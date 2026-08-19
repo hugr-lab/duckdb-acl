@@ -528,6 +528,11 @@ private:
 			if (!store.ResolveTable(principal, key, policy)) {
 				Deny("no access to object \"" + key + "\"");
 			}
+			// the read path needs the 'select' capability, just like DML paths need theirs (spec 003):
+			// a write-only grant (e.g. an audit/ingest table) must not leak reads through either form
+			if (!policy.caps.count("select")) {
+				Deny("select on \"" + key + "\" is not allowed");
+			}
 			if (policy.subquery_form) {
 				ref = BuildTableSubquery(base.Table().GetIdentifierName(), policy, base);
 			} else {

@@ -26,6 +26,7 @@ src/
   include/acl_extension.hpp  # AclExtension : Extension
 test/
   sql/acl.test               # sqllogictest suite (require acl)
+  cpp/                       # standalone C++ invariant tests (make test-cpp), one main() per file
   harness/                   # runnable end-to-end demo (demo.sql + run.sh)
 specs/                       # one lightweight spec per feature, NNN-slug/spec.md (see specs/README.md)
 design/                      # LOCAL, gitignored: numbered research topics NNN-topic/ (our scratch)
@@ -43,6 +44,7 @@ git submodule update --init --recursive
 GEN=ninja make                      # release build of duckdb + the extension
 build/release/test/unittest test/sql/acl.test    # run the suite
 GEN=ninja make test                 # same, via the ci-tools target
+GEN=ninja make test-cpp             # standalone C++ invariant tests (specs/002)
 test/harness/run.sh                 # end-to-end demo against the built extension
 ```
 
@@ -62,6 +64,8 @@ Enable the override in a session with `SET allow_parser_override_extension='fall
 
 - **Two replacement forms**: RENAME (name → physical in place, writable) vs SUBQUERY (wrap a SELECT:
   projection/masks/computed columns/RLS/view SQL, read-only). The resolver picks per object.
+- **Capabilities gate both paths**: `select` on every read of a relation (spec 003), the per-verb
+  capability (`insert`/`update`/`delete`/`merge`) on DML targets.
 - **Markers baked into template copies**: `acl_claim('<name>')` → claim constant; `acl_arg(n)` → n-th
   call argument's AST. Never registered as real functions ⇒ a missed marker fails closed at bind.
 - **Golden rule**: the rewriter adds no query parameters — a user's `$1`/`?` is the only parameter.

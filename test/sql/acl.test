@@ -519,3 +519,37 @@ SELECT id, tenant FROM phys.main.orders_physical WHERE id IN (601, 4) ORDER BY i
 ----
 4	b
 601	a
+
+# --- spec 003: the 'select' capability gates the read path -------------------------------------
+
+# a write-only grant (no 'select' in caps): reads are denied in every position, writes still work
+statement ok
+CREATE TABLE phys.main.audit_physical(id INT, note VARCHAR);
+
+statement ok
+SELECT acl_grant_table('analyst', 'audit_log', 'phys.main.audit_physical', '', '', 'insert');
+
+statement error
+ACL ROLE "analyst" SELECT * FROM audit_log;
+----
+<REGEX>:.*select on "audit_log" is not allowed.*
+
+# the read gate also holds inside a subquery of an otherwise-allowed query
+statement error
+ACL ROLE "analyst" SELECT 1 FROM writable_orders WHERE EXISTS (SELECT 1 FROM audit_log);
+----
+<REGEX>:.*select on "audit_log" is not allowed.*
+
+statement ok
+ACL ROLE "analyst" INSERT INTO audit_log VALUES (1, 'created');
+
+query II
+SELECT id, note FROM phys.main.audit_physical;
+----
+1	created
+
+# an INSERT ... SELECT source is a read and needs 'select' too
+statement error
+ACL ROLE "analyst" INSERT INTO audit_log SELECT id, note FROM audit_log;
+----
+<REGEX>:.*select on "audit_log" is not allowed.*
