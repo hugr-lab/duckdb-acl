@@ -1,0 +1,65 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Release",
+            "type": "shell",
+            "command": "make",
+            "args": ["release"],
+            "options": { "cwd": "${workspaceFolder}", "env": { "GEN": "ninja" } },
+            "group": "build",
+            "problemMatcher": ["$gcc"],
+            "detail": "Build duckdb + the acl extension (release)"
+        },
+        {
+            "label": "Build Debug",
+            "type": "shell",
+            "command": "make",
+            "args": ["debug"],
+            "options": { "cwd": "${workspaceFolder}", "env": { "GEN": "ninja" } },
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": ["$gcc"],
+            "detail": "Build duckdb + the acl extension (debug, with symbols)"
+        },
+        {
+            "label": "Clean",
+            "type": "shell",
+            "command": "make",
+            "args": ["clean"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "detail": "Clean build artifacts"
+        },
+        {
+            "label": "Test (Release)",
+            "type": "shell",
+            "command": "./build/release/test/unittest",
+            "args": ["test/sql/acl.test"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": { "kind": "test", "isDefault": true },
+            "problemMatcher": [],
+            "detail": "Run the acl sqllogictest suite (release)",
+            "dependsOn": "Build Release"
+        },
+        {
+            "label": "Test (Debug)",
+            "type": "shell",
+            "command": "./build/debug/test/unittest",
+            "args": ["test/sql/acl.test"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "Run the acl sqllogictest suite (debug)",
+            "dependsOn": "Build Debug"
+        },
+        {
+            "label": "Run Harness (Release)",
+            "type": "shell",
+            "command": "./test/harness/run.sh",
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "detail": "Run the end-to-end gateway demo against the release build",
+            "dependsOn": "Build Release"
+        }
+    ]
+}

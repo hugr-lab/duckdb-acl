@@ -1,0 +1,46 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug (duckdb CLI)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/debug/duckdb",
+            "args": ["-unsigned"],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build Debug",
+            "env": { "DUCKDB_ALLOW_UNSIGNED_EXTENSIONS": "1" },
+            "stopOnEntry": false,
+            "sourceMap": {
+                "/Users/vgribanov/projects/hugr-lab/duckdb-acl": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Release (duckdb CLI)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/release/duckdb",
+            "args": ["-unsigned"],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build Release",
+            "env": { "DUCKDB_ALLOW_UNSIGNED_EXTENSIONS": "1" },
+            "stopOnEntry": false,
+            "sourceMap": {
+                "/Users/vgribanov/projects/hugr-lab/duckdb-acl": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Debug Tests (acl)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/debug/test/unittest",
+            "args": ["${workspaceFolder}/test/sql/acl.test"],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build Debug",
+            "stopOnEntry": false,
+            "sourceMap": {
+                "/Users/vgribanov/projects/hugr-lab/duckdb-acl": "${workspaceFolder}"
+            }
+        }
+    ]
+}

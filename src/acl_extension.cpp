@@ -38,7 +38,7 @@
 #include <list>
 #include <unordered_map>
 
-// PoC skeleton for the "parser_override + AST-rewrite" ACL model (see docs/DESIGN.md).
+// PoC skeleton for the "parser_override + AST-rewrite" ACL model (see design/DESIGN.md).
 //
 // A trusted gateway prepends `ACL ROLE "<role>"` / `ACL TOKEN '<token>'` / `ACL ADMIN` to every query.
 // The parser_override below (enabled with `SET allow_parser_override_extension='fallback'`) recognizes

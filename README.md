@@ -9,7 +9,7 @@ bind → optimize → execute path — so both `SELECT` and DML work naturally.
 > **Status: proof-of-concept.** The resolvers are in-process stubs (policy registered via SQL helper
 > functions). It tracks **duckdb `main`** because it depends on parser/AST APIs (the `Identifier` type,
 > multi-level `QualifiedName`, `MergeQueryNode`, unified DML query nodes) that are not yet in a stable
-> release. See [docs/DESIGN.md](docs/DESIGN.md).
+> release. See [design/DESIGN.md](design/DESIGN.md).
 
 ## How it works
 
