@@ -6,7 +6,8 @@ verifies the principal, resolves virtual names to physical objects, applies row-
 column masking, gates functions, and returns real `SQLStatement`s to the normal
 bind → optimize → execute path.
 
-Read **[design/DESIGN.md](design/DESIGN.md)** first — it is the canonical description of the model.
+Read **[specs/001-parser-override-ast-rewrite/spec.md](specs/001-parser-override-ast-rewrite/spec.md)**
+for the core model. Deeper research/thinking lives in a local `design/` folder (gitignored).
 
 ## Technology
 
@@ -26,10 +27,8 @@ src/
 test/
   sql/acl.test               # sqllogictest suite (require acl)
   harness/                   # runnable end-to-end demo (demo.sql + run.sh)
-design/
-  DESIGN.md                  # architecture (canonical)
-  research/                  # working research notes (RU) from the PoC phase
-  specs/                     # one lightweight spec per feature (see specs/README.md)
+specs/                       # one lightweight spec per feature, NNN-slug/spec.md (see specs/README.md)
+design/                      # LOCAL, gitignored: research + thinking-out-loud (DESIGN.md, notes)
 ```
 
 `src/acl_extension.cpp` is intentionally one translation unit for now: `PolicyStore` (per-instance
@@ -80,15 +79,16 @@ role-aware resolver behind the same seam.
 
 ## Working process — per-feature specs
 
-We do **not** run full spec-kit. Instead, each feature gets one lightweight spec under
-`design/specs/` (see **[design/specs/README.md](design/specs/README.md)**):
+We do **not** run full spec-kit. Instead, each feature gets one lightweight spec under `specs/` (see
+**[specs/README.md](specs/README.md)**):
 
-1. Before (or alongside) implementing a feature, write `design/specs/NNNN-slug.md` from
-   `design/specs/TEMPLATE.md` — problem, design, enforcement/security, tests, alternatives.
+1. Before (or alongside) implementing a feature, create `specs/NNN-slug/spec.md` from
+   `specs/TEMPLATE.md` — problem, design, enforcement/security, tests, alternatives.
 2. Implement with tests; keep the spec updated; set its status to `implemented` when done.
 3. Reference the spec in the commit/PR.
 
 Keep specs short and honest. When a decision changes, update the spec or supersede it with a new one.
+`design/` (gitignored) is our scratch space for the research behind a spec.
 
 ## Gateway
 

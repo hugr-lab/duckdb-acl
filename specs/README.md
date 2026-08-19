@@ -4,30 +4,43 @@ We keep one **lightweight spec per feature** here. This is deliberately *not* fu
 plan/tasks/constitution machinery, no generated branches. Just a short, honest document per feature so
 design decisions are written down and reviewable.
 
+## Layout
+
+Each feature is a numbered folder holding its `spec.md` (plus any feature-local assets):
+
+```text
+specs/
+  TEMPLATE.md
+  001-parser-override-ast-rewrite/
+    spec.md
+  002-<slug>/
+    spec.md
+```
+
 ## Process
 
-1. **Write a spec first** (or alongside the work): copy `TEMPLATE.md` to `NNNN-slug.md`, where `NNNN`
-   is the next zero-padded number and `slug` is a short kebab-case name. Fill in the problem, the design,
-   enforcement/security considerations, and how it will be tested.
+1. **Write a spec first** (or alongside the work): create `specs/NNN-slug/spec.md` from `TEMPLATE.md`,
+   where `NNN` is the next zero-padded number and `slug` is a short kebab-case name. Fill in the problem,
+   the design, enforcement/security considerations, and how it will be tested.
 2. **Implement with tests.** Prefer sqllogictest (`test/sql/acl.test`); add C++ tests only where SQL
    cannot express it (e.g. parameter binding).
 3. **Keep the spec current.** When the design shifts during implementation, update the spec. Set
    `Status: implemented` when it lands; reference the spec in the commit/PR.
 4. **Supersede, don't rewrite history.** If a later feature reverses a decision, add a new spec and mark
-   the old one `Status: superseded by NNNN`.
+   the old one `Status: superseded by NNN`.
 
 ## What a spec is (and isn't)
 
 - **Is**: the problem, the chosen design and why, the security/enforcement implications, the tests that
   prove it, and the alternatives considered.
-- **Isn't**: a task list, an implementation diary, or API reference docs (those live in
-  [../DESIGN.md](../DESIGN.md) and the code).
+- **Isn't**: a task list, an implementation diary, or API reference docs (those live in the code and
+  `README.md`).
+
+Deeper research and thinking-out-loud lives in a local, un-committed `design/` folder (gitignored) —
+specs are the shareable distillation of that work.
 
 ## Index
 
 | Spec | Title | Status |
 | --- | --- | --- |
-| [0001](0001-parser-override-ast-rewrite.md) | parser_override + AST rewrite (core model) | implemented |
-
-Deeper background and the running research notes from the PoC phase live in
-[../research/](../research/); the canonical architecture is [../DESIGN.md](../DESIGN.md).
+| [001](001-parser-override-ast-rewrite/spec.md) | parser_override + AST rewrite (core model) | implemented |

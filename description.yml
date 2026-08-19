@@ -31,4 +31,4 @@ docs:
     whose claim values are baked in as constants), virtual table/scalar functions expand from templates,
     data-reading / rights-bypass functions (read_csv, postgres_query, ...) are denied, and unknown names
     are refused. The rewritten statements flow through the normal bind -> optimize -> execute path, so
-    SELECT and DML both work. See design/DESIGN.md.
+    SELECT and DML both work. See specs/001-parser-override-ast-rewrite/spec.md.

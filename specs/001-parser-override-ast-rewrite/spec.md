@@ -1,4 +1,4 @@
-# Spec 0001: parser_override + AST rewrite (core model)
+# Spec 001: parser_override + AST rewrite (core model)
 
 - **Status**: implemented
 - **Date**: 2026-08-19

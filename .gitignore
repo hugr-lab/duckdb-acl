@@ -10,3 +10,6 @@ test/python/__pycache__/
 # IDE / clangd caches
 .cache/
 .vscode/*.log
+
+# local design / research scratch (not committed)
+design/
