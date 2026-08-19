@@ -3,63 +3,83 @@
 // binding through the C++ API, which sqllogictest cannot express - hence a standalone test binary.
 // Build + run via `GEN=ninja make test-cpp`.
 
-#include "duckdb.hpp"
-
-#include <iostream>
-#include <string>
-#include <vector>
+#include "acl_test_util.hpp"
 
 using namespace duckdb;
+using namespace acl_test;
 
 namespace {
 
-int failures = 0;
-
-void Check(bool ok, const std::string &what) {
-	std::cout << (ok ? "  ok:   " : "  FAIL: ") << what << "\n";
-	if (!ok) {
-		failures++;
+//! The pure form of the golden rule: a parameterless query stays parameterless after the rewrite,
+//! even though the rewrite splices in an RLS claim value (as a constant, never a parameter)
+void NoUserParameters(Connection &con) {
+	auto prepared = con.Prepare("ACL TOKEN 'tok' SELECT id FROM orders ORDER BY id");
+	if (!CheckOk(*prepared, "parameterless query prepares")) {
+		return;
+	}
+	Check(prepared->GetParameterCount() == 0, "parameterless query: the rewrite added no parameter");
+	auto result = prepared->Execute();
+	if (CheckOk(*result, "parameterless query executes")) {
+		CheckColumn(*result, {1, 2}, "tenant=acme sees ids 1,2");
 	}
 }
 
-void Exec(Connection &con, const std::string &sql) {
-	auto result = con.Query(sql);
-	if (result->HasError()) {
-		throw std::runtime_error("setup failed: " + sql + ": " + result->GetError());
+void DollarParamInOuterWhere(Connection &con) {
+	auto prepared = con.Prepare("ACL TOKEN 'tok' SELECT id FROM orders WHERE amount >= $1 ORDER BY id");
+	if (!CheckOk(*prepared, "outer-WHERE $1 prepares")) {
+		return;
+	}
+	Check(prepared->GetParameterCount() == 1, "outer-WHERE $1: exactly one (user) parameter");
+	auto result = prepared->Execute(150);
+	if (CheckOk(*result, "outer-WHERE $1 executes")) {
+		// acme rows are (1:100, 2:200); amount >= 150 -> id 2
+		CheckColumn(*result, {2}, "amount >= 150 under tenant=acme -> id 2");
+	}
+	// re-execute with a different bound value; the RLS constant (tenant=acme) stays baked in
+	result = prepared->Execute(50);
+	if (CheckOk(*result, "outer-WHERE $1 re-executes")) {
+		CheckColumn(*result, {1, 2}, "amount >= 50 under tenant=acme -> ids 1,2");
 	}
 }
 
-void LoadAcl(Connection &con) {
-	auto local = con.Query("LOAD 'build/release/extension/acl/acl.duckdb_extension'");
-	if (local->HasError()) {
-		auto linked = con.Query("LOAD acl");
-		if (linked->HasError()) {
-			throw std::runtime_error("cannot load the acl extension: " + linked->GetError());
-		}
+//! ? placeholders are numbered by traversal order at bind, so this also catches a rewrite that
+//! duplicates or reorders the node holding one - which a fixed $1 cannot detect
+void QuestionMarkParam(Connection &con) {
+	auto prepared = con.Prepare("ACL TOKEN 'tok' SELECT id FROM orders WHERE amount >= ? ORDER BY id");
+	if (!CheckOk(*prepared, "? placeholder prepares")) {
+		return;
+	}
+	Check(prepared->GetParameterCount() == 1, "? placeholder: exactly one (user) parameter");
+	auto result = prepared->Execute(150);
+	if (CheckOk(*result, "? placeholder executes")) {
+		CheckColumn(*result, {2}, "amount >= 150 under tenant=acme -> id 2");
 	}
 }
 
-//! Collect the first column of a result as int64 values
-std::vector<int64_t> ColumnValues(QueryResult &result) {
-	std::vector<int64_t> values;
-	while (true) {
-		auto chunk = result.Fetch();
-		if (!chunk || chunk->size() == 0) {
-			break;
-		}
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			values.push_back(chunk->GetValue(0, row).GetValue<int64_t>());
-		}
+void DollarParamAsVfuncArgument(Connection &con) {
+	auto prepared = con.Prepare("ACL TOKEN 'tok' SELECT id FROM report($1) ORDER BY id");
+	if (!CheckOk(*prepared, "vfunc-argument $1 prepares")) {
+		return;
 	}
-	return values;
+	Check(prepared->GetParameterCount() == 1, "vfunc-argument $1: exactly one (user) parameter");
+	auto result = prepared->Execute(200);
+	if (CheckOk(*result, "vfunc-argument $1 executes")) {
+		// acme rows with amount >= 200 -> id 2
+		CheckColumn(*result, {2}, "report(200) under tenant=acme -> id 2");
+	}
+	// re-execute with a different bound value: the argument spliced into the expanded template is a
+	// live user parameter, while the claim baked next to it stays a constant
+	result = prepared->Execute(50);
+	if (CheckOk(*result, "vfunc-argument $1 re-executes")) {
+		CheckColumn(*result, {1, 2}, "report(50) under tenant=acme -> ids 1,2");
+	}
 }
 
 void Run() {
-	DBConfig config;
-	config.SetOptionByName("allow_unsigned_extensions", true);
-	DuckDB db(nullptr, &config);
+	DuckDB db(nullptr);
 	Connection con(db);
-	LoadAcl(con);
+	// statically linked: the generated extension loader publishes 'acl' on the config
+	Exec(con, "LOAD acl");
 
 	// physical data, a virtual relation (SUBQUERY with RLS) and a virtual table function
 	Exec(con, "ATTACH ':memory:' AS phys");
@@ -72,46 +92,14 @@ void Run() {
 	Exec(con, "SELECT acl_define_token('tok','analyst','tenant=acme')");
 	Exec(con, "SET allow_parser_override_extension='fallback'");
 
-	// a user parameter in the outer query survives the rewrite: exactly one parameter, and it is the user's
-	{
-		auto prepared = con.Prepare("ACL TOKEN 'tok' SELECT id FROM orders WHERE amount >= $1 ORDER BY id");
-		Check(!prepared->HasError(), "outer-WHERE $1 prepares: " + prepared->GetError());
-		Check(prepared->GetParameterCount() == 1, "outer-WHERE $1: exactly one (user) parameter");
-
-		auto result = prepared->Execute(150);
-		Check(!result->HasError(), "outer-WHERE $1 executes: " + result->GetError());
-		// acme rows are (1:100, 2:200); amount >= 150 -> id 2
-		Check(ColumnValues(*result) == std::vector<int64_t> {2}, "amount >= 150 under tenant=acme -> id 2");
-
-		// re-execute with a different bound value; the RLS constant (tenant=acme) stays baked in
-		result = prepared->Execute(50);
-		Check(!result->HasError(), "outer-WHERE $1 re-executes: " + result->GetError());
-		Check(ColumnValues(*result) == std::vector<int64_t> {1, 2}, "amount >= 50 under tenant=acme -> ids 1,2");
-	}
-
-	// a user parameter passed as a table-function argument also flows through unchanged
-	{
-		auto prepared = con.Prepare("ACL TOKEN 'tok' SELECT id FROM report($1) ORDER BY id");
-		Check(!prepared->HasError(), "vfunc-argument $1 prepares: " + prepared->GetError());
-		Check(prepared->GetParameterCount() == 1, "vfunc-argument $1: exactly one (user) parameter");
-
-		auto result = prepared->Execute(200);
-		Check(!result->HasError(), "vfunc-argument $1 executes: " + result->GetError());
-		// acme rows with amount >= 200 -> id 2
-		Check(ColumnValues(*result) == std::vector<int64_t> {2}, "report(200) under tenant=acme -> id 2");
-	}
+	Scenario("no-user-parameters", [&]() { NoUserParameters(con); });
+	Scenario("dollar-in-outer-where", [&]() { DollarParamInOuterWhere(con); });
+	Scenario("question-mark", [&]() { QuestionMarkParam(con); });
+	Scenario("dollar-as-vfunc-argument", [&]() { DollarParamAsVfuncArgument(con); });
 }
 
 } // namespace
 
 int main() {
-	std::cout << "acl params passthrough (spec 002)\n";
-	try {
-		Run();
-	} catch (std::exception &ex) {
-		std::cout << "  FAIL: " << ex.what() << "\n";
-		failures++;
-	}
-	std::cout << (failures == 0 ? "PASS" : "FAIL") << "\n";
-	return failures == 0 ? 0 : 1;
+	return RunMain("acl params passthrough (spec 002)", Run);
 }

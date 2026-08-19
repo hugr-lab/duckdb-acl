@@ -9,3 +9,12 @@ or
 ```bash
 make test_debug
 ```
+
+The `cpp` directory holds standalone C++ tests for invariants SQL cannot express — prepared-statement
+parameter passthrough and per-instance policy isolation (see `specs/002-cpp-invariant-tests/spec.md`).
+Each `test_*.cpp` is its own program; build and run them with:
+```bash
+GEN=ninja make test-cpp
+```
+`make test` (the release CI target) runs them too on Linux/macOS. The `harness` directory is a runnable
+end-to-end demo against the built loadable extension.

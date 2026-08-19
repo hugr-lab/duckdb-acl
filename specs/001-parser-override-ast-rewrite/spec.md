@@ -61,8 +61,8 @@ that confuses tooling.
 computed columns, full-path/RENAME resolution, virtual views and table/scalar functions (incl. nested
 and argument-as-expression), function gating (allow/deny + policy-driven flip), subquery/CTE/EXISTS/IN
 traversal, CTE shadowing, and DML end-to-end (INSERT/UPDATE/DELETE/MERGE, read-only denial, capability
-denial), plus a multi-statement batch. Parameter passthrough and per-instance isolation were proven with
-C++ prepared-statement tests in the PoC tree (to be re-homed here — see follow-ups).
+denial), plus a multi-statement batch. Parameter passthrough and per-instance isolation are proven by
+the standalone C++ tests under `test/cpp/` (spec 002).
 
 ## Alternatives considered
 

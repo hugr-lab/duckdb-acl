@@ -62,7 +62,8 @@ with the read-only, role-aware ACL resolver behind the same store seam.
 ```sh
 git submodule update --init --recursive
 make            # builds duckdb + the extension (release)
-make test       # runs test/sql/acl.test
+make test       # runs test/sql/acl.test (and the C++ tests on Linux/macOS)
+make test-cpp   # standalone C++ invariant tests only (test/cpp/)
 ```
 
 The loadable extension lands at `build/release/extension/acl/acl.duckdb_extension`; the test binary at

@@ -30,25 +30,35 @@ sneaking back into the store) would not be caught by `test/sql/acl.test`.
 
 Standalone test programs, not unittest integration:
 
-- **Layout** — one scenario per file under `test/cpp/`: `test_acl_params_passthrough.cpp` and
-  `test_acl_instance_isolation.cpp`. Each is a plain program with its own `main()`, small check
-  helpers, PASS/FAIL output, and a non-zero exit code on failure.
-- **Build** — a `test-cpp` Makefile target (style of `mssql-extension`): compile each file directly
-  with `$(CXX) -std=c++17 -I duckdb/src/include`, linking the already-built static libraries —
-  `build/release/extension/acl/libacl_extension.a`, `build/release/src/libduckdb_static.a` (twice,
-  for link-order cycles) and every other built `.a` under `build/release/extension` /
-  `build/release/third_party`. Binaries land in `build/test/` and run immediately. Depends on
-  `release`, so use the same generator as the main build (`GEN=ninja make test-cpp`).
-- **Extension loading** — `LOAD 'build/release/extension/acl/acl.duckdb_extension'` (with
-  `allow_unsigned_extensions`), falling back to `LOAD acl` — the linked-extension registry inside
-  `libduckdb_static.a` knows the name because the library is built with this repo's extension config.
-- **Test content** is ported 1:1 from the PoC:
+- **Layout** — one scenario file per invariant under `test/cpp/` (`test_acl_params_passthrough.cpp`,
+  `test_acl_instance_isolation.cpp`), sharing `acl_test_util.hpp`: check helpers that read
+  `GetError()` only after `HasError()`, a column comparator that re-checks the error state around the
+  fetch loop, and a per-scenario wrapper so one aborted scenario cannot mask the others. Each file is
+  a plain program with its own `main()`, PASS/FAIL output, and a non-zero exit code on failure.
+- **Build** — a `test-cpp` Makefile target (style of `mssql-extension`): a pattern rule compiles each
+  `test/cpp/test_*.cpp` (discovered by wildcard) with `$(CXX) -std=c++17 -O2 -DNDEBUG` (matching the
+  release archives, so `D_ASSERT` stays compiled out) into `build/test/`, incrementally. The archives
+  are named **explicitly**: `libduckdb_generated_extension_loader.a` first, then the per-extension
+  `lib*_extension.a` one level below `build/release/extension/`, then `libduckdb_static.a`
+  (`--start-group`/`--end-group` on Linux). Globbing would also sweep up the *dummy* loader, which
+  defines the same `RegisterLinkedExtensions` symbol and would silently empty the linked-extension
+  registry. Depends on `release`, so use the same generator (`GEN=ninja make test-cpp`).
+- **CI** — `test_release` (what extension-ci-tools' CI invokes) chains `test-cpp` as a prerequisite
+  on the platforms that can build and run the binaries (not Windows, not wasm cross-builds).
+- **Extension loading** — the generated loader publishes `acl` on the config and the `DuckDB`
+  constructor auto-loads linked extensions, so the tests just `LOAD acl` (an idempotent, cwd- and
+  artifact-independent load). The loadable `acl.duckdb_extension` is exercised by `test/harness/`.
+- **Test content** (ported from the PoC, then extended):
   - *Params passthrough*: a SUBQUERY relation with RLS (`tenant = acl_claim('tenant')`) and a vfunc
-    macro with `acl_arg(1)`; `ACL TOKEN` prepared queries with `$1` in the outer WHERE and as the
-    vfunc argument each report `GetParameterCount() == 1`; re-`Execute` with a different bound value
-    changes the result while the baked RLS constant stays fixed.
-  - *Instance isolation*: instance 1 registers a RENAME grant and resolves it; a fresh instance 2
-    running the same `ACL ROLE` query is denied with `no access to object`.
+    macro with `acl_arg(1)`. Four scenarios: a parameterless `ACL TOKEN` query reports
+    `GetParameterCount() == 0` (the pure form of the golden rule); `$1` in the outer WHERE and as the
+    vfunc argument each report exactly one parameter and re-`Execute` with a different bound value
+    while the baked RLS constant stays fixed; a `?` placeholder (numbered by traversal order, so it
+    also catches node duplication/reordering) reports exactly one parameter.
+  - *Instance isolation*: instance 1 registers a RENAME grant and a token and resolves both; a fresh
+    instance 2 is denied the granted name (`no access to object`) **and** rejects instance 1's token
+    (`verification failed` — a process-global token map would be a cross-tenant leak); instance 1
+    still resolves both afterwards.
 
 ## Enforcement & security
 
@@ -59,8 +69,9 @@ name the first instance granted).
 
 ## Testing
 
-- `GEN=ninja make test-cpp` — builds and runs both binaries; fails the target on any check.
-- `build/release/test/unittest test/sql/acl.test` — unchanged, stays green (126 assertions).
+- `GEN=ninja make test-cpp` — builds and runs both binaries; fails the target on any check. A failed
+  run prints the binary's full output; a failed compile prints the compiler's diagnostics directly.
+- `build/release/test/unittest test/sql/acl.test` — stays green.
 
 ## Alternatives considered
 
