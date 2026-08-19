@@ -1,0 +1,521 @@
+# name: test/sql/acl.test
+# description: ACL parser_override + AST rewrite - resolve virtual names to safe subqueries under a role/token
+# group: [sql]
+
+require acl
+
+# a "physical" database holding the real data (never named directly by sandboxed roles)
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100), (2, 'globex', 200), (3, 'acme', 300);
+
+statement ok
+CREATE TABLE phys.main.employees_physical(id INT, name VARCHAR, salary INT, ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.main.employees_physical VALUES (1, 'alice', 100, 'aaa'), (2, 'bob', 200, 'bbb');
+
+# --- admin registers policy -----------------------------------------------------------------------
+# Projection and/or RLS present -> a read-only SUBQUERY; both empty -> a writable RENAME (physical
+# object exposed as-is). A computed column is just a projection expression (name=expr).
+
+# 'orders': SUBQUERY - projects id+amount, RLS on tenant claim, read-only
+statement ok
+SELECT acl_grant_table('analyst', 'orders', 'phys.main.orders_physical', 'id,amount', 'tenant = acl_claim(''tenant'')', 'select');
+
+# 'employees': SUBQUERY - projects id+name, masks ssn to NULL, drops salary entirely, no RLS
+statement ok
+SELECT acl_grant_table('analyst', 'employees', 'phys.main.employees_physical', 'id,name,ssn=NULL', '', 'select');
+
+# 'orders_calc': SUBQUERY with a computed column (amount*2) and RLS
+statement ok
+SELECT acl_grant_table('analyst', 'orders_calc', 'phys.main.orders_physical', 'id,double_amount=amount*2', 'tenant = acl_claim(''tenant'')', 'select');
+
+# 'writable_orders': RENAME - no projection/RLS, exposes the physical table as-is, writable
+statement ok
+SELECT acl_grant_table('analyst', 'writable_orders', 'phys.main.orders_physical', '', '', 'select,insert,update,delete,merge');
+
+# a nested virtual name resolves by its full path to a physical target (RENAME)
+statement ok
+SELECT acl_grant_table('analyst', 'analytics.sales.orders', 'phys.main.orders_physical', '', '', 'select');
+
+# the same writable name for a role that lacks the insert capability
+statement ok
+SELECT acl_grant_table('viewer', 'writable_orders', 'phys.main.orders_physical', '', '', 'select');
+
+# a virtual VIEW: its SQL is the definition (claims baked in), read-only
+statement ok
+SELECT acl_grant_view('analyst', 'recent_orders', 'SELECT id, amount FROM phys.main.orders_physical WHERE amount >= 200 AND tenant = acl_claim(''tenant'')');
+
+# a virtual TABLE FUNCTION (SUBQUERY-macro): acl_arg(n) = n-th call argument, RLS via acl_claim
+statement ok
+SELECT acl_grant_table_function('analyst', 'report', 'SELECT id, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1) AND tenant = acl_claim(''tenant'')');
+
+# a virtual TABLE FUNCTION (RENAME-alias) of a physical/system table function
+statement ok
+SELECT acl_grant_table_function_alias('analyst', 'my_range', 'range');
+
+# a broken template that references an argument the caller does not supply
+statement ok
+SELECT acl_grant_table_function('analyst', 'bad_report', 'SELECT id FROM phys.main.orders_physical WHERE amount >= acl_arg(2)');
+
+# a virtual SCALAR function (expression macro): acl_arg(n) = n-th argument, RLS-style claim via acl_claim
+statement ok
+SELECT acl_grant_scalar('analyst', 'tenant_tag', 'acl_arg(1) || ''@'' || acl_claim(''tenant'')');
+
+statement ok
+SELECT acl_grant_scalar('analyst', 'shout', 'upper(acl_arg(1))');
+
+# a virtual SCALAR function (RENAME-alias) of a physical/system scalar
+statement ok
+SELECT acl_grant_scalar_alias('analyst', 'lc', 'lower');
+
+# principals: a bare role carries default claims; a token carries its own
+statement ok
+SELECT acl_define_role('analyst', 'tenant=globex');
+
+statement ok
+SELECT acl_define_token('tok-acme', 'analyst', 'tenant=acme');
+
+# --- turn on the override for this session ----------------------------------------------------------
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+# non-ACL queries still parse natively (FALLBACK); the gateway trusts unprefixed service traffic
+query I
+SELECT count(*) FROM phys.main.orders_physical;
+----
+3
+
+# --- ROLE form: default claim (tenant=globex) drives RLS -------------------------------------------
+
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+2	200
+
+# --- TOKEN form: token claim (tenant=acme) drives RLS ----------------------------------------------
+
+query II
+ACL TOKEN 'tok-acme' SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+# projection/predicate over the virtual name push into the physical scan
+query I
+ACL TOKEN 'tok-acme' SELECT sum(amount) FROM orders;
+----
+400
+
+# --- column projection + masking -------------------------------------------------------------------
+
+query II
+ACL ROLE "analyst" SELECT id, name FROM employees ORDER BY id;
+----
+1	alice
+2	bob
+
+# a masked column reads as NULL, not the physical value
+query I
+ACL ROLE "analyst" SELECT ssn FROM employees WHERE id = 1;
+----
+NULL
+
+# SELECT * expands to only the exposed columns (id, name, masked ssn) - no error
+query III
+ACL ROLE "analyst" SELECT * FROM employees ORDER BY id;
+----
+1	alice	NULL
+2	bob	NULL
+
+# a dropped column simply does not exist in the safe subquery
+statement error
+ACL ROLE "analyst" SELECT salary FROM employees;
+----
+<REGEX>:.*salary.*
+
+# a forbidden column hidden in a WHERE predicate is equally invisible
+statement error
+ACL ROLE "analyst" SELECT id FROM employees WHERE salary > 100;
+----
+<REGEX>:.*salary.*
+
+# --- unknown / denied objects ----------------------------------------------------------------------
+
+statement error
+ACL ROLE "analyst" SELECT * FROM secrets;
+----
+<REGEX>:.*no access to object.*secrets.*
+
+# a direct reference to the physical database is not a mapped virtual name -> denied
+statement error
+ACL ROLE "analyst" SELECT * FROM orders_physical;
+----
+<REGEX>:.*no access to object.*orders_physical.*
+
+# --- subqueries, CTEs, scope handling (traversal completeness) -------------------------------------
+
+# scalar subquery over the same virtual name is rewritten too; alias survives
+query I
+ACL TOKEN 'tok-acme' SELECT id FROM orders o WHERE amount = (SELECT max(amount) FROM orders) ORDER BY id;
+----
+3
+
+# CTE that reads a virtual name is rewritten inside the CTE body
+query I
+ACL ROLE "analyst" WITH x AS (SELECT id, amount FROM orders) SELECT amount FROM x WHERE id = 2;
+----
+200
+
+# a CTE whose name shadows a virtual object is NOT rewritten (scope wins over catalog)
+query II
+ACL ROLE "analyst" WITH orders AS (SELECT 42 AS id, 7 AS amount) SELECT id, amount FROM orders;
+----
+42	7
+
+# scalar subquery in the SELECT list is rewritten (both orders refs get RLS = acme)
+query II
+ACL TOKEN 'tok-acme' SELECT id, (SELECT max(amount) FROM orders) AS m FROM orders ORDER BY id;
+----
+1	300
+3	300
+
+# scalar subquery whose FROM is an allowed table function
+query I
+ACL ROLE "analyst" SELECT (SELECT count(*) FROM range(2)) AS c;
+----
+2
+
+# correlated EXISTS subquery over a virtual name is rewritten (outer + inner both RLS = acme)
+query I
+ACL TOKEN 'tok-acme' SELECT id FROM orders o WHERE EXISTS (SELECT 1 FROM orders i WHERE i.amount > o.amount) ORDER BY id;
+----
+1
+
+# IN subquery over a virtual name is rewritten
+query I
+ACL TOKEN 'tok-acme' SELECT id FROM orders WHERE amount IN (SELECT amount FROM orders) ORDER BY id;
+----
+1
+3
+
+# derived table in FROM with its own modifiers is rewritten
+query I
+ACL TOKEN 'tok-acme' SELECT amount FROM (SELECT amount FROM orders ORDER BY amount DESC LIMIT 1) t;
+----
+300
+
+# a forbidden column is invisible even inside a scalar subquery in the SELECT list
+statement error
+ACL ROLE "analyst" SELECT (SELECT salary FROM employees LIMIT 1) AS s;
+----
+<REGEX>:.*salary.*
+
+# a denied table function is caught inside an EXISTS subquery
+statement error
+ACL ROLE "analyst" SELECT 1 WHERE EXISTS (SELECT * FROM read_csv('/x'));
+----
+<REGEX>:.*table function.*read_csv.*not allowed.*
+
+# --- computed column (projection expression instead of a real column) ------------------------------
+
+query II
+ACL TOKEN 'tok-acme' SELECT id, double_amount FROM orders_calc ORDER BY id;
+----
+1	200
+3	600
+
+# --- RENAME form: nested virtual path resolves to its physical target -------------------------------
+
+# a RENAME exposes the physical table as-is (no RLS), reachable by its full virtual path
+query I
+ACL ROLE "analyst" SELECT count(*) FROM analytics.sales.orders;
+----
+3
+
+query I
+ACL ROLE "analyst" SELECT amount FROM analytics.sales.orders WHERE id = 2;
+----
+200
+
+# --- DML: a RENAME relation is writable; rewritten statements run as ordinary top-level statements --
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM writable_orders;
+----
+3
+
+statement ok
+ACL TOKEN 'tok-acme' INSERT INTO writable_orders VALUES (9, 'acme', 999);
+
+query I
+SELECT count(*) FROM phys.main.orders_physical;
+----
+4
+
+statement ok
+ACL TOKEN 'tok-acme' DELETE FROM writable_orders WHERE id = 9;
+
+query I
+SELECT count(*) FROM phys.main.orders_physical;
+----
+3
+
+# a read-only SUBQUERY relation (projection/RLS/view) cannot be written to
+statement error
+ACL TOKEN 'tok-acme' INSERT INTO orders VALUES (9, 'acme', 999);
+----
+<REGEX>:.*read-only.*orders.*
+
+# a writable relation still enforces the capability: viewer lacks insert
+statement error
+ACL ROLE "viewer" INSERT INTO writable_orders VALUES (10, 'x', 1);
+----
+<REGEX>:.*insert.*not allowed.*
+
+# --- ADMIN passthrough (bypass, no rewrite) --------------------------------------------------------
+
+query I
+ACL ADMIN SELECT count(*) FROM phys.main.orders_physical;
+----
+3
+
+# --- virtual views ---------------------------------------------------------------------------------
+
+# a view resolves to its defining SQL; claims are baked in (role analyst -> tenant=globex)
+query II
+ACL ROLE "analyst" SELECT id, amount FROM recent_orders ORDER BY id;
+----
+2	200
+
+# the same (cached) view template under a different principal bakes a different claim - the parsed
+# prototype is copied per request, not mutated, so no claim leaks across calls
+query II
+ACL TOKEN 'tok-acme' SELECT id, amount FROM recent_orders ORDER BY id;
+----
+3	300
+
+# a view cannot be a DML target (read-only SUBQUERY)
+statement error
+ACL ROLE "analyst" INSERT INTO recent_orders VALUES (1, 1);
+----
+<REGEX>:.*read-only.*recent_orders.*
+
+# --- table-function gating (default-DENY, allowlist) -----------------------------------------------
+
+# a safe built-in table function is on the default allowlist
+query I
+ACL ROLE "analyst" SELECT count(*) FROM range(3);
+----
+3
+
+# a data-exfiltration table function is denied at parse time (before any bind)
+statement error
+ACL ROLE "analyst" SELECT * FROM read_csv('/etc/passwd');
+----
+<REGEX>:.*table function.*read_csv.*not allowed.*
+
+# the generic SQL-passthrough table function is denied
+statement error
+ACL ROLE "analyst" SELECT * FROM query('SELECT 1');
+----
+<REGEX>:.*table function.*query.*not allowed.*
+
+# a denied table function hidden in a subquery is still caught
+statement error
+ACL ROLE "analyst" SELECT * FROM (SELECT * FROM postgres_query('db', 'SELECT 1')) t;
+----
+<REGEX>:.*table function.*postgres_query.*not allowed.*
+
+# --- function gating: every function routed through the resolver (default-allow, deny readers) ------
+
+# an ordinary transform scalar passes (most extension functions look like this, e.g. ST_AsGeoJSON)
+query I
+ACL ROLE "analyst" SELECT lower('AB');
+----
+ab
+
+# a session/secret-reading scalar is on the default denylist
+statement error
+ACL ROLE "analyst" SELECT getvariable('acl_token');
+----
+<REGEX>:.*getvariable.*not allowed.*
+
+# a denied function hidden in a WHERE predicate is caught by traversal
+statement error
+ACL ROLE "analyst" SELECT id FROM orders WHERE getvariable('x') = 'y';
+----
+<REGEX>:.*getvariable.*not allowed.*
+
+# the decision is policy-driven, not hardcoded: any function can be denied...
+statement ok
+SELECT acl_deny_function('lower');
+
+statement error
+ACL ROLE "analyst" SELECT lower('AB');
+----
+<REGEX>:.*lower.*not allowed.*
+
+# ...and un-denied again (e.g. to relax an over-broad default)
+statement ok
+SELECT acl_allow_function('lower');
+
+query I
+ACL ROLE "analyst" SELECT lower('AB');
+----
+ab
+
+# the admin can also deny a normally-harmless function
+statement ok
+SELECT acl_deny_function('md5');
+
+statement error
+ACL ROLE "analyst" SELECT md5('x');
+----
+<REGEX>:.*md5.*not allowed.*
+
+# --- virtual table functions -----------------------------------------------------------------------
+
+# SUBQUERY-macro: the call argument is substituted into acl_arg(1), RLS claim baked (tenant=acme)
+query II
+ACL TOKEN 'tok-acme' SELECT id, amount FROM report(200) ORDER BY id;
+----
+3	300
+
+# a different argument value flows into the same template
+query II
+ACL TOKEN 'tok-acme' SELECT id, amount FROM report(100) ORDER BY id;
+----
+1	100
+3	300
+
+# the claim differs by principal (role analyst -> tenant=globex)
+query II
+ACL ROLE "analyst" SELECT id, amount FROM report(0) ORDER BY id;
+----
+2	200
+
+# the argument is an AST expression, not just a literal
+query II
+ACL TOKEN 'tok-acme' SELECT id, amount FROM report(100 + 100) ORDER BY id;
+----
+3	300
+
+# a virtual table function expands correctly inside a nested subquery
+query I
+ACL TOKEN 'tok-acme' SELECT id FROM (SELECT id, amount FROM report(200)) t;
+----
+3
+
+# RENAME-alias: my_range retargets to the physical range() table function, arguments kept
+query I
+ACL ROLE "analyst" SELECT count(*) FROM my_range(5);
+----
+5
+
+# a template that references an unsupplied argument is rejected
+statement error
+ACL ROLE "analyst" SELECT * FROM bad_report(5);
+----
+<REGEX>:.*acl_arg.*
+
+# --- virtual scalar functions ----------------------------------------------------------------------
+
+# expression macro: the argument is substituted and the claim is baked (tenant=acme)
+query I
+ACL TOKEN 'tok-acme' SELECT tenant_tag('u1');
+----
+u1@acme
+
+# the same macro under a different principal bakes a different claim (tenant=globex)
+query I
+ACL ROLE "analyst" SELECT tenant_tag('u1');
+----
+u1@globex
+
+# expression macro over a virtual relation's column (argument is a column reference)
+query I
+ACL ROLE "analyst" SELECT shout(name) FROM employees ORDER BY id;
+----
+ALICE
+BOB
+
+# RENAME-alias scalar retargets to the physical function
+query I
+ACL ROLE "analyst" SELECT lc('AB');
+----
+ab
+
+# a virtual scalar used in a WHERE predicate over a virtual relation
+query I
+ACL ROLE "analyst" SELECT id FROM employees WHERE lc(name) = 'alice';
+----
+1
+
+# nested virtual scalars: the inner one is resolved while rewriting the outer one's arguments
+query I
+ACL ROLE "analyst" SELECT lc(shout('Hi'));
+----
+hi
+
+# --- token verification ----------------------------------------------------------------------------
+
+statement error
+ACL TOKEN 'bogus' SELECT id FROM orders;
+----
+<REGEX>:.*token.*verification failed.*
+
+# --- UPDATE / MERGE / INSERT..SELECT end-to-end (writable RENAME relation) --------------------------
+
+# UPDATE rewrites the target to the physical table and runs as a normal top-level statement
+statement ok
+ACL ROLE "analyst" UPDATE writable_orders SET amount = amount + 5 WHERE id = 1;
+
+query I
+SELECT amount FROM phys.main.orders_physical WHERE id = 1;
+----
+105
+
+# INSERT ... SELECT whose source is a virtual table function (report) is rewritten and executed
+statement ok
+ACL TOKEN 'tok-acme' INSERT INTO writable_orders SELECT id + 100, 'x', amount FROM report(300);
+
+query II
+SELECT tenant, amount FROM phys.main.orders_physical WHERE id = 103;
+----
+x	300
+
+# MERGE ... WHEN MATCHED THEN UPDATE (the action's SET expressions are traversed)
+statement ok
+ACL ROLE "analyst" MERGE INTO writable_orders AS t USING (SELECT 2 AS id, 999 AS amt) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET amount = s.amt;
+
+query I
+SELECT amount FROM phys.main.orders_physical WHERE id = 2;
+----
+999
+
+# MERGE ... WHEN NOT MATCHED THEN INSERT (the action's INSERT expressions are traversed)
+statement ok
+ACL ROLE "analyst" MERGE INTO writable_orders AS t USING (SELECT 500 AS id, 'z' AS tn, 50 AS amt) AS s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.tn, s.amt);
+
+query I
+SELECT amount FROM phys.main.orders_physical WHERE id = 500;
+----
+50
+
+# a multi-statement batch behind one ACL prefix: every statement is rewritten under the same principal
+statement ok
+ACL TOKEN 'tok-acme' INSERT INTO writable_orders VALUES (601, 'a', 1); INSERT INTO writable_orders SELECT id + 1, 'b', amount FROM report(300);
+
+query II
+SELECT id, tenant FROM phys.main.orders_physical WHERE id IN (601, 4) ORDER BY id;
+----
+4	b
+601	a
