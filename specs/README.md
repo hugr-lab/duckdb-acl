@@ -44,3 +44,4 @@ specs are the shareable distillation of that work.
 | Spec | Title | Status |
 | --- | --- | --- |
 | [001](001-parser-override-ast-rewrite/spec.md) | parser_override + AST rewrite (core model) | implemented |
+| [002](002-cpp-invariant-tests/spec.md) | standalone C++ invariant tests (params, isolation) | implemented |

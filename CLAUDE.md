@@ -26,6 +26,7 @@ src/
   include/acl_extension.hpp  # AclExtension : Extension
 test/
   sql/acl.test               # sqllogictest suite (require acl)
+  cpp/                       # standalone C++ invariant tests (make test-cpp), one main() per file
   harness/                   # runnable end-to-end demo (demo.sql + run.sh)
 specs/                       # one lightweight spec per feature, NNN-slug/spec.md (see specs/README.md)
 design/                      # LOCAL, gitignored: numbered research topics NNN-topic/ (our scratch)
@@ -43,6 +44,7 @@ git submodule update --init --recursive
 GEN=ninja make                      # release build of duckdb + the extension
 build/release/test/unittest test/sql/acl.test    # run the suite
 GEN=ninja make test                 # same, via the ci-tools target
+GEN=ninja make test-cpp             # standalone C++ invariant tests (specs/002)
 test/harness/run.sh                 # end-to-end demo against the built extension
 ```
 

@@ -76,7 +76,7 @@ C++ prepared-statement tests in the PoC tree (to be re-homed here — see follow
 
 ## Follow-ups
 
-- Re-home the C++ tests (parameter passthrough, per-instance isolation) into this repo.
+- ~~Re-home the C++ tests (parameter passthrough, per-instance isolation) into this repo.~~ Done — spec 002.
 - Replace the in-memory admin stubs with a read-only, role-aware resolver behind the `PolicyStore` seam
   (external policy source, `policy_version` cache, connection pool).
 - Token masking in query logs (a gateway concern); schema-level DDL capability policy.
