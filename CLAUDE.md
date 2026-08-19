@@ -64,6 +64,8 @@ Enable the override in a session with `SET allow_parser_override_extension='fall
 
 - **Two replacement forms**: RENAME (name → physical in place, writable) vs SUBQUERY (wrap a SELECT:
   projection/masks/computed columns/RLS/view SQL, read-only). The resolver picks per object.
+- **Capabilities gate both paths**: `select` on every read of a relation (spec 003), the per-verb
+  capability (`insert`/`update`/`delete`/`merge`) on DML targets.
 - **Markers baked into template copies**: `acl_claim('<name>')` → claim constant; `acl_arg(n)` → n-th
   call argument's AST. Never registered as real functions ⇒ a missed marker fails closed at bind.
 - **Golden rule**: the rewriter adds no query parameters — a user's `$1`/`?` is the only parameter.

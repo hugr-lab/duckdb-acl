@@ -45,3 +45,4 @@ specs are the shareable distillation of that work.
 | --- | --- | --- |
 | [001](001-parser-override-ast-rewrite/spec.md) | parser_override + AST rewrite (core model) | implemented |
 | [002](002-cpp-invariant-tests/spec.md) | standalone C++ invariant tests (params, isolation) | implemented |
+| [003](003-select-capability-read-gate/spec.md) | the 'select' capability gates the read path | implemented |
