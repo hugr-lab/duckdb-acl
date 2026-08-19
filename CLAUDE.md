@@ -28,7 +28,7 @@ test/
   sql/acl.test               # sqllogictest suite (require acl)
   harness/                   # runnable end-to-end demo (demo.sql + run.sh)
 specs/                       # one lightweight spec per feature, NNN-slug/spec.md (see specs/README.md)
-design/                      # LOCAL, gitignored: research + thinking-out-loud (DESIGN.md, notes)
+design/                      # LOCAL, gitignored: numbered research topics NNN-topic/ (our scratch)
 ```
 
 `src/acl_extension.cpp` is intentionally one translation unit for now: `PolicyStore` (per-instance
