@@ -51,7 +51,12 @@ manage policy), and the escape hatch could not be closed in a hardened deploymen
   never hands out scopes.
 - **ALTER** (new statements + `acl_alter_*` functions): a partial change of an **existing** object —
   a missing target is an error, unlike the `ADD`/`GRANT` upserts, and every property not named keeps
-  its value (the replacement form follows the resulting content, exactly as for `ADD`). One `SET`
+  its value (the replacement form follows the resulting content, exactly as for `ADD`). The
+  statement kind must match the object (`ALTER VIRTUAL VIEW` on a table is refused — it would drop
+  the table's RLS and projection while the catalog still displayed them), `SET MAIN` takes
+  `true`/`false` only, an issuer's `AUDIENCES` may not be emptied (use `'*'` to accept any audience
+  deliberately), and the read-modify-write runs as **one transaction on one connection**, so
+  concurrent ALTERs cannot lose an RLS predicate or a column mask. One `SET`
   per statement; several changes are several statements in one batch. Object forms carry the
   `VIRTUAL` marker so they never shadow duckdb's own `ALTER TABLE/VIEW`, which still passes through:
 
@@ -80,7 +85,9 @@ manage policy), and the escape hatch could not be closed in a hardened deploymen
   `passthrough`): no self-escalation.
 - **Anonymous `ACL ADMIN`**: allowed unconditionally in the in-memory dev mode (nothing to protect
   yet); with a catalog or the function-driver enabled it requires
-  `acl_allow_anonymous_admin=true` (setting, default false, instance-level — `SET GLOBAL`).
+  `acl_allow_anonymous_admin=true`. All three extension settings are read through the
+  `DatabaseInstance` (the parser override has no client context), so they are registered with
+  `SetScope::GLOBAL` — a session-scoped `SET` would have reported success and changed nothing.
 - **Bootstrap** needs no special machinery: the admin functions are ordinary SQL functions, so the
   gateway (which owns the connection) calls `acl_grant_admin('platform', 'passthrough')` once, then
   closes the anonymous hatch. Locking yourself out is recoverable the same way — the gateway can
@@ -90,6 +97,23 @@ manage policy), and the escape hatch could not be closed in a hardened deploymen
   no global administration through that source).
 
 ## Enforcement & security
+
+**The extension's own functions are not callable from a query.** Every `acl_*` function is denied by
+the rewriter's function seam, so a principal cannot run `SELECT acl_grant_admin('me','passthrough')`
+(which defeated the whole model — found by review, and open since spec 001 for `acl_grant_table` and
+friends). They stay available in the native context, which is not rewritten; virtual names resolve
+before the seam, so a granted vfunc named `acl_*` still works.
+
+**Handing out access is privilege administration.** A catalog-scoped `manage` edits its catalogs'
+content but may not run `GRANT|REVOKE CATALOG` or `ALTER GRANT` — otherwise it would grant itself
+`select` on the catalog it manages, one statement away from reading everything the instance can
+reach. Those need an unrestricted manage (or passthrough), as do admin-scope grants.
+
+**No widening by accident.** `AdminRights` keeps `unrestricted_manage` as its own flag instead of an
+empty-string sentinel inside the catalog set, an empty `vcat` is refused at grant time and ignored
+when reading, a catalog-scoped row in `acl.admins` stays catalog-scoped, and catalogs are matched
+**exactly** — the policy source compares `vcat` with SQL `=`, so a case-insensitive check would
+authorize a genuinely different catalog.
 
 **A nested `ACL …` is text, never a second entry.** Exactly one prefix is stripped (spec 001) and the
 inner parse runs with the override disabled, so `ACL ROLE "r" ACL NATIVE ACL ADMIN CREATE VIRTUAL
@@ -109,7 +133,11 @@ changed — a non-`ADMIN` prefix behaves exactly as before.
 
 ## Testing
 
-`test/sql/acl_admin_scopes.test` (100 assertions): the dev-mode hatch, its closure once a catalog is
+`test/sql/acl_admin_scopes.test` (125 assertions), including a regression block for every finding of
+the PR review (admin functions denied in a query and working natively, no self-grant of read, a
+catalog-scoped `acl.admins` row staying scoped, empty catalog names refused, exact catalog matching,
+`ALTER` kind validation, `SET MAIN` validation, revocation clearing per-catalog manage, an explicit
+`ACL NATIVE` never re-routed, and audiences that cannot be silently emptied): the dev-mode hatch, its closure once a catalog is
 enabled and reopening by setting, bootstrap of the first admins, refusal for a principal without a
 scope (while its plain queries still work), catalog-restricted `manage` granted as a catalog capability — including a role managing **two**
 catalogs and losing one on revoke, and managing a catalog it cannot read — (allowed in its catalog,

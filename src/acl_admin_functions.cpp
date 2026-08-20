@@ -467,15 +467,7 @@ void AclGrantAdminFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_grant_admin", "role");
 		auto scope = RequiredArg(args, 1, row, "acl_grant_admin", "scope");
-		AdminScope parsed;
-		if (StringUtil::CIEquals(scope, "passthrough")) {
-			parsed = AdminScope::PASSTHROUGH;
-		} else if (StringUtil::CIEquals(scope, "manage")) {
-			parsed = AdminScope::MANAGE;
-		} else {
-			throw InvalidInputException("acl_grant_admin: scope must be 'manage' or 'passthrough'");
-		}
-		StoreOf(state).GrantAdmin(role, parsed);
+		StoreOf(state).GrantAdmin(role, ParseAdminScope(scope));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }

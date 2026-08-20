@@ -30,6 +30,7 @@ struct AclPrefix {
 	enum class Mode { QUERY, MANAGE, NATIVE };
 	Kind kind = Kind::NONE;
 	Mode mode = Mode::QUERY;
+	bool marked = false; // an explicit `ACL [NATIVE]` marker was written
 	string value;
 	string rest;
 };
@@ -101,7 +102,8 @@ AclPrefix ParseAclPrefix(const string &query) {
 		prefix.kind = AclPrefix::Kind::ADMIN;
 		// the gateway's own hatch: native by default, management when marked (or written bare)
 		auto marked = read_marker(pos);
-		prefix.mode = marked == AclPrefix::Mode::QUERY ? AclPrefix::Mode::NATIVE : marked;
+		prefix.marked = marked != AclPrefix::Mode::QUERY;
+		prefix.mode = prefix.marked ? marked : AclPrefix::Mode::NATIVE;
 		prefix.rest = query.substr(pos);
 		return prefix;
 	}
@@ -117,6 +119,7 @@ AclPrefix ParseAclPrefix(const string &query) {
 	prefix.kind = is_role ? AclPrefix::Kind::ROLE : AclPrefix::Kind::TOKEN;
 	prefix.value = ReadQuoted(query, pos);
 	prefix.mode = read_marker(pos);
+	prefix.marked = prefix.mode != AclPrefix::Mode::QUERY;
 	prefix.rest = query.substr(pos);
 	return prefix;
 }
@@ -502,7 +505,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 //! constant argument names the catalog it touches, and whether it escalates privilege.
 struct MgmtProvenance {
 	string vcat;            // "" = not catalog-specific (roles, issuers, mappings, admin grants)
-	bool escalates = false; // admin grants: only a passthrough scope may hand out scopes
+	bool escalates = false; // admin scopes: only a passthrough scope may hand them out
+	//! catalog grants: handing out access is privilege administration, so a catalog-scoped manage
+	//! may not grant read on the catalog it manages (to itself or to anyone else)
+	bool hands_out = false;
 };
 
 MgmtProvenance ProvenanceOf(SQLStatement &statement) {
@@ -522,6 +528,10 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	auto name = StringUtil::Lower(call.FunctionName().GetIdentifierName());
 	if (name == "acl_grant_admin" || name == "acl_revoke_admin") {
 		provenance.escalates = true;
+		return provenance;
+	}
+	if (name == "acl_grant_catalog" || name == "acl_revoke_catalog" || name == "acl_alter_grant") {
+		provenance.hands_out = true;
 		return provenance;
 	}
 	auto entry = CATALOG_ARG.find(name);
@@ -557,28 +567,32 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text) {
 	return statements;
 }
 
-//! Authorize a management batch against the principal's scope (spec 009). MANAGE may run the
-//! grammar - restricted to its catalogs when the grant names one - but never hand out scopes;
-//! PASSTHROUGH may do anything.
-void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, AdminScope scope,
-                   const case_insensitive_set_t &catalogs) {
-	if (scope == AdminScope::PASSTHROUGH) {
+//! Authorize a management batch against the principal's rights (spec 009). A catalog-scoped MANAGE
+//! edits the content of its own catalogs; handing out access or admin scopes is privilege
+//! administration and needs an unrestricted manage / passthrough. PASSTHROUGH may do anything.
+void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights) {
+	if (rights.scope == AdminScope::PASSTHROUGH) {
 		return;
 	}
-	bool unrestricted = catalogs.count("") > 0;
 	for (auto &statement : statements) {
 		auto provenance = ProvenanceOf(*statement);
 		if (provenance.escalates) {
 			throw BinderException("acl admin: granting admin scopes requires a passthrough scope");
 		}
-		if (unrestricted) {
+		if (provenance.hands_out && !rights.unrestricted_manage) {
+			throw BinderException("acl admin: granting access to a catalog requires an unrestricted manage "
+			                      "scope - managing a catalog does not include handing it out");
+		}
+		if (rights.unrestricted_manage) {
 			continue;
 		}
 		if (provenance.vcat.empty()) {
 			throw BinderException(
 			    "acl admin: this statement is not catalog-specific and needs an unrestricted manage scope");
 		}
-		if (!catalogs.count(provenance.vcat)) {
+		// exact match: the policy source compares vcat with SQL `=`, so a case-insensitive check here
+		// would authorize writes into a genuinely different catalog
+		if (!rights.catalogs.count(provenance.vcat)) {
 			throw BinderException("acl admin: no manage scope for catalog \"%s\"", provenance.vcat);
 		}
 	}
@@ -593,17 +607,20 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 
 	auto mode = prefix.mode;
 	bool anonymous = prefix.kind == AclPrefix::Kind::ADMIN;
-	if (anonymous && mode == AclPrefix::Mode::NATIVE && IsMgmtStart(prefix.rest)) {
-		mode = AclPrefix::Mode::MANAGE; // the gateway may write management statements unmarked
+	if (anonymous && !prefix.marked && IsMgmtStart(prefix.rest)) {
+		// the trusted gateway may write management statements unmarked; an explicit `ACL NATIVE`
+		// means "plain SQL, do not interpret it" and must never be re-routed here
+		mode = AclPrefix::Mode::MANAGE;
 	}
 
 	Principal principal;
-	auto scope = AdminScope::PASSTHROUGH;
-	case_insensitive_set_t manage_catalogs;
+	PolicyStore::AdminRights rights;
+	rights.scope = AdminScope::PASSTHROUGH; // the anonymous hatch is god mode by definition
+	rights.unrestricted_manage = true;
 	if (anonymous) {
 		if (!store.AnonymousAdminAllowed()) {
 			throw BinderException("acl admin: a bare ACL ADMIN is disabled - authenticate the principal "
-			                      "(ACL TOKEN '<jwt>' ACL ...) or set acl_allow_anonymous_admin");
+			                      "(ACL TOKEN '<jwt>' ACL ...) or SET GLOBAL acl_allow_anonymous_admin=true");
 		}
 	} else if (mode != AclPrefix::Mode::QUERY) {
 		// leaving the virtual catalog - as management or as native SQL - is a granted capability
@@ -611,8 +628,8 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		if (!store.VerifyPrincipal(is_token, prefix.value, principal)) {
 			throw BinderException("acl_rewrite: %s verification failed", is_token ? "token" : "role");
 		}
-		scope = store.AdminScopeOf(principal, manage_catalogs);
-		if (scope == AdminScope::NONE) {
+		rights = store.AdminRightsOf(principal);
+		if (rights.scope == AdminScope::NONE) {
 			throw BinderException("acl admin: the principal has no ACL administration scope");
 		}
 	}
@@ -620,10 +637,10 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 	if (mode == AclPrefix::Mode::MANAGE) {
 		// the management grammar (spec 008): compiled to admin-function calls, no native parse
 		auto statements = ParseMgmtBatch(prefix.rest);
-		AuthorizeMgmt(statements, scope, manage_catalogs);
+		AuthorizeMgmt(statements, rights);
 		return ParserOverrideResult(std::move(statements));
 	}
-	if (mode == AclPrefix::Mode::NATIVE && scope != AdminScope::PASSTHROUGH) {
+	if (mode == AclPrefix::Mode::NATIVE && rights.scope != AdminScope::PASSTHROUGH) {
 		// a manage scope administers the ACL; running SQL outside the virtual catalog is god mode
 		throw BinderException("acl admin: native SQL outside the virtual catalog requires a passthrough scope");
 	}

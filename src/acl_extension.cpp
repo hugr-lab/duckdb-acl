@@ -51,13 +51,15 @@ void LoadInternal(ExtensionLoader &loader) {
 
 	// bounded staleness of the catalog-backed policy (spec 006): the policy_version is re-read at
 	// most once per this many milliseconds; 0 = check on every batch
+	// all three are read through DatabaseInstance (the parser override has no client context), so they
+	// are registered GLOBAL: a session-scoped SET would report success and change nothing
 	config.AddExtensionOption("acl_version_check_interval",
 	                          "acl: milliseconds between policy_version checks of the policy catalog",
-	                          LogicalType::BIGINT, Value::BIGINT(1000));
+	                          LogicalType::BIGINT, Value::BIGINT(1000), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_allow_anonymous_admin",
 	                          "acl: allow a bare `ACL ADMIN` (no principal) once a policy source is "
 	                          "enabled - the gateway's own escape hatch (spec 009)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_jwt_clock_skew", "acl: allowed clock skew in seconds for JWT exp/nbf checks",
 	                          LogicalType::BIGINT, Value::BIGINT(60));
 

@@ -15,6 +15,7 @@
 
 #include <functional>
 #include <list>
+#include <set>
 #include <unordered_map>
 
 namespace duckdb {
@@ -47,6 +48,10 @@ enum class FunctionKind : uint8_t { SCALAR, TABLE };
 //! What a principal may do with the ACL itself (spec 009). NONE is the default: the ACL is managed
 //! by the gateway, not by the roles it serves.
 enum class AdminScope : uint8_t { NONE, MANAGE, PASSTHROUGH };
+
+//! Parse/print the scope names used by the admin functions, the grammar and the policy source
+AdminScope ParseAdminScope(const string &scope);
+const char *AdminScopeName(AdminScope scope);
 
 //! One issuer's offline JWT verification config (spec 007): a row of acl.issuers, or the in-memory
 //! issuer map. Keys are data, never fetched: the gateway/admin rotates them.
@@ -180,9 +185,11 @@ struct PolicyStore {
 	void CatalogGrantAdmin(const string &role, const string &scope);
 	void CatalogRevokeAdmin(const string &role);
 	//! role -> (scope, vcat) rows of the principal; missing roles simply do not appear
-	void CatalogAdminScopes(const Principal &principal, case_insensitive_map_t<std::pair<string, string>> &out);
-	//! catalogs whose grant carries the "manage" capability for any of the principal's roles
-	void CatalogManageCatalogs(const Principal &principal, case_insensitive_set_t &out);
+	//! Both administration sources of the principal, version-cached: the catalogs whose grant carries
+	//! the "manage" capability, and the (scope, vcat) rows of acl.admins (a non-empty vcat restricts
+	//! a manage scope to that catalog; the driver may return several rows per role)
+	void CatalogAdminRights(const Principal &principal, std::set<string> &catalogs,
+	                        vector<std::pair<string, string>> &scopes);
 	bool CatalogAnonymousAdminAllowed();
 	void CatalogMapRole(const string &issuer, const string &source, const string &external_value, const string &role);
 	//! per-object caps override (the compatibility wrappers carry per-object caps, spec 006)
@@ -209,9 +216,17 @@ struct PolicyStore {
 	//! not granted here - it is a capability of the catalog grant itself ({"manage": true}).
 	void GrantAdmin(const string &role, AdminScope scope);
 	void RevokeAdmin(const string &role);
-	//! The principal's effective scope: the strongest over its roles and its catalog grants.
-	//! `catalogs_out` collects the catalogs it may manage (an empty entry = every catalog).
-	AdminScope AdminScopeOf(const Principal &principal, case_insensitive_set_t &catalogs_out);
+	//! What a principal may do with the ACL. `unrestricted_manage` is a separate flag rather than a
+	//! sentinel inside `catalogs`: an empty/odd catalog name must never widen a grant (spec 009).
+	struct AdminRights {
+		AdminScope scope = AdminScope::NONE;
+		bool unrestricted_manage = false;
+		//! catalogs this principal may manage, compared exactly - the policy source compares vcat with
+		//! SQL `=`, so authorizing case-insensitively would authorize a different catalog
+		std::set<string> catalogs;
+	};
+	//! The principal's effective rights: the strongest over its roles and its catalog grants
+	AdminRights AdminRightsOf(const Principal &principal);
 	//! Whether an anonymous `ACL ADMIN` (no principal) is still permitted: always in the in-memory
 	//! dev mode, and with a policy source only when acl_allow_anonymous_admin is on (spec 009).
 	bool AnonymousAdminAllowed();

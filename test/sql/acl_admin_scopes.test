@@ -426,6 +426,125 @@ ACL ADMIN SELECT count(*) FROM phys.main.batch_native;
 ----
 2
 
+# --- regressions found by the PR review -----------------------------------------------------------
+
+# 1. the extension's own functions are never callable from a principal's query - otherwise one
+#    statement grants itself god mode
+statement error
+ACL ROLE "analyst" SELECT acl_grant_admin('analyst', 'passthrough');
+----
+<REGEX>:.*acl_grant_admin.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT acl_grant_table('analyst', 'x', 'phys.main.orders_physical', '', '', 'select');
+----
+<REGEX>:.*acl_grant_table.*not allowed.*
+
+statement error
+ACL ROLE "platform" SELECT acl_use_db('aclcat');
+----
+<REGEX>:.*acl_use_db.*not allowed.*
+
+# ... but they still work in the native context
+query I
+ACL ADMIN SELECT acl_grant_admin('platform', 'passthrough');
+----
+true
+
+# 2. managing a catalog does not include handing it out (no self-grant of read)
+statement error
+ACL ROLE "sales_owner" ACL GRANT CATALOG sales TO ROLE sales_owner CAPS '{"select": true, "manage": true}';
+----
+<REGEX>:.*granting access to a catalog requires an unrestricted manage scope.*
+
+statement error
+ACL ROLE "sales_owner" ACL ALTER GRANT CATALOG sales TO ROLE sales_owner SET CAPS '{"select": true}';
+----
+<REGEX>:.*requires an unrestricted manage scope.*
+
+# 3. a catalog-scoped row in acl.admins stays catalog-scoped (it must not widen to global)
+statement ok
+ACL ADMIN CREATE ROLE scoped;
+
+statement ok
+ACL ADMIN INSERT INTO aclcat.acl.admins VALUES ('scoped', 'manage', 'sales');
+
+statement ok
+ACL ROLE "scoped" ACL ADD TABLE phys.main.orders_physical AS sales.scoped_ok;
+
+statement error
+ACL ROLE "scoped" ACL ADD TABLE phys.main.orders_physical AS hr.scoped_leak;
+----
+<REGEX>:.*no manage scope for catalog "hr".*
+
+statement error
+ACL ROLE "scoped" ACL CREATE ROLE scoped_role;
+----
+<REGEX>:.*not catalog-specific.*
+
+# 4. an empty catalog name is not a catalog and never means "all of them"
+statement error
+ACL ADMIN GRANT CATALOG '' TO ROLE scoped CAPS '{"manage": true}';
+----
+<REGEX>:.*(expected a catalog name|needs a catalog name).*
+
+# 5. catalog names are matched exactly: manage on "Sales" is not manage on "sales"
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG Sales;
+
+statement ok
+ACL ADMIN CREATE ROLE caseowner;
+
+statement ok
+SELECT acl_grant_catalog('caseowner', 'Sales', '{"manage": true}', false);
+
+statement error
+ACL ROLE "caseowner" ACL ADD TABLE phys.main.orders_physical AS sales.injected;
+----
+<REGEX>:.*no manage scope for catalog "sales".*
+
+# 6. ALTER cannot silently change an object's kind (which would drop its RLS and projection)
+statement error
+ACL ADMIN ALTER VIRTUAL VIEW sales.orders SET AS 'SELECT * FROM phys.main.orders_physical';
+----
+<REGEX>:.*is a table - use ALTER VIRTUAL TABLE.*
+
+# 7. SET MAIN takes true/false, not anything that is not "true"
+statement error
+ACL ADMIN ALTER GRANT CATALOG sales TO ROLE analyst SET MAIN 1;
+----
+<REGEX>:.*MAIN expects true or false.*
+
+# 9. revoking administration removes the per-catalog manage capability as well
+statement ok
+ACL ADMIN REVOKE ADMIN FROM ROLE sales_owner;
+
+statement error
+ACL ROLE "sales_owner" ACL ADD TABLE phys.main.orders_physical AS sales.after_revoke;
+----
+<REGEX>:.*no ACL administration scope.*
+
+# 11. an explicit ACL NATIVE marker is never re-routed into the management grammar
+statement ok
+ACL ADMIN ACL NATIVE CREATE TABLE phys.main.native_marker(x INT);
+
+query I
+ACL ADMIN SELECT count(*) FROM phys.main.native_marker;
+----
+0
+
+# 12. an issuer cannot silently lose its audience check
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/aud' KEYS '{"keys":[]}' AUDIENCES 'api://x' ALGS 'RS256';
+
+statement error
+ACL ADMIN ALTER ISSUER 'https://issuer.test/aud' SET AUDIENCES '';
+----
+<REGEX>:.*at least one audience.*
+
+statement ok
+ACL ADMIN ALTER ISSUER 'https://issuer.test/aud' SET AUDIENCES '*';
+
 # --- closing the anonymous hatch again ------------------------------------------------------------
 
 statement ok

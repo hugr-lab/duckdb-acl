@@ -17,6 +17,8 @@
 #include "duckdb/main/database.hpp"
 #include "yyjson.hpp"
 
+#include <set>
+
 #include <chrono>
 
 namespace duckdb {
@@ -149,7 +151,9 @@ struct CatalogBackend {
 	case_insensitive_map_t<case_insensitive_map_t<string>> claims_cache; // role -> claims
 	case_insensitive_set_t claims_loaded;
 	case_insensitive_map_t<std::pair<bool, IssuerConfig>> issuer_cache; // issuer -> (found, config)
-	case_insensitive_map_t<vector<GrantRow>> fn_grants;                 // function mode: role -> rows
+	//! rolesig -> (manage catalogs, acl.admins rows); administration statements hit this per batch
+	std::unordered_map<string, std::pair<std::set<string>, vector<std::pair<string, string>>>> rights_cache;
+	case_insensitive_map_t<vector<GrantRow>> fn_grants; // function mode: role -> rows
 	case_insensitive_set_t fn_grants_loaded;
 
 	string Tbl(const char *table) {
@@ -173,6 +177,58 @@ struct CatalogBackend {
 			throw BinderException("acl catalog: query failed: %s", result->GetError());
 		}
 		return result;
+	}
+
+	//! Run a read-modify-write as ONE transaction on ONE connection: `body` receives a query callback
+	//! (its reads see the same snapshot the writes commit into) and the statement sink. Without this,
+	//! two concurrent ALTERs of the same object read the same pre-image and the second whole-row
+	//! rewrite silently discards the first - which can drop an RLS predicate or a column mask.
+	void
+	WriteWithReads(const std::function<void(const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &,
+	                                        vector<string> &)> &body) {
+		auto instance = Db();
+		Connection con(*instance);
+		auto begin = con.Query("BEGIN");
+		if (begin->HasError()) {
+			throw BinderException("acl catalog: %s", begin->GetError());
+		}
+		auto rollback = [&]() {
+			con.Query("ROLLBACK");
+		};
+		vector<string> statements;
+		try {
+			auto read = [&](const string &sql) {
+				auto result = con.Query(sql);
+				if (result->HasError()) {
+					throw BinderException("acl catalog: query failed: %s", result->GetError());
+				}
+				return result;
+			};
+			body(read, statements);
+		} catch (...) {
+			rollback();
+			throw;
+		}
+		for (auto &sql : statements) {
+			auto result = con.Query(sql);
+			if (result->HasError()) {
+				rollback();
+				throw BinderException("acl catalog: write failed: %s", result->GetError());
+			}
+		}
+		auto bump = con.Query("UPDATE " + Tbl("meta") +
+		                      " SET \"value\" = CAST(CAST(\"value\" AS BIGINT) + 1 AS VARCHAR)"
+		                      " WHERE \"key\" = 'policy_version'");
+		if (bump->HasError()) {
+			rollback();
+			throw BinderException("acl catalog: version bump failed: %s", bump->GetError());
+		}
+		auto commit = con.Query("COMMIT");
+		if (commit->HasError()) {
+			throw BinderException("acl catalog: %s", commit->GetError());
+		}
+		lock_guard<mutex> guard(lock);
+		checked_once = false;
 	}
 
 	//! Run admin write statements + the policy_version bump in one transaction
@@ -245,6 +301,7 @@ struct CatalogBackend {
 			claims_cache.clear();
 			claims_loaded.clear();
 			issuer_cache.clear();
+			rights_cache.clear();
 			fn_grants.clear();
 			fn_grants_loaded.clear();
 		}
@@ -776,14 +833,38 @@ struct CatalogBackend {
 
 	//! The catalogs the principal may MANAGE: a capability of the catalog grant itself, so a role can
 	//! manage many catalogs (and manage one without being able to read it)
-	void ManageCatalogs(const Principal &principal, case_insensitive_set_t &out) {
+	//! Load (and cache) both administration sources for the principal in one go
+	void LoadRights(const Principal &principal, std::set<string> &catalogs, vector<std::pair<string, string>> &scopes) {
+		if (principal.roles.empty()) {
+			return;
+		}
+		EnsureFresh();
+		auto key = RoleSig(principal);
+		{
+			lock_guard<mutex> guard(lock);
+			auto entry = rights_cache.find(key);
+			if (entry != rights_cache.end()) {
+				catalogs = entry->second.first;
+				scopes = entry->second.second;
+				return;
+			}
+		}
+		ManageCatalogs(principal, catalogs);
+		AdminScopes(principal, scopes);
+		lock_guard<mutex> guard(lock);
+		ClearIfOversized(rights_cache);
+		rights_cache[key] = {catalogs, scopes};
+	}
+
+	void ManageCatalogs(const Principal &principal, std::set<string> &out) {
 		if (principal.roles.empty()) {
 			return;
 		}
 		EnsureFresh();
 		if (function_mode) {
 			for (auto &grant : Grants(principal.roles)) {
-				if (ParseCaps(grant.caps).count("manage")) {
+				// an empty catalog name is not a catalog: never let it stand for "all of them"
+				if (!grant.vcat.empty() && ParseCaps(grant.caps).count("manage")) {
 					out.insert(grant.vcat);
 				}
 			}
@@ -793,14 +874,15 @@ struct CatalogBackend {
 		                    LitList(principal.roles) + ")");
 		for (idx_t row = 0; row < result->RowCount(); row++) {
 			auto caps = result->GetValue(1, row);
-			if (ParseCaps(caps.IsNull() ? string() : caps.ToString()).count("manage")) {
-				out.insert(result->GetValue(0, row).ToString());
+			auto vcat = result->GetValue(0, row).ToString();
+			if (!vcat.empty() && ParseCaps(caps.IsNull() ? string() : caps.ToString()).count("manage")) {
+				out.insert(vcat);
 			}
 		}
 	}
 
 	//! The admin scopes of the principal's roles; the function-driver may serve them through a slot
-	void AdminScopes(const Principal &principal, case_insensitive_map_t<std::pair<string, string>> &out) {
+	void AdminScopes(const Principal &principal, vector<std::pair<string, string>> &out) {
 		if (principal.roles.empty()) {
 			return;
 		}
@@ -818,8 +900,7 @@ struct CatalogBackend {
 		}
 		for (idx_t row = 0; row < result->RowCount(); row++) {
 			auto vcat = result->GetValue(2, row);
-			out[result->GetValue(0, row).ToString()] = {result->GetValue(1, row).ToString(),
-			                                            vcat.IsNull() ? string() : vcat.ToString()};
+			out.emplace_back(result->GetValue(1, row).ToString(), vcat.IsNull() ? string() : vcat.ToString());
 		}
 	}
 
@@ -1010,6 +1091,30 @@ void PolicyStore::CatalogCreate(const string &vcat, const string &comment) {
 	                "INSERT INTO " + catalog->Tbl("catalogs") + " VALUES (" + Lit(vcat) + ", " + Lit(comment) + ")"});
 }
 
+namespace {
+
+//! The statements that (re)write one relation - shared by ADD and the transactional ALTER
+vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, const string &vname, const string &form,
+                                  const string &phys, const string &view_sql, const string &rls,
+                                  const vector<std::pair<string, string>> &columns) {
+	vector<string> statements;
+	statements.push_back("DELETE FROM " + catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                     " AND \"vname\" = " + Lit(vname));
+	statements.push_back("DELETE FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                     " AND \"vname\" = " + Lit(vname));
+	statements.push_back("INSERT INTO " + catalog.Tbl("relations") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) +
+	                     ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) + ", " + Lit(rls) + ")");
+	idx_t pos = 0;
+	for (auto &column : columns) {
+		statements.push_back("INSERT INTO " + catalog.Tbl("relation_columns") + " VALUES (" + Lit(vcat) + ", " +
+		                     Lit(vname) + ", " + std::to_string(pos++) + ", " + Lit(column.first) + ", " +
+		                     Lit(column.second) + ")");
+	}
+	return statements;
+}
+
+} // namespace
+
 void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
                                      const string &view_sql, const string &rls,
                                      const vector<std::pair<string, string>> &columns) {
@@ -1049,6 +1154,9 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 
 void PolicyStore::CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main) {
 	RequireCatalog(catalog, "acl_grant_catalog");
+	if (vcat.empty()) {
+		throw BinderException("acl admin: a grant needs a catalog name");
+	}
 	acl_detail::ParseCaps(caps_json); // validate before persisting
 	catalog->Write({"DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat),
@@ -1114,40 +1222,51 @@ unique_ptr<MaterializedQueryResult> RequireRow(CatalogBackend &catalog, const st
 void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, const string &field,
                                        const string &value, const vector<std::pair<string, string>> &columns) {
 	RequireCatalog(catalog, "acl_alter_relation");
-	auto current = RequireRow(*catalog,
-	                          "SELECT \"form\", \"phys\", \"view_sql\", \"rls\" FROM " + catalog->Tbl("relations") +
-	                              " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname),
-	                          "relation \"" + vcat + "." + vname + "\"");
-	auto form = current->GetValue(0, 0).ToString();
-	auto phys = current->GetValue(1, 0);
-	auto view_sql = current->GetValue(2, 0);
-	auto rls = current->GetValue(3, 0);
-	string new_phys = phys.IsNull() ? string() : phys.ToString();
-	string new_view = view_sql.IsNull() ? string() : view_sql.ToString();
-	string new_rls = rls.IsNull() ? string() : rls.ToString();
-	auto new_columns = columns;
-	if (field != "columns") { // keep the current projection when another property is being set
-		auto rows =
-		    catalog->Query("SELECT \"name\", \"expr\" FROM " + catalog->Tbl("relation_columns") +
-		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
-		new_columns.clear();
-		for (idx_t row = 0; row < rows->RowCount(); row++) {
-			auto expr = rows->GetValue(1, row);
-			new_columns.emplace_back(rows->GetValue(0, row).ToString(), expr.IsNull() ? string() : expr.ToString());
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto current = read("SELECT \"form\", \"phys\", \"view_sql\", \"rls\" FROM " + catalog->Tbl("relations") +
+		                    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		if (current->RowCount() == 0) {
+			throw BinderException("acl admin: relation \"%s.%s\" does not exist", vcat, vname);
 		}
-	}
-	if (field == "phys") {
-		new_phys = value;
-	} else if (field == "rls") {
-		new_rls = value;
-	} else if (field == "view") {
-		new_view = value;
-	} else if (field != "columns") {
-		throw BinderException("acl admin: unknown relation property \"%s\"", field);
-	}
-	// the form follows the content, exactly as it does for ADD
-	string new_form = !new_view.empty() ? "view" : (new_columns.empty() && new_rls.empty() ? "alias" : "subquery");
-	CatalogAddRelation(vcat, vname, new_form, new_phys, new_view, new_rls, new_columns);
+		auto form = current->GetValue(0, 0).ToString();
+		// the statement kind must match what the object is: silently turning a masked/RLS table into
+		// a view (or vice versa) would drop enforcement while the catalog still shows it
+		bool target_is_view = form == "view";
+		if ((field == "view") != target_is_view) {
+			throw BinderException("acl admin: \"%s.%s\" is %s - use ALTER VIRTUAL %s", vcat, vname,
+			                      target_is_view ? "a view" : "a table", target_is_view ? "VIEW" : "TABLE");
+		}
+		auto phys = current->GetValue(1, 0);
+		auto view_sql = current->GetValue(2, 0);
+		auto rls = current->GetValue(3, 0);
+		string new_phys = phys.IsNull() ? string() : phys.ToString();
+		string new_view = view_sql.IsNull() ? string() : view_sql.ToString();
+		string new_rls = rls.IsNull() ? string() : rls.ToString();
+		vector<std::pair<string, string>> new_columns;
+		if (field == "columns") {
+			new_columns = columns;
+		} else { // keep the current projection when another property is being set
+			auto rows = read("SELECT \"name\", \"expr\" FROM " + catalog->Tbl("relation_columns") +
+			                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+			for (idx_t row = 0; row < rows->RowCount(); row++) {
+				auto expr = rows->GetValue(1, row);
+				new_columns.emplace_back(rows->GetValue(0, row).ToString(), expr.IsNull() ? string() : expr.ToString());
+			}
+		}
+		if (field == "phys") {
+			new_phys = value;
+		} else if (field == "rls") {
+			new_rls = value;
+		} else if (field == "view") {
+			new_view = value;
+		} else if (field != "columns") {
+			throw BinderException("acl admin: unknown relation property \"%s\"", field);
+		}
+		// the form follows the content, exactly as it does for ADD
+		string new_form = !new_view.empty() ? "view" : (new_columns.empty() && new_rls.empty() ? "alias" : "subquery");
+		statements = RelationStatements(*catalog, vcat, vname, new_form, new_phys, new_view, new_rls, new_columns);
+	});
 }
 
 void PolicyStore::CatalogAlterSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path) {
@@ -1197,6 +1316,9 @@ void PolicyStore::CatalogAlterGrant(const string &role, const string &vcat, cons
 	if (field == "caps") {
 		caps = value;
 	} else if (field == "main") {
+		if (!StringUtil::CIEquals(value, "true") && !StringUtil::CIEquals(value, "false")) {
+			throw BinderException("acl admin: MAIN expects true or false, got \"%s\"", value);
+		}
 		is_main = StringUtil::CIEquals(value, "true");
 	} else {
 		throw BinderException("acl admin: unknown grant property \"%s\"", field);
@@ -1224,6 +1346,11 @@ void PolicyStore::CatalogAlterIssuer(const string &issuer, const string &field, 
 		config.keys_json = value;
 	} else if (field == "audiences") {
 		config.audiences = split_csv(value);
+		if (config.audiences.empty()) {
+			// an empty allowlist means "accept any aud" downstream - never let that happen silently
+			throw BinderException("acl admin: AUDIENCES must list at least one audience (use '*' to "
+			                      "accept any)");
+		}
 	} else if (field == "algs") {
 		config.algs.clear();
 		for (auto &alg : split_csv(value)) {
@@ -1247,16 +1374,31 @@ void PolicyStore::CatalogGrantAdmin(const string &role, const string &scope) {
 
 void PolicyStore::CatalogRevokeAdmin(const string &role) {
 	RequireCatalog(catalog, "acl_revoke_admin");
-	catalog->Write({"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role)});
+	// de-privileging a role must remove ALL of its administration: the global scope and the
+	// per-catalog manage capabilities, which live in the catalog grants
+	auto grants = catalog->Query("SELECT \"vcat\", \"caps\" FROM " + catalog->Tbl("role_catalogs") +
+	                             " WHERE \"role\" = " + Lit(role));
+	vector<string> statements = {"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role)};
+	for (idx_t row = 0; row < grants->RowCount(); row++) {
+		auto caps_value = grants->GetValue(1, row);
+		auto caps = acl_detail::ParseCaps(caps_value.IsNull() ? string() : caps_value.ToString());
+		if (!caps.erase("manage")) {
+			continue;
+		}
+		vector<string> kept;
+		for (auto &cap : caps) {
+			kept.push_back("\"" + cap + "\": true");
+		}
+		statements.push_back("UPDATE " + catalog->Tbl("role_catalogs") + " SET \"caps\" = " +
+		                     Lit("{" + StringUtil::Join(kept, ", ") + "}") + " WHERE \"role\" = " + Lit(role) +
+		                     " AND \"vcat\" = " + Lit(grants->GetValue(0, row).ToString()));
+	}
+	catalog->Write(statements);
 }
 
-void PolicyStore::CatalogAdminScopes(const Principal &principal,
-                                     case_insensitive_map_t<std::pair<string, string>> &out) {
-	catalog->AdminScopes(principal, out);
-}
-
-void PolicyStore::CatalogManageCatalogs(const Principal &principal, case_insensitive_set_t &out) {
-	catalog->ManageCatalogs(principal, out);
+void PolicyStore::CatalogAdminRights(const Principal &principal, std::set<string> &catalogs,
+                                     vector<std::pair<string, string>> &scopes) {
+	catalog->LoadRights(principal, catalogs, scopes);
 }
 
 bool PolicyStore::CatalogAnonymousAdminAllowed() {
