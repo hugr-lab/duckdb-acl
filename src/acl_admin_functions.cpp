@@ -109,6 +109,16 @@ void AclUseDbFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! acl_use_functions(slot_map_json): switch the store to the function-driver policy source - the
+//! contract slots name registered table functions; arguments carry the selection keys (spec 008)
+void AclUseFunctionsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto map_json = RequiredArg(args, 0, row, "acl_use_functions", "slot map");
+		StoreOf(state).EnableFunctions(DbOf(state), map_json);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
 //! acl_create_catalog(vcat [, comment]): register a virtual catalog (a shared tree of virtual names)
 void AclCreateCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -458,6 +468,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	const LogicalType &b = LogicalType::BOOLEAN;
 	// catalog backend control + catalog-model admin (spec 006)
 	register_admin_set("acl_use_db", {{v}, {v, v}, {v, v, b}}, AclUseDbFunc);
+	register_admin("acl_use_functions", {v}, AclUseFunctionsFunc);
 	register_admin_set("acl_create_catalog", {{v}, {v, v}}, AclCreateCatalogFunc);
 	register_admin("acl_add_relation", {v, v, v, v, v}, AclAddRelationFunc);
 	register_admin("acl_add_view", {v, v, v}, AclAddViewFunc);
