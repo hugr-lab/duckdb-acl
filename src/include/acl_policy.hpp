@@ -167,6 +167,16 @@ struct PolicyStore {
 	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main);
 	void CatalogRevoke(const string &role, const string &vcat);
 	void CatalogDropRelation(const string &vcat, const string &vname);
+	// DROP of the remaining virtual-catalog elements (spec 010). Dropping a catalog removes its own
+	// definitions always; the role grants pointing at it need `cascade`, so an accidental drop cannot
+	// silently revoke people's access.
+	void CatalogDropCatalog(const string &vcat, bool cascade);
+	void CatalogDropSchemaAlias(const string &vcat, const string &alias_path);
+	void CatalogDropFunction(const string &vcat, const string &vname, const string &kind);
+	void CatalogDropRole(const string &role);
+	void CatalogDropIssuer(const string &issuer);
+	void CatalogDropRoleMapping(const string &issuer, const string &source, const string &external_value,
+	                            const string &role);
 	void CatalogDefineRole(const string &role, const case_insensitive_map_t<string> &claims);
 	//! remove=true deletes the gate row (fall back to the default denylist); otherwise upserts it
 	void CatalogSetFunctionGate(const string &name, bool allowed, bool remove);

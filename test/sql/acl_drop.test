@@ -1,0 +1,256 @@
+# name: test/sql/acl_drop.test
+# description: DROP of virtual-catalog elements (spec 010) - cleanup with cascades; what was created
+#   can be removed without leaving dangling grants or resolvable names
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100), (2, 'globex', 200);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+# --- build a full catalog ------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS 'tenant=acme';
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS 'id,amount' RLS 'tenant = acl_claim(''tenant'')';
+
+statement ok
+ACL ADMIN ADD VIEW sales.stats AS 'SELECT count(*) AS n FROM phys.main.orders_physical';
+
+statement ok
+ACL ADMIN ADD SCHEMA phys.main AS sales.raw;
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.report MACRO 'SELECT id FROM phys.main.orders_physical WHERE amount >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD SCALAR sales.shout MACRO 'upper(acl_arg(1))';
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{"select": true}' MAIN;
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/d' KEYS '{"keys":[]}' AUDIENCES 'api://d' ALGS 'RS256' ROLE CLAIM 'groups';
+
+statement ok
+ACL ADMIN MAP GROUP 'g-1' FROM ISSUER 'https://issuer.test/d' TO ROLE analyst;
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM orders;
+----
+1
+
+# --- drop the pieces ------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCALAR sales.shout;
+
+statement error
+ACL ROLE "analyst" SELECT shout('x');
+----
+<REGEX>:.*(not allowed|does not exist|Function with name shout).*
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE FUNCTION sales.report;
+
+statement error
+ACL ROLE "analyst" SELECT * FROM report(1);
+----
+<REGEX>:.*(not allowed|does not exist|Table Function with name report).*
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCHEMA sales.raw;
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM raw.orders_physical;
+----
+<REGEX>:.*no access to object.*
+
+statement ok
+ACL ADMIN DROP VIRTUAL VIEW sales.stats;
+
+statement error
+ACL ROLE "analyst" SELECT * FROM stats;
+----
+<REGEX>:.*no access to object.*
+
+# dropping something that is not there is an error, not a silent success
+statement error
+ACL ADMIN DROP VIRTUAL SCALAR sales.nothere;
+----
+<REGEX>:.*scalar function "sales.nothere" does not exist.*
+
+statement error
+ACL ADMIN DROP ROLE nobody;
+----
+<REGEX>:.*role "nobody" does not exist.*
+
+# --- a catalog still granted to someone is not dropped by accident --------------------------------
+
+statement error
+ACL ADMIN DROP VIRTUAL CATALOG sales;
+----
+<REGEX>:.*still granted to analyst - repeat with CASCADE.*
+
+# the refusal changed nothing
+query I
+ACL ROLE "analyst" SELECT count(*) FROM orders;
+----
+1
+
+statement ok
+ACL ADMIN DROP VIRTUAL CATALOG sales CASCADE;
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM orders;
+----
+<REGEX>:.*no access to object.*
+
+# nothing dangles: definitions and grants are gone together
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'sales';
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.relation_columns WHERE vcat = 'sales';
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.role_catalogs WHERE vcat = 'sales';
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.functions WHERE vcat = 'sales';
+----
+0
+
+# --- roles, issuers and mappings ------------------------------------------------------------------
+
+statement ok
+ACL ADMIN DROP MAP GROUP 'g-1' FROM ISSUER 'https://issuer.test/d' TO ROLE analyst;
+
+query I
+SELECT count(*) FROM aclcat.acl.role_mappings;
+----
+0
+
+statement error
+ACL ADMIN DROP MAP GROUP 'g-1' FROM ISSUER 'https://issuer.test/d' TO ROLE analyst;
+----
+<REGEX>:.*no mapping of group "g-1".*
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG hr;
+
+statement ok
+ACL ADMIN GRANT CATALOG hr TO ROLE analyst CAPS '{"select": true}';
+
+statement ok
+SELECT acl_grant_admin('analyst', 'manage');
+
+statement ok
+ACL ADMIN DROP ROLE analyst;
+
+# every trace of the role is gone
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role = 'analyst';
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.role_catalogs WHERE role = 'analyst';
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.role_claims WHERE role = 'analyst';
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.admins WHERE role = 'analyst';
+----
+0
+
+statement ok
+ACL ADMIN CREATE ROLE analyst2;
+
+statement ok
+ACL ADMIN MAP CLAIM 'ops' FROM ISSUER 'https://issuer.test/d' TO ROLE analyst2;
+
+statement ok
+ACL ADMIN DROP ISSUER 'https://issuer.test/d';
+
+# the issuer's mappings went with it
+query I
+SELECT count(*) FROM aclcat.acl.issuers;
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.role_mappings;
+----
+0
+
+# --- authorization: a catalog-scoped manage cleans inside its catalog, not the catalog itself ------
+
+statement ok
+ACL ADMIN CREATE ROLE owner;
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS hr.people;
+
+statement ok
+SELECT acl_grant_catalog('owner', 'hr', '{"manage": true}', false);
+
+statement ok
+ACL ROLE "owner" ACL DROP VIRTUAL TABLE hr.people;
+
+statement error
+ACL ROLE "owner" ACL DROP VIRTUAL CATALOG hr CASCADE;
+----
+<REGEX>:.*requires an unrestricted manage scope.*
+
+statement error
+ACL ROLE "owner" ACL DROP ROLE analyst2;
+----
+<REGEX>:.*not catalog-specific.*
+
+# --- the whole catalog can be emptied -------------------------------------------------------------
+
+statement ok
+ACL ADMIN DROP VIRTUAL CATALOG hr CASCADE;
+
+statement ok
+ACL ADMIN DROP ROLE analyst2; DROP ROLE owner;
+
+query I
+SELECT (SELECT count(*) FROM aclcat.acl.catalogs) + (SELECT count(*) FROM aclcat.acl.roles) + (SELECT count(*) FROM aclcat.acl.relations) + (SELECT count(*) FROM aclcat.acl.issuers);
+----
+0

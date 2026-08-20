@@ -247,7 +247,10 @@ bool IsMgmtStart(const string &text) {
 			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
 			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "grant");
 		}
-		return StringUtil::CIEquals(second, "relation");
+		// DROP: our own forms carry VIRTUAL, and duckdb has no DROP ROLE/ISSUER/MAP/RELATION
+		return StringUtil::CIEquals(second, "relation") || StringUtil::CIEquals(second, "virtual") ||
+		       StringUtil::CIEquals(second, "role") || StringUtil::CIEquals(second, "issuer") ||
+		       StringUtil::CIEquals(second, "map");
 	}
 	return false;
 }
@@ -493,10 +496,60 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		throw BinderException("acl admin: unknown ALTER VIRTUAL target");
 	}
 	if (StringUtil::CIEquals(keyword, "drop")) {
-		s.Expect("relation");
-		string vcat, vname;
-		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-		return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname)});
+		if (s.Accept("relation")) { // the spec-008 spelling, kept
+			string vcat, vname;
+			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname)});
+		}
+		if (s.Accept("role")) {
+			return MakeAdminCall("acl_drop_role", {Value(s.Word("a role name"))});
+		}
+		if (s.Accept("issuer")) {
+			return MakeAdminCall("acl_drop_issuer", {Value(s.Quoted("issuer"))});
+		}
+		if (s.Accept("map")) { // DROP MAP GROUP|CLAIM '<value>' FROM ISSUER '...' TO ROLE r
+			bool is_group = s.Accept("group");
+			if (!is_group) {
+				s.Expect("claim");
+			}
+			auto external = s.Quoted("external value");
+			s.Expect("from");
+			s.Expect("issuer");
+			auto issuer = s.Quoted("issuer");
+			s.Expect("to");
+			s.Expect("role");
+			auto role = s.Word("a role name");
+			return MakeAdminCall("acl_drop_role_mapping", {Value(issuer), Value(is_group ? "group" : "claim-value"),
+			                                               Value(external), Value(role)});
+		}
+		s.Expect("virtual");
+		if (s.Accept("catalog")) { // DROP VIRTUAL CATALOG c [CASCADE]
+			auto vcat = s.Word("a catalog name");
+			bool cascade = s.Accept("cascade");
+			return MakeAdminCall("acl_drop_catalog", {Value(vcat), Value::BOOLEAN(cascade)});
+		}
+		if (s.Accept("schema")) {
+			string vcat, alias;
+			SplitVirtual(s.Dotted("a virtual alias"), vcat, alias);
+			return MakeAdminCall("acl_drop_schema_alias", {Value(vcat), Value(alias)});
+		}
+		bool scalar = s.Accept("scalar");
+		if (scalar || s.Accept("table")) {
+			bool table_function = !scalar && s.Accept("function");
+			string vcat, vname;
+			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			if (scalar || table_function) {
+				return MakeAdminCall("acl_drop_function",
+				                     {Value(vcat), Value(vname), Value(scalar ? "scalar" : "table")});
+			}
+			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname)});
+		}
+		if (s.Accept("view")) {
+			string vcat, vname;
+			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname)});
+		}
+		throw BinderException("acl admin: unknown DROP VIRTUAL target");
 	}
 	throw BinderException("acl admin: unknown management statement \"%s\"", keyword);
 }
@@ -521,6 +574,8 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	    {"acl_define_issuer", -1},     {"acl_map_role", -1},          {"acl_alter_relation", 0},
 	    {"acl_alter_schema_alias", 0}, {"acl_alter_function", 0},     {"acl_alter_catalog", 0},
 	    {"acl_alter_grant", 1},        {"acl_alter_role", -1},        {"acl_alter_issuer", -1},
+	    {"acl_drop_schema_alias", 0},  {"acl_drop_function", 0},      {"acl_drop_role", -1},
+	    {"acl_drop_issuer", -1},       {"acl_drop_role_mapping", -1},
 	};
 	MgmtProvenance provenance;
 	auto &select = statement.Cast<SelectStatement>().node->Cast<SelectNode>();
@@ -530,7 +585,10 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 		provenance.escalates = true;
 		return provenance;
 	}
-	if (name == "acl_grant_catalog" || name == "acl_revoke_catalog" || name == "acl_alter_grant") {
+	if (name == "acl_grant_catalog" || name == "acl_revoke_catalog" || name == "acl_alter_grant" ||
+	    name == "acl_drop_catalog") {
+		// dropping a catalog takes it away from everyone who holds it, so it is privilege
+		// administration too - a scope over the catalog's content does not include destroying it
 		provenance.hands_out = true;
 		return provenance;
 	}
