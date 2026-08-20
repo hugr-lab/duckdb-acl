@@ -157,6 +157,10 @@ closed. Bounded staleness is explicit and configurable (`acl_version_check_inter
   (sqlite_scanner is pinned in the submodule config), **mysql** (when the submodule pin re-enables
   mysql_scanner), **SQL Server** (scenario written, skips until the mssql duckdb-main compat build
   lands), and a **persistent duckdb file**.
+- **airport-go**: a Go Arrow Flight service implementing this catalog schema, attached through
+  duckdb's airport extension + `acl_use_db` — the policy catalog served remotely *with* filter
+  pushdown (which C-API UDFs/views do not get); the service-shaped external mode next to the
+  function-driver (spec 008).
 - 007: JWT verification (issuers, role mappings, EntraID), real multi-role principals.
 - 008: function-driver (`acl_use_functions`, explicit slot map) + `ACL ADMIN` management grammar.
 - 009: god-mode hardening (`acl.admins`).
