@@ -75,6 +75,46 @@ void DollarParamAsVfuncArgument(Connection &con) {
 	}
 }
 
+//! spec 011: an INSERT into a relation a grant narrowed is re-projected through a subquery, so the
+//! grant's value columns are assigned. The user's parameters must survive that restructuring - same
+//! count, same order, same bound values - and the rewrite must still add none of its own.
+void ParamsThroughInjectedInsert() {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Exec(con, "LOAD acl");
+	Exec(con, "ATTACH ':memory:' AS phys");
+	Exec(con, "CREATE TABLE phys.main.t(id INT, tenant VARCHAR, amount INT)");
+	Exec(con, "ATTACH ':memory:' AS aclcat");
+	Exec(con, "SELECT acl_use_db('aclcat', 'acl', true)");
+	Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
+	Exec(con, "SET allow_parser_override_extension='fallback'");
+	Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG sales");
+	Exec(con, "ACL ADMIN CREATE ROLE writer CLAIMS 'tenant=acme'");
+	Exec(con, "ACL ADMIN ADD TABLE phys.main.t AS sales.t");
+	Exec(con, "ACL ADMIN GRANT CATALOG sales TO ROLE writer CAPS '{\"select\": true, \"insert\": true}' MAIN");
+	Exec(con, "ACL ADMIN GRANT TABLE sales.t TO ROLE writer CAPS '{\"select\": true, \"insert\": true}' "
+	          "COLUMNS 'id,amount,tenant=acl_claim(''tenant'')'");
+
+	auto prepared = con.Prepare("ACL ROLE \"writer\" INSERT INTO t(id, amount) VALUES ($1, $2)");
+	if (!CheckOk(*prepared, "injected INSERT prepares")) {
+		return;
+	}
+	Check(prepared->GetParameterCount() == 2, "injected INSERT: exactly two (user) parameters");
+	auto result = prepared->Execute(7, 700);
+	if (!CheckOk(*result, "injected INSERT executes")) {
+		return;
+	}
+	// the parameters landed in their own columns, and the grant assigned the third
+	auto rows = con.Query("SELECT id FROM phys.main.t WHERE tenant = 'acme' AND amount = 700");
+	CheckColumn(*rows, {7}, "injected INSERT: $1/$2 bound in order, tenant assigned from the claim");
+	// re-execute: the injected value stays a constant while the parameters rebind
+	result = prepared->Execute(8, 800);
+	if (CheckOk(*result, "injected INSERT re-executes")) {
+		auto again = con.Query("SELECT id FROM phys.main.t WHERE tenant = 'acme' ORDER BY id");
+		CheckColumn(*again, {7, 8}, "injected INSERT: the second row is assigned the same claim value");
+	}
+}
+
 void Run() {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -96,6 +136,9 @@ void Run() {
 	Scenario("dollar-in-outer-where", [&]() { DollarParamInOuterWhere(con); });
 	Scenario("question-mark", [&]() { QuestionMarkParam(con); });
 	Scenario("dollar-as-vfunc-argument", [&]() { DollarParamAsVfuncArgument(con); });
+	// its own instance: the grant policy needs a policy catalog, and switching the store mid-test
+	// would change what the scenarios above resolve against
+	Scenario("params-through-injected-insert", []() { ParamsThroughInjectedInsert(); });
 }
 
 } // namespace

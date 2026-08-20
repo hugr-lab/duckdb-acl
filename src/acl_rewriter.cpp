@@ -215,7 +215,7 @@ private:
 			}
 			// a grant's value column is assigned, not suggested: overriding the SET keeps the row
 			// inside the principal's slice, and the predicate keeps the statement there too
-			for (idx_t i = 0; i < node.set_info->columns.size(); i++) {
+			for (idx_t i = 0; i < node.set_info->columns.size() && i < node.set_info->expressions.size(); i++) {
 				for (auto &injection : policy.injections) {
 					if (StringUtil::CIEquals(injection.first, node.set_info->columns[i].GetIdentifierName())) {
 						node.set_info->expressions[i] = InjectedValue(injection, vname);
@@ -583,6 +583,9 @@ private:
 		}
 		if (node.on_conflict_info) {
 			Deny("insert into \"" + vname + "\" cannot use ON CONFLICT under a column policy");
+		}
+		if (!node.select_statement) {
+			Deny("insert into \"" + vname + "\" has no source to apply the grant policy to");
 		}
 		for (auto &column : node.columns) {
 			RequireWritableColumn(policy, column, vname);

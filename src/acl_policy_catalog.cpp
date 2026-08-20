@@ -148,8 +148,15 @@ struct GrantUnion {
 				if (!StringUtil::CIEquals(existing.first, column.first)) {
 					continue;
 				}
-				if (column.second.empty()) {
+				if (column.second.empty() || existing.second.empty()) {
 					existing.second.clear(); // one role sees it unmasked, so the principal does
+				} else if (existing.second != column.second) {
+					// two roles mask the same column differently and neither is wider: there is no
+					// order on expressions, so picking one would depend on the row order the join
+					// happens to return. Refuse instead of masking non-deterministically.
+					throw BinderException("acl: the principal's roles mask column \"%s\" differently (\"%s\" vs "
+					                      "\"%s\") - grant the same expression, or drop one of the grants",
+					                      column.first, existing.second, column.second);
 				}
 				merged = true;
 				break;
@@ -2077,25 +2084,37 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 
 void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy) {
 	RequireCatalog(catalog, "acl_grant_object");
+	// what the name is, in the terms resolution uses: a relation, a table reached through a schema
+	// alias, a function - or the bare alias path, which resolution never looks up by itself
 	auto result = catalog->Query(
 	    "SELECT 'relation' AS kind FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
-	    " AND \"vname\" = " + Lit(vname) + " UNION ALL SELECT 'relation' FROM " + catalog->Tbl("schema_aliases") +
-	    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"alias_path\" = " + Lit(vname) + " UNION ALL SELECT \"kind\" FROM " +
-	    catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+	    " AND \"vname\" = " + Lit(vname) + " UNION ALL SELECT \"kind\" FROM " + catalog->Tbl("functions") +
+	    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+	    " UNION ALL SELECT CASE WHEN \"alias_path\" = " + Lit(vname) + " THEN 'alias' ELSE 'relation' END FROM " +
+	    catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) + " AND (\"alias_path\" = " + Lit(vname) +
+	    " OR substr(" + Lit(vname) + ", 1, length(\"alias_path\") + 1) = \"alias_path\" || '.')");
 	if (result->RowCount() == 0) {
 		throw BinderException("acl admin: object \"%s.%s\" does not exist", vcat, vname);
 	}
-	if (!with_policy) {
-		return;
-	}
-	// a scalar function returns a value, not rows: an RLS predicate or a column list on one would
-	// silently do nothing, so the grant is refused instead
+	case_insensitive_set_t kinds;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		if (result->GetValue(0, row).ToString() != "scalar") {
-			return;
-		}
+		kinds.insert(result->GetValue(0, row).ToString());
 	}
-	throw BinderException("acl admin: scalar function \"%s.%s\" has no rows or columns to narrow", vcat, vname);
+	if (kinds.count("relation") || kinds.count("table")) {
+		return; // rows to narrow, and capabilities that resolution will find
+	}
+	if (kinds.count("alias")) {
+		// a schema alias is a prefix, never a relation of its own: resolution looks up the written
+		// path, so a grant on the bare alias would never be found
+		throw BinderException("acl admin: \"%s.%s\" is a schema alias, so a grant on it would never apply - "
+		                      "grant the table inside it (\"%s.<table>\")",
+		                      vcat, vname, vname);
+	}
+	if (with_policy) {
+		// a scalar function returns a value, not rows: an RLS predicate or a column list on one would
+		// silently do nothing, so the grant is refused instead
+		throw BinderException("acl admin: scalar function \"%s.%s\" has no rows or columns to narrow", vcat, vname);
+	}
 }
 
 void PolicyStore::CatalogEnsureGrant(const string &role, const string &vcat, bool is_main) {

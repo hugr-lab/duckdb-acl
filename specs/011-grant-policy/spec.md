@@ -46,7 +46,9 @@ catalog — a relation, a schema alias or a **virtual table function**.
   `AND`-ed (catalog → object → the object definition's own RLS), column lists intersect. Across the
   principal's roles the effective policy is the **union** (predicates `OR`-ed, columns unioned, a
   column one role sees unmasked is unmasked), matching how capabilities already union — so a role
-  *without* a narrowing grant lifts the narrowing for a principal that holds both;
+  *without* a narrowing grant lifts the narrowing for a principal that holds both. Two roles that
+  mask the same column *differently* are refused rather than resolved: there is no order on
+  expressions, so picking one would depend on the row order the join happens to return;
 - a column hidden by the object definition can never be re-exposed by a grant: naming it is an error,
   not a silent widening. A grant can only hide more or mask harder.
 
@@ -101,7 +103,9 @@ predicate `AND`-ing rather than being a separate feature.
 - `GRANT CATALOG`/`GRANT TABLE` are privilege administration (spec 009): they need an unrestricted
   manage scope, so a catalog-scoped manage cannot widen or narrow other roles' grants;
 - a grant naming an object that does not exist is refused at grant time — a policy that never applies
-  is worse than no policy — and so is `RLS`/`COLUMNS` on a scalar function.
+  is worse than no policy — and so is `RLS`/`COLUMNS` on a scalar function, and a grant on a bare
+  **schema alias** (a prefix, never a relation of its own: resolution looks the written path up, so
+  the grant would never be found — the table *inside* the alias takes one).
 
 ### Storage
 
@@ -122,7 +126,7 @@ statement of the batch executes.
 
 ## Testing
 
-`test/sql/acl_grant_policy.test` (88 assertions): one object granted to three roles with three slices
+`test/sql/acl_grant_policy.test` (110 assertions): one object granted to three roles with three slices
 (tenant RLS + column list, unrestricted, catalog-level predicate); the injected column reading back as
 its value; a hidden column gone; union across the two roles of one JWT principal lifting the
 narrowing; `INSERT` injecting and overriding a claim value through both `VALUES` and `SELECT`; an
@@ -131,9 +135,16 @@ predicate and unable to move a row out of the slice; `RETURNING` of a hidden, ma
 refused while a granted one reads back; `UPDATE … FROM` and `MERGE` refused; a view staying read-only
 under a grant; renames composing with a grant; a grant re-exposing a hidden column refused and one
 masking harder accepted; a grant on an unknown object refused; a row-derived column refused on write;
-`ALTER GRANT … SET RLS` taking effect on the next query; a table function narrowed by a grant in both
+`ALTER GRANT … SET RLS` taking effect on the next query; a table inside a schema alias taking a grant
+(with the catalog level still composing on top) while the bare alias is refused; a table function
+narrowed by a grant in both
 the macro and the `alias` form (with `acl_arg` still carrying the call's argument) while a policy on a
 scalar function is refused; and a catalog-scoped manage refused when handing out a slice.
+
+`test/cpp/test_acl_params_passthrough.cpp` gains the golden-rule case for the one place the rewriter
+restructures a user's node around their parameters: a prepared `INSERT` into a narrowed relation keeps
+exactly its own two parameters, binds them in order through the injection subquery, and re-executes
+with the claim value still baked as a constant.
 
 ## Alternatives considered
 
