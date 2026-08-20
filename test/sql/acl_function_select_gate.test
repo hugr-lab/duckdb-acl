@@ -273,6 +273,32 @@ ACL ROLE "reader_only" INSERT INTO audit VALUES (3, 'nope');
 ----
 <REGEX>:.*insert on "audit" is not allowed.*
 
+# the boundary that makes the two spellings matter: revoking administration rewrites a manage-only
+# grant as an explicit '{}', so it must leave no data access behind - not full access
+statement ok
+ACL ADMIN CREATE ROLE curator;
+
+statement ok
+SELECT acl_grant_catalog('curator', 'sales', '{"manage": true}', true);
+
+statement error
+ACL ROLE "curator" SELECT count(*) FROM audit;
+----
+<REGEX>:.*select on "audit" is not allowed.*
+
+statement ok
+SELECT acl_revoke_admin('curator');
+
+query I
+SELECT caps FROM aclcat.acl.role_catalogs WHERE role = 'curator';
+----
+{}
+
+statement error
+ACL ROLE "curator" SELECT count(*) FROM audit;
+----
+<REGEX>:.*select on "audit" is not allowed.*
+
 # --- markers are baked wherever they stand in a template -------------------------------------------
 # a marker left behind fails closed at bind, which used to make these templates unusable
 

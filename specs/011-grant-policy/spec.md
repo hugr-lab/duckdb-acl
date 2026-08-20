@@ -162,11 +162,18 @@ with the claim value still baked as a constant.
   written unless the grant names a value column (there is no `WITH CHECK` evaluation of the predicate
   against the inserted values). Either evaluate the predicate on the written row, or refuse `insert`
   on a grant whose predicate no value column covers.
-- A virtual **table function** is still gated only by the existence of the catalog grant: the `select`
-  capability of spec 003 gates relations, not function calls. The grant chain now reaches functions,
-  so the capability check belongs there too.
-- **Schema level**: `GRANT SCHEMA sales.raw TO ROLE r …` needs a schema-grant row; the composition
-  already takes an arbitrary chain, so it is storage plus grammar.
+- **Schema level** (once design 004 is implemented in full — virtual schemas need to exist as objects
+  before a schema grant has anything to attach to): `GRANT SCHEMA sales.raw TO ROLE r
+  …` needs a schema-grant row, and with it the questions nesting raises. Schemas nest
+  (`sales.raw.eu.orders`), so a written name has *several* schema ancestors, and the two halves of a
+  grant treat them differently: **capabilities** are "the most specific level that states them wins"
+  — the longest matching schema prefix, the way schema-alias resolution already picks its prefix —
+  while **policy** (RLS, columns) narrows through *every* level on the way down, catalog → each
+  schema ancestor → object. A schema that states no capabilities inherits, exactly like an object
+  grant (spec 012). `manage` stays out of the schema level: administration is scoped per catalog
+  (spec 009), and a schema-scoped manage would need a provenance rule for every management statement.
+  This is also where `create`/`drop` belong — "may this role create objects in this schema" is a
+  schema-level question, which is why design 004 ties the two together.
 - `MERGE`, `UPDATE … FROM` and `DELETE … USING` on a narrowed relation: they need every reference to
   the target qualified before the policy predicate can be added safely.
 - Column lists split on `,`, so an expression may not contain a top-level comma — the unified DDL

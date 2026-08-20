@@ -618,9 +618,10 @@ struct CatalogBackend {
 	}
 	//! the caps column of a resolution query; without an object_caps source there is no override
 	string CapsExpr() {
-		// nullif: an object row that says nothing about capabilities falls back to the catalog grant
-		// instead of replacing it - "unspecified" is not "none" (spec 012)
-		return HasObjectCaps() ? "coalesce(nullif(oc.\"caps\", ''), g.\"caps\")" : "g.\"caps\"";
+		// nullif over the trimmed value: an object row that says nothing about capabilities - NULL,
+		// empty or blank - falls back to the catalog grant instead of replacing it, because
+		// "unspecified" is not "none" (spec 012)
+		return HasObjectCaps() ? "coalesce(nullif(trim(oc.\"caps\"), ''), g.\"caps\")" : "g.\"caps\"";
 	}
 	//! The grant chain's policy columns (spec 011): the catalog grant's and the object grant's own RLS
 	//! and column list. The function-driver's slots do not carry them, so it composes to no narrowing.
