@@ -2,6 +2,7 @@
 
 #include "acl_token.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/parser.hpp"
 
 namespace duckdb {
@@ -175,6 +176,78 @@ void PolicyStore::DefineIssuer(IssuerConfig config) {
 	}
 	lock_guard<mutex> guard(lock);
 	issuers[config.issuer] = std::move(config);
+}
+
+namespace {
+
+AdminScope ParseScope(const string &scope) {
+	if (StringUtil::CIEquals(scope, "passthrough")) {
+		return AdminScope::PASSTHROUGH;
+	}
+	if (StringUtil::CIEquals(scope, "manage")) {
+		return AdminScope::MANAGE;
+	}
+	throw BinderException("acl admin: unknown admin scope \"%s\" (expected manage or passthrough)", scope);
+}
+
+} // namespace
+
+void PolicyStore::GrantAdmin(const string &role, AdminScope scope) {
+	if (catalog) {
+		CatalogGrantAdmin(role, scope == AdminScope::PASSTHROUGH ? "passthrough" : "manage");
+		return;
+	}
+	lock_guard<mutex> guard(lock);
+	admin_scopes[role] = scope;
+}
+
+void PolicyStore::RevokeAdmin(const string &role) {
+	if (catalog) {
+		CatalogRevokeAdmin(role);
+		return;
+	}
+	lock_guard<mutex> guard(lock);
+	admin_scopes.erase(role);
+}
+
+AdminScope PolicyStore::AdminScopeOf(const Principal &principal, case_insensitive_set_t &catalogs_out) {
+	auto strongest = AdminScope::NONE;
+	auto consider = [&](AdminScope scope) {
+		if (scope == AdminScope::MANAGE) {
+			catalogs_out.insert(""); // a global manage scope: every catalog
+		}
+		if (scope > strongest) {
+			strongest = scope;
+		}
+	};
+	if (catalog) {
+		// per-catalog management is a capability of the catalog grant, so a role manages as many
+		// catalogs as it was granted; acl.admins carries only the global scopes
+		CatalogManageCatalogs(principal, catalogs_out);
+		if (!catalogs_out.empty()) {
+			strongest = AdminScope::MANAGE;
+		}
+		case_insensitive_map_t<std::pair<string, string>> rows;
+		CatalogAdminScopes(principal, rows);
+		for (auto &row : rows) {
+			consider(ParseScope(row.second.first));
+		}
+		return strongest;
+	}
+	lock_guard<mutex> guard(lock);
+	for (auto &role : principal.roles) {
+		auto entry = admin_scopes.find(role);
+		if (entry != admin_scopes.end()) {
+			consider(entry->second);
+		}
+	}
+	return strongest;
+}
+
+bool PolicyStore::AnonymousAdminAllowed() {
+	// the in-memory dev mode keeps the historical behavior; a real policy source means production,
+	// where the gateway's own escape hatch must be turned on deliberately
+	return !catalog || CatalogAnonymousAdminAllowed();
 }
 
 void PolicyStore::MapRole(const string &issuer, const string &source, const string &external_value,

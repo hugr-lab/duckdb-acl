@@ -1,0 +1,441 @@
+# name: test/sql/acl_admin_scopes.test
+# description: ACL administration scopes (spec 009) - god mode by grant, not by connection: the
+#   anonymous ACL ADMIN hatch is opt-in with a policy source, and a verified principal administers
+#   the ACL only with a granted scope (manage, optionally per catalog, or passthrough).
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100), (2, 'globex', 200), (3, 'acme', 300);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+# --- in the in-memory dev mode the bare hatch keeps working -------------------------------------
+
+statement ok
+ACL ADMIN SELECT 1;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+# --- with a policy source it is closed until deliberately opened --------------------------------
+
+statement error
+ACL ADMIN SELECT 1;
+----
+<REGEX>:.*bare ACL ADMIN is disabled.*
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN SELECT 1;
+
+# the gateway (still anonymous here) bootstraps the first administrators and a catalog
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG hr;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS 'tenant=acme';
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS 'id,amount' RLS 'tenant = acl_claim(''tenant'')';
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{"select": true}' MAIN;
+
+statement ok
+SELECT acl_grant_admin('platform', 'passthrough');
+
+# managing one catalog is a capability of the catalog grant, so a role can manage several catalogs
+# (and manage one without being able to read it)
+statement ok
+SELECT acl_grant_catalog('sales_owner', 'sales', '{"manage": true}', false);
+
+# --- a principal without a scope cannot administer ----------------------------------------------
+
+statement error
+ACL ROLE "analyst" ACL NATIVE SELECT 1;
+----
+<REGEX>:.*no ACL administration scope.*
+
+# ... while plain queries under the same role keep working
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+# --- manage scope: the management grammar, restricted to its catalog -----------------------------
+
+statement ok
+ACL ROLE "sales_owner" ACL ADD TABLE phys.main.orders_physical AS sales.all_orders;
+
+statement error
+ACL ROLE "sales_owner" ACL ADD TABLE phys.main.orders_physical AS hr.people;
+----
+<REGEX>:.*no manage scope for catalog "hr".*
+
+# not catalog-specific -> needs an unrestricted manage scope
+statement error
+ACL ROLE "sales_owner" ACL CREATE ROLE intruder;
+----
+<REGEX>:.*not catalog-specific.*
+
+# a manage scope is the grammar, not arbitrary SQL
+statement error
+ACL ROLE "sales_owner" ACL NATIVE SELECT 1;
+----
+<REGEX>:.*requires a passthrough scope.*
+
+statement error
+ACL ROLE "sales_owner" ACL NATIVE CREATE TABLE phys.main.sneak(x INT);
+----
+<REGEX>:.*requires a passthrough scope.*
+
+# and it can never hand out scopes (no privilege escalation)
+statement error
+ACL ROLE "sales_owner" ACL GRANT ADMIN passthrough TO ROLE sales_owner;
+----
+<REGEX>:.*requires a passthrough scope.*
+
+# a second managed catalog for the same role - impossible while the scope lived in one admins row
+statement ok
+SELECT acl_grant_catalog('sales_owner', 'hr', '{"manage": true}', false);
+
+statement ok
+ACL ROLE "sales_owner" ACL ADD TABLE phys.main.orders_physical AS hr.owned_too;
+
+statement ok
+SELECT acl_revoke_catalog('sales_owner', 'hr');
+
+statement error
+ACL ROLE "sales_owner" ACL ADD TABLE phys.main.orders_physical AS hr.owned_again;
+----
+<REGEX>:.*no manage scope for catalog "hr".*
+
+# managing a catalog does not imply reading it
+statement error
+ACL ROLE "sales_owner" SELECT * FROM sales.orders;
+----
+<REGEX>:.*select on "sales.orders" is not allowed.*
+
+# --- passthrough scope: god mode by grant --------------------------------------------------------
+
+statement ok
+ACL ROLE "platform" ACL CREATE ROLE auditor;
+
+statement ok
+ACL ROLE "platform" ACL ADD TABLE phys.main.orders_physical AS hr.people;
+
+query I
+ACL ROLE "platform" ACL NATIVE SELECT count(*) FROM phys.main.orders_physical;
+----
+3
+
+statement ok
+ACL ROLE "platform" ACL GRANT ADMIN manage TO ROLE auditor;
+
+# an unrestricted manage scope may touch any catalog, but still only the grammar
+statement ok
+ACL ROLE "auditor" ACL CREATE ROLE analyst2;
+
+statement ok
+ACL ROLE "auditor" ACL ADD TABLE phys.main.orders_physical AS hr.headcount;
+
+statement error
+ACL ROLE "auditor" ACL NATIVE SELECT 1;
+----
+<REGEX>:.*requires a passthrough scope.*
+
+# --- scopes through the grammar, and revocation ---------------------------------------------------
+
+statement ok
+ACL ROLE "platform" ACL REVOKE ADMIN FROM ROLE auditor;
+
+statement error
+ACL ROLE "auditor" ACL CREATE ROLE analyst3;
+----
+<REGEX>:.*no ACL administration scope.*
+
+query I
+SELECT count(*) FROM aclcat.acl.admins WHERE role = 'platform' AND scope = 'passthrough';
+----
+1
+
+# --- the external door: the CLIENT writes the marker ---------------------------------------------
+# the gateway only prepends the principal, so a client asking for anything beyond an ordinary query
+# says so itself: `ACL <mgmt>` to manage the ACL, `ACL NATIVE <sql>` to leave the virtual catalog
+
+statement ok
+ACL ROLE "platform" ACL CREATE ROLE via_external_door;
+
+statement ok
+ACL ROLE "sales_owner" ACL ADD TABLE phys.main.orders_physical AS sales.via_door;
+
+statement error
+ACL ROLE "sales_owner" ACL ADD TABLE phys.main.orders_physical AS hr.via_door;
+----
+<REGEX>:.*no manage scope for catalog "hr".*
+
+statement error
+ACL ROLE "analyst" ACL CREATE ROLE sneaky;
+----
+<REGEX>:.*no ACL administration scope.*
+
+# --- ALTER: partial change of an existing object -------------------------------------------------
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE sales.orders SET COLUMNS 'id,amount,tenant';
+
+query III
+ACL ROLE "analyst" SELECT id, amount, tenant FROM orders ORDER BY id;
+----
+1	100	acme
+3	300	acme
+
+# the RLS survived the column change; now relax it and the masking too
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE sales.orders SET RLS 'true';
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM orders;
+----
+3
+
+statement ok
+ACL ADMIN ALTER VIRTUAL CATALOG sales SET COMMENT 'renamed namespace';
+
+statement ok
+ACL ADMIN ALTER ROLE analyst SET CLAIMS 'tenant=globex';
+
+statement ok
+ACL ADMIN ALTER GRANT CATALOG sales TO ROLE analyst SET CAPS '{"select": true, "insert": true}';
+
+statement ok
+ACL ROLE "analyst" INSERT INTO all_orders VALUES (4, 'globex', 400);
+
+# altering something that does not exist is an error (unlike ADD, which upserts)
+statement error
+ACL ADMIN ALTER VIRTUAL TABLE sales.nothere SET RLS 'true';
+----
+<REGEX>:.*relation "sales.nothere" does not exist.*
+
+statement error
+ACL ADMIN ALTER ROLE nobody SET CLAIMS 'x=1';
+----
+<REGEX>:.*role "nobody" does not exist.*
+
+# a catalog-scoped manage may ALTER inside its catalog only
+statement ok
+ACL ROLE "sales_owner" ACL ALTER VIRTUAL TABLE sales.via_door SET RLS 'true';
+
+statement error
+ACL ROLE "sales_owner" ACL ALTER VIRTUAL TABLE hr.people SET RLS 'true';
+----
+<REGEX>:.*no manage scope for catalog "hr".*
+
+# duckdb's own ALTER TABLE still passes through untouched
+statement ok
+ACL ADMIN CREATE TABLE phys.main.alterable(x INT);
+
+statement ok
+ACL ADMIN ALTER TABLE phys.main.alterable RENAME TO altered;
+
+query I
+ACL ADMIN SELECT count(*) FROM phys.main.altered;
+----
+0
+
+# --- the same door for a JWT principal (quack/ADBC clients) --------------------------------------
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/rs', '{"keys":[{"kty":"RSA","kid":"test-key","alg":"RS256","n":"jps-_RGCObZHYxFmbxIagCg0dZlIifYMV2phhdrLpkrJ8TkoTe_GQK62Nf4Ilh92YUiBofspFfi7-fT937mnN1vzVyAKjHCHA4BmnDHHvCea8QdNP0YcxDXsBReZDFx-e8uEqfG-9_uvhLS0HTwTqhRKtdlwGDrsSoH4WYnCHI1grvQ8BSo7MivppMTzx7UUWeKieKFMeY3jw-g0XgdyZKjIOOaXQTX5AeEm_Xq6OjOtq7gVIgmNfogSQIAWFk5iaMzzafzhQmN_d719rEMSJClAAnCklwpETEq2jWv5vJUhslPL6ZQPd8jnjVMcOzL8Zy9ed5U9te-EQ0IKnfnpZQ","e":"AQAB"},{"kty":"EC","crv":"P-256","kid":"test-ec","alg":"ES256","x":"DQof67TjKFht1fXEua9TTUBimcYFM1za8A06kBIgCDM","y":"RRJa8uTiLTotv77J3eZC2m3YOQSz_aHIk2mnf_5vwCg"}]}', 'api://acl-test', 'RS256', 'roles', '{"tid": "tenant"}');
+
+# the token's role is 'analyst' - no scope, so administering is refused
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' ACL CREATE ROLE from_token;
+----
+<REGEX>:.*no ACL administration scope.*
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{"select": true, "manage": true}' MAIN;
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' ACL ADD TABLE phys.main.orders_physical AS sales.from_token;
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' ACL ADD TABLE phys.main.orders_physical AS hr.from_token;
+----
+<REGEX>:.*no manage scope for catalog "hr".*
+
+# an invalid token is refused before any scope question
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjk0NjY4NDgwMCwic3ViIjoidTUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.d7QJzBvajOOZ4lrYQuLTFOoIdxTA2FU5laRThD0Kv3Hs4QEsDPRf00GiRsaORa9VQbyBefth45hhWpA8RSCLDX9CRFzVxxOO1ErQ84efuaXd-gvKTvqy9oa17vcL4FzUeYHH2-QbMEQZlXVfZQzvtMeR3WEwkZUJO-yhUYjofZB10aB7eWNg3G7jH0mOL6ZPP4UvOkYorJLiIiYZpt3oLWeUr31_b1e7mx6nhOfOEUPxgam4BAoG90lEIoIFzzPKuAlEYwWbURWJm_DhaS6fd6noCtH4SVqDMZHe8qKk3CRWTLc5WhopwLox754NTD7c6HMZ2N_HRzJB68f3Sk9IuQ' ACL CREATE ROLE nope;
+----
+<REGEX>:.*token expired.*
+
+# --- ordinary queries are never mistaken for administration --------------------------------------
+
+# a plain query keeps its virtual-catalog context even for a passthrough principal
+statement ok
+SELECT acl_grant_catalog('platform', 'sales', '{"select": true}', true);
+
+query I
+ACL ROLE "platform" SELECT count(*) FROM orders;
+----
+4
+
+# the marker is the client's request, not a privilege: without a scope it is refused ('auditor' had
+# its scope revoked above), and a manage scope still cannot leave the virtual catalog
+statement error
+ACL ROLE "auditor" ACL NATIVE SELECT 1;
+----
+<REGEX>:.*no ACL administration scope.*
+
+statement error
+ACL ROLE "analyst" ACL NATIVE SELECT 1;
+----
+<REGEX>:.*requires a passthrough scope.*
+
+# and a physical name outside the catalog stays refused in the query context
+statement error
+ACL ROLE "platform" SELECT * FROM phys.main.orders_physical;
+----
+<REGEX>:.*no access to object.*
+
+# --- a nested ACL prefix is text, never a second entry --------------------------------------------
+# exactly one prefix is stripped (spec 001): the inner parse runs with the override disabled, so an
+# `ACL ...` inside the remainder reaches duckdb's own parser and fails there - it cannot re-enter
+
+statement error
+ACL ROLE "platform" ACL NATIVE ACL ADMIN CREATE VIRTUAL CATALOG nested;
+----
+<REGEX>:.*(syntax|Parser).*
+
+statement error
+ACL ROLE "platform" ACL NATIVE ACL ROLE "analyst" SELECT 1;
+----
+<REGEX>:.*(syntax|Parser).*
+
+query I
+SELECT count(*) FROM aclcat.acl.catalogs WHERE vcat = 'nested';
+----
+0
+
+# a doubled marker is not a marker either: the management parser sees "ACL" as a statement keyword
+statement error
+ACL ROLE "platform" ACL ACL NATIVE SELECT 1;
+----
+<REGEX>:.*unknown management statement "ACL".*
+
+# and a manage scope is stopped by the scope check before any of that matters
+statement error
+ACL ROLE "sales_owner" ACL NATIVE ACL ADMIN CREATE VIRTUAL CATALOG nested2;
+----
+<REGEX>:.*requires a passthrough scope.*
+
+# --- multi-statement batches ----------------------------------------------------------------------
+# one prefix (and therefore one mode and one principal) covers the whole batch; management batches
+# are authorized statement by statement AT PARSE TIME, so a refusal executes nothing at all
+
+statement ok
+ACL ROLE "platform" ACL CREATE VIRTUAL CATALOG batch; ADD TABLE phys.main.orders_physical AS batch.orders; GRANT CATALOG batch TO ROLE analyst CAPS '{"select": true}';
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM batch.orders;
+----
+4
+
+# a batch that ends outside the granted catalog is refused whole - the first statement does not land
+statement error
+ACL ROLE "sales_owner" ACL ADD TABLE phys.main.orders_physical AS sales.batch_ok; ADD TABLE phys.main.orders_physical AS hr.batch_bad;
+----
+<REGEX>:.*no manage scope for catalog "hr".*
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM sales.batch_ok;
+----
+<REGEX>:.*no access to object.*
+
+# the same for an escalation hidden at the end of a batch
+statement error
+ACL ROLE "sales_owner" ACL ADD TABLE phys.main.orders_physical AS sales.batch_ok2; GRANT ADMIN passthrough TO ROLE sales_owner;
+----
+<REGEX>:.*requires a passthrough scope.*
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM sales.batch_ok2;
+----
+<REGEX>:.*no access to object.*
+
+# a management batch cannot smuggle plain SQL, and a native batch cannot smuggle management
+statement error
+ACL ROLE "platform" ACL CREATE ROLE mixed_a; SELECT 1;
+----
+<REGEX>:.*unknown management statement.*
+
+statement error
+ACL ROLE "platform" ACL NATIVE SELECT 1; CREATE ROLE mixed_b;
+----
+<REGEX>:.*(syntax|Parser).*
+
+# the marker is read once, right after the prefix: a later `ACL NATIVE` is just text and fails to parse
+statement error
+ACL ROLE "analyst" SELECT 1; ACL NATIVE DROP TABLE phys.main.orders_physical;
+----
+<REGEX>:.*(syntax|Parser).*
+
+query I
+ACL ADMIN SELECT count(*) FROM phys.main.orders_physical;
+----
+4
+
+# authorization is atomic, EXECUTION is not: a batch that passes the scope check but fails at
+# runtime leaves the statements before the failure applied - plain SQL batch semantics
+statement error
+ACL ROLE "platform" ACL ADD TABLE phys.main.orders_physical AS batch.applied; ALTER VIRTUAL TABLE batch.nothere SET RLS 'true';
+----
+<REGEX>:.*relation "batch.nothere" does not exist.*
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM batch.applied;
+----
+4
+
+# a native batch under a passthrough principal runs as ordinary SQL, all statements
+statement ok
+ACL ROLE "platform" ACL NATIVE CREATE TABLE phys.main.batch_native(x INT); INSERT INTO phys.main.batch_native VALUES (1), (2);
+
+query I
+ACL ADMIN SELECT count(*) FROM phys.main.batch_native;
+----
+2
+
+# --- closing the anonymous hatch again ------------------------------------------------------------
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+statement error
+ACL ADMIN CREATE ROLE after_close;
+----
+<REGEX>:.*bare ACL ADMIN is disabled.*
+
+# the granted principals still administer
+statement ok
+ACL ROLE "platform" ACL CREATE ROLE after_close;

@@ -80,6 +80,9 @@ Enable the override in a session with `SET allow_parser_override_extension='fall
   capability (`insert`/`update`/`delete`/`merge`) on DML targets.
 - **Markers baked into template copies**: `acl_claim('<name>')` → claim constant; `acl_arg(n)` → n-th
   call argument's AST. Never registered as real functions ⇒ a missed marker fails closed at bind.
+- **Administration is a capability** (spec 009): `{"manage": true}` in a catalog grant (per catalog,
+  many catalogs per role, independent of `select`), or a global `manage`/`passthrough` in
+  `acl.admins`; never self-escalating, and only `passthrough` leaves the virtual catalog.
 - **Golden rule**: the rewriter adds no query parameters — a user's `$1`/`?` is the only parameter.
 - **Function gating seam**: `PolicyStore::FunctionAllowed` — denies only data-readers / rights-bypass
   functions, passes the rest. This is where a production role-aware resolver plugs in.
@@ -96,6 +99,13 @@ Settings `acl_version_check_interval` (policy staleness) and `acl_jwt_clock_skew
 **JWT** (spec 007): `acl_define_issuer(issuer, keys_json, audiences, algs, role_claim, claim_map)`
 and `acl_map_role(issuer, source, external, role)` — a JWT-shaped `ACL TOKEN` verifies offline
 (RS256/ES256/HS256; mbedtls + vendored p256-m), roles resolve as a multi-role union.
+**Spec 009**: administering the ACL is a granted capability — `acl_grant_admin(role, 'manage'|'passthrough'[, vcat])`
+/ `acl_revoke_admin(role)` (or `ACL ADMIN GRANT|REVOKE ADMIN …`), used through
+the marker the client writes after the principal prefix: `ACL <mgmt>` (manage the ACL) or
+`ACL NATIVE <sql>` (plain SQL outside the virtual catalog — passthrough only); a bare query stays
+in the virtual catalog. `ALTER VIRTUAL …` / `ALTER ROLE|ISSUER|GRANT …` change existing objects
+(missing target = error). `ACL ADMIN …` is the gateway's anonymous form and needs
+`acl_allow_anonymous_admin` once a policy source is enabled.
 **Spec 008**: `acl_use_functions('{"slot": "fn", ...}')` — the function-driver policy source
 (registered table-function callbacks, explicit slot map, read-only); and management SQL —
 `ACL ADMIN CREATE VIRTUAL CATALOG / CREATE ROLE / CREATE ISSUER / ADD TABLE|VIEW|SCHEMA|... /

@@ -702,6 +702,14 @@ struct CatalogBackend {
 		}
 	}
 
+	bool SettingBool(const char *name, bool fallback) {
+		Value value;
+		if (Db()->TryGetCurrentSetting(name, value) && !value.IsNull()) {
+			return value.GetValue<bool>();
+		}
+		return fallback;
+	}
+
 	int64_t SettingInt64(const char *name, int64_t fallback) {
 		Value value;
 		if (Db()->TryGetCurrentSetting(name, value) && !value.IsNull()) {
@@ -764,6 +772,55 @@ struct CatalogBackend {
 		issuer_cache[issuer] = {found, config};
 		out = config;
 		return found;
+	}
+
+	//! The catalogs the principal may MANAGE: a capability of the catalog grant itself, so a role can
+	//! manage many catalogs (and manage one without being able to read it)
+	void ManageCatalogs(const Principal &principal, case_insensitive_set_t &out) {
+		if (principal.roles.empty()) {
+			return;
+		}
+		EnsureFresh();
+		if (function_mode) {
+			for (auto &grant : Grants(principal.roles)) {
+				if (ParseCaps(grant.caps).count("manage")) {
+					out.insert(grant.vcat);
+				}
+			}
+			return;
+		}
+		auto result = Query("SELECT \"vcat\", \"caps\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
+		                    LitList(principal.roles) + ")");
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			auto caps = result->GetValue(1, row);
+			if (ParseCaps(caps.IsNull() ? string() : caps.ToString()).count("manage")) {
+				out.insert(result->GetValue(0, row).ToString());
+			}
+		}
+	}
+
+	//! The admin scopes of the principal's roles; the function-driver may serve them through a slot
+	void AdminScopes(const Principal &principal, case_insensitive_map_t<std::pair<string, string>> &out) {
+		if (principal.roles.empty()) {
+			return;
+		}
+		EnsureFresh();
+		unique_ptr<MaterializedQueryResult> result;
+		if (function_mode) {
+			if (!HasSlot("admin_scopes")) { // optional slot: no admin grants through this source
+				return;
+			}
+			// positional contract: (role, scope, vcat)
+			result = Query("SELECT * FROM " + Slot("admin_scopes") + "(" + ListLit(principal.roles) + ")");
+		} else {
+			result = Query("SELECT \"role\", \"scope\", \"vcat\" FROM " + Tbl("admins") + " WHERE \"role\" IN (" +
+			               LitList(principal.roles) + ")");
+		}
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			auto vcat = result->GetValue(2, row);
+			out[result->GetValue(0, row).ToString()] = {result->GetValue(1, row).ToString(),
+			                                            vcat.IsNull() ? string() : vcat.ToString()};
+		}
 	}
 
 	//! One query maps external role values and checks which raw values exist as internal roles
@@ -838,6 +895,9 @@ struct CatalogBackend {
 		    "CREATE TABLE IF NOT EXISTS " + Tbl("issuers") +
 		        "(\"issuer\" VARCHAR PRIMARY KEY, \"keys_json\" VARCHAR, \"audiences\" VARCHAR,"
 		        " \"algs\" VARCHAR, \"role_claim\" VARCHAR, \"claim_map\" VARCHAR)",
+		    // '' as vcat means "every catalog": NULL cannot be part of the primary key
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("admins") +
+		        "(\"role\" VARCHAR PRIMARY KEY, \"scope\" VARCHAR, \"vcat\" VARCHAR)",
 		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_mappings") +
 		        "(\"issuer\" VARCHAR, \"source\" VARCHAR, \"external_value\" VARCHAR, \"role\" VARCHAR,"
 		        " PRIMARY KEY (\"issuer\", \"source\", \"external_value\", \"role\"))",
@@ -1036,6 +1096,171 @@ void PolicyStore::CatalogSetFunctionGate(const string &name, bool allowed, bool 
 		                     Lit(StringUtil::Lower(name)) + ", '', " + (allowed ? "true" : "false") + ")");
 	}
 	catalog->Write(statements);
+}
+
+namespace {
+
+//! ALTER targets must exist: read the single row, or fail with a specific message
+unique_ptr<MaterializedQueryResult> RequireRow(CatalogBackend &catalog, const string &sql, const string &what) {
+	auto result = catalog.Query(sql);
+	if (result->RowCount() == 0) {
+		throw BinderException("acl admin: %s does not exist", what);
+	}
+	return result;
+}
+
+} // namespace
+
+void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, const string &field,
+                                       const string &value, const vector<std::pair<string, string>> &columns) {
+	RequireCatalog(catalog, "acl_alter_relation");
+	auto current = RequireRow(*catalog,
+	                          "SELECT \"form\", \"phys\", \"view_sql\", \"rls\" FROM " + catalog->Tbl("relations") +
+	                              " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname),
+	                          "relation \"" + vcat + "." + vname + "\"");
+	auto form = current->GetValue(0, 0).ToString();
+	auto phys = current->GetValue(1, 0);
+	auto view_sql = current->GetValue(2, 0);
+	auto rls = current->GetValue(3, 0);
+	string new_phys = phys.IsNull() ? string() : phys.ToString();
+	string new_view = view_sql.IsNull() ? string() : view_sql.ToString();
+	string new_rls = rls.IsNull() ? string() : rls.ToString();
+	auto new_columns = columns;
+	if (field != "columns") { // keep the current projection when another property is being set
+		auto rows =
+		    catalog->Query("SELECT \"name\", \"expr\" FROM " + catalog->Tbl("relation_columns") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+		new_columns.clear();
+		for (idx_t row = 0; row < rows->RowCount(); row++) {
+			auto expr = rows->GetValue(1, row);
+			new_columns.emplace_back(rows->GetValue(0, row).ToString(), expr.IsNull() ? string() : expr.ToString());
+		}
+	}
+	if (field == "phys") {
+		new_phys = value;
+	} else if (field == "rls") {
+		new_rls = value;
+	} else if (field == "view") {
+		new_view = value;
+	} else if (field != "columns") {
+		throw BinderException("acl admin: unknown relation property \"%s\"", field);
+	}
+	// the form follows the content, exactly as it does for ADD
+	string new_form = !new_view.empty() ? "view" : (new_columns.empty() && new_rls.empty() ? "alias" : "subquery");
+	CatalogAddRelation(vcat, vname, new_form, new_phys, new_view, new_rls, new_columns);
+}
+
+void PolicyStore::CatalogAlterSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path) {
+	RequireCatalog(catalog, "acl_alter_schema_alias");
+	RequireRow(*catalog,
+	           "SELECT 1 FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
+	               " AND \"alias_path\" = " + Lit(alias_path),
+	           "schema alias \"" + vcat + "." + alias_path + "\"");
+	CatalogAddSchemaAlias(vcat, alias_path, phys_path);
+}
+
+void PolicyStore::CatalogAlterFunction(const string &vcat, const string &vname, const string &kind, const string &form,
+                                       const string &definition) {
+	RequireCatalog(catalog, "acl_alter_function");
+	RequireRow(*catalog,
+	           "SELECT 1 FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+	               " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind),
+	           kind + " function \"" + vcat + "." + vname + "\"");
+	bool is_alias = form == "alias";
+	CatalogAddFunction(vcat, vname, kind, form, is_alias ? definition : "", is_alias ? "" : definition);
+}
+
+void PolicyStore::CatalogAlterCatalog(const string &vcat, const string &comment) {
+	RequireCatalog(catalog, "acl_alter_catalog");
+	RequireRow(*catalog, "SELECT 1 FROM " + catalog->Tbl("catalogs") + " WHERE \"vcat\" = " + Lit(vcat),
+	           "catalog \"" + vcat + "\"");
+	CatalogCreate(vcat, comment);
+}
+
+void PolicyStore::CatalogAlterRole(const string &role, const case_insensitive_map_t<string> &claims) {
+	RequireCatalog(catalog, "acl_alter_role");
+	RequireRow(*catalog, "SELECT 1 FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role),
+	           "role \"" + role + "\"");
+	CatalogDefineRole(role, claims);
+}
+
+void PolicyStore::CatalogAlterGrant(const string &role, const string &vcat, const string &field, const string &value) {
+	RequireCatalog(catalog, "acl_alter_grant");
+	auto current = RequireRow(*catalog,
+	                          "SELECT \"is_main\", \"caps\" FROM " + catalog->Tbl("role_catalogs") +
+	                              " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat),
+	                          "grant of catalog \"" + vcat + "\" to role \"" + role + "\"");
+	auto is_main_value = current->GetValue(0, 0);
+	bool is_main = !is_main_value.IsNull() && is_main_value.GetValue<bool>();
+	auto caps_value = current->GetValue(1, 0);
+	string caps = caps_value.IsNull() ? string("{}") : caps_value.ToString();
+	if (field == "caps") {
+		caps = value;
+	} else if (field == "main") {
+		is_main = StringUtil::CIEquals(value, "true");
+	} else {
+		throw BinderException("acl admin: unknown grant property \"%s\"", field);
+	}
+	CatalogGrant(role, vcat, caps, is_main);
+}
+
+void PolicyStore::CatalogAlterIssuer(const string &issuer, const string &field, const string &value) {
+	RequireCatalog(catalog, "acl_alter_issuer");
+	IssuerConfig config;
+	if (!CatalogLookupIssuer(issuer, config)) {
+		throw BinderException("acl admin: issuer \"%s\" does not exist", issuer);
+	}
+	auto split_csv = [](const string &csv) {
+		vector<string> parts;
+		for (auto &part : StringUtil::Split(csv, ',')) {
+			StringUtil::Trim(part);
+			if (!part.empty()) {
+				parts.push_back(part);
+			}
+		}
+		return parts;
+	};
+	if (field == "keys") {
+		config.keys_json = value;
+	} else if (field == "audiences") {
+		config.audiences = split_csv(value);
+	} else if (field == "algs") {
+		config.algs.clear();
+		for (auto &alg : split_csv(value)) {
+			config.algs.insert(alg);
+		}
+	} else if (field == "role_claim") {
+		config.role_claim = value;
+	} else if (field == "claim_map") {
+		config.claim_map = value;
+	} else {
+		throw BinderException("acl admin: unknown issuer property \"%s\"", field);
+	}
+	CatalogDefineIssuer(config);
+}
+
+void PolicyStore::CatalogGrantAdmin(const string &role, const string &scope) {
+	RequireCatalog(catalog, "acl_grant_admin");
+	catalog->Write({"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role),
+	                "INSERT INTO " + catalog->Tbl("admins") + " VALUES (" + Lit(role) + ", " + Lit(scope) + ", '')"});
+}
+
+void PolicyStore::CatalogRevokeAdmin(const string &role) {
+	RequireCatalog(catalog, "acl_revoke_admin");
+	catalog->Write({"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role)});
+}
+
+void PolicyStore::CatalogAdminScopes(const Principal &principal,
+                                     case_insensitive_map_t<std::pair<string, string>> &out) {
+	catalog->AdminScopes(principal, out);
+}
+
+void PolicyStore::CatalogManageCatalogs(const Principal &principal, case_insensitive_set_t &out) {
+	catalog->ManageCatalogs(principal, out);
+}
+
+bool PolicyStore::CatalogAnonymousAdminAllowed() {
+	return catalog->SettingBool("acl_allow_anonymous_admin", false);
 }
 
 void PolicyStore::CatalogDefineIssuer(const IssuerConfig &config) {

@@ -64,6 +64,10 @@ SELECT acl_use_functions('{"policy_version": "pol_version", "role_catalogs": "no
 statement ok
 SELECT acl_use_functions('{"policy_version": "pol_version", "role_catalogs": "pol_role_catalogs", "relations": "pol_relations", "relation_columns": "pol_columns", "schema_aliases": "pol_aliases", "functions": "pol_functions", "function_gate": "pol_gate", "role_claims": "pol_claims"}');
 
+# spec 009: with a policy source enabled, the bare `ACL ADMIN` hatch is opt-in
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
 # --- enforcement through the callbacks -----------------------------------------------------------
 
 # subquery form: projection + RLS, the tenant claim comes from the role_claims callback

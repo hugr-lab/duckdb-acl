@@ -12,13 +12,24 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
 
+#include <unordered_map>
+
 namespace duckdb {
 namespace acl {
 namespace {
 
 struct AclPrefix {
 	enum class Kind { NONE, ROLE, TOKEN, ADMIN };
+	//! What the remainder is, decided by the marker the CLIENT writes (the gateway only prepends the
+	//! principal, so the client itself asks for anything beyond an ordinary query):
+	//!   <sql>              -> QUERY:  rewritten inside the principal's virtual catalog
+	//!   ACL <mgmt>         -> MANAGE: an ACL management statement (needs a manage/passthrough scope)
+	//!   ACL NATIVE <sql>   -> NATIVE: plain SQL outside the virtual catalog (needs passthrough)
+	//! `ACL ADMIN ...` is the gateway's own anonymous form of the same thing - NATIVE unless it
+	//! carries a marker or a management statement.
+	enum class Mode { QUERY, MANAGE, NATIVE };
 	Kind kind = Kind::NONE;
+	Mode mode = Mode::QUERY;
 	string value;
 	string rest;
 };
@@ -70,8 +81,27 @@ AclPrefix ParseAclPrefix(const string &query) {
 	}
 	SkipWhitespace(query, pos);
 	auto mode = ReadWord(query, pos);
+	//! Read the client's marker off the remainder: `ACL [NATIVE]`
+	auto read_marker = [&](idx_t &scan) {
+		SkipWhitespace(query, scan);
+		auto saved = scan;
+		if (!StringUtil::CIEquals(ReadWord(query, scan), "acl")) {
+			scan = saved;
+			return AclPrefix::Mode::QUERY;
+		}
+		SkipWhitespace(query, scan);
+		auto after_acl = scan;
+		if (StringUtil::CIEquals(ReadWord(query, scan), "native")) {
+			return AclPrefix::Mode::NATIVE;
+		}
+		scan = after_acl;
+		return AclPrefix::Mode::MANAGE;
+	};
 	if (StringUtil::CIEquals(mode, "admin")) {
 		prefix.kind = AclPrefix::Kind::ADMIN;
+		// the gateway's own hatch: native by default, management when marked (or written bare)
+		auto marked = read_marker(pos);
+		prefix.mode = marked == AclPrefix::Mode::QUERY ? AclPrefix::Mode::NATIVE : marked;
 		prefix.rest = query.substr(pos);
 		return prefix;
 	}
@@ -86,6 +116,7 @@ AclPrefix ParseAclPrefix(const string &query) {
 	}
 	prefix.kind = is_role ? AclPrefix::Kind::ROLE : AclPrefix::Kind::TOKEN;
 	prefix.value = ReadQuoted(query, pos);
+	prefix.mode = read_marker(pos);
 	prefix.rest = query.substr(pos);
 	return prefix;
 }
@@ -198,13 +229,20 @@ bool IsMgmtStart(const string &text) {
 	    StringUtil::CIEquals(first, "revoke") || StringUtil::CIEquals(first, "map")) {
 		return true;
 	}
-	if (StringUtil::CIEquals(first, "create") || StringUtil::CIEquals(first, "drop")) {
+	if (StringUtil::CIEquals(first, "create") || StringUtil::CIEquals(first, "drop") ||
+	    StringUtil::CIEquals(first, "alter")) {
 		AdminScanner ahead(text);
 		ahead.Word("keyword");
 		auto second = ahead.PeekWord();
 		if (StringUtil::CIEquals(first, "create")) {
 			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
 			       StringUtil::CIEquals(second, "issuer");
+		}
+		if (StringUtil::CIEquals(first, "alter")) {
+			// duckdb owns ALTER TABLE/VIEW/...: our object forms carry the VIRTUAL marker, and
+			// ALTER ROLE/ISSUER/GRANT do not exist in duckdb at all
+			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
+			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "grant");
 		}
 		return StringUtil::CIEquals(second, "relation");
 	}
@@ -305,6 +343,15 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		return MakeAdminCall("acl_add_relation", {Value(vcat), Value(vname), Value(phys), Value(columns), Value(rls)});
 	}
 	if (StringUtil::CIEquals(keyword, "grant")) {
+		if (s.Accept("admin")) {
+			// GRANT ADMIN <scope> TO ROLE r - the GLOBAL scope; managing one catalog is granted with
+			// GRANT CATALOG c TO ROLE r CAPS '{"manage": true}'
+			auto scope = s.Word("an admin scope");
+			s.Expect("to");
+			s.Expect("role");
+			auto role = s.Word("a role name");
+			return MakeAdminCall("acl_grant_admin", {Value(role), Value(scope)});
+		}
 		s.Expect("catalog");
 		auto vcat = s.Word("a catalog name");
 		s.Expect("to");
@@ -318,6 +365,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		return MakeAdminCall("acl_grant_catalog", {Value(role), Value(vcat), Value(caps), Value::BOOLEAN(main)});
 	}
 	if (StringUtil::CIEquals(keyword, "revoke")) {
+		if (s.Accept("admin")) { // REVOKE ADMIN FROM ROLE r
+			s.Expect("from");
+			s.Expect("role");
+			auto role = s.Word("a role name");
+			return MakeAdminCall("acl_revoke_admin", {Value(role)});
+		}
 		s.Expect("catalog");
 		auto vcat = s.Word("a catalog name");
 		s.Expect("from");
@@ -340,6 +393,102 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		return MakeAdminCall("acl_map_role",
 		                     {Value(issuer), Value(is_group ? "group" : "claim-value"), Value(external), Value(role)});
 	}
+	if (StringUtil::CIEquals(keyword, "alter")) {
+		if (s.Accept("role")) { // ALTER ROLE r SET CLAIMS '...'
+			auto role = s.Word("a role name");
+			s.Expect("set");
+			s.Expect("claims");
+			return MakeAdminCall("acl_alter_role", {Value(role), Value(s.Quoted("claims list"))});
+		}
+		if (s.Accept("issuer")) { // ALTER ISSUER '...' SET KEYS|AUDIENCES|ALGS|ROLE CLAIM|CLAIM MAP '...'
+			auto issuer = s.Quoted("issuer");
+			s.Expect("set");
+			string field;
+			if (s.Accept("keys")) {
+				field = "keys";
+			} else if (s.Accept("audiences")) {
+				field = "audiences";
+			} else if (s.Accept("algs")) {
+				field = "algs";
+			} else if (s.Accept("role")) {
+				s.Expect("claim");
+				field = "role_claim";
+			} else {
+				s.Expect("claim");
+				s.Expect("map");
+				field = "claim_map";
+			}
+			return MakeAdminCall("acl_alter_issuer", {Value(issuer), Value(field), Value(s.Quoted("value"))});
+		}
+		if (s.Accept("grant")) { // ALTER GRANT CATALOG c TO ROLE r SET CAPS '...' | SET MAIN true|false
+			s.Expect("catalog");
+			auto vcat = s.Word("a catalog name");
+			s.Expect("to");
+			s.Expect("role");
+			auto role = s.Word("a role name");
+			s.Expect("set");
+			if (s.Accept("caps")) {
+				return MakeAdminCall("acl_alter_grant",
+				                     {Value(role), Value(vcat), Value("caps"), Value(s.Quoted("caps JSON"))});
+			}
+			s.Expect("main");
+			auto flag = s.Word("true or false");
+			return MakeAdminCall("acl_alter_grant", {Value(role), Value(vcat), Value("main"), Value(flag)});
+		}
+		// the object forms carry the VIRTUAL marker, so they never shadow duckdb's own ALTER
+		s.Expect("virtual");
+		if (s.Accept("catalog")) { // ALTER VIRTUAL CATALOG c SET COMMENT '...'
+			auto vcat = s.Word("a catalog name");
+			s.Expect("set");
+			s.Expect("comment");
+			return MakeAdminCall("acl_alter_catalog", {Value(vcat), Value(s.Quoted("comment"))});
+		}
+		if (s.Accept("view")) { // ALTER VIRTUAL VIEW v.n SET AS '...'
+			string vcat, vname;
+			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			s.Expect("set");
+			s.Expect("as");
+			return MakeAdminCall("acl_alter_relation",
+			                     {Value(vcat), Value(vname), Value("view"), Value(s.Quoted("view SQL"))});
+		}
+		if (s.Accept("schema")) { // ALTER VIRTUAL SCHEMA v.alias SET PHYS <path>
+			string vcat, alias;
+			SplitVirtual(s.Dotted("a virtual alias"), vcat, alias);
+			s.Expect("set");
+			s.Expect("phys");
+			return MakeAdminCall("acl_alter_schema_alias",
+			                     {Value(vcat), Value(alias), Value(s.Dotted("a physical schema path"))});
+		}
+		bool scalar = s.Accept("scalar");
+		if (scalar || s.Accept("table")) {
+			bool table_function = !scalar && s.Accept("function");
+			string vcat, vname;
+			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			s.Expect("set");
+			if (scalar || table_function) { // ALTER VIRTUAL [TABLE FUNCTION|SCALAR] v.n SET MACRO|ALIAS '...'
+				bool is_macro = s.Accept("macro");
+				if (!is_macro) {
+					s.Expect("alias");
+				}
+				return MakeAdminCall("acl_alter_function",
+				                     {Value(vcat), Value(vname), Value(scalar ? "scalar" : "table"),
+				                      Value(is_macro ? "macro" : "alias"), Value(s.Quoted("definition"))});
+			}
+			// ALTER VIRTUAL TABLE v.n SET PHYS <path> | SET COLUMNS '...' | SET RLS '...'
+			if (s.Accept("phys")) {
+				return MakeAdminCall("acl_alter_relation", {Value(vcat), Value(vname), Value("phys"),
+				                                            Value(s.Dotted("a physical table path"))});
+			}
+			if (s.Accept("columns")) {
+				return MakeAdminCall("acl_alter_relation",
+				                     {Value(vcat), Value(vname), Value("columns"), Value(s.Quoted("columns list"))});
+			}
+			s.Expect("rls");
+			return MakeAdminCall("acl_alter_relation",
+			                     {Value(vcat), Value(vname), Value("rls"), Value(s.Quoted("RLS predicate"))});
+		}
+		throw BinderException("acl admin: unknown ALTER VIRTUAL target");
+	}
 	if (StringUtil::CIEquals(keyword, "drop")) {
 		s.Expect("relation");
 		string vcat, vname;
@@ -347,6 +496,44 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname)});
 	}
 	throw BinderException("acl admin: unknown management statement \"%s\"", keyword);
+}
+
+//! What authorizing a compiled management call needs (spec 009), read off the call itself: which
+//! constant argument names the catalog it touches, and whether it escalates privilege.
+struct MgmtProvenance {
+	string vcat;            // "" = not catalog-specific (roles, issuers, mappings, admin grants)
+	bool escalates = false; // admin grants: only a passthrough scope may hand out scopes
+};
+
+MgmtProvenance ProvenanceOf(SQLStatement &statement) {
+	// name -> index of the constant argument holding the catalog; -1 = none
+	static const std::unordered_map<string, int> CATALOG_ARG = {
+	    {"acl_create_catalog", 0},     {"acl_add_relation", 0},       {"acl_add_view", 0},
+	    {"acl_add_schema_alias", 0},   {"acl_add_table_function", 0}, {"acl_add_table_function_alias", 0},
+	    {"acl_add_scalar", 0},         {"acl_add_scalar_alias", 0},   {"acl_drop_relation", 0},
+	    {"acl_grant_catalog", 1},      {"acl_revoke_catalog", 1},     {"acl_define_role", -1},
+	    {"acl_define_issuer", -1},     {"acl_map_role", -1},          {"acl_alter_relation", 0},
+	    {"acl_alter_schema_alias", 0}, {"acl_alter_function", 0},     {"acl_alter_catalog", 0},
+	    {"acl_alter_grant", 1},        {"acl_alter_role", -1},        {"acl_alter_issuer", -1},
+	};
+	MgmtProvenance provenance;
+	auto &select = statement.Cast<SelectStatement>().node->Cast<SelectNode>();
+	auto &call = select.select_list[0]->Cast<FunctionExpression>();
+	auto name = StringUtil::Lower(call.FunctionName().GetIdentifierName());
+	if (name == "acl_grant_admin" || name == "acl_revoke_admin") {
+		provenance.escalates = true;
+		return provenance;
+	}
+	auto entry = CATALOG_ARG.find(name);
+	if (entry == CATALOG_ARG.end()) {
+		// a management call this table does not know: refuse rather than treat it as unscoped
+		throw BinderException("acl admin: cannot authorize the management call \"%s\"", name);
+	}
+	if (entry->second >= 0) {
+		auto &argument = call.GetArguments()[NumericCast<idx_t>(entry->second)].GetExpression();
+		provenance.vcat = argument.Cast<ConstantExpression>().GetValue().ToString();
+	}
+	return provenance;
 }
 
 //! The whole batch is management statements (the first one decided that); mixing is refused
@@ -370,15 +557,75 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text) {
 	return statements;
 }
 
+//! Authorize a management batch against the principal's scope (spec 009). MANAGE may run the
+//! grammar - restricted to its catalogs when the grant names one - but never hand out scopes;
+//! PASSTHROUGH may do anything.
+void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, AdminScope scope,
+                   const case_insensitive_set_t &catalogs) {
+	if (scope == AdminScope::PASSTHROUGH) {
+		return;
+	}
+	bool unrestricted = catalogs.count("") > 0;
+	for (auto &statement : statements) {
+		auto provenance = ProvenanceOf(*statement);
+		if (provenance.escalates) {
+			throw BinderException("acl admin: granting admin scopes requires a passthrough scope");
+		}
+		if (unrestricted) {
+			continue;
+		}
+		if (provenance.vcat.empty()) {
+			throw BinderException(
+			    "acl admin: this statement is not catalog-specific and needs an unrestricted manage scope");
+		}
+		if (!catalogs.count(provenance.vcat)) {
+			throw BinderException("acl admin: no manage scope for catalog \"%s\"", provenance.vcat);
+		}
+	}
+}
+
 ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &query, ParserOptions &options) {
 	auto prefix = ParseAclPrefix(query);
 	if (prefix.kind == AclPrefix::Kind::NONE) {
 		return ParserOverrideResult(); // fall through to the native parser
 	}
+	auto &store = *info->Cast<AclParserInfo>().store;
 
-	if (prefix.kind == AclPrefix::Kind::ADMIN && IsMgmtStart(prefix.rest)) {
+	auto mode = prefix.mode;
+	bool anonymous = prefix.kind == AclPrefix::Kind::ADMIN;
+	if (anonymous && mode == AclPrefix::Mode::NATIVE && IsMgmtStart(prefix.rest)) {
+		mode = AclPrefix::Mode::MANAGE; // the gateway may write management statements unmarked
+	}
+
+	Principal principal;
+	auto scope = AdminScope::PASSTHROUGH;
+	case_insensitive_set_t manage_catalogs;
+	if (anonymous) {
+		if (!store.AnonymousAdminAllowed()) {
+			throw BinderException("acl admin: a bare ACL ADMIN is disabled - authenticate the principal "
+			                      "(ACL TOKEN '<jwt>' ACL ...) or set acl_allow_anonymous_admin");
+		}
+	} else if (mode != AclPrefix::Mode::QUERY) {
+		// leaving the virtual catalog - as management or as native SQL - is a granted capability
+		bool is_token = prefix.kind == AclPrefix::Kind::TOKEN;
+		if (!store.VerifyPrincipal(is_token, prefix.value, principal)) {
+			throw BinderException("acl_rewrite: %s verification failed", is_token ? "token" : "role");
+		}
+		scope = store.AdminScopeOf(principal, manage_catalogs);
+		if (scope == AdminScope::NONE) {
+			throw BinderException("acl admin: the principal has no ACL administration scope");
+		}
+	}
+
+	if (mode == AclPrefix::Mode::MANAGE) {
 		// the management grammar (spec 008): compiled to admin-function calls, no native parse
-		return ParserOverrideResult(ParseMgmtBatch(prefix.rest));
+		auto statements = ParseMgmtBatch(prefix.rest);
+		AuthorizeMgmt(statements, scope, manage_catalogs);
+		return ParserOverrideResult(std::move(statements));
+	}
+	if (mode == AclPrefix::Mode::NATIVE && scope != AdminScope::PASSTHROUGH) {
+		// a manage scope administers the ACL; running SQL outside the virtual catalog is god mode
+		throw BinderException("acl admin: native SQL outside the virtual catalog requires a passthrough scope");
 	}
 
 	// re-parse the remainder with the native parser (never re-entering this override)
@@ -387,12 +634,10 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 	Parser parser(inner);
 	parser.ParseQuery(prefix.rest);
 
-	if (prefix.kind == AclPrefix::Kind::ADMIN) {
-		return ParserOverrideResult(std::move(parser.statements)); // passthrough, no rewrite
+	if (mode == AclPrefix::Mode::NATIVE) {
+		return ParserOverrideResult(std::move(parser.statements)); // no rewrite: the native context
 	}
 
-	auto &store = *info->Cast<AclParserInfo>().store;
-	Principal principal;
 	bool is_token = prefix.kind == AclPrefix::Kind::TOKEN;
 	if (!store.VerifyPrincipal(is_token, prefix.value, principal)) {
 		throw BinderException("acl_rewrite: %s verification failed", is_token ? "token" : "role");

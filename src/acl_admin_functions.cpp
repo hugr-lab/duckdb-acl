@@ -377,6 +377,117 @@ void AclAllowFunctionFunc(DataChunk &args, ExpressionState &state, Vector &resul
 	SetFunctionGate(args, state, result, "acl_allow_function", true);
 }
 
+//===--------------------------------------------------------------------===//
+// ALTER: partial change of an EXISTING object (spec 009). Unlike the ADD/GRANT upserts, a missing
+// target is an error, and every property not named keeps its current value.
+//===--------------------------------------------------------------------===//
+
+//! acl_alter_relation(vcat, vname, field, value): field is phys | columns | rls | view
+void AclAlterRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_alter_relation", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_alter_relation", "name");
+		auto field = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_relation", "property"));
+		auto value = OptionalArg(args, 3, row, "");
+		StoreOf(state).CatalogAlterRelation(
+		    vcat, vname, field, value, field == "columns" ? ParseColumns(value) : vector<std::pair<string, string>>());
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_alter_schema_alias(vcat, alias_path, phys_path): retarget an existing schema alias
+void AclAlterSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_alter_schema_alias", "catalog");
+		auto alias = RequiredArg(args, 1, row, "acl_alter_schema_alias", "alias path");
+		auto phys = RequiredArg(args, 2, row, "acl_alter_schema_alias", "phys path");
+		StoreOf(state).CatalogAlterSchemaAlias(vcat, alias, phys);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_alter_function(vcat, vname, kind, form, definition): redefine an existing virtual function
+void AclAlterFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_alter_function", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_alter_function", "name");
+		auto kind = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_function", "kind"));
+		auto form = StringUtil::Lower(RequiredArg(args, 3, row, "acl_alter_function", "form"));
+		auto definition = RequiredArg(args, 4, row, "acl_alter_function", "definition");
+		StoreOf(state).CatalogAlterFunction(vcat, vname, kind, form, definition);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_alter_catalog(vcat, comment) / acl_alter_role(role, claims_csv)
+void AclAlterCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_alter_catalog", "catalog");
+		StoreOf(state).CatalogAlterCatalog(vcat, OptionalArg(args, 1, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclAlterRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = RequiredArg(args, 0, row, "acl_alter_role", "role");
+		StoreOf(state).CatalogAlterRole(role, ParseClaims(OptionalArg(args, 1, row, "")));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_alter_grant(role, vcat, field, value): field is caps | main
+void AclAlterGrantFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = RequiredArg(args, 0, row, "acl_alter_grant", "role");
+		auto vcat = RequiredArg(args, 1, row, "acl_alter_grant", "catalog");
+		auto field = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_grant", "property"));
+		auto value = OptionalArg(args, 3, row, "");
+		StoreOf(state).CatalogAlterGrant(role, vcat, field, value);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_alter_issuer(issuer, field, value): field is keys | audiences | algs | role_claim | claim_map
+void AclAlterIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto issuer = RequiredArg(args, 0, row, "acl_alter_issuer", "issuer");
+		auto field = StringUtil::Lower(RequiredArg(args, 1, row, "acl_alter_issuer", "property"));
+		auto value = OptionalArg(args, 2, row, "");
+		StoreOf(state).CatalogAlterIssuer(issuer, field, value);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_grant_admin(role, scope): a GLOBAL administration scope (spec 009) - 'manage' (the management
+//! grammar over every catalog, plus the statements that belong to no catalog) or 'passthrough'
+//! (anything, including native SQL - god mode). Managing ONE catalog is not granted here: it is a
+//! capability of the catalog grant, `acl_grant_catalog(role, vcat, '{"manage": true}')`.
+void AclGrantAdminFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = RequiredArg(args, 0, row, "acl_grant_admin", "role");
+		auto scope = RequiredArg(args, 1, row, "acl_grant_admin", "scope");
+		AdminScope parsed;
+		if (StringUtil::CIEquals(scope, "passthrough")) {
+			parsed = AdminScope::PASSTHROUGH;
+		} else if (StringUtil::CIEquals(scope, "manage")) {
+			parsed = AdminScope::MANAGE;
+		} else {
+			throw InvalidInputException("acl_grant_admin: scope must be 'manage' or 'passthrough'");
+		}
+		StoreOf(state).GrantAdmin(role, parsed);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_revoke_admin(role): drop the role's ACL-administration scope
+void AclRevokeAdminFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		StoreOf(state).RevokeAdmin(RequiredArg(args, 0, row, "acl_revoke_admin", "role"));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
 //! acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_claim, claim_map_json):
 //! register an offline JWT issuer (spec 007). keys_json is a JWKS (RSA n/e, EC x/y, oct k) or a PEM
 //! public key; keys are data - the gateway/admin rotates them.
@@ -494,6 +605,17 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	// offline JWT verification (spec 007)
 	register_admin("acl_define_issuer", {v, v, v, v, v, v}, AclDefineIssuerFunc);
 	register_admin("acl_map_role", {v, v, v, v}, AclMapRoleFunc);
+	// ALTER of existing objects (spec 009)
+	register_admin("acl_alter_relation", {v, v, v, v}, AclAlterRelationFunc);
+	register_admin("acl_alter_schema_alias", {v, v, v}, AclAlterSchemaAliasFunc);
+	register_admin("acl_alter_function", {v, v, v, v, v}, AclAlterFunctionFunc);
+	register_admin("acl_alter_catalog", {v, v}, AclAlterCatalogFunc);
+	register_admin("acl_alter_role", {v, v}, AclAlterRoleFunc);
+	register_admin("acl_alter_grant", {v, v, v, v}, AclAlterGrantFunc);
+	register_admin("acl_alter_issuer", {v, v, v}, AclAlterIssuerFunc);
+	// ACL administration scopes (spec 009)
+	register_admin("acl_grant_admin", {v, v}, AclGrantAdminFunc);
+	register_admin("acl_revoke_admin", {v}, AclRevokeAdminFunc);
 }
 
 } // namespace acl

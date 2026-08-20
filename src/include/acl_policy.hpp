@@ -44,6 +44,10 @@ struct TablePolicy {
 //! Whether a function reference is a scalar/aggregate (expression position) or a table function (FROM)
 enum class FunctionKind : uint8_t { SCALAR, TABLE };
 
+//! What a principal may do with the ACL itself (spec 009). NONE is the default: the ACL is managed
+//! by the gateway, not by the roles it serves.
+enum class AdminScope : uint8_t { NONE, MANAGE, PASSTHROUGH };
+
 //! One issuer's offline JWT verification config (spec 007): a row of acl.issuers, or the in-memory
 //! issuer map. Keys are data, never fetched: the gateway/admin rotates them.
 struct IssuerConfig {
@@ -120,6 +124,8 @@ struct PolicyStore {
 	// issuer registry + external->role mappings (spec 007), memory-mode counterparts of the catalog
 	case_insensitive_map_t<IssuerConfig> issuers;
 	case_insensitive_map_t<case_insensitive_map_t<vector<string>>> role_mappings; // issuer -> external -> roles
+	// role -> global administration scope (spec 009); per-catalog manage lives in the catalog grant
+	case_insensitive_map_t<AdminScope> admin_scopes;
 	// role -> default claims (used by the ROLE form, which carries no token)
 	case_insensitive_map_t<case_insensitive_map_t<string>> role_claims;
 	// gateway-wide function denylist (readers / rights-bypass); everything else passes
@@ -160,6 +166,24 @@ struct PolicyStore {
 	//! remove=true deletes the gate row (fall back to the default denylist); otherwise upserts it
 	void CatalogSetFunctionGate(const string &name, bool allowed, bool remove);
 	void CatalogDefineIssuer(const IssuerConfig &config);
+	// ALTER operations (spec 009): partial change of an EXISTING object - unlike the ADD/GRANT
+	// upserts, a missing target is an error. field names the single property being set.
+	void CatalogAlterRelation(const string &vcat, const string &vname, const string &field, const string &value,
+	                          const vector<std::pair<string, string>> &columns);
+	void CatalogAlterSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path);
+	void CatalogAlterFunction(const string &vcat, const string &vname, const string &kind, const string &form,
+	                          const string &definition);
+	void CatalogAlterCatalog(const string &vcat, const string &comment);
+	void CatalogAlterRole(const string &role, const case_insensitive_map_t<string> &claims);
+	void CatalogAlterGrant(const string &role, const string &vcat, const string &field, const string &value);
+	void CatalogAlterIssuer(const string &issuer, const string &field, const string &value);
+	void CatalogGrantAdmin(const string &role, const string &scope);
+	void CatalogRevokeAdmin(const string &role);
+	//! role -> (scope, vcat) rows of the principal; missing roles simply do not appear
+	void CatalogAdminScopes(const Principal &principal, case_insensitive_map_t<std::pair<string, string>> &out);
+	//! catalogs whose grant carries the "manage" capability for any of the principal's roles
+	void CatalogManageCatalogs(const Principal &principal, case_insensitive_set_t &out);
+	bool CatalogAnonymousAdminAllowed();
 	void CatalogMapRole(const string &issuer, const string &source, const string &external_value, const string &role);
 	//! per-object caps override (the compatibility wrappers carry per-object caps, spec 006)
 	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json);
@@ -180,6 +204,17 @@ struct PolicyStore {
 	//! Register an issuer / map an external role value (memory mode; catalog mode via the Catalog* ops)
 	void DefineIssuer(IssuerConfig config);
 	void MapRole(const string &issuer, const string &source, const string &external_value, const string &role);
+
+	//! Grant/revoke a GLOBAL ACL-administration scope for a role (spec 009). Managing one catalog is
+	//! not granted here - it is a capability of the catalog grant itself ({"manage": true}).
+	void GrantAdmin(const string &role, AdminScope scope);
+	void RevokeAdmin(const string &role);
+	//! The principal's effective scope: the strongest over its roles and its catalog grants.
+	//! `catalogs_out` collects the catalogs it may manage (an empty entry = every catalog).
+	AdminScope AdminScopeOf(const Principal &principal, case_insensitive_set_t &catalogs_out);
+	//! Whether an anonymous `ACL ADMIN` (no principal) is still permitted: always in the in-memory
+	//! dev mode, and with a policy source only when acl_allow_anonymous_admin is on (spec 009).
+	bool AnonymousAdminAllowed();
 
 	bool ResolveTable(const Principal &principal, const string &vname, TablePolicy &out);
 	bool ResolveTableFunction(const Principal &principal, const string &vname, TablePolicy &out);

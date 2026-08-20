@@ -54,6 +54,10 @@ void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("acl_version_check_interval",
 	                          "acl: milliseconds between policy_version checks of the policy catalog",
 	                          LogicalType::BIGINT, Value::BIGINT(1000));
+	config.AddExtensionOption("acl_allow_anonymous_admin",
+	                          "acl: allow a bare `ACL ADMIN` (no principal) once a policy source is "
+	                          "enabled - the gateway's own escape hatch (spec 009)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	config.AddExtensionOption("acl_jwt_clock_skew", "acl: allowed clock skew in seconds for JWT exp/nbf checks",
 	                          LogicalType::BIGINT, Value::BIGINT(60));
 
