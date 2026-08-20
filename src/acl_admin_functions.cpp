@@ -258,6 +258,38 @@ void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &resu
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! acl_register_created(vcat, vname, phys, origin): the one write a principal's own DDL performs
+//! (spec 016). Deliberately narrow - it can only add an alias-form record for an object that was just
+//! created, with no form, projection or policy to choose - and it is unreachable from a principal's
+//! query, where every acl_* name is denied (spec 009).
+void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_register_created", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_register_created", "name");
+		auto phys = RequiredArg(args, 2, row, "acl_register_created", "phys");
+		StoreOf(state).CatalogRegisterCreated(vcat, vname, phys, OptionalArg(args, 3, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_register_existing(vcat, vname, phys, origin): the VIRTUAL ONLY form of the above - it records
+//! an object that must already exist physically, and refuses if it does not (spec 016)
+void AclRegisterExistingFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_register_existing", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_register_existing", "name");
+		auto phys = RequiredArg(args, 2, row, "acl_register_existing", "phys");
+		auto &store = StoreOf(state);
+		if (!store.PhysicalObjectExists(phys)) {
+			throw BinderException("acl: \"%s\" does not exist - this role may register objects, not create them "
+			                      "(VIRTUAL ONLY)",
+			                      phys);
+		}
+		store.CatalogRegisterCreated(vcat, vname, phys, OptionalArg(args, 3, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
 //! acl_grant_schema(role, vcat, path, caps_json[, comment]) / acl_revoke_schema(role, vcat, path):
 //! the middle level of the grant chain (spec 015) - capabilities only, materialised down the subtree
 void AclGrantSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -267,7 +299,13 @@ void AclGrantSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		auto path = RequiredArg(args, 2, row, "acl_grant_schema", "schema path");
 		auto &store = StoreOf(state);
 		store.CatalogEnsureGrant(role, vcat, false);
-		store.CatalogGrantSchema(role, vcat, path, OptionalArg(args, 3, row, ""), OptionalArg(args, 4, row, ""));
+		bool virtual_only = false;
+		if (args.ColumnCount() > 6) {
+			auto value = args.GetValue(6, row);
+			virtual_only = !value.IsNull() && value.GetValue<bool>();
+		}
+		store.CatalogGrantSchema(role, vcat, path, OptionalArg(args, 3, row, ""), OptionalArg(args, 4, row, ""),
+		                         OptionalArg(args, 5, row, ""), virtual_only);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -894,7 +932,9 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_add_view", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}}, AclAddViewFunc);
 	register_admin_set("acl_add_schema_alias", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclAddSchemaAliasFunc);
 	register_admin_set("acl_expand_schema", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclExpandSchemaFunc);
-	register_admin_set("acl_grant_schema", {{v, v, v, v}, {v, v, v, v, v}}, AclGrantSchemaFunc);
+	register_admin_set("acl_grant_schema", {{v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v, b}}, AclGrantSchemaFunc);
+	register_admin_set("acl_register_created", {{v, v, v}, {v, v, v, v}}, AclRegisterCreatedFunc);
+	register_admin_set("acl_register_existing", {{v, v, v}, {v, v, v, v}}, AclRegisterExistingFunc);
 	register_admin("acl_revoke_schema", {v, v, v}, AclRevokeSchemaFunc);
 	register_admin_set("acl_rematerialize_schema_caps", {{v}, {v, v}}, AclRematerializeSchemaCapsFunc);
 	register_admin_set("acl_add_table_function",

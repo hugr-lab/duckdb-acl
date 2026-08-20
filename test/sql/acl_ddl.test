@@ -1,0 +1,299 @@
+# name: test/sql/acl_ddl.test
+# description: DDL through the ACL (spec 016) - `create`/`drop` on a schema grant, and where the
+#   object lands: the grant decides, and the catalog record follows the kind of schema
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE TABLE phys.lake.orders(id INT, amount INT);
+
+statement ok
+INSERT INTO phys.lake.orders VALUES (1, 100);
+
+statement ok
+CREATE SCHEMA phys.staging;
+
+statement ok
+CREATE SCHEMA phys.live;
+
+statement ok
+CREATE TABLE phys.live.events(id INT);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+# an expansion (its records are what is visible) and a live alias (the source is what is visible)
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.vs FROM phys.lake;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.live;
+
+statement ok
+ACL ADMIN CREATE ROLE ingest;
+
+statement ok
+ACL ADMIN CREATE ROLE reader;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE ingest CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE reader CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE reader WITH (select);
+
+# --- without `create` nothing is created ------------------------------------------------------------
+
+statement error
+ACL ROLE "reader" CREATE TABLE vs.landing(id INTEGER);
+----
+<REGEX>:.*create on schema "vs" is not allowed.*
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'landing';
+----
+0
+
+# --- an expansion: the object is created in its origin, and gets a record ---------------------------
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE ingest WITH (select, insert, create);
+
+statement ok
+ACL ROLE "ingest" CREATE TABLE vs.landing(id INTEGER, payload VARCHAR);
+
+query II
+SELECT database_name, schema_name FROM duckdb_tables() WHERE table_name = 'landing';
+----
+phys	lake
+
+query III
+SELECT vname, form, origin FROM aclcat.acl.relations WHERE vname = 'vs.landing';
+----
+vs.landing	alias	phys.lake
+
+# it is a relation like any other: the schema grant's capabilities apply to it at once
+statement ok
+ACL ROLE "ingest" INSERT INTO vs.landing VALUES (1, 'x');
+
+query I
+ACL ROLE "ingest" SELECT count(*) FROM vs.landing;
+----
+1
+
+# ... and REFRESH treats it as part of the expansion rather than as something to add again
+query I
+ACL ADMIN SELECT acl_refresh_schema_objects('sales', 'vs');
+----
+0
+
+# --- an alias: the source shows the object, so no record is written ---------------------------------
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE ingest WITH (select, create);
+
+statement ok
+ACL ROLE "ingest" CREATE TABLE raw.arrived(id INTEGER);
+
+query II
+SELECT database_name, schema_name FROM duckdb_tables() WHERE table_name = 'arrived';
+----
+phys	live
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vname = 'raw.arrived';
+----
+0
+
+# the live alias shows it without a record
+query I
+ACL ROLE "ingest" SELECT count(*) FROM raw.arrived;
+----
+0
+
+# --- INTO: the grant sends the object somewhere else than the declaration ---------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE lander;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE lander CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE lander WITH (select, create) INTO phys.staging;
+
+statement ok
+ACL ROLE "lander" CREATE TABLE vs.dropbox(id INTEGER);
+
+query II
+SELECT database_name, schema_name FROM duckdb_tables() WHERE table_name = 'dropbox';
+----
+phys	staging
+
+# the record points where the object actually is
+query I
+SELECT phys FROM aclcat.acl.relations WHERE vname = 'vs.dropbox';
+----
+phys.staging.dropbox
+
+# a target that does not exist is refused when the grant is written, not when a CREATE lands on it
+statement error
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE lander WITH (create) INTO phys.nosuchschema;
+----
+<REGEX>:.*physical schema "phys.nosuchschema" does not exist.*
+
+# --- VIRTUAL ONLY: registers what exists, never materialises ----------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE curator;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE curator CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE curator WITH (select, create) VIRTUAL ONLY;
+
+statement error
+ACL ROLE "curator" CREATE TABLE vs.imaginary(id INTEGER);
+----
+<REGEX>:.*does not exist - this role may register objects, not create them.*
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'imaginary';
+----
+0
+
+# an object that is already there is registered instead
+statement ok
+CREATE TABLE phys.lake.by_hand(id INT);
+
+statement ok
+ACL ROLE "curator" CREATE TABLE vs.by_hand(id INTEGER);
+
+query II
+SELECT form, phys FROM aclcat.acl.relations WHERE vname = 'vs.by_hand';
+----
+alias	phys.lake.by_hand
+
+# INTO and VIRTUAL ONLY are opposites
+statement error
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE curator WITH (create) INTO phys.staging VIRTUAL ONLY;
+----
+<REGEX>:.*(INTO and VIRTUAL ONLY are opposites|unexpected trailing text).*
+
+# --- dropping: the user-facing drop takes both, the administrative one takes the record --------------
+
+statement error
+ACL ROLE "ingest" DROP TABLE vs.landing;
+----
+<REGEX>:.*drop on schema "vs" is not allowed.*
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE ingest WITH (select, insert, create, drop);
+
+statement ok
+ACL ROLE "ingest" DROP TABLE vs.landing;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'landing';
+----
+0
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vname = 'vs.landing';
+----
+0
+
+# the administrative drop forgets the record and leaves the physics alone
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE sales.vs.dropbox;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vname = 'vs.dropbox';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'dropbox';
+----
+1
+
+# --- a failed CREATE leaves no record behind --------------------------------------------------------
+# the object exists physically but has no record: if the record were written first, a failing CREATE
+# would leave the catalog describing something this role never made
+
+statement ok
+CREATE TABLE phys.lake.ghost(id INT);
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vname = 'vs.ghost';
+----
+0
+
+statement error
+ACL ROLE "ingest" CREATE TABLE vs.ghost(id INTEGER);
+----
+<REGEX>:.*already exists.*
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vname = 'vs.ghost';
+----
+0
+
+# a batch keeps its order: each CREATE is followed by its own record, and a later failure does not
+# undo an earlier success (the batch is not one transaction)
+statement error
+ACL ROLE "ingest" CREATE TABLE vs.first(id INTEGER); CREATE TABLE vs.ghost(id INTEGER);
+----
+<REGEX>:.*already exists.*
+
+query II
+SELECT vname, phys FROM aclcat.acl.relations WHERE vname = 'vs.first';
+----
+vs.first	phys.lake.first
+
+# --- the catalog level does not stand in for the schema level ---------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE schemamaker;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE schemamaker CAPS '{"create": true}' MAIN;
+
+statement error
+ACL ROLE "schemamaker" CREATE TABLE vs.sneaky(id INTEGER);
+----
+<REGEX>:.*no schema of the catalog allows creating "vs.sneaky".*
+
+# --- only tables and views, and never through a name nobody granted ---------------------------------
+
+statement error
+ACL ROLE "ingest" CREATE TABLE nosuchschema.t(id INTEGER);
+----
+<REGEX>:.*no schema of the catalog allows creating.*
+
+statement error
+ACL ROLE "ingest" CREATE TEMP TABLE vs.tmp(id INTEGER);
+----
+<REGEX>:.*temporary objects are not available.*

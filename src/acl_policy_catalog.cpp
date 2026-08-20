@@ -1011,6 +1011,55 @@ struct CatalogBackend {
 		}
 	}
 
+	//! Where a `CREATE`/`DROP` of `vname` lands for this principal (spec 016). One query: the longest
+	//! virtual schema prefix of the name that the principal's roles hold, with the grant that states
+	//! the capability - so a schema nobody granted, or granted without it, simply does not answer.
+	bool DdlTarget(const Principal &principal, const string &vname, const string &capability, acl::DdlTarget &out) {
+		if (principal.roles.empty() || function_mode) {
+			return false; // the driver contract has no schema grants, so it has no DDL target
+		}
+		EnsureFresh();
+		auto sql = GrantsCte(principal) +
+		           "SELECT s.\"vcat\", s.\"path\", s.\"phys_path\", s.\"origin\", rs.\"caps\", rs.\"into\","
+		           " rs.\"virtual_only\" FROM " +
+		           Tbl("schemas") + " s JOIN grants g ON g.\"vcat\" = s.\"vcat\" JOIN " + Tbl("role_schemas") +
+		           " rs ON rs.\"role\" = g.\"role\" AND rs.\"vcat\" = s.\"vcat\""
+		           " AND rs.\"schema_path\" = s.\"path\" WHERE substr(" +
+		           Lit(vname) +
+		           ", 1, length(s.\"path\") + 1) = s.\"path\" || '.'"
+		           " ORDER BY length(s.\"path\") DESC";
+		auto result = Query(sql);
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			auto caps_value = result->GetValue(4, row);
+			if (!EffectiveCaps(caps_value).count(capability)) {
+				continue; // this role may not; another role of the principal still might
+			}
+			auto phys_path = result->GetValue(2, row);
+			auto origin = result->GetValue(3, row);
+			auto into = result->GetValue(5, row);
+			auto only = result->GetValue(6, row);
+			out.vcat = result->GetValue(0, row).ToString();
+			out.schema_path = result->GetValue(1, row).ToString();
+			out.origin = origin.IsNull() ? string() : origin.ToString();
+			// an alias shows the physical schema live, so nothing has to be recorded; an expansion
+			// shows only its own records, so a new object needs one
+			out.needs_record = phys_path.IsNull();
+			out.virtual_only = !only.IsNull() && only.GetValue<bool>();
+			// the grant chooses where this role creates; without a choice the declaration decides
+			out.phys_schema =
+			    !into.IsNull() ? into.ToString() : (phys_path.IsNull() ? out.origin : phys_path.ToString());
+			if (out.phys_schema.empty() && !out.virtual_only) {
+				continue; // a schema that is neither an alias nor an expansion has nowhere to create
+			}
+			return true;
+		}
+		if (result->RowCount() > 0) {
+			throw BinderException("acl: %s on schema \"%s\" is not allowed", capability,
+			                      result->GetValue(1, 0).ToString());
+		}
+		return false;
+	}
+
 	//! Targeted gate lookup: only the rows for this name and these roles leave the database ('' as
 	//! role means a global row - NULL cannot be part of the primary key). Role-specific rows beat
 	//! global rows; among role rows an explicit deny wins.
@@ -1436,6 +1485,10 @@ struct CatalogBackend {
 		        "(\"role\" VARCHAR, \"vcat\" VARCHAR, \"schema_path\" VARCHAR, \"caps\" VARCHAR,"
 		        " \"inherited\" BOOLEAN, \"comment\" VARCHAR,"
 		        " PRIMARY KEY (\"role\", \"vcat\", \"schema_path\"))",
+		    // spec 016: where this role creates - a physical schema of its own (`INTO`), or nothing at
+		    // all (`VIRTUAL ONLY`: it may only register objects that already exist)
+		    "ALTER TABLE " + Tbl("role_schemas") + " ADD COLUMN IF NOT EXISTS \"into\" VARCHAR",
+		    "ALTER TABLE " + Tbl("role_schemas") + " ADD COLUMN IF NOT EXISTS \"virtual_only\" BOOLEAN",
 		    // a record dropped on purpose must not come back on the next REFRESH
 		    "CREATE TABLE IF NOT EXISTS " + Tbl("schema_dropped") +
 		        "(\"vcat\" VARCHAR, \"path\" VARCHAR, \"name\" VARCHAR,"
@@ -1451,9 +1504,9 @@ struct CatalogBackend {
 		    // the declared signature ("name TYPE, …"): it makes a probe meaningful (typed NULLs) and,
 		    // together with a declared result, unnecessary
 		    "ALTER TABLE " + Tbl("functions") + " ADD COLUMN IF NOT EXISTS \"params\" VARCHAR",
-		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '5' WHERE NOT EXISTS (SELECT 1 FROM " +
+		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '6' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
-		    "UPDATE " + Tbl("meta") + " SET \"value\" = '5' WHERE \"key\" = 'schema_version' AND \"value\" < '5'",
+		    "UPDATE " + Tbl("meta") + " SET \"value\" = '6' WHERE \"key\" = 'schema_version' AND \"value\" < '6'",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'policy_version')",
 		};
@@ -1694,8 +1747,52 @@ vector<string> PhysicalObjects(acl_detail::CatalogBackend &catalog, const string
 
 } // namespace
 
+bool PolicyStore::PhysicalObjectExists(const string &phys) {
+	RequireCatalog(catalog, "acl catalog");
+	auto dot = phys.rfind('.');
+	if (dot == string::npos) {
+		return false;
+	}
+	string database, schema;
+	SplitPhysSchema(phys.substr(0, dot), database, schema);
+	auto name = phys.substr(dot + 1);
+	return catalog
+	           ->Query("SELECT 1 FROM duckdb_tables() WHERE database_name = " + Lit(database) +
+	                   " AND schema_name = " + Lit(schema) + " AND table_name = " + Lit(name) +
+	                   " UNION ALL SELECT 1 FROM duckdb_views() WHERE database_name = " + Lit(database) +
+	                   " AND schema_name = " + Lit(schema) + " AND view_name = " + Lit(name))
+	           ->RowCount() > 0;
+}
+
+void PolicyStore::CatalogRegisterCreated(const string &vcat, const string &vname, const string &phys,
+                                         const string &origin) {
+	RequireCatalog(catalog, "acl_register_created");
+	// fixed shape: an alias-form record of the object just created, stamped with the schema's origin
+	// so REFRESH and PRUNE own it like the rest of the expansion
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		statements = RelationStatements(*catalog, vcat, vname, "alias", phys, "", "", {}, "", "", origin);
+		// creating a name that was dropped on purpose earlier makes it current again
+		auto dot = vname.rfind('.');
+		if (dot != string::npos) {
+			statements.push_back("DELETE FROM " + catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                     " AND \"path\" = " + Lit(vname.substr(0, dot)) +
+			                     " AND \"name\" = " + Lit(vname.substr(dot + 1)));
+		}
+	});
+}
+
+bool PolicyStore::ResolveDdlTarget(const Principal &principal, const string &vname, const string &capability,
+                                   DdlTarget &out) {
+	if (!catalog) {
+		return false; // the memory store has no schema grants (dev/tests)
+	}
+	return catalog->DdlTarget(principal, vname, capability, out);
+}
+
 void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, const string &path,
-                                     const string &caps_json, const string &comment) {
+                                     const string &caps_json, const string &comment, const string &into,
+                                     bool virtual_only) {
 	RequireCatalog(catalog, "acl_grant_schema");
 	if (acl_detail::ParseCaps(caps_json).count("manage")) {
 		throw BinderException("acl admin: `manage` is granted per catalog, not per schema - administering the ACL is "
@@ -1704,12 +1801,29 @@ void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, con
 	if (!CatalogObjectExists(vcat, path, "schema")) {
 		throw BinderException("acl admin: schema \"%s.%s\" does not exist", vcat, path);
 	}
+	if (!into.empty()) {
+		// a target checked when granted, not when a CREATE first lands on it (spec 016)
+		string database, schema;
+		SplitPhysSchema(into, database, schema);
+		if (catalog
+		        ->Query("SELECT 1 FROM duckdb_schemas() WHERE database_name = " + Lit(database) +
+		                " AND schema_name = " + Lit(schema))
+		        ->RowCount() == 0) {
+			throw BinderException("acl admin: physical schema \"%s\" does not exist (is its database attached?)", into);
+		}
+	}
+	if (virtual_only && !into.empty()) {
+		throw BinderException("acl admin: INTO and VIRTUAL ONLY are opposites - one names where the role creates, "
+		                      "the other says it never does");
+	}
 	catalog->Write({"DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat) + " AND \"schema_path\" = " + Lit(path),
 	                "INSERT INTO " + catalog->Tbl("role_schemas") +
-	                    "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\", \"comment\") VALUES (" +
+	                    "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\", \"comment\", \"into\","
+	                    " \"virtual_only\") VALUES (" +
 	                    Lit(role) + ", " + Lit(vcat) + ", " + Lit(path) + ", " + Lit(caps_json) + ", false, " +
-	                    (comment.empty() ? "NULL" : Lit(comment)) + ")"});
+	                    (comment.empty() ? "NULL" : Lit(comment)) + ", " + (into.empty() ? "NULL" : Lit(into)) + ", " +
+	                    (virtual_only ? "true" : "false") + ")"});
 	CatalogRematerializeSchemaCaps(vcat, path);
 }
 
@@ -1737,19 +1851,29 @@ void PolicyStore::CatalogRematerializeSchemaCaps(const string &vcat, const strin
 		                    " AND " + in_subtree("\"path\"") + " ORDER BY length(\"path\")");
 		// every explicit grant of the catalog, per role, longest path first: the first ancestor in
 		// that order is the nearest one, which is also what makes an explicit row stop the cascade
-		auto rows = read("SELECT \"role\", \"schema_path\", \"caps\" FROM " + catalog->Tbl("role_schemas") +
-		                 " WHERE \"vcat\" = " + Lit(vcat) +
+		auto rows = read("SELECT \"role\", \"schema_path\", \"caps\", \"into\", \"virtual_only\" FROM " +
+		                 catalog->Tbl("role_schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                 " AND NOT \"inherited\""
 		                 " ORDER BY \"role\", length(\"schema_path\") DESC");
+		struct SchemaGrant {
+			string path;
+			string caps;
+			string into;
+			bool virtual_only;
+		};
 		vector<string> roles;
-		case_insensitive_map_t<vector<std::pair<string, string>>> granted; // role -> (path, caps)
+		case_insensitive_map_t<vector<SchemaGrant>> granted;
 		for (idx_t row = 0; row < rows->RowCount(); row++) {
 			auto role = rows->GetValue(0, row).ToString();
 			auto caps = rows->GetValue(2, row);
+			auto into = rows->GetValue(3, row);
+			auto only = rows->GetValue(4, row);
 			if (!granted.count(role)) {
 				roles.push_back(role);
 			}
-			granted[role].emplace_back(rows->GetValue(1, row).ToString(), caps.IsNull() ? string() : caps.ToString());
+			granted[role].push_back({rows->GetValue(1, row).ToString(), caps.IsNull() ? string() : caps.ToString(),
+			                         into.IsNull() ? string() : into.ToString(),
+			                         !only.IsNull() && only.GetValue<bool>()});
 		}
 		// drop what was inherited inside the subtree: it is about to be recomputed
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -1758,19 +1882,21 @@ void PolicyStore::CatalogRematerializeSchemaCaps(const string &vcat, const strin
 			auto schema_path = schemas->GetValue(0, row).ToString();
 			for (auto &role : roles) {
 				for (auto &grant : granted[role]) {
-					if (grant.first == schema_path) {
+					if (grant.path == schema_path) {
 						break; // the schema states its own capabilities for this role
 					}
-					auto ancestor = grant.first + ".";
+					auto ancestor = grant.path + ".";
 					if (schema_path.size() <= ancestor.size() ||
 					    schema_path.compare(0, ancestor.size(), ancestor) != 0) {
 						continue; // not an ancestor of this schema
 					}
 					statements.push_back("INSERT INTO " + catalog->Tbl("role_schemas") +
-					                     "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\")"
-					                     " VALUES (" +
+					                     "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\","
+					                     " \"into\", \"virtual_only\") VALUES (" +
 					                     Lit(role) + ", " + Lit(vcat) + ", " + Lit(schema_path) + ", " +
-					                     (grant.second.empty() ? "NULL" : Lit(grant.second)) + ", true)");
+					                     (grant.caps.empty() ? "NULL" : Lit(grant.caps)) + ", true, " +
+					                     (grant.into.empty() ? "NULL" : Lit(grant.into)) + ", " +
+					                     (grant.virtual_only ? "true" : "false") + ")");
 					break; // nearest ancestor found for this role; the next role is independent
 				}
 			}

@@ -19,13 +19,18 @@
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/parsed_data/create_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
+#include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -97,12 +102,103 @@ public:
 		case StatementType::EXPLAIN_STATEMENT:
 			RewriteStatement(*stmt.Cast<ExplainStatement>().stmt);
 			break;
+		case StatementType::CREATE_STATEMENT:
+			RewriteCreateStatement(stmt.Cast<CreateStatement>());
+			break;
+		case StatementType::DROP_STATEMENT:
+			RewriteDropStatement(stmt.Cast<DropStatement>());
+			break;
 		default:
 			Deny("statement type " + StatementTypeToString(stmt.type) + " is not permitted under ACL");
 		}
 	}
 
+	//! Statements the rewrite appends after the one being rewritten - the catalog record of an object
+	//! a principal's DDL creates or drops. They run only if the DDL before them succeeded, so a failed
+	//! CREATE never leaves a record behind (spec 016).
+	vector<unique_ptr<SQLStatement>> follow_ups;
+	//! Set when the statement itself must not run: VIRTUAL ONLY registers what exists, it never creates
+	bool drop_statement = false;
+
 private:
+	//===------------------------------------------------------------------===//
+	// DDL through the ACL (spec 016)
+	//===------------------------------------------------------------------===//
+
+	//! `SELECT acl_…(args)` as a statement of the batch. Built here, never written by a principal:
+	//! every acl_* name is denied in a principal's own query (spec 009).
+	unique_ptr<SQLStatement> AclCall(const string &function, vector<Value> arguments) {
+		vector<unique_ptr<ParsedExpression>> children;
+		for (auto &argument : arguments) {
+			children.push_back(make_uniq<ConstantExpression>(std::move(argument)));
+		}
+		auto select = make_uniq<SelectNode>();
+		select->select_list.push_back(make_uniq<FunctionExpression>(Identifier(function), std::move(children)));
+		select->from_table = make_uniq<EmptyTableRef>();
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(select);
+		return std::move(statement);
+	}
+
+	void RewriteCreateStatement(CreateStatement &stmt) {
+		if (!stmt.info) {
+			Deny("unsupported CREATE form");
+		}
+		auto &info = *stmt.info;
+		if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY) {
+			Deny("only tables and views can be created through the ACL");
+		}
+		if (info.temporary) {
+			Deny("temporary objects are not available through the ACL yet");
+		}
+		auto key = VirtualKey(info.GetQualifiedName());
+		DdlTarget target;
+		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
+			Deny("no schema of the catalog allows creating \"" + key + "\"");
+		}
+		auto name = info.GetQualifiedName().Name();
+		auto phys = target.phys_schema + "." + name.GetIdentifierName();
+		if (target.virtual_only) {
+			// the role registers what exists; it never materialises. The CREATE itself is dropped
+			// from the batch, so nothing physical happens.
+			drop_statement = true;
+			follow_ups.push_back(
+			    AclCall("acl_register_existing", {Value(target.vcat), Value(key), Value(phys), Value(target.origin)}));
+			return;
+		}
+		info.SetQualifiedName(ParsePhysName(phys));
+		if (target.needs_record) {
+			// an expansion shows only its own records, so the new object needs one - written after
+			// the CREATE, so a failure leaves nothing behind
+			follow_ups.push_back(
+			    AclCall("acl_register_created", {Value(target.vcat), Value(key), Value(phys), Value(target.origin)}));
+		}
+	}
+
+	void RewriteDropStatement(DropStatement &stmt) {
+		if (!stmt.info) {
+			Deny("unsupported DROP form");
+		}
+		auto &info = *stmt.info;
+		if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY) {
+			Deny("only tables and views can be dropped through the ACL");
+		}
+		auto key = VirtualKey(info.GetQualifiedName());
+		DdlTarget target;
+		if (!store.ResolveDdlTarget(principal, key, "drop", target)) {
+			Deny("no schema of the catalog allows dropping \"" + key + "\"");
+		}
+		if (target.virtual_only) {
+			Deny("\"" + key + "\" is granted VIRTUAL ONLY, so its physical object is not this role's to drop");
+		}
+		auto name = info.GetQualifiedName().Name();
+		info.SetQualifiedName(ParsePhysName(target.phys_schema + "." + name.GetIdentifierName()));
+		if (target.needs_record) {
+			// the record goes with the object it described; 'skip' because a name may have none
+			follow_ups.push_back(AclCall("acl_drop_relation", {Value(target.vcat), Value(key), Value("skip")}));
+		}
+	}
+
 	//===------------------------------------------------------------------===//
 	// Query nodes
 	//===------------------------------------------------------------------===//
@@ -956,9 +1052,20 @@ string BakeTemplateForProbe(const string &sql, const ParserOptions &options, boo
 void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Principal &principal,
                        const ParserOptions &options, PolicyStore &store) {
 	AclRewriter rewriter(principal, options, store);
+	vector<unique_ptr<SQLStatement>> rewritten;
 	for (auto &stmt : statements) {
+		rewriter.follow_ups.clear();
+		rewriter.drop_statement = false;
 		rewriter.RewriteStatement(*stmt);
+		if (!rewriter.drop_statement) {
+			rewritten.push_back(std::move(stmt));
+		}
+		// a DDL statement's catalog record is appended right after it, so the batch stays in order
+		for (auto &follow_up : rewriter.follow_ups) {
+			rewritten.push_back(std::move(follow_up));
+		}
 	}
+	statements = std::move(rewritten);
 }
 
 } // namespace acl
