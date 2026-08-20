@@ -1,0 +1,162 @@
+# name: test/sql/acl_functions_driver.test
+# description: function-driver policy source (spec 008) - the contract mocked with SQL table macros;
+#   callback arguments are the selection keys, no filter pushdown involved
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100), (2, 'globex', 200), (3, 'acme', 300);
+
+statement ok
+CREATE TABLE phys.main.audit_physical(id INT, note VARCHAR);
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+SET GLOBAL acl_version_check_interval=0;
+
+# --- the mocked contract -------------------------------------------------------------------------
+
+statement ok
+CREATE MACRO pol_version() AS TABLE SELECT 3::BIGINT AS version;
+
+statement ok
+CREATE MACRO pol_role_catalogs(rs) AS TABLE SELECT * FROM (VALUES ('analyst', 'sales', true, '{"select": true, "insert": true, "delete": true}')) t(role, vcat, is_main, caps) WHERE list_contains(rs, role);
+
+statement ok
+CREATE MACRO pol_relations(cats, names) AS TABLE SELECT * FROM (VALUES ('sales', 'orders', 'subquery', 'phys.main.orders_physical', NULL, 'tenant = acl_claim(''tenant'')'), ('sales', 'audit', 'alias', 'phys.main.audit_physical', NULL, NULL)) t(vcat, vname, form, phys, view_sql, rls) WHERE list_contains(cats, vcat) AND list_contains(names, vname);
+
+statement ok
+CREATE MACRO pol_columns(cats, names) AS TABLE SELECT * FROM (VALUES ('sales', 'orders', 0, 'id', NULL), ('sales', 'orders', 1, 'amount', NULL)) t(vcat, vname, pos, name, expr) WHERE list_contains(cats, vcat) AND list_contains(names, vname);
+
+statement ok
+CREATE MACRO pol_aliases(cats) AS TABLE SELECT * FROM (VALUES ('sales', 'raw', 'phys.main')) t(vcat, alias_path, phys_path) WHERE list_contains(cats, vcat);
+
+statement ok
+CREATE MACRO pol_functions(cats, names) AS TABLE SELECT * FROM (VALUES ('sales', 'report', 'table', 'macro', NULL, 'SELECT id, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1) AND tenant = acl_claim(''tenant'')')) t(vcat, vname, kind, form, target, template) WHERE list_contains(cats, vcat) AND list_contains(names, vname);
+
+statement ok
+CREATE MACRO pol_gate(rs, names) AS TABLE SELECT * FROM (VALUES ('', 'getvariable', '', true)) t(role, name, kind, allowed) WHERE list_contains(names, name);
+
+statement ok
+CREATE MACRO pol_claims(rs) AS TABLE SELECT * FROM (VALUES ('analyst', 'tenant', 'acme')) t(role, claim, value) WHERE list_contains(rs, role);
+
+# --- enabling fails closed -----------------------------------------------------------------------
+
+statement error
+SELECT acl_use_functions('{"policy_version": "pol_version"}');
+----
+<REGEX>:.*required slot "role_catalogs" is missing.*
+
+statement error
+SELECT acl_use_functions('{"policy_version": "pol_version", "role_catalogs": "no_such_fn", "relations": "pol_relations", "relation_columns": "pol_columns", "schema_aliases": "pol_aliases", "functions": "pol_functions"}');
+----
+<REGEX>:.*unknown function "no_such_fn".*
+
+statement ok
+SELECT acl_use_functions('{"policy_version": "pol_version", "role_catalogs": "pol_role_catalogs", "relations": "pol_relations", "relation_columns": "pol_columns", "schema_aliases": "pol_aliases", "functions": "pol_functions", "function_gate": "pol_gate", "role_claims": "pol_claims"}');
+
+# --- enforcement through the callbacks -----------------------------------------------------------
+
+# subquery form: projection + RLS, the tenant claim comes from the role_claims callback
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+query II
+ACL ROLE "analyst" SELECT id, amount FROM sales.orders ORDER BY id;
+----
+1	100
+3	300
+
+# alias form is writable under the granted caps
+statement ok
+ACL ROLE "analyst" INSERT INTO audit VALUES (1, 'created');
+
+query II
+ACL ROLE "analyst" SELECT id, note FROM audit;
+----
+1	created
+
+statement ok
+ACL ROLE "analyst" DELETE FROM audit WHERE id = 1;
+
+# no 'update' in the caps
+statement error
+ACL ROLE "analyst" UPDATE audit SET note = 'x' WHERE id = 1;
+----
+<REGEX>:.*update on "audit" is not allowed.*
+
+# the subquery form stays read-only by construction
+statement error
+ACL ROLE "analyst" INSERT INTO orders VALUES (9, 900);
+----
+<REGEX>:.*read-only relation.*
+
+# schema alias through the callback
+query I
+ACL ROLE "analyst" SELECT count(*) FROM raw.orders_physical;
+----
+3
+
+# virtual table function through the callback
+query II
+ACL ROLE "analyst" SELECT id, amount FROM report(150) ORDER BY id;
+----
+3	300
+
+# gate callback: an explicit allow row overrides the default denylist...
+statement ok
+ACL ADMIN SET VARIABLE probe = 7;
+
+query I
+ACL ROLE "analyst" SELECT getvariable('probe');
+----
+7
+
+# ...while names without a gate row keep the default denylist
+statement error
+ACL ROLE "analyst" SELECT * FROM read_csv('/etc/passwd');
+----
+<REGEX>:.*not allowed.*
+
+# unknown names and physical names stay refused
+statement error
+ACL ROLE "analyst" SELECT * FROM phys.main.orders_physical;
+----
+<REGEX>:.*no access to object.*
+
+statement error
+ACL ROLE "intern" SELECT id FROM orders;
+----
+<REGEX>:.*no access to object.*
+
+# --- the function-driver source is read-only for admin writes ------------------------------------
+
+statement error
+SELECT acl_grant_table('analyst', 'x', 'phys.main.audit_physical', '', '', 'select');
+----
+<REGEX>:.*read-only.*
+
+# --- a version bump through the callback invalidates the caches ----------------------------------
+
+statement ok
+CREATE OR REPLACE MACRO pol_role_catalogs(rs) AS TABLE SELECT * FROM (VALUES ('analyst', 'sales', true, '{"select": true}')) t(role, vcat, is_main, caps) WHERE false;
+
+statement ok
+CREATE OR REPLACE MACRO pol_version() AS TABLE SELECT 4::BIGINT AS version;
+
+statement error
+ACL ROLE "analyst" SELECT id FROM orders;
+----
+<REGEX>:.*no access to object.*

@@ -1,0 +1,164 @@
+# name: test/sql/acl_admin_sql.test
+# description: ACL ADMIN management grammar (spec 008) - compiled to admin-function calls, executed
+#   through the normal pipeline; native ADMIN passthrough stays intact
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100), (2, 'globex', 200), (3, 'acme', 300);
+
+statement ok
+CREATE TABLE phys.main.audit_physical(id INT, note VARCHAR);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+# --- build a catalog entirely with management SQL ------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales COMMENT 'the sales namespace';
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS 'tenant=acme';
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS 'id,amount' RLS 'tenant = acl_claim(''tenant'')';
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.audit_physical AS sales.audit;
+
+statement ok
+ACL ADMIN ADD SCHEMA phys.main AS sales.raw;
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.report MACRO 'SELECT id, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1) AND tenant = acl_claim(''tenant'')';
+
+statement ok
+ACL ADMIN ADD SCALAR sales.shout MACRO 'upper(acl_arg(1))';
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{"select": true, "insert": true, "delete": true}' MAIN;
+
+# a multi-statement management batch under one prefix
+statement ok
+ACL ADMIN CREATE ROLE auditor; GRANT CATALOG sales TO ROLE auditor CAPS '{"select": true}';
+
+# --- and enforce through it ----------------------------------------------------------------------
+
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+statement ok
+ACL ROLE "analyst" INSERT INTO audit VALUES (1, 'created');
+
+query II
+ACL ROLE "analyst" SELECT id, note FROM audit;
+----
+1	created
+
+statement ok
+ACL ROLE "analyst" DELETE FROM audit WHERE id = 1;
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM raw.orders_physical;
+----
+3
+
+query II
+ACL ROLE "analyst" SELECT id, amount FROM report(150) ORDER BY id;
+----
+3	300
+
+query I
+ACL ROLE "analyst" SELECT shout('hi');
+----
+HI
+
+# the auditor grant resolves qualified names; with no tenant claim the RLS bakes NULL -> zero rows
+query I
+ACL ROLE "auditor" SELECT count(*) FROM sales.orders WHERE amount > 0;
+----
+0
+
+# --- issuers and mappings through the grammar ----------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/x' KEYS '{"keys":[]}' AUDIENCES 'api://x' ALGS 'RS256' ROLE CLAIM 'groups' CLAIM MAP '{"tid": "tenant"}';
+
+statement ok
+ACL ADMIN MAP GROUP 'g-0001' FROM ISSUER 'https://issuer.test/x' TO ROLE analyst;
+
+query I
+SELECT count(*) FROM aclcat.acl.issuers WHERE issuer = 'https://issuer.test/x' AND role_claim = 'groups';
+----
+1
+
+query I
+SELECT count(*) FROM aclcat.acl.role_mappings WHERE external_value = 'g-0001' AND role = 'analyst';
+----
+1
+
+# --- revoke / drop through the grammar -----------------------------------------------------------
+
+statement ok
+ACL ADMIN DROP RELATION sales.audit;
+
+statement error
+ACL ROLE "analyst" SELECT * FROM audit;
+----
+<REGEX>:.*no access to object.*
+
+statement ok
+ACL ADMIN REVOKE CATALOG sales FROM ROLE auditor;
+
+statement error
+ACL ROLE "auditor" SELECT count(*) FROM sales.orders;
+----
+<REGEX>:.*no access to object.*
+
+# --- the native ADMIN passthrough is untouched ---------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE TABLE phys.main.scratch(x INT);
+
+statement ok
+ACL ADMIN INSERT INTO phys.main.scratch VALUES (42);
+
+query I
+ACL ADMIN SELECT x FROM phys.main.scratch;
+----
+42
+
+# --- management typos fail closed, never fall through --------------------------------------------
+
+statement error
+ACL ADMIN GRANT CATLOG sales TO ROLE analyst;
+----
+<REGEX>:.*expected catalog.*
+
+statement error
+ACL ADMIN ADD TABLE phys.main.orders_physical AS plainname;
+----
+<REGEX>:.*must be written as <catalog>.<name>.*
+
+# mixing management and regular SQL in one batch is refused
+statement error
+ACL ADMIN CREATE ROLE r2; SELECT 1;
+----
+<REGEX>:.*unknown management statement.*

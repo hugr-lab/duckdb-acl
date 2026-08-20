@@ -137,6 +137,9 @@ struct PolicyStore {
 	//! Switch to the catalog backend: read policy from schema `schema` of the ATTACHed database
 	//! `db_name` (standard duckdb dialect only). init=true creates/migrates the managed schema first.
 	void EnableCatalog(DatabaseInstance &db, const string &db_name, const string &schema, bool init);
+	//! Switch to the function-driver backend (spec 008): policy comes from registered table-function
+	//! callbacks named by an explicit slot map (JSON); read-only by definition, fails closed at enable.
+	void EnableFunctions(DatabaseInstance &db, const string &slots_json);
 	bool CatalogEnabled() const {
 		return catalog != nullptr;
 	}

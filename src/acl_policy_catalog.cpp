@@ -79,16 +79,61 @@ case_insensitive_set_t ParseCaps(const string &json) {
 	return caps;
 }
 
+//! Parse a flat JSON object of string values ({"slot": "function_name", ...})
+case_insensitive_map_t<string> ParseStringMap(const string &json) {
+	case_insensitive_map_t<string> map;
+	auto doc = duckdb_yyjson::yyjson_read(json.c_str(), json.size(), 0);
+	if (!doc) {
+		throw BinderException("acl catalog: malformed JSON map: %s", json);
+	}
+	string error;
+	auto root = duckdb_yyjson::yyjson_doc_get_root(doc);
+	if (!duckdb_yyjson::yyjson_is_obj(root)) {
+		error = "expected a JSON object";
+	} else {
+		duckdb_yyjson::yyjson_obj_iter iter;
+		duckdb_yyjson::yyjson_obj_iter_init(root, &iter);
+		duckdb_yyjson::yyjson_val *key;
+		while ((key = duckdb_yyjson::yyjson_obj_iter_next(&iter))) {
+			auto value = duckdb_yyjson::yyjson_obj_iter_get_val(key);
+			if (!duckdb_yyjson::yyjson_is_str(value)) {
+				error = "values must be strings";
+				break;
+			}
+			map[duckdb_yyjson::yyjson_get_str(key)] = duckdb_yyjson::yyjson_get_str(value);
+		}
+	}
+	duckdb_yyjson::yyjson_doc_free(doc);
+	if (!error.empty()) {
+		throw BinderException("acl catalog: %s: %s", error, json);
+	}
+	return map;
+}
+
 } // namespace
 
 struct CatalogBackend {
 	CatalogBackend(DatabaseInstance &db_p, string db_name_p, string schema_p)
 	    : db(db_p.shared_from_this()), db_name(std::move(db_name_p)), schema(std::move(schema_p)) {
 	}
+	//! function-driver mode (spec 008): sources are registered callbacks, not tables
+	CatalogBackend(DatabaseInstance &db_p, case_insensitive_map_t<string> slots_p)
+	    : db(db_p.shared_from_this()), function_mode(true), slots(std::move(slots_p)) {
+	}
 
 	weak_ptr<DatabaseInstance> db;
 	string db_name;
 	string schema;
+	bool function_mode = false;
+	case_insensitive_map_t<string> slots; // contract slot -> registered function name
+
+	//! one grant row of the function mode's prefetch (the table mode joins the table directly)
+	struct GrantRow {
+		string role;
+		string vcat;
+		bool is_main;
+		string caps;
+	};
 
 	mutex lock;
 	// version state
@@ -104,6 +149,8 @@ struct CatalogBackend {
 	case_insensitive_map_t<case_insensitive_map_t<string>> claims_cache; // role -> claims
 	case_insensitive_set_t claims_loaded;
 	case_insensitive_map_t<std::pair<bool, IssuerConfig>> issuer_cache; // issuer -> (found, config)
+	case_insensitive_map_t<vector<GrantRow>> fn_grants;                 // function mode: role -> rows
+	case_insensitive_set_t fn_grants_loaded;
 
 	string Tbl(const char *table) {
 		return Ident(db_name) + "." + Ident(schema) + "." + Ident(table);
@@ -130,6 +177,9 @@ struct CatalogBackend {
 
 	//! Run admin write statements + the policy_version bump in one transaction
 	void Write(const vector<string> &statements) {
+		if (function_mode) {
+			throw BinderException("acl catalog: the function-driver policy source is read-only");
+		}
 		auto instance = Db();
 		Connection con(*instance);
 		auto begin = con.Query("BEGIN");
@@ -178,9 +228,12 @@ struct CatalogBackend {
 			last_check = now;
 			checked_once = true;
 		}
-		auto result = Query("SELECT \"value\" FROM " + Tbl("meta") + " WHERE \"key\" = 'policy_version'");
+		auto result = function_mode
+		                  ? Query("SELECT * FROM " + Slot("policy_version") + "()")
+		                  : Query("SELECT \"value\" FROM " + Tbl("meta") + " WHERE \"key\" = 'policy_version'");
 		if (result->RowCount() != 1) {
-			throw BinderException("acl catalog: policy_version not found in %s", Tbl("meta"));
+			throw BinderException("acl catalog: the policy_version source returned %lld rows, expected 1",
+			                      result->RowCount());
 		}
 		auto current = result->GetValue(0, 0).GetValue<int64_t>();
 		lock_guard<mutex> guard(lock);
@@ -192,6 +245,8 @@ struct CatalogBackend {
 			claims_cache.clear();
 			claims_loaded.clear();
 			issuer_cache.clear();
+			fn_grants.clear();
+			fn_grants_loaded.clear();
 		}
 	}
 
@@ -208,11 +263,139 @@ struct CatalogBackend {
 		return StringUtil::Join(roles, ",");
 	}
 
-	//! The shared query prelude: the principal's grants and the unique-main guard, computed in SQL
-	string PrincipalCtes(const Principal &principal) {
-		return "WITH grants AS (SELECT \"role\", \"vcat\", \"is_main\", \"caps\" FROM " + Tbl("role_catalogs") +
-		       " WHERE \"role\" IN (" + LitList(principal.roles) +
-		       ")), main_ok AS (SELECT count(DISTINCT \"vcat\") = 1 AS unique_main FROM grants WHERE \"is_main\") ";
+	bool HasSlot(const char *slot) {
+		return slots.count(slot) > 0;
+	}
+
+	string Slot(const char *slot) {
+		auto entry = slots.find(slot);
+		if (entry == slots.end()) {
+			throw BinderException("acl catalog: the function-driver map has no \"%s\" slot", slot);
+		}
+		return Ident(entry->second);
+	}
+
+	//! A SQL list literal for callback arguments - the arguments ARE the pushdown (spec 008)
+	static string ListLit(const vector<string> &values) {
+		if (values.empty()) {
+			return "CAST([] AS VARCHAR[])";
+		}
+		vector<string> quoted;
+		for (auto &value : values) {
+			quoted.push_back(Lit(value));
+		}
+		return "[" + StringUtil::Join(quoted, ", ") + "]";
+	}
+
+	//! Function mode: fetch (and cache) the principal's grant rows through the role_catalogs callback
+	vector<GrantRow> Grants(const vector<string> &roles) {
+		vector<string> missing;
+		{
+			lock_guard<mutex> guard(lock);
+			for (auto &role : roles) {
+				if (!fn_grants_loaded.count(role)) {
+					missing.push_back(role);
+				}
+			}
+		}
+		if (!missing.empty()) {
+			// positional contract: (role, vcat, is_main, caps)
+			auto result = Query("SELECT * FROM " + Slot("role_catalogs") + "(" + ListLit(missing) + ")");
+			lock_guard<mutex> guard(lock);
+			for (auto &role : missing) {
+				fn_grants_loaded.insert(role);
+				fn_grants[role];
+			}
+			for (idx_t row = 0; row < result->RowCount(); row++) {
+				GrantRow grant;
+				grant.role = result->GetValue(0, row).ToString();
+				grant.vcat = result->GetValue(1, row).ToString();
+				auto is_main = result->GetValue(2, row);
+				grant.is_main = !is_main.IsNull() && is_main.GetValue<bool>();
+				auto caps = result->GetValue(3, row);
+				grant.caps = caps.IsNull() ? string() : caps.ToString();
+				fn_grants[grant.role].push_back(grant);
+			}
+		}
+		lock_guard<mutex> guard(lock);
+		vector<GrantRow> rows;
+		for (auto &role : roles) {
+			auto entry = fn_grants.find(role);
+			if (entry == fn_grants.end()) {
+				continue;
+			}
+			rows.insert(rows.end(), entry->second.begin(), entry->second.end());
+		}
+		return rows;
+	}
+
+	//! The granted catalogs of the principal (function mode; callback arguments need them)
+	vector<string> GrantedCatalogs(const Principal &principal) {
+		case_insensitive_set_t seen;
+		vector<string> catalogs;
+		for (auto &grant : Grants(principal.roles)) {
+			if (!seen.count(grant.vcat)) {
+				seen.insert(grant.vcat);
+				catalogs.push_back(grant.vcat);
+			}
+		}
+		return catalogs;
+	}
+
+	//! The shared query prelude: the principal's grants and the unique-main guard, computed in SQL.
+	//! Table mode scans role_catalogs; function mode embeds the prefetched grants as VALUES.
+	string GrantsCte(const Principal &principal) {
+		string grants;
+		if (!function_mode) {
+			grants = "SELECT \"role\", \"vcat\", \"is_main\", \"caps\" FROM " + Tbl("role_catalogs") +
+			         " WHERE \"role\" IN (" + LitList(principal.roles) + ")";
+		} else {
+			string values;
+			for (auto &grant : Grants(principal.roles)) {
+				values += (values.empty() ? "" : ", ") + string("(") + Lit(grant.role) + ", " + Lit(grant.vcat) + ", " +
+				          (grant.is_main ? "true" : "false") + ", " + Lit(grant.caps) + ")";
+			}
+			grants = values.empty()
+			             ? string("SELECT '' AS \"role\", '' AS \"vcat\", false AS \"is_main\", '' AS \"caps\""
+			                      " WHERE false")
+			             : "SELECT * FROM (VALUES " + values + ") v(\"role\", \"vcat\", \"is_main\", \"caps\")";
+		}
+		return "WITH grants AS (" + grants +
+		       "), main_ok AS (SELECT count(DISTINCT \"vcat\") = 1 AS unique_main FROM grants WHERE \"is_main\") ";
+	}
+
+	//! FROM-sources of the resolution queries: a table reference, or a callback invocation whose
+	//! literal arguments carry the keys (both name interpretations, the granted catalogs)
+	string RelationsSource(const Principal &principal, const vector<string> &names) {
+		return function_mode
+		           ? Slot("relations") + "(" + ListLit(GrantedCatalogs(principal)) + ", " + ListLit(names) + ")"
+		           : Tbl("relations");
+	}
+	string ColumnsSource(const Principal &principal, const vector<string> &names) {
+		return function_mode
+		           ? Slot("relation_columns") + "(" + ListLit(GrantedCatalogs(principal)) + ", " + ListLit(names) + ")"
+		           : Tbl("relation_columns");
+	}
+	string AliasesSource(const Principal &principal) {
+		return function_mode ? Slot("schema_aliases") + "(" + ListLit(GrantedCatalogs(principal)) + ")"
+		                     : Tbl("schema_aliases");
+	}
+	string FunctionsSource(const Principal &principal, const vector<string> &names) {
+		return function_mode
+		           ? Slot("functions") + "(" + ListLit(GrantedCatalogs(principal)) + ", " + ListLit(names) + ")"
+		           : Tbl("functions");
+	}
+	bool HasObjectCaps() {
+		return !function_mode || HasSlot("object_caps");
+	}
+	string ObjectCapsSource(const Principal &principal, const vector<string> &names) {
+		return function_mode ? Slot("object_caps") + "(" + ListLit(principal.roles) + ", " +
+		                           ListLit(GrantedCatalogs(principal)) + ", " + ListLit(names) + ")"
+		                     : Tbl("role_object_caps");
+	}
+	//! the caps column of a resolution query; without an object_caps source there is no override
+	string CapsExpr() {
+		return HasObjectCaps() ? "coalesce(oc.\"caps\", g.\"caps\")" : "g.\"caps\"";
 	}
 
 	//! Split a written name into its qualified interpretation; empty head = no qualified branch
@@ -260,21 +443,22 @@ struct CatalogBackend {
 		SplitName(vname, head, rest);
 		string qualified_cond =
 		    head.empty() ? string("false") : "r.\"vcat\" = " + Lit(head) + " AND r.\"vname\" = " + Lit(rest);
-		auto sql = PrincipalCtes(principal) +
-		           "SELECT r.\"form\", r.\"phys\", r.\"view_sql\", r.\"rls\","
-		           " coalesce(oc.\"caps\", g.\"caps\") AS caps,"
+		vector<string> names = head.empty() ? vector<string> {vname} : vector<string> {vname, rest};
+		string oc_join = HasObjectCaps() ? " LEFT JOIN " + ObjectCapsSource(principal, names) +
+		                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = r.\"vcat\""
+		                                       " AND oc.\"vname\" = r.\"vname\""
+		                                 : string();
+		auto sql = GrantsCte(principal) + "SELECT r.\"form\", r.\"phys\", r.\"view_sql\", r.\"rls\", " + CapsExpr() +
+		           " AS caps,"
 		           " CASE WHEN " +
 		           qualified_cond +
 		           " THEN 1 ELSE 2 END AS prio,"
 		           " (SELECT list(struct_pack(cname := c.\"name\", cexpr := c.\"expr\") ORDER BY c.\"pos\") FROM " +
-		           Tbl("relation_columns") +
+		           ColumnsSource(principal, names) +
 		           " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\") AS cols"
 		           " FROM " +
-		           Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\" LEFT JOIN " +
-		           Tbl("role_object_caps") +
-		           " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = r.\"vcat\" AND oc.\"vname\" = r.\"vname\""
-		           " WHERE (" +
-		           qualified_cond +
+		           RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
+		           " WHERE (" + qualified_cond +
 		           ") OR (g.\"is_main\" AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(vname) +
 		           ") ORDER BY prio";
 		auto result = Query(sql);
@@ -328,17 +512,20 @@ struct CatalogBackend {
 		                 : "sa.\"vcat\" = " + Lit(head) + " AND " + prefix_match(Lit(rest), "sa.\"alias_path\"");
 		auto path_case = "CASE WHEN sa.\"vcat\" = " + (head.empty() ? Lit("") : Lit(head)) + " THEN " + Lit(rest) +
 		                 " ELSE " + Lit(vname) + " END";
-		auto sql = PrincipalCtes(principal) +
-		           "SELECT sa.\"vcat\", sa.\"alias_path\", sa.\"phys_path\","
-		           " coalesce(oc.\"caps\", g.\"caps\") AS caps,"
+		vector<string> names = head.empty() ? vector<string> {vname} : vector<string> {vname, rest};
+		string oc_join = HasObjectCaps() ? " LEFT JOIN " + ObjectCapsSource(principal, names) +
+		                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = sa.\"vcat\""
+		                                       " AND oc.\"vname\" = " +
+		                                       path_case
+		                                 : string();
+		auto sql = GrantsCte(principal) + "SELECT sa.\"vcat\", sa.\"alias_path\", sa.\"phys_path\", " + CapsExpr() +
+		           " AS caps,"
 		           " CASE WHEN " +
 		           qualified_cond +
 		           " THEN 1 ELSE 2 END AS prio"
 		           " FROM " +
-		           Tbl("schema_aliases") + " sa JOIN grants g ON g.\"vcat\" = sa.\"vcat\" LEFT JOIN " +
-		           Tbl("role_object_caps") +
-		           " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = sa.\"vcat\" AND oc.\"vname\" = " + path_case +
-		           " WHERE (" + qualified_cond + ") OR (g.\"is_main\" AND (SELECT unique_main FROM main_ok) AND " +
+		           AliasesSource(principal) + " sa JOIN grants g ON g.\"vcat\" = sa.\"vcat\"" + oc_join + " WHERE (" +
+		           qualified_cond + ") OR (g.\"is_main\" AND (SELECT unique_main FROM main_ok) AND " +
 		           prefix_match(Lit(vname), "sa.\"alias_path\"") + ") ORDER BY prio, length(sa.\"alias_path\") DESC";
 		auto result = Query(sql);
 		if (result->RowCount() == 0) {
@@ -383,14 +570,16 @@ struct CatalogBackend {
 		SplitName(vname, head, rest);
 		string qualified_cond =
 		    head.empty() ? string("false") : "f.\"vcat\" = " + Lit(head) + " AND f.\"vname\" = " + Lit(rest);
-		auto sql = PrincipalCtes(principal) +
+		vector<string> names = head.empty() ? vector<string> {vname} : vector<string> {vname, rest};
+		auto sql = GrantsCte(principal) +
 		           "SELECT f.\"form\", f.\"target\", f.\"template\","
 		           " CASE WHEN " +
 		           qualified_cond +
 		           " THEN 1 ELSE 2 END AS prio"
 		           " FROM " +
-		           Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\" WHERE f.\"kind\" = '" + kind +
-		           "' AND ((" + qualified_cond +
+		           FunctionsSource(principal, names) +
+		           " f JOIN grants g ON g.\"vcat\" = f.\"vcat\" WHERE f.\"kind\" = '" + kind + "' AND ((" +
+		           qualified_cond +
 		           ") OR (g.\"is_main\" AND (SELECT unique_main FROM main_ok) AND f.\"vname\" = " + Lit(vname) +
 		           ")) ORDER BY prio LIMIT 1";
 		auto result = Query(sql);
@@ -428,18 +617,32 @@ struct CatalogBackend {
 				return entry->second.first;
 			}
 		}
-		string role_filter = "\"role\" = ''";
-		if (!principal.roles.empty()) {
-			role_filter += " OR \"role\" IN (" + LitList(principal.roles) + ")";
+		idx_t role_col = 0, allowed_col = 1;
+		unique_ptr<MaterializedQueryResult> result;
+		if (function_mode) {
+			if (!HasSlot("function_gate")) { // no gate source: fall back to the built-in denylist
+				lock_guard<mutex> guard(lock);
+				gates[key] = {false, true};
+				return false;
+			}
+			// positional contract: (role, name, kind, allowed)
+			result = Query("SELECT * FROM " + Slot("function_gate") + "(" + ListLit(principal.roles) + ", " +
+			               ListLit({lowered}) + ")");
+			allowed_col = 3;
+		} else {
+			string role_filter = "\"role\" = ''";
+			if (!principal.roles.empty()) {
+				role_filter += " OR \"role\" IN (" + LitList(principal.roles) + ")";
+			}
+			result = Query("SELECT \"role\", \"allowed\" FROM " + Tbl("function_gate") +
+			               " WHERE lower(\"name\") = " + Lit(lowered) + " AND (" + role_filter + ")");
 		}
-		auto result = Query("SELECT \"role\", \"allowed\" FROM " + Tbl("function_gate") +
-		                    " WHERE lower(\"name\") = " + Lit(lowered) + " AND (" + role_filter + ")");
 		bool have_role_row = false, role_allowed = true;
 		bool have_global_row = false, global_allowed = true;
 		for (idx_t row = 0; row < result->RowCount(); row++) {
-			auto verdict_value = result->GetValue(1, row);
+			auto verdict_value = result->GetValue(allowed_col, row);
 			bool verdict = !verdict_value.IsNull() && verdict_value.GetValue<bool>();
-			if (result->GetValue(0, row).ToString().empty()) {
+			if (result->GetValue(role_col, row).ToString().empty()) {
 				have_global_row = true;
 				global_allowed = verdict;
 			} else {
@@ -467,9 +670,14 @@ struct CatalogBackend {
 				}
 			}
 		}
+		if (function_mode && !HasSlot("role_claims")) {
+			return; // optional slot: no source, no role-default claims
+		}
 		if (!missing.empty()) {
-			auto result = Query("SELECT \"role\", \"claim\", \"value\" FROM " + Tbl("role_claims") +
-			                    " WHERE \"role\" IN (" + LitList(missing) + ")");
+			// positional contract of the callback: (role, claim, value)
+			auto result = function_mode ? Query("SELECT * FROM " + Slot("role_claims") + "(" + ListLit(missing) + ")")
+			                            : Query("SELECT \"role\", \"claim\", \"value\" FROM " + Tbl("role_claims") +
+			                                    " WHERE \"role\" IN (" + LitList(missing) + ")");
 			lock_guard<mutex> guard(lock);
 			for (auto &role : missing) {
 				claims_loaded.insert(role);
@@ -512,31 +720,44 @@ struct CatalogBackend {
 				return entry->second.first;
 			}
 		}
-		auto result = Query("SELECT \"keys_json\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\" FROM " +
-		                    Tbl("issuers") + " WHERE \"issuer\" = " + Lit(issuer));
+		unique_ptr<MaterializedQueryResult> result;
+		idx_t base = 0;
+		if (function_mode) {
+			if (!HasSlot("issuer")) { // optional slot: no JWT issuers through this source
+				lock_guard<mutex> guard(lock);
+				issuer_cache[issuer] = {false, IssuerConfig()};
+				return false;
+			}
+			// positional contract: (issuer, keys_json, audiences, algs, role_claim, claim_map)
+			result = Query("SELECT * FROM " + Slot("issuer") + "(" + Lit(issuer) + ")");
+			base = 1;
+		} else {
+			result = Query("SELECT \"keys_json\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\" FROM " +
+			               Tbl("issuers") + " WHERE \"issuer\" = " + Lit(issuer));
+		}
 		IssuerConfig config;
 		bool found = result->RowCount() > 0;
 		if (found) {
 			config.issuer = issuer;
-			auto keys = result->GetValue(0, 0);
+			auto keys = result->GetValue(base + 0, 0);
 			config.keys_json = keys.IsNull() ? string() : keys.ToString();
-			auto audiences = result->GetValue(1, 0);
+			auto audiences = result->GetValue(base + 1, 0);
 			for (auto &aud : StringUtil::Split(audiences.IsNull() ? string() : audiences.ToString(), ',')) {
 				StringUtil::Trim(aud);
 				if (!aud.empty()) {
 					config.audiences.push_back(aud);
 				}
 			}
-			auto algs = result->GetValue(2, 0);
+			auto algs = result->GetValue(base + 2, 0);
 			for (auto &alg : StringUtil::Split(algs.IsNull() ? string() : algs.ToString(), ',')) {
 				StringUtil::Trim(alg);
 				if (!alg.empty()) {
 					config.algs.insert(alg);
 				}
 			}
-			auto role_claim = result->GetValue(3, 0);
+			auto role_claim = result->GetValue(base + 3, 0);
 			config.role_claim = role_claim.IsNull() ? string() : role_claim.ToString();
-			auto claim_map = result->GetValue(4, 0);
+			auto claim_map = result->GetValue(base + 4, 0);
 			config.claim_map = claim_map.IsNull() ? string() : claim_map.ToString();
 		}
 		lock_guard<mutex> guard(lock);
@@ -552,6 +773,21 @@ struct CatalogBackend {
 			return;
 		}
 		EnsureFresh();
+		if (function_mode) {
+			if (HasSlot("role_mappings")) {
+				// positional contract: (external_value, role)
+				auto result =
+				    Query("SELECT * FROM " + Slot("role_mappings") + "(" + Lit(issuer) + ", " + ListLit(values) + ")");
+				for (idx_t row = 0; row < result->RowCount(); row++) {
+					mapped[result->GetValue(0, row).ToString()].push_back(result->GetValue(1, row).ToString());
+				}
+			}
+			// a raw value is a known role iff the role_catalogs callback grants it anything
+			for (auto &grant : Grants(values)) {
+				known_roles.insert(grant.role);
+			}
+			return;
+		}
 		auto result =
 		    Query("SELECT \"external_value\", \"role\" FROM " + Tbl("role_mappings") +
 		          " WHERE \"issuer\" = " + Lit(issuer) + " AND \"external_value\" IN (" + LitList(values) + ")");
@@ -636,6 +872,30 @@ void PolicyStore::EnableCatalog(DatabaseInstance &db, const string &db_name, con
 		backend->InitSchema();
 	}
 	backend->EnsureFresh(); // validates reachability and the schema before switching over
+	lock_guard<mutex> guard(lock);
+	catalog = std::move(backend);
+}
+
+void PolicyStore::EnableFunctions(DatabaseInstance &db, const string &slots_json) {
+	auto slots = acl_detail::ParseStringMap(slots_json);
+	auto backend = make_uniq<CatalogBackend>(db, slots);
+	// explicit slot map, fail closed at enable (design decision): the core slots are required and
+	// every named function must actually be registered
+	for (auto required :
+	     {"policy_version", "role_catalogs", "relations", "relation_columns", "schema_aliases", "functions"}) {
+		if (!backend->HasSlot(required)) {
+			throw BinderException("acl_use_functions: required slot \"%s\" is missing", required);
+		}
+	}
+	for (auto &slot : slots) {
+		auto exists = backend->Query("SELECT count(*) FROM duckdb_functions() WHERE \"function_name\" = " +
+		                             acl_detail::Lit(slot.second));
+		if (exists->GetValue(0, 0).GetValue<int64_t>() == 0) {
+			throw BinderException("acl_use_functions: slot \"%s\" names an unknown function \"%s\"", slot.first,
+			                      slot.second);
+		}
+	}
+	backend->EnsureFresh(); // probes the policy_version callback before switching over
 	lock_guard<mutex> guard(lock);
 	catalog = std::move(backend);
 }
