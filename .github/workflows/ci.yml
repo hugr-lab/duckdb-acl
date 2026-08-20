@@ -78,7 +78,8 @@ jobs:
         run: |
           git clone --depth 1 --branch v5.0.0 https://github.com/RoaringBitmap/CRoaring
           cmake -S CRoaring -B CRoaring/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_ROARING_TESTS=OFF -DROARING_BUILD_STATIC=ON
+            -DENABLE_ROARING_TESTS=OFF -DROARING_BUILD_STATIC=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           cmake --build CRoaring/build
           sudo cmake --install CRoaring/build
 
