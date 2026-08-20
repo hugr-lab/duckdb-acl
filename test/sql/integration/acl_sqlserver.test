@@ -1,0 +1,76 @@
+# name: test/sql/integration/acl_sqlserver.test
+# description: ACL over a live SQL Server source (specs/005/006) through hugr-lab/mssql-extension,
+#   built from source against our duckdb pin (ACL_INTEGRATION_MSSQL=1)
+# group: [integration]
+
+require acl
+
+require mssql
+
+require-env ACL_MSSQL_DSN
+
+statement ok
+ATTACH '${ACL_MSSQL_DSN}' AS ms (TYPE mssql);
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+SELECT acl_define_role('analyst', 'tenant=acme');
+
+# SUBQUERY form over a SQL Server table: projection + RLS with the baked tenant claim
+statement ok
+SELECT acl_grant_table('analyst', 'orders', 'ms.dbo.orders', 'id,amount', 'tenant = acl_claim(''tenant'')', 'select');
+
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+# masked column over SQL Server; the dropped column is structurally absent
+statement ok
+SELECT acl_grant_table('analyst', 'employees', 'ms.dbo.employees', 'id,name,ssn=NULL', '', 'select');
+
+query III
+ACL ROLE "analyst" SELECT id, name, ssn FROM employees ORDER BY id;
+----
+1	alice	NULL
+2	bob	NULL
+
+statement error
+ACL ROLE "analyst" SELECT salary FROM employees;
+----
+<REGEX>:.*salary.*
+
+# RENAME form is writable end-to-end into SQL Server
+statement ok
+SELECT acl_grant_table('analyst', 'audit', 'ms.dbo.audit_log', '', '', 'select,insert,delete');
+
+statement ok
+ACL ROLE "analyst" INSERT INTO audit VALUES (200, 'from-acl');
+
+query II
+ACL ROLE "analyst" SELECT id, note FROM audit;
+----
+200	from-acl
+
+statement ok
+ACL ROLE "analyst" DELETE FROM audit WHERE id = 200;
+
+query I
+ACL ADMIN SELECT count(*) FROM ms.dbo.audit_log;
+----
+0
+
+# a direct physical name is not a mapped virtual name -> denied
+statement error
+ACL ROLE "analyst" SELECT * FROM ms.dbo.orders;
+----
+<REGEX>:.*no access to object "ms.dbo.orders".*
+
+# source readers stay gated even with the source attached
+statement error
+ACL ROLE "analyst" SELECT * FROM mssql_query('ms', 'SELECT 1 AS x');
+----
+<REGEX>:.*not allowed.*

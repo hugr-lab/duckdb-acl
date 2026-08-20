@@ -18,10 +18,12 @@
 #include <unordered_map>
 
 namespace duckdb {
+class DatabaseInstance;
+
 namespace acl {
 
 struct Principal {
-	string role;
+	vector<string> roles; // multi-role since spec 006 (union semantics); single-element until spec 007
 	case_insensitive_map_t<string> claims;
 };
 
@@ -85,10 +87,15 @@ struct TemplateCache {
 	}
 };
 
-//! Per-database policy store: virtual relations/functions, principals, and the function denylist, plus
-//! the resolver methods over them. Owned by AclParserInfo (reached from the parser override) and shared
-//! with the admin setup functions via ScalarFunctionInfo - no process-global state, so DB instances
-//! stay isolated. In production the resolver methods become the read-only, role-aware ACL callbacks.
+namespace acl_detail {
+struct CatalogBackend; // catalog-DB policy backend (spec 006), defined in acl_policy_catalog.cpp
+} // namespace acl_detail
+
+//! Per-database policy store: the seam the rewriter and the admin functions talk to. Two backends:
+//! the in-memory maps below (default; dev/tests) and, once acl_use_db() ran, the catalog backend
+//! (spec 006) reading policy from an ATTACHed database in standard duckdb dialect. Owned by
+//! AclParserInfo (reached from the parser override) and shared with the admin setup functions via
+//! ScalarFunctionInfo - no process-global state, so DB instances stay isolated.
 struct PolicyStore {
 	mutex lock;
 	// role -> virtual name -> policy (tables and views share one namespace)
@@ -106,6 +113,39 @@ struct PolicyStore {
 	// parsed rewrite-template prototypes, so a template is parsed once and only copied per request
 	TemplateCache<QueryNode> select_cache;      // relation / table-function subquery templates
 	TemplateCache<ParsedExpression> expr_cache; // scalar macro templates
+	// catalog backend (spec 006); present after acl_use_db()
+	unique_ptr<acl_detail::CatalogBackend> catalog;
+
+	// ctor/dtor out of line: the inline-defaulted versions would need ~CatalogBackend, incomplete here
+	PolicyStore();
+	~PolicyStore();
+
+	//! Switch to the catalog backend: read policy from schema `schema` of the ATTACHed database
+	//! `db_name` (standard duckdb dialect only). init=true creates/migrates the managed schema first.
+	void EnableCatalog(DatabaseInstance &db, const string &db_name, const string &schema, bool init);
+	bool CatalogEnabled() const {
+		return catalog != nullptr;
+	}
+
+	// catalog admin operations (spec 006); each throws unless the catalog backend is enabled.
+	// columns are (name, expr) pairs with an empty expr for a plain projected column.
+	void CatalogCreate(const string &vcat, const string &comment);
+	void CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
+	                        const string &view_sql, const string &rls,
+	                        const vector<std::pair<string, string>> &columns);
+	void CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path);
+	void CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
+	                        const string &target, const string &template_sql);
+	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main);
+	void CatalogRevoke(const string &role, const string &vcat);
+	void CatalogDropRelation(const string &vcat, const string &vname);
+	void CatalogDefineRole(const string &role, const case_insensitive_map_t<string> &claims);
+	//! remove=true deletes the gate row (fall back to the default denylist); otherwise upserts it
+	void CatalogSetFunctionGate(const string &name, bool allowed, bool remove);
+	//! per-object caps override (the compatibility wrappers carry per-object caps, spec 006)
+	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json);
+	//! ensure a role->catalog grant row exists without clobbering an existing one
+	void CatalogEnsureGrant(const string &role, const string &vcat, bool is_main);
 
 	//! Instantiate a SELECT template: a fresh SelectStatement whose node is a copy of the cached
 	//! prototype (parsed once). The caller bakes markers into the copy.
@@ -120,14 +160,22 @@ struct PolicyStore {
 	bool ResolveTableFunction(const Principal &principal, const string &vname, TablePolicy &out);
 	bool ResolveScalarFunction(const Principal &principal, const string &vname, TablePolicy &out);
 
-	//! The resolver seam every non-virtual function flows through: it passes unless its bare name is on
-	//! the denylist (matching the last component so a qualified alias db.schema.read_csv cannot slip past).
-	//! A production, role-aware callback would also receive the principal and FunctionKind.
-	bool FunctionAllowed(const QualifiedName &name);
+	//! The resolver seam every non-virtual function flows through. Catalog backend: function_gate rows
+	//! (per-role, then global) decide first; otherwise the built-in denylist passes everything except
+	//! source readers / rights-bypass functions (matching the last name component, so a qualified alias
+	//! db.schema.read_csv cannot slip past).
+	bool FunctionAllowed(const Principal &principal, const QualifiedName &name);
 
 private:
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);
+
+	// catalog-backend bridges, defined in acl_policy_catalog.cpp (the backend type stays private there)
+	bool CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out);
+	bool CatalogResolveFunction(const Principal &principal, const string &vname, bool table_kind, TablePolicy &out);
+	//! returns true when a gate row decides; `allowed` then carries the verdict
+	bool CatalogFunctionGate(const Principal &principal, const QualifiedName &name, bool &allowed);
+	void CatalogLoadRoleClaims(Principal &principal);
 };
 
 //! Carried on the parser extension (parser_info); the override reads the store from it.

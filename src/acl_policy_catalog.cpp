@@ -1,0 +1,703 @@
+// The catalog-DB policy backend (spec 006): policy lives in an ATTACHed database, spoken to only in
+// standard duckdb dialect (source agnostic). Virtual catalogs (shared object definitions) are
+// separated from role grants; caches are keyed by acl.meta's policy_version, re-checked at most once
+// per acl_version_check_interval ms. The selection logic lives in SQL: one resolve miss is one JOIN
+// over role_catalogs/relations/role_object_caps (columns folded in as a list() aggregate), with the
+// qualified-vs-main interpretation and the unique-main guard decided by the query - duckdb's engine
+// does the work, base-table filters push down into the scanners. Every table carries a primary key
+// (sources without rowids need one for DELETE/UPDATE). Reads open short-lived connections (a stored
+// Connection would cycle DatabaseInstance -> config -> store -> connection).
+
+#include "acl_policy.hpp"
+
+#include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
+#include "yyjson.hpp"
+
+#include <chrono>
+
+namespace duckdb {
+namespace acl {
+namespace acl_detail {
+namespace {
+
+string Ident(const string &value) {
+	return "\"" + StringUtil::Replace(value, "\"", "\"\"") + "\"";
+}
+
+string Lit(const string &value) {
+	return "'" + StringUtil::Replace(value, "'", "''") + "'";
+}
+
+string LitList(const vector<string> &values) {
+	vector<string> quoted;
+	for (auto &value : values) {
+		quoted.push_back(Lit(value));
+	}
+	return StringUtil::Join(quoted, ", ");
+}
+
+//! Parse a caps JSON object ({"select": true, "insert": false, ...}) into the set of enabled
+//! capability names, with duckdb's bundled yyjson. Anything but a flat object of booleans is refused.
+case_insensitive_set_t ParseCaps(const string &json) {
+	case_insensitive_set_t caps;
+	auto trimmed = json;
+	StringUtil::Trim(trimmed);
+	if (trimmed.empty()) {
+		return caps; // empty/NULL caps -> no capabilities
+	}
+	auto doc = duckdb_yyjson::yyjson_read(trimmed.c_str(), trimmed.size(), 0);
+	if (!doc) {
+		throw BinderException("acl catalog: malformed caps JSON: %s", json);
+	}
+	string error;
+	auto root = duckdb_yyjson::yyjson_doc_get_root(doc);
+	if (!duckdb_yyjson::yyjson_is_obj(root)) {
+		error = "caps must be a JSON object";
+	} else {
+		duckdb_yyjson::yyjson_obj_iter iter;
+		duckdb_yyjson::yyjson_obj_iter_init(root, &iter);
+		duckdb_yyjson::yyjson_val *key;
+		while ((key = duckdb_yyjson::yyjson_obj_iter_next(&iter))) {
+			auto value = duckdb_yyjson::yyjson_obj_iter_get_val(key);
+			if (!duckdb_yyjson::yyjson_is_bool(value)) {
+				error = "caps values must be true/false";
+				break;
+			}
+			if (duckdb_yyjson::yyjson_get_bool(value)) {
+				caps.insert(duckdb_yyjson::yyjson_get_str(key));
+			}
+		}
+	}
+	duckdb_yyjson::yyjson_doc_free(doc);
+	if (!error.empty()) {
+		throw BinderException("acl catalog: %s: %s", error, json);
+	}
+	return caps;
+}
+
+} // namespace
+
+struct CatalogBackend {
+	CatalogBackend(DatabaseInstance &db_p, string db_name_p, string schema_p)
+	    : db(db_p.shared_from_this()), db_name(std::move(db_name_p)), schema(std::move(schema_p)) {
+	}
+
+	weak_ptr<DatabaseInstance> db;
+	string db_name;
+	string schema;
+
+	mutex lock;
+	// version state
+	int64_t version = -1;
+	std::chrono::steady_clock::time_point last_check;
+	bool checked_once = false;
+	// result caches, invalidated on a version bump; maps are size-capped by ClearIfOversized().
+	// keys carry the principal's sorted role set: the effective policy depends on it.
+	static constexpr idx_t CACHE_CAPACITY = 4096;
+	std::unordered_map<string, std::pair<bool, TablePolicy>> objects;    // rolesig \x1f written name
+	std::unordered_map<string, std::pair<bool, TablePolicy>> functions;  // rolesig \x1f kind \x1f name
+	std::unordered_map<string, std::pair<bool, bool>> gates;             // rolesig \x1f name -> decided, allowed
+	case_insensitive_map_t<case_insensitive_map_t<string>> claims_cache; // role -> claims
+	case_insensitive_set_t claims_loaded;
+
+	string Tbl(const char *table) {
+		return Ident(db_name) + "." + Ident(schema) + "." + Ident(table);
+	}
+
+	shared_ptr<DatabaseInstance> Db() {
+		auto instance = db.lock();
+		if (!instance) {
+			throw BinderException("acl catalog: database instance is gone");
+		}
+		return instance;
+	}
+
+	//! Run one read query on a fresh connection; throws on error
+	unique_ptr<MaterializedQueryResult> Query(const string &sql) {
+		auto instance = Db();
+		Connection con(*instance);
+		auto result = con.Query(sql);
+		if (result->HasError()) {
+			throw BinderException("acl catalog: query failed: %s", result->GetError());
+		}
+		return result;
+	}
+
+	//! Run admin write statements + the policy_version bump in one transaction
+	void Write(const vector<string> &statements) {
+		auto instance = Db();
+		Connection con(*instance);
+		auto begin = con.Query("BEGIN");
+		if (begin->HasError()) {
+			throw BinderException("acl catalog: %s", begin->GetError());
+		}
+		for (auto &sql : statements) {
+			auto result = con.Query(sql);
+			if (result->HasError()) {
+				con.Query("ROLLBACK");
+				throw BinderException("acl catalog: write failed: %s", result->GetError());
+			}
+		}
+		auto bump = con.Query("UPDATE " + Tbl("meta") +
+		                      " SET \"value\" = CAST(CAST(\"value\" AS BIGINT) + 1 AS VARCHAR)"
+		                      " WHERE \"key\" = 'policy_version'");
+		if (bump->HasError()) {
+			con.Query("ROLLBACK");
+			throw BinderException("acl catalog: version bump failed: %s", bump->GetError());
+		}
+		auto commit = con.Query("COMMIT");
+		if (commit->HasError()) {
+			throw BinderException("acl catalog: %s", commit->GetError());
+		}
+		lock_guard<mutex> guard(lock);
+		checked_once = false; // force a version re-read on the next resolve
+	}
+
+	int64_t CheckIntervalMs() {
+		Value value;
+		if (Db()->TryGetCurrentSetting("acl_version_check_interval", value) && !value.IsNull()) {
+			return value.GetValue<int64_t>();
+		}
+		return 1000;
+	}
+
+	//! Re-read policy_version at most once per interval; a bump clears every cache (fail-fresh)
+	void EnsureFresh() {
+		{
+			lock_guard<mutex> guard(lock);
+			auto now = std::chrono::steady_clock::now();
+			auto interval = std::chrono::milliseconds(CheckIntervalMs());
+			if (checked_once && now - last_check < interval) {
+				return;
+			}
+			last_check = now;
+			checked_once = true;
+		}
+		auto result = Query("SELECT \"value\" FROM " + Tbl("meta") + " WHERE \"key\" = 'policy_version'");
+		if (result->RowCount() != 1) {
+			throw BinderException("acl catalog: policy_version not found in %s", Tbl("meta"));
+		}
+		auto current = result->GetValue(0, 0).GetValue<int64_t>();
+		lock_guard<mutex> guard(lock);
+		if (current != version) {
+			version = current;
+			objects.clear();
+			functions.clear();
+			gates.clear();
+			claims_cache.clear();
+			claims_loaded.clear();
+		}
+	}
+
+	template <class MAP>
+	void ClearIfOversized(MAP &map) {
+		if (map.size() > CACHE_CAPACITY) {
+			map.clear(); // crude bound; an LRU can replace this when profiles ask for it
+		}
+	}
+
+	string RoleSig(const Principal &principal) {
+		auto roles = principal.roles;
+		std::sort(roles.begin(), roles.end());
+		return StringUtil::Join(roles, ",");
+	}
+
+	//! The shared query prelude: the principal's grants and the unique-main guard, computed in SQL
+	string PrincipalCtes(const Principal &principal) {
+		return "WITH grants AS (SELECT \"role\", \"vcat\", \"is_main\", \"caps\" FROM " + Tbl("role_catalogs") +
+		       " WHERE \"role\" IN (" + LitList(principal.roles) +
+		       ")), main_ok AS (SELECT count(DISTINCT \"vcat\") = 1 AS unique_main FROM grants WHERE \"is_main\") ";
+	}
+
+	//! Split a written name into its qualified interpretation; empty head = no qualified branch
+	static void SplitName(const string &vname, string &head, string &rest) {
+		auto dot = vname.find('.');
+		if (dot == string::npos) {
+			head.clear();
+			rest.clear();
+		} else {
+			head = vname.substr(0, dot);
+			rest = vname.substr(dot + 1);
+		}
+	}
+
+	bool ResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {
+		if (principal.roles.empty()) {
+			return false;
+		}
+		EnsureFresh();
+		auto key = RoleSig(principal) + "\x1f" + vname;
+		{
+			lock_guard<mutex> guard(lock);
+			auto entry = objects.find(key);
+			if (entry != objects.end()) {
+				out = entry->second.second;
+				return entry->second.first;
+			}
+		}
+		TablePolicy policy;
+		bool found = LookupRelation(principal, vname, policy) || LookupSchemaAlias(principal, vname, policy);
+		lock_guard<mutex> guard(lock);
+		ClearIfOversized(objects);
+		objects[key] = {found, policy};
+		if (found) {
+			out = policy;
+		}
+		return found;
+	}
+
+	//! One JOIN resolves the object: both name interpretations, the unique-main guard, the per-role
+	//! effective caps (object override beats the catalog default) and the projected columns (as a
+	//! list() aggregate) come back in a single result - the engine does the selection.
+	bool LookupRelation(const Principal &principal, const string &vname, TablePolicy &out) {
+		string head, rest;
+		SplitName(vname, head, rest);
+		string qualified_cond =
+		    head.empty() ? string("false") : "r.\"vcat\" = " + Lit(head) + " AND r.\"vname\" = " + Lit(rest);
+		auto sql = PrincipalCtes(principal) +
+		           "SELECT r.\"form\", r.\"phys\", r.\"view_sql\", r.\"rls\","
+		           " coalesce(oc.\"caps\", g.\"caps\") AS caps,"
+		           " CASE WHEN " +
+		           qualified_cond +
+		           " THEN 1 ELSE 2 END AS prio,"
+		           " (SELECT list(struct_pack(cname := c.\"name\", cexpr := c.\"expr\") ORDER BY c.\"pos\") FROM " +
+		           Tbl("relation_columns") +
+		           " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\") AS cols"
+		           " FROM " +
+		           Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\" LEFT JOIN " +
+		           Tbl("role_object_caps") +
+		           " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = r.\"vcat\" AND oc.\"vname\" = r.\"vname\""
+		           " WHERE (" +
+		           qualified_cond +
+		           ") OR (g.\"is_main\" AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(vname) +
+		           ") ORDER BY prio";
+		auto result = Query(sql);
+		if (result->RowCount() == 0) {
+			return false;
+		}
+		auto prio = result->GetValue(5, 0).GetValue<int64_t>();
+		auto form = result->GetValue(0, 0).ToString();
+		auto phys = result->GetValue(1, 0);
+		auto view_sql = result->GetValue(2, 0);
+		auto rls = result->GetValue(3, 0);
+		out.phys = phys.IsNull() ? string() : phys.ToString();
+		out.query = view_sql.IsNull() ? string() : view_sql.ToString();
+		out.rls = rls.IsNull() ? string() : rls.ToString();
+		out.subquery_form = form != "alias";
+		auto cols = result->GetValue(6, 0);
+		if (form == "subquery" && !cols.IsNull()) {
+			for (auto &item : ListValue::GetChildren(cols)) {
+				auto &fields = StructValue::GetChildren(item);
+				auto name = fields[0].ToString();
+				if (fields[1].IsNull() || fields[1].ToString().empty()) {
+					out.projection.push_back(name);
+				} else {
+					out.projection.push_back(fields[1].ToString() + " AS " + name);
+				}
+			}
+		}
+		// remaining rows of the winning interpretation differ only by role: union their caps
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			if (result->GetValue(5, row).GetValue<int64_t>() != prio) {
+				break; // ordered by prio; the losing interpretation starts here
+			}
+			auto caps = result->GetValue(4, row);
+			for (auto &cap : ParseCaps(caps.IsNull() ? string() : caps.ToString())) {
+				out.caps.insert(cap);
+			}
+		}
+		return true;
+	}
+
+	//! The longest granted schema-alias prefix, picked by the query (ORDER BY prefix length);
+	//! the matched prefix RENAMEs into the physical schema, the binder validates existence.
+	bool LookupSchemaAlias(const Principal &principal, const string &vname, TablePolicy &out) {
+		string head, rest;
+		SplitName(vname, head, rest);
+		auto prefix_match = [](const string &path, const string &alias_expr) {
+			return "substr(" + path + ", 1, length(" + alias_expr + ") + 1) = " + alias_expr + " || '.'";
+		};
+		string qualified_cond =
+		    head.empty() ? string("false")
+		                 : "sa.\"vcat\" = " + Lit(head) + " AND " + prefix_match(Lit(rest), "sa.\"alias_path\"");
+		auto path_case = "CASE WHEN sa.\"vcat\" = " + (head.empty() ? Lit("") : Lit(head)) + " THEN " + Lit(rest) +
+		                 " ELSE " + Lit(vname) + " END";
+		auto sql = PrincipalCtes(principal) +
+		           "SELECT sa.\"vcat\", sa.\"alias_path\", sa.\"phys_path\","
+		           " coalesce(oc.\"caps\", g.\"caps\") AS caps,"
+		           " CASE WHEN " +
+		           qualified_cond +
+		           " THEN 1 ELSE 2 END AS prio"
+		           " FROM " +
+		           Tbl("schema_aliases") + " sa JOIN grants g ON g.\"vcat\" = sa.\"vcat\" LEFT JOIN " +
+		           Tbl("role_object_caps") +
+		           " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = sa.\"vcat\" AND oc.\"vname\" = " + path_case +
+		           " WHERE (" + qualified_cond + ") OR (g.\"is_main\" AND (SELECT unique_main FROM main_ok) AND " +
+		           prefix_match(Lit(vname), "sa.\"alias_path\"") + ") ORDER BY prio, length(sa.\"alias_path\") DESC";
+		auto result = Query(sql);
+		if (result->RowCount() == 0) {
+			return false;
+		}
+		auto prio = result->GetValue(4, 0).GetValue<int64_t>();
+		auto vcat = result->GetValue(0, 0).ToString();
+		auto alias_path = result->GetValue(1, 0).ToString();
+		auto &path = prio == 1 ? rest : vname;
+		out.subquery_form = false;
+		out.phys = result->GetValue(2, 0).ToString() + path.substr(alias_path.size());
+		// rows of the same winning alias differ only by role: union their caps
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			if (result->GetValue(4, row).GetValue<int64_t>() != prio || result->GetValue(0, row).ToString() != vcat ||
+			    result->GetValue(1, row).ToString() != alias_path) {
+				continue;
+			}
+			auto caps = result->GetValue(3, row);
+			for (auto &cap : ParseCaps(caps.IsNull() ? string() : caps.ToString())) {
+				out.caps.insert(cap);
+			}
+		}
+		return true;
+	}
+
+	bool ResolveFunction(const Principal &principal, const string &vname, bool table_kind, TablePolicy &out) {
+		if (principal.roles.empty()) {
+			return false;
+		}
+		EnsureFresh();
+		auto kind = table_kind ? "table" : "scalar";
+		auto key = RoleSig(principal) + "\x1f" + kind + "\x1f" + vname;
+		{
+			lock_guard<mutex> guard(lock);
+			auto entry = functions.find(key);
+			if (entry != functions.end()) {
+				out = entry->second.second;
+				return entry->second.first;
+			}
+		}
+		string head, rest;
+		SplitName(vname, head, rest);
+		string qualified_cond =
+		    head.empty() ? string("false") : "f.\"vcat\" = " + Lit(head) + " AND f.\"vname\" = " + Lit(rest);
+		auto sql = PrincipalCtes(principal) +
+		           "SELECT f.\"form\", f.\"target\", f.\"template\","
+		           " CASE WHEN " +
+		           qualified_cond +
+		           " THEN 1 ELSE 2 END AS prio"
+		           " FROM " +
+		           Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\" WHERE f.\"kind\" = '" + kind +
+		           "' AND ((" + qualified_cond +
+		           ") OR (g.\"is_main\" AND (SELECT unique_main FROM main_ok) AND f.\"vname\" = " + Lit(vname) +
+		           ")) ORDER BY prio LIMIT 1";
+		auto result = Query(sql);
+		TablePolicy policy;
+		bool found = result->RowCount() > 0;
+		if (found) {
+			auto form = result->GetValue(0, 0).ToString();
+			auto target = result->GetValue(1, 0);
+			auto template_sql = result->GetValue(2, 0);
+			policy.subquery_form = form != "alias";
+			policy.phys = target.IsNull() ? string() : target.ToString();
+			policy.query = template_sql.IsNull() ? string() : template_sql.ToString();
+		}
+		lock_guard<mutex> guard(lock);
+		ClearIfOversized(functions);
+		functions[key] = {found, policy};
+		if (found) {
+			out = policy;
+		}
+		return found;
+	}
+
+	//! Targeted gate lookup: only the rows for this name and these roles leave the database ('' as
+	//! role means a global row - NULL cannot be part of the primary key). Role-specific rows beat
+	//! global rows; among role rows an explicit deny wins.
+	bool FunctionGate(const Principal &principal, const string &name, bool &allowed) {
+		EnsureFresh();
+		auto lowered = StringUtil::Lower(name);
+		auto key = RoleSig(principal) + "\x1f" + lowered;
+		{
+			lock_guard<mutex> guard(lock);
+			auto entry = gates.find(key);
+			if (entry != gates.end()) {
+				allowed = entry->second.second;
+				return entry->second.first;
+			}
+		}
+		string role_filter = "\"role\" = ''";
+		if (!principal.roles.empty()) {
+			role_filter += " OR \"role\" IN (" + LitList(principal.roles) + ")";
+		}
+		auto result = Query("SELECT \"role\", \"allowed\" FROM " + Tbl("function_gate") +
+		                    " WHERE lower(\"name\") = " + Lit(lowered) + " AND (" + role_filter + ")");
+		bool have_role_row = false, role_allowed = true;
+		bool have_global_row = false, global_allowed = true;
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			auto verdict_value = result->GetValue(1, row);
+			bool verdict = !verdict_value.IsNull() && verdict_value.GetValue<bool>();
+			if (result->GetValue(0, row).ToString().empty()) {
+				have_global_row = true;
+				global_allowed = verdict;
+			} else {
+				have_role_row = true;
+				role_allowed = role_allowed && verdict;
+			}
+		}
+		bool decided = have_role_row || have_global_row;
+		bool verdict = have_role_row ? role_allowed : global_allowed;
+		lock_guard<mutex> guard(lock);
+		ClearIfOversized(gates);
+		gates[key] = {decided, verdict};
+		allowed = verdict;
+		return decided;
+	}
+
+	void LoadRoleClaims(Principal &principal) {
+		EnsureFresh();
+		vector<string> missing;
+		{
+			lock_guard<mutex> guard(lock);
+			for (auto &role : principal.roles) {
+				if (!claims_loaded.count(role)) {
+					missing.push_back(role);
+				}
+			}
+		}
+		if (!missing.empty()) {
+			auto result = Query("SELECT \"role\", \"claim\", \"value\" FROM " + Tbl("role_claims") +
+			                    " WHERE \"role\" IN (" + LitList(missing) + ")");
+			lock_guard<mutex> guard(lock);
+			for (auto &role : missing) {
+				claims_loaded.insert(role);
+				claims_cache[role];
+			}
+			for (idx_t row = 0; row < result->RowCount(); row++) {
+				claims_cache[result->GetValue(0, row).ToString()][result->GetValue(1, row).ToString()] =
+				    result->GetValue(2, row).ToString();
+			}
+		}
+		lock_guard<mutex> guard(lock);
+		for (auto &role : principal.roles) {
+			auto entry = claims_cache.find(role);
+			if (entry == claims_cache.end()) {
+				continue;
+			}
+			for (auto &claim : entry->second) {
+				if (!principal.claims.count(claim.first)) { // explicit claims win over role defaults
+					principal.claims[claim.first] = claim.second;
+				}
+			}
+		}
+	}
+
+	//! Every table carries a primary key: sources without rowids need one for DELETE/UPDATE
+	void InitSchema() {
+		auto instance = Db();
+		Connection con(*instance);
+		vector<string> ddl = {
+		    "CREATE SCHEMA IF NOT EXISTS " + Ident(db_name) + "." + Ident(schema),
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("meta") + "(\"key\" VARCHAR PRIMARY KEY, \"value\" VARCHAR)",
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("catalogs") + "(\"vcat\" VARCHAR PRIMARY KEY, \"comment\" VARCHAR)",
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("relations") +
+		        "(\"vcat\" VARCHAR, \"vname\" VARCHAR, \"form\" VARCHAR, \"phys\" VARCHAR, \"view_sql\" VARCHAR,"
+		        " \"rls\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\"))",
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("relation_columns") +
+		        "(\"vcat\" VARCHAR, \"vname\" VARCHAR, \"pos\" INTEGER, \"name\" VARCHAR, \"expr\" VARCHAR,"
+		        " PRIMARY KEY (\"vcat\", \"vname\", \"pos\"))",
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("schema_aliases") +
+		        "(\"vcat\" VARCHAR, \"alias_path\" VARCHAR, \"phys_path\" VARCHAR,"
+		        " PRIMARY KEY (\"vcat\", \"alias_path\"))",
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("functions") +
+		        "(\"vcat\" VARCHAR, \"vname\" VARCHAR, \"kind\" VARCHAR, \"form\" VARCHAR, \"target\" VARCHAR,"
+		        " \"template\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\", \"kind\"))",
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("roles") + "(\"role\" VARCHAR PRIMARY KEY, \"comment\" VARCHAR)",
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_claims") +
+		        "(\"role\" VARCHAR, \"claim\" VARCHAR, \"value\" VARCHAR, PRIMARY KEY (\"role\", \"claim\"))",
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_catalogs") +
+		        "(\"role\" VARCHAR, \"vcat\" VARCHAR, \"is_main\" BOOLEAN, \"caps\" VARCHAR,"
+		        " PRIMARY KEY (\"role\", \"vcat\"))",
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_object_caps") +
+		        "(\"role\" VARCHAR, \"vcat\" VARCHAR, \"vname\" VARCHAR, \"caps\" VARCHAR,"
+		        " PRIMARY KEY (\"role\", \"vcat\", \"vname\"))",
+		    // '' as role/kind means "global"/"any kind": NULL cannot be part of the primary key
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("function_gate") +
+		        "(\"role\" VARCHAR, \"name\" VARCHAR, \"kind\" VARCHAR, \"allowed\" BOOLEAN,"
+		        " PRIMARY KEY (\"role\", \"name\", \"kind\"))",
+		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
+		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
+		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
+		        Tbl("meta") + " WHERE \"key\" = 'policy_version')",
+		};
+		for (auto &sql : ddl) {
+			auto result = con.Query(sql);
+			if (result->HasError()) {
+				throw BinderException("acl catalog: init failed at [%s]: %s", sql, result->GetError());
+			}
+		}
+	}
+};
+
+} // namespace acl_detail
+
+using acl_detail::CatalogBackend;
+using acl_detail::Lit;
+
+PolicyStore::PolicyStore() {
+}
+
+PolicyStore::~PolicyStore() {
+}
+
+void PolicyStore::EnableCatalog(DatabaseInstance &db, const string &db_name, const string &schema, bool init) {
+	auto backend = make_uniq<CatalogBackend>(db, db_name, schema);
+	if (init) {
+		backend->InitSchema();
+	}
+	backend->EnsureFresh(); // validates reachability and the schema before switching over
+	lock_guard<mutex> guard(lock);
+	catalog = std::move(backend);
+}
+
+bool PolicyStore::CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {
+	return catalog->ResolveTable(principal, vname, out);
+}
+
+bool PolicyStore::CatalogResolveFunction(const Principal &principal, const string &vname, bool table_kind,
+                                         TablePolicy &out) {
+	return catalog->ResolveFunction(principal, vname, table_kind, out);
+}
+
+bool PolicyStore::CatalogFunctionGate(const Principal &principal, const QualifiedName &name, bool &allowed) {
+	return catalog->FunctionGate(principal, name.Name().GetIdentifierName(), allowed);
+}
+
+void PolicyStore::CatalogLoadRoleClaims(Principal &principal) {
+	catalog->LoadRoleClaims(principal);
+}
+
+namespace {
+
+void RequireCatalog(const unique_ptr<CatalogBackend> &catalog, const char *what) {
+	if (!catalog) {
+		throw BinderException("%s requires a policy catalog - run acl_use_db() first", what);
+	}
+}
+
+} // namespace
+
+void PolicyStore::CatalogCreate(const string &vcat, const string &comment) {
+	RequireCatalog(catalog, "acl_create_catalog");
+	catalog->Write({"DELETE FROM " + catalog->Tbl("catalogs") + " WHERE \"vcat\" = " + Lit(vcat),
+	                "INSERT INTO " + catalog->Tbl("catalogs") + " VALUES (" + Lit(vcat) + ", " + Lit(comment) + ")"});
+}
+
+void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
+                                     const string &view_sql, const string &rls,
+                                     const vector<std::pair<string, string>> &columns) {
+	RequireCatalog(catalog, "acl_add_relation");
+	vector<string> statements;
+	statements.push_back("DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                     " AND \"vname\" = " + Lit(vname));
+	statements.push_back("DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                     " AND \"vname\" = " + Lit(vname));
+	statements.push_back("INSERT INTO " + catalog->Tbl("relations") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) +
+	                     ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) + ", " + Lit(rls) + ")");
+	idx_t pos = 0;
+	for (auto &column : columns) {
+		statements.push_back("INSERT INTO " + catalog->Tbl("relation_columns") + " VALUES (" + Lit(vcat) + ", " +
+		                     Lit(vname) + ", " + std::to_string(pos++) + ", " + Lit(column.first) + ", " +
+		                     Lit(column.second) + ")");
+	}
+	catalog->Write(statements);
+}
+
+void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path) {
+	RequireCatalog(catalog, "acl_add_schema_alias");
+	catalog->Write({"DELETE FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                    " AND \"alias_path\" = " + Lit(alias_path),
+	                "INSERT INTO " + catalog->Tbl("schema_aliases") + " VALUES (" + Lit(vcat) + ", " + Lit(alias_path) +
+	                    ", " + Lit(phys_path) + ")"});
+}
+
+void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
+                                     const string &target, const string &template_sql) {
+	RequireCatalog(catalog, "acl_add_function");
+	catalog->Write({"DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                    " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind),
+	                "INSERT INTO " + catalog->Tbl("functions") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) + ", " +
+	                    Lit(kind) + ", " + Lit(form) + ", " + Lit(target) + ", " + Lit(template_sql) + ")"});
+}
+
+void PolicyStore::CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main) {
+	RequireCatalog(catalog, "acl_grant_catalog");
+	acl_detail::ParseCaps(caps_json); // validate before persisting
+	catalog->Write({"DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
+	                    " AND \"vcat\" = " + Lit(vcat),
+	                "INSERT INTO " + catalog->Tbl("role_catalogs") + " VALUES (" + Lit(role) + ", " + Lit(vcat) + ", " +
+	                    (is_main ? "true" : "false") + ", " + Lit(caps_json) + ")"});
+}
+
+void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
+	RequireCatalog(catalog, "acl_revoke_catalog");
+	catalog->Write({"DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
+	                    " AND \"vcat\" = " + Lit(vcat),
+	                "DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
+	                    " AND \"vcat\" = " + Lit(vcat)});
+}
+
+void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
+	RequireCatalog(catalog, "acl_drop_relation");
+	catalog->Write({"DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                    " AND \"vname\" = " + Lit(vname),
+	                "DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                    " AND \"vname\" = " + Lit(vname),
+	                "DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                    " AND \"vname\" = " + Lit(vname)});
+}
+
+void PolicyStore::CatalogDefineRole(const string &role, const case_insensitive_map_t<string> &claims) {
+	RequireCatalog(catalog, "acl_define_role");
+	vector<string> statements;
+	statements.push_back("DELETE FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
+	statements.push_back("INSERT INTO " + catalog->Tbl("roles") + " VALUES (" + Lit(role) + ", '')");
+	statements.push_back("DELETE FROM " + catalog->Tbl("role_claims") + " WHERE \"role\" = " + Lit(role));
+	for (auto &claim : claims) {
+		statements.push_back("INSERT INTO " + catalog->Tbl("role_claims") + " VALUES (" + Lit(role) + ", " +
+		                     Lit(claim.first) + ", " + Lit(claim.second) + ")");
+	}
+	catalog->Write(statements);
+}
+
+void PolicyStore::CatalogSetFunctionGate(const string &name, bool allowed, bool remove) {
+	RequireCatalog(catalog, "acl_deny_function/acl_allow_function");
+	vector<string> statements = {"DELETE FROM " + catalog->Tbl("function_gate") +
+	                             " WHERE \"role\" = '' AND \"name\" = " + Lit(StringUtil::Lower(name))};
+	if (!remove) {
+		statements.push_back("INSERT INTO " + catalog->Tbl("function_gate") + " VALUES ('', " +
+		                     Lit(StringUtil::Lower(name)) + ", '', " + (allowed ? "true" : "false") + ")");
+	}
+	catalog->Write(statements);
+}
+
+void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,
+                                       const string &caps_json) {
+	RequireCatalog(catalog, "acl catalog");
+	acl_detail::ParseCaps(caps_json);
+	catalog->Write({"DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
+	                    " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname),
+	                "INSERT INTO " + catalog->Tbl("role_object_caps") + " VALUES (" + Lit(role) + ", " + Lit(vcat) +
+	                    ", " + Lit(vname) + ", " + Lit(caps_json) + ")"});
+}
+
+void PolicyStore::CatalogEnsureGrant(const string &role, const string &vcat, bool is_main) {
+	RequireCatalog(catalog, "acl catalog");
+	catalog->Write({"INSERT INTO " + catalog->Tbl("role_catalogs") + " SELECT " + Lit(role) + ", " + Lit(vcat) + ", " +
+	                (is_main ? "true" : "false") + ", '{}' WHERE NOT EXISTS (SELECT 1 FROM " +
+	                catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat) +
+	                ")"});
+}
+
+} // namespace acl
+} // namespace duckdb

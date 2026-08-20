@@ -1,0 +1,260 @@
+# name: test/sql/acl_catalog.test
+# description: catalog-backed policy store (spec 006) - virtual catalogs in an ATTACHed database
+# group: [sql]
+
+require acl
+
+# physical data lives in one attached database, the policy catalog in another
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100), (2, 'globex', 200), (3, 'acme', 300);
+
+statement ok
+CREATE TABLE phys.main.audit_physical(id INT, note VARCHAR);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+# catalog admin before acl_use_db fails closed
+statement error
+SELECT acl_create_catalog('sales');
+----
+<REGEX>:.*requires a policy catalog.*
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+# --- build a shared virtual catalog and grant it ------------------------------------------------
+
+statement ok
+SELECT acl_create_catalog('sales', 'the sales namespace');
+
+# subquery form: projection + RLS template (claims bake per principal)
+statement ok
+SELECT acl_add_relation('sales', 'orders', 'phys.main.orders_physical', 'id,amount', 'tenant = acl_claim(''tenant'')');
+
+# alias form (no columns, no RLS): writable
+statement ok
+SELECT acl_add_relation('sales', 'audit', 'phys.main.audit_physical', '', '');
+
+# view form
+statement ok
+SELECT acl_add_view('sales', 'order_stats', 'SELECT count(*) AS orders FROM phys.main.orders_physical WHERE tenant = acl_claim(''tenant'')');
+
+# a whole physical schema under a virtual prefix
+statement ok
+SELECT acl_add_schema_alias('sales', 'raw', 'phys.main');
+
+# virtual functions live in the catalog too
+statement ok
+SELECT acl_add_table_function('sales', 'report', 'SELECT id, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1) AND tenant = acl_claim(''tenant'')');
+
+statement ok
+SELECT acl_add_scalar('sales', 'shout', 'upper(acl_arg(1))');
+
+statement ok
+SELECT acl_grant_catalog('analyst', 'sales', '{"select": true, "insert": true, "delete": true}', true);
+
+statement ok
+SELECT acl_define_role('analyst', 'tenant=acme');
+
+# --- resolution ----------------------------------------------------------------------------------
+
+# unqualified name -> the main catalog; RLS claim comes from the catalog's role_claims
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+# qualified name -> any granted catalog
+query II
+ACL ROLE "analyst" SELECT id, amount FROM sales.orders ORDER BY id;
+----
+1	100
+3	300
+
+# view form
+query I
+ACL ROLE "analyst" SELECT orders FROM order_stats;
+----
+2
+
+# schema alias: any name under the prefix RENAMEs into the physical schema (reads and writes)
+query I
+ACL ROLE "analyst" SELECT count(*) FROM raw.orders_physical;
+----
+3
+
+statement ok
+ACL ROLE "analyst" INSERT INTO audit VALUES (1, 'created');
+
+query II
+ACL ROLE "analyst" SELECT id, note FROM audit;
+----
+1	created
+
+statement ok
+ACL ROLE "analyst" DELETE FROM audit WHERE id = 1;
+
+# writes through the schema alias are capability-gated too (no 'update' in the grant)
+statement error
+ACL ROLE "analyst" UPDATE raw.audit_physical SET note = 'x' WHERE id = 1;
+----
+<REGEX>:.*update on "raw.audit_physical" is not allowed.*
+
+# the subquery form stays read-only by construction
+statement error
+ACL ROLE "analyst" INSERT INTO orders VALUES (9, 900);
+----
+<REGEX>:.*read-only relation.*
+
+# virtual functions resolve through the main catalog
+query II
+ACL ROLE "analyst" SELECT id, amount FROM report(150) ORDER BY id;
+----
+3	300
+
+query I
+ACL ROLE "analyst" SELECT shout('hi');
+----
+HI
+
+# unknown names and physical names are refused
+statement error
+ACL ROLE "analyst" SELECT * FROM phys.main.orders_physical;
+----
+<REGEX>:.*no access to object.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM nothere;
+----
+<REGEX>:.*no access to object.*
+
+# an ungranted role sees nothing
+statement error
+ACL ROLE "intern" SELECT id FROM orders;
+----
+<REGEX>:.*no access to object.*
+
+# --- select capability gates the read path (spec 003 semantics over the catalog) -----------------
+
+statement ok
+SELECT acl_create_catalog('ingest');
+
+statement ok
+SELECT acl_add_relation('ingest', 'dropbox', 'phys.main.audit_physical', '', '');
+
+statement ok
+SELECT acl_grant_catalog('writer', 'ingest', '{"insert": true}', true);
+
+statement ok
+ACL ROLE "writer" INSERT INTO dropbox VALUES (7, 'in');
+
+statement error
+ACL ROLE "writer" SELECT * FROM dropbox;
+----
+<REGEX>:.*select on "dropbox" is not allowed.*
+
+statement ok
+ACL ADMIN DELETE FROM phys.main.audit_physical;
+
+# --- function gating rows in the catalog ----------------------------------------------------------
+
+statement ok
+SELECT acl_deny_function('shout_helper');
+
+statement error
+ACL ROLE "analyst" SELECT shout_helper('x');
+----
+<REGEX>:.*not allowed.*
+
+# the default denylist still applies without a gate row
+statement error
+ACL ROLE "analyst" SELECT * FROM read_csv('/etc/passwd');
+----
+<REGEX>:.*not allowed.*
+
+# an explicit allow row overrides the default denylist
+statement ok
+SELECT acl_allow_function('getvariable');
+
+statement ok
+ACL ADMIN SET VARIABLE probe = 42;
+
+query I
+ACL ROLE "analyst" SELECT getvariable('probe');
+----
+42
+
+# --- the token bridge: tokens verify in memory, policy resolves from the catalog ------------------
+
+statement ok
+SELECT acl_define_token('tok-globex', 'analyst', 'tenant=globex');
+
+query II
+ACL TOKEN 'tok-globex' SELECT id, amount FROM orders ORDER BY id;
+----
+2	200
+
+# --- compatibility wrappers write into the implicit catalog 'default' -----------------------------
+
+statement ok
+SELECT acl_grant_table('legacy', 'old_orders', 'phys.main.orders_physical', 'id,amount', 'tenant = acl_claim(''tenant'')', 'select');
+
+statement ok
+SELECT acl_define_role('legacy', 'tenant=acme');
+
+query II
+ACL ROLE "legacy" SELECT id, amount FROM old_orders ORDER BY id;
+----
+1	100
+3	300
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'default' AND vname = 'old_orders';
+----
+1
+
+# --- ambiguous main catalog: unqualified names stop resolving (fail closed) -----------------------
+
+statement ok
+SELECT acl_grant_catalog('analyst', 'ingest', '{"select": true}', true);
+
+statement error
+ACL ROLE "analyst" SELECT id FROM orders;
+----
+<REGEX>:.*no access to object "orders".*
+
+# qualified names keep working
+query II
+ACL ROLE "analyst" SELECT id, amount FROM sales.orders ORDER BY id;
+----
+1	100
+3	300
+
+# demote one main -> unqualified resolution returns
+statement ok
+SELECT acl_grant_catalog('analyst', 'ingest', '{"select": true}', false);
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM orders;
+----
+2
+
+# revoking the catalog removes access entirely
+statement ok
+SELECT acl_revoke_catalog('analyst', 'ingest');
+
+statement error
+ACL ROLE "analyst" SELECT * FROM ingest.dropbox;
+----
+<REGEX>:.*no access to object.*

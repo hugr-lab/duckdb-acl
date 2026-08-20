@@ -7,12 +7,19 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # Local integration-test environment config (specs/005); see .env.example
 -include .env
 
-# Integration builds (ACL_INTEGRATION=1) add the source scanners; on macOS their build dependencies
-# come from Homebrew (brew install libpq croaring) and cmake needs to be pointed at them
+# Integration builds (ACL_INTEGRATION=1) add the source scanners. Their build dependencies come from
+# vcpkg, like every duckdb extension: the merged-manifest step collects the vcpkg.json of each loaded
+# extension (libpq/openssl from duckdb-postgres, roaring from ducklake, ...), so nothing is listed
+# here by hand. Bootstrap once with `make vcpkg-setup`, or point VCPKG_TOOLCHAIN_PATH at an existing
+# vcpkg checkout.
 ifdef ACL_INTEGRATION
-ifeq ($(shell uname -s),Darwin)
-EXT_FLAGS := -DPostgreSQL_ROOT=$(shell brew --prefix libpq 2>/dev/null) \
-    -Droaring_DIR=$(shell brew --prefix croaring 2>/dev/null)/lib/cmake/roaring
+USE_MERGED_VCPKG_MANIFEST := 1
+VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
+GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)
+ifeq ($(wildcard $(VCPKG_TOOLCHAIN_PATH)),)
+ifneq ($(filter-out vcpkg-setup docker-up docker-down docker-status,$(GOALS)),)
+$(error ACL_INTEGRATION build needs vcpkg: run 'make vcpkg-setup' first, or set VCPKG_TOOLCHAIN_PATH)
+endif
 endif
 endif
 
@@ -20,12 +27,9 @@ endif
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # --- Standalone C++ invariant tests (specs/002-cpp-invariant-tests) ---------
-# Style of hugr-lab/mssql-extension: each test/cpp/test_*.cpp is its own program, compiled directly
-# against the already-built release archives. The archives are named explicitly - in particular the
-# GENERATED extension loader must be linked (never globbed next to the dummy one, which defines the
-# same RegisterLinkedExtensions symbol), so the linked-extension registry works in the test binaries
-# and `LOAD acl` resolves to the statically linked extension. Uses the release build, so run with the
-# same generator as the main build (GEN=ninja make test-cpp).
+# Style of hugr-lab/mssql-extension: each test/cpp/test_*.cpp is its own program built from the
+# already-compiled release tree. Uses the release build, so run with the same generator as the main
+# build (GEN=ninja make test-cpp).
 
 TEST_CPP_SOURCES := $(wildcard test/cpp/test_*.cpp)
 TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,build/test/%,$(TEST_CPP_SOURCES))
@@ -90,6 +94,11 @@ ACL_MYSQL_PORT ?= 6433
 ACL_MYSQL_USER ?= acl
 ACL_MYSQL_PASS ?= aclpass
 ACL_MYSQL_DB ?= acltest
+ACL_MSSQL_HOST ?= localhost
+ACL_MSSQL_PORT ?= 6434
+ACL_MSSQL_USER ?= sa
+ACL_MSSQL_PASS ?= TestPassword1
+ACL_MSSQL_DB ?= acltest
 
 DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
 
@@ -114,4 +123,12 @@ test-integration:
 	ACL_PG_DSN="dbname=$(ACL_PG_DB) user=$(ACL_PG_USER) password=$(ACL_PG_PASS) host=$(ACL_PG_HOST) port=$(ACL_PG_PORT)" \
 	ACL_DUCKLAKE_DSN="ducklake:postgres:dbname=$(ACL_DUCKLAKE_CATALOG_DB) user=$(ACL_PG_USER) password=$(ACL_PG_PASS) host=$(ACL_PG_HOST) port=$(ACL_PG_PORT)" \
 	ACL_MYSQL_DSN="host=$(ACL_MYSQL_HOST) port=$(ACL_MYSQL_PORT) user=$(ACL_MYSQL_USER) passwd=$(ACL_MYSQL_PASS) db=$(ACL_MYSQL_DB)" \
+	ACL_MSSQL_DSN="Server=$(ACL_MSSQL_HOST),$(ACL_MSSQL_PORT);Database=$(ACL_MSSQL_DB);User Id=$(ACL_MSSQL_USER);Password=$(ACL_MSSQL_PASS)" \
 	build/release/test/unittest "test/sql/integration/*"
+
+# Bootstrap a local vcpkg checkout for integration builds (the standard duckdb-extension dependency
+# manager; dependencies themselves come from the merged manifests of the loaded extensions)
+.PHONY: vcpkg-setup
+vcpkg-setup:
+	@test -d vcpkg || git clone https://github.com/microsoft/vcpkg.git vcpkg
+	./vcpkg/bootstrap-vcpkg.sh -disableMetrics
