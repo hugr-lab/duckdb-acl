@@ -889,8 +889,8 @@ struct CatalogBackend {
 		                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
 		                                       " AND oc.\"vname\" = f.\"vname\""
 		                                 : string();
-		auto sql = GrantsCte(principal) + "SELECT f.\"vcat\", f.\"form\", f.\"target\", f.\"template\", " +
-		           GrantPolicyExprs() +
+		auto sql = GrantsCte(principal) + "SELECT f.\"vcat\", f.\"form\", f.\"target\", f.\"template\", " + CapsExpr() +
+		           " AS caps, " + GrantPolicyExprs() +
 		           ","
 		           " CASE WHEN " +
 		           qualified_cond +
@@ -908,18 +908,23 @@ struct CatalogBackend {
 			auto form = result->GetValue(1, 0).ToString();
 			auto target = result->GetValue(2, 0);
 			auto template_sql = result->GetValue(3, 0);
-			auto prio = result->GetValue(8, 0).GetValue<int64_t>();
+			auto prio = result->GetValue(9, 0).GetValue<int64_t>();
 			policy.subquery_form = form != "alias";
 			policy.phys = target.IsNull() ? string() : target.ToString();
 			policy.query = template_sql.IsNull() ? string() : template_sql.ToString();
-			// rows of the same winning function differ only by role: union their grant policies
+			// rows of the same winning function differ only by role: union their caps (spec 012 - a
+			// call is a read, so it needs one) and their grant policies
 			GrantUnion grants;
 			for (idx_t row = 0; row < result->RowCount(); row++) {
-				if (result->GetValue(8, row).GetValue<int64_t>() != prio ||
+				if (result->GetValue(9, row).GetValue<int64_t>() != prio ||
 				    result->GetValue(0, row).ToString() != vcat) {
 					continue;
 				}
-				grants.Add(RowPolicy(*result, row, 4));
+				auto caps = result->GetValue(4, row);
+				for (auto &cap : ParseCaps(caps.IsNull() ? string() : caps.ToString())) {
+					policy.caps.insert(cap);
+				}
+				grants.Add(RowPolicy(*result, row, 5));
 			}
 			ApplyFunctionGrantPolicy(vname, table_kind, grants, policy);
 		}

@@ -374,11 +374,13 @@ void GrantFunctionWrapper(DataChunk &args, ExpressionState &state, Vector &resul
 		}
 		TablePolicy policy;
 		policy.subquery_form = !is_alias;
+		// calling a virtual function is a read, so it carries the select capability in either form
+		// (spec 012); an alias is a rename of a physical function, not a lesser grant
+		policy.caps.insert("select");
 		if (is_alias) {
 			policy.phys = definition;
 		} else {
 			policy.query = definition;
-			policy.caps.insert("select");
 		}
 		lock_guard<mutex> guard(store.lock);
 		(store.*space)[role][vname] = std::move(policy);

@@ -354,6 +354,11 @@ private:
 
 		TablePolicy policy;
 		if (store.ResolveTableFunction(principal, vname, policy)) {
+			// a call returns rows, so it is a read like any relation (spec 012). The check comes
+			// before the template is expanded: a denied call never reaches bind.
+			if (!policy.caps.count("select")) {
+				Deny("select on table function \"" + vname + "\" is not allowed");
+			}
 			RewriteFunctionArgs(function); // resolve virtual names inside the call arguments first
 			Identifier alias = tf.alias.empty() ? Identifier(vname) : tf.alias;
 			if (policy.subquery_form) {
@@ -734,6 +739,11 @@ private:
 			// a virtual scalar function for this role: expand it (expr-macro) or retarget it (alias)
 			TablePolicy spolicy;
 			if (store.ResolveScalarFunction(principal, name, spolicy)) {
+				// its template is admin-authored SQL that may read a physical table, so calling it is
+				// a read too: the same capability gates it (spec 012)
+				if (!spolicy.caps.count("select")) {
+					Deny("select on scalar function \"" + name + "\" is not allowed");
+				}
 				RewriteFunctionArgs(function); // resolve virtual names inside the arguments first
 				if (spolicy.subquery_form) {
 					expr = BuildScalarExpr(name, spolicy, function);
@@ -769,22 +779,24 @@ private:
 
 	//! Replace template markers in a node's expressions: acl_claim('<name>') -> baked constant, and (for
 	//! a table-function macro) acl_arg(<n>) -> the n-th call argument's AST. `args` is null for relations.
+	//! Every expression of the node is visited - including the ones inside its FROM clause and its set
+	//! operations - because a marker left behind fails closed at bind, which would make a perfectly
+	//! reasonable template (a predicate over a subquery, a UNION of two tenant slices) unusable.
 	void BakeMarkersInNode(QueryNode &node, const vector<unique_ptr<ParsedExpression>> *args) {
-		if (node.type != QueryNodeType::SELECT_NODE) {
-			return; // rewrite templates are always plain SELECTs
-		}
-		auto &select = node.Cast<SelectNode>();
-		for (auto &item : select.select_list) {
-			BakeMarkers(item, args);
-		}
-		BakeMarkers(select.where_clause, args);
-		BakeMarkers(select.having, args);
-		BakeMarkers(select.qualify, args);
+		ParsedExpressionIterator::EnumerateQueryNodeChildren(
+		    node, [&](unique_ptr<ParsedExpression> &child) { BakeMarkers(child, args); });
 	}
 
 	void BakeMarkers(unique_ptr<ParsedExpression> &expr, const vector<unique_ptr<ParsedExpression>> *args) {
 		if (!expr) {
 			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			// the expression iterator stops at a subquery's boundary, so its own node is walked here
+			auto &subquery = expr->Cast<SubqueryExpression>();
+			if (subquery.SubqueryMutable() && subquery.SubqueryMutable()->node) {
+				BakeMarkersInNode(*subquery.SubqueryMutable()->node, args);
+			}
 		}
 		if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 			auto &function = expr->Cast<FunctionExpression>();

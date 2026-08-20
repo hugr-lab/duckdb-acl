@@ -1,0 +1,232 @@
+# name: test/sql/acl_function_select_gate.test
+# description: the select capability gates virtual function calls (spec 012) - a call returns rows or
+#   expands admin-authored SQL, so a write-only grant must not read through it; a per-object grant is
+#   the escape hatch for one function
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100), (2, 'globex', 200);
+
+statement ok
+CREATE TABLE phys.main.audit(id INT, note VARCHAR);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.audit AS sales.audit;
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.report MACRO 'SELECT id, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.rng ALIAS 'range';
+
+statement ok
+ACL ADMIN ADD SCALAR sales.shout MACRO 'upper(acl_arg(1))';
+
+statement ok
+ACL ADMIN ADD SCALAR sales.lc ALIAS 'lower';
+
+# a scalar whose template reads a table: this is why a scalar call is a read, not a pure transform
+statement ok
+ACL ADMIN ADD SCALAR sales.tenant_of MACRO '(SELECT tenant FROM phys.main.orders_physical WHERE id = acl_arg(1))';
+
+statement ok
+ACL ADMIN CREATE ROLE reader;
+
+statement ok
+ACL ADMIN CREATE ROLE ingest;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE reader CAPS '{"select": true}' MAIN;
+
+# write-only: the audit/ingest case, exactly where a read must not leak
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE ingest CAPS '{"insert": true}' MAIN;
+
+# --- a read grant reaches every form ---------------------------------------------------------------
+
+query II
+ACL ROLE "reader" SELECT id, amount FROM report(150);
+----
+2	200
+
+query I
+ACL ROLE "reader" SELECT count(*) FROM rng(3);
+----
+3
+
+query I
+ACL ROLE "reader" SELECT shout('hi');
+----
+HI
+
+query I
+ACL ROLE "reader" SELECT lc('ABC');
+----
+abc
+
+query I
+ACL ROLE "reader" SELECT tenant_of(1);
+----
+acme
+
+# --- a write-only grant reaches none of them --------------------------------------------------------
+
+# the write itself still works: the grant is not broken, only its reads are refused
+statement ok
+ACL ROLE "ingest" INSERT INTO audit VALUES (1, 'created');
+
+statement error
+ACL ROLE "ingest" SELECT id, amount FROM report(0);
+----
+<REGEX>:.*select on table function "report" is not allowed.*
+
+statement error
+ACL ROLE "ingest" SELECT count(*) FROM rng(3);
+----
+<REGEX>:.*select on table function "rng" is not allowed.*
+
+statement error
+ACL ROLE "ingest" SELECT shout('hi');
+----
+<REGEX>:.*select on scalar function "shout" is not allowed.*
+
+statement error
+ACL ROLE "ingest" SELECT lc('ABC');
+----
+<REGEX>:.*select on scalar function "lc" is not allowed.*
+
+# the leak this closes: a scalar template reads a table the role holds no read on
+statement error
+ACL ROLE "ingest" SELECT tenant_of(1);
+----
+<REGEX>:.*select on scalar function "tenant_of" is not allowed.*
+
+# ... and reading the relation itself is refused as before (spec 003)
+statement error
+ACL ROLE "ingest" SELECT count(*) FROM audit;
+----
+<REGEX>:.*select on "audit" is not allowed.*
+
+# --- the escape hatch: read on one function, not on the catalog ------------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE sales.shout TO ROLE ingest CAPS '{"select": true}';
+
+query I
+ACL ROLE "ingest" SELECT shout('hi');
+----
+HI
+
+# exactly that one: the object grant does not spill onto its neighbours
+statement error
+ACL ROLE "ingest" SELECT tenant_of(1);
+----
+<REGEX>:.*select on scalar function "tenant_of" is not allowed.*
+
+statement ok
+ACL ADMIN GRANT TABLE sales.report TO ROLE ingest CAPS '{"select": true}';
+
+query II
+ACL ROLE "ingest" SELECT id, amount FROM report(150);
+----
+2	200
+
+# --- the object capability overrides the catalog's in both directions ------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE sales.tenant_of TO ROLE reader CAPS '{"insert": true}';
+
+statement error
+ACL ROLE "reader" SELECT tenant_of(1);
+----
+<REGEX>:.*select on scalar function "tenant_of" is not allowed.*
+
+# its neighbours are untouched by that
+query I
+ACL ROLE "reader" SELECT shout('hi');
+----
+HI
+
+# --- the gate runs before the template is expanded --------------------------------------------------
+# a denied call never reaches bind, so a broken template still reports the ACL refusal
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.broken MACRO 'SELECT * FROM phys.main.not_here';
+
+statement error
+ACL ROLE "ingest" SELECT * FROM broken();
+----
+<REGEX>:.*select on table function "broken" is not allowed.*
+
+query I
+ACL ROLE "reader" SELECT count(*) FROM report(0);
+----
+2
+
+# --- markers are baked wherever they stand in a template -------------------------------------------
+# a marker left behind fails closed at bind, which used to make these templates unusable
+
+statement ok
+ACL ADMIN CREATE ROLE tenanted CLAIMS 'tenant=acme';
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE tenanted CAPS '{"select": true}' MAIN;
+
+# a claim inside a subquery of the template
+statement ok
+ACL ADMIN ADD VIEW sales.mine AS 'SELECT id FROM phys.main.orders_physical WHERE tenant IN (SELECT tenant FROM phys.main.orders_physical WHERE tenant = acl_claim(''tenant''))';
+
+query I
+ACL ROLE "tenanted" SELECT id FROM mine;
+----
+1
+
+# a claim on both sides of a set operation
+statement ok
+ACL ADMIN ADD VIEW sales.tenant_split AS 'SELECT id FROM phys.main.orders_physical WHERE tenant = acl_claim(''tenant'') UNION ALL SELECT id FROM phys.main.orders_physical WHERE tenant <> acl_claim(''tenant'')';
+
+query I
+ACL ROLE "tenanted" SELECT count(*) FROM tenant_split;
+----
+2
+
+# a call argument inside a subquery of a table-function macro
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.at_least(threshold INTEGER) MACRO 'SELECT id FROM phys.main.orders_physical WHERE amount IN (SELECT amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1))';
+
+query I
+ACL ROLE "tenanted" SELECT id FROM at_least(150);
+----
+2
+
+# a claim inside a subquery of an RLS predicate
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.scoped RLS 'tenant IN (SELECT tenant FROM phys.main.orders_physical WHERE tenant = acl_claim(''tenant''))';
+
+query I
+ACL ROLE "tenanted" SELECT id FROM scoped;
+----
+1
