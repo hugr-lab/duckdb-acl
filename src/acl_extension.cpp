@@ -54,6 +54,8 @@ void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("acl_version_check_interval",
 	                          "acl: milliseconds between policy_version checks of the policy catalog",
 	                          LogicalType::BIGINT, Value::BIGINT(1000));
+	config.AddExtensionOption("acl_jwt_clock_skew", "acl: allowed clock skew in seconds for JWT exp/nbf checks",
+	                          LogicalType::BIGINT, Value::BIGINT(60));
 
 	// one policy store per database instance, shared by the parser override and the admin functions
 	auto store = make_shared_ptr<acl::PolicyStore>();

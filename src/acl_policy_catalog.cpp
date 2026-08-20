@@ -103,6 +103,7 @@ struct CatalogBackend {
 	std::unordered_map<string, std::pair<bool, bool>> gates;             // rolesig \x1f name -> decided, allowed
 	case_insensitive_map_t<case_insensitive_map_t<string>> claims_cache; // role -> claims
 	case_insensitive_set_t claims_loaded;
+	case_insensitive_map_t<std::pair<bool, IssuerConfig>> issuer_cache; // issuer -> (found, config)
 
 	string Tbl(const char *table) {
 		return Ident(db_name) + "." + Ident(schema) + "." + Ident(table);
@@ -190,6 +191,7 @@ struct CatalogBackend {
 			gates.clear();
 			claims_cache.clear();
 			claims_loaded.clear();
+			issuer_cache.clear();
 		}
 	}
 
@@ -492,6 +494,78 @@ struct CatalogBackend {
 		}
 	}
 
+	int64_t SettingInt64(const char *name, int64_t fallback) {
+		Value value;
+		if (Db()->TryGetCurrentSetting(name, value) && !value.IsNull()) {
+			return value.GetValue<int64_t>();
+		}
+		return fallback;
+	}
+
+	bool LookupIssuer(const string &issuer, IssuerConfig &out) {
+		EnsureFresh();
+		{
+			lock_guard<mutex> guard(lock);
+			auto entry = issuer_cache.find(issuer);
+			if (entry != issuer_cache.end()) {
+				out = entry->second.second;
+				return entry->second.first;
+			}
+		}
+		auto result = Query("SELECT \"keys_json\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\" FROM " +
+		                    Tbl("issuers") + " WHERE \"issuer\" = " + Lit(issuer));
+		IssuerConfig config;
+		bool found = result->RowCount() > 0;
+		if (found) {
+			config.issuer = issuer;
+			auto keys = result->GetValue(0, 0);
+			config.keys_json = keys.IsNull() ? string() : keys.ToString();
+			auto audiences = result->GetValue(1, 0);
+			for (auto &aud : StringUtil::Split(audiences.IsNull() ? string() : audiences.ToString(), ',')) {
+				StringUtil::Trim(aud);
+				if (!aud.empty()) {
+					config.audiences.push_back(aud);
+				}
+			}
+			auto algs = result->GetValue(2, 0);
+			for (auto &alg : StringUtil::Split(algs.IsNull() ? string() : algs.ToString(), ',')) {
+				StringUtil::Trim(alg);
+				if (!alg.empty()) {
+					config.algs.insert(alg);
+				}
+			}
+			auto role_claim = result->GetValue(3, 0);
+			config.role_claim = role_claim.IsNull() ? string() : role_claim.ToString();
+			auto claim_map = result->GetValue(4, 0);
+			config.claim_map = claim_map.IsNull() ? string() : claim_map.ToString();
+		}
+		lock_guard<mutex> guard(lock);
+		issuer_cache[issuer] = {found, config};
+		out = config;
+		return found;
+	}
+
+	//! One query maps external role values and checks which raw values exist as internal roles
+	void MapExternalRoles(const string &issuer, const vector<string> &values,
+	                      case_insensitive_map_t<vector<string>> &mapped, case_insensitive_set_t &known_roles) {
+		if (values.empty()) {
+			return;
+		}
+		EnsureFresh();
+		auto result =
+		    Query("SELECT \"external_value\", \"role\" FROM " + Tbl("role_mappings") +
+		          " WHERE \"issuer\" = " + Lit(issuer) + " AND \"external_value\" IN (" + LitList(values) + ")");
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			mapped[result->GetValue(0, row).ToString()].push_back(result->GetValue(1, row).ToString());
+		}
+		auto known = Query("SELECT \"role\" FROM " + Tbl("roles") + " WHERE \"role\" IN (" + LitList(values) +
+		                   ") UNION SELECT DISTINCT \"role\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
+		                   LitList(values) + ")");
+		for (idx_t row = 0; row < known->RowCount(); row++) {
+			known_roles.insert(known->GetValue(0, row).ToString());
+		}
+	}
+
 	//! Every table carries a primary key: sources without rowids need one for DELETE/UPDATE
 	void InitSchema() {
 		auto instance = Db();
@@ -525,6 +599,12 @@ struct CatalogBackend {
 		    "CREATE TABLE IF NOT EXISTS " + Tbl("function_gate") +
 		        "(\"role\" VARCHAR, \"name\" VARCHAR, \"kind\" VARCHAR, \"allowed\" BOOLEAN,"
 		        " PRIMARY KEY (\"role\", \"name\", \"kind\"))",
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("issuers") +
+		        "(\"issuer\" VARCHAR PRIMARY KEY, \"keys_json\" VARCHAR, \"audiences\" VARCHAR,"
+		        " \"algs\" VARCHAR, \"role_claim\" VARCHAR, \"claim_map\" VARCHAR)",
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_mappings") +
+		        "(\"issuer\" VARCHAR, \"source\" VARCHAR, \"external_value\" VARCHAR, \"role\" VARCHAR,"
+		        " PRIMARY KEY (\"issuer\", \"source\", \"external_value\", \"role\"))",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
@@ -575,6 +655,23 @@ bool PolicyStore::CatalogFunctionGate(const Principal &principal, const Qualifie
 
 void PolicyStore::CatalogLoadRoleClaims(Principal &principal) {
 	catalog->LoadRoleClaims(principal);
+}
+
+bool PolicyStore::CatalogLookupIssuer(const string &issuer, IssuerConfig &out) {
+	return catalog->LookupIssuer(issuer, out);
+}
+
+void PolicyStore::CatalogMapExternalRoles(const string &issuer, const vector<string> &values,
+                                          case_insensitive_map_t<vector<string>> &mapped,
+                                          case_insensitive_set_t &known_roles) {
+	catalog->MapExternalRoles(issuer, values, mapped, known_roles);
+}
+
+int64_t PolicyStore::JwtClockSkew() {
+	if (catalog) {
+		return catalog->SettingInt64("acl_jwt_clock_skew", 60);
+	}
+	return 60; // the memory mode has no database handle to read the setting from
 }
 
 namespace {
@@ -679,6 +776,30 @@ void PolicyStore::CatalogSetFunctionGate(const string &name, bool allowed, bool 
 		                     Lit(StringUtil::Lower(name)) + ", '', " + (allowed ? "true" : "false") + ")");
 	}
 	catalog->Write(statements);
+}
+
+void PolicyStore::CatalogDefineIssuer(const IssuerConfig &config) {
+	RequireCatalog(catalog, "acl_define_issuer");
+	auto audiences = StringUtil::Join(config.audiences, ",");
+	vector<string> algs_list;
+	for (auto &alg : config.algs) {
+		algs_list.push_back(alg);
+	}
+	auto algs = StringUtil::Join(algs_list, ",");
+	catalog->Write({"DELETE FROM " + catalog->Tbl("issuers") + " WHERE \"issuer\" = " + Lit(config.issuer),
+	                "INSERT INTO " + catalog->Tbl("issuers") + " VALUES (" + Lit(config.issuer) + ", " +
+	                    Lit(config.keys_json) + ", " + Lit(audiences) + ", " + Lit(algs) + ", " +
+	                    Lit(config.role_claim) + ", " + Lit(config.claim_map) + ")"});
+}
+
+void PolicyStore::CatalogMapRole(const string &issuer, const string &source, const string &external_value,
+                                 const string &role) {
+	RequireCatalog(catalog, "acl_map_role");
+	catalog->Write({"DELETE FROM " + catalog->Tbl("role_mappings") + " WHERE \"issuer\" = " + Lit(issuer) +
+	                    " AND \"source\" = " + Lit(source) + " AND \"external_value\" = " + Lit(external_value) +
+	                    " AND \"role\" = " + Lit(role),
+	                "INSERT INTO " + catalog->Tbl("role_mappings") + " VALUES (" + Lit(issuer) + ", " + Lit(source) +
+	                    ", " + Lit(external_value) + ", " + Lit(role) + ")"});
 }
 
 void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,

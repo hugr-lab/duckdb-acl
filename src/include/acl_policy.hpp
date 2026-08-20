@@ -44,6 +44,17 @@ struct TablePolicy {
 //! Whether a function reference is a scalar/aggregate (expression position) or a table function (FROM)
 enum class FunctionKind : uint8_t { SCALAR, TABLE };
 
+//! One issuer's offline JWT verification config (spec 007): a row of acl.issuers, or the in-memory
+//! issuer map. Keys are data, never fetched: the gateway/admin rotates them.
+struct IssuerConfig {
+	string issuer;
+	string keys_json;            // JWKS ({"keys":[...]}: RSA n/e, EC P-256 x/y, oct k) or a PEM public key
+	vector<string> audiences;    // allowlist; the token's aud (string or array) must intersect
+	case_insensitive_set_t algs; // allowlist of {RS256, ES256, HS256}; anything else (incl. none) is refused
+	string role_claim;           // dot path to the roles claim ("roles", "realm_access.roles", "groups")
+	string claim_map;            // JSON: {"<jwt dot path>": "<acl_claim name>"}
+};
+
 //! Which functions are gated is a policy question, not the rewriter's: every function reference is
 //! routed through the resolver, which decides. Most functions - the vast majority extensions add -
 //! are pure transforms (e.g. ST_AsGeoJSON) and pass; only functions that read external data or route
@@ -104,8 +115,11 @@ struct PolicyStore {
 	case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> table_functions;
 	// role -> virtual scalar-function name -> policy (subquery_form=true: expr macro; false: alias)
 	case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> scalar_functions;
-	// token -> principal
+	// token -> principal (the dev stub; a JWT-shaped token takes the real verification path instead)
 	case_insensitive_map_t<Principal> tokens;
+	// issuer registry + external->role mappings (spec 007), memory-mode counterparts of the catalog
+	case_insensitive_map_t<IssuerConfig> issuers;
+	case_insensitive_map_t<case_insensitive_map_t<vector<string>>> role_mappings; // issuer -> external -> roles
 	// role -> default claims (used by the ROLE form, which carries no token)
 	case_insensitive_map_t<case_insensitive_map_t<string>> role_claims;
 	// gateway-wide function denylist (readers / rights-bypass); everything else passes
@@ -142,6 +156,8 @@ struct PolicyStore {
 	void CatalogDefineRole(const string &role, const case_insensitive_map_t<string> &claims);
 	//! remove=true deletes the gate row (fall back to the default denylist); otherwise upserts it
 	void CatalogSetFunctionGate(const string &name, bool allowed, bool remove);
+	void CatalogDefineIssuer(const IssuerConfig &config);
+	void CatalogMapRole(const string &issuer, const string &source, const string &external_value, const string &role);
 	//! per-object caps override (the compatibility wrappers carry per-object caps, spec 006)
 	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json);
 	//! ensure a role->catalog grant row exists without clobbering an existing one
@@ -153,8 +169,14 @@ struct PolicyStore {
 	//! Instantiate an expression template: a fresh copy of the cached parsed prototype.
 	unique_ptr<ParsedExpression> InstantiateExpr(const string &expr, const ParserOptions &options);
 
-	//! Verify a principal offline. In production this checks a token signature; here it is a store hit.
+	//! Verify a principal offline. A JWT-shaped token goes through real signature verification against
+	//! the issuer registry (spec 007, throws with a specific reason on failure); a non-JWT token is a
+	//! dev-stub lookup in the in-memory map; the ROLE form trusts the gateway.
 	bool VerifyPrincipal(bool is_token, const string &value, Principal &out);
+
+	//! Register an issuer / map an external role value (memory mode; catalog mode via the Catalog* ops)
+	void DefineIssuer(IssuerConfig config);
+	void MapRole(const string &issuer, const string &source, const string &external_value, const string &role);
 
 	bool ResolveTable(const Principal &principal, const string &vname, TablePolicy &out);
 	bool ResolveTableFunction(const Principal &principal, const string &vname, TablePolicy &out);
@@ -170,12 +192,25 @@ private:
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);
 
+	//! The real JWT path of VerifyPrincipal (spec 007): issuer lookup -> acl_token verification ->
+	//! role mapping -> claims; throws on any failure. Defined in acl_policy.cpp.
+	void VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out);
+	bool LookupIssuer(const string &issuer, IssuerConfig &out);
+	//! acl_jwt_clock_skew setting (seconds); the memory mode uses the 60s default (no db handle)
+	int64_t JwtClockSkew();
+	//! Map raw role-claim values through role_mappings; unmapped values pass only if the role exists
+	vector<string> MapExternalRoles(const string &issuer, const vector<string> &raw_roles);
+
 	// catalog-backend bridges, defined in acl_policy_catalog.cpp (the backend type stays private there)
 	bool CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out);
 	bool CatalogResolveFunction(const Principal &principal, const string &vname, bool table_kind, TablePolicy &out);
 	//! returns true when a gate row decides; `allowed` then carries the verdict
 	bool CatalogFunctionGate(const Principal &principal, const QualifiedName &name, bool &allowed);
 	void CatalogLoadRoleClaims(Principal &principal);
+	bool CatalogLookupIssuer(const string &issuer, IssuerConfig &out);
+	//! (external_value -> mapped roles) for the given values; also flags which candidates exist as roles
+	void CatalogMapExternalRoles(const string &issuer, const vector<string> &values,
+	                             case_insensitive_map_t<vector<string>> &mapped, case_insensitive_set_t &known_roles);
 };
 
 //! Carried on the parser extension (parser_info); the override reads the store from it.

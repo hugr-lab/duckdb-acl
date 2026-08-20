@@ -49,3 +49,4 @@ specs are the shareable distillation of that work.
 | [004](004-code-structure/spec.md) | code structure and namespaces | implemented |
 | [005](005-integration-env/spec.md) | integration environment, real-database scenarios, CI/CD | implemented |
 | [006](006-catalog-policy-store/spec.md) | catalog-backed policy store (virtual catalogs, phase 1) | implemented |
+| [007](007-jwt-verification/spec.md) | offline JWT verification (issuers, role mappings, EntraID) | implemented |
