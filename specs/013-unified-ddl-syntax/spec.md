@@ -1,6 +1,6 @@
 # Spec 013: one DDL syntax for the virtual catalog
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-08-20
 - **Author**: hugr-lab
 
@@ -65,7 +65,7 @@ GRANT CATALOG sales TO ROLE analyst WITH (select, insert) [MAIN] [RLS (…)] [CO
 GRANT TABLE sales.orders TO ROLE analyst WITH (select) COLUMNS (tenant = acl_claim('tenant'), id);
 ```
 
-`ALTER VIRTUAL … SET <property>` and `DROP VIRTUAL …` keep their shape and gain `IF EXISTS`.
+`ALTER VIRTUAL … SET <property>` and `DROP VIRTUAL …` keep their shape; `DROP` gains `IF EXISTS`.
 
 ### The three rules that make it one language
 
@@ -76,8 +76,11 @@ GRANT TABLE sales.orders TO ROLE analyst WITH (select) COLUMNS (tenant = acl_cla
    `CLAIM MAP (a => b)`. CSV/JSON remain the storage format and the admin functions' input, so
    nothing about the catalog schema changes here.
 3. **Existence is explicit.** `CREATE` fails if the object exists, `CREATE OR REPLACE` overwrites,
-   `CREATE … IF NOT EXISTS` skips, `ALTER`/`DROP` require existence and `IF EXISTS` softens them.
-   The legacy `ADD …` forms keep upserting, so no existing script changes behaviour.
+   `CREATE … IF NOT EXISTS` skips, `DROP … IF EXISTS` makes nothing-to-drop silent. The legacy
+   `ADD …` forms keep upserting, so no existing script changes behaviour. `ALTER` stays strict and
+   gets **no** `IF EXISTS`: an `ALTER` that silently changed nothing looks exactly like one that
+   worked, which is worse than an error. This also repairs a gap - spec 010 said a missing target is
+   an error, and every kind said so except the relation drop, which returned success quietly.
 
 ### What it compiles to
 
@@ -87,8 +90,11 @@ are needed there:
 
 - the `acl_add_*` functions gain a trailing **mode** argument (`upsert` / `create` / `replace` /
   `skip`), defaulting to `upsert` so every current call keeps its meaning;
-- `create`/`skip` need an existence check inside the same transaction as the write, which
-  `WriteWithReads` already provides (it is how `ALTER` reads before writing today).
+- the mode is checked against `CatalogObjectExists(vcat, vname, kind)` - a function's kind is part of
+  its identity, so a table function and a scalar may share a name. The check and the write are two
+  steps inside one admin call rather than one transaction: with the single-gateway deployment
+  invariant that is safe, but a second concurrent writer would make `create` a race, and the fix is
+  to move both into `WriteWithReads` (which is how `ALTER` already reads before writing).
 
 ### Unknown capabilities
 
@@ -110,8 +116,10 @@ for a role with `create` to shadow an existing name.
 
 `test/sql/acl_ddl_syntax.test`: every statement in both spellings (new and legacy) producing the same
 stored rows; an inline predicate with single quotes stored identically to its doubled-quote twin;
-`CREATE` on an existing object refused, `OR REPLACE` overwriting, `IF NOT EXISTS` skipping,
-`ALTER`/`DROP` on a missing object refused and `IF EXISTS` silent; `WITH (select, insert)` producing
+`CREATE` on an existing object refused (and the refusal changing nothing), `OR REPLACE` overwriting,
+`IF NOT EXISTS` keeping what is there, the same three answers from every kind, a table function and a
+scalar of one name coexisting, `DROP` on a missing object refused and `IF EXISTS` silent, and the
+legacy `ADD` still upserting; `WITH (select, insert)` producing
 the same caps JSON as `CAPS '{…}'`; an unknown capability accepted, stored and enforcing nothing;
 `ALIAS OF` for both function kinds; and the existing suites unchanged, since they are written in the
 legacy syntax and must stay green.
@@ -126,6 +134,10 @@ legacy syntax and must stay green.
   which is the problem being fixed.
 
 ## Follow-ups
+
+- The write-mode check and the write are two steps inside one admin call; moving them into one
+  transaction (`WriteWithReads`) would make `create` safe against a second concurrent writer.
+
 
 Parts 2–4 of design 004 extend this grammar: `CREATE VIRTUAL SCHEMA … FROM …` / `REFRESH` (schemas as
 objects), `GRANT SCHEMA … WITH (…)` (schema-level caps and their materialised inheritance), and
