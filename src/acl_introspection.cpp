@@ -28,41 +28,48 @@ struct AclIntrospectionInfo : TableFunctionInfo {
 };
 
 struct AclIntrospectionBindData : TableFunctionData {
-	explicit AclIntrospectionBindData(IntrospectionRows rows_p) : rows(std::move(rows_p)) {
+	AclIntrospectionBindData(shared_ptr<PolicyStore> store_p, string listing_p)
+	    : store(std::move(store_p)), listing(std::move(listing_p)) {
 	}
-	IntrospectionRows rows;
+	shared_ptr<PolicyStore> store;
+	string listing;
 };
 
 struct AclIntrospectionState : GlobalTableFunctionState {
+	explicit AclIntrospectionState(IntrospectionRows rows_p) : rows(std::move(rows_p)) {
+	}
+	IntrospectionRows rows;
 	idx_t emitted = 0;
 };
 
-//! Read the listing here, at bind: the shape of the result is the shape of the function, so the
-//! storage stays the single source of truth for both.
+//! Bind asks the source for the listing's *shape* only: the column names and types come from the
+//! result, so nothing here declares a schema that could drift from the storage.
 unique_ptr<FunctionData> AclIntrospectionBind(ClientContext &, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (!input.info) {
 		throw BinderException("acl: introspection function without its policy store");
 	}
 	auto &info = input.info->Cast<AclIntrospectionInfo>();
-	auto rows = info.store->Introspect(info.listing);
-	return_types = rows.types;
-	for (auto &name : rows.names) {
+	auto shape = info.store->Introspect(info.listing);
+	return_types = shape.types;
+	for (auto &name : shape.names) {
 		names.push_back(Identifier(name));
 	}
-	return make_uniq<AclIntrospectionBindData>(std::move(rows));
+	return make_uniq<AclIntrospectionBindData>(info.store, info.listing);
 }
 
-unique_ptr<GlobalTableFunctionState> AclIntrospectionInit(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<AclIntrospectionState>();
+//! The rows are read per execution, not at bind: a policy read through a prepared statement must
+//! show the policy as it is now, and binding once would freeze it at the moment of preparation.
+unique_ptr<GlobalTableFunctionState> AclIntrospectionInit(ClientContext &, TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<AclIntrospectionBindData>();
+	return make_uniq<AclIntrospectionState>(bind_data.store->Introspect(bind_data.listing));
 }
 
 void AclIntrospectionScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
-	auto &bind_data = data.bind_data->Cast<AclIntrospectionBindData>();
 	auto &state = data.global_state->Cast<AclIntrospectionState>();
 	idx_t count = 0;
-	while (state.emitted < bind_data.rows.rows.size() && count < STANDARD_VECTOR_SIZE) {
-		auto &row = bind_data.rows.rows[state.emitted++];
+	while (state.emitted < state.rows.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows.rows[state.emitted++];
 		for (idx_t col = 0; col < row.size() && col < output.ColumnCount(); col++) {
 			output.data[col].SetValue(count, row[col]);
 		}

@@ -135,6 +135,27 @@ SELECT count(*) FROM (SELECT * FROM acl_issuers()) WHERE columns(*)::VARCHAR LIK
 ----
 0
 
+# --- a listing shows the policy as it is now, not as it was when the statement was prepared ---------
+
+statement ok
+PREPARE relation_count AS SELECT count(*) FROM acl_relations();
+
+query I
+EXECUTE relation_count;
+----
+1
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.second AS phys.main.orders;
+
+query I
+EXECUTE relation_count;
+----
+2
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE sales.second;
+
 # --- a principal cannot reach any of this ------------------------------------------------------------
 
 statement error

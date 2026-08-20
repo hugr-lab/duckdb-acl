@@ -118,9 +118,10 @@ A source that cannot enumerate makes the listing **throw**, with the reason, rat
 empty set: on an admin surface silence reads as "nothing is configured", which is a lie an operator
 would act on.
 
-The shape of a listing **follows the source**: the bind step runs the query and takes the column names
-and types from its result, so no schema is declared here that could drift from the storage after the
-next migration. And an issuer's **keys are absent by construction** — they are not in the projection.
+The shape of a listing **follows the source**: the bind step asks for the column names and types, so
+no schema is declared here that could drift from the storage after the next migration. The **rows are
+read per execution**, not at bind — a policy read through a prepared statement has to show the policy
+as it is now, and binding once would freeze it at the moment of preparation. And an issuer's **keys are absent by construction** — they are not in the projection.
 A verification key is often public, but an HS256 one is a shared secret, and neither belongs in
 metadata.
 
@@ -225,7 +226,8 @@ deny of spec 009 plus these rewrites.
   columns); `acl_status()` answering in every mode while the listings refuse where a source cannot
   enumerate; an issuer's keys absent from `acl_issuers()` under any column and the secret nowhere in
   the row; and a principal refused on every one of them, including `acl_status()`, while the native
-  context reads them.
+  context reads them; and a prepared `acl_relations()` re-executed after a new object appears counting
+it, rather than answering with the policy as it was when the statement was prepared.
 - `acl_metadata_leak.test` (23 assertions, **implemented**): all three surfaces refused under a
   principal — the table function, the view of the same name and `information_schema` — plus their
   neighbours (`duckdb_columns()`, `duckdb_databases()`, `duckdb_secrets()`, `pragma_table_info`),
