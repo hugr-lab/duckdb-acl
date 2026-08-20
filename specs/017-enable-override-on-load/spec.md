@@ -67,6 +67,25 @@ A thrown exception leaves `ParseQuery` in every mode and cannot be cleared by an
 security output; they do not get a channel a neighbour can mute. The `else`-reset looks like a duckdb
 bug rather than an intent — worth reporting upstream, and worth revisiting this if it is fixed.
 
+### Sharing the parser with another override extension
+
+Concretely, with `acl` loaded first and duckpgq second (both want `STRICT`, so the value agrees):
+
+- **a prefixed query** is claimed by us and returned as `PARSE_SUCCESSFUL`, so the loop ends before
+  duckpgq is asked — and a **denial throws**, which leaves `ParseQuery` immediately. This is exactly
+  the arrangement in which a *returned* denial would have been cleared by duckpgq's polite decline,
+  so the decision above is not hypothetical;
+- **the query after our prefix is re-parsed with overrides disabled** (`inner.parser_override_setting
+  = DEFAULT_OVERRIDE`), so another extension's syntax never reaches us: `ACL ROLE "x" SELECT … FROM
+  GRAPH_TABLE(…)` fails as a plain syntax error rather than arriving in our rewriter as a table
+  reference we do not know. Loud, and it keeps a foreign AST out of the rewrite path;
+- **an unprefixed PGQ query** is declined by us and parsed by duckpgq, and runs without the ACL —
+  the same property every unprefixed query has, and the same reason only the gateway may connect.
+
+The deployment consequence is worth stating: a second override extension does not weaken the ACL for
+prefixed queries, but its syntax is available **only outside** the ACL. A gateway that prefixes
+everything cannot use it.
+
 ## Enforcement & security
 
 Nothing about what is enforced changes; this is about the switch that decides whether anything is
