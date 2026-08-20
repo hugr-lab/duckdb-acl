@@ -245,6 +245,70 @@ SELECT count(*) FROM aclcat.acl.relations WHERE vname = 'curated.byhand';
 ----
 1
 
+# a view in the source is expanded like a table, and reads through
+statement ok
+CREATE VIEW phys.main.doubled AS SELECT id * 2 AS n FROM phys.main.orders_physical;
+
+query I
+ACL ADMIN SELECT acl_refresh_schema_objects('sales', 'curated');
+----
+1
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM curated.doubled;
+----
+2
+
+# a name the expansion produced is an object like any other, so redefining it needs OR REPLACE
+# (spec 013) - and CREATE means "this object is mine now", so the record leaves the expansion
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE sales.curated.orders_physical AS phys.main.orders_physical COLUMNS (id);
+----
+<REGEX>:.*already exists.*
+
+statement ok
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE sales.curated.orders_physical AS phys.main.orders_physical COLUMNS (id) COMMENT 'mine';
+
+query III
+SELECT form, comment, origin FROM aclcat.acl.relations WHERE vname = 'curated.orders_physical';
+----
+subquery	mine	NULL
+
+# and a refresh leaves it alone: it never rewrites what is already registered
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA sales.curated REFRESH;
+
+query II
+SELECT form, comment FROM aclcat.acl.relations WHERE vname = 'curated.orders_physical';
+----
+subquery	mine
+
+# editing an expanded record keeps it part of the expansion: REFRESH still leaves it alone, and its
+# origin is not silently forgotten
+query I
+SELECT origin FROM aclcat.acl.relations WHERE vname = 'curated.late';
+----
+phys.main
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE sales.curated.late SET COLUMNS (id);
+
+query II
+SELECT form, origin FROM aclcat.acl.relations WHERE vname = 'curated.late';
+----
+subquery	phys.main
+
+# expanding a source that is not there would leave a schema that can never resolve anything
+statement error
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.ghost FROM phys.nosuchschema;
+----
+<REGEX>:.*physical schema "phys.nosuchschema" does not exist.*
+
+query I
+SELECT count(*) FROM aclcat.acl.schemas WHERE path = 'ghost';
+----
+0
+
 # a live alias has nothing to refresh, and says so instead of pretending
 statement error
 ACL ADMIN ALTER VIRTUAL SCHEMA sales.raw REFRESH;

@@ -72,6 +72,12 @@ admin registered by hand inside the schema is theirs. Both report how many rows 
 second refresh over an unchanged source reports 0. A **live alias** answers `REFRESH` with an error
 rather than pretending: it has nothing to refresh, since it already shows what the source holds.
 
+Redefining an expanded record is two different intentions, and they behave differently: `ALTER`
+tweaks a property and **keeps** the record part of the expansion (so `PRUNE` still removes it when
+its source is gone — it would otherwise point at nothing), while `CREATE OR REPLACE` says "this
+object is mine now" and takes it out. Expanding a source that does not exist is refused: it would
+leave a schema that can never resolve anything.
+
 Consequences, deliberately:
 
 - an expansion is a **snapshot plus edits**, so a table created physically after it is invisible
@@ -102,8 +108,10 @@ alias seeing a table created afterwards while the expansion does not until `REFR
 reporting its count, leaving an admin-modified record alone and not resurrecting a dropped one;
 `PRUNE` removing a record whose source is gone; a single object excluded from an expansion and denied
 while its neighbours resolve; comments on both kinds, surviving an `ALTER`; `DROP` refused while
-records exist and `CASCADE` taking them; and the migration — a catalog written by the previous
-version keeps resolving its aliases.
+records exist and `CASCADE` taking them; a view in the source expanded like a table and read through;
+a name redefined with `CREATE OR REPLACE` leaving the expansion while an `ALTER`ed one stays in it;
+a source that does not exist refused; and the migration — a catalog written by the previous version
+keeps resolving its aliases.
 
 ## Alternatives considered
 

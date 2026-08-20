@@ -784,11 +784,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		                     {Value(issuer), Value(is_group ? "group" : "claim-value"), Value(external), Value(role)});
 	}
 	if (StringUtil::CIEquals(keyword, "alter")) {
-		if (s.Accept("role")) { // ALTER ROLE r SET CLAIMS '...'
+		if (s.Accept("role")) { // ALTER ROLE r SET CLAIMS (...) | '...'
 			auto role = s.Word("a role name");
 			s.Expect("set");
 			s.Expect("claims");
-			return MakeAdminCall("acl_alter_role", {Value(role), Value(s.Quoted("claims list"))});
+			auto claims = s.AtParen() ? ClaimsListToCsv(s.Parens()) : s.Quoted("claims list");
+			return MakeAdminCall("acl_alter_role", {Value(role), Value(claims)});
 		}
 		if (s.Accept("issuer")) { // ALTER ISSUER '...' SET KEYS|AUDIENCES|ALGS|ROLE CLAIM|CLAIM MAP '...'
 			auto issuer = s.Quoted("issuer");
@@ -848,7 +849,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			s.Expect("set");
 			s.Expect("as");
 			return MakeAdminCall("acl_alter_relation",
-			                     {Value(vcat), Value(vname), Value("view"), Value(s.Quoted("view SQL"))});
+			                     {Value(vcat), Value(vname), Value("view"), Value(s.Body("view SQL"))});
 		}
 		if (s.Accept("schema")) { // ALTER VIRTUAL SCHEMA v.path SET PHYS <path> | REFRESH [PRUNE]
 			string vcat, alias;
@@ -873,22 +874,26 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 				if (!is_macro) {
 					s.Expect("alias");
 				}
+				if (!is_macro) {
+					s.Accept("of"); // SET ALIAS OF <fn>, like the CREATE form
+				}
 				return MakeAdminCall("acl_alter_function",
 				                     {Value(vcat), Value(vname), Value(scalar ? "scalar" : "table"),
-				                      Value(is_macro ? "macro" : "alias"), Value(s.Quoted("definition"))});
+				                      Value(is_macro ? "macro" : "alias"),
+				                      Value(is_macro ? s.Body("definition") : s.Name("a target function"))});
 			}
 			// ALTER VIRTUAL TABLE v.n SET PHYS <path> | SET COLUMNS '...' | SET RLS '...'
 			if (s.Accept("phys")) {
 				return MakeAdminCall("acl_alter_relation", {Value(vcat), Value(vname), Value("phys"),
-				                                            Value(s.Dotted("a physical table path"))});
+				                                            Value(s.Name("a physical table path"))});
 			}
 			if (s.Accept("columns")) {
 				return MakeAdminCall("acl_alter_relation",
-				                     {Value(vcat), Value(vname), Value("columns"), Value(s.Quoted("columns list"))});
+				                     {Value(vcat), Value(vname), Value("columns"), Value(s.List("columns list"))});
 			}
 			s.Expect("rls");
 			return MakeAdminCall("acl_alter_relation",
-			                     {Value(vcat), Value(vname), Value("rls"), Value(s.Quoted("RLS predicate"))});
+			                     {Value(vcat), Value(vname), Value("rls"), Value(s.List("RLS predicate"))});
 		}
 		throw BinderException("acl admin: unknown ALTER VIRTUAL target");
 	}

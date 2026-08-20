@@ -1638,6 +1638,15 @@ void SplitPhysSchema(const string &phys_path, string &database, string &schema) 
 vector<string> PhysicalObjects(acl_detail::CatalogBackend &catalog, const string &phys_path) {
 	string database, schema;
 	SplitPhysSchema(phys_path, database, schema);
+	// an empty result is ambiguous - an empty schema, or one that is not there (or a database nobody
+	// attached). Expanding a source that does not exist would leave a schema that can never resolve
+	// anything, so ask first and fail closed with the reason.
+	auto known = catalog.Query("SELECT 1 FROM duckdb_schemas() WHERE database_name = " + Lit(database) +
+	                           " AND schema_name = " + Lit(schema));
+	if (known->RowCount() == 0) {
+		throw BinderException("acl admin: physical schema \"%s\" does not exist (is its database attached?)",
+		                      phys_path);
+	}
 	auto listing =
 	    catalog.Query("SELECT table_name AS name FROM duckdb_tables() WHERE database_name = " + Lit(database) +
 	                  " AND schema_name = " + Lit(schema) +
@@ -2126,15 +2135,23 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		}
 		// the form follows the content, exactly as it does for ADD
 		string new_form = !new_view.empty() ? "view" : (new_columns.empty() && new_rls.empty() ? "alias" : "subquery");
-		auto comment_value = read("SELECT \"comment\" FROM " + catalog->Tbl("relations") +
-		                          " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
-		string comment;
-		if (comment_value->RowCount() > 0 && !comment_value->GetValue(0, 0).IsNull()) {
-			comment = comment_value->GetValue(0, 0).ToString();
+		auto stored = read("SELECT \"comment\", \"origin\" FROM " + catalog->Tbl("relations") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		string comment, origin;
+		if (stored->RowCount() > 0) {
+			if (!stored->GetValue(0, 0).IsNull()) {
+				comment = stored->GetValue(0, 0).ToString();
+			}
+			// editing a record an expansion produced does not take it out of the expansion: REFRESH
+			// still leaves it alone (it never rewrites), and PRUNE still removes it if its source is
+			// gone - which is right, because it would then point at nothing
+			if (!stored->GetValue(1, 0).IsNull()) {
+				origin = stored->GetValue(1, 0).ToString();
+			}
 		}
 		// ALTER keeps the stored schema policy: a declared result is re-declared explicitly, not here
 		statements = RelationStatements(*catalog, vcat, vname, new_form, new_phys, new_view, new_rls, new_columns,
-		                                comment, string());
+		                                comment, string(), origin);
 	});
 }
 
