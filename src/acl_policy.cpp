@@ -2,6 +2,7 @@
 
 #include "acl_token.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/parser.hpp"
 
 namespace duckdb {
@@ -177,6 +178,94 @@ void PolicyStore::DefineIssuer(IssuerConfig config) {
 	issuers[config.issuer] = std::move(config);
 }
 
+AdminScope ParseAdminScope(const string &scope) {
+	if (StringUtil::CIEquals(scope, "passthrough")) {
+		return AdminScope::PASSTHROUGH;
+	}
+	if (StringUtil::CIEquals(scope, "manage")) {
+		return AdminScope::MANAGE;
+	}
+	throw BinderException("acl admin: unknown admin scope \"%s\" (expected manage or passthrough)", scope);
+}
+
+const char *AdminScopeName(AdminScope scope) {
+	switch (scope) {
+	case AdminScope::PASSTHROUGH:
+		return "passthrough";
+	case AdminScope::MANAGE:
+		return "manage";
+	default:
+		throw BinderException("acl admin: an administration grant needs a scope");
+	}
+}
+
+void PolicyStore::GrantAdmin(const string &role, AdminScope scope) {
+	if (catalog) {
+		CatalogGrantAdmin(role, AdminScopeName(scope));
+		return;
+	}
+	lock_guard<mutex> guard(lock);
+	admin_scopes[role] = scope;
+}
+
+void PolicyStore::RevokeAdmin(const string &role) {
+	if (catalog) {
+		CatalogRevokeAdmin(role);
+		return;
+	}
+	lock_guard<mutex> guard(lock);
+	admin_scopes.erase(role);
+}
+
+PolicyStore::AdminRights PolicyStore::AdminRightsOf(const Principal &principal) {
+	AdminRights rights;
+	auto raise = [&](AdminScope scope) {
+		if (scope > rights.scope) {
+			rights.scope = scope;
+		}
+	};
+	if (catalog) {
+		// per-catalog management is a capability of the catalog grant, so a role manages as many
+		// catalogs as it was granted; acl.admins carries the global scopes
+		vector<std::pair<string, string>> rows;
+		CatalogAdminRights(principal, rights.catalogs, rows);
+		if (!rights.catalogs.empty()) {
+			raise(AdminScope::MANAGE);
+		}
+		for (auto &row : rows) {
+			auto scope = ParseAdminScope(row.first);
+			if (scope == AdminScope::MANAGE && !row.second.empty()) {
+				rights.catalogs.insert(row.second); // a catalog-scoped row, not a global one
+				raise(AdminScope::MANAGE);
+				continue;
+			}
+			if (scope == AdminScope::MANAGE) {
+				rights.unrestricted_manage = true;
+			}
+			raise(scope);
+		}
+		return rights;
+	}
+	lock_guard<mutex> guard(lock);
+	for (auto &role : principal.roles) {
+		auto entry = admin_scopes.find(role);
+		if (entry == admin_scopes.end()) {
+			continue;
+		}
+		if (entry->second == AdminScope::MANAGE) {
+			rights.unrestricted_manage = true; // the memory mode has no catalogs to scope to
+		}
+		raise(entry->second);
+	}
+	return rights;
+}
+
+bool PolicyStore::AnonymousAdminAllowed() {
+	// the in-memory dev mode keeps the historical behavior; a real policy source means production,
+	// where the gateway's own escape hatch must be turned on deliberately
+	return !catalog || CatalogAnonymousAdminAllowed();
+}
+
 void PolicyStore::MapRole(const string &issuer, const string &source, const string &external_value,
                           const string &role) {
 	if (catalog) {
@@ -209,6 +298,13 @@ bool PolicyStore::ResolveScalarFunction(const Principal &principal, const string
 }
 
 bool PolicyStore::FunctionAllowed(const Principal &principal, const QualifiedName &name) {
+	// The extension's own functions administer the ACL, so a principal's query may never call them:
+	// otherwise one statement (`SELECT acl_grant_admin('me','passthrough')`) defeats the whole model.
+	// They stay available in the native context (ACL ADMIN / ACL NATIVE), which is not rewritten, and
+	// virtual names resolve before this seam, so a granted vfunc called acl_* still works.
+	if (StringUtil::StartsWith(StringUtil::Lower(name.Name().GetIdentifierName()), "acl_")) {
+		return false;
+	}
 	if (catalog) {
 		bool allowed;
 		if (CatalogFunctionGate(principal, name, allowed)) {

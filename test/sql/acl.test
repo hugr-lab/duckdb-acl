@@ -553,3 +553,57 @@ statement error
 ACL ROLE "analyst" INSERT INTO audit_log SELECT id, note FROM audit_log;
 ----
 <REGEX>:.*select on "audit_log" is not allowed.*
+
+# --- the prefix covers the WHOLE batch: every statement is rewritten and gated ---------------------
+# (the prefix is written once, before the first statement; the rest are not "plain SQL")
+
+# a physical name in the SECOND statement is refused, and the batch is refused whole: the rewrite
+# runs over every statement before any of them executes, so nothing lands
+statement error
+ACL ROLE "analyst" INSERT INTO writable_orders VALUES (701, 'a', 1); SELECT * FROM phys.main.orders_physical;
+----
+<REGEX>:.*no access to object "phys.main.orders_physical".*
+
+query I
+SELECT count(*) FROM phys.main.orders_physical WHERE id = 701;
+----
+0
+
+# a denied function in the third statement refuses the batch just the same
+statement error
+ACL ROLE "analyst" SELECT 1; SELECT 2; SELECT * FROM read_csv('/etc/passwd');
+----
+<REGEX>:.*read_csv.*not allowed.*
+
+# a write through a read-only (masked/RLS) relation is caught in a later statement too
+statement error
+ACL ROLE "analyst" INSERT INTO writable_orders VALUES (702, 'a', 1); INSERT INTO orders VALUES (9, 9);
+----
+<REGEX>:.*read-only relation.*
+
+query I
+SELECT count(*) FROM phys.main.orders_physical WHERE id = 702;
+----
+0
+
+# and the rewrite applies per statement, not only to the first one: the SECOND statement here reads
+# through the RLS relation, so only the principal's rows land
+statement ok
+SELECT acl_define_role('analyst', 'tenant=acme');
+
+statement ok
+ACL ROLE "analyst" SELECT 1; INSERT INTO writable_orders SELECT id + 800, 'batch-rls', amount FROM orders;
+
+query I
+SELECT count(*) FROM phys.main.orders_physical WHERE tenant = 'batch-rls';
+----
+2
+
+# ... and masking too: ssn is projected as NULL for this role, so the copied value is NULL
+statement ok
+ACL ROLE "analyst" SELECT 1; INSERT INTO writable_orders SELECT id + 900, coalesce(ssn, 'MASKED'), id FROM employees;
+
+query I
+SELECT count(*) FROM phys.main.orders_physical WHERE tenant = 'MASKED';
+----
+2

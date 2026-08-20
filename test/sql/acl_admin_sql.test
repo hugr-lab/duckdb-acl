@@ -23,6 +23,10 @@ ATTACH ':memory:' AS aclcat;
 statement ok
 SELECT acl_use_db('aclcat', 'acl', true);
 
+# spec 009: with a policy source enabled, the bare `ACL ADMIN` hatch is opt-in
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
 statement ok
 SET allow_parser_override_extension='fallback';
 

@@ -317,8 +317,10 @@ JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clo
 		Reject("token not yet valid");
 	}
 
-	// audience: the token's aud (string or array) must intersect the issuer's allowlist
-	if (!config.audiences.empty()) {
+	// audience: the token's aud (string or array) must intersect the issuer's allowlist; a single '*'
+	// entry means the issuer deliberately accepts any audience
+	bool any_audience = config.audiences.size() == 1 && config.audiences[0] == "*";
+	if (!config.audiences.empty() && !any_audience) {
 		auto aud = duckdb_yyjson::yyjson_obj_get(payload.Root(), "aud");
 		bool matched = false;
 		auto check = [&](const string &value) {
