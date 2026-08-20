@@ -1,0 +1,105 @@
+# name: test/sql/acl_override_setting.test
+# description: enforcement lives behind the parser override, so the extension turns it on when it
+#   loads (spec 017) - and says so loudly if something turned it off again
+# group: [sql]
+
+require acl
+
+# loading the extension enabled the override: nothing had to be SET by hand
+query I
+SELECT current_setting('allow_parser_override_extension');
+----
+STRICT
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t(id INT, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, 'acme'), (2, 'globex');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+# an ACL statement parses without any SET of our own
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.t AS phys.main.t RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN;
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM t;
+----
+1
+
+# turning it off again makes every ACL statement unparseable - the failure is loud, not silent
+statement ok
+SET GLOBAL allow_parser_override_extension='DEFAULT';
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM t;
+----
+<REGEX>:.*syntax error.*
+
+# and configuring a policy that cannot be enforced says so, in the one path duckdb still runs
+statement error
+SELECT acl_use_db('aclcat', 'acl', false);
+----
+<REGEX>:.*nothing is enforced.*
+
+statement ok
+SET GLOBAL allow_parser_override_extension='STRICT';
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM t;
+----
+1
+
+# --- the native context may use another extension's syntax; the virtual one may not ----------------
+# `ACL NATIVE` rewrites nothing and needs a passthrough scope, so parsing its remainder with the other
+# extensions' overrides enabled grants nothing new. The virtual context keeps duckdb's own parser: a
+# node the rewriter cannot walk has to be refused anyway, and a foreign AST in the rewrite path is how
+# a reference gets missed. Neither half can be tested against a real second extension here, so what is
+# pinned is the re-entrancy guard that makes it safe.
+
+statement ok
+ACL ADMIN CREATE ROLE platform;
+
+statement ok
+SELECT acl_grant_admin('platform', 'passthrough');
+
+statement ok
+ACL ROLE "platform" ACL NATIVE SELECT count(*) FROM phys.main.t;
+
+# a nested prefix must stay unparseable: the inner parse declines our own override, so `ACL ROLE`
+# reaches duckdb's parser as the syntax error it is - it never verifies a second principal
+statement error
+ACL ROLE "platform" ACL NATIVE ACL ROLE "analyst" SELECT 1;
+----
+<REGEX>:.*syntax error.*
+
+statement error
+ACL ROLE "analyst" ACL ROLE "platform" SELECT 1;
+----
+<REGEX>:.*(syntax error|no ACL administration scope).*
+
+# the virtual context is unchanged: what the rewriter cannot resolve is refused
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM phys.main.t;
+----
+<REGEX>:.*no access to object "phys.main.t".*

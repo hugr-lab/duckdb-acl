@@ -62,7 +62,9 @@ make test-integration               # scenarios in test/sql/integration/ (skip w
 
 Build outputs: CLI `build/release/duckdb`, loadable
 `build/release/extension/acl/acl.duckdb_extension`, test binary `build/release/test/unittest`.
-Enable the override in a session with `SET allow_parser_override_extension='fallback';`.
+The extension enables its own parser override on load (`allow_parser_override_extension='STRICT'`,
+spec 017); an explicit value set before loading is left alone, and `SET GLOBAL ...='DEFAULT'` turns
+enforcement off — the `acl_*` functions still configure policy, but no `ACL …` statement parses.
 
 ## Code style
 

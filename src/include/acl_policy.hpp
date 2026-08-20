@@ -330,6 +330,10 @@ struct PolicyStore {
 	//! db.schema.read_csv cannot slip past).
 	bool FunctionAllowed(const Principal &principal, const QualifiedName &name);
 
+	//! The current `allow_parser_override_extension` value. DEFAULT means duckdb skips every parser
+	//! override, so no `ACL …` statement parses and nothing is enforced (spec 017).
+	string ParserOverrideMode();
+
 private:
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);

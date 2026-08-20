@@ -1169,7 +1169,28 @@ void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, const PolicySto
 	}
 }
 
+//! True while this override is parsing the remainder of an ACL statement. The inner parse may run
+//! other extensions' overrides (the native context does), and this keeps ours out of it: a nested
+//! `ACL …` prefix must stay unparseable, or the inner parse would verify a second principal and the
+//! outer one would rewrite what the inner one already produced.
+bool &InAclParse() {
+	static thread_local bool in_parse = false;
+	return in_parse;
+}
+
+struct AclParseGuard {
+	AclParseGuard() {
+		InAclParse() = true;
+	}
+	~AclParseGuard() {
+		InAclParse() = false;
+	}
+};
+
 ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &query, ParserOptions &options) {
+	if (InAclParse()) {
+		return ParserOverrideResult(); // our own inner parse: decline, and let the others try
+	}
 	auto prefix = ParseAclPrefix(query);
 	if (prefix.kind == AclPrefix::Kind::NONE) {
 		return ParserOverrideResult(); // fall through to the native parser
@@ -1216,14 +1237,26 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		throw BinderException("acl admin: native SQL outside the virtual catalog requires a passthrough scope");
 	}
 
-	// re-parse the remainder with the native parser (never re-entering this override)
+	// Re-parse the remainder. In the virtual context the parser must be duckdb's own: a node type the
+	// rewriter cannot walk would have to be refused anyway, and letting a foreign AST into the rewrite
+	// path is how a reference gets missed. The native context is the opposite - it rewrites nothing
+	// and requires a passthrough scope, so another extension's syntax (duckpgq's GRAPH_TABLE, say) is
+	// no more privileged there than the SQL it already allows. `in_acl_parse` keeps *this* override
+	// out of its own inner parse, so a nested `ACL …` prefix stays unparseable.
 	ParserOptions inner = options;
-	inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
-	Parser parser(inner);
-	parser.ParseQuery(prefix.rest);
+	if (mode != AclPrefix::Mode::NATIVE) {
+		inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
+	}
+	vector<unique_ptr<SQLStatement>> statements;
+	{
+		AclParseGuard guard;
+		Parser parser(inner);
+		parser.ParseQuery(prefix.rest);
+		statements = std::move(parser.statements);
+	}
 
 	if (mode == AclPrefix::Mode::NATIVE) {
-		return ParserOverrideResult(std::move(parser.statements)); // no rewrite: the native context
+		return ParserOverrideResult(std::move(statements)); // no rewrite: the native context
 	}
 
 	bool is_token = prefix.kind == AclPrefix::Kind::TOKEN;
@@ -1231,8 +1264,8 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		throw BinderException("acl_rewrite: %s verification failed", is_token ? "token" : "role");
 	}
 
-	RewriteStatements(parser.statements, principal, options, store);
-	return ParserOverrideResult(std::move(parser.statements));
+	RewriteStatements(statements, principal, options, store);
+	return ParserOverrideResult(std::move(statements));
 }
 
 } // namespace
