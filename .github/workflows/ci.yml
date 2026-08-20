@@ -1,0 +1,154 @@
+# CI (specs/005), layout after hugr-lab/mssql-extension: lint + a Linux build that runs the unit
+# suites AND the integration scenarios against live databases (GitHub service containers share the
+# schemas with docker/docker-compose.yml via docker/init/*.sql), plus a representative macOS build
+# on merges to main and manual runs. Full platform coverage lives in release.yml.
+#
+# NOTE: the extension tracks duckdb `main` (submodule pin); everything here builds the pinned
+# submodule, so a red build means our code or the pin - never a floating upstream.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (clang-format)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: clang-format check
+        run: |
+          find src test/cpp \( -name '*.cpp' -o -name '*.hpp' \) -print0 \
+            | xargs -0 clang-format --dry-run --Werror
+
+  build-test-linux:
+    name: Build + test (linux_amd64)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: acl
+          POSTGRES_PASSWORD: aclpass
+          POSTGRES_DB: acltest
+        ports:
+          - 6432:5432
+        options: >-
+          --health-cmd "pg_isready -U acl -d acltest"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      mysql:
+        image: mysql:9
+        env:
+          MYSQL_ROOT_PASSWORD: aclpass
+          MYSQL_DATABASE: acltest
+          MYSQL_USER: acl
+          MYSQL_PASSWORD: aclpass
+        ports:
+          - 6433:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -paclpass"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      GEN: ninja
+      ACL_INTEGRATION: 1
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache libpq-dev postgresql-client mysql-client
+
+      # ducklake needs CRoaring's cmake package; ubuntu's libroaring-dev is too old
+      - name: Build CRoaring (ducklake dependency)
+        run: |
+          git clone --depth 1 --branch v5.0.0 https://github.com/RoaringBitmap/CRoaring
+          cmake -S CRoaring -B CRoaring/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_ROARING_TESTS=OFF -DROARING_BUILD_STATIC=ON
+          cmake --build CRoaring/build
+          sudo cmake --install CRoaring/build
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ccache-linux_amd64-${{ hashFiles('.gitmodules', 'duckdb/CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-linux_amd64-${{ hashFiles('.gitmodules', 'duckdb/CMakeLists.txt') }}-
+            ccache-linux_amd64-
+
+      - name: Build (with scanners)
+        run: |
+          EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
+          ccache -s
+
+      - name: Unit suites
+        run: |
+          build/release/test/unittest test/sql/acl.test
+          make test-cpp
+
+      - name: Initialize integration schemas
+        run: |
+          PGPASSWORD=aclpass psql -h localhost -p 6432 -U acl -d acltest -f docker/init/postgres.sql
+          mysql -h 127.0.0.1 -P 6433 -u acl -paclpass acltest < docker/init/mysql.sql
+
+      - name: Integration tests
+        run: make test-integration
+
+      - name: Upload extension artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: acl-linux_amd64
+          path: build/release/extension/acl/acl.duckdb_extension
+
+  # Representative second platform; PRs stay on the Linux job to keep them fast
+  build-test-osx:
+    name: Build + test (osx_arm64)
+    runs-on: macos-14
+    if: ${{ github.event_name != 'pull_request' }}
+    env:
+      GEN: ninja
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: brew install ninja ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ccache-osx_arm64-${{ hashFiles('.gitmodules', 'duckdb/CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-osx_arm64-${{ hashFiles('.gitmodules', 'duckdb/CMakeLists.txt') }}-
+            ccache-osx_arm64-
+
+      - name: Build
+        run: |
+          EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
+          ccache -s
+
+      - name: Unit suites
+        run: |
+          build/release/test/unittest test/sql/acl.test
+          make test-cpp
+
+      - name: Upload extension artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: acl-osx_arm64
+          path: build/release/extension/acl/acl.duckdb_extension
