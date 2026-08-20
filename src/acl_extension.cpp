@@ -6,6 +6,7 @@
 #include "duckdb/main/settings.hpp"
 
 #include "acl_admin_functions.hpp"
+#include "acl_introspection.hpp"
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
 #include "duckdb/common/helper.hpp"
@@ -82,6 +83,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	// one policy store per database instance, shared by the parser override and the admin functions
 	auto store = make_shared_ptr<acl::PolicyStore>();
 	acl::RegisterAclParser(config, store);
+	acl::RegisterAclIntrospection(loader, store);
 	acl::RegisterAclAdminFunctions(loader, std::move(store));
 }
 

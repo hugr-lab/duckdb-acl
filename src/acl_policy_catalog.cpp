@@ -609,6 +609,15 @@ struct CatalogBackend {
 		           ? Slot("functions") + "(" + ListLit(GrantedCatalogs(principal)) + ", " + ListLit(names) + ")"
 		           : Tbl("functions");
 	}
+	bool FunctionMode() const {
+		return function_mode;
+	}
+	//! One value of the meta table ('schema_version', 'policy_version'); empty when absent
+	string MetaValue(const char *key) {
+		auto result = Query("SELECT \"value\" FROM " + Tbl("meta") + " WHERE \"key\" = " + Lit(key));
+		return result->RowCount() == 0 || result->GetValue(0, 0).IsNull() ? string()
+		                                                                  : result->GetValue(0, 0).ToString();
+	}
 	bool HasObjectCaps() {
 		return !function_mode || HasSlot("object_caps");
 	}
@@ -1938,6 +1947,94 @@ void PolicyStore::CatalogRegisterCreated(const string &vcat, const string &vname
 			                     " AND \"name\" = " + Lit(vname.substr(dot + 1)));
 		}
 	});
+}
+
+IntrospectionRows PolicyStore::Introspect(const string &listing) {
+	// what an operator may read of the policy source itself. The issuer's keys are deliberately absent:
+	// a listing describes the policy, and an HS256 key is a shared secret, not metadata.
+	static const case_insensitive_map_t<string> LISTINGS = {
+	    {"catalogs", "SELECT \"vcat\", \"comment\" FROM %s"},
+	    {"schemas", "SELECT \"vcat\", \"path\", \"phys_path\", \"origin\", \"comment\" FROM %s"},
+	    {"relations", "SELECT \"vcat\", \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"origin\","
+	                  " \"comment\" FROM %s"},
+	    {"relation_columns", "SELECT \"vcat\", \"vname\", \"pos\", \"name\", \"expr\" FROM %s"},
+	    {"object_columns", "SELECT \"vcat\", \"vname\", \"kind\", \"pos\", \"name\", \"type\", \"comment\","
+	                       " \"derived\" FROM %s"},
+	    {"functions", "SELECT \"vcat\", \"vname\", \"kind\", \"form\", \"target\", \"template\", \"params\","
+	                  " \"comment\" FROM %s"},
+	    {"roles", "SELECT \"role\", \"comment\" FROM %s"},
+	    {"role_claims", "SELECT \"role\", \"claim\", \"value\" FROM %s"},
+	    {"grants", "SELECT \"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\" FROM %s"},
+	    {"schema_grants", "SELECT \"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\", \"into\","
+	                      " \"virtual_only\", \"comment\" FROM %s"},
+	    {"object_grants", "SELECT \"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\" FROM %s"},
+	    {"admins", "SELECT \"role\", \"scope\", \"vcat\" FROM %s"},
+	    {"issuers", "SELECT \"issuer\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\" FROM %s"},
+	    {"role_mappings", "SELECT \"issuer\", \"source\", \"external_value\", \"role\" FROM %s"},
+	    {"function_gate", "SELECT \"role\", \"name\", \"kind\", \"allowed\" FROM %s"},
+	};
+	static const case_insensitive_map_t<string> TABLES = {
+	    {"catalogs", "catalogs"},
+	    {"schemas", "schemas"},
+	    {"relations", "relations"},
+	    {"relation_columns", "relation_columns"},
+	    {"object_columns", "object_columns"},
+	    {"functions", "functions"},
+	    {"roles", "roles"},
+	    {"role_claims", "role_claims"},
+	    {"grants", "role_catalogs"},
+	    {"schema_grants", "role_schemas"},
+	    {"object_grants", "role_object_caps"},
+	    {"admins", "admins"},
+	    {"issuers", "issuers"},
+	    {"role_mappings", "role_mappings"},
+	    {"function_gate", "function_gate"},
+	};
+	IntrospectionRows out;
+	if (StringUtil::CIEquals(listing, "status")) {
+		out.names = {"backend", "schema_version", "policy_version", "version_check_interval", "enumerates"};
+		out.types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
+		             LogicalType::BOOLEAN};
+		string backend = catalog ? (catalog->FunctionMode() ? "functions" : "catalog") : "memory";
+		Value schema_version, policy_version;
+		int64_t interval = 0;
+		if (catalog && !catalog->FunctionMode()) {
+			schema_version = Value(catalog->MetaValue("schema_version"));
+			policy_version = Value(catalog->MetaValue("policy_version"));
+			interval = catalog->SettingInt64("acl_version_check_interval", 1000);
+		}
+		out.rows.push_back({Value(backend), schema_version, policy_version, Value::BIGINT(interval),
+		                    Value::BOOLEAN(catalog && !catalog->FunctionMode())});
+		return out;
+	}
+	auto entry = LISTINGS.find(listing);
+	if (entry == LISTINGS.end()) {
+		throw BinderException("acl: there is no listing called \"%s\"", listing);
+	}
+	if (!catalog) {
+		throw BinderException("acl: no policy source is active, so there is nothing to list - run acl_use_db() or "
+		                      "acl_use_functions() first (the in-memory store is a dev stub and does not enumerate)");
+	}
+	if (catalog->FunctionMode()) {
+		throw BinderException("acl: this policy source does not expose enumeration, so \"%s\" cannot be listed - "
+		                      "the driver contract is keyed lookup, and an empty answer would read as \"nothing is "
+		                      "configured\"",
+		                      listing);
+	}
+	auto table = TABLES.find(listing)->second;
+	auto result = catalog->Query(StringUtil::Replace(entry->second, "%s", catalog->Tbl(table.c_str())));
+	for (auto &name : result->GetNames()) {
+		out.names.push_back(name.GetIdentifierName());
+	}
+	out.types = result->GetTypes();
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		vector<Value> values;
+		for (idx_t col = 0; col < result->ColumnCount(); col++) {
+			values.push_back(result->GetValue(col, row));
+		}
+		out.rows.push_back(std::move(values));
+	}
+	return out;
 }
 
 bool PolicyStore::MetadataListing(const Principal &principal, const string &surface, string &sql) {
