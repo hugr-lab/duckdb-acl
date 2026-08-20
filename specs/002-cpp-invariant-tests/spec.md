@@ -37,12 +37,15 @@ Standalone test programs, not unittest integration:
   a plain program with its own `main()`, PASS/FAIL output, and a non-zero exit code on failure.
 - **Build** — a `test-cpp` Makefile target (style of `mssql-extension`): a pattern rule compiles each
   `test/cpp/test_*.cpp` (discovered by wildcard) with `$(CXX) -std=c++17 -O2 -DNDEBUG` (matching the
-  release archives, so `D_ASSERT` stays compiled out) into `build/test/`, incrementally. The archives
-  are named **explicitly**: `libduckdb_generated_extension_loader.a` first, then the per-extension
-  `lib*_extension.a` one level below `build/release/extension/`, then `libduckdb_static.a`
-  (`--start-group`/`--end-group` on Linux). Globbing would also sweep up the *dummy* loader, which
-  defines the same `RegisterLinkedExtensions` symbol and would silently empty the linked-extension
-  registry. Depends on `release`, so use the same generator (`GEN=ninja make test-cpp`).
+  release build, so `D_ASSERT` stays compiled out) into `build/test/`, incrementally. Binaries link
+  the **shared `libduckdb`** (rpath'd into `build/release/src`), exactly like duckdb's own unittest:
+  it already carries the statically linked extensions — including the scanners of an integration
+  build — together with their resolved third-party dependencies, so the link line never tracks
+  archives or loader objects. (Hand-assembling static archives was tried first and broke twice: a
+  glob swept up the *dummy* extension loader, silently emptying the linked-extension registry, and
+  an integration build's ducklake pulled in a CRoaring dependency the list didn't carry.) The target
+  does not depend on `release` — CI builds in a container and tests on the host — it guards on the
+  built library and says how to build.
 - **CI** — `test_release` (what extension-ci-tools' CI invokes) chains `test-cpp` as a prerequisite
   on the platforms that can build and run the binaries (not Windows, not wasm cross-builds).
 - **Extension loading** — the generated loader publishes `acl` on the config and the `DuckDB`
