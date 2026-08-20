@@ -57,3 +57,4 @@ specs are the shareable distillation of that work.
 | [012](012-function-select-gate/spec.md) | the `select` capability gates virtual function calls | implemented |
 | [013](013-unified-ddl-syntax/spec.md) | one DDL syntax for the virtual catalog | implemented |
 | [014](014-virtual-schemas/spec.md) | virtual schemas as objects — alias, expansion, refresh | implemented |
+| [015](015-schema-grants/spec.md) | schema-level grants and materialised caps inheritance | implemented |

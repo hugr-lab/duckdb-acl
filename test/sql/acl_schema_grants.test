@@ -1,0 +1,277 @@
+# name: test/sql/acl_schema_grants.test
+# description: schema-level grants (spec 015) - the middle of the chain, with inheritance materialised
+#   at write time and an `inherited` flag that keeps the cascade repeatable
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.raw;
+
+statement ok
+CREATE TABLE phys.raw.orders(id INT, amount INT);
+
+statement ok
+INSERT INTO phys.raw.orders VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE SCHEMA phys.eu;
+
+statement ok
+CREATE TABLE phys.eu.orders(id INT, amount INT);
+
+statement ok
+INSERT INTO phys.eu.orders VALUES (3, 300);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+# the catalog grant carries no capabilities of its own: the schema level decides
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw FROM phys.raw;
+
+# --- a schema grant covers the objects of its schema -----------------------------------------------
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM raw.orders;
+----
+<REGEX>:.*select on "raw.orders" is not allowed.*
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE analyst WITH (select) COMMENT 'the reading lane';
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM raw.orders;
+----
+2
+
+query IIII
+SELECT schema_path, caps, inherited, comment FROM aclcat.acl.role_schemas WHERE role = 'analyst';
+----
+raw	{"select": true}	false	the reading lane
+
+# ... including objects that appear in it later
+statement ok
+CREATE TABLE phys.raw.appeared(id INT);
+
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA sales.raw REFRESH;
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM raw.appeared;
+----
+0
+
+# the schema grant does not reach a write it never mentioned
+statement error
+ACL ROLE "analyst" INSERT INTO raw.orders VALUES (9, 900);
+----
+<REGEX>:.*insert on "raw.orders" is not allowed.*
+
+# --- the object level still beats the schema level --------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE sales.raw.orders TO ROLE analyst WITH (select, insert);
+
+statement ok
+ACL ROLE "analyst" INSERT INTO raw.orders VALUES (9, 900);
+
+# its neighbour keeps the schema's capabilities
+statement error
+ACL ROLE "analyst" INSERT INTO raw.appeared VALUES (5);
+----
+<REGEX>:.*insert on "raw.appeared" is not allowed.*
+
+# --- nesting: a grant on an ancestor reaches the subtree --------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw.eu FROM phys.eu;
+
+# the child schema inherited at creation, from the nearest ancestor that states capabilities
+query III
+SELECT schema_path, caps, inherited FROM aclcat.acl.role_schemas WHERE role = 'analyst' ORDER BY schema_path;
+----
+raw	{"select": true}	false
+raw.eu	{"select": true}	true
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM raw.eu.orders;
+----
+1
+
+# an explicit grant on the child stops the cascade for its own subtree
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw.eu TO ROLE analyst WITH (select, insert);
+
+query III
+SELECT schema_path, caps, inherited FROM aclcat.acl.role_schemas WHERE role = 'analyst' ORDER BY schema_path;
+----
+raw	{"select": true}	false
+raw.eu	{"select": true, "insert": true}	false
+
+statement ok
+ACL ROLE "analyst" INSERT INTO raw.eu.orders VALUES (4, 400);
+
+# changing the parent leaves the explicit child alone
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE analyst WITH (select, delete);
+
+query III
+SELECT schema_path, caps, inherited FROM aclcat.acl.role_schemas WHERE role = 'analyst' ORDER BY schema_path;
+----
+raw	{"select": true, "delete": true}	false
+raw.eu	{"select": true, "insert": true}	false
+
+# --- the materialisation is idempotent ---------------------------------------------------------------
+
+statement ok
+ACL ADMIN SELECT acl_rematerialize_schema_caps('sales');
+
+query III
+SELECT schema_path, caps, inherited FROM aclcat.acl.role_schemas WHERE role = 'analyst' ORDER BY schema_path;
+----
+raw	{"select": true, "delete": true}	false
+raw.eu	{"select": true, "insert": true}	false
+
+# --- revoking re-points the subtree at the next ancestor ---------------------------------------------
+
+statement ok
+ACL ADMIN REVOKE SCHEMA sales.raw.eu FROM ROLE analyst;
+
+query III
+SELECT schema_path, caps, inherited FROM aclcat.acl.role_schemas WHERE role = 'analyst' ORDER BY schema_path;
+----
+raw	{"select": true, "delete": true}	false
+raw.eu	{"select": true, "delete": true}	true
+
+statement error
+ACL ROLE "analyst" INSERT INTO raw.eu.orders VALUES (5, 500);
+----
+<REGEX>:.*insert on "raw.eu.orders" is not allowed.*
+
+statement ok
+ACL ADMIN REVOKE SCHEMA sales.raw FROM ROLE analyst;
+
+query I
+SELECT count(*) FROM aclcat.acl.role_schemas WHERE role = 'analyst';
+----
+0
+
+# with the whole chain gone the catalog's own (empty) capabilities decide again
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM raw.eu.orders;
+----
+<REGEX>:.*select on "raw.eu.orders" is not allowed.*
+
+# --- several roles, and one role with disjoint grants -------------------------------------------------
+# the nearest ancestor is per role and per subtree: a grant elsewhere must not swallow another one
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE auditor CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw.us AS phys.raw;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE analyst WITH (select);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw.eu TO ROLE analyst WITH (insert);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE auditor WITH (delete);
+
+query IIII
+SELECT role, schema_path, caps, inherited FROM aclcat.acl.role_schemas ORDER BY role, schema_path;
+----
+analyst	raw	{"select": true}	false
+analyst	raw.eu	{"insert": true}	false
+analyst	raw.us	{"select": true}	true
+auditor	raw	{"delete": true}	false
+auditor	raw.eu	{"delete": true}	true
+auditor	raw.us	{"delete": true}	true
+
+# each role sees its own capabilities on the same nested schema: analyst inherited select, auditor
+# inherited delete, and neither borrows the other's
+query I
+ACL ROLE "analyst" SELECT count(*) FROM raw.us.orders;
+----
+3
+
+statement error
+ACL ROLE "auditor" SELECT count(*) FROM raw.us.orders;
+----
+<REGEX>:.*select on "raw.us.orders" is not allowed.*
+
+statement ok
+ACL ROLE "auditor" DELETE FROM raw.us.orders WHERE id = 999;
+
+statement error
+ACL ROLE "analyst" DELETE FROM raw.us.orders WHERE id = 999;
+----
+<REGEX>:.*delete on "raw.us.orders" is not allowed.*
+
+statement ok
+ACL ADMIN REVOKE SCHEMA sales.raw FROM ROLE auditor;
+
+statement ok
+ACL ADMIN REVOKE SCHEMA sales.raw.eu FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE SCHEMA sales.raw FROM ROLE analyst;
+
+# --- fail-closed rules --------------------------------------------------------------------------------
+
+statement error
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE analyst WITH (select, manage);
+----
+<REGEX>:.*`manage` is granted per catalog, not per schema.*
+
+statement error
+ACL ADMIN GRANT SCHEMA sales.nothere TO ROLE analyst WITH (select);
+----
+<REGEX>:.*schema "sales.nothere" does not exist.*
+
+statement error
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE analyst WITH (select) RLS (amount > 0);
+----
+<REGEX>:.*carries capabilities only.*
+
+# a schema grant is not access on its own: without a catalog grant nothing resolves
+statement ok
+ACL ADMIN CREATE ROLE outsider;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE outsider WITH (select);
+
+statement ok
+SELECT acl_revoke_catalog('outsider', 'sales');
+
+statement error
+ACL ROLE "outsider" SELECT count(*) FROM raw.orders;
+----
+<REGEX>:.*no access to object.*

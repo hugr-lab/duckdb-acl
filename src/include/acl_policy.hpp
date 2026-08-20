@@ -184,6 +184,14 @@ struct PolicyStore {
 	void CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
 	                        const string &view_sql, const string &rls, const vector<std::pair<string, string>> &columns,
 	                        const string &returns = string());
+	//! Grant/revoke one schema to a role (spec 015): capabilities only, `manage` refused. Both
+	//! rematerialise the subtree, so the stored rows always show what a role effectively has.
+	void CatalogGrantSchema(const string &role, const string &vcat, const string &path, const string &caps_json,
+	                        const string &comment = string());
+	void CatalogRevokeSchema(const string &role, const string &vcat, const string &path);
+	//! "Rebuild this subtree from the nearest ancestor that states capabilities" - idempotent, so
+	//! grants, schema DDL and drift repair are all the same call (spec 015)
+	void CatalogRematerializeSchemaCaps(const string &vcat, const string &path);
 	//! Expand a physical schema into one virtual record per object (spec 014): a snapshot the admin
 	//! can then edit object by object, unlike the live alias
 	void CatalogExpandSchema(const string &vcat, const string &path, const string &phys_path);

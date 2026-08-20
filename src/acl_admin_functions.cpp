@@ -258,6 +258,40 @@ void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &resu
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! acl_grant_schema(role, vcat, path, caps_json[, comment]) / acl_revoke_schema(role, vcat, path):
+//! the middle level of the grant chain (spec 015) - capabilities only, materialised down the subtree
+void AclGrantSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = RequiredArg(args, 0, row, "acl_grant_schema", "role");
+		auto vcat = RequiredArg(args, 1, row, "acl_grant_schema", "catalog");
+		auto path = RequiredArg(args, 2, row, "acl_grant_schema", "schema path");
+		auto &store = StoreOf(state);
+		store.CatalogEnsureGrant(role, vcat, false);
+		store.CatalogGrantSchema(role, vcat, path, OptionalArg(args, 3, row, ""), OptionalArg(args, 4, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclRevokeSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = RequiredArg(args, 0, row, "acl_revoke_schema", "role");
+		auto vcat = RequiredArg(args, 1, row, "acl_revoke_schema", "catalog");
+		auto path = RequiredArg(args, 2, row, "acl_revoke_schema", "schema path");
+		StoreOf(state).CatalogRevokeSchema(role, vcat, path);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_rematerialize_schema_caps(vcat[, path]): rebuild a subtree's inherited grants - the repair
+//! call for a materialisation that drifted (spec 015)
+void AclRematerializeSchemaCapsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_rematerialize_schema_caps", "catalog");
+		StoreOf(state).CatalogRematerializeSchemaCaps(vcat, OptionalArg(args, 1, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
 //! acl_expand_schema(vcat, path, phys_path[, comment, mode]): register one virtual record per object
 //! the physical schema holds right now (spec 014)
 void AclExpandSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -860,6 +894,9 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_add_view", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}}, AclAddViewFunc);
 	register_admin_set("acl_add_schema_alias", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclAddSchemaAliasFunc);
 	register_admin_set("acl_expand_schema", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclExpandSchemaFunc);
+	register_admin_set("acl_grant_schema", {{v, v, v, v}, {v, v, v, v, v}}, AclGrantSchemaFunc);
+	register_admin("acl_revoke_schema", {v, v, v}, AclRevokeSchemaFunc);
+	register_admin_set("acl_rematerialize_schema_caps", {{v}, {v, v}}, AclRematerializeSchemaCapsFunc);
 	register_admin_set("acl_add_table_function",
 	                   {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
 	                   AclAddTableFunctionFunc);
