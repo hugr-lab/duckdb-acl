@@ -127,8 +127,23 @@ string OptionalArg(DataChunk &args, idx_t col, idx_t row, const string &fallback
 //===--------------------------------------------------------------------===//
 
 //! acl_use_db(db_name [, schema [, init]]): switch the store to the catalog backend reading policy
+//! Configuring a policy that cannot be enforced is worth saying out loud. The extension turns the
+//! override on when it loads, so this fires when something turned it off again - and it fires here,
+//! in the admin functions, because they are the only acl_* path duckdb still runs in that state (an
+//! `ACL …` statement does not even parse).
+void RequireEnforcementEnabled(PolicyStore &store) {
+	auto mode = store.ParserOverrideMode();
+	if (!StringUtil::CIEquals(mode, "DEFAULT")) {
+		return;
+	}
+	throw BinderException("acl: allow_parser_override_extension is DEFAULT, so no `ACL …` statement is parsed and "
+	                      "nothing is enforced - SET GLOBAL allow_parser_override_extension='STRICT' before "
+	                      "configuring a policy");
+}
+
 //! from the ATTACHed database; init=true creates/migrates the managed schema first.
 void AclUseDbFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	RequireEnforcementEnabled(StoreOf(state));
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto db_name = RequiredArg(args, 0, row, "acl_use_db", "database name");
 		auto schema = OptionalArg(args, 1, row, "acl");
@@ -145,6 +160,7 @@ void AclUseDbFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 //! acl_use_functions(slot_map_json): switch the store to the function-driver policy source - the
 //! contract slots name registered table functions; arguments carry the selection keys (spec 008)
 void AclUseFunctionsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	RequireEnforcementEnabled(StoreOf(state));
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto map_json = RequiredArg(args, 0, row, "acl_use_functions", "slot map");
 		StoreOf(state).EnableFunctions(DbOf(state), map_json);

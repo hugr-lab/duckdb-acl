@@ -1119,6 +1119,13 @@ struct CatalogBackend {
 		return fallback;
 	}
 
+	string SettingString(const char *name, const char *fallback) {
+		Value value;
+		if (Db()->TryGetCurrentSetting(name, value) && !value.IsNull()) {
+			return value.ToString();
+		}
+		return fallback;
+	}
 	int64_t SettingInt64(const char *name, int64_t fallback) {
 		Value value;
 		if (Db()->TryGetCurrentSetting(name, value) && !value.IsNull()) {
@@ -1536,6 +1543,13 @@ void PolicyStore::CatalogMapExternalRoles(const string &issuer, const vector<str
                                           case_insensitive_map_t<vector<string>> &mapped,
                                           case_insensitive_set_t &known_roles) {
 	catalog->MapExternalRoles(issuer, values, mapped, known_roles);
+}
+
+string PolicyStore::ParserOverrideMode() {
+	if (!catalog) {
+		return "STRICT"; // the memory store has no database handle; it is a dev/test path
+	}
+	return catalog->SettingString("allow_parser_override_extension", "DEFAULT");
 }
 
 int64_t PolicyStore::JwtClockSkew() {

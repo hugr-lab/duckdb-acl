@@ -2,6 +2,9 @@
 
 #include "acl_extension.hpp"
 
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/main/settings.hpp"
+
 #include "acl_admin_functions.hpp"
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
@@ -62,6 +65,19 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_jwt_clock_skew", "acl: allowed clock skew in seconds for JWT exp/nbf checks",
 	                          LogicalType::BIGINT, Value::BIGINT(60));
+
+	// Enforcement lives entirely behind the parser override, and duckdb skips every override while
+	// `allow_parser_override_extension` is at its default - so loading acl without it leaves the
+	// extension inert: policy can still be configured through the acl_* functions, but no `ACL …`
+	// statement parses. Turn it on here (duckpgq does the same), and pick STRICT: for us the two
+	// modes are identical - a denial is thrown, never returned - while a co-loaded extension that
+	// does use the error channel keeps its own parse errors under STRICT and loses them under
+	// FALLBACK. An explicit value set before load is left alone.
+	Value current;
+	if (!db.TryGetCurrentSetting("allow_parser_override_extension", current) || current.IsNull() ||
+	    StringUtil::CIEquals(current.ToString(), "DEFAULT")) {
+		Settings::Set<AllowParserOverrideExtensionSetting>(db, SetScope::GLOBAL, Value("STRICT"));
+	}
 
 	// one policy store per database instance, shared by the parser override and the admin functions
 	auto store = make_shared_ptr<acl::PolicyStore>();
