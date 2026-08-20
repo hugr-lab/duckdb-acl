@@ -34,30 +34,27 @@ TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,build/test/%,$(TEST_CPP_SOURCES))
 TEST_CPP_FLAGS := -std=c++17 -O2 -DNDEBUG -pthread
 TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include
 
-# per-extension archives live one level below build/release/extension; the loader archives at its
-# root are excluded by the pattern, and the generated loader is added first explicitly
-TEST_CPP_LIBS = build/release/extension/libduckdb_generated_extension_loader.a \
-    $(wildcard build/release/extension/*/lib*_extension.a) \
-    build/release/src/libduckdb_static.a
-
-ifeq ($(shell uname -s),Linux)
-TEST_CPP_LINK = -Wl,--start-group $(TEST_CPP_LIBS) -Wl,--end-group -ldl -lrt
+# Link against the shared libduckdb, exactly like duckdb's own unittest: it already carries the
+# statically linked extensions (acl, core_functions, ... and the scanners of an integration build)
+# together with their resolved third-party dependencies, so the link line never has to track them.
+ifeq ($(shell uname -s),Darwin)
+TEST_CPP_DUCKDB_LIB := build/release/src/libduckdb.dylib
 else
-TEST_CPP_LINK = $(TEST_CPP_LIBS)
+TEST_CPP_DUCKDB_LIB := build/release/src/libduckdb.so
 endif
+TEST_CPP_LINK = -L build/release/src -lduckdb -Wl,-rpath,$(abspath build/release/src)
 
-build/test/%: test/cpp/%.cpp test/cpp/acl_test_util.hpp \
-		build/release/src/libduckdb_static.a build/release/extension/acl/libacl_extension.a
+build/test/%: test/cpp/%.cpp test/cpp/acl_test_util.hpp $(TEST_CPP_DUCKDB_LIB)
 	@mkdir -p build/test
 	$(CXX) $(TEST_CPP_FLAGS) $(TEST_CPP_INCLUDES) $< $(TEST_CPP_LINK) -o $@
 
 # Deliberately NOT depending on `release`: in the distribution CI the build runs inside a docker
 # container and the tests on the host, so re-triggering cmake against the container-made cache fails
-# on the path change. Guard on the archives instead (mssql-extension does the same).
+# on the path change. Guard on the built library instead (mssql-extension does the same).
 .PHONY: test-cpp test-cpp-run
 test-cpp:
-	@test -f build/release/src/libduckdb_static.a || { \
-		echo "test-cpp: build/release archives missing - run 'GEN=ninja make' first" >&2; exit 1; }
+	@test -f $(TEST_CPP_DUCKDB_LIB) || { \
+		echo "test-cpp: $(TEST_CPP_DUCKDB_LIB) missing - run 'GEN=ninja make' first" >&2; exit 1; }
 	@$(MAKE) --no-print-directory test-cpp-run
 
 test-cpp-run: $(TEST_CPP_BINS)
