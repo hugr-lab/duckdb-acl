@@ -40,6 +40,11 @@ struct TablePolicy {
 	string rls;                  // predicate template (SUBQUERY); may contain acl_claim('<name>'); empty = none
 	string query;                // full SELECT template for a view (SUBQUERY; replaces phys/projection/rls)
 	case_insensitive_set_t caps; // {"select","insert","update","delete","merge"}
+	//! Column renames of a writable (alias-form) relation: virtual name -> physical name. Renaming is
+	//! not a restriction, so it does not force the read-only subquery form: reads go through
+	//! `SELECT * RENAME (...)` (by name, so a new physical column can never shift an alias) and writes
+	//! map the names back (spec 010). A restricting projection stays subquery-form and read-only.
+	vector<std::pair<string, string>> renames;
 };
 
 //! Whether a function reference is a scalar/aggregate (expression position) or a table function (FROM)
