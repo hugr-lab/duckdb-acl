@@ -7,6 +7,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/cte_node.hpp"
 #include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/insert_query_node.hpp"
@@ -547,6 +548,81 @@ private:
 };
 
 } // namespace
+
+namespace {
+
+//! Replace acl_claim('…') / acl_arg(n) with NULL constants so the template binds without a
+//! principal. An acl_arg NULL is TYPED from the declared signature when there is one: an untyped
+//! NULL binds to the wrong type whenever the result depends on the argument.
+void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &param_types,
+                     const ParserOptions &options) {
+	if (!expr) {
+		return;
+	}
+	if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expr->Cast<FunctionExpression>();
+		auto marker = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+		if (marker == "acl_claim" || marker == "acl_arg") {
+			string type;
+			if (marker == "acl_arg") {
+				auto &args = function.GetArguments();
+				if (args.size() == 1 && args[0].GetExpression().GetExpressionClass() == ExpressionClass::CONSTANT) {
+					auto position = args[0].GetExpression().Cast<ConstantExpression>().GetValue().GetValue<int64_t>();
+					if (position >= 1 && static_cast<idx_t>(position) <= param_types.size()) {
+						type = param_types[NumericCast<idx_t>(position - 1)];
+					}
+				}
+			}
+			if (type.empty()) {
+				expr = make_uniq<ConstantExpression>(Value(LogicalType::VARCHAR));
+			} else {
+				// parse the cast rather than resolving the type name by hand (no context needed here)
+				auto casted = Parser::ParseExpressionList("CAST(NULL AS " + type + ")", options);
+				expr = std::move(casted[0]);
+			}
+			return;
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { BakeNullMarkers(child, param_types, options); });
+}
+
+void BakeNullMarkersInNode(QueryNode &node, const vector<string> &param_types, const ParserOptions &options) {
+	if (node.type != QueryNodeType::SELECT_NODE) {
+		return;
+	}
+	auto &select = node.Cast<SelectNode>();
+	for (auto &item : select.select_list) {
+		BakeNullMarkers(item, param_types, options);
+	}
+	BakeNullMarkers(select.where_clause, param_types, options);
+	BakeNullMarkers(select.having, param_types, options);
+	BakeNullMarkers(select.qualify, param_types, options);
+}
+
+} // namespace
+
+string BakeTemplateForProbe(const string &sql, const ParserOptions &options, bool expression,
+                            const vector<string> &param_types) {
+	ParserOptions inner = options;
+	inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
+	if (expression) {
+		auto expressions = Parser::ParseExpressionList(sql, inner);
+		if (expressions.size() != 1) {
+			throw BinderException("acl_rewrite: scalar template must be a single expression");
+		}
+		BakeNullMarkers(expressions[0], param_types, inner);
+		return expressions[0]->ToString();
+	}
+	Parser parser(inner);
+	parser.ParseQuery(sql);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		throw BinderException("acl_rewrite: rewrite template is not a single SELECT");
+	}
+	auto &statement = parser.statements[0]->Cast<SelectStatement>();
+	BakeNullMarkersInNode(*statement.node, param_types, inner);
+	return statement.node->ToString();
+}
 
 void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Principal &principal,
                        const ParserOptions &options, PolicyStore &store) {

@@ -190,6 +190,40 @@ struct AdminScanner {
 		}
 		return ReadQuoted(text, pos);
 	}
+	//! The text inside a parenthesised list, e.g. `(id INT, amount INT)` -> "id INT, amount INT".
+	//! Returns empty when the next token is not '('.
+	string Parens() {
+		Skip();
+		if (pos >= text.size() || text[pos] != '(') {
+			return string();
+		}
+		auto start = ++pos;
+		idx_t depth = 1;
+		while (pos < text.size() && depth > 0) {
+			auto c = text[pos];
+			if (c == '\'' || c == '"') {
+				ReadQuoted(text, pos);
+				continue;
+			}
+			if (c == '(') {
+				depth++;
+			} else if (c == ')') {
+				depth--;
+				if (depth == 0) {
+					break;
+				}
+			}
+			pos++;
+		}
+		if (depth != 0) {
+			throw BinderException("acl admin: unbalanced parentheses at position %llu", start);
+		}
+		auto body = text.substr(start, pos - start);
+		pos++; // the closing paren
+		StringUtil::Trim(body);
+		return body;
+	}
+
 	//! a bare identifier path: word(.word)*
 	string Dotted(const char *what) {
 		auto path = Word(what);
@@ -231,6 +265,16 @@ bool IsMgmtStart(const string &text) {
 	if (StringUtil::CIEquals(first, "add") || StringUtil::CIEquals(first, "grant") ||
 	    StringUtil::CIEquals(first, "revoke") || StringUtil::CIEquals(first, "map")) {
 		return true;
+	}
+	if (StringUtil::CIEquals(first, "comment") || StringUtil::CIEquals(first, "analyze")) {
+		// duckdb owns COMMENT ON <object> and ANALYZE: ours always name a VIRTUAL target
+		AdminScanner ahead(text);
+		ahead.Word("keyword");
+		if (StringUtil::CIEquals(first, "analyze")) {
+			return StringUtil::CIEquals(ahead.PeekWord(), "virtual");
+		}
+		ahead.Accept("on");
+		return StringUtil::CIEquals(ahead.PeekWord(), "virtual");
 	}
 	if (StringUtil::CIEquals(first, "create") || StringUtil::CIEquals(first, "drop") ||
 	    StringUtil::CIEquals(first, "alter")) {
@@ -299,11 +343,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	}
 	if (StringUtil::CIEquals(keyword, "add")) {
 		if (s.Accept("view")) {
+			// ADD VIEW v.n [(col TYPE, …)] AS '<sql>' - the CREATE VIEW shape; a declared column list
+			// is the truth and spares the write-time probe
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			auto returns = s.Parens();
 			s.Expect("as");
 			auto sql = s.Quoted("view SQL");
-			return MakeAdminCall("acl_add_view", {Value(vcat), Value(vname), Value(sql)});
+			return MakeAdminCall("acl_add_view", {Value(vcat), Value(vname), Value(sql), Value(returns)});
 		}
 		if (s.Accept("schema")) {
 			auto phys = s.Dotted("a physical schema path");
@@ -313,27 +360,49 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			return MakeAdminCall("acl_add_schema_alias", {Value(vcat), Value(alias), Value(phys)});
 		}
 		if (s.Accept("scalar")) {
+			// ADD SCALAR v.n[(arg TYPE, …)] [RETURNS <type>] MACRO '<expr>' | ALIAS '<fn>'
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			auto params = s.Parens();
+			string returns;
+			if (s.Accept("returns")) {
+				returns = s.Word("a result type");
+			}
 			bool is_macro = s.Accept("macro");
 			if (!is_macro) {
 				s.Expect("alias");
 			}
 			auto definition = s.Quoted(is_macro ? "expression template" : "target function");
-			return MakeAdminCall(is_macro ? "acl_add_scalar" : "acl_add_scalar_alias",
-			                     {Value(vcat), Value(vname), Value(definition)});
+			if (!is_macro) {
+				return MakeAdminCall("acl_add_scalar_alias", {Value(vcat), Value(vname), Value(definition)});
+			}
+			return MakeAdminCall("acl_add_scalar",
+			                     {Value(vcat), Value(vname), Value(definition), Value(params), Value(returns)});
 		}
 		s.Expect("table");
 		if (s.Accept("function")) {
+			// ADD TABLE FUNCTION v.n[(arg TYPE, …)] [RETURNS TABLE (col TYPE, …)] MACRO '<sql>' | ALIAS '<fn>'
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			auto params = s.Parens();
+			string returns;
+			if (s.Accept("returns")) {
+				s.Accept("table");
+				returns = s.Parens();
+				if (returns.empty()) {
+					throw BinderException("acl admin: RETURNS TABLE needs a column list");
+				}
+			}
 			bool is_macro = s.Accept("macro");
 			if (!is_macro) {
 				s.Expect("alias");
 			}
 			auto definition = s.Quoted(is_macro ? "SQL template" : "target function");
-			return MakeAdminCall(is_macro ? "acl_add_table_function" : "acl_add_table_function_alias",
-			                     {Value(vcat), Value(vname), Value(definition)});
+			if (!is_macro) {
+				return MakeAdminCall("acl_add_table_function_alias", {Value(vcat), Value(vname), Value(definition)});
+			}
+			return MakeAdminCall("acl_add_table_function",
+			                     {Value(vcat), Value(vname), Value(definition), Value(params), Value(returns)});
 		}
 		auto phys = s.Dotted("a physical table path");
 		s.Expect("as");
@@ -495,6 +564,39 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		}
 		throw BinderException("acl admin: unknown ALTER VIRTUAL target");
 	}
+	if (StringUtil::CIEquals(keyword, "comment")) {
+		// COMMENT ON VIRTUAL TABLE|VIEW|TABLE FUNCTION|SCALAR v.n [COLUMN c] IS '...'
+		s.Expect("on");
+		s.Expect("virtual");
+		bool scalar = s.Accept("scalar");
+		bool table_function = false;
+		if (!scalar && s.Accept("table")) {
+			table_function = s.Accept("function");
+		} else if (!scalar) {
+			s.Expect("view");
+		}
+		string vcat, vname;
+		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+		string column;
+		if (s.Accept("column")) {
+			column = s.Word("a column name");
+		}
+		s.Expect("is");
+		auto comment = s.Quoted("comment");
+		auto kind = scalar ? "scalar" : (table_function ? "table" : "relation");
+		return MakeAdminCall("acl_comment", {Value(vcat), Value(vname), Value(kind), Value(column), Value(comment)});
+	}
+	if (StringUtil::CIEquals(keyword, "analyze")) {
+		// ANALYZE VIRTUAL CATALOG c [TABLE|VIEW|... v.n]: re-derive stored schemas
+		s.Expect("virtual");
+		if (s.Accept("catalog")) {
+			return MakeAdminCall("acl_refresh_schema", {Value(s.Word("a catalog name")), Value("")});
+		}
+		s.Accept("scalar") || s.Accept("view") || (s.Accept("table") && s.Accept("function"));
+		string vcat, vname;
+		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+		return MakeAdminCall("acl_refresh_schema", {Value(vcat), Value(vname)});
+	}
 	if (StringUtil::CIEquals(keyword, "drop")) {
 		if (s.Accept("relation")) { // the spec-008 spelling, kept
 			string vcat, vname;
@@ -575,7 +677,8 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	    {"acl_alter_schema_alias", 0}, {"acl_alter_function", 0},     {"acl_alter_catalog", 0},
 	    {"acl_alter_grant", 1},        {"acl_alter_role", -1},        {"acl_alter_issuer", -1},
 	    {"acl_drop_schema_alias", 0},  {"acl_drop_function", 0},      {"acl_drop_role", -1},
-	    {"acl_drop_issuer", -1},       {"acl_drop_role_mapping", -1},
+	    {"acl_drop_issuer", -1},       {"acl_drop_role_mapping", -1}, {"acl_comment", 0},
+	    {"acl_refresh_schema", 0},
 	};
 	MgmtProvenance provenance;
 	auto &select = statement.Cast<SelectStatement>().node->Cast<SelectNode>();

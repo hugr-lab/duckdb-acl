@@ -149,7 +149,8 @@ void AclAddViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		auto vcat = RequiredArg(args, 0, row, "acl_add_view", "catalog");
 		auto vname = RequiredArg(args, 1, row, "acl_add_view", "name");
 		auto sql = RequiredArg(args, 2, row, "acl_add_view", "SQL");
-		StoreOf(state).CatalogAddRelation(vcat, vname, "view", "", sql, "", {});
+		// a declared column list (the CREATE VIEW shape) is stored as-is instead of being probed
+		StoreOf(state).CatalogAddRelation(vcat, vname, "view", "", sql, "", {}, OptionalArg(args, 3, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -173,8 +174,11 @@ void AddFunction(DataChunk &args, ExpressionState &state, Vector &result, const 
 		auto vname = RequiredArg(args, 1, row, what, "name");
 		auto definition = RequiredArg(args, 2, row, what, "definition");
 		bool is_alias = string(form) == "alias";
+		// the declared signature and result (the CREATE MACRO shape): the signature types the probe's
+		// NULLs, and a declared result replaces the probe entirely
 		StoreOf(state).CatalogAddFunction(vcat, vname, kind, form, is_alias ? definition : "",
-		                                  is_alias ? "" : definition);
+		                                  is_alias ? "" : definition, OptionalArg(args, 3, row, ""),
+		                                  OptionalArg(args, 4, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -459,6 +463,33 @@ void AclAlterIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! acl_comment(vcat, vname, kind, column, comment): document a virtual object or one of its columns
+void AclCommentFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_comment", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_comment", "name");
+		auto kind = StringUtil::Lower(OptionalArg(args, 2, row, "relation"));
+		auto column = OptionalArg(args, 3, row, "");
+		auto comment = OptionalArg(args, 4, row, "");
+		StoreOf(state).CatalogSetComment(vcat, vname, kind, column, comment);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_refresh_schema(vcat [, vname]): re-derive the stored schema of query-defined objects after the
+//! physical schema moved under them; returns how many objects were re-probed
+void AclRefreshSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	vector<Value> counts;
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_refresh_schema", "catalog");
+		counts.push_back(Value::BIGINT(
+		    NumericCast<int64_t>(StoreOf(state).CatalogRefreshSchema(vcat, OptionalArg(args, 1, row, "")))));
+	}
+	for (idx_t row = 0; row < args.size(); row++) {
+		result.SetValue(row, counts[row]);
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // DROP of virtual-catalog elements (spec 010): cleanup, not access control - REVOKE takes access
 // away, ADD overwrites definitions; these remove what was created so nothing dangles.
@@ -637,15 +668,17 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_use_functions", {v}, AclUseFunctionsFunc);
 	register_admin_set("acl_create_catalog", {{v}, {v, v}}, AclCreateCatalogFunc);
 	register_admin("acl_add_relation", {v, v, v, v, v}, AclAddRelationFunc);
-	register_admin("acl_add_view", {v, v, v}, AclAddViewFunc);
+	register_admin_set("acl_add_view", {{v, v, v}, {v, v, v, v}}, AclAddViewFunc);
 	register_admin("acl_add_schema_alias", {v, v, v}, AclAddSchemaAliasFunc);
-	register_admin("acl_add_table_function", {v, v, v}, AclAddTableFunctionFunc);
+	register_admin_set("acl_add_table_function", {{v, v, v}, {v, v, v, v, v}}, AclAddTableFunctionFunc);
 	register_admin("acl_add_table_function_alias", {v, v, v}, AclAddTableFunctionAliasFunc);
-	register_admin("acl_add_scalar", {v, v, v}, AclAddScalarCatalogFunc);
+	register_admin_set("acl_add_scalar", {{v, v, v}, {v, v, v, v, v}}, AclAddScalarCatalogFunc);
 	register_admin("acl_add_scalar_alias", {v, v, v}, AclAddScalarAliasCatalogFunc);
 	register_admin_set("acl_grant_catalog", {{v, v, v}, {v, v, v, b}}, AclGrantCatalogFunc);
 	register_admin("acl_revoke_catalog", {v, v}, AclRevokeCatalogFunc);
 	register_admin("acl_drop_relation", {v, v}, AclDropRelationFunc);
+	// metadata (spec 010)
+	register_admin_set("acl_comment", {{v, v, v, v, v}}, AclCommentFunc);
 	// DROP of the remaining elements (spec 010)
 	register_admin_set("acl_drop_catalog", {{v}, {v, b}}, AclDropCatalogFunc);
 	register_admin("acl_drop_schema_alias", {v, v}, AclDropSchemaAliasFunc);
@@ -653,6 +686,15 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_drop_role", {v}, AclDropRoleFunc);
 	register_admin("acl_drop_issuer", {v}, AclDropIssuerFunc);
 	register_admin("acl_drop_role_mapping", {v, v, v, v}, AclDropRoleMappingFunc);
+	// re-derive stored schemas; returns the number of objects re-probed
+	auto register_refresh = [&](vector<LogicalType> arguments) {
+		ScalarFunction function(Identifier("acl_refresh_schema"), std::move(arguments), LogicalType::BIGINT,
+		                        AclRefreshSchemaFunc);
+		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+		loader.RegisterFunction(function);
+	};
+	register_refresh({v});
+	register_refresh({v, v});
 	// original stubs / compatibility wrappers
 	register_admin("acl_grant_table", {v, v, v, v, v, v}, AclGrantTableFunc);
 	register_admin("acl_grant_view", {v, v, v}, AclGrantViewFunc);

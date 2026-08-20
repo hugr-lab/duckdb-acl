@@ -10,6 +10,8 @@
 
 #include "acl_policy.hpp"
 
+#include "acl_rewriter.hpp"
+
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -940,6 +942,78 @@ struct CatalogBackend {
 		}
 	}
 
+	//! Bind a template (markers baked to NULL) without reading data, and return its column schema.
+	//! Runs on the write path, so introspection later costs nothing; a failure is not fatal - the
+	//! object is stored with an unknown schema and `acl_refresh_schema` can try again.
+	bool ProbeSchema(const string &sql, bool expression, const vector<string> &param_types,
+	                 vector<std::pair<string, string>> &out) {
+		auto instance = Db();
+		string probe;
+		try {
+			ParserOptions options;
+			auto baked = BakeTemplateForProbe(sql, options, expression, param_types);
+			probe = expression ? "SELECT (" + baked + ") AS \"value\" WHERE false"
+			                   : "SELECT * FROM (" + baked + ") WHERE false";
+		} catch (std::exception &) {
+			return false; // an unparsable template: the definition itself will report it
+		}
+		Connection con(*instance);
+		auto result = con.Query(probe);
+		if (result->HasError()) {
+			return false; // stored as "schema unknown"; acl_refresh_schema can try again later
+		}
+		auto &types = result->GetTypes();
+		for (idx_t col = 0; col < result->ColumnCount(); col++) {
+			out.emplace_back(result->ColumnName(col).GetIdentifierName(), types[col].ToString());
+		}
+		return true;
+	}
+
+	//! "name TYPE, name TYPE" -> the pieces; a bare "TYPE" (a scalar's RETURNS) yields an empty name
+	static vector<std::pair<string, string>> ParseDeclaration(const string &declaration) {
+		vector<std::pair<string, string>> parts;
+		for (auto &item : StringUtil::Split(declaration, ',')) {
+			auto trimmed = item;
+			StringUtil::Trim(trimmed);
+			if (trimmed.empty()) {
+				continue;
+			}
+			auto space = trimmed.find(' ');
+			if (space == string::npos) {
+				parts.emplace_back(string(), trimmed);
+				continue;
+			}
+			auto name = trimmed.substr(0, space);
+			auto type = trimmed.substr(space + 1);
+			StringUtil::Trim(type);
+			parts.emplace_back(name, type);
+		}
+		return parts;
+	}
+
+	static vector<string> DeclaredTypes(const string &declaration) {
+		vector<string> types;
+		for (auto &part : ParseDeclaration(declaration)) {
+			types.push_back(part.second);
+		}
+		return types;
+	}
+
+	//! Statements replacing one object's stored column schema
+	vector<string> ColumnSchemaStatements(const string &vcat, const string &vname, const string &kind,
+	                                      const vector<std::pair<string, string>> &columns, bool derived) {
+		vector<string> statements;
+		statements.push_back("DELETE FROM " + Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
+		idx_t pos = 0;
+		for (auto &column : columns) {
+			statements.push_back("INSERT INTO " + Tbl("object_columns") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) +
+			                     ", " + Lit(kind) + ", " + std::to_string(pos++) + ", " + Lit(column.first) + ", " +
+			                     Lit(column.second) + ", NULL, " + (derived ? "true" : "false") + ")");
+		}
+		return statements;
+	}
+
 	//! Every table carries a primary key: sources without rowids need one for DELETE/UPDATE
 	void InitSchema() {
 		auto instance = Db();
@@ -982,8 +1056,21 @@ struct CatalogBackend {
 		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_mappings") +
 		        "(\"issuer\" VARCHAR, \"source\" VARCHAR, \"external_value\" VARCHAR, \"role\" VARCHAR,"
 		        " PRIMARY KEY (\"issuer\", \"source\", \"external_value\", \"role\"))",
-		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
+		    // spec 010 (schema v2): comments, and the column schema of every object - declared by an
+		    // admin or derived by binding the template at write time (a query-defined object has no
+		    // physical row to read names and types from). Runs after every CREATE TABLE above.
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("object_columns") +
+		        "(\"vcat\" VARCHAR, \"vname\" VARCHAR, \"kind\" VARCHAR, \"pos\" INTEGER, \"name\" VARCHAR,"
+		        " \"type\" VARCHAR, \"comment\" VARCHAR, \"derived\" BOOLEAN,"
+		        " PRIMARY KEY (\"vcat\", \"vname\", \"kind\", \"pos\"))",
+		    "ALTER TABLE " + Tbl("relations") + " ADD COLUMN IF NOT EXISTS \"comment\" VARCHAR",
+		    "ALTER TABLE " + Tbl("functions") + " ADD COLUMN IF NOT EXISTS \"comment\" VARCHAR",
+		    // the declared signature ("name TYPE, …"): it makes a probe meaningful (typed NULLs) and,
+		    // together with a declared result, unnecessary
+		    "ALTER TABLE " + Tbl("functions") + " ADD COLUMN IF NOT EXISTS \"params\" VARCHAR",
+		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '2' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
+		    "UPDATE " + Tbl("meta") + " SET \"value\" = '2' WHERE \"key\" = 'schema_version' AND \"value\" < '2'",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'policy_version')",
 		};
@@ -1096,19 +1183,39 @@ namespace {
 //! The statements that (re)write one relation - shared by ADD and the transactional ALTER
 vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, const string &vname, const string &form,
                                   const string &phys, const string &view_sql, const string &rls,
-                                  const vector<std::pair<string, string>> &columns) {
+                                  const vector<std::pair<string, string>> &columns, const string &comment,
+                                  const string &returns) {
 	vector<string> statements;
 	statements.push_back("DELETE FROM " + catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                     " AND \"vname\" = " + Lit(vname));
 	statements.push_back("DELETE FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                     " AND \"vname\" = " + Lit(vname));
+	// the comment is read by the caller BEFORE the delete above and carried through: a definition
+	// change is not a reason to lose an operator's documentation
 	statements.push_back("INSERT INTO " + catalog.Tbl("relations") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) +
-	                     ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) + ", " + Lit(rls) + ")");
+	                     ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) + ", " + Lit(rls) + ", " +
+	                     (comment.empty() ? string("NULL") : Lit(comment)) + ")");
 	idx_t pos = 0;
 	for (auto &column : columns) {
 		statements.push_back("INSERT INTO " + catalog.Tbl("relation_columns") + " VALUES (" + Lit(vcat) + ", " +
 		                     Lit(vname) + ", " + std::to_string(pos++) + ", " + Lit(column.first) + ", " +
 		                     Lit(column.second) + ")");
+	}
+	// the object's column schema (spec 010): a view has no physical row and no declared projection,
+	// so bind its SQL once, here on the write path; anything else keeps the projected names
+	vector<std::pair<string, string>> schema;
+	bool derived = false;
+	if (!returns.empty()) {
+		schema = CatalogBackend::ParseDeclaration(returns); // declared: never probed
+	} else if (form == "view") {
+		derived = catalog.ProbeSchema(view_sql, false, {}, schema);
+	} else {
+		for (auto &column : columns) {
+			schema.emplace_back(column.first, string()); // type filled from the physical catalog on read
+		}
+	}
+	for (auto &statement : catalog.ColumnSchemaStatements(vcat, vname, "relation", schema, derived)) {
+		statements.push_back(statement);
 	}
 	return statements;
 }
@@ -1117,22 +1224,18 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 
 void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
                                      const string &view_sql, const string &rls,
-                                     const vector<std::pair<string, string>> &columns) {
+                                     const vector<std::pair<string, string>> &columns, const string &returns) {
 	RequireCatalog(catalog, "acl_add_relation");
-	vector<string> statements;
-	statements.push_back("DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                     " AND \"vname\" = " + Lit(vname));
-	statements.push_back("DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                     " AND \"vname\" = " + Lit(vname));
-	statements.push_back("INSERT INTO " + catalog->Tbl("relations") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) +
-	                     ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) + ", " + Lit(rls) + ")");
-	idx_t pos = 0;
-	for (auto &column : columns) {
-		statements.push_back("INSERT INTO " + catalog->Tbl("relation_columns") + " VALUES (" + Lit(vcat) + ", " +
-		                     Lit(vname) + ", " + std::to_string(pos++) + ", " + Lit(column.first) + ", " +
-		                     Lit(column.second) + ")");
-	}
-	catalog->Write(statements);
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto existing = read("SELECT \"comment\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname));
+		string comment;
+		if (existing->RowCount() > 0 && !existing->GetValue(0, 0).IsNull()) {
+			comment = existing->GetValue(0, 0).ToString();
+		}
+		statements = RelationStatements(*catalog, vcat, vname, form, phys, view_sql, rls, columns, comment, returns);
+	});
 }
 
 void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path) {
@@ -1144,12 +1247,33 @@ void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_
 }
 
 void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
-                                     const string &target, const string &template_sql) {
+                                     const string &target, const string &template_sql, const string &params,
+                                     const string &returns) {
 	RequireCatalog(catalog, "acl_add_function");
-	catalog->Write({"DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                    " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind),
-	                "INSERT INTO " + catalog->Tbl("functions") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) + ", " +
-	                    Lit(kind) + ", " + Lit(form) + ", " + Lit(target) + ", " + Lit(template_sql) + ")"});
+	vector<string> statements = {
+	    "DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " +
+	        Lit(vname) + " AND \"kind\" = " + Lit(kind),
+	    "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " +
+	        Lit(vname) + " AND \"kind\" = " + Lit(kind),
+	    "INSERT INTO " + catalog->Tbl("functions") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) + ", " + Lit(kind) +
+	        ", " + Lit(form) + ", " + Lit(target) + ", " + Lit(template_sql) + ", NULL, " + Lit(params) + ")"};
+	// A declared result is the truth and needs no probe: an argument-dependent template cannot be
+	// typed from NULLs anyway, and binding admin SQL at write time touches the sources.
+	vector<std::pair<string, string>> schema;
+	bool derived = false;
+	if (!returns.empty()) {
+		schema = CatalogBackend::ParseDeclaration(returns);
+		if (kind == "scalar" && schema.size() == 1 && schema[0].first.empty()) {
+			schema[0].first = "value"; // a scalar declares only its type
+		}
+	} else if (form == "macro") {
+		derived =
+		    catalog->ProbeSchema(template_sql, kind == "scalar", CatalogBackend::DeclaredTypes(params), schema);
+	}
+	for (auto &statement : catalog->ColumnSchemaStatements(vcat, vname, kind, schema, derived)) {
+		statements.push_back(statement);
+	}
+	catalog->Write(statements);
 }
 
 void PolicyStore::CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main) {
@@ -1176,10 +1300,98 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 	RequireCatalog(catalog, "acl_drop_relation");
 	catalog->Write({"DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                    " AND \"vname\" = " + Lit(vname),
+	                "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                    " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'",
 	                "DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                    " AND \"vname\" = " + Lit(vname),
 	                "DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                    " AND \"vname\" = " + Lit(vname)});
+}
+
+void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, const string &kind, const string &column,
+                                    const string &comment) {
+	RequireCatalog(catalog, "acl_comment");
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto value = comment.empty() ? string("NULL") : Lit(comment);
+		if (!column.empty()) {
+			auto exists = read("SELECT 1 FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                   " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind) +
+			                   " AND \"name\" = " + Lit(column));
+			if (exists->RowCount() == 0) {
+				throw BinderException("acl admin: \"%s.%s\" has no column \"%s\" (its schema may be unknown - "
+				                      "run acl_refresh_schema)",
+				                      vcat, vname, column);
+			}
+			statements.push_back("UPDATE " + catalog->Tbl("object_columns") + " SET \"comment\" = " + value +
+			                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+			                     " AND \"kind\" = " + Lit(kind) + " AND \"name\" = " + Lit(column));
+			return;
+		}
+		auto table = kind == "relation" ? "relations" : "functions";
+		auto where = " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+		             (kind == "relation" ? string() : " AND \"kind\" = " + Lit(kind));
+		auto exists = read("SELECT 1 FROM " + catalog->Tbl(table) + where);
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: \"%s.%s\" does not exist", vcat, vname);
+		}
+		statements.push_back("UPDATE " + catalog->Tbl(table) + " SET \"comment\" = " + value + where);
+	});
+}
+
+idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname) {
+	RequireCatalog(catalog, "acl_refresh_schema");
+	idx_t refreshed = 0;
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		string name_filter = vname.empty() ? string() : " AND \"vname\" = " + Lit(vname);
+		// a declared schema is never re-derived: it is the admin's statement of fact
+		auto declared = read("SELECT \"vname\", \"kind\" FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " +
+		                     Lit(vcat) + " AND \"derived\" = false" + name_filter);
+		case_insensitive_set_t declared_keys;
+		for (idx_t row = 0; row < declared->RowCount(); row++) {
+			declared_keys.insert(declared->GetValue(0, row).ToString() + "\x1f" +
+			                     declared->GetValue(1, row).ToString());
+		}
+		// only query-defined objects have a derived schema; an alias reads the physical catalog live
+		auto views = read("SELECT \"vname\", \"view_sql\" FROM " + catalog->Tbl("relations") +
+		                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"form\" = 'view'" + name_filter);
+		for (idx_t row = 0; row < views->RowCount(); row++) {
+			auto object = views->GetValue(0, row).ToString();
+			if (declared_keys.count(object + "\x1frelation")) {
+				continue;
+			}
+			auto sql = views->GetValue(1, row);
+			vector<std::pair<string, string>> schema;
+			bool derived = !sql.IsNull() && catalog->ProbeSchema(sql.ToString(), false, {}, schema);
+			for (auto &statement : catalog->ColumnSchemaStatements(vcat, object, "relation", schema, derived)) {
+				statements.push_back(statement);
+			}
+			refreshed++;
+		}
+		auto macros = read("SELECT \"vname\", \"kind\", \"template\", \"params\" FROM " + catalog->Tbl("functions") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"form\" = 'macro'" + name_filter);
+		for (idx_t row = 0; row < macros->RowCount(); row++) {
+			auto object = macros->GetValue(0, row).ToString();
+			auto kind = macros->GetValue(1, row).ToString();
+			if (declared_keys.count(object + "\x1f" + kind)) {
+				continue;
+			}
+			auto sql = macros->GetValue(2, row);
+			auto params = macros->GetValue(3, row);
+			vector<std::pair<string, string>> schema;
+			bool derived = !sql.IsNull() &&
+			               catalog->ProbeSchema(sql.ToString(), kind == "scalar",
+			                                    CatalogBackend::DeclaredTypes(params.IsNull() ? string()
+			                                                                                  : params.ToString()),
+			                                    schema);
+			for (auto &statement : catalog->ColumnSchemaStatements(vcat, object, kind, schema, derived)) {
+				statements.push_back(statement);
+			}
+			refreshed++;
+		}
+	});
+	return refreshed;
 }
 
 void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
@@ -1201,7 +1413,7 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 			                      "drop those grants too",
 			                      vcat, StringUtil::Join(roles, ", "));
 		}
-		for (auto table : {"relations", "relation_columns", "schema_aliases", "functions"}) {
+		for (auto table : {"relations", "relation_columns", "schema_aliases", "functions", "object_columns"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
 		}
 		if (cascade) {
@@ -1237,6 +1449,8 @@ void PolicyStore::CatalogDropFunction(const string &vcat, const string &vname, c
 			throw BinderException("acl admin: %s function \"%s.%s\" does not exist", kind, vcat, vname);
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
+		statements.push_back("DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
 	});
 }
@@ -1369,7 +1583,15 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		}
 		// the form follows the content, exactly as it does for ADD
 		string new_form = !new_view.empty() ? "view" : (new_columns.empty() && new_rls.empty() ? "alias" : "subquery");
-		statements = RelationStatements(*catalog, vcat, vname, new_form, new_phys, new_view, new_rls, new_columns);
+		auto comment_value = read("SELECT \"comment\" FROM " + catalog->Tbl("relations") +
+		                          " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		string comment;
+		if (comment_value->RowCount() > 0 && !comment_value->GetValue(0, 0).IsNull()) {
+			comment = comment_value->GetValue(0, 0).ToString();
+		}
+		// ALTER keeps the stored schema policy: a declared result is re-declared explicitly, not here
+		statements = RelationStatements(*catalog, vcat, vname, new_form, new_phys, new_view, new_rls, new_columns,
+		                                comment, string());
 	});
 }
 

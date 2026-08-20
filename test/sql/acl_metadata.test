@@ -1,0 +1,281 @@
+# name: test/sql/acl_metadata.test
+# description: metadata of virtual objects (spec 010, part 2) - comments, and the column schema of
+#   query-defined views and macros derived by binding the template at write time
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100), (2, 'globex', 200);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+# --- a view's schema is derived when the view is written ------------------------------------------
+
+statement ok
+ACL ADMIN ADD VIEW sales.stats AS 'SELECT count(*) AS orders, max(amount) AS top FROM phys.main.orders_physical';
+
+query III
+SELECT name, type, derived FROM aclcat.acl.object_columns WHERE vcat = 'sales' AND vname = 'stats' ORDER BY pos;
+----
+orders	BIGINT	true
+top	INTEGER	true
+
+# claims and arguments are baked to NULL for the probe, so a template with markers still resolves
+statement ok
+ACL ADMIN ADD VIEW sales.mine AS 'SELECT id, amount FROM phys.main.orders_physical WHERE tenant = acl_claim(''tenant'')';
+
+query II
+SELECT name, type FROM aclcat.acl.object_columns WHERE vname = 'mine' ORDER BY pos;
+----
+id	INTEGER
+amount	INTEGER
+
+# --- table-function and scalar macros ------------------------------------------------------------
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.report MACRO 'SELECT id, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1)';
+
+query III
+SELECT name, type, kind FROM aclcat.acl.object_columns WHERE vname = 'report' ORDER BY pos;
+----
+id	INTEGER	table
+amount	INTEGER	table
+
+statement ok
+ACL ADMIN ADD SCALAR sales.shout MACRO 'upper(acl_arg(1))';
+
+query III
+SELECT name, type, kind FROM aclcat.acl.object_columns WHERE vname = 'shout' ORDER BY pos;
+----
+value	VARCHAR	scalar
+
+# an alias-form function is not query-defined: nothing to derive, the physical function is the truth
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.rng ALIAS 'range';
+
+query I
+SELECT count(*) FROM aclcat.acl.object_columns WHERE vname = 'rng';
+----
+0
+
+# --- a projection's names are stored; types come from the physical catalog on read ----------------
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS 'id,amount,ssn=NULL';
+
+query II
+SELECT name, derived FROM aclcat.acl.object_columns WHERE vname = 'orders' ORDER BY pos;
+----
+id	false
+amount	false
+ssn	false
+
+# --- declared schemas: the CREATE VIEW / CREATE MACRO shapes ---------------------------------------
+# a declaration is the truth and needs no probe - which matters for argument-dependent templates
+# (an untyped NULL would bind to the wrong type) and for sources a probe should not touch
+
+statement ok
+ACL ADMIN ADD VIEW sales.declared (id INTEGER, label VARCHAR) AS 'SELECT id, tenant FROM phys.main.orders_physical';
+
+query III
+SELECT name, type, derived FROM aclcat.acl.object_columns WHERE vname = 'declared' ORDER BY pos;
+----
+id	INTEGER	false
+label	VARCHAR	false
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.typed(threshold INTEGER) RETURNS TABLE (id INTEGER, amount INTEGER) MACRO 'SELECT id, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1)';
+
+query III
+SELECT name, type, derived FROM aclcat.acl.object_columns WHERE vname = 'typed' ORDER BY pos;
+----
+id	INTEGER	false
+amount	INTEGER	false
+
+query I
+SELECT params FROM aclcat.acl.functions WHERE vname = 'typed';
+----
+threshold INTEGER
+
+statement ok
+ACL ADMIN ADD SCALAR sales.tagged(text VARCHAR) RETURNS VARCHAR MACRO 'acl_arg(1) || ''!''';
+
+query III
+SELECT name, type, derived FROM aclcat.acl.object_columns WHERE vname = 'tagged' ORDER BY pos;
+----
+value	VARCHAR	false
+
+# the declared signature also types the probe's NULLs when no result is declared: without it the
+# template below would bind acl_arg(1) as VARCHAR and derive the wrong result type
+statement ok
+ACL ADMIN ADD SCALAR sales.doubled(n INTEGER) MACRO 'acl_arg(1) * 2';
+
+query II
+SELECT type, derived FROM aclcat.acl.object_columns WHERE vname = 'doubled';
+----
+INTEGER	true
+
+# a declared schema is never re-derived by ANALYZE
+statement ok
+ACL ADMIN ANALYZE VIRTUAL CATALOG sales;
+
+query II
+SELECT type, derived FROM aclcat.acl.object_columns WHERE vname = 'typed' AND name = 'amount';
+----
+INTEGER	false
+
+# declared objects enforce like any other
+statement ok
+ACL ADMIN CREATE ROLE decl_reader CLAIMS 'tenant=acme';
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE decl_reader CAPS '{"select": true}' MAIN;
+
+query II
+ACL ROLE "decl_reader" SELECT id, amount FROM typed(150) ORDER BY id;
+----
+2	200
+
+query I
+ACL ROLE "decl_reader" SELECT tagged('hi');
+----
+hi!
+
+# --- a probe that cannot bind is stored as "unknown", not refused ---------------------------------
+
+statement ok
+ACL ADMIN ADD VIEW sales.broken AS 'SELECT * FROM phys.main.not_here_yet';
+
+query I
+SELECT count(*) FROM aclcat.acl.object_columns WHERE vname = 'broken';
+----
+0
+
+# ... and it is repaired once the source exists
+statement ok
+ACL ADMIN CREATE TABLE phys.main.not_here_yet(x INT, y VARCHAR);
+
+query I
+ACL ADMIN SELECT acl_refresh_schema('sales', 'broken');
+----
+1
+
+query II
+SELECT name, type FROM aclcat.acl.object_columns WHERE vname = 'broken' ORDER BY pos;
+----
+x	INTEGER
+y	VARCHAR
+
+# --- drift: the physical schema moves under a stored one, ANALYZE re-derives it -------------------
+
+statement ok
+ACL ADMIN ALTER TABLE phys.main.not_here_yet ADD COLUMN z DOUBLE;
+
+query I
+SELECT count(*) FROM aclcat.acl.object_columns WHERE vname = 'broken';
+----
+2
+
+statement ok
+ACL ADMIN ANALYZE VIRTUAL CATALOG sales;
+
+query III
+SELECT name, type, derived FROM aclcat.acl.object_columns WHERE vname = 'broken' ORDER BY pos;
+----
+x	INTEGER	true
+y	VARCHAR	true
+z	DOUBLE	true
+
+# --- comments on objects and columns --------------------------------------------------------------
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL VIEW sales.stats IS 'daily order statistics';
+
+query I
+SELECT comment FROM aclcat.acl.relations WHERE vname = 'stats';
+----
+daily order statistics
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL VIEW sales.stats COLUMN top IS 'largest order';
+
+query I
+SELECT comment FROM aclcat.acl.object_columns WHERE vname = 'stats' AND name = 'top';
+----
+largest order
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL SCALAR sales.shout IS 'uppercase helper';
+
+query I
+SELECT comment FROM aclcat.acl.functions WHERE vname = 'shout';
+----
+uppercase helper
+
+# a comment on something that does not exist is an error, and so is an unknown column
+statement error
+ACL ADMIN COMMENT ON VIRTUAL VIEW sales.nothere IS 'x';
+----
+<REGEX>:.*"sales.nothere" does not exist.*
+
+statement error
+ACL ADMIN COMMENT ON VIRTUAL VIEW sales.stats COLUMN nosuch IS 'x';
+----
+<REGEX>:.*has no column "nosuch".*
+
+# --- comments survive a definition change; a schema change re-derives the columns ------------------
+
+statement ok
+ACL ADMIN ALTER VIRTUAL VIEW sales.stats SET AS 'SELECT count(*) AS orders FROM phys.main.orders_physical';
+
+query I
+SELECT comment FROM aclcat.acl.relations WHERE vname = 'stats';
+----
+daily order statistics
+
+query II
+SELECT name, type FROM aclcat.acl.object_columns WHERE vname = 'stats' ORDER BY pos;
+----
+orders	BIGINT
+
+# dropping an object takes its schema and comments with it
+statement ok
+ACL ADMIN DROP VIRTUAL VIEW sales.stats;
+
+query I
+SELECT count(*) FROM aclcat.acl.object_columns WHERE vname = 'stats';
+----
+0
+
+# --- enforcement is untouched by any of this ------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS 'tenant=acme';
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{"select": true}' MAIN;
+
+query II
+ACL ROLE "analyst" SELECT id, amount FROM mine ORDER BY id;
+----
+1	100

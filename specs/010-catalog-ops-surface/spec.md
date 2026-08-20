@@ -1,7 +1,7 @@
 # Spec 010: operating the virtual catalog — DROP, metadata, introspection
 
-- **Status**: in progress — part 1 (DROP) implemented; parts 2 (metadata) and 3 (introspection +
-  `duckdb_*` substitution) follow as their own PRs against this spec
+- **Status**: in progress — parts 1 (DROP) and 2 (metadata) implemented; part 3 (introspection +
+  `duckdb_*` substitution) follows as its own PR against this spec
 - **Date**: 2026-08-20
 - **Author**: hugr-lab
 
@@ -51,18 +51,24 @@ passthrough (they are not catalog-specific).
 
 ### 2. Metadata: comments, names, types
 
-New optional columns: `relations.comment`, `relation_columns.type` + `.comment`,
-`functions.comment`, plus a `functions_columns` table for a table function's result schema.
+Schema v2 adds `relations.comment`, `functions.comment` and one table for every object's column
+schema: `acl.object_columns(vcat, vname, kind, pos, name, type, comment, derived)` — `kind` is
+`relation` / `table` / `scalar`, and `derived` says whether the row came from a probe or from a
+declared projection. Migrations run in `acl_use_db(..., init := true)`
+(`ALTER TABLE … ADD COLUMN IF NOT EXISTS`), so an existing catalog upgrades in place.
 Three sources, resolved in this order per field:
 
-1. **declared** — what an admin wrote (`COMMENT '…'`, `COLUMNS 'id INT COMMENT …'`);
+1. **declared** — `ACL ADMIN COMMENT ON VIRTUAL TABLE|VIEW|TABLE FUNCTION|SCALAR v.n [COLUMN c] IS
+   '…'` (`acl_comment`), and the projected column names of a subquery-form relation;
 2. **physical** — for `alias`-form relations and plain (non-expression) projected columns: the
    physical `duckdb_tables()`/`duckdb_columns()` row, read live, so it never goes stale;
 3. **probed** — for query-defined objects (`view` form, table-function macros) there is no physical
    row, so the schema is derived by **binding the template at write time** and stored:
-   `ADD/ALTER VIEW|TABLE FUNCTION` binds `SELECT * FROM (<sql>) WHERE false` with `acl_claim(…)` and
-   `acl_arg(n)` baked to NULL, and persists the resulting names and types. Every change goes through
-   us, so the stored schema is written exactly when the definition is.
+   `ADD/ALTER VIEW|TABLE FUNCTION|SCALAR` binds `SELECT * FROM (<sql>) WHERE false` (a scalar macro
+   binds `SELECT (<expr>) AS value WHERE false`) with `acl_claim(…)` and `acl_arg(n)` baked to NULL
+   by the rewriter's own marker logic, and persists the resulting names and types. Every change goes
+   through us, so the stored schema is written exactly when the definition is. Comments survive a
+   definition change; dropping an object takes its schema and comments with it.
 
 Consequences of probing on the write path (deliberate):
 
@@ -70,7 +76,8 @@ Consequences of probing on the write path (deliberate):
 - the probe can fail (the source is not attached yet, or a macro's `acl_arg` cannot be NULL) — that
   is not a refusal: the object is stored with "schema unknown" and a flag;
 - the physical schema can drift under a stored one, so `acl_refresh_schema(vcat[, vname])` /
-  `ACL ADMIN ANALYZE VIRTUAL CATALOG c` re-probes; `alias`-form objects never need it.
+  `ACL ADMIN ANALYZE VIRTUAL CATALOG c` (or one object) re-probes and returns how many objects it
+  re-derived; `alias`-form objects never need it, since they read the physical catalog live.
 
 ### 3. `acl_*` introspection
 
@@ -147,8 +154,13 @@ deny of spec 009 plus these rewrites.
 - `acl_virtual_catalog.test`: a principal's `duckdb_tables()`/`information_schema.columns` showing
   only granted objects and only visible columns; masked columns absent; no physical names; native
   context still unfiltered; the pre-existing physical-catalog leak refused.
-- Metadata: comments and types for alias/subquery/view/macro objects, a probe failure stored as
-  "unknown" and repaired by `acl_refresh_schema`.
+- `acl_metadata.test` (78 assertions, **implemented**): a view's and a macro's schema derived at
+  write time (including templates carrying `acl_claim`/`acl_arg`), a scalar macro's single result
+  type, an alias-form function deriving nothing, projected names stored for subquery relations, a
+  probe that cannot bind stored as "unknown" and repaired by `acl_refresh_schema` once the source
+  exists, drift repaired by `ANALYZE VIRTUAL CATALOG`, comments on objects and columns (with errors
+  for unknown targets), comments surviving an `ALTER … SET AS`, schema and comments removed on
+  `DROP`, and enforcement unchanged throughout.
 
 ## Alternatives considered
 
