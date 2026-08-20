@@ -23,6 +23,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      # the project standard is duckdb's pinned formatter (scripts/format.py: clang_format==11.0.1);
+      # the runner's default clang-format is newer and reflows the code differently
+      - name: Install duckdb's pinned clang-format
+        run: pip install clang_format==11.0.1
       - name: clang-format check
         run: |
           find src test/cpp \( -name '*.cpp' -o -name '*.hpp' \) -print0 \
