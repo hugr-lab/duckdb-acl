@@ -10,12 +10,25 @@
     "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
     "C_Cpp.default.includePath": [
         "${workspaceFolder}/src/include",
+        "${workspaceFolder}/third_party/p256-m",
         "${workspaceFolder}/duckdb/src/include",
-        "${workspaceFolder}/duckdb/third_party/fmt/include"
+        "${workspaceFolder}/duckdb/third_party/fmt/include",
+        "${workspaceFolder}/duckdb/third_party/mbedtls/include",
+        "${workspaceFolder}/duckdb/third_party/yyjson/include"
     ],
     "C_Cpp.default.cppStandard": "c++17",
-    "files.associations": { "*.hpp": "cpp", "*.cpp": "cpp" },
+    "files.associations": {
+        "*.hpp": "cpp",
+        "*.cpp": "cpp"
+    },
     "editor.formatOnSave": false,
-    "files.exclude": { "**/.git": true },
-    "search.exclude": { "build": true, "duckdb": true, "extension-ci-tools": true }
+    "files.exclude": {
+        "**/.git": true
+    },
+    "search.exclude": {
+        "build": true,
+        "duckdb": true,
+        "extension-ci-tools": true
+    },
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/release/compile_commands.json"
 }

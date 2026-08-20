@@ -92,7 +92,10 @@ Two layers (spec 006). **Catalog model**: `acl_use_db(name[,schema[,init]])` swi
 policy catalog in any ATTACHed database (standard duckdb dialect only, source agnostic);
 `acl_create_catalog`, `acl_add_relation/_view/_schema_alias/_table_function[_alias]/_scalar[_alias]`,
 `acl_grant_catalog(role, vcat, caps_json, is_main)`, `acl_revoke_catalog`, `acl_drop_relation`.
-Setting `acl_version_check_interval` bounds policy staleness. **Legacy stubs / wrappers**:
+Settings `acl_version_check_interval` (policy staleness) and `acl_jwt_clock_skew` (JWT exp/nbf).
+**JWT** (spec 007): `acl_define_issuer(issuer, keys_json, audiences, algs, role_claim, claim_map)`
+and `acl_map_role(issuer, source, external, role)` — a JWT-shaped `ACL TOKEN` verifies offline
+(RS256/ES256/HS256; mbedtls + vendored p256-m), roles resolve as a multi-role union. **Legacy stubs / wrappers**:
 `acl_define_token` (memory-only until JWT lands, spec 007), `acl_define_role`, `acl_grant_table`,
 `acl_grant_view`, `acl_grant_table_function[,_alias]`, `acl_grant_scalar[,_alias]`,
 `acl_deny_function`, `acl_allow_function` — without a catalog they fill the in-memory store; with one

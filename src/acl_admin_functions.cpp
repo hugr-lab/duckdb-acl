@@ -367,8 +367,42 @@ void AclAllowFunctionFunc(DataChunk &args, ExpressionState &state, Vector &resul
 	SetFunctionGate(args, state, result, "acl_allow_function", true);
 }
 
-//! acl_define_token(token, role, claims_csv): bind a token to a principal. Deliberately memory-only:
-//! the bridge until real JWT verification lands (spec 007).
+//! acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_claim, claim_map_json):
+//! register an offline JWT issuer (spec 007). keys_json is a JWKS (RSA n/e, EC x/y, oct k) or a PEM
+//! public key; keys are data - the gateway/admin rotates them.
+void AclDefineIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		IssuerConfig config;
+		config.issuer = RequiredArg(args, 0, row, "acl_define_issuer", "issuer");
+		config.keys_json = RequiredArg(args, 1, row, "acl_define_issuer", "keys");
+		for (auto &aud : SplitCsv(OptionalArg(args, 2, row, ""))) {
+			config.audiences.push_back(aud);
+		}
+		for (auto &alg : SplitCsv(OptionalArg(args, 3, row, "RS256"))) {
+			config.algs.insert(alg);
+		}
+		config.role_claim = OptionalArg(args, 4, row, "roles");
+		config.claim_map = OptionalArg(args, 5, row, "");
+		StoreOf(state).DefineIssuer(std::move(config));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_map_role(issuer, source, external_value, role): map a claim value or an EntraID group GUID
+//! to an internal role; one external value may map to several roles
+void AclMapRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto issuer = RequiredArg(args, 0, row, "acl_map_role", "issuer");
+		auto source = RequiredArg(args, 1, row, "acl_map_role", "source");
+		auto external = RequiredArg(args, 2, row, "acl_map_role", "external value");
+		auto role = RequiredArg(args, 3, row, "acl_map_role", "role");
+		StoreOf(state).MapRole(issuer, source, external, role);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_define_token(token, role, claims_csv): bind a non-JWT token to a principal - the dev stub
+//! (a JWT-shaped token always takes the real verification path, spec 007).
 void AclDefineTokenFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto token = RequiredArg(args, 0, row, "acl_define_token", "token");
@@ -446,6 +480,9 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_allow_function", {v}, AclAllowFunctionFunc);
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);
 	register_admin("acl_define_role", {v, v}, AclDefineRoleFunc);
+	// offline JWT verification (spec 007)
+	register_admin("acl_define_issuer", {v, v, v, v, v, v}, AclDefineIssuerFunc);
+	register_admin("acl_map_role", {v, v, v, v}, AclMapRoleFunc);
 }
 
 } // namespace acl

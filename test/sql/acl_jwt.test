@@ -1,0 +1,189 @@
+# name: test/sql/acl_jwt.test
+# description: offline JWT verification (spec 007) - RS256/ES256/HS256, claim mapping, role mapping,
+#   EntraID groups + overage, negatives. Tokens and keys are fixtures from
+#   test/scripts/gen_jwt_fixtures.py; regenerate them together with this file.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100), (2, 'globex', 200), (3, 'acme', 300);
+
+statement ok
+CREATE TABLE phys.main.audit_physical(id INT, note VARCHAR);
+
+statement ok
+INSERT INTO phys.main.audit_physical VALUES (1, 'entry');
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+SELECT acl_grant_table('analyst', 'orders', 'phys.main.orders_physical', 'id,amount', 'tenant = acl_claim(''tenant'')', 'select');
+
+statement ok
+SELECT acl_grant_table('auditor', 'audit', 'phys.main.audit_physical', 'id,note', '', 'select');
+
+# a JWT from an unregistered issuer is rejected before anything else
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1;
+----
+<REGEX>:.*unknown issuer.*
+
+# --- RS256 + ES256 against a JWKS (RSA n/e and EC x/y), claims via claim_map ---------------------
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/rs', '{"keys":[{"kty":"RSA","kid":"test-key","alg":"RS256","n":"jps-_RGCObZHYxFmbxIagCg0dZlIifYMV2phhdrLpkrJ8TkoTe_GQK62Nf4Ilh92YUiBofspFfi7-fT937mnN1vzVyAKjHCHA4BmnDHHvCea8QdNP0YcxDXsBReZDFx-e8uEqfG-9_uvhLS0HTwTqhRKtdlwGDrsSoH4WYnCHI1grvQ8BSo7MivppMTzx7UUWeKieKFMeY3jw-g0XgdyZKjIOOaXQTX5AeEm_Xq6OjOtq7gVIgmNfogSQIAWFk5iaMzzafzhQmN_d719rEMSJClAAnCklwpETEq2jWv5vJUhslPL6ZQPd8jnjVMcOzL8Zy9ed5U9te-EQ0IKnfnpZQ","e":"AQAB"},{"kty":"EC","crv":"P-256","kid":"test-ec","alg":"ES256","x":"DQof67TjKFht1fXEua9TTUBimcYFM1za8A06kBIgCDM","y":"RRJa8uTiLTotv77J3eZC2m3YOQSz_aHIk2mnf_5vwCg"}]}', 'api://acl-test', 'RS256,ES256', 'roles', '{"tid": "tenant"}');
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+query II
+ACL TOKEN 'eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3QtZWMifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU5Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.elvvGbeuz66wCWyFtHnu_JxI4JMWTSoGldYSy7UyjHkZB5wybZnL1nCOlqYIzUMIGEozPGOoZ5cSK_9L3K_ddw' SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+# multi-role union: both roles' grants are visible under one principal
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUyIiwicm9sZXMiOlsiYW5hbHlzdCIsImF1ZGl0b3IiXSwidGlkIjoiYWNtZSJ9.guFpE40gTGSse-r_WRt80-UaF7PO4AiI7FH_Roa2c53oPOGxbUSXgrthA0H5Y5qBxwiq1nEj3cafcS5NYS9aF6A3T4tHi55ePDFNxjNJteJXP3-y7YX-MUR7BDaRumB9wTGB5SUXI0uu8m7cv7S9_u2NcxIs76DIdbU3061k5fWz_V-J0FX7XYEcOcGXr4Bdc5bmjgGG1OX_ACD2L8FtEQz2890HxnQMBoQMlcyXaVfK4qsiwes481ZxxDWWxninQZvX3dHLQtbIDjWFXu-KUQ3Isybc3K3Fd8eoGJ8lkuy_VDofJ1od3g73_IHg1FpIy1A536C_06kyz4bikH7S0w' SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUyIiwicm9sZXMiOlsiYW5hbHlzdCIsImF1ZGl0b3IiXSwidGlkIjoiYWNtZSJ9.guFpE40gTGSse-r_WRt80-UaF7PO4AiI7FH_Roa2c53oPOGxbUSXgrthA0H5Y5qBxwiq1nEj3cafcS5NYS9aF6A3T4tHi55ePDFNxjNJteJXP3-y7YX-MUR7BDaRumB9wTGB5SUXI0uu8m7cv7S9_u2NcxIs76DIdbU3061k5fWz_V-J0FX7XYEcOcGXr4Bdc5bmjgGG1OX_ACD2L8FtEQz2890HxnQMBoQMlcyXaVfK4qsiwes481ZxxDWWxninQZvX3dHLQtbIDjWFXu-KUQ3Isybc3K3Fd8eoGJ8lkuy_VDofJ1od3g73_IHg1FpIy1A536C_06kyz4bikH7S0w' SELECT id, note FROM audit;
+----
+1	entry
+
+# the single-role token does not see the auditor grant
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' SELECT id, note FROM audit;
+----
+<REGEX>:.*no access to object.*
+
+# --- negatives -----------------------------------------------------------------------------------
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjk0NjY4NDgwMCwic3ViIjoidTUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.d7QJzBvajOOZ4lrYQuLTFOoIdxTA2FU5laRThD0Kv3Hs4QEsDPRf00GiRsaORa9VQbyBefth45hhWpA8RSCLDX9CRFzVxxOO1ErQ84efuaXd-gvKTvqy9oa17vcL4FzUeYHH2-QbMEQZlXVfZQzvtMeR3WEwkZUJO-yhUYjofZB10aB7eWNg3G7jH0mOL6ZPP4UvOkYorJLiIiYZpt3oLWeUr31_b1e7mx6nhOfOEUPxgam4BAoG90lEIoIFzzPKuAlEYwWbURWJm_DhaS6fd6noCtH4SVqDMZHe8qKk3CRWTLc5WhopwLox754NTD7c6HMZ2N_HRzJB68f3Sk9IuQ' SELECT 1;
+----
+<REGEX>:.*token expired.*
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vb3RoZXIiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU2Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.OnuSba4DTMP-4eoWkzkjljKYoXZ6XphC3ZppxH46GFuJhdpuxxqFEUI0x8yBBBQAzkWGsErjG9Fp1BoW7qfKE60I9hnP-jNKRZlaCeZ4l-NmJaI0um260DXfCrXOD0D4j5PzubkNGjj1aQKJBxKeBpgr6HAHxjW2r85zFyqWnBbvfEt4FSUVfaDYEtXeWun0vimwbJGup2-eL6nVntnqD9-koWf5otvRzNR_tUPHbewLhq8znThK0wLzS5Z7Eel9A8vD-xl3dVpkNZssY6bCTwRFUwlkK4Ko88dbnUu7LiQZ_DVJbMmK2zceymX5aPJHwj56UwcY6Iuq2-yisg42gw' SELECT 1;
+----
+<REGEX>:.*audience not accepted.*
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJldmlsIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' SELECT 1;
+----
+<REGEX>:.*signature verification failed.*
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU3Iiwicm9sZXMiOlsibm9ib2R5Il0sInRpZCI6ImFjbWUifQ.gZPfwbbE49oIa_fSPznV2FnndMLjCf4-BNvdIA4Mw0e0F4J_oPQr5rff8MCil69PNVdFCiNZBMV7R0KUE7wN8C_K4Iss2qJB8g2qkZrEjp8kw3gl11NBbY4HkBtGslOmIoWzmgKByLiErLx6_RLZW9IWRVFZCrdGrHaWHcYikJbBStUgqUxx0CmVl6kRe9o-aqUvYDCtylmwvxgcGUAltIrTu9qxf3zDD4GSNLsbjS0pwz_yXIJoc2kBJRYk_-D64CZAWLp7TpEi7iKw2wc6hGZ32Z_j27-hqPDQOmuJpeb_aJsjYuzLlOaGMiivRdSrKCoIypL_erwaHuHQ7gPu3g' SELECT 1;
+----
+<REGEX>:.*no recognized roles.*
+
+# --- PEM key delivery (same issuer, same token) --------------------------------------------------
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/rs', '-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjps+/RGCObZHYxFmbxIa
+gCg0dZlIifYMV2phhdrLpkrJ8TkoTe/GQK62Nf4Ilh92YUiBofspFfi7+fT937mn
+N1vzVyAKjHCHA4BmnDHHvCea8QdNP0YcxDXsBReZDFx+e8uEqfG+9/uvhLS0HTwT
+qhRKtdlwGDrsSoH4WYnCHI1grvQ8BSo7MivppMTzx7UUWeKieKFMeY3jw+g0Xgdy
+ZKjIOOaXQTX5AeEm/Xq6OjOtq7gVIgmNfogSQIAWFk5iaMzzafzhQmN/d719rEMS
+JClAAnCklwpETEq2jWv5vJUhslPL6ZQPd8jnjVMcOzL8Zy9ed5U9te+EQ0IKnfnp
+ZQIDAQAB
+-----END PUBLIC KEY-----', 'api://acl-test', 'RS256', 'roles', '{"tid": "tenant"}');
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' SELECT count(*) FROM orders;
+----
+2
+
+# ES256 is no longer in the allowlist after the redefinition
+statement error
+ACL TOKEN 'eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3QtZWMifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU5Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.elvvGbeuz66wCWyFtHnu_JxI4JMWTSoGldYSy7UyjHkZB5wybZnL1nCOlqYIzUMIGEozPGOoZ5cSK_9L3K_ddw' SELECT 1;
+----
+<REGEX>:.*not allowed for this issuer.*
+
+# --- HS256 (oct JWK), including the alg allowlist ------------------------------------------------
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/hs', '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}', 'api://acl-test', 'RS256', 'roles', '{"tid": "tenant"}');
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1;
+----
+<REGEX>:.*not allowed for this issuer.*
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/hs', '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}', 'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT count(*) FROM orders;
+----
+2
+
+# --- EntraID-style groups: GUID -> role mapping, and the overage refusal -------------------------
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/rs', '{"keys":[{"kty":"RSA","kid":"test-key","alg":"RS256","n":"jps-_RGCObZHYxFmbxIagCg0dZlIifYMV2phhdrLpkrJ8TkoTe_GQK62Nf4Ilh92YUiBofspFfi7-fT937mnN1vzVyAKjHCHA4BmnDHHvCea8QdNP0YcxDXsBReZDFx-e8uEqfG-9_uvhLS0HTwTqhRKtdlwGDrsSoH4WYnCHI1grvQ8BSo7MivppMTzx7UUWeKieKFMeY3jw-g0XgdyZKjIOOaXQTX5AeEm_Xq6OjOtq7gVIgmNfogSQIAWFk5iaMzzafzhQmN_d719rEMSJClAAnCklwpETEq2jWv5vJUhslPL6ZQPd8jnjVMcOzL8Zy9ed5U9te-EQ0IKnfnpZQ","e":"AQAB"},{"kty":"EC","crv":"P-256","kid":"test-ec","alg":"ES256","x":"DQof67TjKFht1fXEua9TTUBimcYFM1za8A06kBIgCDM","y":"RRJa8uTiLTotv77J3eZC2m3YOQSz_aHIk2mnf_5vwCg"}]}', 'api://acl-test', 'RS256', 'groups', '{"tid": "tenant"}');
+
+statement ok
+SELECT acl_map_role('https://issuer.test/rs', 'group', '9f3a0000-0000-0000-0000-00000000beef', 'analyst');
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUzIiwiZ3JvdXBzIjpbIjlmM2EwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwYmVlZiJdLCJ0aWQiOiJnbG9iZXgifQ.T-kUM0S41C8VXuEr-OFyfwcFJTfa6f_RlFcVZ3PKVF_C_zXm0j_yqQFrJhXGSlCpCmBtcONYF2mfUNpJuwzAOubhBrwawSZ27yvqASsiG_1OtjI_YJ2-HpWzG-xRCsvXaIGY05gnpSaNEJl9fKe7wBEU-0aldizbxgt_DJDfdjH_H0ZOJpJ6b2KbThg3ww6MRB79aSnn-XJhx4I3oreUf98QNtPJqT9hKysSs4KOCjrBLMVNsboKExzqmbBX51vdr1Z3V9-GQjP1_XKxaIzX97ncdt89T-n1no_bC0AwZfVhWKiZUBdCmtKxcMc4C6Mo-FkF2AoNf0HU2rsOScNc7Q' SELECT id, amount FROM orders ORDER BY id;
+----
+2	200
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU0IiwidGlkIjoiYWNtZSIsIl9jbGFpbV9uYW1lcyI6eyJncm91cHMiOiJzcmMxIn0sIl9jbGFpbV9zb3VyY2VzIjp7InNyYzEiOnsiZW5kcG9pbnQiOiJodHRwczovL2dyYXBoLnRlc3QveCJ9fX0.NX_BJPlVxoCSL4NNRGgwFyEmO2eX9zE7RdJO-4eXXQ1XD9Wzgd23c1yYWrTsu_FEf8KOQWZQak1wsynL5RRivKCjo3kGizcTsiQcaBs2MX6raSq_WMC-26klZPaa1dnsiENnWVt4kAoJ1Y9FLmuNDHEWpo4Sls7fWdlkp8RAlXioIjkFKI9O2zxzbhAXttGR0Ni2pId5vxMz1FOACLzrI8SFi-o2kB4za5rQkYyXk1wV4qvO7LMSbycjS9kUC25DpBVdHSgGLC59oLf1a3MA0N0uyQAlwneJXC08Q1o8f7v2TTLroHlU2wCVD_JDeNLO6uw1xreuRjHHcE6UDf8-Xg' SELECT 1;
+----
+<REGEX>:.*groups overage.*
+
+# --- the non-JWT dev stub still works ------------------------------------------------------------
+
+statement ok
+SELECT acl_define_token('tok-legacy', 'analyst', 'tenant=acme');
+
+query I
+ACL TOKEN 'tok-legacy' SELECT count(*) FROM orders;
+----
+2
+
+# --- the issuer registry lives in the catalog too (spec 006 + 007) -------------------------------
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SELECT acl_grant_table('analyst', 'orders', 'phys.main.orders_physical', 'id,amount', 'tenant = acl_claim(''tenant'')', 'select');
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/rs', '{"keys":[{"kty":"RSA","kid":"test-key","alg":"RS256","n":"jps-_RGCObZHYxFmbxIagCg0dZlIifYMV2phhdrLpkrJ8TkoTe_GQK62Nf4Ilh92YUiBofspFfi7-fT937mnN1vzVyAKjHCHA4BmnDHHvCea8QdNP0YcxDXsBReZDFx-e8uEqfG-9_uvhLS0HTwTqhRKtdlwGDrsSoH4WYnCHI1grvQ8BSo7MivppMTzx7UUWeKieKFMeY3jw-g0XgdyZKjIOOaXQTX5AeEm_Xq6OjOtq7gVIgmNfogSQIAWFk5iaMzzafzhQmN_d719rEMSJClAAnCklwpETEq2jWv5vJUhslPL6ZQPd8jnjVMcOzL8Zy9ed5U9te-EQ0IKnfnpZQ","e":"AQAB"},{"kty":"EC","crv":"P-256","kid":"test-ec","alg":"ES256","x":"DQof67TjKFht1fXEua9TTUBimcYFM1za8A06kBIgCDM","y":"RRJa8uTiLTotv77J3eZC2m3YOQSz_aHIk2mnf_5vwCg"}]}', 'api://acl-test', 'RS256,ES256', 'roles', '{"tid": "tenant"}');
+
+query I
+SELECT count(*) FROM aclcat.acl.issuers;
+----
+1
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300

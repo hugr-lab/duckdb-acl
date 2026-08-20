@@ -1,5 +1,6 @@
 #include "acl_policy.hpp"
 
+#include "acl_token.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/parser/parser.hpp"
 
@@ -45,21 +46,26 @@ unique_ptr<ParsedExpression> PolicyStore::InstantiateExpr(const string &expr, co
 }
 
 bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal &out) {
-	{
-		lock_guard<mutex> guard(lock);
-		if (is_token) {
-			// tokens stay in memory until real JWT verification lands (spec 007)
-			auto entry = tokens.find(value);
+	if (is_token) {
+		string issuer;
+		if (LooksLikeJwt(value, issuer)) {
+			// the real path (spec 007): signature + claims against the issuer registry; throws on
+			// failure, so a bad JWT can never fall back to the dev stub below
+			VerifyJwtPrincipal(value, issuer, out);
+		} else {
+			lock_guard<mutex> guard(lock);
+			auto entry = tokens.find(value); // dev stub for non-JWT tokens
 			if (entry == tokens.end()) {
 				return false;
 			}
 			out = entry->second;
-		} else {
-			out.roles = {value};
-			auto claims = role_claims.find(value);
-			if (claims != role_claims.end()) {
-				out.claims = claims->second;
-			}
+		}
+	} else {
+		lock_guard<mutex> guard(lock);
+		out.roles = {value};
+		auto claims = role_claims.find(value);
+		if (claims != role_claims.end()) {
+			out.claims = claims->second;
 		}
 	}
 	if (catalog) {
@@ -67,6 +73,118 @@ bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal 
 		CatalogLoadRoleClaims(out);
 	}
 	return true;
+}
+
+void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out) {
+	IssuerConfig config;
+	if (!LookupIssuer(issuer, config)) {
+		throw BinderException("acl_rewrite: token rejected: unknown issuer \"%s\"", issuer);
+	}
+	auto verified = VerifyJwt(token, config, JwtClockSkew());
+	if (verified.raw_roles.empty() && verified.groups_overage) {
+		throw BinderException("acl_rewrite: token rejected: groups overage - the groups claim was replaced "
+		                      "by a Graph link; resolve groups at the gateway and use the ROLE form");
+	}
+	out.roles = MapExternalRoles(issuer, verified.raw_roles);
+	if (out.roles.empty()) {
+		throw BinderException("acl_rewrite: token rejected: no recognized roles");
+	}
+	out.claims = std::move(verified.claims);
+	// role-default claims of the mapped roles (explicit token claims win); the catalog side is
+	// merged by the caller via CatalogLoadRoleClaims
+	lock_guard<mutex> guard(lock);
+	for (auto &role : out.roles) {
+		auto defaults = role_claims.find(role);
+		if (defaults == role_claims.end()) {
+			continue;
+		}
+		for (auto &claim : defaults->second) {
+			if (!out.claims.count(claim.first)) {
+				out.claims[claim.first] = claim.second;
+			}
+		}
+	}
+}
+
+bool PolicyStore::LookupIssuer(const string &issuer, IssuerConfig &out) {
+	// like every resolver: an enabled catalog is the only source (a stale memory entry must not
+	// shadow the catalog registry)
+	if (catalog) {
+		return CatalogLookupIssuer(issuer, out);
+	}
+	lock_guard<mutex> guard(lock);
+	auto entry = issuers.find(issuer);
+	if (entry == issuers.end()) {
+		return false;
+	}
+	out = entry->second;
+	return true;
+}
+
+vector<string> PolicyStore::MapExternalRoles(const string &issuer, const vector<string> &raw_roles) {
+	case_insensitive_map_t<vector<string>> mapped;
+	case_insensitive_set_t known;
+	if (catalog) {
+		CatalogMapExternalRoles(issuer, raw_roles, mapped, known);
+	}
+	lock_guard<mutex> guard(lock);
+	auto issuer_map = role_mappings.find(issuer);
+	vector<string> roles;
+	case_insensitive_set_t seen;
+	auto add = [&](const string &role) {
+		if (!seen.count(role)) {
+			seen.insert(role);
+			roles.push_back(role);
+		}
+	};
+	for (auto &raw : raw_roles) {
+		bool matched = false;
+		if (issuer_map != role_mappings.end()) {
+			auto entry = issuer_map->second.find(raw);
+			if (entry != issuer_map->second.end()) {
+				for (auto &role : entry->second) {
+					add(role);
+				}
+				matched = true;
+			}
+		}
+		auto catalog_entry = mapped.find(raw);
+		if (catalog_entry != mapped.end()) {
+			for (auto &role : catalog_entry->second) {
+				add(role);
+			}
+			matched = true;
+		}
+		if (matched) {
+			continue;
+		}
+		// unmapped: accept the raw value as an internal role only if that role is actually known -
+		// unknown values are ignored (fail closed via the "no recognized roles" check)
+		if (known.count(raw) || tables.count(raw) || table_functions.count(raw) || scalar_functions.count(raw) ||
+		    role_claims.count(raw)) {
+			add(raw);
+		}
+	}
+	return roles;
+}
+
+void PolicyStore::DefineIssuer(IssuerConfig config) {
+	if (catalog) {
+		CatalogDefineIssuer(config);
+		return;
+	}
+	lock_guard<mutex> guard(lock);
+	issuers[config.issuer] = std::move(config);
+}
+
+void PolicyStore::MapRole(const string &issuer, const string &source, const string &external_value,
+                          const string &role) {
+	if (catalog) {
+		CatalogMapRole(issuer, source, external_value, role);
+		return;
+	}
+	lock_guard<mutex> guard(lock);
+	role_mappings[issuer][external_value].push_back(role);
 }
 
 bool PolicyStore::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {
