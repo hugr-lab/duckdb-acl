@@ -1,0 +1,368 @@
+# name: test/sql/acl_virtual_schemas.test
+# description: virtual schemas as objects of the catalog (spec 014) - one table for both kinds, a
+#   comment of their own, and the rows of a previous version migrating in place
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100), (2, 'globex', 200);
+
+statement ok
+CREATE TABLE phys.main.audit(id INT, note VARCHAR);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN;
+
+# --- a schema is an object, with a comment of its own ---------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.main COMMENT 'raw layer, as-is';
+
+query III
+SELECT path, phys_path, comment FROM aclcat.acl.schemas WHERE vcat = 'sales';
+----
+raw	phys.main	raw layer, as-is
+
+# it still resolves as the live alias it is
+query I
+ACL ROLE "analyst" SELECT count(*) FROM raw.orders_physical;
+----
+2
+
+# a table created physically afterwards is visible at once: that is what "live" means
+statement ok
+CREATE TABLE phys.main.late(id INT);
+
+statement ok
+INSERT INTO phys.main.late VALUES (7);
+
+query I
+ACL ROLE "analyst" SELECT id FROM raw.late;
+----
+7
+
+# --- comments are set and changed like any other object's -----------------------------------------
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL SCHEMA sales.raw IS 'documented';
+
+query I
+SELECT comment FROM aclcat.acl.schemas WHERE path = 'raw';
+----
+documented
+
+# retargeting the schema keeps its comment, exactly as ALTER on a view does (spec 010)
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA sales.raw SET PHYS phys.main;
+
+query II
+SELECT phys_path, comment FROM aclcat.acl.schemas WHERE path = 'raw';
+----
+phys.main	documented
+
+statement error
+ACL ADMIN COMMENT ON VIRTUAL SCHEMA sales.nothere IS 'x';
+----
+<REGEX>:.*schema "sales.nothere" does not exist.*
+
+# --- existence semantics reach schemas too (spec 013) ----------------------------------------------
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.main;
+----
+<REGEX>:.*already exists.*
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA IF NOT EXISTS sales.raw AS phys.main;
+
+query I
+SELECT comment FROM aclcat.acl.schemas WHERE path = 'raw';
+----
+documented
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCHEMA IF EXISTS sales.nothere;
+
+# --- dropping ---------------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.second AS phys.main;
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCHEMA sales.second;
+
+query I
+SELECT count(*) FROM aclcat.acl.schemas WHERE path = 'second';
+----
+0
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM second.orders_physical;
+----
+<REGEX>:.*no access to object.*
+
+# dropping the catalog takes its schemas with it
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG hr;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA hr.people AS phys.main;
+
+statement ok
+ACL ADMIN DROP VIRTUAL CATALOG hr CASCADE;
+
+query I
+SELECT count(*) FROM aclcat.acl.schemas WHERE vcat = 'hr';
+----
+0
+
+# --- FROM: an expansion is a snapshot the admin can edit object by object ---------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.curated FROM phys.main COMMENT 'curated tables';
+
+query III
+SELECT path, phys_path, origin FROM aclcat.acl.schemas WHERE path = 'curated';
+----
+curated	NULL	phys.main
+
+# one record per object the source held, each an alias-form relation of its own
+query II
+SELECT vname, form FROM aclcat.acl.relations WHERE vcat = 'sales' AND origin = 'phys.main' ORDER BY vname;
+----
+curated.audit	alias
+curated.late	alias
+curated.orders_physical	alias
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM curated.orders_physical;
+----
+2
+
+# a single object can be excluded - the whole reason to expand instead of aliasing
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE sales.curated.audit;
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM curated.audit;
+----
+<REGEX>:.*no access to object.*
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM curated.orders_physical;
+----
+2
+
+# --- REFRESH: the source grew ------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE phys.main.appeared(id INT);
+
+statement ok
+INSERT INTO phys.main.appeared VALUES (42);
+
+# ... which the snapshot does not show until asked
+statement error
+ACL ROLE "analyst" SELECT id FROM curated.appeared;
+----
+<REGEX>:.*no access to object.*
+
+query I
+ACL ADMIN SELECT acl_refresh_schema_objects('sales', 'curated');
+----
+1
+
+query I
+ACL ROLE "analyst" SELECT id FROM curated.appeared;
+----
+42
+
+# the excluded object stays excluded: a drop on purpose is not undone by a refresh
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM curated.audit;
+----
+<REGEX>:.*no access to object.*
+
+# a second refresh has nothing to do
+query I
+ACL ADMIN SELECT acl_refresh_schema_objects('sales', 'curated');
+----
+0
+
+# --- REFRESH PRUNE: the source shrank ----------------------------------------------------------------
+
+statement ok
+DROP TABLE phys.main.appeared;
+
+# without PRUNE the record stays (the source may be temporarily unavailable)
+query I
+ACL ADMIN SELECT acl_refresh_schema_objects('sales', 'curated');
+----
+0
+
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA sales.curated REFRESH PRUNE;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vname = 'curated.appeared';
+----
+0
+
+# an admin's own record inside the schema is not pruned: it is theirs, not the expansion's
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.curated.byhand AS phys.main.orders_physical;
+
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA sales.curated REFRESH PRUNE;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vname = 'curated.byhand';
+----
+1
+
+# a view in the source is expanded like a table, and reads through
+statement ok
+CREATE VIEW phys.main.doubled AS SELECT id * 2 AS n FROM phys.main.orders_physical;
+
+query I
+ACL ADMIN SELECT acl_refresh_schema_objects('sales', 'curated');
+----
+1
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM curated.doubled;
+----
+2
+
+# a name the expansion produced is an object like any other, so redefining it needs OR REPLACE
+# (spec 013) - and CREATE means "this object is mine now", so the record leaves the expansion
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE sales.curated.orders_physical AS phys.main.orders_physical COLUMNS (id);
+----
+<REGEX>:.*already exists.*
+
+statement ok
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE sales.curated.orders_physical AS phys.main.orders_physical COLUMNS (id) COMMENT 'mine';
+
+query III
+SELECT form, comment, origin FROM aclcat.acl.relations WHERE vname = 'curated.orders_physical';
+----
+subquery	mine	NULL
+
+# and a refresh leaves it alone: it never rewrites what is already registered
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA sales.curated REFRESH;
+
+query II
+SELECT form, comment FROM aclcat.acl.relations WHERE vname = 'curated.orders_physical';
+----
+subquery	mine
+
+# editing an expanded record keeps it part of the expansion: REFRESH still leaves it alone, and its
+# origin is not silently forgotten
+query I
+SELECT origin FROM aclcat.acl.relations WHERE vname = 'curated.late';
+----
+phys.main
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE sales.curated.late SET COLUMNS (id);
+
+query II
+SELECT form, origin FROM aclcat.acl.relations WHERE vname = 'curated.late';
+----
+subquery	phys.main
+
+# expanding a source that is not there would leave a schema that can never resolve anything
+statement error
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.ghost FROM phys.nosuchschema;
+----
+<REGEX>:.*physical schema "phys.nosuchschema" does not exist.*
+
+query I
+SELECT count(*) FROM aclcat.acl.schemas WHERE path = 'ghost';
+----
+0
+
+# a live alias has nothing to refresh, and says so instead of pretending
+statement error
+ACL ADMIN ALTER VIRTUAL SCHEMA sales.raw REFRESH;
+----
+<REGEX>:.*live alias, so it has nothing to refresh.*
+
+# --- dropping an expanded schema takes its records only with CASCADE --------------------------------
+
+statement error
+ACL ADMIN DROP VIRTUAL SCHEMA sales.curated;
+----
+<REGEX>:.*still holds .* object.*repeat with CASCADE.*
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCHEMA sales.curated CASCADE;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'sales' AND substr(vname, 1, 8) = 'curated.';
+----
+0
+
+# --- a catalog written by the previous version keeps resolving --------------------------------------
+# the alias rows lived in acl.schema_aliases; init migrates them into acl.schemas in place
+
+statement ok
+ATTACH ':memory:' AS oldcat;
+
+statement ok
+CREATE SCHEMA oldcat.acl;
+
+statement ok
+CREATE TABLE oldcat.acl.schema_aliases(vcat VARCHAR, alias_path VARCHAR, phys_path VARCHAR, PRIMARY KEY (vcat, alias_path));
+
+statement ok
+INSERT INTO oldcat.acl.schema_aliases VALUES ('sales', 'legacy', 'phys.main');
+
+statement ok
+SELECT acl_use_db('oldcat', 'acl', true);
+
+query II
+SELECT path, phys_path FROM oldcat.acl.schemas WHERE path = 'legacy';
+----
+legacy	phys.main
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE ROLE reader;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE reader WITH (select) MAIN;
+
+query I
+ACL ROLE "reader" SELECT count(*) FROM legacy.orders_physical;
+----
+2

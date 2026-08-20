@@ -249,12 +249,49 @@ void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &resu
 		auto alias = RequiredArg(args, 1, row, "acl_add_schema_alias", "alias path");
 		auto phys = RequiredArg(args, 2, row, "acl_add_schema_alias", "phys path");
 		auto &store = StoreOf(state);
-		if (!AllowWrite(store, vcat, alias, "schema", OptionalArg(args, 3, row, ""))) {
+		if (!AllowWrite(store, vcat, alias, "schema", OptionalArg(args, 4, row, ""))) {
 			continue;
 		}
 		store.CatalogAddSchemaAlias(vcat, alias, phys);
+		SetInlineComment(store, vcat, alias, "schema", OptionalArg(args, 3, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_expand_schema(vcat, path, phys_path[, comment, mode]): register one virtual record per object
+//! the physical schema holds right now (spec 014)
+void AclExpandSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_expand_schema", "catalog");
+		auto path = RequiredArg(args, 1, row, "acl_expand_schema", "schema path");
+		auto phys = RequiredArg(args, 2, row, "acl_expand_schema", "phys path");
+		auto &store = StoreOf(state);
+		if (!AllowWrite(store, vcat, path, "schema", OptionalArg(args, 4, row, ""))) {
+			continue;
+		}
+		store.CatalogExpandSchema(vcat, path, phys);
+		SetInlineComment(store, vcat, path, "schema", OptionalArg(args, 3, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_refresh_schema_objects(vcat, path[, prune]): re-read an expansion's source; returns how many
+//! records were added (and, with prune, removed)
+void AclRefreshSchemaObjectsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	vector<Value> counts;
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_refresh_schema_objects", "catalog");
+		auto path = RequiredArg(args, 1, row, "acl_refresh_schema_objects", "schema path");
+		bool prune = false;
+		if (args.ColumnCount() > 2) {
+			auto value = args.GetValue(2, row);
+			prune = !value.IsNull() && value.GetValue<bool>();
+		}
+		counts.push_back(Value::BIGINT(StoreOf(state).CatalogRefreshSchemaObjects(vcat, path, prune)));
+	}
+	for (idx_t row = 0; row < args.size(); row++) {
+		result.SetValue(row, counts[row]);
+	}
 }
 
 void AddFunction(DataChunk &args, ExpressionState &state, Vector &result, const char *what, const char *kind,
@@ -641,8 +678,13 @@ void AclDropSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &res
 		auto vcat = RequiredArg(args, 0, row, "acl_drop_schema_alias", "catalog");
 		auto alias = RequiredArg(args, 1, row, "acl_drop_schema_alias", "alias path");
 		auto &store = StoreOf(state);
+		bool cascade = false;
+		if (args.ColumnCount() > 3) {
+			auto value = args.GetValue(3, row);
+			cascade = !value.IsNull() && value.GetValue<bool>();
+		}
 		if (AllowDrop(store, vcat, alias, "schema", OptionalArg(args, 2, row, ""))) {
-			store.CatalogDropSchemaAlias(vcat, alias);
+			store.CatalogDropSchemaAlias(vcat, alias, cascade);
 		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -816,7 +858,8 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_add_relation", {{v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
 	                   AclAddRelationFunc);
 	register_admin_set("acl_add_view", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}}, AclAddViewFunc);
-	register_admin_set("acl_add_schema_alias", {{v, v, v}, {v, v, v, v}}, AclAddSchemaAliasFunc);
+	register_admin_set("acl_add_schema_alias", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclAddSchemaAliasFunc);
+	register_admin_set("acl_expand_schema", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclExpandSchemaFunc);
 	register_admin_set("acl_add_table_function",
 	                   {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
 	                   AclAddTableFunctionFunc);
@@ -834,7 +877,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_comment", {{v, v, v, v, v}}, AclCommentFunc);
 	// DROP of the remaining elements (spec 010)
 	register_admin_set("acl_drop_catalog", {{v}, {v, b}, {v, b, v}}, AclDropCatalogFunc);
-	register_admin_set("acl_drop_schema_alias", {{v, v}, {v, v, v}}, AclDropSchemaAliasFunc);
+	register_admin_set("acl_drop_schema_alias", {{v, v}, {v, v, v}, {v, v, v, b}}, AclDropSchemaAliasFunc);
 	register_admin_set("acl_drop_function", {{v, v, v}, {v, v, v, v}}, AclDropFunctionFunc);
 	register_admin_set("acl_drop_role", {{v}, {v, v}}, AclDropRoleFunc);
 	register_admin_set("acl_drop_issuer", {{v}, {v, v}}, AclDropIssuerFunc);
@@ -848,6 +891,15 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	};
 	register_refresh({v});
 	register_refresh({v, v});
+	// re-read an expansion's source (spec 014); returns how many records were added or removed
+	auto register_refresh_objects = [&](vector<LogicalType> arguments) {
+		ScalarFunction function(Identifier("acl_refresh_schema_objects"), std::move(arguments), LogicalType::BIGINT,
+		                        AclRefreshSchemaObjectsFunc);
+		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+		loader.RegisterFunction(function);
+	};
+	register_refresh_objects({v, v});
+	register_refresh_objects({v, v, b});
 	// original stubs / compatibility wrappers
 	register_admin("acl_grant_table", {v, v, v, v, v, v}, AclGrantTableFunc);
 	register_admin("acl_grant_view", {v, v, v}, AclGrantViewFunc);

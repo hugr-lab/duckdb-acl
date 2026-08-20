@@ -56,3 +56,4 @@ specs are the shareable distillation of that work.
 | [011](011-grant-policy/spec.md) | per-grant policy — one object, different slices per role | implemented |
 | [012](012-function-select-gate/spec.md) | the `select` capability gates virtual function calls | implemented |
 | [013](013-unified-ddl-syntax/spec.md) | one DDL syntax for the virtual catalog | implemented |
+| [014](014-virtual-schemas/spec.md) | virtual schemas as objects — alias, expansion, refresh | implemented |
