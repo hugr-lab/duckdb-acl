@@ -54,3 +54,4 @@ specs are the shareable distillation of that work.
 | [009](009-admin-scopes/spec.md) | ACL administration scopes (god mode by grant) | implemented |
 | [010](010-catalog-ops-surface/spec.md) | operating the virtual catalog — DROP, metadata, introspection | in progress |
 | [011](011-grant-policy/spec.md) | per-grant policy — one object, different slices per role | implemented |
+| [012](012-function-select-gate/spec.md) | the `select` capability gates virtual function calls | implemented |

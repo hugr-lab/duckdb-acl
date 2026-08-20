@@ -224,6 +224,26 @@ case_insensitive_set_t ParseCaps(const string &json) {
 	return caps;
 }
 
+//! The capabilities of one grant row. An *absent* value (NULL, or the empty string a driver returns
+//! for "not specified") means **every data capability**: a source that hands out a catalog without
+//! saying what may be done with it has already made the access decision, and the caps are how that
+//! decision is narrowed. An explicit `{}` is the opposite - "no capabilities" - so the two are never
+//! conflated. `manage` is never part of the default: administering the ACL is granted explicitly and
+//! only explicitly (spec 009).
+case_insensitive_set_t EffectiveCaps(const Value &stored) {
+	auto text = stored.IsNull() ? string() : stored.ToString();
+	auto trimmed = text;
+	StringUtil::Trim(trimmed);
+	if (!trimmed.empty()) {
+		return ParseCaps(text);
+	}
+	case_insensitive_set_t caps;
+	for (auto capability : {"select", "insert", "update", "delete", "merge"}) {
+		caps.insert(capability);
+	}
+	return caps;
+}
+
 //! Parse a flat JSON object of string values ({"slot": "function_name", ...})
 case_insensitive_map_t<string> ParseStringMap(const string &json) {
 	case_insensitive_map_t<string> map;
@@ -598,7 +618,10 @@ struct CatalogBackend {
 	}
 	//! the caps column of a resolution query; without an object_caps source there is no override
 	string CapsExpr() {
-		return HasObjectCaps() ? "coalesce(oc.\"caps\", g.\"caps\")" : "g.\"caps\"";
+		// nullif over the trimmed value: an object row that says nothing about capabilities - NULL,
+		// empty or blank - falls back to the catalog grant instead of replacing it, because
+		// "unspecified" is not "none" (spec 012)
+		return HasObjectCaps() ? "coalesce(nullif(trim(oc.\"caps\"), ''), g.\"caps\")" : "g.\"caps\"";
 	}
 	//! The grant chain's policy columns (spec 011): the catalog grant's and the object grant's own RLS
 	//! and column list. The function-driver's slots do not carry them, so it composes to no narrowing.
@@ -723,7 +746,7 @@ struct CatalogBackend {
 				break; // ordered by prio; the losing interpretation starts here
 			}
 			auto caps = result->GetValue(4, row);
-			for (auto &cap : ParseCaps(caps.IsNull() ? string() : caps.ToString())) {
+			for (auto &cap : EffectiveCaps(caps)) {
 				out.caps.insert(cap);
 			}
 			grants.Add(RowPolicy(*result, row, 5));
@@ -855,7 +878,7 @@ struct CatalogBackend {
 				continue;
 			}
 			auto caps = result->GetValue(3, row);
-			for (auto &cap : ParseCaps(caps.IsNull() ? string() : caps.ToString())) {
+			for (auto &cap : EffectiveCaps(caps)) {
 				out.caps.insert(cap);
 			}
 			grants.Add(RowPolicy(*result, row, 4));
@@ -889,8 +912,8 @@ struct CatalogBackend {
 		                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
 		                                       " AND oc.\"vname\" = f.\"vname\""
 		                                 : string();
-		auto sql = GrantsCte(principal) + "SELECT f.\"vcat\", f.\"form\", f.\"target\", f.\"template\", " +
-		           GrantPolicyExprs() +
+		auto sql = GrantsCte(principal) + "SELECT f.\"vcat\", f.\"form\", f.\"target\", f.\"template\", " + CapsExpr() +
+		           " AS caps, " + GrantPolicyExprs() +
 		           ","
 		           " CASE WHEN " +
 		           qualified_cond +
@@ -908,18 +931,23 @@ struct CatalogBackend {
 			auto form = result->GetValue(1, 0).ToString();
 			auto target = result->GetValue(2, 0);
 			auto template_sql = result->GetValue(3, 0);
-			auto prio = result->GetValue(8, 0).GetValue<int64_t>();
+			auto prio = result->GetValue(9, 0).GetValue<int64_t>();
 			policy.subquery_form = form != "alias";
 			policy.phys = target.IsNull() ? string() : target.ToString();
 			policy.query = template_sql.IsNull() ? string() : template_sql.ToString();
-			// rows of the same winning function differ only by role: union their grant policies
+			// rows of the same winning function differ only by role: union their caps (spec 012 - a
+			// call is a read, so it needs one) and their grant policies
 			GrantUnion grants;
 			for (idx_t row = 0; row < result->RowCount(); row++) {
-				if (result->GetValue(8, row).GetValue<int64_t>() != prio ||
+				if (result->GetValue(9, row).GetValue<int64_t>() != prio ||
 				    result->GetValue(0, row).ToString() != vcat) {
 					continue;
 				}
-				grants.Add(RowPolicy(*result, row, 4));
+				auto caps = result->GetValue(4, row);
+				for (auto &cap : EffectiveCaps(caps)) {
+					policy.caps.insert(cap);
+				}
+				grants.Add(RowPolicy(*result, row, 5));
 			}
 			ApplyFunctionGrantPolicy(vname, table_kind, grants, policy);
 		}
@@ -1947,7 +1975,7 @@ void PolicyStore::CatalogAlterGrant(const string &role, const string &vcat, cons
 		auto stored = current->GetValue(column, 0);
 		return stored.IsNull() ? string() : stored.ToString();
 	};
-	string caps = current->GetValue(1, 0).IsNull() ? string("{}") : text(1);
+	string caps = text(1); // NULL stays unspecified rather than becoming an explicit "{}"
 	string rls = text(2);
 	string columns = text(3);
 	if (field == "caps") {
