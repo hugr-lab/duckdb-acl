@@ -1,0 +1,89 @@
+# name: test/sql/integration/acl_catalog_postgres.test
+# description: catalog-backed policy store over a live PostgreSQL catalog (spec 006) - the managed
+#   schema is created through the scanner, policy resolves from it, enforcement runs over the same
+#   live source
+# group: [integration]
+
+require acl
+
+require postgres_scanner
+
+require-env ACL_PG_DSN
+
+statement ok
+ATTACH '${ACL_PG_DSN}' AS pg (TYPE postgres);
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+# the policy catalog lives in the postgres container itself (schema init through the scanner)
+statement ok
+SELECT acl_use_db('pg', 'acl', true);
+
+# rebuild the policy from scratch so reruns stay deterministic (the catalog db persists)
+statement ok
+SELECT acl_revoke_catalog('analyst', 'live');
+
+statement ok
+SELECT acl_drop_relation('live', 'orders');
+
+statement ok
+SELECT acl_drop_relation('live', 'audit');
+
+statement ok
+SELECT acl_create_catalog('live', 'policy for the live postgres fixture');
+
+statement ok
+SELECT acl_add_relation('live', 'orders', 'pg.public.orders', 'id,amount', 'tenant = acl_claim(''tenant'')');
+
+statement ok
+SELECT acl_add_relation('live', 'audit', 'pg.public.audit_log', '', '');
+
+statement ok
+SELECT acl_add_schema_alias('live', 'raw', 'pg.public');
+
+statement ok
+SELECT acl_grant_catalog('analyst', 'live', '{"select": true, "insert": true, "delete": true}', true);
+
+statement ok
+SELECT acl_define_role('analyst', 'tenant=acme');
+
+# policy persisted in postgres, enforcement over the postgres fixture
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM raw.employees;
+----
+2
+
+statement ok
+ACL ROLE "analyst" INSERT INTO audit VALUES (100, 'from-catalog-test');
+
+query II
+ACL ROLE "analyst" SELECT id, note FROM audit;
+----
+100	from-catalog-test
+
+statement ok
+ACL ROLE "analyst" DELETE FROM audit WHERE id = 100;
+
+# physical names and unknown names stay refused; readers stay gated
+statement error
+ACL ROLE "analyst" SELECT * FROM pg.public.orders;
+----
+<REGEX>:.*no access to object.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM postgres_query('pg', 'SELECT 1');
+----
+<REGEX>:.*not allowed.*
+
+# the managed schema is plainly visible in the catalog database
+query I
+SELECT count(*) > 0 FROM pg.acl.relations WHERE vcat = 'live';
+----
+true

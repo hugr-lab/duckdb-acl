@@ -319,7 +319,7 @@ private:
 			return;
 		}
 		// not a virtual table function: gate by name, then rewrite arguments and any subquery argument
-		if (!store.FunctionAllowed(function.GetQualifiedName())) {
+		if (!store.FunctionAllowed(principal, function.GetQualifiedName())) {
 			Deny("table function \"" + vname + "\" is not allowed");
 		}
 		RewriteFunctionArgs(function);
@@ -450,7 +450,7 @@ private:
 				return; // handled: do not re-gate or re-recurse
 			}
 			// otherwise route it through the resolver seam (default-allow, deny readers)
-			if (!store.FunctionAllowed(function.GetQualifiedName())) {
+			if (!store.FunctionAllowed(principal, function.GetQualifiedName())) {
 				Deny("function \"" + name + "\" is not allowed");
 			}
 		}

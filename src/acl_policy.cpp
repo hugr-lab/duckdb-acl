@@ -45,36 +45,58 @@ unique_ptr<ParsedExpression> PolicyStore::InstantiateExpr(const string &expr, co
 }
 
 bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal &out) {
-	lock_guard<mutex> guard(lock);
-	if (is_token) {
-		auto entry = tokens.find(value);
-		if (entry == tokens.end()) {
-			return false;
+	{
+		lock_guard<mutex> guard(lock);
+		if (is_token) {
+			// tokens stay in memory until real JWT verification lands (spec 007)
+			auto entry = tokens.find(value);
+			if (entry == tokens.end()) {
+				return false;
+			}
+			out = entry->second;
+		} else {
+			out.roles = {value};
+			auto claims = role_claims.find(value);
+			if (claims != role_claims.end()) {
+				out.claims = claims->second;
+			}
 		}
-		out = entry->second;
-		return true;
 	}
-	out.role = value;
-	auto claims = role_claims.find(value);
-	if (claims != role_claims.end()) {
-		out.claims = claims->second;
+	if (catalog) {
+		// merge catalog-side default claims of the principal's roles (explicit claims win)
+		CatalogLoadRoleClaims(out);
 	}
 	return true;
 }
 
 bool PolicyStore::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {
+	if (catalog) {
+		return CatalogResolveTable(principal, vname, out);
+	}
 	return Resolve(tables, principal, vname, out);
 }
 
 bool PolicyStore::ResolveTableFunction(const Principal &principal, const string &vname, TablePolicy &out) {
+	if (catalog) {
+		return CatalogResolveFunction(principal, vname, true, out);
+	}
 	return Resolve(table_functions, principal, vname, out);
 }
 
 bool PolicyStore::ResolveScalarFunction(const Principal &principal, const string &vname, TablePolicy &out) {
+	if (catalog) {
+		return CatalogResolveFunction(principal, vname, false, out);
+	}
 	return Resolve(scalar_functions, principal, vname, out);
 }
 
-bool PolicyStore::FunctionAllowed(const QualifiedName &name) {
+bool PolicyStore::FunctionAllowed(const Principal &principal, const QualifiedName &name) {
+	if (catalog) {
+		bool allowed;
+		if (CatalogFunctionGate(principal, name, allowed)) {
+			return allowed;
+		}
+	}
 	lock_guard<mutex> guard(lock);
 	return denied_functions.count(name.Name().GetIdentifierName()) == 0;
 }
@@ -82,16 +104,18 @@ bool PolicyStore::FunctionAllowed(const QualifiedName &name) {
 bool PolicyStore::Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space,
                           const Principal &principal, const string &vname, TablePolicy &out) {
 	lock_guard<mutex> guard(lock);
-	auto role_entry = space.find(principal.role);
-	if (role_entry == space.end()) {
-		return false;
+	for (auto &role : principal.roles) {
+		auto role_entry = space.find(role);
+		if (role_entry == space.end()) {
+			continue;
+		}
+		auto entry = role_entry->second.find(vname);
+		if (entry != role_entry->second.end()) {
+			out = entry->second;
+			return true;
+		}
 	}
-	auto entry = role_entry->second.find(vname);
-	if (entry == role_entry->second.end()) {
-		return false;
-	}
-	out = entry->second;
-	return true;
+	return false;
 }
 
 } // namespace acl

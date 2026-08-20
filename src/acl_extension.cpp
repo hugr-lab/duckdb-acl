@@ -49,6 +49,12 @@ void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 
+	// bounded staleness of the catalog-backed policy (spec 006): the policy_version is re-read at
+	// most once per this many milliseconds; 0 = check on every batch
+	config.AddExtensionOption("acl_version_check_interval",
+	                          "acl: milliseconds between policy_version checks of the policy catalog",
+	                          LogicalType::BIGINT, Value::BIGINT(1000));
+
 	// one policy store per database instance, shared by the parser override and the admin functions
 	auto store = make_shared_ptr<acl::PolicyStore>();
 	acl::RegisterAclParser(config, store);

@@ -4,6 +4,8 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
@@ -14,6 +16,10 @@ namespace {
 //! Retrieve the policy store attached to the currently-executing admin setup function
 PolicyStore &StoreOf(ExpressionState &state) {
 	return *state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<AclScalarInfo>().store;
+}
+
+DatabaseInstance &DbOf(ExpressionState &state) {
+	return *state.GetContext().db;
 }
 
 string Trimmed(string value) {
@@ -44,46 +50,215 @@ case_insensitive_map_t<string> ParseClaims(const string &csv) {
 	return claims;
 }
 
+//! cols_csv items are `name` or `name=expr`; returned as (name, expr) pairs (empty expr = plain)
+vector<std::pair<string, string>> ParseColumns(const string &csv) {
+	vector<std::pair<string, string>> columns;
+	for (auto &item : SplitCsv(csv)) {
+		auto pos = item.find('=');
+		if (pos == string::npos) {
+			columns.emplace_back(item, string());
+		} else {
+			columns.emplace_back(Trimmed(item.substr(0, pos)), Trimmed(item.substr(pos + 1)));
+		}
+	}
+	return columns;
+}
+
+//! The old grant functions carry caps as a csv list; the catalog stores a JSON object
+string CapsCsvToJson(const vector<string> &caps) {
+	vector<string> items;
+	for (auto &cap : caps) {
+		items.push_back("\"" + StringUtil::Lower(cap) + "\": true");
+	}
+	return "{" + StringUtil::Join(items, ", ") + "}";
+}
+
+string RequiredArg(DataChunk &args, idx_t col, idx_t row, const char *what, const char *name) {
+	auto value = args.GetValue(col, row);
+	if (value.IsNull()) {
+		throw InvalidInputException("%s: %s must not be NULL", what, name);
+	}
+	return value.ToString();
+}
+
+string OptionalArg(DataChunk &args, idx_t col, idx_t row, const string &fallback) {
+	if (col >= args.ColumnCount()) {
+		return fallback;
+	}
+	auto value = args.GetValue(col, row);
+	return value.IsNull() ? fallback : value.ToString();
+}
+
+//===--------------------------------------------------------------------===//
+// Catalog backend control + catalog-model admin functions (spec 006)
+//===--------------------------------------------------------------------===//
+
+//! acl_use_db(db_name [, schema [, init]]): switch the store to the catalog backend reading policy
+//! from the ATTACHed database; init=true creates/migrates the managed schema first.
+void AclUseDbFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto db_name = RequiredArg(args, 0, row, "acl_use_db", "database name");
+		auto schema = OptionalArg(args, 1, row, "acl");
+		bool init = false;
+		if (args.ColumnCount() > 2) {
+			auto value = args.GetValue(2, row);
+			init = !value.IsNull() && value.GetValue<bool>();
+		}
+		StoreOf(state).EnableCatalog(DbOf(state), db_name, schema, init);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_create_catalog(vcat [, comment]): register a virtual catalog (a shared tree of virtual names)
+void AclCreateCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_create_catalog", "catalog");
+		StoreOf(state).CatalogCreate(vcat, OptionalArg(args, 1, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_add_relation(vcat, vname, phys, cols_csv, rls): define a relation inside a virtual catalog;
+//! no columns and no RLS -> a writable alias (RENAME), otherwise a read-only subquery
+void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_add_relation", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_add_relation", "name");
+		auto phys = RequiredArg(args, 2, row, "acl_add_relation", "phys");
+		auto columns = ParseColumns(OptionalArg(args, 3, row, ""));
+		auto rls = OptionalArg(args, 4, row, "");
+		auto form = columns.empty() && rls.empty() ? "alias" : "subquery";
+		StoreOf(state).CatalogAddRelation(vcat, vname, form, phys, "", rls, columns);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_add_view(vcat, vname, select_sql): a virtual view (full SQL definition, read-only)
+void AclAddViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_add_view", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_add_view", "name");
+		auto sql = RequiredArg(args, 2, row, "acl_add_view", "SQL");
+		StoreOf(state).CatalogAddRelation(vcat, vname, "view", "", sql, "", {});
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_add_schema_alias(vcat, alias_path, phys_path): expose a whole physical schema under a virtual
+//! prefix; any name below it RENAMEs in place, existence is the binder's business
+void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_add_schema_alias", "catalog");
+		auto alias = RequiredArg(args, 1, row, "acl_add_schema_alias", "alias path");
+		auto phys = RequiredArg(args, 2, row, "acl_add_schema_alias", "phys path");
+		StoreOf(state).CatalogAddSchemaAlias(vcat, alias, phys);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AddFunction(DataChunk &args, ExpressionState &state, Vector &result, const char *what, const char *kind,
+                 const char *form) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, what, "catalog");
+		auto vname = RequiredArg(args, 1, row, what, "name");
+		auto definition = RequiredArg(args, 2, row, what, "definition");
+		bool is_alias = string(form) == "alias";
+		StoreOf(state).CatalogAddFunction(vcat, vname, kind, form, is_alias ? definition : "",
+		                                  is_alias ? "" : definition);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_add_table_function(vcat, vname, sql_template) / _alias(vcat, vname, target)
+void AclAddTableFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AddFunction(args, state, result, "acl_add_table_function", "table", "macro");
+}
+void AclAddTableFunctionAliasFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AddFunction(args, state, result, "acl_add_table_function_alias", "table", "alias");
+}
+//! acl_add_scalar(vcat, vname, expr_template) / _alias(vcat, vname, target)
+void AclAddScalarCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AddFunction(args, state, result, "acl_add_scalar", "scalar", "macro");
+}
+void AclAddScalarAliasCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AddFunction(args, state, result, "acl_add_scalar_alias", "scalar", "alias");
+}
+
+//! acl_grant_catalog(role, vcat, caps_json, is_main): grant a virtual catalog to a role
+void AclGrantCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = RequiredArg(args, 0, row, "acl_grant_catalog", "role");
+		auto vcat = RequiredArg(args, 1, row, "acl_grant_catalog", "catalog");
+		auto caps = OptionalArg(args, 2, row, "{}");
+		bool is_main = false;
+		if (args.ColumnCount() > 3) {
+			auto value = args.GetValue(3, row);
+			is_main = !value.IsNull() && value.GetValue<bool>();
+		}
+		StoreOf(state).CatalogGrant(role, vcat, caps, is_main);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclRevokeCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = RequiredArg(args, 0, row, "acl_revoke_catalog", "role");
+		auto vcat = RequiredArg(args, 1, row, "acl_revoke_catalog", "catalog");
+		StoreOf(state).CatalogRevoke(role, vcat);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclDropRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_drop_relation", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_drop_relation", "name");
+		StoreOf(state).CatalogDropRelation(vcat, vname);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//===--------------------------------------------------------------------===//
+// Original admin functions; with a catalog enabled they become compatibility wrappers writing the
+// same content into the implicit virtual catalog 'default' (per-object caps preserved, spec 006)
+//===--------------------------------------------------------------------===//
+
 //! acl_grant_table(role, vname, phys, cols_csv, rls, caps_csv): register a virtual-table policy.
 //! cols_csv items are `name` or `name=expr` (expr masks/renames as `expr AS name`); denied columns
 //! are simply omitted. caps_csv is a comma list of {select,insert,update,delete,merge}.
 void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = args.GetValue(0, row);
-		auto vname = args.GetValue(1, row);
-		auto phys = args.GetValue(2, row);
-		if (role.IsNull() || vname.IsNull() || phys.IsNull()) {
-			throw InvalidInputException("acl_grant_table: role, name and phys must not be NULL");
-		}
-		TablePolicy policy;
-		policy.phys = phys.ToString();
-		auto cols = args.GetValue(3, row);
-		for (auto &item : SplitCsv(cols.IsNull() ? string() : cols.ToString())) {
-			auto pos = item.find('=');
-			if (pos == string::npos) {
-				policy.projection.push_back(item);
-			} else {
-				auto name = Trimmed(item.substr(0, pos));
-				auto expr = Trimmed(item.substr(pos + 1));
-				policy.projection.push_back(expr + " AS " + name);
-			}
-		}
-		auto rls = args.GetValue(4, row);
-		policy.rls = rls.IsNull() ? string() : rls.ToString();
-		// no projection and no RLS: expose the physical table as-is via RENAME (writable); otherwise a
-		// read-only SUBQUERY (masking / computed columns / RLS need a wrapping subquery)
-		policy.subquery_form = !policy.projection.empty() || !policy.rls.empty();
-		auto caps = args.GetValue(5, row);
-		auto cap_list = SplitCsv(caps.IsNull() ? string("select") : caps.ToString());
+		auto role = RequiredArg(args, 0, row, "acl_grant_table", "role");
+		auto vname = RequiredArg(args, 1, row, "acl_grant_table", "name");
+		auto phys = RequiredArg(args, 2, row, "acl_grant_table", "phys");
+		auto columns = ParseColumns(OptionalArg(args, 3, row, ""));
+		auto rls = OptionalArg(args, 4, row, "");
+		auto cap_list = SplitCsv(OptionalArg(args, 5, row, "select"));
 		if (cap_list.empty()) {
 			cap_list.push_back("select");
 		}
+		auto &store = StoreOf(state);
+		if (store.CatalogEnabled()) {
+			auto form = columns.empty() && rls.empty() ? "alias" : "subquery";
+			store.CatalogEnsureGrant(role, "default", true);
+			store.CatalogAddRelation("default", vname, form, phys, "", rls, columns);
+			store.CatalogSetObjectCaps(role, "default", vname, CapsCsvToJson(cap_list));
+			continue;
+		}
+		TablePolicy policy;
+		policy.phys = phys;
+		for (auto &column : columns) {
+			policy.projection.push_back(column.second.empty() ? column.first : column.second + " AS " + column.first);
+		}
+		policy.rls = rls;
+		// no projection and no RLS: expose the physical table as-is via RENAME (writable); otherwise a
+		// read-only SUBQUERY (masking / computed columns / RLS need a wrapping subquery)
+		policy.subquery_form = !policy.projection.empty() || !policy.rls.empty();
 		for (auto &cap : cap_list) {
 			policy.caps.insert(StringUtil::Lower(cap));
 		}
-		auto &store = StoreOf(state);
 		lock_guard<mutex> guard(store.lock);
-		store.tables[role.ToString()][vname.ToString()] = std::move(policy);
+		store.tables[role][vname] = std::move(policy);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -92,148 +267,118 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 //! The SQL may contain acl_claim('<name>') markers; they are baked to constants at rewrite time.
 void AclGrantViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = args.GetValue(0, row);
-		auto vname = args.GetValue(1, row);
-		auto sql = args.GetValue(2, row);
-		if (role.IsNull() || vname.IsNull() || sql.IsNull()) {
-			throw InvalidInputException("acl_grant_view: role, name and SQL must not be NULL");
+		auto role = RequiredArg(args, 0, row, "acl_grant_view", "role");
+		auto vname = RequiredArg(args, 1, row, "acl_grant_view", "name");
+		auto sql = RequiredArg(args, 2, row, "acl_grant_view", "SQL");
+		auto &store = StoreOf(state);
+		if (store.CatalogEnabled()) {
+			store.CatalogEnsureGrant(role, "default", true);
+			store.CatalogAddRelation("default", vname, "view", "", sql, "", {});
+			store.CatalogSetObjectCaps(role, "default", vname, "{\"select\": true}");
+			continue;
 		}
 		TablePolicy policy;
 		policy.subquery_form = true; // a view is always a read-only SUBQUERY
-		policy.query = sql.ToString();
+		policy.query = sql;
 		policy.caps.insert("select");
-		auto &store = StoreOf(state);
 		lock_guard<mutex> guard(store.lock);
-		store.tables[role.ToString()][vname.ToString()] = std::move(policy);
+		store.tables[role][vname] = std::move(policy);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void GrantFunctionWrapper(DataChunk &args, ExpressionState &state, Vector &result, const char *what, const char *kind,
+                          bool is_alias,
+                          case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> PolicyStore::*space) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = RequiredArg(args, 0, row, what, "role");
+		auto vname = RequiredArg(args, 1, row, what, "name");
+		auto definition = RequiredArg(args, 2, row, what, "definition");
+		auto &store = StoreOf(state);
+		if (store.CatalogEnabled()) {
+			store.CatalogEnsureGrant(role, "default", true);
+			store.CatalogAddFunction("default", vname, kind, is_alias ? "alias" : "macro", is_alias ? definition : "",
+			                         is_alias ? "" : definition);
+			continue;
+		}
+		TablePolicy policy;
+		policy.subquery_form = !is_alias;
+		if (is_alias) {
+			policy.phys = definition;
+		} else {
+			policy.query = definition;
+			policy.caps.insert("select");
+		}
+		lock_guard<mutex> guard(store.lock);
+		(store.*space)[role][vname] = std::move(policy);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
 //! acl_grant_table_function(role, vname, sql_template): a virtual table function whose SQL is expanded
-//! as a read-only subquery. The template refers to call arguments as acl_arg(1), acl_arg(2), ... and
-//! may carry RLS via acl_claim('<name>').
+//! as a read-only subquery; arguments via acl_arg(n), RLS via acl_claim('<name>').
 void AclGrantTableFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = args.GetValue(0, row);
-		auto vname = args.GetValue(1, row);
-		auto sql = args.GetValue(2, row);
-		if (role.IsNull() || vname.IsNull() || sql.IsNull()) {
-			throw InvalidInputException("acl_grant_table_function: role, name and SQL must not be NULL");
-		}
-		TablePolicy policy;
-		policy.subquery_form = true;
-		policy.query = sql.ToString();
-		policy.caps.insert("select");
-		auto &store = StoreOf(state);
-		lock_guard<mutex> guard(store.lock);
-		store.table_functions[role.ToString()][vname.ToString()] = std::move(policy);
-	}
-	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+	GrantFunctionWrapper(args, state, result, "acl_grant_table_function", "table", false,
+	                     &PolicyStore::table_functions);
 }
 
-//! acl_grant_table_function_alias(role, vname, phys_function): a virtual table function that is just an
-//! alias of a physical/system table function; the call is retargeted in place, arguments kept as-is.
+//! acl_grant_table_function_alias(role, vname, phys_function): retarget the call in place
 void AclGrantTableFunctionAliasFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = args.GetValue(0, row);
-		auto vname = args.GetValue(1, row);
-		auto phys = args.GetValue(2, row);
-		if (role.IsNull() || vname.IsNull() || phys.IsNull()) {
-			throw InvalidInputException("acl_grant_table_function_alias: role, name and phys must not be NULL");
-		}
-		TablePolicy policy;
-		policy.subquery_form = false;
-		policy.phys = phys.ToString();
-		auto &store = StoreOf(state);
-		lock_guard<mutex> guard(store.lock);
-		store.table_functions[role.ToString()][vname.ToString()] = std::move(policy);
-	}
-	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+	GrantFunctionWrapper(args, state, result, "acl_grant_table_function_alias", "table", true,
+	                     &PolicyStore::table_functions);
 }
 
-//! acl_grant_scalar(role, vname, expr_template): a virtual scalar function replaced by an expression.
-//! The template refers to call arguments as acl_arg(1), acl_arg(2), ... and may use acl_claim('<name>').
+//! acl_grant_scalar(role, vname, expr_template): a virtual scalar replaced by an expression macro
 void AclGrantScalarFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = args.GetValue(0, row);
-		auto vname = args.GetValue(1, row);
-		auto expr = args.GetValue(2, row);
-		if (role.IsNull() || vname.IsNull() || expr.IsNull()) {
-			throw InvalidInputException("acl_grant_scalar: role, name and expression must not be NULL");
-		}
-		TablePolicy policy;
-		policy.subquery_form = true;
-		policy.query = expr.ToString();
-		auto &store = StoreOf(state);
-		lock_guard<mutex> guard(store.lock);
-		store.scalar_functions[role.ToString()][vname.ToString()] = std::move(policy);
-	}
-	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+	GrantFunctionWrapper(args, state, result, "acl_grant_scalar", "scalar", false, &PolicyStore::scalar_functions);
 }
 
-//! acl_grant_scalar_alias(role, vname, phys_function): a virtual scalar function that is just an alias
-//! of a physical/system scalar function; the call is retargeted in place, arguments kept as-is.
+//! acl_grant_scalar_alias(role, vname, phys_function): retarget the call in place
 void AclGrantScalarAliasFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	GrantFunctionWrapper(args, state, result, "acl_grant_scalar_alias", "scalar", true, &PolicyStore::scalar_functions);
+}
+
+//! acl_deny_function(fname) / acl_allow_function(fname): gate a function (scalar or table) by name.
+//! With a catalog: an explicit gate row (allow overrides the default denylist); in memory: the
+//! denylist set is edited directly.
+void SetFunctionGate(DataChunk &args, ExpressionState &state, Vector &result, const char *what, bool allowed) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = args.GetValue(0, row);
-		auto vname = args.GetValue(1, row);
-		auto phys = args.GetValue(2, row);
-		if (role.IsNull() || vname.IsNull() || phys.IsNull()) {
-			throw InvalidInputException("acl_grant_scalar_alias: role, name and phys must not be NULL");
-		}
-		TablePolicy policy;
-		policy.subquery_form = false;
-		policy.phys = phys.ToString();
+		auto fname = RequiredArg(args, 0, row, what, "name");
 		auto &store = StoreOf(state);
+		if (store.CatalogEnabled()) {
+			store.CatalogSetFunctionGate(fname, allowed, false);
+			continue;
+		}
 		lock_guard<mutex> guard(store.lock);
-		store.scalar_functions[role.ToString()][vname.ToString()] = std::move(policy);
+		if (allowed) {
+			store.denied_functions.erase(fname);
+		} else {
+			store.denied_functions.insert(fname);
+		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_deny_function(fname): add a function (scalar or table) to the gateway-wide denylist
 void AclDenyFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto fname = args.GetValue(0, row);
-		if (fname.IsNull()) {
-			throw InvalidInputException("acl_deny_function: name must not be NULL");
-		}
-		auto &store = StoreOf(state);
-		lock_guard<mutex> guard(store.lock);
-		store.denied_functions.insert(fname.ToString());
-	}
-	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+	SetFunctionGate(args, state, result, "acl_deny_function", false);
 }
 
-//! acl_allow_function(fname): remove a function from the denylist (e.g. to un-deny a default)
 void AclAllowFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto fname = args.GetValue(0, row);
-		if (fname.IsNull()) {
-			throw InvalidInputException("acl_allow_function: name must not be NULL");
-		}
-		auto &store = StoreOf(state);
-		lock_guard<mutex> guard(store.lock);
-		store.denied_functions.erase(fname.ToString());
-	}
-	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+	SetFunctionGate(args, state, result, "acl_allow_function", true);
 }
 
-//! acl_define_token(token, role, claims_csv): bind a token to a principal (role + claims)
+//! acl_define_token(token, role, claims_csv): bind a token to a principal. Deliberately memory-only:
+//! the bridge until real JWT verification lands (spec 007).
 void AclDefineTokenFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto token = args.GetValue(0, row);
-		auto role = args.GetValue(1, row);
-		if (token.IsNull() || role.IsNull()) {
-			throw InvalidInputException("acl_define_token: token and role must not be NULL");
-		}
+		auto token = RequiredArg(args, 0, row, "acl_define_token", "token");
+		auto role = RequiredArg(args, 1, row, "acl_define_token", "role");
 		Principal principal;
-		principal.role = role.ToString();
-		auto claims = args.GetValue(2, row);
-		principal.claims = ParseClaims(claims.IsNull() ? string() : claims.ToString());
+		principal.roles = {role};
+		principal.claims = ParseClaims(OptionalArg(args, 2, row, ""));
 		auto &store = StoreOf(state);
 		lock_guard<mutex> guard(store.lock);
-		store.tokens[token.ToString()] = std::move(principal);
+		store.tokens[token] = std::move(principal);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -241,14 +386,15 @@ void AclDefineTokenFunc(DataChunk &args, ExpressionState &state, Vector &result)
 //! acl_define_role(role, claims_csv): default claims carried by the bare ROLE form
 void AclDefineRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = args.GetValue(0, row);
-		if (role.IsNull()) {
-			throw InvalidInputException("acl_define_role: role must not be NULL");
-		}
-		auto claims = args.GetValue(1, row);
+		auto role = RequiredArg(args, 0, row, "acl_define_role", "role");
+		auto claims = ParseClaims(OptionalArg(args, 1, row, ""));
 		auto &store = StoreOf(state);
+		if (store.CatalogEnabled()) {
+			store.CatalogDefineRole(role, claims);
+			continue;
+		}
 		lock_guard<mutex> guard(store.lock);
-		store.role_claims[role.ToString()] = ParseClaims(claims.IsNull() ? string() : claims.ToString());
+		store.role_claims[role] = std::move(claims);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -263,7 +409,33 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		loader.RegisterFunction(function);
 	};
 
+	// overloaded admin functions register as one set under the shared store
+	auto register_admin_set = [&](const string &name, vector<vector<LogicalType>> signatures, scalar_function_t fn) {
+		ScalarFunctionSet set((Identifier(name)));
+		for (auto &arguments : signatures) {
+			ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::BOOLEAN, fn);
+			function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+			set.AddFunction(function);
+		}
+		loader.RegisterFunction(set);
+	};
+
 	const LogicalType &v = LogicalType::VARCHAR;
+	const LogicalType &b = LogicalType::BOOLEAN;
+	// catalog backend control + catalog-model admin (spec 006)
+	register_admin_set("acl_use_db", {{v}, {v, v}, {v, v, b}}, AclUseDbFunc);
+	register_admin_set("acl_create_catalog", {{v}, {v, v}}, AclCreateCatalogFunc);
+	register_admin("acl_add_relation", {v, v, v, v, v}, AclAddRelationFunc);
+	register_admin("acl_add_view", {v, v, v}, AclAddViewFunc);
+	register_admin("acl_add_schema_alias", {v, v, v}, AclAddSchemaAliasFunc);
+	register_admin("acl_add_table_function", {v, v, v}, AclAddTableFunctionFunc);
+	register_admin("acl_add_table_function_alias", {v, v, v}, AclAddTableFunctionAliasFunc);
+	register_admin("acl_add_scalar", {v, v, v}, AclAddScalarCatalogFunc);
+	register_admin("acl_add_scalar_alias", {v, v, v}, AclAddScalarAliasCatalogFunc);
+	register_admin_set("acl_grant_catalog", {{v, v, v}, {v, v, v, b}}, AclGrantCatalogFunc);
+	register_admin("acl_revoke_catalog", {v, v}, AclRevokeCatalogFunc);
+	register_admin("acl_drop_relation", {v, v}, AclDropRelationFunc);
+	// original stubs / compatibility wrappers
 	register_admin("acl_grant_table", {v, v, v, v, v, v}, AclGrantTableFunc);
 	register_admin("acl_grant_view", {v, v, v}, AclGrantViewFunc);
 	register_admin("acl_grant_table_function", {v, v, v}, AclGrantTableFunctionFunc);

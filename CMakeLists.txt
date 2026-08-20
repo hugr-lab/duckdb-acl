@@ -18,6 +18,7 @@ set(EXTENSION_SOURCES
     src/acl_extension.cpp
     src/acl_parser_override.cpp
     src/acl_policy.cpp
+    src/acl_policy_catalog.cpp
     src/acl_rewriter.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
