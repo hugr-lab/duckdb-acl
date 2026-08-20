@@ -186,6 +186,93 @@ ACL ROLE "reader" SELECT count(*) FROM report(0);
 ----
 2
 
+# --- capabilities that were never stated ------------------------------------------------------------
+# a grant that says nothing about capabilities has already made the access decision: caps are how it
+# is narrowed, so an unspecified value is every data capability - but never `manage`
+
+statement ok
+ACL ADMIN CREATE ROLE unstated;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE unstated MAIN;
+
+query I
+ACL ROLE "unstated" SELECT count(*) FROM report(0);
+----
+2
+
+query I
+ACL ROLE "unstated" SELECT shout('hi');
+----
+HI
+
+statement ok
+ACL ROLE "unstated" INSERT INTO audit VALUES (2, 'unstated');
+
+# ... and administering the ACL is not part of it: that is granted explicitly, only explicitly
+statement error
+ACL ROLE "unstated" ACL CREATE VIRTUAL CATALOG sneaky;
+----
+<REGEX>:.*no ACL administration scope.*
+
+# an explicit empty object is the opposite of saying nothing: no capabilities at all
+statement ok
+ACL ADMIN CREATE ROLE nothing_granted;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE nothing_granted CAPS '{}' MAIN;
+
+statement error
+ACL ROLE "nothing_granted" SELECT count(*) FROM report(0);
+----
+<REGEX>:.*select on table function "report" is not allowed.*
+
+statement error
+ACL ROLE "nothing_granted" SELECT count(*) FROM audit;
+----
+<REGEX>:.*select on "audit" is not allowed.*
+
+# an object grant that states nothing *inherits* the catalog's caps rather than defaulting to full:
+# the catalog grant is the access decision, an object grant refines it - and a refinement that says
+# nothing must not widen (the narrowing-only rule of spec 011)
+statement ok
+ACL ADMIN GRANT TABLE sales.report TO ROLE nothing_granted;
+
+statement error
+ACL ROLE "nothing_granted" SELECT count(*) FROM report(0);
+----
+<REGEX>:.*select on table function "report" is not allowed.*
+
+# it takes an explicit capability on the object to lift it
+statement ok
+ACL ADMIN GRANT TABLE sales.report TO ROLE nothing_granted CAPS '{"select": true}';
+
+query I
+ACL ROLE "nothing_granted" SELECT count(*) FROM report(0);
+----
+2
+
+# the same rule the other way round: an object grant attaching only a policy keeps the catalog's
+# capabilities instead of promoting the role to every verb
+statement ok
+ACL ADMIN CREATE ROLE reader_only;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE reader_only CAPS '{"select": true}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.audit TO ROLE reader_only RLS 'id > 0';
+
+query I
+ACL ROLE "reader_only" SELECT count(*) FROM audit;
+----
+2
+
+statement error
+ACL ROLE "reader_only" INSERT INTO audit VALUES (3, 'nope');
+----
+<REGEX>:.*insert on "audit" is not allowed.*
+
 # --- markers are baked wherever they stand in a template -------------------------------------------
 # a marker left behind fails closed at bind, which used to make these templates unusable
 

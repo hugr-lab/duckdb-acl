@@ -239,7 +239,9 @@ void AclGrantCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_grant_catalog", "role");
 		auto vcat = RequiredArg(args, 1, row, "acl_grant_catalog", "catalog");
-		auto caps = OptionalArg(args, 2, row, "{}");
+		// an omitted caps argument is "unspecified", which the resolver reads as the read-only
+		// default; an explicit '{}' is "no capabilities" (spec 012)
+		auto caps = OptionalArg(args, 2, row, "");
 		bool is_main = false;
 		if (args.ColumnCount() > 3) {
 			auto value = args.GetValue(3, row);
@@ -258,7 +260,7 @@ void AclGrantObjectFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		auto role = RequiredArg(args, 0, row, "acl_grant_object", "role");
 		auto vcat = RequiredArg(args, 1, row, "acl_grant_object", "catalog");
 		auto vname = RequiredArg(args, 2, row, "acl_grant_object", "name");
-		auto caps = OptionalArg(args, 3, row, "{}");
+		auto caps = OptionalArg(args, 3, row, "");
 		auto rls = OptionalArg(args, 4, row, "");
 		auto columns = OptionalArg(args, 5, row, "");
 		auto &store = StoreOf(state);

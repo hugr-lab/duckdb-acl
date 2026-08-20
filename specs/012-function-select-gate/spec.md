@@ -59,6 +59,28 @@ a subquery ref in the `FROM`, which the old walk skipped entirely. The explicit 
 to it is a guard rather than a live path — no template shape produces that node today, but duckdb's
 traversal has no case for it and its default throws, and we track duckdb's `main`.
 
+### Capabilities that were never stated
+
+Making the capability decide raised the question of what a grant that never mentions capabilities
+means. Two different things, and the difference is now explicit:
+
+| written | meaning |
+| --- | --- |
+| `GRANT CATALOG sales TO ROLE r` (no `CAPS`), or a driver row with NULL/empty caps | **every data capability** — `select, insert, update, delete, merge` |
+| `GRANT CATALOG sales TO ROLE r CAPS '{}'` | **none** |
+
+A source that hands out a catalog without saying what may be done with it has already made the access
+decision; capabilities are how that decision is *narrowed*, so an unstated one is not a refusal. This
+is what the function-driver contract needed: a platform whose own resolver decides access can return
+grants without caps and have them mean what it intends. `manage` is deliberately **not** part of the
+default — administering the ACL is granted explicitly and only explicitly (spec 009).
+
+An **object** grant is a refinement of a catalog grant rather than an access decision of its own, so
+an object row that states no capabilities **inherits the catalog's** instead of defaulting to full.
+That keeps spec 011's rule intact — a grant may narrow, never widen — so attaching a policy with
+`GRANT TABLE sales.orders TO ROLE r RLS '…'` cannot promote the role to every verb by omission. To
+lift a capability on one object, state it: `… CAPS '{"select": true}'`.
+
 ### Memory backend
 
 The in-memory store (dev/tests) sets `select` on a macro-form function policy but not on an
@@ -74,14 +96,18 @@ capability is resolved through the same grant chain in both paths.
 
 ## Testing
 
-`test/sql/acl_function_select_gate.test` (56 assertions): a write-only catalog grant denied on a
+`test/sql/acl_function_select_gate.test` (75 assertions): a write-only catalog grant denied on a
 virtual table function, on a macro scalar, on an alias scalar and on a scalar whose template reads a
 table (the leak this closes); the write itself still working, so the grant is narrowed and not broken;
 a per-object `select` grant on one function allowing exactly that one while its neighbours stay
 denied; the object-level capability of spec 011 overriding the catalog's in both directions; the gate
 running before expansion (a denied call to a function with a broken template reports the ACL refusal,
 not a binder error); and markers baking inside a subquery, on both sides of a `UNION`, in a
-table-function macro's subquery, in a `WITH` clause and in an RLS predicate's subquery. The existing suites (`acl.test`,
+table-function macro's subquery, in a `WITH` clause and in an RLS predicate's subquery. The
+capability defaults get their own block: a grant with no `CAPS` reading, writing and calling
+functions but still refused ACL administration; an explicit `'{}'` refused everywhere; an object grant
+stating nothing inheriting the catalog's capabilities in both directions (it neither lifts a `'{}'`
+nor promotes a select-only role attaching a policy). The existing suites (`acl.test`,
 `acl_catalog.test`, `acl_functions_driver.test`) prove the memory, catalog and function-driver paths
 still resolve their functions.
 

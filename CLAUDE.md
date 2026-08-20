@@ -76,6 +76,10 @@ Enable the override in a session with `SET allow_parser_override_extension='fall
 
 - **Two replacement forms**: RENAME (name → physical in place, writable) vs SUBQUERY (wrap a SELECT:
   projection/masks/computed columns/RLS/view SQL, read-only). The resolver picks per object.
+- **Unstated caps = every data capability** (spec 012): a grant written without `CAPS` — or a driver
+  row with NULL/empty caps — means `select, insert, update, delete, merge`, never `manage`; an
+  explicit `'{}'` means none. An *object* grant that states nothing inherits the catalog grant's caps,
+  so a refinement never widens by omission.
 - **Capabilities gate both paths**: `select` on every read of a relation (spec 003), the per-verb
   capability (`insert`/`update`/`delete`/`merge`) on DML targets.
 - **Markers baked into template copies**: `acl_claim('<name>')` → claim constant; `acl_arg(n)` → n-th

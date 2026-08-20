@@ -459,7 +459,9 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			s.Expect("to");
 			s.Expect("role");
 			auto role = s.Word("a role name");
-			string caps = "{}", rls, columns;
+			// no CAPS clause = unspecified, which resolves to the read-only default; an explicit
+			// CAPS '{}' still means "no capabilities" (spec 012)
+			string caps, rls, columns;
 			GrantPolicyClauses(s, caps, rls, columns);
 			return MakeAdminCall("acl_grant_object",
 			                     {Value(role), Value(vcat), Value(vname), Value(caps), Value(rls), Value(columns)});
@@ -469,7 +471,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		s.Expect("to");
 		s.Expect("role");
 		auto role = s.Word("a role name");
-		string caps = "{}", rls, columns;
+		string caps, rls, columns;
 		bool main = false;
 		GrantPolicyClauses(s, caps, rls, columns, &main);
 		return MakeAdminCall("acl_grant_catalog",
