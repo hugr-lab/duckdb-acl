@@ -92,6 +92,73 @@ SELECT target, form FROM aclcat.acl.functions WHERE vname = 'rng';
 ----
 range	alias
 
+# --- the SQL-shaped verb: CREATE VIRTUAL <kind> --------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.created AS phys.main.orders_physical COLUMNS (id, amount) RLS (amount > 0) COMMENT 'made with CREATE';
+
+query IIII
+SELECT phys, form, rls, comment FROM aclcat.acl.relations WHERE vname = 'created';
+----
+phys.main.orders_physical	subquery	amount > 0	made with CREATE
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW sales.created_view (n BIGINT) COMMENT 'made with CREATE' AS SELECT count(*) AS n FROM phys.main.orders_physical;
+
+query III
+SELECT form, view_sql, comment FROM aclcat.acl.relations WHERE vname = 'created_view';
+----
+view	SELECT count(*) AS n FROM phys.main.orders_physical	made with CREATE
+
+query II
+SELECT name, type FROM aclcat.acl.object_columns WHERE vname = 'created_view';
+----
+n	BIGINT
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.created_fn(threshold INTEGER) RETURNS TABLE (id INTEGER) COMMENT 'a function' AS SELECT id FROM phys.main.orders_physical WHERE amount >= acl_arg(1);
+
+query IIII
+SELECT kind, form, params, comment FROM aclcat.acl.functions WHERE vname = 'created_fn';
+----
+table	macro	threshold INTEGER	a function
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR sales.created_scalar(text VARCHAR) RETURNS VARCHAR AS upper(acl_arg(1));
+
+query II
+SELECT kind, template FROM aclcat.acl.functions WHERE vname = 'created_scalar';
+----
+scalar	upper(acl_arg(1))
+
+# ALIAS OF, and the older ALIAS, name the same thing
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.created_rng ALIAS OF range;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR sales.created_lc ALIAS OF lower COMMENT 'lowercase';
+
+query III
+SELECT target, form, comment FROM aclcat.acl.functions WHERE vname = 'created_lc';
+----
+lower	alias	lowercase
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.main;
+
+query I
+SELECT phys_path FROM aclcat.acl.schema_aliases WHERE alias_path = 'raw';
+----
+phys.main
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG hr COMMENT 'people';
+
+query I
+SELECT comment FROM aclcat.acl.catalogs WHERE vcat = 'hr';
+----
+people
+
 # --- lists are lists --------------------------------------------------------------------------------
 
 statement ok

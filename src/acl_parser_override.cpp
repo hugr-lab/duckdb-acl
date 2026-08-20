@@ -463,17 +463,107 @@ bool IsMgmtStart(const string &text) {
 	return false;
 }
 
+//! `CREATE VIRTUAL <kind> <name> …` - the SQL-shaped spelling of the ADD forms, with the virtual
+//! name first (like `CREATE TABLE`) and `AS` naming the physical target or the body. The ADD forms
+//! stay accepted: a gateway generates them, and every existing script uses them.
+unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s) {
+	//! `COMMENT '…'` may precede the body (a body runs to the end of the statement, so it cannot
+	//! follow one); for the forms whose tail is a list it may come last as well
+	auto comment_clause = [](AdminScanner &scanner, string &comment) {
+		if (scanner.Accept("comment")) {
+			comment = scanner.Quoted("comment");
+		}
+	};
+	if (s.Accept("catalog")) {
+		auto vcat = s.Word("a catalog name");
+		string comment;
+		comment_clause(s, comment);
+		return MakeAdminCall("acl_create_catalog", {Value(vcat), Value(comment)});
+	}
+	if (s.Accept("schema")) { // CREATE VIRTUAL SCHEMA v.alias AS <phys path>
+		string vcat, alias;
+		SplitVirtual(s.Dotted("a virtual alias"), vcat, alias);
+		s.Expect("as");
+		auto phys = s.Name("a physical schema path");
+		return MakeAdminCall("acl_add_schema_alias", {Value(vcat), Value(alias), Value(phys)});
+	}
+	if (s.Accept("view")) { // CREATE VIRTUAL VIEW v.n [(col TYPE, …)] [COMMENT '…'] AS <sql>
+		string vcat, vname;
+		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+		auto returns = s.Parens();
+		string comment;
+		comment_clause(s, comment);
+		s.Expect("as");
+		auto sql = s.Body("view SQL");
+		return MakeAdminCall("acl_add_view", {Value(vcat), Value(vname), Value(sql), Value(returns), Value(comment)});
+	}
+	bool scalar = s.Accept("scalar");
+	bool table_function = false;
+	if (!scalar) {
+		s.Expect("table");
+		table_function = s.Accept("function");
+	}
+	string vcat, vname;
+	SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+	if (scalar || table_function) {
+		// CREATE VIRTUAL SCALAR|TABLE FUNCTION v.n[(args)] [RETURNS …] [COMMENT '…'] AS <body>
+		//                                                                             | ALIAS OF <fn>
+		auto params = s.Parens();
+		string returns;
+		if (s.Accept("returns")) {
+			if (scalar) {
+				returns = s.Word("a result type");
+			} else {
+				s.Accept("table");
+				returns = s.Parens();
+				if (returns.empty()) {
+					throw BinderException("acl admin: RETURNS TABLE needs a column list");
+				}
+			}
+		}
+		string comment;
+		comment_clause(s, comment);
+		if (s.Accept("alias")) {
+			s.Expect("of");
+			auto target = s.Name("a target function");
+			comment_clause(s, comment); // an alias has no body, so the comment may also come last
+			return MakeAdminCall(scalar ? "acl_add_scalar_alias" : "acl_add_table_function_alias",
+			                     {Value(vcat), Value(vname), Value(target), Value(""), Value(""), Value(comment)});
+		}
+		s.Expect("as");
+		auto definition = s.Body(scalar ? "expression template" : "SQL template");
+		return MakeAdminCall(
+		    scalar ? "acl_add_scalar" : "acl_add_table_function",
+		    {Value(vcat), Value(vname), Value(definition), Value(params), Value(returns), Value(comment)});
+	}
+	// CREATE VIRTUAL TABLE v.n AS <phys> [COLUMNS (…)] [RLS (…)] [COMMENT '…']
+	s.Expect("as");
+	auto phys = s.Name("a physical table path");
+	string columns, rls, comment;
+	for (bool more = true; more;) {
+		more = false;
+		if (s.Accept("columns")) {
+			columns = s.List("columns list");
+			more = true;
+		}
+		if (s.Accept("rls")) {
+			rls = s.List("RLS predicate");
+			more = true;
+		}
+		if (s.Accept("comment")) {
+			comment = s.Quoted("comment");
+			more = true;
+		}
+	}
+	return MakeAdminCall("acl_add_relation",
+	                     {Value(vcat), Value(vname), Value(phys), Value(columns), Value(rls), Value(comment)});
+}
+
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	auto keyword = s.Word("a management keyword");
 	if (StringUtil::CIEquals(keyword, "create")) {
 		if (s.Accept("virtual")) {
-			s.Expect("catalog");
-			auto vcat = s.Word("a catalog name");
-			string comment;
-			if (s.Accept("comment")) {
-				comment = s.Quoted("comment");
-			}
-			return MakeAdminCall("acl_create_catalog", {Value(vcat), Value(comment)});
+			return ParseCreateVirtual(s);
 		}
 		if (s.Accept("role")) {
 			auto role = s.Word("a role name");
@@ -535,6 +625,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			bool is_macro = s.Accept("macro");
 			if (!is_macro) {
 				s.Expect("alias");
+				s.Accept("of"); // ALIAS OF <fn> and the older ALIAS <fn> are the same thing
 			}
 			auto definition = is_macro ? s.Body("expression template") : s.Name("a target function");
 			if (!is_macro) {
@@ -560,6 +651,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			bool is_macro = s.Accept("macro");
 			if (!is_macro) {
 				s.Expect("alias");
+				s.Accept("of"); // ALIAS OF <fn> and the older ALIAS <fn> are the same thing
 			}
 			auto definition = is_macro ? s.Body("SQL template") : s.Name("a target function");
 			if (!is_macro) {
