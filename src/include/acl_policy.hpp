@@ -239,6 +239,9 @@ struct PolicyStore {
 	//! per-object grant: its capabilities and (spec 011) the policy it imposes on the object
 	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json,
 	                          const string &rls = "", const string &columns = "");
+	//! Whether an object of that kind already exists - what CREATE / CREATE OR REPLACE /
+	//! CREATE IF NOT EXISTS decide on (spec 013). kind: catalog|role|issuer|schema|relation|table|scalar
+	bool CatalogObjectExists(const string &vcat, const string &vname, const string &kind);
 	//! refuse a grant naming an object nobody defined - a policy that never applies is worse than none
 	//! - and a policy on a scalar function, which has neither rows nor columns to narrow
 	void CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy);

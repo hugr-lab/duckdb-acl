@@ -152,16 +152,46 @@ void AclUseFunctionsFunc(DataChunk &args, ExpressionState &state, Vector &result
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! What the written statement promised about existence. The legacy `ADD` forms promise nothing and
+//! keep upserting; `CREATE` refuses to overwrite, `OR REPLACE` overwrites, `IF NOT EXISTS` skips.
+//! Returns false when the write must be skipped (spec 013).
+bool AllowWrite(PolicyStore &store, const string &vcat, const string &vname, const string &kind, const string &mode) {
+	if (mode.empty() || mode == "upsert" || mode == "replace") {
+		return true;
+	}
+	if (mode != "create" && mode != "skip") {
+		throw BinderException("acl admin: unknown write mode \"%s\"", mode);
+	}
+	if (!store.CatalogObjectExists(vcat, vname, kind)) {
+		return true;
+	}
+	if (mode == "skip") {
+		return false;
+	}
+	throw BinderException("acl admin: \"%s.%s\" already exists - use CREATE OR REPLACE to overwrite it, or "
+	                      "CREATE ... IF NOT EXISTS to keep the existing one",
+	                      vcat, vname);
+}
+
 //! acl_create_catalog(vcat [, comment]): register a virtual catalog (a shared tree of virtual names)
 void AclCreateCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = RequiredArg(args, 0, row, "acl_create_catalog", "catalog");
-		StoreOf(state).CatalogCreate(vcat, OptionalArg(args, 1, row, ""));
+		auto &store = StoreOf(state);
+		if (!AllowWrite(store, vcat, vcat, "catalog", OptionalArg(args, 2, row, ""))) {
+			continue;
+		}
+		store.CatalogCreate(vcat, OptionalArg(args, 1, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_add_relation(vcat, vname, phys, cols_csv, rls): define a relation inside a virtual catalog;
+//! `DROP … IF EXISTS`: nothing to drop is not an error. Any other mode leaves the drop to report a
+//! missing target itself, which is what makes a typo visible (spec 010).
+bool AllowDrop(PolicyStore &store, const string &vcat, const string &vname, const string &kind, const string &mode) {
+	return mode != "skip" || store.CatalogObjectExists(vcat, vname, kind);
+}
+
 //! A comment written inline with the object (`… COMMENT '…'`). It is a second write rather than a
 //! column of the add: the object's identity is what the add stores, and the comment path (spec 010)
 //! already knows where a comment lives for each kind.
@@ -173,7 +203,8 @@ void SetInlineComment(PolicyStore &store, const string &vcat, const string &vnam
 	store.CatalogSetComment(vcat, vname, kind, "", comment);
 }
 
-//! no columns and no RLS -> a writable alias (RENAME), otherwise a read-only subquery
+//! acl_add_relation(vcat, vname, phys, cols_csv, rls[, comment, mode]): define a relation inside a
+//! virtual catalog; no columns and no RLS -> a writable alias (RENAME), otherwise a read-only subquery
 void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = RequiredArg(args, 0, row, "acl_add_relation", "catalog");
@@ -184,6 +215,9 @@ void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		// renaming is not restricting: a pure rename list keeps the relation writable
 		auto form = rls.empty() && (columns.empty() || IsRenameOnly(columns)) ? "alias" : "subquery";
 		auto &store = StoreOf(state);
+		if (!AllowWrite(store, vcat, vname, "relation", OptionalArg(args, 6, row, ""))) {
+			continue;
+		}
 		store.CatalogAddRelation(vcat, vname, form, phys, "", rls, columns);
 		SetInlineComment(store, vcat, vname, "relation", OptionalArg(args, 5, row, ""));
 	}
@@ -198,6 +232,9 @@ void AclAddViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		auto sql = RequiredArg(args, 2, row, "acl_add_view", "SQL");
 		// a declared column list (the CREATE VIEW shape) is stored as-is instead of being probed
 		auto &store = StoreOf(state);
+		if (!AllowWrite(store, vcat, vname, "relation", OptionalArg(args, 5, row, ""))) {
+			continue;
+		}
 		store.CatalogAddRelation(vcat, vname, "view", "", sql, "", {}, OptionalArg(args, 3, row, ""));
 		SetInlineComment(store, vcat, vname, "relation", OptionalArg(args, 4, row, ""));
 	}
@@ -211,7 +248,11 @@ void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &resu
 		auto vcat = RequiredArg(args, 0, row, "acl_add_schema_alias", "catalog");
 		auto alias = RequiredArg(args, 1, row, "acl_add_schema_alias", "alias path");
 		auto phys = RequiredArg(args, 2, row, "acl_add_schema_alias", "phys path");
-		StoreOf(state).CatalogAddSchemaAlias(vcat, alias, phys);
+		auto &store = StoreOf(state);
+		if (!AllowWrite(store, vcat, alias, "schema", OptionalArg(args, 3, row, ""))) {
+			continue;
+		}
+		store.CatalogAddSchemaAlias(vcat, alias, phys);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -226,6 +267,9 @@ void AddFunction(DataChunk &args, ExpressionState &state, Vector &result, const 
 		// the declared signature and result (the CREATE MACRO shape): the signature types the probe's
 		// NULLs, and a declared result replaces the probe entirely
 		auto &store = StoreOf(state);
+		if (!AllowWrite(store, vcat, vname, kind, OptionalArg(args, 6, row, ""))) {
+			continue;
+		}
 		store.CatalogAddFunction(vcat, vname, kind, form, is_alias ? definition : "", is_alias ? "" : definition,
 		                         OptionalArg(args, 3, row, ""), OptionalArg(args, 4, row, ""));
 		SetInlineComment(store, vcat, vname, kind, OptionalArg(args, 5, row, ""));
@@ -301,7 +345,10 @@ void AclDropRelationFunc(DataChunk &args, ExpressionState &state, Vector &result
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = RequiredArg(args, 0, row, "acl_drop_relation", "catalog");
 		auto vname = RequiredArg(args, 1, row, "acl_drop_relation", "name");
-		StoreOf(state).CatalogDropRelation(vcat, vname);
+		auto &store = StoreOf(state);
+		if (AllowDrop(store, vcat, vname, "relation", OptionalArg(args, 2, row, ""))) {
+			store.CatalogDropRelation(vcat, vname);
+		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -581,7 +628,10 @@ void AclDropCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result)
 			auto value = args.GetValue(1, row);
 			cascade = !value.IsNull() && value.GetValue<bool>();
 		}
-		StoreOf(state).CatalogDropCatalog(vcat, cascade);
+		auto &store = StoreOf(state);
+		if (AllowDrop(store, vcat, vcat, "catalog", OptionalArg(args, 2, row, ""))) {
+			store.CatalogDropCatalog(vcat, cascade);
+		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -590,7 +640,10 @@ void AclDropSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &res
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = RequiredArg(args, 0, row, "acl_drop_schema_alias", "catalog");
 		auto alias = RequiredArg(args, 1, row, "acl_drop_schema_alias", "alias path");
-		StoreOf(state).CatalogDropSchemaAlias(vcat, alias);
+		auto &store = StoreOf(state);
+		if (AllowDrop(store, vcat, alias, "schema", OptionalArg(args, 2, row, ""))) {
+			store.CatalogDropSchemaAlias(vcat, alias);
+		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -600,21 +653,32 @@ void AclDropFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result
 		auto vcat = RequiredArg(args, 0, row, "acl_drop_function", "catalog");
 		auto vname = RequiredArg(args, 1, row, "acl_drop_function", "name");
 		auto kind = StringUtil::Lower(RequiredArg(args, 2, row, "acl_drop_function", "kind"));
-		StoreOf(state).CatalogDropFunction(vcat, vname, kind);
+		auto &store = StoreOf(state);
+		if (AllowDrop(store, vcat, vname, kind, OptionalArg(args, 3, row, ""))) {
+			store.CatalogDropFunction(vcat, vname, kind);
+		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
 void AclDropRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		StoreOf(state).CatalogDropRole(RequiredArg(args, 0, row, "acl_drop_role", "role"));
+		auto role = RequiredArg(args, 0, row, "acl_drop_role", "role");
+		auto &store = StoreOf(state);
+		if (AllowDrop(store, "", role, "role", OptionalArg(args, 1, row, ""))) {
+			store.CatalogDropRole(role);
+		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
 void AclDropIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		StoreOf(state).CatalogDropIssuer(RequiredArg(args, 0, row, "acl_drop_issuer", "issuer"));
+		auto issuer = RequiredArg(args, 0, row, "acl_drop_issuer", "issuer");
+		auto &store = StoreOf(state);
+		if (AllowDrop(store, "", issuer, "issuer", OptionalArg(args, 1, row, ""))) {
+			store.CatalogDropIssuer(issuer);
+		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -708,6 +772,9 @@ void AclDefineRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		auto claims = ParseClaims(OptionalArg(args, 1, row, ""));
 		auto &store = StoreOf(state);
 		if (store.CatalogEnabled()) {
+			if (!AllowWrite(store, "", role, "role", OptionalArg(args, 2, row, ""))) {
+				continue;
+			}
 			store.CatalogDefineRole(role, claims);
 			continue;
 		}
@@ -743,27 +810,34 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	// catalog backend control + catalog-model admin (spec 006)
 	register_admin_set("acl_use_db", {{v}, {v, v}, {v, v, b}}, AclUseDbFunc);
 	register_admin("acl_use_functions", {v}, AclUseFunctionsFunc);
-	register_admin_set("acl_create_catalog", {{v}, {v, v}}, AclCreateCatalogFunc);
-	register_admin_set("acl_add_relation", {{v, v, v, v, v}, {v, v, v, v, v, v}}, AclAddRelationFunc);
-	register_admin_set("acl_add_view", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclAddViewFunc);
-	register_admin("acl_add_schema_alias", {v, v, v}, AclAddSchemaAliasFunc);
-	register_admin_set("acl_add_table_function", {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}},
+	// the trailing argument of the object writers is the write mode of spec 013 (create/replace/skip);
+	// omitted, it is the legacy upsert every ADD form promises
+	register_admin_set("acl_create_catalog", {{v}, {v, v}, {v, v, v}}, AclCreateCatalogFunc);
+	register_admin_set("acl_add_relation", {{v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
+	                   AclAddRelationFunc);
+	register_admin_set("acl_add_view", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}}, AclAddViewFunc);
+	register_admin_set("acl_add_schema_alias", {{v, v, v}, {v, v, v, v}}, AclAddSchemaAliasFunc);
+	register_admin_set("acl_add_table_function",
+	                   {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
 	                   AclAddTableFunctionFunc);
-	register_admin_set("acl_add_table_function_alias", {{v, v, v}, {v, v, v, v, v, v}}, AclAddTableFunctionAliasFunc);
-	register_admin_set("acl_add_scalar", {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}}, AclAddScalarCatalogFunc);
-	register_admin_set("acl_add_scalar_alias", {{v, v, v}, {v, v, v, v, v, v}}, AclAddScalarAliasCatalogFunc);
+	register_admin_set("acl_add_table_function_alias", {{v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
+	                   AclAddTableFunctionAliasFunc);
+	register_admin_set("acl_add_scalar", {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
+	                   AclAddScalarCatalogFunc);
+	register_admin_set("acl_add_scalar_alias", {{v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
+	                   AclAddScalarAliasCatalogFunc);
 	register_admin_set("acl_grant_catalog", {{v, v, v}, {v, v, v, b}, {v, v, v, b, v, v}}, AclGrantCatalogFunc);
 	register_admin_set("acl_grant_object", {{v, v, v, v}, {v, v, v, v, v, v}}, AclGrantObjectFunc);
 	register_admin("acl_revoke_catalog", {v, v}, AclRevokeCatalogFunc);
-	register_admin("acl_drop_relation", {v, v}, AclDropRelationFunc);
+	register_admin_set("acl_drop_relation", {{v, v}, {v, v, v}}, AclDropRelationFunc);
 	// metadata (spec 010)
 	register_admin_set("acl_comment", {{v, v, v, v, v}}, AclCommentFunc);
 	// DROP of the remaining elements (spec 010)
-	register_admin_set("acl_drop_catalog", {{v}, {v, b}}, AclDropCatalogFunc);
-	register_admin("acl_drop_schema_alias", {v, v}, AclDropSchemaAliasFunc);
-	register_admin("acl_drop_function", {v, v, v}, AclDropFunctionFunc);
-	register_admin("acl_drop_role", {v}, AclDropRoleFunc);
-	register_admin("acl_drop_issuer", {v}, AclDropIssuerFunc);
+	register_admin_set("acl_drop_catalog", {{v}, {v, b}, {v, b, v}}, AclDropCatalogFunc);
+	register_admin_set("acl_drop_schema_alias", {{v, v}, {v, v, v}}, AclDropSchemaAliasFunc);
+	register_admin_set("acl_drop_function", {{v, v, v}, {v, v, v, v}}, AclDropFunctionFunc);
+	register_admin_set("acl_drop_role", {{v}, {v, v}}, AclDropRoleFunc);
+	register_admin_set("acl_drop_issuer", {{v}, {v, v}}, AclDropIssuerFunc);
 	register_admin("acl_drop_role_mapping", {v, v, v, v}, AclDropRoleMappingFunc);
 	// re-derive stored schemas; returns the number of objects re-probed
 	auto register_refresh = [&](vector<LogicalType> arguments) {
@@ -784,7 +858,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_deny_function", {v}, AclDenyFunctionFunc);
 	register_admin("acl_allow_function", {v}, AclAllowFunctionFunc);
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);
-	register_admin("acl_define_role", {v, v}, AclDefineRoleFunc);
+	register_admin_set("acl_define_role", {{v, v}, {v, v, v}}, AclDefineRoleFunc);
 	// offline JWT verification (spec 007)
 	register_admin("acl_define_issuer", {v, v, v, v, v, v}, AclDefineIssuerFunc);
 	register_admin("acl_map_role", {v, v, v, v}, AclMapRoleFunc);

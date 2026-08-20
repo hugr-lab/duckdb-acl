@@ -236,3 +236,95 @@ ACL ROLE "analyst" SELECT id, label FROM labelled ORDER BY id;
 ----
 1	acme
 2	globex
+
+# --- existence is explicit ---------------------------------------------------------------------------
+# ADD upserts silently, which is how a typo in a name creates a second object instead of changing the
+# intended one; CREATE says what it expects
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE sales.created AS phys.main.orders_physical;
+----
+<REGEX>:.*"sales.created" already exists.*
+
+# the refusal changed nothing
+query II
+SELECT form, comment FROM aclcat.acl.relations WHERE vname = 'created';
+----
+subquery	made with CREATE
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE IF NOT EXISTS sales.created AS phys.main.orders_physical;
+
+query II
+SELECT form, comment FROM aclcat.acl.relations WHERE vname = 'created';
+----
+subquery	made with CREATE
+
+statement ok
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE sales.created AS phys.main.orders_physical;
+
+query II
+SELECT form, rls FROM aclcat.acl.relations WHERE vname = 'created';
+----
+alias	(empty)
+
+# every kind answers the same way
+statement error
+ACL ADMIN CREATE VIRTUAL CATALOG hr;
+----
+<REGEX>:.*already exists.*
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG IF NOT EXISTS hr;
+
+statement error
+ACL ADMIN CREATE ROLE analyst;
+----
+<REGEX>:.*already exists.*
+
+statement ok
+ACL ADMIN CREATE ROLE IF NOT EXISTS analyst;
+
+query I
+SELECT count(*) FROM aclcat.acl.role_claims WHERE role = 'analyst';
+----
+1
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCALAR sales.created_scalar(text VARCHAR) AS lower(acl_arg(1));
+----
+<REGEX>:.*already exists.*
+
+# a table function and a scalar of the same name are different objects
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.created_scalar AS SELECT 1 AS one;
+
+# the legacy ADD keeps upserting, so existing scripts are untouched
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.created COLUMNS 'id';
+
+query I
+SELECT form FROM aclcat.acl.relations WHERE vname = 'created';
+----
+subquery
+
+# --- DROP ... IF EXISTS -------------------------------------------------------------------------------
+
+statement error
+ACL ADMIN DROP VIRTUAL TABLE sales.never_existed;
+----
+<REGEX>:.*does not exist.*
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE IF EXISTS sales.never_existed;
+
+statement ok
+ACL ADMIN DROP ROLE IF EXISTS nobody;
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCALAR IF EXISTS sales.created_scalar;
+
+query I
+SELECT count(*) FROM aclcat.acl.functions WHERE vname = 'created_scalar' AND kind = 'scalar';
+----
+0
