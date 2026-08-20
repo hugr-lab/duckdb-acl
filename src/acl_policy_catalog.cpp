@@ -44,6 +44,147 @@ string LitList(const vector<string> &values) {
 	return StringUtil::Join(quoted, ", ");
 }
 
+//! A grant's column list, in the same `name` / `name=expr` csv form the object definitions use.
+//! (Splitting on ',' is the store-wide convention, so an expression may not contain a top-level
+//! comma - `coalesce(a, b)` has to be written as a virtual column of the object instead.)
+vector<std::pair<string, string>> ParseColumnList(const string &csv) {
+	vector<std::pair<string, string>> columns;
+	for (auto &part : StringUtil::Split(csv, ',')) {
+		auto item = part;
+		StringUtil::Trim(item);
+		if (item.empty()) {
+			continue;
+		}
+		auto pos = item.find('=');
+		if (pos == string::npos) {
+			columns.emplace_back(item, string());
+			continue;
+		}
+		auto name = item.substr(0, pos);
+		auto expr = item.substr(pos + 1);
+		StringUtil::Trim(name);
+		StringUtil::Trim(expr);
+		columns.emplace_back(name, expr);
+	}
+	return columns;
+}
+
+//! The policy one role's grant chain imposes on one object (spec 011). Levels compose by narrowing:
+//! predicates are AND-ed and column lists intersected on the way down (catalog -> object), so a more
+//! specific grant can hide or mask more but never re-expose.
+struct GrantPolicy {
+	bool restricts = false;                    // a column list was given somewhere in the chain
+	vector<std::pair<string, string>> columns; // visible columns, name -> expr ("" = as-is)
+	vector<string> predicates;                 // AND-ed together
+
+	//! Fold one level of the chain in; empty strings mean "this level says nothing"
+	void Narrow(const string &rls, const string &column_csv) {
+		if (!rls.empty()) {
+			predicates.push_back(rls);
+		}
+		auto level = ParseColumnList(column_csv);
+		if (level.empty()) {
+			return;
+		}
+		if (!restricts) {
+			restricts = true;
+			columns = std::move(level);
+			return;
+		}
+		vector<std::pair<string, string>> intersected;
+		for (auto &column : columns) {
+			for (auto &narrower : level) {
+				if (!StringUtil::CIEquals(column.first, narrower.first)) {
+					continue;
+				}
+				// the narrower level may mask harder, never un-mask what the wider one computed
+				intersected.emplace_back(column.first, narrower.second.empty() ? column.second : narrower.second);
+				break;
+			}
+		}
+		columns = std::move(intersected);
+	}
+
+	string Predicate() const {
+		if (predicates.empty()) {
+			return string();
+		}
+		if (predicates.size() == 1) {
+			return predicates[0];
+		}
+		vector<string> wrapped;
+		for (auto &predicate : predicates) {
+			wrapped.push_back("(" + predicate + ")");
+		}
+		return StringUtil::Join(wrapped, " AND ");
+	}
+};
+
+//! The union of what the principal's roles are granted on one object: a principal may do what any of
+//! its roles may, so predicates are OR-ed (a role without one lifts the restriction entirely) and
+//! column lists unioned (a plain column beats a masked one).
+struct GrantUnion {
+	bool any = false;                  // at least one role's grant was seen
+	bool unrestricted_rls = false;     // some role has no predicate -> no predicate at all
+	bool unrestricted_columns = false; // some role has no column list -> the object's own
+	vector<string> predicates;
+	vector<std::pair<string, string>> columns;
+
+	void Add(const GrantPolicy &policy) {
+		any = true;
+		auto predicate = policy.Predicate();
+		if (predicate.empty()) {
+			unrestricted_rls = true;
+		} else {
+			predicates.push_back(predicate);
+		}
+		if (!policy.restricts) {
+			unrestricted_columns = true;
+			return;
+		}
+		for (auto &column : policy.columns) {
+			bool merged = false;
+			for (auto &existing : columns) {
+				if (!StringUtil::CIEquals(existing.first, column.first)) {
+					continue;
+				}
+				if (column.second.empty() || existing.second.empty()) {
+					existing.second.clear(); // one role sees it unmasked, so the principal does
+				} else if (existing.second != column.second) {
+					// two roles mask the same column differently and neither is wider: there is no
+					// order on expressions, so picking one would depend on the row order the join
+					// happens to return. Refuse instead of masking non-deterministically.
+					throw BinderException("acl: the principal's roles mask column \"%s\" differently (\"%s\" vs "
+					                      "\"%s\") - grant the same expression, or drop one of the grants",
+					                      column.first, existing.second, column.second);
+				}
+				merged = true;
+				break;
+			}
+			if (!merged) {
+				columns.push_back(column);
+			}
+		}
+	}
+
+	string Predicate() const {
+		if (unrestricted_rls || predicates.empty()) {
+			return string();
+		}
+		if (predicates.size() == 1) {
+			return predicates[0];
+		}
+		vector<string> wrapped;
+		for (auto &predicate : predicates) {
+			wrapped.push_back("(" + predicate + ")");
+		}
+		return StringUtil::Join(wrapped, " OR ");
+	}
+	bool Restricts() const {
+		return any && !unrestricted_columns;
+	}
+};
+
 //! Parse a caps JSON object ({"select": true, "insert": false, ...}) into the set of enabled
 //! capability names, with duckdb's bundled yyjson. Anything but a flat object of booleans is refused.
 case_insensitive_set_t ParseCaps(const string &json) {
@@ -406,18 +547,21 @@ struct CatalogBackend {
 	string GrantsCte(const Principal &principal) {
 		string grants;
 		if (!function_mode) {
-			grants = "SELECT \"role\", \"vcat\", \"is_main\", \"caps\" FROM " + Tbl("role_catalogs") +
-			         " WHERE \"role\" IN (" + LitList(principal.roles) + ")";
+			grants = "SELECT \"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\" FROM " +
+			         Tbl("role_catalogs") + " WHERE \"role\" IN (" + LitList(principal.roles) + ")";
 		} else {
 			string values;
 			for (auto &grant : Grants(principal.roles)) {
 				values += (values.empty() ? "" : ", ") + string("(") + Lit(grant.role) + ", " + Lit(grant.vcat) + ", " +
 				          (grant.is_main ? "true" : "false") + ", " + Lit(grant.caps) + ")";
 			}
+			// the driver contract has no policy columns (a platform expresses policy in its own
+			// callbacks), so function mode carries NULLs and composes to "no grant-level narrowing"
 			grants = values.empty()
-			             ? string("SELECT '' AS \"role\", '' AS \"vcat\", false AS \"is_main\", '' AS \"caps\""
-			                      " WHERE false")
-			             : "SELECT * FROM (VALUES " + values + ") v(\"role\", \"vcat\", \"is_main\", \"caps\")";
+			             ? string("SELECT '' AS \"role\", '' AS \"vcat\", false AS \"is_main\", '' AS \"caps\","
+			                      " NULL AS \"rls\", NULL AS \"columns\" WHERE false")
+			             : "SELECT *, NULL AS \"rls\", NULL AS \"columns\" FROM (VALUES " + values +
+			                   ") v(\"role\", \"vcat\", \"is_main\", \"caps\")";
 		}
 		return "WITH grants AS (" + grants +
 		       "), main_ok AS (SELECT count(DISTINCT \"vcat\") = 1 AS unique_main FROM grants WHERE \"is_main\") ";
@@ -455,6 +599,24 @@ struct CatalogBackend {
 	//! the caps column of a resolution query; without an object_caps source there is no override
 	string CapsExpr() {
 		return HasObjectCaps() ? "coalesce(oc.\"caps\", g.\"caps\")" : "g.\"caps\"";
+	}
+	//! The grant chain's policy columns (spec 011): the catalog grant's and the object grant's own RLS
+	//! and column list. The function-driver's slots do not carry them, so it composes to no narrowing.
+	string GrantPolicyExprs() {
+		return function_mode ? "NULL AS crls, NULL AS ccols, NULL AS orls, NULL AS ocols"
+		                     : "g.\"rls\" AS crls, g.\"columns\" AS ccols, oc.\"rls\" AS orls,"
+		                       " oc.\"columns\" AS ocols";
+	}
+	//! Fold the four policy columns of one result row into the chain of one role
+	static GrantPolicy RowPolicy(MaterializedQueryResult &result, idx_t row, idx_t first_column) {
+		auto text = [&](idx_t column) {
+			auto value = result.GetValue(column, row);
+			return value.IsNull() ? string() : value.ToString();
+		};
+		GrantPolicy policy;
+		policy.Narrow(text(first_column), text(first_column + 1));     // catalog level
+		policy.Narrow(text(first_column + 2), text(first_column + 3)); // object level
+		return policy;
 	}
 
 	//! Split a written name into its qualified interpretation; empty head = no qualified branch
@@ -508,7 +670,8 @@ struct CatalogBackend {
 		                                       " AND oc.\"vname\" = r.\"vname\""
 		                                 : string();
 		auto sql = GrantsCte(principal) + "SELECT r.\"form\", r.\"phys\", r.\"view_sql\", r.\"rls\", " + CapsExpr() +
-		           " AS caps,"
+		           " AS caps, " + GrantPolicyExprs() +
+		           ","
 		           " CASE WHEN " +
 		           qualified_cond +
 		           " THEN 1 ELSE 2 END AS prio,"
@@ -524,7 +687,7 @@ struct CatalogBackend {
 		if (result->RowCount() == 0) {
 			return false;
 		}
-		auto prio = result->GetValue(5, 0).GetValue<int64_t>();
+		auto prio = result->GetValue(9, 0).GetValue<int64_t>();
 		auto form = result->GetValue(0, 0).ToString();
 		auto phys = result->GetValue(1, 0);
 		auto view_sql = result->GetValue(2, 0);
@@ -533,7 +696,9 @@ struct CatalogBackend {
 		out.query = view_sql.IsNull() ? string() : view_sql.ToString();
 		out.rls = rls.IsNull() ? string() : rls.ToString();
 		out.subquery_form = form != "alias";
-		auto cols = result->GetValue(6, 0);
+		out.writable = form == "alias"; // a real table stays writable, however a grant narrows it
+		vector<std::pair<string, string>> object_columns;
+		auto cols = result->GetValue(10, 0);
 		if (!cols.IsNull() && form != "view") {
 			for (auto &item : ListValue::GetChildren(cols)) {
 				auto &fields = StructValue::GetChildren(item);
@@ -547,20 +712,99 @@ struct CatalogBackend {
 					}
 					continue;
 				}
-				out.projection.push_back(expr.empty() ? name : expr + " AS " + name);
+				object_columns.emplace_back(name, expr);
 			}
 		}
-		// remaining rows of the winning interpretation differ only by role: union their caps
+		// remaining rows of the winning interpretation differ only by role: union their caps, and the
+		// policies of their grant chains (spec 011)
+		GrantUnion grants;
 		for (idx_t row = 0; row < result->RowCount(); row++) {
-			if (result->GetValue(5, row).GetValue<int64_t>() != prio) {
+			if (result->GetValue(9, row).GetValue<int64_t>() != prio) {
 				break; // ordered by prio; the losing interpretation starts here
 			}
 			auto caps = result->GetValue(4, row);
 			for (auto &cap : ParseCaps(caps.IsNull() ? string() : caps.ToString())) {
 				out.caps.insert(cap);
 			}
+			grants.Add(RowPolicy(*result, row, 5));
 		}
+		ApplyGrantPolicy(vname, grants, object_columns, out);
 		return true;
+	}
+
+	//! Compose the grant chain onto the object's own definition (spec 011). A grant only narrows: its
+	//! predicate is AND-ed onto the object's, its column list intersects the object's, and on the
+	//! write path its value columns become assignments - so a narrowed table stays writable.
+	static void ApplyGrantPolicy(const string &vname, const GrantUnion &grants,
+	                             vector<std::pair<string, string>> &object_columns, TablePolicy &out) {
+		auto predicate = grants.Predicate();
+		bool restricts = grants.Restricts();
+		if (predicate.empty() && !restricts) {
+			for (auto &column : object_columns) {
+				out.projection.push_back(column.second.empty() ? column.first : column.second + " AS " + column.first);
+			}
+			return;
+		}
+		if (!out.query.empty()) {
+			// a view has no column list of its own to intersect: wrap its SQL, so the grant's columns
+			// and predicate apply to the view's output
+			vector<string> items;
+			for (auto &column : grants.columns) {
+				items.push_back(column.second.empty() ? Ident(column.first)
+				                                      : column.second + " AS " + Ident(column.first));
+			}
+			out.query = "SELECT " + (restricts ? StringUtil::Join(items, ", ") : string("*")) + " FROM (" + out.query +
+			            ") AS __acl_granted" + (predicate.empty() ? "" : " WHERE " + predicate);
+			return;
+		}
+		if (!predicate.empty()) {
+			out.rls = out.rls.empty() ? predicate : "(" + out.rls + ") AND (" + predicate + ")";
+		}
+		if (!restricts) {
+			for (auto &column : object_columns) {
+				out.projection.push_back(column.second.empty() ? column.first : column.second + " AS " + column.first);
+			}
+			out.subquery_form = out.subquery_form || !out.rls.empty();
+			return;
+		}
+		// the visible columns of the relation as the object defines it: its own projection, or (for an
+		// alias-form table) every physical column under its virtual name
+		for (auto &column : grants.columns) {
+			string source = column.first; // what to read the value from, in physical terms
+			bool known = object_columns.empty();
+			for (auto &defined : object_columns) {
+				if (StringUtil::CIEquals(defined.first, column.first)) {
+					source = defined.second.empty() ? defined.first : defined.second;
+					known = true;
+					break;
+				}
+			}
+			if (!known) {
+				// the object does not expose it, and a grant may never re-expose what it hid
+				throw BinderException("acl: grant on \"%s\" lists column \"%s\", which the object does not expose",
+				                      vname, column.first);
+			}
+			for (auto &rename : out.renames) {
+				if (StringUtil::CIEquals(rename.first, column.first)) {
+					source = rename.second;
+					break;
+				}
+				if (StringUtil::CIEquals(rename.second, column.first)) {
+					throw BinderException("acl: grant on \"%s\" lists column \"%s\", which the object renamed away",
+					                      vname, column.first);
+				}
+			}
+			auto expr = column.second.empty() ? source : column.second;
+			out.projection.push_back(expr == column.first ? expr : expr + " AS " + Ident(column.first));
+			if (!out.writable) {
+				continue;
+			}
+			out.write_columns.insert(source);
+			if (!column.second.empty()) {
+				out.injections.emplace_back(source, column.second);
+			}
+		}
+		out.subquery_form = true; // a narrowed read is a projection, so it needs the subquery shape
 	}
 
 	//! The longest granted schema-alias prefix, picked by the query (ORDER BY prefix length);
@@ -583,7 +827,8 @@ struct CatalogBackend {
 		                                       path_case
 		                                 : string();
 		auto sql = GrantsCte(principal) + "SELECT sa.\"vcat\", sa.\"alias_path\", sa.\"phys_path\", " + CapsExpr() +
-		           " AS caps,"
+		           " AS caps, " + GrantPolicyExprs() +
+		           ","
 		           " CASE WHEN " +
 		           qualified_cond +
 		           " THEN 1 ELSE 2 END AS prio"
@@ -595,15 +840,17 @@ struct CatalogBackend {
 		if (result->RowCount() == 0) {
 			return false;
 		}
-		auto prio = result->GetValue(4, 0).GetValue<int64_t>();
+		auto prio = result->GetValue(8, 0).GetValue<int64_t>();
 		auto vcat = result->GetValue(0, 0).ToString();
 		auto alias_path = result->GetValue(1, 0).ToString();
 		auto &path = prio == 1 ? rest : vname;
 		out.subquery_form = false;
+		out.writable = true; // an aliased schema maps onto real tables
 		out.phys = result->GetValue(2, 0).ToString() + path.substr(alias_path.size());
-		// rows of the same winning alias differ only by role: union their caps
+		// rows of the same winning alias differ only by role: union their caps and grant policies
+		GrantUnion grants;
 		for (idx_t row = 0; row < result->RowCount(); row++) {
-			if (result->GetValue(4, row).GetValue<int64_t>() != prio || result->GetValue(0, row).ToString() != vcat ||
+			if (result->GetValue(8, row).GetValue<int64_t>() != prio || result->GetValue(0, row).ToString() != vcat ||
 			    result->GetValue(1, row).ToString() != alias_path) {
 				continue;
 			}
@@ -611,7 +858,10 @@ struct CatalogBackend {
 			for (auto &cap : ParseCaps(caps.IsNull() ? string() : caps.ToString())) {
 				out.caps.insert(cap);
 			}
+			grants.Add(RowPolicy(*result, row, 4));
 		}
+		vector<std::pair<string, string>> no_columns;
+		ApplyGrantPolicy(vname, grants, no_columns, out);
 		return true;
 	}
 
@@ -635,27 +885,43 @@ struct CatalogBackend {
 		string qualified_cond =
 		    head.empty() ? string("false") : "f.\"vcat\" = " + Lit(head) + " AND f.\"vname\" = " + Lit(rest);
 		vector<string> names = head.empty() ? vector<string> {vname} : vector<string> {vname, rest};
-		auto sql = GrantsCte(principal) +
-		           "SELECT f.\"form\", f.\"target\", f.\"template\","
+		string oc_join = HasObjectCaps() ? " LEFT JOIN " + ObjectCapsSource(principal, names) +
+		                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
+		                                       " AND oc.\"vname\" = f.\"vname\""
+		                                 : string();
+		auto sql = GrantsCte(principal) + "SELECT f.\"vcat\", f.\"form\", f.\"target\", f.\"template\", " +
+		           GrantPolicyExprs() +
+		           ","
 		           " CASE WHEN " +
 		           qualified_cond +
 		           " THEN 1 ELSE 2 END AS prio"
 		           " FROM " +
-		           FunctionsSource(principal, names) +
-		           " f JOIN grants g ON g.\"vcat\" = f.\"vcat\" WHERE f.\"kind\" = '" + kind + "' AND ((" +
-		           qualified_cond +
+		           FunctionsSource(principal, names) + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join +
+		           " WHERE f.\"kind\" = '" + kind + "' AND ((" + qualified_cond +
 		           ") OR (g.\"is_main\" AND (SELECT unique_main FROM main_ok) AND f.\"vname\" = " + Lit(vname) +
-		           ")) ORDER BY prio LIMIT 1";
+		           ")) ORDER BY prio";
 		auto result = Query(sql);
 		TablePolicy policy;
 		bool found = result->RowCount() > 0;
 		if (found) {
-			auto form = result->GetValue(0, 0).ToString();
-			auto target = result->GetValue(1, 0);
-			auto template_sql = result->GetValue(2, 0);
+			auto vcat = result->GetValue(0, 0).ToString();
+			auto form = result->GetValue(1, 0).ToString();
+			auto target = result->GetValue(2, 0);
+			auto template_sql = result->GetValue(3, 0);
+			auto prio = result->GetValue(8, 0).GetValue<int64_t>();
 			policy.subquery_form = form != "alias";
 			policy.phys = target.IsNull() ? string() : target.ToString();
 			policy.query = template_sql.IsNull() ? string() : template_sql.ToString();
+			// rows of the same winning function differ only by role: union their grant policies
+			GrantUnion grants;
+			for (idx_t row = 0; row < result->RowCount(); row++) {
+				if (result->GetValue(8, row).GetValue<int64_t>() != prio ||
+				    result->GetValue(0, row).ToString() != vcat) {
+					continue;
+				}
+				grants.Add(RowPolicy(*result, row, 4));
+			}
+			ApplyFunctionGrantPolicy(vname, table_kind, grants, policy);
 		}
 		lock_guard<mutex> guard(lock);
 		ClearIfOversized(functions);
@@ -664,6 +930,32 @@ struct CatalogBackend {
 			out = policy;
 		}
 		return found;
+	}
+
+	//! A grant narrows a table function the same way it narrows a relation, only the result is not a
+	//! table but the function's output: the rewriter wraps the expanded/retargeted call in
+	//! `SELECT <columns> FROM (<call>) WHERE <predicate>`. A scalar function has neither rows nor
+	//! columns, so a policy on one is refused rather than silently ignored (spec 011).
+	static void ApplyFunctionGrantPolicy(const string &vname, bool table_kind, const GrantUnion &grants,
+	                                     TablePolicy &out) {
+		auto predicate = grants.Predicate();
+		bool restricts = grants.Restricts();
+		if (predicate.empty() && !restricts) {
+			return;
+		}
+		if (!table_kind) {
+			throw BinderException("acl: the grant on scalar function \"%s\" carries a policy, but a scalar "
+			                      "function has no rows or columns to narrow",
+			                      vname);
+		}
+		out.rls = predicate;
+		if (!restricts) {
+			return;
+		}
+		for (auto &column : grants.columns) {
+			out.projection.push_back(column.second.empty() ? Ident(column.first)
+			                                               : column.second + " AS " + Ident(column.first));
+		}
 	}
 
 	//! Targeted gate lookup: only the rows for this name and these roles leave the database ('' as
@@ -1069,13 +1361,20 @@ struct CatalogBackend {
 		        " \"type\" VARCHAR, \"comment\" VARCHAR, \"derived\" BOOLEAN,"
 		        " PRIMARY KEY (\"vcat\", \"vname\", \"kind\", \"pos\"))",
 		    "ALTER TABLE " + Tbl("relations") + " ADD COLUMN IF NOT EXISTS \"comment\" VARCHAR",
+		    // spec 011 (schema v3): a grant carries its own policy, not only capabilities - an RLS
+		    // predicate and a column list that narrow the object for this role (and supply values on
+		    // writes). Both levels of the chain are grant rows, so both gain the two columns.
+		    "ALTER TABLE " + Tbl("role_catalogs") + " ADD COLUMN IF NOT EXISTS \"rls\" VARCHAR",
+		    "ALTER TABLE " + Tbl("role_catalogs") + " ADD COLUMN IF NOT EXISTS \"columns\" VARCHAR",
+		    "ALTER TABLE " + Tbl("role_object_caps") + " ADD COLUMN IF NOT EXISTS \"rls\" VARCHAR",
+		    "ALTER TABLE " + Tbl("role_object_caps") + " ADD COLUMN IF NOT EXISTS \"columns\" VARCHAR",
 		    "ALTER TABLE " + Tbl("functions") + " ADD COLUMN IF NOT EXISTS \"comment\" VARCHAR",
 		    // the declared signature ("name TYPE, …"): it makes a probe meaningful (typed NULLs) and,
 		    // together with a declared result, unnecessary
 		    "ALTER TABLE " + Tbl("functions") + " ADD COLUMN IF NOT EXISTS \"params\" VARCHAR",
-		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '2' WHERE NOT EXISTS (SELECT 1 FROM " +
+		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '3' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
-		    "UPDATE " + Tbl("meta") + " SET \"value\" = '2' WHERE \"key\" = 'schema_version' AND \"value\" < '2'",
+		    "UPDATE " + Tbl("meta") + " SET \"value\" = '3' WHERE \"key\" = 'schema_version' AND \"value\" < '3'",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'policy_version')",
 		};
@@ -1280,7 +1579,8 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 	catalog->Write(statements);
 }
 
-void PolicyStore::CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main) {
+void PolicyStore::CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
+                               const string &rls, const string &columns) {
 	RequireCatalog(catalog, "acl_grant_catalog");
 	if (vcat.empty()) {
 		throw BinderException("acl admin: a grant needs a catalog name");
@@ -1288,8 +1588,10 @@ void PolicyStore::CatalogGrant(const string &role, const string &vcat, const str
 	acl_detail::ParseCaps(caps_json); // validate before persisting
 	catalog->Write({"DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat),
-	                "INSERT INTO " + catalog->Tbl("role_catalogs") + " VALUES (" + Lit(role) + ", " + Lit(vcat) + ", " +
-	                    (is_main ? "true" : "false") + ", " + Lit(caps_json) + ")"});
+	                "INSERT INTO " + catalog->Tbl("role_catalogs") +
+	                    "(\"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\") VALUES (" + Lit(role) +
+	                    ", " + Lit(vcat) + ", " + (is_main ? "true" : "false") + ", " + Lit(caps_json) + ", " +
+	                    Lit(rls) + ", " + Lit(columns) + ")"});
 }
 
 void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
@@ -1634,16 +1936,26 @@ void PolicyStore::CatalogAlterRole(const string &role, const case_insensitive_ma
 
 void PolicyStore::CatalogAlterGrant(const string &role, const string &vcat, const string &field, const string &value) {
 	RequireCatalog(catalog, "acl_alter_grant");
-	auto current = RequireRow(*catalog,
-	                          "SELECT \"is_main\", \"caps\" FROM " + catalog->Tbl("role_catalogs") +
-	                              " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat),
-	                          "grant of catalog \"" + vcat + "\" to role \"" + role + "\"");
+	auto current =
+	    RequireRow(*catalog,
+	               "SELECT \"is_main\", \"caps\", \"rls\", \"columns\" FROM " + catalog->Tbl("role_catalogs") +
+	                   " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat),
+	               "grant of catalog \"" + vcat + "\" to role \"" + role + "\"");
 	auto is_main_value = current->GetValue(0, 0);
 	bool is_main = !is_main_value.IsNull() && is_main_value.GetValue<bool>();
-	auto caps_value = current->GetValue(1, 0);
-	string caps = caps_value.IsNull() ? string("{}") : caps_value.ToString();
+	auto text = [&](idx_t column) {
+		auto stored = current->GetValue(column, 0);
+		return stored.IsNull() ? string() : stored.ToString();
+	};
+	string caps = current->GetValue(1, 0).IsNull() ? string("{}") : text(1);
+	string rls = text(2);
+	string columns = text(3);
 	if (field == "caps") {
 		caps = value;
+	} else if (field == "rls") {
+		rls = value;
+	} else if (field == "columns") {
+		columns = value;
 	} else if (field == "main") {
 		if (!StringUtil::CIEquals(value, "true") && !StringUtil::CIEquals(value, "false")) {
 			throw BinderException("acl admin: MAIN expects true or false, got \"%s\"", value);
@@ -1652,7 +1964,7 @@ void PolicyStore::CatalogAlterGrant(const string &role, const string &vcat, cons
 	} else {
 		throw BinderException("acl admin: unknown grant property \"%s\"", field);
 	}
-	CatalogGrant(role, vcat, caps, is_main);
+	CatalogGrant(role, vcat, caps, is_main, rls, columns);
 }
 
 void PolicyStore::CatalogAlterIssuer(const string &issuer, const string &field, const string &value) {
@@ -1759,18 +2071,56 @@ void PolicyStore::CatalogMapRole(const string &issuer, const string &source, con
 }
 
 void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,
-                                       const string &caps_json) {
+                                       const string &caps_json, const string &rls, const string &columns) {
 	RequireCatalog(catalog, "acl catalog");
 	acl_detail::ParseCaps(caps_json);
 	catalog->Write({"DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname),
-	                "INSERT INTO " + catalog->Tbl("role_object_caps") + " VALUES (" + Lit(role) + ", " + Lit(vcat) +
-	                    ", " + Lit(vname) + ", " + Lit(caps_json) + ")"});
+	                "INSERT INTO " + catalog->Tbl("role_object_caps") +
+	                    "(\"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\") VALUES (" + Lit(role) + ", " +
+	                    Lit(vcat) + ", " + Lit(vname) + ", " + Lit(caps_json) + ", " + Lit(rls) + ", " + Lit(columns) +
+	                    ")"});
+}
+
+void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy) {
+	RequireCatalog(catalog, "acl_grant_object");
+	// what the name is, in the terms resolution uses: a relation, a table reached through a schema
+	// alias, a function - or the bare alias path, which resolution never looks up by itself
+	auto result = catalog->Query(
+	    "SELECT 'relation' AS kind FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+	    " AND \"vname\" = " + Lit(vname) + " UNION ALL SELECT \"kind\" FROM " + catalog->Tbl("functions") +
+	    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+	    " UNION ALL SELECT CASE WHEN \"alias_path\" = " + Lit(vname) + " THEN 'alias' ELSE 'relation' END FROM " +
+	    catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) + " AND (\"alias_path\" = " + Lit(vname) +
+	    " OR substr(" + Lit(vname) + ", 1, length(\"alias_path\") + 1) = \"alias_path\" || '.')");
+	if (result->RowCount() == 0) {
+		throw BinderException("acl admin: object \"%s.%s\" does not exist", vcat, vname);
+	}
+	case_insensitive_set_t kinds;
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		kinds.insert(result->GetValue(0, row).ToString());
+	}
+	if (kinds.count("relation") || kinds.count("table")) {
+		return; // rows to narrow, and capabilities that resolution will find
+	}
+	if (kinds.count("alias")) {
+		// a schema alias is a prefix, never a relation of its own: resolution looks up the written
+		// path, so a grant on the bare alias would never be found
+		throw BinderException("acl admin: \"%s.%s\" is a schema alias, so a grant on it would never apply - "
+		                      "grant the table inside it (\"%s.<table>\")",
+		                      vcat, vname, vname);
+	}
+	if (with_policy) {
+		// a scalar function returns a value, not rows: an RLS predicate or a column list on one would
+		// silently do nothing, so the grant is refused instead
+		throw BinderException("acl admin: scalar function \"%s.%s\" has no rows or columns to narrow", vcat, vname);
+	}
 }
 
 void PolicyStore::CatalogEnsureGrant(const string &role, const string &vcat, bool is_main) {
 	RequireCatalog(catalog, "acl catalog");
-	catalog->Write({"INSERT INTO " + catalog->Tbl("role_catalogs") + " SELECT " + Lit(role) + ", " + Lit(vcat) + ", " +
+	catalog->Write({"INSERT INTO " + catalog->Tbl("role_catalogs") +
+	                "(\"role\", \"vcat\", \"is_main\", \"caps\") SELECT " + Lit(role) + ", " + Lit(vcat) + ", " +
 	                (is_main ? "true" : "false") + ", '{}' WHERE NOT EXISTS (SELECT 1 FROM " +
 	                catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat) +
 	                ")"});
