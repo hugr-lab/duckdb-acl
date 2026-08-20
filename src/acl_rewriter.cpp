@@ -783,6 +783,26 @@ private:
 	//! operations - because a marker left behind fails closed at bind, which would make a perfectly
 	//! reasonable template (a predicate over a subquery, a UNION of two tenant slices) unusable.
 	void BakeMarkersInNode(QueryNode &node, const vector<unique_ptr<ParsedExpression>> *args) {
+		for (auto &entry : node.cte_map.map) {
+			if (entry.second->query_node) {
+				BakeMarkersInNode(*entry.second->query_node, args);
+			}
+		}
+		if (node.type == QueryNodeType::CTE_NODE) {
+			// a guard, not a live path: a template's WITH clause currently parses into a subquery ref
+			// in the FROM, so this node does not reach us - but duckdb's iterator has no case for it
+			// and its default throws, and we track duckdb's main branch
+			auto &cte = node.Cast<CTENode>();
+			if (cte.query) {
+				BakeMarkersInNode(*cte.query, args);
+			}
+			if (cte.child) {
+				BakeMarkersInNode(*cte.child, args);
+			}
+			ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+			    node, [&](unique_ptr<ParsedExpression> &child) { BakeMarkers(child, args); });
+			return;
+		}
 		ParsedExpressionIterator::EnumerateQueryNodeChildren(
 		    node, [&](unique_ptr<ParsedExpression> &child) { BakeMarkers(child, args); });
 	}

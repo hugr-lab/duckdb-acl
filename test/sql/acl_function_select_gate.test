@@ -222,6 +222,16 @@ ACL ROLE "tenanted" SELECT id FROM at_least(150);
 ----
 2
 
+# a claim inside a CTE of the template: the CTE body lands in the FROM clause, which the old walk
+# did not visit at all
+statement ok
+ACL ADMIN ADD VIEW sales.via_cte AS 'WITH mine AS (SELECT id, tenant FROM phys.main.orders_physical WHERE tenant = acl_claim(''tenant'')) SELECT id FROM mine';
+
+query I
+ACL ROLE "tenanted" SELECT id FROM via_cte;
+----
+1
+
 # a claim inside a subquery of an RLS predicate
 statement ok
 ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.scoped RLS 'tenant IN (SELECT tenant FROM phys.main.orders_physical WHERE tenant = acl_claim(''tenant''))';

@@ -54,7 +54,10 @@ exist`) — safe, but it made perfectly reasonable policy unusable: a predicate 
 Baking now walks every expression of the node through duckdb's own query-node iterator and descends
 into subquery expressions explicitly (the iterator stops at their boundary). Fail-closed is unchanged
 — a marker that is somehow still missed is still not a function — but the templates an admin would
-naturally write now resolve.
+naturally write now resolve. A `WITH` clause is covered by the same walk: a template's CTE parses into
+a subquery ref in the `FROM`, which the old walk skipped entirely. The explicit CTE-node branch next
+to it is a guard rather than a live path — no template shape produces that node today, but duckdb's
+traversal has no case for it and its default throws, and we track duckdb's `main`.
 
 ### Memory backend
 
@@ -71,14 +74,14 @@ capability is resolved through the same grant chain in both paths.
 
 ## Testing
 
-`test/sql/acl_function_select_gate.test` (54 assertions): a write-only catalog grant denied on a
+`test/sql/acl_function_select_gate.test` (56 assertions): a write-only catalog grant denied on a
 virtual table function, on a macro scalar, on an alias scalar and on a scalar whose template reads a
 table (the leak this closes); the write itself still working, so the grant is narrowed and not broken;
 a per-object `select` grant on one function allowing exactly that one while its neighbours stay
 denied; the object-level capability of spec 011 overriding the catalog's in both directions; the gate
 running before expansion (a denied call to a function with a broken template reports the ACL refusal,
 not a binder error); and markers baking inside a subquery, on both sides of a `UNION`, in a
-table-function macro's subquery and in an RLS predicate's subquery. The existing suites (`acl.test`,
+table-function macro's subquery, in a `WITH` clause and in an RLS predicate's subquery. The existing suites (`acl.test`,
 `acl_catalog.test`, `acl_functions_driver.test`) prove the memory, catalog and function-driver paths
 still resolve their functions.
 
