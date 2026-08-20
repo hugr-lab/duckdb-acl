@@ -1,7 +1,7 @@
 # name: test/sql/acl_metadata_leak.test
 # description: metadata surfaces under a principal (spec 010 part 3, step 1) - duckdb exposes the same
-#   catalog three ways (table function, view, information_schema), and a principal's query must not
-#   enumerate the physical catalog through any of them
+#   catalog three ways (table function, view, information_schema) - all three must answer with the
+#   principal's own catalog, and the surfaces that have no filtered form stay refused
 # group: [sql]
 
 require acl
@@ -42,41 +42,49 @@ ACL ROLE "analyst" SELECT count(*) FROM orders;
 ----
 0
 
-# --- the same catalog, three surfaces, none of them a way around the ACL ---------------------------
+# --- the same catalog, three surfaces, all of them answering with the principal's own --------------
+# the table function used to return every table of every attached database; the two view forms were
+# refused by accident, being unknown virtual names. All three are now the same listing.
 
-# 1. the table function - this one used to return every table of every attached database
-statement error
+query I
 ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables();
 ----
-<REGEX>:.*table function "duckdb_tables" is not allowed.*
+1
 
-# 2. the view of the same name
-statement error
+query I
 ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables;
 ----
-<REGEX>:.*no access to object "duckdb_tables".*
+1
 
-# 3. information_schema
-statement error
+query I
 ACL ROLE "analyst" SELECT count(*) FROM information_schema.tables;
 ----
-<REGEX>:.*no access to object "information_schema.tables".*
+1
 
-statement error
-ACL ROLE "analyst" SELECT count(*) FROM information_schema.columns;
+query III
+ACL ROLE "analyst" SELECT table_catalog, table_schema, table_name FROM information_schema.tables;
 ----
-<REGEX>:.*no access to object "information_schema.columns".*
+sales	main	orders
 
-# the neighbours of duckdb_tables enumerate just as much
-statement error
-ACL ROLE "analyst" SELECT count(*) FROM duckdb_columns();
+# the table the role was never granted is in none of them, under any name
+query I
+ACL ROLE "analyst" SELECT count(*) FROM information_schema.tables WHERE table_name = 'secrets';
 ----
-<REGEX>:.*table function "duckdb_columns" is not allowed.*
+0
 
-statement error
-ACL ROLE "analyst" SELECT count(*) FROM duckdb_databases();
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_columns() WHERE table_name = 'secrets';
 ----
-<REGEX>:.*table function "duckdb_databases" is not allowed.*
+0
+
+# ... and neither is the physical database that holds it
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_databases() WHERE database_name = 'phys';
+----
+0
+
+# --- the metadata surfaces with no substitution stay refused ---------------------------------------
+# a listing nobody filtered is a listing of the physical catalog, so it is a denial until it has one
 
 statement error
 ACL ROLE "analyst" SELECT count(*) FROM duckdb_secrets();
@@ -84,9 +92,14 @@ ACL ROLE "analyst" SELECT count(*) FROM duckdb_secrets();
 <REGEX>:.*table function "duckdb_secrets" is not allowed.*
 
 statement error
-ACL ROLE "analyst" SELECT ssn FROM pragma_table_info('phys.main.secrets');
+ACL ROLE "analyst" SELECT * FROM pragma_table_info('phys.main.secrets');
 ----
 <REGEX>:.*table function "pragma_table_info" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_constraints();
+----
+<REGEX>:.*table function "duckdb_constraints" is not allowed.*
 
 # --- the native context is unchanged: that is what it is for ---------------------------------------
 

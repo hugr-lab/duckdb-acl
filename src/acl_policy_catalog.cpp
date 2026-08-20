@@ -1060,6 +1060,119 @@ struct CatalogBackend {
 		return false;
 	}
 
+	//! The SQL behind a metadata surface (spec 010 part 3): the principal's own catalog, in the shape
+	//! duckdb's own metadata has. The shape is not rebuilt by hand - the physical row is joined and its
+	//! identity columns are REPLACEd with the virtual ones, so every other column (types, nullability,
+	//! whatever duckdb adds next) stays correct for free. Objects without a physical row (a view, a
+	//! query-defined function) are added through UNION ALL BY NAME, which fills the rest with NULL.
+	string MetadataListingSql(const Principal &principal, const string &surface) {
+		if (function_mode) {
+			throw BinderException("acl: this policy source does not expose enumeration, so %s cannot be listed "
+			                      "for a principal",
+			                      surface);
+		}
+		// an object appears when the role holds something on it; '{}' is an explicit nothing (spec 012)
+		auto visible =
+		    "(" + CapsExpr() + " IS NULL OR trim(" + CapsExpr() + ") = '' OR trim(" + CapsExpr() + ") <> '{}')";
+		string oc_join = HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
+		                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = r.\"vcat\""
+		                                       " AND oc.\"vname\" = r.\"vname\""
+		                                 : string();
+		// the written path splits into a virtual schema and a name; a bare name sits in `main`
+		string objects = "objects AS (SELECT DISTINCT r.\"vcat\" AS vcat,"
+		                 " CASE WHEN position('.' IN r.\"vname\") > 0"
+		                 " THEN regexp_extract(r.\"vname\", '^(.*)[.][^.]*$', 1) ELSE 'main' END AS vschema,"
+		                 " regexp_extract(r.\"vname\", '([^.]*)$', 1) AS vname, r.\"form\" AS form,"
+		                 " r.\"comment\" AS comment,"
+		                 " str_split(r.\"phys\", '.') AS parts FROM " +
+		                 Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " +
+		                 visible + ")";
+		// an alias schema shows the physical schema live, so its visibility is the role's capabilities
+		// on that schema (its own grant if it has one, otherwise the catalog's) - without this filter a
+		// role granted an explicit nothing would still read the names out of the source
+		auto schema_caps = "coalesce(nullif(trim((SELECT sc.\"caps\" FROM " + Tbl("role_schemas") +
+		                   " sc WHERE sc.\"role\" = g.\"role\" AND sc.\"vcat\" = s.\"vcat\""
+		                   " AND sc.\"schema_path\" = s.\"path\")), ''), g.\"caps\")";
+		auto schema_visible =
+		    "(" + schema_caps + " IS NULL OR trim(" + schema_caps + ") = '' OR trim(" + schema_caps + ") <> '{}')";
+		string aliases = "aliases AS (SELECT DISTINCT s.\"vcat\" AS vcat, s.\"path\" AS path,"
+		                 " str_split(s.\"phys_path\", '.') AS parts FROM " +
+		                 Tbl("schemas") +
+		                 " s JOIN grants g ON g.\"vcat\" = s.\"vcat\""
+		                 " WHERE s.\"phys_path\" IS NOT NULL AND " +
+		                 schema_visible + ")";
+		// a schema exists for the principal when something inside it does
+		string schemas = "vschemas AS (SELECT vcat, path FROM aliases UNION SELECT vcat, vschema FROM objects)";
+		auto prelude = GrantsCte(principal) + ", " + objects + ", " + aliases + ", " + schemas + " ";
+		if (surface == "databases") {
+			// one row per granted catalog, and no physical database name ever appears
+			return prelude + "SELECT DISTINCT vcat AS database_name, NULL AS path, NULL AS comment,"
+			                 " NULL AS tags, false AS internal, NULL AS type, NULL AS database_oid,"
+			                 " false AS readonly FROM vschemas";
+		}
+		if (surface == "schemata") {
+			return prelude + "SELECT DISTINCT vcat AS catalog_name, path AS schema_name, NULL AS schema_owner,"
+			                 " NULL AS default_character_set_catalog, NULL AS default_character_set_schema,"
+			                 " NULL AS default_character_set_name, NULL AS sql_path, false AS internal,"
+			                 " NULL AS comment FROM vschemas";
+		}
+		auto physical = "i.\"table_catalog\" = o.parts[1] AND i.\"table_schema\" = o.parts[2]"
+		                " AND i.\"table_name\" = o.parts[3]";
+		if (surface == "tables") {
+			return prelude +
+			       "SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name)"
+			       " FROM objects o JOIN information_schema.tables i ON " +
+			       physical +
+			       " WHERE len(o.parts) = 3"
+			       " UNION ALL BY NAME"
+			       " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
+			       " 'VIEW' AS table_type FROM objects o WHERE o.form = 'view'"
+			       " UNION ALL BY NAME"
+			       " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema)"
+			       " FROM aliases a JOIN information_schema.tables i"
+			       " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
+			       " WHERE len(a.parts) = 2";
+		}
+		if (surface != "columns") {
+			throw BinderException("acl: unknown metadata surface \"%s\"", surface);
+		}
+		// the columns a role actually sees: an object's own projection when it has one (its rows in
+		// relation_columns name the visible columns, and for an alias form they map virtual -> physical)
+		string projection = " LEFT JOIN " + Tbl("relation_columns") +
+		                    " c ON c.\"vcat\" = o.vcat AND c.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
+		                    " ELSE o.vschema || '.' || o.vname END";
+		// An `alias` relation is the physical table under a virtual name (possibly with renamed
+		// columns), so its listing is the physical row with the identity columns replaced - the rich
+		// shape, for free. Anything else - a projection, a view - is described by its own stored
+		// schema: a masked or computed column has no physical row to borrow, and leaving it out would
+		// hide a column the role can read.
+		return prelude +
+		       "SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
+		       " coalesce(c.\"name\", i.\"column_name\") AS column_name)"
+		       " FROM objects o JOIN information_schema.columns i ON " +
+		       physical + projection +
+		       " AND c.\"expr\" = i.\"column_name\""
+		       " WHERE len(o.parts) = 3 AND o.form = 'alias'"
+		       " AND (c.\"name\" IS NOT NULL OR NOT EXISTS"
+		       " (SELECT 1 FROM " +
+		       Tbl("relation_columns") +
+		       " c2 WHERE c2.\"vcat\" = o.vcat AND c2.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
+		       " ELSE o.vschema || '.' || o.vname END))"
+		       " UNION ALL BY NAME"
+		       " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
+		       " oc.\"name\" AS column_name, oc.\"pos\" + 1 AS ordinal_position, oc.\"type\" AS data_type,"
+		       " oc.\"comment\" AS comment FROM objects o JOIN " +
+		       Tbl("object_columns") +
+		       " oc ON oc.\"vcat\" = o.vcat AND oc.\"kind\" = 'relation'"
+		       " AND oc.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
+		       " ELSE o.vschema || '.' || o.vname END WHERE o.form <> 'alias'"
+		       " UNION ALL BY NAME"
+		       " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema)"
+		       " FROM aliases a JOIN information_schema.columns i"
+		       " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
+		       " WHERE len(a.parts) = 2";
+	}
+
 	//! Targeted gate lookup: only the rows for this name and these roles leave the database ('' as
 	//! role means a global row - NULL cannot be part of the primary key). Role-specific rows beat
 	//! global rows; among role rows an explicit deny wins.
@@ -1662,6 +1775,22 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 		schema = CatalogBackend::ParseDeclaration(returns); // declared: never probed
 	} else if (form == "view") {
 		derived = catalog.ProbeSchema(view_sql, false, {}, schema);
+	} else if (form == "subquery" && !phys.empty() && !columns.empty()) {
+		// A projection is what the role sees, and a computed or masked column (`total = amount * 2`,
+		// `ssn = NULL`) has no physical column to read a type from - so bind the projection once, here
+		// on the write path, exactly as a view's SQL is bound (spec 010). Without this the column is
+		// readable but typeless, and metadata cannot describe it (spec 010 part 3).
+		vector<string> items;
+		for (auto &column : columns) {
+			items.push_back(column.second.empty() ? column.first : column.second + " AS " + column.first);
+		}
+		derived = catalog.ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + phys, false, {}, schema);
+		if (!derived) {
+			schema.clear();
+			for (auto &column : columns) {
+				schema.emplace_back(column.first, string()); // the probe could not bind: names only
+			}
+		}
 	} else {
 		for (auto &column : columns) {
 			schema.emplace_back(column.first, string()); // type filled from the physical catalog on read
@@ -1794,6 +1923,14 @@ void PolicyStore::CatalogRegisterCreated(const string &vcat, const string &vname
 			                     " AND \"name\" = " + Lit(vname.substr(dot + 1)));
 		}
 	});
+}
+
+bool PolicyStore::MetadataListing(const Principal &principal, const string &surface, string &sql) {
+	if (!catalog) {
+		return false; // the memory store has no catalog to list; the surface stays denied
+	}
+	sql = catalog->MetadataListingSql(principal, surface);
+	return true;
 }
 
 bool PolicyStore::ResolveDdlTarget(const Principal &principal, const string &vname, const string &capability,

@@ -83,12 +83,14 @@ SELECT count(*) FROM aclcat.acl.object_columns WHERE vname = 'rng';
 statement ok
 ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS 'id,amount,ssn=NULL';
 
-query II
-SELECT name, derived FROM aclcat.acl.object_columns WHERE vname = 'orders' ORDER BY pos;
+# a projection is bound at write time like a view's SQL, so its columns carry types - including the
+# ones no physical column has (`ssn = NULL` here) - and are re-derived by ANALYZE when the source moves
+query III
+SELECT name, type, derived FROM aclcat.acl.object_columns WHERE vname = 'orders' ORDER BY pos;
 ----
-id	false
-amount	false
-ssn	false
+id	INTEGER	true
+amount	INTEGER	true
+ssn	"NULL"	true
 
 # --- declared schemas: the CREATE VIEW / CREATE MACRO shapes ---------------------------------------
 # a declaration is the truth and needs no probe - which matters for argument-dependent templates

@@ -201,6 +201,10 @@ struct PolicyStore {
 	//! origin, nothing else to choose
 	void CatalogRegisterCreated(const string &vcat, const string &vname, const string &phys,
 	                            const string &origin = string());
+	//! The SQL behind a metadata surface for this principal (spec 010 part 3): duckdb's own shape,
+	//! filtered to what the roles hold, with virtual names in place of physical ones. False when the
+	//! active source cannot enumerate (memory mode); the driver mode throws with the reason.
+	bool MetadataListing(const Principal &principal, const string &surface, string &sql);
 	//! Resolve where a principal's `CREATE`/`DROP` of `vname` lands, requiring `capability`
 	//! (`create` or `drop`) on the virtual schema that owns the name (spec 016). False = no such
 	//! schema for this principal; a schema without the capability throws.

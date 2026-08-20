@@ -399,6 +399,12 @@ private:
 				return; // a CTE reference, not a catalog object
 			}
 			auto key = VirtualKey(base.GetQualifiedName());
+			if (auto surface = MetadataSurface(key)) {
+				// `FROM information_schema.tables` / `FROM duckdb_tables` - the view forms
+				auto alias = base.alias.empty() ? base.Table() : base.alias;
+				ref = BuildMetadataSubquery(surface, alias);
+				return;
+			}
 			TablePolicy policy;
 			if (!store.ResolveTable(principal, key, policy)) {
 				Deny("no access to object \"" + key + "\"");
@@ -479,6 +485,11 @@ private:
 			}
 			// a grant narrows what the function returns, whichever form it took (spec 011)
 			WrapWithGrantPolicy(ref, policy, alias);
+			return;
+		}
+		if (auto surface = MetadataSurface(vname)) {
+			// `FROM duckdb_tables()` - the function form of the same catalog
+			ref = BuildMetadataSubquery(surface, tf.alias.empty() ? Identifier(vname) : tf.alias);
 			return;
 		}
 		// not a virtual table function: gate by name, then rewrite arguments and any subquery argument
@@ -587,6 +598,34 @@ private:
 		sub->column_name_alias = std::move(original.column_name_alias);
 		sub->sample = std::move(original.sample);
 		return std::move(sub);
+	}
+
+	//! duckdb exposes the same catalog as a table function, as a view of the same name and through
+	//! `information_schema` (spec 010 part 3). All three are the same question - "what is in this
+	//! catalog?" - and under a principal all three must answer with the principal's catalog.
+	static const char *MetadataSurface(const string &name) {
+		static const case_insensitive_map_t<string> SURFACES = {
+		    {"information_schema.tables", "tables"},
+		    {"information_schema.columns", "columns"},
+		    {"information_schema.schemata", "schemata"},
+		    {"duckdb_tables", "tables"},
+		    {"duckdb_views", "tables"},
+		    {"duckdb_columns", "columns"},
+		    {"duckdb_schemas", "schemata"},
+		    {"duckdb_databases", "databases"},
+		};
+		auto entry = SURFACES.find(name);
+		return entry == SURFACES.end() ? nullptr : entry->second.c_str();
+	}
+
+	//! Replace a metadata surface with the principal's own catalog in the same shape
+	unique_ptr<TableRef> BuildMetadataSubquery(const char *surface, const Identifier &alias) {
+		string sql;
+		if (!store.MetadataListing(principal, surface, sql)) {
+			Deny(string("metadata is not available: this policy source cannot enumerate ") + surface);
+		}
+		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
 	}
 
 	//! `phys AS virt` items of a relation's rename list
