@@ -54,8 +54,9 @@ test/harness/run.sh                 # end-to-end demo against the built extensio
 
 # integration (specs/005): real DBs in docker + scanner-backed scenarios
 cp .env.example .env                # once
+make vcpkg-setup                    # once: scanner dependencies come from vcpkg (merged manifests)
 make docker-up                      # postgres + mysql + sqlserver (initialized)
-ACL_INTEGRATION=1 GEN=ninja make    # build incl. postgres_scanner/ducklake (macOS: brew install libpq croaring)
+ACL_INTEGRATION=1 GEN=ninja make    # build incl. postgres_scanner/ducklake
 make test-integration               # scenarios in test/sql/integration/ (skip w/o scanner or DSN)
 ```
 
@@ -85,12 +86,17 @@ Enable the override in a session with `SET allow_parser_override_extension='fall
 - **State is per-instance**: `PolicyStore` reached via `AclParserInfo` (parser) and `AclScalarInfo`
   (admin functions' `function_info`) — no process globals.
 
-## Admin / setup functions (stubs)
+## Admin / setup functions
 
-`acl_define_token`, `acl_define_role`, `acl_grant_table`, `acl_grant_view`,
-`acl_grant_table_function[,_alias]`, `acl_grant_scalar[,_alias]`, `acl_deny_function`,
-`acl_allow_function`. These populate the `PolicyStore`; production replaces them with the read-only
-role-aware resolver behind the same seam.
+Two layers (spec 006). **Catalog model**: `acl_use_db(name[,schema[,init]])` switches the store to a
+policy catalog in any ATTACHed database (standard duckdb dialect only, source agnostic);
+`acl_create_catalog`, `acl_add_relation/_view/_schema_alias/_table_function[_alias]/_scalar[_alias]`,
+`acl_grant_catalog(role, vcat, caps_json, is_main)`, `acl_revoke_catalog`, `acl_drop_relation`.
+Setting `acl_version_check_interval` bounds policy staleness. **Legacy stubs / wrappers**:
+`acl_define_token` (memory-only until JWT lands, spec 007), `acl_define_role`, `acl_grant_table`,
+`acl_grant_view`, `acl_grant_table_function[,_alias]`, `acl_grant_scalar[,_alias]`,
+`acl_deny_function`, `acl_allow_function` — without a catalog they fill the in-memory store; with one
+they write the same content into the implicit virtual catalog `default`.
 
 ## Working process — per-feature specs
 

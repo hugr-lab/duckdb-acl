@@ -67,6 +67,7 @@ make test-cpp       # standalone C++ invariant tests only (test/cpp/)
 
 # integration against real databases (docker; see specs/005)
 cp .env.example .env
+make vcpkg-setup
 make docker-up
 ACL_INTEGRATION=1 make    # also builds postgres_scanner + ducklake
 make test-integration

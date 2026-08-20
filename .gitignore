@@ -16,3 +16,7 @@ design/
 
 # local integration-test environment config (copy of .env.example)
 .env
+
+# local vcpkg checkout + artifacts (make vcpkg-setup)
+vcpkg/
+vcpkg_installed/

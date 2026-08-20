@@ -63,6 +63,7 @@ jobs:
       GEN: ninja
       ACL_INTEGRATION: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -71,17 +72,21 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache libpq-dev postgresql-client mysql-client
+          sudo apt-get install -y ninja-build ccache postgresql-client mysql-client
 
-      # ducklake needs CRoaring's cmake package; ubuntu's libroaring-dev is too old
-      - name: Build CRoaring (ducklake dependency)
-        run: |
-          git clone --depth 1 --branch v5.0.0 https://github.com/RoaringBitmap/CRoaring
-          cmake -S CRoaring -B CRoaring/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_ROARING_TESTS=OFF -DROARING_BUILD_STATIC=ON \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-          cmake --build CRoaring/build
-          sudo cmake --install CRoaring/build
+      # scanner dependencies (libpq/openssl/roaring/...) come from vcpkg via the merged manifests
+      # of the loaded extensions - the standard duckdb-extension dependency flow
+      - name: Setup vcpkg
+        run: make vcpkg-setup
+
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v6
+        with:
+          path: vcpkg_bincache
+          key: vcpkg-bincache-linux_amd64-${{ hashFiles('.gitmodules') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-bincache-linux_amd64-${{ hashFiles('.gitmodules') }}-
+            vcpkg-bincache-linux_amd64-
 
       - name: Restore ccache
         uses: actions/cache@v6

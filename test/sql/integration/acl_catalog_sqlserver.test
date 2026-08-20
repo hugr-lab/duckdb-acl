@@ -1,0 +1,75 @@
+# name: test/sql/integration/acl_catalog_sqlserver.test
+# description: catalog-backed policy store over a live SQL Server catalog (spec 006) - the managed
+#   schema is created through hugr-lab/mssql-extension, policy resolves from it. Skips until the
+#   mssql duckdb-main compatibility build lands (see extension_config.cmake).
+# group: [integration]
+
+require acl
+
+require mssql
+
+require-env ACL_MSSQL_DSN
+
+statement ok
+ATTACH '${ACL_MSSQL_DSN}' AS ms (TYPE mssql);
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+# the policy catalog lives in SQL Server itself (schema init through the scanner)
+statement ok
+SELECT acl_use_db('ms', 'acl', true);
+
+# rebuild the policy from scratch so reruns stay deterministic (the catalog db persists)
+statement ok
+SELECT acl_revoke_catalog('analyst', 'mslive');
+
+statement ok
+SELECT acl_drop_relation('mslive', 'orders');
+
+statement ok
+SELECT acl_drop_relation('mslive', 'audit');
+
+statement ok
+SELECT acl_create_catalog('mslive', 'policy for the live sqlserver fixture');
+
+statement ok
+SELECT acl_add_relation('mslive', 'orders', 'ms.dbo.orders', 'id,amount', 'tenant = acl_claim(''tenant'')');
+
+statement ok
+SELECT acl_add_relation('mslive', 'audit', 'ms.dbo.audit_log', '', '');
+
+statement ok
+SELECT acl_grant_catalog('analyst', 'mslive', '{"select": true, "insert": true, "delete": true}', true);
+
+statement ok
+SELECT acl_define_role('analyst', 'tenant=acme');
+
+# policy persisted in SQL Server, enforcement over the SQL Server fixture
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+statement ok
+ACL ROLE "analyst" INSERT INTO audit VALUES (300, 'from-mssql-catalog');
+
+query II
+ACL ROLE "analyst" SELECT id, note FROM audit;
+----
+300	from-mssql-catalog
+
+statement ok
+ACL ROLE "analyst" DELETE FROM audit WHERE id = 300;
+
+statement error
+ACL ROLE "analyst" SELECT * FROM ms.dbo.orders;
+----
+<REGEX>:.*no access to object.*
+
+# the managed schema is plainly visible in the catalog database
+query I
+SELECT count(*) > 0 FROM ms.acl.relations WHERE vcat = 'mslive';
+----
+true

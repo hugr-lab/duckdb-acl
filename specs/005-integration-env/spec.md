@@ -36,8 +36,11 @@ against the container-made cache (`/duckdb_build_dir` vs the host checkout) and 
   lean. Pins come from the duckdb submodule's own `.github/config/extensions/*.cmake` — the versions
   and patches tested against the exact duckdb commit we track. `postgres_scanner` and `ducklake`
   build; `mysql_scanner` is disabled at the submodule pin ("patches do not apply") and flips on here
-  the moment the submodule re-enables it. macOS build deps via Homebrew (`libpq`, `croaring`), wired
-  into `EXT_FLAGS` by the Makefile; Linux uses `libpq-dev` + CRoaring built from source.
+  the moment the submodule re-enables it. Build dependencies (libpq/openssl/roaring/...) come from
+  **vcpkg** through the merged manifests of the loaded extensions — the standard duckdb-extension
+  flow (`make vcpkg-setup` once; `USE_MERGED_VCPKG_MANIFEST` is wired by the Makefile). The SQL
+  Server scanner (our `hugr-lab/mssql-extension`) has its own opt-in gate
+  (`ACL_INTEGRATION_MSSQL=1`), pending its duckdb-main compatibility build.
 - **Scenarios** (`test/sql/integration/*.test`, run by `make test-integration`, which composes the
   DSNs from `.env` and passes them via `require-env`): per source — RLS with baked claims and column
   masking over scanner-backed relations, writable RENAME with DML end-to-end into the source,

@@ -23,8 +23,9 @@ The `sql/integration` directory holds scenarios against live databases (PostgreS
 see `specs/005-integration-env/spec.md`). They need the docker environment and an integration build:
 ```bash
 cp .env.example .env
+make vcpkg-setup                     # once: scanner dependencies via vcpkg
 make docker-up
-ACL_INTEGRATION=1 GEN=ninja make     # macOS: brew install libpq croaring first
+ACL_INTEGRATION=1 GEN=ninja make
 make test-integration
 ```
 Each scenario skips itself when its scanner or DSN is absent, so the plain suites stay runnable
