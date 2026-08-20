@@ -24,15 +24,17 @@ SELECT acl_use_db('pg', 'acl', true);
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
-# rebuild the policy from scratch so reruns stay deterministic (the catalog db persists)
+# rebuild the policy from scratch so reruns stay deterministic (the catalog db persists). The drops
+# pass 'skip' - the DROP ... IF EXISTS mode of spec 013 - because on a fresh catalog there is nothing
+# to drop, and a plain drop reports a missing target.
 statement ok
 SELECT acl_revoke_catalog('analyst', 'live');
 
 statement ok
-SELECT acl_drop_relation('live', 'orders');
+SELECT acl_drop_relation('live', 'orders', 'skip');
 
 statement ok
-SELECT acl_drop_relation('live', 'audit');
+SELECT acl_drop_relation('live', 'audit', 'skip');
 
 statement ok
 SELECT acl_create_catalog('live', 'policy for the live postgres fixture');

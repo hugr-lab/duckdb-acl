@@ -24,15 +24,17 @@ SELECT acl_use_db('ms', 'acl', true);
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
-# rebuild the policy from scratch so reruns stay deterministic (the catalog db persists)
+# rebuild the policy from scratch so reruns stay deterministic (the catalog db persists). The drops
+# pass 'skip' - the DROP ... IF EXISTS mode of spec 013 - because on a fresh catalog there is nothing
+# to drop, and a plain drop reports a missing target.
 statement ok
 SELECT acl_revoke_catalog('analyst', 'mslive');
 
 statement ok
-SELECT acl_drop_relation('mslive', 'orders');
+SELECT acl_drop_relation('mslive', 'orders', 'skip');
 
 statement ok
-SELECT acl_drop_relation('mslive', 'audit');
+SELECT acl_drop_relation('mslive', 'audit', 'skip');
 
 statement ok
 SELECT acl_create_catalog('mslive', 'policy for the live sqlserver fixture');
