@@ -75,16 +75,25 @@ Concretely, with `acl` loaded first and duckpgq second (both want `STRICT`, so t
   duckpgq is asked — and a **denial throws**, which leaves `ParseQuery` immediately. This is exactly
   the arrangement in which a *returned* denial would have been cleared by duckpgq's polite decline,
   so the decision above is not hypothetical;
-- **the query after our prefix is re-parsed with overrides disabled** (`inner.parser_override_setting
-  = DEFAULT_OVERRIDE`), so another extension's syntax never reaches us: `ACL ROLE "x" SELECT … FROM
-  GRAPH_TABLE(…)` fails as a plain syntax error rather than arriving in our rewriter as a table
-  reference we do not know. Loud, and it keeps a foreign AST out of the rewrite path;
+- **the query after our prefix is re-parsed with duckdb's own parser** in the *virtual* context, so
+  another extension's syntax never reaches the rewriter: `ACL ROLE "x" SELECT … FROM GRAPH_TABLE(…)`
+  fails as a plain syntax error rather than arriving as a table reference we cannot walk. A node the
+  rewriter does not understand would have to be refused anyway, and a foreign AST in the rewrite path
+  is how a reference gets missed;
+- **the native context does run the other overrides.** `ACL NATIVE` rewrites nothing and requires a
+  passthrough scope (spec 009), so another extension's syntax is no more privileged there than the
+  SQL it already allows — a passthrough role can use duckpgq through `ACL NATIVE`. Our own override
+  declines its own inner parse (a thread-local guard), so a **nested** `ACL …` prefix stays
+  unparseable: otherwise the inner parse would verify a second principal and the outer one would
+  rewrite what the inner had already produced;
 - **an unprefixed PGQ query** is declined by us and parsed by duckpgq, and runs without the ACL —
   the same property every unprefixed query has, and the same reason only the gateway may connect.
 
 The deployment consequence is worth stating: a second override extension does not weaken the ACL for
-prefixed queries, but its syntax is available **only outside** the ACL. A gateway that prefixes
-everything cannot use it.
+prefixed queries, and its syntax is available to a **passthrough** role through `ACL NATIVE` — but not
+to an ordinary one, whose query is rewritten and therefore parsed by duckdb alone. Giving ordinary
+roles foreign syntax needs the rewriter to understand foreign nodes, which is its own design
+(`design/005-foreign-syntax-under-acl`).
 
 ## Enforcement & security
 
@@ -96,7 +105,9 @@ connect (CLAUDE.md).
 ## Testing
 
 `test/sql/acl_override_setting.test`: the setting is `STRICT` right after `require acl`, and an
-`ACL …` statement parses and enforces without any `SET` of our own; turning it back to `DEFAULT`
+`ACL …` statement parses and enforces without any `SET` of our own; a passthrough role reaching the
+native context, and a nested prefix staying unparseable in both directions (the re-entrancy guard);
+turning it back to `DEFAULT`
 makes `ACL …` a parse error (loud, not silent) and makes `acl_use_db` refuse with the reason; turning
 it on again restores enforcement. The other suites keep their explicit `SET … 'fallback'`, which
 still works — an explicit value is never overridden.

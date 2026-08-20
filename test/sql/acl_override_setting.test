@@ -69,3 +69,37 @@ query I
 ACL ROLE "analyst" SELECT count(*) FROM t;
 ----
 1
+
+# --- the native context may use another extension's syntax; the virtual one may not ----------------
+# `ACL NATIVE` rewrites nothing and needs a passthrough scope, so parsing its remainder with the other
+# extensions' overrides enabled grants nothing new. The virtual context keeps duckdb's own parser: a
+# node the rewriter cannot walk has to be refused anyway, and a foreign AST in the rewrite path is how
+# a reference gets missed. Neither half can be tested against a real second extension here, so what is
+# pinned is the re-entrancy guard that makes it safe.
+
+statement ok
+ACL ADMIN CREATE ROLE platform;
+
+statement ok
+SELECT acl_grant_admin('platform', 'passthrough');
+
+statement ok
+ACL ROLE "platform" ACL NATIVE SELECT count(*) FROM phys.main.t;
+
+# a nested prefix must stay unparseable: the inner parse declines our own override, so `ACL ROLE`
+# reaches duckdb's parser as the syntax error it is - it never verifies a second principal
+statement error
+ACL ROLE "platform" ACL NATIVE ACL ROLE "analyst" SELECT 1;
+----
+<REGEX>:.*syntax error.*
+
+statement error
+ACL ROLE "analyst" ACL ROLE "platform" SELECT 1;
+----
+<REGEX>:.*(syntax error|no ACL administration scope).*
+
+# the virtual context is unchanged: what the rewriter cannot resolve is refused
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM phys.main.t;
+----
+<REGEX>:.*no access to object "phys.main.t".*
