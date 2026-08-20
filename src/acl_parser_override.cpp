@@ -183,6 +183,10 @@ struct AdminScanner {
 		pos = saved;
 		return false;
 	}
+	bool AtParen() {
+		Skip();
+		return pos < text.size() && text[pos] == '(';
+	}
 	string Quoted(const char *what) {
 		Skip();
 		if (pos >= text.size() || (text[pos] != '\'' && text[pos] != '"')) {
@@ -224,6 +228,65 @@ struct AdminScanner {
 		return body;
 	}
 
+	//! Everything up to the end of this statement, taken verbatim - quote- and paren-aware, so a
+	//! body may contain ';' inside a literal or a parenthesised list. This is what makes an inline
+	//! body possible: `AS SELECT … WHERE tenant = acl_claim('tenant')` instead of the same text in a
+	//! quoted string with every quote doubled.
+	string Rest(const char *what) {
+		Skip();
+		auto start = pos;
+		idx_t depth = 0;
+		while (pos < text.size()) {
+			auto c = text[pos];
+			if (c == '\'' || c == '"') {
+				ReadQuoted(text, pos);
+				continue;
+			}
+			if (c == '(') {
+				depth++;
+			} else if (c == ')' && depth > 0) {
+				depth--;
+			} else if (c == ';' && depth == 0) {
+				break;
+			}
+			pos++;
+		}
+		auto body = text.substr(start, pos - start);
+		StringUtil::Trim(body);
+		if (body.empty()) {
+			throw BinderException("acl admin: expected %s at position %llu", what, start);
+		}
+		return body;
+	}
+
+	//! A body written either way: a quoted string (what a gateway generates) or inline to the end of
+	//! the statement (what a human writes). Both forms are accepted everywhere a body is taken.
+	string Body(const char *what) {
+		Skip();
+		if (pos < text.size() && (text[pos] == '\'' || text[pos] == '"')) {
+			return Quoted(what);
+		}
+		return Rest(what);
+	}
+
+	//! A name written either way: bare (`range`, `pg.public.orders`) or as the legacy quoted string
+	string Name(const char *what) {
+		Skip();
+		if (pos < text.size() && (text[pos] == '\'' || text[pos] == '"')) {
+			return Quoted(what);
+		}
+		return Dotted(what);
+	}
+
+	//! A list written either way: `(a, b = c)` or the legacy quoted csv/JSON string
+	string List(const char *what) {
+		Skip();
+		if (pos < text.size() && text[pos] == '(') {
+			return Parens();
+		}
+		return Quoted(what);
+	}
+
 	//! a bare identifier path: word(.word)*
 	string Dotted(const char *what) {
 		auto path = Word(what);
@@ -245,21 +308,98 @@ void SplitVirtual(const string &path, string &vcat, string &vname) {
 	vname = path.substr(dot + 1);
 }
 
+//! `(select, insert)` -> `{"select": true, "insert": true}`. The list form is what a person writes;
+//! JSON stays the storage format and the admin functions' input. An unknown capability is kept as
+//! written rather than refused - the vocabulary grows, and a grant authored against a newer version
+//! must not fail - but it enforces nothing until some spec starts reading it (design 004).
+string CapsListToJson(const string &list) {
+	vector<string> entries;
+	for (auto &item : SplitTopLevel(list, ',')) {
+		if (item.empty()) {
+			continue;
+		}
+		entries.push_back("\"" + StringUtil::Replace(StringUtil::Lower(item), "\"", "") + "\": true");
+	}
+	return "{" + StringUtil::Join(entries, ", ") + "}";
+}
+
+//! Strip one layer of quotes from a list element written as a literal
+string Unquoted(string value) {
+	StringUtil::Trim(value);
+	if (value.size() >= 2 && (value.front() == '\'' || value.front() == '"') && value.back() == value.front()) {
+		auto quote = value.front();
+		value = value.substr(1, value.size() - 2);
+		value = StringUtil::Replace(value, string(2, quote), string(1, quote));
+	}
+	return value;
+}
+
+//! `(tenant = 'acme', unit = 'eu')` -> the stored csv `tenant=acme,unit=eu`
+string ClaimsListToCsv(const string &list) {
+	vector<string> entries;
+	for (auto &item : SplitTopLevel(list, ',')) {
+		if (item.empty()) {
+			continue;
+		}
+		auto split = item.find('=');
+		if (split == string::npos) {
+			throw BinderException("acl admin: a claim is written as name = 'value', got \"%s\"", item);
+		}
+		auto name = item.substr(0, split);
+		StringUtil::Trim(name);
+		entries.push_back(name + "=" + Unquoted(item.substr(split + 1)));
+	}
+	return StringUtil::Join(entries, ",");
+}
+
+//! `('api://hugr', 'api://other')` or `(RS256, ES256)` -> the stored csv
+string ValueListToCsv(const string &list) {
+	vector<string> entries;
+	for (auto &item : SplitTopLevel(list, ',')) {
+		if (!item.empty()) {
+			entries.push_back(Unquoted(item));
+		}
+	}
+	return StringUtil::Join(entries, ",");
+}
+
+//! `(tid => tenant, oid => user_id)` -> the stored JSON `{"tid": "tenant", "oid": "user_id"}`
+string ClaimMapToJson(const string &list) {
+	vector<string> entries;
+	for (auto &item : SplitTopLevel(list, ',')) {
+		if (item.empty()) {
+			continue;
+		}
+		auto arrow = item.find("=>");
+		if (arrow == string::npos) {
+			throw BinderException("acl admin: a claim mapping is written as <jwt path> => <claim>, got \"%s\"", item);
+		}
+		auto from = item.substr(0, arrow);
+		StringUtil::Trim(from);
+		entries.push_back("\"" + Unquoted(from) + "\": \"" + Unquoted(item.substr(arrow + 2)) + "\"");
+	}
+	return "{" + StringUtil::Join(entries, ", ") + "}";
+}
+
 //! The clauses a grant is written with, in any order: CAPS '<json>' RLS '<predicate>'
 //! COLUMNS '<name[=expr], …>' - the grant's own policy (spec 011) - plus MAIN for a catalog grant
 void GrantPolicyClauses(AdminScanner &s, string &caps, string &rls, string &columns, bool *main = nullptr) {
 	for (bool more = true; more;) {
 		more = false;
+		if (s.Accept("with")) { // WITH (select, insert) - the list form of CAPS
+			caps = CapsListToJson(s.Parens());
+			more = true;
+		}
 		if (s.Accept("caps")) {
 			caps = s.Quoted("caps JSON");
 			more = true;
 		}
 		if (s.Accept("rls")) {
-			rls = s.Quoted("an RLS predicate");
+			rls = s.List("an RLS predicate");
 			more = true;
 		}
 		if (s.Accept("columns")) {
-			columns = s.Quoted("a column list");
+			columns = s.List("a column list");
 			more = true;
 		}
 		if (main && s.Accept("main")) {
@@ -339,7 +479,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			auto role = s.Word("a role name");
 			string claims;
 			if (s.Accept("claims")) {
-				claims = s.Quoted("claims list");
+				claims = s.AtParen() ? ClaimsListToCsv(s.Parens()) : s.Quoted("claims list");
 			}
 			return MakeAdminCall("acl_define_role", {Value(role), Value(claims)});
 		}
@@ -349,10 +489,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		auto keys = s.Quoted("keys");
 		string audiences, algs = "RS256", role_claim = "roles", claim_map;
 		if (s.Accept("audiences")) {
-			audiences = s.Quoted("audiences");
+			audiences = s.AtParen() ? ValueListToCsv(s.Parens()) : s.Quoted("audiences");
 		}
 		if (s.Accept("algs")) {
-			algs = s.Quoted("algs");
+			algs = s.AtParen() ? ValueListToCsv(s.Parens()) : s.Quoted("algs");
 		}
 		if (s.Accept("role")) {
 			s.Expect("claim");
@@ -360,7 +500,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		}
 		if (s.Accept("claim")) {
 			s.Expect("map");
-			claim_map = s.Quoted("claim map");
+			claim_map = s.AtParen() ? ClaimMapToJson(s.Parens()) : s.Quoted("claim map");
 		}
 		return MakeAdminCall("acl_define_issuer", {Value(issuer), Value(keys), Value(audiences), Value(algs),
 		                                           Value(role_claim), Value(claim_map)});
@@ -373,7 +513,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 			auto returns = s.Parens();
 			s.Expect("as");
-			auto sql = s.Quoted("view SQL");
+			auto sql = s.Body("view SQL");
 			return MakeAdminCall("acl_add_view", {Value(vcat), Value(vname), Value(sql), Value(returns)});
 		}
 		if (s.Accept("schema")) {
@@ -396,7 +536,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			if (!is_macro) {
 				s.Expect("alias");
 			}
-			auto definition = s.Quoted(is_macro ? "expression template" : "target function");
+			auto definition = is_macro ? s.Body("expression template") : s.Name("a target function");
 			if (!is_macro) {
 				return MakeAdminCall("acl_add_scalar_alias", {Value(vcat), Value(vname), Value(definition)});
 			}
@@ -421,7 +561,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			if (!is_macro) {
 				s.Expect("alias");
 			}
-			auto definition = s.Quoted(is_macro ? "SQL template" : "target function");
+			auto definition = is_macro ? s.Body("SQL template") : s.Name("a target function");
 			if (!is_macro) {
 				return MakeAdminCall("acl_add_table_function_alias", {Value(vcat), Value(vname), Value(definition)});
 			}
@@ -434,10 +574,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 		string columns, rls;
 		if (s.Accept("columns")) {
-			columns = s.Quoted("columns list");
+			columns = s.List("columns list");
 		}
 		if (s.Accept("rls")) {
-			rls = s.Quoted("RLS predicate");
+			rls = s.List("RLS predicate");
 		}
 		return MakeAdminCall("acl_add_relation", {Value(vcat), Value(vname), Value(phys), Value(columns), Value(rls)});
 	}

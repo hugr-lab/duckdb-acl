@@ -45,13 +45,11 @@ string LitList(const vector<string> &values) {
 }
 
 //! A grant's column list, in the same `name` / `name=expr` csv form the object definitions use.
-//! (Splitting on ',' is the store-wide convention, so an expression may not contain a top-level
-//! comma - `coalesce(a, b)` has to be written as a virtual column of the object instead.)
+//! Split at top level only, so an expression may contain commas of its own (`coalesce(a, b)`).
 vector<std::pair<string, string>> ParseColumnList(const string &csv) {
 	vector<std::pair<string, string>> columns;
-	for (auto &part : StringUtil::Split(csv, ',')) {
+	for (auto &part : SplitTopLevel(csv, ',')) {
 		auto item = part;
-		StringUtil::Trim(item);
 		if (item.empty()) {
 			continue;
 		}

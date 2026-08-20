@@ -27,12 +27,12 @@ string Trimmed(string value) {
 	return value;
 }
 
+//! Top-level split: a comma inside quotes or parentheses belongs to an expression, not to the list
 vector<string> SplitCsv(const string &csv) {
 	vector<string> out;
-	for (auto &part : StringUtil::Split(csv, ',')) {
-		auto trimmed = Trimmed(part);
-		if (!trimmed.empty()) {
-			out.push_back(trimmed);
+	for (auto &part : SplitTopLevel(csv, ',')) {
+		if (!part.empty()) {
+			out.push_back(part);
 		}
 	}
 	return out;
@@ -87,7 +87,7 @@ bool IsRenameOnly(const vector<std::pair<string, string>> &columns) {
 vector<std::pair<string, string>> ParseColumns(const string &csv) {
 	vector<std::pair<string, string>> columns;
 	for (auto &item : SplitCsv(csv)) {
-		auto pos = item.find('=');
+		auto pos = item.find('='); // the first '=' separates the name; the rest is the expression
 		if (pos == string::npos) {
 			columns.emplace_back(item, string());
 		} else {

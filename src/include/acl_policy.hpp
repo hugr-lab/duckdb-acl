@@ -82,6 +82,11 @@ struct IssuerConfig {
 	string claim_map;            // JSON: {"<jwt dot path>": "<acl_claim name>"}
 };
 
+//! Split a comma-style list on top-level delimiters only: a delimiter inside quotes or inside
+//! parentheses belongs to an expression, not to the list. Without this a column list breaks on the
+//! first `coalesce(a, b)` - and breaks it silently, into two nonsense entries.
+vector<string> SplitTopLevel(const string &text, char delimiter);
+
 //! Which functions are gated is a policy question, not the rewriter's: every function reference is
 //! routed through the resolver, which decides. Most functions - the vast majority extensions add -
 //! are pure transforms (e.g. ST_AsGeoJSON) and pass; only functions that read external data or route

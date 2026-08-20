@@ -1,0 +1,171 @@
+# name: test/sql/acl_ddl_syntax.test
+# description: one DDL syntax for the virtual catalog (spec 013) - inline bodies and real lists next
+#   to the legacy quoted/CSV/JSON forms, both storing the same rows
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT, ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100, 'a1'), (2, 'globex', 200, 'g2');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+# --- inline bodies: no doubled quotes ---------------------------------------------------------------
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS (id, amount, ssn = NULL) RLS (tenant = acl_claim('tenant'));
+
+query II
+SELECT rls, form FROM aclcat.acl.relations WHERE vname = 'orders';
+----
+tenant = acl_claim('tenant')	subquery
+
+query III
+SELECT name, expr, pos FROM aclcat.acl.relation_columns WHERE vname = 'orders' ORDER BY pos;
+----
+id	(empty)	0
+amount	(empty)	1
+ssn	NULL	2
+
+# the legacy spelling of the very same object stores the very same rows
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.legacy COLUMNS 'id,amount,ssn=NULL' RLS 'tenant = acl_claim(''tenant'')';
+
+query I
+SELECT count(*) FROM aclcat.acl.relations a JOIN aclcat.acl.relations b ON a.rls = b.rls AND a.form = b.form AND a.phys = b.phys WHERE a.vname = 'orders' AND b.vname = 'legacy';
+----
+1
+
+# a view's body reaches the end of the statement, quotes and all
+statement ok
+ACL ADMIN ADD VIEW sales.mine AS SELECT id, amount FROM phys.main.orders_physical WHERE tenant = acl_claim('tenant');
+
+query I
+SELECT view_sql FROM aclcat.acl.relations WHERE vname = 'mine';
+----
+SELECT id, amount FROM phys.main.orders_physical WHERE tenant = acl_claim('tenant')
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.report(threshold INTEGER) RETURNS TABLE (id INTEGER, amount INTEGER) MACRO SELECT id, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1);
+
+query I
+SELECT template FROM aclcat.acl.functions WHERE vname = 'report';
+----
+SELECT id, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1)
+
+statement ok
+ACL ADMIN ADD SCALAR sales.tag MACRO acl_arg(1) || '@' || acl_claim('tenant');
+
+query I
+SELECT template FROM aclcat.acl.functions WHERE vname = 'tag';
+----
+acl_arg(1) || '@' || acl_claim('tenant')
+
+# an alias target may be written bare or quoted
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.rng ALIAS range;
+
+statement ok
+ACL ADMIN ADD SCALAR sales.lc ALIAS 'lower';
+
+query II
+SELECT target, form FROM aclcat.acl.functions WHERE vname = 'rng';
+----
+range	alias
+
+# --- lists are lists --------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS (tenant = 'acme');
+
+query II
+SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'analyst';
+----
+tenant	acme
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select, insert) MAIN;
+
+query I
+SELECT caps FROM aclcat.acl.role_catalogs WHERE role = 'analyst';
+----
+{"select": true, "insert": true}
+
+statement ok
+ACL ADMIN GRANT TABLE sales.orders TO ROLE analyst WITH (select) RLS (amount > 50) COLUMNS (id, amount);
+
+query III
+SELECT caps, rls, columns FROM aclcat.acl.role_object_caps WHERE role = 'analyst' AND vname = 'orders';
+----
+{"select": true}	amount > 50	id, amount
+
+# the object resolves and enforces exactly what those lists said
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/x' KEYS '{"keys":[]}' AUDIENCES ('api://hugr', 'api://other') ALGS (RS256, ES256) ROLE CLAIM 'groups' CLAIM MAP (tid => tenant, oid => user_id);
+
+query III
+SELECT audiences, array_to_string(list_sort(str_split(algs, ',')), '|'), claim_map FROM aclcat.acl.issuers WHERE issuer = 'https://issuer.test/x';
+----
+api://hugr,api://other	ES256|RS256	{"tid": "tenant", "oid": "user_id"}
+
+# an unknown capability is stored as written and enforces nothing
+statement ok
+ACL ADMIN CREATE ROLE futurist;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE futurist WITH (select, temp_tables) MAIN;
+
+query I
+SELECT caps FROM aclcat.acl.role_catalogs WHERE role = 'futurist';
+----
+{"select": true, "temp_tables": true}
+
+statement error
+ACL ROLE "futurist" INSERT INTO orders(id) VALUES (9);
+----
+<REGEX>:.*(read-only relation|insert on).*
+
+# --- a list element may contain commas of its own ----------------------------------------------------
+# splitting on every ',' used to break `coalesce(a, b)` into two nonsense entries, silently
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.labelled COLUMNS (id, label = coalesce(tenant, 'none'));
+
+query II
+SELECT name, expr FROM aclcat.acl.relation_columns WHERE vname = 'labelled' ORDER BY pos;
+----
+id	(empty)
+label	coalesce(tenant, 'none')
+
+statement ok
+ACL ADMIN GRANT TABLE sales.labelled TO ROLE analyst WITH (select) COLUMNS (id, label = coalesce(tenant, 'none'));
+
+query II
+ACL ROLE "analyst" SELECT id, label FROM labelled ORDER BY id;
+----
+1	acme
+2	globex
