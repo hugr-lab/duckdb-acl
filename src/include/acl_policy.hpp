@@ -184,7 +184,16 @@ struct PolicyStore {
 	void CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
 	                        const string &view_sql, const string &rls, const vector<std::pair<string, string>> &columns,
 	                        const string &returns = string());
-	void CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path);
+	//! Expand a physical schema into one virtual record per object (spec 014): a snapshot the admin
+	//! can then edit object by object, unlike the live alias
+	void CatalogExpandSchema(const string &vcat, const string &path, const string &phys_path);
+	//! Re-read an expansion's source: add what appeared, and with `prune` remove what is gone. A
+	//! record dropped on purpose is not resurrected. Returns how many rows changed.
+	int64_t CatalogRefreshSchemaObjects(const string &vcat, const string &path, bool prune);
+	//! One schema row (spec 014): a physical path makes it a live alias, an origin makes it an
+	//! expansion whose content is the catalog's own records, neither makes it a plain namespace
+	void CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path,
+	                           const string &origin = string());
 	//! `params`/`returns` are the declared signature and result ("name TYPE, …"): a declared result is
 	//! stored as-is and never probed - an argument-dependent template cannot be typed from NULLs, and
 	//! binding admin SQL at write time would touch the sources (spec 010)
@@ -205,7 +214,7 @@ struct PolicyStore {
 	//! Re-derive the stored column schema of query-defined objects: one object, or a whole catalog
 	idx_t CatalogRefreshSchema(const string &vcat, const string &vname);
 	void CatalogDropCatalog(const string &vcat, bool cascade);
-	void CatalogDropSchemaAlias(const string &vcat, const string &alias_path);
+	void CatalogDropSchemaAlias(const string &vcat, const string &alias_path, bool cascade = false);
 	void CatalogDropFunction(const string &vcat, const string &vname, const string &kind);
 	void CatalogDropRole(const string &role);
 	void CatalogDropIssuer(const string &issuer);

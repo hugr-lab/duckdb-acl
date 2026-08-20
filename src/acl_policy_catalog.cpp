@@ -1400,6 +1400,15 @@ struct CatalogBackend {
 		        Tbl("schema_aliases") + " a WHERE NOT EXISTS (SELECT 1 FROM " + Tbl("schemas") +
 		        " s WHERE s.\"vcat\" = a.\"vcat\" AND s.\"path\" = a.\"alias_path\")",
 		    "ALTER TABLE " + Tbl("relations") + " ADD COLUMN IF NOT EXISTS \"comment\" VARCHAR",
+		    // spec 014: an expansion's source, and the record's memory of where it came from - which is
+		    // how REFRESH tells its own records from ones an admin registered by hand. Column order
+		    // differs between a fresh catalog and a migrated one, so every INSERT names its columns.
+		    "ALTER TABLE " + Tbl("schemas") + " ADD COLUMN IF NOT EXISTS \"origin\" VARCHAR",
+		    "ALTER TABLE " + Tbl("relations") + " ADD COLUMN IF NOT EXISTS \"origin\" VARCHAR",
+		    // a record dropped on purpose must not come back on the next REFRESH
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("schema_dropped") +
+		        "(\"vcat\" VARCHAR, \"path\" VARCHAR, \"name\" VARCHAR,"
+		        " PRIMARY KEY (\"vcat\", \"path\", \"name\"))",
 		    // spec 011 (schema v3): a grant carries its own policy, not only capabilities - an RLS
 		    // predicate and a column list that narrow the object for this role (and supply values on
 		    // writes). Both levels of the chain are grant rows, so both gain the two columns.
@@ -1527,7 +1536,7 @@ namespace {
 vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, const string &vname, const string &form,
                                   const string &phys, const string &view_sql, const string &rls,
                                   const vector<std::pair<string, string>> &columns, const string &comment,
-                                  const string &returns) {
+                                  const string &returns, const string &origin = string()) {
 	vector<string> statements;
 	statements.push_back("DELETE FROM " + catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                     " AND \"vname\" = " + Lit(vname));
@@ -1535,9 +1544,12 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 	                     " AND \"vname\" = " + Lit(vname));
 	// the comment is read by the caller BEFORE the delete above and carried through: a definition
 	// change is not a reason to lose an operator's documentation
-	statements.push_back("INSERT INTO " + catalog.Tbl("relations") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) +
-	                     ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) + ", " + Lit(rls) + ", " +
-	                     (comment.empty() ? string("NULL") : Lit(comment)) + ")");
+	statements.push_back("INSERT INTO " + catalog.Tbl("relations") +
+	                     "(\"vcat\", \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"comment\", \"origin\")"
+	                     " VALUES (" +
+	                     Lit(vcat) + ", " + Lit(vname) + ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) +
+	                     ", " + Lit(rls) + ", " + (comment.empty() ? string("NULL") : Lit(comment)) + ", " +
+	                     (origin.empty() ? string("NULL") : Lit(origin)) + ")");
 	idx_t pos = 0;
 	for (auto &column : columns) {
 		statements.push_back("INSERT INTO " + catalog.Tbl("relation_columns") + " VALUES (" + Lit(vcat) + ", " +
@@ -1581,7 +1593,8 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 	});
 }
 
-void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path) {
+void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path,
+                                        const string &origin) {
 	RequireCatalog(catalog, "acl_add_schema_alias");
 	// a schema is one row either way (spec 014): with a physical path it is a live alias, without one
 	// it is a schema whose content is the catalog's own records. The comment survives a redefinition.
@@ -1594,9 +1607,10 @@ void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_
 			comment = Lit(current->GetValue(0, 0).ToString());
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("schemas") + where);
-		statements.push_back("INSERT INTO " + catalog->Tbl("schemas") + " VALUES (" + Lit(vcat) + ", " +
-		                     Lit(alias_path) + ", " + (phys_path.empty() ? "NULL" : Lit(phys_path)) + ", " + comment +
-		                     ")");
+		statements.push_back("INSERT INTO " + catalog->Tbl("schemas") +
+		                     "(\"vcat\", \"path\", \"phys_path\", \"comment\", \"origin\") VALUES (" + Lit(vcat) +
+		                     ", " + Lit(alias_path) + ", " + (phys_path.empty() ? "NULL" : Lit(phys_path)) + ", " +
+		                     comment + ", " + (origin.empty() ? "NULL" : Lit(origin)) + ")");
 		// the legacy table is kept in step for one version, so a rollback still resolves
 		statements.push_back("DELETE FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"alias_path\" = " + Lit(alias_path));
@@ -1605,6 +1619,122 @@ void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_
 			                     Lit(alias_path) + ", " + Lit(phys_path) + ")");
 		}
 	});
+}
+
+namespace {
+
+//! `db.schema` -> the two parts duckdb's catalog views are keyed by
+void SplitPhysSchema(const string &phys_path, string &database, string &schema) {
+	auto dot = phys_path.find('.');
+	if (dot == string::npos) {
+		throw BinderException("acl admin: \"%s\" must be written as <database>.<schema>", phys_path);
+	}
+	database = phys_path.substr(0, dot);
+	schema = phys_path.substr(dot + 1);
+}
+
+//! What the source holds right now. Read on the write path only - a principal's query never triggers
+//! it - the same way the schema probe of spec 010 reads the physical catalog.
+vector<string> PhysicalObjects(acl_detail::CatalogBackend &catalog, const string &phys_path) {
+	string database, schema;
+	SplitPhysSchema(phys_path, database, schema);
+	auto listing =
+	    catalog.Query("SELECT table_name AS name FROM duckdb_tables() WHERE database_name = " + Lit(database) +
+	                  " AND schema_name = " + Lit(schema) +
+	                  " UNION SELECT view_name FROM duckdb_views() WHERE database_name = " + Lit(database) +
+	                  " AND schema_name = " + Lit(schema) + " AND NOT internal ORDER BY 1");
+	vector<string> names;
+	for (idx_t row = 0; row < listing->RowCount(); row++) {
+		names.push_back(listing->GetValue(0, row).ToString());
+	}
+	return names;
+}
+
+} // namespace
+
+void PolicyStore::CatalogExpandSchema(const string &vcat, const string &path, const string &phys_path) {
+	RequireCatalog(catalog, "acl_expand_schema");
+	auto names = PhysicalObjects(*catalog, phys_path);
+	// the schema itself carries no physical path: what is visible inside it are the records below,
+	// each of which can then be altered, dropped or granted on its own
+	CatalogAddSchemaAlias(vcat, path, "", phys_path);
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		for (auto &name : names) {
+			auto vname = path + "." + name;
+			auto exists = read("SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                   " AND \"vname\" = " + Lit(vname));
+			if (exists->RowCount() > 0) {
+				continue; // an admin already registered this name: an expansion never overwrites
+			}
+			for (auto &statement : RelationStatements(*catalog, vcat, vname, "alias", phys_path + "." + name, "", "",
+			                                          {}, "", "", phys_path)) {
+				statements.push_back(statement);
+			}
+		}
+		// re-expanding forgets earlier deliberate drops: the admin asked for the source as it is now
+		statements.push_back("DELETE FROM " + catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"path\" = " + Lit(path));
+	});
+}
+
+int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const string &path, bool prune) {
+	RequireCatalog(catalog, "acl_refresh_schema_objects");
+	auto source = catalog->Query("SELECT \"origin\" FROM " + catalog->Tbl("schemas") +
+	                             " WHERE \"vcat\" = " + Lit(vcat) + " AND \"path\" = " + Lit(path));
+	if (source->RowCount() == 0) {
+		throw BinderException("acl admin: schema \"%s.%s\" does not exist", vcat, path);
+	}
+	auto origin_value = source->GetValue(0, 0);
+	if (origin_value.IsNull()) {
+		throw BinderException("acl admin: schema \"%s.%s\" is a live alias, so it has nothing to refresh - it "
+		                      "already shows what the source holds",
+		                      vcat, path);
+	}
+	auto origin = origin_value.ToString();
+	auto names = PhysicalObjects(*catalog, origin);
+	int64_t changed = 0;
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		changed = 0;
+		for (auto &name : names) {
+			auto vname = path + "." + name;
+			auto known = read("SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                  " AND \"vname\" = " + Lit(vname) + " UNION ALL SELECT 1 FROM " +
+			                  catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                  " AND \"path\" = " + Lit(path) + " AND \"name\" = " + Lit(name));
+			if (known->RowCount() > 0) {
+				continue; // already registered, or dropped on purpose and not to be resurrected
+			}
+			for (auto &statement :
+			     RelationStatements(*catalog, vcat, vname, "alias", origin + "." + name, "", "", {}, "", "", origin)) {
+				statements.push_back(statement);
+			}
+			changed++;
+		}
+		if (!prune) {
+			return;
+		}
+		// only records this expansion produced are pruned: what an admin registered by hand is theirs
+		auto stale = read("SELECT \"vname\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                  " AND \"origin\" = " + Lit(origin) + " AND substr(\"vname\", 1, " +
+		                  std::to_string(path.size() + 1) + ") = " + Lit(path + "."));
+		for (idx_t row = 0; row < stale->RowCount(); row++) {
+			auto vname = stale->GetValue(0, row).ToString();
+			auto name = vname.substr(path.size() + 1);
+			if (std::find(names.begin(), names.end(), name) != names.end()) {
+				continue;
+			}
+			for (auto table : {"relations", "relation_columns", "role_object_caps"}) {
+				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat) +
+				                     " AND \"vname\" = " + Lit(vname));
+			}
+			statements.push_back("DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'");
+			changed++;
+		}
+	});
+	return changed;
 }
 
 void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
@@ -1667,6 +1797,18 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 	if (!CatalogObjectExists(vcat, vname, "relation")) {
 		throw BinderException("acl admin: relation \"%s.%s\" does not exist", vcat, vname);
 	}
+	// a record an expansion produced is remembered as dropped, so the next REFRESH does not bring it
+	// back: excluding one object is the whole reason to expand a schema instead of aliasing it
+	auto origin = catalog->Query("SELECT \"origin\" FROM " + catalog->Tbl("relations") +
+	                             " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+	vector<string> tombstone;
+	if (origin->RowCount() > 0 && !origin->GetValue(0, 0).IsNull()) {
+		auto dot = vname.rfind('.');
+		if (dot != string::npos) {
+			tombstone.push_back("INSERT OR IGNORE INTO " + catalog->Tbl("schema_dropped") + " VALUES (" + Lit(vcat) +
+			                    ", " + Lit(vname.substr(0, dot)) + ", " + Lit(vname.substr(dot + 1)) + ")");
+		}
+	}
 	catalog->Write({"DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                    " AND \"vname\" = " + Lit(vname),
 	                "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -1675,6 +1817,9 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 	                    " AND \"vname\" = " + Lit(vname),
 	                "DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                    " AND \"vname\" = " + Lit(vname)});
+	if (!tombstone.empty()) {
+		catalog->Write(tombstone);
+	}
 }
 
 void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, const string &kind, const string &column,
@@ -1803,7 +1948,7 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 	});
 }
 
-void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias_path) {
+void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias_path, bool cascade) {
 	RequireCatalog(catalog, "acl_drop_schema_alias");
 	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
 	                            vector<string> &statements) {
@@ -1811,6 +1956,25 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 		auto exists = read("SELECT 1 FROM " + catalog->Tbl("schemas") + where);
 		if (exists->RowCount() == 0) {
 			throw BinderException("acl admin: schema \"%s.%s\" does not exist", vcat, alias_path);
+		}
+		// an expansion's records are relations of the catalog in their own right, so they go only with
+		// CASCADE - the rule DROP VIRTUAL CATALOG already follows for grants (spec 010)
+		auto prefix =
+		    " AND substr(\"vname\", 1, " + std::to_string(alias_path.size() + 1) + ") = " + Lit(alias_path + ".");
+		auto records =
+		    read("SELECT count(*) FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) + prefix);
+		auto count = records->GetValue(0, 0).GetValue<int64_t>();
+		if (count > 0 && !cascade) {
+			throw BinderException("acl admin: schema \"%s.%s\" still holds %lld object(s) - repeat with CASCADE to "
+			                      "drop them too",
+			                      vcat, alias_path, count);
+		}
+		if (cascade) {
+			for (auto table : {"relations", "relation_columns", "role_object_caps"}) {
+				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat) + prefix);
+			}
+			statements.push_back("DELETE FROM " + catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                     " AND \"path\" = " + Lit(alias_path));
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("schemas") + where);
 		statements.push_back("DELETE FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +

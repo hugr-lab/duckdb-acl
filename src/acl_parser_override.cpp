@@ -498,15 +498,20 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 		comment_clause(s, comment);
 		return MakeAdminCall("acl_create_catalog", {Value(vcat), Value(comment), Value(mode)});
 	}
-	if (s.Accept("schema")) { // CREATE VIRTUAL SCHEMA v.path AS <phys path> [COMMENT '…']
+	if (s.Accept("schema")) {
+		// CREATE VIRTUAL SCHEMA v.path AS <phys> - the live alias, resolves through
+		//                              FROM <phys> - the expansion, one record per object right now
 		if_not_exists(s);
 		string vcat, path;
 		SplitVirtual(s.Dotted("a virtual schema path"), vcat, path);
-		s.Expect("as");
+		bool expand = s.Accept("from");
+		if (!expand) {
+			s.Expect("as");
+		}
 		auto phys = s.Name("a physical schema path");
 		string comment;
 		comment_clause(s, comment);
-		return MakeAdminCall("acl_add_schema_alias",
+		return MakeAdminCall(expand ? "acl_expand_schema" : "acl_add_schema_alias",
 		                     {Value(vcat), Value(path), Value(phys), Value(comment), Value(mode)});
 	}
 	if (s.Accept("view")) { // CREATE VIRTUAL VIEW v.n [(col TYPE, …)] [COMMENT '…'] AS <sql>
@@ -845,9 +850,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			return MakeAdminCall("acl_alter_relation",
 			                     {Value(vcat), Value(vname), Value("view"), Value(s.Quoted("view SQL"))});
 		}
-		if (s.Accept("schema")) { // ALTER VIRTUAL SCHEMA v.alias SET PHYS <path>
+		if (s.Accept("schema")) { // ALTER VIRTUAL SCHEMA v.path SET PHYS <path> | REFRESH [PRUNE]
 			string vcat, alias;
-			SplitVirtual(s.Dotted("a virtual alias"), vcat, alias);
+			SplitVirtual(s.Dotted("a virtual schema path"), vcat, alias);
+			if (s.Accept("refresh")) {
+				bool prune = s.Accept("prune");
+				return MakeAdminCall("acl_refresh_schema_objects", {Value(vcat), Value(alias), Value::BOOLEAN(prune)});
+			}
 			s.Expect("set");
 			s.Expect("phys");
 			return MakeAdminCall("acl_alter_schema_alias",
@@ -963,11 +972,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			bool cascade = s.Accept("cascade");
 			return MakeAdminCall("acl_drop_catalog", {Value(vcat), Value::BOOLEAN(cascade), Value(mode)});
 		}
-		if (s.Accept("schema")) {
+		if (s.Accept("schema")) { // DROP VIRTUAL SCHEMA v.path [CASCADE]
 			if_exists(s);
 			string vcat, alias;
-			SplitVirtual(s.Dotted("a virtual alias"), vcat, alias);
-			return MakeAdminCall("acl_drop_schema_alias", {Value(vcat), Value(alias), Value(mode)});
+			SplitVirtual(s.Dotted("a virtual schema path"), vcat, alias);
+			bool cascade = s.Accept("cascade");
+			return MakeAdminCall("acl_drop_schema_alias",
+			                     {Value(vcat), Value(alias), Value(mode), Value::BOOLEAN(cascade)});
 		}
 		bool scalar = s.Accept("scalar");
 		if (scalar || s.Accept("table")) {
@@ -1005,16 +1016,37 @@ struct MgmtProvenance {
 MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	// name -> index of the constant argument holding the catalog; -1 = none
 	static const std::unordered_map<string, int> CATALOG_ARG = {
-	    {"acl_create_catalog", 0},   {"acl_add_relation", 0},       {"acl_add_view", 0},
-	    {"acl_add_schema_alias", 0}, {"acl_add_table_function", 0}, {"acl_add_table_function_alias", 0},
-	    {"acl_add_scalar", 0},       {"acl_add_scalar_alias", 0},   {"acl_drop_relation", 0},
-	    {"acl_grant_catalog", 1},    {"acl_revoke_catalog", 1},     {"acl_grant_object", 1},
-	    {"acl_define_role", -1},     {"acl_define_issuer", -1},     {"acl_map_role", -1},
-	    {"acl_alter_relation", 0},   {"acl_alter_schema_alias", 0}, {"acl_alter_function", 0},
-	    {"acl_alter_catalog", 0},    {"acl_alter_grant", 1},        {"acl_alter_role", -1},
-	    {"acl_alter_issuer", -1},    {"acl_drop_schema_alias", 0},  {"acl_drop_function", 0},
-	    {"acl_drop_role", -1},       {"acl_drop_issuer", -1},       {"acl_drop_role_mapping", -1},
-	    {"acl_comment", 0},          {"acl_refresh_schema", 0},
+	    {"acl_create_catalog", 0},
+	    {"acl_add_relation", 0},
+	    {"acl_add_view", 0},
+	    {"acl_add_schema_alias", 0},
+	    {"acl_add_table_function", 0},
+	    {"acl_add_table_function_alias", 0},
+	    {"acl_add_scalar", 0},
+	    {"acl_add_scalar_alias", 0},
+	    {"acl_drop_relation", 0},
+	    {"acl_grant_catalog", 1},
+	    {"acl_revoke_catalog", 1},
+	    {"acl_grant_object", 1},
+	    {"acl_define_role", -1},
+	    {"acl_define_issuer", -1},
+	    {"acl_map_role", -1},
+	    {"acl_alter_relation", 0},
+	    {"acl_alter_schema_alias", 0},
+	    {"acl_alter_function", 0},
+	    {"acl_alter_catalog", 0},
+	    {"acl_alter_grant", 1},
+	    {"acl_alter_role", -1},
+	    {"acl_alter_issuer", -1},
+	    {"acl_drop_schema_alias", 0},
+	    {"acl_drop_function", 0},
+	    {"acl_drop_role", -1},
+	    {"acl_drop_issuer", -1},
+	    {"acl_drop_role_mapping", -1},
+	    {"acl_comment", 0},
+	    {"acl_refresh_schema", 0},
+	    {"acl_expand_schema", 0},
+	    {"acl_refresh_schema_objects", 0},
 	};
 	MgmtProvenance provenance;
 	auto &select = statement.Cast<SelectStatement>().node->Cast<SelectNode>();

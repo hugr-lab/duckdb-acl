@@ -1,6 +1,6 @@
 # Spec 014: virtual schemas as objects — alias, expansion, refresh
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-08-20
 - **Author**: hugr-lab
 
@@ -31,8 +31,9 @@ needs schemas to be objects before a grant has anything to attach to.
 
 ### One table for schemas
 
-`acl.schemas(vcat, path, phys_path, comment)` replaces `acl.schema_aliases`, whose rows migrate into
-it (schema v4, in place). `phys_path` carries the two kinds:
+`acl.schemas(vcat, path, phys_path, origin, comment)` replaces `acl.schema_aliases`, whose rows
+migrate into it (schema v4, in place; the legacy table is kept in step for one version so a rollback
+still resolves). `phys_path` carries the two kinds, and `origin` remembers an expansion's source:
 
 | `phys_path` | kind | what it means |
 | --- | --- | --- |
@@ -61,10 +62,15 @@ ALTER VIRTUAL SCHEMA sales.curated REFRESH;            -- add what appeared
 ALTER VIRTUAL SCHEMA sales.curated REFRESH PRUNE;      -- and remove what is gone
 ```
 
-`REFRESH` adds objects that exist physically and have no record yet; it does **not** touch records an
-admin has changed or dropped — a record dropped on purpose must not come back, so a dropped name is
-remembered as a tombstone rather than re-added. `PRUNE` removes records whose physical object is
-gone. Both report how many rows they changed.
+`REFRESH` adds objects that exist physically and have no record yet; it never rewrites an existing
+record, so one an admin changed is safe by construction. A record dropped on purpose is remembered in
+`acl.schema_dropped` and not re-added — excluding one object is the whole reason to expand rather
+than alias, and a refresh that undid it would make the choice pointless. Re-running the expansion
+forgets those tombstones: the admin asked for the source as it is now. `PRUNE` removes records whose
+physical object is gone, and only ones the expansion itself produced (`origin` says which) — what an
+admin registered by hand inside the schema is theirs. Both report how many rows they changed, and a
+second refresh over an unchanged source reports 0. A **live alias** answers `REFRESH` with an error
+rather than pretending: it has nothing to refresh, since it already shows what the source holds.
 
 Consequences, deliberately:
 
@@ -91,7 +97,7 @@ Reading the physical catalog happens on the write path only, so a principal's qu
 
 ## Testing
 
-`test/sql/acl_virtual_schemas.test`: an alias and an expansion over the same physical schema; the
+`test/sql/acl_virtual_schemas.test` (80 assertions): an alias and an expansion over the same physical schema; the
 alias seeing a table created afterwards while the expansion does not until `REFRESH`; `REFRESH`
 reporting its count, leaving an admin-modified record alone and not resurrecting a dropped one;
 `PRUNE` removing a record whose source is gone; a single object excluded from an expansion and denied
@@ -109,6 +115,11 @@ version keeps resolving its aliases.
   change, and a per-query catalog listing is exactly the cost spec 010 avoided for probes.
 
 ## Follow-ups
+
+- Every `INSERT` into `relations` and `schemas` now names its columns: `ADD COLUMN` appends, so a
+  fresh catalog and a migrated one have different column orders, and a positional insert would have
+  put values in the wrong fields. Worth remembering for every future migration.
+
 
 - `CREATE VIRTUAL CATALOG sales AS|FROM pg` — the same two kinds one level up; the mechanics are
   identical and the storage is already there.
