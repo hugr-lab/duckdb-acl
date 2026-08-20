@@ -45,6 +45,19 @@ struct TablePolicy {
 	//! `SELECT * RENAME (...)` (by name, so a new physical column can never shift an alias) and writes
 	//! map the names back (spec 010). A restricting projection stays subquery-form and read-only.
 	vector<std::pair<string, string>> renames;
+
+	// --- grant-level policy (spec 011): a grant narrows an object without redefining it ------------
+	//! Whether DML may target this relation. Independent of `subquery_form` since spec 011: a grant's
+	//! predicate and injected values force the read-only *shape* on reads, while writes still go to
+	//! the physical table with the predicate AND-ed in and the values assigned.
+	bool writable = false;
+	//! Columns a grant assigns on writes: physical column name -> value template (claims/constants
+	//! only). On INSERT the value is added when absent and overridden when supplied; on UPDATE a SET
+	//! of the column is overridden - so a row cannot be written outside the grant's slice.
+	vector<std::pair<string, string>> injections;
+	//! The physical columns a grant allows to be written; empty = unrestricted. Writing anything else
+	//! is refused rather than silently dropped.
+	case_insensitive_set_t write_columns;
 };
 
 //! Whether a function reference is a scalar/aggregate (expression position) or a table function (FROM)
@@ -173,7 +186,8 @@ struct PolicyStore {
 	void CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
 	                        const string &target, const string &template_sql, const string &params = string(),
 	                        const string &returns = string());
-	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main);
+	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
+	                  const string &rls = "", const string &columns = "");
 	void CatalogRevoke(const string &role, const string &vcat);
 	void CatalogDropRelation(const string &vcat, const string &vname);
 	// DROP of the remaining virtual-catalog elements (spec 010). Dropping a catalog removes its own
@@ -217,8 +231,12 @@ struct PolicyStore {
 	                        vector<std::pair<string, string>> &scopes);
 	bool CatalogAnonymousAdminAllowed();
 	void CatalogMapRole(const string &issuer, const string &source, const string &external_value, const string &role);
-	//! per-object caps override (the compatibility wrappers carry per-object caps, spec 006)
-	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json);
+	//! per-object grant: its capabilities and (spec 011) the policy it imposes on the object
+	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json,
+	                          const string &rls = "", const string &columns = "");
+	//! refuse a grant naming an object nobody defined - a policy that never applies is worse than none
+	//! - and a policy on a scalar function, which has neither rows nor columns to narrow
+	void CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy);
 	//! ensure a role->catalog grant row exists without clobbering an existing one
 	void CatalogEnsureGrant(const string &role, const string &vcat, bool is_main);
 

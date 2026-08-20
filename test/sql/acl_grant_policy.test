@@ -1,0 +1,399 @@
+# name: test/sql/acl_grant_policy.test
+# description: per-grant policy (spec 011) - one object, different slices per role: the grant carries
+#   its own RLS and column list, narrowing the object without duplicating it, and supplies values on
+#   the write path so a narrowed relation stays writable
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT, ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100, 'a1'), (2, 'globex', 200, 'g2'), (3, 'acme', 300, 'a3');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+# one object, granted to three roles with three different slices
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS 'tenant=acme';
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+statement ok
+ACL ADMIN CREATE ROLE compliance CLAIMS 'tenant=globex';
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{"select": true}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.orders TO ROLE analyst CAPS '{"select": true, "insert": true, "update": true, "delete": true, "merge": true}' RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,amount,tenant=acl_claim(''tenant'')';
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE auditor CAPS '{"select": true}' MAIN;
+
+# the catalog level of the chain narrows every object of the catalog
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE compliance CAPS '{"select": true}' MAIN RLS 'tenant = acl_claim(''tenant'')';
+
+# --- reads: the same object, three shapes ---------------------------------------------------------
+
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+# an injected column reads back as the value it assigns
+query I
+ACL ROLE "analyst" SELECT DISTINCT tenant FROM orders;
+----
+acme
+
+# a column the grant does not list is not part of the relation any more
+statement error
+ACL ROLE "analyst" SELECT ssn FROM orders;
+----
+<REGEX>:.*ssn.*
+
+# the auditor holds the same object without a narrowing grant: nothing is hidden
+query I
+ACL ROLE "auditor" SELECT count(*) FROM orders;
+----
+3
+
+query I
+ACL ROLE "auditor" SELECT ssn FROM orders WHERE id = 2;
+----
+g2
+
+# the catalog-level predicate reaches the object without naming it
+query I
+ACL ROLE "compliance" SELECT count(*) FROM orders;
+----
+1
+
+query I
+ACL ROLE "compliance" SELECT ssn FROM orders;
+----
+g2
+
+# --- union across the principal's roles -----------------------------------------------------------
+# a principal may do what any of its roles may, so a role without a narrowing grant lifts it
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/rs' KEYS '{"keys":[{"kty":"RSA","kid":"test-key","alg":"RS256","n":"jps-_RGCObZHYxFmbxIagCg0dZlIifYMV2phhdrLpkrJ8TkoTe_GQK62Nf4Ilh92YUiBofspFfi7-fT937mnN1vzVyAKjHCHA4BmnDHHvCea8QdNP0YcxDXsBReZDFx-e8uEqfG-9_uvhLS0HTwTqhRKtdlwGDrsSoH4WYnCHI1grvQ8BSo7MivppMTzx7UUWeKieKFMeY3jw-g0XgdyZKjIOOaXQTX5AeEm_Xq6OjOtq7gVIgmNfogSQIAWFk5iaMzzafzhQmN_d719rEMSJClAAnCklwpETEq2jWv5vJUhslPL6ZQPd8jnjVMcOzL8Zy9ed5U9te-EQ0IKnfnpZQ","e":"AQAB"}]}' AUDIENCES 'api://acl-test' ALGS 'RS256' ROLE CLAIM 'roles';
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUyIiwicm9sZXMiOlsiYW5hbHlzdCIsImF1ZGl0b3IiXSwidGlkIjoiYWNtZSJ9.guFpE40gTGSse-r_WRt80-UaF7PO4AiI7FH_Roa2c53oPOGxbUSXgrthA0H5Y5qBxwiq1nEj3cafcS5NYS9aF6A3T4tHi55ePDFNxjNJteJXP3-y7YX-MUR7BDaRumB9wTGB5SUXI0uu8m7cv7S9_u2NcxIs76DIdbU3061k5fWz_V-J0FX7XYEcOcGXr4Bdc5bmjgGG1OX_ACD2L8FtEQz2890HxnQMBoQMlcyXaVfK4qsiwes481ZxxDWWxninQZvX3dHLQtbIDjWFXu-KUQ3Isybc3K3Fd8eoGJ8lkuy_VDofJ1od3g73_IHg1FpIy1A536C_06kyz4bikH7S0w' SELECT count(*) FROM orders;
+----
+3
+
+# --- writes: a narrowed grant stays writable, and supplies the values -----------------------------
+
+statement ok
+ACL ROLE "analyst" INSERT INTO orders(id, amount) VALUES (10, 1000);
+
+query I
+SELECT tenant FROM phys.main.orders_physical WHERE id = 10;
+----
+acme
+
+# a value the user supplies for an injected column is overridden, not trusted
+statement ok
+ACL ROLE "analyst" INSERT INTO orders(id, amount, tenant) VALUES (11, 1100, 'globex');
+
+query I
+SELECT tenant FROM phys.main.orders_physical WHERE id = 11;
+----
+acme
+
+# an INSERT ... SELECT is projected the same way
+statement ok
+ACL ROLE "analyst" INSERT INTO orders(id, amount) SELECT 12, 1200;
+
+query I
+SELECT tenant FROM phys.main.orders_physical WHERE id = 12;
+----
+acme
+
+# a column the grant does not list cannot be written
+statement error
+ACL ROLE "analyst" INSERT INTO orders(id, ssn) VALUES (13, 'x');
+----
+<REGEX>:.*column "ssn" of "orders" is not writable.*
+
+# without a column list we do not know which physical columns are written
+statement error
+ACL ROLE "analyst" INSERT INTO orders VALUES (14, 'acme', 1400, 'x');
+----
+<REGEX>:.*must name its columns.*
+
+# UPDATE only reaches the rows the role can see ...
+statement ok
+ACL ROLE "analyst" UPDATE orders SET amount = amount + 1;
+
+query II
+SELECT id, amount FROM phys.main.orders_physical WHERE id <= 3 ORDER BY id;
+----
+1	101
+2	200
+3	301
+
+# ... and cannot move a row out of the slice
+statement ok
+ACL ROLE "analyst" UPDATE orders SET tenant = 'globex' WHERE id = 1;
+
+query I
+SELECT tenant FROM phys.main.orders_physical WHERE id = 1;
+----
+acme
+
+# DELETE is bounded by the same predicate
+statement ok
+ACL ROLE "analyst" DELETE FROM orders WHERE amount > 0;
+
+query II
+SELECT id, tenant FROM phys.main.orders_physical ORDER BY id;
+----
+2	globex
+
+# RETURNING reads the physical table, so it may not read past the column policy
+statement error
+ACL ROLE "analyst" INSERT INTO orders(id, amount) VALUES (15, 1500) RETURNING ssn;
+----
+<REGEX>:.*column "ssn" of "orders" is not readable.*
+
+statement error
+ACL ROLE "analyst" INSERT INTO orders(id, amount) VALUES (16, 1600) RETURNING *;
+----
+<REGEX>:.*RETURNING \* on "orders" is not allowed under a column policy.*
+
+# a masked column is computed, so the stored value is not readable either
+statement error
+ACL ROLE "analyst" UPDATE orders SET amount = 1 RETURNING tenant;
+----
+<REGEX>:.*column "tenant" of "orders" is not readable.*
+
+# a column the grant exposes as-is reads back normally
+query I
+ACL ROLE "analyst" INSERT INTO orders(id, amount) VALUES (15, 1500) RETURNING amount;
+----
+1500
+
+query I
+ACL ROLE "analyst" DELETE FROM orders WHERE id = 15 RETURNING amount;
+----
+1500
+
+# a second relation in scope makes an unqualified reference ambiguous, so it is refused
+statement error
+ACL ROLE "analyst" UPDATE orders SET amount = 1 FROM (SELECT 1 AS id) s WHERE orders.id = s.id;
+----
+<REGEX>:.*narrowed by a grant.*
+
+# MERGE is refused rather than half-enforced
+statement error
+ACL ROLE "analyst" MERGE INTO orders USING (SELECT 1 AS id) s ON orders.id = s.id WHEN MATCHED THEN DELETE;
+----
+<REGEX>:.*narrowed by a grant.*
+
+# a read-only object stays read-only: the grant narrows, it never widens
+statement ok
+ACL ADMIN ADD VIEW sales.stats AS 'SELECT tenant, count(*) AS n FROM phys.main.orders_physical GROUP BY tenant';
+
+statement ok
+ACL ADMIN GRANT TABLE sales.stats TO ROLE analyst CAPS '{"select": true, "insert": true}' RLS 'tenant = acl_claim(''tenant'')';
+
+statement error
+ACL ROLE "analyst" INSERT INTO stats(tenant, n) VALUES ('acme', 1);
+----
+<REGEX>:.*read-only relation.*
+
+# a grant's predicate applies to a view's output, not to its source
+query I
+ACL ROLE "analyst" SELECT count(*) FROM stats;
+----
+0
+
+# --- renamed relations compose with a grant --------------------------------------------------------
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.renamed COLUMNS 'order_id=id,total=amount';
+
+statement ok
+ACL ADMIN GRANT TABLE sales.renamed TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS 'order_id,total,tenant=acl_claim(''tenant'')';
+
+statement ok
+ACL ROLE "analyst" INSERT INTO renamed(order_id, total) VALUES (20, 2000);
+
+query II
+SELECT id, tenant FROM phys.main.orders_physical WHERE id = 20;
+----
+20	acme
+
+# a column policy narrows the columns, not the rows: without an RLS clause every row is still there
+query II
+ACL ROLE "analyst" SELECT order_id, total FROM renamed ORDER BY order_id;
+----
+2	200
+20	2000
+
+# the physical name of a renamed column is not part of the relation
+statement error
+ACL ROLE "analyst" SELECT id FROM renamed;
+----
+<REGEX>:.*id.*
+
+# --- table functions are reads too, so a grant narrows their result --------------------------------
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.report MACRO 'SELECT id, tenant, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1)';
+
+# without a policy the role sees whatever the macro returns
+query III
+ACL ROLE "auditor" SELECT id, tenant, amount FROM report(0) ORDER BY id;
+----
+2	globex	200
+20	acme	2000
+
+statement ok
+ACL ADMIN GRANT TABLE sales.report TO ROLE analyst CAPS '{"select": true}' RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,amount';
+
+query II
+ACL ROLE "analyst" SELECT id, amount FROM report(0) ORDER BY id;
+----
+20	2000
+
+# the call's own argument still reaches the macro through acl_arg
+query I
+ACL ROLE "analyst" SELECT count(*) FROM report(5000);
+----
+0
+
+# the grant's column list applies to the function's output as well
+statement error
+ACL ROLE "analyst" SELECT tenant FROM report(0);
+----
+<REGEX>:.*tenant.*
+
+# an alias-form table function is narrowed the same way, around the retargeted call
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.rng ALIAS 'range';
+
+statement ok
+ACL ADMIN GRANT TABLE sales.rng TO ROLE analyst CAPS '{"select": true}' RLS 'range > 2';
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM rng(5);
+----
+2
+
+# a scalar function has neither rows nor columns, so a policy on one is refused at grant time
+statement ok
+ACL ADMIN ADD SCALAR sales.shout MACRO 'upper(acl_arg(1))';
+
+statement error
+ACL ADMIN GRANT TABLE sales.shout TO ROLE analyst CAPS '{"select": true}' RLS 'true';
+----
+<REGEX>:.*scalar function "sales.shout" has no rows or columns to narrow.*
+
+# --- fail-closed rules -----------------------------------------------------------------------------
+
+# a grant may hide more, never re-expose what the object hid
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.public_orders COLUMNS 'id,amount';
+
+statement ok
+ACL ADMIN GRANT TABLE sales.public_orders TO ROLE auditor CAPS '{"select": true}' COLUMNS 'id,ssn';
+
+statement error
+ACL ROLE "auditor" SELECT * FROM public_orders;
+----
+<REGEX>:.*does not expose.*
+
+# ... but it may mask harder
+statement ok
+ACL ADMIN GRANT TABLE sales.public_orders TO ROLE compliance CAPS '{"select": true}' COLUMNS 'id,amount=0';
+
+query II
+ACL ROLE "compliance" SELECT id, amount FROM public_orders;
+----
+2	0
+
+# a grant naming an object nobody defined never applies: refuse it at grant time
+statement error
+ACL ADMIN GRANT TABLE sales.nothere TO ROLE auditor CAPS '{"select": true}';
+----
+<REGEX>:.*"sales.nothere" does not exist.*
+
+# a value column that reads the row is a mask, and a mask cannot be written through
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.doubled;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.doubled TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS 'id,amount=amount * 2';
+
+statement error
+ACL ROLE "analyst" INSERT INTO doubled(id) VALUES (30);
+----
+<REGEX>:.*computed from the row.*
+
+# --- the policy can be changed on an existing grant -------------------------------------------------
+
+# clearing the predicate widens the role back to the object's own shape ...
+statement ok
+ACL ADMIN ALTER GRANT CATALOG sales TO ROLE compliance SET RLS '';
+
+query I
+ACL ROLE "compliance" SELECT count(*) FROM orders;
+----
+2
+
+# ... and a new one takes effect on the next query, without re-granting
+statement ok
+ACL ADMIN ALTER GRANT CATALOG sales TO ROLE compliance SET RLS 'amount > 500';
+
+query II
+ACL ROLE "compliance" SELECT id, amount FROM orders;
+----
+20	2000
+
+# --- authorization: handing out a slice is privilege administration (spec 009) ---------------------
+
+statement ok
+ACL ADMIN CREATE ROLE owner;
+
+statement ok
+SELECT acl_grant_catalog('owner', 'sales', '{"manage": true}', false);
+
+statement error
+ACL ROLE "owner" ACL GRANT TABLE sales.orders TO ROLE auditor CAPS '{"select": true}';
+----
+<REGEX>:.*requires an unrestricted manage scope.*
+
+# and a principal can never reach the grant functions from its own query
+statement error
+ACL ROLE "analyst" SELECT acl_grant_object('analyst', 'sales', 'orders', '{"select": true}');
+----
+<REGEX>:.*not allowed.*

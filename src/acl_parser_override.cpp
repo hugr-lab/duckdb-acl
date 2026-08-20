@@ -245,6 +245,30 @@ void SplitVirtual(const string &path, string &vcat, string &vname) {
 	vname = path.substr(dot + 1);
 }
 
+//! The clauses a grant is written with, in any order: CAPS '<json>' RLS '<predicate>'
+//! COLUMNS '<name[=expr], …>' - the grant's own policy (spec 011) - plus MAIN for a catalog grant
+void GrantPolicyClauses(AdminScanner &s, string &caps, string &rls, string &columns, bool *main = nullptr) {
+	for (bool more = true; more;) {
+		more = false;
+		if (s.Accept("caps")) {
+			caps = s.Quoted("caps JSON");
+			more = true;
+		}
+		if (s.Accept("rls")) {
+			rls = s.Quoted("an RLS predicate");
+			more = true;
+		}
+		if (s.Accept("columns")) {
+			columns = s.Quoted("a column list");
+			more = true;
+		}
+		if (main && s.Accept("main")) {
+			*main = true;
+			more = true;
+		}
+	}
+}
+
 unique_ptr<SQLStatement> MakeAdminCall(const string &function, vector<Value> args) {
 	vector<unique_ptr<ParsedExpression>> children;
 	for (auto &arg : args) {
@@ -427,17 +451,29 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			auto role = s.Word("a role name");
 			return MakeAdminCall("acl_grant_admin", {Value(role), Value(scope)});
 		}
+		// GRANT TABLE|VIEW|OBJECT v.n TO ROLE r [CAPS '…'] [RLS '…'] [COLUMNS '…'] - the grant's own
+		// policy (spec 011): it narrows the object for this role, it never widens it
+		if (s.Accept("table") || s.Accept("view") || s.Accept("object")) {
+			string vcat, vname;
+			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			s.Expect("to");
+			s.Expect("role");
+			auto role = s.Word("a role name");
+			string caps = "{}", rls, columns;
+			GrantPolicyClauses(s, caps, rls, columns);
+			return MakeAdminCall("acl_grant_object",
+			                     {Value(role), Value(vcat), Value(vname), Value(caps), Value(rls), Value(columns)});
+		}
 		s.Expect("catalog");
 		auto vcat = s.Word("a catalog name");
 		s.Expect("to");
 		s.Expect("role");
 		auto role = s.Word("a role name");
-		string caps = "{}";
-		if (s.Accept("caps")) {
-			caps = s.Quoted("caps JSON");
-		}
-		bool main = s.Accept("main");
-		return MakeAdminCall("acl_grant_catalog", {Value(role), Value(vcat), Value(caps), Value::BOOLEAN(main)});
+		string caps = "{}", rls, columns;
+		bool main = false;
+		GrantPolicyClauses(s, caps, rls, columns, &main);
+		return MakeAdminCall("acl_grant_catalog",
+		                     {Value(role), Value(vcat), Value(caps), Value::BOOLEAN(main), Value(rls), Value(columns)});
 	}
 	if (StringUtil::CIEquals(keyword, "revoke")) {
 		if (s.Accept("admin")) { // REVOKE ADMIN FROM ROLE r
@@ -495,7 +531,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			}
 			return MakeAdminCall("acl_alter_issuer", {Value(issuer), Value(field), Value(s.Quoted("value"))});
 		}
-		if (s.Accept("grant")) { // ALTER GRANT CATALOG c TO ROLE r SET CAPS '...' | SET MAIN true|false
+		// ALTER GRANT CATALOG c TO ROLE r SET CAPS '…' | SET RLS '…' | SET COLUMNS '…' | SET MAIN t|f
+		if (s.Accept("grant")) {
 			s.Expect("catalog");
 			auto vcat = s.Word("a catalog name");
 			s.Expect("to");
@@ -505,6 +542,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			if (s.Accept("caps")) {
 				return MakeAdminCall("acl_alter_grant",
 				                     {Value(role), Value(vcat), Value("caps"), Value(s.Quoted("caps JSON"))});
+			}
+			if (s.Accept("rls")) {
+				return MakeAdminCall("acl_alter_grant",
+				                     {Value(role), Value(vcat), Value("rls"), Value(s.Quoted("an RLS predicate"))});
+			}
+			if (s.Accept("columns")) {
+				return MakeAdminCall("acl_alter_grant",
+				                     {Value(role), Value(vcat), Value("columns"), Value(s.Quoted("a column list"))});
 			}
 			s.Expect("main");
 			auto flag = s.Word("true or false");
@@ -669,16 +714,16 @@ struct MgmtProvenance {
 MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	// name -> index of the constant argument holding the catalog; -1 = none
 	static const std::unordered_map<string, int> CATALOG_ARG = {
-	    {"acl_create_catalog", 0},     {"acl_add_relation", 0},       {"acl_add_view", 0},
-	    {"acl_add_schema_alias", 0},   {"acl_add_table_function", 0}, {"acl_add_table_function_alias", 0},
-	    {"acl_add_scalar", 0},         {"acl_add_scalar_alias", 0},   {"acl_drop_relation", 0},
-	    {"acl_grant_catalog", 1},      {"acl_revoke_catalog", 1},     {"acl_define_role", -1},
-	    {"acl_define_issuer", -1},     {"acl_map_role", -1},          {"acl_alter_relation", 0},
-	    {"acl_alter_schema_alias", 0}, {"acl_alter_function", 0},     {"acl_alter_catalog", 0},
-	    {"acl_alter_grant", 1},        {"acl_alter_role", -1},        {"acl_alter_issuer", -1},
-	    {"acl_drop_schema_alias", 0},  {"acl_drop_function", 0},      {"acl_drop_role", -1},
-	    {"acl_drop_issuer", -1},       {"acl_drop_role_mapping", -1}, {"acl_comment", 0},
-	    {"acl_refresh_schema", 0},
+	    {"acl_create_catalog", 0},   {"acl_add_relation", 0},       {"acl_add_view", 0},
+	    {"acl_add_schema_alias", 0}, {"acl_add_table_function", 0}, {"acl_add_table_function_alias", 0},
+	    {"acl_add_scalar", 0},       {"acl_add_scalar_alias", 0},   {"acl_drop_relation", 0},
+	    {"acl_grant_catalog", 1},    {"acl_revoke_catalog", 1},     {"acl_grant_object", 1},
+	    {"acl_define_role", -1},     {"acl_define_issuer", -1},     {"acl_map_role", -1},
+	    {"acl_alter_relation", 0},   {"acl_alter_schema_alias", 0}, {"acl_alter_function", 0},
+	    {"acl_alter_catalog", 0},    {"acl_alter_grant", 1},        {"acl_alter_role", -1},
+	    {"acl_alter_issuer", -1},    {"acl_drop_schema_alias", 0},  {"acl_drop_function", 0},
+	    {"acl_drop_role", -1},       {"acl_drop_issuer", -1},       {"acl_drop_role_mapping", -1},
+	    {"acl_comment", 0},          {"acl_refresh_schema", 0},
 	};
 	MgmtProvenance provenance;
 	auto &select = statement.Cast<SelectStatement>().node->Cast<SelectNode>();
@@ -688,8 +733,8 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 		provenance.escalates = true;
 		return provenance;
 	}
-	if (name == "acl_grant_catalog" || name == "acl_revoke_catalog" || name == "acl_alter_grant" ||
-	    name == "acl_drop_catalog") {
+	if (name == "acl_grant_catalog" || name == "acl_revoke_catalog" || name == "acl_grant_object" ||
+	    name == "acl_alter_grant" || name == "acl_drop_catalog") {
 		// dropping a catalog takes it away from everyone who holds it, so it is privilege
 		// administration too - a scope over the catalog's content does not include destroying it
 		provenance.hands_out = true;

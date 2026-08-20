@@ -4,8 +4,10 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -189,10 +191,12 @@ private:
 		if (node.select_statement && node.select_statement->node) {
 			RewriteQueryNode(*node.select_statement->node);
 		}
+		ApplyInsertPolicy(node, policy, vname);
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname); // RETURNING names the target's own columns
 		}
+		RequireReadableReturning(node.returning_list, policy, vname);
 	}
 
 	void RewriteUpdateNode(UpdateQueryNode &node) {
@@ -203,18 +207,31 @@ private:
 		if (node.set_info) {
 			for (auto &column : node.set_info->columns) {
 				column = MapWrittenColumn(policy, column, vname);
+				RequireWritableColumn(policy, column, vname);
 			}
 			for (auto &expr : node.set_info->expressions) {
 				RewriteExpr(expr);
 				MapColumnRefs(expr, policy, vname);
 			}
+			// a grant's value column is assigned, not suggested: overriding the SET keeps the row
+			// inside the principal's slice, and the predicate keeps the statement there too
+			for (idx_t i = 0; i < node.set_info->columns.size(); i++) {
+				for (auto &injection : policy.injections) {
+					if (StringUtil::CIEquals(injection.first, node.set_info->columns[i].GetIdentifierName())) {
+						node.set_info->expressions[i] = InjectedValue(injection, vname);
+						break;
+					}
+				}
+			}
 			RewriteExpr(node.set_info->condition);
 			MapColumnRefs(node.set_info->condition, policy, vname);
+			AndPolicyPredicate(node.set_info->condition, policy);
 		}
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname);
 		}
+		RequireReadableReturning(node.returning_list, policy, vname);
 	}
 
 	void RewriteDeleteNode(DeleteQueryNode &node) {
@@ -226,10 +243,12 @@ private:
 		}
 		RewriteExpr(node.condition);
 		MapColumnRefs(node.condition, policy, vname);
+		AndPolicyPredicate(node.condition, policy);
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname);
 		}
+		RequireReadableReturning(node.returning_list, policy, vname);
 	}
 
 	void RewriteMergeNode(MergeQueryNode &node) {
@@ -336,12 +355,15 @@ private:
 		TablePolicy policy;
 		if (store.ResolveTableFunction(principal, vname, policy)) {
 			RewriteFunctionArgs(function); // resolve virtual names inside the call arguments first
+			Identifier alias = tf.alias.empty() ? Identifier(vname) : tf.alias;
 			if (policy.subquery_form) {
 				ref = BuildFunctionSubquery(vname, policy, function, tf);
 			} else {
 				// RENAME-alias: retarget the call to a physical/system function, keep the arguments
 				function.SetQualifiedName(ParsePhysName(policy.phys));
 			}
+			// a grant narrows what the function returns, whichever form it took (spec 011)
+			WrapWithGrantPolicy(ref, policy, alias);
 			return;
 		}
 		// not a virtual table function: gate by name, then rewrite arguments and any subquery argument
@@ -381,6 +403,24 @@ private:
 		return std::move(sub);
 	}
 
+	//! `(SELECT <columns> FROM (<what the function expanded to>) [WHERE <predicate>]) AS <alias>` -
+	//! the grant's policy over a table function's result. The shape is parsed as a template over a
+	//! placeholder relation, so the column items and the predicate go through the normal parser (and
+	//! the normal claim baking); the placeholder is then swapped for the real reference.
+	void WrapWithGrantPolicy(unique_ptr<TableRef> &ref, const TablePolicy &policy, const Identifier &alias) {
+		if (policy.rls.empty() && policy.projection.empty()) {
+			return;
+		}
+		string items = policy.projection.empty() ? "*" : StringUtil::Join(policy.projection, ", ");
+		auto sql = "SELECT " + items + " FROM \"__acl_inner\"" + (policy.rls.empty() ? "" : " WHERE " + policy.rls);
+		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		BakeMarkersInNode(*select_stmt->node, nullptr); // acl_arg belongs to the call, not to the policy
+		auto &select = select_stmt->node->Cast<SelectNode>();
+		ref->alias = Identifier();
+		select.from_table = std::move(ref);
+		ref = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+	}
+
 	bool IsCteName(BaseTableRef &base) {
 		auto &name = base.GetQualifiedName();
 		if (!name.Catalog().empty() || !name.Schema().empty()) {
@@ -396,10 +436,18 @@ private:
 		if (!policy.query.empty()) {
 			sql = policy.query; // a view: its SQL is the definition
 		} else {
-			if (policy.projection.empty()) {
+			if (policy.projection.empty() && policy.rls.empty()) {
 				Deny("object \"" + vname + "\" exposes no readable columns");
 			}
-			sql = "SELECT " + StringUtil::Join(policy.projection, ", ") + " FROM " + policy.phys;
+			// no projection means the grant narrowed only the rows (spec 011): every column is read,
+			// renamed by name if the object renames any
+			string items = "*";
+			if (!policy.projection.empty()) {
+				items = StringUtil::Join(policy.projection, ", ");
+			} else if (!policy.renames.empty()) {
+				items = "* RENAME (" + StringUtil::Join(RenameItems(policy), ", ") + ")";
+			}
+			sql = "SELECT " + items + " FROM " + policy.phys;
 			if (!policy.rls.empty()) {
 				sql += " WHERE " + policy.rls;
 			}
@@ -417,17 +465,22 @@ private:
 	//! `(SELECT * RENAME (phys AS virt, …) FROM <phys>) AS <alias>` - the read shape of a renamed but
 	//! writable relation
 	unique_ptr<TableRef> BuildRenamedSubquery(const string &vname, const TablePolicy &policy, BaseTableRef &original) {
-		vector<string> renames;
-		for (auto &rename : policy.renames) {
-			renames.push_back(rename.second + " AS " + rename.first);
-		}
-		auto sql = "SELECT * RENAME (" + StringUtil::Join(renames, ", ") + ") FROM " + policy.phys;
+		auto sql = "SELECT * RENAME (" + StringUtil::Join(RenameItems(policy), ", ") + ") FROM " + policy.phys;
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		Identifier alias = original.alias.empty() ? Identifier(vname) : original.alias;
 		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
 		sub->column_name_alias = std::move(original.column_name_alias);
 		sub->sample = std::move(original.sample);
 		return std::move(sub);
+	}
+
+	//! `phys AS virt` items of a relation's rename list
+	static vector<string> RenameItems(const TablePolicy &policy) {
+		vector<string> items;
+		for (auto &rename : policy.renames) {
+			items.push_back(rename.second + " AS " + rename.first);
+		}
+		return items;
 	}
 
 	//! Map a written column name onto the physical one. A physical name that the policy renamed away
@@ -464,12 +517,160 @@ private:
 		    *expr, [&](unique_ptr<ParsedExpression> &child) { MapColumnRefs(child, policy, vname); });
 	}
 
-	//! A renamed relation may only be written when the statement has no second relation in scope:
-	//! an unqualified column reference could otherwise belong to either side, and guessing would
-	//! silently write the wrong column.
+	//! A grant's value column is an assignment, so it may only be built from claims and constants: an
+	//! expression that reads the row is a mask, and a mask cannot be written through (spec 011).
+	void RequireValueExpression(const ParsedExpression &expr, const string &column, const string &vname) {
+		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			Deny("column \"" + column + "\" of \"" + vname + "\" is computed from the row, so it cannot be written");
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { RequireValueExpression(child, column, vname); });
+	}
+
+	//! The baked value a grant assigns to one column
+	unique_ptr<ParsedExpression> InjectedValue(const std::pair<string, string> &injection, const string &vname) {
+		auto value = store.InstantiateExpr(injection.second, template_options);
+		BakeMarkers(value, nullptr);
+		RequireValueExpression(*value, injection.first, vname);
+		return value;
+	}
+
+	//! Refuse a write to a column the grant does not list: silently dropping it would write a row the
+	//! principal did not ask for.
+	void RequireWritableColumn(const TablePolicy &policy, const Identifier &column, const string &vname) {
+		if (policy.write_columns.empty() || policy.write_columns.count(column.GetIdentifierName())) {
+			return;
+		}
+		Deny("column \"" + column.GetIdentifierName() + "\" of \"" + vname + "\" is not writable");
+	}
+
+	//! AND the policy's (already composed) predicate into a statement's WHERE, so an UPDATE/DELETE
+	//! only reaches rows the principal can see. The predicate names physical columns, so it is added
+	//! after the user's own condition has been mapped.
+	void AndPolicyPredicate(unique_ptr<ParsedExpression> &condition, const TablePolicy &policy) {
+		if (policy.rls.empty()) {
+			return;
+		}
+		auto predicate = store.InstantiateExpr(policy.rls, template_options);
+		BakeMarkers(predicate, nullptr);
+		if (!condition) {
+			condition = std::move(predicate);
+			return;
+		}
+		condition = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(condition),
+		                                             std::move(predicate));
+	}
+
+	//! Whether a grant narrows what may be written at all
+	static bool HasWritePolicy(const TablePolicy &policy) {
+		return !policy.injections.empty() || !policy.write_columns.empty() || !policy.rls.empty();
+	}
+
+	//! Apply the grant's write policy to an INSERT: the written columns must be granted, and every
+	//! injected value is assigned - added when absent, overriding what the user supplied - by
+	//! projecting the source through a subquery. The row therefore belongs to the principal by
+	//! construction, without a separate WITH CHECK.
+	void ApplyInsertPolicy(InsertQueryNode &node, const TablePolicy &policy, const string &vname) {
+		// only a column policy has something to check an INSERT against: a predicate alone does not
+		// confine what is written (that is what a value column is for), so it does not restrict here
+		if (policy.write_columns.empty()) {
+			return;
+		}
+		if (node.columns.empty() || node.default_values || node.column_order == InsertColumnOrder::INSERT_BY_NAME) {
+			// without an explicit column list we do not know which physical columns are written, so
+			// there is nothing to check the grant against
+			Deny("insert into \"" + vname + "\" must name its columns");
+		}
+		if (node.on_conflict_info) {
+			Deny("insert into \"" + vname + "\" cannot use ON CONFLICT under a column policy");
+		}
+		for (auto &column : node.columns) {
+			RequireWritableColumn(policy, column, vname);
+		}
+		if (policy.injections.empty()) {
+			return;
+		}
+		vector<Identifier> columns;
+		vector<unique_ptr<ParsedExpression>> items;
+		for (auto &column : node.columns) {
+			bool injected = false;
+			for (auto &injection : policy.injections) {
+				if (StringUtil::CIEquals(injection.first, column.GetIdentifierName())) {
+					injected = true; // the supplied value is dropped: the grant assigns this column
+					break;
+				}
+			}
+			if (!injected) {
+				columns.push_back(column);
+				items.push_back(make_uniq<ColumnRefExpression>(column));
+			}
+		}
+		for (auto &injection : policy.injections) {
+			columns.push_back(Identifier(injection.first));
+			items.push_back(InjectedValue(injection, vname));
+		}
+		auto source = make_uniq<SubqueryRef>(std::move(node.select_statement), Identifier("__acl_insert"));
+		source->column_name_alias = node.columns;
+		auto select = make_uniq<SelectNode>();
+		select->from_table = std::move(source);
+		select->select_list = std::move(items);
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(select);
+		node.select_statement = std::move(statement);
+		node.columns = std::move(columns);
+	}
+
+	//! RETURNING reads the physical table, so under a column policy it must not become a way back to
+	//! what the grant hid or masked: only columns the grant exposes as-is may be named, and a star -
+	//! which expands to every physical column - never is.
+	void RequireReadableReturning(const vector<unique_ptr<ParsedExpression>> &returning, const TablePolicy &policy,
+	                              const string &vname) {
+		if (policy.write_columns.empty()) {
+			return; // no column policy: the relation is the table, and RETURNING reads the table
+		}
+		for (auto &item : returning) {
+			RequireReadableExpr(*item, policy, vname);
+		}
+	}
+
+	void RequireReadableExpr(const ParsedExpression &expr, const TablePolicy &policy, const string &vname) {
+		if (expr.GetExpressionClass() == ExpressionClass::STAR) {
+			Deny("RETURNING * on \"" + vname + "\" is not allowed under a column policy");
+		}
+		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+			if (names.empty()) {
+				return;
+			}
+			auto name = names.back().GetIdentifierName();
+			bool masked = false;
+			for (auto &injection : policy.injections) {
+				if (StringUtil::CIEquals(injection.first, name)) {
+					masked = true; // the grant computes this column, so the stored value is not readable
+					break;
+				}
+			}
+			if (masked || !policy.write_columns.count(name)) {
+				Deny("column \"" + name + "\" of \"" + vname + "\" is not readable");
+			}
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { RequireReadableExpr(child, policy, vname); });
+	}
+
+	//! A narrowed or renamed relation may only be written when the statement has no second relation in
+	//! scope: an unqualified column reference - the user's, or the one the policy adds to the WHERE -
+	//! could otherwise belong to either side, and guessing would silently write the wrong column.
 	void RequireSingleScope(const TablePolicy &policy, bool has_other_relation, const string &vname) {
-		if (!policy.renames.empty() && has_other_relation) {
+		if (!has_other_relation) {
+			return;
+		}
+		if (!policy.renames.empty()) {
 			Deny("\"" + vname + "\" renames columns, so it cannot be written with FROM/USING/MERGE yet");
+		}
+		if (HasWritePolicy(policy)) {
+			Deny("\"" + vname + "\" is narrowed by a grant, so it cannot be written with FROM/USING/MERGE yet");
 		}
 	}
 
@@ -494,8 +695,9 @@ private:
 		if (!store.ResolveTable(principal, key, policy)) {
 			Deny("no access to object \"" + key + "\"");
 		}
-		// only RENAME relations are writable; a SUBQUERY relation (view / masked / RLS) is read-only
-		if (policy.subquery_form) {
+		// a view / masked / computed relation is read-only; a grant that only narrows a real table
+		// keeps it writable - the narrowing moves onto the written values and the WHERE (spec 011)
+		if (!policy.writable) {
 			Deny(capability + " into read-only relation \"" + key + "\" is not allowed");
 		}
 		if (!policy.caps.count(capability)) {
@@ -584,13 +786,16 @@ private:
 		if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 			auto &function = expr->Cast<FunctionExpression>();
 			auto marker = StringUtil::Lower(function.FunctionName().GetIdentifierName());
-			if (marker == "acl_claim") {
-				expr = make_uniq<ConstantExpression>(ClaimValue(function));
+			if (marker == "acl_claim" || marker == "acl_arg") {
+				// the marker may be the whole select item (`acl_claim('tenant') AS tenant`), so its
+				// alias has to survive the replacement - otherwise the column loses its name
+				auto alias = expr->GetAlias();
+				expr = marker == "acl_claim" ? make_uniq<ConstantExpression>(ClaimValue(function))
+				                             : ArgExpression(function, args);
+				if (!alias.GetIdentifierName().empty()) {
+					expr->SetAlias(alias);
+				}
 				return; // replaced whole node; nothing below to recurse into
-			}
-			if (marker == "acl_arg") {
-				expr = ArgExpression(function, args);
-				return;
 			}
 		}
 		ParsedExpressionIterator::EnumerateChildren(

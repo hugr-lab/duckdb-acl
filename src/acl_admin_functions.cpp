@@ -232,7 +232,9 @@ void AclAddScalarAliasCatalogFunc(DataChunk &args, ExpressionState &state, Vecto
 	AddFunction(args, state, result, "acl_add_scalar_alias", "scalar", "alias");
 }
 
-//! acl_grant_catalog(role, vcat, caps_json, is_main): grant a virtual catalog to a role
+//! acl_grant_catalog(role, vcat, caps_json, is_main[, rls, columns]): grant a virtual catalog to a
+//! role. rls/columns are the grant's own policy (spec 011): they narrow every object of the catalog
+//! for this role - the predicate is AND-ed onto the objects', the column list intersects theirs.
 void AclGrantCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_grant_catalog", "role");
@@ -243,7 +245,27 @@ void AclGrantCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result
 			auto value = args.GetValue(3, row);
 			is_main = !value.IsNull() && value.GetValue<bool>();
 		}
-		StoreOf(state).CatalogGrant(role, vcat, caps, is_main);
+		StoreOf(state).CatalogGrant(role, vcat, caps, is_main, OptionalArg(args, 4, row, ""),
+		                            OptionalArg(args, 5, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_grant_object(role, vcat, vname, caps_json[, rls, columns]): grant one object of a catalog,
+//! with the capabilities and the policy this role gets on it (spec 011)
+void AclGrantObjectFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = RequiredArg(args, 0, row, "acl_grant_object", "role");
+		auto vcat = RequiredArg(args, 1, row, "acl_grant_object", "catalog");
+		auto vname = RequiredArg(args, 2, row, "acl_grant_object", "name");
+		auto caps = OptionalArg(args, 3, row, "{}");
+		auto rls = OptionalArg(args, 4, row, "");
+		auto columns = OptionalArg(args, 5, row, "");
+		auto &store = StoreOf(state);
+		// a grant on an object nobody defined is a policy that never applies: refuse it now
+		store.CatalogRequireGrantTarget(vcat, vname, !rls.empty() || !columns.empty());
+		store.CatalogEnsureGrant(role, vcat, false);
+		store.CatalogSetObjectCaps(role, vcat, vname, caps, rls, columns);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -302,6 +324,7 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		// no projection and no RLS: expose the physical table as-is via RENAME (writable); otherwise a
 		// read-only SUBQUERY (masking / computed columns / RLS need a wrapping subquery)
 		policy.subquery_form = !policy.projection.empty() || !policy.rls.empty();
+		policy.writable = !policy.subquery_form;
 		for (auto &cap : cap_list) {
 			policy.caps.insert(StringUtil::Lower(cap));
 		}
@@ -708,7 +731,8 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_add_table_function_alias", {v, v, v}, AclAddTableFunctionAliasFunc);
 	register_admin_set("acl_add_scalar", {{v, v, v}, {v, v, v, v, v}}, AclAddScalarCatalogFunc);
 	register_admin("acl_add_scalar_alias", {v, v, v}, AclAddScalarAliasCatalogFunc);
-	register_admin_set("acl_grant_catalog", {{v, v, v}, {v, v, v, b}}, AclGrantCatalogFunc);
+	register_admin_set("acl_grant_catalog", {{v, v, v}, {v, v, v, b}, {v, v, v, b, v, v}}, AclGrantCatalogFunc);
+	register_admin_set("acl_grant_object", {{v, v, v, v}, {v, v, v, v, v, v}}, AclGrantObjectFunc);
 	register_admin("acl_revoke_catalog", {v, v}, AclRevokeCatalogFunc);
 	register_admin("acl_drop_relation", {v, v}, AclDropRelationFunc);
 	// metadata (spec 010)
