@@ -159,17 +159,27 @@ struct PolicyStore {
 	// columns are (name, expr) pairs with an empty expr for a plain projected column.
 	void CatalogCreate(const string &vcat, const string &comment);
 	void CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
-	                        const string &view_sql, const string &rls,
-	                        const vector<std::pair<string, string>> &columns);
+	                        const string &view_sql, const string &rls, const vector<std::pair<string, string>> &columns,
+	                        const string &returns = string());
 	void CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path);
+	//! `params`/`returns` are the declared signature and result ("name TYPE, …"): a declared result is
+	//! stored as-is and never probed - an argument-dependent template cannot be typed from NULLs, and
+	//! binding admin SQL at write time would touch the sources (spec 010)
 	void CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
-	                        const string &target, const string &template_sql);
+	                        const string &target, const string &template_sql, const string &params = string(),
+	                        const string &returns = string());
 	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main);
 	void CatalogRevoke(const string &role, const string &vcat);
 	void CatalogDropRelation(const string &vcat, const string &vname);
 	// DROP of the remaining virtual-catalog elements (spec 010). Dropping a catalog removes its own
 	// definitions always; the role grants pointing at it need `cascade`, so an accidental drop cannot
 	// silently revoke people's access.
+	//! Comments on virtual objects and their columns (spec 010); `kind` is relation|table|scalar,
+	//! `column` empty means the object itself
+	void CatalogSetComment(const string &vcat, const string &vname, const string &kind, const string &column,
+	                       const string &comment);
+	//! Re-derive the stored column schema of query-defined objects: one object, or a whole catalog
+	idx_t CatalogRefreshSchema(const string &vcat, const string &vname);
 	void CatalogDropCatalog(const string &vcat, bool cascade);
 	void CatalogDropSchemaAlias(const string &vcat, const string &alias_path);
 	void CatalogDropFunction(const string &vcat, const string &vname, const string &kind);
