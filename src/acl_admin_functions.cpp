@@ -459,6 +459,69 @@ void AclAlterIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//===--------------------------------------------------------------------===//
+// DROP of virtual-catalog elements (spec 010): cleanup, not access control - REVOKE takes access
+// away, ADD overwrites definitions; these remove what was created so nothing dangles.
+//===--------------------------------------------------------------------===//
+
+//! acl_drop_catalog(vcat [, cascade]): definitions always; the role grants need cascade
+void AclDropCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_drop_catalog", "catalog");
+		bool cascade = false;
+		if (args.ColumnCount() > 1) {
+			auto value = args.GetValue(1, row);
+			cascade = !value.IsNull() && value.GetValue<bool>();
+		}
+		StoreOf(state).CatalogDropCatalog(vcat, cascade);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclDropSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_drop_schema_alias", "catalog");
+		auto alias = RequiredArg(args, 1, row, "acl_drop_schema_alias", "alias path");
+		StoreOf(state).CatalogDropSchemaAlias(vcat, alias);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclDropFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_drop_function", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_drop_function", "name");
+		auto kind = StringUtil::Lower(RequiredArg(args, 2, row, "acl_drop_function", "kind"));
+		StoreOf(state).CatalogDropFunction(vcat, vname, kind);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclDropRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		StoreOf(state).CatalogDropRole(RequiredArg(args, 0, row, "acl_drop_role", "role"));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclDropIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		StoreOf(state).CatalogDropIssuer(RequiredArg(args, 0, row, "acl_drop_issuer", "issuer"));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclDropRoleMappingFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto issuer = RequiredArg(args, 0, row, "acl_drop_role_mapping", "issuer");
+		auto source = RequiredArg(args, 1, row, "acl_drop_role_mapping", "source");
+		auto external = RequiredArg(args, 2, row, "acl_drop_role_mapping", "external value");
+		auto role = RequiredArg(args, 3, row, "acl_drop_role_mapping", "role");
+		StoreOf(state).CatalogDropRoleMapping(issuer, source, external, role);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
 //! acl_grant_admin(role, scope): a GLOBAL administration scope (spec 009) - 'manage' (the management
 //! grammar over every catalog, plus the statements that belong to no catalog) or 'passthrough'
 //! (anything, including native SQL - god mode). Managing ONE catalog is not granted here: it is a
@@ -583,6 +646,13 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_grant_catalog", {{v, v, v}, {v, v, v, b}}, AclGrantCatalogFunc);
 	register_admin("acl_revoke_catalog", {v, v}, AclRevokeCatalogFunc);
 	register_admin("acl_drop_relation", {v, v}, AclDropRelationFunc);
+	// DROP of the remaining elements (spec 010)
+	register_admin_set("acl_drop_catalog", {{v}, {v, b}}, AclDropCatalogFunc);
+	register_admin("acl_drop_schema_alias", {v, v}, AclDropSchemaAliasFunc);
+	register_admin("acl_drop_function", {v, v, v}, AclDropFunctionFunc);
+	register_admin("acl_drop_role", {v}, AclDropRoleFunc);
+	register_admin("acl_drop_issuer", {v}, AclDropIssuerFunc);
+	register_admin("acl_drop_role_mapping", {v, v, v, v}, AclDropRoleMappingFunc);
 	// original stubs / compatibility wrappers
 	register_admin("acl_grant_table", {v, v, v, v, v, v}, AclGrantTableFunc);
 	register_admin("acl_grant_view", {v, v, v}, AclGrantViewFunc);

@@ -1182,6 +1182,110 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 	                    " AND \"vname\" = " + Lit(vname)});
 }
 
+void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
+	RequireCatalog(catalog, "acl_drop_catalog");
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto exists = read("SELECT 1 FROM " + catalog->Tbl("catalogs") + " WHERE \"vcat\" = " + Lit(vcat));
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: catalog \"%s\" does not exist", vcat);
+		}
+		auto holders = read("SELECT \"role\" FROM " + catalog->Tbl("role_catalogs") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                    " ORDER BY \"role\"");
+		if (holders->RowCount() > 0 && !cascade) {
+			vector<string> roles;
+			for (idx_t row = 0; row < holders->RowCount(); row++) {
+				roles.push_back(holders->GetValue(0, row).ToString());
+			}
+			throw BinderException("acl admin: catalog \"%s\" is still granted to %s - repeat with CASCADE to "
+			                      "drop those grants too",
+			                      vcat, StringUtil::Join(roles, ", "));
+		}
+		for (auto table : {"relations", "relation_columns", "schema_aliases", "functions"}) {
+			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
+		}
+		if (cascade) {
+			for (auto table : {"role_catalogs", "role_object_caps"}) {
+				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
+			}
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("catalogs") + " WHERE \"vcat\" = " + Lit(vcat));
+	});
+}
+
+void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias_path) {
+	RequireCatalog(catalog, "acl_drop_schema_alias");
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto exists = read("SELECT 1 FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                   " AND \"alias_path\" = " + Lit(alias_path));
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: schema alias \"%s.%s\" does not exist", vcat, alias_path);
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"alias_path\" = " + Lit(alias_path));
+	});
+}
+
+void PolicyStore::CatalogDropFunction(const string &vcat, const string &vname, const string &kind) {
+	RequireCatalog(catalog, "acl_drop_function");
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto exists = read("SELECT 1 FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                   " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: %s function \"%s.%s\" does not exist", kind, vcat, vname);
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
+	});
+}
+
+void PolicyStore::CatalogDropRole(const string &role) {
+	RequireCatalog(catalog, "acl_drop_role");
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto exists = read("SELECT 1 FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: role \"%s\" does not exist", role);
+		}
+		// everything that points at a role goes with it - nothing may dangle
+		for (auto table : {"role_claims", "role_catalogs", "role_object_caps", "admins", "role_mappings"}) {
+			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"role\" = " + Lit(role));
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
+	});
+}
+
+void PolicyStore::CatalogDropIssuer(const string &issuer) {
+	RequireCatalog(catalog, "acl_drop_issuer");
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto exists = read("SELECT 1 FROM " + catalog->Tbl("issuers") + " WHERE \"issuer\" = " + Lit(issuer));
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: issuer \"%s\" does not exist", issuer);
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_mappings") + " WHERE \"issuer\" = " + Lit(issuer));
+		statements.push_back("DELETE FROM " + catalog->Tbl("issuers") + " WHERE \"issuer\" = " + Lit(issuer));
+	});
+}
+
+void PolicyStore::CatalogDropRoleMapping(const string &issuer, const string &source, const string &external_value,
+                                         const string &role) {
+	RequireCatalog(catalog, "acl_drop_role_mapping");
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto where = " WHERE \"issuer\" = " + Lit(issuer) + " AND \"source\" = " + Lit(source) +
+		             " AND \"external_value\" = " + Lit(external_value) + " AND \"role\" = " + Lit(role);
+		auto exists = read("SELECT 1 FROM " + catalog->Tbl("role_mappings") + where);
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: no mapping of %s \"%s\" from issuer \"%s\" to role \"%s\"", source,
+			                      external_value, issuer, role);
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_mappings") + where);
+	});
+}
+
 void PolicyStore::CatalogDefineRole(const string &role, const case_insensitive_map_t<string> &claims) {
 	RequireCatalog(catalog, "acl_define_role");
 	vector<string> statements;
