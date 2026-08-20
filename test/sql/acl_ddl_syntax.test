@@ -1,0 +1,330 @@
+# name: test/sql/acl_ddl_syntax.test
+# description: one DDL syntax for the virtual catalog (spec 013) - inline bodies and real lists next
+#   to the legacy quoted/CSV/JSON forms, both storing the same rows
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT, ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100, 'a1'), (2, 'globex', 200, 'g2');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+# --- inline bodies: no doubled quotes ---------------------------------------------------------------
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.orders COLUMNS (id, amount, ssn = NULL) RLS (tenant = acl_claim('tenant'));
+
+query II
+SELECT rls, form FROM aclcat.acl.relations WHERE vname = 'orders';
+----
+tenant = acl_claim('tenant')	subquery
+
+query III
+SELECT name, expr, pos FROM aclcat.acl.relation_columns WHERE vname = 'orders' ORDER BY pos;
+----
+id	(empty)	0
+amount	(empty)	1
+ssn	NULL	2
+
+# the legacy spelling of the very same object stores the very same rows
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.legacy COLUMNS 'id,amount,ssn=NULL' RLS 'tenant = acl_claim(''tenant'')';
+
+query I
+SELECT count(*) FROM aclcat.acl.relations a JOIN aclcat.acl.relations b ON a.rls = b.rls AND a.form = b.form AND a.phys = b.phys WHERE a.vname = 'orders' AND b.vname = 'legacy';
+----
+1
+
+# a view's body reaches the end of the statement, quotes and all
+statement ok
+ACL ADMIN ADD VIEW sales.mine AS SELECT id, amount FROM phys.main.orders_physical WHERE tenant = acl_claim('tenant');
+
+query I
+SELECT view_sql FROM aclcat.acl.relations WHERE vname = 'mine';
+----
+SELECT id, amount FROM phys.main.orders_physical WHERE tenant = acl_claim('tenant')
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.report(threshold INTEGER) RETURNS TABLE (id INTEGER, amount INTEGER) MACRO SELECT id, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1);
+
+query I
+SELECT template FROM aclcat.acl.functions WHERE vname = 'report';
+----
+SELECT id, amount FROM phys.main.orders_physical WHERE amount >= acl_arg(1)
+
+statement ok
+ACL ADMIN ADD SCALAR sales.tag MACRO acl_arg(1) || '@' || acl_claim('tenant');
+
+query I
+SELECT template FROM aclcat.acl.functions WHERE vname = 'tag';
+----
+acl_arg(1) || '@' || acl_claim('tenant')
+
+# an alias target may be written bare or quoted
+statement ok
+ACL ADMIN ADD TABLE FUNCTION sales.rng ALIAS range;
+
+statement ok
+ACL ADMIN ADD SCALAR sales.lc ALIAS 'lower';
+
+query II
+SELECT target, form FROM aclcat.acl.functions WHERE vname = 'rng';
+----
+range	alias
+
+# --- the SQL-shaped verb: CREATE VIRTUAL <kind> --------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.created AS phys.main.orders_physical COLUMNS (id, amount) RLS (amount > 0) COMMENT 'made with CREATE';
+
+query IIII
+SELECT phys, form, rls, comment FROM aclcat.acl.relations WHERE vname = 'created';
+----
+phys.main.orders_physical	subquery	amount > 0	made with CREATE
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW sales.created_view (n BIGINT) COMMENT 'made with CREATE' AS SELECT count(*) AS n FROM phys.main.orders_physical;
+
+query III
+SELECT form, view_sql, comment FROM aclcat.acl.relations WHERE vname = 'created_view';
+----
+view	SELECT count(*) AS n FROM phys.main.orders_physical	made with CREATE
+
+query II
+SELECT name, type FROM aclcat.acl.object_columns WHERE vname = 'created_view';
+----
+n	BIGINT
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.created_fn(threshold INTEGER) RETURNS TABLE (id INTEGER) COMMENT 'a function' AS SELECT id FROM phys.main.orders_physical WHERE amount >= acl_arg(1);
+
+query IIII
+SELECT kind, form, params, comment FROM aclcat.acl.functions WHERE vname = 'created_fn';
+----
+table	macro	threshold INTEGER	a function
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR sales.created_scalar(text VARCHAR) RETURNS VARCHAR AS upper(acl_arg(1));
+
+query II
+SELECT kind, template FROM aclcat.acl.functions WHERE vname = 'created_scalar';
+----
+scalar	upper(acl_arg(1))
+
+# ALIAS OF, and the older ALIAS, name the same thing
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.created_rng ALIAS OF range;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR sales.created_lc ALIAS OF lower COMMENT 'lowercase';
+
+query III
+SELECT target, form, comment FROM aclcat.acl.functions WHERE vname = 'created_lc';
+----
+lower	alias	lowercase
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.main;
+
+query I
+SELECT phys_path FROM aclcat.acl.schema_aliases WHERE alias_path = 'raw';
+----
+phys.main
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG hr COMMENT 'people';
+
+query I
+SELECT comment FROM aclcat.acl.catalogs WHERE vcat = 'hr';
+----
+people
+
+# --- lists are lists --------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS (tenant = 'acme');
+
+query II
+SELECT claim, value FROM aclcat.acl.role_claims WHERE role = 'analyst';
+----
+tenant	acme
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select, insert) MAIN;
+
+query I
+SELECT caps FROM aclcat.acl.role_catalogs WHERE role = 'analyst';
+----
+{"select": true, "insert": true}
+
+statement ok
+ACL ADMIN GRANT TABLE sales.orders TO ROLE analyst WITH (select) RLS (amount > 50) COLUMNS (id, amount);
+
+query III
+SELECT caps, rls, columns FROM aclcat.acl.role_object_caps WHERE role = 'analyst' AND vname = 'orders';
+----
+{"select": true}	amount > 50	id, amount
+
+# the object resolves and enforces exactly what those lists said
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/x' KEYS '{"keys":[]}' AUDIENCES ('api://hugr', 'api://other') ALGS (RS256, ES256) ROLE CLAIM 'groups' CLAIM MAP (tid => tenant, oid => user_id);
+
+query III
+SELECT audiences, array_to_string(list_sort(str_split(algs, ',')), '|'), claim_map FROM aclcat.acl.issuers WHERE issuer = 'https://issuer.test/x';
+----
+api://hugr,api://other	ES256|RS256	{"tid": "tenant", "oid": "user_id"}
+
+# an unknown capability is stored as written and enforces nothing
+statement ok
+ACL ADMIN CREATE ROLE futurist;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE futurist WITH (select, temp_tables) MAIN;
+
+query I
+SELECT caps FROM aclcat.acl.role_catalogs WHERE role = 'futurist';
+----
+{"select": true, "temp_tables": true}
+
+statement error
+ACL ROLE "futurist" INSERT INTO orders(id) VALUES (9);
+----
+<REGEX>:.*(read-only relation|insert on).*
+
+# --- a list element may contain commas of its own ----------------------------------------------------
+# splitting on every ',' used to break `coalesce(a, b)` into two nonsense entries, silently
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.labelled COLUMNS (id, label = coalesce(tenant, 'none'));
+
+query II
+SELECT name, expr FROM aclcat.acl.relation_columns WHERE vname = 'labelled' ORDER BY pos;
+----
+id	(empty)
+label	coalesce(tenant, 'none')
+
+statement ok
+ACL ADMIN GRANT TABLE sales.labelled TO ROLE analyst WITH (select) COLUMNS (id, label = coalesce(tenant, 'none'));
+
+query II
+ACL ROLE "analyst" SELECT id, label FROM labelled ORDER BY id;
+----
+1	acme
+2	globex
+
+# --- existence is explicit ---------------------------------------------------------------------------
+# ADD upserts silently, which is how a typo in a name creates a second object instead of changing the
+# intended one; CREATE says what it expects
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE sales.created AS phys.main.orders_physical;
+----
+<REGEX>:.*"sales.created" already exists.*
+
+# the refusal changed nothing
+query II
+SELECT form, comment FROM aclcat.acl.relations WHERE vname = 'created';
+----
+subquery	made with CREATE
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE IF NOT EXISTS sales.created AS phys.main.orders_physical;
+
+query II
+SELECT form, comment FROM aclcat.acl.relations WHERE vname = 'created';
+----
+subquery	made with CREATE
+
+statement ok
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE sales.created AS phys.main.orders_physical;
+
+query II
+SELECT form, rls FROM aclcat.acl.relations WHERE vname = 'created';
+----
+alias	(empty)
+
+# every kind answers the same way
+statement error
+ACL ADMIN CREATE VIRTUAL CATALOG hr;
+----
+<REGEX>:.*already exists.*
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG IF NOT EXISTS hr;
+
+statement error
+ACL ADMIN CREATE ROLE analyst;
+----
+<REGEX>:.*already exists.*
+
+statement ok
+ACL ADMIN CREATE ROLE IF NOT EXISTS analyst;
+
+query I
+SELECT count(*) FROM aclcat.acl.role_claims WHERE role = 'analyst';
+----
+1
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCALAR sales.created_scalar(text VARCHAR) AS lower(acl_arg(1));
+----
+<REGEX>:.*already exists.*
+
+# a table function and a scalar of the same name are different objects
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.created_scalar AS SELECT 1 AS one;
+
+# the legacy ADD keeps upserting, so existing scripts are untouched
+statement ok
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.created COLUMNS 'id';
+
+query I
+SELECT form FROM aclcat.acl.relations WHERE vname = 'created';
+----
+subquery
+
+# --- DROP ... IF EXISTS -------------------------------------------------------------------------------
+
+statement error
+ACL ADMIN DROP VIRTUAL TABLE sales.never_existed;
+----
+<REGEX>:.*does not exist.*
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE IF EXISTS sales.never_existed;
+
+statement ok
+ACL ADMIN DROP ROLE IF EXISTS nobody;
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCALAR IF EXISTS sales.created_scalar;
+
+query I
+SELECT count(*) FROM aclcat.acl.functions WHERE vname = 'created_scalar' AND kind = 'scalar';
+----
+0

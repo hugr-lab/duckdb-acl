@@ -183,6 +183,10 @@ struct AdminScanner {
 		pos = saved;
 		return false;
 	}
+	bool AtParen() {
+		Skip();
+		return pos < text.size() && text[pos] == '(';
+	}
 	string Quoted(const char *what) {
 		Skip();
 		if (pos >= text.size() || (text[pos] != '\'' && text[pos] != '"')) {
@@ -224,6 +228,65 @@ struct AdminScanner {
 		return body;
 	}
 
+	//! Everything up to the end of this statement, taken verbatim - quote- and paren-aware, so a
+	//! body may contain ';' inside a literal or a parenthesised list. This is what makes an inline
+	//! body possible: `AS SELECT … WHERE tenant = acl_claim('tenant')` instead of the same text in a
+	//! quoted string with every quote doubled.
+	string Rest(const char *what) {
+		Skip();
+		auto start = pos;
+		idx_t depth = 0;
+		while (pos < text.size()) {
+			auto c = text[pos];
+			if (c == '\'' || c == '"') {
+				ReadQuoted(text, pos);
+				continue;
+			}
+			if (c == '(') {
+				depth++;
+			} else if (c == ')' && depth > 0) {
+				depth--;
+			} else if (c == ';' && depth == 0) {
+				break;
+			}
+			pos++;
+		}
+		auto body = text.substr(start, pos - start);
+		StringUtil::Trim(body);
+		if (body.empty()) {
+			throw BinderException("acl admin: expected %s at position %llu", what, start);
+		}
+		return body;
+	}
+
+	//! A body written either way: a quoted string (what a gateway generates) or inline to the end of
+	//! the statement (what a human writes). Both forms are accepted everywhere a body is taken.
+	string Body(const char *what) {
+		Skip();
+		if (pos < text.size() && (text[pos] == '\'' || text[pos] == '"')) {
+			return Quoted(what);
+		}
+		return Rest(what);
+	}
+
+	//! A name written either way: bare (`range`, `pg.public.orders`) or as the legacy quoted string
+	string Name(const char *what) {
+		Skip();
+		if (pos < text.size() && (text[pos] == '\'' || text[pos] == '"')) {
+			return Quoted(what);
+		}
+		return Dotted(what);
+	}
+
+	//! A list written either way: `(a, b = c)` or the legacy quoted csv/JSON string
+	string List(const char *what) {
+		Skip();
+		if (pos < text.size() && text[pos] == '(') {
+			return Parens();
+		}
+		return Quoted(what);
+	}
+
 	//! a bare identifier path: word(.word)*
 	string Dotted(const char *what) {
 		auto path = Word(what);
@@ -245,21 +308,98 @@ void SplitVirtual(const string &path, string &vcat, string &vname) {
 	vname = path.substr(dot + 1);
 }
 
+//! `(select, insert)` -> `{"select": true, "insert": true}`. The list form is what a person writes;
+//! JSON stays the storage format and the admin functions' input. An unknown capability is kept as
+//! written rather than refused - the vocabulary grows, and a grant authored against a newer version
+//! must not fail - but it enforces nothing until some spec starts reading it (design 004).
+string CapsListToJson(const string &list) {
+	vector<string> entries;
+	for (auto &item : SplitTopLevel(list, ',')) {
+		if (item.empty()) {
+			continue;
+		}
+		entries.push_back("\"" + StringUtil::Replace(StringUtil::Lower(item), "\"", "") + "\": true");
+	}
+	return "{" + StringUtil::Join(entries, ", ") + "}";
+}
+
+//! Strip one layer of quotes from a list element written as a literal
+string Unquoted(string value) {
+	StringUtil::Trim(value);
+	if (value.size() >= 2 && (value.front() == '\'' || value.front() == '"') && value.back() == value.front()) {
+		auto quote = value.front();
+		value = value.substr(1, value.size() - 2);
+		value = StringUtil::Replace(value, string(2, quote), string(1, quote));
+	}
+	return value;
+}
+
+//! `(tenant = 'acme', unit = 'eu')` -> the stored csv `tenant=acme,unit=eu`
+string ClaimsListToCsv(const string &list) {
+	vector<string> entries;
+	for (auto &item : SplitTopLevel(list, ',')) {
+		if (item.empty()) {
+			continue;
+		}
+		auto split = item.find('=');
+		if (split == string::npos) {
+			throw BinderException("acl admin: a claim is written as name = 'value', got \"%s\"", item);
+		}
+		auto name = item.substr(0, split);
+		StringUtil::Trim(name);
+		entries.push_back(name + "=" + Unquoted(item.substr(split + 1)));
+	}
+	return StringUtil::Join(entries, ",");
+}
+
+//! `('api://hugr', 'api://other')` or `(RS256, ES256)` -> the stored csv
+string ValueListToCsv(const string &list) {
+	vector<string> entries;
+	for (auto &item : SplitTopLevel(list, ',')) {
+		if (!item.empty()) {
+			entries.push_back(Unquoted(item));
+		}
+	}
+	return StringUtil::Join(entries, ",");
+}
+
+//! `(tid => tenant, oid => user_id)` -> the stored JSON `{"tid": "tenant", "oid": "user_id"}`
+string ClaimMapToJson(const string &list) {
+	vector<string> entries;
+	for (auto &item : SplitTopLevel(list, ',')) {
+		if (item.empty()) {
+			continue;
+		}
+		auto arrow = item.find("=>");
+		if (arrow == string::npos) {
+			throw BinderException("acl admin: a claim mapping is written as <jwt path> => <claim>, got \"%s\"", item);
+		}
+		auto from = item.substr(0, arrow);
+		StringUtil::Trim(from);
+		entries.push_back("\"" + Unquoted(from) + "\": \"" + Unquoted(item.substr(arrow + 2)) + "\"");
+	}
+	return "{" + StringUtil::Join(entries, ", ") + "}";
+}
+
 //! The clauses a grant is written with, in any order: CAPS '<json>' RLS '<predicate>'
 //! COLUMNS '<name[=expr], …>' - the grant's own policy (spec 011) - plus MAIN for a catalog grant
 void GrantPolicyClauses(AdminScanner &s, string &caps, string &rls, string &columns, bool *main = nullptr) {
 	for (bool more = true; more;) {
 		more = false;
+		if (s.Accept("with")) { // WITH (select, insert) - the list form of CAPS
+			caps = CapsListToJson(s.Parens());
+			more = true;
+		}
 		if (s.Accept("caps")) {
 			caps = s.Quoted("caps JSON");
 			more = true;
 		}
 		if (s.Accept("rls")) {
-			rls = s.Quoted("an RLS predicate");
+			rls = s.List("an RLS predicate");
 			more = true;
 		}
 		if (s.Accept("columns")) {
-			columns = s.Quoted("a column list");
+			columns = s.List("a column list");
 			more = true;
 		}
 		if (main && s.Accept("main")) {
@@ -306,6 +446,12 @@ bool IsMgmtStart(const string &text) {
 		ahead.Word("keyword");
 		auto second = ahead.PeekWord();
 		if (StringUtil::CIEquals(first, "create")) {
+			if (StringUtil::CIEquals(second, "or")) {
+				// CREATE OR REPLACE VIRTUAL … - look past the modifier for the marker
+				ahead.Word("or");
+				ahead.Accept("replace");
+				second = ahead.PeekWord();
+			}
 			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
 			       StringUtil::CIEquals(second, "issuer");
 		}
@@ -323,25 +469,146 @@ bool IsMgmtStart(const string &text) {
 	return false;
 }
 
+//! `CREATE VIRTUAL <kind> <name> …` - the SQL-shaped spelling of the ADD forms, with the virtual
+//! name first (like `CREATE TABLE`) and `AS` naming the physical target or the body. The ADD forms
+//! stay accepted: a gateway generates them, and every existing script uses them.
+unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
+	//! `IF NOT EXISTS` after the kind keyword: keep what is there instead of refusing
+	auto if_not_exists = [&mode](AdminScanner &scanner) {
+		if (!scanner.Accept("if")) {
+			return;
+		}
+		scanner.Expect("not");
+		scanner.Expect("exists");
+		if (mode == "create") {
+			mode = "skip";
+		}
+	};
+	//! `COMMENT '…'` may precede the body (a body runs to the end of the statement, so it cannot
+	//! follow one); for the forms whose tail is a list it may come last as well
+	auto comment_clause = [](AdminScanner &scanner, string &comment) {
+		if (scanner.Accept("comment")) {
+			comment = scanner.Quoted("comment");
+		}
+	};
+	if (s.Accept("catalog")) {
+		if_not_exists(s);
+		auto vcat = s.Word("a catalog name");
+		string comment;
+		comment_clause(s, comment);
+		return MakeAdminCall("acl_create_catalog", {Value(vcat), Value(comment), Value(mode)});
+	}
+	if (s.Accept("schema")) { // CREATE VIRTUAL SCHEMA v.alias AS <phys path>
+		if_not_exists(s);
+		string vcat, alias;
+		SplitVirtual(s.Dotted("a virtual alias"), vcat, alias);
+		s.Expect("as");
+		auto phys = s.Name("a physical schema path");
+		return MakeAdminCall("acl_add_schema_alias", {Value(vcat), Value(alias), Value(phys), Value(mode)});
+	}
+	if (s.Accept("view")) { // CREATE VIRTUAL VIEW v.n [(col TYPE, …)] [COMMENT '…'] AS <sql>
+		if_not_exists(s);
+		string vcat, vname;
+		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+		auto returns = s.Parens();
+		string comment;
+		comment_clause(s, comment);
+		s.Expect("as");
+		auto sql = s.Body("view SQL");
+		return MakeAdminCall("acl_add_view",
+		                     {Value(vcat), Value(vname), Value(sql), Value(returns), Value(comment), Value(mode)});
+	}
+	bool scalar = s.Accept("scalar");
+	bool table_function = false;
+	if (!scalar) {
+		s.Expect("table");
+		table_function = s.Accept("function");
+	}
+	if_not_exists(s);
+	string vcat, vname;
+	SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+	if (scalar || table_function) {
+		// CREATE VIRTUAL SCALAR|TABLE FUNCTION v.n[(args)] [RETURNS …] [COMMENT '…'] AS <body>
+		//                                                                             | ALIAS OF <fn>
+		auto params = s.Parens();
+		string returns;
+		if (s.Accept("returns")) {
+			if (scalar) {
+				returns = s.Word("a result type");
+			} else {
+				s.Accept("table");
+				returns = s.Parens();
+				if (returns.empty()) {
+					throw BinderException("acl admin: RETURNS TABLE needs a column list");
+				}
+			}
+		}
+		string comment;
+		comment_clause(s, comment);
+		if (s.Accept("alias")) {
+			s.Expect("of");
+			auto target = s.Name("a target function");
+			comment_clause(s, comment); // an alias has no body, so the comment may also come last
+			return MakeAdminCall(
+			    scalar ? "acl_add_scalar_alias" : "acl_add_table_function_alias",
+			    {Value(vcat), Value(vname), Value(target), Value(""), Value(""), Value(comment), Value(mode)});
+		}
+		s.Expect("as");
+		auto definition = s.Body(scalar ? "expression template" : "SQL template");
+		return MakeAdminCall(
+		    scalar ? "acl_add_scalar" : "acl_add_table_function",
+		    {Value(vcat), Value(vname), Value(definition), Value(params), Value(returns), Value(comment), Value(mode)});
+	}
+	// CREATE VIRTUAL TABLE v.n AS <phys> [COLUMNS (…)] [RLS (…)] [COMMENT '…']
+	s.Expect("as");
+	auto phys = s.Name("a physical table path");
+	string columns, rls, comment;
+	for (bool more = true; more;) {
+		more = false;
+		if (s.Accept("columns")) {
+			columns = s.List("columns list");
+			more = true;
+		}
+		if (s.Accept("rls")) {
+			rls = s.List("RLS predicate");
+			more = true;
+		}
+		if (s.Accept("comment")) {
+			comment = s.Quoted("comment");
+			more = true;
+		}
+	}
+	return MakeAdminCall("acl_add_relation", {Value(vcat), Value(vname), Value(phys), Value(columns), Value(rls),
+	                                          Value(comment), Value(mode)});
+}
+
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	auto keyword = s.Word("a management keyword");
 	if (StringUtil::CIEquals(keyword, "create")) {
+		// what the statement promises about an existing object: CREATE refuses to overwrite one,
+		// OR REPLACE overwrites, IF NOT EXISTS keeps it (spec 013). The legacy ADD forms upsert.
+		string mode = "create";
+		if (s.Accept("or")) {
+			s.Expect("replace");
+			mode = "replace";
+		}
 		if (s.Accept("virtual")) {
-			s.Expect("catalog");
-			auto vcat = s.Word("a catalog name");
-			string comment;
-			if (s.Accept("comment")) {
-				comment = s.Quoted("comment");
-			}
-			return MakeAdminCall("acl_create_catalog", {Value(vcat), Value(comment)});
+			return ParseCreateVirtual(s, mode);
 		}
 		if (s.Accept("role")) {
+			if (s.Accept("if")) {
+				s.Expect("not");
+				s.Expect("exists");
+				if (mode == "create") {
+					mode = "skip";
+				}
+			}
 			auto role = s.Word("a role name");
 			string claims;
 			if (s.Accept("claims")) {
-				claims = s.Quoted("claims list");
+				claims = s.AtParen() ? ClaimsListToCsv(s.Parens()) : s.Quoted("claims list");
 			}
-			return MakeAdminCall("acl_define_role", {Value(role), Value(claims)});
+			return MakeAdminCall("acl_define_role", {Value(role), Value(claims), Value(mode)});
 		}
 		s.Expect("issuer");
 		auto issuer = s.Quoted("issuer");
@@ -349,10 +616,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		auto keys = s.Quoted("keys");
 		string audiences, algs = "RS256", role_claim = "roles", claim_map;
 		if (s.Accept("audiences")) {
-			audiences = s.Quoted("audiences");
+			audiences = s.AtParen() ? ValueListToCsv(s.Parens()) : s.Quoted("audiences");
 		}
 		if (s.Accept("algs")) {
-			algs = s.Quoted("algs");
+			algs = s.AtParen() ? ValueListToCsv(s.Parens()) : s.Quoted("algs");
 		}
 		if (s.Accept("role")) {
 			s.Expect("claim");
@@ -360,7 +627,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		}
 		if (s.Accept("claim")) {
 			s.Expect("map");
-			claim_map = s.Quoted("claim map");
+			claim_map = s.AtParen() ? ClaimMapToJson(s.Parens()) : s.Quoted("claim map");
 		}
 		return MakeAdminCall("acl_define_issuer", {Value(issuer), Value(keys), Value(audiences), Value(algs),
 		                                           Value(role_claim), Value(claim_map)});
@@ -373,7 +640,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 			auto returns = s.Parens();
 			s.Expect("as");
-			auto sql = s.Quoted("view SQL");
+			auto sql = s.Body("view SQL");
 			return MakeAdminCall("acl_add_view", {Value(vcat), Value(vname), Value(sql), Value(returns)});
 		}
 		if (s.Accept("schema")) {
@@ -395,8 +662,9 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			bool is_macro = s.Accept("macro");
 			if (!is_macro) {
 				s.Expect("alias");
+				s.Accept("of"); // ALIAS OF <fn> and the older ALIAS <fn> are the same thing
 			}
-			auto definition = s.Quoted(is_macro ? "expression template" : "target function");
+			auto definition = is_macro ? s.Body("expression template") : s.Name("a target function");
 			if (!is_macro) {
 				return MakeAdminCall("acl_add_scalar_alias", {Value(vcat), Value(vname), Value(definition)});
 			}
@@ -420,8 +688,9 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			bool is_macro = s.Accept("macro");
 			if (!is_macro) {
 				s.Expect("alias");
+				s.Accept("of"); // ALIAS OF <fn> and the older ALIAS <fn> are the same thing
 			}
-			auto definition = s.Quoted(is_macro ? "SQL template" : "target function");
+			auto definition = is_macro ? s.Body("SQL template") : s.Name("a target function");
 			if (!is_macro) {
 				return MakeAdminCall("acl_add_table_function_alias", {Value(vcat), Value(vname), Value(definition)});
 			}
@@ -434,10 +703,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 		string columns, rls;
 		if (s.Accept("columns")) {
-			columns = s.Quoted("columns list");
+			columns = s.List("columns list");
 		}
 		if (s.Accept("rls")) {
-			rls = s.Quoted("RLS predicate");
+			rls = s.List("RLS predicate");
 		}
 		return MakeAdminCall("acl_add_relation", {Value(vcat), Value(vname), Value(phys), Value(columns), Value(rls)});
 	}
@@ -645,16 +914,28 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		return MakeAdminCall("acl_refresh_schema", {Value(vcat), Value(vname)});
 	}
 	if (StringUtil::CIEquals(keyword, "drop")) {
+		// `IF EXISTS` says nothing-to-drop is not an error; without it a missing target is reported,
+		// which is what makes a typo visible (spec 010)
+		string mode;
+		auto if_exists = [&mode](AdminScanner &scanner) {
+			if (scanner.Accept("if")) {
+				scanner.Expect("exists");
+				mode = "skip";
+			}
+		};
 		if (s.Accept("relation")) { // the spec-008 spelling, kept
+			if_exists(s);
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname)});
+			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname), Value(mode)});
 		}
 		if (s.Accept("role")) {
-			return MakeAdminCall("acl_drop_role", {Value(s.Word("a role name"))});
+			if_exists(s);
+			return MakeAdminCall("acl_drop_role", {Value(s.Word("a role name")), Value(mode)});
 		}
 		if (s.Accept("issuer")) {
-			return MakeAdminCall("acl_drop_issuer", {Value(s.Quoted("issuer"))});
+			if_exists(s);
+			return MakeAdminCall("acl_drop_issuer", {Value(s.Quoted("issuer")), Value(mode)});
 		}
 		if (s.Accept("map")) { // DROP MAP GROUP|CLAIM '<value>' FROM ISSUER '...' TO ROLE r
 			bool is_group = s.Accept("group");
@@ -673,30 +954,34 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		}
 		s.Expect("virtual");
 		if (s.Accept("catalog")) { // DROP VIRTUAL CATALOG c [CASCADE]
+			if_exists(s);
 			auto vcat = s.Word("a catalog name");
 			bool cascade = s.Accept("cascade");
-			return MakeAdminCall("acl_drop_catalog", {Value(vcat), Value::BOOLEAN(cascade)});
+			return MakeAdminCall("acl_drop_catalog", {Value(vcat), Value::BOOLEAN(cascade), Value(mode)});
 		}
 		if (s.Accept("schema")) {
+			if_exists(s);
 			string vcat, alias;
 			SplitVirtual(s.Dotted("a virtual alias"), vcat, alias);
-			return MakeAdminCall("acl_drop_schema_alias", {Value(vcat), Value(alias)});
+			return MakeAdminCall("acl_drop_schema_alias", {Value(vcat), Value(alias), Value(mode)});
 		}
 		bool scalar = s.Accept("scalar");
 		if (scalar || s.Accept("table")) {
 			bool table_function = !scalar && s.Accept("function");
+			if_exists(s);
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 			if (scalar || table_function) {
 				return MakeAdminCall("acl_drop_function",
-				                     {Value(vcat), Value(vname), Value(scalar ? "scalar" : "table")});
+				                     {Value(vcat), Value(vname), Value(scalar ? "scalar" : "table"), Value(mode)});
 			}
-			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname)});
+			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname), Value(mode)});
 		}
 		if (s.Accept("view")) {
+			if_exists(s);
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname)});
+			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname), Value(mode)});
 		}
 		throw BinderException("acl admin: unknown DROP VIRTUAL target");
 	}

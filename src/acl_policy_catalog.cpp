@@ -45,13 +45,11 @@ string LitList(const vector<string> &values) {
 }
 
 //! A grant's column list, in the same `name` / `name=expr` csv form the object definitions use.
-//! (Splitting on ',' is the store-wide convention, so an expression may not contain a top-level
-//! comma - `coalesce(a, b)` has to be written as a virtual column of the object instead.)
+//! Split at top level only, so an expression may contain commas of its own (`coalesce(a, b)`).
 vector<std::pair<string, string>> ParseColumnList(const string &csv) {
 	vector<std::pair<string, string>> columns;
-	for (auto &part : StringUtil::Split(csv, ',')) {
+	for (auto &part : SplitTopLevel(csv, ',')) {
 		auto item = part;
-		StringUtil::Trim(item);
 		if (item.empty()) {
 			continue;
 		}
@@ -1632,6 +1630,12 @@ void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
 
 void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 	RequireCatalog(catalog, "acl_drop_relation");
+	// dropping something that is not there is an error, not a silent success (spec 010) - the other
+	// kinds already said so; the relation drop was the one that stayed quiet. DROP … IF EXISTS is
+	// how a re-runnable script asks for the silent version (spec 013).
+	if (!CatalogObjectExists(vcat, vname, "relation")) {
+		throw BinderException("acl admin: relation \"%s.%s\" does not exist", vcat, vname);
+	}
 	catalog->Write({"DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                    " AND \"vname\" = " + Lit(vname),
 	                "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -2108,6 +2112,29 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 	                    "(\"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\") VALUES (" + Lit(role) + ", " +
 	                    Lit(vcat) + ", " + Lit(vname) + ", " + Lit(caps_json) + ", " + Lit(rls) + ", " + Lit(columns) +
 	                    ")"});
+}
+
+bool PolicyStore::CatalogObjectExists(const string &vcat, const string &vname, const string &kind) {
+	RequireCatalog(catalog, "acl catalog");
+	string sql;
+	if (kind == "catalog") {
+		sql = "SELECT 1 FROM " + catalog->Tbl("catalogs") + " WHERE \"vcat\" = " + Lit(vcat);
+	} else if (kind == "role") {
+		sql = "SELECT 1 FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(vname);
+	} else if (kind == "issuer") {
+		sql = "SELECT 1 FROM " + catalog->Tbl("issuers") + " WHERE \"issuer\" = " + Lit(vname);
+	} else if (kind == "schema") {
+		sql = "SELECT 1 FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
+		      " AND \"alias_path\" = " + Lit(vname);
+	} else if (kind == "relation") {
+		sql = "SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+		      " AND \"vname\" = " + Lit(vname);
+	} else {
+		// a function's kind is part of its identity: a table function and a scalar may share a name
+		sql = "SELECT 1 FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+		      " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind);
+	}
+	return catalog->Query(sql)->RowCount() > 0;
 }
 
 void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy) {

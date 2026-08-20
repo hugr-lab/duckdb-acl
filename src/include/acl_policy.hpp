@@ -82,6 +82,11 @@ struct IssuerConfig {
 	string claim_map;            // JSON: {"<jwt dot path>": "<acl_claim name>"}
 };
 
+//! Split a comma-style list on top-level delimiters only: a delimiter inside quotes or inside
+//! parentheses belongs to an expression, not to the list. Without this a column list breaks on the
+//! first `coalesce(a, b)` - and breaks it silently, into two nonsense entries.
+vector<string> SplitTopLevel(const string &text, char delimiter);
+
 //! Which functions are gated is a policy question, not the rewriter's: every function reference is
 //! routed through the resolver, which decides. Most functions - the vast majority extensions add -
 //! are pure transforms (e.g. ST_AsGeoJSON) and pass; only functions that read external data or route
@@ -234,6 +239,9 @@ struct PolicyStore {
 	//! per-object grant: its capabilities and (spec 011) the policy it imposes on the object
 	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json,
 	                          const string &rls = "", const string &columns = "");
+	//! Whether an object of that kind already exists - what CREATE / CREATE OR REPLACE /
+	//! CREATE IF NOT EXISTS decide on (spec 013). kind: catalog|role|issuer|schema|relation|table|scalar
+	bool CatalogObjectExists(const string &vcat, const string &vname, const string &kind);
 	//! refuse a grant naming an object nobody defined - a policy that never applies is worse than none
 	//! - and a policy on a scalar function, which has neither rows nor columns to narrow
 	void CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy);
