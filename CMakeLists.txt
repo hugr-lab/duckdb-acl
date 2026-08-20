@@ -13,7 +13,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/acl_extension.cpp)
+set(EXTENSION_SOURCES
+    src/acl_admin_functions.cpp
+    src/acl_extension.cpp
+    src/acl_parser_override.cpp
+    src/acl_policy.cpp
+    src/acl_rewriter.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

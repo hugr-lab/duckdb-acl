@@ -22,8 +22,12 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
 
 ```text
 src/
-  acl_extension.cpp          # the whole rewriter (single TU) + extension entry
-  include/acl_extension.hpp  # AclExtension : Extension
+  acl_extension.cpp          # entry: model overview, creates the store, calls the registrations
+  acl_policy.cpp             # PolicyStore + resolver methods, template cache (the resolver seam)
+  acl_rewriter.cpp           # the AST walker; exposes RewriteStatements(...)
+  acl_parser_override.cpp    # ACL prefix scanner + parser_override; exposes RegisterAclParser(...)
+  acl_admin_functions.cpp    # acl_* admin stubs; exposes RegisterAclAdminFunctions(...)
+  include/                   # acl_extension.hpp (AclExtension : Extension) + one header per module
 test/
   sql/acl.test               # sqllogictest suite (require acl)
   cpp/                       # standalone C++ invariant tests (make test-cpp), one main() per file
@@ -32,10 +36,9 @@ specs/                       # one lightweight spec per feature, NNN-slug/spec.m
 design/                      # LOCAL, gitignored: numbered research topics NNN-topic/ (our scratch)
 ```
 
-`src/acl_extension.cpp` is intentionally one translation unit for now: `PolicyStore` (per-instance
-state + resolver methods + template cache), `AclRewriter` (the AST walker), the `ACL` prefix parser +
-`parser_override` entry, and the admin setup functions. Split into multiple files only when a section
-grows enough to warrant it.
+Internals live in `namespace duckdb::acl` (spec 004); only `AclExtension` sits directly in `duckdb`.
+Each module exposes one seam (`RegisterAclParser`, `RegisterAclAdminFunctions`, `RewriteStatements`,
+the `PolicyStore` types); TU-local code stays in anonymous namespaces.
 
 ## Commands
 
