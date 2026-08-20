@@ -93,6 +93,12 @@ struct IssuerConfig {
 	string claim_map;            // JSON: {"<jwt dot path>": "<acl_claim name>"}
 };
 
+//! duckdb answers "what is in this catalog?" three ways - a table function, a view of the same name
+//! and `information_schema` - and under a principal all three are replaced by a listing of the
+//! principal's own catalog (spec 010 part 3). Returns the surface a written name maps to, or nullptr.
+//! The names are reserved: a virtual object may not take one, or it would be listed but unreachable.
+const char *MetadataSurfaceOf(const string &name);
+
 //! Split a comma-style list on top-level delimiters only: a delimiter inside quotes or inside
 //! parentheses belongs to an expression, not to the list. Without this a column list breaks on the
 //! first `coalesce(a, b)` - and breaks it silently, into two nonsense entries.
@@ -201,6 +207,10 @@ struct PolicyStore {
 	//! origin, nothing else to choose
 	void CatalogRegisterCreated(const string &vcat, const string &vname, const string &phys,
 	                            const string &origin = string());
+	//! The SQL behind a metadata surface for this principal (spec 010 part 3): duckdb's own shape,
+	//! filtered to what the roles hold, with virtual names in place of physical ones. False when the
+	//! active source cannot enumerate (memory mode); the driver mode throws with the reason.
+	bool MetadataListing(const Principal &principal, const string &surface, string &sql);
 	//! Resolve where a principal's `CREATE`/`DROP` of `vname` lands, requiring `capability`
 	//! (`create` or `drop`) on the virtual schema that owns the name (spec 016). False = no such
 	//! schema for this principal; a schema without the capability throws.

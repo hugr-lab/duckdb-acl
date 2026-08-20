@@ -1,7 +1,8 @@
 # Spec 010: operating the virtual catalog — DROP, metadata, introspection
 
-- **Status**: in progress — parts 1 (DROP), 2 (metadata) and 2b (column renames) implemented;
-  part 3 (introspection + `duckdb_*` substitution) follows as its own PR against this spec
+- **Status**: in progress — parts 1 (DROP), 2 (metadata), 2b (column renames) and the first step of
+  part 3 (closing the metadata leak) implemented; the `acl_*` listings and the filtered `duckdb_*`
+  substitution follow
 - **Date**: 2026-08-20
 - **Author**: hugr-lab
 
@@ -53,8 +54,10 @@ passthrough (they are not catalog-specific).
 
 Schema v2 adds `relations.comment`, `functions.comment` and one table for every object's column
 schema: `acl.object_columns(vcat, vname, kind, pos, name, type, comment, derived)` — `kind` is
-`relation` / `table` / `scalar`, and `derived` says whether the row came from a probe or from a
-declared projection. Migrations run in `acl_use_db(..., init := true)`
+`relation` / `table` / `scalar`, and `derived` says whether the row was bound at write time (and may
+therefore be re-derived by `ANALYZE`) or declared explicitly and left alone. A **projection is bound
+too**: a masked or computed column (`ssn = NULL`, `total = amount * 2`) has no physical column to
+borrow a type from, and its type follows the source's, so it is re-derived like a view's. Migrations run in `acl_use_db(..., init := true)`
 (`ALTER TABLE … ADD COLUMN IF NOT EXISTS`), so an existing catalog upgrades in place.
 Three sources, resolved in this order per field:
 
@@ -128,6 +131,52 @@ ACL SHOW CATALOGS | RELATIONS IN sales | COLUMNS OF sales.orders | GRANTS FOR RO
 compiled to the same functions with the scope's catalogs baked in as a filter — same authorization
 path as every other management statement, no exit into the native context.
 
+### 3b. Three surfaces, and the leak closed first
+
+duckdb exposes the same catalog **three ways**, and under a principal they behaved differently:
+
+| surface | before | now |
+| --- | --- | --- |
+| `duckdb_tables()` (table function) | **every table of every attached database** | refused by the function gate |
+| `duckdb_tables` (view of the same name) | refused — an unknown virtual name | unchanged |
+| `information_schema.tables` (view) | refused — likewise | unchanged |
+
+The view forms were closed by accident: the rewriter resolves a base table reference as a virtual
+name and finds none. The function form went through the function seam, where nothing had named it.
+The whole `duckdb_*` / `pragma_*` metadata family is now on the denylist of
+`DefaultDeniedFunctions()`, so all three surfaces refuse before the substitution below exists —
+tooling stays blind for now, which is the lesser of the two evils while it is being built. The native
+context (`ACL NATIVE`, passthrough) and an unprefixed connection are unchanged: the gateway is the
+boundary, not this list.
+
+### 3c. What a listing can and cannot say
+
+The listing does not rebuild duckdb's metadata shape by hand: it **joins the physical row and
+`REPLACE`s the identity columns** with the virtual ones, so types, nullability and whatever duckdb
+adds next stay correct for free. Objects with no physical row — a view, a projection's computed
+column — are added through `UNION ALL BY NAME`, which fills the rest with NULL.
+
+That splits the answer honestly:
+
+- an **alias** relation is the physical table under a virtual name, so its listing carries the whole
+  shape (renamed columns included);
+- a **projection** and a **view** are described by their own stored schema: every column the role
+  sees, with the type the write-time probe found — but not the attributes only a physical row has.
+  A column missing from a listing breaks a tool; a missing `is_nullable` does not.
+
+The surface names are **reserved**: a virtual object may not be called `duckdb_tables` or
+`information_schema.tables`, because the name resolves to the listing and the object would be visible
+in metadata yet impossible to select. That is refused when the object is defined rather than
+discovered later. The function forms take no arguments, and a call that passes one is refused rather
+than answered with something it did not ask for.
+
+A masked column typed as `"NULL"` is duckdb's answer for an untyped NULL — an admin who cares about
+what tooling sees writes `ssn = NULL::VARCHAR`.
+
+Everything above is **SQL**, generated per surface and spliced in as a subquery: the filtering, the
+join and the union run inside the principal's own query, so their predicates push down and nothing is
+materialised in C++. The only C++-side query is the write-time probe, once per definition.
+
 ### 4. `duckdb_*` / `information_schema` in the virtual context
 
 In a principal's query these are rewritten into subqueries over the introspection functions with the
@@ -169,9 +218,16 @@ deny of spec 009 plus these rewrites.
 - `acl_introspection.test`: `acl_*` functions in memory and catalog modes, `ACL SHOW` under a
   catalog-scoped manage (only its catalogs), the function-driver's honest error for a missing `list_*`
   slot, `acl_status()`.
-- `acl_virtual_catalog.test`: a principal's `duckdb_tables()`/`information_schema.columns` showing
-  only granted objects and only visible columns; masked columns absent; no physical names; native
-  context still unfiltered; the pre-existing physical-catalog leak refused.
+- `acl_metadata_leak.test` (23 assertions, **implemented**): all three surfaces refused under a
+  principal — the table function, the view of the same name and `information_schema` — plus their
+  neighbours (`duckdb_columns()`, `duckdb_databases()`, `duckdb_secrets()`, `pragma_table_info`),
+  while `ACL NATIVE` under a passthrough scope and an unprefixed connection still enumerate.
+- `acl_virtual_catalog.test` (92 assertions, **implemented**): the three surfaces answering with the
+  principal's catalog; a hidden column absent from the listing rather than merely unreadable; a
+  renamed one listed under its virtual name; a computed and a masked one listed with the probed type;
+  a view's probed schema; an alias schema enumerated from the source under the virtual prefix; no
+  physical name anywhere; a second role seeing its own catalog; a role granted an explicit `{}`
+  seeing nothing at all; and the native context still unfiltered.
 - `acl_column_aliases.test` (46 assertions, **implemented**): a pure rename list keeps `form =
   alias`; reads show the virtual names (and untouched columns keep theirs) while the physical name of
   a renamed column is gone; `INSERT`/`UPDATE`/`DELETE` land on the physical columns; writing a
@@ -196,6 +252,13 @@ deny of spec 009 plus these rewrites.
   outright fixes the leak but leaves tools blind.
 
 ## Follow-ups
+
+- A **plain** projected column could keep the rich physical row (join it by name) while only computed
+  ones fall back to the stored schema — it would recover `is_nullable` and friends for the common
+  case, at the cost of doubling the hairiest branch of the listing SQL.
+- The `acl_*` listings of part 3 (an admin surface over the active source) are still to come; the
+  substitution above went first because tooling needs `information_schema` to work at all.
+
 
 - `SHOW TABLES` / `DESCRIBE` / `PRAGMA table_info` are statement forms the ACL statement gate refuses
   today; map them onto the same rewrite or leave a clear message pointing at `information_schema`.

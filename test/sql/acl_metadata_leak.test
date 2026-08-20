@@ -1,0 +1,121 @@
+# name: test/sql/acl_metadata_leak.test
+# description: metadata surfaces under a principal (spec 010 part 3, step 1) - duckdb exposes the same
+#   catalog three ways (table function, view, information_schema) - all three must answer with the
+#   principal's own catalog, and the surfaces that have no filtered form stay refused
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT);
+
+statement ok
+CREATE TABLE phys.main.secrets(ssn VARCHAR);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN;
+
+# what the role may see: exactly the one object it was granted
+query I
+ACL ROLE "analyst" SELECT count(*) FROM orders;
+----
+0
+
+# --- the same catalog, three surfaces, all of them answering with the principal's own --------------
+# the table function used to return every table of every attached database; the two view forms were
+# refused by accident, being unknown virtual names. All three are now the same listing.
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables();
+----
+1
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables;
+----
+1
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM information_schema.tables;
+----
+1
+
+query III
+ACL ROLE "analyst" SELECT table_catalog, table_schema, table_name FROM information_schema.tables;
+----
+sales	main	orders
+
+# the table the role was never granted is in none of them, under any name
+query I
+ACL ROLE "analyst" SELECT count(*) FROM information_schema.tables WHERE table_name = 'secrets';
+----
+0
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_columns() WHERE table_name = 'secrets';
+----
+0
+
+# ... and neither is the physical database that holds it
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_databases() WHERE database_name = 'phys';
+----
+0
+
+# --- the metadata surfaces with no substitution stay refused ---------------------------------------
+# a listing nobody filtered is a listing of the physical catalog, so it is a denial until it has one
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_secrets();
+----
+<REGEX>:.*table function "duckdb_secrets" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM pragma_table_info('phys.main.secrets');
+----
+<REGEX>:.*table function "pragma_table_info" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_constraints();
+----
+<REGEX>:.*table function "duckdb_constraints" is not allowed.*
+
+# --- the native context is unchanged: that is what it is for ---------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE platform;
+
+statement ok
+SELECT acl_grant_admin('platform', 'passthrough');
+
+query I
+ACL ROLE "platform" ACL NATIVE SELECT count(*) > 0 FROM duckdb_tables();
+----
+true
+
+# and so is a plain connection with no prefix at all - the gateway is the boundary, not this list
+query I
+SELECT count(*) > 0 FROM duckdb_tables();
+----
+true

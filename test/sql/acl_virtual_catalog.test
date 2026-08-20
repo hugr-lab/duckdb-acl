@@ -1,0 +1,219 @@
+# name: test/sql/acl_virtual_catalog.test
+# description: the metadata surfaces answer with the principal's own catalog (spec 010 part 3) - the
+#   same shape duckdb's own metadata has, filtered by the grants, with no physical name in it
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE TABLE phys.lake.orders(id INT, tenant VARCHAR, amount INT, ssn VARCHAR);
+
+statement ok
+CREATE TABLE phys.lake.other(x INT);
+
+statement ok
+CREATE TABLE phys.main.secrets(ssn VARCHAR);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.lake.orders COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.renamed AS phys.lake.orders COLUMNS (order_id = id, total = amount);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW sales.stats (n BIGINT) AS SELECT count(*) AS n FROM phys.lake.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.lake;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN;
+
+# --- tables: the virtual catalog, and nothing of the physical one ----------------------------------
+
+query IIII
+ACL ROLE "analyst" SELECT table_catalog, table_schema, table_name, table_type FROM information_schema.tables ORDER BY 2, 3;
+----
+sales	main	orders	BASE TABLE
+sales	main	renamed	BASE TABLE
+sales	main	stats	VIEW
+sales	raw	orders	BASE TABLE
+sales	raw	other	BASE TABLE
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables();
+----
+5
+
+# the physical database this all points at is not in the listing at all
+query I
+ACL ROLE "analyst" SELECT count(*) FROM information_schema.tables WHERE table_catalog <> 'sales';
+----
+0
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM information_schema.tables WHERE table_name = 'secrets';
+----
+0
+
+# --- columns: what the role actually sees, not what the table has ----------------------------------
+
+query III
+ACL ROLE "analyst" SELECT table_schema, table_name, column_name FROM information_schema.columns WHERE table_name IN ('orders', 'renamed', 'stats') ORDER BY 1, 2, 3;
+----
+main	orders	amount
+main	orders	id
+main	renamed	order_id
+main	renamed	total
+main	stats	n
+raw	orders	amount
+raw	orders	id
+raw	orders	ssn
+raw	orders	tenant
+
+# a column the projection hid is gone from the listing, not merely unreadable
+query I
+ACL ROLE "analyst" SELECT count(*) FROM information_schema.columns WHERE table_schema = 'main' AND column_name IN ('ssn', 'tenant');
+----
+0
+
+# a projection is described by its own stored schema: name and type for every column the role sees,
+# including ones no physical column has. The attributes that only a physical row can supply
+# (nullability and friends) are absent - a missing column breaks a tool, a missing is_nullable does not
+query II
+ACL ROLE "analyst" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'orders' AND table_schema = 'main' ORDER BY 1;
+----
+amount	INTEGER
+id	INTEGER
+
+# an alias relation is the physical table under a virtual name, so its listing keeps the whole shape
+query III
+ACL ROLE "analyst" SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'raw' AND table_name = 'other';
+----
+x	INTEGER	YES
+
+# a computed column and a masked one are in the listing, with the types the write-time probe found
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.computed AS phys.lake.orders COLUMNS (id, total = amount * 2, ssn = NULL);
+
+query II
+ACL ROLE "analyst" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'computed' ORDER BY 1;
+----
+id	INTEGER
+ssn	"NULL"
+total	INTEGER
+
+# a query-defined object has no physical row, and still lists its columns (spec 010 part 2 probed them)
+query II
+ACL ROLE "analyst" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'stats';
+----
+n	BIGINT
+
+# --- schemata and databases -------------------------------------------------------------------------
+
+query II
+ACL ROLE "analyst" SELECT catalog_name, schema_name FROM information_schema.schemata ORDER BY 2;
+----
+sales	main
+sales	raw
+
+query I
+ACL ROLE "analyst" SELECT database_name FROM duckdb_databases();
+----
+sales
+
+# --- another role sees its own catalog ---------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG hr;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE hr.people AS phys.lake.other;
+
+statement ok
+ACL ADMIN CREATE ROLE hr_reader;
+
+statement ok
+ACL ADMIN GRANT CATALOG hr TO ROLE hr_reader WITH (select) MAIN;
+
+query III
+ACL ROLE "hr_reader" SELECT table_catalog, table_schema, table_name FROM information_schema.tables;
+----
+hr	main	people
+
+# and a role granted nothing on an object does not see it
+statement ok
+ACL ADMIN CREATE ROLE nothing_granted;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE nothing_granted CAPS '{}' MAIN;
+
+query I
+ACL ROLE "nothing_granted" SELECT count(*) FROM information_schema.tables;
+----
+0
+
+# --- the native context still sees the real catalog --------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE platform;
+
+statement ok
+SELECT acl_grant_admin('platform', 'passthrough');
+
+query I
+ACL ROLE "platform" ACL NATIVE SELECT count(*) > 0 FROM information_schema.tables WHERE table_name = 'secrets';
+----
+true
+
+# --- the surface names are reserved, and the calls take no arguments -------------------------------
+# a virtual object with a surface's name would be listed and unreachable: the name resolves to the
+# listing, so the object could never be selected. Refused when it is defined, not discovered later.
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE sales.duckdb_tables AS phys.main.secrets;
+----
+<REGEX>:.*"duckdb_tables" is a metadata surface.*
+
+# the same holds for a name that only becomes a surface once its schema is written out: an object
+# `tables` inside a virtual schema called `information_schema` is written `information_schema.tables`
+statement error
+SELECT acl_add_relation('sales', 'information_schema.tables', 'phys.main.secrets', '', '');
+----
+<REGEX>:.*is a metadata surface.*
+
+# none of these functions take arguments, and quietly dropping one answers a question nobody asked
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables('nonsense');
+----
+<REGEX>:.*"duckdb_tables" takes no arguments.*
+
+# a name inside a schema is not a surface, so it stays available
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.reports.duckdb_tables AS phys.lake.other;
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM reports.duckdb_tables;
+----
+0
