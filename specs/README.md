@@ -47,3 +47,4 @@ specs are the shareable distillation of that work.
 | [002](002-cpp-invariant-tests/spec.md) | standalone C++ invariant tests (params, isolation) | implemented |
 | [003](003-select-capability-read-gate/spec.md) | the 'select' capability gates the read path | implemented |
 | [004](004-code-structure/spec.md) | code structure and namespaces | implemented |
+| [005](005-integration-env/spec.md) | integration environment, real-database scenarios, CI/CD | implemented |

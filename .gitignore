@@ -13,3 +13,6 @@ test/python/__pycache__/
 
 # local design / research scratch (not committed)
 design/
+
+# local integration-test environment config (copy of .env.example)
+.env
