@@ -20,6 +20,7 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
@@ -145,11 +146,24 @@ private:
 			Deny("unsupported CREATE form");
 		}
 		auto &info = *stmt.info;
-		if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY) {
-			Deny("only tables and views can be created through the ACL");
+		if (info.type == CatalogType::VIEW_ENTRY) {
+			// a view keeps its body, and the body would be stored with THIS principal's claims baked
+			// in, then re-read by every other role through the same name - one principal's slice
+			// frozen into an object everyone reads. Until that has a design, refuse it.
+			Deny("creating views through the ACL is not available yet - a stored body would carry this "
+			     "principal's claims to everyone who reads it");
+		}
+		if (info.type != CatalogType::TABLE_ENTRY) {
+			Deny("only tables can be created through the ACL");
 		}
 		if (info.temporary) {
 			Deny("temporary objects are not available through the ACL yet");
+		}
+		// CREATE TABLE ... AS SELECT reads before it writes, and that read is a read like any other:
+		// without this a role holding `create` could copy any physical table into its own schema
+		auto &table_info = info.Cast<CreateTableInfo>();
+		if (table_info.query && table_info.query->node) {
+			RewriteQueryNode(*table_info.query->node);
 		}
 		auto key = VirtualKey(info.GetQualifiedName());
 		DdlTarget target;

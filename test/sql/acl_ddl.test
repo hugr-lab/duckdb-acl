@@ -286,6 +286,40 @@ ACL ROLE "schemamaker" CREATE TABLE vs.sneaky(id INTEGER);
 ----
 <REGEX>:.*no schema of the catalog allows creating "vs.sneaky".*
 
+# --- a body reads before it writes, and that read is gated ------------------------------------------
+# without this a role holding `create` copies any physical table into a schema it owns
+
+statement ok
+CREATE TABLE phys.main.secrets(ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.main.secrets VALUES ('super-secret');
+
+statement error
+ACL ROLE "ingest" CREATE TABLE vs.stolen AS SELECT * FROM phys.main.secrets;
+----
+<REGEX>:.*no access to object "phys.main.secrets".*
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'stolen';
+----
+0
+
+# what the role may read, it may copy
+statement ok
+ACL ROLE "ingest" CREATE TABLE vs.copied AS SELECT * FROM vs.orders;
+
+query I
+ACL ROLE "ingest" SELECT count(*) FROM vs.copied;
+----
+1
+
+# a view would store this principal's baked claims for everyone else to read, so not yet
+statement error
+ACL ROLE "ingest" CREATE VIEW vs.v AS SELECT 1 AS one;
+----
+<REGEX>:.*creating views through the ACL is not available yet.*
+
 # --- only tables and views, and never through a name nobody granted ---------------------------------
 
 statement error

@@ -1,6 +1,6 @@
 # Spec 016: DDL through the ACL — `create`, `drop`, and where the object lands
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-08-20
 - **Author**: hugr-lab
 
@@ -79,6 +79,19 @@ an object nobody made.
 its record. `ACL ADMIN DROP VIRTUAL TABLE` remains the administrative one — it forgets the record and
 leaves the physics alone. Two verbs, two meanings, both explicit.
 
+### A body reads before it writes
+
+`CREATE TABLE … AS SELECT` performs a read, and that read is gated exactly like any other: the select
+side goes through the normal rewrite, so a role holding `create` cannot copy a physical table it has
+no access to into a schema it owns. Without this the capability would be an exfiltration primitive —
+`CREATE TABLE mine.stolen AS SELECT * FROM phys.main.secrets` — which is why the check lives here and
+not in a follow-up.
+
+`CREATE VIEW` is **refused for now**, for a different reason: a view keeps its body, the body would
+be stored with *this* principal's claims baked in, and every other role reading through that name
+would then see one principal's slice. That needs a design of its own (a virtual view already exists
+for the admin path and carries markers instead of baked values).
+
 ### Fail-closed rules
 
 - a `CREATE` naming a schema the role holds no `create` on is refused before anything is created;
@@ -100,7 +113,9 @@ is a data capability, not a manage scope, and no amount of DDL produces one.
 
 ## Testing
 
-`test/sql/acl_ddl.test`: a role with `create` on a schema making a table and reading it back; the
+`test/sql/acl_ddl.test` (82 assertions): a `CREATE TABLE … AS SELECT` over a table the role cannot
+read refused while one over a table it can read succeeds, `CREATE VIEW` refused; a role with `create`
+on a schema making a table and reading it back; the
 same statement refused for a role without it; an alias schema needing no record while an expansion
 gets one with the right origin (and `REFRESH`/`PRUNE` then treating it like any other record);
 `INTO` sending the object to a different physical schema than the declaration; `VIRTUAL ONLY`
@@ -123,4 +138,5 @@ leaving no record behind.
 - `CREATE SCHEMA` / `DROP SCHEMA` through the catalog-level `create`/`drop`, and the auto-grant to
   the role that created a schema (design 004: a materialised row, not an implicit rule).
 - Temporary tables for ingest paths (`temp` capability) — recorded separately.
-- `CREATE TABLE … AS SELECT` needs the select side gated as a read before the create side is allowed.
+- `CREATE VIEW` through the ACL: the body has to keep its markers rather than this principal's baked
+  claims, which is what the virtual-view path already does for the admin.
