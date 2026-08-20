@@ -50,6 +50,39 @@ case_insensitive_map_t<string> ParseClaims(const string &csv) {
 	return claims;
 }
 
+//! Whether an expression is just a column reference: then `virtual = physical` is a RENAME, not a
+//! projection - it exposes the same rows and columns under different names, so the relation stays
+//! writable. Anything else (NULL, amount * 2, a function call) restricts or computes and forces the
+//! read-only subquery form.
+bool IsPlainColumnReference(const string &expr) {
+	if (expr.empty()) {
+		return false;
+	}
+	for (auto c : expr) {
+		if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '_') {
+			return false;
+		}
+	}
+	if (StringUtil::CharacterIsDigit(expr[0])) {
+		return false;
+	}
+	auto lowered = StringUtil::Lower(expr);
+	return lowered != "null" && lowered != "true" && lowered != "false" && lowered != "default";
+}
+
+//! A column list is a pure rename list when every entry renames a column onto another column
+bool IsRenameOnly(const vector<std::pair<string, string>> &columns) {
+	if (columns.empty()) {
+		return false;
+	}
+	for (auto &column : columns) {
+		if (!IsPlainColumnReference(column.second)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 //! cols_csv items are `name` or `name=expr`; returned as (name, expr) pairs (empty expr = plain)
 vector<std::pair<string, string>> ParseColumns(const string &csv) {
 	vector<std::pair<string, string>> columns;
@@ -137,7 +170,8 @@ void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		auto phys = RequiredArg(args, 2, row, "acl_add_relation", "phys");
 		auto columns = ParseColumns(OptionalArg(args, 3, row, ""));
 		auto rls = OptionalArg(args, 4, row, "");
-		auto form = columns.empty() && rls.empty() ? "alias" : "subquery";
+		// renaming is not restricting: a pure rename list keeps the relation writable
+		auto form = rls.empty() && (columns.empty() || IsRenameOnly(columns)) ? "alias" : "subquery";
 		StoreOf(state).CatalogAddRelation(vcat, vname, form, phys, "", rls, columns);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));

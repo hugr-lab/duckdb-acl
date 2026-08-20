@@ -1,7 +1,7 @@
 # Spec 010: operating the virtual catalog — DROP, metadata, introspection
 
-- **Status**: in progress — parts 1 (DROP) and 2 (metadata) implemented; part 3 (introspection +
-  `duckdb_*` substitution) follows as its own PR against this spec
+- **Status**: in progress — parts 1 (DROP), 2 (metadata) and 2b (column renames) implemented;
+  part 3 (introspection + `duckdb_*` substitution) follows as its own PR against this spec
 - **Date**: 2026-08-20
 - **Author**: hugr-lab
 
@@ -79,6 +79,24 @@ Consequences of probing on the write path (deliberate):
   `ACL ADMIN ANALYZE VIRTUAL CATALOG c` (or one object) re-probes and returns how many objects it
   re-derived; `alias`-form objects never need it, since they read the physical catalog live.
 
+### 2b. Column renames keep a relation writable
+
+Renaming is not restricting, so it must not cost writability (a restriction is a positive list and
+stays a read-only subquery, so that a column added physically can never appear by itself). A column
+list whose every entry renames one column onto another (`order_id = id, total = amount`) therefore
+keeps the **alias** form:
+
+- **reads** go through `SELECT * RENAME (id AS order_id, …) FROM <phys>` — renaming **by name**, so a
+  column added to the physical table can never shift an alias onto a different column (the hazard of
+  positional `column_name_alias`); columns that were not renamed keep their names;
+- **writes** keep the real table and map the names back: the `INSERT` column list, `UPDATE … SET`
+  targets and the target's own references in `WHERE`/`RETURNING` are translated virtual → physical;
+- naming a **physical** column that the policy renamed away is refused — the virtual relation does
+  not have that column any more;
+- a renamed relation is refused in DML that has a **second relation in scope** (`UPDATE … FROM`,
+  `DELETE … USING`, `MERGE`): an unqualified reference could belong to either side, and guessing
+  would silently write the wrong column. Relations without renames are unaffected.
+
 ### 3. `acl_*` introspection
 
 `acl_catalogs()`, `acl_relations()`, `acl_relation_columns()`, `acl_schema_aliases()`,
@@ -154,7 +172,13 @@ deny of spec 009 plus these rewrites.
 - `acl_virtual_catalog.test`: a principal's `duckdb_tables()`/`information_schema.columns` showing
   only granted objects and only visible columns; masked columns absent; no physical names; native
   context still unfiltered; the pre-existing physical-catalog leak refused.
-- `acl_metadata.test` (78 assertions, **implemented**): a view's and a macro's schema derived at
+- `acl_column_aliases.test` (46 assertions, **implemented**): a pure rename list keeps `form =
+  alias`; reads show the virtual names (and untouched columns keep theirs) while the physical name of
+  a renamed column is gone; `INSERT`/`UPDATE`/`DELETE` land on the physical columns; writing a
+  renamed-away physical name is refused; `UPDATE … FROM` / `MERGE` on a renamed relation are refused
+  rather than guessed; a restricting projection stays read-only; and a newly added physical column
+  cannot shift an alias.
+- `acl_metadata.test` (108 assertions, **implemented**): a view's and a macro's schema derived at
   write time (including templates carrying `acl_claim`/`acl_arg`), a scalar macro's single result
   type, an alias-form function deriving nothing, projected names stored for subquery relations, a
   probe that cannot bind stored as "unknown" and repaired by `acl_refresh_schema` once the source

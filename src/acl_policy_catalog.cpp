@@ -534,15 +534,20 @@ struct CatalogBackend {
 		out.rls = rls.IsNull() ? string() : rls.ToString();
 		out.subquery_form = form != "alias";
 		auto cols = result->GetValue(6, 0);
-		if (form == "subquery" && !cols.IsNull()) {
+		if (!cols.IsNull() && form != "view") {
 			for (auto &item : ListValue::GetChildren(cols)) {
 				auto &fields = StructValue::GetChildren(item);
 				auto name = fields[0].ToString();
-				if (fields[1].IsNull() || fields[1].ToString().empty()) {
-					out.projection.push_back(name);
-				} else {
-					out.projection.push_back(fields[1].ToString() + " AS " + name);
+				auto expr = fields[1].IsNull() ? string() : fields[1].ToString();
+				if (form == "alias") {
+					// an alias-form column list is a rename list (virtual -> physical): it keeps the
+					// relation writable, so reads rename by name and writes map the names back
+					if (!expr.empty()) {
+						out.renames.emplace_back(name, expr);
+					}
+					continue;
 				}
+				out.projection.push_back(expr.empty() ? name : expr + " AS " + name);
 			}
 		}
 		// remaining rows of the winning interpretation differ only by role: union their caps

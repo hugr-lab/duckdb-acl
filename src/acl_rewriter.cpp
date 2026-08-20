@@ -3,6 +3,7 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
@@ -179,42 +180,61 @@ private:
 	}
 
 	void RewriteInsertNode(InsertQueryNode &node) {
-		ResolveDmlTarget(node.table_ref, node.qualified_name, "insert");
+		auto policy = ResolveDmlTarget(node.table_ref, node.qualified_name, "insert");
+		auto vname = dml_target_name;
+		// the written column names are the virtual ones: map them back onto the physical table
+		for (auto &column : node.columns) {
+			column = MapWrittenColumn(policy, column, vname);
+		}
 		if (node.select_statement && node.select_statement->node) {
 			RewriteQueryNode(*node.select_statement->node);
 		}
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
+			MapColumnRefs(item, policy, vname); // RETURNING names the target's own columns
 		}
 	}
 
 	void RewriteUpdateNode(UpdateQueryNode &node) {
-		ResolveDmlTarget(node.table, "update");
+		auto policy = ResolveDmlTarget(node.table, "update");
+		auto vname = dml_target_name;
+		RequireSingleScope(policy, node.from_table != nullptr, vname);
 		RewriteTableRef(node.from_table);
 		if (node.set_info) {
+			for (auto &column : node.set_info->columns) {
+				column = MapWrittenColumn(policy, column, vname);
+			}
 			for (auto &expr : node.set_info->expressions) {
 				RewriteExpr(expr);
+				MapColumnRefs(expr, policy, vname);
 			}
 			RewriteExpr(node.set_info->condition);
+			MapColumnRefs(node.set_info->condition, policy, vname);
 		}
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
+			MapColumnRefs(item, policy, vname);
 		}
 	}
 
 	void RewriteDeleteNode(DeleteQueryNode &node) {
-		ResolveDmlTarget(node.table, "delete");
+		auto policy = ResolveDmlTarget(node.table, "delete");
+		auto vname = dml_target_name;
+		RequireSingleScope(policy, !node.using_clauses.empty(), vname);
 		for (auto &using_ref : node.using_clauses) {
 			RewriteTableRef(using_ref);
 		}
 		RewriteExpr(node.condition);
+		MapColumnRefs(node.condition, policy, vname);
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
+			MapColumnRefs(item, policy, vname);
 		}
 	}
 
 	void RewriteMergeNode(MergeQueryNode &node) {
-		ResolveDmlTarget(node.target, "merge");
+		auto policy = ResolveDmlTarget(node.target, "merge");
+		RequireSingleScope(policy, true, dml_target_name); // MERGE always has a source in scope
 		RewriteTableRef(node.source);
 		RewriteExpr(node.join_condition);
 		for (auto &action_set : node.actions) {
@@ -261,6 +281,11 @@ private:
 			}
 			if (policy.subquery_form) {
 				ref = BuildTableSubquery(base.Table().GetIdentifierName(), policy, base);
+			} else if (!policy.renames.empty()) {
+				// Renamed but still writable: reads go through `SELECT * RENAME (...)`, which renames BY
+				// NAME - a column added to the physical table can never shift an alias onto another
+				// column. Writes keep the real table and map the names back (ResolveDmlTarget).
+				ref = BuildRenamedSubquery(base.Table().GetIdentifierName(), policy, base);
 			} else {
 				// RENAME: swap the name for its physical target in place; it stays a real (writable) table.
 				// Keep the virtual name as an alias so qualified references (vname.col) still resolve.
@@ -389,16 +414,76 @@ private:
 		return std::move(sub);
 	}
 
-	//! Resolve a DML target in place (name -> physical), enforcing the required capability
-	void ResolveDmlTarget(unique_ptr<TableRef> &target, const string &capability) {
-		if (!target || target->type != TableReferenceType::BASE_TABLE) {
-			return;
+	//! `(SELECT * RENAME (phys AS virt, …) FROM <phys>) AS <alias>` - the read shape of a renamed but
+	//! writable relation
+	unique_ptr<TableRef> BuildRenamedSubquery(const string &vname, const TablePolicy &policy, BaseTableRef &original) {
+		vector<string> renames;
+		for (auto &rename : policy.renames) {
+			renames.push_back(rename.second + " AS " + rename.first);
 		}
-		auto &base = target->Cast<BaseTableRef>();
-		ResolveDmlTarget(target, base.GetQualifiedNameMutable(), capability);
+		auto sql = "SELECT * RENAME (" + StringUtil::Join(renames, ", ") + ") FROM " + policy.phys;
+		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		Identifier alias = original.alias.empty() ? Identifier(vname) : original.alias;
+		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+		sub->column_name_alias = std::move(original.column_name_alias);
+		sub->sample = std::move(original.sample);
+		return std::move(sub);
 	}
 
-	void ResolveDmlTarget(unique_ptr<TableRef> &target_ref, QualifiedName &target_name, const string &capability) {
+	//! Map a written column name onto the physical one. A physical name that the policy renamed away
+	//! is refused: the virtual relation does not have that column any more.
+	Identifier MapWrittenColumn(const TablePolicy &policy, const Identifier &written, const string &vname) {
+		auto name = written.GetIdentifierName();
+		for (auto &rename : policy.renames) {
+			if (StringUtil::CIEquals(rename.first, name)) {
+				return Identifier(rename.second);
+			}
+		}
+		for (auto &rename : policy.renames) {
+			if (StringUtil::CIEquals(rename.second, name)) {
+				Deny("\"" + vname + "\" has no column \"" + name + "\"");
+			}
+		}
+		return written;
+	}
+
+	//! Rewrite column references of the DML target's own scope (SET values, WHERE, RETURNING)
+	void MapColumnRefs(unique_ptr<ParsedExpression> &expr, const TablePolicy &policy, const string &vname) {
+		if (!expr) {
+			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &column_ref = expr->Cast<ColumnRefExpression>();
+			auto &names = column_ref.ColumnNamesMutable();
+			if (!names.empty()) {
+				names.back() = MapWrittenColumn(policy, names.back(), vname);
+			}
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expr, [&](unique_ptr<ParsedExpression> &child) { MapColumnRefs(child, policy, vname); });
+	}
+
+	//! A renamed relation may only be written when the statement has no second relation in scope:
+	//! an unqualified column reference could otherwise belong to either side, and guessing would
+	//! silently write the wrong column.
+	void RequireSingleScope(const TablePolicy &policy, bool has_other_relation, const string &vname) {
+		if (!policy.renames.empty() && has_other_relation) {
+			Deny("\"" + vname + "\" renames columns, so it cannot be written with FROM/USING/MERGE yet");
+		}
+	}
+
+	//! Resolve a DML target in place (name -> physical), enforcing the required capability
+	TablePolicy ResolveDmlTarget(unique_ptr<TableRef> &target, const string &capability) {
+		if (!target || target->type != TableReferenceType::BASE_TABLE) {
+			return TablePolicy();
+		}
+		auto &base = target->Cast<BaseTableRef>();
+		return ResolveDmlTarget(target, base.GetQualifiedNameMutable(), capability);
+	}
+
+	TablePolicy ResolveDmlTarget(unique_ptr<TableRef> &target_ref, QualifiedName &target_name,
+	                             const string &capability) {
 		string key;
 		if (target_ref && target_ref->type == TableReferenceType::BASE_TABLE) {
 			key = VirtualKey(target_ref->Cast<BaseTableRef>().GetQualifiedName());
@@ -421,6 +506,8 @@ private:
 			target_ref->Cast<BaseTableRef>().SetQualifiedName(phys);
 		}
 		target_name = phys;
+		dml_target_name = key;
+		return policy;
 	}
 
 	//===------------------------------------------------------------------===//
@@ -543,6 +630,8 @@ private:
 private:
 	const Principal &principal;
 	PolicyStore &store;
+	//! the virtual name of the DML target currently being rewritten (for diagnostics and mapping)
+	string dml_target_name;
 	ParserOptions template_options;
 	case_insensitive_set_t cte_scope;
 };
