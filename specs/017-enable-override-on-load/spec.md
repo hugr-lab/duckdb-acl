@@ -44,18 +44,28 @@ unrestricted access), but it is a footgun with no upside.
 ### Why denials are thrown rather than returned
 
 `ParserOverrideResult` has an error channel (`DISPLAY_EXTENSION_ERROR`), and it is tempting to route
-policy denials through it. Reading how the parser consumes it settles the question — in
-`Parser::ParseQuery` the loop over overrides does:
+policy denials through it. One reading of `Parser::ParseQuery` settles it — the loop over overrides
+does this per extension under `STRICT`:
 
-- a **later** extension returning `PARSE_SUCCESSFUL` returns immediately, and our error is gone;
-- a later extension returning `DISPLAY_ORIGINAL_ERROR` ("not mine") explicitly **resets**
-  `has_strict_extension_error` — our denial evaporates because some unrelated extension is loaded;
-- under `FALLBACK` the returned error is not surfaced at all.
+```cpp
+if (result.type == DISPLAY_EXTENSION_ERROR) { has_strict_extension_error = true; … }
+else                                        { has_strict_extension_error = false; }
+```
 
-So a returned denial can be destroyed by an extension that has nothing to do with us, and the user
-would see "syntax error at or near ACL" instead of the reason. A thrown exception propagates out of
-`ParseQuery` in every mode and cannot be overwritten by anyone. Refusals are security output; they do
-not get a channel that another extension can mute.
+A **later** extension that behaves perfectly well — looks at the query, sees syntax that is not its
+own, returns `DISPLAY_ORIGINAL_ERROR` — thereby **clears our error**. No conflict, no misbehaviour:
+the last extension in registration order decides whether anyone reported anything. With any other
+override extension loaded after us, a denial routed through the result channel would reach the user
+as "syntax error at or near ACL" instead of its reason. Under `FALLBACK` it is not surfaced at all,
+so the channel would also need a per-mode branch.
+
+(A later extension returning `PARSE_SUCCESSFUL` would discard it too, but that case is two grammars
+claiming the same text — a conflict with no sensible resolution from either side, and not something
+to design against.)
+
+A thrown exception leaves `ParseQuery` in every mode and cannot be cleared by anyone. Refusals are
+security output; they do not get a channel a neighbour can mute. The `else`-reset looks like a duckdb
+bug rather than an intent — worth reporting upstream, and worth revisiting this if it is fixed.
 
 ## Enforcement & security
 
