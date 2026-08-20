@@ -728,6 +728,25 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			auto role = s.Word("a role name");
 			return MakeAdminCall("acl_grant_admin", {Value(role), Value(scope)});
 		}
+		// GRANT SCHEMA v.path TO ROLE r WITH (…) [COMMENT '…'] - the middle level (spec 015)
+		if (s.Accept("schema")) {
+			string vcat, path;
+			SplitVirtual(s.Dotted("a virtual schema path"), vcat, path);
+			s.Expect("to");
+			s.Expect("role");
+			auto role = s.Word("a role name");
+			string caps, rls, columns, comment;
+			GrantPolicyClauses(s, caps, rls, columns);
+			if (!rls.empty() || !columns.empty()) {
+				throw BinderException("acl admin: a schema grant carries capabilities only - RLS and COLUMNS belong "
+				                      "to the catalog or to the object (spec 015)");
+			}
+			if (s.Accept("comment")) {
+				comment = s.Quoted("comment");
+			}
+			return MakeAdminCall("acl_grant_schema",
+			                     {Value(role), Value(vcat), Value(path), Value(caps), Value(comment)});
+		}
 		// GRANT TABLE|VIEW|OBJECT v.n TO ROLE r [CAPS '…'] [RLS '…'] [COLUMNS '…'] - the grant's own
 		// policy (spec 011): it narrows the object for this role, it never widens it
 		if (s.Accept("table") || s.Accept("view") || s.Accept("object")) {
@@ -745,7 +764,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		}
 		s.Expect("catalog");
 		auto vcat = s.Word("a catalog name");
-		s.Expect("to");
+		s.Expect("to"); // GRANT CATALOG c TO ROLE r
 		s.Expect("role");
 		auto role = s.Word("a role name");
 		string caps, rls, columns;
@@ -760,6 +779,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			s.Expect("role");
 			auto role = s.Word("a role name");
 			return MakeAdminCall("acl_revoke_admin", {Value(role)});
+		}
+		if (s.Accept("schema")) { // REVOKE SCHEMA v.path FROM ROLE r
+			string vcat, path;
+			SplitVirtual(s.Dotted("a virtual schema path"), vcat, path);
+			s.Expect("from");
+			s.Expect("role");
+			return MakeAdminCall("acl_revoke_schema", {Value(s.Word("a role name")), Value(vcat), Value(path)});
 		}
 		s.Expect("catalog");
 		auto vcat = s.Word("a catalog name");
@@ -1052,6 +1078,9 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	    {"acl_refresh_schema", 0},
 	    {"acl_expand_schema", 0},
 	    {"acl_refresh_schema_objects", 0},
+	    {"acl_grant_schema", 1},
+	    {"acl_revoke_schema", 1},
+	    {"acl_rematerialize_schema_caps", 0},
 	};
 	MgmtProvenance provenance;
 	auto &select = statement.Cast<SelectStatement>().node->Cast<SelectNode>();
@@ -1062,7 +1091,8 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 		return provenance;
 	}
 	if (name == "acl_grant_catalog" || name == "acl_revoke_catalog" || name == "acl_grant_object" ||
-	    name == "acl_alter_grant" || name == "acl_drop_catalog") {
+	    name == "acl_grant_schema" || name == "acl_revoke_schema" || name == "acl_alter_grant" ||
+	    name == "acl_drop_catalog") {
 		// dropping a catalog takes it away from everyone who holds it, so it is privilege
 		// administration too - a scope over the catalog's content does not include destroying it
 		provenance.hands_out = true;

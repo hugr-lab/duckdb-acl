@@ -618,11 +618,35 @@ struct CatalogBackend {
 		                     : Tbl("role_object_caps");
 	}
 	//! the caps column of a resolution query; without an object_caps source there is no override
-	string CapsExpr() {
-		// nullif over the trimmed value: an object row that says nothing about capabilities - NULL,
-		// empty or blank - falls back to the catalog grant instead of replacing it, because
-		// "unspecified" is not "none" (spec 012)
-		return HasObjectCaps() ? "coalesce(nullif(trim(oc.\"caps\"), ''), g.\"caps\")" : "g.\"caps\"";
+	//! The capabilities of the longest schema prefix of `name` this role holds (spec 015). Inheritance
+	//! is materialised on the write path, so this picks one row instead of composing a chain.
+	string SchemaCapsExpr(const string &name_expr, const string &vcat_expr) {
+		if (function_mode) {
+			return string(); // the driver contract has no schema level
+		}
+		return "(SELECT nullif(trim(sc.\"caps\"), '') FROM " + Tbl("role_schemas") +
+		       " sc WHERE sc.\"role\" = g.\"role\" AND sc.\"vcat\" = " + vcat_expr + " AND substr(" + name_expr +
+		       ", 1, length(sc.\"schema_path\") + 1) = sc.\"schema_path\" || '.'"
+		       " ORDER BY length(sc.\"schema_path\") DESC LIMIT 1)";
+	}
+	//! The effective capabilities of one grant row: the most specific level that states them wins -
+	//! object, then schema, then catalog - and a level that says nothing (NULL, empty or blank) is
+	//! "unspecified", which is not "none" (spec 012).
+	string CapsExpr(const string &name_expr = "r.\"vname\"", const string &vcat_expr = "r.\"vcat\"") {
+		string caps = HasObjectCaps() ? "nullif(trim(oc.\"caps\"), '')" : string();
+		auto schema_caps = SchemaCapsExpr(name_expr, vcat_expr);
+		if (caps.empty() && schema_caps.empty()) {
+			return "g.\"caps\"";
+		}
+		vector<string> terms;
+		if (!caps.empty()) {
+			terms.push_back(caps);
+		}
+		if (!schema_caps.empty()) {
+			terms.push_back(schema_caps);
+		}
+		terms.push_back("g.\"caps\"");
+		return "coalesce(" + StringUtil::Join(terms, ", ") + ")";
 	}
 	//! The grant chain's policy columns (spec 011): the catalog grant's and the object grant's own RLS
 	//! and column list. The function-driver's slots do not carry them, so it composes to no narrowing.
@@ -850,8 +874,8 @@ struct CatalogBackend {
 		                                       " AND oc.\"vname\" = " +
 		                                       path_case
 		                                 : string();
-		auto sql = GrantsCte(principal) + "SELECT sa.\"vcat\", sa.\"alias_path\", sa.\"phys_path\", " + CapsExpr() +
-		           " AS caps, " + GrantPolicyExprs() +
+		auto sql = GrantsCte(principal) + "SELECT sa.\"vcat\", sa.\"alias_path\", sa.\"phys_path\", " +
+		           CapsExpr(path_case, "sa.\"vcat\"") + " AS caps, " + GrantPolicyExprs() +
 		           ","
 		           " CASE WHEN " +
 		           qualified_cond +
@@ -913,8 +937,8 @@ struct CatalogBackend {
 		                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
 		                                       " AND oc.\"vname\" = f.\"vname\""
 		                                 : string();
-		auto sql = GrantsCte(principal) + "SELECT f.\"vcat\", f.\"form\", f.\"target\", f.\"template\", " + CapsExpr() +
-		           " AS caps, " + GrantPolicyExprs() +
+		auto sql = GrantsCte(principal) + "SELECT f.\"vcat\", f.\"form\", f.\"target\", f.\"template\", " +
+		           CapsExpr("f.\"vname\"", "f.\"vcat\"") + " AS caps, " + GrantPolicyExprs() +
 		           ","
 		           " CASE WHEN " +
 		           qualified_cond +
@@ -1405,6 +1429,13 @@ struct CatalogBackend {
 		    // differs between a fresh catalog and a migrated one, so every INSERT names its columns.
 		    "ALTER TABLE " + Tbl("schemas") + " ADD COLUMN IF NOT EXISTS \"origin\" VARCHAR",
 		    "ALTER TABLE " + Tbl("relations") + " ADD COLUMN IF NOT EXISTS \"origin\" VARCHAR",
+		    // spec 015 (schema v5): the middle level of the grant chain. Capabilities only - policy stays
+		    // two-level - and `inherited` says whether the row was materialised from an ancestor or
+		    // granted as it stands, which is what makes the cascade repeatable.
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_schemas") +
+		        "(\"role\" VARCHAR, \"vcat\" VARCHAR, \"schema_path\" VARCHAR, \"caps\" VARCHAR,"
+		        " \"inherited\" BOOLEAN, \"comment\" VARCHAR,"
+		        " PRIMARY KEY (\"role\", \"vcat\", \"schema_path\"))",
 		    // a record dropped on purpose must not come back on the next REFRESH
 		    "CREATE TABLE IF NOT EXISTS " + Tbl("schema_dropped") +
 		        "(\"vcat\" VARCHAR, \"path\" VARCHAR, \"name\" VARCHAR,"
@@ -1420,9 +1451,9 @@ struct CatalogBackend {
 		    // the declared signature ("name TYPE, …"): it makes a probe meaningful (typed NULLs) and,
 		    // together with a declared result, unnecessary
 		    "ALTER TABLE " + Tbl("functions") + " ADD COLUMN IF NOT EXISTS \"params\" VARCHAR",
-		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '4' WHERE NOT EXISTS (SELECT 1 FROM " +
+		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '5' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
-		    "UPDATE " + Tbl("meta") + " SET \"value\" = '4' WHERE \"key\" = 'schema_version' AND \"value\" < '4'",
+		    "UPDATE " + Tbl("meta") + " SET \"value\" = '5' WHERE \"key\" = 'schema_version' AND \"value\" < '5'",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'policy_version')",
 		};
@@ -1619,6 +1650,8 @@ void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_
 			                     Lit(alias_path) + ", " + Lit(phys_path) + ")");
 		}
 	});
+	// a schema created under a granted parent inherits its capabilities at creation (spec 015)
+	CatalogRematerializeSchemaCaps(vcat, alias_path);
 }
 
 namespace {
@@ -1661,6 +1694,90 @@ vector<string> PhysicalObjects(acl_detail::CatalogBackend &catalog, const string
 
 } // namespace
 
+void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, const string &path,
+                                     const string &caps_json, const string &comment) {
+	RequireCatalog(catalog, "acl_grant_schema");
+	if (acl_detail::ParseCaps(caps_json).count("manage")) {
+		throw BinderException("acl admin: `manage` is granted per catalog, not per schema - administering the ACL is "
+		                      "catalog-scoped (spec 009)");
+	}
+	if (!CatalogObjectExists(vcat, path, "schema")) {
+		throw BinderException("acl admin: schema \"%s.%s\" does not exist", vcat, path);
+	}
+	catalog->Write({"DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"role\" = " + Lit(role) +
+	                    " AND \"vcat\" = " + Lit(vcat) + " AND \"schema_path\" = " + Lit(path),
+	                "INSERT INTO " + catalog->Tbl("role_schemas") +
+	                    "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\", \"comment\") VALUES (" +
+	                    Lit(role) + ", " + Lit(vcat) + ", " + Lit(path) + ", " + Lit(caps_json) + ", false, " +
+	                    (comment.empty() ? "NULL" : Lit(comment)) + ")"});
+	CatalogRematerializeSchemaCaps(vcat, path);
+}
+
+void PolicyStore::CatalogRevokeSchema(const string &role, const string &vcat, const string &path) {
+	RequireCatalog(catalog, "acl_revoke_schema");
+	catalog->Write({"DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"role\" = " + Lit(role) +
+	                " AND \"vcat\" = " + Lit(vcat) + " AND \"schema_path\" = " + Lit(path)});
+	// the subtree now inherits from whatever ancestor still states capabilities - or from nothing
+	CatalogRematerializeSchemaCaps(vcat, path);
+}
+
+void PolicyStore::CatalogRematerializeSchemaCaps(const string &vcat, const string &path) {
+	RequireCatalog(catalog, "acl_rematerialize_schema_caps");
+	// One idempotent operation, many callers: granting, revoking, schema DDL and drift repair all
+	// reduce to "rebuild this subtree from the nearest ancestor that states capabilities" (spec 015).
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto prefix = path.empty() ? string() : path + ".";
+		auto in_subtree = [&](const string &column) {
+			return path.empty() ? string("true")
+			                    : "(" + column + " = " + Lit(path) + " OR substr(" + column + ", 1, " +
+			                          std::to_string(prefix.size()) + ") = " + Lit(prefix) + ")";
+		};
+		// every schema of the subtree, and every role that states capabilities anywhere above it
+		auto schemas = read("SELECT \"path\" FROM " + catalog->Tbl("schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                    " AND " + in_subtree("\"path\"") + " ORDER BY length(\"path\")");
+		auto explicit_rows = read("SELECT \"role\", \"schema_path\", \"caps\" FROM " + catalog->Tbl("role_schemas") +
+		                          " WHERE \"vcat\" = " + Lit(vcat) +
+		                          " AND NOT \"inherited\""
+		                          " ORDER BY \"role\", length(\"schema_path\") DESC");
+		// drop what was inherited inside the subtree: it is about to be recomputed
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"inherited\" AND " + in_subtree("\"schema_path\""));
+		for (idx_t row = 0; row < schemas->RowCount(); row++) {
+			auto schema_path = schemas->GetValue(0, row).ToString();
+			for (idx_t source = 0; source < explicit_rows->RowCount(); source++) {
+				auto role = explicit_rows->GetValue(0, source).ToString();
+				auto granted = explicit_rows->GetValue(1, source).ToString();
+				if (granted == schema_path) {
+					break; // the schema states its own capabilities: nothing to inherit here
+				}
+				if (schema_path.size() <= granted.size() ||
+				    schema_path.compare(0, granted.size() + 1, granted + ".") != 0) {
+					continue; // not an ancestor of this schema
+				}
+				// rows are ordered longest-first per role, so the first ancestor is the nearest one -
+				// which is also why an explicit row stops the cascade for its own subtree
+				bool covered = false;
+				for (idx_t other = 0; other < source; other++) {
+					if (explicit_rows->GetValue(0, other).ToString() == role) {
+						covered = true;
+						break;
+					}
+				}
+				if (covered) {
+					continue;
+				}
+				auto caps = explicit_rows->GetValue(2, source);
+				statements.push_back("INSERT INTO " + catalog->Tbl("role_schemas") +
+				                     "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\") VALUES (" +
+				                     Lit(role) + ", " + Lit(vcat) + ", " + Lit(schema_path) + ", " +
+				                     (caps.IsNull() ? "NULL" : Lit(caps.ToString())) + ", true)");
+				break;
+			}
+		}
+	});
+}
+
 void PolicyStore::CatalogExpandSchema(const string &vcat, const string &path, const string &phys_path) {
 	RequireCatalog(catalog, "acl_expand_schema");
 	auto names = PhysicalObjects(*catalog, phys_path);
@@ -1685,6 +1802,7 @@ void PolicyStore::CatalogExpandSchema(const string &vcat, const string &path, co
 		statements.push_back("DELETE FROM " + catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"path\" = " + Lit(path));
 	});
+	CatalogRematerializeSchemaCaps(vcat, path);
 }
 
 int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const string &path, bool prune) {
@@ -1988,6 +2106,9 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 		statements.push_back("DELETE FROM " + catalog->Tbl("schemas") + where);
 		statements.push_back("DELETE FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"alias_path\" = " + Lit(alias_path));
+		// the schema is gone, and so are the grants that named it - inherited or not
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"schema_path\" = " + Lit(alias_path));
 	});
 }
 
@@ -2016,7 +2137,8 @@ void PolicyStore::CatalogDropRole(const string &role) {
 			throw BinderException("acl admin: role \"%s\" does not exist", role);
 		}
 		// everything that points at a role goes with it - nothing may dangle
-		for (auto table : {"role_claims", "role_catalogs", "role_object_caps", "admins", "role_mappings"}) {
+		for (auto table :
+		     {"role_claims", "role_catalogs", "role_object_caps", "role_schemas", "admins", "role_mappings"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"role\" = " + Lit(role));
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
