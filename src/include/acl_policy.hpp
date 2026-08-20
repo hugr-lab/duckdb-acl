@@ -159,8 +159,8 @@ struct PolicyStore {
 	// columns are (name, expr) pairs with an empty expr for a plain projected column.
 	void CatalogCreate(const string &vcat, const string &comment);
 	void CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
-	                        const string &view_sql, const string &rls,
-	                        const vector<std::pair<string, string>> &columns, const string &returns = string());
+	                        const string &view_sql, const string &rls, const vector<std::pair<string, string>> &columns,
+	                        const string &returns = string());
 	void CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path);
 	//! `params`/`returns` are the declared signature and result ("name TYPE, …"): a declared result is
 	//! stored as-is and never probed - an argument-dependent template cannot be typed from NULLs, and

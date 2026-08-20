@@ -1250,13 +1250,13 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
                                      const string &target, const string &template_sql, const string &params,
                                      const string &returns) {
 	RequireCatalog(catalog, "acl_add_function");
-	vector<string> statements = {
-	    "DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " +
-	        Lit(vname) + " AND \"kind\" = " + Lit(kind),
-	    "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " +
-	        Lit(vname) + " AND \"kind\" = " + Lit(kind),
-	    "INSERT INTO " + catalog->Tbl("functions") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) + ", " + Lit(kind) +
-	        ", " + Lit(form) + ", " + Lit(target) + ", " + Lit(template_sql) + ", NULL, " + Lit(params) + ")"};
+	vector<string> statements = {"DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                                 " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind),
+	                             "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                                 " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind),
+	                             "INSERT INTO " + catalog->Tbl("functions") + " VALUES (" + Lit(vcat) + ", " +
+	                                 Lit(vname) + ", " + Lit(kind) + ", " + Lit(form) + ", " + Lit(target) + ", " +
+	                                 Lit(template_sql) + ", NULL, " + Lit(params) + ")"};
 	// A declared result is the truth and needs no probe: an argument-dependent template cannot be
 	// typed from NULLs anyway, and binding admin SQL at write time touches the sources.
 	vector<std::pair<string, string>> schema;
@@ -1267,8 +1267,7 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 			schema[0].first = "value"; // a scalar declares only its type
 		}
 	} else if (form == "macro") {
-		derived =
-		    catalog->ProbeSchema(template_sql, kind == "scalar", CatalogBackend::DeclaredTypes(params), schema);
+		derived = catalog->ProbeSchema(template_sql, kind == "scalar", CatalogBackend::DeclaredTypes(params), schema);
 	}
 	for (auto &statement : catalog->ColumnSchemaStatements(vcat, vname, kind, schema, derived)) {
 		statements.push_back(statement);
@@ -1346,8 +1345,8 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 	                            vector<string> &statements) {
 		string name_filter = vname.empty() ? string() : " AND \"vname\" = " + Lit(vname);
 		// a declared schema is never re-derived: it is the admin's statement of fact
-		auto declared = read("SELECT \"vname\", \"kind\" FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " +
-		                     Lit(vcat) + " AND \"derived\" = false" + name_filter);
+		auto declared = read("SELECT \"vname\", \"kind\" FROM " + catalog->Tbl("object_columns") +
+		                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"derived\" = false" + name_filter);
 		case_insensitive_set_t declared_keys;
 		for (idx_t row = 0; row < declared->RowCount(); row++) {
 			declared_keys.insert(declared->GetValue(0, row).ToString() + "\x1f" +
@@ -1381,10 +1380,9 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 			auto params = macros->GetValue(3, row);
 			vector<std::pair<string, string>> schema;
 			bool derived = !sql.IsNull() &&
-			               catalog->ProbeSchema(sql.ToString(), kind == "scalar",
-			                                    CatalogBackend::DeclaredTypes(params.IsNull() ? string()
-			                                                                                  : params.ToString()),
-			                                    schema);
+			               catalog->ProbeSchema(
+			                   sql.ToString(), kind == "scalar",
+			                   CatalogBackend::DeclaredTypes(params.IsNull() ? string() : params.ToString()), schema);
 			for (auto &statement : catalog->ColumnSchemaStatements(vcat, object, kind, schema, derived)) {
 				statements.push_back(statement);
 			}
