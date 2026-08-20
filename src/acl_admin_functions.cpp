@@ -249,10 +249,11 @@ void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &resu
 		auto alias = RequiredArg(args, 1, row, "acl_add_schema_alias", "alias path");
 		auto phys = RequiredArg(args, 2, row, "acl_add_schema_alias", "phys path");
 		auto &store = StoreOf(state);
-		if (!AllowWrite(store, vcat, alias, "schema", OptionalArg(args, 3, row, ""))) {
+		if (!AllowWrite(store, vcat, alias, "schema", OptionalArg(args, 4, row, ""))) {
 			continue;
 		}
 		store.CatalogAddSchemaAlias(vcat, alias, phys);
+		SetInlineComment(store, vcat, alias, "schema", OptionalArg(args, 3, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -816,7 +817,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_add_relation", {{v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
 	                   AclAddRelationFunc);
 	register_admin_set("acl_add_view", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}}, AclAddViewFunc);
-	register_admin_set("acl_add_schema_alias", {{v, v, v}, {v, v, v, v}}, AclAddSchemaAliasFunc);
+	register_admin_set("acl_add_schema_alias", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclAddSchemaAliasFunc);
 	register_admin_set("acl_add_table_function",
 	                   {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
 	                   AclAddTableFunctionFunc);

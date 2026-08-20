@@ -598,8 +598,11 @@ struct CatalogBackend {
 		           : Tbl("relation_columns");
 	}
 	string AliasesSource(const Principal &principal) {
+		// the driver contract keeps its alias-shaped slot (a platform expresses aliases, not comments),
+		// so table mode projects the schema table into the same three columns
 		return function_mode ? Slot("schema_aliases") + "(" + ListLit(GrantedCatalogs(principal)) + ")"
-		                     : Tbl("schema_aliases");
+		                     : "(SELECT \"vcat\", \"path\" AS \"alias_path\", \"phys_path\" FROM " + Tbl("schemas") +
+		                           " WHERE \"phys_path\" IS NOT NULL)";
 	}
 	string FunctionsSource(const Principal &principal, const vector<string> &names) {
 		return function_mode
@@ -1386,6 +1389,16 @@ struct CatalogBackend {
 		        "(\"vcat\" VARCHAR, \"vname\" VARCHAR, \"kind\" VARCHAR, \"pos\" INTEGER, \"name\" VARCHAR,"
 		        " \"type\" VARCHAR, \"comment\" VARCHAR, \"derived\" BOOLEAN,"
 		        " PRIMARY KEY (\"vcat\", \"vname\", \"kind\", \"pos\"))",
+		    // spec 014 (schema v4): a schema is an object of the catalog, not just a prefix rule - it
+		    // carries a comment, and `phys_path` says which kind it is: non-NULL = a live alias that
+		    // resolves through, NULL = a schema whose content is the catalog's own relation records
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("schemas") +
+		        "(\"vcat\" VARCHAR, \"path\" VARCHAR, \"phys_path\" VARCHAR, \"comment\" VARCHAR,"
+		        " PRIMARY KEY (\"vcat\", \"path\"))",
+		    "INSERT INTO " + Tbl("schemas") +
+		        "(\"vcat\", \"path\", \"phys_path\") SELECT a.\"vcat\", a.\"alias_path\", a.\"phys_path\" FROM " +
+		        Tbl("schema_aliases") + " a WHERE NOT EXISTS (SELECT 1 FROM " + Tbl("schemas") +
+		        " s WHERE s.\"vcat\" = a.\"vcat\" AND s.\"path\" = a.\"alias_path\")",
 		    "ALTER TABLE " + Tbl("relations") + " ADD COLUMN IF NOT EXISTS \"comment\" VARCHAR",
 		    // spec 011 (schema v3): a grant carries its own policy, not only capabilities - an RLS
 		    // predicate and a column list that narrow the object for this role (and supply values on
@@ -1398,9 +1411,9 @@ struct CatalogBackend {
 		    // the declared signature ("name TYPE, …"): it makes a probe meaningful (typed NULLs) and,
 		    // together with a declared result, unnecessary
 		    "ALTER TABLE " + Tbl("functions") + " ADD COLUMN IF NOT EXISTS \"params\" VARCHAR",
-		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '3' WHERE NOT EXISTS (SELECT 1 FROM " +
+		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '4' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
-		    "UPDATE " + Tbl("meta") + " SET \"value\" = '3' WHERE \"key\" = 'schema_version' AND \"value\" < '3'",
+		    "UPDATE " + Tbl("meta") + " SET \"value\" = '4' WHERE \"key\" = 'schema_version' AND \"value\" < '4'",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'policy_version')",
 		};
@@ -1570,10 +1583,28 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 
 void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path) {
 	RequireCatalog(catalog, "acl_add_schema_alias");
-	catalog->Write({"DELETE FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                    " AND \"alias_path\" = " + Lit(alias_path),
-	                "INSERT INTO " + catalog->Tbl("schema_aliases") + " VALUES (" + Lit(vcat) + ", " + Lit(alias_path) +
-	                    ", " + Lit(phys_path) + ")"});
+	// a schema is one row either way (spec 014): with a physical path it is a live alias, without one
+	// it is a schema whose content is the catalog's own records. The comment survives a redefinition.
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto where = " WHERE \"vcat\" = " + Lit(vcat) + " AND \"path\" = " + Lit(alias_path);
+		auto current = read("SELECT \"comment\" FROM " + catalog->Tbl("schemas") + where);
+		string comment = "NULL";
+		if (current->RowCount() > 0 && !current->GetValue(0, 0).IsNull()) {
+			comment = Lit(current->GetValue(0, 0).ToString());
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("schemas") + where);
+		statements.push_back("INSERT INTO " + catalog->Tbl("schemas") + " VALUES (" + Lit(vcat) + ", " +
+		                     Lit(alias_path) + ", " + (phys_path.empty() ? "NULL" : Lit(phys_path)) + ", " + comment +
+		                     ")");
+		// the legacy table is kept in step for one version, so a rollback still resolves
+		statements.push_back("DELETE FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"alias_path\" = " + Lit(alias_path));
+		if (!phys_path.empty()) {
+			statements.push_back("INSERT INTO " + catalog->Tbl("schema_aliases") + " VALUES (" + Lit(vcat) + ", " +
+			                     Lit(alias_path) + ", " + Lit(phys_path) + ")");
+		}
+	});
 }
 
 void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
@@ -1666,6 +1697,15 @@ void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, con
 			                     " AND \"kind\" = " + Lit(kind) + " AND \"name\" = " + Lit(column));
 			return;
 		}
+		if (kind == "schema") {
+			auto where = " WHERE \"vcat\" = " + Lit(vcat) + " AND \"path\" = " + Lit(vname);
+			auto exists = read("SELECT 1 FROM " + catalog->Tbl("schemas") + where);
+			if (exists->RowCount() == 0) {
+				throw BinderException("acl admin: schema \"%s.%s\" does not exist", vcat, vname);
+			}
+			statements.push_back("UPDATE " + catalog->Tbl("schemas") + " SET \"comment\" = " + value + where);
+			return;
+		}
 		auto table = kind == "relation" ? "relations" : "functions";
 		auto where = " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
 		             (kind == "relation" ? string() : " AND \"kind\" = " + Lit(kind));
@@ -1750,7 +1790,8 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 			                      "drop those grants too",
 			                      vcat, StringUtil::Join(roles, ", "));
 		}
-		for (auto table : {"relations", "relation_columns", "schema_aliases", "functions", "object_columns"}) {
+		for (auto table :
+		     {"relations", "relation_columns", "schemas", "schema_aliases", "functions", "object_columns"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
 		}
 		if (cascade) {
@@ -1766,11 +1807,12 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 	RequireCatalog(catalog, "acl_drop_schema_alias");
 	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
 	                            vector<string> &statements) {
-		auto exists = read("SELECT 1 FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                   " AND \"alias_path\" = " + Lit(alias_path));
+		auto where = " WHERE \"vcat\" = " + Lit(vcat) + " AND \"path\" = " + Lit(alias_path);
+		auto exists = read("SELECT 1 FROM " + catalog->Tbl("schemas") + where);
 		if (exists->RowCount() == 0) {
-			throw BinderException("acl admin: schema alias \"%s.%s\" does not exist", vcat, alias_path);
+			throw BinderException("acl admin: schema \"%s.%s\" does not exist", vcat, alias_path);
 		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("schemas") + where);
 		statements.push_back("DELETE FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"alias_path\" = " + Lit(alias_path));
 	});
@@ -1935,9 +1977,9 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 void PolicyStore::CatalogAlterSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path) {
 	RequireCatalog(catalog, "acl_alter_schema_alias");
 	RequireRow(*catalog,
-	           "SELECT 1 FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
-	               " AND \"alias_path\" = " + Lit(alias_path),
-	           "schema alias \"" + vcat + "." + alias_path + "\"");
+	           "SELECT 1 FROM " + catalog->Tbl("schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
+	               " AND \"path\" = " + Lit(alias_path),
+	           "schema \"" + vcat + "." + alias_path + "\"");
 	CatalogAddSchemaAlias(vcat, alias_path, phys_path);
 }
 
@@ -2124,8 +2166,8 @@ bool PolicyStore::CatalogObjectExists(const string &vcat, const string &vname, c
 	} else if (kind == "issuer") {
 		sql = "SELECT 1 FROM " + catalog->Tbl("issuers") + " WHERE \"issuer\" = " + Lit(vname);
 	} else if (kind == "schema") {
-		sql = "SELECT 1 FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
-		      " AND \"alias_path\" = " + Lit(vname);
+		sql = "SELECT 1 FROM " + catalog->Tbl("schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
+		      " AND \"path\" = " + Lit(vname);
 	} else if (kind == "relation") {
 		sql = "SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 		      " AND \"vname\" = " + Lit(vname);
@@ -2145,9 +2187,9 @@ void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vn
 	    "SELECT 'relation' AS kind FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 	    " AND \"vname\" = " + Lit(vname) + " UNION ALL SELECT \"kind\" FROM " + catalog->Tbl("functions") +
 	    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
-	    " UNION ALL SELECT CASE WHEN \"alias_path\" = " + Lit(vname) + " THEN 'alias' ELSE 'relation' END FROM " +
-	    catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) + " AND (\"alias_path\" = " + Lit(vname) +
-	    " OR substr(" + Lit(vname) + ", 1, length(\"alias_path\") + 1) = \"alias_path\" || '.')");
+	    " UNION ALL SELECT CASE WHEN \"path\" = " + Lit(vname) + " THEN 'alias' ELSE 'relation' END FROM " +
+	    catalog->Tbl("schemas") + " WHERE \"vcat\" = " + Lit(vcat) + " AND (\"path\" = " + Lit(vname) + " OR substr(" +
+	    Lit(vname) + ", 1, length(\"path\") + 1) = \"path\" || '.')");
 	if (result->RowCount() == 0) {
 		throw BinderException("acl admin: object \"%s.%s\" does not exist", vcat, vname);
 	}

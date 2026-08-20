@@ -498,13 +498,16 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 		comment_clause(s, comment);
 		return MakeAdminCall("acl_create_catalog", {Value(vcat), Value(comment), Value(mode)});
 	}
-	if (s.Accept("schema")) { // CREATE VIRTUAL SCHEMA v.alias AS <phys path>
+	if (s.Accept("schema")) { // CREATE VIRTUAL SCHEMA v.path AS <phys path> [COMMENT '…']
 		if_not_exists(s);
-		string vcat, alias;
-		SplitVirtual(s.Dotted("a virtual alias"), vcat, alias);
+		string vcat, path;
+		SplitVirtual(s.Dotted("a virtual schema path"), vcat, path);
 		s.Expect("as");
 		auto phys = s.Name("a physical schema path");
-		return MakeAdminCall("acl_add_schema_alias", {Value(vcat), Value(alias), Value(phys), Value(mode)});
+		string comment;
+		comment_clause(s, comment);
+		return MakeAdminCall("acl_add_schema_alias",
+		                     {Value(vcat), Value(path), Value(phys), Value(comment), Value(mode)});
 	}
 	if (s.Accept("view")) { // CREATE VIRTUAL VIEW v.n [(col TYPE, …)] [COMMENT '…'] AS <sql>
 		if_not_exists(s);
@@ -881,14 +884,15 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		throw BinderException("acl admin: unknown ALTER VIRTUAL target");
 	}
 	if (StringUtil::CIEquals(keyword, "comment")) {
-		// COMMENT ON VIRTUAL TABLE|VIEW|TABLE FUNCTION|SCALAR v.n [COLUMN c] IS '...'
+		// COMMENT ON VIRTUAL TABLE|VIEW|SCHEMA|TABLE FUNCTION|SCALAR v.n [COLUMN c] IS '...'
 		s.Expect("on");
 		s.Expect("virtual");
-		bool scalar = s.Accept("scalar");
+		bool schema = s.Accept("schema");
+		bool scalar = !schema && s.Accept("scalar");
 		bool table_function = false;
-		if (!scalar && s.Accept("table")) {
+		if (!schema && !scalar && s.Accept("table")) {
 			table_function = s.Accept("function");
-		} else if (!scalar) {
+		} else if (!schema && !scalar) {
 			s.Expect("view");
 		}
 		string vcat, vname;
@@ -899,7 +903,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		}
 		s.Expect("is");
 		auto comment = s.Quoted("comment");
-		auto kind = scalar ? "scalar" : (table_function ? "table" : "relation");
+		auto kind = schema ? "schema" : (scalar ? "scalar" : (table_function ? "table" : "relation"));
 		return MakeAdminCall("acl_comment", {Value(vcat), Value(vname), Value(kind), Value(column), Value(comment)});
 	}
 	if (StringUtil::CIEquals(keyword, "analyze")) {

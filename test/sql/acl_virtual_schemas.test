@@ -1,0 +1,179 @@
+# name: test/sql/acl_virtual_schemas.test
+# description: virtual schemas as objects of the catalog (spec 014) - one table for both kinds, a
+#   comment of their own, and the rows of a previous version migrating in place
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 100), (2, 'globex', 200);
+
+statement ok
+CREATE TABLE phys.main.audit(id INT, note VARCHAR);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN;
+
+# --- a schema is an object, with a comment of its own ---------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.main COMMENT 'raw layer, as-is';
+
+query III
+SELECT path, phys_path, comment FROM aclcat.acl.schemas WHERE vcat = 'sales';
+----
+raw	phys.main	raw layer, as-is
+
+# it still resolves as the live alias it is
+query I
+ACL ROLE "analyst" SELECT count(*) FROM raw.orders_physical;
+----
+2
+
+# a table created physically afterwards is visible at once: that is what "live" means
+statement ok
+CREATE TABLE phys.main.late(id INT);
+
+statement ok
+INSERT INTO phys.main.late VALUES (7);
+
+query I
+ACL ROLE "analyst" SELECT id FROM raw.late;
+----
+7
+
+# --- comments are set and changed like any other object's -----------------------------------------
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL SCHEMA sales.raw IS 'documented';
+
+query I
+SELECT comment FROM aclcat.acl.schemas WHERE path = 'raw';
+----
+documented
+
+# retargeting the schema keeps its comment, exactly as ALTER on a view does (spec 010)
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA sales.raw SET PHYS phys.main;
+
+query II
+SELECT phys_path, comment FROM aclcat.acl.schemas WHERE path = 'raw';
+----
+phys.main	documented
+
+statement error
+ACL ADMIN COMMENT ON VIRTUAL SCHEMA sales.nothere IS 'x';
+----
+<REGEX>:.*schema "sales.nothere" does not exist.*
+
+# --- existence semantics reach schemas too (spec 013) ----------------------------------------------
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.main;
+----
+<REGEX>:.*already exists.*
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA IF NOT EXISTS sales.raw AS phys.main;
+
+query I
+SELECT comment FROM aclcat.acl.schemas WHERE path = 'raw';
+----
+documented
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCHEMA IF EXISTS sales.nothere;
+
+# --- dropping ---------------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.second AS phys.main;
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCHEMA sales.second;
+
+query I
+SELECT count(*) FROM aclcat.acl.schemas WHERE path = 'second';
+----
+0
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM second.orders_physical;
+----
+<REGEX>:.*no access to object.*
+
+# dropping the catalog takes its schemas with it
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG hr;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA hr.people AS phys.main;
+
+statement ok
+ACL ADMIN DROP VIRTUAL CATALOG hr CASCADE;
+
+query I
+SELECT count(*) FROM aclcat.acl.schemas WHERE vcat = 'hr';
+----
+0
+
+# --- a catalog written by the previous version keeps resolving --------------------------------------
+# the alias rows lived in acl.schema_aliases; init migrates them into acl.schemas in place
+
+statement ok
+ATTACH ':memory:' AS oldcat;
+
+statement ok
+CREATE SCHEMA oldcat.acl;
+
+statement ok
+CREATE TABLE oldcat.acl.schema_aliases(vcat VARCHAR, alias_path VARCHAR, phys_path VARCHAR, PRIMARY KEY (vcat, alias_path));
+
+statement ok
+INSERT INTO oldcat.acl.schema_aliases VALUES ('sales', 'legacy', 'phys.main');
+
+statement ok
+SELECT acl_use_db('oldcat', 'acl', true);
+
+query II
+SELECT path, phys_path FROM oldcat.acl.schemas WHERE path = 'legacy';
+----
+legacy	phys.main
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE ROLE reader;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE reader WITH (select) MAIN;
+
+query I
+ACL ROLE "reader" SELECT count(*) FROM legacy.orders_physical;
+----
+2
