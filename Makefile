@@ -4,6 +4,18 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=acl
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
+# Local integration-test environment config (specs/005); see .env.example
+-include .env
+
+# Integration builds (ACL_INTEGRATION=1) add the source scanners; on macOS their build dependencies
+# come from Homebrew (brew install libpq croaring) and cmake needs to be pointed at them
+ifdef ACL_INTEGRATION
+ifeq ($(shell uname -s),Darwin)
+EXT_FLAGS := -DPostgreSQL_ROOT=$(shell brew --prefix libpq 2>/dev/null) \
+    -Droaring_DIR=$(shell brew --prefix croaring 2>/dev/null)/lib/cmake/roaring
+endif
+endif
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
@@ -39,8 +51,13 @@ build/test/%: test/cpp/%.cpp test/cpp/acl_test_util.hpp \
 	@mkdir -p build/test
 	$(CXX) $(TEST_CPP_FLAGS) $(TEST_CPP_INCLUDES) $< $(TEST_CPP_LINK) -o $@
 
+# Deliberately NOT depending on `release`: in the distribution CI the build runs inside a docker
+# container and the tests on the host, so re-triggering cmake against the container-made cache fails
+# on the path change. Guard on the archives instead (mssql-extension does the same).
 .PHONY: test-cpp test-cpp-run
-test-cpp: release
+test-cpp:
+	@test -f build/release/src/libduckdb_static.a || { \
+		echo "test-cpp: build/release archives missing - run 'GEN=ninja make' first" >&2; exit 1; }
 	@$(MAKE) --no-print-directory test-cpp-run
 
 test-cpp-run: $(TEST_CPP_BINS)
@@ -59,3 +76,45 @@ ifeq ($(findstring wasm,$(DUCKDB_PLATFORM)),)
 test_release: test-cpp
 endif
 endif
+
+# --- Integration environment (specs/005-integration-env) --------------------
+# Real databases in docker (postgres, mysql, sqlserver) + DuckLake on the postgres catalog.
+# Copy .env.example to .env first. Scenarios live in test/sql/integration/ and skip themselves
+# when their scanner or DSN is absent (require / require-env).
+
+ACL_PG_HOST ?= localhost
+ACL_PG_PORT ?= 6432
+ACL_PG_USER ?= acl
+ACL_PG_PASS ?= aclpass
+ACL_PG_DB ?= acltest
+ACL_DUCKLAKE_CATALOG_DB ?= ducklake_catalog
+ACL_MYSQL_HOST ?= localhost
+ACL_MYSQL_PORT ?= 6433
+ACL_MYSQL_USER ?= acl
+ACL_MYSQL_PASS ?= aclpass
+ACL_MYSQL_DB ?= acltest
+
+DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
+
+.PHONY: docker-up docker-down docker-status test-integration
+# --wait would treat the one-shot sqlserver-init container as a failure; wait on the servers, then
+# run the init separately (it only starts once sqlserver is healthy anyway)
+docker-up:
+	$(DOCKER_COMPOSE) up -d --wait postgres mysql sqlserver
+	$(DOCKER_COMPOSE) up -d sqlserver-init
+
+docker-down:
+	$(DOCKER_COMPOSE) down
+
+docker-status:
+	$(DOCKER_COMPOSE) ps
+
+# Runs the integration scenarios against the docker databases. Needs an integration build first:
+#   ACL_INTEGRATION=1 GEN=ninja make
+test-integration:
+	@test -x build/release/test/unittest || { \
+		echo "test-integration: no unittest binary - run 'ACL_INTEGRATION=1 GEN=ninja make' first" >&2; exit 1; }
+	ACL_PG_DSN="dbname=$(ACL_PG_DB) user=$(ACL_PG_USER) password=$(ACL_PG_PASS) host=$(ACL_PG_HOST) port=$(ACL_PG_PORT)" \
+	ACL_DUCKLAKE_DSN="ducklake:postgres:dbname=$(ACL_DUCKLAKE_CATALOG_DB) user=$(ACL_PG_USER) password=$(ACL_PG_PASS) host=$(ACL_PG_HOST) port=$(ACL_PG_PORT)" \
+	ACL_MYSQL_DSN="host=$(ACL_MYSQL_HOST) port=$(ACL_MYSQL_PORT) user=$(ACL_MYSQL_USER) passwd=$(ACL_MYSQL_PASS) db=$(ACL_MYSQL_DB)" \
+	build/release/test/unittest "test/sql/integration/*"

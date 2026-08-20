@@ -1,0 +1,93 @@
+# Integration-test databases for duckdb-acl (specs/005), layout after hugr-lab/mssql-extension.
+#
+# Usage:
+#   cp .env.example .env                                  # once; adjust if ports clash
+#   docker compose -f docker/docker-compose.yml up -d     # start + initialize all databases
+#   docker compose -f docker/docker-compose.yml down      # stop
+#   docker compose -f docker/docker-compose.yml down -v   # stop and remove data
+#
+# Or via the Makefile: make docker-up / docker-down / docker-status.
+#
+# PostgreSQL and MySQL run their init scripts from /docker-entrypoint-initdb.d on first start;
+# SQL Server needs an init container (same pattern as mssql-extension). DuckLake is not a server:
+# the scenarios attach it with the PostgreSQL container as its catalog and a local data path.
+
+services:
+  postgres:
+    image: postgres:18
+    container_name: acl-postgres
+    environment:
+      - POSTGRES_USER=${ACL_PG_USER:-acl}
+      - POSTGRES_PASSWORD=${ACL_PG_PASS:-aclpass}
+      - POSTGRES_DB=${ACL_PG_DB:-acltest}
+    ports:
+      - "${ACL_PG_PORT:-6432}:5432"
+    volumes:
+      - ./init/postgres.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      # postgres:18+ images keep PGDATA in a versioned subdirectory; mount the parent
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ACL_PG_USER:-acl} -d ${ACL_PG_DB:-acltest}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mysql:
+    image: mysql:9
+    container_name: acl-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${ACL_MYSQL_PASS:-aclpass}
+      - MYSQL_DATABASE=${ACL_MYSQL_DB:-acltest}
+      - MYSQL_USER=${ACL_MYSQL_USER:-acl}
+      - MYSQL_PASSWORD=${ACL_MYSQL_PASS:-aclpass}
+    ports:
+      - "${ACL_MYSQL_PORT:-6433}:3306"
+    volumes:
+      - ./init/mysql.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${ACL_MYSQL_PASS:-aclpass}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  sqlserver:
+    # SQL Server 2025 (x64 emulation on ARM64 Macs)
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    container_name: acl-sqlserver
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=${ACL_MSSQL_PASS:-TestPassword1}
+    ports:
+      - "${ACL_MSSQL_PORT:-6434}:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${ACL_MSSQL_PASS:-TestPassword1} -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # init container: applies the SQL Server schema once the server is healthy
+  sqlserver-init:
+    image: mcr.microsoft.com/mssql/server:2025-latest
+    container_name: acl-sqlserver-init
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    volumes:
+      - ./init:/init:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Running SQL Server init script..."
+        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P ${ACL_MSSQL_PASS:-TestPassword1} -C -i /init/sqlserver.sql
+        echo "SQL Server init complete."
+    environment:
+      - ACL_MSSQL_PASS=${ACL_MSSQL_PASS:-TestPassword1}
+
+volumes:
+  postgres-data:
+  mysql-data:
+  sqlserver-data:

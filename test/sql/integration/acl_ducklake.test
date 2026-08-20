@@ -1,0 +1,65 @@
+# name: test/sql/integration/acl_ducklake.test
+# description: ACL over DuckLake (specs/005) - PostgreSQL-backed catalog, per-run data path
+# group: [integration]
+
+require acl
+
+require ducklake
+
+require parquet
+
+require-env ACL_DUCKLAKE_DSN
+
+# the catalog persists the data path across runs while __TEST_DIR__ is per-run: override it
+statement ok
+ATTACH '${ACL_DUCKLAKE_DSN}' AS lake (DATA_PATH '__TEST_DIR__/lake_data', OVERRIDE_DATA_PATH TRUE);
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+# the catalog database persists across runs while the data path does not: recreate the fixture
+# (older snapshots may reference removed files; the scenarios never time-travel)
+statement ok
+ACL ADMIN CREATE OR REPLACE TABLE lake.orders AS SELECT * FROM (VALUES (1, 'acme', 100), (2, 'globex', 200), (3, 'acme', 300)) t(id, tenant, amount);
+
+statement ok
+ACL ADMIN CREATE OR REPLACE TABLE lake.audit_log (id INT, note VARCHAR);
+
+statement ok
+SELECT acl_define_role('analyst', 'tenant=acme');
+
+# SUBQUERY form over a lake table: projection + RLS with the baked tenant claim
+statement ok
+SELECT acl_grant_table('analyst', 'orders', 'lake.main.orders', 'id,amount', 'tenant = acl_claim(''tenant'')', 'select');
+
+query II
+ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
+----
+1	100
+3	300
+
+# RENAME form is writable end-to-end into the lake
+statement ok
+SELECT acl_grant_table('analyst', 'audit', 'lake.main.audit_log', '', '', 'select,insert,update,delete');
+
+statement ok
+ACL ROLE "analyst" INSERT INTO audit VALUES (1, 'created');
+
+query II
+ACL ROLE "analyst" SELECT id, note FROM audit;
+----
+1	created
+
+statement ok
+ACL ROLE "analyst" DELETE FROM audit WHERE id = 1;
+
+query I
+ACL ADMIN SELECT count(*) FROM lake.main.audit_log;
+----
+0
+
+# a direct physical lake name is not a mapped virtual name -> denied
+statement error
+ACL ROLE "analyst" SELECT * FROM lake.main.orders;
+----
+<REGEX>:.*no access to object "lake.main.orders".*

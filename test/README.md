@@ -18,3 +18,14 @@ GEN=ninja make test-cpp
 ```
 `make test` (the release CI target) runs them too on Linux/macOS. The `harness` directory is a runnable
 end-to-end demo against the built loadable extension.
+
+The `sql/integration` directory holds scenarios against live databases (PostgreSQL, MySQL, DuckLake —
+see `specs/005-integration-env/spec.md`). They need the docker environment and an integration build:
+```bash
+cp .env.example .env
+make docker-up
+ACL_INTEGRATION=1 GEN=ninja make     # macOS: brew install libpq croaring first
+make test-integration
+```
+Each scenario skips itself when its scanner or DSN is absent, so the plain suites stay runnable
+without docker.

@@ -30,8 +30,10 @@ src/
   include/                   # acl_extension.hpp (AclExtension : Extension) + one header per module
 test/
   sql/acl.test               # sqllogictest suite (require acl)
+  sql/integration/           # scenarios against live databases (make test-integration; skip w/o env)
   cpp/                       # standalone C++ invariant tests (make test-cpp), one main() per file
   harness/                   # runnable end-to-end demo (demo.sql + run.sh)
+docker/                      # integration databases: compose + per-DB init SQL (specs/005)
 specs/                       # one lightweight spec per feature, NNN-slug/spec.md (see specs/README.md)
 design/                      # LOCAL, gitignored: numbered research topics NNN-topic/ (our scratch)
 ```
@@ -49,6 +51,12 @@ build/release/test/unittest test/sql/acl.test    # run the suite
 GEN=ninja make test                 # same, via the ci-tools target
 GEN=ninja make test-cpp             # standalone C++ invariant tests (specs/002)
 test/harness/run.sh                 # end-to-end demo against the built extension
+
+# integration (specs/005): real DBs in docker + scanner-backed scenarios
+cp .env.example .env                # once
+make docker-up                      # postgres + mysql + sqlserver (initialized)
+ACL_INTEGRATION=1 GEN=ninja make    # build incl. postgres_scanner/ducklake (macOS: brew install libpq croaring)
+make test-integration               # scenarios in test/sql/integration/ (skip w/o scanner or DSN)
 ```
 
 Build outputs: CLI `build/release/duckdb`, loadable

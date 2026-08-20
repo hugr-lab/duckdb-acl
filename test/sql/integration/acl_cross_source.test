@@ -1,0 +1,61 @@
+# name: test/sql/integration/acl_cross_source.test
+# description: one principal over two live sources (specs/005) - PostgreSQL and DuckLake behind one
+#   virtual namespace: cross-source join and cross-source DML through virtual names only
+# group: [integration]
+
+require acl
+
+require postgres_scanner
+
+require ducklake
+
+require parquet
+
+require-env ACL_PG_DSN
+
+require-env ACL_DUCKLAKE_DSN
+
+statement ok
+ATTACH '${ACL_PG_DSN}' AS pg (TYPE postgres);
+
+# the catalog persists the data path across runs while __TEST_DIR__ is per-run: override it
+statement ok
+ATTACH '${ACL_DUCKLAKE_DSN}' AS lake (DATA_PATH '__TEST_DIR__/lake_data', OVERRIDE_DATA_PATH TRUE);
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+ACL ADMIN CREATE OR REPLACE TABLE lake.order_notes AS SELECT * FROM (VALUES (1, 'rush'), (2, 'bulk'), (3, 'rush')) t(order_id, note);
+
+statement ok
+SELECT acl_define_role('analyst', 'tenant=acme');
+
+# the same virtual namespace spans both sources
+statement ok
+SELECT acl_grant_table('analyst', 'orders', 'pg.public.orders', 'id,amount', 'tenant = acl_claim(''tenant'')', 'select');
+
+statement ok
+SELECT acl_grant_table('analyst', 'notes', 'lake.main.order_notes', '', '', 'select');
+
+statement ok
+SELECT acl_grant_table('analyst', 'audit', 'pg.public.audit_log', '', '', 'select,insert,delete');
+
+# cross-source join through virtual names only; RLS on the postgres side still applies
+query III
+ACL ROLE "analyst" SELECT o.id, o.amount, n.note FROM orders o JOIN notes n ON o.id = n.order_id ORDER BY o.id;
+----
+1	100	rush
+3	300	rush
+
+# cross-source DML: INSERT into postgres selecting from the lake, all through virtual names
+statement ok
+ACL ROLE "analyst" INSERT INTO audit SELECT order_id, note FROM notes WHERE note = 'bulk';
+
+query II
+ACL ADMIN SELECT id, note FROM pg.public.audit_log;
+----
+2	bulk
+
+statement ok
+ACL ROLE "analyst" DELETE FROM audit WHERE id = 2;
