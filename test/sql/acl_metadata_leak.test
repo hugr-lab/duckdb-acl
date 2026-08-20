@@ -1,0 +1,108 @@
+# name: test/sql/acl_metadata_leak.test
+# description: metadata surfaces under a principal (spec 010 part 3, step 1) - duckdb exposes the same
+#   catalog three ways (table function, view, information_schema), and a principal's query must not
+#   enumerate the physical catalog through any of them
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT);
+
+statement ok
+CREATE TABLE phys.main.secrets(ssn VARCHAR);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN;
+
+# what the role may see: exactly the one object it was granted
+query I
+ACL ROLE "analyst" SELECT count(*) FROM orders;
+----
+0
+
+# --- the same catalog, three surfaces, none of them a way around the ACL ---------------------------
+
+# 1. the table function - this one used to return every table of every attached database
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables();
+----
+<REGEX>:.*table function "duckdb_tables" is not allowed.*
+
+# 2. the view of the same name
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables;
+----
+<REGEX>:.*no access to object "duckdb_tables".*
+
+# 3. information_schema
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM information_schema.tables;
+----
+<REGEX>:.*no access to object "information_schema.tables".*
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM information_schema.columns;
+----
+<REGEX>:.*no access to object "information_schema.columns".*
+
+# the neighbours of duckdb_tables enumerate just as much
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_columns();
+----
+<REGEX>:.*table function "duckdb_columns" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_databases();
+----
+<REGEX>:.*table function "duckdb_databases" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_secrets();
+----
+<REGEX>:.*table function "duckdb_secrets" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT ssn FROM pragma_table_info('phys.main.secrets');
+----
+<REGEX>:.*table function "pragma_table_info" is not allowed.*
+
+# --- the native context is unchanged: that is what it is for ---------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE platform;
+
+statement ok
+SELECT acl_grant_admin('platform', 'passthrough');
+
+query I
+ACL ROLE "platform" ACL NATIVE SELECT count(*) > 0 FROM duckdb_tables();
+----
+true
+
+# and so is a plain connection with no prefix at all - the gateway is the boundary, not this list
+query I
+SELECT count(*) > 0 FROM duckdb_tables();
+----
+true

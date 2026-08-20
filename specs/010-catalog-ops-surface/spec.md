@@ -1,7 +1,8 @@
 # Spec 010: operating the virtual catalog — DROP, metadata, introspection
 
-- **Status**: in progress — parts 1 (DROP), 2 (metadata) and 2b (column renames) implemented;
-  part 3 (introspection + `duckdb_*` substitution) follows as its own PR against this spec
+- **Status**: in progress — parts 1 (DROP), 2 (metadata), 2b (column renames) and the first step of
+  part 3 (closing the metadata leak) implemented; the `acl_*` listings and the filtered `duckdb_*`
+  substitution follow
 - **Date**: 2026-08-20
 - **Author**: hugr-lab
 
@@ -128,6 +129,24 @@ ACL SHOW CATALOGS | RELATIONS IN sales | COLUMNS OF sales.orders | GRANTS FOR RO
 compiled to the same functions with the scope's catalogs baked in as a filter — same authorization
 path as every other management statement, no exit into the native context.
 
+### 3b. Three surfaces, and the leak closed first
+
+duckdb exposes the same catalog **three ways**, and under a principal they behaved differently:
+
+| surface | before | now |
+| --- | --- | --- |
+| `duckdb_tables()` (table function) | **every table of every attached database** | refused by the function gate |
+| `duckdb_tables` (view of the same name) | refused — an unknown virtual name | unchanged |
+| `information_schema.tables` (view) | refused — likewise | unchanged |
+
+The view forms were closed by accident: the rewriter resolves a base table reference as a virtual
+name and finds none. The function form went through the function seam, where nothing had named it.
+The whole `duckdb_*` / `pragma_*` metadata family is now on the denylist of
+`DefaultDeniedFunctions()`, so all three surfaces refuse before the substitution below exists —
+tooling stays blind for now, which is the lesser of the two evils while it is being built. The native
+context (`ACL NATIVE`, passthrough) and an unprefixed connection are unchanged: the gateway is the
+boundary, not this list.
+
 ### 4. `duckdb_*` / `information_schema` in the virtual context
 
 In a principal's query these are rewritten into subqueries over the introspection functions with the
@@ -169,6 +188,10 @@ deny of spec 009 plus these rewrites.
 - `acl_introspection.test`: `acl_*` functions in memory and catalog modes, `ACL SHOW` under a
   catalog-scoped manage (only its catalogs), the function-driver's honest error for a missing `list_*`
   slot, `acl_status()`.
+- `acl_metadata_leak.test` (23 assertions, **implemented**): all three surfaces refused under a
+  principal — the table function, the view of the same name and `information_schema` — plus their
+  neighbours (`duckdb_columns()`, `duckdb_databases()`, `duckdb_secrets()`, `pragma_table_info`),
+  while `ACL NATIVE` under a passthrough scope and an unprefixed connection still enumerate.
 - `acl_virtual_catalog.test`: a principal's `duckdb_tables()`/`information_schema.columns` showing
   only granted objects and only visible columns; masked columns absent; no physical names; native
   context still unfiltered; the pre-existing physical-catalog leak refused.

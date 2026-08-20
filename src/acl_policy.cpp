@@ -59,7 +59,18 @@ case_insensitive_set_t DefaultDeniedFunctions() {
 	        "mysql_scan", "mysql_execute", "mssql_query", "mssql_scan", "mssql_execute", "sqlite_scan", "sqlite_query",
 	        "iceberg_scan", "iceberg_metadata", "delta_scan", "query", "query_table",
 	        // session / secret state
-	        "getvariable", "which_secret", "current_setting", "current_query"};
+	        "getvariable", "which_secret", "current_setting", "current_query",
+	        // metadata surfaces: they enumerate every attached database, so under a principal they are
+	        // a listing of the physical catalog the ACL exists to hide. Denied until spec 010 part 3
+	        // replaces them with a listing filtered by the principal's grants - a denial keeps tooling
+	        // blind, a leak keeps it informed about other people's tables.
+	        "duckdb_databases", "duckdb_schemas", "duckdb_tables", "duckdb_views", "duckdb_columns",
+	        "duckdb_constraints", "duckdb_indexes", "duckdb_functions", "duckdb_types", "duckdb_sequences",
+	        "duckdb_secrets", "duckdb_settings", "duckdb_extensions", "duckdb_dependencies", "duckdb_temporary_files",
+	        "duckdb_memory", "duckdb_optimizers", "duckdb_variables", "duckdb_log_contexts", "duckdb_logs",
+	        "pragma_database_size", "pragma_show", "pragma_storage_info", "pragma_table_info", "pragma_metadata_info",
+	        "pragma_user_agent", "pragma_version", "show_databases", "show_tables", "show_tables_expanded",
+	        "sql_auto_complete", "test_all_types"};
 }
 
 unique_ptr<SelectStatement> PolicyStore::InstantiateSelect(const string &sql, const ParserOptions &options) {
