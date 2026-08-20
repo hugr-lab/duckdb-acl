@@ -735,8 +735,15 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			s.Expect("to");
 			s.Expect("role");
 			auto role = s.Word("a role name");
-			string caps, rls, columns, comment;
+			string caps, rls, columns, comment, into;
+			bool virtual_only = false;
 			GrantPolicyClauses(s, caps, rls, columns);
+			if (s.Accept("into")) { // where this role creates - the grant decides, not the schema
+				into = s.Name("a physical schema path");
+			} else if (s.Accept("virtual")) {
+				s.Expect("only");
+				virtual_only = true;
+			}
 			if (!rls.empty() || !columns.empty()) {
 				throw BinderException("acl admin: a schema grant carries capabilities only - RLS and COLUMNS belong "
 				                      "to the catalog or to the object (spec 015)");
@@ -744,8 +751,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			if (s.Accept("comment")) {
 				comment = s.Quoted("comment");
 			}
-			return MakeAdminCall("acl_grant_schema",
-			                     {Value(role), Value(vcat), Value(path), Value(caps), Value(comment)});
+			return MakeAdminCall("acl_grant_schema", {Value(role), Value(vcat), Value(path), Value(caps),
+			                                          Value(comment), Value(into), Value::BOOLEAN(virtual_only)});
 		}
 		// GRANT TABLE|VIEW|OBJECT v.n TO ROLE r [CAPS '…'] [RLS '…'] [COLUMNS '…'] - the grant's own
 		// policy (spec 011): it narrows the object for this role, it never widens it

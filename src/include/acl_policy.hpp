@@ -60,6 +60,17 @@ struct TablePolicy {
 	case_insensitive_set_t write_columns;
 };
 
+//! Where a principal's DDL lands (spec 016): the virtual schema the written name belongs to, the
+//! physical schema its grant creates in, and whether the catalog needs a record for what is made.
+struct DdlTarget {
+	string vcat;        // the virtual catalog
+	string schema_path; // the virtual schema inside it
+	string phys_schema; // `db.schema` the object is created in / dropped from
+	bool needs_record;  // an expansion shows only its records, so a new object needs one
+	bool virtual_only;  // the role may register existing objects, never create them
+	string origin;      // the expansion's source, stamped on the record so REFRESH owns it too
+};
+
 //! Whether a function reference is a scalar/aggregate (expression position) or a table function (FROM)
 enum class FunctionKind : uint8_t { SCALAR, TABLE };
 
@@ -184,10 +195,20 @@ struct PolicyStore {
 	void CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
 	                        const string &view_sql, const string &rls, const vector<std::pair<string, string>> &columns,
 	                        const string &returns = string());
+	//! Whether `db.schema.name` exists physically - what VIRTUAL ONLY checks before recording it
+	bool PhysicalObjectExists(const string &phys);
+	//! Record an object a principal's own DDL just created (spec 016): alias form, the schema's
+	//! origin, nothing else to choose
+	void CatalogRegisterCreated(const string &vcat, const string &vname, const string &phys,
+	                            const string &origin = string());
+	//! Resolve where a principal's `CREATE`/`DROP` of `vname` lands, requiring `capability`
+	//! (`create` or `drop`) on the virtual schema that owns the name (spec 016). False = no such
+	//! schema for this principal; a schema without the capability throws.
+	bool ResolveDdlTarget(const Principal &principal, const string &vname, const string &capability, DdlTarget &out);
 	//! Grant/revoke one schema to a role (spec 015): capabilities only, `manage` refused. Both
 	//! rematerialise the subtree, so the stored rows always show what a role effectively has.
 	void CatalogGrantSchema(const string &role, const string &vcat, const string &path, const string &caps_json,
-	                        const string &comment = string());
+	                        const string &comment = string(), const string &into = string(), bool virtual_only = false);
 	void CatalogRevokeSchema(const string &role, const string &vcat, const string &path);
 	//! "Rebuild this subtree from the nearest ancestor that states capabilities" - idempotent, so
 	//! grants, schema DDL and drift repair are all the same call (spec 015)
