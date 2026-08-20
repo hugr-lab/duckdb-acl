@@ -399,7 +399,7 @@ private:
 				return; // a CTE reference, not a catalog object
 			}
 			auto key = VirtualKey(base.GetQualifiedName());
-			if (auto surface = MetadataSurface(key)) {
+			if (auto surface = MetadataSurfaceOf(key)) {
 				// `FROM information_schema.tables` / `FROM duckdb_tables` - the view forms
 				auto alias = base.alias.empty() ? base.Table() : base.alias;
 				ref = BuildMetadataSubquery(surface, alias);
@@ -487,8 +487,12 @@ private:
 			WrapWithGrantPolicy(ref, policy, alias);
 			return;
 		}
-		if (auto surface = MetadataSurface(vname)) {
-			// `FROM duckdb_tables()` - the function form of the same catalog
+		if (auto surface = MetadataSurfaceOf(vname)) {
+			// `FROM duckdb_tables()` - the function form of the same catalog. None of these take
+			// arguments, and quietly dropping one would answer a question nobody asked.
+			if (!function.GetArguments().empty()) {
+				Deny("\"" + vname + "\" takes no arguments");
+			}
 			ref = BuildMetadataSubquery(surface, tf.alias.empty() ? Identifier(vname) : tf.alias);
 			return;
 		}
@@ -598,24 +602,6 @@ private:
 		sub->column_name_alias = std::move(original.column_name_alias);
 		sub->sample = std::move(original.sample);
 		return std::move(sub);
-	}
-
-	//! duckdb exposes the same catalog as a table function, as a view of the same name and through
-	//! `information_schema` (spec 010 part 3). All three are the same question - "what is in this
-	//! catalog?" - and under a principal all three must answer with the principal's catalog.
-	static const char *MetadataSurface(const string &name) {
-		static const case_insensitive_map_t<string> SURFACES = {
-		    {"information_schema.tables", "tables"},
-		    {"information_schema.columns", "columns"},
-		    {"information_schema.schemata", "schemata"},
-		    {"duckdb_tables", "tables"},
-		    {"duckdb_views", "tables"},
-		    {"duckdb_columns", "columns"},
-		    {"duckdb_schemas", "schemata"},
-		    {"duckdb_databases", "databases"},
-		};
-		auto entry = SURFACES.find(name);
-		return entry == SURFACES.end() ? nullptr : entry->second.c_str();
 	}
 
 	//! Replace a metadata surface with the principal's own catalog in the same shape

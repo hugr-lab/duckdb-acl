@@ -1804,10 +1804,25 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 
 } // namespace
 
+namespace {
+
+//! A virtual object may not take a metadata surface's name: the surface wins when the name is
+//! written, so the object would be listed and unreachable (spec 010 part 3).
+void RequireNotReserved(const string &vname) {
+	if (MetadataSurfaceOf(vname)) {
+		throw BinderException("acl admin: \"%s\" is a metadata surface, so it cannot name a virtual object - a "
+		                      "principal's query resolves that name to the catalog listing",
+		                      vname);
+	}
+}
+
+} // namespace
+
 void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
                                      const string &view_sql, const string &rls,
                                      const vector<std::pair<string, string>> &columns, const string &returns) {
 	RequireCatalog(catalog, "acl_add_relation");
+	RequireNotReserved(vname);
 	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
 	                            vector<string> &statements) {
 		auto existing = read("SELECT \"comment\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -2145,6 +2160,7 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
                                      const string &target, const string &template_sql, const string &params,
                                      const string &returns) {
 	RequireCatalog(catalog, "acl_add_function");
+	RequireNotReserved(vname);
 	vector<string> statements = {"DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                                 " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind),
 	                             "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +

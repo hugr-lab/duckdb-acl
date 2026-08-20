@@ -186,3 +186,34 @@ query I
 ACL ROLE "platform" ACL NATIVE SELECT count(*) > 0 FROM information_schema.tables WHERE table_name = 'secrets';
 ----
 true
+
+# --- the surface names are reserved, and the calls take no arguments -------------------------------
+# a virtual object with a surface's name would be listed and unreachable: the name resolves to the
+# listing, so the object could never be selected. Refused when it is defined, not discovered later.
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE sales.duckdb_tables AS phys.main.secrets;
+----
+<REGEX>:.*"duckdb_tables" is a metadata surface.*
+
+# the same holds for a name that only becomes a surface once its schema is written out: an object
+# `tables` inside a virtual schema called `information_schema` is written `information_schema.tables`
+statement error
+SELECT acl_add_relation('sales', 'information_schema.tables', 'phys.main.secrets', '', '');
+----
+<REGEX>:.*is a metadata surface.*
+
+# none of these functions take arguments, and quietly dropping one answers a question nobody asked
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables('nonsense');
+----
+<REGEX>:.*"duckdb_tables" takes no arguments.*
+
+# a name inside a schema is not a surface, so it stays available
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.reports.duckdb_tables AS phys.lake.other;
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM reports.duckdb_tables;
+----
+0

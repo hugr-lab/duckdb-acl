@@ -164,6 +164,12 @@ That splits the answer honestly:
   sees, with the type the write-time probe found — but not the attributes only a physical row has.
   A column missing from a listing breaks a tool; a missing `is_nullable` does not.
 
+The surface names are **reserved**: a virtual object may not be called `duckdb_tables` or
+`information_schema.tables`, because the name resolves to the listing and the object would be visible
+in metadata yet impossible to select. That is refused when the object is defined rather than
+discovered later. The function forms take no arguments, and a call that passes one is refused rather
+than answered with something it did not ask for.
+
 A masked column typed as `"NULL"` is duckdb's answer for an untyped NULL — an admin who cares about
 what tooling sees writes `ssn = NULL::VARCHAR`.
 

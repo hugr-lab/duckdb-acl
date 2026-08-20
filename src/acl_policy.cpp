@@ -8,6 +8,21 @@
 namespace duckdb {
 namespace acl {
 
+const char *MetadataSurfaceOf(const string &name) {
+	static const case_insensitive_map_t<string> SURFACES = {
+	    {"information_schema.tables", "tables"},
+	    {"information_schema.columns", "columns"},
+	    {"information_schema.schemata", "schemata"},
+	    {"duckdb_tables", "tables"},
+	    {"duckdb_views", "tables"},
+	    {"duckdb_columns", "columns"},
+	    {"duckdb_schemas", "schemata"},
+	    {"duckdb_databases", "databases"},
+	};
+	auto entry = SURFACES.find(name);
+	return entry == SURFACES.end() ? nullptr : entry->second.c_str();
+}
+
 vector<string> SplitTopLevel(const string &text, char delimiter) {
 	vector<string> parts;
 	string current;
