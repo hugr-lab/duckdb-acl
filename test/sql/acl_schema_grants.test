@@ -184,6 +184,66 @@ ACL ROLE "analyst" SELECT count(*) FROM raw.eu.orders;
 ----
 <REGEX>:.*select on "raw.eu.orders" is not allowed.*
 
+# --- several roles, and one role with disjoint grants -------------------------------------------------
+# the nearest ancestor is per role and per subtree: a grant elsewhere must not swallow another one
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE auditor CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw.us AS phys.raw;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE analyst WITH (select);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw.eu TO ROLE analyst WITH (insert);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE auditor WITH (delete);
+
+query IIII
+SELECT role, schema_path, caps, inherited FROM aclcat.acl.role_schemas ORDER BY role, schema_path;
+----
+analyst	raw	{"select": true}	false
+analyst	raw.eu	{"insert": true}	false
+analyst	raw.us	{"select": true}	true
+auditor	raw	{"delete": true}	false
+auditor	raw.eu	{"delete": true}	true
+auditor	raw.us	{"delete": true}	true
+
+# each role sees its own capabilities on the same nested schema: analyst inherited select, auditor
+# inherited delete, and neither borrows the other's
+query I
+ACL ROLE "analyst" SELECT count(*) FROM raw.us.orders;
+----
+3
+
+statement error
+ACL ROLE "auditor" SELECT count(*) FROM raw.us.orders;
+----
+<REGEX>:.*select on "raw.us.orders" is not allowed.*
+
+statement ok
+ACL ROLE "auditor" DELETE FROM raw.us.orders WHERE id = 999;
+
+statement error
+ACL ROLE "analyst" DELETE FROM raw.us.orders WHERE id = 999;
+----
+<REGEX>:.*delete on "raw.us.orders" is not allowed.*
+
+statement ok
+ACL ADMIN REVOKE SCHEMA sales.raw FROM ROLE auditor;
+
+statement ok
+ACL ADMIN REVOKE SCHEMA sales.raw.eu FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE SCHEMA sales.raw FROM ROLE analyst;
+
 # --- fail-closed rules --------------------------------------------------------------------------------
 
 statement error

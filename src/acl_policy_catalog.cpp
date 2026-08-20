@@ -1733,46 +1733,46 @@ void PolicyStore::CatalogRematerializeSchemaCaps(const string &vcat, const strin
 			                    : "(" + column + " = " + Lit(path) + " OR substr(" + column + ", 1, " +
 			                          std::to_string(prefix.size()) + ") = " + Lit(prefix) + ")";
 		};
-		// every schema of the subtree, and every role that states capabilities anywhere above it
 		auto schemas = read("SELECT \"path\" FROM " + catalog->Tbl("schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                    " AND " + in_subtree("\"path\"") + " ORDER BY length(\"path\")");
-		auto explicit_rows = read("SELECT \"role\", \"schema_path\", \"caps\" FROM " + catalog->Tbl("role_schemas") +
-		                          " WHERE \"vcat\" = " + Lit(vcat) +
-		                          " AND NOT \"inherited\""
-		                          " ORDER BY \"role\", length(\"schema_path\") DESC");
+		// every explicit grant of the catalog, per role, longest path first: the first ancestor in
+		// that order is the nearest one, which is also what makes an explicit row stop the cascade
+		auto rows = read("SELECT \"role\", \"schema_path\", \"caps\" FROM " + catalog->Tbl("role_schemas") +
+		                 " WHERE \"vcat\" = " + Lit(vcat) +
+		                 " AND NOT \"inherited\""
+		                 " ORDER BY \"role\", length(\"schema_path\") DESC");
+		vector<string> roles;
+		case_insensitive_map_t<vector<std::pair<string, string>>> granted; // role -> (path, caps)
+		for (idx_t row = 0; row < rows->RowCount(); row++) {
+			auto role = rows->GetValue(0, row).ToString();
+			auto caps = rows->GetValue(2, row);
+			if (!granted.count(role)) {
+				roles.push_back(role);
+			}
+			granted[role].emplace_back(rows->GetValue(1, row).ToString(), caps.IsNull() ? string() : caps.ToString());
+		}
 		// drop what was inherited inside the subtree: it is about to be recomputed
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"inherited\" AND " + in_subtree("\"schema_path\""));
 		for (idx_t row = 0; row < schemas->RowCount(); row++) {
 			auto schema_path = schemas->GetValue(0, row).ToString();
-			for (idx_t source = 0; source < explicit_rows->RowCount(); source++) {
-				auto role = explicit_rows->GetValue(0, source).ToString();
-				auto granted = explicit_rows->GetValue(1, source).ToString();
-				if (granted == schema_path) {
-					break; // the schema states its own capabilities: nothing to inherit here
-				}
-				if (schema_path.size() <= granted.size() ||
-				    schema_path.compare(0, granted.size() + 1, granted + ".") != 0) {
-					continue; // not an ancestor of this schema
-				}
-				// rows are ordered longest-first per role, so the first ancestor is the nearest one -
-				// which is also why an explicit row stops the cascade for its own subtree
-				bool covered = false;
-				for (idx_t other = 0; other < source; other++) {
-					if (explicit_rows->GetValue(0, other).ToString() == role) {
-						covered = true;
-						break;
+			for (auto &role : roles) {
+				for (auto &grant : granted[role]) {
+					if (grant.first == schema_path) {
+						break; // the schema states its own capabilities for this role
 					}
+					auto ancestor = grant.first + ".";
+					if (schema_path.size() <= ancestor.size() ||
+					    schema_path.compare(0, ancestor.size(), ancestor) != 0) {
+						continue; // not an ancestor of this schema
+					}
+					statements.push_back("INSERT INTO " + catalog->Tbl("role_schemas") +
+					                     "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\")"
+					                     " VALUES (" +
+					                     Lit(role) + ", " + Lit(vcat) + ", " + Lit(schema_path) + ", " +
+					                     (grant.second.empty() ? "NULL" : Lit(grant.second)) + ", true)");
+					break; // nearest ancestor found for this role; the next role is independent
 				}
-				if (covered) {
-					continue;
-				}
-				auto caps = explicit_rows->GetValue(2, source);
-				statements.push_back("INSERT INTO " + catalog->Tbl("role_schemas") +
-				                     "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\") VALUES (" +
-				                     Lit(role) + ", " + Lit(vcat) + ", " + Lit(schema_path) + ", " +
-				                     (caps.IsNull() ? "NULL" : Lit(caps.ToString())) + ", true)");
-				break;
 			}
 		}
 	});
