@@ -1,8 +1,7 @@
 # Spec 010: operating the virtual catalog — DROP, metadata, introspection
 
-- **Status**: in progress — parts 1 (DROP), 2 (metadata), 2b (column renames) and the first step of
-  part 3 (closing the metadata leak) implemented; the `acl_*` listings and the filtered `duckdb_*`
-  substitution follow
+- **Status**: implemented — parts 1 (DROP), 2 (metadata), 2b (column renames) and 3 (the `acl_*`
+  listings, the closed metadata leak and the filtered `duckdb_*` / `information_schema` substitution)
 - **Date**: 2026-08-20
 - **Author**: hugr-lab
 
@@ -111,13 +110,20 @@ difference:
 
 | mode | enumeration |
 | --- | --- |
-| memory (dev) | full — the store's own maps |
-| attached catalog | full — a SELECT over the source's tables |
-| function-driver | only what the platform exposes through optional `list_*` slots (the resolution contract is keyed lookup, so "show me everything" is not expressible without them) |
+| attached catalog | full — a SELECT over the source's tables, one function per listing |
+| memory (dev) | none: `acl_status()` answers, the listings refuse. The in-memory store is a dev stub whose contents are the test file above it; an operator surface is for deployments, which use a catalog or a driver |
+| function-driver | none today: the resolution contract is keyed lookup, so "show me everything" is not expressible. Optional `list_*` slots would change that |
 
-A missing `list_*` slot makes the corresponding function **throw** ("this policy source does not
-expose enumeration for relations") rather than return an empty set: on an admin surface, silence
-reads as "nothing is configured", which is a lie an operator would act on.
+A source that cannot enumerate makes the listing **throw**, with the reason, rather than return an
+empty set: on an admin surface silence reads as "nothing is configured", which is a lie an operator
+would act on.
+
+The shape of a listing **follows the source**: the bind step asks for the column names and types, so
+no schema is declared here that could drift from the storage after the next migration. The **rows are
+read per execution**, not at bind — a policy read through a prepared statement has to show the policy
+as it is now, and binding once would freeze it at the moment of preparation. And an issuer's **keys are absent by construction** — they are not in the projection.
+A verification key is often public, but an HS256 one is a shared secret, and neither belongs in
+metadata.
 
 Gating: these functions administer/expose policy, so the spec-009 rule already denies them in a
 principal's query (`acl_*` is refused by the function seam). They are available in the native
@@ -215,9 +221,13 @@ deny of spec 009 plus these rewrites.
   dropping a role or an issuer takes its claims/grants/scope/mappings with it; a catalog-scoped
   `manage` may drop inside its catalog but not the catalog itself (privilege administration) nor
   anything non-catalog-specific; the whole catalog can be emptied to zero rows.
-- `acl_introspection.test`: `acl_*` functions in memory and catalog modes, `ACL SHOW` under a
-  catalog-scoped manage (only its catalogs), the function-driver's honest error for a missing `list_*`
-  slot, `acl_status()`.
+- `acl_introspection.test` (60 assertions, **implemented**): the listings returning the policy as the
+  operator wrote it (catalogs, relations, schemas, functions, claims, all three grant levels, relation
+  columns); `acl_status()` answering in every mode while the listings refuse where a source cannot
+  enumerate; an issuer's keys absent from `acl_issuers()` under any column and the secret nowhere in
+  the row; and a principal refused on every one of them, including `acl_status()`, while the native
+  context reads them; and a prepared `acl_relations()` re-executed after a new object appears counting
+it, rather than answering with the policy as it was when the statement was prepared.
 - `acl_metadata_leak.test` (23 assertions, **implemented**): all three surfaces refused under a
   principal — the table function, the view of the same name and `information_schema` — plus their
   neighbours (`duckdb_columns()`, `duckdb_databases()`, `duckdb_secrets()`, `pragma_table_info`),
@@ -256,8 +266,9 @@ deny of spec 009 plus these rewrites.
 - A **plain** projected column could keep the rich physical row (join it by name) while only computed
   ones fall back to the stored schema — it would recover `is_nullable` and friends for the common
   case, at the cost of doubling the hairiest branch of the listing SQL.
-- The `acl_*` listings of part 3 (an admin surface over the active source) are still to come; the
-  substitution above went first because tooling needs `information_schema` to work at all.
+- `ACL SHOW …` as the grammar form of the listings, so a catalog-scoped manage can read them without
+  the native context (the functions exist; only the grammar and the scope filter are missing).
+- Enumeration for the function-driver, through optional `list_*` slots.
 
 
 - `SHOW TABLES` / `DESCRIBE` / `PRAGMA table_info` are statement forms the ACL statement gate refuses

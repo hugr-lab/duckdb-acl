@@ -1,0 +1,186 @@
+# name: test/sql/acl_introspection.test
+# description: acl_* introspection over the active policy source (spec 010 part 3) - the operator's
+#   view of the policy itself, refusing rather than answering emptily when a source cannot enumerate
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, tenant VARCHAR);
+
+# --- with no policy source there is nothing to list, and it says so --------------------------------
+
+statement error
+SELECT * FROM acl_relations();
+----
+<REGEX>:.*no policy source is active, so there is nothing to list.*
+
+# the status of the source is always answerable
+query II
+SELECT backend, enumerates FROM acl_status();
+----
+memory	false
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+query II
+SELECT backend, enumerates FROM acl_status();
+----
+catalog	true
+
+query I
+SELECT schema_version = policy_version OR schema_version IS NOT NULL FROM acl_status();
+----
+true
+
+# --- the policy as the operator wrote it -------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales COMMENT 'the sales namespace';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders COLUMNS (id) COMMENT 'orders, id only';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.main;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION sales.report(threshold INTEGER) AS SELECT id FROM phys.main.orders WHERE id >= acl_arg(1);
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE analyst WITH (select, insert);
+
+statement ok
+ACL ADMIN GRANT TABLE sales.orders TO ROLE analyst WITH (select) RLS (tenant = acl_claim('tenant'));
+
+query II
+SELECT vcat, comment FROM acl_catalogs();
+----
+sales	the sales namespace
+
+query IIII
+SELECT vcat, vname, form, comment FROM acl_relations();
+----
+sales	orders	subquery	orders, id only
+
+query III
+SELECT vcat, path, phys_path FROM acl_schemas();
+----
+sales	raw	phys.main
+
+query IIII
+SELECT vcat, vname, kind, params FROM acl_functions();
+----
+sales	report	table	threshold INTEGER
+
+query II
+SELECT role, claim || '=' || value FROM acl_role_claims();
+----
+analyst	tenant=acme
+
+query III
+SELECT role, vcat, caps FROM acl_grants();
+----
+analyst	sales	{"select": true}
+
+query IIII
+SELECT role, schema_path, caps, inherited FROM acl_schema_grants();
+----
+analyst	raw	{"select": true, "insert": true}	false
+
+query III
+SELECT role, vname, rls FROM acl_object_grants();
+----
+analyst	orders	tenant = acl_claim('tenant')
+
+query III
+SELECT vcat, vname, name FROM acl_relation_columns();
+----
+sales	orders	id
+
+# --- an issuer's keys are secret material, so a listing does not carry them ------------------------
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/x' KEYS '{"keys":[{"kty":"oct","k":"c3VwZXItc2VjcmV0"}]}' AUDIENCES ('api://x') ALGS (HS256) ROLE CLAIM 'roles';
+
+query IIII
+SELECT issuer, audiences, algs, role_claim FROM acl_issuers();
+----
+https://issuer.test/x	api://x	HS256	roles
+
+# there is no column holding the key, under any name
+statement error
+SELECT keys_json FROM acl_issuers();
+----
+<REGEX>:.*keys_json.*
+
+query I
+SELECT count(*) FROM (SELECT * FROM acl_issuers()) WHERE columns(*)::VARCHAR LIKE '%super-secret%';
+----
+0
+
+# --- a listing shows the policy as it is now, not as it was when the statement was prepared ---------
+
+statement ok
+PREPARE relation_count AS SELECT count(*) FROM acl_relations();
+
+query I
+EXECUTE relation_count;
+----
+1
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.second AS phys.main.orders;
+
+query I
+EXECUTE relation_count;
+----
+2
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE sales.second;
+
+# --- a principal cannot reach any of this ------------------------------------------------------------
+
+statement error
+ACL ROLE "analyst" SELECT * FROM acl_relations();
+----
+<REGEX>:.*table function "acl_relations" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM acl_issuers();
+----
+<REGEX>:.*table function "acl_issuers" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM acl_status();
+----
+<REGEX>:.*table function "acl_status" is not allowed.*
+
+# the native context is where an administrator reads them
+statement ok
+ACL ADMIN CREATE ROLE platform;
+
+statement ok
+SELECT acl_grant_admin('platform', 'passthrough');
+
+query I
+ACL ROLE "platform" ACL NATIVE SELECT count(*) FROM acl_relations();
+----
+1

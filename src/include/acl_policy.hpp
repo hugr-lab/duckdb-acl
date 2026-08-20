@@ -71,6 +71,14 @@ struct DdlTarget {
 	string origin;      // the expansion's source, stamped on the record so REFRESH owns it too
 };
 
+//! One row set of the introspection surface (spec 010 part 3): the shape follows the active source,
+//! so a listing never has to declare a schema of its own.
+struct IntrospectionRows {
+	vector<string> names;
+	vector<LogicalType> types;
+	vector<vector<Value>> rows;
+};
+
 //! Whether a function reference is a scalar/aggregate (expression position) or a table function (FROM)
 enum class FunctionKind : uint8_t { SCALAR, TABLE };
 
@@ -211,6 +219,10 @@ struct PolicyStore {
 	//! filtered to what the roles hold, with virtual names in place of physical ones. False when the
 	//! active source cannot enumerate (memory mode); the driver mode throws with the reason.
 	bool MetadataListing(const Principal &principal, const string &surface, string &sql);
+	//! Read one listing of the active policy source for an operator (spec 010 part 3). `listing` names
+	//! a table of the policy model ("relations", "grants", …) or "status". Throws when the active
+	//! source cannot enumerate - silence on an admin surface reads as "nothing is configured".
+	IntrospectionRows Introspect(const string &listing);
 	//! Resolve where a principal's `CREATE`/`DROP` of `vname` lands, requiring `capability`
 	//! (`create` or `drop`) on the virtual schema that owns the name (spec 016). False = no such
 	//! schema for this principal; a schema without the capability throws.
