@@ -1136,8 +1136,15 @@ struct CatalogBackend {
 		                       string(HasObjectCaps() ? "oc.\"columns\"" : "NULL") + " AS obj_columns FROM " +
 		                       Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " +
 		                       visible + ")";
+		// spec 026: what a grant's own projection produces - a mask that changes a column's type, or a
+		// computed column the object never had. Probed when the grant is written, so a listing can
+		// describe what the role reads rather than what the physical table holds.
+		string projected = "gprojection AS (SELECT DISTINCT pc.\"vcat\" AS vcat, pc.\"vname\" AS vname,"
+		                   " pc.\"name\" AS name, pc.\"type\" AS type, pc.\"pos\" AS pos FROM " +
+		                   Tbl("grant_columns") +
+		                   " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\")";
 		auto prelude = GrantsCte(principal) + ", " + objects + ", " + aliases + ", " + schemas + ", " + grant_columns +
-		               ", " + vfunctions + " ";
+		               ", " + vfunctions + ", " + projected + " ";
 		if (surface == "databases") {
 			// one row per granted catalog, and no physical database name ever appears
 			return prelude + "SELECT DISTINCT vcat AS database_name, NULL AS path, NULL AS comment,"
@@ -1228,28 +1235,36 @@ struct CatalogBackend {
 			       key + " AND " + keeps("gc.cat_columns", name_expr) + " AND " + keeps("gc.obj_columns", name_expr) +
 			       "))";
 		};
-		if (surface == "columns") {
-			return prelude + "SELECT * FROM (" + columns_sql + ") l WHERE " +
-			       column_visible("l.table_catalog",
-			                      "CASE WHEN l.table_schema = 'main' THEN l.table_name"
-			                      " ELSE l.table_schema || '.' || l.table_name END",
-			                      "l.column_name");
-		}
-		// spec 022: a reference is visible when both of its ends are, and when every column it names is
-		// a column the role can see. Anything else would describe an object - or a column - the role
-		// has no access to, which is what a listing must never do.
 		auto path = [](const string &alias) {
 			return "CASE WHEN " + alias + ".vschema = 'main' THEN " + alias + ".vname ELSE " + alias +
 			       ".vschema || '.' || " + alias + ".vname END";
 		};
+		string listed_path = "CASE WHEN l.table_schema = 'main' THEN l.table_name"
+		                     " ELSE l.table_schema || '.' || l.table_name END";
+		// A grant's own projection wins over the object's row for the names it defines - it is what the
+		// role actually reads - and adds the ones the object never had (spec 026).
+		string effective_columns =
+		    "SELECT * FROM (" + columns_sql + ") l WHERE " +
+		    column_visible("l.table_catalog", listed_path, "l.column_name") +
+		    " AND NOT EXISTS (SELECT 1 FROM gprojection gp WHERE gp.vcat = l.table_catalog AND gp.vname = " +
+		    listed_path + " AND gp.name = l.column_name)" +
+		    " UNION ALL BY NAME"
+		    " SELECT gp.vcat AS table_catalog,"
+		    " CASE WHEN position('.' IN gp.vname) > 0 THEN regexp_extract(gp.vname, '^(.*)[.][^.]*$', 1)"
+		    " ELSE 'main' END AS table_schema,"
+		    " regexp_extract(gp.vname, '([^.]*)$', 1) AS table_name,"
+		    " gp.name AS column_name, gp.pos + 1 AS ordinal_position, gp.type AS data_type"
+		    " FROM gprojection gp WHERE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = gp.vcat AND " +
+		    path("o") + " = gp.vname)";
+		if (surface == "columns") {
+			return prelude + effective_columns;
+		}
+		// spec 022: a reference is visible when both of its ends are, and when every column it names is
+		// a column the role can see. Anything else would describe an object - or a column - the role
+		// has no access to, which is what a listing must never do.
 		string column_path = "CASE WHEN vc.table_schema = 'main' THEN vc.table_name"
 		                     " ELSE vc.table_schema || '.' || vc.table_name END";
-		auto narrowed_columns = "SELECT * FROM (" + columns_sql + ") l WHERE " +
-		                        column_visible("l.table_catalog",
-		                                       "CASE WHEN l.table_schema = 'main' THEN l.table_name"
-		                                       " ELSE l.table_schema || '.' || l.table_name END",
-		                                       "l.column_name");
-		return prelude + ", vcolumns AS (" + narrowed_columns + ") " +
+		return prelude + ", vcolumns AS (" + effective_columns + ") " +
 		       "SELECT r.\"vcat\" AS vcat, r.\"name\" AS name, r.\"from_vname\" AS from_object,"
 		       " r.\"to_vname\" AS to_object,"
 		       // the arguments a function end is called with, and - separately - the columns of the join
@@ -1639,6 +1654,19 @@ struct CatalogBackend {
 		return string();
 	}
 
+	//! Bind a projection over a relation and return the columns it produces (spec 026). Never fatal: an
+	//! unbindable projection leaves the listing as it was rather than refusing the grant.
+	bool ProjectionSchema(const string &source, const string &column_csv, vector<std::pair<string, string>> &out) {
+		vector<string> items;
+		for (auto &column : ParseColumnList(column_csv)) {
+			items.push_back(column.second.empty() ? column.first : column.second + " AS " + column.first);
+		}
+		if (items.empty()) {
+			return false;
+		}
+		return ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + source, false, {}, out);
+	}
+
 	//! Read a document through duckdb's own filesystem (spec 023). A local path works out of the box;
 	//! an https URL needs httpfs, and duckdb says so itself - which is the error an operator needs.
 	bool ReadText(const string &uri, string &out, string &error) {
@@ -1828,9 +1856,16 @@ struct CatalogBackend {
 		    // valid; a URI is read through duckdb's own filesystem, so an https URL (with httpfs) and a
 		    // file an operator refreshes out of band are the same mechanism.
 		    "ALTER TABLE " + Tbl("issuers") + " ADD COLUMN IF NOT EXISTS \"jwks_uri\" VARCHAR",
-		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '8' WHERE NOT EXISTS (SELECT 1 FROM " +
+		    // spec 026 (schema v9): the columns a *grant's* projection produces. An object's own columns
+		    // are probed when it is defined (spec 010), but a grant may mask one into another type or
+		    // add a computed one the object never had - and a listing that cannot see those describes
+		    // something the role does not read.
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("grant_columns") +
+		        "(\"role\" VARCHAR, \"vcat\" VARCHAR, \"vname\" VARCHAR, \"pos\" INTEGER, \"name\" VARCHAR,"
+		        " \"type\" VARCHAR, PRIMARY KEY (\"role\", \"vcat\", \"vname\", \"pos\"))",
+		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '9' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
-		    "UPDATE " + Tbl("meta") + " SET \"value\" = '8' WHERE \"key\" = 'schema_version' AND \"value\" < '8'",
+		    "UPDATE " + Tbl("meta") + " SET \"value\" = '9' WHERE \"key\" = 'schema_version' AND \"value\" < '9'",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'policy_version')",
 		};
@@ -2511,6 +2546,7 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"schema_grants", "SELECT \"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\", \"into\","
 	                      " \"virtual_only\", \"comment\" FROM %s"},
 	    {"object_grants", "SELECT \"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\" FROM %s"},
+	    {"grant_columns", "SELECT \"role\", \"vcat\", \"vname\", \"pos\", \"name\", \"type\" FROM %s"},
 	    {"admins", "SELECT \"role\", \"scope\", \"vcat\" FROM %s"},
 	    {"issuers", "SELECT \"issuer\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\", \"jwks_uri\""
 	                " FROM %s"},
@@ -2531,6 +2567,7 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"grants", "role_catalogs"},
 	    {"schema_grants", "role_schemas"},
 	    {"object_grants", "role_object_caps"},
+	    {"grant_columns", "grant_columns"},
 	    {"admins", "admins"},
 	    {"issuers", "issuers"},
 	    {"role_mappings", "role_mappings"},
@@ -2849,6 +2886,8 @@ void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
 	catalog->Write({"DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat),
 	                "DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
+	                    " AND \"vcat\" = " + Lit(vcat),
+	                "DELETE FROM " + catalog->Tbl("grant_columns") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat)});
 }
 
@@ -2879,6 +2918,8 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 	                "DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                    " AND \"vname\" = " + Lit(vname),
 	                "DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                    " AND \"vname\" = " + Lit(vname),
+	                "DELETE FROM " + catalog->Tbl("grant_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                    " AND \"vname\" = " + Lit(vname)});
 	if (!tombstone.empty()) {
 		catalog->Write(tombstone);
@@ -3411,6 +3452,30 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 					throw InvalidInputException("acl: the predicate of the grant on \"%s\" does not bind "
 					                            "against it: %s",
 					                            vname, error);
+				}
+			}
+		}
+		// what this projection actually produces: names a mask renames the type of, and columns the
+		// object never had. Probed here, where it is written, so a listing can describe what the role
+		// reads rather than what the physical table holds (spec 026).
+		statements.push_back("DELETE FROM " + catalog->Tbl("grant_columns") + " WHERE \"role\" = " + Lit(role) +
+		                     " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		if (!columns.empty()) {
+			auto shape = read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + catalog->Tbl("relations") +
+			                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+			if (shape->RowCount() > 0) {
+				auto form = shape->GetValue(0, 0).IsNull() ? string() : shape->GetValue(0, 0).ToString();
+				auto phys = shape->GetValue(1, 0).IsNull() ? string() : shape->GetValue(1, 0).ToString();
+				auto view_sql = shape->GetValue(2, 0).IsNull() ? string() : shape->GetValue(2, 0).ToString();
+				auto source = form == "view" ? "(" + view_sql + ")" : phys;
+				vector<std::pair<string, string>> derived;
+				if (!source.empty() && catalog->ProjectionSchema(source, columns, derived)) {
+					idx_t pos = 0;
+					for (auto &column : derived) {
+						statements.push_back("INSERT INTO " + catalog->Tbl("grant_columns") + " VALUES (" + Lit(role) +
+						                     ", " + Lit(vcat) + ", " + Lit(vname) + ", " + std::to_string(pos++) +
+						                     ", " + Lit(column.first) + ", " + Lit(column.second) + ")");
+					}
 				}
 			}
 		}

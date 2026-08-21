@@ -1,0 +1,140 @@
+# name: test/sql/acl_grant_projection.test
+# description: a grant's own projection is probed where it is written (spec 026), so the metadata
+#   describes what the role reads - a mask's type and a computed column the object never had
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t(id INT, tenant VARCHAR, amount INT, ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, 'acme', 10, 's1');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
+
+# a projection stated on the grant: one column as-is, one masked into another type, one computed out
+# of a column the role never sees
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select)
+    COLUMNS (id, ssn = NULL, label = coalesce(tenant, 'none'));
+
+# --- the two metadata surfaces agree, and both describe what the role reads -------------------------
+
+query II
+ACL ROLE "r" SELECT column_name, column_type FROM (DESCRIBE t) ORDER BY column_name;
+----
+id	INTEGER
+label	VARCHAR
+ssn	"NULL"
+
+query II
+ACL ROLE "r" SELECT column_name, data_type FROM information_schema.columns
+    WHERE table_name = 't' ORDER BY column_name;
+----
+id	INTEGER
+label	VARCHAR
+ssn	"NULL"
+
+# and that is what a SELECT * gives back
+query III
+ACL ROLE "r" SELECT * FROM t;
+----
+1	NULL	acme
+
+# the column the grant does not project is in neither surface
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.columns
+    WHERE table_name = 't' AND column_name IN ('tenant', 'amount');
+----
+0
+
+# --- the operator sees what was probed ----------------------------------------------------------------
+
+query III
+SELECT vname, name, type FROM acl_grant_columns() ORDER BY pos;
+----
+t	id	INTEGER
+t	ssn	"NULL"
+t	label	VARCHAR
+
+# --- a grant with no projection of its own is unaffected ------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE plain;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE plain MAIN;
+
+query I
+ACL ROLE "plain" SELECT count(*) FROM information_schema.columns WHERE table_name = 't';
+----
+4
+
+query I
+SELECT count(*) FROM aclcat.acl.grant_columns WHERE role = 'plain';
+----
+0
+
+# --- rewriting the grant rewrites what was probed -------------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, amount);
+
+query I
+ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM information_schema.columns
+    WHERE table_name = 't';
+----
+amount,id
+
+# --- and revoking it takes the rows with it ---------------------------------------------------------------
+
+statement ok
+SELECT acl_revoke_catalog('r', 'c');
+
+query I
+SELECT count(*) FROM aclcat.acl.grant_columns WHERE role = 'r';
+----
+0
+
+# dropping the object clears them too, whoever they belonged to
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, label = coalesce(tenant, 'none'));
+
+query I
+SELECT count(*) FROM aclcat.acl.grant_columns WHERE vname = 't';
+----
+2
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c.t;
+
+query I
+SELECT count(*) FROM aclcat.acl.grant_columns WHERE vname = 't';
+----
+0

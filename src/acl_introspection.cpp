@@ -82,11 +82,11 @@ void AclIntrospectionScan(ClientContext &, TableFunctionInput &data, DataChunk &
 
 void RegisterAclIntrospection(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
 	// one function per listing of the policy model, plus the status of the source itself
-	static const char *LISTINGS[] = {"catalogs",       "schemas",     "relations",  "relation_columns",
-	                                 "object_columns", "functions",   "references", "reference_columns",
-	                                 "roles",          "role_claims", "grants",     "schema_grants",
-	                                 "object_grants",  "admins",      "issuers",    "role_mappings",
-	                                 "function_gate",  "status"};
+	static const char *LISTINGS[] = {"catalogs",       "schemas",       "relations",  "relation_columns",
+	                                 "object_columns", "functions",     "references", "reference_columns",
+	                                 "roles",          "role_claims",   "grants",     "schema_grants",
+	                                 "object_grants",  "grant_columns", "admins",     "issuers",
+	                                 "role_mappings",  "function_gate", "status"};
 	for (auto listing : LISTINGS) {
 		TableFunction function(Identifier(string("acl_") + listing), {}, AclIntrospectionScan, AclIntrospectionBind,
 		                       AclIntrospectionInit);
