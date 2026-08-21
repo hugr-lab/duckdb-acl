@@ -123,6 +123,12 @@ public:
 		case StatementType::PRAGMA_STATEMENT:
 			RewritePragmaStatement(stmt.Cast<PragmaStatement>());
 			break;
+		case StatementType::TRANSACTION_STATEMENT:
+			// BEGIN / COMMIT / ROLLBACK name no object and carry no expression, so there is nothing to
+			// rewrite and nothing to gate: they are session control, not access. A client driver cannot
+			// work without them - a quack client sends one before it reads anything - and refusing them
+			// left a served connection unable to load its own catalog (spec 041).
+			break;
 		default:
 			Deny("statement type " + StatementTypeToString(stmt.type) + " is not permitted under ACL");
 		}

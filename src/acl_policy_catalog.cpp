@@ -752,7 +752,19 @@ struct CatalogBackend {
 		SplitName(vname, head, rest);
 		string qualified_cond =
 		    head.empty() ? string("false") : "r.\"vcat\" = " + Lit(head) + " AND r.\"vname\" = " + Lit(rest);
+		// An object of the default schema is stored under a bare name, so `main.orders` names the same
+		// thing `orders` does. A client that loaded a catalog addresses tables that way - it is what a
+		// quack client pushes to the server - and refusing it left a served connection unable to read
+		// its own objects (spec 041). The qualified interpretation still wins, so a catalog actually
+		// named `main` is unaffected.
+		string unqualified = vname;
+		if (StringUtil::CIEquals(head, "main")) {
+			unqualified = rest;
+		}
 		vector<string> names = head.empty() ? vector<string> {vname} : vector<string> {vname, rest};
+		if (unqualified != vname) {
+			names.push_back(unqualified);
+		}
 		string oc_join = HasObjectCaps() ? " LEFT JOIN " + ObjectCapsSource(principal, names) +
 		                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = r.\"vcat\""
 		                                       " AND oc.\"vname\" = r.\"vname\""
@@ -771,7 +783,7 @@ struct CatalogBackend {
 		           " FROM " +
 		           RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
 		           " WHERE (" + qualified_cond +
-		           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(vname) +
+		           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(unqualified) +
 		           // by role, so a principal holding several of them merges their column lists in one
 		           // order rather than in whatever order the store returned (spec 036)
 		           ") ORDER BY prio, g.\"role\"";
