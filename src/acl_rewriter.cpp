@@ -892,17 +892,43 @@ private:
 	//! the grant's policy over a table function's result. The shape is parsed as a template over a
 	//! placeholder relation, so the column items and the predicate go through the normal parser (and
 	//! the normal claim baking); the placeholder is then swapped for the real reference.
+	//! The call the grant's wrapper is written around appears in it as `"__acl_inner"`. A narrowing
+	//! wrapper nests (spec 038), so the placeholder is not always the outer FROM - find it wherever it
+	//! is and put the real call there.
+	static bool PlaceInner(unique_ptr<TableRef> &node, unique_ptr<TableRef> &call) {
+		if (!node) {
+			return false;
+		}
+		if (node->type == TableReferenceType::BASE_TABLE &&
+		    StringUtil::CIEquals(node->Cast<BaseTableRef>().Table().GetIdentifierName(), "__acl_inner")) {
+			node = std::move(call);
+			return true;
+		}
+		if (node->type == TableReferenceType::SUBQUERY) {
+			auto &sub = node->Cast<SubqueryRef>();
+			if (sub.subquery && sub.subquery->node && sub.subquery->node->type == QueryNodeType::SELECT_NODE) {
+				return PlaceInner(sub.subquery->node->Cast<SelectNode>().from_table, call);
+			}
+		}
+		return false;
+	}
+
 	void WrapWithGrantPolicy(unique_ptr<TableRef> &ref, const TablePolicy &policy, const Identifier &alias) {
-		if (policy.rls.empty() && policy.projection.empty()) {
+		if (policy.rls.empty() && policy.projection.empty() && policy.wrap_sql.empty()) {
 			return;
 		}
-		string items = policy.projection.empty() ? "*" : StringUtil::Join(policy.projection, ", ");
-		auto sql = "SELECT " + items + " FROM \"__acl_inner\"" + (policy.rls.empty() ? "" : " WHERE " + policy.rls);
+		string sql = policy.wrap_sql;
+		if (sql.empty()) {
+			string items = policy.projection.empty() ? "*" : StringUtil::Join(policy.projection, ", ");
+			sql = "SELECT " + items + " FROM \"__acl_inner\"" + (policy.rls.empty() ? "" : " WHERE " + policy.rls);
+		}
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		BakeMarkersInNode(*select_stmt->node, nullptr); // acl_arg belongs to the call, not to the policy
 		auto &select = select_stmt->node->Cast<SelectNode>();
 		ref->alias = Identifier();
-		select.from_table = std::move(ref);
+		if (!PlaceInner(select.from_table, ref)) {
+			Deny("the grant's projection could not be applied to \"" + alias.GetIdentifierName() + "\"");
+		}
 		ref = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
 	}
 

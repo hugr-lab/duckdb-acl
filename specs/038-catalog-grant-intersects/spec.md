@@ -1,6 +1,6 @@
 # Spec 038: a catalog-wide column list intersects, and a mask that cannot apply refuses
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-08-21
 - **Author**: hugr-lab
 
@@ -103,7 +103,7 @@ grant's.
 
 ## Testing
 
-`test/sql/acl_catalog_columns.test` (new):
+`test/sql/acl_catalog_columns.test` (new, 57 assertions):
 
 - one catalog-wide `COLUMNS (id, ssn = NULL)` over three objects: applied where `ssn` exists,
   intersected to `id` where the object simply lacks it, refused where a *mask* cannot be applied;
@@ -113,6 +113,12 @@ grant's.
 - a grant on a table function may hide and mask its columns and may not rename or add to them;
 - the union of two roles comes out in the object's order, not in either role's;
 - an object grant still narrows a catalog grant, and cannot widen it.
+
+The listing needed no change: for a plain alias it already filtered the physical columns by the
+granted names, and the write-time probe never records a name that does not bind — so `SELECT *`,
+`duckdb_columns()` and the synthesized DDL agree on all three objects without further work.
+
+Full suite: 40 files, 3187 assertions, both C++ binaries.
 
 ## Alternatives considered
 
@@ -134,5 +140,9 @@ grant's.
 - **A mask's refusal is also duckdb's message** (`Column "ssn" in REPLACE list not found in FROM
   clause`) rather than ours, and it arrives at the reader rather than at the author. It says the right
   thing, but it does not say which grant caused it.
-- Column names containing regex or quoting metacharacters need care in the generated lambda; names are
-  compared case-insensitively, as duckdb identifiers are.
+- Column names containing quoting metacharacters need care in the generated lambda; names are compared
+  case-insensitively, as duckdb identifiers are.
+- **An object whose mask cannot be applied is unreadable but still listed**, showing the columns the
+  bare names intersect to. Same shape as spec 037's follow-up about conflicting roles: the listing
+  describes something no query can return. Both want the same fix — a listing that asks whether the
+  object resolves at all.

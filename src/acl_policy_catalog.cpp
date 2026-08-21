@@ -1124,10 +1124,28 @@ struct CatalogBackend {
 		if (!restricts) {
 			return;
 		}
+		// spec 038: a function's returns cannot be known without calling it, so the grant is not folded
+		// in here but expressed as SQL the engine resolves while binding - the same shape a plain alias
+		// gets. A bare name the function does not return intersects away; a mask it cannot apply
+		// refuses. Naming and shaping a function's output stays with its declaration in the catalog.
+		vector<string> replaces;
+		vector<string> names;
 		for (auto &column : grants.columns) {
-			out.projection.push_back(column.second.empty() ? Ident(column.first)
-			                                               : column.second + " AS " + Ident(column.first));
+			names.push_back(Lit(StringUtil::Lower(column.first)));
+			if (!column.second.empty()) {
+				replaces.push_back(column.second + " AS " + Ident(column.first));
+			}
 		}
+		string inner = "SELECT *";
+		if (!replaces.empty()) {
+			inner += " REPLACE (" + StringUtil::Join(replaces, ", ") + ")";
+		}
+		inner += " FROM \"__acl_inner\"";
+		if (!out.rls.empty()) {
+			inner += " WHERE " + out.rls;
+		}
+		out.wrap_sql = "SELECT COLUMNS(lambda __acl_col: lower(__acl_col) IN (" + StringUtil::Join(names, ", ") +
+		               ")) FROM (" + inner + ")";
 	}
 
 	//! Where a `CREATE`/`DROP` of `vname` lands for this principal (spec 016). One query: the longest
