@@ -1,0 +1,187 @@
+# name: test/sql/acl_write_check.test
+# description: the grant's predicate confines what is written (spec 024) - not only which rows may be
+#   reached. A row that would land outside the principal's own slice is refused where it is written.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+CREATE TABLE phys.main.feed(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 10), (2, 'globex', 20);
+
+statement ok
+INSERT INTO phys.main.feed VALUES (1, 'zzz', 100), (7, 'zzz', 700);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.feed AS phys.main.feed;
+
+statement ok
+ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
+
+# a predicate and nothing else: no injected value to force the column, which is the case that used to
+# let a row through
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select, insert, update, delete, merge)
+    RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN GRANT TABLE c.feed TO ROLE r WITH (select);
+
+# --- INSERT ------------------------------------------------------------------------------------------
+
+statement error
+ACL ROLE "r" INSERT INTO orders (id, tenant, amount) VALUES (3, 'globex', 30);
+----
+<REGEX>:.*does not satisfy the grant on "orders".*
+
+statement ok
+ACL ROLE "r" INSERT INTO orders (id, tenant, amount) VALUES (4, 'acme', 40);
+
+# a row the predicate reads a column of, that the insert does not supply, cannot be judged at all
+statement error
+ACL ROLE "r" INSERT INTO orders (id, amount) VALUES (5, 50);
+----
+<REGEX>:.*must supply "tenant".*
+
+statement error
+ACL ROLE "r" INSERT INTO orders VALUES (6, 'acme', 60);
+----
+<REGEX>:.*must name its columns.*
+
+# one violating row refuses the whole statement rather than writing the rest
+statement error
+ACL ROLE "r" INSERT INTO orders (id, tenant, amount)
+    SELECT * FROM (VALUES (7, 'acme', 70), (8, 'globex', 80)) v(a, b, c);
+----
+<REGEX>:.*does not satisfy the grant on "orders".*
+
+query II
+SELECT id, tenant FROM phys.main.orders ORDER BY id;
+----
+1	acme
+2	globex
+4	acme
+
+# --- UPDATE ------------------------------------------------------------------------------------------
+
+# the row may be reached, and that is not the same as being allowed to move it out of the slice
+statement error
+ACL ROLE "r" UPDATE orders SET tenant = 'globex' WHERE id = 1;
+----
+<REGEX>:.*does not satisfy the grant on "orders".*
+
+statement ok
+ACL ROLE "r" UPDATE orders SET amount = 11 WHERE id = 1;
+
+# a SET that touches nothing the predicate reads needs no check: the new row satisfies it exactly when
+# the old one did, and the predicate on the WHERE already decided that
+query II
+SELECT id, amount FROM phys.main.orders WHERE id = 1;
+----
+1	11
+
+# --- MERGE --------------------------------------------------------------------------------------------
+
+statement error
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
+    WHEN MATCHED THEN UPDATE SET tenant = 'globex';
+----
+<REGEX>:.*does not satisfy the grant on "orders".*
+
+statement error
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
+    WHEN NOT MATCHED THEN INSERT (id, tenant, amount) VALUES (feed.id, 'globex', feed.amount);
+----
+<REGEX>:.*does not satisfy the grant on "orders".*
+
+statement ok
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
+    WHEN NOT MATCHED THEN INSERT (id, tenant, amount) VALUES (feed.id, 'acme', feed.amount);
+
+query II
+SELECT id, tenant FROM phys.main.orders ORDER BY id;
+----
+1	acme
+2	globex
+4	acme
+7	acme
+
+# the insert branch is judged like any other insert, so it must name what the predicate reads
+statement error
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
+    WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (feed.id, feed.amount);
+----
+<REGEX>:.*must supply "tenant".*
+
+# --- an injected value satisfies the predicate by construction -------------------------------------------
+# the other half of spec 011: a grant that assigns the column does not need the writer to get it right
+
+statement ok
+ACL ADMIN CREATE ROLE inj CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE inj CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE inj WITH (select, insert, update)
+    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant = acl_claim('tenant'));
+
+# the writer names neither tenant nor a value for it, and the row still lands inside the slice
+statement ok
+ACL ROLE "inj" INSERT INTO orders (id, amount) VALUES (9, 90);
+
+query II
+SELECT id, tenant FROM phys.main.orders WHERE id = 9;
+----
+9	acme
+
+# and a value it does supply is overridden rather than refused
+statement ok
+ACL ROLE "inj" INSERT INTO orders (id, tenant, amount) VALUES (10, 'globex', 100);
+
+query II
+SELECT id, tenant FROM phys.main.orders WHERE id = 10;
+----
+10	acme
+
+# --- a grant without a predicate is unaffected -----------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE open;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE open MAIN;
+
+statement ok
+ACL ROLE "open" INSERT INTO orders VALUES (11, 'globex', 110);
+
+query II
+SELECT id, tenant FROM phys.main.orders WHERE id = 11;
+----
+11	globex
