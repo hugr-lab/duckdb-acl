@@ -1,0 +1,139 @@
+# name: test/sql/acl_show_describe.test
+# description: DESCRIBE / SUMMARIZE / SHOW TABLES under a principal (spec 025) - the forms a client
+#   sends before it sends anything else, answered from the principal's own catalog
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, tenant VARCHAR, amount INT, ssn VARCHAR);
+
+statement ok
+CREATE TABLE phys.lake.events(id INT, kind VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.secrets(id INT, value VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 10, 's1'), (2, 'globex', 20, 's2');
+
+statement ok
+INSERT INTO phys.lake.events VALUES (1, 'created');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.vs FROM phys.lake;
+
+statement ok
+ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- DESCRIBE describes what the role can read, not what the table has ------------------------------
+
+query I
+ACL ROLE "r" SELECT count(*) FROM (DESCRIBE orders) WHERE column_name IN ('tenant', 'ssn');
+----
+0
+
+query II
+ACL ROLE "r" SELECT column_name, column_type FROM (DESCRIBE orders) ORDER BY column_name;
+----
+amount	INTEGER
+id	INTEGER
+
+# a query describes itself the same way, through the same read path
+query I
+ACL ROLE "r" SELECT column_name FROM (DESCRIBE (SELECT id FROM orders));
+----
+id
+
+# the physical table is not a name the principal has
+statement error
+ACL ROLE "r" DESCRIBE phys.main.orders;
+----
+<REGEX>:.*no access to object "phys.main.orders".*
+
+statement error
+ACL ROLE "r" DESCRIBE secrets;
+----
+<REGEX>:.*(no access to object|select on).*
+
+# --- SHOW TABLES lists the principal's catalog -------------------------------------------------------
+
+query I
+ACL ROLE "r" SHOW TABLES;
+----
+orders
+
+query I
+ACL ROLE "r" SHOW TABLES FROM vs;
+----
+events
+
+# nothing of the physical world appears
+query I
+ACL ROLE "r" SELECT count(*) FROM (SHOW TABLES) WHERE name = 'secrets';
+----
+0
+
+# --- SUMMARIZE reads data, so the grant's predicate applies to it ------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE narrow CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE narrow CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE narrow WITH (select) RLS (tenant = acl_claim('tenant'));
+
+# two rows exist; the role may read one, and the summary counts one
+query II
+ACL ROLE "narrow" SELECT column_name, count FROM (SUMMARIZE orders) WHERE column_name = 'id';
+----
+id	1
+
+query I
+SELECT count(*) FROM phys.main.orders;
+----
+2
+
+# --- a role that may see nothing sees nothing ---------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE empty;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE empty CAPS '{}' MAIN;
+
+query I
+ACL ROLE "empty" SELECT count(*) FROM (SHOW TABLES);
+----
+0
+
+statement error
+ACL ROLE "empty" DESCRIBE orders;
+----
+<REGEX>:.*select on "orders" is not allowed.*

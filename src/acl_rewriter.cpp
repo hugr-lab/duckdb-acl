@@ -35,6 +35,7 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/showref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
@@ -595,6 +596,9 @@ private:
 		case TableReferenceType::TABLE_FUNCTION:
 			RewriteTableFunction(ref);
 			break;
+		case TableReferenceType::SHOW_REF:
+			RewriteShowRef(ref);
+			break;
 		case TableReferenceType::EMPTY_FROM:
 		case TableReferenceType::EXPRESSION_LIST:
 			break;
@@ -656,6 +660,68 @@ private:
 		if (tf.subquery && tf.subquery->node) {
 			RewriteQueryNode(*tf.subquery->node);
 		}
+	}
+
+	//! `DESCRIBE` / `SUMMARIZE` / `SHOW TABLES` (spec 025). These are what a client sends before it
+	//! sends anything else, so refusing them left every ordinary tool talking to a wall.
+	void RewriteShowRef(unique_ptr<TableRef> &ref) {
+		auto &show = ref->Cast<ShowRef>();
+		if (show.query) {
+			// DESCRIBE (SELECT …) - the query is the principal's, and it is rewritten like any other
+			RewriteQueryNode(*show.query);
+			return;
+		}
+		if (show.show_type == ShowType::DESCRIBE || show.show_type == ShowType::SUMMARY) {
+			// `DESCRIBE <name>` becomes `DESCRIBE (SELECT * FROM <name>)`: the same shape to the caller,
+			// and the answer comes from the read path, so it describes what the principal can read
+			// rather than what the physical table has.
+			auto select = make_uniq<SelectNode>();
+			select->select_list.push_back(make_uniq<StarExpression>());
+			auto base = make_uniq<BaseTableRef>();
+			base->SetQualifiedName(show.qualified_name);
+			select->from_table = std::move(base);
+			show.query = std::move(select);
+			show.qualified_name = QualifiedName();
+			RewriteQueryNode(*show.query);
+			return;
+		}
+		// SHOW TABLES [FROM <schema>] - the principal's own catalog in the shape SHOW TABLES has
+		string sql;
+		if (!store.MetadataListing(principal, "tables", sql)) {
+			Deny("metadata is not available: this policy source cannot enumerate tables");
+		}
+		string filter;
+		if (show.show_type == ShowType::SHOW_FROM) {
+			auto path = show.qualified_name.Path();
+			vector<string> parts;
+			for (auto &part : path) {
+				if (!part.empty()) {
+					parts.push_back(part.GetIdentifierName());
+				}
+			}
+			auto name = show.qualified_name.Name().GetIdentifierName();
+			if (!name.empty()) {
+				parts.push_back(name);
+			}
+			if (parts.empty()) {
+				Deny("SHOW TABLES FROM needs a schema");
+			}
+			filter = " WHERE table_schema = " + SqlLiteral(parts.back());
+			if (parts.size() > 1) {
+				filter += " AND table_catalog = " + SqlLiteral(parts[parts.size() - 2]);
+			}
+		} else {
+			// bare SHOW TABLES is the current schema, which for a principal is the default one
+			filter = " WHERE table_schema = 'main'";
+		}
+		sql = "SELECT table_name AS name FROM (" + sql + ")" + filter + " ORDER BY 1";
+		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		ref = make_uniq<SubqueryRef>(std::move(select_stmt), Identifier("__acl_show"));
+	}
+
+	//! A single-quoted SQL literal of a name we splice into generated SQL
+	static string SqlLiteral(const string &text) {
+		return "'" + StringUtil::Replace(text, "'", "''") + "'";
 	}
 
 	//! Rewrite each argument expression of a function call (without re-gating the function itself)
