@@ -1307,6 +1307,19 @@ private:
 		return Identifier();
 	}
 
+	//! Whether an expression contains a subquery anywhere - the one part QualifyWithTarget leaves in
+	//! its own scope, and therefore the one part whose meaning depends on the predicate having been
+	//! bound against its target.
+	static bool ContainsSubquery(const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			return true;
+		}
+		bool found = false;
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { found = found || ContainsSubquery(child); });
+		return found;
+	}
+
 	//! The grant's predicate, baked and bound to the target by name; nullptr when the grant has none
 	unique_ptr<ParsedExpression> TargetPredicate(const TablePolicy &policy, const Identifier &alias,
 	                                             const string &vname) {
@@ -1315,6 +1328,16 @@ private:
 		}
 		auto predicate = store.InstantiateExpr(policy.rls, template_options);
 		BakeMarkers(predicate, nullptr);
+		// Here a second relation is in scope, and a subquery's body keeps its own scope (see
+		// QualifyWithTarget) - which is safe exactly because the predicate was bound against its target
+		// when it was written (spec 021). Without that verdict a bare name in there could resolve
+		// against the source instead, and quietly filter the wrong rows (spec 027).
+		if (policy.rls_unchecked && ContainsSubquery(*predicate)) {
+			throw BinderException("acl: the predicate of \"%s\" contains a subquery and was never checked against "
+			                      "the object, so it cannot be used where a second relation is in scope - run "
+			                      "acl_refresh_schema() with the object reachable, or rewrite the grant",
+			                      vname);
+		}
 		QualifyWithTarget(predicate, alias);
 		return predicate;
 	}

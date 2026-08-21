@@ -34,10 +34,15 @@ struct Principal {
 //! columns / masks, an RLS predicate, or a full view SQL - and is read-only by construction (you cannot
 //! write through a subquery). Claim values are baked in for either RLS or view/computed SQL.
 struct TablePolicy {
-	bool subquery_form = true;   // true: wrap a SELECT (read-only); false: rename in place (writable)
-	string phys;                 // physical relation reference, e.g. "phys.main.orders_physical"
-	vector<string> projection;   // SQL select items (SUBQUERY), e.g. {"id", "NULL AS ssn", "amount*2 AS total"}
-	string rls;                  // predicate template (SUBQUERY); may contain acl_claim('<name>'); empty = none
+	bool subquery_form = true; // true: wrap a SELECT (read-only); false: rename in place (writable)
+	string phys;               // physical relation reference, e.g. "phys.main.orders_physical"
+	vector<string> projection; // SQL select items (SUBQUERY), e.g. {"id", "NULL AS ssn", "amount*2 AS total"}
+	string rls;                // predicate template (SUBQUERY); may contain acl_claim('<name>'); empty = none
+	//! Whether some part of `rls` was never bound against this object (spec 027): the object did not
+	//! exist where the predicate was written, so nothing judged what its names refer to. Harmless on a
+	//! read - the binder decides - but a write with a second relation in scope must not inject a
+	//! subquery whose free names could resolve against the source instead of the target (spec 020).
+	bool rls_unchecked = false;
 	string query;                // full SELECT template for a view (SUBQUERY; replaces phys/projection/rls)
 	case_insensitive_set_t caps; // {"select","insert","update","delete","merge"}
 	//! Column renames of a writable (alias-form) relation: virtual name -> physical name. Renaming is
