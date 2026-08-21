@@ -872,20 +872,45 @@ struct CatalogBackend {
 		// declares none - every physical column under its own name. The grant's list is a subset of the
 		// object's (checked below), so it replaces what the object allowed rather than adding to it.
 		out.write_columns.clear();
-		for (auto &column : grants.columns) {
-			string source = column.first;        // what to read the value from, in physical terms
-			bool known = object_columns.empty(); // no projection: the object exposes whatever it has
+		// spec 038: where the object states its own columns, the grant is folded into them - in the
+		// object's order, so a column's position belongs to the object rather than to whoever asks. A
+		// listed name the object does not have is a *bare name* that grants nothing (it intersects
+		// away) or a *mask* that cannot be applied (it refuses): protection that is silently skipped
+		// is the one failure mode worth refusing over.
+		auto listed = grants.columns;
+		if (!object_columns.empty()) {
+			for (auto &column : listed) {
+				bool known = false;
+				for (auto &defined : object_columns) {
+					if (StringUtil::CIEquals(defined.first, column.first)) {
+						known = true;
+						break;
+					}
+				}
+				if (!known && !column.second.empty()) {
+					throw BinderException("acl: the grant on \"%s\" masks column \"%s\", which the object does not "
+					                      "have - a mask that cannot be applied would leave it unprotected",
+					                      vname, column.first);
+				}
+			}
+			vector<std::pair<string, string>> ordered;
+			for (auto &defined : object_columns) {
+				for (auto &column : listed) {
+					if (StringUtil::CIEquals(defined.first, column.first)) {
+						ordered.push_back(column);
+						break;
+					}
+				}
+			}
+			listed = std::move(ordered);
+		}
+		for (auto &column : listed) {
+			string source = column.first; // what to read the value from, in physical terms
 			for (auto &defined : object_columns) {
 				if (StringUtil::CIEquals(defined.first, column.first)) {
 					source = defined.second.empty() ? defined.first : defined.second;
-					known = true;
 					break;
 				}
-			}
-			if (!known) {
-				// the object does not expose it, and a grant may never re-expose what it hid
-				throw BinderException("acl: grant on \"%s\" lists column \"%s\", which the object does not expose",
-				                      vname, column.first);
 			}
 			for (auto &rename : out.renames) {
 				if (StringUtil::CIEquals(rename.first, column.first)) {
