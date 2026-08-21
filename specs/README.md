@@ -74,3 +74,4 @@ specs are the shareable distillation of that work.
 | [029](029-columns-always-restrict/spec.md) | a column list is a projection, whatever it is made of | implemented |
 | [030](030-drop-cascade/spec.md) | what goes with a dropped object | implemented |
 | [031](031-show-surface/spec.md) | every `SHOW` answers its own question | implemented |
+| [032](032-function-capabilities/spec.md) | what a capability means for a function | implemented |

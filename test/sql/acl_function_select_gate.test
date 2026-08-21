@@ -155,9 +155,11 @@ ACL ROLE "ingest" SELECT id, amount FROM report(150);
 2	200
 
 # --- the object capability overrides the catalog's in both directions ------------------------------
+# an explicit empty set is "no capabilities", so it takes `select` away from a role the catalog gave
+# it to (a write capability would say the same thing, and is refused on a function since spec 032)
 
 statement ok
-ACL ADMIN GRANT TABLE sales.tenant_of TO ROLE reader CAPS '{"insert": true}';
+ACL ADMIN GRANT TABLE sales.tenant_of TO ROLE reader CAPS '{}';
 
 statement error
 ACL ROLE "reader" SELECT tenant_of(1);

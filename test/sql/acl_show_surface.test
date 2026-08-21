@@ -113,17 +113,19 @@ ACL ROLE "r" SHOW TABLES FROM vs;
 ----
 events
 
-# --- SHOW VARIABLES answers with nothing, in the shape it answers with ------------------------------------
-# a principal has no session variables: `getvariable` is denied and nothing sets one for it
+# --- SHOW VARIABLES is refused, not answered empty ---------------------------------------------------------
+# only `ACL NATIVE` sets a session variable, and `getvariable` is denied for the same reason. An empty
+# answer would claim the principal has no variables; the truth is that the ones which exist are not its
 
-query III
+statement error
 ACL ROLE "r" SHOW VARIABLES;
 ----
+<REGEX>:.*SHOW VARIABLES is not available under ACL.*
 
-query I
+statement error
 ACL ROLE "r" SELECT count(*) FROM (SHOW VARIABLES);
 ----
-0
+<REGEX>:.*SHOW VARIABLES is not available under ACL.*
 
 # --- PRAGMA table_info is answered, not refused -----------------------------------------------------------
 

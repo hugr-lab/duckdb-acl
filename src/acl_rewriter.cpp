@@ -788,11 +788,11 @@ private:
 		// asking which databases it had got back a list of tables (spec 031).
 		auto asked = ShowTarget(show);
 		if (asked == "variables") {
-			// a principal has no session variables: `getvariable` is denied and nothing sets one for it.
-			// An empty answer in the right shape beats an error for a client that asks on connect.
-			ref = SubqueryOf("SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS value, NULL::VARCHAR AS type"
-			                 " WHERE false");
-			return;
+			// Session variables are not the principal's: only `ACL NATIVE` sets one, and `getvariable`
+			// is denied for the same reason. Answering empty would claim the principal has none, when
+			// the truth is that the ones which exist are none of its business (spec 031).
+			Deny("SHOW VARIABLES is not available under ACL: session variables are not part of a "
+			     "principal's catalog");
 		}
 		if (asked == "databases" || asked == "schemas" || asked == "__show_tables_expanded" ||
 		    (asked == "tables" && show.show_type != ShowType::SHOW_FROM)) {
@@ -1480,6 +1480,13 @@ private:
 		}
 		TablePolicy policy;
 		if (!store.ResolveTable(principal, key, policy)) {
+			// a name the principal *does* have, of a kind that is called rather than written: say which
+			// rather than leave an administrator reading "no access" about an object they can see
+			TablePolicy called;
+			if (store.ResolveTableFunction(principal, key, called) ||
+			    store.ResolveScalarFunction(principal, key, called)) {
+				Deny("\"" + key + "\" is a function, which is called rather than written");
+			}
 			Deny("no access to object \"" + key + "\"");
 		}
 		// a view / masked / computed relation is read-only; a grant that only narrows a real table

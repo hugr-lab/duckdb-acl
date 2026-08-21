@@ -341,7 +341,7 @@ struct PolicyStore {
 	bool CatalogObjectExists(const string &vcat, const string &vname, const string &kind);
 	//! refuse a grant naming an object nobody defined - a policy that never applies is worse than none
 	//! - and a policy on a scalar function, which has neither rows nor columns to narrow
-	void CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy);
+	void CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy, const string &caps_json);
 	//! ensure a role->catalog grant row exists without clobbering an existing one
 	void CatalogEnsureGrant(const string &role, const string &vcat, bool is_main);
 

@@ -3789,7 +3789,30 @@ void PolicyStore::CatalogMapRole(const string &issuer, const string &source, con
 void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,
                                        const string &caps_json, const string &rls, const string &columns) {
 	RequireCatalog(catalog, "acl catalog");
-	acl_detail::ParseCaps(caps_json);
+	// spec 032: a capability that cannot apply to what it names is a misunderstanding, not a no-op, and
+	// the refusal belongs here rather than in the pre-check - the legacy wrappers write a grant without
+	// passing through that one.
+	auto caps = acl_detail::ParseCaps(caps_json);
+	if (caps.count("manage")) {
+		throw BinderException("acl admin: `manage` is granted per catalog, not per object - administering the ACL is "
+		                      "catalog-scoped (spec 009)");
+	}
+	string written_verb;
+	for (auto verb : {"insert", "update", "delete", "merge"}) {
+		if (written_verb.empty() && caps.count(verb)) {
+			written_verb = verb;
+		}
+	}
+	if (!written_verb.empty() && !CatalogObjectExists(vcat, vname, "relation")) {
+		// a function is called rather than written, so a write verb on one would never be consulted
+		for (auto kind : {"table", "scalar"}) {
+			if (CatalogObjectExists(vcat, vname, kind)) {
+				throw BinderException("acl admin: \"%s.%s\" is a function, which is called rather than written - "
+				                      "`%s` on it would never be consulted (grant `select`)",
+				                      vcat, vname, written_verb);
+			}
+		}
+	}
 	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
 	                            vector<string> &statements) {
 		// the grant's predicate is checked against the object it filters, here rather than at query
@@ -3852,7 +3875,8 @@ bool PolicyStore::CatalogObjectExists(const string &vcat, const string &vname, c
 	return catalog->Query(sql)->RowCount() > 0;
 }
 
-void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy) {
+void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy,
+                                            const string &caps_json) {
 	RequireCatalog(catalog, "acl_grant_object");
 	// what the name is, in the terms resolution uses: a relation, a table reached through a schema
 	// alias, a function - or the bare alias path, which resolution never looks up by itself
