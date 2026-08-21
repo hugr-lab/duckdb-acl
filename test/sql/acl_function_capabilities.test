@@ -194,3 +194,20 @@ statement error
 ACL ADMIN GRANT OBJECT c.shout TO ROLE r WITH (select) RLS (x = 1);
 ----
 <REGEX>:.*has no rows or columns to narrow.*
+
+# --- the refusal is at the write, so the legacy wrappers cannot go around it -------------------------------
+# `acl_grant_table` registers an object and grants it in one call, without passing through the
+# grant-target pre-check - so that is not where the refusal can live
+
+statement error
+SELECT acl_grant_table('r', 'legacy', 'phys.main.orders', '', '', 'select,manage');
+----
+<REGEX>:.*`manage` is granted per catalog, not per object.*
+
+statement ok
+SELECT acl_grant_table('r', 'legacy', 'phys.main.orders', '', '', 'select,insert');
+
+query I
+SELECT caps FROM acl_object_grants() WHERE vname = 'legacy';
+----
+{"select": true, "insert": true}

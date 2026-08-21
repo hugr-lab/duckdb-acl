@@ -40,9 +40,11 @@ that holds for a scalar too, whose value is read the same way. No new capability
 `execute` distinct from `select` would break every grant that exists and buy nothing, since there is
 no second thing one can do with a function.
 
-**A capability that cannot apply is refused where it is written.** `CatalogRequireGrantTarget`
-already knows what the name is — a relation, a table function, a scalar, a schema alias — and already
-refuses a *policy* on a scalar for the same reason (spec 011). It now also refuses:
+**A capability that cannot apply is refused where the grant row is written** — in
+`CatalogSetObjectCaps`, not in the `CatalogRequireGrantTarget` pre-check. The pre-check is the obvious
+place and the wrong one: the legacy wrappers (`acl_grant_table` and friends) register an object and
+grant it in one call without passing through it, so a refusal living there is one `SELECT
+acl_grant_table(…, 'select,manage')` away from being bypassed. Refused:
 
 - any of `insert` / `update` / `delete` / `merge` when the name is only a function;
 - `manage` on any object grant, whichever kind it names.
@@ -72,13 +74,14 @@ resolvers are asked before the refusal is written, so an administrator reads
 
 ## Testing
 
-`test/sql/acl_function_capabilities.test` (42 assertions): `select` letting a table function and a
+`test/sql/acl_function_capabilities.test` (45 assertions): `select` letting a table function and a
 scalar be called and an explicit `{}` taking it away from each; each of the four write verbs refused
 on a table function and on a scalar, with the verb named; `false` not counting as a capability; a
 relation still taking all five; `manage` refused on a relation grant and on a function grant while
 still working at the catalog level; `INSERT`/`UPDATE`/`DELETE` naming a function refused by kind
-while a name that is nothing still says so; and a grant's `RLS` and column list still narrowing a
-table function, with a policy on a scalar still refused.
+while a name that is nothing still says so; a grant's `RLS` and column list still narrowing a
+table function, with a policy on a scalar still refused; and the legacy `acl_grant_table` wrapper
+refused for `manage` too, since it reaches the write without the pre-check.
 
 `acl_function_select_gate.test` demonstrated "an object capability overrides the catalog's downward"
 with `CAPS '{"insert": true}'` on a scalar — a grant this spec now refuses. It says the same thing
