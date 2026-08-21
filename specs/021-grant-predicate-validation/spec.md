@@ -8,8 +8,9 @@
 
 A grant's predicate — and an object's own — is bound against the relation it filters **at the moment it
 is written**. A predicate that cannot bind is refused there, instead of being stored and failing for
-whoever eventually queries the object. That also removes spec 020's last refusal: with the predicate
-known to bind against its target, a subquery inside it is no longer a hazard.
+whoever eventually queries the object. That also removes spec 020's last refusal: a predicate known to
+bind against its target makes a subquery inside it ordinary rather than dangerous — with the caveat in
+"Validation is best-effort" below.
 
 ## Problem
 
@@ -50,11 +51,27 @@ common shape — so the projection is not part of this question.
 Both write paths are covered: the grant (`acl_grant_object` and the `GRANT … RLS` forms) and the
 object definition (`acl_add_relation` and the `CREATE VIRTUAL …  RLS` forms).
 
+### Validation is best-effort, and that bounds what it may be leaned on for
+
+Two paths store a predicate unchecked: the source is not attached yet (the deliberate skip above), and
+the object was created inside a transaction that has not committed, so the probe's own connection
+cannot see it. In both the grant is stored as before.
+
+This matters because the refusal below is lifted *on the strength of* validation. The residual case is
+therefore not zero: a predicate with a bare correlated subquery reference naming a column the target
+does not have, written while the target was unbindable, still turns permissive in a multi-relation
+write. What keeps it narrow is that such a grant is broken for every ordinary use — any single-relation
+read of the object fails loudly with `Referenced column … not found` — so it would have to be an object
+used *only* as a multi-relation write target to go unnoticed.
+
+Closing it properly means recording whether a predicate was validated and refusing the multi-relation
+form for unvalidated ones; see follow-ups.
+
 ### Spec 020's subquery refusal is lifted
 
 `UPDATE … FROM` / `DELETE … USING` / `MERGE` accepted every predicate except one containing a
-subquery. That refusal existed only for the broken-grant case above, which can no longer be stored, so
-it is gone. The qualifier walk now descends into the *operand* of `x IN (SELECT …)` — which is in the
+subquery. That refusal existed only for the broken-grant case above, which the normal write path can no
+longer store, so it is gone. The qualifier walk now descends into the *operand* of `x IN (SELECT …)` — which is in the
 outer scope and needs the target's name — and leaves the subquery's own body alone, where a bare name
 belongs to its own scope.
 
@@ -101,4 +118,8 @@ succeeds.
 - The same treatment for a grant's **projection** expressions (`total = amount * 2`): they are probed
   today when the object is defined, but a grant-level projection is not checked the same way.
 - Re-validation on `acl_refresh_schema`: a source that drops a column leaves a predicate that no longer
-  binds, and nothing notices until a query does.
+  binds, and nothing notices until a query does. The same pass would validate predicates stored while
+  their source was unavailable.
+- **Record whether a predicate was validated.** With that flag, the multi-relation write forms can
+  refuse an unvalidated predicate containing a subquery, which closes the residual case above instead
+  of bounding it.
