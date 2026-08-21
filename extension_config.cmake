@@ -30,3 +30,25 @@ if(DEFINED ENV{ACL_INTEGRATION_MSSQL} AND NOT MINGW AND NOT ${WASM_ENABLED})
         GIT_TAG 1d74ae2c0e6c3fc963d3915784a36a7d06f0b6d1
     )
 endif()
+
+# The quack door (specs/041): duckdb's own client/server protocol, built here so the door can be
+# tested against a real server rather than only through its callbacks. Opt-in via ACL_QUACK=1, since
+# it pulls openssl/curl through vcpkg and quack itself is pre-release - the contract we plug into
+# (its authentication/authorization callbacks) can move, and a pinned build is how we find out.
+# quack needs json + autocomplete (core) and httpfs, which it pins itself; we take duckdb's own pin
+# so everything builds against the commit we track.
+#
+# NOT USABLE YET: quack 2ca17797 builds against duckdb e20aeb78, which is 65 commits (one day) ahead
+# of our a9ddce5a. Measured, not guessed - it needs `RemoteCapability::EXECUTE_STATEMENT` and the
+# `RemoteExecute(ClientContext &, unique_ptr<SQLStatement>)` overload, neither of which exists at our
+# pin. Moving our duckdb pin forward is the way in, and it is a step of its own.
+if(DEFINED ENV{ACL_QUACK} AND NOT MINGW AND NOT ${WASM_ENABLED})
+    duckdb_extension_load(json)
+    duckdb_extension_load(autocomplete)
+    include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/httpfs.cmake)
+    duckdb_extension_load(quack
+        DONT_LINK
+        GIT_URL https://github.com/duckdb/duckdb-quack
+        GIT_TAG 2ca17797acfed0e29187482700db30d0b01a7954
+    )
+endif()
