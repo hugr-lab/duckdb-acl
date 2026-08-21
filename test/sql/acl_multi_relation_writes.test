@@ -1,0 +1,224 @@
+# name: test/sql/acl_multi_relation_writes.test
+# description: writing with a second relation in scope (spec 020) - UPDATE ... FROM, DELETE ... USING
+#   and MERGE on a narrowed target: the grant's predicate binds to the target by name, and every MERGE
+#   branch that can touch a target row carries it
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, tenant VARCHAR, amount INT, ssn VARCHAR);
+
+# the source carries a column of the same name as the predicate's - the capture trap: an unqualified
+# `tenant = acl_claim(...)` would bind here and filter the wrong rows
+statement ok
+CREATE TABLE phys.main.feed(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 10, 's1'), (2, 'globex', 20, 's2'), (3, 'acme', 30, 's3');
+
+statement ok
+INSERT INTO phys.main.feed VALUES (1, 'zzz', 100), (2, 'zzz', 200), (9, 'zzz', 900);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.feed AS phys.main.feed;
+
+statement ok
+ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select, insert, update, delete, merge)
+    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN GRANT TABLE c.feed TO ROLE r WITH (select);
+
+# --- UPDATE ... FROM -------------------------------------------------------------------------------
+# id 2 is globex and matches the feed, so only a predicate bound to the target keeps it out; and if the
+# predicate had been captured by feed.tenant ('zzz') nothing at all would have been updated
+
+statement ok
+ACL ROLE "r" UPDATE orders SET amount = feed.amount FROM feed WHERE orders.id = feed.id;
+
+query III
+SELECT id, tenant, amount FROM phys.main.orders ORDER BY id;
+----
+1	acme	100
+2	globex	20
+3	acme	30
+
+# --- DELETE ... USING ------------------------------------------------------------------------------
+
+statement ok
+ACL ROLE "r" DELETE FROM orders USING feed WHERE orders.id = feed.id AND feed.id = 2;
+
+# globex survived: the statement named it, the grant did not reach it
+query I
+SELECT count(*) FROM phys.main.orders WHERE tenant = 'globex';
+----
+1
+
+# the principal's own row does delete this way
+statement ok
+ACL ROLE "r" DELETE FROM orders USING feed WHERE orders.id = feed.id AND feed.id = 1;
+
+query I
+SELECT count(*) FROM phys.main.orders WHERE id = 1;
+----
+0
+
+# --- MERGE: WHEN NOT MATCHED BY SOURCE is the branch that needs its own predicate ------------------
+# with the predicate on the ON clause, a row outside the grant never matches - which lands it in
+# "not matched by source", where an unguarded DELETE would reach exactly the rows it must not
+
+statement ok
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
+    WHEN MATCHED THEN UPDATE SET amount = feed.amount
+    WHEN NOT MATCHED BY SOURCE THEN DELETE;
+
+# globex (id 2) is still here; acme's id 3 was not in the feed, so the principal's own DELETE took it
+query III
+SELECT id, tenant, amount FROM phys.main.orders ORDER BY id;
+----
+2	globex	20
+
+# --- MERGE: the INSERT branch carries the column policy --------------------------------------------
+
+statement ok
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
+    WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (feed.id, feed.amount);
+
+# Two things at once. The grant assigns `tenant`, so rows arrive inside the principal's slice without
+# a WITH CHECK. And id 2 is inserted *alongside* the globex row rather than updating it: that row is
+# outside the grant, so it never matched, so the source row counts as not matched. A principal cannot
+# update through a row it cannot see, and it learns nothing about it either.
+query III
+SELECT id, tenant, amount FROM phys.main.orders ORDER BY id, tenant;
+----
+1	acme	100
+2	acme	200
+2	globex	20
+9	acme	900
+
+# a column the grant does not expose cannot be written through the merge either
+statement error
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
+    WHEN NOT MATCHED THEN INSERT (id, ssn) VALUES (feed.id, 'x');
+----
+<REGEX>:.*ssn.*
+
+# an injected column is assigned, not suggested: the supplied value is dropped
+statement ok
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
+    WHEN MATCHED THEN UPDATE SET tenant = 'globex';
+
+query I
+SELECT count(*) FROM phys.main.orders WHERE tenant = 'globex';
+----
+1
+
+# without an explicit column list there is nothing to check the grant against
+statement error
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id WHEN NOT MATCHED THEN INSERT BY NAME;
+----
+<REGEX>:.*must name its columns.*
+
+# --- MERGE: RETURNING is gated like every other read ----------------------------------------------
+
+statement error
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
+    WHEN MATCHED THEN UPDATE SET amount = 1 RETURNING ssn;
+----
+<REGEX>:.*column "ssn" of "orders" is not readable.*
+
+# --- a renamed target with a second relation in scope -------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.renamed AS phys.main.orders COLUMNS (order_id = id, total = amount);
+
+statement ok
+ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select, update, merge) COLUMNS (order_id, total);
+
+# `feed.id` is the source's column, and `id` is also the physical name behind `order_id`. A name-only
+# mapping refused it as `"renamed" has no column "id"`; the qualifier says whose column it is.
+statement ok
+ACL ROLE "r" UPDATE renamed SET total = 42 FROM feed WHERE renamed.order_id = feed.id;
+
+# the `renamed` grant carries no predicate, so every row the feed names is written - what is being
+# checked here is that `feed.id` reached the source and `renamed.order_id` reached the target
+query II
+SELECT id, amount FROM phys.main.orders ORDER BY id, amount;
+----
+1	42
+2	42
+2	42
+9	42
+
+# the principal's own name is still the only one they may write: the physical one is not theirs
+statement error
+ACL ROLE "r" UPDATE renamed SET amount = 1 FROM feed WHERE renamed.order_id = feed.id;
+----
+<REGEX>:.*"renamed" has no column "amount".*
+
+# ... and a MERGE against a renamed target maps its ON clause and its branches the same way
+statement ok
+ACL ROLE "r" MERGE INTO renamed AS t USING feed ON t.order_id = feed.id
+    WHEN MATCHED THEN UPDATE SET total = 7;
+
+query II
+SELECT id, amount FROM phys.main.orders ORDER BY id, amount;
+----
+1	7
+2	7
+2	7
+9	7
+
+statement ok
+ACL ADMIN CREATE ROLE sub CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE sub CAPS '{}' MAIN;
+
+# a predicate that filters with a subquery cannot be bound to the target by name, because a bare name
+# inside it belongs to the subquery's scope
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE sub WITH (select, update, merge)
+    RLS (id IN (SELECT id FROM phys.main.feed));
+
+statement ok
+ACL ADMIN GRANT TABLE c.feed TO ROLE sub WITH (select);
+
+statement error
+ACL ROLE "sub" UPDATE orders SET amount = 1 FROM feed WHERE orders.id = feed.id;
+----
+<REGEX>:.*filters with a subquery.*
+
+# ... and the single-relation form still works for that role, since nothing needs qualifying there
+statement ok
+ACL ROLE "sub" UPDATE orders SET amount = 2 WHERE id = 9;
+
+query I
+SELECT amount FROM phys.main.orders WHERE id = 9;
+----
+2

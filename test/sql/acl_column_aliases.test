@@ -100,20 +100,11 @@ ACL ROLE "analyst" UPDATE orders SET amount = 1 WHERE order_id = 1;
 ----
 <REGEX>:.*has no column "amount".*
 
-# --- a second relation in scope is refused rather than guessed ------------------------------------
+# a second relation in scope is allowed since spec 020, and covered there against a renamed target -
+# these writes change data, so they live in that file rather than in the middle of this one
 
 statement ok
 ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.raw_orders;
-
-statement error
-ACL ROLE "analyst" UPDATE orders SET total = 1 FROM raw_orders WHERE orders.order_id = raw_orders.id;
-----
-<REGEX>:.*cannot be written with FROM/USING/MERGE yet.*
-
-statement error
-ACL ROLE "analyst" MERGE INTO orders AS t USING (SELECT 1 AS k) AS s ON t.order_id = s.k WHEN MATCHED THEN DELETE;
-----
-<REGEX>:.*cannot be written with FROM/USING/MERGE yet.*
 
 # a relation without renames is unaffected by any of this
 statement ok

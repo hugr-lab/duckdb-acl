@@ -206,17 +206,13 @@ ACL ROLE "analyst" DELETE FROM orders WHERE id = 15 RETURNING amount;
 ----
 1500
 
-# a second relation in scope makes an unqualified reference ambiguous, so it is refused
-statement error
+# a second relation in scope is allowed since spec 020: the grant's predicate is bound to the target
+# by name, so a column of the same name on the other relation cannot capture it
+statement ok
 ACL ROLE "analyst" UPDATE orders SET amount = 1 FROM (SELECT 1 AS id) s WHERE orders.id = s.id;
-----
-<REGEX>:.*narrowed by a grant.*
 
-# MERGE is refused rather than half-enforced
-statement error
+statement ok
 ACL ROLE "analyst" MERGE INTO orders USING (SELECT 1 AS id) s ON orders.id = s.id WHEN MATCHED THEN DELETE;
-----
-<REGEX>:.*narrowed by a grant.*
 
 # a read-only object stays read-only: the grant narrows, it never widens
 statement ok

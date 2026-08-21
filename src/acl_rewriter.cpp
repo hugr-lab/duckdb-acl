@@ -368,7 +368,6 @@ private:
 	void RewriteUpdateNode(UpdateQueryNode &node) {
 		auto policy = ResolveDmlTarget(node.table, "update");
 		auto vname = dml_target_name;
-		RequireSingleScope(policy, node.from_table != nullptr, vname);
 		RewriteTableRef(node.from_table);
 		if (node.set_info) {
 			for (auto &column : node.set_info->columns) {
@@ -390,8 +389,13 @@ private:
 				}
 			}
 			RewriteExpr(node.set_info->condition);
-			MapColumnRefs(node.set_info->condition, policy, vname);
-			AndPolicyPredicate(node.set_info->condition, policy);
+			MapColumnRefs(node.set_info->condition, policy, vname,
+			              node.from_table ? TargetAliasOf(node.table) : Identifier());
+			if (node.from_table) {
+				AndInto(node.set_info->condition, TargetPredicate(policy, TargetAliasOf(node.table), vname));
+			} else {
+				AndPolicyPredicate(node.set_info->condition, policy);
+			}
 		}
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
@@ -403,13 +407,17 @@ private:
 	void RewriteDeleteNode(DeleteQueryNode &node) {
 		auto policy = ResolveDmlTarget(node.table, "delete");
 		auto vname = dml_target_name;
-		RequireSingleScope(policy, !node.using_clauses.empty(), vname);
 		for (auto &using_ref : node.using_clauses) {
 			RewriteTableRef(using_ref);
 		}
 		RewriteExpr(node.condition);
-		MapColumnRefs(node.condition, policy, vname);
-		AndPolicyPredicate(node.condition, policy);
+		MapColumnRefs(node.condition, policy, vname,
+		              node.using_clauses.empty() ? Identifier() : TargetAliasOf(node.table));
+		if (!node.using_clauses.empty()) {
+			AndInto(node.condition, TargetPredicate(policy, TargetAliasOf(node.table), vname));
+		} else {
+			AndPolicyPredicate(node.condition, policy);
+		}
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname);
@@ -419,26 +427,103 @@ private:
 
 	void RewriteMergeNode(MergeQueryNode &node) {
 		auto policy = ResolveDmlTarget(node.target, "merge");
-		RequireSingleScope(policy, true, dml_target_name); // MERGE always has a source in scope
+		auto vname = dml_target_name;
+		auto alias = TargetAliasOf(node.target);
 		RewriteTableRef(node.source);
 		RewriteExpr(node.join_condition);
+		MapColumnRefs(node.join_condition, policy, vname, alias);
+		// The predicate joins the target rather than filters the result: a row outside the grant is
+		// never matched, so no WHEN MATCHED branch can reach it.
+		AndInto(node.join_condition, TargetPredicate(policy, alias, vname));
 		for (auto &action_set : node.actions) {
 			for (auto &action : action_set.second) {
 				RewriteExpr(action->condition);
+				MapColumnRefs(action->condition, policy, vname, alias);
+				if (action_set.first == MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE) {
+					// ... but "not matched" now includes every row the predicate excluded, and this
+					// branch acts on exactly those, so it needs the predicate of its own.
+					AndInto(action->condition, TargetPredicate(policy, alias, vname));
+				}
 				if (action->update_info) {
+					for (auto &column : action->update_info->columns) {
+						column = MapWrittenColumn(policy, column, vname);
+						RequireWritableColumn(policy, column, vname);
+					}
 					for (auto &expr : action->update_info->expressions) {
 						RewriteExpr(expr);
+						MapColumnRefs(expr, policy, vname, alias);
 					}
+					ApplySetInjections(*action->update_info, policy, vname);
 					RewriteExpr(action->update_info->condition);
+					MapColumnRefs(action->update_info->condition, policy, vname, alias);
 				}
 				for (auto &expr : action->expressions) {
 					RewriteExpr(expr);
+					MapColumnRefs(expr, policy, vname, alias);
+				}
+				if (action->action_type == MergeActionType::MERGE_INSERT) {
+					ApplyMergeInsertPolicy(*action, policy, vname);
 				}
 			}
 		}
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
+			MapColumnRefs(item, policy, vname, alias);
 		}
+		RequireReadableReturning(node.returning_list, policy, vname);
+	}
+
+	//! A grant's value column is assigned, not suggested - the same rule the UPDATE path applies
+	void ApplySetInjections(UpdateSetInfo &set_info, const TablePolicy &policy, const string &vname) {
+		for (idx_t i = 0; i < set_info.columns.size() && i < set_info.expressions.size(); i++) {
+			for (auto &injection : policy.injections) {
+				if (StringUtil::CIEquals(injection.first, set_info.columns[i].GetIdentifierName())) {
+					set_info.expressions[i] = InjectedValue(injection, vname);
+					break;
+				}
+			}
+		}
+	}
+
+	//! A merge's INSERT branch writes a new row, so it carries the grant's column policy exactly as a
+	//! plain INSERT does: only granted columns, and every injected value assigned rather than supplied.
+	void ApplyMergeInsertPolicy(MergeIntoAction &action, const TablePolicy &policy, const string &vname) {
+		if (policy.write_columns.empty() && policy.injections.empty()) {
+			return;
+		}
+		if (action.default_values || action.insert_columns.empty() ||
+		    action.column_order == InsertColumnOrder::INSERT_BY_NAME) {
+			// without an explicit column list we do not know which physical columns are written
+			Deny("the insert branch of a merge into \"" + vname + "\" must name its columns");
+		}
+		for (auto &column : action.insert_columns) {
+			column = MapWrittenColumn(policy, column, vname);
+			RequireWritableColumn(policy, column, vname);
+		}
+		if (policy.injections.empty()) {
+			return;
+		}
+		vector<Identifier> columns;
+		vector<unique_ptr<ParsedExpression>> items;
+		for (idx_t i = 0; i < action.insert_columns.size() && i < action.expressions.size(); i++) {
+			bool injected = false;
+			for (auto &injection : policy.injections) {
+				if (StringUtil::CIEquals(injection.first, action.insert_columns[i].GetIdentifierName())) {
+					injected = true; // the supplied value is dropped: the grant assigns this column
+					break;
+				}
+			}
+			if (!injected) {
+				columns.push_back(action.insert_columns[i]);
+				items.push_back(std::move(action.expressions[i]));
+			}
+		}
+		for (auto &injection : policy.injections) {
+			columns.push_back(Identifier(injection.first));
+			items.push_back(InjectedValue(injection, vname));
+		}
+		action.insert_columns = std::move(columns);
+		action.expressions = std::move(items);
 	}
 
 	//===------------------------------------------------------------------===//
@@ -697,20 +782,26 @@ private:
 	}
 
 	//! Rewrite column references of the DML target's own scope (SET values, WHERE, RETURNING)
-	void MapColumnRefs(unique_ptr<ParsedExpression> &expr, const TablePolicy &policy, const string &vname) {
+	void MapColumnRefs(unique_ptr<ParsedExpression> &expr, const TablePolicy &policy, const string &vname,
+	                   const Identifier &target_alias = Identifier()) {
 		if (!expr) {
 			return;
 		}
 		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &column_ref = expr->Cast<ColumnRefExpression>();
 			auto &names = column_ref.ColumnNamesMutable();
-			if (!names.empty()) {
-				names.back() = MapWrittenColumn(policy, names.back(), vname);
+			if (names.empty()) {
+				return;
 			}
+			if (!target_alias.empty() && names.size() >= 2 &&
+			    !StringUtil::CIEquals(names[names.size() - 2].GetIdentifierName(), target_alias.GetIdentifierName())) {
+				return; // qualified by another relation in scope: not the target's column
+			}
+			names.back() = MapWrittenColumn(policy, names.back(), vname);
 			return;
 		}
 		ParsedExpressionIterator::EnumerateChildren(
-		    *expr, [&](unique_ptr<ParsedExpression> &child) { MapColumnRefs(child, policy, vname); });
+		    *expr, [&](unique_ptr<ParsedExpression> &child) { MapColumnRefs(child, policy, vname, target_alias); });
 	}
 
 	//! A grant's value column is an assignment, so it may only be built from claims and constants: an
@@ -858,19 +949,75 @@ private:
 		    expr, [&](const ParsedExpression &child) { RequireReadableExpr(child, policy, vname); });
 	}
 
-	//! A narrowed or renamed relation may only be written when the statement has no second relation in
-	//! scope: an unqualified column reference - the user's, or the one the policy adds to the WHERE -
-	//! could otherwise belong to either side, and guessing would silently write the wrong column.
-	void RequireSingleScope(const TablePolicy &policy, bool has_other_relation, const string &vname) {
-		if (!has_other_relation) {
+	//! A policy predicate containing a subquery cannot be qualified: a bare name inside it belongs to
+	//! that subquery's own scope, not to the target's.
+	static bool ContainsSubquery(const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			return true;
+		}
+		bool found = false;
+		ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+			if (ContainsSubquery(child)) {
+				found = true;
+			}
+		});
+		return found;
+	}
+
+	//! Qualify every bare column reference with the target's alias. Without this, a column of the same
+	//! name on the other relation in scope captures the grant's predicate and it filters the wrong rows.
+	static void QualifyWithTarget(unique_ptr<ParsedExpression> &expr, const Identifier &alias) {
+		if (!expr) {
 			return;
 		}
-		if (!policy.renames.empty()) {
-			Deny("\"" + vname + "\" renames columns, so it cannot be written with FROM/USING/MERGE yet");
+		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = expr->Cast<ColumnRefExpression>().ColumnNamesMutable();
+			if (names.size() == 1) {
+				names.insert(names.begin(), alias);
+			}
+			return;
 		}
-		if (HasWritePolicy(policy)) {
-			Deny("\"" + vname + "\" is narrowed by a grant, so it cannot be written with FROM/USING/MERGE yet");
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expr, [&](unique_ptr<ParsedExpression> &child) { QualifyWithTarget(child, alias); });
+	}
+
+	//! The name the target answers to after ResolveDmlTarget: its alias, which is the virtual name
+	//! unless the principal wrote one of their own (spec 019).
+	static Identifier TargetAliasOf(const unique_ptr<TableRef> &target) {
+		if (target && target->type == TableReferenceType::BASE_TABLE) {
+			auto &base = target->Cast<BaseTableRef>();
+			return base.alias.empty() ? base.Table() : base.alias;
 		}
+		return Identifier();
+	}
+
+	//! The grant's predicate, baked and bound to the target by name; nullptr when the grant has none
+	unique_ptr<ParsedExpression> TargetPredicate(const TablePolicy &policy, const Identifier &alias,
+	                                             const string &vname) {
+		if (policy.rls.empty()) {
+			return nullptr;
+		}
+		auto predicate = store.InstantiateExpr(policy.rls, template_options);
+		BakeMarkers(predicate, nullptr);
+		if (ContainsSubquery(*predicate)) {
+			Deny("the grant on \"" + vname +
+			     "\" filters with a subquery, so it cannot be written with "
+			     "FROM/USING/MERGE yet");
+		}
+		QualifyWithTarget(predicate, alias);
+		return predicate;
+	}
+
+	static void AndInto(unique_ptr<ParsedExpression> &condition, unique_ptr<ParsedExpression> predicate) {
+		if (!predicate) {
+			return;
+		}
+		if (!condition) {
+			condition = std::move(predicate);
+			return;
+		}
+		condition = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(condition),
+		                                             std::move(predicate));
 	}
 
 	//! Resolve a DML target in place (name -> physical), enforcing the required capability
