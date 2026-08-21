@@ -12,6 +12,8 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <unordered_map>
 
 namespace duckdb {
@@ -1292,12 +1294,64 @@ void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &ou
 	}
 }
 
+//! Is `name_lower` *called* anywhere in the query - the identifier followed by its open parenthesis?
+//! Allocation-free, because every unprefixed statement passes through here, so it must not copy the
+//! query to lowercase.
+//!
+//! The parenthesis is not pedantry: the resolver embeds the name it is looking up as a literal in its
+//! own catalog SQL, so a bare occurrence says nothing about what the statement does. A call is what a
+//! generated ingest statement always contains and a quoted name never is.
+bool CallsFunctionNamed(const string &query, const char *name_lower, idx_t name_size) {
+	if (query.size() < name_size) {
+		return false;
+	}
+	auto end = query.end();
+	auto ci_match = [](char a, char b) {
+		return StringUtil::CharacterToLower(a) == b;
+	};
+	for (auto it = query.begin();;) {
+		it = std::search(it, end, name_lower, name_lower + name_size, ci_match);
+		if (it == end) {
+			return false;
+		}
+		auto after = it + UnsafeNumericCast<int64_t>(name_size);
+		while (after != end && StringUtil::CharacterIsSpace(*after)) {
+			after++;
+		}
+		if (after != end && *after == '(') {
+			return true;
+		}
+		++it;
+	}
+}
+
+//! quack drains a client's streamed INSERT with a statement the *server* generates on the client's
+//! own connection - `INSERT INTO <schema>.<table> SELECT * FROM scan_data_from_quack_client('<id>')`
+//! - and generates it unprefixed, so it arrives here as an ordinary native statement and would run
+//! with the operator's rights and no policy at all.
+//!
+//! Measured, not hypothesised (spec 041): where the published name resolves to a physical table of
+//! matching width, a client bulk-inserted rows its own predicate forbids. The refusal lives here, at
+//! the one place every unprefixed statement passes, rather than only in the probe quack authorizes
+//! first - what actually writes is this statement, and it names this function every time.
+//!
+//! This is where the stream ledger will attach the principal instead of refusing (spec 042): the
+//! stream id carries quack's connection id, which is already bound to a session.
+bool DrainsQuackClientStream(const string &query) {
+	static constexpr const char *STREAM_SCAN = "scan_data_from_quack_client";
+	return CallsFunctionNamed(query, STREAM_SCAN, strlen(STREAM_SCAN));
+}
+
 ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &query, ParserOptions &options) {
 	if (InAclParse()) {
 		return ParserOverrideResult(); // our own inner parse: decline, and let the others try
 	}
 	auto prefix = ParseAclPrefix(query);
 	if (prefix.kind == AclPrefix::Kind::NONE) {
+		if (DrainsQuackClientStream(query)) {
+			throw BinderException("acl: a streamed insert carries no principal, so it would be written outside "
+			                      "the policy - bulk loading through the quack door is not available yet");
+		}
 		return ParserOverrideResult(); // fall through to the native parser
 	}
 	auto &store = *info->Cast<AclParserInfo>().store;

@@ -105,8 +105,10 @@ SELECT * FROM remote.main.orders ORDER BY id;
 2	globex
 
 # --- streamed ingest does not write ---------------------------------------------------------------------
-# the server generates its ingest INSERT unprefixed, and outside the ACL a virtual name is nothing - so
-# it fails rather than writing around the policy (spec 041)
+# quack asks the authorization function about a streamed insert with a statement it never executes, and
+# then generates the real INSERT unprefixed. We answer no to the question, because we cannot enforce the
+# statement that would follow it (spec 041). This refusal is deliberate: the layout below is the one that
+# proves it has to be.
 
 statement ok
 CREATE TABLE bulk AS SELECT i AS id, 'bulk' AS tenant FROM range(5000) t(i);
@@ -114,7 +116,7 @@ CREATE TABLE bulk AS SELECT i AS id, 'bulk' AS tenant FROM range(5000) t(i);
 statement error
 INSERT INTO remote.main.orders SELECT * FROM bulk;
 ----
-<REGEX>:.*orders.*
+<REGEX>:.*Authorization failed.*
 
 query I
 SELECT count(*) FROM phys.main.orders;

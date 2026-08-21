@@ -97,6 +97,43 @@ SELECT acl_quack_authorize('conn-1', 'SELECT 1') IS NOT NULL;
 ----
 true
 
+# --- a streamed insert is refused, at both places it can be refused -------------------------------------
+# quack asks about a streamed insert with a statement it never executes, reading only whether the answer
+# is NULL - so composing a prefix for it would say "allowed" while enforcing nothing, and the real INSERT
+# is then generated unprefixed. Measured (spec 041): on a layout where that generated statement resolves,
+# it wrote rows the principal's own predicate forbids.
+
+query I
+SELECT acl_quack_authorize('conn-1', 'INSERT INTO "main"."orders" VALUES (NULL)') IS NULL;
+----
+true
+
+# the shape is matched, not the exact text quack happens to produce today
+query III
+SELECT acl_quack_authorize('conn-1', '  insert into orders values (null)  ;') IS NULL,
+       acl_quack_authorize('conn-1', 'INSERT INTO "s"."t" VALUES (NULL);') IS NULL,
+       acl_quack_authorize('conn-1', 'INSERT INTO orders VALUES (NULL)') IS NULL;
+----
+true	true	true
+
+# an ordinary insert is still composed and enforced: refusing ingest must not refuse writing
+query I
+SELECT acl_quack_authorize('conn-1', 'INSERT INTO orders (id, tenant) VALUES (1, ''acme'')') IS NOT NULL;
+----
+true
+
+# and the statement that would actually write - the one the server generates on its own - is refused
+# where every unprefixed statement passes, so the fence does not depend on recognising the question
+statement error
+SELECT * FROM scan_data_from_quack_client('someone-elses-stream');
+----
+<REGEX>:.*streamed insert carries no principal.*
+
+statement error
+INSERT INTO phys.main.orders SELECT * FROM scan_data_from_quack_client('c:1');
+----
+<REGEX>:.*streamed insert carries no principal.*
+
 # --- an expired session stops composing, on the connection it was bound to ----------------------------
 # opened with a wide skew, judged with none - the same trick the session contract's own test uses
 

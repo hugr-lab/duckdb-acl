@@ -1025,9 +1025,39 @@ void AclQuackAuthenticateFunc(DataChunk &args, ExpressionState &state, Vector &r
 	}
 }
 
+//! quack asks the authorization function about a streamed insert with a statement it never executes
+//! - `INSERT INTO <schema>.<table> VALUES (NULL)` - purely so a policy layer can decide whether this
+//! principal may write to that table. Only the answer's nullness is read: our prefixed VARCHAR is
+//! non-NULL, so it reads as "allowed" while enforcing nothing, and the real insert is then generated
+//! unprefixed (spec 041). Until the ledger can attach a principal to it, the honest answer is no.
+//!
+//! Matched narrowly - a two-part target and a single NULL value, which is quack's exact generated
+//! form. A client writing that same statement by hand is refused too; it inserts a NULL row into a
+//! one-column table, so the cost of the false refusal is small next to what it guards.
+bool IsQuackIngestProbe(const string &sql) {
+	static const string HEAD = "insert into ";
+	static const string TAIL = "values (null)";
+	string trimmed = sql;
+	StringUtil::Trim(trimmed);
+	while (!trimmed.empty() && trimmed.back() == ';') {
+		trimmed.pop_back();
+		StringUtil::Trim(trimmed);
+	}
+	if (trimmed.size() < HEAD.size() + TAIL.size()) {
+		return false;
+	}
+	if (!StringUtil::CIStartsWith(trimmed, HEAD) || !StringUtil::CIEndsWith(trimmed, TAIL)) {
+		return false;
+	}
+	auto target = trimmed.substr(HEAD.size(), trimmed.size() - HEAD.size() - TAIL.size());
+	StringUtil::Trim(target);
+	return !target.empty();
+}
+
 //! acl_quack_authorize(connection_id, query): quack's authorization callback (spec 041). A VARCHAR
 //! return replaces the SQL quack executes, so returning the prefixed statement is the whole of
-//! serving under the ACL; NULL is a refusal, which is what an unknown or expired session gets.
+//! serving under the ACL; NULL is a refusal, which is what an unknown or expired session gets - and
+//! what a streamed insert gets, because the statement that would write it is not this one.
 void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -1036,6 +1066,10 @@ void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &resu
 		auto &store = StoreOf(state);
 		string handle;
 		if (!store.SessionHandleFor(connection_id, handle)) {
+			result.SetValue(row, Value());
+			continue;
+		}
+		if (IsQuackIngestProbe(sql)) {
 			result.SetValue(row, Value());
 			continue;
 		}

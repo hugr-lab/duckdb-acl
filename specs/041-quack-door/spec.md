@@ -20,7 +20,8 @@ streamed ingest fails closed.
 
 A gateway prefixes every statement today. A client that connects for itself cannot: it authenticates
 once and then sends ordinary SQL. Without something in between, a served connection is either
-unprefixed — and under `STRICT` refuses everything — or prefixed by a component that must be trusted
+unprefixed — and an unprefixed statement is not refused, it simply runs natively with the operator's
+rights, which is worse — or prefixed by a component that must be trusted
 to do it on every statement, forever.
 
 ## Design
@@ -84,15 +85,44 @@ Two refusals only a live client found, both fixed here:
 
 - a small `INSERT … VALUES` is pushed to the server **as a statement**, so it goes through the
   authorization function, gets prefixed, and is enforced — the row lands through the ACL;
-- a bulk `INSERT … SELECT` goes down quack's `SEND_DATA` path, where the server generates
-  `INSERT INTO <schema>.<table> SELECT * FROM scan_data_from_quack_client('<id>')` **unprefixed**, on
-  the client's own connection. That statement names a *virtual* object, and outside the ACL virtual
-  names do not exist — so it fails (`Table with name orders does not exist`) and nothing is written.
+- a bulk `INSERT … SELECT` goes down quack's `SEND_DATA` path, and that path **is not the statement
+  path**. quack asks the authorization function about it with a statement it never executes —
+  `INSERT INTO <schema>.<table> VALUES (NULL)`, generated purely so a policy layer can decide — and
+  reads only whether the answer is NULL. It then generates the real statement,
+  `INSERT INTO <schema>.<table> SELECT * FROM scan_data_from_quack_client('<id>')`, **unprefixed**, on
+  the client's own connection.
 
-So streamed ingest does not bypass the ACL; it does not work. That is fail-closed by construction
-rather than by a check, and it settles the v1 question: no stream ledger is needed for safety. One is
-needed for *functionality* — and bulk loading is a large part of what quack is for — so it is a spec
-of its own, with two pieces this one measured — the first of which landed here:
+The first version of this spec called that fail-closed, because the generated statement names a
+*virtual* object and outside the ACL virtual names do not exist. **That was wrong, and the correction
+is the important part of this section.** Two mistakes stood behind it:
+
+- **an unprefixed statement is not refused.** `STRICT` governs whether duckdb consults an override at
+  all, not whether every statement must carry a prefix — so a statement we decline runs natively, with
+  the operator's rights and no policy. Declining is right for the console and the bootstrap; it is
+  exactly wrong for a statement a client caused.
+- **the name resolves more often than the test's layout suggested.** The generated INSERT is resolved
+  in the server's *default* catalog. The integration test kept its physical tables in an attached
+  catalog, so the name found nothing and the write failed — a property of that layout, not of the
+  design. Put the physical table in the default catalog under the name the object publishes, and the
+  statement binds.
+
+Measured on that layout, with the object publishing its full width: a client bulk-inserted **5000 rows
+carrying a tenant its own grant predicate forbids**, into the physical table, with no RLS, no injected
+claim, and no capability check that meant anything — the prefixed VARCHAR we returned for the probe is
+non-NULL, so quack read it as "allowed" while nothing enforced it. Where the widths disagreed the write
+was stopped only by `table orders has 3 columns but 2 values were supplied`, which is duckdb counting,
+not us deciding.
+
+**So it is refused, in two places.** The probe is answered NULL — quack turns that into
+"Authorization failed" and no data moves at all. And the generated statement is refused where every
+unprefixed statement passes, in the parser override itself: a statement that *calls*
+`scan_data_from_quack_client` carries no principal and cannot be enforced, so it does not run. The
+second is the security boundary — what writes is that statement, and it names that function every time,
+whatever quack later does to the question it asks first. The first is the good error message.
+
+Streamed ingest therefore does not work, deliberately and by a check rather than by an accident of
+layout. Making it *work* is a spec of its own — bulk loading is a large part of what quack is for —
+with two pieces this one measured, the first of which landed here:
 
 - **the column list has to be supplied** — and this half landed here. duckdb matches a listless INSERT
   by position against the table's *full width*, and does not match by name at all, while the client
@@ -108,8 +138,11 @@ of its own, with two pieces this one measured — the first of which landed here
 Worth saying plainly, because it shrinks what looks like a large piece of work: once the generated
 statement reaches the rewriter **with a principal attached**, it is an ordinary `INSERT … SELECT` and
 everything above is machinery we already have. The only door-specific part is attaching the principal
-to an unprefixed statement — one lookup by the stream id the authorization callback recorded before
-the first row moved. The ledger is not an ingest mechanism; it is that lookup.
+to an unprefixed statement — and the stream id makes that nearly free. quack builds it as
+`connection_id + ":" + uuid` (`QuackStreamRegistry::MakeId`) and passes it to the scan function, so the
+statement that refuses to run today *already carries* the connection id that
+`acl_quack_authenticate` bound to a session. The ledger is not a new table and not an ingest mechanism;
+it is reading the principal back out of the id at the place that currently throws.
 
 What is left open is precisely where the two meet. The generated ingest INSERT names no columns, and
 the synthesis above declines to name them when the grant injects values — because an injection projects
@@ -130,6 +163,25 @@ thing that returns.)
   authentication function into "Authentication failed", and NULL from the authorization function into
   "Authorization failed" — both fail-closed by quack's own construction (`EvaluateAuthQuery` returns
   `Value(false)` on any error).
+- **Answering a question quack asks is not the same as enforcing the statement it runs.** The ingest
+  probe is the one place where the two came apart, and it is the reason for the fence in the parser
+  override: what enforces a statement is the rewrite, so a path that does not carry our rewritten SQL
+  must be refused rather than authorized. Anything a future quack asks about but executes itself falls
+  under the same rule.
+- **The other message types were audited for the same shape**, since the bug was not that this one
+  path was wrong but that we had not asked the question of each. quack handles nine:
+  `CONNECTION_REQUEST` calls the authentication function; `PREPARE_REQUEST` calls the authorization
+  function **and executes what it returns**, which is the path the whole door rests on;
+  `SEND_DATA_REQUEST` is the one above. The remaining six — `FETCH_REQUEST`, `FINALIZE`,
+  `CANCEL_REQUEST`, `DISCONNECT_MESSAGE`, `ACKNOWLEDGEMENT`, `HEARTBEAT_REQUEST` — carry no SQL and
+  touch only the state of the connection they arrive on, which the server resolves per message from
+  the connection id. So exactly two message types carry SQL, and both are accounted for. This list is
+  a snapshot of a pre-release protocol: a new message type is a new question, not a new answer.
+- **The fence is blunt on purpose.** It refuses any unprefixed statement that *calls*
+  `scan_data_from_quack_client`, without parsing. The parenthesis is required because the resolver
+  embeds the name it is looking up as a literal in its own catalog SQL — found by this very test — so
+  a bare occurrence proves nothing while a call is what a generated ingest statement always is. A
+  client cannot author that text: the statement is the server's own.
 - **The handle never reaches the client.** quack's `connection_id` does, and it is a bearer credential
   in quack's model; our handle is separate, minted by us, and only ever appears in SQL we compose.
 - **A client cannot re-prefix its way anywhere.** Verified before this spec: a client writing its own
@@ -140,12 +192,20 @@ thing that returns.)
 
 ## Testing
 
-`test/sql/acl_quack_door.test` (38 assertions) — the callbacks as ordinary SQL functions, which is all
+`test/sql/acl_quack_door.test` (45 assertions) — the callbacks as ordinary SQL functions, which is all
 a door has to prove: authentication true for a verified token, false for one nobody can verify and for
 one from an issuer nobody defined; authorization composing the prefix for a bound connection and
 refusing an unknown one; an expired session refused on the connection it was bound to;
 `acl_quack_serve` refusing each condition by name; quack's own functions denied to a principal, and
-the callbacks themselves out of a principal's reach.
+the callbacks themselves out of a principal's reach. Plus both halves of the ingest refusal: the probe
+answered NULL in the shapes it can arrive in, an ordinary insert still composed, and the parser fence
+refusing a statement that calls the stream scan.
+
+`test/sql/integration/acl_quack_ingest_denied.test` (25 assertions, needs `ACL_QUACK=1`) — the bypass,
+on the layout that made it real: the physical table in the server's default catalog under the published
+name, the object publishing its full width, and the role confined by a predicate. A bulk insert is
+refused, the table is unchanged and carries no forbidden tenant, and a small insert still writes through
+the statement path — so the refusal is aimed at ingest, not at writing.
 
 `test/sql/integration/acl_quack_serve.test` (32 assertions, needs `ACL_QUACK=1`) — the live door in one
 process, since quack is both server and client: one call opens it, a client with a verified token
