@@ -915,7 +915,7 @@ void AclSessionOpenFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto token = RequiredArg(args, 0, row, "acl_session_open", "token");
-		auto handle = StoreOf(state).SessionOpen(*context.db, token);
+		auto handle = StoreOf(state).SessionOpen(token);
 		if (handle.empty()) {
 			result.SetValue(row, Value());
 			continue;

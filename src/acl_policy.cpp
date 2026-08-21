@@ -2,13 +2,11 @@
 
 #include "acl_token.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
-#include "duckdb/common/encryption_state.hpp"
-#include "duckdb/common/random_engine.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
-#include "duckdb/main/config.hpp"
 
 #include <chrono>
+#include <random>
 #include "duckdb/parser/parser.hpp"
 
 namespace duckdb {
@@ -164,21 +162,21 @@ int64_t NowSeconds() {
 	    .count();
 }
 
-//! A handle a client cannot guess: 128 bits from duckdb's own encryption utility, hex-encoded. Never
+//! A handle a client cannot guess: 128 bits from the platform's entropy source, hex-encoded. Never
 //! derived from the token, so holding one tells nothing about it (spec 040).
-string MintHandle(DatabaseInstance &db) {
+//!
+//! `std::random_device` rather than duckdb's own utilities, deliberately: `RandomEngine` seeds from
+//! the clock off Linux, and the encryption util refuses to generate randomness unless OpenSSL arrived
+//! with httpfs (its mbedTLS fallback demands `force_mbedtls_unsafe`). On both supported platforms
+//! `std::random_device` is the OS CSPRNG, and it cannot quietly degrade into a timestamp.
+string MintHandle() {
 	constexpr idx_t HANDLE_BYTES = 16;
 	data_t bytes[HANDLE_BYTES];
-	auto &util = DBConfig::GetConfig(db).encryption_util;
-	auto state = util ? util->CreateEncryptionState(make_uniq<EncryptionStateMetadata>()) : nullptr;
-	if (state) {
-		state->GenerateRandomData(bytes, HANDLE_BYTES);
-	} else {
-		// no crypto provider in this build: still unguessable in practice, and the handle is only ever
-		// a lookup key - it carries nothing and grants nothing on its own
-		RandomEngine engine;
-		for (idx_t i = 0; i < HANDLE_BYTES; i++) {
-			bytes[i] = static_cast<data_t>(engine.NextRandomInteger(0, 256));
+	std::random_device source;
+	for (idx_t i = 0; i < HANDLE_BYTES; i += 4) {
+		auto word = static_cast<uint32_t>(source());
+		for (idx_t byte = 0; byte < 4; byte++) {
+			bytes[i + byte] = static_cast<data_t>((word >> (8 * byte)) & 0xFF);
 		}
 	}
 	string handle(HANDLE_BYTES * 2, '\0');
@@ -191,7 +189,7 @@ string MintHandle(DatabaseInstance &db) {
 
 } // namespace
 
-string PolicyStore::SessionOpen(DatabaseInstance &db, const string &token) {
+string PolicyStore::SessionOpen(const string &token) {
 	Principal principal;
 	int64_t expires_at = 0;
 	string issuer;
@@ -218,7 +216,7 @@ string PolicyStore::SessionOpen(DatabaseInstance &db, const string &token) {
 	} else if (!VerifyPrincipal(true, token, principal)) {
 		return string(); // the dev stub, which carries no expiry
 	}
-	auto handle = MintHandle(db);
+	auto handle = MintHandle();
 	lock_guard<mutex> guard(lock);
 	sessions[handle] = Session {std::move(principal), expires_at};
 	return handle;

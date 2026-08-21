@@ -371,7 +371,7 @@ struct PolicyStore {
 	bool VerifyPrincipal(bool is_token, const string &value, Principal &out);
 	//! Verify a token and mint an opaque handle for it (spec 040). Empty when the token does not
 	//! verify: a door refuses rather than learning why, and the reason belongs to whoever verified.
-	string SessionOpen(DatabaseInstance &db, const string &token);
+	string SessionOpen(const string &token);
 	//! The principal behind a handle, or false with `reason` saying which of "unknown" / "expired" it
 	//! is - a client that reconnects needs to tell those apart.
 	bool SessionPrincipal(const string &handle, Principal &out, string &reason);

@@ -72,13 +72,17 @@ channel. Not in this spec: the shared backends, and the portability predicate th
 - **Fail-closed at every step.** A token that does not verify gives NULL, not a session. An unknown,
   closed or expired handle gives NULL from `acl_session_sql` and a refusal from the prefix. A door
   that forgets to check NULL prefixes nothing, and an unprefixed statement is refused under `STRICT`.
-- **A handle is a bearer credential**, so it is minted with the same care as any other: cryptographic
-  randomness, never derived from the token, never logged by us. It is strictly better than the JWT it
-  replaces in the query text — shorter-lived, revocable by `acl_session_close`, and useless outside
+- **A handle is a bearer credential**, so where its randomness comes from is a decision, not a
+  detail. It uses `std::random_device` — the OS CSPRNG on both supported platforms — rather than
+  duckdb's own utilities, and the self-review is why: `RandomEngine` seeds from the clock off Linux,
+  and the encryption util refuses to generate randomness unless OpenSSL arrived with httpfs (its
+  mbedTLS fallback demands `force_mbedtls_unsafe`). Reading `DBConfig::encryption_util` directly, as
+  the first cut did, silently took the clock-seeded path in every ordinary build. The handle is never
+  derived from the token, never logged by us, revocable by `acl_session_close`, and useless outside
   this instance.
-- **A client cannot mint or borrow one.** `acl_session_open` is an admin-surface function like
-  `acl_use_db`: a principal's statement is rewritten inside its virtual catalog, where the function
-  does not exist. And a client writing `ACL SESSION 'x'` into its own query text is refused the same
+- **A client cannot mint or borrow one.** Verified rather than assumed: under a principal all three
+  functions are refused by the gate (`function "acl_session_open" is not allowed`), so a principal can
+  neither mint a session, nor compose a prefix, nor close somebody else's. And a client writing `ACL SESSION 'x'` into its own query text is refused the same
   way a doubled prefix is today — the injected prefix is the only one that binds.
 - **No new query parameters** (the golden rule): the prefix is text, and the statement after it is the
   client's own.
@@ -125,4 +129,9 @@ process not seeing each other's sessions.
 - **Revocation** beyond `exp` and an explicit close: a shared backend can mark a session dead, bounded
   by the local cache TTL, the same way a policy change already is.
 - **What a door reports about a refused session** — "expired" and "unknown" are different for a
-  client, and NULL alone does not say which.
+  client, and NULL alone does not say which. `SessionPrincipal` already distinguishes them; only the
+  SQL surface flattens it.
+- **Nothing sweeps abandoned sessions.** An expired record is erased when it is next looked up, and a
+  closed one when it is closed — but a door that opens sessions and then forgets them leaves entries
+  in memory until something asks for each. Bounded in practice by a door closing on disconnect;
+  unbounded if one does not. A periodic sweep, or a cap, belongs with the shared backends.
