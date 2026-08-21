@@ -904,6 +904,43 @@ struct CatalogBackend {
 			}
 			listed = std::move(ordered);
 		}
+		if (object_columns.empty()) {
+			// spec 038: the object's own columns are not known here and we do not probe for them - the
+			// engine answers while it binds the statement we generate. A mask goes into an inner
+			// REPLACE, which errors when the column is not there (a mask that cannot be applied must
+			// never be silently skipped); the listed names go into an outer COLUMNS(lambda ...), which
+			// keeps what matches and ignores what does not. Both keep the source's own order, which is
+			// the object's. The predicate stays inside, so RLS reads physical values, not masked ones.
+			vector<string> replaces;
+			vector<string> names;
+			for (auto &column : listed) {
+				names.push_back(Lit(StringUtil::Lower(column.first)));
+				if (!column.second.empty()) {
+					replaces.push_back(column.second + " AS " + Ident(column.first));
+				}
+			}
+			string inner = "SELECT *";
+			if (!replaces.empty()) {
+				inner += " REPLACE (" + StringUtil::Join(replaces, ", ") + ")";
+			}
+			inner += " FROM " + out.phys;
+			if (!out.rls.empty()) {
+				inner += " WHERE " + out.rls;
+			}
+			out.query = "SELECT COLUMNS(lambda __acl_col: lower(__acl_col) IN (" + StringUtil::Join(names, ", ") +
+			            ")) FROM (" + inner + ")";
+			for (auto &column : listed) {
+				if (!out.writable) {
+					continue;
+				}
+				out.write_columns.insert(column.first);
+				if (!column.second.empty()) {
+					out.injections.emplace_back(column.first, column.second);
+				}
+			}
+			out.subquery_form = true;
+			return;
+		}
 		for (auto &column : listed) {
 			string source = column.first; // what to read the value from, in physical terms
 			for (auto &defined : object_columns) {
