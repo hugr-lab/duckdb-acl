@@ -157,3 +157,28 @@ statement error
 ACL ROLE "analyst" SELECT acl_quack_authorize('conn-1', 'SELECT 1');
 ----
 <REGEX>:.*acl_quack_authorize.*not allowed.*
+
+# --- acl_quack_serve refuses to open a door a client could step out of --------------------------------
+# each condition is checked before quack is touched at all, so the refusal names the thing to fix
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement error
+SELECT acl_quack_serve('quack:localhost:31999', 'server-token');
+----
+<REGEX>:.*acl_allow_anonymous_admin.*is on.*
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+statement error
+SELECT acl_quack_serve('quack:localhost:31999', '');
+----
+<REGEX>:.*pass a server token explicitly.*
+
+# with the instance in order, the only thing left is quack itself - which this build does not load
+statement error
+SELECT acl_quack_serve('quack:localhost:31999', 'server-token');
+----
+<REGEX>:.*quack is not loaded.*

@@ -1,3 +1,4 @@
+#include "duckdb/main/connection.hpp"
 #include "acl_admin_functions.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -919,6 +920,58 @@ string PrefixedForSession(PolicyStore &store, const string &handle, const string
 	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
 }
 
+//! acl_quack_serve(uri[, token]): the safe way to open the quack door (spec 041). It installs the two
+//! callbacks and starts quack's server - but only from an instance a client cannot step out of, and it
+//! says which condition is missing rather than serving something half-configured. Everything it sets
+//! could be set by hand; the point of the function is that it is all of it or none.
+void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto uri = RequiredArg(args, 0, row, "acl_quack_serve", "listen uri");
+		auto token = args.ColumnCount() > 1 ? OptionalArg(args, 1, row, "") : string();
+		auto &store = StoreOf(state);
+		if (!store.CatalogEnabled()) {
+			throw BinderException("acl_quack_serve: no policy source is configured - a served instance "
+			                      "resolves every statement against one, so `acl_use_db` (or the function "
+			                      "driver) comes first");
+		}
+		if (store.CatalogAnonymousAdminAllowed()) {
+			throw BinderException("acl_quack_serve: `acl_allow_anonymous_admin` is on, so a served client "
+			                      "could administer the ACL with a bare `ACL ADMIN` - turn it off before "
+			                      "opening the door");
+		}
+		Value override_setting;
+		if (context.TryGetCurrentSetting("allow_parser_override_extension", override_setting) &&
+		    !StringUtil::CIEquals(override_setting.ToString(), "strict")) {
+			throw BinderException("acl_quack_serve: the parser override is \"%s\", not STRICT - a served "
+			                      "statement that failed to parse as ACL would fall through to plain SQL",
+			                      override_setting.ToString());
+		}
+		if (token.empty()) {
+			throw BinderException("acl_quack_serve: pass a server token explicitly. It is not what admits a "
+			                      "client - their JWT is - but a default-configured quack accepts whatever a "
+			                      "caller sends, and this is the outer fence around that");
+		}
+		// quack listens in the clear by construction, so a non-local bind belongs behind a proxy
+		Connection con(*context.db);
+		auto install = con.Query("SET GLOBAL quack_authentication_function = 'acl_quack_authenticate'; "
+		                         "SET GLOBAL quack_authorization_function = 'acl_quack_authorize';");
+		if (install->HasError()) {
+			throw BinderException("acl_quack_serve: quack is not loaded (%s)", install->GetError());
+		}
+		auto quoted = [](const string &value) {
+			return "'" + StringUtil::Replace(value, "'", "''") + "'";
+		};
+		auto served =
+		    con.Query("SELECT listen_uri FROM quack_serve(" + quoted(uri) + ", token := " + quoted(token) + ")");
+		if (served->HasError()) {
+			throw BinderException("acl_quack_serve: %s", served->GetError());
+		}
+		result.SetValue(row, served->RowCount() > 0 ? served->GetValue(0, 0) : Value(uri));
+	}
+}
+
 //! acl_quack_authenticate(session_id, client_token, server_token): quack's authentication callback
 //! (spec 041). The client's token is a JWT we verify for ourselves, so quack's own shared token is
 //! not what admits anyone - it stays the operator's outer fence, and this decides the principal.
@@ -1152,6 +1205,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	};
 	// the quack door (spec 041): the two callbacks quack calls, both thin over the contract above
 	register_admin("acl_quack_authenticate", {v, v, v}, AclQuackAuthenticateFunc);
+	register_session_text("acl_quack_serve", {v, v}, AclQuackServeFunc);
 	register_session_text("acl_quack_authorize", {v, v}, AclQuackAuthorizeFunc);
 	register_session_text("acl_session_open", {v}, AclSessionOpenFunc);
 	register_session_text("acl_session_sql", {v, v}, AclSessionSqlFunc);
