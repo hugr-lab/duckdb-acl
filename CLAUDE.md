@@ -82,8 +82,17 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
   row with NULL/empty caps — means `select, insert, update, delete, merge`, never `manage`; an
   explicit `'{}'` means none. An *object* grant that states nothing inherits the catalog grant's caps,
   so a refinement never widens by omission.
+- **A grant's predicate confines writes too** (spec 024): it is AND-ed into the read/write `WHERE` and
+  also checked against the row being written — an `INSERT`/`UPDATE`/`MERGE` that would leave a row
+  outside the principal's slice is refused where the value is written (`error()` inside a `CASE`). An
+  insert under a predicate must name its columns and supply what the predicate reads; an injected
+  value satisfies it by construction.
 - **Capabilities gate both paths**: `select` on every read of a relation (spec 003), the per-verb
   capability (`insert`/`update`/`delete`/`merge`) on DML targets.
+- **`DESCRIBE` / `SUMMARIZE` / `SHOW TABLES` are answered** (spec 025): `DESCRIBE <name>` becomes
+  `DESCRIBE (SELECT * FROM <name>)`, so the description is of the rewritten relation — a hidden column
+  is hidden from it too; `SHOW TABLES [FROM s]` is the principal's `information_schema.tables` in the
+  shape `SHOW TABLES` returns.
 - **Markers baked into template copies**: `acl_claim('<name>')` → claim constant; `acl_arg(n)` → n-th
   call argument's AST. Never registered as real functions ⇒ a missed marker fails closed at bind.
 - **Administration is a capability** (spec 009): `{"manage": true}` in a catalog grant (per catalog,

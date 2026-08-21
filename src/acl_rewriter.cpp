@@ -3,6 +3,7 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -34,6 +35,7 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/showref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
@@ -334,6 +336,8 @@ private:
 			RewriteQueryNode(*node.select_statement->node);
 		}
 		ApplyInsertPolicy(node, policy, vname);
+		ApplyInsertCheck(node, policy, vname);
+		ApplyConflictPolicy(node, policy, vname);
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname); // RETURNING names the target's own columns
@@ -342,6 +346,35 @@ private:
 			MapTargetQualifier(item, vname, node.qualified_name.Name().GetIdentifierName());
 		}
 		RequireReadableReturning(node.returning_list, policy, vname);
+	}
+
+	//! `ON CONFLICT … DO UPDATE` is an update wearing an insert's clothes, and it was going through
+	//! untouched: its SET list decides what an existing row becomes, and the row it lands on may belong
+	//! to someone else entirely. It carries the same policy as any other update (specs 011, 024).
+	void ApplyConflictPolicy(InsertQueryNode &node, const TablePolicy &policy, const string &vname) {
+		if (!node.on_conflict_info) {
+			return;
+		}
+		auto &conflict = *node.on_conflict_info;
+		RewriteExpr(conflict.condition);
+		MapColumnRefs(conflict.condition, policy, vname);
+		if (!conflict.set_info) {
+			return;
+		}
+		for (auto &column : conflict.set_info->columns) {
+			column = MapWrittenColumn(policy, column, vname);
+			RequireWritableColumn(policy, column, vname);
+		}
+		for (auto &expr : conflict.set_info->expressions) {
+			RewriteExpr(expr);
+			MapColumnRefs(expr, policy, vname);
+		}
+		ApplySetInjections(*conflict.set_info, policy, vname);
+		RewriteExpr(conflict.set_info->condition);
+		MapColumnRefs(conflict.set_info->condition, policy, vname);
+		// which rows it may update at all, and what they may become
+		AndPolicyPredicate(conflict.set_info->condition, policy);
+		ApplyUpdateCheck(*conflict.set_info, policy, vname, Identifier());
 	}
 
 	//! `RETURNING vname.col` -> `RETURNING <physical table>.col`: only for INSERT, where the target is
@@ -388,6 +421,7 @@ private:
 					}
 				}
 			}
+			ApplyUpdateCheck(*node.set_info, policy, vname, node.from_table ? TargetAliasOf(node.table) : Identifier());
 			RewriteExpr(node.set_info->condition);
 			MapColumnRefs(node.set_info->condition, policy, vname,
 			              node.from_table ? TargetAliasOf(node.table) : Identifier());
@@ -454,6 +488,7 @@ private:
 						MapColumnRefs(expr, policy, vname, alias);
 					}
 					ApplySetInjections(*action->update_info, policy, vname);
+					ApplyUpdateCheck(*action->update_info, policy, vname, alias);
 					RewriteExpr(action->update_info->condition);
 					MapColumnRefs(action->update_info->condition, policy, vname, alias);
 				}
@@ -463,6 +498,7 @@ private:
 				}
 				if (action->action_type == MergeActionType::MERGE_INSERT) {
 					ApplyMergeInsertPolicy(*action, policy, vname);
+					ApplyMergeInsertCheck(*action, policy, vname);
 				}
 			}
 		}
@@ -590,6 +626,9 @@ private:
 		case TableReferenceType::TABLE_FUNCTION:
 			RewriteTableFunction(ref);
 			break;
+		case TableReferenceType::SHOW_REF:
+			RewriteShowRef(ref);
+			break;
 		case TableReferenceType::EMPTY_FROM:
 		case TableReferenceType::EXPRESSION_LIST:
 			break;
@@ -651,6 +690,68 @@ private:
 		if (tf.subquery && tf.subquery->node) {
 			RewriteQueryNode(*tf.subquery->node);
 		}
+	}
+
+	//! `DESCRIBE` / `SUMMARIZE` / `SHOW TABLES` (spec 025). These are what a client sends before it
+	//! sends anything else, so refusing them left every ordinary tool talking to a wall.
+	void RewriteShowRef(unique_ptr<TableRef> &ref) {
+		auto &show = ref->Cast<ShowRef>();
+		if (show.query) {
+			// DESCRIBE (SELECT …) - the query is the principal's, and it is rewritten like any other
+			RewriteQueryNode(*show.query);
+			return;
+		}
+		if (show.show_type == ShowType::DESCRIBE || show.show_type == ShowType::SUMMARY) {
+			// `DESCRIBE <name>` becomes `DESCRIBE (SELECT * FROM <name>)`: the same shape to the caller,
+			// and the answer comes from the read path, so it describes what the principal can read
+			// rather than what the physical table has.
+			auto select = make_uniq<SelectNode>();
+			select->select_list.push_back(make_uniq<StarExpression>());
+			auto base = make_uniq<BaseTableRef>();
+			base->SetQualifiedName(show.qualified_name);
+			select->from_table = std::move(base);
+			show.query = std::move(select);
+			show.qualified_name = QualifiedName();
+			RewriteQueryNode(*show.query);
+			return;
+		}
+		// SHOW TABLES [FROM <schema>] - the principal's own catalog in the shape SHOW TABLES has
+		string sql;
+		if (!store.MetadataListing(principal, "tables", sql)) {
+			Deny("metadata is not available: this policy source cannot enumerate tables");
+		}
+		string filter;
+		if (show.show_type == ShowType::SHOW_FROM) {
+			auto path = show.qualified_name.Path();
+			vector<string> parts;
+			for (auto &part : path) {
+				if (!part.empty()) {
+					parts.push_back(part.GetIdentifierName());
+				}
+			}
+			auto name = show.qualified_name.Name().GetIdentifierName();
+			if (!name.empty()) {
+				parts.push_back(name);
+			}
+			if (parts.empty()) {
+				Deny("SHOW TABLES FROM needs a schema");
+			}
+			filter = " WHERE table_schema = " + SqlLiteral(parts.back());
+			if (parts.size() > 1) {
+				filter += " AND table_catalog = " + SqlLiteral(parts[parts.size() - 2]);
+			}
+		} else {
+			// bare SHOW TABLES is the current schema, which for a principal is the default one
+			filter = " WHERE table_schema = 'main'";
+		}
+		sql = "SELECT table_name AS name FROM (" + sql + ")" + filter + " ORDER BY 1";
+		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		ref = make_uniq<SubqueryRef>(std::move(select_stmt), Identifier("__acl_show"));
+	}
+
+	//! A single-quoted SQL literal of a name we splice into generated SQL
+	static string SqlLiteral(const string &text) {
+		return "'" + StringUtil::Replace(text, "'", "''") + "'";
 	}
 
 	//! Rewrite each argument expression of a function call (without re-gating the function itself)
@@ -886,6 +987,194 @@ private:
 	//! Whether a grant narrows what may be written at all
 	static bool HasWritePolicy(const TablePolicy &policy) {
 		return !policy.injections.empty() || !policy.write_columns.empty() || !policy.rls.empty();
+	}
+
+	//! spec 024: a grant's predicate confines what is written, not only what may be reached. Without
+	//! this an INSERT lands a row outside the principal's own slice - one it cannot read back - and an
+	//! UPDATE moves its own row out of it.
+	void ApplyInsertCheck(InsertQueryNode &node, const TablePolicy &policy, const string &vname) {
+		auto predicate = WritePredicate(policy);
+		if (!predicate) {
+			return;
+		}
+		if (node.columns.empty() || node.default_values || !node.select_statement) {
+			Deny("insert into \"" + vname +
+			     "\" must name its columns: the grant's predicate decides which rows "
+			     "may be written, and an unnamed column has no value to judge");
+		}
+		// a predicate reading a column the row does not carry cannot be evaluated at all
+		vector<string> read;
+		CollectColumnNames(*predicate, read);
+		for (auto &name : read) {
+			bool written = false;
+			for (auto &column : node.columns) {
+				if (StringUtil::CIEquals(column.GetIdentifierName(), name)) {
+					written = true;
+					break;
+				}
+			}
+			if (!written) {
+				Deny("insert into \"" + vname + "\" must supply \"" + name +
+				     "\": the grant's predicate reads it "
+				     "to decide whether the row may be "
+				     "written");
+			}
+		}
+		vector<unique_ptr<ParsedExpression>> items;
+		for (idx_t i = 0; i < node.columns.size(); i++) {
+			unique_ptr<ParsedExpression> item = make_uniq<ColumnRefExpression>(node.columns[i]);
+			if (i == 0) {
+				item = GuardedValue(std::move(item), std::move(predicate), vname);
+			}
+			items.push_back(std::move(item));
+		}
+		auto source = make_uniq<SubqueryRef>(std::move(node.select_statement), Identifier("__acl_check"));
+		source->column_name_alias = node.columns;
+		auto select = make_uniq<SelectNode>();
+		select->from_table = std::move(source);
+		select->select_list = std::move(items);
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(select);
+		node.select_statement = std::move(statement);
+	}
+
+	//! spec 024: the insert branch of a merge writes a new row, so the grant's predicate judges it like
+	//! any other insert
+	void ApplyMergeInsertCheck(MergeIntoAction &action, const TablePolicy &policy, const string &vname) {
+		auto predicate = WritePredicate(policy);
+		if (!predicate) {
+			return;
+		}
+		if (action.default_values || action.insert_columns.empty() || action.expressions.empty()) {
+			Deny("the insert branch of a merge into \"" + vname +
+			     "\" must name its columns: the grant's predicate "
+			     "decides which rows may be written");
+		}
+		vector<string> read;
+		CollectColumnNames(*predicate, read);
+		for (auto &name : read) {
+			bool written = false;
+			for (auto &column : action.insert_columns) {
+				if (StringUtil::CIEquals(column.GetIdentifierName(), name)) {
+					written = true;
+					break;
+				}
+			}
+			if (!written) {
+				Deny("the insert branch of a merge into \"" + vname + "\" must supply \"" + name +
+				     "\": the grant's predicate reads it to decide whether the row may be written");
+			}
+		}
+		// the predicate names the row's columns; here they are the values about to be inserted
+		UpdateSetInfo as_row;
+		for (idx_t i = 0; i < action.insert_columns.size() && i < action.expressions.size(); i++) {
+			as_row.columns.push_back(action.insert_columns[i]);
+			as_row.expressions.push_back(action.expressions[i]->Copy());
+		}
+		SubstituteSetValues(predicate, as_row);
+		action.expressions[0] = GuardedValue(std::move(action.expressions[0]), std::move(predicate), vname);
+	}
+
+	//! The row an UPDATE leaves behind: a column it sets takes the new value, every other keeps its own.
+	//! Substituting the SET list into the grant's predicate is what turns "which rows may be touched"
+	//! into "what they may become" (spec 024).
+	static void SubstituteSetValues(unique_ptr<ParsedExpression> &expr, const UpdateSetInfo &set_info) {
+		if (!expr) {
+			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &parts = expr->Cast<ColumnRefExpression>().ColumnNames();
+			if (parts.empty()) {
+				return;
+			}
+			auto name = parts.back().GetIdentifierName();
+			for (idx_t i = 0; i < set_info.columns.size() && i < set_info.expressions.size(); i++) {
+				if (StringUtil::CIEquals(set_info.columns[i].GetIdentifierName(), name)) {
+					expr = set_info.expressions[i]->Copy();
+					return;
+				}
+			}
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expr, [&](unique_ptr<ParsedExpression> &child) { SubstituteSetValues(child, set_info); });
+	}
+
+	//! spec 024: the row an UPDATE writes must satisfy the grant, not merely the row it started from
+	void ApplyUpdateCheck(UpdateSetInfo &set_info, const TablePolicy &policy, const string &vname,
+	                      const Identifier &target_alias) {
+		auto predicate = WritePredicate(policy);
+		if (!predicate || set_info.columns.empty() || set_info.expressions.empty()) {
+			return;
+		}
+		// A SET that touches nothing the predicate reads leaves the answer where it was: the new row
+		// satisfies the grant exactly when the old one did, and the predicate on the WHERE (or the ON)
+		// already guaranteed that. Skipping the guard there is not only cheaper - a merge with a
+		// WHEN NOT MATCHED BY SOURCE branch evaluates this expression for rows the branch never
+		// touches, and a guard would fire on them.
+		vector<string> read;
+		CollectColumnNames(*predicate, read);
+		bool touches = false;
+		for (auto &name : read) {
+			for (auto &column : set_info.columns) {
+				if (StringUtil::CIEquals(column.GetIdentifierName(), name)) {
+					touches = true;
+					break;
+				}
+			}
+		}
+		if (!touches) {
+			return;
+		}
+		// the predicate's own names are the target's, so they are bound to it before the SET list is
+		// folded in - otherwise a same-named column on the other relation captures them (spec 020)
+		if (!target_alias.empty()) {
+			QualifyWithTarget(predicate, target_alias);
+		}
+		SubstituteSetValues(predicate, set_info);
+		set_info.expressions[0] = GuardedValue(std::move(set_info.expressions[0]), std::move(predicate), vname);
+	}
+
+	//! Every column name an expression reads, whatever it is qualified by. Used to decide whether a row
+	//! about to be written can be judged by the grant's predicate at all (spec 024).
+	static void CollectColumnNames(const ParsedExpression &expr, vector<string> &names) {
+		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &parts = expr.Cast<ColumnRefExpression>().ColumnNames();
+			if (!parts.empty()) {
+				names.push_back(parts.back().GetIdentifierName());
+			}
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { CollectColumnNames(child, names); });
+	}
+
+	//! `CASE WHEN <predicate> THEN <value> ELSE error('…') END` - the row that does not satisfy the
+	//! grant is refused where it would be written, rather than landing outside the principal's slice.
+	//! DuckDB evaluates a CASE per row, so the error fires only for the rows that violate it.
+	unique_ptr<ParsedExpression> GuardedValue(unique_ptr<ParsedExpression> value,
+	                                          unique_ptr<ParsedExpression> predicate, const string &vname) {
+		vector<unique_ptr<ParsedExpression>> message;
+		message.push_back(make_uniq<ConstantExpression>(
+		    Value("acl_rewrite: the row does not satisfy the grant on \"" + vname + "\", so it cannot be written")));
+		auto raise = make_uniq<FunctionExpression>(Identifier("error"), std::move(message));
+		auto guard = make_uniq<CaseExpression>();
+		CaseCheck check;
+		check.when_expr = std::move(predicate);
+		check.then_expr = std::move(value);
+		guard->CaseChecksMutable().push_back(std::move(check));
+		guard->ElseMutable() = std::move(raise);
+		return std::move(guard);
+	}
+
+	//! The grant's predicate, baked, or nullptr when the grant has none
+	unique_ptr<ParsedExpression> WritePredicate(const TablePolicy &policy) {
+		if (policy.rls.empty()) {
+			return nullptr;
+		}
+		auto predicate = store.InstantiateExpr(policy.rls, template_options);
+		BakeMarkers(predicate, nullptr);
+		return predicate;
 	}
 
 	//! Apply the grant's write policy to an INSERT: the written columns must be granted, and every
