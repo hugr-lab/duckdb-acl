@@ -72,3 +72,4 @@ specs are the shareable distillation of that work.
 | [027](027-validation-completeness/spec.md) | a skipped write-time check is remembered, and taken again | implemented |
 | [028](028-dml-in-a-cte/spec.md) | a DML statement inside a `WITH` | implemented |
 | [029](029-columns-always-restrict/spec.md) | a column list is a projection, whatever it is made of | implemented |
+| [030](030-drop-cascade/spec.md) | what goes with a dropped object | implemented |

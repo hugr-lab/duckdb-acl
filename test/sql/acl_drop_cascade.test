@@ -1,0 +1,274 @@
+# name: test/sql/acl_drop_cascade.test
+# description: what goes with a dropped object (spec 030) - five drop paths kept five hand-written
+#   lists of tables and each had forgotten a different one, most visibly the references (spec 022)
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.customers(id INT, city VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, cust INT, dest VARCHAR);
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE TABLE phys.lake.events(id INT, kind VARCHAR);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.customers AS phys.main.customers;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.report AS phys.main.report_fn;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.by_customer FROM customers TO orders ON (id = cust);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.to_report FROM customers TO FUNCTION report(id => id);
+
+# --- a reference goes with either of its ends ---------------------------------------------------------
+# it is a declared join path between two objects; with one end gone it is not a hint any more, it is a
+# lie. It grants nothing, so it never stands in the way of the drop either
+
+query II
+SELECT name, to_vname FROM acl_references() ORDER BY name;
+----
+by_customer	orders
+to_report	report
+
+query I
+SELECT count(*) FROM acl_reference_columns();
+----
+3
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c.orders;
+
+query I
+SELECT string_agg(name, ',' ORDER BY name) FROM acl_references();
+----
+to_report
+
+query I
+SELECT count(*) FROM acl_reference_columns() WHERE name = 'by_customer';
+----
+0
+
+# the function end counts the same way
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE FUNCTION c.report;
+
+query I
+SELECT count(*) FROM acl_references();
+----
+0
+
+query I
+SELECT count(*) FROM acl_reference_columns();
+----
+0
+
+# dropping the *from* end works the same as dropping the *to* end
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.back FROM orders TO customers ON (cust = id);
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c.orders;
+
+query I
+SELECT count(*) FROM acl_references();
+----
+0
+
+# --- a grant's probed projection goes with what it describes -------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select) COLUMNS (id, marker = dest);
+
+query I
+SELECT count(*) FROM acl_grant_columns();
+----
+2
+
+# dropping the role takes them, not only the grant they belong to
+statement ok
+ACL ADMIN DROP ROLE r;
+
+query I
+SELECT count(*) FROM acl_grant_columns();
+----
+0
+
+query I
+SELECT count(*) FROM acl_object_grants();
+----
+0
+
+# --- a function's grant rows go with it, unless something else answers to that name ----------------------
+# `role_object_caps` is keyed by name alone, so a relation and a function of the same name share one row
+
+statement ok
+ACL ADMIN CREATE ROLE g;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE g MAIN;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.solo AS phys.main.solo_fn;
+
+statement ok
+ACL ADMIN GRANT OBJECT c.solo TO ROLE g WITH (select);
+
+query I
+SELECT count(*) FROM acl_object_grants() WHERE vname = 'solo';
+----
+1
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE FUNCTION c.solo;
+
+query I
+SELECT count(*) FROM acl_object_grants() WHERE vname = 'solo';
+----
+0
+
+# ... but a relation of the same name keeps it, because the row cannot tell the two apart
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE g WITH (select);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.orders AS phys.main.report_fn;
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE FUNCTION c.orders;
+
+query I
+SELECT count(*) FROM acl_object_grants() WHERE vname = 'orders';
+----
+1
+
+# --- a schema cascade reaches everything under its path --------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.vs FROM phys.lake;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.vs.inner AS phys.lake.events;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.vs.fn AS phys.lake.fn;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.crosses FROM c.vs.inner TO orders ON (id = id);
+
+statement ok
+ACL ADMIN GRANT TABLE c.vs.inner TO ROLE g WITH (select) COLUMNS (id, k = kind);
+
+query I
+SELECT count(*) FROM acl_grant_columns() WHERE vname = 'vs.inner';
+----
+2
+
+# a function under the path is an object too, so it also needs CASCADE
+statement error
+ACL ADMIN DROP VIRTUAL SCHEMA c.vs;
+----
+<REGEX>:.*still holds.*object\(s\).*CASCADE.*
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCHEMA c.vs CASCADE;
+
+query I
+SELECT count(*) FROM acl_references() WHERE name = 'crosses';
+----
+0
+
+query I
+SELECT count(*) FROM acl_grant_columns() WHERE vname = 'vs.inner';
+----
+0
+
+query I
+SELECT count(*) FROM acl_functions() WHERE vname = 'vs.fn';
+----
+0
+
+query I
+SELECT count(*) FROM acl_object_columns() WHERE vname = 'vs.inner';
+----
+0
+
+# --- dropping the catalog leaves nothing of it behind ------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.again FROM phys.lake;
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.again TO ROLE g WITH (select);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.last FROM customers TO orders ON (id = cust);
+
+statement ok
+ACL ADMIN GRANT TABLE c.customers TO ROLE g WITH (select) COLUMNS (id, town = city);
+
+statement ok
+ACL ADMIN DROP VIRTUAL CATALOG c CASCADE;
+
+query IIIIII
+SELECT (SELECT count(*) FROM acl_catalogs()), (SELECT count(*) FROM acl_relations()),
+       (SELECT count(*) FROM acl_functions()), (SELECT count(*) FROM acl_references()),
+       (SELECT count(*) FROM acl_reference_columns()), (SELECT count(*) FROM acl_grant_columns());
+----
+0	0	0	0	0	0
+
+query III
+SELECT (SELECT count(*) FROM acl_schemas()), (SELECT count(*) FROM acl_schema_grants()),
+       (SELECT count(*) FROM acl_object_grants());
+----
+0	0	0
+
+# the tombstones an expansion left behind are the catalog's too
+query I
+SELECT count(*) FROM aclcat.acl.schema_dropped;
+----
+0
+
+# the role itself is not the catalog's to drop
+query I
+SELECT count(*) FROM acl_roles();
+----
+1
