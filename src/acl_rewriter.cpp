@@ -27,6 +27,7 @@
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/pragma_statement.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
@@ -103,24 +104,90 @@ public:
 		case StatementType::MERGE_INTO_STATEMENT:
 			RewriteQueryNode(*stmt.Cast<MergeIntoStatement>().node);
 			break;
-		case StatementType::EXPLAIN_STATEMENT:
-			RewriteStatement(*stmt.Cast<ExplainStatement>().stmt);
+		case StatementType::EXPLAIN_STATEMENT: {
+			auto &explain = stmt.Cast<ExplainStatement>();
+			RewriteStatement(*explain.stmt);
+			if (replacement) {
+				// the inner statement became a different one (a PRAGMA answered as a SELECT, spec 031):
+				// the EXPLAIN keeps its place and explains what the principal actually runs
+				explain.stmt = std::move(replacement);
+			}
 			break;
+		}
 		case StatementType::CREATE_STATEMENT:
 			RewriteCreateStatement(stmt.Cast<CreateStatement>());
 			break;
 		case StatementType::DROP_STATEMENT:
 			RewriteDropStatement(stmt.Cast<DropStatement>());
 			break;
+		case StatementType::PRAGMA_STATEMENT:
+			RewritePragmaStatement(stmt.Cast<PragmaStatement>());
+			break;
 		default:
 			Deny("statement type " + StatementTypeToString(stmt.type) + " is not permitted under ACL");
 		}
+	}
+
+	//! A PRAGMA that asks what is here is the question SHOW asks in an older spelling, and it is what a
+	//! client sends before anything else (spec 031). The two that name the catalog are answered from the
+	//! principal's own; every other PRAGMA stays denied, because a PRAGMA is otherwise a setting.
+	void RewritePragmaStatement(PragmaStatement &stmt) {
+		auto name = StringUtil::Lower(stmt.info->name.GetIdentifierName());
+		string sql;
+		if (name == "table_info") {
+			if (stmt.info->parameters.size() != 1) {
+				Deny("PRAGMA table_info needs exactly one table name");
+			}
+			// answered through DESCRIBE rather than through the column listing, so it goes down the
+			// read path: a name the principal has no access to is refused, not answered with no rows
+			sql = "SELECT CAST(row_number() OVER () - 1 AS INTEGER) AS cid, column_name AS name,"
+			      " column_type AS type, \"null\" = 'NO' AS notnull, \"default\" AS dflt_value,"
+			      " coalesce(key = 'PRI', false) AS pk FROM (DESCRIBE (SELECT * FROM " +
+			      PragmaTargetName(*stmt.info->parameters[0]) + "))";
+		} else if (name == "show_tables") {
+			sql = "SELECT * FROM (SHOW TABLES)";
+		} else {
+			Deny("PRAGMA \"" + name + "\" is not permitted under ACL");
+		}
+		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		RewriteQueryNode(*select_stmt->node); // the DESCRIBE / SHOW inside is the principal's own
+		replacement = std::move(select_stmt);
+	}
+
+	//! The table a `PRAGMA table_info(...)` names, requoted part by part so it splices into generated
+	//! SQL as the name the principal wrote - `'vs.inner'` is a schema and a table, not one identifier.
+	static string PragmaTargetName(const ParsedExpression &parameter) {
+		string written;
+		if (parameter.GetExpressionClass() == ExpressionClass::CONSTANT) {
+			auto &value = parameter.Cast<ConstantExpression>().GetValue();
+			if (!value.IsNull()) {
+				written = value.ToString();
+			}
+		} else if (parameter.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			vector<string> parts;
+			for (auto &part : parameter.Cast<ColumnRefExpression>().ColumnNames()) {
+				parts.push_back(part.GetIdentifierName());
+			}
+			written = StringUtil::Join(parts, ".");
+		}
+		if (written.empty()) {
+			throw BinderException("acl_rewrite: PRAGMA table_info needs a table name");
+		}
+		vector<string> quoted;
+		for (auto &part : StringUtil::Split(written, '.')) {
+			quoted.push_back("\"" + StringUtil::Replace(part, "\"", "\"\"") + "\"");
+		}
+		return StringUtil::Join(quoted, ".");
 	}
 
 	//! Statements the rewrite appends after the one being rewritten - the catalog record of an object
 	//! a principal's DDL creates or drops. They run only if the DDL before them succeeded, so a failed
 	//! CREATE never leaves a record behind (spec 016).
 	vector<unique_ptr<SQLStatement>> follow_ups;
+	//! Set when a statement is answered by a different one entirely - a PRAGMA rewritten into the
+	//! SELECT that answers it (spec 031). The caller puts this in its place, so an enclosing EXPLAIN
+	//! keeps explaining the statement the principal actually runs.
+	unique_ptr<SQLStatement> replacement;
 	//! Set when the statement itself must not run: VIRTUAL ONLY registers what exists, it never creates
 	bool drop_statement = false;
 
@@ -715,6 +782,31 @@ private:
 			RewriteQueryNode(*show.query);
 			return;
 		}
+		// SHOW_UNQUALIFIED carries *what* to show in the name duckdb's transform put there - "tables",
+		// "databases", "schemas", "variables", or __show_tables_expanded for SHOW ALL TABLES. Every one
+		// of them used to be answered with the table listing, in the shape SHOW TABLES has: a client
+		// asking which databases it had got back a list of tables (spec 031).
+		auto asked = ShowTarget(show);
+		if (asked == "variables") {
+			// a principal has no session variables: `getvariable` is denied and nothing sets one for it.
+			// An empty answer in the right shape beats an error for a client that asks on connect.
+			ref = SubqueryOf("SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS value, NULL::VARCHAR AS type"
+			                 " WHERE false");
+			return;
+		}
+		if (asked == "databases" || asked == "schemas" || asked == "__show_tables_expanded" ||
+		    (asked == "tables" && show.show_type != ShowType::SHOW_FROM)) {
+			auto surface = asked == "databases"                ? "show_databases"
+			               : asked == "schemas"                ? "show_schemas"
+			               : asked == "__show_tables_expanded" ? "show_tables_expanded"
+			                                                   : "show_tables";
+			string listing;
+			if (!store.MetadataListing(principal, surface, listing)) {
+				Deny("metadata is not available: this policy source cannot enumerate " + asked);
+			}
+			ref = SubqueryOf(listing);
+			return;
+		}
 		// SHOW TABLES [FROM <schema>] - the principal's own catalog in the shape SHOW TABLES has
 		string sql;
 		if (!store.MetadataListing(principal, "tables", sql)) {
@@ -745,8 +837,23 @@ private:
 			filter = " WHERE table_schema = 'main'";
 		}
 		sql = "SELECT table_name AS name FROM (" + sql + ")" + filter + " ORDER BY 1";
+		ref = SubqueryOf(sql);
+	}
+
+	//! What a SHOW_UNQUALIFIED asks for. duckdb's transform stores the word quoted ("\"databases\"")
+	//! for the four it knows, and the bare marker __show_tables_expanded for SHOW ALL TABLES.
+	static string ShowTarget(const ShowRef &show) {
+		auto name = StringUtil::Lower(show.qualified_name.Name().GetIdentifierName());
+		if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
+			name = name.substr(1, name.size() - 2);
+		}
+		return name;
+	}
+
+	//! Wrap generated listing SQL as the subquery that replaces a metadata table reference
+	unique_ptr<TableRef> SubqueryOf(const string &sql) {
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
-		ref = make_uniq<SubqueryRef>(std::move(select_stmt), Identifier("__acl_show"));
+		return make_uniq<SubqueryRef>(std::move(select_stmt), Identifier("__acl_show"));
 	}
 
 	//! A single-quoted SQL literal of a name we splice into generated SQL
@@ -1675,8 +1782,11 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 	for (auto &stmt : statements) {
 		rewriter.follow_ups.clear();
 		rewriter.drop_statement = false;
+		rewriter.replacement = nullptr;
 		rewriter.RewriteStatement(*stmt);
-		if (!rewriter.drop_statement) {
+		if (rewriter.replacement) {
+			rewritten.push_back(std::move(rewriter.replacement));
+		} else if (!rewriter.drop_statement) {
 			rewritten.push_back(std::move(stmt));
 		}
 		// a DDL statement's catalog record is appended right after it, so the batch stays in order
