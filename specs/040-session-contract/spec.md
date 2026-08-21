@@ -86,6 +86,15 @@ channel. Not in this spec: the shared backends, and the portability predicate th
   device is deterministic, and minting is refused. A build that cannot produce an unguessable handle
   should say so, not hand one out.
 
+  **In production the util would usually be there** — httpfs is autoloadable, and loading it fills
+  `encryption_util` with the OpenSSL-backed one. So the reason not to use it is not that it is
+  missing; it is that it buys nothing and costs something. Nothing, because OpenSSL's `RAND_bytes` is
+  seeded from the same kernel sources the device reads directly. Something, because it makes the
+  handle's randomness conditional on an unrelated extension being loaded, and because reaching for it
+  can try to *load* httpfs as a side effect of opening a session — while the path taken when it is
+  absent (mbedTLS, which refuses) is the one no test would exercise. One source, always the same one,
+  is the property worth having in the code that mints a credential.
+
   The handle is never derived from the token, never logged by us, revocable by `acl_session_close`,
   and useless outside this instance.
 - **A client cannot mint or borrow one.** Verified rather than assumed: under a principal all three
