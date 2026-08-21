@@ -66,6 +66,13 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_jwt_clock_skew", "acl: allowed clock skew in seconds for JWT exp/nbf checks",
 	                          LogicalType::BIGINT, Value::BIGINT(60));
+	config.AddExtensionOption("acl_jwks_refresh_interval",
+	                          "acl: seconds a fetched JWKS is used before it is read again (spec 023)",
+	                          LogicalType::BIGINT, Value::BIGINT(300), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_jwks_max_stale",
+	                          "acl: seconds a JWKS that can no longer be read may still be used; past "
+	                          "that a token is refused rather than verified against keys of unknown age",
+	                          LogicalType::BIGINT, Value::BIGINT(3600), nullptr, SetScope::GLOBAL);
 
 	// Enforcement lives entirely behind the parser override, and duckdb skips every override while
 	// `allow_parser_override_extension` is at its default - so loading acl without it leaves the

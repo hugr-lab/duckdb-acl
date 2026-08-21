@@ -105,6 +105,11 @@ Settings `acl_version_check_interval` (policy staleness) and `acl_jwt_clock_skew
 **JWT** (spec 007): `acl_define_issuer(issuer, keys_json, audiences, algs, role_claim, claim_map)`
 and `acl_map_role(issuer, source, external, role)` — a JWT-shaped `ACL TOKEN` verifies offline
 (RS256/ES256/HS256; mbedtls + vendored p256-m), roles resolve as a multi-role union.
+**Spec 023**: an issuer may name a document to read its keys from instead of pasting them —
+`KEYS FROM '<uri>'` (or the 7th argument of `acl_define_issuer`), read through duckdb's own filesystem,
+so an https JWKS (needs httpfs) and a file refreshed out of band are one mechanism. Cached per
+instance: `acl_jwks_refresh_interval` (300s), a re-read when a token names an unknown `kid`, and
+`acl_jwks_max_stale` (3600s; `0` = a failed read is fatal at once). Keys and location are alternatives.
 **Spec 009**: administering the ACL is a granted capability — `acl_grant_admin(role, 'manage'|'passthrough'[, vcat])`
 / `acl_revoke_admin(role)` (or `ACL ADMIN GRANT|REVOKE ADMIN …`), used through
 the marker the client writes after the principal prefix: `ACL <mgmt>` (manage the ACL) or

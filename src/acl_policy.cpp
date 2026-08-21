@@ -147,6 +147,9 @@ void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, 
 	if (!LookupIssuer(issuer, config)) {
 		throw BinderException("acl_rewrite: token rejected: unknown issuer \"%s\"", issuer);
 	}
+	// the keys may come from a document rather than the row (spec 023); the token's kid decides
+	// whether a cached one is still enough
+	config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
 	auto verified = VerifyJwt(token, config, JwtClockSkew());
 	if (verified.raw_roles.empty() && verified.groups_overage) {
 		throw BinderException("acl_rewrite: token rejected: groups overage - the groups claim was replaced "

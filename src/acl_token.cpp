@@ -128,8 +128,14 @@ bool SplitJwt(const string &token, ParsedJwt &out) {
 	return true;
 }
 
-//! Find the JWKS key entry to verify with: matching kid if the token carries one, else the only key
-//! of the right kty. Returns nullptr when the config is a PEM (not JWKS).
+//! Find the JWKS key entry to verify with: the one whose kid the token names, or - when it names none
+//! - the only signing key of the right kty. Returns nullptr when there is no such key, or when the
+//! config is a PEM rather than a JWKS.
+//!
+//! A key marked for encryption is skipped: RFC 7517 says `use` states what a key is for, and a real
+//! JWKS carries both (a Keycloak realm publishes an RSA-OAEP key beside its RS256 one). And a kid that
+//! matches nothing is an error rather than a reason to try another key: during a rotation that is the
+//! difference between "no key with id X" and a misleading "signature verification failed".
 yyjson_val *SelectJwk(yyjson_val *keys_root, const string &kid, const char *kty) {
 	if (!keys_root || !duckdb_yyjson::yyjson_is_obj(keys_root)) {
 		return nullptr;
@@ -138,8 +144,8 @@ yyjson_val *SelectJwk(yyjson_val *keys_root, const string &kid, const char *kty)
 	if (!keys || !duckdb_yyjson::yyjson_is_arr(keys)) {
 		return nullptr;
 	}
-	yyjson_val *fallback = nullptr;
-	idx_t fallback_count = 0;
+	yyjson_val *only_signing = nullptr;
+	idx_t signing_count = 0;
 	duckdb_yyjson::yyjson_arr_iter iter;
 	duckdb_yyjson::yyjson_arr_iter_init(keys, &iter);
 	while (auto key = duckdb_yyjson::yyjson_arr_iter_next(&iter)) {
@@ -147,17 +153,21 @@ yyjson_val *SelectJwk(yyjson_val *keys_root, const string &kid, const char *kty)
 		if (entry_kty != kty) {
 			continue;
 		}
-		auto entry_kid = JsonString(duckdb_yyjson::yyjson_obj_get(key, "kid"));
-		if (!kid.empty() && entry_kid == kid) {
-			return key;
+		auto use = JsonString(duckdb_yyjson::yyjson_obj_get(key, "use"));
+		if (!use.empty() && use != "sig") {
+			continue;
 		}
-		fallback = key;
-		fallback_count++;
+		auto entry_kid = JsonString(duckdb_yyjson::yyjson_obj_get(key, "kid"));
+		if (!kid.empty()) {
+			if (entry_kid == kid) {
+				return key;
+			}
+			continue;
+		}
+		only_signing = key;
+		signing_count++;
 	}
-	if (kid.empty() && fallback_count == 1) {
-		return fallback;
-	}
-	return kid.empty() ? nullptr : fallback; // kid given but unmatched: try the single same-kty key
+	return signing_count == 1 ? only_signing : nullptr;
 }
 
 vector<uint8_t> Sha256(const string &input) {
@@ -272,6 +282,41 @@ bool LooksLikeJwt(const string &token, string &issuer_out) {
 	}
 	issuer_out = JsonString(duckdb_yyjson::yyjson_obj_get(payload.Root(), "iss"));
 	return true;
+}
+
+string JwtKid(const string &token) {
+	ParsedJwt jwt;
+	if (!SplitJwt(token, jwt)) {
+		return string();
+	}
+	JsonDoc header(jwt.header_json);
+	if (!header.Root()) {
+		return string();
+	}
+	return JsonString(duckdb_yyjson::yyjson_obj_get(header.Root(), "kid"));
+}
+
+bool JwksHasKid(const string &keys_json, const string &kid) {
+	if (kid.empty()) {
+		return true;
+	}
+	JsonDoc keys(keys_json);
+	if (!keys.Root()) {
+		return true; // not a JWKS (a PEM, or unparseable): the verifier will say so, not the cache
+	}
+	auto array = duckdb_yyjson::yyjson_obj_get(keys.Root(), "keys");
+	if (!array || !duckdb_yyjson::yyjson_is_arr(array)) {
+		return true;
+	}
+	duckdb_yyjson::yyjson_val *key;
+	duckdb_yyjson::yyjson_arr_iter iter;
+	duckdb_yyjson::yyjson_arr_iter_init(array, &iter);
+	while ((key = duckdb_yyjson::yyjson_arr_iter_next(&iter))) {
+		if (JsonString(duckdb_yyjson::yyjson_obj_get(key, "kid")) == kid) {
+			return true;
+		}
+	}
+	return false;
 }
 
 JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clock_skew_seconds) {

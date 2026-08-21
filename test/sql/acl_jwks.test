@@ -1,0 +1,212 @@
+# name: test/sql/acl_jwks.test
+# description: an issuer's keys read from a document (spec 023) - the same mechanism for an https JWKS
+#   and for a file an operator refreshes, cached per instance with a TTL and a bounded staleness
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+# every verification re-reads, so a rotation is visible without waiting out a TTL
+statement ok
+SET GLOBAL acl_jwks_refresh_interval = 0;
+
+statement ok
+COPY (SELECT '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AS c)
+    TO '__TEST_DIR__/jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/hs' KEYS FROM '__TEST_DIR__/jwks.json'
+    AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+# a mapped role has to be a role the catalog knows, which a grant is what makes it
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN;
+
+# --- the keys come from the document ---------------------------------------------------------------
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+1
+
+# rotating the document rotates the keys: the same token stops verifying once the key behind it is
+# gone, without the issuer being touched
+statement ok
+COPY (SELECT '{"keys":[{"kty":"oct","k":"ZGlmZmVyZW50LXNlY3JldA"}]}' AS c)
+    TO '__TEST_DIR__/jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1;
+----
+<REGEX>:.*signature verification failed.*
+
+statement ok
+COPY (SELECT '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AS c)
+    TO '__TEST_DIR__/jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+1
+
+# repointing an issuer takes effect at once: keys read from the old location say nothing about the new
+# one, and an operator moving an issuer does not mean "after the TTL"
+statement ok
+COPY (SELECT '{"keys":[{"kty":"oct","k":"ZGlmZmVyZW50LXNlY3JldA"}]}' AS c)
+    TO '__TEST_DIR__/other-jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+
+statement ok
+SET GLOBAL acl_jwks_refresh_interval = 300;
+
+statement ok
+ACL ADMIN ALTER ISSUER 'https://issuer.test/hs' SET KEYS FROM '__TEST_DIR__/other-jwks.json';
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1;
+----
+<REGEX>:.*signature verification failed.*
+
+statement ok
+ACL ADMIN ALTER ISSUER 'https://issuer.test/hs' SET KEYS FROM '__TEST_DIR__/jwks.json';
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+1
+
+statement ok
+SET GLOBAL acl_jwks_refresh_interval = 0;
+
+# --- a document that cannot be read -----------------------------------------------------------------
+# keys of unknown age are not trusted forever: with no staleness allowed, a failed read is fatal, and
+# the message names the location rather than blaming the token
+
+statement ok
+SET GLOBAL acl_jwks_max_stale = 0;
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/gone' KEYS FROM '__TEST_DIR__/nosuch.json'
+    AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
+
+statement error
+ACL TOKEN 'eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJpc3MiOiAiaHR0cHM6Ly9pc3N1ZXIudGVzdC9nb25lIiwgImF1ZCI6ICJhcGk6Ly9hY2wtdGVzdCIsICJleHAiOiA0MTAyNDQ0ODAwLCAic3ViIjogInU4IiwgInJvbGVzIjogWyJhbmFseXN0Il19.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' SELECT 1;
+----
+<REGEX>:.*keys of issuer "https://issuer.test/gone" could not be read.*
+
+statement ok
+SET GLOBAL acl_jwks_max_stale = 3600;
+
+# --- the two forms are alternatives -----------------------------------------------------------------
+
+statement error
+SELECT acl_define_issuer('https://issuer.test/both', '{"keys":[]}', 'api://x', 'HS256', 'roles', '', '__TEST_DIR__/jwks.json');
+----
+<REGEX>:.*either as a document or as a location.*
+
+statement error
+SELECT acl_define_issuer('https://issuer.test/none', '', 'api://x', 'HS256', 'roles', '', '');
+----
+<REGEX>:.*either as a document or as a location.*
+
+# --- switching one for the other --------------------------------------------------------------------
+# an issuer that pasted its keys and is then pointed at a document must not keep the paste, or it would
+# verify against keys nobody can see any more
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/paste', '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}', 'api://acl-test', 'HS256', 'roles', '');
+
+query II
+SELECT keys_json IS NOT NULL AND keys_json <> '', jwks_uri IS NULL OR jwks_uri = ''
+    FROM aclcat.acl.issuers WHERE issuer = 'https://issuer.test/paste';
+----
+true	true
+
+statement ok
+ACL ADMIN ALTER ISSUER 'https://issuer.test/paste' SET KEYS FROM '__TEST_DIR__/jwks.json';
+
+query II
+SELECT keys_json IS NULL OR keys_json = '', jwks_uri IS NOT NULL
+    FROM aclcat.acl.issuers WHERE issuer = 'https://issuer.test/paste';
+----
+true	true
+
+statement ok
+ACL ADMIN ALTER ISSUER 'https://issuer.test/paste' SET KEYS '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}';
+
+query II
+SELECT keys_json IS NOT NULL AND keys_json <> '', jwks_uri IS NULL OR jwks_uri = ''
+    FROM aclcat.acl.issuers WHERE issuer = 'https://issuer.test/paste';
+----
+true	true
+
+# --- the operator sees where an issuer's keys come from, and still never sees the keys ---------------
+
+query II
+SELECT issuer, jwks_uri IS NOT NULL FROM acl_issuers() WHERE issuer = 'https://issuer.test/hs';
+----
+https://issuer.test/hs	true
+
+statement error
+SELECT keys_json FROM acl_issuers();
+----
+<REGEX>:.*keys_json.*
+
+# --- a pasted JWKS keeps working exactly as before ----------------------------------------------------
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/inline', '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}', 'api://acl-test', 'HS256', 'roles', '');
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2lubGluZSIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1OSIsInJvbGVzIjpbImFuYWx5c3QiXX0.HfA9nxdf-imBrNqWnCluv0-E2hubPBcoeRhxlR3MQ7s' SELECT 1 AS ok;
+----
+1
+
+# and its row carries no location, so nothing is read for it at all
+query I
+SELECT jwks_uri IS NULL OR jwks_uri = '' FROM aclcat.acl.issuers WHERE issuer = 'https://issuer.test/inline';
+----
+true
+
+# --- a real JWKS carries more than one key ------------------------------------------------------------
+# A Keycloak realm publishes an RSA-OAEP key beside its RS256 one, so `use` decides what a key is for:
+# an encryption key never verifies a signature, and a kid that matches nothing is an error rather than
+# a reason to try another key - during a rotation that is the difference between "no key with this id"
+# and a misleading "signature verification failed".
+
+statement ok
+COPY (SELECT '{"keys":[{"kty":"RSA","kid":"enc-key","alg":"RSA-OAEP","use":"enc","n":"jps-_RGCObZHYxFmbxIagCg0dZlIifYMV2phhdrLpkrJ8TkoTe_GQK62Nf4Ilh92YUiBofspFfi7-fT937mnN1vzVyAKjHCHA4BmnDHHvCea8QdNP0YcxDXsBReZDFx-e8uEqfG-9_uvhLS0HTwTqhRKtdlwGDrsSoH4WYnCHI1grvQ8BSo7MivppMTzx7UUWeKieKFMeY3jw-g0XgdyZKjIOOaXQTX5AeEm_Xq6OjOtq7gVIgmNfogSQIAWFk5iaMzzafzhQmN_d719rEMSJClAAnCklwpETEq2jWv5vJUhslPL6ZQPd8jnjVMcOzL8Zy9ed5U9te-EQ0IKnfnpZQ","e":"AQAB"},{"kty":"RSA","kid":"test-key","alg":"RS256","use":"sig","n":"jps-_RGCObZHYxFmbxIagCg0dZlIifYMV2phhdrLpkrJ8TkoTe_GQK62Nf4Ilh92YUiBofspFfi7-fT937mnN1vzVyAKjHCHA4BmnDHHvCea8QdNP0YcxDXsBReZDFx-e8uEqfG-9_uvhLS0HTwTqhRKtdlwGDrsSoH4WYnCHI1grvQ8BSo7MivppMTzx7UUWeKieKFMeY3jw-g0XgdyZKjIOOaXQTX5AeEm_Xq6OjOtq7gVIgmNfogSQIAWFk5iaMzzafzhQmN_d719rEMSJClAAnCklwpETEq2jWv5vJUhslPL6ZQPd8jnjVMcOzL8Zy9ed5U9te-EQ0IKnfnpZQ","e":"AQAB"}]}' AS c)
+    TO '__TEST_DIR__/rs-jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/rs' KEYS FROM '__TEST_DIR__/rs-jwks.json'
+    AUDIENCES ('api://acl-test') ALGS (RS256) ROLE CLAIM 'roles';
+
+# the encryption key does not shadow the signing one: a token naming the sig kid still verifies
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' SELECT 1 AS ok;
+----
+1
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImVuYy1rZXkifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdfQ.KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKg' SELECT 1;
+----
+<REGEX>:.*no usable RS256 key.*
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InVua25vd24ta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdfQ.KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKg' SELECT 1;
+----
+<REGEX>:.*no usable RS256 key.*
