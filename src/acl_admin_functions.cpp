@@ -756,7 +756,8 @@ void AclAlterGrantFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_alter_issuer(issuer, field, value): field is keys | audiences | algs | role_claim | claim_map
+//! acl_alter_issuer(issuer, field, value): field is keys | jwks_uri | audiences | algs | role_claim |
+//! claim_map. `keys` and `jwks_uri` are alternatives, so setting either clears the other.
 void AclAlterIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto issuer = RequiredArg(args, 0, row, "acl_alter_issuer", "issuer");
@@ -900,14 +901,20 @@ void AclRevokeAdminFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_claim, claim_map_json):
+//! acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_claim, claim_map_json[, jwks_uri]):
 //! register an offline JWT issuer (spec 007). keys_json is a JWKS (RSA n/e, EC x/y, oct k) or a PEM
-//! public key; keys are data - the gateway/admin rotates them.
+//! public key; jwks_uri (spec 023) names a document to read them from instead - an https URL or a file
+//! an operator refreshes. Exactly one of the two carries the keys.
 void AclDefineIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		IssuerConfig config;
 		config.issuer = RequiredArg(args, 0, row, "acl_define_issuer", "issuer");
-		config.keys_json = RequiredArg(args, 1, row, "acl_define_issuer", "keys");
+		config.keys_json = OptionalArg(args, 1, row, "");
+		config.jwks_uri = OptionalArg(args, 6, row, "");
+		if (config.keys_json.empty() == config.jwks_uri.empty()) {
+			throw BinderException("acl_define_issuer: an issuer carries its keys either as a document or as a "
+			                      "location to read one from, and must state exactly one of them");
+		}
 		for (auto &aud : SplitCsv(OptionalArg(args, 2, row, ""))) {
 			config.audiences.push_back(aud);
 		}
@@ -1081,7 +1088,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);
 	register_admin_set("acl_define_role", {{v, v}, {v, v, v}}, AclDefineRoleFunc);
 	// offline JWT verification (spec 007)
-	register_admin("acl_define_issuer", {v, v, v, v, v, v}, AclDefineIssuerFunc);
+	register_admin_set("acl_define_issuer", {{v, v, v, v, v, v}, {v, v, v, v, v, v, v}}, AclDefineIssuerFunc);
 	register_admin("acl_map_role", {v, v, v, v}, AclMapRoleFunc);
 	// ALTER of existing objects (spec 009)
 	register_admin("acl_alter_relation", {v, v, v, v}, AclAlterRelationFunc);

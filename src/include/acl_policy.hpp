@@ -99,6 +99,10 @@ struct IssuerConfig {
 	case_insensitive_set_t algs; // allowlist of {RS256, ES256, HS256}; anything else (incl. none) is refused
 	string role_claim;           // dot path to the roles claim ("roles", "realm_access.roles", "groups")
 	string claim_map;            // JSON: {"<jwt dot path>": "<acl_claim name>"}
+	//! Where the keys are read from when they are not pasted in (spec 023): anything duckdb's own
+	//! filesystem opens - an https JWKS URL (needs httpfs) or a file an operator refreshes out of
+	//! band. Empty means `keys_json` is the whole truth.
+	string jwks_uri;
 };
 
 //! duckdb answers "what is in this catalog?" three ways - a table function, a view of the same name
@@ -181,6 +185,15 @@ struct PolicyStore {
 	case_insensitive_map_t<AdminScope> admin_scopes;
 	// role -> default claims (used by the ROLE form, which carries no token)
 	case_insensitive_map_t<case_insensitive_map_t<string>> role_claims;
+	//! What an issuer's JWKS URI last yielded (spec 023). Reading is the whole mechanism: a TTL says
+	//! when to read again, and a bounded staleness says how long a failed read may be survived.
+	struct JwksEntry {
+		string keys_json;
+		int64_t fetched_at = 0; // seconds since epoch of the last successful read; 0 = never
+		int64_t tried_at = 0;   // last attempt, successful or not - the floor under retries
+		string error;
+	};
+	case_insensitive_map_t<JwksEntry> jwks_cache;
 	// gateway-wide function denylist (readers / rights-bypass); everything else passes
 	case_insensitive_set_t denied_functions = DefaultDeniedFunctions();
 	// parsed rewrite-template prototypes, so a template is parsed once and only copied per request
@@ -376,8 +389,14 @@ private:
 	//! role mapping -> claims; throws on any failure. Defined in acl_policy.cpp.
 	void VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out);
 	bool LookupIssuer(const string &issuer, IssuerConfig &out);
+	//! spec 023: the keys to verify with. An issuer that names a JWKS URI has them read through
+	//! duckdb's filesystem and cached per instance; one that pastes a JWKS keeps using it. `kid` is
+	//! the token's, so a key that rotated in since the last read triggers one extra read.
+	string ResolveIssuerKeys(const IssuerConfig &config, const string &kid);
 	//! acl_jwt_clock_skew setting (seconds); the memory mode uses the 60s default (no db handle)
 	int64_t JwtClockSkew();
+	int64_t JwksRefreshInterval();
+	int64_t JwksMaxStale();
 	//! Map raw role-claim values through role_mappings; unmapped values pass only if the role exists
 	vector<string> MapExternalRoles(const string &issuer, const vector<string> &raw_roles);
 

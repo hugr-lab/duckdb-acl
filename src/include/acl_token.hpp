@@ -22,6 +22,14 @@ struct JwtClaims {
 //! Returns the token's issuer so the caller can look up the config. Never throws.
 bool LooksLikeJwt(const string &token, string &issuer_out);
 
+//! The `kid` of the token's header, or empty when there is none (or the token is not parseable). Used
+//! to decide whether a key set needs re-reading before the token is judged (spec 023).
+string JwtKid(const string &token);
+
+//! Whether a JWKS document contains a key with this id. A JWKS that is a bare PEM, or a token with no
+//! kid, answers true: there is nothing to look up, so nothing is missing.
+bool JwksHasKid(const string &keys_json, const string &kid);
+
 //! Full verification: signature (per the issuer's alg/keys), exp/nbf with skew, audience, role and
 //! claim extraction. Throws BinderException with a specific reason on any failure (the gateway is
 //! trusted to see diagnostics); a denial must throw anyway (FALLBACK would silently re-parse).

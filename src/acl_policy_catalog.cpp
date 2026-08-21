@@ -10,6 +10,8 @@
 
 #include "acl_policy.hpp"
 
+#include "acl_token.hpp"
+
 #include "acl_rewriter.hpp"
 
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -1431,7 +1433,8 @@ struct CatalogBackend {
 			result = Query("SELECT * FROM " + Slot("issuer") + "(" + Lit(issuer) + ")");
 			base = 1;
 		} else {
-			result = Query("SELECT \"keys_json\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\" FROM " +
+			result = Query("SELECT \"keys_json\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\","
+			               " \"jwks_uri\" FROM " +
 			               Tbl("issuers") + " WHERE \"issuer\" = " + Lit(issuer));
 		}
 		IssuerConfig config;
@@ -1458,6 +1461,11 @@ struct CatalogBackend {
 			config.role_claim = role_claim.IsNull() ? string() : role_claim.ToString();
 			auto claim_map = result->GetValue(base + 4, 0);
 			config.claim_map = claim_map.IsNull() ? string() : claim_map.ToString();
+			// the function-driver slot has no jwks_uri column: its platform hands over the keys itself
+			if (result->ColumnCount() > base + 5) {
+				auto jwks_uri = result->GetValue(base + 5, 0);
+				config.jwks_uri = jwks_uri.IsNull() ? string() : jwks_uri.ToString();
+			}
 		}
 		lock_guard<mutex> guard(lock);
 		issuer_cache[issuer] = {found, config};
@@ -1631,6 +1639,28 @@ struct CatalogBackend {
 		return string();
 	}
 
+	//! Read a document through duckdb's own filesystem (spec 023). A local path works out of the box;
+	//! an https URL needs httpfs, and duckdb says so itself - which is the error an operator needs.
+	bool ReadText(const string &uri, string &out, string &error) {
+		auto instance = Db();
+		Connection con(*instance);
+		auto result = con.Query("SELECT content FROM read_text(" + Lit(uri) + ")");
+		if (result->HasError()) {
+			error = result->GetError();
+			return false;
+		}
+		if (result->RowCount() == 0) {
+			error = "there is no document there";
+			return false;
+		}
+		if (result->RowCount() != 1 || result->GetValue(0, 0).IsNull()) {
+			error = "the location holds no single document";
+			return false;
+		}
+		out = result->GetValue(0, 0).ToString();
+		return true;
+	}
+
 	//! Whether a relation has a column of that name. False only when the relation itself binds and the
 	//! column does not: a source that cannot be reached at all answers true, since it cannot answer.
 	bool ColumnBinds(const string &source, const string &column) {
@@ -1794,9 +1824,13 @@ struct CatalogBackend {
 		    "CREATE TABLE IF NOT EXISTS " + Tbl("reference_columns") +
 		        "(\"vcat\" VARCHAR, \"name\" VARCHAR, \"pos\" INTEGER, \"side\" VARCHAR, \"column\" VARCHAR,"
 		        " \"param\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\", \"pos\", \"side\"))",
-		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '7' WHERE NOT EXISTS (SELECT 1 FROM " +
+		    // spec 023 (schema v8): where an issuer's keys come from. A JWKS the operator pasted stays
+		    // valid; a URI is read through duckdb's own filesystem, so an https URL (with httpfs) and a
+		    // file an operator refreshes out of band are the same mechanism.
+		    "ALTER TABLE " + Tbl("issuers") + " ADD COLUMN IF NOT EXISTS \"jwks_uri\" VARCHAR",
+		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '8' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
-		    "UPDATE " + Tbl("meta") + " SET \"value\" = '7' WHERE \"key\" = 'schema_version' AND \"value\" < '7'",
+		    "UPDATE " + Tbl("meta") + " SET \"value\" = '8' WHERE \"key\" = 'schema_version' AND \"value\" < '8'",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'policy_version')",
 		};
@@ -1893,6 +1927,78 @@ int64_t PolicyStore::JwtClockSkew() {
 		return catalog->SettingInt64("acl_jwt_clock_skew", 60);
 	}
 	return 60; // the memory mode has no database handle to read the setting from
+}
+
+int64_t PolicyStore::JwksRefreshInterval() {
+	if (!catalog) {
+		return 300;
+	}
+	return catalog->SettingInt64("acl_jwks_refresh_interval", 300);
+}
+
+int64_t PolicyStore::JwksMaxStale() {
+	if (!catalog) {
+		return 3600;
+	}
+	return catalog->SettingInt64("acl_jwks_max_stale", 3600);
+}
+
+//! spec 023: the key set a token is judged against. An issuer that pastes a JWKS keeps it; one that
+//! names a URI has it read through duckdb's filesystem, cached here, and re-read when the TTL expires
+//! or when the token names a key the cached document does not have.
+string PolicyStore::ResolveIssuerKeys(const IssuerConfig &config, const string &kid) {
+	if (config.jwks_uri.empty()) {
+		return config.keys_json;
+	}
+	if (!catalog) {
+		throw BinderException("acl_rewrite: token rejected: issuer \"%s\" reads its keys from \"%s\", which needs "
+		                      "a policy catalog - the in-memory store cannot read documents",
+		                      config.issuer, config.jwks_uri);
+	}
+	auto now =
+	    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+	auto refresh = JwksRefreshInterval();
+	JwksEntry entry;
+	{
+		lock_guard<mutex> guard(lock);
+		auto found = jwks_cache.find(config.issuer);
+		if (found != jwks_cache.end()) {
+			entry = found->second;
+		}
+	}
+	bool expired = entry.keys_json.empty() || now - entry.fetched_at >= refresh;
+	// a key that rotated in since the last read: worth one more read, but not once per token, so the
+	// same floor as any other retry applies
+	bool rotated = !expired && !JwksHasKid(entry.keys_json, kid);
+	static constexpr int64_t RETRY_FLOOR_SECONDS = 10;
+	if ((expired || rotated) && now - entry.tried_at >= (rotated ? RETRY_FLOOR_SECONDS : 0)) {
+		string document, error;
+		entry.tried_at = now;
+		if (catalog->ReadText(config.jwks_uri, document, error)) {
+			entry.keys_json = std::move(document);
+			entry.fetched_at = now;
+			entry.error.clear();
+		} else {
+			entry.error = std::move(error);
+		}
+		lock_guard<mutex> guard(lock);
+		jwks_cache[config.issuer] = entry;
+	}
+	if (entry.keys_json.empty()) {
+		throw BinderException("acl_rewrite: token rejected: the keys of issuer \"%s\" could not be read from "
+		                      "\"%s\": %s",
+		                      config.issuer, config.jwks_uri, entry.error);
+	}
+	// keys that can no longer be read are used for a bounded while and then stop being trusted: an
+	// issuer that has been unreachable for a day says nothing about a key that may have been revoked
+	auto max_stale = JwksMaxStale();
+	if (!entry.error.empty() && (max_stale <= 0 || now - entry.fetched_at > max_stale)) {
+		throw BinderException("acl_rewrite: token rejected: the keys of issuer \"%s\" were last read %lld seconds "
+		                      "ago and \"%s\" is still unreadable (%s); acl_jwks_max_stale is %lld",
+		                      config.issuer, static_cast<long long>(now - entry.fetched_at), config.jwks_uri,
+		                      entry.error, static_cast<long long>(max_stale));
+	}
+	return entry.keys_json;
 }
 
 namespace {
@@ -2403,7 +2509,8 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	                      " \"virtual_only\", \"comment\" FROM %s"},
 	    {"object_grants", "SELECT \"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\" FROM %s"},
 	    {"admins", "SELECT \"role\", \"scope\", \"vcat\" FROM %s"},
-	    {"issuers", "SELECT \"issuer\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\" FROM %s"},
+	    {"issuers", "SELECT \"issuer\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\", \"jwks_uri\""
+	                " FROM %s"},
 	    {"role_mappings", "SELECT \"issuer\", \"source\", \"external_value\", \"role\" FROM %s"},
 	    {"function_gate", "SELECT \"role\", \"name\", \"kind\", \"allowed\" FROM %s"},
 	};
@@ -3187,7 +3294,13 @@ void PolicyStore::CatalogAlterIssuer(const string &issuer, const string &field, 
 		return parts;
 	};
 	if (field == "keys") {
+		// the two are alternatives, so setting one clears the other: an issuer whose keys were pasted
+		// and then pointed at a document must not keep verifying against the old paste
 		config.keys_json = value;
+		config.jwks_uri.clear();
+	} else if (field == "jwks_uri") {
+		config.jwks_uri = value;
+		config.keys_json.clear();
 	} else if (field == "audiences") {
 		config.audiences = split_csv(value);
 		if (config.audiences.empty()) {
@@ -3260,7 +3373,8 @@ void PolicyStore::CatalogDefineIssuer(const IssuerConfig &config) {
 	catalog->Write({"DELETE FROM " + catalog->Tbl("issuers") + " WHERE \"issuer\" = " + Lit(config.issuer),
 	                "INSERT INTO " + catalog->Tbl("issuers") + " VALUES (" + Lit(config.issuer) + ", " +
 	                    Lit(config.keys_json) + ", " + Lit(audiences) + ", " + Lit(algs) + ", " +
-	                    Lit(config.role_claim) + ", " + Lit(config.claim_map) + ")"});
+	                    Lit(config.role_claim) + ", " + Lit(config.claim_map) + ", " +
+	                    (config.jwks_uri.empty() ? string("NULL") : Lit(config.jwks_uri)) + ")"});
 }
 
 void PolicyStore::CatalogMapRole(const string &issuer, const string &source, const string &external_value,

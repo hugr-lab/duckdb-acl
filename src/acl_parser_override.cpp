@@ -688,7 +688,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		s.Expect("issuer");
 		auto issuer = s.Quoted("issuer");
 		s.Expect("keys");
-		auto keys = s.Quoted("keys");
+		// KEYS '<jwks>' pastes the document; KEYS FROM '<uri>' names where to read it (spec 023)
+		string keys, jwks_uri;
+		if (s.Accept("from")) {
+			jwks_uri = s.Quoted("a JWKS location");
+		} else {
+			keys = s.Quoted("keys");
+		}
 		string audiences, algs = "RS256", role_claim = "roles", claim_map;
 		if (s.Accept("audiences")) {
 			audiences = s.AtParen() ? ValueListToCsv(s.Parens()) : s.Quoted("audiences");
@@ -705,7 +711,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			claim_map = s.AtParen() ? ClaimMapToJson(s.Parens()) : s.Quoted("claim map");
 		}
 		return MakeAdminCall("acl_define_issuer", {Value(issuer), Value(keys), Value(audiences), Value(algs),
-		                                           Value(role_claim), Value(claim_map)});
+		                                           Value(role_claim), Value(claim_map), Value(jwks_uri)});
 	}
 	if (StringUtil::CIEquals(keyword, "add")) {
 		if (s.Accept("view")) {
@@ -896,7 +902,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			s.Expect("set");
 			string field;
 			if (s.Accept("keys")) {
-				field = "keys";
+				field = s.Accept("from") ? "jwks_uri" : "keys";
 			} else if (s.Accept("audiences")) {
 				field = "audiences";
 			} else if (s.Accept("algs")) {
