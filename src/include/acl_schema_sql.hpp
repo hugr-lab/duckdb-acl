@@ -9,6 +9,7 @@ namespace acl {
 //! The managed schema, in the order it must be applied. `<schema>` and `<table>` are
 //! substituted with the qualified names of the catalog being initialised, and ACL_KEY_TEXT
 //! with the key-column type that catalog's kind needs (spec 033).
+// clang-format off
 static const char *const ACL_SCHEMA_SQL[] = {
     "CREATE SCHEMA IF NOT EXISTS <schema>",
     "CREATE TABLE IF NOT EXISTS <meta>(\"key\" ACL_KEY_TEXT PRIMARY KEY, \"value\" VARCHAR)",
@@ -35,6 +36,7 @@ static const char *const ACL_SCHEMA_SQL[] = {
     "INSERT INTO <meta> SELECT 'schema_version', '10' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'schema_version')",
     "INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'policy_version')",
 };
+// clang-format on
 
 //! The version this schema is. A catalog carries its own in `meta`, and a build refuses one
 //! that does not match: the migration contract rests on the two being comparable (spec 034).

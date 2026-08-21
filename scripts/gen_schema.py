@@ -94,6 +94,10 @@ def write_header(statements):
         "//! The managed schema, in the order it must be applied. `<schema>` and `<table>` are",
         "//! substituted with the qualified names of the catalog being initialised, and ACL_KEY_TEXT",
         "//! with the key-column type that catalog's kind needs (spec 033).",
+        # A DDL statement is one string and does not wrap: reflowing it would only make the
+        # generated file disagree with the .sql it came from, so the formatter is told to
+        # leave the table alone rather than the column limit relaxed for the whole file.
+        "// clang-format off",
         "static const char *const ACL_SCHEMA_SQL[] = {",
     ]
     for _, _, sql in statements:
@@ -101,6 +105,7 @@ def write_header(statements):
     version = schema_version(statements)
     out += [
         "};",
+        "// clang-format on",
         "",
         "//! The version this schema is. A catalog carries its own in `meta`, and a build refuses one",
         "//! that does not match: the migration contract rests on the two being comparable (spec 034).",

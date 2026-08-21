@@ -772,7 +772,9 @@ struct CatalogBackend {
 		           RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
 		           " WHERE (" + qualified_cond +
 		           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(vname) +
-		           ") ORDER BY prio";
+		           // by role, so a principal holding several of them merges their column lists in one
+		           // order rather than in whatever order the store returned (spec 036)
+		           ") ORDER BY prio, g.\"role\"";
 		auto result = Query(sql);
 		if (result->RowCount() == 0) {
 			return false;
@@ -936,7 +938,8 @@ struct CatalogBackend {
 		           " FROM " +
 		           AliasesSource(principal) + " sa JOIN grants g ON g.\"vcat\" = sa.\"vcat\"" + oc_join + " WHERE (" +
 		           qualified_cond + ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND " +
-		           prefix_match(Lit(vname), "sa.\"alias_path\"") + ") ORDER BY prio, length(sa.\"alias_path\") DESC";
+		           prefix_match(Lit(vname), "sa.\"alias_path\"") +
+		           ") ORDER BY prio, length(sa.\"alias_path\") DESC, g.\"role\"";
 		auto result = Query(sql);
 		if (result->RowCount() == 0) {
 			return false;
@@ -1000,7 +1003,7 @@ struct CatalogBackend {
 		           FunctionsSource(principal, names) + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join +
 		           " WHERE f.\"kind\" = '" + kind + "' AND ((" + qualified_cond +
 		           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND f.\"vname\" = " + Lit(vname) +
-		           ")) ORDER BY prio";
+		           ")) ORDER BY prio, g.\"role\"";
 		auto result = Query(sql);
 		TablePolicy policy;
 		bool found = result->RowCount() > 0;
@@ -1175,23 +1178,65 @@ struct CatalogBackend {
 		// spec 026: what a grant's own projection produces - a mask that changes a column's type, or a
 		// computed column the object never had. Probed when the grant is written, so a listing can
 		// describe what the role reads rather than what the physical table holds.
-		string projected = "gprojection AS (SELECT DISTINCT pc.\"vcat\" AS vcat, pc.\"vname\" AS vname,"
-		                   " pc.\"name\" AS name, pc.\"type\" AS type, pc.\"pos\" AS pos FROM " +
+		// A principal may hold several roles, and two of them may project the same name - at the same
+		// position or at different ones. One row per name is the invariant every consumer depends on:
+		// a duplicate makes `column_count` wrong and the synthesized DDL invalid SQL (spec 035).
+		//
+		// The order has to be the read path's, not merely stable, because a client may project by
+		// position (spec 036). The read path merges roles in role-name order, appending each role's
+		// list in its own order - so a column belongs where the first role that states it put it.
+		// Ranking by `(role, pos)` and taking each name's first occurrence reproduces exactly that,
+		// and the outer row_number closes the gaps a merged name leaves behind.
+		string projected = "gprojection AS (SELECT vcat, vname, name, type,"
+		                   " row_number() OVER (PARTITION BY vcat, vname ORDER BY rk) - 1 AS pos FROM"
+		                   " (SELECT vcat, vname, name, min_by(type, rk) AS type, min(rk) AS rk FROM"
+		                   " (SELECT vcat, vname, name, type,"
+		                   " row_number() OVER (PARTITION BY vcat, vname ORDER BY \"role\", \"pos\") AS rk FROM"
+		                   " (SELECT DISTINCT pc.\"vcat\" AS vcat, pc.\"vname\" AS vname, pc.\"name\" AS name,"
+		                   " pc.\"type\" AS type, pc.\"role\" AS \"role\", pc.\"pos\" AS \"pos\" FROM " +
 		                   Tbl("grant_columns") +
-		                   " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\")";
+		                   " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\""
+		                   // One role whose chain states no column list lifts the restriction for the
+		                   // whole principal (spec 011: `Restricts()` is `any && !unrestricted`), and
+		                   // then the object's own columns are what it reads - so another role's
+		                   // projection must not be listed either, or the listing would advertise a
+		                   // column `SELECT *` never returns.
+		                   " WHERE NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE gc.vcat = pc.\"vcat\""
+		                   " AND gc.vname = pc.\"vname\""
+		                   " AND (gc.cat_columns IS NULL OR trim(gc.cat_columns) = '')"
+		                   " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))))"
+		                   " GROUP BY vcat, vname, name))";
 		auto prelude = GrantsCte(principal) + ", " + objects + ", " + aliases + ", " + schemas + ", " + grant_columns +
 		               ", " + vfunctions + ", " + projected + " ";
+		// spec 035: each surface answers in its own standard shape, column for column and type for
+		// type. A value that would describe the physical object rather than the virtual one is not
+		// borrowed - an oid identifies a physical catalog entry, a path is the physical database.
+		auto empty_map = "MAP {}::MAP(VARCHAR, VARCHAR)";
 		if (surface == "databases") {
 			// one row per granted catalog, and no physical database name ever appears
-			return prelude + "SELECT DISTINCT vcat AS database_name, NULL AS path, NULL AS comment,"
-			                 " NULL AS tags, false AS internal, NULL AS type, NULL AS database_oid,"
-			                 " false AS readonly FROM vschemas";
+			return prelude +
+			       "SELECT vcat AS database_name, NULL::BIGINT AS database_oid, NULL::VARCHAR AS path,"
+			       " NULL::VARCHAR AS comment, " +
+			       empty_map +
+			       " AS tags, false AS internal, NULL::VARCHAR AS type,"
+			       " false AS readonly, false AS encrypted, NULL::VARCHAR AS cipher, " +
+			       empty_map + " AS options FROM (SELECT DISTINCT vcat FROM vschemas)";
 		}
 		if (surface == "schemata") {
-			return prelude + "SELECT DISTINCT vcat AS catalog_name, path AS schema_name, NULL AS schema_owner,"
-			                 " NULL AS default_character_set_catalog, NULL AS default_character_set_schema,"
-			                 " NULL AS default_character_set_name, NULL AS sql_path, false AS internal,"
-			                 " NULL AS comment FROM vschemas";
+			return prelude + "SELECT DISTINCT vcat AS catalog_name, path AS schema_name,"
+			                 " NULL::VARCHAR AS schema_owner, NULL::VARCHAR AS default_character_set_catalog,"
+			                 " NULL::VARCHAR AS default_character_set_schema,"
+			                 " NULL::VARCHAR AS default_character_set_name, NULL::VARCHAR AS sql_path"
+			                 " FROM vschemas";
+		}
+		if (surface == "duckdb_schemas") {
+			return prelude +
+			       "SELECT NULL::BIGINT AS oid, vcat AS database_name, NULL::BIGINT AS database_oid,"
+			       " path AS schema_name, NULL::VARCHAR AS comment, " +
+			       empty_map +
+			       " AS tags, false AS internal, NULL::VARCHAR AS sql,"
+			       " NULL::VARCHAR AS parent_schema, NULL::BIGINT AS parent_schema_oid"
+			       " FROM (SELECT DISTINCT vcat, path FROM vschemas)";
 		}
 		// spec 031: the SHOW forms, each in the shape duckdb answers it with. They are the same catalog
 		// the information_schema surfaces describe - only a client asking `SHOW DATABASES` wants one
@@ -1208,8 +1253,11 @@ struct CatalogBackend {
 		}
 		auto physical = "i.\"table_catalog\" = o.parts[1] AND i.\"table_schema\" = o.parts[2]"
 		                " AND i.\"table_name\" = o.parts[3]";
+		// the comment is the virtual object's own: a physical comment describes the physical table, and
+		// may say things about it the role is not reading (spec 035)
 		string tables_sql =
-		    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name)"
+		    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
+		           " o.comment AS \"TABLE_COMMENT\")"
 		           " FROM objects o JOIN information_schema.tables i ON ") +
 		    physical +
 		    " WHERE len(o.parts) = 3"
@@ -1233,7 +1281,8 @@ struct CatalogBackend {
 			       " WHERE g.\"vcat\" = t.table_catalog AND g.\"is_main\" = true) ORDER BY 1";
 		}
 		if (surface != "columns" && surface != "references" && surface != "show_tables_expanded" &&
-		    surface != "show_tables") {
+		    surface != "show_tables" && surface != "duckdb_tables" && surface != "duckdb_views" &&
+		    surface != "duckdb_columns") {
 			throw BinderException("acl: unknown metadata surface \"%s\"", surface);
 		}
 		// the columns a role actually sees: an object's own projection when it has one (its rows in
@@ -1261,7 +1310,9 @@ struct CatalogBackend {
 		    " UNION ALL BY NAME"
 		    " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
 		    " oc.\"name\" AS column_name, oc.\"pos\" + 1 AS ordinal_position, oc.\"type\" AS data_type,"
-		    " oc.\"comment\" AS comment FROM objects o JOIN " +
+		    // `COLUMN_COMMENT` is what information_schema.columns calls it; a `comment` of our own
+		    // added a 46th column to a surface whose shape is fixed (spec 035)
+		    " oc.\"comment\" AS \"COLUMN_COMMENT\" FROM objects o JOIN " +
 		    Tbl("object_columns") +
 		    " oc ON oc.\"vcat\" = o.vcat AND oc.\"kind\" = 'relation'"
 		    " AND oc.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
@@ -1317,6 +1368,51 @@ struct CatalogBackend {
 		    path("o") + " = gp.vname)";
 		if (surface == "columns") {
 			return prelude + effective_columns;
+		}
+		if (surface == "duckdb_columns") {
+			// the same rows as information_schema.columns, in duckdb's own shape. `is_nullable` and
+			// `is_generated` are booleans there and strings here, and a synthesized row (a mask, a
+			// computed column) has neither - duckdb always answers, so a default is closer than a NULL.
+			return prelude + "SELECT c.table_catalog AS database_name, NULL::BIGINT AS database_oid," +
+			       " c.table_schema AS schema_name, NULL::BIGINT AS schema_oid," +
+			       " c.table_name AS table_name, NULL::BIGINT AS table_oid," +
+			       " c.column_name AS column_name, c.ordinal_position::INTEGER AS column_index," +
+			       " c.\"COLUMN_COMMENT\" AS comment, false AS internal," + " c.column_default AS column_default," +
+			       " coalesce(c.is_nullable = 'YES', true) AS is_nullable," +
+			       " c.data_type AS data_type, NULL::BIGINT AS data_type_id," +
+			       " c.character_maximum_length::INTEGER AS character_maximum_length," +
+			       " c.numeric_precision::INTEGER AS numeric_precision," +
+			       " c.numeric_precision_radix::INTEGER AS numeric_precision_radix," +
+			       " c.numeric_scale::INTEGER AS numeric_scale, " + empty_map +
+			       " AS tags, coalesce(c.is_generated = 'YES', false) AS is_generated," +
+			       " c.generation_expression AS generation_expression FROM (" + effective_columns + ") c";
+		}
+		if (surface == "duckdb_tables" || surface == "duckdb_views") {
+			bool views = surface == "duckdb_views";
+			// the columns the role reads, used for both the count and the synthesized DDL - so
+			// `DESCRIBE`, the columns listing and `sql` cannot describe three different objects
+			string of_this_table = " FROM vcolumns c WHERE c.table_catalog = t.table_catalog"
+			                       " AND c.table_schema = t.table_schema AND c.table_name = t.table_name";
+			string column_count = "(SELECT count(*)" + of_this_table + ")::BIGINT AS column_count";
+			auto quoted = [](const string &expr) {
+				return "'\"' || replace(" + expr + ", '\"', '\"\"') || '\"'";
+			};
+			// what the role reads, spelled as DDL a client can parse and bind - never the physical
+			// `CREATE TABLE`, which names the physical object and its full set of columns
+			string ddl = "(SELECT 'CREATE TABLE ' || " + quoted("t.table_name") + " || '(' || string_agg(" +
+			             quoted("c.column_name") + " || ' ' || c.data_type, ', ' ORDER BY c.ordinal_position)" +
+			             " || ');'" + of_this_table + ")";
+			string head = string("SELECT t.table_catalog AS database_name, NULL::BIGINT AS database_oid,") +
+			              " t.table_schema AS schema_name, NULL::BIGINT AS schema_oid, t.table_name AS " +
+			              (views ? "view_name" : "table_name") + ", NULL::BIGINT AS " +
+			              (views ? "view_oid" : "table_oid") + ", t.\"TABLE_COMMENT\" AS comment, " + empty_map +
+			              " AS tags, false AS internal, false AS temporary, ";
+			string tail = views ? column_count + ", NULL::VARCHAR AS sql, true AS is_bound"
+			                    : "NULL::BOOLEAN AS has_primary_key, NULL::BIGINT AS estimated_size, " + column_count +
+			                          ", NULL::BIGINT AS index_count, NULL::BIGINT AS check_constraint_count, " + ddl +
+			                          " AS sql";
+			return prelude + ", vcolumns AS (" + effective_columns + ") " + head + tail + " FROM (" + tables_sql +
+			       ") t WHERE t.table_type " + (views ? "=" : "<>") + " 'VIEW'";
 		}
 		if (surface == "show_tables_expanded") {
 			// `SHOW ALL TABLES`: every table of every catalog the principal holds, with the columns it

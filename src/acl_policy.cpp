@@ -9,14 +9,17 @@ namespace duckdb {
 namespace acl {
 
 const char *MetadataSurfaceOf(const string &name) {
+	// The written name decides the shape (spec 035). These surfaces describe the same catalog, but
+	// each answers with its own columns, and a client that selects a column by name - which is what a
+	// program does - breaks on any other shape.
 	static const case_insensitive_map_t<string> SURFACES = {
 	    {"information_schema.tables", "tables"},
 	    {"information_schema.columns", "columns"},
 	    {"information_schema.schemata", "schemata"},
-	    {"duckdb_tables", "tables"},
-	    {"duckdb_views", "tables"},
-	    {"duckdb_columns", "columns"},
-	    {"duckdb_schemas", "schemata"},
+	    {"duckdb_tables", "duckdb_tables"},
+	    {"duckdb_views", "duckdb_views"},
+	    {"duckdb_columns", "duckdb_columns"},
+	    {"duckdb_schemas", "duckdb_schemas"},
 	    {"duckdb_databases", "databases"},
 	};
 	auto entry = SURFACES.find(name);
