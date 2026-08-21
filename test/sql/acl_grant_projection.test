@@ -85,8 +85,10 @@ t	label	VARCHAR
 # an expression in a grant is evaluated over the physical row, where the hidden column still is
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.renamed AS phys.main.t COLUMNS (order_id = id, total = amount);
+ACL ADMIN CREATE VIRTUAL TABLE c.renamed AS phys.main.t COLUMNS (order_id = id, marker = amount);
 
+# the grant may only name what the object exposes (spec 029), but its *expression* still runs over the
+# physical row - so a column the object's projection dropped is still what the mask reads from
 statement ok
 ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select)
     COLUMNS (order_id, marker = coalesce(tenant, 'none'));

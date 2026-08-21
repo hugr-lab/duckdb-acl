@@ -44,13 +44,25 @@ alias
 statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{"select": true, "insert": true, "update": true, "delete": true, "merge": true}' MAIN;
 
-# --- reads see the virtual names, and the columns that were not renamed keep theirs ---------------
+# --- reads see the virtual names, and only the columns the list named (spec 029) -------------------
 
-query III
-ACL ROLE "analyst" SELECT order_id, total, tenant FROM orders ORDER BY order_id;
+query II
+ACL ROLE "analyst" SELECT order_id, total FROM orders ORDER BY order_id;
 ----
-1	100	acme
-2	200	globex
+1	100
+2	200
+
+# a column list is a projection whatever it is made of: one made only of renames no longer passes the
+# columns it did not name straight through
+statement error
+ACL ROLE "analyst" SELECT tenant FROM orders;
+----
+<REGEX>:.*(tenant|Referenced column).*
+
+query I
+ACL ROLE "analyst" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM (DESCRIBE orders);
+----
+order_id,total
 
 # the physical name of a renamed column is gone from the virtual relation
 statement error
@@ -61,12 +73,19 @@ ACL ROLE "analyst" SELECT id FROM orders;
 # --- writes map the names back --------------------------------------------------------------------
 
 statement ok
-ACL ROLE "analyst" INSERT INTO orders(order_id, tenant, total) VALUES (3, 'acme', 300);
+ACL ROLE "analyst" INSERT INTO orders(order_id, total) VALUES (3, 300);
 
 query II
 ACL ADMIN SELECT id, amount FROM phys.main.orders_physical WHERE id = 3;
 ----
 3	300
+
+# a column the list did not name is not writable either - hiding it on the read path and leaving it
+# open on the write path would only be half a projection
+statement error
+ACL ROLE "analyst" INSERT INTO orders(order_id, total, tenant) VALUES (8, 800, 'acme');
+----
+<REGEX>:.*column "tenant" of "orders" is not writable.*
 
 statement ok
 ACL ROLE "analyst" UPDATE orders SET total = 350 WHERE order_id = 3;
@@ -133,13 +152,20 @@ ACL ROLE "analyst" INSERT INTO masked(order_id) VALUES (5);
 ----
 <REGEX>:.*read-only relation.*
 
-# --- a column added to the physical table cannot shift an alias (renaming is by name) --------------
+# --- a column added to the physical table cannot shift an alias, and does not appear at all --------
+# renaming is by name, so nothing moves; and since the list is a projection, a new physical column is
+# not something the relation gained behind the administrator's back
 
 statement ok
 ACL ADMIN ALTER TABLE phys.main.orders_physical ADD COLUMN note VARCHAR;
 
-query III
-ACL ROLE "analyst" SELECT order_id, total, note FROM orders ORDER BY order_id;
+query II
+ACL ROLE "analyst" SELECT order_id, total FROM orders ORDER BY order_id;
 ----
-1	100	NULL
-2	200	NULL
+1	100
+2	200
+
+statement error
+ACL ROLE "analyst" SELECT note FROM orders;
+----
+<REGEX>:.*(note|Referenced column).*
