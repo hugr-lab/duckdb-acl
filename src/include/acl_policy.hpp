@@ -195,6 +195,14 @@ struct PolicyStore {
 	case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> scalar_functions;
 	// token -> principal (the dev stub; a JWT-shaped token takes the real verification path instead)
 	case_insensitive_map_t<Principal> tokens;
+	//! Served sessions (spec 040): a door verifies a token once and every statement afterwards carries
+	//! the handle instead. Handles are cryptographically random and case-sensitive, so this is a plain
+	//! map. In-memory and per-instance for now; the shared backends a cluster needs come later.
+	struct Session {
+		Principal principal;
+		int64_t expires_at = 0; // seconds since the epoch; 0 = the token carried none (the dev stub)
+	};
+	unordered_map<string, Session> sessions;
 	// issuer registry + external->role mappings (spec 007), memory-mode counterparts of the catalog
 	case_insensitive_map_t<IssuerConfig> issuers;
 	case_insensitive_map_t<case_insensitive_map_t<vector<string>>> role_mappings; // issuer -> external -> roles
@@ -361,6 +369,14 @@ struct PolicyStore {
 	//! the issuer registry (spec 007, throws with a specific reason on failure); a non-JWT token is a
 	//! dev-stub lookup in the in-memory map; the ROLE form trusts the gateway.
 	bool VerifyPrincipal(bool is_token, const string &value, Principal &out);
+	//! Verify a token and mint an opaque handle for it (spec 040). Empty when the token does not
+	//! verify: a door refuses rather than learning why, and the reason belongs to whoever verified.
+	string SessionOpen(DatabaseInstance &db, const string &token);
+	//! The principal behind a handle, or false with `reason` saying which of "unknown" / "expired" it
+	//! is - a client that reconnects needs to tell those apart.
+	bool SessionPrincipal(const string &handle, Principal &out, string &reason);
+	//! End a session. Idempotent: closing an unknown handle is not an error, since a door may retry.
+	void SessionClose(const string &handle);
 
 	//! Register an issuer / map an external role value (memory mode; catalog mode via the Catalog* ops)
 	void DefineIssuer(IssuerConfig config);

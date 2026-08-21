@@ -1,0 +1,150 @@
+# name: test/sql/acl_session.test
+# description: the session contract both doors stand on (spec 040) - open a token once, prefix every
+#   statement with the handle, close it; and refuse an unknown, closed or expired one
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme'), (2, 'globex');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders RLS 'tenant = acl_claim(''tenant'')';
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- open: a verified token becomes an opaque handle ------------------------------------------------
+
+statement ok
+CREATE TABLE live AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS handle;
+
+# 128 bits of hex, and nothing of the token in it
+query II
+SELECT length(handle), handle SIMILAR TO '[0-9A-Fa-f]+' FROM live;
+----
+32	true
+
+# a token that does not verify gives NULL rather than an error carrying detail
+query I
+SELECT acl_session_open('not.a.jwt') IS NULL;
+----
+true
+
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.wrongsignaturewrongsignaturewrongsignaturewro') IS NULL;
+----
+true
+
+# --- acl_session_sql: the whole of a door's decision --------------------------------------------------
+
+query I
+SELECT acl_session_sql((SELECT handle FROM live), 'SELECT * FROM orders')
+     = 'ACL SESSION ''' || (SELECT handle FROM live) || ''' SELECT * FROM orders' FROM live;
+----
+true
+
+# an unknown handle is not usable, and neither is one that was closed
+query I
+SELECT acl_session_sql('00000000000000000000000000000000', 'SELECT 1') IS NULL;
+----
+true
+
+statement ok
+CREATE TABLE closed AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS handle;
+
+query I
+SELECT acl_session_sql((SELECT handle FROM closed), 'SELECT 1') IS NOT NULL;
+----
+true
+
+statement ok
+SELECT acl_session_close((SELECT handle FROM closed));
+
+query I
+SELECT acl_session_sql((SELECT handle FROM closed), 'SELECT 1') IS NULL;
+----
+true
+
+# closing again is not an error: a door may retry a disconnect
+statement ok
+SELECT acl_session_close((SELECT handle FROM closed));
+
+# two sessions from one token are two sessions
+query I
+SELECT (SELECT handle FROM live) <> (SELECT handle FROM closed);
+----
+true
+
+# --- expiry is judged on every use, not only at open ---------------------------------------------------
+# a token whose `exp` is in the past, accepted with a wide skew and then judged with none
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=86400;
+
+statement ok
+CREATE TABLE stale AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc4NzM0MzU0Mywic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.zF2pHtZ_Dh8LawCZuqgMhqztPebyHkyPJEZq4Q0S72k') AS handle;
+
+query I
+SELECT acl_session_sql((SELECT handle FROM stale), 'SELECT 1') IS NOT NULL;
+----
+true
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=0;
+
+query I
+SELECT acl_session_sql((SELECT handle FROM stale), 'SELECT 1') IS NULL;
+----
+true
+
+# --- the prefix itself ---------------------------------------------------------------------------------
+# a handle a client invents resolves to nothing, and says which of the two reasons it is
+
+statement error
+ACL SESSION '00000000000000000000000000000000' SELECT * FROM orders;
+----
+<REGEX>:.*session unknown.*
+
+statement error
+ACL SESSION 'deadbeef' SELECT 1;
+----
+<REGEX>:.*session unknown.*
+
+# the form still demands a quoted value, like ROLE and TOKEN do
+statement error
+ACL SESSION SELECT 1;
+----
+<REGEX>:.*requires a quoted value.*
+
+# and a client writing its own session prefix inside a query does not become another principal
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg' ACL SESSION 'whatever' SELECT 1;
+----
+<REGEX>:.*administration scope.*

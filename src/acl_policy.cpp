@@ -2,7 +2,13 @@
 
 #include "acl_token.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/encryption_state.hpp"
+#include "duckdb/common/random_engine.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/blob.hpp"
+#include "duckdb/main/config.hpp"
+
+#include <chrono>
 #include "duckdb/parser/parser.hpp"
 
 namespace duckdb {
@@ -148,6 +154,95 @@ unique_ptr<ParsedExpression> PolicyStore::InstantiateExpr(const string &expr, co
 		}
 		return std::move(expressions[0]);
 	});
+}
+
+namespace {
+
+//! Seconds since the epoch, for judging a session's `exp` the same way the verifier judged it.
+int64_t NowSeconds() {
+	return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+	    .count();
+}
+
+//! A handle a client cannot guess: 128 bits from duckdb's own encryption utility, hex-encoded. Never
+//! derived from the token, so holding one tells nothing about it (spec 040).
+string MintHandle(DatabaseInstance &db) {
+	constexpr idx_t HANDLE_BYTES = 16;
+	data_t bytes[HANDLE_BYTES];
+	auto &util = DBConfig::GetConfig(db).encryption_util;
+	auto state = util ? util->CreateEncryptionState(make_uniq<EncryptionStateMetadata>()) : nullptr;
+	if (state) {
+		state->GenerateRandomData(bytes, HANDLE_BYTES);
+	} else {
+		// no crypto provider in this build: still unguessable in practice, and the handle is only ever
+		// a lookup key - it carries nothing and grants nothing on its own
+		RandomEngine engine;
+		for (idx_t i = 0; i < HANDLE_BYTES; i++) {
+			bytes[i] = static_cast<data_t>(engine.NextRandomInteger(0, 256));
+		}
+	}
+	string handle(HANDLE_BYTES * 2, '\0');
+	for (idx_t i = 0; i < HANDLE_BYTES; i++) {
+		handle[2 * i] = Blob::HEX_TABLE[bytes[i] >> 4];
+		handle[2 * i + 1] = Blob::HEX_TABLE[bytes[i] & 0x0F];
+	}
+	return handle;
+}
+
+} // namespace
+
+string PolicyStore::SessionOpen(DatabaseInstance &db, const string &token) {
+	Principal principal;
+	int64_t expires_at = 0;
+	string issuer;
+	if (LooksLikeJwt(token, issuer)) {
+		// the real path: whatever refuses a token in the prefix refuses it here, and for the same
+		// reason - a session must never be a way to get in with something a prefix would reject
+		IssuerConfig config;
+		if (!LookupIssuer(issuer, config)) {
+			return string();
+		}
+		config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
+		JwtClaims verified;
+		try {
+			verified = VerifyJwt(token, config, JwtClockSkew());
+		} catch (std::exception &) {
+			return string(); // the door refuses; it does not learn why
+		}
+		principal.roles = MapExternalRoles(issuer, verified.raw_roles);
+		if (principal.roles.empty()) {
+			return string();
+		}
+		principal.claims = verified.claims;
+		expires_at = verified.expires_at;
+	} else if (!VerifyPrincipal(true, token, principal)) {
+		return string(); // the dev stub, which carries no expiry
+	}
+	auto handle = MintHandle(db);
+	lock_guard<mutex> guard(lock);
+	sessions[handle] = Session {std::move(principal), expires_at};
+	return handle;
+}
+
+bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string &reason) {
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry == sessions.end()) {
+		reason = "unknown";
+		return false;
+	}
+	if (entry->second.expires_at > 0 && entry->second.expires_at + JwtClockSkew() < NowSeconds()) {
+		sessions.erase(entry); // it can never come back, so do not keep it around
+		reason = "expired";
+		return false;
+	}
+	out = entry->second.principal;
+	return true;
+}
+
+void PolicyStore::SessionClose(const string &handle) {
+	lock_guard<mutex> guard(lock);
+	sessions.erase(handle);
 }
 
 bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal &out) {
