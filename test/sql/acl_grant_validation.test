@@ -1,0 +1,137 @@
+# name: test/sql/acl_grant_validation.test
+# description: a predicate is checked where it is written (spec 021) - a grant whose filter cannot bind
+#   against the object it filters is refused at the source, not left for whoever queries it
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, tenant VARCHAR, amount INT, ssn VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.allow(id INT, key VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 10, 's1'), (2, 'globex', 20, 's2');
+
+statement ok
+INSERT INTO phys.main.allow VALUES (1, 'acme');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
+
+# --- a predicate that cannot bind is refused where it is written ------------------------------------
+
+statement error
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select) RLS (tenat = acl_claim('tenant'));
+----
+<REGEX>:.*does not bind against it.*tenat.*
+
+# the grant that used to turn permissive under a join: a bare correlated name the target does not have
+statement error
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select)
+    RLS (EXISTS (SELECT 1 FROM phys.main.allow a WHERE a.key = label));
+----
+<REGEX>:.*does not bind against it.*label.*
+
+# nothing was written
+query I
+SELECT count(*) FROM aclcat.acl.role_object_caps WHERE vname = 'orders';
+----
+0
+
+# an object's own predicate is checked the same way, at definition
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bad AS phys.main.orders RLS (nope > 0);
+----
+<REGEX>:.*does not bind against it.*nope.*
+
+# --- what must keep working ------------------------------------------------------------------------
+
+# a claim is a marker, not a column: it is nulled for the check, as the schema probe does
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select) RLS (tenant = acl_claim('tenant'));
+
+# a predicate may filter on a column the grant itself hides - the check binds against the object, not
+# against the projection, because that is what the predicate runs against
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select) RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount);
+
+query II
+ACL ROLE "r" SELECT id, amount FROM orders;
+----
+1	10
+
+# a subquery predicate is legitimate and now accepted with a second relation in scope (spec 020's last
+# refusal), because binding it here is what proves its names mean what they say
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.allow AS phys.main.allow;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select, update) RLS (id IN (SELECT id FROM phys.main.allow));
+
+statement ok
+ACL ADMIN GRANT TABLE c.allow TO ROLE r WITH (select);
+
+statement ok
+ACL ROLE "r" UPDATE orders SET amount = 111 FROM allow WHERE orders.id = allow.id;
+
+query II
+SELECT id, amount FROM phys.main.orders ORDER BY id;
+----
+1	111
+2	20
+
+# --- when the object cannot be bound at all, there is nothing to judge the predicate against --------
+# a policy written before its source is attached must not be refused for being uncheckable
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.later AS notyet.main.things;
+
+statement ok
+ACL ADMIN GRANT TABLE c.later TO ROLE r WITH (select) RLS (whatever = 1);
+
+query I
+SELECT count(*) FROM aclcat.acl.role_object_caps WHERE vname = 'later';
+----
+1
+
+# --- a view's predicate is checked against the view's own SQL --------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.stats AS SELECT tenant, count(*) AS n FROM phys.main.orders GROUP BY tenant;
+
+statement error
+ACL ADMIN GRANT TABLE c.stats TO ROLE r WITH (select) RLS (amount > 0);
+----
+<REGEX>:.*does not bind against it.*amount.*
+
+statement ok
+ACL ADMIN GRANT TABLE c.stats TO ROLE r WITH (select) RLS (n > 0);
+
+query II
+ACL ROLE "r" SELECT tenant, n FROM stats ORDER BY tenant;
+----
+acme	1
+globex	1
