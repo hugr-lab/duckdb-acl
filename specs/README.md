@@ -76,3 +76,4 @@ specs are the shareable distillation of that work.
 | [031](031-show-surface/spec.md) | every `SHOW` answers its own question | implemented |
 | [032](032-function-capabilities/spec.md) | what a capability means for a function | implemented |
 | [033](033-policy-catalog-on-sql-server/spec.md) | the policy catalog on SQL Server | implemented |
+| [034](034-schema-as-a-file/spec.md) | the policy schema is a file | implemented |
