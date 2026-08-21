@@ -61,3 +61,13 @@ specs are the shareable distillation of that work.
 | [016](016-ddl-through-acl/spec.md) | DDL through the ACL — `create`, `drop`, and where the object lands | implemented |
 | [017](017-enable-override-on-load/spec.md) | the extension enables its own parser override | implemented |
 | [018](018-create-view-through-acl/spec.md) | a role may create a view — `CREATE VIEW` through the ACL | implemented |
+| [019](019-dml-target-qualification/spec.md) | a write may qualify its columns by the name the principal used | implemented |
+| [020](020-multi-relation-writes/spec.md) | writing with a second relation in scope | implemented |
+| [021](021-grant-predicate-validation/spec.md) | a predicate is checked where it is written | implemented |
+| [022](022-object-references/spec.md) | references — declared join paths between objects | implemented |
+| [023](023-jwks-from-a-document/spec.md) | an issuer's keys read from a document | implemented |
+| [024](024-write-check/spec.md) | the grant's predicate confines what is written | implemented |
+| [025](025-show-and-describe/spec.md) | `DESCRIBE`, `SUMMARIZE` and `SHOW TABLES` under a principal | implemented |
+| [026](026-grant-projection-columns/spec.md) | a grant's projection is probed where it is written | implemented |
+| [027](027-validation-completeness/spec.md) | a skipped write-time check is remembered, and taken again | implemented |
+| [028](028-dml-in-a-cte/spec.md) | a DML statement inside a `WITH` | implemented |

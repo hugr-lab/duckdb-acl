@@ -1,0 +1,336 @@
+# name: test/sql/acl_dml_in_cte.test
+# description: DuckDB lets a CTE be a DML statement, and a CTE be the source of one. Every policy that
+#   applies to a top-level write applies inside a WITH the same way - the walk reaches it either way.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, tenant VARCHAR, amount INT, ssn VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.feed(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+CREATE TABLE phys.main.secrets(id INT, v VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 10, 's1'), (2, 'globex', 20, 's2');
+
+statement ok
+INSERT INTO phys.main.feed VALUES (1, 'acme', 100), (2, 'acme', 200);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.feed AS phys.main.feed;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.secrets AS phys.main.secrets;
+
+statement ok
+ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select, insert, update, delete, merge)
+    RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN GRANT TABLE c.feed TO ROLE r WITH (select);
+
+# --- a DML statement as the CTE body ------------------------------------------------------------------
+# the grant's predicate confines what it writes (spec 024), exactly as at the top level
+
+statement error
+ACL ROLE "r" WITH ins AS (INSERT INTO orders (id, tenant, amount) VALUES (3, 'globex', 30) RETURNING id)
+    SELECT * FROM ins;
+----
+<REGEX>:.*does not satisfy the grant on "orders".*
+
+query I
+ACL ROLE "r" WITH ins AS (INSERT INTO orders (id, tenant, amount) VALUES (4, 'acme', 40) RETURNING id)
+    SELECT * FROM ins;
+----
+4
+
+query II
+SELECT id, tenant FROM phys.main.orders ORDER BY id;
+----
+1	acme
+2	globex
+4	acme
+
+# an UPDATE with no WHERE of its own still only reaches the principal's slice
+query II
+ACL ROLE "r" WITH u AS (UPDATE orders SET amount = 999 RETURNING id, amount) SELECT * FROM u ORDER BY id;
+----
+1	999
+4	999
+
+query II
+SELECT id, amount FROM phys.main.orders ORDER BY id;
+----
+1	999
+2	20
+4	999
+
+# and so does a DELETE
+query I
+ACL ROLE "r" WITH d AS (DELETE FROM orders RETURNING id) SELECT count(*) FROM d;
+----
+2
+
+query II
+SELECT id, tenant FROM phys.main.orders ORDER BY id;
+----
+2	globex
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 10, 's1');
+
+# --- the capability gate reaches into a CTE too --------------------------------------------------------
+
+statement error
+ACL ROLE "r" WITH ins AS (INSERT INTO feed VALUES (9, 'acme', 900) RETURNING id) SELECT * FROM ins;
+----
+<REGEX>:.*insert on "feed" is not allowed.*
+
+statement error
+ACL ROLE "r" WITH ins AS (INSERT INTO secrets VALUES (1, 'x') RETURNING id) SELECT * FROM ins;
+----
+<REGEX>:.*(no access to object|insert on).*
+
+# the physical name is not a name the principal has, in a CTE or anywhere else
+statement error
+ACL ROLE "r" WITH ins AS (INSERT INTO phys.main.orders VALUES (9, 'acme', 90, 's9') RETURNING id)
+    SELECT * FROM ins;
+----
+<REGEX>:.*no access to object "phys.main.orders".*
+
+# --- RETURNING inside a CTE is a read, and reads what the grant projects ---------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE masked CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE masked CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE masked WITH (select, insert) COLUMNS (id, tenant, amount);
+
+statement error
+ACL ROLE "masked" WITH ins AS (INSERT INTO orders (id, tenant, amount) VALUES (7, 'acme', 70) RETURNING ssn)
+    SELECT * FROM ins;
+----
+<REGEX>:.*column "ssn" of "orders" is not readable.*
+
+query II
+ACL ROLE "masked" WITH ins AS (INSERT INTO orders (id, tenant, amount) VALUES (7, 'acme', 70)
+    RETURNING id, amount) SELECT * FROM ins;
+----
+7	70
+
+# --- a CTE as the source of a write ----------------------------------------------------------------------
+# the CTE body is rewritten like any other read, so what it carries is already the principal's slice
+
+query III
+ACL ROLE "r" WITH src AS (SELECT id, tenant, amount FROM feed) SELECT * FROM src ORDER BY id;
+----
+1	acme	100
+2	acme	200
+
+statement ok
+ACL ROLE "r" WITH src AS (SELECT id + 20 AS id, tenant, amount FROM feed)
+    INSERT INTO orders (id, tenant, amount) SELECT id, tenant, amount FROM src;
+
+query II
+SELECT id, tenant FROM phys.main.orders ORDER BY id;
+----
+1	acme
+2	globex
+7	acme
+21	acme
+22	acme
+
+# --- a CTE as the second relation of a multi-relation write ------------------------------------------------
+# the target's predicate is bound to its alias first (spec 020), so a same-named column on the CTE
+# cannot capture it
+
+statement ok
+ACL ROLE "r" WITH s AS (SELECT 1 AS id, 55 AS amount)
+    UPDATE orders SET amount = s.amount FROM s WHERE orders.id = s.id;
+
+query II
+SELECT id, amount FROM phys.main.orders WHERE id IN (1, 2) ORDER BY id;
+----
+1	55
+2	20
+
+# a CTE that carries a `tenant` of its own does not become the predicate's `tenant`
+statement ok
+ACL ROLE "r" WITH s AS (SELECT 2 AS id, 'globex' AS tenant, 66 AS amount)
+    UPDATE orders SET amount = s.amount FROM s WHERE orders.id = s.id;
+
+query II
+SELECT id, amount FROM phys.main.orders WHERE id = 2;
+----
+2	20
+
+statement ok
+ACL ROLE "r" WITH s AS (SELECT 21 AS id, 'globex' AS tenant, 77 AS amount)
+    MERGE INTO orders USING s ON orders.id = s.id WHEN MATCHED THEN UPDATE SET amount = s.amount;
+
+query II
+SELECT id, amount FROM phys.main.orders WHERE id = 21;
+----
+21	77
+
+# --- a CTE name is a CTE, never a catalog object ----------------------------------------------------------
+# spec 001's scope stack, with a DML in the picture: the read resolves to the CTE, the write target
+# resolves to the catalog
+
+query II
+ACL ROLE "r" WITH orders AS (SELECT 99 AS id, 'anything' AS tenant) SELECT * FROM orders;
+----
+99	anything
+
+statement ok
+ACL ROLE "r" WITH other AS (SELECT 31 AS id, 'acme' AS tenant, 31 AS amount)
+    INSERT INTO orders (id, tenant, amount) SELECT id, tenant, amount FROM other;
+
+query I
+SELECT count(*) FROM phys.main.orders WHERE id = 31;
+----
+1
+
+# --- a role that may not read cannot read through a CTE either --------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE empty;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE empty CAPS '{}' MAIN;
+
+statement error
+ACL ROLE "empty" WITH s AS (SELECT * FROM orders) SELECT * FROM s;
+----
+<REGEX>:.*select on "orders" is not allowed.*
+
+statement error
+ACL ROLE "empty" WITH d AS (DELETE FROM orders RETURNING id) SELECT * FROM d;
+----
+<REGEX>:.*delete on "orders" is not allowed.*
+
+# --- a DML CTE targeting something read-only is refused as anywhere else ----------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.ov AS 'SELECT id, amount FROM phys.main.orders';
+
+statement ok
+ACL ADMIN GRANT VIEW c.ov TO ROLE r WITH (select, delete);
+
+statement error
+ACL ROLE "r" WITH d AS (DELETE FROM ov RETURNING id) SELECT * FROM d;
+----
+<REGEX>:.*read-only relation "ov".*
+
+# --- an unreferenced DML CTE still runs, so it still has to be confined -------------------------------------
+# a data-modifying CTE executes whether or not anything selects from it: skipping the walk for one
+# nothing reads would be a write nobody checked
+
+statement ok
+CREATE TABLE phys.main.wipe(id INT, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys.main.wipe VALUES (1, 'acme'), (2, 'globex');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.wipe AS phys.main.wipe;
+
+statement ok
+ACL ADMIN GRANT TABLE c.wipe TO ROLE r WITH (select, delete) RLS (tenant = acl_claim('tenant'));
+
+query I
+ACL ROLE "r" WITH d AS (DELETE FROM wipe RETURNING id) SELECT 1 AS x;
+----
+1
+
+query II
+SELECT id, tenant FROM phys.main.wipe ORDER BY id;
+----
+2	globex
+
+# --- a CTE may shadow the *name* of the write target without becoming the target ---------------------------
+# the read inside resolves to the CTE, the write target resolves to the catalog - and everything the
+# grant says about the write still applies
+
+statement ok
+CREATE TABLE phys.main.shadow(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.shadow AS phys.main.shadow;
+
+statement ok
+ACL ADMIN GRANT TABLE c.shadow TO ROLE r WITH (select, insert, delete) RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ROLE "r" WITH shadow AS (SELECT 5 AS id, 'acme' AS tenant, 50 AS amount)
+    INSERT INTO shadow (id, tenant, amount) SELECT id, tenant, amount FROM shadow;
+
+query III
+SELECT id, tenant, amount FROM phys.main.shadow;
+----
+5	acme	50
+
+# the predicate is not fooled by the shadowing either
+statement error
+ACL ROLE "r" WITH shadow AS (SELECT 6 AS id, 'globex' AS tenant, 60 AS amount)
+    INSERT INTO shadow (id, tenant, amount) SELECT id, tenant, amount FROM shadow;
+----
+<REGEX>:.*does not satisfy the grant on "shadow".*
+
+# a shadowed DELETE target is the table, and still only the principal's rows
+statement ok
+INSERT INTO phys.main.shadow VALUES (7, 'globex', 70);
+
+statement ok
+ACL ROLE "r" WITH shadow AS (SELECT 99 AS id) DELETE FROM shadow;
+
+query II
+SELECT id, tenant FROM phys.main.shadow ORDER BY id;
+----
+7	globex
+
+# --- what DuckDB itself does not allow, pinned so we notice if it ever does --------------------------------
+# both would be new positions for the walk to reach: a data-modifying CTE below the top level, and a
+# MERGE as a CTE body
+
+statement error
+ACL ROLE "r" SELECT (WITH d AS (DELETE FROM orders RETURNING id) SELECT count(*) FROM d) AS n;
+----
+<REGEX>:.*data-modifying statement must be at the top level.*
+
+statement error
+ACL ROLE "r" WITH m AS (MERGE INTO orders USING (SELECT 1 AS id, 88 AS amount) s ON orders.id = s.id
+    WHEN MATCHED THEN UPDATE SET amount = s.amount RETURNING orders.id) SELECT * FROM m;
+----
+<REGEX>:.*CTE body must be a SELECT.*
