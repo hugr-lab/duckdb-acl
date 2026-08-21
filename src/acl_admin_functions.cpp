@@ -908,6 +908,56 @@ void AclMapRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! The statement a live session runs, with its prefix in front - or empty when the session is not
+//! usable. The one place the prefix is composed, so every door spells it the same way.
+string PrefixedForSession(PolicyStore &store, const string &handle, const string &sql) {
+	Principal principal;
+	string reason;
+	if (!store.SessionPrincipal(handle, principal, reason)) {
+		return string();
+	}
+	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
+}
+
+//! acl_quack_authenticate(session_id, client_token, server_token): quack's authentication callback
+//! (spec 041). The client's token is a JWT we verify for ourselves, so quack's own shared token is
+//! not what admits anyone - it stays the operator's outer fence, and this decides the principal.
+//! Binding is by quack's `session_id`, which is the `connection_id` every later message carries.
+void AclQuackAuthenticateFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto session_id = RequiredArg(args, 0, row, "acl_quack_authenticate", "session id");
+		auto token = RequiredArg(args, 1, row, "acl_quack_authenticate", "client token");
+		auto &store = StoreOf(state);
+		auto handle = store.SessionOpen(token);
+		if (handle.empty()) {
+			result.SetValue(row, Value::BOOLEAN(false));
+			continue;
+		}
+		store.SessionBind(session_id, handle);
+		result.SetValue(row, Value::BOOLEAN(true));
+	}
+}
+
+//! acl_quack_authorize(connection_id, query): quack's authorization callback (spec 041). A VARCHAR
+//! return replaces the SQL quack executes, so returning the prefixed statement is the whole of
+//! serving under the ACL; NULL is a refusal, which is what an unknown or expired session gets.
+void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto connection_id = RequiredArg(args, 0, row, "acl_quack_authorize", "connection id");
+		auto sql = RequiredArg(args, 1, row, "acl_quack_authorize", "query");
+		auto &store = StoreOf(state);
+		string handle;
+		if (!store.SessionHandleFor(connection_id, handle)) {
+			result.SetValue(row, Value());
+			continue;
+		}
+		auto prefixed = PrefixedForSession(store, handle, sql);
+		result.SetValue(row, prefixed.empty() ? Value() : Value(prefixed));
+	}
+}
+
 //! acl_session_open(token): verify a token once and mint an opaque handle for it (spec 040). NULL
 //! when it does not verify - a door refuses rather than learning why.
 void AclSessionOpenFunc(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -1100,6 +1150,9 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		function.SetFallible();
 		loader.RegisterFunction(function);
 	};
+	// the quack door (spec 041): the two callbacks quack calls, both thin over the contract above
+	register_admin("acl_quack_authenticate", {v, v, v}, AclQuackAuthenticateFunc);
+	register_session_text("acl_quack_authorize", {v, v}, AclQuackAuthorizeFunc);
 	register_session_text("acl_session_open", {v}, AclSessionOpenFunc);
 	register_session_text("acl_session_sql", {v, v}, AclSessionSqlFunc);
 	register_admin("acl_session_close", {v}, AclSessionCloseFunc);
