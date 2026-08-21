@@ -872,20 +872,82 @@ struct CatalogBackend {
 		// declares none - every physical column under its own name. The grant's list is a subset of the
 		// object's (checked below), so it replaces what the object allowed rather than adding to it.
 		out.write_columns.clear();
-		for (auto &column : grants.columns) {
-			string source = column.first;        // what to read the value from, in physical terms
-			bool known = object_columns.empty(); // no projection: the object exposes whatever it has
+		// spec 038: where the object states its own columns, the grant is folded into them - in the
+		// object's order, so a column's position belongs to the object rather than to whoever asks. A
+		// listed name the object does not have is a *bare name* that grants nothing (it intersects
+		// away) or a *mask* that cannot be applied (it refuses): protection that is silently skipped
+		// is the one failure mode worth refusing over.
+		auto listed = grants.columns;
+		if (!object_columns.empty()) {
+			for (auto &column : listed) {
+				bool known = false;
+				for (auto &defined : object_columns) {
+					if (StringUtil::CIEquals(defined.first, column.first)) {
+						known = true;
+						break;
+					}
+				}
+				if (!known && !column.second.empty()) {
+					throw BinderException("acl: the grant on \"%s\" masks column \"%s\", which the object does not "
+					                      "have - a mask that cannot be applied would leave it unprotected",
+					                      vname, column.first);
+				}
+			}
+			vector<std::pair<string, string>> ordered;
+			for (auto &defined : object_columns) {
+				for (auto &column : listed) {
+					if (StringUtil::CIEquals(defined.first, column.first)) {
+						ordered.push_back(column);
+						break;
+					}
+				}
+			}
+			listed = std::move(ordered);
+		}
+		if (object_columns.empty()) {
+			// spec 038: the object's own columns are not known here and we do not probe for them - the
+			// engine answers while it binds the statement we generate. A mask goes into an inner
+			// REPLACE, which errors when the column is not there (a mask that cannot be applied must
+			// never be silently skipped); the listed names go into an outer COLUMNS(lambda ...), which
+			// keeps what matches and ignores what does not. Both keep the source's own order, which is
+			// the object's. The predicate stays inside, so RLS reads physical values, not masked ones.
+			vector<string> replaces;
+			vector<string> names;
+			for (auto &column : listed) {
+				names.push_back(Lit(StringUtil::Lower(column.first)));
+				if (!column.second.empty()) {
+					replaces.push_back(column.second + " AS " + Ident(column.first));
+				}
+			}
+			string inner = "SELECT *";
+			if (!replaces.empty()) {
+				inner += " REPLACE (" + StringUtil::Join(replaces, ", ") + ")";
+			}
+			inner += " FROM " + out.phys;
+			if (!out.rls.empty()) {
+				inner += " WHERE " + out.rls;
+			}
+			out.query = "SELECT COLUMNS(lambda __acl_col: lower(__acl_col) IN (" + StringUtil::Join(names, ", ") +
+			            ")) FROM (" + inner + ")";
+			for (auto &column : listed) {
+				if (!out.writable) {
+					continue;
+				}
+				out.write_columns.insert(column.first);
+				if (!column.second.empty()) {
+					out.injections.emplace_back(column.first, column.second);
+				}
+			}
+			out.subquery_form = true;
+			return;
+		}
+		for (auto &column : listed) {
+			string source = column.first; // what to read the value from, in physical terms
 			for (auto &defined : object_columns) {
 				if (StringUtil::CIEquals(defined.first, column.first)) {
 					source = defined.second.empty() ? defined.first : defined.second;
-					known = true;
 					break;
 				}
-			}
-			if (!known) {
-				// the object does not expose it, and a grant may never re-expose what it hid
-				throw BinderException("acl: grant on \"%s\" lists column \"%s\", which the object does not expose",
-				                      vname, column.first);
 			}
 			for (auto &rename : out.renames) {
 				if (StringUtil::CIEquals(rename.first, column.first)) {
@@ -1062,10 +1124,28 @@ struct CatalogBackend {
 		if (!restricts) {
 			return;
 		}
+		// spec 038: a function's returns cannot be known without calling it, so the grant is not folded
+		// in here but expressed as SQL the engine resolves while binding - the same shape a plain alias
+		// gets. A bare name the function does not return intersects away; a mask it cannot apply
+		// refuses. Naming and shaping a function's output stays with its declaration in the catalog.
+		vector<string> replaces;
+		vector<string> names;
 		for (auto &column : grants.columns) {
-			out.projection.push_back(column.second.empty() ? Ident(column.first)
-			                                               : column.second + " AS " + Ident(column.first));
+			names.push_back(Lit(StringUtil::Lower(column.first)));
+			if (!column.second.empty()) {
+				replaces.push_back(column.second + " AS " + Ident(column.first));
+			}
 		}
+		string inner = "SELECT *";
+		if (!replaces.empty()) {
+			inner += " REPLACE (" + StringUtil::Join(replaces, ", ") + ")";
+		}
+		inner += " FROM \"__acl_inner\"";
+		if (!out.rls.empty()) {
+			inner += " WHERE " + out.rls;
+		}
+		out.wrap_sql = "SELECT COLUMNS(lambda __acl_col: lower(__acl_col) IN (" + StringUtil::Join(names, ", ") +
+		               ")) FROM (" + inner + ")";
 	}
 
 	//! Where a `CREATE`/`DROP` of `vname` lands for this principal (spec 016). One query: the longest
@@ -1889,14 +1969,16 @@ struct CatalogBackend {
 		}
 		vector<string> items;
 		for (auto &column : ParseColumnList(column_csv)) {
+			// the alias is an identifier and the bare source is one too - quoted, or a column whose name
+			// is not a bare word could never be granted at all, since the probe would not parse
 			if (!column.second.empty()) {
-				items.push_back(column.second + " AS " + column.first); // the grant computes it
+				items.push_back(column.second + " AS " + Ident(column.first)); // the grant masks it
 				continue;
 			}
 			auto object = own.find(column.first);
 			// a bare name is the object's column, which its own projection may have renamed
-			items.push_back((object != own.end() && !object->second.empty() ? object->second : column.first) + " AS " +
-			                column.first);
+			items.push_back((object != own.end() && !object->second.empty() ? object->second : Ident(column.first)) +
+			                " AS " + Ident(column.first));
 		}
 		if (items.empty()) {
 			return string();

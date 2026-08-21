@@ -107,6 +107,29 @@ ACL ROLE "r" SELECT column_name, data_type FROM information_schema.columns
 marker	VARCHAR
 order_id	INTEGER
 
+# --- a column whose name is not a bare word ------------------------------------------------------------
+# the probe builds `<source> AS <alias>`; unquoted, a name like `od''d` made the probe itself
+# unparseable, so such a column could never be granted at all
+
+statement ok
+CREATE TABLE phys.main.odd(id INT, "od''d" VARCHAR);
+
+statement ok
+INSERT INTO phys.main.odd VALUES (1, 'x');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.odd AS phys.main.odd;
+
+# through the function form, where the name arrives as itself; the SQL grammar keeps an identifier's
+# quotes in the list it stores, so the same grant written with COLUMNS (...) does not match
+statement ok
+SELECT acl_grant_object('r', 'c', 'odd', '{"select": true}', '', 'id, od''''d');
+
+query II
+ACL ROLE "r" SELECT * FROM odd;
+----
+1	x
+
 # --- a projection that cannot bind is refused where it is written ------------------------------------------
 # the same rule spec 021 applies to a predicate: a grant that could never work is a mistake, not
 # something to discover when someone reads

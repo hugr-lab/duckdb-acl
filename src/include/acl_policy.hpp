@@ -43,7 +43,13 @@ struct TablePolicy {
 	//! read - the binder decides - but a write with a second relation in scope must not inject a
 	//! subquery whose free names could resolve against the source instead of the target (spec 020).
 	bool rls_unchecked = false;
-	string query;                // full SELECT template for a view (SUBQUERY; replaces phys/projection/rls)
+	string query; // full SELECT template for a view (SUBQUERY; replaces phys/projection/rls)
+	//! How a grant narrows a *table function's* result (spec 038). The function's returns cannot be
+	//! known without calling it, so the narrowing is expressed as SQL the engine resolves while it
+	//! binds: masks in an inner `REPLACE` (which errors when the column is not there) and the listed
+	//! names in an outer `COLUMNS(lambda …)` (which keeps what matches and ignores what does not).
+	//! Wraps the call, which appears in it as the placeholder `"__acl_inner"`. Empty = no projection.
+	string wrap_sql;
 	case_insensitive_set_t caps; // {"select","insert","update","delete","merge"}
 	//! Column renames of a writable (alias-form) relation: virtual name -> physical name. Renaming is
 	//! not a restriction, so it does not force the read-only subquery form: reads go through
