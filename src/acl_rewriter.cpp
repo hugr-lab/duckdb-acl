@@ -788,11 +788,11 @@ private:
 		// asking which databases it had got back a list of tables (spec 031).
 		auto asked = ShowTarget(show);
 		if (asked == "variables") {
-			// a principal has no session variables: `getvariable` is denied and nothing sets one for it.
-			// An empty answer in the right shape beats an error for a client that asks on connect.
-			ref = SubqueryOf("SELECT NULL::VARCHAR AS name, NULL::VARCHAR AS value, NULL::VARCHAR AS type"
-			                 " WHERE false");
-			return;
+			// Session variables are not the principal's: only `ACL NATIVE` sets one, and `getvariable`
+			// is denied for the same reason. Answering empty would claim the principal has none, when
+			// the truth is that the ones which exist are none of its business (spec 031).
+			Deny("SHOW VARIABLES is not available under ACL: session variables are not part of a "
+			     "principal's catalog");
 		}
 		if (asked == "databases" || asked == "schemas" || asked == "__show_tables_expanded" ||
 		    (asked == "tables" && show.show_type != ShowType::SHOW_FROM)) {

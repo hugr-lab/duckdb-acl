@@ -53,9 +53,10 @@ The three new shapes are listing surfaces rather than SQL assembled in the rewri
 main-catalog test needs the `grants` CTE, which only `MetadataListingSql` has. The
 `information_schema` surfaces are untouched.
 
-**`SHOW VARIABLES` answers with nothing, in the right shape.** A principal has no session variables:
-`getvariable` is denied and nothing sets one for it. An empty result beats an error for a client that
-asks on connect.
+**`SHOW VARIABLES` is refused.** Only `ACL NATIVE` sets a session variable, and `getvariable` is
+denied for exactly that reason — they are instance state, not the principal's. Answering empty (the
+first shape of this) would claim the principal *has* no variables, when the truth is that the ones
+which exist are none of its business. The two are different claims, and only the second is true.
 
 **`PRAGMA table_info` goes through `DESCRIBE`, not through the listing.** The rewrite builds
 `SELECT … FROM (DESCRIBE (SELECT * FROM <name>))` and rewrites *that*, so the answer comes down the
@@ -83,11 +84,10 @@ only `table_info` and `show_tables` name the catalog.
 
 ## Testing
 
-`test/sql/acl_show_surface.test` (90 assertions): `SHOW DATABASES` listing the granted catalogs and no
+`test/sql/acl_show_surface.test` (91 assertions): `SHOW DATABASES` listing the granted catalogs and no
 physical one; `SHOW SCHEMAS` in its three-column shape with `current` true only for the MAIN catalog's
 `main`; `SHOW ALL TABLES` in its six-column shape, carrying only the columns the role reads and none
-of the objects it cannot see; `SHOW TABLES` and `SHOW TABLES FROM` unchanged; `SHOW VARIABLES` empty
-in the right shape; `PRAGMA table_info` in DuckDB's shape for a bare and a schema-qualified name,
+of the objects it cannot see; `SHOW TABLES` and `SHOW TABLES FROM` unchanged; `SHOW VARIABLES` refused; `PRAGMA table_info` in DuckDB's shape for a bare and a schema-qualified name,
 refused for a hidden name and for a physical one; `PRAGMA show_tables`; other PRAGMAs refused by name;
 a role that may see nothing seeing nothing through any of them; and an enclosing `EXPLAIN` still
 explaining — the plan shape, not the data — while `EXPLAIN` of a denied PRAGMA is still denied.
@@ -97,8 +97,11 @@ explaining — the plan shape, not the data — while `EXPLAIN` of a denied PRAG
 - **Keep answering everything with the table listing.** It is what a `SHOW` form got before, and it is
   wrong in a way a client cannot detect.
 - **Refuse the forms we do not answer.** For `SHOW DATABASES`/`SHOW SCHEMAS` the ACL genuinely knows
-  the answer, so refusing would hide something the principal is entitled to. Only `SHOW VARIABLES` has
-  nothing to say, and there an empty result says it.
+  the answer, so refusing would hide something the principal is entitled to — which is why only
+  `SHOW VARIABLES` is refused.
+- **Answer `SHOW VARIABLES` with an empty set.** Friendlier to a connect-time probe, and it makes a
+  claim that is not true: it says the principal has no variables rather than that variables are not
+  its concern. It would also be one edit away from becoming a real leak.
 - **Answer `PRAGMA table_info` from the `columns` listing.** Simpler SQL, but a name the principal
   cannot see comes back as an empty result instead of a refusal, which reads as "no columns".
 
