@@ -67,6 +67,14 @@ refusing `MERGE` and still applying its predicate to a qualified single-relation
 - **Refuse a qualified reference with a clear message.** Honest, but it makes `MERGE` permanently
   unavailable, which is not a trade worth making for a two-line fix.
 
+## Known limitation
+
+A **schema-qualified** column reference — `vs.tbl.id` — does not resolve, because the virtual name is
+carried by an alias and an alias is a single identifier. This is not new and not specific to writes:
+reads behave identically (`SELECT vs.tbl.id FROM vs.tbl` fails the same way), since the read path uses
+the same alias. Single-component qualification, which is what clients actually emit, works everywhere.
+Worth stating so nobody rediscovers it as a bug.
+
 ## Follow-ups
 
 - `UPDATE … FROM`, `DELETE … USING` and `MERGE` on a *narrowed* target remain refused (design/007 §1).
