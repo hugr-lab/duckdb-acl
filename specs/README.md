@@ -75,3 +75,4 @@ specs are the shareable distillation of that work.
 | [030](030-drop-cascade/spec.md) | what goes with a dropped object | implemented |
 | [031](031-show-surface/spec.md) | every `SHOW` answers its own question | implemented |
 | [032](032-function-capabilities/spec.md) | what a capability means for a function | implemented |
+| [033](033-policy-catalog-on-sql-server/spec.md) | the policy catalog on SQL Server | implemented |

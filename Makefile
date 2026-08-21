@@ -100,7 +100,9 @@ ACL_MSSQL_USER ?= sa
 ACL_MSSQL_PASS ?= TestPassword1
 ACL_MSSQL_DB ?= acltest
 
-DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
+# -p matches the `name:` in the compose file: belt and braces, so no invocation can pick up the
+# directory-derived project name and adopt an unrelated project's containers (spec 033)
+DOCKER_COMPOSE := docker compose -p duckdb-acl -f docker/docker-compose.yml
 
 .PHONY: docker-up docker-down docker-status test-integration
 # --wait would treat the one-shot sqlserver-init container as a failure; wait on the servers, then

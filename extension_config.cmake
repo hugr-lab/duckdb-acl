@@ -20,14 +20,13 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
 endif()
 
 # SQL Server scanner (hugr-lab/mssql-extension) for the integration scenarios. A separate opt-in;
-# its openssl/simdutf dependencies arrive through the merged vcpkg manifest. PENDING: the pinned
-# commit does not yet compile against our duckdb-main pin (API drift; a compat build is in progress
-# in the mssql-extension repo) - re-pin GIT_TAG when it lands. The acl_sqlserver.test scenario
-# skips itself until then.
+# its openssl/simdutf dependencies arrive through the merged vcpkg manifest. The pin is a commit on
+# that repo's main, which now tracks duckdb main as we do (spec 033) - re-pin when it moves and the
+# scenarios need something newer.
 if(DEFINED ENV{ACL_INTEGRATION_MSSQL} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(mssql
         DONT_LINK
         GIT_URL https://github.com/hugr-lab/mssql-extension
-        GIT_TAG e2b8c01a5ed053a15ae8bea4eef314114c04efea
+        GIT_TAG 1d74ae2c0e6c3fc963d3915784a36a7d06f0b6d1
     )
 endif()
