@@ -794,15 +794,21 @@ struct CatalogBackend {
 				auto &fields = StructValue::GetChildren(item);
 				auto name = fields[0].ToString();
 				auto expr = fields[1].IsNull() ? string() : fields[1].ToString();
-				if (form == "alias") {
-					// an alias-form column list is a rename list (virtual -> physical): it keeps the
-					// relation writable, so reads rename by name and writes map the names back
-					if (!expr.empty()) {
-						out.renames.emplace_back(name, expr);
-					}
-					continue;
+				if (form == "alias" && !expr.empty()) {
+					// the list maps virtual -> physical, and a write maps the name back (spec 010)
+					out.renames.emplace_back(name, expr);
 				}
 				object_columns.emplace_back(name, expr);
+			}
+		}
+		// spec 029: a column list is a projection at every level, whatever it is made of. An alias-form
+		// list still maps names back on writes and still leaves the relation writable - what it no
+		// longer does is pass the columns it did not list straight through, which is what a list made
+		// only of renames used to do while every metadata surface said otherwise.
+		if (form == "alias" && !object_columns.empty()) {
+			out.subquery_form = true;
+			for (auto &column : object_columns) {
+				out.write_columns.insert(column.second.empty() ? column.first : column.second);
 			}
 		}
 		// remaining rows of the winning interpretation differ only by role: union their caps, and the
@@ -858,11 +864,13 @@ struct CatalogBackend {
 			out.subquery_form = out.subquery_form || !out.rls.empty();
 			return;
 		}
-		// the visible columns of the relation as the object defines it: its own projection, or (for an
-		// alias-form table) every physical column under its virtual name
+		// the visible columns of the relation as the object defines it: its own projection, or - when it
+		// declares none - every physical column under its own name. The grant's list is a subset of the
+		// object's (checked below), so it replaces what the object allowed rather than adding to it.
+		out.write_columns.clear();
 		for (auto &column : grants.columns) {
-			string source = column.first; // what to read the value from, in physical terms
-			bool known = object_columns.empty();
+			string source = column.first;        // what to read the value from, in physical terms
+			bool known = object_columns.empty(); // no projection: the object exposes whatever it has
 			for (auto &defined : object_columns) {
 				if (StringUtil::CIEquals(defined.first, column.first)) {
 					source = defined.second.empty() ? defined.first : defined.second;
@@ -2200,7 +2208,7 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 		schema = CatalogBackend::ParseDeclaration(returns); // declared: never probed
 	} else if (form == "view") {
 		derived = catalog.ProbeSchema(view_sql, false, {}, schema);
-	} else if (form == "subquery" && !phys.empty() && !columns.empty()) {
+	} else if ((form == "subquery" || form == "alias") && !phys.empty() && !columns.empty()) {
 		// A projection is what the role sees, and a computed or masked column (`total = amount * 2`,
 		// `ssn = NULL`) has no physical column to read a type from - so bind the projection once, here
 		// on the write path, exactly as a view's SQL is bound (spec 010). Without this the column is
