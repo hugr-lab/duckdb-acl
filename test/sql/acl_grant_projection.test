@@ -1,6 +1,7 @@
 # name: test/sql/acl_grant_projection.test
 # description: a grant's own projection is probed where it is written (spec 026), so the metadata
-#   describes what the role reads - a mask's type and a computed column the object never had
+#   describes what the role reads - the type a mask gives a column, over an expression that may
+#   read what the role cannot (spec 037 leaves naming and computing to the catalog)
 # group: [sql]
 
 require acl
@@ -35,39 +36,40 @@ ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
 
-# a projection stated on the grant: one column as-is, one masked into another type, one computed out
-# of a column the role never sees
+# a projection stated on the grant: one column as-is, one masked into another type, one masked by an
+# expression over a column the role never sees
 statement ok
 ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select)
-    COLUMNS (id, ssn = NULL, label = coalesce(tenant, 'none'));
+    COLUMNS (id, ssn = NULL, amount = coalesce(tenant, 'none'));
 
 # --- the two metadata surfaces agree, and both describe what the role reads -------------------------
 
 query II
 ACL ROLE "r" SELECT column_name, column_type FROM (DESCRIBE t) ORDER BY column_name;
 ----
+amount	VARCHAR
 id	INTEGER
-label	VARCHAR
 ssn	"NULL"
 
 query II
 ACL ROLE "r" SELECT column_name, data_type FROM information_schema.columns
     WHERE table_name = 't' ORDER BY column_name;
 ----
+amount	VARCHAR
 id	INTEGER
-label	VARCHAR
 ssn	"NULL"
 
-# and that is what a SELECT * gives back
+# and that is what a SELECT * gives back - in the object's order, not the order the grant was
+# written in (spec 037)
 query III
 ACL ROLE "r" SELECT * FROM t;
 ----
-1	NULL	acme
+1	acme	NULL
 
 # the column the grant does not project is in neither surface
 query I
 ACL ROLE "r" SELECT count(*) FROM information_schema.columns
-    WHERE table_name = 't' AND column_name IN ('tenant', 'amount');
+    WHERE table_name = 't' AND column_name = 'tenant';
 ----
 0
 
@@ -77,8 +79,8 @@ query III
 SELECT vname, name, type FROM acl_grant_columns() ORDER BY pos;
 ----
 t	id	INTEGER
+t	amount	VARCHAR
 t	ssn	"NULL"
-t	label	VARCHAR
 
 # --- the two levels fold the way the resolver folds them -------------------------------------------------
 # a bare name in a grant is the object's column, which the object's own projection may have renamed;
@@ -110,9 +112,15 @@ order_id	INTEGER
 # something to discover when someone reads
 
 statement error
-ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, bad = nosuchcolumn);
+ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, ssn = nosuchcolumn);
 ----
 <REGEX>:.*projection of the grant on "t" does not bind against it.*
+
+# a name the object does not have is refused before its expression is even tried (spec 037)
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, bad = tenant);
+----
+<REGEX>:.*lists "bad", which the object does not have.*
 
 # ... but an object whose source is not attached cannot judge one, so it is accepted unchecked
 statement ok
@@ -170,7 +178,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, label = coalesce(tenant, 'none'));
+ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, amount = coalesce(tenant, 'none'));
 
 query I
 SELECT count(*) FROM aclcat.acl.grant_columns WHERE vname = 't';

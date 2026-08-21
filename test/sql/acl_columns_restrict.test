@@ -174,26 +174,23 @@ ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM (DESC
 amount,id,note,ssn,tenant
 
 # --- a grant may only name what the object exposes ------------------------------------------------------
-# the refusal is at resolution rather than where the grant is written (see the spec's follow-up), so
-# it is the role's own read that reports it
-
-statement ok
-ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select) COLUMNS (order_id, tenant);
+# and it is refused where it is written, not where it is read (spec 037)
 
 statement error
-ACL ROLE "r" SELECT order_id FROM renamed;
+ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select) COLUMNS (order_id, tenant);
 ----
-<REGEX>:.*lists column "tenant", which the object does not expose.*
+<REGEX>:.*lists "tenant", which the object does not have.*
 
-# ... while its expression still runs over the physical row, so a mask may read what the object dropped
+# ... while a mask's expression still runs over the physical row, so it may read what the object
+# dropped - it just has to be a mask of a column the object does expose
 statement ok
 ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select, insert, update)
-    COLUMNS (order_id, total = coalesce(tenant, 'none'));
+    COLUMNS (order_id = coalesce(tenant, 'none'));
 
-query II
+query I
 ACL ROLE "r" SELECT * FROM renamed;
 ----
-1	acme
+acme
 
 # --- a grant's list replaces the object's, it never adds to it --------------------------------------------
 # the object allows two columns to be written and the grant allows one: the union would let a write

@@ -1857,6 +1857,26 @@ struct CatalogBackend {
 		return any;
 	}
 
+	//! What an object exposes, in its own order: the column list it declares, or - when it declares
+	//! none - the columns of the source it stands for. False when the source cannot be bound here, in
+	//! which case the object is not ours to judge and a grant on it is left alone (spec 037).
+	bool ExposedColumns(const string &source, const vector<string> &declared, vector<string> &out) {
+		if (!declared.empty()) {
+			out = declared;
+			return true;
+		}
+		auto instance = Db();
+		Connection con(*instance);
+		auto probe = con.Query("SELECT * FROM " + source + " WHERE false");
+		if (probe->HasError()) {
+			return false;
+		}
+		for (auto &name : probe->GetNames()) {
+			out.push_back(name.GetIdentifierName());
+		}
+		return true;
+	}
+
 	//! Bind a projection over a relation and return the columns it produces (spec 026). Never fatal: an
 	//! unbindable projection leaves the listing as it was rather than refusing the grant.
 	//! Returns the binder's message when the projection is at fault, and an empty string when it binds -
@@ -2338,6 +2358,70 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 //! bind is a mistake worth refusing, and by `acl_refresh_schema`, where it is only a fact that has
 //! not become true yet (spec 027) - `strict` picks between the two.
 using ReadFn = std::function<unique_ptr<MaterializedQueryResult>(const string &)>;
+
+//! A grant hides and masks; naming, computing and ordering belong to the virtual catalog (spec 037).
+//! So a grant's column list may only name columns the object exposes, and the order it was written in
+//! carries no meaning - the list is stored in the object's order, which makes a column's position a
+//! property of the object rather than of whoever asks. An object this cannot be judged against (not
+//! written yet, or a source that does not bind here) is left alone; the read path still refuses a
+//! column the object does not expose.
+string NormaliseGrantColumns(CatalogBackend &catalog, const ReadFn &read, const string &vcat, const string &vname,
+                             const string &columns) {
+	if (columns.empty()) {
+		return columns;
+	}
+	auto shape = read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + catalog.Tbl("relations") +
+	                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+	if (shape->RowCount() == 0) {
+		return columns;
+	}
+	auto text = [&](idx_t column) {
+		auto value = shape->GetValue(column, 0);
+		return value.IsNull() ? string() : value.ToString();
+	};
+	auto form = text(0);
+	string source = form == "view" ? "(" + text(2) + ")" : text(1);
+	if (source.empty()) {
+		return columns;
+	}
+	vector<string> declared;
+	auto rows = read("SELECT \"name\" FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                 " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+	for (idx_t i = 0; i < rows->RowCount(); i++) {
+		declared.push_back(rows->GetValue(0, i).ToString());
+	}
+	vector<string> exposed;
+	if (!catalog.ExposedColumns(source, declared, exposed)) {
+		return columns;
+	}
+	auto listed = acl_detail::ParseColumnList(columns);
+	for (auto &column : listed) {
+		bool found = false;
+		for (auto &name : exposed) {
+			if (StringUtil::CIEquals(name, column.first)) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			throw InvalidInputException(
+			    "acl: the grant on \"%s\" lists \"%s\", which the object does not have - a grant may hide or mask a "
+			    "column, but naming, computing and ordering belong to the virtual catalog (spec 037)",
+			    vname, column.first);
+		}
+	}
+	vector<string> parts;
+	for (auto &name : exposed) {
+		for (auto &column : listed) {
+			if (!StringUtil::CIEquals(name, column.first)) {
+				continue;
+			}
+			parts.push_back(column.second.empty() ? column.first : column.first + " = " + column.second);
+			break;
+		}
+	}
+	return StringUtil::Join(parts, ", ");
+}
 
 void GrantProjectionStatements(CatalogBackend &catalog, const ReadFn &read, const string &role, const string &vcat,
                                const string &vname, const string &columns, vector<string> &statements, bool strict) {
@@ -3903,14 +3987,16 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 		// what this projection actually produces: names a mask renames the type of, and columns the
 		// object never had. Probed here, where it is written, so a listing can describe what the role
 		// reads rather than what the physical table holds (spec 026).
-		GrantProjectionStatements(*catalog, read, role, vcat, vname, columns, statements, true);
+		// spec 037: what the grant may say at all, and in whose order it is kept
+		auto listed = NormaliseGrantColumns(*catalog, read, vcat, vname, columns);
+		GrantProjectionStatements(*catalog, read, role, vcat, vname, listed, statements, true);
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
 		                     " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
 		statements.push_back("INSERT INTO " + catalog->Tbl("role_object_caps") +
 		                     "(\"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\", \"rls_checked\")"
 		                     " VALUES (" +
 		                     Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " + Lit(caps_json) + ", " +
-		                     Lit(rls) + ", " + Lit(columns) + ", " +
+		                     Lit(rls) + ", " + Lit(listed) + ", " +
 		                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ")");
 	});
 }

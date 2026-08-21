@@ -33,7 +33,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG c;
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders COLUMNS (id, tag = tenant, amount, note);
 
 statement ok
 ACL ADMIN CREATE ROLE ra;
@@ -51,10 +51,10 @@ ACL ADMIN GRANT CATALOG c TO ROLE rb WITH (select) MAIN;
 # position in each. The merge rule: a column belongs where the first role naming it - roles in name
 # order - put it. So: id, tag (from ra), then amount (new in rb).
 statement ok
-ACL ADMIN GRANT OBJECT c.orders TO ROLE ra COLUMNS (id, tag = tenant);
+ACL ADMIN GRANT OBJECT c.orders TO ROLE ra COLUMNS (id, tag);
 
 statement ok
-ACL ADMIN GRANT OBJECT c.orders TO ROLE rb COLUMNS (id, amount, tag = tenant);
+ACL ADMIN GRANT OBJECT c.orders TO ROLE rb COLUMNS (id, amount, tag);
 
 # --- the read path ---------------------------------------------------------------------------------
 
@@ -127,29 +127,29 @@ ACL ADMIN CREATE ROLE solo;
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE solo WITH (select) MAIN;
 
-# the grant reorders the table and adds a computed column: the list is the order
+# written out of order on purpose: the object's order is the order (spec 037)
 statement ok
-ACL ADMIN GRANT OBJECT c.orders TO ROLE solo COLUMNS (note, initial = tenant, id);
+ACL ADMIN GRANT OBJECT c.orders TO ROLE solo COLUMNS (note, amount, id);
 
 query III
 ACL ROLE "solo" SELECT * FROM orders;
 ----
-first	acme	1
+1	100	first
 
 query I
 ACL ROLE "solo" SELECT string_agg(column_name, ',') FROM (DESCRIBE orders);
 ----
-note,initial,id
+id,amount,note
 
 query I
 ACL ROLE "solo" SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns();
 ----
-note,initial,id
+id,amount,note
 
 query I
 ACL ROLE "solo" SELECT sql FROM duckdb_tables();
 ----
-CREATE TABLE "orders"("note" VARCHAR, "initial" VARCHAR, "id" INTEGER);
+CREATE TABLE "orders"("id" INTEGER, "amount" INTEGER, "note" VARCHAR);
 
 # --- one role without a column list lifts the other's projection entirely ----------------------------
 # spec 011: a grant that states nothing does not narrow, so the principal reads the object's own
@@ -163,7 +163,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE rc WITH (select) MAIN;
 
 statement ok
-ACL ADMIN GRANT OBJECT c.orders TO ROLE rc COLUMNS (id, tag = tenant);
+ACL ADMIN GRANT OBJECT c.orders TO ROLE rc COLUMNS (id, tag);
 
 statement ok
 ACL ADMIN CREATE ROLE rd;
@@ -176,19 +176,19 @@ query I
 ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYyIsInJkIl19.w6ZV8MIubCKzMG30PnMNFiFoGzBNXJ3p1BkwbsOuwVw'
 SELECT string_agg(column_name, ',') FROM (DESCRIBE orders);
 ----
-id,tenant,amount,note
+id,tag,amount,note
 
 query I
 ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYyIsInJkIl19.w6ZV8MIubCKzMG30PnMNFiFoGzBNXJ3p1BkwbsOuwVw'
 SELECT string_agg(column_name || '@' || column_index, ',' ORDER BY column_index) FROM duckdb_columns();
 ----
-id@1,tenant@2,amount@3,note@4
+id@1,tag@2,amount@3,note@4
 
 query I
 ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYyIsInJkIl19.w6ZV8MIubCKzMG30PnMNFiFoGzBNXJ3p1BkwbsOuwVw'
 SELECT sql FROM duckdb_tables();
 ----
-CREATE TABLE "orders"("id" INTEGER, "tenant" VARCHAR, "amount" INTEGER, "note" VARCHAR);
+CREATE TABLE "orders"("id" INTEGER, "tag" VARCHAR, "amount" INTEGER, "note" VARCHAR);
 
 # --- an object with no grant projection keeps the object's own order ---------------------------------
 
@@ -201,14 +201,14 @@ ACL ADMIN GRANT CATALOG c TO ROLE plain WITH (select) MAIN;
 query I
 ACL ROLE "plain" SELECT string_agg(column_name, ',') FROM (DESCRIBE orders);
 ----
-id,tenant,amount,note
+id,tag,amount,note
 
 query I
 ACL ROLE "plain" SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns();
 ----
-id,tenant,amount,note
+id,tag,amount,note
 
 query I
 ACL ROLE "plain" SELECT sql FROM duckdb_tables();
 ----
-CREATE TABLE "orders"("id" INTEGER, "tenant" VARCHAR, "amount" INTEGER, "note" VARCHAR);
+CREATE TABLE "orders"("id" INTEGER, "tag" VARCHAR, "amount" INTEGER, "note" VARCHAR);

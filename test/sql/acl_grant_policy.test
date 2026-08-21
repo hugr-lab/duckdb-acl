@@ -320,13 +320,10 @@ ACL ADMIN GRANT TABLE sales.shout TO ROLE analyst CAPS '{"select": true}' RLS 't
 statement ok
 ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.public_orders COLUMNS 'id,amount';
 
-statement ok
-ACL ADMIN GRANT TABLE sales.public_orders TO ROLE auditor CAPS '{"select": true}' COLUMNS 'id,ssn';
-
 statement error
-ACL ROLE "auditor" SELECT * FROM public_orders;
+ACL ADMIN GRANT TABLE sales.public_orders TO ROLE auditor CAPS '{"select": true}' COLUMNS 'id,ssn';
 ----
-<REGEX>:.*does not expose.*
+<REGEX>:.*lists "ssn", which the object does not have.*
 
 # ... but it may mask harder
 statement ok
