@@ -167,12 +167,24 @@ int64_t NowSeconds() {
 //!
 //! `std::random_device` rather than duckdb's own utilities, deliberately: `RandomEngine` seeds from
 //! the clock off Linux, and the encryption util refuses to generate randomness unless OpenSSL arrived
-//! with httpfs (its mbedTLS fallback demands `force_mbedtls_unsafe`). On both supported platforms
-//! `std::random_device` is the OS CSPRNG, and it cannot quietly degrade into a timestamp.
+//! with httpfs (its mbedTLS fallback demands `force_mbedtls_unsafe`). On glibc, libc++ and MSVC the
+//! device is the OS CSPRNG - `getrandom`, `arc4random` and `rand_s` respectively.
+//!
+//! The one implementation that was not is MinGW's before GCC 9.2, where it returned a fixed sequence.
+//! That failure is silent and total, so it is checked for rather than assumed: two independent
+//! devices agreeing on 64 bits means the device is deterministic, and a handle from it would be
+//! guessable by anyone with the same toolchain. Refusing to mint beats minting that.
 string MintHandle() {
 	constexpr idx_t HANDLE_BYTES = 16;
-	data_t bytes[HANDLE_BYTES];
 	std::random_device source;
+	{
+		std::random_device other;
+		if (source() == other() && source() == other()) {
+			throw InternalException("acl: this build's std::random_device is deterministic, so a session handle "
+			                        "would be guessable - refusing to mint one");
+		}
+	}
+	data_t bytes[HANDLE_BYTES];
 	for (idx_t i = 0; i < HANDLE_BYTES; i += 4) {
 		auto word = static_cast<uint32_t>(source());
 		for (idx_t byte = 0; byte < 4; byte++) {

@@ -16,7 +16,7 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   (`Identifier`, multi-level `QualifiedName`, `MergeQueryNode`, unified DML query nodes) not yet in a
   stable release. Re-pin to a tag once those land.
 - **Dependencies**: none (no vcpkg/OpenSSL).
-- **Platforms**: Linux (GCC), macOS (Clang).
+- **Platforms**: Linux (GCC), macOS (Clang), Windows (MSVC — a release target; CI builds the first two).
 
 ## Project structure
 

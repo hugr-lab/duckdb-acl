@@ -73,13 +73,21 @@ channel. Not in this spec: the shared backends, and the portability predicate th
   closed or expired handle gives NULL from `acl_session_sql` and a refusal from the prefix. A door
   that forgets to check NULL prefixes nothing, and an unprefixed statement is refused under `STRICT`.
 - **A handle is a bearer credential**, so where its randomness comes from is a decision, not a
-  detail. It uses `std::random_device` — the OS CSPRNG on both supported platforms — rather than
-  duckdb's own utilities, and the self-review is why: `RandomEngine` seeds from the clock off Linux,
-  and the encryption util refuses to generate randomness unless OpenSSL arrived with httpfs (its
-  mbedTLS fallback demands `force_mbedtls_unsafe`). Reading `DBConfig::encryption_util` directly, as
-  the first cut did, silently took the clock-seeded path in every ordinary build. The handle is never
-  derived from the token, never logged by us, revocable by `acl_session_close`, and useless outside
-  this instance.
+  detail. It uses `std::random_device` rather than duckdb's own utilities, and the self-review is
+  why: `RandomEngine` seeds from the clock off Linux, and the encryption util refuses to generate
+  randomness unless OpenSSL arrived with httpfs (its mbedTLS fallback demands
+  `force_mbedtls_unsafe`). Reading `DBConfig::encryption_util` directly, as the first cut did,
+  silently took the clock-seeded path in every ordinary build.
+
+  Across the three target platforms the device is the OS CSPRNG — `getrandom` on glibc, `arc4random`
+  on libc++, `rand_s` on MSVC, which is what builds `windows_amd64`. The one implementation that was
+  not is MinGW's before GCC 9.2, which returned a fixed sequence; that failure is silent and total,
+  so it is **checked for rather than assumed**: two independent devices agreeing on 64 bits means the
+  device is deterministic, and minting is refused. A build that cannot produce an unguessable handle
+  should say so, not hand one out.
+
+  The handle is never derived from the token, never logged by us, revocable by `acl_session_close`,
+  and useless outside this instance.
 - **A client cannot mint or borrow one.** Verified rather than assumed: under a principal all three
   functions are refused by the gate (`function "acl_session_open" is not allowed`), so a principal can
   neither mint a session, nor compose a prefix, nor close somebody else's. And a client writing `ACL SESSION 'x'` into its own query text is refused the same
