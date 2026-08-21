@@ -140,8 +140,17 @@ Full suite: 40 files, 3187 assertions, both C++ binaries.
 - **A mask's refusal is also duckdb's message** (`Column "ssn" in REPLACE list not found in FROM
   clause`) rather than ours, and it arrives at the reader rather than at the author. It says the right
   thing, but it does not say which grant caused it.
-- Column names containing quoting metacharacters need care in the generated lambda; names are compared
-  case-insensitively, as duckdb identifiers are.
+- Column names containing quoting metacharacters: the generated lambda quotes them as string literals
+  and the `REPLACE` alias as an identifier, both escaped. Two neighbouring places did not, and the
+  self-review found them:
+  - the write-time probe built `<source> AS <alias>` unquoted, so a column named `od''d` made the
+    probe itself unparseable and such a column could never be granted at all. Fixed here.
+  - the SQL grammar keeps an identifier's quotes in the list it stores, so `COLUMNS (id, "od''d")`
+    records the name *with* its quotes and then matches nothing. The function form
+    (`acl_grant_object(…, 'id, od''d')`) works. Unquoting per item in the grammar is its own change,
+    with its own question about what `"a b"` should mean.
+
+  Names are compared case-insensitively, as duckdb identifiers are.
 - **An object whose mask cannot be applied is unreadable but still listed**, showing the columns the
   bare names intersect to. Same shape as spec 037's follow-up about conflicting roles: the listing
   describes something no query can return. Both want the same fix — a listing that asks whether the

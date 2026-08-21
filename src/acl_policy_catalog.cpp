@@ -1969,14 +1969,16 @@ struct CatalogBackend {
 		}
 		vector<string> items;
 		for (auto &column : ParseColumnList(column_csv)) {
+			// the alias is an identifier and the bare source is one too - quoted, or a column whose name
+			// is not a bare word could never be granted at all, since the probe would not parse
 			if (!column.second.empty()) {
-				items.push_back(column.second + " AS " + column.first); // the grant computes it
+				items.push_back(column.second + " AS " + Ident(column.first)); // the grant masks it
 				continue;
 			}
 			auto object = own.find(column.first);
 			// a bare name is the object's column, which its own projection may have renamed
-			items.push_back((object != own.end() && !object->second.empty() ? object->second : column.first) + " AS " +
-			                column.first);
+			items.push_back((object != own.end() && !object->second.empty() ? object->second : Ident(column.first)) +
+			                " AS " + Ident(column.first));
 		}
 		if (items.empty()) {
 			return string();
