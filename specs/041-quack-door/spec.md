@@ -92,13 +92,14 @@ Two refusals only a live client found, both fixed here:
 So streamed ingest does not bypass the ACL; it does not work. That is fail-closed by construction
 rather than by a check, and it settles the v1 question: no stream ledger is needed for safety. One is
 needed for *functionality* — and bulk loading is a large part of what quack is for — so it is a spec
-of its own, with two pieces this one measured but does not land:
+of its own, with two pieces this one measured — the first of which landed here:
 
-- **the column list has to be supplied.** duckdb matches a listless INSERT by position against the
-  table's *full width*, and does not match by name at all, while the client counts the columns spec
-  035 published. Verified: with the list supplied from the principal's writable columns in publish
-  order, `INSERT INTO orders VALUES (1, 'acme')` against a published two-column shape writes those two
-  and leaves the hidden one alone.
+- **the column list has to be supplied** — and this half landed here. duckdb matches a listless INSERT
+  by position against the table's *full width*, and does not match by name at all, while the client
+  counts the columns spec 035 published. So a listless insert now gets the list of the principal's
+  writable columns in publish order: an insert of the shape we advertised writes the columns we
+  advertised, and a value too many is duckdb's own width error rather than a row nobody asked for.
+  **Only where the grant assigns no values**, which is the part left open below.
 - **the ingest INSERT is a projection we build, not data we let through.** Once rewritten under the
   principal it goes down `ApplyInsertPolicy` like any other insert, so the grant's injected values
   (`tenant = acl_claim('tenant')`) are *assigned* rather than taken from the client, and the predicate
@@ -110,9 +111,18 @@ everything above is machinery we already have. The only door-specific part is at
 to an unprefixed statement — one lookup by the stream id the authorization callback recorded before
 the first row moved. The ledger is not an ingest mechanism; it is that lookup.
 
-Neither piece can land yet: a grant projection over a marker stores a phantom column with a NULL name
-(see `design/BACKLOG.md`), and the list synthesis reads that same list — so a phantom column would
-become a phantom write target. Measured, not hypothesised.
+What is left open is precisely where the two meet. The generated ingest INSERT names no columns, and
+the synthesis above declines to name them when the grant injects values — because an injection projects
+the source through a subquery that names what it wants, and a source one column too wide would then
+lose a column silently, which is the failure mode this layer refuses everywhere else. A client writing
+by hand is simply told to name its columns; a generated statement has nobody to tell. So the ledger
+spec owns both halves: the lookup that attaches the principal, and a projection built over the stream
+whose width is checked rather than trusted.
+
+(The list synthesis could not land at all until the phantom column was fixed — a grant projection over
+a marker stored a column with a NULL name, and the synthesis reads that same list, so a phantom column
+would have become a phantom write target. Fixed on this branch; recorded because it is the kind of
+thing that returns.)
 
 ## Enforcement & security
 
