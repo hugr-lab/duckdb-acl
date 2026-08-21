@@ -188,6 +188,7 @@ struct PolicyStore {
 	//! What an issuer's JWKS URI last yielded (spec 023). Reading is the whole mechanism: a TTL says
 	//! when to read again, and a bounded staleness says how long a failed read may be survived.
 	struct JwksEntry {
+		string uri; // what these keys were read from: a different location is a different cache entry
 		string keys_json;
 		int64_t fetched_at = 0; // seconds since epoch of the last successful read; 0 = never
 		int64_t tried_at = 0;   // last attempt, successful or not - the floor under retries

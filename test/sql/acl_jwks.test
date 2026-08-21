@@ -63,6 +63,34 @@ ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50
 ----
 1
 
+# repointing an issuer takes effect at once: keys read from the old location say nothing about the new
+# one, and an operator moving an issuer does not mean "after the TTL"
+statement ok
+COPY (SELECT '{"keys":[{"kty":"oct","k":"ZGlmZmVyZW50LXNlY3JldA"}]}' AS c)
+    TO '__TEST_DIR__/other-jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+
+statement ok
+SET GLOBAL acl_jwks_refresh_interval = 300;
+
+statement ok
+ACL ADMIN ALTER ISSUER 'https://issuer.test/hs' SET KEYS FROM '__TEST_DIR__/other-jwks.json';
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1;
+----
+<REGEX>:.*signature verification failed.*
+
+statement ok
+ACL ADMIN ALTER ISSUER 'https://issuer.test/hs' SET KEYS FROM '__TEST_DIR__/jwks.json';
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+1
+
+statement ok
+SET GLOBAL acl_jwks_refresh_interval = 0;
+
 # --- a document that cannot be read -----------------------------------------------------------------
 # keys of unknown age are not trusted forever: with no staleness allowed, a failed read is fatal, and
 # the message names the location rather than blaming the token

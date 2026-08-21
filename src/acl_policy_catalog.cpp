@@ -1962,10 +1962,13 @@ string PolicyStore::ResolveIssuerKeys(const IssuerConfig &config, const string &
 	{
 		lock_guard<mutex> guard(lock);
 		auto found = jwks_cache.find(config.issuer);
-		if (found != jwks_cache.end()) {
+		// an issuer repointed at another location starts from nothing: keys read from the old one say
+		// nothing about the new one, and waiting out the TTL is not what an operator repointing it means
+		if (found != jwks_cache.end() && found->second.uri == config.jwks_uri) {
 			entry = found->second;
 		}
 	}
+	entry.uri = config.jwks_uri;
 	bool expired = entry.keys_json.empty() || now - entry.fetched_at >= refresh;
 	// a key that rotated in since the last read: worth one more read, but not once per token, so the
 	// same floor as any other retry applies

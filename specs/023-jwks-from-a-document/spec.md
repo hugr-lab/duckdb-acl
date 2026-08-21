@@ -46,6 +46,7 @@ document must not keep verifying against a paste nobody can see any more.
 | the token names a `kid` the cached document does not have | read, no more often than every 10 seconds — a rotation is worth a read, once per token is not |
 | the read fails and something is cached | keep using it until `acl_jwks_max_stale` (3600s) has passed since the last **successful** read; `0` means a failed read is fatal at once |
 | the read fails and nothing is cached | refuse, naming the location and the reason |
+| the issuer is repointed at another location | the cache entry does not apply: keys read from the old location say nothing about the new one, and an operator moving an issuer does not mean "after the TTL" |
 
 Keys of unknown age stop being trusted deliberately: an issuer that has been unreachable for a day
 says nothing about a key that may have been revoked in the meantime.
@@ -78,12 +79,13 @@ during a rotation:
 
 ## Testing
 
-`test/sql/acl_jwks.test` (40 assertions): a token verified against keys read from a file; rotating the
+`test/sql/acl_jwks.test` (47 assertions): a token verified against keys read from a file; rotating the
 file rotating the keys, with `acl_jwks_refresh_interval = 0` making that visible without waiting;
 a location that cannot be read refused with `acl_jwks_max_stale = 0`, naming the location; keys and
 location refused together and refused absent; `ALTER ISSUER … SET KEYS FROM` and `SET KEYS` each
 clearing the other; the operator's listing showing the location and still not the keys; a pasted JWKS
-unaffected; and a Keycloak-shaped JWKS — an encryption key beside a signing one — where the signing
+unaffected; repointing an issuer taking effect at once rather than after the interval; and a
+Keycloak-shaped JWKS — an encryption key beside a signing one — where the signing
 key is still found by `kid`, the encryption key is not usable, and an unknown `kid` says so.
 
 ## Alternatives considered
@@ -102,5 +104,8 @@ key is still found by `kid`, the encryption key is not usable, and an unknown `k
 
 - **Discovery**: accept an issuer URL and resolve `jwks_uri` from its OIDC document, refreshing both.
 - **An allowlist for locations**, or moving the field behind `passthrough` — see the security note.
+- **A document that is not a JWKS** reports "no usable key" rather than "this is not a JWKS": the same
+  nullptr means "a PEM, handled elsewhere" and "unparseable", which is fine for RS256 and vague for the
+  others.
 - **A listing of what the cache holds** (last read, last error, key ids) so an operator can see why
   tokens are failing without reading logs.
