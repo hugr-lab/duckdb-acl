@@ -211,6 +211,9 @@ struct PolicyStore {
 	                        const string &returns = string());
 	//! Whether `db.schema.name` exists physically - what VIRTUAL ONLY checks before recording it
 	bool PhysicalObjectExists(const string &phys);
+	//! Record a view a role created (spec 018): its body was resolved with the author's rights, with
+	//! claims left as markers, so reading it is decided by the grant on the view itself
+	void CatalogRegisterView(const string &vcat, const string &vname, const string &body);
 	//! Record an object a principal's own DDL just created (spec 016): alias form, the schema's
 	//! origin, nothing else to choose
 	void CatalogRegisterCreated(const string &vcat, const string &vname, const string &phys,

@@ -21,6 +21,7 @@
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
@@ -147,14 +148,11 @@ private:
 		}
 		auto &info = *stmt.info;
 		if (info.type == CatalogType::VIEW_ENTRY) {
-			// a view keeps its body, and the body would be stored with THIS principal's claims baked
-			// in, then re-read by every other role through the same name - one principal's slice
-			// frozen into an object everyone reads. Until that has a design, refuse it.
-			Deny("creating views through the ACL is not available yet - a stored body would carry this "
-			     "principal's claims to everyone who reads it");
+			RewriteCreateView(stmt);
+			return;
 		}
 		if (info.type != CatalogType::TABLE_ENTRY) {
-			Deny("only tables can be created through the ACL");
+			Deny("only tables and views can be created through the ACL");
 		}
 		if (info.temporary) {
 			Deny("temporary objects are not available through the ACL yet");
@@ -189,6 +187,33 @@ private:
 		}
 	}
 
+	//! `CREATE VIEW v AS <query>` saves the query, in the virtual names it was written in. Nothing
+	//! physical is made: the body is a record, and every read resolves it through the reader (spec 018).
+	void RewriteCreateView(CreateStatement &stmt) {
+		auto &info = stmt.info->Cast<CreateViewInfo>();
+		if (info.temporary) {
+			Deny("temporary objects are not available through the ACL yet");
+		}
+		if (!info.query) {
+			Deny("a view needs a query");
+		}
+		auto key = VirtualKey(info.GetQualifiedName());
+		DdlTarget target;
+		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
+			Deny("no schema of the catalog allows creating \"" + key + "\"");
+		}
+		// The body is resolved here, with its author's rights: a view is an object of the virtual
+		// catalog in its own right, and reading it is decided by the grant on the view - not by grants
+		// on what it happens to read. Claims stay markers, so a reader in another tenant still sees
+		// their own rows rather than the author's (spec 018).
+		keep_claim_markers = true;
+		RewriteQueryNode(*info.query->node);
+		keep_claim_markers = false;
+		auto body = info.query->ToString();
+		drop_statement = true;
+		follow_ups.push_back(AclCall("acl_register_view", {Value(target.vcat), Value(key), Value(body)}));
+	}
+
 	void RewriteDropStatement(DropStatement &stmt) {
 		if (!stmt.info) {
 			Deny("unsupported DROP form");
@@ -201,6 +226,13 @@ private:
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "drop", target)) {
 			Deny("no schema of the catalog allows dropping \"" + key + "\"");
+		}
+		TablePolicy existing;
+		if (store.ResolveTable(principal, key, existing) && !existing.query.empty()) {
+			// a view has no physical object behind it: the record is the whole of it
+			drop_statement = true;
+			follow_ups.push_back(AclCall("acl_drop_relation", {Value(target.vcat), Value(key), Value("skip")}));
+			return;
 		}
 		if (target.virtual_only) {
 			Deny("\"" + key + "\" is granted VIRTUAL ONLY, so its physical object is not this role's to drop");
@@ -956,6 +988,9 @@ private:
 		if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 			auto &function = expr->Cast<FunctionExpression>();
 			auto marker = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+			if (marker == "acl_claim" && keep_claim_markers) {
+				return; // stored body: this claim is resolved by whoever reads it, not by its author
+			}
 			if (marker == "acl_claim" || marker == "acl_arg") {
 				// the marker may be the whole select item (`acl_claim('tenant') AS tenant`), so its
 				// alias has to survive the replacement - otherwise the column loses its name
@@ -1007,6 +1042,11 @@ private:
 	PolicyStore &store;
 	//! the virtual name of the DML target currently being rewritten (for diagnostics and mapping)
 	string dml_target_name;
+	//! While rewriting a body that will be *stored* (a role's CREATE VIEW, spec 018): names and policy
+	//! resolve now, with the creator's rights, but `acl_claim` stays a marker so every later reader is
+	//! filtered by their own claims. `acl_arg` is still substituted - it belongs to a call that is
+	//! happening now and would mean nothing in a stored body.
+	bool keep_claim_markers = false;
 	ParserOptions template_options;
 	case_insensitive_set_t cte_scope;
 };
@@ -1014,6 +1054,8 @@ private:
 } // namespace
 
 namespace {
+
+void BakeNullMarkersInNode(QueryNode &node, const vector<string> &param_types, const ParserOptions &options);
 
 //! Replace acl_claim('…') / acl_arg(n) with NULL constants so the template binds without a
 //! principal. An acl_arg NULL is TYPED from the declared signature when there is one: an untyped
@@ -1047,21 +1089,21 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 			return;
 		}
 	}
+	if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		auto &subquery = expr->Cast<SubqueryExpression>().SubqueryMutable();
+		if (subquery) {
+			BakeNullMarkersInNode(*subquery->node, param_types, options);
+		}
+	}
 	ParsedExpressionIterator::EnumerateChildren(
 	    *expr, [&](unique_ptr<ParsedExpression> &child) { BakeNullMarkers(child, param_types, options); });
 }
 
+//! Every expression the node owns, at any depth: a marker left standing anywhere makes the probe
+//! unbindable, and a resolved body puts the author's policy in a FROM subquery rather than on top.
 void BakeNullMarkersInNode(QueryNode &node, const vector<string> &param_types, const ParserOptions &options) {
-	if (node.type != QueryNodeType::SELECT_NODE) {
-		return;
-	}
-	auto &select = node.Cast<SelectNode>();
-	for (auto &item : select.select_list) {
-		BakeNullMarkers(item, param_types, options);
-	}
-	BakeNullMarkers(select.where_clause, param_types, options);
-	BakeNullMarkers(select.having, param_types, options);
-	BakeNullMarkers(select.qualify, param_types, options);
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node, [&](unique_ptr<ParsedExpression> &child) { BakeNullMarkers(child, param_types, options); });
 }
 
 } // namespace

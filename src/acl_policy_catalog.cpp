@@ -1931,6 +1931,16 @@ bool PolicyStore::PhysicalObjectExists(const string &phys) {
 	           ->RowCount() > 0;
 }
 
+void PolicyStore::CatalogRegisterView(const string &vcat, const string &vname, const string &body) {
+	RequireCatalog(catalog, "acl_register_view");
+	RequireNotReserved(vname);
+	// fixed shape, like the record of a created table: a body and nothing else to choose
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		statements = RelationStatements(*catalog, vcat, vname, "view", "", body, "", {}, "", "");
+	});
+}
+
 void PolicyStore::CatalogRegisterCreated(const string &vcat, const string &vname, const string &phys,
                                          const string &origin) {
 	RequireCatalog(catalog, "acl_register_created");

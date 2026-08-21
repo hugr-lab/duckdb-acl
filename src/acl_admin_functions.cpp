@@ -288,6 +288,18 @@ void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &res
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! acl_register_view(vcat, vname, body): the write a role's own CREATE VIEW performs (spec 018) -
+//! the body as written, in virtual names, and nothing else to choose
+void AclRegisterViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_register_view", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_register_view", "name");
+		auto body = RequiredArg(args, 2, row, "acl_register_view", "body");
+		StoreOf(state).CatalogRegisterView(vcat, vname, body);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
 //! acl_register_existing(vcat, vname, phys, origin): the VIRTUAL ONLY form of the above - it records
 //! an object that must already exist physically, and refuses if it does not (spec 016)
 void AclRegisterExistingFunc(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -951,6 +963,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_grant_schema", {{v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v, b}}, AclGrantSchemaFunc);
 	register_admin_set("acl_register_created", {{v, v, v}, {v, v, v, v}}, AclRegisterCreatedFunc);
 	register_admin_set("acl_register_existing", {{v, v, v}, {v, v, v, v}}, AclRegisterExistingFunc);
+	register_admin("acl_register_view", {v, v, v}, AclRegisterViewFunc);
 	register_admin("acl_revoke_schema", {v, v, v}, AclRevokeSchemaFunc);
 	register_admin_set("acl_rematerialize_schema_caps", {{v}, {v, v}}, AclRematerializeSchemaCapsFunc);
 	register_admin_set("acl_add_table_function",

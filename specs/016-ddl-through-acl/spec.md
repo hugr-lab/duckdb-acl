@@ -87,10 +87,11 @@ no access to into a schema it owns. Without this the capability would be an exfi
 `CREATE TABLE mine.stolen AS SELECT * FROM phys.main.secrets` — which is why the check lives here and
 not in a follow-up.
 
-`CREATE VIEW` is **refused for now**, for a different reason: a view keeps its body, the body would
-be stored with *this* principal's claims baked in, and every other role reading through that name
-would then see one principal's slice. That needs a design of its own (a virtual view already exists
-for the admin path and carries markers instead of baked values).
+`CREATE VIEW` was refused here and is allowed by **spec 018**: a view is an object of the catalog in
+its own right, its body resolved once with its author's rights and its claims left as markers. The
+worry recorded here — "the body would carry this principal's claims to everyone" — was half right:
+baking claims is indeed wrong (and is not done), while freezing the author's *policy* is exactly what
+a view is for.
 
 ### Fail-closed rules
 
@@ -138,5 +139,4 @@ leaving no record behind.
 - `CREATE SCHEMA` / `DROP SCHEMA` through the catalog-level `create`/`drop`, and the auto-grant to
   the role that created a schema (design 004: a materialised row, not an implicit rule).
 - Temporary tables for ingest paths (`temp` capability) — recorded separately.
-- `CREATE VIEW` through the ACL: the body has to keep its markers rather than this principal's baked
-  claims, which is what the virtual-view path already does for the admin.
+- ~~`CREATE VIEW` through the ACL~~ — spec 018.

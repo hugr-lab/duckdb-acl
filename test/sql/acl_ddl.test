@@ -314,11 +314,20 @@ ACL ROLE "ingest" SELECT count(*) FROM vs.copied;
 ----
 1
 
-# a view would store this principal's baked claims for everyone else to read, so not yet
-statement error
+# a view saves the query rather than materialising anything: the body is a record, read through
+# whoever reads it (spec 018)
+statement ok
 ACL ROLE "ingest" CREATE VIEW vs.v AS SELECT 1 AS one;
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name = 'v';
 ----
-<REGEX>:.*creating views through the ACL is not available yet.*
+0
+
+query I
+ACL ROLE "ingest" SELECT one FROM vs.v;
+----
+1
 
 # --- only tables and views, and never through a name nobody granted ---------------------------------
 

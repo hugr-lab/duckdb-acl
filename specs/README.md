@@ -60,3 +60,4 @@ specs are the shareable distillation of that work.
 | [015](015-schema-grants/spec.md) | schema-level grants and materialised caps inheritance | implemented |
 | [016](016-ddl-through-acl/spec.md) | DDL through the ACL — `create`, `drop`, and where the object lands | implemented |
 | [017](017-enable-override-on-load/spec.md) | the extension enables its own parser override | implemented |
+| [018](018-create-view-through-acl/spec.md) | a role may create a view — `CREATE VIEW` through the ACL | implemented |

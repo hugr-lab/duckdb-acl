@@ -1,0 +1,243 @@
+# name: test/sql/acl_create_view.test
+# description: a role may create a view (spec 018) - the body is resolved once with its author's rights
+#   and the grant on the view decides who reads it, while claims stay markers so nobody's tenant is frozen
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE TABLE phys.lake.orders(id INT, tenant VARCHAR, amount INT, region VARCHAR);
+
+statement ok
+INSERT INTO phys.lake.orders VALUES (1, 'acme', 100, 'eu'), (2, 'globex', 200, 'us'), (3, 'acme', 300, 'eu');
+
+# a real table that no virtual catalog exposes - nothing may reach it through a view body
+statement ok
+CREATE TABLE phys.main.secrets(ssn VARCHAR);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.vs FROM phys.lake;
+
+statement ok
+ACL ADMIN CREATE ROLE wide CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN CREATE ROLE narrow CLAIMS (tenant = 'globex');
+
+statement ok
+ACL ADMIN CREATE ROLE outsider;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE wide CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE narrow CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE outsider CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE wide WITH (select, create, drop);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE narrow WITH (select);
+
+# the same object, two shapes: one role sees three columns, the other one
+statement ok
+ACL ADMIN GRANT TABLE sales.vs.orders TO ROLE wide WITH (select) COLUMNS (id, amount, region) RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN GRANT TABLE sales.vs.orders TO ROLE narrow WITH (select) COLUMNS (id) RLS (tenant = acl_claim('tenant'));
+
+# --- saving a query --------------------------------------------------------------------------------
+
+statement error
+ACL ROLE "narrow" CREATE VIEW vs.nope AS SELECT id FROM vs.orders;
+----
+<REGEX>:.*create on schema "vs" is not allowed.*
+
+statement ok
+ACL ROLE "wide" CREATE VIEW vs.report AS SELECT id, amount FROM vs.orders;
+
+# nothing physical was made, and the stored body is the *resolved* query: the author's policy is
+# inlined (their projection, their predicate), while the claim stays a marker
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name = 'report';
+----
+0
+
+query II
+SELECT form, view_sql LIKE '%phys.lake.orders%' AND view_sql LIKE '%acl_claim(''tenant'')%' FROM aclcat.acl.relations WHERE vname = 'vs.report';
+----
+view	true
+
+# the author's reach is the whole of the author's reach: a body cannot name a physical object, so
+# `create` publishes what its holder can read and nothing beyond it
+statement error
+ACL ROLE "wide" CREATE VIEW vs.leak AS SELECT * FROM phys.main.secrets;
+----
+<REGEX>:.*no access to object "phys.main.secrets".*
+
+# the body is bound at write time (spec 010), so the view describes its columns like any other object
+query II
+ACL ROLE "wide" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'report' ORDER BY 1;
+----
+amount	INTEGER
+id	INTEGER
+
+# --- read by its author ------------------------------------------------------------------------------
+
+query II
+ACL ROLE "wide" SELECT id, amount FROM vs.report ORDER BY id;
+----
+1	100
+3	300
+
+# --- read by a role whose own grant on the source is narrower ------------------------------------------
+# a view is an object of the catalog in its own right: reading it is decided by the grant on the view,
+# not by grants on what it reads. `narrow` cannot see `amount` on the table and does see it here - the
+# author's rights shaped the body, which is what a view is for.
+
+query II
+ACL ROLE "narrow" SELECT id, amount FROM vs.report;
+----
+2	200
+
+query I
+ACL ROLE "narrow" SELECT count(*) FROM vs.orders;
+----
+1
+
+statement error
+ACL ROLE "narrow" SELECT amount FROM vs.orders;
+----
+<REGEX>:.*amount.*
+
+# ... but the rows are still the reader's own: the claim stayed a marker, so each tenant sees theirs
+query I
+ACL ROLE "wide" SELECT count(*) FROM vs.report;
+----
+2
+
+# --- read without a grant on the view -----------------------------------------------------------------
+# the view is an object, so it is granted like one - and without that grant there is nothing to read
+
+statement error
+ACL ROLE "outsider" SELECT * FROM vs.report;
+----
+<REGEX>:.*(no access to object|select on).*
+
+statement ok
+ACL ADMIN GRANT TABLE sales.vs.report TO ROLE outsider WITH (select);
+
+# outsider holds nothing on the table the view reads, and reads the view all the same
+query I
+ACL ROLE "outsider" SELECT count(*) FROM vs.report;
+----
+0
+
+statement error
+ACL ROLE "outsider" SELECT count(*) FROM vs.orders;
+----
+<REGEX>:.*(no access to object|select on "vs.orders").*
+
+# --- a view over a view -------------------------------------------------------------------------------
+
+statement ok
+ACL ROLE "wide" CREATE VIEW vs.big AS SELECT id FROM vs.report WHERE amount >= 200;
+
+query I
+ACL ROLE "wide" SELECT id FROM vs.big;
+----
+3
+
+# --- a body with a UNION ---------------------------------------------------------------------------------
+# a set operation is walked branch by branch, so neither branch escapes the policy
+
+statement error
+ACL ROLE "wide" CREATE VIEW vs.sneak AS SELECT id, amount FROM vs.orders UNION ALL SELECT 0, 0 FROM phys.main.secrets;
+----
+<REGEX>:.*no access to object "phys.main.secrets".*
+
+statement ok
+ACL ROLE "wide" CREATE VIEW vs.both AS SELECT id, amount FROM vs.orders UNION ALL SELECT id, amount * 2 FROM vs.orders;
+
+# the author's predicate landed in *both* branches, and the probe still derived the columns
+query I
+SELECT view_sql NOT LIKE '%vs.orders%'
+       AND len(view_sql) - len(replace(view_sql, 'acl_claim', '')) = 2 * len('acl_claim')
+  FROM aclcat.acl.relations WHERE vname = 'vs.both';
+----
+true
+
+query II
+ACL ROLE "wide" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'both' ORDER BY 1;
+----
+amount	INTEGER
+id	INTEGER
+
+# two rows of the author's tenant, doubled by the union
+query I
+ACL ROLE "wide" SELECT count(*) FROM vs.both;
+----
+4
+
+statement ok
+ACL ROLE "wide" DROP VIEW vs.both;
+
+# --- dropping ------------------------------------------------------------------------------------------
+
+statement error
+ACL ROLE "narrow" DROP VIEW vs.report;
+----
+<REGEX>:.*drop on schema "vs" is not allowed.*
+
+statement ok
+ACL ROLE "wide" DROP VIEW vs.big;
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vname = 'vs.big';
+----
+0
+
+# --- an admin's view and a role's view are the same kind of object -------------------------------------
+# both carry a body that reaches past the reader's own grants; the difference is only who resolved it
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW sales.stats AS SELECT count(*) AS n FROM phys.lake.orders;
+
+query II
+SELECT form, view_sql FROM aclcat.acl.relations WHERE vname = 'stats';
+----
+view	SELECT count(*) AS n FROM phys.lake.orders
+
+statement ok
+ACL ADMIN GRANT TABLE sales.stats TO ROLE narrow WITH (select);
+
+query I
+ACL ROLE "narrow" SELECT n FROM stats;
+----
+3
+
+query I
+ACL ROLE "narrow" SELECT count(*) FROM vs.orders;
+----
+1
