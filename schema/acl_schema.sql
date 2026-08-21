@@ -70,6 +70,4 @@ CREATE TABLE IF NOT EXISTS acl."grant_columns"("role" VARCHAR, "vcat" VARCHAR, "
 
 INSERT INTO acl."meta" SELECT 'schema_version', '10' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
 
-UPDATE acl."meta" SET "value" = '10' WHERE "key" = 'schema_version' AND CAST("value" AS INTEGER) < 10;
-
 INSERT INTO acl."meta" SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'policy_version');

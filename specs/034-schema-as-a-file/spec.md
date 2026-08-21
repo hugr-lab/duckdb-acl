@@ -50,9 +50,17 @@ spec 033 had to work around. A version the catalog carries is cheaper and works 
 what `InitSchema` runs) and `schema/acl_schema.sql` (names resolved, ready to run). `make schema`
 regenerates; `make schema-check` fails when they are stale.
 
-**The version is compared as a number.** The stamp read `WHERE "value" < '10'` — string order, in
-which `'9' < '10'` is false, so a catalog at 9 would never be re-stamped. Nothing depended on it
-while the version only ever went up on a fresh catalog; the migration contract does.
+**The version is a decision, not a comparison in SQL.** The stamp read `WHERE "value" < '10'` —
+string order, in which `'9' < '10'` is false, so a catalog at 9 would never be re-stamped and no
+migration would ever pick it up. Casting it in SQL fixes the ordering and breaks something else: a
+stamp that is not a number *throws*, leaving a corrupt catalog impossible to re-initialise. The
+schema file only ever inserts the stamp; bringing an existing one up to date happens in C++, where
+"unreadable" is a case rather than an exception.
+
+**A catalog says which shape it is, and a build refuses one it does not read.** `schema_version` was
+reported by `acl_status()` and checked by nothing, so applying the wrong version's file surfaced as a
+missing column in the middle of somebody's query. `acl_use_db` now refuses it by name, with both
+numbers — the failure a hand-applied schema makes possible is the one worth catching early.
 
 **Only the duckdb dialect is rendered.** A hand-rolled per-dialect renderer — T-SQL batch guards,
 `IF OBJECT_ID`, type maps — is a second thing to keep correct, and the schema is plain SQL that a
@@ -80,6 +88,11 @@ narrow two rows to one.
 
 `make schema-check`: the rendered files regenerate byte-identically, and `schema/acl_schema.sql`
 applied to an empty database serves a real policy with init disabled.
+
+`test/sql/acl_schema_version.test` (23 assertions): a stamp from another version refused with both
+numbers, a missing one and an unreadable one each refused by their own reason, `acl_use_db(…, true)`
+making any of them current again rather than refusing, and the check happening where the catalog is
+chosen rather than in the middle of a query.
 
 The behaviour of the schema itself is covered where it always was — every catalog-backed test
 initialises it, so the whole suite is the regression test for the rendering being faithful. Both

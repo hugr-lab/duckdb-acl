@@ -33,9 +33,12 @@ static const char *const ACL_SCHEMA_SQL[] = {
     "CREATE TABLE IF NOT EXISTS <reference_columns>(\"vcat\" ACL_KEY_TEXT, \"name\" ACL_KEY_TEXT, \"pos\" INTEGER, \"side\" ACL_KEY_TEXT, \"column\" VARCHAR, \"param\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\", \"pos\", \"side\"))",
     "CREATE TABLE IF NOT EXISTS <grant_columns>(\"role\" ACL_KEY_TEXT, \"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"pos\" INTEGER, \"name\" VARCHAR, \"type\" VARCHAR, PRIMARY KEY (\"role\", \"vcat\", \"vname\", \"pos\"))",
     "INSERT INTO <meta> SELECT 'schema_version', '10' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'schema_version')",
-    "UPDATE <meta> SET \"value\" = '10' WHERE \"key\" = 'schema_version' AND CAST(\"value\" AS INTEGER) < 10",
     "INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'policy_version')",
 };
+
+//! The version this schema is. A catalog carries its own in `meta`, and a build refuses one
+//! that does not match: the migration contract rests on the two being comparable (spec 034).
+static constexpr int ACL_SCHEMA_VERSION = 10;
 
 } // namespace acl
 } // namespace duckdb

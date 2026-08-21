@@ -68,6 +68,15 @@ def read_statements(path):
     return statements
 
 
+def schema_version(statements):
+    """The version the schema stamps into `meta` - the one statement that says what this shape is."""
+    for _, _, sql in statements:
+        found = re.search(r"'schema_version', '(\d+)'", sql)
+        if found:
+            return int(found.group(1))
+    raise SystemExit("gen_schema: the schema does not stamp a schema_version")
+
+
 def cpp_literal(text):
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -89,8 +98,14 @@ def write_header(statements):
     ]
     for _, _, sql in statements:
         out.append("    " + cpp_literal(sql) + ",")
+    version = schema_version(statements)
     out += [
         "};",
+        "",
+        "//! The version this schema is. A catalog carries its own in `meta`, and a build refuses one",
+        "//! that does not match: the migration contract rests on the two being comparable (spec 034).",
+        "static constexpr int ACL_SCHEMA_VERSION = %d;" % version,]
+    out += [
         "",
         "} // namespace acl",
         "} // namespace duckdb",

@@ -18,8 +18,9 @@
 --
 -- Every table carries a primary key: sources without rowids need one for DELETE/UPDATE.
 --
--- The version is compared as a number, not as text: '9' < '10' is false in string order, and a
--- catalog that never gets re-stamped is one no migration would ever pick up.
+-- The stamp is only ever *inserted* here: bringing an existing one up to date is a decision about
+-- versions, which the extension makes in C++ where a value that is not a number is a case rather
+-- than an exception (spec 034).
 
 -- @section schema
 -- The tables as they are now: a catalog is created complete, in one statement each, and stamped with
@@ -82,6 +83,5 @@ CREATE TABLE IF NOT EXISTS <grant_columns>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_T
 
 INSERT INTO <meta> SELECT 'schema_version', '10' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
-UPDATE <meta> SET "value" = '10' WHERE "key" = 'schema_version' AND CAST("value" AS INTEGER) < 10;
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');

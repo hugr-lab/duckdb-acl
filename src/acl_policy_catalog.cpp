@@ -1904,6 +1904,30 @@ struct CatalogBackend {
 		return out;
 	}
 
+	//! The catalog says which shape it is; this build knows one. A schema applied by hand (spec 034)
+	//! is the case that makes them differ, and the failure without this check is a missing column in
+	//! the middle of somebody's query rather than a word at the moment the catalog is chosen.
+	void RequireSchemaVersion() {
+		auto stored = MetaValue("schema_version");
+		if (stored.empty()) {
+			throw BinderException("acl catalog: \"%s\".\"%s\" has no schema_version - it is not an acl policy "
+			                      "schema, or it was applied without the version stamp (see schema/acl_schema.sql)",
+			                      db_name, schema);
+		}
+		int64_t version = 0;
+		try {
+			version = std::stoll(stored);
+		} catch (std::exception &) {
+			throw BinderException("acl catalog: \"%s\".\"%s\" has schema_version \"%s\", which is not a number",
+			                      db_name, schema, stored);
+		}
+		if (version != ACL_SCHEMA_VERSION) {
+			throw BinderException("acl catalog: \"%s\".\"%s\" is schema version %lld, this build reads %d - apply "
+			                      "the matching schema/acl_schema.sql, or let acl_use_db(..., true) create it",
+			                      db_name, schema, version, ACL_SCHEMA_VERSION);
+		}
+	}
+
 	//! What a key column is declared as, by the kind of catalog it lives in. Everywhere but SQL Server
 	//! that is a plain VARCHAR; the mssql scanner maps every VARCHAR - length or not - to
 	//! NVARCHAR(MAX), which SQL Server refuses to index, so key columns take its own bounded type.
@@ -1942,6 +1966,23 @@ struct CatalogBackend {
 				throw BinderException("acl catalog: init failed at [%s]: %s", sql, result->GetError());
 			}
 		}
+		// bringing an existing stamp up to date is a decision about versions, not a comparison SQL
+		// should make: `CAST(value AS INTEGER)` throws on a stamp that is not a number, which left a
+		// corrupt catalog impossible to re-initialise (spec 034).
+		auto stored = MetaValue("schema_version");
+		int64_t version = -1;
+		try {
+			version = stored.empty() ? -1 : std::stoll(stored);
+		} catch (std::exception &) {
+			version = -1; // unreadable: init is exactly the moment to make it current
+		}
+		if (version != ACL_SCHEMA_VERSION) {
+			auto stamp = con.Query("UPDATE " + Tbl("meta") + " SET \"value\" = '" + std::to_string(ACL_SCHEMA_VERSION) +
+			                       "' WHERE \"key\" = 'schema_version'");
+			if (stamp->HasError()) {
+				throw BinderException("acl catalog: could not stamp the schema version: %s", stamp->GetError());
+			}
+		}
 	}
 };
 
@@ -1961,7 +2002,8 @@ void PolicyStore::EnableCatalog(DatabaseInstance &db, const string &db_name, con
 	if (init) {
 		backend->InitSchema();
 	}
-	backend->EnsureFresh(); // validates reachability and the schema before switching over
+	backend->RequireSchemaVersion(); // spec 034: a schema applied by hand must be the one this build reads
+	backend->EnsureFresh();          // validates reachability and the schema before switching over
 	lock_guard<mutex> guard(lock);
 	catalog = std::move(backend);
 }
