@@ -25,5 +25,9 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 string BakeTemplateForProbe(const string &sql, const ParserOptions &options, bool expression,
                             const vector<string> &param_types);
 
+//! The (qualifier, column) pairs an expression names. Every reference must be qualified: without a
+//! side we cannot tell whose column it is, and a reference is only visible when its columns are.
+vector<std::pair<string, string>> QualifiedColumnRefs(const string &expression, const ParserOptions &options);
+
 } // namespace acl
 } // namespace duckdb

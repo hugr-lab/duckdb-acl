@@ -1,0 +1,289 @@
+# name: test/sql/acl_references.test
+# description: declared join paths between objects (spec 022) - a hint an agent reads, never enforced,
+#   and visible only when both ends and every column it names are visible to the role
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, customer_id INT, amount INT, secret VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.customers(id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.rates(plan VARCHAR, rate INT);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.customers AS phys.main.customers;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.rates AS phys.main.rates;
+
+# --- declaring ------------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM c.orders TO c.customers
+    ON (customer_id = id) CARDINALITY many_to_one COMMENT 'the ordering customer';
+
+# a reference may be arbitrary SQL rather than an equality, and the join method is part of what it
+# means: an ASOF match is one row, the same condition as a plain join fans out
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.order_rate FROM orders TO rates
+    ON EXPRESSION 'orders.amount >= rates.rate' CARDINALITY many_to_one OPTIONAL JOIN asof;
+
+# the columns of the expression are extracted when it is written, so visibility is a lookup later
+query III
+SELECT name, side, "column" FROM aclcat.acl.reference_columns WHERE name = 'order_rate' ORDER BY pos;
+----
+order_rate	from	amount
+order_rate	to	rate
+
+query IIIII
+SELECT name, from_vname, to_vname, cardinality, join_method FROM aclcat.acl."references" ORDER BY name;
+----
+order_rate	orders	rates	many_to_one	asof
+orders_customer	orders	customers	many_to_one	NULL
+
+# --- what is refused where it is written ------------------------------------------------------------
+
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.bad_end FROM orders TO nowhere ON (id = id);
+----
+<REGEX>:.*"nowhere" is not an object of "c".*
+
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.bad_col FROM orders TO customers ON (nope = id);
+----
+<REGEX>:.*"orders" has no column "nope".*
+
+# an expression must name the side of every column: without a side there is no way to tell whose
+# column it is, and so no way to check it against what a role sees
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.bare FROM orders TO customers ON EXPRESSION 'customer_id = customers.id';
+----
+<REGEX>:.*is not qualified.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.stray FROM orders TO customers ON EXPRESSION 'orders.id = elsewhere.id';
+----
+<REGEX>:.*"elsewhere" names neither end.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.dup FROM orders TO customers ON (customer_id = id) CARDINALITY nonsense;
+----
+<REGEX>:.*unknown cardinality.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers ON (customer_id = id);
+----
+<REGEX>:.*already exists.*
+
+# --- what a role sees -------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE full;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE full MAIN;
+
+query IIIIII
+ACL ROLE "full" SELECT name, from_object, to_object, from_columns, to_columns, comment
+    FROM acl_references() ORDER BY name;
+----
+order_rate	orders	rates	amount	rate	NULL
+orders_customer	orders	customers	customer_id	id	the ordering customer
+
+# the argument narrows to one object's references - what an agent asks before writing a query
+query I
+ACL ROLE "full" SELECT name FROM acl_references('rates');
+----
+order_rate
+
+# --- a reference is only as visible as its ends and its columns ---------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE narrow;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE narrow CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE narrow WITH (select) COLUMNS (id, customer_id, amount);
+
+statement ok
+ACL ADMIN GRANT TABLE c.customers TO ROLE narrow WITH (select);
+
+# `rates` is not granted at all, so the reference into it does not exist for this role
+query I
+ACL ROLE "narrow" SELECT name FROM acl_references() ORDER BY name;
+----
+orders_customer
+
+# a reference over a column the grant hides is hidden with it: naming the column would say it exists
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.by_secret FROM orders TO customers ON (secret = name);
+
+query I
+ACL ROLE "full" SELECT count(*) FROM acl_references() WHERE name = 'by_secret';
+----
+1
+
+query I
+ACL ROLE "narrow" SELECT count(*) FROM acl_references() WHERE name = 'by_secret';
+----
+0
+
+# and the column itself is gone from the metadata too, which is the same rule one level down
+query I
+ACL ROLE "narrow" SELECT count(*) FROM information_schema.columns
+    WHERE table_name = 'orders' AND column_name = 'secret';
+----
+0
+
+# --- a view is an end like any other, and a table function is a lateral call -------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.big_orders AS SELECT id, customer_id FROM phys.main.orders WHERE amount > 50;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.orders_of(cust INTEGER) RETURNS TABLE (id INTEGER, dest VARCHAR) AS
+    SELECT id, secret AS dest FROM phys.main.orders WHERE customer_id = acl_arg(1);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.all_orders() RETURNS TABLE (id INTEGER, customer_id INTEGER) AS
+    SELECT id, customer_id FROM phys.main.orders;
+
+# a view needs nothing special: it is a relation of the catalog, and its columns come from the probe
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.big_to_customer FROM big_orders TO customers ON (customer_id = id);
+
+# a table function takes arguments, so the parenthesis after its name is the substitution - which
+# column of the source row feeds which parameter - while ON, when present, is the join condition on
+# the function's result. Pure substitution needs no condition at all.
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.cust_orders FROM customers TO FUNCTION orders_of(cust => id)
+    CARDINALITY one_to_many COMMENT 'the orders of this customer';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.local_orders FROM customers TO FUNCTION orders_of(cust => id)
+    ON EXPRESSION 'customers.name = orders_of.dest';
+
+# and a function may be joined on its result alone, with no arguments at all
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.any_order FROM customers TO FUNCTION all_orders ON (id = customer_id);
+
+query IIIIII
+ACL ROLE "full" SELECT name, to_object, to_kind, arguments, from_columns, to_columns
+    FROM acl_references() WHERE to_kind = 'function' ORDER BY name;
+----
+any_order	all_orders	function	NULL	id	customer_id
+cust_orders	orders_of	function	cust => id	NULL	NULL
+local_orders	orders_of	function	cust => id	name	dest
+
+# a parameter is checked against the declared signature - and only against it: a table function's
+# template carries acl_arg(n) markers, so binding it would prove nothing the declaration does not say
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.bad_param FROM customers TO FUNCTION orders_of(nope => id);
+----
+<REGEX>:.*has no parameter "nope" \(declared: cust\).*
+
+# the condition names columns of the result, which the catalog stores declared or probed
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.bad_result FROM customers TO FUNCTION all_orders ON (id = nothere);
+----
+<REGEX>:.*"all_orders" has no column "nothere".*
+
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.no_fn FROM customers TO FUNCTION nothing(cust => id);
+----
+<REGEX>:.*"nothing" is not a table function of "c".*
+
+# arguments belong to a function end; a relation takes none
+statement error
+SELECT acl_add_reference('c', 'bad_args', 'customers', 'orders', 'relation', 'x => id', 'id = id');
+----
+<REGEX>:.*substitutes arguments, which only a table function end takes.*
+
+# the function is granted like any other object, so a role that cannot call it does not see the
+# reference into it - while the reference between two relations stays
+statement ok
+ACL ADMIN CREATE ROLE nofn;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE nofn CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.customers TO ROLE nofn WITH (select);
+
+statement ok
+ACL ADMIN GRANT TABLE c.big_orders TO ROLE nofn WITH (select);
+
+query II
+ACL ROLE "nofn" SELECT name, to_kind FROM acl_references() ORDER BY name;
+----
+big_to_customer	relation
+
+# --- it stays a hint: nothing is enforced and nothing is granted by it -------------------------------
+
+# the reference does not make the far side readable
+statement error
+ACL ROLE "narrow" SELECT * FROM rates;
+----
+<REGEX>:.*(no access to object|select on).*
+
+# nor does it make a hidden column readable through the object it names
+statement error
+ACL ROLE "narrow" SELECT secret FROM orders;
+----
+<REGEX>:.*secret.*
+
+# --- lifecycle ----------------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN DROP VIRTUAL REFERENCE c.by_secret;
+
+query I
+ACL ROLE "full" SELECT count(*) FROM acl_references() WHERE name = 'by_secret';
+----
+0
+
+statement error
+ACL ADMIN DROP VIRTUAL REFERENCE c.by_secret;
+----
+<REGEX>:.*does not exist.*
+
+statement ok
+ACL ADMIN DROP VIRTUAL REFERENCE IF EXISTS c.by_secret;
+
+# --- the principal's surface is not the operator's ---------------------------------------------------
+# `acl_references` is substituted before the function gate, exactly as the metadata surfaces are, so a
+# principal reads their own view of it without a hole in the gate
+
+statement error
+ACL ROLE "full" SELECT * FROM acl_relations();
+----
+<REGEX>:.*table function "acl_relations" is not allowed.*
+
+statement error
+ACL ROLE "full" SELECT * FROM acl_references('a', 'b');
+----
+<REGEX>:.*takes at most one argument.*

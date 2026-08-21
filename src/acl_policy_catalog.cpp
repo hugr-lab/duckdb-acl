@@ -657,6 +657,13 @@ struct CatalogBackend {
 		terms.push_back("g.\"caps\"");
 		return "coalesce(" + StringUtil::Join(terms, ", ") + ")";
 	}
+	//! The same visibility test as an object's, written against a `functions f` row instead of a
+	//! `relations r` one - a function is granted like any other object of the catalog.
+	string FunctionVisibleExpr() {
+		auto caps = CapsExpr("f.\"vname\"", "f.\"vcat\"");
+		return "(" + caps + " IS NULL OR trim(" + caps + ") = '' OR trim(" + caps + ") <> '{}')";
+	}
+
 	//! The grant chain's policy columns (spec 011): the catalog grant's and the object grant's own RLS
 	//! and column list. The function-driver's slots do not carry them, so it composes to no narrowing.
 	string GrantPolicyExprs() {
@@ -1112,7 +1119,23 @@ struct CatalogBackend {
 		                 schema_visible + ")";
 		// a schema exists for the principal when something inside it does
 		string schemas = "vschemas AS (SELECT vcat, path FROM aliases UNION SELECT vcat, vschema FROM objects)";
-		auto prelude = GrantsCte(principal) + ", " + objects + ", " + aliases + ", " + schemas + " ";
+		// spec 011 narrows columns per grant level, and the listing has to narrow with it: the object
+		// row is kept per role here (unlike `objects`, which collapses them) so that "visible for at
+		// least one role" can be asked column by column.
+		string vfunctions = "vfunctions AS (SELECT DISTINCT f.\"vcat\" AS vcat, f.\"vname\" AS vname FROM " +
+		                    Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" +
+		                    (HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
+		                                           " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
+		                                           " AND oc.\"vname\" = f.\"vname\""
+		                                     : string()) +
+		                    " WHERE f.\"kind\" = 'table' AND " + FunctionVisibleExpr() + ")";
+		string grant_columns = "gcolumns AS (SELECT r.\"vcat\" AS vcat, r.\"vname\" AS vname, g.\"role\" AS role,"
+		                       " g.\"columns\" AS cat_columns, " +
+		                       string(HasObjectCaps() ? "oc.\"columns\"" : "NULL") + " AS obj_columns FROM " +
+		                       Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " +
+		                       visible + ")";
+		auto prelude = GrantsCte(principal) + ", " + objects + ", " + aliases + ", " + schemas + ", " + grant_columns +
+		               ", " + vfunctions + " ";
 		if (surface == "databases") {
 			// one row per granted catalog, and no physical database name ever appears
 			return prelude + "SELECT DISTINCT vcat AS database_name, NULL AS path, NULL AS comment,"
@@ -1142,7 +1165,7 @@ struct CatalogBackend {
 			       " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
 			       " WHERE len(a.parts) = 2";
 		}
-		if (surface != "columns") {
+		if (surface != "columns" && surface != "references") {
 			throw BinderException("acl: unknown metadata surface \"%s\"", surface);
 		}
 		// the columns a role actually sees: an object's own projection when it has one (its rows in
@@ -1155,31 +1178,112 @@ struct CatalogBackend {
 		// shape, for free. Anything else - a projection, a view - is described by its own stored
 		// schema: a masked or computed column has no physical row to borrow, and leaving it out would
 		// hide a column the role can read.
-		return prelude +
-		       "SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
-		       " coalesce(c.\"name\", i.\"column_name\") AS column_name)"
-		       " FROM objects o JOIN information_schema.columns i ON " +
-		       physical + projection +
-		       " AND c.\"expr\" = i.\"column_name\""
-		       " WHERE len(o.parts) = 3 AND o.form = 'alias'"
-		       " AND (c.\"name\" IS NOT NULL OR NOT EXISTS"
-		       " (SELECT 1 FROM " +
-		       Tbl("relation_columns") +
-		       " c2 WHERE c2.\"vcat\" = o.vcat AND c2.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
-		       " ELSE o.vschema || '.' || o.vname END))"
-		       " UNION ALL BY NAME"
-		       " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
-		       " oc.\"name\" AS column_name, oc.\"pos\" + 1 AS ordinal_position, oc.\"type\" AS data_type,"
-		       " oc.\"comment\" AS comment FROM objects o JOIN " +
-		       Tbl("object_columns") +
-		       " oc ON oc.\"vcat\" = o.vcat AND oc.\"kind\" = 'relation'"
-		       " AND oc.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
-		       " ELSE o.vschema || '.' || o.vname END WHERE o.form <> 'alias'"
-		       " UNION ALL BY NAME"
-		       " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema)"
-		       " FROM aliases a JOIN information_schema.columns i"
-		       " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
-		       " WHERE len(a.parts) = 2";
+		string columns_sql =
+		    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
+		           " coalesce(c.\"name\", i.\"column_name\") AS column_name)"
+		           " FROM objects o JOIN information_schema.columns i ON ") +
+		    physical + projection +
+		    " AND c.\"expr\" = i.\"column_name\""
+		    " WHERE len(o.parts) = 3 AND o.form = 'alias'"
+		    " AND (c.\"name\" IS NOT NULL OR NOT EXISTS"
+		    " (SELECT 1 FROM " +
+		    Tbl("relation_columns") +
+		    " c2 WHERE c2.\"vcat\" = o.vcat AND c2.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
+		    " ELSE o.vschema || '.' || o.vname END))"
+		    " UNION ALL BY NAME"
+		    " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
+		    " oc.\"name\" AS column_name, oc.\"pos\" + 1 AS ordinal_position, oc.\"type\" AS data_type,"
+		    " oc.\"comment\" AS comment FROM objects o JOIN " +
+		    Tbl("object_columns") +
+		    " oc ON oc.\"vcat\" = o.vcat AND oc.\"kind\" = 'relation'"
+		    " AND oc.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
+		    " ELSE o.vschema || '.' || o.vname END WHERE o.form <> 'alias'"
+		    " UNION ALL BY NAME"
+		    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema)"
+		    " FROM aliases a JOIN information_schema.columns i"
+		    " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
+		    " WHERE len(a.parts) = 2";
+		// The names a grant states: split the list and take the part before '=' of a masked item. A
+		// mask's expression may itself contain a comma, which splits into a fragment that matches no
+		// column - harmless, since only the names on the left of '=' can ever match one.
+		auto stated = [](const string &column_expr) {
+			return "list_transform(str_split(" + column_expr +
+			       ", ','), lambda y: lower(trim(CASE WHEN position('=' IN y) > 0"
+			       " THEN regexp_extract(y, '^([^=]*)=', 1) ELSE y END)))";
+		};
+		auto keeps = [&](const string &column_expr, const string &name_expr) {
+			return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = '' OR list_contains(" +
+			       stated(column_expr) + ", lower(" + name_expr + ")))";
+		};
+		// Visible for at least one role: a principal may read what any of its roles may (spec 011). A
+		// row with no grant row at all is not an object of the catalog - it is a column of a live
+		// schema alias, whose visibility is the schema's, decided in `aliases` - so it is left alone.
+		auto column_visible = [&](const string &vcat_expr, const string &vname_expr, const string &name_expr) {
+			string key = "gc.vcat = " + vcat_expr + " AND gc.vname = " + vname_expr;
+			return "(NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE " + key + ")" +
+			       " OR EXISTS (SELECT 1 FROM gcolumns gc"
+			       " WHERE " +
+			       key + " AND " + keeps("gc.cat_columns", name_expr) + " AND " + keeps("gc.obj_columns", name_expr) +
+			       "))";
+		};
+		if (surface == "columns") {
+			return prelude + "SELECT * FROM (" + columns_sql + ") l WHERE " +
+			       column_visible("l.table_catalog",
+			                      "CASE WHEN l.table_schema = 'main' THEN l.table_name"
+			                      " ELSE l.table_schema || '.' || l.table_name END",
+			                      "l.column_name");
+		}
+		// spec 022: a reference is visible when both of its ends are, and when every column it names is
+		// a column the role can see. Anything else would describe an object - or a column - the role
+		// has no access to, which is what a listing must never do.
+		auto path = [](const string &alias) {
+			return "CASE WHEN " + alias + ".vschema = 'main' THEN " + alias + ".vname ELSE " + alias +
+			       ".vschema || '.' || " + alias + ".vname END";
+		};
+		string column_path = "CASE WHEN vc.table_schema = 'main' THEN vc.table_name"
+		                     " ELSE vc.table_schema || '.' || vc.table_name END";
+		auto narrowed_columns = "SELECT * FROM (" + columns_sql + ") l WHERE " +
+		                        column_visible("l.table_catalog",
+		                                       "CASE WHEN l.table_schema = 'main' THEN l.table_name"
+		                                       " ELSE l.table_schema || '.' || l.table_name END",
+		                                       "l.column_name");
+		return prelude + ", vcolumns AS (" + narrowed_columns + ") " +
+		       "SELECT r.\"vcat\" AS vcat, r.\"name\" AS name, r.\"from_vname\" AS from_object,"
+		       " r.\"to_vname\" AS to_object,"
+		       // the arguments a function end is called with, and - separately - the columns of the join
+		       // condition: an argument's source column is a `from` column that also names a parameter
+		       " (SELECT string_agg(rc.\"param\" || ' => ' || rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
+		       Tbl("reference_columns") +
+		       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"param\" IS NOT NULL)"
+		       " AS arguments,"
+		       " (SELECT string_agg(rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
+		       Tbl("reference_columns") +
+		       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'from'"
+		       " AND rc.\"param\" IS NULL)"
+		       " AS from_columns,"
+		       " (SELECT string_agg(rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
+		       Tbl("reference_columns") +
+		       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'to')"
+		       " AS to_columns,"
+		       " r.\"to_kind\" AS to_kind, r.\"expr\" AS expression, r.\"cardinality\" AS cardinality,"
+		       " r.\"optional\" AS optional, r.\"join_method\" AS join_method, r.\"comment\" AS comment FROM " +
+		       Tbl("references") + " r WHERE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = r.\"vcat\" AND " +
+		       path("o") + " = r.\"from_vname\")" +
+		       // the far end is an object, or - for a lateral call - a table function the role may use
+		       " AND (CASE WHEN r.\"to_kind\" = 'function'"
+		       " THEN EXISTS (SELECT 1 FROM vfunctions vf WHERE vf.vcat = r.\"vcat\""
+		       " AND vf.vname = r.\"to_vname\")"
+		       " ELSE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = r.\"vcat\" AND " +
+		       path("o") + " = r.\"to_vname\") END)" +
+		       // every column it names must be one the role sees. The `to` side of a lateral call names
+		       // parameters, not columns, so there is nothing there to hide or to check.
+		       " AND NOT EXISTS (SELECT 1 FROM " + Tbl("reference_columns") +
+		       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\""
+		       " AND NOT (r.\"to_kind\" = 'function' AND rc.\"side\" = 'to')"
+		       " AND NOT EXISTS (SELECT 1 FROM vcolumns vc WHERE vc.table_catalog = r.\"vcat\" AND " +
+		       column_path +
+		       " = CASE WHEN rc.\"side\" = 'from' THEN r.\"from_vname\" ELSE r.\"to_vname\" END"
+		       " AND vc.column_name = rc.\"column\"))";
 	}
 
 	//! Targeted gate lookup: only the rows for this name and these roles leave the database ('' as
@@ -1527,6 +1631,19 @@ struct CatalogBackend {
 		return string();
 	}
 
+	//! Whether a relation has a column of that name. False only when the relation itself binds and the
+	//! column does not: a source that cannot be reached at all answers true, since it cannot answer.
+	bool ColumnBinds(const string &source, const string &column) {
+		auto instance = Db();
+		Connection con(*instance);
+		auto base = con.Query("SELECT * FROM " + source + " WHERE false");
+		if (base->HasError()) {
+			return true;
+		}
+		auto quoted = "\"" + StringUtil::Replace(column, "\"", "\"\"") + "\"";
+		return !con.Query("SELECT " + quoted + " FROM " + source + " WHERE false")->HasError();
+	}
+
 	//! "name TYPE, name TYPE" -> the pieces; a bare "TYPE" (a scalar's RETURNS) yields an empty name
 	static vector<std::pair<string, string>> ParseDeclaration(const string &declaration) {
 		vector<std::pair<string, string>> parts;
@@ -1663,9 +1780,23 @@ struct CatalogBackend {
 		    // the declared signature ("name TYPE, …"): it makes a probe meaningful (typed NULLs) and,
 		    // together with a declared result, unnecessary
 		    "ALTER TABLE " + Tbl("functions") + " ADD COLUMN IF NOT EXISTS \"params\" VARCHAR",
-		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '6' WHERE NOT EXISTS (SELECT 1 FROM " +
+		    // spec 022 (schema v7): references - declared join paths between objects of the virtual
+		    // catalog. Not foreign keys: nothing is enforced, the ends may live in different sources,
+		    // and the record is a hint an agent reads. The columns live in their own table so that
+		    // visibility is an anti-join rather than the parsing of a packed string.
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("references") +
+		        "(\"vcat\" VARCHAR, \"name\" VARCHAR, \"from_vname\" VARCHAR, \"to_vname\" VARCHAR,"
+		        " \"to_kind\" VARCHAR, \"expr\" VARCHAR, \"cardinality\" VARCHAR, \"optional\" BOOLEAN,"
+		        " \"join_method\" VARCHAR, \"comment\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\"))",
+		    // one row per column the reference names, with the side it belongs to: 'from' or 'to'.
+		    // A pair join writes two rows per position; an expression writes one row per name it
+		    // mentions, attributed at write time by its qualifier.
+		    "CREATE TABLE IF NOT EXISTS " + Tbl("reference_columns") +
+		        "(\"vcat\" VARCHAR, \"name\" VARCHAR, \"pos\" INTEGER, \"side\" VARCHAR, \"column\" VARCHAR,"
+		        " \"param\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\", \"pos\", \"side\"))",
+		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '7' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
-		    "UPDATE " + Tbl("meta") + " SET \"value\" = '6' WHERE \"key\" = 'schema_version' AND \"value\" < '6'",
+		    "UPDATE " + Tbl("meta") + " SET \"value\" = '7' WHERE \"key\" = 'schema_version' AND \"value\" < '7'",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'policy_version')",
 		};
@@ -1883,6 +2014,257 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 	});
 }
 
+namespace {
+
+//! "a=b" -> the two halves, trimmed; refuses anything else so a typo is not stored as a column name
+std::pair<string, string> SplitPair(const string &text, const string &name) {
+	auto eq = text.find('=');
+	if (eq == string::npos) {
+		throw InvalidInputException("acl: reference \"%s\": \"%s\" is not a column pair (expected from=to)", name,
+		                            text);
+	}
+	auto left = text.substr(0, eq);
+	auto right = text.substr(eq + 1);
+	StringUtil::Trim(left);
+	StringUtil::Trim(right);
+	if (left.empty() || right.empty()) {
+		throw InvalidInputException("acl: reference \"%s\": \"%s\" is not a column pair (expected from=to)", name,
+		                            text);
+	}
+	return {left, right};
+}
+
+} // namespace
+
+void PolicyStore::CatalogAddReference(const string &vcat, const string &name, const string &from_vname,
+                                      const string &to_vname, const string &to_kind, const string &args,
+                                      const string &pairs, const string &expr, const string &cardinality, bool optional,
+                                      const string &join_method, const string &comment) {
+	RequireCatalog(catalog, "acl_add_reference");
+	RequireNotReserved(name);
+	static const case_insensitive_set_t CARDINALITIES = {"many_to_one", "one_to_many", "one_to_one", "many_to_many"};
+	if (!cardinality.empty() && !CARDINALITIES.count(cardinality)) {
+		throw InvalidInputException("acl: reference \"%s\": unknown cardinality \"%s\" (expected many_to_one, "
+		                            "one_to_many, one_to_one or many_to_many)",
+		                            name, cardinality);
+	}
+	static const case_insensitive_set_t METHODS = {"asof", "positional"};
+	if (!join_method.empty() && !METHODS.count(join_method)) {
+		throw InvalidInputException("acl: reference \"%s\": unknown join method \"%s\" (expected asof or "
+		                            "positional)",
+		                            name, join_method);
+	}
+	if (!pairs.empty() && !expr.empty()) {
+		throw InvalidInputException("acl: reference \"%s\" joins either by column pairs or by an expression, not "
+		                            "both",
+		                            name);
+	}
+	bool to_function = StringUtil::CIEquals(to_kind, "function");
+	if (pairs.empty() && expr.empty() && args.empty()) {
+		// a condition may be left out only when the arguments are the whole relationship: the function
+		// is called with the row's values and its result is what the row relates to
+		throw InvalidInputException("acl: reference \"%s\" states neither a join condition nor arguments", name);
+	}
+	if (!args.empty() && !to_function) {
+		throw InvalidInputException("acl: reference \"%s\" substitutes arguments, which only a table function end "
+		                            "takes",
+		                            name);
+	}
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		// a reference between objects that do not exist describes nothing
+		auto require_relation = [&](const string &end) {
+			auto found = read("SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                  " AND \"vname\" = " + Lit(end));
+			if (found->RowCount() == 0) {
+				throw InvalidInputException("acl: reference \"%s\": \"%s\" is not an object of \"%s\"", name, end,
+				                            vcat);
+			}
+		};
+		require_relation(from_vname);
+		// The declared parameters of a table function end. Read, never bound: a template carries
+		// acl_arg(n) markers and its result depends on the arguments, so binding it would prove
+		// nothing the declaration does not already say (spec 010).
+		vector<string> parameters;
+		if (to_function) {
+			auto found = read("SELECT \"params\" FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                  " AND \"vname\" = " + Lit(to_vname) + " AND \"kind\" = 'table'");
+			if (found->RowCount() == 0) {
+				throw InvalidInputException("acl: reference \"%s\": \"%s\" is not a table function of \"%s\"", name,
+				                            to_vname, vcat);
+			}
+			if (!found->GetValue(0, 0).IsNull()) {
+				for (auto &parameter : CatalogBackend::ParseDeclaration(found->GetValue(0, 0).ToString())) {
+					if (!parameter.first.empty()) {
+						parameters.push_back(parameter.first);
+					}
+				}
+			}
+		} else {
+			require_relation(to_vname);
+		}
+		// pos, side, column, parameter ("" unless the column is substituted into an argument)
+		vector<std::tuple<idx_t, string, string, string>> columns;
+		idx_t pos = 0;
+		// An argument substitution names a column of the source row, so it is a `from` column for
+		// every purpose - existence, visibility - and carries the parameter it feeds alongside.
+		for (auto &item : SplitTopLevel(args, ',')) {
+			auto trimmed = item;
+			StringUtil::Trim(trimmed);
+			if (trimmed.empty()) {
+				continue;
+			}
+			auto arrow = trimmed.find("=>");
+			if (arrow == string::npos) {
+				throw InvalidInputException("acl: reference \"%s\": \"%s\" is not an argument (expected "
+				                            "parameter => column)",
+				                            name, trimmed);
+			}
+			auto parameter = trimmed.substr(0, arrow);
+			auto column = trimmed.substr(arrow + 2);
+			StringUtil::Trim(parameter);
+			StringUtil::Trim(column);
+			if (parameter.empty() || column.empty()) {
+				throw InvalidInputException("acl: reference \"%s\": \"%s\" is not an argument (expected "
+				                            "parameter => column)",
+				                            name, trimmed);
+			}
+			columns.emplace_back(pos++, "from", column, parameter);
+		}
+		// the join condition: column pairs read from -> to, or a qualified expression
+		if (!pairs.empty()) {
+			for (auto &item : SplitTopLevel(pairs, ',')) {
+				auto trimmed = item;
+				StringUtil::Trim(trimmed);
+				if (trimmed.empty()) {
+					continue;
+				}
+				auto pair = SplitPair(trimmed, name);
+				columns.emplace_back(pos, "from", pair.first, string());
+				columns.emplace_back(pos, "to", pair.second, string());
+				pos++;
+			}
+		} else if (!expr.empty()) {
+			ParserOptions options;
+			auto from_tail = SplitTopLevel(from_vname, '.').back();
+			auto to_tail = SplitTopLevel(to_vname, '.').back();
+			for (auto &ref : QualifiedColumnRefs(expr, options)) {
+				string side;
+				if (StringUtil::CIEquals(ref.first, from_tail)) {
+					side = "from";
+				} else if (StringUtil::CIEquals(ref.first, to_tail)) {
+					side = "to";
+				} else {
+					throw InvalidInputException("acl: reference \"%s\": \"%s\" names neither end (expected \"%s\" "
+					                            "or \"%s\")",
+					                            name, ref.first, from_tail, to_tail);
+				}
+				columns.emplace_back(pos++, side, ref.second, string());
+			}
+		}
+		if (columns.empty()) {
+			throw InvalidInputException("acl: reference \"%s\" names no columns", name);
+		}
+		// A name the end does not have is a mistake, and it would make the reference invisible to
+		// everyone once visibility is checked. The names are the *virtual* ones - what a role sees -
+		// so they are looked for where the catalog keeps those: a declared projection first (which is
+		// also where a rename lives), then a probed schema, and finally the physical table itself for
+		// a plain alias, whose columns the catalog does not store. If none of the three can answer -
+		// the source is not attached - the reference is accepted, as spec 021 does for a predicate.
+		for (auto &column : columns) {
+			bool from_side = std::get<1>(column) == "from";
+			auto &end = from_side ? from_vname : to_vname;
+			auto &column_name = std::get<2>(column);
+			auto &parameter = std::get<3>(column);
+			if (!parameter.empty()) {
+				// the parameter side of an argument: the declared signature is the whole truth, and a
+				// function that declares none cannot be judged at all
+				if (!parameters.empty()) {
+					bool declared = false;
+					for (auto &candidate : parameters) {
+						if (StringUtil::CIEquals(candidate, parameter)) {
+							declared = true;
+							break;
+						}
+					}
+					if (!declared) {
+						throw InvalidInputException("acl: reference \"%s\": \"%s\" has no parameter \"%s\" "
+						                            "(declared: %s)",
+						                            name, to_vname, parameter, StringUtil::Join(parameters, ", "));
+					}
+				}
+			}
+			auto missing = [&]() {
+				throw InvalidInputException("acl: reference \"%s\": \"%s\" has no column \"%s\"", name, end,
+				                            column_name);
+			};
+			if (!from_side && to_function) {
+				// the far side of the condition names columns of the function's *result*, which the
+				// catalog stores whether they were declared or probed
+				auto known = read("SELECT count(*) FILTER (WHERE \"name\" = " + Lit(column_name) + "), count(*) FROM " +
+				                  catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+				                  " AND \"kind\" = 'table' AND \"vname\" = " + Lit(to_vname));
+				if (known->GetValue(1, 0).GetValue<int64_t>() > 0 && known->GetValue(0, 0).GetValue<int64_t>() == 0) {
+					missing();
+				}
+				continue;
+			}
+			auto declared = read("SELECT count(*) FILTER (WHERE \"name\" = " + Lit(column_name) + "), count(*) FROM " +
+			                     catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                     " AND \"vname\" = " + Lit(end));
+			if (declared->GetValue(1, 0).GetValue<int64_t>() > 0) {
+				if (declared->GetValue(0, 0).GetValue<int64_t>() == 0) {
+					missing();
+				}
+				continue;
+			}
+			auto probed = read("SELECT count(*) FILTER (WHERE \"name\" = " + Lit(column_name) + "), count(*) FROM " +
+			                   catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                   " AND \"kind\" = 'relation' AND \"vname\" = " + Lit(end));
+			if (probed->GetValue(1, 0).GetValue<int64_t>() > 0) {
+				if (probed->GetValue(0, 0).GetValue<int64_t>() == 0) {
+					missing();
+				}
+				continue;
+			}
+			auto phys = read("SELECT \"phys\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                 " AND \"vname\" = " + Lit(end));
+			if (phys->RowCount() == 0 || phys->GetValue(0, 0).IsNull()) {
+				continue;
+			}
+			auto source = phys->GetValue(0, 0).ToString();
+			if (!catalog->ColumnBinds(source, column_name)) {
+				missing();
+			}
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("reference_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"name\" = " + Lit(name));
+		statements.push_back("DELETE FROM " + catalog->Tbl("references") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"name\" = " + Lit(name));
+		statements.push_back(
+		    "INSERT INTO " + catalog->Tbl("references") + " VALUES (" + Lit(vcat) + ", " + Lit(name) + ", " +
+		    Lit(from_vname) + ", " + Lit(to_vname) + ", " + Lit(to_function ? "function" : "relation") + ", " +
+		    (expr.empty() ? string("NULL") : Lit(expr)) + ", " +
+		    (cardinality.empty() ? string("NULL") : Lit(cardinality)) + ", " + (optional ? "true" : "false") + ", " +
+		    (join_method.empty() ? string("NULL") : Lit(join_method)) + ", " +
+		    (comment.empty() ? string("NULL") : Lit(comment)) + ")");
+		for (auto &column : columns) {
+			statements.push_back("INSERT INTO " + catalog->Tbl("reference_columns") + " VALUES (" + Lit(vcat) + ", " +
+			                     Lit(name) + ", " + std::to_string(std::get<0>(column)) + ", " +
+			                     Lit(std::get<1>(column)) + ", " + Lit(std::get<2>(column)) + ", " +
+			                     (std::get<3>(column).empty() ? string("NULL") : Lit(std::get<3>(column))) + ")");
+		}
+	});
+}
+
+void PolicyStore::CatalogDropReference(const string &vcat, const string &name) {
+	RequireCatalog(catalog, "acl_drop_reference");
+	catalog->Write({"DELETE FROM " + catalog->Tbl("reference_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                    " AND \"name\" = " + Lit(name),
+	                "DELETE FROM " + catalog->Tbl("references") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                    " AND \"name\" = " + Lit(name)});
+}
+
 void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path,
                                         const string &origin) {
 	RequireCatalog(catalog, "acl_add_schema_alias");
@@ -2011,6 +2393,9 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	                       " \"derived\" FROM %s"},
 	    {"functions", "SELECT \"vcat\", \"vname\", \"kind\", \"form\", \"target\", \"template\", \"params\","
 	                  " \"comment\" FROM %s"},
+	    {"references", "SELECT \"vcat\", \"name\", \"from_vname\", \"to_vname\", \"to_kind\", \"expr\","
+	                   " \"cardinality\", \"optional\", \"join_method\", \"comment\" FROM %s"},
+	    {"reference_columns", "SELECT \"vcat\", \"name\", \"pos\", \"side\", \"column\", \"param\" FROM %s"},
 	    {"roles", "SELECT \"role\", \"comment\" FROM %s"},
 	    {"role_claims", "SELECT \"role\", \"claim\", \"value\" FROM %s"},
 	    {"grants", "SELECT \"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\" FROM %s"},
@@ -2029,6 +2414,8 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"relation_columns", "relation_columns"},
 	    {"object_columns", "object_columns"},
 	    {"functions", "functions"},
+	    {"references", "references"},
+	    {"reference_columns", "reference_columns"},
 	    {"roles", "roles"},
 	    {"role_claims", "role_claims"},
 	    {"grants", "role_catalogs"},
@@ -2934,6 +3321,9 @@ bool PolicyStore::CatalogObjectExists(const string &vcat, const string &vname, c
 	} else if (kind == "relation") {
 		sql = "SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 		      " AND \"vname\" = " + Lit(vname);
+	} else if (kind == "reference") {
+		sql = "SELECT 1 FROM " + catalog->Tbl("references") + " WHERE \"vcat\" = " + Lit(vcat) +
+		      " AND \"name\" = " + Lit(vname);
 	} else {
 		// a function's kind is part of its identity: a table function and a scalar may share a name
 		sql = "SELECT 1 FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +

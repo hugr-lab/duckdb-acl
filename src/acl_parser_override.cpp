@@ -464,7 +464,7 @@ bool IsMgmtStart(const string &text) {
 		// DROP: our own forms carry VIRTUAL, and duckdb has no DROP ROLE/ISSUER/MAP/RELATION
 		return StringUtil::CIEquals(second, "relation") || StringUtil::CIEquals(second, "virtual") ||
 		       StringUtil::CIEquals(second, "role") || StringUtil::CIEquals(second, "issuer") ||
-		       StringUtil::CIEquals(second, "map");
+		       StringUtil::CIEquals(second, "map") || StringUtil::CIEquals(second, "reference");
 	}
 	return false;
 }
@@ -497,6 +497,73 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 		string comment;
 		comment_clause(s, comment);
 		return MakeAdminCall("acl_create_catalog", {Value(vcat), Value(comment), Value(mode)});
+	}
+	if (s.Accept("reference")) {
+		// CREATE VIRTUAL REFERENCE v.name FROM <object> TO <object>
+		//     ON (from_col = to_col, …) | ON EXPRESSION '<sql>'
+		//     [CARDINALITY <kind>] [OPTIONAL] [JOIN <method>] [COMMENT '…']
+		if_not_exists(s);
+		string vcat, name;
+		SplitVirtual(s.Dotted("a virtual name"), vcat, name);
+		//! an endpoint may be written with or without the reference's own catalog in front of it
+		auto endpoint = [&s, &vcat]() {
+			auto written = s.Dotted("an object name");
+			auto prefix = vcat + ".";
+			if (written.size() > prefix.size() && StringUtil::CIEquals(written.substr(0, prefix.size()), prefix)) {
+				return written.substr(prefix.size());
+			}
+			return written;
+		};
+		s.Expect("from");
+		auto from_vname = endpoint();
+		s.Expect("to");
+		// TO FUNCTION f(param => col, …): the parenthesis is the argument substitution - which column
+		// of the source row feeds which parameter - and ON, when present, is the join condition on the
+		// function's result. Pure substitution needs no condition at all.
+		bool to_function = s.Accept("function");
+		auto to_vname = endpoint();
+		string call_args;
+		if (to_function) {
+			call_args = s.Parens();
+		}
+		string pairs, expr;
+		if (s.Accept("on")) {
+			// a bare list is a list of column pairs; SQL is spelled out, so neither can be mistaken
+			// for the other and a qualified name never reads as a column name
+			if (s.Accept("expression")) {
+				expr = s.Quoted("a join expression");
+			} else {
+				pairs = s.List("column pairs");
+			}
+		} else if (!to_function) {
+			throw BinderException("acl admin: a reference between objects needs an ON condition");
+		}
+		string cardinality, join_method, comment;
+		bool optional = false;
+		for (bool more = true; more;) {
+			more = false;
+			if (s.Accept("cardinality")) {
+				cardinality = s.Word("a cardinality");
+				more = true;
+			}
+			if (s.Accept("optional")) {
+				optional = true;
+				more = true;
+			}
+			if (s.Accept("join")) {
+				join_method = s.Word("a join method");
+				more = true;
+			}
+			if (s.Accept("comment")) {
+				comment = s.Quoted("comment");
+				more = true;
+			}
+		}
+		return MakeAdminCall("acl_add_reference",
+		                     {Value(vcat), Value(name), Value(from_vname), Value(to_vname),
+		                      Value(to_function ? "function" : "relation"), Value(call_args), Value(pairs), Value(expr),
+		                      Value(cardinality), Value(optional ? "true" : "false"), Value(join_method),
+		                      Value(comment), Value(mode)});
 	}
 	if (s.Accept("schema")) {
 		// CREATE VIRTUAL SCHEMA v.path AS <phys> - the live alias, resolves through
@@ -980,6 +1047,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname), Value(mode)});
 		}
+		if (s.Accept("reference")) {
+			if_exists(s);
+			string vcat, name;
+			SplitVirtual(s.Dotted("a virtual name"), vcat, name);
+			return MakeAdminCall("acl_drop_reference", {Value(vcat), Value(name), Value(mode)});
+		}
 		if (s.Accept("role")) {
 			if_exists(s);
 			return MakeAdminCall("acl_drop_role", {Value(s.Word("a role name")), Value(mode)});
@@ -1035,6 +1108,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname), Value(mode)});
+		}
+		if (s.Accept("reference")) {
+			if_exists(s);
+			string vcat, name;
+			SplitVirtual(s.Dotted("a virtual name"), vcat, name);
+			return MakeAdminCall("acl_drop_reference", {Value(vcat), Value(name), Value(mode)});
 		}
 		throw BinderException("acl admin: unknown DROP VIRTUAL target");
 	}
