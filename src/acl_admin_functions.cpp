@@ -908,6 +908,47 @@ void AclMapRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! acl_session_open(token): verify a token once and mint an opaque handle for it (spec 040). NULL
+//! when it does not verify - a door refuses rather than learning why.
+void AclSessionOpenFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto token = RequiredArg(args, 0, row, "acl_session_open", "token");
+		auto handle = StoreOf(state).SessionOpen(token);
+		if (handle.empty()) {
+			result.SetValue(row, Value());
+			continue;
+		}
+		result.SetValue(row, Value(handle));
+	}
+}
+
+//! acl_session_sql(handle, sql): the statement to run, with the session's prefix in front of it.
+//! NULL when the session is not usable, which is the whole of a door's decision.
+void AclSessionSqlFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto handle = RequiredArg(args, 0, row, "acl_session_sql", "handle");
+		auto sql = RequiredArg(args, 1, row, "acl_session_sql", "sql");
+		Principal principal;
+		string reason;
+		if (!StoreOf(state).SessionPrincipal(handle, principal, reason)) {
+			result.SetValue(row, Value());
+			continue;
+		}
+		result.SetValue(row, Value("ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + sql));
+	}
+}
+
+//! acl_session_close(handle): end it. Idempotent, so a door may retry a disconnect.
+void AclSessionCloseFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		StoreOf(state).SessionClose(RequiredArg(args, 0, row, "acl_session_close", "handle"));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
 //! acl_define_token(token, role, claims_csv): bind a non-JWT token to a principal - the dev stub
 //! (a JWT-shaped token always takes the real verification path, spec 007).
 void AclDefineTokenFunc(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -1052,6 +1093,16 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_grant_scalar_alias", {v, v, v}, AclGrantScalarAliasFunc);
 	register_admin("acl_deny_function", {v}, AclDenyFunctionFunc);
 	register_admin("acl_allow_function", {v}, AclAllowFunctionFunc);
+	// the session contract both doors stand on (spec 040): open once, prefix every statement, close
+	auto register_session_text = [&](const string &name, vector<LogicalType> arguments, scalar_function_t fn) {
+		ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::VARCHAR, fn);
+		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+		function.SetFallible();
+		loader.RegisterFunction(function);
+	};
+	register_session_text("acl_session_open", {v}, AclSessionOpenFunc);
+	register_session_text("acl_session_sql", {v, v}, AclSessionSqlFunc);
+	register_admin("acl_session_close", {v}, AclSessionCloseFunc);
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);
 	register_admin_set("acl_define_role", {{v, v}, {v, v, v}}, AclDefineRoleFunc);
 	// offline JWT verification (spec 007)

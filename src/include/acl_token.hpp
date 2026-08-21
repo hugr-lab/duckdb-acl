@@ -16,6 +16,9 @@ struct JwtClaims {
 	vector<string> raw_roles;              // values of the role claim, before mapping
 	case_insensitive_map_t<string> claims; // extracted via claim_map
 	bool groups_overage = false;           // EntraID groups overage marker present
+	//! The token's `exp`, as seconds since the epoch. Verified here; kept so a session minted from
+	//! this token can be refused once it passes, without holding the token itself (spec 040).
+	int64_t expires_at = 0;
 };
 
 //! Structural check only: three base64url segments with a JSON header carrying an alg.

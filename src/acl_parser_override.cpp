@@ -19,7 +19,7 @@ namespace acl {
 namespace {
 
 struct AclPrefix {
-	enum class Kind { NONE, ROLE, TOKEN, ADMIN };
+	enum class Kind { NONE, ROLE, TOKEN, SESSION, ADMIN };
 	//! What the remainder is, decided by the marker the CLIENT writes (the gateway only prepends the
 	//! principal, so the client itself asks for anything beyond an ordinary query):
 	//!   <sql>              -> QUERY:  rewritten inside the principal's virtual catalog
@@ -109,14 +109,17 @@ AclPrefix ParseAclPrefix(const string &query) {
 	}
 	bool is_role = StringUtil::CIEquals(mode, "role");
 	bool is_token = StringUtil::CIEquals(mode, "token");
-	if (!is_role && !is_token) {
+	// a session stands for a token a door already verified, so the handle rides where the token did
+	// and everything after it - the markers, the batch - reads the same way (spec 040)
+	bool is_session = StringUtil::CIEquals(mode, "session");
+	if (!is_role && !is_token && !is_session) {
 		return prefix; // "ACL <unknown>" -> leave for the native parser (NONE)
 	}
 	SkipWhitespace(query, pos);
 	if (pos >= query.size() || (query[pos] != '\'' && query[pos] != '"')) {
 		throw ParserException("acl_rewrite: ACL %s requires a quoted value", mode);
 	}
-	prefix.kind = is_role ? AclPrefix::Kind::ROLE : AclPrefix::Kind::TOKEN;
+	prefix.kind = is_role ? AclPrefix::Kind::ROLE : (is_session ? AclPrefix::Kind::SESSION : AclPrefix::Kind::TOKEN);
 	prefix.value = ReadQuoted(query, pos);
 	prefix.mode = read_marker(pos);
 	prefix.marked = prefix.mode != AclPrefix::Mode::QUERY;
@@ -1272,6 +1275,23 @@ struct AclParseGuard {
 	}
 };
 
+//! The principal a prefix stands for. A role is itself, a token is verified here, and a session is a
+//! handle a door already exchanged a token for (spec 040) - so this is the one place that turns any
+//! of the three into a principal, and the one place that refuses.
+void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &out) {
+	if (prefix.kind == AclPrefix::Kind::SESSION) {
+		string reason;
+		if (!store.SessionPrincipal(prefix.value, out, reason)) {
+			throw BinderException("acl_rewrite: session %s", reason);
+		}
+		return;
+	}
+	bool is_token = prefix.kind == AclPrefix::Kind::TOKEN;
+	if (!store.VerifyPrincipal(is_token, prefix.value, out)) {
+		throw BinderException("acl_rewrite: %s verification failed", is_token ? "token" : "role");
+	}
+}
+
 ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &query, ParserOptions &options) {
 	if (InAclParse()) {
 		return ParserOverrideResult(); // our own inner parse: decline, and let the others try
@@ -1301,10 +1321,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		}
 	} else if (mode != AclPrefix::Mode::QUERY) {
 		// leaving the virtual catalog - as management or as native SQL - is a granted capability
-		bool is_token = prefix.kind == AclPrefix::Kind::TOKEN;
-		if (!store.VerifyPrincipal(is_token, prefix.value, principal)) {
-			throw BinderException("acl_rewrite: %s verification failed", is_token ? "token" : "role");
-		}
+		ResolvePrincipal(store, prefix, principal);
 		rights = store.AdminRightsOf(principal);
 		if (rights.scope == AdminScope::NONE) {
 			throw BinderException("acl admin: the principal has no ACL administration scope");
@@ -1344,10 +1361,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		return ParserOverrideResult(std::move(statements)); // no rewrite: the native context
 	}
 
-	bool is_token = prefix.kind == AclPrefix::Kind::TOKEN;
-	if (!store.VerifyPrincipal(is_token, prefix.value, principal)) {
-		throw BinderException("acl_rewrite: %s verification failed", is_token ? "token" : "role");
-	}
+	ResolvePrincipal(store, prefix, principal);
 
 	RewriteStatements(statements, principal, options, store);
 	return ParserOverrideResult(std::move(statements));

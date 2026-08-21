@@ -3,6 +3,10 @@
 #include "acl_token.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/blob.hpp"
+
+#include <chrono>
+#include <random>
 #include "duckdb/parser/parser.hpp"
 
 namespace duckdb {
@@ -148,6 +152,107 @@ unique_ptr<ParsedExpression> PolicyStore::InstantiateExpr(const string &expr, co
 		}
 		return std::move(expressions[0]);
 	});
+}
+
+namespace {
+
+//! Seconds since the epoch, for judging a session's `exp` the same way the verifier judged it.
+int64_t NowSeconds() {
+	return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+	    .count();
+}
+
+//! A handle a client cannot guess: 128 bits from the platform's entropy source, hex-encoded. Never
+//! derived from the token, so holding one tells nothing about it (spec 040).
+//!
+//! `std::random_device` rather than duckdb's own utilities, deliberately: `RandomEngine` seeds from
+//! the clock off Linux, and the encryption util refuses to generate randomness unless OpenSSL arrived
+//! with httpfs (its mbedTLS fallback demands `force_mbedtls_unsafe`). On glibc, libc++ and MSVC the
+//! device is the OS CSPRNG - `getrandom`, `arc4random` and `rand_s` respectively.
+//!
+//! The one implementation that was not is MinGW's before GCC 9.2, where it returned a fixed sequence.
+//! That failure is silent and total, so it is checked for rather than assumed: two independent
+//! devices agreeing on 64 bits means the device is deterministic, and a handle from it would be
+//! guessable by anyone with the same toolchain. Refusing to mint beats minting that.
+string MintHandle() {
+	constexpr idx_t HANDLE_BYTES = 16;
+	std::random_device source;
+	{
+		std::random_device other;
+		if (source() == other() && source() == other()) {
+			throw InternalException("acl: this build's std::random_device is deterministic, so a session handle "
+			                        "would be guessable - refusing to mint one");
+		}
+	}
+	data_t bytes[HANDLE_BYTES];
+	for (idx_t i = 0; i < HANDLE_BYTES; i += 4) {
+		auto word = static_cast<uint32_t>(source());
+		for (idx_t byte = 0; byte < 4; byte++) {
+			bytes[i + byte] = static_cast<data_t>((word >> (8 * byte)) & 0xFF);
+		}
+	}
+	string handle(HANDLE_BYTES * 2, '\0');
+	for (idx_t i = 0; i < HANDLE_BYTES; i++) {
+		handle[2 * i] = Blob::HEX_TABLE[bytes[i] >> 4];
+		handle[2 * i + 1] = Blob::HEX_TABLE[bytes[i] & 0x0F];
+	}
+	return handle;
+}
+
+} // namespace
+
+string PolicyStore::SessionOpen(const string &token) {
+	Principal principal;
+	int64_t expires_at = 0;
+	string issuer;
+	if (LooksLikeJwt(token, issuer)) {
+		// the real path: whatever refuses a token in the prefix refuses it here, and for the same
+		// reason - a session must never be a way to get in with something a prefix would reject
+		IssuerConfig config;
+		if (!LookupIssuer(issuer, config)) {
+			return string();
+		}
+		config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
+		JwtClaims verified;
+		try {
+			verified = VerifyJwt(token, config, JwtClockSkew());
+		} catch (std::exception &) {
+			return string(); // the door refuses; it does not learn why
+		}
+		principal.roles = MapExternalRoles(issuer, verified.raw_roles);
+		if (principal.roles.empty()) {
+			return string();
+		}
+		principal.claims = verified.claims;
+		expires_at = verified.expires_at;
+	} else if (!VerifyPrincipal(true, token, principal)) {
+		return string(); // the dev stub, which carries no expiry
+	}
+	auto handle = MintHandle();
+	lock_guard<mutex> guard(lock);
+	sessions[handle] = Session {std::move(principal), expires_at};
+	return handle;
+}
+
+bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string &reason) {
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry == sessions.end()) {
+		reason = "unknown";
+		return false;
+	}
+	if (entry->second.expires_at > 0 && entry->second.expires_at + JwtClockSkew() < NowSeconds()) {
+		sessions.erase(entry); // it can never come back, so do not keep it around
+		reason = "expired";
+		return false;
+	}
+	out = entry->second.principal;
+	return true;
+}
+
+void PolicyStore::SessionClose(const string &handle) {
+	lock_guard<mutex> guard(lock);
+	sessions.erase(handle);
 }
 
 bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal &out) {

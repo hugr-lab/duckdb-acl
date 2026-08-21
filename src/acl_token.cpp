@@ -354,7 +354,8 @@ JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clo
 	if (!exp || !duckdb_yyjson::yyjson_is_num(exp)) {
 		Reject("missing exp claim");
 	}
-	if (duckdb_yyjson::yyjson_get_sint(exp) + clock_skew_seconds < now) {
+	auto expires_at = duckdb_yyjson::yyjson_get_sint(exp);
+	if (expires_at + clock_skew_seconds < now) {
 		Reject("token expired");
 	}
 	auto nbf = duckdb_yyjson::yyjson_obj_get(payload.Root(), "nbf");
@@ -390,6 +391,8 @@ JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clo
 	}
 
 	JwtClaims result;
+	// kept so a session minted from this token can be refused once it passes (spec 040)
+	result.expires_at = expires_at;
 	result.issuer = config.issuer;
 
 	// the roles claim: a string or an array of strings at the configured dot path
