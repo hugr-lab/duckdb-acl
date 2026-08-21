@@ -420,29 +420,30 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN;
 
 statement ok
-ACL ADMIN GRANT OBJECT c.orders TO ROLE auditor COLUMNS (id, initial = tenant[1]);
+ACL ADMIN GRANT OBJECT c.orders TO ROLE auditor COLUMNS (id, tenant = tenant[1]);
 
 query II
 ACL ROLE "auditor" SELECT column_name, data_type FROM duckdb_columns()
 WHERE table_name = 'orders' ORDER BY column_index;
 ----
 id	INTEGER
-initial	VARCHAR
+tenant	VARCHAR
 
 query II
 ACL ROLE "auditor" SELECT sql, column_count FROM duckdb_tables() WHERE table_name = 'orders';
 ----
-CREATE TABLE "orders"("id" INTEGER, "initial" VARCHAR);	2
+CREATE TABLE "orders"("id" INTEGER, "tenant" VARCHAR);	2
 
 query II
 ACL ROLE "auditor" SELECT column_name, column_type FROM (DESCRIBE orders);
 ----
 id	INTEGER
-initial	VARCHAR
+tenant	VARCHAR
 
-# and the role that cannot read `tenant` is not told it exists, in any of the three
+# and the column the grant leaves out is not mentioned in any of the three
 query I
-ACL ROLE "auditor" SELECT count(*) FROM duckdb_columns() WHERE column_name = 'tenant';
+ACL ROLE "auditor" SELECT count(*) FROM duckdb_columns()
+WHERE table_name = 'orders' AND column_name = 'ssn';
 ----
 0
 
@@ -538,7 +539,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG m;
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE m.orders AS phys.main.orders;
+ACL ADMIN CREATE VIRTUAL TABLE m.orders AS phys.main.orders COLUMNS (id, tag = tenant, ssn);
 
 statement ok
 ACL ADMIN CREATE ROLE r1;
@@ -554,10 +555,10 @@ ACL ADMIN GRANT CATALOG m TO ROLE r2 WITH (select) MAIN;
 
 # overlapping plain lists (`id` in both) and the same projection at two different positions
 statement ok
-ACL ADMIN GRANT OBJECT m.orders TO ROLE r1 COLUMNS (id, tag = tenant);
+ACL ADMIN GRANT OBJECT m.orders TO ROLE r1 COLUMNS (id, tag = lower(tenant));
 
 statement ok
-ACL ADMIN GRANT OBJECT m.orders TO ROLE r2 COLUMNS (id, ssn, tag = tenant);
+ACL ADMIN GRANT OBJECT m.orders TO ROLE r2 COLUMNS (id, ssn, tag = lower(tenant));
 
 # roles ["r1","r2"]
 query II

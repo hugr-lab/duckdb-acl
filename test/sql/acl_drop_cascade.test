@@ -116,7 +116,7 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
 
 statement ok
-ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select) COLUMNS (id, marker = dest);
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select) COLUMNS (id, dest = upper(dest));
 
 query I
 SELECT count(*) FROM acl_grant_columns();
@@ -195,7 +195,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL REFERENCE c.crosses FROM c.vs.inner TO orders ON (id = id);
 
 statement ok
-ACL ADMIN GRANT TABLE c.vs.inner TO ROLE g WITH (select) COLUMNS (id, k = kind);
+ACL ADMIN GRANT TABLE c.vs.inner TO ROLE g WITH (select) COLUMNS (id, kind = upper(kind));
 
 query I
 SELECT count(*) FROM acl_grant_columns() WHERE vname = 'vs.inner';
@@ -243,7 +243,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL REFERENCE c.last FROM customers TO orders ON (id = cust);
 
 statement ok
-ACL ADMIN GRANT TABLE c.customers TO ROLE g WITH (select) COLUMNS (id, town = city);
+ACL ADMIN GRANT TABLE c.customers TO ROLE g WITH (select) COLUMNS (id, city = upper(city));
 
 statement ok
 ACL ADMIN DROP VIRTUAL CATALOG c CASCADE;

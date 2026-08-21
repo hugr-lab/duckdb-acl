@@ -1,0 +1,139 @@
+# name: test/sql/acl_grant_scope.test
+# description: a grant hides and masks; naming, computing and ordering belong to the virtual catalog
+#   (spec 037)
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR, amount INTEGER, ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 100, 'secret');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+# a plain alias: what it exposes is what the source has
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.plain AS phys.main.orders;
+
+# and an object that does state its shape - naming, computing and ordering, all of it the catalog's
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.shaped AS phys.main.orders
+    COLUMNS (order_id = id, tag = tenant, initial = tenant[1]);
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select) MAIN;
+
+# --- what a grant may do: hide, and mask what it keeps ------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, tenant, ssn = NULL);
+
+query IIII
+ACL ROLE "r" SELECT *, 1 FROM plain;
+----
+1	acme	NULL	1
+
+# a mask's expression still runs over the physical row, so it may read a column the grant hides
+statement ok
+ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, tenant = tenant || '/' || ssn);
+
+query II
+ACL ROLE "r" SELECT * FROM plain;
+----
+1	acme/secret
+
+# --- what it may not do -------------------------------------------------------------------------------
+# a name the object does not have, whether the object states its shape or not
+
+statement error
+ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, nosuch);
+----
+<REGEX>:.*lists "nosuch", which the object does not have.*
+
+statement error
+ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (id, label = tenant);
+----
+<REGEX>:.*naming, computing and ordering belong to the virtual catalog.*
+
+# the shaped object exposes its own names, so the physical ones are not a grant's to use either
+statement error
+ACL ADMIN GRANT OBJECT c.shaped TO ROLE r COLUMNS (order_id, tenant);
+----
+<REGEX>:.*lists "tenant", which the object does not have.*
+
+statement ok
+ACL ADMIN GRANT OBJECT c.shaped TO ROLE r COLUMNS (order_id, tag);
+
+query II
+ACL ROLE "r" SELECT * FROM shaped;
+----
+1	acme
+
+# --- the written order carries no meaning --------------------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT OBJECT c.plain TO ROLE r COLUMNS (ssn = NULL, amount, id);
+
+query III
+ACL ROLE "r" SELECT * FROM plain;
+----
+1	100	NULL
+
+query I
+ACL ROLE "r" SELECT string_agg(column_name, ',') FROM (DESCRIBE plain);
+----
+id,amount,ssn
+
+query I
+ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns()
+WHERE table_name = 'plain';
+----
+id,amount,ssn
+
+query I
+ACL ROLE "r" SELECT sql FROM duckdb_tables() WHERE table_name = 'plain';
+----
+CREATE TABLE "plain"("id" INTEGER, "amount" INTEGER, "ssn" "NULL");
+
+# what the operator sees stored is the normalised list, not the order it was typed in
+query I
+SELECT columns FROM acl_object_grants() WHERE vname = 'plain';
+----
+id, amount, ssn = NULL
+
+# --- the catalog keeps every power the grant lost -------------------------------------------------------
+# rename, compute and order, all three, on the object
+
+query I
+ACL ROLE "r" SELECT string_agg(column_name, ',') FROM (DESCRIBE shaped);
+----
+order_id,tag
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.shaped SET COLUMNS 'initial = tenant[1], order_id = id';
+
+statement ok
+ACL ADMIN GRANT OBJECT c.shaped TO ROLE r COLUMNS (initial, order_id);
+
+query II
+ACL ROLE "r" SELECT * FROM shaped;
+----
+a	1
