@@ -143,6 +143,10 @@ process not seeing each other's sessions.
 
 - The **shared session backends** (catalog table, function driver) and the portability predicate a
   cluster needs — `design/010-serving-clients` §4.1 and §10.2.
+- **Revisit the handle's source when the Flight SQL server lands.** That build links Arrow, gRPC and
+  OpenSSL unconditionally, so a real CSPRNG is present without depending on httpfs having been loaded
+  — which removes the objection above and makes the deterministic-device check unnecessary in it. Not
+  a change to make speculatively: it becomes right exactly when that dependency becomes unavoidable.
 - **Revocation** beyond `exp` and an explicit close: a shared backend can mark a session dead, bounded
   by the local cache TTL, the same way a policy change already is.
 - **What a door reports about a refused session** — "expired" and "unknown" are different for a
