@@ -517,6 +517,9 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 		s.Expect("from");
 		auto from_vname = endpoint();
 		s.Expect("to");
+		// TO FUNCTION f: the far end is a table function, so the pairs read "column => parameter" and
+		// the join is a lateral call rather than a condition
+		bool to_function = s.Accept("function");
 		auto to_vname = endpoint();
 		s.Expect("on");
 		// a bare list is a list of column pairs; SQL is spelled out, so neither can be mistaken for
@@ -548,10 +551,10 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 				more = true;
 			}
 		}
-		return MakeAdminCall("acl_add_reference",
-		                     {Value(vcat), Value(name), Value(from_vname), Value(to_vname), Value(pairs), Value(expr),
-		                      Value(cardinality), Value(optional ? "true" : "false"), Value(join_method),
-		                      Value(comment), Value(mode)});
+		return MakeAdminCall("acl_add_reference", {Value(vcat), Value(name), Value(from_vname), Value(to_vname),
+		                                           Value(to_function ? "function" : "relation"), Value(pairs),
+		                                           Value(expr), Value(cardinality), Value(optional ? "true" : "false"),
+		                                           Value(join_method), Value(comment), Value(mode)});
 	}
 	if (s.Accept("schema")) {
 		// CREATE VIRTUAL SCHEMA v.path AS <phys> - the live alias, resolves through

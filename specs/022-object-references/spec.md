@@ -39,6 +39,7 @@ simplification below follows from that.
 | --- | --- |
 | `name` | unique in the catalog; one pair of objects may have several (`orders.customer`, `orders.billing_customer`) |
 | `from_vname`, `to_vname` | the two ends, as virtual names |
+| `to_kind` | `relation` or `function` — a table function end is a lateral call, not a join |
 | pairs *or* `expr` | how they join — column pairs, or arbitrary SQL. Exactly one of the two |
 | `cardinality` | `many_to_one`, `one_to_many`, `one_to_one`, `many_to_many` |
 | `optional` | whether the far side may be absent |
@@ -63,10 +64,31 @@ storing both invites records that contradict themselves. Planner hints, multi-ho
 inside a reference are all out: **a reference describes a join predicate and its shape — never a
 projection, an aggregate or a filter.**
 
+### The ends: a relation, a view, or a table function
+
+A **view** needs nothing special. It is a relation of the catalog like any other, its columns come
+from the write-time probe, so both the existence check and the visibility check reach it unchanged.
+
+A **table function** is different in kind, and the difference is not cosmetic: it is fed *arguments*,
+not joined on a condition. So a reference into one is a **lateral call**, and its pairs read
+`source column => parameter` rather than `column = column`. `to_kind` records which of the two an end
+is, so an agent reading the listing knows to write `LATERAL f(…)` instead of a join. An expression is
+refused for a function end — there is no condition for it to be.
+
+**A function end is checked against its declared signature, and against nothing else.** No binding:
+a table function's template carries `acl_arg(n)` markers whose result depends on the arguments, so it
+cannot be typed from NULLs (spec 010 says as much), and binding it would prove nothing the declaration
+does not already say. The parameters are a stored field; a function that declares no signature simply
+cannot be judged, and is accepted.
+
+A function may only be the `to` end: a lateral call takes its arguments from the row on its left.
+
 ### Visibility: both ends, every column
 
-A reference is visible to a principal when both of its objects are, and when every column it names is
-one the role can see. Otherwise it would announce an object the role has no access to, or name a
+A reference is visible to a principal when both of its ends are — an object it may read, or a table
+function it may call, which is granted the same way — and when every column it names is one the role
+can see. The `to` side of a lateral call names parameters rather than columns, so there is nothing
+there to hide or to check. Otherwise it would announce an object the role has no access to, or name a
 column a projection hides and suggest joining on it.
 
 There is no capability on a reference and no separate grant: it opens nothing, so its visibility is
@@ -114,13 +136,16 @@ not attached.
 
 ## Testing
 
-`test/sql/acl_references.test` (67 assertions): declaring both forms and reading back the columns
+`test/sql/acl_references.test` (92 assertions): declaring both forms and reading back the columns
 extracted from an expression; refusals at write time (an end that does not exist, a column that does
 not, an unqualified expression, an expression naming neither end, an unknown cardinality, a name in
 use); a role seeing both references and narrowing to one object; a role seeing neither the reference
 into an object it cannot read nor the one over a column its grant hides — with that column also gone
 from `information_schema.columns`; the reference granting nothing; drop, `IF EXISTS`, and the
-principal's surface being substituted rather than gated.
+principal's surface being substituted rather than gated; a view as an end needing nothing special, a
+table function end with its parameter checked against the declared signature, an expression refused
+for one, and a role that cannot call the function not seeing the reference into it while the one
+between two relations stays.
 
 ## Alternatives considered
 
@@ -140,8 +165,6 @@ principal's surface being substituted rather than gated.
 - **Import physical foreign keys** as a starting set: read the source's FKs, map them through renames,
   drop the ones whose ends are not in the catalog or whose columns are hidden. The same shape as a
   schema expansion, with the same `REFRESH` and idempotency.
-- **References to table functions**: the argument comes from the source row (`orders → report(orders.id)`),
-  which is a lateral join and needs its own way of writing the substitution.
 - **Cross-catalog references**: today both ends live in one virtual catalog.
 - **Many-to-many through a junction**: expressible as two references; a single record naming the
   junction may read better.

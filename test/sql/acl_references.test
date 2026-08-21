@@ -159,6 +159,70 @@ ACL ROLE "narrow" SELECT count(*) FROM information_schema.columns
 ----
 0
 
+# --- a view is an end like any other, and a table function is a lateral call -------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.big_orders AS SELECT id, customer_id FROM phys.main.orders WHERE amount > 50;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.orders_of(cust INTEGER) AS
+    SELECT id FROM phys.main.orders WHERE customer_id = acl_arg(1);
+
+# a view needs nothing special: it is a relation of the catalog, and its columns come from the probe
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.big_to_customer FROM big_orders TO customers ON (customer_id = id);
+
+# a table function is fed arguments, so the pair reads "source column => parameter" and the reference
+# describes a lateral call rather than a join condition
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.cust_orders FROM customers TO FUNCTION orders_of
+    ON (id = cust) CARDINALITY one_to_many COMMENT 'the orders of this customer';
+
+query IIIIII
+ACL ROLE "full" SELECT name, from_object, to_object, to_kind, from_columns, to_columns
+    FROM acl_references() WHERE to_kind = 'function' OR from_object = 'big_orders' ORDER BY name;
+----
+big_to_customer	big_orders	customers	relation	customer_id	id
+cust_orders	customers	orders_of	function	id	cust
+
+# the parameter is checked against the declared signature - and only against it: a table function's
+# template carries acl_arg(n) markers, so binding it would prove nothing the declaration does not say
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.bad_param FROM customers TO FUNCTION orders_of ON (id = nope);
+----
+<REGEX>:.*has no parameter "nope" \(declared: cust\).*
+
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.no_fn FROM customers TO FUNCTION nothing ON (id = cust);
+----
+<REGEX>:.*"nothing" is not a table function of "c".*
+
+# an expression means nothing for a lateral call: there is no condition, only arguments
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.bad_form FROM customers TO FUNCTION orders_of
+    ON EXPRESSION 'customers.id = orders_of.cust';
+----
+<REGEX>:.*names arguments rather than a join condition.*
+
+# the function is granted like any other object, so a role that cannot call it does not see the
+# reference into it - while the reference between two relations stays
+statement ok
+ACL ADMIN CREATE ROLE nofn;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE nofn CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.customers TO ROLE nofn WITH (select);
+
+statement ok
+ACL ADMIN GRANT TABLE c.big_orders TO ROLE nofn WITH (select);
+
+query II
+ACL ROLE "nofn" SELECT name, to_kind FROM acl_references() ORDER BY name;
+----
+big_to_customer	relation
+
 # --- it stays a hint: nothing is enforced and nothing is granted by it -------------------------------
 
 # the reference does not make the far side readable
