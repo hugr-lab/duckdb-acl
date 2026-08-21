@@ -1,0 +1,201 @@
+# name: test/sql/acl_show_surface.test
+# description: every SHOW form answers its own question (spec 031) - they all used to be answered with
+#   the table listing - and PRAGMA table_info is answered instead of refused
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, tenant VARCHAR, amount INT, ssn VARCHAR);
+
+statement ok
+CREATE TABLE phys.lake.events(id INT, kind VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.secrets(id INT, v VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 10, 's1');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG lake;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.vs FROM phys.lake;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE lake.events AS phys.lake.events;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE r MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG lake TO ROLE r;
+
+# --- SHOW DATABASES is about databases -----------------------------------------------------------------
+# it used to answer with the table listing, so a client asking which databases it had got back tables
+
+query I
+ACL ROLE "r" SHOW DATABASES;
+----
+lake
+sales
+
+# and never a physical one, whether attached or not
+query I
+ACL ROLE "r" SELECT count(*) FROM (SHOW DATABASES) WHERE database_name IN ('phys', 'aclcat', 'memory');
+----
+0
+
+# --- SHOW SCHEMAS is about schemas, and says which one an unqualified name resolves in ------------------
+
+query III
+ACL ROLE "r" SHOW SCHEMAS;
+----
+lake	main	false
+sales	main	true
+sales	vs	false
+
+# --- SHOW ALL TABLES has its own shape, and it carries the columns -------------------------------------
+
+query IIIIII
+ACL ROLE "r" SHOW ALL TABLES;
+----
+lake	main	events	[id, kind]	[INTEGER, VARCHAR]	false
+sales	main	orders	[id, amount]	[INTEGER, INTEGER]	false
+sales	vs	events	[id, kind]	[INTEGER, VARCHAR]	false
+
+# the columns the object does not project are absent from it, as everywhere else
+query I
+ACL ROLE "r" SELECT count(*) FROM (SHOW ALL TABLES)
+    WHERE list_contains(column_names, 'ssn') OR list_contains(column_names, 'tenant');
+----
+0
+
+query I
+ACL ROLE "r" SELECT count(*) FROM (SHOW ALL TABLES) WHERE name = 'secrets';
+----
+0
+
+# --- SHOW TABLES is unchanged (spec 025) ----------------------------------------------------------------
+
+query I
+ACL ROLE "r" SHOW TABLES;
+----
+orders
+
+query I
+ACL ROLE "r" SHOW TABLES FROM vs;
+----
+events
+
+# --- SHOW VARIABLES answers with nothing, in the shape it answers with ------------------------------------
+# a principal has no session variables: `getvariable` is denied and nothing sets one for it
+
+query III
+ACL ROLE "r" SHOW VARIABLES;
+----
+
+query I
+ACL ROLE "r" SELECT count(*) FROM (SHOW VARIABLES);
+----
+0
+
+# --- PRAGMA table_info is answered, not refused -----------------------------------------------------------
+
+query IIIIII
+ACL ROLE "r" PRAGMA table_info('orders');
+----
+0	id	INTEGER	false	NULL	false
+1	amount	INTEGER	false	NULL	false
+
+# a schema-qualified name is a schema and a table, not one identifier
+query IIIIII
+ACL ROLE "r" PRAGMA table_info('vs.events');
+----
+0	id	INTEGER	false	NULL	false
+1	kind	VARCHAR	false	NULL	false
+
+# it goes down the read path, so a name the principal does not have is refused rather than answered
+# with no rows at all
+statement error
+ACL ROLE "r" PRAGMA table_info('secrets');
+----
+<REGEX>:.*no access to object "secrets".*
+
+statement error
+ACL ROLE "r" PRAGMA table_info('phys.main.orders');
+----
+<REGEX>:.*no access to object.*
+
+# --- PRAGMA show_tables is the same listing ---------------------------------------------------------------
+
+query I
+ACL ROLE "r" PRAGMA show_tables;
+----
+orders
+
+# --- everything else a PRAGMA can do stays denied ----------------------------------------------------------
+# a PRAGMA is otherwise a setting, and a principal sets nothing
+
+statement error
+ACL ROLE "r" PRAGMA version;
+----
+<REGEX>:.*PRAGMA "version" is not permitted under ACL.*
+
+statement error
+ACL ROLE "r" PRAGMA database_list;
+----
+<REGEX>:.*PRAGMA "database_list" is not permitted under ACL.*
+
+statement error
+ACL ROLE "r" PRAGMA table_info('orders', 'extra');
+----
+<REGEX>:.*(exactly one table name|table_info).*
+
+# --- a role that may see nothing sees nothing through any of them --------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE empty;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE empty CAPS '{}' MAIN;
+
+query I
+ACL ROLE "empty" SELECT count(*) FROM (SHOW ALL TABLES);
+----
+0
+
+query I
+ACL ROLE "empty" SELECT count(*) FROM (SHOW SCHEMAS);
+----
+0
+
+statement error
+ACL ROLE "empty" PRAGMA table_info('orders');
+----
+<REGEX>:.*select on "orders" is not allowed.*

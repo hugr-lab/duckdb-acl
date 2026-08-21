@@ -1191,24 +1191,47 @@ struct CatalogBackend {
 			                 " NULL AS default_character_set_name, NULL AS sql_path, false AS internal,"
 			                 " NULL AS comment FROM vschemas";
 		}
+		// spec 031: the SHOW forms, each in the shape duckdb answers it with. They are the same catalog
+		// the information_schema surfaces describe - only a client asking `SHOW DATABASES` wants one
+		// column called `database_name`, not an information_schema row.
+		if (surface == "show_databases") {
+			return prelude + "SELECT DISTINCT vcat AS database_name FROM vschemas ORDER BY 1";
+		}
+		if (surface == "show_schemas") {
+			// `current` is the schema an unqualified name resolves in: `main` of the catalog the
+			// principal holds as MAIN, which is exactly what resolution falls back to
+			return prelude + "SELECT DISTINCT s.vcat AS database_name, s.path AS schema_name,"
+			                 " (s.path = 'main' AND EXISTS (SELECT 1 FROM grants g WHERE g.\"vcat\" = s.vcat"
+			                 " AND g.\"is_main\")) AS \"current\" FROM vschemas s ORDER BY ALL";
+		}
 		auto physical = "i.\"table_catalog\" = o.parts[1] AND i.\"table_schema\" = o.parts[2]"
 		                " AND i.\"table_name\" = o.parts[3]";
+		string tables_sql =
+		    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name)"
+		           " FROM objects o JOIN information_schema.tables i ON ") +
+		    physical +
+		    " WHERE len(o.parts) = 3"
+		    " UNION ALL BY NAME"
+		    " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
+		    " 'VIEW' AS table_type FROM objects o WHERE o.form = 'view'"
+		    " UNION ALL BY NAME"
+		    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema)"
+		    " FROM aliases a JOIN information_schema.tables i"
+		    " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
+		    " WHERE len(a.parts) = 2";
 		if (surface == "tables") {
-			return prelude +
-			       "SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name)"
-			       " FROM objects o JOIN information_schema.tables i ON " +
-			       physical +
-			       " WHERE len(o.parts) = 3"
-			       " UNION ALL BY NAME"
-			       " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
-			       " 'VIEW' AS table_type FROM objects o WHERE o.form = 'view'"
-			       " UNION ALL BY NAME"
-			       " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema)"
-			       " FROM aliases a JOIN information_schema.tables i"
-			       " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
-			       " WHERE len(a.parts) = 2";
+			return prelude + tables_sql;
 		}
-		if (surface != "columns" && surface != "references") {
+		if (surface == "show_tables") {
+			// a bare `SHOW TABLES` is the schema an unqualified name resolves in - `main` of the MAIN
+			// catalog. Filtering on the schema alone listed the `main` of every granted catalog, whose
+			// tables a bare name does not reach (spec 031).
+			return prelude + "SELECT t.table_name AS name FROM (" + tables_sql +
+			       ") t WHERE t.table_schema = 'main' AND EXISTS (SELECT 1 FROM grants g"
+			       " WHERE g.\"vcat\" = t.table_catalog AND g.\"is_main\") ORDER BY 1";
+		}
+		if (surface != "columns" && surface != "references" && surface != "show_tables_expanded" &&
+		    surface != "show_tables") {
 			throw BinderException("acl: unknown metadata surface \"%s\"", surface);
 		}
 		// the columns a role actually sees: an object's own projection when it has one (its rows in
@@ -1292,6 +1315,15 @@ struct CatalogBackend {
 		    path("o") + " = gp.vname)";
 		if (surface == "columns") {
 			return prelude + effective_columns;
+		}
+		if (surface == "show_tables_expanded") {
+			// `SHOW ALL TABLES`: every table of every catalog the principal holds, with the columns it
+			// reads - the same fold duckdb does over duckdb_tables + duckdb_columns
+			return prelude + ", vcolumns AS (" + effective_columns +
+			       ") SELECT c.table_catalog AS database, c.table_schema AS schema, c.table_name AS name,"
+			       " list(c.column_name ORDER BY c.ordinal_position) AS column_names,"
+			       " list(c.data_type ORDER BY c.ordinal_position) AS column_types, false AS temporary"
+			       " FROM vcolumns c GROUP BY ALL ORDER BY ALL";
 		}
 		// spec 022: a reference is visible when both of its ends are, and when every column it names is
 		// a column the role can see. Anything else would describe an object - or a column - the role
