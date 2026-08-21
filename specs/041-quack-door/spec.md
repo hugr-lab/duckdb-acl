@@ -130,14 +130,14 @@ become a phantom write target. Measured, not hypothesised.
 
 ## Testing
 
-`test/sql/acl_quack_door.test` (36 assertions) — the callbacks as ordinary SQL functions, which is all
+`test/sql/acl_quack_door.test` (38 assertions) — the callbacks as ordinary SQL functions, which is all
 a door has to prove: authentication true for a verified token, false for one nobody can verify and for
 one from an issuer nobody defined; authorization composing the prefix for a bound connection and
 refusing an unknown one; an expired session refused on the connection it was bound to;
 `acl_quack_serve` refusing each condition by name; quack's own functions denied to a principal, and
 the callbacks themselves out of a principal's reach.
 
-`test/sql/integration/acl_quack_serve.test` (30 assertions, needs `ACL_QUACK=1`) — the live door in one
+`test/sql/integration/acl_quack_serve.test` (32 assertions, needs `ACL_QUACK=1`) — the live door in one
 process, since quack is both server and client: one call opens it, a client with a verified token
 reads its own slice over the socket, a physical name and an unpublished column are refused, an
 unverifiable token does not get in at all, an attached catalog is the principal's, and a bulk insert
@@ -154,8 +154,9 @@ fails rather than writing around the policy.
 
 ## Follow-ups
 
-- **quack is pre-release**, and the callback contract is what we stand on. It is pinned by commit here
-  (`ACL_QUACK=1`), which is how a contract change becomes a build failure rather than a surprise.
+- **quack is pre-release**, and the callback contract is what we stand on. It is pinned by commit, and
+  CI's linux job builds with `ACL_QUACK=1` and runs the live round trip — so a contract change arrives
+  as a red build on the next PR rather than as a surprise on the machine that happens to build it.
 - **A stopped listener keeps answering for a while.** Measured: after `quack_stop` the server is gone
   from `quack_server_list()` and a fresh process refuses the port, but a listener whose client still
   holds a pooled connection went on answering. So closing sessions and closing the socket are not the
