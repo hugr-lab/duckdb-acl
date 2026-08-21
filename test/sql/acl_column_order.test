@@ -1,0 +1,175 @@
+# name: test/sql/acl_column_order.test
+# description: a principal's columns come out in one order, whoever asks and whatever the token says
+#   (spec 036) - the read path, the listings and the synthesized DDL agree, and role order in the
+#   token does not change the answer
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR, amount INTEGER, note VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 100, 'first');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/order',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE ra;
+
+statement ok
+ACL ADMIN CREATE ROLE rb;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE ra WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE rb WITH (select) MAIN;
+
+# `ra` lists (id, tag); `rb` lists (id, amount, tag) - overlapping, and `tag` sits at a different
+# position in each. The merge rule: a column belongs where the first role naming it - roles in name
+# order - put it. So: id, tag (from ra), then amount (new in rb).
+statement ok
+ACL ADMIN GRANT OBJECT c.orders TO ROLE ra COLUMNS (id, tag = tenant);
+
+statement ok
+ACL ADMIN GRANT OBJECT c.orders TO ROLE rb COLUMNS (id, amount, tag = tenant);
+
+# --- the read path ---------------------------------------------------------------------------------
+
+query III
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+SELECT * FROM orders;
+----
+1	acme	100
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+SELECT string_agg(column_name, ',') FROM (DESCRIBE orders);
+----
+id,tag,amount
+
+# --- the listings say the same, in the same order ----------------------------------------------------
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns();
+----
+id,tag,amount
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns;
+----
+id,tag,amount
+
+# the DDL a client parses and then projects positionally against
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+SELECT sql FROM duckdb_tables();
+----
+CREATE TABLE "orders"("id" INTEGER, "tag" VARCHAR, "amount" INTEGER);
+
+# positions are 1..N with no gaps, whatever names the merge dropped as duplicates
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+SELECT string_agg(column_index::VARCHAR, ',' ORDER BY column_index) FROM duckdb_columns();
+----
+1,2,3
+
+# --- and the token's role order does not change any of it --------------------------------------------
+# roles ["rb","ra"] instead of ["ra","rb"]: same principal, same answer
+
+query III
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYiIsInJhIl19.qiyN1EYYd8dRQZPjHz00AiodxA9ZJTd7QEk1hYP0QRI'
+SELECT * FROM orders;
+----
+1	acme	100
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYiIsInJhIl19.qiyN1EYYd8dRQZPjHz00AiodxA9ZJTd7QEk1hYP0QRI'
+SELECT string_agg(column_name, ',') FROM (DESCRIBE orders);
+----
+id,tag,amount
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYiIsInJhIl19.qiyN1EYYd8dRQZPjHz00AiodxA9ZJTd7QEk1hYP0QRI'
+SELECT sql FROM duckdb_tables();
+----
+CREATE TABLE "orders"("id" INTEGER, "tag" VARCHAR, "amount" INTEGER);
+
+# --- a single role keeps its own list order, including a reordering one ------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE solo;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE solo WITH (select) MAIN;
+
+# the grant reorders the table and adds a computed column: the list is the order
+statement ok
+ACL ADMIN GRANT OBJECT c.orders TO ROLE solo COLUMNS (note, initial = tenant, id);
+
+query III
+ACL ROLE "solo" SELECT * FROM orders;
+----
+first	acme	1
+
+query I
+ACL ROLE "solo" SELECT string_agg(column_name, ',') FROM (DESCRIBE orders);
+----
+note,initial,id
+
+query I
+ACL ROLE "solo" SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns();
+----
+note,initial,id
+
+query I
+ACL ROLE "solo" SELECT sql FROM duckdb_tables();
+----
+CREATE TABLE "orders"("note" VARCHAR, "initial" VARCHAR, "id" INTEGER);
+
+# --- an object with no grant projection keeps the object's own order ---------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE plain;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE plain WITH (select) MAIN;
+
+query I
+ACL ROLE "plain" SELECT string_agg(column_name, ',') FROM (DESCRIBE orders);
+----
+id,tenant,amount,note
+
+query I
+ACL ROLE "plain" SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns();
+----
+id,tenant,amount,note
+
+query I
+ACL ROLE "plain" SELECT sql FROM duckdb_tables();
+----
+CREATE TABLE "orders"("id" INTEGER, "tenant" VARCHAR, "amount" INTEGER, "note" VARCHAR);

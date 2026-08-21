@@ -210,17 +210,13 @@ Whole suite: 37 files, 2997 assertions, plus both C++ binaries.
   `YES`. Making it follow the grant's capabilities is worth doing with the writability work, not here.
 - `information_schema.columns` has 45 columns and most of them will be NULL for a synthesized row.
   That matches what duckdb itself returns for most of them.
-- **Column order under multiple roles is not pinned, on either side.** The read path merges roles by
-  appending each role's list in the order the grants come back from the store, so the resulting
-  column order is whatever that order happened to be; the listing computes its own order from
-  positions. Measured: for two roles the DDL said `(id, tag, amount)` while `DESCRIBE` said
-  `(id, amount, tag)`. Same columns, same types, different order — and **that matters more than it
-  looks**, because quack's scan projects *positionally*
-  (`query += "#" + to_string(col_id.GetPrimaryIndex() + 1)`) against the client-side catalog built
-  from this DDL. A client could therefore read the right types from the wrong columns. The fix belongs
-  on the read path — make the multi-role merge order deterministic — and the listing then follows;
-  that is spec 011's territory, not this one. Single-role grants agree today, including a grant that
-  reorders and adds a computed column, which is what the tests pin.
+- ~~**Column order under multiple roles is not pinned, on either side.**~~ Fixed by **spec 036**: the
+  read path merged roles in store order and the listing computed its own order from positions, so for
+  two roles the DDL said `(id, tag, amount)` while `DESCRIBE` said `(id, amount, tag)`. That matters
+  more than it looks, because quack's scan projects *positionally*
+  (`query += "#" + to_string(col_id.GetPrimaryIndex() + 1)`) against a client-side catalog built from
+  this DDL. Both sides now order by *(first role naming the column, in role-name order; its position
+  in that role's list)*.
 - **An object whose roles conflict is still listed.** Two roles masking one name differently make the
   whole object unreadable (`SELECT`, `SELECT *` and `DESCRIBE` all refuse), yet it appears in the
   listings — one row per column now, but describing something nobody can read. Excluding it would

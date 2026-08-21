@@ -772,7 +772,9 @@ struct CatalogBackend {
 		           RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
 		           " WHERE (" + qualified_cond +
 		           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(vname) +
-		           ") ORDER BY prio";
+		           // by role, so a principal holding several of them merges their column lists in one
+		           // order rather than in whatever order the store returned (spec 036)
+		           ") ORDER BY prio, g.\"role\"";
 		auto result = Query(sql);
 		if (result->RowCount() == 0) {
 			return false;
@@ -936,7 +938,8 @@ struct CatalogBackend {
 		           " FROM " +
 		           AliasesSource(principal) + " sa JOIN grants g ON g.\"vcat\" = sa.\"vcat\"" + oc_join + " WHERE (" +
 		           qualified_cond + ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND " +
-		           prefix_match(Lit(vname), "sa.\"alias_path\"") + ") ORDER BY prio, length(sa.\"alias_path\") DESC";
+		           prefix_match(Lit(vname), "sa.\"alias_path\"") +
+		           ") ORDER BY prio, length(sa.\"alias_path\") DESC, g.\"role\"";
 		auto result = Query(sql);
 		if (result->RowCount() == 0) {
 			return false;
@@ -1000,7 +1003,7 @@ struct CatalogBackend {
 		           FunctionsSource(principal, names) + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join +
 		           " WHERE f.\"kind\" = '" + kind + "' AND ((" + qualified_cond +
 		           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND f.\"vname\" = " + Lit(vname) +
-		           ")) ORDER BY prio";
+		           ")) ORDER BY prio, g.\"role\"";
 		auto result = Query(sql);
 		TablePolicy policy;
 		bool found = result->RowCount() > 0;
@@ -1177,14 +1180,23 @@ struct CatalogBackend {
 		// describe what the role reads rather than what the physical table holds.
 		// A principal may hold several roles, and two of them may project the same name - at the same
 		// position or at different ones. One row per name is the invariant every consumer depends on:
-		// a duplicate makes `column_count` wrong and the synthesized DDL invalid SQL (spec 035). Where
-		// the roles genuinely disagree about the expression, the read path refuses the object outright.
-		string projected = "gprojection AS (SELECT vcat, vname, name, min_by(type, pos) AS type, min(pos) AS pos"
-		                   " FROM (SELECT DISTINCT pc.\"vcat\" AS vcat, pc.\"vname\" AS vname,"
-		                   " pc.\"name\" AS name, pc.\"type\" AS type, pc.\"pos\" AS pos FROM " +
+		// a duplicate makes `column_count` wrong and the synthesized DDL invalid SQL (spec 035).
+		//
+		// The order has to be the read path's, not merely stable, because a client may project by
+		// position (spec 036). The read path merges roles in role-name order, appending each role's
+		// list in its own order - so a column belongs where the first role that states it put it.
+		// Ranking by `(role, pos)` and taking each name's first occurrence reproduces exactly that,
+		// and the outer row_number closes the gaps a merged name leaves behind.
+		string projected = "gprojection AS (SELECT vcat, vname, name, type,"
+		                   " row_number() OVER (PARTITION BY vcat, vname ORDER BY rk) - 1 AS pos FROM"
+		                   " (SELECT vcat, vname, name, min_by(type, rk) AS type, min(rk) AS rk FROM"
+		                   " (SELECT vcat, vname, name, type,"
+		                   " row_number() OVER (PARTITION BY vcat, vname ORDER BY \"role\", \"pos\") AS rk FROM"
+		                   " (SELECT DISTINCT pc.\"vcat\" AS vcat, pc.\"vname\" AS vname, pc.\"name\" AS name,"
+		                   " pc.\"type\" AS type, pc.\"role\" AS \"role\", pc.\"pos\" AS \"pos\" FROM " +
 		                   Tbl("grant_columns") +
-		                   " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\")"
-		                   " GROUP BY vcat, vname, name)";
+		                   " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\"))"
+		                   " GROUP BY vcat, vname, name))";
 		auto prelude = GrantsCte(principal) + ", " + objects + ", " + aliases + ", " + schemas + ", " + grant_columns +
 		               ", " + vfunctions + ", " + projected + " ";
 		// spec 035: each surface answers in its own standard shape, column for column and type for
