@@ -74,13 +74,18 @@ vector<std::pair<string, string>> ParseColumnList(const string &csv) {
 //! specific grant can hide or mask more but never re-expose.
 struct GrantPolicy {
 	bool restricts = false;                    // a column list was given somewhere in the chain
+	bool unchecked = false;                    // some level's predicate was never bound (spec 027)
 	vector<std::pair<string, string>> columns; // visible columns, name -> expr ("" = as-is)
 	vector<string> predicates;                 // AND-ed together
 
-	//! Fold one level of the chain in; empty strings mean "this level says nothing"
-	void Narrow(const string &rls, const string &column_csv) {
+	//! Fold one level of the chain in; empty strings mean "this level says nothing". `rls_checked`
+	//! records whether that level's predicate was actually bound when it was written (spec 027).
+	void Narrow(const string &rls, const string &column_csv, bool rls_checked = true) {
 		if (!rls.empty()) {
 			predicates.push_back(rls);
+			if (!rls_checked) {
+				unchecked = true;
+			}
 		}
 		auto level = ParseColumnList(column_csv);
 		if (level.empty()) {
@@ -127,6 +132,7 @@ struct GrantUnion {
 	bool any = false;                  // at least one role's grant was seen
 	bool unrestricted_rls = false;     // some role has no predicate -> no predicate at all
 	bool unrestricted_columns = false; // some role has no column list -> the object's own
+	bool unchecked = false;            // some contributing predicate was never bound (spec 027)
 	vector<string> predicates;
 	vector<std::pair<string, string>> columns;
 
@@ -137,6 +143,7 @@ struct GrantUnion {
 			unrestricted_rls = true;
 		} else {
 			predicates.push_back(predicate);
+			unchecked = unchecked || policy.unchecked;
 		}
 		if (!policy.restricts) {
 			unrestricted_columns = true;
@@ -165,6 +172,12 @@ struct GrantUnion {
 				columns.push_back(column);
 			}
 		}
+	}
+
+	//! Only meaningful together with a non-empty Predicate(): a role without one lifts the restriction
+	//! entirely, and there is then no predicate left to have gone unchecked.
+	bool Unchecked() const {
+		return unchecked && !unrestricted_rls && !predicates.empty();
 	}
 
 	string Predicate() const {
@@ -567,7 +580,7 @@ struct CatalogBackend {
 	string GrantsCte(const Principal &principal) {
 		string grants;
 		if (!function_mode) {
-			grants = "SELECT \"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\" FROM " +
+			grants = "SELECT \"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\", \"rls_checked\" FROM " +
 			         Tbl("role_catalogs") + " WHERE \"role\" IN (" + LitList(principal.roles) + ")";
 		} else {
 			string values;
@@ -579,9 +592,9 @@ struct CatalogBackend {
 			// callbacks), so function mode carries NULLs and composes to "no grant-level narrowing"
 			grants = values.empty()
 			             ? string("SELECT '' AS \"role\", '' AS \"vcat\", false AS \"is_main\", '' AS \"caps\","
-			                      " NULL AS \"rls\", NULL AS \"columns\" WHERE false")
-			             : "SELECT *, NULL AS \"rls\", NULL AS \"columns\" FROM (VALUES " + values +
-			                   ") v(\"role\", \"vcat\", \"is_main\", \"caps\")";
+			                      " NULL AS \"rls\", NULL AS \"columns\", NULL AS \"rls_checked\" WHERE false")
+			             : "SELECT *, NULL AS \"rls\", NULL AS \"columns\", NULL AS \"rls_checked\" FROM (VALUES " +
+			                   values + ") v(\"role\", \"vcat\", \"is_main\", \"caps\")";
 		}
 		return "WITH grants AS (" + grants +
 		       "), main_ok AS (SELECT count(DISTINCT \"vcat\") = 1 AS unique_main FROM grants WHERE \"is_main\") ";
@@ -669,19 +682,26 @@ struct CatalogBackend {
 	//! The grant chain's policy columns (spec 011): the catalog grant's and the object grant's own RLS
 	//! and column list. The function-driver's slots do not carry them, so it composes to no narrowing.
 	string GrantPolicyExprs() {
-		return function_mode ? "NULL AS crls, NULL AS ccols, NULL AS orls, NULL AS ocols"
-		                     : "g.\"rls\" AS crls, g.\"columns\" AS ccols, oc.\"rls\" AS orls,"
-		                       " oc.\"columns\" AS ocols";
+		return function_mode ? "NULL AS crls, NULL AS ccols, false AS cchk, NULL AS orls, NULL AS ocols,"
+		                       " false AS ochk"
+		                     : "g.\"rls\" AS crls, g.\"columns\" AS ccols, g.\"rls_checked\" AS cchk,"
+		                       " oc.\"rls\" AS orls, oc.\"columns\" AS ocols, oc.\"rls_checked\" AS ochk";
 	}
-	//! Fold the four policy columns of one result row into the chain of one role
+	//! Fold the six policy columns of one result row into the chain of one role. A NULL `rls_checked`
+	//! is a row written before spec 027 existed, and counts as unchecked: `acl_refresh_schema` judges
+	//! those and fills the verdict in.
 	static GrantPolicy RowPolicy(MaterializedQueryResult &result, idx_t row, idx_t first_column) {
 		auto text = [&](idx_t column) {
 			auto value = result.GetValue(column, row);
 			return value.IsNull() ? string() : value.ToString();
 		};
+		auto flag = [&](idx_t column) {
+			auto value = result.GetValue(column, row);
+			return !value.IsNull() && value.GetValue<bool>();
+		};
 		GrantPolicy policy;
-		policy.Narrow(text(first_column), text(first_column + 1));     // catalog level
-		policy.Narrow(text(first_column + 2), text(first_column + 3)); // object level
+		policy.Narrow(text(first_column), text(first_column + 1), flag(first_column + 2));     // catalog level
+		policy.Narrow(text(first_column + 3), text(first_column + 4), flag(first_column + 5)); // object level
 		return policy;
 	}
 
@@ -743,7 +763,9 @@ struct CatalogBackend {
 		           " THEN 1 ELSE 2 END AS prio,"
 		           " (SELECT list(struct_pack(cname := c.\"name\", cexpr := c.\"expr\") ORDER BY c.\"pos\") FROM " +
 		           ColumnsSource(principal, names) +
-		           " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\") AS cols"
+		           " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\") AS cols, " +
+		           (function_mode ? "NULL" : "r.\"rls_checked\"") +
+		           " AS rchk"
 		           " FROM " +
 		           RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
 		           " WHERE (" + qualified_cond +
@@ -753,7 +775,7 @@ struct CatalogBackend {
 		if (result->RowCount() == 0) {
 			return false;
 		}
-		auto prio = result->GetValue(9, 0).GetValue<int64_t>();
+		auto prio = result->GetValue(11, 0).GetValue<int64_t>();
 		auto form = result->GetValue(0, 0).ToString();
 		auto phys = result->GetValue(1, 0);
 		auto view_sql = result->GetValue(2, 0);
@@ -761,10 +783,12 @@ struct CatalogBackend {
 		out.phys = phys.IsNull() ? string() : phys.ToString();
 		out.query = view_sql.IsNull() ? string() : view_sql.ToString();
 		out.rls = rls.IsNull() ? string() : rls.ToString();
+		auto rchk = result->GetValue(13, 0);
+		out.rls_unchecked = !out.rls.empty() && (rchk.IsNull() || !rchk.GetValue<bool>());
 		out.subquery_form = form != "alias";
 		out.writable = form == "alias"; // a real table stays writable, however a grant narrows it
 		vector<std::pair<string, string>> object_columns;
-		auto cols = result->GetValue(10, 0);
+		auto cols = result->GetValue(12, 0);
 		if (!cols.IsNull() && form != "view") {
 			for (auto &item : ListValue::GetChildren(cols)) {
 				auto &fields = StructValue::GetChildren(item);
@@ -785,7 +809,7 @@ struct CatalogBackend {
 		// policies of their grant chains (spec 011)
 		GrantUnion grants;
 		for (idx_t row = 0; row < result->RowCount(); row++) {
-			if (result->GetValue(9, row).GetValue<int64_t>() != prio) {
+			if (result->GetValue(11, row).GetValue<int64_t>() != prio) {
 				break; // ordered by prio; the losing interpretation starts here
 			}
 			auto caps = result->GetValue(4, row);
@@ -805,6 +829,7 @@ struct CatalogBackend {
 	                             vector<std::pair<string, string>> &object_columns, TablePolicy &out) {
 		auto predicate = grants.Predicate();
 		bool restricts = grants.Restricts();
+		out.rls_unchecked = out.rls_unchecked || grants.Unchecked();
 		if (predicate.empty() && !restricts) {
 			for (auto &column : object_columns) {
 				out.projection.push_back(column.second.empty() ? column.first : column.second + " AS " + column.first);
@@ -906,7 +931,7 @@ struct CatalogBackend {
 		if (result->RowCount() == 0) {
 			return false;
 		}
-		auto prio = result->GetValue(8, 0).GetValue<int64_t>();
+		auto prio = result->GetValue(10, 0).GetValue<int64_t>();
 		auto vcat = result->GetValue(0, 0).ToString();
 		auto alias_path = result->GetValue(1, 0).ToString();
 		auto &path = prio == 1 ? rest : vname;
@@ -916,7 +941,7 @@ struct CatalogBackend {
 		// rows of the same winning alias differ only by role: union their caps and grant policies
 		GrantUnion grants;
 		for (idx_t row = 0; row < result->RowCount(); row++) {
-			if (result->GetValue(8, row).GetValue<int64_t>() != prio || result->GetValue(0, row).ToString() != vcat ||
+			if (result->GetValue(10, row).GetValue<int64_t>() != prio || result->GetValue(0, row).ToString() != vcat ||
 			    result->GetValue(1, row).ToString() != alias_path) {
 				continue;
 			}
@@ -974,7 +999,7 @@ struct CatalogBackend {
 			auto form = result->GetValue(1, 0).ToString();
 			auto target = result->GetValue(2, 0);
 			auto template_sql = result->GetValue(3, 0);
-			auto prio = result->GetValue(9, 0).GetValue<int64_t>();
+			auto prio = result->GetValue(11, 0).GetValue<int64_t>();
 			policy.subquery_form = form != "alias";
 			policy.phys = target.IsNull() ? string() : target.ToString();
 			policy.query = template_sql.IsNull() ? string() : template_sql.ToString();
@@ -982,7 +1007,7 @@ struct CatalogBackend {
 			// call is a read, so it needs one) and their grant policies
 			GrantUnion grants;
 			for (idx_t row = 0; row < result->RowCount(); row++) {
-				if (result->GetValue(9, row).GetValue<int64_t>() != prio ||
+				if (result->GetValue(11, row).GetValue<int64_t>() != prio ||
 				    result->GetValue(0, row).ToString() != vcat) {
 					continue;
 				}
@@ -1011,6 +1036,7 @@ struct CatalogBackend {
 	                                     TablePolicy &out) {
 		auto predicate = grants.Predicate();
 		bool restricts = grants.Restricts();
+		out.rls_unchecked = grants.Unchecked();
 		if (predicate.empty() && !restricts) {
 			return;
 		}
@@ -1630,7 +1656,10 @@ struct CatalogBackend {
 	//! The target is bound on its own first: if *that* fails there is nothing to judge the predicate
 	//! against - the source may simply not be attached yet - and the predicate is accepted, exactly as
 	//! a schema probe that cannot bind is not fatal.
-	string PredicateError(const string &source, const string &rls) {
+	string PredicateError(const string &source, const string &rls, bool *checked = nullptr) {
+		if (checked) {
+			*checked = false;
+		}
 		if (rls.empty() || source.empty()) {
 			return string();
 		}
@@ -1639,6 +1668,9 @@ struct CatalogBackend {
 		auto base = con.Query("SELECT * FROM " + source + " WHERE false");
 		if (base->HasError()) {
 			return string(); // the object itself does not bind here; not the predicate's fault
+		}
+		if (checked) {
+			*checked = true; // whatever the answer, the predicate was judged rather than waved through
 		}
 		string baked;
 		try {
@@ -1654,13 +1686,49 @@ struct CatalogBackend {
 		return string();
 	}
 
+	//! A catalog grant's predicate filters every object of the catalog, so there is no single object to
+	//! bind it against: it is judged against all of them, and counts as checked only when every object
+	//! that binds at all accepted it. Unlike an object's own predicate this never refuses the write - a
+	//! catalog predicate that does not fit one object is a real (if questionable) configuration, and it
+	//! was allowed before the flag existed.
+	bool CatalogPredicateChecked(const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                             const string &vcat, const string &rls) {
+		if (rls.empty()) {
+			return true; // nothing to judge
+		}
+		auto rows =
+		    read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat));
+		bool any = false;
+		for (idx_t row = 0; row < rows->RowCount(); row++) {
+			auto text = [&](idx_t column) {
+				auto value = rows->GetValue(column, row);
+				return value.IsNull() ? string() : value.ToString();
+			};
+			auto form = text(0);
+			auto source = form == "view" ? "(" + text(2) + ")" : text(1);
+			bool checked = false;
+			auto error = PredicateError(source, rls, &checked);
+			if (!checked) {
+				continue; // this object cannot be bound here; it judges nothing either way
+			}
+			if (!error.empty()) {
+				return false;
+			}
+			any = true;
+		}
+		return any;
+	}
+
 	//! Bind a projection over a relation and return the columns it produces (spec 026). Never fatal: an
 	//! unbindable projection leaves the listing as it was rather than refusing the grant.
 	//! Returns the binder's message when the projection is at fault, and an empty string when it binds -
 	//! or when the object itself does not bind, since then there is nothing to judge it against. The
 	//! same two steps as a predicate's check (spec 021), for the same reason.
 	string ProjectionSchema(const string &source, const string &column_csv, const case_insensitive_map_t<string> &own,
-	                        vector<std::pair<string, string>> &out) {
+	                        vector<std::pair<string, string>> &out, bool *checked = nullptr) {
+		if (checked) {
+			*checked = false;
+		}
 		vector<string> items;
 		for (auto &column : ParseColumnList(column_csv)) {
 			if (!column.second.empty()) {
@@ -1679,6 +1747,9 @@ struct CatalogBackend {
 		Connection con(*instance);
 		if (con.Query("SELECT * FROM " + source + " WHERE false")->HasError()) {
 			return string(); // the object does not bind here; not the projection's fault
+		}
+		if (checked) {
+			*checked = true; // whatever the answer, the projection was probed rather than waved through
 		}
 		auto sql = "SELECT " + StringUtil::Join(items, ", ") + " FROM " + source;
 		if (ProbeSchema(sql, false, {}, out)) {
@@ -1884,9 +1955,16 @@ struct CatalogBackend {
 		    "CREATE TABLE IF NOT EXISTS " + Tbl("grant_columns") +
 		        "(\"role\" VARCHAR, \"vcat\" VARCHAR, \"vname\" VARCHAR, \"pos\" INTEGER, \"name\" VARCHAR,"
 		        " \"type\" VARCHAR, PRIMARY KEY (\"role\", \"vcat\", \"vname\", \"pos\"))",
-		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '9' WHERE NOT EXISTS (SELECT 1 FROM " +
+		    // spec 027 (schema v10): whether a predicate was actually bound when it was written. Spec 021
+		    // binds one where it can, and accepts it unchecked when the object cannot be bound at all -
+		    // so "it was accepted" and "it was judged" are different facts, and only the second one lets
+		    // a write with a second relation in scope trust a subquery inside it.
+		    "ALTER TABLE " + Tbl("relations") + " ADD COLUMN IF NOT EXISTS \"rls_checked\" BOOLEAN",
+		    "ALTER TABLE " + Tbl("role_object_caps") + " ADD COLUMN IF NOT EXISTS \"rls_checked\" BOOLEAN",
+		    "ALTER TABLE " + Tbl("role_catalogs") + " ADD COLUMN IF NOT EXISTS \"rls_checked\" BOOLEAN",
+		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '10' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
-		    "UPDATE " + Tbl("meta") + " SET \"value\" = '9' WHERE \"key\" = 'schema_version' AND \"value\" < '9'",
+		    "UPDATE " + Tbl("meta") + " SET \"value\" = '10' WHERE \"key\" = 'schema_version' AND \"value\" < '10'",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'policy_version')",
 		};
@@ -2088,28 +2166,31 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 	                     " AND \"vname\" = " + Lit(vname));
 	statements.push_back("DELETE FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                     " AND \"vname\" = " + Lit(vname));
+	// a predicate is checked where it is written, not where it is used (spec 021): a predicate that
+	// cannot bind against its own object is a mistake, and it only ever surfaced for whoever queried
+	bool checked = false;
+	if (!rls.empty()) {
+		auto source = form == "view" ? "(" + view_sql + ")" : phys;
+		auto error = catalog.PredicateError(source, rls, &checked);
+		if (!error.empty()) {
+			throw InvalidInputException("acl: the predicate of \"%s\" does not bind against it: %s", vname, error);
+		}
+	}
 	// the comment is read by the caller BEFORE the delete above and carried through: a definition
 	// change is not a reason to lose an operator's documentation
 	statements.push_back("INSERT INTO " + catalog.Tbl("relations") +
-	                     "(\"vcat\", \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"comment\", \"origin\")"
+	                     "(\"vcat\", \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"comment\", \"origin\","
+	                     " \"rls_checked\")"
 	                     " VALUES (" +
 	                     Lit(vcat) + ", " + Lit(vname) + ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) +
 	                     ", " + Lit(rls) + ", " + (comment.empty() ? string("NULL") : Lit(comment)) + ", " +
-	                     (origin.empty() ? string("NULL") : Lit(origin)) + ")");
+	                     (origin.empty() ? string("NULL") : Lit(origin)) + ", " +
+	                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ")");
 	idx_t pos = 0;
 	for (auto &column : columns) {
 		statements.push_back("INSERT INTO " + catalog.Tbl("relation_columns") + " VALUES (" + Lit(vcat) + ", " +
 		                     Lit(vname) + ", " + std::to_string(pos++) + ", " + Lit(column.first) + ", " +
 		                     Lit(column.second) + ")");
-	}
-	// a predicate is checked where it is written, not where it is used (spec 021): a predicate that
-	// cannot bind against its own object is a mistake, and it only ever surfaced for whoever queried
-	if (!rls.empty()) {
-		auto source = form == "view" ? "(" + view_sql + ")" : phys;
-		auto error = catalog.PredicateError(source, rls);
-		if (!error.empty()) {
-			throw InvalidInputException("acl: the predicate of \"%s\" does not bind against it: %s", vname, error);
-		}
 	}
 	// the object's column schema (spec 010): a view has no physical row and no declared projection,
 	// so bind its SQL once, here on the write path; anything else keeps the projected names
@@ -2144,6 +2225,73 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 		statements.push_back(statement);
 	}
 	return statements;
+}
+
+//! What a grant's projection actually produces, folded the way the resolver folds it (spec 026), as
+//! the `grant_columns` rows for one grant. Shared by the write path, where a projection that cannot
+//! bind is a mistake worth refusing, and by `acl_refresh_schema`, where it is only a fact that has
+//! not become true yet (spec 027) - `strict` picks between the two.
+using ReadFn = std::function<unique_ptr<MaterializedQueryResult>(const string &)>;
+
+void GrantProjectionStatements(CatalogBackend &catalog, const ReadFn &read, const string &role, const string &vcat,
+                               const string &vname, const string &columns, vector<string> &statements, bool strict) {
+	auto clear = "DELETE FROM " + catalog.Tbl("grant_columns") + " WHERE \"role\" = " + Lit(role) +
+	             " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname);
+	if (strict) {
+		// the grant is being rewritten, so whatever an earlier projection produced is gone either way
+		statements.push_back(clear);
+	}
+	if (columns.empty()) {
+		return;
+	}
+	auto shape = read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + catalog.Tbl("relations") +
+	                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+	if (shape->RowCount() == 0) {
+		return;
+	}
+	auto text = [&](idx_t column) {
+		auto value = shape->GetValue(column, 0);
+		return value.IsNull() ? string() : value.ToString();
+	};
+	auto form = text(0);
+	// What the role actually gets is the two levels folded together, the way the resolver folds them:
+	// a grant's *expression* is evaluated over the physical row, while a bare name in it refers to the
+	// object's own column - which a rename may have moved.
+	string source = form == "view" ? "(" + text(2) + ")" : text(1);
+	case_insensitive_map_t<string> own;
+	if (form != "view") {
+		auto rows = read("SELECT \"name\", \"expr\" FROM " + catalog.Tbl("relation_columns") +
+		                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		for (idx_t i = 0; i < rows->RowCount(); i++) {
+			own[rows->GetValue(0, i).ToString()] =
+			    rows->GetValue(1, i).IsNull() ? string() : rows->GetValue(1, i).ToString();
+		}
+	}
+	vector<std::pair<string, string>> derived;
+	if (source.empty()) {
+		return;
+	}
+	bool probed = false;
+	auto error = catalog.ProjectionSchema(source, columns, own, derived, &probed);
+	if (!error.empty() || !probed) {
+		if (!strict) {
+			return; // the object still cannot judge it; leave what an earlier probe found in place
+		}
+		if (!probed) {
+			return; // accepted unprobed, exactly as spec 026 wrote it
+		}
+		throw InvalidInputException("acl: the projection of the grant on \"%s\" does not bind against it: %s", vname,
+		                            error);
+	}
+	if (!strict) {
+		statements.push_back(clear); // re-probed: replace the earlier rows rather than lose them
+	}
+	idx_t pos = 0;
+	for (auto &column : derived) {
+		statements.push_back("INSERT INTO " + catalog.Tbl("grant_columns") + " VALUES (" + Lit(role) + ", " +
+		                     Lit(vcat) + ", " + Lit(vname) + ", " + std::to_string(pos++) + ", " + Lit(column.first) +
+		                     ", " + Lit(column.second) + ")");
+	}
 }
 
 } // namespace
@@ -2551,8 +2699,8 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	static const case_insensitive_map_t<string> LISTINGS = {
 	    {"catalogs", "SELECT \"vcat\", \"comment\" FROM %s"},
 	    {"schemas", "SELECT \"vcat\", \"path\", \"phys_path\", \"origin\", \"comment\" FROM %s"},
-	    {"relations", "SELECT \"vcat\", \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"origin\","
-	                  " \"comment\" FROM %s"},
+	    {"relations", "SELECT \"vcat\", \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"rls_checked\","
+	                  " \"origin\", \"comment\" FROM %s"},
 	    {"relation_columns", "SELECT \"vcat\", \"vname\", \"pos\", \"name\", \"expr\" FROM %s"},
 	    {"object_columns", "SELECT \"vcat\", \"vname\", \"kind\", \"pos\", \"name\", \"type\", \"comment\","
 	                       " \"derived\" FROM %s"},
@@ -2563,10 +2711,12 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"reference_columns", "SELECT \"vcat\", \"name\", \"pos\", \"side\", \"column\", \"param\" FROM %s"},
 	    {"roles", "SELECT \"role\", \"comment\" FROM %s"},
 	    {"role_claims", "SELECT \"role\", \"claim\", \"value\" FROM %s"},
-	    {"grants", "SELECT \"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\" FROM %s"},
+	    {"grants", "SELECT \"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"rls_checked\", \"columns\""
+	               " FROM %s"},
 	    {"schema_grants", "SELECT \"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\", \"into\","
 	                      " \"virtual_only\", \"comment\" FROM %s"},
-	    {"object_grants", "SELECT \"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\" FROM %s"},
+	    {"object_grants", "SELECT \"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"rls_checked\", \"columns\""
+	                      " FROM %s"},
 	    {"grant_columns", "SELECT \"role\", \"vcat\", \"vname\", \"pos\", \"name\", \"type\" FROM %s"},
 	    {"admins", "SELECT \"role\", \"scope\", \"vcat\" FROM %s"},
 	    {"issuers", "SELECT \"issuer\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\", \"jwks_uri\""
@@ -2894,12 +3044,20 @@ void PolicyStore::CatalogGrant(const string &role, const string &vcat, const str
 		throw BinderException("acl admin: a grant needs a catalog name");
 	}
 	acl_detail::ParseCaps(caps_json); // validate before persisting
-	catalog->Write({"DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
-	                    " AND \"vcat\" = " + Lit(vcat),
-	                "INSERT INTO " + catalog->Tbl("role_catalogs") +
-	                    "(\"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\") VALUES (" + Lit(role) +
-	                    ", " + Lit(vcat) + ", " + (is_main ? "true" : "false") + ", " + Lit(caps_json) + ", " +
-	                    Lit(rls) + ", " + Lit(columns) + ")"});
+	// the verdict is read on the connection that writes it (spec 027), so what it judges the predicate
+	// against is the catalog this grant commits into
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto checked = catalog->CatalogPredicateChecked(read, vcat, rls);
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
+		                     " AND \"vcat\" = " + Lit(vcat));
+		statements.push_back("INSERT INTO " + catalog->Tbl("role_catalogs") +
+		                     "(\"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\", \"rls_checked\")"
+		                     " VALUES (" +
+		                     Lit(role) + ", " + Lit(vcat) + ", " + (is_main ? "true" : "false") + ", " +
+		                     Lit(caps_json) + ", " + Lit(rls) + ", " + Lit(columns) + ", " +
+		                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ")");
+	});
 }
 
 void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
@@ -3036,6 +3194,78 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 				statements.push_back(statement);
 			}
 			refreshed++;
+		}
+		// spec 027: the verdicts, not only the schemas. A predicate written while its object could not
+		// be bound was accepted unchecked (spec 021), and a grant's projection was left unprobed for
+		// the same reason (spec 026) - both are facts about the physical world, and this is the moment
+		// the physical world is looked at again.
+		auto shapes = read("SELECT \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\" FROM " +
+		                   catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) + name_filter);
+		case_insensitive_map_t<string> sources;
+		for (idx_t row = 0; row < shapes->RowCount(); row++) {
+			auto text = [&](idx_t column) {
+				auto value = shapes->GetValue(column, row);
+				return value.IsNull() ? string() : value.ToString();
+			};
+			auto object = text(0);
+			auto source = text(1) == "view" ? "(" + text(3) + ")" : text(2);
+			sources[object] = source;
+			auto rls = text(4);
+			if (rls.empty()) {
+				continue;
+			}
+			bool checked = false;
+			auto error = catalog->PredicateError(source, rls, &checked);
+			// a predicate that now binds and fails is broken, and every read of the object already
+			// says so - recording the verdict is what an operator can act on, aborting the refresh of
+			// a whole catalog is not
+			statements.push_back("UPDATE " + catalog->Tbl("relations") +
+			                     " SET \"rls_checked\" = " + (checked && error.empty() ? "true" : "false") +
+			                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(object));
+			refreshed++;
+		}
+		auto grants = read("SELECT \"role\", \"vname\", \"rls\", \"columns\" FROM " + catalog->Tbl("role_object_caps") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) + name_filter);
+		for (idx_t row = 0; row < grants->RowCount(); row++) {
+			auto text = [&](idx_t column) {
+				auto value = grants->GetValue(column, row);
+				return value.IsNull() ? string() : value.ToString();
+			};
+			auto role = text(0);
+			auto object = text(1);
+			auto rls = text(2);
+			auto columns = text(3);
+			auto source = sources.find(object);
+			if (source == sources.end()) {
+				continue; // the grant names something that is not a relation; nothing to bind against
+			}
+			if (!rls.empty()) {
+				bool checked = false;
+				auto error = catalog->PredicateError(source->second, rls, &checked);
+				statements.push_back("UPDATE " + catalog->Tbl("role_object_caps") + " SET \"rls_checked\" = " +
+				                     (checked && error.empty() ? "true" : "false") + " WHERE \"role\" = " + Lit(role) +
+				                     " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(object));
+			}
+			if (!columns.empty()) {
+				GrantProjectionStatements(*catalog, read, role, vcat, object, columns, statements, false);
+			}
+			if (!rls.empty() || !columns.empty()) {
+				refreshed++;
+			}
+		}
+		// the catalog level of the chain has no single object to bind against, so it is judged against
+		// all of them - which is exactly what a refresh has just made current
+		if (vname.empty()) {
+			auto catalog_grants = read("SELECT \"role\", \"rls\" FROM " + catalog->Tbl("role_catalogs") +
+			                           " WHERE \"vcat\" = " + Lit(vcat) + " AND \"rls\" IS NOT NULL AND \"rls\" <> ''");
+			for (idx_t row = 0; row < catalog_grants->RowCount(); row++) {
+				auto role = catalog_grants->GetValue(0, row).ToString();
+				auto rls = catalog_grants->GetValue(1, row).ToString();
+				statements.push_back("UPDATE " + catalog->Tbl("role_catalogs") + " SET \"rls_checked\" = " +
+				                     (catalog->CatalogPredicateChecked(read, vcat, rls) ? "true" : "false") +
+				                     " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat));
+				refreshed++;
+			}
 		}
 	});
 	return refreshed;
@@ -3460,6 +3690,7 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 	                            vector<string> &statements) {
 		// the grant's predicate is checked against the object it filters, here rather than at query
 		// time (spec 021) - a predicate that cannot bind is a mistake, whoever eventually runs into it
+		bool checked = false;
 		if (!rls.empty()) {
 			auto shape = read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + catalog->Tbl("relations") +
 			                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
@@ -3468,7 +3699,7 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 				auto phys = shape->GetValue(1, 0).IsNull() ? string() : shape->GetValue(1, 0).ToString();
 				auto view_sql = shape->GetValue(2, 0).IsNull() ? string() : shape->GetValue(2, 0).ToString();
 				auto source = form == "view" ? "(" + view_sql + ")" : phys;
-				auto error = catalog->PredicateError(source, rls);
+				auto error = catalog->PredicateError(source, rls, &checked);
 				if (!error.empty()) {
 					throw InvalidInputException("acl: the predicate of the grant on \"%s\" does not bind "
 					                            "against it: %s",
@@ -3479,51 +3710,15 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 		// what this projection actually produces: names a mask renames the type of, and columns the
 		// object never had. Probed here, where it is written, so a listing can describe what the role
 		// reads rather than what the physical table holds (spec 026).
-		statements.push_back("DELETE FROM " + catalog->Tbl("grant_columns") + " WHERE \"role\" = " + Lit(role) +
-		                     " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
-		if (!columns.empty()) {
-			auto shape = read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + catalog->Tbl("relations") +
-			                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
-			if (shape->RowCount() > 0) {
-				auto form = shape->GetValue(0, 0).IsNull() ? string() : shape->GetValue(0, 0).ToString();
-				auto phys = shape->GetValue(1, 0).IsNull() ? string() : shape->GetValue(1, 0).ToString();
-				auto view_sql = shape->GetValue(2, 0).IsNull() ? string() : shape->GetValue(2, 0).ToString();
-				// What the role actually gets is the two levels folded together, the way the resolver
-				// folds them: a grant's *expression* is evaluated over the physical row, while a bare
-				// name in it refers to the object's own column - which a rename may have moved.
-				string source = form == "view" ? "(" + view_sql + ")" : phys;
-				case_insensitive_map_t<string> own;
-				if (form != "view") {
-					auto rows = read("SELECT \"name\", \"expr\" FROM " + catalog->Tbl("relation_columns") +
-					                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
-					for (idx_t i = 0; i < rows->RowCount(); i++) {
-						own[rows->GetValue(0, i).ToString()] =
-						    rows->GetValue(1, i).IsNull() ? string() : rows->GetValue(1, i).ToString();
-					}
-				}
-				vector<std::pair<string, string>> derived;
-				if (!source.empty()) {
-					auto error = catalog->ProjectionSchema(source, columns, own, derived);
-					if (!error.empty()) {
-						throw InvalidInputException("acl: the projection of the grant on \"%s\" does not bind "
-						                            "against it: %s",
-						                            vname, error);
-					}
-					idx_t pos = 0;
-					for (auto &column : derived) {
-						statements.push_back("INSERT INTO " + catalog->Tbl("grant_columns") + " VALUES (" + Lit(role) +
-						                     ", " + Lit(vcat) + ", " + Lit(vname) + ", " + std::to_string(pos++) +
-						                     ", " + Lit(column.first) + ", " + Lit(column.second) + ")");
-					}
-				}
-			}
-		}
+		GrantProjectionStatements(*catalog, read, role, vcat, vname, columns, statements, true);
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
 		                     " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
 		statements.push_back("INSERT INTO " + catalog->Tbl("role_object_caps") +
-		                     "(\"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\") VALUES (" + Lit(role) +
-		                     ", " + Lit(vcat) + ", " + Lit(vname) + ", " + Lit(caps_json) + ", " + Lit(rls) + ", " +
-		                     Lit(columns) + ")");
+		                     "(\"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\", \"rls_checked\")"
+		                     " VALUES (" +
+		                     Lit(role) + ", " + Lit(vcat) + ", " + Lit(vname) + ", " + Lit(caps_json) + ", " +
+		                     Lit(rls) + ", " + Lit(columns) + ", " +
+		                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ")");
 	});
 }
 

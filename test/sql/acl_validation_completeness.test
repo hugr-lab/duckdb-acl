@@ -1,0 +1,296 @@
+# name: test/sql/acl_validation_completeness.test
+# description: a predicate accepted unchecked stays marked as such (spec 027), is refused where a
+#   second relation could capture it, and is judged again by acl_refresh_schema
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.feed(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+CREATE TABLE phys.main.allowed(t VARCHAR);
+
+statement ok
+INSERT INTO phys.main.feed VALUES (1, 'acme', 10), (7, 'zzz', 70);
+
+statement ok
+INSERT INTO phys.main.allowed VALUES ('acme');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.feed AS phys.main.feed;
+
+statement ok
+ACL ADMIN GRANT TABLE c.feed TO ROLE r WITH (select);
+
+# --- a grant written while its object cannot be bound is accepted, and says so ----------------------
+# spec 021 accepts it: there is nothing to judge it against. The verdict is now recorded rather than
+# forgotten, which is what lets a write path tell "judged and fine" from "never judged".
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS notyet.main.orders;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select, update, merge)
+    RLS (tenant IN (SELECT t FROM phys.main.allowed));
+
+query II
+SELECT vname, rls_checked FROM acl_object_grants() WHERE role = 'r' ORDER BY vname;
+----
+feed	NULL
+orders	false
+
+# a grant with no predicate has no verdict to record - NULL is "nothing to judge", false is "something
+# to judge and nothing judged it"
+query I
+SELECT rls_checked FROM acl_object_grants() WHERE vname = 'feed';
+----
+NULL
+
+statement ok
+ACL ADMIN GRANT TABLE c.feed TO ROLE r WITH (select) RLS (tenant = acl_claim('tenant'));
+
+query I
+SELECT rls_checked FROM acl_object_grants() WHERE vname = 'feed';
+----
+true
+
+# --- the object appears, and reads work while the verdict is still missing --------------------------
+
+statement ok
+ATTACH ':memory:' AS notyet;
+
+statement ok
+CREATE TABLE notyet.main.orders(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO notyet.main.orders VALUES (1, 'acme', 10), (2, 'globex', 20);
+
+# a read has only the target in scope, so the binder decides what the subquery's names mean
+query II
+ACL ROLE "r" SELECT id, tenant FROM orders ORDER BY id;
+----
+1	acme
+
+# and so does a single-relation write
+statement ok
+ACL ROLE "r" UPDATE orders SET amount = 11 WHERE id = 1;
+
+query I
+SELECT amount FROM notyet.main.orders WHERE id = 1;
+----
+11
+
+# --- but a second relation in scope is refused while the predicate is unjudged ----------------------
+# the subquery's body keeps its own scope, which is only safe because the predicate was bound against
+# its target. Without that verdict a bare name in there could resolve against the source instead.
+
+statement error
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
+    WHEN MATCHED THEN UPDATE SET amount = feed.amount;
+----
+<REGEX>:.*contains a subquery and was never checked.*
+
+statement error
+ACL ROLE "r" UPDATE orders SET amount = feed.amount FROM feed WHERE orders.id = feed.id;
+----
+<REGEX>:.*contains a subquery and was never checked.*
+
+# --- acl_refresh_schema judges it, and the write goes through ---------------------------------------
+
+statement ok
+SELECT acl_refresh_schema('c');
+
+query I
+SELECT rls_checked FROM acl_object_grants() WHERE vname = 'orders';
+----
+true
+
+statement ok
+ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
+    WHEN MATCHED THEN UPDATE SET amount = feed.amount;
+
+query II
+SELECT id, amount FROM notyet.main.orders ORDER BY id;
+----
+1	10
+2	20
+
+# --- the refusal is exactly as narrow as the reason for it -------------------------------------------
+# a predicate with no subquery is fully qualified onto the target (spec 020), so nothing depends on
+# it having been judged
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.plain AS later.main.orders;
+
+statement ok
+ACL ADMIN GRANT TABLE c.plain TO ROLE r WITH (select, merge) RLS (tenant = acl_claim('tenant'));
+
+query I
+SELECT rls_checked FROM acl_object_grants() WHERE vname = 'plain';
+----
+false
+
+statement ok
+ATTACH ':memory:' AS later;
+
+statement ok
+CREATE TABLE later.main.orders(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO later.main.orders VALUES (1, 'acme', 10);
+
+statement ok
+ACL ROLE "r" MERGE INTO plain USING feed ON plain.id = feed.id
+    WHEN MATCHED THEN UPDATE SET amount = feed.amount;
+
+# --- an object's own predicate carries the same verdict ------------------------------------------------
+
+statement ok
+ACL ADMIN ADD TABLE absent.main.t AS c.own COLUMNS (id, tenant) RLS (tenant = acl_claim('tenant'));
+
+query I
+SELECT rls_checked FROM acl_relations() WHERE vname = 'own';
+----
+false
+
+statement ok
+ATTACH ':memory:' AS absent;
+
+statement ok
+CREATE TABLE absent.main.t(id INT, tenant VARCHAR);
+
+statement ok
+SELECT acl_refresh_schema('c');
+
+query I
+SELECT rls_checked FROM acl_relations() WHERE vname = 'own';
+----
+true
+
+# --- a predicate that now binds and fails is recorded, not thrown ---------------------------------------
+# every read of that object already fails; aborting the refresh of a whole catalog would only take the
+# other objects' verdicts down with it
+
+statement ok
+ACL ADMIN ADD TABLE gone.main.t AS c.broken RLS (nosuchcolumn = 1);
+
+statement ok
+ATTACH ':memory:' AS gone;
+
+statement ok
+CREATE TABLE gone.main.t(id INT);
+
+statement ok
+SELECT acl_refresh_schema('c');
+
+query I
+SELECT rls_checked FROM acl_relations() WHERE vname = 'broken';
+----
+false
+
+# the rest of the catalog was judged all the same
+query I
+SELECT rls_checked FROM acl_relations() WHERE vname = 'own';
+----
+true
+
+# --- and the refresh re-probes a grant projection that could not bind before ------------------------------
+# spec 026 accepts an unprobed projection for the same reason spec 021 accepts an unjudged predicate
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.masked AS pending.main.t;
+
+statement ok
+ACL ADMIN GRANT TABLE c.masked TO ROLE r WITH (select) COLUMNS (id, label = coalesce(tenant, 'none'));
+
+query I
+SELECT count(*) FROM acl_grant_columns() WHERE vname = 'masked';
+----
+0
+
+statement ok
+ATTACH ':memory:' AS pending;
+
+statement ok
+CREATE TABLE pending.main.t(id INT, tenant VARCHAR);
+
+statement ok
+SELECT acl_refresh_schema('c');
+
+query II
+SELECT name, type FROM acl_grant_columns() WHERE vname = 'masked' ORDER BY pos;
+----
+id	INTEGER
+label	VARCHAR
+
+# and that is what the role's metadata says it reads
+query I
+ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM information_schema.columns
+    WHERE table_name = 'masked';
+----
+id,label
+
+# a refresh that cannot re-probe leaves what an earlier probe found: losing the rows would make the
+# metadata describe the physical table again, which is the leak spec 026 closed
+
+statement ok
+DETACH pending;
+
+statement ok
+SELECT acl_refresh_schema('c');
+
+query II
+SELECT name, type FROM acl_grant_columns() WHERE vname = 'masked' ORDER BY pos;
+----
+id	INTEGER
+label	VARCHAR
+
+# --- the catalog level of the chain is judged against every object it filters -----------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG one;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE one.t AS phys.main.feed;
+
+statement ok
+ACL ADMIN GRANT CATALOG one TO ROLE r CAPS '{}' RLS (tenant = acl_claim('tenant'));
+
+query I
+SELECT rls_checked FROM acl_grants() WHERE role = 'r' AND vcat = 'one';
+----
+true
+
+# an object it does not fit takes the verdict down: the predicate filters that one too
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE one.u AS phys.main.allowed;
+
+statement ok
+SELECT acl_refresh_schema('one');
+
+query I
+SELECT rls_checked FROM acl_grants() WHERE role = 'r' AND vcat = 'one';
+----
+false
