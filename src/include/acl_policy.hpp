@@ -254,6 +254,12 @@ struct PolicyStore {
 	void CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
 	                        const string &target, const string &template_sql, const string &params = string(),
 	                        const string &returns = string());
+	//! spec 022: a reference is a declared join path between two objects - a hint, never a constraint.
+	//! Either `pairs` ("from_col=to_col, …") or `expr` (a qualified SQL condition), never both.
+	void CatalogAddReference(const string &vcat, const string &name, const string &from_vname, const string &to_vname,
+	                         const string &pairs, const string &expr, const string &cardinality, bool optional,
+	                         const string &join_method, const string &comment);
+	void CatalogDropReference(const string &vcat, const string &name);
 	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
 	                  const string &rls = "", const string &columns = "");
 	void CatalogRevoke(const string &role, const string &vcat);

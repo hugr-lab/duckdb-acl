@@ -112,6 +112,12 @@ the marker the client writes after the principal prefix: `ACL <mgmt>` (manage th
 in the virtual catalog. `ALTER VIRTUAL …` / `ALTER ROLE|ISSUER|GRANT …` change existing objects
 (missing target = error). `ACL ADMIN …` is the gateway's anonymous form and needs
 `acl_allow_anonymous_admin` once a policy source is enabled.
+**Spec 022**: references — declared join paths between objects: `acl_add_reference(vcat, name, from, to,
+pairs, expr, cardinality, optional, join_method, comment[, mode])` / `acl_drop_reference`, or
+`ACL ADMIN CREATE VIRTUAL REFERENCE c.name FROM a TO b ON (col = col) | ON EXPRESSION '<sql>'
+[CARDINALITY …] [OPTIONAL] [JOIN asof] [COMMENT '…']`. A hint an agent reads, never enforced and
+granting nothing; visible only when both ends and every column it names are. A principal reads its own
+through `acl_references([object])`, substituted before the function gate.
 **Spec 008**: `acl_use_functions('{"slot": "fn", ...}')` — the function-driver policy source
 (registered table-function callbacks, explicit slot map, read-only); and management SQL —
 `ACL ADMIN CREATE VIRTUAL CATALOG / CREATE ROLE / CREATE ISSUER / ADD TABLE|VIEW|SCHEMA|... /

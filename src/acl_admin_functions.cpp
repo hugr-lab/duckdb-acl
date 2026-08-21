@@ -189,6 +189,45 @@ bool AllowWrite(PolicyStore &store, const string &vcat, const string &vname, con
 	                      vcat, vname);
 }
 
+//! acl_add_reference(vcat, name, from, to [, pairs, expr, cardinality, optional, join_method, comment, mode]):
+//! declare a join path between two objects of the virtual catalog (spec 022). A hint, never enforced.
+void AclAddReferenceFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_add_reference", "catalog");
+		auto name = RequiredArg(args, 1, row, "acl_add_reference", "name");
+		auto from_vname = RequiredArg(args, 2, row, "acl_add_reference", "from");
+		auto to_vname = RequiredArg(args, 3, row, "acl_add_reference", "to");
+		auto &store = StoreOf(state);
+		if (!AllowWrite(store, vcat, name, "reference", OptionalArg(args, 10, row, ""))) {
+			continue;
+		}
+		auto optional_text = OptionalArg(args, 7, row, "");
+		store.CatalogAddReference(vcat, name, from_vname, to_vname, OptionalArg(args, 4, row, ""),
+		                          OptionalArg(args, 5, row, ""), OptionalArg(args, 6, row, ""),
+		                          StringUtil::CIEquals(optional_text, "true"), OptionalArg(args, 8, row, ""),
+		                          OptionalArg(args, 9, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_drop_reference(vcat, name [, mode]): remove a declared join path
+void AclDropReferenceFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_drop_reference", "catalog");
+		auto name = RequiredArg(args, 1, row, "acl_drop_reference", "name");
+		auto &store = StoreOf(state);
+		auto mode = OptionalArg(args, 2, row, "");
+		if (mode == "skip" && !store.CatalogObjectExists(vcat, name, "reference")) {
+			continue;
+		}
+		if (mode != "skip" && !store.CatalogObjectExists(vcat, name, "reference")) {
+			throw BinderException("acl admin: reference \"%s.%s\" does not exist", vcat, name);
+		}
+		store.CatalogDropReference(vcat, name);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
 //! acl_create_catalog(vcat [, comment]): register a virtual catalog (a shared tree of virtual names)
 void AclCreateCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -992,6 +1031,18 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_drop_role", {{v}, {v, v}}, AclDropRoleFunc);
 	register_admin_set("acl_drop_issuer", {{v}, {v, v}}, AclDropIssuerFunc);
 	register_admin("acl_drop_role_mapping", {v, v, v, v}, AclDropRoleMappingFunc);
+	// spec 022: declared join paths
+	register_admin_set("acl_add_reference",
+	                   {{v, v, v, v},
+	                    {v, v, v, v, v},
+	                    {v, v, v, v, v, v},
+	                    {v, v, v, v, v, v, v},
+	                    {v, v, v, v, v, v, v, v},
+	                    {v, v, v, v, v, v, v, v, v},
+	                    {v, v, v, v, v, v, v, v, v, v},
+	                    {v, v, v, v, v, v, v, v, v, v, v}},
+	                   AclAddReferenceFunc);
+	register_admin_set("acl_drop_reference", {{v, v}, {v, v, v}}, AclDropReferenceFunc);
 	// re-derive stored schemas; returns the number of objects re-probed
 	auto register_refresh = [&](vector<LogicalType> arguments) {
 		ScalarFunction function(Identifier("acl_refresh_schema"), std::move(arguments), LogicalType::BIGINT,

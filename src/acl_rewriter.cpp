@@ -637,6 +637,12 @@ private:
 			ref = BuildMetadataSubquery(surface, tf.alias.empty() ? Identifier(vname) : tf.alias);
 			return;
 		}
+		if (StringUtil::CIEquals(vname, "acl_references")) {
+			// spec 022: the principal's own view of the declared join paths. Substituted here, before
+			// the function gate, exactly as the metadata surfaces are - so it needs no hole in the gate.
+			ref = BuildReferencesSubquery(function, tf.alias.empty() ? Identifier(vname) : tf.alias);
+			return;
+		}
 		// not a virtual table function: gate by name, then rewrite arguments and any subquery argument
 		if (!store.FunctionAllowed(principal, function.GetQualifiedName())) {
 			Deny("table function \"" + vname + "\" is not allowed");
@@ -750,6 +756,35 @@ private:
 		string sql;
 		if (!store.MetadataListing(principal, surface, sql)) {
 			Deny(string("metadata is not available: this policy source cannot enumerate ") + surface);
+		}
+		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+	}
+
+	//! `FROM acl_references()` / `acl_references('orders')`: the references whose both ends this
+	//! principal can see, optionally narrowed to the ones touching one object.
+	unique_ptr<TableRef> BuildReferencesSubquery(FunctionExpression &function, const Identifier &alias) {
+		auto &arguments = function.GetArguments();
+		if (arguments.size() > 1) {
+			Deny("acl_references takes at most one argument: the object to list references for");
+		}
+		string object;
+		if (arguments.size() == 1) {
+			auto &argument = arguments[0].GetExpression();
+			if (argument.GetExpressionClass() != ExpressionClass::CONSTANT) {
+				// the filter is spliced into generated SQL, so it has to be known now - and the golden
+				// rule forbids adding a parameter of our own to carry it
+				Deny("acl_references needs a constant object name");
+			}
+			object = argument.Cast<ConstantExpression>().GetValue().ToString();
+		}
+		string sql;
+		if (!store.MetadataListing(principal, "references", sql)) {
+			Deny("references are not available: this policy source cannot enumerate them");
+		}
+		if (!object.empty()) {
+			auto quoted = "'" + StringUtil::Replace(object, "'", "''") + "'";
+			sql = "SELECT * FROM (" + sql + ") WHERE from_object = " + quoted + " OR to_object = " + quoted;
 		}
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
@@ -1273,6 +1308,31 @@ void BakeNullMarkersInNode(QueryNode &node, const vector<string> &param_types, c
 }
 
 } // namespace
+
+vector<std::pair<string, string>> QualifiedColumnRefs(const string &expression, const ParserOptions &options) {
+	ParserOptions inner = options;
+	inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
+	auto parsed = Parser::ParseExpressionList(expression, inner);
+	if (parsed.size() != 1) {
+		throw BinderException("acl: a join expression must be a single expression");
+	}
+	vector<std::pair<string, string>> refs;
+	std::function<void(const ParsedExpression &)> walk = [&](const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+			if (names.size() < 2) {
+				throw BinderException("acl: \"%s\" is not qualified - a join expression must name the side of "
+				                      "every column, so the reference can be checked against what a role sees",
+				                      names.empty() ? string("?") : names.back().GetIdentifierName());
+			}
+			refs.emplace_back(names[names.size() - 2].GetIdentifierName(), names.back().GetIdentifierName());
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) { walk(child); });
+	};
+	walk(*parsed[0]);
+	return refs;
+}
 
 string BakeTemplateForProbe(const string &sql, const ParserOptions &options, bool expression,
                             const vector<string> &param_types) {
