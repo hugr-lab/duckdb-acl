@@ -104,9 +104,16 @@ public:
 		case StatementType::MERGE_INTO_STATEMENT:
 			RewriteQueryNode(*stmt.Cast<MergeIntoStatement>().node);
 			break;
-		case StatementType::EXPLAIN_STATEMENT:
-			RewriteStatement(*stmt.Cast<ExplainStatement>().stmt);
+		case StatementType::EXPLAIN_STATEMENT: {
+			auto &explain = stmt.Cast<ExplainStatement>();
+			RewriteStatement(*explain.stmt);
+			if (replacement) {
+				// the inner statement became a different one (a PRAGMA answered as a SELECT, spec 031):
+				// the EXPLAIN keeps its place and explains what the principal actually runs
+				explain.stmt = std::move(replacement);
+			}
 			break;
+		}
 		case StatementType::CREATE_STATEMENT:
 			RewriteCreateStatement(stmt.Cast<CreateStatement>());
 			break;
@@ -144,8 +151,7 @@ public:
 		}
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		RewriteQueryNode(*select_stmt->node); // the DESCRIBE / SHOW inside is the principal's own
-		drop_statement = true;
-		follow_ups.push_back(std::move(select_stmt));
+		replacement = std::move(select_stmt);
 	}
 
 	//! The table a `PRAGMA table_info(...)` names, requoted part by part so it splices into generated
@@ -178,6 +184,10 @@ public:
 	//! a principal's DDL creates or drops. They run only if the DDL before them succeeded, so a failed
 	//! CREATE never leaves a record behind (spec 016).
 	vector<unique_ptr<SQLStatement>> follow_ups;
+	//! Set when a statement is answered by a different one entirely - a PRAGMA rewritten into the
+	//! SELECT that answers it (spec 031). The caller puts this in its place, so an enclosing EXPLAIN
+	//! keeps explaining the statement the principal actually runs.
+	unique_ptr<SQLStatement> replacement;
 	//! Set when the statement itself must not run: VIRTUAL ONLY registers what exists, it never creates
 	bool drop_statement = false;
 
@@ -1772,8 +1782,11 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 	for (auto &stmt : statements) {
 		rewriter.follow_ups.clear();
 		rewriter.drop_statement = false;
+		rewriter.replacement = nullptr;
 		rewriter.RewriteStatement(*stmt);
-		if (!rewriter.drop_statement) {
+		if (rewriter.replacement) {
+			rewritten.push_back(std::move(rewriter.replacement));
+		} else if (!rewriter.drop_statement) {
 			rewritten.push_back(std::move(stmt));
 		}
 		// a DDL statement's catalog record is appended right after it, so the batch stays in order

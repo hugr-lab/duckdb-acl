@@ -60,9 +60,10 @@ asks on connect.
 **`PRAGMA table_info` goes through `DESCRIBE`, not through the listing.** The rewrite builds
 `SELECT … FROM (DESCRIBE (SELECT * FROM <name>))` and rewrites *that*, so the answer comes down the
 read path: a name the principal has no access to is refused exactly as `DESCRIBE` refuses it, rather
-than answered with no rows — which a client would read as "a table with no columns". The statement is
-replaced through the existing `drop_statement` + `follow_ups` seam, so nothing in the entry point
-changed.
+than answered with no rows — which a client would read as "a table with no columns". The statement is replaced through a
+`replacement` slot the entry point consumes — and so does the `EXPLAIN` case, which puts it inside the
+`EXPLAIN` rather than instead of it. Dropping the statement and appending the answer, which was the
+first shape of this, made `EXPLAIN PRAGMA table_info(…)` quietly return the data instead of a plan.
 
 **Every other PRAGMA stays denied.** A PRAGMA is otherwise a setting, and a principal sets nothing;
 only `table_info` and `show_tables` name the catalog.
@@ -82,13 +83,14 @@ only `table_info` and `show_tables` name the catalog.
 
 ## Testing
 
-`test/sql/acl_show_surface.test` (87 assertions): `SHOW DATABASES` listing the granted catalogs and no
+`test/sql/acl_show_surface.test` (90 assertions): `SHOW DATABASES` listing the granted catalogs and no
 physical one; `SHOW SCHEMAS` in its three-column shape with `current` true only for the MAIN catalog's
 `main`; `SHOW ALL TABLES` in its six-column shape, carrying only the columns the role reads and none
 of the objects it cannot see; `SHOW TABLES` and `SHOW TABLES FROM` unchanged; `SHOW VARIABLES` empty
 in the right shape; `PRAGMA table_info` in DuckDB's shape for a bare and a schema-qualified name,
 refused for a hidden name and for a physical one; `PRAGMA show_tables`; other PRAGMAs refused by name;
-and a role that may see nothing seeing nothing through any of them.
+a role that may see nothing seeing nothing through any of them; and an enclosing `EXPLAIN` still
+explaining — the plan shape, not the data — while `EXPLAIN` of a denied PRAGMA is still denied.
 
 ## Alternatives considered
 

@@ -199,3 +199,17 @@ statement error
 ACL ROLE "empty" PRAGMA table_info('orders');
 ----
 <REGEX>:.*select on "orders" is not allowed.*
+
+# --- an enclosing EXPLAIN keeps its place -----------------------------------------------------------------
+# the PRAGMA is answered by a different statement, so the replacement has to happen inside the EXPLAIN
+# rather than instead of it - otherwise a client asking for a plan quietly gets the data
+
+query II
+ACL ROLE "r" EXPLAIN PRAGMA table_info('orders');
+----
+physical_plan	<REGEX>:.*Projection.*
+
+statement error
+ACL ROLE "r" EXPLAIN PRAGMA version;
+----
+<REGEX>:.*PRAGMA "version" is not permitted under ACL.*
