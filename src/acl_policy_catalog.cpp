@@ -1656,15 +1656,36 @@ struct CatalogBackend {
 
 	//! Bind a projection over a relation and return the columns it produces (spec 026). Never fatal: an
 	//! unbindable projection leaves the listing as it was rather than refusing the grant.
-	bool ProjectionSchema(const string &source, const string &column_csv, vector<std::pair<string, string>> &out) {
+	//! Returns the binder's message when the projection is at fault, and an empty string when it binds -
+	//! or when the object itself does not bind, since then there is nothing to judge it against. The
+	//! same two steps as a predicate's check (spec 021), for the same reason.
+	string ProjectionSchema(const string &source, const string &column_csv, const case_insensitive_map_t<string> &own,
+	                        vector<std::pair<string, string>> &out) {
 		vector<string> items;
 		for (auto &column : ParseColumnList(column_csv)) {
-			items.push_back(column.second.empty() ? column.first : column.second + " AS " + column.first);
+			if (!column.second.empty()) {
+				items.push_back(column.second + " AS " + column.first); // the grant computes it
+				continue;
+			}
+			auto object = own.find(column.first);
+			// a bare name is the object's column, which its own projection may have renamed
+			items.push_back((object != own.end() && !object->second.empty() ? object->second : column.first) + " AS " +
+			                column.first);
 		}
 		if (items.empty()) {
-			return false;
+			return string();
 		}
-		return ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + source, false, {}, out);
+		auto instance = Db();
+		Connection con(*instance);
+		if (con.Query("SELECT * FROM " + source + " WHERE false")->HasError()) {
+			return string(); // the object does not bind here; not the projection's fault
+		}
+		auto sql = "SELECT " + StringUtil::Join(items, ", ") + " FROM " + source;
+		if (ProbeSchema(sql, false, {}, out)) {
+			return string();
+		}
+		auto probe = con.Query("SELECT * FROM (" + sql + ") WHERE false");
+		return probe->HasError() ? probe->GetError() : string("the projection could not be described");
 	}
 
 	//! Read a document through duckdb's own filesystem (spec 023). A local path works out of the box;
@@ -3467,9 +3488,27 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 				auto form = shape->GetValue(0, 0).IsNull() ? string() : shape->GetValue(0, 0).ToString();
 				auto phys = shape->GetValue(1, 0).IsNull() ? string() : shape->GetValue(1, 0).ToString();
 				auto view_sql = shape->GetValue(2, 0).IsNull() ? string() : shape->GetValue(2, 0).ToString();
-				auto source = form == "view" ? "(" + view_sql + ")" : phys;
+				// What the role actually gets is the two levels folded together, the way the resolver
+				// folds them: a grant's *expression* is evaluated over the physical row, while a bare
+				// name in it refers to the object's own column - which a rename may have moved.
+				string source = form == "view" ? "(" + view_sql + ")" : phys;
+				case_insensitive_map_t<string> own;
+				if (form != "view") {
+					auto rows = read("SELECT \"name\", \"expr\" FROM " + catalog->Tbl("relation_columns") +
+					                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+					for (idx_t i = 0; i < rows->RowCount(); i++) {
+						own[rows->GetValue(0, i).ToString()] =
+						    rows->GetValue(1, i).IsNull() ? string() : rows->GetValue(1, i).ToString();
+					}
+				}
 				vector<std::pair<string, string>> derived;
-				if (!source.empty() && catalog->ProjectionSchema(source, columns, derived)) {
+				if (!source.empty()) {
+					auto error = catalog->ProjectionSchema(source, columns, own, derived);
+					if (!error.empty()) {
+						throw InvalidInputException("acl: the projection of the grant on \"%s\" does not bind "
+						                            "against it: %s",
+						                            vname, error);
+					}
 					idx_t pos = 0;
 					for (auto &column : derived) {
 						statements.push_back("INSERT INTO " + catalog->Tbl("grant_columns") + " VALUES (" + Lit(role) +

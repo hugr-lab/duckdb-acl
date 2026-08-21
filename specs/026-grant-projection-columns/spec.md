@@ -35,8 +35,15 @@ Spec 021 recorded this as a follow-up; spec 025 made it visible from two sides a
 binds a predicate: when a grant states columns, bind `SELECT <items> FROM <the object>` and store the
 resulting names and types in `grant_columns(role, vcat, vname, pos, name, type)`.
 
-Not fatal if it cannot bind — a source that is not attached leaves the listing as it was, rather than
-refusing the grant.
+**The two levels are folded the way the resolver folds them.** A bare name in a grant is the *object's*
+column, which the object's own projection may have renamed (`order_id` where the table has `id`); an
+expression in a grant is evaluated over the *physical* row, where a column the object's projection
+hides still is (`marker = coalesce(tenant, …)` on an object that does not expose `tenant`). The probe
+builds exactly that, so it describes what the role will get rather than one level of it.
+
+**A projection that cannot bind is refused where it is written**, the same rule spec 021 applies to a
+predicate — and the same two steps: the object is bound first, so a source that is not attached yet
+leaves the projection accepted unchecked rather than blamed for something it cannot be judged on.
 
 **The listing prefers the grant's rows for the names they define** and adds the ones the object never
 had. A name the grant does not mention still comes from the object's own probe and is still narrowed
@@ -58,11 +65,12 @@ a name has.
 
 ## Testing
 
-`test/sql/acl_grant_projection.test` (49 assertions): a grant projecting one column as-is, one masked
+`test/sql/acl_grant_projection.test` (61 assertions): a grant projecting one column as-is, one masked
 to `NULL` and one computed from a column the role cannot see; `DESCRIBE` and
 `information_schema.columns` agreeing on all three, and agreeing with what `SELECT *` returns; columns
-the grant omits absent from both; the operator's listing showing what was probed; a role without a
-projection of its own unaffected; rewriting a grant rewriting its rows; and revoking the grant or
+the grant omits absent from both; the operator's listing showing what was probed; the two levels folded together on a renamed object, where a bare name and a computed one land side by
+side and both surfaces agree; a projection that cannot bind refused, and one whose source is not
+attached accepted; a role without a projection of its own unaffected; rewriting a grant rewriting its rows; and revoking the grant or
 dropping the object clearing them.
 
 ## Alternatives considered

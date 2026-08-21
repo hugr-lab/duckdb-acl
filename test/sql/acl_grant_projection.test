@@ -80,6 +80,50 @@ t	id	INTEGER
 t	ssn	"NULL"
 t	label	VARCHAR
 
+# --- the two levels fold the way the resolver folds them -------------------------------------------------
+# a bare name in a grant is the object's column, which the object's own projection may have renamed;
+# an expression in a grant is evaluated over the physical row, where the hidden column still is
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.renamed AS phys.main.t COLUMNS (order_id = id, total = amount);
+
+statement ok
+ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select)
+    COLUMNS (order_id, marker = coalesce(tenant, 'none'));
+
+query II
+ACL ROLE "r" SELECT * FROM renamed;
+----
+1	acme
+
+query II
+ACL ROLE "r" SELECT column_name, data_type FROM information_schema.columns
+    WHERE table_name = 'renamed' ORDER BY column_name;
+----
+marker	VARCHAR
+order_id	INTEGER
+
+# --- a projection that cannot bind is refused where it is written ------------------------------------------
+# the same rule spec 021 applies to a predicate: a grant that could never work is a mistake, not
+# something to discover when someone reads
+
+statement error
+ACL ADMIN GRANT TABLE c.t TO ROLE r WITH (select) COLUMNS (id, bad = nosuchcolumn);
+----
+<REGEX>:.*projection of the grant on "t" does not bind against it.*
+
+# ... but an object whose source is not attached cannot judge one, so it is accepted unchecked
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.later AS notyet.main.x;
+
+statement ok
+ACL ADMIN GRANT TABLE c.later TO ROLE r WITH (select) COLUMNS (id, z = 1);
+
+query I
+SELECT count(*) FROM aclcat.acl.grant_columns WHERE vname = 'later';
+----
+0
+
 # --- a grant with no projection of its own is unaffected ------------------------------------------------
 
 statement ok
