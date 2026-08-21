@@ -472,7 +472,7 @@ void AclGrantObjectFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		auto columns = OptionalArg(args, 5, row, "");
 		auto &store = StoreOf(state);
 		// a grant on an object nobody defined is a policy that never applies: refuse it now
-		store.CatalogRequireGrantTarget(vcat, vname, !rls.empty() || !columns.empty());
+		store.CatalogRequireGrantTarget(vcat, vname, !rls.empty() || !columns.empty(), caps);
 		store.CatalogEnsureGrant(role, vcat, false);
 		store.CatalogSetObjectCaps(role, vcat, vname, caps, rls, columns);
 	}

@@ -1,0 +1,196 @@
+# name: test/sql/acl_function_capabilities.test
+# description: what a capability means for a virtual function (spec 032) - `select` is the only one
+#   that applies, and the ones that cannot are refused where they are written rather than stored
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 10), (2, 'globex', 20);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.report MACRO 'SELECT id, amount FROM phys.main.orders WHERE amount >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD SCALAR c.shout MACRO 'upper(acl_arg(1))';
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- `select` is the capability a call needs, and the only one it needs ------------------------------
+
+statement ok
+ACL ADMIN GRANT OBJECT c.report TO ROLE r WITH (select);
+
+query I
+ACL ROLE "r" SELECT count(*) FROM report(5);
+----
+2
+
+statement ok
+ACL ADMIN GRANT OBJECT c.shout TO ROLE r WITH (select);
+
+query I
+ACL ROLE "r" SELECT shout('x');
+----
+X
+
+# an explicit empty set takes it away again, on either kind
+statement ok
+ACL ADMIN GRANT OBJECT c.report TO ROLE r CAPS '{}';
+
+statement error
+ACL ROLE "r" SELECT count(*) FROM report(5);
+----
+<REGEX>:.*select on table function "report" is not allowed.*
+
+statement ok
+ACL ADMIN GRANT OBJECT c.shout TO ROLE r CAPS '{}';
+
+statement error
+ACL ROLE "r" SELECT shout('x');
+----
+<REGEX>:.*select on scalar function "shout" is not allowed.*
+
+# --- a write capability on a function is refused where it is written ----------------------------------
+# it would never be consulted: a function is called, and the DML paths never resolve one
+
+statement error
+ACL ADMIN GRANT OBJECT c.report TO ROLE r WITH (select, insert);
+----
+<REGEX>:.*"c.report" is a function, which is called rather than written.*`insert`.*
+
+statement error
+ACL ADMIN GRANT OBJECT c.report TO ROLE r WITH (select, update);
+----
+<REGEX>:.*is a function, which is called rather than written.*`update`.*
+
+statement error
+ACL ADMIN GRANT OBJECT c.report TO ROLE r WITH (select, delete);
+----
+<REGEX>:.*`delete`.*
+
+statement error
+ACL ADMIN GRANT OBJECT c.report TO ROLE r WITH (select, merge);
+----
+<REGEX>:.*`merge`.*
+
+statement error
+ACL ADMIN GRANT OBJECT c.shout TO ROLE r WITH (select, insert);
+----
+<REGEX>:.*"c.shout" is a function, which is called rather than written.*
+
+# a capability written as false is not a capability, so it is not refused
+statement ok
+ACL ADMIN GRANT OBJECT c.report TO ROLE r CAPS '{"select": true, "insert": false}';
+
+query I
+ACL ROLE "r" SELECT count(*) FROM report(5);
+----
+2
+
+# and a relation takes the write verbs as it always did
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE r WITH (select, insert, update, delete, merge);
+
+# --- `manage` is granted per catalog, never per object -------------------------------------------------
+# an object grant carrying it administers nothing, so it used to be stored and silently ignored
+
+statement error
+ACL ADMIN GRANT TABLE c.orders TO ROLE r CAPS '{"manage": true}';
+----
+<REGEX>:.*`manage` is granted per catalog, not per object.*
+
+statement error
+ACL ADMIN GRANT OBJECT c.report TO ROLE r CAPS '{"manage": true}';
+----
+<REGEX>:.*`manage` is granted per catalog, not per object.*
+
+# the catalog level is where it belongs, and it still works there
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{"select": true, "manage": true}' MAIN;
+
+query II
+SELECT role, scope FROM acl_admins() WHERE role = 'r';
+----
+
+query I
+SELECT count(*) FROM acl_grants() WHERE role = 'r' AND caps LIKE '%manage%';
+----
+1
+
+# --- naming a function as a DML target says so ----------------------------------------------------------
+# it used to read "no access to object", which is wrong about an object the principal can see
+
+statement ok
+ACL ADMIN GRANT OBJECT c.report TO ROLE r WITH (select);
+
+statement error
+ACL ROLE "r" INSERT INTO report VALUES (9, 90);
+----
+<REGEX>:.*"report" is a function, which is called rather than written.*
+
+statement error
+ACL ROLE "r" DELETE FROM report;
+----
+<REGEX>:.*"report" is a function, which is called rather than written.*
+
+statement error
+ACL ROLE "r" UPDATE report SET amount = 1;
+----
+<REGEX>:.*"report" is a function, which is called rather than written.*
+
+# a name that really is nothing still says that
+statement error
+ACL ROLE "r" INSERT INTO nowhere VALUES (1);
+----
+<REGEX>:.*no access to object "nowhere".*
+
+# --- a table function's rows and columns are still narrowed by a grant (spec 011) -----------------------
+# the capability decides whether it may be called; the policy decides what comes back
+
+statement ok
+ACL ADMIN GRANT OBJECT c.report TO ROLE r WITH (select) RLS (amount > 15);
+
+query I
+ACL ROLE "r" SELECT count(*) FROM report(0);
+----
+1
+
+statement ok
+ACL ADMIN GRANT OBJECT c.report TO ROLE r WITH (select) COLUMNS (id);
+
+query I
+ACL ROLE "r" SELECT count(*) FROM (DESCRIBE (SELECT * FROM report(0)));
+----
+1
+
+# ... while a scalar has neither, and a policy on one is refused (spec 011)
+statement error
+ACL ADMIN GRANT OBJECT c.shout TO ROLE r WITH (select) RLS (x = 1);
+----
+<REGEX>:.*has no rows or columns to narrow.*

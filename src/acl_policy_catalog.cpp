@@ -3852,7 +3852,8 @@ bool PolicyStore::CatalogObjectExists(const string &vcat, const string &vname, c
 	return catalog->Query(sql)->RowCount() > 0;
 }
 
-void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy) {
+void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy,
+                                            const string &caps_json) {
 	RequireCatalog(catalog, "acl_grant_object");
 	// what the name is, in the terms resolution uses: a relation, a table reached through a schema
 	// alias, a function - or the bare alias path, which resolution never looks up by itself
@@ -3869,6 +3870,23 @@ void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vn
 	case_insensitive_set_t kinds;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		kinds.insert(result->GetValue(0, row).ToString());
+	}
+	// spec 032: a capability that cannot apply to what it names is a misunderstanding, not a no-op.
+	// `manage` is granted per catalog (spec 009) and an object grant carrying it administers nothing;
+	// a function is called rather than written, so the write verbs on one would never be consulted.
+	auto caps = acl_detail::ParseCaps(caps_json);
+	if (caps.count("manage")) {
+		throw BinderException("acl admin: `manage` is granted per catalog, not per object - administering the ACL is "
+		                      "catalog-scoped (spec 009)");
+	}
+	if (!kinds.count("relation") && (kinds.count("table") || kinds.count("scalar"))) {
+		for (auto verb : {"insert", "update", "delete", "merge"}) {
+			if (caps.count(verb)) {
+				throw BinderException("acl admin: \"%s.%s\" is a function, which is called rather than written - "
+				                      "`%s` on it would never be consulted (grant `select`)",
+				                      vcat, vname, verb);
+			}
+		}
 	}
 	if (kinds.count("relation") || kinds.count("table")) {
 		return; // rows to narrow, and capabilities that resolution will find

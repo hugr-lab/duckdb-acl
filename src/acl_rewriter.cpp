@@ -1480,6 +1480,13 @@ private:
 		}
 		TablePolicy policy;
 		if (!store.ResolveTable(principal, key, policy)) {
+			// a name the principal *does* have, of a kind that is called rather than written: say which
+			// rather than leave an administrator reading "no access" about an object they can see
+			TablePolicy called;
+			if (store.ResolveTableFunction(principal, key, called) ||
+			    store.ResolveScalarFunction(principal, key, called)) {
+				Deny("\"" + key + "\" is a function, which is called rather than written");
+			}
 			Deny("no access to object \"" + key + "\"");
 		}
 		// a view / masked / computed relation is read-only; a grant that only narrows a real table

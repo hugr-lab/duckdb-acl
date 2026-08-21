@@ -53,5 +53,8 @@ checks are untouched (`ResolveDmlTarget` still requires the per-verb capability 
 
 ## Follow-ups
 
-- A `select`-like capability story for virtual table functions (today they are always readable once
-  granted); revisit with the production role-aware resolver.
+- ~~A `select`-like capability story for virtual table functions (today they are always readable once
+  granted); revisit with the production role-aware resolver.~~ Answered by
+  [spec 012](../012-function-select-gate/spec.md) (a call needs `select`) and
+  [spec 032](../032-function-capabilities/spec.md) (the capabilities that cannot apply are refused
+  where they are written).
