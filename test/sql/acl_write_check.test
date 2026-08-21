@@ -21,6 +21,12 @@ statement ok
 INSERT INTO phys.main.feed VALUES (1, 'zzz', 100), (7, 'zzz', 700);
 
 statement ok
+CREATE TABLE phys.main.keyed(id INT PRIMARY KEY, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.keyed VALUES (1, 'acme', 10), (2, 'globex', 20);
+
+statement ok
 ATTACH ':memory:' AS aclcat;
 
 statement ok
@@ -138,6 +144,42 @@ ACL ROLE "r" MERGE INTO orders USING feed ON orders.id = feed.id
     WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (feed.id, feed.amount);
 ----
 <REGEX>:.*must supply "tenant".*
+
+# --- ON CONFLICT DO UPDATE is an update wearing an insert's clothes ---------------------------------------
+# it decides what an existing row becomes, and the row it lands on may belong to someone else
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.keyed AS phys.main.keyed;
+
+statement ok
+ACL ADMIN GRANT TABLE c.keyed TO ROLE r WITH (select, insert, update) RLS (tenant = acl_claim('tenant'));
+
+statement error
+ACL ROLE "r" INSERT INTO keyed (id, tenant, amount) VALUES (1, 'acme', 99)
+    ON CONFLICT (id) DO UPDATE SET tenant = 'globex';
+----
+<REGEX>:.*does not satisfy the grant on "keyed".*
+
+# the conflicting row belongs to another tenant: the upsert must not reach it
+statement ok
+ACL ROLE "r" INSERT INTO keyed (id, tenant, amount) VALUES (2, 'acme', 777)
+    ON CONFLICT (id) DO UPDATE SET amount = 777;
+
+query III
+SELECT id, tenant, amount FROM phys.main.keyed ORDER BY id;
+----
+1	acme	10
+2	globex	20
+
+# ... while an upsert onto its own row works
+statement ok
+ACL ROLE "r" INSERT INTO keyed (id, tenant, amount) VALUES (1, 'acme', 55)
+    ON CONFLICT (id) DO UPDATE SET amount = 55;
+
+query II
+SELECT id, amount FROM phys.main.keyed WHERE id = 1;
+----
+1	55
 
 # --- an injected value satisfies the predicate by construction -------------------------------------------
 # the other half of spec 011: a grant that assigns the column does not need the writer to get it right

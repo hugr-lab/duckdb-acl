@@ -56,6 +56,12 @@ be touched" into "what they may become".
 the predicate exactly when the old one did, which the `WHERE` (or a `MERGE`'s `ON`) already
 guaranteed. That is not only cheaper — see below.
 
+**`ON CONFLICT … DO UPDATE` is an update wearing an insert's clothes**, and it was going through
+untouched: its `SET` list decides what an *existing* row becomes, and the row it lands on may belong to
+someone else entirely. It now carries the whole policy of an update — the written columns mapped and
+checked, the injections applied, the predicate AND-ed into its condition (so it cannot reach another
+principal's row) and the check on what the row becomes.
+
 **`MERGE`** gets both halves: its `UPDATE` branch is checked like an update, its `INSERT` branch like
 an insert. The predicate is bound to the target's alias first, exactly as spec 020 binds the `USING`
 half, so a same-named column on the source cannot capture it.
@@ -88,12 +94,14 @@ that was trying to move rows across the predicate, which is the shape we refuse 
 
 ## Testing
 
-`test/sql/acl_write_check.test` (56 assertions): an insert outside the slice refused and one inside it
+`test/sql/acl_write_check.test` (71 assertions): an insert outside the slice refused and one inside it
 written; an insert that does not name its columns, and one that omits a column the predicate reads,
 each refused with that reason; a multi-row insert with one violator writing nothing; an update moving
 its own row out refused while an update within the slice works; a `MERGE` refused on both its update
 and its insert branch and accepted when the row stays inside; the merge insert branch required to
-supply what the predicate reads; an injected value still overriding a supplied one and satisfying the
+supply what the predicate reads; `ON CONFLICT DO UPDATE` refused when it would move a row out and
+when it would land on another tenant's row, and accepted on the principal's own; an injected value
+still overriding a supplied one and satisfying the
 predicate without the writer naming it; and a grant with no predicate unaffected.
 
 ## Alternatives considered

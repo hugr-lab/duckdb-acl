@@ -337,6 +337,7 @@ private:
 		}
 		ApplyInsertPolicy(node, policy, vname);
 		ApplyInsertCheck(node, policy, vname);
+		ApplyConflictPolicy(node, policy, vname);
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname); // RETURNING names the target's own columns
@@ -345,6 +346,35 @@ private:
 			MapTargetQualifier(item, vname, node.qualified_name.Name().GetIdentifierName());
 		}
 		RequireReadableReturning(node.returning_list, policy, vname);
+	}
+
+	//! `ON CONFLICT … DO UPDATE` is an update wearing an insert's clothes, and it was going through
+	//! untouched: its SET list decides what an existing row becomes, and the row it lands on may belong
+	//! to someone else entirely. It carries the same policy as any other update (specs 011, 024).
+	void ApplyConflictPolicy(InsertQueryNode &node, const TablePolicy &policy, const string &vname) {
+		if (!node.on_conflict_info) {
+			return;
+		}
+		auto &conflict = *node.on_conflict_info;
+		RewriteExpr(conflict.condition);
+		MapColumnRefs(conflict.condition, policy, vname);
+		if (!conflict.set_info) {
+			return;
+		}
+		for (auto &column : conflict.set_info->columns) {
+			column = MapWrittenColumn(policy, column, vname);
+			RequireWritableColumn(policy, column, vname);
+		}
+		for (auto &expr : conflict.set_info->expressions) {
+			RewriteExpr(expr);
+			MapColumnRefs(expr, policy, vname);
+		}
+		ApplySetInjections(*conflict.set_info, policy, vname);
+		RewriteExpr(conflict.set_info->condition);
+		MapColumnRefs(conflict.set_info->condition, policy, vname);
+		// which rows it may update at all, and what they may become
+		AndPolicyPredicate(conflict.set_info->condition, policy);
+		ApplyUpdateCheck(*conflict.set_info, policy, vname, Identifier());
 	}
 
 	//! `RETURNING vname.col` -> `RETURNING <physical table>.col`: only for INSERT, where the target is
