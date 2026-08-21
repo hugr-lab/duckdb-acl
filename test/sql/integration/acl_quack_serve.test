@@ -121,5 +121,24 @@ SELECT count(*) FROM phys.main.orders;
 ----
 2
 
+# --- closing the door closes what it served --------------------------------------------------------------
+# the sessions are bound to connections that will never come back, and nothing else can tell they are
+# gone: a door is the only thing that knows it closed
+
 statement ok
-SELECT * FROM quack_stop('quack:localhost:31491');
+DETACH remote;
+
+query I
+SELECT acl_quack_stop('quack:localhost:31491') LIKE '%session(s) closed%';
+----
+true
+
+query I
+SELECT count(*) FROM quack_server_list();
+----
+0
+
+# What is asserted is what this layer answers for: the server is gone from quack's own list and the
+# sessions it served are closed. Whether the socket is already refusing is quack's to say - measured,
+# a listener whose client still holds a pooled connection keeps answering for a while after the stop,
+# so asserting on the socket here would be testing quack's shutdown rather than ours.

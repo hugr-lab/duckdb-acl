@@ -271,6 +271,14 @@ void PolicyStore::SessionBind(const string &external_id, const string &handle) {
 	session_bindings[external_id] = handle;
 }
 
+idx_t PolicyStore::SessionCloseAll() {
+	lock_guard<mutex> guard(lock);
+	auto closed = sessions.size();
+	sessions.clear();
+	session_bindings.clear();
+	return closed;
+}
+
 bool PolicyStore::SessionHandleFor(const string &external_id, string &handle) {
 	lock_guard<mutex> guard(lock);
 	auto entry = session_bindings.find(external_id);

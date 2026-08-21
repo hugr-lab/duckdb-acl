@@ -972,6 +972,39 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	}
 }
 
+//! acl_quack_stop(uri): close the door, and the sessions it served with it (spec 041). Stopping the
+//! listener leaves every session bound to a connection that will never come back, and nothing else
+//! can tell that they are gone - a door is the only thing that knows it closed.
+//!
+//! quack does not tell a callback which server a connection arrived at, so sessions cannot be
+//! attributed to one. They are therefore swept only when no quack server is left in the instance:
+//! with two doors open, stopping one says what it did rather than guessing whose sessions to drop.
+void AclQuackStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto uri = RequiredArg(args, 0, row, "acl_quack_stop", "listen uri");
+		auto quoted = [](const string &value) {
+			return "'" + StringUtil::Replace(value, "'", "''") + "'";
+		};
+		Connection con(*context.db);
+		auto stopped = con.Query("SELECT * FROM quack_stop(" + quoted(uri) + ")");
+		if (stopped->HasError()) {
+			throw BinderException("acl_quack_stop: %s", stopped->GetError());
+		}
+		auto remaining = con.Query("SELECT count(*) FROM quack_server_list()");
+		bool last_door =
+		    !remaining->HasError() && remaining->RowCount() > 0 && remaining->GetValue(0, 0).GetValue<int64_t>() == 0;
+		string note = stopped->RowCount() > 0 ? stopped->GetValue(0, 0).ToString() : uri;
+		if (!last_door) {
+			result.SetValue(row, Value(note + " (another quack server is still open, so its sessions stay)"));
+			continue;
+		}
+		auto closed = StoreOf(state).SessionCloseAll();
+		result.SetValue(row, Value(note + " (" + std::to_string(closed) + " session(s) closed)"));
+	}
+}
+
 //! acl_quack_authenticate(session_id, client_token, server_token): quack's authentication callback
 //! (spec 041). The client's token is a JWT we verify for ourselves, so quack's own shared token is
 //! not what admits anyone - it stays the operator's outer fence, and this decides the principal.
@@ -1206,6 +1239,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	// the quack door (spec 041): the two callbacks quack calls, both thin over the contract above
 	register_admin("acl_quack_authenticate", {v, v, v}, AclQuackAuthenticateFunc);
 	register_session_text("acl_quack_serve", {v, v}, AclQuackServeFunc);
+	register_session_text("acl_quack_stop", {v}, AclQuackStopFunc);
 	register_session_text("acl_quack_authorize", {v, v}, AclQuackAuthorizeFunc);
 	register_session_text("acl_session_open", {v}, AclSessionOpenFunc);
 	register_session_text("acl_session_sql", {v, v}, AclSessionSqlFunc);

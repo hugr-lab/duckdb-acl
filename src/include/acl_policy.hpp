@@ -391,6 +391,9 @@ struct PolicyStore {
 	//! replaces it: a door that reconnects under the same id gets the session it just authenticated.
 	void SessionBind(const string &external_id, const string &handle);
 	bool SessionHandleFor(const string &external_id, string &handle);
+	//! Drop every session and binding, and say how many there were. What a door does when it closes:
+	//! the connections it served will never come back, and nothing else can tell that they are gone.
+	idx_t SessionCloseAll();
 
 	//! Register an issuer / map an external role value (memory mode; catalog mode via the Catalog* ops)
 	void DefineIssuer(IssuerConfig config);

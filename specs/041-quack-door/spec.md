@@ -53,6 +53,14 @@ configured, `acl_allow_anonymous_admin` is off, the parser override is `STRICT`,
 set explicitly. Both callback settings are `SetScope::GLOBAL`, so one served instance serves one
 policy — which is exactly "this repo is one instance, and it stays that way".
 
+**`acl_quack_stop` closes the door and what it served.** Stopping the listener leaves every session
+bound to a connection that will never come back, and nothing else can tell that they are gone — a
+door is the only thing that knows it closed. quack does not tell a callback which server a connection
+arrived at, so sessions cannot be attributed to one; they are swept when no quack server is left in
+the instance, and with two doors open the stop says what it did rather than guessing whose sessions
+to drop. One instance serving one policy is the stated scope, so that branch is a guard rather than a
+feature.
+
 **TLS is not ours.** quack listens in the clear by construction
 (`QuackUri(listen_uri, /* the server will always listen without SSL */ false)`), so a served
 deployment sits behind a reverse proxy. `acl_quack_serve` says so rather than implying otherwise.
@@ -148,6 +156,11 @@ fails rather than writing around the policy.
 
 - **quack is pre-release**, and the callback contract is what we stand on. It is pinned by commit here
   (`ACL_QUACK=1`), which is how a contract change becomes a build failure rather than a surprise.
+- **A stopped listener keeps answering for a while.** Measured: after `quack_stop` the server is gone
+  from `quack_server_list()` and a fresh process refuses the port, but a listener whose client still
+  holds a pooled connection went on answering. So closing sessions and closing the socket are not the
+  same event, and only the first is ours. Upstream's, and worth knowing before anyone relies on stop
+  as a security boundary rather than as an operation.
 - **A quack client cannot enumerate the attached catalog**: `QuackSchemaCatalogEntry::Scan` is a `TODO`
   in quack, so `duckdb_tables()` over the attached catalog is empty while reads work. Upstream's.
 - **Streamed ingest** — the stream ledger, if someone needs bulk loading through this door.
