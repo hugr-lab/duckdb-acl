@@ -1,6 +1,6 @@
 # Spec 041: the quack door
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-08-21
 - **Author**: hugr-lab
 
@@ -122,14 +122,18 @@ become a phantom write target. Measured, not hypothesised.
 
 ## Testing
 
-`test/sql/acl_quack_door.test` — the callbacks as ordinary SQL functions, which is all a door has to
-prove: authentication true for a verified token and false otherwise; authorization composing the
-prefix for a bound connection and refusing an unknown one; a closed session refused; and quack's
-functions denied to a principal.
+`test/sql/acl_quack_door.test` (36 assertions) — the callbacks as ordinary SQL functions, which is all
+a door has to prove: authentication true for a verified token, false for one nobody can verify and for
+one from an issuer nobody defined; authorization composing the prefix for a bound connection and
+refusing an unknown one; an expired session refused on the connection it was bound to;
+`acl_quack_serve` refusing each condition by name; quack's own functions denied to a principal, and
+the callbacks themselves out of a principal's reach.
 
-`test/sql/integration/acl_quack_serve.test` (needs `ACL_QUACK=1`) — the live door: serve, attach from
-the same process, read the principal's slice, be refused a physical name, and have streamed ingest
-fail rather than write.
+`test/sql/integration/acl_quack_serve.test` (30 assertions, needs `ACL_QUACK=1`) — the live door in one
+process, since quack is both server and client: one call opens it, a client with a verified token
+reads its own slice over the socket, a physical name and an unpublished column are refused, an
+unverifiable token does not get in at all, an attached catalog is the principal's, and a bulk insert
+fails rather than writing around the policy.
 
 ## Alternatives considered
 
