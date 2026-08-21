@@ -1,0 +1,171 @@
+# name: test/sql/acl_set_operations.test
+# description: set operations under the ACL - a UNION/EXCEPT/INTERSECT is walked branch by branch, so
+#   every branch carries its own policy and no branch is a way around one
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.a(id INT, tenant VARCHAR, secret VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.b(id INT, tenant VARCHAR, note VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.hidden(id INT);
+
+statement ok
+INSERT INTO phys.main.a VALUES (1, 'acme', 's1'), (2, 'globex', 's2'), (4, 'acme', 's4');
+
+statement ok
+INSERT INTO phys.main.b VALUES (1, 'acme', 'n1'), (3, 'globex', 'n3');
+
+statement ok
+INSERT INTO phys.main.hidden VALUES (99);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.a AS phys.main.a;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.b AS phys.main.b;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.hidden AS phys.main.hidden;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.f(lo INTEGER) AS SELECT id FROM phys.main.b WHERE id >= acl_arg(1);
+
+statement ok
+ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
+
+# nothing by way of the catalog: every object below is granted on its own, and `hidden` never is
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r CAPS '{}' MAIN;
+
+# the two readable tables are shaped differently on purpose - one by a claim, one by a plain predicate
+statement ok
+ACL ADMIN GRANT TABLE c.a TO ROLE r WITH (select, insert) COLUMNS (id, tenant) RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN GRANT TABLE c.b TO ROLE r WITH (select) COLUMNS (id) RLS (id < 3);
+
+statement ok
+ACL ADMIN GRANT TABLE c.f TO ROLE r WITH (select);
+
+# --- each branch keeps its own policy ------------------------------------------------------------
+
+# a yields the claim's rows (1, 4); b yields id < 3 (1)
+query I
+ACL ROLE "r" SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY 1;
+----
+1
+1
+4
+
+query I
+ACL ROLE "r" SELECT id FROM a INTERSECT SELECT id FROM b;
+----
+1
+
+query I
+ACL ROLE "r" SELECT id FROM a EXCEPT SELECT id FROM b ORDER BY 1;
+----
+4
+
+# a column neither grant projects is not reachable from a branch either
+statement error
+ACL ROLE "r" SELECT secret FROM a UNION ALL SELECT note FROM b;
+----
+<REGEX>:.*secret.*
+
+# a branch may be a virtual table function: its argument is inlined like anywhere else
+query I
+ACL ROLE "r" SELECT id FROM a UNION ALL SELECT id FROM f(1) ORDER BY 1;
+----
+1
+1
+3
+4
+
+# --- a branch is not a way around a grant ---------------------------------------------------------
+
+statement error
+ACL ROLE "r" SELECT id FROM a UNION ALL SELECT id FROM phys.main.hidden;
+----
+<REGEX>:.*no access to object "phys.main.hidden".*
+
+statement error
+ACL ROLE "r" SELECT id FROM a UNION ALL SELECT id FROM hidden;
+----
+<REGEX>:.*select on "hidden" is not allowed.*
+
+# the second branch of every set operation is walked too
+statement error
+ACL ROLE "r" SELECT id FROM a EXCEPT SELECT id FROM hidden;
+----
+<REGEX>:.*select on "hidden" is not allowed.*
+
+statement error
+ACL ROLE "r" SELECT id FROM a INTERSECT SELECT id FROM hidden;
+----
+<REGEX>:.*select on "hidden" is not allowed.*
+
+# --- nested in the shapes a set operation shows up in ----------------------------------------------
+
+query I
+ACL ROLE "r" WITH u AS (SELECT id FROM a UNION ALL SELECT id FROM b) SELECT count(*) FROM u;
+----
+3
+
+statement error
+ACL ROLE "r" WITH u AS (SELECT id FROM a UNION ALL SELECT id FROM hidden) SELECT count(*) FROM u;
+----
+<REGEX>:.*select on "hidden" is not allowed.*
+
+# a recursive CTE's anchor is a branch like any other
+statement error
+ACL ROLE "r" WITH RECURSIVE u(id) AS (SELECT id FROM hidden UNION ALL SELECT id + 1 FROM u WHERE id < 100) SELECT count(*) FROM u;
+----
+<REGEX>:.*select on "hidden" is not allowed.*
+
+# ... and so is one inside a scalar subquery
+statement error
+ACL ROLE "r" SELECT (SELECT count(*) FROM (SELECT id FROM a UNION ALL SELECT id FROM hidden)) AS n;
+----
+<REGEX>:.*select on "hidden" is not allowed.*
+
+# --- as the source of a write --------------------------------------------------------------------
+
+statement ok
+ACL ROLE "r" INSERT INTO a (id, tenant) SELECT 7, 'acme' UNION ALL SELECT 8, 'acme';
+
+query I
+ACL ROLE "r" SELECT count(*) FROM a;
+----
+4
+
+statement error
+ACL ROLE "r" INSERT INTO a (id, tenant) SELECT 9, 'acme' UNION ALL SELECT id, 'acme' FROM hidden;
+----
+<REGEX>:.*select on "hidden" is not allowed.*
+
+# the refused statement wrote nothing
+query I
+SELECT count(*) FROM phys.main.a WHERE id = 9;
+----
+0

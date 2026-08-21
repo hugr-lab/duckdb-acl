@@ -34,6 +34,14 @@ creates with `CREATE VIRTUAL VIEW` — the only difference is whose rights resol
 the tenant is not: a reader in another tenant sees their own rows, not the author's. Baking would
 nail the view to whoever happened to create it.
 
+### It describes its columns like any other object
+
+The write-time probe of spec 010 binds a body with the markers nulled, so `information_schema.columns`
+answers for these views too. That probe used to null markers only in the top-level `SELECT`, which is
+never where a resolved body keeps them — the author's policy lands in a `FROM` subquery. It now walks
+the whole node (subqueries, CTEs, set operations, scalar subqueries), which also fixes admin-authored
+templates whose marker sits below the top level.
+
 ### Reading it
 
 A view is granted like any other object, and that grant is the whole decision. A reader needs no
@@ -62,13 +70,23 @@ grant.
 
 ## Testing
 
-`test/sql/acl_create_view.test` (48 assertions): a role with `create` making a view and reading it;
+`test/sql/acl_create_view.test` (63 assertions): a role with `create` making a view and reading it;
+a body that names a physical object refused, so `create` publishes only what its holder can read;
+the same refusal through a `UNION` branch, and a legitimate `UNION` body carrying the author's
+predicate in *both* branches; `information_schema.columns` describing a view whose body carries a
+claim, and one whose body is a set operation;
 the stored body being the resolved query with the claim still a marker and nothing physical created;
 a role whose own grant hides a column reading it through the view (the author's rights shaped the
 body) while still being refused that column on the table; each reader's own tenant through the same
 view; a reader with no grant on the view refused and, once granted, reading it without any right on
 the source; `create` required to make one and `drop` to remove it; a view over a view; and an
 admin-authored virtual view behaving identically, since it is the same kind of object.
+
+A view body may be any query node, so the branch-by-branch walk it relies on got its own coverage
+while it was under review: `test/sql/acl_set_operations.test` (42 assertions) checks that each branch
+of a `UNION`/`EXCEPT`/`INTERSECT` keeps its own policy, that no branch — including a recursive CTE's
+anchor, one inside a scalar subquery, and one feeding an `INSERT` — is a way around a grant, and that
+a refused statement writes nothing. That behaviour predates this spec; only the tests are new.
 
 ## Alternatives considered
 
@@ -83,9 +101,6 @@ admin-authored virtual view behaving identically, since it is the same kind of o
 
 ## Follow-ups
 
-- Column metadata for a role-created view: the write-time probe of spec 010 binds a body against the
-  physical catalog, which now works for these too — worth wiring, so `information_schema.columns`
-  describes them.
 - `CREATE OR REPLACE` on a view another view was built over: the older body is already inlined in the
   newer one, so replacing the source does not change what was built on it. Worth stating in the docs,
   and possibly worth recording the dependency.

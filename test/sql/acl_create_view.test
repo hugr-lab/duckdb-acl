@@ -1,6 +1,6 @@
 # name: test/sql/acl_create_view.test
-# description: a role may save a query (spec 018) - the body is stored as written and resolved through
-#   whoever reads it, so the view lends no authority and freezes nobody's slice
+# description: a role may create a view (spec 018) - the body is resolved once with its author's rights
+#   and the grant on the view decides who reads it, while claims stay markers so nobody's tenant is frozen
 # group: [sql]
 
 require acl
@@ -16,6 +16,10 @@ CREATE TABLE phys.lake.orders(id INT, tenant VARCHAR, amount INT, region VARCHAR
 
 statement ok
 INSERT INTO phys.lake.orders VALUES (1, 'acme', 100, 'eu'), (2, 'globex', 200, 'us'), (3, 'acme', 300, 'eu');
+
+# a real table that no virtual catalog exposes - nothing may reach it through a view body
+statement ok
+CREATE TABLE phys.main.secrets(ssn VARCHAR);
 
 statement ok
 ATTACH ':memory:' AS aclcat;
@@ -85,6 +89,20 @@ SELECT form, view_sql LIKE '%phys.lake.orders%' AND view_sql LIKE '%acl_claim(''
 ----
 view	true
 
+# the author's reach is the whole of the author's reach: a body cannot name a physical object, so
+# `create` publishes what its holder can read and nothing beyond it
+statement error
+ACL ROLE "wide" CREATE VIEW vs.leak AS SELECT * FROM phys.main.secrets;
+----
+<REGEX>:.*no access to object "phys.main.secrets".*
+
+# the body is bound at write time (spec 010), so the view describes its columns like any other object
+query II
+ACL ROLE "wide" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'report' ORDER BY 1;
+----
+amount	INTEGER
+id	INTEGER
+
 # --- read by its author ------------------------------------------------------------------------------
 
 query II
@@ -150,6 +168,40 @@ query I
 ACL ROLE "wide" SELECT id FROM vs.big;
 ----
 3
+
+# --- a body with a UNION ---------------------------------------------------------------------------------
+# a set operation is walked branch by branch, so neither branch escapes the policy
+
+statement error
+ACL ROLE "wide" CREATE VIEW vs.sneak AS SELECT id, amount FROM vs.orders UNION ALL SELECT 0, 0 FROM phys.main.secrets;
+----
+<REGEX>:.*no access to object "phys.main.secrets".*
+
+statement ok
+ACL ROLE "wide" CREATE VIEW vs.both AS SELECT id, amount FROM vs.orders UNION ALL SELECT id, amount * 2 FROM vs.orders;
+
+# the author's predicate landed in *both* branches, and the probe still derived the columns
+query I
+SELECT view_sql NOT LIKE '%vs.orders%'
+       AND len(view_sql) - len(replace(view_sql, 'acl_claim', '')) = 2 * len('acl_claim')
+  FROM aclcat.acl.relations WHERE vname = 'vs.both';
+----
+true
+
+query II
+ACL ROLE "wide" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'both' ORDER BY 1;
+----
+amount	INTEGER
+id	INTEGER
+
+# two rows of the author's tenant, doubled by the union
+query I
+ACL ROLE "wide" SELECT count(*) FROM vs.both;
+----
+4
+
+statement ok
+ACL ROLE "wide" DROP VIEW vs.both;
 
 # --- dropping ------------------------------------------------------------------------------------------
 

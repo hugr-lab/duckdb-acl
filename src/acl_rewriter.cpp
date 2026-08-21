@@ -1055,6 +1055,8 @@ private:
 
 namespace {
 
+void BakeNullMarkersInNode(QueryNode &node, const vector<string> &param_types, const ParserOptions &options);
+
 //! Replace acl_claim('…') / acl_arg(n) with NULL constants so the template binds without a
 //! principal. An acl_arg NULL is TYPED from the declared signature when there is one: an untyped
 //! NULL binds to the wrong type whenever the result depends on the argument.
@@ -1087,21 +1089,21 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 			return;
 		}
 	}
+	if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		auto &subquery = expr->Cast<SubqueryExpression>().SubqueryMutable();
+		if (subquery) {
+			BakeNullMarkersInNode(*subquery->node, param_types, options);
+		}
+	}
 	ParsedExpressionIterator::EnumerateChildren(
 	    *expr, [&](unique_ptr<ParsedExpression> &child) { BakeNullMarkers(child, param_types, options); });
 }
 
+//! Every expression the node owns, at any depth: a marker left standing anywhere makes the probe
+//! unbindable, and a resolved body puts the author's policy in a FROM subquery rather than on top.
 void BakeNullMarkersInNode(QueryNode &node, const vector<string> &param_types, const ParserOptions &options) {
-	if (node.type != QueryNodeType::SELECT_NODE) {
-		return;
-	}
-	auto &select = node.Cast<SelectNode>();
-	for (auto &item : select.select_list) {
-		BakeNullMarkers(item, param_types, options);
-	}
-	BakeNullMarkers(select.where_clause, param_types, options);
-	BakeNullMarkers(select.having, param_types, options);
-	BakeNullMarkers(select.qualify, param_types, options);
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node, [&](unique_ptr<ParsedExpression> &child) { BakeNullMarkers(child, param_types, options); });
 }
 
 } // namespace
