@@ -23,6 +23,41 @@ const char *MetadataSurfaceOf(const string &name) {
 	return entry == SURFACES.end() ? nullptr : entry->second.c_str();
 }
 
+namespace {
+
+//! Whether an expression is just a column reference: then `virtual = physical` renames rather than
+//! computes. Anything else (NULL, amount * 2, a function call) has no physical column behind it, so
+//! the relation cannot be written through.
+bool IsPlainColumnReference(const string &expr) {
+	if (expr.empty()) {
+		return false;
+	}
+	for (auto c : expr) {
+		if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '_') {
+			return false;
+		}
+	}
+	if (StringUtil::CharacterIsDigit(expr[0])) {
+		return false;
+	}
+	auto lowered = StringUtil::Lower(expr);
+	return lowered != "null" && lowered != "true" && lowered != "false" && lowered != "default";
+}
+
+} // namespace
+
+bool RenameOnlyColumns(const vector<std::pair<string, string>> &columns) {
+	if (columns.empty()) {
+		return false;
+	}
+	for (auto &column : columns) {
+		if (!IsPlainColumnReference(column.second)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 vector<string> SplitTopLevel(const string &text, char delimiter) {
 	vector<string> parts;
 	string current;

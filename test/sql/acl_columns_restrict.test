@@ -217,3 +217,32 @@ query II
 SELECT id, amount FROM phys.main.t WHERE id = 5;
 ----
 5	NULL
+
+# --- the same list gives the same relation however it is written -------------------------------------
+# the form follows the content, and ADD and ALTER now decide it through one rule: writing the identical
+# list two ways used to give a writable relation one way and a read-only one the other
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.two SET COLUMNS (order_id = id, total = amount);
+
+query I
+SELECT form FROM acl_relations() WHERE vname = 'two';
+----
+alias
+
+statement ok
+ACL ROLE "r" INSERT INTO two (order_id) VALUES (6);
+
+# ... and a list that masks still costs writability, whichever way it is written
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.two SET COLUMNS (order_id = id, total = NULL);
+
+query I
+SELECT form FROM acl_relations() WHERE vname = 'two';
+----
+subquery
+
+statement error
+ACL ROLE "r" INSERT INTO two (order_id) VALUES (7);
+----
+<REGEX>:.*read-only relation "two".*

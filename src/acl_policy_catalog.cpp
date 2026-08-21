@@ -3491,8 +3491,12 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		} else if (field != "columns") {
 			throw BinderException("acl admin: unknown relation property \"%s\"", field);
 		}
-		// the form follows the content, exactly as it does for ADD
-		string new_form = !new_view.empty() ? "view" : (new_columns.empty() && new_rls.empty() ? "alias" : "subquery");
+		// the form follows the content, exactly as it does for ADD - through the same rule, so the same
+		// list cannot give a writable relation one way and a read-only one the other
+		string new_form =
+		    !new_view.empty()
+		        ? "view"
+		        : (new_rls.empty() && (new_columns.empty() || RenameOnlyColumns(new_columns)) ? "alias" : "subquery");
 		auto stored = read("SELECT \"comment\", \"origin\" FROM " + catalog->Tbl("relations") +
 		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
 		string comment, origin;

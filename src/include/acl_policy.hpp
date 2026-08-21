@@ -121,6 +121,12 @@ const char *MetadataSurfaceOf(const string &name);
 //! first `coalesce(a, b)` - and breaks it silently, into two nonsense entries.
 vector<string> SplitTopLevel(const string &text, char delimiter);
 
+//! Whether a column list renames and nothing else - every entry is `virtual = <plain column>`. Such a
+//! list keeps a relation in the writable alias form; anything else (a mask, a computed column) makes
+//! it a read-only subquery. Since spec 029 both restrict alike, so this decides writability only -
+//! and it is shared, because ADD and ALTER giving the same list two different forms is a bug.
+bool RenameOnlyColumns(const vector<std::pair<string, string>> &columns);
+
 //! Which functions are gated is a policy question, not the rewriter's: every function reference is
 //! routed through the resolver, which decides. Most functions - the vast majority extensions add -
 //! are pure transforms (e.g. ST_AsGeoJSON) and pass; only functions that read external data or route

@@ -82,15 +82,22 @@ meaning without a migration.
   (spec 026), so a mask may compute from a column the object's projection dropped; both levels are
   written by the same administrator, so the object's projection was never a boundary against them.
 
+**ADD and ALTER decide the form through one rule.** They did not: `ADD TABLE … COLUMNS 'order_id=id,
+total=amount'` produced a writable alias-form relation while `ALTER … SET COLUMNS` with the identical
+list produced a read-only one — its comment already claimed "the form follows the content, exactly as
+it does for ADD". The rename-only test moves out of the admin module into `acl::RenameOnlyColumns`,
+shared by both. Since this spec makes both forms restrict alike, that rule now decides writability and
+nothing else.
+
 ## Testing
 
-`test/sql/acl_columns_restrict.test` (58 assertions): the three shapes of a list all restricting
+`test/sql/acl_columns_restrict.test` (64 assertions): the three shapes of a list all restricting
 identically; the dropped column unreadable and unwritable; all three metadata surfaces agreeing with
 the data path, with real types; the relation still alias-form, still writable, still mapping names
 back; a physical column added later not joining the relation; an object with no list unaffected; a
 grant refused for naming what the object does not expose while its expression still reads the
 physical row; and a grant's list replacing the object's set of writable columns rather than adding to
-it.
+it; and `ALTER` giving the same relation the same list `ADD` does, writability included.
 
 Updated for the new meaning: `acl_column_aliases.test` (spec 010's, which asserted the pass-through
 directly), `acl_grant_policy.test` and `acl_grant_projection.test`.
