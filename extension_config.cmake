@@ -38,10 +38,9 @@ endif()
 # quack needs json + autocomplete (core) and httpfs, which it pins itself; we take duckdb's own pin
 # so everything builds against the commit we track.
 #
-# NOT USABLE YET: quack 2ca17797 builds against duckdb e20aeb78, which is 65 commits (one day) ahead
-# of our a9ddce5a. Measured, not guessed - it needs `RemoteCapability::EXECUTE_STATEMENT` and the
-# `RemoteExecute(ClientContext &, unique_ptr<SQLStatement>)` overload, neither of which exists at our
-# pin. Moving our duckdb pin forward is the way in, and it is a step of its own.
+# quack targets duckdb e20aeb78, which is why the submodule moved there: at our previous pin it needed
+# `RemoteCapability::EXECUTE_STATEMENT` and the `RemoteExecute(ClientContext &,
+# unique_ptr<SQLStatement>)` overload, and got neither.
 if(DEFINED ENV{ACL_QUACK} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(json)
     duckdb_extension_load(autocomplete)
