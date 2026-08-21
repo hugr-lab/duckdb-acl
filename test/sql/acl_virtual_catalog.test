@@ -61,10 +61,17 @@ sales	main	stats	VIEW
 sales	raw	orders	BASE TABLE
 sales	raw	other	BASE TABLE
 
+# duckdb_tables() answers about tables and duckdb_views() about views (spec 035), so the five rows
+# information_schema.tables carries split four/one rather than being repeated by both
 query I
 ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables();
 ----
-5
+4
+
+query II
+ACL ROLE "analyst" SELECT view_name, column_count FROM duckdb_views();
+----
+stats	1
 
 # the physical database this all points at is not in the listing at all
 query I
