@@ -769,24 +769,25 @@ struct CatalogBackend {
 		                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = r.\"vcat\""
 		                                       " AND oc.\"vname\" = r.\"vname\""
 		                                 : string();
-		auto sql = GrantsCte(principal) + "SELECT r.\"form\", r.\"phys\", r.\"view_sql\", r.\"rls\", " + CapsExpr() +
-		           " AS caps, " + GrantPolicyExprs() +
-		           ","
-		           " CASE WHEN " +
-		           qualified_cond +
-		           " THEN 1 ELSE 2 END AS prio,"
-		           " (SELECT list(struct_pack(cname := c.\"name\", cexpr := c.\"expr\") ORDER BY c.\"pos\") FROM " +
-		           ColumnsSource(principal, names) +
-		           " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\") AS cols, " +
-		           (function_mode ? "NULL" : "r.\"rls_checked\"") +
-		           " AS rchk"
-		           " FROM " +
-		           RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
-		           " WHERE (" + qualified_cond +
-		           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(unqualified) +
-		           // by role, so a principal holding several of them merges their column lists in one
-		           // order rather than in whatever order the store returned (spec 036)
-		           ") ORDER BY prio, g.\"role\"";
+		auto sql =
+		    GrantsCte(principal) + "SELECT r.\"form\", r.\"phys\", r.\"view_sql\", r.\"rls\", " + CapsExpr() +
+		    " AS caps, " + GrantPolicyExprs() +
+		    ","
+		    " CASE WHEN " +
+		    qualified_cond +
+		    " THEN 1 ELSE 2 END AS prio,"
+		    " (SELECT list(struct_pack(cname := c.\"name\", cexpr := c.\"expr\") ORDER BY c.\"pos\") FROM " +
+		    ColumnsSource(principal, names) +
+		    " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\") AS cols, " +
+		    (function_mode ? "NULL" : "r.\"rls_checked\"") +
+		    " AS rchk"
+		    " FROM " +
+		    RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE (" +
+		    qualified_cond +
+		    ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(unqualified) +
+		    // by role, so a principal holding several of them merges their column lists in one
+		    // order rather than in whatever order the store returned (spec 036)
+		    ") ORDER BY prio, g.\"role\"";
 		auto result = Query(sql);
 		if (result->RowCount() == 0) {
 			return false;

@@ -1729,6 +1729,11 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 		auto marker = StringUtil::Lower(function.FunctionName().GetIdentifierName());
 		if (marker == "acl_claim" || marker == "acl_arg") {
 			string type;
+			// a claim is a string by construction (the principal carries them as such), so a mask over
+			// one is VARCHAR and the probe can say so; only an argument's type has to be declared
+			if (marker == "acl_claim") {
+				type = "VARCHAR";
+			}
 			if (marker == "acl_arg") {
 				auto &args = function.GetArguments();
 				if (args.size() == 1 && args[0].GetExpression().GetExpressionClass() == ExpressionClass::CONSTANT) {
@@ -1738,12 +1743,24 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 					}
 				}
 			}
+			// The replacement is a different node, so the alias the marker carried has to be carried
+			// over: a probe reads the column *names* a projection produces, and dropping it stored a
+			// column with no name in `grant_columns` - which then appeared in every listing, sharing an
+			// ordinal with the column it was supposed to be (spec 042).
+			//
+			// The *type* is deliberately left untyped where the signature does not give one: the baked
+			// template is serialised back to text, and a bare `NULL` binds against anything, which is
+			// what lets a predicate like `amount >= acl_arg(1)` be probed at all.
+			auto alias = expr->GetAlias();
 			if (type.empty()) {
 				expr = make_uniq<ConstantExpression>(Value(LogicalType::VARCHAR));
 			} else {
 				// parse the cast rather than resolving the type name by hand (no context needed here)
 				auto casted = Parser::ParseExpressionList("CAST(NULL AS " + type + ")", options);
 				expr = std::move(casted[0]);
+			}
+			if (!alias.GetIdentifierName().empty()) {
+				expr->SetAlias(alias);
 			}
 			return;
 		}
