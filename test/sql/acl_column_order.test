@@ -151,6 +151,45 @@ ACL ROLE "solo" SELECT sql FROM duckdb_tables();
 ----
 CREATE TABLE "orders"("note" VARCHAR, "initial" VARCHAR, "id" INTEGER);
 
+# --- one role without a column list lifts the other's projection entirely ----------------------------
+# spec 011: a grant that states nothing does not narrow, so the principal reads the object's own
+# columns - and then the other role's projection must not be listed either, or a client would be told
+# about a column `SELECT *` never returns, at a position that collides with a real one.
+
+statement ok
+ACL ADMIN CREATE ROLE rc;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE rc WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT OBJECT c.orders TO ROLE rc COLUMNS (id, tag = tenant);
+
+statement ok
+ACL ADMIN CREATE ROLE rd;
+
+# rd states no column list at either level, so it lifts rc's restriction
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE rd WITH (select) MAIN;
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYyIsInJkIl19.w6ZV8MIubCKzMG30PnMNFiFoGzBNXJ3p1BkwbsOuwVw'
+SELECT string_agg(column_name, ',') FROM (DESCRIBE orders);
+----
+id,tenant,amount,note
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYyIsInJkIl19.w6ZV8MIubCKzMG30PnMNFiFoGzBNXJ3p1BkwbsOuwVw'
+SELECT string_agg(column_name || '@' || column_index, ',' ORDER BY column_index) FROM duckdb_columns();
+----
+id@1,tenant@2,amount@3,note@4
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYyIsInJkIl19.w6ZV8MIubCKzMG30PnMNFiFoGzBNXJ3p1BkwbsOuwVw'
+SELECT sql FROM duckdb_tables();
+----
+CREATE TABLE "orders"("id" INTEGER, "tenant" VARCHAR, "amount" INTEGER, "note" VARCHAR);
+
 # --- an object with no grant projection keeps the object's own order ---------------------------------
 
 statement ok

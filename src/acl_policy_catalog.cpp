@@ -1195,7 +1195,16 @@ struct CatalogBackend {
 		                   " (SELECT DISTINCT pc.\"vcat\" AS vcat, pc.\"vname\" AS vname, pc.\"name\" AS name,"
 		                   " pc.\"type\" AS type, pc.\"role\" AS \"role\", pc.\"pos\" AS \"pos\" FROM " +
 		                   Tbl("grant_columns") +
-		                   " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\"))"
+		                   " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\""
+		                   // One role whose chain states no column list lifts the restriction for the
+		                   // whole principal (spec 011: `Restricts()` is `any && !unrestricted`), and
+		                   // then the object's own columns are what it reads - so another role's
+		                   // projection must not be listed either, or the listing would advertise a
+		                   // column `SELECT *` never returns.
+		                   " WHERE NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE gc.vcat = pc.\"vcat\""
+		                   " AND gc.vname = pc.\"vname\""
+		                   " AND (gc.cat_columns IS NULL OR trim(gc.cat_columns) = '')"
+		                   " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))))"
 		                   " GROUP BY vcat, vname, name))";
 		auto prelude = GrantsCte(principal) + ", " + objects + ", " + aliases + ", " + schemas + ", " + grant_columns +
 		               ", " + vfunctions + ", " + projected + " ";

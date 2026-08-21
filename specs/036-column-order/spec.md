@@ -100,9 +100,29 @@ because a consumer counts them.
 - positions are `1,2,3` with no gaps where a duplicate was merged away;
 - a single role whose grant reorders the table and adds a computed column (`note, initial = tenant,
   id`) keeps its own list order everywhere;
+- one role restricting while another states nothing — the object's own columns, with no phantom
+  projection column and no repeated position;
 - an object with no grant projection keeps the object's own column order.
 
-Full suite: 38 files, 3086 assertions, both C++ binaries.
+Full suite: 38 files, 3094 assertions, both C++ binaries.
+
+### A defect the self-review found
+
+Fixing the order exposed a worse neighbour. Where one role stated a column list and another stated
+none, the read path applied spec 011 — a grant that says nothing does not narrow, so the principal
+reads the object's own columns — while the listing still unioned in the restricting role's
+projection:
+
+```text
+read path →  id, tenant, amount, note
+listing   →  id@1, tenant@2, tag@2, amount@3, note@4
+DDL       →  CREATE TABLE "orders"("id" …, "tenant" …, "tag" …, "amount" …, "note" …);
+```
+
+A phantom column that `SELECT *` never returns, at a position colliding with a real one — and a
+client binding that DDL and projecting positionally would have read nonsense. The projection CTE now
+drops out entirely for an object where any granting role's chain states no column list, which is the
+same rule `Restricts()` applies on the read path.
 
 ## Alternatives considered
 
