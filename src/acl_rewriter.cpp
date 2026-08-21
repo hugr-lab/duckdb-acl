@@ -949,25 +949,17 @@ private:
 		    expr, [&](const ParsedExpression &child) { RequireReadableExpr(child, policy, vname); });
 	}
 
-	//! A policy predicate containing a subquery cannot be qualified: a bare name inside it belongs to
-	//! that subquery's own scope, not to the target's.
-	static bool ContainsSubquery(const ParsedExpression &expr) {
-		if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
-			return true;
-		}
-		bool found = false;
-		ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
-			if (ContainsSubquery(child)) {
-				found = true;
-			}
-		});
-		return found;
-	}
-
 	//! Qualify every bare column reference with the target's alias. Without this, a column of the same
 	//! name on the other relation in scope captures the grant's predicate and it filters the wrong rows.
 	static void QualifyWithTarget(unique_ptr<ParsedExpression> &expr, const Identifier &alias) {
 		if (!expr) {
+			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			// The operand of `x IN (SELECT …)` is in the outer scope and needs the target's name; the
+			// subquery's own body does not - a bare name in there belongs to its own scope, and the
+			// grant is known to bind against its target (spec 021), so leaving it alone keeps its meaning.
+			QualifyWithTarget(expr->Cast<SubqueryExpression>().GetChildMutable(), alias);
 			return;
 		}
 		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
@@ -999,11 +991,6 @@ private:
 		}
 		auto predicate = store.InstantiateExpr(policy.rls, template_options);
 		BakeMarkers(predicate, nullptr);
-		if (ContainsSubquery(*predicate)) {
-			Deny("the grant on \"" + vname +
-			     "\" filters with a subquery, so it cannot be written with "
-			     "FROM/USING/MERGE yet");
-		}
 		QualifyWithTarget(predicate, alias);
 		return predicate;
 	}

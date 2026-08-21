@@ -933,6 +933,9 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	auto register_admin = [&](const string &name, vector<LogicalType> arguments, scalar_function_t fn) {
 		ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::BOOLEAN, fn);
 		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+		// an admin function refuses at execution time - a bad predicate, a name in use, a missing
+		// target - and an unmarked function turns those refusals into INTERNAL errors
+		function.SetFallible();
 		loader.RegisterFunction(function);
 	};
 
@@ -942,6 +945,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		for (auto &arguments : signatures) {
 			ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::BOOLEAN, fn);
 			function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+			function.SetFallible();
 			set.AddFunction(function);
 		}
 		loader.RegisterFunction(set);
@@ -993,6 +997,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		ScalarFunction function(Identifier("acl_refresh_schema"), std::move(arguments), LogicalType::BIGINT,
 		                        AclRefreshSchemaFunc);
 		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+		function.SetFallible();
 		loader.RegisterFunction(function);
 	};
 	register_refresh({v});
@@ -1002,6 +1007,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		ScalarFunction function(Identifier("acl_refresh_schema_objects"), std::move(arguments), LogicalType::BIGINT,
 		                        AclRefreshSchemaObjectsFunc);
 		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+		function.SetFallible();
 		loader.RegisterFunction(function);
 	};
 	register_refresh_objects({v, v});

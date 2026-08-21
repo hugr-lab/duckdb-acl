@@ -200,8 +200,8 @@ ACL ADMIN CREATE ROLE sub CLAIMS (tenant = 'acme');
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE sub CAPS '{}' MAIN;
 
-# a predicate that filters with a subquery cannot be bound to the target by name, because a bare name
-# inside it belongs to the subquery's scope
+# a predicate that filters with a subquery works too since spec 021: the grant is known to bind
+# against its own target, so a bare name inside the subquery keeps the scope it was written in
 statement ok
 ACL ADMIN GRANT TABLE c.orders TO ROLE sub WITH (select, update, merge)
     RLS (id IN (SELECT id FROM phys.main.feed));
@@ -209,10 +209,8 @@ ACL ADMIN GRANT TABLE c.orders TO ROLE sub WITH (select, update, merge)
 statement ok
 ACL ADMIN GRANT TABLE c.feed TO ROLE sub WITH (select);
 
-statement error
+statement ok
 ACL ROLE "sub" UPDATE orders SET amount = 1 FROM feed WHERE orders.id = feed.id;
-----
-<REGEX>:.*filters with a subquery.*
 
 # ... and the single-relation form still works for that role, since nothing needs qualifying there
 statement ok

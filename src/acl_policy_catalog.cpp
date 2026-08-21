@@ -1497,6 +1497,36 @@ struct CatalogBackend {
 		return true;
 	}
 
+	//! Bind a grant's predicate against the object it filters, without reading data. Returns the
+	//! binder's message when the predicate is at fault and an empty string when it binds.
+	//!
+	//! The target is bound on its own first: if *that* fails there is nothing to judge the predicate
+	//! against - the source may simply not be attached yet - and the predicate is accepted, exactly as
+	//! a schema probe that cannot bind is not fatal.
+	string PredicateError(const string &source, const string &rls) {
+		if (rls.empty() || source.empty()) {
+			return string();
+		}
+		auto instance = Db();
+		Connection con(*instance);
+		auto base = con.Query("SELECT * FROM " + source + " WHERE false");
+		if (base->HasError()) {
+			return string(); // the object itself does not bind here; not the predicate's fault
+		}
+		string baked;
+		try {
+			ParserOptions options;
+			baked = BakeTemplateForProbe("SELECT * FROM " + source + " WHERE (" + rls + ")", options, false, {});
+		} catch (std::exception &error) {
+			return string(error.what());
+		}
+		auto probe = con.Query("SELECT * FROM (" + baked + ") WHERE false");
+		if (probe->HasError()) {
+			return probe->GetError();
+		}
+		return string();
+	}
+
 	//! "name TYPE, name TYPE" -> the pieces; a bare "TYPE" (a scalar's RETURNS) yields an empty name
 	static vector<std::pair<string, string>> ParseDeclaration(const string &declaration) {
 		vector<std::pair<string, string>> parts;
@@ -1775,6 +1805,15 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 		statements.push_back("INSERT INTO " + catalog.Tbl("relation_columns") + " VALUES (" + Lit(vcat) + ", " +
 		                     Lit(vname) + ", " + std::to_string(pos++) + ", " + Lit(column.first) + ", " +
 		                     Lit(column.second) + ")");
+	}
+	// a predicate is checked where it is written, not where it is used (spec 021): a predicate that
+	// cannot bind against its own object is a mistake, and it only ever surfaced for whoever queried
+	if (!rls.empty()) {
+		auto source = form == "view" ? "(" + view_sql + ")" : phys;
+		auto error = catalog.PredicateError(source, rls);
+		if (!error.empty()) {
+			throw InvalidInputException("acl: the predicate of \"%s\" does not bind against it: %s", vname, error);
+		}
 	}
 	// the object's column schema (spec 010): a view has no physical row and no declared projection,
 	// so bind its SQL once, here on the write path; anything else keeps the projected names
@@ -2851,12 +2890,33 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
                                        const string &caps_json, const string &rls, const string &columns) {
 	RequireCatalog(catalog, "acl catalog");
 	acl_detail::ParseCaps(caps_json);
-	catalog->Write({"DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
-	                    " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname),
-	                "INSERT INTO " + catalog->Tbl("role_object_caps") +
-	                    "(\"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\") VALUES (" + Lit(role) + ", " +
-	                    Lit(vcat) + ", " + Lit(vname) + ", " + Lit(caps_json) + ", " + Lit(rls) + ", " + Lit(columns) +
-	                    ")"});
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		// the grant's predicate is checked against the object it filters, here rather than at query
+		// time (spec 021) - a predicate that cannot bind is a mistake, whoever eventually runs into it
+		if (!rls.empty()) {
+			auto shape = read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + catalog->Tbl("relations") +
+			                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+			if (shape->RowCount() > 0) {
+				auto form = shape->GetValue(0, 0).IsNull() ? string() : shape->GetValue(0, 0).ToString();
+				auto phys = shape->GetValue(1, 0).IsNull() ? string() : shape->GetValue(1, 0).ToString();
+				auto view_sql = shape->GetValue(2, 0).IsNull() ? string() : shape->GetValue(2, 0).ToString();
+				auto source = form == "view" ? "(" + view_sql + ")" : phys;
+				auto error = catalog->PredicateError(source, rls);
+				if (!error.empty()) {
+					throw InvalidInputException("acl: the predicate of the grant on \"%s\" does not bind "
+					                            "against it: %s",
+					                            vname, error);
+				}
+			}
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
+		                     " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		statements.push_back("INSERT INTO " + catalog->Tbl("role_object_caps") +
+		                     "(\"role\", \"vcat\", \"vname\", \"caps\", \"rls\", \"columns\") VALUES (" + Lit(role) +
+		                     ", " + Lit(vcat) + ", " + Lit(vname) + ", " + Lit(caps_json) + ", " + Lit(rls) + ", " +
+		                     Lit(columns) + ")");
+	});
 }
 
 bool PolicyStore::CatalogObjectExists(const string &vcat, const string &vname, const string &kind) {
