@@ -93,6 +93,9 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
   `DESCRIBE (SELECT * FROM <name>)`, so the description is of the rewritten relation — a hidden column
   is hidden from it too; `SHOW TABLES [FROM s]` is the principal's `information_schema.tables` in the
   shape `SHOW TABLES` returns.
+- **A grant's projection is probed where it is written** (spec 026): a mask that changes a column's
+  type and a computed column the object never had are stored in `grant_columns`, so
+  `information_schema.columns` and `DESCRIBE` describe the same thing — what the role reads.
 - **Markers baked into template copies**: `acl_claim('<name>')` → claim constant; `acl_arg(n)` → n-th
   call argument's AST. Never registered as real functions ⇒ a missed marker fails closed at bind.
 - **Administration is a capability** (spec 009): `{"manage": true}` in a catalog grant (per catalog,
