@@ -189,9 +189,11 @@ bool AllowWrite(PolicyStore &store, const string &vcat, const string &vname, con
 	                      vcat, vname);
 }
 
-//! acl_add_reference(vcat, name, from, to [, to_kind, pairs, expr, cardinality, optional, join_method,
-//! comment, mode]): declare a join path between two objects of the virtual catalog (spec 022). A hint,
-//! never enforced. `to_kind` is "relation" (default) or "function" for a lateral call.
+//! acl_add_reference(vcat, name, from, to [, to_kind, args, pairs, expr, cardinality, optional,
+//! join_method, comment, mode]): declare a join path between two objects of the virtual catalog
+//! (spec 022). A hint, never enforced. `to_kind` is "relation" (default) or "function"; `args` is the
+//! argument substitution of a function end ("param => column, …") and `pairs`/`expr` the join
+//! condition, which for a function end names columns of its result.
 void AclAddReferenceFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = RequiredArg(args, 0, row, "acl_add_reference", "catalog");
@@ -199,14 +201,15 @@ void AclAddReferenceFunc(DataChunk &args, ExpressionState &state, Vector &result
 		auto from_vname = RequiredArg(args, 2, row, "acl_add_reference", "from");
 		auto to_vname = RequiredArg(args, 3, row, "acl_add_reference", "to");
 		auto &store = StoreOf(state);
-		if (!AllowWrite(store, vcat, name, "reference", OptionalArg(args, 11, row, ""))) {
+		if (!AllowWrite(store, vcat, name, "reference", OptionalArg(args, 12, row, ""))) {
 			continue;
 		}
-		auto optional_text = OptionalArg(args, 8, row, "");
+		auto optional_text = OptionalArg(args, 9, row, "");
 		store.CatalogAddReference(vcat, name, from_vname, to_vname, OptionalArg(args, 4, row, ""),
 		                          OptionalArg(args, 5, row, ""), OptionalArg(args, 6, row, ""),
-		                          OptionalArg(args, 7, row, ""), StringUtil::CIEquals(optional_text, "true"),
-		                          OptionalArg(args, 9, row, ""), OptionalArg(args, 10, row, ""));
+		                          OptionalArg(args, 7, row, ""), OptionalArg(args, 8, row, ""),
+		                          StringUtil::CIEquals(optional_text, "true"), OptionalArg(args, 10, row, ""),
+		                          OptionalArg(args, 11, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -1042,7 +1045,8 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	                    {v, v, v, v, v, v, v, v, v},
 	                    {v, v, v, v, v, v, v, v, v, v},
 	                    {v, v, v, v, v, v, v, v, v, v, v},
-	                    {v, v, v, v, v, v, v, v, v, v, v, v}},
+	                    {v, v, v, v, v, v, v, v, v, v, v, v},
+	                    {v, v, v, v, v, v, v, v, v, v, v, v, v}},
 	                   AclAddReferenceFunc);
 	register_admin_set("acl_drop_reference", {{v, v}, {v, v, v}}, AclDropReferenceFunc);
 	// re-derive stored schemas; returns the number of objects re-probed

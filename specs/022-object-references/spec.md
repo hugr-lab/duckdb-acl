@@ -39,7 +39,8 @@ simplification below follows from that.
 | --- | --- |
 | `name` | unique in the catalog; one pair of objects may have several (`orders.customer`, `orders.billing_customer`) |
 | `from_vname`, `to_vname` | the two ends, as virtual names |
-| `to_kind` | `relation` or `function` — a table function end is a lateral call, not a join |
+| `to_kind` | `relation` or `function` |
+| arguments | for a function end: parameter => source column, the substitution |
 | pairs *or* `expr` | how they join — column pairs, or arbitrary SQL. Exactly one of the two |
 | `cardinality` | `many_to_one`, `one_to_many`, `one_to_one`, `many_to_many` |
 | `optional` | whether the far side may be absent |
@@ -69,26 +70,35 @@ projection, an aggregate or a filter.**
 A **view** needs nothing special. It is a relation of the catalog like any other, its columns come
 from the write-time probe, so both the existence check and the visibility check reach it unchanged.
 
-A **table function** is different in kind, and the difference is not cosmetic: it is fed *arguments*,
-not joined on a condition. So a reference into one is a **lateral call**, and its pairs read
-`source column => parameter` rather than `column = column`. `to_kind` records which of the two an end
-is, so an agent reading the listing knows to write `LATERAL f(…)` instead of a join. An expression is
-refused for a function end — there is no condition for it to be.
+A **table function** is different in kind: it takes *arguments*. One rule covers every shape of that,
+and it is the same rule as a function call anywhere else — **the parenthesis after the name is the
+argument substitution, and `ON` is the join condition**:
 
-**A function end is checked against its declared signature, and against nothing else.** No binding:
-a table function's template carries `acl_arg(n)` markers whose result depends on the arguments, so it
-cannot be typed from NULLs (spec 010 says as much), and binding it would prove nothing the declaration
-does not already say. The parameters are a stored field; a function that declares no signature simply
-cannot be judged, and is accepted.
+```sql
+TO FUNCTION orders_of(cust => id)                                   -- pure substitution, no condition
+TO FUNCTION all_orders ON (id = customer_id)                        -- no arguments, join on the result
+TO FUNCTION orders_of(cust => id) ON (city = dest)                  -- both
+```
 
-A function may only be the `to` end: a lateral call takes its arguments from the row on its left.
+`cust => id` reads *parameter => source column*, the direction SQL already uses for named arguments.
+An argument's source column is a `from` column for every purpose — it must exist, and it must be
+visible — and it carries the parameter it feeds alongside it. `ON`, for a function end, names columns
+of the function's **result**, which the catalog stores whether they were declared with `RETURNS TABLE`
+or probed at write time. A condition may be omitted only when arguments are the whole relationship.
+
+**Nothing here is bound.** The parameters come from the declared signature, the result columns from
+the stored schema. A table function's template carries `acl_arg(n)` markers whose result depends on
+the arguments, so it cannot be typed from NULLs (spec 010 says as much), and binding it would prove
+nothing the declaration does not already say. A function that declares no signature simply cannot be
+judged on its parameters, and is accepted.
+
+A function may only be the `to` end: arguments come from the row on the left.
 
 ### Visibility: both ends, every column
 
 A reference is visible to a principal when both of its ends are — an object it may read, or a table
 function it may call, which is granted the same way — and when every column it names is one the role
-can see. The `to` side of a lateral call names parameters rather than columns, so there is nothing
-there to hide or to check. Otherwise it would announce an object the role has no access to, or name a
+can see, arguments included. Otherwise it would announce an object the role has no access to, or name a
 column a projection hides and suggest joining on it.
 
 There is no capability on a reference and no separate grant: it opens nothing, so its visibility is
@@ -136,16 +146,17 @@ not attached.
 
 ## Testing
 
-`test/sql/acl_references.test` (92 assertions): declaring both forms and reading back the columns
+`test/sql/acl_references.test` (102 assertions): declaring both forms and reading back the columns
 extracted from an expression; refusals at write time (an end that does not exist, a column that does
 not, an unqualified expression, an expression naming neither end, an unknown cardinality, a name in
 use); a role seeing both references and narrowing to one object; a role seeing neither the reference
 into an object it cannot read nor the one over a column its grant hides — with that column also gone
 from `information_schema.columns`; the reference granting nothing; drop, `IF EXISTS`, and the
 principal's surface being substituted rather than gated; a view as an end needing nothing special, a
-table function end with its parameter checked against the declared signature, an expression refused
-for one, and a role that cannot call the function not seeing the reference into it while the one
-between two relations stays.
+a table function end in its three shapes — substitution alone, a join on the result alone, and both —
+with the parameter checked against the declared signature and the condition against the stored result
+columns, arguments refused for a relation end, and a role that cannot call the function not seeing the
+reference into it while the one between two relations stays.
 
 ## Alternatives considered
 

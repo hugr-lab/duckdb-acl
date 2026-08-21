@@ -1250,9 +1250,16 @@ struct CatalogBackend {
 		return prelude + ", vcolumns AS (" + narrowed_columns + ") " +
 		       "SELECT r.\"vcat\" AS vcat, r.\"name\" AS name, r.\"from_vname\" AS from_object,"
 		       " r.\"to_vname\" AS to_object,"
+		       // the arguments a function end is called with, and - separately - the columns of the join
+		       // condition: an argument's source column is a `from` column that also names a parameter
+		       " (SELECT string_agg(rc.\"param\" || ' => ' || rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
+		       Tbl("reference_columns") +
+		       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"param\" IS NOT NULL)"
+		       " AS arguments,"
 		       " (SELECT string_agg(rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
 		       Tbl("reference_columns") +
-		       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'from')"
+		       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'from'"
+		       " AND rc.\"param\" IS NULL)"
 		       " AS from_columns,"
 		       " (SELECT string_agg(rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
 		       Tbl("reference_columns") +
@@ -1786,7 +1793,7 @@ struct CatalogBackend {
 		    // mentions, attributed at write time by its qualifier.
 		    "CREATE TABLE IF NOT EXISTS " + Tbl("reference_columns") +
 		        "(\"vcat\" VARCHAR, \"name\" VARCHAR, \"pos\" INTEGER, \"side\" VARCHAR, \"column\" VARCHAR,"
-		        " PRIMARY KEY (\"vcat\", \"name\", \"pos\", \"side\"))",
+		        " \"param\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\", \"pos\", \"side\"))",
 		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '7' WHERE NOT EXISTS (SELECT 1 FROM " +
 		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
 		    "UPDATE " + Tbl("meta") + " SET \"value\" = '7' WHERE \"key\" = 'schema_version' AND \"value\" < '7'",
@@ -2030,8 +2037,8 @@ std::pair<string, string> SplitPair(const string &text, const string &name) {
 } // namespace
 
 void PolicyStore::CatalogAddReference(const string &vcat, const string &name, const string &from_vname,
-                                      const string &to_vname, const string &to_kind, const string &pairs,
-                                      const string &expr, const string &cardinality, bool optional,
+                                      const string &to_vname, const string &to_kind, const string &args,
+                                      const string &pairs, const string &expr, const string &cardinality, bool optional,
                                       const string &join_method, const string &comment) {
 	RequireCatalog(catalog, "acl_add_reference");
 	RequireNotReserved(name);
@@ -2047,21 +2054,24 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 		                            "positional)",
 		                            name, join_method);
 	}
-	if (pairs.empty() == expr.empty()) {
-		throw InvalidInputException("acl: reference \"%s\" joins either by column pairs or by an expression, and "
-		                            "must state exactly one of them",
+	if (!pairs.empty() && !expr.empty()) {
+		throw InvalidInputException("acl: reference \"%s\" joins either by column pairs or by an expression, not "
+		                            "both",
 		                            name);
 	}
-	if (StringUtil::CIEquals(to_kind, "function") && !expr.empty()) {
-		// a table function is fed arguments, not joined on a condition - the pairs say which column of
-		// the source row goes into which parameter, and there is nothing for an expression to mean
-		throw InvalidInputException("acl: reference \"%s\" ends in a table function, so it names arguments rather "
-		                            "than a join condition",
+	bool to_function = StringUtil::CIEquals(to_kind, "function");
+	if (pairs.empty() && expr.empty() && args.empty()) {
+		// a condition may be left out only when the arguments are the whole relationship: the function
+		// is called with the row's values and its result is what the row relates to
+		throw InvalidInputException("acl: reference \"%s\" states neither a join condition nor arguments", name);
+	}
+	if (!args.empty() && !to_function) {
+		throw InvalidInputException("acl: reference \"%s\" substitutes arguments, which only a table function end "
+		                            "takes",
 		                            name);
 	}
 	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
 	                            vector<string> &statements) {
-		bool to_function = StringUtil::CIEquals(to_kind, "function");
 		// a reference between objects that do not exist describes nothing
 		auto require_relation = [&](const string &end) {
 			auto found = read("SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -2074,9 +2084,8 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 		require_relation(from_vname);
 		// The declared parameters of a table function end. Read, never bound: a template carries
 		// acl_arg(n) markers and its result depends on the arguments, so binding it would prove
-		// nothing that the declaration does not already say (spec 010).
+		// nothing the declaration does not already say (spec 010).
 		vector<string> parameters;
-		bool parameters_known = false;
 		if (to_function) {
 			auto found = read("SELECT \"params\" FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
 			                  " AND \"vname\" = " + Lit(to_vname) + " AND \"kind\" = 'table'");
@@ -2088,17 +2097,42 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 				for (auto &parameter : CatalogBackend::ParseDeclaration(found->GetValue(0, 0).ToString())) {
 					if (!parameter.first.empty()) {
 						parameters.push_back(parameter.first);
-						parameters_known = true;
 					}
 				}
 			}
 		} else {
 			require_relation(to_vname);
 		}
-		// pos, side, column
-		vector<std::tuple<idx_t, string, string>> columns;
+		// pos, side, column, parameter ("" unless the column is substituted into an argument)
+		vector<std::tuple<idx_t, string, string, string>> columns;
+		idx_t pos = 0;
+		// An argument substitution names a column of the source row, so it is a `from` column for
+		// every purpose - existence, visibility - and carries the parameter it feeds alongside.
+		for (auto &item : SplitTopLevel(args, ',')) {
+			auto trimmed = item;
+			StringUtil::Trim(trimmed);
+			if (trimmed.empty()) {
+				continue;
+			}
+			auto arrow = trimmed.find("=>");
+			if (arrow == string::npos) {
+				throw InvalidInputException("acl: reference \"%s\": \"%s\" is not an argument (expected "
+				                            "parameter => column)",
+				                            name, trimmed);
+			}
+			auto parameter = trimmed.substr(0, arrow);
+			auto column = trimmed.substr(arrow + 2);
+			StringUtil::Trim(parameter);
+			StringUtil::Trim(column);
+			if (parameter.empty() || column.empty()) {
+				throw InvalidInputException("acl: reference \"%s\": \"%s\" is not an argument (expected "
+				                            "parameter => column)",
+				                            name, trimmed);
+			}
+			columns.emplace_back(pos++, "from", column, parameter);
+		}
+		// the join condition: column pairs read from -> to, or a qualified expression
 		if (!pairs.empty()) {
-			idx_t pos = 0;
 			for (auto &item : SplitTopLevel(pairs, ',')) {
 				auto trimmed = item;
 				StringUtil::Trim(trimmed);
@@ -2106,15 +2140,14 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 					continue;
 				}
 				auto pair = SplitPair(trimmed, name);
-				columns.emplace_back(pos, "from", pair.first);
-				columns.emplace_back(pos, "to", pair.second);
+				columns.emplace_back(pos, "from", pair.first, string());
+				columns.emplace_back(pos, "to", pair.second, string());
 				pos++;
 			}
-		} else {
+		} else if (!expr.empty()) {
 			ParserOptions options;
 			auto from_tail = SplitTopLevel(from_vname, '.').back();
 			auto to_tail = SplitTopLevel(to_vname, '.').back();
-			idx_t pos = 0;
 			for (auto &ref : QualifiedColumnRefs(expr, options)) {
 				string side;
 				if (StringUtil::CIEquals(ref.first, from_tail)) {
@@ -2126,13 +2159,13 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 					                            "or \"%s\")",
 					                            name, ref.first, from_tail, to_tail);
 				}
-				columns.emplace_back(pos++, side, ref.second);
+				columns.emplace_back(pos++, side, ref.second, string());
 			}
 		}
 		if (columns.empty()) {
 			throw InvalidInputException("acl: reference \"%s\" names no columns", name);
 		}
-		// A column the object does not have is a mistake, and it would make the reference invisible to
+		// A name the end does not have is a mistake, and it would make the reference invisible to
 		// everyone once visibility is checked. The names are the *virtual* ones - what a role sees -
 		// so they are looked for where the catalog keeps those: a declared projection first (which is
 		// also where a rename lives), then a probed schema, and finally the physical table itself for
@@ -2142,27 +2175,37 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 			bool from_side = std::get<1>(column) == "from";
 			auto &end = from_side ? from_vname : to_vname;
 			auto &column_name = std::get<2>(column);
+			auto &parameter = std::get<3>(column);
+			if (!parameter.empty()) {
+				// the parameter side of an argument: the declared signature is the whole truth, and a
+				// function that declares none cannot be judged at all
+				if (!parameters.empty()) {
+					bool declared = false;
+					for (auto &candidate : parameters) {
+						if (StringUtil::CIEquals(candidate, parameter)) {
+							declared = true;
+							break;
+						}
+					}
+					if (!declared) {
+						throw InvalidInputException("acl: reference \"%s\": \"%s\" has no parameter \"%s\" "
+						                            "(declared: %s)",
+						                            name, to_vname, parameter, StringUtil::Join(parameters, ", "));
+					}
+				}
+			}
 			auto missing = [&]() {
 				throw InvalidInputException("acl: reference \"%s\": \"%s\" has no column \"%s\"", name, end,
 				                            column_name);
 			};
-			if (to_function && !from_side) {
-				// a parameter, not a column: the declaration is the whole truth, and a function that
-				// declares no signature cannot be judged at all
-				if (!parameters_known) {
-					continue;
-				}
-				bool declared = false;
-				for (auto &parameter : parameters) {
-					if (StringUtil::CIEquals(parameter, column_name)) {
-						declared = true;
-						break;
-					}
-				}
-				if (!declared) {
-					throw InvalidInputException("acl: reference \"%s\": \"%s\" has no parameter \"%s\" "
-					                            "(declared: %s)",
-					                            name, end, column_name, StringUtil::Join(parameters, ", "));
+			if (!from_side && to_function) {
+				// the far side of the condition names columns of the function's *result*, which the
+				// catalog stores whether they were declared or probed
+				auto known = read("SELECT count(*) FILTER (WHERE \"name\" = " + Lit(column_name) + "), count(*) FROM " +
+				                  catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+				                  " AND \"kind\" = 'table' AND \"vname\" = " + Lit(to_vname));
+				if (known->GetValue(1, 0).GetValue<int64_t>() > 0 && known->GetValue(0, 0).GetValue<int64_t>() == 0) {
+					missing();
 				}
 				continue;
 			}
@@ -2208,7 +2251,8 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 		for (auto &column : columns) {
 			statements.push_back("INSERT INTO " + catalog->Tbl("reference_columns") + " VALUES (" + Lit(vcat) + ", " +
 			                     Lit(name) + ", " + std::to_string(std::get<0>(column)) + ", " +
-			                     Lit(std::get<1>(column)) + ", " + Lit(std::get<2>(column)) + ")");
+			                     Lit(std::get<1>(column)) + ", " + Lit(std::get<2>(column)) + ", " +
+			                     (std::get<3>(column).empty() ? string("NULL") : Lit(std::get<3>(column))) + ")");
 		}
 	});
 }
@@ -2351,7 +2395,7 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	                  " \"comment\" FROM %s"},
 	    {"references", "SELECT \"vcat\", \"name\", \"from_vname\", \"to_vname\", \"to_kind\", \"expr\","
 	                   " \"cardinality\", \"optional\", \"join_method\", \"comment\" FROM %s"},
-	    {"reference_columns", "SELECT \"vcat\", \"name\", \"pos\", \"side\", \"column\" FROM %s"},
+	    {"reference_columns", "SELECT \"vcat\", \"name\", \"pos\", \"side\", \"column\", \"param\" FROM %s"},
 	    {"roles", "SELECT \"role\", \"comment\" FROM %s"},
 	    {"role_claims", "SELECT \"role\", \"claim\", \"value\" FROM %s"},
 	    {"grants", "SELECT \"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"columns\" FROM %s"},

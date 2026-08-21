@@ -116,7 +116,9 @@ in the virtual catalog. `ALTER VIRTUAL …` / `ALTER ROLE|ISSUER|GRANT …` chan
 pairs, expr, cardinality, optional, join_method, comment[, mode])` / `acl_drop_reference`, or
 `ACL ADMIN CREATE VIRTUAL REFERENCE c.name FROM a TO [FUNCTION] b ON (col = col) | ON EXPRESSION '<sql>'
 [CARDINALITY …] [OPTIONAL] [JOIN asof] [COMMENT '…']`. An end may be a table, a view or a table
-function; `TO FUNCTION f ON (col = param)` is a lateral call, checked against the declared signature. A hint an agent reads, never enforced and
+function; for a function the parenthesis after its name is the argument substitution
+(`TO FUNCTION f(param => col)`, checked against the declared signature) and `ON` is the join condition
+on its result — either may stand alone. A hint an agent reads, never enforced and
 granting nothing; visible only when both ends and every column it names are. A principal reads its own
 through `acl_references([object])`, substituted before the function gate.
 **Spec 008**: `acl_use_functions('{"slot": "fn", ...}')` — the function-driver policy source

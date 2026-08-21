@@ -165,44 +165,63 @@ statement ok
 ACL ADMIN CREATE VIRTUAL VIEW c.big_orders AS SELECT id, customer_id FROM phys.main.orders WHERE amount > 50;
 
 statement ok
-ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.orders_of(cust INTEGER) AS
-    SELECT id FROM phys.main.orders WHERE customer_id = acl_arg(1);
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.orders_of(cust INTEGER) RETURNS TABLE (id INTEGER, dest VARCHAR) AS
+    SELECT id, secret AS dest FROM phys.main.orders WHERE customer_id = acl_arg(1);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.all_orders() RETURNS TABLE (id INTEGER, customer_id INTEGER) AS
+    SELECT id, customer_id FROM phys.main.orders;
 
 # a view needs nothing special: it is a relation of the catalog, and its columns come from the probe
 statement ok
 ACL ADMIN CREATE VIRTUAL REFERENCE c.big_to_customer FROM big_orders TO customers ON (customer_id = id);
 
-# a table function is fed arguments, so the pair reads "source column => parameter" and the reference
-# describes a lateral call rather than a join condition
+# a table function takes arguments, so the parenthesis after its name is the substitution - which
+# column of the source row feeds which parameter - while ON, when present, is the join condition on
+# the function's result. Pure substitution needs no condition at all.
 statement ok
-ACL ADMIN CREATE VIRTUAL REFERENCE c.cust_orders FROM customers TO FUNCTION orders_of
-    ON (id = cust) CARDINALITY one_to_many COMMENT 'the orders of this customer';
+ACL ADMIN CREATE VIRTUAL REFERENCE c.cust_orders FROM customers TO FUNCTION orders_of(cust => id)
+    CARDINALITY one_to_many COMMENT 'the orders of this customer';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.local_orders FROM customers TO FUNCTION orders_of(cust => id)
+    ON EXPRESSION 'customers.name = orders_of.dest';
+
+# and a function may be joined on its result alone, with no arguments at all
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.any_order FROM customers TO FUNCTION all_orders ON (id = customer_id);
 
 query IIIIII
-ACL ROLE "full" SELECT name, from_object, to_object, to_kind, from_columns, to_columns
-    FROM acl_references() WHERE to_kind = 'function' OR from_object = 'big_orders' ORDER BY name;
+ACL ROLE "full" SELECT name, to_object, to_kind, arguments, from_columns, to_columns
+    FROM acl_references() WHERE to_kind = 'function' ORDER BY name;
 ----
-big_to_customer	big_orders	customers	relation	customer_id	id
-cust_orders	customers	orders_of	function	id	cust
+any_order	all_orders	function	NULL	id	customer_id
+cust_orders	orders_of	function	cust => id	NULL	NULL
+local_orders	orders_of	function	cust => id	name	dest
 
-# the parameter is checked against the declared signature - and only against it: a table function's
+# a parameter is checked against the declared signature - and only against it: a table function's
 # template carries acl_arg(n) markers, so binding it would prove nothing the declaration does not say
 statement error
-ACL ADMIN CREATE VIRTUAL REFERENCE c.bad_param FROM customers TO FUNCTION orders_of ON (id = nope);
+ACL ADMIN CREATE VIRTUAL REFERENCE c.bad_param FROM customers TO FUNCTION orders_of(nope => id);
 ----
 <REGEX>:.*has no parameter "nope" \(declared: cust\).*
 
+# the condition names columns of the result, which the catalog stores declared or probed
 statement error
-ACL ADMIN CREATE VIRTUAL REFERENCE c.no_fn FROM customers TO FUNCTION nothing ON (id = cust);
+ACL ADMIN CREATE VIRTUAL REFERENCE c.bad_result FROM customers TO FUNCTION all_orders ON (id = nothere);
+----
+<REGEX>:.*"all_orders" has no column "nothere".*
+
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE c.no_fn FROM customers TO FUNCTION nothing(cust => id);
 ----
 <REGEX>:.*"nothing" is not a table function of "c".*
 
-# an expression means nothing for a lateral call: there is no condition, only arguments
+# arguments belong to a function end; a relation takes none
 statement error
-ACL ADMIN CREATE VIRTUAL REFERENCE c.bad_form FROM customers TO FUNCTION orders_of
-    ON EXPRESSION 'customers.id = orders_of.cust';
+SELECT acl_add_reference('c', 'bad_args', 'customers', 'orders', 'relation', 'x => id', 'id = id');
 ----
-<REGEX>:.*names arguments rather than a join condition.*
+<REGEX>:.*substitutes arguments, which only a table function end takes.*
 
 # the function is granted like any other object, so a role that cannot call it does not see the
 # reference into it - while the reference between two relations stays

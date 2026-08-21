@@ -259,8 +259,9 @@ struct PolicyStore {
 	//! `to_kind` is "relation" or "function": a table function end is fed arguments (a lateral call),
 	//! so the pairs read "source column => parameter" and are checked against its declared signature.
 	void CatalogAddReference(const string &vcat, const string &name, const string &from_vname, const string &to_vname,
-	                         const string &to_kind, const string &pairs, const string &expr, const string &cardinality,
-	                         bool optional, const string &join_method, const string &comment);
+	                         const string &to_kind, const string &args, const string &pairs, const string &expr,
+	                         const string &cardinality, bool optional, const string &join_method,
+	                         const string &comment);
 	void CatalogDropReference(const string &vcat, const string &name);
 	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
 	                  const string &rls = "", const string &columns = "");

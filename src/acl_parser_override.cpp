@@ -517,18 +517,26 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 		s.Expect("from");
 		auto from_vname = endpoint();
 		s.Expect("to");
-		// TO FUNCTION f: the far end is a table function, so the pairs read "column => parameter" and
-		// the join is a lateral call rather than a condition
+		// TO FUNCTION f(param => col, …): the parenthesis is the argument substitution - which column
+		// of the source row feeds which parameter - and ON, when present, is the join condition on the
+		// function's result. Pure substitution needs no condition at all.
 		bool to_function = s.Accept("function");
 		auto to_vname = endpoint();
-		s.Expect("on");
-		// a bare list is a list of column pairs; SQL is spelled out, so neither can be mistaken for
-		// the other and a qualified name never reads as a column name
+		string call_args;
+		if (to_function) {
+			call_args = s.Parens();
+		}
 		string pairs, expr;
-		if (s.Accept("expression")) {
-			expr = s.Quoted("a join expression");
-		} else {
-			pairs = s.List("column pairs");
+		if (s.Accept("on")) {
+			// a bare list is a list of column pairs; SQL is spelled out, so neither can be mistaken
+			// for the other and a qualified name never reads as a column name
+			if (s.Accept("expression")) {
+				expr = s.Quoted("a join expression");
+			} else {
+				pairs = s.List("column pairs");
+			}
+		} else if (!to_function) {
+			throw BinderException("acl admin: a reference between objects needs an ON condition");
 		}
 		string cardinality, join_method, comment;
 		bool optional = false;
@@ -551,10 +559,11 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 				more = true;
 			}
 		}
-		return MakeAdminCall("acl_add_reference", {Value(vcat), Value(name), Value(from_vname), Value(to_vname),
-		                                           Value(to_function ? "function" : "relation"), Value(pairs),
-		                                           Value(expr), Value(cardinality), Value(optional ? "true" : "false"),
-		                                           Value(join_method), Value(comment), Value(mode)});
+		return MakeAdminCall("acl_add_reference",
+		                     {Value(vcat), Value(name), Value(from_vname), Value(to_vname),
+		                      Value(to_function ? "function" : "relation"), Value(call_args), Value(pairs), Value(expr),
+		                      Value(cardinality), Value(optional ? "true" : "false"), Value(join_method),
+		                      Value(comment), Value(mode)});
 	}
 	if (s.Accept("schema")) {
 		// CREATE VIRTUAL SCHEMA v.path AS <phys> - the live alias, resolves through
