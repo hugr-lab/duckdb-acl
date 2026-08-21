@@ -132,10 +132,9 @@ ACL ADMIN GRANT TABLE c.orders TO ROLE narrow WITH (select, update, delete, merg
 statement ok
 ACL ADMIN GRANT TABLE c.incoming TO ROLE narrow WITH (select);
 
-statement error
+# since spec 020 this is allowed, and the grant's predicate rides the ON clause
+statement ok
 ACL ROLE "narrow" MERGE INTO orders USING incoming ON orders.id = incoming.id WHEN MATCHED THEN UPDATE SET amount = 1;
-----
-<REGEX>:.*narrowed by a grant.*
 
 # ... and its own predicate still applies to a qualified single-relation write
 statement ok
