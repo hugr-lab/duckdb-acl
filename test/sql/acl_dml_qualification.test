@@ -1,0 +1,147 @@
+# name: test/sql/acl_dml_qualification.test
+# description: a write may qualify its columns by the name the principal used (spec 019) - the virtual
+#   name survives the swap to the physical one, which is what makes MERGE usable at all
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders_physical(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders_physical VALUES (1, 'acme', 10), (2, 'globex', 20), (3, 'acme', 30);
+
+statement ok
+CREATE TABLE phys.main.feed(id INT, amount INT);
+
+statement ok
+INSERT INTO phys.main.feed VALUES (1, 100), (4, 400);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+# the virtual name differs from the physical table name - the normal case for a virtual catalog, and
+# the only case in which this ever mattered
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders_physical;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.incoming AS phys.main.feed;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- every verb, qualified by the virtual name -----------------------------------------------------
+
+query I
+ACL ROLE "r" SELECT orders.id FROM orders ORDER BY 1;
+----
+1
+2
+3
+
+statement ok
+ACL ROLE "r" UPDATE orders SET amount = 11 WHERE orders.id = 1;
+
+query I
+ACL ROLE "r" DELETE FROM orders WHERE orders.id = 3 RETURNING orders.id;
+----
+3
+
+query I
+ACL ROLE "r" INSERT INTO orders VALUES (4, 'acme', 40) RETURNING orders.id;
+----
+4
+
+# unqualified still works, and so does a user's own alias
+statement ok
+ACL ROLE "r" UPDATE orders SET amount = 12 WHERE id = 1;
+
+statement ok
+ACL ROLE "r" UPDATE orders AS o SET amount = 13 WHERE o.id = 1;
+
+query II
+ACL ROLE "r" SELECT id, amount FROM orders WHERE id = 1;
+----
+1	13
+
+# --- MERGE, which has no other way to name its target ----------------------------------------------
+
+statement ok
+ACL ROLE "r" MERGE INTO orders USING incoming ON orders.id = incoming.id
+    WHEN MATCHED THEN UPDATE SET amount = incoming.amount
+    WHEN NOT MATCHED THEN INSERT (id, tenant, amount) VALUES (incoming.id, 'acme', incoming.amount);
+
+# id 4 was already there, so the MERGE matched and updated it rather than inserting a second one
+query III
+ACL ROLE "r" SELECT id, tenant, amount FROM orders ORDER BY id;
+----
+1	acme	100
+2	globex	20
+4	acme	400
+
+# an explicit alias on the target is left alone
+statement ok
+ACL ROLE "r" MERGE INTO orders AS t USING incoming ON t.id = incoming.id
+    WHEN MATCHED THEN UPDATE SET amount = 0;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM orders WHERE amount = 0;
+----
+2
+
+# --- the swap is still a swap: the physical name is not a way in -----------------------------------
+
+statement error
+ACL ROLE "r" UPDATE phys.main.orders_physical SET amount = 1;
+----
+<REGEX>:.*no access to object "phys.main.orders_physical".*
+
+statement error
+ACL ROLE "r" MERGE INTO orders USING phys.main.feed f ON orders.id = f.id WHEN MATCHED THEN UPDATE SET amount = 1;
+----
+<REGEX>:.*no access to object "phys.main.feed".*
+
+# --- a narrowed grant still refuses the forms it refused before ------------------------------------
+# (the alias changes nothing about which statements are allowed)
+
+statement ok
+ACL ADMIN CREATE ROLE narrow CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE narrow CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE narrow WITH (select, update, delete, merge) RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN GRANT TABLE c.incoming TO ROLE narrow WITH (select);
+
+statement error
+ACL ROLE "narrow" MERGE INTO orders USING incoming ON orders.id = incoming.id WHEN MATCHED THEN UPDATE SET amount = 1;
+----
+<REGEX>:.*narrowed by a grant.*
+
+# ... and its own predicate still applies to a qualified single-relation write
+statement ok
+ACL ROLE "narrow" UPDATE orders SET amount = 7 WHERE orders.id = 2;
+
+query I
+SELECT count(*) FROM phys.main.orders_physical WHERE amount = 7;
+----
+0

@@ -337,8 +337,32 @@ private:
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname); // RETURNING names the target's own columns
+			// An INSERT target binds under its table name - DuckDB ignores an alias here, with or
+			// without the ACL - so a qualifier the principal wrote is mapped rather than aliased.
+			MapTargetQualifier(item, vname, node.qualified_name.Name().GetIdentifierName());
 		}
 		RequireReadableReturning(node.returning_list, policy, vname);
+	}
+
+	//! `RETURNING vname.col` -> `RETURNING <physical table>.col`: only for INSERT, where the target is
+	//! bound by name. The other verbs keep the virtual name as an alias instead (ResolveDmlTarget).
+	void MapTargetQualifier(unique_ptr<ParsedExpression> &expr, const string &vname, const string &phys_table) {
+		if (!expr) {
+			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = expr->Cast<ColumnRefExpression>().ColumnNamesMutable();
+			if (names.size() >= 2) {
+				auto &qualifier = names[names.size() - 2];
+				auto last = SplitTopLevel(vname, '.').back();
+				if (StringUtil::CIEquals(qualifier.GetIdentifierName(), last)) {
+					qualifier = Identifier(phys_table);
+				}
+			}
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expr, [&](unique_ptr<ParsedExpression> &child) { MapTargetQualifier(child, vname, phys_table); });
 	}
 
 	void RewriteUpdateNode(UpdateQueryNode &node) {
@@ -880,7 +904,15 @@ private:
 		}
 		auto phys = ParsePhysName(policy.phys);
 		if (target_ref && target_ref->type == TableReferenceType::BASE_TABLE) {
-			target_ref->Cast<BaseTableRef>().SetQualifiedName(phys);
+			// Keep the virtual name as an alias, exactly as the read path does: a statement that
+			// qualifies its own columns still resolves after the swap, and MERGE's ON clause has no
+			// other way to name the target.
+			auto &base = target_ref->Cast<BaseTableRef>();
+			auto virtual_name = base.Table();
+			base.SetQualifiedName(phys);
+			if (base.alias.empty()) {
+				base.alias = virtual_name;
+			}
 		}
 		target_name = phys;
 		dml_target_name = key;
