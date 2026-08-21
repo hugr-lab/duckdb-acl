@@ -1,0 +1,219 @@
+# name: test/sql/acl_columns_restrict.test
+# description: an object's column list is a projection whatever it is made of (spec 029) - a list of
+#   pure renames used to pass every unlisted column through while the metadata said it did not
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t(id INT, tenant VARCHAR, amount INT, ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, 'acme', 10, 'SECRET');
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- the three shapes of a column list all mean the same thing --------------------------------------
+# bare names, renames, and renames beside a mask: each names what the relation has, and nothing else
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.bare AS phys.main.t COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.renamed AS phys.main.t COLUMNS (order_id = id, total = amount);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.mixed AS phys.main.t COLUMNS (order_id = id, ssn = NULL);
+
+query I
+ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM (DESCRIBE bare);
+----
+amount,id
+
+query I
+ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM (DESCRIBE renamed);
+----
+order_id,total
+
+query I
+ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM (DESCRIBE mixed);
+----
+order_id,ssn
+
+# what the role reads is what it was told it would read
+query II
+ACL ROLE "r" SELECT * FROM renamed;
+----
+1	10
+
+statement error
+ACL ROLE "r" SELECT ssn FROM renamed;
+----
+<REGEX>:.*(ssn|Referenced column).*
+
+statement error
+ACL ROLE "r" SELECT tenant FROM renamed;
+----
+<REGEX>:.*(tenant|Referenced column).*
+
+# --- every metadata surface agrees with the data path, and the types are real -----------------------
+# the disagreement is what made this dangerous: information_schema reported the projection while the
+# read returned the whole table
+
+query II
+ACL ROLE "r" SELECT column_name, data_type FROM information_schema.columns
+    WHERE table_name = 'renamed' ORDER BY column_name;
+----
+order_id	INTEGER
+total	INTEGER
+
+query II
+ACL ROLE "r" SELECT column_name, column_type FROM (DESCRIBE renamed) ORDER BY column_name;
+----
+order_id	INTEGER
+total	INTEGER
+
+query II
+SELECT name, type FROM acl_object_columns() WHERE vname = 'renamed' ORDER BY name;
+----
+order_id	INTEGER
+total	INTEGER
+
+# --- a rename list still keeps the relation writable, and still maps the names back ------------------
+# what changed is what it exposes, not what it is: the record is still alias-form
+
+query I
+SELECT form FROM acl_relations() WHERE vname = 'renamed';
+----
+alias
+
+statement ok
+ACL ROLE "r" INSERT INTO renamed (order_id, total) VALUES (2, 20);
+
+query II
+SELECT id, amount FROM phys.main.t WHERE id = 2;
+----
+2	20
+
+statement ok
+ACL ROLE "r" UPDATE renamed SET total = 22 WHERE order_id = 2;
+
+query I
+SELECT amount FROM phys.main.t WHERE id = 2;
+----
+22
+
+statement ok
+ACL ROLE "r" DELETE FROM renamed WHERE order_id = 2;
+
+query I
+SELECT count(*) FROM phys.main.t;
+----
+1
+
+# a column the list did not name is not writable either - a projection that only covered reads would
+# leave the other half of the hole open
+statement error
+ACL ROLE "r" INSERT INTO renamed (order_id, total, ssn) VALUES (3, 30, 'WRITTEN');
+----
+<REGEX>:.*column "ssn" of "renamed" is not writable.*
+
+statement error
+ACL ROLE "r" UPDATE renamed SET tenant = 'globex' WHERE order_id = 1;
+----
+<REGEX>:.*(tenant|is not writable|has no column).*
+
+# the physical name of a renamed column is still not part of the relation
+statement error
+ACL ROLE "r" INSERT INTO renamed (id, amount) VALUES (4, 40);
+----
+<REGEX>:.*has no column "id".*
+
+# --- a column added to the physical table does not join the relation ---------------------------------
+
+statement ok
+ALTER TABLE phys.main.t ADD COLUMN note VARCHAR;
+
+query I
+ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM (DESCRIBE renamed);
+----
+order_id,total
+
+statement error
+ACL ROLE "r" SELECT note FROM renamed;
+----
+<REGEX>:.*(note|Referenced column).*
+
+# --- an object with no column list is unaffected -------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.whole AS phys.main.t;
+
+query I
+ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM (DESCRIBE whole);
+----
+amount,id,note,ssn,tenant
+
+# --- a grant may only name what the object exposes ------------------------------------------------------
+# the refusal is at resolution rather than where the grant is written (see the spec's follow-up), so
+# it is the role's own read that reports it
+
+statement ok
+ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select) COLUMNS (order_id, tenant);
+
+statement error
+ACL ROLE "r" SELECT order_id FROM renamed;
+----
+<REGEX>:.*lists column "tenant", which the object does not expose.*
+
+# ... while its expression still runs over the physical row, so a mask may read what the object dropped
+statement ok
+ACL ADMIN GRANT TABLE c.renamed TO ROLE r WITH (select, insert, update)
+    COLUMNS (order_id, total = coalesce(tenant, 'none'));
+
+query II
+ACL ROLE "r" SELECT * FROM renamed;
+----
+1	acme
+
+# --- a grant's list replaces the object's, it never adds to it --------------------------------------------
+# the object allows two columns to be written and the grant allows one: the union would let a write
+# through that the grant had taken away
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.two AS phys.main.t COLUMNS (order_id = id, total = amount);
+
+statement ok
+ACL ADMIN GRANT TABLE c.two TO ROLE r WITH (select, insert) COLUMNS (order_id);
+
+statement error
+ACL ROLE "r" INSERT INTO two (order_id, total) VALUES (5, 50);
+----
+<REGEX>:.*column "amount" of "two" is not writable.*
+
+statement ok
+ACL ROLE "r" INSERT INTO two (order_id) VALUES (5);
+
+query II
+SELECT id, amount FROM phys.main.t WHERE id = 5;
+----
+5	NULL

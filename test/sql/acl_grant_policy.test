@@ -235,7 +235,7 @@ ACL ROLE "analyst" SELECT count(*) FROM stats;
 # --- renamed relations compose with a grant --------------------------------------------------------
 
 statement ok
-ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.renamed COLUMNS 'order_id=id,total=amount';
+ACL ADMIN ADD TABLE phys.main.orders_physical AS sales.renamed COLUMNS 'order_id=id,total=amount,tenant=tenant';
 
 statement ok
 ACL ADMIN GRANT TABLE sales.renamed TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS 'order_id,total,tenant=acl_claim(''tenant'')';

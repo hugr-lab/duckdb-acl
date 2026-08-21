@@ -83,6 +83,11 @@ Consequences of probing on the write path (deliberate):
 
 ### 2b. Column renames keep a relation writable
 
+> **Partly superseded by [spec 029](../029-columns-always-restrict/spec.md).** The half of this
+> section that said a rename list "is not restricting" — that unlisted columns pass through — is gone:
+> a column list is a projection whatever it is made of. Everything else here still holds, including
+> the writability this section exists to preserve.
+
 Renaming is not restricting, so it must not cost writability (a restriction is a positive list and
 stays a read-only subquery, so that a column added physically can never appear by itself). A column
 list whose every entry renames one column onto another (`order_id = id, total = amount`) therefore
@@ -90,7 +95,9 @@ keeps the **alias** form:
 
 - **reads** go through `SELECT * RENAME (id AS order_id, …) FROM <phys>` — renaming **by name**, so a
   column added to the physical table can never shift an alias onto a different column (the hazard of
-  positional `column_name_alias`); columns that were not renamed keep their names;
+  positional `column_name_alias`); columns that were not renamed keep their names
+  *(spec 029: the read is now a projection of the listed columns, and an unlisted one is not there at
+  all — which makes the same hazard impossible for a stronger reason)*;
 - **writes** keep the real table and map the names back: the `INSERT` column list, `UPDATE … SET`
   targets and the target's own references in `WHERE`/`RETURNING` are translated virtual → physical;
 - naming a **physical** column that the policy renamed away is refused — the virtual relation does
