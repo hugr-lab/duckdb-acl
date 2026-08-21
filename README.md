@@ -57,6 +57,35 @@ passes the rest.
 `acl_allow_function`. These populate the per-database policy store; a production build replaces them
 with the read-only, role-aware ACL resolver behind the same store seam.
 
+## The policy schema
+
+The catalog-backed policy store keeps its own schema — `relations`, `role_catalogs`, `grant_columns`
+and the rest — in whatever database you point `acl_use_db(...)` at. `acl_use_db('<db>', 'acl', true)`
+creates it for you; the third argument turns that off, for a database where you would rather apply
+the schema yourself.
+
+It is written down once, in [`schema/policy_schema.sql`](schema/policy_schema.sql), and everything
+else is rendered from it by `make schema`:
+
+| file | what it is |
+| --- | --- |
+| `schema/acl_schema.sql` | the schema as it stands, ready to run — then `acl_use_db('<db>', 'acl', false)` |
+| `src/include/acl_schema_sql.hpp` | what the extension runs when it initialises a catalog |
+
+There are no migrations yet — duckdb-acl has not been released, so every catalog is created at the
+current version. [`schema/migrations/README.md`](schema/migrations/README.md) is the contract the
+first one will follow.
+
+Because both come from one file, a hand-applied schema and the extension's own cannot drift
+apart; `make schema-check` fails if they have, and applies the file to an empty database to confirm
+the extension is content with what it finds.
+
+Only the duckdb dialect is kept. The SQL is plain, so translating it to another engine is a job for a
+translator rather than for a renderer we would have to keep correct — two things a target may need:
+a key column is indexed, so SQL Server needs it bounded (`NVARCHAR(255)`, not `NVARCHAR(MAX)`, which
+cannot carry an index — see [specs/033](specs/033-policy-catalog-on-sql-server/spec.md)), and
+`IF NOT EXISTS` on `CREATE TABLE` / `ADD COLUMN` is not universal.
+
 ## Build
 
 ```sh
@@ -64,6 +93,9 @@ git submodule update --init --recursive
 make                # builds duckdb + the extension (release)
 make test           # runs test/sql/acl.test (and the C++ tests on Linux/macOS)
 make test-cpp       # standalone C++ invariant tests only (test/cpp/)
+
+make schema            # re-render the policy schema after editing schema/policy_schema.sql
+make schema-check      # fail if the rendered files are stale, or if the schema no longer applies
 
 # integration against real databases (docker; see specs/005)
 cp .env.example .env

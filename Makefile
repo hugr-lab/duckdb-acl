@@ -100,7 +100,9 @@ ACL_MSSQL_USER ?= sa
 ACL_MSSQL_PASS ?= TestPassword1
 ACL_MSSQL_DB ?= acltest
 
-DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
+# -p matches the `name:` in the compose file: belt and braces, so no invocation can pick up the
+# directory-derived project name and adopt an unrelated project's containers (spec 033)
+DOCKER_COMPOSE := docker compose -p duckdb-acl -f docker/docker-compose.yml
 
 .PHONY: docker-up docker-down docker-status test-integration
 # --wait would treat the one-shot sqlserver-init container as a failure; wait on the servers, then
@@ -125,6 +127,16 @@ test-integration:
 	ACL_MYSQL_DSN="host=$(ACL_MYSQL_HOST) port=$(ACL_MYSQL_PORT) user=$(ACL_MYSQL_USER) passwd=$(ACL_MYSQL_PASS) db=$(ACL_MYSQL_DB)" \
 	ACL_MSSQL_DSN="Server=$(ACL_MSSQL_HOST),$(ACL_MSSQL_PORT);Database=$(ACL_MSSQL_DB);User Id=$(ACL_MSSQL_USER);Password=$(ACL_MSSQL_PASS)" \
 	build/release/test/unittest "test/sql/integration/*"
+
+# --- The managed policy schema (spec 034) ---------------------------------
+# schema/policy_schema.sql is the source of truth; everything else is rendered from it, so what an
+# operator applies by hand and what the extension creates are the same statements.
+.PHONY: schema schema-check
+schema:
+	python3 scripts/gen_schema.py
+
+schema-check:
+	./scripts/check_schema.sh
 
 # Bootstrap a local vcpkg checkout for integration builds (the standard duckdb-extension dependency
 # manager; dependencies themselves come from the merged manifests of the loaded extensions)

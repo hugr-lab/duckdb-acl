@@ -1,0 +1,93 @@
+# name: test/sql/acl_schema_version.test
+# description: a catalog says which schema shape it is, and a build refuses one it does not read
+#   (spec 034) - the case a hand-applied schema makes possible
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t(id INT, tenant VARCHAR);
+
+# init creates the schema and stamps it, so this is always the version this build reads
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+query I
+SELECT count(*) FROM store.acl.meta WHERE "key" = 'schema_version';
+----
+1
+
+# and using it again without init is fine: the stamp matches
+statement ok
+SELECT acl_use_db('store', 'acl', false);
+
+# --- a stamp from another version is refused, and says both numbers ------------------------------
+
+statement ok
+UPDATE store.acl.meta SET "value" = '9' WHERE "key" = 'schema_version';
+
+statement error
+SELECT acl_use_db('store', 'acl', false);
+----
+<REGEX>:.*is schema version 9, this build reads [0-9]+.*apply the matching.*
+
+# init brings it back up to this build's version rather than refusing
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SELECT acl_use_db('store', 'acl', false);
+
+# --- a schema with no stamp at all is not an acl schema -------------------------------------------
+# the case of applying acl_schema.sql without the statement at the end of it
+
+statement ok
+DELETE FROM store.acl.meta WHERE "key" = 'schema_version';
+
+statement error
+SELECT acl_use_db('store', 'acl', false);
+----
+<REGEX>:.*has no schema_version.*
+
+statement ok
+INSERT INTO store.acl.meta VALUES ('schema_version', 'ten');
+
+statement error
+SELECT acl_use_db('store', 'acl', false);
+----
+<REGEX>:.*which is not a number.*
+
+# --- the check is at the moment the catalog is chosen, not in the middle of a query ---------------
+# which is the whole point: a mismatched schema used to surface as a missing column much later
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, 'acme');
+
+query II
+ACL ROLE "r" SELECT * FROM t;
+----
+1	acme

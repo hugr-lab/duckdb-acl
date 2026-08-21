@@ -12,6 +12,11 @@
 # SQL Server needs an init container (same pattern as mssql-extension). DuckLake is not a server:
 # the scenarios attach it with the PostgreSQL container as its catalog and a local data path.
 
+# An explicit project name: without it compose derives one from this file's directory ('docker'),
+# which collides with any other compose file that also lives in a directory called `docker` - it
+# then treats those containers as ours and recreates them (spec 033).
+name: duckdb-acl
+
 services:
   postgres:
     image: postgres:18

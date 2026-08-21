@@ -9,6 +9,7 @@
 // Connection would cycle DatabaseInstance -> config -> store -> connection).
 
 #include "acl_policy.hpp"
+#include "acl_schema_sql.hpp"
 
 #include "acl_token.hpp"
 
@@ -597,7 +598,8 @@ struct CatalogBackend {
 			                   values + ") v(\"role\", \"vcat\", \"is_main\", \"caps\")";
 		}
 		return "WITH grants AS (" + grants +
-		       "), main_ok AS (SELECT count(DISTINCT \"vcat\") = 1 AS unique_main FROM grants WHERE \"is_main\") ";
+		       "), main_ok AS (SELECT count(DISTINCT \"vcat\") = 1 AS unique_main FROM grants WHERE \"is_main\" = "
+		       "true) ";
 	}
 
 	//! FROM-sources of the resolution queries: a table reference, or a callback invocation whose
@@ -769,7 +771,7 @@ struct CatalogBackend {
 		           " FROM " +
 		           RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
 		           " WHERE (" + qualified_cond +
-		           ") OR (g.\"is_main\" AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(vname) +
+		           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(vname) +
 		           ") ORDER BY prio";
 		auto result = Query(sql);
 		if (result->RowCount() == 0) {
@@ -933,7 +935,7 @@ struct CatalogBackend {
 		           " THEN 1 ELSE 2 END AS prio"
 		           " FROM " +
 		           AliasesSource(principal) + " sa JOIN grants g ON g.\"vcat\" = sa.\"vcat\"" + oc_join + " WHERE (" +
-		           qualified_cond + ") OR (g.\"is_main\" AND (SELECT unique_main FROM main_ok) AND " +
+		           qualified_cond + ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND " +
 		           prefix_match(Lit(vname), "sa.\"alias_path\"") + ") ORDER BY prio, length(sa.\"alias_path\") DESC";
 		auto result = Query(sql);
 		if (result->RowCount() == 0) {
@@ -997,7 +999,7 @@ struct CatalogBackend {
 		           " FROM " +
 		           FunctionsSource(principal, names) + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join +
 		           " WHERE f.\"kind\" = '" + kind + "' AND ((" + qualified_cond +
-		           ") OR (g.\"is_main\" AND (SELECT unique_main FROM main_ok) AND f.\"vname\" = " + Lit(vname) +
+		           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND f.\"vname\" = " + Lit(vname) +
 		           ")) ORDER BY prio";
 		auto result = Query(sql);
 		TablePolicy policy;
@@ -1202,7 +1204,7 @@ struct CatalogBackend {
 			// principal holds as MAIN, which is exactly what resolution falls back to
 			return prelude + "SELECT DISTINCT s.vcat AS database_name, s.path AS schema_name,"
 			                 " (s.path = 'main' AND EXISTS (SELECT 1 FROM grants g WHERE g.\"vcat\" = s.vcat"
-			                 " AND g.\"is_main\")) AS \"current\" FROM vschemas s ORDER BY ALL";
+			                 " AND g.\"is_main\" = true)) AS \"current\" FROM vschemas s ORDER BY ALL";
 		}
 		auto physical = "i.\"table_catalog\" = o.parts[1] AND i.\"table_schema\" = o.parts[2]"
 		                " AND i.\"table_name\" = o.parts[3]";
@@ -1228,7 +1230,7 @@ struct CatalogBackend {
 			// tables a bare name does not reach (spec 031).
 			return prelude + "SELECT t.table_name AS name FROM (" + tables_sql +
 			       ") t WHERE t.table_schema = 'main' AND EXISTS (SELECT 1 FROM grants g"
-			       " WHERE g.\"vcat\" = t.table_catalog AND g.\"is_main\") ORDER BY 1";
+			       " WHERE g.\"vcat\" = t.table_catalog AND g.\"is_main\" = true) ORDER BY 1";
 		}
 		if (surface != "columns" && surface != "references" && surface != "show_tables_expanded" &&
 		    surface != "show_tables") {
@@ -1879,139 +1881,106 @@ struct CatalogBackend {
 		return statements;
 	}
 
+	//! Substitute the schema file's placeholders: `<schema>` is the qualified schema of the catalog
+	//! being initialised and `<name>` one of its tables. Only `<lower_case_word>` counts, so the `<`
+	//! of a comparison in the file is left alone.
+	string ResolveSchemaNames(const string &sql) {
+		string out;
+		for (idx_t i = 0; i < sql.size();) {
+			if (sql[i] == '<') {
+				idx_t j = i + 1;
+				while (j < sql.size() && ((sql[j] >= 'a' && sql[j] <= 'z') || sql[j] == '_')) {
+					j++;
+				}
+				if (j > i + 1 && j < sql.size() && sql[j] == '>') {
+					auto name = sql.substr(i + 1, j - i - 1);
+					out += name == "schema" ? Ident(db_name) + "." + Ident(schema) : Tbl(name.c_str());
+					i = j + 1;
+					continue;
+				}
+			}
+			out += sql[i++];
+		}
+		return out;
+	}
+
+	//! The catalog says which shape it is; this build knows one. A schema applied by hand (spec 034)
+	//! is the case that makes them differ, and the failure without this check is a missing column in
+	//! the middle of somebody's query rather than a word at the moment the catalog is chosen.
+	void RequireSchemaVersion() {
+		auto stored = MetaValue("schema_version");
+		if (stored.empty()) {
+			throw BinderException("acl catalog: \"%s\".\"%s\" has no schema_version - it is not an acl policy "
+			                      "schema, or it was applied without the version stamp (see schema/acl_schema.sql)",
+			                      db_name, schema);
+		}
+		int64_t version = 0;
+		try {
+			version = std::stoll(stored);
+		} catch (std::exception &) {
+			throw BinderException("acl catalog: \"%s\".\"%s\" has schema_version \"%s\", which is not a number",
+			                      db_name, schema, stored);
+		}
+		if (version != ACL_SCHEMA_VERSION) {
+			throw BinderException("acl catalog: \"%s\".\"%s\" is schema version %lld, this build reads %d - apply "
+			                      "the matching schema/acl_schema.sql, or let acl_use_db(..., true) create it",
+			                      db_name, schema, version, ACL_SCHEMA_VERSION);
+		}
+	}
+
+	//! What a key column is declared as, by the kind of catalog it lives in. Everywhere but SQL Server
+	//! that is a plain VARCHAR; the mssql scanner maps every VARCHAR - length or not - to
+	//! NVARCHAR(MAX), which SQL Server refuses to index, so key columns take its own bounded type.
+	//! 255 characters is then a real limit on a name, a role or a schema path there (spec 033).
+	string KeyColumnType() {
+		auto result = Query("SELECT \"type\" FROM duckdb_databases() WHERE \"database_name\" = " + Lit(db_name));
+		if (result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
+		    StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "mssql")) {
+			return "MSSQL_VARCHAR(255)";
+		}
+		return "VARCHAR";
+	}
+
 	//! Every table carries a primary key: sources without rowids need one for DELETE/UPDATE
 	void InitSchema() {
 		auto instance = Db();
 		Connection con(*instance);
-		vector<string> ddl = {
-		    "CREATE SCHEMA IF NOT EXISTS " + Ident(db_name) + "." + Ident(schema),
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("meta") + "(\"key\" VARCHAR PRIMARY KEY, \"value\" VARCHAR)",
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("catalogs") + "(\"vcat\" VARCHAR PRIMARY KEY, \"comment\" VARCHAR)",
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("relations") +
-		        "(\"vcat\" VARCHAR, \"vname\" VARCHAR, \"form\" VARCHAR, \"phys\" VARCHAR, \"view_sql\" VARCHAR,"
-		        " \"rls\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\"))",
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("relation_columns") +
-		        "(\"vcat\" VARCHAR, \"vname\" VARCHAR, \"pos\" INTEGER, \"name\" VARCHAR, \"expr\" VARCHAR,"
-		        " PRIMARY KEY (\"vcat\", \"vname\", \"pos\"))",
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("schema_aliases") +
-		        "(\"vcat\" VARCHAR, \"alias_path\" VARCHAR, \"phys_path\" VARCHAR,"
-		        " PRIMARY KEY (\"vcat\", \"alias_path\"))",
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("functions") +
-		        "(\"vcat\" VARCHAR, \"vname\" VARCHAR, \"kind\" VARCHAR, \"form\" VARCHAR, \"target\" VARCHAR,"
-		        " \"template\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\", \"kind\"))",
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("roles") + "(\"role\" VARCHAR PRIMARY KEY, \"comment\" VARCHAR)",
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_claims") +
-		        "(\"role\" VARCHAR, \"claim\" VARCHAR, \"value\" VARCHAR, PRIMARY KEY (\"role\", \"claim\"))",
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_catalogs") +
-		        "(\"role\" VARCHAR, \"vcat\" VARCHAR, \"is_main\" BOOLEAN, \"caps\" VARCHAR,"
-		        " PRIMARY KEY (\"role\", \"vcat\"))",
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_object_caps") +
-		        "(\"role\" VARCHAR, \"vcat\" VARCHAR, \"vname\" VARCHAR, \"caps\" VARCHAR,"
-		        " PRIMARY KEY (\"role\", \"vcat\", \"vname\"))",
-		    // '' as role/kind means "global"/"any kind": NULL cannot be part of the primary key
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("function_gate") +
-		        "(\"role\" VARCHAR, \"name\" VARCHAR, \"kind\" VARCHAR, \"allowed\" BOOLEAN,"
-		        " PRIMARY KEY (\"role\", \"name\", \"kind\"))",
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("issuers") +
-		        "(\"issuer\" VARCHAR PRIMARY KEY, \"keys_json\" VARCHAR, \"audiences\" VARCHAR,"
-		        " \"algs\" VARCHAR, \"role_claim\" VARCHAR, \"claim_map\" VARCHAR)",
-		    // '' as vcat means "every catalog": NULL cannot be part of the primary key
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("admins") +
-		        "(\"role\" VARCHAR PRIMARY KEY, \"scope\" VARCHAR, \"vcat\" VARCHAR)",
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_mappings") +
-		        "(\"issuer\" VARCHAR, \"source\" VARCHAR, \"external_value\" VARCHAR, \"role\" VARCHAR,"
-		        " PRIMARY KEY (\"issuer\", \"source\", \"external_value\", \"role\"))",
-		    // spec 010 (schema v2): comments, and the column schema of every object - declared by an
-		    // admin or derived by binding the template at write time (a query-defined object has no
-		    // physical row to read names and types from). Runs after every CREATE TABLE above.
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("object_columns") +
-		        "(\"vcat\" VARCHAR, \"vname\" VARCHAR, \"kind\" VARCHAR, \"pos\" INTEGER, \"name\" VARCHAR,"
-		        " \"type\" VARCHAR, \"comment\" VARCHAR, \"derived\" BOOLEAN,"
-		        " PRIMARY KEY (\"vcat\", \"vname\", \"kind\", \"pos\"))",
-		    // spec 014 (schema v4): a schema is an object of the catalog, not just a prefix rule - it
-		    // carries a comment, and `phys_path` says which kind it is: non-NULL = a live alias that
-		    // resolves through, NULL = a schema whose content is the catalog's own relation records
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("schemas") +
-		        "(\"vcat\" VARCHAR, \"path\" VARCHAR, \"phys_path\" VARCHAR, \"comment\" VARCHAR,"
-		        " PRIMARY KEY (\"vcat\", \"path\"))",
-		    "INSERT INTO " + Tbl("schemas") +
-		        "(\"vcat\", \"path\", \"phys_path\") SELECT a.\"vcat\", a.\"alias_path\", a.\"phys_path\" FROM " +
-		        Tbl("schema_aliases") + " a WHERE NOT EXISTS (SELECT 1 FROM " + Tbl("schemas") +
-		        " s WHERE s.\"vcat\" = a.\"vcat\" AND s.\"path\" = a.\"alias_path\")",
-		    "ALTER TABLE " + Tbl("relations") + " ADD COLUMN IF NOT EXISTS \"comment\" VARCHAR",
-		    // spec 014: an expansion's source, and the record's memory of where it came from - which is
-		    // how REFRESH tells its own records from ones an admin registered by hand. Column order
-		    // differs between a fresh catalog and a migrated one, so every INSERT names its columns.
-		    "ALTER TABLE " + Tbl("schemas") + " ADD COLUMN IF NOT EXISTS \"origin\" VARCHAR",
-		    "ALTER TABLE " + Tbl("relations") + " ADD COLUMN IF NOT EXISTS \"origin\" VARCHAR",
-		    // spec 015 (schema v5): the middle level of the grant chain. Capabilities only - policy stays
-		    // two-level - and `inherited` says whether the row was materialised from an ancestor or
-		    // granted as it stands, which is what makes the cascade repeatable.
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("role_schemas") +
-		        "(\"role\" VARCHAR, \"vcat\" VARCHAR, \"schema_path\" VARCHAR, \"caps\" VARCHAR,"
-		        " \"inherited\" BOOLEAN, \"comment\" VARCHAR,"
-		        " PRIMARY KEY (\"role\", \"vcat\", \"schema_path\"))",
-		    // spec 016: where this role creates - a physical schema of its own (`INTO`), or nothing at
-		    // all (`VIRTUAL ONLY`: it may only register objects that already exist)
-		    "ALTER TABLE " + Tbl("role_schemas") + " ADD COLUMN IF NOT EXISTS \"into\" VARCHAR",
-		    "ALTER TABLE " + Tbl("role_schemas") + " ADD COLUMN IF NOT EXISTS \"virtual_only\" BOOLEAN",
-		    // a record dropped on purpose must not come back on the next REFRESH
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("schema_dropped") +
-		        "(\"vcat\" VARCHAR, \"path\" VARCHAR, \"name\" VARCHAR,"
-		        " PRIMARY KEY (\"vcat\", \"path\", \"name\"))",
-		    // spec 011 (schema v3): a grant carries its own policy, not only capabilities - an RLS
-		    // predicate and a column list that narrow the object for this role (and supply values on
-		    // writes). Both levels of the chain are grant rows, so both gain the two columns.
-		    "ALTER TABLE " + Tbl("role_catalogs") + " ADD COLUMN IF NOT EXISTS \"rls\" VARCHAR",
-		    "ALTER TABLE " + Tbl("role_catalogs") + " ADD COLUMN IF NOT EXISTS \"columns\" VARCHAR",
-		    "ALTER TABLE " + Tbl("role_object_caps") + " ADD COLUMN IF NOT EXISTS \"rls\" VARCHAR",
-		    "ALTER TABLE " + Tbl("role_object_caps") + " ADD COLUMN IF NOT EXISTS \"columns\" VARCHAR",
-		    "ALTER TABLE " + Tbl("functions") + " ADD COLUMN IF NOT EXISTS \"comment\" VARCHAR",
-		    // the declared signature ("name TYPE, …"): it makes a probe meaningful (typed NULLs) and,
-		    // together with a declared result, unnecessary
-		    "ALTER TABLE " + Tbl("functions") + " ADD COLUMN IF NOT EXISTS \"params\" VARCHAR",
-		    // spec 022 (schema v7): references - declared join paths between objects of the virtual
-		    // catalog. Not foreign keys: nothing is enforced, the ends may live in different sources,
-		    // and the record is a hint an agent reads. The columns live in their own table so that
-		    // visibility is an anti-join rather than the parsing of a packed string.
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("references") +
-		        "(\"vcat\" VARCHAR, \"name\" VARCHAR, \"from_vname\" VARCHAR, \"to_vname\" VARCHAR,"
-		        " \"to_kind\" VARCHAR, \"expr\" VARCHAR, \"cardinality\" VARCHAR, \"optional\" BOOLEAN,"
-		        " \"join_method\" VARCHAR, \"comment\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\"))",
-		    // one row per column the reference names, with the side it belongs to: 'from' or 'to'.
-		    // A pair join writes two rows per position; an expression writes one row per name it
-		    // mentions, attributed at write time by its qualifier.
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("reference_columns") +
-		        "(\"vcat\" VARCHAR, \"name\" VARCHAR, \"pos\" INTEGER, \"side\" VARCHAR, \"column\" VARCHAR,"
-		        " \"param\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\", \"pos\", \"side\"))",
-		    // spec 023 (schema v8): where an issuer's keys come from. A JWKS the operator pasted stays
-		    // valid; a URI is read through duckdb's own filesystem, so an https URL (with httpfs) and a
-		    // file an operator refreshes out of band are the same mechanism.
-		    "ALTER TABLE " + Tbl("issuers") + " ADD COLUMN IF NOT EXISTS \"jwks_uri\" VARCHAR",
-		    // spec 026 (schema v9): the columns a *grant's* projection produces. An object's own columns
-		    // are probed when it is defined (spec 010), but a grant may mask one into another type or
-		    // add a computed one the object never had - and a listing that cannot see those describes
-		    // something the role does not read.
-		    "CREATE TABLE IF NOT EXISTS " + Tbl("grant_columns") +
-		        "(\"role\" VARCHAR, \"vcat\" VARCHAR, \"vname\" VARCHAR, \"pos\" INTEGER, \"name\" VARCHAR,"
-		        " \"type\" VARCHAR, PRIMARY KEY (\"role\", \"vcat\", \"vname\", \"pos\"))",
-		    // spec 027 (schema v10): whether a predicate was actually bound when it was written. Spec 021
-		    // binds one where it can, and accepts it unchecked when the object cannot be bound at all -
-		    // so "it was accepted" and "it was judged" are different facts, and only the second one lets
-		    // a write with a second relation in scope trust a subquery inside it.
-		    "ALTER TABLE " + Tbl("relations") + " ADD COLUMN IF NOT EXISTS \"rls_checked\" BOOLEAN",
-		    "ALTER TABLE " + Tbl("role_object_caps") + " ADD COLUMN IF NOT EXISTS \"rls_checked\" BOOLEAN",
-		    "ALTER TABLE " + Tbl("role_catalogs") + " ADD COLUMN IF NOT EXISTS \"rls_checked\" BOOLEAN",
-		    "INSERT INTO " + Tbl("meta") + " SELECT 'schema_version', '10' WHERE NOT EXISTS (SELECT 1 FROM " +
-		        Tbl("meta") + " WHERE \"key\" = 'schema_version')",
-		    "UPDATE " + Tbl("meta") + " SET \"value\" = '10' WHERE \"key\" = 'schema_version' AND \"value\" < '10'",
-		    "INSERT INTO " + Tbl("meta") + " SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM " +
-		        Tbl("meta") + " WHERE \"key\" = 'policy_version')",
-		};
+		// spec 034: the schema is written down once, in schema/policy_schema.sql; this header is
+		// generated from it, so what an operator applies by hand and what the extension creates here are
+		// the same statements.
+		vector<string> ddl;
+		for (auto statement : ACL_SCHEMA_SQL) {
+			ddl.push_back(ResolveSchemaNames(statement));
+		}
+		// spec 033: the type key columns are declared with follows the catalog's own kind. duckdb and
+		// postgres index a VARCHAR of any length; SQL Server's scanner creates every VARCHAR as
+		// NVARCHAR(MAX), which cannot carry an index at all (error 1750), so there they are declared
+		// with the scanner's own bounded type instead.
+		auto key_type = KeyColumnType();
+		for (auto &sql : ddl) {
+			sql = StringUtil::Replace(sql, "ACL_KEY_TEXT", key_type);
+		}
 		for (auto &sql : ddl) {
 			auto result = con.Query(sql);
 			if (result->HasError()) {
 				throw BinderException("acl catalog: init failed at [%s]: %s", sql, result->GetError());
+			}
+		}
+		// bringing an existing stamp up to date is a decision about versions, not a comparison SQL
+		// should make: `CAST(value AS INTEGER)` throws on a stamp that is not a number, which left a
+		// corrupt catalog impossible to re-initialise (spec 034).
+		auto stored = MetaValue("schema_version");
+		int64_t version = -1;
+		try {
+			version = stored.empty() ? -1 : std::stoll(stored);
+		} catch (std::exception &) {
+			version = -1; // unreadable: init is exactly the moment to make it current
+		}
+		if (version != ACL_SCHEMA_VERSION) {
+			auto stamp = con.Query("UPDATE " + Tbl("meta") + " SET \"value\" = '" + std::to_string(ACL_SCHEMA_VERSION) +
+			                       "' WHERE \"key\" = 'schema_version'");
+			if (stamp->HasError()) {
+				throw BinderException("acl catalog: could not stamp the schema version: %s", stamp->GetError());
 			}
 		}
 	}
@@ -2033,7 +2002,8 @@ void PolicyStore::EnableCatalog(DatabaseInstance &db, const string &db_name, con
 	if (init) {
 		backend->InitSchema();
 	}
-	backend->EnsureFresh(); // validates reachability and the schema before switching over
+	backend->RequireSchemaVersion(); // spec 034: a schema applied by hand must be the one this build reads
+	backend->EnsureFresh();          // validates reachability and the schema before switching over
 	lock_guard<mutex> guard(lock);
 	catalog = std::move(backend);
 }

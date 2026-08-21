@@ -1,7 +1,8 @@
 # name: test/sql/integration/acl_catalog_sqlserver.test
 # description: catalog-backed policy store over a live SQL Server catalog (spec 006) - the managed
-#   schema is created through hugr-lab/mssql-extension, policy resolves from it. Skips until the
-#   mssql duckdb-main compatibility build lands (see extension_config.cmake).
+#   schema is created through hugr-lab/mssql-extension, policy resolves from it. The scanner now
+#   builds against our duckdb pin, and the key columns are declared by the catalog's own kind, so
+#   SQL Server can index them (spec 033).
 # group: [integration]
 
 require acl
