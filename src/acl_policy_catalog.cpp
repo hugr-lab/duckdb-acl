@@ -3078,6 +3078,49 @@ void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
 	                    " AND \"vcat\" = " + Lit(vcat)});
 }
 
+namespace {
+
+//! Builds the name test for a given column, so one call covers a single object (`"vname" = 'x'`) and a
+//! whole schema prefix alike.
+using NamePred = std::function<string(const char *)>;
+
+NamePred ExactName(const string &vname) {
+	return [vname](const char *column) {
+		return "\"" + string(column) + "\" = " + Lit(vname);
+	};
+}
+
+NamePred PrefixName(const string &path) {
+	return [path](const char *column) {
+		return "substr(\"" + string(column) + "\", 1, " + std::to_string(path.size() + 1) + ") = " + Lit(path + ".");
+	};
+}
+
+//! A reference is a declared join path between two objects (spec 022). When either end goes the path
+//! is not a hint any more, it is a lie - so it goes with the end, and so do the columns it recorded.
+//! Nothing is refused: a reference grants nothing, so it must never stand in the way of a drop.
+void DropReferencesNaming(CatalogBackend &catalog, const string &vcat, const NamePred &pred,
+                          vector<string> &statements) {
+	auto in_cat = " WHERE \"vcat\" = " + Lit(vcat) + " AND ";
+	auto ends = "(" + pred("from_vname") + " OR " + pred("to_vname") + ")";
+	// the columns first: their rows are found through the references they belong to
+	statements.push_back("DELETE FROM " + catalog.Tbl("reference_columns") + in_cat +
+	                     "\"name\" IN (SELECT \"name\" FROM " + catalog.Tbl("references") + in_cat + ends + ")");
+	statements.push_back("DELETE FROM " + catalog.Tbl("references") + in_cat + ends);
+}
+
+//! What a grant recorded about one name: the grant itself and the projection probed for it (spec 026).
+//! `role_object_caps` is keyed by name alone, so a name shared by a relation and a function has one
+//! row for both - which is why this is only called once nothing of that name is left.
+void DropGrantRowsFor(CatalogBackend &catalog, const string &vcat, const NamePred &pred, vector<string> &statements) {
+	auto in_cat = " WHERE \"vcat\" = " + Lit(vcat) + " AND ";
+	for (auto table : {"role_object_caps", "grant_columns"}) {
+		statements.push_back("DELETE FROM " + catalog.Tbl(table) + in_cat + pred("vname"));
+	}
+}
+
+} // namespace
+
 void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 	RequireCatalog(catalog, "acl_drop_relation");
 	// dropping something that is not there is an error, not a silent success (spec 010) - the other
@@ -3098,16 +3141,19 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 			                    ", " + Lit(vname.substr(0, dot)) + ", " + Lit(vname.substr(dot + 1)) + ")");
 		}
 	}
-	catalog->Write({"DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                    " AND \"vname\" = " + Lit(vname),
-	                "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                    " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'",
-	                "DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                    " AND \"vname\" = " + Lit(vname),
-	                "DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                    " AND \"vname\" = " + Lit(vname),
-	                "DELETE FROM " + catalog->Tbl("grant_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                    " AND \"vname\" = " + Lit(vname)});
+	auto pred = ExactName(vname);
+	vector<string> statements = {"DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                                 " AND \"vname\" = " + Lit(vname),
+	                             "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                                 " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'",
+	                             "DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                                 " AND \"vname\" = " + Lit(vname)};
+	// a function of the same name keeps the grant, because the grant row cannot tell them apart
+	if (!CatalogObjectExists(vcat, vname, "table") && !CatalogObjectExists(vcat, vname, "scalar")) {
+		DropGrantRowsFor(*catalog, vcat, pred, statements);
+	}
+	DropReferencesNaming(*catalog, vcat, pred, statements);
+	catalog->Write(statements);
 	if (!tombstone.empty()) {
 		catalog->Write(tombstone);
 	}
@@ -3298,12 +3344,12 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 			                      "drop those grants too",
 			                      vcat, StringUtil::Join(roles, ", "));
 		}
-		for (auto table :
-		     {"relations", "relation_columns", "schemas", "schema_aliases", "functions", "object_columns"}) {
+		for (auto table : {"relations", "relation_columns", "schemas", "schema_aliases", "functions", "object_columns",
+		                   "references", "reference_columns", "schema_dropped"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
 		}
 		if (cascade) {
-			for (auto table : {"role_catalogs", "role_object_caps"}) {
+			for (auto table : {"role_catalogs", "role_object_caps", "grant_columns", "role_schemas"}) {
 				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
 			}
 		}
@@ -3324,8 +3370,9 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 		// CASCADE - the rule DROP VIRTUAL CATALOG already follows for grants (spec 010)
 		auto prefix =
 		    " AND substr(\"vname\", 1, " + std::to_string(alias_path.size() + 1) + ") = " + Lit(alias_path + ".");
-		auto records =
-		    read("SELECT count(*) FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) + prefix);
+		auto records = read("SELECT (SELECT count(*) FROM " + catalog->Tbl("relations") +
+		                    " WHERE \"vcat\" = " + Lit(vcat) + prefix + ") + (SELECT count(*) FROM " +
+		                    catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) + prefix + ")");
 		auto count = records->GetValue(0, 0).GetValue<int64_t>();
 		if (count > 0 && !cascade) {
 			throw BinderException("acl admin: schema \"%s.%s\" still holds %lld object(s) - repeat with CASCADE to "
@@ -3333,9 +3380,12 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 			                      vcat, alias_path, count);
 		}
 		if (cascade) {
-			for (auto table : {"relations", "relation_columns", "role_object_caps"}) {
+			for (auto table : {"relations", "relation_columns", "object_columns", "functions"}) {
 				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat) + prefix);
 			}
+			auto under = PrefixName(alias_path);
+			DropGrantRowsFor(*catalog, vcat, under, statements);
+			DropReferencesNaming(*catalog, vcat, under, statements);
 			statements.push_back("DELETE FROM " + catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " + Lit(vcat) +
 			                     " AND \"path\" = " + Lit(alias_path));
 		}
@@ -3361,6 +3411,16 @@ void PolicyStore::CatalogDropFunction(const string &vcat, const string &vname, c
 		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
 		statements.push_back("DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
+		auto pred = ExactName(vname);
+		// the grant rows name the object, not its kind: they go only once nothing of that name is left
+		auto others =
+		    read("SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+		         " AND \"vname\" = " + Lit(vname) + " UNION ALL SELECT 1 FROM " + catalog->Tbl("functions") +
+		         " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " AND \"kind\" <> " + Lit(kind));
+		if (others->RowCount() == 0) {
+			DropGrantRowsFor(*catalog, vcat, pred, statements);
+		}
+		DropReferencesNaming(*catalog, vcat, pred, statements);
 	});
 }
 
@@ -3373,8 +3433,8 @@ void PolicyStore::CatalogDropRole(const string &role) {
 			throw BinderException("acl admin: role \"%s\" does not exist", role);
 		}
 		// everything that points at a role goes with it - nothing may dangle
-		for (auto table :
-		     {"role_claims", "role_catalogs", "role_object_caps", "role_schemas", "admins", "role_mappings"}) {
+		for (auto table : {"role_claims", "role_catalogs", "role_object_caps", "grant_columns", "role_schemas",
+		                   "admins", "role_mappings"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"role\" = " + Lit(role));
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
