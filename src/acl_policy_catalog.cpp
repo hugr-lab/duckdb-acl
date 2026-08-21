@@ -885,6 +885,7 @@ struct CatalogBackend {
 		// declares none - every physical column under its own name. The grant's list is a subset of the
 		// object's (checked below), so it replaces what the object allowed rather than adding to it.
 		out.write_columns.clear();
+		out.write_order.clear();
 		// spec 038: where the object states its own columns, the grant is folded into them - in the
 		// object's order, so a column's position belongs to the object rather than to whoever asks. A
 		// listed name the object does not have is a *bare name* that grants nothing (it intersects
@@ -947,6 +948,7 @@ struct CatalogBackend {
 					continue;
 				}
 				out.write_columns.insert(column.first);
+				out.write_order.push_back(column.first);
 				if (!column.second.empty()) {
 					out.injections.emplace_back(column.first, column.second);
 				}
@@ -978,6 +980,7 @@ struct CatalogBackend {
 				continue;
 			}
 			out.write_columns.insert(source);
+			out.write_order.push_back(column.first);
 			if (!column.second.empty()) {
 				out.injections.emplace_back(source, column.second);
 			}

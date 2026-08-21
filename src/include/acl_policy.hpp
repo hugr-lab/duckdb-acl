@@ -69,6 +69,11 @@ struct TablePolicy {
 	//! The physical columns a grant allows to be written; empty = unrestricted. Writing anything else
 	//! is refused rather than silently dropped.
 	case_insensitive_set_t write_columns;
+	//! The same columns under the names the principal knows them by, in the order the object is
+	//! published in (spec 042). duckdb matches an INSERT that names no columns by *position* against
+	//! the table's full width and never by name, while a client counts the columns spec 035 published
+	//! - so the list has to be supplied, or the client is counting columns it was never shown.
+	vector<string> write_order;
 };
 
 //! Where a principal's DDL lands (spec 016): the virtual schema the written name belongs to, the

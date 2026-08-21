@@ -1326,6 +1326,21 @@ private:
 		if (policy.write_columns.empty()) {
 			return;
 		}
+		if (node.columns.empty() && !node.default_values && node.column_order != InsertColumnOrder::INSERT_BY_NAME &&
+		    !policy.write_order.empty() && policy.injections.empty()) {
+			// duckdb matches a listless INSERT by position against the *table's* full width, while the
+			// client is counting the columns we published (spec 035). Supplying the list closes that
+			// gap: an insert of the shape we advertised writes the columns we advertised, and a value
+			// too many is duckdb's own width error rather than a row nobody asked for.
+			//
+			// Only where the grant assigns no values. An injection projects the source through a
+			// subquery that names the columns it wants, and a source one column too wide then loses
+			// that column silently - which is the failure mode this whole layer refuses elsewhere. With
+			// injections the client still names its columns, and is told so.
+			for (auto &column : policy.write_order) {
+				node.columns.emplace_back(column);
+			}
+		}
 		if (node.columns.empty() || node.default_values || node.column_order == InsertColumnOrder::INSERT_BY_NAME) {
 			// without an explicit column list we do not know which physical columns are written, so
 			// there is nothing to check the grant against
