@@ -13,8 +13,21 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # extension (libpq/openssl from duckdb-postgres, roaring from ducklake, ...), so nothing is listed
 # here by hand. Bootstrap once with `make vcpkg-setup`, or point VCPKG_TOOLCHAIN_PATH at an existing
 # vcpkg checkout.
-ifneq ($(or $(ACL_INTEGRATION),$(ACL_QUACK)),)
+#
+# The Flight door (ACL_FLIGHT=1) is the exception, and deliberately so. Its dependency - Arrow with
+# Flight SQL, 89 ports of it - is ours rather than some loaded extension's, and the merged-manifest
+# step keeps only `dependencies` from each vcpkg.json while dropping manifest *features*. Declaring
+# Arrow as a plain dependency would therefore make every integration build install it too. So a
+# flight-only build skips the merge - it loads no other extension, so it has nothing to merge - and
+# takes this repo's own manifest with its `flight` feature switched on instead.
+ifneq ($(or $(ACL_INTEGRATION),$(ACL_QUACK),$(ACL_FLIGHT)),)
+ifeq ($(or $(ACL_INTEGRATION),$(ACL_QUACK)),)
+# Through EXT_FLAGS, not BUILD_FLAGS: the included Makefile rebuilds BUILD_FLAGS from scratch and
+# folds EXT_FLAGS into it, so anything set here directly is silently dropped.
+EXT_FLAGS += -DVCPKG_MANIFEST_FEATURES='flight'
+else
 USE_MERGED_VCPKG_MANIFEST := 1
+endif
 VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
 GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)
 ifeq ($(wildcard $(VCPKG_TOOLCHAIN_PATH)),)
@@ -128,6 +141,19 @@ test-integration:
 	ACL_MYSQL_DSN="host=$(ACL_MYSQL_HOST) port=$(ACL_MYSQL_PORT) user=$(ACL_MYSQL_USER) passwd=$(ACL_MYSQL_PASS) db=$(ACL_MYSQL_DB)" \
 	ACL_MSSQL_DSN="Server=$(ACL_MSSQL_HOST),$(ACL_MSSQL_PORT);Database=$(ACL_MSSQL_DB);User Id=$(ACL_MSSQL_USER);Password=$(ACL_MSSQL_PASS)" \
 	build/release/test/unittest "test/sql/integration/*"
+
+# The Flight SQL door's dependency check (specs/045): does the built extension carry everything it
+# needs, or did it pick something up from the machine? Run it after an ACL_FLIGHT=1 build - it is the
+# only thing standing between us and an artifact that works here and nowhere else.
+.PHONY: check-flight-deps test-flight
+check-flight-deps:
+	./scripts/check_flight_deps.sh
+
+# The Flight SQL door end to end (specs/045): one duckdb serves, a third-party pyarrow client reads its
+# own slice through it. Needs ACL_FLIGHT=1 GEN=ninja make, and pyarrow; skips itself, saying why, when
+# either is missing.
+test-flight:
+	test/e2e/flight/run.sh
 
 # The door end-to-end (specs/043): a served instance with real sources and several client processes.
 # Needs the same docker databases plus a quack build:

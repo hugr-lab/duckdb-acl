@@ -14,7 +14,9 @@
         "${workspaceFolder}/duckdb/src/include",
         "${workspaceFolder}/duckdb/third_party/fmt/include",
         "${workspaceFolder}/duckdb/third_party/mbedtls/include",
-        "${workspaceFolder}/duckdb/third_party/yyjson/include"
+        "${workspaceFolder}/duckdb/third_party/yyjson/include",
+        "${workspaceFolder}/build/release/vcpkg_installed/*/include",
+        "${workspaceFolder}/build/debug/vcpkg_installed/*/include"
     ],
     "C_Cpp.default.cppStandard": "c++17",
     "files.associations": {
@@ -30,5 +32,5 @@
         "duckdb": true,
         "extension-ci-tools": true
     },
-    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/release/compile_commands.json"
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/.cache/clangd/compile_commands.json"
 }

@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# The Arrow Flight SQL door, end to end (spec 045).
+#
+# One duckdb process serves; the client is a separate process speaking Flight SQL through pyarrow -
+# third-party on purpose, because a door is only proven by something that is not us. pyarrow ships
+# Flight but not Flight SQL, so client.py encodes the one command it needs by hand; that is a feature
+# of the test rather than a shortcut, since it means nothing about the exchange is taken on trust from
+# a library that shares our assumptions.
+#
+# Skips (exit 0, saying why) without an ACL_FLIGHT build or without pyarrow. Fails loudly otherwise.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+BUILD="${BUILD_DIR:-$ROOT/build/release}"
+DUCKDB="${DUCKDB_BIN:-$BUILD/duckdb}"
+ACL_EXT="${ACL_EXT:-$BUILD/extension/acl/acl.duckdb_extension}"
+PORT="${ACL_FLIGHT_PORT:-32700}"
+URI="grpc://localhost:$PORT"
+
+# An HS256 token for the seeded issuer: role analyst, tenant acme, exp in 2100.
+TOKEN='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1hY21lIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.vzPJbHXAXfczhZwQp183JaaBLlSRSipNsSqwxoIFfng'
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+[ -x "$DUCKDB" ] || { echo "SKIP: no duckdb CLI at $DUCKDB"; exit 0; }
+[ -f "$ACL_EXT" ] || { echo "SKIP: no acl extension at $ACL_EXT"; exit 0; }
+have="$(echo "LOAD '$ACL_EXT'; SELECT count(*) FROM duckdb_functions() WHERE function_name='acl_flight_serve';" \
+        | "$DUCKDB" -unsigned -noheader -list 2>/dev/null | tail -1 | tr -d ' ')"
+if [ "$have" != "1" ]; then
+	echo "SKIP: this build has no Flight door - rebuild with ACL_FLIGHT=1"
+	exit 0
+fi
+python3 -c "import pyarrow.flight" 2>/dev/null || { echo "SKIP: pyarrow is not installed"; exit 0; }
+
+TMP="$(mktemp -d)"
+SERVER_PID=""
+cleanup() {
+	local rc=$?
+	if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+		kill "$SERVER_PID" 2>/dev/null || true
+		wait "$SERVER_PID" 2>/dev/null || true
+	fi
+	rm -rf "$TMP"
+	exit $rc
+}
+trap cleanup EXIT INT TERM
+
+{
+	echo "LOAD '$ACL_EXT';"
+	sed "s|\${ACL_E2E_URI}|$URI|g" "$HERE/bootstrap.sql"
+	# hold the process open for the length of the run; the door lives in it
+	echo "SELECT 1;"
+} >"$TMP/server.sql"
+# stdin is held open by a FIFO for the length of the run: the CLI exits when stdin closes, the door
+# has to outlive the statements that opened it, and stopping it means sending a statement to the very
+# process that serves - `acl_flight_stop` closes a door in its own process and nobody else's.
+FIFO="$TMP/ctl"
+mkfifo "$FIFO"
+"$DUCKDB" -unsigned <"$FIFO" >"$TMP/server.log" 2>&1 &
+SERVER_PID=$!
+exec 3>"$FIFO"
+cat "$TMP/server.sql" >&3
+
+# Wait for the door rather than sleeping and hoping.
+ready=""
+for _ in $(seq 1 60); do
+	if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+		cat "$TMP/server.log" >&2
+		fail "the server exited before it was serving"
+	fi
+	if python3 "$HERE/client.py" "$URI" "SELECT 1 AS ok" "$TOKEN" >/dev/null 2>&1; then
+		ready=1; break
+	fi
+	sleep 0.5
+done
+[ -n "$ready" ] || { cat "$TMP/server.log" >&2; fail "the door never came up on $URI"; }
+
+# `|| true` because half of what follows is a refusal, and under `set -e` a client that exits non-zero
+# would end the run before the assertion could say what it saw.
+ask() { python3 "$HERE/client.py" "$URI" "$1" "${2:-$TOKEN}" 2>&1 || true; }
+
+# --- the principal reads its own slice, and only that ---------------------------------------------
+# Five acme rows out of ten seeded; the predicate is what makes the other five invisible.
+got="$(ask "SELECT count(*) AS n FROM orders")"
+echo "$got" | grep -q "'n': \[5\]" || fail "expected 5 rows for this tenant, got: $got"
+
+got="$(ask "SELECT count(*) AS n FROM orders WHERE tenant = 'globex'")"
+echo "$got" | grep -q "'n': \[0\]" || fail "another tenant's rows were visible: $got"
+
+# --- the physical object is refused by the same path that refuses it anywhere ----------------------
+got="$(ask "SELECT * FROM memory.main.orders")"
+echo "$got" | grep -q "no access to object" || fail "the physical name was not refused: $got"
+
+# --- a token nobody can verify does not get in -----------------------------------------------------
+got="$(ask "SELECT 1" "not-a-jwt")"
+echo "$got" | grep -q "authentication failed" || fail "an unverifiable token was admitted: $got"
+
+# --- and neither does a call carrying no credentials at all -------------------------------------------
+# An earlier cut remembered the session against the Flight peer, so a call without a token was answered
+# from whatever had authenticated from that address and port before. Ports are reused; this is the
+# assertion that keeps that from coming back.
+got="$(ask "SELECT 1" "-")"
+echo "$got" | grep -q "authentication failed" || fail "a call with no token was admitted: $got"
+
+# --- and the door closes ------------------------------------------------------------------------------
+echo "SELECT acl_flight_stop('$URI');" >&3
+stopped=""
+for _ in $(seq 1 40); do
+	if ! python3 "$HERE/client.py" "$URI" "SELECT 1" "$TOKEN" >/dev/null 2>&1; then
+		stopped=1; break
+	fi
+	sleep 0.25
+done
+[ -n "$stopped" ] || fail "the door was still answering after acl_flight_stop"
+grep -q "session(s) closed" "$TMP/server.log" || fail "acl_flight_stop did not report what it closed"
+
+echo "PASS: a third-party Flight SQL client read its own slice through the door, which then closed"
