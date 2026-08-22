@@ -225,6 +225,17 @@ would make the integration job's timing unreadable. That job also runs `make che
 it runs anything, since an artifact that borrowed a library from the runner would pass every test on
 the runner and fail everywhere else.
 
+**It runs on merges and on request, not on pull requests** — the same shape the macOS job has, and for
+the same reason: a cold build measured 98 minutes on a runner. That choice is what keeps the plain
+Actions cache sufficient. The repository's cache budget is 10 GB with eviction by age, and this build's
+share is well over a gigabyte competing with the integration cache and seven release ccaches; a job
+that runs rarely fills it rarely enough not to fight for room. A pull request that needs the door
+checked dispatches the workflow by hand.
+
+A package feed on GitHub Packages was tried first, since an Actions cache written by a pull request is
+visible to that pull request alone. It works, but it wants mono and a `packages: write` permission to
+solve a problem that not running on pull requests removes — dependencies that do not earn their keep.
+
 - `test/sql/acl_flight_door.test` — the start-up refusals, and the functions denied to a principal.
 - `test/sql/integration/acl_flight_serve.test` — a live server in one process, a client connecting with
   a JWT and reading its own slice, a physical name refused, an unverifiable token refused at the

@@ -126,25 +126,24 @@ jobs:
           name: acl-linux_amd64
           path: build/release/extension/acl/acl.duckdb_extension
 
-  # The Arrow Flight SQL door (specs/045). Its own job rather than a step in the Linux one: it pulls
-  # Arrow with Flight SQL - 89 vcpkg ports - which has nothing to do with the scanners and would make
-  # the integration job's timing unreadable. The first run on main is slow while the binary cache fills;
-  # every run after that restores it, and pull requests read the cache main left behind.
+  # The Arrow Flight SQL door (specs/045). Its own job rather than a step in the Linux one - it pulls
+  # Arrow with Flight SQL, 89 vcpkg ports that have nothing to do with the scanners - and, like the
+  # macOS job, off pull requests: a cold build of it takes an hour and a half.
+  #
+  # That it does not run on PRs is what keeps the plain Actions cache sufficient. The repository's cache
+  # budget is 10 GB with eviction by age, and this build's share of it is well over a gigabyte competing
+  # with the integration cache and seven release ccaches; a job that runs on merges and on request fills
+  # it rarely enough not to fight for room. A pull request that needs the door checked can dispatch this
+  # workflow by hand.
   build-test-flight:
     name: Build + test (flight door)
     runs-on: ubuntu-24.04
-    # NuGet on GitHub Packages, not the Actions cache, and the reason is scoping: a cache written by a
-    # pull request is visible to that pull request alone, so every PR would rebuild 89 ports however
-    # many times we ran it. A package feed belongs to the repository, so the first run that fills it -
-    # wherever it happens - is the last slow one.
-    permissions:
-      contents: read
-      packages: write
+    if: ${{ github.event_name != 'pull_request' }}
     env:
       GEN: ninja
       ACL_FLIGHT: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      VCPKG_FEED: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -153,25 +152,23 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          # mono runs vcpkg's nuget client, which is how the binary cache reaches the package feed
-          sudo apt-get install -y ninja-build ccache mono-devel
+          sudo apt-get install -y ninja-build ccache
           # the e2e client is third-party on purpose: a door is only proven by something that is not us
           pip install pyarrow
 
       - name: Setup vcpkg
         run: make vcpkg-setup
 
-      # A pull request from a fork gets a read-only token, so it reads the feed and does not write to
-      # it; `readwrite` degrades to `read` rather than failing the build.
-      - name: Point vcpkg at the package feed
-        shell: bash
-        run: |
-          NUGET="$(./vcpkg/vcpkg fetch nuget | tail -1)"
-          mono "$NUGET" sources add \
-            -Source "$VCPKG_FEED" -Name github -StorePasswordInClearText \
-            -UserName "${{ github.repository_owner }}" -Password "${{ secrets.GITHUB_TOKEN }}" || true
-          mono "$NUGET" setapikey "${{ secrets.GITHUB_TOKEN }}" -Source "$VCPKG_FEED" || true
-          echo "VCPKG_BINARY_SOURCES=clear;nuget,github,readwrite" >> "$GITHUB_ENV"
+      # Keyed on vcpkg.json too: Arrow arrives through the `flight` manifest feature, so a change there
+      # is a change of dependencies and the old cache no longer describes this build.
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v6
+        with:
+          path: vcpkg_bincache
+          key: vcpkg-bincache-flight-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-bincache-flight-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-
+            vcpkg-bincache-flight-
 
       - name: Restore ccache
         uses: actions/cache@v6
