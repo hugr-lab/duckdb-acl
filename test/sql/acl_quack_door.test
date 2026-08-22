@@ -125,6 +125,12 @@ INSERT INTO phys.main.orders SELECT * FROM scan_data_from_quack_client('conn-nev
 ----
 <REGEX>:.*has no session.*
 
+# a quoted identifier is the same call, and is read the same way
+statement error
+SELECT * FROM "scan_data_from_quack_client"('someone-elses-stream');
+----
+<REGEX>:.*names no connection.*
+
 # two streams in one statement is not a shape the door generates, so it is not one it accepts
 statement error
 SELECT * FROM scan_data_from_quack_client('conn-1:1'), scan_data_from_quack_client('conn-1:2');

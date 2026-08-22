@@ -1,0 +1,93 @@
+# name: test/sql/integration/acl_quack_ingest_shape.test
+# description: a drained stream is read by POSITION (spec 042), and `SendDataRequestMessage` carries no
+#   column list - so what the client's own column list does to the chunks it sends is load-bearing, not
+#   a detail. Both columns are VARCHAR on purpose: a swapped pair could not be caught by a type error,
+#   only by being right.
+#
+#   Measured here, and the reason the positional reading is sound: the client's plan re-orders into the
+#   table's column order before sending, and fills an unnamed column with NULL at full width. So neither
+#   a permutation nor a subset reaches the server as a shifted or narrowed stream.
+# group: [integration]
+
+require acl
+
+require httpfs
+
+require quack
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+CREATE TABLE pairs(a VARCHAR, b VARCHAR);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.pairs AS memory.main.pairs;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.pairs TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS 'a,b';
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+statement ok
+SELECT acl_quack_serve('quack:localhost:31580', 'integration-server-token');
+
+statement ok
+ATTACH 'quack:localhost:31580' AS remote (TYPE quack,
+    TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+statement ok
+CREATE TABLE src AS SELECT 'A' || i AS av, 'B' || i AS bv FROM range(5000) t(i);
+
+# --- a client that names its columns in the other order ------------------------------------------------
+
+statement ok
+INSERT INTO remote.main.pairs (b, a) SELECT bv, av FROM src;
+
+# every row kept its own column: nothing was written into the neighbouring one
+query III
+SELECT count(*), count(*) FILTER (WHERE a LIKE 'A%'), count(*) FILTER (WHERE a LIKE 'B%') FROM pairs;
+----
+5000	5000	0
+
+statement ok
+DELETE FROM pairs;
+
+# --- a client that names only one of them --------------------------------------------------------------
+
+statement ok
+INSERT INTO remote.main.pairs (a) SELECT av FROM src;
+
+# the stream arrives at full width with NULL in the position nobody named, so the value still lands in
+# its own column rather than sliding into the first one
+query III
+SELECT count(*), count(*) FILTER (WHERE a LIKE 'A%'), count(*) FILTER (WHERE b IS NULL) FROM pairs;
+----
+5000	5000	5000
+
+statement ok
+DETACH remote;
+
+statement ok
+SELECT acl_quack_stop('quack:localhost:31580');

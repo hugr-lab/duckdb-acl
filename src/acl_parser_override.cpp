@@ -1319,6 +1319,9 @@ bool CallsFunctionNamed(const string &query, const char *name_lower, idx_t name_
 			return false;
 		}
 		auto after = it + UnsafeNumericCast<int64_t>(name_size);
+		if (after != end && *after == '"') {
+			after++; // a quoted identifier is the same call: `"name"(...)`
+		}
 		while (after != end && StringUtil::CharacterIsSpace(*after)) {
 			after++;
 		}
@@ -1363,6 +1366,9 @@ string ExtractStreamId(const string &query) {
 		}
 		auto at = UnsafeNumericCast<idx_t>(it - query.begin());
 		auto scan = at + name_size;
+		if (scan < query.size() && query[scan] == '"') {
+			scan++; // `"name"(…)` is the same call, and the fence above reads it the same way
+		}
 		SkipWhitespace(query, scan);
 		if (scan >= query.size() || query[scan] != '(') {
 			pos = at + 1; // the name as ordinary text, not a call

@@ -112,13 +112,22 @@ Measured while implementing, and worth stating because it constrains how an obje
   for the predicate to judge. So a confined, writable object is modelled as a plain object plus a grant
   that states its columns — which is also the shape that makes the positional list meaningful.
 
+### The client's own column list, measured
+
+The stream is read positionally, and `SendDataRequestMessage` carries no column list — so what a
+client's `INSERT INTO t (b, a) …` does to the chunks it sends is load-bearing. Measured rather than
+assumed, with two VARCHAR columns so a swap could not be caught by a type error:
+
+- **a permutation arrives in the table's order.** The client's plan re-orders before sending, so
+  naming the columns backwards writes each value into its own column.
+- **a subset arrives at full width**, with NULL in the position nobody named.
+
+So neither reaches the server as a shifted or a narrowed stream, and the positional reading is sound
+for both. `acl_quack_ingest_shape.test` pins it, because it is a property of quack's client that our
+correctness rests on rather than one we control.
+
 ### Still open
 
-- **What a client's column subset does.** `INSERT INTO remote.main.orders (tenant) SELECT …` loses its
-  column list on the wire — `SendDataRequestMessage` carries connection id, schema, table, chunks and
-  query uuid, and nothing else. Whether duckdb's insert plan then produces full-width chunks or narrow
-  ones decides whether that is an ordinary case or an error. The width checks above make it an error
-  either way rather than a shifted row; what is missing is an error that says so in those words.
 - **Ordered vs unordered streams.** quack signals `NO_ORDER` for an unordered stream so the planner
   picks a parallel insert. The rewrite wraps the source and does not re-order it, and the 5000-row
   round trip lands in full — but no test pins the parallel plan specifically.
@@ -160,6 +169,10 @@ also what proves the recovery happened. That case uses `conn-1:aaaa:bbbb`, so it
 - under a grant that *assigns* the tenant, the same 5000 forbidden rows are accepted and stored with
   the claim's tenant instead — the client's value in that position is replaced, not trusted.
 
+`test/sql/integration/acl_quack_ingest_shape.test` (25 assertions) pins the client behaviour the
+positional reading depends on: a permuted column list arrives in the table's order, a subset arrives at
+full width with NULL where nothing was named.
+
 Its counterpart `acl_quack_ingest_denied.test` (25) keeps the dangerous layout from spec 041 — the
 physical table in the server's default catalog under the published name — and now pins that what stops
 the write is the write policy rather than the transport.
@@ -179,10 +192,11 @@ the write is the write policy rather than the transport.
 
 ## Follow-ups
 
-- **The probe now passes.** Spec 041 answered NULL to quack's ingest question, which stopped a stream
-  before a row moved; with the drain enforced, that refusal would refuse everything. The cost is that a
-  client whose write will be refused still streams its data first and learns at the end. Answering the
-  question honestly — the principal's `insert` capability on that object — would refuse it early, and
+- **The probe now passes**, and takes the ordinary path rather than a special case: it is prefixed like
+  every other statement. Spec 041 answered NULL, which with the drain enforced would refuse every bulk
+  load. Handing back the prefixed form is also the safe answer for a statement we are told is never
+  run — if quack ever does run it, it runs through the ACL rather than around it. The cost is that a
+  client whose write will be refused streams its data first and learns at the end; answering early
   needs a capability check reachable without a statement to rewrite.
 - **A statement the fence does not recognise is still unpoliced.** The fence keys on a call to
   `scan_data_from_quack_client`; if quack ever drains a stream by another name, an unprefixed write
