@@ -105,7 +105,7 @@ ACL_MSSQL_DB ?= acltest
 # directory-derived project name and adopt an unrelated project's containers (spec 033)
 DOCKER_COMPOSE := docker compose -p duckdb-acl -f docker/docker-compose.yml
 
-.PHONY: docker-up docker-down docker-status test-integration
+.PHONY: docker-up docker-down docker-status test-integration test-e2e
 # --wait would treat the one-shot sqlserver-init container as a failure; wait on the servers, then
 # run the init separately (it only starts once sqlserver is healthy anyway)
 docker-up:
@@ -128,6 +128,17 @@ test-integration:
 	ACL_MYSQL_DSN="host=$(ACL_MYSQL_HOST) port=$(ACL_MYSQL_PORT) user=$(ACL_MYSQL_USER) passwd=$(ACL_MYSQL_PASS) db=$(ACL_MYSQL_DB)" \
 	ACL_MSSQL_DSN="Server=$(ACL_MSSQL_HOST),$(ACL_MSSQL_PORT);Database=$(ACL_MSSQL_DB);User Id=$(ACL_MSSQL_USER);Password=$(ACL_MSSQL_PASS)" \
 	build/release/test/unittest "test/sql/integration/*"
+
+# The door end-to-end (specs/043): a served instance with real sources and several client processes.
+# Needs the same docker databases plus a quack build:
+#   ACL_INTEGRATION=1 ACL_QUACK=1 GEN=ninja make      (add ACL_INTEGRATION_MSSQL=1 for the mssql leg)
+# Each source is a leg that skips itself, with the reason, when it cannot run - and the run fails if
+# no leg ran at all, so "everything skipped" can never read as a pass.
+test-e2e:
+	ACL_PG_DSN="dbname=$(ACL_PG_DB) user=$(ACL_PG_USER) password=$(ACL_PG_PASS) host=$(ACL_PG_HOST) port=$(ACL_PG_PORT)" \
+	ACL_DUCKLAKE_DSN="ducklake:postgres:dbname=$(ACL_DUCKLAKE_CATALOG_DB) user=$(ACL_PG_USER) password=$(ACL_PG_PASS) host=$(ACL_PG_HOST) port=$(ACL_PG_PORT)" \
+	ACL_MSSQL_DSN="Server=$(ACL_MSSQL_HOST),$(ACL_MSSQL_PORT);Database=$(ACL_MSSQL_DB);User Id=$(ACL_MSSQL_USER);Password=$(ACL_MSSQL_PASS)" \
+	test/e2e/door/run.sh
 
 # --- The managed policy schema (spec 034) ---------------------------------
 # schema/policy_schema.sql is the source of truth; everything else is rendered from it, so what an

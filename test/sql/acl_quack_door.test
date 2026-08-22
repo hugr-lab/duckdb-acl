@@ -113,29 +113,14 @@ SELECT acl_quack_authorize('conn-1', 'INSERT INTO orders (id, tenant) VALUES (1,
 ----
 true
 
-# the statement that actually writes carries no prefix, so it is met where every unprefixed statement
-# passes - and it is refused unless the principal can be recovered from the stream id it carries
+# the statement that actually writes carries no prefix, and while no door of ours is open it is not
+# ours to judge either: a plain quack server's own ingest is its business, and refusing it here would
+# take bulk loading away from anyone who merely loads this extension (spec 043). What the fence does
+# once a door IS open is pinned by the integration scenarios, which can open one.
 statement error
 SELECT * FROM scan_data_from_quack_client('someone-elses-stream');
 ----
-<REGEX>:.*names no connection.*
-
-statement error
-INSERT INTO phys.main.orders SELECT * FROM scan_data_from_quack_client('conn-never:1');
-----
-<REGEX>:.*has no session.*
-
-# a quoted identifier is the same call, and is read the same way
-statement error
-SELECT * FROM "scan_data_from_quack_client"('someone-elses-stream');
-----
-<REGEX>:.*names no connection.*
-
-# two streams in one statement is not a shape the door generates, so it is not one it accepts
-statement error
-SELECT * FROM scan_data_from_quack_client('conn-1:1'), scan_data_from_quack_client('conn-1:2');
-----
-<REGEX>:.*not one this door opened.*
+<REGEX>:.*does not exist.*
 
 # the name as ordinary text is not a call, and must not be mistaken for one: the resolver embeds the
 # name it is looking up as a literal in its own catalog SQL, which is how this was found
@@ -143,15 +128,6 @@ query I
 SELECT 'scan_data_from_quack_client' AS just_a_string;
 ----
 scan_data_from_quack_client
-
-# where the principal *is* recovered, the write is judged as any of that principal's writes: this role
-# holds select and no more, so the insert is refused for want of the capability - which is also what
-# proves the recovery happened. The id splits at the FIRST colon, so a uuid carrying one still names
-# connection "conn-1" rather than something nobody bound.
-statement error
-INSERT INTO orders SELECT * FROM scan_data_from_quack_client('conn-1:aaaa:bbbb');
-----
-<REGEX>:.*insert.*"orders".*
 
 # --- an expired session stops composing, on the connection it was bound to ----------------------------
 # opened with a wide skew, judged with none - the same trick the session contract's own test uses

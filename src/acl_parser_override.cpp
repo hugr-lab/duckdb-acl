@@ -1444,8 +1444,14 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 	}
 	auto prefix = ParseAclPrefix(query);
 	if (prefix.kind == AclPrefix::Kind::NONE) {
-		if (DrainsQuackClientStream(query)) {
-			return DrainStreamUnderPrincipal(*info->Cast<AclParserInfo>().store, query, options);
+		// The one thing we do to a statement nobody prefixed - and only while a door of ours is open.
+		// The refusal exists because a client *we serve* caused the statement; with no door open, a
+		// plain quack server's ingest is its own business, and taking it would mean anyone who merely
+		// loads this extension loses quack's bulk loading (spec 043, found by the throughput benchmark,
+		// whose un-ACL'd baseline could not load at all).
+		auto &store = *info->Cast<AclParserInfo>().store;
+		if (store.DoorOpen() && DrainsQuackClientStream(query)) {
+			return DrainStreamUnderPrincipal(store, query, options);
 		}
 		return ParserOverrideResult(); // fall through to the native parser
 	}
