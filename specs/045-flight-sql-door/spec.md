@@ -182,6 +182,27 @@ The catalog methods are the next thing to build, and they are the same problem s
 refuses on its own — there is nothing to guard against while they are missing, only work to do to make
 them answer.
 
+**And they go through the same machinery quack's introspection does — decided now, before either
+exists in two shapes.** Under quack, introspection is already ordinary SQL: a client asks
+`information_schema.columns`, the rewriter substitutes spec 035's surfaces, and the answer is built
+over the policy catalog. A Flight RPC should therefore be a *thin adapter*: compose the SQL those
+surfaces already answer, run it as the principal through the normal path, and shape the result into the
+form Flight SQL prescribes.
+
+Two reasons, and the second is the one that matters. Performance is one place to fix instead of two —
+spec 043 measured `information_schema.columns` at 70 ms through the door, nearly the whole cost of a
+connect, and that work should not be duplicated into a second protocol only to be optimised twice. But
+the real reason is that a second route to metadata is a second place deciding what a principal may see,
+and therefore a second place it can diverge. Twice this project has already found a path that answered
+a client while bypassing the rewriter (spec 041, twice over); one mechanism under both doors is how a
+third is avoided.
+
+A concrete place divergence would have been likely: `GetTables` with `include_schema` wants each
+table's Arrow schema, meaning column *types* — and the types a role sees are not the physical ones,
+since a mask may change them. Spec 026 stores exactly that in `grant_columns` so that
+`information_schema.columns` and `DESCRIBE` describe the same thing. An RPC implemented on its own
+would very likely have read the physical types and quietly disagreed with what the role can read.
+
 ## Enforcement & security
 
 - **The door decides nothing.** It turns a token into a handle and puts a prefix on a statement; the
