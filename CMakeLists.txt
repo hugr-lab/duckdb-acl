@@ -30,7 +30,11 @@ set(EXTENSION_SOURCES
 # 89 vcpkg ports, measured - and an ordinary build has no reason to pay for a door it does not open.
 # Static targets, as the airport extension does: a loadable extension is dlopen'd RTLD_LOCAL, so what
 # it needs has to be inside it.
-if(DEFINED ENV{ACL_FLIGHT})
+#
+# Excluded on WASM and MinGW, the way the scanners and quack are. WASM is not a maybe: the door is a
+# gRPC server, and there is nothing there for it to listen on. MinGW is a maybe nobody has tested -
+# Arrow and gRPC through vcpkg are an MSVC story - so it says no rather than failing somewhere deep.
+if(DEFINED ENV{ACL_FLIGHT} AND NOT MINGW AND NOT ${WASM_ENABLED})
     # Arrow, its Flight libraries and gRPC come from the build's own vcpkg manifest tree, found the
     # way every other vcpkg dependency in this repo is found - the toolchain's own wrapper, nothing
     # hand-steered. Steering it by hand was tried at length and each attempt broke something else: a
@@ -68,7 +72,7 @@ endif()
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-if(DEFINED ENV{ACL_FLIGHT})
+if(DEFINED ENV{ACL_FLIGHT} AND NOT MINGW AND NOT ${WASM_ENABLED})
     foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
         target_compile_definitions(${target} PRIVATE ACL_FLIGHT_ENABLED=1)
         target_link_libraries(${target}

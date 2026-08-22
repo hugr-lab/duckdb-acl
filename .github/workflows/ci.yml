@@ -133,11 +133,18 @@ jobs:
   build-test-flight:
     name: Build + test (flight door)
     runs-on: ubuntu-24.04
+    # NuGet on GitHub Packages, not the Actions cache, and the reason is scoping: a cache written by a
+    # pull request is visible to that pull request alone, so every PR would rebuild 89 ports however
+    # many times we ran it. A package feed belongs to the repository, so the first run that fills it -
+    # wherever it happens - is the last slow one.
+    permissions:
+      contents: read
+      packages: write
     env:
       GEN: ninja
       ACL_FLIGHT: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+      VCPKG_FEED: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
     steps:
       - uses: actions/checkout@v7
         with:
@@ -146,23 +153,25 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache
+          # mono runs vcpkg's nuget client, which is how the binary cache reaches the package feed
+          sudo apt-get install -y ninja-build ccache mono-devel
           # the e2e client is third-party on purpose: a door is only proven by something that is not us
           pip install pyarrow
 
       - name: Setup vcpkg
         run: make vcpkg-setup
 
-      # Keyed on vcpkg.json too: Arrow arrives through the `flight` manifest feature, so a change there
-      # is a change of dependencies and the old cache no longer describes this build.
-      - name: Cache vcpkg binary packages
-        uses: actions/cache@v6
-        with:
-          path: vcpkg_bincache
-          key: vcpkg-bincache-flight-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-${{ github.run_id }}
-          restore-keys: |
-            vcpkg-bincache-flight-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-
-            vcpkg-bincache-flight-
+      # A pull request from a fork gets a read-only token, so it reads the feed and does not write to
+      # it; `readwrite` degrades to `read` rather than failing the build.
+      - name: Point vcpkg at the package feed
+        shell: bash
+        run: |
+          NUGET="$(./vcpkg/vcpkg fetch nuget | tail -1)"
+          mono "$NUGET" sources add \
+            -Source "$VCPKG_FEED" -Name github -StorePasswordInClearText \
+            -UserName "${{ github.repository_owner }}" -Password "${{ secrets.GITHUB_TOKEN }}" || true
+          mono "$NUGET" setapikey "${{ secrets.GITHUB_TOKEN }}" -Source "$VCPKG_FEED" || true
+          echo "VCPKG_BINARY_SOURCES=clear;nuget,github,readwrite" >> "$GITHUB_ENV"
 
       - name: Restore ccache
         uses: actions/cache@v6
