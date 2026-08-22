@@ -968,6 +968,9 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		if (served->HasError()) {
 			throw BinderException("acl_quack_serve: %s", served->GetError());
 		}
+		// From here the fence on unprefixed statements applies: a drained stream is now ours to judge
+		// (spec 043). Set after the listener is up, so a refused serve leaves nothing behind.
+		store.SetDoorOpen(true);
 		result.SetValue(row, served->RowCount() > 0 ? served->GetValue(0, 0) : Value(uri));
 	}
 }
@@ -1000,7 +1003,11 @@ void AclQuackStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 			result.SetValue(row, Value(note + " (another quack server is still open, so its sessions stay)"));
 			continue;
 		}
-		auto closed = StoreOf(state).SessionCloseAll();
+		auto &store = StoreOf(state);
+		// The last door is closed, so the fence on unprefixed statements lifts with it: a drained
+		// stream is once again nobody's business but quack's own (spec 043).
+		store.SetDoorOpen(false);
+		auto closed = store.SessionCloseAll();
 		result.SetValue(row, Value(note + " (" + std::to_string(closed) + " session(s) closed)"));
 	}
 }

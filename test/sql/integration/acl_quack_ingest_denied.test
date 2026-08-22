@@ -91,6 +91,32 @@ SELECT count(*), count(*) FILTER (WHERE tenant = 'INJECTED') FROM orders;
 ----
 1	0
 
+# --- with a door open, an unprefixed drain is ours to judge -------------------------------------------
+# The fence applies only while a door of ours is serving (spec 043) - here one is, so a generated
+# statement whose principal cannot be recovered is refused rather than run with the operator's rights.
+
+statement error
+SELECT * FROM scan_data_from_quack_client('someone-elses-stream');
+----
+<REGEX>:.*names no connection.*
+
+statement error
+INSERT INTO orders SELECT * FROM scan_data_from_quack_client('conn-never:1');
+----
+<REGEX>:.*has no session.*
+
+# a quoted identifier is the same call, read the same way
+statement error
+SELECT * FROM "scan_data_from_quack_client"('someone-elses-stream');
+----
+<REGEX>:.*names no connection.*
+
+# two streams in one statement is not a shape the door generates, so not one it accepts
+statement error
+SELECT * FROM scan_data_from_quack_client('a:1'), scan_data_from_quack_client('a:2');
+----
+<REGEX>:.*not one this door opened.*
+
 # a small insert still goes through the statement path, so it is enforced rather than refused: the
 # tenant is the claim's, not the client's, and the row lands
 statement ok

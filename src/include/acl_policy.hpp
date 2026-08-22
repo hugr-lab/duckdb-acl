@@ -217,6 +217,8 @@ struct PolicyStore {
 	//! is what turns "which connection is this" into "which principal is this" without the door ever
 	//! holding one.
 	unordered_map<string, string> session_bindings;
+	//! Whether a door of ours is serving on this instance (spec 043); see SetDoorOpen.
+	bool door_open = false;
 	// issuer registry + external->role mappings (spec 007), memory-mode counterparts of the catalog
 	case_insensitive_map_t<IssuerConfig> issuers;
 	case_insensitive_map_t<case_insensitive_map_t<vector<string>>> role_mappings; // issuer -> external -> roles
@@ -398,6 +400,15 @@ struct PolicyStore {
 	//! Drop every session and binding, and say how many there were. What a door does when it closes:
 	//! the connections it served will never come back, and nothing else can tell that they are gone.
 	idx_t SessionCloseAll();
+
+	//! Is an ACL door serving on this instance (spec 043)? Set by `acl_quack_serve`, cleared when the
+	//! last door stops. It gates the one thing we do to statements nobody prefixed: refusing a drained
+	//! quack stream. That refusal exists because a client *we serve* caused the statement; where no
+	//! door of ours is open, a plain quack server's own ingest is its business, and breaking it would
+	//! be us disabling an unrelated feature for anyone who merely loads this extension. Measured, not
+	//! supposed: the throughput benchmark's un-ACL'd baseline could not bulk-load at all.
+	void SetDoorOpen(bool open);
+	bool DoorOpen();
 
 	//! Register an issuer / map an external role value (memory mode; catalog mode via the Catalog* ops)
 	void DefineIssuer(IssuerConfig config);

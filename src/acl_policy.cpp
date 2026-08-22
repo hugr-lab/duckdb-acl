@@ -258,6 +258,16 @@ bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string 
 	return true;
 }
 
+void PolicyStore::SetDoorOpen(bool open) {
+	lock_guard<mutex> guard(lock);
+	door_open = open;
+}
+
+bool PolicyStore::DoorOpen() {
+	lock_guard<mutex> guard(lock);
+	return door_open;
+}
+
 void PolicyStore::SessionClose(const string &handle) {
 	lock_guard<mutex> guard(lock);
 	sessions.erase(handle);
