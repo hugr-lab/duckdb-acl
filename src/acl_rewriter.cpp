@@ -755,6 +755,21 @@ private:
 			ref = BuildReferencesSubquery(function, tf.alias.empty() ? Identifier(vname) : tf.alias);
 			return;
 		}
+		// A principal may drain the stream its own connection is filling, and no other (spec 042). The
+		// function stays denied by the gate - this is not a hole in it but a statement the server
+		// generated for this principal, recognised by the exact stream id the override recovered the
+		// principal from. An id that is not that one is refused by the gate below, as it should be.
+		if (!principal.ingest_stream.empty() && StringUtil::CIEquals(vname, "scan_data_from_quack_client") &&
+		    function.GetArguments().size() == 1) {
+			auto &arg = function.GetArguments()[0].GetExpression();
+			if (arg.GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+				auto &value = arg.Cast<ConstantExpression>().GetValue();
+				if (!value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR &&
+				    value.GetValue<string>() == principal.ingest_stream) {
+					return; // the principal's own stream: nothing to gate and nothing to rewrite
+				}
+			}
+		}
 		// not a virtual table function: gate by name, then rewrite arguments and any subquery argument
 		if (!store.FunctionAllowed(principal, function.GetQualifiedName())) {
 			Deny("table function \"" + vname + "\" is not allowed");
@@ -1316,6 +1331,44 @@ private:
 		return predicate;
 	}
 
+	//! Assign the grant's injected values into a *drained stream* (spec 042). The source is quack's
+	//! scan, whose columns are named `col0, col1, …` by position and carry none of the client's own
+	//! names - so the value is substituted by position, through `SELECT * REPLACE (<expr> AS col<i>)`.
+	//!
+	//! The `*` is what makes this safe where a named projection would not be. It keeps the source's
+	//! width, so a stream wider than the list this insert names is caught by duckdb's own width check;
+	//! and REPLACE refuses a column that is not there, so a stream too narrow to hold the position
+	//! being replaced is caught too. Both directions are errors, and neither is a shifted row.
+	void ApplyStreamInjections(InsertQueryNode &node, const TablePolicy &policy, const string &vname) {
+		auto star = make_uniq<StarExpression>();
+		auto &replacements = star->ReplaceListMutable();
+		for (auto &injection : policy.injections) {
+			idx_t position = 0;
+			bool found = false;
+			for (idx_t i = 0; i < node.columns.size(); i++) {
+				if (StringUtil::CIEquals(node.columns[i].GetIdentifierName(), injection.first)) {
+					position = i;
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				// the grant assigns a column this insert does not write: nothing to replace, and
+				// appending it would shift every position after it
+				Deny("insert into \"" + vname + "\" cannot assign \"" + injection.first +
+				     "\", which the streamed shape does not carry");
+			}
+			replacements[Identifier("col" + to_string(position))] = InjectedValue(injection, vname);
+		}
+		auto source = make_uniq<SubqueryRef>(std::move(node.select_statement), Identifier("__acl_stream"));
+		auto select = make_uniq<SelectNode>();
+		select->from_table = std::move(source);
+		select->select_list.push_back(std::move(star));
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(select);
+		node.select_statement = std::move(statement);
+	}
+
 	//! Apply the grant's write policy to an INSERT: the written columns must be granted, and every
 	//! injected value is assigned - added when absent, overriding what the user supplied - by
 	//! projecting the source through a subquery. The row therefore belongs to the principal by
@@ -1327,16 +1380,21 @@ private:
 			return;
 		}
 		if (node.columns.empty() && !node.default_values && node.column_order != InsertColumnOrder::INSERT_BY_NAME &&
-		    !policy.write_order.empty() && policy.injections.empty()) {
+		    !policy.write_order.empty() && (policy.injections.empty() || !principal.ingest_stream.empty())) {
 			// duckdb matches a listless INSERT by position against the *table's* full width, while the
 			// client is counting the columns we published (spec 035). Supplying the list closes that
 			// gap: an insert of the shape we advertised writes the columns we advertised, and a value
 			// too many is duckdb's own width error rather than a row nobody asked for.
 			//
-			// Only where the grant assigns no values. An injection projects the source through a
-			// subquery that names the columns it wants, and a source one column too wide then loses
-			// that column silently - which is the failure mode this whole layer refuses elsewhere. With
-			// injections the client still names its columns, and is told so.
+			// Where the grant assigns values, a client writing by hand must still name its columns: the
+			// general injection path aliases the source positionally and a source one column too wide
+			// loses that column silently, which is the failure mode this layer refuses elsewhere.
+			//
+			// A drained stream is the exception, because there is nobody to tell: the statement is the
+			// server's own (spec 042). It is safe there because the injection below takes the `* REPLACE`
+			// form for it, which keeps the source's width intact so a mismatch is an error either way -
+			// too narrow and REPLACE names a column that does not exist, too wide and the width no
+			// longer matches this list.
 			for (auto &column : policy.write_order) {
 				node.columns.emplace_back(column);
 			}
@@ -1356,6 +1414,10 @@ private:
 			RequireWritableColumn(policy, column, vname);
 		}
 		if (policy.injections.empty()) {
+			return;
+		}
+		if (!principal.ingest_stream.empty()) {
+			ApplyStreamInjections(node, policy, vname);
 			return;
 		}
 		vector<Identifier> columns;

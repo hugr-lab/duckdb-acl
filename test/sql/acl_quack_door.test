@@ -97,42 +97,61 @@ SELECT acl_quack_authorize('conn-1', 'SELECT 1') IS NOT NULL;
 ----
 true
 
-# --- a streamed insert is refused, at both places it can be refused -------------------------------------
+# --- a streamed insert is judged where it is written ------------------------------------------------
 # quack asks about a streamed insert with a statement it never executes, reading only whether the answer
-# is NULL - so composing a prefix for it would say "allowed" while enforcing nothing, and the real INSERT
-# is then generated unprefixed. Measured (spec 041): on a layout where that generated statement resolves,
-# it wrote rows the principal's own predicate forbids.
+# is NULL. Spec 041 answered no, because nothing enforced the statement that followed; spec 042 enforces
+# that statement where the server generates it, so the probe passes and the write is judged at the drain.
 
 query I
-SELECT acl_quack_authorize('conn-1', 'INSERT INTO "main"."orders" VALUES (NULL)') IS NULL;
+SELECT acl_quack_authorize('conn-1', 'INSERT INTO "main"."orders" VALUES (NULL)') IS NOT NULL;
 ----
 true
 
-# the shape is matched, not the exact text quack happens to produce today
-query III
-SELECT acl_quack_authorize('conn-1', '  insert into orders values (null)  ;') IS NULL,
-       acl_quack_authorize('conn-1', 'INSERT INTO "s"."t" VALUES (NULL);') IS NULL,
-       acl_quack_authorize('conn-1', 'INSERT INTO orders VALUES (NULL)') IS NULL;
-----
-true	true	true
-
-# an ordinary insert is still composed and enforced: refusing ingest must not refuse writing
+# an ordinary insert is composed and enforced as any statement is
 query I
 SELECT acl_quack_authorize('conn-1', 'INSERT INTO orders (id, tenant) VALUES (1, ''acme'')') IS NOT NULL;
 ----
 true
 
-# and the statement that would actually write - the one the server generates on its own - is refused
-# where every unprefixed statement passes, so the fence does not depend on recognising the question
+# the statement that actually writes carries no prefix, so it is met where every unprefixed statement
+# passes - and it is refused unless the principal can be recovered from the stream id it carries
 statement error
 SELECT * FROM scan_data_from_quack_client('someone-elses-stream');
 ----
-<REGEX>:.*streamed insert carries no principal.*
+<REGEX>:.*names no connection.*
 
 statement error
-INSERT INTO phys.main.orders SELECT * FROM scan_data_from_quack_client('c:1');
+INSERT INTO phys.main.orders SELECT * FROM scan_data_from_quack_client('conn-never:1');
 ----
-<REGEX>:.*streamed insert carries no principal.*
+<REGEX>:.*has no session.*
+
+# a quoted identifier is the same call, and is read the same way
+statement error
+SELECT * FROM "scan_data_from_quack_client"('someone-elses-stream');
+----
+<REGEX>:.*names no connection.*
+
+# two streams in one statement is not a shape the door generates, so it is not one it accepts
+statement error
+SELECT * FROM scan_data_from_quack_client('conn-1:1'), scan_data_from_quack_client('conn-1:2');
+----
+<REGEX>:.*not one this door opened.*
+
+# the name as ordinary text is not a call, and must not be mistaken for one: the resolver embeds the
+# name it is looking up as a literal in its own catalog SQL, which is how this was found
+query I
+SELECT 'scan_data_from_quack_client' AS just_a_string;
+----
+scan_data_from_quack_client
+
+# where the principal *is* recovered, the write is judged as any of that principal's writes: this role
+# holds select and no more, so the insert is refused for want of the capability - which is also what
+# proves the recovery happened. The id splits at the FIRST colon, so a uuid carrying one still names
+# connection "conn-1" rather than something nobody bound.
+statement error
+INSERT INTO orders SELECT * FROM scan_data_from_quack_client('conn-1:aaaa:bbbb');
+----
+<REGEX>:.*insert.*"orders".*
 
 # --- an expired session stops composing, on the connection it was bound to ----------------------------
 # opened with a wide skew, judged with none - the same trick the session contract's own test uses
