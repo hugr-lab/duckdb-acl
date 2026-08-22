@@ -123,6 +123,12 @@ public:
 		case StatementType::PRAGMA_STATEMENT:
 			RewritePragmaStatement(stmt.Cast<PragmaStatement>());
 			break;
+		case StatementType::TRANSACTION_STATEMENT:
+			// BEGIN / COMMIT / ROLLBACK name no object and carry no expression, so there is nothing to
+			// rewrite and nothing to gate: they are session control, not access. A client driver cannot
+			// work without them - a quack client sends one before it reads anything - and refusing them
+			// left a served connection unable to load its own catalog (spec 041).
+			break;
 		default:
 			Deny("statement type " + StatementTypeToString(stmt.type) + " is not permitted under ACL");
 		}
@@ -1320,6 +1326,21 @@ private:
 		if (policy.write_columns.empty()) {
 			return;
 		}
+		if (node.columns.empty() && !node.default_values && node.column_order != InsertColumnOrder::INSERT_BY_NAME &&
+		    !policy.write_order.empty() && policy.injections.empty()) {
+			// duckdb matches a listless INSERT by position against the *table's* full width, while the
+			// client is counting the columns we published (spec 035). Supplying the list closes that
+			// gap: an insert of the shape we advertised writes the columns we advertised, and a value
+			// too many is duckdb's own width error rather than a row nobody asked for.
+			//
+			// Only where the grant assigns no values. An injection projects the source through a
+			// subquery that names the columns it wants, and a source one column too wide then loses
+			// that column silently - which is the failure mode this whole layer refuses elsewhere. With
+			// injections the client still names its columns, and is told so.
+			for (auto &column : policy.write_order) {
+				node.columns.emplace_back(column);
+			}
+		}
 		if (node.columns.empty() || node.default_values || node.column_order == InsertColumnOrder::INSERT_BY_NAME) {
 			// without an explicit column list we do not know which physical columns are written, so
 			// there is nothing to check the grant against
@@ -1723,6 +1744,11 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 		auto marker = StringUtil::Lower(function.FunctionName().GetIdentifierName());
 		if (marker == "acl_claim" || marker == "acl_arg") {
 			string type;
+			// a claim is a string by construction (the principal carries them as such), so a mask over
+			// one is VARCHAR and the probe can say so; only an argument's type has to be declared
+			if (marker == "acl_claim") {
+				type = "VARCHAR";
+			}
 			if (marker == "acl_arg") {
 				auto &args = function.GetArguments();
 				if (args.size() == 1 && args[0].GetExpression().GetExpressionClass() == ExpressionClass::CONSTANT) {
@@ -1732,12 +1758,24 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 					}
 				}
 			}
+			// The replacement is a different node, so the alias the marker carried has to be carried
+			// over: a probe reads the column *names* a projection produces, and dropping it stored a
+			// column with no name in `grant_columns` - which then appeared in every listing, sharing an
+			// ordinal with the column it was supposed to be (spec 042).
+			//
+			// The *type* is deliberately left untyped where the signature does not give one: the baked
+			// template is serialised back to text, and a bare `NULL` binds against anything, which is
+			// what lets a predicate like `amount >= acl_arg(1)` be probed at all.
+			auto alias = expr->GetAlias();
 			if (type.empty()) {
 				expr = make_uniq<ConstantExpression>(Value(LogicalType::VARCHAR));
 			} else {
 				// parse the cast rather than resolving the type name by hand (no context needed here)
 				auto casted = Parser::ParseExpressionList("CAST(NULL AS " + type + ")", options);
 				expr = std::move(casted[0]);
+			}
+			if (!alias.GetIdentifierName().empty()) {
+				expr->SetAlias(alias);
 			}
 			return;
 		}

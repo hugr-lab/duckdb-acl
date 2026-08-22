@@ -7,18 +7,19 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # Local integration-test environment config (specs/005); see .env.example
 -include .env
 
-# Integration builds (ACL_INTEGRATION=1) add the source scanners. Their build dependencies come from
+# Integration builds (ACL_INTEGRATION=1) add the source scanners, and ACL_QUACK=1 adds the quack
+# extension the door is tested against. Their build dependencies come from
 # vcpkg, like every duckdb extension: the merged-manifest step collects the vcpkg.json of each loaded
 # extension (libpq/openssl from duckdb-postgres, roaring from ducklake, ...), so nothing is listed
 # here by hand. Bootstrap once with `make vcpkg-setup`, or point VCPKG_TOOLCHAIN_PATH at an existing
 # vcpkg checkout.
-ifdef ACL_INTEGRATION
+ifneq ($(or $(ACL_INTEGRATION),$(ACL_QUACK)),)
 USE_MERGED_VCPKG_MANIFEST := 1
 VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
 GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)
 ifeq ($(wildcard $(VCPKG_TOOLCHAIN_PATH)),)
 ifneq ($(filter-out vcpkg-setup docker-up docker-down docker-status,$(GOALS)),)
-$(error ACL_INTEGRATION build needs vcpkg: run 'make vcpkg-setup' first, or set VCPKG_TOOLCHAIN_PATH)
+$(error this build needs vcpkg: run 'make vcpkg-setup' first, or set VCPKG_TOOLCHAIN_PATH)
 endif
 endif
 endif

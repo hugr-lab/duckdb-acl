@@ -62,6 +62,10 @@ jobs:
     env:
       GEN: ninja
       ACL_INTEGRATION: 1
+      # the quack door is built here too (spec 041), so the live round trip runs on every PR rather
+      # than only where someone built it by hand. quack is pre-release and the callback contract is
+      # what we stand on: a change to it should arrive as a red build, not as a surprise later.
+      ACL_QUACK: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
     steps:

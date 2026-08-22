@@ -57,8 +57,12 @@ cp .env.example .env                # once
 make vcpkg-setup                    # once: scanner dependencies come from vcpkg (merged manifests)
 make docker-up                      # postgres + mysql + sqlserver (initialized)
 ACL_INTEGRATION=1 GEN=ninja make    # build incl. postgres_scanner/ducklake
+ACL_QUACK=1 GEN=ninja make          # build incl. quack (spec 041): the live door test needs it
 make test-integration               # scenarios in test/sql/integration/ (skip w/o scanner or DSN)
 ```
+
+CI builds the linux job with both flags, so the served round trip is exercised on every PR; the
+macOS job builds neither and runs the plain suite.
 
 Build outputs: CLI `build/release/duckdb`, loadable
 `build/release/extension/acl/acl.duckdb_extension`, test binary `build/release/test/unittest`.
@@ -147,6 +151,32 @@ effects) into the admin functions; anything else after `ACL ADMIN` stays native 
 `acl_grant_view`, `acl_grant_table_function[,_alias]`, `acl_grant_scalar[,_alias]`,
 `acl_deny_function`, `acl_allow_function` — without a catalog they fill the in-memory store; with one
 they write the same content into the implicit virtual catalog `default`.
+
+## Serving clients directly
+
+A gateway prefixes every statement. A client that connects for itself cannot, so a **session** turns a
+token into a principal once and a **door** attaches it to every statement after that.
+
+**Spec 040 — the session contract**: `acl_session_open(token)` mints an opaque random handle (or NULL
+if the token does not verify), `acl_session_sql(handle, sql)` returns that SQL with
+`ACL SESSION '<handle>'` in front (NULL if the session is unknown, closed or past its `exp` — judged on
+every use), `acl_session_close(handle)` ends it. `ACL SESSION '<handle>'` is a fourth prefix kind
+alongside ROLE/TOKEN/ADMIN, carrying the same markers. All three functions are denied to a principal:
+a client can neither mint a session, compose a prefix, nor close somebody else's. State is in memory
+per `DatabaseInstance`; the shared backends a cluster needs are a follow-up.
+
+**Spec 041 — the quack door**: quack calls an authentication function per connection and an
+authorization function per statement **whose VARCHAR return replaces the executed SQL**, so serving
+under the ACL is two thin wrappers over the contract: `acl_quack_authenticate(session_id, client_token,
+server_token)` opens a session and binds it to the connection, `acl_quack_authorize(connection_id,
+query)` composes the prefix or answers NULL, which quack turns into a refusal. `acl_quack_serve(uri,
+token)` installs both and starts the listener, refusing an instance a client could step out of
+(anonymous admin on, override not `STRICT`, no server token, quack not loaded);
+`acl_quack_stop(uri)` closes the door and sweeps the sessions it served. quack's own fourteen functions
+are on the denylist — the gate is a denylist, so a loaded extension widens the surface until named.
+quack listens in the clear: a served deployment sits behind a reverse proxy. Streamed ingest
+(`SEND_DATA`) is generated **unprefixed** by the server and therefore fails rather than writing around
+the policy — fail-closed by construction, and why bulk loading through this door needs its own spec.
 
 ## Working process — per-feature specs
 

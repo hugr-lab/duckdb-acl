@@ -1,0 +1,232 @@
+# name: test/sql/acl_quack_door.test
+# description: the two callbacks quack calls, and quack's own surface denied to a principal (spec 041).
+#   Both callbacks are ordinary SQL functions, so what a door has to prove needs no server at all: that
+#   it calls the session contract, and refuses when the contract does.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme'), (2, 'globex');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+# --- authentication: the client's token is a JWT we verify for ourselves -----------------------------
+# quack's own server token is the operator's outer fence; it is not what admits anyone, so it is
+# ignored here on purpose
+
+query I
+SELECT acl_quack_authenticate('conn-1',
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc',
+    'the server token, ignored');
+----
+true
+
+query I
+SELECT acl_quack_authenticate('conn-bad', 'not-a-jwt', 'ignored');
+----
+false
+
+# a well-formed token from an issuer nobody defined is refused the same way, and says no more
+query I
+SELECT acl_quack_authenticate('conn-evil',
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2V2aWwudGVzdCIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsiYW5hbHlzdCJdfQ.xxxx',
+    'ignored');
+----
+false
+
+# --- authorization: the statement quack executes instead of the client's ------------------------------
+
+query II
+SELECT acl_quack_authorize('conn-1', 'SELECT * FROM orders') LIKE 'ACL SESSION ''%',
+       acl_quack_authorize('conn-1', 'SELECT * FROM orders') LIKE '%'' SELECT * FROM orders';
+----
+true	true
+
+# a connection nobody authenticated composes nothing, which quack turns into "Authorization failed"
+query I
+SELECT acl_quack_authorize('conn-never', 'SELECT 1') IS NULL;
+----
+true
+
+query I
+SELECT acl_quack_authorize('conn-bad', 'SELECT 1') IS NULL;
+----
+true
+
+# authenticating the same connection again replaces its session rather than adding one
+query I
+SELECT acl_quack_authenticate('conn-1',
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc',
+    'ignored');
+----
+true
+
+query I
+SELECT acl_quack_authorize('conn-1', 'SELECT 1') IS NOT NULL;
+----
+true
+
+# --- a streamed insert is refused, at both places it can be refused -------------------------------------
+# quack asks about a streamed insert with a statement it never executes, reading only whether the answer
+# is NULL - so composing a prefix for it would say "allowed" while enforcing nothing, and the real INSERT
+# is then generated unprefixed. Measured (spec 041): on a layout where that generated statement resolves,
+# it wrote rows the principal's own predicate forbids.
+
+query I
+SELECT acl_quack_authorize('conn-1', 'INSERT INTO "main"."orders" VALUES (NULL)') IS NULL;
+----
+true
+
+# the shape is matched, not the exact text quack happens to produce today
+query III
+SELECT acl_quack_authorize('conn-1', '  insert into orders values (null)  ;') IS NULL,
+       acl_quack_authorize('conn-1', 'INSERT INTO "s"."t" VALUES (NULL);') IS NULL,
+       acl_quack_authorize('conn-1', 'INSERT INTO orders VALUES (NULL)') IS NULL;
+----
+true	true	true
+
+# an ordinary insert is still composed and enforced: refusing ingest must not refuse writing
+query I
+SELECT acl_quack_authorize('conn-1', 'INSERT INTO orders (id, tenant) VALUES (1, ''acme'')') IS NOT NULL;
+----
+true
+
+# and the statement that would actually write - the one the server generates on its own - is refused
+# where every unprefixed statement passes, so the fence does not depend on recognising the question
+statement error
+SELECT * FROM scan_data_from_quack_client('someone-elses-stream');
+----
+<REGEX>:.*streamed insert carries no principal.*
+
+statement error
+INSERT INTO phys.main.orders SELECT * FROM scan_data_from_quack_client('c:1');
+----
+<REGEX>:.*streamed insert carries no principal.*
+
+# --- an expired session stops composing, on the connection it was bound to ----------------------------
+# opened with a wide skew, judged with none - the same trick the session contract's own test uses
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=86400;
+
+query I
+SELECT acl_quack_authenticate('conn-stale',
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc4NzM0MzU0Mywic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.YotpRkPkL-D6Eb35wvhqA2X9FgRrYU3ILGTWjvKIzNU',
+    'ignored');
+----
+true
+
+query I
+SELECT acl_quack_authorize('conn-stale', 'SELECT 1') IS NOT NULL;
+----
+true
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=0;
+
+query I
+SELECT acl_quack_authorize('conn-stale', 'SELECT 1') IS NULL;
+----
+true
+
+# --- quack's own surface is not a principal's ----------------------------------------------------------
+# loading an extension extends the function surface, and this gate is a denylist - so the names go in
+# before anything serves, not after
+
+statement error
+ACL ROLE "analyst" SELECT * FROM quack_active_connections();
+----
+<REGEX>:.*quack_active_connections.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM quack_query('quack:elsewhere', 'SELECT 1');
+----
+<REGEX>:.*quack_query.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM scan_data_from_quack_client('someone-elses-stream');
+----
+<REGEX>:.*scan_data_from_quack_client.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM quack_serve('quack:localhost:1');
+----
+<REGEX>:.*quack_serve.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM whoami();
+----
+<REGEX>:.*whoami.*not allowed.*
+
+# and the callbacks themselves are the door's, not a principal's
+statement error
+ACL ROLE "analyst" SELECT acl_quack_authorize('conn-1', 'SELECT 1');
+----
+<REGEX>:.*acl_quack_authorize.*not allowed.*
+
+# --- acl_quack_serve refuses to open a door a client could step out of --------------------------------
+# each condition is checked before quack is touched at all, so the refusal names the thing to fix
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement error
+SELECT acl_quack_serve('quack:localhost:31999', 'server-token');
+----
+<REGEX>:.*acl_allow_anonymous_admin.*is on.*
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+statement error
+SELECT acl_quack_serve('quack:localhost:31999', '');
+----
+<REGEX>:.*pass a server token explicitly.*
+
+# with the instance in order, the only thing left is quack itself - which this build does not load
+statement error
+SELECT acl_quack_serve('quack:localhost:31999', 'server-token');
+----
+<REGEX>:.*quack is not loaded.*
+
+# acl_quack_stop is the door's too, and it needs quack for the same reason serving does
+statement error
+SELECT acl_quack_stop('quack:localhost:31999');
+----
+<REGEX>:.*
+
+statement error
+ACL ROLE "analyst" SELECT acl_quack_stop('quack:localhost:31999');
+----
+<REGEX>:.*acl_quack_stop.*not allowed.*

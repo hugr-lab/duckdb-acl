@@ -1,0 +1,146 @@
+# name: test/sql/integration/acl_quack_serve.test
+# description: the quack door against a live server (spec 041), built from source against our duckdb
+#   pin (ACL_QUACK=1). quack is both server and client, so the whole round trip fits in one process:
+#   serve, connect over the socket, and see the ACL decide.
+# group: [integration]
+
+require acl
+
+require httpfs
+
+require quack
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR, ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 's1'), (2, 'globex', 's2');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+# the object publishes two of the three physical columns: `ssn` is not the principal's
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders COLUMNS (id, tenant);
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+# --- one call opens it -------------------------------------------------------------------------------
+
+query I
+SELECT acl_quack_serve('quack:localhost:31491', 'integration-server-token');
+----
+quack:localhost:31491
+
+# --- a client with a verified token sees its own catalog, over the socket ------------------------------
+
+query II
+SELECT * FROM quack_query('quack:localhost:31491', 'SELECT * FROM orders ORDER BY id',
+    token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+1	acme
+2	globex
+
+# the physical object is refused by the same path that refuses it anywhere else
+statement error
+SELECT * FROM quack_query('quack:localhost:31491', 'SELECT * FROM phys.main.orders',
+    token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+<REGEX>:.*no access to object "phys.main.orders".*
+
+# and the column the object does not publish is not reachable either
+statement error
+SELECT * FROM quack_query('quack:localhost:31491', 'SELECT ssn FROM orders',
+    token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+<REGEX>:.*ssn.*
+
+# --- a token nobody can verify does not get in at all --------------------------------------------------
+
+statement error
+SELECT * FROM quack_query('quack:localhost:31491', 'SELECT 1', token := 'not-a-jwt');
+----
+<REGEX>:.*Authentication failed.*
+
+statement error
+SELECT * FROM quack_query('quack:localhost:31491', 'SELECT 1',
+    token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2V2aWwudGVzdCIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsiYW5hbHlzdCJdfQ.xxxx');
+----
+<REGEX>:.*Authentication failed.*
+
+# --- the catalog a client attaches is the principal's ---------------------------------------------------
+
+statement ok
+ATTACH 'quack:localhost:31491' AS remote (TYPE quack,
+    TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+query II
+SELECT * FROM remote.main.orders ORDER BY id;
+----
+1	acme
+2	globex
+
+# --- streamed ingest does not write ---------------------------------------------------------------------
+# quack asks the authorization function about a streamed insert with a statement it never executes, and
+# then generates the real INSERT unprefixed. We answer no to the question, because we cannot enforce the
+# statement that would follow it (spec 041). This refusal is deliberate: the layout below is the one that
+# proves it has to be.
+
+statement ok
+CREATE TABLE bulk AS SELECT i AS id, 'bulk' AS tenant FROM range(5000) t(i);
+
+statement error
+INSERT INTO remote.main.orders SELECT * FROM bulk;
+----
+<REGEX>:.*Authorization failed.*
+
+query I
+SELECT count(*) FROM phys.main.orders;
+----
+2
+
+# --- closing the door closes what it served --------------------------------------------------------------
+# the sessions are bound to connections that will never come back, and nothing else can tell they are
+# gone: a door is the only thing that knows it closed
+
+statement ok
+DETACH remote;
+
+query I
+SELECT acl_quack_stop('quack:localhost:31491') LIKE '%session(s) closed%';
+----
+true
+
+query I
+SELECT count(*) FROM quack_server_list();
+----
+0
+
+# What is asserted is what this layer answers for: the server is gone from quack's own list and the
+# sessions it served are closed. Whether the socket is already refusing is quack's to say - measured,
+# a listener whose client still holds a pooled connection keeps answering for a while after the stop,
+# so asserting on the socket here would be testing quack's shutdown rather than ours.

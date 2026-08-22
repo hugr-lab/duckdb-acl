@@ -69,6 +69,11 @@ struct TablePolicy {
 	//! The physical columns a grant allows to be written; empty = unrestricted. Writing anything else
 	//! is refused rather than silently dropped.
 	case_insensitive_set_t write_columns;
+	//! The same columns under the names the principal knows them by, in the order the object is
+	//! published in (spec 042). duckdb matches an INSERT that names no columns by *position* against
+	//! the table's full width and never by name, while a client counts the columns spec 035 published
+	//! - so the list has to be supplied, or the client is counting columns it was never shown.
+	vector<string> write_order;
 };
 
 //! Where a principal's DDL lands (spec 016): the virtual schema the written name belongs to, the
@@ -203,6 +208,11 @@ struct PolicyStore {
 		int64_t expires_at = 0; // seconds since the epoch; 0 = the token carried none (the dev stub)
 	};
 	unordered_map<string, Session> sessions;
+	//! A door's own connection id -> our handle (spec 041). quack hands its `session_id` to the
+	//! authentication callback and the same value as `connection_id` on every later message, so this
+	//! is what turns "which connection is this" into "which principal is this" without the door ever
+	//! holding one.
+	unordered_map<string, string> session_bindings;
 	// issuer registry + external->role mappings (spec 007), memory-mode counterparts of the catalog
 	case_insensitive_map_t<IssuerConfig> issuers;
 	case_insensitive_map_t<case_insensitive_map_t<vector<string>>> role_mappings; // issuer -> external -> roles
@@ -377,6 +387,13 @@ struct PolicyStore {
 	bool SessionPrincipal(const string &handle, Principal &out, string &reason);
 	//! End a session. Idempotent: closing an unknown handle is not an error, since a door may retry.
 	void SessionClose(const string &handle);
+	//! Bind a door's connection id to a handle, and look one up. Binding an id that is already bound
+	//! replaces it: a door that reconnects under the same id gets the session it just authenticated.
+	void SessionBind(const string &external_id, const string &handle);
+	bool SessionHandleFor(const string &external_id, string &handle);
+	//! Drop every session and binding, and say how many there were. What a door does when it closes:
+	//! the connections it served will never come back, and nothing else can tell that they are gone.
+	idx_t SessionCloseAll();
 
 	//! Register an issuer / map an external role value (memory mode; catalog mode via the Catalog* ops)
 	void DefineIssuer(IssuerConfig config);

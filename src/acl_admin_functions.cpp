@@ -1,3 +1,4 @@
+#include "duckdb/main/connection.hpp"
 #include "acl_admin_functions.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -908,6 +909,175 @@ void AclMapRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! The statement a live session runs, with its prefix in front - or empty when the session is not
+//! usable. The one place the prefix is composed, so every door spells it the same way.
+string PrefixedForSession(PolicyStore &store, const string &handle, const string &sql) {
+	Principal principal;
+	string reason;
+	if (!store.SessionPrincipal(handle, principal, reason)) {
+		return string();
+	}
+	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
+}
+
+//! acl_quack_serve(uri[, token]): the safe way to open the quack door (spec 041). It installs the two
+//! callbacks and starts quack's server - but only from an instance a client cannot step out of, and it
+//! says which condition is missing rather than serving something half-configured. Everything it sets
+//! could be set by hand; the point of the function is that it is all of it or none.
+void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto uri = RequiredArg(args, 0, row, "acl_quack_serve", "listen uri");
+		auto token = args.ColumnCount() > 1 ? OptionalArg(args, 1, row, "") : string();
+		auto &store = StoreOf(state);
+		if (!store.CatalogEnabled()) {
+			throw BinderException("acl_quack_serve: no policy source is configured - a served instance "
+			                      "resolves every statement against one, so `acl_use_db` (or the function "
+			                      "driver) comes first");
+		}
+		if (store.CatalogAnonymousAdminAllowed()) {
+			throw BinderException("acl_quack_serve: `acl_allow_anonymous_admin` is on, so a served client "
+			                      "could administer the ACL with a bare `ACL ADMIN` - turn it off before "
+			                      "opening the door");
+		}
+		Value override_setting;
+		if (context.TryGetCurrentSetting("allow_parser_override_extension", override_setting) &&
+		    !StringUtil::CIEquals(override_setting.ToString(), "strict")) {
+			throw BinderException("acl_quack_serve: the parser override is \"%s\", not STRICT - a served "
+			                      "statement that failed to parse as ACL would fall through to plain SQL",
+			                      override_setting.ToString());
+		}
+		if (token.empty()) {
+			throw BinderException("acl_quack_serve: pass a server token explicitly. It is not what admits a "
+			                      "client - their JWT is - but a default-configured quack accepts whatever a "
+			                      "caller sends, and this is the outer fence around that");
+		}
+		// quack listens in the clear by construction, so a non-local bind belongs behind a proxy
+		Connection con(*context.db);
+		auto install = con.Query("SET GLOBAL quack_authentication_function = 'acl_quack_authenticate'; "
+		                         "SET GLOBAL quack_authorization_function = 'acl_quack_authorize';");
+		if (install->HasError()) {
+			throw BinderException("acl_quack_serve: quack is not loaded (%s)", install->GetError());
+		}
+		auto quoted = [](const string &value) {
+			return "'" + StringUtil::Replace(value, "'", "''") + "'";
+		};
+		auto served =
+		    con.Query("SELECT listen_uri FROM quack_serve(" + quoted(uri) + ", token := " + quoted(token) + ")");
+		if (served->HasError()) {
+			throw BinderException("acl_quack_serve: %s", served->GetError());
+		}
+		result.SetValue(row, served->RowCount() > 0 ? served->GetValue(0, 0) : Value(uri));
+	}
+}
+
+//! acl_quack_stop(uri): close the door, and the sessions it served with it (spec 041). Stopping the
+//! listener leaves every session bound to a connection that will never come back, and nothing else
+//! can tell that they are gone - a door is the only thing that knows it closed.
+//!
+//! quack does not tell a callback which server a connection arrived at, so sessions cannot be
+//! attributed to one. They are therefore swept only when no quack server is left in the instance:
+//! with two doors open, stopping one says what it did rather than guessing whose sessions to drop.
+void AclQuackStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto uri = RequiredArg(args, 0, row, "acl_quack_stop", "listen uri");
+		auto quoted = [](const string &value) {
+			return "'" + StringUtil::Replace(value, "'", "''") + "'";
+		};
+		Connection con(*context.db);
+		auto stopped = con.Query("SELECT * FROM quack_stop(" + quoted(uri) + ")");
+		if (stopped->HasError()) {
+			throw BinderException("acl_quack_stop: %s", stopped->GetError());
+		}
+		auto remaining = con.Query("SELECT count(*) FROM quack_server_list()");
+		bool last_door =
+		    !remaining->HasError() && remaining->RowCount() > 0 && remaining->GetValue(0, 0).GetValue<int64_t>() == 0;
+		string note = stopped->RowCount() > 0 ? stopped->GetValue(0, 0).ToString() : uri;
+		if (!last_door) {
+			result.SetValue(row, Value(note + " (another quack server is still open, so its sessions stay)"));
+			continue;
+		}
+		auto closed = StoreOf(state).SessionCloseAll();
+		result.SetValue(row, Value(note + " (" + std::to_string(closed) + " session(s) closed)"));
+	}
+}
+
+//! acl_quack_authenticate(session_id, client_token, server_token): quack's authentication callback
+//! (spec 041). The client's token is a JWT we verify for ourselves, so quack's own shared token is
+//! not what admits anyone - it stays the operator's outer fence, and this decides the principal.
+//! Binding is by quack's `session_id`, which is the `connection_id` every later message carries.
+void AclQuackAuthenticateFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto session_id = RequiredArg(args, 0, row, "acl_quack_authenticate", "session id");
+		auto token = RequiredArg(args, 1, row, "acl_quack_authenticate", "client token");
+		auto &store = StoreOf(state);
+		auto handle = store.SessionOpen(token);
+		if (handle.empty()) {
+			result.SetValue(row, Value::BOOLEAN(false));
+			continue;
+		}
+		store.SessionBind(session_id, handle);
+		result.SetValue(row, Value::BOOLEAN(true));
+	}
+}
+
+//! quack asks the authorization function about a streamed insert with a statement it never executes
+//! - `INSERT INTO <schema>.<table> VALUES (NULL)` - purely so a policy layer can decide whether this
+//! principal may write to that table. Only the answer's nullness is read: our prefixed VARCHAR is
+//! non-NULL, so it reads as "allowed" while enforcing nothing, and the real insert is then generated
+//! unprefixed (spec 041). Until the ledger can attach a principal to it, the honest answer is no.
+//!
+//! Matched narrowly - a two-part target and a single NULL value, which is quack's exact generated
+//! form. A client writing that same statement by hand is refused too; it inserts a NULL row into a
+//! one-column table, so the cost of the false refusal is small next to what it guards.
+bool IsQuackIngestProbe(const string &sql) {
+	static const string HEAD = "insert into ";
+	static const string TAIL = "values (null)";
+	string trimmed = sql;
+	StringUtil::Trim(trimmed);
+	while (!trimmed.empty() && trimmed.back() == ';') {
+		trimmed.pop_back();
+		StringUtil::Trim(trimmed);
+	}
+	if (trimmed.size() < HEAD.size() + TAIL.size()) {
+		return false;
+	}
+	if (!StringUtil::CIStartsWith(trimmed, HEAD) || !StringUtil::CIEndsWith(trimmed, TAIL)) {
+		return false;
+	}
+	auto target = trimmed.substr(HEAD.size(), trimmed.size() - HEAD.size() - TAIL.size());
+	StringUtil::Trim(target);
+	return !target.empty();
+}
+
+//! acl_quack_authorize(connection_id, query): quack's authorization callback (spec 041). A VARCHAR
+//! return replaces the SQL quack executes, so returning the prefixed statement is the whole of
+//! serving under the ACL; NULL is a refusal, which is what an unknown or expired session gets - and
+//! what a streamed insert gets, because the statement that would write it is not this one.
+void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto connection_id = RequiredArg(args, 0, row, "acl_quack_authorize", "connection id");
+		auto sql = RequiredArg(args, 1, row, "acl_quack_authorize", "query");
+		auto &store = StoreOf(state);
+		string handle;
+		if (!store.SessionHandleFor(connection_id, handle)) {
+			result.SetValue(row, Value());
+			continue;
+		}
+		if (IsQuackIngestProbe(sql)) {
+			result.SetValue(row, Value());
+			continue;
+		}
+		auto prefixed = PrefixedForSession(store, handle, sql);
+		result.SetValue(row, prefixed.empty() ? Value() : Value(prefixed));
+	}
+}
+
 //! acl_session_open(token): verify a token once and mint an opaque handle for it (spec 040). NULL
 //! when it does not verify - a door refuses rather than learning why.
 void AclSessionOpenFunc(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -1100,6 +1270,11 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		function.SetFallible();
 		loader.RegisterFunction(function);
 	};
+	// the quack door (spec 041): the two callbacks quack calls, both thin over the contract above
+	register_admin("acl_quack_authenticate", {v, v, v}, AclQuackAuthenticateFunc);
+	register_session_text("acl_quack_serve", {v, v}, AclQuackServeFunc);
+	register_session_text("acl_quack_stop", {v}, AclQuackStopFunc);
+	register_session_text("acl_quack_authorize", {v, v}, AclQuackAuthorizeFunc);
 	register_session_text("acl_session_open", {v}, AclSessionOpenFunc);
 	register_session_text("acl_session_sql", {v, v}, AclSessionSqlFunc);
 	register_admin("acl_session_close", {v}, AclSessionCloseFunc);

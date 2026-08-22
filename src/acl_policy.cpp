@@ -106,28 +106,36 @@ vector<string> SplitTopLevel(const string &text, char delimiter) {
 }
 
 case_insensitive_set_t DefaultDeniedFunctions() {
-	return {// file / blob readers
-	        "read_csv", "read_csv_auto", "read_parquet", "parquet_scan", "read_json", "read_json_auto",
-	        "read_json_objects", "read_ndjson", "read_ndjson_objects", "read_text", "read_blob", "sniff_csv", "glob",
-	        // spatial readers
-	        "st_read", "st_readosm", "st_read_meta",
-	        // external-source scanners / SQL passthrough (bypass the gateway's ACL)
-	        "postgres_query", "postgres_scan", "postgres_scan_pushdown", "postgres_execute", "mysql_query",
-	        "mysql_scan", "mysql_execute", "mssql_query", "mssql_scan", "mssql_execute", "sqlite_scan", "sqlite_query",
-	        "iceberg_scan", "iceberg_metadata", "delta_scan", "query", "query_table",
-	        // session / secret state
-	        "getvariable", "which_secret", "current_setting", "current_query",
-	        // metadata surfaces: they enumerate every attached database, so under a principal they are
-	        // a listing of the physical catalog the ACL exists to hide. Denied until spec 010 part 3
-	        // replaces them with a listing filtered by the principal's grants - a denial keeps tooling
-	        // blind, a leak keeps it informed about other people's tables.
-	        "duckdb_databases", "duckdb_schemas", "duckdb_tables", "duckdb_views", "duckdb_columns",
-	        "duckdb_constraints", "duckdb_indexes", "duckdb_functions", "duckdb_types", "duckdb_sequences",
-	        "duckdb_secrets", "duckdb_settings", "duckdb_extensions", "duckdb_dependencies", "duckdb_temporary_files",
-	        "duckdb_memory", "duckdb_optimizers", "duckdb_variables", "duckdb_log_contexts", "duckdb_logs",
-	        "pragma_database_size", "pragma_show", "pragma_storage_info", "pragma_table_info", "pragma_metadata_info",
-	        "pragma_user_agent", "pragma_version", "show_databases", "show_tables", "show_tables_expanded",
-	        "sql_auto_complete", "test_all_types"};
+	return {
+	    // file / blob readers
+	    "read_csv", "read_csv_auto", "read_parquet", "parquet_scan", "read_json", "read_json_auto", "read_json_objects",
+	    "read_ndjson", "read_ndjson_objects", "read_text", "read_blob", "sniff_csv", "glob",
+	    // spatial readers
+	    "st_read", "st_readosm", "st_read_meta",
+	    // external-source scanners / SQL passthrough (bypass the gateway's ACL)
+	    "postgres_query", "postgres_scan", "postgres_scan_pushdown", "postgres_execute", "mysql_query", "mysql_scan",
+	    "mysql_execute", "mssql_query", "mssql_scan", "mssql_execute", "sqlite_scan", "sqlite_query", "iceberg_scan",
+	    "iceberg_metadata", "delta_scan", "query", "query_table",
+	    // session / secret state
+	    "getvariable", "which_secret", "current_setting", "current_query",
+	    // metadata surfaces: they enumerate every attached database, so under a principal they are
+	    // a listing of the physical catalog the ACL exists to hide. Denied until spec 010 part 3
+	    // replaces them with a listing filtered by the principal's grants - a denial keeps tooling
+	    // blind, a leak keeps it informed about other people's tables.
+	    "duckdb_databases", "duckdb_schemas", "duckdb_tables", "duckdb_views", "duckdb_columns", "duckdb_constraints",
+	    "duckdb_indexes", "duckdb_functions", "duckdb_types", "duckdb_sequences", "duckdb_secrets", "duckdb_settings",
+	    "duckdb_extensions", "duckdb_dependencies", "duckdb_temporary_files", "duckdb_memory", "duckdb_optimizers",
+	    "duckdb_variables", "duckdb_log_contexts", "duckdb_logs", "pragma_database_size", "pragma_show",
+	    "pragma_storage_info", "pragma_table_info", "pragma_metadata_info", "pragma_user_agent", "pragma_version",
+	    "show_databases", "show_tables", "show_tables_expanded", "sql_auto_complete", "test_all_types",
+	    // the quack door's own surface (spec 041): loading an extension extends the function
+	    // surface, and this gate is a denylist - so its failure mode is the thing nobody named.
+	    // Between them these read other sessions and their SQL, run arbitrary SQL against another
+	    // server, cancel another principal's query, start and stop servers, and read a client's
+	    // data stream by id.
+	    "quack_active_connections", "quack_server_list", "quack_query", "quack_query_by_name", "quack_cancel",
+	    "quack_serve", "quack_stop", "quack_clear_cache", "quack_identify", "quack_uri_parser", "quack_connection_id",
+	    "quack_check_token", "quack_nop_authorization", "scan_data_from_quack_client", "whoami"};
 }
 
 unique_ptr<SelectStatement> PolicyStore::InstantiateSelect(const string &sql, const ParserOptions &options) {
@@ -253,6 +261,32 @@ bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string 
 void PolicyStore::SessionClose(const string &handle) {
 	lock_guard<mutex> guard(lock);
 	sessions.erase(handle);
+	for (auto entry = session_bindings.begin(); entry != session_bindings.end();) {
+		entry = entry->second == handle ? session_bindings.erase(entry) : std::next(entry);
+	}
+}
+
+void PolicyStore::SessionBind(const string &external_id, const string &handle) {
+	lock_guard<mutex> guard(lock);
+	session_bindings[external_id] = handle;
+}
+
+idx_t PolicyStore::SessionCloseAll() {
+	lock_guard<mutex> guard(lock);
+	auto closed = sessions.size();
+	sessions.clear();
+	session_bindings.clear();
+	return closed;
+}
+
+bool PolicyStore::SessionHandleFor(const string &external_id, string &handle) {
+	lock_guard<mutex> guard(lock);
+	auto entry = session_bindings.find(external_id);
+	if (entry == session_bindings.end()) {
+		return false;
+	}
+	handle = entry->second;
+	return true;
 }
 
 bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal &out) {
