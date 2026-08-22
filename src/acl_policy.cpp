@@ -330,6 +330,15 @@ idx_t PolicyStore::SessionCount() {
 	return sessions.size();
 }
 
+string PolicyStore::SessionSql(const string &handle, const string &sql) {
+	Principal principal;
+	string reason;
+	if (!SessionPrincipal(handle, principal, reason)) {
+		return string();
+	}
+	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
+}
+
 void PolicyStore::SetDoorOpen(bool open) {
 	lock_guard<mutex> guard(lock);
 	door_open = open;

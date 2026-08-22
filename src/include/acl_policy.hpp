@@ -398,6 +398,10 @@ struct PolicyStore {
 	//! The principal behind a handle, or false with `reason` saying which of "unknown" / "expired" it
 	//! is - a client that reconnects needs to tell those apart.
 	bool SessionPrincipal(const string &handle, Principal &out, string &reason);
+	//! The statement a door should run instead of the client's: the same SQL with `ACL SESSION '<h>'`
+	//! in front, or empty when the session is not usable. The whole outward contract of spec 040 in one
+	//! call, so that a second door composes it the same way the first one does rather than similarly.
+	string SessionSql(const string &handle, const string &sql);
 	//! End a session. Idempotent: closing an unknown handle is not an error, since a door may retry.
 	void SessionClose(const string &handle);
 	//! Bind a door's connection id to a handle, and look one up. Binding an id that is already bound

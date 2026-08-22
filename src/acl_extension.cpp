@@ -2,6 +2,10 @@
 
 #include "acl_extension.hpp"
 
+#ifdef ACL_FLIGHT_ENABLED
+#include "acl_flight_door.hpp"
+#endif
+
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/settings.hpp"
 
@@ -99,6 +103,12 @@ void LoadInternal(ExtensionLoader &loader) {
 	auto store = make_shared_ptr<acl::PolicyStore>();
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
+#ifdef ACL_FLIGHT_ENABLED
+	// The Flight SQL door (spec 045), present only in an ACL_FLIGHT=1 build. Registered here so the
+	// seam is real rather than declared: if Arrow ever fails to link, it fails at build time and not
+	// the first time somebody opens a door.
+	acl::RegisterAclFlightDoor(loader, store);
+#endif
 	acl::RegisterAclAdminFunctions(loader, std::move(store));
 }
 

@@ -912,12 +912,7 @@ void AclMapRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 //! The statement a live session runs, with its prefix in front - or empty when the session is not
 //! usable. The one place the prefix is composed, so every door spells it the same way.
 string PrefixedForSession(PolicyStore &store, const string &handle, const string &sql) {
-	Principal principal;
-	string reason;
-	if (!store.SessionPrincipal(handle, principal, reason)) {
-		return string();
-	}
-	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
+	return store.SessionSql(handle, sql);
 }
 
 //! acl_quack_serve(uri[, token]): the safe way to open the quack door (spec 041). It installs the two

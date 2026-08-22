@@ -13,7 +13,7 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # extension (libpq/openssl from duckdb-postgres, roaring from ducklake, ...), so nothing is listed
 # here by hand. Bootstrap once with `make vcpkg-setup`, or point VCPKG_TOOLCHAIN_PATH at an existing
 # vcpkg checkout.
-ifneq ($(or $(ACL_INTEGRATION),$(ACL_QUACK)),)
+ifneq ($(or $(ACL_INTEGRATION),$(ACL_QUACK),$(ACL_FLIGHT)),)
 USE_MERGED_VCPKG_MANIFEST := 1
 VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
 GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)
@@ -128,6 +128,13 @@ test-integration:
 	ACL_MYSQL_DSN="host=$(ACL_MYSQL_HOST) port=$(ACL_MYSQL_PORT) user=$(ACL_MYSQL_USER) passwd=$(ACL_MYSQL_PASS) db=$(ACL_MYSQL_DB)" \
 	ACL_MSSQL_DSN="Server=$(ACL_MSSQL_HOST),$(ACL_MSSQL_PORT);Database=$(ACL_MSSQL_DB);User Id=$(ACL_MSSQL_USER);Password=$(ACL_MSSQL_PASS)" \
 	build/release/test/unittest "test/sql/integration/*"
+
+# The Flight SQL door's dependency check (specs/045): does the built extension carry everything it
+# needs, or did it pick something up from the machine? Run it after an ACL_FLIGHT=1 build - it is the
+# only thing standing between us and an artifact that works here and nowhere else.
+.PHONY: check-flight-deps
+check-flight-deps:
+	./scripts/check_flight_deps.sh
 
 # The door end-to-end (specs/043): a served instance with real sources and several client processes.
 # Needs the same docker databases plus a quack build:
