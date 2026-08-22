@@ -413,8 +413,8 @@ struct PolicyStore {
 	//! SessionOpen - the operation that grows the map is the one that pays to clean it, so there is no
 	//! thread to own and no cost on a quiet instance.
 	idx_t SessionSweep();
-	//! The sweep proper; the caller holds the lock.
-	idx_t SweepLocked(int64_t now);
+	//! The sweep proper; the caller holds the lock and has read the settings before taking it.
+	idx_t SweepLocked(int64_t now, int64_t skew, int64_t idle);
 	//! How many sessions are live right now. Denied to a principal, like the rest of this surface.
 	idx_t SessionCount();
 	//! Settings behind the two rules (spec 044): seconds a session may go unused before it is dead

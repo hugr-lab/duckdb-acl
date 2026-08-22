@@ -44,7 +44,11 @@ rules end a session, and either is enough:
 The idle rule is the one that matters for the door: it does not care what the token claims, only whether
 anyone is still there.
 
-**A sweep drops every dead record in one pass**, and the bindings that point at them. It runs:
+**A sweep drops every dead record in one pass**, and every binding left pointing at a session that is
+gone — *unconditionally*, not only when the pass removed something. `SessionPrincipal` erases a session
+it finds dead on use and leaves its binding behind, so a connection whose session died that way would
+keep a row in `session_bindings` forever: the same unbounded growth this spec is about, one map to the
+left. It runs:
 
 - explicitly, through `acl_session_sweep()`, which returns how many it removed — an operator's tool, and
   what the tests use so that sweeping is observable rather than inferred;
@@ -79,6 +83,13 @@ them.
   still stands, and this adds a third reason to it.
 - **Per instance, under the same lock** as the rest of the store. The sweep is O(n) in the map, run at
   most once a minute, so it cannot become the thing that serialises a busy door.
+- **Settings are read before the lock is taken, not under it.** Reading one goes through the catalog to
+  the `DatabaseInstance`; it executes no SQL today, but since spec 043 the parser override takes this
+  same lock on every unprefixed statement, so anything that did would deadlock on a non-recursive
+  mutex. Passing the values in removes the possibility instead of relying on it staying true.
+- **The cap is checked and the session inserted in one critical section.** The first cut checked under
+  the lock, released it to mint the handle, and took it again to insert — so concurrent opens could
+  step over the cap between the two windows. Minting needs no lock, so it happens first.
 
 ## Testing
 
