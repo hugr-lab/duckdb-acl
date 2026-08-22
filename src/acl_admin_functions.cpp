@@ -1091,6 +1091,21 @@ void AclSessionSqlFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	}
 }
 
+//! acl_session_sweep(): drop every session that has expired or gone idle, and say how many went
+//! (spec 044). The same pass SessionOpen runs by itself; here it is an operator's tool, and what makes
+//! sweeping observable to a test rather than inferred from behaviour.
+void AclSessionSweepFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto swept = Value::BIGINT(NumericCast<int64_t>(StoreOf(state).SessionSweep()));
+	result.Reference(swept, count_t(args.size()));
+}
+
+//! acl_session_count(): how many sessions are live. Denied to a principal like the rest of this
+//! surface - a client may not learn how many others there are.
+void AclSessionCountFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto live = Value::BIGINT(NumericCast<int64_t>(StoreOf(state).SessionCount()));
+	result.Reference(live, count_t(args.size()));
+}
+
 //! acl_session_close(handle): end it. Idempotent, so a door may retry a disconnect.
 void AclSessionCloseFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -1258,6 +1273,15 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_session_text("acl_session_open", {v}, AclSessionOpenFunc);
 	register_session_text("acl_session_sql", {v, v}, AclSessionSqlFunc);
 	register_admin("acl_session_close", {v}, AclSessionCloseFunc);
+	// the bound on all of the above (spec 044): sweeping and counting, both the door's, never a client's
+	auto register_session_bigint = [&](const string &name, scalar_function_t fn) {
+		ScalarFunction function(Identifier(name), {}, LogicalType::BIGINT, fn);
+		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+		function.SetFallible();
+		loader.RegisterFunction(function);
+	};
+	register_session_bigint("acl_session_sweep", AclSessionSweepFunc);
+	register_session_bigint("acl_session_count", AclSessionCountFunc);
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);
 	register_admin_set("acl_define_role", {{v, v}, {v, v, v}}, AclDefineRoleFunc);
 	// offline JWT verification (spec 007)

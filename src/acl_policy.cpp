@@ -164,6 +164,10 @@ unique_ptr<ParsedExpression> PolicyStore::InstantiateExpr(const string &expr, co
 
 namespace {
 
+//! How often SessionOpen sweeps by itself. A constant rather than a setting: it trades a little
+//! staleness for not walking the map on every arrival, and no deployment needs to tune that.
+constexpr int64_t SWEEP_INTERVAL_SECONDS = 60;
+
 //! Seconds since the epoch, for judging a session's `exp` the same way the verifier judged it.
 int64_t NowSeconds() {
 	return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
@@ -236,26 +240,94 @@ string PolicyStore::SessionOpen(const string &token) {
 	} else if (!VerifyPrincipal(true, token, principal)) {
 		return string(); // the dev stub, which carries no expiry
 	}
+	// Minted before the lock because it needs none, so that checking the cap and inserting happen in
+	// ONE critical section: doing them in two let concurrent opens step over the cap between them.
+	auto now = NowSeconds();
+	auto cap = MaxSessions();
+	auto skew = JwtClockSkew();
+	auto idle_timeout = SessionIdleTimeout();
 	auto handle = MintHandle();
 	lock_guard<mutex> guard(lock);
-	sessions[handle] = Session {std::move(principal), expires_at};
+	// Sweep before making room rather than after running out: at most once a minute on a quiet door,
+	// and always when the map is at its cap, so the cost lands on arrivals and never on a reader.
+	if (now - last_sweep >= SWEEP_INTERVAL_SECONDS || (cap > 0 && sessions.size() >= static_cast<idx_t>(cap))) {
+		SweepLocked(now, skew, idle_timeout);
+	}
+	if (cap > 0 && sessions.size() >= static_cast<idx_t>(cap)) {
+		// Refusing rather than evicting: making room by ending somebody else's session would let an
+		// arriving stranger disconnect a working client, which is the worse of the two failures
+		// (spec 044). A door turns this into "Authentication failed", which a client already handles.
+		return string();
+	}
+	sessions[handle] = Session {std::move(principal), expires_at, now};
 	return handle;
 }
 
 bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string &reason) {
+	// Read before the lock, for the reason SweepLocked gives.
+	auto now = NowSeconds();
+	auto skew = JwtClockSkew();
+	auto idle = SessionIdleTimeout();
 	lock_guard<mutex> guard(lock);
 	auto entry = sessions.find(handle);
 	if (entry == sessions.end()) {
 		reason = "unknown";
 		return false;
 	}
-	if (entry->second.expires_at > 0 && entry->second.expires_at + JwtClockSkew() < NowSeconds()) {
+	if (entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
 		sessions.erase(entry); // it can never come back, so do not keep it around
 		reason = "expired";
 		return false;
 	}
+	if (idle > 0 && entry->second.last_used + idle < now) {
+		sessions.erase(entry);
+		reason = "idle";
+		return false;
+	}
+	entry->second.last_used = now;
 	out = entry->second.principal;
 	return true;
+}
+
+//! Caller holds the lock, and has read the two settings *before* taking it. Reading a setting goes
+//! through the catalog to the DatabaseInstance; it executes no SQL today, but the parser override takes
+//! this same lock on every unprefixed statement (spec 043), so anything that did would deadlock on a
+//! non-recursive mutex. Passing them in removes the possibility rather than relying on it.
+idx_t PolicyStore::SweepLocked(int64_t now, int64_t skew, int64_t idle) {
+	idx_t removed = 0;
+	for (auto entry = sessions.begin(); entry != sessions.end();) {
+		bool expired = entry->second.expires_at > 0 && entry->second.expires_at + skew < now;
+		// No `last_used > 0` guard: a session without a timestamp is a bug, and letting one live forever
+		// is the wrong way to be wrong about it. Every session gets its stamp at SessionOpen.
+		bool stale = idle > 0 && entry->second.last_used + idle < now;
+		if (expired || stale) {
+			entry = sessions.erase(entry);
+			removed++;
+			continue;
+		}
+		++entry;
+	}
+	// Unconditionally, not only when this pass removed something: SessionPrincipal erases a session it
+	// finds dead and leaves its binding behind, so a connection whose session died on use would keep a
+	// row here forever - the same unbounded growth this spec is about, one map to the left.
+	for (auto binding = session_bindings.begin(); binding != session_bindings.end();) {
+		binding = sessions.count(binding->second) == 0 ? session_bindings.erase(binding) : std::next(binding);
+	}
+	last_sweep = now;
+	return removed;
+}
+
+idx_t PolicyStore::SessionSweep() {
+	auto now = NowSeconds();
+	auto skew = JwtClockSkew();
+	auto idle = SessionIdleTimeout();
+	lock_guard<mutex> guard(lock);
+	return SweepLocked(now, skew, idle);
+}
+
+idx_t PolicyStore::SessionCount() {
+	lock_guard<mutex> guard(lock);
+	return sessions.size();
 }
 
 void PolicyStore::SetDoorOpen(bool open) {
@@ -278,6 +350,13 @@ void PolicyStore::SessionClose(const string &handle) {
 
 void PolicyStore::SessionBind(const string &external_id, const string &handle) {
 	lock_guard<mutex> guard(lock);
+	// Ending what this replaces, rather than leaving it behind: a connection that authenticates again
+	// used to orphan its previous session - unreachable, since the handle is never handed out twice and
+	// the binding is gone, but permanent all the same (spec 044).
+	auto previous = session_bindings.find(external_id);
+	if (previous != session_bindings.end() && previous->second != handle) {
+		sessions.erase(previous->second);
+	}
 	session_bindings[external_id] = handle;
 }
 

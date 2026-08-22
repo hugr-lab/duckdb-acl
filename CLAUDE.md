@@ -165,6 +165,15 @@ alongside ROLE/TOKEN/ADMIN, carrying the same markers. All three functions are d
 a client can neither mint a session, compose a prefix, nor close somebody else's. State is in memory
 per `DatabaseInstance`; the shared backends a cluster needs are a follow-up.
 
+**Spec 044 — sessions end when nobody ends them**: a door mints one per connection and quack calls
+nothing on disconnect, so two rules bound the map. A session dies at its token's `exp` *or* after
+`acl_session_idle_timeout` seconds unused (default 900; `0` disables) — `exp` bounds a credential and
+says nothing about whether anyone is still there. `acl_session_sweep()` drops every dead record and
+returns how many; `SessionOpen` runs the same pass by itself, at most once a minute or whenever the map
+is at `acl_max_sessions` (default 10000; `0` unlimited). At the cap a new session is **refused**, never
+an old one evicted — making room by ending somebody's session is the worse failure. `acl_session_count()`
+reports the live total; both new functions are the door's, not a principal's.
+
 **Spec 041 — the quack door**: quack calls an authentication function per connection and an
 authorization function per statement **whose VARCHAR return replaces the executed SQL**, so serving
 under the ACL is two thin wrappers over the contract: `acl_quack_authenticate(session_id, client_token,
