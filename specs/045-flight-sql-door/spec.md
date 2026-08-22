@@ -53,13 +53,17 @@ requirement, and the whole thing sits behind `ACL_FLIGHT=1` so an ordinary build
 the pattern spec 041 established for quack. Measured after wiring it up: the loadable extension goes
 from 36 MB to 49 MB, so the door itself costs about 13 MB of artifact.
 
-**One cost is not yet contained, and it should be said rather than discovered.** The merged-manifest
-step keeps only `dependencies` from each extension's `vcpkg.json` and drops manifest *features*, so
-"install Arrow only when the door is built" cannot be expressed there. Arrow is therefore declared
-unconditionally, which means an `ACL_INTEGRATION=1` build now installs it too. A plain build is
-untouched, because it does not use vcpkg at all. Closing this properly needs either a generated
-manifest or a word with upstream about features surviving the merge; until then it is a known tax on
-the integration build.
+**Contained, and the way round is worth writing down.** The merged-manifest step keeps only
+`dependencies` from each extension's `vcpkg.json` and drops manifest *features*, so declaring Arrow as
+a plain dependency would make every integration build install 89 ports for a door it is not opening.
+But the merge exists to combine *several loaded extensions'* dependencies, and a flight-only build
+loads none — it has nothing to merge. So it skips the merge and takes this repo's own manifest with the
+`flight` feature switched on, while `ACL_INTEGRATION` and `ACL_QUACK` keep the merged path exactly as
+before. Verified by running the merge script on our manifest: the feature does not survive it, which
+is precisely why it is the right place to put Arrow.
+
+The one combination left unhandled is both at once — an integration *and* flight build — which nothing
+needs today and which would want the feature and the merge together.
 
 ### Everything is carried, and it is checked rather than intended
 
@@ -159,10 +163,12 @@ does not get in.
   and it deserves the same measurement rather than an assumption), the Flight SQL catalog methods
   (`GetTables`, `GetDbSchemas`, …), and multiple endpoints for parallel fetch.
 
-The catalog methods deserve a note now rather than a surprise later: Flight SQL has its own metadata
-RPCs, and answering them is the same problem spec 035 solved for `information_schema` — they must show
-the principal's objects and nothing else. Until they are implemented they must **refuse**, not fall
-through to an unfiltered answer.
+The catalog methods are the next thing to build, and they are the same problem spec 035 solved for
+`information_schema`: Flight SQL has its own metadata RPCs (`GetTables`, `GetDbSchemas`, `GetCatalogs`,
+…), and each must show the principal's objects and nothing else. Checked rather than assumed: Arrow's
+`FlightSqlServerBase` answers `NotImplemented` for every RPC not overridden, so an unimplemented one
+refuses on its own — there is nothing to guard against while they are missing, only work to do to make
+them answer.
 
 ## Enforcement & security
 

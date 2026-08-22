@@ -13,8 +13,21 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # extension (libpq/openssl from duckdb-postgres, roaring from ducklake, ...), so nothing is listed
 # here by hand. Bootstrap once with `make vcpkg-setup`, or point VCPKG_TOOLCHAIN_PATH at an existing
 # vcpkg checkout.
+#
+# The Flight door (ACL_FLIGHT=1) is the exception, and deliberately so. Its dependency - Arrow with
+# Flight SQL, 89 ports of it - is ours rather than some loaded extension's, and the merged-manifest
+# step keeps only `dependencies` from each vcpkg.json while dropping manifest *features*. Declaring
+# Arrow as a plain dependency would therefore make every integration build install it too. So a
+# flight-only build skips the merge - it loads no other extension, so it has nothing to merge - and
+# takes this repo's own manifest with its `flight` feature switched on instead.
 ifneq ($(or $(ACL_INTEGRATION),$(ACL_QUACK),$(ACL_FLIGHT)),)
+ifeq ($(or $(ACL_INTEGRATION),$(ACL_QUACK)),)
+# Through EXT_FLAGS, not BUILD_FLAGS: the included Makefile rebuilds BUILD_FLAGS from scratch and
+# folds EXT_FLAGS into it, so anything set here directly is silently dropped.
+EXT_FLAGS += -DVCPKG_MANIFEST_FEATURES='flight'
+else
 USE_MERGED_VCPKG_MANIFEST := 1
+endif
 VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
 GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)
 ifeq ($(wildcard $(VCPKG_TOOLCHAIN_PATH)),)
