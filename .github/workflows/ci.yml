@@ -126,6 +126,69 @@ jobs:
           name: acl-linux_amd64
           path: build/release/extension/acl/acl.duckdb_extension
 
+  # The Arrow Flight SQL door (specs/045). Its own job rather than a step in the Linux one: it pulls
+  # Arrow with Flight SQL - 89 vcpkg ports - which has nothing to do with the scanners and would make
+  # the integration job's timing unreadable. The first run on main is slow while the binary cache fills;
+  # every run after that restores it, and pull requests read the cache main left behind.
+  build-test-flight:
+    name: Build + test (flight door)
+    runs-on: ubuntu-24.04
+    env:
+      GEN: ninja
+      ACL_FLIGHT: 1
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+          # the e2e client is third-party on purpose: a door is only proven by something that is not us
+          pip install pyarrow
+
+      - name: Setup vcpkg
+        run: make vcpkg-setup
+
+      # Keyed on vcpkg.json too: Arrow arrives through the `flight` manifest feature, so a change there
+      # is a change of dependencies and the old cache no longer describes this build.
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v6
+        with:
+          path: vcpkg_bincache
+          key: vcpkg-bincache-flight-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-bincache-flight-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-
+            vcpkg-bincache-flight-
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ccache-flight-${{ hashFiles('.gitmodules', 'duckdb/CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-flight-${{ hashFiles('.gitmodules', 'duckdb/CMakeLists.txt') }}-
+            ccache-flight-
+
+      - name: Build (with the Flight door)
+        run: |
+          EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
+          ccache -s
+
+      # Before anything is run: an artifact that borrowed a library from the runner would work here and
+      # nowhere else, and neither of the two times that happened showed up in a build log.
+      - name: Check the artifact carries its dependencies
+        run: make check-flight-deps
+
+      - name: Unit suites
+        run: build/release/test/unittest test/sql/acl.test
+
+      - name: Flight door end to end
+        run: make test-flight
+
   # Representative second platform; PRs stay on the Linux job to keep them fast
   build-test-osx:
     name: Build + test (osx_arm64)

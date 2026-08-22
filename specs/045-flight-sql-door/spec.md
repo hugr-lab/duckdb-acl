@@ -186,7 +186,11 @@ them answer.
 ## Testing
 
 Following spec 041's split, since it worked: the parts that need no server proven as ordinary SQL, the
-round trip proven live behind `ACL_FLIGHT=1`, and both in CI.
+round trip proven live behind `ACL_FLIGHT=1`, and both in CI — the door gets a job of its own there
+rather than a step in the Linux one, because 89 vcpkg ports have nothing to do with the scanners and
+would make the integration job's timing unreadable. That job also runs `make check-flight-deps` before
+it runs anything, since an artifact that borrowed a library from the runner would pass every test on
+the runner and fail everywhere else.
 
 - `test/sql/acl_flight_door.test` — the start-up refusals, and the functions denied to a principal.
 - `test/sql/integration/acl_flight_serve.test` — a live server in one process, a client connecting with
