@@ -69,6 +69,14 @@ void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("acl_jwks_refresh_interval",
 	                          "acl: seconds a fetched JWKS is used before it is read again (spec 023)",
 	                          LogicalType::BIGINT, Value::BIGINT(300), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_session_idle_timeout",
+	                          "acl: seconds a session may go unused before it is dead, whatever its "
+	                          "token's exp says; 0 disables the rule (spec 044)",
+	                          LogicalType::BIGINT, Value::BIGINT(900), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_max_sessions",
+	                          "acl: how many sessions may live at once; at the cap a new one is refused "
+	                          "rather than an old one evicted, and 0 means unlimited (spec 044)",
+	                          LogicalType::BIGINT, Value::BIGINT(10000), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_jwks_max_stale",
 	                          "acl: seconds a JWKS that can no longer be read may still be used; past "
 	                          "that a token is refused rather than verified against keys of unknown age",

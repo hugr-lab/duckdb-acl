@@ -210,6 +210,10 @@ struct PolicyStore {
 	struct Session {
 		Principal principal;
 		int64_t expires_at = 0; // seconds since the epoch; 0 = the token carried none (the dev stub)
+		//! When it was last opened or resolved (spec 044). `exp` bounds a credential and says nothing
+		//! about whether anyone is still there; a door sees connections that simply stop, so this is
+		//! what ends them.
+		int64_t last_used = 0;
 	};
 	unordered_map<string, Session> sessions;
 	//! A door's own connection id -> our handle (spec 041). quack hands its `session_id` to the
@@ -219,6 +223,9 @@ struct PolicyStore {
 	unordered_map<string, string> session_bindings;
 	//! Whether a door of ours is serving on this instance (spec 043); see SetDoorOpen.
 	bool door_open = false;
+	//! When sessions were last swept (spec 044), so the automatic sweep inside SessionOpen runs at most
+	//! once a minute rather than on every arrival.
+	int64_t last_sweep = 0;
 	// issuer registry + external->role mappings (spec 007), memory-mode counterparts of the catalog
 	case_insensitive_map_t<IssuerConfig> issuers;
 	case_insensitive_map_t<case_insensitive_map_t<vector<string>>> role_mappings; // issuer -> external -> roles
@@ -400,6 +407,20 @@ struct PolicyStore {
 	//! Drop every session and binding, and say how many there were. What a door does when it closes:
 	//! the connections it served will never come back, and nothing else can tell that they are gone.
 	idx_t SessionCloseAll();
+
+	//! Drop every session that has expired or gone idle, and the bindings pointing at them; returns how
+	//! many went (spec 044). Runs on request through `acl_session_sweep()`, and by itself inside
+	//! SessionOpen - the operation that grows the map is the one that pays to clean it, so there is no
+	//! thread to own and no cost on a quiet instance.
+	idx_t SessionSweep();
+	//! The sweep proper; the caller holds the lock.
+	idx_t SweepLocked(int64_t now);
+	//! How many sessions are live right now. Denied to a principal, like the rest of this surface.
+	idx_t SessionCount();
+	//! Settings behind the two rules (spec 044): seconds a session may go unused before it is dead
+	//! (0 = never), and how many may live at once (0 = unlimited).
+	int64_t SessionIdleTimeout();
+	int64_t MaxSessions();
 
 	//! Is an ACL door serving on this instance (spec 043)? Set by `acl_quack_serve`, cleared when the
 	//! last door stops. It gates the one thing we do to statements nobody prefixed: refusing a drained

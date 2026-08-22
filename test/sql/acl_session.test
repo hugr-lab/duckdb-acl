@@ -148,3 +148,112 @@ statement error
 ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg' ACL SESSION 'whatever' SELECT 1;
 ----
 <REGEX>:.*administration scope.*
+
+# --- sessions end when nobody ends them (spec 044) -------------------------------------------------
+# Everything above closes what it opens. A door does not: quack calls the authentication function per
+# connection and nothing on disconnect, so what is left behind is what this section is about.
+#
+# Counted as deltas from whatever this file has already left live - and that a live session survives a
+# sweep is itself the first assertion, since a sweeper that took working sessions would be worse than
+# none at all.
+
+statement ok
+CREATE TABLE base AS SELECT acl_session_count() AS n;
+
+statement ok
+SELECT acl_session_sweep();
+
+query I
+SELECT acl_session_count() = n FROM base;
+----
+true
+
+# counting follows opening and closing
+statement ok
+CREATE TABLE counted AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS handle;
+
+query I
+SELECT acl_session_count() - n FROM base;
+----
+1
+
+statement ok
+SELECT acl_session_close(handle) FROM counted;
+
+query I
+SELECT acl_session_count() - n FROM base;
+----
+0
+
+# an expired session goes in the sweep rather than waiting to be asked for. Opened under a wide skew so
+# it exists at all, judged with none - the same trick the expiry test above uses.
+statement ok
+SET GLOBAL acl_jwt_clock_skew=86400;
+
+statement ok
+CREATE TABLE swept AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc4NzM0MzU0Mywic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.zF2pHtZ_Dh8LawCZuqgMhqztPebyHkyPJEZq4Q0S72k') AS handle;
+
+query I
+SELECT acl_session_count() - n FROM base;
+----
+1
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=0;
+
+query I
+SELECT acl_session_sweep();
+----
+1
+
+query I
+SELECT acl_session_count() - n FROM base;
+----
+0
+
+# --- the cap refuses rather than evicts ---------------------------------------------------------------
+# Making room by ending somebody else's session would let an arriving stranger disconnect a working
+# client. At the cap a new session is refused, and NULL is what a door already handles.
+
+# one live session, then a cap that is already reached: the arithmetic stays out of it, since SET takes
+# no subquery and the count carried in from earlier in this file is not ours to predict
+statement ok
+CREATE TABLE capped AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS h;
+
+statement ok
+SET GLOBAL acl_max_sessions=1;
+
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NULL;
+----
+true
+
+# the session already open is untouched by the refusal - nothing was evicted to make room
+query I
+SELECT acl_session_count() - n FROM base;
+----
+1
+
+statement ok
+SET GLOBAL acl_max_sessions=10000;
+
+# and with room again, opening works
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NOT NULL;
+----
+true
+
+statement ok
+SELECT acl_session_close(h) FROM capped;
+
+# --- both are the door's, not a principal's -----------------------------------------------------------
+
+statement error
+ACL ROLE "r" SELECT acl_session_sweep();
+----
+<REGEX>:.*acl_session_sweep.*not allowed.*
+
+statement error
+ACL ROLE "r" SELECT acl_session_count();
+----
+<REGEX>:.*acl_session_count.*not allowed.*

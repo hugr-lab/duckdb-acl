@@ -2287,6 +2287,20 @@ int64_t PolicyStore::JwtClockSkew() {
 	return 60; // the memory mode has no database handle to read the setting from
 }
 
+int64_t PolicyStore::SessionIdleTimeout() {
+	if (catalog) {
+		return catalog->SettingInt64("acl_session_idle_timeout", 900);
+	}
+	return 900;
+}
+
+int64_t PolicyStore::MaxSessions() {
+	if (catalog) {
+		return catalog->SettingInt64("acl_max_sessions", 10000);
+	}
+	return 10000;
+}
+
 int64_t PolicyStore::JwksRefreshInterval() {
 	if (!catalog) {
 		return 300;
