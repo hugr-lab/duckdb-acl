@@ -194,8 +194,26 @@ What they say, measured rather than assumed:
   help either** — the same 4x connect — so the cost is not in resolving names or in the number of
   published objects.
 
-So: nothing to optimise per statement, and one clear question left — what those ~170ms of connect are
-spent on. Deliberately not chased here; the point of this round was the instrument.
+**And the instrument answered its own question.** The connect was chased down with it, by elimination:
+quack's authorization callback mechanism is free (an identity macro costs nothing over no callback at
+all), its authentication mechanism is free too, our own authentication is ~10µs for a JWT verify and a
+session, and catalog size barely matters (thirty published objects add 27ms over one). What is left is
+what a client asks for once at attach — and, measured through the door against a catalog of a single
+object:
+
+| statement | through the door |
+| --- | --- |
+| `SELECT 1` | 6 ms |
+| `SELECT count(*) FROM information_schema.tables` | 25 ms |
+| `SELECT count(*) FROM information_schema.columns` | **70 ms** |
+
+So the connect cost is spec 035's metadata surfaces. They are generated SQL over the policy catalog,
+parsed and planned afresh on every call, and their cost is nearly independent of how much they return —
+which is exactly the signature above. A client pays it once, at attach; a gateway deployment, which
+never attaches a catalog, does not pay it at all.
+
+Nothing here is optimised yet, deliberately. But the target is now a single named thing rather than a
+suspicion, and the shape of the fix is visible from the measurement: it is planning, not data.
 
 An honest note on the write figure: a streamed insert is sent by the client and drained by a statement
 on the *server*, so the client's own timer stops when the data is away rather than when it is written.
