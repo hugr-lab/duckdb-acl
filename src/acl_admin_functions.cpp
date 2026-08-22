@@ -1070,7 +1070,11 @@ void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &resu
 			continue;
 		}
 		if (IsQuackIngestProbe(sql)) {
-			result.SetValue(row, Value());
+			// The question quack asks before a stream starts, and never executes. Spec 041 answered no,
+			// because nothing enforced the statement that followed it; spec 042 enforces that statement
+			// where it is generated, so the honest answer is now "ask me again when you run it" - the
+			// session exists, and the write is judged where the write happens.
+			result.SetValue(row, Value(sql));
 			continue;
 		}
 		auto prefixed = PrefixedForSession(store, handle, sql);

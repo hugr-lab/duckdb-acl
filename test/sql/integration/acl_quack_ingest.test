@@ -1,0 +1,131 @@
+# name: test/sql/integration/acl_quack_ingest.test
+# description: bulk loading through the quack door, under the policy (spec 042). The server generates
+#   its ingest INSERT unprefixed, but the stream id it carries is `<connection_id>:<uuid>` and that
+#   connection is already bound to a session - so the principal is recovered from the statement itself
+#   and the write goes through the ordinary rewrite: capability, column list, predicate, injection.
+#
+#   The counterpart is acl_quack_ingest_denied.test, which keeps proving that a stream whose principal
+#   cannot be recovered writes nothing.
+# group: [integration]
+
+require acl
+
+require httpfs
+
+require quack
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+CREATE TABLE orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO orders VALUES (1, 'acme');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+
+# the grant states its columns (so a write has a publish order to be checked against) and confines the
+# principal to its own tenant
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true}' RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,tenant';
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+statement ok
+SELECT acl_quack_serve('quack:localhost:31579', 'integration-server-token');
+
+statement ok
+ATTACH 'quack:localhost:31579' AS remote (TYPE quack,
+    TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+# --- a bulk insert of rows the grant allows lands ---------------------------------------------------
+
+statement ok
+CREATE TABLE bulk AS SELECT i AS id, 'acme' AS tenant FROM range(5000) t(i);
+
+statement ok
+INSERT INTO remote.main.orders SELECT * FROM bulk;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE tenant = 'acme') FROM orders;
+----
+5001	5001
+
+# and the principal reads back what it wrote, through its own slice
+query I
+SELECT count(*) FROM remote.main.orders;
+----
+5001
+
+# --- a bulk insert of rows the predicate forbids writes nothing --------------------------------------
+# the check is where the value is written (spec 024), so this is refused rather than silently dropped
+
+statement ok
+CREATE TABLE foreign_rows AS SELECT i AS id, 'globex' AS tenant FROM range(5000) t(i);
+
+statement error
+INSERT INTO remote.main.orders SELECT * FROM foreign_rows;
+----
+<REGEX>:.*does not satisfy the grant.*
+
+query I
+SELECT count(*) FILTER (WHERE tenant = 'globex') FROM orders;
+----
+0
+
+# --- a grant that assigns the tenant takes it from the claim, not from the client ---------------------
+# the client streams whatever it likes in that position; the value written is the principal's
+
+statement ok
+DETACH remote;
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true}' COLUMNS 'id,tenant=acl_claim(''tenant'')';
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+statement ok
+ATTACH 'quack:localhost:31579' AS remote2 (TYPE quack,
+    TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+statement ok
+INSERT INTO remote2.main.orders SELECT * FROM foreign_rows;
+
+# every streamed row carried 'globex'; every stored row carries the claim's tenant
+query II
+SELECT count(*) FILTER (WHERE tenant = 'globex'), count(*) FILTER (WHERE tenant = 'acme') FROM orders;
+----
+0	10001
+
+statement ok
+DETACH remote2;
+
+statement ok
+SELECT acl_quack_stop('quack:localhost:31579');

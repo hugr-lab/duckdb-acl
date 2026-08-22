@@ -1,13 +1,18 @@
 # name: test/sql/integration/acl_quack_ingest_denied.test
-# description: streamed ingest through the quack door must not write around the policy (spec 041), on
-#   the layout where the accident that used to stop it is absent. acl_quack_serve.test proves ingest is
-#   refused; this one proves the refusal is the thing doing the work.
+# description: streamed ingest through the quack door must not write around the policy, on the layout
+#   where the accident that used to stop it is absent (specs 041, 042).
 #
 #   quack generates its ingest INSERT on the server, unprefixed, naming the schema and table the client
 #   sent. Unprefixed statements run natively - the parser override is consulted, not obeyed - so that
 #   INSERT resolves in the server's *default* catalog with the operator's rights. Where a physical table
 #   sits there under the name the object publishes, and the published width matches, the rows land: 5000
-#   rows carrying a tenant this role's own predicate forbids were written this way before the refusal.
+#   rows carrying a tenant this role's own predicate forbids were written this way before spec 041
+#   refused it.
+#
+#   Spec 042 lets the write through when the principal can be recovered from the stream id - so what this
+#   file now pins is that the enforcement, and not the accident, is what stops it: the grant here confines
+#   the role with a predicate but states no columns, so there is no publish order to write positionally
+#   against, and an unnamed column has no value for the predicate to judge.
 # group: [integration]
 
 require acl
@@ -73,11 +78,12 @@ SELECT * FROM remote.main.orders;
 statement ok
 CREATE TABLE bulk AS SELECT i AS id, 'INJECTED' AS tenant FROM range(5000) t(i);
 
-# the probe: a bulk insert goes down quack's SEND_DATA path, which is the one we cannot rewrite
+# the probe: a bulk insert goes down quack's SEND_DATA path, and is refused by the write policy rather
+# than by anything about the transport
 statement error
 INSERT INTO remote.main.orders SELECT * FROM bulk;
 ----
-<REGEX>:.*Authorization failed.*
+<REGEX>:.*must name its columns.*
 
 # nothing was written, and in particular no row carries a tenant the predicate forbids
 query II

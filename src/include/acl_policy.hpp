@@ -26,6 +26,10 @@ namespace acl {
 struct Principal {
 	vector<string> roles; // multi-role since spec 006 (union semantics); single-element until spec 007
 	case_insensitive_map_t<string> claims;
+	//! The one quack stream this principal is draining, when the statement being rewritten is the
+	//! ingest INSERT the server generated for it (spec 042). Empty for every statement a client or a
+	//! gateway wrote - which is what keeps the exemption it carries from reaching any of them.
+	string ingest_stream;
 };
 
 //! Policy for one virtual relation (table or view) under one role. The resolver picks the replacement

@@ -104,11 +104,11 @@ SELECT * FROM remote.main.orders ORDER BY id;
 1	acme
 2	globex
 
-# --- streamed ingest does not write ---------------------------------------------------------------------
-# quack asks the authorization function about a streamed insert with a statement it never executes, and
-# then generates the real INSERT unprefixed. We answer no to the question, because we cannot enforce the
-# statement that would follow it (spec 041). This refusal is deliberate: the layout below is the one that
-# proves it has to be.
+# --- streamed ingest is enforced, and this object cannot take it ------------------------------------------
+# the generated INSERT is rewritten under the principal recovered from its stream id (spec 042), so it is
+# refused for the reason any write to this object is refused: the object narrows its columns, which makes
+# it a projection, and a projection is read-only. Bulk loading into a writable object is proven in
+# acl_quack_ingest.test.
 
 statement ok
 CREATE TABLE bulk AS SELECT i AS id, 'bulk' AS tenant FROM range(5000) t(i);
@@ -116,7 +116,7 @@ CREATE TABLE bulk AS SELECT i AS id, 'bulk' AS tenant FROM range(5000) t(i);
 statement error
 INSERT INTO remote.main.orders SELECT * FROM bulk;
 ----
-<REGEX>:.*Authorization failed.*
+<REGEX>:.*read-only relation.*
 
 query I
 SELECT count(*) FROM phys.main.orders;

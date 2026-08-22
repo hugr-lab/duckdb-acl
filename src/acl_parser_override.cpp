@@ -1301,6 +1301,10 @@ void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &ou
 //! The parenthesis is not pedantry: the resolver embeds the name it is looking up as a literal in its
 //! own catalog SQL, so a bare occurrence says nothing about what the statement does. A call is what a
 //! generated ingest statement always contains and a quoted name never is.
+//! The table function quack's server generates to drain a client's streamed insert. Never a name a
+//! client can author: it is on the denylist for a principal, and this statement is the server's own.
+constexpr const char *STREAM_SCAN = "scan_data_from_quack_client";
+
 bool CallsFunctionNamed(const string &query, const char *name_lower, idx_t name_size) {
 	if (query.size() < name_size) {
 		return false;
@@ -1335,11 +1339,97 @@ bool CallsFunctionNamed(const string &query, const char *name_lower, idx_t name_
 //! the one place every unprefixed statement passes, rather than only in the probe quack authorizes
 //! first - what actually writes is this statement, and it names this function every time.
 //!
-//! This is where the stream ledger will attach the principal instead of refusing (spec 042): the
-//! stream id carries quack's connection id, which is already bound to a session.
+//! Spec 042 attaches the principal here instead of refusing, when it can be recovered; the refusal
+//! below is what remains when it cannot.
 bool DrainsQuackClientStream(const string &query) {
-	static constexpr const char *STREAM_SCAN = "scan_data_from_quack_client";
 	return CallsFunctionNamed(query, STREAM_SCAN, strlen(STREAM_SCAN));
+}
+
+//! The one stream id a generated ingest statement drains, or empty when the statement is not exactly
+//! one such call with one quoted argument. Deliberately unforgiving: every shape we do not recognise
+//! ends in a refusal, so reading this wrong costs a bulk load and never a policy.
+string ExtractStreamId(const string &query) {
+	auto name_size = strlen(STREAM_SCAN);
+	auto ci_match = [](char a, char b) {
+		return StringUtil::CharacterToLower(a) == b;
+	};
+	string found;
+	idx_t pos = 0;
+	while (pos < query.size()) {
+		auto it = std::search(query.begin() + UnsafeNumericCast<int64_t>(pos), query.end(), STREAM_SCAN,
+		                      STREAM_SCAN + name_size, ci_match);
+		if (it == query.end()) {
+			break;
+		}
+		auto at = UnsafeNumericCast<idx_t>(it - query.begin());
+		auto scan = at + name_size;
+		SkipWhitespace(query, scan);
+		if (scan >= query.size() || query[scan] != '(') {
+			pos = at + 1; // the name as ordinary text, not a call
+			continue;
+		}
+		scan++;
+		SkipWhitespace(query, scan);
+		if (scan >= query.size() || query[scan] != '\'') {
+			return string(); // a call whose argument we cannot read
+		}
+		auto value = ReadQuoted(query, scan);
+		SkipWhitespace(query, scan);
+		if (scan >= query.size() || query[scan] != ')') {
+			return string(); // more than the single argument quack passes
+		}
+		if (!found.empty()) {
+			return string(); // two streams in one statement is not a shape we know
+		}
+		found = value;
+		pos = scan;
+	}
+	return found;
+}
+
+//! Recover the principal a generated ingest statement belongs to and rewrite it as an ordinary
+//! insert (spec 042). quack builds the stream id as `connection_id + ":" + uuid`, and
+//! `acl_quack_authenticate` bound that connection id to a session - so the statement carries the key
+//! to its own principal, and nothing has to be journalled ahead of time.
+//!
+//! Every step that does not succeed throws: the rewrite is the exception here and the refusal is the
+//! rule, which is the opposite of how the rest of the override reads.
+ParserOverrideResult DrainStreamUnderPrincipal(PolicyStore &store, const string &query, ParserOptions &options) {
+	static constexpr const char *REFUSED = "acl: a streamed insert carries no principal, so it would be written "
+	                                       "outside the policy";
+	auto stream_id = ExtractStreamId(query);
+	if (stream_id.empty()) {
+		throw BinderException("%s (its stream is not one this door opened)", REFUSED);
+	}
+	auto colon = stream_id.find(':');
+	if (colon == string::npos || colon == 0) {
+		throw BinderException("%s (its stream names no connection)", REFUSED);
+	}
+	auto connection_id = stream_id.substr(0, colon);
+	string handle;
+	if (!store.SessionHandleFor(connection_id, handle)) {
+		throw BinderException("%s (its connection has no session)", REFUSED);
+	}
+	Principal principal;
+	string reason;
+	if (!store.SessionPrincipal(handle, principal, reason)) {
+		throw BinderException("%s (its session is %s)", REFUSED, reason.empty() ? "not usable" : reason.c_str());
+	}
+	// the one exemption this path carries, and it is bound to this exact stream: the principal may
+	// read the source the server is filling for it, and no other
+	principal.ingest_stream = stream_id;
+
+	vector<unique_ptr<SQLStatement>> statements;
+	{
+		AclParseGuard guard;
+		ParserOptions inner = options;
+		inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
+		Parser parser(inner);
+		parser.ParseQuery(query);
+		statements = std::move(parser.statements);
+	}
+	RewriteStatements(statements, principal, options, store);
+	return ParserOverrideResult(std::move(statements));
 }
 
 ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &query, ParserOptions &options) {
@@ -1349,8 +1439,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 	auto prefix = ParseAclPrefix(query);
 	if (prefix.kind == AclPrefix::Kind::NONE) {
 		if (DrainsQuackClientStream(query)) {
-			throw BinderException("acl: a streamed insert carries no principal, so it would be written outside "
-			                      "the policy - bulk loading through the quack door is not available yet");
+			return DrainStreamUnderPrincipal(*info->Cast<AclParserInfo>().store, query, options);
 		}
 		return ParserOverrideResult(); // fall through to the native parser
 	}
