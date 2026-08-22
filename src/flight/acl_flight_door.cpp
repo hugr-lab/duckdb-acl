@@ -16,6 +16,8 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include <thread>
 
 #include <arrow/c/bridge.h>
 #include <arrow/flight/server.h>
@@ -31,6 +33,16 @@ namespace duckdb {
 namespace acl {
 
 namespace {
+
+//! The store this call belongs to, reached the way the admin functions reach it (spec 041): through
+//! the function's own info, so nothing here is a process global.
+shared_ptr<PolicyStore> StoreShared(ExpressionState &state) {
+	return state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<AclScalarInfo>().store;
+}
+
+PolicyStore &StoreOf(ExpressionState &state) {
+	return *StoreShared(state);
+}
 
 namespace flight = arrow::flight;
 namespace flightsql = arrow::flight::sql;
@@ -247,11 +259,18 @@ private:
 	shared_ptr<FlightDoorState> state;
 };
 
-//! One server per listen uri, per instance. Kept here rather than in the store: the store is policy,
+//! A door that is listening: the server, the thread serving it, and the state its calls share.
+struct ServedDoor {
+	std::unique_ptr<AclFlightSqlServer> server;
+	std::thread thread;
+	shared_ptr<FlightDoorState> state;
+};
+
+//! One server per listen uri, per process. Kept here rather than in the store: the store is policy,
 //! and a listening socket is not.
 struct ServedDoors {
 	std::mutex lock;
-	std::unordered_map<string, std::unique_ptr<flight::FlightServerBase>> servers;
+	std::unordered_map<string, ServedDoor> doors;
 
 	static ServedDoors &Get() {
 		static ServedDoors doors;
@@ -259,13 +278,126 @@ struct ServedDoors {
 	}
 };
 
+//! `grpc://host:port`, or a bare `host:port` for convenience. Returned by value because everything
+//! after this point needs the host to decide whether serving it in the clear is acceptable.
+arrow::Result<flight::Location> ParseListenUri(const string &uri, string &host_out) {
+	auto text = StringUtil::Contains(uri, "://") ? uri : "grpc://" + uri;
+	ARROW_ASSIGN_OR_RAISE(auto location, flight::Location::Parse(text));
+	// Read back from the parsed form rather than from what was passed in: `Location` normalises, and
+	// the host is what decides below whether serving this address in the clear is acceptable.
+	auto normalised = location.ToString();
+	auto host_start = normalised.find("://");
+	host_start = host_start == string::npos ? 0 : host_start + 3;
+	auto host_end = normalised.find(':', host_start);
+	host_out = normalised.substr(host_start, host_end == string::npos ? string::npos : host_end - host_start);
+	return location;
+}
+
+//! The four things spec 041 refuses to serve past, restated for this door. Each is checked before the
+//! socket is touched, so the refusal names the thing to fix.
+void RefuseUnlessServable(ClientContext &context, PolicyStore &store, const string &host) {
+	if (!store.CatalogEnabled()) {
+		throw BinderException("acl_flight_serve: no policy source is configured - a served instance "
+		                      "resolves every statement against one, so `acl_use_db` comes first");
+	}
+	if (store.CatalogAnonymousAdminAllowed()) {
+		throw BinderException("acl_flight_serve: `acl_allow_anonymous_admin` is on, so a served client "
+		                      "could administer the ACL with a bare `ACL ADMIN` - turn it off first");
+	}
+	Value override_setting;
+	if (context.TryGetCurrentSetting("allow_parser_override_extension", override_setting) &&
+	    !StringUtil::CIEquals(override_setting.ToString(), "strict")) {
+		throw BinderException("acl_flight_serve: the parser override is \"%s\", not STRICT - a served "
+		                      "statement that failed to parse as ACL would fall through to plain SQL",
+		                      override_setting.ToString());
+	}
+	// TLS is this door's own job (spec 045) and is not implemented yet, so the only address it will
+	// serve is one that cannot leave the machine. Refusing is the honest form of "not yet".
+	if (host != "localhost" && host != "127.0.0.1" && host != "::1") {
+		throw BinderException("acl_flight_serve: this door serves in the clear so far, so it binds only "
+		                      "localhost - TLS is a follow-up, and until it lands a non-local address "
+		                      "would be handing out data unencrypted (spec 045)");
+	}
+}
+
+//! acl_flight_serve(uri): start the Flight SQL door in this process.
+void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto uri = FlatVector::GetData<string_t>(args.data[0])[row].GetString();
+		auto &store = StoreOf(state);
+
+		string host;
+		auto location = ParseListenUri(uri, host);
+		if (!location.ok()) {
+			throw BinderException("acl_flight_serve: %s", location.status().ToString());
+		}
+		RefuseUnlessServable(context, store, host);
+
+		auto &doors = ServedDoors::Get();
+		std::lock_guard<std::mutex> guard(doors.lock);
+		if (doors.doors.count(uri) > 0) {
+			throw BinderException("acl_flight_serve: a door is already listening on %s", uri);
+		}
+
+		ServedDoor door;
+		door.state = make_shared_ptr<FlightDoorState>(*context.db, StoreShared(state));
+		door.server = std::make_unique<AclFlightSqlServer>(door.state);
+		flight::FlightServerOptions options(*location);
+		auto init = door.server->Init(options);
+		if (!init.ok()) {
+			throw BinderException("acl_flight_serve: %s", init.ToString());
+		}
+		// Serve() blocks for the life of the door, so it gets a thread of its own; Shutdown() is what
+		// ends it, and acl_flight_stop is the only thing that calls that.
+		auto *serving = door.server.get();
+		door.thread = std::thread([serving]() { (void)serving->Serve(); });
+		doors.doors.emplace(uri, std::move(door));
+
+		result.SetValue(row, Value(uri));
+	}
+}
+
+//! acl_flight_stop(uri): close it, and end the sessions it served - a door is the only thing that
+//! knows it closed (spec 041's reasoning, unchanged here).
+void AclFlightStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto uri = FlatVector::GetData<string_t>(args.data[0])[row].GetString();
+		auto &doors = ServedDoors::Get();
+		ServedDoor door;
+		{
+			std::lock_guard<std::mutex> guard(doors.lock);
+			auto entry = doors.doors.find(uri);
+			if (entry == doors.doors.end()) {
+				throw BinderException("acl_flight_stop: no door of ours is listening on %s", uri);
+			}
+			door = std::move(entry->second);
+			doors.doors.erase(entry);
+		}
+		auto shutdown = door.server->Shutdown();
+		if (door.thread.joinable()) {
+			door.thread.join();
+		}
+		auto closed = StoreOf(state).SessionCloseAll();
+		result.SetValue(row, Value(uri + " (" + std::to_string(closed) + " session(s) closed)" +
+		                           (shutdown.ok() ? "" : " [" + shutdown.ToString() + "]")));
+	}
+}
+
 } // namespace
 
 void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
-	(void)loader;
-	(void)store;
-	// Registration of acl_flight_serve / acl_flight_stop lands in the next commit; this file exists
-	// first so that the build integration - which is the risky half - is proven on its own.
+	auto v = LogicalType::VARCHAR;
+	auto register_door = [&](const string &name, scalar_function_t fn) {
+		ScalarFunction function(Identifier(name), {v}, v, fn);
+		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+		function.SetFallible();
+		loader.RegisterFunction(function);
+	};
+	register_door("acl_flight_serve", AclFlightServeFunc);
+	register_door("acl_flight_stop", AclFlightStopFunc);
 }
 
 } // namespace acl

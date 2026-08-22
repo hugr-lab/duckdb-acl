@@ -1,6 +1,6 @@
 # Spec 045: the Flight SQL door
 
-- **Status**: draft
+- **Status**: implemented (first cut)
 - **Date**: 2026-08-22
 - **Author**: hugr-lab
 
@@ -135,7 +135,8 @@ it once with `acl_session_open` (spec 040) and keep the handle in the Flight ses
 worry recorded earlier about ADBC and JDBC having cookie middleware off by default: the mechanism is
 the server's and standard, so carrying it is a driver setting rather than something we invent.
 
-**TLS is ours here**, unlike quack. Flight is meant to be exposed, Arrow supports TLS directly, and a
+**TLS is ours here**, unlike quack — and until it lands the door **binds localhost only**, refusing any
+other address rather than handing out data in the clear over a protocol meant to cross machines. Flight is meant to be exposed, Arrow supports TLS directly, and a
 door that hands out data over a protocol drivers use from other machines should not depend on a reverse
 proxy being remembered.
 
@@ -146,10 +147,14 @@ says plainly that it is a local socket.
 ### What the first cut is, and is not
 
 Minimal on purpose, because the point of the first cut is that the transport works in-process and the
-prefix reaches the rewriter:
+prefix reaches the rewriter. **It does**: a third-party pyarrow client connects with a JWT, and reads
+exactly its own slice — five of ten seeded rows, the rest invisible to the grant's predicate. A
+physical name is refused by the same rewriter that refuses it anywhere, and a token nobody can verify
+does not get in.
 
-- **in**: start and stop the server, a session from the call headers, `GetFlightInfoStatement` and
-  `DoGetStatement` for a plain query, results from a DuckDB `ArrowQueryResult`;
+- **in**: `acl_flight_serve(uri)` / `acl_flight_stop(uri)`, a session from the call headers,
+  `GetFlightInfoStatement` and `DoGetStatement` for a plain query, results converted from DuckDB chunks
+  through the C ABI;
 - **not in**: prepared statements, `DoPut` ingest (spec 042's problem again, in another protocol —
   and it deserves the same measurement rather than an assumption), the Flight SQL catalog methods
   (`GetTables`, `GetDbSchemas`, …), and multiple endpoints for parallel fetch.
