@@ -132,12 +132,24 @@ Arrow's `FlightSqlServerBase` has exactly the two seams a door needs, so ours is
   server in a map keyed by a random id, which is the same shape as the session handle itself and for the
   same reason.
 
-**Sessions come from Arrow, not from us.** `arrow/flight/sql/server_session_middleware.h` ships a
-`ServerSessionMiddleware` with `GetSession()` and `GetCallHeaders()` — a server-side session mechanism
-with a place to hang state. The client's token arrives in the call headers at the first call; we verify
-it once with `acl_session_open` (spec 040) and keep the handle in the Flight session. That answers the
-worry recorded earlier about ADBC and JDBC having cookie middleware off by default: the mechanism is
-the server's and standard, so carrying it is a driver setting rather than something we invent.
+**The credential is per call, and the door keeps no session between calls.** The token arrives in the
+call headers, is verified with `acl_session_open` (spec 040), used, and closed before the call returns.
+
+The first cut did the obvious thing instead — verify once, remember the handle against the Flight peer,
+and let a later call without a token use it — and that is a hole: the peer is `ipv4:host:port`, ports are
+reused, and a client landing on a recycled port would inherit the previous one's session. gRPC metadata
+is per call and every Flight SQL driver sends credentials that way, so requiring it each time costs a
+JWT verification (~10µs, spec 043's benchmark) and removes the question. It also means a door under load
+leaves nothing behind for spec 044's sweeper to find.
+
+Arrow does ship a `ServerSessionMiddleware` with `GetSession()` and `GetCallHeaders()`, and it is where
+a longer-lived session would belong if one is ever wanted — worth knowing, unused for now.
+
+**A ticket stands for the question, not for the answer.** It holds an opaque id; the server keeps the
+client's *own* SQL against it, unprefixed. Not the composed statement, for a reason found by breaking
+it: the prefix names a session, and the session must be alive when the statement is **parsed**, which
+happens later and more than once. So each use composes afresh, under whoever is fetching — which also
+means a ticket that reached another principal returns *their* slice rather than the asker's.
 
 **TLS is ours here**, unlike quack — and until it lands the door **binds localhost only**, refusing any
 other address rather than handing out data in the clear over a protocol meant to cross machines. Flight is meant to be exposed, Arrow supports TLS directly, and a

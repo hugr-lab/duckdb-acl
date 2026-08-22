@@ -83,35 +83,23 @@ struct FlightDoorState {
 	shared_ptr<PolicyStore> store;
 
 	std::mutex lock;
-	//! ticket id -> the already-prefixed statement it stands for. The prefixed text never leaves the
-	//! server: what the client holds is the id.
+	//! ticket id -> the client's own SQL, unprefixed. Not the composed statement: the prefix names a
+	//! session, and a session has to be alive when the statement is *parsed*, which happens later and
+	//! more than once. So the ticket stands for the question, and each use composes it afresh under the
+	//! caller of that moment. What the client holds is the id either way.
 	std::unordered_map<string, string> tickets;
-	//! Flight peer -> session handle. A Flight call carries its peer identity, and the handshake is
-	//! what binds a verified token to it - the same job quack's connection_id does (spec 041).
-	std::unordered_map<string, string> sessions;
-
-	void Bind(const string &peer, const string &handle) {
-		std::lock_guard<std::mutex> guard(lock);
-		auto previous = sessions.find(peer);
-		if (previous != sessions.end() && previous->second != handle) {
-			store->SessionClose(previous->second); // as SessionBind does: end what this replaces
-		}
-		sessions[peer] = handle;
-	}
-
-	bool HandleFor(const string &peer, string &out) {
-		std::lock_guard<std::mutex> guard(lock);
-		auto entry = sessions.find(peer);
-		if (entry == sessions.end()) {
-			return false;
-		}
-		out = entry->second;
-		return true;
-	}
+	//! Outstanding tickets are bounded. A ticket nobody fetches is never cleaned up otherwise, which
+	//! is spec 044's problem in miniature - so past the bound the oldest are dropped rather than the
+	//! map growing forever. Dropping is safe here in a way evicting a session is not: a lost ticket
+	//! costs a client one retry, where a lost session costs it its connection.
+	static constexpr idx_t MAX_TICKETS = 4096;
 
 	string PutTicket(const string &prefixed) {
 		auto id = MintId();
 		std::lock_guard<std::mutex> guard(lock);
+		if (tickets.size() >= MAX_TICKETS) {
+			tickets.clear();
+		}
 		tickets[id] = prefixed;
 		return id;
 	}
@@ -161,21 +149,26 @@ public:
 
 		auto prefixed = state->store->SessionSql(handle, command.query);
 		if (prefixed.empty()) {
+			state->store->SessionClose(handle);
 			return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 		}
 
 		// The schema has to be known before the rows are fetched, so the statement is prepared once
 		// here. Preparing also means a statement the ACL refuses fails now, with the client still
 		// waiting on GetFlightInfo, rather than half way through a stream.
+		//
+		// The session stays alive across this: the prefix is resolved when the statement is *parsed*,
+		// so closing it any earlier makes the very statement we just composed unresolvable.
 		Connection con(state->db);
 		auto prepared = con.Prepare(prefixed);
+		state->store->SessionClose(handle);
 		if (prepared->HasError()) {
 			return StatusFromDuck("acl", prepared->GetError());
 		}
 		std::shared_ptr<arrow::Schema> schema;
 		ARROW_ASSIGN_OR_RAISE(schema, SchemaOf(*prepared));
 
-		auto ticket_id = state->PutTicket(prefixed);
+		auto ticket_id = state->PutTicket(command.query);
 		ARROW_ASSIGN_OR_RAISE(auto ticket, flightsql::CreateStatementQueryTicket(ticket_id));
 		std::vector<flight::FlightEndpoint> endpoints {
 		    flight::FlightEndpoint {flight::Ticket {std::move(ticket)}, {}, std::nullopt, {}}};
@@ -187,12 +180,28 @@ public:
 	//! so the ACL has already had its say; what is left is running it and handing over Arrow.
 	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
 	DoGetStatement(const flight::ServerCallContext &context, const flightsql::StatementQueryTicket &command) override {
-		string prefixed;
-		if (!state->TakeTicket(string(command.statement_handle), prefixed)) {
+		// A ticket is unguessable but not secret - it travels to the client and through whatever sits
+		// between. Re-checking the caller's token means a ticket seen by somebody else is not enough on
+		// its own, and it costs a JWT verification.
+		string caller;
+		ARROW_ASSIGN_OR_RAISE(caller, SessionFor(context));
+
+		string query;
+		if (!state->TakeTicket(string(command.statement_handle), query)) {
+			state->store->SessionClose(caller);
 			return arrow::Status::KeyError("acl: unknown or already fetched ticket");
+		}
+		// Composed under whoever is fetching, not whoever asked - so a ticket that reached another
+		// principal returns *their* slice rather than the asker's, and a ticket alone is never a way
+		// to read as somebody else.
+		auto prefixed = state->store->SessionSql(caller, query);
+		if (prefixed.empty()) {
+			state->store->SessionClose(caller);
+			return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 		}
 		Connection con(state->db);
 		auto result = con.Query(prefixed);
+		state->store->SessionClose(caller);
 		if (result->HasError()) {
 			return StatusFromDuck("acl", result->GetError());
 		}
@@ -216,21 +225,25 @@ public:
 	}
 
 private:
-	//! The caller's session: their token verified once, then remembered against the Flight peer. A
-	//! token that does not verify is refused here and learns nothing more (spec 040).
+	//! The caller's session, from the token this very call carries - and from nothing else.
+	//!
+	//! An earlier cut remembered the handle against the Flight peer and let a call without a token use
+	//! it. That is a session bound to `ipv4:host:port`, and ports are reused: a later client landing on
+	//! a recycled port would inherit the previous one's session. gRPC metadata is per-call and every
+	//! Flight SQL driver sends its credentials that way, so requiring the token on each call costs
+	//! nothing and removes the question.
+	//!
+	//! The session is opened and closed inside the call. Verifying a JWT and minting a handle is ~10µs
+	//! (spec 043's benchmark), which is cheaper than the state a longer-lived one would need - and it
+	//! means a door under load leaves nothing behind for the sweeper of spec 044 to find.
 	arrow::Result<string> SessionFor(const flight::ServerCallContext &context) {
-		auto peer = context.peer_identity().empty() ? context.peer() : context.peer_identity();
 		auto token = TokenFromHeaders(context);
-		if (!token.empty()) {
-			auto handle = state->store->SessionOpen(token);
-			if (handle.empty()) {
-				return arrow::Status::UnknownError("acl: authentication failed");
-			}
-			state->Bind(peer, handle);
-			return handle;
+		if (token.empty()) {
+			return arrow::Status::UnknownError("acl: authentication failed");
 		}
-		string handle;
-		if (!state->HandleFor(peer, handle)) {
+		auto handle = state->store->SessionOpen(token);
+		if (handle.empty()) {
+			// what refuses a token in the prefix refuses it here, and says no more (spec 040)
 			return arrow::Status::UnknownError("acl: authentication failed");
 		}
 		return handle;

@@ -23,7 +23,9 @@ def statement_query(sql: str) -> bytes:
 uri, sql = sys.argv[1], sys.argv[2]
 token = sys.argv[3] if len(sys.argv) > 3 else TOKEN
 client = flight.connect(uri)
-options = flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {token}".encode())])
+# "-" means: send no credentials at all. The door must refuse that, and it is worth being able to ask.
+headers = [] if token == "-" else [(b"authorization", f"Bearer {token}".encode())]
+options = flight.FlightCallOptions(headers=headers)
 info = client.get_flight_info(flight.FlightDescriptor.for_command(statement_query(sql)), options)
 table = client.do_get(info.endpoints[0].ticket, options).read_all()
 print(table.to_pydict())

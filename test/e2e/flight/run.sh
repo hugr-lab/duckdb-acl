@@ -96,6 +96,13 @@ echo "$got" | grep -q "no access to object" || fail "the physical name was not r
 got="$(ask "SELECT 1" "not-a-jwt")"
 echo "$got" | grep -q "authentication failed" || fail "an unverifiable token was admitted: $got"
 
+# --- and neither does a call carrying no credentials at all -------------------------------------------
+# An earlier cut remembered the session against the Flight peer, so a call without a token was answered
+# from whatever had authenticated from that address and port before. Ports are reused; this is the
+# assertion that keeps that from coming back.
+got="$(ask "SELECT 1" "-")"
+echo "$got" | grep -q "authentication failed" || fail "a call with no token was admitted: $got"
+
 # --- and the door closes ------------------------------------------------------------------------------
 echo "SELECT acl_flight_stop('$URI');" >&3
 stopped=""
