@@ -6,6 +6,13 @@
 #                   their dependencies come from vcpkg's static triplet. If this works, the door can
 #                   be considered for the release matrix; if it does not, we learn why here rather
 #                   than during a release.
+#
+#                   First answer: everything *builds* - abseil, gRPC, Arrow, Flight and Flight SQL all
+#                   compiled under MSVC, and so did duckdb. The link then failed on LNK2038, a runtime
+#                   library mismatch: `x64-windows-static-md` builds its libraries against the dynamic
+#                   CRT (/MD) while duckdb's extension objects use the static one (/MT). Hence the
+#                   triplet below is `x64-windows-static`. Worth keeping in the comment: the failure
+#                   looked like "Arrow does not work on Windows" and was nothing of the kind.
 #   mingw-plain   - does the extension build under MinGW *at all*? The release matrix has no MinGW,
 #                   so this is unmeasured ground. The door is excluded there by CMakeLists (Arrow and
 #                   gRPC through vcpkg are an MSVC story), so this deliberately builds without it:
@@ -58,7 +65,7 @@ jobs:
             -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
             -DDUCKDB_EXPLICIT_PLATFORM=windows_amd64 \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
             -DVCPKG_MANIFEST_DIR="$GITHUB_WORKSPACE" \
             -DVCPKG_MANIFEST_FEATURES=flight
           cmake --build build/release --target acl_loadable_extension
