@@ -30,15 +30,16 @@ ifneq ($(ACL_NEEDS_VCPKG),)
 USE_MERGED_VCPKG_MANIFEST := 1
 VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
 GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)
+# Only the goals that actually configure cmake need a toolchain, and naming those is a short, closed
+# list. The guard used to name the exceptions instead, and that list was wrong twice in one day: the
+# distribution workflow runs `make set_duckdb_version` in its checkout phase and `make configure_ci`
+# (a documented no-op in extension-ci-tools) in its setup phase, both before any vcpkg exists - and on
+# linux one never exists beside the source at all, because the build runs inside a container carrying
+# its own. An $(error) at parse time failed the build on both. What needs vcpkg is ours to enumerate;
+# what does not is somebody else's list, and it grows without telling us (specs/045).
+ACL_VCPKG_GOALS := all release debug reldebug relassert wasm_mvp wasm_eh wasm_threads
 ifeq ($(wildcard $(VCPKG_TOOLCHAIN_PATH)),)
-# Housekeeping goals never configure anything, so the guard must stay out of their way. This is not a
-# tidiness point: the distribution workflow's checkout phase runs `make set_duckdb_version` before it
-# has installed vcpkg, and an $(error) at parse time failed the build there - found by running their
-# workflow rather than ours (specs/045).
-ACL_NO_BUILD_GOALS := vcpkg-setup docker-up docker-down docker-status \
-                      set_duckdb_version set_duckdb_tag set_duckdb_repository \
-                      output_distribution_matrix clean clean-python pull update
-ifneq ($(filter-out $(ACL_NO_BUILD_GOALS),$(GOALS)),)
+ifneq ($(filter $(ACL_VCPKG_GOALS),$(GOALS)),)
 $(error this build needs vcpkg: run 'make vcpkg-setup' first, or set VCPKG_TOOLCHAIN_PATH)
 endif
 endif
