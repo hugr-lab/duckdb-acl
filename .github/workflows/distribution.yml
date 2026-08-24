@@ -43,6 +43,11 @@ jobs:
       ci_tools_version: main
       # No exclusions: WASM gets the extension without the door, because the Arrow dependency carries
       # `"platform": "!wasm32"` and CMakeLists guards on WASM_ENABLED (specs/045).
+      #
+      # macOS ships bison 2.3, which cannot parse thrift's grammar - and thrift comes with Arrow.
+      # This asks for a modern bison and flex; the same string goes into description.yml as
+      # `requires_toolchains`, which is where `airport` carries it too.
+      extra_toolchains: parser_tools
       vcpkg_binary_sources: ${{ vars.VCPKG_BINARY_SOURCES }}
     secrets:
       VCPKG_CACHING_AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}

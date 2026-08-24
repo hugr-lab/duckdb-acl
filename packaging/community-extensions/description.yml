@@ -13,6 +13,10 @@ extension:
   language: C++
   build: cmake
   license: MIT
+  # macOS still ships bison 2.3, and thrift - which arrow pulls in - has a grammar it cannot parse.
+  # This is the documented way to ask for a modern one (brew install bison flex; winflexbison3 on
+  # Windows). `airport` carries the same line for the same reason.
+  requires_toolchains: parser_tools
   maintainers:
     - vgsml
 
