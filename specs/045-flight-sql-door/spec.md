@@ -53,6 +53,26 @@ requirement, and the whole thing sits behind `ACL_FLIGHT=1` so an ordinary build
 the pattern spec 041 established for quack. Measured after wiring it up: the loadable extension goes
 from 36 MB to 49 MB, so the door itself costs about 13 MB of artifact.
 
+### Building the way the distributor will, before submitting
+
+We are not submitting to community-extensions yet - that happens alongside duckdb 2.0 - but preparing
+means finding out here what would otherwise be found in their pipeline. So `.github/workflows/distribution.yml`
+calls *their* reusable workflow (`duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml`)
+rather than a matrix of our own that resembles it. The imitation is where the bugs were: our own release
+matrix had WASM jobs configured with Ninja and then built with `emmake make`, a Windows job with no
+vcpkg at all, and the wrong CRT triplet - three failures that the workflow we now call simply does not
+have.
+
+**It also exposes the thing that actually gates submission.** Their `checkout` phase runs
+`make set_duckdb_version`, which is `cd duckdb && git checkout <version>` - our submodule pin does not
+survive it. So the extension is compiled against a duckdb *they* choose, and this repository's
+CLAUDE.md says plainly that we depend on parser APIs not yet in a stable release. Tracking `main` in
+this workflow is the early warning for that, and the reason submission waits for 2.0 rather than for
+anything of Arrow's.
+
+Cache: `docs/vcpkg-cache-r2.md`. Without it every platform pays the full Arrow build; with it, `airport`
+- which links the same libraries - completes its whole matrix in 21 minutes.
+
 ### How it is distributed, which decides how it is built
 
 **The door ships in the extension, through duckdb/community-extensions, on every platform that can
