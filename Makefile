@@ -31,7 +31,14 @@ USE_MERGED_VCPKG_MANIFEST := 1
 VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
 GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)
 ifeq ($(wildcard $(VCPKG_TOOLCHAIN_PATH)),)
-ifneq ($(filter-out vcpkg-setup docker-up docker-down docker-status,$(GOALS)),)
+# Housekeeping goals never configure anything, so the guard must stay out of their way. This is not a
+# tidiness point: the distribution workflow's checkout phase runs `make set_duckdb_version` before it
+# has installed vcpkg, and an $(error) at parse time failed the build there - found by running their
+# workflow rather than ours (specs/045).
+ACL_NO_BUILD_GOALS := vcpkg-setup docker-up docker-down docker-status \
+                      set_duckdb_version set_duckdb_tag set_duckdb_repository \
+                      output_distribution_matrix clean clean-python pull update
+ifneq ($(filter-out $(ACL_NO_BUILD_GOALS),$(GOALS)),)
 $(error this build needs vcpkg: run 'make vcpkg-setup' first, or set VCPKG_TOOLCHAIN_PATH)
 endif
 endif
