@@ -106,7 +106,7 @@ true
 # a token whose `exp` is in the past, accepted with a wide skew and then judged with none
 
 statement ok
-SET GLOBAL acl_jwt_clock_skew=86400;
+SET GLOBAL acl_jwt_clock_skew=315360000;
 
 statement ok
 CREATE TABLE stale AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc4NzM0MzU0Mywic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.zF2pHtZ_Dh8LawCZuqgMhqztPebyHkyPJEZq4Q0S72k') AS handle;
@@ -188,7 +188,7 @@ SELECT acl_session_count() - n FROM base;
 # an expired session goes in the sweep rather than waiting to be asked for. Opened under a wide skew so
 # it exists at all, judged with none - the same trick the expiry test above uses.
 statement ok
-SET GLOBAL acl_jwt_clock_skew=86400;
+SET GLOBAL acl_jwt_clock_skew=315360000;
 
 statement ok
 CREATE TABLE swept AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc4NzM0MzU0Mywic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.zF2pHtZ_Dh8LawCZuqgMhqztPebyHkyPJEZq4Q0S72k') AS handle;

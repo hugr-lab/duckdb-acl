@@ -1,0 +1,51 @@
+# The build community-extensions will run, run here first (specs/045).
+#
+# We are not submitting yet - that happens alongside duckdb 2.0 - but the point of preparing is to find
+# out on our own repository what would otherwise be found in someone else's pipeline. So this calls the
+# very workflow they call, with the same inputs, rather than a matrix of our own that resembles it.
+#
+# Two things it teaches that our hand-rolled release.yml could not:
+#
+#   - it builds against `duckdb_version`, checking the submodule out to that version rather than to our
+#     pin. That is what community-extensions does, and it is why our code has to compile against a
+#     duckdb we do not choose. Tracking `main` here is the early warning for that.
+#   - it covers the platforms they cover, with their triplets - including MinGW and musl, which our own
+#     matrix never had.
+#
+# The Flight SQL door needs Arrow, so the vcpkg binary cache is what keeps this in minutes rather than
+# hours: see docs/vcpkg-cache-r2.md. Without the secrets (a fork, for instance) it falls back to
+# duckdb's public read-only cache and is merely slow.
+name: Distribution build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+  schedule:
+    # Weekday mornings: duckdb main moves, and we would rather learn that it broke us from a red build
+    # than from a submission.
+    - cron: '17 4 * * 1-5'
+
+concurrency:
+  group: distribution-${{ github.ref }}
+  # Deliberately not cancelling: these runs fill the vcpkg cache, and a cancelled one leaves nothing
+  # behind for the next. `airport` sets the same.
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      extension_name: acl
+      duckdb_version: main
+      ci_tools_version: main
+      # No exclusions: WASM gets the extension without the door, because the Arrow dependency carries
+      # `"platform": "!wasm32"` and CMakeLists guards on WASM_ENABLED (specs/045).
+      vcpkg_binary_sources: ${{ vars.VCPKG_BINARY_SOURCES }}
+    secrets:
+      VCPKG_CACHING_AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
+      VCPKG_CACHING_AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
+      VCPKG_CACHING_AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
+      VCPKG_CACHING_AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}

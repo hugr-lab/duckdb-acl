@@ -66,6 +66,9 @@ jobs:
       # than only where someone built it by hand. quack is pre-release and the callback contract is
       # what we stand on: a change to it should arrive as a red build, not as a surprise later.
       ACL_QUACK: 1
+      # Opting out of the Flight door keeps this job about the scanners and the quack door, which is
+      # what it is for. The flight job below builds the default configuration - the one that ships.
+      ACL_NO_FLIGHT: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
     steps:
@@ -141,7 +144,8 @@ jobs:
     if: ${{ github.event_name != 'pull_request' }}
     env:
       GEN: ninja
-      ACL_FLIGHT: 1
+      # No ACL_FLIGHT: the door is what a default build produces now. This job is therefore the one
+      # that builds what community-extensions will build, which is why it is worth its 90 minutes.
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
     steps:
@@ -202,6 +206,9 @@ jobs:
     if: ${{ github.event_name != 'pull_request' }}
     env:
       GEN: ninja
+      # A second platform for the ACL itself, not for the door - this job has no vcpkg step and does
+      # not want an hour of Arrow. The door's own job covers the default configuration.
+      ACL_NO_FLIGHT: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - uses: actions/checkout@v7

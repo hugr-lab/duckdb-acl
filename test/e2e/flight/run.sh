@@ -28,7 +28,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 have="$(echo "LOAD '$ACL_EXT'; SELECT count(*) FROM duckdb_functions() WHERE function_name='acl_flight_serve';" \
         | "$DUCKDB" -unsigned -noheader -list 2>/dev/null | tail -1 | tr -d ' ')"
 if [ "$have" != "1" ]; then
-	echo "SKIP: this build has no Flight door - rebuild with ACL_FLIGHT=1"
+	echo "SKIP: this build has no Flight door - it was built with ACL_NO_FLIGHT=1, or on WASM"
 	exit 0
 fi
 python3 -c "import pyarrow.flight" 2>/dev/null || { echo "SKIP: pyarrow is not installed"; exit 0; }

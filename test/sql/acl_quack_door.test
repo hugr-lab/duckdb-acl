@@ -130,10 +130,12 @@ SELECT 'scan_data_from_quack_client' AS just_a_string;
 scan_data_from_quack_client
 
 # --- an expired session stops composing, on the connection it was bound to ----------------------------
-# opened with a wide skew, judged with none - the same trick the session contract's own test uses
+# opened with a skew wide enough that the fixture's age cannot matter, judged with none. It was
+# 86400 once, which covered the token's exp on the day this was written and stopped covering it
+# two days later - a test that passes only while it is new is worse than one that fails.
 
 statement ok
-SET GLOBAL acl_jwt_clock_skew=86400;
+SET GLOBAL acl_jwt_clock_skew=315360000;
 
 query I
 SELECT acl_quack_authenticate('conn-stale',

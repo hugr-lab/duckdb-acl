@@ -53,6 +53,57 @@ requirement, and the whole thing sits behind `ACL_FLIGHT=1` so an ordinary build
 the pattern spec 041 established for quack. Measured after wiring it up: the loadable extension goes
 from 36 MB to 49 MB, so the door itself costs about 13 MB of artifact.
 
+### Building the way the distributor will, before submitting
+
+We are not submitting to community-extensions yet - that happens alongside duckdb 2.0 - but preparing
+means finding out here what would otherwise be found in their pipeline. So `.github/workflows/distribution.yml`
+calls *their* reusable workflow (`duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml`)
+rather than a matrix of our own that resembles it. The imitation is where the bugs were: our own release
+matrix had WASM jobs configured with Ninja and then built with `emmake make`, a Windows job with no
+vcpkg at all, and the wrong CRT triplet - three failures that the workflow we now call simply does not
+have.
+
+**It also exposes the thing that actually gates submission.** Their `checkout` phase runs
+`make set_duckdb_version`, which is `cd duckdb && git checkout <version>` - our submodule pin does not
+survive it. So the extension is compiled against a duckdb *they* choose, and this repository's
+CLAUDE.md says plainly that we depend on parser APIs not yet in a stable release. Tracking `main` in
+this workflow is the early warning for that, and the reason submission waits for 2.0 rather than for
+anything of Arrow's.
+
+Cache: `docs/vcpkg-cache-r2.md`. Without it every platform pays the full Arrow build; with it, `airport`
+- which links the same libraries - completes its whole matrix in 21 minutes.
+
+### How it is distributed, which decides how it is built
+
+**The door ships in the extension, through duckdb/community-extensions, on every platform that can
+hold it.** That is the requirement, and it settles a build question rather than the other way round:
+their pipeline builds from a `description.yml` and sets no environment variables of ours, so a door
+behind `ACL_FLIGHT=1` would simply never be in an artifact anyone downloads. It is therefore built by
+**default**, and `ACL_NO_FLIGHT=1` is the way out for a fast local loop.
+
+An earlier draft of this section concluded the opposite - that thirteen platforms times Arrow-and-gRPC
+was hopeless and the door would have to be self-built. That was wrong, and `airport` was the
+counter-example sitting in plain sight: it links Arrow Flight statically, ships through the same
+pipeline, and declares `excluded_platforms: wasm_mvp;wasm_eh;wasm_threads` - so Arrow builds on MinGW
+and musl too, and there is a supported way to opt out of the platforms where it cannot.
+
+**And WASM keeps the other door.** The quack door costs a WASM build nothing, because none of it is
+linked: all four of its functions are registered unconditionally, and `acl_quack_serve` reaches quack
+through runtime SQL (`con.Query("... quack_serve(...)")`) rather than through a symbol - which is why an
+instance without quack answers "quack is not loaded" instead of failing to build. `ACL_QUACK=1` builds
+quack itself, and only so our own tests have a server to talk to.
+
+So a WASM artifact carries the ACL and the whole quack door, with no gRPC anywhere in it. What it loses
+is exactly the thing that cannot exist there. Worth writing down because it is easy to break by
+accident: putting any of those four functions behind a build flag would quietly take the door away from
+a platform that can still use it.
+
+We need that opt-out for nothing at all. Our extension is access control, which works perfectly well in
+WASM; only the *door* cannot be there. So the Arrow dependency carries `"platform": "!wasm32"` and
+`CMakeLists.txt` guards on `WASM_ENABLED` - a WASM build asks vcpkg for nothing, compiles no door, and
+produces a working extension. `packaging/community-extensions/description.yml` therefore excludes
+nothing: all thirteen platforms get the ACL, and the ten that are not WASM get the door with it.
+
 **Contained, and the way round is worth writing down.** The merged-manifest step keeps only
 `dependencies` from each extension's `vcpkg.json` and drops manifest *features*, so declaring Arrow as
 a plain dependency would make every integration build install 89 ports for a door it is not opening.
@@ -225,7 +276,9 @@ would make the integration job's timing unreadable. That job also runs `make che
 it runs anything, since an artifact that borrowed a library from the runner would pass every test on
 the runner and fail everywhere else.
 
-**It runs on merges and on request, not on pull requests** — the same shape the macOS job has, and for
+**The flight job is now the default build**, so it is the job that builds what
+community-extensions will build; the integration and macOS jobs opt out with `ACL_NO_FLIGHT=1` to stay
+quick. **It runs on merges and on request, not on pull requests** — the same shape the macOS job has, and for
 the same reason: a cold build measured 98 minutes on a runner. That choice is what keeps the plain
 Actions cache sufficient. The repository's cache budget is 10 GB with eviction by age, and this build's
 share is well over a gigabyte competing with the integration cache and seven release ccaches; a job
