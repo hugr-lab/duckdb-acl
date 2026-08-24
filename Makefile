@@ -85,18 +85,28 @@ test-cpp:
 
 test-cpp-run: $(TEST_CPP_BINS)
 	@test -n "$(TEST_CPP_BINS)" || { echo "test-cpp: no test/cpp/test_*.cpp sources found" >&2; exit 1; }
-	@fail=0; \
+	@fail=0; out=$$(mktemp); \
 	for b in $(TEST_CPP_BINS); do \
-		if $$b >$$b.out 2>&1; then echo "  PASS $$(basename $$b)"; \
-		else echo "  FAIL $$(basename $$b)"; cat $$b.out; fail=1; fi; \
+		if $$b >$$out 2>&1; then echo "  PASS $$(basename $$b)"; \
+		else echo "  FAIL $$(basename $$b)"; cat $$out; fail=1; fi; \
 	done; \
+	rm -f $$out; \
 	exit $$fail
 
 # CI runs `make test_release` (extension-ci-tools); chain the C++ tests into it on the platforms
-# that can build and run them (not Windows, not wasm cross-builds)
+# that can build and run them (not Windows, not wasm cross-builds).
+#
+# On linux the distribution build runs `make test_release` twice against the same mounted tree: once
+# inside the container that built it, then again on the host. The second run is theirs to make - it
+# exercises the extension outside the container - but our C++ binaries cannot join it. They were
+# linked in the container with an rpath naming a container path, and the tree they would have to
+# relink into belongs to root. So the container's run is the one that counts, and LINUX_CI_IN_DOCKER=0
+# (which is set only for that host pass) means step aside.
 ifneq ($(OS),Windows_NT)
 ifeq ($(findstring wasm,$(DUCKDB_PLATFORM)),)
+ifneq ($(LINUX_CI_IN_DOCKER),0)
 test_release: test-cpp
+endif
 endif
 endif
 
