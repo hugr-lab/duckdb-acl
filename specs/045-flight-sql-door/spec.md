@@ -67,6 +67,17 @@ counter-example sitting in plain sight: it links Arrow Flight statically, ships 
 pipeline, and declares `excluded_platforms: wasm_mvp;wasm_eh;wasm_threads` - so Arrow builds on MinGW
 and musl too, and there is a supported way to opt out of the platforms where it cannot.
 
+**And WASM keeps the other door.** The quack door costs a WASM build nothing, because none of it is
+linked: all four of its functions are registered unconditionally, and `acl_quack_serve` reaches quack
+through runtime SQL (`con.Query("... quack_serve(...)")`) rather than through a symbol - which is why an
+instance without quack answers "quack is not loaded" instead of failing to build. `ACL_QUACK=1` builds
+quack itself, and only so our own tests have a server to talk to.
+
+So a WASM artifact carries the ACL and the whole quack door, with no gRPC anywhere in it. What it loses
+is exactly the thing that cannot exist there. Worth writing down because it is easy to break by
+accident: putting any of those four functions behind a build flag would quietly take the door away from
+a platform that can still use it.
+
 We need that opt-out for nothing at all. Our extension is access control, which works perfectly well in
 WASM; only the *door* cannot be there. So the Arrow dependency carries `"platform": "!wasm32"` and
 `CMakeLists.txt` guards on `WASM_ENABLED` - a WASM build asks vcpkg for nothing, compiles no door, and
