@@ -14,20 +14,20 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # here by hand. Bootstrap once with `make vcpkg-setup`, or point VCPKG_TOOLCHAIN_PATH at an existing
 # vcpkg checkout.
 #
-# The Flight door (ACL_FLIGHT=1) is the exception, and deliberately so. Its dependency - Arrow with
-# Flight SQL, 89 ports of it - is ours rather than some loaded extension's, and the merged-manifest
-# step keeps only `dependencies` from each vcpkg.json while dropping manifest *features*. Declaring
-# Arrow as a plain dependency would therefore make every integration build install it too. So a
-# flight-only build skips the merge - it loads no other extension, so it has nothing to merge - and
-# takes this repo's own manifest with its `flight` feature switched on instead.
-ifneq ($(or $(ACL_INTEGRATION),$(ACL_QUACK),$(ACL_FLIGHT)),)
-ifeq ($(or $(ACL_INTEGRATION),$(ACL_QUACK)),)
-# Through EXT_FLAGS, not BUILD_FLAGS: the included Makefile rebuilds BUILD_FLAGS from scratch and
-# folds EXT_FLAGS into it, so anything set here directly is silently dropped.
-EXT_FLAGS += -DVCPKG_MANIFEST_FEATURES='flight'
-else
-USE_MERGED_VCPKG_MANIFEST := 1
+# The Flight SQL door is part of the extension, not an option - it is what a client with an ADBC or
+# JDBC driver connects to, and it ships through community-extensions like any other feature. So Arrow
+# is an ordinary dependency and every build installs it, the way `airport` does.
+#
+# ACL_NO_FLIGHT=1 is the way out, for a fast local loop: it drops the door *and* the vcpkg step with
+# it, since nothing else in a plain build needs vcpkg.
+ifeq ($(ACL_NO_FLIGHT),)
+ACL_NEEDS_VCPKG := 1
 endif
+ifneq ($(or $(ACL_INTEGRATION),$(ACL_QUACK)),)
+ACL_NEEDS_VCPKG := 1
+endif
+ifneq ($(ACL_NEEDS_VCPKG),)
+USE_MERGED_VCPKG_MANIFEST := 1
 VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
 GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)
 ifeq ($(wildcard $(VCPKG_TOOLCHAIN_PATH)),)

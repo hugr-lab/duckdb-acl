@@ -1,5 +1,14 @@
 {
-    "dependencies": [],
+    "dependencies": [
+        {
+            "name": "arrow",
+            "default-features": false,
+            "features": [
+                "flightsql"
+            ],
+            "platform": "!wasm32"
+        }
+    ],
     "vcpkg-configuration": {
         "overlay-ports": [
             "./extension-ci-tools/vcpkg_ports"
@@ -7,19 +16,5 @@
         "overlay-triplets": [
             "./extension-ci-tools/toolchains"
         ]
-    },
-    "features": {
-        "flight": {
-            "description": "Arrow Flight SQL door (spec 045); enabled by ACL_FLIGHT=1",
-            "dependencies": [
-                {
-                    "name": "arrow",
-                    "default-features": false,
-                    "features": [
-                        "flightsql"
-                    ]
-                }
-            ]
-        }
     }
 }

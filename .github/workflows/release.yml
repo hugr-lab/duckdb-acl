@@ -25,8 +25,12 @@ jobs:
           - id: osx_arm64
             runner: macos-14
     env:
-      GEN: ninja
+      # Not for WASM: extension-ci-tools configures those targets with $(GENERATOR) and then runs
+      # `emmake make`, so Ninja leaves it hunting for a Makefile nobody wrote. This is why the wasm
+      # jobs had never produced an artifact.
+      GEN: ${{ startsWith(matrix.platform.id, 'wasm') && '' || 'ninja' }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -40,6 +44,23 @@ jobs:
           else
             sudo apt-get update && sudo apt-get install -y ninja-build ccache
           fi
+
+      # The Flight SQL door is part of a released artifact, so these builds need Arrow from vcpkg -
+      # every platform except WASM, where the manifest's `!wasm32` leaves it out and CMakeLists leaves
+      # the door out with it.
+      - name: Setup vcpkg
+        if: ${{ !startsWith(matrix.platform.id, 'wasm') }}
+        run: make vcpkg-setup
+
+      - name: Cache vcpkg binary packages
+        if: ${{ !startsWith(matrix.platform.id, 'wasm') }}
+        uses: actions/cache@v6
+        with:
+          path: vcpkg_bincache
+          key: vcpkg-bincache-rel-${{ matrix.platform.id }}-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-bincache-rel-${{ matrix.platform.id }}-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-
+            vcpkg-bincache-rel-${{ matrix.platform.id }}-
 
       - name: Restore ccache
         uses: actions/cache@v6
@@ -82,15 +103,35 @@ jobs:
 
       - uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Setup vcpkg
+        shell: bash
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          ./vcpkg/bootstrap-vcpkg.sh
+
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v6
+        with:
+          path: vcpkg_bincache
+          key: vcpkg-bincache-rel-windows-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-bincache-rel-windows-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-
+            vcpkg-bincache-rel-windows-
+
       - name: Build (MSVC, mirrors the ci-tools cmake invocation)
         shell: bash
         run: |
           choco install ninja -y
+          # `x64-windows-static`, not `-static-md`: duckdb builds extension objects against the static
+          # CRT, and the dynamic-CRT triplet ends the build at LNK2038 after three hours of vcpkg.
           cmake -G Ninja -S duckdb -B build/release \
             -DCMAKE_BUILD_TYPE=Release \
             -DEXTENSION_STATIC_BUILD=1 \
             -DDUCKDB_EXTENSION_CONFIGS="$GITHUB_WORKSPACE/extension_config.cmake" \
-            -DDUCKDB_EXPLICIT_PLATFORM=windows_amd64
+            -DDUCKDB_EXPLICIT_PLATFORM=windows_amd64 \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DVCPKG_MANIFEST_DIR="$GITHUB_WORKSPACE"
           cmake --build build/release --target acl_loadable_extension
 
       - name: Stage artifact

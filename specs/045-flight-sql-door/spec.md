@@ -53,6 +53,26 @@ requirement, and the whole thing sits behind `ACL_FLIGHT=1` so an ordinary build
 the pattern spec 041 established for quack. Measured after wiring it up: the loadable extension goes
 from 36 MB to 49 MB, so the door itself costs about 13 MB of artifact.
 
+### How it is distributed, which decides how it is built
+
+**The door ships in the extension, through duckdb/community-extensions, on every platform that can
+hold it.** That is the requirement, and it settles a build question rather than the other way round:
+their pipeline builds from a `description.yml` and sets no environment variables of ours, so a door
+behind `ACL_FLIGHT=1` would simply never be in an artifact anyone downloads. It is therefore built by
+**default**, and `ACL_NO_FLIGHT=1` is the way out for a fast local loop.
+
+An earlier draft of this section concluded the opposite - that thirteen platforms times Arrow-and-gRPC
+was hopeless and the door would have to be self-built. That was wrong, and `airport` was the
+counter-example sitting in plain sight: it links Arrow Flight statically, ships through the same
+pipeline, and declares `excluded_platforms: wasm_mvp;wasm_eh;wasm_threads` - so Arrow builds on MinGW
+and musl too, and there is a supported way to opt out of the platforms where it cannot.
+
+We need that opt-out for nothing at all. Our extension is access control, which works perfectly well in
+WASM; only the *door* cannot be there. So the Arrow dependency carries `"platform": "!wasm32"` and
+`CMakeLists.txt` guards on `WASM_ENABLED` - a WASM build asks vcpkg for nothing, compiles no door, and
+produces a working extension. `packaging/community-extensions/description.yml` therefore excludes
+nothing: all thirteen platforms get the ACL, and the ten that are not WASM get the door with it.
+
 **Contained, and the way round is worth writing down.** The merged-manifest step keeps only
 `dependencies` from each extension's `vcpkg.json` and drops manifest *features*, so declaring Arrow as
 a plain dependency would make every integration build install 89 ports for a door it is not opening.
@@ -225,7 +245,9 @@ would make the integration job's timing unreadable. That job also runs `make che
 it runs anything, since an artifact that borrowed a library from the runner would pass every test on
 the runner and fail everywhere else.
 
-**It runs on merges and on request, not on pull requests** — the same shape the macOS job has, and for
+**The flight job is now the default build**, so it is the job that builds what
+community-extensions will build; the integration and macOS jobs opt out with `ACL_NO_FLIGHT=1` to stay
+quick. **It runs on merges and on request, not on pull requests** — the same shape the macOS job has, and for
 the same reason: a cold build measured 98 minutes on a runner. That choice is what keeps the plain
 Actions cache sufficient. The repository's cache budget is 10 GB with eviction by age, and this build's
 share is well over a gigabyte competing with the integration cache and seven release ccaches; a job

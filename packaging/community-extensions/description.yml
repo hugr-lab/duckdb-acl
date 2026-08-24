@@ -1,0 +1,33 @@
+# What we submit to duckdb/community-extensions (specs/045). Kept here so the thing we ask them to
+# build is reviewable in this repository rather than only in a pull request against theirs.
+#
+# No excluded platforms, and that is the point. `airport` excludes the three WASM targets because its
+# whole purpose is Arrow Flight; ours is access control, which works perfectly well in WASM - only the
+# door cannot be there, and it is left out by CMakeLists and by a `!wasm32` platform expression on the
+# Arrow dependency. So every one of the thirteen platforms gets the extension, and nine of them get the
+# door as well.
+extension:
+  name: acl
+  description: Role and token scoped access control for DuckDB, enforced by rewriting the statement before bind
+  version: 0.1.0
+  language: C++
+  build: cmake
+  license: MIT
+  maintainers:
+    - vgsml
+
+repo:
+  github: hugr-lab/duckdb-acl
+  ref: TBD
+
+docs:
+  hello_world: |
+    -- A gateway prefixes each statement with the principal; the extension resolves the virtual
+    -- catalog, applies row filters and column masks, and hands ordinary SQL to the binder.
+    ACL ROLE 'analyst' SELECT id, amount FROM orders;
+  extended_description: |
+    The extension enforces access control in a `parser_override`: it rewrites the statement before
+    bind, so a principal only ever sees the objects, rows and columns its grants allow. Clients that
+    connect for themselves are served through a door - quack, or the built-in Arrow Flight SQL server
+    reachable by any ADBC or JDBC driver - which turns a JWT into a session and prefixes every
+    statement after that.

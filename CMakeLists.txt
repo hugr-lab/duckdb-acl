@@ -26,15 +26,18 @@ set(EXTENSION_SOURCES
     src/acl_token.cpp
     third_party/p256-m/p256-m.c)
 
-# The Arrow Flight SQL door (specs/045). Opt-in via ACL_FLIGHT=1, because it links Arrow C++ and gRPC -
-# 89 vcpkg ports, measured - and an ordinary build has no reason to pay for a door it does not open.
-# Static targets, as the airport extension does: a loadable extension is dlopen'd RTLD_LOCAL, so what
-# it needs has to be inside it.
+# The Arrow Flight SQL door (specs/045): built by default, because it is what a client with an ADBC or
+# JDBC driver connects to - a feature of the extension rather than an option for people who build it
+# themselves. Static targets, as the airport extension does: a loadable extension is dlopen'd
+# RTLD_LOCAL, so what it needs has to be inside it.
 #
-# Excluded on WASM and MinGW, the way the scanners and quack are. WASM is not a maybe: the door is a
-# gRPC server, and there is nothing there for it to listen on. MinGW is a maybe nobody has tested -
-# Arrow and gRPC through vcpkg are an MSVC story - so it says no rather than failing somewhere deep.
-if(DEFINED ENV{ACL_FLIGHT} AND NOT MINGW AND NOT ${WASM_ENABLED})
+# Excluded on WASM, and only there. The door is a gRPC server and there is nothing in WASM for it to
+# listen on; community-extensions is told the same thing through `excluded_platforms` in
+# packaging/community-extensions/description.yml. MinGW is *not* excluded: `airport` ships Arrow Flight
+# through the same pipeline with only WASM excluded, so it builds there.
+#
+# ACL_NO_FLIGHT=1 leaves it out, for a fast local build; it drops the vcpkg step with it.
+if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_FLIGHT})
     # Arrow, its Flight libraries and gRPC come from the build's own vcpkg manifest tree, found the
     # way every other vcpkg dependency in this repo is found - the toolchain's own wrapper, nothing
     # hand-steered. Steering it by hand was tried at length and each attempt broke something else: a
@@ -72,7 +75,7 @@ endif()
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-if(DEFINED ENV{ACL_FLIGHT} AND NOT MINGW AND NOT ${WASM_ENABLED})
+if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_FLIGHT})
     foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
         target_compile_definitions(${target} PRIVATE ACL_FLIGHT_ENABLED=1)
         target_link_libraries(${target}
