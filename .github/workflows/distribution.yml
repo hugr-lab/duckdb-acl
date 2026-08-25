@@ -17,15 +17,14 @@
 # duckdb's public read-only cache and is merely slow.
 name: Distribution build
 
+# Run it when we ask, and on a release tag. Deliberately not on a schedule: this matrix builds Arrow
+# and gRPC on nine platforms, and a nightly one would spend that on days when nothing changed. The
+# early warning about duckdb `main` is worth having, but it is worth having when someone is looking.
 on:
   workflow_dispatch:
   push:
     tags:
       - 'v*'
-  schedule:
-    # Weekday mornings: duckdb main moves, and we would rather learn that it broke us from a red build
-    # than from a submission.
-    - cron: '17 4 * * 1-5'
 
 concurrency:
   group: distribution-${{ github.ref }}
