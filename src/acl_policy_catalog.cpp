@@ -1542,6 +1542,20 @@ struct CatalogBackend {
 		       Tbl("reference_columns") +
 		       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'to')"
 		       " AS to_columns,"
+		       // The same two, as lists. `string_agg` reads well for a human and for an agent, but a
+		       // consumer that has to *pair* the sides by position cannot get there from a joined
+		       // string - splitting on ', ' breaks on a column name containing one. Flight SQL's
+		       // key RPCs need exactly that pairing (spec 046), so the lists are published beside the
+		       // strings rather than instead of them.
+		       " (SELECT list(rc.\"column\" ORDER BY rc.\"pos\") FROM " +
+		       Tbl("reference_columns") +
+		       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'from'"
+		       " AND rc.\"param\" IS NULL)"
+		       " AS from_column_list,"
+		       " (SELECT list(rc.\"column\" ORDER BY rc.\"pos\") FROM " +
+		       Tbl("reference_columns") +
+		       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'to')"
+		       " AS to_column_list,"
 		       " r.\"to_kind\" AS to_kind, r.\"expr\" AS expression, r.\"cardinality\" AS cardinality,"
 		       " r.\"optional\" AS optional, r.\"join_method\" AS join_method, r.\"comment\" AS comment FROM " +
 		       Tbl("references") + " r WHERE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = r.\"vcat\" AND " +

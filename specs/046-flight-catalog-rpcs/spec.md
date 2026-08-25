@@ -1,6 +1,6 @@
 # Spec 046: the Flight door answers the catalog it is asked about
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-08-25
 - **Author**: hugr-lab
 
@@ -147,16 +147,25 @@ values as `list(... ORDER BY pos)`. Additive, so nothing that reads the surface 
 ### The rows become the protocol's shape, not duckdb's
 
 The response schemas are fixed by Flight SQL — taken from `SqlSchema::GetTablesSchema()` and friends
-rather than written out here, so they cannot drift from the Arrow version we link. The door casts in
-SQL to the duckdb types whose Arrow layout matches (`INTEGER` → `int32`, `UTINYINT` → `uint8`,
-`VARCHAR` → `utf8`) and imports the resulting array *against the protocol's schema*, the same
-`ArrowConverter` path `DoGetStatement` already uses.
+rather than written out here, so they cannot drift from the Arrow version we link.
 
-That works only if the physical layout is what the protocol expects, and two instance settings can
-change it: `arrow_large_buffer_size` turns `utf8` into `large_utf8`, and `produce_arrow_string_view`
-turns it into `string_view`. A catalog answer therefore builds its client properties explicitly
-instead of inheriting the instance's — a client's tree must not depend on how the server was
-configured for something else.
+The batches are built with Arrow's own builders, row by row, rather than by exporting duckdb's Arrow
+form and declaring the protocol's schema over it. Importing would be less code and would quietly
+depend on two instance settings — `arrow_large_buffer_size` turns `utf8` into `large_utf8`,
+`produce_arrow_string_view` turns it into `string_view` — so a client's catalog tree would depend on
+how the server happened to be configured for something else. Building explicitly costs a row loop over
+a listing of tens of rows, removes the question, and gives the exact nullability the protocol asks for.
+Four types cover every catalog column between them (`utf8`, `binary`, `int32`, `uint8`); anything else
+is a mistake worth failing on rather than guessing at.
+
+**A duckdb exception must not reach gRPC.** duckdb throws and Arrow's handler does not catch, so
+anything that escapes arrives at the client as `Unexpected error in RPC handling` — which says nothing
+at all. Found the way these are always found: `include_schema` threw
+`Context does not have a transaction active` (parsing a type name resolves it against the catalog, and
+a user-defined type is a catalog entry) and the client learned only that *something* went wrong. The
+type parsing now runs inside one transaction for the whole listing — which is also the right shape,
+since the schemas a client is handed then describe one consistent view rather than a per-table sample —
+and the boundary converts what still escapes into a `Status` that names it.
 
 ### The ticket is the command
 
@@ -168,6 +177,18 @@ else — `DoGet` composes under whoever fetches, exactly as the statement path d
 
 `GetFlightInfo*` for a catalog command does not run any SQL at all: the schema is a protocol constant,
 so it authenticates, returns the fixed schema and a ticket, and leaves the work to `DoGet`.
+
+**And the endpoint carries no location, deliberately.** Flight's own words are that an empty location
+list means the ticket "can only be redeemed on the current service where the ticket was generated" —
+which is exactly right for a catalog answer, because a catalog answer is the same on every ready node.
+Nodes converge on one policy version (design 009 §3: a node is ready only when it has), so redirecting
+a catalog call would buy a round trip and change nothing. Statements are where routing has something to
+decide; listings are not, and saying so here keeps a future coordinator from having to work it out.
+
+That also keeps "the ticket is the command" true in a cluster rather than only on one node: a catalog
+command names no session and grants nothing, so it is safe to hand to the client whatever the topology
+becomes. The question of what a *statement* ticket must be when a coordinator routes it is spec 045's
+boundary condition, not this spec's.
 
 ### Functions are not tables, and are not answered here
 
@@ -190,9 +211,18 @@ use, and tying it to a Flight RPC that does not exist would put it in the wrong 
 
 ### Where it lives
 
-`src/flight/acl_flight_catalog.cpp` holds the command → SQL mapping and the result → batch mapping;
-`acl_flight_door.cpp` keeps the server class and delegates. The SQL composition is a free function in
-`namespace duckdb::acl` so a C++ test can check the text it produces without a server.
+Three files, and the split is the spec's argument made structural:
+
+- `src/acl_catalog_rpc.cpp` — the command → SQL mapping. It links **no Arrow** and is compiled into
+  every build, door or not, so the composition can be tested without a server and without a build that
+  links Arrow at all.
+- `src/flight/acl_flight_catalog.cpp` — running one of those statements under a session, and the
+  rows → batch mapping. This is the only part that needs Arrow.
+- `src/flight/acl_flight_door.cpp` — the server class, which delegates.
+
+The extension's internals are not exported from `libduckdb`, so the C++ test compiles
+`src/acl_catalog_rpc.cpp` into itself rather than the other way round: widening a symbol's visibility
+so a test can reach it would be letting the test decide the API.
 
 ## Enforcement & security
 
@@ -240,8 +270,9 @@ bootstrap two roles already share:
   reference appears as `GetExportedKeys` of the parent; a reference to a table function returns nothing
 - with no token, every one of them fails the same way a statement does
 
-**Regression** — `test/sql/acl.test` covers the two new `acl_references()` columns, since that surface
-is reachable without a door.
+**Regression** — `test/sql/acl_references.test` covers the two new `acl_references()` columns with a
+two-pair reference, since that surface is reachable without a door and the pairing is the property the
+key RPCs depend on.
 
 ## Alternatives considered
 

@@ -4,5 +4,6 @@
 # ACL_FLIGHT=1 build compiles any of it - so keeping it behind one directory keeps that boundary
 # visible rather than spread through the source list.
 set(ACL_FLIGHT_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/acl_flight_catalog.cpp
     ${CMAKE_CURRENT_LIST_DIR}/acl_flight_door.cpp
     PARENT_SCOPE)
