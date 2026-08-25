@@ -103,12 +103,13 @@ void ListingsAnswerUnderARole(Connection &con) {
 	Check(Joined(schemas) == "c|main", "GetDbSchemas: " + Joined(schemas));
 
 	auto tables = RunAsRole(con, "analyst", BuildCatalogListing(CatalogListing::TABLES, none));
-	Check(Joined(tables) == "c|main|customers|BASE TABLE ; c|main|orders|BASE TABLE",
+	Check(Joined(tables) == "c|main|customers|BASE TABLE ; c|main|orders|BASE TABLE ; c|main|shipments|BASE TABLE",
 	      "GetTables is what the role is granted: " + Joined(tables));
 
 	// the other role is granted one object of the two, and it is not the one above
 	auto other = RunAsRole(con, "narrow", BuildCatalogListing(CatalogListing::TABLES, none));
-	Check(Joined(other) == "c|main|customers|BASE TABLE", "and another role sees its own: " + Joined(other));
+	Check(Joined(other) == "c|main|customers|BASE TABLE ; c|main|shipments|BASE TABLE",
+	      "and another role sees its own: " + Joined(other));
 
 	auto types = RunAsRole(con, "analyst", BuildCatalogListing(CatalogListing::TABLE_TYPES, none));
 	Check(Joined(types) == "BASE TABLE", "GetTableTypes comes from the same rows: " + Joined(types));
@@ -131,7 +132,8 @@ void ColumnsAreOneStatementForEveryTable(Connection &con) {
 	CatalogFilter none;
 	auto columns = RunAsRole(con, "analyst", BuildCatalogListing(CatalogListing::COLUMNS, none));
 	Check(Joined(columns) == "c|main|customers|id|INTEGER ; c|main|customers|name|VARCHAR ; "
-	                         "c|main|orders|id|INTEGER ; c|main|orders|customer_id|INTEGER",
+	                         "c|main|orders|id|INTEGER ; c|main|orders|customer_id|INTEGER ; "
+	                         "c|main|shipments|id|INTEGER ; c|main|shipments|customer_id|INTEGER",
 	      "every column of every table, in order, in one statement: " + Joined(columns));
 	// `secret` is not granted to this role, so it is absent here - which is the whole point: what the
 	// client is told it will receive is what it will receive (spec 026)
@@ -150,7 +152,7 @@ void ReferencesAreTheForeignKeys(Connection &con) {
 	      "imported keys of the referencing table: " + Joined(imported));
 
 	auto exported = RunAsRole(con, "analyst", BuildKeyListing(KeyListing::EXPORTED, customers, none));
-	Check(Joined(exported) == Joined(imported), "the same reference is the parent's exported key");
+	Check(!exported.empty() && exported[0] == imported[0], "the same reference is the parent's exported key");
 
 	// the other direction is not a key of this table
 	auto backwards = RunAsRole(con, "analyst", BuildKeyListing(KeyListing::IMPORTED, customers, none));
@@ -158,6 +160,33 @@ void ReferencesAreTheForeignKeys(Connection &con) {
 
 	auto cross = RunAsRole(con, "analyst", BuildKeyListing(KeyListing::CROSS, customers, orders));
 	Check(Joined(cross) == Joined(imported), "cross reference names both ends: " + Joined(cross));
+}
+
+//! The two review findings, pinned. A catalog-qualified TableRef is what JDBC/ADBC clients send
+//! routinely, and neither test sent one; exported keys must group by the referencing table, which a
+//! one-reference fixture cannot distinguish from any other order. The names interleave against the
+//! tables (a_ref on shipments, orders_customer on orders), so name-order and table-order disagree.
+void CatalogQualifiedRefsAndExportOrder(Connection &con) {
+	CatalogTableRef customers;
+	customers.has_catalog = true;
+	customers.catalog = "c";
+	customers.table = "customers";
+	CatalogTableRef none;
+
+	auto exported = RunAsRole(con, "analyst", BuildKeyListing(KeyListing::EXPORTED, customers, none));
+	Check(exported.size() == 2, "a catalog-qualified ref binds and answers");
+	// two children, names interleaved against the tables: by name a_ref (shipments) would come first,
+	// by referencing table orders does - so this passes only with the proto's ordering
+	Check(exported.size() == 2 && exported[0].find("|orders|") != string::npos &&
+	          exported[1].find("|shipments|") != string::npos,
+	      "exported keys group by the referencing table: " + Joined(exported));
+
+	CatalogTableRef wrong;
+	wrong.has_catalog = true;
+	wrong.catalog = "elsewhere";
+	wrong.table = "customers";
+	auto empty = RunAsRole(con, "analyst", BuildKeyListing(KeyListing::EXPORTED, wrong, none));
+	Check(empty.empty(), "a wrong catalog matches nothing rather than erroring");
 }
 
 void WhatCannotBeAKeyIsNotOne(Connection &con) {
@@ -192,6 +221,11 @@ int main() {
 	          " ON (customer_id = id) CARDINALITY many_to_one");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL REFERENCE c.by_expression FROM orders TO customers"
 	          " ON EXPRESSION 'orders.customer_id > customers.id'");
+	// a second child of customers, so exported keys have an order worth asserting; a_ref sorts before
+	// orders_customer by name but after it by referencing table - the orderings disagree on purpose
+	Exec(con, "CREATE TABLE phys.main.shipments(id INTEGER, customer_id INTEGER)");
+	Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.shipments AS phys.main.shipments");
+	Exec(con, "ACL ADMIN CREATE VIRTUAL REFERENCE c.a_ref FROM shipments TO customers ON (customer_id = id)");
 	Exec(con, "ACL ADMIN CREATE ROLE analyst");
 	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN COLUMNS (id, customer_id, name)");
 	Exec(con, "ACL ADMIN CREATE ROLE narrow");
@@ -206,6 +240,7 @@ int main() {
 		Scenario("filters-narrow", [&]() { FiltersNarrowTheListing(con); });
 		Scenario("columns-in-one-statement", [&]() { ColumnsAreOneStatementForEveryTable(con); });
 		Scenario("references-are-keys", [&]() { ReferencesAreTheForeignKeys(con); });
+		Scenario("catalog-qualified-and-export-order", [&]() { CatalogQualifiedRefsAndExportOrder(con); });
 		Scenario("not-every-reference-is-a-key", [&]() { WhatCannotBeAKeyIsNotOne(con); });
 	});
 }

@@ -39,7 +39,10 @@ string TablePathsCte() {
 void AppendTableRef(CatalogQuery &query, vector<string> &conditions, const CatalogTableRef &table,
                     const string &alias) {
 	if (table.has_catalog) {
-		conditions.push_back(alias + ".vcat = " + Bind(query, Value(table.catalog)));
+		// the catalog of a reference is the row's own `vcat` - `alias` is a VARCHAR path column, and
+		// `<path>.vcat` binds as a struct extraction and fails. Found by review: JDBC/ADBC clients
+		// pass the catalog routinely, and neither test did.
+		conditions.push_back("r.vcat = " + Bind(query, Value(table.catalog)));
 	}
 	auto schema = table.schema.empty() ? string("main") : table.schema;
 	auto path = schema == "main" ? table.table : schema + "." + table.table;
@@ -174,8 +177,15 @@ CatalogQuery BuildKeyListing(KeyListing listing, const CatalogTableRef &table, c
 	            " 3::UTINYINT AS update_rule, 3::UTINYINT AS delete_rule"
 	            " FROM pairs"
 	            " JOIN acl_table_paths pk ON pk.table_catalog = pairs.vcat AND pk.path = pairs.to_object"
-	            " JOIN acl_table_paths fk ON fk.table_catalog = pairs.vcat AND fk.path = pairs.from_object"
-	            " ORDER BY pk_catalog_name, pk_db_schema_name, pk_table_name, pairs.name, key_sequence";
+	            " JOIN acl_table_paths fk ON fk.table_catalog = pairs.vcat AND fk.path = pairs.from_object" +
+	            // The proto fixes the ordering per listing, and they differ: exported keys group by the
+	            // *referencing* table (a driver folds consecutive rows into per-table key sets), the
+	            // other two by the referenced one. One ORDER BY for all three passed a one-reference
+	            // test and was wrong for exported keys the moment a parent had two children.
+	            (listing == KeyListing::EXPORTED
+	                 ? string(" ORDER BY fk_catalog_name, fk_db_schema_name, fk_table_name, fk_key_name, key_sequence")
+	                 : string(" ORDER BY pk_catalog_name, pk_db_schema_name, pk_table_name, pk_key_name,"
+	                          " key_sequence"));
 	return query;
 }
 

@@ -251,7 +251,7 @@ there is nothing to escape and nothing to get wrong.
 
 ## Testing
 
-**C++ (`test/cpp/test_acl_flight_catalog_sql.cpp`)** — the composition is a pure function, so it is
+**C++ (`test/cpp/test_acl_catalog_rpc.cpp`)** — the composition is a pure function, so it is
 checked without a server: that each command produces the expected statement, that a null filter and an
 empty-string filter differ, that `table_types` becomes an `IN` list, and that a pattern appears as a
 parameter reference rather than as text.
