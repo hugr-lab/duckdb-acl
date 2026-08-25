@@ -17,15 +17,14 @@
 # duckdb's public read-only cache and is merely slow.
 name: Distribution build
 
+# Run it when we ask, and on a release tag. Deliberately not on a schedule: this matrix builds Arrow
+# and gRPC on nine platforms, and a nightly one would spend that on days when nothing changed. The
+# early warning about duckdb `main` is worth having, but it is worth having when someone is looking.
 on:
   workflow_dispatch:
   push:
     tags:
       - 'v*'
-  schedule:
-    # Weekday mornings: duckdb main moves, and we would rather learn that it broke us from a red build
-    # than from a submission.
-    - cron: '17 4 * * 1-5'
 
 concurrency:
   group: distribution-${{ github.ref }}
@@ -43,6 +42,11 @@ jobs:
       ci_tools_version: main
       # No exclusions: WASM gets the extension without the door, because the Arrow dependency carries
       # `"platform": "!wasm32"` and CMakeLists guards on WASM_ENABLED (specs/045).
+      #
+      # macOS ships bison 2.3, which cannot parse thrift's grammar - and thrift comes with Arrow.
+      # This asks for a modern bison and flex; the same string goes into description.yml as
+      # `requires_toolchains`, which is where `airport` carries it too.
+      extra_toolchains: parser_tools
       vcpkg_binary_sources: ${{ vars.VCPKG_BINARY_SOURCES }}
     secrets:
       VCPKG_CACHING_AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}

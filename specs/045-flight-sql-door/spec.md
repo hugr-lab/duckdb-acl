@@ -73,6 +73,38 @@ anything of Arrow's.
 Cache: `docs/vcpkg-cache-r2.md`. Without it every platform pays the full Arrow build; with it, `airport`
 - which links the same libraries - completes its whole matrix in 21 minutes.
 
+**Measured, once it ran.** The first cold arm64 build took 84 minutes, of which gRPC was 43 - Arrow
+itself only 3.9. The second, against a warmed R2 bucket, took 20: `Restored 94 package(s) from AWS`,
+gRPC down to 11 seconds. So the cache is not an optimisation of a build that would otherwise be slow;
+it is the difference between a matrix that fits in a coffee break and one that does not.
+
+### What their pipeline does to a Makefile, which is not what a Makefile expects
+
+Four runs were needed before a platform finished, and none of the four failed on our code. Every one
+failed on an assumption about *when* and *where* `make` is invoked, and all four are worth writing
+down because nothing in the repository would have revealed them.
+
+- **They call our targets in phases we do not control.** `checkout` runs `make set_duckdb_version`;
+  `setup` runs `make configure_ci` (which in extension-ci-tools is `@echo "... is skipped ..."` and
+  configures nothing); `test` runs `make test_release`. A `$(error)` guard at parse time fires on all
+  of them. The first fix named the exceptions and was wrong again one phase later - the list is theirs,
+  not ours, and it grows without telling us. The guard now names the goals that *do* configure cmake
+  (`all release debug reldebug relassert`, the three wasm targets) and lets everything else through.
+- **On linux there is no vcpkg beside the source at all.** `setup_linux` never installs one: the build
+  runs inside a container carrying its own `/vcpkg`, and the `VCPKG_TOOLCHAIN_PATH` in the job
+  environment names a host path that will never exist.
+- **`test_release` runs twice over the same mounted tree** - once in that container as root, then
+  again on the host as `runner`. Our C++ tests were chained to it, and the second pass could not
+  create `build/test/*.out` because the first had left root-owned files there. Four passing tests were
+  reported as four failures, with the *previous* run's successful output printed underneath them. They
+  now capture to `mktemp` and step aside when `LINUX_CI_IN_DOCKER=0`: the binaries carry an rpath
+  naming a container path, so the host pass was never one they could join.
+- **macOS ships bison 2.3** - 2006, the last release under GPLv2 - and thrift, which Arrow pulls in,
+  has a grammar it cannot parse. `extra_toolchains: parser_tools` installs a current one, and vcpkg
+  looks for it in the keg-only path homebrew uses rather than on `PATH`. `airport` carries the same
+  `requires_toolchains: parser_tools`, for the same dependency - our answer was already written in the
+  extension we had been reading all along.
+
 ### How it is distributed, which decides how it is built
 
 **The door ships in the extension, through duckdb/community-extensions, on every platform that can
