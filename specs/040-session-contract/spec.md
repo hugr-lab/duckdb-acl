@@ -66,6 +66,9 @@ handle to record, per `DatabaseInstance`, behind a mutex, swept on close and on 
 shaped so the catalog and function-driver backends from `design/010-serving-clients` §4.1 can follow
 without changing the contract — that is what lets a cluster own session state without a private
 channel. Not in this spec: the shared backends, and the portability predicate they exist for.
+(Update, 2026-08-26: likely not in *any* spec - in the coordinator topology of design 010 §10.4,
+statements always pass through the coordinator, workers verify the token per call, and a pinned
+session is the coordinator's own routing row - so no shared session state is needed anywhere.)
 
 ## Enforcement & security
 
@@ -156,3 +159,4 @@ process not seeing each other's sessions.
   closed one when it is closed — but a door that opens sessions and then forgets them leaves entries
   in memory until something asks for each. Bounded in practice by a door closing on disconnect;
   unbounded if one does not. A periodic sweep, or a cap, belongs with the shared backends.
+  (Both landed instance-local instead: spec 044's sweeper and caps - the shared backends were not needed for this either.)
