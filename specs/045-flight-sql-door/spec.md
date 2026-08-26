@@ -70,8 +70,8 @@ CLAUDE.md says plainly that we depend on parser APIs not yet in a stable release
 this workflow is the early warning for that, and the reason submission waits for 2.0 rather than for
 anything of Arrow's.
 
-Cache: `docs/vcpkg-cache-r2.md`. Without it every platform pays the full Arrow build; with it, `airport`
-- which links the same libraries - completes its whole matrix in 21 minutes.
+Cache: `docs/vcpkg-cache-r2.md`. Without it every platform pays the full Arrow build; with it,
+`airport` - which links the same libraries - completes its whole matrix in 21 minutes.
 
 **Measured, once it ran.** The first cold arm64 build took 84 minutes, of which gRPC was 43 - Arrow
 itself only 3.9. The second, against a warmed R2 bucket, took 20: `Restored 94 package(s) from AWS`,
@@ -233,6 +233,19 @@ client's *own* SQL against it, unprefixed. Not the composed statement, for a rea
 it: the prefix names a session, and the session must be alive when the statement is **parsed**, which
 happens later and more than once. So each use composes afresh, under whoever is fetching — which also
 means a ticket that reached another principal returns *their* slice rather than the asker's.
+
+**And that is a boundary condition, not a free choice.** Holding the client's own SQL in a ticket is
+safe *because the token is the authority*: every call re-verifies it, so a ticket is a convenience and
+not a capability, and the worst a tampered one can do is run SQL the same client could have sent
+anyway. Design 010's scale-out notes say the opposite — "never raw SQL in a ticket" — and they are
+right in the topology they describe, where a coordinator decides authorization once and the ticket
+carries the right to collect a result. The two are the same rule seen from either side of one
+question: **is the bearer of authority the token or the ticket?** While it is the token, this shape is
+correct and the door happens to cluster almost for free — a ticket that carried its statement rather
+than an id into node memory would be redeemable on any node, since every node verifies the JWT offline
+and reads the same policy. The moment a ticket becomes the authority, the SQL must come out of it. So
+this is written down as a condition rather than a decision: whoever changes the first half must change
+the second.
 
 **TLS is ours here**, unlike quack — and until it lands the door **binds localhost only**, refusing any
 other address rather than handing out data in the clear over a protocol meant to cross machines. Flight is meant to be exposed, Arrow supports TLS directly, and a

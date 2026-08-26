@@ -11,6 +11,9 @@
 
 #include "acl_flight_door.hpp"
 
+#include "acl_flight_catalog.hpp"
+#include "duckdb/common/error_data.hpp"
+
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -144,36 +147,34 @@ public:
 	arrow::Result<std::unique_ptr<flight::FlightInfo>>
 	GetFlightInfoStatement(const flight::ServerCallContext &context, const flightsql::StatementQuery &command,
 	                       const flight::FlightDescriptor &descriptor) override {
-		string handle;
-		ARROW_ASSIGN_OR_RAISE(handle, SessionFor(context));
+		return UnderSession(context, [&](const string &handle) -> arrow::Result<std::unique_ptr<flight::FlightInfo>> {
+			auto prefixed = state->store->SessionSql(handle, command.query);
+			if (prefixed.empty()) {
+				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
+			}
 
-		auto prefixed = state->store->SessionSql(handle, command.query);
-		if (prefixed.empty()) {
-			state->store->SessionClose(handle);
-			return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
-		}
+			// The schema has to be known before the rows are fetched, so the statement is prepared once
+			// here. Preparing also means a statement the ACL refuses fails now, with the client still
+			// waiting on GetFlightInfo, rather than half way through a stream.
+			//
+			// The session stays alive across this: the prefix is resolved when the statement is
+			// *parsed*, so closing it any earlier makes the very statement we just composed
+			// unresolvable.
+			Connection con(state->db);
+			auto prepared = con.Prepare(prefixed);
+			if (prepared->HasError()) {
+				return StatusFromDuck("acl", prepared->GetError());
+			}
+			std::shared_ptr<arrow::Schema> schema;
+			ARROW_ASSIGN_OR_RAISE(schema, SchemaOf(*prepared));
 
-		// The schema has to be known before the rows are fetched, so the statement is prepared once
-		// here. Preparing also means a statement the ACL refuses fails now, with the client still
-		// waiting on GetFlightInfo, rather than half way through a stream.
-		//
-		// The session stays alive across this: the prefix is resolved when the statement is *parsed*,
-		// so closing it any earlier makes the very statement we just composed unresolvable.
-		Connection con(state->db);
-		auto prepared = con.Prepare(prefixed);
-		state->store->SessionClose(handle);
-		if (prepared->HasError()) {
-			return StatusFromDuck("acl", prepared->GetError());
-		}
-		std::shared_ptr<arrow::Schema> schema;
-		ARROW_ASSIGN_OR_RAISE(schema, SchemaOf(*prepared));
-
-		auto ticket_id = state->PutTicket(command.query);
-		ARROW_ASSIGN_OR_RAISE(auto ticket, flightsql::CreateStatementQueryTicket(ticket_id));
-		std::vector<flight::FlightEndpoint> endpoints {
-		    flight::FlightEndpoint {flight::Ticket {std::move(ticket)}, {}, std::nullopt, {}}};
-		ARROW_ASSIGN_OR_RAISE(auto info, flight::FlightInfo::Make(*schema, descriptor, endpoints, -1, -1, false));
-		return std::make_unique<flight::FlightInfo>(std::move(info));
+			auto ticket_id = state->PutTicket(command.query);
+			ARROW_ASSIGN_OR_RAISE(auto ticket, flightsql::CreateStatementQueryTicket(ticket_id));
+			std::vector<flight::FlightEndpoint> endpoints {
+			    flight::FlightEndpoint {flight::Ticket {std::move(ticket)}, {}, std::nullopt, {}}};
+			ARROW_ASSIGN_OR_RAISE(auto info, flight::FlightInfo::Make(*schema, descriptor, endpoints, -1, -1, false));
+			return std::make_unique<flight::FlightInfo>(std::move(info));
+		});
 	}
 
 	//! Where the rows go out. The statement behind this ticket was prefixed when the ticket was made,
@@ -183,48 +184,265 @@ public:
 		// A ticket is unguessable but not secret - it travels to the client and through whatever sits
 		// between. Re-checking the caller's token means a ticket seen by somebody else is not enough on
 		// its own, and it costs a JWT verification.
-		string caller;
-		ARROW_ASSIGN_OR_RAISE(caller, SessionFor(context));
+		return UnderSession(
+		    context, [&](const string &caller) -> arrow::Result<std::unique_ptr<flight::FlightDataStream>> {
+			    string query;
+			    if (!state->TakeTicket(string(command.statement_handle), query)) {
+				    return arrow::Status::KeyError("acl: unknown or already fetched ticket");
+			    }
+			    // Composed under whoever is fetching, not whoever asked - so a ticket that reached another
+			    // principal returns *their* slice rather than the asker's, and a ticket alone is never a
+			    // way to read as somebody else.
+			    auto prefixed = state->store->SessionSql(caller, query);
+			    if (prefixed.empty()) {
+				    return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
+			    }
+			    Connection con(state->db);
+			    auto result = con.Query(prefixed);
+			    if (result->HasError()) {
+				    return StatusFromDuck("acl", result->GetError());
+			    }
+			    std::shared_ptr<arrow::Schema> schema;
+			    ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result->GetTypes(), result->GetNames()));
 
-		string query;
-		if (!state->TakeTicket(string(command.statement_handle), query)) {
-			state->store->SessionClose(caller);
-			return arrow::Status::KeyError("acl: unknown or already fetched ticket");
-		}
-		// Composed under whoever is fetching, not whoever asked - so a ticket that reached another
-		// principal returns *their* slice rather than the asker's, and a ticket alone is never a way
-		// to read as somebody else.
-		auto prefixed = state->store->SessionSql(caller, query);
-		if (prefixed.empty()) {
-			state->store->SessionClose(caller);
-			return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
-		}
-		Connection con(state->db);
-		auto result = con.Query(prefixed);
-		state->store->SessionClose(caller);
-		if (result->HasError()) {
-			return StatusFromDuck("acl", result->GetError());
-		}
-		std::shared_ptr<arrow::Schema> schema;
-		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result->GetTypes(), result->GetNames()));
+			    std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+			    auto properties = con.context->GetClientProperties();
+			    while (true) {
+				    auto chunk = result->Fetch();
+				    if (!chunk || chunk->size() == 0) {
+					    break;
+				    }
+				    ArrowArray array;
+				    ArrowConverter::ToArrowArray(*chunk, &array, properties, {});
+				    ARROW_ASSIGN_OR_RAISE(auto batch, arrow::ImportRecordBatch(&array, schema));
+				    batches.push_back(std::move(batch));
+			    }
+			    ARROW_ASSIGN_OR_RAISE(auto reader, arrow::RecordBatchReader::Make(std::move(batches), schema));
+			    return std::make_unique<flight::RecordBatchStream>(std::move(reader));
+		    });
+	}
 
-		std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
-		auto properties = con.context->GetClientProperties();
-		while (true) {
-			auto chunk = result->Fetch();
-			if (!chunk || chunk->size() == 0) {
-				break;
-			}
-			ArrowArray array;
-			ArrowConverter::ToArrowArray(*chunk, &array, properties, {});
-			ARROW_ASSIGN_OR_RAISE(auto batch, arrow::ImportRecordBatch(&array, schema));
-			batches.push_back(std::move(batch));
+	//! --- the catalog RPCs (spec 046) -------------------------------------------------------------
+	//!
+	//! Every one of them is a statement the principal could have written. The door composes SQL over
+	//! the surfaces spec 035 already replaces, runs it through the same session prefix, and reshapes
+	//! the rows into the schema the protocol fixes. It holds a mapping, not a policy - so no bug here
+	//! can widen what a role sees, because there is no path from here to the physical catalog.
+
+	arrow::Result<std::unique_ptr<flight::FlightInfo>>
+	GetFlightInfoCatalogs(const flight::ServerCallContext &context,
+	                      const flight::FlightDescriptor &descriptor) override {
+		return CatalogInfo(context, flightsql::SqlSchema::GetCatalogsSchema(), descriptor);
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
+	DoGetCatalogs(const flight::ServerCallContext &context) override {
+		return CatalogStream(context, flightsql::SqlSchema::GetCatalogsSchema(),
+		                     BuildCatalogListing(CatalogListing::CATALOGS, CatalogFilter()));
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightInfo>>
+	GetFlightInfoSchemas(const flight::ServerCallContext &context, const flightsql::GetDbSchemas &command,
+	                     const flight::FlightDescriptor &descriptor) override {
+		return CatalogInfo(context, flightsql::SqlSchema::GetDbSchemasSchema(), descriptor);
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
+	DoGetDbSchemas(const flight::ServerCallContext &context, const flightsql::GetDbSchemas &command) override {
+		return CatalogStream(context, flightsql::SqlSchema::GetDbSchemasSchema(),
+		                     BuildCatalogListing(CatalogListing::DB_SCHEMAS, FilterFrom(command)));
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightInfo>>
+	GetFlightInfoTables(const flight::ServerCallContext &context, const flightsql::GetTables &command,
+	                    const flight::FlightDescriptor &descriptor) override {
+		return CatalogInfo(context,
+		                   command.include_schema ? flightsql::SqlSchema::GetTablesSchemaWithIncludedSchema()
+		                                          : flightsql::SqlSchema::GetTablesSchema(),
+		                   descriptor);
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>> DoGetTables(const flight::ServerCallContext &context,
+	                                                                     const flightsql::GetTables &command) override {
+		auto filter = FilterFrom(command);
+		if (!command.include_schema) {
+			return CatalogStream(context, flightsql::SqlSchema::GetTablesSchema(),
+			                     BuildCatalogListing(CatalogListing::TABLES, filter));
 		}
+		// With schemas: two statements, not one per table. The second is the columns listing under the
+		// same filters, which describes what the role actually reads - so a hidden column is absent
+		// from the schema a client is promised, and a masked one carries the mask's type (spec 026).
+		auto schema = flightsql::SqlSchema::GetTablesSchemaWithIncludedSchema();
+		return CatalogStream(
+		    context, schema, [&](const string &handle) -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
+			    ARROW_ASSIGN_OR_RAISE(auto tables,
+			                          RunCatalogQuery(*state->store, state->db, handle,
+			                                          BuildCatalogListing(CatalogListing::TABLES, filter)));
+			    ARROW_ASSIGN_OR_RAISE(auto columns,
+			                          RunCatalogQuery(*state->store, state->db, handle,
+			                                          BuildCatalogListing(CatalogListing::COLUMNS, filter)));
+			    Connection con(state->db);
+			    ARROW_ASSIGN_OR_RAISE(auto serialized, SchemasFor(*con.context, *tables, *columns));
+			    return BatchFrom(schema, *tables, &serialized);
+		    });
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightInfo>>
+	GetFlightInfoTableTypes(const flight::ServerCallContext &context,
+	                        const flight::FlightDescriptor &descriptor) override {
+		return CatalogInfo(context, flightsql::SqlSchema::GetTableTypesSchema(), descriptor);
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
+	DoGetTableTypes(const flight::ServerCallContext &context) override {
+		return CatalogStream(context, flightsql::SqlSchema::GetTableTypesSchema(),
+		                     BuildCatalogListing(CatalogListing::TABLE_TYPES, CatalogFilter()));
+	}
+
+	//! Empty, and deliberately. Spec 035 decided that a primary key is a property of the *physical*
+	//! table and not a fact about the virtual one; answering it here from a different surface would
+	//! contradict that rather than fill the gap. The way to fill it is a declared virtual key, the way
+	//! spec 022 declared references - in the backlog, not smuggled in as a physical constraint.
+	arrow::Result<std::unique_ptr<flight::FlightInfo>>
+	GetFlightInfoPrimaryKeys(const flight::ServerCallContext &context, const flightsql::GetPrimaryKeys &command,
+	                         const flight::FlightDescriptor &descriptor) override {
+		return CatalogInfo(context, flightsql::SqlSchema::GetPrimaryKeysSchema(), descriptor);
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
+	DoGetPrimaryKeys(const flight::ServerCallContext &context, const flightsql::GetPrimaryKeys &command) override {
+		auto schema = flightsql::SqlSchema::GetPrimaryKeysSchema();
+		return CatalogStream(context, schema, [&](const string &) { return EmptyBatch(schema); });
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightInfo>>
+	GetFlightInfoImportedKeys(const flight::ServerCallContext &context, const flightsql::GetImportedKeys &command,
+	                          const flight::FlightDescriptor &descriptor) override {
+		return CatalogInfo(context, flightsql::SqlSchema::GetImportedKeysSchema(), descriptor);
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
+	DoGetImportedKeys(const flight::ServerCallContext &context, const flightsql::GetImportedKeys &command) override {
+		return CatalogStream(context, flightsql::SqlSchema::GetImportedKeysSchema(),
+		                     BuildKeyListing(KeyListing::IMPORTED, TableRefFrom(command.table_ref), CatalogTableRef()));
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightInfo>>
+	GetFlightInfoExportedKeys(const flight::ServerCallContext &context, const flightsql::GetExportedKeys &command,
+	                          const flight::FlightDescriptor &descriptor) override {
+		return CatalogInfo(context, flightsql::SqlSchema::GetExportedKeysSchema(), descriptor);
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
+	DoGetExportedKeys(const flight::ServerCallContext &context, const flightsql::GetExportedKeys &command) override {
+		return CatalogStream(context, flightsql::SqlSchema::GetExportedKeysSchema(),
+		                     BuildKeyListing(KeyListing::EXPORTED, TableRefFrom(command.table_ref), CatalogTableRef()));
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightInfo>>
+	GetFlightInfoCrossReference(const flight::ServerCallContext &context, const flightsql::GetCrossReference &command,
+	                            const flight::FlightDescriptor &descriptor) override {
+		return CatalogInfo(context, flightsql::SqlSchema::GetCrossReferenceSchema(), descriptor);
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
+	DoGetCrossReference(const flight::ServerCallContext &context,
+	                    const flightsql::GetCrossReference &command) override {
+		return CatalogStream(
+		    context, flightsql::SqlSchema::GetCrossReferenceSchema(),
+		    BuildKeyListing(KeyListing::CROSS, TableRefFrom(command.pk_table_ref), TableRefFrom(command.fk_table_ref)));
+	}
+
+private:
+	//! A catalog answer needs no SQL to describe itself: its schema is a protocol constant. So this
+	//! authenticates - nobody lists anything without a live token - and leaves the work to `DoGet`.
+	//!
+	//! The endpoint carries **no location**, and that is a decision rather than an omission. Flight's
+	//! own words are that an empty location list means the ticket "can only be redeemed on the current
+	//! service where the ticket was generated", which is right for a listing: every ready node answers
+	//! it identically, so redirecting one would buy a round trip and change nothing. The ticket is the
+	//! command itself - it names no session and grants nothing - so nothing is remembered between the
+	//! two calls and no ticket registry is touched.
+	arrow::Result<std::unique_ptr<flight::FlightInfo>> CatalogInfo(const flight::ServerCallContext &context,
+	                                                               const std::shared_ptr<arrow::Schema> &schema,
+	                                                               const flight::FlightDescriptor &descriptor) {
+		return UnderSession(context, [&](const string &) -> arrow::Result<std::unique_ptr<flight::FlightInfo>> {
+			std::vector<flight::FlightEndpoint> endpoints {
+			    flight::FlightEndpoint {flight::Ticket {descriptor.cmd}, {}, std::nullopt, {}}};
+			ARROW_ASSIGN_OR_RAISE(auto info, flight::FlightInfo::Make(*schema, descriptor, endpoints, -1, -1, false));
+			return std::make_unique<flight::FlightInfo>(std::move(info));
+		});
+	}
+
+	//! A catalog answer: whatever `produce` builds under the caller's session, as one stream in the
+	//! protocol's schema. The two-statement `include_schema` path and the one-statement everything
+	//! else share this skeleton rather than each carrying a copy of the open-run-close discipline.
+	template <class Produce>
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>> CatalogStream(const flight::ServerCallContext &context,
+	                                                                       const std::shared_ptr<arrow::Schema> &schema,
+	                                                                       Produce produce) {
+		return UnderSession(context,
+		                    [&](const string &handle) -> arrow::Result<std::unique_ptr<flight::FlightDataStream>> {
+			                    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::RecordBatch> batch, produce(handle));
+			                    return StreamOf(schema, std::move(batch));
+		                    });
+	}
+
+	//! One statement, under the caller's own session, shaped into the protocol's schema.
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>> CatalogStream(const flight::ServerCallContext &context,
+	                                                                       const std::shared_ptr<arrow::Schema> &schema,
+	                                                                       const CatalogQuery &query) {
+		return CatalogStream(
+		    context, schema, [&](const string &handle) -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
+			    ARROW_ASSIGN_OR_RAISE(auto rows, RunCatalogQuery(*state->store, state->db, handle, query));
+			    return BatchFrom(schema, *rows, nullptr);
+		    });
+	}
+
+	static arrow::Result<std::unique_ptr<flight::FlightDataStream>>
+	StreamOf(const std::shared_ptr<arrow::Schema> &schema, std::shared_ptr<arrow::RecordBatch> batch) {
+		std::vector<std::shared_ptr<arrow::RecordBatch>> batches {std::move(batch)};
 		ARROW_ASSIGN_OR_RAISE(auto reader, arrow::RecordBatchReader::Make(std::move(batches), schema));
 		return std::make_unique<flight::RecordBatchStream>(std::move(reader));
 	}
 
-private:
+	//! A session that closes itself, whichever way the call leaves. Sessions here are opened and closed
+	//! inside one RPC (see SessionFor); the one way to leak one was a C++ exception between the two,
+	//! and this is what makes that impossible rather than merely unlikely.
+	struct SessionScope {
+		SessionScope(PolicyStore &store_p, string handle_p) : store(store_p), handle(std::move(handle_p)) {
+		}
+		~SessionScope() {
+			store.SessionClose(handle);
+		}
+		PolicyStore &store;
+		string handle;
+	};
+
+	//! The boundary every RPC crosses: authenticate, run `body` under the session, close the session,
+	//! and let no C++ exception out.
+	//!
+	//! The last clause is the reason this exists. duckdb reports through exceptions and gRPC's handler
+	//! catches everything into one message - "Unexpected error in RPC handling" - which tells a client
+	//! nothing and used to skip SessionClose on the way past. Two of the throws are not even ours to
+	//! avoid: SessionOpen resolves an issuer's keys before it verifies anything, and a JWKS document
+	//! that cannot be read throws from under SessionFor; the Arrow converters throw on a type they do
+	//! not carry. Every RPC now runs inside one try, so what escapes is a Status that names itself, and
+	//! the session is closed by the scope's destructor either way. This is the same boundary the
+	//! statement RPCs of spec 045 needed and did not have.
+	template <class Body>
+	auto UnderSession(const flight::ServerCallContext &context, Body body) -> decltype(body(string())) {
+		try {
+			string handle;
+			ARROW_ASSIGN_OR_RAISE(handle, SessionFor(context));
+			SessionScope scope(*state->store, handle);
+			return body(handle);
+		} catch (std::exception &ex) {
+			// duckdb's what() is a JSON envelope; ErrorData gives the message a person wrote
+			return StatusFromDuck("acl", ErrorData(ex).Message());
+		}
+	}
+
 	//! The caller's session, from the token this very call carries - and from nothing else.
 	//!
 	//! An earlier cut remembered the handle against the Flight peer and let a call without a token use

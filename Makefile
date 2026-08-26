@@ -58,7 +58,9 @@ TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,build/test/%,$(TEST_CPP_SOURCES))
 
 # match the release archives (-O2 -DNDEBUG), so D_ASSERT is compiled out of the test TUs too
 TEST_CPP_FLAGS := -std=c++17 -O2 -DNDEBUG -pthread
-TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include
+# `src/include` so a test can reach a seam the extension exposes to itself - spec 046's catalog
+# statement composition is a free function, and checking the text it produces needs its header.
+TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include
 
 # Link against the shared libduckdb, exactly like duckdb's own unittest: it already carries the
 # statically linked extensions (acl, core_functions, ... and the scanners of an integration build)
@@ -70,9 +72,15 @@ TEST_CPP_DUCKDB_LIB := build/release/src/libduckdb.so
 endif
 TEST_CPP_LINK = -L build/release/src -lduckdb -Wl,-rpath,$(abspath build/release/src)
 
+# A test may need one of the extension's own translation units compiled into it. The extension's
+# internals are not exported from libduckdb, and widening their visibility so a test could reach them
+# would be the wrong way round - the test links the source instead. (spec 046)
+build/test/test_acl_catalog_rpc: src/acl_catalog_rpc.cpp
+build/test/test_acl_catalog_rpc: TEST_CPP_EXTRA := src/acl_catalog_rpc.cpp
+
 build/test/%: test/cpp/%.cpp test/cpp/acl_test_util.hpp $(TEST_CPP_DUCKDB_LIB)
 	@mkdir -p build/test
-	$(CXX) $(TEST_CPP_FLAGS) $(TEST_CPP_INCLUDES) $< $(TEST_CPP_LINK) -o $@
+	$(CXX) $(TEST_CPP_FLAGS) $(TEST_CPP_INCLUDES) $< $(TEST_CPP_EXTRA) $(TEST_CPP_LINK) -o $@
 
 # Deliberately NOT depending on `release`: in the distribution CI the build runs inside a docker
 # container and the tests on the host, so re-triggering cmake against the container-made cache fails

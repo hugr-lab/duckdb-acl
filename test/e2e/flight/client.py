@@ -14,18 +14,85 @@ def varint(n):
         if not n:
             return out
 
-def statement_query(sql: str) -> bytes:
-    """An Any-wrapped CommandStatementQuery, encoded by hand - pyarrow ships Flight but not Flight SQL."""
-    inner = b"\x0a" + varint(len(sql)) + sql.encode()
-    url = b"type.googleapis.com/arrow.flight.protocol.sql.CommandStatementQuery"
-    return b"\x0a" + varint(len(url)) + url + b"\x12" + varint(len(inner)) + inner
+def field(number: int, payload: bytes) -> bytes:
+    """One length-delimited protobuf field."""
+    return bytes([(number << 3) | 2]) + varint(len(payload)) + payload
 
-uri, sql = sys.argv[1], sys.argv[2]
+
+def text(number: int, value: str) -> bytes:
+    return field(number, value.encode())
+
+
+def flag(number: int, value: bool) -> bytes:
+    return bytes([(number << 3) | 0]) + varint(1 if value else 0)
+
+
+def command(name: str, inner: bytes) -> bytes:
+    """An Any-wrapped Flight SQL command, encoded by hand - pyarrow ships Flight but not Flight SQL.
+
+    That is a feature of this test rather than a shortcut: nothing about the exchange is taken on
+    trust from a library that shares our assumptions, and a field number we got wrong shows up as a
+    filter that did not filter rather than as a silent agreement between two halves of ourselves.
+
+    The numbers below are checked twice over: the assertions in run.sh fail if a filter does not
+    filter, and they match `format/FlightSql.proto`, which arrow's vcpkg build leaves in
+    `vcpkg/buildtrees/arrow/src/*/` if you want to read it.
+    """
+    url = f"type.googleapis.com/arrow.flight.protocol.sql.{name}".encode()
+    return field(1, url) + field(2, inner)
+
+
+def statement_query(sql: str) -> bytes:
+    return command("CommandStatementQuery", text(1, sql))
+
+
+def catalog_command(spec: str) -> bytes:
+    """`@name` or `@name:arg` - the catalog RPCs, in the terms the protocol uses."""
+    name, _, argument = spec[1:].partition(":")
+    if name == "catalogs":
+        return command("CommandGetCatalogs", b"")
+    if name == "types":
+        return command("CommandGetTableTypes", b"")
+    if name == "schemas":
+        # optional string catalog = 1; optional string db_schema_filter_pattern = 2
+        return command("CommandGetDbSchemas", text(2, argument) if argument else b"")
+    if name == "tables":
+        # optional catalog = 1, db_schema pattern = 2, table pattern = 3, types = 4, include_schema = 5
+        return command("CommandGetTables", (text(3, argument) if argument else b"") + flag(5, False))
+    if name == "tables_schema":
+        return command("CommandGetTables", (text(3, argument) if argument else b"") + flag(5, True))
+    if name == "table_types_filter":
+        return command("CommandGetTables", text(4, argument) + flag(5, False))
+    # the key RPCs name a table: optional catalog = 1, optional db_schema = 2, string table = 3
+    if name in ("pk", "imported", "exported"):
+        message = {"pk": "CommandGetPrimaryKeys", "imported": "CommandGetImportedKeys",
+                   "exported": "CommandGetExportedKeys"}[name]
+        return command(message, text(3, argument))
+    if name == "cross":
+        pk_table, fk_table = argument.split(",")
+        # pk_catalog = 1, pk_db_schema = 2, pk_table = 3, fk_catalog = 4, fk_db_schema = 5, fk_table = 6
+        return command("CommandGetCrossReference", text(3, pk_table) + text(6, fk_table))
+    raise SystemExit(f"unknown catalog command: {spec}")
+
+
+uri, ask = sys.argv[1], sys.argv[2]
 token = sys.argv[3] if len(sys.argv) > 3 else TOKEN
 client = flight.connect(uri)
 # "-" means: send no credentials at all. The door must refuse that, and it is worth being able to ask.
 headers = [] if token == "-" else [(b"authorization", f"Bearer {token}".encode())]
 options = flight.FlightCallOptions(headers=headers)
-info = client.get_flight_info(flight.FlightDescriptor.for_command(statement_query(sql)), options)
-table = client.do_get(info.endpoints[0].ticket, options).read_all()
-print(table.to_pydict())
+descriptor = catalog_command(ask) if ask.startswith("@") else statement_query(ask)
+info = client.get_flight_info(flight.FlightDescriptor.for_command(descriptor), options)
+reader = client.do_get(info.endpoints[0].ticket, options)
+table = reader.read_all()
+data = table.to_pydict()
+# `table_schema` is a serialized IPC schema, which is bytes nobody can read in a shell assertion.
+# Unpack it into the column names and types it describes, which is the thing worth asserting on.
+if "table_schema" in data:
+    import pyarrow as pa
+    unpacked = []
+    for blob in data["table_schema"]:
+        schema = pa.ipc.read_schema(pa.BufferReader(blob))
+        unpacked.append([f"{f.name}:{f.type}" for f in schema])
+    data["table_schema"] = unpacked
+print(data)
