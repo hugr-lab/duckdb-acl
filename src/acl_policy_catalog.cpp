@@ -1308,10 +1308,32 @@ struct CatalogBackend {
 		// type. A value that would describe the physical object rather than the virtual one is not
 		// borrowed - an oid identifies a physical catalog entry, a path is the physical database.
 		auto empty_map = "MAP {}::MAP(VARCHAR, VARCHAR)";
+		// An oid a client can key on, with nothing physical in it. Spec 035 answered every oid with
+		// NULL - a physical catalog entry's identifier is not a fact about a virtual object - and that
+		// held until quack started joining tables to schemas by oid and reading it as int64 (its
+		// nested-schema catalog load, 2026-08-26): a NULL there is a client-side internal error, and an
+		// ATTACH that never completes. So the ids are synthesized from the virtual name - stable
+		// across calls, the same for the same object on every surface (a table's schema_oid *is* its
+		// schema's oid, by construction), and unrelated to anything in a physical catalog. The kind is
+		// salted in so a schema and a table can never share one; chr(31) keeps `a` + `b.c` apart from
+		// `a.b` + `c`; the shift keeps a UBIGINT hash inside BIGINT.
+		auto oid_of = [](const string &kind, const string &name_expr) {
+			return "(hash('" + kind + "' || chr(31) || " + name_expr + ") >> 1)::BIGINT";
+		};
+		auto database_oid = [&](const string &vcat_expr) {
+			return oid_of("database", vcat_expr);
+		};
+		auto schema_oid = [&](const string &vcat_expr, const string &path_expr) {
+			return oid_of("schema", vcat_expr + " || chr(31) || " + path_expr);
+		};
+		auto object_oid = [&](const string &kind, const string &vcat_expr, const string &schema_expr,
+		                      const string &name_expr) {
+			return oid_of(kind, vcat_expr + " || chr(31) || " + schema_expr + " || chr(31) || " + name_expr);
+		};
 		if (surface == "databases") {
 			// one row per granted catalog, and no physical database name ever appears
-			return prelude +
-			       "SELECT vcat AS database_name, NULL::BIGINT AS database_oid, NULL::VARCHAR AS path,"
+			return prelude + "SELECT vcat AS database_name, " + database_oid("vcat") +
+			       " AS database_oid, NULL::VARCHAR AS path,"
 			       " NULL::VARCHAR AS comment, " +
 			       empty_map +
 			       " AS tags, false AS internal, NULL::VARCHAR AS type,"
@@ -1326,9 +1348,8 @@ struct CatalogBackend {
 			                 " FROM vschemas";
 		}
 		if (surface == "duckdb_schemas") {
-			return prelude +
-			       "SELECT NULL::BIGINT AS oid, vcat AS database_name, NULL::BIGINT AS database_oid,"
-			       " path AS schema_name, NULL::VARCHAR AS comment, " +
+			return prelude + "SELECT " + schema_oid("vcat", "path") + " AS oid, vcat AS database_name, " +
+			       database_oid("vcat") + " AS database_oid, path AS schema_name, NULL::VARCHAR AS comment, " +
 			       empty_map +
 			       " AS tags, false AS internal, NULL::VARCHAR AS sql,"
 			       " NULL::VARCHAR AS parent_schema, NULL::BIGINT AS parent_schema_oid"
@@ -1469,9 +1490,10 @@ struct CatalogBackend {
 			// the same rows as information_schema.columns, in duckdb's own shape. `is_nullable` and
 			// `is_generated` are booleans there and strings here, and a synthesized row (a mask, a
 			// computed column) has neither - duckdb always answers, so a default is closer than a NULL.
-			return prelude + "SELECT c.table_catalog AS database_name, NULL::BIGINT AS database_oid," +
-			       " c.table_schema AS schema_name, NULL::BIGINT AS schema_oid," +
-			       " c.table_name AS table_name, NULL::BIGINT AS table_oid," +
+			return prelude + "SELECT c.table_catalog AS database_name, " + database_oid("c.table_catalog") +
+			       " AS database_oid, c.table_schema AS schema_name, " +
+			       schema_oid("c.table_catalog", "c.table_schema") + " AS schema_oid, c.table_name AS table_name, " +
+			       object_oid("table", "c.table_catalog", "c.table_schema", "c.table_name") + " AS table_oid," +
 			       " c.column_name AS column_name, c.ordinal_position::INTEGER AS column_index," +
 			       " c.\"COLUMN_COMMENT\" AS comment, false AS internal," + " c.column_default AS column_default," +
 			       " coalesce(c.is_nullable = 'YES', true) AS is_nullable," +
@@ -1498,9 +1520,11 @@ struct CatalogBackend {
 			string ddl = "(SELECT 'CREATE TABLE ' || " + quoted("t.table_name") + " || '(' || string_agg(" +
 			             quoted("c.column_name") + " || ' ' || c.data_type, ', ' ORDER BY c.ordinal_position)" +
 			             " || ');'" + of_this_table + ")";
-			string head = string("SELECT t.table_catalog AS database_name, NULL::BIGINT AS database_oid,") +
-			              " t.table_schema AS schema_name, NULL::BIGINT AS schema_oid, t.table_name AS " +
-			              (views ? "view_name" : "table_name") + ", NULL::BIGINT AS " +
+			string head = string("SELECT t.table_catalog AS database_name, ") + database_oid("t.table_catalog") +
+			              " AS database_oid, t.table_schema AS schema_name, " +
+			              schema_oid("t.table_catalog", "t.table_schema") + " AS schema_oid, t.table_name AS " +
+			              (views ? "view_name" : "table_name") + ", " +
+			              object_oid("table", "t.table_catalog", "t.table_schema", "t.table_name") + " AS " +
 			              (views ? "view_oid" : "table_oid") + ", t.\"TABLE_COMMENT\" AS comment, " + empty_map +
 			              " AS tags, false AS internal, false AS temporary, ";
 			string tail = views ? column_count + ", NULL::VARCHAR AS sql, true AS is_bound"

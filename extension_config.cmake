@@ -38,7 +38,8 @@ endif()
 # quack needs json + autocomplete (core) and httpfs, which it pins itself; we take duckdb's own pin
 # so everything builds against the commit we track.
 #
-# quack targets duckdb e20aeb78, which is why the submodule moved there: at our previous pin it needed
+# quack targets duckdb f1c54da78b (its own submodule pin, 2026-08-25), and the submodule follows it: at
+# an earlier pin it needed
 # `RemoteCapability::EXECUTE_STATEMENT` and the `RemoteExecute(ClientContext &,
 # unique_ptr<SQLStatement>)` overload, and got neither.
 if(DEFINED ENV{ACL_QUACK} AND NOT MINGW AND NOT ${WASM_ENABLED})
@@ -48,6 +49,6 @@ if(DEFINED ENV{ACL_QUACK} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(quack
         DONT_LINK
         GIT_URL https://github.com/duckdb/duckdb-quack
-        GIT_TAG 2ca17797acfed0e29187482700db30d0b01a7954
+        GIT_TAG f28823ddb9b6b9c22e72176f2b8db00cbc8b6e9b
     )
 endif()

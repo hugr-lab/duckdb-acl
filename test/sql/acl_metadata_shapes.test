@@ -324,23 +324,80 @@ orders	orders a role may read
 
 query I
 ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables()
-WHERE estimated_size IS NOT NULL OR table_oid IS NOT NULL OR schema_oid IS NOT NULL
-   OR database_oid IS NOT NULL OR index_count IS NOT NULL OR check_constraint_count IS NOT NULL
+WHERE estimated_size IS NOT NULL OR index_count IS NOT NULL OR check_constraint_count IS NOT NULL
    OR has_primary_key IS NOT NULL OR internal OR temporary;
 ----
 0
 
 query I
 ACL ROLE "analyst" SELECT count(*) FROM duckdb_databases()
-WHERE path IS NOT NULL OR database_oid IS NOT NULL OR internal OR readonly OR encrypted;
+WHERE path IS NOT NULL OR internal OR readonly OR encrypted;
 ----
 0
 
 query I
 ACL ROLE "analyst" SELECT count(*) FROM duckdb_schemas()
-WHERE oid IS NOT NULL OR database_oid IS NOT NULL OR sql IS NOT NULL OR internal;
+WHERE sql IS NOT NULL OR internal;
 ----
 0
+
+# --- oids are synthesized: present, consistent across surfaces, and not the physical ones -----------
+# They were NULL until quack began joining tables to schemas by oid and reading it as int64 - a NULL
+# there is a client-side internal error and an ATTACH that never completes (2026-08-26). What replaces
+# it is a stable hash of the virtual name, so three things must hold and each is checked on its own.
+
+# present, on every surface
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables()
+WHERE table_oid IS NULL OR schema_oid IS NULL OR database_oid IS NULL;
+----
+0
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_schemas() WHERE oid IS NULL OR database_oid IS NULL;
+----
+0
+
+# consistent: a table's schema_oid is its schema's oid, and its database_oid is the database's - this
+# is the join quack makes, and it must hold for the columns surface too
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables() t
+WHERE NOT EXISTS (SELECT 1 FROM duckdb_schemas() s
+                  WHERE s.oid = t.schema_oid AND s.database_oid = t.database_oid
+                    AND s.schema_name = t.schema_name AND s.database_name = t.database_name);
+----
+0
+
+# a view's columns are in duckdb_columns too, so the object side is tables-and-views
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_columns() c
+WHERE NOT EXISTS (SELECT 1 FROM (SELECT table_oid, schema_oid, table_name FROM duckdb_tables()
+                                 UNION ALL
+                                 SELECT view_oid, schema_oid, view_name FROM duckdb_views()) t
+                  WHERE t.table_oid = c.table_oid AND t.schema_oid = c.schema_oid
+                    AND t.table_name = c.table_name);
+----
+0
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_schemas() s
+WHERE NOT EXISTS (SELECT 1 FROM duckdb_databases() d WHERE d.database_oid = s.database_oid);
+----
+0
+
+# not physical: the oid is a function of the *virtual* name and nothing else - which pins the formula,
+# and is what makes it impossible for a physical catalog's counter to show through
+query I
+ACL ROLE "analyst" SELECT table_oid = (hash('table' || chr(31) || 'c' || chr(31) || 'main' || chr(31) || 'orders') >> 1)::BIGINT
+FROM duckdb_tables() WHERE table_name = 'orders';
+----
+true
+
+query I
+ACL ROLE "analyst" SELECT oid = (hash('schema' || chr(31) || 'c' || chr(31) || 'main') >> 1)::BIGINT
+FROM duckdb_schemas() WHERE schema_name = 'main';
+----
+true
 
 # no DDL names the physical database, and the one whose grant hides `ssn` does not mention it either
 # (`masked` legitimately has a column called `ssn` - it is the mask, which the role does read)
