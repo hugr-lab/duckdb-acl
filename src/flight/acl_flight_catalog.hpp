@@ -26,6 +26,13 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> EmptyBatch(const std::shared_
 arrow::Result<vector<string>> SchemasFor(ClientContext &context, MaterializedQueryResult &tables,
                                          MaterializedQueryResult &columns);
 
+//! The parameter rows a client bound to a prepared statement, read back as duckdb values (spec 047).
+//! The batches are exposed as an ArrowArrayStream and read through `arrow_scan` - duckdb's own
+//! conversion, the same mechanism its in-tree ADBC layer uses - so no second Arrow-to-duckdb type
+//! mapping exists in this codebase.
+arrow::Result<vector<vector<Value>>> ParamRowsFrom(DatabaseInstance &db, arrow::flight::FlightMessageReader &reader,
+                                                   idx_t max_rows);
+
 CatalogFilter FilterFrom(const arrow::flight::sql::GetTables &command);
 CatalogFilter FilterFrom(const arrow::flight::sql::GetDbSchemas &command);
 CatalogTableRef TableRefFrom(const arrow::flight::sql::TableRef &table);

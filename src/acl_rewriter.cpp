@@ -1057,7 +1057,7 @@ private:
 	//! Map a written column name onto the physical one. A physical name that the policy renamed away
 	//! is refused: the virtual relation does not have that column any more.
 	Identifier MapWrittenColumn(const TablePolicy &policy, const Identifier &written, const string &vname) {
-		auto name = written.GetIdentifierName();
+		const auto &name = written.GetIdentifierName();
 		for (auto &rename : policy.renames) {
 			if (StringUtil::CIEquals(rename.first, name)) {
 				return Identifier(rename.second);
@@ -1690,8 +1690,8 @@ private:
 	//! way duckdb's own `include_implicit` is a hint) - a miswritten call falls through to the binder,
 	//! whose error is better than ours.
 	bool IsSessionIdentityCall(const FunctionExpression &function) {
-		auto qualified = function.GetQualifiedName();
-		auto name = qualified.Name().GetIdentifierName();
+		const auto &qualified = function.GetQualifiedName();
+		const auto &name = qualified.Name().GetIdentifierName();
 		bool database = StringUtil::CIEquals(name, "current_database") || StringUtil::CIEquals(name, "current_catalog");
 		bool schema = StringUtil::CIEquals(name, "current_schema") || StringUtil::CIEquals(name, "current_schemas");
 		if (!database && !schema) {
@@ -1889,12 +1889,17 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 			// column with no name in `grant_columns` - which then appeared in every listing, sharing an
 			// ordinal with the column it was supposed to be (spec 042).
 			//
-			// The *type* is deliberately left untyped where the signature does not give one: the baked
+			// The *type* is deliberately untyped where the signature does not give one: the baked
 			// template is serialised back to text, and a bare `NULL` binds against anything, which is
-			// what lets a predicate like `amount >= acl_arg(1)` be probed at all.
+			// what lets a predicate like `amount >= acl_arg(1)` be probed at all. That word is doing
+			// real work: `Value()` is the untyped SQLNULL, while `Value(LogicalType::VARCHAR)` - what
+			// stood here - is a *typed* NULL that merely used to serialise as bare `NULL` because
+			// duckdb lost the type in ToSQLString. duckdb#25002 fixed that, typed NULLs now render as
+			// `NULL::VARCHAR`, and the probe of that very predicate started refusing to bind - found
+			// by the distribution build tracking duckdb main, two days ahead of our pin.
 			auto alias = expr->GetAlias();
 			if (type.empty()) {
-				expr = make_uniq<ConstantExpression>(Value(LogicalType::VARCHAR));
+				expr = make_uniq<ConstantExpression>(Value());
 			} else {
 				// parse the cast rather than resolving the type name by hand (no context needed here)
 				auto casted = Parser::ParseExpressionList("CAST(NULL AS " + type + ")", options);
