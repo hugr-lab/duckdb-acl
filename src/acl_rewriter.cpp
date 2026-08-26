@@ -1655,6 +1655,26 @@ private:
 				}
 				return; // handled: do not re-gate or re-recurse
 			}
+			// The session-identity functions answer as the *principal*, not as the process. A served
+			// client asks `current_database()` to learn where its bare names resolve - and the honest
+			// answer under the ACL is the principal's MAIN catalog, not the physical default the
+			// server process happens to sit in (which is also a name a principal must never see).
+			// quack's catalog load made this load-bearing: it folds the remote catalog whose name
+			// equals current_database() into the client's top level, so the physical answer un-folds
+			// the virtual catalog and every remote name grows a spurious level.
+			if (IsSessionIdentityCall(function)) {
+				if (StringUtil::CIEquals(name, "current_schema")) {
+					// where an unqualified name lands inside the catalog - `main`, by construction
+					expr = make_uniq<ConstantExpression>(Value("main"));
+				} else if (StringUtil::CIEquals(name, "current_schemas")) {
+					vector<unique_ptr<ParsedExpression>> parts;
+					parts.push_back(make_uniq<ConstantExpression>(Value("main")));
+					expr = make_uniq<FunctionExpression>(Identifier("list_value"), std::move(parts));
+				} else {
+					expr = BuildCurrentDatabaseExpr();
+				}
+				return;
+			}
 			// otherwise route it through the resolver seam (default-allow, deny readers)
 			if (!store.FunctionAllowed(principal, function.GetQualifiedName())) {
 				Deny("function \"" + name + "\" is not allowed");
@@ -1662,6 +1682,50 @@ private:
 		}
 		ParsedExpressionIterator::EnumerateChildren(*expr,
 		                                            [&](unique_ptr<ParsedExpression> &child) { RewriteExpr(child); });
+	}
+
+	//! `current_database()` / `current_catalog()` / `current_schema()` / `current_schemas(...)`,
+	//! spelled bare or through the qualifiers duckdb itself accepts for them. Only the zero-argument
+	//! forms are taken (current_schemas keeps its one argument, which the substitution ignores the
+	//! way duckdb's own `include_implicit` is a hint) - a miswritten call falls through to the binder,
+	//! whose error is better than ours.
+	bool IsSessionIdentityCall(const FunctionExpression &function) {
+		auto qualified = function.GetQualifiedName();
+		auto name = qualified.Name().GetIdentifierName();
+		bool database = StringUtil::CIEquals(name, "current_database") || StringUtil::CIEquals(name, "current_catalog");
+		bool schema = StringUtil::CIEquals(name, "current_schema") || StringUtil::CIEquals(name, "current_schemas");
+		if (!database && !schema) {
+			return false;
+		}
+		if (!StringUtil::CIEquals(name, "current_schemas") && !function.GetArguments().empty()) {
+			return false;
+		}
+		auto &path = qualified.Path();
+		for (idx_t i = 0; i + 1 < path.size(); i++) { // every component but the name itself
+			auto piece = path[i].GetIdentifierName();
+			if (!piece.empty() && !StringUtil::CIEquals(piece, "main") && !StringUtil::CIEquals(piece, "system") &&
+			    !StringUtil::CIEquals(piece, "pg_catalog")) {
+				return false; // someone else's current_database is not this one
+			}
+		}
+		return true;
+	}
+
+	//! The catalog a bare name resolves in: the principal's MAIN catalog - and NULL when it is not
+	//! unique, which is exactly when bare-name resolution refuses too. Built over the same listing
+	//! `SHOW SCHEMAS` answers with, so a policy source that cannot enumerate refuses here as well.
+	unique_ptr<ParsedExpression> BuildCurrentDatabaseExpr() {
+		string sql;
+		if (!store.MetadataListing(principal, "show_schemas", sql)) {
+			Deny("metadata is not available: this policy source cannot enumerate the current catalog");
+		}
+		auto wrapped = "SELECT CASE WHEN count(DISTINCT database_name) = 1 THEN min(database_name) END FROM (" + sql +
+		               ") WHERE \"current\"";
+		auto statement = store.InstantiateSelect(wrapped, template_options);
+		auto subquery = make_uniq<SubqueryExpression>();
+		subquery->SubqueryMutable() = std::move(statement);
+		subquery->GetSubqueryTypeMutable() = SubqueryType::SCALAR;
+		return subquery;
 	}
 
 	//! Expand a virtual scalar function `vfunc(args)` into its template expression, substituting the

@@ -103,6 +103,43 @@ ACL ROLE "analyst" SELECT count(*) FROM duckdb_constraints();
 
 # --- the native context is unchanged: that is what it is for ---------------------------------------
 
+# --- the session-identity functions answer as the principal --------------------------------------
+# current_database() is where a client believes its bare names resolve, and quack's catalog load
+# folds the remote catalog by that name - so the physical default leaking through does not merely
+# name a database the role cannot see, it makes every remote object grow a spurious level.
+
+query I
+ACL ROLE "analyst" SELECT current_database();
+----
+sales
+
+query I
+ACL ROLE "analyst" SELECT current_catalog();
+----
+sales
+
+query I
+ACL ROLE "analyst" SELECT current_schema();
+----
+main
+
+query I
+ACL ROLE "analyst" SELECT current_schemas(true);
+----
+[main]
+
+# and inside an expression, where the walker meets it as a child
+query I
+ACL ROLE "analyst" SELECT 'db=' || current_database();
+----
+db=sales
+
+# unprefixed stays the process's own answer - the ACL rewrites principals, not the instance
+query I
+SELECT current_database();
+----
+memory
+
 statement ok
 ACL ADMIN CREATE ROLE platform;
 
