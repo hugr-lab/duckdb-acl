@@ -14,6 +14,9 @@
 #include "acl_flight_catalog.hpp"
 #include "duckdb/common/error_data.hpp"
 
+#include <algorithm>
+#include <arrow/util/config.h>
+
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -117,6 +120,54 @@ struct FlightDoorState {
 		tickets.erase(entry); // one ticket, one fetch: a replayed ticket is not a second read
 		return true;
 	}
+
+	//! A prepared statement (spec 047): the client's own SQL - never the composed statement, for the
+	//! ticket's reason - and the parameter rows the client has bound to it. Door state, not session
+	//! state: our sessions are per call and stay that way.
+	struct PreparedRecord {
+		string query;
+		vector<vector<Value>> parameter_rows;
+	};
+	std::unordered_map<string, PreparedRecord> prepared;
+	//! The ticket cap's reasoning inverted: refuse a new handle rather than evict somebody's old one.
+	//! An evicted prepared statement is a mid-flight failure; a refused Create is a clean retry.
+	static constexpr idx_t MAX_PREPARED = 4096;
+
+	bool PutPrepared(const string &query, string &handle_out) {
+		auto id = MintId();
+		std::lock_guard<std::mutex> guard(lock);
+		if (prepared.size() >= MAX_PREPARED) {
+			return false;
+		}
+		prepared[id] = PreparedRecord {query, {}};
+		handle_out = id;
+		return true;
+	}
+
+	bool FindPrepared(const string &handle, PreparedRecord &out) {
+		std::lock_guard<std::mutex> guard(lock);
+		auto entry = prepared.find(handle);
+		if (entry == prepared.end()) {
+			return false;
+		}
+		out = entry->second;
+		return true;
+	}
+
+	bool BindPrepared(const string &handle, vector<vector<Value>> rows) {
+		std::lock_guard<std::mutex> guard(lock);
+		auto entry = prepared.find(handle);
+		if (entry == prepared.end()) {
+			return false;
+		}
+		entry->second.parameter_rows = std::move(rows);
+		return true;
+	}
+
+	void ClosePrepared(const string &handle) {
+		std::lock_guard<std::mutex> guard(lock);
+		prepared.erase(handle);
+	}
 };
 
 //! The token a call carries, or "" - read from the headers on every call rather than only at a
@@ -139,6 +190,26 @@ string TokenFromHeaders(const flight::ServerCallContext &context) {
 class AclFlightSqlServer : public flightsql::FlightSqlServerBase {
 public:
 	explicit AclFlightSqlServer(shared_ptr<FlightDoorState> state_p) : state(std::move(state_p)) {
+		// SqlInfo (spec 047): the base class answers GetSqlInfo from this registry - and answers
+		// NOT_FOUND from an empty one, which a driver refuses outright while tolerating a server that
+		// lacks the RPC entirely. So the registry is filled, with values chosen to be true rather
+		// than flattering; a wrong answer here once panicked the Go driver (design/012).
+		using Info = flightsql::SqlInfoOptions;
+		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_NAME, string("duckdb-acl"));
+#ifdef EXT_VERSION_ACL
+		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_VERSION, string(EXT_VERSION_ACL));
+#else
+		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_VERSION, string("dev"));
+#endif
+		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_ARROW_VERSION, string(ARROW_VERSION_STRING));
+		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_READ_ONLY, false);
+		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_SQL, true);
+		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_SUBSTRAIT, false);
+		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_TRANSACTION,
+		                int32_t(Info::SqlSupportedTransaction::SQL_SUPPORTED_TRANSACTION_NONE));
+		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_CANCEL, false);
+		// flips to true in the commit that implements DoPutCommandStatementIngest (spec 049)
+		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_BULK_INGESTION, false);
 	}
 
 	//! Where a client's SQL arrives. Nothing about the policy is decided here: the statement is
@@ -220,6 +291,212 @@ public:
 			    ARROW_ASSIGN_OR_RAISE(auto reader, arrow::RecordBatchReader::Make(std::move(batches), schema));
 			    return std::make_unique<flight::RecordBatchStream>(std::move(reader));
 		    });
+	}
+
+	//! --- prepared statements (spec 047) ----------------------------------------------------------
+	//!
+	//! The ticket rule, applied to a handle: the record holds the client's own SQL, every call
+	//! re-verifies the token, and execution composes under whoever calls - a stolen handle earns its
+	//! holder exactly what their own token earns them. The client's parameters are the only
+	//! parameters in the composed statement (the rewriter adds none - the golden rule), so the bound
+	//! values map onto it one to one.
+
+	arrow::Result<flightsql::ActionCreatePreparedStatementResult>
+	CreatePreparedStatement(const flight::ServerCallContext &context,
+	                        const flightsql::ActionCreatePreparedStatementRequest &request) override {
+		return UnderSession(
+		    context, [&](const string &handle) -> arrow::Result<flightsql::ActionCreatePreparedStatementResult> {
+			    if (!request.transaction_id.empty()) {
+				    return arrow::Status::NotImplemented("acl: transactions are not supported");
+			    }
+			    Connection con(state->db);
+			    std::shared_ptr<arrow::Schema> dataset_schema;
+			    std::shared_ptr<arrow::Schema> parameter_schema;
+			    ARROW_RETURN_NOT_OK(PrepareSchemas(con, handle, request.query, dataset_schema, parameter_schema));
+			    string statement_handle;
+			    if (!state->PutPrepared(request.query, statement_handle)) {
+				    return arrow::Status::Invalid("acl: too many open prepared statements - close some");
+			    }
+			    flightsql::ActionCreatePreparedStatementResult result;
+			    result.dataset_schema = std::move(dataset_schema);
+			    result.parameter_schema = std::move(parameter_schema);
+			    result.prepared_statement_handle = std::move(statement_handle);
+			    return result;
+		    });
+	}
+
+	arrow::Status ClosePreparedStatement(const flight::ServerCallContext &context,
+	                                     const flightsql::ActionClosePreparedStatementRequest &request) override {
+		auto closed = UnderSession(context, [&](const string &) -> arrow::Result<bool> {
+			state->ClosePrepared(request.prepared_statement_handle);
+			return true;
+		});
+		return closed.status();
+	}
+
+	arrow::Status DoPutPreparedStatementQuery(const flight::ServerCallContext &context,
+	                                          const flightsql::PreparedStatementQuery &command,
+	                                          flight::FlightMessageReader *reader,
+	                                          flight::FlightMetadataWriter *writer) override {
+		auto bound = UnderSession(context, [&](const string &) -> arrow::Result<bool> {
+			ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader));
+			if (!state->BindPrepared(command.prepared_statement_handle, std::move(rows))) {
+				return arrow::Status::KeyError("acl: unknown prepared statement");
+			}
+			return true;
+		});
+		return bound.status();
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightInfo>>
+	GetFlightInfoPreparedStatement(const flight::ServerCallContext &context,
+	                               const flightsql::PreparedStatementQuery &command,
+	                               const flight::FlightDescriptor &descriptor) override {
+		return UnderSession(context, [&](const string &handle) -> arrow::Result<std::unique_ptr<flight::FlightInfo>> {
+			FlightDoorState::PreparedRecord record;
+			if (!state->FindPrepared(command.prepared_statement_handle, record)) {
+				return arrow::Status::KeyError("acl: unknown prepared statement");
+			}
+			Connection con(state->db);
+			std::shared_ptr<arrow::Schema> dataset_schema;
+			std::shared_ptr<arrow::Schema> parameter_schema;
+			ARROW_RETURN_NOT_OK(PrepareSchemas(con, handle, record.query, dataset_schema, parameter_schema));
+			// like the catalog RPCs: the ticket is the protocol's own command, which carries the
+			// handle - nothing is remembered between the two calls that is not already in the record
+			std::vector<flight::FlightEndpoint> endpoints {
+			    flight::FlightEndpoint {flight::Ticket {descriptor.cmd}, {}, std::nullopt, {}}};
+			ARROW_ASSIGN_OR_RAISE(auto info,
+			                      flight::FlightInfo::Make(*dataset_schema, descriptor, endpoints, -1, -1, false));
+			return std::make_unique<flight::FlightInfo>(std::move(info));
+		});
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
+	DoGetPreparedStatement(const flight::ServerCallContext &context,
+	                       const flightsql::PreparedStatementQuery &command) override {
+		return UnderSession(context,
+		                    [&](const string &caller) -> arrow::Result<std::unique_ptr<flight::FlightDataStream>> {
+			                    FlightDoorState::PreparedRecord record;
+			                    if (!state->FindPrepared(command.prepared_statement_handle, record)) {
+				                    return arrow::Status::KeyError("acl: unknown prepared statement");
+			                    }
+			                    auto prefixed = state->store->SessionSql(caller, record.query);
+			                    if (prefixed.empty()) {
+				                    return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
+			                    }
+			                    Connection con(state->db);
+			                    auto stmt = con.Prepare(prefixed);
+			                    if (stmt->HasError()) {
+				                    return StatusFromDuck("acl", stmt->GetError());
+			                    }
+			                    // one row of values for a query; none bound means none needed - the binder says if not
+			                    vector<Value> values;
+			                    if (!record.parameter_rows.empty()) {
+				                    values = record.parameter_rows.front();
+			                    }
+			                    auto result = stmt->Execute(values, false);
+			                    if (result->HasError()) {
+				                    return StatusFromDuck("acl", result->GetError());
+			                    }
+			                    return StreamRows(con, *result);
+		                    });
+	}
+
+	arrow::Result<int64_t> DoPutPreparedStatementUpdate(const flight::ServerCallContext &context,
+	                                                    const flightsql::PreparedStatementUpdate &command,
+	                                                    flight::FlightMessageReader *reader) override {
+		return UnderSession(context, [&](const string &caller) -> arrow::Result<int64_t> {
+			FlightDoorState::PreparedRecord record;
+			if (!state->FindPrepared(command.prepared_statement_handle, record)) {
+				return arrow::Status::KeyError("acl: unknown prepared statement");
+			}
+			ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader));
+			auto prefixed = state->store->SessionSql(caller, record.query);
+			if (prefixed.empty()) {
+				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
+			}
+			Connection con(state->db);
+			auto stmt = con.Prepare(prefixed);
+			if (stmt->HasError()) {
+				return StatusFromDuck("acl", stmt->GetError());
+			}
+			// executemany: once per parameter row; a parameterless update runs once
+			if (rows.empty()) {
+				rows.push_back({});
+			}
+			int64_t total = 0;
+			for (auto &row : rows) {
+				auto result = stmt->Execute(row, false);
+				if (result->HasError()) {
+					return StatusFromDuck("acl", result->GetError());
+				}
+				auto chunk = result->Fetch();
+				if (chunk && chunk->size() > 0 && chunk->ColumnCount() == 1) {
+					auto count = chunk->GetValue(0, 0);
+					if (!count.IsNull()) {
+						total += count.GetValue<int64_t>();
+					}
+				}
+			}
+			return total;
+		});
+	}
+
+	//! Prepare under the caller and hand back both schemas the protocol wants: the result's, and the
+	//! parameters' - the latter from duckdb's own binder, ordered by parameter position, so the
+	//! client binds exactly what the composed statement will accept.
+	arrow::Status PrepareSchemas(Connection &con, const string &session_handle, const string &query,
+	                             std::shared_ptr<arrow::Schema> &dataset_schema,
+	                             std::shared_ptr<arrow::Schema> &parameter_schema) {
+		auto prefixed = state->store->SessionSql(session_handle, query);
+		if (prefixed.empty()) {
+			return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
+		}
+		auto stmt = con.Prepare(prefixed);
+		if (stmt->HasError()) {
+			return StatusFromDuck("acl", stmt->GetError());
+		}
+		ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaOf(*stmt));
+
+		vector<std::pair<idx_t, std::pair<string, LogicalType>>> ordered;
+		for (auto &entry : stmt->GetNamedParameterMap()) {
+			LogicalType type = LogicalType::UNKNOWN;
+			stmt->TryGetParameterType(entry.first, type);
+			ordered.emplace_back(entry.second, std::make_pair(entry.first.GetIdentifierName(), type));
+		}
+		std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+		vector<LogicalType> types;
+		vector<Identifier> names;
+		for (auto &entry : ordered) {
+			names.emplace_back(entry.second.first);
+			// an unresolved parameter type binds as anything; VARCHAR is the honest wire default
+			types.push_back(entry.second.second.id() == LogicalTypeId::UNKNOWN ? LogicalType::VARCHAR
+			                                                                   : entry.second.second);
+		}
+		ARROW_ASSIGN_OR_RAISE(parameter_schema, SchemaFor(types, names));
+		return arrow::Status::OK();
+	}
+
+	//! A finished result as one Flight stream - the tail every data-returning RPC shares. (The
+	//! statement path predates it and still carries its own copy; folding that is cleanup, not now.)
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>> StreamRows(Connection &con, QueryResult &result) {
+		std::shared_ptr<arrow::Schema> schema;
+		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result.GetTypes(), result.GetNames()));
+
+		std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+		auto properties = con.context->GetClientProperties();
+		while (true) {
+			auto chunk = result.Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			ArrowArray array;
+			ArrowConverter::ToArrowArray(*chunk, &array, properties, {});
+			ARROW_ASSIGN_OR_RAISE(auto batch, arrow::ImportRecordBatch(&array, schema));
+			batches.push_back(std::move(batch));
+		}
+		ARROW_ASSIGN_OR_RAISE(auto reader, arrow::RecordBatchReader::Make(std::move(batches), schema));
+		return std::make_unique<flight::RecordBatchStream>(std::move(reader));
 	}
 
 	//! --- the catalog RPCs (spec 046) -------------------------------------------------------------
@@ -473,8 +750,20 @@ private:
 
 	//! duckdb names columns with `Identifier`; the Arrow converter takes plain strings, so the one
 	//! conversion happens here rather than at both call sites.
-	arrow::Result<std::shared_ptr<arrow::Schema>> SchemaFor(const vector<LogicalType> &types,
+	arrow::Result<std::shared_ptr<arrow::Schema>> SchemaFor(const vector<LogicalType> &types_p,
 	                                                        const vector<Identifier> &names) {
+		// A type the binder could not resolve at prepare - a parameter, or a DML whose injected
+		// write-check rides on one (spec 024) - arrives here as UNKNOWN, which Arrow cannot spell.
+		// The promise degrades to VARCHAR, the wire default; what a fetch actually streams is built
+		// from the *executed* result, which is always concretely typed. Found by a real driver
+		// preparing an INSERT under an RLS grant: the result column of the rewritten statement was
+		// UNKNOWN and the promised-schema conversion threw.
+		vector<LogicalType> types = types_p;
+		for (auto &type : types) {
+			if (type.id() == LogicalTypeId::UNKNOWN) {
+				type = LogicalType::VARCHAR;
+			}
+		}
 		vector<string> plain;
 		plain.reserve(names.size());
 		for (auto &name : names) {

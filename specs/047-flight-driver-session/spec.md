@@ -1,6 +1,6 @@
 # Spec 047: the door answers a driver's session layer
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-08-26
 - **Author**: hugr-lab
 
@@ -106,10 +106,17 @@ it was waiting for.
 
 **e2e through the real driver** (`test/e2e/flight/adbc.sh`, skipped without the driver): the survey
 matrix of design/013 §4 turned into assertions - parameterized `?` and `$1` answer the principal's
-slice; `executemany` inserts land and the grant's predicate still refuses a cross-tenant row
-(spec 024, already proven for text DML); `adbc_get_info` returns the registered values; a second
-principal executing a stolen handle gets its own slice; the poisoned-cursor sequence from the survey
-now runs clean end to end.
+slice; `executemany` inserts land and the grant's predicate refuses a cross-tenant row at the write
+(spec 024's message, through the driver's prepared path); `adbc_get_info` returns the registered
+values; two principals running the same SQL see their own slices; the poisoned-cursor sequence from
+the survey runs clean end to end.
+
+**Found by running, fixed at the seam:** a prepared INSERT under an RLS grant has an *UNKNOWN-typed
+result column* - the injected write-check (spec 024) rides on unresolved parameters - and Arrow
+cannot spell UNKNOWN, so the promised-schema conversion threw. The door's `SchemaFor` now degrades
+UNKNOWN to VARCHAR: the promise is a wire default, and what a fetch actually streams is built from
+the executed result, which is always concretely typed. The same latent bug sat under spec 045's text
+path for any parameterized statement (`SELECT ?`); one seam fixes both.
 
 **The hand-encoded client** (`test/e2e/flight/client.py`) stays as-is for the unprefixed
 protocol-level checks; prepared statements are exercised through the driver on purpose - the point

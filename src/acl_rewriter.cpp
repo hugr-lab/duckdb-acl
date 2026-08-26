@@ -1057,7 +1057,7 @@ private:
 	//! Map a written column name onto the physical one. A physical name that the policy renamed away
 	//! is refused: the virtual relation does not have that column any more.
 	Identifier MapWrittenColumn(const TablePolicy &policy, const Identifier &written, const string &vname) {
-		auto name = written.GetIdentifierName();
+		const auto &name = written.GetIdentifierName();
 		for (auto &rename : policy.renames) {
 			if (StringUtil::CIEquals(rename.first, name)) {
 				return Identifier(rename.second);
@@ -1690,8 +1690,8 @@ private:
 	//! way duckdb's own `include_implicit` is a hint) - a miswritten call falls through to the binder,
 	//! whose error is better than ours.
 	bool IsSessionIdentityCall(const FunctionExpression &function) {
-		auto qualified = function.GetQualifiedName();
-		auto name = qualified.Name().GetIdentifierName();
+		const auto &qualified = function.GetQualifiedName();
+		const auto &name = qualified.Name().GetIdentifierName();
 		bool database = StringUtil::CIEquals(name, "current_database") || StringUtil::CIEquals(name, "current_catalog");
 		bool schema = StringUtil::CIEquals(name, "current_schema") || StringUtil::CIEquals(name, "current_schemas");
 		if (!database && !schema) {

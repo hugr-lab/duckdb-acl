@@ -19,6 +19,9 @@
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/function/table/arrow.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/main/connection.hpp"
 
 #include <arrow/array/builder_binary.h>
@@ -26,6 +29,7 @@
 #include <arrow/c/bridge.h>
 #include <arrow/ipc/writer.h>
 #include <arrow/record_batch.h>
+#include <arrow/table.h>
 
 namespace duckdb {
 namespace acl {
@@ -248,6 +252,71 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, MaterializedQue
 		serialized.push_back(buffer->ToString());
 	}
 	return serialized;
+}
+
+namespace {
+
+//! The two adapters `arrow_scan` wants around a C stream. Produce moves the stream into duckdb's
+//! wrapper - called once per scan, and the source is spent after it; GetSchema hands out the fresh
+//! copy the C ABI contract already makes ours to own.
+unique_ptr<ArrowArrayStreamWrapper> ParamStreamProduce(uintptr_t stream_ptr, ArrowStreamParameters &) {
+	auto stream = reinterpret_cast<ArrowArrayStream *>(stream_ptr);
+	auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
+	wrapper->arrow_array_stream = *stream;
+	stream->release = nullptr;
+	return wrapper;
+}
+
+void ParamStreamGetSchema(ArrowArrayStream *stream, ArrowSchema &schema) {
+	stream->get_schema(stream, &schema);
+}
+
+} // namespace
+
+arrow::Result<vector<vector<Value>>> ParamRowsFrom(DatabaseInstance &db, flight::FlightMessageReader &reader) {
+	// collect the client's batches, then hand them to duckdb as one stream
+	ARROW_ASSIGN_OR_RAISE(auto table, reader.ToTable());
+	auto batch_reader = std::make_shared<arrow::TableBatchReader>(*table);
+	ArrowArrayStream stream;
+	ARROW_RETURN_NOT_OK(arrow::ExportRecordBatchReader(batch_reader, &stream));
+
+	vector<vector<Value>> rows;
+	try {
+		Connection con(db);
+		auto result =
+		    con.TableFunction("arrow_scan", {Value::POINTER(reinterpret_cast<uintptr_t>(&stream)),
+		                                     Value::POINTER(reinterpret_cast<uintptr_t>(ParamStreamProduce)),
+		                                     Value::POINTER(reinterpret_cast<uintptr_t>(ParamStreamGetSchema))})
+		        ->Execute();
+		if (result->HasError()) {
+			if (stream.release) {
+				stream.release(&stream);
+			}
+			return arrow::Status::Invalid("acl: reading bound parameters: " + result->GetError());
+		}
+		while (true) {
+			auto chunk = result->Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			for (idx_t row = 0; row < chunk->size(); row++) {
+				vector<Value> values;
+				for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
+					values.push_back(chunk->GetValue(col, row));
+				}
+				rows.push_back(std::move(values));
+			}
+		}
+	} catch (std::exception &ex) {
+		if (stream.release) {
+			stream.release(&stream);
+		}
+		return arrow::Status::Invalid("acl: reading bound parameters: " + ErrorData(ex).Message());
+	}
+	if (stream.release) {
+		stream.release(&stream);
+	}
+	return rows;
 }
 
 CatalogFilter FilterFrom(const flightsql::GetTables &command) {
