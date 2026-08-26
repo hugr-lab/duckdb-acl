@@ -20,6 +20,13 @@ SET GLOBAL acl_allow_anonymous_admin=true;
 SELECT acl_define_issuer('https://issuer.test/s',
     '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
     'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+-- A second issuer whose keys live in a document that does not exist, with a failed read fatal at
+-- once. A token naming it makes SessionOpen *throw* - keys are resolved before anything is verified
+-- - which is the review's case: a C++ exception from under the door's own authentication, and the
+-- one the boundary has to turn into a named refusal rather than "Unexpected error in RPC handling".
+ACL ADMIN CREATE ISSUER 'https://issuer.test/file' KEYS FROM '/nonexistent/acl-e2e-jwks.json'
+    AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
+SET GLOBAL acl_jwks_max_stale = 0;
 ACL ADMIN CREATE VIRTUAL CATALOG c;
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders;
 ACL ADMIN CREATE VIRTUAL TABLE c.customers AS memory.main.customers;

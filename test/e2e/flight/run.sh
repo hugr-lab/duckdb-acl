@@ -164,6 +164,28 @@ for probe in "@catalogs" "@tables" "@imported:orders"; do
 	echo "$got" | grep -q "authentication failed" || fail "$probe was answered with no token: $got"
 done
 
+# --- a C++ exception under an RPC is a named refusal, and leaves no session behind ------------------
+# The second issuer's keys cannot be read and a failed read is fatal, so SessionOpen throws from under
+# the door's own authentication - the review's case. gRPC would report that as "Unexpected error in
+# RPC handling", which says nothing; the boundary turns it into the message the policy wrote.
+FILE_TOKEN='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2ZpbGUiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXX0.xxxx'
+for probe in "SELECT 1" "@tables" "@imported:orders"; do
+	got="$(ask "$probe" "$FILE_TOKEN")"
+	case "$got" in *"Unexpected error in RPC handling"*) fail "$probe: the exception reached gRPC unnamed: $got";; esac
+	echo "$got" | grep -q "could not be read" || fail "$probe: the refusal did not say why: $got"
+done
+
+# Every RPC opens a session and must close it whichever way it leaves; after everything above -
+# refusals, throws and all - the door's own count is what proves nothing was left for the sweeper.
+echo "SELECT 'sessions=' || acl_session_count() AS live;" >&3
+counted=""
+for _ in $(seq 1 40); do
+	if grep -q "sessions=" "$TMP/server.log"; then counted=1; break; fi
+	sleep 0.25
+done
+[ -n "$counted" ] || fail "the server did not answer acl_session_count()"
+grep -q "sessions=0" "$TMP/server.log" || fail "a session was left open: $(grep sessions= "$TMP/server.log")"
+
 # --- and the door closes ------------------------------------------------------------------------------
 echo "SELECT acl_flight_stop('$URI');" >&3
 stopped=""

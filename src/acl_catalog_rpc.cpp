@@ -15,6 +15,13 @@ string Bind(CatalogQuery &query, Value value) {
 
 //! The virtual path of an object as the listings spell it: bare in `main`, `schema.name` elsewhere.
 //! Composed in SQL rather than in C++ so it is built from the listing's own columns.
+//!
+//! This is the store's own spelling, not a convention of the door's: a relation's key *is* this path
+//! (`relations.vname`, and `from_vname`/`to_vname` on a reference), and `acl_policy_catalog.cpp`
+//! spells the same CASE in its `path()` helpers. Which is also why the obvious collision - a table
+//! named "foo.bar" in main against a table `bar` in schema `foo` - cannot arise: both would be the
+//! key `foo.bar`, and the store holds one row for it (checked, not assumed). If the store's spelling
+//! ever changes, this must change with it, or every key answer becomes silently empty.
 string PathExpr(const string &schema_column, const string &name_column) {
 	return "CASE WHEN " + schema_column + " = 'main' THEN " + name_column + " ELSE " + schema_column + " || '.' || " +
 	       name_column + " END";

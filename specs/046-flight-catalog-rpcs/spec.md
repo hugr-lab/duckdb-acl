@@ -158,37 +158,32 @@ a listing of tens of rows, removes the question, and gives the exact nullability
 Four types cover every catalog column between them (`utf8`, `binary`, `int32`, `uint8`); anything else
 is a mistake worth failing on rather than guessing at.
 
-**A duckdb exception must not reach gRPC.** duckdb throws and Arrow's handler does not catch, so
-anything that escapes arrives at the client as `Unexpected error in RPC handling` — which says nothing
-at all. Found the way these are always found: `include_schema` threw
-`Context does not have a transaction active` (parsing a type name resolves it against the catalog, and
-a user-defined type is a catalog entry) and the client learned only that *something* went wrong. The
-type parsing now runs inside one transaction for the whole listing — which is also the right shape,
-since the schemas a client is handed then describe one consistent view rather than a per-table sample —
-and the boundary converts what still escapes into a `Status` that names it.
+**A duckdb exception must not reach gRPC — so every RPC runs inside one boundary.** duckdb reports
+through exceptions and gRPC's handler catches everything into a single message, `Unexpected error in
+RPC handling`, which tells a client nothing; and an exception that flew past `SessionClose` left a
+session behind for the sweeper. The first cut caught only the one throw it had seen (`include_schema`'s
+type parsing, which resolves a name against the catalog and needs a transaction). Review found the
+throws it had not: `SessionOpen` resolves an issuer's keys *before* it verifies anything, so a JWKS
+document that cannot be read throws from under the door's own authentication; the Arrow converters
+throw on a type they do not carry; and `ValueOrDie()` on a schema import would not throw at all but
+**abort the process** — one client's sidebar taking the instance down.
 
-### The ticket is the command
+So the door has one boundary, `UnderSession`: authenticate, run the RPC's body under the session, close
+the session from a scope guard's destructor whichever way the body leaves, and turn any exception into
+a `Status` carrying the message the policy wrote (`ErrorData`, since duckdb's `what()` is a JSON
+envelope). Every RPC — the catalog ones here and the statement ones of spec 045, which needed it just
+as much — goes through it, and `CatalogStream` takes a producer so the two-statement `include_schema`
+path shares the skeleton rather than copying it. `SchemasFor` does its duckdb work inside one
+transaction and its Arrow work outside, where a failure is a `Status` and never an abort.
 
-For a statement, the door mints an opaque ticket and remembers the SQL behind it (spec 045). A catalog
-RPC needs none of that: the command *is* the request, so the ticket is the serialized command and
-`FlightSqlServerBase` decodes it back for us in `DoGet`. Nothing is remembered between the two calls,
-so these RPCs add no state, cannot exhaust `MAX_TICKETS`, and cannot be replayed to read as somebody
-else — `DoGet` composes under whoever fetches, exactly as the statement path does.
+The e2e pins it from the outside: a token naming a file-backed issuer whose document does not exist
+gets a refusal that says the keys *could not be read*, not `Unexpected error`, and after every
+refusal and throw of the run `acl_session_count()` is zero.
 
-`GetFlightInfo*` for a catalog command does not run any SQL at all: the schema is a protocol constant,
-so it authenticates, returns the fixed schema and a ticket, and leaves the work to `DoGet`.
-
-**And the endpoint carries no location, deliberately.** Flight's own words are that an empty location
-list means the ticket "can only be redeemed on the current service where the ticket was generated" —
-which is exactly right for a catalog answer, because a catalog answer is the same on every ready node.
-Nodes converge on one policy version (design 009 §3: a node is ready only when it has), so redirecting
-a catalog call would buy a round trip and change nothing. Statements are where routing has something to
-decide; listings are not, and saying so here keeps a future coordinator from having to work it out.
-
-That also keeps "the ticket is the command" true in a cluster rather than only on one node: a catalog
-command names no session and grants nothing, so it is safe to hand to the client whatever the topology
-becomes. The question of what a *statement* ticket must be when a coordinator routes it is spec 045's
-boundary condition, not this spec's.
+**A table with no visible columns is promised an empty schema, and that is the honest answer.** It is
+exactly what `information_schema.columns` says about it, so the two Flight answers agree with each
+other and with SQL. The case itself — an object a role can list but not read — is a listing-level
+matter already tracked as spec 038's follow-up, and fixing it there fixes it here.
 
 ### Functions are not tables, and are not answered here
 

@@ -208,38 +208,44 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, MaterializedQue
 		                           columns.GetValue(2, row).ToString());
 		by_object[key].push_back(row);
 	}
-	vector<string> serialized;
-	try {
-		// Parsing a type name resolves it against the catalog - a user-defined type is a catalog entry -
-		// so it needs a transaction, and without one duckdb refuses rather than guessing. One transaction
-		// covers every table, which is also the right shape: the schemas a client is handed describe one
-		// consistent view of the catalog rather than a per-table sample of it.
-		context.RunFunctionInTransaction([&]() {
-			for (idx_t row = 0; row < tables.RowCount(); row++) {
-				auto key = std::make_tuple(tables.GetValue(0, row).ToString(), tables.GetValue(1, row).ToString(),
-				                           tables.GetValue(2, row).ToString());
-				vector<LogicalType> types;
-				vector<string> names;
-				auto found = by_object.find(key);
-				if (found != by_object.end()) {
-					for (auto column_row : found->second) {
-						names.push_back(columns.GetValue(3, column_row).ToString());
-						types.push_back(
-						    TransformStringToLogicalType(columns.GetValue(4, column_row).ToString(), context));
-					}
+
+	// Two passes, and the split is deliberate. Parsing a type name resolves it against the catalog -
+	// a user-defined type is a catalog entry - so it needs a transaction, and one transaction covers
+	// every table: the schemas a client is handed then describe one consistent view rather than a
+	// per-table sample. The Arrow half runs *outside* it, where a failure can be returned as a Status.
+	// An earlier cut did both inside and reached for ValueOrDie(), which on failure aborts the whole
+	// process - one client's sidebar taking the instance down. Nothing here is worth that.
+	vector<std::pair<vector<string>, vector<LogicalType>>> parsed;
+	context.RunFunctionInTransaction([&]() {
+		for (idx_t row = 0; row < tables.RowCount(); row++) {
+			auto key = std::make_tuple(tables.GetValue(0, row).ToString(), tables.GetValue(1, row).ToString(),
+			                           tables.GetValue(2, row).ToString());
+			vector<string> names;
+			vector<LogicalType> types;
+			// A table with no rows in the columns listing gets an empty schema, and that is the honest
+			// answer rather than a gap to paper over: it is exactly what information_schema.columns
+			// says about it, so the two Flight answers agree with each other and with SQL. The case
+			// itself - an object a role can list but not read - is a listing-level matter, tracked as
+			// such (spec 038's follow-up), and fixing it there fixes it here.
+			auto found = by_object.find(key);
+			if (found != by_object.end()) {
+				for (auto column_row : found->second) {
+					names.push_back(columns.GetValue(3, column_row).ToString());
+					types.push_back(TransformStringToLogicalType(columns.GetValue(4, column_row).ToString(), context));
 				}
-				ArrowSchema exported;
-				auto properties = context.GetClientProperties();
-				ArrowConverter::ToArrowSchema(&exported, types, names, properties);
-				auto schema = arrow::ImportSchema(&exported).ValueOrDie();
-				serialized.push_back(arrow::ipc::SerializeSchema(*schema).ValueOrDie()->ToString());
 			}
-		});
-	} catch (std::exception &ex) {
-		// duckdb throws; gRPC does not catch. Anything that escapes here becomes "Unexpected error in
-		// RPC handling" at the client, which says nothing at all - so it is turned into a Status that
-		// names what happened.
-		return arrow::Status::Invalid(string("acl: describing a catalog: ") + ex.what());
+			parsed.emplace_back(std::move(names), std::move(types));
+		}
+	});
+
+	vector<string> serialized;
+	auto properties = context.GetClientProperties();
+	for (auto &entry : parsed) {
+		ArrowSchema exported;
+		ArrowConverter::ToArrowSchema(&exported, entry.second, entry.first, properties);
+		ARROW_ASSIGN_OR_RAISE(auto schema, arrow::ImportSchema(&exported));
+		ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::ipc::SerializeSchema(*schema));
+		serialized.push_back(buffer->ToString());
 	}
 	return serialized;
 }
