@@ -1889,12 +1889,17 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 			// column with no name in `grant_columns` - which then appeared in every listing, sharing an
 			// ordinal with the column it was supposed to be (spec 042).
 			//
-			// The *type* is deliberately left untyped where the signature does not give one: the baked
+			// The *type* is deliberately untyped where the signature does not give one: the baked
 			// template is serialised back to text, and a bare `NULL` binds against anything, which is
-			// what lets a predicate like `amount >= acl_arg(1)` be probed at all.
+			// what lets a predicate like `amount >= acl_arg(1)` be probed at all. That word is doing
+			// real work: `Value()` is the untyped SQLNULL, while `Value(LogicalType::VARCHAR)` - what
+			// stood here - is a *typed* NULL that merely used to serialise as bare `NULL` because
+			// duckdb lost the type in ToSQLString. duckdb#25002 fixed that, typed NULLs now render as
+			// `NULL::VARCHAR`, and the probe of that very predicate started refusing to bind - found
+			// by the distribution build tracking duckdb main, two days ahead of our pin.
 			auto alias = expr->GetAlias();
 			if (type.empty()) {
-				expr = make_uniq<ConstantExpression>(Value(LogicalType::VARCHAR));
+				expr = make_uniq<ConstantExpression>(Value());
 			} else {
 				// parse the cast rather than resolving the type name by hand (no context needed here)
 				auto casted = Parser::ParseExpressionList("CAST(NULL AS " + type + ")", options);
