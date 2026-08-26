@@ -91,8 +91,28 @@ it was waiting for.
 
 ## Enforcement & security
 
-- **A handle is not an authority.** Every call re-verifies the token; execution composes under the
-  caller. Stealing a handle earns its holder exactly what their own token earns them.
+- **A handle earns a thief nothing at all.** The first cut's rule - "a stolen handle answers the
+  caller's own slice" - covered read authority but not integrity: review showed any authenticated
+  principal who learned a handle could rebind the owner's parameters (quietly changing the owner's
+  results), close the owner's statement, or read the owner's bound values back through `SELECT ?`.
+  Every record now carries its creator's fingerprint (sorted roles + claims - a reconnect owns its
+  handles, a different principal never does), every use requires it, and a mismatch answers exactly
+  like a handle that never existed: no oracle. Close of a foreign handle is a silent no-op.
+- **Handles are swept, not only capped.** Clients that crash close nothing, and a client whose token
+  expired *cannot* close - so records idle past `acl_session_idle_timeout` are dropped when the cap
+  is hit, spec 044's rule on a second map. Without it, 4096 leaked handles were a permanent
+  door-wide denial of CreatePreparedStatement.
+- **Bound parameters are bounded while being read** (65536 rows): parameters are for parameters,
+  bulk data is spec 049's ingest, and a bound enforced after materialization is no bound at all.
+- **A batch is one outcome.** `executemany` runs inside one server-side transaction: a mid-batch
+  refusal (spec 024's write-check) rolls the whole batch back, so a client retry cannot duplicate
+  the rows that had already landed. Zero bound rows with declared parameters is zero executions -
+  DBAPI's meaning - not one; only a parameterless statement runs once. And a query executes exactly
+  one bound row: more is a refusal, never a silent answer from the first.
+- **The promise agrees with the stream.** A result type that rides on a parameter (`SELECT ? AS v`)
+  is UNKNOWN at prepare; with a bound row the schema is resolved by *planning* with the values -
+  planning executes nothing - so the FlightInfo promise and the DoGet stream carry the same types
+  instead of degrading to the wire default.
 - **Parameters are values, never SQL.** They travel as Arrow data, convert through `arrow_scan`, and
   bind through duckdb's parameter binding - no string ever meets the parser.
 - **Fail-closed edges**: unknown handle → refusal; the cap refuses new handles rather than evicting;

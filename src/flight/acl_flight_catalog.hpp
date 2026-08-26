@@ -30,7 +30,8 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, MaterializedQue
 //! The batches are exposed as an ArrowArrayStream and read through `arrow_scan` - duckdb's own
 //! conversion, the same mechanism its in-tree ADBC layer uses - so no second Arrow-to-duckdb type
 //! mapping exists in this codebase.
-arrow::Result<vector<vector<Value>>> ParamRowsFrom(DatabaseInstance &db, arrow::flight::FlightMessageReader &reader);
+arrow::Result<vector<vector<Value>>> ParamRowsFrom(DatabaseInstance &db, arrow::flight::FlightMessageReader &reader,
+                                                   idx_t max_rows);
 
 CatalogFilter FilterFrom(const arrow::flight::sql::GetTables &command);
 CatalogFilter FilterFrom(const arrow::flight::sql::GetDbSchemas &command);

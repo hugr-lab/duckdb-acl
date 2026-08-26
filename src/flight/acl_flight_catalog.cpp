@@ -273,9 +273,25 @@ void ParamStreamGetSchema(ArrowArrayStream *stream, ArrowSchema &schema) {
 
 } // namespace
 
-arrow::Result<vector<vector<Value>>> ParamRowsFrom(DatabaseInstance &db, flight::FlightMessageReader &reader) {
-	// collect the client's batches, then hand them to duckdb as one stream
-	ARROW_ASSIGN_OR_RAISE(auto table, reader.ToTable());
+arrow::Result<vector<vector<Value>>> ParamRowsFrom(DatabaseInstance &db, flight::FlightMessageReader &reader,
+                                                   idx_t max_rows) {
+	// Collect the client's batches - refusing *while reading*, not after they sit in RAM: a bound
+	// enforced post-materialization is no bound at all against a multi-gigabyte "parameter" stream.
+	std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+	int64_t total_rows = 0;
+	while (true) {
+		ARROW_ASSIGN_OR_RAISE(auto chunk, reader.Next());
+		if (!chunk.data) {
+			break;
+		}
+		total_rows += chunk.data->num_rows();
+		if (total_rows > static_cast<int64_t>(max_rows)) {
+			return arrow::Status::Invalid("acl: too many parameter rows bound - batch data belongs to ingest");
+		}
+		batches.push_back(std::move(chunk.data));
+	}
+	ARROW_ASSIGN_OR_RAISE(auto schema, reader.GetSchema());
+	ARROW_ASSIGN_OR_RAISE(auto table, arrow::Table::FromRecordBatches(schema, std::move(batches)));
 	auto batch_reader = std::make_shared<arrow::TableBatchReader>(*table);
 	ArrowArrayStream stream;
 	ARROW_RETURN_NOT_OK(arrow::ExportRecordBatchReader(batch_reader, &stream));

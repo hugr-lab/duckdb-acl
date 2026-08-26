@@ -44,12 +44,17 @@ with connect(acme_token) as conn:
                     [(300, "acme", 1, 0), (301, "acme", 2, 1)])
     cur.execute("SELECT count(*) FROM orders WHERE id >= 300")
     check("executemany rows landed", cur.fetchall() == [(2,)])
+    # one batch, one outcome: the good row and the cross-tenant row travel in the SAME executemany,
+    # and the refusal must take the whole batch with it - a partial commit plus a client retry is a
+    # duplicated row (the review's scenario)
     try:
         cur.executemany("INSERT INTO orders (id, tenant, amount, customer_id) VALUES (?, ?, ?, ?)",
-                        [(302, "globex", 1, 0)])
-        check("cross-tenant executemany refused", False, "the row was written")
+                        [(310, "acme", 1, 0), (311, "globex", 1, 0)])
+        check("cross-tenant executemany refused", False, "the batch was written")
     except Exception as ex:
         check("cross-tenant executemany refused", "does not satisfy the grant" in str(ex), ex)
+    cur.execute("SELECT count(*) FROM orders WHERE id IN (310, 311)")
+    check("and the refusal took the whole batch (no partial commit)", cur.fetchall() == [(0,)])
 
     # --- get_info comes from the registered SqlInfo ------------------------------------------------
     info = conn.adbc_get_info()

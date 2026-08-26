@@ -19,9 +19,20 @@ have="$(echo "LOAD '$ACL_EXT'; SELECT count(*) FROM duckdb_functions() WHERE fun
         | "$DUCKDB" -unsigned -noheader -list 2>/dev/null | tail -1 | tr -d ' ')"
 [ "$have" = "1" ] || { echo "SKIP: this build has no Flight door"; exit 0; }
 "$PYBIN" -c "import adbc_driver_flightsql" 2>/dev/null || { echo "SKIP: adbc_driver_flightsql is not installed (set ACL_ADBC_PYTHON)"; exit 0; }
+# the readiness probe runs client.py, which needs pyarrow - without this check a missing pyarrow
+# reads as "the door never came up", which is a lie about the door
+"$PYBIN" -c "import pyarrow.flight" 2>/dev/null || { echo "SKIP: pyarrow is not installed in $PYBIN"; exit 0; }
 
 TMP="$(mktemp -d)"; SERVER_PID=""
-cleanup() { local rc=$?; [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; rm -rf "$TMP"; exit $rc; }
+cleanup() {
+	local rc=$?
+	if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+		kill "$SERVER_PID" 2>/dev/null || true
+		wait "$SERVER_PID" 2>/dev/null || true
+	fi
+	rm -rf "$TMP"
+	exit $rc
+}
 trap cleanup EXIT INT TERM
 FIFO="$TMP/ctl"; mkfifo "$FIFO"
 { echo "LOAD '$ACL_EXT';"; sed "s|\${ACL_E2E_URI}|$URI|g" "$HERE/bootstrap.sql"; echo "SELECT 1;"; } >"$TMP/server.sql"
