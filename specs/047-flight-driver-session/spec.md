@@ -53,6 +53,14 @@ only that the values stay true as features land.
 
 ### Prepared statements: the ticket rule, applied to a handle
 
+> **Revision 2026-08-27 — the reservation.** As first implemented, the record held the client's SQL
+> and every execution re-composed and re-prepared it — the double parse spec 045 had, inherited. The
+> record now holds the statement **prepared once** at Create (with the Connection it lives on);
+> GetFlightInfo answers schemas from the stored statement, DoGet and the update path execute it.
+> Steps 1–5 below read accordingly; the security rules are unchanged — the owner fingerprint was
+> already the authority, and it is exactly what makes storing the bound statement safe. The statement
+> ticket of spec 045 became the same record with `single_use` set: one store, one sweep, one rule.
+
 The protocol's flow, and what the door does at each step - every call through the same
 `UnderSession` boundary as everything else (token verified per call, session per call, exceptions
 become named Statuses):
