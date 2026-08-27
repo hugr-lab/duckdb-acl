@@ -228,11 +228,22 @@ leaves nothing behind for spec 044's sweeper to find.
 Arrow does ship a `ServerSessionMiddleware` with `GetSession()` and `GetCallHeaders()`, and it is where
 a longer-lived session would belong if one is ever wanted — worth knowing, unused for now.
 
-**A ticket stands for the question, not for the answer.** It holds an opaque id; the server keeps the
-client's *own* SQL against it, unprefixed. Not the composed statement, for a reason found by breaking
-it: the prefix names a session, and the session must be alive when the statement is **parsed**, which
-happens later and more than once. So each use composes afresh, under whoever is fetching — which also
-means a ticket that reached another principal returns *their* slice rather than the asker's.
+**A ticket redeems a reservation.** (Revised 2026-08-27; the first cut is kept below for the
+record.) The ticket is an opaque id; behind it the door holds a *reservation* — the statement parsed,
+rewritten and bound **once**, at `GetFlightInfo`, together with the Connection it lives on and the
+creating principal's fingerprint. `DoGet` verifies the caller *is* that principal and executes: no
+second parse, no second resolution. A stolen ticket earns nothing — spec 047's owner rule, which
+superseded this spec's original "a stolen ticket answers the thief's own slice": that rule required
+re-composing under the fetcher, and re-composing was the entire reason the ticket held text and the
+statement was parsed twice. Owner-only is stronger *and* cheaper. Knowingly accepted: the reservation
+holds rights as resolved at creation; a policy change inside its TTL-bounded life is not re-read —
+the same window every prepared statement everywhere accepts. Reservations are swept by the session
+idle timeout (spec 044's rule), and the cap refuses new ones rather than evicting old.
+
+*The first cut, superseded:* the ticket held the client's own SQL and each use composed afresh under
+whoever fetched — chosen because the prefix names a session that must be alive at parse, and because
+a ticket was then no authority. Both properties survive the revision by other means: the one parse
+happens while the creating call's session is alive, and the owner check is the non-authority.
 
 **And that is a boundary condition, not a free choice.** Holding the client's own SQL in a ticket is
 safe *because the token is the authority*: every call re-verifies it, so a ticket is a convenience and

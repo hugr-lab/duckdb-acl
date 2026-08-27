@@ -1,0 +1,54 @@
+# name: test/sql/acl_statement_gate.test
+# description: statement types outside the gate's allow-list fail closed - pinned, not coincidental.
+#   design/011 asked for exactly this the day CONNECT/DISCONNECT were grammar scaffolding: "the gate
+#   admits an allow-list, so an unknown type fails closed - but that should be a test, not a
+#   coincidence, the day the statement is implemented." They are implemented now (the CONNECT
+#   chokepoint routes raw SQL to a remote catalog), which is precisely why a principal must never
+#   reach them: CONNECT hands every following statement's text to another executor, stepping around
+#   the rewriter the way spec 041's streamed ingest once did.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t(i INT);
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+statement error
+ACL ROLE "r" CONNECT phys;
+----
+<REGEX>:.*statement type CONNECT is not permitted under ACL.*
+
+statement error
+ACL ROLE "r" DISCONNECT;
+----
+<REGEX>:.*statement type DISCONNECT is not permitted under ACL.*
+
+# the gate refuses the mode, not the words: a statement that merely *names* connect is untouched
+query I
+ACL ROLE "r" SELECT 'CONNECT phys' AS just_a_string;
+----
+CONNECT phys
