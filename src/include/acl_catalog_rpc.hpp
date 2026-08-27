@@ -63,6 +63,7 @@ struct CatalogTableRef {
 
 CatalogQuery BuildCatalogListing(CatalogListing listing, const CatalogFilter &filter);
 CatalogQuery BuildKeyListing(KeyListing listing, const CatalogTableRef &table, const CatalogTableRef &second);
+CatalogQuery BuildPrimaryKeyListing(const CatalogTableRef &table);
 
 } // namespace acl
 } // namespace duckdb

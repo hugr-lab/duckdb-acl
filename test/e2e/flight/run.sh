@@ -154,9 +154,21 @@ echo "$got" | grep -q "'fk_column_name': \['customer_id'\]" || fail "cross refer
 got="$(ask "@imported:customers")"
 echo "$got" | grep -q "'fk_column_name': \[\]" || fail "the parent imported something: $got"
 
-# --- primary keys answer empty, deliberately (spec 035) -------------------------------------------
+# --- primary keys answer the DECLARED key (spec 048) ----------------------------------------------
 got="$(ask "@pk:orders")"
-echo "$got" | grep -q "'column_name': \[\]" || fail "GetPrimaryKeys was not empty: $got"
+echo "$got" | grep -q "'column_name': \['id'\]" || fail "GetPrimaryKeys did not answer the declared key: $got"
+echo "$got" | grep -q "'key_sequence': \[1\]" || fail "key_sequence: $got"
+
+# the declared key reaches the promised Arrow schema: id is a non-nullable field
+got="$(ask "@tables_schema")"
+echo "$got" | grep -q "'id:int64 NOT NULL'" || fail "the promised schema does not carry the key's NOT NULL: $got"
+
+# --- text DML through DoPut(CommandStatementUpdate) - the JDBC executeUpdate wire -----------------
+got="$(ask "@update:INSERT INTO orders (id, tenant, amount, customer_id) VALUES (500, 'acme', 5, 0)")"
+echo "$got" | grep -q "{'count': 1}" || fail "the update wire did not land one row: $got"
+
+got="$(ask "@update:INSERT INTO orders (id, tenant, amount, customer_id) VALUES (501, 'globex', 5, 0)")"
+case "$got" in *"does not satisfy the grant"*) ;; *) fail "a cross-tenant update-wire row was not refused: $got";; esac
 
 # --- and none of them is answered without a token --------------------------------------------------
 for probe in "@catalogs" "@tables" "@imported:orders"; do

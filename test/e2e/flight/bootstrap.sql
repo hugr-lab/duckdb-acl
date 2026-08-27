@@ -28,7 +28,9 @@ ACL ADMIN CREATE ISSUER 'https://issuer.test/file' KEYS FROM '/nonexistent/acl-e
     AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
 SET GLOBAL acl_jwks_max_stale = 0;
 ACL ADMIN CREATE VIRTUAL CATALOG c;
-ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders;
+-- the key needs no COLUMNS list (a bare list is a projection, which is read-only) - and the key
+-- itself is what promises id NOT NULL
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders PRIMARY KEY (id);
 ACL ADMIN CREATE VIRTUAL TABLE c.customers AS memory.main.customers;
 ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers
     ON (customer_id = id) CARDINALITY many_to_one COMMENT 'the ordering customer';

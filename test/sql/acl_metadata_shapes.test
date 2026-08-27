@@ -325,7 +325,15 @@ orders	orders a role may read
 query I
 ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables()
 WHERE estimated_size IS NOT NULL OR index_count IS NOT NULL OR check_constraint_count IS NOT NULL
-   OR has_primary_key IS NOT NULL OR internal OR temporary;
+   OR internal OR temporary;
+----
+0
+
+# has_primary_key stopped being a refused physical fact (spec 048): it reports the *declared* key,
+# so its consistency check is agreement with acl_keys(), not nullness
+query I
+ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables() t
+WHERE t.has_primary_key <> EXISTS (SELECT 1 FROM acl_keys() k WHERE k.object = t.table_name);
 ----
 0
 

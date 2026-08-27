@@ -1,0 +1,162 @@
+# name: test/sql/acl_declared_shape.test
+# description: the declared shape of an object (spec 048) - a primary key and per-column nullability,
+#   declared on the object's own declaration, granting nothing, enforcing nothing, visible only as
+#   far as the role sees.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, tenant VARCHAR, amount INT);
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders
+    COLUMNS (id NOT NULL, tenant, amount) PRIMARY KEY (id);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.stats (day VARCHAR NOT NULL, total INTEGER) PRIMARY KEY (day)
+    AS 'SELECT tenant AS day, sum(amount)::INTEGER AS total FROM phys.main.orders GROUP BY 1';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.report(min_amount INTEGER)
+    RETURNS (id INTEGER NOT NULL, amount INTEGER) PRIMARY KEY (id)
+    AS 'SELECT id, amount FROM phys.main.orders WHERE amount >= acl_arg(1)';
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- the declared keys, through the principal's own surface -------------------------------------
+
+query IIII
+ACL ROLE "r" SELECT object, kind, key_sequence, "column" FROM acl_keys() ORDER BY object, key_sequence;
+----
+orders	relation	1	id
+report	table	1	id
+stats	relation	1	day
+
+query I
+ACL ROLE "r" SELECT "column" FROM acl_keys('orders');
+----
+id
+
+# --- nullability: declared wins, a key column implies NOT NULL, undeclared stays open -------------
+
+query II
+ACL ROLE "r" SELECT column_name, is_nullable FROM information_schema.columns
+WHERE table_name = 'orders' ORDER BY ordinal_position;
+----
+id	NO
+tenant	NULL
+amount	NULL
+
+# day is NOT NULL twice over (declared, and the key); total is undeclared on a stored schema
+query II
+ACL ROLE "r" SELECT column_name, is_nullable FROM information_schema.columns
+WHERE table_name = 'stats' ORDER BY ordinal_position;
+----
+day	NO
+total	NULL
+
+# duckdb's boolean shape converts the same rows: undeclared coalesces to nullable
+query II
+ACL ROLE "r" SELECT column_name, is_nullable FROM duckdb_columns()
+WHERE table_name = 'orders' ORDER BY column_index;
+----
+id	false
+tenant	true
+amount	true
+
+# --- has_primary_key answers from the same rows as acl_keys() ------------------------------------
+
+query II
+ACL ROLE "r" SELECT table_name, has_primary_key FROM duckdb_tables() ORDER BY 1;
+----
+orders	true
+
+# --- ALTER round-trips, and redefining the body keeps the key -----------------------------------
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET PRIMARY KEY (id, tenant);
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_keys('orders');
+----
+2
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE FUNCTION c.report SET MACRO 'SELECT id, amount FROM phys.main.orders WHERE amount > acl_arg(1)';
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_keys('report');
+----
+1
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.orders DROP PRIMARY KEY;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_keys('orders');
+----
+0
+
+query II
+ACL ROLE "r" SELECT table_name, has_primary_key FROM duckdb_tables() ORDER BY 1;
+----
+orders	false
+
+# --- refusals happen where the admin writes ------------------------------------------------------
+
+statement error
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE c.orders AS phys.main.orders
+    COLUMNS (id, tenant) PRIMARY KEY (nope);
+----
+<REGEX>:.*primary key of "orders" names "nope", which is not a column.*
+
+statement error
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE c.orders AS phys.main.orders
+    COLUMNS (id NULL, tenant) PRIMARY KEY (id);
+----
+<REGEX>:.*"id" is declared nullable and named in the primary key.*
+
+# --- visibility: a grant that hides a key column hides the key -----------------------------------
+
+statement ok
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE c.orders AS phys.main.orders
+    COLUMNS (id NOT NULL, tenant, amount) PRIMARY KEY (id);
+
+statement ok
+ACL ADMIN CREATE ROLE narrow;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE narrow MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE narrow COLUMNS (tenant, amount);
+
+query I
+ACL ROLE "narrow" SELECT count(*) FROM acl_keys('orders');
+----
+0
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_keys('orders');
+----
+1

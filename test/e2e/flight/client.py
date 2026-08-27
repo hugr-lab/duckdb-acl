@@ -46,6 +46,40 @@ def statement_query(sql: str) -> bytes:
     return command("CommandStatementQuery", text(1, sql))
 
 
+def read_varint(payload: bytes, at: int):
+    shift, out = 0, 0
+    while True:
+        byte = payload[at]
+        out |= (byte & 0x7F) << shift
+        at += 1
+        if not byte & 0x80:
+            return out, at
+        shift += 7
+
+
+def do_update(client, options, sql: str) -> int:
+    """Text DML via DoPut(CommandStatementUpdate) - the wire JDBC's executeUpdate speaks (spec 048).
+    The count comes back as a DoPutUpdateResult{record_count=1} in the writer's metadata."""
+    import pyarrow as pa
+    descriptor = flight.FlightDescriptor.for_command(command("CommandStatementUpdate", text(1, sql)))
+    writer, reader = client.do_put(descriptor, pa.schema([]), options)
+    writer.done_writing()
+    buf = reader.read()
+    writer.close()
+    if buf is None:
+        return -1
+    payload = buf.to_pybytes()
+    at = 0
+    while at < len(payload):
+        tag = payload[at]
+        at += 1
+        if tag >> 3 == 1 and tag & 7 == 0:
+            value, at = read_varint(payload, at)
+            return value
+        value, at = read_varint(payload, at)  # skip an unexpected field
+    return -1
+
+
 def catalog_command(spec: str) -> bytes:
     """`@name` or `@name:arg` - the catalog RPCs, in the terms the protocol uses."""
     name, _, argument = spec[1:].partition(":")
@@ -81,6 +115,9 @@ client = flight.connect(uri)
 # "-" means: send no credentials at all. The door must refuse that, and it is worth being able to ask.
 headers = [] if token == "-" else [(b"authorization", f"Bearer {token}".encode())]
 options = flight.FlightCallOptions(headers=headers)
+if ask.startswith("@update:"):
+    print({"count": do_update(client, options, ask[len("@update:"):])})
+    raise SystemExit(0)
 descriptor = catalog_command(ask) if ask.startswith("@") else statement_query(ask)
 info = client.get_flight_info(flight.FlightDescriptor.for_command(descriptor), options)
 reader = client.do_get(info.endpoints[0].ticket, options)
@@ -93,6 +130,6 @@ if "table_schema" in data:
     unpacked = []
     for blob in data["table_schema"]:
         schema = pa.ipc.read_schema(pa.BufferReader(blob))
-        unpacked.append([f"{f.name}:{f.type}" for f in schema])
+        unpacked.append([f"{f.name}:{f.type}" + ("" if f.nullable else " NOT NULL") for f in schema])
     data["table_schema"] = unpacked
 print(data)

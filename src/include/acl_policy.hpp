@@ -270,7 +270,12 @@ struct PolicyStore {
 	void CatalogCreate(const string &vcat, const string &comment);
 	void CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
 	                        const string &view_sql, const string &rls, const vector<std::pair<string, string>> &columns,
-	                        const string &returns = string());
+	                        const string &returns = string(), const string &pk = string(),
+	                        const case_insensitive_map_t<int8_t> &nullable_marks = {});
+	//! The declared primary key of an existing object (spec 048): empty csv drops it. Declared,
+	//! never enforced; validated against the object's declared columns where they are known.
+	void CatalogSetKey(const string &vcat, const string &vname, const string &kind, const string &pk);
+	string ExistingKeyCsv(const string &vcat, const string &vname, const string &kind);
 	//! Whether `db.schema.name` exists physically - what VIRTUAL ONLY checks before recording it
 	bool PhysicalObjectExists(const string &phys);
 	//! Record a view a role created (spec 018): its body was resolved with the author's rights, with
@@ -315,7 +320,8 @@ struct PolicyStore {
 	//! binding admin SQL at write time would touch the sources (spec 010)
 	void CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
 	                        const string &target, const string &template_sql, const string &params = string(),
-	                        const string &returns = string());
+	                        const string &returns = string(), const string &pk = string(),
+	                        const case_insensitive_map_t<int8_t> &nullable_marks = {});
 	//! spec 022: a reference is a declared join path between two objects - a hint, never a constraint.
 	//! Either `pairs` ("from_col=to_col, …") or `expr` (a qualified SQL condition), never both.
 	//! `to_kind` is "relation" or "function": a table function end is fed arguments (a lateral call),
@@ -352,7 +358,8 @@ struct PolicyStore {
 	// ALTER operations (spec 009): partial change of an EXISTING object - unlike the ADD/GRANT
 	// upserts, a missing target is an error. field names the single property being set.
 	void CatalogAlterRelation(const string &vcat, const string &vname, const string &field, const string &value,
-	                          const vector<std::pair<string, string>> &columns);
+	                          const vector<std::pair<string, string>> &columns,
+	                          const case_insensitive_map_t<int8_t> &nullable_marks = {});
 	void CatalogAlterSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path);
 	void CatalogAlterFunction(const string &vcat, const string &vname, const string &kind, const string &form,
 	                          const string &definition);

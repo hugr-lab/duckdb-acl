@@ -131,9 +131,10 @@ void FiltersNarrowTheListing(Connection &con) {
 void ColumnsAreOneStatementForEveryTable(Connection &con) {
 	CatalogFilter none;
 	auto columns = RunAsRole(con, "analyst", BuildCatalogListing(CatalogListing::COLUMNS, none));
-	Check(Joined(columns) == "c|main|customers|id|INTEGER ; c|main|customers|name|VARCHAR ; "
-	                         "c|main|orders|id|INTEGER ; c|main|orders|customer_id|INTEGER ; "
-	                         "c|main|shipments|id|INTEGER ; c|main|shipments|customer_id|INTEGER",
+	// the sixth column is spec 048's nullability - and orders.id answers NO from its declared key
+	Check(Joined(columns) == "c|main|customers|id|INTEGER|YES ; c|main|customers|name|VARCHAR|YES ; "
+	                         "c|main|orders|id|INTEGER|NO ; c|main|orders|customer_id|INTEGER|YES ; "
+	                         "c|main|shipments|id|INTEGER|YES ; c|main|shipments|customer_id|INTEGER|YES",
 	      "every column of every table, in order, in one statement: " + Joined(columns));
 	// `secret` is not granted to this role, so it is absent here - which is the whole point: what the
 	// client is told it will receive is what it will receive (spec 026)
@@ -215,7 +216,7 @@ int main() {
 	Exec(con, "SELECT acl_use_db('store','acl',true)");
 	Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG c");
-	Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders");
+	Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders PRIMARY KEY (id)");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.customers AS phys.main.customers");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers"
 	          " ON (customer_id = id) CARDINALITY many_to_one");
@@ -232,6 +233,25 @@ int main() {
 	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE narrow MAIN");
 	Exec(con, "ACL ADMIN GRANT OBJECT c.orders TO ROLE narrow WITH ()");
 
+	auto pk_checks = [&]() {
+		CatalogTableRef orders;
+		orders.table = "orders";
+		auto rows = RunAsRole(con, "analyst", BuildPrimaryKeyListing(orders));
+		Check(Joined(rows) == "c|main|orders|id|1|orders_pk",
+		      "GetPrimaryKeys answers the declared key: " + Joined(rows));
+		CatalogTableRef qualified;
+		qualified.has_catalog = true;
+		qualified.catalog = "c";
+		qualified.table = "orders";
+		auto same = RunAsRole(con, "analyst", BuildPrimaryKeyListing(qualified));
+		Check(Joined(same) == Joined(rows), "and catalog-qualified answers the same (the review's lesson)");
+		CatalogTableRef elsewhere;
+		elsewhere.has_catalog = true;
+		elsewhere.catalog = "nope";
+		elsewhere.table = "orders";
+		Check(RunAsRole(con, "analyst", BuildPrimaryKeyListing(elsewhere)).empty(), "a wrong catalog matches nothing");
+	};
+
 	return acl_test::RunMain("acl Flight SQL catalog statements (spec 046)", [&]() {
 		Scenario("patterns-are-parameters", PatternsAreParameters);
 		Scenario("absent-catalog-is-not-empty", AbsentCatalogIsNotAnEmptyOne);
@@ -242,5 +262,6 @@ int main() {
 		Scenario("references-are-keys", [&]() { ReferencesAreTheForeignKeys(con); });
 		Scenario("catalog-qualified-and-export-order", [&]() { CatalogQualifiedRefsAndExportOrder(con); });
 		Scenario("not-every-reference-is-a-key", [&]() { WhatCannotBeAKeyIsNotOne(con); });
+		Scenario("declared-primary-key", pk_checks);
 	});
 }
