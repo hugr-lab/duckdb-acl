@@ -46,10 +46,11 @@ string TablePathsCte() {
 void AppendTableRef(CatalogQuery &query, vector<string> &conditions, const CatalogTableRef &table,
                     const string &alias) {
 	if (table.has_catalog) {
-		// the catalog of a reference is the row's own `vcat` - `alias` is a VARCHAR path column, and
-		// `<path>.vcat` binds as a struct extraction and fails. Found by review: JDBC/ADBC clients
-		// pass the catalog routinely, and neither test did.
-		conditions.push_back("r.vcat = " + Bind(query, Value(table.catalog)));
+		// the catalog is the row's own `vcat` - `alias` is a VARCHAR path column, and `<path>.vcat`
+		// binds as a struct extraction and fails. Found by review: JDBC/ADBC clients pass the
+		// catalog routinely, and neither test did. The alias's qualifier names the row variable.
+		auto row_variable = alias.substr(0, alias.find('.'));
+		conditions.push_back(row_variable + ".vcat = " + Bind(query, Value(table.catalog)));
 	}
 	auto schema = table.schema.empty() ? string("main") : table.schema;
 	auto path = schema == "main" ? table.table : schema + "." + table.table;
@@ -124,12 +125,32 @@ CatalogQuery BuildCatalogListing(CatalogListing listing, const CatalogFilter &fi
 		if (filter.has_table_pattern) {
 			conditions.push_back("table_name LIKE " + Bind(query, Value(filter.table_pattern)));
 		}
-		query.sql = "SELECT table_catalog, table_schema, table_name, column_name, data_type"
+		// is_nullable rides along for the promised Arrow schema (spec 048): duckdb's converter
+		// cannot say non-nullable, so the door clears the flag itself from this very column
+		query.sql = "SELECT table_catalog, table_schema, table_name, column_name, data_type, is_nullable"
 		            " FROM information_schema.columns" +
 		            Where(conditions) + " ORDER BY 1, 2, 3, ordinal_position";
 		return query;
 	}
 	throw InternalException("acl: unknown catalog listing");
+}
+
+//! GetPrimaryKeys (spec 048): the declared key of one table, from the same acl_keys() surface a
+//! principal reads - the door holds a mapping, not a policy. `key_name` is `<object>_pk`: the
+//! protocol wants a name and the declaration has none of its own.
+CatalogQuery BuildPrimaryKeyListing(const CatalogTableRef &table) {
+	CatalogQuery query;
+	vector<string> conditions;
+	AppendTableRef(query, conditions, table, "k.object");
+	conditions.push_back("k.kind = 'relation'"); // a table function's declared key is not the table's
+	query.sql = "WITH " + TablePathsCte() +
+	            " SELECT p.table_catalog AS catalog_name, p.table_schema AS db_schema_name,"
+	            " p.table_name, k.\"column\" AS column_name, k.key_sequence::INTEGER AS key_sequence,"
+	            " k.object || '_pk' AS key_name"
+	            " FROM acl_keys() k"
+	            " JOIN acl_table_paths p ON p.table_catalog = k.vcat AND p.path = k.object" +
+	            Where(conditions) + " ORDER BY key_sequence";
+	return query;
 }
 
 CatalogQuery BuildKeyListing(KeyListing listing, const CatalogTableRef &table, const CatalogTableRef &second) {

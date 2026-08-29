@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS acl."catalogs"("vcat" VARCHAR PRIMARY KEY, "comment" 
 
 CREATE TABLE IF NOT EXISTS acl."relations"("vcat" VARCHAR, "vname" VARCHAR, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, PRIMARY KEY ("vcat", "vname"));
 
-CREATE TABLE IF NOT EXISTS acl."relation_columns"("vcat" VARCHAR, "vname" VARCHAR, "pos" INTEGER, "name" VARCHAR, "expr" VARCHAR, PRIMARY KEY ("vcat", "vname", "pos"));
+CREATE TABLE IF NOT EXISTS acl."relation_columns"("vcat" VARCHAR, "vname" VARCHAR, "pos" INTEGER, "name" VARCHAR, "expr" VARCHAR, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "pos"));
 
 CREATE TABLE IF NOT EXISTS acl."schema_aliases"("vcat" VARCHAR, "alias_path" VARCHAR, "phys_path" VARCHAR, PRIMARY KEY ("vcat", "alias_path"));
 
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS acl."role_mappings"("issuer" VARCHAR, "source" VARCHA
 -- spec 010 (schema v2): comments, and the column schema of every object - declared by an
 -- admin or derived by binding the template at write time (a query-defined object has no
 -- physical row to read names and types from). Runs after every CREATE TABLE above.
-CREATE TABLE IF NOT EXISTS acl."object_columns"("vcat" VARCHAR, "vname" VARCHAR, "kind" VARCHAR, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, "comment" VARCHAR, "derived" BOOLEAN, PRIMARY KEY ("vcat", "vname", "kind", "pos"));
+CREATE TABLE IF NOT EXISTS acl."object_columns"("vcat" VARCHAR, "vname" VARCHAR, "kind" VARCHAR, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, "comment" VARCHAR, "derived" BOOLEAN, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "kind", "pos"));
 
 CREATE TABLE IF NOT EXISTS acl."schemas"("vcat" VARCHAR, "path" VARCHAR, "phys_path" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, PRIMARY KEY ("vcat", "path"));
 
@@ -64,10 +64,15 @@ CREATE TABLE IF NOT EXISTS acl."references"("vcat" VARCHAR, "name" VARCHAR, "fro
 
 CREATE TABLE IF NOT EXISTS acl."reference_columns"("vcat" VARCHAR, "name" VARCHAR, "pos" INTEGER, "side" VARCHAR, "column" VARCHAR, "param" VARCHAR, PRIMARY KEY ("vcat", "name", "pos", "side"));
 
+-- spec 048 (schema v11): the declared shape - a primary key an admin states about a virtual
+-- object (a table, a view or a table function; `kind` mirrors object_columns). Declared, never
+-- enforced; visible only when the object and every named column are.
+CREATE TABLE IF NOT EXISTS acl."keys"("vcat" VARCHAR, "vname" VARCHAR, "kind" VARCHAR, "pos" INTEGER, "column" VARCHAR, PRIMARY KEY ("vcat", "vname", "kind", "pos"));
+
 -- add a computed one the object never had - and a listing that cannot see those describes
 -- something the role does not read.
 CREATE TABLE IF NOT EXISTS acl."grant_columns"("role" VARCHAR, "vcat" VARCHAR, "vname" VARCHAR, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, PRIMARY KEY ("role", "vcat", "vname", "pos"));
 
-INSERT INTO acl."meta" SELECT 'schema_version', '10' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
+INSERT INTO acl."meta" SELECT 'schema_version', '11' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
 
 INSERT INTO acl."meta" SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'policy_version');

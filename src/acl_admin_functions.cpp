@@ -52,17 +52,74 @@ case_insensitive_map_t<string> ParseClaims(const string &csv) {
 }
 
 //! cols_csv items are `name` or `name=expr`; returned as (name, expr) pairs (empty expr = plain)
-vector<std::pair<string, string>> ParseColumns(const string &csv) {
+//! Strip a trailing NOT NULL / NULL declaration off a bare column item (spec 048): `id NOT NULL`
+//! declares, `ssn = NULL` masks - the '=' keeps the two unmistakable. Returns the bare name.
+string StripNullableSuffix(const string &item, case_insensitive_map_t<int8_t> &marks) {
+	auto words = StringUtil::Split(item, ' ');
+	if (words.size() >= 3 && StringUtil::CIEquals(words[words.size() - 2], "not") &&
+	    StringUtil::CIEquals(words.back(), "null")) {
+		auto name = Trimmed(item.substr(0, item.size() - words.back().size() - words[words.size() - 2].size() - 2));
+		marks[name] = 0; // declared NOT NULL
+		return name;
+	}
+	if (words.size() >= 2 && StringUtil::CIEquals(words.back(), "null")) {
+		auto name = Trimmed(item.substr(0, item.size() - words.back().size() - 1));
+		marks[name] = 1; // declared nullable, explicitly
+		return name;
+	}
+	return item;
+}
+
+vector<std::pair<string, string>> ParseColumns(const string &csv, case_insensitive_map_t<int8_t> *marks = nullptr) {
 	vector<std::pair<string, string>> columns;
+	case_insensitive_map_t<int8_t> local;
+	auto &out = marks ? *marks : local;
 	for (auto &item : SplitCsv(csv)) {
 		auto pos = item.find('='); // the first '=' separates the name; the rest is the expression
 		if (pos == string::npos) {
-			columns.emplace_back(item, string());
+			columns.emplace_back(StripNullableSuffix(item, out), string());
 		} else {
-			columns.emplace_back(Trimmed(item.substr(0, pos)), Trimmed(item.substr(pos + 1)));
+			auto name = Trimmed(item.substr(0, pos));
+			auto expr = Trimmed(item.substr(pos + 1));
+			// spec 048: a mask may promise NOT NULL explicitly - the one escape a computed key column
+			// has. Only this form: an expression of its own can end in "NOT NULL" only as "IS NOT
+			// NULL", which is kept whole, and a trailing bare NULL is the mask's value (`ssn = NULL`),
+			// never a mark.
+			auto words = StringUtil::Split(expr, ' ');
+			if (words.size() >= 3 && StringUtil::CIEquals(words[words.size() - 2], "not") &&
+			    StringUtil::CIEquals(words.back(), "null") && !StringUtil::CIEquals(words[words.size() - 3], "is")) {
+				out[name] = 0;
+				expr = Trimmed(expr.substr(0, expr.size() - words.back().size() - words[words.size() - 2].size() - 2));
+			}
+			columns.emplace_back(name, expr);
 		}
 	}
 	return columns;
+}
+
+//! The RETURNS declaration with nullability suffixes stripped into marks: `id INTEGER NOT NULL`
+//! must never reach the type parser whole (it would refuse), and the mark belongs beside the
+//! column either way.
+string StripDeclarationNullability(const string &declaration, case_insensitive_map_t<int8_t> &marks) {
+	vector<string> cleaned;
+	for (auto &item : SplitCsv(declaration)) {
+		auto words = StringUtil::Split(item, ' ');
+		if (words.size() >= 4 && StringUtil::CIEquals(words[words.size() - 2], "not") &&
+		    StringUtil::CIEquals(words.back(), "null")) {
+			marks[words[0]] = 0;
+			words.pop_back();
+			words.pop_back();
+			cleaned.push_back(StringUtil::Join(words, " "));
+		} else if (words.size() >= 3 && StringUtil::CIEquals(words.back(), "null") &&
+		           !StringUtil::CIEquals(words[words.size() - 2], "not")) {
+			marks[words[0]] = 1;
+			words.pop_back();
+			cleaned.push_back(StringUtil::Join(words, " "));
+		} else {
+			cleaned.push_back(item);
+		}
+	}
+	return StringUtil::Join(cleaned, ", ");
 }
 
 //! The old grant functions carry caps as a csv list; the catalog stores a JSON object
@@ -237,15 +294,17 @@ void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		auto vcat = RequiredArg(args, 0, row, "acl_add_relation", "catalog");
 		auto vname = RequiredArg(args, 1, row, "acl_add_relation", "name");
 		auto phys = RequiredArg(args, 2, row, "acl_add_relation", "phys");
-		auto columns = ParseColumns(OptionalArg(args, 3, row, ""));
+		case_insensitive_map_t<int8_t> marks;
+		auto columns = ParseColumns(OptionalArg(args, 3, row, ""), &marks);
 		auto rls = OptionalArg(args, 4, row, "");
+		auto pk = OptionalArg(args, 7, row, "");
 		// renaming is not restricting: a pure rename list keeps the relation writable
 		auto form = rls.empty() && (columns.empty() || RenameOnlyColumns(columns)) ? "alias" : "subquery";
 		auto &store = StoreOf(state);
 		if (!AllowWrite(store, vcat, vname, "relation", OptionalArg(args, 6, row, ""))) {
 			continue;
 		}
-		store.CatalogAddRelation(vcat, vname, form, phys, "", rls, columns);
+		store.CatalogAddRelation(vcat, vname, form, phys, "", rls, columns, "", pk, marks);
 		SetInlineComment(store, vcat, vname, "relation", OptionalArg(args, 5, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -262,7 +321,9 @@ void AclAddViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		if (!AllowWrite(store, vcat, vname, "relation", OptionalArg(args, 5, row, ""))) {
 			continue;
 		}
-		store.CatalogAddRelation(vcat, vname, "view", "", sql, "", {}, OptionalArg(args, 3, row, ""));
+		case_insensitive_map_t<int8_t> marks;
+		auto returns = StripDeclarationNullability(OptionalArg(args, 3, row, ""), marks);
+		store.CatalogAddRelation(vcat, vname, "view", "", sql, "", {}, returns, OptionalArg(args, 6, row, ""), marks);
 		SetInlineComment(store, vcat, vname, "relation", OptionalArg(args, 4, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -418,9 +479,23 @@ void AddFunction(DataChunk &args, ExpressionState &state, Vector &result, const 
 		if (!AllowWrite(store, vcat, vname, kind, OptionalArg(args, 6, row, ""))) {
 			continue;
 		}
+		case_insensitive_map_t<int8_t> marks;
+		auto returns = StripDeclarationNullability(OptionalArg(args, 4, row, ""), marks);
 		store.CatalogAddFunction(vcat, vname, kind, form, is_alias ? definition : "", is_alias ? "" : definition,
-		                         OptionalArg(args, 3, row, ""), OptionalArg(args, 4, row, ""));
+		                         OptionalArg(args, 3, row, ""), returns, OptionalArg(args, 7, row, ""), marks);
 		SetInlineComment(store, vcat, vname, kind, OptionalArg(args, 5, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_set_key(vcat, vname, kind, pk_csv): the declared primary key of an existing object; an
+//! empty csv drops it (spec 048)
+void AclSetKeyFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_set_key", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_set_key", "name");
+		auto kind = RequiredArg(args, 2, row, "acl_set_key", "kind");
+		StoreOf(state).CatalogSetKey(vcat, vname, kind, OptionalArg(args, 3, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -665,8 +740,9 @@ void AclAlterRelationFunc(DataChunk &args, ExpressionState &state, Vector &resul
 		auto vname = RequiredArg(args, 1, row, "acl_alter_relation", "name");
 		auto field = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_relation", "property"));
 		auto value = OptionalArg(args, 3, row, "");
-		StoreOf(state).CatalogAlterRelation(
-		    vcat, vname, field, value, field == "columns" ? ParseColumns(value) : vector<std::pair<string, string>>());
+		case_insensitive_map_t<int8_t> marks;
+		auto columns = field == "columns" ? ParseColumns(value, &marks) : vector<std::pair<string, string>>();
+		StoreOf(state).CatalogAlterRelation(vcat, vname, field, value, columns, marks);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -1177,9 +1253,13 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	// the trailing argument of the object writers is the write mode of spec 013 (create/replace/skip);
 	// omitted, it is the legacy upsert every ADD form promises
 	register_admin_set("acl_create_catalog", {{v}, {v, v}, {v, v, v}}, AclCreateCatalogFunc);
-	register_admin_set("acl_add_relation", {{v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
+	register_admin_set("acl_set_key", {{v, v, v}, {v, v, v, v}}, AclSetKeyFunc);
+	register_admin_set("acl_add_relation",
+	                   {{v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v}},
 	                   AclAddRelationFunc);
-	register_admin_set("acl_add_view", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}}, AclAddViewFunc);
+	register_admin_set("acl_add_view",
+	                   {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
+	                   AclAddViewFunc);
 	register_admin_set("acl_add_schema_alias", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclAddSchemaAliasFunc);
 	register_admin_set("acl_expand_schema", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclExpandSchemaFunc);
 	register_admin_set("acl_grant_schema", {{v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v, b}}, AclGrantSchemaFunc);
@@ -1188,9 +1268,10 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_register_view", {v, v, v}, AclRegisterViewFunc);
 	register_admin("acl_revoke_schema", {v, v, v}, AclRevokeSchemaFunc);
 	register_admin_set("acl_rematerialize_schema_caps", {{v}, {v, v}}, AclRematerializeSchemaCapsFunc);
-	register_admin_set("acl_add_table_function",
-	                   {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
-	                   AclAddTableFunctionFunc);
+	register_admin_set(
+	    "acl_add_table_function",
+	    {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v}},
+	    AclAddTableFunctionFunc);
 	register_admin_set("acl_add_table_function_alias", {{v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
 	                   AclAddTableFunctionAliasFunc);
 	register_admin_set("acl_add_scalar", {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},

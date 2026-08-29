@@ -37,7 +37,18 @@ SELECT acl_use_db('store', 'acl', false);
 ----
 <REGEX>:.*is schema version 9, this build reads [0-9]+.*apply the matching.*
 
-# init brings it back up to this build's version rather than refusing
+# init refuses an older stamp rather than re-stamping it: CREATE TABLE IF NOT EXISTS cannot add
+# a column to a table that already exists, so replaying the schema is not a migration - the honest
+# way up is schema/migrations/v<n>.sql, in order (spec 048 review)
+statement error
+SELECT acl_use_db('store', 'acl', true);
+----
+<REGEX>:.*is schema version 9 and this build creates [0-9]+.*schema/migrations.*
+
+# or, for a catalog with nothing worth keeping, a fresh schema
+statement ok
+DROP SCHEMA store.acl CASCADE;
+
 statement ok
 SELECT acl_use_db('store', 'acl', true);
 

@@ -591,12 +591,23 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 		string vcat, vname;
 		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 		auto returns = s.Parens();
-		string comment;
-		comment_clause(s, comment);
+		string comment, pk;
+		for (bool more = true; more;) {
+			more = false;
+			if (s.Accept("primary")) {
+				s.Expect("key");
+				pk = s.List("key columns");
+				more = true;
+			}
+			if (s.Accept("comment")) {
+				comment = s.Quoted("comment");
+				more = true;
+			}
+		}
 		s.Expect("as");
 		auto sql = s.Body("view SQL");
-		return MakeAdminCall("acl_add_view",
-		                     {Value(vcat), Value(vname), Value(sql), Value(returns), Value(comment), Value(mode)});
+		return MakeAdminCall("acl_add_view", {Value(vcat), Value(vname), Value(sql), Value(returns), Value(comment),
+		                                      Value(mode), Value(pk)});
 	}
 	bool scalar = s.Accept("scalar");
 	bool table_function = false;
@@ -623,6 +634,11 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 				}
 			}
 		}
+		string pk;
+		if (!scalar && s.Accept("primary")) { // after RETURNS: a key describes the result (spec 048)
+			s.Expect("key");
+			pk = s.List("key columns");
+		}
 		string comment;
 		comment_clause(s, comment);
 		if (s.Accept("alias")) {
@@ -635,14 +651,17 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 		}
 		s.Expect("as");
 		auto definition = s.Body(scalar ? "expression template" : "SQL template");
-		return MakeAdminCall(
-		    scalar ? "acl_add_scalar" : "acl_add_table_function",
-		    {Value(vcat), Value(vname), Value(definition), Value(params), Value(returns), Value(comment), Value(mode)});
+		vector<Value> call_args = {Value(vcat),    Value(vname),   Value(definition), Value(params),
+		                           Value(returns), Value(comment), Value(mode)};
+		if (!scalar) {
+			call_args.push_back(Value(pk)); // a scalar result has no key to declare
+		}
+		return MakeAdminCall(scalar ? "acl_add_scalar" : "acl_add_table_function", std::move(call_args));
 	}
 	// CREATE VIRTUAL TABLE v.n AS <phys> [COLUMNS (…)] [RLS (…)] [COMMENT '…']
 	s.Expect("as");
 	auto phys = s.Name("a physical table path");
-	string columns, rls, comment;
+	string columns, rls, comment, pk;
 	for (bool more = true; more;) {
 		more = false;
 		if (s.Accept("columns")) {
@@ -653,13 +672,18 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 			rls = s.List("RLS predicate");
 			more = true;
 		}
+		if (s.Accept("primary")) { // PRIMARY KEY (col, ...) - declared, never enforced (spec 048)
+			s.Expect("key");
+			pk = s.List("key columns");
+			more = true;
+		}
 		if (s.Accept("comment")) {
 			comment = s.Quoted("comment");
 			more = true;
 		}
 	}
 	return MakeAdminCall("acl_add_relation", {Value(vcat), Value(vname), Value(phys), Value(columns), Value(rls),
-	                                          Value(comment), Value(mode)});
+	                                          Value(comment), Value(mode), Value(pk)});
 }
 
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
@@ -954,10 +978,20 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			s.Expect("comment");
 			return MakeAdminCall("acl_alter_catalog", {Value(vcat), Value(s.Quoted("comment"))});
 		}
-		if (s.Accept("view")) { // ALTER VIRTUAL VIEW v.n SET AS '...'
+		if (s.Accept("view")) { // ALTER VIRTUAL VIEW v.n SET AS '...' | SET|DROP PRIMARY KEY (spec 048)
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			if (s.Accept("drop")) {
+				s.Expect("primary");
+				s.Expect("key");
+				return MakeAdminCall("acl_set_key", {Value(vcat), Value(vname), Value("relation"), Value("")});
+			}
 			s.Expect("set");
+			if (s.Accept("primary")) {
+				s.Expect("key");
+				return MakeAdminCall("acl_set_key",
+				                     {Value(vcat), Value(vname), Value("relation"), Value(s.List("key columns"))});
+			}
 			s.Expect("as");
 			return MakeAdminCall("acl_alter_relation",
 			                     {Value(vcat), Value(vname), Value("view"), Value(s.Body("view SQL"))});
@@ -979,7 +1013,19 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			bool table_function = !scalar && s.Accept("function");
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			if (!scalar && s.Accept("drop")) { // ALTER VIRTUAL ... DROP PRIMARY KEY (spec 048: a scalar has none)
+				s.Expect("primary");
+				s.Expect("key");
+				return MakeAdminCall("acl_set_key", {Value(vcat), Value(vname),
+				                                     Value(string(table_function ? "table" : "relation")), Value("")});
+			}
 			s.Expect("set");
+			if (!scalar && s.Accept("primary")) { // ALTER VIRTUAL ... SET PRIMARY KEY (col, ...)
+				s.Expect("key");
+				return MakeAdminCall("acl_set_key",
+				                     {Value(vcat), Value(vname), Value(string(table_function ? "table" : "relation")),
+				                      Value(s.List("key columns"))});
+			}
 			if (scalar || table_function) { // ALTER VIRTUAL [TABLE FUNCTION|SCALAR] v.n SET MACRO|ALIAS '...'
 				bool is_macro = s.Accept("macro");
 				if (!is_macro) {

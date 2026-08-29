@@ -15,7 +15,7 @@ static const char *const ACL_SCHEMA_SQL[] = {
     "CREATE TABLE IF NOT EXISTS <meta>(\"key\" ACL_KEY_TEXT PRIMARY KEY, \"value\" VARCHAR)",
     "CREATE TABLE IF NOT EXISTS <catalogs>(\"vcat\" ACL_KEY_TEXT PRIMARY KEY, \"comment\" VARCHAR)",
     "CREATE TABLE IF NOT EXISTS <relations>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"form\" VARCHAR, \"phys\" VARCHAR, \"view_sql\" VARCHAR, \"rls\" VARCHAR, \"comment\" VARCHAR, \"origin\" VARCHAR, \"rls_checked\" BOOLEAN, PRIMARY KEY (\"vcat\", \"vname\"))",
-    "CREATE TABLE IF NOT EXISTS <relation_columns>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"pos\" INTEGER, \"name\" VARCHAR, \"expr\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\", \"pos\"))",
+    "CREATE TABLE IF NOT EXISTS <relation_columns>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"pos\" INTEGER, \"name\" VARCHAR, \"expr\" VARCHAR, \"nullable\" BOOLEAN, PRIMARY KEY (\"vcat\", \"vname\", \"pos\"))",
     "CREATE TABLE IF NOT EXISTS <schema_aliases>(\"vcat\" ACL_KEY_TEXT, \"alias_path\" ACL_KEY_TEXT, \"phys_path\" VARCHAR, PRIMARY KEY (\"vcat\", \"alias_path\"))",
     "CREATE TABLE IF NOT EXISTS <functions>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"kind\" ACL_KEY_TEXT, \"form\" VARCHAR, \"target\" VARCHAR, \"template\" VARCHAR, \"comment\" VARCHAR, \"params\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\", \"kind\"))",
     "CREATE TABLE IF NOT EXISTS <roles>(\"role\" ACL_KEY_TEXT PRIMARY KEY, \"comment\" VARCHAR)",
@@ -26,21 +26,22 @@ static const char *const ACL_SCHEMA_SQL[] = {
     "CREATE TABLE IF NOT EXISTS <issuers>(\"issuer\" ACL_KEY_TEXT PRIMARY KEY, \"keys_json\" VARCHAR, \"audiences\" VARCHAR, \"algs\" VARCHAR, \"role_claim\" VARCHAR, \"claim_map\" VARCHAR, \"jwks_uri\" VARCHAR)",
     "CREATE TABLE IF NOT EXISTS <admins>(\"role\" ACL_KEY_TEXT PRIMARY KEY, \"scope\" VARCHAR, \"vcat\" VARCHAR)",
     "CREATE TABLE IF NOT EXISTS <role_mappings>(\"issuer\" ACL_KEY_TEXT, \"source\" ACL_KEY_TEXT, \"external_value\" ACL_KEY_TEXT, \"role\" ACL_KEY_TEXT, PRIMARY KEY (\"issuer\", \"source\", \"external_value\", \"role\"))",
-    "CREATE TABLE IF NOT EXISTS <object_columns>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"kind\" ACL_KEY_TEXT, \"pos\" INTEGER, \"name\" VARCHAR, \"type\" VARCHAR, \"comment\" VARCHAR, \"derived\" BOOLEAN, PRIMARY KEY (\"vcat\", \"vname\", \"kind\", \"pos\"))",
+    "CREATE TABLE IF NOT EXISTS <object_columns>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"kind\" ACL_KEY_TEXT, \"pos\" INTEGER, \"name\" VARCHAR, \"type\" VARCHAR, \"comment\" VARCHAR, \"derived\" BOOLEAN, \"nullable\" BOOLEAN, PRIMARY KEY (\"vcat\", \"vname\", \"kind\", \"pos\"))",
     "CREATE TABLE IF NOT EXISTS <schemas>(\"vcat\" ACL_KEY_TEXT, \"path\" ACL_KEY_TEXT, \"phys_path\" VARCHAR, \"comment\" VARCHAR, \"origin\" VARCHAR, PRIMARY KEY (\"vcat\", \"path\"))",
     "CREATE TABLE IF NOT EXISTS <role_schemas>(\"role\" ACL_KEY_TEXT, \"vcat\" ACL_KEY_TEXT, \"schema_path\" ACL_KEY_TEXT, \"caps\" VARCHAR, \"inherited\" BOOLEAN, \"comment\" VARCHAR, \"into\" VARCHAR, \"virtual_only\" BOOLEAN, PRIMARY KEY (\"role\", \"vcat\", \"schema_path\"))",
     "CREATE TABLE IF NOT EXISTS <schema_dropped>(\"vcat\" ACL_KEY_TEXT, \"path\" ACL_KEY_TEXT, \"name\" ACL_KEY_TEXT, PRIMARY KEY (\"vcat\", \"path\", \"name\"))",
     "CREATE TABLE IF NOT EXISTS <references>(\"vcat\" ACL_KEY_TEXT, \"name\" ACL_KEY_TEXT, \"from_vname\" VARCHAR, \"to_vname\" VARCHAR, \"to_kind\" VARCHAR, \"expr\" VARCHAR, \"cardinality\" VARCHAR, \"optional\" BOOLEAN, \"join_method\" VARCHAR, \"comment\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\"))",
     "CREATE TABLE IF NOT EXISTS <reference_columns>(\"vcat\" ACL_KEY_TEXT, \"name\" ACL_KEY_TEXT, \"pos\" INTEGER, \"side\" ACL_KEY_TEXT, \"column\" VARCHAR, \"param\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\", \"pos\", \"side\"))",
+    "CREATE TABLE IF NOT EXISTS <keys>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"kind\" ACL_KEY_TEXT, \"pos\" INTEGER, \"column\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\", \"kind\", \"pos\"))",
     "CREATE TABLE IF NOT EXISTS <grant_columns>(\"role\" ACL_KEY_TEXT, \"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"pos\" INTEGER, \"name\" VARCHAR, \"type\" VARCHAR, PRIMARY KEY (\"role\", \"vcat\", \"vname\", \"pos\"))",
-    "INSERT INTO <meta> SELECT 'schema_version', '10' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'schema_version')",
+    "INSERT INTO <meta> SELECT 'schema_version', '11' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'schema_version')",
     "INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'policy_version')",
 };
 // clang-format on
 
 //! The version this schema is. A catalog carries its own in `meta`, and a build refuses one
 //! that does not match: the migration contract rests on the two being comparable (spec 034).
-static constexpr int ACL_SCHEMA_VERSION = 10;
+static constexpr int ACL_SCHEMA_VERSION = 11;
 
 } // namespace acl
 } // namespace duckdb

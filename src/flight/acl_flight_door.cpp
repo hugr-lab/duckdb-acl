@@ -321,6 +321,41 @@ public:
 		                    });
 	}
 
+	//! Text DML via DoPut - the path JDBC's executeUpdate speaks (spec 048). The statement path's
+	//! twin: same session, same composition, same rewriter, same verbatim refusals; the count comes
+	//! back as the protocol wants. Multi-statement strings keep duckdb's own refusal at Prepare.
+	arrow::Result<int64_t> DoPutCommandStatementUpdate(const flight::ServerCallContext &context,
+	                                                   const flightsql::StatementUpdate &command) override {
+		return UnderSession(context, [&](const string &handle) -> arrow::Result<int64_t> {
+			if (!command.transaction_id.empty()) {
+				return arrow::Status::NotImplemented("acl: transactions are not supported");
+			}
+			auto prefixed = state->store->SessionSql(handle, command.query);
+			if (prefixed.empty()) {
+				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
+			}
+			Connection con(state->db);
+			auto stmt = con.Prepare(prefixed);
+			if (stmt->HasError()) {
+				return StatusFromDuck("acl", stmt->GetError());
+			}
+			vector<Value> values;
+			auto result = stmt->Execute(values, false);
+			if (result->HasError()) {
+				return StatusFromDuck("acl", result->GetError());
+			}
+			int64_t total = 0;
+			auto chunk = result->Fetch();
+			if (chunk && chunk->size() > 0 && chunk->ColumnCount() == 1) {
+				auto count = chunk->GetValue(0, 0);
+				if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
+					total = count.GetValue<int64_t>();
+				}
+			}
+			return total;
+		});
+	}
+
 	//! --- prepared statements (spec 047) ----------------------------------------------------------
 	//!
 	//! The ticket rule, applied to a handle: the record holds the client's own SQL, every call
@@ -650,10 +685,6 @@ public:
 		                     BuildCatalogListing(CatalogListing::TABLE_TYPES, CatalogFilter()));
 	}
 
-	//! Empty, and deliberately. Spec 035 decided that a primary key is a property of the *physical*
-	//! table and not a fact about the virtual one; answering it here from a different surface would
-	//! contradict that rather than fill the gap. The way to fill it is a declared virtual key, the way
-	//! spec 022 declared references - in the backlog, not smuggled in as a physical constraint.
 	arrow::Result<std::unique_ptr<flight::FlightInfo>>
 	GetFlightInfoPrimaryKeys(const flight::ServerCallContext &context, const flightsql::GetPrimaryKeys &command,
 	                         const flight::FlightDescriptor &descriptor) override {
@@ -662,8 +693,10 @@ public:
 
 	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
 	DoGetPrimaryKeys(const flight::ServerCallContext &context, const flightsql::GetPrimaryKeys &command) override {
-		auto schema = flightsql::SqlSchema::GetPrimaryKeysSchema();
-		return CatalogStream(context, schema, [&](const string &) { return EmptyBatch(schema); });
+		// spec 048: the *declared* key, from the same acl_keys() surface a principal reads - still
+		// never a physical fact (spec 035's rule stands; the declaration is the virtual object's own)
+		return CatalogStream(context, flightsql::SqlSchema::GetPrimaryKeysSchema(),
+		                     BuildPrimaryKeyListing(TableRefFrom(command.table_ref)));
 	}
 
 	arrow::Result<std::unique_ptr<flight::FlightInfo>>

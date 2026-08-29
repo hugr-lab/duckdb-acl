@@ -219,13 +219,19 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, MaterializedQue
 	// per-table sample. The Arrow half runs *outside* it, where a failure can be returned as a Status.
 	// An earlier cut did both inside and reached for ValueOrDie(), which on failure aborts the whole
 	// process - one client's sidebar taking the instance down. Nothing here is worth that.
-	vector<std::pair<vector<string>, vector<LogicalType>>> parsed;
+	struct ParsedTableSchema {
+		vector<string> names;
+		vector<LogicalType> types;
+		vector<bool> non_nullable;
+	};
+	vector<ParsedTableSchema> parsed;
 	context.RunFunctionInTransaction([&]() {
 		for (idx_t row = 0; row < tables.RowCount(); row++) {
 			auto key = std::make_tuple(tables.GetValue(0, row).ToString(), tables.GetValue(1, row).ToString(),
 			                           tables.GetValue(2, row).ToString());
 			vector<string> names;
 			vector<LogicalType> types;
+			vector<bool> non_nullable;
 			// A table with no rows in the columns listing gets an empty schema, and that is the honest
 			// answer rather than a gap to paper over: it is exactly what information_schema.columns
 			// says about it, so the two Flight answers agree with each other and with SQL. The case
@@ -236,9 +242,11 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, MaterializedQue
 				for (auto column_row : found->second) {
 					names.push_back(columns.GetValue(3, column_row).ToString());
 					types.push_back(TransformStringToLogicalType(columns.GetValue(4, column_row).ToString(), context));
+					auto nullable = columns.GetValue(5, column_row);
+					non_nullable.push_back(!nullable.IsNull() && nullable.ToString() == "NO");
 				}
 			}
-			parsed.emplace_back(std::move(names), std::move(types));
+			parsed.push_back(ParsedTableSchema {std::move(names), std::move(types), std::move(non_nullable)});
 		}
 	});
 
@@ -246,8 +254,17 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, MaterializedQue
 	auto properties = context.GetClientProperties();
 	for (auto &entry : parsed) {
 		ArrowSchema exported;
-		ArrowConverter::ToArrowSchema(&exported, entry.second, entry.first, properties);
+		ArrowConverter::ToArrowSchema(&exported, entry.types, entry.names, properties);
 		ARROW_ASSIGN_OR_RAISE(auto schema, arrow::ImportSchema(&exported));
+		// duckdb's converter marks every field nullable (it has nowhere to learn otherwise);
+		// a declared NOT NULL is the door's to carry into the promise (spec 048)
+		for (idx_t field = 0; field < entry.non_nullable.size(); field++) {
+			if (entry.non_nullable[field]) {
+				ARROW_ASSIGN_OR_RAISE(schema,
+				                      schema->SetField(NumericCast<int>(field),
+				                                       schema->field(NumericCast<int>(field))->WithNullable(false)));
+			}
+		}
 		ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::ipc::SerializeSchema(*schema));
 		serialized.push_back(buffer->ToString());
 	}

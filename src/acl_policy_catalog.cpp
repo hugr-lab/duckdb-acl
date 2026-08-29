@@ -1397,7 +1397,7 @@ struct CatalogBackend {
 			       ") t WHERE t.table_schema = 'main' AND EXISTS (SELECT 1 FROM grants g"
 			       " WHERE g.\"vcat\" = t.table_catalog AND g.\"is_main\" = true) ORDER BY 1";
 		}
-		if (surface != "columns" && surface != "references" && surface != "show_tables_expanded" &&
+		if (surface != "columns" && surface != "references" && surface != "keys" && surface != "show_tables_expanded" &&
 		    surface != "show_tables" && surface != "duckdb_tables" && surface != "duckdb_views" &&
 		    surface != "duckdb_columns") {
 			throw BinderException("acl: unknown metadata surface \"%s\"", surface);
@@ -1412,9 +1412,23 @@ struct CatalogBackend {
 		// shape, for free. Anything else - a projection, a view - is described by its own stored
 		// schema: a masked or computed column has no physical row to borrow, and leaving it out would
 		// hide a column the role can read.
+		// spec 048: one nullability precedence everywhere - the declared mark wins, the physical
+		// answer flows where nothing is declared, and a declared-key column reports NOT NULL
+		auto pk_implies = [&](const string &vcat_expr, const string &vname_expr, const string &column_expr) {
+			return "EXISTS (SELECT 1 FROM " + Tbl("keys") + " pk WHERE pk.\"vcat\" = " + vcat_expr +
+			       " AND pk.\"vname\" = " + vname_expr + " AND pk.\"kind\" = 'relation'" +
+			       " AND lower(pk.\"column\") = lower(" + column_expr + "))";
+		};
+		string alias_vname = "CASE WHEN o.vschema = 'main' THEN o.vname ELSE o.vschema || '.' || o.vname END";
+		string alias_nullable = "CASE WHEN c.\"nullable\" IS NOT NULL THEN"
+		                        " CASE WHEN c.\"nullable\" THEN 'YES' ELSE 'NO' END WHEN " +
+		                        pk_implies("o.vcat", alias_vname, "coalesce(c.\"name\", i.\"column_name\")") +
+		                        " THEN 'NO' ELSE i.\"is_nullable\" END";
 		string columns_sql =
 		    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
-		           " coalesce(c.\"name\", i.\"column_name\") AS column_name)"
+		           " coalesce(c.\"name\", i.\"column_name\") AS column_name, ") +
+		    alias_nullable +
+		    string(" AS is_nullable)"
 		           " FROM objects o JOIN information_schema.columns i ON ") +
 		    physical + projection +
 		    " AND c.\"expr\" = i.\"column_name\""
@@ -1426,7 +1440,11 @@ struct CatalogBackend {
 		    " ELSE o.vschema || '.' || o.vname END))"
 		    " UNION ALL BY NAME"
 		    " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
-		    " oc.\"name\" AS column_name, oc.\"pos\" + 1 AS ordinal_position, oc.\"type\" AS data_type,"
+		    " oc.\"name\" AS column_name, oc.\"pos\" + 1 AS ordinal_position, oc.\"type\" AS data_type," +
+		    string(" CASE WHEN oc.\"nullable\" IS NOT NULL THEN CASE WHEN oc.\"nullable\" THEN 'YES'"
+		           " ELSE 'NO' END WHEN ") +
+		    pk_implies("o.vcat", alias_vname, "oc.\"name\"") +
+		    " THEN 'NO' ELSE NULL END AS is_nullable,"
 		    // `COLUMN_COMMENT` is what information_schema.columns calls it; a `comment` of our own
 		    // added a 46th column to a surface whose shape is fixed (spec 035)
 		    " oc.\"comment\" AS \"COLUMN_COMMENT\" FROM objects o JOIN " +
@@ -1527,8 +1545,25 @@ struct CatalogBackend {
 			              object_oid("table", "t.table_catalog", "t.table_schema", "t.table_name") + " AS " +
 			              (views ? "view_oid" : "table_oid") + ", t.\"TABLE_COMMENT\" AS comment, " + empty_map +
 			              " AS tags, false AS internal, false AS temporary, ";
+			// has_primary_key stops being a refused physical fact and reports the *declared* key
+			// (spec 048) - the same rows acl_keys() answers with, so the two cannot disagree
+			string key_path = "CASE WHEN t.table_schema = 'main' THEN t.table_name"
+			                  " ELSE t.table_schema || '.' || t.table_name END";
+			// the same rule as acl_keys(): a key over a hidden column is not this role's to see, so
+			// has_primary_key and the keys listing cannot disagree under any grant
+			string key_col_path = "CASE WHEN vc.table_schema = 'main' THEN vc.table_name"
+			                      " ELSE vc.table_schema || '.' || vc.table_name END";
+			string has_key = "EXISTS (SELECT 1 FROM " + Tbl("keys") +
+			                 " k WHERE k.\"vcat\" = t.table_catalog AND k.\"vname\" = " + key_path +
+			                 " AND k.\"kind\" = 'relation'"
+			                 " AND NOT EXISTS (SELECT 1 FROM " +
+			                 Tbl("keys") +
+			                 " k2 WHERE k2.\"vcat\" = k.\"vcat\" AND k2.\"vname\" = k.\"vname\""
+			                 " AND k2.\"kind\" = 'relation'"
+			                 " AND NOT EXISTS (SELECT 1 FROM vcolumns vc WHERE vc.table_catalog = k.\"vcat\" AND " +
+			                 key_col_path + " = k2.\"vname\" AND lower(vc.column_name) = lower(k2.\"column\"))))";
 			string tail = views ? column_count + ", NULL::VARCHAR AS sql, true AS is_bound"
-			                    : "NULL::BOOLEAN AS has_primary_key, NULL::BIGINT AS estimated_size, " + column_count +
+			                    : has_key + " AS has_primary_key, NULL::BIGINT AS estimated_size, " + column_count +
 			                          ", NULL::BIGINT AS index_count, NULL::BIGINT AS check_constraint_count, " + ddl +
 			                          " AS sql";
 			return prelude + ", vcolumns AS (" + effective_columns + ") " + head + tail + " FROM (" + tables_sql +
@@ -1542,6 +1577,46 @@ struct CatalogBackend {
 			       " list(c.column_name ORDER BY c.ordinal_position) AS column_names,"
 			       " list(c.data_type ORDER BY c.ordinal_position) AS column_types, false AS temporary"
 			       " FROM vcolumns c GROUP BY ALL ORDER BY ALL";
+		}
+		// spec 048: the declared keys a principal may see - the object visible, and every column the
+		// key names visible (a listed key over a hidden column describes what the role cannot read).
+		// A grant's columns list narrows a table function's result exactly as it narrows a relation
+		// (spec 011), so a function's key hides with any key column the narrowing takes away.
+		if (surface == "keys") {
+			string kcolumn_path = "CASE WHEN vc.table_schema = 'main' THEN vc.table_name"
+			                      " ELSE vc.table_schema || '.' || vc.table_name END";
+			string gfcolumns = "gfcolumns AS (SELECT DISTINCT f.\"vcat\" AS vcat, f.\"vname\" AS vname,"
+			                   " g.\"columns\" AS cat_columns, " +
+			                   string(HasObjectCaps() ? "oc.\"columns\"" : "NULL") + " AS obj_columns FROM " +
+			                   Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" +
+			                   (HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
+			                                          " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
+			                                          " AND oc.\"vname\" = f.\"vname\""
+			                                    : string()) +
+			                   " WHERE f.\"kind\" = 'table' AND " + FunctionVisibleExpr() + ")";
+			string fkey = "gf.vcat = k.\"vcat\" AND gf.vname = k.\"vname\"";
+			string fcolumn_visible = "(NOT EXISTS (SELECT 1 FROM gfcolumns gf WHERE " + fkey +
+			                         ") OR EXISTS (SELECT 1 FROM gfcolumns gf WHERE " + fkey + " AND " +
+			                         keeps("gf.cat_columns", "k2.\"column\"") + " AND " +
+			                         keeps("gf.obj_columns", "k2.\"column\"") + "))";
+			return prelude + ", vcolumns AS (" + effective_columns + "), " + gfcolumns +
+			       " SELECT k.\"vcat\" AS vcat, k.\"vname\" AS object, k.\"kind\" AS kind,"
+			       " k.\"pos\" + 1 AS key_sequence, k.\"column\" AS \"column\" FROM " +
+			       Tbl("keys") +
+			       " k WHERE (CASE WHEN k.\"kind\" = 'table'"
+			       " THEN EXISTS (SELECT 1 FROM vfunctions vf WHERE vf.vcat = k.\"vcat\""
+			       " AND vf.vname = k.\"vname\")"
+			       " ELSE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = k.\"vcat\" AND " +
+			       path("o") +
+			       " = k.\"vname\") END)"
+			       " AND NOT EXISTS (SELECT 1 FROM " +
+			       Tbl("keys") +
+			       " k2 WHERE k2.\"vcat\" = k.\"vcat\" AND k2.\"vname\" = k.\"vname\""
+			       " AND k2.\"kind\" = k.\"kind\" AND NOT CASE WHEN k.\"kind\" = 'table' THEN " +
+			       fcolumn_visible +
+			       " ELSE EXISTS (SELECT 1 FROM vcolumns vc WHERE vc.table_catalog = k.\"vcat\" AND " + kcolumn_path +
+			       " = k2.\"vname\" AND lower(vc.column_name) = lower(k2.\"column\")) END)"
+			       " ORDER BY vcat, object, key_sequence";
 		}
 		// spec 022: a reference is visible when both of its ends are, and when every column it names is
 		// a column the role can see. Anything else would describe an object - or a column - the role
@@ -1922,6 +1997,95 @@ struct CatalogBackend {
 		return true;
 	}
 
+	//! The declared key's rows (spec 048). `known` are the lowercased column names the caller could
+	//! establish; empty means nothing checkable, and the key is stored as written - the same
+	//! best-effort rule as an unbindable predicate. An explicitly nullable key column is a
+	//! contradiction refused outright.
+	//! A projection entry that merely renames reads the physical column as it is; anything else is
+	//! an expression whose NULL-capability the declaration cannot see (spec 048).
+	static bool BareIdentifier(const string &expr) {
+		string text = expr;
+		StringUtil::Trim(text);
+		if (text.empty()) {
+			return true;
+		}
+		if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+			return text.find('"', 1) == text.size() - 1; // one quoted name, nothing after it
+		}
+		if (!isalpha(static_cast<unsigned char>(text[0])) && text[0] != '_') {
+			return false;
+		}
+		for (auto ch : text) {
+			if (!isalnum(static_cast<unsigned char>(ch)) && ch != '_') {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	//! The keys rows of one declaration. A stated key is validated strictly and a violation refused;
+	//! a `carried` key - one an ALTER or a replace reads out of the store and passes back - lapses
+	//! instead when the new shape no longer supports it (only the DELETE is written): the redefinition
+	//! is the admin's decision, and blocking it over a key they did not state helps nobody.
+	vector<string> KeyStatements(const string &vcat, const string &vname, const string &kind, const string &pk,
+	                             const vector<string> &known, const case_insensitive_map_t<int8_t> &nullable_marks,
+	                             const vector<std::pair<string, string>> *masked = nullptr, bool carried = false) {
+		vector<string> statements;
+		statements.push_back("DELETE FROM " + Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
+		vector<string> inserts;
+		idx_t pos = 0;
+		for (auto &item : StringUtil::Split(pk, ',')) {
+			auto column = item;
+			StringUtil::Trim(column);
+			if (column.size() >= 2 && column.front() == '"' && column.back() == '"') {
+				// a quoted identifier stores and compares as its name, exactly as a column does
+				column = StringUtil::Replace(column.substr(1, column.size() - 2), "\"\"", "\"");
+			}
+			if (column.empty()) {
+				continue;
+			}
+			if (!known.empty() && std::find(known.begin(), known.end(), StringUtil::Lower(column)) == known.end()) {
+				if (carried) {
+					return statements;
+				}
+				throw InvalidInputException("acl: the primary key of \"%s\" names \"%s\", which is not a column "
+				                            "of its declaration",
+				                            vname, column);
+			}
+			auto mark = nullable_marks.find(column);
+			if (mark != nullable_marks.end() && mark->second != 0) {
+				if (carried) {
+					return statements;
+				}
+				throw InvalidInputException("acl: \"%s\" is declared nullable and named in the primary key of "
+				                            "\"%s\" - a key column cannot be nullable",
+				                            column, vname);
+			}
+			// a computed or masked column may be NULL whatever the physical rows hold, so a key over one
+			// is a promise the declaration cannot see through - unless the admin states NOT NULL
+			// explicitly, which is theirs to make (spec 048)
+			if (masked && (mark == nullable_marks.end() || mark->second != 0)) {
+				for (auto &pair : *masked) {
+					if (StringUtil::CIEquals(pair.first, column) && !pair.second.empty() &&
+					    !BareIdentifier(pair.second)) {
+						if (carried) {
+							return statements;
+						}
+						throw InvalidInputException(
+						    "acl: \"%s\" is computed by an expression, so the primary key of \"%s\" cannot "
+						    "vouch that it is never NULL - declare the column NOT NULL explicitly to key it",
+						    column, vname);
+					}
+				}
+			}
+			inserts.push_back("INSERT INTO " + Tbl("keys") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) + ", " +
+			                  Lit(kind) + ", " + std::to_string(pos++) + ", " + Lit(column) + ")");
+		}
+		statements.insert(statements.end(), inserts.begin(), inserts.end());
+		return statements;
+	}
+
 	//! Bind a grant's predicate against the object it filters, without reading data. Returns the
 	//! binder's message when the predicate is at fault and an empty string when it binds.
 	//!
@@ -2120,15 +2284,19 @@ struct CatalogBackend {
 
 	//! Statements replacing one object's stored column schema
 	vector<string> ColumnSchemaStatements(const string &vcat, const string &vname, const string &kind,
-	                                      const vector<std::pair<string, string>> &columns, bool derived) {
+	                                      const vector<std::pair<string, string>> &columns, bool derived,
+	                                      const case_insensitive_map_t<int8_t> &nullable_marks = {}) {
 		vector<string> statements;
 		statements.push_back("DELETE FROM " + Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
 		idx_t pos = 0;
 		for (auto &column : columns) {
+			auto mark = nullable_marks.find(column.first);
+			string nullable = mark == nullable_marks.end() ? "NULL" : (mark->second ? "true" : "false");
 			statements.push_back("INSERT INTO " + Tbl("object_columns") + " VALUES (" + Lit(vcat) + ", " + Lit(vname) +
 			                     ", " + Lit(kind) + ", " + std::to_string(pos++) + ", " + Lit(column.first) + ", " +
-			                     Lit(column.second) + ", NULL, " + (derived ? "true" : "false") + ")");
+			                     Lit(column.second) + ", NULL, " + (derived ? "true" : "false") + ", " + nullable +
+			                     ")");
 		}
 		return statements;
 	}
@@ -2200,6 +2368,30 @@ struct CatalogBackend {
 		// spec 034: the schema is written down once, in schema/policy_schema.sql; this header is
 		// generated from it, so what an operator applies by hand and what the extension creates here are
 		// the same statements.
+		// an existing stamp is judged BEFORE anything is applied (spec 048 review): `CREATE TABLE IF
+		// NOT EXISTS` cannot add a column to a table that already exists, so replaying the schema over
+		// an older catalog and re-stamping it claimed a shape the tables do not have - and destroyed
+		// the honest refusal RequireSchemaVersion gives. An older catalog takes its steps from
+		// schema/migrations/ (v<n>.sql for every version above its own, in order); a newer one belongs
+		// to a newer build. An unreadable stamp is repaired below: init is exactly the moment.
+		string stored;
+		try {
+			stored = MetaValue("schema_version");
+		} catch (std::exception &) {
+			// no meta table to read: a fresh database, which is exactly what init is for
+		}
+		int64_t stamped = -1;
+		try {
+			stamped = stored.empty() ? -1 : std::stoll(stored);
+		} catch (std::exception &) {
+			stamped = -1;
+		}
+		if (stamped >= 0 && stamped != ACL_SCHEMA_VERSION) {
+			throw BinderException("acl catalog: \"%s\".\"%s\" is schema version %lld and this build creates %d - "
+			                      "an older catalog is migrated (schema/migrations/v<n>.sql for every version "
+			                      "above %lld, in order), not re-initialised",
+			                      db_name, schema, stamped, ACL_SCHEMA_VERSION, stamped);
+		}
 		vector<string> ddl;
 		for (auto statement : ACL_SCHEMA_SQL) {
 			ddl.push_back(ResolveSchemaNames(statement));
@@ -2218,17 +2410,7 @@ struct CatalogBackend {
 				throw BinderException("acl catalog: init failed at [%s]: %s", sql, result->GetError());
 			}
 		}
-		// bringing an existing stamp up to date is a decision about versions, not a comparison SQL
-		// should make: `CAST(value AS INTEGER)` throws on a stamp that is not a number, which left a
-		// corrupt catalog impossible to re-initialise (spec 034).
-		auto stored = MetaValue("schema_version");
-		int64_t version = -1;
-		try {
-			version = stored.empty() ? -1 : std::stoll(stored);
-		} catch (std::exception &) {
-			version = -1; // unreadable: init is exactly the moment to make it current
-		}
-		if (version != ACL_SCHEMA_VERSION) {
+		if (stamped != ACL_SCHEMA_VERSION) { // fresh, or an unreadable stamp being repaired (spec 034)
 			auto stamp = con.Query("UPDATE " + Tbl("meta") + " SET \"value\" = '" + std::to_string(ACL_SCHEMA_VERSION) +
 			                       "' WHERE \"key\" = 'schema_version'");
 			if (stamp->HasError()) {
@@ -2433,10 +2615,15 @@ void PolicyStore::CatalogCreate(const string &vcat, const string &comment) {
 namespace {
 
 //! The statements that (re)write one relation - shared by ADD and the transactional ALTER
+//! The declared shape of spec 048 rides the same write: `pk` is the csv of key columns (empty =
+//! none), `nullable_marks` the explicit per-column declarations (absent = undeclared). Both are
+//! validated here, where the admin writes them, against whatever column names the write itself
+//! establishes - and never enforced anywhere.
 vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, const string &vname, const string &form,
                                   const string &phys, const string &view_sql, const string &rls,
                                   const vector<std::pair<string, string>> &columns, const string &comment,
-                                  const string &returns, const string &origin = string()) {
+                                  const string &returns, const string &origin = string(), const string &pk = string(),
+                                  const case_insensitive_map_t<int8_t> &nullable_marks = {}, bool pk_carried = false) {
 	vector<string> statements;
 	statements.push_back("DELETE FROM " + catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                     " AND \"vname\" = " + Lit(vname));
@@ -2464,9 +2651,12 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 	                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ")");
 	idx_t pos = 0;
 	for (auto &column : columns) {
-		statements.push_back("INSERT INTO " + catalog.Tbl("relation_columns") + " VALUES (" + Lit(vcat) + ", " +
-		                     Lit(vname) + ", " + std::to_string(pos++) + ", " + Lit(column.first) + ", " +
-		                     Lit(column.second) + ")");
+		auto mark = nullable_marks.find(column.first);
+		string nullable = mark == nullable_marks.end() ? "NULL" : (mark->second ? "true" : "false");
+		statements.push_back("INSERT INTO " + catalog.Tbl("relation_columns") +
+		                     "(\"vcat\", \"vname\", \"pos\", \"name\", \"expr\", \"nullable\") VALUES (" + Lit(vcat) +
+		                     ", " + Lit(vname) + ", " + std::to_string(pos++) + ", " + Lit(column.first) + ", " +
+		                     Lit(column.second) + ", " + nullable + ")");
 	}
 	// the object's column schema (spec 010): a view has no physical row and no declared projection,
 	// so bind its SQL once, here on the write path; anything else keeps the projected names
@@ -2497,7 +2687,30 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 			schema.emplace_back(column.first, string()); // type filled from the physical catalog on read
 		}
 	}
-	for (auto &statement : catalog.ColumnSchemaStatements(vcat, vname, "relation", schema, derived)) {
+	for (auto &statement : catalog.ColumnSchemaStatements(vcat, vname, "relation", schema, derived, nullable_marks)) {
+		statements.push_back(statement);
+	}
+	// the declared key (spec 048): validated against the names this very write establishes - the
+	// projection, the declared/probed schema, or (for a bare alias) the source probed here for the
+	// validation alone, storing nothing. A source that does not bind stays uncheckable, and the key
+	// is then accepted the way an uncheckable predicate is.
+	vector<string> known;
+	for (auto &column : columns) {
+		known.push_back(StringUtil::Lower(column.first));
+	}
+	for (auto &entry : schema) {
+		known.push_back(StringUtil::Lower(entry.first));
+	}
+	if (known.empty() && !pk.empty() && !phys.empty()) {
+		vector<std::pair<string, string>> probed;
+		if (catalog.ProbeSchema("SELECT * FROM " + phys, false, {}, probed)) {
+			for (auto &entry : probed) {
+				known.push_back(StringUtil::Lower(entry.first));
+			}
+		}
+	}
+	for (auto &statement :
+	     catalog.KeyStatements(vcat, vname, "relation", pk, known, nullable_marks, &columns, pk_carried)) {
 		statements.push_back(statement);
 	}
 	return statements;
@@ -2652,7 +2865,8 @@ void RequireNotReserved(const string &vname) {
 
 void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
                                      const string &view_sql, const string &rls,
-                                     const vector<std::pair<string, string>> &columns, const string &returns) {
+                                     const vector<std::pair<string, string>> &columns, const string &returns,
+                                     const string &pk, const case_insensitive_map_t<int8_t> &nullable_marks) {
 	RequireCatalog(catalog, "acl_add_relation");
 	RequireNotReserved(vname);
 	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
@@ -2663,7 +2877,23 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 		if (existing->RowCount() > 0 && !existing->GetValue(0, 0).IsNull()) {
 			comment = existing->GetValue(0, 0).ToString();
 		}
-		statements = RelationStatements(*catalog, vcat, vname, form, phys, view_sql, rls, columns, comment, returns);
+		// a replace that states no key keeps the one declared before, exactly as the comment is kept: a
+		// redeclaration is not a reason to lose it. It lapses only when the new shape no longer supports
+		// it; removing one on purpose is ALTER ... DROP PRIMARY KEY (spec 048).
+		string kept_pk = pk;
+		bool pk_carried = false;
+		if (pk.empty()) {
+			auto keyed = read("SELECT \"column\" FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                  " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation' ORDER BY \"pos\"");
+			vector<string> parts;
+			for (idx_t row = 0; row < keyed->RowCount(); row++) {
+				parts.push_back(keyed->GetValue(0, row).ToString());
+			}
+			kept_pk = StringUtil::Join(parts, ", ");
+			pk_carried = !kept_pk.empty();
+		}
+		statements = RelationStatements(*catalog, vcat, vname, form, phys, view_sql, rls, columns, comment, returns,
+		                                string(), kept_pk, nullable_marks, pk_carried);
 	});
 }
 
@@ -3041,14 +3271,15 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"schemas", "SELECT \"vcat\", \"path\", \"phys_path\", \"origin\", \"comment\" FROM %s"},
 	    {"relations", "SELECT \"vcat\", \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"rls_checked\","
 	                  " \"origin\", \"comment\" FROM %s"},
-	    {"relation_columns", "SELECT \"vcat\", \"vname\", \"pos\", \"name\", \"expr\" FROM %s"},
+	    {"relation_columns", "SELECT \"vcat\", \"vname\", \"pos\", \"name\", \"expr\", \"nullable\" FROM %s"},
 	    {"object_columns", "SELECT \"vcat\", \"vname\", \"kind\", \"pos\", \"name\", \"type\", \"comment\","
-	                       " \"derived\" FROM %s"},
+	                       " \"derived\", \"nullable\" FROM %s"},
 	    {"functions", "SELECT \"vcat\", \"vname\", \"kind\", \"form\", \"target\", \"template\", \"params\","
 	                  " \"comment\" FROM %s"},
 	    {"references", "SELECT \"vcat\", \"name\", \"from_vname\", \"to_vname\", \"to_kind\", \"expr\","
 	                   " \"cardinality\", \"optional\", \"join_method\", \"comment\" FROM %s"},
 	    {"reference_columns", "SELECT \"vcat\", \"name\", \"pos\", \"side\", \"column\", \"param\" FROM %s"},
+	    {"keys", "SELECT \"vcat\", \"vname\", \"kind\", \"pos\", \"column\" FROM %s"},
 	    {"roles", "SELECT \"role\", \"comment\" FROM %s"},
 	    {"role_claims", "SELECT \"role\", \"claim\", \"value\" FROM %s"},
 	    {"grants", "SELECT \"role\", \"vcat\", \"is_main\", \"caps\", \"rls\", \"rls_checked\", \"columns\""
@@ -3073,6 +3304,7 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"functions", "functions"},
 	    {"references", "references"},
 	    {"reference_columns", "reference_columns"},
+	    {"keys", "keys"},
 	    {"roles", "roles"},
 	    {"role_claims", "role_claims"},
 	    {"grants", "role_catalogs"},
@@ -3339,6 +3571,9 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat) +
 				                     " AND \"vname\" = " + Lit(vname));
 			}
+			// a vanished relation takes only its own key: a same-named table function keeps its rows
+			statements.push_back("DELETE FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'");
 			statements.push_back("DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 			                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'");
 			changed++;
@@ -3347,9 +3582,93 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 	return changed;
 }
 
+//! The stored key of one object, as the csv the writers take - what an ALTER carries through so a
+//! redefinition does not silently drop a declaration (spec 048).
+string PolicyStore::ExistingKeyCsv(const string &vcat, const string &vname, const string &kind) {
+	auto rows = catalog->Query("SELECT \"column\" FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                           " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind) + " ORDER BY \"pos\"");
+	vector<string> columns;
+	for (idx_t row = 0; row < rows->RowCount(); row++) {
+		columns.push_back(rows->GetValue(0, row).ToString());
+	}
+	return StringUtil::Join(columns, ", ");
+}
+
+void PolicyStore::CatalogSetKey(const string &vcat, const string &vname, const string &kind, const string &pk) {
+	RequireCatalog(catalog, "acl_set_key");
+	// the target must exist: silently keying a name that is not there is a typo kept forever
+	if (StringUtil::CIEquals(kind, "relation")) {
+		auto exists = catalog->Query("SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                             " AND \"vname\" = " + Lit(vname));
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: relation \"%s.%s\" does not exist", vcat, vname);
+		}
+	} else {
+		auto exists = catalog->Query("SELECT 1 FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                             " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: %s function \"%s.%s\" does not exist", kind, vcat, vname);
+		}
+	}
+	// validate against the stored schema when there is one; none stored = nothing checkable
+	vector<string> known;
+	auto rows =
+	    catalog->Query("SELECT \"name\" FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                   " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
+	for (idx_t row = 0; row < rows->RowCount(); row++) {
+		known.push_back(StringUtil::Lower(rows->GetValue(0, row).ToString()));
+	}
+	// the declared marks and the projection's expressions: an explicitly nullable or a masked column
+	// is refused as a key here exactly as it is where the object is declared (spec 048)
+	case_insensitive_map_t<int8_t> marks;
+	auto marked = catalog->Query("SELECT \"name\", \"nullable\" FROM " + catalog->Tbl("object_columns") +
+	                             " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+	                             " AND \"kind\" = " + Lit(kind) + " AND \"nullable\" IS NOT NULL");
+	for (idx_t row = 0; row < marked->RowCount(); row++) {
+		marks[marked->GetValue(0, row).ToString()] = marked->GetValue(1, row).GetValue<bool>() ? 1 : 0;
+	}
+	vector<std::pair<string, string>> masked;
+	if (StringUtil::CIEquals(kind, "relation")) {
+		auto declared =
+		    catalog->Query("SELECT \"name\", \"expr\", \"nullable\" FROM " + catalog->Tbl("relation_columns") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+		vector<string> projected;
+		for (idx_t row = 0; row < declared->RowCount(); row++) {
+			auto name = declared->GetValue(0, row).ToString();
+			auto expr = declared->GetValue(1, row);
+			masked.emplace_back(name, expr.IsNull() ? string() : expr.ToString());
+			auto nullable = declared->GetValue(2, row);
+			if (!nullable.IsNull()) {
+				marks[name] = nullable.GetValue<bool>() ? 1 : 0;
+			}
+			projected.push_back(StringUtil::Lower(name));
+		}
+		if (known.empty()) {
+			known = projected;
+		}
+	}
+	// a bare alias declares nothing, but its source may bind here: probe it for the validation alone,
+	// storing nothing - a source that does not bind leaves the key uncheckable-accepted (spec 048)
+	if (known.empty() && StringUtil::CIEquals(kind, "relation")) {
+		auto phys_row = catalog->Query("SELECT \"phys\" FROM " + catalog->Tbl("relations") +
+		                               " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		if (phys_row->RowCount() > 0 && !phys_row->GetValue(0, 0).IsNull()) {
+			auto phys = phys_row->GetValue(0, 0).ToString();
+			vector<std::pair<string, string>> probed;
+			if (!phys.empty() && catalog->ProbeSchema("SELECT * FROM " + phys, false, {}, probed)) {
+				for (auto &entry : probed) {
+					known.push_back(StringUtil::Lower(entry.first));
+				}
+			}
+		}
+	}
+	catalog->Write(catalog->KeyStatements(vcat, vname, kind, pk, known, marks, &masked)); // Write bumps policy_version
+}
+
 void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
                                      const string &target, const string &template_sql, const string &params,
-                                     const string &returns) {
+                                     const string &returns, const string &pk,
+                                     const case_insensitive_map_t<int8_t> &nullable_marks, bool pk_carried) {
 	RequireCatalog(catalog, "acl_add_function");
 	RequireNotReserved(vname);
 	vector<string> statements = {"DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -3371,7 +3690,14 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 	} else if (form == "macro") {
 		derived = catalog->ProbeSchema(template_sql, kind == "scalar", CatalogBackend::DeclaredTypes(params), schema);
 	}
-	for (auto &statement : catalog->ColumnSchemaStatements(vcat, vname, kind, schema, derived)) {
+	for (auto &statement : catalog->ColumnSchemaStatements(vcat, vname, kind, schema, derived, nullable_marks)) {
+		statements.push_back(statement);
+	}
+	vector<string> known;
+	for (auto &entry : schema) {
+		known.push_back(StringUtil::Lower(entry.first));
+	}
+	for (auto &statement : catalog->KeyStatements(vcat, vname, kind, pk, known, nullable_marks, nullptr, pk_carried)) {
 		statements.push_back(statement);
 	}
 	catalog->Write(statements);
@@ -3479,7 +3805,9 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 	                             "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                                 " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'",
 	                             "DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                                 " AND \"vname\" = " + Lit(vname)};
+	                                 " AND \"vname\" = " + Lit(vname),
+	                             "DELETE FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                                 " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'"};
 	// a function of the same name keeps the grant, because the grant row cannot tell them apart
 	if (!CatalogObjectExists(vcat, vname, "table") && !CatalogObjectExists(vcat, vname, "scalar")) {
 		DropGrantRowsFor(*catalog, vcat, pred, statements);
@@ -3677,7 +4005,7 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 			                      vcat, StringUtil::Join(roles, ", "));
 		}
 		for (auto table : {"relations", "relation_columns", "schemas", "schema_aliases", "functions", "object_columns",
-		                   "references", "reference_columns", "schema_dropped"}) {
+		                   "references", "reference_columns", "schema_dropped", "keys"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
 		}
 		if (cascade) {
@@ -3712,7 +4040,7 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 			                      vcat, alias_path, count);
 		}
 		if (cascade) {
-			for (auto table : {"relations", "relation_columns", "object_columns", "functions"}) {
+			for (auto table : {"relations", "relation_columns", "object_columns", "functions", "keys"}) {
 				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat) + prefix);
 			}
 			auto under = PrefixName(alias_path);
@@ -3742,6 +4070,8 @@ void PolicyStore::CatalogDropFunction(const string &vcat, const string &vname, c
 		statements.push_back("DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
 		statements.push_back("DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
+		statements.push_back("DELETE FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
 		auto pred = ExactName(vname);
 		// the grant rows name the object, not its kind: they go only once nothing of that name is left
@@ -3840,7 +4170,8 @@ unique_ptr<MaterializedQueryResult> RequireRow(CatalogBackend &catalog, const st
 } // namespace
 
 void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, const string &field,
-                                       const string &value, const vector<std::pair<string, string>> &columns) {
+                                       const string &value, const vector<std::pair<string, string>> &columns,
+                                       const case_insensitive_map_t<int8_t> &nullable_marks) {
 	RequireCatalog(catalog, "acl_alter_relation");
 	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
 	                            vector<string> &statements) {
@@ -3864,14 +4195,31 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		string new_view = view_sql.IsNull() ? string() : view_sql.ToString();
 		string new_rls = rls.IsNull() ? string() : rls.ToString();
 		vector<std::pair<string, string>> new_columns;
+		case_insensitive_map_t<int8_t> kept_marks = nullable_marks;
 		if (field == "columns") {
 			new_columns = columns;
-		} else { // keep the current projection when another property is being set
-			auto rows = read("SELECT \"name\", \"expr\" FROM " + catalog->Tbl("relation_columns") +
+		} else { // keep the current projection - and its nullability marks - when another property is set
+			auto rows = read("SELECT \"name\", \"expr\", \"nullable\" FROM " + catalog->Tbl("relation_columns") +
 			                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
 			for (idx_t row = 0; row < rows->RowCount(); row++) {
 				auto expr = rows->GetValue(1, row);
-				new_columns.emplace_back(rows->GetValue(0, row).ToString(), expr.IsNull() ? string() : expr.ToString());
+				auto name = rows->GetValue(0, row).ToString();
+				new_columns.emplace_back(name, expr.IsNull() ? string() : expr.ToString());
+				auto nullable = rows->GetValue(2, row);
+				if (!nullable.IsNull()) {
+					kept_marks[name] = nullable.GetValue<bool>() ? 1 : 0;
+				}
+			}
+			// a view or a declared result keeps its marks in object_columns - carry those too, the
+			// projection's own (when both state a name) winning
+			auto declared = read("SELECT \"name\", \"nullable\" FROM " + catalog->Tbl("object_columns") +
+			                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+			                     " AND \"kind\" = 'relation' AND \"nullable\" IS NOT NULL");
+			for (idx_t row = 0; row < declared->RowCount(); row++) {
+				auto name = declared->GetValue(0, row).ToString();
+				if (kept_marks.find(name) == kept_marks.end()) {
+					kept_marks[name] = declared->GetValue(1, row).GetValue<bool>() ? 1 : 0;
+				}
 			}
 		}
 		if (field == "phys") {
@@ -3904,8 +4252,19 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 			}
 		}
 		// ALTER keeps the stored schema policy: a declared result is re-declared explicitly, not here
+		// spec 048: a redefinition must not silently drop the declared key - read and carry it
+		string kept_pk;
+		{
+			auto key_rows = read("SELECT \"column\" FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation' ORDER BY \"pos\"");
+			vector<string> parts;
+			for (idx_t key_row = 0; key_row < key_rows->RowCount(); key_row++) {
+				parts.push_back(key_rows->GetValue(0, key_row).ToString());
+			}
+			kept_pk = StringUtil::Join(parts, ", ");
+		}
 		statements = RelationStatements(*catalog, vcat, vname, new_form, new_phys, new_view, new_rls, new_columns,
-		                                comment, string(), origin);
+		                                comment, string(), origin, kept_pk, kept_marks, true);
 	});
 }
 
@@ -3926,7 +4285,18 @@ void PolicyStore::CatalogAlterFunction(const string &vcat, const string &vname, 
 	               " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind),
 	           kind + " function \"" + vcat + "." + vname + "\"");
 	bool is_alias = form == "alias";
-	CatalogAddFunction(vcat, vname, kind, form, is_alias ? definition : "", is_alias ? "" : definition);
+	// redefining the body must not silently drop the declared shape (spec 048): the key and the
+	// nullability marks are read and carried; the key lapses only if the new result loses its column
+	string pk = ExistingKeyCsv(vcat, vname, kind);
+	case_insensitive_map_t<int8_t> marks;
+	auto declared = catalog->Query("SELECT \"name\", \"nullable\" FROM " + catalog->Tbl("object_columns") +
+	                               " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+	                               " AND \"kind\" = " + Lit(kind) + " AND \"nullable\" IS NOT NULL");
+	for (idx_t row = 0; row < declared->RowCount(); row++) {
+		marks[declared->GetValue(0, row).ToString()] = declared->GetValue(1, row).GetValue<bool>() ? 1 : 0;
+	}
+	CatalogAddFunction(vcat, vname, kind, form, is_alias ? definition : "", is_alias ? "" : definition, "", "", pk,
+	                   marks, true);
 }
 
 void PolicyStore::CatalogAlterCatalog(const string &vcat, const string &comment) {
