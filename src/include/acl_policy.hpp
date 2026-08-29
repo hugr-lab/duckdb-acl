@@ -30,6 +30,10 @@ struct Principal {
 	//! ingest INSERT the server generated for it (spec 042). Empty for every statement a client or a
 	//! gateway wrote - which is what keeps the exemption it carries from reaching any of them.
 	string ingest_stream;
+	//! The statement is the Flight door's own composed ingest INSERT (spec 049): the function gate
+	//! passes its arrow_scan source and nothing else. Set only by the ACL INGEST prefix, which only
+	//! the door's C++ composes - never a client's or a gateway's text.
+	bool arrow_ingest = false;
 };
 
 //! Policy for one virtual relation (table or view) under one role. The resolver picks the replacement
@@ -431,6 +435,7 @@ struct PolicyStore {
 	//! Settings behind the two rules (spec 044): seconds a session may go unused before it is dead
 	//! (0 = never), and how many may live at once (0 = unlimited).
 	int64_t SessionIdleTimeout();
+	int64_t MaxIngestRows();
 	int64_t MaxSessions();
 
 	//! Is an ACL door serving on this instance (spec 043)? Set by `acl_quack_serve`, cleared when the

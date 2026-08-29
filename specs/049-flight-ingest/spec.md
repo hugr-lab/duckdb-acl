@@ -57,10 +57,12 @@ The server, inside `UnderSession` (the caller's live session, as every other doo
    materialized into `Value`s, so a multi-gigabyte load never sits in server RAM as a row vector.
 3. **Composes the insert as the server's own text**, from the client's Arrow field names:
    `INSERT INTO <catalog>.<schema>.<table> ("a", "b", "c") SELECT "a", "b", "c"
-    FROM arrow_scan(<data_ptr>, <produce_ptr>, <schema_ptr>)`,
+    FROM arrow_scan($1, $2, $3)`,
    the qualified name built from whatever of `catalog`/`schema`/`table` the command supplied (a bare
    `table` resolves in the session's MAIN catalog, as a bare name does for a query). The three
-   pointers are the server's own, baked as integer literals — the client never sees or controls them.
+   parameters are the server's stream/adapter pointers, bound by the door at execution — `POINTER`
+   has no literal form in SQL text, and this statement carries no parameters of anybody else's, so
+   no user numbering exists to shift and the client never sees or controls them.
 4. **Prefixes it as `ACL INGEST '<handle>' …`** (the door's own composition, above) and prepares +
    executes on a call-local `Connection`. The load is **one statement**, so duckdb's own statement
    atomicity is the transaction: a refusal anywhere — a predicate violation on row N, a stream error,
@@ -116,7 +118,9 @@ Mechanics:
   is your data; the policy speaks when it flows into a real target.
 - **Lifetime**: swept with the session (spec 044's sweeper additionally drops the session's staging
   tables); `if_exists = REPLACE` is allowed *for staging* — it is yours to replace — and
-  `if_not_exist = CREATE` is the normal case there.
+  `if_not_exist = CREATE` is the normal case there. An explicit `catalog`/`schema` alongside
+  `temporary` is refused: the staging namespace is the server's, exactly as duckdb's own ADBC
+  driver documents the combination as incompatible.
 - **Gate**: an explicit **`temp` capability** on the main catalog (the long-planned cap; never part
   of the unstated-caps default, spec 012's rule) — the governance answer to "clients will fill the
   server's memory": an admin grants staging deliberately, `acl_max_ingest_rows` bounds each load,
@@ -152,9 +156,10 @@ spec). A driver reads it to decide whether to offer `adbc_ingest`.
 - **The client authors no SQL.** The insert text is the server's; the field names come from the
   client's Arrow schema and are quoted identifiers in a column list duckdb checks by width and name —
   a stream wider or narrower than the target's writable set is duckdb's own error, not a shifted row.
-- **The golden rule holds.** The composed statement's only constants are the server's three pointers
-  and the policy's injected values; no rewriter-added query parameter (`$1`/`?`). arrow_scan's
-  pointers are AST constants, not parameters — the same standing spec 042's drain has.
+- **The golden rule holds.** The rewriter adds no parameter here or anywhere; the composed
+  statement's `$1..$3` are the door's own, bound to its own pointers in a statement that carries no
+  client SQL and therefore no client parameters to renumber. The policy's injected values are baked
+  constants, exactly as everywhere else.
 - **The caps and the predicate are the write's real gate**, reached through the ordinary INSERT path;
   the transport carries the data, the policy decides the rows.
 

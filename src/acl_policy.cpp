@@ -116,6 +116,9 @@ case_insensitive_set_t DefaultDeniedFunctions() {
 	    "postgres_query", "postgres_scan", "postgres_scan_pushdown", "postgres_execute", "mysql_query", "mysql_scan",
 	    "mysql_execute", "mssql_query", "mssql_scan", "mssql_execute", "sqlite_scan", "sqlite_query", "iceberg_scan",
 	    "iceberg_metadata", "delta_scan", "query", "query_table",
+	    // spec 049: three raw pointers into a table. The ingest source - the door's own composed
+	    // statement is exempted by Principal::arrow_ingest - and nobody else's.
+	    "arrow_scan", "arrow_scan_dumb",
 	    // session / secret state
 	    "getvariable", "which_secret", "current_setting", "current_query",
 	    // metadata surfaces: they enumerate every attached database, so under a principal they are

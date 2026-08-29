@@ -56,6 +56,28 @@ with connect(acme_token) as conn:
     cur.execute("SELECT count(*) FROM orders WHERE id IN (310, 311)")
     check("and the refusal took the whole batch (no partial commit)", cur.fetchall() == [(0,)])
 
+    # --- bulk ingestion (spec 049): the real driver's adbc_ingest, confined like any write --------
+    import pyarrow as pa
+    batch = pa.table({"id": [400, 401], "tenant": ["acme", "acme"], "amount": [1, 2],
+                      "customer_id": [0, 1]})
+    n = cur.adbc_ingest("orders", batch, mode="append")
+    check("adbc_ingest append landed", n == 2, n)
+    cur.execute("SELECT count(*) FROM orders WHERE id IN (400, 401)")
+    check("the ingested rows read back", cur.fetchall() == [(2,)])
+    try:
+        cur.adbc_ingest("orders", pa.table({"id": [410], "tenant": ["globex"], "amount": [1],
+                                            "customer_id": [0]}), mode="append")
+        check("cross-tenant ingest refused", False, "the stream was written")
+    except Exception as ex:
+        check("cross-tenant ingest refused", "does not satisfy the grant" in str(ex), ex)
+    cur.execute("SELECT count(*) FROM orders WHERE id = 410")
+    check("and nothing of the refused stream landed", cur.fetchall() == [(0,)])
+    try:
+        cur.adbc_ingest("brand_new", batch, mode="create")
+        check("mode create refused with the reason", False, "a table was created")
+    except Exception as ex:
+        check("mode create refused with the reason", "does not create tables" in str(ex), ex)
+
     # --- get_info comes from the registered SqlInfo ------------------------------------------------
     info = conn.adbc_get_info()
     check("get_info vendor", info.get("vendor_name") == "duckdb-acl", info.get("vendor_name"))
