@@ -160,3 +160,218 @@ query I
 ACL ROLE "r" SELECT count(*) FROM acl_keys('orders');
 ----
 1
+
+# --- review pins (the interrupted review's five candidates, verified here) ------------------------
+
+# 1. an ALTER of another property keeps the nullability marks
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET RLS 'tenant = acl_claim(''tenant'')';
+
+query II
+ACL ROLE "r" SELECT column_name, is_nullable FROM information_schema.columns
+WHERE table_name = 'orders' AND column_name = 'id';
+----
+id	NO
+
+# 2. dropping the object takes its key with it - the view through the relation drop, the function
+#    through its own
+statement ok
+SELECT acl_drop_relation('c', 'stats');
+
+statement ok
+SELECT acl_drop_function('c', 'report', 'table');
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_keys() WHERE object IN ('report', 'stats');
+----
+0
+
+# 3. keying a name that is not there is refused, not kept
+statement error
+ACL ADMIN ALTER VIRTUAL TABLE c.ghost SET PRIMARY KEY (id);
+----
+<REGEX>:.*relation "c.ghost" does not exist.*
+
+# 4. has_primary_key follows the visibility rule: the narrow role cannot see the key, so it must
+#    not be told the table has one - and the consistency check holds under EVERY role
+query II
+ACL ROLE "narrow" SELECT table_name, has_primary_key FROM duckdb_tables() ORDER BY 1;
+----
+orders	false
+
+query I
+ACL ROLE "narrow" SELECT count(*) FROM duckdb_tables() t
+WHERE t.has_primary_key <> EXISTS (SELECT 1 FROM acl_keys() k WHERE k.object = t.table_name);
+----
+0
+
+# 5. a quoted identifier in the key list stores as its name
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET PRIMARY KEY ("id");
+
+query I
+ACL ROLE "r" SELECT "column" FROM acl_keys('orders');
+----
+id
+
+# --- second review round: the angles the first agent never reported -------------------------------
+
+# 1. a view's key is the ALTER grammar's too, and redefining its SQL keeps both the key and the
+#    declared marks (they live in object_columns, which the first fix round did not carry)
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.daily (day VARCHAR NOT NULL, total INTEGER NOT NULL)
+    AS 'SELECT tenant AS day, sum(amount)::INTEGER AS total FROM phys.main.orders GROUP BY 1';
+
+statement ok
+ACL ADMIN ALTER VIRTUAL VIEW c.daily SET PRIMARY KEY (day);
+
+query II
+ACL ROLE "r" SELECT "column", kind FROM acl_keys('daily');
+----
+day	relation
+
+statement ok
+ACL ADMIN ALTER VIRTUAL VIEW c.daily SET AS 'SELECT tenant AS day, count(*)::INTEGER AS total FROM phys.main.orders GROUP BY 1';
+
+query II
+ACL ROLE "r" SELECT column_name, is_nullable FROM information_schema.columns
+WHERE table_name = 'daily' ORDER BY ordinal_position;
+----
+day	NO
+total	NO
+
+query I
+ACL ROLE "r" SELECT "column" FROM acl_keys('daily');
+----
+day
+
+statement ok
+ACL ADMIN ALTER VIRTUAL VIEW c.daily DROP PRIMARY KEY;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_keys('daily');
+----
+0
+
+# 2. a scalar cannot take a key through ALTER either (CREATE already has no clause for one)
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.twice AS 'acl_arg(1) * 2';
+
+statement error
+ACL ADMIN ALTER VIRTUAL SCALAR c.twice SET PRIMARY KEY (value);
+----
+alias
+
+statement error
+ACL ADMIN ALTER VIRTUAL SCALAR c.twice DROP PRIMARY KEY;
+----
+expected set
+
+# 3. a masked column cannot carry the key's NOT NULL implication - the mask may answer NULL
+#    whatever the physical rows hold; an explicit NOT NULL is the admin's own promise and passes
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders
+    COLUMNS (id = CASE WHEN id > 0 THEN id END, tenant) PRIMARY KEY (id);
+----
+NOT NULL explicitly
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders
+    COLUMNS (id = CASE WHEN id > 0 THEN id END NOT NULL, tenant) PRIMARY KEY (id);
+
+query I
+ACL ROLE "r" SELECT is_nullable FROM information_schema.columns
+WHERE table_name = 'masked' AND column_name = 'id';
+----
+NO
+
+# 4. a bare alias' key is validated against the probed source - a typo is refused, not stored
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.bare AS phys.main.orders PRIMARY KEY (typo_col);
+----
+not a column
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.bare AS phys.main.orders PRIMARY KEY (id);
+
+statement error
+ACL ADMIN ALTER VIRTUAL TABLE c.bare SET PRIMARY KEY (nope);
+----
+not a column
+
+query I
+ACL ROLE "r" SELECT "column" FROM acl_keys('bare');
+----
+id
+
+# 5. a replace that states no key keeps the declared one (as the comment is kept); it lapses only
+#    when the new shape loses the column, instead of blocking the redeclaration
+statement ok
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE c.bare AS phys.main.orders COLUMNS (id NOT NULL, tenant);
+
+query I
+ACL ROLE "r" SELECT "column" FROM acl_keys('bare');
+----
+id
+
+statement ok
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE c.bare AS phys.main.orders COLUMNS (tenant, amount);
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_keys('bare');
+----
+0
+
+# 6. redefining a table function's body keeps its key and its declared marks
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.perday(m INTEGER)
+    RETURNS (id INTEGER NOT NULL, amount INTEGER NOT NULL) PRIMARY KEY (id)
+    AS 'SELECT id, amount FROM phys.main.orders WHERE amount >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE FUNCTION c.perday SET MACRO 'SELECT id, amount * 2 AS amount FROM phys.main.orders WHERE amount >= acl_arg(1)';
+
+query II
+ACL ROLE "r" SELECT "column", kind FROM acl_keys('perday');
+----
+id	table
+
+query II
+SELECT "name", "nullable" FROM store.acl.object_columns WHERE "vname" = 'perday' ORDER BY "pos";
+----
+id	0
+amount	0
+
+# 7. a grant's columns list narrows a function's result too, so a key over a narrowed-away column
+#    hides with it - while a role that reads the column still sees the key
+statement ok
+ACL ADMIN CREATE ROLE fnarrow;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE fnarrow MAIN COLUMNS (amount, tenant);
+
+query I
+ACL ROLE "fnarrow" SELECT count(*) FROM acl_keys('perday');
+----
+0
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_keys('perday');
+----
+1
+
+# 8. an older catalog is refused at init, never silently re-stamped: CREATE TABLE IF NOT EXISTS
+#    cannot add a column to a table that already exists (keep this block last - it switches stores)
+statement ok
+ATTACH ':memory:' AS old_store;
+
+statement ok
+SELECT acl_use_db('old_store', 'acl', true);
+
+statement ok
+UPDATE old_store.acl.meta SET "value" = '10' WHERE "key" = 'schema_version';
+
+statement error
+SELECT acl_use_db('old_store', 'acl', true);
+----
+schema/migrations

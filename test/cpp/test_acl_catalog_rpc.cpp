@@ -250,6 +250,13 @@ int main() {
 		elsewhere.catalog = "nope";
 		elsewhere.table = "orders";
 		Check(RunAsRole(con, "analyst", BuildPrimaryKeyListing(elsewhere)).empty(), "a wrong catalog matches nothing");
+		// review round 2: a table function may share the relation's name, and its declared key is not
+		// the table's primary key - the listing filters by kind
+		Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.orders(m INTEGER) RETURNS (fid INTEGER NOT NULL) "
+		          "PRIMARY KEY (fid) AS 'SELECT id AS fid FROM phys.main.orders WHERE id >= acl_arg(1)'");
+		auto still = RunAsRole(con, "analyst", BuildPrimaryKeyListing(orders));
+		Check(Joined(still) == "c|main|orders|id|1|orders_pk",
+		      "a same-named table function adds nothing to the table's key: " + Joined(still));
 	};
 
 	return acl_test::RunMain("acl Flight SQL catalog statements (spec 046)", [&]() {

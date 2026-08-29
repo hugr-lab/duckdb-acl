@@ -142,6 +142,7 @@ CatalogQuery BuildPrimaryKeyListing(const CatalogTableRef &table) {
 	CatalogQuery query;
 	vector<string> conditions;
 	AppendTableRef(query, conditions, table, "k.object");
+	conditions.push_back("k.kind = 'relation'"); // a table function's declared key is not the table's
 	query.sql = "WITH " + TablePathsCte() +
 	            " SELECT p.table_catalog AS catalog_name, p.table_schema AS db_schema_name,"
 	            " p.table_name, k.\"column\" AS column_name, k.key_sequence::INTEGER AS key_sequence,"

@@ -1,6 +1,6 @@
 # Spec 048: the declared shape of an object - keys and nullability
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-08-27
 - **Author**: hugr-lab
 
@@ -58,13 +58,16 @@ is a hint a client or an agent reads: it does not create an index, does not reje
 not imply NOT NULL. duckdb could not enforce it against a remote source anyway; pretending otherwise
 would be the lie spec 035 exists to prevent. `update_rule`-style honesty, applied to keys.
 
-### Storage: one new table, no migration
+### Storage: one new table, and the first migration step
 
 `<keys>("vcat" KEY, "vname" KEY, "kind" KEY, "pos" INTEGER, "column" VARCHAR)` in the managed schema
 - `kind` mirroring `object_columns` (`relation` / `table`), so a table, a view and a table function
-store keys the same way. Pre-release, so no migration file: the table joins `policy_schema.sql`,
-`make schema` regenerates, `ACL_SCHEMA_VERSION` steps 10 -> 11, and `CREATE TABLE IF NOT EXISTS`
-does the rest.
+store keys the same way. The table joins `policy_schema.sql`, `make schema` regenerates,
+`ACL_SCHEMA_VERSION` steps 10 -> 11. `CREATE TABLE IF NOT EXISTS` covers the new table but cannot
+add `nullable` to columns tables that already exist, so this version is the first to need a real
+step: `schema/migrations/v11.sql` (the spec-034 contract). `acl_use_db(..., true)` refuses an older
+stamp by version and points at the migrations instead of re-stamping - replaying the schema over a
+v10 catalog and claiming v11 left broken tables behind the one honest failure.
 
 ### The surface: `acl_keys()`, the spec-022 pattern verbatim
 
@@ -72,17 +75,46 @@ A principal reads keys through `acl_keys([object])` - substituted in the rewrite
 function gate, exactly as `acl_references()` is, and visible under the same rule: **a key is listed
 only when its object and every column it names are visible to the role.** A grant that hides `id`
 hides the key that names it - a listed key a role cannot select is a description of something it
-cannot see.
+cannot see. The same rule reaches a table function: a grant's columns list narrows its result
+exactly as it narrows a relation (spec 011), so a function's key hides with any narrowed-away
+column.
 
 Two consumers, one source:
 
-- **`GetPrimaryKeys`** (the Flight door) composes over `acl_keys()` filtered to the named table -
-  the spec-046 rule unchanged: the door holds a mapping, not a policy. `key_sequence` from `pos`
+- **`GetPrimaryKeys`** (the Flight door) composes over `acl_keys()` filtered to the named table
+  and to `kind = 'relation'` - a table function sharing the table's name declares its own key, not
+  the table's. The spec-046 rule unchanged: the door holds a mapping, not a policy. `key_sequence` from `pos`
   (1-based), `key_name` = `'<vname>_pk'`.
 - **`has_primary_key`** in `duckdb_tables()` flips from NULL to an honest EXISTS over the same rows.
   The spec-035 table gains a row: it is no longer a physical fact being refused but a virtual
   declaration being reported. The metadata-shapes leak assertion moves `has_primary_key` from the
   "must be NULL" set to a consistency check against `acl_keys()`.
+
+### What the second review round settled
+
+- **A key is a declaration the redefinitions respect.** `CREATE OR REPLACE` and every `ALTER` that
+  does not state a key *carry* the stored one (exactly as the comment is carried), together with the
+  declared nullability marks - wherever they live (`relation_columns` or `object_columns`). A
+  carried key is not re-litigated: when the new shape no longer has its column, it **lapses**
+  (silently, only the delete is written) instead of blocking a redeclaration the admin never tied to
+  it. Removing a key on purpose is `ALTER ... DROP PRIMARY KEY` - a view alters its key too, and a
+  scalar cannot (`ALTER VIRTUAL SCALAR ... SET PRIMARY KEY` does not parse, as with CREATE).
+- **A masked column cannot be keyed by implication.** A projection entry that is an expression may
+  answer NULL whatever the physical rows hold, so `PRIMARY KEY` over it is refused unless the admin
+  also writes `NOT NULL` after the mask - an explicit promise is theirs to make, and the surface
+  then reports the mark, not the implication. A bare rename is not an expression, and a mask ending
+  in its own `IS NOT NULL` is kept whole - only the trailing `NOT NULL` mark is stripped.
+- **A bare alias' key is validated after all**: the source is probed (`SELECT * ... WHERE false`)
+  for the check alone, storing nothing; a source that does not bind leaves the key
+  uncheckable-accepted, the predicate rule verbatim.
+- **Known limitation:** a *grant-level* mask that keeps the column's type is not stored (spec 026
+  stores only type-changing masks and computed columns), so a role reading a declared-NOT-NULL
+  column through such a mask still sees `is_nullable = 'NO'` and the Arrow non-null promise. The fix
+  is storing every masked name, which belongs to spec 026's table, not here.
+- **`DESCRIBE` stays generic**: spec 025 describes the rewritten relation through duckdb's own
+  subquery describe, whose `null`/`key` columns are always `YES`/`NULL`. The declared shape lives in
+  `information_schema.columns`, `duckdb_columns()`, `acl_keys()` and the Arrow schema; making
+  DESCRIBE agree would mean synthesizing its answer and is not worth diverging from spec 025.
 
 ### `DoPutCommandStatementUpdate`: the prepared update, minus parameters
 

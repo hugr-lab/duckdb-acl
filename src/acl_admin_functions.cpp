@@ -79,7 +79,19 @@ vector<std::pair<string, string>> ParseColumns(const string &csv, case_insensiti
 		if (pos == string::npos) {
 			columns.emplace_back(StripNullableSuffix(item, out), string());
 		} else {
-			columns.emplace_back(Trimmed(item.substr(0, pos)), Trimmed(item.substr(pos + 1)));
+			auto name = Trimmed(item.substr(0, pos));
+			auto expr = Trimmed(item.substr(pos + 1));
+			// spec 048: a mask may promise NOT NULL explicitly - the one escape a computed key column
+			// has. Only this form: an expression of its own can end in "NOT NULL" only as "IS NOT
+			// NULL", which is kept whole, and a trailing bare NULL is the mask's value (`ssn = NULL`),
+			// never a mark.
+			auto words = StringUtil::Split(expr, ' ');
+			if (words.size() >= 3 && StringUtil::CIEquals(words[words.size() - 2], "not") &&
+			    StringUtil::CIEquals(words.back(), "null") && !StringUtil::CIEquals(words[words.size() - 3], "is")) {
+				out[name] = 0;
+				expr = Trimmed(expr.substr(0, expr.size() - words.back().size() - words[words.size() - 2].size() - 2));
+			}
+			columns.emplace_back(name, expr);
 		}
 	}
 	return columns;

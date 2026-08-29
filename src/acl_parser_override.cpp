@@ -978,10 +978,20 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			s.Expect("comment");
 			return MakeAdminCall("acl_alter_catalog", {Value(vcat), Value(s.Quoted("comment"))});
 		}
-		if (s.Accept("view")) { // ALTER VIRTUAL VIEW v.n SET AS '...'
+		if (s.Accept("view")) { // ALTER VIRTUAL VIEW v.n SET AS '...' | SET|DROP PRIMARY KEY (spec 048)
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			if (s.Accept("drop")) {
+				s.Expect("primary");
+				s.Expect("key");
+				return MakeAdminCall("acl_set_key", {Value(vcat), Value(vname), Value("relation"), Value("")});
+			}
 			s.Expect("set");
+			if (s.Accept("primary")) {
+				s.Expect("key");
+				return MakeAdminCall("acl_set_key",
+				                     {Value(vcat), Value(vname), Value("relation"), Value(s.List("key columns"))});
+			}
 			s.Expect("as");
 			return MakeAdminCall("acl_alter_relation",
 			                     {Value(vcat), Value(vname), Value("view"), Value(s.Body("view SQL"))});
@@ -1003,20 +1013,17 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			bool table_function = !scalar && s.Accept("function");
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			if (s.Accept("drop")) { // ALTER VIRTUAL ... DROP PRIMARY KEY (spec 048)
+			if (!scalar && s.Accept("drop")) { // ALTER VIRTUAL ... DROP PRIMARY KEY (spec 048: a scalar has none)
 				s.Expect("primary");
 				s.Expect("key");
-				return MakeAdminCall("acl_set_key",
-				                     {Value(vcat), Value(vname),
-				                      Value(string(scalar ? "scalar" : (table_function ? "table" : "relation"))),
-				                      Value("")});
+				return MakeAdminCall("acl_set_key", {Value(vcat), Value(vname),
+				                                     Value(string(table_function ? "table" : "relation")), Value("")});
 			}
 			s.Expect("set");
-			if (s.Accept("primary")) { // ALTER VIRTUAL ... SET PRIMARY KEY (col, ...)
+			if (!scalar && s.Accept("primary")) { // ALTER VIRTUAL ... SET PRIMARY KEY (col, ...)
 				s.Expect("key");
 				return MakeAdminCall("acl_set_key",
-				                     {Value(vcat), Value(vname),
-				                      Value(string(scalar ? "scalar" : (table_function ? "table" : "relation"))),
+				                     {Value(vcat), Value(vname), Value(string(table_function ? "table" : "relation")),
 				                      Value(s.List("key columns"))});
 			}
 			if (scalar || table_function) { // ALTER VIRTUAL [TABLE FUNCTION|SCALAR] v.n SET MACRO|ALIAS '...'

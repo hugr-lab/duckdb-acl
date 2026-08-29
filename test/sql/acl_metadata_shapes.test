@@ -333,7 +333,9 @@ WHERE estimated_size IS NOT NULL OR index_count IS NOT NULL OR check_constraint_
 # so its consistency check is agreement with acl_keys(), not nullness
 query I
 ACL ROLE "analyst" SELECT count(*) FROM duckdb_tables() t
-WHERE t.has_primary_key <> EXISTS (SELECT 1 FROM acl_keys() k WHERE k.object = t.table_name);
+WHERE t.has_primary_key <> EXISTS (SELECT 1 FROM acl_keys() k WHERE k.kind = 'relation'
+    AND k.object = CASE WHEN t.schema_name = 'main' THEN t.table_name
+                        ELSE t.schema_name || '.' || t.table_name END);
 ----
 0
 

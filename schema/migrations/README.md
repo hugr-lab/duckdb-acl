@@ -1,8 +1,10 @@
 # Schema migrations
 
-Empty on purpose: duckdb-acl has not been released, so every catalog is created from
-[`../acl_schema.sql`](../acl_schema.sql) at the current version and there is nothing to migrate from.
-This file is the contract the first migration will follow (spec 034).
+The steps that take an existing policy catalog from one schema version to the next. The extension
+does not apply them itself: `acl_use_db(..., true)` refuses a catalog with an older stamp by
+version and points here - an operator applies the steps by hand, in order, against the database
+that holds the schema. A fresh catalog is always created from [`../acl_schema.sql`](../acl_schema.sql)
+complete and needs none of them. `v11.sql` (spec 048) is the first step.
 
 ## The contract
 

@@ -321,7 +321,7 @@ struct PolicyStore {
 	void CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
 	                        const string &target, const string &template_sql, const string &params = string(),
 	                        const string &returns = string(), const string &pk = string(),
-	                        const case_insensitive_map_t<int8_t> &nullable_marks = {});
+	                        const case_insensitive_map_t<int8_t> &nullable_marks = {}, bool pk_carried = false);
 	//! spec 022: a reference is a declared join path between two objects - a hint, never a constraint.
 	//! Either `pairs` ("from_col=to_col, …") or `expr` (a qualified SQL condition), never both.
 	//! `to_kind` is "relation" or "function": a table function end is fed arguments (a lateral call),
