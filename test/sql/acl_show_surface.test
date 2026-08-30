@@ -211,9 +211,23 @@ ACL ROLE "r" EXPLAIN SELECT * FROM orders;
 ----
 <REGEX>:.*EXPLAIN needs the explain capability.*
 
+# EXPLAIN ANALYZE runs the query besides, so it wants at least the same gate - and is refused before
+# the inner query can run (the gate is at parser-override time, ahead of bind/execute)
+statement error
+ACL ROLE "r" EXPLAIN ANALYZE SELECT * FROM orders;
+----
+<REGEX>:.*EXPLAIN needs the explain capability.*
+
 # grant it, and the plan (physical names and all) is the principal's to see
 statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE r WITH (select, insert, update, delete, merge, explain) MAIN;
+
+# the audited leak itself, now permitted with the capability: a plain EXPLAIN of a virtual read
+# renders the physical object it resolves to, which is the point of holding explain
+query II
+ACL ROLE "r" EXPLAIN SELECT id FROM orders;
+----
+physical_plan	<REGEX>:.*phys.main.orders.*
 
 # --- an enclosing EXPLAIN keeps its place -----------------------------------------------------------------
 # the PRAGMA is answered by a different statement, so the replacement has to happen inside the EXPLAIN

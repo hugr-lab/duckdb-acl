@@ -30,7 +30,8 @@ so each was probed against a live principal rather than reasoned about from its 
 | Surface | Who answers | What a principal gets | Verdict |
 | --- | --- | --- | --- |
 | `EXPLAIN [ANALYZE] <query>` | duckdb planner | `Table: phys.main.secret_orders` in the plan | **leaked → fixed here** |
-| binder error under a COLUMNS projection | rewriter (SUBQUERY form) | only the granted columns (`Candidate bindings: id`) | safe |
+| binder error, read path (SUBQUERY *or* RENAME) | rewriter | only the granted columns; the physical target is aliased to the virtual name, so a column-not-found error names the *alias* | safe |
+| binder error, write path (INSERT/UPDATE names a column that does not exist) | duckdb binder | the physical **leaf** table name (`Table "orders_physical" does not have column …`) - duckdb's INSERT/UPDATE binder resolves columns by the target table, not its alias | **residual, low - see below** |
 | `duckdb_tables()` (function form) | rewriter → filtered listing | the principal's own tables only | safe (spec 035) |
 | `duckdb_settings/secrets/functions()` | function gate | "table function … is not allowed" | safe (denied) |
 | `sqlite_master`, `pragma_table_info(...)` | rewriter / gate | "no access" / "not allowed" | safe |
@@ -39,8 +40,19 @@ so each was probed against a live principal rather than reasoned about from its 
 | Flight `GetSqlInfo` / `GetXdbcTypeInfo` | the door's SqlInfo registry | server capabilities, no data | out of scope: server metadata, not a principal's catalog (noted, not a leak) |
 | Flight catalog RPCs (`GetTables`, …) | composed SQL under the prefix | the principal's own catalog | safe (spec 046) |
 
-So the audit's yield is one finding, and the rest is a record that the gate and the surface
-replacements already cover what they must - kept as a table so the next surface added has a checklist.
+So the audit's yield is one finding fixed here (EXPLAIN) and one low residual accepted (below); the
+rest is a record that the gate and the surface replacements already cover what they must - kept as a
+table so the next surface added has a checklist.
+
+**The write-path residual.** An `INSERT`/`UPDATE` that names a nonexistent column produces a duckdb
+binder error citing the physical *leaf* table name - because duckdb resolves a DML target's columns
+by the bound table, not by the `AS <virtual>` alias the rewriter attaches (the read path is aliased
+and stays safe; this is why `MapTargetQualifier` exists for the write path). It is accepted, not
+fixed, for the same reason EXPLAIN is a capability rather than a refusal: the principal already holds
+a write capability on *this exact object*, learns only its unqualified leaf name (never the
+catalog/schema/database), and only by deliberately naming a column that does not exist. Scrubbing
+duckdb's own binder message is brittle and buys little. Recorded here so it is a known, bounded fact
+rather than a surprise; a scrub could ride the write path later if a deployment needs it.
 
 ### EXPLAIN as the `explain` capability
 
@@ -68,6 +80,11 @@ replacements already cover what they must - kept as a table so the next surface 
 
 - `test/sql/acl_show_surface.test`: EXPLAIN refused for a role whose MAIN grant has the unstated
   default (no `explain`); granted `explain`, the existing EXPLAIN-of-a-rewritten-PRAGMA test passes.
+- `test/sql/acl_show_surface.test` also pins `EXPLAIN ANALYZE` refused without the cap (it runs the
+  query, so it wants at least the same gate, and the gate is ahead of bind/execute), and the audited
+  leak itself permitted *with* the cap - a plain `EXPLAIN SELECT` rendering the physical name.
+- `test/sql/acl.test`: memory mode has no MAIN grant to carry the capability, so a principal's
+  EXPLAIN is refused there - pinned, since it is a deliberate consequence rather than an accident.
 - `test/e2e/flight/run.sh`: the served `analyst` (granted `select, insert, temp`, not `explain`) is
   refused EXPLAIN through the real door with the capability's reason.
 - The inventory rows that are already safe are pinned by their own specs (035 metadata, 031
