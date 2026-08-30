@@ -250,6 +250,9 @@ got="$(ACL_COOKIE_JAR="$TJ" ask "SELECT count(*) AS n FROM scratch")"
 echo "$got" | grep -q "'n': \[5\]" || fail "the session's temp did not resolve on its own connection: $got"
 got="$(ACL_COOKIE_JAR="$TJ" ask "SELECT name FROM (SHOW TABLES) WHERE name = 'scratch'")"
 echo "$got" | grep -q "'name': \['scratch'\]" || fail "SHOW TABLES does not list the session's temp: $got"
+# and the protocol's own catalog RPC agrees with SHOW TABLES - one catalog, not two
+got="$(ACL_COOKIE_JAR="$TJ" ask "@tables")"
+echo "$got" | grep -q "scratch" || fail "GetTables does not list the session's temp: $got"
 # another connection of the SAME principal is another session, and the temp is not in it - the
 # refusal is the authoritative one, because the door knows that session's temp catalog is empty
 got="$(ACL_COOKIE_JAR="$TMP/otherjar" ask "SELECT * FROM scratch")"
@@ -268,6 +271,14 @@ got="$(ACL_COOKIE_JAR="$IJ" ask "@ingest:stage_raw:temp:id,amount:720,1;721,2")"
 echo "$got" | grep -q "'count': 2" || fail "the temporary ingest did not land on the session: $got"
 got="$(ACL_COOKIE_JAR="$IJ" ask "SELECT count(*) AS n FROM stage_raw")"
 echo "$got" | grep -q "'n': \[2\]" || fail "the staged rows did not read back on the session: $got"
+# a client's own BEGIN spans RPCs on the held connection - and ingest refuses to load inside a
+# transaction it would not own, so a partial load can never be committed by the client
+got="$(ACL_COOKIE_JAR="$IJ" ask "@update:BEGIN TRANSACTION")"
+echo "$got" | grep -q "'count':" || fail "BEGIN on the session connection failed: $got"
+got="$(ACL_COOKIE_JAR="$IJ" ask "@ingest:stage_txn:temp:id,amount:1,1")"
+case "$got" in *"inside an open transaction"*) ;; *) fail "ingest inside a client transaction was not refused: $got";; esac
+got="$(ACL_COOKIE_JAR="$IJ" ask "@update:ROLLBACK")"
+echo "$got" | grep -q "'count':" || fail "ROLLBACK on the session connection failed: $got"
 
 # drop is symmetric with resolution, on the session that owns the object
 DJ="$TMP/dropjar"

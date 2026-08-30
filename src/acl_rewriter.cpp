@@ -271,7 +271,10 @@ private:
 			dml_target_name = key;
 			return true; // already aimed at the private temp catalog: pass through untouched
 		}
-		if (!BareName(written) || !TempResolves(written.Name().GetIdentifierName())) {
+		// a metadata surface always wins bare-name resolution on the read path, so no verb may ever
+		// read the same name as a temp - the anti-shadow rule, kept symmetric
+		if (!BareName(written) || MetadataSurfaceOf(written.Name().GetIdentifierName()) ||
+		    !TempResolves(written.Name().GetIdentifierName())) {
 			return false;
 		}
 		auto virtual_name = written.Name();
@@ -315,6 +318,11 @@ private:
 			     "\" is a granted object of the catalog, so a temporary table of that name would be "
 			     "unreachable - pick another name");
 		}
+		if (MetadataSurfaceOf(bare)) {
+			Deny("\"" + bare +
+			     "\" is a metadata surface, which always wins bare-name resolution - a temporary "
+			     "table of that name would be unreachable");
+		}
 		// CREATE TEMP TABLE ... AS SELECT reads before it writes, and that read is a read like any
 		// other - the same rule the non-temp CTAS path applies
 		auto &table_info = info.Cast<CreateTableInfo>();
@@ -333,7 +341,10 @@ private:
 		if (TempQualified(written)) {
 			return true; // already aimed at the private temp catalog
 		}
-		if (!BareName(written) || !TempResolves(written.Name().GetIdentifierName())) {
+		// a metadata surface always wins bare-name resolution on the read path, so no verb may ever
+		// read the same name as a temp - the anti-shadow rule, kept symmetric
+		if (!BareName(written) || MetadataSurfaceOf(written.Name().GetIdentifierName()) ||
+		    !TempResolves(written.Name().GetIdentifierName())) {
 			return false;
 		}
 		info.SetQualifiedName(TempName(written.Name()));

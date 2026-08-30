@@ -117,7 +117,6 @@ struct FlightDoorState {
 		//! One execution at a time per connection: neither a Connection nor a PreparedStatement is
 		//! a concurrent object, and every reservation of a session now shares this one.
 		std::mutex exec;
-		int64_t last_used = 0;
 	};
 	std::unordered_map<string, shared_ptr<SessionConn>> session_conns;
 	int64_t last_conn_sweep = 0;
@@ -235,14 +234,13 @@ struct FlightDoorState {
 		auto now = NowSeconds();
 		if (now - last_conn_sweep >= 60) {
 			last_conn_sweep = now;
-			SweepConnsLocked(now);
+			SweepConnsLocked();
 		}
 		auto &entry = session_conns[handle];
 		if (!entry) {
 			entry = make_shared_ptr<SessionConn>();
 			entry->con = make_uniq<Connection>(db);
 		}
-		entry->last_used = now;
 		return entry;
 	}
 
@@ -253,15 +251,15 @@ struct FlightDoorState {
 		session_conns.erase(handle);
 	}
 
-	//! Connections whose session is gone (swept, expired, admin-killed) or that sat unused past the
-	//! idle timeout go with it. The door cannot observe the store's own sweeps, so it runs this one
-	//! on the same clock; SessionAlive bumps nothing - an observer must not keep the observed alive.
-	//! Caller holds the lock.
-	void SweepConnsLocked(int64_t now) {
-		auto idle = store->SessionIdleTimeout();
+	//! Connections whose session is gone (swept, expired, admin-killed) go with it - and ONE clock
+	//! rules both: the session's own liveness. The connection deliberately has no idle clock of its
+	//! own, because the metadata RPCs keep a session warm without executing on its connection, and a
+	//! second clock diverging there dropped temp tables under a live session (the PR review's
+	//! finding). SessionAlive bumps nothing - an observer must not keep the observed alive. Caller
+	//! holds the lock.
+	void SweepConnsLocked() {
 		for (auto it = session_conns.begin(); it != session_conns.end();) {
-			bool stale = idle > 0 && now - it->second->last_used > idle;
-			if (stale || !store->SessionAlive(it->first)) {
+			if (!store->SessionAlive(it->first)) {
 				it = session_conns.erase(it);
 			} else {
 				++it;
@@ -711,20 +709,21 @@ public:
 			                      Value::POINTER(reinterpret_cast<uintptr_t>(&IngestStreamGetSchema))};
 			// the row cross-check has to decide BEFORE the write commits, or a false mismatch reports
 			// failure on data that already landed and a retry double-loads (the review's finding). So
-			// the load runs in a transaction this call rolls back on any doubt. A transaction the
-			// caller already opened (once transactions land) is joined, not nested: we own the
-			// BEGIN/COMMIT only when there was none, exactly as GizmoSQL's guard does.
-			bool owns_txn = !con.HasActiveTransaction();
-			if (owns_txn) {
-				auto begun = con.Query("BEGIN TRANSACTION");
-				if (begun->HasError()) {
-					return StatusFromDuck("acl", begun->GetError());
-				}
+			// the load runs in a transaction this call OWNS. A held connection means a client's own
+			// SQL `BEGIN` really does span RPCs now (as it always has on quack) - and joining such a
+			// transaction would hand the rollback decision to the client, whose COMMIT would keep a
+			// partial load. Refusing to load inside a transaction we would not own keeps "one batch,
+			// one outcome" structural rather than conditional (the PR review's finding).
+			if (con.HasActiveTransaction()) {
+				return arrow::Status::Invalid(
+				    "acl: ingest inside an open transaction is not supported - commit or roll back first");
+			}
+			auto begun = con.Query("BEGIN TRANSACTION");
+			if (begun->HasError()) {
+				return StatusFromDuck("acl", begun->GetError());
 			}
 			auto fail = [&](arrow::Status status) -> arrow::Status {
-				if (owns_txn) {
-					con.Query("ROLLBACK");
-				}
+				con.Query("ROLLBACK");
 				return status;
 			};
 			auto result = stmt->Execute(values, false);
@@ -748,11 +747,9 @@ public:
 				return fail(arrow::Status::Invalid("acl: the target took " + std::to_string(total) + " rows of the " +
 				                                   std::to_string(ingest.rows) + " the stream delivered"));
 			}
-			if (owns_txn) {
-				auto committed = con.Query("COMMIT");
-				if (committed->HasError()) {
-					return StatusFromDuck("acl", committed->GetError());
-				}
+			auto committed = con.Query("COMMIT");
+			if (committed->HasError()) {
+				return StatusFromDuck("acl", committed->GetError());
 			}
 			return total;
 		});
@@ -1067,11 +1064,17 @@ public:
 		auto schema = flightsql::SqlSchema::GetTablesSchemaWithIncludedSchema();
 		return CatalogStream(
 		    context, schema, [&](const string &handle) -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
+			    // on the session's own connection (spec 050): a listing composed here goes through
+			    // the same rewriter with the executing context set, so the session's temp tables
+			    // appear in GetTables exactly as they do in SHOW TABLES
+			    auto conn = state->ConnFor(handle);
+			    std::lock_guard<std::mutex> execution(conn->exec);
+			    TempScanScope temp_scan(conn->con->context.get());
 			    ARROW_ASSIGN_OR_RAISE(auto tables,
-			                          RunCatalogQuery(*state->store, state->db, handle,
+			                          RunCatalogQuery(*state->store, *conn->con, handle,
 			                                          BuildCatalogListing(CatalogListing::TABLES, filter)));
 			    ARROW_ASSIGN_OR_RAISE(auto columns,
-			                          RunCatalogQuery(*state->store, state->db, handle,
+			                          RunCatalogQuery(*state->store, *conn->con, handle,
 			                                          BuildCatalogListing(CatalogListing::COLUMNS, filter)));
 			    Connection con(state->db);
 			    ARROW_ASSIGN_OR_RAISE(auto serialized, SchemasFor(*con.context, *tables, *columns));
@@ -1184,7 +1187,10 @@ private:
 	                                                                       const CatalogQuery &query) {
 		return CatalogStream(
 		    context, schema, [&](const string &handle) -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
-			    ARROW_ASSIGN_OR_RAISE(auto rows, RunCatalogQuery(*state->store, state->db, handle, query));
+			    auto conn = state->ConnFor(handle);
+			    std::lock_guard<std::mutex> execution(conn->exec);
+			    TempScanScope temp_scan(conn->con->context.get());
+			    ARROW_ASSIGN_OR_RAISE(auto rows, RunCatalogQuery(*state->store, *conn->con, handle, query));
 			    return BatchFrom(schema, *rows, nullptr);
 		    });
 	}

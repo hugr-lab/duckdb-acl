@@ -71,6 +71,13 @@ The root is that spec 045 declared sessions per-RPC, reasoning from a port-reuse
   the principal fingerprint; the connection is the session's.
 - On session end (idle / `exp` / `CloseSession` / door stop) the connection is destroyed and duckdb
   reclaims every temp object and rolls back any open transaction - no graveyard, no burial, no drain.
+- **One clock rules the connection's life: the session's.** The door's connection sweep drops an
+  entry only when the store says the session is dead; the connection deliberately has no idle clock
+  of its own, because the metadata RPCs keep a session warm without executing on its connection, and
+  a second clock diverging there dropped temp tables under a live session (PR #60 review, finding 1).
+- **A client's own SQL `BEGIN` spans RPCs now**, exactly as it always has on quack - the rewriter
+  passes transaction control through, and the connection persists. Protocol-level transactions stay
+  `NotImplemented`; ingest refuses to load inside a transaction it would not own (below).
 - **quack** is unchanged: it already holds one persistent `QuackConnection` per client. Temp is native
   on it; we only authorise.
 
@@ -110,10 +117,13 @@ and every existing test is unchanged.
 - **Anti-shadow**: a virtual name always wins bare-name resolution; `CREATE TEMP` of a name that
   resolves as a granted virtual object is refused for clarity.
 - **Catalog inclusion**: the table listings - `SHOW TABLES`, `information_schema.tables`,
-  `duckdb_tables` - list the session's own temp objects for that session only (via the same direct
-  read); `DESCRIBE <temp>` needs no listing row, it goes down the read path. The columns surfaces do
-  not list temp columns (a follow-up if a tool turns out to need them). Flight only (needs the
-  executing context); quack's native temp already shows in its own catalog.
+  `duckdb_tables`, and the Flight catalog RPCs (`GetTables`), which run on the session's own
+  connection for exactly this reason - list the session's temp objects for that session only (via
+  the same direct read); `DESCRIBE <temp>` needs no listing row, it goes down the read path.
+  Deliberately NOT listed: the columns surfaces (a temp's columns are read through DESCRIBE) and
+  `SHOW ALL TABLES` (its shape carries column arrays the direct read does not produce) - follow-ups
+  if a tool turns out to need them. Flight only (needs the executing context); quack's native temp
+  already shows in its own catalog.
 
 ### Ingest `temporary = true` (spec 049 milestone 2, completed here)
 

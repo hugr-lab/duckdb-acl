@@ -121,6 +121,12 @@ ACL ROLE "scratch" CREATE TEMP TABLE foo.bar(id INTEGER);
 ----
 <REGEX>:.*temporary table lives in the session.*
 
+# a metadata surface wins bare-name resolution the same way a granted object does
+statement error
+ACL ROLE "scratch" CREATE TEMP TABLE duckdb_tables(id INTEGER);
+----
+<REGEX>:.*metadata surface.*
+
 # --- DML and DROP are symmetric with resolution ------------------------------------------------------
 
 # a temp object is the session's own: the temp capability admits it, per-verb caps do not apply
