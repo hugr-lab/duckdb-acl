@@ -1583,8 +1583,8 @@ void AclFlightStopFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 
 void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
 	auto v = LogicalType::VARCHAR;
-	auto register_door = [&](const string &name, vector<vector<LogicalType>> signatures,
-	                         const scalar_function_t &fn, bool special_nulls) {
+	auto register_door = [&](const string &name, vector<vector<LogicalType>> signatures, const scalar_function_t &fn,
+	                         bool special_nulls) {
 		ScalarFunctionSet set((Identifier(name)));
 		for (auto &arguments : signatures) {
 			ScalarFunction function(Identifier(name), std::move(arguments), v, fn);
