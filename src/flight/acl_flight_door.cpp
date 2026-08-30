@@ -95,8 +95,22 @@ struct FlightDoorState {
 
 	std::mutex lock;
 
+	//! The session's connection (spec 050): a session IS a duckdb connection, held for as long as
+	//! the session lives, so what a connection owns - temp tables, in time a transaction - survives
+	//! across the session's RPCs and is visible to nobody else's. ~7KB idle, measured; destroying
+	//! the entry reclaims all of it natively.
+	struct SessionConn {
+		unique_ptr<Connection> con;
+		//! One execution at a time per connection: neither a Connection nor a PreparedStatement is
+		//! a concurrent object, and every reservation of a session now shares this one.
+		std::mutex exec;
+		int64_t last_used = 0;
+	};
+	std::unordered_map<string, shared_ptr<SessionConn>> session_conns;
+	int64_t last_conn_sweep = 0;
+
 	//! The reservation (design 010 §10.3, applied to one instance): a statement PARSED, REWRITTEN
-	//! AND BOUND exactly once, held with the Connection it lives on, redeemable only by the
+	//! AND BOUND exactly once, held on its session's own connection, redeemable only by the
 	//! principal that made it. The ticket the client carries is an opaque id and nothing more - it
 	//! is not an authority (the owner check is), and it carries no data (the store does).
 	//!
@@ -112,14 +126,15 @@ struct FlightDoorState {
 	//! rights at creation - a policy change between creation and redemption is not re-read. The
 	//! window is TTL-bounded and identical to what any prepared statement anywhere accepts.
 	struct Reservation {
-		unique_ptr<Connection> con;
+		//! The session's connection, shared: the map entry may go (a transient session's does at
+		//! scope end), but a pending ticket keeps the connection alive for exactly its own
+		//! redemption - the shared_ptr is what bridges GetFlightInfo to DoGet.
+		shared_ptr<SessionConn> conn;
 		unique_ptr<PreparedStatement> stmt;
 		string owner; // the creating principal's fingerprint (roles + claims)
 		int64_t last_used = 0;
 		bool single_use = false;
 		vector<vector<Value>> parameter_rows;
-		//! One execution at a time per record: a PreparedStatement is not a concurrent object.
-		std::mutex exec_lock;
 	};
 	std::unordered_map<string, shared_ptr<Reservation>> reservations;
 	//! Refuse a new reservation rather than evict somebody's old one: an evicted one is a mid-flight
@@ -197,6 +212,54 @@ struct FlightDoorState {
 		if (entry != reservations.end() && entry->second->owner == owner) {
 			reservations.erase(entry);
 		}
+	}
+
+	//! The session's connection, made on first use. Every execution path of a session goes through
+	//! here, which is the whole point: what one statement of a session leaves on the connection, the
+	//! next statement of the same session finds, and nobody else can.
+	shared_ptr<SessionConn> ConnFor(const string &handle) {
+		std::lock_guard<std::mutex> guard(lock);
+		auto now = NowSeconds();
+		if (now - last_conn_sweep >= 60) {
+			last_conn_sweep = now;
+			SweepConnsLocked(now);
+		}
+		auto &entry = session_conns[handle];
+		if (!entry) {
+			entry = make_shared_ptr<SessionConn>();
+			entry->con = make_uniq<Connection>(db);
+		}
+		entry->last_used = now;
+		return entry;
+	}
+
+	//! Drop a session's connection entry. A reservation still holding the shared_ptr keeps the
+	//! connection alive for its own pending redemption; nobody new can reach it.
+	void DropConn(const string &handle) {
+		std::lock_guard<std::mutex> guard(lock);
+		session_conns.erase(handle);
+	}
+
+	//! Connections whose session is gone (swept, expired, admin-killed) or that sat unused past the
+	//! idle timeout go with it. The door cannot observe the store's own sweeps, so it runs this one
+	//! on the same clock; SessionAlive bumps nothing - an observer must not keep the observed alive.
+	//! Caller holds the lock.
+	void SweepConnsLocked(int64_t now) {
+		auto idle = store->SessionIdleTimeout();
+		for (auto it = session_conns.begin(); it != session_conns.end();) {
+			bool stale = idle > 0 && now - it->second->last_used > idle;
+			if (stale || !store->SessionAlive(it->first)) {
+				it = session_conns.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+
+	//! What the door's stop does: the server is down and its threads joined, so nothing is mid-use.
+	void CloseAllConns() {
+		std::lock_guard<std::mutex> guard(lock);
+		session_conns.clear();
 	}
 };
 
@@ -365,8 +428,11 @@ public:
 			// schema comes from the same binder that will produce the rows; and DoGet has nothing
 			// left to do but execute.
 			auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
-			reservation->con = make_uniq<Connection>(state->db);
-			reservation->stmt = reservation->con->Prepare(prefixed);
+			reservation->conn = state->ConnFor(handle);
+			{
+				std::lock_guard<std::mutex> execution(reservation->conn->exec);
+				reservation->stmt = reservation->conn->con->Prepare(prefixed);
+			}
 			if (reservation->stmt->HasError()) {
 				return StatusFromDuck("acl", reservation->stmt->GetError());
 			}
@@ -400,13 +466,13 @@ public:
 			                    if (!reservation) {
 				                    return arrow::Status::KeyError("acl: unknown or already fetched ticket");
 			                    }
-			                    std::lock_guard<std::mutex> execution(reservation->exec_lock);
+			                    std::lock_guard<std::mutex> execution(reservation->conn->exec);
 			                    vector<Value> values;
 			                    auto result = reservation->stmt->Execute(values, false);
 			                    if (result->HasError()) {
 				                    return StatusFromDuck("acl", result->GetError());
 			                    }
-			                    return StreamRows(*reservation->con, *result);
+			                    return StreamRows(*reservation->conn->con, *result);
 		                    });
 	}
 
@@ -423,8 +489,9 @@ public:
 			if (prefixed.empty()) {
 				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			}
-			Connection con(state->db);
-			auto stmt = con.Prepare(prefixed);
+			auto conn = state->ConnFor(handle);
+			std::lock_guard<std::mutex> execution(conn->exec);
+			auto stmt = conn->con->Prepare(prefixed);
 			if (stmt->HasError()) {
 				return StatusFromDuck("acl", stmt->GetError());
 			}
@@ -577,7 +644,9 @@ public:
 			auto sql =
 			    "INSERT INTO " + target + " (" + columns + ") SELECT " + columns + " FROM arrow_scan($1, $2, $3)";
 			auto prefixed = "ACL INGEST '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
-			Connection con(state->db);
+			auto conn = state->ConnFor(handle);
+			std::lock_guard<std::mutex> execution(conn->exec);
+			auto &con = *conn->con;
 			auto stmt = con.Prepare(prefixed);
 			if (stmt->HasError()) {
 				return StatusFromDuck("acl", stmt->GetError());
@@ -656,8 +725,11 @@ public:
 				    return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			    }
 			    auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
-			    reservation->con = make_uniq<Connection>(state->db);
-			    reservation->stmt = reservation->con->Prepare(prefixed);
+			    reservation->conn = state->ConnFor(handle);
+			    {
+				    std::lock_guard<std::mutex> execution(reservation->conn->exec);
+				    reservation->stmt = reservation->conn->con->Prepare(prefixed);
+			    }
 			    if (reservation->stmt->HasError()) {
 				    return StatusFromDuck("acl", reservation->stmt->GetError());
 			    }
@@ -695,7 +767,7 @@ public:
 			if (!reservation) {
 				return arrow::Status::KeyError("acl: unknown prepared statement");
 			}
-			std::lock_guard<std::mutex> execution(reservation->exec_lock);
+			std::lock_guard<std::mutex> execution(reservation->conn->exec);
 			reservation->parameter_rows = std::move(rows);
 			return true;
 		});
@@ -715,7 +787,7 @@ public:
 			std::shared_ptr<arrow::Schema> dataset_schema;
 			std::shared_ptr<arrow::Schema> parameter_schema;
 			{
-				std::lock_guard<std::mutex> execution(reservation->exec_lock);
+				std::lock_guard<std::mutex> execution(reservation->conn->exec);
 				auto bound = reservation->parameter_rows.empty() ? nullptr : &reservation->parameter_rows.front();
 				ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->stmt, bound, dataset_schema, parameter_schema));
 			}
@@ -739,7 +811,7 @@ public:
 			    if (!reservation) {
 				    return arrow::Status::KeyError("acl: unknown prepared statement");
 			    }
-			    std::lock_guard<std::mutex> execution(reservation->exec_lock);
+			    std::lock_guard<std::mutex> execution(reservation->conn->exec);
 			    if (reservation->parameter_rows.size() > 1) {
 				    // answering from the first row alone is a silently wrong result; batches are
 				    // the update path's business
@@ -754,7 +826,7 @@ public:
 			    if (result->HasError()) {
 				    return StatusFromDuck("acl", result->GetError());
 			    }
-			    return StreamRows(*reservation->con, *result);
+			    return StreamRows(*reservation->conn->con, *result);
 		    });
 	}
 
@@ -768,7 +840,7 @@ public:
 				return arrow::Status::KeyError("acl: unknown prepared statement");
 			}
 			ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader, FlightDoorState::MAX_PARAM_ROWS));
-			std::lock_guard<std::mutex> execution(reservation->exec_lock);
+			std::lock_guard<std::mutex> execution(reservation->conn->exec);
 			// executemany semantics, DBAPI's: once per parameter row. Zero rows with declared
 			// parameters is zero executions - not one; only a parameterless statement runs once.
 			if (rows.empty()) {
@@ -779,7 +851,7 @@ public:
 			}
 			// One batch, one outcome (the review's lesson): a mid-batch refusal rolls the whole
 			// batch back, so a retry cannot duplicate rows.
-			auto &con = *reservation->con;
+			auto &con = *reservation->conn->con;
 			auto begun = con.Query("BEGIN TRANSACTION");
 			if (begun->HasError()) {
 				return StatusFromDuck("acl", begun->GetError());
@@ -1072,12 +1144,15 @@ private:
 	//! inside one RPC (see SessionFor); the one way to leak one was a C++ exception between the two,
 	//! and this is what makes that impossible rather than merely unlikely.
 	struct SessionScope {
-		SessionScope(PolicyStore &store_p, string handle_p) : store(store_p), handle(std::move(handle_p)) {
+		SessionScope(FlightDoorState &state_p, string handle_p) : state(state_p), handle(std::move(handle_p)) {
 		}
 		~SessionScope() {
-			store.SessionClose(handle);
+			state.store->SessionClose(handle);
+			// a transient session's connection goes with it; a pending ticket's shared_ptr is what
+			// bridges its GetFlightInfo to its DoGet
+			state.DropConn(handle);
 		}
-		PolicyStore &store;
+		FlightDoorState &state;
 		string handle;
 	};
 
@@ -1103,7 +1178,7 @@ private:
 				// stop end it - an RPC boundary does not
 				return body(handle);
 			}
-			SessionScope scope(*state->store, handle);
+			SessionScope scope(*state, handle);
 			return body(handle);
 		} catch (std::exception &ex) {
 			// duckdb's what() is a JSON envelope; ErrorData gives the message a person wrote
@@ -1159,6 +1234,7 @@ private:
 						return handle; // the connection's own live session, same principal
 					}
 					state->store->SessionClose(handle); // re-authenticated as somebody else
+					state->DropConn(handle);            // and the old principal's connection with it
 				}
 			}
 		}
@@ -1188,6 +1264,7 @@ private:
 					if (state->store->SessionPrincipal(handle, current, reason) && VerifyQuietly(token, caller) &&
 					    PrincipalFingerprint(caller) == PrincipalFingerprint(current)) {
 						state->store->SessionClose(handle); // also drops the cookie binding
+						state->DropConn(handle);
 					}
 				}
 			}
@@ -1356,6 +1433,7 @@ void AclFlightStopFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		if (door.thread.joinable()) {
 			door.thread.join();
 		}
+		door.state->CloseAllConns();
 		auto closed = StoreOf(state).SessionCloseAll();
 		result.SetValue(row, Value(uri + " (" + std::to_string(closed) + " session(s) closed)" +
 		                           (shutdown.ok() ? "" : " [" + shutdown.ToString() + "]")));

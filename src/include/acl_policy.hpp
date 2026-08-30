@@ -416,6 +416,9 @@ struct PolicyStore {
 	//! The principal behind a handle, or false with `reason` saying which of "unknown" / "expired" it
 	//! is - a client that reconnects needs to tell those apart.
 	bool SessionPrincipal(const string &handle, Principal &out, string &reason);
+	//! Is this session live right now, without touching its idle clock. The door's connection sweep
+	//! asks this for every held connection, and an observer must not keep the observed alive.
+	bool SessionAlive(const string &handle);
 	//! The statement a door should run instead of the client's: the same SQL with `ACL SESSION '<h>'`
 	//! in front, or empty when the session is not usable. The whole outward contract of spec 040 in one
 	//! call, so that a second door composes it the same way the first one does rather than similarly.

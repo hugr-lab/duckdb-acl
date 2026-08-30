@@ -293,6 +293,27 @@ bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string 
 	return true;
 }
 
+bool PolicyStore::SessionAlive(const string &handle) {
+	// The same three judgements as SessionPrincipal, minus every side effect: no bump - a periodic
+	// sweep that touched the clock would keep every session it looks at alive forever - and no erase,
+	// which stays the business of the paths that answer a caller.
+	auto now = NowSeconds();
+	auto skew = JwtClockSkew();
+	auto idle = SessionIdleTimeout();
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry == sessions.end()) {
+		return false;
+	}
+	if (entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
+		return false;
+	}
+	if (idle > 0 && entry->second.last_used + idle < now) {
+		return false;
+	}
+	return true;
+}
+
 //! Caller holds the lock, and has read the two settings *before* taking it. Reading a setting goes
 //! through the catalog to the DatabaseInstance; it executes no SQL today, but the parser override takes
 //! this same lock on every unprefixed statement (spec 043), so anything that did would deadlock on a
