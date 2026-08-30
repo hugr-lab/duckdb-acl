@@ -83,6 +83,19 @@ arrow::Status StatusFromDuck(const string &what, const string &error) {
 	return arrow::Status::Invalid(what + ": " + error);
 }
 
+//! The exec-context seam (spec 050), held for exactly the Prepare that needs it: the rewriter reads
+//! this context to resolve session temp names authoritatively. Set inside the connection's exec
+//! lock, on the calling thread - the parse inside Prepare runs synchronously on it, and it is
+//! cleared before the lock is released, so no other thread ever observes a value.
+struct TempScanScope {
+	explicit TempScanScope(ClientContext *context) {
+		SetTempScanContext(context);
+	}
+	~TempScanScope() {
+		SetTempScanContext(nullptr);
+	}
+};
+
 //! Everything one served instance needs: the database the statements run against, the store that
 //! resolves sessions, and the statements whose tickets are outstanding.
 struct FlightDoorState {
@@ -95,8 +108,21 @@ struct FlightDoorState {
 
 	std::mutex lock;
 
+	//! The session's connection (spec 050): a session IS a duckdb connection, held for as long as
+	//! the session lives, so what a connection owns - temp tables, in time a transaction - survives
+	//! across the session's RPCs and is visible to nobody else's. ~7KB idle, measured; destroying
+	//! the entry reclaims all of it natively.
+	struct SessionConn {
+		unique_ptr<Connection> con;
+		//! One execution at a time per connection: neither a Connection nor a PreparedStatement is
+		//! a concurrent object, and every reservation of a session now shares this one.
+		std::mutex exec;
+	};
+	std::unordered_map<string, shared_ptr<SessionConn>> session_conns;
+	int64_t last_conn_sweep = 0;
+
 	//! The reservation (design 010 §10.3, applied to one instance): a statement PARSED, REWRITTEN
-	//! AND BOUND exactly once, held with the Connection it lives on, redeemable only by the
+	//! AND BOUND exactly once, held on its session's own connection, redeemable only by the
 	//! principal that made it. The ticket the client carries is an opaque id and nothing more - it
 	//! is not an authority (the owner check is), and it carries no data (the store does).
 	//!
@@ -112,14 +138,15 @@ struct FlightDoorState {
 	//! rights at creation - a policy change between creation and redemption is not re-read. The
 	//! window is TTL-bounded and identical to what any prepared statement anywhere accepts.
 	struct Reservation {
-		unique_ptr<Connection> con;
+		//! The session's connection, shared: the map entry may go (a transient session's does at
+		//! scope end), but a pending ticket keeps the connection alive for exactly its own
+		//! redemption - the shared_ptr is what bridges GetFlightInfo to DoGet.
+		shared_ptr<SessionConn> conn;
 		unique_ptr<PreparedStatement> stmt;
 		string owner; // the creating principal's fingerprint (roles + claims)
 		int64_t last_used = 0;
 		bool single_use = false;
 		vector<vector<Value>> parameter_rows;
-		//! One execution at a time per record: a PreparedStatement is not a concurrent object.
-		std::mutex exec_lock;
 	};
 	std::unordered_map<string, shared_ptr<Reservation>> reservations;
 	//! Refuse a new reservation rather than evict somebody's old one: an evicted one is a mid-flight
@@ -197,6 +224,53 @@ struct FlightDoorState {
 		if (entry != reservations.end() && entry->second->owner == owner) {
 			reservations.erase(entry);
 		}
+	}
+
+	//! The session's connection, made on first use. Every execution path of a session goes through
+	//! here, which is the whole point: what one statement of a session leaves on the connection, the
+	//! next statement of the same session finds, and nobody else can.
+	shared_ptr<SessionConn> ConnFor(const string &handle) {
+		std::lock_guard<std::mutex> guard(lock);
+		auto now = NowSeconds();
+		if (now - last_conn_sweep >= 60) {
+			last_conn_sweep = now;
+			SweepConnsLocked();
+		}
+		auto &entry = session_conns[handle];
+		if (!entry) {
+			entry = make_shared_ptr<SessionConn>();
+			entry->con = make_uniq<Connection>(db);
+		}
+		return entry;
+	}
+
+	//! Drop a session's connection entry. A reservation still holding the shared_ptr keeps the
+	//! connection alive for its own pending redemption; nobody new can reach it.
+	void DropConn(const string &handle) {
+		std::lock_guard<std::mutex> guard(lock);
+		session_conns.erase(handle);
+	}
+
+	//! Connections whose session is gone (swept, expired, admin-killed) go with it - and ONE clock
+	//! rules both: the session's own liveness. The connection deliberately has no idle clock of its
+	//! own, because the metadata RPCs keep a session warm without executing on its connection, and a
+	//! second clock diverging there dropped temp tables under a live session (the PR review's
+	//! finding). SessionAlive bumps nothing - an observer must not keep the observed alive. Caller
+	//! holds the lock.
+	void SweepConnsLocked() {
+		for (auto it = session_conns.begin(); it != session_conns.end();) {
+			if (!store->SessionAlive(it->first)) {
+				it = session_conns.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+
+	//! What the door's stop does: the server is down and its threads joined, so nothing is mid-use.
+	void CloseAllConns() {
+		std::lock_guard<std::mutex> guard(lock);
+		session_conns.clear();
 	}
 };
 
@@ -365,8 +439,12 @@ public:
 			// schema comes from the same binder that will produce the rows; and DoGet has nothing
 			// left to do but execute.
 			auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
-			reservation->con = make_uniq<Connection>(state->db);
-			reservation->stmt = reservation->con->Prepare(prefixed);
+			reservation->conn = state->ConnFor(handle);
+			{
+				std::lock_guard<std::mutex> execution(reservation->conn->exec);
+				TempScanScope temp_scan(reservation->conn->con->context.get());
+				reservation->stmt = reservation->conn->con->Prepare(prefixed);
+			}
 			if (reservation->stmt->HasError()) {
 				return StatusFromDuck("acl", reservation->stmt->GetError());
 			}
@@ -400,13 +478,13 @@ public:
 			                    if (!reservation) {
 				                    return arrow::Status::KeyError("acl: unknown or already fetched ticket");
 			                    }
-			                    std::lock_guard<std::mutex> execution(reservation->exec_lock);
+			                    std::lock_guard<std::mutex> execution(reservation->conn->exec);
 			                    vector<Value> values;
 			                    auto result = reservation->stmt->Execute(values, false);
 			                    if (result->HasError()) {
 				                    return StatusFromDuck("acl", result->GetError());
 			                    }
-			                    return StreamRows(*reservation->con, *result);
+			                    return StreamRows(*reservation->conn->con, *result);
 		                    });
 	}
 
@@ -423,8 +501,10 @@ public:
 			if (prefixed.empty()) {
 				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			}
-			Connection con(state->db);
-			auto stmt = con.Prepare(prefixed);
+			auto conn = state->ConnFor(handle);
+			std::lock_guard<std::mutex> execution(conn->exec);
+			TempScanScope temp_scan(conn->con->context.get());
+			auto stmt = conn->con->Prepare(prefixed);
 			if (stmt->HasError()) {
 				return StatusFromDuck("acl", stmt->GetError());
 			}
@@ -521,24 +601,54 @@ public:
 			if (command.transaction_id.has_value() && !command.transaction_id->empty()) {
 				return arrow::Status::NotImplemented("acl: transactions are not supported");
 			}
-			if (command.temporary) {
-				return arrow::Status::NotImplemented(
-				    "acl: temporary staging is not implemented yet (spec 049 milestone 2)");
-			}
 			using NotExist = flightsql::TableDefinitionOptionsTableNotExistOption;
 			using Exists = flightsql::TableDefinitionOptionsTableExistsOption;
-			if (command.table_definition_options.if_not_exist == NotExist::kCreate) {
-				return arrow::Status::Invalid("acl: this door does not create tables - creating needs a create "
-				                              "capability and a declared physical home (spec 050); declare the "
-				                              "target and ingest with mode append");
-			}
-			if (command.table_definition_options.if_exists == Exists::kReplace) {
-				return arrow::Status::Invalid("acl: this door does not replace tables - replacing needs create "
-				                              "and drop capabilities (spec 050); ingest appends");
-			}
-			if (command.table_definition_options.if_exists == Exists::kFail) {
-				return arrow::Status::AlreadyExists("acl: if_exists = FAIL asks to fail when the target exists, "
-				                                    "and an append target here always exists");
+			auto not_exist = command.table_definition_options.if_not_exist;
+			auto if_exists = command.table_definition_options.if_exists;
+			bool temp_create = false;
+			bool temp_replace = false;
+			if (command.temporary) {
+				// spec 050, completing spec 049 milestone 2: the staging target is a native temp
+				// table on the session's own connection - which only exists for a connection-long
+				// (cookie) session. The composed CREATE goes through the same rewriter gate as a
+				// client's own: the temp capability, the anti-shadow rule, and the arrow_scan
+				// exemption only the ACL INGEST prefix carries.
+				if (!ClientSentCookie(context)) {
+					return arrow::Status::Invalid(
+					    "acl: a temporary ingest target lives in the session, and this call carries "
+					    "none - a client that echoes the door's session cookie has one from its "
+					    "second call on");
+				}
+				if ((command.catalog.has_value() && !command.catalog->empty() &&
+				     !StringUtil::CIEquals(*command.catalog, "temp")) ||
+				    (command.schema.has_value() && !command.schema->empty() &&
+				     !StringUtil::CIEquals(*command.schema, "main") &&
+				     !StringUtil::CIEquals(*command.schema, "temp"))) {
+					return arrow::Status::Invalid(
+					    "acl: a temporary target has no catalog or schema of its own - name the table alone");
+				}
+				if (not_exist == NotExist::kCreate && if_exists == Exists::kAppend) {
+					return arrow::Status::Invalid("acl: mode create_append is ambiguous for a temporary target - "
+					                              "ingest with mode create, replace or append");
+				}
+				temp_replace = if_exists == Exists::kReplace;
+				temp_create = temp_replace || not_exist == NotExist::kCreate;
+				// mode append falls through: the INSERT below aims at the session's temp catalog,
+				// and a target that was never created is the bind's own honest error
+			} else {
+				if (not_exist == NotExist::kCreate) {
+					return arrow::Status::Invalid("acl: this door does not create tables - creating needs a create "
+					                              "capability and a declared physical home (spec 050); declare the "
+					                              "target and ingest with mode append, or stage with temporary");
+				}
+				if (if_exists == Exists::kReplace) {
+					return arrow::Status::Invalid("acl: this door does not replace tables - replacing needs create "
+					                              "and drop capabilities (spec 050); ingest appends");
+				}
+				if (if_exists == Exists::kFail) {
+					return arrow::Status::AlreadyExists("acl: if_exists = FAIL asks to fail when the target exists, "
+					                                    "and an append target here always exists");
+				}
 			}
 			ARROW_ASSIGN_OR_RAISE(auto schema, reader->GetSchema());
 			if (schema->num_fields() == 0) {
@@ -574,10 +684,22 @@ public:
 			// the three pointers travel as the door's own bound parameters - POINTER has no literal
 			// form in SQL text, and this statement carries no parameters of anybody else's, so the
 			// golden rule stands: the rewriter adds none, and no user numbering exists to shift
-			auto sql =
-			    "INSERT INTO " + target + " (" + columns + ") SELECT " + columns + " FROM arrow_scan($1, $2, $3)";
+			string sql;
+			if (temp_create) {
+				sql = string("CREATE ") + (temp_replace ? "OR REPLACE " : "") + "TEMP TABLE " + quote(command.table) +
+				      " AS SELECT * FROM arrow_scan($1, $2, $3)";
+			} else {
+				if (command.temporary) {
+					// append into the session's own staging table, never anywhere else
+					target = "temp.main." + quote(command.table);
+				}
+				sql = "INSERT INTO " + target + " (" + columns + ") SELECT " + columns + " FROM arrow_scan($1, $2, $3)";
+			}
 			auto prefixed = "ACL INGEST '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
-			Connection con(state->db);
+			auto conn = state->ConnFor(handle);
+			std::lock_guard<std::mutex> execution(conn->exec);
+			TempScanScope temp_scan(conn->con->context.get());
+			auto &con = *conn->con;
 			auto stmt = con.Prepare(prefixed);
 			if (stmt->HasError()) {
 				return StatusFromDuck("acl", stmt->GetError());
@@ -587,20 +709,21 @@ public:
 			                      Value::POINTER(reinterpret_cast<uintptr_t>(&IngestStreamGetSchema))};
 			// the row cross-check has to decide BEFORE the write commits, or a false mismatch reports
 			// failure on data that already landed and a retry double-loads (the review's finding). So
-			// the load runs in a transaction this call rolls back on any doubt. A transaction the
-			// caller already opened (once transactions land) is joined, not nested: we own the
-			// BEGIN/COMMIT only when there was none, exactly as GizmoSQL's guard does.
-			bool owns_txn = !con.HasActiveTransaction();
-			if (owns_txn) {
-				auto begun = con.Query("BEGIN TRANSACTION");
-				if (begun->HasError()) {
-					return StatusFromDuck("acl", begun->GetError());
-				}
+			// the load runs in a transaction this call OWNS. A held connection means a client's own
+			// SQL `BEGIN` really does span RPCs now (as it always has on quack) - and joining such a
+			// transaction would hand the rollback decision to the client, whose COMMIT would keep a
+			// partial load. Refusing to load inside a transaction we would not own keeps "one batch,
+			// one outcome" structural rather than conditional (the PR review's finding).
+			if (con.HasActiveTransaction()) {
+				return arrow::Status::Invalid(
+				    "acl: ingest inside an open transaction is not supported - commit or roll back first");
+			}
+			auto begun = con.Query("BEGIN TRANSACTION");
+			if (begun->HasError()) {
+				return StatusFromDuck("acl", begun->GetError());
 			}
 			auto fail = [&](arrow::Status status) -> arrow::Status {
-				if (owns_txn) {
-					con.Query("ROLLBACK");
-				}
+				con.Query("ROLLBACK");
 				return status;
 			};
 			auto result = stmt->Execute(values, false);
@@ -624,11 +747,9 @@ public:
 				return fail(arrow::Status::Invalid("acl: the target took " + std::to_string(total) + " rows of the " +
 				                                   std::to_string(ingest.rows) + " the stream delivered"));
 			}
-			if (owns_txn) {
-				auto committed = con.Query("COMMIT");
-				if (committed->HasError()) {
-					return StatusFromDuck("acl", committed->GetError());
-				}
+			auto committed = con.Query("COMMIT");
+			if (committed->HasError()) {
+				return StatusFromDuck("acl", committed->GetError());
 			}
 			return total;
 		});
@@ -656,8 +777,12 @@ public:
 				    return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			    }
 			    auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
-			    reservation->con = make_uniq<Connection>(state->db);
-			    reservation->stmt = reservation->con->Prepare(prefixed);
+			    reservation->conn = state->ConnFor(handle);
+			    {
+				    std::lock_guard<std::mutex> execution(reservation->conn->exec);
+				    TempScanScope temp_scan(reservation->conn->con->context.get());
+				    reservation->stmt = reservation->conn->con->Prepare(prefixed);
+			    }
 			    if (reservation->stmt->HasError()) {
 				    return StatusFromDuck("acl", reservation->stmt->GetError());
 			    }
@@ -695,7 +820,7 @@ public:
 			if (!reservation) {
 				return arrow::Status::KeyError("acl: unknown prepared statement");
 			}
-			std::lock_guard<std::mutex> execution(reservation->exec_lock);
+			std::lock_guard<std::mutex> execution(reservation->conn->exec);
 			reservation->parameter_rows = std::move(rows);
 			return true;
 		});
@@ -715,7 +840,7 @@ public:
 			std::shared_ptr<arrow::Schema> dataset_schema;
 			std::shared_ptr<arrow::Schema> parameter_schema;
 			{
-				std::lock_guard<std::mutex> execution(reservation->exec_lock);
+				std::lock_guard<std::mutex> execution(reservation->conn->exec);
 				auto bound = reservation->parameter_rows.empty() ? nullptr : &reservation->parameter_rows.front();
 				ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->stmt, bound, dataset_schema, parameter_schema));
 			}
@@ -739,7 +864,7 @@ public:
 			    if (!reservation) {
 				    return arrow::Status::KeyError("acl: unknown prepared statement");
 			    }
-			    std::lock_guard<std::mutex> execution(reservation->exec_lock);
+			    std::lock_guard<std::mutex> execution(reservation->conn->exec);
 			    if (reservation->parameter_rows.size() > 1) {
 				    // answering from the first row alone is a silently wrong result; batches are
 				    // the update path's business
@@ -754,7 +879,7 @@ public:
 			    if (result->HasError()) {
 				    return StatusFromDuck("acl", result->GetError());
 			    }
-			    return StreamRows(*reservation->con, *result);
+			    return StreamRows(*reservation->conn->con, *result);
 		    });
 	}
 
@@ -768,7 +893,7 @@ public:
 				return arrow::Status::KeyError("acl: unknown prepared statement");
 			}
 			ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader, FlightDoorState::MAX_PARAM_ROWS));
-			std::lock_guard<std::mutex> execution(reservation->exec_lock);
+			std::lock_guard<std::mutex> execution(reservation->conn->exec);
 			// executemany semantics, DBAPI's: once per parameter row. Zero rows with declared
 			// parameters is zero executions - not one; only a parameterless statement runs once.
 			if (rows.empty()) {
@@ -779,7 +904,7 @@ public:
 			}
 			// One batch, one outcome (the review's lesson): a mid-batch refusal rolls the whole
 			// batch back, so a retry cannot duplicate rows.
-			auto &con = *reservation->con;
+			auto &con = *reservation->conn->con;
 			auto begun = con.Query("BEGIN TRANSACTION");
 			if (begun->HasError()) {
 				return StatusFromDuck("acl", begun->GetError());
@@ -939,11 +1064,17 @@ public:
 		auto schema = flightsql::SqlSchema::GetTablesSchemaWithIncludedSchema();
 		return CatalogStream(
 		    context, schema, [&](const string &handle) -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
+			    // on the session's own connection (spec 050): a listing composed here goes through
+			    // the same rewriter with the executing context set, so the session's temp tables
+			    // appear in GetTables exactly as they do in SHOW TABLES
+			    auto conn = state->ConnFor(handle);
+			    std::lock_guard<std::mutex> execution(conn->exec);
+			    TempScanScope temp_scan(conn->con->context.get());
 			    ARROW_ASSIGN_OR_RAISE(auto tables,
-			                          RunCatalogQuery(*state->store, state->db, handle,
+			                          RunCatalogQuery(*state->store, *conn->con, handle,
 			                                          BuildCatalogListing(CatalogListing::TABLES, filter)));
 			    ARROW_ASSIGN_OR_RAISE(auto columns,
-			                          RunCatalogQuery(*state->store, state->db, handle,
+			                          RunCatalogQuery(*state->store, *conn->con, handle,
 			                                          BuildCatalogListing(CatalogListing::COLUMNS, filter)));
 			    Connection con(state->db);
 			    ARROW_ASSIGN_OR_RAISE(auto serialized, SchemasFor(*con.context, *tables, *columns));
@@ -1056,7 +1187,10 @@ private:
 	                                                                       const CatalogQuery &query) {
 		return CatalogStream(
 		    context, schema, [&](const string &handle) -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
-			    ARROW_ASSIGN_OR_RAISE(auto rows, RunCatalogQuery(*state->store, state->db, handle, query));
+			    auto conn = state->ConnFor(handle);
+			    std::lock_guard<std::mutex> execution(conn->exec);
+			    TempScanScope temp_scan(conn->con->context.get());
+			    ARROW_ASSIGN_OR_RAISE(auto rows, RunCatalogQuery(*state->store, *conn->con, handle, query));
 			    return BatchFrom(schema, *rows, nullptr);
 		    });
 	}
@@ -1072,12 +1206,15 @@ private:
 	//! inside one RPC (see SessionFor); the one way to leak one was a C++ exception between the two,
 	//! and this is what makes that impossible rather than merely unlikely.
 	struct SessionScope {
-		SessionScope(PolicyStore &store_p, string handle_p) : store(store_p), handle(std::move(handle_p)) {
+		SessionScope(FlightDoorState &state_p, string handle_p) : state(state_p), handle(std::move(handle_p)) {
 		}
 		~SessionScope() {
-			store.SessionClose(handle);
+			state.store->SessionClose(handle);
+			// a transient session's connection goes with it; a pending ticket's shared_ptr is what
+			// bridges its GetFlightInfo to its DoGet
+			state.DropConn(handle);
 		}
-		PolicyStore &store;
+		FlightDoorState &state;
 		string handle;
 	};
 
@@ -1103,7 +1240,7 @@ private:
 				// stop end it - an RPC boundary does not
 				return body(handle);
 			}
-			SessionScope scope(*state->store, handle);
+			SessionScope scope(*state, handle);
 			return body(handle);
 		} catch (std::exception &ex) {
 			// duckdb's what() is a JSON envelope; ErrorData gives the message a person wrote
@@ -1159,6 +1296,7 @@ private:
 						return handle; // the connection's own live session, same principal
 					}
 					state->store->SessionClose(handle); // re-authenticated as somebody else
+					state->DropConn(handle);            // and the old principal's connection with it
 				}
 			}
 		}
@@ -1188,6 +1326,7 @@ private:
 					if (state->store->SessionPrincipal(handle, current, reason) && VerifyQuietly(token, caller) &&
 					    PrincipalFingerprint(caller) == PrincipalFingerprint(current)) {
 						state->store->SessionClose(handle); // also drops the cookie binding
+						state->DropConn(handle);
 					}
 				}
 			}
@@ -1356,6 +1495,7 @@ void AclFlightStopFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		if (door.thread.joinable()) {
 			door.thread.join();
 		}
+		door.state->CloseAllConns();
 		auto closed = StoreOf(state).SessionCloseAll();
 		result.SetValue(row, Value(uri + " (" + std::to_string(closed) + " session(s) closed)" +
 		                           (shutdown.ok() ? "" : " [" + shutdown.ToString() + "]")));

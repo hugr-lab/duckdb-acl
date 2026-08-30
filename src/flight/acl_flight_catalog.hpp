@@ -11,11 +11,12 @@
 
 namespace duckdb {
 class ClientContext;
+class Connection;
 class MaterializedQueryResult;
 
 namespace acl {
 
-arrow::Result<unique_ptr<MaterializedQueryResult>> RunCatalogQuery(PolicyStore &store, DatabaseInstance &db,
+arrow::Result<unique_ptr<MaterializedQueryResult>> RunCatalogQuery(PolicyStore &store, Connection &con,
                                                                    const string &handle, const CatalogQuery &query);
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>>

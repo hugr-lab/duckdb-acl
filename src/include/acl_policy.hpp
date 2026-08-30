@@ -20,6 +20,7 @@
 
 namespace duckdb {
 class DatabaseInstance;
+class ClientContext;
 
 namespace acl {
 
@@ -38,6 +39,23 @@ struct Principal {
 	//! the door's C++ composes - never a client's or a gateway's text.
 	bool arrow_ingest = false;
 };
+
+//! The exec-context seam (spec 050): the ClientContext of the connection a statement is being
+//! prepared on, stashed in a thread-local by a door that owns the Prepare call site (the Flight door
+//! does; quack's Prepare is quack's). The rewriter reads it to resolve session temp names
+//! authoritatively; unset, it falls back to temp-qualifying, which binds only against the private
+//! temp catalog and can never reach a physical object. `ParserOptions` carries no context, and a
+//! live catalog lookup during the statement's own parse throws - this seam is what remains.
+void SetTempScanContext(ClientContext *context);
+ClientContext *TempScanContext();
+//! Whether this connection's private temp catalog holds a table of this name - a direct read of the
+//! committed entries via the no-context, no-transaction DuckCatalog scan (~70ns, measured;
+//! independent of attached-catalog size). Safe on the parse thread: the door holds the connection's
+//! exec lock around Prepare, so nothing else runs on the connection while this reads it.
+bool TempCatalogHas(ClientContext &context, const string &name);
+//! Every temp table name of the connection, for the metadata surfaces (spec 050): a session lists
+//! its own temp objects and nobody else's - per-connection by construction.
+vector<string> TempCatalogNames(ClientContext &context);
 
 //! Policy for one virtual relation (table or view) under one role. The resolver picks the replacement
 //! form: RENAME (subquery_form=false) swaps the name in place for a physical object - it stays a real
@@ -406,6 +424,14 @@ struct PolicyStore {
 	//! Instantiate an expression template: a fresh copy of the cached parsed prototype.
 	unique_ptr<ParsedExpression> InstantiateExpr(const string &expr, const ParserOptions &options);
 
+	//! Does a capability sit EXPLICITLY on the principal's MAIN catalog grant (spec 050)? Explicit
+	//! means written: an unstated caps column defaults to the data capabilities (spec 012), and
+	//! `temp` is deliberately not among them, so this answers false unless somebody granted it.
+	//! Memory mode has no catalog grants and answers false - the session-temp surface needs a policy
+	//! catalog, like the rest of the served story.
+	bool PrincipalMainCap(const Principal &principal, const string &capability);
+	bool CatalogPrincipalMainCap(const Principal &principal, const string &capability);
+
 	//! Verify a principal offline. A JWT-shaped token goes through real signature verification against
 	//! the issuer registry (spec 007, throws with a specific reason on failure); a non-JWT token is a
 	//! dev-stub lookup in the in-memory map; the ROLE form trusts the gateway.
@@ -416,6 +442,9 @@ struct PolicyStore {
 	//! The principal behind a handle, or false with `reason` saying which of "unknown" / "expired" it
 	//! is - a client that reconnects needs to tell those apart.
 	bool SessionPrincipal(const string &handle, Principal &out, string &reason);
+	//! Is this session live right now, without touching its idle clock. The door's connection sweep
+	//! asks this for every held connection, and an observer must not keep the observed alive.
+	bool SessionAlive(const string &handle);
 	//! The statement a door should run instead of the client's: the same SQL with `ACL SESSION '<h>'`
 	//! in front, or empty when the session is not usable. The whole outward contract of spec 040 in one
 	//! call, so that a second door composes it the same way the first one does rather than similarly.

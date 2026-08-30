@@ -183,8 +183,10 @@ got="$(ask "@ingest:newtab:create:id:1")"
 case "$got" in *"does not create tables"*) ;; *) fail "mode create was not refused with the reason: $got";; esac
 got="$(ask "@ingest:orders:replace:id:1")"
 case "$got" in *"does not replace tables"*) ;; *) fail "mode replace was not refused with the reason: $got";; esac
-got="$(ask "@ingest:orders:temp:id,tenant,amount,customer_id:720,acme,1,0")"
-case "$got" in *"milestone 2"*) ;; *) fail "temporary was not refused as milestone 2: $got";; esac
+# temporary now stages into the session (spec 050) - so a cookie-less call has nowhere to hold it;
+# the session-borne success is asserted in the temp section below, where sessions are expected
+got="$(ask "@ingest:stage_raw:temp:id,amount:720,1;721,2")"
+case "$got" in *"lives in the session"*) ;; *) fail "a cookie-less temporary ingest was not refused: $got";; esac
 got="$(ask "@ingest:orders:append:id,tenant,nope:1,acme,1")"
 case "$got" in *nope*) ;; *) fail "an unknown ingest column was not named in the refusal: $got";; esac
 
@@ -232,6 +234,62 @@ done
 [ -n "$counted" ] || fail "the server did not answer the cookie session count"
 grep -q "cookielive=1" "$TMP/server.log" || fail "a cookie connection did not reuse ONE session: $(grep cookielive= "$TMP/server.log")"
 
+# --- session temp tables live on the cookie connection (spec 050) ---------------------------------
+# Created through the update wire on a cookie session, resolved by a later read on the SAME session
+# (the authoritative direct-scan path: the door hands the rewriter the executing context), listed by
+# the session's own SHOW TABLES - and invisible to every other session, including a different
+# principal riding a stolen cookie (F5), whose re-authentication ends the session and its temp.
+TJ="$TMP/tempjar"
+# prime the jar: the first call of a connection is transient (the client has no cookie to return
+# yet), and a transient session's temp would honestly die with the call - a real driver's handshake
+# RPCs prime this for free
+ACL_COOKIE_JAR="$TJ" ask "SELECT 1" >/dev/null
+got="$(ACL_COOKIE_JAR="$TJ" ask "@update:CREATE TEMP TABLE scratch AS SELECT r AS id FROM range(5) t(r)")"
+echo "$got" | grep -q "'count':" || fail "CREATE TEMP on a cookie session failed: $got"
+got="$(ACL_COOKIE_JAR="$TJ" ask "SELECT count(*) AS n FROM scratch")"
+echo "$got" | grep -q "'n': \[5\]" || fail "the session's temp did not resolve on its own connection: $got"
+got="$(ACL_COOKIE_JAR="$TJ" ask "SELECT name FROM (SHOW TABLES) WHERE name = 'scratch'")"
+echo "$got" | grep -q "'name': \['scratch'\]" || fail "SHOW TABLES does not list the session's temp: $got"
+# and the protocol's own catalog RPC agrees with SHOW TABLES - one catalog, not two
+got="$(ACL_COOKIE_JAR="$TJ" ask "@tables")"
+echo "$got" | grep -q "scratch" || fail "GetTables does not list the session's temp: $got"
+# another connection of the SAME principal is another session, and the temp is not in it - the
+# refusal is the authoritative one, because the door knows that session's temp catalog is empty
+got="$(ACL_COOKIE_JAR="$TMP/otherjar" ask "SELECT * FROM scratch")"
+echo "$got" | grep -q "no access to object" || fail "another session reached the temp: $got"
+# a different principal on the stolen cookie earns nothing: the fingerprint mismatch closes the
+# old session - temp and all - and opens their own, where the name does not exist
+GLOBEX='eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJpc3MiOiAiaHR0cHM6Ly9pc3N1ZXIudGVzdC9zIiwgImF1ZCI6ICJhcGk6Ly9hY2wtdGVzdCIsICJleHAiOiA0MTAyNDQ0ODAwLCAic3ViIjogInUtZ2xvYmV4IiwgInJvbGVzIjogWyJhbmFseXN0Il0sICJ0aWQiOiAiZ2xvYmV4In0.N92ysQlqQLA2PapK-VdxsokNyXPxPlmO6YQJVQB8H6I'
+got="$(ACL_COOKIE_JAR="$TJ" ask "SELECT * FROM scratch" "$GLOBEX")"
+echo "$got" | grep -q "no access to object" || fail "a stolen cookie carried a temp across principals: $got"
+got="$(ACL_COOKIE_JAR="$TJ" ask "SELECT * FROM scratch")"
+echo "$got" | grep -q "no access to object" || fail "the temp survived a re-authentication that should have ended its session: $got"
+# the raw ingest wire stages into the session too (spec 049 milestone 2, completed by spec 050)
+IJ="$TMP/ingestjar"
+ACL_COOKIE_JAR="$IJ" ask "SELECT 1" >/dev/null
+got="$(ACL_COOKIE_JAR="$IJ" ask "@ingest:stage_raw:temp:id,amount:720,1;721,2")"
+echo "$got" | grep -q "'count': 2" || fail "the temporary ingest did not land on the session: $got"
+got="$(ACL_COOKIE_JAR="$IJ" ask "SELECT count(*) AS n FROM stage_raw")"
+echo "$got" | grep -q "'n': \[2\]" || fail "the staged rows did not read back on the session: $got"
+# a client's own BEGIN spans RPCs on the held connection - and ingest refuses to load inside a
+# transaction it would not own, so a partial load can never be committed by the client
+got="$(ACL_COOKIE_JAR="$IJ" ask "@update:BEGIN TRANSACTION")"
+echo "$got" | grep -q "'count':" || fail "BEGIN on the session connection failed: $got"
+got="$(ACL_COOKIE_JAR="$IJ" ask "@ingest:stage_txn:temp:id,amount:1,1")"
+case "$got" in *"inside an open transaction"*) ;; *) fail "ingest inside a client transaction was not refused: $got";; esac
+got="$(ACL_COOKIE_JAR="$IJ" ask "@update:ROLLBACK")"
+echo "$got" | grep -q "'count':" || fail "ROLLBACK on the session connection failed: $got"
+
+# drop is symmetric with resolution, on the session that owns the object
+DJ="$TMP/dropjar"
+ACL_COOKIE_JAR="$DJ" ask "SELECT 1" >/dev/null
+got="$(ACL_COOKIE_JAR="$DJ" ask "@update:CREATE TEMP TABLE gone(id INTEGER)")"
+echo "$got" | grep -q "'count':" || fail "CREATE TEMP for the drop check failed: $got"
+got="$(ACL_COOKIE_JAR="$DJ" ask "@update:DROP TABLE gone")"
+echo "$got" | grep -q "'count':" || fail "DROP of the session's temp failed: $got"
+got="$(ACL_COOKIE_JAR="$DJ" ask "SELECT * FROM gone")"
+echo "$got" | grep -q "no access to object" || fail "the dropped temp still resolves: $got"
+
 # --- and the door closes ------------------------------------------------------------------------------
 echo "SELECT acl_flight_stop('$URI');" >&3
 stopped=""
@@ -244,4 +302,4 @@ done
 [ -n "$stopped" ] || fail "the door was still answering after acl_flight_stop"
 grep -q "session(s) closed" "$TMP/server.log" || fail "acl_flight_stop did not report what it closed"
 
-echo "PASS: a third-party Flight SQL client read its own slice, a cookie connection reused one session, and the door closed"
+echo "PASS: a third-party Flight SQL client read its own slice, a cookie connection reused one session, session temp tables stayed the session's own, and the door closed"

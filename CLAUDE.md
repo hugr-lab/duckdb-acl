@@ -187,6 +187,22 @@ quack listens in the clear: a served deployment sits behind a reverse proxy. Str
 (`SEND_DATA`) is generated **unprefixed** by the server and therefore fails rather than writing around
 the policy — fail-closed by construction, and why bulk loading through this door needs its own spec.
 
+**Specs 045–050 — the Flight SQL door**: `acl_flight_serve(uri)` / `acl_flight_stop(uri)` serve the
+protocol ADBC and JDBC drivers speak. A statement is a single-use **reservation** (spec 047): parsed,
+rewritten and bound once at GetFlightInfo, redeemable at DoGet only by the principal fingerprint that
+made it. The catalog RPCs answer the principal's catalog (spec 046), bulk ingest appends under an
+`ACL INGEST` prefix only the door composes (spec 049). **Spec 050**: a session IS a duckdb
+connection — identified by the door's own CSPRNG cookie (a cookie-less call gets a per-call session;
+a client has a durable one from its second call on), held as a `Connection` per session and executed
+on under a per-session lock. On it, **session temp tables**: `CREATE TEMP TABLE` under the explicit
+`temp` capability of the MAIN catalog grant (never in the unstated default), bare names resolve
+virtual-first then via a direct no-transaction read of the connection's temp catalog (the thread-local
+exec-context seam the door sets around Prepare; without it — quack — the rewriter temp-qualifies and
+the bind decides), DML/DROP are symmetric, `SHOW TABLES`/tables listings include the session's own
+temps, and ingest `temporary = true` stages into a session temp the client then moves with plain SQL.
+duckdb reclaims everything with the connection; `acl_sessions()` / `acl_session_kill(id)` are the ops
+surface.
+
 ## Working process — per-feature specs
 
 We do **not** run full spec-kit. Instead, each feature gets one lightweight spec under `specs/` (see

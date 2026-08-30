@@ -1,6 +1,6 @@
 # Spec 050: the session is a connection, and temp tables live in it
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-08-30
 - **Author**: hugr-lab
 
@@ -71,6 +71,13 @@ The root is that spec 045 declared sessions per-RPC, reasoning from a port-reuse
   the principal fingerprint; the connection is the session's.
 - On session end (idle / `exp` / `CloseSession` / door stop) the connection is destroyed and duckdb
   reclaims every temp object and rolls back any open transaction - no graveyard, no burial, no drain.
+- **One clock rules the connection's life: the session's.** The door's connection sweep drops an
+  entry only when the store says the session is dead; the connection deliberately has no idle clock
+  of its own, because the metadata RPCs keep a session warm without executing on its connection, and
+  a second clock diverging there dropped temp tables under a live session (PR #60 review, finding 1).
+- **A client's own SQL `BEGIN` spans RPCs now**, exactly as it always has on quack - the rewriter
+  passes transaction control through, and the connection persists. Protocol-level transactions stay
+  `NotImplemented`; ingest refuses to load inside a transaction it would not own (below).
 - **quack** is unchanged: it already holds one persistent `QuackConnection` per client. Temp is native
   on it; we only authorise.
 
@@ -109,16 +116,26 @@ and every existing test is unchanged.
 - **Already-qualified** `temp.x` / `temp.main.x` passes through untouched.
 - **Anti-shadow**: a virtual name always wins bare-name resolution; `CREATE TEMP` of a name that
   resolves as a granted virtual object is refused for clarity.
-- **Catalog inclusion**: the metadata surfaces list the session's own temp objects for that session
-  only (via the same direct read), so `SHOW TABLES` / `DESCRIBE` see what the session owns. Flight
-  only (needs the executing context); quack's native temp already shows in its own catalog.
+- **Catalog inclusion**: the table listings - `SHOW TABLES`, `information_schema.tables`,
+  `duckdb_tables`, and the Flight catalog RPCs (`GetTables`), which run on the session's own
+  connection for exactly this reason - list the session's temp objects for that session only (via
+  the same direct read); `DESCRIBE <temp>` needs no listing row, it goes down the read path.
+  Deliberately NOT listed: the columns surfaces (a temp's columns are read through DESCRIBE) and
+  `SHOW ALL TABLES` (its shape carries column arrays the direct read does not produce) - follow-ups
+  if a tool turns out to need them. Flight only (needs the executing context); quack's native temp
+  already shows in its own catalog.
 
 ### Ingest `temporary = true` (spec 049 milestone 2, completed here)
 
 Composes `CREATE TEMP TABLE <name> AS SELECT * FROM arrow_scan($1,$2,$3)` on the held connection
-instead of the `_acl_staging` scratch; the client then `MERGE INTO target USING <name>` as ordinary
+instead of the `_acl_staging` scratch; the client then merges or copies from `<name>` as ordinary
 SQL. Refused without the `temp` cap, and on a cookie-less (transient) call, which has no session to
-hold the temp - the honest refusal spec 049 promised.
+hold the temp - the honest refusal spec 049 promised. Modes: `create` composes the CREATE TEMP,
+`replace` its OR REPLACE form, `append` the INSERT aimed at `temp.main.<name>` (a target never
+created is the bind's own error); `create_append` is refused as ambiguous. The composed CREATE rides
+the same `ACL INGEST` prefix as the append INSERT - the prefix admits exactly those two statement
+shapes and nothing wider - and goes through the same rewriter gate as a client's own CREATE TEMP:
+the capability, the anti-shadow rule, the arrow_scan exemption only this prefix carries.
 
 ### Fleet-management seams (for the BUSL front, design/015 §8)
 
@@ -145,14 +162,23 @@ Three admin-scoped functions, reached through the passthrough admin door (no pri
   cookie reuses a session across calls; a different-principal token opens a fresh one and closes the
   old; an unverifiable token refuses cookie or not; the idle clock is not advanced by an unverified
   call; `CloseSession` ends it and needs the token.
-- A cpp test for temp resolution: a temp created on a held connection resolves for that session and is
-  invisible to another; a physical name never resolves via the temp path; anti-shadow refuses a temp
-  over a granted name; `temp` cap gates `CREATE TEMP`.
-- `test/sql/*`: the `temp` capability at the statement gate; existing "no access" behaviour intact for
-  principals without it.
-- `test/e2e/flight/`: the ADBC leg drives `adbc_ingest(temporary=True)` then a text `MERGE` and reads
-  the merged rows; a second connection of the same token neither sees nor resolves the first's temp;
-  `sessions=N` reflects live connection-long sessions (not the M1 `sessions=0`).
+- `test/sql/acl_temp.test`: the fallback (quack-shaped) path end to end - sqllogictest has no
+  executing context, exactly like quack: the `temp` cap gates CREATE TEMP, bare names resolve into
+  the private temp catalog, `temp.main.x` passes through, a miss fails inside temp and never against
+  physical, anti-shadow refuses a temp over a granted name, DML/DROP are symmetric, and every
+  refusal a capability-less role had is unchanged. (The thread-local seam is unreachable from
+  outside the extension, so the planned cpp unit became the e2e below - proven against the real
+  door rather than a re-implementation of its call site.)
+- `test/e2e/flight/run.sh`: the authoritative path against the served door - CREATE TEMP through the
+  update wire on a cookie session, resolved by a later read of the SAME session, listed by the
+  session's own `SHOW TABLES`; another connection of the same principal is refused with "no access"
+  (the door *knows* that session's temp catalog is empty); a different principal on a stolen cookie
+  (F5) earns nothing, and the re-authentication ends the hijacked session, temp and all; DROP is
+  symmetric; the raw ingest wire stages with `temporary` and reads back on its session.
+- `test/e2e/flight/adbc.sh`: the real driver (cookie middleware on, so a connection IS one session)
+  drives `adbc_ingest(temporary=True)`, reads its own staging table, moves the rows into the granted
+  table with plain `INSERT ... SELECT` under every rule the grant carries, and a second connection
+  of the same token cannot see the staging table.
 
 ## Alternatives considered
 

@@ -19,7 +19,10 @@ def mint(tenant):
     return f"{head}.{body}.{sig}"
 
 def connect(token):
-    return dbapi.connect(uri, db_kwargs={DatabaseOptions.AUTHORIZATION_HEADER.value: f"Bearer {token}"})
+    # the cookie is what makes a connection ONE session on the door (spec 050) - the same middleware
+    # every production deployment of this driver would enable
+    return dbapi.connect(uri, db_kwargs={DatabaseOptions.AUTHORIZATION_HEADER.value: f"Bearer {token}",
+                                         DatabaseOptions.WITH_COOKIE_MIDDLEWARE.value: "true"})
 
 failures = 0
 def check(name, ok, detail=""):
@@ -77,6 +80,28 @@ with connect(acme_token) as conn:
         check("mode create refused with the reason", False, "a table was created")
     except Exception as ex:
         check("mode create refused with the reason", "does not create tables" in str(ex), ex)
+
+    # --- spec 050: a temporary ingest target lives in the session ---------------------------------
+    # The staging pattern spec 049 promised: bulk rows into a session temp, then ordinary SQL moves
+    # them into the granted table under every rule the grant carries - and the staging table is
+    # invisible to every other connection, then gone with this one.
+    stage = pa.table({"id": [510, 511], "tenant": ["acme", "acme"], "amount": [7, 8],
+                      "customer_id": [0, 1]})
+    n = cur.adbc_ingest("stage", stage, temporary=True)
+    check("temporary ingest landed in the session", n == 2, n)
+    cur.execute("SELECT count(*) FROM stage")
+    check("the session reads its own staging table", cur.fetchall() == [(2,)])
+    cur.execute("INSERT INTO orders (id, tenant, amount, customer_id) "
+                "SELECT id, tenant, amount, customer_id FROM stage")
+    cur.fetchall()  # a DML through the query wire executes on the fetch - redeem the ticket
+    cur.execute("SELECT count(*) FROM orders WHERE id IN (510, 511)")
+    check("staged rows moved into the granted table as ordinary SQL", cur.fetchall() == [(2,)])
+    with connect(acme_token) as other:
+        try:
+            other.cursor().execute("SELECT * FROM stage")
+            check("another connection cannot see the staging table", False, "it answered")
+        except Exception as ex:
+            check("another connection cannot see the staging table", "no access to object" in str(ex), ex)
 
     # --- get_info comes from the registered SqlInfo ------------------------------------------------
     info = conn.adbc_get_info()

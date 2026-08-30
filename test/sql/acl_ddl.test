@@ -339,4 +339,4 @@ ACL ROLE "ingest" CREATE TABLE nosuchschema.t(id INTEGER);
 statement error
 ACL ROLE "ingest" CREATE TEMP TABLE vs.tmp(id INTEGER);
 ----
-<REGEX>:.*temporary objects are not available.*
+<REGEX>:.*temporary objects need the temp capability.*

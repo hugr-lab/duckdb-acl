@@ -126,13 +126,12 @@ struct ColumnBuilder {
 
 //! One statement, composed and run under the caller's session. The session is judged on every use
 //! (spec 040), so an expired one refuses here rather than returning a stale answer.
-arrow::Result<unique_ptr<MaterializedQueryResult>> RunCatalogQuery(PolicyStore &store, DatabaseInstance &db,
+arrow::Result<unique_ptr<MaterializedQueryResult>> RunCatalogQuery(PolicyStore &store, Connection &con,
                                                                    const string &handle, const CatalogQuery &query) {
 	auto prefixed = store.SessionSql(handle, query.sql);
 	if (prefixed.empty()) {
 		return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 	}
-	Connection con(db);
 	auto prepared = con.Prepare(prefixed);
 	if (prepared->HasError()) {
 		return arrow::Status::Invalid("acl: " + prepared->GetError());

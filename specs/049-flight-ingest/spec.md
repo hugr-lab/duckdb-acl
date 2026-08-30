@@ -1,6 +1,6 @@
 # Spec 049: the Flight ingest — bulk loading through the door, under the policy
 
-- **Status**: implemented (milestone 1: append); milestone 2 (session temp) redesigned in design/015, its own spec
+- **Status**: implemented (milestone 1: append; milestone 2: `temporary = true` stages into the session temp table of spec 050)
 - **Date**: 2026-08-29
 - **Author**: hugr-lab
 

@@ -8,7 +8,9 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
 
@@ -1578,11 +1580,18 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 	ResolvePrincipal(store, prefix, principal);
 
 	if (prefix.kind == AclPrefix::Kind::INGEST) {
-		// the ingest prefix carries the door's own composed INSERT and nothing else (spec 049): one
-		// statement, of one kind - anything wider would hand the arrow_scan exemption to text the
-		// door never wrote
-		if (statements.size() != 1 || statements[0]->type != StatementType::INSERT_STATEMENT) {
-			throw BinderException("acl_rewrite: the ingest prefix carries exactly one INSERT statement");
+		// the ingest prefix carries the door's own composed statement and nothing else (spec 049):
+		// one statement, of exactly two shapes - the append INSERT, or (spec 050) the CREATE TEMP
+		// staging table. Anything wider would hand the arrow_scan exemption to text the door never
+		// wrote.
+		bool insert_form = statements.size() == 1 && statements[0]->type == StatementType::INSERT_STATEMENT;
+		bool temp_create_form = false;
+		if (statements.size() == 1 && statements[0]->type == StatementType::CREATE_STATEMENT) {
+			auto &info = statements[0]->Cast<CreateStatement>().info;
+			temp_create_form = info && info->temporary && info->type == CatalogType::TABLE_ENTRY;
+		}
+		if (!insert_form && !temp_create_form) {
+			throw BinderException("acl_rewrite: the ingest prefix carries exactly one INSERT or CREATE TEMP statement");
 		}
 		principal.arrow_ingest = true;
 	}

@@ -198,6 +198,198 @@ public:
 	bool drop_statement = false;
 
 private:
+	//! The `temp` capability, asked of the store once per batch (spec 050): -1 unknown, else 0/1.
+	int temp_cap_state = -1;
+
+	//===------------------------------------------------------------------===//
+	// Session temp tables (spec 050)
+	//===------------------------------------------------------------------===//
+
+	//! The `temp` capability: explicit on the principal's MAIN catalog grant, never inherited from
+	//! unstated caps (spec 012's rule holds by construction - the default set does not carry it).
+	bool TempAllowed() {
+		if (temp_cap_state < 0) {
+			temp_cap_state = store.PrincipalMainCap(principal, "temp") ? 1 : 0;
+		}
+		return temp_cap_state == 1;
+	}
+
+	//! A name the principal already aimed at the temp catalog: first qualifier `temp`. It binds only
+	//! against the connection's private temp catalog and can never reach a physical object (probed:
+	//! `temp.main.x` does not find a physical `x`, and `ATTACH ... AS temp` is refused by duckdb).
+	static bool TempQualified(const QualifiedName &name) {
+		auto parts = NameParts(name);
+		return parts.size() >= 2 && StringUtil::CIEquals(parts.front(), "temp");
+	}
+
+	//! The written parts of a name - the same view VirtualKey joins: qualifiers first, and the
+	//! object's own name as the LAST part (QualifiedName::Path() includes it).
+	static vector<string> NameParts(const QualifiedName &name) {
+		vector<string> parts;
+		for (auto &part : name.Path()) {
+			if (!part.empty()) {
+				parts.push_back(part.GetIdentifierName());
+			}
+		}
+		return parts;
+	}
+
+	//! A bare, unqualified name - the only written shape that may resolve as a session temp.
+	static bool BareName(const QualifiedName &name) {
+		return NameParts(name).size() == 1;
+	}
+
+	//! Whether a bare name resolves into the session's temp catalog. With the executing connection's
+	//! context at hand (the Flight door sets it around Prepare) the answer is authoritative - a
+	//! direct read of that connection's committed temp entries. Without one (quack owns its own
+	//! Prepare) the fallback says yes and lets the temp-qualified bind decide: a miss fails inside
+	//! the private temp catalog, reaching nothing physical - the only cost is the message ("does not
+	//! exist" instead of "no access").
+	bool TempResolves(const string &name) {
+		auto *context = TempScanContext();
+		return context ? TempCatalogHas(*context, name) : true;
+	}
+
+	//! The private temp catalog's qualified form of a bare temp name.
+	static QualifiedName TempName(const Identifier &name) {
+		vector<Identifier> path;
+		path.emplace_back("temp");
+		path.emplace_back("main");
+		return QualifiedName(std::move(path), name);
+	}
+
+	//! Point a DML target at the session's temp catalog when the name is the session's own temp.
+	//! True = handled: the caller enforces nothing further, because no grant narrows an object only
+	//! this connection can see - it is written natively and reclaimed with the connection.
+	bool TryTempDmlTarget(unique_ptr<TableRef> &target_ref, QualifiedName &target_name, const string &key) {
+		if (!TempAllowed()) {
+			return false;
+		}
+		bool base_form = target_ref && target_ref->type == TableReferenceType::BASE_TABLE;
+		const QualifiedName &written = base_form ? target_ref->Cast<BaseTableRef>().GetQualifiedName() : target_name;
+		if (TempQualified(written)) {
+			dml_target_name = key;
+			return true; // already aimed at the private temp catalog: pass through untouched
+		}
+		// a metadata surface always wins bare-name resolution on the read path, so no verb may ever
+		// read the same name as a temp - the anti-shadow rule, kept symmetric
+		if (!BareName(written) || MetadataSurfaceOf(written.Name().GetIdentifierName()) ||
+		    !TempResolves(written.Name().GetIdentifierName())) {
+			return false;
+		}
+		auto virtual_name = written.Name();
+		auto phys = TempName(virtual_name);
+		if (base_form) {
+			auto &base = target_ref->Cast<BaseTableRef>();
+			base.SetQualifiedName(phys);
+			if (base.alias.empty()) {
+				base.alias = virtual_name;
+			}
+		}
+		target_name = phys;
+		dml_target_name = key;
+		return true;
+	}
+
+	//! `CREATE TEMP TABLE` (spec 050): a native temp object on the executing connection - which a
+	//! door holds per session, so it lives exactly as long as the session and duckdb reclaims it.
+	//! Admitted only under the explicit `temp` capability; nothing is registered in the policy
+	//! catalog, because nothing outlives the connection or is visible beyond it.
+	void RewriteCreateTempTable(CreateStatement &stmt) {
+		auto &info = *stmt.info;
+		if (!TempAllowed()) {
+			Deny("temporary objects need the temp capability on the MAIN catalog grant");
+		}
+		// only the private temp catalog may be named; any other home would be a physical write
+		auto qualifiers = NameParts(info.GetQualifiedName());
+		for (idx_t i = 0; i + 1 < qualifiers.size(); i++) {
+			auto lowered = StringUtil::Lower(qualifiers[i]);
+			if (lowered != "temp" && lowered != "main") {
+				Deny("a temporary table lives in the session, not in a schema - write CREATE TEMP TABLE " +
+				     info.GetQualifiedName().Name().GetIdentifierName());
+			}
+		}
+		// anti-shadow: a granted virtual name always wins bare-name resolution, so a temp of the
+		// same name could never be read back - refuse the confusion where it is written
+		auto bare = info.GetQualifiedName().Name().GetIdentifierName();
+		TablePolicy shadowed;
+		if (store.ResolveTable(principal, bare, shadowed)) {
+			Deny("\"" + bare +
+			     "\" is a granted object of the catalog, so a temporary table of that name would be "
+			     "unreachable - pick another name");
+		}
+		if (MetadataSurfaceOf(bare)) {
+			Deny("\"" + bare +
+			     "\" is a metadata surface, which always wins bare-name resolution - a temporary "
+			     "table of that name would be unreachable");
+		}
+		// CREATE TEMP TABLE ... AS SELECT reads before it writes, and that read is a read like any
+		// other - the same rule the non-temp CTAS path applies
+		auto &table_info = info.Cast<CreateTableInfo>();
+		if (table_info.query && table_info.query->node) {
+			RewriteQueryNode(*table_info.query->node);
+		}
+		// the statement itself passes through untouched: the temp catalog is the connection's own
+	}
+
+	//! DROP of a session temp, symmetric with how it resolves. True = handled (native drop).
+	bool TryTempDrop(DropInfo &info) {
+		if (!TempAllowed() || info.type != CatalogType::TABLE_ENTRY) {
+			return false; // temp views are not admitted, so there are none to drop
+		}
+		auto written = info.GetQualifiedName();
+		if (TempQualified(written)) {
+			return true; // already aimed at the private temp catalog
+		}
+		// a metadata surface always wins bare-name resolution on the read path, so no verb may ever
+		// read the same name as a temp - the anti-shadow rule, kept symmetric
+		if (!BareName(written) || MetadataSurfaceOf(written.Name().GetIdentifierName()) ||
+		    !TempResolves(written.Name().GetIdentifierName())) {
+			return false;
+		}
+		info.SetQualifiedName(TempName(written.Name()));
+		return true;
+	}
+
+	//! The session's temp names as a SQL list literal, or "" - only with the executing context at
+	//! hand (the Flight door), and only under the capability that admitted them.
+	string TempNamesList() {
+		auto *context = TempScanContext();
+		if (!context || !TempAllowed()) {
+			return string();
+		}
+		auto names = TempCatalogNames(*context);
+		if (names.empty()) {
+			return string();
+		}
+		vector<string> quoted;
+		for (auto &name : names) {
+			quoted.push_back(SqlLiteral(name));
+		}
+		return "[" + StringUtil::Join(quoted, ", ") + "]";
+	}
+
+	//! spec 050: the metadata surfaces list the session's own temp objects, for that session only.
+	//! Only the table listings - a temp's columns are read through DESCRIBE, which goes down the
+	//! read path and needs no listing row.
+	void AppendTempListing(const string &surface, string &sql) {
+		auto names = TempNamesList();
+		if (names.empty()) {
+			return;
+		}
+		if (surface == "tables") {
+			sql = "SELECT * FROM (" + sql +
+			      ") UNION ALL BY NAME (SELECT 'temp' AS table_catalog, 'main' AS table_schema, unnest(" + names +
+			      ") AS table_name, 'LOCAL TEMPORARY' AS table_type)";
+		} else if (surface == "duckdb_tables") {
+			sql = "SELECT * FROM (" + sql +
+			      ") UNION ALL BY NAME (SELECT 'temp' AS database_name, 'main' AS schema_name, unnest(" + names +
+			      ") AS table_name, true AS \"temporary\")";
+		} else if (surface == "show_tables") {
+			sql = "SELECT name FROM ((" + sql + ") UNION ALL (SELECT unnest(" + names + ") AS name)) ORDER BY 1";
+		}
+	}
+
 	//===------------------------------------------------------------------===//
 	// DDL through the ACL (spec 016)
 	//===------------------------------------------------------------------===//
@@ -230,7 +422,8 @@ private:
 			Deny("only tables and views can be created through the ACL");
 		}
 		if (info.temporary) {
-			Deny("temporary objects are not available through the ACL yet");
+			RewriteCreateTempTable(stmt);
+			return;
 		}
 		// CREATE TABLE ... AS SELECT reads before it writes, and that read is a read like any other:
 		// without this a role holding `create` could copy any physical table into its own schema
@@ -300,6 +493,10 @@ private:
 		auto key = VirtualKey(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "drop", target)) {
+			// the session's own temp table drops natively, symmetric with how it resolves (spec 050)
+			if (TryTempDrop(info)) {
+				return;
+			}
 			Deny("no schema of the catalog allows dropping \"" + key + "\"");
 		}
 		TablePolicy existing;
@@ -657,6 +854,20 @@ private:
 			}
 			TablePolicy policy;
 			if (!store.ResolveTable(principal, key, policy)) {
+				// not virtual - the session's own temp table still answers (spec 050). Virtual wins
+				// bare-name resolution, so this is reached only when no grant claims the name.
+				if (TempAllowed() && TempQualified(base.GetQualifiedName())) {
+					return; // already aimed at the private temp catalog - nothing to resolve
+				}
+				if (TempAllowed() && BareName(base.GetQualifiedName()) &&
+				    TempResolves(base.Table().GetIdentifierName())) {
+					auto virtual_name = base.Table();
+					base.SetQualifiedName(TempName(virtual_name));
+					if (base.alias.empty()) {
+						base.alias = virtual_name;
+					}
+					return;
+				}
 				Deny("no access to object \"" + key + "\"");
 			}
 			// the read path needs the 'select' capability, just like DML paths need theirs (spec 003):
@@ -837,6 +1048,7 @@ private:
 			if (!store.MetadataListing(principal, surface, listing)) {
 				Deny("metadata is not available: this policy source cannot enumerate " + asked);
 			}
+			AppendTempListing(surface, listing);
 			ref = SubqueryOf(listing);
 			return;
 		}
@@ -1024,6 +1236,7 @@ private:
 		if (!store.MetadataListing(principal, surface, sql)) {
 			Deny(string("metadata is not available: this policy source cannot enumerate ") + surface);
 		}
+		AppendTempListing(surface, sql);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
 	}
@@ -1628,6 +1841,12 @@ private:
 		}
 		TablePolicy policy;
 		if (!store.ResolveTable(principal, key, policy)) {
+			// the session's own temp table is written natively, with nothing to enforce: no grant
+			// narrows an object only this connection can see (spec 050). Virtual wins - this is
+			// reached only when no grant claims the name.
+			if (TryTempDmlTarget(target_ref, target_name, key)) {
+				return TablePolicy();
+			}
 			// a name the principal *does* have, of a kind that is called rather than written: say which
 			// rather than leave an administrator reading "no access" about an object they can see
 			TablePolicy called;
