@@ -234,6 +234,7 @@ string PolicyStore::SessionOpen(const string &token) {
 		} catch (std::exception &) {
 			return string(); // the door refuses; it does not learn why
 		}
+		principal.subject = verified.subject;
 		principal.roles = MapExternalRoles(issuer, verified.raw_roles);
 		if (principal.roles.empty()) {
 			return string();
@@ -433,6 +434,7 @@ void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, 
 		throw BinderException("acl_rewrite: token rejected: groups overage - the groups claim was replaced "
 		                      "by a Graph link; resolve groups at the gateway and use the ROLE form");
 	}
+	out.subject = verified.subject;
 	out.roles = MapExternalRoles(issuer, verified.raw_roles);
 	if (out.roles.empty()) {
 		throw BinderException("acl_rewrite: token rejected: no recognized roles");

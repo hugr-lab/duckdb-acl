@@ -211,6 +211,7 @@ string PrincipalFingerprint(const Principal &principal) {
 	}
 	std::sort(claims.begin(), claims.end());
 	string out;
+	out += principal.subject + "\x1d"; // identity within the issuer (spec 050 F5), before roles/claims
 	for (auto &role : roles) {
 		out += role + "\x1f";
 	}

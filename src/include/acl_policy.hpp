@@ -24,6 +24,9 @@ class DatabaseInstance;
 namespace acl {
 
 struct Principal {
+	//! The token's subject within its issuer (spec 050 F5): part of a principal's identity, so two
+	//! users sharing roles+claims are not one session. Empty for the ROLE form and the dev stub.
+	string subject;
 	vector<string> roles; // multi-role since spec 006 (union semantics); single-element until spec 007
 	case_insensitive_map_t<string> claims;
 	//! The one quack stream this principal is draining, when the statement being rewritten is the
