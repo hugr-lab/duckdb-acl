@@ -18,11 +18,16 @@ def mint(tenant):
     sig = b64(hmac.new(b"acl-test-hs256-secret", f"{head}.{body}".encode(), hashlib.sha256).digest())
     return f"{head}.{body}.{sig}"
 
-def connect(token):
+def connect(token, autocommit=True):
     # the cookie is what makes a connection ONE session on the door (spec 050) - the same middleware
     # every production deployment of this driver would enable
-    return dbapi.connect(uri, db_kwargs={DatabaseOptions.AUTHORIZATION_HEADER.value: f"Bearer {token}",
+    conn = dbapi.connect(uri, db_kwargs={DatabaseOptions.AUTHORIZATION_HEADER.value: f"Bearer {token}",
                                          DatabaseOptions.WITH_COOKIE_MIDDLEWARE.value: "true"})
+    # spec 055 makes the door support transactions, so the driver now honours DBAPI manual-commit by
+    # default. The per-statement RLS/ingest checks below want autocommit (each statement stands alone);
+    # the transaction block opts back into manual-commit to drive BeginTransaction/EndTransaction.
+    conn.adbc_connection.set_autocommit(autocommit)
+    return conn
 
 failures = 0
 def check(name, ok, detail=""):
@@ -106,6 +111,40 @@ with connect(acme_token) as conn:
     # --- get_info comes from the registered SqlInfo ------------------------------------------------
     info = conn.adbc_get_info()
     check("get_info vendor", info.get("vendor_name") == "duckdb-acl", info.get("vendor_name"))
+
+# --- transactions on the held connection (spec 055): the real driver's manual-commit mode ---------
+# DBAPI keeps autocommit off, so the driver sends BeginTransaction and our commit()/rollback() send
+# EndTransaction - all on the one session the cookie pins, so the transaction spans the RPCs.
+with connect(acme_token, autocommit=False) as conn:
+    cur = conn.cursor()
+    # a DML through the query path executes on the server when its result is read, so each write is
+    # followed by fetchall() to force the DoGet inside the transaction rather than let the driver
+    # defer it past the commit/rollback (an ADBC dbapi lazy-execution quirk, not a server one)
+    def write(sql):
+        cur.execute(sql); cur.fetchall()
+    write("INSERT INTO orders (id, tenant, amount, customer_id) VALUES (600, 'acme', 1, 0)")
+    conn.rollback()
+    cur.execute("SELECT count(*) FROM orders WHERE id = 600")
+    check("a rolled-back insert did not land", cur.fetchall() == [(0,)])
+    write("INSERT INTO orders (id, tenant, amount, customer_id) VALUES (601, 'acme', 1, 0)")
+    conn.commit()
+    cur.execute("SELECT count(*) FROM orders WHERE id = 601")
+    check("a committed insert landed", cur.fetchall() == [(1,)])
+    # read-your-writes inside an open transaction, before commit
+    write("INSERT INTO orders (id, tenant, amount, customer_id) VALUES (602, 'acme', 1, 0)")
+    cur.execute("SELECT count(*) FROM orders WHERE id = 602")
+    check("an uncommitted insert is visible to its own transaction", cur.fetchall() == [(1,)])
+    conn.rollback()
+    cur.execute("SELECT count(*) FROM orders WHERE id = 602")
+    check("and gone after rollback", cur.fetchall() == [(0,)])
+    # the predicate still confines a write inside a transaction - RLS is not a commit-time check
+    try:
+        write("INSERT INTO orders (id, tenant, amount, customer_id) VALUES (603, 'globex', 1, 0)")
+        conn.commit()
+        check("cross-tenant write refused inside a transaction", False, "it committed")
+    except Exception as ex:
+        check("cross-tenant write refused inside a transaction", "does not satisfy the grant" in str(ex), ex)
+        conn.rollback()
 
 # --- two principals through the same prepared SQL see their own slices ---------------------------
 with connect(acme_token) as acme, connect(mint("globex")) as globex:

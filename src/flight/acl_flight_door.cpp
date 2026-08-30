@@ -117,6 +117,10 @@ struct FlightDoorState {
 		//! One execution at a time per connection: neither a Connection nor a PreparedStatement is
 		//! a concurrent object, and every reservation of a session now shares this one.
 		std::mutex exec;
+		//! The open transaction's id (spec 055), or "" for none. A session's connection holds at most
+		//! one transaction - BeginTransaction opens it, EndTransaction ends it, and destroying the
+		//! connection (session end) rolls it back natively. Guarded by `exec`, like the connection.
+		string txn_id;
 	};
 	std::unordered_map<string, shared_ptr<SessionConn>> session_conns;
 	int64_t last_conn_sweep = 0;
@@ -415,11 +419,79 @@ public:
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_READ_ONLY, false);
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_SQL, true);
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_SUBSTRAIT, false);
+		// spec 055: transactions live on the session's held connection - BEGIN/COMMIT/ROLLBACK across
+		// RPCs, which is what a driver with autocommit off asks for. Savepoints are a follow-up.
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_TRANSACTION,
-		                int32_t(Info::SqlSupportedTransaction::SQL_SUPPORTED_TRANSACTION_NONE));
+		                int32_t(Info::SqlSupportedTransaction::SQL_SUPPORTED_TRANSACTION_TRANSACTION));
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_CANCEL, false);
 		// specs 049/051: DoPutCommandStatementIngest below - append, create or replace under the ACL
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_BULK_INGESTION, true);
+	}
+
+	//! A statement's transaction_id, checked against the session's open transaction (spec 055). Empty
+	//! is autocommit and always fine; a non-empty id must be the one BeginTransaction handed this
+	//! session - a foreign or stale id is refused rather than silently run outside its transaction.
+	//! The caller holds `conn->exec`, so the transaction it names cannot be ended underneath the check.
+	static arrow::Status ValidateTxnLocked(const FlightDoorState::SessionConn &conn, const string &txn_id) {
+		if (!txn_id.empty() && conn.txn_id != txn_id) {
+			return arrow::Status::KeyError("acl: unknown transaction - it belongs to no open transaction of "
+			                               "this session (begin one, or omit the id for autocommit)");
+		}
+		return arrow::Status::OK();
+	}
+
+	//! Begin a transaction on the session's own connection (spec 055): it spans the session's RPCs
+	//! because the connection does, and it is rolled back natively if the session ends first. Needs a
+	//! connection-long (cookie) session - a per-call one has nowhere to hold it.
+	arrow::Result<flightsql::ActionBeginTransactionResult>
+	BeginTransaction(const flight::ServerCallContext &context,
+	                 const flightsql::ActionBeginTransactionRequest &) override {
+		return UnderSession(context,
+		                    [&](const string &handle) -> arrow::Result<flightsql::ActionBeginTransactionResult> {
+			                    if (!ClientSentCookie(context)) {
+				                    return arrow::Status::Invalid(
+				                        "acl: a transaction needs a connection-long session - echo the door's "
+				                        "session cookie (a client has one from its second call on)");
+			                    }
+			                    auto conn = state->ConnFor(handle);
+			                    std::lock_guard<std::mutex> execution(conn->exec);
+			                    if (!conn->txn_id.empty()) {
+				                    return arrow::Status::Invalid(
+				                        "acl: a transaction is already open on this session - commit or roll it "
+				                        "back first (savepoints are a follow-up)");
+			                    }
+			                    auto begun = conn->con->Query("BEGIN TRANSACTION");
+			                    if (begun->HasError()) {
+				                    return StatusFromDuck("acl", begun->GetError());
+			                    }
+			                    conn->txn_id = MintId();
+			                    flightsql::ActionBeginTransactionResult result;
+			                    result.transaction_id = conn->txn_id;
+			                    return result;
+		                    });
+	}
+
+	//! Commit or roll back the session's transaction (spec 055). The id must be the session's own; the
+	//! record is cleared whichever way duckdb's own COMMIT/ROLLBACK goes, so a failed commit does not
+	//! strand the session in a transaction it can no longer name.
+	arrow::Status EndTransaction(const flight::ServerCallContext &context,
+	                             const flightsql::ActionEndTransactionRequest &request) override {
+		auto ended = UnderSession(context, [&](const string &handle) -> arrow::Result<bool> {
+			auto conn = state->ConnFor(handle);
+			std::lock_guard<std::mutex> execution(conn->exec);
+			if (conn->txn_id.empty() || conn->txn_id != request.transaction_id) {
+				return arrow::Status::KeyError("acl: unknown transaction");
+			}
+			const char *verb =
+			    request.action == flightsql::ActionEndTransactionRequest::kCommit ? "COMMIT" : "ROLLBACK";
+			auto done = conn->con->Query(verb);
+			conn->txn_id.clear();
+			if (done->HasError()) {
+				return StatusFromDuck("acl", done->GetError());
+			}
+			return true;
+		});
+		return ended.status();
 	}
 
 	//! Where a client's SQL arrives. Nothing about the policy is decided here: the statement is
@@ -442,6 +514,7 @@ public:
 			reservation->conn = state->ConnFor(handle);
 			{
 				std::lock_guard<std::mutex> execution(reservation->conn->exec);
+				ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, command.transaction_id));
 				TempScanScope temp_scan(reservation->conn->con->context.get());
 				reservation->stmt = reservation->conn->con->Prepare(prefixed);
 			}
@@ -494,15 +567,13 @@ public:
 	arrow::Result<int64_t> DoPutCommandStatementUpdate(const flight::ServerCallContext &context,
 	                                                   const flightsql::StatementUpdate &command) override {
 		return UnderSession(context, [&](const string &handle) -> arrow::Result<int64_t> {
-			if (!command.transaction_id.empty()) {
-				return arrow::Status::NotImplemented("acl: transactions are not supported");
-			}
 			auto prefixed = state->store->SessionSql(handle, command.query);
 			if (prefixed.empty()) {
 				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			}
 			auto conn = state->ConnFor(handle);
 			std::lock_guard<std::mutex> execution(conn->exec);
+			ARROW_RETURN_NOT_OK(ValidateTxnLocked(*conn, command.transaction_id));
 			TempScanScope temp_scan(conn->con->context.get());
 			auto stmt = conn->con->Prepare(prefixed);
 			if (stmt->HasError()) {
@@ -599,7 +670,10 @@ public:
 	                                                   flight::FlightMessageReader *reader) override {
 		return UnderSession(context, [&](const string &handle) -> arrow::Result<int64_t> {
 			if (command.transaction_id.has_value() && !command.transaction_id->empty()) {
-				return arrow::Status::NotImplemented("acl: transactions are not supported");
+				// ingest runs the load in a transaction it owns (the row-count cross-check must decide
+				// before commit, spec 049); joining a client's transaction would hand it the rollback
+				return arrow::Status::Invalid(
+				    "acl: bulk ingest runs in its own transaction - do not run it inside one");
 			}
 			using NotExist = flightsql::TableDefinitionOptionsTableNotExistOption;
 			using Exists = flightsql::TableDefinitionOptionsTableExistsOption;
@@ -772,9 +846,6 @@ public:
 	                        const flightsql::ActionCreatePreparedStatementRequest &request) override {
 		return UnderSession(
 		    context, [&](const string &handle) -> arrow::Result<flightsql::ActionCreatePreparedStatementResult> {
-			    if (!request.transaction_id.empty()) {
-				    return arrow::Status::NotImplemented("acl: transactions are not supported");
-			    }
 			    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(handle));
 			    auto prefixed = state->store->SessionSql(handle, request.query);
 			    if (prefixed.empty()) {
@@ -784,6 +855,7 @@ public:
 			    reservation->conn = state->ConnFor(handle);
 			    {
 				    std::lock_guard<std::mutex> execution(reservation->conn->exec);
+				    ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, request.transaction_id));
 				    TempScanScope temp_scan(reservation->conn->con->context.get());
 				    reservation->stmt = reservation->conn->con->Prepare(prefixed);
 			    }
@@ -907,17 +979,25 @@ public:
 				rows.push_back({});
 			}
 			// One batch, one outcome (the review's lesson): a mid-batch refusal rolls the whole
-			// batch back, so a retry cannot duplicate rows.
+			// batch back, so a retry cannot duplicate rows. When the client already holds an explicit
+			// transaction (spec 055), the batch joins it rather than nesting a second BEGIN - the
+			// client owns the commit then, and a mid-batch failure surfaces without us rolling back
+			// work that is now the client's to keep or discard.
 			auto &con = *reservation->conn->con;
-			auto begun = con.Query("BEGIN TRANSACTION");
-			if (begun->HasError()) {
-				return StatusFromDuck("acl", begun->GetError());
+			bool owns_txn = !con.HasActiveTransaction();
+			if (owns_txn) {
+				auto begun = con.Query("BEGIN TRANSACTION");
+				if (begun->HasError()) {
+					return StatusFromDuck("acl", begun->GetError());
+				}
 			}
 			int64_t total = 0;
 			for (auto &row : rows) {
 				auto result = reservation->stmt->Execute(row, false);
 				if (result->HasError()) {
-					con.Query("ROLLBACK");
+					if (owns_txn) {
+						con.Query("ROLLBACK");
+					}
 					return StatusFromDuck("acl", result->GetError());
 				}
 				auto chunk = result->Fetch();
@@ -929,9 +1009,11 @@ public:
 					}
 				}
 			}
-			auto committed = con.Query("COMMIT");
-			if (committed->HasError()) {
-				return StatusFromDuck("acl", committed->GetError());
+			if (owns_txn) {
+				auto committed = con.Query("COMMIT");
+				if (committed->HasError()) {
+					return StatusFromDuck("acl", committed->GetError());
+				}
 			}
 			return total;
 		});
