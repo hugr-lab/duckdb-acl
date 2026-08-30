@@ -97,6 +97,40 @@ void InstancesDoNotShareSessions(Connection &first, const std::string &extension
 	}
 }
 
+//! The ops surface (spec 050): acl_sessions() lists the live sessions by a NON-secret id, and
+//! acl_session_kill(id) ends one. Both are the door's - a principal is refused.
+void OpsSurfaceListsAndKills(Connection &con) {
+	auto open = con.Query("SELECT acl_session_open('opstok')");
+	if (!Check(!open->HasError() && !open->GetValue(0, 0).IsNull(), "a session opens for the ops test")) {
+		return;
+	}
+	auto listed = con.Query("SELECT acl_sessions()");
+	if (!CheckOk(*listed, "acl_sessions() answers")) {
+		return;
+	}
+	auto json = listed->GetValue(0, 0).ToString();
+	Check(json.find("\"analyst\"") != std::string::npos, "the listing carries the principal's role");
+	Check(json.find("opstok") == std::string::npos, "the listing never carries the handle");
+	// pull the non-secret ops id out of the JSON and kill by it
+	auto key = json.find("\"id\":\"");
+	if (!Check(key != std::string::npos, "the listing carries an ops id")) {
+		return;
+	}
+	auto start = key + 6;
+	auto end = json.find('"', start);
+	auto id = json.substr(start, end - start);
+	auto killed = con.Query("SELECT acl_session_kill('" + id + "')");
+	if (CheckOk(*killed, "acl_session_kill runs")) {
+		Check(killed->GetValue(0, 0).GetValue<bool>(), "it reports the session was found");
+	}
+	auto again = con.Query("SELECT acl_session_kill('" + id + "')");
+	Check(!again->HasError() && !again->GetValue(0, 0).GetValue<bool>(),
+	      "killing a gone session is false, not an error");
+	// a principal may not see or end sessions - the acl_ gate denies the whole surface
+	auto denied = con.Query("ACL ROLE \"analyst\" SELECT acl_sessions()");
+	Check(denied->HasError(), "a principal is refused the ops listing");
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -125,6 +159,8 @@ int main(int argc, char *argv[]) {
 	Scenario("composed-sql-is-the-query", [&]() { ComposedSqlIsTheQuery(con); });
 	Scenario("closing-ends-it", [&]() { ClosingEndsIt(con); });
 	Scenario("instances-do-not-share-sessions", [&]() { InstancesDoNotShareSessions(con, extension); });
+	Exec(con, "SELECT acl_define_token('opstok','analyst','tenant=acme')");
+	Scenario("ops-surface-lists-and-kills", [&]() { OpsSurfaceListsAndKills(con); });
 
 	std::cout << (failures == 0 ? "PASS" : "FAIL") << "\n";
 	return failures == 0 ? 0 : 1;

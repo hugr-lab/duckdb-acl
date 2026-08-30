@@ -216,6 +216,10 @@ struct PolicyStore {
 	//! map. In-memory and per-instance for now; the shared backends a cluster needs come later.
 	struct Session {
 		Principal principal;
+		//! A short, NON-secret id for the ops surface (spec 050): the handle is a bearer credential and
+		//! must never appear in a listing or a log, so acl_sessions()/acl_session_kill() speak this
+		//! instead. It authenticates nothing - only the handle/cookie can act as the session.
+		string id;
 		int64_t expires_at = 0; // seconds since the epoch; 0 = the token carried none (the dev stub)
 		//! When it was last opened or resolved (spec 044). `exp` bounds a credential and says nothing
 		//! about whether anyone is still there; a door sees connections that simply stop, so this is
@@ -435,6 +439,18 @@ struct PolicyStore {
 	idx_t SweepLocked(int64_t now, int64_t skew, int64_t idle);
 	//! How many sessions are live right now. Denied to a principal, like the rest of this surface.
 	idx_t SessionCount();
+	//! One live session, for the admin ops surface (spec 050) - never the handle.
+	struct SessionInfo {
+		string id;
+		string subject;
+		vector<string> roles;
+		int64_t expires_at = 0;
+		int64_t idle_seconds = 0;
+	};
+	//! A snapshot of the live sessions - admin-only (the door's, not a principal's).
+	vector<SessionInfo> SessionList();
+	//! End the session with this ops id; true if one was found. Admin-only.
+	bool SessionKill(const string &id);
 	//! Settings behind the two rules (spec 044): seconds a session may go unused before it is dead
 	//! (0 = never), and how many may live at once (0 = unlimited).
 	int64_t SessionIdleTimeout();
