@@ -38,6 +38,12 @@ session - the one distinction that actually changes what the client does.
   a principal by the blanket `acl_` gate, available to the door/gateway that holds the contract.
 - `SessionPrincipal` keeps its erase-on-read: it is used where the reason is read in the same C++ call
   (the door's `OwnerOf`, `SessionFor`), so erasing there loses nothing.
+- **The survives-the-NULL property is single-threaded.** A concurrent `acl_session_sweep()` or a
+  `SessionOpen` sweep on another connection may erase the dead record between a client's NULL and its
+  `acl_session_reason`, which then reads "unknown" rather than the true "expired"/"idle". This is
+  self-correcting and harmless: told "unknown", the client reopens with the same token; if it was
+  really expired, `SessionOpen` refuses the stale JWT and the client fetches a fresh one - one extra
+  round trip, no wrong outcome.
 
 ## Enforcement & security
 

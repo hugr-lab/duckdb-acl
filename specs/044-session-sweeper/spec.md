@@ -56,7 +56,7 @@ left. It runs:
   The operation that grows the map is the one that pays to clean it — no thread, nothing to shut down,
   and no cost on a quiet instance.
 
-**A cap bounds it: `acl_max_sessions` (default 10000; `0` = unlimited).** At the cap, `SessionOpen`
+**A cap bounds it: `acl_max_sessions` (default 1000; `0` = unlimited).** At the cap, `SessionOpen`
 sweeps first and refuses if the map is still full. Refusing rather than evicting is deliberate: evicting
 the oldest would let an arriving stranger end an active client's session, which is a worse failure than
 being told to try later. A door turns the refusal into "Authentication failed", which is already what a

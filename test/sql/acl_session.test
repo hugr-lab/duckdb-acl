@@ -253,7 +253,7 @@ SELECT acl_session_count() - n FROM base;
 1
 
 statement ok
-SET GLOBAL acl_max_sessions=10000;
+SET GLOBAL acl_max_sessions=1000;
 
 # and with room again, opening works
 query I
@@ -275,3 +275,8 @@ statement error
 ACL ROLE "r" SELECT acl_session_count();
 ----
 <REGEX>:.*acl_session_count.*not allowed.*
+
+statement error
+ACL ROLE "r" SELECT acl_session_reason('whatever');
+----
+<REGEX>:.*acl_session_reason.*not allowed.*

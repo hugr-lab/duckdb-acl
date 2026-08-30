@@ -231,7 +231,9 @@ for probe in "SELECT 1" "@tables" "@imported:orders"; do
 done
 
 # Every RPC opens a session and must close it whichever way it leaves; after everything above -
-# refusals, throws and all - the door's own count is what proves nothing was left for the sweeper.
+# refusals, throws and all - the door's own count is 0. Since spec 054 acl_session_count reports the
+# LIVE count (not the map size), so this proves no live session lingers; a transient session leaked
+# here is freshly minted and therefore live and counted, which is exactly the leak worth catching.
 echo "SELECT 'sessions=' || acl_session_count() AS live;" >&3
 counted=""
 for _ in $(seq 1 40); do
