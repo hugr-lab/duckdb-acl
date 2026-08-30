@@ -319,6 +319,26 @@ bool PolicyStore::SessionAlive(const string &handle) {
 	return true;
 }
 
+string PolicyStore::SessionReason(const string &handle) {
+	// Read-only, like SessionAlive: no bump, no erase - so a client that got NULL from SessionSql can
+	// call this next and still learn the true reason rather than "unknown" (spec 054).
+	auto now = NowSeconds();
+	auto skew = JwtClockSkew();
+	auto idle = SessionIdleTimeout();
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry == sessions.end()) {
+		return "unknown";
+	}
+	if (entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
+		return "expired";
+	}
+	if (idle > 0 && entry->second.last_used + idle < now) {
+		return "idle";
+	}
+	return "live";
+}
+
 //! Caller holds the lock, and has read the two settings *before* taking it. Reading a setting goes
 //! through the catalog to the DatabaseInstance; it executes no SQL today, but the parser override takes
 //! this same lock on every unprefixed statement (spec 043), so anything that did would deadlock on a
@@ -356,8 +376,22 @@ idx_t PolicyStore::SessionSweep() {
 }
 
 idx_t PolicyStore::SessionCount() {
+	// The live total, not the map size: a dead session lingers until the next sweep now that resolving
+	// one no longer erases it (spec 054), and "how many sessions are live right now" must not count
+	// the not-yet-swept dead. Judged read-only, like SessionAlive.
+	auto now = NowSeconds();
+	auto skew = JwtClockSkew();
+	auto idle = SessionIdleTimeout();
 	lock_guard<mutex> guard(lock);
-	return sessions.size();
+	idx_t live = 0;
+	for (auto &entry : sessions) {
+		bool expired = entry.second.expires_at > 0 && entry.second.expires_at + skew < now;
+		bool stale = idle > 0 && entry.second.last_used + idle < now;
+		if (!expired && !stale) {
+			live++;
+		}
+	}
+	return live;
 }
 
 vector<PolicyStore::SessionInfo> PolicyStore::SessionList() {
@@ -393,11 +427,25 @@ bool PolicyStore::SessionKill(const string &id) {
 }
 
 string PolicyStore::SessionSql(const string &handle, const string &sql) {
-	Principal principal;
-	string reason;
-	if (!SessionPrincipal(handle, principal, reason)) {
+	// Judge here rather than through SessionPrincipal, for one reason: SessionPrincipal *erases* a
+	// dead session on read, which would leave a follow-up SessionReason nothing to report but
+	// "unknown" (spec 054). This bumps the live session (using it keeps it alive - the idle rule of
+	// spec 044) and leaves a dead one in place for SessionReason and the sweep; it never erases.
+	auto now = NowSeconds();
+	auto skew = JwtClockSkew();
+	auto idle = SessionIdleTimeout();
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry == sessions.end()) {
 		return string();
 	}
+	if (entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
+		return string();
+	}
+	if (idle > 0 && entry->second.last_used + idle < now) {
+		return string();
+	}
+	entry->second.last_used = now;
 	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
 }
 

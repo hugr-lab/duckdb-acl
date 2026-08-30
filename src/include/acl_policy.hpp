@@ -445,6 +445,12 @@ struct PolicyStore {
 	//! Is this session live right now, without touching its idle clock. The door's connection sweep
 	//! asks this for every held connection, and an observer must not keep the observed alive.
 	bool SessionAlive(const string &handle);
+	//! Why a handle is not usable, judged read-only (no bump, no erase, like SessionAlive): one of
+	//! "live", "expired" (the token's exp passed), "idle" (swept for inactivity) or "unknown" (no such
+	//! session - closed, never opened, or already swept). Spec 054: a client that reconnects needs to
+	//! tell "get a fresh token" (expired) from "reopen with the same one" (idle/unknown), which one
+	//! NULL never told it. Read-only so it survives a prior SessionSql that returned NULL.
+	string SessionReason(const string &handle);
 	//! The statement a door should run instead of the client's: the same SQL with `ACL SESSION '<h>'`
 	//! in front, or empty when the session is not usable. The whole outward contract of spec 040 in one
 	//! call, so that a second door composes it the same way the first one does rather than similarly.

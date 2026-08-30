@@ -31,8 +31,9 @@ Ordered: security and integrity first, functional completeness second, optimisat
    NotImplemented; a SQL `BEGIN` spans RPCs since spec 050 (as it always has on quack) and ingest
    refuses to run inside one. Decide and spec the real contract instead of the current honest
    patchwork.
-5. **Telling a client why its session ended** (spec 044 follow-up): expired, swept, closed and
-   never-existed are one NULL today.
+5. **Telling a client why its session ended** - DONE → spec 054. `acl_session_reason(handle)` returns
+   "live"/"expired"/"idle"/"unknown", judged read-only so it survives the NULL from `acl_session_sql`.
+   Closed and never-existed both read "unknown" (no tombstone, by design).
 6. **Temp objects in the columns surfaces and `SHOW ALL TABLES`** (spec 050 deliberate exclusions) -
    when a tool turns out to need them.
 7. **`GetXdbcTypeInfo`** (spec 046 follow-up): not implemented; some drivers degrade without it.

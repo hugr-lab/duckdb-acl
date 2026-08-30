@@ -56,7 +56,7 @@ left. It runs:
   The operation that grows the map is the one that pays to clean it — no thread, nothing to shut down,
   and no cost on a quiet instance.
 
-**A cap bounds it: `acl_max_sessions` (default 10000; `0` = unlimited).** At the cap, `SessionOpen`
+**A cap bounds it: `acl_max_sessions` (default 1000; `0` = unlimited).** At the cap, `SessionOpen`
 sweeps first and refuses if the map is still full. Refusing rather than evicting is deliberate: evicting
 the oldest would let an arriving stranger end an active client's session, which is a worse failure than
 being told to try later. A door turns the refusal into "Authentication failed", which is already what a
@@ -119,7 +119,8 @@ whole seconds, so a margin under a second decides the outcome by where the bound
 
 ## Follow-ups
 
-- **Shared session backends** (spec 040) will need their own sweeping, and a cluster's cap is a
-  different question from an instance's. The rules here are the local case of both.
-- **Telling a client why its session ended** — expired, swept, closed, or never existed — is still one
-  NULL for all four.
+- **Shared session backends** (spec 040) — dropped (2026-08-30): nodes are node-local by design, no
+  shared session store (see the single-node backlog and design/015).
+- **Telling a client why its session ended** — DONE → spec 054: `acl_session_reason(handle)` returns
+  "live"/"expired"/"idle"/"unknown", judged read-only so it survives the NULL from `acl_session_sql`
+  that prompts it. Closed and never-existed both read as "unknown" (no tombstone, by design).

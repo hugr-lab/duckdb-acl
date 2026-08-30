@@ -1152,13 +1152,23 @@ void AclSessionSqlFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto handle = RequiredArg(args, 0, row, "acl_session_sql", "handle");
 		auto sql = RequiredArg(args, 1, row, "acl_session_sql", "sql");
-		Principal principal;
-		string reason;
-		if (!StoreOf(state).SessionPrincipal(handle, principal, reason)) {
-			result.SetValue(row, Value());
-			continue;
-		}
-		result.SetValue(row, Value("ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + sql));
+		// SessionSql, not SessionPrincipal: the latter erases a dead session on read, which would
+		// leave the follow-up acl_session_reason nothing to report but "unknown" (spec 054). SessionSql
+		// composes for a live session (bumping it) and returns "" for a dead one without erasing it.
+		auto composed = StoreOf(state).SessionSql(handle, sql);
+		result.SetValue(row, composed.empty() ? Value() : Value(composed));
+	}
+}
+
+//! acl_session_reason(handle): why a handle is not usable (spec 054) - "live", "expired", "idle" or
+//! "unknown". A client that got NULL from acl_session_sql calls this to tell "get a fresh token"
+//! (expired) from "reopen with the same one" (idle/unknown). Read-only, so the reason survives the
+//! NULL that prompted the call. The door's, not a principal's - denied like the rest of this surface.
+void AclSessionReasonFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto handle = RequiredArg(args, 0, row, "acl_session_reason", "handle");
+		result.SetValue(row, Value(StoreOf(state).SessionReason(handle)));
 	}
 }
 
@@ -1410,6 +1420,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_session_text("acl_session_open", {v}, AclSessionOpenFunc);
 	register_session_text("acl_sessions", {}, AclSessionsFunc); // the ops listing (spec 050), never the handle
 	register_session_text("acl_session_sql", {v, v}, AclSessionSqlFunc);
+	register_session_text("acl_session_reason", {v}, AclSessionReasonFunc); // spec 054: why a NULL
 	register_admin("acl_session_close", {v}, AclSessionCloseFunc);
 	// the bound on all of the above (spec 044): sweeping and counting, both the door's, never a client's
 	auto register_session_bigint = [&](const string &name, scalar_function_t fn) {

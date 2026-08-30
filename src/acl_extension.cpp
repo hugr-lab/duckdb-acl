@@ -79,8 +79,10 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BIGINT, Value::BIGINT(900), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_max_sessions",
 	                          "acl: how many sessions may live at once; at the cap a new one is refused "
-	                          "rather than an old one evicted, and 0 means unlimited (spec 044)",
-	                          LogicalType::BIGINT, Value::BIGINT(10000), nullptr, SetScope::GLOBAL);
+	                          "rather than an old one evicted, and 0 means unlimited (spec 044). Each "
+	                          "session holds a duckdb connection (spec 050), so this bounds held "
+	                          "connections too - 1000 is a deliberately conservative default",
+	                          LogicalType::BIGINT, Value::BIGINT(1000), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_max_ingest_rows",
 	                          "acl: maximum rows one Flight ingest may stream (0 = unlimited, spec 049)",
 	                          LogicalType::BIGINT, Value::BIGINT(0), nullptr, SetScope::GLOBAL);
