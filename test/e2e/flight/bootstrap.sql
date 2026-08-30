@@ -35,7 +35,8 @@ ACL ADMIN CREATE VIRTUAL TABLE c.customers AS memory.main.customers;
 ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers
     ON (customer_id = id) CARDINALITY many_to_one COMMENT 'the ordering customer';
 ACL ADMIN CREATE ROLE analyst;
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+-- temp is explicit (spec 050): session temp tables ride on it, and nothing else grants them
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, temp) MAIN;
 -- one role, many tenants: the slice comes from the token's claim
 ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
     CAPS '{"select": true, "insert": true}'

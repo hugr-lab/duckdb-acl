@@ -1,0 +1,158 @@
+# name: test/sql/acl_temp.test
+# description: session temp tables (spec 050) - the explicit `temp` capability on the MAIN catalog
+#   grant, bare-name resolution into the private temp catalog (the fallback path: sqllogictest has no
+#   executing context, exactly like quack), anti-shadow, and DML/DROP symmetry
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, amount INT);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 100);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE scratch;
+
+statement ok
+ACL ADMIN CREATE ROLE plain;
+
+# `temp` is explicit: written on the MAIN catalog grant, never part of the unstated default (spec 012)
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE scratch WITH (select, insert, temp) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE plain WITH (select) MAIN;
+
+# --- the capability gates the statement --------------------------------------------------------------
+
+statement error
+ACL ROLE "plain" CREATE TEMP TABLE scratchpad(id INTEGER);
+----
+<REGEX>:.*temporary objects need the temp capability.*
+
+# an unstated caps grant is every data capability - and still not temp (explicit means explicit)
+statement error
+ACL ROLE "plain" SELECT * FROM nosuch;
+----
+<REGEX>:.*no access to object.*
+
+# --- native creation and bare-name resolution --------------------------------------------------------
+
+statement ok
+ACL ROLE "scratch" CREATE TEMP TABLE scratchpad(id INTEGER, note VARCHAR);
+
+# a bare name nobody granted resolves into the session's temp catalog under the capability
+statement ok
+ACL ROLE "scratch" INSERT INTO scratchpad VALUES (1, 'one');
+
+query II
+ACL ROLE "scratch" SELECT id, note FROM scratchpad;
+----
+1	one
+
+# the already-qualified spelling passes through untouched
+query I
+ACL ROLE "scratch" SELECT count(*) FROM temp.main.scratchpad;
+----
+1
+
+# a miss fails inside the private temp catalog - it can never reach a physical object, so the only
+# difference from the no-temp world is the message
+statement error
+ACL ROLE "scratch" SELECT * FROM nosuch;
+----
+<REGEX>:.*(does not exist|no access).*
+
+statement error
+ACL ROLE "scratch" INSERT INTO nosuchtmp VALUES (1);
+----
+<REGEX>:.*(does not exist|no access).*
+
+# --- CTAS reads under the ACL ------------------------------------------------------------------------
+
+statement ok
+ACL ROLE "scratch" CREATE TEMP TABLE snap AS SELECT id, amount FROM orders;
+
+query I
+ACL ROLE "scratch" SELECT count(*) FROM snap;
+----
+1
+
+# the CTAS source is a read like any other: a physical name is refused where it is read
+statement error
+ACL ROLE "scratch" CREATE TEMP TABLE leak AS SELECT * FROM phys.main.orders;
+----
+<REGEX>:.*no access to object.*
+
+# --- anti-shadow and the one legal home --------------------------------------------------------------
+
+# a granted virtual name always wins bare-name resolution, so a temp of that name could never be
+# read back - refused where it would be written
+statement error
+ACL ROLE "scratch" CREATE TEMP TABLE orders(id INTEGER);
+----
+<REGEX>:.*granted object of the catalog.*
+
+statement error
+ACL ROLE "scratch" CREATE TEMP TABLE foo.bar(id INTEGER);
+----
+<REGEX>:.*temporary table lives in the session.*
+
+# --- DML and DROP are symmetric with resolution ------------------------------------------------------
+
+# a temp object is the session's own: the temp capability admits it, per-verb caps do not apply
+statement ok
+ACL ROLE "scratch" UPDATE scratchpad SET note = 'uno' WHERE id = 1;
+
+query II
+ACL ROLE "scratch" SELECT id, note FROM scratchpad;
+----
+1	uno
+
+statement ok
+ACL ROLE "scratch" DELETE FROM scratchpad WHERE id = 1;
+
+query I
+ACL ROLE "scratch" SELECT count(*) FROM scratchpad;
+----
+0
+
+statement ok
+ACL ROLE "scratch" DROP TABLE scratchpad;
+
+statement error
+ACL ROLE "scratch" SELECT * FROM temp.main.scratchpad;
+----
+<REGEX>:.*does not exist.*
+
+statement ok
+ACL ROLE "scratch" DROP TABLE snap;
+
+# without the capability nothing above exists: the same statements stay refused
+statement error
+ACL ROLE "plain" DROP TABLE anything;
+----
+<REGEX>:.*no schema of the catalog allows dropping.*

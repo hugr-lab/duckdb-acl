@@ -1,9 +1,14 @@
 #include "acl_policy.hpp"
 
 #include "acl_token.hpp"
+#include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
+#include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_data.hpp"
 
 #include <chrono>
 #include <random>
@@ -676,6 +681,60 @@ void PolicyStore::MapRole(const string &issuer, const string &source, const stri
 	}
 	lock_guard<mutex> guard(lock);
 	role_mappings[issuer][external_value].push_back(role);
+}
+
+//! The exec-context seam (spec 050). Thread-local: the door sets it on the thread that calls
+//! Prepare, the rewriter reads it on that same thread during the parse inside that Prepare, and it
+//! is cleared before the exec lock is released - no other thread ever observes a value.
+static thread_local ClientContext *temp_scan_context = nullptr;
+
+void SetTempScanContext(ClientContext *context) {
+	temp_scan_context = context;
+}
+
+ClientContext *TempScanContext() {
+	return temp_scan_context;
+}
+
+//! Walk the connection's private temp catalog through the NO-context, NO-transaction overloads:
+//! committed entries only, which is exactly right - a name only becomes resolvable once the
+//! statement that created it has finished. A live Catalog::GetEntry here would throw "no active
+//! transaction" (probed); this does not, because it never opens one.
+static void ScanTempTables(ClientContext &context, const std::function<void(const string &)> &callback) {
+	auto &temp_db = ClientData::Get(context).temporary_objects;
+	if (!temp_db) {
+		return;
+	}
+	auto &catalog = temp_db->GetCatalog().Cast<DuckCatalog>();
+	catalog.ScanSchemas([&](SchemaCatalogEntry &schema_entry) {
+		schema_entry.Cast<DuckSchemaEntry>().Scan(
+		    CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) { callback(entry.name.GetIdentifierName()); });
+	});
+}
+
+bool TempCatalogHas(ClientContext &context, const string &name) {
+	bool found = false;
+	ScanTempTables(context, [&](const string &entry) {
+		if (StringUtil::CIEquals(entry, name)) {
+			found = true;
+		}
+	});
+	return found;
+}
+
+vector<string> TempCatalogNames(ClientContext &context) {
+	vector<string> names;
+	ScanTempTables(context, [&](const string &entry) { names.push_back(entry); });
+	std::sort(names.begin(), names.end());
+	return names;
+}
+
+bool PolicyStore::PrincipalMainCap(const Principal &principal, const string &capability) {
+	if (catalog) {
+		return CatalogPrincipalMainCap(principal, capability);
+	}
+	// memory mode has no catalog grants, so nothing explicit can sit on one - fail closed
+	return false;
 }
 
 bool PolicyStore::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {

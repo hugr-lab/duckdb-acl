@@ -48,4 +48,4 @@ done
 
 "$PYBIN" "$HERE/adbc_client.py" "$URI" "$TOKEN" || fail "adbc assertions failed"
 echo "SELECT acl_flight_stop('$URI');" >&3
-echo "PASS: the real ADBC driver prepared, parameterized, bulk-inserted and was confined to its slice"
+echo "PASS: the real ADBC driver prepared, parameterized, bulk-inserted, staged through a session temp, and was confined to its slice"

@@ -1167,6 +1167,25 @@ struct CatalogBackend {
 	//! Where a `CREATE`/`DROP` of `vname` lands for this principal (spec 016). One query: the longest
 	//! virtual schema prefix of the name that the principal's roles hold, with the grant that states
 	//! the capability - so a schema nobody granted, or granted without it, simply does not answer.
+	//! Whether `capability` is written EXPLICITLY on the principal's MAIN catalog grant (spec 050).
+	//! EffectiveCaps carries spec 012's rule for free: an unstated caps column defaults to the data
+	//! capabilities, which never include `temp` - so anything beyond them is here only if granted.
+	bool PrincipalMainCap(const Principal &principal, const string &capability) {
+		if (principal.roles.empty()) {
+			return false;
+		}
+		EnsureFresh();
+		auto sql = GrantsCte(principal) +
+		           "SELECT \"caps\" FROM grants WHERE \"is_main\" = true AND (SELECT unique_main FROM main_ok)";
+		auto result = Query(sql);
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			if (EffectiveCaps(result->GetValue(0, row)).count(capability)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	bool DdlTarget(const Principal &principal, const string &vname, const string &capability, acl::DdlTarget &out) {
 		if (principal.roles.empty() || function_mode) {
 			return false; // the driver contract has no schema grants, so it has no DDL target
@@ -2477,6 +2496,10 @@ bool PolicyStore::CatalogResolveFunction(const Principal &principal, const strin
 
 bool PolicyStore::CatalogFunctionGate(const Principal &principal, const QualifiedName &name, bool &allowed) {
 	return catalog->FunctionGate(principal, name.Name().GetIdentifierName(), allowed);
+}
+
+bool PolicyStore::CatalogPrincipalMainCap(const Principal &principal, const string &capability) {
+	return catalog->PrincipalMainCap(principal, capability);
 }
 
 void PolicyStore::CatalogLoadRoleClaims(Principal &principal) {

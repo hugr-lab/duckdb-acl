@@ -55,10 +55,10 @@ def do_ingest(client, options, spec: str) -> int:
     `<table>:<mode>:<cols>:<rows>` with rows `v,v,..;v,v,..`; ints stay ints, the rest are strings.
     Field numbers from FlightSql.proto: table_definition_options=1 (if_not_exist=1, if_exists=2),
     table=2, temporary=5. Modes: append (not_exist=FAIL, exists=APPEND), create (CREATE, FAIL),
-    replace (FAIL, REPLACE), temp (append + temporary)."""
+    replace (FAIL, REPLACE), temp (create + temporary - the session staging table, spec 050)."""
     import pyarrow as pa
     table_name, mode, cols, rows = spec.split(":", 3)
-    tdo = {"append": (2, 2), "create": (1, 1), "replace": (2, 3), "temp": (2, 2)}[mode]
+    tdo = {"append": (2, 2), "create": (1, 1), "replace": (2, 3), "temp": (1, 1)}[mode]
     payload = field(1, enum_field(1, tdo[0]) + enum_field(2, tdo[1])) + text(2, table_name)
     if mode == "temp":
         payload += flag(5, True)

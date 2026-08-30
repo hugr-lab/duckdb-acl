@@ -83,6 +83,19 @@ arrow::Status StatusFromDuck(const string &what, const string &error) {
 	return arrow::Status::Invalid(what + ": " + error);
 }
 
+//! The exec-context seam (spec 050), held for exactly the Prepare that needs it: the rewriter reads
+//! this context to resolve session temp names authoritatively. Set inside the connection's exec
+//! lock, on the calling thread - the parse inside Prepare runs synchronously on it, and it is
+//! cleared before the lock is released, so no other thread ever observes a value.
+struct TempScanScope {
+	explicit TempScanScope(ClientContext *context) {
+		SetTempScanContext(context);
+	}
+	~TempScanScope() {
+		SetTempScanContext(nullptr);
+	}
+};
+
 //! Everything one served instance needs: the database the statements run against, the store that
 //! resolves sessions, and the statements whose tickets are outstanding.
 struct FlightDoorState {
@@ -431,6 +444,7 @@ public:
 			reservation->conn = state->ConnFor(handle);
 			{
 				std::lock_guard<std::mutex> execution(reservation->conn->exec);
+				TempScanScope temp_scan(reservation->conn->con->context.get());
 				reservation->stmt = reservation->conn->con->Prepare(prefixed);
 			}
 			if (reservation->stmt->HasError()) {
@@ -491,6 +505,7 @@ public:
 			}
 			auto conn = state->ConnFor(handle);
 			std::lock_guard<std::mutex> execution(conn->exec);
+			TempScanScope temp_scan(conn->con->context.get());
 			auto stmt = conn->con->Prepare(prefixed);
 			if (stmt->HasError()) {
 				return StatusFromDuck("acl", stmt->GetError());
@@ -588,24 +603,54 @@ public:
 			if (command.transaction_id.has_value() && !command.transaction_id->empty()) {
 				return arrow::Status::NotImplemented("acl: transactions are not supported");
 			}
-			if (command.temporary) {
-				return arrow::Status::NotImplemented(
-				    "acl: temporary staging is not implemented yet (spec 049 milestone 2)");
-			}
 			using NotExist = flightsql::TableDefinitionOptionsTableNotExistOption;
 			using Exists = flightsql::TableDefinitionOptionsTableExistsOption;
-			if (command.table_definition_options.if_not_exist == NotExist::kCreate) {
-				return arrow::Status::Invalid("acl: this door does not create tables - creating needs a create "
-				                              "capability and a declared physical home (spec 050); declare the "
-				                              "target and ingest with mode append");
-			}
-			if (command.table_definition_options.if_exists == Exists::kReplace) {
-				return arrow::Status::Invalid("acl: this door does not replace tables - replacing needs create "
-				                              "and drop capabilities (spec 050); ingest appends");
-			}
-			if (command.table_definition_options.if_exists == Exists::kFail) {
-				return arrow::Status::AlreadyExists("acl: if_exists = FAIL asks to fail when the target exists, "
-				                                    "and an append target here always exists");
+			auto not_exist = command.table_definition_options.if_not_exist;
+			auto if_exists = command.table_definition_options.if_exists;
+			bool temp_create = false;
+			bool temp_replace = false;
+			if (command.temporary) {
+				// spec 050, completing spec 049 milestone 2: the staging target is a native temp
+				// table on the session's own connection - which only exists for a connection-long
+				// (cookie) session. The composed CREATE goes through the same rewriter gate as a
+				// client's own: the temp capability, the anti-shadow rule, and the arrow_scan
+				// exemption only the ACL INGEST prefix carries.
+				if (!ClientSentCookie(context)) {
+					return arrow::Status::Invalid(
+					    "acl: a temporary ingest target lives in the session, and this call carries "
+					    "none - a client that echoes the door's session cookie has one from its "
+					    "second call on");
+				}
+				if ((command.catalog.has_value() && !command.catalog->empty() &&
+				     !StringUtil::CIEquals(*command.catalog, "temp")) ||
+				    (command.schema.has_value() && !command.schema->empty() &&
+				     !StringUtil::CIEquals(*command.schema, "main") &&
+				     !StringUtil::CIEquals(*command.schema, "temp"))) {
+					return arrow::Status::Invalid(
+					    "acl: a temporary target has no catalog or schema of its own - name the table alone");
+				}
+				if (not_exist == NotExist::kCreate && if_exists == Exists::kAppend) {
+					return arrow::Status::Invalid("acl: mode create_append is ambiguous for a temporary target - "
+					                              "ingest with mode create, replace or append");
+				}
+				temp_replace = if_exists == Exists::kReplace;
+				temp_create = temp_replace || not_exist == NotExist::kCreate;
+				// mode append falls through: the INSERT below aims at the session's temp catalog,
+				// and a target that was never created is the bind's own honest error
+			} else {
+				if (not_exist == NotExist::kCreate) {
+					return arrow::Status::Invalid("acl: this door does not create tables - creating needs a create "
+					                              "capability and a declared physical home (spec 050); declare the "
+					                              "target and ingest with mode append, or stage with temporary");
+				}
+				if (if_exists == Exists::kReplace) {
+					return arrow::Status::Invalid("acl: this door does not replace tables - replacing needs create "
+					                              "and drop capabilities (spec 050); ingest appends");
+				}
+				if (if_exists == Exists::kFail) {
+					return arrow::Status::AlreadyExists("acl: if_exists = FAIL asks to fail when the target exists, "
+					                                    "and an append target here always exists");
+				}
 			}
 			ARROW_ASSIGN_OR_RAISE(auto schema, reader->GetSchema());
 			if (schema->num_fields() == 0) {
@@ -641,11 +686,21 @@ public:
 			// the three pointers travel as the door's own bound parameters - POINTER has no literal
 			// form in SQL text, and this statement carries no parameters of anybody else's, so the
 			// golden rule stands: the rewriter adds none, and no user numbering exists to shift
-			auto sql =
-			    "INSERT INTO " + target + " (" + columns + ") SELECT " + columns + " FROM arrow_scan($1, $2, $3)";
+			string sql;
+			if (temp_create) {
+				sql = string("CREATE ") + (temp_replace ? "OR REPLACE " : "") + "TEMP TABLE " + quote(command.table) +
+				      " AS SELECT * FROM arrow_scan($1, $2, $3)";
+			} else {
+				if (command.temporary) {
+					// append into the session's own staging table, never anywhere else
+					target = "temp.main." + quote(command.table);
+				}
+				sql = "INSERT INTO " + target + " (" + columns + ") SELECT " + columns + " FROM arrow_scan($1, $2, $3)";
+			}
 			auto prefixed = "ACL INGEST '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
 			auto conn = state->ConnFor(handle);
 			std::lock_guard<std::mutex> execution(conn->exec);
+			TempScanScope temp_scan(conn->con->context.get());
 			auto &con = *conn->con;
 			auto stmt = con.Prepare(prefixed);
 			if (stmt->HasError()) {
@@ -728,6 +783,7 @@ public:
 			    reservation->conn = state->ConnFor(handle);
 			    {
 				    std::lock_guard<std::mutex> execution(reservation->conn->exec);
+				    TempScanScope temp_scan(reservation->conn->con->context.get());
 				    reservation->stmt = reservation->conn->con->Prepare(prefixed);
 			    }
 			    if (reservation->stmt->HasError()) {
