@@ -258,10 +258,12 @@ and reads the same policy. The moment a ticket becomes the authority, the SQL mu
 this is written down as a condition rather than a decision: whoever changes the first half must change
 the second.
 
-**TLS is ours here**, unlike quack — and until it lands the door **binds localhost only**, refusing any
-other address rather than handing out data in the clear over a protocol meant to cross machines. Flight is meant to be exposed, Arrow supports TLS directly, and a
-door that hands out data over a protocol drivers use from other machines should not depend on a reverse
-proxy being remembered.
+**TLS is ours here**, unlike quack. This first cut **bound localhost only**, refusing any other address
+rather than handing out data in the clear — and **spec 053 landed it**: `acl_flight_serve(uri, cert,
+key)` serves over `grpc+tls` and may bind any address, while `acl_flight_serve(uri)` stays
+cleartext-localhost. Flight is meant to be exposed, Arrow supports TLS directly, and a door that hands
+out data over a protocol drivers use from other machines no longer depends on a reverse proxy being
+remembered (though one stays a valid deployment).
 
 **Starting it refuses the same four things** `acl_quack_serve` refuses (spec 041): no policy source,
 anonymous admin on, the parser override not `STRICT`, and — here — no TLS material unless the operator

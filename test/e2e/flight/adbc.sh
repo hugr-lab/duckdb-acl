@@ -17,7 +17,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 [ -f "$ACL_EXT" ] || { echo "SKIP: no acl extension at $ACL_EXT"; exit 0; }
 have="$(echo "LOAD '$ACL_EXT'; SELECT count(*) FROM duckdb_functions() WHERE function_name='acl_flight_serve';" \
         | "$DUCKDB" -unsigned -noheader -list 2>/dev/null | tail -1 | tr -d ' ')"
-[ "$have" = "1" ] || { echo "SKIP: this build has no Flight door"; exit 0; }
+[ "$have" != "0" ] || { echo "SKIP: this build has no Flight door"; exit 0; }
 "$PYBIN" -c "import adbc_driver_flightsql" 2>/dev/null || { echo "SKIP: adbc_driver_flightsql is not installed (set ACL_ADBC_PYTHON)"; exit 0; }
 # the readiness probe runs client.py, which needs pyarrow - without this check a missing pyarrow
 # reads as "the door never came up", which is a lie about the door

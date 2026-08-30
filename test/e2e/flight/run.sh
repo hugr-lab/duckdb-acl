@@ -27,7 +27,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 [ -f "$ACL_EXT" ] || { echo "SKIP: no acl extension at $ACL_EXT"; exit 0; }
 have="$(echo "LOAD '$ACL_EXT'; SELECT count(*) FROM duckdb_functions() WHERE function_name='acl_flight_serve';" \
         | "$DUCKDB" -unsigned -noheader -list 2>/dev/null | tail -1 | tr -d ' ')"
-if [ "$have" != "1" ]; then
+if [ "$have" = "0" ]; then
 	echo "SKIP: this build has no Flight door - it was built with ACL_NO_FLIGHT=1, or on WASM"
 	exit 0
 fi

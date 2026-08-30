@@ -20,9 +20,10 @@ Ordered: security and integrity first, functional completeness second, optimisat
    policy_schema.sql), so the concurrent record write the spec-051 review worried about fails on
    the key at write time - fail-closed, last-writer never wins. Kept on the list so the item does
    not resurface; nothing to build.
-3. **TLS on the Flight door** (spec 045 deferral): the door binds localhost only until it lands.
-   A single node serving clients directly - no front in this phase - needs either TLS of its own
-   (Arrow supports it natively) or a written decision that a reverse proxy is required equipment.
+3. **TLS on the Flight door** - DONE → spec 053. `acl_flight_serve(uri, cert, key)` serves over TLS
+   (`grpc+tls`) and may bind any address; `acl_flight_serve(uri)` stays cleartext-localhost. cert/key
+   are inline PEM or paths read through duckdb's filesystem. A reverse proxy stays valid but is no
+   longer required. mTLS is a follow-up.
 
 ## B. Functional completeness
 

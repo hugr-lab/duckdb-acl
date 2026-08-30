@@ -181,6 +181,7 @@ check-flight-deps:
 test-flight:
 	test/e2e/flight/run.sh
 	test/e2e/flight/adbc.sh
+	test/e2e/flight/tls.sh
 
 # The door end-to-end (specs/043): a served instance with real sources and several client processes.
 # Needs the same docker databases plus a quack build:

@@ -189,7 +189,8 @@ quack listens in the clear: a served deployment sits behind a reverse proxy. Str
 (`SEND_DATA`) is generated **unprefixed** by the server and therefore fails rather than writing around
 the policy — fail-closed by construction, and why bulk loading through this door needs its own spec.
 
-**Specs 045–050 — the Flight SQL door**: `acl_flight_serve(uri)` / `acl_flight_stop(uri)` serve the
+**Specs 045–053 — the Flight SQL door**: `acl_flight_serve(uri[, cert, key])` / `acl_flight_stop(uri)`
+serve the
 protocol ADBC and JDBC drivers speak. A statement is a single-use **reservation** (spec 047): parsed,
 rewritten and bound once at GetFlightInfo, redeemable at DoGet only by the principal fingerprint that
 made it. The catalog RPCs answer the principal's catalog (spec 046), bulk ingest appends under an
@@ -203,7 +204,12 @@ exec-context seam the door sets around Prepare; without it — quack — the rew
 the bind decides), DML/DROP are symmetric, `SHOW TABLES`/tables listings include the session's own
 temps, and ingest `temporary = true` stages into a session temp the client then moves with plain SQL.
 duckdb reclaims everything with the connection; `acl_sessions()` / `acl_session_kill(id)` are the ops
-surface.
+surface. **Spec 051**: ingest `mode=create`/`replace` builds/replaces a table in a granted physical
+home, and `CREATE OR REPLACE` is priced at `create`+`drop` (REPLACE is a drop). **Spec 052**: EXPLAIN
+is the explicit `explain` capability (a plan names physical objects); the rest of the leak-audit
+surfaces are confirmed fail-closed. **Spec 053**: `acl_flight_serve(uri, cert, key)` serves over TLS
+(`grpc+tls`, cert/key inline-PEM or read through duckdb's filesystem) and may bind any address; the
+one-arg form stays cleartext-localhost.
 
 ## Working process — per-feature specs
 

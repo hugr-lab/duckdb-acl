@@ -189,7 +189,16 @@ class CookieJarFactory(flight.ClientMiddlewareFactory):
 uri, ask = sys.argv[1], sys.argv[2]
 token = sys.argv[3] if len(sys.argv) > 3 else TOKEN
 _jar = os.environ.get("ACL_COOKIE_JAR")
-client = flight.FlightClient(uri, middleware=[CookieJarFactory(_jar)]) if _jar else flight.connect(uri)
+# spec 053: a grpc+tls door is reached with the server's cert as the root (self-signed in the test);
+# the client verifies the server, which is the point of TLS here
+_kw = {}
+_root = os.environ.get("ACL_TLS_ROOT")
+if _root:
+    with open(_root, "rb") as f:
+        _kw["tls_root_certs"] = f.read()
+if _jar:
+    _kw["middleware"] = [CookieJarFactory(_jar)]
+client = flight.FlightClient(uri, **_kw)
 # "-" means: send no credentials at all. The door must refuse that, and it is worth being able to ask.
 headers = [] if token == "-" else [(b"authorization", f"Bearer {token}".encode())]
 options = flight.FlightCallOptions(headers=headers)
