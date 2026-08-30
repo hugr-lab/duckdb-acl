@@ -418,7 +418,7 @@ public:
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_TRANSACTION,
 		                int32_t(Info::SqlSupportedTransaction::SQL_SUPPORTED_TRANSACTION_NONE));
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_CANCEL, false);
-		// spec 049: DoPutCommandStatementIngest below - append into an existing writable target
+		// specs 049/051: DoPutCommandStatementIngest below - append, create or replace under the ACL
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_BULK_INGESTION, true);
 	}
 
@@ -605,8 +605,8 @@ public:
 			using Exists = flightsql::TableDefinitionOptionsTableExistsOption;
 			auto not_exist = command.table_definition_options.if_not_exist;
 			auto if_exists = command.table_definition_options.if_exists;
-			bool temp_create = false;
-			bool temp_replace = false;
+			bool create_form = false;
+			bool replace_form = false;
 			if (command.temporary) {
 				// spec 050, completing spec 049 milestone 2: the staging target is a native temp
 				// table on the session's own connection - which only exists for a connection-long
@@ -631,21 +631,22 @@ public:
 					return arrow::Status::Invalid("acl: mode create_append is ambiguous for a temporary target - "
 					                              "ingest with mode create, replace or append");
 				}
-				temp_replace = if_exists == Exists::kReplace;
-				temp_create = temp_replace || not_exist == NotExist::kCreate;
+				replace_form = if_exists == Exists::kReplace;
+				create_form = replace_form || not_exist == NotExist::kCreate;
 				// mode append falls through: the INSERT below aims at the session's temp catalog,
 				// and a target that was never created is the bind's own honest error
 			} else {
-				if (not_exist == NotExist::kCreate) {
-					return arrow::Status::Invalid("acl: this door does not create tables - creating needs a create "
-					                              "capability and a declared physical home (spec 050); declare the "
-					                              "target and ingest with mode append, or stage with temporary");
+				// spec 051: create and replace land in a physical home through the same rewriter
+				// gate as a CREATE the principal typed - because the composed statement is one; the
+				// create capability prices CREATE, and drop prices the REPLACE. Only the two-faced
+				// mode keeps a refusal of its own.
+				if (not_exist == NotExist::kCreate && if_exists == Exists::kAppend) {
+					return arrow::Status::Invalid(
+					    "acl: mode create_append is ambiguous - ingest with mode create, replace or append");
 				}
-				if (if_exists == Exists::kReplace) {
-					return arrow::Status::Invalid("acl: this door does not replace tables - replacing needs create "
-					                              "and drop capabilities (spec 050); ingest appends");
-				}
-				if (if_exists == Exists::kFail) {
+				replace_form = if_exists == Exists::kReplace;
+				create_form = replace_form || not_exist == NotExist::kCreate;
+				if (!create_form && if_exists == Exists::kFail) {
 					return arrow::Status::AlreadyExists("acl: if_exists = FAIL asks to fail when the target exists, "
 					                                    "and an append target here always exists");
 				}
@@ -685,8 +686,11 @@ public:
 			// form in SQL text, and this statement carries no parameters of anybody else's, so the
 			// golden rule stands: the rewriter adds none, and no user numbering exists to shift
 			string sql;
-			if (temp_create) {
-				sql = string("CREATE ") + (temp_replace ? "OR REPLACE " : "") + "TEMP TABLE " + quote(command.table) +
+			if (create_form) {
+				// one composition for both homes: the session's temp catalog (spec 050) or the
+				// granted physical schema the rewriter resolves (spec 051)
+				sql = string("CREATE ") + (replace_form ? "OR REPLACE " : "") +
+				      (command.temporary ? "TEMP TABLE " + quote(command.table) : "TABLE " + target) +
 				      " AS SELECT * FROM arrow_scan($1, $2, $3)";
 			} else {
 				if (command.temporary) {

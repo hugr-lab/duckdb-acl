@@ -1581,17 +1581,18 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 
 	if (prefix.kind == AclPrefix::Kind::INGEST) {
 		// the ingest prefix carries the door's own composed statement and nothing else (spec 049):
-		// one statement, of exactly two shapes - the append INSERT, or (spec 050) the CREATE TEMP
-		// staging table. Anything wider would hand the arrow_scan exemption to text the door never
-		// wrote.
+		// one statement, of exactly two shapes - the append INSERT, or the CREATE TABLE that stages
+		// into the session (spec 050) or creates/replaces in a granted home (spec 051). Anything
+		// wider would hand the arrow_scan exemption to text the door never wrote.
 		bool insert_form = statements.size() == 1 && statements[0]->type == StatementType::INSERT_STATEMENT;
-		bool temp_create_form = false;
+		bool create_form = false;
 		if (statements.size() == 1 && statements[0]->type == StatementType::CREATE_STATEMENT) {
 			auto &info = statements[0]->Cast<CreateStatement>().info;
-			temp_create_form = info && info->temporary && info->type == CatalogType::TABLE_ENTRY;
+			create_form = info && info->type == CatalogType::TABLE_ENTRY;
 		}
-		if (!insert_form && !temp_create_form) {
-			throw BinderException("acl_rewrite: the ingest prefix carries exactly one INSERT or CREATE TEMP statement");
+		if (!insert_form && !create_form) {
+			throw BinderException(
+			    "acl_rewrite: the ingest prefix carries exactly one INSERT or CREATE TABLE statement");
 		}
 		principal.arrow_ingest = true;
 	}

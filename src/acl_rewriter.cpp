@@ -436,9 +436,30 @@ private:
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
 			Deny("no schema of the catalog allows creating \"" + key + "\"");
 		}
+		// REPLACE is a drop in disguise (spec 051): a role that may not drop must not replace -
+		// probed live, a create-only role replaced a physical table and its rows by omission
+		if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+			DdlTarget drop_target;
+			if (!store.ResolveDdlTarget(principal, key, "drop", drop_target)) {
+				Deny("CREATE OR REPLACE drops \"" + key +
+				     "\" before it creates, so it needs the drop capability on the schema as well");
+			}
+		}
 		auto name = info.GetQualifiedName().Name();
 		auto phys = target.phys_schema + "." + name.GetIdentifierName();
 		if (target.virtual_only) {
+			// the record IS the object here and the record writer upserts, so the conflict clause is
+			// enforced where the statement is admitted (spec 051): plain CREATE refuses a duplicate,
+			// IF NOT EXISTS is a no-op, OR REPLACE passed the drop gate above
+			if (store.CatalogObjectExists(target.vcat, key, "relation")) {
+				if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+					drop_statement = true;
+					return;
+				}
+				if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
+					Deny("\"" + key + "\" already exists");
+				}
+			}
 			// the role registers what exists; it never materialises. The CREATE itself is dropped
 			// from the batch, so nothing physical happens.
 			drop_statement = true;
@@ -469,6 +490,25 @@ private:
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
 			Deny("no schema of the catalog allows creating \"" + key + "\"");
+		}
+		// the same two rules as a table's (spec 051): REPLACE is priced as a drop, and - since a
+		// view's record is the whole object and the record writer upserts - an existing name is
+		// never overwritten by omission
+		if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+			DdlTarget drop_target;
+			if (!store.ResolveDdlTarget(principal, key, "drop", drop_target)) {
+				Deny("CREATE OR REPLACE drops \"" + key +
+				     "\" before it creates, so it needs the drop capability on the schema as well");
+			}
+		}
+		if (store.CatalogObjectExists(target.vcat, key, "relation")) {
+			if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+				drop_statement = true; // IF NOT EXISTS: it does - a no-op, not an error
+				return;
+			}
+			if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
+				Deny("\"" + key + "\" already exists");
+			}
 		}
 		// The body is resolved here, with its author's rights: a view is an object of the virtual
 		// catalog in its own right, and reading it is decided by the grant on the view - not by grants

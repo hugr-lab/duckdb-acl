@@ -58,8 +58,13 @@ def do_ingest(client, options, spec: str) -> int:
     replace (FAIL, REPLACE), temp (create + temporary - the session staging table, spec 050)."""
     import pyarrow as pa
     table_name, mode, cols, rows = spec.split(":", 3)
+    schema_name = ""
+    if "." in table_name:  # `schema.table` travels as the proto's own schema field (3)
+        schema_name, table_name = table_name.split(".", 1)
     tdo = {"append": (2, 2), "create": (1, 1), "replace": (2, 3), "temp": (1, 1)}[mode]
     payload = field(1, enum_field(1, tdo[0]) + enum_field(2, tdo[1])) + text(2, table_name)
+    if schema_name:
+        payload += text(3, schema_name)
     if mode == "temp":
         payload += flag(5, True)
     names = cols.split(",")
