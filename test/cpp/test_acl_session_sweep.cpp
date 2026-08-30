@@ -81,7 +81,13 @@ void IdleIsRefusedBeforeAnySweep(Connection &con) {
 	std::this_thread::sleep_for(std::chrono::milliseconds(2500));
 	auto composed = con.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
 	Check(!composed->HasError() && composed->GetValue(0, 0).IsNull(), "an idle session composes nothing");
-	Check(Scalar(con, "SELECT acl_session_count()") == 0, "and resolving it dropped the record");
+	// Resolving it no longer erases it (spec 054): the record survives so acl_session_reason can still
+	// say *why* it was refused - "idle", not "unknown". The sweep is what drops it.
+	auto reason = con.Query("SELECT acl_session_reason('" + handle + "')");
+	Check(!reason->HasError() && reason->GetValue(0, 0).ToString() == "idle",
+	      "and the reason is still there to read after the NULL");
+	Check(Scalar(con, "SELECT acl_session_sweep()") == 1, "the sweep drops the idle record");
+	Check(Scalar(con, "SELECT acl_session_count()") == 0, "and then it is gone");
 	Exec(con, "SET GLOBAL acl_session_idle_timeout=900");
 }
 

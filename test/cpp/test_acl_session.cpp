@@ -6,6 +6,9 @@
 
 #include "acl_test_util.hpp"
 
+#include <chrono>
+#include <thread>
+
 using namespace duckdb;
 using namespace acl_test;
 
@@ -79,6 +82,44 @@ void ClosingEndsIt(Connection &con) {
 	}
 	auto result = con.Query("ACL SESSION '" + handle + "' SELECT id FROM orders");
 	Check(result->HasError(), "a closed handle is refused by the prefix too");
+}
+
+//! Why a NULL (spec 054): a client that gets nothing from acl_session_sql learns whether to reopen
+//! with the same token or fetch a fresh one. The reason is read-only, so it survives the NULL that
+//! prompts it, and a live session reports "live".
+std::string ReasonOf(Connection &con, const std::string &handle) {
+	auto result = con.Query("SELECT acl_session_reason('" + handle + "')");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return std::string();
+	}
+	return result->GetValue(0, 0).ToString();
+}
+
+void SessionEndReason(Connection &con) {
+	// unknown: a handle no session ever had
+	Check(ReasonOf(con, "nosuchhandle") == "unknown", "an unknown handle reads as unknown");
+
+	auto handle = OpenSession(con, TOKEN);
+	if (!Check(!handle.empty(), "session opens for the reason check")) {
+		return;
+	}
+	Check(ReasonOf(con, handle) == "live", "a fresh session reads as live");
+
+	// idle: swept for inactivity - the reason must survive the NULL that acl_session_sql returns, so
+	// the two calls in sequence (compose -> reason) both see the dead session, not one erasing it
+	Exec(con, "SET GLOBAL acl_session_idle_timeout=1");
+	std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+	auto composed = con.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
+	if (CheckOk(*composed, "acl_session_sql answers for an idle handle")) {
+		Check(composed->GetValue(0, 0).IsNull(), "an idle session composes nothing");
+	}
+	Check(ReasonOf(con, handle) == "idle", "and the reason after the NULL is idle, not unknown");
+	Exec(con, "SET GLOBAL acl_session_idle_timeout=900");
+
+	// closed: indistinguishable from never-existed by design (no tombstone), so it reads as unknown
+	auto fresh = OpenSession(con, TOKEN);
+	Exec(con, "SELECT acl_session_close('" + fresh + "')");
+	Check(ReasonOf(con, fresh) == "unknown", "a closed session reads as unknown (reopen with the same token)");
 }
 
 //! Sessions are per-instance state, like the store itself: two databases in one process never see
@@ -161,6 +202,7 @@ int main(int argc, char *argv[]) {
 	Scenario("instances-do-not-share-sessions", [&]() { InstancesDoNotShareSessions(con, extension); });
 	Exec(con, "SELECT acl_define_token('opstok','analyst','tenant=acme')");
 	Scenario("ops-surface-lists-and-kills", [&]() { OpsSurfaceListsAndKills(con); });
+	Scenario("session-end-reason", [&]() { SessionEndReason(con); });
 
 	std::cout << (failures == 0 ? "PASS" : "FAIL") << "\n";
 	return failures == 0 ? 0 : 1;

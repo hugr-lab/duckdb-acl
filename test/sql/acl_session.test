@@ -124,6 +124,24 @@ SELECT acl_session_sql((SELECT handle FROM stale), 'SELECT 1') IS NULL;
 ----
 true
 
+# spec 054: the NULL says nothing on its own - acl_session_reason says why, and it survives the NULL
+# (resolving no longer erases the record), so a client learns to fetch a fresh token rather than reopen
+query I
+SELECT acl_session_reason((SELECT handle FROM stale)) = 'expired';
+----
+true
+
+# a live session reads as live; a handle nobody had reads as unknown
+query I
+SELECT acl_session_reason((SELECT handle FROM live)) = 'live';
+----
+true
+
+query I
+SELECT acl_session_reason('00000000000000000000000000000000') = 'unknown';
+----
+true
+
 # --- the prefix itself ---------------------------------------------------------------------------------
 # a handle a client invents resolves to nothing, and says which of the two reasons it is
 
