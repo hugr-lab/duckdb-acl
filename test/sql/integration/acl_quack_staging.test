@@ -1,0 +1,136 @@
+# name: test/sql/integration/acl_quack_staging.test
+# description: bulk staging through the quack door (spec 056) - the staging pattern on quack is a
+#   GRANTED SCHEMA, not a server temp: a quack client's CREATE TEMP is its own local temp catalog and
+#   an attached catalog cannot hold one, so the server-side temp of spec 050 is unreachable from here
+#   by construction. What composes instead is all machinery that already exists: CREATE into a schema
+#   granted create (spec 016/051), the bulk drain into it (spec 042), promotion as ordinary SQL under
+#   the target's grant, and DROP under the schema's drop.
+# group: [integration]
+
+require acl
+
+require httpfs
+
+require quack
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+CREATE TABLE orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+CREATE SCHEMA staging;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.stage AS memory.staging;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+
+# the target is confined to the principal's tenant; the staging schema is the principal's to build in
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{"select": true, "insert": true}' RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,tenant';
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, drop);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+statement ok
+SELECT acl_quack_serve('quack:localhost:31581', 'integration-server-token');
+
+statement ok
+ATTACH 'quack:localhost:31581' AS remote (TYPE quack,
+    TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+# --- the client builds its staging table through the door and bulk-streams into it -----------------
+
+statement ok
+CREATE TABLE remote.stage.load(id INTEGER, tenant VARCHAR);
+
+statement ok
+CREATE TABLE payload AS SELECT i AS id, CASE WHEN i % 2 = 0 THEN 'acme' ELSE 'globex' END AS tenant
+    FROM range(5000) t(i);
+
+# a genuinely streamed load (spec 042's drain): the payload lives client-side, so quack must SEND_DATA
+statement ok
+INSERT INTO remote.stage.load SELECT * FROM payload;
+
+# staged in full - the staging schema carries no predicate, mixed tenants land there untouched
+query I
+SELECT count(*) FROM remote.stage.load;
+----
+5000
+
+# ...and physically where the schema says
+query I
+SELECT count(*) FROM memory.staging.load;
+----
+5000
+
+# --- promotion is ordinary SQL under the target's grant --------------------------------------------
+# whole-set promotion carries globex rows the predicate forbids: refused where the value is written,
+# and nothing of it lands
+
+statement error
+INSERT INTO remote.main.orders SELECT id, tenant FROM remote.stage.load;
+----
+<REGEX>:.*does not satisfy the grant.*
+
+query I
+SELECT count(*) FROM memory.main.orders;
+----
+0
+
+# the principal's own slice promotes
+statement ok
+INSERT INTO remote.main.orders SELECT id, tenant FROM remote.stage.load WHERE tenant = 'acme';
+
+query II
+SELECT count(*), count(*) FILTER (WHERE tenant = 'acme') FROM memory.main.orders;
+----
+2500	2500
+
+# and the principal reads back exactly its slice through the door
+query I
+SELECT count(*) FROM remote.main.orders;
+----
+2500
+
+# --- the staging table drops under the schema's drop capability ------------------------------------
+
+statement ok
+DROP TABLE remote.stage.load;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'load';
+----
+0
+
+statement ok
+DETACH remote;
+
+statement ok
+SELECT acl_quack_stop('quack:localhost:31581');

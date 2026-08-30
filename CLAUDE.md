@@ -186,8 +186,12 @@ token)` installs both and starts the listener, refusing an instance a client cou
 `acl_quack_stop(uri)` closes the door and sweeps the sessions it served. quack's own fourteen functions
 are on the denylist — the gate is a denylist, so a loaded extension widens the surface until named.
 quack listens in the clear: a served deployment sits behind a reverse proxy. Streamed ingest
-(`SEND_DATA`) is generated **unprefixed** by the server and therefore fails rather than writing around
-the policy — fail-closed by construction, and why bulk loading through this door needs its own spec.
+(`SEND_DATA`) is generated **unprefixed** by the server; spec 042 recovers the principal from the
+stream id the statement itself carries and enforces the write as that principal's — the refusal
+remains only where recovery fails. Staging on quack is a **granted schema** (spec 056): a client's
+`CREATE TEMP` is its own local catalog and an attached catalog cannot hold one, so the Flight door's
+server-side temp (spec 050) is unreachable from here by construction — CREATE/drain/promote/DROP
+through specs 016/042/051 is the pattern instead.
 
 **Specs 045–053 — the Flight SQL door**: `acl_flight_serve(uri[, cert, key])` / `acl_flight_stop(uri)`
 serve the
