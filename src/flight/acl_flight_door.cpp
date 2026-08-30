@@ -30,6 +30,8 @@
 
 #include <arrow/c/bridge.h>
 #include <arrow/flight/server.h>
+#include <arrow/flight/middleware.h>
+#include <arrow/flight/server_middleware.h>
 #include <arrow/flight/sql/server.h>
 #include <arrow/record_batch.h>
 #include <arrow/status.h>
@@ -235,6 +237,90 @@ string TokenFromHeaders(const flight::ServerCallContext &context) {
 	}
 	return string();
 }
+
+//! The session cookie (spec 050): the client's connection identity, in a cookie we own so a session
+//! spans the connection's RPCs. Our own middleware rather than Arrow's ServerSessionMiddleware,
+//! whose session store is never evicted (the M1 review's F2) - here the id lives in the ACL's own
+//! session_bindings, swept with the sessions (spec 044), so nothing accumulates.
+constexpr const char *SESSION_COOKIE = "acl_flight_session_id";
+constexpr const char *COOKIE_MIDDLEWARE_KEY = "acl-cookie";
+
+//! A CSPRNG cookie id (F4): every nibble from random_device, not a seeded PRNG - the cookie selects a
+//! session that owns client resources, so it is a bearer credential and gets bearer-grade bytes.
+string MintCookieId() {
+	std::random_device rd;
+	static constexpr char HEX[] = "0123456789abcdef";
+	string out;
+	out.reserve(32);
+	for (int i = 0; i < 16; i++) {
+		auto byte = static_cast<unsigned>(rd()) & 0xFFu;
+		out += HEX[byte >> 4];
+		out += HEX[byte & 0xF];
+	}
+	return out;
+}
+
+//! The session cookie a request carries, parsed by NAME from the Cookie header (F1: never a substring
+//! of the value). Empty when the client sent none.
+string CookieFromHeaders(const flight::ServerCallContext &context) {
+	for (const auto &header : context.incoming_headers()) {
+		if (!StringUtil::CIEquals(string(header.first), "cookie")) {
+			continue;
+		}
+		string cookies(header.second);
+		idx_t pos = 0;
+		while (pos < cookies.size()) {
+			auto semi = cookies.find(';', pos);
+			auto piece = cookies.substr(pos, semi == string::npos ? string::npos : semi - pos);
+			auto eq = piece.find('=');
+			if (eq != string::npos) {
+				string name = piece.substr(0, eq);
+				StringUtil::Trim(name);
+				if (name == SESSION_COOKIE) {
+					string value = piece.substr(eq + 1);
+					StringUtil::Trim(value);
+					return value;
+				}
+			}
+			if (semi == string::npos) {
+				break;
+			}
+			pos = semi + 1;
+		}
+	}
+	return string();
+}
+
+//! Carries the connection's cookie id for one call and, when it was minted this call, emits it.
+class CookieMiddleware : public flight::ServerMiddleware {
+public:
+	CookieMiddleware(string id_p, bool fresh_p) : id(std::move(id_p)), fresh(fresh_p) {
+	}
+	string name() const override {
+		return COOKIE_MIDDLEWARE_KEY;
+	}
+	void SendingHeaders(flight::AddCallHeaders *outgoing) override {
+		if (fresh && outgoing) {
+			outgoing->AddHeader("set-cookie",
+			                    string(SESSION_COOKIE) + "=" + id + "; HttpOnly; Path=/; SameSite=Strict");
+		}
+	}
+	void CallCompleted(const arrow::Status &) override {
+	}
+	string id;
+	bool fresh; // minted this call (client sent none) -> set-cookie, and this call is transient
+};
+
+class CookieMiddlewareFactory : public flight::ServerMiddlewareFactory {
+public:
+	arrow::Status StartCall(const flight::CallInfo &, const flight::ServerCallContext &context,
+	                        std::shared_ptr<flight::ServerMiddleware> *middleware) override {
+		auto incoming = CookieFromHeaders(context);
+		bool fresh = incoming.empty();
+		*middleware = std::make_shared<CookieMiddleware>(fresh ? MintCookieId() : incoming, fresh);
+		return arrow::Status::OK();
+	}
+};
 
 class AclFlightSqlServer : public flightsql::FlightSqlServerBase {
 public:
@@ -1009,7 +1095,13 @@ private:
 	auto UnderSession(const flight::ServerCallContext &context, Body body) -> decltype(body(string())) {
 		try {
 			string handle;
-			ARROW_ASSIGN_OR_RAISE(handle, SessionFor(context));
+			bool transient = false;
+			ARROW_ASSIGN_OR_RAISE(handle, SessionFor(context, transient));
+			if (!transient) {
+				// a connection-long session (spec 050): the sweeper, exp, CloseSession or the door's
+				// stop end it - an RPC boundary does not
+				return body(handle);
+			}
 			SessionScope scope(*state->store, handle);
 			return body(handle);
 		} catch (std::exception &ex) {
@@ -1018,28 +1110,90 @@ private:
 		}
 	}
 
-	//! The caller's session, from the token this very call carries - and from nothing else.
-	//!
-	//! An earlier cut remembered the handle against the Flight peer and let a call without a token use
-	//! it. That is a session bound to `ipv4:host:port`, and ports are reused: a later client landing on
-	//! a recycled port would inherit the previous one's session. gRPC metadata is per-call and every
-	//! Flight SQL driver sends its credentials that way, so requiring the token on each call costs
-	//! nothing and removes the question.
-	//!
-	//! The session is opened and closed inside the call. Verifying a JWT and minting a handle is ~10µs
-	//! (spec 043's benchmark), which is cheaper than the state a longer-lived one would need - and it
-	//! means a door under load leaves nothing behind for the sweeper of spec 044 to find.
-	arrow::Result<string> SessionFor(const flight::ServerCallContext &context) {
+	//! The connection's cookie id, from our own middleware (empty if unavailable).
+	string CookieOf(const flight::ServerCallContext &context) {
+		auto *raw = context.GetMiddleware(COOKIE_MIDDLEWARE_KEY);
+		return raw ? static_cast<CookieMiddleware *>(raw)->id : string();
+	}
+	//! Did the client actually send the cookie back - the difference between a connection-long session
+	//! and a per-call one. A freshly minted cookie (client sent none) is transient.
+	bool ClientSentCookie(const flight::ServerCallContext &context) {
+		auto *raw = context.GetMiddleware(COOKIE_MIDDLEWARE_KEY);
+		return raw && !static_cast<CookieMiddleware *>(raw)->fresh;
+	}
+	//! Verify a token without opening a session and without learning why a bad one is bad.
+	bool VerifyQuietly(const string &token, Principal &out) {
+		try {
+			return state->store->VerifyPrincipal(true, token, out);
+		} catch (std::exception &) {
+			return false;
+		}
+	}
+
+	//! The caller's session (spec 050): the client's connection, identified by the cookie our
+	//! middleware set. A call that returns the cookie reuses the connection's session - which is what
+	//! lets a session own resources across calls - and only a session of the SAME principal; a call
+	//! without the cookie gets a per-call session, closed on the way out (the cookie-less degradation:
+	//! single-call RPCs still work, a session resource honestly refuses on the next call). The token
+	//! is the authority of every call, verified BEFORE the session's idle clock is touched (F9); an
+	//! unverifiable token falls through to the honest refusal it always earned, cookie or not.
+	arrow::Result<string> SessionFor(const flight::ServerCallContext &context, bool &transient) {
 		auto token = TokenFromHeaders(context);
 		if (token.empty()) {
 			return arrow::Status::UnknownError("acl: authentication failed");
+		}
+		auto cookie = CookieOf(context);
+		transient = !ClientSentCookie(context);
+		if (!transient) {
+			string handle;
+			if (state->store->SessionHandleFor(cookie, handle)) {
+				Principal caller;
+				if (!VerifyQuietly(token, caller)) {
+					return arrow::Status::UnknownError("acl: authentication failed");
+				}
+				Principal current;
+				string reason;
+				if (state->store->SessionPrincipal(handle, current, reason)) {
+					if (PrincipalFingerprint(caller) == PrincipalFingerprint(current)) {
+						return handle; // the connection's own live session, same principal
+					}
+					state->store->SessionClose(handle); // re-authenticated as somebody else
+				}
+			}
 		}
 		auto handle = state->store->SessionOpen(token);
 		if (handle.empty()) {
 			// what refuses a token in the prefix refuses it here, and says no more (spec 040)
 			return arrow::Status::UnknownError("acl: authentication failed");
 		}
+		if (!transient) {
+			state->store->SessionBind(cookie, handle);
+		}
 		return handle;
+	}
+
+	//! The driver's own end-of-connection signal (spec 050): closes our session when the token speaks
+	//! for it - a stolen cookie alone ends nothing. Idempotent.
+	arrow::Result<flight::CloseSessionResult> CloseSession(const flight::ServerCallContext &context,
+	                                                       const flight::CloseSessionRequest &) override {
+		try {
+			auto token = TokenFromHeaders(context);
+			auto cookie = CookieOf(context);
+			if (!token.empty() && !cookie.empty()) {
+				string handle;
+				if (state->store->SessionHandleFor(cookie, handle)) {
+					Principal current, caller;
+					string reason;
+					if (state->store->SessionPrincipal(handle, current, reason) && VerifyQuietly(token, caller) &&
+					    PrincipalFingerprint(caller) == PrincipalFingerprint(current)) {
+						state->store->SessionClose(handle); // also drops the cookie binding
+					}
+				}
+			}
+			return flight::CloseSessionResult {flight::CloseSessionStatus::kClosed};
+		} catch (std::exception &ex) {
+			return StatusFromDuck("acl", ErrorData(ex).Message());
+		}
 	}
 
 	arrow::Result<std::shared_ptr<arrow::Schema>> SchemaOf(PreparedStatement &prepared) {
@@ -1163,6 +1317,9 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		door.state = make_shared_ptr<FlightDoorState>(*context.db, StoreShared(state));
 		door.server = std::make_unique<AclFlightSqlServer>(door.state);
 		flight::FlightServerOptions options(*location);
+		// spec 050: the cookie identifies a client connection, which is what lets a session persist
+		std::shared_ptr<flight::ServerMiddlewareFactory> cookie_factory = std::make_shared<CookieMiddlewareFactory>();
+		options.middleware.emplace_back(string(COOKIE_MIDDLEWARE_KEY), std::move(cookie_factory));
 		auto init = door.server->Init(options);
 		if (!init.ok()) {
 			throw BinderException("acl_flight_serve: %s", init.ToString());
