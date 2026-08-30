@@ -42,8 +42,10 @@ def command(name: str, inner: bytes) -> bytes:
     return field(1, url) + field(2, inner)
 
 
-def statement_query(sql: str) -> bytes:
-    return command("CommandStatementQuery", text(1, sql))
+def statement_query(sql: str, transaction_id: str = "") -> bytes:
+    # field 1 = query, field 2 = transaction_id (spec 055) - a bogus id proves ValidateTxnLocked
+    inner = text(1, sql) + (text(2, transaction_id) if transaction_id else b"")
+    return command("CommandStatementQuery", inner)
 
 
 def enum_field(number: int, value: int) -> bytes:
@@ -208,7 +210,11 @@ if ask.startswith("@update:"):
 if ask.startswith("@ingest:"):
     print({"count": do_ingest(client, options, ask[len("@ingest:"):])})
     raise SystemExit(0)
-descriptor = catalog_command(ask) if ask.startswith("@") else statement_query(ask)
+if ask.startswith("@txnq:"):  # @txnq:<transaction_id>:<sql> - a statement carrying a transaction id
+    _txn, _sql = ask[len("@txnq:"):].split(":", 1)
+    descriptor = statement_query(_sql, _txn)
+else:
+    descriptor = catalog_command(ask) if ask.startswith("@") else statement_query(ask)
 info = client.get_flight_info(flight.FlightDescriptor.for_command(descriptor), options)
 reader = client.do_get(info.endpoints[0].ticket, options)
 table = reader.read_all()

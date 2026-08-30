@@ -209,7 +209,12 @@ home, and `CREATE OR REPLACE` is priced at `create`+`drop` (REPLACE is a drop). 
 is the explicit `explain` capability (a plan names physical objects); the rest of the leak-audit
 surfaces are confirmed fail-closed. **Spec 053**: `acl_flight_serve(uri, cert, key)` serves over TLS
 (`grpc+tls`, cert/key inline-PEM or read through duckdb's filesystem) and may bind any address; the
-one-arg form stays cleartext-localhost.
+one-arg form stays cleartext-localhost. **Spec 054**: `acl_session_reason(handle)` tells a client why
+a session is gone (live/expired/idle/unknown), read-only so it survives the NULL from
+`acl_session_sql`. **Spec 055**: transactions live on the session's connection -
+`BeginTransaction`/`EndTransaction` open and end one, `transaction_id` is validated against the
+session's own, so a driver with autocommit off (DBeaver, ADBC manual-commit) works; ingest still owns
+its own transaction.
 
 ## Working process — per-feature specs
 

@@ -96,6 +96,11 @@ echo "$got" | grep -q "no access to object" || fail "the physical name was not r
 got="$(ask "EXPLAIN SELECT * FROM orders")"
 echo "$got" | grep -q "explain capability" || fail "EXPLAIN was not gated by the capability: $got"
 
+# --- a statement carrying a transaction id that names no open transaction is refused (spec 055) ----
+# the security-critical ValidateTxnLocked path: a stolen/invented id cannot ride into a transaction
+got="$(ask "@txnq:deadbeefdeadbeefdeadbeefdeadbeef:SELECT 1")"
+echo "$got" | grep -q "unknown transaction" || fail "a foreign transaction id was not refused: $got"
+
 # --- a token nobody can verify does not get in -----------------------------------------------------
 got="$(ask "SELECT 1" "not-a-jwt")"
 echo "$got" | grep -q "authentication failed" || fail "an unverifiable token was admitted: $got"

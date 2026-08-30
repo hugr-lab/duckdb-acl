@@ -27,10 +27,10 @@ Ordered: security and integrity first, functional completeness second, optimisat
 
 ## B. Functional completeness
 
-4. **Transactions on the held connection** (specs 047/050 deferral): `BeginTransaction` RPC is
-   NotImplemented; a SQL `BEGIN` spans RPCs since spec 050 (as it always has on quack) and ingest
-   refuses to run inside one. Decide and spec the real contract instead of the current honest
-   patchwork.
+4. **Transactions on the held connection** - DONE → spec 055. `BeginTransaction`/`EndTransaction`
+   open and end a transaction on the session's connection; `FLIGHT_SQL_SERVER_TRANSACTION` is now
+   `TRANSACTION`, so a driver with autocommit off (DBeaver, ADBC manual-commit) works. Savepoints
+   are a follow-up.
 5. **Telling a client why its session ended** - DONE → spec 054. `acl_session_reason(handle)` returns
    "live"/"expired"/"idle"/"unknown", judged read-only so it survives the NULL from `acl_session_sql`.
    Closed and never-existed both read "unknown" (no tombstone, by design).
