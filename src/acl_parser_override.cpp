@@ -1345,7 +1345,6 @@ void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &ou
 		if (!store.SessionPrincipal(prefix.value, out, reason)) {
 			throw BinderException("acl_rewrite: session %s", reason);
 		}
-		out.session_scope = prefix.value; // staging (spec 049) resolves against this very session
 		return;
 	}
 	bool is_token = prefix.kind == AclPrefix::Kind::TOKEN;

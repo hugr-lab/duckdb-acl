@@ -216,8 +216,6 @@ string MintHandle() {
 
 } // namespace
 
-static void BuryStagedLocked(PolicyStore::Session &session, vector<string> &graveyard);
-
 string PolicyStore::SessionOpen(const string &token) {
 	Principal principal;
 	int64_t expires_at = 0;
@@ -280,13 +278,11 @@ bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string 
 		return false;
 	}
 	if (entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
-		BuryStagedLocked(entry->second, staging_graveyard);
 		sessions.erase(entry); // it can never come back, so do not keep it around
 		reason = "expired";
 		return false;
 	}
 	if (idle > 0 && entry->second.last_used + idle < now) {
-		BuryStagedLocked(entry->second, staging_graveyard);
 		sessions.erase(entry);
 		reason = "idle";
 		return false;
@@ -308,7 +304,6 @@ idx_t PolicyStore::SweepLocked(int64_t now, int64_t skew, int64_t idle) {
 		// is the wrong way to be wrong about it. Every session gets its stamp at SessionOpen.
 		bool stale = idle > 0 && entry->second.last_used + idle < now;
 		if (expired || stale) {
-			BuryStagedLocked(entry->second, staging_graveyard);
 			entry = sessions.erase(entry);
 			removed++;
 			continue;
@@ -323,98 +318,6 @@ idx_t PolicyStore::SweepLocked(int64_t now, int64_t skew, int64_t idle) {
 	}
 	last_sweep = now;
 	return removed;
-}
-
-string PrincipalFingerprint(const Principal &principal) {
-	auto roles = principal.roles;
-	std::sort(roles.begin(), roles.end());
-	vector<string> claims;
-	for (auto &entry : principal.claims) {
-		claims.push_back(entry.first + "\x1e" + entry.second);
-	}
-	std::sort(claims.begin(), claims.end());
-	string out;
-	for (auto &role : roles) {
-		out += role + "\x1f";
-	}
-	out += "\x1f";
-	for (auto &claim : claims) {
-		out += claim + "\x1f";
-	}
-	return out;
-}
-
-//! Caller holds the lock. A dying session takes its staging to the graveyard, never straight to a
-//! DROP: whoever erases a session is under the store lock and must run no SQL (spec 044's rule).
-static void BuryStagedLocked(PolicyStore::Session &session, vector<string> &graveyard) {
-	for (auto &table : session.staged) {
-		graveyard.push_back(table.second);
-	}
-	session.staged.clear();
-}
-
-bool PolicyStore::StagingResolve(const string &handle, const string &name, string &phys) {
-	auto now = NowSeconds();
-	lock_guard<mutex> guard(lock);
-	auto entry = sessions.find(handle);
-	if (entry == sessions.end()) {
-		return false;
-	}
-	auto table = entry->second.staged.find(name);
-	if (table == entry->second.staged.end()) {
-		return false;
-	}
-	entry->second.last_used = now;
-	phys = table->second;
-	return true;
-}
-
-string PolicyStore::StagingIdFor(const string &handle) {
-	auto minted = MintHandle();
-	lock_guard<mutex> guard(lock);
-	auto entry = sessions.find(handle);
-	if (entry == sessions.end()) {
-		return string();
-	}
-	if (entry->second.staging_id.empty()) {
-		// random and NOT the handle: a handle is a credential, and this names catalog tables
-		entry->second.staging_id = minted;
-	}
-	return entry->second.staging_id;
-}
-
-void PolicyStore::StagingAdd(const string &handle, const string &name, const string &phys) {
-	lock_guard<mutex> guard(lock);
-	auto entry = sessions.find(handle);
-	if (entry != sessions.end()) {
-		entry->second.staged[name] = phys;
-	}
-}
-
-bool PolicyStore::StagingRemove(const string &handle, const string &name, string &phys) {
-	lock_guard<mutex> guard(lock);
-	auto entry = sessions.find(handle);
-	if (entry == sessions.end()) {
-		return false;
-	}
-	auto table = entry->second.staged.find(name);
-	if (table == entry->second.staged.end()) {
-		return false;
-	}
-	phys = table->second;
-	// condemned as well as unregistered: the rewritten DROP normally lands first and the graveyard's
-	// IF EXISTS is a no-op, but a client that prepared the DROP and never fetched would otherwise
-	// leave the physical scratch orphaned forever
-	staging_graveyard.push_back(phys);
-	entry->second.staged.erase(table);
-	return true;
-}
-
-vector<string> PolicyStore::TakeStagingGraveyard() {
-	lock_guard<mutex> guard(lock);
-	auto taken = std::move(staging_graveyard);
-	staging_graveyard.clear();
-	return taken;
 }
 
 idx_t PolicyStore::SessionSweep() {
@@ -451,10 +354,6 @@ bool PolicyStore::DoorOpen() {
 
 void PolicyStore::SessionClose(const string &handle) {
 	lock_guard<mutex> guard(lock);
-	auto entry = sessions.find(handle);
-	if (entry != sessions.end()) {
-		BuryStagedLocked(entry->second, staging_graveyard);
-	}
 	sessions.erase(handle);
 	for (auto entry = session_bindings.begin(); entry != session_bindings.end();) {
 		entry = entry->second == handle ? session_bindings.erase(entry) : std::next(entry);
@@ -468,11 +367,7 @@ void PolicyStore::SessionBind(const string &external_id, const string &handle) {
 	// the binding is gone, but permanent all the same (spec 044).
 	auto previous = session_bindings.find(external_id);
 	if (previous != session_bindings.end() && previous->second != handle) {
-		auto replaced = sessions.find(previous->second);
-		if (replaced != sessions.end()) {
-			BuryStagedLocked(replaced->second, staging_graveyard);
-			sessions.erase(replaced);
-		}
+		sessions.erase(previous->second);
 	}
 	session_bindings[external_id] = handle;
 }
@@ -480,9 +375,6 @@ void PolicyStore::SessionBind(const string &external_id, const string &handle) {
 idx_t PolicyStore::SessionCloseAll() {
 	lock_guard<mutex> guard(lock);
 	auto closed = sessions.size();
-	for (auto &entry : sessions) {
-		BuryStagedLocked(entry.second, staging_graveyard);
-	}
 	sessions.clear();
 	session_bindings.clear();
 	return closed;

@@ -168,27 +168,3 @@ is what a real client does.
   `FLIGHT_SQL_SERVER_BULK_INGESTION` to true.
 - **Transactions**: `FLIGHT_SQL_SERVER_TRANSACTION` says none; `BeginTransaction` stays unimplemented
   until a spec wants it.
-
-## Amendment (2026-08-30): the session is the connection
-
-The original text opened and closed a session inside every RPC, reasoning from spec 045's port-reuse
-lesson. That lesson condemns *peer*-bound sessions, and it was over-applied: a per-RPC session is not
-a session at all - nothing can live in one, `acl_session_count()` always answers zero, and the
-session resource spec 049 needed (staging) had nowhere to exist. Reworked per design/015:
-
-- **A session is the client's connection**, identified by the protocol's own cookie
-  (`ServerSessionMiddleware`, `arrow_flight_session_id`): many sessions per token - parallel
-  connections of one principal are separate sessions with separate resources, exactly Postgres'
-  semantics. The ADBC driver opts in with `adbc.flight.sql.rpc.with_cookie_middleware`; JDBC carries
-  cookies out of the box.
-- **The token stays the authority of every call.** The cookie only selects the session, and only a
-  session of the same principal: a cookie presented with a different principal's token starts a
-  fresh session (the old one is closed - the connection re-authenticated); a refreshed token of the
-  same principal continues it. Our handle never leaves the server: it rides inside the middleware's
-  session as an option, not in any header.
-- **A call without the cookie degrades to the per-RPC behavior** - opened, used, closed on the way
-  out. Single-call RPCs (append-ingest included) work unchanged; a session resource honestly refuses
-  on the next call.
-- **`CloseSession` is honored**: the driver's own end-of-connection signal closes our session (token
-  verified and matched first - a stolen cookie alone ends nothing). The sweeper (spec 044), the
-  token's `exp` and the door's stop remain the other closers; an RPC boundary is no longer one.

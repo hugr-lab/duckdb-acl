@@ -298,19 +298,6 @@ private:
 			Deny("only tables and views can be dropped through the ACL");
 		}
 		auto key = VirtualKey(info.GetQualifiedName());
-		// spec 049: a staging table is the session's own - dropping it needs no schema grant. The
-		// registration goes at rewrite time; if the drop then fails to execute, what remains is a
-		// physical scratch the TTL sweep already owns.
-		{
-			string staged;
-			if (!principal.session_scope.empty() && store.StagingRemove(principal.session_scope, key, staged)) {
-				info.SetQualifiedName(ParsePhysName(staged));
-				// the graveyard also holds this name now, and a door may drain it first: IF EXISTS
-				// semantics make the two orders indistinguishable
-				info.if_not_found = OnEntryNotFound::RETURN_NULL;
-				return;
-			}
-		}
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "drop", target)) {
 			Deny("no schema of the catalog allows dropping \"" + key + "\"");
@@ -670,18 +657,6 @@ private:
 			}
 			TablePolicy policy;
 			if (!store.ResolveTable(principal, key, policy)) {
-				// spec 049: the session's own staging table - rewritten to its physical scratch in
-				// place, like a RENAME. It can never shadow a granted object: resolution was tried
-				// first, and the ingest refused the collision at registration.
-				string staged;
-				if (!principal.session_scope.empty() && store.StagingResolve(principal.session_scope, key, staged)) {
-					auto virtual_name = base.Table();
-					base.SetQualifiedName(ParsePhysName(staged));
-					if (base.alias.empty()) {
-						base.alias = virtual_name;
-					}
-					break;
-				}
 				Deny("no access to object \"" + key + "\"");
 			}
 			// the read path needs the 'select' capability, just like DML paths need theirs (spec 003):
@@ -1653,26 +1628,14 @@ private:
 		}
 		TablePolicy policy;
 		if (!store.ResolveTable(principal, key, policy)) {
-			string staged;
-			if (!principal.session_scope.empty() && store.StagingResolve(principal.session_scope, key, staged)) {
-				// the session's own staging table (spec 049): writable scratch with no policy of
-				// its own - the policy speaks when its rows flow into a real target
-				policy = TablePolicy();
-				policy.subquery_form = false;
-				policy.writable = true;
-				policy.phys = staged;
-				policy.caps = {"select", "insert", "update", "delete", "merge"};
-			} else {
-				// a name the principal *does* have, of a kind that is called rather than written: say
-				// which rather than leave an administrator reading "no access" about an object they
-				// can see
-				TablePolicy called;
-				if (store.ResolveTableFunction(principal, key, called) ||
-				    store.ResolveScalarFunction(principal, key, called)) {
-					Deny("\"" + key + "\" is a function, which is called rather than written");
-				}
-				Deny("no access to object \"" + key + "\"");
+			// a name the principal *does* have, of a kind that is called rather than written: say which
+			// rather than leave an administrator reading "no access" about an object they can see
+			TablePolicy called;
+			if (store.ResolveTableFunction(principal, key, called) ||
+			    store.ResolveScalarFunction(principal, key, called)) {
+				Deny("\"" + key + "\" is a function, which is called rather than written");
 			}
+			Deny("no access to object \"" + key + "\"");
 		}
 		// a view / masked / computed relation is read-only; a grant that only narrows a real table
 		// keeps it writable - the narrowing moves onto the written values and the WHERE (spec 011)

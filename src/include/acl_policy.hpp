@@ -30,10 +30,6 @@ struct Principal {
 	//! ingest INSERT the server generated for it (spec 042). Empty for every statement a client or a
 	//! gateway wrote - which is what keeps the exemption it carries from reaching any of them.
 	string ingest_stream;
-	//! The session this statement runs under, when it arrived by an ACL SESSION or ACL INGEST
-	//! prefix - what the rewriter resolves the session's own staging tables by (spec 049). Empty for
-	//! a gateway's ROLE/TOKEN prefix: staging is a session resource, and those carry no session.
-	string session_scope;
 	//! The statement is the Flight door's own composed ingest INSERT (spec 049): the function gate
 	//! passes its arrow_scan source and nothing else. Set only by the ACL INGEST prefix, which only
 	//! the door's C++ composes - never a client's or a gateway's text.
@@ -202,10 +198,6 @@ struct CatalogBackend; // catalog-DB policy backend (spec 006), defined in acl_p
 //! (spec 006) reading policy from an ATTACHed database in standard duckdb dialect. Owned by
 //! AclParserInfo (reached from the parser override) and shared with the admin setup functions via
 //! ScalarFunctionInfo - no process-global state, so DB instances stay isolated.
-//! Who a principal *is*, for owning state across calls: the sorted roles and claims. Two tokens of
-//! the same principal (a reconnect, a refresh) fingerprint alike; two principals never do.
-string PrincipalFingerprint(const Principal &principal);
-
 struct PolicyStore {
 	mutex lock;
 	// role -> virtual name -> policy (tables and views share one namespace)
@@ -226,13 +218,6 @@ struct PolicyStore {
 		//! about whether anyone is still there; a door sees connections that simply stop, so this is
 		//! what ends them.
 		int64_t last_used = 0;
-		//! Staging tables (spec 049 milestone 2): the server's scratch this session ingested with
-		//! `temporary = true`, reached by the name the client gave it. A session resource in the full
-		//! sense (design/015): it lives exactly as long as the session and dies with it - by idle, by
-		//! exp, by CloseSession, by the door stopping. The physical drops go through the graveyard,
-		//! because whoever erases a session holds the store lock and must run no SQL.
-		case_insensitive_map_t<string> staged; // client name -> physical name under _acl_staging
-		string staging_id;                     // random, non-credential: it names tables, handles never do
 	};
 	unordered_map<string, Session> sessions;
 	//! A door's own connection id -> our handle (spec 041). quack hands its `session_id` to the
@@ -240,7 +225,6 @@ struct PolicyStore {
 	//! is what turns "which connection is this" into "which principal is this" without the door ever
 	//! holding one.
 	unordered_map<string, string> session_bindings;
-	vector<string> staging_graveyard;
 	//! Whether a door of ours is serving on this instance (spec 043); see SetDoorOpen.
 	bool door_open = false;
 	//! When sessions were last swept (spec 044), so the automatic sweep inside SessionOpen runs at most
@@ -452,15 +436,6 @@ struct PolicyStore {
 	//! (0 = never), and how many may live at once (0 = unlimited).
 	int64_t SessionIdleTimeout();
 	int64_t MaxIngestRows();
-	//! Staging tables (spec 049 milestone 2), a session resource: keyed by the session handle
-	bool StagingResolve(const string &handle, const string &name, string &phys);
-	string StagingIdFor(const string &handle);
-	void StagingAdd(const string &handle, const string &name, const string &phys);
-	bool StagingRemove(const string &handle, const string &name, string &phys);
-	vector<string> TakeStagingGraveyard();
-	//! Whether some role of the principal holds `cap` on a MAIN catalog grant, stated explicitly -
-	//! the unstated-caps default never includes it (spec 012's rule, applied to `temp`)
-	bool PrincipalMainCap(const Principal &principal, const string &cap);
 	int64_t MaxSessions();
 
 	//! Is an ACL door serving on this instance (spec 043)? Set by `acl_quack_serve`, cleared when the
