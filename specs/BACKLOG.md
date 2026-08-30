@@ -55,12 +55,12 @@ Ordered: security and integrity first, functional completeness second, optimisat
 
 ## D. Live validation - the closing item of this phase
 
-12. **A live scenario against real client tools**: DBeaver (the Flight SQL JDBC driver), a quack
-    client, and an ADBC client (python; Power BI where available) each walk one scripted scenario
-    against a served node - connect, browse the catalog tree, read a slice, write under a grant,
-    stage temp and promote, and every refusal reads sensibly in the tool's own UI. Scripted where
-    possible (the e2e already drives the real ADBC driver), a runbook where a GUI is involved: the
-    phase ends with eyes on real tools, not only on our own harnesses.
+12. **A live scenario against real client tools** - DONE → spec 057. `test/live/serve.sh` stands up
+    one seeded node (Flight door, `--tls` optional, quack door where built) and prints URIs, the
+    DBeaver JDBC URL and three tokens; `test/live/RUNBOOK.md` is the per-tool walk with expected
+    outcomes (13 DBeaver steps, ADBC spot-check, quack pass, and what a refusal must read like).
+    The scripted legs were already CI's (`make test-flight`, the quack integration + door e2e);
+    the runbook is the human pass. A scripted JDBC leg waits for a Java toolchain.
 
 ## Done recently (for orientation)
 

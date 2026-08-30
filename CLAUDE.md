@@ -51,6 +51,7 @@ build/release/test/unittest test/sql/acl.test    # run the suite
 GEN=ninja make test                 # same, via the ci-tools target
 GEN=ninja make test-cpp             # standalone C++ invariant tests (specs/002)
 test/harness/run.sh                 # end-to-end demo against the built extension
+test/live/serve.sh [--tls]          # serve one seeded node for real client tools (spec 057 runbook)
 
 # integration (specs/005): real DBs in docker + scanner-backed scenarios
 cp .env.example .env                # once
