@@ -37,10 +37,12 @@ Ordered: security and integrity first, functional completeness second, optimisat
 6. **Temp objects in the columns surfaces and `SHOW ALL TABLES`** (spec 050 deliberate exclusions) -
    when a tool turns out to need them.
 7. **`GetXdbcTypeInfo`** (spec 046 follow-up): not implemented; some drivers degrade without it.
-8. **Bulk ingest for quack** - decided 2026-08-30: quack gets a real ingest path of its own, not a
-   "Flight-only" note. quack's unprefixed `SEND_DATA` stays fail-closed by construction (spec 042);
-   the shape to design from is the staging pattern the Flight door proved - `temporary` staging on
-   the client's own persistent connection, promotion as ordinary SQL under the grant.
+8. **Bulk ingest for quack** - DONE → spec 056, and mostly it already existed: bulk into granted
+   tables has worked since spec 042 (the drain's recovered principal enforces every streamed row).
+   What 056 adds is the decision and the pin: quack's staging is a **granted schema**
+   (CREATE/drain/promote/DROP through specs 016/042/051, proven live end to end), because a quack
+   client cannot address the server connection's temp catalog through an attached catalog - the
+   Flight door's server-side temp (spec 050) is unreachable from quack by construction.
 
 ## C. Optimisations / platform
 
