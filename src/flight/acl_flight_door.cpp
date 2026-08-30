@@ -19,6 +19,8 @@
 #include <arrow/util/config.h>
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -255,8 +257,8 @@ public:
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_TRANSACTION,
 		                int32_t(Info::SqlSupportedTransaction::SQL_SUPPORTED_TRANSACTION_NONE));
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_CANCEL, false);
-		// flips to true in the commit that implements DoPutCommandStatementIngest (spec 049)
-		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_BULK_INGESTION, false);
+		// spec 049: DoPutCommandStatementIngest below - append into an existing writable target
+		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_BULK_INGESTION, true);
 	}
 
 	//! Where a client's SQL arrives. Nothing about the policy is decided here: the statement is
@@ -350,6 +352,195 @@ public:
 				auto count = chunk->GetValue(0, 0);
 				if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
 					total = count.GetValue<int64_t>();
+				}
+			}
+			return total;
+		});
+	}
+
+	//! --- bulk ingestion (spec 049) ---------------------------------------------------------------
+
+	//! The client's Flight stream as a C ArrowArrayStream: get_next pulls the reader directly, so a
+	//! load never sits in server RAM whole, and the row cap refuses *while reading*. The state lives
+	//! on the DoPut frame, which outlives the one statement that scans it - release is a no-op.
+	struct IngestStreamState {
+		flight::FlightMessageReader *reader = nullptr;
+		std::shared_ptr<arrow::Schema> schema;
+		int64_t cap = 0;
+		int64_t rows = 0;
+		std::string error;
+	};
+	static int IngestGetSchema(struct ArrowArrayStream *stream, struct ArrowSchema *out) {
+		auto &ingest = *reinterpret_cast<IngestStreamState *>(stream->private_data);
+		auto status = arrow::ExportSchema(*ingest.schema, out);
+		if (!status.ok()) {
+			ingest.error = status.ToString();
+			return EINVAL;
+		}
+		return 0;
+	}
+	static int IngestGetNext(struct ArrowArrayStream *stream, struct ArrowArray *out) {
+		auto &ingest = *reinterpret_cast<IngestStreamState *>(stream->private_data);
+		auto chunk = ingest.reader->Next();
+		if (!chunk.ok()) {
+			ingest.error = chunk.status().ToString();
+			return EINVAL;
+		}
+		if (!chunk->data) {
+			out->release = nullptr; // end of stream
+			return 0;
+		}
+		ingest.rows += chunk->data->num_rows();
+		if (ingest.cap > 0 && ingest.rows > ingest.cap) {
+			ingest.error = "acl: the ingest exceeds acl_max_ingest_rows (" + std::to_string(ingest.cap) + ")";
+			return EINVAL;
+		}
+		auto status = arrow::ExportRecordBatch(*chunk->data, out);
+		if (!status.ok()) {
+			ingest.error = status.ToString();
+			return EINVAL;
+		}
+		return 0;
+	}
+	static const char *IngestLastError(struct ArrowArrayStream *stream) {
+		auto &ingest = *reinterpret_cast<IngestStreamState *>(stream->private_data);
+		return ingest.error.empty() ? nullptr : ingest.error.c_str();
+	}
+	static void IngestRelease(struct ArrowArrayStream *stream) {
+		stream->release = nullptr; // owned by the DoPut frame
+	}
+	//! The two adapters arrow_scan wants (the ParamRowsFrom pattern): produce moves the C stream into
+	//! duckdb's wrapper, get-schema asks the stream itself.
+	static unique_ptr<ArrowArrayStreamWrapper> IngestStreamProduce(uintptr_t stream_ptr, ArrowStreamParameters &) {
+		auto source = reinterpret_cast<ArrowArrayStream *>(stream_ptr);
+		auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
+		wrapper->arrow_array_stream = *source;
+		source->release = nullptr;
+		return wrapper;
+	}
+	static void IngestStreamGetSchema(ArrowArrayStream *stream, ArrowSchema &schema) {
+		stream->get_schema(stream, &schema);
+	}
+
+	//! Flight SQL bulk ingestion (spec 049): the client streams batches at a named table, the server
+	//! composes `INSERT INTO <target>(<the stream's own column names>) SELECT ... FROM arrow_scan(...)`
+	//! under the ACL INGEST prefix - a prefix only this code composes - and the rewriter enforces it
+	//! as any other INSERT: caps, the grant's predicate where the row is written, injections. One
+	//! statement, atomic on duckdb's own terms: a refusal anywhere stores nothing.
+	arrow::Result<int64_t> DoPutCommandStatementIngest(const flight::ServerCallContext &context,
+	                                                   const flightsql::StatementIngest &command,
+	                                                   flight::FlightMessageReader *reader) override {
+		return UnderSession(context, [&](const string &handle) -> arrow::Result<int64_t> {
+			if (command.transaction_id.has_value() && !command.transaction_id->empty()) {
+				return arrow::Status::NotImplemented("acl: transactions are not supported");
+			}
+			if (command.temporary) {
+				return arrow::Status::NotImplemented(
+				    "acl: temporary staging is not implemented yet (spec 049 milestone 2)");
+			}
+			using NotExist = flightsql::TableDefinitionOptionsTableNotExistOption;
+			using Exists = flightsql::TableDefinitionOptionsTableExistsOption;
+			if (command.table_definition_options.if_not_exist == NotExist::kCreate) {
+				return arrow::Status::Invalid("acl: this door does not create tables - creating needs a create "
+				                              "capability and a declared physical home (spec 050); declare the "
+				                              "target and ingest with mode append");
+			}
+			if (command.table_definition_options.if_exists == Exists::kReplace) {
+				return arrow::Status::Invalid("acl: this door does not replace tables - replacing needs create "
+				                              "and drop capabilities (spec 050); ingest appends");
+			}
+			if (command.table_definition_options.if_exists == Exists::kFail) {
+				return arrow::Status::AlreadyExists("acl: if_exists = FAIL asks to fail when the target exists, "
+				                                    "and an append target here always exists");
+			}
+			ARROW_ASSIGN_OR_RAISE(auto schema, reader->GetSchema());
+			if (schema->num_fields() == 0) {
+				return arrow::Status::Invalid("acl: the ingest stream declares no columns");
+			}
+			// the client's own field names, quoted: the rewriter and duckdb check them by name and
+			// width, so a stream that does not match the writable set is an error, never a shifted row
+			auto quote = [](const string &name) {
+				return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+			};
+			string target;
+			if (command.catalog.has_value() && !command.catalog->empty()) {
+				target += quote(*command.catalog) + ".";
+			}
+			if (command.schema.has_value() && !command.schema->empty()) {
+				target += quote(*command.schema) + ".";
+			}
+			target += quote(command.table);
+			string columns;
+			for (int i = 0; i < schema->num_fields(); i++) {
+				columns += (i ? ", " : "") + quote(schema->field(i)->name());
+			}
+			IngestStreamState ingest;
+			ingest.reader = reader;
+			ingest.schema = schema;
+			ingest.cap = state->store->MaxIngestRows();
+			ArrowArrayStream stream;
+			stream.get_schema = IngestGetSchema;
+			stream.get_next = IngestGetNext;
+			stream.get_last_error = IngestLastError;
+			stream.release = IngestRelease;
+			stream.private_data = &ingest;
+			// the three pointers travel as the door's own bound parameters - POINTER has no literal
+			// form in SQL text, and this statement carries no parameters of anybody else's, so the
+			// golden rule stands: the rewriter adds none, and no user numbering exists to shift
+			auto sql =
+			    "INSERT INTO " + target + " (" + columns + ") SELECT " + columns + " FROM arrow_scan($1, $2, $3)";
+			auto prefixed = "ACL INGEST '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
+			Connection con(state->db);
+			auto stmt = con.Prepare(prefixed);
+			if (stmt->HasError()) {
+				return StatusFromDuck("acl", stmt->GetError());
+			}
+			vector<Value> values {Value::POINTER(reinterpret_cast<uintptr_t>(&stream)),
+			                      Value::POINTER(reinterpret_cast<uintptr_t>(&IngestStreamProduce)),
+			                      Value::POINTER(reinterpret_cast<uintptr_t>(&IngestStreamGetSchema))};
+			// the row cross-check has to decide BEFORE the write commits, or a false mismatch reports
+			// failure on data that already landed and a retry double-loads (the review's finding). So
+			// the load runs in a transaction this call rolls back on any doubt. A transaction the
+			// caller already opened (once transactions land) is joined, not nested: we own the
+			// BEGIN/COMMIT only when there was none, exactly as GizmoSQL's guard does.
+			bool owns_txn = !con.HasActiveTransaction();
+			if (owns_txn) {
+				auto begun = con.Query("BEGIN TRANSACTION");
+				if (begun->HasError()) {
+					return StatusFromDuck("acl", begun->GetError());
+				}
+			}
+			auto fail = [&](arrow::Status status) -> arrow::Status {
+				if (owns_txn) {
+					con.Query("ROLLBACK");
+				}
+				return status;
+			};
+			auto result = stmt->Execute(values, false);
+			if (result->HasError()) {
+				return fail(StatusFromDuck("acl", result->GetError()));
+			}
+			int64_t total = 0;
+			auto chunk = result->Fetch();
+			if (chunk && chunk->size() > 0 && chunk->ColumnCount() == 1) {
+				auto count = chunk->GetValue(0, 0);
+				if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
+					total = count.GetValue<int64_t>();
+				}
+			}
+			if (!ingest.error.empty()) {
+				return fail(arrow::Status::Invalid(ingest.error));
+			}
+			// the GizmoSQL lesson: a partial load must be an error, never a silent success - and now it
+			// is caught before commit, so nothing of a mismatched load is stored
+			if (total != ingest.rows) {
+				return fail(arrow::Status::Invalid("acl: the target took " + std::to_string(total) + " rows of the " +
+				                                   std::to_string(ingest.rows) + " the stream delivered"));
+			}
+			if (owns_txn) {
+				auto committed = con.Query("COMMIT");
+				if (committed->HasError()) {
+					return StatusFromDuck("acl", committed->GetError());
 				}
 			}
 			return total;

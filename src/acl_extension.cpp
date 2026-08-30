@@ -81,6 +81,9 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          "acl: how many sessions may live at once; at the cap a new one is refused "
 	                          "rather than an old one evicted, and 0 means unlimited (spec 044)",
 	                          LogicalType::BIGINT, Value::BIGINT(10000), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_max_ingest_rows",
+	                          "acl: maximum rows one Flight ingest may stream (0 = unlimited, spec 049)",
+	                          LogicalType::BIGINT, Value::BIGINT(0), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_jwks_max_stale",
 	                          "acl: seconds a JWKS that can no longer be read may still be used; past "
 	                          "that a token is refused rather than verified against keys of unknown age",

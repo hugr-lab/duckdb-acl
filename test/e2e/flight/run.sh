@@ -170,6 +170,24 @@ echo "$got" | grep -q "{'count': 1}" || fail "the update wire did not land one r
 got="$(ask "@update:INSERT INTO orders (id, tenant, amount, customer_id) VALUES (501, 'globex', 5, 0)")"
 case "$got" in *"does not satisfy the grant"*) ;; *) fail "a cross-tenant update-wire row was not refused: $got";; esac
 
+# --- bulk ingestion through DoPut(CommandStatementIngest) - spec 049 ------------------------------
+got="$(ask "@ingest:orders:append:id,tenant,amount,customer_id:700,acme,7,0;701,acme,8,1")"
+echo "$got" | grep -q "{'count': 2}" || fail "the ingest did not land two rows: $got"
+got="$(ask "SELECT count(*) FROM orders WHERE id IN (700, 701)")"
+echo "$got" | grep -q "\[2\]" || fail "the ingested rows did not read back: $got"
+got="$(ask "@ingest:orders:append:id,tenant,amount,customer_id:710,globex,7,0")"
+case "$got" in *"does not satisfy the grant"*) ;; *) fail "a cross-tenant ingest was not refused: $got";; esac
+got="$(ask "SELECT count(*) FROM orders WHERE id = 710")"
+echo "$got" | grep -q "\[0\]" || fail "the refused ingest left rows behind: $got"
+got="$(ask "@ingest:newtab:create:id:1")"
+case "$got" in *"does not create tables"*) ;; *) fail "mode create was not refused with the reason: $got";; esac
+got="$(ask "@ingest:orders:replace:id:1")"
+case "$got" in *"does not replace tables"*) ;; *) fail "mode replace was not refused with the reason: $got";; esac
+got="$(ask "@ingest:orders:temp:id,tenant,amount,customer_id:720,acme,1,0")"
+case "$got" in *"milestone 2"*) ;; *) fail "temporary was not refused as milestone 2: $got";; esac
+got="$(ask "@ingest:orders:append:id,tenant,nope:1,acme,1")"
+case "$got" in *nope*) ;; *) fail "an unknown ingest column was not named in the refusal: $got";; esac
+
 # --- and none of them is answered without a token --------------------------------------------------
 for probe in "@catalogs" "@tables" "@imported:orders"; do
 	got="$(ask "$probe" "-")"

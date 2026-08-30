@@ -21,7 +21,7 @@ namespace acl {
 namespace {
 
 struct AclPrefix {
-	enum class Kind { NONE, ROLE, TOKEN, SESSION, ADMIN };
+	enum class Kind { NONE, ROLE, TOKEN, SESSION, ADMIN, INGEST };
 	//! What the remainder is, decided by the marker the CLIENT writes (the gateway only prepends the
 	//! principal, so the client itself asks for anything beyond an ordinary query):
 	//!   <sql>              -> QUERY:  rewritten inside the principal's virtual catalog
@@ -106,6 +106,19 @@ AclPrefix ParseAclPrefix(const string &query) {
 		auto marked = read_marker(pos);
 		prefix.marked = marked != AclPrefix::Mode::QUERY;
 		prefix.mode = prefix.marked ? marked : AclPrefix::Mode::NATIVE;
+		prefix.rest = query.substr(pos);
+		return prefix;
+	}
+	if (StringUtil::CIEquals(mode, "ingest")) {
+		// spec 049: the door's own composition for its ingest INSERT - a session handle, then the
+		// statement. No markers ride here: the remainder must be the INSERT itself, and an embedded
+		// `ACL ...` is mid-statement garbage exactly as it is after any other prefix.
+		SkipWhitespace(query, pos);
+		if (pos >= query.size() || (query[pos] != '\'' && query[pos] != '"')) {
+			throw ParserException("acl_rewrite: ACL INGEST requires a quoted session handle");
+		}
+		prefix.kind = AclPrefix::Kind::INGEST;
+		prefix.value = ReadQuoted(query, pos);
 		prefix.rest = query.substr(pos);
 		return prefix;
 	}
@@ -1327,7 +1340,7 @@ struct AclParseGuard {
 //! handle a door already exchanged a token for (spec 040) - so this is the one place that turns any
 //! of the three into a principal, and the one place that refuses.
 void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &out) {
-	if (prefix.kind == AclPrefix::Kind::SESSION) {
+	if (prefix.kind == AclPrefix::Kind::SESSION || prefix.kind == AclPrefix::Kind::INGEST) {
 		string reason;
 		if (!store.SessionPrincipal(prefix.value, out, reason)) {
 			throw BinderException("acl_rewrite: session %s", reason);
@@ -1564,6 +1577,15 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 
 	ResolvePrincipal(store, prefix, principal);
 
+	if (prefix.kind == AclPrefix::Kind::INGEST) {
+		// the ingest prefix carries the door's own composed INSERT and nothing else (spec 049): one
+		// statement, of one kind - anything wider would hand the arrow_scan exemption to text the
+		// door never wrote
+		if (statements.size() != 1 || statements[0]->type != StatementType::INSERT_STATEMENT) {
+			throw BinderException("acl_rewrite: the ingest prefix carries exactly one INSERT statement");
+		}
+		principal.arrow_ingest = true;
+	}
 	RewriteStatements(statements, principal, options, store);
 	return ParserOverrideResult(std::move(statements));
 }

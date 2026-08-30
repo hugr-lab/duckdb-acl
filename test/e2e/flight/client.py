@@ -46,6 +46,46 @@ def statement_query(sql: str) -> bytes:
     return command("CommandStatementQuery", text(1, sql))
 
 
+def enum_field(number: int, value: int) -> bytes:
+    return bytes([(number << 3) | 0]) + varint(value)
+
+
+def do_ingest(client, options, spec: str) -> int:
+    """Bulk ingestion via DoPut(CommandStatementIngest) - spec 049. `spec` is
+    `<table>:<mode>:<cols>:<rows>` with rows `v,v,..;v,v,..`; ints stay ints, the rest are strings.
+    Field numbers from FlightSql.proto: table_definition_options=1 (if_not_exist=1, if_exists=2),
+    table=2, temporary=5. Modes: append (not_exist=FAIL, exists=APPEND), create (CREATE, FAIL),
+    replace (FAIL, REPLACE), temp (append + temporary)."""
+    import pyarrow as pa
+    table_name, mode, cols, rows = spec.split(":", 3)
+    tdo = {"append": (2, 2), "create": (1, 1), "replace": (2, 3), "temp": (2, 2)}[mode]
+    payload = field(1, enum_field(1, tdo[0]) + enum_field(2, tdo[1])) + text(2, table_name)
+    if mode == "temp":
+        payload += flag(5, True)
+    names = cols.split(",")
+    parsed = [[int(v) if v.lstrip("-").isdigit() else v for v in row.split(",")]
+              for row in rows.split(";")]
+    data = pa.table({name: [row[i] for row in parsed] for i, name in enumerate(names)})
+    descriptor = flight.FlightDescriptor.for_command(command("CommandStatementIngest", payload))
+    writer, reader = client.do_put(descriptor, data.schema, options)
+    writer.write_table(data)
+    writer.done_writing()
+    buf = reader.read()
+    writer.close()
+    if buf is None:
+        return -1
+    payload = buf.to_pybytes()
+    at = 0
+    while at < len(payload):
+        tag = payload[at]
+        at += 1
+        if tag >> 3 == 1 and tag & 7 == 0:
+            value, at = read_varint(payload, at)
+            return value
+        value, at = read_varint(payload, at)  # skip an unexpected field
+    return -1
+
+
 def read_varint(payload: bytes, at: int):
     shift, out = 0, 0
     while True:
@@ -117,6 +157,9 @@ headers = [] if token == "-" else [(b"authorization", f"Bearer {token}".encode()
 options = flight.FlightCallOptions(headers=headers)
 if ask.startswith("@update:"):
     print({"count": do_update(client, options, ask[len("@update:"):])})
+    raise SystemExit(0)
+if ask.startswith("@ingest:"):
+    print({"count": do_ingest(client, options, ask[len("@ingest:"):])})
     raise SystemExit(0)
 descriptor = catalog_command(ask) if ask.startswith("@") else statement_query(ask)
 info = client.get_flight_info(flight.FlightDescriptor.for_command(descriptor), options)

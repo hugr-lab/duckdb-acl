@@ -776,6 +776,12 @@ private:
 				}
 			}
 		}
+		// spec 049: the Flight door's ingest INSERT reads the client's batches through arrow_scan.
+		// The function stays denied by the gate - this statement is the server's own, marked by a
+		// prefix only the door composes, and its pointers are the server's own text.
+		if (principal.arrow_ingest && StringUtil::CIEquals(vname, "arrow_scan")) {
+			return;
+		}
 		// not a virtual table function: gate by name, then rewrite arguments and any subquery argument
 		if (!store.FunctionAllowed(principal, function.GetQualifiedName())) {
 			Deny("table function \"" + vname + "\" is not allowed");

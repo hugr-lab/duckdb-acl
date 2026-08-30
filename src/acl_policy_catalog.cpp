@@ -2514,6 +2514,13 @@ int64_t PolicyStore::SessionIdleTimeout() {
 	return 900;
 }
 
+int64_t PolicyStore::MaxIngestRows() {
+	if (catalog) {
+		return catalog->SettingInt64("acl_max_ingest_rows", 0);
+	}
+	return 0;
+}
+
 int64_t PolicyStore::MaxSessions() {
 	if (catalog) {
 		return catalog->SettingInt64("acl_max_sessions", 10000);
