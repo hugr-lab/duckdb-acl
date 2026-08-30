@@ -1396,7 +1396,7 @@ struct ServedDoors {
 
 //! `grpc://host:port`, or a bare `host:port` for convenience. Returned by value because everything
 //! after this point needs the host to decide whether serving it in the clear is acceptable.
-arrow::Result<flight::Location> ParseListenUri(const string &uri, string &host_out) {
+arrow::Result<flight::Location> ParseListenUri(const string &uri, string &host_out, int &port_out) {
 	auto text = StringUtil::Contains(uri, "://") ? uri : "grpc://" + uri;
 	ARROW_ASSIGN_OR_RAISE(auto location, flight::Location::Parse(text));
 	// Read back from the parsed form rather than from what was passed in: `Location` normalises, and
@@ -1404,14 +1404,57 @@ arrow::Result<flight::Location> ParseListenUri(const string &uri, string &host_o
 	auto normalised = location.ToString();
 	auto host_start = normalised.find("://");
 	host_start = host_start == string::npos ? 0 : host_start + 3;
-	auto host_end = normalised.find(':', host_start);
-	host_out = normalised.substr(host_start, host_end == string::npos ? string::npos : host_end - host_start);
+	// A bracketed IPv6 literal (`[::1]:port`) carries colons inside the host, so the port is the
+	// colon AFTER the closing bracket - splitting on the first colon would take one from inside the
+	// address (the review's finding, which the `any address` promise now invites).
+	size_t host_end;
+	if (host_start < normalised.size() && normalised[host_start] == '[') {
+		auto close = normalised.find(']', host_start);
+		host_out = normalised.substr(host_start, close == string::npos ? string::npos : close - host_start + 1);
+		host_end = (close != string::npos) ? normalised.find(':', close) : string::npos;
+	} else {
+		host_end = normalised.find(':', host_start);
+		host_out = normalised.substr(host_start, host_end == string::npos ? string::npos : host_end - host_start);
+	}
+	port_out = host_end == string::npos ? 0 : std::atoi(normalised.c_str() + host_end + 1);
 	return location;
+}
+
+//! A PEM cert or key argument: inline PEM if it opens with the armor, otherwise a path/URI read
+//! through duckdb's own filesystem - the same mechanism spec 023 reads a JWKS document with, so a
+//! local file works out of the box and an operator's secret manager or object store rides httpfs.
+string ReadPem(ClientContext &context, const string &arg, const char *what) {
+	auto trimmed = arg;
+	StringUtil::Trim(trimmed);
+	if (StringUtil::StartsWith(trimmed, "-----BEGIN")) {
+		return trimmed; // inline PEM, handed straight to Arrow
+	}
+	Connection con(*context.db);
+	auto quoted = "'" + StringUtil::Replace(trimmed, "'", "''") + "'";
+	auto result = con.Query("SELECT content FROM read_text(" + quoted + ")");
+	if (result->HasError()) {
+		throw BinderException("acl_flight_serve: could not read the %s from \"%s\": %s", what, trimmed,
+		                      result->GetError());
+	}
+	if (result->RowCount() != 1 || result->GetValue(0, 0).IsNull()) {
+		throw BinderException("acl_flight_serve: the %s location \"%s\" holds no single document", what, trimmed);
+	}
+	auto content = result->GetValue(0, 0).ToString();
+	// validate here rather than let a non-PEM file reach Arrow as the "cryptic gRPC init error" this
+	// helper exists to avoid (the review's finding): a path to the wrong file is a common mistake
+	auto content_head = content;
+	StringUtil::Trim(content_head);
+	if (!StringUtil::StartsWith(content_head, "-----BEGIN")) {
+		throw BinderException("acl_flight_serve: the %s at \"%s\" is not PEM (no -----BEGIN marker) - "
+		                      "pass a PEM file/URI or inline PEM text",
+		                      what, trimmed);
+	}
+	return content;
 }
 
 //! The four things spec 041 refuses to serve past, restated for this door. Each is checked before the
 //! socket is touched, so the refusal names the thing to fix.
-void RefuseUnlessServable(ClientContext &context, PolicyStore &store, const string &host) {
+void RefuseUnlessServable(ClientContext &context, PolicyStore &store, const string &host, bool has_tls) {
 	if (!store.CatalogEnabled()) {
 		throw BinderException("acl_flight_serve: no policy source is configured - a served instance "
 		                      "resolves every statement against one, so `acl_use_db` comes first");
@@ -1427,12 +1470,13 @@ void RefuseUnlessServable(ClientContext &context, PolicyStore &store, const stri
 		                      "statement that failed to parse as ACL would fall through to plain SQL",
 		                      override_setting.ToString());
 	}
-	// TLS is this door's own job (spec 045) and is not implemented yet, so the only address it will
-	// serve is one that cannot leave the machine. Refusing is the honest form of "not yet".
-	if (host != "localhost" && host != "127.0.0.1" && host != "::1") {
-		throw BinderException("acl_flight_serve: this door serves in the clear so far, so it binds only "
-		                      "localhost - TLS is a follow-up, and until it lands a non-local address "
-		                      "would be handing out data unencrypted (spec 045)");
+	// TLS is what lets the door leave the machine (spec 053). Without a certificate it serves in the
+	// clear, so it binds only an address that cannot leave the machine; with one, any address is the
+	// operator's call. This is the one refusal a certificate lifts - the three above stand regardless.
+	if (!has_tls && host != "localhost" && host != "127.0.0.1" && host != "::1" && host != "[::1]") {
+		throw BinderException("acl_flight_serve: without a TLS certificate the door serves in the clear, so it "
+		                      "binds only localhost - pass a cert and key to serve a non-local address "
+		                      "(acl_flight_serve(uri, cert, key)), or put a TLS-terminating proxy in front");
 	}
 }
 
@@ -1441,15 +1485,39 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	auto &context = state.GetContext();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	for (idx_t row = 0; row < args.size(); row++) {
+		if (FlatVector::IsNull(args.data[0], row)) {
+			throw BinderException("acl_flight_serve: the listen uri is required");
+		}
 		auto uri = FlatVector::GetData<string_t>(args.data[0])[row].GetString();
 		auto &store = StoreOf(state);
 
+		// spec 053: a cert+key turn the door to TLS - read as inline PEM or through duckdb's own
+		// filesystem (a path, or an object-store URI over httpfs). Both or neither: a key without a
+		// cert cannot serve, and saying so beats a cryptic gRPC init error.
+		bool has_cert = args.ColumnCount() > 1 && !FlatVector::IsNull(args.data[1], row);
+		bool has_key = args.ColumnCount() > 2 && !FlatVector::IsNull(args.data[2], row);
+		if (has_cert != has_key) {
+			throw BinderException("acl_flight_serve: TLS needs both a certificate and a key - "
+			                      "acl_flight_serve(uri, cert, key)");
+		}
+		bool has_tls = has_cert && has_key;
+
 		string host;
-		auto location = ParseListenUri(uri, host);
+		int port = 0;
+		auto location = ParseListenUri(uri, host, port);
 		if (!location.ok()) {
 			throw BinderException("acl_flight_serve: %s", location.status().ToString());
 		}
-		RefuseUnlessServable(context, store, host);
+		RefuseUnlessServable(context, store, host, has_tls);
+		if (has_tls) {
+			// build the location as grpc+tls whatever scheme was written: the certificate is the
+			// intent, and a plain grpc:// location would start a cleartext listener beside the certs
+			auto tls_location = flight::Location::ForGrpcTls(host, port);
+			if (!tls_location.ok()) {
+				throw BinderException("acl_flight_serve: %s", tls_location.status().ToString());
+			}
+			location = tls_location;
+		}
 
 		auto &doors = ServedDoors::Get();
 		std::lock_guard<std::mutex> guard(doors.lock);
@@ -1461,6 +1529,11 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		door.state = make_shared_ptr<FlightDoorState>(*context.db, StoreShared(state));
 		door.server = std::make_unique<AclFlightSqlServer>(door.state);
 		flight::FlightServerOptions options(*location);
+		if (has_tls) {
+			auto cert = ReadPem(context, FlatVector::GetData<string_t>(args.data[1])[row].GetString(), "certificate");
+			auto key = ReadPem(context, FlatVector::GetData<string_t>(args.data[2])[row].GetString(), "key");
+			options.tls_certificates.push_back(flight::CertKeyPair {std::move(cert), std::move(key)});
+		}
 		// spec 050: the cookie identifies a client connection, which is what lets a session persist
 		std::shared_ptr<flight::ServerMiddlewareFactory> cookie_factory = std::make_shared<CookieMiddlewareFactory>();
 		options.middleware.emplace_back(string(COOKIE_MIDDLEWARE_KEY), std::move(cookie_factory));
@@ -1510,14 +1583,27 @@ void AclFlightStopFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 
 void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
 	auto v = LogicalType::VARCHAR;
-	auto register_door = [&](const string &name, scalar_function_t fn) {
-		ScalarFunction function(Identifier(name), {v}, v, fn);
-		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-		function.SetFallible();
-		loader.RegisterFunction(function);
+	auto register_door = [&](const string &name, vector<vector<LogicalType>> signatures, const scalar_function_t &fn,
+	                         bool special_nulls) {
+		ScalarFunctionSet set((Identifier(name)));
+		for (auto &arguments : signatures) {
+			ScalarFunction function(Identifier(name), std::move(arguments), v, fn);
+			function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+			function.SetFallible();
+			// the serve body must run even when a cert/key argument is NULL, or duckdb's default null
+			// propagation returns NULL without ever reaching the cert-without-key guard - a served
+			// door that silently does not start (the review's finding)
+			if (special_nulls) {
+				function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+			}
+			set.AddFunction(function);
+		}
+		loader.RegisterFunction(set);
 	};
-	register_door("acl_flight_serve", AclFlightServeFunc);
-	register_door("acl_flight_stop", AclFlightStopFunc);
+	// spec 053: acl_flight_serve(uri) serves in the clear on localhost; (uri, cert, key) serves TLS
+	// and may bind any address.
+	register_door("acl_flight_serve", {{v}, {v, v, v}}, AclFlightServeFunc, true);
+	register_door("acl_flight_stop", {{v}}, AclFlightStopFunc, false);
 }
 
 } // namespace acl
