@@ -36,14 +36,21 @@ security was the last thing keeping it on localhost.
 path/URI read through duckdb's own filesystem** - the same mechanism spec 023 reads a JWKS document
 with (`read_text`). A local file works out of the box; an object-store URI rides httpfs; a secret
 manager that can present a path or a text works without a new mechanism. Nothing is written to disk by
-us - the material is handed straight to Arrow.
+us - the material is handed straight to Arrow. What a path yields is validated to be PEM (the
+`-----BEGIN` marker) before it reaches Arrow, so a path to the wrong file is a named error rather than
+a cryptic gRPC init failure. Both arguments are required together; because a NULL argument would
+otherwise short-circuit duckdb's default null propagation and return NULL without ever running the
+body (a door that silently does not start), the function declares `SPECIAL_HANDLING` so the
+cert-without-key guard always fires.
 
 ### Serving
 
 - With certs, the listen `Location` is built as `grpc+tls` whatever scheme the uri was written in -
   the certificate is the intent, and a plain `grpc://` location would open a cleartext listener beside
-  the certs. `ParseListenUri` now also returns the port, so `Location::ForGrpcTls(host, port)` can be
-  built directly.
+  the certs. `ParseListenUri` now also returns the port (parsing a bracketed IPv6 literal `[::1]:port`
+  correctly - the port is the colon after the closing bracket, not the first colon, which sits inside
+  the address), so `Location::ForGrpcTls(host, port)` can be built directly for any address the
+  "any address" promise now invites.
 - `FlightServerOptions.tls_certificates` gets one `CertKeyPair{pem_cert, pem_key}`. Arrow terminates
   TLS in gRPC; nothing about the ACL, the sessions, the cookie middleware or the rewriter changes -
   the encrypted transport is entirely beneath them.
@@ -71,9 +78,11 @@ us - the material is handed straight to Arrow.
 ## Testing
 
 - `test/e2e/flight/tls.sh`: a self-signed cert; a cleartext bind on a non-local address is refused
-  with the localhost reason; a TLS door on the same address comes up; a pyarrow client that trusts
-  the cert reads its own RLS slice over `grpc+tls`; a client that does not trust the cert is rejected
-  by the handshake. Wired into `make test-flight` and the CI flight-door job.
+  with the localhost reason; a cert-without-key call is refused by the guard; a path to a non-PEM
+  file is refused with the PEM reason; an inline-PEM TLS door initializes; a TLS door on a non-local
+  address comes up; a pyarrow client that trusts the cert reads its own RLS slice over `grpc+tls`; a
+  client that does not trust the cert is rejected specifically by certificate verification. Wired
+  into `make test-flight` and the CI flight-door job.
 - `test/e2e/flight/client.py` gained `ACL_TLS_ROOT` (a root cert to verify the server), so the same
   third-party client drives the encrypted door.
 
