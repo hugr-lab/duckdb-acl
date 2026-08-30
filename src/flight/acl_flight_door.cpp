@@ -238,6 +238,11 @@ struct FlightDoorState {
 		auto now = NowSeconds();
 		if (now - last_conn_sweep >= 60) {
 			last_conn_sweep = now;
+			// sweep abandoned reservations on the same clock, not only under cap pressure (spec 055
+			// review): a reservation holds a shared_ptr to its SessionConn, so a lingering one pins
+			// the connection - and now an open transaction with its write locks - past session end.
+			// This bounds an abandoned transaction to the idle timeout rather than the reservation cap.
+			SweepReservationsLocked(store->SessionIdleTimeout());
 			SweepConnsLocked();
 		}
 		auto &entry = session_conns[handle];

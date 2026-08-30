@@ -54,7 +54,15 @@ row-count cross-check to decide before commit.
 
 A transaction dies with its connection: session end (idle / `exp` / `CloseSession` / stop) destroys
 the `Connection`, and duckdb rolls back any open transaction natively. No transaction registry, no
-separate sweep - the `txn_id` is a field on the connection that is already swept.
+separate sweep - the `txn_id` is a field on the connection.
+
+One subtlety the review surfaced: a `Reservation` holds a `shared_ptr<SessionConn>`, so a lingering
+reservation (a prepared statement, or an unfetched ticket) keeps the connection - and its open
+transaction, with its write locks - alive past session end. Reservations were swept only under cap
+pressure, so an abandoned transaction could outlive its session until the reservation cap was hit.
+Fixed: the door's 60-second sweep now runs `SweepReservationsLocked` alongside the connection sweep,
+so an abandoned reservation (and the transaction it pins) is reclaimed within the idle timeout - which
+is what makes "a transaction dies with its session" true rather than aspirational.
 
 ## Enforcement & security
 
@@ -67,6 +75,22 @@ separate sweep - the `txn_id` is a field on the connection that is already swept
 - Fail-closed: no cookie session -> no transaction; a second begin -> refused; a foreign id ->
   refused; a session that ends mid-transaction -> rolled back by connection teardown.
 
+Two client-behaviour limitations, recorded rather than fixed because neither weakens the ACL (every
+statement is still gated per-execute) and both are unusual:
+
+- **Mixing raw SQL and Flight transaction control desyncs `txn_id`.** The rewriter passes `BEGIN`/
+  `COMMIT`/`ROLLBACK` through (quack needs them, spec 043), so a client that opens a transaction with
+  the Flight `BeginTransaction` action and then closes it with a raw SQL `COMMIT` leaves `txn_id` set
+  while duckdb's transaction is gone; later statements bearing that id run in autocommit until the
+  next `EndTransaction` clears it. A client should use one mechanism; the Flight-only flow the drivers
+  speak stays in sync. (Ingest and the executemany batch already trust duckdb's own
+  `HasActiveTransaction`, so they are unaffected.)
+- **A query-path DML deferred past its transaction runs in autocommit.** `transaction_id` is validated
+  at prepare (GetFlightInfo); the write runs at DoGet. A client that begins, prepares a DML under the
+  transaction, then commits/rolls back *before fetching* will have the deferred DoGet execute outside
+  the transaction. This is the ADBC dbapi laziness the tests force past with `fetchall()`; a JDBC
+  `executeUpdate` runs eagerly and does not hit it.
+
 ## Testing
 
 - `test/e2e/flight/adbc.sh` (the real ADBC driver, manual-commit): a rolled-back insert does not land;
@@ -78,6 +102,10 @@ separate sweep - the `txn_id` is a field on the connection that is already swept
   its DoGet (the actual execution) is *deferred* until the result is read, so the test forces it with
   `fetchall()` to keep the write inside the transaction. This is the Python dbapi driver's laziness,
   not the server's - a JDBC `executeUpdate` (DBeaver) runs eagerly.
+- `test/e2e/flight/run.sh` pins the security-critical refusal directly (raw client, `@txnq:<id>:<sql>`
+  sends a `StatementQuery` carrying a transaction id): a statement bearing an id that names no open
+  transaction of the session is refused with "unknown transaction" - the `ValidateTxnLocked` path a
+  stolen or invented id must never pass.
 
 ## Alternatives considered
 
