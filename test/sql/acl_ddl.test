@@ -340,3 +340,144 @@ statement error
 ACL ROLE "ingest" CREATE TEMP TABLE vs.tmp(id INTEGER);
 ----
 <REGEX>:.*temporary objects need the temp capability.*
+
+# --- REPLACE is a drop: create alone does not price it (spec 051) -----------------------------------
+# A fresh role, because `ingest` has collected wider grants over this file: `builder` holds exactly
+# select+create on vs - the shape of the live-probed hole.
+
+statement ok
+ACL ADMIN CREATE ROLE builder;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE builder CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE builder WITH (select, create);
+
+statement error
+ACL ROLE "builder" CREATE OR REPLACE TABLE vs.copied(id INTEGER);
+----
+<REGEX>:.*(needs the drop capability|drop on schema).*
+
+# the object and its rows survived the refusal
+query I
+ACL ROLE "builder" SELECT count(*) FROM vs.copied;
+----
+1
+
+# a view's record is the whole object, and it is not overwritten by omission
+statement error
+ACL ROLE "builder" CREATE VIEW vs.v AS SELECT 2 AS two;
+----
+<REGEX>:.*already exists.*
+
+statement ok
+ACL ROLE "builder" CREATE VIEW IF NOT EXISTS vs.v AS SELECT 2 AS two;
+
+# the no-op kept the original body
+query I
+ACL ROLE "builder" SELECT one FROM vs.v;
+----
+1
+
+statement error
+ACL ROLE "builder" CREATE OR REPLACE VIEW vs.v AS SELECT 2 AS two;
+----
+<REGEX>:.*(needs the drop capability|drop on schema).*
+
+# with drop granted, OR REPLACE means what it says - for the view and for the table
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE builder WITH (select, insert, create, drop);
+
+statement ok
+ACL ROLE "builder" CREATE OR REPLACE VIEW vs.v AS SELECT 2 AS two;
+
+query I
+ACL ROLE "builder" SELECT two FROM vs.v;
+----
+2
+
+statement ok
+ACL ROLE "builder" CREATE OR REPLACE TABLE vs.copied(id INTEGER);
+
+query I
+ACL ROLE "builder" SELECT count(*) FROM vs.copied;
+----
+0
+
+# plain CREATE TABLE must not clobber a view record either: the record occupies the name with
+# nothing physical behind it, so the native duplicate error never fires (the review's finding)
+statement error
+ACL ROLE "builder" CREATE TABLE vs.v(id INTEGER);
+----
+<REGEX>:.*already exists.*
+
+statement ok
+ACL ROLE "builder" CREATE TABLE IF NOT EXISTS vs.v(id INTEGER);
+
+query I
+ACL ROLE "builder" SELECT two FROM vs.v;
+----
+2
+
+# IF NOT EXISTS over a taken name discards the body unrun and unvalidated - nothing of it executes
+statement ok
+ACL ROLE "builder" CREATE VIEW IF NOT EXISTS vs.v AS SELECT * FROM phys.lake.orders;
+
+query I
+ACL ROLE "builder" SELECT two FROM vs.v;
+----
+2
+
+# --- the drop must hold on the schema that hosts the create (the refinement leak) -------------------
+# An explicit child grant that omits drop governs its own level: the parent's drop must not price a
+# REPLACE the child withheld (spec 012: a refinement never widens by omission).
+
+statement ok
+CREATE SCHEMA phys.deep;
+
+statement ok
+CREATE TABLE phys.deep.t(id INT);
+
+statement ok
+INSERT INTO phys.deep.t VALUES (1);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.zone AS phys.staging;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.zone.inner AS phys.deep;
+
+statement ok
+ACL ADMIN CREATE ROLE refined;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE refined CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.zone TO ROLE refined WITH (select, create, drop);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.zone.inner TO ROLE refined WITH (select, create);
+
+statement error
+ACL ROLE "refined" CREATE OR REPLACE TABLE zone.inner.t(id INTEGER);
+----
+<REGEX>:.*(drop capability on the schema that hosts|drop on schema).*
+
+# the table and its row survived
+query I
+ACL ROLE "refined" SELECT count(*) FROM zone.inner.t;
+----
+1
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.zone.inner TO ROLE refined WITH (select, create, drop);
+
+statement ok
+ACL ROLE "refined" CREATE OR REPLACE TABLE zone.inner.t(id INTEGER);
+
+query I
+ACL ROLE "refined" SELECT count(*) FROM zone.inner.t;
+----
+0

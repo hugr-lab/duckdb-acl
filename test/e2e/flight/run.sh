@@ -111,7 +111,7 @@ got="$(ask "@catalogs")"
 [ "$got" = "{'catalog_name': ['c']}" ] || fail "GetCatalogs is not the principal's: $got"
 
 got="$(ask "@schemas")"
-echo "$got" | grep -q "'db_schema_name': \['main'\]" || fail "GetDbSchemas: $got"
+echo "$got" | grep -q "'db_schema_name': \['main', 'stage', 'stage2'\]" || fail "GetDbSchemas: $got"
 case "$got" in *memory*) fail "the physical database was listed: $got";; esac
 
 got="$(ask "@tables")"
@@ -180,9 +180,28 @@ case "$got" in *"does not satisfy the grant"*) ;; *) fail "a cross-tenant ingest
 got="$(ask "SELECT count(*) FROM orders WHERE id = 710")"
 echo "$got" | grep -q "\[0\]" || fail "the refused ingest left rows behind: $got"
 got="$(ask "@ingest:newtab:create:id:1")"
-case "$got" in *"does not create tables"*) ;; *) fail "mode create was not refused with the reason: $got";; esac
+case "$got" in *"no schema of the catalog allows creating"*) ;; *) fail "mode create was not refused with the reason: $got";; esac
 got="$(ask "@ingest:orders:replace:id:1")"
-case "$got" in *"does not replace tables"*) ;; *) fail "mode replace was not refused with the reason: $got";; esac
+case "$got" in *"no schema of the catalog allows creating"*) ;; *) fail "mode replace was not refused with the reason: $got";; esac
+
+# --- and a schema granted create+drop takes an ingest-created table (spec 051) ---------------------
+got="$(ask "@ingest:stage.fresh:create:id,amount:800,1;801,2")"
+echo "$got" | grep -q "'count': 2" || fail "mode create did not land in the staging schema: $got"
+got="$(ask "SELECT count(*) AS n FROM stage.fresh")"
+echo "$got" | grep -q "'n': \[2\]" || fail "the created table did not read back: $got"
+got="$(ask "@ingest:stage.fresh:replace:id,amount:900,9")"
+echo "$got" | grep -q "'count': 1" || fail "mode replace did not swap the table: $got"
+got="$(ask "SELECT count(*) AS n FROM stage.fresh")"
+echo "$got" | grep -q "'n': \[1\]" || fail "the replaced table did not read back: $got"
+got="$(ask "@update:DROP TABLE stage.fresh")"
+echo "$got" | grep -q "'count':" || fail "DROP of the created table failed: $got"
+# create-only prices CREATE and nothing more: replace through the door is refused without drop
+got="$(ask "@ingest:stage2.once:create:id:1")"
+echo "$got" | grep -q "'count': 1" || fail "create into the create-only schema failed: $got"
+got="$(ask "@ingest:stage2.once:replace:id:2")"
+case "$got" in *"drop"*) ;; *) fail "replace without drop was not refused: $got";; esac
+got="$(ask "SELECT count(*) AS n FROM stage2.once")"
+echo "$got" | grep -q "'n': \[1\]" || fail "the refused replace touched the table: $got"
 # temporary now stages into the session (spec 050) - so a cookie-less call has nowhere to hold it;
 # the session-borne success is asserted in the temp section below, where sessions are expected
 got="$(ask "@ingest:stage_raw:temp:id,amount:720,1;721,2")"

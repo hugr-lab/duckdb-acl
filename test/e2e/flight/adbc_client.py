@@ -79,7 +79,7 @@ with connect(acme_token) as conn:
         cur.adbc_ingest("brand_new", batch, mode="create")
         check("mode create refused with the reason", False, "a table was created")
     except Exception as ex:
-        check("mode create refused with the reason", "does not create tables" in str(ex), ex)
+        check("mode create refused with the reason", "no schema of the catalog allows creating" in str(ex), ex)
 
     # --- spec 050: a temporary ingest target lives in the session ---------------------------------
     # The staging pattern spec 049 promised: bulk rows into a session temp, then ordinary SQL moves
