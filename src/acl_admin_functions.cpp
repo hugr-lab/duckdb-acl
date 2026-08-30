@@ -1177,6 +1177,67 @@ void AclSessionCountFunc(DataChunk &args, ExpressionState &state, Vector &result
 	result.Reference(live, count_t(args.size()));
 }
 
+//! Minimal JSON string escape for the ops surface below.
+static string JsonEscape(const string &value) {
+	string out;
+	out.reserve(value.size() + 2);
+	for (char c : value) {
+		switch (c) {
+		case '"':
+			out += "\\\"";
+			break;
+		case '\\':
+			out += "\\\\";
+			break;
+		case '\n':
+			out += "\\n";
+			break;
+		case '\r':
+			out += "\\r";
+			break;
+		case '\t':
+			out += "\\t";
+			break;
+		default:
+			out += c;
+		}
+	}
+	return out;
+}
+
+//! acl_sessions(): the live sessions on this node, as a JSON array - the admin/front ops surface
+//! (spec 050). Never the handle (a bearer credential): each session shows its non-secret ops id, its
+//! principal (subject + roles), how long it has been idle, and its token exp. Denied to a principal
+//! like the rest of this surface - a client may not learn who else is connected.
+void AclSessionsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto sessions = StoreOf(state).SessionList();
+	string json = "[";
+	for (idx_t i = 0; i < sessions.size(); i++) {
+		auto &session = sessions[i];
+		string roles = "[";
+		for (idx_t r = 0; r < session.roles.size(); r++) {
+			roles += (r ? "," : "") + string("\"") + JsonEscape(session.roles[r]) + "\"";
+		}
+		roles += "]";
+		json += (i ? "," : "");
+		json += "{\"id\":\"" + JsonEscape(session.id) + "\",\"subject\":\"" + JsonEscape(session.subject) +
+		        "\",\"roles\":" + roles + ",\"idle_seconds\":" + std::to_string(session.idle_seconds) +
+		        ",\"expires_at\":" + std::to_string(session.expires_at) + "}";
+	}
+	json += "]";
+	result.Reference(Value(json), count_t(args.size()));
+}
+
+//! acl_session_kill(id): end the session with this ops id (from acl_sessions()), true if one was
+//! found. The operator's hand on a stuck connection; over SessionClose, and by the non-secret id, so
+//! nothing here handles a credential. Denied to a principal.
+void AclSessionKillFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto id = RequiredArg(args, 0, row, "acl_session_kill", "session id");
+		result.SetValue(row, Value::BOOLEAN(StoreOf(state).SessionKill(id)));
+	}
+}
+
 //! acl_session_close(handle): end it. Idempotent, so a door may retry a disconnect.
 void AclSessionCloseFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -1347,6 +1408,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_session_text("acl_quack_stop", {v}, AclQuackStopFunc);
 	register_session_text("acl_quack_authorize", {v, v}, AclQuackAuthorizeFunc);
 	register_session_text("acl_session_open", {v}, AclSessionOpenFunc);
+	register_session_text("acl_sessions", {}, AclSessionsFunc); // the ops listing (spec 050), never the handle
 	register_session_text("acl_session_sql", {v, v}, AclSessionSqlFunc);
 	register_admin("acl_session_close", {v}, AclSessionCloseFunc);
 	// the bound on all of the above (spec 044): sweeping and counting, both the door's, never a client's
@@ -1358,6 +1420,12 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	};
 	register_session_bigint("acl_session_sweep", AclSessionSweepFunc);
 	register_session_bigint("acl_session_count", AclSessionCountFunc);
+	{
+		ScalarFunction kill(Identifier("acl_session_kill"), {v}, LogicalType::BOOLEAN, AclSessionKillFunc);
+		kill.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+		kill.SetFallible();
+		loader.RegisterFunction(kill);
+	}
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);
 	register_admin_set("acl_define_role", {{v, v}, {v, v, v}}, AclDefineRoleFunc);
 	// offline JWT verification (spec 007)

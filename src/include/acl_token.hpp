@@ -13,6 +13,7 @@ namespace acl {
 //! The outcome of parsing + verifying one JWT against its issuer config
 struct JwtClaims {
 	string issuer;
+	string subject;                        // the token's `sub` - identity within an issuer (spec 050 F5)
 	vector<string> raw_roles;              // values of the role claim, before mapping
 	case_insensitive_map_t<string> claims; // extracted via claim_map
 	bool groups_overage = false;           // EntraID groups overage marker present

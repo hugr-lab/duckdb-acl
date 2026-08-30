@@ -394,6 +394,11 @@ JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clo
 	// kept so a session minted from this token can be refused once it passes (spec 040)
 	result.expires_at = expires_at;
 	result.issuer = config.issuer;
+	// the subject: identity within the issuer, so two different users who happen to share roles and
+	// claims are not one principal (spec 050 F5 - it goes into the fingerprint)
+	if (auto sub = JsonPath(payload.Root(), "sub")) {
+		result.subject = JsonString(sub);
+	}
 
 	// the roles claim: a string or an array of strings at the configured dot path
 	auto roles = JsonPath(payload.Root(), config.role_claim.empty() ? "roles" : config.role_claim);

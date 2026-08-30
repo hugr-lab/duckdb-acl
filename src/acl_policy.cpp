@@ -234,6 +234,7 @@ string PolicyStore::SessionOpen(const string &token) {
 		} catch (std::exception &) {
 			return string(); // the door refuses; it does not learn why
 		}
+		principal.subject = verified.subject;
 		principal.roles = MapExternalRoles(issuer, verified.raw_roles);
 		if (principal.roles.empty()) {
 			return string();
@@ -262,7 +263,7 @@ string PolicyStore::SessionOpen(const string &token) {
 		// (spec 044). A door turns this into "Authentication failed", which a client already handles.
 		return string();
 	}
-	sessions[handle] = Session {std::move(principal), expires_at, now};
+	sessions[handle] = Session {std::move(principal), MintHandle().substr(0, 12), expires_at, now};
 	return handle;
 }
 
@@ -331,6 +332,38 @@ idx_t PolicyStore::SessionSweep() {
 idx_t PolicyStore::SessionCount() {
 	lock_guard<mutex> guard(lock);
 	return sessions.size();
+}
+
+vector<PolicyStore::SessionInfo> PolicyStore::SessionList() {
+	auto now = NowSeconds();
+	lock_guard<mutex> guard(lock);
+	vector<SessionInfo> out;
+	out.reserve(sessions.size());
+	for (auto &entry : sessions) {
+		SessionInfo info;
+		info.id = entry.second.id;
+		info.subject = entry.second.principal.subject;
+		info.roles = entry.second.principal.roles;
+		info.expires_at = entry.second.expires_at;
+		info.idle_seconds = now - entry.second.last_used;
+		out.push_back(std::move(info));
+	}
+	return out;
+}
+
+bool PolicyStore::SessionKill(const string &id) {
+	lock_guard<mutex> guard(lock);
+	for (auto entry = sessions.begin(); entry != sessions.end(); ++entry) {
+		if (entry->second.id == id) {
+			auto handle = entry->first;
+			sessions.erase(entry);
+			for (auto binding = session_bindings.begin(); binding != session_bindings.end();) {
+				binding = binding->second == handle ? session_bindings.erase(binding) : std::next(binding);
+			}
+			return true;
+		}
+	}
+	return false;
 }
 
 string PolicyStore::SessionSql(const string &handle, const string &sql) {
@@ -433,6 +466,7 @@ void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, 
 		throw BinderException("acl_rewrite: token rejected: groups overage - the groups claim was replaced "
 		                      "by a Graph link; resolve groups at the gateway and use the ROLE form");
 	}
+	out.subject = verified.subject;
 	out.roles = MapExternalRoles(issuer, verified.raw_roles);
 	if (out.roles.empty()) {
 		throw BinderException("acl_rewrite: token rejected: no recognized roles");

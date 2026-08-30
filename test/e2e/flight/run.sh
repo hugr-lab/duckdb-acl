@@ -216,6 +216,22 @@ done
 [ -n "$counted" ] || fail "the server did not answer acl_session_count()"
 grep -q "sessions=0" "$TMP/server.log" || fail "a session was left open: $(grep sessions= "$TMP/server.log")"
 
+# --- cookie sessions persist a connection across RPCs (spec 050) ----------------------------------
+# The raw client above returns no cookie, so every call was transient and the count is 0. A client
+# that echoes the door's cookie keeps ONE session across calls - the foundation temp tables need.
+JAR="$TMP/cookiejar"
+ACL_COOKIE_JAR="$JAR" ask "SELECT 1" >/dev/null   # call 1: the door mints and sets the cookie
+ACL_COOKIE_JAR="$JAR" ask "SELECT 1" >/dev/null   # call 2: the client returns it -> same session
+[ -s "$JAR" ] || fail "the door never set a session cookie"
+echo "SELECT 'cookielive=' || acl_session_count() AS live;" >&3
+counted=""
+for _ in $(seq 1 40); do
+	if grep -q "cookielive=" "$TMP/server.log"; then counted=1; break; fi
+	sleep 0.25
+done
+[ -n "$counted" ] || fail "the server did not answer the cookie session count"
+grep -q "cookielive=1" "$TMP/server.log" || fail "a cookie connection did not reuse ONE session: $(grep cookielive= "$TMP/server.log")"
+
 # --- and the door closes ------------------------------------------------------------------------------
 echo "SELECT acl_flight_stop('$URI');" >&3
 stopped=""
@@ -228,4 +244,4 @@ done
 [ -n "$stopped" ] || fail "the door was still answering after acl_flight_stop"
 grep -q "session(s) closed" "$TMP/server.log" || fail "acl_flight_stop did not report what it closed"
 
-echo "PASS: a third-party Flight SQL client read its own slice through the door, which then closed"
+echo "PASS: a third-party Flight SQL client read its own slice, a cookie connection reused one session, and the door closed"
