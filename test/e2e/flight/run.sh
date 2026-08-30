@@ -111,7 +111,7 @@ got="$(ask "@catalogs")"
 [ "$got" = "{'catalog_name': ['c']}" ] || fail "GetCatalogs is not the principal's: $got"
 
 got="$(ask "@schemas")"
-echo "$got" | grep -q "'db_schema_name': \['main', 'stage'\]" || fail "GetDbSchemas: $got"
+echo "$got" | grep -q "'db_schema_name': \['main', 'stage', 'stage2'\]" || fail "GetDbSchemas: $got"
 case "$got" in *memory*) fail "the physical database was listed: $got";; esac
 
 got="$(ask "@tables")"
@@ -195,6 +195,13 @@ got="$(ask "SELECT count(*) AS n FROM stage.fresh")"
 echo "$got" | grep -q "'n': \[1\]" || fail "the replaced table did not read back: $got"
 got="$(ask "@update:DROP TABLE stage.fresh")"
 echo "$got" | grep -q "'count':" || fail "DROP of the created table failed: $got"
+# create-only prices CREATE and nothing more: replace through the door is refused without drop
+got="$(ask "@ingest:stage2.once:create:id:1")"
+echo "$got" | grep -q "'count': 1" || fail "create into the create-only schema failed: $got"
+got="$(ask "@ingest:stage2.once:replace:id:2")"
+case "$got" in *"drop"*) ;; *) fail "replace without drop was not refused: $got";; esac
+got="$(ask "SELECT count(*) AS n FROM stage2.once")"
+echo "$got" | grep -q "'n': \[1\]" || fail "the refused replace touched the table: $got"
 # temporary now stages into the session (spec 050) - so a cookie-less call has nowhere to hold it;
 # the session-borne success is asserted in the temp section below, where sessions are expected
 got="$(ask "@ingest:stage_raw:temp:id,amount:720,1;721,2")"

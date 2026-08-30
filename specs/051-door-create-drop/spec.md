@@ -35,15 +35,19 @@ CREATE the principal typed, because it is one. This closes the refusal spec 049 
 
 In `RewriteCreateStatement` (tables) and `RewriteCreateView`, after the `create` capability resolves:
 
-- **`OR REPLACE` requires `drop`** - `ResolveDdlTarget(principal, key, "drop", ...)` must also
-  succeed, or the statement is refused naming the missing capability. Replacing IS dropping;
+- **`OR REPLACE` requires `drop`** - `ResolveDdlTarget(principal, key, "drop", ...)` must succeed
+  **and resolve to the same schema row that hosts the create**: a parent schema's `drop` must not
+  price a REPLACE an explicit child grant withheld (spec 012's no-widening-by-omission, kept at
+  every level of the path - the review's refinement finding, probed live). Replacing IS dropping;
   spec 016's capability split stays meaningful.
-- **Views check existence** (their record is the whole object): a plain `CREATE VIEW` over an
-  existing relation record is refused ("already exists"); `IF NOT EXISTS` becomes a no-op (the
-  statement is dropped from the batch, nothing registered); `OR REPLACE` (with `drop`) upserts, as
-  the record writer always did. Tables need no existence check of their own - the physical CREATE
-  fails natively on a duplicate - except the `VIRTUAL ONLY` register path, which gets the same
-  three-way rule as views (it writes a record and touches nothing physical).
+- **Every CREATE path checks the record** - views, `VIRTUAL ONLY`, and plain tables alike: a plain
+  CREATE over an existing relation record is refused ("already exists"); `IF NOT EXISTS` becomes a
+  no-op (the statement is dropped from the batch, nothing registered, the body discarded
+  unvalidated - nothing of it ever runs); `OR REPLACE` (priced above) upserts, as the record writer
+  always did. The table path needs this exactly as much as the view path, because a view record
+  occupies a name with nothing physical behind it - "the physical CREATE fails natively on a
+  duplicate" does not cover it (the review's finding: a plain `CREATE TABLE` clobbered a view
+  record).
 - `CREATE [OR REPLACE] TEMP TABLE` is untouched: the session's own object, spec 050's rule (the
   temp branch returns before any of this).
 
@@ -76,6 +80,12 @@ cross-check and the door-owned transaction wrap the CTAS exactly as they wrap th
   only the door composes.
 - The golden rule stands: the three POINTER parameters are the door's own, on a statement that
   carries nobody else's.
+- `CREATE OR REPLACE TEMP TABLE` stays priced by `temp` alone - deliberate, not an omission: the
+  object is the session's own, nothing shared or granted is destroyed by replacing it.
+- A REPLACE keeps the virtual name and therefore the grants on it: a grant projection or key probed
+  against the old shape (spec 026) may describe the new object wrongly until
+  `acl_refresh_schema()` - the same situation as altering a physical table under a standing grant,
+  documented rather than blocked.
 
 ## Testing
 
@@ -101,6 +111,10 @@ cross-check and the door-owned transaction wrap the CTAS exactly as they wrap th
 
 ## Follow-ups
 
+- A uniqueness constraint on `relations(vcat, vname)` (schema migration): the existence check runs
+  at rewrite time and the record write later in the batch, so two concurrent record-writing CREATEs
+  on different connections could both pass and upsert last-writer-wins. Physical tables are guarded
+  by duckdb's own catalog; the records deserve the same guard at write time.
 - The single-node backlog review (after this spec): TLS on the node, pin-on-demand pooling,
   transactions on the held connection, temp columns surfaces. Sessions stay node-local by design -
   the shared-session-backend follow-up of spec 040 is dropped (2026-08-30): nodes know nothing of

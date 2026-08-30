@@ -13,8 +13,10 @@ CREATE TABLE orders AS
 CREATE TABLE customers AS
     SELECT i AS id, 'name' || i AS name, 'ssn-' || i AS ssn FROM range(3) t(i);
 
--- spec 051: a physical home a role may build in through ingest create/replace
+-- spec 051: a physical home a role may build in through ingest create/replace - and a second one
+-- granted create WITHOUT drop, so the replace refusal has a stage of its own
 CREATE SCHEMA staging;
+CREATE SCHEMA staging2;
 
 ATTACH ':memory:' AS store;
 SELECT acl_use_db('store', 'acl', true);
@@ -48,6 +50,8 @@ ACL ADMIN GRANT TABLE c.customers TO ROLE analyst WITH (select) COLUMNS (id, nam
 -- spec 051: create prices CREATE, drop prices REPLACE and DROP - a live-alias schema as the home
 ACL ADMIN CREATE VIRTUAL SCHEMA c.stage AS memory.staging;
 ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, drop);
+ACL ADMIN CREATE VIRTUAL SCHEMA c.stage2 AS memory.staging2;
+ACL ADMIN GRANT SCHEMA c.stage2 TO ROLE analyst WITH (select, insert, create);
 SET GLOBAL acl_allow_anonymous_admin=false;
 
 SELECT acl_flight_serve('${ACL_E2E_URI}');

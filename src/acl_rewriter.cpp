@@ -409,6 +409,39 @@ private:
 		return std::move(statement);
 	}
 
+	//! spec 051: REPLACE is a drop in disguise - a role that may not drop must not replace (probed
+	//! live: a create-only role replaced a physical table and its rows). The drop must hold on the
+	//! SAME schema row that hosts the create: a parent's drop must not price a REPLACE an explicit
+	//! child grant withheld (the review's refinement finding, also probed live).
+	void RequireReplaceDroppable(const CreateInfo &info, const string &key, const DdlTarget &target) {
+		if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
+			return;
+		}
+		DdlTarget drop_target;
+		if (!store.ResolveDdlTarget(principal, key, "drop", drop_target) || drop_target.vcat != target.vcat ||
+		    drop_target.schema_path != target.schema_path) {
+			Deny("CREATE OR REPLACE drops \"" + key +
+			     "\" before it creates, so it needs the drop capability on the schema that hosts it");
+		}
+	}
+
+	//! The conflict clause against the catalog's record (spec 051): the record writer upserts, so
+	//! this is the only place the clause can be enforced. A view record occupies a name with nothing
+	//! physical behind it, so the TABLE path needs this exactly as much as the view path (the
+	//! review's finding). True = proceed; false = IF NOT EXISTS found the name taken (a no-op).
+	bool AdmitRecordConflict(const CreateInfo &info, const string &vcat, const string &key) {
+		if (!store.CatalogObjectExists(vcat, key, "relation")) {
+			return true;
+		}
+		if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+			return false;
+		}
+		if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
+			Deny("\"" + key + "\" already exists");
+		}
+		return true;
+	}
+
 	void RewriteCreateStatement(CreateStatement &stmt) {
 		if (!stmt.info) {
 			Deny("unsupported CREATE form");
@@ -436,30 +469,17 @@ private:
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
 			Deny("no schema of the catalog allows creating \"" + key + "\"");
 		}
-		// REPLACE is a drop in disguise (spec 051): a role that may not drop must not replace -
-		// probed live, a create-only role replaced a physical table and its rows by omission
-		if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
-			DdlTarget drop_target;
-			if (!store.ResolveDdlTarget(principal, key, "drop", drop_target)) {
-				Deny("CREATE OR REPLACE drops \"" + key +
-				     "\" before it creates, so it needs the drop capability on the schema as well");
-			}
+		RequireReplaceDroppable(info, key, target);
+		// the record check guards the TABLE path too: a view record occupies the name with nothing
+		// physical behind it, so "the physical CREATE fails natively" is not enough (the review's
+		// finding - a plain CREATE TABLE clobbered a view record)
+		if (!AdmitRecordConflict(info, target.vcat, key)) {
+			drop_statement = true; // IF NOT EXISTS: the name is taken - a no-op, not an error
+			return;
 		}
 		auto name = info.GetQualifiedName().Name();
 		auto phys = target.phys_schema + "." + name.GetIdentifierName();
 		if (target.virtual_only) {
-			// the record IS the object here and the record writer upserts, so the conflict clause is
-			// enforced where the statement is admitted (spec 051): plain CREATE refuses a duplicate,
-			// IF NOT EXISTS is a no-op, OR REPLACE passed the drop gate above
-			if (store.CatalogObjectExists(target.vcat, key, "relation")) {
-				if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
-					drop_statement = true;
-					return;
-				}
-				if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
-					Deny("\"" + key + "\" already exists");
-				}
-			}
 			// the role registers what exists; it never materialises. The CREATE itself is dropped
 			// from the batch, so nothing physical happens.
 			drop_statement = true;
@@ -491,24 +511,12 @@ private:
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
 			Deny("no schema of the catalog allows creating \"" + key + "\"");
 		}
-		// the same two rules as a table's (spec 051): REPLACE is priced as a drop, and - since a
-		// view's record is the whole object and the record writer upserts - an existing name is
-		// never overwritten by omission
-		if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
-			DdlTarget drop_target;
-			if (!store.ResolveDdlTarget(principal, key, "drop", drop_target)) {
-				Deny("CREATE OR REPLACE drops \"" + key +
-				     "\" before it creates, so it needs the drop capability on the schema as well");
-			}
-		}
-		if (store.CatalogObjectExists(target.vcat, key, "relation")) {
-			if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
-				drop_statement = true; // IF NOT EXISTS: it does - a no-op, not an error
-				return;
-			}
-			if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
-				Deny("\"" + key + "\" already exists");
-			}
+		// the same rules as a table's (spec 051): REPLACE priced as a drop on the schema that hosts
+		// the create, and an existing name never overwritten by omission
+		RequireReplaceDroppable(info, key, target);
+		if (!AdmitRecordConflict(info, target.vcat, key)) {
+			drop_statement = true; // IF NOT EXISTS: the name is taken - a no-op, not an error
+			return;
 		}
 		// The body is resolved here, with its author's rights: a view is an object of the virtual
 		// catalog in its own right, and reading it is decided by the grant on the view - not by grants
