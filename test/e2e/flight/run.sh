@@ -92,6 +92,10 @@ echo "$got" | grep -q "'n': \[0\]" || fail "another tenant's rows were visible: 
 got="$(ask "SELECT * FROM memory.main.orders")"
 echo "$got" | grep -q "no access to object" || fail "the physical name was not refused: $got"
 
+# --- EXPLAIN is a capability (spec 052): a plan names physical objects, and analyst was not granted it
+got="$(ask "EXPLAIN SELECT * FROM orders")"
+echo "$got" | grep -q "explain capability" || fail "EXPLAIN was not gated by the capability: $got"
+
 # --- a token nobody can verify does not get in -----------------------------------------------------
 got="$(ask "SELECT 1" "not-a-jwt")"
 echo "$got" | grep -q "authentication failed" || fail "an unverifiable token was admitted: $got"
