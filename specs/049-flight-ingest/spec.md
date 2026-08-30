@@ -1,6 +1,6 @@
 # Spec 049: the Flight ingest — bulk loading through the door, under the policy
 
-- **Status**: draft
+- **Status**: implemented (milestone 1: append); milestone 2 (session temp) redesigned in design/015, its own spec
 - **Date**: 2026-08-29
 - **Author**: hugr-lab
 
@@ -94,37 +94,15 @@ handle itself is server-internal — a Flight client holds a token, never the ha
 there is no client-named stream id to bind to (the pointers are the server's own text), so the flag
 is a boolean carried by a prefix nobody else can compose.
 
-### `temporary = true` — a session staging table, and SQL does the rest (milestone 2)
+### `temporary = true` — deferred to a session-temp spec (see design/015)
 
-The decided upsert flow: ingest stages, SQL copies. A `MERGE` needs its matching condition *and its
-actions* (`WHEN MATCHED THEN UPDATE/DELETE …`), and both are SQL — no flag semantics carries them.
-So the RPC's own `temporary` field creates a **session staging table** and the client follows with
-an ordinary text statement (`MERGE INTO target USING stage ON …`, or `INSERT … SELECT`), which the
-rewriter enforces as any other: `merge`/`insert` caps on the target, predicate confinement, the lot.
-
-Mechanics:
-
-- **Physical home**: a scratch schema in the server's own default catalog (`_acl_staging`), the
-  table's physical name **prefixed by the session** — `_acl_staging."<session>_<name>"` — so two
-  sessions' `stage1` never meet. Created by the server's own unprefixed CTAS from the same
-  `arrow_scan` source: no policy object is touched — the bytes are the client's own, and the ACL has
-  nothing to say about a table only their session can reach.
-- **Resolution is session-local**: the session record keeps `{staged name → physical name}`; under
-  an `ACL SESSION` prefix an unresolved bare name is looked up there *after* the virtual catalog, and
-  a staged name that would collide with a virtual name the principal can see is **refused at ingest
-  time** — a staging table never shadows a granted object (design/013 §7's anti-shadowing rule).
-- **Ownership by construction**: only the owning session resolves the name; another session's
-  `stage1` is another physical table. Reading or appending to your own staging needs no grant — it
-  is your data; the policy speaks when it flows into a real target.
-- **Lifetime**: swept with the session (spec 044's sweeper additionally drops the session's staging
-  tables); `if_exists = REPLACE` is allowed *for staging* — it is yours to replace — and
-  `if_not_exist = CREATE` is the normal case there. An explicit `catalog`/`schema` alongside
-  `temporary` is refused: the staging namespace is the server's, exactly as duckdb's own ADBC
-  driver documents the combination as incompatible.
-- **Gate**: an explicit **`temp` capability** on the main catalog (the long-planned cap; never part
-  of the unstated-caps default, spec 012's rule) — the governance answer to "clients will fill the
-  server's memory": an admin grants staging deliberately, `acl_max_ingest_rows` bounds each load,
-  and a disk-backed server database spills instead of holding it in RAM.
+Milestone 1 refuses `temporary = true` with `NotImplemented`. The staging design first sketched here
+was reworked after the milestone-1 review: rather than a hand-managed `_acl_staging` table with its
+own graveyard and lifecycle, a temporary ingest becomes a native `CREATE TEMP TABLE` on the session's
+own held duckdb connection (Flight) or quack's persistent connection, reclaimed by duckdb when the
+connection closes. That rests on "an Arrow Flight session is a duckdb connection" (spec 047's
+amendment, design/015 §7), so it lands with that work, not here. Until then the client stages with
+ordinary SQL where it can, and `temporary = true` over the RPC is refused.
 
 ### What a writable ingest requires (unchanged from spec 042)
 

@@ -649,7 +649,15 @@ bool PolicyStore::FunctionAllowed(const Principal &principal, const QualifiedNam
 	// otherwise one statement (`SELECT acl_grant_admin('me','passthrough')`) defeats the whole model.
 	// They stay available in the native context (ACL ADMIN / ACL NATIVE), which is not rewritten, and
 	// virtual names resolve before this seam, so a granted vfunc called acl_* still works.
-	if (StringUtil::StartsWith(StringUtil::Lower(name.Name().GetIdentifierName()), "acl_")) {
+	auto lowered = StringUtil::Lower(name.Name().GetIdentifierName());
+	if (StringUtil::StartsWith(lowered, "acl_")) {
+		return false;
+	}
+	// spec 049: arrow_scan / arrow_scan_dumb turn three raw pointers into a table - memory-unsafe in a
+	// principal's hands. The one ingest exemption is Principal::arrow_ingest, honored in the rewriter
+	// before this seam is reached; here they are hard-denied AHEAD of the catalog gate, so an
+	// acl_allow_function row can never re-open a pointer-dereference primitive (the review's finding).
+	if (lowered == "arrow_scan" || lowered == "arrow_scan_dumb") {
 		return false;
 	}
 	if (catalog) {

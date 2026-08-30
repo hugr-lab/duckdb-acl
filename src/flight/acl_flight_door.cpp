@@ -498,9 +498,27 @@ public:
 			vector<Value> values {Value::POINTER(reinterpret_cast<uintptr_t>(&stream)),
 			                      Value::POINTER(reinterpret_cast<uintptr_t>(&IngestStreamProduce)),
 			                      Value::POINTER(reinterpret_cast<uintptr_t>(&IngestStreamGetSchema))};
+			// the row cross-check has to decide BEFORE the write commits, or a false mismatch reports
+			// failure on data that already landed and a retry double-loads (the review's finding). So
+			// the load runs in a transaction this call rolls back on any doubt. A transaction the
+			// caller already opened (once transactions land) is joined, not nested: we own the
+			// BEGIN/COMMIT only when there was none, exactly as GizmoSQL's guard does.
+			bool owns_txn = !con.HasActiveTransaction();
+			if (owns_txn) {
+				auto begun = con.Query("BEGIN TRANSACTION");
+				if (begun->HasError()) {
+					return StatusFromDuck("acl", begun->GetError());
+				}
+			}
+			auto fail = [&](arrow::Status status) -> arrow::Status {
+				if (owns_txn) {
+					con.Query("ROLLBACK");
+				}
+				return status;
+			};
 			auto result = stmt->Execute(values, false);
 			if (result->HasError()) {
-				return StatusFromDuck("acl", result->GetError());
+				return fail(StatusFromDuck("acl", result->GetError()));
 			}
 			int64_t total = 0;
 			auto chunk = result->Fetch();
@@ -511,12 +529,19 @@ public:
 				}
 			}
 			if (!ingest.error.empty()) {
-				return arrow::Status::Invalid(ingest.error);
+				return fail(arrow::Status::Invalid(ingest.error));
 			}
-			// the GizmoSQL lesson: a partial load must be an error, never a silent success
+			// the GizmoSQL lesson: a partial load must be an error, never a silent success - and now it
+			// is caught before commit, so nothing of a mismatched load is stored
 			if (total != ingest.rows) {
-				return arrow::Status::Invalid("acl: the target took " + std::to_string(total) + " rows of the " +
-				                              std::to_string(ingest.rows) + " the stream delivered");
+				return fail(arrow::Status::Invalid("acl: the target took " + std::to_string(total) + " rows of the " +
+				                                   std::to_string(ingest.rows) + " the stream delivered"));
+			}
+			if (owns_txn) {
+				auto committed = con.Query("COMMIT");
+				if (committed->HasError()) {
+					return StatusFromDuck("acl", committed->GetError());
+				}
 			}
 			return total;
 		});
