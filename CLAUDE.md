@@ -85,7 +85,9 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
 - **Unstated caps = every data capability** (spec 012): a grant written without `CAPS` — or a driver
   row with NULL/empty caps — means `select, insert, update, delete, merge`, never `manage`; an
   explicit `'{}'` means none. An *object* grant that states nothing inherits the catalog grant's caps,
-  so a refinement never widens by omission.
+  so a refinement never widens by omission. The capabilities *outside* that default are explicit-only
+  and never inherited: `create`/`drop` on a schema (spec 016/051), `temp` (spec 050) and `explain`
+  (spec 052) on the MAIN catalog grant — each granted by name or not held.
 - **A grant's predicate confines writes too** (spec 024): it is AND-ed into the read/write `WHERE` and
   also checked against the row being written — an `INSERT`/`UPDATE`/`MERGE` that would leave a row
   outside the principal's slice is refused where the value is written (`error()` inside a `CASE`). An

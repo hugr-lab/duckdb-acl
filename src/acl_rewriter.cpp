@@ -105,6 +105,16 @@ public:
 			RewriteQueryNode(*stmt.Cast<MergeIntoStatement>().node);
 			break;
 		case StatementType::EXPLAIN_STATEMENT: {
+			// spec 052: a plan names physical objects - the scan of a RENAME-form table is
+			// `phys.schema.table`, and EXPLAIN ANALYZE runs the query besides. That a principal who
+			// may run a query also learns where it lands is acceptable - but only to a role that was
+			// granted it. `explain` is an explicit capability on the MAIN catalog grant, never in the
+			// unstated-caps default (spec 012's rule, like `temp`); without it EXPLAIN is refused,
+			// physical names and all.
+			if (!store.PrincipalMainCap(principal, "explain")) {
+				Deny("EXPLAIN needs the explain capability on the MAIN catalog grant: a plan names the "
+				     "physical objects a query resolves to");
+			}
 			auto &explain = stmt.Cast<ExplainStatement>();
 			RewriteStatement(*explain.stmt);
 			if (replacement) {

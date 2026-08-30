@@ -9,14 +9,12 @@ Ordered: security and integrity first, functional completeness second, optimisat
 
 ## A. Security / integrity
 
-1. **The leak audit** (owed before anything ships - design/ROADMAP "After the servers land").
-   A spec-shaped inventory: surface → who answers it → what a principal gets → the test that pins it.
-   At least: metadata surfaces beyond the replaced ones (whatever a loaded extension registers - the
-   function gate is a denylist, and its failure mode is the name nobody wrote); **error and plan
-   text** (`EXPLAIN` prints physical names, binder errors quote physical columns - what a refusal
-   teaches has never been audited); server-level answers that bypass the prefix (`GetSqlInfo` is
-   server metadata by design, prepared-statement schemas); session state and secrets. Inventory
-   first, code second.
+1. **The leak audit** - DONE → spec 052. The inventory (a table in the spec) found the gate and the
+   surface replacements already fail-closed everywhere but one: `EXPLAIN` printed physical names.
+   Fixed by making EXPLAIN an explicit `explain` capability on the MAIN grant (refused by default,
+   physical names and all); binder errors under a projection, metadata table functions,
+   `sqlite_master`, settings/secrets and runtime errors were all confirmed safe. `GetSqlInfo` is
+   server metadata by design; `GetXdbcTypeInfo` stays unimplemented (item 7).
 2. **Uniqueness on `relations(vcat, vname)`** - RESOLVED by verification (2026-08-30): the managed
    schema already declares `PRIMARY KEY ("vcat", "vname")` on `relations` (spec 034,
    policy_schema.sql), so the concurrent record write the spec-051 review worried about fails on
