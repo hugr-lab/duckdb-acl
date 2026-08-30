@@ -34,6 +34,9 @@ fi
 python3 -c "import pyarrow.flight" 2>/dev/null || { echo "SKIP: pyarrow is not installed"; exit 0; }
 
 TMP="$(mktemp -d)"
+# one cookie jar for every ask: each client process returns the door's session cookie, so the
+# whole run is ONE connection-long session (design/015) - which the staging scenarios rely on
+export ACL_COOKIE_JAR="$TMP/cookies"
 SERVER_PID=""
 cleanup() {
 	local rc=$?
@@ -183,8 +186,24 @@ got="$(ask "@ingest:newtab:create:id:1")"
 case "$got" in *"does not create tables"*) ;; *) fail "mode create was not refused with the reason: $got";; esac
 got="$(ask "@ingest:orders:replace:id:1")"
 case "$got" in *"does not replace tables"*) ;; *) fail "mode replace was not refused with the reason: $got";; esac
+# --- milestone 2: a staging table, then SQL does the rest -----------------------------------------
 got="$(ask "@ingest:orders:temp:id,tenant,amount,customer_id:720,acme,1,0")"
-case "$got" in *"milestone 2"*) ;; *) fail "temporary was not refused as milestone 2: $got";; esac
+case "$got" in *"may not shadow"*) ;; *) fail "a staging name shadowing a catalog object was not refused: $got";; esac
+got="$(ask "@ingest:tmp1:temp:id,v:2,777;900,111")"
+echo "$got" | grep -q "{'count': 2}" || fail "the staging ingest did not land two rows: $got"
+got="$(ask "SELECT count(*) FROM tmp1")"
+echo "$got" | grep -q "\[2\]" || fail "the staging table did not read back for its own credential: $got"
+got="$(ask "@ingest:tmp1:temp:id,v:901,5")"
+echo "$got" | grep -q "{'count': 1}" || fail "appending to existing staging did not land: $got"
+got="$(ask "MERGE INTO orders USING tmp1 ON orders.id = tmp1.id WHEN MATCHED THEN UPDATE SET amount = tmp1.v WHEN NOT MATCHED THEN INSERT (id, tenant, amount, customer_id) VALUES (tmp1.id, 'acme', tmp1.v, 0)")"
+case "$got" in *Error*|*error*) fail "the merge from staging failed: $got";; esac
+got="$(ask "SELECT amount FROM orders WHERE id = 2")"
+echo "$got" | grep -q "\[777\]" || fail "the merge did not update through the staging table: $got"
+got="$(ask "SELECT count(*) FROM orders WHERE id IN (900, 901)")"
+echo "$got" | grep -q "\[2\]" || fail "the merge did not insert the unmatched staging rows: $got"
+got="$(ask "DROP TABLE tmp1")"
+got="$(ask "SELECT count(*) FROM tmp1")"
+case "$got" in *"no access"*) ;; *) fail "the dropped staging table still resolves: $got";; esac
 got="$(ask "@ingest:orders:append:id,tenant,nope:1,acme,1")"
 case "$got" in *nope*) ;; *) fail "an unknown ingest column was not named in the refusal: $got";; esac
 
@@ -205,8 +224,9 @@ for probe in "SELECT 1" "@tables" "@imported:orders"; do
 	echo "$got" | grep -q "could not be read" || fail "$probe: the refusal did not say why: $got"
 done
 
-# Every RPC opens a session and must close it whichever way it leaves; after everything above -
-# refusals, throws and all - the door's own count is what proves nothing was left for the sweeper.
+# One cookie jar = one connection-long session for the whole run (design/015); the failed-auth
+# probes opened none, and every transient path closed behind itself - so the count is exactly 1,
+# and the door's stop is what ends it below.
 echo "SELECT 'sessions=' || acl_session_count() AS live;" >&3
 counted=""
 for _ in $(seq 1 40); do
@@ -214,7 +234,7 @@ for _ in $(seq 1 40); do
 	sleep 0.25
 done
 [ -n "$counted" ] || fail "the server did not answer acl_session_count()"
-grep -q "sessions=0" "$TMP/server.log" || fail "a session was left open: $(grep sessions= "$TMP/server.log")"
+grep -q "sessions=1" "$TMP/server.log" || fail "expected exactly the one connection-long session: $(grep sessions= "$TMP/server.log")"
 
 # --- and the door closes ------------------------------------------------------------------------------
 echo "SELECT acl_flight_stop('$URI');" >&3

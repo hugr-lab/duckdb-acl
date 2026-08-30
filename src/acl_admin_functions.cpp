@@ -1078,7 +1078,7 @@ void AclQuackStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		// The last door is closed, so the fence on unprefixed statements lifts with it: a drained
 		// stream is once again nobody's business but quack's own (spec 043).
 		store.SetDoorOpen(false);
-		auto closed = store.SessionCloseAll();
+		auto closed = store.SessionCloseAll(); // spec 049: staging goes with the sessions, into the graveyard
 		result.SetValue(row, Value(note + " (" + std::to_string(closed) + " session(s) closed)"));
 	}
 }

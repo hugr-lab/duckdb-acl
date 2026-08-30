@@ -31,6 +31,7 @@
 #include <arrow/c/bridge.h>
 #include <arrow/flight/server.h>
 #include <arrow/flight/sql/server.h>
+#include <arrow/flight/sql/server_session_middleware.h>
 #include <arrow/record_batch.h>
 #include <arrow/status.h>
 #include <arrow/table.h>
@@ -59,6 +60,27 @@ namespace flightsql = arrow::flight::sql;
 //! The header a client's JWT arrives in. `authorization: Bearer <jwt>` is what every Flight SQL driver
 //! sends when it is given a token, so this is the driver's setting rather than our invention.
 constexpr const char *AUTH_HEADER = "authorization";
+//! The registration key of Arrow's own session middleware, and the option under which OUR session
+//! handle rides inside its cookie-identified session (design/015: the cookie names the client's
+//! CONNECTION; the handle stays server-side state of it, never a header).
+constexpr const char *SESSION_MIDDLEWARE_KEY = "acl-session";
+constexpr const char *ACL_HANDLE_OPTION = "acl.session_handle";
+
+//! Ids for the session cookie: random and non-credential - the cookie selects a context, the token
+//! authorizes every call, and nothing about a cookie may earn what a token would not.
+string MintCookieId() {
+	static thread_local std::mt19937_64 engine(std::random_device {}());
+	static constexpr char HEX[] = "0123456789abcdef";
+	string out;
+	for (int piece = 0; piece < 2; piece++) {
+		auto value = engine();
+		for (int nibble = 0; nibble < 16; nibble++) {
+			out += HEX[value & 0xF];
+			value >>= 4;
+		}
+	}
+	return out;
+}
 constexpr const char *BEARER = "bearer ";
 
 //! An opaque, unguessable id - for tickets, for the same reason spec 040 mints one for a session: a
@@ -197,27 +219,6 @@ struct FlightDoorState {
 		}
 	}
 };
-
-//! Who a principal *is*, for owning door state across calls: the sorted roles and claims. Two tokens
-//! of the same principal (a reconnect, a refresh) fingerprint alike; two principals never do.
-string PrincipalFingerprint(const Principal &principal) {
-	auto roles = principal.roles;
-	std::sort(roles.begin(), roles.end());
-	vector<string> claims;
-	for (auto &entry : principal.claims) {
-		claims.push_back(entry.first + "\x1e" + entry.second);
-	}
-	std::sort(claims.begin(), claims.end());
-	string out;
-	for (auto &role : roles) {
-		out += role + "\x1f";
-	}
-	out += "\x1f";
-	for (auto &claim : claims) {
-		out += claim + "\x1f";
-	}
-	return out;
-}
 
 //! The token a call carries, or "" - read from the headers on every call rather than only at a
 //! handshake, because a Flight client is free to open a fresh connection per call and several drivers
@@ -422,11 +423,12 @@ public:
 		stream->get_schema(stream, &schema);
 	}
 
-	//! Flight SQL bulk ingestion (spec 049): the client streams batches at a named table, the server
-	//! composes `INSERT INTO <target>(<the stream's own column names>) SELECT ... FROM arrow_scan(...)`
-	//! under the ACL INGEST prefix - a prefix only this code composes - and the rewriter enforces it
-	//! as any other INSERT: caps, the grant's predicate where the row is written, injections. One
-	//! statement, atomic on duckdb's own terms: a refusal anywhere stores nothing.
+	//! Flight SQL bulk ingestion (spec 049). Append: the server composes `INSERT INTO <target>
+	//! (<the stream's own column names>) SELECT ... FROM arrow_scan($1,$2,$3)` under the ACL INGEST
+	//! prefix - a prefix only this code composes - and the rewriter enforces it as any other INSERT.
+	//! Temporary (milestone 2): the stream lands in the server's own scratch under a name only this
+	//! credential resolves - no prefix and no policy object, because the bytes are the client's own;
+	//! the policy speaks when a later statement moves them into a real target.
 	arrow::Result<int64_t> DoPutCommandStatementIngest(const flight::ServerCallContext &context,
 	                                                   const flightsql::StatementIngest &command,
 	                                                   flight::FlightMessageReader *reader) override {
@@ -434,25 +436,8 @@ public:
 			if (command.transaction_id.has_value() && !command.transaction_id->empty()) {
 				return arrow::Status::NotImplemented("acl: transactions are not supported");
 			}
-			if (command.temporary) {
-				return arrow::Status::NotImplemented(
-				    "acl: temporary staging is not implemented yet (spec 049 milestone 2)");
-			}
 			using NotExist = flightsql::TableDefinitionOptionsTableNotExistOption;
 			using Exists = flightsql::TableDefinitionOptionsTableExistsOption;
-			if (command.table_definition_options.if_not_exist == NotExist::kCreate) {
-				return arrow::Status::Invalid("acl: this door does not create tables - creating needs a create "
-				                              "capability and a declared physical home (spec 050); declare the "
-				                              "target and ingest with mode append");
-			}
-			if (command.table_definition_options.if_exists == Exists::kReplace) {
-				return arrow::Status::Invalid("acl: this door does not replace tables - replacing needs create "
-				                              "and drop capabilities (spec 050); ingest appends");
-			}
-			if (command.table_definition_options.if_exists == Exists::kFail) {
-				return arrow::Status::AlreadyExists("acl: if_exists = FAIL asks to fail when the target exists, "
-				                                    "and an append target here always exists");
-			}
 			ARROW_ASSIGN_OR_RAISE(auto schema, reader->GetSchema());
 			if (schema->num_fields() == 0) {
 				return arrow::Status::Invalid("acl: the ingest stream declares no columns");
@@ -462,14 +447,6 @@ public:
 			auto quote = [](const string &name) {
 				return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
 			};
-			string target;
-			if (command.catalog.has_value() && !command.catalog->empty()) {
-				target += quote(*command.catalog) + ".";
-			}
-			if (command.schema.has_value() && !command.schema->empty()) {
-				target += quote(*command.schema) + ".";
-			}
-			target += quote(command.table);
 			string columns;
 			for (int i = 0; i < schema->num_fields(); i++) {
 				columns += (i ? ", " : "") + quote(schema->field(i)->name());
@@ -487,38 +464,130 @@ public:
 			// the three pointers travel as the door's own bound parameters - POINTER has no literal
 			// form in SQL text, and this statement carries no parameters of anybody else's, so the
 			// golden rule stands: the rewriter adds none, and no user numbering exists to shift
-			auto sql =
-			    "INSERT INTO " + target + " (" + columns + ") SELECT " + columns + " FROM arrow_scan($1, $2, $3)";
-			auto prefixed = "ACL INGEST '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
-			Connection con(state->db);
-			auto stmt = con.Prepare(prefixed);
-			if (stmt->HasError()) {
-				return StatusFromDuck("acl", stmt->GetError());
-			}
 			vector<Value> values {Value::POINTER(reinterpret_cast<uintptr_t>(&stream)),
 			                      Value::POINTER(reinterpret_cast<uintptr_t>(&IngestStreamProduce)),
 			                      Value::POINTER(reinterpret_cast<uintptr_t>(&IngestStreamGetSchema))};
-			auto result = stmt->Execute(values, false);
-			if (result->HasError()) {
-				return StatusFromDuck("acl", result->GetError());
-			}
-			int64_t total = 0;
-			auto chunk = result->Fetch();
-			if (chunk && chunk->size() > 0 && chunk->ColumnCount() == 1) {
-				auto count = chunk->GetValue(0, 0);
-				if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
-					total = count.GetValue<int64_t>();
+			Connection con(state->db);
+			auto execute = [&](const string &sql) -> arrow::Result<int64_t> {
+				auto stmt = con.Prepare(sql);
+				if (stmt->HasError()) {
+					return StatusFromDuck("acl", stmt->GetError());
 				}
+				auto result = stmt->Execute(values, false);
+				if (result->HasError()) {
+					return StatusFromDuck("acl", result->GetError());
+				}
+				int64_t total = 0;
+				auto chunk = result->Fetch();
+				if (chunk && chunk->size() > 0 && chunk->ColumnCount() == 1) {
+					auto count = chunk->GetValue(0, 0);
+					if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
+						total = count.GetValue<int64_t>();
+					}
+				}
+				if (!ingest.error.empty()) {
+					return arrow::Status::Invalid(ingest.error);
+				}
+				// the GizmoSQL lesson: a partial load must be an error, never a silent success
+				if (total != ingest.rows) {
+					return arrow::Status::Invalid("acl: the target took " + std::to_string(total) + " rows of the " +
+					                              std::to_string(ingest.rows) + " the stream delivered");
+				}
+				return total;
+			};
+
+			if (command.temporary) {
+				// --- milestone 2: a staging table, scoped to the credential ---------------------------
+				if ((command.catalog.has_value() && !command.catalog->empty()) ||
+				    (command.schema.has_value() && !command.schema->empty())) {
+					return arrow::Status::Invalid(
+					    "acl: temporary staging takes no catalog or schema - the namespace is the server's own");
+				}
+				for (auto ch : command.table) {
+					if (!isalnum(static_cast<unsigned char>(ch)) && ch != '_') {
+						return arrow::Status::Invalid(
+						    "acl: a staging name is a bare identifier - letters, digits and _");
+					}
+				}
+				Principal principal;
+				string reason;
+				if (!state->store->SessionPrincipal(handle, principal, reason)) {
+					return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
+				}
+				if (!state->store->PrincipalMainCap(principal, "temp")) {
+					return arrow::Status::Invalid(
+					    "acl: temporary staging needs an explicit temp capability on the MAIN catalog grant");
+				}
+				string phys;
+				bool exists = state->store->StagingResolve(handle, command.table, phys);
+				TablePolicy shadow;
+				if (!exists && state->store->ResolveTable(principal, command.table, shadow)) {
+					return arrow::Status::Invalid("acl: \"" + command.table +
+					                              "\" is an object of the catalog - a staging table may "
+					                              "not shadow it");
+				}
+				if (exists && command.table_definition_options.if_exists == Exists::kFail) {
+					return arrow::Status::AlreadyExists("acl: staging table \"" + command.table + "\" already exists");
+				}
+				if (!exists && command.table_definition_options.if_not_exist == NotExist::kFail) {
+					return arrow::Status::Invalid("acl: staging table \"" + command.table + "\" does not exist");
+				}
+				bool replace = exists && command.table_definition_options.if_exists == Exists::kReplace;
+				if (!exists) {
+					auto made = con.Query("CREATE SCHEMA IF NOT EXISTS _acl_staging");
+					if (made->HasError()) {
+						return StatusFromDuck("acl", made->GetError());
+					}
+					auto staging_id = state->store->StagingIdFor(handle);
+					if (staging_id.empty()) {
+						return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
+					}
+					phys = "_acl_staging." + staging_id + "_" + command.table;
+				}
+				auto dot = phys.find('.');
+				auto quoted = "\"" + phys.substr(0, dot) + "\".\"" + phys.substr(dot + 1) + "\"";
+				// the server's own scratch, reached only through the staging map: no prefix, no policy
+				string sql;
+				if (!exists || replace) {
+					sql = string("CREATE ") + (replace ? "OR REPLACE " : "") + "TABLE " + quoted +
+					      " AS SELECT * FROM arrow_scan($1, $2, $3)";
+				} else {
+					sql = "INSERT INTO " + quoted + " (" + columns + ") SELECT " + columns +
+					      " FROM arrow_scan($1, $2, $3)";
+				}
+				ARROW_ASSIGN_OR_RAISE(auto total, execute(sql));
+				if (!exists) {
+					state->store->StagingAdd(handle, command.table, phys);
+				}
+				return total;
 			}
-			if (!ingest.error.empty()) {
-				return arrow::Status::Invalid(ingest.error);
+
+			// --- milestone 1: append into an existing writable target --------------------------------
+			if (command.table_definition_options.if_not_exist == NotExist::kCreate) {
+				return arrow::Status::Invalid("acl: this door does not create tables - creating needs a create "
+				                              "capability and a declared physical home (spec 050); declare the "
+				                              "target and ingest with mode append");
 			}
-			// the GizmoSQL lesson: a partial load must be an error, never a silent success
-			if (total != ingest.rows) {
-				return arrow::Status::Invalid("acl: the target took " + std::to_string(total) + " rows of the " +
-				                              std::to_string(ingest.rows) + " the stream delivered");
+			if (command.table_definition_options.if_exists == Exists::kReplace) {
+				return arrow::Status::Invalid("acl: this door does not replace tables - replacing needs create "
+				                              "and drop capabilities (spec 050); ingest appends");
 			}
-			return total;
+			if (command.table_definition_options.if_exists == Exists::kFail) {
+				return arrow::Status::AlreadyExists("acl: if_exists = FAIL asks to fail when the target exists, "
+				                                    "and an append target here always exists");
+			}
+			string target;
+			if (command.catalog.has_value() && !command.catalog->empty()) {
+				target += quote(*command.catalog) + ".";
+			}
+			if (command.schema.has_value() && !command.schema->empty()) {
+				target += quote(*command.schema) + ".";
+			}
+			target += quote(command.table);
+			auto sql =
+			    "INSERT INTO " + target + " (" + columns + ") SELECT " + columns + " FROM arrow_scan($1, $2, $3)";
+			auto prefixed = "ACL INGEST '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
+			return execute(prefixed);
 		});
 	}
 
@@ -956,6 +1025,22 @@ private:
 		return std::make_unique<flight::RecordBatchStream>(std::move(reader));
 	}
 
+	//! Drop what the sweeps condemned (spec 049): staging tables of credentials nobody has spoken
+	//! for. The sweep runs under the store lock and must run no SQL, so the drops land here - on the
+	//! way into any RPC, which is the next moment this door provably has a connection to run them on.
+	void DrainStaging() {
+		auto graves = state->store->TakeStagingGraveyard();
+		if (graves.empty()) {
+			return;
+		}
+		Connection con(state->db);
+		for (auto &phys : graves) {
+			auto dot = phys.find('.');
+			auto quoted = "\"" + phys.substr(0, dot) + "\".\"" + phys.substr(dot + 1) + "\"";
+			con.Query("DROP TABLE IF EXISTS " + quoted);
+		}
+	}
+
 	//! A session that closes itself, whichever way the call leaves. Sessions here are opened and closed
 	//! inside one RPC (see SessionFor); the one way to leak one was a C++ exception between the two,
 	//! and this is what makes that impossible rather than merely unlikely.
@@ -983,8 +1068,15 @@ private:
 	template <class Body>
 	auto UnderSession(const flight::ServerCallContext &context, Body body) -> decltype(body(string())) {
 		try {
+			DrainStaging(); // a lock and an empty check when there is nothing to drop
 			string handle;
-			ARROW_ASSIGN_OR_RAISE(handle, SessionFor(context));
+			bool transient = false;
+			ARROW_ASSIGN_OR_RAISE(handle, SessionFor(context, transient));
+			if (!transient) {
+				// a connection-long session (design/015): the sweeper, exp, CloseSession or the
+				// door's stop end it - an RPC boundary does not
+				return body(handle);
+			}
 			SessionScope scope(*state->store, handle);
 			return body(handle);
 		} catch (std::exception &ex) {
@@ -1001,20 +1093,115 @@ private:
 	//! Flight SQL driver sends its credentials that way, so requiring the token on each call costs
 	//! nothing and removes the question.
 	//!
-	//! The session is opened and closed inside the call. Verifying a JWT and minting a handle is ~10µs
-	//! (spec 043's benchmark), which is cheaper than the state a longer-lived one would need - and it
-	//! means a door under load leaves nothing behind for the sweeper of spec 044 to find.
-	arrow::Result<string> SessionFor(const flight::ServerCallContext &context) {
+	//! The session is the client's CONNECTION, identified by the protocol's own cookie (design/015).
+	//! A call that carries the cookie reuses the connection's session - which is what lets a session
+	//! own resources (staging, spec 049) across calls - and a call without one gets a per-call
+	//! session, closed on the way out: the cookie-less degradation, in which append-ingest still
+	//! works and staging honestly refuses on the next call. The token stays the authority either
+	//! way, verified per call; the cookie only selects, and it may select only a session of the
+	//! same principal (a refreshed token of the same principal continues the session).
+	arrow::Result<string> SessionFor(const flight::ServerCallContext &context, bool &transient) {
 		auto token = TokenFromHeaders(context);
 		if (token.empty()) {
 			return arrow::Status::UnknownError("acl: authentication failed");
+		}
+		transient = !ClientSentSessionCookie(context);
+		auto session = ArrowSessionOf(context);
+		if (!transient && session) {
+			auto stored = session->GetSessionOption(ACL_HANDLE_OPTION);
+			if (stored && std::holds_alternative<std::string>(*stored)) {
+				auto handle = std::get<std::string>(*stored);
+				Principal current;
+				string reason;
+				if (state->store->SessionPrincipal(handle, current, reason)) {
+					Principal caller;
+					if (VerifyQuietly(token, caller)) {
+						if (PrincipalFingerprint(caller) == PrincipalFingerprint(current)) {
+							return handle; // the connection's own session, under the same principal
+						}
+						// the connection re-authenticated as somebody else: their session ends here
+						state->store->SessionClose(handle);
+					}
+					// an unverifiable token falls through to SessionOpen, which refuses - or throws -
+					// exactly as it would with no cookie in play: the cookie must never change what a
+					// client learns about its own credential
+				}
+			}
 		}
 		auto handle = state->store->SessionOpen(token);
 		if (handle.empty()) {
 			// what refuses a token in the prefix refuses it here, and says no more (spec 040)
 			return arrow::Status::UnknownError("acl: authentication failed");
 		}
+		if (session) {
+			session->SetSessionOption(ACL_HANDLE_OPTION, flight::SessionOptionValue(handle));
+		}
 		return handle;
+	}
+
+	//! The middleware's session for this call, or nullptr - never an error: a client that carries no
+	//! cookie simply gets the transient path.
+	std::shared_ptr<flightsql::FlightSession> ArrowSessionOf(const flight::ServerCallContext &context) {
+		auto *raw = context.GetMiddleware(SESSION_MIDDLEWARE_KEY);
+		if (!raw) {
+			return nullptr;
+		}
+		auto &middleware = *static_cast<flightsql::ServerSessionMiddleware *>(raw);
+		auto session = middleware.GetSession();
+		if (!session.ok() || !*session) {
+			return nullptr;
+		}
+		return *session;
+	}
+
+	//! Did this call carry the session cookie - the difference between a connection-long session and
+	//! a per-call one. The middleware creates a session either way; only a client that RETURNS
+	//! cookies can ever come back to it.
+	static bool ClientSentSessionCookie(const flight::ServerCallContext &context) {
+		for (const auto &header : context.incoming_headers()) {
+			if (StringUtil::CIEquals(string(header.first), "cookie") &&
+			    string(header.second).find(flightsql::kSessionCookieName) != string::npos) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! Verify without opening anything and without learning why a bad token is bad.
+	bool VerifyQuietly(const string &token, Principal &out) {
+		try {
+			return state->store->VerifyPrincipal(true, token, out);
+		} catch (std::exception &) {
+			return false;
+		}
+	}
+
+	//! The protocol's own end-of-connection signal (design/015): the driver closes, the session goes
+	//! - the first honest close any of our doors has had. Idempotent, and the token must speak for
+	//! the session it closes: a stolen cookie alone ends nothing.
+	arrow::Result<flight::CloseSessionResult> CloseSession(const flight::ServerCallContext &context,
+	                                                       const flight::CloseSessionRequest &request) override {
+		try {
+			auto token = TokenFromHeaders(context);
+			auto session = ArrowSessionOf(context);
+			if (!token.empty() && session) {
+				auto stored = session->GetSessionOption(ACL_HANDLE_OPTION);
+				if (stored && std::holds_alternative<std::string>(*stored)) {
+					auto handle = std::get<std::string>(*stored);
+					Principal current, caller;
+					string reason;
+					if (state->store->SessionPrincipal(handle, current, reason) && VerifyQuietly(token, caller) &&
+					    PrincipalFingerprint(caller) == PrincipalFingerprint(current)) {
+						state->store->SessionClose(handle);
+						session->EraseSessionOption(ACL_HANDLE_OPTION);
+					}
+				}
+			}
+			DrainStaging();
+			return flight::CloseSessionResult {flight::CloseSessionStatus::kClosed};
+		} catch (std::exception &ex) {
+			return StatusFromDuck("acl", ErrorData(ex).Message());
+		}
 	}
 
 	arrow::Result<std::shared_ptr<arrow::Schema>> SchemaOf(PreparedStatement &prepared) {
@@ -1138,6 +1325,10 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		door.state = make_shared_ptr<FlightDoorState>(*context.db, StoreShared(state));
 		door.server = std::make_unique<AclFlightSqlServer>(door.state);
 		flight::FlightServerOptions options(*location);
+		// design/015: the protocol's session cookie identifies a client connection, which is what
+		// lets a session own resources (staging, spec 049) across the RPCs of that connection
+		options.middleware.emplace_back(SESSION_MIDDLEWARE_KEY,
+		                                flightsql::MakeServerSessionMiddlewareFactory(MintCookieId));
 		auto init = door.server->Init(options);
 		if (!init.ok()) {
 			throw BinderException("acl_flight_serve: %s", init.ToString());
@@ -1173,7 +1364,7 @@ void AclFlightStopFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		if (door.thread.joinable()) {
 			door.thread.join();
 		}
-		auto closed = StoreOf(state).SessionCloseAll();
+		auto closed = StoreOf(state).SessionCloseAll(); // staging goes with the sessions, into the graveyard
 		result.SetValue(row, Value(uri + " (" + std::to_string(closed) + " session(s) closed)" +
 		                           (shutdown.ok() ? "" : " [" + shutdown.ToString() + "]")));
 	}

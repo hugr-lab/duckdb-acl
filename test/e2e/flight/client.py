@@ -5,6 +5,36 @@ TOKEN = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50Z
          "dGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1hY21lIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0."
          "vzPJbHXAXfczhZwQp183JaaBLlSRSipNsSqwxoIFfng")
 
+
+class CookieJar(flight.ClientMiddleware):
+    """Persist the door's session cookie across processes (design/015): each `ask` in run.sh is a
+    fresh process, and only a client that RETURNS the cookie keeps its connection-long session -
+    which is what the staging scenarios exercise."""
+    def __init__(self, path):
+        self.path = path
+    def sending_headers(self):
+        try:
+            cookie = open(self.path).read().strip()
+        except OSError:
+            cookie = ""
+        return {"cookie": cookie} if cookie else {}
+    def received_headers(self, headers):
+        for key, values in headers.items():
+            if key.lower() == "set-cookie":
+                for item in values if isinstance(values, list) else [values]:
+                    if "arrow_flight_session_id" in item:
+                        open(self.path, "w").write(item.split(";")[0].strip())
+    def call_completed(self, exception):
+        pass
+
+
+class CookieJarFactory(flight.ClientMiddlewareFactory):
+    def __init__(self, path):
+        self.path = path
+    def start_call(self, info):
+        return CookieJar(self.path)
+
+
 def varint(n):
     out = b""
     while True:
@@ -58,7 +88,7 @@ def do_ingest(client, options, spec: str) -> int:
     replace (FAIL, REPLACE), temp (append + temporary)."""
     import pyarrow as pa
     table_name, mode, cols, rows = spec.split(":", 3)
-    tdo = {"append": (2, 2), "create": (1, 1), "replace": (2, 3), "temp": (2, 2)}[mode]
+    tdo = {"append": (2, 2), "create": (1, 1), "replace": (2, 3), "temp": (1, 2)}[mode]
     payload = field(1, enum_field(1, tdo[0]) + enum_field(2, tdo[1])) + text(2, table_name)
     if mode == "temp":
         payload += flag(5, True)
@@ -151,7 +181,10 @@ def catalog_command(spec: str) -> bytes:
 
 uri, ask = sys.argv[1], sys.argv[2]
 token = sys.argv[3] if len(sys.argv) > 3 else TOKEN
-client = flight.connect(uri)
+import os
+jar = os.environ.get("ACL_COOKIE_JAR")
+middleware = [CookieJarFactory(jar)] if jar else []
+client = flight.FlightClient(uri, middleware=middleware)
 # "-" means: send no credentials at all. The door must refuse that, and it is worth being able to ask.
 headers = [] if token == "-" else [(b"authorization", f"Bearer {token}".encode())]
 options = flight.FlightCallOptions(headers=headers)

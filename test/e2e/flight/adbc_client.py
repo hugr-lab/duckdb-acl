@@ -19,7 +19,11 @@ def mint(tenant):
     return f"{head}.{body}.{sig}"
 
 def connect(token):
-    return dbapi.connect(uri, db_kwargs={DatabaseOptions.AUTHORIZATION_HEADER.value: f"Bearer {token}"})
+    return dbapi.connect(uri, db_kwargs={
+        DatabaseOptions.AUTHORIZATION_HEADER.value: f"Bearer {token}",
+        # design/015: the cookie makes the connection a session, which staging lives in
+        "adbc.flight.sql.rpc.with_cookie_middleware": "true",
+    })
 
 failures = 0
 def check(name, ok, detail=""):
@@ -78,6 +82,34 @@ with connect(acme_token) as conn:
     except Exception as ex:
         check("mode create refused with the reason", "does not create tables" in str(ex), ex)
 
+    # --- milestone 2: temporary staging + a text MERGE - the decided upsert flow ------------------
+    stage = pa.table({"id": [300, 950], "amount": [42, 9]})
+    n = cur.adbc_ingest("stage1", stage, mode="create", temporary=True)
+    check("temporary staging landed", n == 2, n)
+    cur.execute("SELECT count(*) FROM stage1")
+    check("the credential reads its own staging", cur.fetchall() == [(2,)])
+    cur.execute("MERGE INTO orders USING stage1 ON orders.id = stage1.id "
+                "WHEN MATCHED THEN UPDATE SET amount = stage1.amount "
+                "WHEN NOT MATCHED THEN INSERT (id, tenant, amount, customer_id) "
+                "VALUES (stage1.id, 'acme', stage1.amount, 0)")
+    cur.fetchall()  # the flight driver prepares on execute and runs on fetch - fetch, so it runs
+    cur.execute("SELECT amount FROM orders WHERE id = 300")
+    check("merge updated the matched row from staging", cur.fetchall() == [(42,)])
+    cur.execute("SELECT count(*) FROM orders WHERE id = 950")
+    check("merge inserted the unmatched row from staging", cur.fetchall() == [(1,)])
+    try:
+        cur.adbc_ingest("stage2", stage, mode="create", temporary=True, db_schema_name="main")
+        check("temporary with a schema refused", False, "it was accepted")
+    except Exception as ex:
+        check("temporary with a schema refused", "takes no catalog or schema" in str(ex), ex)
+    cur.execute("DROP TABLE stage1")
+    cur.fetchall()
+    try:
+        cur.execute("SELECT count(*) FROM stage1")
+        check("the dropped staging no longer resolves", False, "it still answered")
+    except Exception as ex:
+        check("the dropped staging no longer resolves", "no access" in str(ex), ex)
+
     # --- get_info comes from the registered SqlInfo ------------------------------------------------
     info = conn.adbc_get_info()
     check("get_info vendor", info.get("vendor_name") == "duckdb-acl", info.get("vendor_name"))
@@ -89,6 +121,14 @@ with connect(acme_token) as acme, connect(mint("globex")) as globex:
     acme_rows = a.fetchall()[0][0]
     g.execute("SELECT count(*) FROM orders WHERE tenant = 'acme'")
     check("globex cannot see acme rows through the same SQL", g.fetchall() == [(0,)])
+    # spec 049: another session's staging is not a name here (and another principal, another session)
+    a.execute("SELECT count(*) FROM orders")  # acme re-stages under its own fingerprint
+    acme.cursor().adbc_ingest("iso_stage", pa.table({"id": [1]}), mode="create", temporary=True)
+    try:
+        g.execute("SELECT count(*) FROM iso_stage")
+        check("another credential's staging is invisible", False, "globex read it")
+    except Exception as ex:
+        check("another credential's staging is invisible", "no access" in str(ex), ex)
     g.execute("SELECT count(*) FROM orders")
     globex_rows = g.fetchall()[0][0]
     check("the two principals see different slices", acme_rows > 0 and globex_rows != acme_rows,

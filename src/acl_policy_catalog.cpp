@@ -1886,6 +1886,30 @@ struct CatalogBackend {
 		rights_cache[key] = {catalogs, scopes};
 	}
 
+	//! An explicitly stated capability on a MAIN catalog grant (spec 049: `temp`). Explicit only:
+	//! NULL/empty caps mean every DATA capability (spec 012), never this one - so the check is
+	//! membership in the parsed set, and an unstated grant answers no.
+	bool HasMainCap(const Principal &principal, const string &cap) {
+		EnsureFresh();
+		if (function_mode) {
+			for (auto &grant : Grants(principal.roles)) {
+				if (grant.is_main && ParseCaps(grant.caps).count(cap)) {
+					return true;
+				}
+			}
+			return false;
+		}
+		auto result = Query("SELECT \"caps\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
+		                    LitList(principal.roles) + ") AND \"is_main\"");
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			auto caps = result->GetValue(0, row);
+			if (!caps.IsNull() && ParseCaps(caps.ToString()).count(cap)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	void ManageCatalogs(const Principal &principal, std::set<string> &out) {
 		if (principal.roles.empty()) {
 			return;
@@ -3376,6 +3400,13 @@ bool PolicyStore::MetadataListing(const Principal &principal, const string &surf
 	}
 	sql = catalog->MetadataListingSql(principal, surface);
 	return true;
+}
+
+bool PolicyStore::PrincipalMainCap(const Principal &principal, const string &cap) {
+	if (!catalog || principal.roles.empty()) {
+		return false; // the memory store has no catalog grants, and an explicit cap is never implied
+	}
+	return catalog->HasMainCap(principal, cap);
 }
 
 bool PolicyStore::ResolveDdlTarget(const Principal &principal, const string &vname, const string &capability,

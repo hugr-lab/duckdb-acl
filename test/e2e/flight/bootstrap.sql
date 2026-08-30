@@ -35,10 +35,10 @@ ACL ADMIN CREATE VIRTUAL TABLE c.customers AS memory.main.customers;
 ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers
     ON (customer_id = id) CARDINALITY many_to_one COMMENT 'the ordering customer';
 ACL ADMIN CREATE ROLE analyst;
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, merge, temp) MAIN;
 -- one role, many tenants: the slice comes from the token's claim
 ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
-    CAPS '{"select": true, "insert": true}'
+    CAPS '{"select": true, "insert": true, "merge": true}'
     RLS 'tenant = acl_claim(''tenant'')';
 ACL ADMIN GRANT TABLE c.customers TO ROLE analyst WITH (select) COLUMNS (id, name);
 SET GLOBAL acl_allow_anonymous_admin=false;
