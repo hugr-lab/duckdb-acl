@@ -111,10 +111,11 @@ cross-check and the door-owned transaction wrap the CTAS exactly as they wrap th
 
 ## Follow-ups
 
-- A uniqueness constraint on `relations(vcat, vname)` (schema migration): the existence check runs
-  at rewrite time and the record write later in the batch, so two concurrent record-writing CREATEs
-  on different connections could both pass and upsert last-writer-wins. Physical tables are guarded
-  by duckdb's own catalog; the records deserve the same guard at write time.
+- ~~A uniqueness constraint on `relations(vcat, vname)`~~ - verified after merge: the managed
+  schema already declares `PRIMARY KEY ("vcat", "vname")` on `relations` (spec 034), so a
+  concurrent record-writing CREATE that slips past the rewrite-time existence check fails on the
+  key at write time - fail-closed, last-writer never wins. The review's premise (no constraint)
+  was mistaken; nothing to build.
 - The single-node backlog review (after this spec): TLS on the node, pin-on-demand pooling,
   transactions on the held connection, temp columns surfaces. Sessions stay node-local by design -
   the shared-session-backend follow-up of spec 040 is dropped (2026-08-30): nodes know nothing of
