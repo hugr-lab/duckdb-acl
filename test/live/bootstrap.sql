@@ -41,8 +41,14 @@ ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, dro
 ACL ADMIN CREATE ROLE viewer;
 ACL ADMIN GRANT CATALOG c TO ROLE viewer CAPS '{}' MAIN;
 ACL ADMIN GRANT TABLE c.orders TO ROLE viewer WITH (select) RLS 'tenant = acl_claim(''tenant'')';
+
+-- an optional real issuer (spec 057): serve.sh fills this with a Keycloak issuer when
+-- ACL_LIVE_KEYCLOAK is set, else it is a no-op. A Keycloak realm role named `analyst`/`viewer`
+-- resolves to the same ACL role by name (unmapped raw roles match a known role), and a `tenant`
+-- claim (a user attribute + protocol mapper) drives the RLS the demo tokens drive with `tid`.
+${LIVE_KEYCLOAK_ISSUER}
 SET GLOBAL acl_allow_anonymous_admin=false;
 
-SELECT acl_flight_serve(${LIVE_FLIGHT_ARGS});
+${LIVE_FLIGHT_SERVE}
 ${LIVE_QUACK_SERVE}
 SELECT 'the live node is up' AS status;

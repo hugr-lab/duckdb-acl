@@ -24,12 +24,23 @@ way to stand up a node for that, and no script of what to check.
 
 ## Design
 
-- **`test/live/serve.sh`** - one command to a live node: seeds the runbook's policy (an RLS-sliced
-  `orders`, a column-hidden `customers`, a staging schema with create+drop, the `temp` and `explain`
-  capabilities on `analyst`, a minimal `viewer` for refusal steps), serves the Flight door
-  (`--tls` switches to `grpc+tls` on `0.0.0.0` with a self-signed cert - spec 053's path) and the
-  quack door when the extension is built, prints the URIs, the DBeaver JDBC URL, and three tokens
-  (`analyst@acme`, `analyst@globex`, `viewer@acme`), and holds until Ctrl+C.
+- **`test/live/serve.sh [flight|quack|all] [--tls]`** - one command to a live node, and the doors
+  are separable: `flight` serves only the Flight SQL door (ADBC/JDBC/DBeaver), `quack` only the quack
+  door, `all` (default) both. It seeds the runbook's policy (an RLS-sliced `orders`, a column-hidden
+  `customers`, a staging schema with create+drop, the `temp` and `explain` capabilities on `analyst`,
+  a minimal `viewer` for refusal steps), serves the chosen door(s) (`--tls` switches Flight to
+  `grpc+tls` on `0.0.0.0` with a self-signed cert - spec 053's path), prints the URIs, the DBeaver
+  JDBC URL, and three tokens, and holds until Ctrl+C. Ports move with `ACL_LIVE_PORT` /
+  `ACL_LIVE_QUACK_PORT`.
+- **VS Code tasks** (`.vscode/tasks.json`) run each server in its own terminal panel - *Serve: Flight
+  SQL door*, *Serve: quack door*, *Serve: both doors*, *Serve: Flight over TLS* - alongside the
+  existing build/test tasks; `make serve-flight` / `serve-quack` / `serve-live` are the CLI twins.
+- **A real IdP is opt-in** (`ACL_LIVE_KEYCLOAK=<realm-url>`): the node then defines a second issuer
+  that fetches the realm's JWKS over httpfs (spec 023), verifies RS256 (spec 007), takes roles from
+  `realm_access.roles` and maps a `tenant` claim to the RLS - the demo HS256 issuer stays alongside.
+  A Keycloak realm role named `analyst`/`viewer` resolves to the ACL role by name (the unmapped-role
+  rule), so no `acl_map_role` is needed. `test/live/mint_token.py` mints the demo tokens; the runbook
+  has the Keycloak-console setup and the token-fetch curl.
 - **`test/live/RUNBOOK.md`** - the walk: 13 DBeaver steps (tree shows only the virtual catalog, `ssn`
   absent from the column tree, the slice, the predicate refusal, EXPLAIN under its capability,
   manual-commit rollback through the real driver, session temp, staging create/drop, the viewer's

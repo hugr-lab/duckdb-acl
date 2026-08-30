@@ -3,17 +3,93 @@
 The single-node phase ends with eyes on real tools, not only our own harnesses. Start the node:
 
 ```sh
-make                       # if not built yet
-test/live/serve.sh         # or: test/live/serve.sh --tls
+make                              # if not built yet
+test/live/serve.sh                # both doors
+test/live/serve.sh flight         # the Flight SQL door only (ADBC / JDBC / DBeaver)
+test/live/serve.sh flight --tls   # ... over grpc+tls
+test/live/serve.sh quack          # the quack door only (needs an ACL_QUACK=1 build)
 ```
 
+Or from VS Code: **Terminal > Run Task** - `acl: serve Flight SQL door`, `acl: serve quack door`,
+`acl: serve both doors` (each in its own terminal panel; Ctrl+C stops it). Or `make serve-flight` /
+`make serve-quack` / `make serve-live`.
+
 It prints the URIs and three tokens (`analyst@acme`, `analyst@globex`, `viewer@acme`) and stays up
-until Ctrl+C. Everything scripted below the GUI steps is already pinned by CI (`make test-flight`,
+until Ctrl+C.
+
+## Editing the launch configuration
+
+Everything the node serves is decided in three places, all next to this file:
+
+- **`bootstrap.sql` is the policy seed** - the tables, the virtual catalog, the roles and every
+  grant. Edit it like any admin SQL (the `ACL ADMIN ...` block): add a role, change a grant's RLS,
+  widen a capability - the next `serve.sh` start serves the edited world. The two `${LIVE_*}` lines
+  at the bottom are substituted by `serve.sh`; leave them be.
+- **`serve.sh` knobs** are environment variables: `ACL_LIVE_PORT` (Flight, default 32700),
+  `ACL_LIVE_QUACK_PORT` (quack, default 31700), `BUILD_DIR`/`DUCKDB_BIN`/`ACL_EXT` to point at a
+  different build. E.g. `ACL_LIVE_PORT=40000 test/live/serve.sh flight`.
+- **Tokens follow the roles**: a role you add in `bootstrap.sql` needs a token that names it -
+  `test/live/mint_token.py <role>[,role2] [tenant] [subject]` mints one for the demo issuer
+  (HS256, the fixture secret). Example: `test/live/mint_token.py auditor globex`.
+
+To change what a **VS Code task** runs (a port, a mode), edit `.vscode/tasks.json` - either the
+`command` itself or add an env block to a task:
+
+```json
+{ "label": "acl: serve Flight SQL door (port 40000)",
+  "type": "shell",
+  "command": "test/live/serve.sh flight",
+  "options": { "env": { "ACL_LIVE_PORT": "40000" } },
+  "problemMatcher": [] }
+``` Everything scripted below the GUI steps is already pinned by CI (`make test-flight`,
 the quack integration tests); this runbook is the human pass over the same ground.
 
 The one rule for reading results: **every number a tool shows must be explainable by the token you
 pasted** - `analyst@acme` sees 5 of the 10 seeded orders, `analyst@globex` the other 5, and neither
 ever sees `customers.ssn` anywhere, including in the column tree.
+
+## Hooking a real Keycloak (optional)
+
+The demo tokens are HS256 over a fixture secret - fine for a walk-through, not what a deployment
+looks like. A real issuer is one line: start the node with `ACL_LIVE_KEYCLOAK` pointing at a realm,
+and the node defines an issuer that fetches the realm's JWKS over httpfs (spec 023), verifies RS256
+(spec 007), takes roles from `realm_access.roles`, and maps a `tenant` claim to the RLS the demo
+drives with `tid`:
+
+```sh
+ACL_LIVE_KEYCLOAK=http://localhost:18070/realms/master test/live/serve.sh flight
+# knobs: ACL_LIVE_KC_AUDIENCE (default 'account'), ACL_LIVE_KC_TENANT_CLAIM (default 'tenant')
+```
+
+The demo tokens keep working alongside it. What to set up in the Keycloak realm, all in the admin
+console, so a token actually resolves to a working principal:
+
+1. **A realm role named `analyst`** (or `viewer`). Our unmapped-role rule accepts a raw role by name
+   when an ACL role of that name exists, so no `acl_map_role` is needed - Keycloak's own noise roles
+   (`default-roles-*`, `offline_access`, `uma_authorization`) simply don't match and are ignored.
+2. **A `tenant` on the token.** Add a user attribute `tenant = acme`, then a client (or realm) protocol
+   mapper of type *User Attribute* → token claim name `tenant` (include in access token). The RLS
+   `tenant = acl_claim('tenant')` then slices to that tenant; without it the analyst sees zero rows,
+   which is itself a correct (if dull) result.
+3. **A client with Direct Access Grants** (for the curl below), or use any client your tooling has.
+   Audience: if the token's `aud` is not `account`, pass `ACL_LIVE_KC_AUDIENCE=<the aud>` (a client
+   scope's *Audience* mapper sets it).
+
+Get a token and use it exactly like a demo one (DBeaver `token` property, ADBC `authorization`
+header, quack `TOKEN`):
+
+```sh
+curl -s -d grant_type=password -d client_id=<client> -d username=<user> -d password=<pw> \
+  http://localhost:18070/realms/master/protocol/openid-connect/token \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+```
+
+Then walk the same steps below. A `tenant=acme` Keycloak user with the `analyst` realm role sees the
+acme slice; give a second user `tenant=globex` to see the split. This is the same node - only the
+issuer differs, which is the point: nothing in the door or the policy changed to accept a real IdP.
+
+I have not created anything in your Keycloak (it is shared infra); the steps above are yours to run,
+or say the word and I will script the realm/client/user setup against a realm you name.
 
 ## DBeaver (the Arrow Flight SQL JDBC driver - what spec 047 targets)
 
