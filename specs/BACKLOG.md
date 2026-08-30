@@ -17,9 +17,11 @@ Ordered: security and integrity first, functional completeness second, optimisat
    teaches has never been audited); server-level answers that bypass the prefix (`GetSqlInfo` is
    server metadata by design, prepared-statement schemas); session state and secrets. Inventory
    first, code second.
-2. **Uniqueness on `relations(vcat, vname)`** + schema migration (spec 051 follow-up): the record
-   existence check runs at rewrite time and the write later, so a concurrent record-writing CREATE
-   is last-writer-wins today. Small, closes the TOCTOU class at write time.
+2. **Uniqueness on `relations(vcat, vname)`** - RESOLVED by verification (2026-08-30): the managed
+   schema already declares `PRIMARY KEY ("vcat", "vname")` on `relations` (spec 034,
+   policy_schema.sql), so the concurrent record write the spec-051 review worried about fails on
+   the key at write time - fail-closed, last-writer never wins. Kept on the list so the item does
+   not resurface; nothing to build.
 3. **TLS on the Flight door** (spec 045 deferral): the door binds localhost only until it lands.
    A single node serving clients directly - no front in this phase - needs either TLS of its own
    (Arrow supports it natively) or a written decision that a reverse proxy is required equipment.
