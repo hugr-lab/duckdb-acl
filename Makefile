@@ -183,6 +183,16 @@ test-flight:
 	test/e2e/flight/adbc.sh
 	test/e2e/flight/tls.sh
 
+# The live-validation node (spec 057): one seeded server for real client tools, held until Ctrl+C.
+# The VS Code tasks in .vscode/tasks.json run the same commands.
+.PHONY: serve-flight serve-quack serve-live
+serve-flight:
+	test/live/serve.sh flight
+serve-quack:
+	test/live/serve.sh quack
+serve-live:
+	test/live/serve.sh all
+
 # The door end-to-end (specs/043): a served instance with real sources and several client processes.
 # Needs the same docker databases plus a quack build:
 #   ACL_INTEGRATION=1 ACL_QUACK=1 GEN=ninja make      (add ACL_INTEGRATION_MSSQL=1 for the mssql leg)

@@ -60,6 +60,46 @@
             "problemMatcher": [],
             "detail": "Run the end-to-end gateway demo against the release build",
             "dependsOn": "Build Release"
+        },
+        {
+            "label": "Serve: Flight SQL door (ADBC/JDBC/DBeaver)",
+            "type": "shell",
+            "command": "test/live/serve.sh flight",
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "reveal": "always" },
+            "runOptions": { "instanceLimit": 1 },
+            "detail": "spec 057: serve only the Flight SQL door on localhost:32700 (Ctrl+C to stop). Set ACL_LIVE_KEYCLOAK to hook a real IdP."
+        },
+        {
+            "label": "Serve: Flight SQL door over TLS",
+            "type": "shell",
+            "command": "test/live/serve.sh flight --tls",
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "reveal": "always" },
+            "runOptions": { "instanceLimit": 1 },
+            "detail": "spec 057: serve the Flight door over grpc+tls on 0.0.0.0:32700 with a self-signed cert"
+        },
+        {
+            "label": "Serve: quack door",
+            "type": "shell",
+            "command": "test/live/serve.sh quack",
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "reveal": "always" },
+            "runOptions": { "instanceLimit": 1 },
+            "detail": "spec 057: serve only the quack door on localhost:31700 (needs an ACL_QUACK=1 build)"
+        },
+        {
+            "label": "Serve: both doors",
+            "type": "shell",
+            "command": "test/live/serve.sh all",
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "reveal": "always" },
+            "runOptions": { "instanceLimit": 1 },
+            "detail": "spec 057: serve the Flight and quack doors together"
         }
     ]
 }
