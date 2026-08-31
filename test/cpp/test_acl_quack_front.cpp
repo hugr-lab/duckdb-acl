@@ -176,7 +176,13 @@ int main(int argc, char *argv[]) {
 			Shell("openssl req -x509 -newkey rsa:2048 -keyout '" + key + "' -out '" + cert +
 			      "' -days 2 -nodes -subj /CN=localhost -addext subjectAltName=DNS:localhost 2>/dev/null");
 			if (!FileExists(cert) || !FileExists(key)) {
-				Check(true, "skip: no openssl to mint a throwaway cert");
+				std::cout << "  skip: no openssl to mint a throwaway cert\n";
+				return;
+			}
+			if (Shell("command -v curl 2>/dev/null").empty()) {
+				std::cout << "  skip: no curl to probe the https front\n";
+				std::remove(cert.c_str());
+				std::remove(key.c_str());
 				return;
 			}
 			auto served = con.Query("SELECT acl_quack_serve('quack:localhost:31976', 'front-token', '" + cert + "', '" +
@@ -196,6 +202,33 @@ int main(int argc, char *argv[]) {
 			Exec(con, "SELECT acl_quack_stop('quack:localhost:31976')");
 			std::remove(cert.c_str());
 			std::remove(key.c_str());
+		});
+
+		Scenario("a new instance reclaims a leaked front of a dead one (spec 062 review)", [&] {
+			{
+				DBConfig cfg;
+				cfg.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+				DuckDB dying(nullptr, &cfg);
+				Connection dc(dying);
+				Exec(dc, "LOAD '" + extension + "'");
+				Exec(dc, "LOAD '" + httpfs_ext + "'");
+				Exec(dc, "LOAD '" + quack_ext + "'");
+				SetupFixture(dc, "");
+				Exec(dc, "SELECT acl_quack_serve('quack:localhost:31977', 'front-token')");
+				// no acl_quack_stop: the instance is destroyed here, leaking its front
+			}
+			DBConfig cfg;
+			cfg.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+			DuckDB fresh(nullptr, &cfg);
+			Connection fc(fresh);
+			Exec(fc, "LOAD '" + extension + "'");
+			Exec(fc, "LOAD '" + httpfs_ext + "'");
+			Exec(fc, "LOAD '" + quack_ext + "'");
+			SetupFixture(fc, "");
+			auto reserved = fc.Query("SELECT acl_quack_serve('quack:localhost:31977', 'front-token')");
+			Check(!reserved->HasError(), "the same address serves again - the dead instance's front was reclaimed: " +
+			                                 (reserved->HasError() ? reserved->GetError() : ""));
+			Exec(fc, "SELECT acl_quack_stop('quack:localhost:31977')");
 		});
 
 		idp.Stop();

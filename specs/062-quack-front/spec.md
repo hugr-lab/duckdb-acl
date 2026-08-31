@@ -58,6 +58,42 @@ scenario that caught the frozen version); the TLS front serves the same discover
 integration suite and the door e2e now run THROUGH the front, so every existing drain/staging pin
 doubles as a proxy regression.
 
+## The review's findings (applied / recorded)
+
+The adversarial review confirmed the core (remote clients cannot reach quack around the TLS front;
+the loopback quack still enforces the full ACL) and found no exploitable memory-safety bug - the
+cert/key double-free, the post-teardown UAF, SSRF and payload truncation all dissolved on tracing
+(httplib up-refs the PEM objects and only frees the SSL_CTX; the CatalogBackend's
+`weak_ptr<DatabaseInstance>` plus httplib's `catch(std::exception)` turn a discovery hit after
+instance death into a benign HTTP 500; the proxy target is the fixed literal `127.0.0.1`; httplib's
+default payload max is `SIZE_MAX`). Two structural findings and the edges are addressed:
+
+- **A leaked front of a dead instance is reclaimed** (was: refused forever, thread + public port +
+  store leaked). The front now carries a `weak_ptr<DatabaseInstance>`; a serve of an address whose
+  existing front's instance has expired reclaims it (stops and joins the zombie listener) and takes
+  its place. Pinned by a test that serves from a to-be-destroyed instance, drops it, and re-serves
+  the same address.
+- **IPv6 parsing is validated** on both sides: `ParseQuackEndpoint`'s bracket branch now falls
+  through the host/port guard (empty host, non-numeric or out-of-range port refuse), and the
+  provider classifies an IPv6-loopback door (`quack:[::1]:port`) correctly instead of forcing https.
+- **Test robustness**: the https leg skips (not fails) when `curl` is absent, matching the quack/
+  openssl skips.
+
+Recorded, not code-fixed (a decision, honestly the better posture than pre-062):
+
+- **The front does not verify the loopback listener is still its quack.** If the internal quack is
+  stopped out of band (a raw `quack_stop` on the internal uri, never through `acl_quack_stop`) while
+  the front lives, and a *local* process on the host then binds the freed loopback port, the front
+  would forward client bodies (bearer tokens) to that squatter. This requires local host access AND
+  an out-of-band stop; the supported teardown is `acl_quack_stop` on the public uri, which stops the
+  front first. Net token exposure is *better* than pre-062 (where quack listened on the public bind
+  in the clear, so a network attacker read tokens off the wire); the residual is a local-only
+  window. A future bind-and-hold handoff (quack binds and reports its port, or the front passes the
+  socket) would close it - noted for the quack side.
+- **Discovery is unauthenticated and lists issuer URLs**, which may name internal IdP hosts - the
+  same public class of fact OIDC discovery itself serves; an operator who considers issuer hostnames
+  sensitive fronts the door on a network they trust for that metadata.
+
 ## Alternatives considered
 
 - **TLS inside quack** - quack's server is deliberately plain ("the server will always listen

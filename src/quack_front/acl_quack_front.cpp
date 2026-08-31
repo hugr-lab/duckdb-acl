@@ -13,6 +13,8 @@
 
 #include "acl_quack_front.hpp"
 
+#include "duckdb/main/database.hpp"
+
 #include <map>
 #include <memory>
 #include <mutex>
@@ -33,6 +35,7 @@ struct Front {
 	std::unique_ptr<hl::Server> server;
 	std::thread listener;
 	int internal_port = 0;
+	weak_ptr<DatabaseInstance> owner;
 #ifdef ACL_OIDC_TLS
 	X509 *cert = nullptr;
 	EVP_PKEY *key = nullptr;
@@ -154,10 +157,17 @@ std::string StartQuackFront(const QuackFrontConfig &config) {
 	front->server->wait_until_ready();
 
 	front->internal_port = config.internal_port;
+	front->owner = config.owner;
 	std::lock_guard<std::mutex> guard(fronts_lock);
 	auto key = Key(config.host, config.port);
-	if (fronts.count(key)) {
-		return "quack front: " + key + " is already served";
+	auto existing = fronts.find(key);
+	if (existing != fronts.end()) {
+		// a front whose serving instance is gone is a leak, not a live door - reclaim it and take
+		// its place rather than refuse the address forever (the review's finding)
+		if (!existing->second->owner.expired()) {
+			return "quack front: " + key + " is already served";
+		}
+		fronts.erase(existing); // ~Front stops and joins the zombie listener
 	}
 	fronts[key] = std::move(front);
 	return "";

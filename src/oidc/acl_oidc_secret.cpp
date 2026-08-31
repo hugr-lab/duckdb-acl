@@ -87,8 +87,16 @@ oidc::TokenSet Acquire(ClientContext &context, const CreateSecretInput &input, c
 			throw InvalidInputException(
 			    "acl oidc secret: name ISSUER, or give SCOPE a concrete door ('quack:host:port') to discover it");
 		}
-		auto host = endpoint.substr(0, endpoint.find(':'));
-		bool local = host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
+		// classify the door host: an IPv6 literal is bracketed ([::1]:port), so the port colon is the
+		// one after ']'; anything else splits at the first colon (the review's IPv6 finding)
+		string host;
+		if (!endpoint.empty() && endpoint.front() == '[') {
+			auto bracket = endpoint.find(']');
+			host = bracket == string::npos ? endpoint : endpoint.substr(1, bracket - 1);
+		} else {
+			host = endpoint.substr(0, endpoint.find(':'));
+		}
+		bool local = host == "localhost" || host == "127.0.0.1" || host == "::1";
 		auto discovered = oidc::FetchQuackAuth((local ? "http://" : "https://") + endpoint);
 		if (!discovered.Ok()) {
 			throw InvalidInputException("acl oidc secret: door discovery at \"%s\" failed: %s", endpoint,

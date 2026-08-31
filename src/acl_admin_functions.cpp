@@ -1021,14 +1021,14 @@ static void ParseQuackEndpoint(const string &uri, string &host, int &port) {
 		if (StringUtil::StartsWith(rest, ":")) {
 			port = std::atoi(rest.substr(1).c_str());
 		}
-		return;
-	}
-	auto colon = rest.find(':');
-	if (colon == string::npos) {
-		host = rest;
 	} else {
-		host = rest.substr(0, colon);
-		port = std::atoi(rest.substr(colon + 1).c_str());
+		auto colon = rest.find(':');
+		if (colon == string::npos) {
+			host = rest;
+		} else {
+			host = rest.substr(0, colon);
+			port = std::atoi(rest.substr(colon + 1).c_str());
+		}
 	}
 	if (host.empty() || port <= 0 || port > 65535) {
 		throw BinderException("acl_quack_serve: malformed uri \"%s\"", uri);
@@ -1154,6 +1154,7 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		front.wellknown = [shared_store] {
 			return WellKnownQuackAuth(*shared_store); // per request: the document tracks the policy live
 		};
+		front.owner = context.db; // shared_ptr -> weak_ptr, so a dead instance's front can be reclaimed
 		auto front_error = StartQuackFront(front);
 		if (!front_error.empty()) {
 			con.Query("SELECT * FROM quack_stop(" + quoted(internal_uri) + ")"); // leave nothing behind

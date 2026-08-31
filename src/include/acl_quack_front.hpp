@@ -17,6 +17,9 @@
 #include <string>
 
 namespace duckdb {
+
+class DatabaseInstance;
+
 namespace acl {
 
 struct QuackFrontConfig {
@@ -29,6 +32,9 @@ struct QuackFrontConfig {
 	//! is advertised immediately - a frozen document would lie (caught by the front's own test).
 	//! The callback must own everything it touches (capture shared ownership of the store).
 	std::function<std::string()> wellknown;
+	//! The instance that served this front; when it dies without an explicit stop, a later serve of
+	//! the same address reclaims the leaked listener instead of refusing forever (spec 062 review).
+	weak_ptr<DatabaseInstance> owner;
 };
 
 //! Start the front; "" on success, otherwise the reason (already-bound, TLS on a
