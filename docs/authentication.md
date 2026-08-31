@@ -4,7 +4,10 @@ The one invariant everything else hangs off: **a node never runs an OAuth flow, 
 password, never mints a token.** It verifies an IdP-issued OIDC access token offline - JWKS
 (`KEYS FROM '<url>'`, fetched through duckdb's own filesystem), RS256/ES256/HS256, issuer, audience,
 `exp`/`nbf` - and resolves roles and claims into the ACL (specs 007/023). Keycloak and Entra tokens
-verify the same way; a node may trust several issuers at once.
+verify the same way; a node may trust several issuers at once. (One Entra note, live-earned: Microsoft's JWKS endpoint needs `SET GLOBAL
+force_download=true` under httpfs, and an app registration issues v1-style tokens unless its
+`requestedAccessTokenVersion` is set to 2 - or simply configure the issuer as whatever `iss` the
+token actually carries.)
 
 ## Token acquisition is the client side's
 
