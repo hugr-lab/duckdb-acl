@@ -61,35 +61,59 @@ ACL_LIVE_KEYCLOAK=http://localhost:18070/realms/master test/live/serve.sh flight
 # knobs: ACL_LIVE_KC_AUDIENCE (default 'account'), ACL_LIVE_KC_TENANT_CLAIM (default 'tenant')
 ```
 
-The demo tokens keep working alongside it. What to set up in the Keycloak realm, all in the admin
-console, so a token actually resolves to a working principal:
-
-1. **A realm role named `analyst`** (or `viewer`). Our unmapped-role rule accepts a raw role by name
-   when an ACL role of that name exists, so no `acl_map_role` is needed - Keycloak's own noise roles
-   (`default-roles-*`, `offline_access`, `uma_authorization`) simply don't match and are ignored.
-2. **A `tenant` on the token.** Add a user attribute `tenant = acme`, then a client (or realm) protocol
-   mapper of type *User Attribute* → token claim name `tenant` (include in access token). The RLS
-   `tenant = acl_claim('tenant')` then slices to that tenant; without it the analyst sees zero rows,
-   which is itself a correct (if dull) result.
-3. **A client with Direct Access Grants** (for the curl below), or use any client your tooling has.
-   Audience: if the token's `aud` is not `account`, pass `ACL_LIVE_KC_AUDIENCE=<the aud>` (a client
-   scope's *Audience* mapper sets it).
-
-Get a token and use it exactly like a demo one (DBeaver `token` property, ADBC `authorization`
-header, quack `TOKEN`):
+The demo tokens keep working alongside it. The standing dev realm is scripted and idempotent:
 
 ```sh
-curl -s -d grant_type=password -d client_id=<client> -d username=<user> -d password=<pw> \
-  http://localhost:18070/realms/master/protocol/openid-connect/token \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+test/live/keycloak_realm.sh      # creates/converges realm 'acl-dev' from the .env KEY_CLOAK_* creds
 ```
 
-Then walk the same steps below. A `tenant=acme` Keycloak user with the `analyst` realm role sees the
-acme slice; give a second user `tenant=globex` to see the split. This is the same node - only the
-issuer differs, which is the point: nothing in the door or the policy changed to accept a real IdP.
+It builds a public client `acl-cli` (password + device flow), realm roles `analyst`/`viewer` (our
+unmapped-role rule matches them to ACL roles by name), users `analyst1`(acme)/`analyst2`(globex)/
+`viewer1`(acme) with a `tenant` attribute and its protocol mapper - and bakes in the Keycloak 26
+lessons: the declarative user profile must allow unmanaged attributes (else the tenant claim
+silently vanishes), and a user needs email/names/cleared-requiredActions or the password grant
+answers "Account is not fully set up".
 
-I have not created anything in your Keycloak (it is shared infra); the steps above are yours to run,
-or say the word and I will script the realm/client/user setup against a realm you name.
+With the realm in place, no token is hand-carried at all on the quack side (spec 061):
+
+```sql
+CREATE SECRET kc (TYPE quack, PROVIDER oidc, SCOPE 'quack:<host>:<port>',
+                  ISSUER 'http://localhost:18070/realms/acl-dev', CLIENT_ID 'acl-cli',
+                  FLOW 'password', USERNAME 'analyst1', PASSWORD '...');  -- or FLOW 'device'
+ATTACH 'quack:<host>:<port>' AS remote (TYPE quack);
+```
+
+Proven live end to end: analyst1 reads the acme slice, analyst2 the globex slice, a replace re-mints
+through the refresh chain. Nothing in the door or the policy changed to accept the real IdP.
+
+## Hooking Entra ID (optional, proven live)
+
+The same machinery accepts Microsoft Entra. An app registration with an `analyst` appRole assigned
+to its own service principal gives a client_credentials token carrying `roles:["analyst"]`; the node
+trusts it with:
+
+```sql
+SET GLOBAL force_download=true;  -- Microsoft's JWKS endpoint answers HEAD/GET inconsistently,
+                                 -- and httpfs refuses the mismatch without this
+ACL ADMIN CREATE ISSUER 'https://login.microsoftonline.com/<tenant>/v2.0'
+  KEYS FROM 'https://login.microsoftonline.com/<tenant>/discovery/keys'
+  AUDIENCES ('<appId>') ALGS (RS256) ROLE CLAIM 'roles';
+```
+
+and the provider mints over live TLS:
+
+```sql
+CREATE SECRET entra (TYPE quack, PROVIDER oidc, SCOPE 'quack:<host>:<port>',
+    ISSUER 'https://login.microsoftonline.com/<tenant>/v2.0', CLIENT_ID '<appId>',
+    FLOW 'client_credentials', CLIENT_SECRET '<secret>', OAUTH_SCOPE '<appId>/.default');
+```
+
+Entra lessons, live-earned: an app requests **v1 tokens by default** (`iss: sts.windows.net/...`) -
+set `{"api":{"requestedAccessTokenVersion":2}}` via a Graph PATCH on the application object (the
+generic `az ad app update --set` cannot reach it) and expect minutes of propagation, or simply trust
+whatever `iss` the token actually carries; a machine token has no tenant attribute, so claim-driven
+RLS applies to user flows, not client_credentials. In Fabric/Azure the environment mints the token
+instead - see docs/clients/powerbi-fabric.md.
 
 ## DBeaver (the Arrow Flight SQL JDBC driver - what spec 047 targets)
 

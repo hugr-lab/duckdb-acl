@@ -87,8 +87,12 @@ Follow-up spec material; the provider test uses the grant-borne shape meanwhile.
 ## Follow-ups
 
 - The inline-RLS attach bug above.
-- Live Keycloak and **Entra ID** validation of the provider (the user's ask): device and
-  client_credentials against login.microsoftonline.com, the runbook's Keycloak section gaining the
-  CREATE SECRET example.
+- ~~Live Keycloak and Entra ID validation~~ — DONE 2026-08-31, both green end to end: Keycloak 26
+  realm `acl-dev` (scripted, `test/live/keycloak_realm.sh`) with password-flow secrets slicing both
+  tenants through the door, and Entra ID with a client_credentials secret over live TLS (appRole →
+  ACL role by name; the runbook records the earned lessons - Keycloak's unmanaged-attribute policy
+  and profile completeness, Entra's v1-token default and the `force_download=true` httpfs needs for
+  Microsoft's JWKS endpoint). Device flow verified against the fake IdP and available live
+  (`FLOW 'device'`); its browser step stays a manual runbook item.
 - The v2 token-resolver seam in quack (per-connect minting); extraction of the provider into a
   standalone client extension (design/016 §11).
