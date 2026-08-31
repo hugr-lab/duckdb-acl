@@ -1,5 +1,6 @@
 #include "duckdb/main/connection.hpp"
 #include "acl_admin_functions.hpp"
+#include "acl_quack_front.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
@@ -17,6 +18,12 @@ namespace {
 //! Retrieve the policy store attached to the currently-executing admin setup function
 PolicyStore &StoreOf(ExpressionState &state) {
 	return *state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<AclScalarInfo>().store;
+}
+
+//! Shared ownership of the same store, for a callback that may outlive the call (the quack front's
+//! live discovery document, spec 062).
+shared_ptr<PolicyStore> SharedStoreOf(ExpressionState &state) {
+	return state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<AclScalarInfo>().store;
 }
 
 DatabaseInstance &DbOf(ExpressionState &state) {
@@ -991,6 +998,86 @@ string PrefixedForSession(PolicyStore &store, const string &handle, const string
 	return store.SessionSql(handle, sql);
 }
 
+//! `quack:host:port` / `quack://host:port` (IPv6 in brackets), mirroring quack's own parser - the
+//! front must bind exactly what quack would have (spec 062).
+static void ParseQuackEndpoint(const string &uri, string &host, int &port) {
+	auto rest = uri;
+	StringUtil::Trim(rest);
+	if (StringUtil::StartsWith(rest, "quack://")) {
+		rest = rest.substr(8);
+	} else if (StringUtil::StartsWith(rest, "quack:")) {
+		rest = rest.substr(6);
+	} else {
+		throw BinderException("acl_quack_serve: the uri must start with 'quack:'");
+	}
+	port = 9494; // quack's own default
+	if (StringUtil::StartsWith(rest, "[")) {
+		auto bracket = rest.find(']');
+		if (bracket == string::npos) {
+			throw BinderException("acl_quack_serve: malformed IPv6 uri");
+		}
+		host = rest.substr(1, bracket - 1);
+		rest = rest.substr(bracket + 1);
+		if (StringUtil::StartsWith(rest, ":")) {
+			port = std::atoi(rest.substr(1).c_str());
+		}
+	} else {
+		auto colon = rest.find(':');
+		if (colon == string::npos) {
+			host = rest;
+		} else {
+			host = rest.substr(0, colon);
+			port = std::atoi(rest.substr(colon + 1).c_str());
+		}
+	}
+	if (host.empty() || port <= 0 || port > 65535) {
+		throw BinderException("acl_quack_serve: malformed uri \"%s\"", uri);
+	}
+}
+
+//! Inline PEM, or a location read through duckdb's own filesystem (the spec 053 pattern).
+static string ReadPemFor(ClientContext &context, const string &arg, const char *what) {
+	auto trimmed = arg;
+	StringUtil::Trim(trimmed);
+	if (StringUtil::StartsWith(trimmed, "-----BEGIN")) {
+		return trimmed;
+	}
+	Connection con(*context.db);
+	auto quoted = "'" + StringUtil::Replace(trimmed, "'", "''") + "'";
+	auto result = con.Query("SELECT content FROM read_text(" + quoted + ")");
+	if (result->HasError()) {
+		throw BinderException("acl_quack_serve: could not read the %s from \"%s\": %s", what, trimmed,
+		                      result->GetError());
+	}
+	if (result->RowCount() != 1 || result->GetValue(0, 0).IsNull()) {
+		throw BinderException("acl_quack_serve: the %s location \"%s\" holds no single document", what, trimmed);
+	}
+	auto content = result->GetValue(0, 0).ToString();
+	auto head = content;
+	StringUtil::Trim(head);
+	if (!StringUtil::StartsWith(head, "-----BEGIN")) {
+		throw BinderException("acl_quack_serve: the %s at \"%s\" is not PEM (no -----BEGIN marker)", what, trimmed);
+	}
+	return content;
+}
+
+//! The discovery document (spec 062): the issuers the node trusts, and nothing else - metadata of
+//! the same public class OIDC discovery itself serves.
+static string WellKnownQuackAuth(PolicyStore &store) {
+	string json = "{\"issuers\":[";
+	auto issuers = store.ListIssuers();
+	for (idx_t i = 0; i < issuers.size(); i++) {
+		if (i > 0) {
+			json += ",";
+		}
+		auto escaped = StringUtil::Replace(issuers[i], "\\", "\\\\");
+		escaped = StringUtil::Replace(escaped, "\"", "\\\"");
+		json += "\"" + escaped + "\"";
+	}
+	json += "]}";
+	return json;
+}
+
 //! acl_quack_serve(uri[, token]): the safe way to open the quack door (spec 041). It installs the two
 //! callbacks and starts quack's server - but only from an instance a client cannot step out of, and it
 //! says which condition is missing rather than serving something half-configured. Everything it sets
@@ -1034,15 +1121,58 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		auto quoted = [](const string &value) {
 			return "'" + StringUtil::Replace(value, "'", "''") + "'";
 		};
-		auto served =
-		    con.Query("SELECT listen_uri FROM quack_serve(" + quoted(uri) + ", token := " + quoted(token) + ")");
+		// spec 062: the public bind belongs to OUR front - it terminates TLS where asked, answers
+		// /.well-known/quack-auth itself, and streams the rest to the real quack, which moves to a
+		// loopback-only port nothing can reach around the front
+		string public_host;
+		int public_port = 0;
+		ParseQuackEndpoint(uri, public_host, public_port);
+		auto cert_arg = args.ColumnCount() > 2 ? OptionalArg(args, 2, row, "") : string();
+		auto key_arg = args.ColumnCount() > 3 ? OptionalArg(args, 3, row, "") : string();
+		if (cert_arg.empty() != key_arg.empty()) {
+			throw BinderException("acl_quack_serve: TLS needs both the certificate and the key");
+		}
+		auto cert_pem = cert_arg.empty() ? string() : ReadPemFor(context, cert_arg, "certificate");
+		auto key_pem = key_arg.empty() ? string() : ReadPemFor(context, key_arg, "private key");
+		auto internal_port = FreeLoopbackPort();
+		if (internal_port <= 0) {
+			throw BinderException("acl_quack_serve: no free loopback port for the internal listener");
+		}
+		auto internal_uri = "quack:127.0.0.1:" + std::to_string(internal_port);
+		// the front adds a loopback hop, so give the heartbeat lease more headroom before quack
+		// starts (only raise it): a fronted drain must not trip "heartbeat lease expired" under load
+		Value current_hb;
+		if (context.TryGetCurrentSetting("quack_default_heartbeat_timeout", current_hb) && !current_hb.IsNull() &&
+		    current_hb.GetValue<int64_t>() < 300) {
+			con.Query("SET GLOBAL quack_default_heartbeat_timeout=300");
+		}
+		auto served = con.Query("SELECT listen_uri FROM quack_serve(" + quoted(internal_uri) +
+		                        ", token := " + quoted(token) + ")");
 		if (served->HasError()) {
 			throw BinderException("acl_quack_serve: %s", served->GetError());
+		}
+		QuackFrontConfig front;
+		front.host = public_host;
+		front.port = public_port;
+		front.internal_port = internal_port;
+		front.cert_pem = cert_pem;
+		front.key_pem = key_pem;
+		auto shared_store = SharedStoreOf(state);
+		front.wellknown = [shared_store] {
+			return WellKnownQuackAuth(*shared_store); // per request: the document tracks the policy live
+		};
+		front.owner = context.db; // shared_ptr -> weak_ptr, so a dead instance's front can be reclaimed
+		auto front_error = StartQuackFront(front);
+		if (!front_error.empty()) {
+			con.Query("SELECT * FROM quack_stop(" + quoted(internal_uri) + ")"); // leave nothing behind
+			throw BinderException("acl_quack_serve: %s", front_error);
 		}
 		// From here the fence on unprefixed statements applies: a drained stream is now ours to judge
 		// (spec 043). Set after the listener is up, so a refused serve leaves nothing behind.
 		store.SetDoorOpen(true);
-		result.SetValue(row, served->RowCount() > 0 ? served->GetValue(0, 0) : Value(uri));
+		// the PUBLIC uri: quack's own listen_uri is the loopback internal since spec 062, and the
+		// caller's world is the front
+		result.SetValue(row, Value(uri));
 	}
 }
 
@@ -1062,7 +1192,15 @@ void AclQuackStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 			return "'" + StringUtil::Replace(value, "'", "''") + "'";
 		};
 		Connection con(*context.db);
-		auto stopped = con.Query("SELECT * FROM quack_stop(" + quoted(uri) + ")");
+		string stop_host;
+		int stop_port = 0;
+		ParseQuackEndpoint(uri, stop_host, stop_port);
+		int internal_port = 0;
+		auto target = uri;
+		if (StopQuackFront(stop_host, stop_port, internal_port)) {
+			target = "quack:127.0.0.1:" + std::to_string(internal_port); // the quack behind the front
+		}
+		auto stopped = con.Query("SELECT * FROM quack_stop(" + quoted(target) + ")");
 		if (stopped->HasError()) {
 			throw BinderException("acl_quack_stop: %s", stopped->GetError());
 		}
@@ -1414,7 +1552,19 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	};
 	// the quack door (spec 041): the two callbacks quack calls, both thin over the contract above
 	register_admin("acl_quack_authenticate", {v, v, v}, AclQuackAuthenticateFunc);
-	register_session_text("acl_quack_serve", {v, v}, AclQuackServeFunc);
+	auto register_session_text_set = [&](const string &name, vector<vector<LogicalType>> signatures,
+	                                     scalar_function_t fn) {
+		ScalarFunctionSet set((Identifier(name)));
+		for (auto &arguments : signatures) {
+			ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::VARCHAR, fn);
+			function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+			function.SetFallible();
+			set.AddFunction(function);
+		}
+		loader.RegisterFunction(set);
+	};
+	// spec 062: the 4-arg form fronts the door with TLS (cert, key - inline PEM or a path)
+	register_session_text_set("acl_quack_serve", {{v, v}, {v, v, v, v}}, AclQuackServeFunc);
 	register_session_text("acl_quack_stop", {v}, AclQuackStopFunc);
 	register_session_text("acl_quack_authorize", {v, v}, AclQuackAuthorizeFunc);
 	register_session_text("acl_session_open", {v}, AclSessionOpenFunc);

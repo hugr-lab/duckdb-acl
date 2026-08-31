@@ -19,6 +19,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace duckdb {
 namespace acl {
@@ -58,6 +59,20 @@ struct Endpoints {
 //! GET `<issuer>/.well-known/openid-configuration` (RFC 8414). The advertised
 //! issuer must equal the asked-for one — a mismatch is refused, not adopted.
 Endpoints Discover(const std::string &issuer_url, int timeout_seconds = 10);
+
+//! A door's own auth-discovery document (spec 062): `GET
+//! <base>/.well-known/quack-auth` names the issuers the node trusts, so a
+//! client needs no IdP configuration beyond the door's address.
+struct DoorAuth {
+	std::vector<std::string> issuers;
+	std::string error;
+
+	bool Ok() const {
+		return error.empty();
+	}
+};
+
+DoorAuth FetchQuackAuth(const std::string &base_url, int timeout_seconds = 10);
 
 //! What a token endpoint answered. `error` carries the human-readable failure;
 //! `error_code` the protocol's machine code (authorization_pending, slow_down,

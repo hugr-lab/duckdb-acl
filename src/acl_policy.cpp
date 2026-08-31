@@ -569,6 +569,21 @@ void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, 
 	}
 }
 
+vector<string> PolicyStore::ListIssuers() {
+	// the discovery document's content (spec 062): issuer URLs only - public by nature, the same
+	// class of fact OIDC discovery itself publishes
+	vector<string> out;
+	if (catalog) {
+		CatalogListIssuers(out);
+		return out;
+	}
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : issuers) {
+		out.push_back(entry.second.issuer);
+	}
+	return out;
+}
+
 bool PolicyStore::LookupIssuer(const string &issuer, IssuerConfig &out) {
 	// like every resolver: an enabled catalog is the only source (a stale memory entry must not
 	// shadow the catalog registry)

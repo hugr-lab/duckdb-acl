@@ -26,6 +26,7 @@ set(EXTENSION_SOURCES
     src/acl_parser_override.cpp
     src/oidc/acl_oidc.cpp
     src/oidc/acl_oidc_secret.cpp
+    src/quack_front/acl_quack_front.cpp
     src/acl_policy.cpp
     src/acl_policy_catalog.cpp
     src/acl_rewriter.cpp

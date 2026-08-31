@@ -306,6 +306,37 @@ Endpoints Discover(const std::string &issuer_url, int timeout_seconds) {
 	return out;
 }
 
+DoorAuth FetchQuackAuth(const std::string &base_url, int timeout_seconds) {
+	DoorAuth out;
+	auto base = base_url;
+	while (!base.empty() && base.back() == '/') {
+		base.pop_back();
+	}
+	auto response = HttpGet(base + "/.well-known/quack-auth", timeout_seconds);
+	if (!response.Ok()) {
+		out.error = response.error.empty() ? ("door discovery answered HTTP " + std::to_string(response.status))
+		                                   : response.error;
+		return out;
+	}
+	auto *doc = duckdb_yyjson::yyjson_read(response.body.data(), response.body.size(), 0);
+	if (!doc) {
+		out.error = "door discovery answered non-JSON";
+		return out;
+	}
+	auto *issuers = duckdb_yyjson::yyjson_obj_get(duckdb_yyjson::yyjson_doc_get_root(doc), "issuers");
+	if (issuers && duckdb_yyjson::yyjson_is_arr(issuers)) {
+		duckdb_yyjson::yyjson_arr_iter iter;
+		duckdb_yyjson::yyjson_arr_iter_init(issuers, &iter);
+		while (auto *item = duckdb_yyjson::yyjson_arr_iter_next(&iter)) {
+			if (duckdb_yyjson::yyjson_is_str(item)) {
+				out.issuers.emplace_back(duckdb_yyjson::yyjson_get_str(item));
+			}
+		}
+	}
+	duckdb_yyjson::yyjson_doc_free(doc);
+	return out;
+}
+
 TokenSet ClientCredentials(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                            const std::string &scope) {
 	std::map<std::string, std::string> params {
