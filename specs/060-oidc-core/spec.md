@@ -74,8 +74,34 @@ consumers (A1/B3).
 - **String-scanning JSON** (mssql's parser) - replaced with the bundled yyjson; a token response is
   attacker-influenced input and deserves a real parser.
 
+## The review's findings (applied / carried)
+
+The adversarial review confirmed the invariant (no node path references the module - by grep, link
+analysis and the absence of static-init side effects), the TLS posture (verification explicit and
+never disabled; the vcpkg OpenSSL's default verify paths resolve on this platform) and the ODR
+engineering across all four build combinations (httpfs's static co-link included). Fixed on its
+findings: the issuer-mismatch test now exercises the actual check (a lying document served at the
+asked-about path) rather than passing through a 404; the device poll's deadline guard is
+subtraction, not addition, with the server-adopted interval and slow_down growth clamped - a hostile
+IdP can no longer overflow the guard into an unbounded sleep; a discovery document naming a
+cleartext endpoint for an https issuer is refused (credentials must not travel weaker than the
+discovery did); the advertised issuer is normalised like the asked-for one (an IdP whose canonical
+issuer ends in '/' verifies); IPv6 authorities parse and garbage ports refuse.
+
+**Named obligations for the consumer specs (A1/B3), from the review:**
+
+1. **The cache's owner contract**: an owner that dies MUST `Invalidate`/`Clear` its keys (the raw
+   pointer key has the ABA hazard - a recycled address would inherit tokens), and the cache key MUST
+   include issuer+client_id so a collision can at worst serve the same credential.
+2. **`expires_at == 0` is the IdP's choice, not the caller's**: RFC 6749 makes `expires_in`
+   optional, so a consumer MUST wire its 401/verification-failure path to `Invalidate`, or a
+   token cached without expiry outlives its validity silently.
+3. **Trust-store note**: keychain-only roots (corporate TLS inspection on macOS) are invisible to
+   the vcpkg OpenSSL; `SSL_CERT_FILE` is the documented workaround.
+
 ## Follow-ups
 
-- Block A1: the quack secret provider consumes this (`FLOW token|client_credentials|device|password`).
-- Block B3: the door's admin-enabled password handshake consumes `PasswordGrant`.
+- Block A1: the quack secret provider consumes this (`FLOW token|client_credentials|device|password`),
+  under the named obligations above.
+- Block B3: the door's admin-enabled password handshake consumes `PasswordGrant`, same obligations.
 - Auth-code+PKCE stays with the drivers (a browser is a client-side affair, design/016 §2).

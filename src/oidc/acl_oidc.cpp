@@ -59,15 +59,49 @@ UrlParts ParseUrl(const std::string &url) {
 	auto slash = rest.find('/');
 	auto authority = slash == std::string::npos ? rest : rest.substr(0, slash);
 	out.path = slash == std::string::npos ? "/" : rest.substr(slash);
-	auto colon = authority.rfind(':');
-	if (colon != std::string::npos) {
-		out.host = authority.substr(0, colon);
-		out.port = std::atoi(authority.substr(colon + 1).c_str());
+	auto default_port = out.https ? 443 : 80;
+	std::string port_text;
+	if (!authority.empty() && authority.front() == '[') { // [v6]:port - the colon comes after ']'
+		auto bracket = authority.find(']');
+		if (bracket == std::string::npos) {
+			out.error = "malformed URL authority: " + url;
+			return out;
+		}
+		out.host = authority.substr(1, bracket - 1);
+		if (bracket + 1 < authority.size()) {
+			if (authority[bracket + 1] != ':') {
+				out.error = "malformed URL authority: " + url;
+				return out;
+			}
+			port_text = authority.substr(bracket + 2);
+		}
 	} else {
-		out.host = authority;
-		out.port = out.https ? 443 : 80;
+		auto colon = authority.rfind(':');
+		if (colon != std::string::npos) {
+			out.host = authority.substr(0, colon);
+			port_text = authority.substr(colon + 1);
+		} else {
+			out.host = authority;
+		}
 	}
-	if (out.host.empty() || out.port <= 0) {
+	if (port_text.empty()) {
+		out.port = default_port;
+	} else {
+		// digits only, and a port-sized value - "80xyz" must refuse, not silently become 80
+		for (char c : port_text) {
+			if (!isdigit(static_cast<unsigned char>(c))) {
+				out.error = "malformed port in URL: " + url;
+				return out;
+			}
+		}
+		auto value = port_text.size() <= 5 ? std::atoi(port_text.c_str()) : 0;
+		if (value <= 0 || value > 65535) {
+			out.error = "malformed port in URL: " + url;
+			return out;
+		}
+		out.port = value;
+	}
+	if (out.host.empty()) {
 		out.error = "malformed URL authority: " + url;
 	}
 	return out;
@@ -188,6 +222,9 @@ TokenSet FromTokenResponse(const HttpResult &response) {
 		out.access_token = json.Str("access_token");
 		out.refresh_token = json.Str("refresh_token");
 		auto expires_in = json.Int("expires_in");
+		if (expires_in > 366 * 86400) { // a year: past that the value is nonsense, and unclamped it
+			expires_in = 366 * 86400;   // could overflow the epoch arithmetic (the review's finding)
+		}
 		out.expires_at = expires_in > 0 ? NowSeconds() + expires_in : 0;
 		if (out.access_token.empty()) {
 			out.error = "the token endpoint answered 2xx without an access_token";
@@ -240,6 +277,10 @@ Endpoints Discover(const std::string &issuer_url, int timeout_seconds) {
 	}
 	Json json(response.body);
 	auto advertised = json.Str("issuer");
+	// normalised exactly like the asked-for issuer: some IdPs canonically end in '/' (Azure AD v1)
+	while (!advertised.empty() && advertised.back() == '/') {
+		advertised.pop_back();
+	}
 	// RFC 8414: the document must speak for the issuer it was asked about — adopting a different one
 	// would let a compromised document redirect every flow
 	if (advertised != issuer) {
@@ -250,6 +291,17 @@ Endpoints Discover(const std::string &issuer_url, int timeout_seconds) {
 	out.device_authorization_endpoint = json.Str("device_authorization_endpoint");
 	if (out.token_endpoint.empty()) {
 		out.error = "discovery document carries no token_endpoint";
+		return out;
+	}
+	// an https issuer whose document names a cleartext endpoint is a downgrade: the credentials the
+	// flows POST must not travel weaker than the discovery did (the review's finding)
+	if (issuer.rfind("https://", 0) == 0) {
+		for (const auto *endpoint : {&out.token_endpoint, &out.device_authorization_endpoint}) {
+			if (!endpoint->empty() && endpoint->rfind("https://", 0) != 0) {
+				out.error = "discovery names a cleartext endpoint for an https issuer - refused: " + *endpoint;
+				return out;
+			}
+		}
 	}
 	return out;
 }
@@ -317,11 +369,11 @@ DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_i
 	out.verification_uri_complete = json.Str("verification_uri_complete");
 	auto interval = json.Int("interval");
 	if (interval > 0) {
-		out.interval = interval;
+		out.interval = interval > 900 ? 900 : interval; // a malicious interval must not become a sleep
 	}
 	auto expires_in = json.Int("expires_in");
 	if (expires_in > 0) {
-		out.expires_in = expires_in;
+		out.expires_in = expires_in > 86400 ? 86400 : expires_in;
 	}
 	if (out.device_code.empty()) {
 		out.error = "device authorization answered without a device_code";
@@ -340,11 +392,14 @@ TokenSet DevicePoll(const Endpoints &ep, const std::string &client_id, const std
 			return result;
 		}
 		if (result.error_code == "slow_down") {
-			interval += 5; // RFC 8628 §3.5
+			interval = interval + 5 > 3600 ? 3600 : interval + 5; // RFC 8628 §3.5, bounded
 		} else if (result.error_code != "authorization_pending") {
 			return result; // denied, expired, transport - the caller's to report
 		}
-		if (NowSeconds() + interval > deadline_epoch_seconds) {
+		// subtraction, not addition: a hostile interval must not overflow the guard into an
+		// unbounded sleep (the review's finding) - the promise is that the poll never outlives
+		// the deadline, whatever the server answers
+		if (interval >= deadline_epoch_seconds - NowSeconds()) {
 			result.error = "device flow timed out before the user approved";
 			result.error_code = "expired_token";
 			return result;

@@ -57,6 +57,19 @@ struct FakeIdp {
 			                               "/token\",\"device_authorization_endpoint\":\"" + Issuer() + "/device\"}",
 			                           "application/json");
 		           });
+		// a LYING document: served at /realms/other, speaking for the root issuer - discovery asked
+		// about /realms/other must refuse it on the issuer check, not on a 404
+		server.Get("/realms/other/.well-known/openid-configuration", [this](const duckdb_httplib::Request &,
+		                                                                    duckdb_httplib::Response &res) {
+			res.set_content("{\"issuer\":\"" + Issuer() + "\",\"token_endpoint\":\"" + Issuer() + "/token\"}",
+			                "application/json");
+		});
+		// a canonical trailing slash: the advertised issuer ends in '/', the asked-for one does not
+		server.Get("/slashy/.well-known/openid-configuration", [this](const duckdb_httplib::Request &,
+		                                                              duckdb_httplib::Response &res) {
+			res.set_content("{\"issuer\":\"" + Issuer() + "/slashy/\",\"token_endpoint\":\"" + Issuer() + "/token\"}",
+			                "application/json");
+		});
 		server.Post("/device", [this](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
 			res.set_content("{\"device_code\":\"dc-1\",\"user_code\":\"WDJB-MJHT\",\"verification_uri\":\"" + Issuer() +
 			                    "/activate\",\"interval\":0,\"expires_in\":60}",
@@ -134,7 +147,11 @@ int main() {
 		Check(ep.token_endpoint == idp.Issuer() + "/token", "token endpoint discovered");
 		Check(!ep.device_authorization_endpoint.empty(), "device endpoint discovered");
 		auto mismatch = Discover(idp.Issuer() + "/realms/other");
-		Check(!mismatch.Ok(), "a document speaking for another issuer is refused: " + mismatch.error);
+		Check(!mismatch.Ok() && mismatch.error.find("issuer mismatch") != std::string::npos,
+		      "a document speaking for another issuer is refused ON THE ISSUER CHECK: " + mismatch.error);
+		auto slashy = Discover(idp.Issuer() + "/slashy");
+		Check(slashy.Ok(),
+		      "a canonical trailing slash in the advertised issuer is normalised, not refused: " + slashy.error);
 	});
 
 	Scenario("client_credentials - the machine identity flow", [&] {
