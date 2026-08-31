@@ -31,6 +31,7 @@
 #include <arrow/c/bridge.h>
 #include <arrow/flight/server.h>
 #include <arrow/flight/middleware.h>
+#include <arrow/flight/server_auth.h>
 #include <arrow/flight/server_middleware.h>
 #include <arrow/flight/sql/server.h>
 #include <arrow/record_batch.h>
@@ -1616,6 +1617,14 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		door.state = make_shared_ptr<FlightDoorState>(*context.db, StoreShared(state));
 		door.server = std::make_unique<AclFlightSqlServer>(door.state);
 		flight::FlightServerOptions options(*location);
+		// spec 058: the Arrow Flight SQL JDBC driver (DBeaver) opens a connection by calling the
+		// Handshake RPC, and a server with no auth_handler answers it "This service does not have an
+		// authentication mechanism enabled" - so the driver cannot even connect, though pyarrow and
+		// ADBC, which never handshake, work. A NoOpAuthHandler makes Handshake a no-op success; it
+		// weakens nothing, because the real gate is the per-call `authorization: Bearer` header every
+		// RPC still carries (TokenFromHeaders), which NoOpAuthHandler does not touch. A call with no
+		// valid token is refused exactly as before.
+		options.auth_handler = std::make_shared<flight::NoOpAuthHandler>();
 		if (has_tls) {
 			auto cert = ReadPem(context, FlatVector::GetData<string_t>(args.data[1])[row].GetString(), "certificate");
 			auto key = ReadPem(context, FlatVector::GetData<string_t>(args.data[2])[row].GetString(), "key");
