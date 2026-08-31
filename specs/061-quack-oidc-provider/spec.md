@@ -66,6 +66,24 @@ A **pre-existing bug**: a virtual table whose RLS is INLINE on `CREATE VIRTUAL T
 `view_sql` (acl_policy_catalog.cpp's relation lookup). No attach test covered the inline shape.
 Follow-up spec material; the provider test uses the grant-borne shape meanwhile.
 
+## The review's findings (applied)
+
+- **The cache key now includes OAUTH_SCOPE**: a refresh request carries no scope and answers with
+  the original grant's (RFC 6749 §6), so two configs differing only in scope must never share a
+  chain - previously a replace asking for a narrower scope silently received the broader token.
+- **Rotation survives**: a refresh response that omits the refresh token (the RFC allows it) now
+  carries the old one forward instead of destroying the chain after one replace; the test pins the
+  SECOND replace against an IdP that rotates exactly that way, and the scope isolation besides.
+- **The chain outlives the access token**: the cache stores only the refresh token, with no expiry
+  (its validity is unknowable client-side) and the access token blanked; a genuinely dead chain is
+  invalidated where the refresh fails with `invalid_grant` - a transport failure or a caller's own
+  `invalid_client` no longer evicts a good chain.
+- **The device poll is cancellable**: it checks the querying connection's interrupt between polls
+  and sleeps in one-second slices, so Ctrl-C ends the wait instead of the IdP's deadline.
+- Documented (docs/clients/quack.md): the stale-stored-token failure mode and its re-mint lever;
+  PERSISTENT secrets write the minted token to disk and revive stale; the CREATE SECRET statement
+  text itself carries credentials, so it belongs on a local, unlogged connection.
+
 ## Follow-ups
 
 - The inline-RLS attach bug above.

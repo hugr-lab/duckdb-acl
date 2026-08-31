@@ -59,9 +59,17 @@ int64_t NowSeconds() {
 	    .count();
 }
 
+//! The refresh-chain cache key: everything that shapes the credential, the OAuth scope included -
+//! a refresh request carries no scope (RFC 6749 §6) and answers with the ORIGINAL grant's, so two
+//! configs differing only in OAUTH_SCOPE must never share a chain (the review's finding).
+string CacheKey(const CreateSecretInput &input, const string &flow) {
+	return Param(input, "issuer") + "|" + Param(input, "client_id") + "|" + flow + "|" + Param(input, "username") +
+	       "|" + Param(input, "oauth_scope");
+}
+
 //! Run the configured flow and return the token set; every refusal is the
 //! protocol's own, surfaced verbatim — never a silent fallback to another flow.
-oidc::TokenSet Acquire(const CreateSecretInput &input, const string &flow) {
+oidc::TokenSet Acquire(ClientContext &context, const CreateSecretInput &input, const string &flow) {
 	if (flow == "token") {
 		oidc::TokenSet out;
 		out.access_token = Require(input, "token", "token");
@@ -76,15 +84,24 @@ oidc::TokenSet Acquire(const CreateSecretInput &input, const string &flow) {
 		throw InvalidInputException("acl oidc secret: discovery against \"%s\" failed: %s", issuer, endpoints.error);
 	}
 	// the cache is consulted for a refresh token ONLY (see the header comment); the key carries
-	// everything that names the credential, so a collision can at worst serve the same one
-	auto cache_key = issuer + "|" + client_id + "|" + flow + "|" + Param(input, "username");
+	// everything that shapes the credential, so a collision can at worst serve the same one
+	auto cache_key = CacheKey(input, flow);
 	auto cached = oidc::TokenCache::Instance().Get(nullptr, cache_key, /*margin*/ 0);
 	if (!cached.refresh_token.empty()) {
 		auto renewed = oidc::RefreshGrant(endpoints, client_id, client_secret, cached.refresh_token);
 		if (renewed.Ok()) {
+			if (renewed.refresh_token.empty()) {
+				// RFC 6749 §6: a refresh response MAY omit the refresh token, and the old one then
+				// stays valid - carry it forward or the chain dies after one replace (the review)
+				renewed.refresh_token = cached.refresh_token;
+			}
 			return renewed;
 		}
-		oidc::TokenCache::Instance().Invalidate(nullptr, cache_key); // the refresh token is spent
+		if (renewed.error_code == "invalid_grant") {
+			// the token itself is spent/revoked - only then is the chain dead. A transport failure
+			// or an invalid_client (the CALLER's wrong secret) must not evict a good chain.
+			oidc::TokenCache::Instance().Invalidate(nullptr, cache_key);
+		}
 	}
 	if (flow == "client_credentials") {
 		return oidc::ClientCredentials(endpoints, client_id, client_secret, oauth_scope);
@@ -105,13 +122,13 @@ oidc::TokenSet Acquire(const CreateSecretInput &input, const string &flow) {
 			std::cerr << "  (or open " << begun.verification_uri_complete << " directly)\n";
 		}
 		return oidc::DevicePoll(endpoints, client_id, begun.device_code, begun.interval,
-		                        NowSeconds() + begun.expires_in);
+		                        NowSeconds() + begun.expires_in, [&context] { return context.IsInterrupted(); });
 	}
 	throw InvalidInputException(
 	    "acl oidc secret: FLOW must be 'token', 'client_credentials', 'password' or 'device', not '%s'", flow);
 }
 
-unique_ptr<BaseSecret> CreateQuackOidcSecret(ClientContext &, CreateSecretInput &input) {
+unique_ptr<BaseSecret> CreateQuackOidcSecret(ClientContext &context, CreateSecretInput &input) {
 	auto flow = StringUtil::Lower(Param(input, "flow"));
 	if (flow.empty()) {
 		flow = Param(input, "token").empty() ? string() : string("token");
@@ -120,16 +137,18 @@ unique_ptr<BaseSecret> CreateQuackOidcSecret(ClientContext &, CreateSecretInput 
 		throw InvalidInputException(
 		    "acl oidc secret: name a FLOW ('token', 'client_credentials', 'password' or 'device')");
 	}
-	auto minted = Acquire(input, flow);
+	auto minted = Acquire(context, input, flow);
 	if (!minted.Ok()) {
 		throw InvalidInputException("acl oidc secret: the %s flow was refused: %s", flow, minted.error);
 	}
-	if (flow != "token") {
-		// keep the refresh token (and only through it, silent re-mints); the access token is
-		// deliberately not served from this cache - see the header comment
-		auto cache_key =
-		    Param(input, "issuer") + "|" + Param(input, "client_id") + "|" + flow + "|" + Param(input, "username");
-		oidc::TokenCache::Instance().Set(nullptr, cache_key, minted);
+	if (flow != "token" && !minted.refresh_token.empty()) {
+		// keep the refresh CHAIN and nothing else: the access token is blanked (it is never served
+		// from here) and the entry carries no expiry - the access token's lifetime must not kill a
+		// refresh token that outlives it by hours (the review); a genuinely dead chain is
+		// invalidated where the refresh fails with invalid_grant.
+		oidc::TokenSet chain;
+		chain.refresh_token = minted.refresh_token;
+		oidc::TokenCache::Instance().Set(nullptr, CacheKey(input, flow), std::move(chain));
 	}
 	auto scope = input.scope;
 	if (scope.empty()) {

@@ -382,9 +382,18 @@ DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_i
 }
 
 TokenSet DevicePoll(const Endpoints &ep, const std::string &client_id, const std::string &device_code,
-                    int64_t interval_seconds, int64_t deadline_epoch_seconds) {
+                    int64_t interval_seconds, int64_t deadline_epoch_seconds, const std::function<bool()> &cancelled) {
 	auto interval = interval_seconds < 0 ? 0 : interval_seconds;
+	auto is_cancelled = [&] {
+		return cancelled && cancelled();
+	};
 	while (true) {
+		if (is_cancelled()) {
+			TokenSet out;
+			out.error = "device flow cancelled";
+			out.error_code = "cancelled";
+			return out;
+		}
 		auto result = PostGrant(ep, {{"grant_type", "urn:ietf:params:oauth:grant-type:device_code"},
 		                             {"client_id", client_id},
 		                             {"device_code", device_code}});
@@ -404,8 +413,14 @@ TokenSet DevicePoll(const Endpoints &ep, const std::string &client_id, const std
 			result.error_code = "expired_token";
 			return result;
 		}
-		if (interval > 0) {
-			std::this_thread::sleep_for(std::chrono::seconds(interval));
+		for (int64_t slept = 0; slept < interval; slept++) {
+			if (is_cancelled()) {
+				TokenSet out;
+				out.error = "device flow cancelled";
+				out.error_code = "cancelled";
+				return out;
+			}
+			std::this_thread::sleep_for(std::chrono::seconds(1));
 		}
 	}
 }

@@ -149,7 +149,8 @@ int main(int argc, char *argv[]) {
 
 		Scenario("before quack's type exists, CREATE SECRET is the type lookup's refusal", [&] {
 			auto refused = con.Query("CREATE SECRET early (TYPE quack, PROVIDER oidc, FLOW 'token', TOKEN 't')");
-			Check(refused->HasError(), "refused: " + (refused->HasError() ? refused->GetError() : "it passed"));
+			Check(refused->HasError() && refused->GetError().find("quack") != std::string::npos,
+			      "refused by the type lookup: " + (refused->HasError() ? refused->GetError() : "it passed"));
 		});
 
 		// the round trip needs the quack extension; without a quack build the flows still run by
@@ -213,6 +214,24 @@ int main(int argc, char *argv[]) {
 			Check(!replaced->HasError(), "the replace mints again");
 			Check(idp.refresh_grants.load() == before_refresh + 1, "...via grant_type=refresh_token (silent)");
 			Check(idp.password_grants.load() == before_password, "...and the password never travelled again");
+			// the fake IdP's refresh answers carry NO new refresh token (RFC 6749 allows it) - the
+			// chain must survive rotation, so the SECOND replace still refreshes silently
+			auto again = con.Query("CREATE OR REPLACE SECRET pw (TYPE quack, PROVIDER oidc, SCOPE 'quack:c', "
+			                       "FLOW 'password', ISSUER '" +
+			                       idp.Issuer() + "', CLIENT_ID 'cli', USERNAME 'analyst', PASSWORD 'pw')");
+			Check(!again->HasError(), "the second replace mints too");
+			Check(idp.refresh_grants.load() == before_refresh + 2,
+			      "...still via the refresh chain (rotation without a new token did not kill it)");
+			Check(idp.password_grants.load() == before_password, "...and the password still never travelled");
+			// a different OAUTH_SCOPE is a different credential shape: it must NOT ride this chain
+			auto other_scope = con.Query("CREATE SECRET pw_narrow (TYPE quack, PROVIDER oidc, SCOPE 'quack:f', "
+			                             "FLOW 'password', ISSUER '" +
+			                             idp.Issuer() +
+			                             "', CLIENT_ID 'cli', USERNAME 'analyst', PASSWORD 'pw', "
+			                             "OAUTH_SCOPE 'narrow')");
+			Check(!other_scope->HasError(), "a scoped secret mints");
+			Check(idp.password_grants.load() == before_password + 1,
+			      "...through the FULL grant - a different scope never rides another scope's chain");
 		});
 
 		if (quack_loaded) {

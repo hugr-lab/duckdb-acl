@@ -36,6 +36,17 @@ not re-prompt. Passwords and client secrets are consumed by the flow and never s
 carries only the minted token (redacted) and the visible issuer/client/flow. `OAUTH_SCOPE` passes an
 OAuth scope through (plain `SCOPE` is the secret's own matching clause).
 
+Worth knowing:
+
+- **When the minted token expires**, the door refuses the next connection with its ordinary
+  verification error - the fix is `CREATE OR REPLACE SECRET` (the re-mint lever), not a new ATTACH.
+- **`CREATE PERSISTENT SECRET` writes the minted token to disk** (duckdb's standard secret storage,
+  `redact_keys` governs display only), and after a restart it revives with whatever staleness it
+  has while the refresh chain lived only in process memory - prefer the default temporary secret
+  and re-mint per session.
+- The `CREATE SECRET` statement itself carries the password/client secret as ordinary SQL text -
+  run it locally, never through a gateway or shell that logs statements.
+
 ## Planned (design/016 block A2)
 
 - TLS and `/.well-known/quack-auth` discovery on the served side, fronted by the acl extension's own
