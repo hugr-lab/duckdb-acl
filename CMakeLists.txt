@@ -14,6 +14,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(src/include)
 # vendored P-256 ECDSA (ES256 verify; duckdb's trimmed mbedtls carries no ECDSA)
 include_directories(third_party/p256-m)
+# the OIDC client core (spec 060) compiles duckdb's bundled httplib in its one TU and parses
+# responses with the bundled yyjson
+include_directories(duckdb/third_party/httplib duckdb/third_party/yyjson/include)
 
 set(EXTENSION_SOURCES
     src/acl_admin_functions.cpp
@@ -21,6 +24,7 @@ set(EXTENSION_SOURCES
     src/acl_extension.cpp
     src/acl_introspection.cpp
     src/acl_parser_override.cpp
+    src/oidc/acl_oidc.cpp
     src/acl_policy.cpp
     src/acl_policy_catalog.cpp
     src/acl_rewriter.cpp
@@ -68,6 +72,9 @@ if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_FLIGHT})
     # Named outright: Arrow's Flight libraries use gRPC's C core beyond what their own config carries
     # over, so leaving it implicit ends in unresolved grpc_* symbols at the very last step.
     find_package(gRPC CONFIG REQUIRED)
+    # the OIDC core's https client (spec 060): the same vcpkg tree that feeds Arrow/gRPC carries
+    # OpenSSL, so the TLS variant of the client exists exactly when the flight door does
+    find_package(OpenSSL REQUIRED)
 
     add_subdirectory(src/flight)
     list(APPEND EXTENSION_SOURCES ${ACL_FLIGHT_SOURCES})
@@ -78,13 +85,15 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_FLIGHT})
     foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
-        target_compile_definitions(${target} PRIVATE ACL_FLIGHT_ENABLED=1)
+        target_compile_definitions(${target} PRIVATE ACL_FLIGHT_ENABLED=1 ACL_OIDC_TLS=1)
         target_link_libraries(${target}
             ArrowFlightSql::arrow_flight_sql_static
             ArrowFlight::arrow_flight_static
             Arrow::arrow_static
             gRPC::grpc++
-            gRPC::grpc)
+            gRPC::grpc
+            OpenSSL::SSL
+            OpenSSL::Crypto)
     endforeach()
 endif()
 

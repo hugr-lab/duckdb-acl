@@ -60,7 +60,8 @@ TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,build/test/%,$(TEST_CPP_SOURCES))
 TEST_CPP_FLAGS := -std=c++17 -O2 -DNDEBUG -pthread
 # `src/include` so a test can reach a seam the extension exposes to itself - spec 046's catalog
 # statement composition is a free function, and checking the text it produces needs its header.
-TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include
+TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include \
+	-I duckdb/third_party/httplib -I duckdb/third_party/yyjson/include
 
 # Link against the shared libduckdb, exactly like duckdb's own unittest: it already carries the
 # statically linked extensions (acl, core_functions, ... and the scanners of an integration build)
@@ -77,6 +78,11 @@ TEST_CPP_LINK = -L build/release/src -lduckdb -Wl,-rpath,$(abspath build/release
 # would be the wrong way round - the test links the source instead. (spec 046)
 build/test/test_acl_catalog_rpc: src/acl_catalog_rpc.cpp
 build/test/test_acl_catalog_rpc: TEST_CPP_EXTRA := src/acl_catalog_rpc.cpp
+
+# the OIDC core (spec 060) is duckdb-free by design, so its test compiles the module plus the
+# bundled yyjson directly - the fake IdP inside the test is the bundled httplib's own Server
+build/test/test_acl_oidc: src/oidc/acl_oidc.cpp src/include/acl_oidc.hpp
+build/test/test_acl_oidc: TEST_CPP_EXTRA := src/oidc/acl_oidc.cpp duckdb/third_party/yyjson/yyjson.cpp
 
 build/test/%: test/cpp/%.cpp test/cpp/acl_test_util.hpp $(TEST_CPP_DUCKDB_LIB)
 	@mkdir -p build/test
