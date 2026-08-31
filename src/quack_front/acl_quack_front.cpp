@@ -68,13 +68,26 @@ std::string Key(const std::string &host, int port) {
 
 //! Streamed pass-through to the loopback quack: the method, path, body and
 //! content type travel; quack's protocol is POST bodies, so this is the whole
-//! of it. The proxy client is per-request — quack's own server closes
-//! connections on its schedule, and a stale kept-alive socket would turn into
-//! spurious refusals.
+//! of it. The upstream client is KEPT ALIVE per worker thread (thread_local),
+//! keyed by port: a fresh connect per request added enough latency under load
+//! that quack's heartbeat lease expired (the front's own CI regression). Each
+//! httplib worker owns one connection, so a long drain on one worker never
+//! blocks a heartbeat on another, and neither pays TCP setup twice.
+hl::Client &UpstreamFor(int internal_port) {
+	static thread_local std::map<int, std::unique_ptr<hl::Client>> clients;
+	auto entry = clients.find(internal_port);
+	if (entry == clients.end()) {
+		auto client = std::make_unique<hl::Client>("127.0.0.1", internal_port);
+		client->set_connection_timeout(10);
+		client->set_read_timeout(600); // a drain of a large SEND_DATA body is legitimate work
+		client->set_keep_alive(true);
+		entry = clients.emplace(internal_port, std::move(client)).first;
+	}
+	return *entry->second;
+}
+
 void Proxy(int internal_port, const hl::Request &request, hl::Response &response) {
-	hl::Client upstream("127.0.0.1", internal_port);
-	upstream.set_connection_timeout(10);
-	upstream.set_read_timeout(600); // a drain of a large SEND_DATA body is legitimate work
+	auto &upstream = UpstreamFor(internal_port);
 	auto content_type = request.get_header_value("Content-Type");
 	hl::Result answer;
 	if (request.method == "POST") {
@@ -133,6 +146,11 @@ std::string StartQuackFront(const QuackFrontConfig &config) {
 	} else {
 		front->server = std::make_unique<hl::Server>();
 	}
+	// a long-held drain must not starve heartbeats on other connections: give the front plenty of
+	// workers (quack's own default keep-alive is generous, and these threads are cheap when idle)
+	front->server->new_task_queue = [] {
+		return new hl::ThreadPool(64);
+	};
 
 	auto wellknown = config.wellknown;
 	front->server->Get("/.well-known/quack-auth", [wellknown](const hl::Request &, hl::Response &response) {

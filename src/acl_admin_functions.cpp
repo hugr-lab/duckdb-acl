@@ -1139,6 +1139,13 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			throw BinderException("acl_quack_serve: no free loopback port for the internal listener");
 		}
 		auto internal_uri = "quack:127.0.0.1:" + std::to_string(internal_port);
+		// the front adds a loopback hop, so give the heartbeat lease more headroom before quack
+		// starts (only raise it): a fronted drain must not trip "heartbeat lease expired" under load
+		Value current_hb;
+		if (context.TryGetCurrentSetting("quack_default_heartbeat_timeout", current_hb) && !current_hb.IsNull() &&
+		    current_hb.GetValue<int64_t>() < 300) {
+			con.Query("SET GLOBAL quack_default_heartbeat_timeout=300");
+		}
 		auto served = con.Query("SELECT listen_uri FROM quack_serve(" + quoted(internal_uri) +
 		                        ", token := " + quoted(token) + ")");
 		if (served->HasError()) {
