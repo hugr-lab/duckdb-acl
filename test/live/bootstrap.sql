@@ -30,9 +30,15 @@ ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers
 -- analyst: the full working role - reads its slice, writes under the predicate, stages, EXPLAINs
 ACL ADMIN CREATE ROLE analyst;
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, temp, explain) MAIN;
+-- COLUMNS lists all four (so it restricts nothing) but gives the write path a publish order - which
+-- is what a quack SEND_DATA drain auto-names its positional stream against: without it, an unnamed
+-- INSERT under a predicate is refused (spec 024/042), and quack's drain is always unnamed because
+-- the column list does not travel over the wire. The Flight door's adbc_ingest names columns itself,
+-- so it needs neither - but the one grant serves both doors.
 ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
     CAPS '{"select": true, "insert": true}'
-    RLS 'tenant = acl_claim(''tenant'')';
+    RLS 'tenant = acl_claim(''tenant'')'
+    COLUMNS 'id,tenant,amount,customer_id';
 ACL ADMIN GRANT TABLE c.customers TO ROLE analyst WITH (select) COLUMNS (id, name);
 ACL ADMIN CREATE VIRTUAL SCHEMA c.stage AS memory.staging;
 ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, drop);
