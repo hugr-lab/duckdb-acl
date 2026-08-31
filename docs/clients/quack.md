@@ -16,10 +16,27 @@ INSERT INTO remote.main.orders SELECT * FROM payload;  -- bulk SEND_DATA drain, 
   grant to carry a `COLUMNS` list (the drain is positional on the wire).
 - The client's own `CREATE TEMP TABLE` is local to the client and never reaches the server.
 
-## Planned (design/016 block A)
+## OIDC without hand-carried tokens (spec 061)
 
-- `CREATE SECRET (TYPE quack, PROVIDER oidc, ISSUER ..., CLIENT_ID ..., FLOW
-  'token'|'client_credentials'|'device'|'password' ...)` - the provider runs the flow at CREATE and
-  re-mints on `CREATE OR REPLACE`; quack itself is unchanged.
+The `oidc` provider runs a real flow at `CREATE SECRET` and stores the minted token where quack
+already looks - `ATTACH` then needs no TOKEN at all:
+
+```sql
+CREATE SECRET kc (TYPE quack, PROVIDER oidc, SCOPE 'quack:<host>:<port>',
+                  ISSUER 'https://kc/realms/x', CLIENT_ID 'cli',
+                  FLOW 'device');                      -- prints a URL + code, waits for approval
+-- FLOW 'password'            + USERNAME/PASSWORD     (where the IdP allows it)
+-- FLOW 'client_credentials'  + CLIENT_SECRET         (machine identity)
+-- FLOW 'token'               + TOKEN                 (a token you already have)
+ATTACH 'quack:<host>:<port>' AS remote (TYPE quack);   -- rides the secret
+```
+
+`CREATE OR REPLACE SECRET` re-mints - silently, off the cached refresh token, so a device flow does
+not re-prompt. Passwords and client secrets are consumed by the flow and never stored; the secret
+carries only the minted token (redacted) and the visible issuer/client/flow. `OAUTH_SCOPE` passes an
+OAuth scope through (plain `SCOPE` is the secret's own matching clause).
+
+## Planned (design/016 block A2)
+
 - TLS and `/.well-known/quack-auth` discovery on the served side, fronted by the acl extension's own
-  listener.
+  listener - after which `ISSUER` becomes optional (discovered from the door).
