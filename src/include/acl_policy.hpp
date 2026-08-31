@@ -471,7 +471,7 @@ struct PolicyStore {
 	//! thread to own and no cost on a quiet instance.
 	idx_t SessionSweep();
 	//! The sweep proper; the caller holds the lock and has read the settings before taking it.
-	idx_t SweepLocked(int64_t now, int64_t skew, int64_t idle);
+	idx_t SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp_binds);
 	//! How many sessions are live right now. Denied to a principal, like the rest of this surface.
 	idx_t SessionCount();
 	//! One live session, for the admin ops surface (spec 050) - never the handle.
@@ -489,6 +489,9 @@ struct PolicyStore {
 	//! Settings behind the two rules (spec 044): seconds a session may go unused before it is dead
 	//! (0 = never), and how many may live at once (0 = unlimited).
 	int64_t SessionIdleTimeout();
+	//! spec 059: true when acl_session_token_binding = every_use - the token exp is re-judged on every
+	//! use of a live session; false (connect, the default) binds freshness to establishment only.
+	bool SessionExpEveryUse();
 	int64_t MaxIngestRows();
 	int64_t MaxSessions();
 

@@ -77,6 +77,20 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          "acl: seconds a session may go unused before it is dead, whatever its "
 	                          "token's exp says; 0 disables the rule (spec 044)",
 	                          LogicalType::BIGINT, Value::BIGINT(900), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "acl_session_token_binding",
+	    "acl: when the token's exp is judged - 'connect' (default) gates only session establishment, "
+	    "so a session opened with a fresh token keeps working until idle/close/kill; 'every_use' "
+	    "re-judges exp on every use (spec 059)",
+	    LogicalType::VARCHAR, Value("connect"),
+	    [](ClientContext &, SetScope, Value &parameter) {
+		    auto value = StringUtil::Lower(parameter.ToString());
+		    if (value != "connect" && value != "every_use") {
+			    throw InvalidInputException("acl_session_token_binding accepts 'connect' or 'every_use', not '%s'",
+			                                parameter.ToString());
+		    }
+	    },
+	    SetScope::GLOBAL);
 	config.AddExtensionOption("acl_max_sessions",
 	                          "acl: how many sessions may live at once; at the cap a new one is refused "
 	                          "rather than an old one evicted, and 0 means unlimited (spec 044). Each "

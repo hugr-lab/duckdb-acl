@@ -6,6 +6,10 @@
 
 ## Summary
 
+> **Amended by spec 059**: the `exp` rule below now applies only under
+> `acl_session_token_binding='every_use'`; the default `'connect'` judges `exp` at session
+> establishment only, and the idle rule is the working bound on open sessions.
+
 Spec 040 left one thing open and named it plainly: nothing sweeps abandoned sessions. A record is
 erased when it is closed, and when it is next looked up past its `exp` — and never otherwise. This adds
 the three things that turn that from a note into a bound: an **idle timeout**, so a session nobody uses

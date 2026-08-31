@@ -171,7 +171,9 @@ per `DatabaseInstance`; the shared backends a cluster needs are a follow-up.
 **Spec 044 — sessions end when nobody ends them**: a door mints one per connection and quack calls
 nothing on disconnect, so two rules bound the map. A session dies at its token's `exp` *or* after
 `acl_session_idle_timeout` seconds unused (default 900; `0` disables) — `exp` bounds a credential and
-says nothing about whether anyone is still there. `acl_session_sweep()` drops every dead record and
+says nothing about whether anyone is still there. **Spec 059** relaxes the first rule by default:
+`acl_session_token_binding='connect'` (default) judges `exp` only at establishment — an open session
+works until idle/close/kill; `'every_use'` restores per-use judgment. `acl_session_sweep()` drops every dead record and
 returns how many; `SessionOpen` runs the same pass by itself, at most once a minute or whenever the map
 is at `acl_max_sessions` (default 1000; `0` unlimited). At the cap a new session is **refused**, never
 an old one evicted — making room by ending somebody's session is the worse failure. `acl_session_count()`

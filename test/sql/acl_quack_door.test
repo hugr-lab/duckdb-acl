@@ -134,6 +134,10 @@ scan_data_from_quack_client
 # 86400 once, which covered the token's exp on the day this was written and stopped covering it
 # two days later - a test that passes only while it is new is worse than one that fails.
 
+# the strict binding: this block pins the exp-per-use refusal, which is opt-in since spec 059
+statement ok
+SET GLOBAL acl_session_token_binding='every_use';
+
 statement ok
 SET GLOBAL acl_jwt_clock_skew=315360000;
 
@@ -156,6 +160,10 @@ query I
 SELECT acl_quack_authorize('conn-stale', 'SELECT 1') IS NULL;
 ----
 true
+
+
+statement ok
+SET GLOBAL acl_session_token_binding='connect';
 
 # --- quack's own surface is not a principal's ----------------------------------------------------------
 # loading an extension extends the function surface, and this gate is a denylist - so the names go in
