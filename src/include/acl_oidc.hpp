@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -103,12 +104,15 @@ struct DeviceAuthorization {
 
 DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_id, const std::string &scope = "");
 
-//! The device flow's second half: poll until granted, denied, or the deadline.
-//! Honours authorization_pending (wait `interval`) and slow_down (+5s, §3.5).
-//! `interval` of 0 polls without sleeping (tests); the poll never outlives
+//! The device flow's second half: poll until granted, denied, the deadline, or
+//! the caller's own cancellation. Honours authorization_pending (wait
+//! `interval`) and slow_down (+5s, §3.5); sleeps in one-second slices so a
+//! cancellation (a query interrupt) is honoured promptly. `interval` of 0
+//! polls without sleeping (tests); the poll never outlives
 //! `deadline_epoch_seconds`.
 TokenSet DevicePoll(const Endpoints &ep, const std::string &client_id, const std::string &device_code,
-                    int64_t interval_seconds, int64_t deadline_epoch_seconds);
+                    int64_t interval_seconds, int64_t deadline_epoch_seconds,
+                    const std::function<bool()> &cancelled = nullptr);
 
 //! The cache: keyed by an owner pointer (a DatabaseInstance, a provider, ...)
 //! plus a caller-chosen key; a token is served only while it has more than

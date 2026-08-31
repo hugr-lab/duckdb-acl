@@ -187,6 +187,10 @@ int main() {
 		Check(idp.device_polls_seen >= 3, "at least two pendings were actually answered before the grant");
 		auto denied = DevicePoll(ep, "cli", "dc-bogus", 0, deadline);
 		Check(!denied.Ok() && denied.error_code == "access_denied", "an unknown device code is refused");
+		idp.pending_polls = 1000; // never granted - only the cancellation can end this poll
+		auto cancelled = DevicePoll(ep, "cli", begun.device_code, 0, deadline, [] { return true; });
+		Check(!cancelled.Ok() && cancelled.error_code == "cancelled",
+		      "a cancellation ends the poll before the deadline");
 	});
 
 	Scenario("the cache serves only tokens with margin left", [&] {

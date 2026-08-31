@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "acl_extension.hpp"
+#include "acl_oidc_secret.hpp"
 
 #ifdef ACL_FLIGHT_ENABLED
 #include "acl_flight_door.hpp"
@@ -150,6 +151,7 @@ void LoadInternal(ExtensionLoader &loader) {
 
 	// one policy store per database instance, shared by the parser override and the admin functions
 	auto store = make_shared_ptr<acl::PolicyStore>();
+	acl::RegisterQuackOidcProvider(loader); // spec 061: CREATE SECRET (TYPE quack, PROVIDER oidc, ...)
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
 #ifdef ACL_FLIGHT_ENABLED
