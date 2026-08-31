@@ -319,7 +319,7 @@ bool JwksHasKid(const string &keys_json, const string &kid) {
 	return false;
 }
 
-JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clock_skew_seconds) {
+JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clock_skew_seconds, bool ignore_exp) {
 	ParsedJwt jwt;
 	if (!SplitJwt(token, jwt)) {
 		Reject("not a JWT");
@@ -355,7 +355,7 @@ JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clo
 		Reject("missing exp claim");
 	}
 	auto expires_at = duckdb_yyjson::yyjson_get_sint(exp);
-	if (expires_at + clock_skew_seconds < now) {
+	if (!ignore_exp && expires_at + clock_skew_seconds < now) {
 		Reject("token expired");
 	}
 	auto nbf = duckdb_yyjson::yyjson_obj_get(payload.Root(), "nbf");

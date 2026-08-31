@@ -504,13 +504,13 @@ bool PolicyStore::SessionHandleFor(const string &external_id, string &handle) {
 	return true;
 }
 
-bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal &out) {
+bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal &out, bool ignore_exp) {
 	if (is_token) {
 		string issuer;
 		if (LooksLikeJwt(value, issuer)) {
 			// the real path (spec 007): signature + claims against the issuer registry; throws on
 			// failure, so a bad JWT can never fall back to the dev stub below
-			VerifyJwtPrincipal(value, issuer, out);
+			VerifyJwtPrincipal(value, issuer, out, ignore_exp);
 		} else {
 			lock_guard<mutex> guard(lock);
 			auto entry = tokens.find(value); // dev stub for non-JWT tokens
@@ -534,7 +534,7 @@ bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal 
 	return true;
 }
 
-void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out) {
+void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out, bool ignore_exp) {
 	IssuerConfig config;
 	if (!LookupIssuer(issuer, config)) {
 		throw BinderException("acl_rewrite: token rejected: unknown issuer \"%s\"", issuer);
@@ -542,7 +542,7 @@ void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, 
 	// the keys may come from a document rather than the row (spec 023); the token's kid decides
 	// whether a cached one is still enough
 	config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
-	auto verified = VerifyJwt(token, config, JwtClockSkew());
+	auto verified = VerifyJwt(token, config, JwtClockSkew(), ignore_exp);
 	if (verified.raw_roles.empty() && verified.groups_overage) {
 		throw BinderException("acl_rewrite: token rejected: groups overage - the groups claim was replaced "
 		                      "by a Graph link; resolve groups at the gateway and use the ROLE form");

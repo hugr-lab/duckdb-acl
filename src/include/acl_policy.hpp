@@ -435,7 +435,7 @@ struct PolicyStore {
 	//! Verify a principal offline. A JWT-shaped token goes through real signature verification against
 	//! the issuer registry (spec 007, throws with a specific reason on failure); a non-JWT token is a
 	//! dev-stub lookup in the in-memory map; the ROLE form trusts the gateway.
-	bool VerifyPrincipal(bool is_token, const string &value, Principal &out);
+	bool VerifyPrincipal(bool is_token, const string &value, Principal &out, bool ignore_exp = false);
 	//! Verify a token and mint an opaque handle for it (spec 040). Empty when the token does not
 	//! verify: a door refuses rather than learning why, and the reason belongs to whoever verified.
 	string SessionOpen(const string &token);
@@ -547,7 +547,7 @@ private:
 
 	//! The real JWT path of VerifyPrincipal (spec 007): issuer lookup -> acl_token verification ->
 	//! role mapping -> claims; throws on any failure. Defined in acl_policy.cpp.
-	void VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out);
+	void VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out, bool ignore_exp = false);
 	bool LookupIssuer(const string &issuer, IssuerConfig &out);
 	//! spec 023: the keys to verify with. An issuer that names a JWKS URI has them read through
 	//! duckdb's filesystem and cached per instance; one that pastes a JWKS keeps using it. `kid` is

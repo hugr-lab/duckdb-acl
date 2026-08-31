@@ -359,5 +359,41 @@ true
 statement ok
 SET GLOBAL acl_session_token_binding='connect';
 
+# ...and under 'connect' too: establishment is always gated, the binding never weakens the open
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NULL;
+----
+true
+
+# a session-scoped value would validate, display, and be ignored by the judgment - refused instead
+statement error
+SET acl_session_token_binding='every_use';
+----
+<REGEX>:.*is global.*
+
+# under 'connect' the idle rule is the only automatic reaper - disabling it is refused...
+statement error
+SET GLOBAL acl_session_idle_timeout=0;
+----
+<REGEX>:.*no automatic session reaper.*
+
+# ...and so is entering 'connect' while it is already disabled
+statement ok
+SET GLOBAL acl_session_token_binding='every_use';
+
+statement ok
+SET GLOBAL acl_session_idle_timeout=0;
+
+statement error
+SET GLOBAL acl_session_token_binding='connect';
+----
+<REGEX>:.*needs a live idle reaper.*
+
+statement ok
+SET GLOBAL acl_session_idle_timeout=900;
+
+statement ok
+SET GLOBAL acl_session_token_binding='connect';
+
 statement ok
 SET GLOBAL acl_jwt_clock_skew=60;

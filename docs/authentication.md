@@ -35,5 +35,9 @@ an unauthenticated discovery surface so clients need no IdP configuration of the
   ends their open session at the next statement. Choose it when revocation latency matters more than
   short-token ergonomics.
 
-An expired token can never *open* a session under either setting. The value is validated at
-`SET GLOBAL`; an unrecognised value stored by other means hardens to `every_use`.
+An expired token can never *open* a session under either setting - on the Flight door a stale
+bearer continues its own established session (its signature and issuer still verify on every call;
+only staleness is forgiven) and can never start a new one. Because idle is the only automatic
+reaper under `connect`, disabling it (`acl_session_idle_timeout=0`) and `connect` refuse each
+other at `SET`. The setting is GLOBAL-only and validated where set; an unrecognised value stored by
+other means hardens to `every_use`, and a deployment without a policy catalog stays at `every_use`.

@@ -73,21 +73,51 @@ void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("acl_jwks_refresh_interval",
 	                          "acl: seconds a fetched JWKS is used before it is read again (spec 023)",
 	                          LogicalType::BIGINT, Value::BIGINT(300), nullptr, SetScope::GLOBAL);
-	config.AddExtensionOption("acl_session_idle_timeout",
-	                          "acl: seconds a session may go unused before it is dead, whatever its "
-	                          "token's exp says; 0 disables the rule (spec 044)",
-	                          LogicalType::BIGINT, Value::BIGINT(900), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "acl_session_idle_timeout",
+	    "acl: seconds a session may go unused before it is dead, whatever its "
+	    "token's exp says; 0 disables the rule (spec 044) - refused while "
+	    "acl_session_token_binding='connect', where idle is the only automatic reaper (spec 059)",
+	    LogicalType::BIGINT, Value::BIGINT(900),
+	    [](ClientContext &context, SetScope, Value &parameter) {
+		    if (!parameter.IsNull() && parameter.GetValue<int64_t>() == 0) {
+			    Value binding;
+			    auto have = context.TryGetCurrentSetting("acl_session_token_binding", binding);
+			    auto value = have && !binding.IsNull() ? StringUtil::Lower(binding.ToString()) : string("connect");
+			    if (value == "connect") {
+				    throw InvalidInputException(
+				        "acl_session_idle_timeout=0 would leave no automatic session reaper under "
+				        "acl_session_token_binding='connect' - set the binding to 'every_use' first (spec 059)");
+			    }
+		    }
+	    },
+	    SetScope::GLOBAL);
 	config.AddExtensionOption(
 	    "acl_session_token_binding",
 	    "acl: when the token's exp is judged - 'connect' (default) gates only session establishment, "
 	    "so a session opened with a fresh token keeps working until idle/close/kill; 'every_use' "
 	    "re-judges exp on every use (spec 059)",
 	    LogicalType::VARCHAR, Value("connect"),
-	    [](ClientContext &, SetScope, Value &parameter) {
+	    [](ClientContext &context, SetScope scope, Value &parameter) {
+		    if (scope != SetScope::GLOBAL) {
+			    // a session-scoped value would validate, show in current_setting() and be ignored by
+			    // the judgment, which reads the global - refuse the false comfort outright
+			    throw InvalidInputException("acl_session_token_binding is global - use SET GLOBAL");
+		    }
 		    auto value = StringUtil::Lower(parameter.ToString());
 		    if (value != "connect" && value != "every_use") {
 			    throw InvalidInputException("acl_session_token_binding accepts 'connect' or 'every_use', not '%s'",
 			                                parameter.ToString());
+		    }
+		    if (value == "connect") {
+			    // under 'connect' the idle rule is the ONLY automatic reaper; with it disabled every
+			    // abandoned session would pin acl_max_sessions forever (spec 059)
+			    Value idle;
+			    if (context.TryGetCurrentSetting("acl_session_idle_timeout", idle) && !idle.IsNull() &&
+			        idle.GetValue<int64_t>() == 0) {
+				    throw InvalidInputException("acl_session_token_binding='connect' needs a live idle reaper: "
+				                                "set acl_session_idle_timeout > 0 first (it is currently 0/disabled)");
+			    }
 		    }
 	    },
 	    SetScope::GLOBAL);

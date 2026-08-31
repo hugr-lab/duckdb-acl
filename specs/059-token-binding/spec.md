@@ -37,6 +37,26 @@ no security (the token was still valid at every judgment) and broke every short-
   under either binding. An expired token opens nothing; `connect` only stops re-judging a credential
   that was already accepted.
 - The setting is read before the store lock (the SweepLocked discipline) and passed into the sweep.
+- **The Flight door's per-call re-verification honours the binding** (the review's chief finding:
+  without this, spec 050's F9 - the token is the authority of every call - silently overrode the
+  binding, and the flagship scenario failed exactly on the door that serves DBeaver). Under
+  `connect`, `SessionFor`'s and `CloseSession`'s re-verification of an EXISTING session's bearer
+  runs with `ignore_exp`: the expiry comparison alone is skipped - signature, issuer, audience,
+  `nbf`, the exp claim's presence and the roles still verify, and the fingerprint match against the
+  bound session still gates. The token remains the cryptographic proof of identity on every call;
+  only its staleness is forgiven, and only for a live same-principal session. `SessionOpen` never
+  sets `ignore_exp`, so a stale token can continue a session and never start one.
+- **Memory mode keeps the strict rule.** Without a policy catalog the store cannot read the setting,
+  so it stays at `every_use` - pre-059-compatible and the stricter mode - rather than silently
+  ignoring an operator's choice. (Both doors refuse to serve without a catalog anyway.)
+- **The reaper-less combination is refused at SET**: under `connect` the idle rule is the only
+  automatic reaper, so `acl_session_idle_timeout=0` is refused while the binding is `connect`, and
+  entering `connect` is refused while idle is 0 - otherwise every abandoned session would pin
+  `acl_max_sessions` forever. And the binding is GLOBAL-only: a session-scoped SET would validate,
+  display, and be ignored by the judgment, so it is refused outright.
+- Ops note: `acl_sessions()` reports `expires_at` raw; under `connect` a session may legitimately
+  outlive it - compare against the clock to see which sessions run on a stale credential, and
+  `acl_session_kill` ends any of them.
 
 ## Enforcement & security
 
@@ -52,6 +72,11 @@ no security (the token was still valid at every judgment) and broke every short-
   drops rather than rises.
 
 ## Testing
+
+`test/e2e/flight/run.sh` proves the flagship scenario end to end through the real door: a cookie
+session established with a fresh bearer keeps answering after the server's skew flip makes that
+bearer look long-expired (connect), a fresh open under the same skew is refused in both modes, and
+flipping to `every_use` refuses the very same call.
 
 `test/sql/acl_session.test`: with a hugely negative `acl_jwt_clock_skew` making every exp look
 past-due to the judgment (no sleeps), the default binding keeps an open session answering

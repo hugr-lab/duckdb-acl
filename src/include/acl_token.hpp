@@ -37,7 +37,11 @@ bool JwksHasKid(const string &keys_json, const string &kid);
 //! Full verification: signature (per the issuer's alg/keys), exp/nbf with skew, audience, role and
 //! claim extraction. Throws BinderException with a specific reason on any failure (the gateway is
 //! trusted to see diagnostics); a denial must throw anyway (FALLBACK would silently re-parse).
-JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clock_skew_seconds);
+//! ignore_exp (spec 059, 'connect' binding): skip only the expiry comparison - the claim must still
+//! be present, and signature/issuer/audience/nbf are always enforced. Used exclusively to
+//! re-verify the bearer of an ALREADY OPEN session; establishment never sets it.
+JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clock_skew_seconds,
+                    bool ignore_exp = false);
 
 } // namespace acl
 } // namespace duckdb
