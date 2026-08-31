@@ -188,7 +188,10 @@ token)` installs both and starts the listener, refusing an instance a client cou
 (anonymous admin on, override not `STRICT`, no server token, quack not loaded);
 `acl_quack_stop(uri)` closes the door and sweeps the sessions it served. quack's own fourteen functions
 are on the denylist — the gate is a denylist, so a loaded extension widens the surface until named.
-quack listens in the clear: a served deployment sits behind a reverse proxy. Streamed ingest
+**Spec 062** fronts the door: the public bind belongs to our front listener (the real quack moves
+to loopback), `acl_quack_serve(uri, token[, cert, key])` terminates TLS there, and
+`GET /.well-known/quack-auth` serves the node's issuers live - so `ISSUER` in a provider secret
+(spec 061) is optional when its SCOPE names the door. Streamed ingest
 (`SEND_DATA`) is generated **unprefixed** by the server; spec 042 recovers the principal from the
 stream id the statement itself carries and enforces the write as that principal's — the refusal
 remains only where recovery fails. Staging on quack is a **granted schema** (spec 056): a client's

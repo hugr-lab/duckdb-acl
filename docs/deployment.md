@@ -14,8 +14,10 @@ SELECT acl_quack_serve('quack:localhost:31700', server_token); -- quack door (cl
 - The Flight door speaks the protocol ADBC and JDBC drivers use; TLS is native (`grpc+tls`,
   cert/key inline-PEM or read through duckdb's filesystem). The one-arg form deliberately binds
   cleartext-localhost only.
-- The quack door listens in the clear today and belongs behind a TLS-terminating reverse proxy;
-  native TLS + an auth-discovery endpoint on this door are planned (design/016 block A2).
+- The quack door is fronted (spec 062): `acl_quack_serve(uri, token[, cert, key])` serves TLS
+  natively (the real quack listens loopback-only behind the front), and the front answers
+  `GET /.well-known/quack-auth` - the issuers the node trusts, live from the policy - so clients
+  can discover where to authenticate from the door address alone.
 - Sessions: each held session is a duckdb connection; `acl_max_sessions` (default 1000) bounds them,
   `acl_session_idle_timeout` (default 900s) reaps abandoned ones, `acl_sessions()` /
   `acl_session_kill(id)` are the ops surface.

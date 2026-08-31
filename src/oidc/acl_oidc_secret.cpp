@@ -59,23 +59,51 @@ int64_t NowSeconds() {
 	    .count();
 }
 
-//! The refresh-chain cache key: everything that shapes the credential, the OAuth scope included -
-//! a refresh request carries no scope (RFC 6749 §6) and answers with the ORIGINAL grant's, so two
-//! configs differing only in OAUTH_SCOPE must never share a chain (the review's finding).
-string CacheKey(const CreateSecretInput &input, const string &flow) {
-	return Param(input, "issuer") + "|" + Param(input, "client_id") + "|" + flow + "|" + Param(input, "username") +
-	       "|" + Param(input, "oauth_scope");
-}
-
 //! Run the configured flow and return the token set; every refusal is the
 //! protocol's own, surfaced verbatim — never a silent fallback to another flow.
-oidc::TokenSet Acquire(ClientContext &context, const CreateSecretInput &input, const string &flow) {
+oidc::TokenSet Acquire(ClientContext &context, const CreateSecretInput &input, const string &flow,
+                       string &resolved_issuer) {
 	if (flow == "token") {
 		oidc::TokenSet out;
 		out.access_token = Require(input, "token", "token");
 		return out;
 	}
-	auto issuer = Require(input, "issuer", flow.c_str());
+	auto issuer = Param(input, "issuer");
+	if (issuer.empty()) {
+		// spec 062: the door advertises its issuers on /.well-known/quack-auth, so ISSUER may be
+		// omitted when the secret's SCOPE names a concrete door - the scheme mirrors quack's own
+		// client rule (loopback speaks http, anything else https, i.e. the TLS front)
+		string endpoint;
+		for (auto &scope : input.scope) {
+			if (scope.rfind("quack:", 0) == 0 && scope.size() > 6) {
+				endpoint = scope.substr(6);
+				while (!endpoint.empty() && endpoint.front() == '/') {
+					endpoint.erase(endpoint.begin());
+				}
+				break;
+			}
+		}
+		if (endpoint.empty()) {
+			throw InvalidInputException(
+			    "acl oidc secret: name ISSUER, or give SCOPE a concrete door ('quack:host:port') to discover it");
+		}
+		auto host = endpoint.substr(0, endpoint.find(':'));
+		bool local = host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
+		auto discovered = oidc::FetchQuackAuth((local ? "http://" : "https://") + endpoint);
+		if (!discovered.Ok()) {
+			throw InvalidInputException("acl oidc secret: door discovery at \"%s\" failed: %s", endpoint,
+			                            discovered.error);
+		}
+		if (discovered.issuers.empty()) {
+			throw InvalidInputException("acl oidc secret: the door advertises no issuers - name ISSUER explicitly");
+		}
+		if (discovered.issuers.size() > 1) {
+			throw InvalidInputException("acl oidc secret: the door advertises %d issuers - name ISSUER explicitly",
+			                            int(discovered.issuers.size()));
+		}
+		issuer = discovered.issuers.front();
+	}
+	resolved_issuer = issuer;
 	auto client_id = Require(input, "client_id", flow.c_str());
 	auto client_secret = Param(input, "client_secret");
 	auto oauth_scope = Param(input, "oauth_scope");
@@ -85,7 +113,8 @@ oidc::TokenSet Acquire(ClientContext &context, const CreateSecretInput &input, c
 	}
 	// the cache is consulted for a refresh token ONLY (see the header comment); the key carries
 	// everything that shapes the credential, so a collision can at worst serve the same one
-	auto cache_key = CacheKey(input, flow);
+	auto cache_key = issuer + "|" + Param(input, "client_id") + "|" + flow + "|" + Param(input, "username") + "|" +
+	                 Param(input, "oauth_scope");
 	auto cached = oidc::TokenCache::Instance().Get(nullptr, cache_key, /*margin*/ 0);
 	if (!cached.refresh_token.empty()) {
 		auto renewed = oidc::RefreshGrant(endpoints, client_id, client_secret, cached.refresh_token);
@@ -137,7 +166,8 @@ unique_ptr<BaseSecret> CreateQuackOidcSecret(ClientContext &context, CreateSecre
 		throw InvalidInputException(
 		    "acl oidc secret: name a FLOW ('token', 'client_credentials', 'password' or 'device')");
 	}
-	auto minted = Acquire(context, input, flow);
+	string resolved_issuer;
+	auto minted = Acquire(context, input, flow, resolved_issuer);
 	if (!minted.Ok()) {
 		throw InvalidInputException("acl oidc secret: the %s flow was refused: %s", flow, minted.error);
 	}
@@ -148,7 +178,9 @@ unique_ptr<BaseSecret> CreateQuackOidcSecret(ClientContext &context, CreateSecre
 		// invalidated where the refresh fails with invalid_grant.
 		oidc::TokenSet chain;
 		chain.refresh_token = minted.refresh_token;
-		oidc::TokenCache::Instance().Set(nullptr, CacheKey(input, flow), std::move(chain));
+		auto chain_key = resolved_issuer + "|" + Param(input, "client_id") + "|" + flow + "|" +
+		                 Param(input, "username") + "|" + Param(input, "oauth_scope");
+		oidc::TokenCache::Instance().Set(nullptr, chain_key, std::move(chain));
 	}
 	auto scope = input.scope;
 	if (scope.empty()) {
@@ -158,7 +190,10 @@ unique_ptr<BaseSecret> CreateQuackOidcSecret(ClientContext &context, CreateSecre
 	secret->secret_map["token"] = Value(minted.access_token); // the field quack's client reads
 	// visible configuration, so duckdb_secrets() tells an operator what minted this token; the raw
 	// credentials (password, client_secret) were consumed by the flow and are NOT stored
-	for (const char *keep : {"issuer", "client_id", "flow", "username"}) {
+	if (!resolved_issuer.empty()) {
+		secret->secret_map["issuer"] = Value(resolved_issuer); // the resolved one, discovery included
+	}
+	for (const char *keep : {"client_id", "flow", "username"}) {
 		auto value = Param(input, keep);
 		if (!value.empty()) {
 			secret->secret_map[keep] = Value(value);

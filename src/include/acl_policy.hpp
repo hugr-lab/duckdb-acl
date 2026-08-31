@@ -470,6 +470,8 @@ struct PolicyStore {
 	//! SessionOpen - the operation that grows the map is the one that pays to clean it, so there is no
 	//! thread to own and no cost on a quiet instance.
 	idx_t SessionSweep();
+	//! Every issuer the policy names, for the doors' discovery documents (spec 062).
+	vector<string> ListIssuers();
 	//! The sweep proper; the caller holds the lock and has read the settings before taking it.
 	idx_t SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp_binds);
 	//! How many sessions are live right now. Denied to a principal, like the rest of this surface.
@@ -567,6 +569,7 @@ private:
 	bool CatalogFunctionGate(const Principal &principal, const QualifiedName &name, bool &allowed);
 	void CatalogLoadRoleClaims(Principal &principal);
 	bool CatalogLookupIssuer(const string &issuer, IssuerConfig &out);
+	void CatalogListIssuers(vector<string> &out);
 	//! (external_value -> mapped roles) for the given values; also flags which candidates exist as roles
 	void CatalogMapExternalRoles(const string &issuer, const vector<string> &values,
 	                             case_insensitive_map_t<vector<string>> &mapped, case_insensitive_set_t &known_roles);

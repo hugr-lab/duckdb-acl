@@ -47,7 +47,16 @@ Worth knowing:
 - The `CREATE SECRET` statement itself carries the password/client secret as ordinary SQL text -
   run it locally, never through a gateway or shell that logs statements.
 
-## Planned (design/016 block A2)
+## Discovery: ISSUER is optional (spec 062)
 
-- TLS and `/.well-known/quack-auth` discovery on the served side, fronted by the acl extension's own
-  listener - after which `ISSUER` becomes optional (discovered from the door).
+A served door advertises the issuers the node trusts on `GET /.well-known/quack-auth`, so a secret
+whose `SCOPE` names a concrete door needs no IdP configuration at all:
+
+```sql
+CREATE SECRET kc (TYPE quack, PROVIDER oidc, SCOPE 'quack:<host>:<port>',
+                  CLIENT_ID 'acl-cli', FLOW 'device');   -- ISSUER discovered from the door
+```
+
+A door advertising several issuers refuses the omission by count - name `ISSUER` then. The door
+itself serves TLS when given a cert/key (`acl_quack_serve(uri, token, cert, key)`); a remote quack
+client speaks https by default, a loopback one stays plain.

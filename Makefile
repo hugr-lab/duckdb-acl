@@ -84,6 +84,10 @@ build/test/test_acl_catalog_rpc: TEST_CPP_EXTRA := src/acl_catalog_rpc.cpp
 build/test/test_acl_oidc: src/oidc/acl_oidc.cpp src/include/acl_oidc.hpp
 build/test/test_acl_oidc: TEST_CPP_EXTRA := src/oidc/acl_oidc.cpp duckdb/third_party/yyjson/yyjson.cpp
 
+# the front test drives discovery through the core's HttpGet (spec 062)
+build/test/test_acl_quack_front: src/oidc/acl_oidc.cpp src/include/acl_oidc.hpp
+build/test/test_acl_quack_front: TEST_CPP_EXTRA := src/oidc/acl_oidc.cpp duckdb/third_party/yyjson/yyjson.cpp
+
 build/test/%: test/cpp/%.cpp test/cpp/acl_test_util.hpp $(TEST_CPP_DUCKDB_LIB)
 	@mkdir -p build/test
 	$(CXX) $(TEST_CPP_FLAGS) $(TEST_CPP_INCLUDES) $< $(TEST_CPP_EXTRA) $(TEST_CPP_LINK) -o $@

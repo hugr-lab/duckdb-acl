@@ -1818,6 +1818,19 @@ struct CatalogBackend {
 		return fallback;
 	}
 
+	//! Every issuer the policy names - the discovery document's content (spec 062). Function-driver
+	//! mode has no issuers table to enumerate, so discovery is empty there rather than guessed.
+	void ListIssuers(vector<string> &out) {
+		if (function_mode) {
+			return;
+		}
+		EnsureFresh();
+		auto result = Query("SELECT \"issuer\" FROM " + Tbl("issuers") + " ORDER BY 1");
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			out.push_back(result->GetValue(0, row).ToString());
+		}
+	}
+
 	bool LookupIssuer(const string &issuer, IssuerConfig &out) {
 		EnsureFresh();
 		{
@@ -2508,6 +2521,10 @@ void PolicyStore::CatalogLoadRoleClaims(Principal &principal) {
 
 bool PolicyStore::CatalogLookupIssuer(const string &issuer, IssuerConfig &out) {
 	return catalog->LookupIssuer(issuer, out);
+}
+
+void PolicyStore::CatalogListIssuers(vector<string> &out) {
+	catalog->ListIssuers(out);
 }
 
 void PolicyStore::CatalogMapExternalRoles(const string &issuer, const vector<string> &values,
