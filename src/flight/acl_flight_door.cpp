@@ -1352,9 +1352,14 @@ private:
 		return raw && !static_cast<CookieMiddleware *>(raw)->fresh;
 	}
 	//! Verify a token without opening a session and without learning why a bad one is bad.
-	bool VerifyQuietly(const string &token, Principal &out) {
+	//! ignore_exp: spec 059's 'connect' binding - re-verifying the bearer of an EXISTING session
+	//! tolerates a past exp (the session was established with a fresh one); signature, issuer,
+	//! audience, nbf and roles are still enforced, so the token remains the cryptographic proof of
+	//! identity F9 asks for - only its staleness is forgiven, and only against a live session of the
+	//! same fingerprint. Establishment (SessionOpen) never ignores exp, under either binding.
+	bool VerifyQuietly(const string &token, Principal &out, bool ignore_exp = false) {
 		try {
-			return state->store->VerifyPrincipal(true, token, out);
+			return state->store->VerifyPrincipal(true, token, out, ignore_exp);
 		} catch (std::exception &) {
 			return false;
 		}
@@ -1378,7 +1383,9 @@ private:
 			string handle;
 			if (state->store->SessionHandleFor(cookie, handle)) {
 				Principal caller;
-				if (!VerifyQuietly(token, caller)) {
+				// under 'connect' the existing session's bearer may be stale; everything else about
+				// it must still verify, and the fingerprint match below still gates (spec 059)
+				if (!VerifyQuietly(token, caller, !state->store->SessionExpEveryUse())) {
 					return arrow::Status::UnknownError("acl: authentication failed");
 				}
 				Principal current;
@@ -1415,7 +1422,8 @@ private:
 				if (state->store->SessionHandleFor(cookie, handle)) {
 					Principal current, caller;
 					string reason;
-					if (state->store->SessionPrincipal(handle, current, reason) && VerifyQuietly(token, caller) &&
+					if (state->store->SessionPrincipal(handle, current, reason) &&
+					    VerifyQuietly(token, caller, !state->store->SessionExpEveryUse()) &&
 					    PrincipalFingerprint(caller) == PrincipalFingerprint(current)) {
 						state->store->SessionClose(handle); // also drops the cookie binding
 						state->DropConn(handle);

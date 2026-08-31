@@ -255,12 +255,13 @@ string PolicyStore::SessionOpen(const string &token) {
 	auto cap = MaxSessions();
 	auto skew = JwtClockSkew();
 	auto idle_timeout = SessionIdleTimeout();
+	auto exp_binds = SessionExpEveryUse();
 	auto handle = MintHandle();
 	lock_guard<mutex> guard(lock);
 	// Sweep before making room rather than after running out: at most once a minute on a quiet door,
 	// and always when the map is at its cap, so the cost lands on arrivals and never on a reader.
 	if (now - last_sweep >= SWEEP_INTERVAL_SECONDS || (cap > 0 && sessions.size() >= static_cast<idx_t>(cap))) {
-		SweepLocked(now, skew, idle_timeout);
+		SweepLocked(now, skew, idle_timeout, exp_binds);
 	}
 	if (cap > 0 && sessions.size() >= static_cast<idx_t>(cap)) {
 		// Refusing rather than evicting: making room by ending somebody else's session would let an
@@ -277,13 +278,14 @@ bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string 
 	auto now = NowSeconds();
 	auto skew = JwtClockSkew();
 	auto idle = SessionIdleTimeout();
+	auto exp_binds = SessionExpEveryUse();
 	lock_guard<mutex> guard(lock);
 	auto entry = sessions.find(handle);
 	if (entry == sessions.end()) {
 		reason = "unknown";
 		return false;
 	}
-	if (entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
+	if (exp_binds && entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
 		sessions.erase(entry); // it can never come back, so do not keep it around
 		reason = "expired";
 		return false;
@@ -305,12 +307,13 @@ bool PolicyStore::SessionAlive(const string &handle) {
 	auto now = NowSeconds();
 	auto skew = JwtClockSkew();
 	auto idle = SessionIdleTimeout();
+	auto exp_binds = SessionExpEveryUse();
 	lock_guard<mutex> guard(lock);
 	auto entry = sessions.find(handle);
 	if (entry == sessions.end()) {
 		return false;
 	}
-	if (entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
+	if (exp_binds && entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
 		return false;
 	}
 	if (idle > 0 && entry->second.last_used + idle < now) {
@@ -325,12 +328,13 @@ string PolicyStore::SessionReason(const string &handle) {
 	auto now = NowSeconds();
 	auto skew = JwtClockSkew();
 	auto idle = SessionIdleTimeout();
+	auto exp_binds = SessionExpEveryUse();
 	lock_guard<mutex> guard(lock);
 	auto entry = sessions.find(handle);
 	if (entry == sessions.end()) {
 		return "unknown";
 	}
-	if (entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
+	if (exp_binds && entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
 		return "expired";
 	}
 	if (idle > 0 && entry->second.last_used + idle < now) {
@@ -343,10 +347,10 @@ string PolicyStore::SessionReason(const string &handle) {
 //! through the catalog to the DatabaseInstance; it executes no SQL today, but the parser override takes
 //! this same lock on every unprefixed statement (spec 043), so anything that did would deadlock on a
 //! non-recursive mutex. Passing them in removes the possibility rather than relying on it.
-idx_t PolicyStore::SweepLocked(int64_t now, int64_t skew, int64_t idle) {
+idx_t PolicyStore::SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp_binds) {
 	idx_t removed = 0;
 	for (auto entry = sessions.begin(); entry != sessions.end();) {
-		bool expired = entry->second.expires_at > 0 && entry->second.expires_at + skew < now;
+		bool expired = exp_binds && entry->second.expires_at > 0 && entry->second.expires_at + skew < now;
 		// No `last_used > 0` guard: a session without a timestamp is a bug, and letting one live forever
 		// is the wrong way to be wrong about it. Every session gets its stamp at SessionOpen.
 		bool stale = idle > 0 && entry->second.last_used + idle < now;
@@ -371,8 +375,9 @@ idx_t PolicyStore::SessionSweep() {
 	auto now = NowSeconds();
 	auto skew = JwtClockSkew();
 	auto idle = SessionIdleTimeout();
+	auto exp_binds = SessionExpEveryUse();
 	lock_guard<mutex> guard(lock);
-	return SweepLocked(now, skew, idle);
+	return SweepLocked(now, skew, idle, exp_binds);
 }
 
 idx_t PolicyStore::SessionCount() {
@@ -382,10 +387,11 @@ idx_t PolicyStore::SessionCount() {
 	auto now = NowSeconds();
 	auto skew = JwtClockSkew();
 	auto idle = SessionIdleTimeout();
+	auto exp_binds = SessionExpEveryUse();
 	lock_guard<mutex> guard(lock);
 	idx_t live = 0;
 	for (auto &entry : sessions) {
-		bool expired = entry.second.expires_at > 0 && entry.second.expires_at + skew < now;
+		bool expired = exp_binds && entry.second.expires_at > 0 && entry.second.expires_at + skew < now;
 		bool stale = idle > 0 && entry.second.last_used + idle < now;
 		if (!expired && !stale) {
 			live++;
@@ -434,12 +440,13 @@ string PolicyStore::SessionSql(const string &handle, const string &sql) {
 	auto now = NowSeconds();
 	auto skew = JwtClockSkew();
 	auto idle = SessionIdleTimeout();
+	auto exp_binds = SessionExpEveryUse();
 	lock_guard<mutex> guard(lock);
 	auto entry = sessions.find(handle);
 	if (entry == sessions.end()) {
 		return string();
 	}
-	if (entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
+	if (exp_binds && entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
 		return string();
 	}
 	if (idle > 0 && entry->second.last_used + idle < now) {
@@ -497,13 +504,13 @@ bool PolicyStore::SessionHandleFor(const string &external_id, string &handle) {
 	return true;
 }
 
-bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal &out) {
+bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal &out, bool ignore_exp) {
 	if (is_token) {
 		string issuer;
 		if (LooksLikeJwt(value, issuer)) {
 			// the real path (spec 007): signature + claims against the issuer registry; throws on
 			// failure, so a bad JWT can never fall back to the dev stub below
-			VerifyJwtPrincipal(value, issuer, out);
+			VerifyJwtPrincipal(value, issuer, out, ignore_exp);
 		} else {
 			lock_guard<mutex> guard(lock);
 			auto entry = tokens.find(value); // dev stub for non-JWT tokens
@@ -527,7 +534,7 @@ bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal 
 	return true;
 }
 
-void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out) {
+void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out, bool ignore_exp) {
 	IssuerConfig config;
 	if (!LookupIssuer(issuer, config)) {
 		throw BinderException("acl_rewrite: token rejected: unknown issuer \"%s\"", issuer);
@@ -535,7 +542,7 @@ void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, 
 	// the keys may come from a document rather than the row (spec 023); the token's kid decides
 	// whether a cached one is still enough
 	config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
-	auto verified = VerifyJwt(token, config, JwtClockSkew());
+	auto verified = VerifyJwt(token, config, JwtClockSkew(), ignore_exp);
 	if (verified.raw_roles.empty() && verified.groups_overage) {
 		throw BinderException("acl_rewrite: token rejected: groups overage - the groups claim was replaced "
 		                      "by a Graph link; resolve groups at the gateway and use the ROLE form");

@@ -264,6 +264,35 @@ done
 [ -n "$counted" ] || fail "the server did not answer the cookie session count"
 grep -q "cookielive=1" "$TMP/server.log" || fail "a cookie connection did not reuse ONE session: $(grep cookielive= "$TMP/server.log")"
 
+# --- a session outlives its token's exp under the default binding (spec 059) ----------------------
+# The cookie session below is established while the token is fresh; then the server's clock skew goes
+# hugely negative, which makes the same bearer look long-expired to every later re-verification. Under
+# acl_session_token_binding='connect' (the default) the established session keeps answering - the
+# stale bearer still proves identity (signature/issuer/audience), only its staleness is forgiven;
+# under 'every_use' the very same call is refused. Establishment never forgives: a fresh open under
+# the skewed clock is refused in both modes.
+BJ="$TMP/bindjar"
+ACL_COOKIE_JAR="$BJ" ask "SELECT 1" >/dev/null          # prime: mint the cookie
+ACL_COOKIE_JAR="$BJ" ask "SELECT 1" >/dev/null          # bind: the session is established, token fresh
+echo "SET GLOBAL acl_jwt_clock_skew=-9999999999; SELECT 'skewflip' AS s;" >&3
+flipped=""
+for _ in $(seq 1 40); do grep -q "skewflip" "$TMP/server.log" && { flipped=1; break; }; sleep 0.25; done
+[ -n "$flipped" ] || fail "the server did not apply the skew flip"
+got="$(ACL_COOKIE_JAR="$BJ" ask "SELECT 1 AS alive")"
+echo "$got" | grep -q "'alive': \[1\]" || fail "connect binding: the established session died at token exp: $got"
+got="$(ACL_COOKIE_JAR="$TMP/freshjar" ask "SELECT 1")"
+echo "$got" | grep -qi "authentication failed" || fail "a stale token opened a NEW session under connect: $got"
+echo "SET GLOBAL acl_session_token_binding='every_use'; SELECT 'strictflip' AS s;" >&3
+flipped=""
+for _ in $(seq 1 40); do grep -q "strictflip" "$TMP/server.log" && { flipped=1; break; }; sleep 0.25; done
+[ -n "$flipped" ] || fail "the server did not apply the strict binding"
+got="$(ACL_COOKIE_JAR="$BJ" ask "SELECT 1 AS alive")"
+echo "$got" | grep -qi "authentication failed" || fail "every_use binding: the stale-bearer session was not refused: $got"
+echo "SET GLOBAL acl_session_token_binding='connect'; SET GLOBAL acl_jwt_clock_skew=60; SELECT 'unflip' AS s;" >&3
+flipped=""
+for _ in $(seq 1 40); do grep -q "unflip" "$TMP/server.log" && { flipped=1; break; }; sleep 0.25; done
+[ -n "$flipped" ] || fail "the server did not restore the clock"
+
 # --- session temp tables live on the cookie connection (spec 050) ---------------------------------
 # Created through the update wire on a cookie session, resolved by a later read on the SAME session
 # (the authoritative direct-scan path: the door hands the rewriter the executing context), listed by

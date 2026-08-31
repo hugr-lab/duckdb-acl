@@ -2537,6 +2537,18 @@ int64_t PolicyStore::SessionIdleTimeout() {
 	return 900;
 }
 
+bool PolicyStore::SessionExpEveryUse() {
+	// spec 059: 'connect' (default) binds token freshness to session establishment; 'every_use'
+	// re-judges exp per use, the pre-059 behaviour. An unknown value fails CLOSED to the stricter
+	// mode - the set-callback refuses unknown values loudly, this is the second line of defence.
+	// Memory mode (no catalog) cannot read the setting at all, so it KEEPS the pre-059 strict rule
+	// rather than silently ignoring an operator's every_use: stricter, and unchanged from before.
+	if (!catalog) {
+		return true;
+	}
+	return !StringUtil::CIEquals(catalog->SettingString("acl_session_token_binding", "connect"), "connect");
+}
+
 int64_t PolicyStore::MaxIngestRows() {
 	if (catalog) {
 		return catalog->SettingInt64("acl_max_ingest_rows", 0);

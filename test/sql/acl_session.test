@@ -102,8 +102,13 @@ SELECT (SELECT handle FROM live) <> (SELECT handle FROM closed);
 ----
 true
 
-# --- expiry is judged on every use, not only at open ---------------------------------------------------
-# a token whose `exp` is in the past, accepted with a wide skew and then judged with none
+# --- expiry is judged on every use under acl_session_token_binding='every_use' (specs 044/059) --------
+# a token whose `exp` is in the past, accepted with a wide skew and then judged with none; the default
+# 'connect' binding would keep the session working (pinned at the end of this file), so the strict
+# rule is switched on for this block
+
+statement ok
+SET GLOBAL acl_session_token_binding='every_use';
 
 statement ok
 SET GLOBAL acl_jwt_clock_skew=315360000;
@@ -141,6 +146,7 @@ query I
 SELECT acl_session_reason('00000000000000000000000000000000') = 'unknown';
 ----
 true
+
 
 # --- the prefix itself ---------------------------------------------------------------------------------
 # a handle a client invents resolves to nothing, and says which of the two reasons it is
@@ -229,6 +235,9 @@ SELECT acl_session_count() - n FROM base;
 ----
 0
 
+statement ok
+SET GLOBAL acl_session_token_binding='connect';
+
 # --- the cap refuses rather than evicts ---------------------------------------------------------------
 # Making room by ending somebody else's session would let an arriving stranger disconnect a working
 # client. At the cap a new session is refused, and NULL is what a door already handles.
@@ -280,3 +289,111 @@ statement error
 ACL ROLE "r" SELECT acl_session_reason('whatever');
 ----
 <REGEX>:.*acl_session_reason.*not allowed.*
+
+# --- spec 059: the token's freshness gates establishment, not the established session ----------------
+# The lever: a hugely negative clock skew makes every exp look past-due to the *judgment* without
+# waiting - the session below was opened while the skew was sane, so only the per-use rule changes.
+
+statement ok
+CREATE TEMP TABLE bind AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS h;
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=-9999999999;
+
+# default 'connect': the session keeps answering though its token's exp is (per the skew) long past
+query I
+SELECT acl_session_sql(h, 'SELECT 1') IS NOT NULL FROM bind;
+----
+true
+
+query I
+SELECT acl_session_reason(h) FROM bind;
+----
+live
+
+# ...and the sweep does not reap it either
+query I
+SELECT acl_session_sweep();
+----
+0
+
+# 'every_use' restores the pre-059 rule: the same session is now refused, named, and swept
+statement ok
+SET GLOBAL acl_session_token_binding='every_use';
+
+query I
+SELECT acl_session_sql(h, 'SELECT 1') IS NULL FROM bind;
+----
+true
+
+query I
+SELECT acl_session_reason(h) FROM bind;
+----
+expired
+
+# the sweep reaps it (and possibly other long-lived sessions this file left open - under this skew
+# every 2100-exp token looks past-due, so the count is a floor, and the bind session's own fate is
+# pinned by name right after)
+query I
+SELECT acl_session_sweep() >= 1;
+----
+true
+
+query I
+SELECT acl_session_reason(h) FROM bind;
+----
+unknown
+
+# the value is validated where it is set, not silently accepted
+statement error
+SET GLOBAL acl_session_token_binding='sometimes';
+----
+<REGEX>:.*accepts 'connect' or 'every_use'.*
+
+# an expired token still cannot OPEN a session under either binding - establishment is always gated
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NULL;
+----
+true
+
+statement ok
+SET GLOBAL acl_session_token_binding='connect';
+
+# ...and under 'connect' too: establishment is always gated, the binding never weakens the open
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NULL;
+----
+true
+
+# a session-scoped value would validate, display, and be ignored by the judgment - refused instead
+statement error
+SET acl_session_token_binding='every_use';
+----
+<REGEX>:.*is global.*
+
+# under 'connect' the idle rule is the only automatic reaper - disabling it is refused...
+statement error
+SET GLOBAL acl_session_idle_timeout=0;
+----
+<REGEX>:.*no automatic session reaper.*
+
+# ...and so is entering 'connect' while it is already disabled
+statement ok
+SET GLOBAL acl_session_token_binding='every_use';
+
+statement ok
+SET GLOBAL acl_session_idle_timeout=0;
+
+statement error
+SET GLOBAL acl_session_token_binding='connect';
+----
+<REGEX>:.*needs a live idle reaper.*
+
+statement ok
+SET GLOBAL acl_session_idle_timeout=900;
+
+statement ok
+SET GLOBAL acl_session_token_binding='connect';
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=60;
