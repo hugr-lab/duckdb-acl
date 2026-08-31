@@ -95,7 +95,14 @@ or say the word and I will script the realm/client/user setup against a realm yo
 
 Setup once: Database > Driver Manager > New - class `org.apache.arrow.driver.jdbc.ArrowFlightJdbcDriver`,
 artifact `org.apache.arrow:flight-sql-jdbc-driver:<current>` from Maven. New connection with the JDBC
-URL `serve.sh` printed; put the token in driver properties as `token`.
+URL `serve.sh` printed.
+
+**Auth**: the driver forwards its user/driver properties as Flight call headers, and the door reads
+`authorization: Bearer <jwt>` (spec 058 also makes the driver's connect-time Handshake succeed, which
+a header-only server otherwise refuses). So add a **driver/user property** named `authorization` with
+value `Bearer <token>` (the token alone - not `(analyst@acme): ...`, that label is not part of it).
+Leave the Username/Password fields empty. If a build predates spec 058, *Test Connection* fails with
+*"This service does not have an authentication mechanism enabled"* - rebuild.
 
 | # | Do | Expect |
 |---|----|--------|
