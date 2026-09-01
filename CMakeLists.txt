@@ -84,11 +84,12 @@ endif()
 # The embedded quack door (specs/063): quack's own server, compiled INTO acl rather than reached
 # through a loopback proxy (the spec-062 front it replaces). The server graph comes from the pinned
 # `third_party/quack` submodule; only the httplib-facing files are acl-owned adapted copies
-# (src/quack_embed/) - one carries a namespace-agnostic HttpQuackServer declaration, the other the
-# TLS + /.well-known listener. Everything acl registers is `acl_quack_*`-named (spec 063), so a
-# standalone quack loaded alongside never collides. WASM has nothing to listen on; MinGW mirrors
-# quack's own platform gating.
-if(NOT ${WASM_ENABLED} AND NOT MINGW AND NOT DEFINED ENV{ACL_NO_QUACK_EMBED})
+# (src/quack_embed/) - the namespace-alias shim plus the TLS + /.well-known listener. Everything acl
+# registers is `acl_quack_*`-named (spec 063), so a standalone quack loaded alongside never collides.
+# WASM is the only exclusion - it has nothing to listen on (there a WASM duckdb is a quack CLIENT, not
+# a server). The graph is portable std/httplib, so it builds on every other target incl. MinGW, which
+# only needs winsock linked by hand below (its GCC ignores httplib's MSVC `#pragma comment` link).
+if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_QUACK_EMBED})
     set(QUACK_SRC ${CMAKE_CURRENT_LIST_DIR}/third_party/quack/src)
     set(QUACK_EMBED ${CMAKE_CURRENT_LIST_DIR}/src/quack_embed)
     include_directories(
@@ -155,6 +156,12 @@ endif()
 if(DEFINED ACL_QUACK_EMBED_ENABLED)
     foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
         target_compile_definitions(${target} PRIVATE ACL_QUACK_EMBED_ENABLED=1)
+        # The embedded httplib server needs winsock on Windows. MSVC gets it from httplib's own
+        # `#pragma comment(lib, "ws2_32.lib")`, but GCC (MinGW) ignores that pragma, so link it by hand;
+        # crypt32 is OpenSSL's Windows dependency for the RNG. Harmless duplicates under MSVC.
+        if(WIN32)
+            target_link_libraries(${target} ws2_32 crypt32)
+        endif()
     endforeach()
 endif()
 

@@ -1131,7 +1131,7 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		result.SetValue(row, Value(actual_uri));
 #else
 		throw BinderException("acl_quack_serve: this build was compiled without the embedded door "
-		                      "(ACL_NO_QUACK_EMBED, WASM or MinGW)");
+		                      "(ACL_NO_QUACK_EMBED or WASM)");
 #endif
 	}
 }
@@ -1166,7 +1166,7 @@ void AclQuackStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		result.SetValue(row, Value(note + " (" + std::to_string(closed) + " session(s) closed)"));
 #else
 		throw BinderException("acl_quack_stop: this build was compiled without the embedded door "
-		                      "(ACL_NO_QUACK_EMBED, WASM or MinGW)");
+		                      "(ACL_NO_QUACK_EMBED or WASM)");
 #endif
 	}
 }

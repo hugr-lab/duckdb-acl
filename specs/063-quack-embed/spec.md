@@ -38,8 +38,16 @@ take quack as a submodule and run its **original** server inside acl, adapting o
   `src/quack_embed/include/acl_quack_httplib_ns.hpp` aliases `namespace duckdb_httplib =
   duckdb_httplib_openssl;` under the macro. The embed graph compiles UNCHANGED under both namespaces;
   TLS is compiled in exactly when the flight build's OpenSSL is present.
-- **Enabled by default** (non-WASM, non-MinGW); `ACL_NO_QUACK_EMBED=1` drops it (a stub `acl_quack_serve`
-  then reports the door was left out). `ACL_QUACK_EMBED_ENABLED` tells acl's own TUs to call the server.
+- **Enabled by default on every non-WASM target** (WASM has nothing to listen on — there a WASM duckdb
+  is a quack *client*, not a server); `ACL_NO_QUACK_EMBED=1` drops it (a stub `acl_quack_serve` then
+  reports the door was left out). `ACL_QUACK_EMBED_ENABLED` tells acl's own TUs to call the server.
+- **Platform coverage.** The server graph is portable std + duckdb's bundled httplib, with no
+  POSIX-only calls, so it builds on the whole distribution matrix (linux amd64/arm, windows MSVC and
+  **MinGW**, osx arm — WASM excepted). MinGW is NOT a special case: its only wrinkle is that GCC ignores
+  httplib's MSVC `#pragma comment(lib, "ws2_32.lib")`, so `CMakeLists` links `ws2_32`/`crypt32` by hand
+  on `WIN32`. **No new dependency** rides in: httplib and mbedtls are bundled in duckdb, OpenSSL is
+  already pulled by `arrow[flightsql]` (and the OIDC core), and quack's curl user is the client half,
+  which is excluded — so the distribution vcpkg manifest is unchanged.
 
 ### The listener — `AclQuackServer`
 
@@ -108,6 +116,10 @@ otherwise. Full sql suite and all cpp tests green.
 
 ## Follow-ups
 
+- Our PR CI builds linux amd64 + osx arm only; the full matrix (linux arm, windows MSVC/MinGW, WASM) is
+  verified by the community-extensions distribution build (`packaging/community-extensions/description.yml`
+  — no excluded platforms). Since the embed adds no dependency, that build's footprint is unchanged, but
+  the Windows/MinGW *compile* of quack's server is exercised there rather than in our own CI.
 - CI inits submodules recursively, which also clones quack's own (unused) nested `duckdb`. The quack
   submodule is marked `shallow`; the nested clone is wasteful but its pins are valid, so it is a CI-time
   cost, not a correctness risk.
