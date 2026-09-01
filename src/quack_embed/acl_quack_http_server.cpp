@@ -33,6 +33,7 @@
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 #include "mbedtls_wrapper.hpp"
 #include <openssl/rand.h>
+#include <type_traits>
 #endif
 
 #include <condition_variable>
@@ -181,6 +182,41 @@ struct AclDoorCryptoUtil : public duckdb_mbedtls::MbedTlsWrapper::AESStateMBEDTL
 
 std::mutex g_crypto_lock;
 
+//! duckdb main's httplib (>=0.53) dropped SSLServer(X509*, EVP_PKEY*) for SSLServer(PemMemory); our
+//! older pinned duckdb still has the X509 pair. We build against the pin locally and against duckdb
+//! main at the distribution stage, so detect which constructor the header carries.
+template <typename S, typename = void>
+struct HasPemMemoryCtor : std::false_type {};
+template <typename S>
+struct HasPemMemoryCtor<S, std::void_t<typename S::PemMemory>> : std::true_type {};
+
+//! Build an SSLServer from inline PEM across both httplib generations. Modern: inline PEM straight in
+//! (nothing to own). Legacy: parse PEM into an X509/EVP_PKEY pair the caller then owns (cert_out/
+//! key_out), returning null if it does not parse. A template so `if constexpr` discards - rather than
+//! compiles - the branch whose constructor this header lacks.
+template <typename S = duckdb_httplib::SSLServer>
+std::unique_ptr<S> MakeTlsServer(const string &cert_pem, const string &key_pem, X509 *&cert_out, EVP_PKEY *&key_out) {
+	if constexpr (HasPemMemoryCtor<S>::value) {
+		typename S::PemMemory pem {};
+		pem.cert_pem = cert_pem.c_str();
+		pem.cert_pem_len = cert_pem.size();
+		pem.key_pem = key_pem.c_str();
+		pem.key_pem_len = key_pem.size();
+		return make_uniq<S>(pem);
+	} else {
+		auto *cert_bio = BIO_new_mem_buf(cert_pem.data(), int(cert_pem.size()));
+		cert_out = PEM_read_bio_X509(cert_bio, nullptr, nullptr, nullptr);
+		BIO_free(cert_bio);
+		auto *key_bio = BIO_new_mem_buf(key_pem.data(), int(key_pem.size()));
+		key_out = PEM_read_bio_PrivateKey(key_bio, nullptr, nullptr, nullptr);
+		BIO_free(key_bio);
+		if (!cert_out || !key_out) {
+			return nullptr;
+		}
+		return make_uniq<S>(cert_out, key_out);
+	}
+}
+
 //! Give the instance a real crypto module for the server's RNG if it has none — WITHOUT loading httpfs
 //! or the unsafe mbedtls flag. Only-if-empty, so a loaded httpfs (its own OpenSSL util) always wins,
 //! and only at serve time, so a non-serving instance keeps duckdb's default crypto posture. The lock
@@ -236,16 +272,10 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 		if (cert_pem.empty() || key_pem.empty()) {
 			throw IOException("TLS needs both a certificate and a key");
 		}
-		auto *cert_bio = BIO_new_mem_buf(cert_pem.data(), int(cert_pem.size()));
-		tls_cert = PEM_read_bio_X509(cert_bio, nullptr, nullptr, nullptr);
-		BIO_free(cert_bio);
-		auto *key_bio = BIO_new_mem_buf(key_pem.data(), int(key_pem.size()));
-		tls_key = PEM_read_bio_PrivateKey(key_bio, nullptr, nullptr, nullptr);
-		BIO_free(key_bio);
-		if (!tls_cert || !tls_key) {
+		auto tls = MakeTlsServer(cert_pem, key_pem, tls_cert, tls_key);
+		if (!tls) {
 			throw IOException("the certificate or key did not parse as PEM");
 		}
-		auto tls = make_uniq<duckdb_httplib::SSLServer>(tls_cert, tls_key);
 		if (!tls->is_valid()) {
 			throw IOException("the TLS context refused the certificate/key pair");
 		}
