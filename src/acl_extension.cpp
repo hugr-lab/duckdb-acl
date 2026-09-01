@@ -1,6 +1,9 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "acl_extension.hpp"
+#ifdef ACL_QUACK_EMBED_ENABLED
+#include "acl_quack_embed.hpp"
+#endif
 #include "acl_oidc_secret.hpp"
 
 #ifdef ACL_FLIGHT_ENABLED
@@ -154,6 +157,11 @@ void LoadInternal(ExtensionLoader &loader) {
 	acl::RegisterQuackOidcProvider(loader); // spec 061: CREATE SECRET (TYPE quack, PROVIDER oidc, ...)
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
+#ifdef ACL_QUACK_EMBED_ENABLED
+	// The embedded quack door (spec 063): the acl_quack_* server settings and the acl_quack_scan_data
+	// drain the server INSERTs through. Present in every non-WASM/MinGW build unless ACL_NO_QUACK_EMBED.
+	acl::RegisterAclQuackEmbed(loader);
+#endif
 #ifdef ACL_FLIGHT_ENABLED
 	// The Flight SQL door (spec 045), present only in an ACL_FLIGHT=1 build. Registered here so the
 	// seam is real rather than declared: if Arrow ever fails to link, it fails at build time and not

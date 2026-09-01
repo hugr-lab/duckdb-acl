@@ -1,8 +1,14 @@
 # Spec 062: the quack front - TLS and discovery, with quack unchanged
 
-- **Status**: implemented
+- **Status**: superseded by 063
 - **Date**: 2026-08-31
 - **Author**: hugr-lab
+
+> **Superseded by [spec 063](../063-quack-embed/spec.md)**: the loopback front is replaced by quack's
+> server compiled into acl (`AclQuackServer`). The public bind, TLS termination and the
+> `/.well-known/quack-auth` discovery route move onto that one listener — no proxy hop, no heartbeat
+> headroom tax. The `acl_quack_serve(uri, token[, cert, key])` surface is unchanged (063 adds a `mode`
+> argument); the front code (`src/quack_front/`) is deleted.
 
 ## Summary
 
