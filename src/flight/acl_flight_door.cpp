@@ -24,6 +24,7 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
+#include "acl_door_auth.hpp"
 #include "acl_oidc.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
@@ -415,76 +416,6 @@ public:
 //! is the gate for B3 - the node carries no flow toggle of its own; an IdP that refuses ROPC refuses
 //! this handshake, and that refusal is surfaced as the answer.
 
-//! OIDC endpoint metadata per issuer, cached process-wide: the content is the IdP's own public
-//! discovery document keyed by issuer URL, so instances sharing a process share it safely. A failed
-//! read is cached briefly too - discovery answers an unauthenticated caller, and a dead IdP must not
-//! turn every probe into a fresh network wait.
-std::mutex discovery_cache_lock;
-std::unordered_map<string, std::pair<oidc::Endpoints, std::chrono::steady_clock::time_point>> discovery_cache;
-
-oidc::Endpoints DiscoverCached(const string &issuer) {
-	auto now = std::chrono::steady_clock::now();
-	{
-		std::lock_guard<std::mutex> guard(discovery_cache_lock);
-		auto entry = discovery_cache.find(issuer);
-		if (entry != discovery_cache.end()) {
-			auto ttl = std::chrono::seconds(entry->second.first.Ok() ? 300 : 30);
-			if (now - entry->second.second < ttl) {
-				return entry->second.first;
-			}
-		}
-	}
-	auto ep = oidc::Discover(issuer);
-	std::lock_guard<std::mutex> guard(discovery_cache_lock);
-	discovery_cache[issuer] = {ep, now};
-	return ep;
-}
-
-string JsonQuote(const string &value) {
-	string out = "\"";
-	for (auto c : value) {
-		if (c == '"' || c == '\\') {
-			out += '\\';
-			out += c;
-		} else if (static_cast<unsigned char>(c) < 0x20) {
-			out += StringUtil::Format("\\u%04x", static_cast<int>(c));
-		} else {
-			out += c;
-		}
-	}
-	out += "\"";
-	return out;
-}
-
-//! The discovery document (B2): the issuers the node trusts and, per issuer, what its own OIDC
-//! discovery advertises - public metadata by nature, the same class of fact a `.well-known` document
-//! publishes. client_id is included (a public client identifier, printed in every SPA); the
-//! client_secret never is. An issuer whose IdP cannot be reached is still named, endpoint-less.
-string DiscoverAuthJson(PolicyStore &store) {
-	string json = "{\"issuers\":[";
-	auto issuers = store.ListIssuers();
-	for (idx_t i = 0; i < issuers.size(); i++) {
-		if (i > 0) {
-			json += ",";
-		}
-		json += "{\"issuer\":" + JsonQuote(issuers[i]);
-		IssuerConfig config;
-		if (store.LookupIssuer(issuers[i], config) && !config.client_id.empty()) {
-			json += ",\"client_id\":" + JsonQuote(config.client_id);
-		}
-		auto ep = DiscoverCached(issuers[i]);
-		if (ep.Ok()) {
-			json += ",\"token_endpoint\":" + JsonQuote(ep.token_endpoint);
-			if (!ep.device_authorization_endpoint.empty()) {
-				json += ",\"device_authorization_endpoint\":" + JsonQuote(ep.device_authorization_endpoint);
-			}
-		}
-		json += "}";
-	}
-	json += "]}";
-	return json;
-}
-
 //! The door's auth handler: what the Handshake RPC does. A payload-less handshake stays the no-op
 //! success of spec 058 (the per-call Bearer header is the real gate, and IsValid refuses nobody);
 //! the payload `discover-auth` answers the discovery document - the Handshake is the protocol's own
@@ -500,7 +431,7 @@ public:
 			payload.clear(); // a client that sent nothing is the JDBC/ADBC path: connect, nothing more
 		}
 		if (payload == "discover-auth") {
-			return outgoing->Write(DiscoverAuthJson(*state->store));
+			return outgoing->Write(DoorAuthJson(*state->store));
 		}
 		return arrow::Status::OK();
 	}
@@ -598,7 +529,7 @@ public:
 			if (!state->store->LookupIssuer(issuer, config) || config.client_id.empty()) {
 				continue; // an issuer with no client_id cannot do ROPC and is skipped (spec 064)
 			}
-			auto ep = DiscoverCached(issuer);
+			auto ep = DiscoverEndpointsCached(issuer);
 			if (!ep.Ok()) {
 				refusal = "acl: OIDC discovery against " + issuer + " failed: " + ep.error;
 				continue;

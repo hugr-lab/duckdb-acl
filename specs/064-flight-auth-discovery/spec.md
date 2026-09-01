@@ -117,5 +117,7 @@ and never the secret, and the catalog round-trip keeps it.
 
 - The custom JDBC driver / acl-login agent (auth-code+PKCE, device) remain separate-repo work; this
   spec makes the node discoverable and password-capable for them.
-- quack's discovery document still lists bare issuer URLs; teaching it this spec's richer shape
-  (client_id + endpoints) is a small parity follow-up.
+- ~~quack's discovery document still lists bare issuer URLs~~ — done in the follow-up commit: one
+  shared composer (`acl_door_auth.cpp`) now serves both doors, so `GET /.well-known/quack-auth` and
+  the Handshake's `discover-auth` answer the same document, and `oidc::FetchQuackAuth` (the
+  spec-061 ISSUER-less provider) reads both the old bare-URL shape and this one.

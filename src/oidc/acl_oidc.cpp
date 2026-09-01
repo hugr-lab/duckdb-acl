@@ -329,7 +329,14 @@ DoorAuth FetchQuackAuth(const std::string &base_url, int timeout_seconds) {
 		duckdb_yyjson::yyjson_arr_iter_init(issuers, &iter);
 		while (auto *item = duckdb_yyjson::yyjson_arr_iter_next(&iter)) {
 			if (duckdb_yyjson::yyjson_is_str(item)) {
+				// the spec-062 shape: a bare issuer URL
 				out.issuers.emplace_back(duckdb_yyjson::yyjson_get_str(item));
+			} else if (duckdb_yyjson::yyjson_is_obj(item)) {
+				// the spec-064 shape: {"issuer": ..., "client_id": ..., endpoints...}
+				auto *issuer = duckdb_yyjson::yyjson_obj_get(item, "issuer");
+				if (issuer && duckdb_yyjson::yyjson_is_str(issuer)) {
+					out.issuers.emplace_back(duckdb_yyjson::yyjson_get_str(issuer));
+				}
 			}
 		}
 	}
