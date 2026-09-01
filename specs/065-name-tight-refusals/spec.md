@@ -1,6 +1,6 @@
 # Spec 065: refusals and listings that keep the source's names
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-09-01
 - **Author**: hugr-lab
 
@@ -65,17 +65,37 @@ whole truth the refusals may use. From that:
    only (`acl_rewrite: object "orders" exposes no readable columns` — probed 2026-09-01). Tests pin
    it; nothing to build. A declared list IS the opt-in to clean refusals, per object, at zero
    query-path cost — the operational guidance for sensitive objects.
-2. **The grant's list is judged where it is written.** A `COLUMNS` list on a grant that matches no
-   column of any *known-shape* object of that grant's scope is certainly a mistake — refuse the
-   grant at write, naming the list. Objects without a declared shape (bare aliases) and table
-   functions cannot vote and do not block. This catches the admin's typo before any principal can
-   reach the engine's leaky error.
-3. **`duckdb_tables().sql` always carries a parsable string** (a quack client builds its catalog
-   from it and today fails on the whole catalog when one object answers NULL), composed from
-   catalog facts.
-4. **`is_insertable_into` follows the grant's capabilities**, not the physical row.
+2. **The grant's list is judged where it is written** (returned to scope by the user: "тоже можно,
+   но только там где возможно — без пробы"). Only the **bare** items are judged — a `name = expr`
+   entry defines its own column (a mask, a computed column, spec 026) and owes nothing to existing
+   names; on a declared object the computed case keeps spec 037's own richer refusal. A bare list
+   that matches no column of any *known-shape* object of the grant's scope is refused at write,
+   naming the list. The judgment fires only when it can be right: a scope with nothing declared yet
+   (a fresh catalog, a grant written before its objects), one shape-less relation, one undeclared
+   table function, or any alias schema, and the write is allowed — the list may match there. It
+   judges only where the list itself is being written: `ALTER GRANT SET MAIN/CAPS/RLS` never
+   re-judges a stored list against a catalog that has moved. Shapes come from `relation_columns`
+   and `object_columns`, read with the same `ParseColumnList` the read path uses; nothing is probed.
+3. **`duckdb_tables()` never answers a NULL `sql`** (a quack client builds its catalog from it and
+   failed on the whole catalog): an object whose visible column set is empty has no DDL to
+   synthesize — `CREATE TABLE t();` does not even parse — so the row is not listed there at all,
+   judged from the same `vcolumns` fold every other answer uses. The filter is the tables branch's
+   own: `duckdb_views` keeps every readable view (its `sql` is NULL by design there, and a view
+   whose shape was never probed still answers reads), and `information_schema.tables` /
+   `SHOW TABLES` still list the object (nothing there synthesizes DDL).
+4. **`is_insertable_into` follows the grant**, not the physical row: the effective caps chain
+   (object → schema → catalog, spec 012's unstated-default read textually, like the rest of the
+   listing SQL) and the relation's **stored form** — `form = 'alias'` is writable, everything else
+   (a mask, an RLS'd relation, a view) is the read-only SUBQUERY form. The form was decided where
+   the object was written (`RenameOnlyColumns`), so the listing and the write path cannot disagree;
+   the lookup keys by the stored vname, so a `main.`-qualified object judges its own rows.
 5. **The management grammar unquotes `COLUMNS` items**, so `COLUMNS ("odd name")` matches the
-   column it names, like the function form does.
+   column it names, like the function form does — including a quoted name followed by spec 048's
+   nullability suffix (`"odd name" NOT NULL`). The stored csv form splits on `,` and `=`, so a
+   quoted name containing either is refused where written rather than silently re-split into
+   columns the admin never named. The emitters quote the bare stored name back (`Ident`) wherever
+   it re-enters generated SQL — stored verbatim WITH quotes, the old form only accidentally
+   composed valid SQL on that path.
 
 ### Accepted risk — written down, not wished away
 
