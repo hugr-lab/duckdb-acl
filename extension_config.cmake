@@ -9,9 +9,40 @@ duckdb_extension_load(acl
 # Integration builds (specs/005): also build the source scanners the integration scenarios attach
 # through. Opt-in via ACL_INTEGRATION=1 so regular/release builds stay lean. Pins and patches come
 # from the duckdb submodule's own extension config, so they are the versions tested against the
-# exact duckdb commit we track.
+# exact duckdb commit we track - except postgres_scanner, pinned below with one patch of ours.
 if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
-    include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/postgres_scanner.cmake)
+    # postgres_scanner: the submodule's own pin (c91ea57) plus ONE patch of ours. duckdb-postgres
+    # #552 (2026-08-11) made postgres_execute an alias of postgres_query, which PREPAREs the SQL -
+    # and PostgreSQL refuses multi-command strings in a prepared statement, which is exactly what
+    # DuckLake's postgres metadata manager flushes through postgres_execute (one batched string per
+    # commit). ducklake's own CI still pins duckdb-postgres from before the alias, so upstream has
+    # not seen it break yet - it will on ducklake's next duckdb bump. No upstream commit both
+    # compiles against the duckdb main we track (post-alias commits carry the API adaptations) and
+    # still has the real postgres_execute, so patches/postgres_scanner/ restores it (PQexec, simple
+    # protocol) on top of the pin. The FetchContent_Declare below wins over the one
+    # register_external_extension makes for the same content name (CMake keeps the first declare),
+    # which is how our PATCH_COMMAND gets in - duckdb_extension_load has no patch-dir parameter.
+    # Drop all of this for the submodule's include once upstream restores postgres_execute.
+    # (A patched _deps clone is dirty by design, so a later pin change trips the git-update stash
+    # dance: wipe build/*/_deps/postgres_scanner_extension_fc-* and rebuild - CI is always fresh.)
+    include(FetchContent)
+    if(NOT Python3_EXECUTABLE)
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    endif()
+    FetchContent_Declare(
+        postgres_scanner_extension_fc
+        GIT_REPOSITORY https://github.com/duckdb/duckdb-postgres
+        GIT_TAG c91ea5779322c97dfff1940f67b3a4d5b6a1e07e
+        GIT_SUBMODULES "database-connector"
+        PATCH_COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/duckdb/scripts/apply_extension_patches.py ${CMAKE_CURRENT_LIST_DIR}/patches/postgres_scanner/
+        SOURCE_SUBDIR __duckdb_no_add_subdirectory__
+    )
+    duckdb_extension_load(postgres_scanner
+        DONT_LINK
+        GIT_URL https://github.com/duckdb/duckdb-postgres
+        GIT_TAG c91ea5779322c97dfff1940f67b3a4d5b6a1e07e
+        SUBMODULES database-connector
+    )
     include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/ducklake.cmake)
     # mysql_scanner is currently disabled at the submodule pin ("patches do not apply"); flip its
     # gate here the moment the submodule re-enables it.
