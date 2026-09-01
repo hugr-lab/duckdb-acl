@@ -120,7 +120,7 @@ true
 statement error
 SELECT * FROM scan_data_from_quack_client('someone-elses-stream');
 ----
-<REGEX>:.*does not exist.*
+<REGEX>:.*(does not exist|not in the catalog).*
 
 # the name as ordinary text is not a call, and must not be mistaken for one: the resolver embeds the
 # name it is looking up as a literal in its own catalog SQL, which is how this was found
@@ -219,18 +219,13 @@ SELECT acl_quack_serve('quack:localhost:31999', '');
 ----
 <REGEX>:.*pass a server token explicitly.*
 
-# with the instance in order, the only thing left is quack itself - which this build does not load
-statement error
-SELECT acl_quack_serve('quack:localhost:31999', 'server-token');
-----
-<REGEX>:.*quack is not loaded.*
+# spec 063: with the instance in order, acl_quack_serve no longer needs the quack loadable - the door
+# is quack's server compiled into acl, so serving here would bind a real listener (its success turning
+# on the build's crypto: OpenSSL in a flight build, else httpfs) and leave it running past the test.
+# That serve/stop lifecycle - and that acl_quack_stop returns a status rather than an error - is pinned
+# by test/cpp/test_acl_quack_embed.cpp instead; here we only prove the preconditions above refuse early.
 
-# acl_quack_stop is the door's too, and it needs quack for the same reason serving does
-statement error
-SELECT acl_quack_stop('quack:localhost:31999');
-----
-<REGEX>:.*
-
+# acl_quack_stop is the door's own, never a principal's
 statement error
 ACL ROLE "analyst" SELECT acl_quack_stop('quack:localhost:31999');
 ----
