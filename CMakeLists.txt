@@ -120,8 +120,13 @@ if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_QUACK_EMBED})
         ${QUACK_SRC}/quack_uri.cpp
         ${QUACK_SRC}/quack_log.cpp)
     # quack hardcodes `duckdb_httplib::` — force-include the namespace bridge into every embed TU so
-    # those names resolve onto the OpenSSL namespace when TLS is compiled in (see the shim header).
-    set(ACL_QUACK_EMBED_COMPILE_OPTS "-include;${QUACK_EMBED}/include/acl_quack_httplib_ns.hpp")
+    # those names resolve onto the OpenSSL namespace when TLS is compiled in (see the shim header). The
+    # force-include flag is compiler-specific: MSVC spells it /FI, GCC/Clang (incl. MinGW) -include.
+    if(MSVC)
+        set(ACL_QUACK_EMBED_COMPILE_OPTS "/FI${QUACK_EMBED}/include/acl_quack_httplib_ns.hpp")
+    else()
+        set(ACL_QUACK_EMBED_COMPILE_OPTS "-include;${QUACK_EMBED}/include/acl_quack_httplib_ns.hpp")
+    endif()
     # TLS is compiled in exactly when the flight build's OpenSSL is present (same gate as ACL_OIDC_TLS).
     if(NOT DEFINED ENV{ACL_NO_FLIGHT})
         set(ACL_QUACK_EMBED_DEFS "CPPHTTPLIB_OPENSSL_SUPPORT")
