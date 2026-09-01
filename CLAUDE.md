@@ -242,6 +242,13 @@ schema v12), the IdP's token verified offline and returned as the connection's b
 toggle of ours - the IdP's refusal is the gate; TLS-only by refusal; `acl_issuers()` never lists the
 secret.
 
+**Spec 066 — node drain**: `acl_drain()` stops seating new clients at the one seam they all cross
+(`SessionOpen` refuses; the doors say why — Flight answers UNAVAILABLE "draining", quack's discovery
+answers 503 `draining`) while established sessions keep working; the operator watches
+`acl_session_count()` fall, kills stragglers with `acl_session_kill`, then stops the doors and the
+process. `acl_resume()` / `acl_drain_status()` complete the surface; all three are denied to a
+principal. The node never waits or times out by itself — the deadline belongs to the orchestrator.
+
 ## Working process — per-feature specs
 
 We do **not** run full spec-kit. Instead, each feature gets one lightweight spec under `specs/` (see

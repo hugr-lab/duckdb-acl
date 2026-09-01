@@ -225,6 +225,12 @@ string MintHandle() {
 } // namespace
 
 string PolicyStore::SessionOpen(const string &token) {
+	// Spec 066: a draining node seats nobody new. Refused before verifying anything - there is
+	// nothing to decide with the result, and the drain path stays free of JWKS reads. Established
+	// sessions never come back through here, so they keep working.
+	if (draining.load(std::memory_order_relaxed)) {
+		return string();
+	}
 	Principal principal;
 	int64_t expires_at = 0;
 	string issuer;
@@ -467,6 +473,14 @@ void PolicyStore::SetDoorOpen(bool open) {
 bool PolicyStore::DoorOpen() {
 	lock_guard<mutex> guard(lock);
 	return door_open;
+}
+
+bool PolicyStore::SetDraining(bool value) {
+	return draining.exchange(value);
+}
+
+bool PolicyStore::Draining() const {
+	return draining.load(std::memory_order_relaxed);
 }
 
 void PolicyStore::SessionClose(const string &handle) {

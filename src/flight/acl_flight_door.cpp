@@ -515,6 +515,12 @@ public:
 		if (!BasicFromHeaders(context, user, password)) {
 			return arrow::Status::OK();
 		}
+		// a draining node refuses before running the grant (spec 066): the handshake exists only to
+		// seat a new client, and minting an IdP token for one the node will refuse is waste and noise
+		if (state->store->Draining()) {
+			return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
+			                               "acl: node is draining - not accepting new sessions");
+		}
 		// a cleartext door refuses before anything reads the password: the one thing worse than the
 		// node seeing a password is the wire carrying it readable
 		if (!has_tls) {
@@ -1555,6 +1561,13 @@ private:
 					state->DropConn(handle);            // and the old principal's connection with it
 				}
 			}
+		}
+		// Whoever reaches this point is new: no live session of their own resolved above. A draining
+		// node seats nobody new (spec 066), and says WHY - a load balancer and a driver both treat
+		// UNAVAILABLE as "go elsewhere", where a generic auth failure would read as bad credentials.
+		if (state->store->Draining()) {
+			return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
+			                               "acl: node is draining - not accepting new sessions");
 		}
 		auto handle = state->store->SessionOpen(token);
 		if (handle.empty()) {

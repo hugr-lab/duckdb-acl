@@ -237,7 +237,8 @@ enum class AclServerState { WAITING_TO_START, RUNNING, CLOSED };
 class AclQuackServer : public QuackServer {
 public:
 	AclQuackServer(ClientContext &context, const QuackUri &uri_p, const string &token_p, const string &cert_pem,
-	               const string &key_pem, std::function<string()> wellknown, bool discovery);
+	               const string &key_pem, std::function<string()> wellknown, std::function<bool()> draining,
+	               bool discovery);
 	~AclQuackServer() override;
 
 	void StopAccepting() override;
@@ -257,6 +258,7 @@ private:
 	std::mutex state_lock;
 	AclServerState server_state = AclServerState::WAITING_TO_START;
 	std::function<string()> wellknown;
+	std::function<bool()> draining;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 	X509 *tls_cert = nullptr;
 	EVP_PKEY *tls_key = nullptr;
@@ -265,8 +267,8 @@ private:
 
 AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, const string &token_p,
                                const string &cert_pem, const string &key_pem, std::function<string()> wellknown_p,
-                               bool discovery)
-    : QuackServer(context, uri_p, token_p), wellknown(std::move(wellknown_p)) {
+                               std::function<bool()> draining_p, bool discovery)
+    : QuackServer(context, uri_p, token_p), wellknown(std::move(wellknown_p)), draining(std::move(draining_p)) {
 	if (!cert_pem.empty() || !key_pem.empty()) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 		if (cert_pem.empty() || key_pem.empty()) {
@@ -312,9 +314,18 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 	// `mode := 'plain'` leaves it off entirely - a bare quack server.
 	if (discovery) {
 		auto wk = wellknown;
-		server->Get("/.well-known/quack-auth", [wk](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
-			res.set_content(wk ? wk() : "{\"issuers\":[]}", "application/json");
-		});
+		auto dr = draining;
+		server->Get("/.well-known/quack-auth",
+		            [wk, dr](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
+			            // A draining node (spec 066) answers 503 here BEFORE the document: this route is what a
+			            // load balancer's health check watches, and new connections are refused anyway.
+			            if (dr && dr()) {
+				            res.status = 503;
+				            res.set_content("draining", "text/plain");
+				            return;
+			            }
+			            res.set_content(wk ? wk() : "{\"issuers\":[]}", "application/json");
+		            });
 	}
 
 	server->Options("/quack", [](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
@@ -465,7 +476,7 @@ string StartAclQuackServer(ClientContext &context, const AclQuackServeConfig &cf
 		}
 
 		auto server = make_uniq<AclQuackServer>(context, listen_uri, cfg.token, cfg.cert_pem, cfg.key_pem,
-		                                        cfg.wellknown, cfg.discovery);
+		                                        cfg.wellknown, cfg.draining, cfg.discovery);
 		auto key = server->ListenUri().CanonicalUri();
 		actual_uri_out = server->ListenUri().Uri();
 		std::lock_guard<std::mutex> guard(g_servers_lock);

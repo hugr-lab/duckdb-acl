@@ -39,6 +39,10 @@ struct AclQuackServeConfig {
 	//! Composes the /.well-known/quack-auth document PER REQUEST, so an issuer added or dropped after
 	//! the serve is advertised immediately. The callback must own everything it touches.
 	std::function<string()> wellknown;
+	//! Answers whether the node is draining (spec 066), read per discovery request: while true,
+	//! /.well-known/quack-auth answers 503 `draining` - the health-check shape a load balancer or an
+	//! ops probe already watches. Unset = never draining.
+	std::function<bool()> draining;
 	//! Default (true): advertise /.well-known/quack-auth so an acl-aware client discovers the issuers.
 	//! `mode := 'plain'` sets false - a bare quack server (no discovery route), for a stock client or
 	//! when TLS is terminated by a reverse proxy upstream. Still acl-gated; still cleartext-only here.
