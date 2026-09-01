@@ -1,0 +1,95 @@
+# name: test/sql/acl_issuer_client.test
+# description: an issuer's OAuth client (spec 064) - the credential the node runs the password grant
+#   as, and what auth discovery advertises. Stored on the issuer, surfaced without its secret.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+# the SQL form carries the client: CLIENT ID, optionally CLIENT SECRET
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/a' KEYS '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AUDIENCES 'api://acl-test' ALGS 'HS256' CLIENT ID 'door-app' CLIENT SECRET 'super-secret-value';
+
+# the function form: 8th arg client_id, 9th client_secret
+statement ok
+SELECT acl_define_issuer('https://issuer.test/b',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '', '', 'public-app');
+
+# an issuer without a client is simply one that does no ROPC here
+statement ok
+SELECT acl_define_issuer('https://issuer.test/c',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '');
+
+# introspection lists the client_id - a public identifier - and never the secret
+query II
+SELECT issuer, client_id FROM acl_issuers() ORDER BY issuer;
+----
+https://issuer.test/a	door-app
+https://issuer.test/b	public-app
+https://issuer.test/c	NULL
+
+statement error
+SELECT client_secret FROM acl_issuers();
+----
+<REGEX>:.*client_secret.*
+
+# and no column of the listing carries the secret's value
+query I
+SELECT count(*) FROM (SELECT * FROM acl_issuers()) WHERE columns(*)::VARCHAR LIKE '%super-secret-value%';
+----
+0
+
+# a secret with no id authenticates nothing, and is refused where it is written
+statement error
+SELECT acl_define_issuer('https://issuer.test/d',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '', '', '', 'secret-alone');
+----
+<REGEX>:.*without a client_id.*
+
+# ALTER reaches both fields; clearing the id clears the secret with it
+statement ok
+ACL ADMIN ALTER ISSUER 'https://issuer.test/c' SET CLIENT ID 'late-app';
+
+query I
+SELECT client_id FROM acl_issuers() WHERE issuer = 'https://issuer.test/c';
+----
+late-app
+
+statement ok
+ACL ADMIN ALTER ISSUER 'https://issuer.test/c' SET CLIENT SECRET 's3';
+
+statement ok
+ACL ADMIN ALTER ISSUER 'https://issuer.test/a' SET CLIENT ID '';
+
+query I
+SELECT client_id IS NULL FROM acl_issuers() WHERE issuer = 'https://issuer.test/a';
+----
+true
+
+# a secret cannot be set onto an issuer whose id was just cleared
+statement error
+ACL ADMIN ALTER ISSUER 'https://issuer.test/a' SET CLIENT SECRET 'sx';
+----
+<REGEX>:.*without a CLIENT ID.*
+
+# the credential survives the round trip through the policy catalog: re-open and read again
+statement ok
+SELECT acl_use_db('store', 'acl', false);
+
+query II
+SELECT issuer, client_id FROM acl_issuers() ORDER BY issuer;
+----
+https://issuer.test/a	NULL
+https://issuer.test/b	public-app
+https://issuer.test/c	late-app

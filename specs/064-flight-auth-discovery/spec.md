@@ -1,6 +1,6 @@
-# Spec 064: the Flight door's auth discovery + admin-enabled password handshake (Block B)
+# Spec 064: the Flight door's auth discovery + IdP-gated password handshake (Block B)
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-09-01
 - **Author**: hugr-lab
 
@@ -9,94 +9,113 @@
 design/016 Block B, the **node side** of "how a Flight SQL client authenticates without a human
 pasting a JWT". The client tooling — a custom JDBC driver, an `acl-login` agent, a Power BI connector
 — lives in separate repos (design/016 §3); what the MIT node owes them is two things the Flight door
-does not have yet:
+did not have:
 
-- **B2 — discovery.** The door advertises, unauthenticated, the issuers it trusts and the OAuth flows
-  the admin allows, so a driver knows *where* to authenticate and *how*. This is the Flight analog of
-  the quack door's `GET /.well-known/quack-auth` (spec 062/063).
-- **B3 — an admin-enabled password handshake.** For a *vanilla* Flight SQL client (stock Arrow Flight
-  JDBC, only Username/Password fields, no custom driver), the door — **only when the admin has enabled
-  the `password` flow for that issuer** — exchanges the Handshake's username/password for a token via
-  the IdP's resource-owner password grant (ROPC), verifies that token offline exactly like a Bearer,
-  and mints a session. Off by default; a deliberate, opt-in relaxation of design/016 §0.
+- **B2 — discovery.** The door advertises, unauthenticated, the issuers it trusts, each issuer's
+  OAuth client_id, and the endpoints the IdP's own OIDC discovery names — so a driver knows *where*
+  to authenticate and *how*. The Flight analog of the quack door's `GET /.well-known/quack-auth`
+  (spec 062/063), answered over the **Handshake RPC** (payload `discover-auth`), because that is the
+  protocol's own unauthenticated pre-auth exchange and `FlightSqlServerBase` seals `DoAction` final.
+- **B3 — the password handshake, gated by the IdP.** For a *vanilla* Flight SQL client (stock Arrow
+  Flight JDBC or ADBC, only Username/Password fields, no custom driver), a **BasicAuth Handshake**
+  becomes the OAuth password grant (ROPC), run by the node against the issuer's token endpoint as
+  the `client_id` the admin put on the issuer. The token the IdP answers is **verified offline
+  exactly like any Bearer**, and handed back as the connection's bearer — every later call takes the
+  unchanged per-call path. The node carries **no flow toggle of its own**: an IdP that permits ROPC
+  answers with a token, one that does not answers `unsupported_grant_type`/`invalid_grant`, and that
+  refusal is surfaced as the handshake's answer.
 
-B1 (spec 058's NoOp handshake — the server-side prerequisite that lets a header-Bearer client connect)
-is already done.
+B1 (spec 058's no-op handshake — the server-side prerequisite that lets a header-Bearer client
+connect) is unchanged: a payload-less, header-less handshake still succeeds and gates nothing,
+because the per-call `authorization: Bearer` header remains the real gate.
 
 ## Problem
 
-The door verifies an `authorization: Bearer <jwt>` on every call (spec 045), and that is the whole of
-its auth. A client that already holds a token works; a client that does not has no way to (a) learn
-which IdP to go to, or (b) get a token from stock Username/Password fields. quack got both through its
-front's discovery + provider; the Flight door got neither.
+The door verifies an `authorization: Bearer <jwt>` on every call (spec 045), and that was the whole
+of its auth. A client that already holds a token works; a client that does not had no way to (a)
+learn which IdP to go to, or (b) get a token from stock Username/Password fields. quack got both
+through its server's discovery + provider (specs 061–063); the Flight door had neither.
 
-### No flow-gate of ours — the IdP is the gate (user, 2026-09-01)
+## Design
 
-design/016 §2 spoke of an admin "flow menu"; the user's refinement removes our half of it: **the IdP
-decides whether the password grant is allowed, not a setting of ours.** The node does not carry a
-per-issuer `flows` toggle. It simply attempts the grant against the issuer; an IdP that permits ROPC
-answers with a token, one that does not answers `unsupported_grant_type`/`invalid_grant`, and that IS
-the refusal. One fewer setting, and the policy lives where it belongs (the org's IdP config). The only
-issuer config the grant needs is the **client_id** it authenticates the grant as — the same app
-registration whose tokens the node already verifies (added to `acl_define_issuer`, optional
-client_secret for a confidential client). That is the credential for the call, not a gate.
+### The issuer carries its OAuth client (schema v12)
 
-### B2 — discovery (unauthenticated)
+`client_id` and `client_secret` live on the issuer — the same app registration whose tokens the
+node already verifies. `acl_define_issuer(..., jwks_uri[, client_id[, client_secret]])`;
+`ACL ADMIN CREATE ISSUER ... [CLIENT ID '<id>' [CLIENT SECRET '<secret>']]`;
+`ALTER ISSUER '<iss>' SET CLIENT ID|CLIENT SECRET '<value>'`. A secret without an id is refused
+where written; clearing the id clears the secret with it. `acl_issuers()` lists `client_id` (a
+public identifier, printed in every SPA) and **never** the secret. Policy catalogs migrate with
+`schema/migrations/v12.sql`.
 
-A Flight `DoAction("discover-auth")` (unauthenticated — the NoOp handshake path, no Bearer required)
-answers a JSON body: the issuers from `PolicyStore::ListIssuers()` and, per issuer, the OIDC endpoints
-discovered from `.well-known/openid-configuration` (whose presence tells a driver what the IdP itself
-supports — a `device_authorization_endpoint` means device flow is there, etc.). Same class of public
-metadata OIDC discovery serves — where to authenticate, never who may. Shape mirrors `oidc::DoorAuth`
-so the same client code reads a quack door and a Flight door.
+### B2 — discovery over the Handshake
 
-### B3 — password handshake (the IdP gates it)
+The door's own `ServerAuthHandler` (replacing arrow's `NoOpAuthHandler`) reads the handshake
+payload: empty = the spec-058 no-op; `discover-auth` = the discovery document as JSON —
 
-Replace the door's `NoOpAuthHandler` with a handler that:
-- still makes a Bearer-header call a no-op success (B1 unchanged — the header is the real gate);
-- when the Handshake carries **BasicAuth** (username/password): run `oidc::Discover(issuer)` +
-  `oidc::PasswordGrant(ep, client_id, …, username, password)` (spec 060, already built) against the
-  configured issuer, **verify the returned access token offline** (the same `VerifyPrincipal` every
-  Bearer takes), mint a session, and return the session token as the Handshake's bearer, which the
-  driver then sends as `authorization: Bearer` on every subsequent call;
-- surfaces the IdP's own refusal when the grant is not permitted there (no token minted).
+```json
+{"issuers":[{"issuer":"https://idp/","client_id":"door-app",
+             "token_endpoint":"https://idp/token",
+             "device_authorization_endpoint":"https://idp/device"}]}
+```
 
-With more than one issuer configured the door tries the issuer whose config carries a client_id (an
-issuer with no client_id cannot do ROPC and is skipped); a single-issuer node is the common case.
-The password is used once to obtain a token and **never logged, never stored, never re-sent**.
+Issuers come from the live policy per request; each issuer's endpoints from
+`oidc::Discover` (spec 060), cached process-wide (public metadata keyed by issuer URL; 300 s, a
+failure 30 s — an unauthenticated caller must not turn a dead IdP into a fresh network wait each
+probe). An unreachable IdP leaves its issuer named, endpoint-less. A
+`device_authorization_endpoint`'s presence tells a driver device flow exists — the IdP's own
+discovery says what the IdP supports; ours only relays it.
+
+### B3 — the password handshake
+
+A server middleware watches the Handshake for `authorization: Basic`. When present: refuse at once
+on a cleartext door (a password on a readable wire is the one thing worse than the node seeing it);
+otherwise walk the issuers that carry a `client_id` (one with none cannot do ROPC and is skipped) —
+`oidc::Discover` + `oidc::PasswordGrant` (spec 060), verify the returned access token through the
+same `VerifyPrincipal` every Bearer takes, and on success answer the handshake with
+`authorization: Bearer <access_token>` in the response headers — the place stock JDBC, ADBC and
+pyarrow's `authenticate_basic_token` all read it from. The bearer **is the IdP's token**, not a
+credential of ours: every subsequent call verifies it offline on the unchanged path, sessions stay
+cookie-driven (spec 050), and expiry behaves as for any bearer. The password is used once and is
+neither logged nor stored.
 
 ## Enforcement & security
 
-- **§0 relaxation is gated by the IdP, not by us.** The node runs ROPC only from a BasicAuth
-  handshake, and only succeeds when the org's IdP permits the password grant — the policy lives at the
-  IdP, exactly where an org already decides whether ROPC is acceptable. Every other path keeps the
-  invariant. The resulting token is still verified offline — the node trusts the IdP's answer, not the
-  password.
-- **Discovery leaks nothing private** — issuer URLs and flow names, the same facts a `.well-known`
-  document publishes. Unauthenticated by design.
-- Password is transient (grant → discard); TLS (spec 053) is the transport for the handshake carrying
-  it, and a non-TLS door should refuse `password` (a cleartext password on the wire is the one thing
-  worse than the node seeing it).
+- **The IdP is the gate, not a setting of ours** (user, 2026-09-01). The node attempts the grant
+  only from a BasicAuth handshake; whether it succeeds is the org's IdP policy, exactly where the
+  ROPC decision already lives. The resulting token is still verified offline — the node trusts its
+  own verification, never the password.
+- **Discovery leaks nothing private** — issuer URLs, a public client_id, and the endpoints the
+  IdP's own `.well-known` publishes. Unauthenticated by design.
+- **TLS-only by refusal**: the cleartext door refuses the password before anything reads it.
+- The plain Bearer path, the cookie sessions, and every per-call gate are untouched.
 
 ## Tests
 
-- discovery: `DoAction("discover-auth")` with no Bearer answers the configured issuers + flows.
-- password handshake: with `password` enabled for the fixture issuer, a BasicAuth handshake against a
-  fake IdP mints a session and a follow-up query reads the principal's slice; with it disabled, the
-  handshake is refused by name; a Bearer-only call is unaffected either way.
+`test/e2e/flight/auth.sh` — a fake IdP (stdlib python, sharing no code with the door) serves
+discovery + the grant; asserts: discovery answers unauthenticated from the live policy (issuer,
+client_id, token_endpoint, device endpoint; no secret field); a BasicAuth handshake earns exactly
+the tenant's RLS slice; a wrong password and an ROPC-off IdP surface the IdP's refusal; a cleartext
+door refuses by name; the plain bearer path is unchanged. `test/sql/acl_issuer_client.test` — the
+credential surface: both SQL forms, ALTER, secret-without-id refusals, `acl_issuers()` shows the id
+and never the secret, and the catalog round-trip keeps it.
 
 ## Alternatives considered
 
-- **GetSqlInfo for discovery** instead of DoAction: GetSqlInfo is reached after connect and is
-  awkward to answer unauthenticated; DoAction is the cleaner unauthenticated pre-auth call.
-- **Never let the node do ROPC** (keep §0 absolute): rejected by the user — the password grant is the
-  only way a vanilla DBeaver works without our driver, and the org's IdP already gates whether ROPC is
-  allowed, so the node deferring to it is not our policy call to make.
-- **A per-issuer `flows` admin setting** to enable/advertise password: rejected by the user — "it is
-  the IdP that decides, not a setting of ours; if the password flow is available there it works, if
-  not it does not — no second setting."
+- **DoAction("discover-auth") for discovery**: the natural RPC, but `FlightSqlServerBase` seals
+  `DoAction`/`ListActions` `final` with no custom-action hook — an unknown action never reaches us.
+  The Handshake is the protocol's own unauthenticated pre-auth exchange, and doubles as where the
+  password flow already lives.
+- **A door-minted session token as the handshake's bearer**: a second bearer kind with its own
+  lifetime rules and store, for zero gain — the IdP's access token already verifies on every call.
+- **A per-issuer `flows` admin setting**: rejected by the user — "it is the IdP that decides, not a
+  setting of ours; if the password flow is available there it works, if not it does not."
+- **Never let the node do ROPC** (keep design/016 §0 absolute): rejected — the password grant is the
+  only way a vanilla DBeaver works without our driver, and the org's IdP already gates it.
 
 ## Follow-ups
 
 - The custom JDBC driver / acl-login agent (auth-code+PKCE, device) remain separate-repo work; this
-  spec only makes the node discoverable and password-capable for them.
+  spec makes the node discoverable and password-capable for them.
+- quack's discovery document still lists bare issuer URLs; teaching it this spec's richer shape
+  (client_id + endpoints) is a small parity follow-up.

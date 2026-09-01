@@ -23,6 +23,8 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/blob.hpp"
+#include "acl_oidc.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -405,6 +407,230 @@ public:
 		*middleware = std::make_shared<CookieMiddleware>(fresh ? MintCookieId() : incoming, fresh);
 		return arrow::Status::OK();
 	}
+};
+
+//! --- spec 064: auth discovery + the password handshake --------------------------------------------
+//! The two things a client without a token needs from the door: WHERE to authenticate (B2) and, for a
+//! vanilla Username/Password client, the door running the OAuth password grant for it (B3). The IdP
+//! is the gate for B3 - the node carries no flow toggle of its own; an IdP that refuses ROPC refuses
+//! this handshake, and that refusal is surfaced as the answer.
+
+//! OIDC endpoint metadata per issuer, cached process-wide: the content is the IdP's own public
+//! discovery document keyed by issuer URL, so instances sharing a process share it safely. A failed
+//! read is cached briefly too - discovery answers an unauthenticated caller, and a dead IdP must not
+//! turn every probe into a fresh network wait.
+std::mutex discovery_cache_lock;
+std::unordered_map<string, std::pair<oidc::Endpoints, std::chrono::steady_clock::time_point>> discovery_cache;
+
+oidc::Endpoints DiscoverCached(const string &issuer) {
+	auto now = std::chrono::steady_clock::now();
+	{
+		std::lock_guard<std::mutex> guard(discovery_cache_lock);
+		auto entry = discovery_cache.find(issuer);
+		if (entry != discovery_cache.end()) {
+			auto ttl = std::chrono::seconds(entry->second.first.Ok() ? 300 : 30);
+			if (now - entry->second.second < ttl) {
+				return entry->second.first;
+			}
+		}
+	}
+	auto ep = oidc::Discover(issuer);
+	std::lock_guard<std::mutex> guard(discovery_cache_lock);
+	discovery_cache[issuer] = {ep, now};
+	return ep;
+}
+
+string JsonQuote(const string &value) {
+	string out = "\"";
+	for (auto c : value) {
+		if (c == '"' || c == '\\') {
+			out += '\\';
+			out += c;
+		} else if (static_cast<unsigned char>(c) < 0x20) {
+			out += StringUtil::Format("\\u%04x", static_cast<int>(c));
+		} else {
+			out += c;
+		}
+	}
+	out += "\"";
+	return out;
+}
+
+//! The discovery document (B2): the issuers the node trusts and, per issuer, what its own OIDC
+//! discovery advertises - public metadata by nature, the same class of fact a `.well-known` document
+//! publishes. client_id is included (a public client identifier, printed in every SPA); the
+//! client_secret never is. An issuer whose IdP cannot be reached is still named, endpoint-less.
+string DiscoverAuthJson(PolicyStore &store) {
+	string json = "{\"issuers\":[";
+	auto issuers = store.ListIssuers();
+	for (idx_t i = 0; i < issuers.size(); i++) {
+		if (i > 0) {
+			json += ",";
+		}
+		json += "{\"issuer\":" + JsonQuote(issuers[i]);
+		IssuerConfig config;
+		if (store.LookupIssuer(issuers[i], config) && !config.client_id.empty()) {
+			json += ",\"client_id\":" + JsonQuote(config.client_id);
+		}
+		auto ep = DiscoverCached(issuers[i]);
+		if (ep.Ok()) {
+			json += ",\"token_endpoint\":" + JsonQuote(ep.token_endpoint);
+			if (!ep.device_authorization_endpoint.empty()) {
+				json += ",\"device_authorization_endpoint\":" + JsonQuote(ep.device_authorization_endpoint);
+			}
+		}
+		json += "}";
+	}
+	json += "]}";
+	return json;
+}
+
+//! The door's auth handler: what the Handshake RPC does. A payload-less handshake stays the no-op
+//! success of spec 058 (the per-call Bearer header is the real gate, and IsValid refuses nobody);
+//! the payload `discover-auth` answers the discovery document - the Handshake is the protocol's own
+//! unauthenticated pre-auth exchange, and FlightSqlServerBase seals DoAction against custom actions.
+class AclDoorAuthHandler : public flight::ServerAuthHandler {
+public:
+	explicit AclDoorAuthHandler(shared_ptr<FlightDoorState> state_p) : state(std::move(state_p)) {
+	}
+	arrow::Status Authenticate(const flight::ServerCallContext &, flight::ServerAuthSender *outgoing,
+	                           flight::ServerAuthReader *incoming) override {
+		string payload;
+		if (!incoming->Read(&payload).ok()) {
+			payload.clear(); // a client that sent nothing is the JDBC/ADBC path: connect, nothing more
+		}
+		if (payload == "discover-auth") {
+			return outgoing->Write(DiscoverAuthJson(*state->store));
+		}
+		return arrow::Status::OK();
+	}
+	arrow::Status IsValid(const flight::ServerCallContext &, const std::string &, std::string *peer_identity) override {
+		peer_identity->clear();
+		return arrow::Status::OK();
+	}
+
+private:
+	shared_ptr<FlightDoorState> state;
+};
+
+//! `authorization: Basic <base64 user:password>` on the Handshake, or false. Anywhere else the
+//! header is ignored: the exchange runs once per connection, where the drivers send it.
+bool BasicFromHeaders(const flight::ServerCallContext &context, string &user, string &password) {
+	for (const auto &header : context.incoming_headers()) {
+		if (!StringUtil::CIEquals(string(header.first), AUTH_HEADER)) {
+			continue;
+		}
+		string value(header.second);
+		constexpr const char *BASIC = "Basic ";
+		if (value.size() <= strlen(BASIC) || !StringUtil::CIEquals(value.substr(0, strlen(BASIC)), BASIC)) {
+			return false;
+		}
+		auto encoded = value.substr(strlen(BASIC));
+		string decoded;
+		try {
+			string_t blob(encoded.c_str(), NumericCast<uint32_t>(encoded.size()));
+			auto size = Blob::FromBase64Size(blob);
+			decoded.resize(size);
+			Blob::FromBase64(blob, reinterpret_cast<data_ptr_t>(&decoded[0]), size);
+		} catch (std::exception &) {
+			return false; // not base64 is not an error to act on, it is simply not BasicAuth
+		}
+		auto colon = decoded.find(':');
+		if (colon == string::npos) {
+			return false;
+		}
+		user = decoded.substr(0, colon);
+		password = decoded.substr(colon + 1);
+		return true;
+	}
+	return false;
+}
+
+//! Carries the bearer the handshake earned back to the client, in the response header the Flight
+//! drivers (JDBC, ADBC, pyarrow's authenticate_basic_token) read it from.
+class PasswordHandshakeMiddleware : public flight::ServerMiddleware {
+public:
+	explicit PasswordHandshakeMiddleware(string bearer_p) : bearer(std::move(bearer_p)) {
+	}
+	void SendingHeaders(flight::AddCallHeaders *outgoing_headers) override {
+		outgoing_headers->AddHeader("authorization", "Bearer " + bearer);
+	}
+	void CallCompleted(const arrow::Status &) override {
+	}
+	std::string name() const override {
+		return "PasswordHandshakeMiddleware";
+	}
+
+private:
+	string bearer;
+};
+
+//! B3: a BasicAuth Handshake becomes the OAuth password grant, run by the node against the issuer's
+//! own token endpoint, as the client_id the admin put on the issuer. The token the IdP answers is
+//! verified offline exactly like any Bearer - the node trusts its own verification, never the
+//! password - and handed back as the connection's bearer, so every later call takes the normal path.
+//! The password crosses this function once and is neither logged nor stored.
+class PasswordHandshakeFactory : public flight::ServerMiddlewareFactory {
+public:
+	PasswordHandshakeFactory(shared_ptr<FlightDoorState> state_p, bool has_tls_p)
+	    : state(std::move(state_p)), has_tls(has_tls_p) {
+	}
+	arrow::Status StartCall(const flight::CallInfo &info, const flight::ServerCallContext &context,
+	                        std::shared_ptr<flight::ServerMiddleware> *middleware) override {
+		if (info.method != flight::FlightMethod::Handshake) {
+			return arrow::Status::OK();
+		}
+		string user, password;
+		if (!BasicFromHeaders(context, user, password)) {
+			return arrow::Status::OK();
+		}
+		// a cleartext door refuses before anything reads the password: the one thing worse than the
+		// node seeing a password is the wire carrying it readable
+		if (!has_tls) {
+			return flight::MakeFlightError(flight::FlightStatusCode::Unauthenticated,
+			                               "acl: the password handshake needs a TLS door "
+			                               "(acl_flight_serve with a certificate) - refused over cleartext");
+		}
+		string refusal = "acl: no issuer here carries a CLIENT ID, so the door cannot run the "
+		                 "password grant - authenticate with a bearer token instead";
+		for (auto &issuer : state->store->ListIssuers()) {
+			IssuerConfig config;
+			if (!state->store->LookupIssuer(issuer, config) || config.client_id.empty()) {
+				continue; // an issuer with no client_id cannot do ROPC and is skipped (spec 064)
+			}
+			auto ep = DiscoverCached(issuer);
+			if (!ep.Ok()) {
+				refusal = "acl: OIDC discovery against " + issuer + " failed: " + ep.error;
+				continue;
+			}
+			auto tokens = oidc::PasswordGrant(ep, config.client_id, config.client_secret, user, password);
+			if (!tokens.Ok()) {
+				// the IdP's own refusal IS the gate: unsupported_grant_type means ROPC is off there
+				refusal = "acl: the IdP at " + issuer + " refused the password grant: " + tokens.error;
+				continue;
+			}
+			Principal principal;
+			bool verified = false;
+			try {
+				verified = state->store->VerifyPrincipal(true, tokens.access_token, principal);
+			} catch (std::exception &) {
+				verified = false;
+			}
+			if (!verified) {
+				refusal = "acl: the token the IdP at " + issuer +
+				          " answered does not verify against "
+				          "this door's issuers";
+				continue;
+			}
+			*middleware = std::make_shared<PasswordHandshakeMiddleware>(tokens.access_token);
+			return arrow::Status::OK();
+		}
+		return flight::MakeFlightError(flight::FlightStatusCode::Unauthenticated, refusal);
+	}
+
+private:
+	shared_ptr<FlightDoorState> state;
+	bool has_tls;
 };
 
 class AclFlightSqlServer : public flightsql::FlightSqlServerBase {
@@ -1628,11 +1854,11 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		// spec 058: the Arrow Flight SQL JDBC driver (DBeaver) opens a connection by calling the
 		// Handshake RPC, and a server with no auth_handler answers it "This service does not have an
 		// authentication mechanism enabled" - so the driver cannot even connect, though pyarrow and
-		// ADBC, which never handshake, work. A NoOpAuthHandler makes Handshake a no-op success; it
-		// weakens nothing, because the real gate is the per-call `authorization: Bearer` header every
-		// RPC still carries (TokenFromHeaders), which NoOpAuthHandler does not touch. A call with no
-		// valid token is refused exactly as before.
-		options.auth_handler = std::make_shared<flight::NoOpAuthHandler>();
+		// ADBC, which never handshake, work. The door's handler keeps that a no-op success (the real
+		// gate is the per-call `authorization: Bearer` header every RPC still carries), and spec 064
+		// adds the two pre-auth answers: the `discover-auth` payload reads the discovery document,
+		// and a BasicAuth handshake runs the IdP-gated password grant (the middleware below).
+		options.auth_handler = std::make_shared<AclDoorAuthHandler>(door.state);
 		if (has_tls) {
 			auto cert = ReadPem(context, FlatVector::GetData<string_t>(args.data[1])[row].GetString(), "certificate");
 			auto key = ReadPem(context, FlatVector::GetData<string_t>(args.data[2])[row].GetString(), "key");
@@ -1641,6 +1867,9 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		// spec 050: the cookie identifies a client connection, which is what lets a session persist
 		std::shared_ptr<flight::ServerMiddlewareFactory> cookie_factory = std::make_shared<CookieMiddlewareFactory>();
 		options.middleware.emplace_back(string(COOKIE_MIDDLEWARE_KEY), std::move(cookie_factory));
+		// spec 064: a BasicAuth Handshake becomes the IdP-gated password grant; TLS-only by refusal
+		options.middleware.emplace_back(string("acl-password-handshake"),
+		                                std::make_shared<PasswordHandshakeFactory>(door.state, has_tls));
 		auto init = door.server->Init(options);
 		if (!init.ok()) {
 			throw BinderException("acl_flight_serve: %s", init.ToString());

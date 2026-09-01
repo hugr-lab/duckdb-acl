@@ -810,7 +810,8 @@ void AclAlterGrantFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 }
 
 //! acl_alter_issuer(issuer, field, value): field is keys | jwks_uri | audiences | algs | role_claim |
-//! claim_map. `keys` and `jwks_uri` are alternatives, so setting either clears the other.
+//! claim_map | client_id | client_secret. `keys` and `jwks_uri` are alternatives, so setting either
+//! clears the other; an empty client value clears that credential (spec 064).
 void AclAlterIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto issuer = RequiredArg(args, 0, row, "acl_alter_issuer", "issuer");
@@ -954,10 +955,12 @@ void AclRevokeAdminFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_claim, claim_map_json[, jwks_uri]):
-//! register an offline JWT issuer (spec 007). keys_json is a JWKS (RSA n/e, EC x/y, oct k) or a PEM
-//! public key; jwks_uri (spec 023) names a document to read them from instead - an https URL or a file
-//! an operator refreshes. Exactly one of the two carries the keys.
+//! acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_claim, claim_map_json[, jwks_uri
+//! [, client_id[, client_secret]]]): register an offline JWT issuer (spec 007). keys_json is a JWKS
+//! (RSA n/e, EC x/y, oct k) or a PEM public key; jwks_uri (spec 023) names a document to read them
+//! from instead - an https URL or a file an operator refreshes. Exactly one of the two carries the
+//! keys. client_id (spec 064) is the app registration the node runs the password grant as and what
+//! auth discovery advertises; client_secret only for a confidential client.
 void AclDefineIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		IssuerConfig config;
@@ -976,6 +979,12 @@ void AclDefineIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result
 		}
 		config.role_claim = OptionalArg(args, 4, row, "roles");
 		config.claim_map = OptionalArg(args, 5, row, "");
+		config.client_id = OptionalArg(args, 7, row, "");
+		config.client_secret = OptionalArg(args, 8, row, "");
+		if (!config.client_secret.empty() && config.client_id.empty()) {
+			throw BinderException("acl_define_issuer: a client_secret without a client_id authenticates "
+			                      "nothing - state the client_id it belongs to");
+		}
 		StoreOf(state).DefineIssuer(std::move(config));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -1540,7 +1549,10 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);
 	register_admin_set("acl_define_role", {{v, v}, {v, v, v}}, AclDefineRoleFunc);
 	// offline JWT verification (spec 007)
-	register_admin_set("acl_define_issuer", {{v, v, v, v, v, v}, {v, v, v, v, v, v, v}}, AclDefineIssuerFunc);
+	register_admin_set(
+	    "acl_define_issuer",
+	    {{v, v, v, v, v, v}, {v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v, v}},
+	    AclDefineIssuerFunc);
 	register_admin("acl_map_role", {v, v, v, v}, AclMapRoleFunc);
 	// ALTER of existing objects (spec 009)
 	register_admin("acl_alter_relation", {v, v, v, v}, AclAlterRelationFunc);
