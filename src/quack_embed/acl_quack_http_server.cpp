@@ -501,10 +501,12 @@ bool StopAclQuackServer(const string &uri) {
 		gone = std::move(it->second);
 		g_servers.erase(it);
 	}
-	// Free the listening port synchronously; the full teardown (worker-pool join) runs off-thread so
-	// the caller's statement does not block on in-flight drains.
+	// Stop accepting (frees the port), then tear down fully and SYNCHRONOUSLY - joining the listener
+	// and the worker pool here rather than on a detached thread. The detach saved the caller a moment
+	// on a busy server, but a detached teardown racing process exit is exactly what left a joinable
+	// std::thread to be destroyed under us on Linux ("terminate called without an active exception").
 	gone->StopAccepting();
-	std::thread([srv = std::move(gone)]() mutable { srv.reset(); }).detach();
+	gone.reset();
 	return true;
 }
 

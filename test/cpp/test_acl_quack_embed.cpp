@@ -66,6 +66,11 @@ struct FakeIdp {
 			thread.join();
 		}
 	}
+	//! RAII: if any Exec throws mid-test, the unwind must not destroy a joinable thread (that is a
+	//! std::terminate). Stop() is safe to call twice.
+	~FakeIdp() {
+		Stop();
+	}
 };
 
 bool FileExists(const std::string &path) {
