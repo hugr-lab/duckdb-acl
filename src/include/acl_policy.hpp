@@ -367,7 +367,7 @@ struct PolicyStore {
 	                         const string &comment);
 	void CatalogDropReference(const string &vcat, const string &name);
 	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
-	                  const string &rls = "", const string &columns = "");
+	                  const string &rls = "", const string &columns = "", bool judge_columns = true);
 	void CatalogRevoke(const string &role, const string &vcat);
 	void CatalogDropRelation(const string &vcat, const string &vname);
 	// DROP of the remaining virtual-catalog elements (spec 010). Dropping a catalog removes its own

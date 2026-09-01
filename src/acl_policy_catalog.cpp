@@ -855,7 +855,9 @@ struct CatalogBackend {
 		out.rls_unchecked = out.rls_unchecked || grants.Unchecked();
 		if (predicate.empty() && !restricts) {
 			for (auto &column : object_columns) {
-				out.projection.push_back(column.second.empty() ? column.first : column.second + " AS " + column.first);
+				// the stored name is bare (spec 065 unquotes at parse), so quoting is the emitter's job
+				out.projection.push_back(column.second.empty() ? Ident(column.first)
+				                                               : column.second + " AS " + Ident(column.first));
 			}
 			return;
 		}
@@ -876,7 +878,8 @@ struct CatalogBackend {
 		}
 		if (!restricts) {
 			for (auto &column : object_columns) {
-				out.projection.push_back(column.second.empty() ? column.first : column.second + " AS " + column.first);
+				out.projection.push_back(column.second.empty() ? Ident(column.first)
+				                                               : column.second + " AS " + Ident(column.first));
 			}
 			out.subquery_form = out.subquery_form || !out.rls.empty();
 			return;
@@ -1254,8 +1257,8 @@ struct CatalogBackend {
 		string objects = "objects AS (SELECT DISTINCT r.\"vcat\" AS vcat,"
 		                 " CASE WHEN position('.' IN r.\"vname\") > 0"
 		                 " THEN regexp_extract(r.\"vname\", '^(.*)[.][^.]*$', 1) ELSE 'main' END AS vschema,"
-		                 " regexp_extract(r.\"vname\", '([^.]*)$', 1) AS vname, r.\"form\" AS form,"
-		                 " r.\"comment\" AS comment,"
+		                 " regexp_extract(r.\"vname\", '([^.]*)$', 1) AS vname, r.\"vname\" AS stored_name,"
+		                 " r.\"form\" AS form, r.\"comment\" AS comment,"
 		                 " str_split(r.\"phys\", '.') AS parts FROM " +
 		                 Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " +
 		                 visible + ")";
@@ -1389,20 +1392,47 @@ struct CatalogBackend {
 		}
 		auto physical = "i.\"table_catalog\" = o.parts[1] AND i.\"table_schema\" = o.parts[2]"
 		                " AND i.\"table_name\" = o.parts[3]";
+		// spec 065: is_insertable_into follows the grant, not the physical row - a capability the
+		// principal does not hold, or a read-only (masked) relation, answers NO. The caps chain is
+		// judged the way the resolver's default reads it (spec 012: unstated = the data capabilities,
+		// an explicit '{}' = none); a caps JSON is admin-written, so the true-flag test is textual,
+		// like the rest of this file's caps SQL. The listing is a hint - the write path stays the
+		// authority - so a YES the write path would still refuse errs on the side it must.
+		auto caps_allow_insert = [&](const string &caps_expr) {
+			return "(" + caps_expr + " IS NULL OR trim(" + caps_expr + ") = '' OR regexp_matches(" + caps_expr +
+			       ", '(?i)\"insert\"\\s*:\\s*true'))";
+		};
+		string o_oc_join = HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
+		                                         " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = o.vcat"
+		                                         " AND oc.\"vname\" = o.stored_name"
+		                                   : string();
+		// writability is the stored authority's verdict, not re-derived: the relation's form was
+		// decided where it was written (RenameOnlyColumns) - only the plain alias form takes writes,
+		// a mask or an RLS'd relation is the read-only SUBQUERY form
+		string object_insertable = "CASE WHEN o.form = 'alias' AND EXISTS (SELECT 1 FROM grants g" + o_oc_join +
+		                           " WHERE g.\"vcat\" = o.vcat AND " +
+		                           caps_allow_insert(CapsExpr("o.stored_name", "o.vcat")) +
+		                           ") THEN 'YES' ELSE 'NO' END AS is_insertable_into";
+		string alias_schema_caps = "coalesce((SELECT nullif(trim(sc.\"caps\"), '') FROM " + Tbl("role_schemas") +
+		                           " sc WHERE sc.\"role\" = g.\"role\" AND sc.\"vcat\" = a.vcat"
+		                           " AND sc.\"schema_path\" = a.path), g.\"caps\")";
+		string alias_insertable = "CASE WHEN EXISTS (SELECT 1 FROM grants g WHERE g.\"vcat\" = a.vcat AND " +
+		                          caps_allow_insert(alias_schema_caps) +
+		                          ") THEN 'YES' ELSE 'NO' END AS is_insertable_into";
 		// the comment is the virtual object's own: a physical comment describes the physical table, and
 		// may say things about it the role is not reading (spec 035)
 		string tables_sql =
 		    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
-		           " o.comment AS \"TABLE_COMMENT\")"
-		           " FROM objects o JOIN information_schema.tables i ON ") +
-		    physical +
+		           " o.comment AS \"TABLE_COMMENT\", ") +
+		    object_insertable + ") FROM objects o JOIN information_schema.tables i ON " + physical +
 		    " WHERE len(o.parts) = 3"
 		    " UNION ALL BY NAME"
 		    " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
-		    " 'VIEW' AS table_type FROM objects o WHERE o.form = 'view'"
+		    " 'VIEW' AS table_type, 'NO' AS is_insertable_into FROM objects o WHERE o.form = 'view'"
 		    " UNION ALL BY NAME"
-		    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema)"
-		    " FROM aliases a JOIN information_schema.tables i"
+		    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +
+		    alias_insertable +
+		    ") FROM aliases a JOIN information_schema.tables i"
 		    " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
 		    " WHERE len(a.parts) = 2";
 		if (surface == "tables") {
@@ -1585,8 +1615,14 @@ struct CatalogBackend {
 			                    : has_key + " AS has_primary_key, NULL::BIGINT AS estimated_size, " + column_count +
 			                          ", NULL::BIGINT AS index_count, NULL::BIGINT AS check_constraint_count, " + ddl +
 			                          " AS sql";
+			// spec 065: an object with no visible column has no DDL to synthesize - a NULL `sql` broke
+			// a quack client on the whole catalog, so the row is not listed at all (catalog facts only:
+			// vcolumns is the same fold every other answer here uses)
+			// the filter is the tables branch's own: only there is `sql` synthesized from the columns,
+			// and a view whose shape was never probed must stay listed (its read still answers)
 			return prelude + ", vcolumns AS (" + effective_columns + ") " + head + tail + " FROM (" + tables_sql +
-			       ") t WHERE t.table_type " + (views ? "=" : "<>") + " 'VIEW'";
+			       ") t WHERE t.table_type " + (views ? "=" : "<>") + " 'VIEW'" +
+			       (views ? string() : " AND EXISTS (SELECT 1" + of_this_table + ")");
 		}
 		if (surface == "show_tables_expanded") {
 			// `SHOW ALL TABLES`: every table of every catalog the principal holds, with the columns it
@@ -2739,7 +2775,8 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 		// readable but typeless, and metadata cannot describe it (spec 010 part 3).
 		vector<string> items;
 		for (auto &column : columns) {
-			items.push_back(column.second.empty() ? column.first : column.second + " AS " + column.first);
+			items.push_back(column.second.empty() ? acl_detail::Ident(column.first)
+			                                      : column.second + " AS " + acl_detail::Ident(column.first));
 		}
 		derived = catalog.ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + phys, false, {}, schema);
 		if (!derived) {
@@ -3769,13 +3806,89 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 	catalog->Write(statements);
 }
 
+namespace {
+
+//! spec 065: a grant's COLUMNS list is judged where it is written - against the shapes the catalog
+//! already knows, never by probing. Only the BARE items are judged: a `name = expr` entry defines a
+//! new column (a mask, a computed column - spec 026) and owes nothing to any existing name. Names
+//! come from relation_columns (declared mappings) and object_columns (declared/probed shapes,
+//! relations and functions alike), read with the same ParseColumnList the read path uses. The
+//! judgment fires only when it CAN be right: a scope with no declared shape at all (an empty
+//! catalog, a grant written before its objects), one shape-less object, an undeclared table
+//! function, or any alias schema - and the write is allowed, because the list may match there. A
+//! bare list that matches nothing anywhere known is certainly a typo, and the principal it
+//! misconfigures would otherwise meet the engine's error instead of this one.
+void ValidateGrantColumns(CatalogBackend &catalog, const string &vcat, const string &columns,
+                          const string &object_scope) {
+	if (columns.empty() || catalog.FunctionMode()) {
+		return; // nothing listed, or a keyed-lookup driver with nothing to enumerate
+	}
+	vector<string> names;
+	for (auto &column : acl_detail::ParseColumnList(columns)) {
+		auto name = column.first;
+		StringUtil::Trim(name);
+		if (!name.empty() && column.second.empty()) {
+			names.push_back(Lit(StringUtil::Lower(name)));
+		}
+	}
+	if (names.empty()) {
+		return; // every item defines its own column; there is nothing that must already exist
+	}
+	auto in_list = "(" + StringUtil::Join(names, ", ") + ")";
+	string scope = object_scope.empty() ? string() : " AND \"vname\" = " + Lit(object_scope);
+	// nothing declared in scope - a fresh catalog, a grant written before its objects - is not
+	// judgeable; neither is an object-scope target without a declared shape
+	auto shaped =
+	    catalog.Query("SELECT 1 FROM (SELECT 1 FROM " + catalog.Tbl("relation_columns") +
+	                  " WHERE \"vcat\" = " + Lit(vcat) + scope + " UNION ALL SELECT 1 FROM " +
+	                  catalog.Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) + scope + ") s LIMIT 1");
+	if (shaped->RowCount() == 0) {
+		return;
+	}
+	if (object_scope.empty()) {
+		// catalog scope: an alias schema or a shape-less object anywhere means we cannot judge
+		auto aliases = catalog.Query("SELECT 1 FROM " + catalog.Tbl("schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                             " AND \"phys_path\" IS NOT NULL LIMIT 1");
+		if (aliases->RowCount() > 0) {
+			return;
+		}
+		auto shapeless = catalog.Query("SELECT 1 FROM (SELECT \"vname\" FROM " + catalog.Tbl("relations") +
+		                               " WHERE \"vcat\" = " + Lit(vcat) + " UNION ALL SELECT \"vname\" FROM " +
+		                               catalog.Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                               " AND \"kind\" = 'table') o WHERE NOT EXISTS (SELECT 1 FROM " +
+		                               catalog.Tbl("relation_columns") + " c WHERE c.\"vcat\" = " + Lit(vcat) +
+		                               " AND c.\"vname\" = o.\"vname\")"
+		                               " AND NOT EXISTS (SELECT 1 FROM " +
+		                               catalog.Tbl("object_columns") + " oc WHERE oc.\"vcat\" = " + Lit(vcat) +
+		                               " AND oc.\"vname\" = o.\"vname\") LIMIT 1");
+		if (shapeless->RowCount() > 0) {
+			return;
+		}
+	}
+	auto match = catalog.Query("SELECT 1 FROM (SELECT lower(\"name\") AS n FROM " + catalog.Tbl("relation_columns") +
+	                           " WHERE \"vcat\" = " + Lit(vcat) + scope + " UNION ALL SELECT lower(\"name\") FROM " +
+	                           catalog.Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) + scope +
+	                           ") s WHERE n IN " + in_list + " LIMIT 1");
+	if (match->RowCount() == 0) {
+		throw BinderException(
+		    "acl admin: COLUMNS (%s) matches no column of %s - "
+		    "every shape this catalog declares was checked, and nothing the list names exists",
+		    columns, object_scope.empty() ? "any object of catalog \"" + vcat + "\"" : "\"" + object_scope + "\"");
+	}
+}
+
+} // namespace
+
 void PolicyStore::CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
-                               const string &rls, const string &columns) {
+                               const string &rls, const string &columns, bool judge_columns) {
 	RequireCatalog(catalog, "acl_grant_catalog");
 	if (vcat.empty()) {
 		throw BinderException("acl admin: a grant needs a catalog name");
 	}
 	acl_detail::ParseCaps(caps_json); // validate before persisting
+	if (judge_columns) {              // only where the list itself is being written - never re-judging a stored one
+		ValidateGrantColumns(*catalog, vcat, columns, "");
+	}
 	// the verdict is read on the connection that writes it (spec 027), so what it judges the predicate
 	// against is the catalog this grant commits into
 	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
@@ -4409,7 +4522,7 @@ void PolicyStore::CatalogAlterGrant(const string &role, const string &vcat, cons
 	} else {
 		throw BinderException("acl admin: unknown grant property \"%s\"", field);
 	}
-	CatalogGrant(role, vcat, caps, is_main, rls, columns);
+	CatalogGrant(role, vcat, caps, is_main, rls, columns, field == "columns");
 }
 
 void PolicyStore::CatalogAlterIssuer(const string &issuer, const string &field, const string &value) {
@@ -4539,6 +4652,7 @@ void PolicyStore::CatalogMapRole(const string &issuer, const string &source, con
 void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,
                                        const string &caps_json, const string &rls, const string &columns) {
 	RequireCatalog(catalog, "acl catalog");
+	ValidateGrantColumns(*catalog, vcat, columns, vname);
 	// spec 032: a capability that cannot apply to what it names is a misunderstanding, not a no-op, and
 	// the refusal belongs here rather than in the pre-check - the legacy wrappers write a grant without
 	// passing through that one.

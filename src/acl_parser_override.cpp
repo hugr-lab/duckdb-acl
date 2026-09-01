@@ -401,6 +401,81 @@ string ClaimMapToJson(const string &list) {
 	return "{" + StringUtil::Join(entries, ", ") + "}";
 }
 
+//! spec 065: a management COLUMNS list is written like SQL, so a quoted identifier must mean the
+//! name it quotes - `COLUMNS ("odd name", id = pk)` stores `odd name` (with its space), not the
+//! quotes. Only the item's NAME (left of a top-level `=`) is unquoted: the right side is an
+//! expression, where a quoted identifier is already valid SQL. Stored verbatim, the quotes made the
+//! item match no column, ever - the function form never had the defect.
+string UnquoteColumnsList(const string &raw) {
+	vector<string> items;
+	for (auto &item : SplitTopLevel(raw, ',')) {
+		auto text = item;
+		StringUtil::Trim(text);
+		if (text.empty()) {
+			continue;
+		}
+		// the first top-level `=` splits name from expression; one inside quotes or parens is the
+		// expression's own (the same reading SplitTopLevel gives a comma)
+		idx_t split = text.size();
+		char quote = 0;
+		idx_t depth = 0;
+		for (idx_t i = 0; i < text.size(); i++) {
+			auto c = text[i];
+			if (quote) {
+				if (c == quote) {
+					quote = 0;
+				}
+			} else if (c == '\'' || c == '"') {
+				quote = c;
+			} else if (c == '(') {
+				depth++;
+			} else if (c == ')' && depth > 0) {
+				depth--;
+			} else if (c == '=' && depth == 0) {
+				split = i;
+				break;
+			}
+		}
+		auto name = text.substr(0, split);
+		StringUtil::Trim(name);
+		if (!name.empty() && name.front() == '"') {
+			// the quoted token may carry a suffix (`"odd name" NOT NULL`, spec 048's nullability
+			// mark): unquote the token, keep the suffix - the consumer strips it as it always did
+			idx_t close = name.size();
+			for (idx_t i = 1; i < name.size(); i++) {
+				if (name[i] != '"') {
+					continue;
+				}
+				if (i + 1 < name.size() && name[i + 1] == '"') {
+					i++; // a doubled quote is a literal one
+					continue;
+				}
+				close = i;
+				break;
+			}
+			if (close < name.size()) {
+				auto bare = StringUtil::Replace(name.substr(1, close - 1), "\"\"", "\"");
+				// the stored csv form cannot carry these characters in a name: every later reader
+				// splits on them, and a silent re-split would grant something the admin never wrote
+				if (bare.find(',') != string::npos || bare.find('=') != string::npos) {
+					throw BinderException("acl admin: a column name containing ',' or '=' cannot be carried by a "
+					                      "COLUMNS list - the stored form splits on them (got \"%s\")",
+					                      bare);
+				}
+				name = bare + name.substr(close + 1);
+			}
+		}
+		if (split < text.size()) {
+			auto rest = text.substr(split + 1);
+			StringUtil::Trim(rest);
+			items.push_back(name + " = " + rest);
+		} else {
+			items.push_back(name);
+		}
+	}
+	return StringUtil::Join(items, ", ");
+}
+
 //! The clauses a grant is written with, in any order: CAPS '<json>' RLS '<predicate>'
 //! COLUMNS '<name[=expr], …>' - the grant's own policy (spec 011) - plus MAIN for a catalog grant
 void GrantPolicyClauses(AdminScanner &s, string &caps, string &rls, string &columns, bool *main = nullptr) {
@@ -419,7 +494,7 @@ void GrantPolicyClauses(AdminScanner &s, string &caps, string &rls, string &colu
 			more = true;
 		}
 		if (s.Accept("columns")) {
-			columns = s.List("a column list");
+			columns = UnquoteColumnsList(s.List("a column list"));
 			more = true;
 		}
 		if (main && s.Accept("main")) {
@@ -680,7 +755,7 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 	for (bool more = true; more;) {
 		more = false;
 		if (s.Accept("columns")) {
-			columns = s.List("columns list");
+			columns = UnquoteColumnsList(s.List("columns list"));
 			more = true;
 		}
 		if (s.Accept("rls")) {
@@ -839,7 +914,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 		string columns, rls;
 		if (s.Accept("columns")) {
-			columns = s.List("columns list");
+			columns = UnquoteColumnsList(s.List("columns list"));
 		}
 		if (s.Accept("rls")) {
 			rls = s.List("RLS predicate");
@@ -996,8 +1071,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 				                     {Value(role), Value(vcat), Value("rls"), Value(s.Quoted("an RLS predicate"))});
 			}
 			if (s.Accept("columns")) {
-				return MakeAdminCall("acl_alter_grant",
-				                     {Value(role), Value(vcat), Value("columns"), Value(s.Quoted("a column list"))});
+				return MakeAdminCall("acl_alter_grant", {Value(role), Value(vcat), Value("columns"),
+				                                         Value(UnquoteColumnsList(s.Quoted("a column list")))});
 			}
 			s.Expect("main");
 			auto flag = s.Word("true or false");
@@ -1078,8 +1153,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 				                                            Value(s.Name("a physical table path"))});
 			}
 			if (s.Accept("columns")) {
-				return MakeAdminCall("acl_alter_relation",
-				                     {Value(vcat), Value(vname), Value("columns"), Value(s.List("columns list"))});
+				return MakeAdminCall("acl_alter_relation", {Value(vcat), Value(vname), Value("columns"),
+				                                            Value(UnquoteColumnsList(s.List("columns list")))});
 			}
 			s.Expect("rls");
 			return MakeAdminCall("acl_alter_relation",
