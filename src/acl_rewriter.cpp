@@ -1034,7 +1034,13 @@ private:
 		// function stays denied by the gate - this is not a hole in it but a statement the server
 		// generated for this principal, recognised by the exact stream id the override recovered the
 		// principal from. An id that is not that one is refused by the gate below, as it should be.
-		if (!principal.ingest_stream.empty() && StringUtil::CIEquals(vname, "scan_data_from_quack_client") &&
+		// The drain function is acl_quack_scan_data for the embedded door (spec 063), or the legacy
+		// scan_data_from_quack_client for a co-loaded stock quack - the gate must exempt either when it
+		// is this principal's own stream. (acl_quack_scan_data also trips the acl_-prefix denial in the
+		// gate, so without this exemption the door's own drain refuses itself.)
+		if (!principal.ingest_stream.empty() &&
+		    (StringUtil::CIEquals(vname, "acl_quack_scan_data") ||
+		     StringUtil::CIEquals(vname, "scan_data_from_quack_client")) &&
 		    function.GetArguments().size() == 1) {
 			auto &arg = function.GetArguments()[0].GetExpression();
 			if (arg.GetExpressionType() == ExpressionType::VALUE_CONSTANT) {

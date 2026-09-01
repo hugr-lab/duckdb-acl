@@ -6,3 +6,7 @@
 	path = duckdb
 	url = https://github.com/duckdb/duckdb
 	branch = main
+[submodule "third_party/quack"]
+	path = third_party/quack
+	url = https://github.com/duckdb/duckdb-quack
+	shallow = true

@@ -1362,9 +1362,13 @@ void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &ou
 //! The parenthesis is not pedantry: the resolver embeds the name it is looking up as a literal in its
 //! own catalog SQL, so a bare occurrence says nothing about what the statement does. A call is what a
 //! generated ingest statement always contains and a quoted name never is.
-//! The table function quack's server generates to drain a client's streamed insert. Never a name a
+//! The table function a quack server generates to drain a client's streamed insert. Never a name a
 //! client can author: it is on the denylist for a principal, and this statement is the server's own.
-constexpr const char *STREAM_SCAN = "scan_data_from_quack_client";
+//! Two names: the embedded door (spec 063) drains through `acl_quack_scan_data`, but a stock quack
+//! co-loaded and serving alongside still generates the original `scan_data_from_quack_client`. The
+//! fence catches BOTH, so either server's unprefixed drain fails closed here.
+constexpr const char *STREAM_SCAN = "acl_quack_scan_data";
+constexpr const char *STREAM_SCAN_LEGACY = "scan_data_from_quack_client";
 
 bool CallsFunctionNamed(const string &query, const char *name_lower, idx_t name_size) {
 	if (query.size() < name_size) {
@@ -1406,22 +1410,23 @@ bool CallsFunctionNamed(const string &query, const char *name_lower, idx_t name_
 //! Spec 042 attaches the principal here instead of refusing, when it can be recovered; the refusal
 //! below is what remains when it cannot.
 bool DrainsQuackClientStream(const string &query) {
-	return CallsFunctionNamed(query, STREAM_SCAN, strlen(STREAM_SCAN));
+	return CallsFunctionNamed(query, STREAM_SCAN, strlen(STREAM_SCAN)) ||
+	       CallsFunctionNamed(query, STREAM_SCAN_LEGACY, strlen(STREAM_SCAN_LEGACY));
 }
 
 //! The one stream id a generated ingest statement drains, or empty when the statement is not exactly
 //! one such call with one quoted argument. Deliberately unforgiving: every shape we do not recognise
 //! ends in a refusal, so reading this wrong costs a bulk load and never a policy.
-string ExtractStreamId(const string &query) {
-	auto name_size = strlen(STREAM_SCAN);
+string ExtractStreamIdFor(const string &query, const char *scan_name) {
+	auto name_size = strlen(scan_name);
 	auto ci_match = [](char a, char b) {
 		return StringUtil::CharacterToLower(a) == b;
 	};
 	string found;
 	idx_t pos = 0;
 	while (pos < query.size()) {
-		auto it = std::search(query.begin() + UnsafeNumericCast<int64_t>(pos), query.end(), STREAM_SCAN,
-		                      STREAM_SCAN + name_size, ci_match);
+		auto it = std::search(query.begin() + UnsafeNumericCast<int64_t>(pos), query.end(), scan_name,
+		                      scan_name + name_size, ci_match);
 		if (it == query.end()) {
 			break;
 		}
@@ -1452,6 +1457,17 @@ string ExtractStreamId(const string &query) {
 		pos = scan;
 	}
 	return found;
+}
+
+//! The stream id, from whichever drain name the statement uses (embedded or a co-loaded stock quack).
+//! A statement that somehow named both would extract from neither cleanly, so the embedded name is
+//! tried first and the legacy only when the embedded is absent.
+string ExtractStreamId(const string &query) {
+	auto id = ExtractStreamIdFor(query, STREAM_SCAN);
+	if (!id.empty()) {
+		return id;
+	}
+	return ExtractStreamIdFor(query, STREAM_SCAN_LEGACY);
 }
 
 //! Recover the principal a generated ingest statement belongs to and rewrite it as an ordinary

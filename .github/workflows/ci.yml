@@ -141,11 +141,15 @@ jobs:
   build-test-flight:
     name: Build + test (flight door)
     runs-on: ubuntu-24.04
-    if: ${{ github.event_name != 'pull_request' }}
     env:
       GEN: ninja
-      # No ACL_FLIGHT: the door is what a default build produces now. This job is therefore the one
-      # that builds what community-extensions will build, which is why it is worth its 90 minutes.
+      # No ACL_NO_FLIGHT: the door is what a default build produces, so this job builds the
+      # full-functionality configuration community-extensions ships - flight AND the embedded quack
+      # server (spec 063). It runs on PRs too, not only on push: 063's whole surface (the door's TLS
+      # and its OpenSSL RNG) lives on this path, so it must be a red build on a PR, not a surprise at
+      # distribution time.
+      # ACL_QUACK adds the quack *client* loadable so the embedded-door cpp test can ATTACH to itself.
+      ACL_QUACK: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
     steps:
@@ -194,7 +198,11 @@ jobs:
         run: make check-flight-deps
 
       - name: Unit suites
-        run: build/release/test/unittest test/sql/acl.test
+        run: |
+          build/release/test/unittest test/sql/acl.test
+          # the embedded quack door's cpp test runs HERE, on the flight build, so its TLS + OpenSSL
+          # RNG path is exercised (the no-flight linux job above builds it cleartext-only)
+          make test-cpp
 
       - name: Flight door end to end
         run: make test-flight

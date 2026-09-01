@@ -188,10 +188,20 @@ token)` installs both and starts the listener, refusing an instance a client cou
 (anonymous admin on, override not `STRICT`, no server token, quack not loaded);
 `acl_quack_stop(uri)` closes the door and sweeps the sessions it served. quack's own fourteen functions
 are on the denylist — the gate is a denylist, so a loaded extension widens the surface until named.
-**Spec 062** fronts the door: the public bind belongs to our front listener (the real quack moves
-to loopback), `acl_quack_serve(uri, token[, cert, key])` terminates TLS there, and
-`GET /.well-known/quack-auth` serves the node's issuers live - so `ISSUER` in a provider secret
-(spec 061) is optional when its SCOPE names the door. Streamed ingest
+**Spec 062 → 063**: the door is now quack's **server compiled into acl** (`third_party/quack` submodule,
+the server object graph in `src/quack_embed/`), replacing the spec-062 loopback front. `AclQuackServer`
+binds the public address itself, terminates TLS (`acl_quack_serve(uri, token[, cert, key][, mode])`,
+inline PEM or read through the filesystem), and answers `GET /.well-known/quack-auth` from the live
+policy — so `ISSUER` in a provider secret (spec 061) is optional when its SCOPE names the door. Its SQL
+surface is `acl_quack_*`-named (settings and the `acl_quack_scan_data` drain), so a standalone quack
+co-loads without a clash; `mode := 'plain'` raises a bare, discovery-less (still acl-gated) server for
+TLS-terminating-upstream deployments. The server's token/session RNG comes from an OpenSSL-backed
+`EncryptionUtil` acl registers at serve time (only-if-empty, flight builds), so it needs neither `LOAD
+httpfs` nor `force_mbedtls_unsafe` — duckdb's bundled mbedtls RNG is a non-crypto PRNG, unfit for auth
+tokens. A namespace-alias shim (`acl_quack_httplib_ns.hpp`) lets quack's
+`duckdb_httplib::` sources compile in the OpenSSL httplib namespace; `sync.py` regenerates the few
+acl_-renamed TUs on a submodule bump; the embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
+Streamed ingest
 (`SEND_DATA`) is generated **unprefixed** by the server; spec 042 recovers the principal from the
 stream id the statement itself carries and enforces the write as that principal's — the refusal
 remains only where recovery fails. Staging on quack is a **granted schema** (spec 056): a client's

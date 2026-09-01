@@ -1,9 +1,13 @@
-// The quack door's front listener (spec 062): the public bind belongs to the front, which answers
-// /.well-known/quack-auth itself and streams everything else to the loopback quack. Exercised end to
-// end: the discovery document names the fixture issuer; a real quack ATTACH rides through the proxy;
-// an ISSUER-less provider secret discovers the issuer from the door; and the TLS variant serves the
-// same discovery over https (checked with curl -k against a throwaway openssl cert). Needs an
-// ACL_QUACK build for the proxy legs; skips them gracefully otherwise.
+// The embedded quack door (spec 063): quack's server compiled INTO acl, replacing the spec-062
+// loopback front. One listener owns the public address - it answers the unauthenticated
+// /.well-known/quack-auth itself, speaks the quack protocol directly (a real client ATTACHes and
+// reads its own RLS slice), and terminates TLS where asked. Exercised end to end: discovery names the
+// fixture issuers; a real quack client rides the embedded server; an ISSUER-less provider secret
+// discovers the issuer from the door; the TLS variant serves the same discovery over https; and a
+// leaked server of a dead instance is reclaimed by a later serve of the same address.
+//
+// Needs an ACL_QUACK=1 build for the client leg (the quack loadable does the ATTACH); skips it
+// gracefully otherwise. httpfs is loaded so the server has a writable crypto module for its RNG.
 
 #include "acl_test_util.hpp"
 
@@ -62,6 +66,11 @@ struct FakeIdp {
 			thread.join();
 		}
 	}
+	//! RAII: if any Exec throws mid-test, the unwind must not destroy a joinable thread (that is a
+	//! std::terminate). Stop() is safe to call twice.
+	~FakeIdp() {
+		Stop();
+	}
 };
 
 bool FileExists(const std::string &path) {
@@ -83,7 +92,13 @@ std::string Shell(const std::string &command) {
 	return out;
 }
 
-void SetupFixture(Connection &con, const std::string &extra_issuer) {
+void SetupFixture(Connection &con, const std::string &httpfs_ext, const std::string &extra_issuer) {
+	// The embedded server's RNG needs a crypto module. httpfs provides one (its OpenSSL util), but acl
+	// registers its own OpenSSL-backed one at serve time too, so an empty httpfs_ext exercises that
+	// self-contained path — no httpfs, no force_mbedtls_unsafe.
+	if (!httpfs_ext.empty()) {
+		Exec(con, "LOAD '" + httpfs_ext + "'");
+	}
 	Exec(con, "ATTACH ':memory:' AS store");
 	Exec(con, "CREATE TABLE orders(id INTEGER, tenant VARCHAR)");
 	Exec(con, "INSERT INTO orders VALUES (1,'acme'),(2,'acme'),(3,'globex')");
@@ -111,11 +126,11 @@ void SetupFixture(Connection &con, const std::string &extra_issuer) {
 
 int main(int argc, char *argv[]) {
 	std::string extension = argc > 1 ? argv[1] : "build/release/extension/acl/acl.duckdb_extension";
-	return RunMain("the quack front: discovery + proxy + TLS (spec 062)", [&] {
+	return RunMain("the embedded quack door: discovery + real client + TLS (spec 063)", [&] {
 		auto quack_ext = std::string("build/release/extension/quack/quack.duckdb_extension");
 		auto httpfs_ext = std::string("build/release/extension/httpfs/httpfs.duckdb_extension");
 		if (!FileExists(quack_ext) || !FileExists(httpfs_ext)) {
-			std::cout << "  skip: the front test needs an ACL_QUACK=1 build\n";
+			std::cout << "  skip: the embedded-door test needs an ACL_QUACK=1 build\n";
 			return;
 		}
 		FakeIdp idp;
@@ -126,10 +141,9 @@ int main(int argc, char *argv[]) {
 		DuckDB db(nullptr, &config);
 		Connection con(db);
 		Exec(con, "LOAD '" + extension + "'");
-		Exec(con, "LOAD '" + httpfs_ext + "'");
-		Exec(con, "LOAD '" + quack_ext + "'");
-		SetupFixture(con, idp.Issuer());
-		Exec(con, "SELECT acl_quack_serve('quack:localhost:31975', 'front-token')");
+		Exec(con, "LOAD '" + quack_ext + "'"); // the CLIENT half, for the ATTACH leg; no clash (acl_quack_* names)
+		SetupFixture(con, httpfs_ext, idp.Issuer());
+		Exec(con, "SELECT acl_quack_serve('quack:localhost:31975', 'server-token')");
 
 		Scenario("the door advertises its issuers, unauthenticated", [&] {
 			auto answer = duckdb::acl::oidc::HttpGet("http://localhost:31975/.well-known/quack-auth");
@@ -139,11 +153,11 @@ int main(int argc, char *argv[]) {
 			      "...naming both configured issuers: " + answer.body);
 		});
 
-		Scenario("a real quack client rides through the front's proxy", [&] {
+		Scenario("a real quack client reads its own slice through the embedded server", [&] {
 			Exec(con, "ATTACH 'quack:localhost:31975' AS remote (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
 			auto rows = con.Query("SELECT count(*)::BIGINT FROM remote.main.orders");
-			if (CheckOk(*rows, "the proxied ATTACH answers")) {
-				Check(rows->GetValue(0, 0).GetValue<int64_t>() == 2, "...with the acme slice");
+			if (CheckOk(*rows, "the ATTACH answers")) {
+				Check(rows->GetValue(0, 0).GetValue<int64_t>() == 2, "...with the acme slice (RLS applied)");
 			}
 			Exec(con, "DETACH remote");
 		});
@@ -169,10 +183,10 @@ int main(int argc, char *argv[]) {
 
 		Exec(con, "SELECT acl_quack_stop('quack:localhost:31975')");
 
-		Scenario("the TLS front serves the same discovery over https", [&] {
+		Scenario("the TLS server serves the same discovery over https", [&] {
 			auto tmpdir = std::string(getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
-			auto cert = tmpdir + "/aclfront-cert.pem";
-			auto key = tmpdir + "/aclfront-key.pem";
+			auto cert = tmpdir + "/aclembed-cert.pem";
+			auto key = tmpdir + "/aclembed-key.pem";
 			Shell("openssl req -x509 -newkey rsa:2048 -keyout '" + key + "' -out '" + cert +
 			      "' -days 2 -nodes -subj /CN=localhost -addext subjectAltName=DNS:localhost 2>/dev/null");
 			if (!FileExists(cert) || !FileExists(key)) {
@@ -180,15 +194,15 @@ int main(int argc, char *argv[]) {
 				return;
 			}
 			if (Shell("command -v curl 2>/dev/null").empty()) {
-				std::cout << "  skip: no curl to probe the https front\n";
+				std::cout << "  skip: no curl to probe the https server\n";
 				std::remove(cert.c_str());
 				std::remove(key.c_str());
 				return;
 			}
-			auto served = con.Query("SELECT acl_quack_serve('quack:localhost:31976', 'front-token', '" + cert + "', '" +
-			                        key + "')");
+			auto served = con.Query("SELECT acl_quack_serve('quack:localhost:31976', 'server-token', '" + cert +
+			                        "', '" + key + "')");
 			if (served->HasError()) {
-				// a build without OpenSSL fronts cleartext only, and says so
+				// a build without OpenSSL serves cleartext only, and says so
 				Check(served->GetError().find("OpenSSL") != std::string::npos,
 				      "TLS on a non-TLS build is a named refusal: " + served->GetError());
 				std::remove(cert.c_str());
@@ -204,29 +218,72 @@ int main(int argc, char *argv[]) {
 			std::remove(key.c_str());
 		});
 
-		Scenario("a new instance reclaims a leaked front of a dead one (spec 062 review)", [&] {
+		Scenario("mode := 'plain' is a bare server: no discovery route, still acl-gated", [&] {
+			// an earlier scenario dropped the token's issuer; re-add it so the client can authenticate
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
+			Exec(con, "SELECT acl_define_issuer('https://issuer.test/s',"
+			          "'{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
+			          "'api://acl-test','HS256','roles','{\"tid\": \"tenant\"}')");
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
+			Exec(con, "SELECT acl_quack_serve('quack:localhost:31978', 'server-token', 'plain')");
+			auto disc = duckdb::acl::oidc::HttpGet("http://localhost:31978/.well-known/quack-auth");
+			// the route is not registered in plain mode, so discovery does not carry the issuers list
+			Check(!disc.Ok() || disc.body.find("\"issuers\"") == std::string::npos,
+			      "plain mode does not advertise discovery: " + disc.body);
+			Exec(con, "ATTACH 'quack:localhost:31978' AS bare (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
+			auto rows = con.Query("SELECT count(*)::BIGINT FROM bare.main.orders");
+			if (CheckOk(*rows, "a client still ATTACHes to the bare server")) {
+				Check(rows->GetValue(0, 0).GetValue<int64_t>() == 2, "...and the acl gate still applies (acme slice)");
+			}
+			Exec(con, "DETACH bare");
+			Exec(con, "SELECT acl_quack_stop('quack:localhost:31978')");
+		});
+
+		Scenario("the server is self-contained: serves with no httpfs and no force_mbedtls_unsafe", [&] {
+			// acl registers its own OpenSSL-backed crypto module at serve time, so the RNG works without
+			// httpfs and without the unsafe mbedtls flag (whose RNG is a non-crypto PRNG anyway).
+			DBConfig cfg;
+			cfg.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+			DuckDB bare(nullptr, &cfg);
+			Connection bc(bare);
+			Exec(bc, "LOAD '" + extension + "'");
+			SetupFixture(bc, /* no httpfs */ "", "");
+			auto served = bc.Query("SELECT acl_quack_serve('quack:localhost:31979', 'server-token')");
+			bool ok = !served->HasError();
+			// A build with OpenSSL (the flight build) registers acl's own RNG util, so serve succeeds. A
+			// build without it (ACL_NO_FLIGHT - the PR CI's linux job) has no such util, so serve is
+			// legitimately refused for want of a crypto module. Both are correct; only the flag matters.
+			bool refused_no_crypto =
+			    served->HasError() && served->GetError().find("crypto module") != std::string::npos;
+			Check(ok || refused_no_crypto, "serve without httpfs succeeds (OpenSSL build), or is refused for want of a "
+			                               "crypto module (non-OpenSSL build): " +
+			                                   (served->HasError() ? served->GetError() : "ok"));
+			if (ok) {
+				Exec(bc, "SELECT acl_quack_stop('quack:localhost:31979')");
+			}
+		});
+
+		Scenario("a new instance reclaims a leaked server of a dead one (spec 062 review, kept in 063)", [&] {
 			{
 				DBConfig cfg;
 				cfg.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
 				DuckDB dying(nullptr, &cfg);
 				Connection dc(dying);
 				Exec(dc, "LOAD '" + extension + "'");
-				Exec(dc, "LOAD '" + httpfs_ext + "'");
 				Exec(dc, "LOAD '" + quack_ext + "'");
-				SetupFixture(dc, "");
-				Exec(dc, "SELECT acl_quack_serve('quack:localhost:31977', 'front-token')");
-				// no acl_quack_stop: the instance is destroyed here, leaking its front
+				SetupFixture(dc, httpfs_ext, "");
+				Exec(dc, "SELECT acl_quack_serve('quack:localhost:31977', 'server-token')");
+				// no acl_quack_stop: the instance is destroyed here, leaking its embedded server
 			}
 			DBConfig cfg;
 			cfg.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
 			DuckDB fresh(nullptr, &cfg);
 			Connection fc(fresh);
 			Exec(fc, "LOAD '" + extension + "'");
-			Exec(fc, "LOAD '" + httpfs_ext + "'");
 			Exec(fc, "LOAD '" + quack_ext + "'");
-			SetupFixture(fc, "");
-			auto reserved = fc.Query("SELECT acl_quack_serve('quack:localhost:31977', 'front-token')");
-			Check(!reserved->HasError(), "the same address serves again - the dead instance's front was reclaimed: " +
+			SetupFixture(fc, httpfs_ext, "");
+			auto reserved = fc.Query("SELECT acl_quack_serve('quack:localhost:31977', 'server-token')");
+			Check(!reserved->HasError(), "the same address serves again - the dead instance's server was reclaimed: " +
 			                                 (reserved->HasError() ? reserved->GetError() : ""));
 			Exec(fc, "SELECT acl_quack_stop('quack:localhost:31977')");
 		});
