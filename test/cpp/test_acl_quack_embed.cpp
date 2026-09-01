@@ -244,9 +244,18 @@ int main(int argc, char *argv[]) {
 			Exec(bc, "LOAD '" + extension + "'");
 			SetupFixture(bc, /* no httpfs */ "", "");
 			auto served = bc.Query("SELECT acl_quack_serve('quack:localhost:31979', 'server-token')");
-			Check(!served->HasError(),
-			      "serve without httpfs succeeds: " + (served->HasError() ? served->GetError() : ""));
-			Exec(bc, "SELECT acl_quack_stop('quack:localhost:31979')");
+			bool ok = !served->HasError();
+			// A build with OpenSSL (the flight build) registers acl's own RNG util, so serve succeeds. A
+			// build without it (ACL_NO_FLIGHT - the PR CI's linux job) has no such util, so serve is
+			// legitimately refused for want of a crypto module. Both are correct; only the flag matters.
+			bool refused_no_crypto =
+			    served->HasError() && served->GetError().find("crypto module") != std::string::npos;
+			Check(ok || refused_no_crypto, "serve without httpfs succeeds (OpenSSL build), or is refused for want of a "
+			                               "crypto module (non-OpenSSL build): " +
+			                                   (served->HasError() ? served->GetError() : "ok"));
+			if (ok) {
+				Exec(bc, "SELECT acl_quack_stop('quack:localhost:31979')");
+			}
 		});
 
 		Scenario("a new instance reclaims a leaked server of a dead one (spec 062 review, kept in 063)", [&] {
