@@ -82,14 +82,14 @@ def main():
         out = text
         for a, b in RENAMES.items():
             out = out.replace(a, b)
-        dest = OUT / name
+        dest = OUT / ("acl_embed_" + name[len("quack_"):] if name.startswith("quack_") else name)
         dest.write_text(BANNER + out)
         # quack is formatted with its own duckdb pin's .clang-format, which differs from ours just
         # enough that a few files fail the CI check. Normalise to OUR pinned clang-format (11.0.1) so
         # the generated files stay clean on every regeneration.
         if shutil.which("clang-format"):
             subprocess.run(["clang-format", "-i", str(dest)], check=True)
-        print(f"generated src/quack_embed/{name}")
+        print(f"generated {dest.relative_to(ROOT)}")
     if failures:
         print("\nSYNC FAILED:", file=sys.stderr)
         for f in failures:
