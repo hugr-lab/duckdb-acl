@@ -24,6 +24,7 @@ set(EXTENSION_SOURCES
     src/acl_extension.cpp
     src/acl_introspection.cpp
     src/acl_parser_override.cpp
+    src/acl_door_auth.cpp
     src/oidc/acl_oidc.cpp
     src/oidc/acl_oidc_secret.cpp
     src/acl_policy.cpp

@@ -1,5 +1,6 @@
 #include "duckdb/main/connection.hpp"
 #include "acl_admin_functions.hpp"
+#include "acl_door_auth.hpp"
 #ifdef ACL_QUACK_EMBED_ENABLED
 #include "acl_quack_embed.hpp"
 #endif
@@ -1035,23 +1036,6 @@ static string ReadPemFor(ClientContext &context, const string &arg, const char *
 	return content;
 }
 
-//! The discovery document (spec 062): the issuers the node trusts, and nothing else - metadata of
-//! the same public class OIDC discovery itself serves.
-static string WellKnownQuackAuth(PolicyStore &store) {
-	string json = "{\"issuers\":[";
-	auto issuers = store.ListIssuers();
-	for (idx_t i = 0; i < issuers.size(); i++) {
-		if (i > 0) {
-			json += ",";
-		}
-		auto escaped = StringUtil::Replace(issuers[i], "\\", "\\\\");
-		escaped = StringUtil::Replace(escaped, "\"", "\\\"");
-		json += "\"" + escaped + "\"";
-	}
-	json += "]}";
-	return json;
-}
-
 //! acl_quack_serve(uri[, token]): the safe way to open the quack door (spec 041). It installs the two
 //! callbacks and starts quack's server - but only from an instance a client cannot step out of, and it
 //! says which condition is missing rather than serving something half-configured. Everything it sets
@@ -1125,9 +1109,10 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		cfg.cert_pem = cert_arg.empty() ? string() : ReadPemFor(context, cert_arg, "certificate");
 		cfg.key_pem = key_arg.empty() ? string() : ReadPemFor(context, key_arg, "private key");
 		auto shared_store = SharedStoreOf(state);
-		// per request, so the discovery document tracks an issuer added or dropped after the serve
+		// per request, so the discovery document tracks an issuer added or dropped after the serve;
+		// the document is spec 064's - the same one the Flight door answers to `discover-auth`
 		cfg.wellknown = [shared_store] {
-			return WellKnownQuackAuth(*shared_store);
+			return DoorAuthJson(*shared_store);
 		};
 		string actual_uri;
 		auto error = StartAclQuackServer(context, cfg, actual_uri);

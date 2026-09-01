@@ -108,10 +108,11 @@ void SetupFixture(Connection &con, const std::string &httpfs_ext, const std::str
 	          "'{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
 	          "'api://acl-test','HS256','roles','{\"tid\": \"tenant\"}')");
 	if (!extra_issuer.empty()) {
-		// registered ONLY so door discovery would list two issuers; removed again below
+		// registered ONLY so door discovery would list two issuers; removed again below. Carries a
+		// client_id, so discovery must advertise it in the spec-064 shape.
 		Exec(con, "SELECT acl_define_issuer('" + extra_issuer +
 		              "','{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
-		              "'api://acl-test','HS256','roles','{}')");
+		              "'api://acl-test','HS256','roles','{}','','door-app')");
 	}
 	Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG c");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders");
@@ -151,6 +152,13 @@ int main(int argc, char *argv[]) {
 			Check(answer.body.find("https://issuer.test/s") != std::string::npos &&
 			          answer.body.find(idp.Issuer()) != std::string::npos,
 			      "...naming both configured issuers: " + answer.body);
+			// spec 064: the document is the doors' shared shape - the reachable IdP's entry carries
+			// its client_id and the token endpoint the IdP's own discovery names; the unreachable
+			// fixture issuer stays named, endpoint-less
+			Check(answer.body.find("\"client_id\":\"door-app\"") != std::string::npos,
+			      "...with the issuer's client_id: " + answer.body);
+			Check(answer.body.find("\"token_endpoint\":\"" + idp.Issuer() + "/token\"") != std::string::npos,
+			      "...and the IdP's live token endpoint: " + answer.body);
 		});
 
 		Scenario("a real quack client reads its own slice through the embedded server", [&] {
