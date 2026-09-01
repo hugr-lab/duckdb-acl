@@ -6,7 +6,9 @@
 
 ## Summary
 
-The release-blocker family from the backlog: when an object cannot be read — a grant's column list
+Reclassified with the user (2026-09-01): **development, not a release blocker** — what leaks is
+names-never-data, provokable only by an already-granted principal, so this hardens rather than
+gates. The family: when an object cannot be read — a grant's column list
 intersects to nothing, or a mask's source column no longer exists — the refusal today is **duckdb's
 binder error over the SQL we generated**, and it names what the principal must never see: physical
 column names, the object's full physical column list, and our rewrite machinery. The listings have
