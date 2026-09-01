@@ -147,6 +147,12 @@ if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_FLIGHT})
             gRPC::grpc
             OpenSSL::SSL
             OpenSSL::Crypto)
+        # duckdb's bundled httplib >=0.53 loads the OS trust store in its OpenSSL TLS path
+        # (tls::load_system_certs), which on macOS calls the Security framework - link it, and
+        # CoreFoundation it leans on. Both the OIDC client (spec 060) and the embedded door pull it in.
+        if(APPLE)
+            target_link_libraries(${target} "-framework Security" "-framework CoreFoundation")
+        endif()
     endforeach()
 endif()
 
