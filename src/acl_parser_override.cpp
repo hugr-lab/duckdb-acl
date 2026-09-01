@@ -754,8 +754,19 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			s.Expect("map");
 			claim_map = s.AtParen() ? ClaimMapToJson(s.Parens()) : s.Quoted("claim map");
 		}
-		return MakeAdminCall("acl_define_issuer", {Value(issuer), Value(keys), Value(audiences), Value(algs),
-		                                           Value(role_claim), Value(claim_map), Value(jwks_uri)});
+		// CLIENT ID '<id>' [CLIENT SECRET '<secret>'] - the node-side OAuth client (spec 064)
+		string client_id, client_secret;
+		if (s.Accept("client")) {
+			s.Expect("id");
+			client_id = s.Quoted("a client id");
+			if (s.Accept("client")) {
+				s.Expect("secret");
+				client_secret = s.Quoted("a client secret");
+			}
+		}
+		return MakeAdminCall("acl_define_issuer",
+		                     {Value(issuer), Value(keys), Value(audiences), Value(algs), Value(role_claim),
+		                      Value(claim_map), Value(jwks_uri), Value(client_id), Value(client_secret)});
 	}
 	if (StringUtil::CIEquals(keyword, "add")) {
 		if (s.Accept("view")) {
@@ -954,6 +965,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			} else if (s.Accept("role")) {
 				s.Expect("claim");
 				field = "role_claim";
+			} else if (s.Accept("client")) { // SET CLIENT ID | CLIENT SECRET (spec 064)
+				if (s.Accept("id")) {
+					field = "client_id";
+				} else {
+					s.Expect("secret");
+					field = "client_secret";
+				}
 			} else {
 				s.Expect("claim");
 				s.Expect("map");

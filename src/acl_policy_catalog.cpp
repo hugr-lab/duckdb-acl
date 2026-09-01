@@ -1854,7 +1854,7 @@ struct CatalogBackend {
 			base = 1;
 		} else {
 			result = Query("SELECT \"keys_json\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\","
-			               " \"jwks_uri\" FROM " +
+			               " \"jwks_uri\", \"client_id\", \"client_secret\" FROM " +
 			               Tbl("issuers") + " WHERE \"issuer\" = " + Lit(issuer));
 		}
 		IssuerConfig config;
@@ -1885,6 +1885,13 @@ struct CatalogBackend {
 			if (result->ColumnCount() > base + 5) {
 				auto jwks_uri = result->GetValue(base + 5, 0);
 				config.jwks_uri = jwks_uri.IsNull() ? string() : jwks_uri.ToString();
+			}
+			// spec 064: the node-side OAuth client; the function-driver slot may omit both columns
+			if (result->ColumnCount() > base + 7) {
+				auto client_id = result->GetValue(base + 6, 0);
+				config.client_id = client_id.IsNull() ? string() : client_id.ToString();
+				auto client_secret = result->GetValue(base + 7, 0);
+				config.client_secret = client_secret.IsNull() ? string() : client_secret.ToString();
 			}
 		}
 		lock_guard<mutex> guard(lock);
@@ -3349,8 +3356,8 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	                      " FROM %s"},
 	    {"grant_columns", "SELECT \"role\", \"vcat\", \"vname\", \"pos\", \"name\", \"type\" FROM %s"},
 	    {"admins", "SELECT \"role\", \"scope\", \"vcat\" FROM %s"},
-	    {"issuers", "SELECT \"issuer\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\", \"jwks_uri\""
-	                " FROM %s"},
+	    {"issuers", "SELECT \"issuer\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\", \"jwks_uri\","
+	                " \"client_id\" FROM %s"},
 	    {"role_mappings", "SELECT \"issuer\", \"source\", \"external_value\", \"role\" FROM %s"},
 	    {"function_gate", "SELECT \"role\", \"name\", \"kind\", \"allowed\" FROM %s"},
 	};
@@ -4445,6 +4452,18 @@ void PolicyStore::CatalogAlterIssuer(const string &issuer, const string &field, 
 		config.role_claim = value;
 	} else if (field == "claim_map") {
 		config.claim_map = value;
+	} else if (field == "client_id") {
+		// spec 064: dropping the id drops the secret with it - a secret with no id signs nothing
+		config.client_id = value;
+		if (value.empty()) {
+			config.client_secret.clear();
+		}
+	} else if (field == "client_secret") {
+		if (!value.empty() && config.client_id.empty()) {
+			throw BinderException("acl admin: a CLIENT SECRET without a CLIENT ID authenticates nothing - "
+			                      "set the CLIENT ID first");
+		}
+		config.client_secret = value;
 	} else {
 		throw BinderException("acl admin: unknown issuer property \"%s\"", field);
 	}
@@ -4502,7 +4521,9 @@ void PolicyStore::CatalogDefineIssuer(const IssuerConfig &config) {
 	                "INSERT INTO " + catalog->Tbl("issuers") + " VALUES (" + Lit(config.issuer) + ", " +
 	                    Lit(config.keys_json) + ", " + Lit(audiences) + ", " + Lit(algs) + ", " +
 	                    Lit(config.role_claim) + ", " + Lit(config.claim_map) + ", " +
-	                    (config.jwks_uri.empty() ? string("NULL") : Lit(config.jwks_uri)) + ")"});
+	                    (config.jwks_uri.empty() ? string("NULL") : Lit(config.jwks_uri)) + ", " +
+	                    (config.client_id.empty() ? string("NULL") : Lit(config.client_id)) + ", " +
+	                    (config.client_secret.empty() ? string("NULL") : Lit(config.client_secret)) + ")"});
 }
 
 void PolicyStore::CatalogMapRole(const string &issuer, const string &source, const string &external_value,

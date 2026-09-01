@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS <role_object_caps>("role" ACL_KEY_TEXT, "vcat" ACL_KE
 -- '' as role/kind means "global"/"any kind": NULL cannot be part of the primary key
 CREATE TABLE IF NOT EXISTS <function_gate>("role" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "allowed" BOOLEAN, PRIMARY KEY ("role", "name", "kind"));
 
-CREATE TABLE IF NOT EXISTS <issuers>("issuer" ACL_KEY_TEXT PRIMARY KEY, "keys_json" VARCHAR, "audiences" VARCHAR, "algs" VARCHAR, "role_claim" VARCHAR, "claim_map" VARCHAR, "jwks_uri" VARCHAR);
+CREATE TABLE IF NOT EXISTS <issuers>("issuer" ACL_KEY_TEXT PRIMARY KEY, "keys_json" VARCHAR, "audiences" VARCHAR, "algs" VARCHAR, "role_claim" VARCHAR, "claim_map" VARCHAR, "jwks_uri" VARCHAR, "client_id" VARCHAR, "client_secret" VARCHAR);
 
 -- '' as vcat means "every catalog": NULL cannot be part of the primary key
 CREATE TABLE IF NOT EXISTS <admins>("role" ACL_KEY_TEXT PRIMARY KEY, "scope" VARCHAR, "vcat" VARCHAR);
@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS <keys>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "ki
 -- something the role does not read.
 CREATE TABLE IF NOT EXISTS <grant_columns>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, PRIMARY KEY ("role", "vcat", "vname", "pos"));
 
-INSERT INTO <meta> SELECT 'schema_version', '11' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '12' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');

@@ -148,6 +148,12 @@ struct IssuerConfig {
 	//! filesystem opens - an https JWKS URL (needs httpfs) or a file an operator refreshes out of
 	//! band. Empty means `keys_json` is the whole truth.
 	string jwks_uri;
+	//! The app registration the node itself runs the OAuth password grant as (spec 064), and what
+	//! auth discovery advertises for a driver's own flow. Empty = this issuer does no ROPC here.
+	string client_id;
+	//! Only a confidential client has one; public clients (the common case) leave it empty. Never
+	//! surfaced by introspection.
+	string client_secret;
 };
 
 //! duckdb answers "what is in this catalog?" three ways - a table function, a view of the same name
@@ -472,6 +478,10 @@ struct PolicyStore {
 	idx_t SessionSweep();
 	//! Every issuer the policy names, for the doors' discovery documents (spec 062).
 	vector<string> ListIssuers();
+	//! One issuer's configuration, for the doors: discovery advertises its client_id and the
+	//! password handshake runs the grant as it (spec 064). The config includes the client_secret,
+	//! so a caller surfaces chosen fields, never the struct.
+	bool LookupIssuer(const string &issuer, IssuerConfig &out);
 	//! The sweep proper; the caller holds the lock and has read the settings before taking it.
 	idx_t SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp_binds);
 	//! How many sessions are live right now. Denied to a principal, like the rest of this surface.
@@ -550,7 +560,6 @@ private:
 	//! The real JWT path of VerifyPrincipal (spec 007): issuer lookup -> acl_token verification ->
 	//! role mapping -> claims; throws on any failure. Defined in acl_policy.cpp.
 	void VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out, bool ignore_exp = false);
-	bool LookupIssuer(const string &issuer, IssuerConfig &out);
 	//! spec 023: the keys to verify with. An issuer that names a JWKS URI has them read through
 	//! duckdb's filesystem and cached per instance; one that pastes a JWKS keeps using it. `kid` is
 	//! the token's, so a key that rotated in since the last read triggers one extra read.

@@ -234,7 +234,13 @@ a session is gone (live/expired/idle/unknown), read-only so it survives the NULL
 `acl_session_sql`. **Spec 055**: transactions live on the session's connection -
 `BeginTransaction`/`EndTransaction` open and end one, `transaction_id` is validated against the
 session's own, so a driver with autocommit off (DBeaver, ADBC manual-commit) works; ingest still owns
-its own transaction.
+its own transaction. **Spec 064**: auth discovery + the IdP-gated password handshake - the
+Handshake payload `discover-auth` answers issuers/client_id/OIDC endpoints unauthenticated
+(FlightSqlServerBase seals DoAction), and a BasicAuth handshake becomes the OAuth password grant run
+as the issuer's `client_id` (`acl_define_issuer` args 8-9, `CREATE|ALTER ISSUER ... CLIENT ID|SECRET`,
+schema v12), the IdP's token verified offline and returned as the connection's bearer; no flow
+toggle of ours - the IdP's refusal is the gate; TLS-only by refusal; `acl_issuers()` never lists the
+secret.
 
 ## Working process — per-feature specs
 
