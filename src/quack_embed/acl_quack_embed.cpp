@@ -44,12 +44,6 @@ void RegisterAclQuackEmbed(ExtensionLoader &loader) {
 	config.AddExtensionOption("acl_quack_prepare_inline_rows",
 	                          "acl embedded door: rows returned inline in a PREPARE response before FETCH",
 	                          LogicalType::UBIGINT, Value::UBIGINT(QUACK_PREPARE_INLINE_ROWS_DEFAULT));
-	config.AddExtensionOption("acl_quack_fetch_read_ahead",
-	                          "acl embedded door: FETCH requests kept in flight ahead of the scan (0 = threads)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(0));
-	config.AddExtensionOption("acl_quack_debug_fetch_delay_ms",
-	                          "acl embedded door: DEBUG max random ms delay before a FETCH response publishes",
-	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 	config.AddExtensionOption("acl_quack_debug_emit_delay_ms",
 	                          "acl embedded door: DEBUG max random ms delay before the collector publishes a batch",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));

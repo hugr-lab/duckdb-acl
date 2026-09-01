@@ -31,8 +31,6 @@ RENAMES = {
     '"quack_authentication_function"': '"acl_quack_authentication_function"',
     '"quack_authorization_function"': '"acl_quack_authorization_function"',
     '"quack_prepare_inline_rows"': '"acl_quack_prepare_inline_rows"',
-    '"quack_fetch_read_ahead"': '"acl_quack_fetch_read_ahead"',
-    '"quack_debug_fetch_delay_ms"': '"acl_quack_debug_fetch_delay_ms"',
     '"quack_debug_emit_delay_ms"': '"acl_quack_debug_emit_delay_ms"',
     '"quack_target_batch_bytes"': '"acl_quack_target_batch_bytes"',
     '"quack_rebalance_buffer_bytes"': '"acl_quack_rebalance_buffer_bytes"',
@@ -55,7 +53,6 @@ FILES = {
     "quack_result_cache.cpp": [
         '"quack_enable_reconnects"', '"quack_cache_max_rows"', '"quack_result_ttl"',
     ],
-    "quack_fetch_ahead.cpp": ['"quack_fetch_read_ahead"', '"quack_debug_fetch_delay_ms"'],
     "quack_fetch_collector.cpp": ['"quack_debug_emit_delay_ms"'],
     "quack_rebalancer_sink.cpp": ['"quack_target_batch_bytes"', '"quack_rebalance_buffer_bytes"'],
     "quack_scan_from_client.cpp": ['"scan_data_from_quack_client"'],

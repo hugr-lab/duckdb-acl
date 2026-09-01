@@ -109,7 +109,6 @@ if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_QUACK_EMBED})
         ${QUACK_EMBED}/acl_quack_embed.cpp
         ${QUACK_EMBED}/quack_server.cpp
         ${QUACK_EMBED}/quack_result_cache.cpp
-        ${QUACK_EMBED}/quack_fetch_ahead.cpp
         ${QUACK_EMBED}/quack_fetch_collector.cpp
         ${QUACK_EMBED}/quack_rebalancer_sink.cpp
         ${QUACK_EMBED}/quack_scan_from_client.cpp
