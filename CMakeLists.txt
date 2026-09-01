@@ -125,10 +125,19 @@ if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_QUACK_EMBED})
     # quack hardcodes `duckdb_httplib::` — force-include the namespace bridge into every embed TU so
     # those names resolve onto the OpenSSL namespace when TLS is compiled in (see the shim header). The
     # force-include flag is compiler-specific: MSVC spells it /FI, GCC/Clang (incl. MinGW) -include.
+    #
+    # -fvisibility=hidden on GCC/Clang is the load-bearing part: the embed graph defines quack's own
+    # C++ symbols (duckdb::QuackServer, QuackScanFromClientFunction::GetFunction, ...). Statically
+    # linked into libduckdb they would be EXPORTED, and on Linux's flat dynamic namespace a co-loaded
+    # stock `quack.duckdb_extension` binds ITS calls to those exported acl copies - so quack's init ran
+    # acl's GetFunction and tried to register acl_quack_scan_data (macOS's two-level namespace hides
+    # this, which is why it only failed on the Linux CI). Hiding the embed symbols keeps each image
+    # bound to its own. MSVC/Windows exports only the extension entrypoint, so it needs neither.
     if(MSVC)
         set(ACL_QUACK_EMBED_COMPILE_OPTS "/FI${QUACK_EMBED}/include/acl_quack_httplib_ns.hpp")
     else()
-        set(ACL_QUACK_EMBED_COMPILE_OPTS "-include;${QUACK_EMBED}/include/acl_quack_httplib_ns.hpp")
+        set(ACL_QUACK_EMBED_COMPILE_OPTS
+            "-include;${QUACK_EMBED}/include/acl_quack_httplib_ns.hpp;-fvisibility=hidden;-fvisibility-inlines-hidden")
     endif()
     # TLS is compiled in exactly when the flight build's OpenSSL is present (same gate as ACL_OIDC_TLS).
     if(NOT DEFINED ENV{ACL_NO_FLIGHT})
