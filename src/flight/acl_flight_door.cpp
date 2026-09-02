@@ -1557,6 +1557,14 @@ private:
 					if (PrincipalFingerprint(caller) == PrincipalFingerprint(current)) {
 						return handle; // the connection's own live session, same principal
 					}
+					// Re-authenticating as somebody else is a SWAP: close this session, open
+					// another. A draining node refuses the swap BEFORE the close (spec 066):
+					// drain never ends a session, and the close without the open would be
+					// exactly that - the old principal keeps working until it leaves by itself.
+					if (state->store->Draining()) {
+						return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
+						                               "acl: node is draining - not accepting new sessions");
+					}
 					state->store->SessionClose(handle); // re-authenticated as somebody else
 					state->DropConn(handle);            // and the old principal's connection with it
 				}

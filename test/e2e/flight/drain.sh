@@ -75,6 +75,28 @@ refusal="$("$PYBIN" "$HERE/client.py" "$URI" "SELECT 1" "$TOKEN" 2>&1)" \
 	&& fail "a new client was seated during the drain"
 echo "$refusal" | grep -q "draining" || fail "the refusal does not say draining: $refusal"
 
+# re-authenticating the SEATED connection as another principal is a session swap - close, then open.
+# A draining node must refuse the swap BEFORE the close: the globex token is refused...
+GLOBEX_TOKEN="$("$PYBIN" - <<'PYEOF'
+import base64, hashlib, hmac, json
+key = base64.urlsafe_b64decode("YWNsLXRlc3QtaHMyNTYtc2VjcmV0==")
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+header = b64(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+payload = b64(json.dumps({"iss": "https://issuer.test/s", "aud": "api://acl-test", "exp": 4102444800,
+                          "sub": "u-globex", "roles": ["analyst"], "tid": "globex"},
+                         separators=(",", ":")).encode())
+sig = b64(hmac.new(key, f"{header}.{payload}".encode(), hashlib.sha256).digest())
+print(f"{header}.{payload}.{sig}")
+PYEOF
+)"
+swap="$(ACL_COOKIE_JAR="$JAR" "$PYBIN" "$HERE/client.py" "$URI" "SELECT 1" "$GLOBEX_TOKEN" 2>&1)" \
+	&& fail "a session swap was allowed during the drain"
+echo "$swap" | grep -q "draining" || fail "the swap refusal does not say draining: $swap"
+# ...and the seated session survived the attempt (half a swap - the close without the open - would
+# be drain ending a session, which it never does)
+ACL_COOKIE_JAR="$JAR" "$PYBIN" "$HERE/client.py" "$URI" "SELECT count(*) FROM orders" "$TOKEN" >/dev/null \
+	|| fail "the refused swap killed the seated session"
+
 operator RESUME_DONE "acl_resume()::VARCHAR"
 
 "$PYBIN" "$HERE/client.py" "$URI" "SELECT 1" "$TOKEN" >/dev/null \

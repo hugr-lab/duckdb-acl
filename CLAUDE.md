@@ -244,9 +244,9 @@ secret.
 
 **Spec 066 — node drain**: `acl_drain()` stops seating new clients at the one seam they all cross
 (`SessionOpen` refuses; the doors say why — Flight answers UNAVAILABLE "draining", quack's discovery
-answers 503 `draining`) while established sessions keep working; the operator watches
-`acl_session_count()` fall, kills stragglers with `acl_session_kill`, then stops the doors and the
-process. `acl_resume()` / `acl_drain_status()` complete the surface; all three are denied to a
+answers 503 `draining`) while established sessions keep working; repeating `acl_drain()` is the
+watch loop (it sweeps, then answers what remains - the auto-sweep rode `SessionOpen`, which drain
+turns off), stragglers go to `acl_session_kill`, then the doors stop and the process exits. `acl_resume()` / `acl_drain_status()` complete the surface; all three are denied to a
 principal. The node never waits or times out by itself — the deadline belongs to the orchestrator.
 
 ## Working process — per-feature specs

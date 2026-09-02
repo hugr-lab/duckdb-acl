@@ -46,7 +46,10 @@ The doors additionally check the flag at their own establishment points, only to
 
 - **Flight**: `SessionFor`'s fall-through to `SessionOpen` (a new client, or a re-authentication as
   a different principal) answers `Unavailable: acl: node is draining - not accepting new sessions`
-  instead of the generic authentication failure. A resolving cookie session is untouched. The
+  instead of the generic authentication failure. A resolving cookie session is untouched — and a
+  re-authentication as a *different* principal is refused **before** the old session is closed
+  (the review's finding): that path is a swap, close-then-open, and refusing only the open would
+  leave the close behind — drain ending a session, which it never does. The
   password handshake (spec 064) is also refused while draining — it exists only to seat new clients,
   and running the IdP grant for a client the node will refuse is wasted and noisy.
 - **quack**: the authentication callback answers NULL, which quack turns into its own refusal (the
@@ -132,9 +135,10 @@ before serving).
 - **C++ (quack embed)**: in `test/cpp/test_acl_quack_embed.cpp` — serve, connect and query; drain;
   the established connection still answers; a fresh connection is refused at authentication;
   `/.well-known/quack-auth` answers 503/`draining`; resume; a fresh connection succeeds again.
-- **Flight e2e** (`test/e2e/flight/drain.sh`): an ADBC client connects (durable cookie session) and
-  keeps querying across the drain; a second client connecting during drain is refused with the
-  draining message; after `acl_resume()` it connects.
+- **Flight e2e** (`test/e2e/flight/drain.sh`): a durable-cookie client keeps querying across the
+  drain; a second client connecting during drain is refused with the draining message; the seated
+  connection re-authenticating as a different principal (a session swap) is refused *and its
+  original session survives the attempt*; after `acl_resume()` a new client connects.
 
 ## Alternatives considered
 
