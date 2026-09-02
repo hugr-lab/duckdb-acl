@@ -103,6 +103,12 @@ struct FakeIdp {
 			thread.join();
 		}
 	}
+	//! RAII, like the embed test's fixture: if any Exec throws mid-test, the unwind must not destroy
+	//! a joinable thread - that is a std::terminate which core-dumps and loses the buffered output,
+	//! masking the real failure. Stop() is safe to call twice.
+	~FakeIdp() {
+		Stop();
+	}
 };
 
 bool FileExists(const std::string &path) {
