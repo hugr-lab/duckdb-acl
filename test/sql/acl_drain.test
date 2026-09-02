@@ -1,0 +1,136 @@
+# name: test/sql/acl_drain.test
+# description: node drain (spec 066) - a draining node seats no new session while established ones
+#   keep working; the operator enters, observes and leaves the state; a principal may do none of it
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme'), (2, 'globex');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/d',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders RLS 'tenant = acl_claim(''tenant'')';
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- serving is the starting state -------------------------------------------------------------------
+
+query I
+SELECT acl_drain_status();
+----
+serving
+
+# resuming a node that already serves did nothing, and says so
+query I
+SELECT acl_resume();
+----
+false
+
+# --- a session opened before the drain ---------------------------------------------------------------
+
+statement ok
+CREATE TABLE live AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2QiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.gstZBDzIufL6uJz88zCxoRtnuoCHhnvaqFIPbaIDCyM') AS handle;
+
+query I
+SELECT handle IS NOT NULL FROM live;
+----
+true
+
+# --- drain: no new session, the old one keeps working ------------------------------------------------
+
+# entering drain returns what remains to be drained: the one live session
+query I
+SELECT acl_drain();
+----
+1
+
+query I
+SELECT acl_drain_status();
+----
+draining
+
+# the same, perfectly valid token that opened `live` is refused now - a draining node seats nobody new
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2QiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.gstZBDzIufL6uJz88zCxoRtnuoCHhnvaqFIPbaIDCyM') IS NULL;
+----
+true
+
+# the established session still composes: in-flight clients finish their work
+query I
+SELECT acl_session_sql((SELECT handle FROM live), 'SELECT * FROM orders')
+     = 'ACL SESSION ''' || (SELECT handle FROM live) || ''' SELECT * FROM orders' FROM live;
+----
+true
+
+# and the ops surface still watches it
+query I
+SELECT acl_session_count();
+----
+1
+
+# draining a draining node is idempotent - it re-answers what remains
+query I
+SELECT acl_drain();
+----
+1
+
+# --- resume: back to seating clients -----------------------------------------------------------------
+
+query I
+SELECT acl_resume();
+----
+true
+
+query I
+SELECT acl_drain_status();
+----
+serving
+
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2QiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.gstZBDzIufL6uJz88zCxoRtnuoCHhnvaqFIPbaIDCyM') IS NOT NULL;
+----
+true
+
+# --- a principal touches none of this ----------------------------------------------------------------
+
+statement error
+ACL ROLE "r" SELECT acl_drain();
+----
+<REGEX>:.*acl_drain.*not allowed.*
+
+statement error
+ACL ROLE "r" SELECT acl_resume();
+----
+<REGEX>:.*acl_resume.*not allowed.*
+
+statement error
+ACL ROLE "r" SELECT acl_drain_status();
+----
+<REGEX>:.*acl_drain_status.*not allowed.*

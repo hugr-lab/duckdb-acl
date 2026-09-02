@@ -170,6 +170,37 @@ int main(int argc, char *argv[]) {
 			Exec(con, "DETACH remote");
 		});
 
+		Scenario("a draining node refuses new clients while the established one finishes (spec 066)", [&] {
+			Exec(con, "ATTACH 'quack:localhost:31975' AS before (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
+			auto rows = con.Query("SELECT count(*)::BIGINT FROM before.main.orders");
+			CheckOk(*rows, "a client is seated before the drain");
+			Exec(con, "SELECT acl_drain()");
+			rows = con.Query("SELECT count(*)::BIGINT FROM before.main.orders");
+			if (CheckOk(*rows, "...and its connection still answers during the drain")) {
+				Check(rows->GetValue(0, 0).GetValue<int64_t>() == 2, "...the same acme slice");
+			}
+			// the discovery route is the LB's take-me-out signal
+			auto wk = duckdb::acl::oidc::HttpGet("http://localhost:31975/.well-known/quack-auth");
+			Check(wk.status == 503 && wk.body == "draining",
+			      "the well-known answers 503 `draining`: " + std::to_string(wk.status) + " " + wk.body);
+			// a fresh connection - the same valid tokens that seated `before` - is refused now
+			auto during =
+			    con.Query("ATTACH 'quack:localhost:31975' AS during (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
+			auto refused = during->HasError();
+			if (!refused) {
+				auto probe = con.Query("SELECT count(*) FROM during.main.orders");
+				refused = probe->HasError();
+				Exec(con, "DETACH during");
+			}
+			Check(refused, "a new client is refused during the drain");
+			Exec(con, "SELECT acl_resume()");
+			Exec(con, "ATTACH 'quack:localhost:31975' AS after (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
+			rows = con.Query("SELECT count(*)::BIGINT FROM after.main.orders");
+			CheckOk(*rows, "after acl_resume a new client is seated again");
+			Exec(con, "DETACH after");
+			Exec(con, "DETACH before");
+		});
+
 		Scenario("two advertised issuers make an ISSUER-less secret ask for one", [&] {
 			auto ambiguous = con.Query("CREATE SECRET amb (TYPE quack, PROVIDER oidc, SCOPE "
 			                           "'quack:localhost:31975', CLIENT_ID 'cli', FLOW 'password', "

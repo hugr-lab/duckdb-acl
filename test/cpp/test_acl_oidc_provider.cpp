@@ -103,6 +103,12 @@ struct FakeIdp {
 			thread.join();
 		}
 	}
+	//! RAII, like the embed test's fixture: if any Exec throws mid-test, the unwind must not destroy
+	//! a joinable thread - that is a std::terminate which core-dumps and loses the buffered output,
+	//! masking the real failure. Stop() is safe to call twice.
+	~FakeIdp() {
+		Stop();
+	}
 };
 
 bool FileExists(const std::string &path) {
@@ -143,6 +149,14 @@ int main(int argc, char *argv[]) {
 
 		DBConfig config;
 		config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+		// Hermetic, deliberately: duckdb maps secret type "quack" to the REAL quack extension
+		// (EXTENSION_SECRET_TYPES), so wherever the extension repository serves quack for this
+		// platform, `CREATE SECRET (TYPE quack)` autoinstalls it - registering the very type whose
+		// absence the first scenario asserts, and colliding with the manual registration below. The
+		// distribution run against duckdb main found this the day the nightly repo started carrying
+		// quack. This test is about OUR provider against a fake IdP, never about the repo's quack.
+		config.SetOptionByName("autoinstall_known_extensions", Value::BOOLEAN(false));
+		config.SetOptionByName("autoload_known_extensions", Value::BOOLEAN(false));
 		DuckDB db(nullptr, &config);
 		Connection con(db);
 		Exec(con, "LOAD '" + extension + "'");

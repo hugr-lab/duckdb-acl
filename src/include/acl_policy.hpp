@@ -13,6 +13,7 @@
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 
+#include <atomic>
 #include <functional>
 #include <list>
 #include <set>
@@ -258,6 +259,10 @@ struct PolicyStore {
 	unordered_map<string, string> session_bindings;
 	//! Whether a door of ours is serving on this instance (spec 043); see SetDoorOpen.
 	bool door_open = false;
+	//! Drain (spec 066): while set, SessionOpen seats nobody new; established sessions keep working.
+	//! Atomic rather than under `lock`: the doors read it on paths that must not contend with the
+	//! session map, and a flag flip needs no invariant with anything else.
+	std::atomic<bool> draining {false};
 	//! When sessions were last swept (spec 044), so the automatic sweep inside SessionOpen runs at most
 	//! once a minute rather than on every arrival.
 	int64_t last_sweep = 0;
@@ -515,6 +520,12 @@ struct PolicyStore {
 	//! supposed: the throughput benchmark's un-ACL'd baseline could not bulk-load at all.
 	void SetDoorOpen(bool open);
 	bool DoorOpen();
+
+	//! Drain (spec 066): stop seating new clients while established sessions keep working, so an
+	//! operator can rotate the node out gracefully. Runtime state, not configuration - a restarted
+	//! node serves. SetDraining returns the previous value (acl_resume tells whether it did anything).
+	bool SetDraining(bool value);
+	bool Draining() const;
 
 	//! Register an issuer / map an external role value (memory mode; catalog mode via the Catalog* ops)
 	void DefineIssuer(IssuerConfig config);

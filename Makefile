@@ -193,6 +193,7 @@ test-flight:
 	test/e2e/flight/adbc.sh
 	test/e2e/flight/tls.sh
 	test/e2e/flight/auth.sh
+	test/e2e/flight/drain.sh
 
 # The live-validation node (spec 057): one seeded server for real client tools, held until Ctrl+C.
 # The VS Code tasks in .vscode/tasks.json run the same commands.

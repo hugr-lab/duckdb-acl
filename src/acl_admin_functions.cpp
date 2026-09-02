@@ -1114,6 +1114,10 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		cfg.wellknown = [shared_store] {
 			return DoorAuthJson(*shared_store);
 		};
+		// spec 066: while draining, the discovery route answers 503 - the LB's take-me-out signal
+		cfg.draining = [shared_store] {
+			return shared_store->Draining();
+		};
 		string actual_uri;
 		auto error = StartAclQuackServer(context, cfg, actual_uri);
 		if (!error.empty()) {
@@ -1267,6 +1271,32 @@ void AclSessionSweepFunc(DataChunk &args, ExpressionState &state, Vector &result
 void AclSessionCountFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto live = Value::BIGINT(NumericCast<int64_t>(StoreOf(state).SessionCount()));
 	result.Reference(live, count_t(args.size()));
+}
+
+//! acl_drain(): stop seating new clients (spec 066) - every establishment path refuses while the
+//! flag is set, established sessions keep working. Sweeps before counting: the automatic sweep rode
+//! SessionOpen (spec 044, "the operation that grows the map pays to clean it"), and drain turns
+//! that operation off - so the drain surface pays instead, and the count it returns is what really
+//! remains, not residue. Idempotent, which makes repeating it the operator's watch loop. Denied to
+//! a principal like the rest of this surface.
+void AclDrainFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &store = StoreOf(state);
+	store.SetDraining(true);
+	store.SessionSweep();
+	auto live = Value::BIGINT(NumericCast<int64_t>(store.SessionCount()));
+	result.Reference(live, count_t(args.size()));
+}
+
+//! acl_resume(): leave drain; true when the node was draining, false when it already served.
+void AclResumeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto was_draining = Value::BOOLEAN(StoreOf(state).SetDraining(false));
+	result.Reference(was_draining, count_t(args.size()));
+}
+
+//! acl_drain_status(): 'draining' | 'serving' - what an ops probe reads.
+void AclDrainStatusFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto status = Value(StoreOf(state).Draining() ? "draining" : "serving");
+	result.Reference(status, count_t(args.size()));
 }
 
 //! Minimal JSON string escape for the ops surface below.
@@ -1525,6 +1555,10 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	};
 	register_session_bigint("acl_session_sweep", AclSessionSweepFunc);
 	register_session_bigint("acl_session_count", AclSessionCountFunc);
+	// drain (spec 066): the operator's graceful-stop surface, denied to a principal like the rest
+	register_session_bigint("acl_drain", AclDrainFunc);
+	register_admin("acl_resume", {}, AclResumeFunc);
+	register_session_text("acl_drain_status", {}, AclDrainStatusFunc);
 	{
 		ScalarFunction kill(Identifier("acl_session_kill"), {v}, LogicalType::BOOLEAN, AclSessionKillFunc);
 		kill.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
