@@ -187,7 +187,12 @@ int64_t NowSeconds() {
 
 //! A handle a client cannot guess: 128 bits from the platform's entropy source, hex-encoded. Never
 //! derived from the token, so holding one tells nothing about it (spec 040).
-//!
+string MintHandle() {
+	return MintRandomHex(16);
+}
+
+} // namespace
+
 //! `std::random_device` rather than duckdb's own utilities, deliberately: `RandomEngine` seeds from
 //! the clock off Linux, and the encryption util refuses to generate randomness unless OpenSSL arrived
 //! with httpfs (its mbedTLS fallback demands `force_mbedtls_unsafe`). On glibc, libc++ and MSVC the
@@ -195,34 +200,29 @@ int64_t NowSeconds() {
 //!
 //! The one implementation that was not is MinGW's before GCC 9.2, where it returned a fixed sequence.
 //! That failure is silent and total, so it is checked for rather than assumed: two independent
-//! devices agreeing on 64 bits means the device is deterministic, and a handle from it would be
+//! devices agreeing on 64 bits means the device is deterministic, and a credential from it would be
 //! guessable by anyone with the same toolchain. Refusing to mint beats minting that.
-string MintHandle() {
-	constexpr idx_t HANDLE_BYTES = 16;
+string MintRandomHex(idx_t bytes) {
 	std::random_device source;
 	{
 		std::random_device other;
 		if (source() == other() && source() == other()) {
-			throw InternalException("acl: this build's std::random_device is deterministic, so a session handle "
-			                        "would be guessable - refusing to mint one");
+			throw InternalException("acl: this build's std::random_device is deterministic, so a credential minted "
+			                        "from it would be guessable - refusing to mint one");
 		}
 	}
-	data_t bytes[HANDLE_BYTES];
-	for (idx_t i = 0; i < HANDLE_BYTES; i += 4) {
+	string out(bytes * 2, '\0');
+	idx_t i = 0;
+	while (i < bytes) {
 		auto word = static_cast<uint32_t>(source());
-		for (idx_t byte = 0; byte < 4; byte++) {
-			bytes[i + byte] = static_cast<data_t>((word >> (8 * byte)) & 0xFF);
+		for (idx_t byte = 0; byte < 4 && i < bytes; byte++, i++) {
+			auto value = static_cast<data_t>((word >> (8 * byte)) & 0xFF);
+			out[2 * i] = Blob::HEX_TABLE[value >> 4];
+			out[2 * i + 1] = Blob::HEX_TABLE[value & 0x0F];
 		}
 	}
-	string handle(HANDLE_BYTES * 2, '\0');
-	for (idx_t i = 0; i < HANDLE_BYTES; i++) {
-		handle[2 * i] = Blob::HEX_TABLE[bytes[i] >> 4];
-		handle[2 * i + 1] = Blob::HEX_TABLE[bytes[i] & 0x0F];
-	}
-	return handle;
+	return out;
 }
-
-} // namespace
 
 string PolicyStore::SessionOpen(const string &token) {
 	// Spec 066: a draining node seats nobody new. Refused before verifying anything - there is

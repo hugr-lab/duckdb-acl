@@ -250,6 +250,13 @@ public:
 	bool OwnerExpired() const {
 		return db_ptr.expired();
 	}
+	//! Whether this database instance opened the server: the registry is per process, and a stop or
+	//! a "last door" count from another instance would act on the wrong sessions (the 2026-09-03
+	//! review).
+	bool OwnedBy(const DatabaseInstance &db) const {
+		auto owner = db_ptr.lock();
+		return owner.get() == &db;
+	}
 
 private:
 	static void ListenThread(AclQuackServer *self);
@@ -500,7 +507,7 @@ string StartAclQuackServer(ClientContext &context, const AclQuackServeConfig &cf
 	}
 }
 
-bool StopAclQuackServer(const string &uri) {
+bool StopAclQuackServer(const DatabaseInstance &caller, const string &uri) {
 	unique_ptr<AclQuackServer> gone;
 	{
 		std::lock_guard<std::mutex> guard(g_servers_lock);
@@ -508,6 +515,9 @@ bool StopAclQuackServer(const string &uri) {
 		auto it = g_servers.find(parsed.CanonicalUri());
 		if (it == g_servers.end()) {
 			return false;
+		}
+		if (!it->second->OwnedBy(caller)) {
+			throw BinderException("acl_quack_stop: the server on %s belongs to another database instance", uri);
 		}
 		gone = std::move(it->second);
 		g_servers.erase(it);
@@ -521,9 +531,15 @@ bool StopAclQuackServer(const string &uri) {
 	return true;
 }
 
-idx_t AclQuackServerCount() {
+idx_t AclQuackServerCount(const DatabaseInstance &db) {
 	std::lock_guard<std::mutex> guard(g_servers_lock);
-	return g_servers.size();
+	idx_t count = 0;
+	for (auto &entry : g_servers) {
+		if (entry.second->OwnedBy(db)) {
+			count++;
+		}
+	}
+	return count;
 }
 
 } // namespace acl

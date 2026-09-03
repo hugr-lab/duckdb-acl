@@ -114,6 +114,17 @@ otherwise. Full sql suite and all cpp tests green.
   file), keeps the submodule pristine, and self-heals across bumps.
 - **Reuse `quack_*` names (minimal fork).** Rejected by the user in favour of clean co-load (Strategy B).
 
+## Addendum 2026-09-03 — stop and "last door" are per instance
+
+The embedded registry is per process, and the server already knew its opener (the `weak_ptr` that
+reclaims a dead instance's listener) — but `acl_quack_stop` did not ask, and `AclQuackServerCount()`
+counted every instance's servers. Two instances in one process: B could stop A's door, and A's
+"last door" judgement never came true while B served, so A's fence on unprefixed statements stayed
+armed and A's sessions were never closed. Both take the calling instance now — a foreign stop is
+refused, the count is the instance's own. The serve preconditions moved to the shared
+`RefuseUnlessServable` the same day (spec 053's cleartext rule now holds here too, with `plain` as
+the explicit opt-out). Pinned by `test_acl_instance_isolation.cpp`.
+
 ## Follow-ups
 
 - Our PR CI builds linux amd64 + osx arm only; the full matrix (linux arm, windows MSVC/MinGW, WASM) is

@@ -42,7 +42,6 @@
 #include <arrow/status.h>
 #include <arrow/table.h>
 #include <mutex>
-#include <random>
 #include <unordered_map>
 
 namespace duckdb {
@@ -71,17 +70,7 @@ constexpr const char *BEARER = "bearer ";
 //! An opaque, unguessable id - for tickets, for the same reason spec 040 mints one for a session: a
 //! Flight ticket is handed to the client, so nothing in it may be a credential of ours.
 string MintId() {
-	static const char *HEX = "0123456789abcdef";
-	std::random_device source;
-	string out;
-	out.reserve(32);
-	for (idx_t i = 0; i < 4; i++) {
-		auto word = static_cast<uint64_t>(source()) | (static_cast<uint64_t>(source()) << 32);
-		for (idx_t nibble = 0; nibble < 8; nibble++) {
-			out.push_back(HEX[(word >> (nibble * 4)) & 0xF]);
-		}
-	}
-	return out;
+	return MintRandomHex(16); // the store's minter, with its deterministic-device guard (spec 040)
 }
 
 arrow::Status StatusFromDuck(const string &what, const string &error) {
@@ -337,16 +326,7 @@ constexpr const char *COOKIE_MIDDLEWARE_KEY = "acl-cookie";
 //! A CSPRNG cookie id (F4): every nibble from random_device, not a seeded PRNG - the cookie selects a
 //! session that owns client resources, so it is a bearer credential and gets bearer-grade bytes.
 string MintCookieId() {
-	std::random_device rd;
-	static constexpr char HEX[] = "0123456789abcdef";
-	string out;
-	out.reserve(32);
-	for (int i = 0; i < 16; i++) {
-		auto byte = static_cast<unsigned>(rd()) & 0xFFu;
-		out += HEX[byte >> 4];
-		out += HEX[byte & 0xF];
-	}
-	return out;
+	return MintRandomHex(16); // bearer-grade bytes from the one guarded minter (spec 040)
 }
 
 //! The session cookie a request carries, parsed by NAME from the Cookie header (F1: never a substring
@@ -1655,6 +1635,11 @@ struct ServedDoor {
 	std::unique_ptr<AclFlightSqlServer> server;
 	std::thread thread;
 	shared_ptr<FlightDoorState> state;
+	//! The database instance that opened it. The registry is per process and keyed by uri, so
+	//! without this another instance could stop this door - and close ITS OWN sessions for the
+	//! privilege (the 2026-09-03 review); and an instance that closed without acl_flight_stop left
+	//! a door nobody could reclaim. The quack door has held the same since spec 063.
+	weak_ptr<DatabaseInstance> owner;
 };
 
 //! One server per listen uri, per process. Kept here rather than in the store: the store is policy,
@@ -1737,12 +1722,38 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		}
 
 		auto &doors = ServedDoors::Get();
+		// Reclaim a door left behind by an instance that closed without acl_flight_stop, BEFORE
+		// binding, so its port is actually free; a live instance's door on this uri is refused,
+		// untouched. The teardown runs outside the registry lock, as the quack door's does.
+		{
+			ServedDoor zombie;
+			bool reclaim = false;
+			{
+				std::lock_guard<std::mutex> guard(doors.lock);
+				auto entry = doors.doors.find(uri);
+				if (entry != doors.doors.end()) {
+					if (!entry->second.owner.expired()) {
+						throw BinderException("acl_flight_serve: a door is already listening on %s", uri);
+					}
+					zombie = std::move(entry->second);
+					doors.doors.erase(entry);
+					reclaim = true;
+				}
+			}
+			if (reclaim) {
+				(void)zombie.server->Shutdown();
+				if (zombie.thread.joinable()) {
+					zombie.thread.join();
+				}
+			}
+		}
 		std::lock_guard<std::mutex> guard(doors.lock);
 		if (doors.doors.count(uri) > 0) {
 			throw BinderException("acl_flight_serve: a door is already listening on %s", uri);
 		}
 
 		ServedDoor door;
+		door.owner = context.db;
 		door.state = make_shared_ptr<FlightDoorState>(*context.db, StoreShared(state));
 		door.server = std::make_unique<AclFlightSqlServer>(door.state);
 		flight::FlightServerOptions options(*location);
@@ -1794,6 +1805,11 @@ void AclFlightStopFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			auto entry = doors.doors.find(uri);
 			if (entry == doors.doors.end()) {
 				throw BinderException("acl_flight_stop: no door of ours is listening on %s", uri);
+			}
+			// another instance's door is not ours to stop: the sessions closed below would be
+			// THIS instance's, and the door that died would be theirs
+			if (entry->second.owner.lock().get() != state.GetContext().db.get()) {
+				throw BinderException("acl_flight_stop: the door on %s belongs to another database instance", uri);
 			}
 			door = std::move(entry->second);
 			doors.doors.erase(entry);

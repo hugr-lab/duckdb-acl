@@ -58,6 +58,14 @@ bool TempCatalogHas(ClientContext &context, const string &name);
 //! its own temp objects and nobody else's - per-connection by construction.
 vector<string> TempCatalogNames(ClientContext &context);
 
+//! `bytes` bytes from the platform's CSPRNG, hex-encoded - the ONE minter behind every credential
+//! we hand a client: the session handle (spec 040), the Flight ticket id and the Flight session
+//! cookie (spec 050). Refuses, rather than mints, on a build whose `std::random_device` is
+//! deterministic (MinGW before GCC 9.2 - a supported target); see the definition for why the device
+//! and not duckdb's own utilities. Three copies of this once existed and only one carried the guard
+//! (the 2026-09-03 review).
+string MintRandomHex(idx_t bytes);
+
 //! Policy for one virtual relation (table or view) under one role. The resolver picks the replacement
 //! form: RENAME (subquery_form=false) swaps the name in place for a physical object - it stays a real
 //! table, so it is writable; SUBQUERY (subquery_form=true) wraps a SELECT - projection with computed

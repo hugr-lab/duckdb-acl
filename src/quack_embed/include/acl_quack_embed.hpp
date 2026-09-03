@@ -23,6 +23,7 @@
 namespace duckdb {
 
 class ClientContext;
+class DatabaseInstance;
 class ExtensionLoader;
 
 namespace acl {
@@ -55,10 +56,13 @@ struct AclQuackServeConfig {
 string StartAclQuackServer(ClientContext &context, const AclQuackServeConfig &cfg, string &actual_uri_out);
 
 //! Stop the embedded server for this uri; false when none is registered. Frees the port synchronously.
-bool StopAclQuackServer(const string &uri);
+//! Refuses (throws) a server another database instance opened: the registry is per process, and
+//! the sessions the caller would close afterwards are its own, not the door's.
+bool StopAclQuackServer(const DatabaseInstance &caller, const string &uri);
 
-//! Number of embedded servers currently registered on this process (the door's ops surface).
-idx_t AclQuackServerCount();
+//! Number of embedded servers THIS database instance has open (the "last door" judgement of
+//! acl_quack_stop): another instance's servers must not keep this one's fence armed.
+idx_t AclQuackServerCount(const DatabaseInstance &db);
 
 //! Register the embedded door's SQL surface: the acl_quack_* server settings the embedded graph reads,
 //! and the acl_quack_scan_data drain table function. Auth/authz scalars (acl_quack_authenticate/
