@@ -34,19 +34,14 @@ before if cheap; **later** — development, after the release.
    (subject/roles), statement class, objects and capability, verdict with reason, a correlation id
    supplied by the caller, **never data**; where it is written, how it is read, how it cannot become
    a DoS vector. The cluster repo depends on this existing; it cannot reconstruct it. After 043.
-4. **Management and native SQL through the doors.** What `ACL <mgmt>`, `ACL ADMIN …` and
-   `ACL NATIVE …` do when they arrive through a door rather than on the node's own connection; is a
-   passthrough principal driving `acl_quack_stop`/`acl_flight_serve`/`acl_drain` over a door the
-   operator path or a surface to narrow (spec 066 made `acl_drain` reachable that way deliberately);
-   do refusals leak; are policy writes scoped correctly over a served session. Tests, fail-closed.
-5. **One migration (v13)**: `CatalogDropRelation` reads before it writes and then writes twice,
+4. **One migration (v13)**: `CatalogDropRelation` reads before it writes and then writes twice,
    outside the one-transaction shape the other writers use — a half-applied drop leaves access the
    admin believes is gone; the write-only `schema_aliases` shadow table goes (written in four places,
    read nowhere in table mode; "kept for a rollback" — there was no release to roll back to). Plus
    the check the migration README promises and nothing runs: a catalog migrated from n−1 and one
    created at n have the same columns in the same order. (The `kind` column for `role_object_caps`
    moved to *Later*: it changes the function-driver slot contract, not only the table.)
-6. **Review findings of 2026-09-03** (each small, each real):
+5. **Review findings of 2026-09-03** (each small, each real):
    - `PolicyStore::SessionOpen`'s JWT branch does not merge role-default claims (memory
      `role_claims` and `CatalogLoadRoleClaims`), unlike `VerifyPrincipal`/`VerifyJwtPrincipal`: the
      same token yields different claims through a door than through a gateway prefix, and an RLS
@@ -67,7 +62,7 @@ before if cheap; **later** — development, after the release.
      instance B closes B's sessions while A's door dies; `AclQuackServerCount()` is process-wide, so
      A never clears `door_open`. A `weak_ptr<DatabaseInstance>` on the door, per-instance counts, a
      two-instance test.
-7. **Release mechanics.** No publication exists: `distribution.yml` builds nine platforms and
+6. **Release mechanics.** No publication exists: `distribution.yml` builds nine platforms and
    publishes nothing. A release job over its artifacts — `SHA256SUMS.txt`, GitHub release
    (pre-release on a `-` in the tag), build-provenance attestation. Two `description.yml` with
    different versions and a memory-mode `hello_world` become one; `README.md` teaches catalog mode;
@@ -149,7 +144,7 @@ Leak audit → 052. Quack's own functions denied → 041. `acl_require_prefix` �
 Live validation → 057. Name-tight refusals, COLUMNS unquoting, `sql` never NULL,
 `is_insertable_into` from caps, write-time list validation → 065. DuckLake↔PostgreSQL → PR #78
 (duckdb-postgres #552; one patch of ours). Graceful shutdown / drain → 066. Foreign syntax under the
-prefix → 067. Client-local settings (TimeZone/Calendar on a session) → 068. Migration loader → resolved by decision (the extension refuses an older stamp and points
+prefix → 067. Client-local settings (TimeZone/Calendar on a session) → 068. Management and native SQL over a session (scope-gated, passthrough = the operator path over a door) → pinned in test_acl_session.cpp. Migration loader → resolved by decision (the extension refuses an older stamp and points
 at `v<n>.sql`; v11, v12 applied for real); schema version = 12. Distribution on every merge to main →
 PR #84. The whole `test/sql` in CI + schema-check + sync.py drift → PR #85. Windows/MSVC → covered by
 the distribution matrix on merge. PEG spike → design/014; ADBC driver spike → design/012.
