@@ -57,3 +57,73 @@ jobs:
       VCPKG_CACHING_AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
       VCPKG_CACHING_AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
       VCPKG_CACHING_AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+
+  # Release mechanics (release plan 5.3): on a v* tag, the nine artifacts the distribution built become
+  # a GitHub release - one file per platform, a SHA256SUMS.txt beside them, and a build-provenance
+  # attestation for each, so a downloaded .duckdb_extension can be traced to the workflow run that
+  # produced it. An extension that IS the authorization boundary is the one artifact a tampered copy
+  # of would matter most; the attestation costs nothing and is verified with `gh attestation verify`.
+  # The first release follows duckdb 2.0 (community-extensions alongside); until then a tag publishes
+  # a pre-release for our own use - `prerelease` is automatic on a `-` in the tag (v0.1.0-rc1).
+  release:
+    name: Publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download every platform's artifact
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      # the reusable workflow names an artifact acl-<duckdb_version>-extension-<platform> and puts the
+      # extension file somewhere inside it; the release wants one flat file per platform, named by
+      # the tag's version so two releases never collide in a download directory
+      - name: Collect the extensions
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p release
+          found=0
+          for dir in artifacts/*/; do
+            name="$(basename "$dir")"
+            platform="${name##*-extension-}"
+            file="$(find "$dir" -name 'acl.duckdb_extension*' -type f | head -1)"
+            if [ -z "$file" ]; then
+              echo "::error::no extension file in artifact $name"
+              exit 1
+            fi
+            ext="${file##*/acl.duckdb_extension}"
+            cp "$file" "release/acl-${version}-${platform}.duckdb_extension${ext}"
+            found=$((found + 1))
+          done
+          [ "$found" -ge 9 ] || { echo "::error::expected nine platforms, found $found"; exit 1; }
+          (cd release && sha256sum *.duckdb_extension* > SHA256SUMS.txt)
+          ls -la release
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/*.duckdb_extension*
+
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.duckdb_extension*
+            release/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          body: |
+            duckdb-acl ${{ github.ref_name }} — one `.duckdb_extension` per platform, built by the
+            distribution workflow against the duckdb version it names. Verify a download with
+            `sha256sum -c SHA256SUMS.txt` and its provenance with
+            `gh attestation verify <file> --repo hugr-lab/duckdb-acl`.
+
+            Load it with `LOAD '<path>/acl-…-<platform>.duckdb_extension';` on a duckdb of the same
+            version (`-unsigned` until the extension is signed by community-extensions).
