@@ -242,6 +242,15 @@ schema v12), the IdP's token verified offline and returned as the connection's b
 toggle of ours - the IdP's refusal is the gate; TLS-only by refusal; `acl_issuers()` never lists the
 secret.
 
+**Spec 067 — the PEG world**: duckdb's PEG parser is the parser at our pin; `parser_override` is
+intact and load-bearing upstream. Foreign syntax under the prefix is a three-way contract, pinned by
+`test/cpp/test_acl_foreign_parser.cpp`: bare — a co-loaded extension's token peeler works (loading
+acl costs nobody anything); in the virtual context — its opaque `ExtensionStatement` is
+default-denied (unenumerable ⇒ unconfinable); under `ACL NATIVE` — works, gated on the passthrough
+scope, never the syntax. Grammar-extension registration is not exposed upstream yet; when it lands,
+extended-grammar AST flows through the same inner parse (walked or denied per node) and the prefix
+itself becomes a grammar rule (design/014 spike; the upstream question is design/011/QUESTION.md).
+
 **Spec 066 — node drain**: `acl_drain()` stops seating new clients at the one seam they all cross
 (`SessionOpen` refuses; the doors say why — Flight answers UNAVAILABLE "draining", quack's discovery
 answers 503 `draining`) while established sessions keep working; repeating `acl_drain()` is the

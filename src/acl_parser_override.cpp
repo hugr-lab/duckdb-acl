@@ -1664,12 +1664,18 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		throw BinderException("acl admin: native SQL outside the virtual catalog requires a passthrough scope");
 	}
 
-	// Re-parse the remainder. In the virtual context the parser must be duckdb's own: a node type the
-	// rewriter cannot walk would have to be refused anyway, and letting a foreign AST into the rewrite
-	// path is how a reference gets missed. The native context is the opposite - it rewrites nothing
-	// and requires a passthrough scope, so another extension's syntax (duckpgq's GRAPH_TABLE, say) is
-	// no more privileged there than the SQL it already allows. `in_acl_parse` keeps *this* override
-	// out of its own inner parse, so a nested `ACL …` prefix stays unparseable.
+	// Re-parse the remainder. Foreign syntax reaches this parse two ways (spec 067), and both stay
+	// safe by construction. A foreign parser_override runs only in the NATIVE context (the setting
+	// below) - it may hand back arbitrary AST, and NATIVE rewrites nothing and requires passthrough,
+	// so another extension's syntax is no more privileged there than the SQL it already allows. A
+	// foreign parse_function (the PEG peeler) runs in EVERY context - `options` carries the
+	// extension list and the compiled-grammar cache through - but what it claims becomes an opaque
+	// ExtensionStatement planned by its own extension, which the rewriter's statement gate
+	// default-denies in the virtual context: we cannot enumerate what we cannot see. When upstream
+	// lands grammar-extension registration, extended-grammar statements arrive as ordinary AST the
+	// rewriter walks node by node - unknown nodes denied - through this same call, unchanged.
+	// `in_acl_parse` keeps *this* override out of its own inner parse, so a nested `ACL …` prefix
+	// stays unparseable.
 	ParserOptions inner = options;
 	if (mode != AclPrefix::Mode::NATIVE) {
 		inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
