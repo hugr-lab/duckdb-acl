@@ -54,7 +54,6 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # build (GEN=ninja make test-cpp).
 
 TEST_CPP_SOURCES := $(wildcard test/cpp/test_*.cpp)
-TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,$(TEST_CPP_DIR)/%,$(TEST_CPP_SOURCES))
 
 # match the release archives (-O2 -DNDEBUG), so D_ASSERT is compiled out of the test TUs too.
 # SANITIZE=1 (release plan 3.1) builds them under ASan+UBSan instead - -O1 with frame pointers, no
@@ -74,6 +73,8 @@ TEST_CPP_FLAGS := -std=c++17 -O2 -DNDEBUG -pthread
 TEST_CPP_DIR := build/test
 TEST_CPP_RUN_ENV :=
 endif
+# after the flavour is chosen: `:=` expands TEST_CPP_DIR here and now
+TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,$(TEST_CPP_DIR)/%,$(TEST_CPP_SOURCES))
 # `src/include` so a test can reach a seam the extension exposes to itself - spec 046's catalog
 # statement composition is a free function, and checking the text it produces needs its header.
 TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include \
