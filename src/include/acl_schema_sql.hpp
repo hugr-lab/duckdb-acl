@@ -16,7 +16,6 @@ static const char *const ACL_SCHEMA_SQL[] = {
     "CREATE TABLE IF NOT EXISTS <catalogs>(\"vcat\" ACL_KEY_TEXT PRIMARY KEY, \"comment\" VARCHAR)",
     "CREATE TABLE IF NOT EXISTS <relations>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"form\" VARCHAR, \"phys\" VARCHAR, \"view_sql\" VARCHAR, \"rls\" VARCHAR, \"comment\" VARCHAR, \"origin\" VARCHAR, \"rls_checked\" BOOLEAN, PRIMARY KEY (\"vcat\", \"vname\"))",
     "CREATE TABLE IF NOT EXISTS <relation_columns>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"pos\" INTEGER, \"name\" VARCHAR, \"expr\" VARCHAR, \"nullable\" BOOLEAN, PRIMARY KEY (\"vcat\", \"vname\", \"pos\"))",
-    "CREATE TABLE IF NOT EXISTS <schema_aliases>(\"vcat\" ACL_KEY_TEXT, \"alias_path\" ACL_KEY_TEXT, \"phys_path\" VARCHAR, PRIMARY KEY (\"vcat\", \"alias_path\"))",
     "CREATE TABLE IF NOT EXISTS <functions>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"kind\" ACL_KEY_TEXT, \"form\" VARCHAR, \"target\" VARCHAR, \"template\" VARCHAR, \"comment\" VARCHAR, \"params\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\", \"kind\"))",
     "CREATE TABLE IF NOT EXISTS <roles>(\"role\" ACL_KEY_TEXT PRIMARY KEY, \"comment\" VARCHAR)",
     "CREATE TABLE IF NOT EXISTS <role_claims>(\"role\" ACL_KEY_TEXT, \"claim\" ACL_KEY_TEXT, \"value\" VARCHAR, PRIMARY KEY (\"role\", \"claim\"))",
@@ -34,14 +33,14 @@ static const char *const ACL_SCHEMA_SQL[] = {
     "CREATE TABLE IF NOT EXISTS <reference_columns>(\"vcat\" ACL_KEY_TEXT, \"name\" ACL_KEY_TEXT, \"pos\" INTEGER, \"side\" ACL_KEY_TEXT, \"column\" VARCHAR, \"param\" VARCHAR, PRIMARY KEY (\"vcat\", \"name\", \"pos\", \"side\"))",
     "CREATE TABLE IF NOT EXISTS <keys>(\"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"kind\" ACL_KEY_TEXT, \"pos\" INTEGER, \"column\" VARCHAR, PRIMARY KEY (\"vcat\", \"vname\", \"kind\", \"pos\"))",
     "CREATE TABLE IF NOT EXISTS <grant_columns>(\"role\" ACL_KEY_TEXT, \"vcat\" ACL_KEY_TEXT, \"vname\" ACL_KEY_TEXT, \"pos\" INTEGER, \"name\" VARCHAR, \"type\" VARCHAR, PRIMARY KEY (\"role\", \"vcat\", \"vname\", \"pos\"))",
-    "INSERT INTO <meta> SELECT 'schema_version', '12' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'schema_version')",
+    "INSERT INTO <meta> SELECT 'schema_version', '13' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'schema_version')",
     "INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE \"key\" = 'policy_version')",
 };
 // clang-format on
 
 //! The version this schema is. A catalog carries its own in `meta`, and a build refuses one
 //! that does not match: the migration contract rests on the two being comparable (spec 034).
-static constexpr int ACL_SCHEMA_VERSION = 12;
+static constexpr int ACL_SCHEMA_VERSION = 13;
 
 } // namespace acl
 } // namespace duckdb

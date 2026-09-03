@@ -45,11 +45,11 @@ before if cheap; **later** — development, after the release.
    `SetSessionOptions`.
 6. **One migration (v13)**: `CatalogDropRelation` reads before it writes and then writes twice,
    outside the one-transaction shape the other writers use — a half-applied drop leaves access the
-   admin believes is gone; `role_object_caps` gains the `kind` column that turns the same-name
-   guard into a key; the write-only `schema_aliases` shadow table goes (written in four places, read
-   nowhere; "kept for a rollback" — there was no release to roll back to). Plus the check the
-   migration README promises and nothing runs: a catalog migrated from n−1 and one created at n have
-   the same columns in the same order.
+   admin believes is gone; the write-only `schema_aliases` shadow table goes (written in four places,
+   read nowhere in table mode; "kept for a rollback" — there was no release to roll back to). Plus
+   the check the migration README promises and nothing runs: a catalog migrated from n−1 and one
+   created at n have the same columns in the same order. (The `kind` column for `role_object_caps`
+   moved to *Later*: it changes the function-driver slot contract, not only the table.)
 7. **Review findings of 2026-09-03** (each small, each real):
    - `PolicyStore::SessionOpen`'s JWT branch does not merge role-default claims (memory
      `role_claims` and `CatalogLoadRoleClaims`), unlike `VerifyPrincipal`/`VerifyJwtPrincipal`: the

@@ -54,3 +54,45 @@ SQL
 "$duckdb" -f "$tmp/use.sql" | tee "$tmp/out" | tail -6
 grep -q "schema-applied-ok" "$tmp/out" || { echo "  the applied schema did not serve a policy" >&2; exit 1; }
 echo "  ok"
+
+# 3. the migration contract (schema/migrations/README.md): a catalog created from the schema file the
+#    `main` branch ships, taken forward by every v<n>.sql above its version, must have the same tables
+#    and columns - in the same order, with the same types - as one created fresh from the current file.
+#    Before a merge origin/main is version n-1 and this exercises the new step; after it, both are n
+#    and there is nothing to migrate, which is reported rather than faked.
+echo "schema-check: does a catalog migrated from main's schema match a fresh one?"
+if ! git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+    git fetch -q --depth 1 origin main 2>/dev/null || true
+fi
+if ! git show origin/main:schema/acl_schema.sql > "$tmp/prev.sql" 2>/dev/null; then
+    echo "  skip: origin/main is not available here" >&2
+else
+    version_of() { grep -oE "'schema_version', '[0-9]+'" "$1" | grep -oE "[0-9]+" | head -1; }
+    prev_version="$(version_of "$tmp/prev.sql")"
+    cur_version="$(version_of schema/acl_schema.sql)"
+    if [ -z "$prev_version" ] || [ -z "$cur_version" ]; then
+        echo "  a schema file does not stamp a schema_version" >&2; exit 1
+    fi
+    if [ "$prev_version" -ge "$cur_version" ]; then
+        echo "  (origin/main is at $prev_version, this tree at $cur_version - nothing to migrate)"
+    else
+        "$duckdb" "$tmp/migrated.db" -c ".read $tmp/prev.sql" >/dev/null
+        for v in $(seq "$((prev_version + 1))" "$cur_version"); do
+            step="schema/migrations/v$v.sql"
+            [ -f "$step" ] || { echo "  missing migration step $step" >&2; exit 1; }
+            "$duckdb" "$tmp/migrated.db" -c ".read $step" >/dev/null
+        done
+        "$duckdb" "$tmp/fresh.db" -c ".read schema/acl_schema.sql" >/dev/null
+        shape="SELECT table_name, ordinal_position, column_name, data_type FROM information_schema.columns WHERE table_schema = 'acl' ORDER BY 1, 2"
+        stamp="SELECT value FROM acl.meta WHERE key = 'schema_version'"
+        "$duckdb" -csv -noheader "$tmp/migrated.db" -c "$shape" > "$tmp/migrated.shape"
+        "$duckdb" -csv -noheader "$tmp/fresh.db" -c "$shape" > "$tmp/fresh.shape"
+        if ! diff -u "$tmp/fresh.shape" "$tmp/migrated.shape"; then
+            echo "  a catalog migrated $prev_version -> $cur_version differs from a fresh $cur_version (above: - fresh, + migrated)" >&2
+            exit 1
+        fi
+        migrated_stamp="$("$duckdb" -csv -noheader "$tmp/migrated.db" -c "$stamp")"
+        [ "$migrated_stamp" = "$cur_version" ] || { echo "  the migrated catalog is stamped $migrated_stamp, not $cur_version" >&2; exit 1; }
+        echo "  ok ($prev_version -> $cur_version: $(wc -l < "$tmp/fresh.shape" | tr -d ' ') columns match)"
+    fi
+fi

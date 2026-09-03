@@ -24,8 +24,8 @@
 
 -- @section schema
 -- The tables as they are now: a catalog is created complete, in one statement each, and stamped with
--- the schema version at the end. There are no migrations yet - see schema/migrations/README.md for
--- the contract they will follow.
+-- the schema version at the end. A catalog an older version created is brought forward by the
+-- hand-written steps in schema/migrations/ (v<n>.sql), under the contract its README states.
 
 CREATE SCHEMA IF NOT EXISTS <schema>;
 
@@ -36,8 +36,6 @@ CREATE TABLE IF NOT EXISTS <catalogs>("vcat" ACL_KEY_TEXT PRIMARY KEY, "comment"
 CREATE TABLE IF NOT EXISTS <relations>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, PRIMARY KEY ("vcat", "vname"));
 
 CREATE TABLE IF NOT EXISTS <relation_columns>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "pos" INTEGER, "name" VARCHAR, "expr" VARCHAR, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "pos"));
-
-CREATE TABLE IF NOT EXISTS <schema_aliases>("vcat" ACL_KEY_TEXT, "alias_path" ACL_KEY_TEXT, "phys_path" VARCHAR, PRIMARY KEY ("vcat", "alias_path"));
 
 CREATE TABLE IF NOT EXISTS <functions>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "form" VARCHAR, "target" VARCHAR, "template" VARCHAR, "comment" VARCHAR, "params" VARCHAR, PRIMARY KEY ("vcat", "vname", "kind"));
 
@@ -86,7 +84,7 @@ CREATE TABLE IF NOT EXISTS <keys>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "ki
 -- something the role does not read.
 CREATE TABLE IF NOT EXISTS <grant_columns>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, PRIMARY KEY ("role", "vcat", "vname", "pos"));
 
-INSERT INTO <meta> SELECT 'schema_version', '12' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '13' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');

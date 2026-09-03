@@ -113,6 +113,20 @@ suites pass unchanged: 36 files locally, 132 assertions over 6 integration scena
   be exercised by nothing. The contract is written down instead, which is the part that is hard to
   change later.
 
+## Addendum 2026-09-03 — v13, and the migration contract is checked rather than promised
+
+Schema **13** (`schema/migrations/v13.sql`): the pre-spec-015 `schema_aliases` table goes. It had been
+"kept in step for one version, so a rollback still resolves" after `schemas` replaced it — written on
+every schema write, read by nothing in table mode (the function-driver *slot* of that name is a
+callback contract and stays) — and no release ever shipped it, so there was no version to roll back
+to. The migrations README claimed the steps were generated (`gen_schema.py` never did; v11–v13 are
+hand-written) and promised an invariant nothing verified: a catalog migrated from n−1 and one created
+fresh at n have the same columns in the same order. `make schema-check` now proves it — a catalog is
+built from the schema file `origin/main` ships, every step above its version is applied, and the
+column shape of every `acl` table (name, position, type) plus the stamp is diffed against a fresh
+catalog; before a merge that is the new step under test, after it both sides are n and it says so.
+CI runs it on every PR (phase 0 of the release plan).
+
 ## Follow-ups
 
 - **The first release needs the loader.** `schema/migrations/README.md` says what it must do; until

@@ -26,9 +26,11 @@ complete and needs none of them. `v11.sql` (spec 048) is the first step.
   exactly what the schema file would have created. That is the invariant to check when adding a step:
   a catalog migrated from `<n-1>` and one created fresh at `<n>` must have the same columns in the
   same order.
-- Every step is generated from `../policy_schema.sql` by `make schema`, like everything else here —
-  the source file is where a new column is added, and the step records how an existing catalog gets
-  there.
+- A step is written by hand alongside the change to `../policy_schema.sql` (the source file is where
+  a new column is added; `make schema` regenerates the complete current schema, never the steps), and
+  **the invariant above is checked, not assumed**: `make schema-check` builds a catalog from the
+  schema file the `main` branch ships, applies every step above its version, and diffs the column
+  shape of every `acl` table against a catalog created fresh from the current file.
 
 ## Why not "add the column if it is missing"
 
