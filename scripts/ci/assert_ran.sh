@@ -25,6 +25,13 @@ if [ "$min_cases" -eq 0 ] && [ "$min_assertions" -eq 0 ]; then
 fi
 summary="$(grep -oE '[0-9]+ assertions in [0-9]+ test cases' "$log" | tail -1 || true)"
 if [ -z "$summary" ]; then
+	# a failed suite prints a different summary ("test cases: N | M passed | K failed"); say so rather
+	# than asking whether it ran at all
+	failed="$(grep -oE 'test cases:\s+[0-9]+\s+\|\s+[0-9]+ passed\s+\|\s+[0-9]+ failed' "$log" | tail -1 || true)"
+	if [ -n "$failed" ]; then
+		echo "assert_ran: the suite failed - $failed (the failures are above)" >&2
+		exit 1
+	fi
 	echo "assert_ran: no unittest summary line in $log - did the suite run at all?" >&2
 	exit 1
 fi
