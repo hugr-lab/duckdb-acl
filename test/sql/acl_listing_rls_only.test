@@ -1,0 +1,99 @@
+# name: test/sql/acl_listing_rls_only.test
+# description: a relation that only filters (RLS, no column list) is listed with the physical row's
+#   columns - it once fell through both listing branches, a table with no columns at all, invisible to
+#   a client that builds its catalog from the columns (found by spec 043's cross-source leg)
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR, amount INTEGER, ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 10, 's1'), (2, 'globex', 20, 's2');
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+# the three shapes side by side: filtered only, a projection with a mask, a plain alias
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.filtered AS phys.main.orders RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.masked AS phys.main.orders COLUMNS (id, amount, ssn = NULL::VARCHAR) RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.plain AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+# every surface lists the filtered relation, with the physical row's four columns
+query I
+ACL ROLE "analyst" SELECT table_name FROM duckdb_tables() ORDER BY 1;
+----
+filtered
+masked
+plain
+
+query II
+ACL ROLE "analyst" SELECT table_name, count(*) FROM duckdb_columns() GROUP BY 1 ORDER BY 1;
+----
+filtered	4
+masked	3
+plain	4
+
+query II
+ACL ROLE "analyst" SELECT table_name, count(*) FROM information_schema.columns GROUP BY 1 ORDER BY 1;
+----
+filtered	4
+masked	3
+plain	4
+
+query I
+ACL ROLE "analyst" SELECT column_name FROM information_schema.columns WHERE table_name = 'filtered' ORDER BY ordinal_position;
+----
+id
+tenant
+amount
+ssn
+
+# the listing and the relation describe the same thing (spec 026)
+query I
+ACL ROLE "analyst" SELECT count(*) FROM (DESCRIBE (SELECT * FROM filtered));
+----
+4
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM (DESCRIBE (SELECT * FROM masked));
+----
+3
+
+# and the filter still filters: the listing widened nothing
+query I
+ACL ROLE "analyst" SELECT count(*) FROM filtered;
+----
+1
+
+# the masked projection keeps its own stored shape - one row per column, no physical duplicate
+query I
+ACL ROLE "analyst" SELECT column_name FROM duckdb_columns() WHERE table_name = 'masked' ORDER BY column_index;
+----
+id
+amount
+ssn
