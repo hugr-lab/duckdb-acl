@@ -93,7 +93,7 @@ else is rendered from it by `make schema`:
 | file | what it is |
 | --- | --- |
 | `schema/acl_schema.sql` | the schema as it stands, ready to run — then `acl_use_db('<db>', 'acl', false)` |
-| `src/include/acl_schema_sql.hpp` | what the extension runs when it initialises a catalog |
+| `src/acl_schema_sql.hpp` | what the extension runs when it initialises a catalog |
 
 There are no migrations yet — duckdb-acl has not been released, so every catalog is created at the
 current version. [`schema/migrations/README.md`](schema/migrations/README.md) is the contract the

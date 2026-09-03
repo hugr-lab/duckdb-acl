@@ -90,11 +90,13 @@ before if cheap; **later** — development, after the release.
   rewritten; IO/socket failures throw `BinderException`. Fix and write down before clients match on it.
 - **The Flight door has no sqllogictest coverage** (only e2e, skipped on PRs): serve-argument
   validation is reachable from SQL; `DoorAuthJson` has no test at all.
-- **`test/harness/run.sh` exits 1** (intentional denials under `set -e`) — the first five minutes.
-- Refactors before release (design/RELEASE-PLAN.md phase 4): the `ACL ADMIN` grammar out of
-  `acl_parser_override.cpp` (`AuthorizeMgmt` is invisible there); `acl_policy_catalog.cpp` split
-  into read path / admin writers / listings / validators; the quack door lifecycle next to its
-  server; `door_open` atomic; `acl_schema_sql.hpp` out of the public headers.
+- ~~**`test/harness/run.sh` exits 1**~~ — done (#103): the demo speaks the catalog model and the
+  runner judges the transcript. Not yet wired into CI.
+- Refactors before release (design/RELEASE-PLAN.md phase 4): ~~the `ACL ADMIN` grammar out of
+  `acl_parser_override.cpp`~~ (#99); ~~`acl_policy_catalog.cpp` split into read path / admin writers /
+  listings / validators~~ (#102); the quack door lifecycle next to its server (#105);
+  ~~`door_open` atomic; `acl_schema_sql.hpp` out of the public headers~~ (done with this line).
+  Still open: the error-prefix contract (4.4).
 
 ## Later
 
