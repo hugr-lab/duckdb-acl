@@ -147,7 +147,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.main;
 
 query I
-SELECT phys_path FROM aclcat.acl.schema_aliases WHERE alias_path = 'raw';
+SELECT phys_path FROM aclcat.acl.schemas WHERE path = 'raw';
 ----
 phys.main
 

@@ -24,8 +24,6 @@ CREATE TABLE IF NOT EXISTS acl."relations"("vcat" VARCHAR, "vname" VARCHAR, "for
 
 CREATE TABLE IF NOT EXISTS acl."relation_columns"("vcat" VARCHAR, "vname" VARCHAR, "pos" INTEGER, "name" VARCHAR, "expr" VARCHAR, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "pos"));
 
-CREATE TABLE IF NOT EXISTS acl."schema_aliases"("vcat" VARCHAR, "alias_path" VARCHAR, "phys_path" VARCHAR, PRIMARY KEY ("vcat", "alias_path"));
-
 CREATE TABLE IF NOT EXISTS acl."functions"("vcat" VARCHAR, "vname" VARCHAR, "kind" VARCHAR, "form" VARCHAR, "target" VARCHAR, "template" VARCHAR, "comment" VARCHAR, "params" VARCHAR, PRIMARY KEY ("vcat", "vname", "kind"));
 
 CREATE TABLE IF NOT EXISTS acl."roles"("role" VARCHAR PRIMARY KEY, "comment" VARCHAR);
@@ -73,6 +71,6 @@ CREATE TABLE IF NOT EXISTS acl."keys"("vcat" VARCHAR, "vname" VARCHAR, "kind" VA
 -- something the role does not read.
 CREATE TABLE IF NOT EXISTS acl."grant_columns"("role" VARCHAR, "vcat" VARCHAR, "vname" VARCHAR, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, PRIMARY KEY ("role", "vcat", "vname", "pos"));
 
-INSERT INTO acl."meta" SELECT 'schema_version', '12' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
+INSERT INTO acl."meta" SELECT 'schema_version', '13' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
 
 INSERT INTO acl."meta" SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'policy_version');

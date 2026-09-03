@@ -3269,13 +3269,6 @@ void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_
 		                     "(\"vcat\", \"path\", \"phys_path\", \"comment\", \"origin\") VALUES (" + Lit(vcat) +
 		                     ", " + Lit(alias_path) + ", " + (phys_path.empty() ? "NULL" : Lit(phys_path)) + ", " +
 		                     comment + ", " + (origin.empty() ? "NULL" : Lit(origin)) + ")");
-		// the legacy table is kept in step for one version, so a rollback still resolves
-		statements.push_back("DELETE FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                     " AND \"alias_path\" = " + Lit(alias_path));
-		if (!phys_path.empty()) {
-			statements.push_back("INSERT INTO " + catalog->Tbl("schema_aliases") + " VALUES (" + Lit(vcat) + ", " +
-			                     Lit(alias_path) + ", " + Lit(phys_path) + ")");
-		}
 	});
 	// a schema created under a granted parent inherits its capabilities at creation (spec 015)
 	CatalogRematerializeSchemaCaps(vcat, alias_path);
@@ -3966,36 +3959,42 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 	if (!CatalogObjectExists(vcat, vname, "relation")) {
 		throw BinderException("acl admin: relation \"%s.%s\" does not exist", vcat, vname);
 	}
-	// a record an expansion produced is remembered as dropped, so the next REFRESH does not bring it
-	// back: excluding one object is the whole reason to expand a schema instead of aliasing it
-	auto origin = catalog->Query("SELECT \"origin\" FROM " + catalog->Tbl("relations") +
-	                             " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
-	vector<string> tombstone;
-	if (origin->RowCount() > 0 && !origin->GetValue(0, 0).IsNull()) {
-		auto dot = vname.rfind('.');
-		if (dot != string::npos) {
-			tombstone.push_back("INSERT OR IGNORE INTO " + catalog->Tbl("schema_dropped") + " VALUES (" + Lit(vcat) +
-			                    ", " + Lit(vname.substr(0, dot)) + ", " + Lit(vname.substr(dot + 1)) + ")");
-		}
-	}
+	// One transaction for the reads that decide and every row that goes (the 2026-09-03 review): a
+	// drop that read outside and wrote twice could leave the object's grants live after its record
+	// was gone - access the admin believed revoked. The other writers already use this shape.
 	auto pred = ExactName(vname);
-	vector<string> statements = {"DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                                 " AND \"vname\" = " + Lit(vname),
-	                             "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                                 " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'",
-	                             "DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                                 " AND \"vname\" = " + Lit(vname),
-	                             "DELETE FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
-	                                 " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'"};
-	// a function of the same name keeps the grant, because the grant row cannot tell them apart
-	if (!CatalogObjectExists(vcat, vname, "table") && !CatalogObjectExists(vcat, vname, "scalar")) {
-		DropGrantRowsFor(*catalog, vcat, pred, statements);
-	}
-	DropReferencesNaming(*catalog, vcat, pred, statements);
-	catalog->Write(statements);
-	if (!tombstone.empty()) {
-		catalog->Write(tombstone);
-	}
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		statements.push_back("DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname));
+		statements.push_back("DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'");
+		statements.push_back("DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname));
+		statements.push_back("DELETE FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'");
+		// a function of the same name keeps the grant, because the grant row cannot tell them apart
+		auto same_named_function =
+		    read("SELECT 1 FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
+		         " AND \"vname\" = " + Lit(vname) + " LIMIT 1");
+		if (same_named_function->RowCount() == 0) {
+			DropGrantRowsFor(*catalog, vcat, pred, statements);
+		}
+		DropReferencesNaming(*catalog, vcat, pred, statements);
+		// a record an expansion produced is remembered as dropped, so the next REFRESH does not
+		// bring it back: excluding one object is the whole reason to expand a schema instead of
+		// aliasing it
+		auto origin = read("SELECT \"origin\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                   " AND \"vname\" = " + Lit(vname));
+		if (origin->RowCount() > 0 && !origin->GetValue(0, 0).IsNull()) {
+			auto dot = vname.rfind('.');
+			if (dot != string::npos) {
+				statements.push_back("INSERT OR IGNORE INTO " + catalog->Tbl("schema_dropped") + " VALUES (" +
+				                     Lit(vcat) + ", " + Lit(vname.substr(0, dot)) + ", " + Lit(vname.substr(dot + 1)) +
+				                     ")");
+			}
+		}
+	});
 }
 
 void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, const string &kind, const string &column,
@@ -4183,8 +4182,8 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 			                      "drop those grants too",
 			                      vcat, StringUtil::Join(roles, ", "));
 		}
-		for (auto table : {"relations", "relation_columns", "schemas", "schema_aliases", "functions", "object_columns",
-		                   "references", "reference_columns", "schema_dropped", "keys"}) {
+		for (auto table : {"relations", "relation_columns", "schemas", "functions", "object_columns", "references",
+		                   "reference_columns", "schema_dropped", "keys"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
 		}
 		if (cascade) {
@@ -4229,8 +4228,6 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 			                     " AND \"path\" = " + Lit(alias_path));
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("schemas") + where);
-		statements.push_back("DELETE FROM " + catalog->Tbl("schema_aliases") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                     " AND \"alias_path\" = " + Lit(alias_path));
 		// the schema is gone, and so are the grants that named it - inherited or not
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"schema_path\" = " + Lit(alias_path));
