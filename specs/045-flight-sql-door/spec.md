@@ -364,6 +364,21 @@ solve a problem that not running on pull requests removes — dependencies that 
 - **Two extensions, one per door.** community-extensions takes a git ref, so one extension with an
   opt-in flag is what fits.
 
+## Addendum 2026-09-03 — the registry knows whose door it is; one minter for every credential
+
+The release review found two things the per-process registry ("one server per listen uri, per
+process") left open. **Ownership**: a `ServedDoor` carried no instance identity, so with two
+database instances in one process, instance B's `acl_flight_stop(uri)` shut down A's door — and then
+closed *B's own* sessions for the privilege (`SessionCloseAll` runs on the caller's store); and an
+instance that closed without `acl_flight_stop` left a door nobody could reclaim. Each door now holds
+a `weak_ptr<DatabaseInstance>` to its opener: a stop from another instance is refused
+(`belongs to another database instance`), and a serve on the uri of a dead instance's door reclaims
+it first — the quack door's shape since spec 063. **The minter**: the ticket id and the session cookie
+(a bearer credential by its own comment) were minted by two local `std::random_device` loops without
+the guard `MintHandle` carries against a deterministic device (MinGW before GCC 9.2, a supported
+target); the three are one `MintRandomHex` now (spec 040's rules, one place). Pinned by
+`test_acl_instance_isolation.cpp`: two serving instances, A's door refused to B and stopped by A.
+
 ## Follow-ups
 
 - **Ingest through Flight SQL** (`DoPut`), which is spec 042's question in another protocol.

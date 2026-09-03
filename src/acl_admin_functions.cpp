@@ -1110,11 +1110,12 @@ void AclQuackStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto uri = RequiredArg(args, 0, row, "acl_quack_stop", "listen uri");
 #ifdef ACL_QUACK_EMBED_ENABLED
-		auto stopped = StopAclQuackServer(uri);
+		auto stopped = StopAclQuackServer(*context.db, uri);
 		string note = stopped ? ("Stopped listening on " + uri) : ("No server found listening on " + uri);
-		// The embedded registry knows exactly how many doors are left, so the last-door judgement is
-		// exact (no guessing which door's sessions to drop).
-		bool last_door = AclQuackServerCount() == 0;
+		// The embedded registry knows exactly how many doors THIS instance has left, so the last-door
+		// judgement is exact (no guessing which door's sessions to drop) - and another instance's
+		// doors do not keep this instance's fence armed.
+		bool last_door = AclQuackServerCount(*context.db) == 0;
 		if (!last_door) {
 			result.SetValue(row, Value(note + " (another quack server is still open, so its sessions stay)"));
 			continue;
