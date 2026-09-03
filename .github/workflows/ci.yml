@@ -31,6 +31,12 @@ jobs:
         run: |
           find src test/cpp \( -name '*.cpp' -o -name '*.hpp' \) -print0 \
             | xargs -0 clang-format --dry-run --Werror
+      # a malformed workflow fails here, not at the first push that runs it (release plan 3.8); the
+      # rules are .yamllint's, relaxed on purpose
+      - name: yamllint
+        run: |
+          pip install yamllint
+          yamllint .github/workflows docker/docker-compose.yml packaging
       # the embedded quack server's acl_-renamed TUs are generated from the submodule by sync.py
       # (spec 063); a submodule bump without regeneration, or a hand edit of a generated file, is
       # drift this catches. Only the quack submodule itself is needed - not its nested duckdb.
@@ -87,7 +93,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache postgresql-client mysql-client
+          sudo apt-get install -y ninja-build ccache postgresql-client mysql-client clang libclang-rt-18-dev
 
       # scanner dependencies (libpq/openssl/roaring/...) come from vcpkg via the merged manifests
       # of the loaded extensions - the standard duckdb-extension dependency flow
@@ -133,11 +139,22 @@ jobs:
           scripts/ci/assert_ran.sh suite.log 50 3000
           make test-cpp
 
+      # the first five minutes of a user, run as a test: the demo speaks the catalog model and the
+      # runner judges the transcript - exactly the four announced refusals and nothing else (plan 5.6)
+      - name: End-to-end demo (test/harness)
+        run: test/harness/run.sh
+
       # the same C++ tests under ASan+UBSan (release plan 3.1): JWT/JWKS/OIDC parsing, the session
       # map and the catalog RPC composition are exactly where a memory error is a security error.
       # Separate binaries (build/test-sanitized) against the same release libduckdb.
       - name: C++ tests under ASan+UBSan
         run: make test-cpp SANITIZE=1
+
+      # the OIDC core's parsers under libFuzzer for a minute (release plan 3.6): the bytes an IdP or
+      # a door answers are the node's pre-authentication network input. clang carries libFuzzer;
+      # the target links the release libduckdb like the sanitized tests do.
+      - name: Fuzz the OIDC parsers
+        run: make fuzz-oidc CXX=clang++ FUZZ_SECONDS=60
 
       # the generated policy schema (acl_schema_sql.hpp, acl_schema.sql) must match
       # schema/policy_schema.sql, and a hand-applied copy must work: RequireSchemaVersion catches a
@@ -156,6 +173,15 @@ jobs:
         run: |
           make test-integration 2>&1 | tee integration.log
           scripts/ci/assert_ran.sh integration.log 8 200 'require-env ACL_(PG|DUCKLAKE)_DSN'
+
+      # spec 043 through the door: one served process, several client processes, real sources - the
+      # postgres and ducklake legs and the postgres x ducklake pair (mssql has no service here and
+      # skips by name). The harness fails by itself when no leg ran; this insists on all three.
+      - name: Door e2e (spec 043)
+        run: |
+          make test-e2e 2>&1 | tee e2e.log
+          scripts/ci/assert_ran.sh e2e.log 0 0
+          grep -E '^PASS: legs run:.* postgres .*ducklake .*pair' e2e.log
 
       - name: Upload extension artifact
         if: github.event_name != 'pull_request'
