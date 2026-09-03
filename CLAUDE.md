@@ -24,6 +24,9 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
 src/
   acl_extension.cpp          # entry: model overview, creates the store, calls the registrations
   acl_policy.cpp             # PolicyStore + resolver methods, template cache (the resolver seam)
+  acl_policy_catalog.cpp     # the catalog backend's READ path: resolution, gate, rights, caches
+  acl_catalog_admin.cpp      #   ... its writers (PolicyStore::Catalog*), acl_metadata_listing.cpp the
+  acl_catalog_validation.cpp #   listings, and the probe/bind validators; declared in acl_policy_catalog.hpp
   acl_rewriter.cpp           # the AST walker; exposes RewriteStatements(...)
   acl_parser_override.cpp    # ACL prefix scanner + parser_override; exposes RegisterAclParser(...)
   acl_admin_functions.cpp    # acl_* admin stubs; exposes RegisterAclAdminFunctions(...)
