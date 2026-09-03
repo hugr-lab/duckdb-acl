@@ -6,6 +6,10 @@ duckdb_extension_load(acl
     LOAD_TESTS
 )
 
+# icu: the client-local rendering settings a session may set (spec 068 - TimeZone, Calendar) are
+# ICU's, so the test binary carries it; a deployed duckdb autoloads it. In-tree, no vcpkg.
+duckdb_extension_load(icu)
+
 # Integration builds (specs/005): also build the source scanners the integration scenarios attach
 # through. Opt-in via ACL_INTEGRATION=1 so regular/release builds stay lean. Pins and patches come
 # from the duckdb submodule's own extension config, so they are the versions tested against the

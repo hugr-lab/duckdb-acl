@@ -158,5 +158,23 @@ with connect(acme_token) as acme, connect(mint("globex")) as globex:
     check("the two principals see different slices", acme_rows > 0 and globex_rows != acme_rows,
           f"acme={acme_rows} globex={globex_rows}")
 
+# --- client-local settings over the protocol (spec 068): the driver's session options -------------
+from adbc_driver_flightsql import ConnectionOptions
+with connect(acme_token) as conn:
+    cur = conn.cursor()
+    cur.execute("SELECT 1")  # the first call earns the cookie; a session option needs the session
+    cur.fetchall()
+    tz_option = ConnectionOptions.OPTION_SESSION_OPTION_PREFIX.value + "TimeZone"
+    conn.adbc_connection.set_options(**{tz_option: "Asia/Tokyo"})
+    cur.execute("SELECT '2026-01-01 00:00:00+00'::TIMESTAMPTZ::VARCHAR")
+    shown = cur.fetchall()[0][0]
+    check("a session option sets the time zone the door renders in", "+09" in shown, shown)
+    check("...and the driver reads it back", conn.adbc_connection.get_option(tz_option) == "Asia/Tokyo")
+    try:
+        conn.adbc_connection.set_options(**{ConnectionOptions.OPTION_SESSION_OPTION_PREFIX.value + "threads": "1"})
+        check("a setting outside the list is refused as a session option", False, "it was accepted")
+    except Exception as refused:  # the driver surfaces the per-option error
+        check("a setting outside the list is refused as a session option", True, refused)
+
 print("PASS" if failures == 0 else f"FAIL ({failures})")
 sys.exit(0 if failures == 0 else 1)

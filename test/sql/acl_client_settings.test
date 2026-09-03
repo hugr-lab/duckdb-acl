@@ -1,0 +1,84 @@
+# name: test/sql/acl_client_settings.test
+# description: client-local settings (spec 068) - the SQL gate's side. SET stays refused under a
+#   principal except the two rendering settings (TimeZone, Calendar), a constant value, a session
+#   scope, and only through a session of the client's own; a per-statement prefix (what a gateway
+#   writes on a connection it shares) may never leave a setting behind. The positive path needs a
+#   live session handle and is pinned in test/cpp/test_acl_session.cpp; here are the refusals.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t(id INTEGER);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- a setting outside the list is refused, whatever the scope -----------------------------------------
+
+statement error
+ACL ROLE "r" SET search_path = 'phys.main';
+----
+<REGEX>:.*SET "search_path" is not permitted under ACL.*
+
+statement error
+ACL ROLE "r" SET threads = 1;
+----
+<REGEX>:.*SET "threads" is not permitted under ACL.*
+
+statement error
+ACL ROLE "r" SET VARIABLE x = 1;
+----
+<REGEX>:.*is not permitted under ACL.*
+
+statement error
+ACL ROLE "r" RESET search_path;
+----
+<REGEX>:.*is not permitted under ACL.*
+
+# --- a listed setting through a per-statement prefix is refused: the connection is not the client's --
+
+statement error
+ACL ROLE "r" SET TimeZone = 'Asia/Tokyo';
+----
+<REGEX>:.*needs a session of the client's own.*
+
+statement error
+ACL ROLE "r" SET SESSION Calendar = 'gregorian';
+----
+<REGEX>:.*needs a session of the client's own.*
+
+# --- GLOBAL is refused before the session question is even asked ---------------------------------------
+
+statement error
+ACL ROLE "r" SET GLOBAL TimeZone = 'Asia/Tokyo';
+----
+<REGEX>:.*SET GLOBAL "TimeZone" is not permitted under ACL.*
+
+# --- and the gate refuses the statement, never the word -------------------------------------------------
+
+query I
+ACL ROLE "r" SELECT 'SET TimeZone' AS just_a_string;
+----
+SET TimeZone

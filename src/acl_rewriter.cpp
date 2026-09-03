@@ -32,6 +32,7 @@
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/set_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
@@ -133,6 +134,9 @@ public:
 		case StatementType::PRAGMA_STATEMENT:
 			RewritePragmaStatement(stmt.Cast<PragmaStatement>());
 			break;
+		case StatementType::SET_STATEMENT:
+			RewriteSetStatement(stmt.Cast<SetStatement>());
+			break;
 		case StatementType::TRANSACTION_STATEMENT:
 			// BEGIN / COMMIT / ROLLBACK name no object and carry no expression, so there is nothing to
 			// rewrite and nothing to gate: they are session control, not access. A client driver cannot
@@ -147,6 +151,38 @@ public:
 	//! A PRAGMA that asks what is here is the question SHOW asks in an older spelling, and it is what a
 	//! client sends before anything else (spec 031). The two that name the catalog are answered from the
 	//! principal's own; every other PRAGMA stays denied, because a PRAGMA is otherwise a setting.
+	//! Client-local settings (spec 068). A setting is process or connection state a principal has no
+	//! business in, so SET stays refused - except the two rendering settings (TimeZone, Calendar): a
+	//! TIMESTAMPTZ shown in the server's zone is a wrong answer, not a cosmetic one. Even those only
+	//! for a principal that owns its connection - a session (spec 050) - because a per-statement
+	//! prefix a gateway writes runs on a connection the gateway shares, where a setting left behind
+	//! is the next principal's wrong answer. The value must be a constant (no expression may read
+	//! anything on its way into a setting), and GLOBAL is never a principal's to set.
+	void RewriteSetStatement(SetStatement &stmt) {
+		auto &name = stmt.name.GetIdentifierName();
+		if (stmt.scope == SetScope::VARIABLE || !ClientSettingAllowed(name)) {
+			Deny((stmt.set_type == SetType::SET ? "SET \"" : "RESET \"") + name +
+			     "\" is not permitted under ACL: only the client-local rendering settings (TimeZone, Calendar) "
+			     "may be set, and only on a session of the client's own");
+		}
+		if (stmt.scope == SetScope::GLOBAL) {
+			Deny("SET GLOBAL \"" + name +
+			     "\" is not permitted under ACL: a global setting changes the node for every principal - set it "
+			     "for the session");
+		}
+		if (!principal.session_connection) {
+			Deny("SET \"" + name +
+			     "\" needs a session of the client's own (a door's ACL SESSION): a per-statement prefix runs on a "
+			     "connection the gateway shares, where a setting would leak to the next principal");
+		}
+		if (stmt.set_type == SetType::SET) {
+			auto &set = stmt.Cast<SetVariableStatement>();
+			if (!set.value || set.value->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+				Deny("SET \"" + name + "\" takes a constant value under ACL");
+			}
+		}
+	}
+
 	void RewritePragmaStatement(PragmaStatement &stmt) {
 		auto name = StringUtil::Lower(stmt.info->name.GetIdentifierName());
 		string sql;

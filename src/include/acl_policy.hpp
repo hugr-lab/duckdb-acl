@@ -39,7 +39,18 @@ struct Principal {
 	//! passes its arrow_scan source and nothing else. Set only by the ACL INGEST prefix, which only
 	//! the door's C++ composes - never a client's or a gateway's text.
 	bool arrow_ingest = false;
+	//! The principal owns the connection the statement runs on (spec 068): set only by the
+	//! ACL SESSION prefix - a door's client, whose session IS a connection (spec 050). A per-statement
+	//! prefix a gateway writes runs on a connection the gateway shares between principals, so a
+	//! setting left there would leak to the next one; only a session may SET anything.
+	bool session_connection = false;
 };
+
+//! The client-local settings a principal may set on its own session (spec 068): rendering only -
+//! a TIMESTAMPTZ shown in the server's zone is a wrong answer - and nothing that changes what a
+//! statement resolves to, reads, or costs. One list for the SQL gate and the Flight door's
+//! SetSessionOptions, so the two doors can never disagree about it.
+bool ClientSettingAllowed(const string &name);
 
 //! The exec-context seam (spec 050): the ClientContext of the connection a statement is being
 //! prepared on, stashed in a thread-local by a door that owns the Prepare call site (the Flight door
