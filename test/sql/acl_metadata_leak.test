@@ -134,6 +134,12 @@ ACL ROLE "analyst" SELECT 'db=' || current_database();
 ----
 db=sales
 
+# and the caller's alias survives the substitution: the select item is still `db`
+query I
+ACL ROLE "analyst" SELECT t.db FROM (SELECT current_database() AS db) t;
+----
+sales
+
 # unprefixed stays the process's own answer - the ACL rewrites principals, not the instance
 query I
 SELECT current_database();

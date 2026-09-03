@@ -132,6 +132,13 @@ ACL ROLE "analyst" SELECT shout('hi');
 ----
 HI
 
+# the caller's alias names the select item, not the call: it survives the expansion (the harness
+# demo answered a column named after the expanded expression instead of `tag`)
+query I
+ACL ROLE "analyst" SELECT t.tag FROM (SELECT shout('hi') AS tag) t;
+----
+HI
+
 # unknown names and physical names are refused
 statement error
 ACL ROLE "analyst" SELECT * FROM phys.main.orders_physical;
