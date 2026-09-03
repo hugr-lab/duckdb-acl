@@ -93,7 +93,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache postgresql-client mysql-client
+          sudo apt-get install -y ninja-build ccache postgresql-client mysql-client clang libclang-rt-18-dev
 
       # scanner dependencies (libpq/openssl/roaring/...) come from vcpkg via the merged manifests
       # of the loaded extensions - the standard duckdb-extension dependency flow
@@ -149,6 +149,12 @@ jobs:
       # Separate binaries (build/test-sanitized) against the same release libduckdb.
       - name: C++ tests under ASan+UBSan
         run: make test-cpp SANITIZE=1
+
+      # the OIDC core's parsers under libFuzzer for a minute (release plan 3.6): the bytes an IdP or
+      # a door answers are the node's pre-authentication network input. clang carries libFuzzer;
+      # the target links the release libduckdb like the sanitized tests do.
+      - name: Fuzz the OIDC parsers
+        run: make fuzz-oidc CXX=clang++ FUZZ_SECONDS=60
 
       # the generated policy schema (acl_schema_sql.hpp, acl_schema.sql) must match
       # schema/policy_schema.sql, and a hand-applied copy must work: RequireSchemaVersion catches a
