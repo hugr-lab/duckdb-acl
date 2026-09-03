@@ -3,7 +3,7 @@
 #
 # The ACL_FLIGHT build pulls Arrow, gRPC and their dependencies, and several of those are resolved by
 # Arrow's own CMake modules rather than ours - FindOpenSSLAlt.cmake on macOS literally shells out to
-# `brew`. So "we told CMake where to look" is not evidence; this is. Run after an ACL_FLIGHT=1 build.
+# `brew`. So "we told CMake where to look" is not evidence; this is. Run after a default (flight) build.
 #
 # Allowed: the OS itself. Everything else - a homebrew dylib, a /usr/local library, anything the
 # machine happened to carry - is a build that would behave differently on the next machine.
