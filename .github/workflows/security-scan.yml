@@ -1,0 +1,42 @@
+# Secret scanning (release plan 3.2). An access-control extension's test tree carries JWT signing
+# material and OIDC client configuration on purpose; the one thing that must never land in the
+# history is a real key, and a leaked signing key is a total ACL bypass. Every PR and push to main,
+# plus a weekly pass over the whole history so a detector added later still finds an old commit.
+#
+# TruffleHog rather than gitleaks: gitleaks-action needs a paid licence for organisation repos;
+# TruffleHog OSS is free and verifies what it finds, which is what keeps the scan quiet.
+name: Security scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 5 * * 1'
+  # a failed scheduled run can only be re-run against the workflow definition it ran with, so a fix
+  # to this file never turns an old run green - dispatch a fresh one instead
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trufflehog:
+    name: Secret scan (TruffleHog)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # the whole history: a secret committed and then "deleted" is still in the repository
+          fetch-depth: 0
+      - name: TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          # only verified findings fail the run - an unverified high-entropy string is what a test
+          # fixture looks like, and the HS256 test secret is one on purpose
+          extra_args: --only-verified

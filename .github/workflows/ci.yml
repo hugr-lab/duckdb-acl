@@ -117,11 +117,27 @@ jobs:
           EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
           ccache -s
 
+      # the artifact must LOAD, not only compile: copied out of the tree and loaded from another
+      # directory, as an operator would (release plan 3.3)
+      - name: The artifact loads
+        run: scripts/ci/smoke_load.sh
+
+      # vcpkg's cache only grows; drop two-week-old archives before actions/cache saves it (3.4)
+      - name: Prune the vcpkg binary cache
+        if: always()
+        run: scripts/ci/prune_vcpkg_cache.sh
+
       - name: Unit suites
         run: |
           build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
           scripts/ci/assert_ran.sh suite.log 50 3000
           make test-cpp
+
+      # the same C++ tests under ASan+UBSan (release plan 3.1): JWT/JWKS/OIDC parsing, the session
+      # map and the catalog RPC composition are exactly where a memory error is a security error.
+      # Separate binaries (build/test-sanitized) against the same release libduckdb.
+      - name: C++ tests under ASan+UBSan
+        run: make test-cpp SANITIZE=1
 
       # the generated policy schema (acl_schema_sql.hpp, acl_schema.sql) must match
       # schema/policy_schema.sql, and a hand-applied copy must work: RequireSchemaVersion catches a
@@ -211,6 +227,16 @@ jobs:
           EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
           ccache -s
 
+      # the artifact must LOAD, not only compile: copied out of the tree and loaded from another
+      # directory, as an operator would (release plan 3.3)
+      - name: The artifact loads
+        run: scripts/ci/smoke_load.sh
+
+      # vcpkg's cache only grows; drop two-week-old archives before actions/cache saves it (3.4)
+      - name: Prune the vcpkg binary cache
+        if: always()
+        run: scripts/ci/prune_vcpkg_cache.sh
+
       # Before anything is run: an artifact that borrowed a library from the runner would work here and
       # nowhere else, and neither of the two times that happened showed up in a build log.
       - name: Check the artifact carries its dependencies
@@ -262,6 +288,16 @@ jobs:
         run: |
           EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
           ccache -s
+
+      # the artifact must LOAD, not only compile: copied out of the tree and loaded from another
+      # directory, as an operator would (release plan 3.3)
+      - name: The artifact loads
+        run: scripts/ci/smoke_load.sh
+
+      # vcpkg's cache only grows; drop two-week-old archives before actions/cache saves it (3.4)
+      - name: Prune the vcpkg binary cache
+        if: always()
+        run: scripts/ci/prune_vcpkg_cache.sh
 
       - name: Unit suites
         run: |

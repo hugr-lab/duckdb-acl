@@ -54,10 +54,26 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # build (GEN=ninja make test-cpp).
 
 TEST_CPP_SOURCES := $(wildcard test/cpp/test_*.cpp)
-TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,build/test/%,$(TEST_CPP_SOURCES))
+TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,$(TEST_CPP_DIR)/%,$(TEST_CPP_SOURCES))
 
-# match the release archives (-O2 -DNDEBUG), so D_ASSERT is compiled out of the test TUs too
+# match the release archives (-O2 -DNDEBUG), so D_ASSERT is compiled out of the test TUs too.
+# SANITIZE=1 (release plan 3.1) builds them under ASan+UBSan instead - -O1 with frame pointers, no
+# -DNDEBUG so the asserts ARE the checks, first report fatal - into their own directory so the two
+# flavours never share a stale binary. The binaries link the uninstrumented release libduckdb, which
+# is fine: the instrumented executable puts the sanitizer runtime first. LSan stays off: libduckdb's
+# static initialisers hold allocations for the process lifetime and would report as leaks.
+# Linux only in practice: on current macOS (Darwin 25.6 observed, 25.5 in mssql-extension's notes)
+# an ASan-instrumented binary hangs at process init before main - so CI's linux job is where this
+# runs, and a dev box on macOS gets the plain flavour.
+ifeq ($(SANITIZE),1)
+TEST_CPP_FLAGS := -std=c++17 -g -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all -pthread
+TEST_CPP_DIR := build/test-sanitized
+TEST_CPP_RUN_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+else
 TEST_CPP_FLAGS := -std=c++17 -O2 -DNDEBUG -pthread
+TEST_CPP_DIR := build/test
+TEST_CPP_RUN_ENV :=
+endif
 # `src/include` so a test can reach a seam the extension exposes to itself - spec 046's catalog
 # statement composition is a free function, and checking the text it produces needs its header.
 TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include \
@@ -76,20 +92,20 @@ TEST_CPP_LINK = -L build/release/src -lduckdb -Wl,-rpath,$(abspath build/release
 # A test may need one of the extension's own translation units compiled into it. The extension's
 # internals are not exported from libduckdb, and widening their visibility so a test could reach them
 # would be the wrong way round - the test links the source instead. (spec 046)
-build/test/test_acl_catalog_rpc: src/acl_catalog_rpc.cpp
-build/test/test_acl_catalog_rpc: TEST_CPP_EXTRA := src/acl_catalog_rpc.cpp
+$(TEST_CPP_DIR)/test_acl_catalog_rpc: src/acl_catalog_rpc.cpp
+$(TEST_CPP_DIR)/test_acl_catalog_rpc: TEST_CPP_EXTRA := src/acl_catalog_rpc.cpp
 
 # the OIDC core (spec 060) is duckdb-free by design, so its test compiles the module plus the
 # bundled yyjson directly - the fake IdP inside the test is the bundled httplib's own Server
-build/test/test_acl_oidc: src/oidc/acl_oidc.cpp src/include/acl_oidc.hpp
-build/test/test_acl_oidc: TEST_CPP_EXTRA := src/oidc/acl_oidc.cpp duckdb/third_party/yyjson/yyjson.cpp
+$(TEST_CPP_DIR)/test_acl_oidc: src/oidc/acl_oidc.cpp src/include/acl_oidc.hpp
+$(TEST_CPP_DIR)/test_acl_oidc: TEST_CPP_EXTRA := src/oidc/acl_oidc.cpp duckdb/third_party/yyjson/yyjson.cpp
 
 # the embedded-door test drives discovery through the core's HttpGet (spec 063)
-build/test/test_acl_quack_embed: src/oidc/acl_oidc.cpp src/include/acl_oidc.hpp
-build/test/test_acl_quack_embed: TEST_CPP_EXTRA := src/oidc/acl_oidc.cpp duckdb/third_party/yyjson/yyjson.cpp
+$(TEST_CPP_DIR)/test_acl_quack_embed: src/oidc/acl_oidc.cpp src/include/acl_oidc.hpp
+$(TEST_CPP_DIR)/test_acl_quack_embed: TEST_CPP_EXTRA := src/oidc/acl_oidc.cpp duckdb/third_party/yyjson/yyjson.cpp
 
-build/test/%: test/cpp/%.cpp test/cpp/acl_test_util.hpp $(TEST_CPP_DUCKDB_LIB)
-	@mkdir -p build/test
+$(TEST_CPP_DIR)/%: test/cpp/%.cpp test/cpp/acl_test_util.hpp $(TEST_CPP_DUCKDB_LIB)
+	@mkdir -p $(TEST_CPP_DIR)
 	$(CXX) $(TEST_CPP_FLAGS) $(TEST_CPP_INCLUDES) $< $(TEST_CPP_EXTRA) $(TEST_CPP_LINK) -o $@
 
 # Deliberately NOT depending on `release`: in the distribution CI the build runs inside a docker
@@ -105,7 +121,7 @@ test-cpp-run: $(TEST_CPP_BINS)
 	@test -n "$(TEST_CPP_BINS)" || { echo "test-cpp: no test/cpp/test_*.cpp sources found" >&2; exit 1; }
 	@fail=0; out=$$(mktemp); \
 	for b in $(TEST_CPP_BINS); do \
-		if $$b >$$out 2>&1; then echo "  PASS $$(basename $$b)"; \
+		if $(TEST_CPP_RUN_ENV) $$b >$$out 2>&1; then echo "  PASS $$(basename $$b)"; \
 		else echo "  FAIL $$(basename $$b)"; cat $$out; fail=1; fi; \
 	done; \
 	rm -f $$out; \
