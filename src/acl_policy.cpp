@@ -475,13 +475,11 @@ string PolicyStore::SessionSql(const string &handle, const string &sql) {
 }
 
 void PolicyStore::SetDoorOpen(bool open) {
-	lock_guard<mutex> guard(lock);
-	door_open = open;
+	door_open.store(open);
 }
 
 bool PolicyStore::DoorOpen() {
-	lock_guard<mutex> guard(lock);
-	return door_open;
+	return door_open.load();
 }
 
 bool ClientSettingAllowed(const string &name) {

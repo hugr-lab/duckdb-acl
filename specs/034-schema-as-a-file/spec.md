@@ -46,7 +46,7 @@ That replaces the shape the extension used to have — replay every `ALTER … I
 which grows without bound and is not portable: the SQL Server scanner drops the clause, which is what
 spec 033 had to work around. A version the catalog carries is cheaper and works everywhere.
 
-**`scripts/gen_schema.py` renders it** into `src/include/acl_schema_sql.hpp` (placeholders intact —
+**`scripts/gen_schema.py` renders it** into `src/acl_schema_sql.hpp` (placeholders intact —
 what `InitSchema` runs) and `schema/acl_schema.sql` (names resolved, ready to run). `make schema`
 regenerates; `make schema-check` fails when they are stale.
 

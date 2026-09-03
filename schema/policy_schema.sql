@@ -1,7 +1,7 @@
 -- The managed policy schema of duckdb-acl (spec 006), and the only place it is written down.
 --
 -- This file is the source of truth. `make schema` renders it into
---   src/include/acl_schema_sql.hpp   the statements the extension runs, placeholders intact
+--   src/acl_schema_sql.hpp           the statements the extension runs, placeholders intact
 --   schema/acl_schema.sql            the same with names resolved, ready to apply by hand
 -- so a hand-applied schema and the one the extension creates cannot drift apart (spec 034).
 --

@@ -11,12 +11,12 @@ cd "$root"
 echo "schema-check: outputs current?"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-for f in src/include/acl_schema_sql.hpp schema/acl_schema.sql; do
+for f in src/acl_schema_sql.hpp schema/acl_schema.sql; do
     cp "$f" "$tmp/$(basename "$f").before"
 done
 python3 scripts/gen_schema.py >/dev/null
 stale=0
-for f in src/include/acl_schema_sql.hpp schema/acl_schema.sql; do
+for f in src/acl_schema_sql.hpp schema/acl_schema.sql; do
     if ! diff -q "$tmp/$(basename "$f").before" "$f" >/dev/null; then
         echo "  STALE: $f - run 'make schema' and commit the result" >&2
         stale=1

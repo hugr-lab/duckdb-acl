@@ -276,8 +276,9 @@ struct PolicyStore {
 	//! is what turns "which connection is this" into "which principal is this" without the door ever
 	//! holding one.
 	unordered_map<string, string> session_bindings;
-	//! Whether a door of ours is serving on this instance (spec 043); see SetDoorOpen.
-	bool door_open = false;
+	//! Whether a door of ours is serving on this instance (spec 043); see SetDoorOpen. Atomic, not
+	//! under `lock`: the parser override reads it on every unprefixed statement of the process.
+	std::atomic<bool> door_open {false};
 	//! Drain (spec 066): while set, SessionOpen seats nobody new; established sessions keep working.
 	//! Atomic rather than under `lock`: the doors read it on paths that must not contend with the
 	//! session map, and a flag flip needs no invariant with anything else.
