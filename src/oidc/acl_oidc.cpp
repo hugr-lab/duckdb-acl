@@ -208,10 +208,21 @@ struct Json {
 	}
 };
 
+TokenSet PostGrant(const Endpoints &ep, const std::map<std::string, std::string> &params) {
+	if (!ep.Ok()) {
+		TokenSet out;
+		out.error = ep.error.empty() ? "no token endpoint" : ep.error;
+		return out;
+	}
+	return ParseTokenResponse(HttpPostForm(ep.token_endpoint, params));
+}
+
+} // namespace
+
 //! Every token endpoint answer goes through here: 2xx with an access_token is a
 //! grant; anything else is the protocol's error/error_description, or the raw
 //! transport failure. Nothing is inferred.
-TokenSet FromTokenResponse(const HttpResult &response) {
+TokenSet ParseTokenResponse(const HttpResult &response) {
 	TokenSet out;
 	if (!response.error.empty()) {
 		out.error = response.error;
@@ -238,17 +249,6 @@ TokenSet FromTokenResponse(const HttpResult &response) {
 	return out;
 }
 
-TokenSet PostGrant(const Endpoints &ep, const std::map<std::string, std::string> &params) {
-	if (!ep.Ok()) {
-		TokenSet out;
-		out.error = ep.error.empty() ? "no token endpoint" : ep.error;
-		return out;
-	}
-	return FromTokenResponse(HttpPostForm(ep.token_endpoint, params));
-}
-
-} // namespace
-
 HttpResult HttpGet(const std::string &url, int timeout_seconds) {
 	auto parts = ParseUrl(url);
 	return Run(parts, timeout_seconds, [&](auto &client) { return client.Get(parts.path.c_str()); });
@@ -269,7 +269,12 @@ Endpoints Discover(const std::string &issuer_url, int timeout_seconds) {
 		issuer.pop_back();
 	}
 	out.issuer = issuer;
-	auto response = HttpGet(issuer + "/.well-known/openid-configuration", timeout_seconds);
+	return ParseDiscoveryDocument(issuer, HttpGet(issuer + "/.well-known/openid-configuration", timeout_seconds));
+}
+
+Endpoints ParseDiscoveryDocument(const std::string &issuer, const HttpResult &response) {
+	Endpoints out;
+	out.issuer = issuer;
 	if (!response.Ok()) {
 		out.error =
 		    response.error.empty() ? ("discovery answered HTTP " + std::to_string(response.status)) : response.error;
@@ -312,7 +317,11 @@ DoorAuth FetchQuackAuth(const std::string &base_url, int timeout_seconds) {
 	while (!base.empty() && base.back() == '/') {
 		base.pop_back();
 	}
-	auto response = HttpGet(base + "/.well-known/quack-auth", timeout_seconds);
+	return ParseQuackAuthDocument(HttpGet(base + "/.well-known/quack-auth", timeout_seconds));
+}
+
+DoorAuth ParseQuackAuthDocument(const HttpResult &response) {
+	DoorAuth out;
 	if (!response.Ok()) {
 		out.error = response.error.empty() ? ("door discovery answered HTTP " + std::to_string(response.status))
 		                                   : response.error;
@@ -391,7 +400,11 @@ DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_i
 	if (!scope.empty()) {
 		params["scope"] = scope;
 	}
-	auto response = HttpPostForm(ep.device_authorization_endpoint, params);
+	return ParseDeviceAuthorization(HttpPostForm(ep.device_authorization_endpoint, params));
+}
+
+DeviceAuthorization ParseDeviceAuthorization(const HttpResult &response) {
+	DeviceAuthorization out;
 	if (!response.Ok()) {
 		Json json(response.body);
 		auto code = json.Str("error");

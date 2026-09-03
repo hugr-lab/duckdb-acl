@@ -213,6 +213,27 @@ test-flight:
 	test/e2e/flight/auth.sh
 	test/e2e/flight/drain.sh
 
+# --- libFuzzer over the OIDC core's parsers (release plan 3.6) -----------------------------------
+# The bytes an IdP or a door answers are the node's pre-authentication network input. The module
+# takes nothing from duckdb but its bundled httplib and yyjson (spec 060), so the target is one TU
+# plus the bundled yyjson and test/fuzz/fuzz_oidc_parse.cpp, under -fsanitize=fuzzer,address,undefined
+# - clang only. It links the built libduckdb for the few helpers httplib itself reaches for (re2);
+# like the sanitized C++ tests, the instrumented executable puts the sanitizer runtime first.
+# FUZZ_SECONDS bounds the run; the seed corpus in test/fuzz/corpus grows in place. CI runs it on
+# every PR after the build (the linux job).
+FUZZ_SECONDS ?= 30
+.PHONY: fuzz-oidc
+fuzz-oidc:
+	@test -f $(TEST_CPP_DUCKDB_LIB) || { \
+		echo "fuzz-oidc: $(TEST_CPP_DUCKDB_LIB) missing - run 'GEN=ninja make' first" >&2; exit 1; }
+	@mkdir -p build/fuzz
+	$(CXX) -std=c++17 -g -O1 -pthread -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
+		-I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include \
+		-I duckdb/third_party/httplib -I duckdb/third_party/yyjson/include \
+		test/fuzz/fuzz_oidc_parse.cpp src/oidc/acl_oidc.cpp duckdb/third_party/yyjson/yyjson.cpp \
+		$(TEST_CPP_LINK) -o build/fuzz/fuzz_oidc_parse
+	build/fuzz/fuzz_oidc_parse -max_total_time=$(FUZZ_SECONDS) -max_len=4096 -print_final_stats=1 test/fuzz/corpus
+
 # The live-validation node (spec 057): one seeded server for real client tools, held until Ctrl+C.
 # The VS Code tasks in .vscode/tasks.json run the same commands.
 .PHONY: serve-flight serve-quack serve-live
