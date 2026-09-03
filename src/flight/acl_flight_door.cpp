@@ -49,16 +49,6 @@ namespace acl {
 
 namespace {
 
-//! The store this call belongs to, reached the way the admin functions reach it (spec 041): through
-//! the function's own info, so nothing here is a process global.
-shared_ptr<PolicyStore> StoreShared(ExpressionState &state) {
-	return state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<AclScalarInfo>().store;
-}
-
-PolicyStore &StoreOf(ExpressionState &state) {
-	return *StoreShared(state);
-}
-
 namespace flight = arrow::flight;
 namespace flightsql = arrow::flight::sql;
 
@@ -1814,7 +1804,7 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 
 		ServedDoor door;
 		door.owner = context.db;
-		door.state = make_shared_ptr<FlightDoorState>(*context.db, StoreShared(state));
+		door.state = make_shared_ptr<FlightDoorState>(*context.db, SharedStoreOf(state));
 		door.server = std::make_unique<AclFlightSqlServer>(door.state);
 		flight::FlightServerOptions options(*location);
 		// spec 058: the Arrow Flight SQL JDBC driver (DBeaver) opens a connection by calling the

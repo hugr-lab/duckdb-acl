@@ -3,9 +3,39 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 
 namespace duckdb {
 namespace acl {
+
+shared_ptr<PolicyStore> SharedStoreOf(ExpressionState &state) {
+	return state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<AclScalarInfo>().store;
+}
+
+PolicyStore &StoreOf(ExpressionState &state) {
+	return *SharedStoreOf(state);
+}
+
+string RequiredArg(DataChunk &args, idx_t col, idx_t row, const char *fn, const char *what) {
+	auto value = args.GetValue(col, row);
+	if (value.IsNull()) {
+		throw InvalidInputException("%s: %s must not be NULL", fn, what);
+	}
+	return value.ToString();
+}
+
+string OptionalArg(DataChunk &args, idx_t col, idx_t row, const string &fallback) {
+	if (col >= args.ColumnCount()) {
+		return fallback;
+	}
+	auto value = args.GetValue(col, row);
+	return value.IsNull() ? fallback : value.ToString();
+}
+
+string Trimmed(string value) {
+	StringUtil::Trim(value);
+	return value;
+}
 
 string JsonQuote(const string &value) {
 	string out = "\"";
