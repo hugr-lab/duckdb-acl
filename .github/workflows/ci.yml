@@ -31,6 +31,14 @@ jobs:
         run: |
           find src test/cpp \( -name '*.cpp' -o -name '*.hpp' \) -print0 \
             | xargs -0 clang-format --dry-run --Werror
+      # the embedded quack server's acl_-renamed TUs are generated from the submodule by sync.py
+      # (spec 063); a submodule bump without regeneration, or a hand edit of a generated file, is
+      # drift this catches. Only the quack submodule itself is needed - not its nested duckdb.
+      - name: Generated quack embed sources are current
+        run: |
+          git submodule update --init --depth 1 third_party/quack
+          python3 src/quack_embed/sync.py
+          git diff --exit-code -- src/quack_embed/
 
   build-test-linux:
     name: Build + test (linux_amd64)
@@ -111,8 +119,14 @@ jobs:
 
       - name: Unit suites
         run: |
-          build/release/test/unittest test/sql/acl.test
+          build/release/test/unittest 'test/sql/*'
           make test-cpp
+
+      # the generated policy schema (acl_schema_sql.hpp, acl_schema.sql) must match
+      # schema/policy_schema.sql, and a hand-applied copy must work: RequireSchemaVersion catches a
+      # version mismatch, never a shape mismatch at the same version - this does
+      - name: Generated schema is current
+        run: make schema-check
 
       - name: Initialize integration schemas
         run: |
@@ -199,7 +213,7 @@ jobs:
 
       - name: Unit suites
         run: |
-          build/release/test/unittest test/sql/acl.test
+          build/release/test/unittest 'test/sql/*'
           # the embedded quack door's cpp test runs HERE, on the flight build, so its TLS + OpenSSL
           # RNG path is exercised (the no-flight linux job above builds it cleartext-only)
           make test-cpp
@@ -242,7 +256,7 @@ jobs:
 
       - name: Unit suites
         run: |
-          build/release/test/unittest test/sql/acl.test
+          build/release/test/unittest 'test/sql/*'
           make test-cpp
 
       - name: Upload extension artifact

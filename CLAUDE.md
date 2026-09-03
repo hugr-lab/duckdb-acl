@@ -47,8 +47,8 @@ the `PolicyStore` types); TU-local code stays in anonymous namespaces.
 ```sh
 git submodule update --init --recursive
 GEN=ninja make                      # release build of duckdb + the extension
-build/release/test/unittest test/sql/acl.test    # run the suite
-GEN=ninja make test                 # same, via the ci-tools target
+build/release/test/unittest 'test/sql/*'         # run the WHOLE suite (what CI runs; ~50 files)
+build/release/test/unittest test/sql/acl.test    # one file (acl.test is the memory-mode baseline only)
 GEN=ninja make test-cpp             # standalone C++ invariant tests (specs/002)
 test/harness/run.sh                 # end-to-end demo against the built extension
 test/live/serve.sh [--tls]          # serve one seeded node for real client tools (spec 057 runbook)
