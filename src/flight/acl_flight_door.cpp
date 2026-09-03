@@ -1569,6 +1569,66 @@ private:
 		return handle;
 	}
 
+	//! Client-local settings over the protocol (spec 068): what a driver sets with session options
+	//! (ADBC's `adbc.flight.sql.session.option.<name>`) lands as SQL SET on the session's own
+	//! connection, through the same allowlist the SQL gate applies - so the two paths can never
+	//! disagree. A per-call session has no connection to keep a setting on, so it is refused like
+	//! any other session resource (spec 050).
+	arrow::Result<flight::SetSessionOptionsResult>
+	SetSessionOptions(const flight::ServerCallContext &context,
+	                  const flight::SetSessionOptionsRequest &request) override {
+		return UnderSession(context, [&](const string &handle) -> arrow::Result<flight::SetSessionOptionsResult> {
+			if (!ClientSentCookie(context)) {
+				return arrow::Status::Invalid("acl: a session option needs a connection-long session - echo the "
+				                              "door's session cookie (a client has one from its second call on)");
+			}
+			auto conn = state->ConnFor(handle);
+			std::lock_guard<std::mutex> execution(conn->exec);
+			flight::SetSessionOptionsResult result;
+			for (auto &option : request.session_options) {
+				if (!ClientSettingAllowed(option.first)) {
+					result.errors[option.first] = {flight::SetSessionOptionErrorValue::kInvalidName};
+					continue;
+				}
+				auto *text = std::get_if<std::string>(&option.second);
+				bool erase = std::holds_alternative<std::monostate>(option.second);
+				if (!text && !erase) {
+					result.errors[option.first] = {flight::SetSessionOptionErrorValue::kInvalidValue};
+					continue;
+				}
+				auto sql = erase ? "RESET \"" + option.first + "\""
+				                 : "SET \"" + option.first + "\" = '" + StringUtil::Replace(*text, "'", "''") + "'";
+				auto applied = conn->con->Query(sql);
+				if (applied->HasError()) {
+					result.errors[option.first] = {flight::SetSessionOptionErrorValue::kInvalidValue};
+				}
+			}
+			return result;
+		});
+	}
+
+	//! The listed settings as this session currently renders them. Read through current_setting on
+	//! the session's own connection - the door's, never the principal's (the function gate denies a
+	//! principal current_setting, spec 052).
+	arrow::Result<flight::GetSessionOptionsResult>
+	GetSessionOptions(const flight::ServerCallContext &context, const flight::GetSessionOptionsRequest &) override {
+		return UnderSession(context, [&](const string &handle) -> arrow::Result<flight::GetSessionOptionsResult> {
+			flight::GetSessionOptionsResult result;
+			if (!ClientSentCookie(context)) {
+				return result; // a per-call session holds nothing
+			}
+			auto conn = state->ConnFor(handle);
+			std::lock_guard<std::mutex> execution(conn->exec);
+			for (const char *name : {"TimeZone", "Calendar"}) {
+				auto value = conn->con->Query(string("SELECT current_setting('") + name + "')");
+				if (!value->HasError() && value->RowCount() == 1 && !value->GetValue(0, 0).IsNull()) {
+					result.session_options[name] = value->GetValue(0, 0).ToString();
+				}
+			}
+			return result;
+		});
+	}
+
 	//! The driver's own end-of-connection signal (spec 050): closes our session when the token speaks
 	//! for it - a stolen cookie alone ends nothing. Idempotent.
 	arrow::Result<flight::CloseSessionResult> CloseSession(const flight::ServerCallContext &context,

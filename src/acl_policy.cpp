@@ -484,6 +484,14 @@ bool PolicyStore::DoorOpen() {
 	return door_open;
 }
 
+bool ClientSettingAllowed(const string &name) {
+	// TimeZone and Calendar (ICU) decide how a TIMESTAMPTZ and a date part are RENDERED for this
+	// client and nothing else: not what a name resolves to (search_path), not what is read
+	// (file_search_path, enable_external_access), not what a statement may cost (threads, memory).
+	// Everything outside this list stays refused; growing it is a spec, not a line.
+	return StringUtil::CIEquals(name, "TimeZone") || StringUtil::CIEquals(name, "Calendar");
+}
+
 bool PolicyStore::SetDraining(bool value) {
 	return draining.exchange(value);
 }

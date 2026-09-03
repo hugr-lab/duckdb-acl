@@ -1440,6 +1440,9 @@ void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &ou
 		if (!store.SessionPrincipal(prefix.value, out, reason)) {
 			throw BinderException("acl_rewrite: session %s", reason);
 		}
+		// a session is a connection of the client's own (spec 050), so a setting may live on it
+		// (spec 068); the ingest prefix carries the door's composed INSERT and sets nothing
+		out.session_connection = prefix.kind == AclPrefix::Kind::SESSION;
 		return;
 	}
 	bool is_token = prefix.kind == AclPrefix::Kind::TOKEN;

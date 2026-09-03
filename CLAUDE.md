@@ -251,6 +251,13 @@ scope, never the syntax. Grammar-extension registration is not exposed upstream 
 extended-grammar AST flows through the same inner parse (walked or denied per node) and the prefix
 itself becomes a grammar rule (design/014 spike; the upstream question is design/011/QUESTION.md).
 
+**Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
+render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
+value, a session scope, and only on a session of the client's own (`Principal::session_connection`,
+set by `ACL SESSION` alone): a per-statement prefix runs on a connection the gateway shares, where a
+setting would leak to the next principal. The Flight door's `SetSessionOptions`/`GetSessionOptions`
+apply the same list on the session's connection. The build carries `icu` for the tests.
+
 **Spec 066 — node drain**: `acl_drain()` stops seating new clients at the one seam they all cross
 (`SessionOpen` refuses; the doors say why — Flight answers UNAVAILABLE "draining", quack's discovery
 answers 503 `draining`) while established sessions keep working; repeating `acl_drain()` is the

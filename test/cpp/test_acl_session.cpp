@@ -226,6 +226,44 @@ int main(int argc, char *argv[]) {
 		}
 		Exec(con, "SELECT acl_session_close('" + handle + "')");
 	});
+
+	Scenario("a session may set its own rendering settings (spec 068)", [&]() {
+		// icu carries TimeZone/Calendar; the test binary links it (extension_config.cmake)
+		auto icu = con.Query("LOAD icu");
+		if (icu->HasError()) {
+			std::cout << "  skip: no icu in this build (" << icu->GetError() << ")\n";
+			return;
+		}
+		auto handle = OpenSession(con, TOKEN);
+		if (!Check(!handle.empty(), "a session opens for the settings check")) {
+			return;
+		}
+		auto prefix = "ACL SESSION '" + handle + "' ";
+		auto render = [&]() {
+			auto shown = con.Query(prefix + "SELECT '2026-01-01 00:00:00+00'::TIMESTAMPTZ::VARCHAR");
+			return shown->HasError() ? "ERROR: " + shown->GetError() : shown->GetValue(0, 0).ToString();
+		};
+		auto set = con.Query(prefix + "SET TimeZone = 'Asia/Tokyo'");
+		if (CheckOk(*set, "the session sets its time zone")) {
+			auto tokyo = render();
+			Check(tokyo.find("09:00:00+09") != std::string::npos, "...and renders a TIMESTAMPTZ in it: " + tokyo);
+		}
+		auto reset = con.Query(prefix + "RESET TimeZone");
+		if (CheckOk(*reset, "the session resets it")) {
+			auto after = render();
+			Check(after.find("+09") == std::string::npos, "...and the zone is the server's again: " + after);
+		}
+		// the same session may not reach outside the list, nor the node
+		auto other = con.Query(prefix + "SET threads = 1");
+		Check(other->HasError() && other->GetError().find("not permitted under ACL") != std::string::npos,
+		      "a setting outside the list is refused on a session too");
+		auto global = con.Query(prefix + "SET GLOBAL TimeZone = 'Asia/Tokyo'");
+		Check(global->HasError() && global->GetError().find("SET GLOBAL") != std::string::npos,
+		      "GLOBAL is refused on a session too");
+		auto computed = con.Query(prefix + "SET TimeZone = (SELECT 'Asia/Tokyo')");
+		Check(computed->HasError(), "a non-constant value is refused");
+		Exec(con, "SELECT acl_session_close('" + handle + "')");
+	});
 	Exec(con, "SELECT acl_define_token('opstok','analyst','tenant=acme')");
 	Scenario("ops-surface-lists-and-kills", [&]() { OpsSurfaceListsAndKills(con); });
 	Scenario("session-end-reason", [&]() { SessionEndReason(con); });
