@@ -231,6 +231,19 @@ SELECT acl_quack_serve('quack:[::]:31998', 'server-token');
 ----
 <REGEX>:.*binds only localhost.*
 
+# what the environment refuses is an IO error, not a binder error (the error contract,
+# docs/security.md section 8): `plain` lifts the loopback rule, so this reaches the socket, and
+# 192.0.2.1 (TEST-NET-1) is an address no host has - the bind fails at once and nothing stays open.
+# A build without OpenSSL (no Flight door) takes the server's RNG from httpfs, and refuses to serve
+# before it binds until that is loaded - what a deployment does anyway (JWKS ride on it too).
+statement ok
+LOAD httpfs;
+
+statement error
+SELECT acl_quack_serve('quack:192.0.2.1:31997', 'server-token', 'plain');
+----
+<REGEX>:IO Error: acl_quack_serve: failed to bind.*
+
 # spec 063: with the instance in order, acl_quack_serve no longer needs the quack loadable - the door
 # is quack's server compiled into acl, so serving here would bind a real listener (its success turning
 # on the build's crypto: OpenSSL in a flight build, else httpfs) and leave it running past the test.

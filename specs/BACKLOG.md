@@ -85,9 +85,10 @@ before if cheap; **later** — development, after the release.
 - **A principal's functions surface** (`duckdb_functions()` / `information_schema.routines`): a
   virtual table function is callable but appears in no listing, so an agent browsing the catalog
   cannot learn it exists or its signature; params and result columns are already stored.
-- **Error-prefix contract**: `acl:`, `acl admin:`, `acl catalog:`, `acl_rewrite:`, `acl_flight_serve:`
-  … three conventions, undocumented, and `acl_rewrite:` fires from `SessionOpen` where nothing is
-  rewritten; IO/socket failures throw `BinderException`. Fix and write down before clients match on it.
+- ~~**Error-prefix contract**~~ — written down in `docs/security.md` §8 (the prefix is the contract,
+  the exception class says which kind of thing went wrong, the wording is not promised); file and
+  socket failures of a serve are `IOException`. `acl_rewrite: token rejected` never leaves
+  `SessionOpen` - it is caught there and a door gets NULL/false.
 - **The Flight door has no sqllogictest coverage** (only e2e, skipped on PRs): serve-argument
   validation is reachable from SQL; `DoorAuthJson` has no test at all.
 - ~~**`test/harness/run.sh` exits 1**~~ — done (#103): the demo speaks the catalog model and the

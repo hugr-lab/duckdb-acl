@@ -459,10 +459,21 @@ What a client may rely on:
   draining, `Invalid`, `KeyError`, …) with the same text; through quack, an authentication or
   authorization refusal is quack's own "Authentication failed" / "Authorization failed" (spec 041).
 
-The taxonomy is being tightened before release (release plan item 4.4: one rule, one list,
-`IOException` for file and socket failures that are `BinderException` today, and `acl_rewrite:` no
-longer raised from `SessionOpen`, where nothing is rewritten). The prefixes are the part clients
-may match on now; the exception classes and the exact wording after a prefix are not promised.
+The rule (release plan 4.4): **the prefix is the contract; the exception class says which kind of
+thing went wrong; the wording after the prefix is not promised.** A client matches on the prefix and,
+if it needs more, on a keyword (`no access`, `not allowed`, `read-only`, `draining`) - never on the
+whole sentence. duckdb prints the class in front of every message:
+
+| class | printed as | when |
+| --- | --- | --- |
+| `BinderException` | `Binder Error:` | a refusal or a policy/configuration problem: every `acl_rewrite:` and `acl admin:` refusal, `acl catalog:`, a door precondition (`acl_flight_serve: …`), an occupied uri |
+| `InvalidInputException` | `Invalid Input Error:` | the shape of an argument or a token: a NULL where a value is required, malformed JSON, the per-row write check |
+| `IOException` | `IO Error:` | the environment, not the policy: a certificate or key that could not be read or parsed, a listen address that could not be bound (`acl_quack_serve: failed to bind …`, `acl_flight_serve: …`) |
+| `ParserException` | `Parser Error:` | the prefix itself (`acl_rewrite: …`) or the statement text after it does not parse |
+
+A token that does not verify is refused as `acl_rewrite: token rejected: <reason>` on the prefix
+path (`ACL TOKEN '…'`); a door never sees that text - `acl_session_open` answers NULL and
+`acl_quack_authenticate` false, and `acl_session_reason` says why a session is gone.
 
 ## 9. Hardening checklist
 
