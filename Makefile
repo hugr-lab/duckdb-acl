@@ -196,15 +196,16 @@ test-integration:
 	build/release/test/unittest "test/sql/integration/*"
 
 # The Flight SQL door's dependency check (specs/045): does the built extension carry everything it
-# needs, or did it pick something up from the machine? Run it after an ACL_FLIGHT=1 build - it is the
-# only thing standing between us and an artifact that works here and nowhere else.
+# needs, or did it pick something up from the machine? Run it after a build with the door in (the
+# default; ACL_NO_FLIGHT=1 leaves it out) - it is the only thing standing between us and an artifact
+# that works here and nowhere else.
 .PHONY: check-flight-deps test-flight
 check-flight-deps:
 	./scripts/check_flight_deps.sh
 
 # The Flight SQL door end to end (specs/045): one duckdb serves, a third-party pyarrow client reads its
-# own slice through it. Needs ACL_FLIGHT=1 GEN=ninja make, and pyarrow; skips itself, saying why, when
-# either is missing.
+# own slice through it. Needs a build with the door in (GEN=ninja make, without ACL_NO_FLIGHT=1) and
+# pyarrow; skips itself, saying why, when either is missing.
 test-flight:
 	test/e2e/flight/run.sh
 	test/e2e/flight/adbc.sh
