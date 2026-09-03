@@ -73,7 +73,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          "enabled - the gateway's own escape hatch (spec 009)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_jwt_clock_skew", "acl: allowed clock skew in seconds for JWT exp/nbf checks",
-	                          LogicalType::BIGINT, Value::BIGINT(60));
+	                          LogicalType::BIGINT, Value::BIGINT(60), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_jwks_refresh_interval",
 	                          "acl: seconds a fetched JWKS is used before it is read again (spec 023)",
 	                          LogicalType::BIGINT, Value::BIGINT(300), nullptr, SetScope::GLOBAL);
