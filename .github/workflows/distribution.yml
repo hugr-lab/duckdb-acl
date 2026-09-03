@@ -17,12 +17,16 @@
 # duckdb's public read-only cache and is merely slow.
 name: Distribution build
 
-# Run it when we ask, and on a release tag. Deliberately not on a schedule: this matrix builds Arrow
-# and gRPC on nine platforms, and a nightly one would spend that on days when nothing changed. The
-# early warning about duckdb `main` is worth having, but it is worth having when someone is looking.
+# Run it on every merge to main, on a release tag, and when we ask. Not on a schedule: this matrix
+# builds Arrow and gRPC on nine platforms, and a nightly one would spend that on days when nothing
+# changed - a merge is exactly the day something did. Merge-time runs are what give Windows (MSVC and
+# MinGW), musl and wasm their coverage at all: the PR jobs stay on Linux and macOS to keep PRs fast,
+# and the early warning about duckdb `main` drift arrives with the change that has to live with it.
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
