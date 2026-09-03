@@ -25,6 +25,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
 #include "acl_door_auth.hpp"
+#include "acl_door_common.hpp"
 #include "acl_oidc.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
@@ -1694,66 +1695,6 @@ arrow::Result<flight::Location> ParseListenUri(const string &uri, string &host_o
 	return location;
 }
 
-//! A PEM cert or key argument: inline PEM if it opens with the armor, otherwise a path/URI read
-//! through duckdb's own filesystem - the same mechanism spec 023 reads a JWKS document with, so a
-//! local file works out of the box and an operator's secret manager or object store rides httpfs.
-string ReadPem(ClientContext &context, const string &arg, const char *what) {
-	auto trimmed = arg;
-	StringUtil::Trim(trimmed);
-	if (StringUtil::StartsWith(trimmed, "-----BEGIN")) {
-		return trimmed; // inline PEM, handed straight to Arrow
-	}
-	Connection con(*context.db);
-	auto quoted = "'" + StringUtil::Replace(trimmed, "'", "''") + "'";
-	auto result = con.Query("SELECT content FROM read_text(" + quoted + ")");
-	if (result->HasError()) {
-		throw BinderException("acl_flight_serve: could not read the %s from \"%s\": %s", what, trimmed,
-		                      result->GetError());
-	}
-	if (result->RowCount() != 1 || result->GetValue(0, 0).IsNull()) {
-		throw BinderException("acl_flight_serve: the %s location \"%s\" holds no single document", what, trimmed);
-	}
-	auto content = result->GetValue(0, 0).ToString();
-	// validate here rather than let a non-PEM file reach Arrow as the "cryptic gRPC init error" this
-	// helper exists to avoid (the review's finding): a path to the wrong file is a common mistake
-	auto content_head = content;
-	StringUtil::Trim(content_head);
-	if (!StringUtil::StartsWith(content_head, "-----BEGIN")) {
-		throw BinderException("acl_flight_serve: the %s at \"%s\" is not PEM (no -----BEGIN marker) - "
-		                      "pass a PEM file/URI or inline PEM text",
-		                      what, trimmed);
-	}
-	return content;
-}
-
-//! The four things spec 041 refuses to serve past, restated for this door. Each is checked before the
-//! socket is touched, so the refusal names the thing to fix.
-void RefuseUnlessServable(ClientContext &context, PolicyStore &store, const string &host, bool has_tls) {
-	if (!store.CatalogEnabled()) {
-		throw BinderException("acl_flight_serve: no policy source is configured - a served instance "
-		                      "resolves every statement against one, so `acl_use_db` comes first");
-	}
-	if (store.CatalogAnonymousAdminAllowed()) {
-		throw BinderException("acl_flight_serve: `acl_allow_anonymous_admin` is on, so a served client "
-		                      "could administer the ACL with a bare `ACL ADMIN` - turn it off first");
-	}
-	Value override_setting;
-	if (context.TryGetCurrentSetting("allow_parser_override_extension", override_setting) &&
-	    !StringUtil::CIEquals(override_setting.ToString(), "strict")) {
-		throw BinderException("acl_flight_serve: the parser override is \"%s\", not STRICT - a served "
-		                      "statement that failed to parse as ACL would fall through to plain SQL",
-		                      override_setting.ToString());
-	}
-	// TLS is what lets the door leave the machine (spec 053). Without a certificate it serves in the
-	// clear, so it binds only an address that cannot leave the machine; with one, any address is the
-	// operator's call. This is the one refusal a certificate lifts - the three above stand regardless.
-	if (!has_tls && host != "localhost" && host != "127.0.0.1" && host != "::1" && host != "[::1]") {
-		throw BinderException("acl_flight_serve: without a TLS certificate the door serves in the clear, so it "
-		                      "binds only localhost - pass a cert and key to serve a non-local address "
-		                      "(acl_flight_serve(uri, cert, key)), or put a TLS-terminating proxy in front");
-	}
-}
-
 //! acl_flight_serve(uri): start the Flight SQL door in this process.
 void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
@@ -1782,7 +1723,9 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		if (!location.ok()) {
 			throw BinderException("acl_flight_serve: %s", location.status().ToString());
 		}
-		RefuseUnlessServable(context, store, host, has_tls);
+		// the preconditions both doors share (acl_door_common): a cleartext Flight door has no
+		// explicit cleartext mode, so without a certificate it is loopback-only, full stop
+		RefuseUnlessServable(context, store, "acl_flight_serve", host, has_tls, false);
 		if (has_tls) {
 			// build the location as grpc+tls whatever scheme was written: the certificate is the
 			// intent, and a plain grpc:// location would start a cleartext listener beside the certs
@@ -1812,8 +1755,10 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		// and a BasicAuth handshake runs the IdP-gated password grant (the middleware below).
 		options.auth_handler = std::make_shared<AclDoorAuthHandler>(door.state);
 		if (has_tls) {
-			auto cert = ReadPem(context, FlatVector::GetData<string_t>(args.data[1])[row].GetString(), "certificate");
-			auto key = ReadPem(context, FlatVector::GetData<string_t>(args.data[2])[row].GetString(), "key");
+			auto cert = ReadPemArg(context, FlatVector::GetData<string_t>(args.data[1])[row].GetString(), "certificate",
+			                       "acl_flight_serve");
+			auto key = ReadPemArg(context, FlatVector::GetData<string_t>(args.data[2])[row].GetString(), "key",
+			                      "acl_flight_serve");
 			options.tls_certificates.push_back(flight::CertKeyPair {std::move(cert), std::move(key)});
 		}
 		// spec 050: the cookie identifies a client connection, which is what lets a session persist
