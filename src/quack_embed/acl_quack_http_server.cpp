@@ -279,18 +279,18 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 	if (!cert_pem.empty() || !key_pem.empty()) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 		if (cert_pem.empty() || key_pem.empty()) {
-			throw IOException("TLS needs both a certificate and a key");
+			throw IOException("acl_quack_serve: TLS needs both a certificate and a key");
 		}
 		auto tls = MakeTlsServer(cert_pem, key_pem, tls_cert, tls_key);
 		if (!tls) {
-			throw IOException("the certificate or key did not parse as PEM");
+			throw IOException("acl_quack_serve: the certificate or key did not parse as PEM");
 		}
 		if (!tls->is_valid()) {
-			throw IOException("the TLS context refused the certificate/key pair");
+			throw IOException("acl_quack_serve: the TLS context refused the certificate/key pair");
 		}
 		server = std::move(tls);
 #else
-		throw IOException("TLS needs a build that carries OpenSSL (the flight build) - "
+		throw IOException("acl_quack_serve: TLS needs a build that carries OpenSSL (the flight build) - "
 		                  "this build serves cleartext only");
 #endif
 	} else {
@@ -368,7 +368,7 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 	});
 
 	if (!server->is_valid()) {
-		throw IOException("failed to instantiate the server at %s", uri_p.Http());
+		throw IOException("acl_quack_serve: failed to instantiate the server at %s", uri_p.Http());
 	}
 
 	bool success;
@@ -382,7 +382,7 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 		success = server->bind_to_port(uri_p.Host(), uri_p.Port());
 	}
 	if (!success) {
-		throw IOException("failed to bind %s (address in use, permission denied, or invalid "
+		throw IOException("acl_quack_serve: failed to bind %s (address in use, permission denied, or invalid "
 		                  "host/port)",
 		                  uri_p.Http());
 	}
@@ -493,6 +493,10 @@ string StartAclQuackServer(ClientContext &context, const AclQuackServeConfig &cf
 		}
 		g_servers.emplace(key, std::move(server));
 		return "";
+	} catch (IOException &) {
+		// a bind or PEM failure is the environment's, not the policy's: it keeps its IO class all the
+		// way to the caller (the error contract, docs/security.md section 8)
+		throw;
 	} catch (std::exception &ex) {
 		string message = ex.what();
 		// The server's token/session RNG needs a writable crypto module; without one the raw mbedtls

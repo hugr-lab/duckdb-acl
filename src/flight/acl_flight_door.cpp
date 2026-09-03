@@ -1830,7 +1830,10 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		                                std::make_shared<PasswordHandshakeFactory>(door.state, has_tls));
 		auto init = door.server->Init(options);
 		if (!init.ok()) {
-			throw BinderException("acl_flight_serve: %s", init.ToString());
+			// Init binds the listen address (and loads the TLS material): what fails here is the
+			// environment - a port in use, an address that is not ours - not the policy, so it is an
+			// IO error (the error contract, docs/security.md section 8)
+			throw IOException("acl_flight_serve: %s", init.ToString());
 		}
 		// Serve() blocks for the life of the door, so it gets a thread of its own; Shutdown() is what
 		// ends it, and acl_flight_stop is the only thing that calls that.

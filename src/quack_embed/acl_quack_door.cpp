@@ -95,6 +95,9 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			return shared_store->Draining();
 		};
 		string actual_uri;
+		// a bind or PEM failure inside is an IOException that carries this function's prefix and passes
+		// through untouched (the error contract, docs/security.md section 8); what comes back as text is
+		// a refused state - an occupied uri, a missing crypto module - and stays a binder error
 		auto error = StartAclQuackServer(context, cfg, actual_uri);
 		if (!error.empty()) {
 			throw BinderException("acl_quack_serve: %s", error);
