@@ -119,7 +119,8 @@ jobs:
 
       - name: Unit suites
         run: |
-          build/release/test/unittest 'test/sql/*'
+          build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
+          scripts/ci/assert_ran.sh suite.log 50 3000
           make test-cpp
 
       # the generated policy schema (acl_schema_sql.hpp, acl_schema.sql) must match
@@ -134,7 +135,11 @@ jobs:
           mysql -h 127.0.0.1 -P 6433 -u acl -paclpass acltest < docker/init/mysql.sql
 
       - name: Integration tests
-        run: make test-integration
+        # PostgreSQL is a service of this job: a PG- or DuckLake-gated scenario that skips here ran
+        # nothing it was set up to run (release plan 0.3)
+        run: |
+          make test-integration 2>&1 | tee integration.log
+          scripts/ci/assert_ran.sh integration.log 8 200 'require-env ACL_(PG|DUCKLAKE)_DSN'
 
       - name: Upload extension artifact
         if: github.event_name != 'pull_request'
@@ -213,13 +218,17 @@ jobs:
 
       - name: Unit suites
         run: |
-          build/release/test/unittest 'test/sql/*'
+          build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
+          scripts/ci/assert_ran.sh suite.log 50 3000
           # the embedded quack door's cpp test runs HERE, on the flight build, so its TLS + OpenSSL
           # RNG path is exercised (the no-flight linux job above builds it cleartext-only)
           make test-cpp
 
       - name: Flight door end to end
-        run: make test-flight
+        # every e2e script exits 0 with `SKIP:` on a missing dependency - right on a dev box, a lie here
+        run: |
+          make test-flight 2>&1 | tee flight.log
+          scripts/ci/assert_ran.sh flight.log 0 0
 
   # Representative second platform; PRs stay on the Linux job to keep them fast
   build-test-osx:
@@ -256,7 +265,8 @@ jobs:
 
       - name: Unit suites
         run: |
-          build/release/test/unittest 'test/sql/*'
+          build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
+          scripts/ci/assert_ran.sh suite.log 50 3000
           make test-cpp
 
       - name: Upload extension artifact
