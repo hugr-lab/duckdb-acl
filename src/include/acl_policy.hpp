@@ -237,7 +237,7 @@ struct TemplateCache {
 };
 
 namespace acl_detail {
-struct CatalogBackend; // catalog-DB policy backend (spec 006), defined in acl_policy_catalog.cpp
+struct CatalogBackend; // catalog-DB policy backend (spec 006), declared in acl_policy_catalog.hpp
 } // namespace acl_detail
 
 //! Per-database policy store: the seam the rewriter and the admin functions talk to. Two backends:
