@@ -264,6 +264,58 @@ int main(int argc, char *argv[]) {
 		Check(computed->HasError(), "a non-constant value is refused");
 		Exec(con, "SELECT acl_session_close('" + handle + "')");
 	});
+	Scenario("management and native SQL over a session are the session's scope, exactly (plan 2.2)", [&]() {
+		// What a door's client writes after the principal is what a gateway's client writes after
+		// the prefix: `ACL <management>` and `ACL NATIVE <sql>` (spec 009). The door composes
+		// `ACL SESSION '<h>' ` in front and nothing else, so the same gates decide - the session's
+		// principal, its scope resolved per statement (a grant made after the session opened counts),
+		// and never the door's own rights. Pinned here because no test ever drove the admin path
+		// through a session, and it is the most privileged path a door carries.
+		auto handle = OpenSession(con, TOKEN);
+		if (!Check(!handle.empty(), "a session opens for the admin-path check")) {
+			return;
+		}
+		auto prefix = "ACL SESSION '" + handle + "' ";
+		auto refused_with = [&](const string &sql, const string &needle, const string &what) {
+			auto result = con.Query(prefix + sql);
+			Check(result->HasError() && result->GetError().find(needle) != std::string::npos,
+			      what + ": " + (result->HasError() ? result->GetError() : "it passed"));
+		};
+		// no scope: neither management nor native, and the refusal names the scope
+		refused_with("ACL CREATE ROLE made_over_session", "no ACL administration scope",
+		             "a session without a scope may not administer");
+		refused_with("ACL NATIVE SELECT acl_drain_status()", "no ACL administration scope", "...nor run native SQL");
+		// manage: management yes, native no, admin grants no (never self-escalating)
+		Exec(con, "SELECT acl_grant_admin('analyst', 'manage')");
+		auto made = con.Query(prefix + "ACL CREATE ROLE made_over_session");
+		if (CheckOk(*made, "a manage scope administers over a session")) {
+			auto rows = con.Query("SELECT count(*)::BIGINT FROM store.acl.roles WHERE \"role\" = 'made_over_session'");
+			Check(!rows->HasError() && rows->GetValue(0, 0).GetValue<int64_t>() == 1,
+			      "...and the policy write landed in the catalog");
+		}
+		refused_with("ACL NATIVE SELECT acl_drain_status()", "requires a passthrough scope",
+		             "a manage scope is refused native SQL");
+		refused_with("ACL GRANT ADMIN passthrough TO ROLE analyst", "requires a passthrough scope",
+		             "a manage scope cannot grant itself passthrough");
+		auto still_manage = con.Query(prefix + "ACL NATIVE SELECT 1");
+		Check(still_manage->HasError(), "...and it is still not passthrough afterwards");
+		// passthrough: native SQL runs - including the node's own control functions. That is the
+		// operator path over a door (spec 066 made acl_drain reachable this way on purpose): a
+		// passthrough scope is god mode by definition, and a door adds no authority it lacked.
+		Exec(con, "SELECT acl_revoke_admin('analyst')");
+		Exec(con, "SELECT acl_grant_admin('analyst', 'passthrough')");
+		auto native = con.Query(prefix + "ACL NATIVE SELECT acl_drain_status()");
+		if (CheckOk(*native, "a passthrough scope runs native SQL over a session")) {
+			Check(native->GetValue(0, 0).ToString() == "serving", "...including the node's control surface");
+		}
+		// the virtual context is unchanged by the scope: the same session still reads its slice
+		auto slice = con.Query(prefix + "SELECT count(*)::BIGINT FROM orders");
+		Check(!slice->HasError() && slice->GetValue(0, 0).GetValue<int64_t>() == 2,
+		      "the virtual context still confines the passthrough principal's ordinary statements");
+		Exec(con, "SELECT acl_revoke_admin('analyst')");
+		Exec(con, "ACL ADMIN DROP ROLE made_over_session");
+		Exec(con, "SELECT acl_session_close('" + handle + "')");
+	});
 	Exec(con, "SELECT acl_define_token('opstok','analyst','tenant=acme')");
 	Scenario("ops-surface-lists-and-kills", [&]() { OpsSurfaceListsAndKills(con); });
 	Scenario("session-end-reason", [&]() { SessionEndReason(con); });
