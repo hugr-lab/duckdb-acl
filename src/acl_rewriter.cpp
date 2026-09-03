@@ -2007,7 +2007,11 @@ private:
 				}
 				RewriteFunctionArgs(function); // resolve virtual names inside the arguments first
 				if (spolicy.subquery_form) {
+					// the caller's alias names the select item, not the call: `tenant_tag(x) AS tag` is
+					// still the column `tag` after the macro expands (the harness demo lost it)
+					auto alias = function.GetAlias();
 					expr = BuildScalarExpr(name, spolicy, function);
+					expr->SetAlias(std::move(alias));
 				} else {
 					function.SetQualifiedName(ParsePhysName(spolicy.phys));
 				}
@@ -2021,6 +2025,7 @@ private:
 			// equals current_database() into the client's top level, so the physical answer un-folds
 			// the virtual catalog and every remote name grows a spurious level.
 			if (IsSessionIdentityCall(function)) {
+				auto alias = function.GetAlias(); // the select item keeps its name (see the macro above)
 				if (StringUtil::CIEquals(name, "current_schema")) {
 					// where an unqualified name lands inside the catalog - `main`, by construction
 					expr = make_uniq<ConstantExpression>(Value("main"));
@@ -2031,6 +2036,7 @@ private:
 				} else {
 					expr = BuildCurrentDatabaseExpr();
 				}
+				expr->SetAlias(std::move(alias));
 				return;
 			}
 			// otherwise route it through the resolver seam (default-allow, deny readers)
