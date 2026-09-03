@@ -124,7 +124,9 @@ Existing pins that complete the picture: nested prefix (acl_admin_scopes.test), 
 
 ## Follow-ups
 
-- **Post the upstream question** (design/011/QUESTION.md) — the gate to the grammar port.
+- **Wait for upstream** (decision 2026-09-03: nothing to comment on, no question to post — we simply
+  wait; design/011/QUESTION.md stays a draft). Reopen the day `ParserCache::GetMatcher` stops building
+  only `CreateDefault()`, or an ExtensionLoader/DBConfig grammar API appears.
 - **The grammar port itself** (prefix-as-rule, hand scanner deleted) — its own spec, when the
   registration API lands.
 - **design/005 paths 2–3** (a property graph as a virtual-catalog object; a reference-enumeration
