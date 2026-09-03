@@ -24,8 +24,8 @@
 
 -- @section schema
 -- The tables as they are now: a catalog is created complete, in one statement each, and stamped with
--- the schema version at the end. There are no migrations yet - see schema/migrations/README.md for
--- the contract they will follow.
+-- the schema version at the end. A catalog an older version created is brought forward by the
+-- hand-written steps in schema/migrations/ (v<n>.sql), under the contract its README states.
 
 CREATE SCHEMA IF NOT EXISTS <schema>;
 
