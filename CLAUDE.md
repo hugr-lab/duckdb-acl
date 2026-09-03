@@ -112,7 +112,9 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
 - **Function gating seam**: `PolicyStore::FunctionAllowed` — denies only data-readers / rights-bypass
   functions, passes the rest. This is where a production role-aware resolver plugs in.
 - **State is per-instance**: `PolicyStore` reached via `AclParserInfo` (parser) and `AclScalarInfo`
-  (admin functions' `function_info`) — no process globals.
+  (admin functions' `function_info`) — no process globals. Every `acl_*` scalar is registered through
+  `MarkAclScalar` (fallible **and volatile**): a foldable side effect runs while the optimizer plans
+  and may run again at execution; `test/sql/acl_scalar_stability.test` lists any function that forgot.
 
 ## Admin / setup functions
 

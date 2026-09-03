@@ -633,5 +633,18 @@ struct AclScalarInfo : ScalarFunctionInfo {
 	shared_ptr<PolicyStore> store;
 };
 
+//! What every acl_* scalar is registered with. Fallible: the function refuses at execution time - a
+//! bad predicate, a name in use, a missing target - and an unmarked function turns those refusals
+//! into INTERNAL errors. Volatile: the function changes per-instance state or reads state that
+//! changes under it, so the optimizer may not fold it at plan time - a folded call runs while the
+//! statement is planned and may run again when it executes, and the second call sees the world the
+//! first one changed (`acl_quack_stop(uri) LIKE '%closed%'` stopped the door, then reported that
+//! nobody served it).
+inline void MarkAclScalar(ScalarFunction &function, const shared_ptr<PolicyStore> &store) {
+	function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+	function.SetFallible();
+	function.SetVolatile();
+}
+
 } // namespace acl
 } // namespace duckdb

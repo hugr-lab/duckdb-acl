@@ -1112,6 +1112,12 @@ void AclQuackStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 #ifdef ACL_QUACK_EMBED_ENABLED
 		auto stopped = StopAclQuackServer(*context.db, uri);
 		string note = stopped ? ("Stopped listening on " + uri) : ("No server found listening on " + uri);
+		if (!stopped) {
+			// nothing of ours closed, so there is nothing to sweep: a stop of a uri nobody serves must
+			// not end the sessions of the doors that ARE open (found writing docs/serving.md)
+			result.SetValue(row, Value(note));
+			continue;
+		}
 		// The embedded registry knows exactly how many doors THIS instance has left, so the last-door
 		// judgement is exact (no guessing which door's sessions to drop) - and another instance's
 		// doors do not keep this instance's fence armed.
@@ -1347,10 +1353,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	// register an admin setup function, attaching the shared store via its function_info
 	auto register_admin = [&](const string &name, vector<LogicalType> arguments, scalar_function_t fn) {
 		ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::BOOLEAN, fn);
-		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-		// an admin function refuses at execution time - a bad predicate, a name in use, a missing
-		// target - and an unmarked function turns those refusals into INTERNAL errors
-		function.SetFallible();
+		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);
 	};
 
@@ -1359,8 +1362,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		ScalarFunctionSet set((Identifier(name)));
 		for (auto &arguments : signatures) {
 			ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::BOOLEAN, fn);
-			function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-			function.SetFallible();
+			MarkAclScalar(function, store);
 			set.AddFunction(function);
 		}
 		loader.RegisterFunction(set);
@@ -1430,8 +1432,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	auto register_refresh = [&](vector<LogicalType> arguments) {
 		ScalarFunction function(Identifier("acl_refresh_schema"), std::move(arguments), LogicalType::BIGINT,
 		                        AclRefreshSchemaFunc);
-		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-		function.SetFallible();
+		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);
 	};
 	register_refresh({v});
@@ -1440,8 +1441,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	auto register_refresh_objects = [&](vector<LogicalType> arguments) {
 		ScalarFunction function(Identifier("acl_refresh_schema_objects"), std::move(arguments), LogicalType::BIGINT,
 		                        AclRefreshSchemaObjectsFunc);
-		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-		function.SetFallible();
+		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);
 	};
 	register_refresh_objects({v, v});
@@ -1458,8 +1458,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	// the session contract both doors stand on (spec 040): open once, prefix every statement, close
 	auto register_session_text = [&](const string &name, vector<LogicalType> arguments, scalar_function_t fn) {
 		ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::VARCHAR, fn);
-		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-		function.SetFallible();
+		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);
 	};
 	// the quack door (spec 041): the two callbacks quack calls, both thin over the contract above
@@ -1469,8 +1468,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		ScalarFunctionSet set((Identifier(name)));
 		for (auto &arguments : signatures) {
 			ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::VARCHAR, fn);
-			function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-			function.SetFallible();
+			MarkAclScalar(function, store);
 			set.AddFunction(function);
 		}
 		loader.RegisterFunction(set);
@@ -1487,8 +1485,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	// the bound on all of the above (spec 044): sweeping and counting, both the door's, never a client's
 	auto register_session_bigint = [&](const string &name, scalar_function_t fn) {
 		ScalarFunction function(Identifier(name), {}, LogicalType::BIGINT, fn);
-		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-		function.SetFallible();
+		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);
 	};
 	register_session_bigint("acl_session_sweep", AclSessionSweepFunc);
@@ -1499,8 +1496,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_session_text("acl_drain_status", {}, AclDrainStatusFunc);
 	{
 		ScalarFunction kill(Identifier("acl_session_kill"), {v}, LogicalType::BOOLEAN, AclSessionKillFunc);
-		kill.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-		kill.SetFallible();
+		MarkAclScalar(kill, store);
 		loader.RegisterFunction(kill);
 	}
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);

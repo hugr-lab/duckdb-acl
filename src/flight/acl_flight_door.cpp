@@ -1894,8 +1894,7 @@ void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> stor
 		ScalarFunctionSet set((Identifier(name)));
 		for (auto &arguments : signatures) {
 			ScalarFunction function(Identifier(name), std::move(arguments), v, fn);
-			function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-			function.SetFallible();
+			MarkAclScalar(function, store);
 			// the serve body must run even when a cert/key argument is NULL, or duckdb's default null
 			// propagation returns NULL without ever reaching the cert-without-key guard - a served
 			// door that silently does not start (the review's finding)
