@@ -200,6 +200,32 @@ int main(int argc, char *argv[]) {
 	Scenario("composed-sql-is-the-query", [&]() { ComposedSqlIsTheQuery(con); });
 	Scenario("closing-ends-it", [&]() { ClosingEndsIt(con); });
 	Scenario("instances-do-not-share-sessions", [&]() { InstancesDoNotShareSessions(con, extension); });
+	Scenario("role-default-claims-reach-the-session", [&]() {
+		// A role that carries the tenant as a DEFAULT claim, and a token that names the role but
+		// carries no tenant claim at all: the prefix path merges the default (VerifyPrincipal), and
+		// the session must answer identically - it replays what SessionOpen stored, so a merge the
+		// session path skipped made the same token return NOTHING through a door (RLS on an absent
+		// claim bakes NULL, fail-closed) while the gateway returned the slice. The 2026-09-03 review.
+		Exec(con, "ACL ADMIN CREATE ROLE defaulted CLAIMS (tenant = 'acme')");
+		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE defaulted MAIN");
+		const std::string no_tid =
+		    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wt"
+		    "dGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoiZCIsInJvbGVzIjpbImRlZmF1bHRlZCJdfQ."
+		    "hBRUGp4u7kgSswo0DSb-3yDV_ZxBpluov1IpAdZ-5nk";
+		auto by_token = con.Query("ACL TOKEN '" + no_tid + "' SELECT count(*)::BIGINT FROM orders");
+		auto handle = OpenSession(con, no_tid);
+		Check(!handle.empty(), "the claim-less token opens a session");
+		auto by_session = con.Query("ACL SESSION '" + handle + "' SELECT count(*)::BIGINT FROM orders");
+		if (CheckOk(*by_token, "the prefix path answers") && CheckOk(*by_session, "the session path answers")) {
+			auto prefix_rows = by_token->GetValue(0, 0).GetValue<int64_t>();
+			auto session_rows = by_session->GetValue(0, 0).GetValue<int64_t>();
+			Check(prefix_rows == 2,
+			      "the prefix path sees the role's default slice (acme): " + std::to_string(prefix_rows));
+			Check(session_rows == prefix_rows,
+			      "...and the session sees the SAME slice: " + std::to_string(session_rows));
+		}
+		Exec(con, "SELECT acl_session_close('" + handle + "')");
+	});
 	Exec(con, "SELECT acl_define_token('opstok','analyst','tenant=acme')");
 	Scenario("ops-surface-lists-and-kills", [&]() { OpsSurfaceListsAndKills(con); });
 	Scenario("session-end-reason", [&]() { SessionEndReason(con); });

@@ -109,6 +109,22 @@ session is the coordinator's own routing row - so no shared session state is nee
 - **Per-instance state**, reached through the same `PolicyStore` the parser already has — no process
   globals, so two instances in one process never share sessions.
 
+### Addendum 2026-09-03 — a session carries exactly the prefix's principal, both ways
+
+The contract said a session must never be a way *in* with something the prefix would refuse. The
+release review found the other direction broken: `SessionOpen`'s JWT branch verified the token and
+mapped its roles but skipped the role-default claims that `VerifyPrincipal` merges for `ACL TOKEN`
+(the memory `role_claims` and the catalog's `LoadRoleClaims`). Since `ACL SESSION` replays the
+stored principal verbatim, the same token answered differently through a door than through a
+gateway: an RLS predicate on a role-default claim baked `NULL` (fail-closed, spec 003) and returned
+nothing. Both paths now merge through one helper (`MergeMemoryRoleDefaults` + `CatalogLoadRoleClaims`,
+explicit token claims winning); `test_acl_session.cpp` pins prefix and session answering the same
+slice for a claim-less token of a role with a default claim, and fails without the fix.
+
+Same review, same family: `acl_jwt_clock_skew` was registered session-scoped while the store reads
+it through the instance — `SET` reported success and changed nothing; it is GLOBAL now, like every
+sibling, and `acl_session.test` pins that a plain `SET` admits a token the default skew refuses.
+
 ## Testing
 
 `test/sql/acl_session.test` (33 assertions):

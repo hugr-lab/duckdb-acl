@@ -571,6 +571,11 @@ private:
 	//! The real JWT path of VerifyPrincipal (spec 007): issuer lookup -> acl_token verification ->
 	//! role mapping -> claims; throws on any failure. Defined in acl_policy.cpp.
 	void VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out, bool ignore_exp = false);
+	//! The memory-mode role-default claims of `out.roles`, merged under the explicit ones (the token's
+	//! win). One helper for both principal paths - the prefix (VerifyJwtPrincipal) and the session
+	//! (SessionOpen) - so the same token can never carry different claims through a door than through
+	//! a gateway (spec 040's contract; the 2026-09-03 review finding).
+	void MergeMemoryRoleDefaults(Principal &out);
 	//! spec 023: the keys to verify with. An issuer that names a JWKS URI has them read through
 	//! duckdb's filesystem and cached per instance; one that pastes a JWKS keeps using it. `kid` is
 	//! the token's, so a key that rotated in since the last read triggers one extra read.

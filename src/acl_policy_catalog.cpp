@@ -2618,9 +2618,9 @@ int64_t PolicyStore::MaxIngestRows() {
 
 int64_t PolicyStore::MaxSessions() {
 	if (catalog) {
-		return catalog->SettingInt64("acl_max_sessions", 10000);
+		return catalog->SettingInt64("acl_max_sessions", 1000); // the registered default (spec 044)
 	}
-	return 10000;
+	return 1000;
 }
 
 int64_t PolicyStore::JwksRefreshInterval() {

@@ -397,3 +397,29 @@ SET GLOBAL acl_session_token_binding='connect';
 
 statement ok
 SET GLOBAL acl_jwt_clock_skew=60;
+
+# --- acl_jwt_clock_skew is a GLOBAL setting (the 2026-09-03 review) ----------------------------------
+# The store reads it through the instance, so a session-scoped registration made `SET` report success
+# and change nothing. A token that expired on 2026-01-01 is refused by the default skew and admitted
+# by a skew wide enough to cover it - which a plain SET must reach.
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc2NzIyNTYwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.MFWp7qAyuQXdxbmhheIS1GHzdCuIiU-o-89r26BBvr8' SELECT count(*) FROM orders;
+----
+<REGEX>:.*token expired.*
+
+statement ok
+SET acl_jwt_clock_skew = 10000000000;
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc2NzIyNTYwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.MFWp7qAyuQXdxbmhheIS1GHzdCuIiU-o-89r26BBvr8' SELECT count(*) FROM orders;
+----
+1
+
+statement ok
+RESET acl_jwt_clock_skew;
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc2NzIyNTYwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.MFWp7qAyuQXdxbmhheIS1GHzdCuIiU-o-89r26BBvr8' SELECT count(*) FROM orders;
+----
+<REGEX>:.*token expired.*

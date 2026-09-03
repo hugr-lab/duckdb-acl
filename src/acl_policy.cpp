@@ -254,6 +254,15 @@ string PolicyStore::SessionOpen(const string &token) {
 			return string();
 		}
 		principal.claims = verified.claims;
+		// The role-default claims, exactly as the ACL TOKEN path merges them (VerifyPrincipal): a
+		// session is what `ACL SESSION` replays verbatim, so a claim the prefix path would carry and
+		// the session lacked made the SAME token answer differently through a door than through a
+		// gateway - an RLS predicate on a role default baked NULL and returned nothing (the 2026-09-03
+		// review). Explicit token claims win, both here and there.
+		MergeMemoryRoleDefaults(principal);
+		if (catalog) {
+			CatalogLoadRoleClaims(principal);
+		}
 		expires_at = verified.expires_at;
 	} else if (!VerifyPrincipal(true, token, principal)) {
 		return string(); // the dev stub, which carries no expiry
@@ -572,6 +581,10 @@ void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, 
 	out.claims = std::move(verified.claims);
 	// role-default claims of the mapped roles (explicit token claims win); the catalog side is
 	// merged by the caller via CatalogLoadRoleClaims
+	MergeMemoryRoleDefaults(out);
+}
+
+void PolicyStore::MergeMemoryRoleDefaults(Principal &out) {
 	lock_guard<mutex> guard(lock);
 	for (auto &role : out.roles) {
 		auto defaults = role_claims.find(role);
