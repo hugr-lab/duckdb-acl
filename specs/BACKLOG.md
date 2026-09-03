@@ -24,12 +24,13 @@ before if cheap; **later** — development, after the release.
    grows** — a catalog-wide `ssn = NULL` does not cover an `ssn_backup` added later, and a schema
    alias shows a whole new table. Memory mode leaves the quickstart (it cannot serve, list or read a
    JWKS); the eight legacy wrappers are labelled legacy.
-2. **Spec 043 — concurrency and isolation across roles** is still a draft. The release's headline
-   (two doors, many clients) has never been tested with more than one client: a session's principal
-   never leaking into another connection's statement, one role's RLS slice staying its own while
-   another writes next to it, a bulk ingest under one role not showing another role rows it may not,
-   the per-statement (not per-stream) atomicity of a drained stream. Proven under load, under
-   sanitizers, against real sources.
+2. ~~**Spec 043 — concurrency and isolation across roles**~~ — implemented 2026-09-04: the
+   in-process half (`test_acl_concurrency.cpp`, under ASan/UBSan in CI; `acl_interleave.test`) and
+   the door harness with all seven assertions (a reader during a drain, a client killed
+   mid-statement, the cross-source join under load on a postgres × ducklake leg). The harness runs
+   locally against docker sources (`make test-e2e`); CI has the sources but does not run it yet -
+   wiring it into the linux job is the open piece. It found one bug on the way (an RLS-only
+   relation listed without columns; fixed).
 3. **Audit** (decided 2026-09-03: in the release). An event per engine decision — principal
    (subject/roles), statement class, objects and capability, verdict with reason, a correlation id
    supplied by the caller, **never data**; where it is written, how it is read, how it cannot become

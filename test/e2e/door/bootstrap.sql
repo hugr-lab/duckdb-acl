@@ -37,6 +37,10 @@ ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
     RLS 'tenant = acl_claim(''tenant'')'
     COLUMNS 'id,tenant=acl_claim(''tenant''),amount';
 
+-- A leg may publish a second object over another source (the cross-source join under load): run.sh
+-- renders the statements here, or nothing.
+${ACL_E2E_EXTRA}
+
 SET GLOBAL acl_allow_anonymous_admin=false;
 
 -- --- the door ------------------------------------------------------------------------------------
