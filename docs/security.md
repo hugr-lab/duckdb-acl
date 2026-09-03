@@ -338,13 +338,20 @@ are name leaks bounded to an already-granted principal.
   principal cannot see; where a unique constraint exists "the failure does disclose that *some* row
   with that key exists outside the principal's slice … a deployment that cares should not grant
   `merge` on a table whose key space is shared across tenants".
-- **Concurrency under load is not yet proven (spec 043, draft).** Isolation is by construction -
-  the override receives no `ClientContext`, "which is *why* identity rides in the statement text";
-  each session executes under its own lock on its own connection - and the e2e harness runs three
-  legs (postgres, mssql, ducklake) with two clients streaming 20 000 rows each, asserting "slices
-  stay separate, no row is stored outside the slice that wrote it, and concurrent ingests add up".
-  Not yet written: a reader during another client's drain, the cross-source join under load, session
-  lifecycle across clients. The backlog lists this as a release blocker.
+- **Concurrency under load is proven the way spec 043 asked for (implemented 2026-09-04).**
+  Isolation is by construction - the override receives no `ClientContext`, "which is *why*
+  identity rides in the statement text"; each session executes under its own lock on its own
+  connection - and it is exercised two ways. In process, on every build: four writers of two
+  tenants, an auditor with a hidden column and a thread bumping the policy version under them,
+  then six threads interleaving two principals' prefixes on one shared connection
+  (`test/cpp/test_acl_concurrency.cpp`, under ASan/UBSan in CI; `test/sql/acl_interleave.test`).
+  Through the door, with real sources (`make test-e2e`): on each leg two clients stream 20 000
+  rows apiece while a reader ticks through the load (zero foreign rows on every tick, and a count
+  that is all or nothing - an ingest is one statement), a fourth client is `SIGKILL`ed mid-load
+  (its rows stored all or not at all, the door answering afterwards), and a postgres × ducklake leg
+  joins across sources under the load. Every assertion is by `id`, never by the computed `tenant`.
+  The exercise found and fixed one listing bug (an RLS-only relation listed without its columns,
+  invisible to a client that builds its catalog from them).
 - **An ingest is atomic per statement, not per stream (spec 042).** A session that expires
   mid-stream "ends the drain with an error and a partially written table". The fence keys on two
   scan names; "if quack ever drains a stream by another name, an unprefixed write runs natively
