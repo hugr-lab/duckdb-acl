@@ -223,9 +223,13 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                    " ELSE o.vschema || '.' || o.vname END";
 	// An `alias` relation is the physical table under a virtual name (possibly with renamed
 	// columns), so its listing is the physical row with the identity columns replaced - the rich
-	// shape, for free. Anything else - a projection, a view - is described by its own stored
-	// schema: a masked or computed column has no physical row to borrow, and leaving it out would
-	// hide a column the role can read.
+	// shape, for free. So is a relation that only filters (an RLS predicate and no column list): its
+	// shape IS the physical row's, and nothing was probed for it at write time. Anything else - a
+	// projection, a view - is described by its own stored schema: a masked or computed column has no
+	// physical row to borrow, and leaving it out would hide a column the role can read. (An RLS-only
+	// relation once fell through both branches - listed as a table, with no columns at all, so a
+	// client building its catalog from the columns could not see it: found by spec 043's
+	// cross-source leg.)
 	// spec 048: one nullability precedence everywhere - the declared mark wins, the physical
 	// answer flows where nothing is declared, and a declared-key column reports NOT NULL
 	auto pk_implies = [&](const string &vcat_expr, const string &vname_expr, const string &column_expr) {
@@ -246,7 +250,11 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	           " FROM objects o JOIN information_schema.columns i ON ") +
 	    physical + projection +
 	    " AND c.\"expr\" = i.\"column_name\""
-	    " WHERE len(o.parts) = 3 AND o.form = 'alias'"
+	    " WHERE len(o.parts) = 3 AND (o.form = 'alias' OR (o.form = 'subquery' AND NOT EXISTS"
+	    " (SELECT 1 FROM " +
+	    Tbl("relation_columns") +
+	    " c3 WHERE c3.\"vcat\" = o.vcat AND c3.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
+	    " ELSE o.vschema || '.' || o.vname END)))"
 	    " AND (c.\"name\" IS NOT NULL OR NOT EXISTS"
 	    " (SELECT 1 FROM " +
 	    Tbl("relation_columns") +

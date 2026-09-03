@@ -1,6 +1,6 @@
 # Spec 043: several clients, real sources, at the same time
 
-- **Status**: draft
+- **Status**: implemented (the harness with all seven assertions, the in-process half; 2026-09-04)
 - **Date**: 2026-08-22
 - **Author**: hugr-lab
 
@@ -148,14 +148,53 @@ different tenants streaming 20 000 rows apiece into one table at the same time. 
 seconds. What it asserts today is the first three items above: slices stay separate, no row is stored
 outside the slice that wrote it, and concurrent ingests add up.
 
-Not yet written, and the reason each is a step rather than a line:
+**The in-process half landed on 2026-09-04** (release plan 2.1, the first step): two pins that need
+no socket and no source, so every build runs them.
 
-- **a reader running *during* another client's drain** needs a third client whose statements interleave
-  with a load in flight, which is a different orchestration than "start two, wait for both";
-- **the cross-source join under load** needs a second published object over another source, and with
-  mysql unavailable the interesting pairing is postgres × ducklake or postgres × mssql;
-- **session lifecycle across clients** — one client's session closed or its process killed mid-statement
-  while the others keep working.
+- `test/cpp/test_acl_concurrency.cpp` — one instance, four writers (two tenants of one role, claims
+  from HS256 tokens, one session and one connection each) inserting into their own id ranges while an
+  auditor role reads every tenant through a projection that hides a column, and a churn thread bumps
+  `policy_version` on every tick (every cache cleared under load), sweeps, and opens and closes
+  sessions. Each writer round reads its own range back (exactly its writes, by `id`) and one range of
+  the other tenant (nothing, however many rows are there by now); a delete under the predicate leaves
+  exactly the second half. Then the gateway's shape: six threads, two tenants, **one shared
+  connection**, prefixes interleaved. Finally the physical table is read natively: no row outside the
+  slice of its writer, totals per tenant exact, no NULL tenant, no session left open. ~7 s, ~2000
+  checks; under ASan/UBSan in CI's sanitized flavour. Verified by breaking it: with the grant's RLS
+  removed the first failure is the foreign-range read ("saw a row in the other tenant's range").
+- `test/sql/acl_interleave.test` — the deterministic version on two named connections: alternating
+  principals, the other principal on the same connection right after, a delete aimed outside the
+  slice deleting nothing, a supplied tenant overridden by the assignment, the physical rows read
+  natively.
+
+**The three remaining scenarios landed the same day** (release plan 2.1, the second step), all in
+`run.sh`, on every leg:
+
+- **A reader during another client's drain**: a third client of tenant acme ticks `READER_TICKS`
+  (300) times through the whole load. Every tick counts zero foreign rows, and - an ingest being one
+  statement - counts either the seeded rows or the seeded rows plus the whole load, never a part. The
+  run reports whether the ticks straddled the load (they do: 3–11 ticks before, the rest after) rather
+  than requiring it, since a fast machine can finish a load before the first tick.
+- **A client killed mid-statement**: a fourth client, tenant globex, with a load five times the
+  others', gets `SIGKILL` one second in (`ACL_E2E_KILL_AFTER`), with no goodbye to the server. Its
+  rows are stored all or not at all (observed: nothing - the drain aborted cleanly), everybody else's
+  assertions hold, and the door answers a fresh client afterwards.
+- **The cross-source join under load**: a fourth leg, `pair` (postgres × ducklake), publishes the
+  orders on postgres and a `rates` table on the lake, RLS'd by the same claim; a joiner client joins
+  the two through the catalog `JOIN_TICKS` (100) times while the writers drain into postgres. Each tick
+  is the joiner's own slice joined to exactly its own rate (the sum is `n × 10`; another tenant's rate
+  row reaching the join would multiply it), zero foreign rows, all or nothing.
+
+**And the pair leg found what it was written to find** - not in the join, in the listing. A relation
+defined with an RLS predicate and no column list (`c.rates AS lake.main.e2e_rates RLS (…)`) was listed
+in `information_schema.tables` and `SHOW TABLES` but in neither `duckdb_columns()` nor
+`information_schema.columns`, and so not in `duckdb_tables()` (which folds the columns): the listing
+described alias-form relations by the physical row and everything else by the stored schema, and an
+RLS-only relation - subquery form, nothing probed at write time - fell through both. A quack client
+builds its catalog from the columns, so `remote.main.rates` did not exist for it while the server
+resolved it fine. The same over postgres and over memory; not a ducklake matter. Fixed in the
+listing (an RLS-only relation is described by the physical row, as an alias is) and pinned by
+`test/sql/acl_listing_rls_only.test`.
 
 ### Verified by breaking it
 

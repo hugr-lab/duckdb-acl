@@ -1,0 +1,124 @@
+# name: test/sql/acl_interleave.test
+# description: two principals interleaved on two connections of one instance (spec 043, the in-process
+#   half): a statement leaves nothing behind for the next one - on its own connection, and on a
+#   connection another principal uses right after it. The threaded version with the policy moving
+#   underneath is test/cpp/test_acl_concurrency.cpp; this is the deterministic pin every build runs.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 10), (2, 'globex', 20);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+# two roles, one object, the same writable slice each: the predicate confines reads and writes, the
+# assigned column puts every insert inside it (specs 011/024)
+statement ok
+ACL ADMIN CREATE ROLE acme CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN CREATE ROLE globex CLAIMS (tenant = 'globex');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE acme WITH (select, insert, delete) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE globex WITH (select, insert, delete) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE acme WITH (select, insert, delete)
+    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE globex WITH (select, insert, delete)
+    RLS (tenant = acl_claim('tenant')) COLUMNS (id, amount, tenant = acl_claim('tenant'));
+
+# --- interleaved: each principal on its own connection, statements alternating -----------------------
+
+statement ok con1
+ACL ROLE "acme" INSERT INTO orders (id, amount) VALUES (101, 1);
+
+# the other tenant does not see it, whichever connection asks
+query I con2
+ACL ROLE "globex" SELECT count(*) FROM orders WHERE id = 101;
+----
+0
+
+statement ok con2
+ACL ROLE "globex" INSERT INTO orders (id, amount) VALUES (201, 2);
+
+query I con1
+ACL ROLE "acme" SELECT id FROM orders WHERE id >= 100 ORDER BY id;
+----
+101
+
+query I con2
+ACL ROLE "globex" SELECT id FROM orders WHERE id >= 100 ORDER BY id;
+----
+201
+
+# --- the same connection, the other principal: the previous statement left nothing behind --------
+
+query I con1
+ACL ROLE "globex" SELECT id FROM orders WHERE id >= 100 ORDER BY id;
+----
+201
+
+query I con2
+ACL ROLE "acme" SELECT id FROM orders WHERE id >= 100 ORDER BY id;
+----
+101
+
+# --- a write aimed outside the slice lands inside it or not at all --------------------------------
+
+# a delete of the other tenant's row deletes nothing
+statement ok con2
+ACL ROLE "globex" DELETE FROM orders WHERE id = 101;
+
+query I con1
+ACL ROLE "acme" SELECT count(*) FROM orders WHERE id = 101;
+----
+1
+
+# a supplied tenant is overridden by the grant's assignment: the row is stored as the writer's
+statement ok con2
+ACL ROLE "globex" INSERT INTO orders (id, amount, tenant) VALUES (301, 3, 'acme');
+
+query I con1
+ACL ROLE "acme" SELECT count(*) FROM orders WHERE id = 301;
+----
+0
+
+query I con2
+ACL ROLE "globex" SELECT count(*) FROM orders WHERE id = 301;
+----
+1
+
+# --- what is stored, read natively: every row carries the tenant of the principal that wrote it ---
+
+query II
+SELECT id, tenant FROM phys.main.orders WHERE id >= 100 ORDER BY id;
+----
+101	acme
+201	globex
+301	globex
