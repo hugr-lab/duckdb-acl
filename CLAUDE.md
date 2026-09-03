@@ -30,6 +30,10 @@ src/
   acl_rewriter.cpp           # the AST walker; exposes RewriteStatements(...)
   acl_parser_override.cpp    # ACL prefix scanner + parser_override; exposes RegisterAclParser(...)
   acl_admin_functions.cpp    # acl_* admin stubs; exposes RegisterAclAdminFunctions(...)
+  acl_door_common.cpp        # what every acl_* scalar and both doors share: StoreOf/RequiredArg, PEM, JSON
+  flight/                    # the Flight SQL door (spec 045); seam RegisterAclFlightDoor(...)
+  quack_embed/               # the embedded quack server (spec 063) + acl_quack_door.cpp (serve/stop, the
+                             #   two callbacks); seam acl_quack_embed.hpp: RegisterAclQuackEmbed/Door(...)
   include/                   # acl_extension.hpp (AclExtension : Extension) + one header per module
 test/
   sql/acl.test               # sqllogictest suite (require acl)

@@ -11,8 +11,24 @@
 
 #include "acl_policy.hpp"
 
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
+
 namespace duckdb {
 namespace acl {
+
+//! The store an acl_* scalar belongs to, reached through the function's own info (AclScalarInfo), so
+//! nothing here is a process global (spec 041). The shared form is for a callback that may outlive
+//! the call - the quack door's live discovery document (specs 062/063). Once three copies: the admin
+//! functions, the Flight door and the quack door each had their own.
+PolicyStore &StoreOf(ExpressionState &state);
+shared_ptr<PolicyStore> SharedStoreOf(ExpressionState &state);
+
+//! The argument readers every acl_* scalar uses. `fn` and `what` name the function and the argument
+//! in the refusal of a NULL; an optional argument past the last column answers its fallback.
+string RequiredArg(DataChunk &args, idx_t col, idx_t row, const char *fn, const char *what);
+string OptionalArg(DataChunk &args, idx_t col, idx_t row, const string &fallback);
+string Trimmed(string value);
 
 //! A JSON string literal, quotes included: `"` and `\` escaped, every control byte below 0x20 as
 //! `\u00XX`. Anything that reaches a JSON document from a token - a subject, a role, a claim - goes

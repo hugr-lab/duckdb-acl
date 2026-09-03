@@ -159,8 +159,11 @@ void LoadInternal(ExtensionLoader &loader) {
 	acl::RegisterAclIntrospection(loader, store);
 #ifdef ACL_QUACK_EMBED_ENABLED
 	// The embedded quack door (spec 063): the acl_quack_* server settings and the acl_quack_scan_data
-	// drain the server INSERTs through. Present in every non-WASM/MinGW build unless ACL_NO_QUACK_EMBED.
+	// drain the server INSERTs through, then the door itself - serve/stop and the two callbacks the
+	// server calls (src/quack_embed/acl_quack_door.cpp, the shape of the Flight door below). Present in
+	// every non-WASM build unless ACL_NO_QUACK_EMBED; without it there is no acl_quack_* function at all.
 	acl::RegisterAclQuackEmbed(loader);
+	acl::RegisterAclQuackDoor(loader, store);
 #endif
 #ifdef ACL_FLIGHT_ENABLED
 	// The Flight SQL door (spec 045), present only in an ACL_FLIGHT=1 build. Registered here so the
