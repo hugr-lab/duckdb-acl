@@ -6,34 +6,53 @@ verifies the principal, resolves virtual names to physical objects, applies row-
 column masking, gates functions, and hands real `SQLStatement`s back to the normal
 bind → optimize → execute path — so both `SELECT` and DML work naturally.
 
-> **Status: proof-of-concept.** The resolvers are in-process stubs (policy registered via SQL helper
-> functions). It tracks **duckdb `main`** because it depends on parser/AST APIs (the `Identifier` type,
-> multi-level `QualifiedName`, `MergeQueryNode`, unified DML query nodes) that are not yet in a stable
-> release. See [specs/001-parser-override-ast-rewrite/spec.md](specs/001-parser-override-ast-rewrite/spec.md).
+> **Status: pre-release.** The first release follows duckdb 2.0; until then the extension tracks
+> **duckdb `main`** (it depends on parser/AST APIs — the `Identifier` type, multi-level `QualifiedName`,
+> `MergeQueryNode`, unified DML query nodes — not yet in a stable release). One spec per feature lives
+> under [specs/](specs/); [specs/001](specs/001-parser-override-ast-rewrite/spec.md) is the core model.
 
 ## How it works
 
-A gateway sends, per request, one of:
+Policy lives in a **policy catalog** — a schema the extension manages in any ATTACHed database — and is
+written in management SQL. A statement reaches the engine one of two ways:
 
-```
-ACL ROLE  "<role>"   <sql> ; <sql> ; ...
-ACL TOKEN '<token>'  <sql> ; <sql> ; ...
-ACL ADMIN            <sql>            -- passthrough, no rewrite
-```
+- **through a gateway**, which prefixes every statement with the principal it verified:
 
-Enable the override for the session, then run prefixed queries:
+  ```
+  ACL ROLE  "<role>"   <sql>            -- the gateway resolved the role
+  ACL TOKEN '<jwt>'    <sql>            -- the extension verifies the JWT offline (issuers, JWKS)
+  ACL SESSION '<h>'    <sql>            -- a door's client: token exchanged for a session once
+  ```
+
+- **through a door**, for a client that connects for itself: the built-in **Arrow Flight SQL** server
+  (`acl_flight_serve`, any ADBC/JDBC driver) or the embedded **quack** server (`acl_quack_serve`). A door
+  turns the client's JWT into a session and prefixes every statement after that.
+
+Either way the override rewrites the statement before bind: virtual names resolve to physical objects,
+row filters and column masks are applied, functions are gated, and ordinary `SQLStatement`s go on to
+bind → optimize → execute.
 
 ```sql
-LOAD acl;
-SET allow_parser_override_extension = 'fallback';   -- ACL … is rewritten; everything else is native
+LOAD acl;                                    -- enables the override in STRICT mode on load
+ATTACH ':memory:' AS store;                  -- any ATTACHed database can hold the policy catalog
+SELECT acl_use_db('store', 'acl', true);     -- create/open the managed schema `acl` in it
+SET GLOBAL acl_allow_anonymous_admin = true; -- bootstrap: bare ACL ADMIN is allowed for now
 
--- admin setup (in production these are the read-only ACL resolver, not SQL calls)
-SELECT acl_grant_table('analyst', 'orders', 'phys.main.orders_physical',
-                       'id,amount', 'tenant = acl_claim(''tenant'')', 'select');
-SELECT acl_define_token('tok', 'analyst', 'tenant=acme');
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;          -- physical target
+ACL ADMIN CREATE ROLE analyst CLAIMS (tenant = 'acme');               -- a default claim
+ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN;
+ACL ADMIN GRANT TABLE c.orders TO ROLE analyst WITH (select)
+    RLS (tenant = acl_claim('tenant'));                               -- row-level security
 
-ACL TOKEN 'tok' SELECT id, amount FROM orders;   -- (SELECT id, amount FROM phys… WHERE tenant='acme')
+ACL ROLE "analyst" SELECT id, amount FROM orders;   -- rewritten: ... WHERE tenant = 'acme'
+
+SET GLOBAL acl_allow_anonymous_admin = false;       -- before any door opens
+SELECT acl_flight_serve('grpc+tls://0.0.0.0:31337', 'cert.pem', 'key.pem');
 ```
+
+The memory-mode helpers (`acl_grant_table`, `acl_define_token`, …) are a dev/test substrate: without a
+policy catalog the extension cannot serve a client, list metadata or read a JWKS.
 
 ## Resolution forms
 
@@ -50,12 +69,16 @@ whose claims are baked via `acl_claim('<name>')`. Everything else routes through
 denies only data-reading / rights-bypass functions (`read_csv`, `postgres_query`, `getvariable`, …) and
 passes the rest.
 
-## Admin / setup functions (stubs)
+## Administration
 
-`acl_define_token`, `acl_define_role`, `acl_grant_table`, `acl_grant_view`,
-`acl_grant_table_function[,_alias]`, `acl_grant_scalar[,_alias]`, `acl_deny_function`,
-`acl_allow_function`. These populate the per-database policy store; a production build replaces them
-with the read-only, role-aware ACL resolver behind the same store seam.
+Policy is written in management SQL — `ACL ADMIN CREATE VIRTUAL CATALOG | TABLE | VIEW | SCHEMA |
+REFERENCE …`, `CREATE ROLE | ISSUER …`, `GRANT CATALOG | TABLE | SCHEMA … TO ROLE …`, `ALTER … `, `DROP …`
+— or through the equivalent `acl_*` functions (`acl_add_relation`, `acl_grant_catalog`,
+`acl_define_issuer`, …). Administration is itself a capability (spec 009): `ACL ADMIN` is the
+gateway's anonymous form and needs `acl_allow_anonymous_admin`; a principal administers with a
+granted `manage` scope (`ACL TOKEN '…' ACL <management statement>`). The legacy memory-mode wrappers
+(`acl_define_token`, `acl_grant_table`, …) remain for tests and, with a catalog, write into the
+implicit virtual catalog `default`.
 
 ## The policy schema
 
