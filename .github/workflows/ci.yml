@@ -169,6 +169,8 @@ jobs:
       # distribution time.
       # ACL_QUACK adds the quack *client* loadable so the embedded-door cpp test can ATTACH to itself.
       ACL_QUACK: 1
+      # the Flight door's own sqllogictests exist only where the door does (release plan 2.3)
+      ACL_FLIGHT_TESTS: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
     steps:
@@ -219,7 +221,7 @@ jobs:
       - name: Unit suites
         run: |
           build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
-          scripts/ci/assert_ran.sh suite.log 50 3000
+          scripts/ci/assert_ran.sh suite.log 50 3000 'require-env ACL_FLIGHT_TESTS'
           # the embedded quack door's cpp test runs HERE, on the flight build, so its TLS + OpenSSL
           # RNG path is exercised (the no-flight linux job above builds it cleartext-only)
           make test-cpp

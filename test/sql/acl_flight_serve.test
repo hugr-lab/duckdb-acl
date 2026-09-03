@@ -1,0 +1,111 @@
+# name: test/sql/acl_flight_serve.test
+# description: the Flight door's serve-argument refusals (specs 045/053, release plan 2.3). Every
+#   case here is refused BEFORE a socket is bound, so the test leaves no listener behind; the served
+#   round trip is the e2e's (make test-flight). Gated on ACL_FLIGHT_TESTS: the door exists only in a
+#   flight build, and the flight CI job sets the variable and refuses the skip (assert_ran).
+# group: [sql]
+
+require acl
+
+require-env ACL_FLIGHT_TESTS
+
+statement ok
+ATTACH ':memory:' AS store;
+
+# --- no policy source: the first thing every door refuses ------------------------------------------
+
+statement error
+SELECT acl_flight_serve('grpc://localhost:31980');
+----
+<REGEX>:.*acl_flight_serve: no policy source is configured.*
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+# --- anonymous admin on: a served client could administer the ACL ---------------------------------
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement error
+SELECT acl_flight_serve('grpc://localhost:31980');
+----
+<REGEX>:.*acl_allow_anonymous_admin.*is on.*
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+# --- the override must be STRICT: a statement that failed to parse as ACL would run as plain SQL ---
+
+statement ok
+SET GLOBAL allow_parser_override_extension='fallback';
+
+statement error
+SELECT acl_flight_serve('grpc://localhost:31980');
+----
+<REGEX>:.*parser override is "fallback", not STRICT.*
+
+statement ok
+SET GLOBAL allow_parser_override_extension='strict';
+
+# --- cleartext binds only loopback (spec 053); a certificate lifts it -------------------------------
+
+statement error
+SELECT acl_flight_serve('grpc://0.0.0.0:31980');
+----
+<REGEX>:.*binds only localhost.*
+
+statement error
+SELECT acl_flight_serve('grpc://[::]:31980');
+----
+<REGEX>:.*binds only localhost.*
+
+# --- TLS arguments: both or neither, and PEM or nothing -------------------------------------------------
+
+statement error
+SELECT acl_flight_serve('grpc://0.0.0.0:31980', '-----BEGIN CERTIFICATE-----', NULL);
+----
+<REGEX>:.*TLS needs both a certificate and a key.*
+
+statement error
+SELECT acl_flight_serve('grpc://0.0.0.0:31980', NULL, '-----BEGIN PRIVATE KEY-----');
+----
+<REGEX>:.*TLS needs both a certificate and a key.*
+
+# a location that holds no document is refused as a read (an IO error naming the location), not
+# as a cryptic TLS init error - duckdb's read_text answers a missing path with no rows, not an error
+statement error
+SELECT acl_flight_serve('grpc://0.0.0.0:31980', '/nonexistent/acl-cert.pem', '/nonexistent/acl-key.pem');
+----
+<REGEX>:.*acl_flight_serve: the certificate location "/nonexistent/acl-cert.pem" holds no single document.*
+
+# and a document that is not PEM is refused by name too
+statement error
+SELECT acl_flight_serve('grpc://0.0.0.0:31980', 'README.md', 'README.md');
+----
+<REGEX>:.*acl_flight_serve: the certificate at "README.md" is not PEM.*
+
+# --- a uri the door cannot parse ---------------------------------------------------------------------------
+
+statement error
+SELECT acl_flight_serve('not a uri at all');
+----
+<REGEX>:.*acl_flight_serve.*
+
+# --- and none of the above is a principal's to call --------------------------------------------------------
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement error
+ACL ROLE "r" SELECT acl_flight_serve('grpc://localhost:31980');
+----
+<REGEX>:.*acl_flight_serve.*not allowed.*
+
+statement error
+ACL ROLE "r" SELECT acl_flight_stop('grpc://localhost:31980');
+----
+<REGEX>:.*acl_flight_stop.*not allowed.*
