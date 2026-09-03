@@ -23,6 +23,7 @@ set(EXTENSION_SOURCES
     src/acl_catalog_rpc.cpp
     src/acl_extension.cpp
     src/acl_introspection.cpp
+    src/acl_admin_sql.cpp
     src/acl_parser_override.cpp
     src/acl_door_auth.cpp
     src/acl_door_common.cpp
