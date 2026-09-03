@@ -119,6 +119,16 @@ struct DeviceAuthorization {
 
 DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_id, const std::string &scope = "");
 
+//! The parsers behind the exchanges above, over a response already received:
+//! pure functions of the bytes an IdP or a door answered, which is what the
+//! fuzz target (test/fuzz/fuzz_oidc_parse.cpp) feeds them. Every value out is
+//! bounded or refused; nothing is inferred from a malformed document.
+//! `issuer` is the asked-for issuer, already stripped of trailing slashes.
+TokenSet ParseTokenResponse(const HttpResult &response);
+Endpoints ParseDiscoveryDocument(const std::string &issuer, const HttpResult &response);
+DoorAuth ParseQuackAuthDocument(const HttpResult &response);
+DeviceAuthorization ParseDeviceAuthorization(const HttpResult &response);
+
 //! The device flow's second half: poll until granted, denied, the deadline, or
 //! the caller's own cancellation. Honours authorization_pending (wait
 //! `interval`) and slow_down (+5s, §3.5); sleeps in one-second slices so a

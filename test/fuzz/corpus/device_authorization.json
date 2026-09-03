@@ -1,0 +1,1 @@
+3{"device_code":"dc-1","user_code":"ABCD-EFGH","verification_uri":"https://issuer.test/device","verification_uri_complete":"https://issuer.test/device?user_code=ABCD-EFGH","interval":5,"expires_in":600}
