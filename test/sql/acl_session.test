@@ -451,3 +451,23 @@ true
 
 statement ok
 SELECT acl_session_close((SELECT handle FROM odd));
+
+# --- stopping a door nobody serves ends nothing (found writing docs/serving.md) -------------------------
+# acl_quack_stop answered "No server found" and then, with no quack door open on the instance, ran the
+# last-door path anyway - closing every session of the instance, the Flight door's included.
+
+statement ok
+CREATE TABLE survivor AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS handle;
+
+query I
+SELECT acl_quack_stop('quack:localhost:31997') LIKE 'No server found listening on %';
+----
+true
+
+query I
+SELECT acl_session_sql((SELECT handle FROM survivor), 'SELECT 1') IS NOT NULL;
+----
+true
+
+statement ok
+SELECT acl_session_close((SELECT handle FROM survivor));

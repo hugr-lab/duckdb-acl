@@ -1112,6 +1112,12 @@ void AclQuackStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 #ifdef ACL_QUACK_EMBED_ENABLED
 		auto stopped = StopAclQuackServer(*context.db, uri);
 		string note = stopped ? ("Stopped listening on " + uri) : ("No server found listening on " + uri);
+		if (!stopped) {
+			// nothing of ours closed, so there is nothing to sweep: a stop of a uri nobody serves must
+			// not end the sessions of the doors that ARE open (found writing docs/serving.md)
+			result.SetValue(row, Value(note));
+			continue;
+		}
 		// The embedded registry knows exactly how many doors THIS instance has left, so the last-door
 		// judgement is exact (no guessing which door's sessions to drop) - and another instance's
 		// doors do not keep this instance's fence armed.
