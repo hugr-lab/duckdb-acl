@@ -3,6 +3,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "acl_door_auth.hpp"
+#include "acl_door_common.hpp"
 
 #include "duckdb/common/string_util.hpp"
 
@@ -17,22 +18,6 @@ namespace {
 
 std::mutex discovery_cache_lock;
 std::unordered_map<string, std::pair<oidc::Endpoints, std::chrono::steady_clock::time_point>> discovery_cache;
-
-string JsonQuote(const string &value) {
-	string out = "\"";
-	for (auto c : value) {
-		if (c == '"' || c == '\\') {
-			out += '\\';
-			out += c;
-		} else if (static_cast<unsigned char>(c) < 0x20) {
-			out += StringUtil::Format("\\u%04x", static_cast<int>(c));
-		} else {
-			out += c;
-		}
-	}
-	out += "\"";
-	return out;
-}
 
 } // namespace
 

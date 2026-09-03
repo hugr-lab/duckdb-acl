@@ -1,6 +1,7 @@
 #include "duckdb/main/connection.hpp"
 #include "acl_admin_functions.hpp"
 #include "acl_door_auth.hpp"
+#include "acl_door_common.hpp"
 #ifdef ACL_QUACK_EMBED_ENABLED
 #include "acl_quack_embed.hpp"
 #endif
@@ -1010,32 +1011,6 @@ string PrefixedForSession(PolicyStore &store, const string &handle, const string
 	return store.SessionSql(handle, sql);
 }
 
-//! Inline PEM, or a location read through duckdb's own filesystem (the spec 053 pattern).
-static string ReadPemFor(ClientContext &context, const string &arg, const char *what) {
-	auto trimmed = arg;
-	StringUtil::Trim(trimmed);
-	if (StringUtil::StartsWith(trimmed, "-----BEGIN")) {
-		return trimmed;
-	}
-	Connection con(*context.db);
-	auto quoted = "'" + StringUtil::Replace(trimmed, "'", "''") + "'";
-	auto result = con.Query("SELECT content FROM read_text(" + quoted + ")");
-	if (result->HasError()) {
-		throw BinderException("acl_quack_serve: could not read the %s from \"%s\": %s", what, trimmed,
-		                      result->GetError());
-	}
-	if (result->RowCount() != 1 || result->GetValue(0, 0).IsNull()) {
-		throw BinderException("acl_quack_serve: the %s location \"%s\" holds no single document", what, trimmed);
-	}
-	auto content = result->GetValue(0, 0).ToString();
-	auto head = content;
-	StringUtil::Trim(head);
-	if (!StringUtil::StartsWith(head, "-----BEGIN")) {
-		throw BinderException("acl_quack_serve: the %s at \"%s\" is not PEM (no -----BEGIN marker)", what, trimmed);
-	}
-	return content;
-}
-
 //! acl_quack_serve(uri[, token]): the safe way to open the quack door (spec 041). It installs the two
 //! callbacks and starts quack's server - but only from an instance a client cannot step out of, and it
 //! says which condition is missing rather than serving something half-configured. Everything it sets
@@ -1047,23 +1022,6 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		auto uri = RequiredArg(args, 0, row, "acl_quack_serve", "listen uri");
 		auto token = args.ColumnCount() > 1 ? OptionalArg(args, 1, row, "") : string();
 		auto &store = StoreOf(state);
-		if (!store.CatalogEnabled()) {
-			throw BinderException("acl_quack_serve: no policy source is configured - a served instance "
-			                      "resolves every statement against one, so `acl_use_db` (or the function "
-			                      "driver) comes first");
-		}
-		if (store.CatalogAnonymousAdminAllowed()) {
-			throw BinderException("acl_quack_serve: `acl_allow_anonymous_admin` is on, so a served client "
-			                      "could administer the ACL with a bare `ACL ADMIN` - turn it off before "
-			                      "opening the door");
-		}
-		Value override_setting;
-		if (context.TryGetCurrentSetting("allow_parser_override_extension", override_setting) &&
-		    !StringUtil::CIEquals(override_setting.ToString(), "strict")) {
-			throw BinderException("acl_quack_serve: the parser override is \"%s\", not STRICT - a served "
-			                      "statement that failed to parse as ACL would fall through to plain SQL",
-			                      override_setting.ToString());
-		}
 		if (token.empty()) {
 			throw BinderException("acl_quack_serve: pass a server token explicitly. It is not what admits a "
 			                      "client - their JWT is - but a default-configured quack accepts whatever a "
@@ -1096,6 +1054,11 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			throw BinderException("acl_quack_serve: 'plain' mode is a cleartext server - terminate TLS upstream, "
 			                      "or drop the mode to serve TLS here");
 		}
+		// The preconditions both doors share (acl_door_common), checked before quack is touched at
+		// all so the refusal names the thing to fix. `plain` is the explicit cleartext opt-in - a
+		// proxy terminates TLS upstream - so it, like a certificate, lifts the loopback-only rule;
+		// the default embedded cleartext door binds only localhost, exactly as the Flight door does.
+		RefuseUnlessServable(context, store, "acl_quack_serve", ListenHost(uri), !cert_arg.empty(), plain);
 #ifdef ACL_QUACK_EMBED_ENABLED
 		// spec 063: quack's own server, compiled into acl. It binds the public address itself,
 		// terminates TLS where asked, and answers /.well-known/quack-auth - no loopback front, no
@@ -1106,8 +1069,8 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		cfg.uri = uri;
 		cfg.token = token;
 		cfg.discovery = !plain;
-		cfg.cert_pem = cert_arg.empty() ? string() : ReadPemFor(context, cert_arg, "certificate");
-		cfg.key_pem = key_arg.empty() ? string() : ReadPemFor(context, key_arg, "private key");
+		cfg.cert_pem = cert_arg.empty() ? string() : ReadPemArg(context, cert_arg, "certificate", "acl_quack_serve");
+		cfg.key_pem = key_arg.empty() ? string() : ReadPemArg(context, key_arg, "private key", "acl_quack_serve");
 		auto shared_store = SharedStoreOf(state);
 		// per request, so the discovery document tracks an issuer added or dropped after the serve;
 		// the document is spec 064's - the same one the Flight door answers to `discover-auth`
@@ -1299,34 +1262,6 @@ void AclDrainStatusFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	result.Reference(status, count_t(args.size()));
 }
 
-//! Minimal JSON string escape for the ops surface below.
-static string JsonEscape(const string &value) {
-	string out;
-	out.reserve(value.size() + 2);
-	for (char c : value) {
-		switch (c) {
-		case '"':
-			out += "\\\"";
-			break;
-		case '\\':
-			out += "\\\\";
-			break;
-		case '\n':
-			out += "\\n";
-			break;
-		case '\r':
-			out += "\\r";
-			break;
-		case '\t':
-			out += "\\t";
-			break;
-		default:
-			out += c;
-		}
-	}
-	return out;
-}
-
 //! acl_sessions(): the live sessions on this node, as a JSON array - the admin/front ops surface
 //! (spec 050). Never the handle (a bearer credential): each session shows its non-secret ops id, its
 //! principal (subject + roles), how long it has been idle, and its token exp. Denied to a principal
@@ -1338,12 +1273,14 @@ void AclSessionsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		auto &session = sessions[i];
 		string roles = "[";
 		for (idx_t r = 0; r < session.roles.size(); r++) {
-			roles += (r ? "," : "") + string("\"") + JsonEscape(session.roles[r]) + "\"";
+			roles += (r ? "," : "") + JsonQuote(session.roles[r]);
 		}
 		roles += "]";
 		json += (i ? "," : "");
-		json += "{\"id\":\"" + JsonEscape(session.id) + "\",\"subject\":\"" + JsonEscape(session.subject) +
-		        "\",\"roles\":" + roles + ",\"idle_seconds\":" + std::to_string(session.idle_seconds) +
+		// JsonQuote (acl_door_common), not a local escaper: a subject or role comes from a token, and
+		// a control byte in it emitted raw made this an invalid document (the 2026-09-03 review)
+		json += "{\"id\":" + JsonQuote(session.id) + ",\"subject\":" + JsonQuote(session.subject) +
+		        ",\"roles\":" + roles + ",\"idle_seconds\":" + std::to_string(session.idle_seconds) +
 		        ",\"expires_at\":" + std::to_string(session.expires_at) + "}";
 	}
 	json += "]";

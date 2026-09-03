@@ -423,3 +423,31 @@ statement error
 ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc2NzIyNTYwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.MFWp7qAyuQXdxbmhheIS1GHzdCuIiU-o-89r26BBvr8' SELECT count(*) FROM orders;
 ----
 <REGEX>:.*token expired.*
+
+# --- acl_sessions() is valid JSON whatever a token carries (the 2026-09-03 review) --------------------
+# A subject or a role comes from a token; one escaper emitted control bytes raw and the listing was
+# an invalid document on the first odd byte. This subject carries 0x01 and a double quote, and the
+# listing must show them as JSON escapes (\u0001, \") - checked as text, so the pin needs no json
+# extension (a mid-file `require json` would silently stop the file where the extension is absent).
+
+statement ok
+CREATE TABLE odd AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoiY3RsXHUwMDAxXCJxIiwicm9sZXMiOlsiciJdLCJ0aWQiOiJhY21lIn0.h83QtvahuRlc8Df2p1980c19zdlpz_VkH3IxJo_2jg4') AS handle;
+
+query I
+SELECT handle IS NOT NULL FROM odd;
+----
+true
+
+query I
+SELECT acl_sessions() LIKE '%"subject":"ctl\u0001\"q"%';
+----
+true
+
+# and no raw control byte anywhere in the document
+query I
+SELECT position(chr(1) IN acl_sessions()) = 0;
+----
+true
+
+statement ok
+SELECT acl_session_close((SELECT handle FROM odd));

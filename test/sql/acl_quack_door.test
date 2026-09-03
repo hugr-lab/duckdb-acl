@@ -219,6 +219,18 @@ SELECT acl_quack_serve('quack:localhost:31999', '');
 ----
 <REGEX>:.*pass a server token explicitly.*
 
+# the rule both doors share (acl_door_common, the 2026-09-03 review): a cleartext door binds only
+# loopback - a certificate lifts it, and so does the explicit `plain` mode (TLS terminated upstream)
+statement error
+SELECT acl_quack_serve('quack:0.0.0.0:31998', 'server-token');
+----
+<REGEX>:.*binds only localhost.*
+
+statement error
+SELECT acl_quack_serve('quack:[::]:31998', 'server-token');
+----
+<REGEX>:.*binds only localhost.*
+
 # spec 063: with the instance in order, acl_quack_serve no longer needs the quack loadable - the door
 # is quack's server compiled into acl, so serving here would bind a real listener (its success turning
 # on the build's crypto: OpenSSL in a flight build, else httpfs) and leave it running past the test.
