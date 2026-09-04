@@ -238,7 +238,7 @@ class AclQuackServer : public QuackServer {
 public:
 	AclQuackServer(ClientContext &context, const QuackUri &uri_p, const string &token_p, const string &cert_pem,
 	               const string &key_pem, std::function<string()> wellknown, std::function<bool()> draining,
-	               bool discovery);
+	               std::function<string()> metrics, bool discovery);
 	~AclQuackServer() override;
 
 	void StopAccepting() override;
@@ -266,6 +266,7 @@ private:
 	AclServerState server_state = AclServerState::WAITING_TO_START;
 	std::function<string()> wellknown;
 	std::function<bool()> draining;
+	std::function<string()> metrics;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 	X509 *tls_cert = nullptr;
 	EVP_PKEY *tls_key = nullptr;
@@ -274,8 +275,9 @@ private:
 
 AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, const string &token_p,
                                const string &cert_pem, const string &key_pem, std::function<string()> wellknown_p,
-                               std::function<bool()> draining_p, bool discovery)
-    : QuackServer(context, uri_p, token_p), wellknown(std::move(wellknown_p)), draining(std::move(draining_p)) {
+                               std::function<bool()> draining_p, std::function<string()> metrics_p, bool discovery)
+    : QuackServer(context, uri_p, token_p), wellknown(std::move(wellknown_p)), draining(std::move(draining_p)),
+      metrics(std::move(metrics_p)) {
 	if (!cert_pem.empty() || !key_pem.empty()) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 		if (cert_pem.empty() || key_pem.empty()) {
@@ -333,6 +335,23 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 			            }
 			            res.set_content(wk ? wk() : "{\"issuers\":[]}", "application/json");
 		            });
+	}
+
+	// spec 069: GET /metrics, opt-in (`acl_metrics_endpoint`) - the Prometheus text of acl_metrics(),
+	// composed per request so a SET after the serve takes effect; 404 while off, like a route that is
+	// not there. Unauthenticated by design, like discovery: counts and states of the node, never a
+	// handle, a principal or an object name (the bounded attribute sets of acl_metrics()).
+	if (metrics) {
+		auto mt = metrics;
+		server->Get("/metrics", [mt](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
+			auto text = mt();
+			if (text.empty()) {
+				res.status = 404;
+				res.set_content("not found\n", "text/plain");
+				return;
+			}
+			res.set_content(text, "text/plain; version=0.0.4; charset=utf-8");
+		});
 	}
 
 	server->Options("/quack", [](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
@@ -483,7 +502,7 @@ string StartAclQuackServer(ClientContext &context, const AclQuackServeConfig &cf
 		}
 
 		auto server = make_uniq<AclQuackServer>(context, listen_uri, cfg.token, cfg.cert_pem, cfg.key_pem,
-		                                        cfg.wellknown, cfg.draining, cfg.discovery);
+		                                        cfg.wellknown, cfg.draining, cfg.metrics, cfg.discovery);
 		auto key = server->ListenUri().CanonicalUri();
 		actual_uri_out = server->ListenUri().Uri();
 		std::lock_guard<std::mutex> guard(g_servers_lock);

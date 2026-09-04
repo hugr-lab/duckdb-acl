@@ -37,6 +37,10 @@ struct AclQuackServeConfig {
 	//! /.well-known/quack-auth answers 503 `draining` - the health-check shape a load balancer or an
 	//! ops probe already watches. Unset = never draining.
 	std::function<bool()> draining;
+	//! Renders the Prometheus text of acl_metrics() PER REQUEST for GET /metrics (spec 069), or ""
+	//! while `acl_metrics_endpoint` is off - the route then answers 404, like one that is not there.
+	//! Unset = no route at all.
+	std::function<string()> metrics;
 	//! Default (true): advertise /.well-known/quack-auth so an acl-aware client discovers the issuers.
 	//! `mode := 'plain'` sets false - a bare quack server (no discovery route), for a stock client or
 	//! when TLS is terminated by a reverse proxy upstream. Still acl-gated; still cleartext-only here.

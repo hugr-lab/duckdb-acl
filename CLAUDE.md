@@ -274,6 +274,27 @@ watch loop (it sweeps, then answers what remains - the auto-sweep rode `SessionO
 turns off), stragglers go to `acl_session_kill`, then the doors stop and the process exits. `acl_resume()` / `acl_drain_status()` complete the surface; all three are denied to a
 principal. The node never waits or times out by itself — the deadline belongs to the orchestrator.
 
+**Spec 069 — audit and metrics, layered**: every decision is an event (`AuditEvent`, header-only
+contract in `acl_audit.hpp`): statement/admin (emitted by the parser override after the decision, with
+the objects the rewrite touched and the capability judged for each, `rewrite_us`, and on a refusal one
+`reason_code` of a bounded taxonomy — the `Reason` enum every `Deny` site names, carried to the
+override's catch by a thread-local note), session (open/close/refuse, with door and duration), ingest
+(rows, from both doors; quack's drain outcome comes through a `sync.py` patch of the generated server
+TU), door (Flight tickets and the password handshake), policy (reloaded/written/source_error, from the
+catalog backend's `on_policy`), keys (JWKS refreshed/refresh_failed). The `AuditPipeline`
+(`acl_audit_pipeline.hpp`, acl-internal) drains a bounded queue on one thread into registered sinks,
+a ring (`acl_audit_events()`) and a JSON-lines file (`acl_audit_sink`); counters are derived from
+the events whatever the level, gauges are readers the owners register; `acl_metrics()` answers both,
+`GET /metrics` on the quack listener when `acl_metrics_endpoint` is on. Levels
+`acl_audit_level` = off/denied/decisions/all, per-session override `acl_session_audit_level`.
+Hooks live in the ObjectCache (`AuditHooks`, `GetOrCreate` by type string — no RTTI, no acl
+symbol: a loadable extension is RTLD_LOCAL) so `acl_otel` (separate repo,
+`specs/069-audit/extension-requirements.md`) registers sinks and a `SessionPolicy` without
+linking acl. Trace: `TRACE '<id>' [PARENT '<tp>']` prefix markers, composed by every door from
+`acl_correlation_id` / `acl_traceparent` (session-scoped, on spec 068's allowlist) or Flight's
+`x-correlation-id` / `traceparent` headers. Never a claim value, a handle or statement text on an
+event; metric attributes from bounded sets only.
+
 ## Working process — per-feature specs
 
 We do **not** run full spec-kit. Instead, each feature gets one lightweight spec under `specs/` (see

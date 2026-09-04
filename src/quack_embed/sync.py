@@ -43,6 +43,30 @@ RENAMES = {
     'scan_data_from_quack_client': 'acl_quack_scan_data',
 }
 
+# Exact-text patches applied after the renames: acl's own hooks into the server's logic, each
+# guarded like a rename - an anchor that is gone fails the sync, so an upstream change of the
+# patched site is re-audited rather than silently dropped. Keep these few and small.
+PATCHES = {
+    "quack_server.cpp": [
+        # spec 069: the audit hears the outcome of a client's drained insert (rows, or the error)
+        (
+            '#include "duckdb/main/client_config.hpp"\n',
+            '#include "duckdb/main/client_config.hpp"\n#include "acl_quack_embed.hpp"\n',
+        ),
+        (
+            "\t\tauto result = connection.duckdb_connection->Query(sql);\n"
+            "\t\tif (result->HasError()) {\n"
+            "\t\t\tstream->SetError(result->GetErrorObject());\n"
+            "\t\t}\n",
+            "\t\tauto result = connection.duckdb_connection->Query(sql);\n"
+            "\t\tif (result->HasError()) {\n"
+            "\t\t\tstream->SetError(result->GetErrorObject());\n"
+            "\t\t}\n"
+            "\t\tacl::AclQuackDrainCompleted(*connection.duckdb_connection, stream_id, *result);\n",
+        ),
+    ],
+}
+
 # file -> the subset of RENAMES that MUST appear in it (guard against silent drift)
 FILES = {
     "quack_server.cpp": [
@@ -82,6 +106,11 @@ def main():
         out = text
         for a, b in RENAMES.items():
             out = out.replace(a, b)
+        for anchor, patched in PATCHES.get(name, []):
+            if out.count(anchor) != 1:
+                failures.append(f"{name}: patch anchor {anchor!r} found {out.count(anchor)} times, expected 1")
+                continue
+            out = out.replace(anchor, patched)
         dest = OUT / ("acl_embed_" + name[len("quack_"):] if name.startswith("quack_") else name)
         dest.write_text(BANNER + out)
         # quack is formatted with its own duckdb pin's .clang-format, which differs from ours just

@@ -12,6 +12,7 @@
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 #include <atomic>
 #include <functional>
@@ -533,8 +534,29 @@ struct PolicyStore {
 		string id;
 		string door;
 		int8_t audit_level = -1;
+		Principal principal;
 	};
 	bool SessionRefOf(const string &handle, SessionRef &out);
+	//! The audit's seams for what is not a statement decision (spec 069). Each emits one event -
+	//! whatever the level: counted always, recorded where the level says - and never throws.
+	//! An ingest drain completed on the session behind `handle`: the rows it wrote, or why it failed
+	//! (`error` empty = it succeeded). A failure that carries our own prefix is the write policy
+	//! refusing where the value is written (spec 024) or the door's own load check; any other is the
+	//! physical source refusing the write.
+	void AuditIngest(const string &handle, int64_t rows, const string &error);
+	//! A door event: the password handshake (spec 064) or a ticket's fate (spec 047) - `detail` is
+	//! `handshake` or `ticket_issued` / `ticket_redeemed` / `ticket_expired` / `ticket_foreign`.
+	//! `handle` names the session when there is one; `principal` the one a handshake verified.
+	void AuditDoor(const string &door, const string &detail, bool allowed, const string &reason_code,
+	               const string &reason, const string &handle = string(), const Principal *principal = nullptr);
+	//! The policy source: `reloaded` (a version change adopted), `written` (a management write
+	//! committed), `source_error` (the source did not answer - the statement was refused)
+	void AuditPolicy(const string &detail, const string &reason);
+	//! An issuer's keys were re-read from their document (`refreshed`) or could not be (`refresh_failed`)
+	void AuditKeys(const string &issuer, bool ok, const string &error);
+	//! The store of an instance, for code that holds a connection and nothing else (the embedded
+	//! quack server's drain thread): registered in the object cache at load. Null before load.
+	static shared_ptr<PolicyStore> Of(DatabaseInstance &db);
 	//! End a session. Idempotent: closing an unknown handle is not an error, since a door may retry.
 	void SessionClose(const string &handle);
 	//! Bind a door's connection id to a handle, and look one up. Binding an id that is already bound
@@ -674,6 +696,22 @@ struct AclParserInfo : ParserExtensionInfo {
 	explicit AclParserInfo(shared_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
 	}
 	shared_ptr<PolicyStore> store;
+};
+
+//! The store's entry in the instance's object cache (spec 069): what `PolicyStore::Of(db)` reads.
+//! A weak reference - the cache must not keep the store alive past the extension's own ownership.
+class PolicyStoreHandle : public ObjectCacheEntry {
+public:
+	static string ObjectType() {
+		return "acl_policy_store";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // never evicted: a handle, not a cache
+	}
+	weak_ptr<PolicyStore> store;
 };
 
 //! Carried on each admin setup scalar function (function_info); reaches the same store at execution.

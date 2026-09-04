@@ -170,6 +170,33 @@ int main(int argc, char *argv[]) {
 			Exec(con, "DETACH remote");
 		});
 
+		Scenario("GET /metrics is opt-in and renders what acl_metrics() answers (spec 069)", [&] {
+			auto off = duckdb::acl::oidc::HttpGet("http://localhost:31975/metrics");
+			Check(off.status == 404,
+			      "off by default: 404, like a route that is not there (" + std::to_string(off.status) + ")");
+			Exec(con, "SET GLOBAL acl_metrics_endpoint = true");
+			auto on = duckdb::acl::oidc::HttpGet("http://localhost:31975/metrics");
+			Check(on.Ok() && on.status == 200, "on: the Prometheus text answers: " + on.error);
+			Check(on.body.find("# TYPE acl_sessions_live gauge\n") != std::string::npos,
+			      "...with a TYPE line per metric");
+			// the client's ATTACH above opened a session at this door: the counter names the door, and
+			// the text carries the same value acl_metrics() answers
+			auto opened = con.Query("SELECT value FROM acl_metrics() WHERE name = 'acl.sessions.opened' AND "
+			                        "attributes = '{\"door\":\"quack\"}'");
+			if (CheckOk(*opened, "acl_metrics() has the sessions the door opened") && opened->RowCount() == 1) {
+				auto line = "acl_sessions_opened{door=\"quack\"} " + opened->GetValue(0, 0).ToString() + "\n";
+				Check(on.body.find(line) != std::string::npos, "...and the endpoint renders the same row: " + line);
+			}
+			Check(on.body.find("acl_decisions{") != std::string::npos, "...and the decisions the client's reads were");
+			// never a session handle, a subject or an object name: the attribute sets are bounded
+			Check(on.body.find("subject=") == std::string::npos && on.body.find("object=") == std::string::npos &&
+			          on.body.find("role=") == std::string::npos,
+			      "no principal, object or role label anywhere in the text");
+			Exec(con, "SET GLOBAL acl_metrics_endpoint = false");
+			auto again = duckdb::acl::oidc::HttpGet("http://localhost:31975/metrics");
+			Check(again.status == 404, "off again: 404 - the setting is read per request");
+		});
+
 		Scenario("a draining node refuses new clients while the established one finishes (spec 066)", [&] {
 			Exec(con, "ATTACH 'quack:localhost:31975' AS before (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
 			auto rows = con.Query("SELECT count(*)::BIGINT FROM before.main.orders");

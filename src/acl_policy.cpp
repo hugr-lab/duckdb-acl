@@ -10,6 +10,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/main/database.hpp"
 
 #include <chrono>
 #include <random>
@@ -522,7 +523,97 @@ bool PolicyStore::SessionRefOf(const string &handle, SessionRef &out) {
 	out.id = entry->second.id;
 	out.door = entry->second.door;
 	out.audit_level = entry->second.audit_level;
+	out.principal = entry->second.principal;
 	return true;
+}
+
+void PolicyStore::AuditIngest(const string &handle, int64_t rows, const string &error) {
+	if (!audit) {
+		return;
+	}
+	SessionRef ref;
+	SessionRefOf(handle, ref);
+	AuditEvent event;
+	event.kind = "ingest";
+	event.door = ref.door;
+	event.session = ref.id;
+	event.principal = ref.principal;
+	event.allowed = error.empty();
+	event.rows = rows;
+	event.level = event.allowed ? AuditLevel::DECISIONS : AuditLevel::DENIED;
+	if (!event.allowed) {
+		event.reason_code = error.find("acl") != string::npos ? "write_policy" : "source_error";
+		event.reason = error;
+	}
+	event.recorded = audit->Records(event.level, ref.audit_level);
+	audit->Emit(std::move(event));
+}
+
+void PolicyStore::AuditDoor(const string &door, const string &detail, bool allowed, const string &reason_code,
+                            const string &reason, const string &handle, const Principal *principal) {
+	if (!audit) {
+		return;
+	}
+	AuditEvent event;
+	event.kind = "door";
+	event.door = door;
+	event.detail = detail;
+	event.allowed = allowed;
+	event.reason_code = reason_code;
+	event.reason = reason;
+	int8_t session_level = -1;
+	SessionRef ref;
+	if (!handle.empty() && SessionRefOf(handle, ref)) {
+		event.session = ref.id;
+		event.principal = ref.principal;
+		session_level = ref.audit_level;
+	}
+	if (principal) {
+		event.principal = *principal;
+	}
+	event.level = allowed ? AuditLevel::ALL : AuditLevel::DENIED;
+	event.recorded = audit->Records(event.level, session_level);
+	audit->Emit(std::move(event));
+}
+
+void PolicyStore::AuditPolicy(const string &detail, const string &reason) {
+	if (!audit) {
+		return;
+	}
+	AuditEvent event;
+	event.kind = "policy";
+	event.detail = detail;
+	event.allowed = detail != "source_error";
+	if (!event.allowed) {
+		event.reason_code = "source_error";
+		event.reason = reason;
+	}
+	event.level = event.allowed ? AuditLevel::ALL : AuditLevel::DENIED;
+	event.recorded = audit->Records(event.level, -1);
+	audit->Emit(std::move(event));
+}
+
+void PolicyStore::AuditKeys(const string &issuer, bool ok, const string &error) {
+	if (!audit) {
+		return;
+	}
+	AuditEvent event;
+	event.kind = "keys";
+	event.objects.push_back(AuditObject {issuer, "keys"});
+	event.detail = ok ? "refreshed" : "refresh_failed";
+	event.allowed = ok;
+	if (!ok) {
+		event.reason_code = "source_error";
+		event.reason = error;
+	}
+	event.level = ok ? AuditLevel::ALL : AuditLevel::DENIED;
+	event.recorded = audit->Records(event.level, -1);
+	audit->Emit(std::move(event));
+}
+
+shared_ptr<PolicyStore> PolicyStore::Of(DatabaseInstance &db) {
+	auto handle = db.GetObjectCache().Get<PolicyStoreHandle>(PolicyStoreHandle::ObjectType());
+	return handle ? handle->store.lock() : nullptr;
 }
 
 void TraceFromContext(ClientContext &context, string &correlation_id, string &traceparent) {

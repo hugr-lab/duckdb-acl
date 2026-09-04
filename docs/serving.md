@@ -404,6 +404,53 @@ connection - the door's read; `current_setting` stays denied to principals. On q
 `SET TimeZone = 'Asia/Tokyo'` is plain SQL through `acl_quack_authorize` and the gate is the whole
 mechanism. duckdb autoloads `icu` for the settings themselves.
 
+## Audit and metrics (spec 069)
+
+Every decision the node makes about a principal is one **event**: a statement admitted or refused
+(with the objects it touched and the capability judged for each), a management statement, a session
+opened / closed / refused, an ingest completed with its row count, a Flight ticket issued / redeemed /
+expired / presented by somebody else, the password handshake, a policy reload or source error, a keys
+refresh. An event carries who (subject, roles - never a claim value), where (`door`, the session's ops
+id - never the handle), what (the statement class - never the text), the verdict, and on a refusal
+one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only`, `function_denied`,
+`statement_type`, `unchecked_predicate`, `setting_denied`, `parse`, `principal`,
+`mgmt_unauthorized`, `ddl_home`, `draining`, `at_capacity`, `source_error`, `unavailable`,
+`write_policy`, `policy_error`) plus the refusal text.
+
+- **Levels** - `SET GLOBAL acl_audit_level = 'off' | 'denied' | 'decisions' | 'all'` (default
+  `decisions`): refusals only; every statement/admin/ingest decision; plus the session, door, policy
+  and keys lifecycle. `acl_session_audit_level(<ops id>, <level>)` overrides it for one live session
+  (the operator's call, never the principal's). Whatever the level, the **counters count**: metrics
+  are a state of the node, audit is a record of it.
+- **Where it goes** - a ring of the last `acl_audit_buffer` events (default 10000), read with
+  `acl_audit_events()`; optionally one JSON line per event appended to `acl_audit_sink` (a path or
+  URI through duckdb's filesystem, so an object store rides httpfs); and any sink an extension
+  registers through `acl_audit.hpp` (the `acl_otel` extension ships OTel logs and metrics). Delivery
+  is off the decision path: a bounded queue (`acl_audit_queue`) and one audit thread; when a sink is
+  slow the queue drops and **counts** (`acl_audit_dropped()`, `acl.audit.dropped`) - a statement is
+  never slowed by its own audit.
+- **Metrics** - `acl_metrics()` answers every counter and gauge with its attributes as JSON:
+  `acl.decisions{verdict,kind,door,statement}`, `acl.denials{reason_code,door}`,
+  `acl.sessions.opened/refused/closed`, `acl.sessions.live`, `acl.door.handshakes`,
+  `acl.door.tickets{outcome}`, `acl.ingest.statements`, `acl.admin.statements{scope}`,
+  `acl.policy.version/staleness/reloads/writes/source_errors`, `acl.jwks.refreshes/age`,
+  `acl.audit.events/dropped/sink_errors/queue_fill/ring_fill`, `acl.node.draining/uptime/info`.
+  Attribute values come from bounded sets only - never a role, a subject or an object name.
+  `SET GLOBAL acl_metrics_endpoint = true` adds `GET /metrics` (Prometheus text) to the quack door's
+  listener, unauthenticated like discovery; 404 while off.
+- **Tracing** - a statement's trace rides in the prefix as `TRACE '<correlation id>'` and
+  `PARENT '<W3C traceparent>'`, written by whoever composes it: a gateway calling `acl_session_sql`
+  sets `acl_correlation_id` / `acl_traceparent` on its connection first; a quack client SETs the same
+  two on its own session (spec 068's allowlist); a Flight client sends the `x-correlation-id` and
+  `traceparent` headers, or sets them through `SetSessionOptions`. Every event of that statement
+  carries both.
+- **Node identity** - `acl_node_id` (default `<hostname>:<pid>`) is on every event and metric row, so
+  a fleet's streams merge without ambiguity. Nodes never share audit state; a central view is the
+  collector's job (spec 069, "In a fleet").
+
+The whole surface - `acl_audit_events()`, `acl_metrics()`, `acl_session_audit_level`,
+`acl_audit_flush`, `acl_audit_dropped`, the settings - is the operator's: denied to a principal.
+
 ## Deployment invariants and hardening checklist
 
 - **One of two shapes: gateway-only, or doors.** In the gateway deployment only the gateway connects

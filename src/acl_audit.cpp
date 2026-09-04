@@ -203,7 +203,11 @@ void AuditPipeline::Count(const AuditEvent &event) {
 			counters.Add("acl.sessions.closed", {{"door", event.door}, {"how", event.detail}});
 		}
 	} else if (event.kind == "door") {
-		counters.Add("acl.door.handshakes", {{"door", event.door}, {"result", verdict}});
+		if (event.detail.compare(0, 7, "ticket_") == 0) {
+			counters.Add("acl.door.tickets", {{"door", event.door}, {"outcome", event.detail.substr(7)}});
+		} else {
+			counters.Add("acl.door.handshakes", {{"door", event.door}, {"result", verdict}});
+		}
 	} else if (event.kind == "policy") {
 		if (event.detail == "reloaded") {
 			counters.Add("acl.policy.reloads", {});

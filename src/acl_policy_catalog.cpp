@@ -14,8 +14,10 @@
 // are the other three units of the module (release plan 4.2).
 
 #include "acl_policy_catalog.hpp"
+#include "acl_rewriter.hpp"
 #include "acl_schema_sql.hpp"
 #include "acl_token.hpp"
+#include "duckdb/common/error_data.hpp"
 
 namespace duckdb {
 namespace acl {
@@ -119,6 +121,9 @@ void CatalogBackend::Write(const vector<string> &statements) {
 	if (commit->HasError()) {
 		throw BinderException("acl catalog: %s", commit->GetError());
 	}
+	if (on_policy) {
+		on_policy("written", string());
+	}
 	lock_guard<mutex> guard(lock);
 	checked_once = false; // force a version re-read on the next resolve
 }
@@ -142,15 +147,30 @@ void CatalogBackend::EnsureFresh() {
 		last_check = now;
 		checked_once = true;
 	}
-	auto result = function_mode ? Query("SELECT * FROM " + Slot("policy_version") + "()")
-	                            : Query("SELECT \"value\" FROM " + Tbl("meta") + " WHERE \"key\" = 'policy_version'");
-	if (result->RowCount() != 1) {
-		throw BinderException("acl catalog: the policy_version source returned %lld rows, expected 1",
-		                      result->RowCount());
+	int64_t current;
+	try {
+		auto result = function_mode
+		                  ? Query("SELECT * FROM " + Slot("policy_version") + "()")
+		                  : Query("SELECT \"value\" FROM " + Tbl("meta") + " WHERE \"key\" = 'policy_version'");
+		if (result->RowCount() != 1) {
+			throw BinderException("acl catalog: the policy_version source returned %lld rows, expected 1",
+			                      result->RowCount());
+		}
+		current = result->GetValue(0, 0).GetValue<int64_t>();
+	} catch (std::exception &ex) {
+		// the source did not answer: the statement that asked is refused (fail closed), the refusal
+		// names the source rather than the principal, and the node's counters see it (spec 069)
+		NoteDenyReason(Reason::SOURCE_ERROR);
+		if (on_policy) {
+			on_policy("source_error", ErrorData(ex).RawMessage());
+		}
+		throw;
 	}
-	auto current = result->GetValue(0, 0).GetValue<int64_t>();
 	lock_guard<mutex> guard(lock);
 	if (current != version) {
+		if (version != -1 && on_policy) {
+			on_policy("reloaded", string()); // a version this node had already adopted was replaced
+		}
 		version = current;
 		objects.clear();
 		functions.clear();
@@ -1319,6 +1339,9 @@ PolicyStore::~PolicyStore() {
 
 void PolicyStore::EnableCatalog(DatabaseInstance &db, const string &db_name, const string &schema, bool init) {
 	auto backend = make_uniq<CatalogBackend>(db, db_name, schema);
+	backend->on_policy = [this](const string &detail, const string &reason) {
+		AuditPolicy(detail, reason);
+	};
 	if (init) {
 		backend->InitSchema();
 	}
@@ -1331,6 +1354,9 @@ void PolicyStore::EnableCatalog(DatabaseInstance &db, const string &db_name, con
 void PolicyStore::EnableFunctions(DatabaseInstance &db, const string &slots_json) {
 	auto slots = acl_detail::ParseStringMap(slots_json);
 	auto backend = make_uniq<CatalogBackend>(db, slots);
+	backend->on_policy = [this](const string &detail, const string &reason) {
+		AuditPolicy(detail, reason);
+	};
 	// explicit slot map, fail closed at enable (design decision): the core slots are required and
 	// every named function must actually be registered
 	for (auto required :
@@ -1509,10 +1535,12 @@ string PolicyStore::ResolveIssuerKeys(const IssuerConfig &config, const string &
 		} else {
 			entry.error = std::move(error);
 		}
+		AuditKeys(config.issuer, entry.error.empty(), entry.error);
 		lock_guard<mutex> guard(lock);
 		jwks_cache[config.issuer] = entry;
 	}
 	if (entry.keys_json.empty()) {
+		NoteDenyReason(Reason::SOURCE_ERROR); // the source of the keys, not the principal, is what failed
 		throw BinderException("acl_rewrite: token rejected: the keys of issuer \"%s\" could not be read from "
 		                      "\"%s\": %s",
 		                      config.issuer, config.jwks_uri, entry.error);

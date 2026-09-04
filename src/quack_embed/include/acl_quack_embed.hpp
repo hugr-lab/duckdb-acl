@@ -21,6 +21,8 @@
 namespace duckdb {
 
 class ExtensionLoader;
+class Connection;
+class MaterializedQueryResult;
 
 namespace acl {
 
@@ -31,6 +33,11 @@ void RegisterAclQuackEmbed(ExtensionLoader &loader);
 //! Register the door itself (spec 041/063): acl_quack_serve / acl_quack_stop, and the two callbacks
 //! the server calls - acl_quack_authenticate per connection, acl_quack_authorize per statement.
 void RegisterAclQuackDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store);
+
+//! The server's drain of a client's streamed insert completed (spec 042): called from the generated
+//! server TU (a sync.py patch, see there) with the INSERT's outcome, so the audit records the load
+//! with its rows - or why it failed - as the session's (spec 069). Never throws.
+void AclQuackDrainCompleted(Connection &connection, const string &stream_id, MaterializedQueryResult &result);
 
 } // namespace acl
 } // namespace duckdb

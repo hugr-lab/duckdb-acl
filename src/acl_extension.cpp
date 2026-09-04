@@ -211,6 +211,9 @@ void LoadInternal(ExtensionLoader &loader) {
 	pipeline->Attach(db);
 	store->audit = pipeline;
 	acl::RegisterAclAudit(loader, store, pipeline);
+	// the store's own handle in the cache (weak): what PolicyStore::Of(db) answers to code that holds a
+	// connection and nothing else - the embedded quack server's drain thread (spec 069)
+	db.GetObjectCache().GetOrCreate<acl::PolicyStoreHandle>(acl::PolicyStoreHandle::ObjectType())->store = store;
 	acl::RegisterAclAdminFunctions(loader, std::move(store));
 }
 

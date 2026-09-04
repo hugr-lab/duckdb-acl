@@ -351,10 +351,11 @@ SELECT value FROM acl_metrics() WHERE name = 'acl.denials' AND attributes = '{"r
 ----
 1
 
+# the four anonymous management statements of the setup, and the two above
 query I
 SELECT sum(value) FROM acl_metrics() WHERE name = 'acl.admin.statements' AND attributes LIKE '%"scope":"anonymous"%';
 ----
-2
+6
 
 # at `denied` an allowed decision is counted but not recorded
 statement ok
@@ -422,6 +423,97 @@ ACL ROLE "analyst" SET acl_correlation_id = 'mine';
 ----
 <REGEX>:.*SET.*
 
+# --- the policy source and the keys: what the node adopted, wrote, or could not read -------------
+
+statement ok
+SET GLOBAL acl_audit_level='all';
+
+statement ok
+SET GLOBAL acl_version_check_interval=0;
+
+statement ok
+SELECT acl_audit_flush();
+
+statement ok
+SET VARIABLE seq1 = (SELECT coalesce(max(seq), 0) FROM acl_audit_events());
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM c.orders;
+----
+0
+
+statement ok
+SELECT acl_audit_flush();
+
+# a management write commits (`written`); the next resolve adopts the new version (`reloaded`)
+query II
+SELECT detail, count(*) FROM acl_audit_events() WHERE seq > getvariable('seq1') AND kind = 'policy'
+GROUP BY detail ORDER BY detail;
+----
+reloaded	1
+written	1
+
+query I
+SELECT value >= 1 FROM acl_metrics() WHERE name = 'acl.policy.reloads';
+----
+true
+
+# an issuer's keys read from a document (spec 023): the read is a `keys` event naming the issuer
+statement ok
+COPY (SELECT '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AS c)
+    TO '__TEST_DIR__/audit_jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/hs' KEYS FROM '__TEST_DIR__/audit_jwks.json'
+    AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+1
+
+statement ok
+SELECT acl_audit_flush();
+
+query IIII
+SELECT kind, detail, verdict, objects FROM acl_audit_events() WHERE kind = 'keys' ORDER BY seq;
+----
+keys	refreshed	allowed	[{'name': 'https://issuer.test/hs', 'capability': keys}]
+
+# repointed at a document that is not there: the read fails, and the token is refused as
+# source_error - the source of the keys, not the principal, is what failed
+statement ok
+ACL ADMIN ALTER ISSUER 'https://issuer.test/hs' SET KEYS FROM '__TEST_DIR__/missing_jwks.json';
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+<REGEX>:.*could not be read.*
+
+statement ok
+SELECT acl_audit_flush();
+
+query III
+SELECT detail, verdict, reason_code FROM acl_audit_events() WHERE kind = 'keys' ORDER BY seq DESC LIMIT 1;
+----
+refresh_failed	denied	source_error
+
+query I
+SELECT reason_code FROM acl_audit_events() WHERE kind = 'statement' ORDER BY seq DESC LIMIT 1;
+----
+source_error
+
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.jwks.refreshes' AND attributes LIKE '%"result":"refresh_failed"%';
+----
+1
+
+statement ok
+SET GLOBAL acl_audit_level='decisions';
+
 # --- the surface is the operator's, never a principal's ------------------------------------------
 
 statement ok
@@ -446,3 +538,31 @@ statement error
 ACL ROLE "analyst" SET acl_audit_level = 'off';
 ----
 <REGEX>:.*SET.*
+
+# --- a source that stops answering: the statement is refused as source_error, and counted --------
+
+statement ok
+DROP TABLE store.acl.meta;
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM c.orders;
+----
+<REGEX>:.*acl catalog.*
+
+statement ok
+SELECT acl_audit_flush();
+
+query III
+SELECT kind, detail, reason_code FROM acl_audit_events() WHERE kind = 'policy' ORDER BY seq DESC LIMIT 1;
+----
+policy	source_error	source_error
+
+query I
+SELECT reason_code FROM acl_audit_events() WHERE kind = 'statement' ORDER BY seq DESC LIMIT 1;
+----
+source_error
+
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.policy.source_errors';
+----
+1

@@ -160,6 +160,7 @@ struct FlightDoorState {
 		auto now = NowSeconds();
 		for (auto it = reservations.begin(); it != reservations.end();) {
 			if (now - it->second->last_used > idle_seconds) {
+				store->AuditDoor("flight", "ticket_expired", true, string(), string());
 				it = reservations.erase(it);
 			} else {
 				++it;
@@ -511,6 +512,8 @@ public:
 		// a draining node refuses before running the grant (spec 066): the handshake exists only to
 		// seat a new client, and minting an IdP token for one the node will refuse is waste and noise
 		if (state->store->Draining()) {
+			state->store->AuditDoor("flight", "handshake", false, "draining",
+			                        "acl: node is draining - not accepting new sessions");
 			return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
 			                               "acl: node is draining - not accepting new sessions");
 		}
@@ -553,8 +556,10 @@ public:
 				continue;
 			}
 			*middleware = std::make_shared<PasswordHandshakeMiddleware>(tokens.access_token);
+			state->store->AuditDoor("flight", "handshake", true, string(), string(), string(), &principal);
 			return arrow::Status::OK();
 		}
+		state->store->AuditDoor("flight", "handshake", false, "principal", refusal);
 		return flight::MakeFlightError(flight::FlightStatusCode::Unauthenticated, refusal);
 	}
 
@@ -694,6 +699,7 @@ public:
 			if (ticket_id.empty()) {
 				return arrow::Status::Invalid("acl: too many open tickets - fetch or retry later");
 			}
+			state->store->AuditDoor("flight", "ticket_issued", true, string(), string(), handle);
 			ARROW_ASSIGN_OR_RAISE(auto ticket, flightsql::CreateStatementQueryTicket(ticket_id));
 			std::vector<flight::FlightEndpoint> endpoints {
 			    flight::FlightEndpoint {flight::Ticket {std::move(ticket)}, {}, std::nullopt, {}}};
@@ -714,8 +720,13 @@ public:
 			                    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(caller));
 			                    auto reservation = state->TakeReservation(string(command.statement_handle), owner);
 			                    if (!reservation) {
+				                    // a ticket of somebody else's reads exactly like none (no oracle) - and is
+				                    // the one event here worth a denial: a stolen ticket presented (spec 047)
+				                    state->store->AuditDoor("flight", "ticket_foreign", false, "principal",
+				                                            "acl: unknown or already fetched ticket", caller);
 				                    return arrow::Status::KeyError("acl: unknown or already fetched ticket");
 			                    }
+			                    state->store->AuditDoor("flight", "ticket_redeemed", true, string(), string(), caller);
 			                    std::lock_guard<std::mutex> execution(reservation->conn->exec);
 			                    vector<Value> values;
 			                    auto result = reservation->stmt->Execute(values, false);
@@ -969,6 +980,7 @@ public:
 			}
 			auto fail = [&](arrow::Status status) -> arrow::Status {
 				con.Query("ROLLBACK");
+				state->store->AuditIngest(handle, -1, status.ToString()); // the load's outcome (spec 069)
 				return status;
 			};
 			auto result = stmt->Execute(values, false);
@@ -994,8 +1006,10 @@ public:
 			}
 			auto committed = con.Query("COMMIT");
 			if (committed->HasError()) {
+				state->store->AuditIngest(handle, -1, committed->GetError());
 				return StatusFromDuck("acl", committed->GetError());
 			}
+			state->store->AuditIngest(handle, total, string()); // rows written - a number, never data
 			return total;
 		});
 	}
