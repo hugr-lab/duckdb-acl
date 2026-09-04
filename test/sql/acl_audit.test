@@ -1,0 +1,283 @@
+# name: test/sql/acl_audit.test
+# description: the audit base (spec 069) - the session lifecycle as events at the levels that record
+#   it, the counters and gauges behind acl_metrics(), the ring's bound, the JSON-lines sink, the
+#   operator's per-session level, and the whole surface refused to a principal
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+SET GLOBAL acl_node_id='node-under-test';
+
+# --- the session lifecycle: an opened session is `all`, a refused one is a denial -----------------
+
+statement ok
+SET GLOBAL acl_audit_level='decisions';
+
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc') IS NOT NULL;
+----
+true
+
+query I
+SELECT acl_session_open('not-a-jwt') IS NULL;
+----
+true
+
+statement ok
+SELECT acl_audit_flush();
+
+# at `decisions` the open is not recorded, the refusal (a denial) is
+query IIII
+SELECT kind, detail, verdict, reason_code FROM acl_audit_events() WHERE kind = 'session' ORDER BY seq;
+----
+session	refused	denied	principal
+
+statement ok
+SET GLOBAL acl_audit_level='all';
+
+statement ok
+SET VARIABLE h = (SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc'));
+
+statement ok
+SELECT acl_session_close(getvariable('h'));
+
+statement ok
+SELECT acl_audit_flush();
+
+# the open and the close, with who, where and how; the close carries how long it lived
+query IIIIII
+SELECT kind, detail, verdict, door, subject, duration_us >= 0
+FROM acl_audit_events() WHERE kind = 'session' AND detail IN ('opened', 'client') ORDER BY seq;
+----
+session	opened	allowed	session	u	NULL
+session	client	allowed	session	u	true
+
+# every event names the node and carries the level it belongs to; roles ride as a list
+query III
+SELECT node, level, roles FROM acl_audit_events() WHERE detail = 'opened';
+----
+node-under-test	all	[analyst]
+
+# --- the counters are a state of the node: they count whatever the level recorded -----------------
+# three opens succeeded (one unrecorded at `decisions`), one was refused
+
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.sessions.opened' AND attributes = '{"door":"session"}';
+----
+2
+
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.sessions.refused' AND attributes LIKE '%"reason_code":"principal"%';
+----
+1
+
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.sessions.closed' AND attributes LIKE '%"how":"client"%';
+----
+1
+
+# the gauges: states read from the store, not occurrences
+query II
+SELECT name, value FROM acl_metrics() WHERE name IN ('acl.sessions.live', 'acl.node.draining', 'acl.sessions.max') ORDER BY name;
+----
+acl.node.draining	0
+acl.sessions.live	1
+acl.sessions.max	1000
+
+query I
+SELECT value >= 0 FROM acl_metrics() WHERE name = 'acl.policy.version';
+----
+true
+
+# every attribute key is from the bounded sets - a row naming a role, a subject or an object here is a
+# cardinality leak
+query I
+SELECT count(*) FROM acl_metrics()
+WHERE attributes SIMILAR TO '.*"(role|subject|object|tenant|claim)".*';
+----
+0
+
+query I
+SELECT acl_audit_dropped();
+----
+0
+
+# --- the operator's per-session level: that session's later events follow it ---------------------
+
+statement ok
+SET VARIABLE h2 = (SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc'));
+
+statement ok
+SELECT acl_audit_flush();
+
+statement ok
+SET VARIABLE id2 = (SELECT session FROM acl_audit_events() WHERE detail = 'opened' ORDER BY seq DESC LIMIT 1);
+
+query I
+SELECT acl_session_audit_level(getvariable('id2'), 'off');
+----
+true
+
+query I
+SELECT acl_session_audit_level('no-such-session', 'all');
+----
+false
+
+statement error
+SELECT acl_session_audit_level(getvariable('id2'), 'loud');
+----
+<REGEX>:.*unknown level.*
+
+statement ok
+SELECT acl_session_close(getvariable('h2'));
+
+statement ok
+SELECT acl_audit_flush();
+
+# the close of a session at `off` is counted but not recorded
+query I
+SELECT count(*) FROM acl_audit_events() WHERE detail = 'client' AND session = getvariable('id2');
+----
+0
+
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.sessions.closed' AND attributes LIKE '%"how":"client"%';
+----
+2
+
+# --- the ring is bounded, and what falls off it is counted --------------------------------------
+
+statement ok
+SET GLOBAL acl_audit_buffer=2;
+
+statement ok
+SELECT acl_session_open('not-a-jwt');
+
+statement ok
+SELECT acl_session_open('not-a-jwt');
+
+statement ok
+SELECT acl_session_open('not-a-jwt');
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_audit_events();
+----
+2
+
+query I
+SELECT acl_audit_dropped() > 0;
+----
+true
+
+statement ok
+SET GLOBAL acl_audit_buffer=10000;
+
+# --- the JSON-lines sink: every field a column, no claim values ---------------------------------
+
+statement ok
+SET GLOBAL acl_audit_sink='__TEST_DIR__/audit.jsonl';
+
+statement ok
+SELECT acl_session_open('not-a-jwt');
+
+statement ok
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+statement ok
+SELECT acl_audit_flush();
+
+# one JSON object per line (read back without the json extension: the shape is what is pinned here,
+# a consumer with the extension loaded reads it with read_json_auto): the refusal, then the open
+query IIII
+SELECT content LIKE '{"ts_us":%',
+       content LIKE '%"kind":"session","statement":"","objects":[],"verdict":"denied","reason_code":"principal"%',
+       content LIKE '%"subject":"u","roles":["analyst"],"kind":"session"%',
+       content LIKE '%"detail":"opened"}' || chr(10)
+FROM read_text('__TEST_DIR__/audit.jsonl');
+----
+true	true	true	true
+
+# never a claim value: the token carries tid=acme, the file does not
+query II
+SELECT content LIKE '%acme%', content LIKE '%"claims"%' FROM read_text('__TEST_DIR__/audit.jsonl');
+----
+false	false
+
+# an unwritable path counts drops and the node keeps deciding
+statement ok
+SET GLOBAL acl_audit_sink='/nonexistent-dir-for-acl/audit.jsonl';
+
+statement ok
+SELECT acl_session_open('not-a-jwt');
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT value > 0 FROM acl_metrics() WHERE name = 'acl.audit.sink_errors' AND attributes = '{"sink":"file"}';
+----
+true
+
+statement ok
+SET GLOBAL acl_audit_sink='';
+
+# --- the surface is the operator's, never a principal's ------------------------------------------
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+statement error
+ACL ROLE "analyst" SELECT * FROM acl_audit_events();
+----
+<REGEX>:.*acl_audit_events.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM acl_metrics();
+----
+<REGEX>:.*acl_metrics.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT acl_session_audit_level('x', 'off');
+----
+<REGEX>:.*acl_session_audit_level.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SET acl_audit_level = 'off';
+----
+<REGEX>:.*SET.*

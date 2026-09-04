@@ -20,6 +20,7 @@ include_directories(duckdb/third_party/httplib duckdb/third_party/yyjson/include
 
 set(EXTENSION_SOURCES
     src/acl_admin_functions.cpp
+    src/acl_audit.cpp
     src/acl_catalog_rpc.cpp
     src/acl_extension.cpp
     src/acl_introspection.cpp

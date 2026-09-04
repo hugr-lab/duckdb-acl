@@ -1434,6 +1434,26 @@ int64_t PolicyStore::MaxSessions() {
 	return 1000;
 }
 
+int64_t PolicyStore::PolicyVersion() {
+	if (!catalog) {
+		return -1;
+	}
+	lock_guard<mutex> guard(catalog->lock);
+	return catalog->version;
+}
+
+int64_t PolicyStore::PolicyStalenessSeconds() {
+	if (!catalog) {
+		return -1;
+	}
+	lock_guard<mutex> guard(catalog->lock);
+	if (!catalog->checked_once) {
+		return -1;
+	}
+	auto since = std::chrono::steady_clock::now() - catalog->last_check;
+	return std::chrono::duration_cast<std::chrono::seconds>(since).count();
+}
+
 int64_t PolicyStore::JwksRefreshInterval() {
 	if (!catalog) {
 		return 300;

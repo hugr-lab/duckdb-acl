@@ -1,5 +1,6 @@
 #include "acl_policy.hpp"
 
+#include "acl_audit_pipeline.hpp"
 #include "acl_token.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
@@ -191,6 +192,32 @@ string MintHandle() {
 	return MintRandomHex(16);
 }
 
+//! One session lifecycle event (spec 069), at level `all`: opened, refused (with why), or closed
+//! (with how and for how long). Nothing when the effective level does not record it. Safe under the
+//! store's lock: emitting takes the audit queue's lock and reads two settings, nothing of the store's.
+void SessionEvent(AuditPipeline *hooks, const Principal &principal, const string &door, const string &id,
+                  int8_t session_level, const string &detail, const string &reason_code, const string &reason,
+                  int64_t duration_us) {
+	if (!hooks) {
+		return;
+	}
+	// always emitted - the counters are a state of the node whatever the level - and recorded only
+	// where the level says so: an opened/closed session is `all`, a refused one is a denial
+	AuditEvent event;
+	event.level = reason_code.empty() ? AuditLevel::ALL : AuditLevel::DENIED;
+	event.recorded = hooks->Records(event.level, session_level);
+	event.kind = "session";
+	event.door = door;
+	event.session = id;
+	event.principal = principal;
+	event.detail = detail;
+	event.allowed = reason_code.empty();
+	event.reason_code = reason_code;
+	event.reason = reason;
+	event.duration_us = duration_us;
+	hooks->Emit(std::move(event));
+}
+
 } // namespace
 
 //! `std::random_device` rather than duckdb's own utilities, deliberately: `RandomEngine` seeds from
@@ -224,12 +251,18 @@ string MintRandomHex(idx_t bytes) {
 	return out;
 }
 
-string PolicyStore::SessionOpen(const string &token) {
+string PolicyStore::SessionOpen(const string &token, const string &door) {
+	// a refusal is a session event too (spec 069): the reason a client never learns is what the
+	// operator's record carries
+	auto refused = [&](const Principal &who, const char *code, const string &reason) {
+		SessionEvent(audit.get(), who, door, "", -1, "refused", code, reason, -1);
+		return string();
+	};
 	// Spec 066: a draining node seats nobody new. Refused before verifying anything - there is
 	// nothing to decide with the result, and the drain path stays free of JWKS reads. Established
 	// sessions never come back through here, so they keep working.
 	if (draining.load(std::memory_order_relaxed)) {
-		return string();
+		return refused(Principal(), "draining", "acl: node is draining - not accepting new sessions");
 	}
 	Principal principal;
 	int64_t expires_at = 0;
@@ -239,19 +272,19 @@ string PolicyStore::SessionOpen(const string &token) {
 		// reason - a session must never be a way to get in with something a prefix would reject
 		IssuerConfig config;
 		if (!LookupIssuer(issuer, config)) {
-			return string();
+			return refused(Principal(), "principal", "acl_rewrite: token rejected: unknown issuer \"" + issuer + "\"");
 		}
 		config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
 		JwtClaims verified;
 		try {
 			verified = VerifyJwt(token, config, JwtClockSkew());
-		} catch (std::exception &) {
-			return string(); // the door refuses; it does not learn why
+		} catch (std::exception &ex) {
+			return refused(Principal(), "principal", ex.what()); // the door refuses; it does not learn why
 		}
 		principal.subject = verified.subject;
 		principal.roles = MapExternalRoles(issuer, verified.raw_roles);
 		if (principal.roles.empty()) {
-			return string();
+			return refused(principal, "principal", "acl_rewrite: token rejected: no recognized roles");
 		}
 		principal.claims = verified.claims;
 		// The role-default claims, exactly as the ACL TOKEN path merges them (VerifyPrincipal): a
@@ -265,7 +298,14 @@ string PolicyStore::SessionOpen(const string &token) {
 		}
 		expires_at = verified.expires_at;
 	} else if (!VerifyPrincipal(true, token, principal)) {
-		return string(); // the dev stub, which carries no expiry
+		return refused(Principal(), "principal", "acl_rewrite: token verification failed"); // the dev stub
+	}
+	// The session's own audit level (spec 069): the door's policy - the extended extension's rule
+	// per role, user and door - answers once, here; no opinion means the instance's level applies.
+	int8_t session_level = -1;
+	AuditLevel chosen;
+	if (audit && audit->LevelForSession(principal, door, chosen)) {
+		session_level = static_cast<int8_t>(chosen);
 	}
 	// Minted before the lock because it needs none, so that checking the cap and inserting happen in
 	// ONE critical section: doing them in two let concurrent opens step over the cap between them.
@@ -275,6 +315,7 @@ string PolicyStore::SessionOpen(const string &token) {
 	auto idle_timeout = SessionIdleTimeout();
 	auto exp_binds = SessionExpEveryUse();
 	auto handle = MintHandle();
+	auto id = MintHandle().substr(0, 12);
 	lock_guard<mutex> guard(lock);
 	// Sweep before making room rather than after running out: at most once a minute on a quiet door,
 	// and always when the map is at its cap, so the cost lands on arrivals and never on a reader.
@@ -285,10 +326,23 @@ string PolicyStore::SessionOpen(const string &token) {
 		// Refusing rather than evicting: making room by ending somebody else's session would let an
 		// arriving stranger disconnect a working client, which is the worse of the two failures
 		// (spec 044). A door turns this into "Authentication failed", which a client already handles.
-		return string();
+		return refused(principal, "at_capacity",
+		               "acl: at acl_max_sessions - a new session is refused, never an old one ended");
 	}
-	sessions[handle] = Session {std::move(principal), MintHandle().substr(0, 12), expires_at, now};
+	SessionEvent(audit.get(), principal, door, id, session_level, "opened", "", "", -1);
+	Session session {std::move(principal), id, expires_at, now};
+	session.door = door;
+	session.opened_at = now;
+	session.audit_level = session_level;
+	sessions[handle] = std::move(session);
 	return handle;
+}
+
+//! The close event of a session being removed (spec 069): how it ended, and for how long it lived.
+//! Caller holds the lock; the event itself takes nothing of the store's.
+void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now) {
+	auto lived = session.opened_at > 0 ? (now - session.opened_at) * 1000000 : -1;
+	SessionEvent(audit.get(), session.principal, session.door, session.id, session.audit_level, how, "", "", lived);
 }
 
 bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string &reason) {
@@ -304,11 +358,13 @@ bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string 
 		return false;
 	}
 	if (exp_binds && entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
+		SessionClosed(entry->second, "expired", now);
 		sessions.erase(entry); // it can never come back, so do not keep it around
 		reason = "expired";
 		return false;
 	}
 	if (idle > 0 && entry->second.last_used + idle < now) {
+		SessionClosed(entry->second, "idle", now);
 		sessions.erase(entry);
 		reason = "idle";
 		return false;
@@ -373,6 +429,7 @@ idx_t PolicyStore::SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp
 		// is the wrong way to be wrong about it. Every session gets its stamp at SessionOpen.
 		bool stale = idle > 0 && entry->second.last_used + idle < now;
 		if (expired || stale) {
+			SessionClosed(entry->second, expired ? "expired" : "idle", now);
 			entry = sessions.erase(entry);
 			removed++;
 			continue;
@@ -436,10 +493,12 @@ vector<PolicyStore::SessionInfo> PolicyStore::SessionList() {
 }
 
 bool PolicyStore::SessionKill(const string &id) {
+	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
 	for (auto entry = sessions.begin(); entry != sessions.end(); ++entry) {
 		if (entry->second.id == id) {
 			auto handle = entry->first;
+			SessionClosed(entry->second, "killed", now);
 			sessions.erase(entry);
 			for (auto binding = session_bindings.begin(); binding != session_bindings.end();) {
 				binding = binding->second == handle ? session_bindings.erase(binding) : std::next(binding);
@@ -499,28 +558,42 @@ bool PolicyStore::Draining() const {
 }
 
 void PolicyStore::SessionClose(const string &handle) {
+	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
-	sessions.erase(handle);
-	for (auto entry = session_bindings.begin(); entry != session_bindings.end();) {
-		entry = entry->second == handle ? session_bindings.erase(entry) : std::next(entry);
+	auto entry = sessions.find(handle);
+	if (entry != sessions.end()) {
+		SessionClosed(entry->second, "client", now);
+		sessions.erase(entry);
+	}
+	for (auto binding = session_bindings.begin(); binding != session_bindings.end();) {
+		binding = binding->second == handle ? session_bindings.erase(binding) : std::next(binding);
 	}
 }
 
 void PolicyStore::SessionBind(const string &external_id, const string &handle) {
+	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
 	// Ending what this replaces, rather than leaving it behind: a connection that authenticates again
 	// used to orphan its previous session - unreachable, since the handle is never handed out twice and
 	// the binding is gone, but permanent all the same (spec 044).
 	auto previous = session_bindings.find(external_id);
 	if (previous != session_bindings.end() && previous->second != handle) {
-		sessions.erase(previous->second);
+		auto replaced = sessions.find(previous->second);
+		if (replaced != sessions.end()) {
+			SessionClosed(replaced->second, "client", now);
+			sessions.erase(replaced);
+		}
 	}
 	session_bindings[external_id] = handle;
 }
 
 idx_t PolicyStore::SessionCloseAll() {
+	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
 	auto closed = sessions.size();
+	for (auto &entry : sessions) {
+		SessionClosed(entry.second, "door_stopped", now);
+	}
 	sessions.clear();
 	session_bindings.clear();
 	return closed;
@@ -534,6 +607,33 @@ bool PolicyStore::SessionHandleFor(const string &external_id, string &handle) {
 	}
 	handle = entry->second;
 	return true;
+}
+
+bool PolicyStore::SetSessionAuditLevel(const string &id, int8_t level) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			entry.second.audit_level = level;
+			return true;
+		}
+	}
+	return false;
+}
+
+int8_t PolicyStore::SessionAuditLevel(const string &handle) {
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	return entry == sessions.end() ? -1 : entry->second.audit_level;
+}
+
+vector<std::pair<string, int64_t>> PolicyStore::JwksAges() {
+	auto now = NowSeconds();
+	lock_guard<mutex> guard(lock);
+	vector<std::pair<string, int64_t>> out;
+	for (auto &entry : jwks_cache) {
+		out.emplace_back(entry.first, entry.second.fetched_at > 0 ? now - entry.second.fetched_at : -1);
+	}
+	return out;
 }
 
 bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal &out, bool ignore_exp) {

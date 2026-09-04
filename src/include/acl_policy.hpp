@@ -25,6 +25,8 @@ class ClientContext;
 
 namespace acl {
 
+class AuditPipeline; // the audit's own side (spec 069), acl_audit_pipeline.hpp
+
 struct Principal {
 	//! The token's subject within its issuer (spec 050 F5): part of a principal's identity, so two
 	//! users sharing roles+claims are not one session. Empty for the ROLE form and the dev stub.
@@ -276,8 +278,16 @@ struct PolicyStore {
 		//! about whether anyone is still there; a door sees connections that simply stop, so this is
 		//! what ends them.
 		int64_t last_used = 0;
+		//! Which door opened it (spec 069: on every event about it) and when - the close event's duration
+		string door;
+		int64_t opened_at = 0;
+		//! The session's own audit level (spec 069): -1 inherits the instance's; set by the door's
+		//! SessionPolicy at open or by the operator afterwards, never by the principal
+		int8_t audit_level = -1;
 	};
 	unordered_map<string, Session> sessions;
+	//! The audit pipeline of this instance (spec 069); set at load, before anything serves
+	shared_ptr<AuditPipeline> audit;
 	//! A door's own connection id -> our handle (spec 041). quack hands its `session_id` to the
 	//! authentication callback and the same value as `connection_id` on every later message, so this
 	//! is what turns "which connection is this" into "which principal is this" without the door ever
@@ -476,7 +486,19 @@ struct PolicyStore {
 	bool VerifyPrincipal(bool is_token, const string &value, Principal &out, bool ignore_exp = false);
 	//! Verify a token and mint an opaque handle for it (spec 040). Empty when the token does not
 	//! verify: a door refuses rather than learning why, and the reason belongs to whoever verified.
-	string SessionOpen(const string &token);
+	string SessionOpen(const string &token, const string &door = "session");
+	//! The operator's per-session audit level (spec 069), by the ops id; -1 inherits. False = no such session.
+	bool SetSessionAuditLevel(const string &id, int8_t level);
+	//! A session's own level by handle, -1 when it inherits or the handle is unknown.
+	int8_t SessionAuditLevel(const string &handle);
+	//! The close event of a session being removed (spec 069); caller holds the lock.
+	void SessionClosed(const Session &session, const char *how, int64_t now);
+	//! The gauges the audit reads (spec 069): the policy version the caches are keyed by (-1 without a
+	//! catalog), seconds since the last successful version check (-1 = never), and per issuer the
+	//! seconds since its keys were last read successfully.
+	int64_t PolicyVersion();
+	int64_t PolicyStalenessSeconds();
+	vector<std::pair<string, int64_t>> JwksAges();
 	//! The principal behind a handle, or false with `reason` saying which of "unknown" / "expired" it
 	//! is - a client that reconnects needs to tell those apart.
 	bool SessionPrincipal(const string &handle, Principal &out, string &reason);
