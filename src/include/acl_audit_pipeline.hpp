@@ -47,8 +47,9 @@ public:
 	//! The events of the ring, oldest first.
 	vector<AuditEvent> Ring();
 	int64_t Dropped() const;
-	//! Wait until every event enqueued so far has been handled (tests; shutdown).
-	void Flush();
+	//! Wait until every event enqueued so far has been handled (tests; shutdown), then flush the sinks
+	//! and sync the file. Bounded: false when the thread did not drain in time (a sink is stuck).
+	bool Flush(int64_t timeout_ms = 30000);
 	void Stop();
 
 private:
@@ -56,6 +57,7 @@ private:
 	void Handle(const AuditEvent &event);
 	void Count(const AuditEvent &event);
 	void WriteFile(const AuditEvent &event);
+	void SyncFile();
 	string Setting(const char *name, const string &fallback);
 	int64_t SettingInt(const char *name, int64_t fallback);
 

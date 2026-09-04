@@ -560,7 +560,16 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		return ParserOverrideResult(); // our own inner parse: decline, and let the others try
 	}
 	auto &store = *info->Cast<AclParserInfo>().store;
-	auto prefix = ParseAclPrefix(query);
+	AclPrefix prefix;
+	try {
+		prefix = ParseAclPrefix(query);
+	} catch (std::exception &ex) {
+		// a prefix that does not scan (an unterminated quote, a bare ACL TOKEN) is a refusal too, and
+		// counted as one: nobody is known yet, so it is the gateway's, and a parse
+		StatementAudit audit(store.audit.get());
+		audit.Denied(ex);
+		throw;
+	}
 	if (prefix.kind == AclPrefix::Kind::NONE) {
 		// The one thing we do to a statement nobody prefixed - and only while a door of ours is open.
 		// The refusal exists because a client *we serve* caused the statement; with no door open, a

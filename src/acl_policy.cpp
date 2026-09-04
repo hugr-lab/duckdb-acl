@@ -1,7 +1,9 @@
 #include "acl_policy.hpp"
 
 #include "acl_audit_pipeline.hpp"
+#include "acl_rewriter.hpp"
 #include "acl_token.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -219,6 +221,14 @@ void SessionEvent(AuditPipeline *hooks, const Principal &principal, const string
 	hooks->Emit(std::move(event));
 }
 
+//! A JWT verification, counted by its result (spec 069): not an event - the session or statement
+//! it was for is one - but a rate the node reports
+void CountJwt(AuditPipeline *hooks, const char *result) {
+	if (hooks) {
+		hooks->Hooks().Counters().Add("acl.jwt.verifications", {{"result", result}});
+	}
+}
+
 } // namespace
 
 //! `std::random_device` rather than duckdb's own utilities, deliberately: `RandomEngine` seeds from
@@ -275,14 +285,20 @@ string PolicyStore::SessionOpen(const string &token, const string &door) {
 		if (!LookupIssuer(issuer, config)) {
 			return refused(Principal(), "principal", "acl_rewrite: token rejected: unknown issuer \"" + issuer + "\"");
 		}
-		config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
 		JwtClaims verified;
 		try {
+			config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
 			verified = VerifyJwt(token, config, JwtClockSkew());
 		} catch (std::exception &ex) {
-			return refused(Principal(), "principal", ex.what()); // the door refuses; it does not learn why
+			// the door refuses; it does not learn why. The audit does: the keys' source, when that is
+			// what failed (a note the read left), else the principal
+			CountJwt(audit.get(), "failed");
+			auto code = TakeDenyReason();
+			return refused(Principal(), code.empty() ? "principal" : code.c_str(), ErrorData(ex).RawMessage());
 		}
+		CountJwt(audit.get(), "ok");
 		principal.subject = verified.subject;
+		principal.issuer = issuer;
 		principal.roles = MapExternalRoles(issuer, verified.raw_roles);
 		if (principal.roles.empty()) {
 			return refused(principal, "principal", "acl_rewrite: token rejected: no recognized roles");
@@ -542,7 +558,10 @@ void PolicyStore::AuditIngest(const string &handle, int64_t rows, const string &
 	event.rows = rows;
 	event.level = event.allowed ? AuditLevel::DECISIONS : AuditLevel::DENIED;
 	if (!event.allowed) {
-		event.reason_code = error.find("acl") != string::npos ? "write_policy" : "source_error";
+		// our own refusal carries our prefix (the rewriter's error() inside the written value, or the
+		// door's load check); anything else is the physical source refusing the write
+		bool ours = error.find("acl_rewrite:") != string::npos || error.find("acl:") != string::npos;
+		event.reason_code = ours ? "write_policy" : "source_error";
 		event.reason = error;
 	}
 	event.recorded = audit->Records(event.level, ref.audit_level);
@@ -780,8 +799,15 @@ bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal 
 		string issuer;
 		if (LooksLikeJwt(value, issuer)) {
 			// the real path (spec 007): signature + claims against the issuer registry; throws on
-			// failure, so a bad JWT can never fall back to the dev stub below
-			VerifyJwtPrincipal(value, issuer, out, ignore_exp);
+			// failure, so a bad JWT can never fall back to the dev stub below. Counted either way
+			// (spec 069): a verification is not an event, but its rate is a state of the node.
+			try {
+				VerifyJwtPrincipal(value, issuer, out, ignore_exp);
+			} catch (...) {
+				CountJwt(audit.get(), "failed");
+				throw;
+			}
+			CountJwt(audit.get(), "ok");
 		} else {
 			lock_guard<mutex> guard(lock);
 			auto entry = tokens.find(value); // dev stub for non-JWT tokens
@@ -819,6 +845,7 @@ void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, 
 		                      "by a Graph link; resolve groups at the gateway and use the ROLE form");
 	}
 	out.subject = verified.subject;
+	out.issuer = issuer;
 	out.roles = MapExternalRoles(issuer, verified.raw_roles);
 	if (out.roles.empty()) {
 		throw BinderException("acl_rewrite: token rejected: no recognized roles");

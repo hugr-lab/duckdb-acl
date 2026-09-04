@@ -150,7 +150,17 @@ void AuditPipeline::Emit(AuditEvent event) {
 		queue.push_back(std::move(event));
 		enqueued++;
 		if (!worker.joinable()) {
-			worker = std::thread([this]() { Run(); });
+			// started on the first event; a thread the platform refuses costs this event, never the
+			// decision that produced it (the audit is off the decision path in failure too)
+			try {
+				worker = std::thread([this]() { Run(); });
+			} catch (std::exception &) {
+				queue.pop_back();
+				enqueued--;
+				dropped++;
+				hooks->Counters().Add("acl.audit.dropped", {{"where", "queue"}});
+				return;
+			}
 		}
 	}
 	queue_cv.notify_one();
@@ -270,9 +280,10 @@ void AuditPipeline::WriteFile(const AuditEvent &event) {
 			file = fs.OpenFile(path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_APPEND |
 			                             FileFlags::FILE_FLAGS_FILE_CREATE);
 		}
+		// one write per event, no fsync: a sync per line would bound the whole audit to the disk's
+		// fsync rate and fill the queue under load. Flush() and Stop() sync what was written.
 		auto line = AuditEventJson(event) + "\n";
 		file->Write(const_cast<char *>(line.data()), NumericCast<int64_t>(line.size()));
-		file->Sync();
 	} catch (std::exception &) {
 		file.reset();
 		dropped++;
@@ -290,11 +301,14 @@ int64_t AuditPipeline::Dropped() const {
 	return dropped.load();
 }
 
-void AuditPipeline::Flush() {
+bool AuditPipeline::Flush(int64_t timeout_ms) {
+	bool drained;
 	{
 		std::unique_lock<std::mutex> guard(queue_lock);
 		auto target = enqueued;
-		drained_cv.wait(guard, [&]() { return handled >= target || stopping; });
+		// bounded: a sink that blocks must not hang the operator's connection that asked for a flush
+		drained = drained_cv.wait_for(guard, std::chrono::milliseconds(timeout_ms),
+		                              [&]() { return handled >= target || stopping; });
 	}
 	for (auto &sink : hooks->Sinks()) {
 		try {
@@ -302,6 +316,21 @@ void AuditPipeline::Flush() {
 		} catch (...) {
 			hooks->Counters().Add("acl.audit.sink_errors", {{"sink", "extension"}});
 		}
+	}
+	SyncFile();
+	return drained;
+}
+
+void AuditPipeline::SyncFile() {
+	std::lock_guard<std::mutex> guard(file_lock);
+	if (!file) {
+		return;
+	}
+	try {
+		file->Sync();
+	} catch (std::exception &) {
+		file.reset();
+		hooks->Counters().Add("acl.audit.sink_errors", {{"sink", "file"}});
 	}
 }
 
@@ -314,6 +343,7 @@ void AuditPipeline::Stop() {
 	if (worker.joinable()) {
 		worker.join();
 	}
+	SyncFile();
 	std::lock_guard<std::mutex> guard(file_lock);
 	file.reset();
 }
@@ -337,6 +367,7 @@ string AuditEventJson(const AuditEvent &event) {
 	field("door", event.door);
 	field("session", event.session);
 	field("subject", event.principal.subject);
+	field("issuer", event.principal.issuer);
 	string roles = "[";
 	for (idx_t i = 0; i < event.principal.roles.size(); i++) {
 		roles += (i ? "," : "") + JsonQuote(event.principal.roles[i]);
@@ -463,9 +494,7 @@ void AuditEventsScan(ClientContext &, TableFunctionInput &data, DataChunk &outpu
 		output.data[col++].SetValue(count, NullableVarchar(event.door));
 		output.data[col++].SetValue(count, NullableVarchar(event.session));
 		output.data[col++].SetValue(count, NullableVarchar(event.principal.subject));
-		auto issuer = event.principal.claims.find("iss");
-		output.data[col++].SetValue(count,
-		                            NullableVarchar(issuer == event.principal.claims.end() ? "" : issuer->second));
+		output.data[col++].SetValue(count, NullableVarchar(event.principal.issuer));
 		vector<Value> roles;
 		for (auto &role : event.principal.roles) {
 			roles.emplace_back(role);
@@ -559,10 +588,11 @@ void AuditDroppedFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value::BIGINT(PipelineOf(state).Dropped()), count_t(args.size()));
 }
 
-//! acl_audit_flush(): wait until everything enqueued so far reached every sink (tests, shutdown)
+//! acl_audit_flush(): wait until everything enqueued so far reached every sink (tests, shutdown);
+//! false when the audit thread did not drain within the bound (a sink is stuck)
 void AuditFlushFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	PipelineOf(state).Flush();
-	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+	auto drained = PipelineOf(state).Flush();
+	result.Reference(Value::BOOLEAN(drained), count_t(args.size()));
 }
 
 //! acl_session_audit_level(id, level): the operator's per-session level (spec 069); '' inherits

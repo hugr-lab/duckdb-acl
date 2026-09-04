@@ -11,6 +11,7 @@
 
 #include "acl_flight_door.hpp"
 
+#include "acl_audit.hpp"
 #include "acl_flight_catalog.hpp"
 #include "duckdb/common/error_data.hpp"
 
@@ -1925,6 +1926,29 @@ void AclFlightStopFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 } // namespace
 
 void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
+	// the door's state gauge (spec 069): doors of this instance serving right now. Through the
+	// registry in the object cache, which exists before the pipeline is attached.
+	{
+		auto &db = loader.GetDatabaseInstance();
+		auto hooks = db.GetObjectCache().GetOrCreate<AuditHooks>(AuditHooks::ObjectType());
+		weak_ptr<DatabaseInstance> weak_db = db.shared_from_this();
+		hooks->Gauges().Register("acl.door.state", {{"door", "flight"}}, "1", "doors serving right now",
+		                         [weak_db]() -> int64_t {
+			                         auto locked = weak_db.lock();
+			                         if (!locked) {
+				                         return 0;
+			                         }
+			                         auto &doors = ServedDoors::Get();
+			                         std::lock_guard<std::mutex> guard(doors.lock);
+			                         int64_t count = 0;
+			                         for (auto &entry : doors.doors) {
+				                         if (entry.second.owner.lock().get() == locked.get()) {
+					                         count++;
+				                         }
+			                         }
+			                         return count;
+		                         });
+	}
 	auto v = LogicalType::VARCHAR;
 	auto register_door = [&](const string &name, vector<vector<LogicalType>> signatures, const scalar_function_t &fn,
 	                         bool special_nulls) {

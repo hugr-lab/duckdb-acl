@@ -19,6 +19,8 @@
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
 #include "duckdb/common/helper.hpp"
+
+#include <chrono>
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -211,6 +213,19 @@ void LoadInternal(ExtensionLoader &loader) {
 	pipeline->Attach(db);
 	store->audit = pipeline;
 	acl::RegisterAclAudit(loader, store, pipeline);
+	// the node's own gauges (spec 069): how long it has been up, and which build it is
+	{
+		string version;
+#ifdef EXT_VERSION_ACL
+		version = EXT_VERSION_ACL;
+#endif
+		auto loaded = std::chrono::steady_clock::now();
+		hooks->Gauges().Register("acl.node.uptime", {}, "s", "seconds since the extension loaded", [loaded]() {
+			return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - loaded).count();
+		});
+		hooks->Gauges().Register("acl.node.info", {{"version", version.empty() ? "dev" : version}}, "1",
+		                         "always 1; the build in the attributes", []() { return int64_t(1); });
+	}
 	// the store's own handle in the cache (weak): what PolicyStore::Of(db) answers to code that holds a
 	// connection and nothing else - the embedded quack server's drain thread (spec 069)
 	db.GetObjectCache().GetOrCreate<acl::PolicyStoreHandle>(acl::PolicyStoreHandle::ObjectType())->store = store;

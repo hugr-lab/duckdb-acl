@@ -85,11 +85,12 @@ FROM acl_audit_events() WHERE kind = 'session' AND detail IN ('opened', 'client'
 session	opened	allowed	session	u	NULL
 session	client	allowed	session	u	true
 
-# every event names the node and carries the level it belongs to; roles ride as a list
-query III
-SELECT node, level, roles FROM acl_audit_events() WHERE detail = 'opened';
+# every event names the node and carries the level it belongs to; roles ride as a list, and the
+# issuer that vouched for the subject stands beside it (two IdPs' subjects never merge)
+query IIII
+SELECT node, level, roles, issuer FROM acl_audit_events() WHERE detail = 'opened';
 ----
-node-under-test	all	[analyst]
+node-under-test	all	[analyst]	https://issuer.test/s
 
 # --- the counters are a state of the node: they count whatever the level recorded -----------------
 # three opens succeeded (one unrecorded at `decisions`), one was refused
@@ -121,6 +122,26 @@ query I
 SELECT value >= 0 FROM acl_metrics() WHERE name = 'acl.policy.version';
 ----
 true
+
+# the node's own states: up for a while, one build, no door serving in this test
+query III
+SELECT name, attributes LIKE '{"version":%', value >= 0 FROM acl_metrics()
+WHERE name IN ('acl.node.info', 'acl.node.uptime') ORDER BY name;
+----
+acl.node.info	true	true
+acl.node.uptime	false	true
+
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.door.state' AND attributes = '{"door":"quack"}';
+----
+0
+
+# every JWT verification is counted by its result: the two opens above verified, not-a-jwt is not
+# a JWT (the dev stub, nothing to verify)
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.jwt.verifications' AND attributes = '{"result":"ok"}';
+----
+2
 
 # every attribute key is from the bounded sets - a row naming a role, a subject or an object here is a
 # cardinality leak
@@ -227,7 +248,7 @@ SELECT acl_audit_flush();
 query IIII
 SELECT content LIKE '{"ts_us":%',
        content LIKE '%"kind":"session","statement":"","objects":[],"verdict":"denied","reason_code":"principal"%',
-       content LIKE '%"subject":"u","roles":["analyst"],"kind":"session"%',
+       content LIKE '%"subject":"u","issuer":"https://issuer.test/s","roles":["analyst"],"kind":"session"%',
        content LIKE '%"detail":"opened"}' || chr(10)
 FROM read_text('__TEST_DIR__/audit.jsonl');
 ----
@@ -508,6 +529,11 @@ source_error
 
 query I
 SELECT value FROM acl_metrics() WHERE name = 'acl.jwks.refreshes' AND attributes LIKE '%"result":"refresh_failed"%';
+----
+1
+
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.jwt.verifications' AND attributes = '{"result":"failed"}';
 ----
 1
 
