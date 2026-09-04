@@ -134,7 +134,19 @@ int main(int argc, char *argv[]) {
 			}
 			Exec(con, "SELECT acl_session_close('" + handle + "')");
 			FlushAudit(con);
-			auto events = sink->Snapshot();
+			// the setup's ACL ADMIN statements were decided at the default level and reached the sink
+			// too, as admin decisions; the session's own events are what this scenario reads
+			auto all = sink->Snapshot();
+			vector<acl::AuditEvent> events;
+			idx_t admin = 0;
+			for (auto &event : all) {
+				if (event.kind == "session") {
+					events.push_back(event);
+				} else if (event.kind == "admin" && event.allowed && event.level == acl::AuditLevel::DECISIONS) {
+					admin++;
+				}
+			}
+			Check(admin == 4, "the four management statements arrived as admin decisions: " + std::to_string(admin));
 			Check(events.size() == 2, "the open and the close reached the sink: " + std::to_string(events.size()));
 			if (events.size() == 2) {
 				Check(events[0].kind == "session" && events[0].detail == "opened", "first the open");
@@ -146,7 +158,7 @@ int main(int argc, char *argv[]) {
 				Check(events[0].recorded, "a sink only ever sees recorded events");
 				Check(!events[0].node.empty(), "the node is named on every event");
 			}
-			Check(sink->off_thread.load() == 2, "delivered on the audit thread, never the caller's");
+			Check(sink->off_thread.load() == all.size(), "delivered on the audit thread, never the caller's");
 		});
 
 		Scenario("a refusal is a denial, recorded at `denied`, counted either way", [&]() {

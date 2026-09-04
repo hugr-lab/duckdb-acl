@@ -510,6 +510,50 @@ bool PolicyStore::SessionKill(const string &id) {
 }
 
 string PolicyStore::SessionSql(const string &handle, const string &sql) {
+	return SessionSql(handle, sql, string(), string());
+}
+
+bool PolicyStore::SessionRefOf(const string &handle, SessionRef &out) {
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry == sessions.end()) {
+		return false;
+	}
+	out.id = entry->second.id;
+	out.door = entry->second.door;
+	out.audit_level = entry->second.audit_level;
+	return true;
+}
+
+void TraceFromContext(ClientContext &context, string &correlation_id, string &traceparent) {
+	Value value;
+	if (context.TryGetCurrentSetting("acl_correlation_id", value) && !value.IsNull()) {
+		correlation_id = value.ToString();
+	}
+	if (context.TryGetCurrentSetting("acl_traceparent", value) && !value.IsNull()) {
+		traceparent = value.ToString();
+	}
+}
+
+string TraceMarkers(const string &correlation_id, const string &traceparent) {
+	// bounded, and quoted the way every other prefix value is: a trace names a request, it does not
+	// carry a payload, and an id that could not fit a log line is not one
+	auto marker = [](const char *keyword, const string &value) {
+		auto bounded = value.size() > 256 ? value.substr(0, 256) : value;
+		return string(keyword) + " '" + StringUtil::Replace(bounded, "'", "''") + "' ";
+	};
+	string out;
+	if (!correlation_id.empty()) {
+		out += marker("TRACE", correlation_id);
+	}
+	if (!traceparent.empty()) {
+		out += marker("PARENT", traceparent);
+	}
+	return out;
+}
+
+string PolicyStore::SessionSql(const string &handle, const string &sql, const string &correlation_id,
+                               const string &traceparent) {
 	// Judge here rather than through SessionPrincipal, for one reason: SessionPrincipal *erases* a
 	// dead session on read, which would leave a follow-up SessionReason nothing to report but
 	// "unknown" (spec 054). This bumps the live session (using it keeps it alive - the idle rule of
@@ -530,7 +574,8 @@ string PolicyStore::SessionSql(const string &handle, const string &sql) {
 		return string();
 	}
 	entry->second.last_used = now;
-	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
+	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + TraceMarkers(correlation_id, traceparent) +
+	       sql;
 }
 
 void PolicyStore::SetDoorOpen(bool open) {
@@ -545,8 +590,11 @@ bool ClientSettingAllowed(const string &name) {
 	// TimeZone and Calendar (ICU) decide how a TIMESTAMPTZ and a date part are RENDERED for this
 	// client and nothing else: not what a name resolves to (search_path), not what is read
 	// (file_search_path, enable_external_access), not what a statement may cost (threads, memory).
-	// Everything outside this list stays refused; growing it is a spec, not a line.
-	return StringUtil::CIEquals(name, "TimeZone") || StringUtil::CIEquals(name, "Calendar");
+	// Everything outside this list stays refused; growing it is a spec, not a line. The two trace
+	// settings (spec 069) name the request a session's statements belong to, and change nothing
+	// about what a statement reads or costs.
+	return StringUtil::CIEquals(name, "TimeZone") || StringUtil::CIEquals(name, "Calendar") ||
+	       StringUtil::CIEquals(name, "acl_correlation_id") || StringUtil::CIEquals(name, "acl_traceparent");
 }
 
 bool PolicyStore::SetDraining(bool value) {

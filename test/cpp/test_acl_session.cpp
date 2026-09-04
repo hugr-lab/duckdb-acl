@@ -262,6 +262,16 @@ int main(int argc, char *argv[]) {
 		      "GLOBAL is refused on a session too");
 		auto computed = con.Query(prefix + "SET TimeZone = (SELECT 'Asia/Tokyo')");
 		Check(computed->HasError(), "a non-constant value is refused");
+		// the trace settings (spec 069) are on the same list: a session names its own request, and
+		// the door composes it into the prefix from that very connection
+		auto trace = con.Query(prefix + "SET acl_correlation_id = 'req-from-session'");
+		if (CheckOk(*trace, "a session sets its correlation id")) {
+			auto composed = con.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
+			auto text = composed->HasError() ? "ERROR: " + composed->GetError() : composed->GetValue(0, 0).ToString();
+			Check(text.find("TRACE 'req-from-session' SELECT 1") != std::string::npos,
+			      "...and the composed prefix carries it: " + text);
+			Exec(con, prefix + "RESET acl_correlation_id");
+		}
 		Exec(con, "SELECT acl_session_close('" + handle + "')");
 	});
 	Scenario("management and native SQL over a session are the session's scope, exactly (plan 2.2)", [&]() {

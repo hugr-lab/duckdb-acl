@@ -995,7 +995,10 @@ void AclSessionSqlFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		// SessionSql, not SessionPrincipal: the latter erases a dead session on read, which would
 		// leave the follow-up acl_session_reason nothing to report but "unknown" (spec 054). SessionSql
 		// composes for a live session (bumping it) and returns "" for a dead one without erasing it.
-		auto composed = StoreOf(state).SessionSql(handle, sql);
+		// the trace rides from the caller's own settings (spec 069): a gateway sets them per request
+		string correlation_id, traceparent;
+		TraceFromContext(state.GetContext(), correlation_id, traceparent);
+		auto composed = StoreOf(state).SessionSql(handle, sql, correlation_id, traceparent);
 		result.SetValue(row, composed.empty() ? Value() : Value(composed));
 	}
 }

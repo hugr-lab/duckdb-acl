@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "acl_audit.hpp"
 #include "acl_policy.hpp"
 
 namespace duckdb {
@@ -12,9 +13,52 @@ class SQLStatement;
 
 namespace acl {
 
+//! The bounded taxonomy every refusal names (spec 069): the one dimension a denial counter carries,
+//! beside the free text a client reads. Grows by a spec, never by a message.
+enum class Reason : uint8_t {
+	NO_ACCESS,
+	CAPABILITY,
+	READ_ONLY,
+	FUNCTION_DENIED,
+	STATEMENT_TYPE,
+	UNCHECKED_PREDICATE,
+	SETTING_DENIED,
+	PARSE,
+	PRINCIPAL,
+	MGMT_UNAUTHORIZED,
+	DDL_HOME,
+	DRAINING,
+	AT_CAPACITY,
+	SOURCE_ERROR,
+	UNAVAILABLE,
+	WRITE_POLICY,
+	POLICY_ERROR
+};
+const char *ReasonCode(Reason reason);
+
+//! Note the reason of the refusal about to be thrown. Thread-local, so a refusal thrown anywhere
+//! under the rewrite names its code without the exception carrying it: the override that catches
+//! the exception takes it back once, and a code nobody noted falls to the phase the override was in.
+void NoteDenyReason(Reason reason);
+//! The reason noted since the last take, cleared; empty when nothing was noted.
+string TakeDenyReason();
+
+//! What the rewrite of one batch decided, per statement (spec 069): the class, every object it
+//! touched with the capability the decision needed, and what the decision cost. The entry of the
+//! statement being rewritten is the last one, so a refusal thrown mid-walk leaves what was decided
+//! up to it.
+struct AuditTrail {
+	struct Statement {
+		string statement;
+		vector<AuditObject> objects;
+		int64_t rewrite_us = -1;
+	};
+	vector<Statement> statements;
+};
+
 //! Rewrite every statement of one ACL batch in place, under one verified principal
 void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Principal &principal,
-                       const ParserOptions &options, PolicyStore &store);
+                       const ParserOptions &options, PolicyStore &store, AuditTrail *trail = nullptr);
 
 //! Rewrite a policy template into a bindable form by baking every marker to NULL: used at write time
 //! to derive the column names and types of a query-defined object (spec 010). `expression` picks the

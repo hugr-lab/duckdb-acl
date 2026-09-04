@@ -257,6 +257,171 @@ true
 statement ok
 SET GLOBAL acl_audit_sink='';
 
+# --- statement decisions: who, what, which objects with which capability, and why not ------------
+
+statement ok
+SET GLOBAL acl_audit_level='decisions';
+
+statement ok
+SELECT acl_audit_flush();
+
+statement ok
+SET VARIABLE seq0 = (SELECT coalesce(max(seq), 0) FROM acl_audit_events());
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM c.orders;
+----
+0
+
+statement error
+ACL ROLE "analyst" INSERT INTO c.orders VALUES (1, 'x');
+----
+<REGEX>:.*insert on "c.orders" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM c.nothing;
+----
+<REGEX>:.*no access to object.*
+
+statement error
+ACL TOKEN 'not-a-jwt' SELECT 1;
+----
+<REGEX>:.*verification failed.*
+
+statement error
+ACL ROLE "analyst" SELEC 1;
+----
+<REGEX>:.*
+
+statement ok
+ACL ROLE "analyst" TRACE 'req-42' PARENT '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01' SELECT 1;
+
+statement ok
+ACL ADMIN CREATE ROLE reporter;
+
+statement ok
+ACL ADMIN SELECT 1;
+
+statement ok
+SELECT acl_audit_flush();
+
+# one event per statement decided: the class, the objects with the capability the decision needed
+# (named even when it was refused), and the code a denial counts under
+query IIIIII
+SELECT kind, statement, door, verdict, reason_code, objects
+FROM acl_audit_events() WHERE seq > getvariable('seq0') AND kind IN ('statement', 'admin') ORDER BY seq;
+----
+statement	select	gateway	allowed	NULL	[{'name': c.orders, 'capability': select}]
+statement	insert	gateway	denied	capability	[{'name': c.orders, 'capability': insert}]
+statement	select	gateway	denied	no_access	[]
+statement	NULL	gateway	denied	principal	[]
+statement	NULL	gateway	denied	parse	[]
+statement	select	gateway	allowed	NULL	[]
+admin	manage	admin	allowed	NULL	[{'name': acl_define_role, 'capability': manage}]
+admin	native	admin	allowed	NULL	[]
+
+# a denial carries our refusal text; a decision carries what it cost; the roles ride on both
+query IIII
+SELECT reason LIKE '%insert on "c.orders" is not allowed%', rewrite_us >= 0, roles, subject
+FROM acl_audit_events() WHERE seq > getvariable('seq0') AND statement = 'insert';
+----
+true	true	[analyst]	NULL
+
+# the trace the prefix carried is on the event, and on nothing else
+query II
+SELECT correlation_id, traceparent FROM acl_audit_events() WHERE seq > getvariable('seq0') AND correlation_id IS NOT NULL;
+----
+req-42	00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE seq > getvariable('seq0') AND kind = 'statement' AND correlation_id IS NULL;
+----
+5
+
+# the counters: decisions by verdict/kind/door/class, denials by code, admin statements by scope
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.decisions'
+  AND attributes LIKE '%"door":"gateway"%' AND attributes LIKE '%"kind":"statement"%'
+  AND attributes LIKE '%"statement":"select"%' AND attributes LIKE '%"verdict":"allowed"%';
+----
+2
+
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.denials' AND attributes = '{"reason_code":"capability","door":"gateway"}';
+----
+1
+
+query I
+SELECT sum(value) FROM acl_metrics() WHERE name = 'acl.admin.statements' AND attributes LIKE '%"scope":"anonymous"%';
+----
+2
+
+# at `denied` an allowed decision is counted but not recorded
+statement ok
+SET GLOBAL acl_audit_level='denied';
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM c.orders;
+----
+0
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE seq > getvariable('seq0') AND kind = 'statement' AND verdict = 'allowed';
+----
+2
+
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.decisions'
+  AND attributes LIKE '%"door":"gateway"%' AND attributes LIKE '%"kind":"statement"%'
+  AND attributes LIKE '%"statement":"select"%' AND attributes LIKE '%"verdict":"allowed"%';
+----
+3
+
+statement ok
+SET GLOBAL acl_audit_level='decisions';
+
+# --- the trace a door composes: the caller's own settings, in the prefix it writes ---------------
+
+statement ok
+SET acl_correlation_id = 'corr-7';
+
+statement ok
+SET VARIABLE h3 = (SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc'));
+
+query I
+SELECT acl_session_sql(getvariable('h3'), 'SELECT 1') LIKE 'ACL SESSION ''%'' TRACE ''corr-7'' SELECT 1';
+----
+true
+
+statement ok
+SET acl_traceparent = '00-abc-def-01';
+
+query I
+SELECT acl_session_sql(getvariable('h3'), 'SELECT 1') LIKE '%'' TRACE ''corr-7'' PARENT ''00-abc-def-01'' SELECT 1';
+----
+true
+
+statement ok
+RESET acl_correlation_id;
+
+statement ok
+RESET acl_traceparent;
+
+query I
+SELECT acl_session_sql(getvariable('h3'), 'SELECT 1') LIKE 'ACL SESSION ''%'' SELECT 1';
+----
+true
+
+# a per-statement prefix runs on a connection the gateway shares: a principal may not SET the trace
+# there (spec 068's rule); on a session of its own it may (acl_client_settings.test, the C++ session test)
+statement error
+ACL ROLE "analyst" SET acl_correlation_id = 'mine';
+----
+<REGEX>:.*SET.*
+
 # --- the surface is the operator's, never a principal's ------------------------------------------
 
 statement ok

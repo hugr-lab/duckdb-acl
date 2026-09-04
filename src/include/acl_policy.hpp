@@ -54,6 +54,13 @@ struct Principal {
 //! SetSessionOptions, so the two doors can never disagree about it.
 bool ClientSettingAllowed(const string &name);
 
+//! The trace a caller's context carries (spec 069): the client-local settings `acl_correlation_id`
+//! and `acl_traceparent`, which a client may SET on its own session and a door composes into the
+//! prefix. Empty when unset.
+void TraceFromContext(ClientContext &context, string &correlation_id, string &traceparent);
+//! The `TRACE '<id>' PARENT '<tp>' ` markers for a prefix, or empty when neither is set
+string TraceMarkers(const string &correlation_id, const string &traceparent);
+
 //! The exec-context seam (spec 050): the ClientContext of the connection a statement is being
 //! prepared on, stashed in a thread-local by a door that owns the Prepare call site (the Flight door
 //! does; quack's Prepare is quack's). The rewriter reads it to resolve session temp names
@@ -515,6 +522,19 @@ struct PolicyStore {
 	//! in front, or empty when the session is not usable. The whole outward contract of spec 040 in one
 	//! call, so that a second door composes it the same way the first one does rather than similarly.
 	string SessionSql(const string &handle, const string &sql);
+	//! The same, carrying the statement's trace (spec 069): `TRACE '<correlation id>'` and
+	//! `PARENT '<traceparent>'` ride between the handle and the SQL, so every event about the
+	//! statement names the request it belongs to. Empty values write no marker.
+	string SessionSql(const string &handle, const string &sql, const string &correlation_id, const string &traceparent);
+	//! What the audit says about a session (spec 069): its ops id, the door that opened it and its
+	//! own level. A lookup with no side effect - no idle bump, no erase - so an event can name a
+	//! session without keeping it alive.
+	struct SessionRef {
+		string id;
+		string door;
+		int8_t audit_level = -1;
+	};
+	bool SessionRefOf(const string &handle, SessionRef &out);
 	//! End a session. Idempotent: closing an unknown handle is not an error, since a door may retry.
 	void SessionClose(const string &handle);
 	//! Bind a door's connection id to a handle, and look one up. Binding an id that is already bound

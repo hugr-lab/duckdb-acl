@@ -1,8 +1,10 @@
 #include "acl_parser_override.hpp"
 
 #include "acl_admin_sql.hpp"
+#include "acl_audit_pipeline.hpp"
 #include "acl_rewriter.hpp"
 #include "acl_scan_util.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
 #include "duckdb/common/helper.hpp"
@@ -39,6 +41,10 @@ struct AclPrefix {
 	bool marked = false; // an explicit `ACL [NATIVE]` marker was written
 	string value;
 	string rest;
+	//! The statement's trace (spec 069): `TRACE '<correlation id>'` / `PARENT '<traceparent>'`,
+	//! written after the principal by whoever composes the prefix, carried onto every event about it
+	string correlation_id;
+	string traceparent;
 };
 
 AclPrefix ParseAclPrefix(const string &query) {
@@ -67,8 +73,28 @@ AclPrefix ParseAclPrefix(const string &query) {
 		scan = after_acl;
 		return AclPrefix::Mode::MANAGE;
 	};
+	//! Read the trace markers off the remainder, in either order: `[TRACE '<id>'] [PARENT '<tp>']`
+	auto read_trace = [&](idx_t &scan) {
+		for (;;) {
+			SkipWhitespace(query, scan);
+			auto saved = scan;
+			auto word = ReadWord(query, scan);
+			bool trace = StringUtil::CIEquals(word, "trace");
+			bool parent = StringUtil::CIEquals(word, "parent");
+			if (!trace && !parent) {
+				scan = saved;
+				return;
+			}
+			SkipWhitespace(query, scan);
+			if (scan >= query.size() || (query[scan] != '\'' && query[scan] != '"')) {
+				throw ParserException("acl_rewrite: ACL %s requires a quoted value", trace ? "TRACE" : "PARENT");
+			}
+			(trace ? prefix.correlation_id : prefix.traceparent) = ReadQuoted(query, scan);
+		}
+	};
 	if (StringUtil::CIEquals(mode, "admin")) {
 		prefix.kind = AclPrefix::Kind::ADMIN;
+		read_trace(pos);
 		// the gateway's own hatch: native by default, management when marked (or written bare)
 		auto marked = read_marker(pos);
 		prefix.marked = marked != AclPrefix::Mode::QUERY;
@@ -86,6 +112,7 @@ AclPrefix ParseAclPrefix(const string &query) {
 		}
 		prefix.kind = AclPrefix::Kind::INGEST;
 		prefix.value = ReadQuoted(query, pos);
+		read_trace(pos);
 		prefix.rest = query.substr(pos);
 		return prefix;
 	}
@@ -103,6 +130,7 @@ AclPrefix ParseAclPrefix(const string &query) {
 	}
 	prefix.kind = is_role ? AclPrefix::Kind::ROLE : (is_session ? AclPrefix::Kind::SESSION : AclPrefix::Kind::TOKEN);
 	prefix.value = ReadQuoted(query, pos);
+	read_trace(pos);
 	prefix.mode = read_marker(pos);
 	prefix.marked = prefix.mode != AclPrefix::Mode::QUERY;
 	prefix.rest = query.substr(pos);
@@ -146,6 +174,7 @@ void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &ou
 	if (prefix.kind == AclPrefix::Kind::SESSION || prefix.kind == AclPrefix::Kind::INGEST) {
 		string reason;
 		if (!store.SessionPrincipal(prefix.value, out, reason)) {
+			NoteDenyReason(Reason::PRINCIPAL);
 			throw BinderException("acl_rewrite: session %s", reason);
 		}
 		// a session is a connection of the client's own (spec 050), so a setting may live on it
@@ -155,8 +184,89 @@ void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &ou
 	}
 	bool is_token = prefix.kind == AclPrefix::Kind::TOKEN;
 	if (!store.VerifyPrincipal(is_token, prefix.value, out)) {
+		NoteDenyReason(Reason::PRINCIPAL);
 		throw BinderException("acl_rewrite: %s verification failed", is_token ? "token" : "role");
 	}
+}
+
+//! The audit's view of one prefixed batch (spec 069): filled as the override learns who and what,
+//! emitted once per statement decided - or once for the refusal that ended the batch, naming the
+//! statement it stopped at and what had been decided up to it. Every event is emitted whatever the
+//! level (the counters are a state of the node) and recorded only where the level says so.
+struct StatementAudit {
+	explicit StatementAudit(AuditPipeline *audit) : audit(audit) {
+		TakeDenyReason(); // a stale note from a refusal nobody audited must not name this one
+		proto.kind = "statement";
+		proto.door = "gateway";
+	}
+
+	AuditPipeline *audit;
+	AuditEvent proto; // what every event of the batch shares: door, session, principal, trace
+	int8_t session_level = -1;
+	AuditTrail trail;
+	//! What the override was doing when an exception nobody noted escaped: it names the code
+	Reason phase = Reason::PARSE;
+
+	//! The batch runs under a session: its door, its ops id and its own level name the events
+	void OnSession(PolicyStore &store, const string &handle) {
+		PolicyStore::SessionRef ref;
+		if (store.SessionRefOf(handle, ref)) {
+			proto.door = ref.door;
+			proto.session = ref.id;
+			session_level = ref.audit_level;
+		}
+	}
+
+	void Decided(const AuditTrail::Statement &stmt, bool allowed, const string &code, const string &reason) {
+		if (!audit) {
+			return;
+		}
+		AuditEvent event = proto;
+		event.level = allowed ? AuditLevel::DECISIONS : AuditLevel::DENIED;
+		event.recorded = audit->Records(event.level, session_level);
+		event.statement = stmt.statement;
+		event.objects = stmt.objects;
+		event.rewrite_us = stmt.rewrite_us;
+		event.allowed = allowed;
+		event.reason_code = code;
+		event.reason = reason;
+		audit->Emit(std::move(event));
+	}
+
+	void Allowed() {
+		for (auto &stmt : trail.statements) {
+			Decided(stmt, true, string(), string());
+		}
+	}
+
+	void Denied(const std::exception &ex) {
+		auto code = TakeDenyReason();
+		if (code.empty()) {
+			code = ReasonCode(phase);
+		}
+		AuditTrail::Statement last;
+		if (!trail.statements.empty()) {
+			last = trail.statements.back();
+		}
+		ErrorData error(ex);
+		Decided(last, false, code, error.RawMessage());
+	}
+};
+
+//! The admin function a compiled management statement calls (`SELECT acl_<fn>(...)`), or ""
+string MgmtCallName(SQLStatement &stmt) {
+	if (stmt.type != StatementType::SELECT_STATEMENT) {
+		return string();
+	}
+	auto &node = *stmt.Cast<SelectStatement>().node;
+	if (node.type != QueryNodeType::SELECT_NODE) {
+		return string();
+	}
+	auto &select = node.Cast<SelectNode>();
+	if (select.select_list.size() != 1 || select.select_list[0]->GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return string();
+	}
+	return select.select_list[0]->Cast<FunctionExpression>().FunctionName().GetIdentifierName();
 }
 
 //! Is `name_lower` *called* anywhere in the query - the identifier followed by its open parenthesis?
@@ -281,9 +391,11 @@ string ExtractStreamId(const string &query) {
 //!
 //! Every step that does not succeed throws: the rewrite is the exception here and the refusal is the
 //! rule, which is the opposite of how the rest of the override reads.
-ParserOverrideResult DrainStreamUnderPrincipal(PolicyStore &store, const string &query, ParserOptions &options) {
+ParserOverrideResult DrainStreamUnderPrincipal(PolicyStore &store, const string &query, ParserOptions &options,
+                                               StatementAudit &audit) {
 	static constexpr const char *REFUSED = "acl: a streamed insert carries no principal, so it would be written "
 	                                       "outside the policy";
+	audit.phase = Reason::PRINCIPAL;
 	auto stream_id = ExtractStreamId(query);
 	if (stream_id.empty()) {
 		throw BinderException("%s (its stream is not one this door opened)", REFUSED);
@@ -297,6 +409,7 @@ ParserOverrideResult DrainStreamUnderPrincipal(PolicyStore &store, const string 
 	if (!store.SessionHandleFor(connection_id, handle)) {
 		throw BinderException("%s (its connection has no session)", REFUSED);
 	}
+	audit.OnSession(store, handle);
 	Principal principal;
 	string reason;
 	if (!store.SessionPrincipal(handle, principal, reason)) {
@@ -305,7 +418,9 @@ ParserOverrideResult DrainStreamUnderPrincipal(PolicyStore &store, const string 
 	// the one exemption this path carries, and it is bound to this exact stream: the principal may
 	// read the source the server is filling for it, and no other
 	principal.ingest_stream = stream_id;
+	audit.proto.principal = principal;
 
+	audit.phase = Reason::PARSE;
 	vector<unique_ptr<SQLStatement>> statements;
 	{
 		AclParseGuard guard;
@@ -315,29 +430,15 @@ ParserOverrideResult DrainStreamUnderPrincipal(PolicyStore &store, const string 
 		parser.ParseQuery(query);
 		statements = std::move(parser.statements);
 	}
-	RewriteStatements(statements, principal, options, store);
+	audit.phase = Reason::POLICY_ERROR;
+	RewriteStatements(statements, principal, options, store, &audit.trail);
 	return ParserOverrideResult(std::move(statements));
 }
 
-ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &query, ParserOptions &options) {
-	if (InAclParse()) {
-		return ParserOverrideResult(); // our own inner parse: decline, and let the others try
-	}
-	auto prefix = ParseAclPrefix(query);
-	if (prefix.kind == AclPrefix::Kind::NONE) {
-		// The one thing we do to a statement nobody prefixed - and only while a door of ours is open.
-		// The refusal exists because a client *we serve* caused the statement; with no door open, a
-		// plain quack server's ingest is its own business, and taking it would mean anyone who merely
-		// loads this extension loses quack's bulk loading (spec 043, found by the throughput benchmark,
-		// whose un-ACL'd baseline could not load at all).
-		auto &store = *info->Cast<AclParserInfo>().store;
-		if (store.DoorOpen() && DrainsQuackClientStream(query)) {
-			return DrainStreamUnderPrincipal(store, query, options);
-		}
-		return ParserOverrideResult(); // fall through to the native parser
-	}
-	auto &store = *info->Cast<AclParserInfo>().store;
-
+//! One prefixed batch, decided. Every refusal throws; the caller turns the outcome into the audit's
+//! events, so this only has to say what it is doing (`audit.phase`) and whom it is doing it for.
+ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, ParserOptions &options,
+                              StatementAudit &audit) {
 	auto mode = prefix.mode;
 	bool anonymous = prefix.kind == AclPrefix::Kind::ADMIN;
 	if (anonymous && !prefix.marked && IsMgmtStart(prefix.rest)) {
@@ -351,28 +452,50 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 	rights.scope = AdminScope::PASSTHROUGH; // the anonymous hatch is god mode by definition
 	rights.unrestricted_manage = true;
 	if (anonymous) {
+		audit.proto.door = "admin";
+		audit.proto.detail = "anonymous";
 		if (!store.AnonymousAdminAllowed()) {
+			NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
 			throw BinderException("acl admin: a bare ACL ADMIN is disabled - authenticate the principal "
 			                      "(ACL TOKEN '<jwt>' ACL ...) or SET GLOBAL acl_allow_anonymous_admin=true");
 		}
 	} else if (mode != AclPrefix::Mode::QUERY) {
 		// leaving the virtual catalog - as management or as native SQL - is a granted capability
+		audit.phase = Reason::PRINCIPAL;
 		ResolvePrincipal(store, prefix, principal);
+		audit.proto.principal = principal;
 		rights = store.AdminRightsOf(principal);
+		audit.proto.detail = rights.scope == AdminScope::PASSTHROUGH ? "passthrough" : "manage";
 		if (rights.scope == AdminScope::NONE) {
+			NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
 			throw BinderException("acl admin: the principal has no ACL administration scope");
 		}
+	}
+	if (mode != AclPrefix::Mode::QUERY) {
+		audit.proto.kind = "admin"; // management, or native SQL outside the virtual catalog
 	}
 
 	if (mode == AclPrefix::Mode::MANAGE) {
 		// the management grammar (spec 008): compiled to admin-function calls, no native parse
+		audit.phase = Reason::PARSE;
 		auto statements = ParseMgmtBatch(prefix.rest);
+		for (auto &stmt : statements) {
+			audit.trail.statements.emplace_back();
+			audit.trail.statements.back().statement = "manage";
+			audit.trail.statements.back().objects.push_back(AuditObject {MgmtCallName(*stmt), "manage"});
+		}
+		audit.phase = Reason::MGMT_UNAUTHORIZED;
 		AuthorizeMgmt(statements, rights);
 		return ParserOverrideResult(std::move(statements));
 	}
-	if (mode == AclPrefix::Mode::NATIVE && rights.scope != AdminScope::PASSTHROUGH) {
-		// a manage scope administers the ACL; running SQL outside the virtual catalog is god mode
-		throw BinderException("acl admin: native SQL outside the virtual catalog requires a passthrough scope");
+	if (mode == AclPrefix::Mode::NATIVE) {
+		audit.trail.statements.emplace_back();
+		audit.trail.statements.back().statement = "native";
+		if (rights.scope != AdminScope::PASSTHROUGH) {
+			// a manage scope administers the ACL; running SQL outside the virtual catalog is god mode
+			NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
+			throw BinderException("acl admin: native SQL outside the virtual catalog requires a passthrough scope");
+		}
 	}
 
 	// Re-parse the remainder. Foreign syntax reaches this parse two ways (spec 067), and both stay
@@ -387,6 +510,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 	// rewriter walks node by node - unknown nodes denied - through this same call, unchanged.
 	// `in_acl_parse` keeps *this* override out of its own inner parse, so a nested `ACL …` prefix
 	// stays unparseable.
+	audit.phase = Reason::PARSE;
 	ParserOptions inner = options;
 	if (mode != AclPrefix::Mode::NATIVE) {
 		inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
@@ -403,9 +527,12 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		return ParserOverrideResult(std::move(statements)); // no rewrite: the native context
 	}
 
+	audit.phase = Reason::PRINCIPAL;
 	ResolvePrincipal(store, prefix, principal);
+	audit.proto.principal = principal;
 
 	if (prefix.kind == AclPrefix::Kind::INGEST) {
+		audit.proto.detail = "ingest";
 		// the ingest prefix carries the door's own composed statement and nothing else (spec 049):
 		// one statement, of exactly two shapes - the append INSERT, or the CREATE TABLE that stages
 		// into the session (spec 050) or creates/replaces in a granted home (spec 051). Anything
@@ -417,13 +544,60 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 			create_form = info && info->type == CatalogType::TABLE_ENTRY;
 		}
 		if (!insert_form && !create_form) {
+			NoteDenyReason(Reason::STATEMENT_TYPE);
 			throw BinderException(
 			    "acl_rewrite: the ingest prefix carries exactly one INSERT or CREATE TABLE statement");
 		}
 		principal.arrow_ingest = true;
 	}
-	RewriteStatements(statements, principal, options, store);
+	audit.phase = Reason::POLICY_ERROR; // an unnoted failure under the rewrite is the policy's
+	RewriteStatements(statements, principal, options, store, &audit.trail);
 	return ParserOverrideResult(std::move(statements));
+}
+
+ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &query, ParserOptions &options) {
+	if (InAclParse()) {
+		return ParserOverrideResult(); // our own inner parse: decline, and let the others try
+	}
+	auto &store = *info->Cast<AclParserInfo>().store;
+	auto prefix = ParseAclPrefix(query);
+	if (prefix.kind == AclPrefix::Kind::NONE) {
+		// The one thing we do to a statement nobody prefixed - and only while a door of ours is open.
+		// The refusal exists because a client *we serve* caused the statement; with no door open, a
+		// plain quack server's ingest is its own business, and taking it would mean anyone who merely
+		// loads this extension loses quack's bulk loading (spec 043, found by the throughput benchmark,
+		// whose un-ACL'd baseline could not load at all).
+		if (store.DoorOpen() && DrainsQuackClientStream(query)) {
+			StatementAudit audit(store.audit.get());
+			audit.proto.detail = "drain";
+			try {
+				auto result = DrainStreamUnderPrincipal(store, query, options, audit);
+				audit.Allowed();
+				return result;
+			} catch (std::exception &ex) {
+				audit.Denied(ex);
+				throw;
+			}
+		}
+		return ParserOverrideResult(); // fall through to the native parser
+	}
+
+	// the decision is audited whatever happens to it (spec 069): one event per statement decided, or
+	// one for the refusal - the events are emitted here, after the decision, never on its path
+	StatementAudit audit(store.audit.get());
+	audit.proto.correlation_id = prefix.correlation_id;
+	audit.proto.traceparent = prefix.traceparent;
+	if (prefix.kind == AclPrefix::Kind::SESSION || prefix.kind == AclPrefix::Kind::INGEST) {
+		audit.OnSession(store, prefix.value); // known before anything is judged: a parse error names it too
+	}
+	try {
+		auto result = Prefixed(store, prefix, options, audit);
+		audit.Allowed();
+		return result;
+	} catch (std::exception &ex) {
+		audit.Denied(ex);
+		throw;
+	}
 }
 
 } // namespace

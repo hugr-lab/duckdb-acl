@@ -157,7 +157,7 @@ void AclQuackAuthenticateFunc(DataChunk &args, ExpressionState &state, Vector &r
 		auto session_id = RequiredArg(args, 0, row, "acl_quack_authenticate", "session id");
 		auto token = RequiredArg(args, 1, row, "acl_quack_authenticate", "client token");
 		auto &store = StoreOf(state);
-		auto handle = store.SessionOpen(token);
+		auto handle = store.SessionOpen(token, "quack");
 		if (handle.empty()) {
 			result.SetValue(row, Value::BOOLEAN(false));
 			continue;
@@ -188,8 +188,11 @@ void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &resu
 			result.SetValue(row, Value());
 			continue;
 		}
-		// SessionSql is the one place the prefix is composed, so every door spells it the same way
-		auto prefixed = store.SessionSql(handle, sql);
+		// SessionSql is the one place the prefix is composed, so every door spells it the same way;
+		// the trace is whatever the client SET on its connection (spec 069)
+		string correlation_id, traceparent;
+		TraceFromContext(state.GetContext(), correlation_id, traceparent);
+		auto prefixed = store.SessionSql(handle, sql, correlation_id, traceparent);
 		result.SetValue(row, prefixed.empty() ? Value() : Value(prefixed));
 	}
 }

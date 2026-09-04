@@ -98,6 +98,14 @@ void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("acl_metrics_endpoint",
 	                          "acl: serve GET /metrics (Prometheus text) on the embedded quack listener",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
+	// the two client-local trace settings (spec 069): session scope, and the one pair a principal may
+	// SET on a session of its own (spec 068's allowlist) - a door composes them into the prefix
+	config.AddExtensionOption("acl_correlation_id",
+	                          "acl: the correlation id the audit events of this session's statements carry",
+	                          LogicalType::VARCHAR, Value(""));
+	config.AddExtensionOption("acl_traceparent",
+	                          "acl: the W3C traceparent the audit events of this session's statements carry",
+	                          LogicalType::VARCHAR, Value(""));
 	config.AddExtensionOption("acl_jwks_refresh_interval",
 	                          "acl: seconds a fetched JWKS is used before it is read again (spec 023)",
 	                          LogicalType::BIGINT, Value::BIGINT(300), nullptr, SetScope::GLOBAL);
