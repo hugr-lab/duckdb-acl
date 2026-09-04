@@ -54,7 +54,7 @@ One record per decision:
 | `session` | VARCHAR | the ops id `acl_sessions()` shows - never the handle - or NULL |
 | `subject`, `issuer`, `roles` | VARCHAR, VARCHAR, VARCHAR[] | the principal; the `ROLE` form has roles only |
 | `kind` | VARCHAR | `statement`, `admin`, `session`, `ingest`, `door`, `policy`, `keys` |
-| `statement` | VARCHAR | the class: `SELECT`, `INSERT`, `CREATE TABLE`, `MANAGEMENT`, `NATIVE`, … - never the text |
+| `statement` | VARCHAR | the class, duckdb's statement type lowercased (`select`, `insert`, `create`, `set`, …), or `manage` / `native` for the two admin forms - never the text |
 | `objects` | STRUCT(name VARCHAR, capability VARCHAR)[] | every virtual object the resolution touched, with the capability judged for it |
 | `verdict` | VARCHAR | `allowed` or `denied` |
 | `reason_code` | VARCHAR | on `denied`: one of a bounded set (below) - the dimension a metric can carry |
@@ -69,7 +69,19 @@ One record per decision:
 **Reason codes** (the taxonomy every `Deny` site names; the text after the prefix stays free):
 `no_access`, `capability`, `read_only`, `function_denied`, `statement_type`, `unchecked_predicate`,
 `setting_denied`, `parse`, `principal` (a token, role or session that did not verify),
-`mgmt_unauthorized`, `ddl_home`, `draining`, `at_capacity`, `source_error`.
+`mgmt_unauthorized`, `ddl_home`, `draining`, `at_capacity`, `source_error` (the policy source or an
+issuer's keys did not answer), `unavailable`, `write_policy` (a row refused where it is written,
+spec 024, or by the door's own load check), `policy_error` (a template or a policy row the rewriter
+could not use - the operator's, not the principal's; also the fallback for a failure under the
+rewrite that named no code).
+
+**What a reason may carry.** The `reason` is our own refusal text, which names virtual objects,
+capabilities, functions and settings and nothing else - with three exceptions the audit closes
+itself: a `parse` refusal echoes the statement's text at or near the error (a literal in it could be
+a secret), so it is replaced by a fixed sentence; a `principal` refusal may echo a claim of a token
+nobody verified (its issuer, its algorithm), so every quoted value is blanked; an `ingest` failure
+that is the physical source's carries the row it refused, so only the error's class is kept. Every
+reason is cut to 512 bytes, every trace id to 128, on a character boundary.
 
 **The stream is sufficient by design**: everything a consumer might count is in the events - a
 decision with its code, a session's open and close with how and how long, an ingest with its rows, a
@@ -109,8 +121,11 @@ client-local allowlist.
   with the objects, or `denied` with the refusal. One event covers a whole batch only when it is
   refused before any statement is walked (a prefix that does not parse, a principal that does not
   verify).
-- **`AuthorizeMgmt`**: kind `admin`, `statement` = `MANAGEMENT`, objects = the catalogs targeted,
-  verdict per batch (a management batch is authorized as one - spec 009).
+- **`AuthorizeMgmt`**: kind `admin`, `statement` = `manage`, one event per compiled call with the
+  admin function it is (`objects` = `[{acl_add_relation, manage}]`), `detail` = the scope it ran under
+  (anonymous / manage / passthrough); a refused batch is one event naming every call in it (a
+  management batch is authorized as one - spec 009). `ACL NATIVE` is kind `admin`, `statement` =
+  `native`.
 - **`SessionOpen`** and the doors: kind `session` at level `all` - opened, refused with the reason a
   client never sees (`token rejected: …`, `draining`, `at acl_max_sessions`), expired, killed. Kind
   `door` for the password handshake and its refusals (spec 064).
@@ -207,8 +222,9 @@ The base keeps **counters and gauges only** - no histograms, no per-role or per-
 every distribution (rewrite latency, session duration, rows per ingest) and every high-cardinality
 breakdown is the extension's, derived from the event stream, with the buckets and the limits of its
 own choosing (the owner's decision, 2026-09-04). What the base counts it counts with attributes
-from bounded sets only: `door` ∈ {flight, quack, gateway, admin}, `kind`, `verdict`, the statement
-class, `reason_code`, `result`, the issuer, a door's uri.
+from bounded sets only: `door` ∈ {flight, quack, gateway, admin, session (a session minted through
+`acl_session_open` by a gateway)}, `kind`, `verdict`, the statement class, `reason_code`, `result`,
+the issuer.
 
 `acl_metrics()` is a table function over `AuditHooks::Counters()` and `Gauges()`:
 `name`, `kind` (`counter` / `gauge`), `attributes` (a JSON object), `value`, `unit`, `description`.
@@ -223,16 +239,19 @@ The OTel extension reads the same two structs directly in C++ on its own scrape 
 | `acl.ingest.statements` | `door`, `verdict` |
 | `acl.admin.statements` | `verdict`, `scope`: anonymous / manage / passthrough |
 | `acl.policy.reloads`, `acl.policy.source_errors`, `acl.policy.writes` | - |
-| `acl.policy.cache` | `cache`: objects / functions / gates / rights, `result`: hit / miss |
-| `acl.jwt.verifications` | `result`: ok / expired / bad_signature / unknown_kid / unknown_issuer / no_roles |
-| `acl.jwks.refreshes` | `issuer`, `result` |
-| `acl.audit.events`, `acl.audit.dropped` (`where`: queue / ring / sink), `acl.audit.sink_errors` (`sink`) | - |
+| `acl.jwt.verifications` | `result`: ok / failed (why it failed is the refusal's `reason_code` on the session or statement event) |
+| `acl.jwks.refreshes` | `issuer`, `result`: refreshed / refresh_failed |
+| `acl.audit.events`, `acl.audit.dropped` (`where`: queue / ring / sink / rate_limit), `acl.audit.sink_errors` (`sink`) | - |
+
+(A cache hit/miss counter for the catalog backend's caches was considered and left out of the base:
+the version gauge and the reload counter say when the caches were rebuilt, which is what an incident
+needs; a hit ratio is a tuning figure the extension can derive if it ever wants one.)
 
 | gauge | what |
 | --- | --- |
 | `acl.sessions.live` (`door`), `acl.sessions.max` | the session map against its cap |
-| `acl.door.state` (`door`, `uri`) | 1 serving, 0 draining |
-| `acl.node.draining`, `acl.node.uptime`, `acl.node.info` (=1; attributes: acl version, duckdb version, node id) | the node |
+| `acl.door.state` (`door`) | listeners of this instance serving right now (a uri is not a bounded set) |
+| `acl.node.draining`, `acl.node.uptime`, `acl.node.info` (=1; attribute: the acl build version) | the node; the node id is on every row already |
 | `acl.policy.version` | the policy version the caches are keyed by - to correlate an incident with a change |
 | `acl.policy.staleness` | seconds since the last successful version check: it grows when the source is unreachable |
 | `acl.jwks.age` (`issuer`) | seconds since the issuer's keys were last read successfully |
@@ -286,7 +305,9 @@ The caller supplies them; the node never invents one. Three ways in, two fields 
 
 - a **prefix marker** for a gateway, which shares a connection between principals and cannot afford
   a `SET` per statement: `ACL TOKEN '…' TRACE '<correlation>' [PARENT '<traceparent>'] <sql>` (and
-  after `ROLE`/`SESSION`), each up to 128 printable bytes, single quotes doubled;
+  after `ROLE`/`SESSION`), each up to 128 printable bytes, single quotes doubled, each marker at
+  most once - a second one written in the SQL text behind a door's prefix is a parse refusal, not
+  a replacement;
 - a **client-local setting** for a served session (spec 068's allowlist grows by two):
   `SET acl_correlation_id = '…'` and `SET acl_traceparent = '…'`, stamped on every statement of that
   session until changed;
@@ -308,7 +329,16 @@ extension does can slow or stop a decision.
 Composing an event is a handful of small strings and one queue push under a mutex; everything else
 is on the audit thread. Against the 25–70 µs the rewrite itself costs (spec 043's measurement) this
 is noise at `decisions`; `test/bench/rewrite_cost.py` gets a column for "with audit" to keep it
-honest, and a level of `off` removes even the composition.
+honest. A level of `off` still composes and counts (the counters are a state of the node whatever
+the level) - it records nothing.
+
+**One source cannot drown the others.** A refusal is cheap to cause and an event each, so a
+principal - or an unauthenticated client presenting refused tokens - could push everybody else's
+records out of the ring, the queue and every sink. The base records at most
+`acl_audit_denials_per_second` (default 100) denials per second per source - a session, else a
+principal, else a door; the rest are counted exactly like the recorded ones (`acl.denials` stays
+true) and reported as `acl.audit.dropped{where=rate_limit}`. Allowed decisions are bounded by the
+work they cost and are not limited.
 
 ### What it is not
 
@@ -328,8 +358,11 @@ of what was recorded. Not an OTel SDK dependency in this repo.
   like any extension. It sees claim values in memory; what it stores or exports is its own contract.
 - Fail-open by design in the base: a dropped event is counted, never a refused statement. A strict
   mode is a sink's policy, not the base's.
-- The correlation and trace ids are the caller's strings, untrusted: bounded in length,
-  JSON-escaped on the way out (`JsonQuote`), never interpreted.
+- The correlation and trace ids are the caller's strings, untrusted: bounded in length (128 bytes,
+  cut on a character boundary, control characters dropped), JSON-escaped on the way out
+  (`JsonQuote`), never interpreted. On quack the client's `SET acl_correlation_id` lands on the
+  session's record (the server evaluates the composition on a connection of its own), on Flight the
+  headers win over the session's settings.
 
 ## Testing
 

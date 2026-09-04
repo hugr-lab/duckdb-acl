@@ -1461,6 +1461,9 @@ int64_t PolicyStore::MaxSessions() {
 }
 
 int64_t PolicyStore::PolicyVersion() {
+	// the store's lock first: a gauge reader is not a statement, and acl_use_db may be swapping the
+	// backend under it (the 2026-09-04 review)
+	lock_guard<mutex> store_guard(lock);
 	if (!catalog) {
 		return -1;
 	}
@@ -1469,6 +1472,7 @@ int64_t PolicyStore::PolicyVersion() {
 }
 
 int64_t PolicyStore::PolicyStalenessSeconds() {
+	lock_guard<mutex> store_guard(lock);
 	if (!catalog) {
 		return -1;
 	}
@@ -1549,6 +1553,7 @@ string PolicyStore::ResolveIssuerKeys(const IssuerConfig &config, const string &
 	// issuer that has been unreachable for a day says nothing about a key that may have been revoked
 	auto max_stale = JwksMaxStale();
 	if (!entry.error.empty() && (max_stale <= 0 || now - entry.fetched_at > max_stale)) {
+		NoteDenyReason(Reason::SOURCE_ERROR); // the same cause as above: the keys' source, not the principal
 		throw BinderException("acl_rewrite: token rejected: the keys of issuer \"%s\" were last read %lld seconds "
 		                      "ago and \"%s\" is still unreadable (%s); acl_jwks_max_stale is %lld",
 		                      config.issuer, static_cast<long long>(now - entry.fetched_at), config.jwks_uri,

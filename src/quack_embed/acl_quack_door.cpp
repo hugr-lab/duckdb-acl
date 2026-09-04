@@ -246,6 +246,18 @@ void AclQuackDrainCompleted(Connection &connection, const string &stream_id, Mat
 }
 
 void RegisterAclQuackDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
+	// the door's state gauge (spec 069): listeners of this instance serving right now. Through the
+	// registry in the object cache, which exists before the pipeline is attached.
+	{
+		auto &db = loader.GetDatabaseInstance();
+		auto hooks = db.GetObjectCache().GetOrCreate<AuditHooks>(AuditHooks::ObjectType());
+		weak_ptr<DatabaseInstance> weak_db = db.shared_from_this();
+		hooks->Gauges().Register("acl.door.state", {{"door", "quack"}}, "1", "listeners serving right now",
+		                         [weak_db]() -> int64_t {
+			                         auto locked = weak_db.lock();
+			                         return locked ? int64_t(AclQuackServerCount(*locked)) : 0;
+		                         });
+	}
 	const LogicalType &v = LogicalType::VARCHAR;
 	auto register_text = [&](const string &name, vector<vector<LogicalType>> signatures, const scalar_function_t &fn) {
 		ScalarFunctionSet set((Identifier(name)));

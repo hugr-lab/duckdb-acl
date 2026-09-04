@@ -291,9 +291,15 @@ Hooks live in the ObjectCache (`AuditHooks`, `GetOrCreate` by type string — no
 symbol: a loadable extension is RTLD_LOCAL) so `acl_otel` (separate repo,
 `specs/069-audit/extension-requirements.md`) registers sinks and a `SessionPolicy` without
 linking acl. Trace: `TRACE '<id>' [PARENT '<tp>']` prefix markers, composed by every door from
-`acl_correlation_id` / `acl_traceparent` (session-scoped, on spec 068's allowlist) or Flight's
-`x-correlation-id` / `traceparent` headers. Never a claim value, a handle or statement text on an
-event; metric attributes from bounded sets only.
+`acl_correlation_id` / `acl_traceparent` (session-scoped, on spec 068's allowlist; a session's
+value also lands on its record, since quack composes on a server connection) or Flight's
+`x-correlation-id` / `traceparent` headers; each marker once. Never a claim value, a handle or
+statement text on an event: a `parse` reason is a fixed sentence, a `principal` reason has its
+quoted values blanked, a source's ingest error keeps only its class (`AuditReasonText`,
+`AuditIngest`); reasons ≤512 bytes, traces ≤128. `acl_audit_denials_per_second` (100) bounds the
+recorded refusals per source (counted regardless). Metric attributes from bounded sets only. The
+pipeline's worker never holds the instance (settings and the file are the emitting thread's);
+`PolicyStoreHandle`'s destructor in the object cache is the shutdown seam.
 
 ## Working process — per-feature specs
 

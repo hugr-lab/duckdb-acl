@@ -73,8 +73,12 @@ AclPrefix ParseAclPrefix(const string &query) {
 		scan = after_acl;
 		return AclPrefix::Mode::MANAGE;
 	};
-	//! Read the trace markers off the remainder, in either order: `[TRACE '<id>'] [PARENT '<tp>']`
+	//! Read the trace markers off the remainder, in either order: `[TRACE '<id>'] [PARENT '<tp>']`.
+	//! Each at most once: the one the door or the gateway composed is the statement's, and a second
+	//! one written in the SQL text behind it must not replace it (the 2026-09-04 review).
 	auto read_trace = [&](idx_t &scan) {
+		bool seen_trace = false;
+		bool seen_parent = false;
 		for (;;) {
 			SkipWhitespace(query, scan);
 			auto saved = scan;
@@ -85,6 +89,11 @@ AclPrefix ParseAclPrefix(const string &query) {
 				scan = saved;
 				return;
 			}
+			if (trace ? seen_trace : seen_parent) {
+				throw ParserException("acl_rewrite: ACL %s may be written once in a prefix",
+				                      trace ? "TRACE" : "PARENT");
+			}
+			(trace ? seen_trace : seen_parent) = true;
 			SkipWhitespace(query, scan);
 			if (scan >= query.size() || (query[scan] != '\'' && query[scan] != '"')) {
 				throw ParserException("acl_rewrite: ACL %s requires a quoted value", trace ? "TRACE" : "PARENT");
@@ -180,6 +189,10 @@ void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &ou
 		// a session is a connection of the client's own (spec 050), so a setting may live on it
 		// (spec 068); the ingest prefix carries the door's composed INSERT and sets nothing
 		out.session_connection = prefix.kind == AclPrefix::Kind::SESSION;
+		PolicyStore::SessionRef ref;
+		if (store.SessionRefOf(prefix.value, ref)) {
+			out.session = ref.id; // the ops id, for what the statement records about its session
+		}
 		return;
 	}
 	bool is_token = prefix.kind == AclPrefix::Kind::TOKEN;
@@ -213,6 +226,7 @@ struct StatementAudit {
 		if (store.SessionRefOf(handle, ref)) {
 			proto.door = ref.door;
 			proto.session = ref.id;
+			proto.principal = ref.principal; // known before anything is judged: a parse refusal names it too
 			session_level = ref.audit_level;
 		}
 	}
@@ -247,9 +261,17 @@ struct StatementAudit {
 		AuditTrail::Statement last;
 		if (!trail.statements.empty()) {
 			last = trail.statements.back();
+			if (proto.kind == "admin") {
+				// a management batch is authorized as a whole: the refusal names every call in it
+				// rather than whichever happened to be compiled last
+				last.objects.clear();
+				for (auto &stmt : trail.statements) {
+					last.objects.insert(last.objects.end(), stmt.objects.begin(), stmt.objects.end());
+				}
+			}
 		}
 		ErrorData error(ex);
-		Decided(last, false, code, error.RawMessage());
+		Decided(last, false, code, AuditReasonText(code, error.RawMessage()));
 	}
 };
 
@@ -415,6 +437,7 @@ ParserOverrideResult DrainStreamUnderPrincipal(PolicyStore &store, const string 
 	if (!store.SessionPrincipal(handle, principal, reason)) {
 		throw BinderException("%s (its session is %s)", REFUSED, reason.empty() ? "not usable" : reason.c_str());
 	}
+	principal.session = audit.proto.session;
 	// the one exemption this path carries, and it is bound to this exact stream: the principal may
 	// read the source the server is filling for it, and no other
 	principal.ingest_stream = stream_id;
@@ -560,7 +583,16 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		return ParserOverrideResult(); // our own inner parse: decline, and let the others try
 	}
 	auto &store = *info->Cast<AclParserInfo>().store;
-	auto prefix = ParseAclPrefix(query);
+	AclPrefix prefix;
+	try {
+		prefix = ParseAclPrefix(query);
+	} catch (std::exception &ex) {
+		// a prefix that does not scan (an unterminated quote, a bare ACL TOKEN) is a refusal too, and
+		// counted as one: nobody is known yet, so it is the gateway's, and a parse
+		StatementAudit audit(store.audit.get());
+		audit.Denied(ex);
+		throw;
+	}
 	if (prefix.kind == AclPrefix::Kind::NONE) {
 		// The one thing we do to a statement nobody prefixed - and only while a door of ours is open.
 		// The refusal exists because a client *we serve* caused the statement; with no door open, a

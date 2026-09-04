@@ -19,6 +19,8 @@
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
 #include "duckdb/common/helper.hpp"
+
+#include <chrono>
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -78,10 +80,20 @@ void LoadInternal(ExtensionLoader &loader) {
 	// the audit (spec 069): the instance's level, the pipeline's bounds, the base file sink, the node's
 	// name on every event, the Prometheus rendering on the embedded listener - all read through the
 	// instance by the audit thread and the emitting seams, so GLOBAL
-	config.AddExtensionOption("acl_audit_level",
-	                          "acl: what is recorded - off, denied (refusals only), decisions (every "
-	                          "statement/admin/ingest decision), all (plus the session and door lifecycle)",
-	                          LogicalType::VARCHAR, Value("decisions"), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "acl_audit_level",
+	    "acl: what is recorded - off, denied (refusals only), decisions (every "
+	    "statement/admin/ingest decision), all (plus the session and door lifecycle)",
+	    LogicalType::VARCHAR, Value("decisions"),
+	    [](ClientContext &, SetScope, Value &value) {
+		    // refused at SET time: a level nobody meant must not quietly become `decisions`
+		    acl::AuditLevel parsed;
+		    if (value.IsNull() || !acl::ParseAuditLevel(value.ToString(), parsed)) {
+			    throw InvalidInputException("acl_audit_level: unknown level \"%s\" (off, denied, decisions, all)",
+			                                value.IsNull() ? "NULL" : value.ToString());
+		    }
+	    },
+	    SetScope::GLOBAL);
 	config.AddExtensionOption("acl_audit_buffer",
 	                          "acl: how many of the newest audit events acl_audit_events() holds (0 = none)",
 	                          LogicalType::BIGINT, Value::BIGINT(10000), nullptr, SetScope::GLOBAL);
@@ -92,6 +104,10 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          "acl: a path or URI the audit appends one JSON line per event to ('' = none); read "
 	                          "through duckdb's filesystem, so an object store rides httpfs",
 	                          LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_audit_denials_per_second",
+	                          "acl: refusals RECORDED per second per source (a session, a principal, a door); "
+	                          "the rest are counted only, as dropped where=rate_limit (0 = unlimited)",
+	                          LogicalType::BIGINT, Value::BIGINT(100), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_node_id",
 	                          "acl: the node's name on every audit event and metric ('' = <hostname>:<pid>)",
 	                          LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);
@@ -211,6 +227,19 @@ void LoadInternal(ExtensionLoader &loader) {
 	pipeline->Attach(db);
 	store->audit = pipeline;
 	acl::RegisterAclAudit(loader, store, pipeline);
+	// the node's own gauges (spec 069): how long it has been up, and which build it is
+	{
+		string version;
+#ifdef EXT_VERSION_ACL
+		version = EXT_VERSION_ACL;
+#endif
+		auto loaded = std::chrono::steady_clock::now();
+		hooks->Gauges().Register("acl.node.uptime", {}, "s", "seconds since the extension loaded", [loaded]() {
+			return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - loaded).count();
+		});
+		hooks->Gauges().Register("acl.node.info", {{"version", version.empty() ? "dev" : version}}, "1",
+		                         "always 1; the build in the attributes", []() { return int64_t(1); });
+	}
 	// the store's own handle in the cache (weak): what PolicyStore::Of(db) answers to code that holds a
 	// connection and nothing else - the embedded quack server's drain thread (spec 069)
 	db.GetObjectCache().GetOrCreate<acl::PolicyStoreHandle>(acl::PolicyStoreHandle::ObjectType())->store = store;

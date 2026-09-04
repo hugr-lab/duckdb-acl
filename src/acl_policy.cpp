@@ -1,7 +1,9 @@
 #include "acl_policy.hpp"
 
 #include "acl_audit_pipeline.hpp"
+#include "acl_rewriter.hpp"
 #include "acl_token.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -214,9 +216,17 @@ void SessionEvent(AuditPipeline *hooks, const Principal &principal, const string
 	event.detail = detail;
 	event.allowed = reason_code.empty();
 	event.reason_code = reason_code;
-	event.reason = reason;
+	event.reason = AuditReasonText(reason_code, reason);
 	event.duration_us = duration_us;
 	hooks->Emit(std::move(event));
+}
+
+//! A JWT verification, counted by its result (spec 069): not an event - the session or statement
+//! it was for is one - but a rate the node reports
+void CountJwt(AuditPipeline *hooks, const char *result) {
+	if (hooks) {
+		hooks->Hooks().Counters().Add("acl.jwt.verifications", {{"result", result}});
+	}
 }
 
 } // namespace
@@ -271,18 +281,25 @@ string PolicyStore::SessionOpen(const string &token, const string &door) {
 	if (LooksLikeJwt(token, issuer)) {
 		// the real path: whatever refuses a token in the prefix refuses it here, and for the same
 		// reason - a session must never be a way to get in with something a prefix would reject
+		TakeDenyReason(); // a note a refusal nobody audited left on this thread must not name this one
 		IssuerConfig config;
 		if (!LookupIssuer(issuer, config)) {
 			return refused(Principal(), "principal", "acl_rewrite: token rejected: unknown issuer \"" + issuer + "\"");
 		}
-		config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
 		JwtClaims verified;
 		try {
+			config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
 			verified = VerifyJwt(token, config, JwtClockSkew());
 		} catch (std::exception &ex) {
-			return refused(Principal(), "principal", ex.what()); // the door refuses; it does not learn why
+			// the door refuses; it does not learn why. The audit does: the keys' source, when that is
+			// what failed (a note the read left), else the principal
+			CountJwt(audit.get(), "failed");
+			auto code = TakeDenyReason();
+			return refused(Principal(), code.empty() ? "principal" : code.c_str(), ErrorData(ex).RawMessage());
 		}
+		CountJwt(audit.get(), "ok");
 		principal.subject = verified.subject;
+		principal.issuer = issuer;
 		principal.roles = MapExternalRoles(issuer, verified.raw_roles);
 		if (principal.roles.empty()) {
 			return refused(principal, "principal", "acl_rewrite: token rejected: no recognized roles");
@@ -542,8 +559,23 @@ void PolicyStore::AuditIngest(const string &handle, int64_t rows, const string &
 	event.rows = rows;
 	event.level = event.allowed ? AuditLevel::DECISIONS : AuditLevel::DENIED;
 	if (!event.allowed) {
-		event.reason_code = error.find("acl") != string::npos ? "write_policy" : "source_error";
-		event.reason = error;
+		// Our own refusal carries our prefix - the rewriter's error() inside the written value, or
+		// the door's load check - and names virtual objects only, so it is kept from the prefix on.
+		// Anything else is the physical source refusing the write, and its text carries the row it
+		// refused ("Duplicate key \"id: 7, ssn: ...\""): only the class of the error is kept.
+		auto ours = error.find("acl_rewrite:");
+		if (ours == string::npos) {
+			ours = error.find("acl:");
+		}
+		if (ours != string::npos) {
+			event.reason_code = "write_policy";
+			event.reason = error.substr(ours);
+		} else {
+			event.reason_code = "source_error";
+			auto colon = error.find(':');
+			auto klass = colon == string::npos ? string("error") : error.substr(0, colon);
+			event.reason = "acl: the source refused the write (" + TruncateUtf8(klass, 64) + ")";
+		}
 	}
 	event.recorded = audit->Records(event.level, ref.audit_level);
 	audit->Emit(std::move(event));
@@ -560,7 +592,7 @@ void PolicyStore::AuditDoor(const string &door, const string &detail, bool allow
 	event.detail = detail;
 	event.allowed = allowed;
 	event.reason_code = reason_code;
-	event.reason = reason;
+	event.reason = AuditReasonText(reason_code, reason);
 	int8_t session_level = -1;
 	SessionRef ref;
 	if (!handle.empty() && SessionRefOf(handle, ref)) {
@@ -616,6 +648,13 @@ shared_ptr<PolicyStore> PolicyStore::Of(DatabaseInstance &db) {
 	return handle ? handle->store.lock() : nullptr;
 }
 
+PolicyStoreHandle::~PolicyStoreHandle() {
+	auto locked = store.lock();
+	if (locked && locked->audit) {
+		locked->audit->Stop(); // the instance is going: drain now, with the file system still whole
+	}
+}
+
 void TraceFromContext(ClientContext &context, string &correlation_id, string &traceparent) {
 	Value value;
 	if (context.TryGetCurrentSetting("acl_correlation_id", value) && !value.IsNull()) {
@@ -626,12 +665,34 @@ void TraceFromContext(ClientContext &context, string &correlation_id, string &tr
 	}
 }
 
+string TruncateUtf8(const string &text, idx_t max_bytes) {
+	if (text.size() <= max_bytes) {
+		return text;
+	}
+	auto cut = max_bytes;
+	// back off to the start of the character the cut would split (a continuation byte is 10xxxxxx)
+	while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) {
+		cut--;
+	}
+	return text.substr(0, cut);
+}
+
+string BoundTrace(const string &value) {
+	string clean;
+	clean.reserve(value.size());
+	for (auto c : value) {
+		if (static_cast<unsigned char>(c) >= 0x20 && c != 0x7f) {
+			clean += c;
+		}
+	}
+	return TruncateUtf8(clean, 128);
+}
+
 string TraceMarkers(const string &correlation_id, const string &traceparent) {
 	// bounded, and quoted the way every other prefix value is: a trace names a request, it does not
 	// carry a payload, and an id that could not fit a log line is not one
 	auto marker = [](const char *keyword, const string &value) {
-		auto bounded = value.size() > 256 ? value.substr(0, 256) : value;
-		return string(keyword) + " '" + StringUtil::Replace(bounded, "'", "''") + "' ";
+		return string(keyword) + " '" + StringUtil::Replace(BoundTrace(value), "'", "''") + "' ";
 	};
 	string out;
 	if (!correlation_id.empty()) {
@@ -641,6 +702,37 @@ string TraceMarkers(const string &correlation_id, const string &traceparent) {
 		out += marker("PARENT", traceparent);
 	}
 	return out;
+}
+
+vector<std::pair<string, int64_t>> PolicyStore::SessionCountsByDoor() {
+	// the doors of the base are always listed, at zero when idle: a gauge that vanishes at zero is
+	// one a dashboard cannot tell from a node that stopped reporting
+	std::map<string, int64_t> counts {{"flight", 0}, {"quack", 0}, {"session", 0}};
+	{
+		lock_guard<mutex> guard(lock);
+		for (auto &entry : sessions) {
+			counts[entry.second.door]++;
+		}
+	}
+	return vector<std::pair<string, int64_t>>(counts.begin(), counts.end());
+}
+
+bool PolicyStore::SetSessionTrace(const string &id, const string &name, const string &value) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id != id) {
+			continue;
+		}
+		if (StringUtil::CIEquals(name, "acl_correlation_id")) {
+			entry.second.correlation_id = BoundTrace(value);
+		} else if (StringUtil::CIEquals(name, "acl_traceparent")) {
+			entry.second.traceparent = BoundTrace(value);
+		} else {
+			return false;
+		}
+		return true;
+	}
+	return false;
 }
 
 string PolicyStore::SessionSql(const string &handle, const string &sql, const string &correlation_id,
@@ -665,8 +757,11 @@ string PolicyStore::SessionSql(const string &handle, const string &sql, const st
 		return string();
 	}
 	entry->second.last_used = now;
-	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + TraceMarkers(correlation_id, traceparent) +
-	       sql;
+	// what the caller carries (a header, the composing connection's settings) wins; else what the
+	// client SET on the session itself, wherever the composition is evaluated
+	auto &cid = correlation_id.empty() ? entry->second.correlation_id : correlation_id;
+	auto &tp = traceparent.empty() ? entry->second.traceparent : traceparent;
+	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + TraceMarkers(cid, tp) + sql;
 }
 
 void PolicyStore::SetDoorOpen(bool open) {
@@ -780,8 +875,15 @@ bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal 
 		string issuer;
 		if (LooksLikeJwt(value, issuer)) {
 			// the real path (spec 007): signature + claims against the issuer registry; throws on
-			// failure, so a bad JWT can never fall back to the dev stub below
-			VerifyJwtPrincipal(value, issuer, out, ignore_exp);
+			// failure, so a bad JWT can never fall back to the dev stub below. Counted either way
+			// (spec 069): a verification is not an event, but its rate is a state of the node.
+			try {
+				VerifyJwtPrincipal(value, issuer, out, ignore_exp);
+			} catch (...) {
+				CountJwt(audit.get(), "failed");
+				throw;
+			}
+			CountJwt(audit.get(), "ok");
 		} else {
 			lock_guard<mutex> guard(lock);
 			auto entry = tokens.find(value); // dev stub for non-JWT tokens
@@ -819,6 +921,7 @@ void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, 
 		                      "by a Graph link; resolve groups at the gateway and use the ROLE form");
 	}
 	out.subject = verified.subject;
+	out.issuer = issuer;
 	out.roles = MapExternalRoles(issuer, verified.raw_roles);
 	if (out.roles.empty()) {
 		throw BinderException("acl_rewrite: token rejected: no recognized roles");

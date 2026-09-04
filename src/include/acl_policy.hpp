@@ -32,6 +32,9 @@ struct Principal {
 	//! The token's subject within its issuer (spec 050 F5): part of a principal's identity, so two
 	//! users sharing roles+claims are not one session. Empty for the ROLE form and the dev stub.
 	string subject;
+	//! The issuer that vouched for the subject (spec 007): on every audit event about the principal
+	//! (spec 069), so two IdPs' subjects never merge. Empty for the ROLE form and the dev stub.
+	string issuer;
 	vector<string> roles; // multi-role since spec 006 (union semantics); single-element until spec 007
 	case_insensitive_map_t<string> claims;
 	//! The one quack stream this principal is draining, when the statement being rewritten is the
@@ -47,6 +50,9 @@ struct Principal {
 	//! prefix a gateway writes runs on a connection the gateway shares between principals, so a
 	//! setting left there would leak to the next one; only a session may SET anything.
 	bool session_connection = false;
+	//! The ops id of that session (never the handle), for what a statement records about it - the
+	//! trace it SETs (spec 069). Empty off a session.
+	string session;
 };
 
 //! The client-local settings a principal may set on its own session (spec 068): rendering only -
@@ -61,6 +67,11 @@ bool ClientSettingAllowed(const string &name);
 void TraceFromContext(ClientContext &context, string &correlation_id, string &traceparent);
 //! The `TRACE '<id>' PARENT '<tp>' ` markers for a prefix, or empty when neither is set
 string TraceMarkers(const string &correlation_id, const string &traceparent);
+//! A trace value as the audit keeps it (spec 069): control characters dropped, at most 128 bytes,
+//! cut on a character boundary - an id names a request, it does not carry a payload
+string BoundTrace(const string &value);
+//! `text` cut to at most `max_bytes`, never inside a UTF-8 sequence
+string TruncateUtf8(const string &text, idx_t max_bytes);
 
 //! The exec-context seam (spec 050): the ClientContext of the connection a statement is being
 //! prepared on, stashed in a thread-local by a door that owns the Prepare call site (the Flight door
@@ -292,6 +303,11 @@ struct PolicyStore {
 		//! The session's own audit level (spec 069): -1 inherits the instance's; set by the door's
 		//! SessionPolicy at open or by the operator afterwards, never by the principal
 		int8_t audit_level = -1;
+		//! The trace the client SET on its session (spec 069): kept here, not only on the connection,
+		//! because the prefix is composed wherever the door evaluates it - quack's authorization runs
+		//! on a connection of the server's, not the client's
+		string correlation_id;
+		string traceparent;
 	};
 	unordered_map<string, Session> sessions;
 	//! The audit pipeline of this instance (spec 069); set at load, before anything serves
@@ -537,6 +553,11 @@ struct PolicyStore {
 		Principal principal;
 	};
 	bool SessionRefOf(const string &handle, SessionRef &out);
+	//! Record the trace a session's client SET (spec 069), by ops id: `name` is acl_correlation_id or
+	//! acl_traceparent, an empty value is a RESET. False for an unknown session.
+	bool SetSessionTrace(const string &id, const string &name, const string &value);
+	//! Live sessions per door (spec 069's acl.sessions.live gauge); a door with none is not listed
+	vector<std::pair<string, int64_t>> SessionCountsByDoor();
 	//! The audit's seams for what is not a statement decision (spec 069). Each emits one event -
 	//! whatever the level: counted always, recorded where the level says - and never throws.
 	//! An ingest drain completed on the session behind `handle`: the rows it wrote, or why it failed
@@ -700,8 +721,12 @@ struct AclParserInfo : ParserExtensionInfo {
 
 //! The store's entry in the instance's object cache (spec 069): what `PolicyStore::Of(db)` reads.
 //! A weak reference - the cache must not keep the store alive past the extension's own ownership.
+//! Its destruction is also the audit's shutdown seam: the instance resets its object cache early in
+//! its own teardown, while the file system and the sinks are still whole, so the pipeline drains
+//! there - not from whatever destructor happens to release the store last.
 class PolicyStoreHandle : public ObjectCacheEntry {
 public:
+	~PolicyStoreHandle() override;
 	static string ObjectType() {
 		return "acl_policy_store";
 	}

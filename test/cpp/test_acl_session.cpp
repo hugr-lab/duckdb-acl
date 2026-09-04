@@ -266,11 +266,18 @@ int main(int argc, char *argv[]) {
 		// the door composes it into the prefix from that very connection
 		auto trace = con.Query(prefix + "SET acl_correlation_id = 'req-from-session'");
 		if (CheckOk(*trace, "a session sets its correlation id")) {
-			auto composed = con.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
+			// composed from ANOTHER connection: the value lives on the session's record, not only on
+			// the connection that SET it - quack evaluates the composition on a connection of the
+			// server's (the 2026-09-04 review)
+			Connection other(db);
+			auto composed = other.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
 			auto text = composed->HasError() ? "ERROR: " + composed->GetError() : composed->GetValue(0, 0).ToString();
 			Check(text.find("TRACE 'req-from-session' SELECT 1") != std::string::npos,
-			      "...and the composed prefix carries it: " + text);
+			      "...and the composed prefix carries it, from any connection: " + text);
 			Exec(con, prefix + "RESET acl_correlation_id");
+			auto reset = other.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
+			auto after = reset->HasError() ? "ERROR: " + reset->GetError() : reset->GetValue(0, 0).ToString();
+			Check(after.find("TRACE") == std::string::npos, "...and a RESET clears it: " + after);
 		}
 		Exec(con, "SELECT acl_session_close('" + handle + "')");
 	});

@@ -11,6 +11,7 @@
 
 #include "acl_flight_door.hpp"
 
+#include "acl_audit.hpp"
 #include "acl_flight_catalog.hpp"
 #include "duckdb/common/error_data.hpp"
 
@@ -978,14 +979,16 @@ public:
 			if (begun->HasError()) {
 				return StatusFromDuck("acl", begun->GetError());
 			}
-			auto fail = [&](arrow::Status status) -> arrow::Status {
+			// `audit_text` is the RAW error, not the status the client gets: the audit keeps only our
+			// own refusals whole and reduces a source's error to its class (spec 069)
+			auto fail = [&](arrow::Status status, const string &audit_text) -> arrow::Status {
 				con.Query("ROLLBACK");
-				state->store->AuditIngest(handle, -1, status.ToString()); // the load's outcome (spec 069)
+				state->store->AuditIngest(handle, -1, audit_text);
 				return status;
 			};
 			auto result = stmt->Execute(values, false);
 			if (result->HasError()) {
-				return fail(StatusFromDuck("acl", result->GetError()));
+				return fail(StatusFromDuck("acl", result->GetError()), result->GetError());
 			}
 			int64_t total = 0;
 			auto chunk = result->Fetch();
@@ -996,13 +999,14 @@ public:
 				}
 			}
 			if (!ingest.error.empty()) {
-				return fail(arrow::Status::Invalid(ingest.error));
+				return fail(arrow::Status::Invalid(ingest.error), ingest.error);
 			}
 			// the GizmoSQL lesson: a partial load must be an error, never a silent success - and now it
 			// is caught before commit, so nothing of a mismatched load is stored
 			if (total != ingest.rows) {
-				return fail(arrow::Status::Invalid("acl: the target took " + std::to_string(total) + " rows of the " +
-				                                   std::to_string(ingest.rows) + " the stream delivered"));
+				auto mismatch = "acl: the target took " + std::to_string(total) + " rows of the " +
+				                std::to_string(ingest.rows) + " the stream delivered";
+				return fail(arrow::Status::Invalid(mismatch), mismatch);
 			}
 			auto committed = con.Query("COMMIT");
 			if (committed->HasError()) {
@@ -1925,6 +1929,29 @@ void AclFlightStopFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 } // namespace
 
 void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
+	// the door's state gauge (spec 069): doors of this instance serving right now. Through the
+	// registry in the object cache, which exists before the pipeline is attached.
+	{
+		auto &db = loader.GetDatabaseInstance();
+		auto hooks = db.GetObjectCache().GetOrCreate<AuditHooks>(AuditHooks::ObjectType());
+		weak_ptr<DatabaseInstance> weak_db = db.shared_from_this();
+		hooks->Gauges().Register("acl.door.state", {{"door", "flight"}}, "1", "doors serving right now",
+		                         [weak_db]() -> int64_t {
+			                         auto locked = weak_db.lock();
+			                         if (!locked) {
+				                         return 0;
+			                         }
+			                         auto &doors = ServedDoors::Get();
+			                         std::lock_guard<std::mutex> guard(doors.lock);
+			                         int64_t count = 0;
+			                         for (auto &entry : doors.doors) {
+				                         if (entry.second.owner.lock().get() == locked.get()) {
+					                         count++;
+				                         }
+			                         }
+			                         return count;
+		                         });
+	}
 	auto v = LogicalType::VARCHAR;
 	auto register_door = [&](const string &name, vector<vector<LogicalType>> signatures, const scalar_function_t &fn,
 	                         bool special_nulls) {

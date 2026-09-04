@@ -212,6 +212,17 @@ public:
 		std::lock_guard<std::mutex> guard(lock);
 		dynamics.push_back(Dynamic {name, unit, description, std::move(reader)});
 	}
+	//! Drop every gauge of this name: an owner whose state is going away takes its readers with it,
+	//! so a later snapshot never calls into freed memory.
+	void Remove(const string &name) {
+		std::lock_guard<std::mutex> guard(lock);
+		for (auto it = entries.begin(); it != entries.end();) {
+			it = it->name == name ? entries.erase(it) : it + 1;
+		}
+		for (auto it = dynamics.begin(); it != dynamics.end();) {
+			it = it->name == name ? dynamics.erase(it) : it + 1;
+		}
+	}
 	vector<AuditMetric> Snapshot() const {
 		vector<Entry> fixed;
 		vector<Dynamic> dynamic;

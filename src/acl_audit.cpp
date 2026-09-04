@@ -18,8 +18,8 @@
 #include <chrono>
 
 #ifdef _WIN32
+#include "duckdb/common/windows.hpp" // NOMINMAX and the rest of the project's idiom, then windows.h
 #include <process.h>
-#include <winsock2.h>
 #else
 #include <unistd.h>
 #endif
@@ -71,6 +71,10 @@ AuditPipeline::AuditPipeline(shared_ptr<AuditHooks> hooks_p) : hooks(std::move(h
 }
 
 AuditPipeline::~AuditPipeline() {
+	// the readers registered above hold `this`; a consumer that kept the registry past the pipeline
+	// (a shared_ptr<AuditHooks> of its own) must not be handed freed memory by a later snapshot
+	hooks->Gauges().Remove("acl.audit.queue_fill");
+	hooks->Gauges().Remove("acl.audit.ring_fill");
 	Stop();
 }
 
@@ -132,11 +136,25 @@ bool AuditPipeline::LevelForSession(const Principal &principal, const string &do
 }
 
 void AuditPipeline::Emit(AuditEvent event) {
-	event.ts_us = NowMicros();
-	event.seq = ++seq;
+	// Every setting is read HERE, on the emitting thread - which runs inside the instance - and
+	// carried to the worker. The worker must never take a reference to the instance: a worker that
+	// held its last one would run the instance's teardown, and this pipeline's own Stop(), on
+	// itself (the 2026-09-04 review).
 	auto configured = Setting("acl_node_id", "");
 	event.node = configured.empty() ? node : configured;
 	auto cap = SettingInt("acl_audit_queue", 10000);
+	ring_cap = SettingInt("acl_audit_buffer", 10000);
+	OpenFileIfNeeded(Setting("acl_audit_sink", ""));
+	// what a caller could have made long is bounded here, once, for every sink: a refusal's text
+	// and the trace ids (the reason's content was already decided by its code, AuditReasonText)
+	event.reason = TruncateUtf8(event.reason, 512);
+	event.correlation_id = BoundTrace(event.correlation_id);
+	event.traceparent = BoundTrace(event.traceparent);
+	if (!event.allowed && event.recorded && !AdmitDenial(event, SettingInt("acl_audit_denials_per_second", 100))) {
+		event.recorded = false; // counted below like any other, recorded nowhere
+		dropped++;
+		hooks->Counters().Add("acl.audit.dropped", {{"where", "rate_limit"}});
+	}
 	{
 		std::lock_guard<std::mutex> guard(queue_lock);
 		if (stopping) {
@@ -147,13 +165,53 @@ void AuditPipeline::Emit(AuditEvent event) {
 			hooks->Counters().Add("acl.audit.dropped", {{"where", "queue"}});
 			return;
 		}
+		// under the lock: the sequence is the queue's order, which is what a sink is promised
+		event.ts_us = NowMicros();
+		event.seq = ++seq;
 		queue.push_back(std::move(event));
 		enqueued++;
 		if (!worker.joinable()) {
-			worker = std::thread([this]() { Run(); });
+			// started on the first event; a thread the platform refuses costs this event, never the
+			// decision that produced it (the audit is off the decision path in failure too)
+			try {
+				worker = std::thread([this]() { Run(); });
+			} catch (std::exception &) {
+				queue.pop_back();
+				enqueued--;
+				dropped++;
+				hooks->Counters().Add("acl.audit.dropped", {{"where", "queue"}});
+				return;
+			}
 		}
 	}
 	queue_cv.notify_one();
+}
+
+bool AuditPipeline::AdmitDenial(const AuditEvent &event, int64_t per_second) {
+	if (per_second <= 0) {
+		return true;
+	}
+	// the source: the session when there is one, else the principal (a gateway's ROLE form has roles
+	// only), else the door - the last is what an unauthenticated flood of refused tokens falls to
+	string source;
+	if (!event.session.empty()) {
+		source = "session:" + event.session;
+	} else if (!event.principal.subject.empty() || !event.principal.roles.empty()) {
+		source = "principal:" + event.principal.issuer + "|" + event.principal.subject + "|" +
+		         StringUtil::Join(event.principal.roles, ",");
+	} else {
+		source = "door:" + event.door;
+	}
+	auto second = NowMicros() / 1000000;
+	std::lock_guard<std::mutex> guard(rate_lock);
+	if (denial_buckets.size() > 4096) {
+		denial_buckets.clear(); // bounded: a flood of sources is a flood too, and a reset is cheap
+	}
+	auto &bucket = denial_buckets[source];
+	if (bucket.first != second) {
+		bucket = {second, 0};
+	}
+	return ++bucket.second <= per_second;
 }
 
 void AuditPipeline::Run() {
@@ -162,7 +220,14 @@ void AuditPipeline::Run() {
 		{
 			std::unique_lock<std::mutex> guard(queue_lock);
 			queue_cv.wait(guard, [this]() { return !queue.empty() || stopping; });
+			if (abandon && !queue.empty()) {
+				// Stop() waited its bound: what is left is dropped and counted, not delivered
+				dropped += int64_t(queue.size());
+				hooks->Counters().Add("acl.audit.dropped", {{"where", "queue"}}, int64_t(queue.size()));
+				queue.clear();
+			}
 			if (queue.empty()) {
+				drained_cv.notify_all();
 				return; // stopping, and nothing left
 			}
 			event = std::move(queue.front());
@@ -237,11 +302,11 @@ void AuditPipeline::Handle(const AuditEvent &event) {
 			hooks->Counters().Add("acl.audit.sink_errors", {{"sink", "extension"}});
 		}
 	}
-	auto ring_cap = SettingInt("acl_audit_buffer", 10000);
-	if (ring_cap > 0) {
+	auto cap = ring_cap.load();
+	if (cap > 0) {
 		std::lock_guard<std::mutex> guard(ring_lock);
 		ring.push_back(event);
-		while (int64_t(ring.size()) > ring_cap) {
+		while (int64_t(ring.size()) > cap) {
 			ring.pop_front();
 			dropped++;
 			hooks->Counters().Add("acl.audit.dropped", {{"where", "ring"}});
@@ -250,31 +315,54 @@ void AuditPipeline::Handle(const AuditEvent &event) {
 	WriteFile(event);
 }
 
-void AuditPipeline::WriteFile(const AuditEvent &event) {
-	auto path = Setting("acl_audit_sink", "");
+void AuditPipeline::OpenFileIfNeeded(const string &path) {
 	std::lock_guard<std::mutex> guard(file_lock);
 	if (path != file_path) {
-		file.reset();
+		file.reset(); // the setting changed: the old file is closed, the new one opened below, now
 		file_path = path;
+		last_open_attempt = std::chrono::steady_clock::time_point();
 	}
-	if (path.empty()) {
+	if (path.empty() || file) {
 		return;
 	}
+	// a path that will not open is retried once a second, not once per statement
+	auto now = std::chrono::steady_clock::now();
+	if (now - last_open_attempt < std::chrono::seconds(1)) {
+		return;
+	}
+	last_open_attempt = now;
 	auto instance = db.lock();
 	if (!instance) {
 		return;
 	}
 	try {
-		if (!file) {
-			auto &fs = FileSystem::GetFileSystem(*instance);
-			file = fs.OpenFile(path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_APPEND |
-			                             FileFlags::FILE_FLAGS_FILE_CREATE);
-		}
-		auto line = AuditEventJson(event) + "\n";
-		file->Write(const_cast<char *>(line.data()), NumericCast<int64_t>(line.size()));
-		file->Sync();
+		auto &fs = FileSystem::GetFileSystem(*instance);
+		file = fs.OpenFile(path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_APPEND |
+		                             FileFlags::FILE_FLAGS_FILE_CREATE);
 	} catch (std::exception &) {
 		file.reset();
+		hooks->Counters().Add("acl.audit.sink_errors", {{"sink", "file"}});
+	}
+}
+
+void AuditPipeline::WriteFile(const AuditEvent &event) {
+	std::lock_guard<std::mutex> guard(file_lock);
+	if (file_path.empty()) {
+		return;
+	}
+	if (!file) {
+		// the path is set and did not open (counted where it failed): this event is lost to the file
+		dropped++;
+		hooks->Counters().Add("acl.audit.dropped", {{"where", "sink"}});
+		return;
+	}
+	try {
+		// one write per event, no fsync: a sync per line would bound the whole audit to the disk's
+		// fsync rate and fill the queue under load. Flush() and Stop() sync what was written.
+		auto line = AuditEventJson(event) + "\n";
+		file->Write(const_cast<char *>(line.data()), NumericCast<int64_t>(line.size()));
+	} catch (std::exception &) {
+		file.reset(); // the next Emit reopens
 		dropped++;
 		hooks->Counters().Add("acl.audit.dropped", {{"where", "sink"}});
 		hooks->Counters().Add("acl.audit.sink_errors", {{"sink", "file"}});
@@ -290,11 +378,14 @@ int64_t AuditPipeline::Dropped() const {
 	return dropped.load();
 }
 
-void AuditPipeline::Flush() {
+bool AuditPipeline::Flush(int64_t timeout_ms) {
+	bool drained;
 	{
 		std::unique_lock<std::mutex> guard(queue_lock);
 		auto target = enqueued;
-		drained_cv.wait(guard, [&]() { return handled >= target || stopping; });
+		// bounded: a sink that blocks must not hang the operator's connection that asked for a flush
+		drained = drained_cv.wait_for(guard, std::chrono::milliseconds(timeout_ms),
+		                              [&]() { return handled >= target || stopping; });
 	}
 	for (auto &sink : hooks->Sinks()) {
 		try {
@@ -303,19 +394,78 @@ void AuditPipeline::Flush() {
 			hooks->Counters().Add("acl.audit.sink_errors", {{"sink", "extension"}});
 		}
 	}
+	SyncFile();
+	return drained;
+}
+
+void AuditPipeline::SyncFile() {
+	std::lock_guard<std::mutex> guard(file_lock);
+	if (!file) {
+		return;
+	}
+	try {
+		file->Sync();
+	} catch (std::exception &) {
+		file.reset();
+		hooks->Counters().Add("acl.audit.sink_errors", {{"sink", "file"}});
+	}
 }
 
 void AuditPipeline::Stop() {
 	{
-		std::lock_guard<std::mutex> guard(queue_lock);
+		std::unique_lock<std::mutex> guard(queue_lock);
 		stopping = true;
+		queue_cv.notify_all();
+		// the backlog gets a bounded while to reach the sinks; what is still queued after that is
+		// dropped and counted rather than holding the instance's shutdown for a slow sink
+		if (worker.joinable()) {
+			drained_cv.wait_for(guard, std::chrono::seconds(5), [this]() { return queue.empty(); });
+		}
+		abandon = true;
+		queue_cv.notify_all();
 	}
-	queue_cv.notify_all();
 	if (worker.joinable()) {
-		worker.join();
+		if (worker.get_id() == std::this_thread::get_id()) {
+			worker.detach(); // the teardown reached us from our own thread: joining would be a deadlock
+		} else {
+			worker.join();
+		}
 	}
+	SyncFile();
 	std::lock_guard<std::mutex> guard(file_lock);
 	file.reset();
+}
+
+//===--------------------------------------------------------------------===//
+// What a reason may carry
+//===--------------------------------------------------------------------===//
+
+string AuditReasonText(const string &reason_code, const string &text) {
+	if (reason_code == "parse") {
+		// the parser echoes the text at or near the error - a literal, a value: not for the audit
+		return "acl_rewrite: the statement did not parse (its text is not recorded)";
+	}
+	if (reason_code == "principal") {
+		// "unknown issuer \"...\"", "algorithm \"...\" is not allowed": the quoted value is a claim of
+		// a token nobody verified, and it is the caller's to make as long as they like
+		string out;
+		bool quoted = false;
+		char quote = 0;
+		for (auto c : text) {
+			if (!quoted && (c == '"' || c == '\'')) {
+				quoted = true;
+				quote = c;
+				out += c;
+			} else if (quoted && c == quote) {
+				quoted = false;
+				out += c;
+			} else if (!quoted) {
+				out += c;
+			}
+		}
+		return out;
+	}
+	return text;
 }
 
 //===--------------------------------------------------------------------===//
@@ -337,6 +487,7 @@ string AuditEventJson(const AuditEvent &event) {
 	field("door", event.door);
 	field("session", event.session);
 	field("subject", event.principal.subject);
+	field("issuer", event.principal.issuer);
 	string roles = "[";
 	for (idx_t i = 0; i < event.principal.roles.size(); i++) {
 		roles += (i ? "," : "") + JsonQuote(event.principal.roles[i]);
@@ -463,9 +614,7 @@ void AuditEventsScan(ClientContext &, TableFunctionInput &data, DataChunk &outpu
 		output.data[col++].SetValue(count, NullableVarchar(event.door));
 		output.data[col++].SetValue(count, NullableVarchar(event.session));
 		output.data[col++].SetValue(count, NullableVarchar(event.principal.subject));
-		auto issuer = event.principal.claims.find("iss");
-		output.data[col++].SetValue(count,
-		                            NullableVarchar(issuer == event.principal.claims.end() ? "" : issuer->second));
+		output.data[col++].SetValue(count, NullableVarchar(event.principal.issuer));
 		vector<Value> roles;
 		for (auto &role : event.principal.roles) {
 			roles.emplace_back(role);
@@ -559,10 +708,11 @@ void AuditDroppedFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value::BIGINT(PipelineOf(state).Dropped()), count_t(args.size()));
 }
 
-//! acl_audit_flush(): wait until everything enqueued so far reached every sink (tests, shutdown)
+//! acl_audit_flush(): wait until everything enqueued so far reached every sink (tests, shutdown);
+//! false when the audit thread did not drain within the bound (a sink is stuck)
 void AuditFlushFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	PipelineOf(state).Flush();
-	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+	auto drained = PipelineOf(state).Flush();
+	result.Reference(Value::BOOLEAN(drained), count_t(args.size()));
 }
 
 //! acl_session_audit_level(id, level): the operator's per-session level (spec 069); '' inherits
@@ -596,8 +746,17 @@ void RegisterAclAudit(ExtensionLoader &loader, shared_ptr<PolicyStore> store, sh
 			return locked ? read(*locked) : -1;
 		};
 	};
-	gauges.Register("acl.sessions.live", {}, "1", "sessions alive right now",
-	                with_store([](PolicyStore &s) { return int64_t(s.SessionCount()); }));
+	gauges.RegisterDynamic("acl.sessions.live", "1", "sessions alive right now, per door", [weak_store]() {
+		vector<std::pair<vector<std::pair<string, string>>, int64_t>> out;
+		auto locked = weak_store.lock();
+		if (!locked) {
+			return out;
+		}
+		for (auto &door : locked->SessionCountsByDoor()) {
+			out.emplace_back(vector<std::pair<string, string>> {{"door", door.first}}, door.second);
+		}
+		return out;
+	});
 	gauges.Register("acl.sessions.max", {}, "1", "acl_max_sessions",
 	                with_store([](PolicyStore &s) { return s.MaxSessions(); }));
 	gauges.Register("acl.node.draining", {}, "1", "1 while acl_drain() is in effect",

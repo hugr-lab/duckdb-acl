@@ -1048,7 +1048,10 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		}
 
 		if (stream->HasError()) {
-			auto error = connection.insert.Finalize();
+			// acl: read from the stream this handler holds, before the finalize - a second SEND_DATA
+			// racing this one finds the insert already finalized and would answer an empty error
+			auto error = stream->GetError();
+			connection.insert.Finalize();
 			return make_uniq<ErrorResponse>(error);
 		}
 		return make_uniq<SendDataResponseMessage>(); // accept_budget unset = unbounded (future flow control)

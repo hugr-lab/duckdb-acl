@@ -15,6 +15,7 @@
 #include "duckdb/common/file_system.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <thread>
@@ -47,8 +48,12 @@ public:
 	//! The events of the ring, oldest first.
 	vector<AuditEvent> Ring();
 	int64_t Dropped() const;
-	//! Wait until every event enqueued so far has been handled (tests; shutdown).
-	void Flush();
+	//! Wait until every event enqueued so far has been handled (tests; shutdown), then flush the sinks
+	//! and sync the file. Bounded: false when the thread did not drain in time (a sink is stuck).
+	bool Flush(int64_t timeout_ms = 30000);
+	//! End the thread: the backlog gets a bounded while to reach the sinks, the rest is dropped and
+	//! counted, the file is synced and closed. Idempotent; safe from the audit thread itself (the
+	//! instance's teardown may run on whichever thread held its last reference - then it detaches).
 	void Stop();
 
 private:
@@ -56,6 +61,10 @@ private:
 	void Handle(const AuditEvent &event);
 	void Count(const AuditEvent &event);
 	void WriteFile(const AuditEvent &event);
+	//! On the emitting thread: (re)open the file sink when the path changed or a write failed. The
+	//! worker only ever writes to a handle opened here, so it never touches the instance.
+	void OpenFileIfNeeded(const string &path);
+	void SyncFile();
 	string Setting(const char *name, const string &fallback);
 	int64_t SettingInt(const char *name, int64_t fallback);
 
@@ -72,19 +81,37 @@ private:
 	int64_t handled = 0;
 	int64_t enqueued = 0;
 	bool stopping = false;
+	bool abandon = false; // Stop() gave up on the backlog: the worker drops what is left, counted
 	std::thread worker;
 
+	//! The denial rate limit (spec 069): per source - a session, else a principal, else a door - at
+	//! most `acl_audit_denials_per_second` denials are RECORDED per second; the rest are counted (the
+	//! counters stay exact) and reported as dropped where=rate_limit. One principal's flood of cheap
+	//! refusals cannot push everybody else's records out of the ring, the queue or a sink.
+	bool AdmitDenial(const AuditEvent &event, int64_t per_second);
+	std::mutex rate_lock;
+	unordered_map<string, std::pair<int64_t, int64_t>> denial_buckets; // source -> (second, count)
+
+	// the settings the worker uses, read on the emitting thread (inside the instance) per event
+	std::atomic<int64_t> ring_cap {10000};
 	std::mutex ring_lock;
 	std::deque<AuditEvent> ring;
 
-	// the file sink: opened by path, reopened when the setting changes
+	// the file sink: opened by path on the emitting thread, written by the worker
 	std::mutex file_lock;
 	string file_path;
 	unique_ptr<FileHandle> file;
+	std::chrono::steady_clock::time_point last_open_attempt;
 };
 
 //! JSON-lines rendering of one event, the base file sink's line: every field, no claim values.
 string AuditEventJson(const AuditEvent &event);
+
+//! What a refusal's text may carry onto an event, by code (spec 069): a `parse` refusal echoes the
+//! statement's own text ("at or near ..."), so it is replaced by a fixed sentence; a `principal`
+//! refusal may echo a claim of an UNVERIFIED token (its issuer, its algorithm), so every quoted
+//! value is blanked; every other code is our own text, which names virtual objects and nothing else.
+string AuditReasonText(const string &reason_code, const string &text);
 
 //! Register the audit surface: `acl_audit_events()`, `acl_metrics()`, `acl_audit_dropped()`,
 //! `acl_audit_flush()`, `acl_session_audit_level()`, and the gauges the store owns.
