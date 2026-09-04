@@ -149,6 +149,13 @@ enum class FunctionKind : uint8_t { SCALAR, TABLE };
 
 //! What a principal may do with the ACL itself (spec 009). NONE is the default: the ACL is managed
 //! by the gateway, not by the roles it serves.
+//! wingdi.h (windows.h, reached through httplib and gRPC on Windows) defines PASSTHROUGH as a GDI
+//! escape code; where it got in before this header, the macro would turn the enumerator into a
+//! number (the 2026-09-04 windows_amd64 distribution build). The embed shim leaves GDI out
+//! (NOGDI); this covers every other include order.
+#ifdef PASSTHROUGH
+#undef PASSTHROUGH
+#endif
 enum class AdminScope : uint8_t { NONE, MANAGE, PASSTHROUGH };
 
 //! Parse/print the scope names used by the admin functions, the grammar and the policy source

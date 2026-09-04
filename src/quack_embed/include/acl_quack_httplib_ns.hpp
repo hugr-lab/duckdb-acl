@@ -13,6 +13,14 @@
 //===----------------------------------------------------------------------===//
 #pragma once
 
+// windows.h, reached through httplib here, spills wingdi.h's macros over ordinary identifiers:
+// PASSTHROUGH (a GDI escape code) collided with AdminScope::PASSTHROUGH in acl_policy.hpp once this
+// shim preceded it in every embed TU (the 4.3 move; MSVC: "missing '}' before 'constant'"), and
+// ERROR waits to do the same. Nothing in the embed draws, so the GDI half is left out.
+#if defined(_WIN32) && !defined(NOGDI)
+#define NOGDI
+#endif
+
 #include "httplib.hpp"
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
