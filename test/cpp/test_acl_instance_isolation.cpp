@@ -80,12 +80,18 @@ void Run() {
 
 		if (has_function(ca, "acl_quack_serve")) {
 			// the embedded quack server's RNG needs a crypto module: httpfs provides one where the
-			// build is not OpenSSL-backed (the flight build registers its own) - load it if present
+			// build is not OpenSSL-backed (the flight build registers its own) - load it if present.
+			// A build with neither (the plain macOS job: ACL_NO_FLIGHT, no ACL_QUACK, so no httpfs)
+			// gets duckdb's non-crypto PRNG through force_mbedtls_unsafe - unfit for a deployment's
+			// tokens, exactly right for a test whose subject is door ownership, not RNG quality.
 			auto httpfs = std::string("build/release/extension/httpfs/httpfs.duckdb_extension");
 			std::ifstream probe(httpfs);
 			if (probe.good()) {
 				Exec(ca, "LOAD '" + httpfs + "'");
 				Exec(cb, "LOAD '" + httpfs + "'");
+			} else {
+				Exec(ca, "SET force_mbedtls_unsafe = 'true'");
+				Exec(cb, "SET force_mbedtls_unsafe = 'true'");
 			}
 			auto served = ca.Query("SELECT acl_quack_serve('quack:localhost:31990', 'server-token')");
 			if (CheckOk(*served, "instance A opens a quack door")) {
