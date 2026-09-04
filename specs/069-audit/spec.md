@@ -240,6 +240,45 @@ The OTel extension reads the same two structs directly in C++ on its own scrape 
 Every counter above is also derivable from the events (a consumer that only listens loses nothing);
 the gauges are states, not occurrences, and exist only here.
 
+### Looking at it without the extension
+
+Three ways, none needing OTel, all of them what the tests use:
+
+- **SQL**: `acl_metrics()` and `acl_audit_events()` on a local connection or through the operator's
+  `ACL … ACL NATIVE` passthrough over a door - the way `acl_sessions()` is read today. A dashboard
+  is one query; a test is one `query` block.
+- **The file**: the JSON-lines sink read back with `read_json_auto(...)` - every field a column, so
+  "who read what yesterday" is a `GROUP BY` in duckdb itself.
+- **A Prometheus endpoint, opt-in**: `SET GLOBAL acl_metrics_endpoint = true` adds `GET /metrics`
+  (the text exposition format, ~50 lines to render, no dependency) to the embedded listener the
+  quack door already runs beside `/.well-known/quack-auth` - and to a `plain`-mode listener started
+  for nothing else where only the Flight door serves. Off by default; when on, it is what a
+  Prometheus, an OpenTelemetry Collector's `prometheus` receiver or Azure Monitor's managed
+  Prometheus scrape. The endpoint is a rendering of `acl_metrics()`, so the two can never disagree.
+
+The extension is for exporting; looking is free.
+
+### In a fleet (the cluster repo, later)
+
+A node decides alone and reports alone; nothing in the audit shares state across nodes, exactly as
+sessions do not (spec 040's follow-up stands). What the fleet needs from each node is already in
+the design:
+
+- **identity**: `acl_node_id` set by the orchestrator (else `<hostname>:<pid>`) is on every event
+  and every metric (`node`, and `service.instance.id` once exported); `(node, seq)` is a global
+  order key with no coordination.
+- **correlation**: the front mints the trace and passes `traceparent` / `x-correlation-id` through
+  the door's metadata or the `TRACE … PARENT …` marker; a request in the front's telemetry and the
+  node's decision meet in the backend by those ids, not by clocks.
+- **aggregation**: across nodes it happens in the backend (the Collector, App Insights, Prometheus),
+  never in a node; per-node counters roll up because their attributes are bounded and identical.
+- **central rules**: the policy catalog is the fleet's shared configuration channel already; the
+  extension's level rules live there as a read-only consumer's table (requirements R3 and §5),
+  written by the fleet, read by every node on its own interval.
+- **health**: `acl.door.state`, `acl.policy.staleness`, `acl.jwks.age` and the extension's
+  `acl_otel.healthy` are what the orchestrator drains a node on (`acl_drain()`, spec 066) and what
+  readiness reads; the file sink is for a single node with a disk, the fleet exports.
+
 ### Correlation and trace ids
 
 The caller supplies them; the node never invents one. Three ways in, two fields out:
@@ -302,6 +341,15 @@ of what was recorded. Not an OTel SDK dependency in this repo.
   session changes what that session's next statements record.
 - The file sink: set to a temp path, run statements, `read_json_auto` reads them back with the same
   fields and no claim values; an unwritable path counts drops and the statements still run.
+- Metrics, in sqllogictest over `acl_metrics()`: after N allowed and M denied statements the
+  `acl.decisions` rows by `verdict` read N and M and `acl.denials` by `reason_code` reads each code
+  once; `acl.sessions.live` follows `acl_session_open` / `acl_session_close`; `acl.policy.version`
+  follows a management write; every row's `attributes` keys are from the bounded sets and nothing
+  else (a row with a role or an object name is a failed test). The Prometheus endpoint, in the
+  embedded-door C++ test: `GET /metrics` renders exactly the rows of `acl_metrics()` (same names,
+  same values, `# TYPE` lines), answers 404 while the setting is off, and never lists a session
+  handle. The door harness asserts `acl.sessions.opened` = the clients it started and
+  `acl.ingest.statements` = the loads, read through the endpoint.
 - C++ (`make test-cpp`): `test_acl_audit_hooks.cpp` registers a sink and a session policy through
   `GetObjectCache().GetOrCreate<AuditHooks>` from a translation unit that includes only
   `acl_audit.hpp` - the extension contract proven without a second extension; a sink that blocks

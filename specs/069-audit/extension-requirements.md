@@ -46,6 +46,22 @@ never slow or stop one.
   `OTEL_EXPORTER_OTLP_*` environment and from `acl_otel_*` settings (settings win).
 - R1.5 Its own bounded queue between `OnEvent` and the exporter: `OnEvent` never blocks on the
   network; an overflow drops and counts (R6).
+- R1.6 **Application Insights, transparently.** The extension speaks OTLP only; the bridge into
+  Azure Monitor is the OpenTelemetry Collector's `azuremonitor` exporter (or Azure Monitor's own
+  OTLP ingestion where it is available) - no Azure SDK in the extension. What has to hold for the
+  result to read naturally in App Insights:
+  - `service.name` → `cloud_RoleName`, `service.instance.id` (the node id) → `cloud_RoleInstance`,
+    so a fleet's nodes show as instances of one role;
+  - every log record lands in the `traces` table with our attributes as `customDimensions` - hence
+    attribute names are flat, stable, `acl.`-prefixed and never nested; `acl.objects` is a JSON
+    string, not a structure;
+  - severity maps to `severityLevel` (INFO 1, WARN 2, ERROR 3), so `denied` events filter as
+    warnings out of the box;
+  - `traceparent` → `operation_Id` / `operation_ParentId`, which is what joins a request in the
+    front's App Insights to the node's decision (the `requests` and `traces` tables share
+    `operation_Id`);
+  - a reference Collector configuration (receiver otlp, exporter azuremonitor with the connection
+    string from the environment) ships with the extension and is what its integration test runs.
 
 ### R2 - OpenTelemetry metrics
 
@@ -64,6 +80,12 @@ never slow or stop one.
   new values fold into `other`, and an allowlist of roles/objects where the operator wants exactness.
 - R2.4 Nothing here re-counts what the base counts differently: a base counter and its exported
   series agree, by construction of R2.1.
+- R2.5 **Fit for Application Insights `customMetrics`**: at most 10 dimensions per instrument
+  (Azure Monitor's limit), dimension names stable across versions, values from bounded sets (the
+  base's rule, kept), and the opt-in series of R2.3 capped so that a dimension never exceeds the
+  backend's per-dimension cardinality - the `other` fold is what keeps a metric alive under a
+  tenant explosion. Histograms export as OTLP histograms; where the bridge cannot ingest one, the
+  extension also emits the `_sum` / `_count` pair so a rate and a mean survive.
 
 ### R3 - levels per role, per user, per door
 
@@ -154,11 +176,25 @@ never slow or stop one.
 - The contract test in **this** repo, `test/cpp/test_acl_audit_hooks.cpp`, is the reference: the
   extension's sink registration is the same code path.
 
-## 5. Open questions for the extension's repo
+## 5. Decisions (closed 2026-09-04 with the owner)
 
-- The name: `acl_otel`, or the more general `acl_observe` (a Prometheus scrape endpoint would fit
-  the same shape and the same hooks).
-- Whether the OTel C++ SDK is vendored or taken from vcpkg (the base's vcpkg manifests are the
-  precedent).
-- Whether `acl_otel_level_rules` also lives as a table in the policy catalog for the fleet to manage
-  centrally - a read-only consumer of the base's catalog is allowed by R9.3; a writer is not.
+- **The name is `acl_otel`.** It exports; it does not scrape-serve. The Prometheus text endpoint is
+  the base's (spec 069, *Looking at it without the extension*), so nothing general is left for a
+  broader name to cover.
+- **The OTel C++ SDK comes from vcpkg** (`opentelemetry-cpp` with the `otlp-grpc` / `otlp-http`
+  features), through the same merged-manifest flow the base uses for Arrow and gRPC; the flight
+  build already carries gRPC and protobuf, which the OTLP gRPC exporter shares. No vendoring.
+- **Level rules may live in the policy catalog**, as the extension's own table in its own schema of
+  the catalog database (`acl_otel.level_rules`, created by the extension at first use), read by
+  every node on `acl_otel_rules_interval` (default 30 s) and written by the fleet or an operator with
+  plain SQL. The node is a read-only consumer of that database (R9.3); the base's `acl` schema and
+  its migrations are untouched. `acl_otel_level_rules` (the JSON setting) stays for a single node
+  and wins over the table when both are set.
+
+## 6. In a fleet
+
+The node-side story is spec 069's *In a fleet*; what it asks of the extension: put the node id on
+everything (R1.3), never buffer across a restart (a lost queue is counted, not replayed - the
+backend is the durable copy), read the central rules (§5) rather than carry a per-node file, and
+export `acl_otel.healthy` so the orchestrator can drain on it. Nothing in the extension talks to
+another node.
