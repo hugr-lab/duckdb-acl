@@ -308,6 +308,10 @@ struct CatalogBackend {
 	int64_t version = -1;
 	std::chrono::steady_clock::time_point last_check;
 	bool checked_once = false;
+	//! The audit's ear on the source (spec 069): `reloaded` when a version change is adopted, `written`
+	//! when a write commits, `source_error` (with the reason) when the source did not answer. Set by
+	//! the store that owns the backend; unset = nobody listens.
+	std::function<void(const string &detail, const string &reason)> on_policy;
 	// result caches, invalidated on a version bump; maps are size-capped by ClearIfOversized().
 	// keys carry the principal's sorted role set: the effective policy depends on it.
 	static constexpr idx_t CACHE_CAPACITY = 4096;

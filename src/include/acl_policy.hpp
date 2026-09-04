@@ -12,6 +12,7 @@
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 #include <atomic>
 #include <functional>
@@ -24,6 +25,8 @@ class DatabaseInstance;
 class ClientContext;
 
 namespace acl {
+
+class AuditPipeline; // the audit's own side (spec 069), acl_audit_pipeline.hpp
 
 struct Principal {
 	//! The token's subject within its issuer (spec 050 F5): part of a principal's identity, so two
@@ -51,6 +54,13 @@ struct Principal {
 //! statement resolves to, reads, or costs. One list for the SQL gate and the Flight door's
 //! SetSessionOptions, so the two doors can never disagree about it.
 bool ClientSettingAllowed(const string &name);
+
+//! The trace a caller's context carries (spec 069): the client-local settings `acl_correlation_id`
+//! and `acl_traceparent`, which a client may SET on its own session and a door composes into the
+//! prefix. Empty when unset.
+void TraceFromContext(ClientContext &context, string &correlation_id, string &traceparent);
+//! The `TRACE '<id>' PARENT '<tp>' ` markers for a prefix, or empty when neither is set
+string TraceMarkers(const string &correlation_id, const string &traceparent);
 
 //! The exec-context seam (spec 050): the ClientContext of the connection a statement is being
 //! prepared on, stashed in a thread-local by a door that owns the Prepare call site (the Flight door
@@ -276,8 +286,16 @@ struct PolicyStore {
 		//! about whether anyone is still there; a door sees connections that simply stop, so this is
 		//! what ends them.
 		int64_t last_used = 0;
+		//! Which door opened it (spec 069: on every event about it) and when - the close event's duration
+		string door;
+		int64_t opened_at = 0;
+		//! The session's own audit level (spec 069): -1 inherits the instance's; set by the door's
+		//! SessionPolicy at open or by the operator afterwards, never by the principal
+		int8_t audit_level = -1;
 	};
 	unordered_map<string, Session> sessions;
+	//! The audit pipeline of this instance (spec 069); set at load, before anything serves
+	shared_ptr<AuditPipeline> audit;
 	//! A door's own connection id -> our handle (spec 041). quack hands its `session_id` to the
 	//! authentication callback and the same value as `connection_id` on every later message, so this
 	//! is what turns "which connection is this" into "which principal is this" without the door ever
@@ -476,7 +494,19 @@ struct PolicyStore {
 	bool VerifyPrincipal(bool is_token, const string &value, Principal &out, bool ignore_exp = false);
 	//! Verify a token and mint an opaque handle for it (spec 040). Empty when the token does not
 	//! verify: a door refuses rather than learning why, and the reason belongs to whoever verified.
-	string SessionOpen(const string &token);
+	string SessionOpen(const string &token, const string &door = "session");
+	//! The operator's per-session audit level (spec 069), by the ops id; -1 inherits. False = no such session.
+	bool SetSessionAuditLevel(const string &id, int8_t level);
+	//! A session's own level by handle, -1 when it inherits or the handle is unknown.
+	int8_t SessionAuditLevel(const string &handle);
+	//! The close event of a session being removed (spec 069); caller holds the lock.
+	void SessionClosed(const Session &session, const char *how, int64_t now);
+	//! The gauges the audit reads (spec 069): the policy version the caches are keyed by (-1 without a
+	//! catalog), seconds since the last successful version check (-1 = never), and per issuer the
+	//! seconds since its keys were last read successfully.
+	int64_t PolicyVersion();
+	int64_t PolicyStalenessSeconds();
+	vector<std::pair<string, int64_t>> JwksAges();
 	//! The principal behind a handle, or false with `reason` saying which of "unknown" / "expired" it
 	//! is - a client that reconnects needs to tell those apart.
 	bool SessionPrincipal(const string &handle, Principal &out, string &reason);
@@ -493,6 +523,40 @@ struct PolicyStore {
 	//! in front, or empty when the session is not usable. The whole outward contract of spec 040 in one
 	//! call, so that a second door composes it the same way the first one does rather than similarly.
 	string SessionSql(const string &handle, const string &sql);
+	//! The same, carrying the statement's trace (spec 069): `TRACE '<correlation id>'` and
+	//! `PARENT '<traceparent>'` ride between the handle and the SQL, so every event about the
+	//! statement names the request it belongs to. Empty values write no marker.
+	string SessionSql(const string &handle, const string &sql, const string &correlation_id, const string &traceparent);
+	//! What the audit says about a session (spec 069): its ops id, the door that opened it and its
+	//! own level. A lookup with no side effect - no idle bump, no erase - so an event can name a
+	//! session without keeping it alive.
+	struct SessionRef {
+		string id;
+		string door;
+		int8_t audit_level = -1;
+		Principal principal;
+	};
+	bool SessionRefOf(const string &handle, SessionRef &out);
+	//! The audit's seams for what is not a statement decision (spec 069). Each emits one event -
+	//! whatever the level: counted always, recorded where the level says - and never throws.
+	//! An ingest drain completed on the session behind `handle`: the rows it wrote, or why it failed
+	//! (`error` empty = it succeeded). A failure that carries our own prefix is the write policy
+	//! refusing where the value is written (spec 024) or the door's own load check; any other is the
+	//! physical source refusing the write.
+	void AuditIngest(const string &handle, int64_t rows, const string &error);
+	//! A door event: the password handshake (spec 064) or a ticket's fate (spec 047) - `detail` is
+	//! `handshake` or `ticket_issued` / `ticket_redeemed` / `ticket_expired` / `ticket_foreign`.
+	//! `handle` names the session when there is one; `principal` the one a handshake verified.
+	void AuditDoor(const string &door, const string &detail, bool allowed, const string &reason_code,
+	               const string &reason, const string &handle = string(), const Principal *principal = nullptr);
+	//! The policy source: `reloaded` (a version change adopted), `written` (a management write
+	//! committed), `source_error` (the source did not answer - the statement was refused)
+	void AuditPolicy(const string &detail, const string &reason);
+	//! An issuer's keys were re-read from their document (`refreshed`) or could not be (`refresh_failed`)
+	void AuditKeys(const string &issuer, bool ok, const string &error);
+	//! The store of an instance, for code that holds a connection and nothing else (the embedded
+	//! quack server's drain thread): registered in the object cache at load. Null before load.
+	static shared_ptr<PolicyStore> Of(DatabaseInstance &db);
 	//! End a session. Idempotent: closing an unknown handle is not an error, since a door may retry.
 	void SessionClose(const string &handle);
 	//! Bind a door's connection id to a handle, and look one up. Binding an id that is already bound
@@ -632,6 +696,22 @@ struct AclParserInfo : ParserExtensionInfo {
 	explicit AclParserInfo(shared_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
 	}
 	shared_ptr<PolicyStore> store;
+};
+
+//! The store's entry in the instance's object cache (spec 069): what `PolicyStore::Of(db)` reads.
+//! A weak reference - the cache must not keep the store alive past the extension's own ownership.
+class PolicyStoreHandle : public ObjectCacheEntry {
+public:
+	static string ObjectType() {
+		return "acl_policy_store";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // never evicted: a handle, not a cache
+	}
+	weak_ptr<PolicyStore> store;
 };
 
 //! Carried on each admin setup scalar function (function_info); reaches the same store at execution.

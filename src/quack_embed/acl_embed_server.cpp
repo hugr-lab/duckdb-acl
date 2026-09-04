@@ -17,6 +17,7 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 
 #include "duckdb/main/client_config.hpp"
+#include "acl_quack_embed.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 
 #include "quack_server.hpp"
@@ -288,6 +289,7 @@ static void RunInsertStatement(QuackConnection &connection, shared_ptr<QuackData
 		if (result->HasError()) {
 			stream->SetError(result->GetErrorObject());
 		}
+		acl::AclQuackDrainCompleted(*connection.duckdb_connection, stream_id, *result);
 	} catch (std::exception &ex) {
 		stream->SetError(ErrorData(ex));
 	}

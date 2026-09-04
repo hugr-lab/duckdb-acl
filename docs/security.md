@@ -212,6 +212,23 @@ combined with a certificate. Both doors require cert **and** key together.
   grammar's `phys` targets are not themselves restricted … manage scopes belong to trusted
   operators".
 
+### Audit (spec 069)
+
+Every decision is an event emitted **after** it is made, off the decision path: the parser override
+emits one per statement it decides (or one for the refusal that ended the batch), the store one per
+session opened / closed / refused, the doors one per ingest completed, ticket, and password handshake,
+the catalog backend one per reload, write and source error. An event never carries a claim value, a
+session handle, or statement text - the subject and roles, the session's ops id, and the statement
+class stand in for them - and the JSON-lines file sink writes exactly those fields. A refusal names
+one code of a bounded taxonomy (the `Reason` enum in `acl_rewriter.hpp`; every `Deny` site names
+its own, and a failure nobody noted falls to the phase it escaped from - `parse`, `principal`,
+`mgmt_unauthorized`, `policy_error`). Metric attributes are drawn from bounded sets, so a metric row
+can never name a role, a subject or an object (`acl_audit.test` pins it). A slow or throwing sink
+costs dropped events, counted, never a slower statement; a level of `off` still counts. The audit
+surface is refused to a principal like every other operator function; the Prometheus route is
+opt-in and unauthenticated by design, like discovery - it publishes counts and states, nothing a
+principal could not infer from its own refusals.
+
 ## 3. Capabilities and scopes
 
 | capability | where it is granted | in the unstated default? | gates |
@@ -493,6 +510,9 @@ Before a node serves anyone:
 - [ ] A policy catalog is configured (`acl_use_db`); memory mode is the dev stub.
 - [ ] `acl_allow_anonymous_admin` is **off** once the first `passthrough` admin exists; the doors
       refuse to open while it is on.
+- [ ] The audit goes somewhere that outlives the node (`acl_audit_sink`, or a registered sink) and
+      `acl.audit.dropped` is watched; `acl_metrics_endpoint` is on only where the listener's address
+      is not public, or the scrape is fronted (spec 069).
 - [ ] Admin scopes are minimal: catalog-scoped `manage` for operators of one catalog, `passthrough`
       for the platform only - it is "the actual god mode" and the only scope that runs `ACL NATIVE`.
 - [ ] Sensitive objects declare `COLUMNS (…)`; no whole-table grant sits on a live alias whose

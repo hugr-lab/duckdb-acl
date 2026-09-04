@@ -358,10 +358,27 @@ run_leg() {
 	echo "$L SELECT * FROM quack_query('quack:localhost:$port', 'SELECT 1', token := '$TOKEN_ACME');" \
 		| "$DUCKDB" -unsigned >/dev/null 2>&1 || fail "$name: the door stopped answering after a client died mid-statement"
 
+	# --- the audit's counters, read through the door's own listener (spec 069) ---
+	# Every load above was a quack drain the audit recorded as an ingest of its session, and every
+	# client a session: the Prometheus route answers both. At least the two writers' loads completed
+	# (the victim's may or may not have), and at least the four clients this leg started were seated.
+	local audit_note="metrics not checked (no curl)"
+	if command -v curl >/dev/null 2>&1; then
+		local metrics ingests opened
+		metrics="$(curl -sf "http://localhost:$port/metrics" || true)"
+		[ -n "$metrics" ] || fail "$name: GET /metrics answered nothing (bootstrap.sql sets acl_metrics_endpoint)"
+		ingests="$(echo "$metrics" | awk '/^acl_ingest_statements\{door="quack",verdict="allowed"\} /{print $2}')"
+		[ "${ingests:-0}" -ge 2 ] || fail "$name: the audit counted ${ingests:-0} completed loads, expected at least 2"
+		opened="$(echo "$metrics" | awk '/^acl_sessions_opened\{door="quack"\} /{print $2}')"
+		[ "${opened:-0}" -ge 4 ] || fail "$name: the audit counted ${opened:-0} sessions opened, expected at least 4"
+		echo "$metrics" | grep -q '^acl_sessions_live ' || fail "$name: GET /metrics carries no acl_sessions_live gauge"
+		audit_note="the audit counted $ingests loads and $opened sessions"
+	fi
+
 	kill_server
 	RAN="$RAN $name"
 	echo "  pass $name: two writers x $ROWS rows + a reader x $ticks ticks${joins:+ + a cross-source joiner x $joins ticks}" \
-	     "+ a killed writer, ${elapsed}s; no row outside its own slice; $overlap; $victim_note; the door still answers"
+	     "+ a killed writer, ${elapsed}s; no row outside its own slice; $overlap; $victim_note; the door still answers; $audit_note"
 }
 
 # --- the legs ------------------------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 # Spec 069: Audit and observability - the base mechanism here, the rest through public hooks
 
-- **Status**: draft (revised 2026-09-04 after the owner's direction; nothing implemented)
+- **Status**: implemented (the base; the extended extension `acl_otel` is a separate repo - see
+  [extension-requirements.md](extension-requirements.md))
 - **Date**: 2026-09-04
 - **Author**: hugr-lab
 

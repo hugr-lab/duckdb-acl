@@ -11,9 +11,13 @@
 
 #include "acl_quack_embed.hpp"
 
+#include "acl_audit_pipeline.hpp"
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
 #include "acl_quack_server.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
 
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -94,6 +98,21 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		cfg.draining = [shared_store] {
 			return shared_store->Draining();
 		};
+		// spec 069: GET /metrics, read per request - the operator's SET GLOBAL acl_metrics_endpoint
+		// after the serve counts, and "" (404) while it is off
+		weak_ptr<DatabaseInstance> weak_db = context.db;
+		cfg.metrics = [shared_store, weak_db]() -> string {
+			auto db = weak_db.lock();
+			if (!db || !shared_store->audit) {
+				return string();
+			}
+			Value on;
+			if (!DBConfig::GetConfig(*db).TryGetCurrentSetting("acl_metrics_endpoint", on) || on.IsNull() ||
+			    !on.GetValue<bool>()) {
+				return string();
+			}
+			return RenderPrometheus(shared_store->audit->Hooks());
+		};
 		string actual_uri;
 		// a bind or PEM failure inside is an IOException that carries this function's prefix and passes
 		// through untouched (the error contract, docs/security.md section 8); what comes back as text is
@@ -157,7 +176,7 @@ void AclQuackAuthenticateFunc(DataChunk &args, ExpressionState &state, Vector &r
 		auto session_id = RequiredArg(args, 0, row, "acl_quack_authenticate", "session id");
 		auto token = RequiredArg(args, 1, row, "acl_quack_authenticate", "client token");
 		auto &store = StoreOf(state);
-		auto handle = store.SessionOpen(token);
+		auto handle = store.SessionOpen(token, "quack");
 		if (handle.empty()) {
 			result.SetValue(row, Value::BOOLEAN(false));
 			continue;
@@ -188,13 +207,43 @@ void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &resu
 			result.SetValue(row, Value());
 			continue;
 		}
-		// SessionSql is the one place the prefix is composed, so every door spells it the same way
-		auto prefixed = store.SessionSql(handle, sql);
+		// SessionSql is the one place the prefix is composed, so every door spells it the same way;
+		// the trace is whatever the client SET on its connection (spec 069)
+		string correlation_id, traceparent;
+		TraceFromContext(state.GetContext(), correlation_id, traceparent);
+		auto prefixed = store.SessionSql(handle, sql, correlation_id, traceparent);
 		result.SetValue(row, prefixed.empty() ? Value() : Value(prefixed));
 	}
 }
 
 } // namespace
+
+void AclQuackDrainCompleted(Connection &connection, const string &stream_id, MaterializedQueryResult &result) {
+	// The stream id is `<connection id>:<uuid>`, and the connection id is what acl_quack_authenticate
+	// bound to a session - the same key the override used to decide this very INSERT (spec 042). A
+	// stream nobody bound was refused at parse and has nothing to complete.
+	auto store = PolicyStore::Of(*connection.context->db);
+	if (!store) {
+		return;
+	}
+	auto colon = stream_id.find(':');
+	string handle;
+	if (colon == string::npos || colon == 0 || !store->SessionHandleFor(stream_id.substr(0, colon), handle)) {
+		return;
+	}
+	if (result.HasError()) {
+		store->AuditIngest(handle, -1, result.GetError());
+		return;
+	}
+	int64_t rows = -1;
+	if (result.RowCount() == 1 && result.ColumnCount() == 1) {
+		auto count = result.GetValue(0, 0);
+		if (!count.IsNull()) {
+			rows = count.GetValue<int64_t>();
+		}
+	}
+	store->AuditIngest(handle, rows, string());
+}
 
 void RegisterAclQuackDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
 	const LogicalType &v = LogicalType::VARCHAR;

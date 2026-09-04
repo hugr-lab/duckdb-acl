@@ -41,6 +41,9 @@ expect 'read_csv' 'the data-reading function to be refused (2/4)'
 expect 'read-only relation' 'the write through the projection to be refused (3/4)'
 expect 'anonymous' 'the anonymous ACL ADMIN to be refused with the hatch closed (4/4)'
 expect 'user-1@globex' 'the virtual scalar to expand with the baked claim'
+expect '"reason_code":"function_denied"' 'the audit to count the refused function under its code (spec 069)'
+expect '"reason_code":"read_only"' 'the audit to count the refused write under its code (spec 069)'
+expect '"reason_code":"mgmt_unauthorized"' 'the audit to count the refused anonymous admin under its code (spec 069)'
 if [ "$fail" -ne 0 ]; then
   echo "harness: FAILED - see the transcript above" >&2
   exit 1

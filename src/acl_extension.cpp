@@ -14,6 +14,7 @@
 #include "duckdb/main/settings.hpp"
 
 #include "acl_admin_functions.hpp"
+#include "acl_audit_pipeline.hpp"
 #include "acl_introspection.hpp"
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
@@ -74,6 +75,37 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_jwt_clock_skew", "acl: allowed clock skew in seconds for JWT exp/nbf checks",
 	                          LogicalType::BIGINT, Value::BIGINT(60), nullptr, SetScope::GLOBAL);
+	// the audit (spec 069): the instance's level, the pipeline's bounds, the base file sink, the node's
+	// name on every event, the Prometheus rendering on the embedded listener - all read through the
+	// instance by the audit thread and the emitting seams, so GLOBAL
+	config.AddExtensionOption("acl_audit_level",
+	                          "acl: what is recorded - off, denied (refusals only), decisions (every "
+	                          "statement/admin/ingest decision), all (plus the session and door lifecycle)",
+	                          LogicalType::VARCHAR, Value("decisions"), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_audit_buffer",
+	                          "acl: how many of the newest audit events acl_audit_events() holds (0 = none)",
+	                          LogicalType::BIGINT, Value::BIGINT(10000), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_audit_queue",
+	                          "acl: events waiting for the audit thread before new ones are dropped and counted",
+	                          LogicalType::BIGINT, Value::BIGINT(10000), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_audit_sink",
+	                          "acl: a path or URI the audit appends one JSON line per event to ('' = none); read "
+	                          "through duckdb's filesystem, so an object store rides httpfs",
+	                          LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_node_id",
+	                          "acl: the node's name on every audit event and metric ('' = <hostname>:<pid>)",
+	                          LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_metrics_endpoint",
+	                          "acl: serve GET /metrics (Prometheus text) on the embedded quack listener",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
+	// the two client-local trace settings (spec 069): session scope, and the one pair a principal may
+	// SET on a session of its own (spec 068's allowlist) - a door composes them into the prefix
+	config.AddExtensionOption("acl_correlation_id",
+	                          "acl: the correlation id the audit events of this session's statements carry",
+	                          LogicalType::VARCHAR, Value(""));
+	config.AddExtensionOption("acl_traceparent",
+	                          "acl: the W3C traceparent the audit events of this session's statements carry",
+	                          LogicalType::VARCHAR, Value(""));
 	config.AddExtensionOption("acl_jwks_refresh_interval",
 	                          "acl: seconds a fetched JWKS is used before it is read again (spec 023)",
 	                          LogicalType::BIGINT, Value::BIGINT(300), nullptr, SetScope::GLOBAL);
@@ -171,6 +203,17 @@ void LoadInternal(ExtensionLoader &loader) {
 	// the first time somebody opens a door.
 	acl::RegisterAclFlightDoor(loader, store);
 #endif
+	// The audit and observability hooks (spec 069): one registry per instance, reached through the
+	// object cache so an extension loaded before or after us finds the same one; attached to the store,
+	// which emits the session events, and registered with its SQL surface.
+	auto hooks = db.GetObjectCache().GetOrCreate<acl::AuditHooks>(acl::AuditHooks::ObjectType());
+	auto pipeline = make_shared_ptr<acl::AuditPipeline>(hooks);
+	pipeline->Attach(db);
+	store->audit = pipeline;
+	acl::RegisterAclAudit(loader, store, pipeline);
+	// the store's own handle in the cache (weak): what PolicyStore::Of(db) answers to code that holds a
+	// connection and nothing else - the embedded quack server's drain thread (spec 069)
+	db.GetObjectCache().GetOrCreate<acl::PolicyStoreHandle>(acl::PolicyStoreHandle::ObjectType())->store = store;
 	acl::RegisterAclAdminFunctions(loader, std::move(store));
 }
 

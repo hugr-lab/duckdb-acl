@@ -160,6 +160,7 @@ struct FlightDoorState {
 		auto now = NowSeconds();
 		for (auto it = reservations.begin(); it != reservations.end();) {
 			if (now - it->second->last_used > idle_seconds) {
+				store->AuditDoor("flight", "ticket_expired", true, string(), string());
 				it = reservations.erase(it);
 			} else {
 				++it;
@@ -292,6 +293,28 @@ string PrincipalFingerprint(const Principal &principal) {
 //! The token a call carries, or "" - read from the headers on every call rather than only at a
 //! handshake, because a Flight client is free to open a fresh connection per call and several drivers
 //! do exactly that.
+//! The statement's trace (spec 069): the call's own `x-correlation-id` / `traceparent` headers
+//! first - a driver sets them per request - else whatever the client SET on its session's
+//! connection (spec 068's allowlist, or SetSessionOptions).
+void TraceOfCall(const flight::ServerCallContext &context, ClientContext &session_context, string &correlation_id,
+                 string &traceparent) {
+	for (const auto &header : context.incoming_headers()) {
+		if (StringUtil::CIEquals(string(header.first), "x-correlation-id")) {
+			correlation_id = string(header.second);
+		} else if (StringUtil::CIEquals(string(header.first), "traceparent")) {
+			traceparent = string(header.second);
+		}
+	}
+	string set_correlation_id, set_traceparent;
+	TraceFromContext(session_context, set_correlation_id, set_traceparent);
+	if (correlation_id.empty()) {
+		correlation_id = set_correlation_id;
+	}
+	if (traceparent.empty()) {
+		traceparent = set_traceparent;
+	}
+}
+
 string TokenFromHeaders(const flight::ServerCallContext &context) {
 	for (const auto &header : context.incoming_headers()) {
 		if (!StringUtil::CIEquals(string(header.first), AUTH_HEADER)) {
@@ -489,6 +512,8 @@ public:
 		// a draining node refuses before running the grant (spec 066): the handshake exists only to
 		// seat a new client, and minting an IdP token for one the node will refuse is waste and noise
 		if (state->store->Draining()) {
+			state->store->AuditDoor("flight", "handshake", false, "draining",
+			                        "acl: node is draining - not accepting new sessions");
 			return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
 			                               "acl: node is draining - not accepting new sessions");
 		}
@@ -531,8 +556,10 @@ public:
 				continue;
 			}
 			*middleware = std::make_shared<PasswordHandshakeMiddleware>(tokens.access_token);
+			state->store->AuditDoor("flight", "handshake", true, string(), string(), string(), &principal);
 			return arrow::Status::OK();
 		}
+		state->store->AuditDoor("flight", "handshake", false, "principal", refusal);
 		return flight::MakeFlightError(flight::FlightStatusCode::Unauthenticated, refusal);
 	}
 
@@ -642,7 +669,10 @@ public:
 	                       const flight::FlightDescriptor &descriptor) override {
 		return UnderSession(context, [&](const string &handle) -> arrow::Result<std::unique_ptr<flight::FlightInfo>> {
 			ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(handle));
-			auto prefixed = state->store->SessionSql(handle, command.query);
+			auto conn = state->ConnFor(handle);
+			string correlation_id, traceparent;
+			TraceOfCall(context, *conn->con->context, correlation_id, traceparent);
+			auto prefixed = state->store->SessionSql(handle, command.query, correlation_id, traceparent);
 			if (prefixed.empty()) {
 				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			}
@@ -651,7 +681,7 @@ public:
 			// schema comes from the same binder that will produce the rows; and DoGet has nothing
 			// left to do but execute.
 			auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
-			reservation->conn = state->ConnFor(handle);
+			reservation->conn = conn;
 			{
 				std::lock_guard<std::mutex> execution(reservation->conn->exec);
 				ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, command.transaction_id));
@@ -669,6 +699,7 @@ public:
 			if (ticket_id.empty()) {
 				return arrow::Status::Invalid("acl: too many open tickets - fetch or retry later");
 			}
+			state->store->AuditDoor("flight", "ticket_issued", true, string(), string(), handle);
 			ARROW_ASSIGN_OR_RAISE(auto ticket, flightsql::CreateStatementQueryTicket(ticket_id));
 			std::vector<flight::FlightEndpoint> endpoints {
 			    flight::FlightEndpoint {flight::Ticket {std::move(ticket)}, {}, std::nullopt, {}}};
@@ -689,8 +720,13 @@ public:
 			                    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(caller));
 			                    auto reservation = state->TakeReservation(string(command.statement_handle), owner);
 			                    if (!reservation) {
+				                    // a ticket of somebody else's reads exactly like none (no oracle) - and is
+				                    // the one event here worth a denial: a stolen ticket presented (spec 047)
+				                    state->store->AuditDoor("flight", "ticket_foreign", false, "principal",
+				                                            "acl: unknown or already fetched ticket", caller);
 				                    return arrow::Status::KeyError("acl: unknown or already fetched ticket");
 			                    }
+			                    state->store->AuditDoor("flight", "ticket_redeemed", true, string(), string(), caller);
 			                    std::lock_guard<std::mutex> execution(reservation->conn->exec);
 			                    vector<Value> values;
 			                    auto result = reservation->stmt->Execute(values, false);
@@ -707,11 +743,13 @@ public:
 	arrow::Result<int64_t> DoPutCommandStatementUpdate(const flight::ServerCallContext &context,
 	                                                   const flightsql::StatementUpdate &command) override {
 		return UnderSession(context, [&](const string &handle) -> arrow::Result<int64_t> {
-			auto prefixed = state->store->SessionSql(handle, command.query);
+			auto conn = state->ConnFor(handle);
+			string correlation_id, traceparent;
+			TraceOfCall(context, *conn->con->context, correlation_id, traceparent);
+			auto prefixed = state->store->SessionSql(handle, command.query, correlation_id, traceparent);
 			if (prefixed.empty()) {
 				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			}
-			auto conn = state->ConnFor(handle);
 			std::lock_guard<std::mutex> execution(conn->exec);
 			ARROW_RETURN_NOT_OK(ValidateTxnLocked(*conn, command.transaction_id));
 			TempScanScope temp_scan(conn->con->context.get());
@@ -942,6 +980,7 @@ public:
 			}
 			auto fail = [&](arrow::Status status) -> arrow::Status {
 				con.Query("ROLLBACK");
+				state->store->AuditIngest(handle, -1, status.ToString()); // the load's outcome (spec 069)
 				return status;
 			};
 			auto result = stmt->Execute(values, false);
@@ -967,8 +1006,10 @@ public:
 			}
 			auto committed = con.Query("COMMIT");
 			if (committed->HasError()) {
+				state->store->AuditIngest(handle, -1, committed->GetError());
 				return StatusFromDuck("acl", committed->GetError());
 			}
+			state->store->AuditIngest(handle, total, string()); // rows written - a number, never data
 			return total;
 		});
 	}
@@ -987,12 +1028,15 @@ public:
 		return UnderSession(
 		    context, [&](const string &handle) -> arrow::Result<flightsql::ActionCreatePreparedStatementResult> {
 			    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(handle));
-			    auto prefixed = state->store->SessionSql(handle, request.query);
+			    auto conn = state->ConnFor(handle);
+			    string correlation_id, traceparent;
+			    TraceOfCall(context, *conn->con->context, correlation_id, traceparent);
+			    auto prefixed = state->store->SessionSql(handle, request.query, correlation_id, traceparent);
 			    if (prefixed.empty()) {
 				    return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			    }
 			    auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
-			    reservation->conn = state->ConnFor(handle);
+			    reservation->conn = conn;
 			    {
 				    std::lock_guard<std::mutex> execution(reservation->conn->exec);
 				    ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, request.transaction_id));
@@ -1548,7 +1592,7 @@ private:
 			return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
 			                               "acl: node is draining - not accepting new sessions");
 		}
-		auto handle = state->store->SessionOpen(token);
+		auto handle = state->store->SessionOpen(token, "flight");
 		if (handle.empty()) {
 			// what refuses a token in the prefix refuses it here, and says no more (spec 040)
 			return arrow::Status::UnknownError("acl: authentication failed");

@@ -61,3 +61,6 @@ ACL ROLE "analyst" INSERT INTO orders VALUES (10, 'globex', 1);
 .print '--- (refused 4/4) with the bootstrap hatch closed, the anonymous ACL ADMIN form is gone too ---'
 SET GLOBAL acl_allow_anonymous_admin = false;
 ACL ADMIN SELECT count(*) FROM phys.main.orders;
+
+.print '--- the audit counted every refusal above under its code (spec 069) ---'
+SELECT name, attributes, value FROM acl_metrics() WHERE name = 'acl.denials' ORDER BY attributes;
