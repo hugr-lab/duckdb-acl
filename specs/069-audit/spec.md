@@ -52,14 +52,28 @@ One record per decision:
 | `door` | VARCHAR | `flight`, `quack`, `gateway` (a prefix on a plain connection), `admin` (a bare `ACL ADMIN`) |
 | `session` | VARCHAR | the ops id `acl_sessions()` shows - never the handle - or NULL |
 | `subject`, `issuer`, `roles` | VARCHAR, VARCHAR, VARCHAR[] | the principal; the `ROLE` form has roles only |
-| `kind` | VARCHAR | `statement`, `admin`, `session`, `ingest`, `door` |
+| `kind` | VARCHAR | `statement`, `admin`, `session`, `ingest`, `door`, `policy`, `keys` |
 | `statement` | VARCHAR | the class: `SELECT`, `INSERT`, `CREATE TABLE`, `MANAGEMENT`, `NATIVE`, … - never the text |
 | `objects` | STRUCT(name VARCHAR, capability VARCHAR)[] | every virtual object the resolution touched, with the capability judged for it |
 | `verdict` | VARCHAR | `allowed` or `denied` |
+| `reason_code` | VARCHAR | on `denied`: one of a bounded set (below) - the dimension a metric can carry |
 | `reason` | VARCHAR | on `denied`: our refusal, prefix included; NULL on `allowed` |
 | `correlation_id` | VARCHAR | what the caller supplied (below), else NULL |
 | `traceparent` | VARCHAR | the W3C trace context the caller supplied, else NULL - what an OTel exporter needs to attach the event to a trace |
 | `rewrite_us` | INTEGER | the decision's own cost |
+| `rows` | BIGINT | `ingest` only: rows the completed drain wrote (a number, not data); NULL elsewhere |
+| `duration_us` | BIGINT | `session` close events only: how long the session lived; NULL elsewhere |
+| `detail` | VARCHAR | a bounded word for `policy` / `keys` / `session` events: `reloaded`, `source_error`, `refreshed`, `refresh_failed`, `idle`, `expired`, `killed`, `door_stopped`, `client` |
+
+**Reason codes** (the taxonomy every `Deny` site names; the text after the prefix stays free):
+`no_access`, `capability`, `read_only`, `function_denied`, `statement_type`, `unchecked_predicate`,
+`setting_denied`, `parse`, `principal` (a token, role or session that did not verify),
+`mgmt_unauthorized`, `ddl_home`, `draining`, `at_capacity`, `source_error`.
+
+**The stream is sufficient by design**: everything a consumer might count is in the events - a
+decision with its code, a session's open and close with how and how long, an ingest with its rows, a
+policy reload or source error, a keys refresh. Only what is not an occurrence but a state (live
+sessions, queue fill, policy staleness, JWKS age) is a gauge the base exposes instead.
 
 Deliberately **not** in the stored event: the statement text, parameter values, anything read or
 written, physical names (the reason is our refusal text, which names virtual facts only - spec 065).
@@ -99,7 +113,14 @@ client-local allowlist.
 - **`SessionOpen`** and the doors: kind `session` at level `all` - opened, refused with the reason a
   client never sees (`token rejected: …`, `draining`, `at acl_max_sessions`), expired, killed. Kind
   `door` for the password handshake and its refusals (spec 064).
-- **Ingest** (specs 042/049): kind `ingest`, the target with `insert`, the verdict.
+- **Ingest** (specs 042/049): kind `ingest`, emitted **when the drain completes**, not when it is
+  admitted - both doors run the ingest INSERT themselves, so the row count is theirs to know and no
+  duckdb execution hook is needed: the target with `insert`, `allowed` with `rows`, or `denied`
+  with the reason (a client that died mid-stream leaves a denied `ingest` with `rows` NULL).
+- **The policy source**: kind `policy` at level `all` - `reloaded` when a version bump clears the
+  caches, `source_error` when a catalog read fails and the resolver refuses closed (the denial that
+  follows carries `reason_code = source_error` too). Kind `keys` at level `all`: a JWKS document
+  `refreshed` or `refresh_failed`, with the issuer in `objects[0].name`.
 
 ### The hooks - the base's public C++ surface
 
@@ -118,9 +139,12 @@ struct AuditEvent {
 	string door; string session;
 	Principal principal;                 // subject, issuer, roles, claims - in memory, the sink's to filter
 	string kind; string statement; vector<AuditObject> objects;
-	bool allowed; string reason;
+	bool allowed; string reason_code; string reason;
 	string correlation_id; string traceparent;
-	int64_t rewrite_us;
+	int64_t rewrite_us;                  // the decision's own cost
+	int64_t rows;                        // ingest: rows written by the completed drain; else -1
+	int64_t duration_us;                 // session close: how long it lived; else -1
+	string detail;                       // policy / keys / session: the bounded word of the table above
 };
 
 //! A consumer of events. Called on the audit thread, never on the decision path.
@@ -136,11 +160,12 @@ struct SessionPolicy {
 	virtual bool LevelFor(const Principal &principal, const string &door, AuditLevel &out) = 0;
 };
 
-//! The counters an exporter scrapes; every field is an atomic the base increments.
-struct AuditCounters {
-	std::atomic<int64_t> allowed, denied, sessions_opened, sessions_refused, sessions_live,
-	    events_emitted, events_dropped, sink_errors;
-};
+//! The counters and gauges an exporter scrapes - the tables of the *Metrics* section, one atomic
+//! per (name, attribute-tuple); the base increments, nobody else writes. `Snapshot()` copies them
+//! under no lock into plain integers with their names and attributes, which is what a scrape wants.
+struct AuditMetric { string name; string kind; vector<pair<string, string>> attributes; int64_t value; string unit; };
+struct AuditCounters { /* atomics behind the counter table */ vector<AuditMetric> Snapshot() const; };
+struct AuditGauges   { /* atomics behind the gauge table   */ vector<AuditMetric> Snapshot() const; };
 
 //! Per DatabaseInstance. Reached from ANY extension through duckdb's object cache:
 //!   auto hooks = db.GetObjectCache().GetOrCreate<AuditHooks>("acl_audit_hooks");
@@ -152,6 +177,7 @@ public:
 	void RemoveSink(const shared_ptr<AuditSink> &sink);
 	void SetSessionPolicy(shared_ptr<SessionPolicy> policy);
 	const AuditCounters &Counters() const;
+	const AuditGauges &Gauges() const;
 	static string ObjectType();  // "acl_audit_hooks"
 };
 
@@ -176,11 +202,43 @@ availability argument: nothing an exporter does can take the node down or slow a
 
 ### Metrics
 
-`acl_metrics()` is a table function over `AuditCounters` plus the gauges the store already knows
-(live sessions, drain state, ring fill, queue fill) - `name`, `value`, `kind` (`counter`/`gauge`).
-The OTel extension reads `AuditHooks::Counters()` directly in C++ on its own scrape interval and
-maps them to OTel instruments; per-role or per-object aggregates it derives from the event stream it
-already receives. The base publishes no protocol.
+The base keeps **counters and gauges only** - no histograms, no per-role or per-object dimensions:
+every distribution (rewrite latency, session duration, rows per ingest) and every high-cardinality
+breakdown is the extension's, derived from the event stream, with the buckets and the limits of its
+own choosing (the owner's decision, 2026-09-04). What the base counts it counts with attributes
+from bounded sets only: `door` ∈ {flight, quack, gateway, admin}, `kind`, `verdict`, the statement
+class, `reason_code`, `result`, the issuer, a door's uri.
+
+`acl_metrics()` is a table function over `AuditHooks::Counters()` and `Gauges()`:
+`name`, `kind` (`counter` / `gauge`), `attributes` (a JSON object), `value`, `unit`, `description`.
+The OTel extension reads the same two structs directly in C++ on its own scrape interval.
+
+| counter | attributes |
+| --- | --- |
+| `acl.decisions` | `verdict`, `kind`, `door`, `statement` |
+| `acl.denials` | `reason_code`, `door` |
+| `acl.sessions.opened`, `acl.sessions.refused` (`reason_code`), `acl.sessions.closed` (`how`) | `door` |
+| `acl.door.handshakes` (`result`), `acl.door.tickets` (`outcome`: issued / redeemed / expired / foreign) | `door` |
+| `acl.ingest.statements` | `door`, `verdict` |
+| `acl.admin.statements` | `verdict`, `scope`: anonymous / manage / passthrough |
+| `acl.policy.reloads`, `acl.policy.source_errors`, `acl.policy.writes` | - |
+| `acl.policy.cache` | `cache`: objects / functions / gates / rights, `result`: hit / miss |
+| `acl.jwt.verifications` | `result`: ok / expired / bad_signature / unknown_kid / unknown_issuer / no_roles |
+| `acl.jwks.refreshes` | `issuer`, `result` |
+| `acl.audit.events`, `acl.audit.dropped` (`where`: queue / ring / sink), `acl.audit.sink_errors` (`sink`) | - |
+
+| gauge | what |
+| --- | --- |
+| `acl.sessions.live` (`door`), `acl.sessions.max` | the session map against its cap |
+| `acl.door.state` (`door`, `uri`) | 1 serving, 0 draining |
+| `acl.node.draining`, `acl.node.uptime`, `acl.node.info` (=1; attributes: acl version, duckdb version, node id) | the node |
+| `acl.policy.version` | the policy version the caches are keyed by - to correlate an incident with a change |
+| `acl.policy.staleness` | seconds since the last successful version check: it grows when the source is unreachable |
+| `acl.jwks.age` (`issuer`) | seconds since the issuer's keys were last read successfully |
+| `acl.audit.queue_fill`, `acl.audit.ring_fill` | the pipeline's own health |
+
+Every counter above is also derivable from the events (a consumer that only listens loses nothing);
+the gauges are states, not occurrences, and exist only here.
 
 ### Correlation and trace ids
 
@@ -195,21 +253,15 @@ The caller supplies them; the node never invents one. Three ways in, two fields 
 - the **Flight door** also reads the gRPC metadata keys `x-correlation-id` and `traceparent` on each
   call - what ADBC/JDBC clients and an OTel-instrumented front set without touching SQL.
 
-### What the extended extension does with this (for the record; its own repo)
+### What the extended extension does with this
 
-- `OtelLogSink : AuditSink` - maps an event to an OTel LogRecord (severity from `verdict`, the trace
-  context from `traceparent`, attributes from the fields), batches, exports over OTLP.
-- An OTel metrics exporter reading `Counters()` on a timer; the per-role/per-object counters it keeps
-  from the events.
-- `RolePolicy : SessionPolicy` - the level per role/user/door from its own configuration (an
-  `acl_otel_*` setting or a table), which is "logging on a connection" decided by rule rather than by
-  hand.
-- Enrichment (claim values where the deployment says they are not personal data), sampling of
-  `allowed` events under load, a strict mode that fails the statement when its event cannot be
-  exported (the base stays fail-open).
-
-Loading: `LOAD acl; LOAD acl_otel;` in either order. Both call `GetOrCreate<AuditHooks>`; the
-registry is per `DatabaseInstance`, so two instances in one process never share sinks.
+Its requirements are a document of their own, beside this spec:
+[`extension-requirements.md`](extension-requirements.md) - the contract it consumes, the OTel
+logs and metrics it produces (every histogram and every per-role / per-object / per-tenant series is
+derived there, from the events), the level rules per role, user and door, per-connection logging,
+enrichment, sampling, its own health and settings. In one line: `LOAD acl; LOAD acl_otel;` in either
+order, both call `GetOrCreate<AuditHooks>`, the registry is per `DatabaseInstance`, and nothing the
+extension does can slow or stop a decision.
 
 ### What it costs
 
