@@ -80,10 +80,20 @@ void LoadInternal(ExtensionLoader &loader) {
 	// the audit (spec 069): the instance's level, the pipeline's bounds, the base file sink, the node's
 	// name on every event, the Prometheus rendering on the embedded listener - all read through the
 	// instance by the audit thread and the emitting seams, so GLOBAL
-	config.AddExtensionOption("acl_audit_level",
-	                          "acl: what is recorded - off, denied (refusals only), decisions (every "
-	                          "statement/admin/ingest decision), all (plus the session and door lifecycle)",
-	                          LogicalType::VARCHAR, Value("decisions"), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "acl_audit_level",
+	    "acl: what is recorded - off, denied (refusals only), decisions (every "
+	    "statement/admin/ingest decision), all (plus the session and door lifecycle)",
+	    LogicalType::VARCHAR, Value("decisions"),
+	    [](ClientContext &, SetScope, Value &value) {
+		    // refused at SET time: a level nobody meant must not quietly become `decisions`
+		    acl::AuditLevel parsed;
+		    if (value.IsNull() || !acl::ParseAuditLevel(value.ToString(), parsed)) {
+			    throw InvalidInputException("acl_audit_level: unknown level \"%s\" (off, denied, decisions, all)",
+			                                value.IsNull() ? "NULL" : value.ToString());
+		    }
+	    },
+	    SetScope::GLOBAL);
 	config.AddExtensionOption("acl_audit_buffer",
 	                          "acl: how many of the newest audit events acl_audit_events() holds (0 = none)",
 	                          LogicalType::BIGINT, Value::BIGINT(10000), nullptr, SetScope::GLOBAL);
@@ -94,6 +104,10 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          "acl: a path or URI the audit appends one JSON line per event to ('' = none); read "
 	                          "through duckdb's filesystem, so an object store rides httpfs",
 	                          LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_audit_denials_per_second",
+	                          "acl: refusals RECORDED per second per source (a session, a principal, a door); "
+	                          "the rest are counted only, as dropped where=rate_limit (0 = unlimited)",
+	                          LogicalType::BIGINT, Value::BIGINT(100), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_node_id",
 	                          "acl: the node's name on every audit event and metric ('' = <hostname>:<pid>)",
 	                          LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);

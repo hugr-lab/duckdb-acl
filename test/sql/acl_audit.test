@@ -43,6 +43,11 @@ SET GLOBAL acl_node_id='node-under-test';
 
 # --- the session lifecycle: an opened session is `all`, a refused one is a denial -----------------
 
+statement error
+SET GLOBAL acl_audit_level='loud';
+----
+<REGEX>:.*unknown level.*
+
 statement ok
 SET GLOBAL acl_audit_level='decisions';
 
@@ -110,13 +115,17 @@ SELECT value FROM acl_metrics() WHERE name = 'acl.sessions.closed' AND attribute
 ----
 1
 
-# the gauges: states read from the store, not occurrences
-query II
-SELECT name, value FROM acl_metrics() WHERE name IN ('acl.sessions.live', 'acl.node.draining', 'acl.sessions.max') ORDER BY name;
+# the gauges: states read from the store, not occurrences; the live sessions are per door, and the
+# base's doors are listed at zero rather than missing
+query III
+SELECT name, attributes, value FROM acl_metrics()
+WHERE name IN ('acl.sessions.live', 'acl.node.draining', 'acl.sessions.max') ORDER BY name, attributes;
 ----
-acl.node.draining	0
-acl.sessions.live	1
-acl.sessions.max	1000
+acl.node.draining	{}	0
+acl.sessions.live	{"door":"flight"}	0
+acl.sessions.live	{"door":"quack"}	0
+acl.sessions.live	{"door":"session"}	1
+acl.sessions.max	{}	1000
 
 query I
 SELECT value >= 0 FROM acl_metrics() WHERE name = 'acl.policy.version';
@@ -359,6 +368,36 @@ SELECT count(*) FROM acl_audit_events() WHERE seq > getvariable('seq0') AND kind
 ----
 5
 
+# a parse refusal records no text of the statement: the parser echoes the text at or near the error,
+# and a literal in it could be a secret
+query I
+SELECT reason FROM acl_audit_events() WHERE seq > getvariable('seq0') AND reason_code = 'parse';
+----
+acl_rewrite: the statement did not parse (its text is not recorded)
+
+# the issuer of a token nobody verified is the caller's to make up: quoted values of a principal
+# refusal are blanked before the event
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2V2aWwuZXhhbXBsZSIsInN1YiI6IngiLCJleHAiOjQxMDI0NDQ4MDAsInJvbGVzIjpbImFuYWx5c3QiXX0.c2ln' SELECT 1;
+----
+<REGEX>:.*unknown issuer.*
+
+statement ok
+SELECT acl_audit_flush();
+
+query II
+SELECT reason LIKE '%unknown issuer ""%', reason LIKE '%evil%'
+FROM acl_audit_events() WHERE reason_code = 'principal' ORDER BY seq DESC LIMIT 1;
+----
+true	false
+
+# each trace marker is written once: the one the door composed is the statement's, and a second one
+# in the SQL text behind it must not replace it
+statement error
+ACL ROLE "analyst" TRACE 'mine' TRACE 'yours' SELECT 1;
+----
+<REGEX>:.*TRACE may be written once.*
+
 # the counters: decisions by verdict/kind/door/class, denials by code, admin statements by scope
 query I
 SELECT value FROM acl_metrics() WHERE name = 'acl.decisions'
@@ -443,6 +482,62 @@ statement error
 ACL ROLE "analyst" SET acl_correlation_id = 'mine';
 ----
 <REGEX>:.*SET.*
+
+# --- a flood of cheap refusals from one source is counted, but not recorded past the limit --------
+
+statement ok
+SET GLOBAL acl_audit_denials_per_second=1;
+
+statement ok
+SELECT acl_audit_flush();
+
+statement ok
+SET VARIABLE seq2 = (SELECT coalesce(max(seq), 0) FROM acl_audit_events());
+
+# a source of its own (a role nobody granted), so the second's budget is not already spent by the
+# refusals above
+statement error
+ACL ROLE "flooder" SELECT * FROM c.nothing;
+----
+<REGEX>:.*no access.*
+
+statement error
+ACL ROLE "flooder" SELECT * FROM c.nothing;
+----
+<REGEX>:.*no access.*
+
+statement error
+ACL ROLE "flooder" SELECT * FROM c.nothing;
+----
+<REGEX>:.*no access.*
+
+statement error
+ACL ROLE "flooder" SELECT * FROM c.nothing;
+----
+<REGEX>:.*no access.*
+
+statement ok
+SELECT acl_audit_flush();
+
+# one per second per source is recorded (two if a second boundary fell between them); the rest are
+# dropped where=rate_limit - and every one of the four is still counted as a denial
+query I
+SELECT count(*) BETWEEN 1 AND 2 FROM acl_audit_events() WHERE seq > getvariable('seq2') AND reason_code = 'no_access';
+----
+true
+
+query I
+SELECT value >= 2 FROM acl_metrics() WHERE name = 'acl.audit.dropped' AND attributes = '{"where":"rate_limit"}';
+----
+true
+
+query I
+SELECT value >= 5 FROM acl_metrics() WHERE name = 'acl.denials' AND attributes = '{"reason_code":"no_access","door":"gateway"}';
+----
+true
+
+statement ok
+SET GLOBAL acl_audit_denials_per_second=100;
 
 # --- the policy source and the keys: what the node adopted, wrote, or could not read -------------
 
@@ -532,10 +627,11 @@ SELECT value FROM acl_metrics() WHERE name = 'acl.jwks.refreshes' AND attributes
 ----
 1
 
+# the unknown-issuer token of the statement section, and the unreadable keys here
 query I
 SELECT value FROM acl_metrics() WHERE name = 'acl.jwt.verifications' AND attributes = '{"result":"failed"}';
 ----
-1
+2
 
 statement ok
 SET GLOBAL acl_audit_level='decisions';

@@ -979,14 +979,16 @@ public:
 			if (begun->HasError()) {
 				return StatusFromDuck("acl", begun->GetError());
 			}
-			auto fail = [&](arrow::Status status) -> arrow::Status {
+			// `audit_text` is the RAW error, not the status the client gets: the audit keeps only our
+			// own refusals whole and reduces a source's error to its class (spec 069)
+			auto fail = [&](arrow::Status status, const string &audit_text) -> arrow::Status {
 				con.Query("ROLLBACK");
-				state->store->AuditIngest(handle, -1, status.ToString()); // the load's outcome (spec 069)
+				state->store->AuditIngest(handle, -1, audit_text);
 				return status;
 			};
 			auto result = stmt->Execute(values, false);
 			if (result->HasError()) {
-				return fail(StatusFromDuck("acl", result->GetError()));
+				return fail(StatusFromDuck("acl", result->GetError()), result->GetError());
 			}
 			int64_t total = 0;
 			auto chunk = result->Fetch();
@@ -997,13 +999,14 @@ public:
 				}
 			}
 			if (!ingest.error.empty()) {
-				return fail(arrow::Status::Invalid(ingest.error));
+				return fail(arrow::Status::Invalid(ingest.error), ingest.error);
 			}
 			// the GizmoSQL lesson: a partial load must be an error, never a silent success - and now it
 			// is caught before commit, so nothing of a mismatched load is stored
 			if (total != ingest.rows) {
-				return fail(arrow::Status::Invalid("acl: the target took " + std::to_string(total) + " rows of the " +
-				                                   std::to_string(ingest.rows) + " the stream delivered"));
+				auto mismatch = "acl: the target took " + std::to_string(total) + " rows of the " +
+				                std::to_string(ingest.rows) + " the stream delivered";
+				return fail(arrow::Status::Invalid(mismatch), mismatch);
 			}
 			auto committed = con.Query("COMMIT");
 			if (committed->HasError()) {

@@ -371,7 +371,7 @@ run_leg() {
 		[ "${ingests:-0}" -ge 2 ] || fail "$name: the audit counted ${ingests:-0} completed loads, expected at least 2"
 		opened="$(echo "$metrics" | awk '/^acl_sessions_opened\{door="quack"\} /{print $2}')"
 		[ "${opened:-0}" -ge 4 ] || fail "$name: the audit counted ${opened:-0} sessions opened, expected at least 4"
-		echo "$metrics" | grep -q '^acl_sessions_live ' || fail "$name: GET /metrics carries no acl_sessions_live gauge"
+		echo "$metrics" | grep -q '^acl_sessions_live[{ ]' || fail "$name: GET /metrics carries no acl_sessions_live gauge"
 		audit_note="the audit counted $ingests loads and $opened sessions"
 	fi
 

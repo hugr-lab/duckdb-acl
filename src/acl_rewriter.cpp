@@ -239,11 +239,20 @@ public:
 			         "\" needs a session of the client's own (a door's ACL SESSION): a per-statement prefix runs on a "
 			         "connection the gateway shares, where a setting would leak to the next principal");
 		}
+		string value;
 		if (stmt.set_type == SetType::SET) {
 			auto &set = stmt.Cast<SetVariableStatement>();
 			if (!set.value || set.value->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 				Deny(Reason::SETTING_DENIED, "SET \"" + name + "\" takes a constant value under ACL");
 			}
+			auto &constant = set.value->Cast<ConstantExpression>().GetValue();
+			value = constant.IsNull() ? string() : constant.ToString();
+		}
+		// the trace settings (spec 069) land on the session's record too: the door composes the prefix
+		// from there, whichever connection evaluates the composition (quack's is the server's, not
+		// the client's). A RESET clears it.
+		if (StringUtil::CIEquals(name, "acl_correlation_id") || StringUtil::CIEquals(name, "acl_traceparent")) {
+			store.SetSessionTrace(principal.session, name, value);
 		}
 	}
 
@@ -1425,7 +1434,8 @@ private:
 	unique_ptr<TableRef> BuildReferencesSubquery(FunctionExpression &function, const Identifier &alias) {
 		auto &arguments = function.GetArguments();
 		if (arguments.size() > 1) {
-			Deny(Reason::POLICY_ERROR, "acl_references takes at most one argument: the object to list references for");
+			Deny(Reason::STATEMENT_TYPE,
+			     "acl_references takes at most one argument: the object to list references for");
 		}
 		string object;
 		if (arguments.size() == 1) {
@@ -1433,7 +1443,7 @@ private:
 			if (argument.GetExpressionClass() != ExpressionClass::CONSTANT) {
 				// the filter is spliced into generated SQL, so it has to be known now - and the golden
 				// rule forbids adding a parameter of our own to carry it
-				Deny(Reason::POLICY_ERROR, "acl_references needs a constant object name");
+				Deny(Reason::STATEMENT_TYPE, "acl_references needs a constant object name");
 			}
 			object = argument.Cast<ConstantExpression>().GetValue().ToString();
 		}
@@ -1454,13 +1464,13 @@ private:
 	unique_ptr<TableRef> BuildKeysSubquery(FunctionExpression &function, const Identifier &alias) {
 		auto &arguments = function.GetArguments();
 		if (arguments.size() > 1) {
-			Deny(Reason::POLICY_ERROR, "acl_keys takes at most one argument: the object to list the key of");
+			Deny(Reason::STATEMENT_TYPE, "acl_keys takes at most one argument: the object to list the key of");
 		}
 		string object;
 		if (arguments.size() == 1) {
 			auto &argument = arguments[0].GetExpression();
 			if (argument.GetExpressionClass() != ExpressionClass::CONSTANT) {
-				Deny(Reason::POLICY_ERROR, "acl_keys needs a constant object name");
+				Deny(Reason::STATEMENT_TYPE, "acl_keys needs a constant object name");
 			}
 			object = argument.Cast<ConstantExpression>().GetValue().ToString();
 		}
@@ -1899,7 +1909,7 @@ private:
 
 	void RequireReadableExpr(const ParsedExpression &expr, const TablePolicy &policy, const string &vname) {
 		if (expr.GetExpressionClass() == ExpressionClass::STAR) {
-			Deny(Reason::STATEMENT_TYPE, "RETURNING * on \"" + vname + "\" is not allowed under a column policy");
+			Deny(Reason::WRITE_POLICY, "RETURNING * on \"" + vname + "\" is not allowed under a column policy");
 		}
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
@@ -2035,7 +2045,7 @@ private:
 			TablePolicy called;
 			if (store.ResolveTableFunction(principal, key, called) ||
 			    store.ResolveScalarFunction(principal, key, called)) {
-				Deny(Reason::DDL_HOME, "\"" + key + "\" is a function, which is called rather than written");
+				Deny(Reason::STATEMENT_TYPE, "\"" + key + "\" is a function, which is called rather than written");
 			}
 			Deny(Reason::NO_ACCESS, "no access to object \"" + key + "\"");
 		}

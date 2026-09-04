@@ -223,8 +223,16 @@ class stand in for them - and the JSON-lines file sink writes exactly those fiel
 one code of a bounded taxonomy (the `Reason` enum in `acl_rewriter.hpp`; every `Deny` site names
 its own, and a failure nobody noted falls to the phase it escaped from - `parse`, `principal`,
 `mgmt_unauthorized`, `policy_error`). Metric attributes are drawn from bounded sets, so a metric row
-can never name a role, a subject or an object (`acl_audit.test` pins it). A slow or throwing sink
-costs dropped events, counted, never a slower statement; a level of `off` still counts. The audit
+can never name a role, a subject or an object (`acl_audit.test` pins it). A refusal's `reason` is
+our own text and names virtual objects only; the three places it could carry more are closed: a
+`parse` reason is a fixed sentence (the parser echoes the statement's text), a `principal` reason
+has its quoted values blanked (the issuer or algorithm of a token nobody verified), an ingest
+failure of the physical source keeps only the error's class (the source's text carries the row it
+refused). Reasons are bounded to 512 bytes and trace ids to 128, so a caller cannot grow the ring.
+A slow or throwing sink costs dropped events, counted, never a slower statement; a level of `off`
+still counts. One source - a session, a principal, a door - has at most
+`acl_audit_denials_per_second` refusals recorded per second (all are counted), so a flood of cheap
+refusals cannot push other principals' records out of the ring, the queue or a sink. The audit
 surface is refused to a principal like every other operator function; the Prometheus route is
 opt-in and unauthenticated by design, like discovery - it publishes counts and states, nothing a
 principal could not infer from its own refusals.

@@ -441,12 +441,26 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
 - **Tracing** - a statement's trace rides in the prefix as `TRACE '<correlation id>'` and
   `PARENT '<W3C traceparent>'`, written by whoever composes it: a gateway calling `acl_session_sql`
   sets `acl_correlation_id` / `acl_traceparent` on its connection first; a quack client SETs the same
-  two on its own session (spec 068's allowlist); a Flight client sends the `x-correlation-id` and
+  two on its own session (spec 068's allowlist - the value lands on the session's record, since the
+  server composes on a connection of its own); a Flight client sends the `x-correlation-id` and
   `traceparent` headers, or sets them through `SetSessionOptions`. Every event of that statement
   carries both.
 - **Node identity** - `acl_node_id` (default `<hostname>:<pid>`) is on every event and metric row, so
   a fleet's streams merge without ambiguity. Nodes never share audit state; a central view is the
   collector's job (spec 069, "In a fleet").
+- **What a refusal's text may carry** - our own message, which names virtual objects and nothing
+  else, with three exceptions the audit closes itself: a `parse` refusal is a fixed sentence (the
+  parser would echo the statement's text, and a literal in it could be a secret); a `principal`
+  refusal has its quoted values blanked (the issuer or algorithm of a token nobody verified is the
+  caller's to make up); an `ingest` failure that is the physical source's keeps only the error's
+  class (`acl: the source refused the write (Constraint Error)`), never the row it refused. Reasons
+  are cut to 512 bytes, trace ids to 128.
+- **One source cannot drown the others** - at most `acl_audit_denials_per_second` (default 100)
+  refusals per second per source (a session, else a principal, else a door) are recorded; the rest
+  are counted exactly like the recorded ones (`acl.denials` stays true) and show as
+  `acl.audit.dropped{where=rate_limit}`. Allowed decisions are not limited. `0` disables the limit.
+- **Each trace marker once** - a second `TRACE` or `PARENT` written in the SQL text behind a door's
+  prefix is a parse refusal, not a replacement of the one the door composed.
 
 The whole surface - `acl_audit_events()`, `acl_metrics()`, `acl_session_audit_level`,
 `acl_audit_flush`, `acl_audit_dropped`, the settings - is the operator's: denied to a principal.
