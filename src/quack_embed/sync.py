@@ -64,6 +64,24 @@ PATCHES = {
             "\t\t}\n"
             "\t\tacl::AclQuackDrainCompleted(*connection.duckdb_connection, stream_id, *result);\n",
         ),
+        # a refused drain: the error is read from the stream this handler holds BEFORE the finalize -
+        # a second SEND_DATA racing this one finds the insert already finalized (no stream) and would
+        # answer the client an empty error (a CI flake on the read-only refusal, 2026-09-04)
+        (
+            "\t\tif (stream->HasError()) {\n"
+            "\t\t\tauto error = connection.insert.Finalize();\n"
+            "\t\t\treturn make_uniq<ErrorResponse>(error);\n"
+            "\t\t}\n"
+            "\t\treturn make_uniq<SendDataResponseMessage>();",
+            "\t\tif (stream->HasError()) {\n"
+            "\t\t\t// acl: read from the stream this handler holds, before the finalize - a second SEND_DATA\n"
+            "\t\t\t// racing this one finds the insert already finalized and would answer an empty error\n"
+            "\t\t\tauto error = stream->GetError();\n"
+            "\t\t\tconnection.insert.Finalize();\n"
+            "\t\t\treturn make_uniq<ErrorResponse>(error);\n"
+            "\t\t}\n"
+            "\t\treturn make_uniq<SendDataResponseMessage>();",
+        ),
     ],
 }
 
