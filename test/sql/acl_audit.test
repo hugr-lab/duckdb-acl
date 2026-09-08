@@ -579,6 +579,9 @@ true
 
 # an issuer's keys read from a document (spec 023): the read is a `keys` event naming the issuer
 statement ok
+SET GLOBAL acl_jwks_locations = 'https://, __TEST_DIR__/';
+
+statement ok
 COPY (SELECT '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AS c)
     TO '__TEST_DIR__/audit_jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
 

@@ -109,7 +109,9 @@ void SetupFixture(Connection &con, const std::string &httpfs_ext, const std::str
 	          "'api://acl-test','HS256','roles','{\"tid\": \"tenant\"}')");
 	if (!extra_issuer.empty()) {
 		// registered ONLY so door discovery would list two issuers; removed again below. Carries a
-		// client_id, so discovery must advertise it in the spec-064 shape.
+		// client_id, so discovery must advertise it in the spec-064 shape. The stub IdP is http on
+		// loopback: the node fetches its discovery only from a location the operator listed (spec 071)
+		Exec(con, "SET GLOBAL acl_jwks_locations = 'https://, " + extra_issuer + "/'");
 		Exec(con, "SELECT acl_define_issuer('" + extra_issuer +
 		              "','{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
 		              "'api://acl-test','HS256','roles','{}','','door-app')");

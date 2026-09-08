@@ -1512,6 +1512,92 @@ int64_t PolicyStore::JwksMaxStale() {
 	return catalog->SettingInt64("acl_jwks_max_stale", 3600);
 }
 
+string PolicyStore::JwksLocations() {
+	if (!catalog) {
+		return "https://";
+	}
+	return catalog->SettingString("acl_jwks_locations", "https://");
+}
+
+//! spec 071: a location is allowed when it starts with one of the operator's prefixes, compared as
+//! written - no URL normalisation, so no normalisation bugs; the list is the operator's to shape
+bool PolicyStore::JwksLocationAllowed(const string &uri, string &why) {
+	// a prefix admits a directory or an origin, and ".." would walk out of either: refused whatever
+	// the list says (review: `/etc/acl/jwks/../../tmp/evil.json` passed a textual prefix)
+	if (uri.find("..") != string::npos) {
+		why = "\"" + uri + "\" contains \"..\", which no location may";
+		return false;
+	}
+	auto setting = JwksLocations();
+	for (auto &item : StringUtil::Split(setting, ',')) {
+		auto prefix = item;
+		StringUtil::Trim(prefix);
+		if (!prefix.empty() && StringUtil::StartsWith(uri, prefix)) {
+			why.clear();
+			return true;
+		}
+	}
+	why = "\"" + uri + "\" is outside acl_jwks_locations (" + setting + ")";
+	return false;
+}
+
+vector<PolicyStore::JwksCacheRow> PolicyStore::JwksCacheRows() {
+	vector<JwksCacheRow> rows;
+	if (!catalog) {
+		return rows; // memory mode reads no documents and caches none
+	}
+	if (catalog->function_mode) {
+		// the function driver enumerates nothing (spec 008): the cache is the listing
+		lock_guard<mutex> guard(lock);
+		for (auto &cached : jwks_cache) {
+			JwksCacheRow row;
+			row.issuer = cached.first;
+			row.location = cached.second.uri;
+			string why;
+			row.allowed = JwksLocationAllowed(row.location, why);
+			row.fetched_at = cached.second.fetched_at;
+			row.tried_at = cached.second.tried_at;
+			row.error = cached.second.error;
+			if (!cached.second.keys_json.empty()) {
+				row.keys = JwksKeyIds(cached.second.keys_json, row.kids);
+			}
+			rows.push_back(std::move(row));
+		}
+		return rows;
+	}
+	auto issuers = catalog->Query("SELECT \"issuer\", \"jwks_uri\" FROM " + catalog->Tbl("issuers") +
+	                              " WHERE \"jwks_uri\" IS NOT NULL AND \"jwks_uri\" <> '' ORDER BY 1");
+	lock_guard<mutex> guard(lock);
+	for (idx_t i = 0; i < issuers->RowCount(); i++) {
+		JwksCacheRow row;
+		row.issuer = issuers->GetValue(0, i).ToString();
+		row.location = issuers->GetValue(1, i).ToString();
+		string why;
+		row.allowed = JwksLocationAllowed(row.location, why);
+		auto cached = jwks_cache.find(row.issuer);
+		if (cached != jwks_cache.end() && cached->second.uri == row.location) {
+			row.fetched_at = cached->second.fetched_at;
+			row.tried_at = cached->second.tried_at;
+			row.error = cached->second.error;
+			if (!cached->second.keys_json.empty()) {
+				row.keys = JwksKeyIds(cached->second.keys_json, row.kids);
+			}
+		}
+		rows.push_back(std::move(row));
+	}
+	return rows;
+}
+
+int64_t PolicyStore::JwksDropCache(const string &issuer) {
+	lock_guard<mutex> guard(lock);
+	if (issuer.empty()) {
+		auto dropped = NumericCast<int64_t>(jwks_cache.size());
+		jwks_cache.clear();
+		return dropped;
+	}
+	return NumericCast<int64_t>(jwks_cache.erase(issuer));
+}
+
 //! spec 023: the key set a token is judged against. An issuer that pastes a JWKS keeps it; one that
 //! names a URI has it read through duckdb's filesystem, cached here, and re-read when the TTL expires
 //! or when the token names a key the cached document does not have.
@@ -1526,6 +1612,34 @@ string PolicyStore::ResolveIssuerKeys(const IssuerConfig &config, const string &
 	}
 	auto now =
 	    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+	static constexpr int64_t RETRY_FLOOR_SECONDS = 10;
+	// spec 071: judged against the setting as it is on THIS node, now, before any document is opened
+	// - and a cached document from a location no longer on the list is not used either: an operator
+	// who took a location off the list meant now, not after acl_jwks_max_stale. The refusal is the
+	// entry's last attempt (acl_jwks_cache shows it) and one keys event per retry floor, not per token.
+	string why;
+	if (!JwksLocationAllowed(config.jwks_uri, why)) {
+		bool record = false;
+		{
+			lock_guard<mutex> guard(lock);
+			auto &entry = jwks_cache[config.issuer];
+			if (entry.uri != config.jwks_uri) {
+				entry = JwksEntry();
+				entry.uri = config.jwks_uri;
+			}
+			// the first refusal is recorded at once; the same refusal again, once per floor
+			record = entry.error != why || now - entry.tried_at >= RETRY_FLOOR_SECONDS;
+			entry.tried_at = now;
+			entry.error = why;
+		}
+		if (record) {
+			AuditKeys(config.issuer, false, why, "location_refused", "policy_error");
+		}
+		NoteDenyReason(Reason::POLICY_ERROR); // the policy names a source this node does not read from
+		throw BinderException("acl_rewrite: token rejected: the keys of issuer \"%s\" cannot be read: %s - list its "
+		                      "prefix there, or paste the keys",
+		                      config.issuer, why);
+	}
 	auto refresh = JwksRefreshInterval();
 	JwksEntry entry;
 	{
@@ -1542,7 +1656,6 @@ string PolicyStore::ResolveIssuerKeys(const IssuerConfig &config, const string &
 	// a key that rotated in since the last read: worth one more read, but not once per token, so the
 	// same floor as any other retry applies
 	bool rotated = !expired && !JwksHasKid(entry.keys_json, kid);
-	static constexpr int64_t RETRY_FLOOR_SECONDS = 10;
 	if ((expired || rotated) && now - entry.tried_at >= (rotated ? RETRY_FLOOR_SECONDS : 0)) {
 		string document, error;
 		entry.tried_at = now;
@@ -1555,6 +1668,14 @@ string PolicyStore::ResolveIssuerKeys(const IssuerConfig &config, const string &
 		}
 		AuditKeys(config.issuer, entry.error.empty(), entry.error);
 		lock_guard<mutex> guard(lock);
+		if (!entry.error.empty() && jwks_cache.find(config.issuer) == jwks_cache.end()) {
+			// acl_jwks_refresh dropped the entry while this read was in flight and the read failed:
+			// the copy in hand carries the old document, and writing it back would serve it until
+			// acl_jwks_max_stale - exactly what the drop meant to end. The attempt is recorded, the
+			// document is not (spec 071 review).
+			entry.keys_json.clear();
+			entry.fetched_at = 0;
+		}
 		jwks_cache[config.issuer] = entry;
 	}
 	if (entry.keys_json.empty()) {

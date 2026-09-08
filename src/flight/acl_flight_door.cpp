@@ -832,7 +832,7 @@ public:
 			if (!state->store->LookupIssuer(issuer, config) || config.client_id.empty()) {
 				continue; // an issuer with no client_id cannot do ROPC and is skipped (spec 064)
 			}
-			auto ep = DiscoverEndpointsCached(issuer);
+			auto ep = DiscoverEndpointsCached(*state->store, issuer);
 			if (!ep.Ok()) {
 				refusal = "acl: OIDC discovery against " + issuer + " failed: " + ep.error;
 				continue;

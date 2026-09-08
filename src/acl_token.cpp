@@ -319,6 +319,30 @@ bool JwksHasKid(const string &keys_json, const string &kid) {
 	return false;
 }
 
+int64_t JwksKeyIds(const string &keys_json, vector<string> &kids) {
+	kids.clear();
+	JsonDoc keys(keys_json);
+	if (!keys.Root()) {
+		return keys_json.find("-----BEGIN") != string::npos ? 1 : 0; // a PEM public key, or nothing usable
+	}
+	auto array = duckdb_yyjson::yyjson_obj_get(keys.Root(), "keys");
+	if (!array || !duckdb_yyjson::yyjson_is_arr(array)) {
+		return 0;
+	}
+	int64_t count = 0;
+	duckdb_yyjson::yyjson_val *key;
+	duckdb_yyjson::yyjson_arr_iter iter;
+	duckdb_yyjson::yyjson_arr_iter_init(array, &iter);
+	while ((key = duckdb_yyjson::yyjson_arr_iter_next(&iter))) {
+		count++;
+		auto kid = JsonString(duckdb_yyjson::yyjson_obj_get(key, "kid"));
+		if (!kid.empty()) {
+			kids.push_back(kid);
+		}
+	}
+	return count;
+}
+
 JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clock_skew_seconds, bool ignore_exp) {
 	ParsedJwt jwt;
 	if (!SplitJwt(token, jwt)) {

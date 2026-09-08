@@ -17,7 +17,7 @@ namespace acl {
 //! An issuer's OIDC endpoints through a process-wide TTL cache: public metadata keyed by issuer
 //! URL, so instances sharing a process share it safely. 300 s; a failed read 30 s — discovery
 //! answers unauthenticated callers, and a dead IdP must not turn every probe into a network wait.
-oidc::Endpoints DiscoverEndpointsCached(const string &issuer);
+oidc::Endpoints DiscoverEndpointsCached(PolicyStore &store, const string &issuer);
 
 //! The discovery document: {"issuers":[{"issuer":…,"client_id":…,"token_endpoint":…,
 //! "device_authorization_endpoint":…}]}. client_id is included (a public identifier); the

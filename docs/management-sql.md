@@ -353,6 +353,12 @@ Functions: `acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_c
 one of `keys`, `jwks_uri`, `audiences`, `algs`, `role_claim`, `claim_map`, `client_id`,
 `client_secret`, `acl_drop_issuer(issuer[, mode])`.
 
+A `KEYS FROM` location must start with one of the prefixes in `acl_jwks_locations` (GLOBAL, default
+`https://`; a local directory is listed by name, `..` is refused anywhere): a location outside the
+list is refused where it is written - `acl admin: KEYS FROM "<uri>" is outside acl_jwks_locations (…)
+- list its prefix there first, or paste the keys` - and again where the node would read it (spec 071,
+docs/authentication.md).
+
 ## Role mappings
 
 ```

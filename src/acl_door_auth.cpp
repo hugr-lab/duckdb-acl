@@ -2,6 +2,7 @@
 // acl_door_auth.cpp — the auth-discovery document (spec 064), shared by the doors
 //===----------------------------------------------------------------------===//
 
+#include "duckdb/common/string_util.hpp"
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
 
@@ -23,7 +24,20 @@ std::unordered_map<string, std::pair<oidc::Endpoints, std::chrono::steady_clock:
 
 } // namespace
 
-oidc::Endpoints DiscoverEndpointsCached(const string &issuer) {
+oidc::Endpoints DiscoverEndpointsCached(PolicyStore &store, const string &issuer) {
+	// spec 071: the node fetches from the network only where the operator allowed - the issuer's
+	// discovery document is a fetch like a key document, judged by the same list (and not cached:
+	// the list may change)
+	// judged as what is fetched - the discovery document's URL, not the bare issuer - so a prefix
+	// that names the realm with its trailing slash admits it, exactly as it admits the realm's keys
+	auto document = issuer + (StringUtil::EndsWith(issuer, "/") ? "" : "/") + ".well-known/openid-configuration";
+	string why;
+	if (!store.JwksLocationAllowed(document, why)) {
+		oidc::Endpoints refused;
+		refused.issuer = issuer;
+		refused.error = "the issuer's discovery is not read from here: " + why;
+		return refused;
+	}
 	auto now = std::chrono::steady_clock::now();
 	{
 		std::lock_guard<std::mutex> guard(discovery_cache_lock);
@@ -53,7 +67,7 @@ string DoorAuthJson(PolicyStore &store) {
 		if (store.LookupIssuer(issuers[i], config) && !config.client_id.empty()) {
 			json += ",\"client_id\":" + JsonQuote(config.client_id);
 		}
-		auto ep = DiscoverEndpointsCached(issuers[i]);
+		auto ep = DiscoverEndpointsCached(store, issuers[i]);
 		if (ep.Ok()) {
 			json += ",\"token_endpoint\":" + JsonQuote(ep.token_endpoint);
 			if (!ep.device_authorization_endpoint.empty()) {

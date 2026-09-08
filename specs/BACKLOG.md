@@ -108,7 +108,8 @@ before if cheap; **later** — development, after the release.
   result columns) so they opt into spec 065's clean refusals without a hand-typed list.
 - **Nested virtual schemas are presented flat** (`parent_schema_oid` NULL); fine until a virtual
   catalog actually nests.
-- **JWKS**: an allowlist for `KEYS FROM` locations and a listing of what the cache holds.
+- ~~**JWKS**: an allowlist for `KEYS FROM` locations and a listing of what the cache holds.~~ - spec 071
+  (2026-09-08): `acl_jwks_locations`, `acl_jwks_cache()`, `acl_jwks_refresh()`.
 - **Mid-ingest failure semantics**: if the process dies mid-ingest, the client must be told to
   restart rather than silently receive a partial load.
 - **The session-identity sweep, the nice version**: `current_setting`/`getvariable` are *denied*

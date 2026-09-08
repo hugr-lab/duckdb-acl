@@ -68,6 +68,7 @@ CREATE TABLE orders AS SELECT i AS id, CASE WHEN i%2=0 THEN 'acme' ELSE 'globex'
 ATTACH ':memory:' AS store;
 SELECT acl_use_db('store','acl',true);
 SET GLOBAL acl_allow_anonymous_admin=true;
+SET GLOBAL acl_jwks_locations = 'https://, $IDP/';  -- the stub IdP is http on loopback: listed by name (spec 071)
 ACL ADMIN CREATE ISSUER '$IDP' KEYS '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AUDIENCES 'api://acl-test' ALGS 'HS256' ROLE CLAIM 'roles' CLAIM MAP (tid => tenant) CLIENT ID 'acl-door';
 ACL ADMIN CREATE VIRTUAL CATALOG c;
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders;

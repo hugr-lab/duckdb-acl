@@ -545,7 +545,8 @@ Before a node serves anyone:
       under `connect` binding), `acl_session_token_binding` (`every_use` where revocation latency
       matters), `acl_max_ingest_rows` where a ceiling is wanted.
 - [ ] Issuers: audiences are never `'*'` by accident; `acl_jwks_max_stale` is `0` if a failed JWKS
-      read must be fatal at once; `KEYS FROM` locations are trusted (an allowlist is a backlog item).
+      read must be fatal at once; `acl_jwks_locations` names the origins keys may be read from (the
+      default admits https only; a local JWKS directory is listed by name - spec 071).
 - [ ] Stopping a node follows spec 066: `acl_drain()` → watch the count → `acl_session_kill` for
       stragglers → `acl_flight_stop` / `acl_quack_stop` → close duckdb. Stop the Flight door before
       closing the instance.

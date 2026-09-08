@@ -143,6 +143,13 @@ and `acl_map_role(issuer, source, external, role)` — a JWT-shaped `ACL TOKEN` 
 so an https JWKS (needs httpfs) and a file refreshed out of band are one mechanism. Cached per
 instance: `acl_jwks_refresh_interval` (300s), a re-read when a token names an unknown `kid`, and
 `acl_jwks_max_stale` (3600s; `0` = a failed read is fatal at once). Keys and location are alternatives.
+**Spec 071**: `acl_jwks_locations` (GLOBAL only, default `https://`) lists the prefixes a `KEYS FROM`
+location - and an issuer's discovery URL (spec 064) - may start with; `..` is refused anywhere; a
+location outside it is refused where written and again where read (the node's setting binds,
+whatever a shared catalog says; the refusal is the cache row's last attempt and a `keys` event
+`location_refused` / `policy_error`, floored); `acl_jwks_cache()` lists what the node trusts
+(location, allowed, fetched/tried, error, key count, kids - never keys), `acl_jwks_refresh([issuer])`
+drops the cache so the next token re-reads (a read in flight cannot write the old document back).
 **Spec 009**: administering the ACL is a granted capability — `acl_grant_admin(role, 'manage'|'passthrough'[, vcat])`
 / `acl_revoke_admin(role)` (or `ACL ADMIN GRANT|REVOKE ADMIN …`), used through
 the marker the client writes after the principal prefix: `ACL <mgmt>` (manage the ACL) or

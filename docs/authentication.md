@@ -104,6 +104,35 @@ Cached per instance, in memory:
 | the read fails and nothing is cached | refuse: *"the keys of issuer "X" could not be read from "uri": <reason>"* |
 | the issuer is repointed at another location | the cache does not apply; the new location is read at once |
 
+**Where a node reads from** (spec 071): `acl_jwks_locations` (GLOBAL, default `https://`) lists,
+comma-separated, the prefixes a `KEYS FROM` location may start with - `'https://, /etc/acl/jwks/'`
+admits any https URL and the files under that directory, `'https://kc.corp/realms/'` pins one
+origin, `''` admits no location (keys are pasted or nothing). A location outside the list is refused
+where it is written (`CREATE|ALTER ISSUER … KEYS FROM`, `acl_define_issuer`, `acl_alter_issuer`:
+*"KEYS FROM "uri" is outside acl_jwks_locations (…) - list its prefix there first, or paste the
+keys"*) and again where it would be read, against the setting as it is on *this* node, now: the
+token is rejected (*"the keys of issuer "X" cannot be read: "uri" is outside acl_jwks_locations
+(…)"*), the cached document is not used either, the refusal shows as the row's error in
+`acl_jwks_cache()`, and a `keys` event `location_refused` (reason `policy_error`, at `denied`)
+carries it - a policy catalog shared by a fleet cannot make one node read what it was not told to.
+The prefixes are compared as written: lower-case scheme, a directory prefix ending in `/` - and a
+host prefix too (`https://kc.corp` admits `https://kc.corp.evil/` and `https://kc.corp@evil/`;
+`https://kc.corp/` admits neither); a location containing `..` is refused whatever the list says.
+The setting is global only (`SET GLOBAL`; a session scope is refused). The issuer's OIDC discovery
+document (`<issuer>/.well-known/openid-configuration`, spec 064) is fetched under the same list,
+judged by that URL: an issuer whose document is outside it is listed by the discovery answer
+without endpoints, and the password handshake refuses - a prefix `https://kc.corp/realms/x/` admits
+both the realm's keys and its discovery.
+
+**What the node trusts right now**: `acl_jwks_cache()` answers one row per issuer that reads its
+keys - `issuer`, `location`, `allowed` (on this node, now), `fetched_at` / `age_seconds` (the last
+successful read; NULL: never), `last_tried_at`, `error` (the last attempt's, NULL when it
+succeeded), `keys` (in the cached document; a PEM counts one) and `kids` (the public names of those
+keys, never the keys). `acl_jwks_refresh([issuer])` drops the cached document of one issuer - of
+every issuer without an argument - and answers how many, so the next token re-reads whatever the
+refresh interval says - the rotation-incident verb. Both are the operator's: denied to a principal,
+like every `acl_*` function.
+
 Key selection inside a JWKS: a key whose `use` is not `sig` is skipped (a Keycloak realm publishes an
 RSA-OAEP encryption key beside its signing key); a `kid` that matches nothing is *"no usable RS256
 key for this issuer"*, never a fallback to another key. A token without a `kid` verifies only when
@@ -287,6 +316,7 @@ changed.
 | `acl_jwt_clock_skew` | 60 | seconds of skew allowed on `exp`/`nbf` |
 | `acl_jwks_refresh_interval` | 300 | seconds a fetched JWKS is used before it is read again |
 | `acl_jwks_max_stale` | 3600 | seconds a JWKS that can no longer be read may still be used; `0` = a failed read is fatal |
+| `acl_jwks_locations` | `https://` | comma-separated prefixes a `KEYS FROM` location may start with; refused outside them where written and where read; `''` admits none (spec 071) |
 | `acl_session_idle_timeout` | 900 | seconds a session may go unused; `0` disables (refused under `connect`) |
 | `acl_session_token_binding` | `connect` | when `exp` is judged: `connect` or `every_use` |
 | `acl_max_sessions` | 1000 | live sessions at once; a new one is refused at the cap; `0` unlimited |
@@ -313,6 +343,8 @@ changed.
 | `token rejected: the keys of issuer "X" could not be read from "uri": ...` | nothing cached and the read failed | the reason is duckdb's own (httpfs missing, 404, ...) |
 | `token rejected: the keys of issuer "X" were last read N seconds ago and "uri" is still unreadable (...); acl_jwks_max_stale is M` | the cached keys are older than allowed | fix the location; raise `acl_jwks_max_stale` only knowingly |
 | `token rejected: issuer "X" reads its keys from "uri", which needs a policy catalog - the in-memory store cannot read documents` | `KEYS FROM` without `acl_use_db` | enable a policy catalog, or paste the keys |
+| `token rejected: the keys of issuer "X" cannot be read: "uri" is outside acl_jwks_locations (…)` | the location is not on this node's list (spec 071) | list its prefix in `acl_jwks_locations`, or paste the keys |
+| `acl admin: KEYS FROM "uri" is outside acl_jwks_locations (…)` | the same, at the write | the same |
 | `session unknown` / `session expired` / `session idle` | the `ACL SESSION` handle is not usable | the door reconnects; `acl_session_reason` tells the client why |
 | `... requires a quoted value` | `ACL SESSION`/`TOKEN` without a quoted value | a door composes the prefix; a client never writes one |
 | `acl_session_token_binding accepts 'connect' or 'every_use', not 'X'` / `... is global - use SET GLOBAL` | a bad or session-scoped value | `SET GLOBAL` one of the two |
