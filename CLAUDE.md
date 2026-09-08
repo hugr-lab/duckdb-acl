@@ -61,6 +61,7 @@ GEN=ninja make                      # release build of duckdb + the extension
 build/release/test/unittest 'test/sql/*'         # run the WHOLE suite (what CI runs; ~50 files)
 build/release/test/unittest test/sql/acl.test    # one file (acl.test is the memory-mode baseline only)
 GEN=ninja make test-cpp             # standalone C++ invariant tests (specs/002)
+make tidy                           # clang-tidy (the repo config) over our sources; needs LLVM's clang-tidy
 test/harness/run.sh                 # end-to-end demo against the built extension
 test/live/serve.sh [--tls]          # serve one seeded node for real client tools (spec 057 runbook)
 

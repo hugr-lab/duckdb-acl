@@ -16,11 +16,8 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/main/database.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 
 #include <algorithm>
-#include <set>
 
 namespace duckdb {
 namespace acl {
@@ -321,10 +318,15 @@ private:
 		}
 	}
 
-	//! The columns a relation exposes right now: its declared names, else what the source has
+	//! The columns a relation exposes right now: its declared names (the contract), else what its
+	//! source binds to NOW - not the stored schema, which is exactly what may be stale
 	bool Exposed(const Relation &relation, case_insensitive_set_t &out) {
+		vector<string> declared;
+		for (auto &entry : relation.declared) {
+			declared.push_back(entry.first);
+		}
 		vector<string> names;
-		if (!catalog.ExposedColumns(relation.Source(), relation.known, names)) {
+		if (!catalog.ExposedColumns(relation.Source(), declared, names)) {
 			return false;
 		}
 		for (auto &name : names) {
@@ -736,15 +738,12 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 			    "REMAP the column, alter those grants, or DROP MISSING COLUMNS AND MASKS",
 			    vcat, vname, StringUtil::Join(orphaned, ", "));
 		}
-		Columns kept;
-		for (auto &column : columns) {
-			if (!missing.count(column.first)) {
-				kept.push_back(column);
-			}
-		}
-		columns = std::move(kept);
-		changed += NumericCast<int64_t>(missing.size());
-		CatalogAlterRelation(vcat, vname, "columns", "", columns, marks);
+		// Not one transaction (each writer is its own, spec 034's version bump included), so the
+		// order is what keeps a failure midway harmless: the grants lose their mask items FIRST -
+		// a grant with fewer items reads less, never more - and the object's list is cut after.
+		// A grant rewrite that fails leaves the object whole and the dead entry unreadable as
+		// before; a cut that fails leaves masks gone from grants that could not read the column
+		// anyway. Nothing on either path widens.
 		for (auto &grant : affected) {
 			vector<string> items;
 			for (auto &item : grant.items) {
@@ -756,6 +755,15 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 			}
 			CatalogSetObjectCaps(grant.role, vcat, vname, grant.caps, grant.rls, StringUtil::Join(items, ", "));
 		}
+		Columns kept;
+		for (auto &column : columns) {
+			if (!missing.count(column.first)) {
+				kept.push_back(column);
+			}
+		}
+		columns = std::move(kept);
+		changed += NumericCast<int64_t>(missing.size());
+		CatalogAlterRelation(vcat, vname, "columns", "", columns, marks);
 		CatalogRefreshSchema(vcat, vname);
 		return changed;
 	} else {
@@ -821,16 +829,16 @@ void CheckScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 	idx_t count = 0;
 	while (state.next < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &row = state.rows[state.next++];
-		output.SetValue(0, count, Value(row.vcat));
-		output.SetValue(1, count, Value(row.kind));
-		output.SetValue(2, count, Value(row.object));
-		output.SetValue(3, count, row.role.empty() ? Value(LogicalType::VARCHAR) : Value(row.role));
-		output.SetValue(4, count, Value(row.problem));
-		output.SetValue(5, count, Value(row.detail));
-		output.SetValue(6, count, Value(row.repair));
+		output.data[0].SetValue(count, Value(row.vcat));
+		output.data[1].SetValue(count, Value(row.kind));
+		output.data[2].SetValue(count, Value(row.object));
+		output.data[3].SetValue(count, row.role.empty() ? Value(LogicalType::VARCHAR) : Value(row.role));
+		output.data[4].SetValue(count, Value(row.problem));
+		output.data[5].SetValue(count, Value(row.detail));
+		output.data[6].SetValue(count, Value(row.repair));
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 //! acl_repair_relation(vcat, vname, action[, spec]) -> entries changed

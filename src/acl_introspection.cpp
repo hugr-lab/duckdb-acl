@@ -80,7 +80,7 @@ void AclIntrospectionScan(ClientContext &, TableFunctionInput &data, DataChunk &
 
 } // namespace
 
-void RegisterAclIntrospection(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
+void RegisterAclIntrospection(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {
 	// one function per listing of the policy model, plus the status of the source itself
 	static const char *LISTINGS[] = {"catalogs",       "schemas",       "relations",  "relation_columns",
 	                                 "object_columns", "functions",     "references", "reference_columns",

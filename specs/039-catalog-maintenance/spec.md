@@ -79,12 +79,11 @@ The vocabulary, what each is judged from, and the repair it names:
 | `source_missing` | the relation's `phys` does not bind (dropped, renamed) | `ALTER VIRTUAL TABLE … SET PHYS` / `DROP VIRTUAL TABLE` |
 | `column_missing` | a declared `COLUMNS` entry whose expression no longer binds against the source | `REPAIR VIRTUAL TABLE … REMAP (…)` or `… DROP MISSING COLUMNS` |
 | `definition_broken` | a view's SQL, or a macro's template with its declared parameter types, does not bind | `CREATE OR REPLACE VIRTUAL VIEW … AS` / `acl_alter_function` |
-| `schema_stale` | a query-defined object's stored (derived) schema differs from what its definition binds to now | `ANALYZE VIRTUAL …` |
-| `rls_broken` | a predicate (object or grant) that fails to bind now | `ALTER … SET RLS` |
+| `schema_stale` | a query-defined object's stored (derived) schema - a view's, a macro's, or a declared-list table's projection - differs from what its definition binds to now | `ANALYZE VIRTUAL …` (which now re-derives a table's projection too, carrying its marks and column comments) |
+| `rls_broken` | a predicate (object or grant) that fails to bind now | `ALTER VIRTUAL TABLE|VIEW … SET RLS` / `ALTER GRANT CATALOG … SET RLS` / for an object grant the `acl_grant_object(…)` re-grant (it has no ALTER form, and a GRANT with fewer clauses would reset what it does not state) |
 | `rls_unchecked` | a predicate never judged (spec 027's verdict is false and the object binds now) | `ANALYZE VIRTUAL CATALOG` |
-| `grant_column_missing` | a bare item of a grant's `COLUMNS` list matches no column of the object any more | `ALTER GRANT … SET COLUMNS` |
-| `mask_broken` | a `name = expr` grant item whose expression does not bind over the object | `ALTER GRANT … SET COLUMNS` |
-| `mask_orphaned` | a grant mask names a column the object no longer has: it protects nothing (the `ssn_backup` case of the drift matrix) | `ALTER GRANT … SET COLUMNS` |
+| `grant_column_missing` | a bare item of a grant's `COLUMNS` list matches no column of the object (an object grant), or of any object of the catalog (a catalog grant, reported once with object `*` - a catalog-wide bare name is absent where an object lacks it by design, spec 038) | `acl_grant_object(…)` re-grant / `ALTER GRANT CATALOG … SET COLUMNS` |
+| `mask_broken` | a `name = expr` grant item names a column the object does not expose, or its expression does not bind over the object - every read of the object by that role refuses (spec 038) | the same |
 | `schema_missing` | a schema alias's physical path has no schema behind it | `ALTER VIRTUAL SCHEMA … SET PHYS` / `DROP VIRTUAL SCHEMA` |
 | `expansion_stale` | an expansion's source has tables it did not record (and did not exclude), or records whose source is gone | `ALTER VIRTUAL SCHEMA … REFRESH [PRUNE]` |
 | `reference_dangling` | a reference's end object, or a column it names, is not in the catalog - virtual facts only, no probe | `DROP VIRTUAL REFERENCE` |
@@ -104,17 +103,22 @@ The repairs a dead declared list needs, applied on purpose; returns the entries 
   too); then the grants' projections on the object are re-probed (spec 026, non-strict - what
   `ANALYZE` does), so the listing describes the mended object.
 - **`drop_missing`**: every entry whose expression no longer binds is removed from the list. It
-  **refuses** when a grant on the object (object grant, or the catalog grant's list) carries a
-  `name = expr` item on a name it is about to drop - the mask would go from "protecting a column"
-  to "orphaned" in the same stroke, silently. The refusal names them: `acl admin: "c.customers":
-  dropping "ssn" would orphan the mask of role "analyst" (object grant) - REMAP the column, alter
-  that grant, or DROP MISSING COLUMNS AND MASKS`. Bare grant items on the dropped name intersect
-  away already (spec 038) and need no refusal. Returns the entries dropped; 0 when nothing is
-  missing.
+  **refuses** when an *object grant* on the object carries a `name = expr` item on a name it is
+  about to drop - the mask would go from "protecting a column" to "orphaned" in the same stroke,
+  silently. The refusal names them: `acl admin: "c.customers": dropping the missing column(s) would
+  orphan the mask(s) on "ssn" (role "analyst") - REMAP the column, alter those grants, or DROP
+  MISSING COLUMNS AND MASKS`. A *catalog grant's* mask is not touched either way: it protects the
+  column on every other object, and spec 038 refuses this object's reads for it - which the check
+  reports as `mask_broken`. Bare grant items on the dropped name intersect away already (spec 038)
+  and need no refusal. Returns the entries dropped; 0 when nothing is missing.
 - **`drop_missing_and_masks`**: `drop_missing` plus the removal of exactly those grant mask items,
   by name, from the grants that carried them - nothing is orphaned and nothing is silent: the
   count includes them, and each grant's projection is re-probed. The mask protected a column that
   no longer exists; what the admin acknowledges is that a column of that name is gone for good.
+  Not one transaction (every catalog writer is its own, with spec 034's version bump), so the
+  order is what keeps a failure midway harmless: the grants lose their mask items first - a grant
+  with fewer items reads less, never more - and the object's list is cut after; a step that fails
+  leaves the earlier ones applied and nothing wider than before.
 
 All three are `manage` on the catalog (the scope row `acl_refresh_schema` has), write the policy
 catalog under the version bump every write takes (spec 034), and so reach every node through the
@@ -123,9 +127,13 @@ ordinary reload.
 ### The listing marks a broken object
 
 For an alias/subquery relation **with a declared list**, the tables surfaces (`information_schema.
-tables`, `duckdb_tables()`, `duckdb_views()`, `SHOW`) compute, by a join and never a probe, the
+tables`, `duckdb_tables()` - a view-form relation has no declared list, so `duckdb_views()` never
+carries the mark, and the `SHOW` forms have no comment column) compute, by a join and never a probe, the
 declared entries whose expression is a bare identifier with no row in `information_schema.columns`
-of the physical table. When there are any, the object's comment is prefixed:
+of the physical table - one scan of `information_schema.columns` per listing, grouped per table,
+against the declared entries grouped per object (a bare expression that is one of SQL's bare-word
+functions - `current_user`, `current_date`, … - or a constant is not judged: a computed column is
+not a source column the mark could miss). When there are any, the object's comment is prefixed:
 `acl: broken - declared column(s) ssn no longer exist in the source; ` + the admin's comment (the
 virtual names, never the physical). The columns surface is unchanged - the contract as written: an
 object listed from its grant or stored projection (spec 026) keeps the vanished column, one listed
@@ -167,26 +175,37 @@ catalog, none means unrestricted.
 ## Testing
 
 `test/sql/acl_catalog_maintenance.test` (memory source, policy catalog in an attached `:memory:`):
+a declared-list table (`id = pk, tenant = internal_tenant, ssn = ssn_raw, amount`), a bare alias, two
+views (one that will break, one whose schema will go stale), a table macro, a scalar alias of a
+physical macro, a schema alias, an expansion, a reference, a catalog grant with a bare list, and two
+roles - `analyst` with an object-grant mask (`ssn = NULL`), `poor` with a bare item on `ssn` and an
+RLS predicate on the bare alias.
 
-- a declared-list table, a bare alias, a view over the table, a scalar and a table macro, a schema
-  alias, an expansion, a reference, two roles - one with a mask (`ssn = NULL`) in its object grant,
-  one with a bare `COLUMNS` list and an RLS predicate;
-- a clean catalog checks empty;
+- a clean catalog checks empty (the function and the SQL form);
 - `ALTER TABLE … DROP COLUMN ssn_raw`: `column_missing` on the table with the repair text,
-  `schema_stale` on the view, `grant_column_missing` for the bare item, the mask untouched (the
-  declared list still names `ssn`); the listing carries the mark, the columns surface lists the
-  survivors, the read fails as before;
-- `REPAIR … DROP MISSING COLUMNS` is **refused** naming the role; `REPAIR … REMAP (ssn = ssn_v2)`
-  after `ADD COLUMN ssn_v2` mends it: the principal reads again (masked), the mark is gone, the
-  check is empty;
+  `definition_broken` on the view that read it, `mask_broken` for a mask on the bare alias's dropped
+  column (object and catalog grants); `poor` is refused with duckdb's `Referenced column "ssn_raw"`
+  error (spec 065 probe A) while `analyst`, whose mask never reads the column, still gets rows;
+  `information_schema.tables` and `duckdb_tables()` carry the mark; the columns surface keeps the
+  contract as written (`id, ssn` for `poor`);
+- `REPAIR … DROP MISSING COLUMNS` is refused naming the role; a `REMAP` to a name that does not bind,
+  or of a column the list does not declare, is refused; `REMAP (ssn = ssn_v2)` after `ADD COLUMN
+  ssn_v2` returns 1: both roles read again, the mark is gone, the table's findings are gone;
 - a second drop, then `DROP MISSING COLUMNS AND MASKS`: returns 2 (the entry and the mask), the
-  grant no longer lists `ssn`, the check is empty;
-- `ALTER TABLE … RENAME TO`: `source_missing` on the alias and on the declared table; `DROP TABLE`
-  behind a view: `definition_broken`; a schema alias to a dropped schema: `schema_missing`; an
-  expansion's source with a new table: `expansion_stale`; a reference to an object dropped from
-  the catalog: `reference_dangling`; a grant predicate over a dropped column: `rls_broken`;
-- the SQL forms compile to the same calls; a principal calling either function is denied; a
-  catalog-scoped `manage` role checks its own catalog and is refused another.
+  grant no longer lists `ssn`, the list has three entries, `poor`'s bare item is
+  `grant_column_missing` with the exact re-grant as its repair; a repeated repair returns 0;
+- the rest of the vocabulary, each with its repair text: `rls_unchecked` (a predicate accepted
+  unchecked over a source that did not exist, and `ANALYZE` clears it), `schema_stale` on a table
+  (a retyped source column, and `ANALYZE VIRTUAL TABLE` clears it), `source_missing` on the bare
+  alias (renamed) and on the declared table, `definition_broken` for the macro template and for the
+  scalar alias whose target is gone, `schema_stale` on the view (added and removed columns named),
+  `schema_missing`, `expansion_stale` with both halves (unrecorded and gone, `REFRESH PRUNE`),
+  `reference_dangling` for a column and for an end, `rls_broken` for the grant predicate,
+  `grant_column_missing` with object `*` for the catalog grant;
+- the no-argument form walks every catalog (a second catalog with a broken object of its own);
+- the surface is the operator's: a principal is denied both functions; a catalog-scoped `manage`
+  role checks and repairs its own catalog and is refused another; a repair on a view or a bare alias
+  says where to go instead.
 
 ## Found on the way
 
@@ -200,6 +219,16 @@ catalog, none means unrestricted.
   way the mark on the object is what says the read fails; the spec text and the docs say so.
 - **An expansion keeps its source in `origin`, not `phys_path`** (spec 014's records): the first cut
   of the schema check skipped every expansion.
+- **A view's stored schema is exactly what may be stale** (review): judging a grant's items against
+  it hid a catalog-wide bare name that matched nothing any more; a grant is judged against the
+  declared list, else against what the source binds to now.
+- **`ANALYZE VIRTUAL TABLE` did not re-derive a table's projection schema** (review): `schema_stale`
+  on a table named a repair that could not mend it - and the refresh dropped a view's declared
+  nullability marks and column comments on the way. Both fixed in `CatalogRefreshSchema`.
+- **The listing mark called a bare-word function a missing column** (review, measured:
+  `who = current_user` was marked broken while the check was clean) - the bare-word functions are
+  excluded; and the first cut ran a correlated subquery over `information_schema.columns` per
+  relation on every principal's listing - it is one grouped scan now.
 
 ## Alternatives considered
 

@@ -741,7 +741,8 @@ void SessionAuditLevelFunc(DataChunk &args, ExpressionState &state, Vector &resu
 
 } // namespace
 
-void RegisterAclAudit(ExtensionLoader &loader, shared_ptr<PolicyStore> store, shared_ptr<AuditPipeline> pipeline) {
+void RegisterAclAudit(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store,
+                      const shared_ptr<AuditPipeline> &pipeline) {
 	// the states the store owns, read at snapshot time (spec 069: a gauge is a state, never an event)
 	auto &gauges = pipeline->Hooks().Gauges();
 	weak_ptr<PolicyStore> weak_store = store;

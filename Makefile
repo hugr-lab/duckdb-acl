@@ -223,6 +223,23 @@ test-flight:
 # FUZZ_SECONDS bounds the run; the seed corpus in test/fuzz/corpus grows in place. CI runs it on
 # every PR after the build (the linux job).
 FUZZ_SECONDS ?= 30
+# clang-tidy over our own sources with the repo's config (duckdb's .clang-tidy, symlinked), read
+# through the compile database a build leaves in build/release. Needs LLVM's clang-tidy (brew's is
+# fine: `brew install llvm`); on macOS the SDK path must be handed over, or every <system> header is
+# "not found". Findings in duckdb's and arrow's headers are not ours and are filtered out.
+LLVM_BIN ?= $(shell ls -d /opt/homebrew/opt/llvm/bin 2>/dev/null || echo /usr/bin)
+TIDY_SOURCES := $(wildcard src/*.cpp src/flight/*.cpp src/oidc/*.cpp) src/quack_embed/acl_quack_door.cpp
+TIDY_SYSROOT := $(shell xcrun --show-sdk-path 2>/dev/null)
+.PHONY: tidy
+tidy:
+	@test -f build/release/compile_commands.json || { echo "tidy: no compile database - run 'GEN=ninja make' first" >&2; exit 1; }
+	@$(LLVM_BIN)/run-clang-tidy -clang-tidy-binary $(LLVM_BIN)/clang-tidy -p build/release -quiet \
+		-header-filter='.*/duckdb-acl/src/include/.*' \
+		$(if $(TIDY_SYSROOT),-extra-arg=-isysroot -extra-arg=$(TIDY_SYSROOT),) \
+		$(abspath $(TIDY_SOURCES)) 2>/dev/null \
+		| grep -E '^$(CURDIR)/src/[^ ]+:[0-9]+:[0-9]+: (warning|error)' | sort -u \
+		| sed 's|^$(CURDIR)/||' ; true
+
 .PHONY: fuzz-oidc
 fuzz-oidc:
 	@test -f $(TEST_CPP_DUCKDB_LIB) || { \

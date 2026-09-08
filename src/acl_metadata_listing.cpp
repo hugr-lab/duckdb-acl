@@ -22,26 +22,36 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                                 : string();
 	// spec 039: a declared-list object whose source lost a column is MARKED, not narrowed. The
 	// declared entries that read a bare source column (a name, or a quoted one - an expression is
-	// not judged, and neither is a constant) with no row in information_schema.columns are what the
-	// mark names - a join over catalog facts and the same information_schema the columns surface
-	// already reads, never a probe (spec 065). The columns surface lists the survivors; the mark on
-	// the object says the read will fail anyway, and acl_check_catalog has the rest.
+	// not judged, and neither is a constant or one of SQL's bare-word functions) with no column of
+	// that name in the physical table are what the mark names - a join over catalog facts and ONE
+	// scan of the same information_schema the columns surface already reads, never a probe (spec
+	// 065). The columns surface keeps the contract as written; the mark on the object says the read
+	// will fail anyway, and acl_check_catalog (which probes) has the rest.
+	string physcols = "physcols AS (SELECT table_catalog, table_schema, table_name, list(lower(column_name)) AS cols"
+	                  " FROM information_schema.columns GROUP BY 1, 2, 3)";
+	string declared = "declared AS (SELECT dc.\"vcat\" AS vcat, dc.\"vname\" AS vname,"
+	                  " list(dc.\"name\" ORDER BY dc.\"pos\") AS names,"
+	                  " list(lower(CASE WHEN dc.\"expr\" IS NULL OR dc.\"expr\" = '' THEN dc.\"name\""
+	                  " WHEN dc.\"expr\" LIKE '\"%\"' THEN substr(dc.\"expr\", 2, length(dc.\"expr\") - 2)"
+	                  " ELSE dc.\"expr\" END) ORDER BY dc.\"pos\") AS reads FROM " +
+	                  Tbl("relation_columns") +
+	                  " dc WHERE (dc.\"expr\" IS NULL OR dc.\"expr\" = ''"
+	                  " OR regexp_matches(dc.\"expr\", '^[A-Za-z_][A-Za-z0-9_]*$')"
+	                  " OR regexp_matches(dc.\"expr\", '^\"[^\"]+\"$'))"
+	                  " AND lower(coalesce(dc.\"expr\", '')) NOT IN ('null', 'true', 'false', 'current_catalog',"
+	                  " 'current_date', 'current_role', 'current_schema', 'current_time', 'current_timestamp',"
+	                  " 'current_user', 'localtime', 'localtimestamp', 'session_user', 'user')"
+	                  " GROUP BY 1, 2)";
 	string missing =
-	    "CASE WHEN r.\"form\" IN ('alias', 'subquery') AND len(str_split(r.\"phys\", '.')) = 3 THEN"
-	    " (SELECT string_agg(dc.\"name\", ', ' ORDER BY dc.\"pos\") FROM " +
-	    Tbl("relation_columns") +
-	    " dc WHERE dc.\"vcat\" = r.\"vcat\" AND dc.\"vname\" = r.\"vname\""
-	    " AND lower(coalesce(dc.\"expr\", '')) NOT IN ('null', 'true', 'false')"
-	    " AND (dc.\"expr\" IS NULL OR dc.\"expr\" = ''"
-	    " OR regexp_matches(dc.\"expr\", '^[A-Za-z_][A-Za-z0-9_]*$')"
-	    " OR regexp_matches(dc.\"expr\", '^\"[^\"]+\"$'))"
-	    " AND NOT EXISTS (SELECT 1 FROM information_schema.columns ic"
-	    " WHERE ic.table_catalog = str_split(r.\"phys\", '.')[1]"
-	    " AND ic.table_schema = str_split(r.\"phys\", '.')[2]"
-	    " AND ic.table_name = str_split(r.\"phys\", '.')[3]"
-	    " AND lower(ic.column_name) = lower(CASE WHEN dc.\"expr\" IS NULL OR dc.\"expr\" = '' THEN dc.\"name\""
-	    " WHEN dc.\"expr\" LIKE '\"%\"' THEN substr(dc.\"expr\", 2, length(dc.\"expr\") - 2)"
-	    " ELSE dc.\"expr\" END))) ELSE NULL END";
+	    "CASE WHEN r.\"form\" IN ('alias', 'subquery') AND len(str_split(r.\"phys\", '.')) = 3"
+	    " AND d.names IS NOT NULL THEN nullif(array_to_string(list_transform(list_filter("
+	    "range(1, len(d.names) + 1), lambda i: NOT list_contains(coalesce(p.cols, []::VARCHAR[]), d.reads[i])),"
+	    " lambda i: d.names[i]), ', '), '') ELSE NULL END";
+	string relations_marked = "(SELECT r.*, " + missing + " AS missing FROM " + Tbl("relations") +
+	                          " r LEFT JOIN declared d ON d.vcat = r.\"vcat\" AND d.vname = r.\"vname\""
+	                          " LEFT JOIN physcols p ON p.table_catalog = str_split(r.\"phys\", '.')[1]"
+	                          " AND p.table_schema = str_split(r.\"phys\", '.')[2]"
+	                          " AND p.table_name = str_split(r.\"phys\", '.')[3])";
 	string marked = "CASE WHEN r.missing IS NOT NULL THEN 'acl: broken - declared column(s) ' || r.missing ||"
 	                " ' no longer exist in the source' || CASE WHEN r.\"comment\" IS NULL OR r.\"comment\" = ''"
 	                " THEN '' ELSE '; ' || r.\"comment\" END ELSE r.\"comment\" END";
@@ -53,9 +63,9 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                 " r.\"form\" AS form, " +
 	                 marked +
 	                 " AS comment,"
-	                 " str_split(r.\"phys\", '.') AS parts FROM (SELECT r.*, " +
-	                 missing + " AS missing FROM " + Tbl("relations") +
-	                 " r) r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " + visible + ")";
+	                 " str_split(r.\"phys\", '.') AS parts FROM " +
+	                 relations_marked + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " + visible +
+	                 ")";
 	// an alias schema shows the physical schema live, so its visibility is the role's capabilities
 	// on that schema (its own grant if it has one, otherwise the catalog's) - without this filter a
 	// role granted an explicit nothing would still read the names out of the source
@@ -118,8 +128,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                   " AND (gc.cat_columns IS NULL OR trim(gc.cat_columns) = '')"
 	                   " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))))"
 	                   " GROUP BY vcat, vname, name))";
-	auto prelude = GrantsCte(principal) + ", " + objects + ", " + aliases + ", " + schemas + ", " + grant_columns +
-	               ", " + vfunctions + ", " + projected + " ";
+	auto prelude = GrantsCte(principal) + ", " + physcols + ", " + declared + ", " + objects + ", " + aliases + ", " +
+	               schemas + ", " + grant_columns + ", " + vfunctions + ", " + projected + " ";
 	// spec 035: each surface answers in its own standard shape, column for column and type for
 	// type. A value that would describe the physical object rather than the virtual one is not
 	// borrowed - an oid identifies a physical catalog entry, a path is the physical database.

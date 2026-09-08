@@ -307,7 +307,7 @@ arrow::Result<vector<vector<Value>>> ParamRowsFrom(DatabaseInstance &db, flight:
 		batches.push_back(std::move(chunk.data));
 	}
 	ARROW_ASSIGN_OR_RAISE(auto schema, reader.GetSchema());
-	ARROW_ASSIGN_OR_RAISE(auto table, arrow::Table::FromRecordBatches(schema, std::move(batches)));
+	ARROW_ASSIGN_OR_RAISE(auto table, arrow::Table::FromRecordBatches(schema, batches));
 	auto batch_reader = std::make_shared<arrow::TableBatchReader>(*table);
 	ArrowArrayStream stream;
 	ARROW_RETURN_NOT_OK(arrow::ExportRecordBatchReader(batch_reader, &stream));

@@ -3,13 +3,11 @@
 #include "acl_door_common.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 
 namespace duckdb {
 namespace acl {
@@ -1138,14 +1136,15 @@ void AclDefineRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 
 void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
 	// register an admin setup function, attaching the shared store via its function_info
-	auto register_admin = [&](const string &name, vector<LogicalType> arguments, scalar_function_t fn) {
+	auto register_admin = [&](const string &name, vector<LogicalType> arguments, const scalar_function_t &fn) {
 		ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::BOOLEAN, fn);
 		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);
 	};
 
 	// overloaded admin functions register as one set under the shared store
-	auto register_admin_set = [&](const string &name, vector<vector<LogicalType>> signatures, scalar_function_t fn) {
+	auto register_admin_set = [&](const string &name, vector<vector<LogicalType>> signatures,
+	                              const scalar_function_t &fn) {
 		ScalarFunctionSet set((Identifier(name)));
 		for (auto &arguments : signatures) {
 			ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::BOOLEAN, fn);
@@ -1243,7 +1242,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_deny_function", {v}, AclDenyFunctionFunc);
 	register_admin("acl_allow_function", {v}, AclAllowFunctionFunc);
 	// the session contract both doors stand on (spec 040): open once, prefix every statement, close
-	auto register_session_text = [&](const string &name, vector<LogicalType> arguments, scalar_function_t fn) {
+	auto register_session_text = [&](const string &name, vector<LogicalType> arguments, const scalar_function_t &fn) {
 		ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::VARCHAR, fn);
 		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);
@@ -1256,7 +1255,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_session_text("acl_session_reason", {v}, AclSessionReasonFunc); // spec 054: why a NULL
 	register_admin("acl_session_close", {v}, AclSessionCloseFunc);
 	// the bound on all of the above (spec 044): sweeping and counting, both the door's, never a client's
-	auto register_session_bigint = [&](const string &name, scalar_function_t fn) {
+	auto register_session_bigint = [&](const string &name, const scalar_function_t &fn) {
 		ScalarFunction function(Identifier(name), {}, LogicalType::BIGINT, fn);
 		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);

@@ -570,7 +570,7 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | `source_missing` | the relation's physical source does not bind (dropped, renamed) | `ALTER VIRTUAL TABLE … SET PHYS` / `DROP VIRTUAL TABLE` |
 | `column_missing` | a declared `COLUMNS` entry whose expression no longer binds against the source | `REPAIR VIRTUAL TABLE … REMAP (…)` or `… DROP MISSING COLUMNS` |
 | `definition_broken` | a view's SQL, a macro's template (with its declared parameter types), or an alias's target function does not bind / exist | `CREATE OR REPLACE VIRTUAL VIEW … AS` / `acl_alter_function` |
-| `schema_stale` | a query-defined object's stored (derived) schema differs from what its definition binds to now | `ANALYZE VIRTUAL …` |
+| `schema_stale` | a query-defined object's stored (derived) schema - a view's, a macro's, or a declared-list table's projection - differs from what its definition binds to now | `ANALYZE VIRTUAL …` (re-derives a table's projection too since spec 039, keeping its marks and column comments) |
 | `rls_broken` / `rls_unchecked` | a predicate (object or grant) fails to bind / was accepted unchecked and binds now (spec 027) | `… SET RLS`, a re-grant / `ANALYZE VIRTUAL CATALOG` |
 | `grant_column_missing` | a bare item of a grant's `COLUMNS` list matches no column of the object (an object grant), or of any object of the catalog (a catalog grant) | `acl_grant_object(…)` / `ALTER GRANT CATALOG … SET COLUMNS` |
 | `mask_broken` | a `name = expr` grant item names a column the object does not expose, or its expression does not bind - every read of that object by that role refuses (spec 038) | the same |
@@ -602,11 +602,14 @@ here (`ANALYZE VIRTUAL VIEW` re-derives, `CREATE OR REPLACE VIRTUAL VIEW` redefi
 alias has no list to mend.
 
 While a declared-list object is broken, the tables listings a principal sees (`information_schema.
-tables`, `duckdb_tables()`, `duckdb_views()`) carry the mark in the object's comment - `acl: broken -
+tables`, `duckdb_tables()`) carry the mark in the object's comment - `acl: broken -
 declared column(s) ssn no longer exist in the source` - rather than quietly describing a narrower
 object; the columns surface keeps the contract as written. A role whose grant *masks* the vanished
 column (`ssn = NULL`) never reads it and keeps its rows; a role whose grant reads it gets the binder
-error spec 065 accepted.
+error spec 065 accepted. The mark judges declared entries that read a bare source column - a
+computed column written as an expression, a constant or one of SQL's bare-word functions
+(`current_user`, `current_date`, …) is not judged; write anything else that is not a column with
+parentheses or a cast so it cannot be mistaken for one.
 
 ```sql
 ACL ADMIN CHECK VIRTUAL CATALOG sales;
@@ -618,7 +621,8 @@ Functions: `acl_check_catalog([vcat])` (a table function; no argument walks ever
 `acl_repair_relation(vcat, vname, action[, spec])` (returns BIGINT; `action` is `remap` with the
 list in `spec`, `drop_missing`, or `drop_missing_and_masks`). Both are the administrator's: denied to
 a principal, and under a role's management scope confined to the catalogs it manages (the
-no-argument check needs an unrestricted scope).
+no-argument function form, which walks every catalog, is the operator's own connection's - the
+management grammar always names one).
 
 ## ALTER
 

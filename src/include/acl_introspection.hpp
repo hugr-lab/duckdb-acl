@@ -13,7 +13,7 @@ class ExtensionLoader;
 namespace acl {
 
 //! Register the acl_* introspection table functions against this instance's policy store
-void RegisterAclIntrospection(ExtensionLoader &loader, shared_ptr<PolicyStore> store);
+void RegisterAclIntrospection(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
 
 } // namespace acl
 } // namespace duckdb

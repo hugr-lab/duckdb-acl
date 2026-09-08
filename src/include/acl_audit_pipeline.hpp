@@ -115,7 +115,8 @@ string AuditReasonText(const string &reason_code, const string &text);
 
 //! Register the audit surface: `acl_audit_events()`, `acl_metrics()`, `acl_audit_dropped()`,
 //! `acl_audit_flush()`, `acl_session_audit_level()`, and the gauges the store owns.
-void RegisterAclAudit(ExtensionLoader &loader, shared_ptr<PolicyStore> store, shared_ptr<AuditPipeline> pipeline);
+void RegisterAclAudit(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store,
+                      const shared_ptr<AuditPipeline> &pipeline);
 
 } // namespace acl
 } // namespace duckdb

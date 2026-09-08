@@ -907,7 +907,7 @@ bool PolicyStore::SetSessionAuditLevel(const string &id, int8_t level) {
 int8_t PolicyStore::SessionAuditLevel(const string &handle) {
 	lock_guard<mutex> guard(lock);
 	auto entry = sessions.find(handle);
-	return entry == sessions.end() ? -1 : entry->second.audit_level;
+	return entry == sessions.end() ? static_cast<int8_t>(-1) : entry->second.audit_level;
 }
 
 vector<std::pair<string, int64_t>> PolicyStore::JwksAges() {
@@ -1184,6 +1184,7 @@ void PolicyStore::MapRole(const string &issuer, const string &source, const stri
 //! The exec-context seam (spec 050). Thread-local: the door sets it on the thread that calls
 //! Prepare, the rewriter reads it on that same thread during the parse inside that Prepare, and it
 //! is cleared before the exec lock is released - no other thread ever observes a value.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 static thread_local ClientContext *temp_scan_context = nullptr;
 
 void SetTempScanContext(ClientContext *context) {

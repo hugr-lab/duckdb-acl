@@ -23,8 +23,8 @@
 #include "acl_oidc_secret.hpp"
 
 #include "acl_oidc.hpp"
-#include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/secret/secret.hpp"
