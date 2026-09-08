@@ -224,16 +224,30 @@ for probe in "@catalogs" "@tables" "@imported:orders"; do
 	echo "$got" | grep -q "authentication failed" || fail "$probe was answered with no token: $got"
 done
 
-# --- a C++ exception under an RPC is a named refusal, and leaves no session behind ------------------
-# The second issuer's keys cannot be read and a failed read is fatal, so SessionOpen throws from under
-# the door's own authentication - the review's case. gRPC would report that as "Unexpected error in
-# RPC handling", which says nothing; the boundary turns it into the message the policy wrote.
+# --- a failure under the door's own authentication is a named refusal, and leaves no session behind
+# The second issuer's keys cannot be read and a failed read is fatal (acl_jwks_max_stale = 0), so the
+# verification fails from under the door's authentication - the review's case. gRPC would report an
+# escaped exception as "Unexpected error in RPC handling", which says nothing. Since spec 069 the
+# client is told no more than "authentication failed" (a token is refused the same way whatever the
+# cause - spec 040), and the REASON goes where the operator reads it: a `session` event `refused`
+# with reason_code `source_error` (the keys' source failed, not the principal) and the policy's text -
+# a refusal is recorded at every audit level but `off`.
 FILE_TOKEN='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2ZpbGUiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXX0.xxxx'
 for probe in "SELECT 1" "@tables" "@imported:orders"; do
 	got="$(ask "$probe" "$FILE_TOKEN")"
 	case "$got" in *"Unexpected error in RPC handling"*) fail "$probe: the exception reached gRPC unnamed: $got";; esac
-	echo "$got" | grep -q "could not be read" || fail "$probe: the refusal did not say why: $got"
+	echo "$got" | grep -q "authentication failed" || fail "$probe: the refusal was not the named one: $got"
+	echo "$got" | grep -q "could not be read" && fail "$probe: the refusal told the client why (the operator's, not the client's): $got"
 done
+echo "SELECT acl_audit_flush();" >&3
+echo "SELECT 'keysrefused=' || count(*) FROM acl_audit_events() WHERE kind = 'session' AND detail = 'refused' AND verdict = 'denied' AND reason_code = 'source_error' AND reason LIKE '%could not be read%';" >&3
+counted=""
+for _ in $(seq 1 40); do
+	if grep -q "keysrefused=" "$TMP/server.log"; then counted=1; break; fi
+	sleep 0.25
+done
+[ -n "$counted" ] || fail "the server did not answer the refused-session count"
+grep -q "keysrefused=3" "$TMP/server.log" || fail "the three refusals were not recorded with their reason: $(grep keysrefused= "$TMP/server.log")"
 
 # Every RPC opens a session and must close it whichever way it leaves; after everything above -
 # refusals, throws and all - the door's own count is 0. Since spec 054 acl_session_count reports the

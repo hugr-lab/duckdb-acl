@@ -104,6 +104,16 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          "acl: a path or URI the audit appends one JSON line per event to ('' = none); read "
 	                          "through duckdb's filesystem, so an object store rides httpfs",
 	                          LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);
+	// spec 070: the Flight door streams. What a statement may hand out (0 = unlimited), and how long
+	// an open result stream may sit unpulled before the session's next statement supersedes it.
+	config.AddExtensionOption("acl_max_result_rows",
+	                          "acl: rows a statement may hand out through the Flight door (0 = unlimited); "
+	                          "exactly that many go out, then the stream ends in a refusal",
+	                          LogicalType::BIGINT, Value::BIGINT(0), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_flight_stream_idle",
+	                          "acl: seconds an open Flight result stream may sit unpulled before the session's "
+	                          "next statement ends it and runs (0 = never: the statement waits for the stream)",
+	                          LogicalType::BIGINT, Value::BIGINT(30), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_audit_denials_per_second",
 	                          "acl: refusals RECORDED per second per source (a session, a principal, a door); "
 	                          "the rest are counted only, as dropped where=rate_limit (0 = unlimited)",

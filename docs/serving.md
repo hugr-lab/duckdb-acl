@@ -121,6 +121,27 @@ What the door serves, every RPC authenticated per call from the `authorization: 
   ingest may stream, enforced while reading. A `transaction_id` on ingest is refused, and so is an
   ingest inside a client's open transaction (the refusal says `inside an open transaction`): the
   ingest owns its own transaction so the row-count cross-check decides before commit.
+- **Results stream, and a client that stops is heard** (spec 070). `DoGet` executes the statement
+  lazily and converts one duckdb chunk into one Arrow batch as the client pulls it - nothing beyond
+  the chunk in flight is held, whatever the result's size, and the first batch of a 200M-row scan is
+  on the wire in tens of milliseconds. The stream's end interrupts the query the way duckdb's own
+  `LIMIT` stops a pipeline: *consumed* (the last chunk), *cancelled* (the client closed the reader,
+  cancelled the call, applied its own LIMIT or died - gRPC tears the call down and the door
+  interrupts what still runs), *superseded* (the session's next statement found the stream unpulled
+  for `acl_flight_stream_idle` seconds - default 30 - and ended it before running; a driver that
+  consumes sequentially never sees this, a statement arriving while the stream is being pulled waits
+  for it; a session the operator kills, or one that expires, takes its stream with it at the next
+  pull - `acl: the session ended` - while a pull itself counts as the session's activity), *capped*
+  (`acl_max_result_rows`, default 0 = unlimited: exactly N rows go out, then the stream ends in
+  `acl: the result exceeds acl_max_result_rows (N)` - the mirror of `acl_max_ingest_rows`) or
+  *failed* (a source error mid-stream reaches the client as an error, never as a short result; the
+  audit keeps only the error's class). Whatever ends a stream also closes the query, so its
+  operators' state (a sort's runs, a hash table) is released then, not at the session's next
+  statement. Each end is one `door` event `stream_<outcome>` with the rows that went out.
+  In the other direction a `DoPut` ingest whose client cancels or dies mid-stream is seen between
+  batches and at the end of the stream (a dead client reads as a clean half-close to gRPC): the load
+  fails as `acl: the client cancelled the ingest`, rolls back whole (nothing lands), its ingest event
+  reads `denied` / `unavailable`, and a `door` event `ingest_cancelled` says which side stopped.
 - **Sessions are cookie-identified connections** (spec 050). The first call of a connection is
   handed a session cookie (Arrow's `arrow_flight_session_id`, minted by our CSPRNG); a client that
   returns it has a durable session backed by a duckdb `Connection` the door holds for the session's
@@ -315,6 +336,8 @@ report success and change nothing):
 | `acl_session_token_binding` | `connect` | `connect` judges `exp` at establishment only; `every_use` re-judges it on every use. GLOBAL-only (`acl_session_token_binding is global - use SET GLOBAL`); other values refused (`acl_session_token_binding accepts 'connect' or 'every_use', not '<v>'`); entering `connect` with idle at 0 is refused (`acl_session_token_binding='connect' needs a live idle reaper: set acl_session_idle_timeout > 0 first (it is currently 0/disabled)`). Memory mode (no policy catalog) stays at `every_use` |
 | `acl_max_sessions` | 1000 | sessions that may live at once; at the cap a new one is refused; `0` = unlimited |
 | `acl_max_ingest_rows` | 0 | rows one Flight ingest may stream; `0` = unlimited |
+| `acl_max_result_rows` | 0 | rows one Flight statement may hand out: exactly that many go out, then the stream ends in a refusal; `0` = unlimited (spec 070) |
+| `acl_flight_stream_idle` | 30 | seconds a Flight result stream may sit unpulled (since its last pull returned) before the session's next statement ends it and runs; a stream being pulled is never ended - the statement waits; `0` = never - the statement waits for the stream's own end (spec 070) |
 | `acl_jwt_clock_skew` | 60 | seconds of skew allowed on JWT `exp`/`nbf` (GLOBAL since the 2026-09-03 review) |
 | `acl_version_check_interval` | 1000 | milliseconds between `policy_version` re-reads of the policy catalog (`0` = every batch) |
 | `acl_jwks_refresh_interval` | 300 | seconds a fetched JWKS is used before it is read again |
@@ -409,8 +432,9 @@ mechanism. duckdb autoloads `icu` for the settings themselves.
 Every decision the node makes about a principal is one **event**: a statement admitted or refused
 (with the objects it touched and the capability judged for each), a management statement, a session
 opened / closed / refused, an ingest completed with its row count, a Flight ticket issued / redeemed /
-expired / presented by somebody else, the password handshake, a policy reload or source error, a keys
-refresh. An event carries who (subject, roles - never a claim value), where (`door`, the session's ops
+expired / presented by somebody else, a Flight result stream ended (consumed, cancelled, superseded,
+capped, failed - with the rows that went out) or an ingest its client cancelled, the password
+handshake, a policy reload or source error, a keys refresh. An event carries who (subject, roles - never a claim value), where (`door`, the session's ops
 id - never the handle), what (the statement class - never the text), the verdict, and on a refusal
 one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only`, `function_denied`,
 `statement_type`, `unchecked_predicate`, `setting_denied`, `parse`, `principal`,
@@ -432,7 +456,10 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
 - **Metrics** - `acl_metrics()` answers every counter and gauge with its attributes as JSON:
   `acl.decisions{verdict,kind,door,statement}`, `acl.denials{reason_code,door}`,
   `acl.sessions.opened/refused/closed`, `acl.sessions.live`, `acl.door.handshakes`,
-  `acl.door.tickets{outcome}`, `acl.ingest.statements`, `acl.admin.statements{scope}`,
+  `acl.door.tickets{outcome}`, `acl.door.streams{door,outcome}` (result streams ended, by outcome,
+  plus `ingest_cancelled` - the stream in the other direction) and the gauge
+  `acl.door.streams_open{door}` (result streams pulling right now) - spec 070,
+  `acl.ingest.statements`, `acl.admin.statements{scope}`,
   `acl.policy.version/staleness/reloads/writes/source_errors`, `acl.jwks.refreshes/age`,
   `acl.audit.events/dropped/sink_errors/queue_fill/ring_fill`, `acl.node.draining/uptime/info`.
   Attribute values come from bounded sets only - never a role, a subject or an object name.

@@ -18,6 +18,14 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# An explicit `shell: bash` is `bash -eo pipefail`; the default `bash -e` has no pipefail, so every
+# `<suite> 2>&1 | tee <log>` step below reported tee's exit code and a failing suite behind the pipe
+# passed (the Flight e2e was red on main from #117 to spec 070, green on the badge). The pipe is
+# kept - the log is what assert_ran.sh reads - and pipefail makes the step fail with the suite.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   lint:
     name: Lint (clang-format)
