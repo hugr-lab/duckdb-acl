@@ -124,6 +124,21 @@ SELECT count(*) FILTER (WHERE tenant = 'globex'), count(*) FILTER (WHERE tenant 
 ----
 0	10001
 
+# the client names the stream's columns (since quack f4328c5 its own table's names travel in the
+# statement it composes): naming them so the grant's value would land elsewhere - `col1` first,
+# `col0` second, the names the old server-side drain used by position - must not move it. The
+# assignment is by position, whatever the source calls its columns (the 2026-09-08 review).
+statement ok
+CREATE TABLE swapped AS SELECT i AS col1, 'globex' AS col0 FROM range(5) t(i);
+
+statement ok
+INSERT INTO remote2.main.orders SELECT * FROM swapped;
+
+query II
+SELECT count(*) FILTER (WHERE tenant = 'globex'), count(*) FILTER (WHERE tenant = 'acme') FROM orders;
+----
+0	10006
+
 statement ok
 DETACH remote2;
 

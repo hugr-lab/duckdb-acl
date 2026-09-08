@@ -29,8 +29,9 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
     # metadata as ONE multi-command string - refused by a prepared statement since duckdb-postgres #552,
     # and duckdb-postgres fffcb35's `prepare := false` is an opt-in the caller must take. ducklake took
     # it in 7f2f82c (2026-09-01, the batches split); 7f0ece3 is that plus its test. It targets duckdb
-    # 1b3c92a - an ancestor of the 2.0 branch - and needs exactly ONE of the branch's ducklake patches
-    # (0011, the TableCatalogEntry columns virtual), carried in patches/ducklake/ and applied through
+    # 1b3c92a - an ancestor of the 2.0 branch - and needs TWO of the branch's ducklake patches (0010,
+    # the merge-into action pipelines; 0011, the TableCatalogEntry columns virtual), carried in
+    # patches/ducklake/ and applied through
     # the FetchContent pre-declare (CMake keeps the first declare for a content name; the loader below
     # has no patch-dir parameter). Drop all of this for the submodule's include once the submodule's
     # own pin passes 7f2f82c. (A pin change trips FetchContent's git-update on a stale _deps clone:

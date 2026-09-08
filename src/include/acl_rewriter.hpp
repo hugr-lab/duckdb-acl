@@ -52,6 +52,7 @@ struct AuditTrail {
 		string statement;
 		vector<AuditObject> objects;
 		int64_t rewrite_us = -1;
+		string detail; // what the walk found the statement to be beyond its class: `drain`
 	};
 	vector<Statement> statements;
 };

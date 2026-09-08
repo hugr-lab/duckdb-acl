@@ -221,15 +221,20 @@ void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &resu
 
 void AclQuackStatementCompleted(Connection &connection, const string &connection_id, const string &sql,
                                 QueryResult &result) {
-	if (!StatementDrainsQuackStream(sql)) {
-		return; // an ordinary statement: its decision is the override's event
-	}
 	// the connection id is what acl_quack_authenticate bound to a session; a drain on a connection
 	// nobody bound was refused at parse and has nothing to complete
 	auto store = PolicyStore::Of(*connection.context->db);
 	string handle;
 	if (!store || !store->SessionHandleFor(connection_id, handle)) {
 		return;
+	}
+	// what makes the statement a drain is the note the rewriter left on the session when it exempted
+	// the call on the AST (spec 042) - never this text, which a client could dress up with a literal
+	// or an alias to have an ordinary statement recorded as a load. The note names the stream, and
+	// the statement that completed must carry it.
+	auto stream = store->TakeSessionDrain(handle);
+	if (stream.empty() || sql.find(stream) == string::npos) {
+		return; // an ordinary statement: its decision is the override's event
 	}
 	if (result.HasError()) {
 		store->AuditIngest(handle, -1, result.GetError());

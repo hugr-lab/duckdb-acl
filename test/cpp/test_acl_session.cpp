@@ -307,12 +307,20 @@ int main(int argc, char *argv[]) {
 		              std::string::npos,
 		      "over a gateway prefix the function stays denied by the gate: " +
 		          (over_role->HasError() ? over_role->GetError() : "no error"));
+		// no exemption without a string-constant id: the text names no candidate, the gate denies the
+		// call like any other denylisted function
 		auto no_id = con.Query("ACL SESSION '" + handle +
-		                       "' INSERT INTO c.orders (id, tenant) SELECT * FROM scan_data_from_quack_client(NULL, "
+		                       "' INSERT INTO c.raw (id, tenant) SELECT * FROM scan_data_from_quack_client(NULL, "
 		                       "NULL::STRUCT(id INTEGER, tenant VARCHAR), ordered := true)");
-		Check(no_id->HasError() && no_id->GetError().find("shape this door does not read") != std::string::npos,
-		      "a drain call whose id is not a string constant is refused before anything runs: " +
+		Check(no_id->HasError() &&
+		          no_id->GetError().find("table function \"scan_data_from_quack_client\" is not allowed") !=
+		              std::string::npos,
+		      "a drain call whose id is not a string constant gets no exemption: " +
 		          (no_id->HasError() ? no_id->GetError() : "no error"));
+		// a literal that merely mentions the function is a literal, nothing more
+		auto literal = con.Query("ACL SESSION '" + handle + "' SELECT 'scan_data_from_quack_client(x)' AS s");
+		Check(!literal->HasError(), "a literal naming the function is not a drain and not a refusal: " +
+		                                (literal->HasError() ? literal->GetError() : "ok"));
 		Exec(con, "SELECT acl_session_close('" + handle + "')");
 	});
 	Scenario("management and native SQL over a session are the session's scope, exactly (plan 2.2)", [&]() {

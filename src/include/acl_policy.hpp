@@ -308,6 +308,10 @@ struct PolicyStore {
 		//! on a connection of the server's, not the client's
 		string correlation_id;
 		string traceparent;
+		//! The stream the session's last rewritten statement drained (spec 042, judged on the AST), for
+		//! the door's completion hook to tell a load's outcome from any other statement's (spec 069);
+		//! taken once
+		string drain_stream;
 	};
 	unordered_map<string, Session> sessions;
 	//! The audit pipeline of this instance (spec 069); set at load, before anything serves
@@ -558,6 +562,11 @@ struct PolicyStore {
 	bool SetSessionTrace(const string &id, const string &name, const string &value);
 	//! Live sessions per door (spec 069's acl.sessions.live gauge); a door with none is not listed
 	vector<std::pair<string, int64_t>> SessionCountsByDoor();
+	//! The rewriter found the session's statement to drain `stream` (spec 042): remembered by ops id
+	//! for the completion hook, which takes it by handle - once - and ignores any statement that left
+	//! no note. What the audit calls an ingest is decided on the AST, never on a statement's text.
+	void NoteSessionDrain(const string &id, const string &stream);
+	string TakeSessionDrain(const string &handle);
 	//! The audit's seams for what is not a statement decision (spec 069). Each emits one event -
 	//! whatever the level: counted always, recorded where the level says - and never throws.
 	//! An ingest drain completed on the session behind `handle`: the rows it wrote, or why it failed

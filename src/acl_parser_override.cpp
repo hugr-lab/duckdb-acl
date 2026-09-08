@@ -241,6 +241,9 @@ struct StatementAudit {
 		event.statement = stmt.statement;
 		event.objects = stmt.objects;
 		event.rewrite_us = stmt.rewrite_us;
+		if (!stmt.detail.empty()) {
+			event.detail = stmt.detail; // what the walk found it to be (`drain`), judged on the AST
+		}
 		event.allowed = allowed;
 		event.reason_code = code;
 		event.reason = reason;
@@ -563,13 +566,12 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		// the session's own (quack keeps it on the connection), so the id names a stream only this
 		// principal's connection could fill - the one exemption spec 042 grants, keyed by the exact
 		// id the statement carries, and the rewriter retargets the call to the door's own function.
-		auto stream_id = ExtractStreamId(prefix.rest);
-		if (stream_id.empty()) {
-			NoteDenyReason(Reason::STATEMENT_TYPE);
-			throw BinderException("acl: a streamed insert names its stream in a shape this door does not read");
-		}
-		principal.ingest_stream = stream_id;
-		audit.proto.detail = "drain";
+		// The text names only the CANDIDATE id; whether the statement is a drain is decided on the AST
+		// (the rewriter exempts exactly one call, constant-for-constant, and marks the statement's
+		// audit entry). A text that mentions the function in a literal, or names its stream in a
+		// shape this does not read, gets no exemption - the gate then denies a real call, and a
+		// literal is just a literal (the 2026-09-08 review).
+		principal.ingest_stream = ExtractStreamId(prefix.rest);
 	}
 	if (prefix.kind == AclPrefix::Kind::INGEST) {
 		audit.proto.detail = "ingest";
@@ -650,10 +652,6 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 }
 
 } // namespace
-
-bool StatementDrainsQuackStream(const string &sql) {
-	return DrainsQuackClientStream(sql);
-}
 
 void RegisterAclParser(DBConfig &config, shared_ptr<PolicyStore> store) {
 	ParserExtension extension;
