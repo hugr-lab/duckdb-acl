@@ -1,0 +1,388 @@
+# name: test/sql/acl_catalog_maintenance.test
+# description: spec 039 - the check that finds what drifted (acl_check_catalog / CHECK VIRTUAL
+#   CATALOG), the repair that mends a declared list on purpose (acl_repair_relation / REPAIR VIRTUAL
+#   TABLE) and never drops a mask silently, and the listing that marks a broken object instead of
+#   narrowing it.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+CREATE TABLE phys.main.customers(pk INTEGER, internal_tenant VARCHAR, ssn_raw VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO phys.main.customers VALUES (1, 'acme', '111-22-3333', 10), (2, 'globex', '444-55-6666', 20);
+
+statement ok
+CREATE TABLE phys.main.items(id INTEGER, sku VARCHAR);
+
+statement ok
+INSERT INTO phys.main.items VALUES (1, 'sku-1');
+
+statement ok
+CREATE SCHEMA phys.ext;
+
+statement ok
+CREATE TABLE phys.ext.a(id INTEGER);
+
+statement ok
+CREATE SCHEMA phys.old;
+
+statement ok
+CREATE TABLE phys.old.t(x INTEGER);
+
+statement ok
+CREATE MACRO phys.main.twice(x) AS x * 2;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+# a declared list: the contract the check judges against
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.customers AS phys.main.customers COLUMNS (id = pk, tenant = internal_tenant, ssn = ssn_raw, amount);
+
+# a bare alias: no contract beyond "binds"
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.items AS phys.main.items;
+
+# two views: one that will break, one whose schema will go stale
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.secrets AS 'SELECT pk, ssn_raw FROM phys.main.customers';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.stock AS 'SELECT * FROM phys.main.items';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.twice ALIAS OF phys.main.twice;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.old AS phys.old;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.ext FROM phys.ext;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.cust_items FROM customers TO items ON (id = id);
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+# an object grant with a mask on the declared column
+statement ok
+ACL ADMIN GRANT OBJECT c.customers TO ROLE analyst COLUMNS (id, tenant, ssn = NULL, amount);
+
+statement ok
+ACL ADMIN CREATE ROLE poor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE poor WITH (select) MAIN;
+
+# a bare item on the declared column, and a predicate over the bare alias
+statement ok
+ACL ADMIN GRANT OBJECT c.customers TO ROLE poor COLUMNS (id, ssn);
+
+statement ok
+ACL ADMIN GRANT OBJECT c.items TO ROLE poor RLS (sku <> '');
+
+# --- a clean catalog checks empty --------------------------------------------------------------------
+query I
+SELECT count(*) FROM acl_check_catalog('c');
+----
+0
+
+query IIIIIII
+ACL ADMIN CHECK VIRTUAL CATALOG c;
+----
+
+query I
+ACL ROLE "analyst" SELECT ssn FROM customers WHERE id = 1;
+----
+NULL
+
+# --- the source drops a declared column: the object is dead, and the check says why -------------------
+statement ok
+ALTER TABLE phys.main.customers DROP COLUMN ssn_raw;
+
+# a role whose grant reads the column is refused with duckdb's error (spec 065 probe A, accepted);
+# the analyst's mask replaces the column and never reads it, so that role still gets its rows
+statement error
+ACL ROLE "poor" SELECT * FROM customers;
+----
+<REGEX>:.*Binder Error.*
+
+query II
+ACL ROLE "analyst" SELECT id, ssn FROM customers ORDER BY id;
+----
+1	NULL
+2	NULL
+
+query IIIIII
+SELECT kind, object, role, problem, detail, repair FROM acl_check_catalog('c') ORDER BY kind, object, role;
+----
+table	customers	NULL	column_missing	declared column "ssn" reads "ssn_raw", which "phys.main.customers" no longer has: Binder Error: Referenced column "ssn_raw" not found in FROM clause!	REPAIR VIRTUAL TABLE c.customers REMAP (ssn = <column>)  -- or DROP MISSING COLUMNS
+view	secrets	NULL	definition_broken	the view's SQL does not bind: Binder Error: Referenced column "ssn_raw" not found in FROM clause!	CREATE OR REPLACE VIRTUAL VIEW c.secrets AS '<sql>'
+
+# the listing marks the object rather than narrowing it quietly...
+query II
+ACL ROLE "analyst" SELECT table_name, comment FROM duckdb_tables() WHERE table_name = 'customers';
+----
+customers	acl: broken - declared column(s) ssn no longer exist in the source
+
+query I
+ACL ROLE "analyst" SELECT "TABLE_COMMENT" FROM information_schema.tables WHERE table_name = 'customers';
+----
+acl: broken - declared column(s) ssn no longer exist in the source
+
+# ...while the columns surface keeps the contract as written (the grant's projection, spec 026,
+# the vanished column included): the mark on the object is what says the read fails
+query I
+ACL ROLE "poor" SELECT column_name FROM information_schema.columns WHERE table_name = 'customers' ORDER BY ordinal_position;
+----
+id
+ssn
+
+# --- the repair refuses to orphan a mask, and REMAP mends a column that moved ------------------------
+statement error
+ACL ADMIN REPAIR VIRTUAL TABLE c.customers DROP MISSING COLUMNS;
+----
+<REGEX>:.*would orphan the mask\(s\) on "ssn" \(role "analyst"\).*
+
+statement error
+ACL ADMIN REPAIR VIRTUAL TABLE c.customers REMAP (ssn = ssn_new);
+----
+<REGEX>:.*"ssn = ssn_new" does not bind against "phys.main.customers".*
+
+statement error
+ACL ADMIN REPAIR VIRTUAL TABLE c.customers REMAP (ghost = pk);
+----
+<REGEX>:.*declares no column "ghost".*
+
+statement ok
+ALTER TABLE phys.main.customers ADD COLUMN ssn_v2 VARCHAR DEFAULT 'x';
+
+query I
+ACL ADMIN REPAIR VIRTUAL TABLE c.customers REMAP (ssn = ssn_v2);
+----
+1
+
+# the principal reads again, masked; the mark is gone; the table's findings are gone
+query II
+ACL ROLE "analyst" SELECT id, ssn FROM customers ORDER BY id;
+----
+1	NULL
+2	NULL
+
+query I
+ACL ROLE "poor" SELECT ssn FROM customers WHERE id = 1;
+----
+x
+
+query I
+ACL ROLE "analyst" SELECT comment FROM duckdb_tables() WHERE table_name = 'customers';
+----
+NULL
+
+query II
+SELECT object, problem FROM acl_check_catalog('c') WHERE kind = 'table';
+----
+
+# --- the column goes for good: DROP MISSING COLUMNS AND MASKS names what it gives up ------------------
+statement ok
+ALTER TABLE phys.main.customers DROP COLUMN ssn_v2;
+
+query I
+ACL ADMIN REPAIR VIRTUAL TABLE c.customers DROP MISSING COLUMNS AND MASKS;
+----
+2
+
+query I
+SELECT "columns" FROM store.acl.role_object_caps WHERE role = 'analyst' AND vname = 'customers';
+----
+id, tenant, amount
+
+query I
+SELECT count(*) FROM store.acl.relation_columns WHERE vname = 'customers';
+----
+3
+
+# the mask is gone with the column; poor's bare item now matches nothing, and the check says so
+query IIII
+SELECT object, role, problem, repair FROM acl_check_catalog('c') WHERE kind = 'grant' ORDER BY role;
+----
+customers	poor	grant_column_missing	SELECT acl_grant_object('poor', 'c', 'customers', '', '', 'id')
+
+statement ok
+SELECT acl_grant_object('poor', 'c', 'customers', '', '', 'id');
+
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE kind = 'grant';
+----
+0
+
+# a repeated repair has nothing to do
+query I
+SELECT acl_repair_relation('c', 'customers', 'drop_missing');
+----
+0
+
+# --- the rest of the vocabulary ---------------------------------------------------------------------
+# a predicate over a column the bare alias lost
+statement ok
+ALTER TABLE phys.main.items DROP COLUMN sku;
+
+# a column added to a view's source: the stored schema is stale
+statement ok
+ALTER TABLE phys.main.items ADD COLUMN price INTEGER;
+
+# a table renamed under its alias, a schema alias's path gone, a macro alias whose target is gone
+statement ok
+ALTER TABLE phys.main.customers RENAME TO customers2;
+
+statement ok
+DROP SCHEMA phys.old CASCADE;
+
+statement ok
+DROP MACRO phys.main.twice;
+
+# an expansion whose source gained a table, and a reference whose end is no longer an object
+statement ok
+CREATE TABLE phys.ext.b(id INTEGER);
+
+statement ok
+DELETE FROM store.acl.relations WHERE vname = 'items';
+
+query IIIII
+SELECT kind, object, role, problem, repair FROM acl_check_catalog('c') ORDER BY kind, object, role;
+----
+function	twice	NULL	definition_broken	acl_alter_function('c', 'twice', 'scalar', 'alias', '<target>')
+reference	cust_items	NULL	reference_dangling	DROP VIRTUAL REFERENCE c.cust_items
+schema	ext	NULL	expansion_stale	ALTER VIRTUAL SCHEMA c.ext REFRESH
+schema	old	NULL	schema_missing	ALTER VIRTUAL SCHEMA c.old SET PHYS <path>  -- or DROP VIRTUAL SCHEMA c.old
+table	customers	NULL	source_missing	ALTER VIRTUAL TABLE c.customers SET PHYS <path>  -- or DROP VIRTUAL TABLE c.customers
+view	secrets	NULL	definition_broken	CREATE OR REPLACE VIRTUAL VIEW c.secrets AS '<sql>'
+view	stock	NULL	schema_stale	ANALYZE VIRTUAL VIEW c.stock
+
+query I
+SELECT detail FROM acl_check_catalog('c') WHERE object = 'stock';
+----
+the stored schema no longer matches what the SQL binds to (added: price INTEGER; removed: sku)
+
+query I
+SELECT detail FROM acl_check_catalog('c') WHERE object = 'ext';
+----
+1 source object(s) not recorded (b)
+
+# the repairs the rows name
+statement ok
+ACL ADMIN ANALYZE VIRTUAL VIEW c.stock;
+
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA c.ext REFRESH;
+
+statement ok
+ACL ADMIN DROP VIRTUAL REFERENCE c.cust_items;
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.customers SET PHYS phys.main.customers2;
+
+query II
+SELECT object, problem FROM acl_check_catalog('c') ORDER BY 1;
+----
+old	schema_missing
+secrets	definition_broken
+twice	definition_broken
+
+# the bare alias's grant predicate, written while sku existed, once the object is back as a record
+# (a predicate over a column that is already gone is refused where it is written, spec 021)
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.items AS phys.main.items;
+
+statement error
+ACL ADMIN GRANT OBJECT c.items TO ROLE poor RLS (sku <> '');
+----
+<REGEX>:.*does not bind against it.*
+
+query III
+SELECT object, role, problem FROM acl_check_catalog('c') WHERE kind = 'grant';
+----
+items	poor	rls_broken
+
+# the no-argument form walks every catalog; the SQL form is the same rows
+query I
+SELECT count(*) FROM acl_check_catalog();
+----
+4
+
+# the SQL form answers the same rows (a prefix opens a statement, so it is not a subquery here)
+query IIIIIII rowsort
+ACL ADMIN CHECK VIRTUAL CATALOG c;
+----
+c	function	twice	NULL	definition_broken	the target function "phys.main.twice" is not defined in this instance (is its extension loaded?)	acl_alter_function('c', 'twice', 'scalar', 'alias', '<target>')
+c	grant	items	poor	rls_broken	the predicate of role "poor" does not bind against "c.items": Binder Error: Referenced column "sku" not found in FROM clause!	SELECT acl_grant_object('poor', 'c', 'items', '', 'sku <> ''''', '')  -- with a predicate that binds
+c	schema	old	NULL	schema_missing	the physical schema "phys.old" does not exist (is its database attached?)	ALTER VIRTUAL SCHEMA c.old SET PHYS <path>  -- or DROP VIRTUAL SCHEMA c.old
+c	view	secrets	NULL	definition_broken	the view's SQL does not bind: Catalog Error: Table with name customers does not exist!	CREATE OR REPLACE VIRTUAL VIEW c.secrets AS '<sql>'
+
+# --- the surface is the operator's -----------------------------------------------------------------
+statement error
+ACL ROLE "analyst" SELECT * FROM acl_check_catalog('c');
+----
+<REGEX>:.*table function "acl_check_catalog" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT acl_repair_relation('c', 'customers', 'drop_missing');
+----
+<REGEX>:.*function "acl_repair_relation" is not allowed.*
+
+statement error
+SELECT * FROM acl_check_catalog('nope');
+----
+<REGEX>:.*catalog "nope" does not exist.*
+
+# a catalog-scoped manage checks its own catalog and is refused another
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG d;
+
+statement ok
+ACL ADMIN CREATE ROLE mgr;
+
+statement ok
+SELECT acl_grant_catalog('mgr', 'c', '{"manage": true}', false);
+
+statement ok
+ACL ROLE "mgr" ACL CHECK VIRTUAL CATALOG c;
+
+statement error
+ACL ROLE "mgr" ACL CHECK VIRTUAL CATALOG d;
+----
+<REGEX>:.*no manage scope for catalog "d".*
+
+statement error
+ACL ROLE "mgr" ACL REPAIR VIRTUAL TABLE d.x DROP MISSING COLUMNS;
+----
+<REGEX>:.*no manage scope for catalog "d".*
+
+# a repair on a view or a bare alias says where to go instead
+statement error
+ACL ADMIN REPAIR VIRTUAL TABLE c.secrets DROP MISSING COLUMNS;
+----
+<REGEX>:.*is a view - ANALYZE VIRTUAL VIEW.*
+
+statement error
+ACL ADMIN REPAIR VIRTUAL TABLE c.items DROP MISSING COLUMNS;
+----
+<REGEX>:.*declares no COLUMNS list.*

@@ -20,15 +20,42 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = r.\"vcat\""
 	                                       " AND oc.\"vname\" = r.\"vname\""
 	                                 : string();
+	// spec 039: a declared-list object whose source lost a column is MARKED, not narrowed. The
+	// declared entries that read a bare source column (a name, or a quoted one - an expression is
+	// not judged, and neither is a constant) with no row in information_schema.columns are what the
+	// mark names - a join over catalog facts and the same information_schema the columns surface
+	// already reads, never a probe (spec 065). The columns surface lists the survivors; the mark on
+	// the object says the read will fail anyway, and acl_check_catalog has the rest.
+	string missing =
+	    "CASE WHEN r.\"form\" IN ('alias', 'subquery') AND len(str_split(r.\"phys\", '.')) = 3 THEN"
+	    " (SELECT string_agg(dc.\"name\", ', ' ORDER BY dc.\"pos\") FROM " +
+	    Tbl("relation_columns") +
+	    " dc WHERE dc.\"vcat\" = r.\"vcat\" AND dc.\"vname\" = r.\"vname\""
+	    " AND lower(coalesce(dc.\"expr\", '')) NOT IN ('null', 'true', 'false')"
+	    " AND (dc.\"expr\" IS NULL OR dc.\"expr\" = ''"
+	    " OR regexp_matches(dc.\"expr\", '^[A-Za-z_][A-Za-z0-9_]*$')"
+	    " OR regexp_matches(dc.\"expr\", '^\"[^\"]+\"$'))"
+	    " AND NOT EXISTS (SELECT 1 FROM information_schema.columns ic"
+	    " WHERE ic.table_catalog = str_split(r.\"phys\", '.')[1]"
+	    " AND ic.table_schema = str_split(r.\"phys\", '.')[2]"
+	    " AND ic.table_name = str_split(r.\"phys\", '.')[3]"
+	    " AND lower(ic.column_name) = lower(CASE WHEN dc.\"expr\" IS NULL OR dc.\"expr\" = '' THEN dc.\"name\""
+	    " WHEN dc.\"expr\" LIKE '\"%\"' THEN substr(dc.\"expr\", 2, length(dc.\"expr\") - 2)"
+	    " ELSE dc.\"expr\" END))) ELSE NULL END";
+	string marked = "CASE WHEN r.missing IS NOT NULL THEN 'acl: broken - declared column(s) ' || r.missing ||"
+	                " ' no longer exist in the source' || CASE WHEN r.\"comment\" IS NULL OR r.\"comment\" = ''"
+	                " THEN '' ELSE '; ' || r.\"comment\" END ELSE r.\"comment\" END";
 	// the written path splits into a virtual schema and a name; a bare name sits in `main`
 	string objects = "objects AS (SELECT DISTINCT r.\"vcat\" AS vcat,"
 	                 " CASE WHEN position('.' IN r.\"vname\") > 0"
 	                 " THEN regexp_extract(r.\"vname\", '^(.*)[.][^.]*$', 1) ELSE 'main' END AS vschema,"
 	                 " regexp_extract(r.\"vname\", '([^.]*)$', 1) AS vname, r.\"vname\" AS stored_name,"
-	                 " r.\"form\" AS form, r.\"comment\" AS comment,"
-	                 " str_split(r.\"phys\", '.') AS parts FROM " +
-	                 Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " + visible +
-	                 ")";
+	                 " r.\"form\" AS form, " +
+	                 marked +
+	                 " AS comment,"
+	                 " str_split(r.\"phys\", '.') AS parts FROM (SELECT r.*, " +
+	                 missing + " AS missing FROM " + Tbl("relations") +
+	                 " r) r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " + visible + ")";
 	// an alias schema shows the physical schema live, so its visibility is the role's capabilities
 	// on that schema (its own grant if it has one, otherwise the catalog's) - without this filter a
 	// role granted an explicit nothing would still read the names out of the source

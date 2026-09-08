@@ -22,7 +22,8 @@ A statement is administered from behind one of the `ACL` prefixes:
 TABLE`, `INSERT`, `SELECT`, duckdb's own `ALTER TABLE` or `COMMENT ON TABLE`) is plain SQL. The
 management forms are recognized by their first words - `ADD`, `GRANT`, `REVOKE`, `MAP`, `CREATE
 [OR REPLACE] VIRTUAL|ROLE|ISSUER`, `ALTER VIRTUAL|ROLE|ISSUER|GRANT`, `DROP VIRTUAL|RELATION|
-REFERENCE|ROLE|ISSUER|MAP`, `COMMENT ON VIRTUAL`, `ANALYZE VIRTUAL` - and a typo after one of those
+REFERENCE|ROLE|ISSUER|MAP`, `COMMENT ON VIRTUAL`, `ANALYZE VIRTUAL`, `CHECK VIRTUAL`, `REPAIR VIRTUAL` -
+and a typo after one of those
 is an error, never a fallthrough into native SQL.
 
 The `acl_*` functions themselves can only be called in the native context (`ACL ADMIN SELECT
@@ -548,6 +549,77 @@ ACL ADMIN ANALYZE VIRTUAL CATALOG sales;
 
 Function: `acl_refresh_schema(vcat[, vname])` (returns BIGINT).
 
+## Checking and repairing a catalog
+
+```
+CHECK VIRTUAL CATALOG <catalog>
+REPAIR VIRTUAL TABLE <catalog>.<name> REMAP (<column> = <expression>, …)
+REPAIR VIRTUAL TABLE <catalog>.<name> DROP MISSING COLUMNS [AND MASKS]
+```
+
+The source changes under the catalog - a column dropped or renamed, a table gone, a view's
+dependency moved - and nothing on a principal's query path may look (spec 065). `CHECK VIRTUAL
+CATALOG` is the administrator's look, off the query path: it probes every stored fact of the catalog
+against the source and answers **one row per finding** - `vcat`, `kind` (`table`, `view`,
+`function`, `schema`, `grant`, `reference`), `object`, `role` (a grant's, else NULL), `problem`,
+`detail` (our sentence; it may name the physical column or path - this is the admin's surface) and
+`repair` (the statement that mends it, ready to paste). It writes nothing. The problems:
+
+| problem | what no longer holds | the repair it names |
+| --- | --- | --- |
+| `source_missing` | the relation's physical source does not bind (dropped, renamed) | `ALTER VIRTUAL TABLE … SET PHYS` / `DROP VIRTUAL TABLE` |
+| `column_missing` | a declared `COLUMNS` entry whose expression no longer binds against the source | `REPAIR VIRTUAL TABLE … REMAP (…)` or `… DROP MISSING COLUMNS` |
+| `definition_broken` | a view's SQL, a macro's template (with its declared parameter types), or an alias's target function does not bind / exist | `CREATE OR REPLACE VIRTUAL VIEW … AS` / `acl_alter_function` |
+| `schema_stale` | a query-defined object's stored (derived) schema differs from what its definition binds to now | `ANALYZE VIRTUAL …` |
+| `rls_broken` / `rls_unchecked` | a predicate (object or grant) fails to bind / was accepted unchecked and binds now (spec 027) | `… SET RLS`, a re-grant / `ANALYZE VIRTUAL CATALOG` |
+| `grant_column_missing` | a bare item of a grant's `COLUMNS` list matches no column of the object (an object grant), or of any object of the catalog (a catalog grant) | `acl_grant_object(…)` / `ALTER GRANT CATALOG … SET COLUMNS` |
+| `mask_broken` | a `name = expr` grant item names a column the object does not expose, or its expression does not bind - every read of that object by that role refuses (spec 038) | the same |
+| `schema_missing` | a schema alias's or expansion's physical schema has no schema behind it | `ALTER VIRTUAL SCHEMA … SET PHYS` / `DROP VIRTUAL SCHEMA` |
+| `expansion_stale` | an expansion's source has tables it did not record (and did not exclude), or records whose source is gone | `ALTER VIRTUAL SCHEMA … REFRESH [PRUNE]` |
+| `reference_dangling` | a reference's end object, or a column it names, is not in the catalog (catalog facts only) | `DROP VIRTUAL REFERENCE` |
+
+A bare alias (no declared list) has no contract beyond "binds", so only `source_missing` can be
+found on it - declaring `COLUMNS` is the opt-in to `column_missing`, as it is to spec 065's clean
+refusals. A column *added* to the source is not a finding: it appears live under a whole-table grant
+by design (docs/security.md, "a grant on the source's future").
+
+`REPAIR VIRTUAL TABLE` mends a declared list on purpose, and **never drops a mask silently**:
+
+- `REMAP (ssn = ssn_v2, …)` gives the named entries new expressions, each probed to bind before
+  anything is written (a name the list does not declare, or an expression that does not bind, is
+  refused and nothing changes); the grants' projections on the object are re-probed after.
+- `DROP MISSING COLUMNS` removes every entry whose expression no longer binds. It is **refused**
+  while an object grant on that object masks one of those names (`… would orphan the mask(s) on
+  "ssn" (role "analyst") - REMAP the column, alter those grants, or DROP MISSING COLUMNS AND MASKS`).
+  A catalog grant's mask is not touched either way: it protects the column on every other object,
+  and spec 038 refuses this object's reads for it - which `CHECK` reports as `mask_broken`.
+- `DROP MISSING COLUMNS AND MASKS` also removes exactly those mask items from the object grants
+  that carried them, by name; the count includes them. The mask protected a column that no longer
+  exists; what the administrator acknowledges is that a column of that name is gone for good.
+
+Both return how many entries changed (`0` when nothing was missing). A view has nothing to repair
+here (`ANALYZE VIRTUAL VIEW` re-derives, `CREATE OR REPLACE VIRTUAL VIEW` redefines), and a bare
+alias has no list to mend.
+
+While a declared-list object is broken, the tables listings a principal sees (`information_schema.
+tables`, `duckdb_tables()`, `duckdb_views()`) carry the mark in the object's comment - `acl: broken -
+declared column(s) ssn no longer exist in the source` - rather than quietly describing a narrower
+object; the columns surface keeps the contract as written. A role whose grant *masks* the vanished
+column (`ssn = NULL`) never reads it and keeps its rows; a role whose grant reads it gets the binder
+error spec 065 accepted.
+
+```sql
+ACL ADMIN CHECK VIRTUAL CATALOG sales;
+ACL ADMIN REPAIR VIRTUAL TABLE sales.customers REMAP (ssn = ssn_v2);
+ACL ADMIN REPAIR VIRTUAL TABLE sales.customers DROP MISSING COLUMNS AND MASKS;
+```
+
+Functions: `acl_check_catalog([vcat])` (a table function; no argument walks every catalog),
+`acl_repair_relation(vcat, vname, action[, spec])` (returns BIGINT; `action` is `remap` with the
+list in `spec`, `drop_missing`, or `drop_missing_and_masks`). Both are the administrator's: denied to
+a principal, and under a role's management scope confined to the catalogs it manages (the
+no-argument check needs an unrestricted scope).
+
 ## ALTER
 
 `ALTER` changes one property of an existing object: a missing target is an error (there is no `IF
@@ -565,6 +637,8 @@ forms carry the `VIRTUAL` marker so duckdb's own `ALTER TABLE` stays native.
 | `ALTER VIRTUAL VIEW <c>.<n> SET PRIMARY KEY (…)` / `DROP PRIMARY KEY`                            | `acl_set_key(vcat, vname, 'relation', pk_csv)`              |
 | `ALTER VIRTUAL SCHEMA <c>.<path> SET PHYS <phys schema>`                                         | `acl_alter_schema_alias(vcat, path, phys)`                  |
 | `ALTER VIRTUAL SCHEMA <c>.<path> REFRESH [PRUNE]`                                                | `acl_refresh_schema_objects(vcat, path, prune)`             |
+| `CHECK VIRTUAL CATALOG <c>`                                                                        | `SELECT * FROM acl_check_catalog(vcat)` (spec 039)                                      |
+| `REPAIR VIRTUAL TABLE <c>.<n> REMAP (<v> = <expr>, …)` / `DROP MISSING COLUMNS [AND MASKS]`          | `acl_repair_relation(vcat, vname, 'remap', list)` / `(…, 'drop_missing[_and_masks]')`   |
 | `ALTER VIRTUAL TABLE FUNCTION <c>.<n> SET MACRO <select>` / `SET ALIAS [OF] <fn>`                | `acl_alter_function(vcat, vname, 'table', 'macro' or 'alias', definition)` |
 | `ALTER VIRTUAL TABLE FUNCTION <c>.<n> SET PRIMARY KEY (…)` / `DROP PRIMARY KEY`                  | `acl_set_key(vcat, vname, 'table', pk_csv)`                 |
 | `ALTER VIRTUAL SCALAR <c>.<n> SET MACRO <expression>` / `SET ALIAS [OF] <fn>`                    | `acl_alter_function(vcat, vname, 'scalar', 'macro' or 'alias', definition)` |
@@ -671,6 +745,8 @@ section.
 | `acl_set_key(vcat, vname, kind[, pk_csv])`                                                            | declared primary key; `kind` `relation`/`table`; empty list drops it    |
 | `acl_comment(vcat, vname, kind, column, comment)`                                                     | comment an object (`column` empty) or a column                          |
 | `acl_refresh_schema(vcat[, vname])` -> BIGINT                                                         | re-derive stored schemas; objects re-probed                             |
+| `acl_check_catalog([vcat])` (table function)                                                          | what no longer holds against the source, one row per finding (spec 039) |
+| `acl_repair_relation(vcat, vname, action[, spec])` -> BIGINT                                          | mend a declared list: `remap`, `drop_missing`, `drop_missing_and_masks` |
 | `acl_add_reference(vcat, name, from, to[, to_kind, args, pairs, expr, cardinality, optional, join_method, comment, mode])` | declare a join path                                |
 | `acl_drop_reference(vcat, name[, mode])`                                                              | drop it                                                                 |
 | `acl_register_created(vcat, vname, phys[, origin])`                                                   | internal: the record a principal's own `CREATE` writes                  |
