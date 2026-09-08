@@ -414,6 +414,28 @@ bool PolicyStore::SessionAlive(const string &handle) {
 	return true;
 }
 
+bool PolicyStore::SessionTouch(const string &handle) {
+	// SessionAlive with the bump: a reader pulling a stream is a client at work, and its session must
+	// not die of idleness under it (spec 070). The three judgements are the same.
+	auto now = NowSeconds();
+	auto skew = JwtClockSkew();
+	auto idle = SessionIdleTimeout();
+	auto exp_binds = SessionExpEveryUse();
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry == sessions.end()) {
+		return false;
+	}
+	if (exp_binds && entry->second.expires_at > 0 && entry->second.expires_at + skew < now) {
+		return false;
+	}
+	if (idle > 0 && entry->second.last_used + idle < now) {
+		return false;
+	}
+	entry->second.last_used = now;
+	return true;
+}
+
 string PolicyStore::SessionReason(const string &handle) {
 	// Read-only, like SessionAlive: no bump, no erase - so a client that got NULL from SessionSql can
 	// call this next and still learn the true reason rather than "unknown" (spec 054).

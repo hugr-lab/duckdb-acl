@@ -94,16 +94,25 @@ got="$(client first "SELECT * FROM big")"
 echo "$got" | grep -q "'rows': [1-9]" || fail "no first batch: $got"
 first_ms="$(echo "$got" | sed -n "s/.*'first_ms': \([0-9]*\).*/\1/p")"
 [ "$first_ms" -lt 3000 ] || fail "the first batch took ${first_ms}ms - that is a materialized result, not a stream"
-# ...and the cancel was heard: the query was interrupted, the stream recorded with what went out
-ended="$(server_says "SELECT detail, rows FROM acl_audit_events() WHERE kind = 'door' AND detail LIKE 'stream_%' ORDER BY seq DESC LIMIT 1")"
-echo "$ended" | grep -q "^stream_cancelled,[1-9]" || fail "the cancel was not heard as stream_cancelled with rows: $ended"
+# ...and the cancel was heard: the query was interrupted, the stream recorded with what went out. The
+# event lands when gRPC tears the call down, a moment after the client's cancel - so it is awaited
+last_stream() { server_says "SELECT detail, rows FROM acl_audit_events() WHERE kind = 'door' AND detail LIKE 'stream_%' ORDER BY seq DESC LIMIT 1"; }
+await_stream() { # <regex> <what> - the newest stream event must match within 5s
+	local i ended
+	for i in $(seq 1 50); do
+		ended="$(last_stream)"
+		if echo "$ended" | grep -q "$1"; then echo "$ended"; return 0; fi
+		sleep 0.1
+	done
+	fail "$2: $ended"
+}
+ended="$(await_stream "^stream_cancelled,[1-9]" "the cancel was not heard as stream_cancelled with rows")"
 echo "  pass first batch in ${first_ms}ms, then the cancel is heard ($ended)"
 
 # --- a full read ends as consumed, with its count ------------------------------------------------
 got="$(client consume "SELECT * FROM orders")"
 echo "$got" | grep -q "'rows': 5" || fail "the tenant's five rows: $got"
-ended="$(server_says "SELECT detail, rows FROM acl_audit_events() WHERE kind = 'door' AND detail LIKE 'stream_%' ORDER BY seq DESC LIMIT 1")"
-[ "$ended" = "stream_consumed,5" ] || fail "a full read is stream_consumed with its rows: $ended"
+ended="$(await_stream "^stream_consumed,5$" "a full read is stream_consumed with its rows")"
 echo "  pass a full read is consumed ($ended)"
 
 # --- a forgotten cursor is superseded by the session's next statement ---------------------------
@@ -120,14 +129,35 @@ done
 [ "$ended" = "1" ] || fail "the idle stream was not recorded as superseded: $ended"
 echo "  pass an idle stream is superseded after ${waited}ms, the next statement runs"
 
-# --- the row cap ends the stream in a refusal -----------------------------------------------------
+# --- a session the operator kills takes its stream with it at the next pull ----------------------
+ACL_STREAM_PAUSE=3 python3 "$HERE/stream_client.py" "$URI" killed "SELECT * FROM big" >"$TMP/killed.out" 2>&1 &
+KILLED_PID=$!
+for _ in $(seq 1 100); do
+	grep -q "^held" "$TMP/killed.out" 2>/dev/null && break
+	sleep 0.1
+done
+grep -q "^held" "$TMP/killed.out" || { cat "$TMP/killed.out" >&2; fail "the client never held its first batch"; }
+# every live session is a departed client's but this one; the ops surface ends them all (spec 050)
+killed="$(server_says "SELECT count(*) FROM (SELECT acl_session_kill(id) AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\s*\"([^\"]+)\"', 1)) AS id)) WHERE k")"
+[ "$killed" -ge 1 ] || fail "no session was killed: $killed"
+wait "$KILLED_PID" 2>/dev/null || true
+got="$(tail -1 "$TMP/killed.out")"
+echo "$got" | grep -q "the session ended" || fail "the killed session's stream did not end at the next pull: $got"
+ended="$(await_stream "^stream_superseded,[1-9]" "the killed session's stream was not recorded")"
+echo "  pass a killed session's stream ends at its next pull ($ended)"
+
+# --- the row cap ends the stream in a refusal, after exactly N rows -------------------------------
 echo "SET GLOBAL acl_max_result_rows=1000;" >&3
+cap="$(server_says "SELECT current_setting('acl_max_result_rows')")"
+[ "$cap" = "1000" ] || fail "the cap was not set: $cap"
 got="$(client consume "SELECT * FROM big")"
 echo "$got" | grep -q "exceeds acl_max_result_rows (1000)" || fail "the cap was not applied: $got"
-ended="$(server_says "SELECT detail, rows >= 1000 FROM acl_audit_events() WHERE kind = 'door' AND detail = 'stream_capped'")"
-[ "$ended" = "stream_capped,true" ] || fail "the cap was not recorded: $ended"
+echo "$got" | grep -q "'rows': 1000," || fail "the client did not receive exactly the 1000 rows before the refusal: $got"
+ended="$(await_stream "^stream_capped,1000$" "the cap was not recorded with exactly its rows")"
 echo "SET GLOBAL acl_max_result_rows=0;" >&3
-echo "  pass the row cap refuses past 1000 rows"
+cap="$(server_says "SELECT current_setting('acl_max_result_rows')")"
+[ "$cap" = "0" ] || fail "the cap was not lifted: $cap"
+echo "  pass the row cap hands out exactly 1000 rows, then refuses"
 
 # --- a bulk load whose client dies mid-stream is rolled back and named ---------------------------
 python3 "$HERE/stream_client.py" "$URI" ingest orders >"$TMP/ingest.out" 2>&1 &

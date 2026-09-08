@@ -230,10 +230,9 @@ done
 # escaped exception as "Unexpected error in RPC handling", which says nothing. Since spec 069 the
 # client is told no more than "authentication failed" (a token is refused the same way whatever the
 # cause - spec 040), and the REASON goes where the operator reads it: a `session` event `refused`
-# with reason_code `source_error` (the keys' source failed, not the principal) and the policy's text.
+# with reason_code `source_error` (the keys' source failed, not the principal) and the policy's text -
+# a refusal is recorded at every audit level but `off`.
 FILE_TOKEN='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2ZpbGUiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXX0.xxxx'
-echo "SET GLOBAL acl_audit_level='all';" >&3   # session events are recorded at `all` (spec 069)
-sleep 0.5
 for probe in "SELECT 1" "@tables" "@imported:orders"; do
 	got="$(ask "$probe" "$FILE_TOKEN")"
 	case "$got" in *"Unexpected error in RPC handling"*) fail "$probe: the exception reached gRPC unnamed: $got";; esac

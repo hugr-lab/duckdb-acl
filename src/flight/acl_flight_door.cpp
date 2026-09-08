@@ -29,6 +29,7 @@
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
 #include "acl_oidc.hpp"
+#include "duckdb/main/stream_query_result.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -126,20 +127,30 @@ struct FlightDoorState {
 		std::mutex stream_lock;
 		shared_ptr<ResultStream> stream;
 		std::atomic<int64_t> stream_last_pull {0};
-		bool StreamOpen() {
-			std::lock_guard<std::mutex> guard(stream_lock);
-			return stream && stream->result;
-		}
 		//! Ends the open stream from another thread - the session's next statement, the session's end:
-		//! the query is interrupted, the result dropped, and the reader finds `superseded` in its slot.
-		//! Caller holds `stream_lock`.
+		//! the query is interrupted and closed, the result dropped, and the reader finds `superseded`
+		//! in its slot. Caller holds `stream_lock`, so no pull is in flight.
 		void EndStreamLocked() {
 			if (stream && stream->result) {
-				con->context->Interrupt();
+				CloseResult(*stream->result, true);
 				stream->result.reset();
 				stream->superseded = true;
 			}
 			stream.reset();
+		}
+		//! What ends a query on this connection, whoever ends it: the interrupt stops the pipeline's
+		//! tasks where they are, Close() waits for them and RELEASES the active query - the executor
+		//! and every operator's intermediate state (a sort's runs, a hash table). At our pin the
+		//! result's destructor releases nothing: without Close() an abandoned query's memory stays on
+		//! the connection until the session's next statement, which a client holding an idle cookie
+		//! never sends.
+		void CloseResult(QueryResult &result, bool interrupt) {
+			if (interrupt) {
+				con->context->Interrupt();
+			}
+			if (result.GetResultType() == QueryResultType::STREAM_RESULT) {
+				result.Cast<StreamQueryResult>().Close();
+			}
 		}
 	};
 	std::unordered_map<string, shared_ptr<SessionConn>> session_conns;
@@ -152,7 +163,8 @@ struct FlightDoorState {
 	//! consumes sequentially never does - unless the stream has sat unpulled for
 	//! acl_flight_stream_idle seconds, a cursor somebody forgot: then it is interrupted (duckdb's own
 	//! rule, "a new query invalidates the previous stream result", made explicit and bounded), its
-	//! reader ends the stream and releases `exec`, and the statement runs.
+	//! reader ends the stream and releases `exec`, and the statement runs. `0` turns the rule off:
+	//! the statement waits for the stream's own end, however long.
 	std::unique_lock<std::mutex> LockForStatement(SessionConn &conn) {
 		for (;;) {
 			std::unique_lock<std::mutex> guard(conn.exec);
@@ -162,7 +174,7 @@ struct FlightDoorState {
 					return guard; // no stream on this connection: the statement runs
 				}
 				auto idle = store->FlightStreamIdleSeconds();
-				if (idle >= 0 && NowMillis() - conn.stream_last_pull.load() >= idle * 1000) {
+				if (idle > 0 && NowMillis() - conn.stream_last_pull.load() >= idle * 1000) {
 					// a cursor somebody forgot: ended here, from this thread. The interrupt stops
 					// whatever the query still runs, the result goes, and the reader finds it gone on
 					// its next pull (if there ever is one)
@@ -293,21 +305,34 @@ struct FlightDoorState {
 	//! here, which is the whole point: what one statement of a session leaves on the connection, the
 	//! next statement of the same session finds, and nobody else can.
 	shared_ptr<SessionConn> ConnFor(const string &handle) {
-		std::lock_guard<std::mutex> guard(lock);
-		auto now = NowSeconds();
-		if (now - last_conn_sweep >= 60) {
-			last_conn_sweep = now;
-			// sweep abandoned reservations on the same clock, not only under cap pressure (spec 055
-			// review): a reservation holds a shared_ptr to its SessionConn, so a lingering one pins
-			// the connection - and now an open transaction with its write locks - past session end.
-			// This bounds an abandoned transaction to the idle timeout rather than the reservation cap.
-			SweepReservationsLocked(store->SessionIdleTimeout());
-			SweepConnsLocked();
+		vector<shared_ptr<SessionConn>> reaped;
+		shared_ptr<SessionConn> entry;
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			auto now = NowSeconds();
+			if (now - last_conn_sweep >= 60) {
+				last_conn_sweep = now;
+				// sweep abandoned reservations on the same clock, not only under cap pressure (spec
+				// 055 review): a reservation holds a shared_ptr to its SessionConn, so a lingering one
+				// pins the connection - and now an open transaction with its write locks - past
+				// session end. This bounds an abandoned transaction to the idle timeout rather than
+				// the reservation cap.
+				SweepReservationsLocked(store->SessionIdleTimeout());
+				reaped = SweepConnsLocked();
+			}
+			auto &slot = session_conns[handle];
+			if (!slot) {
+				slot = make_shared_ptr<SessionConn>();
+				slot->con = make_uniq<Connection>(db);
+			}
+			entry = slot;
 		}
-		auto &entry = session_conns[handle];
-		if (!entry) {
-			entry = make_shared_ptr<SessionConn>();
-			entry->con = make_uniq<Connection>(db);
+		// a stream still open on a dead session's connection ends now, not when its client notices
+		// (spec 070) - OUTSIDE the door's lock: ending it waits for a pull in flight (whose Fetch may
+		// be a whole sort) and for the query's tasks, and no other session should wait with it
+		for (auto &conn : reaped) {
+			std::lock_guard<std::mutex> stream(conn->stream_lock);
+			conn->EndStreamLocked();
 		}
 		return entry;
 	}
@@ -324,22 +349,19 @@ struct FlightDoorState {
 	//! own, because the metadata RPCs keep a session warm without executing on its connection, and a
 	//! second clock diverging there dropped temp tables under a live session (the PR review's
 	//! finding). SessionAlive bumps nothing - an observer must not keep the observed alive. Caller
-	//! holds the lock.
-	void SweepConnsLocked() {
+	//! holds the lock. Answers the dropped connections, for the caller to end their streams once the
+	//! lock is released.
+	vector<shared_ptr<SessionConn>> SweepConnsLocked() {
+		vector<shared_ptr<SessionConn>> reaped;
 		for (auto it = session_conns.begin(); it != session_conns.end();) {
 			if (!store->SessionAlive(it->first)) {
-				// a stream still open on a dead session's connection ends now, not when its client
-				// notices (spec 070): the reader keeps the connection alive until it does
-				{
-					auto &conn = *it->second;
-					std::lock_guard<std::mutex> stream(conn.stream_lock);
-					conn.EndStreamLocked();
-				}
+				reaped.push_back(it->second);
 				it = session_conns.erase(it);
 			} else {
 				++it;
 			}
 		}
+		return reaped;
 	}
 
 	//! What the door's stop does: the server is down and its threads joined, so nothing is mid-use.
@@ -363,22 +385,28 @@ class AclResultReader : public arrow::RecordBatchReader {
 public:
 	AclResultReader(shared_ptr<FlightDoorState> state_p, shared_ptr<FlightDoorState::Reservation> reservation_p,
 	                shared_ptr<FlightDoorState::ResultStream> slot_p, std::shared_ptr<arrow::Schema> schema_p,
-	                const flight::ServerCallContext &context_p, string handle_p)
+	                ClientProperties properties_p, const flight::ServerCallContext &context_p, string handle_p,
+	                bool durable_p)
 	    : state(std::move(state_p)), reservation(std::move(reservation_p)), slot(std::move(slot_p)),
-	      schema_(std::move(schema_p)), context(context_p), handle(std::move(handle_p)),
-	      cap(state->store->MaxResultRows()) {
+	      schema_(std::move(schema_p)), properties(std::move(properties_p)), context(context_p),
+	      handle(std::move(handle_p)), durable(durable_p), cap(state->store->MaxResultRows()) {
 		reservation->conn->stream_last_pull.store(FlightDoorState::NowMillis());
 		state->open_streams++;
 	}
 	~AclResultReader() override {
 		// a stream gRPC tore down mid-way (a no-op for one that ended itself): the client cancelled
-		// it - unless the session's next statement, or the session's end, had already ended it
-		bool superseded;
-		{
-			std::lock_guard<std::mutex> stream(reservation->conn->stream_lock);
-			superseded = slot->superseded;
+		// it - unless the session's next statement, or the session's end, had already ended it, which
+		// End reads off the slot under the lock (a supersede landing right now is still seen)
+		End("cancelled");
+	}
+	//! The caller, holding `exec`, could not hand this reader to gRPC after all (the stream wrapper's
+	//! allocation threw): no stream existed. The result stays in the slot for the connection to end
+	//! (LockForStatement, at the idle rule) - End here would take `exec` on the caller's thread.
+	void Abandon() {
+		if (!ended) {
+			ended = true;
+			state->open_streams--;
 		}
-		End(superseded ? "superseded" : "cancelled");
 	}
 
 	std::shared_ptr<arrow::Schema> schema() const override {
@@ -390,12 +418,24 @@ public:
 		if (ended) {
 			return arrow::Status::OK();
 		}
-		auto &conn = *reservation->conn;
-		conn.stream_last_pull.store(FlightDoorState::NowMillis());
+		if (cap_reached) {
+			// the rows up to the cap went out with the previous batch; this pull is the refusal
+			auto message = CapMessage();
+			End("capped", message);
+			return arrow::Status::Invalid(message);
+		}
 		if (context.is_cancelled()) {
 			End("cancelled");
 			return arrow::Status::OK();
 		}
+		// a pull is the session's activity (its idle clock) - and a session that is gone, killed by
+		// the operator or expired, takes its stream with it at the next pull. A per-call session (no
+		// cookie) closed at its RPC's end by design; its stream is the reader's alone.
+		if (durable && !state->store->SessionTouch(handle)) {
+			End("superseded", "acl: the session ended");
+			return arrow::Status::Cancelled("acl: the session ended");
+		}
+		auto &conn = *reservation->conn;
 		unique_ptr<DataChunk> chunk;
 		string error;
 		bool gone = false;
@@ -416,6 +456,9 @@ public:
 					error = slot->result->GetError();
 				}
 			}
+			// the idle clock: time since the last pull RETURNED - a chunk that takes long to compute is
+			// not a cursor somebody forgot
+			conn.stream_last_pull.store(FlightDoorState::NowMillis());
 		}
 		if (gone) {
 			// ended from another thread: the session's next statement (idle), or the session's end
@@ -436,22 +479,40 @@ public:
 			End("consumed");
 			return arrow::Status::OK();
 		}
-		rows += NumericCast<int64_t>(chunk->size());
-		if (cap > 0 && rows > cap) {
-			auto message = "acl: the result exceeds acl_max_result_rows (" + std::to_string(cap) + ")";
-			End("capped", message);
-			return arrow::Status::Invalid(message);
+		// the cap: exactly N rows go out, then the refusal - the batch that crosses the line is cut at it
+		if (cap > 0 && rows + NumericCast<int64_t>(chunk->size()) >= cap) {
+			auto keep = cap - rows;
+			if (keep <= 0) {
+				auto message = CapMessage();
+				End("capped", message);
+				return arrow::Status::Invalid(message);
+			}
+			chunk->SetCardinalityUnsafe(NumericCast<idx_t>(keep)); // the logical count only, as ToArrowArray reads it
+			cap_reached = true;
 		}
-		ArrowArray array;
-		ArrowConverter::ToArrowArray(*chunk, &array, conn.con->context->GetClientProperties(), {});
-		ARROW_ASSIGN_OR_RAISE(*batch, arrow::ImportRecordBatch(&array, schema_));
+		rows += NumericCast<int64_t>(chunk->size());
+		try {
+			ArrowArray array;
+			ArrowConverter::ToArrowArray(*chunk, &array, properties, {});
+			auto imported = arrow::ImportRecordBatch(&array, schema_);
+			if (!imported.ok()) {
+				End("failed", imported.status().ToString());
+				return imported.status();
+			}
+			*batch = *imported;
+		} catch (std::exception &ex) {
+			// a chunk Arrow cannot carry: the stream fails with a name, not gRPC's "Unexpected error"
+			auto message = ErrorData(ex).RawMessage();
+			End("failed", message);
+			return StatusFromDuck("acl", message);
+		}
 		return arrow::Status::OK();
 	}
 
 private:
-	//! Once. Interrupts a query still running for nobody, drops the result off the connection, and
-	//! records the stream with what went out.
-	void End(const string &outcome, const string &message = string()) {
+	//! Once. Interrupts and closes a query still running for nobody, drops the result off the
+	//! connection, and records the stream with what went out.
+	void End(string outcome, const string &message = string()) {
 		if (ended) {
 			return;
 		}
@@ -461,10 +522,10 @@ private:
 			std::lock_guard<std::mutex> exec(conn.exec);
 			std::lock_guard<std::mutex> stream(conn.stream_lock);
 			if (slot->result) {
-				if (outcome != "consumed") {
-					conn.con->context->Interrupt();
-				}
+				conn.CloseResult(*slot->result, outcome != "consumed");
 				slot->result.reset();
+			} else if (slot->superseded && outcome == "cancelled") {
+				outcome = "superseded"; // the connection's side ended it first
 			}
 			if (conn.stream == slot) {
 				conn.stream.reset();
@@ -473,17 +534,39 @@ private:
 		state->open_streams--;
 		bool allowed = outcome == "consumed" || outcome == "cancelled" || outcome == "superseded";
 		string code = outcome == "capped" ? "at_capacity" : (outcome == "failed" ? "source_error" : string());
-		state->store->AuditDoor("flight", "stream_" + outcome, allowed, code, message, handle, nullptr, rows);
+		// the source's own error text carries physical names and row values (spec 069): the client
+		// gets it as any statement error, the audit keeps its class
+		auto reason = outcome == "failed" ? SourceErrorClass(message) : message;
+		state->store->AuditDoor("flight", "stream_" + outcome, allowed, code, reason, handle, nullptr, rows);
+	}
+	string CapMessage() const {
+		return "acl: the result exceeds acl_max_result_rows (" + std::to_string(cap) + ")";
+	}
+	//! Our own refusal from the prefix on; anything else reduced to its class, as AuditIngest does.
+	static string SourceErrorClass(const string &error) {
+		auto ours = error.find("acl_rewrite:");
+		if (ours == string::npos) {
+			ours = error.find("acl:");
+		}
+		if (ours != string::npos) {
+			return error.substr(ours);
+		}
+		auto colon = error.find(':');
+		auto klass = colon == string::npos ? string("error") : error.substr(0, MinValue<size_t>(colon, 64));
+		return "acl: the source failed the read (" + klass + ")";
 	}
 
 	shared_ptr<FlightDoorState> state;
 	shared_ptr<FlightDoorState::Reservation> reservation;
 	shared_ptr<FlightDoorState::ResultStream> slot;
 	std::shared_ptr<arrow::Schema> schema_;
+	ClientProperties properties;
 	const flight::ServerCallContext &context;
 	string handle;
+	bool durable;
 	int64_t cap;
 	int64_t rows = 0;
+	bool cap_reached = false;
 	bool ended = false;
 };
 
@@ -1525,8 +1608,13 @@ public:
 		if (result->HasError()) {
 			return StatusFromDuck("acl", result->GetError());
 		}
+		// the session connection's own properties, read once (under `exec`) and used for the schema AND
+		// every batch: the two must agree on the layout (arrow_large_buffer_size, string views - GLOBAL
+		// settings an admin may change while the stream lives), and a per-pull read would race a SET
+		// of the session's own (spec 068) on the same config
+		auto properties = reservation->conn->con->context->GetClientProperties();
 		std::shared_ptr<arrow::Schema> schema;
-		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result->GetTypes(), result->GetNames()));
+		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result->GetTypes(), result->GetNames(), properties));
 		auto slot = make_shared_ptr<FlightDoorState::ResultStream>();
 		slot->result = std::move(result);
 		{
@@ -1534,9 +1622,15 @@ public:
 			std::lock_guard<std::mutex> stream(conn.stream_lock);
 			conn.stream = slot; // LockForStatement let this statement in: no live stream sits here
 		}
-		auto reader = std::make_shared<AclResultReader>(state, std::move(reservation), std::move(slot),
-		                                                std::move(schema), context, handle);
-		return std::make_unique<flight::RecordBatchStream>(std::move(reader));
+		auto reader =
+		    std::make_shared<AclResultReader>(state, std::move(reservation), std::move(slot), std::move(schema),
+		                                      std::move(properties), context, handle, ClientSentCookie(context));
+		try {
+			return std::make_unique<flight::RecordBatchStream>(reader);
+		} catch (...) {
+			reader->Abandon(); // its destructor must not take `exec`, which this thread holds
+			throw;
+		}
 	}
 
 	//! --- the catalog RPCs (spec 046) -------------------------------------------------------------
@@ -1751,10 +1845,11 @@ private:
 	//!
 	//! The last clause is the reason this exists. duckdb reports through exceptions and gRPC's handler
 	//! catches everything into one message - "Unexpected error in RPC handling" - which tells a client
-	//! nothing and used to skip SessionClose on the way past. Two of the throws are not even ours to
-	//! avoid: SessionOpen resolves an issuer's keys before it verifies anything, and a JWKS document
-	//! that cannot be read throws from under SessionFor; the Arrow converters throw on a type they do
-	//! not carry. Every RPC now runs inside one try, so what escapes is a Status that names itself, and
+	//! nothing and used to skip SessionClose on the way past. Not every throw is ours to avoid: the
+	//! Arrow converters throw on a type they do not carry, a policy source that fails answers through
+	//! an exception (SessionOpen has caught its own since spec 069 - a JWKS document that cannot be
+	//! read is `authentication failed` to the client and a `session refused` event with the reason).
+	//! Every RPC now runs inside one try, so what escapes is a Status that names itself, and
 	//! the session is closed by the scope's destructor either way. This is the same boundary the
 	//! statement RPCs of spec 045 needed and did not have.
 	template <class Body>
@@ -1955,6 +2050,13 @@ private:
 	//! conversion happens here rather than at both call sites.
 	arrow::Result<std::shared_ptr<arrow::Schema>> SchemaFor(const vector<LogicalType> &types_p,
 	                                                        const vector<Identifier> &names) {
+		Connection con(state->db);
+		return SchemaFor(types_p, names, con.context->GetClientProperties());
+	}
+	//! ... with the properties the arrays will be built with: schema and batches must agree on the
+	//! layout (spec 070 - a stream lives long enough for a GLOBAL arrow setting to change under it)
+	arrow::Result<std::shared_ptr<arrow::Schema>>
+	SchemaFor(const vector<LogicalType> &types_p, const vector<Identifier> &names, ClientProperties properties) {
 		// A type the binder could not resolve at prepare - a parameter, or a DML whose injected
 		// write-check rides on one (spec 024) - arrives here as UNKNOWN, which Arrow cannot spell.
 		// The promise degrades to VARCHAR, the wire default; what a fetch actually streams is built
@@ -1972,8 +2074,6 @@ private:
 		for (auto &name : names) {
 			plain.push_back(name.GetIdentifierName());
 		}
-		Connection con(state->db);
-		auto properties = con.context->GetClientProperties();
 		ArrowSchema schema;
 		ArrowConverter::ToArrowSchema(&schema, types, plain, properties);
 		return arrow::ImportSchema(&schema);

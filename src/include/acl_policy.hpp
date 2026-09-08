@@ -533,6 +533,9 @@ struct PolicyStore {
 	//! Is this session live right now, without touching its idle clock. The door's connection sweep
 	//! asks this for every held connection, and an observer must not keep the observed alive.
 	bool SessionAlive(const string &handle);
+	//! spec 070: a pull of a result stream is the session's activity - the same judgements as
+	//! SessionAlive, plus the bump: true if the session is live (and now used), false if it is gone
+	bool SessionTouch(const string &handle);
 	//! Why a handle is not usable, judged read-only (no bump, no erase, like SessionAlive): one of
 	//! "live", "expired" (the token's exp passed), "idle" (swept for inactivity) or "unknown" (no such
 	//! session - closed, never opened, or already swept). Spec 054: a client that reconnects needs to

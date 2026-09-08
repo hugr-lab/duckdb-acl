@@ -2,19 +2,27 @@
 client that pulls a result the way a driver does, and stops the way a client stops.
 
   stream_client.py <uri> first <sql>       time to the first batch, then cancel the read
-  stream_client.py <uri> consume <sql>     read it all; prints the row count
+  stream_client.py <uri> consume <sql>     read it all, chunk by chunk; prints the row count (and the
+                                           error that ended it, with the rows received before)
   stream_client.py <uri> supersede <sql>   read one batch, keep the stream open, run `SELECT 1` on the
                                            same session (a cookie), print how long that waited
+  stream_client.py <uri> killed <sql>      read one batch, pause (stream.sh kills the session), then
+                                           drain to the error that ends the stream
   stream_client.py <uri> ingest <table>    stream batches into <table> forever - stream.sh kills it
 
 Every mode prints one dict on the last line; a refusal prints {"error": "..."}.
 """
 import os
+import signal
 import sys
 import time
 
 import pyarrow as pa
 import pyarrow.flight as flight
+
+# a client that hangs (a stream the server never ends, a cap not in force and 200M rows to read) must
+# fail the run, not hold it: one deadline for the whole process, whatever the mode
+signal.alarm(int(os.environ.get("ACL_STREAM_DEADLINE", "120")))
 
 TOKEN = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
          "eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9."
@@ -94,9 +102,33 @@ def main():
             reader.cancel()
             print({"first_ms": first_ms, "rows": rows})
         elif mode == "consume":
+            # chunk by chunk, so what arrived before a mid-stream refusal (the cap) is counted too
             reader = open_stream(arg)
-            table = reader.read_all()
-            print({"rows": table.num_rows})
+            rows = 0
+            try:
+                while True:
+                    rows += reader.read_chunk().data.num_rows
+            except StopIteration:
+                print({"rows": rows})
+            except Exception as ex:  # noqa: BLE001 - the assertion is about the text
+                print({"rows": rows, "error": str(ex)})
+        elif mode == "killed":
+            # read one batch, then pause while stream.sh kills the session from the server side; the
+            # next pull must say the session ended, not hand over another batch
+            open_stream("SELECT 1 AS warm").read_all()
+            reader = open_stream(arg)
+            held = reader.read_chunk().data.num_rows
+            sys.stdout.write("held\n")
+            sys.stdout.flush()
+            time.sleep(float(os.environ.get("ACL_STREAM_PAUSE", "3")))
+            # gRPC had already sent a few batches ahead of the one read: they arrive, then the end
+            more = 0
+            try:
+                for _ in range(200):
+                    more += reader.read_chunk().data.num_rows
+                print({"held": held, "more": more, "error": "the stream did not end"})
+            except Exception as ex:  # noqa: BLE001
+                print({"held": held, "more": more, "error": str(ex)})
         elif mode == "supersede":
             # a session is a connection from the SECOND call on (spec 050: the cookie arrives with the
             # first answer): warm up, so the stream and the probe below share one connection

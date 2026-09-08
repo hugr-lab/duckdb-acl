@@ -67,10 +67,31 @@ transport.
   the middle of a pull (duckdb invalidates a `StreamQueryResult` the moment another query starts on
   its connection), and the session's next statement can end the stream from its own thread. Every
   place a statement used to take `exec` now goes through `LockForStatement`: it takes `exec`, and if a
-  stream is open on the connection either ends it (idle past `acl_flight_stream_idle`: interrupt,
-  drop the result, mark the slot superseded) or lets go and looks again 20 ms later (the stream is
-  being pulled). The slot is the stream's own, so a newer stream on the same connection never
-  overwrites what an older reader will read about itself.
+  stream is open on the connection either ends it (idle past `acl_flight_stream_idle` since its last
+  pull *returned*: interrupt, close, drop the result, mark the slot superseded) or lets go and looks
+  again 20 ms later (the stream is being pulled). `acl_flight_stream_idle = 0` turns the rule off -
+  the statement waits for the stream's own end. The slot is the stream's own, so a newer stream on
+  the same connection never overwrites what an older reader will read about itself.
+- **Ending a stream closes the query, not only interrupts it** (`SessionConn::CloseResult`). At our
+  pin `~StreamQueryResult` releases nothing; `StreamQueryResult::Close()` is what runs duckdb's
+  `CleanupInternal` - `CancelTasks` and the release of the active query, the executor and every
+  operator's intermediate state (a sort's runs, a hash table). Interrupt alone would stop the CPU
+  and leave that memory on the connection until the session's next statement, which a client
+  holding an idle cookie never sends. Every end - the reader's, the supersede, the sweep - goes
+  through it.
+- **A pull is the session's activity, and a dead session ends its stream.** Each pull of a durable
+  (cookie) session calls `PolicyStore::SessionTouch` - `SessionAlive`'s judgements plus the idle
+  bump, so a client that pulls a long stream and sends no other RPC is not reaped under it - and a
+  session that is gone (killed by `acl_session_kill`, expired) ends the stream at that pull:
+  `acl: the session ended`, recorded as `stream_superseded`. A per-call (cookie-less) session is
+  closed at its RPC's end by design, so its stream is the reader's alone and is not judged. Between
+  pulls a killed session's stream is ended by the door's sweep (`ConnFor`, once a minute, on any
+  session's RPC) - outside the door's lock, since ending it waits for a pull in flight and for the
+  query's tasks.
+- **One `ClientProperties` snapshot** (taken under `exec` when the statement executes) builds both
+  the schema and every batch: the layout-affecting GLOBAL arrow settings (`arrow_large_buffer_size`,
+  string views, list views) may change while a stream lives, and the two must agree; a per-pull
+  read would also race a `SET` of the session's own (spec 068) on the same config.
 - **The end of the stream interrupts the query.** Five ways a stream ends, one mechanism
   (`AclResultReader::End`, once per stream: interrupt unless consumed, drop the result, one event):
   - *consumed*: `Fetch` returns an empty chunk; the reader reports end of stream, the result is
@@ -91,16 +112,18 @@ transport.
     that dies with a stream open (`SweepConnsLocked`) ends it the same way;
   - *capped* and *failed*: below.
 - **`acl_max_result_rows`** (GLOBAL, default 0 = unlimited): rows a statement may hand out through
-  the door; counted as they are streamed, and the stream ends in a refusal
-  (`acl: the result exceeds acl_max_result_rows (N)`) the moment the count passes it - after N rows
-  have gone out, which the spec accepts: the bound is about the node's egress and the source's
-  work, not about hiding row N+1. The mirror of `acl_max_ingest_rows`.
+  the door. Exactly N go out - the batch that crosses the line is cut at it (`DataChunk::
+  SetCardinality`) - and the next pull is the refusal (`acl: the result exceeds acl_max_result_rows
+  (N)`), so the event's `rows` is what the client received. The bound is about the node's egress
+  and the source's work, not about hiding row N+1 - the refusal names the cap. The mirror of
+  `acl_max_ingest_rows`.
 - **The schema is unchanged**: GetFlightInfo already answers it from the bound statement; the
   stream's `GetSchemaPayload` is the same schema, so a client sees exactly what it saw.
 - Transactions (spec 055): a stream inside a client's explicit transaction runs on the session
-  connection like today; an interrupted statement inside a transaction leaves the transaction
-  invalid, as duckdb does, and the client's next statement gets duckdb's own "transaction is
-  aborted" until it rolls back - the same as an interrupted statement on any connection.
+  connection like today. An interrupted stream does NOT invalidate the transaction: duckdb's cleanup
+  of an abandoned stream result passes `invalidate_transaction = false` (`client_context.cpp`,
+  `CleanupInternal`), and only SELECTs stream (DML binds `FORCE_MATERIALIZED`), so no partial write
+  can survive to a COMMIT. The client's transaction stays usable after a cancelled read.
 
 ### Ingest: the client that stops sending is heard
 
@@ -133,11 +156,16 @@ transport.
   connection stay alive as long as the stream).
 - `FlightDoorState::ResultStream` (the slot: `unique_ptr<QueryResult> result`, `bool superseded`);
   `SessionConn` gains `std::mutex stream_lock`, `shared_ptr<ResultStream> stream`,
-  `std::atomic<int64_t> stream_last_pull` (the idle clock, steady-clock milliseconds),
-  `StreamOpen()` and `EndStreamLocked()`; `FlightDoorState` gains `LockForStatement(conn)` and the
-  `open_streams` counter behind the gauge.
-- Settings `acl_max_result_rows` (BIGINT, 0), `acl_flight_stream_idle` (BIGINT seconds, 30);
-  `PolicyStore::MaxResultRows()` / `FlightStreamIdleSeconds()` read them through the instance.
+  `std::atomic<int64_t> stream_last_pull` (the idle clock, steady-clock milliseconds, stamped when a
+  pull returns), `EndStreamLocked()` and `CloseResult()`; `FlightDoorState` gains
+  `LockForStatement(conn)`, a `SweepConnsLocked` that hands the reaped connections back for their
+  streams to be ended outside the lock, and the `open_streams` counter behind the gauge.
+  `AclResultReader` carries the properties snapshot, `durable` (a cookie session: judged per pull),
+  `cap_reached` (the refusal is the pull after the cut batch) and `Abandon()` (the stream wrapper's
+  allocation threw under the caller's `exec`: the reader must not take it in its destructor).
+- `PolicyStore::SessionTouch(handle)`: `SessionAlive` plus the idle bump.
+- Settings `acl_max_result_rows` (BIGINT, 0), `acl_flight_stream_idle` (BIGINT seconds, 30; 0 =
+  off); `PolicyStore::MaxResultRows()` / `FlightStreamIdleSeconds()` read them through the instance.
 
 ### Interaction
 
@@ -145,8 +173,11 @@ transport.
   to the stream's end instead of the materialization's.
 - Spec 050's sessions: a per-call session (no cookie) gets a per-call connection, which the reader
   keeps alive until the stream ends - as the reservation already did for the ticket.
-- Spec 066's drain: `acl_session_kill` on a session with an open stream destroys the connection
-  after interrupting it; the client's stream ends in an error, as a killed session's statements do.
+- Spec 066's drain: `acl_session_kill` on a session with an open stream ends the stream at its next
+  pull (`acl: the session ended`) or at the door's next sweep, whichever comes first; the reader
+  pins the connection until then, and the connection goes with the reader. `acl_flight_stop` joins
+  the server's handler threads, so a stream that keeps pulling holds the stop until it is ended -
+  kill first, as spec 066's runbook says.
 
 ## Enforcement & security
 
@@ -184,13 +215,28 @@ transport.
     session (a cookie; warmed up first, since the cookie arrives with the first answer) with
     `acl_flight_stream_idle = 2`: it answers after ≥ 1.5 s and < 10 s, and one `stream_superseded`
     event lands once gRPC tears the old call down;
-  - *cap*: `SET GLOBAL acl_max_result_rows = 1000`; the read ends in `acl: the result exceeds
-    acl_max_result_rows (1000)`, event `stream_capped` with rows ≥ 1000;
+  - *killed*: read one batch, pause; the server kills every live session (`acl_session_kill` over
+    `acl_sessions()`); the client drains what gRPC had already sent ahead (the door pulls a few
+    batches past the one the client reads - the same reason `stream_cancelled` records more rows
+    than the client took) and then fails with `acl: the session ended`; the newest stream event is
+    `stream_superseded` with rows > 0;
+  - *cap*: `SET GLOBAL acl_max_result_rows = 1000` (confirmed through `current_setting` before the
+    client starts - a cap not in force would mean a 200M-row read); the client receives exactly
+    1000 rows and then `acl: the result exceeds acl_max_result_rows (1000)`, event `stream_capped`
+    with rows = 1000;
   - *ingest cancel*: a DoPut streaming 10k-row batches forever, `kill -9` after 30k sent: one
     `door` event `ingest_cancelled`, zero of its rows stored, the ingest event `denied / unavailable`.
+  Every stream event is awaited (it lands when gRPC tears the call down, a moment after the client is
+  gone); the client carries its own deadline (`signal.alarm`, 120 s) so a hang fails the run.
 - A source error mid-stream reaches the client as an error, not a short result, by construction
   (`RecordBatchReader::ReadNext` returns the status; `RecordBatchStream` propagates it); the
   existing Flight e2e and the C++ door tests keep every other RPC where it was.
+- Not covered by a test, stated so it is not mistaken for tested: the "waits while being pulled"
+  branch of `LockForStatement` (only the idle branch runs in the e2e); the `is_cancelled()` poll
+  between pulls (indistinguishable from the destructor path from outside); `stream_failed` end to
+  end (no source fails mid-stream on demand in the fixture); the transaction interaction; the
+  counter and gauge through `acl_metrics()` (their derivation is spec 069's, from the same events
+  the e2e reads).
 - The memory claim is pinned by construction (no vector of batches exists in the code) and by
   the first-batch timing; an RSS measurement is a bench (`test/bench/`), not a test.
 
@@ -210,7 +256,18 @@ transport.
   the load of a client killed mid-way was *committed* - a partial load nobody asked for. The
   end-of-stream check is what turns it into the rollback.
 - **The idle clock in whole seconds** made a 2 s threshold fire after 1.2 s; the clock is
-  steady-clock milliseconds.
+  steady-clock milliseconds - and stamped when a pull returns, not when it starts: a chunk that
+  takes longer than the idle rule to compute (a big sort's first chunk) followed by any RPC of the
+  same session had been superseded while being pulled (review).
+- **Interrupt alone leaks the query** (review): `~StreamQueryResult` is empty at our pin, `Close()`
+  is what releases the executor and the operators' state - every end now closes.
+- **The cap over-counted** (review): the batch that crossed the cap was refused *and* counted, so
+  a cap of 1000 sent nothing and recorded 2048. The batch is cut at the line, the refusal follows.
+- **A killed session's stream ran on** (review): nothing judged the session between pulls, and a
+  stream pulled for longer than the idle timeout without another RPC was reaped under its client.
+  `SessionTouch` per pull settles both.
+- **Schema and batches from different properties** (review): the schema came from a fresh
+  connection at execute, each batch from the session connection at pull time; one snapshot now.
 
 ## Alternatives considered
 
