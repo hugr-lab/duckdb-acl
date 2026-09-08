@@ -320,8 +320,9 @@ the events whatever the level, gauges are readers the owners register; `acl_metr
 `GET /metrics` on the quack listener when `acl_metrics_endpoint` is on. Levels
 `acl_audit_level` = off/denied/decisions/all, per-session override `acl_session_audit_level`.
 Hooks live in the ObjectCache (`AuditHooks`, `GetOrCreate` by type string — no RTTI, no acl
-symbol: a loadable extension is RTLD_LOCAL) so `acl_otel` (separate repo,
-`specs/069-audit/extension-requirements.md`) registers sinks and a `SessionPolicy` without
+symbol: a loadable extension is RTLD_LOCAL) so `acl_otel` ([hugr-lab/acl-otel](https://github.com/hugr-lab/acl-otel),
+the contract in `specs/069-audit/extension-requirements.md`; it pins the SAME duckdb as this repo -
+a pin bump here is a bump there the same day) registers sinks and a `SessionPolicy` without
 linking acl. Trace: `TRACE '<id>' [PARENT '<tp>']` prefix markers, composed by every door from
 `acl_correlation_id` / `acl_traceparent` (session-scoped, on spec 068's allowlist; a session's
 value also lands on its record, since quack composes on a server connection) or Flight's

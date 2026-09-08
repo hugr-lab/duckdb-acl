@@ -1,8 +1,10 @@
 # Requirements for the observability extension (`acl_otel`)
 
-- **Status**: draft, 2026-09-04 - the contract an extension built on spec 069's hooks has to meet.
-  It lives here, beside the spec, because the base is what defines the contract; the extension itself
-  is its own repository.
+- **Status**: the contract an extension built on spec 069's hooks has to meet (2026-09-04); built
+  against by **[hugr-lab/acl-otel](https://github.com/hugr-lab/acl-otel)** since 2026-09-08 (its spec 001
+  is the wiring - sink, level policy, settings, status; 002+ the transports and derivations, mapped to
+  R1-R10 there). It lives here, beside the spec, because the base is what defines the contract; the
+  extension itself is its own repository, BUSL-licensed, pinned to the same duckdb as the base.
 - **Reads**: [spec.md](spec.md) first - the event, the levels, the hooks header, the base sinks.
 
 ## 0. What it is, in one paragraph
