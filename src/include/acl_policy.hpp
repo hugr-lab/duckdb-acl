@@ -27,6 +27,7 @@ class ClientContext;
 namespace acl {
 
 class AuditPipeline; // the audit's own side (spec 069), acl_audit_pipeline.hpp
+class AuditHooks;    // its registry, acl_audit.hpp
 
 struct Principal {
 	//! The token's subject within its issuer (spec 050 F5): part of a principal's identity, so two
@@ -316,6 +317,10 @@ struct PolicyStore {
 	unordered_map<string, Session> sessions;
 	//! The audit pipeline of this instance (spec 069); set at load, before anything serves
 	shared_ptr<AuditPipeline> audit;
+	//! The audit registry the pipeline drains and the doors register their gauges on (spec 069):
+	//! the instance's shared one, or a private one when the shared one was stamped with another
+	//! contract version (AuditHooks::Reach). Set at load before the doors register.
+	shared_ptr<AuditHooks> hooks;
 	//! A door's own connection id -> our handle (spec 041). quack hands its `session_id` to the
 	//! authentication callback and the same value as `connection_id` on every later message, so this
 	//! is what turns "which connection is this" into "which principal is this" without the door ever

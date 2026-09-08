@@ -323,7 +323,10 @@ Hooks live in the ObjectCache (`AuditHooks`, `GetOrCreate` by type string — no
 symbol: a loadable extension is RTLD_LOCAL) so `acl_otel` ([hugr-lab/acl-otel](https://github.com/hugr-lab/acl-otel),
 the contract in `specs/069-audit/extension-requirements.md`; it pins the SAME duckdb as this repo -
 a pin bump here is a bump there the same day) registers sinks and a `SessionPolicy` without
-linking acl. Trace: `TRACE '<id>' [PARENT '<tp>']` prefix markers, composed by every door from
+linking acl. The registry is stamped with `AuditHooks::CONTRACT_VERSION` (its first member) and
+reached through `AuditHooks::Reach` on both sides: a registry from another header revision is
+refused - the base audits on a private one and says so in `acl.audit.contract`, the extension does
+not attach. **Bump the version on any change to what `acl_audit.hpp` lays out.** Trace: `TRACE '<id>' [PARENT '<tp>']` prefix markers, composed by every door from
 `acl_correlation_id` / `acl_traceparent` (session-scoped, on spec 068's allowlist; a session's
 value also lands on its record, since quack composes on a server connection) or Flight's
 `x-correlation-id` / `traceparent` headers; each marker once. Never a claim value, a handle or

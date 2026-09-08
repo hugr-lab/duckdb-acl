@@ -95,12 +95,35 @@ void FlushAudit(Connection &con) {
 int main(int argc, char *argv[]) {
 	std::string extension = argc > 1 ? argv[1] : "build/release/extension/acl/acl.duckdb_extension";
 	return RunMain("test_acl_audit_hooks: the contract an extended extension builds on (spec 069)", [&]() {
+		Scenario("a registry stamped with another contract version is refused by Reach", [&]() {
+			// The refusal itself, on a second instance. The whole round trip - acl loading beside a
+			// stale registry and auditing on a private one, the extension refusing to attach - needs two
+			// REAL loadables in one process and lives in acl-otel's test_acl_otel_contract: here acl is
+			// statically linked into libduckdb, so it has loaded before any test code runs and every
+			// registry this process creates is the base's own.
+			DuckDB other(nullptr);
+			auto &cache = other.instance->GetObjectCache();
+			auto stale = cache.GetOrCreate<acl::AuditHooks>(acl::AuditHooks::ObjectType());
+			auto was = stale->contract_version;
+			stale->contract_version = 999;
+			string why;
+			Check(!acl::AuditHooks::Reach(cache, why) && why.find("999") != string::npos &&
+			          why.find(std::to_string(acl::AuditHooks::CONTRACT_VERSION)) != string::npos,
+			      "Reach refuses it and names both versions: " + why);
+			stale->contract_version = was;
+			Check(acl::AuditHooks::Reach(cache, why).get() == stale.get() && why.empty(),
+			      "...and hands out the same registry once the stamp matches again");
+		});
+
 		DBConfig config;
 		config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
 		DuckDB db(nullptr, &config);
 
 		// --- reached BEFORE acl loads, the way an extension loaded first would ------------------
-		auto hooks = db.instance->GetObjectCache().GetOrCreate<acl::AuditHooks>(acl::AuditHooks::ObjectType());
+		string why;
+		auto hooks = acl::AuditHooks::Reach(db.instance->GetObjectCache(), why);
+		Check(hooks && why.empty(), "the registry is reached and stamped with this header's contract version");
+		Check(hooks->contract_version == acl::AuditHooks::CONTRACT_VERSION, "...the stamp is the version");
 		auto sink = make_shared_ptr<RecordingSink>();
 		sink->caller = std::this_thread::get_id();
 		hooks->AddSink(sink);
