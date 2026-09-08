@@ -1162,13 +1162,26 @@ private:
 		if (!principal.ingest_stream.empty() &&
 		    (StringUtil::CIEquals(vname, "acl_quack_scan_data") ||
 		     StringUtil::CIEquals(vname, "scan_data_from_quack_client")) &&
-		    function.GetArguments().size() == 1) {
+		    !function.GetArguments().empty()) {
+			// the id is the first argument; the client's call (quack f4328c5) adds the types and
+			// `ordered :=` after it, which pass through untouched
 			auto &arg = function.GetArguments()[0].GetExpression();
 			if (arg.GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
 				auto &value = arg.Cast<ConstantExpression>().GetValue();
 				if (!value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR &&
 				    value.GetValue<string>() == principal.ingest_stream) {
-					return; // the principal's own stream: nothing to gate and nothing to rewrite
+					// the principal's own stream: nothing to gate. The call is retargeted to the
+					// embedded door's own function (spec 063, strategy B): the client composes the stock
+					// name, and a stock quack co-loaded beside us owns that one. This - the AST, not the
+					// text - is what makes the statement a drain for the audit (spec 069): its event says
+					// so, and the session remembers the stream so the door's completion hook can tell
+					// the load's outcome from any other statement's.
+					function.SetQualifiedName(ParsePhysName("acl_quack_scan_data"));
+					if (trail) {
+						trail->detail = "drain";
+					}
+					store.NoteSessionDrain(principal.session, principal.ingest_stream);
+					return;
 				}
 			}
 		}
@@ -1802,15 +1815,71 @@ private:
 				Deny(Reason::WRITE_POLICY, "insert into \"" + vname + "\" cannot assign \"" + injection.first +
 				                               "\", which the streamed shape does not carry");
 			}
-			replacements[Identifier("col" + to_string(position))] = InjectedValue(injection, vname);
+			replacements[Identifier("__acl_c" + to_string(position))] = InjectedValue(injection, vname);
 		}
+		// The source's columns are aliased BY POSITION here, never trusted by name: since quack f4328c5
+		// the client names them (its NULL::STRUCT(...) prototype), and a client that named its second
+		// column `col2` and its third `col1` would have put the grant's value where it chose and its own
+		// value where the grant's belonged (the 2026-09-08 review). With the aliases the replacement
+		// lands on the position this insert's column list assigns, whatever the source called it; a
+		// source narrower than that position is still a REPLACE of a column that is not there, and one
+		// wider still fails the insert's own width check.
 		auto source = make_uniq<SubqueryRef>(std::move(node.select_statement), Identifier("__acl_stream"));
+		for (idx_t i = 0; i < node.columns.size(); i++) {
+			source->column_name_alias.emplace_back("__acl_c" + to_string(i));
+		}
 		auto select = make_uniq<SelectNode>();
 		select->from_table = std::move(source);
 		select->select_list.push_back(std::move(star));
 		auto statement = make_uniq<SelectStatement>();
 		statement->node = std::move(select);
 		node.select_statement = std::move(statement);
+	}
+
+	//! Whether this INSERT's source is exactly the drain of the principal's own stream (spec 042): a
+	//! bare `SELECT *` over the drain function called with the very id the prefix carried. Judged on
+	//! the AST, never on the statement's text: the text scan in the override only names the candidate
+	//! id, and a statement that merely mentions the function in a literal or an alias is not a drain
+	//! (the 2026-09-08 review). Anything else - a projection, a WHERE, another source - takes the
+	//! ordinary insert path, where a client writing by hand names its columns.
+	bool SourceIsOwnDrain(const InsertQueryNode &node) {
+		if (principal.ingest_stream.empty() || !node.select_statement || !node.select_statement->node ||
+		    node.select_statement->node->type != QueryNodeType::SELECT_NODE) {
+			return false;
+		}
+		auto &select = node.select_statement->node->Cast<SelectNode>();
+		if (select.select_list.size() != 1 || select.where_clause || !select.from_table ||
+		    select.from_table->type != TableReferenceType::TABLE_FUNCTION) {
+			return false;
+		}
+		auto &item = *select.select_list[0];
+		if (item.GetExpressionClass() != ExpressionClass::STAR) {
+			return false;
+		}
+		auto &star = item.Cast<StarExpression>();
+		if (!star.ReplaceList().empty() || !star.ExcludeList().empty()) {
+			return false;
+		}
+		auto &tf = select.from_table->Cast<TableFunctionRef>();
+		if (!tf.function || tf.function->GetExpressionClass() != ExpressionClass::FUNCTION) {
+			return false;
+		}
+		auto &function = tf.function->Cast<FunctionExpression>();
+		auto name = function.FunctionName().GetIdentifierName();
+		if (!StringUtil::CIEquals(name, "acl_quack_scan_data") &&
+		    !StringUtil::CIEquals(name, "scan_data_from_quack_client")) {
+			return false;
+		}
+		if (function.GetArguments().empty()) {
+			return false;
+		}
+		auto &arg = function.GetArguments()[0].GetExpression();
+		if (arg.GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+			return false;
+		}
+		auto &value = arg.Cast<ConstantExpression>().GetValue();
+		return !value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR &&
+		       value.GetValue<string>() == principal.ingest_stream;
 	}
 
 	//! Apply the grant's write policy to an INSERT: the written columns must be granted, and every
@@ -1824,7 +1893,7 @@ private:
 			return;
 		}
 		if (node.columns.empty() && !node.default_values && node.column_order != InsertColumnOrder::INSERT_BY_NAME &&
-		    !policy.write_order.empty() && (policy.injections.empty() || !principal.ingest_stream.empty())) {
+		    !policy.write_order.empty() && (policy.injections.empty() || SourceIsOwnDrain(node))) {
 			// duckdb matches a listless INSERT by position against the *table's* full width, while the
 			// client is counting the columns we published (spec 035). Supplying the list closes that
 			// gap: an insert of the shape we advertised writes the columns we advertised, and a value
@@ -1860,7 +1929,7 @@ private:
 		if (policy.injections.empty()) {
 			return;
 		}
-		if (!principal.ingest_stream.empty()) {
+		if (SourceIsOwnDrain(node)) {
 			ApplyStreamInjections(node, policy, vname);
 			return;
 		}

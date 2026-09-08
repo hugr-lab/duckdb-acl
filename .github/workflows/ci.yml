@@ -3,8 +3,9 @@
 # schemas with docker/docker-compose.yml via docker/init/*.sql), plus a representative macOS build
 # on merges to main and manual runs. Full platform coverage lives in release.yml.
 #
-# NOTE: the extension tracks duckdb `main` (submodule pin); everything here builds the pinned
-# submodule, so a red build means our code or the pin - never a floating upstream.
+# NOTE: the extension tracks duckdb's 2.0 release branch `v2.0-cyanoptera` (submodule pin; the
+# `v2.0.0` tag once it is cut); everything here builds the pinned submodule, so a red build means
+# our code or the pin - never a floating upstream.
 name: CI
 
 on:

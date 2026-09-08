@@ -74,10 +74,11 @@ before if cheap; **later** — development, after the release.
 
 - **The schema renders only for the schema name `acl`** (`scripts/gen_schema.py` hard-substitutes
   it); an operator with another name edits a generated file its header forbids editing.
-- **File the duckdb-postgres upstream issue** (draft at
-  `design/notes/duckdb-postgres-upstream-issue-draft.md`) and plan the retirement of
-  `patches/postgres_scanner/0001-restore-postgres-execute.patch` once upstream restores
-  `postgres_execute`; ducklake will hit the same on its next duckdb bump.
+- ~~File the duckdb-postgres upstream issue~~ — moot: upstream fixed it from both sides without
+  us (duckdb-postgres fffcb35, 2026-09-02, "Allow non-preparable queries in postgres_query";
+  ducklake 7f2f82c, 2026-09-01, the metadata batches split). Our postgres patch is retired (the
+  duckdb 2.0 branch pins fffcb35); ducklake is pinned ahead of the submodule (7f0ece3) with one patch
+  of the branch's own (the columns virtual) until the submodule's ducklake pin passes 7f2f82c.
 - **The listing marks a broken object** instead of narrowing it: while a declared-list object is dead
   (a source column vanished), `duckdb_columns()` quietly describes a narrower object no query
   returns. The cheap two-thirds of spec 039.

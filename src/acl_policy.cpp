@@ -717,6 +717,30 @@ vector<std::pair<string, int64_t>> PolicyStore::SessionCountsByDoor() {
 	return vector<std::pair<string, int64_t>>(counts.begin(), counts.end());
 }
 
+void PolicyStore::NoteSessionDrain(const string &id, const string &stream) {
+	if (id.empty()) {
+		return;
+	}
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			entry.second.drain_stream = stream;
+			return;
+		}
+	}
+}
+
+string PolicyStore::TakeSessionDrain(const string &handle) {
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry == sessions.end()) {
+		return string();
+	}
+	auto stream = std::move(entry->second.drain_stream);
+	entry->second.drain_stream.clear();
+	return stream;
+}
+
 bool PolicyStore::SetSessionTrace(const string &id, const string &name, const string &value) {
 	lock_guard<mutex> guard(lock);
 	for (auto &entry : sessions) {
@@ -1213,6 +1237,13 @@ bool PolicyStore::FunctionAllowed(const Principal &principal, const QualifiedNam
 	// virtual names resolve before this seam, so a granted vfunc called acl_* still works.
 	auto lowered = StringUtil::Lower(name.Name().GetIdentifierName());
 	if (StringUtil::StartsWith(lowered, "acl_")) {
+		return false;
+	}
+	// ducklake's own functions are the lakehouse operator's - snapshots, expiry, file cleanup,
+	// merges, metadata listings (ducklake_snapshots, ducklake_expire_snapshots, ...): every one reads
+	// or changes the physical lake behind the virtual catalog, and the gate is a denylist, so the
+	// prefix is named rather than each of them (the 2026-09-08 review)
+	if (StringUtil::StartsWith(lowered, "ducklake_")) {
 		return false;
 	}
 	// spec 049: arrow_scan / arrow_scan_dumb turn three raw pointers into a table - memory-unsafe in a

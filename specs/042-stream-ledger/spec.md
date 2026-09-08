@@ -190,6 +190,50 @@ the write is the write policy rather than the transport.
 - **Refuse ingest permanently and tell clients to use `INSERT … VALUES`.** Honest, and gives up the
   reason to have a bulk protocol at all.
 
+## Addendum 2026-09-08 — the client composes the drain (quack f4328c5, the duckdb 2.0 pin)
+
+quack's send-path rework (duckdb-quack #252, in the commit duckdb 2.0 pins) moved the drain statement
+to the **client**: it now composes `INSERT INTO <remote name> SELECT * FROM
+scan_data_from_quack_client('<uuid>', NULL::STRUCT(...), ordered := true|false)` and sends it as an
+ordinary `PREPARE_REQUEST`, so it arrives through the door's authorization callback and is prefixed
+`ACL SESSION '<h>'` like every other statement. The stream id is a bare uuid ("the connection id is
+the secret"), and the stream registry lives on the session's own connection - a stream another
+session filled is not findable from this one. Consequences here:
+
+- **No principal to recover**: the statement is already the session's. The exemption stays what it
+  was - the exact stream id the statement carries, compared constant-for-constant at the call - but
+  the override sets `Principal::ingest_stream` from the prefixed statement itself when a `SESSION`
+  prefix carries a drain call (`ExtractStreamId` reads the first argument; the two that follow pass
+  through untouched). A `ROLE`/`TOKEN` prefix (a gateway's shared connection) gets no exemption: the
+  drain function stays denied there, as it should - no connection of that principal's is filling any
+  stream.
+- **Strategy B kept**: the client composes the stock name; the rewriter retargets the exempted call to
+  `acl_quack_scan_data`, the embedded door's own function, so a stock quack co-loaded beside us still
+  owns `scan_data_from_quack_client`.
+- **The unprefixed fence stays** for a server-generated drain (a stock quack serving beside us): it
+  carries no principal and is refused, as before. With bare uuids the "connection" recovery can never
+  succeed, so the refusal is what remains of that path.
+- **The client names the stream's columns** (its `NULL::STRUCT(...)` prototype carries its own
+  table's names), so the injection of a grant's value can no longer trust a name: the old server
+  drain named columns `col<i>` by position, and a client naming its second column `col2` and its
+  third `col1` would have put the grant's value where it chose (found by the 2026-09-08 review,
+  reproduced through the door). The source is now aliased by position (`__acl_c<i>`) before the
+  `* REPLACE`, whatever the client called its columns; `acl_quack_ingest.test` loads a table named
+  to swap.
+- **A drain is judged on the AST, never on the text.** The text scan only names the candidate id;
+  the rewriter exempts exactly one call, constant-for-constant, and only then (a) takes the stream
+  injection path and the listless-INSERT exemption - `SourceIsOwnDrain`: a bare `SELECT *` over the
+  drain call with that id, nothing else - (b) marks the statement's audit entry `drain`, and (c)
+  notes the stream on the session. A statement that mentions the function in a literal or an alias
+  is an ordinary statement: no exemption, no injection path, no `drain` on its event.
+- **The audit's ingest event** (spec 069) comes from the server's statement driver (a `sync.py`
+  patch on `DriveQuery`): a completed drain reports its row count, a failed one its error class -
+  for exactly the statement the session's note names, so a client cannot have an ordinary statement
+  recorded as a load.
+- The refusals a client sees are unchanged in text (`insert into read-only relation ...`, `must name
+  its columns ...`), but arrive at `PREPARE` rather than at the end of the stream - the early answer
+  the first follow-up below asked for, for free.
+
 ## Follow-ups
 
 - **The probe now passes**, and takes the ordinary path rather than a special case: it is prefixed like
@@ -208,6 +252,10 @@ the write is the write policy rather than the transport.
 - **`CONNECT`/`DISCONNECT`** (duckdb PR #22732) will add another way for a client's statements to reach
   a server. If they travel as their own message type rather than through `PREPARE_REQUEST`, spec 041's
   rule applies again and the audit must be re-run. See `design/011-peg-parser-2.0`.
+- **An unconsumed stream holds memory until the session's next statement** (quack f4328c5: the
+  registry keeps a stream until the next PREPARE, its buffer has no capacity bound, SEND_DATA has no
+  accept budget). An authenticated client can push bytes into a stream whose statement never scans
+  it (`... WHERE 1=0`). quack's design; bound it there, or cap a session's stream bytes at the door.
 - **Concurrency and isolation across roles** is the next spec on this door: two clients under different
   roles reading and writing at once, a principal that must never reach another connection's statement,
   and what two concurrent drains into one table look like given that an ingest is atomic per statement

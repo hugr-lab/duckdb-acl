@@ -281,6 +281,48 @@ int main(int argc, char *argv[]) {
 		}
 		Exec(con, "SELECT acl_session_close('" + handle + "')");
 	});
+	Scenario("a hand-composed drain call is the session's own to admit, and nothing without a server", [&]() {
+		// Since quack f4328c5 the drain of a streamed insert is a statement the client composes (spec
+		// 042 addendum): under a session the call is exempted by its stream id and retargeted to the
+		// door's own function. On a session that is not a quack server's - a plain connection here,
+		// a Flight session in production - the ACL admits it and the function's bind refuses it: no
+		// quack session state, no stream, nothing dereferenced. A gateway's prefix gets no exemption.
+		// a writable target: c.orders carries RLS and is a read-only projection, which would refuse
+		// the write before the call is ever looked at
+		Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.raw AS phys.main.orders");
+		auto handle = OpenSession(con, TOKEN);
+		if (!Check(!handle.empty(), "a session opens for the drain check")) {
+			return;
+		}
+		auto drain = "INSERT INTO c.raw (id, tenant) SELECT * FROM scan_data_from_quack_client('handmade', "
+		             "NULL::STRUCT(id INTEGER, tenant VARCHAR), ordered := true)";
+		auto over_session = con.Query("ACL SESSION '" + handle + "' " + drain);
+		Check(over_session->HasError() &&
+		          over_session->GetError().find("internal function driven by the quack server") != std::string::npos,
+		      "over a session the ACL admits the call (retargeted) and the bind refuses it: " +
+		          (over_session->HasError() ? over_session->GetError() : "no error"));
+		auto over_role = con.Query(std::string("ACL ROLE \"analyst\" ") + drain);
+		Check(over_role->HasError() &&
+		          over_role->GetError().find("table function \"scan_data_from_quack_client\" is not allowed") !=
+		              std::string::npos,
+		      "over a gateway prefix the function stays denied by the gate: " +
+		          (over_role->HasError() ? over_role->GetError() : "no error"));
+		// no exemption without a string-constant id: the text names no candidate, the gate denies the
+		// call like any other denylisted function
+		auto no_id = con.Query("ACL SESSION '" + handle +
+		                       "' INSERT INTO c.raw (id, tenant) SELECT * FROM scan_data_from_quack_client(NULL, "
+		                       "NULL::STRUCT(id INTEGER, tenant VARCHAR), ordered := true)");
+		Check(no_id->HasError() &&
+		          no_id->GetError().find("table function \"scan_data_from_quack_client\" is not allowed") !=
+		              std::string::npos,
+		      "a drain call whose id is not a string constant gets no exemption: " +
+		          (no_id->HasError() ? no_id->GetError() : "no error"));
+		// a literal that merely mentions the function is a literal, nothing more
+		auto literal = con.Query("ACL SESSION '" + handle + "' SELECT 'scan_data_from_quack_client(x)' AS s");
+		Check(!literal->HasError(), "a literal naming the function is not a drain and not a refusal: " +
+		                                (literal->HasError() ? literal->GetError() : "ok"));
+		Exec(con, "SELECT acl_session_close('" + handle + "')");
+	});
 	Scenario("management and native SQL over a session are the session's scope, exactly (plan 2.2)", [&]() {
 		// What a door's client writes after the principal is what a gateway's client writes after
 		// the prefix: `ACL <management>` and `ACL NATIVE <sql>` (spec 009). The door composes

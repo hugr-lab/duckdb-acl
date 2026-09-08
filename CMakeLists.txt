@@ -126,8 +126,8 @@ if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_QUACK_EMBED})
         ${QUACK_EMBED}/acl_embed_scan_from_client.cpp
         ${QUACK_SRC}/quack_message.cpp
         ${QUACK_SRC}/serialize_quack_message.cpp
-        ${QUACK_SRC}/quack_data_stream.cpp
         ${QUACK_SRC}/quack_rebalancer_core.cpp
+        ${QUACK_SRC}/quack_random.cpp
         ${QUACK_SRC}/quack_uri.cpp
         ${QUACK_SRC}/quack_log.cpp)
     # quack hardcodes `duckdb_httplib::` — force-include the namespace bridge into every embed TU so

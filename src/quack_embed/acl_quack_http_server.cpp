@@ -372,8 +372,11 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 		auto response = HandleMessage(stream);
 		auto raw = response->RawPayload();
 		if (raw) {
-			auto data = const_char_ptr_cast(raw->GetData());
-			auto size = raw->GetPosition();
+			// already serialized: httplib sends the bytes with no copy (quack f4328c5: the wire header
+			// is prepended, so the body starts at RawPayloadStart())
+			auto body_start = response->RawPayloadStart();
+			auto data = const_char_ptr_cast(raw->GetData()) + body_start;
+			auto size = raw->GetPosition() - body_start;
 			shared_ptr<QuackMessage> owned(std::move(response));
 			res.set_content_provider(size, "application/vnd.duckdb",
 			                         [owned, data](size_t offset, size_t length, duckdb_httplib::DataSink &sink) {

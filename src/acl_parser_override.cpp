@@ -241,6 +241,9 @@ struct StatementAudit {
 		event.statement = stmt.statement;
 		event.objects = stmt.objects;
 		event.rewrite_us = stmt.rewrite_us;
+		if (!stmt.detail.empty()) {
+			event.detail = stmt.detail; // what the walk found it to be (`drain`), judged on the AST
+		}
 		event.allowed = allowed;
 		event.reason_code = code;
 		event.reason = reason;
@@ -383,8 +386,10 @@ string ExtractStreamIdFor(const string &query, const char *scan_name) {
 		}
 		auto value = ReadQuoted(query, scan);
 		SkipWhitespace(query, scan);
-		if (scan >= query.size() || query[scan] != ')') {
-			return string(); // more than the single argument quack passes
+		// the id is the first argument; since quack f4328c5 the client's call carries two more
+		// (`NULL::STRUCT(...)` for the types, `ordered := ...`), so a comma ends it as well as `)`
+		if (scan >= query.size() || (query[scan] != ')' && query[scan] != ',')) {
+			return string(); // a shape we do not know
 		}
 		if (!found.empty()) {
 			return string(); // two streams in one statement is not a shape we know
@@ -554,6 +559,20 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	ResolvePrincipal(store, prefix, principal);
 	audit.proto.principal = principal;
 
+	if (prefix.kind == AclPrefix::Kind::SESSION && DrainsQuackClientStream(prefix.rest)) {
+		// Since quack f4328c5 the drain of a client's streamed insert is a statement the CLIENT
+		// composes and the door authorizes like any other: `INSERT ... SELECT * FROM
+		// scan_data_from_quack_client('<id>', ...)`, under this very session. The stream registry is
+		// the session's own (quack keeps it on the connection), so the id names a stream only this
+		// principal's connection could fill - the one exemption spec 042 grants, keyed by the exact
+		// id the statement carries, and the rewriter retargets the call to the door's own function.
+		// The text names only the CANDIDATE id; whether the statement is a drain is decided on the AST
+		// (the rewriter exempts exactly one call, constant-for-constant, and marks the statement's
+		// audit entry). A text that mentions the function in a literal, or names its stream in a
+		// shape this does not read, gets no exemption - the gate then denies a real call, and a
+		// literal is just a literal (the 2026-09-08 review).
+		principal.ingest_stream = ExtractStreamId(prefix.rest);
+	}
 	if (prefix.kind == AclPrefix::Kind::INGEST) {
 		audit.proto.detail = "ingest";
 		// the ingest prefix carries the door's own composed statement and nothing else (spec 049):

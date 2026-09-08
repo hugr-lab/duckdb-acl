@@ -6,9 +6,10 @@ verifies the principal, resolves virtual names to physical objects, applies row-
 column masking, gates functions, and hands real `SQLStatement`s back to the normal
 bind → optimize → execute path — so both `SELECT` and DML work naturally.
 
-> **Status: pre-release.** The first release follows duckdb 2.0; until then the extension tracks
-> **duckdb `main`** (it depends on parser/AST APIs — the `Identifier` type, multi-level `QualifiedName`,
-> `MergeQueryNode`, unified DML query nodes — not yet in a stable release). One spec per feature lives
+> **Status: pre-release.** The first release follows duckdb 2.0; the extension tracks duckdb's
+> **2.0 release branch (`v2.0-cyanoptera`)** and will pin the `v2.0.0` tag when it is cut (it depends
+> on parser/AST APIs — the `Identifier` type, multi-level `QualifiedName`, `MergeQueryNode`, unified
+> DML query nodes — that land with 2.0). One spec per feature lives
 > under [specs/](specs/); [specs/001](specs/001-parser-override-ast-rewrite/spec.md) is the core model.
 
 ## How it works
