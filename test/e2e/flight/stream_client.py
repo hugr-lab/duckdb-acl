@@ -121,10 +121,14 @@ def main():
             sys.stdout.write("held\n")
             sys.stdout.flush()
             time.sleep(float(os.environ.get("ACL_STREAM_PAUSE", "3")))
-            # gRPC had already sent a few batches ahead of the one read: they arrive, then the end
+            # gRPC had already sent batches ahead of the one read - as many as its flow-control window
+            # held while we paused, which on a fast runner is a lot - so drain until the end arrives
+            # or a deadline passes, never for a fixed number of batches: a budget in batches makes the
+            # assertion depend on how much the transport happened to buffer, and that is a coin toss.
             more = 0
+            deadline = time.monotonic() + float(os.environ.get("ACL_STREAM_DRAIN", "30"))
             try:
-                for _ in range(200):
+                while time.monotonic() < deadline:
                     more += reader.read_chunk().data.num_rows
                 print({"held": held, "more": more, "error": "the stream did not end"})
             except Exception as ex:  # noqa: BLE001
