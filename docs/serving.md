@@ -450,7 +450,8 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
 - **Where it goes** - a ring of the last `acl_audit_buffer` events (default 10000), read with
   `acl_audit_events()`; optionally one JSON line per event appended to `acl_audit_sink` (a path or
   URI through duckdb's filesystem, so an object store rides httpfs); and any sink an extension
-  registers through `acl_audit.hpp` (the `acl_otel` extension ships OTel logs and metrics). Delivery
+  registers through `acl_audit.hpp` (the [`acl_otel`](https://github.com/hugr-lab/acl-otel) extension
+  ships OTel logs and metrics; loaded beside `acl`, either order). Delivery
   is off the decision path: a bounded queue (`acl_audit_queue`) and one audit thread; when a sink is
   slow the queue drops and **counts** (`acl_audit_dropped()`, `acl.audit.dropped`) - a statement is
   never slowed by its own audit.
