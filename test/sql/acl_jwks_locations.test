@@ -1,0 +1,199 @@
+# name: test/sql/acl_jwks_locations.test
+# description: spec 071 - where a node reads its keys from: acl_jwks_locations refuses a KEYS FROM
+#   location outside the operator's prefixes where it is written and again where it would be read,
+#   acl_jwks_cache() says what the node trusts right now, acl_jwks_refresh() drops it.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET GLOBAL acl_audit_level = 'all';
+
+statement ok
+COPY (SELECT '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AS c)
+    TO '__TEST_DIR__/loc_jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+
+# --- the default admits https and nothing else ----------------------------------------------------
+query I
+SELECT current_setting('acl_jwks_locations');
+----
+https://
+
+statement error
+ACL ADMIN CREATE ISSUER 'https://issuer.test/hs' KEYS FROM '__TEST_DIR__/loc_jwks.json'
+    AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
+----
+<REGEX>:.*KEYS FROM "[^"]*loc_jwks.json" is outside acl_jwks_locations \(https://\) - list its prefix there first, or paste the keys.*
+
+statement error
+ACL ADMIN CREATE ISSUER 'https://issuer.test/plain' KEYS FROM 'http://kc.internal/realms/x/protocol/openid-connect/certs'
+    AUDIENCES ('api://acl-test') ALGS (RS256) ROLE CLAIM 'roles';
+----
+<REGEX>:.*is outside acl_jwks_locations.*
+
+statement error
+SELECT acl_define_issuer('https://issuer.test/fn', '', 'api://acl-test', 'HS256', 'roles', '', '/etc/acl/keys.json');
+----
+<REGEX>:.*KEYS FROM "/etc/acl/keys.json" is outside acl_jwks_locations.*
+
+# a location outside the list is a refused write, so nothing was written
+query I
+SELECT count(*) FROM acl_issuers();
+----
+0
+
+# --- the deployment vouches for its directory by name --------------------------------------------
+statement ok
+SET GLOBAL acl_jwks_locations = 'https://, __TEST_DIR__/';
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/hs' KEYS FROM '__TEST_DIR__/loc_jwks.json'
+    AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+# nothing read yet: the row is there, the cache is not
+query IIIIII
+SELECT issuer, location LIKE '%loc_jwks.json', allowed, fetched_at IS NULL, keys IS NULL, error IS NULL FROM acl_jwks_cache();
+----
+https://issuer.test/hs	true	true	true	true	true
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+1
+
+# read once: one key, no kid, an age, no error
+query IIIIII
+SELECT allowed, fetched_at IS NOT NULL, age_seconds >= 0, last_tried_at IS NOT NULL, keys, kids FROM acl_jwks_cache();
+----
+true	true	true	true	1	[]
+
+# --- taken off the list, the location is not read, and the cached document is not used either ----
+statement ok
+SET GLOBAL acl_jwks_locations = 'https://';
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+<REGEX>:.*token rejected: the keys of issuer "https://issuer.test/hs" are at "[^"]*loc_jwks.json" is outside acl_jwks_locations \(https://\) - list its prefix there, or paste the keys.*
+
+query II
+SELECT allowed, keys FROM acl_jwks_cache();
+----
+false	1
+
+# the refusal is a keys event with the reason (the audit at `denied`), never a client's to see
+statement ok
+SELECT acl_audit_flush();
+
+query III
+SELECT detail, reason_code, reason LIKE '%outside acl_jwks_locations%' FROM acl_audit_events() WHERE kind = 'keys' ORDER BY seq DESC LIMIT 1;
+----
+refresh_failed	source_error	true
+
+# back on the list, the cached document serves
+statement ok
+SET GLOBAL acl_jwks_locations = 'https://, __TEST_DIR__/';
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+1
+
+# --- acl_jwks_refresh drops what the node trusted; the next token re-reads ----------------------
+# a rotated document is not seen while the cache is fresh (acl_jwks_refresh_interval at 300 s)...
+statement ok
+COPY (SELECT '{"keys":[{"kty":"oct","kid":"k2","k":"ZGlmZmVyZW50LXNlY3JldA"}]}' AS c)
+    TO '__TEST_DIR__/loc_jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+1
+
+# ...until the operator drops it: the old secret's token is refused, the document's new kid is listed
+query I
+SELECT acl_jwks_refresh();
+----
+1
+
+query I
+SELECT fetched_at IS NULL FROM acl_jwks_cache();
+----
+true
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+<REGEX>:.*token rejected.*
+
+query II
+SELECT keys, kids FROM acl_jwks_cache();
+----
+1	[k2]
+
+query I
+SELECT acl_jwks_refresh('https://issuer.test/hs');
+----
+1
+
+query I
+SELECT acl_jwks_refresh('https://issuer.test/nobody');
+----
+0
+
+# --- '' admits nothing: keys are pasted or nothing -------------------------------------------------
+statement ok
+SET GLOBAL acl_jwks_locations = '';
+
+statement error
+ACL ADMIN CREATE ISSUER 'https://issuer.test/none' KEYS FROM 'https://kc.corp/realms/x/protocol/openid-connect/certs'
+    AUDIENCES ('api://acl-test') ALGS (RS256) ROLE CLAIM 'roles';
+----
+<REGEX>:.*is outside acl_jwks_locations \(\).*
+
+statement ok
+ACL ADMIN CREATE ISSUER 'https://issuer.test/pasted' KEYS '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}'
+    AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
+
+# a pasted issuer reads no location and is not listed
+query I
+SELECT count(*) FROM acl_jwks_cache() WHERE issuer = 'https://issuer.test/pasted';
+----
+0
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'https://, __TEST_DIR__/';
+
+# --- the surface is the operator's ----------------------------------------------------------------
+statement error
+ACL ROLE "analyst" SELECT * FROM acl_jwks_cache();
+----
+<REGEX>:.*table function "acl_jwks_cache" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT acl_jwks_refresh();
+----
+<REGEX>:.*function "acl_jwks_refresh" is not allowed.*
+
+statement error
+ACL ROLE "analyst" SET acl_jwks_locations = '/';
+----
+<REGEX>:.*SET.*

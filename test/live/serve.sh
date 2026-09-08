@@ -84,7 +84,9 @@ if [ -n "${ACL_LIVE_KEYCLOAK:-}" ]; then
 	KC_AUD="${ACL_LIVE_KC_AUDIENCE:-account}"
 	KC_TENANT="${ACL_LIVE_KC_TENANT_CLAIM:-tenant}"
 	KC_PRELOAD="$HTTPFS_LOAD"  # the issuer define reads the JWKS at verify time
-	KC_ISSUER="ACL ADMIN CREATE ISSUER '$KC_REALM' KEYS FROM '$KC_REALM/protocol/openid-connect/certs' AUDIENCES ('$KC_AUD') ALGS (RS256) ROLE CLAIM 'realm_access.roles' CLAIM MAP '{\"$KC_TENANT\": \"tenant\"}';"
+	# the realm's own URL is the one location this node reads keys from (spec 071): a local
+	# Keycloak over http is admitted by name, never by scheme
+	KC_ISSUER=\"SET GLOBAL acl_jwks_locations = 'https://, $KC_REALM/'; ACL ADMIN CREATE ISSUER '$KC_REALM' KEYS FROM '$KC_REALM/protocol/openid-connect/certs' AUDIENCES ('$KC_AUD') ALGS (RS256) ROLE CLAIM 'realm_access.roles' CLAIM MAP '{\"$KC_TENANT\": \"tenant\"}';"
 fi
 
 {

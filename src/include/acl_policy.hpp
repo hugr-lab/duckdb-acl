@@ -649,6 +649,21 @@ struct PolicyStore {
 	int64_t MaxIngestRows();
 	//! spec 070: rows a statement may hand out through a door (0 = unlimited), and the seconds an open
 	//! Flight result stream may sit unpulled before the session's next statement supersedes it
+	//! spec 071: the prefixes a KEYS FROM location may start with (acl_jwks_locations), and the
+	//! judgement of one location against them - `why` says which list refused it
+	string JwksLocations();
+	bool JwksLocationAllowed(const string &uri, string &why);
+	//! spec 071: what the node trusts right now - one row per issuer that reads its keys
+	struct JwksCacheRow {
+		string issuer, location, error;
+		bool allowed = false;
+		int64_t fetched_at = 0, tried_at = 0; // seconds since epoch; 0 = never
+		int64_t keys = -1;                    // -1 = nothing cached
+		vector<string> kids;
+	};
+	vector<JwksCacheRow> JwksCacheRows();
+	//! spec 071: drop the cached document of one issuer ("" = every issuer); the next token re-reads
+	int64_t JwksDropCache(const string &issuer);
 	int64_t MaxResultRows();
 	int64_t FlightStreamIdleSeconds();
 	int64_t MaxSessions();

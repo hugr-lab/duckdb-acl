@@ -18,6 +18,10 @@ SET GLOBAL acl_allow_anonymous_admin=true;
 statement ok
 SET GLOBAL acl_jwks_refresh_interval = 0;
 
+# a file is a location the deployment vouches for by name (spec 071)
+statement ok
+SET GLOBAL acl_jwks_locations = 'https://, __TEST_DIR__/';
+
 statement ok
 COPY (SELECT '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AS c)
     TO '__TEST_DIR__/jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');

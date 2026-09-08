@@ -34,6 +34,10 @@ string JwtKid(const string &token);
 //! kid, answers true: there is nothing to look up, so nothing is missing.
 bool JwksHasKid(const string &keys_json, const string &kid);
 
+//! spec 071: how many keys a document holds (a PEM counts one) and the `kid`s of those that have one,
+//! in the document's order - the public names of the keys, never the keys
+int64_t JwksKeyIds(const string &keys_json, vector<string> &kids);
+
 //! Full verification: signature (per the issuer's alg/keys), exp/nbf with skew, audience, role and
 //! claim extraction. Throws BinderException with a specific reason on any failure (the gateway is
 //! trusted to see diagnostics); a denial must throw anyway (FALLBACK would silently re-parse).

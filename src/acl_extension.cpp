@@ -136,6 +136,11 @@ void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("acl_jwks_refresh_interval",
 	                          "acl: seconds a fetched JWKS is used before it is read again (spec 023)",
 	                          LogicalType::BIGINT, Value::BIGINT(300), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_jwks_locations",
+	                          "acl: comma-separated prefixes a KEYS FROM location may start with; a location "
+	                          "outside them is refused where it is written and where it would be read; '' "
+	                          "admits none (spec 071)",
+	                          LogicalType::VARCHAR, Value("https://"), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption(
 	    "acl_session_idle_timeout",
 	    "acl: seconds a session may go unused before it is dead, whatever its "

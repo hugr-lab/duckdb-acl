@@ -1962,6 +1962,12 @@ bool PolicyStore::CatalogAnonymousAdminAllowed() {
 
 void PolicyStore::CatalogDefineIssuer(const IssuerConfig &config) {
 	RequireCatalog(catalog, "acl_define_issuer");
+	// spec 071: a location the operator did not allow is refused here, early and clearly - and
+	// again where it would be read, which is the check that binds a shared catalog to this node
+	string why;
+	if (!config.jwks_uri.empty() && !JwksLocationAllowed(config.jwks_uri, why)) {
+		throw BinderException("acl admin: KEYS FROM %s - list its prefix there first, or paste the keys", why);
+	}
 	auto audiences = StringUtil::Join(config.audiences, ",");
 	vector<string> algs_list;
 	for (auto &alg : config.algs) {
