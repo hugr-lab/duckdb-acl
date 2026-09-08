@@ -13,9 +13,13 @@ namespace acl {
 //! The outcome of parsing + verifying one JWT against its issuer config
 struct JwtClaims {
 	string issuer;
+	string subject;                        // the token's `sub` - identity within an issuer (spec 050 F5)
 	vector<string> raw_roles;              // values of the role claim, before mapping
 	case_insensitive_map_t<string> claims; // extracted via claim_map
 	bool groups_overage = false;           // EntraID groups overage marker present
+	//! The token's `exp`, as seconds since the epoch. Verified here; kept so a session minted from
+	//! this token can be refused once it passes, without holding the token itself (spec 040).
+	int64_t expires_at = 0;
 };
 
 //! Structural check only: three base64url segments with a JSON header carrying an alg.
@@ -33,7 +37,11 @@ bool JwksHasKid(const string &keys_json, const string &kid);
 //! Full verification: signature (per the issuer's alg/keys), exp/nbf with skew, audience, role and
 //! claim extraction. Throws BinderException with a specific reason on any failure (the gateway is
 //! trusted to see diagnostics); a denial must throw anyway (FALLBACK would silently re-parse).
-JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clock_skew_seconds);
+//! ignore_exp (spec 059, 'connect' binding): skip only the expiry comparison - the claim must still
+//! be present, and signature/issuer/audience/nbf are always enforced. Used exclusively to
+//! re-verify the bearer of an ALREADY OPEN session; establishment never sets it.
+JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clock_skew_seconds,
+                    bool ignore_exp = false);
 
 } // namespace acl
 } // namespace duckdb

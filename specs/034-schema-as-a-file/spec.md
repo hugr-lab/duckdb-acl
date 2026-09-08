@@ -46,7 +46,7 @@ That replaces the shape the extension used to have — replay every `ALTER … I
 which grows without bound and is not portable: the SQL Server scanner drops the clause, which is what
 spec 033 had to work around. A version the catalog carries is cheaper and works everywhere.
 
-**`scripts/gen_schema.py` renders it** into `src/include/acl_schema_sql.hpp` (placeholders intact —
+**`scripts/gen_schema.py` renders it** into `src/acl_schema_sql.hpp` (placeholders intact —
 what `InitSchema` runs) and `schema/acl_schema.sql` (names resolved, ready to run). `make schema`
 regenerates; `make schema-check` fails when they are stale.
 
@@ -112,6 +112,20 @@ suites pass unchanged: 36 files locally, 132 assertions over 6 integration scena
   files are not: with no release there is no catalog below the current version, so the loader would
   be exercised by nothing. The contract is written down instead, which is the part that is hard to
   change later.
+
+## Addendum 2026-09-03 — v13, and the migration contract is checked rather than promised
+
+Schema **13** (`schema/migrations/v13.sql`): the pre-spec-015 `schema_aliases` table goes. It had been
+"kept in step for one version, so a rollback still resolves" after `schemas` replaced it — written on
+every schema write, read by nothing in table mode (the function-driver *slot* of that name is a
+callback contract and stays) — and no release ever shipped it, so there was no version to roll back
+to. The migrations README claimed the steps were generated (`gen_schema.py` never did; v11–v13 are
+hand-written) and promised an invariant nothing verified: a catalog migrated from n−1 and one created
+fresh at n have the same columns in the same order. `make schema-check` now proves it — a catalog is
+built from the schema file `origin/main` ships, every step above its version is applied, and the
+column shape of every `acl` table (name, position, type) plus the stamp is diffed against a fresh
+catalog; before a merge that is the new step under test, after it both sides are n and it says so.
+CI runs it on every PR (phase 0 of the release plan).
 
 ## Follow-ups
 

@@ -12,7 +12,9 @@
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
+#include <atomic>
 #include <functional>
 #include <list>
 #include <set>
@@ -20,13 +22,81 @@
 
 namespace duckdb {
 class DatabaseInstance;
+class ClientContext;
 
 namespace acl {
 
+class AuditPipeline; // the audit's own side (spec 069), acl_audit_pipeline.hpp
+
 struct Principal {
+	//! The token's subject within its issuer (spec 050 F5): part of a principal's identity, so two
+	//! users sharing roles+claims are not one session. Empty for the ROLE form and the dev stub.
+	string subject;
+	//! The issuer that vouched for the subject (spec 007): on every audit event about the principal
+	//! (spec 069), so two IdPs' subjects never merge. Empty for the ROLE form and the dev stub.
+	string issuer;
 	vector<string> roles; // multi-role since spec 006 (union semantics); single-element until spec 007
 	case_insensitive_map_t<string> claims;
+	//! The one quack stream this principal is draining, when the statement being rewritten is the
+	//! ingest INSERT the server generated for it (spec 042). Empty for every statement a client or a
+	//! gateway wrote - which is what keeps the exemption it carries from reaching any of them.
+	string ingest_stream;
+	//! The statement is the Flight door's own composed ingest INSERT (spec 049): the function gate
+	//! passes its arrow_scan source and nothing else. Set only by the ACL INGEST prefix, which only
+	//! the door's C++ composes - never a client's or a gateway's text.
+	bool arrow_ingest = false;
+	//! The principal owns the connection the statement runs on (spec 068): set only by the
+	//! ACL SESSION prefix - a door's client, whose session IS a connection (spec 050). A per-statement
+	//! prefix a gateway writes runs on a connection the gateway shares between principals, so a
+	//! setting left there would leak to the next one; only a session may SET anything.
+	bool session_connection = false;
+	//! The ops id of that session (never the handle), for what a statement records about it - the
+	//! trace it SETs (spec 069). Empty off a session.
+	string session;
 };
+
+//! The client-local settings a principal may set on its own session (spec 068): rendering only -
+//! a TIMESTAMPTZ shown in the server's zone is a wrong answer - and nothing that changes what a
+//! statement resolves to, reads, or costs. One list for the SQL gate and the Flight door's
+//! SetSessionOptions, so the two doors can never disagree about it.
+bool ClientSettingAllowed(const string &name);
+
+//! The trace a caller's context carries (spec 069): the client-local settings `acl_correlation_id`
+//! and `acl_traceparent`, which a client may SET on its own session and a door composes into the
+//! prefix. Empty when unset.
+void TraceFromContext(ClientContext &context, string &correlation_id, string &traceparent);
+//! The `TRACE '<id>' PARENT '<tp>' ` markers for a prefix, or empty when neither is set
+string TraceMarkers(const string &correlation_id, const string &traceparent);
+//! A trace value as the audit keeps it (spec 069): control characters dropped, at most 128 bytes,
+//! cut on a character boundary - an id names a request, it does not carry a payload
+string BoundTrace(const string &value);
+//! `text` cut to at most `max_bytes`, never inside a UTF-8 sequence
+string TruncateUtf8(const string &text, idx_t max_bytes);
+
+//! The exec-context seam (spec 050): the ClientContext of the connection a statement is being
+//! prepared on, stashed in a thread-local by a door that owns the Prepare call site (the Flight door
+//! does; quack's Prepare is quack's). The rewriter reads it to resolve session temp names
+//! authoritatively; unset, it falls back to temp-qualifying, which binds only against the private
+//! temp catalog and can never reach a physical object. `ParserOptions` carries no context, and a
+//! live catalog lookup during the statement's own parse throws - this seam is what remains.
+void SetTempScanContext(ClientContext *context);
+ClientContext *TempScanContext();
+//! Whether this connection's private temp catalog holds a table of this name - a direct read of the
+//! committed entries via the no-context, no-transaction DuckCatalog scan (~70ns, measured;
+//! independent of attached-catalog size). Safe on the parse thread: the door holds the connection's
+//! exec lock around Prepare, so nothing else runs on the connection while this reads it.
+bool TempCatalogHas(ClientContext &context, const string &name);
+//! Every temp table name of the connection, for the metadata surfaces (spec 050): a session lists
+//! its own temp objects and nobody else's - per-connection by construction.
+vector<string> TempCatalogNames(ClientContext &context);
+
+//! `bytes` bytes from the platform's CSPRNG, hex-encoded - the ONE minter behind every credential
+//! we hand a client: the session handle (spec 040), the Flight ticket id and the Flight session
+//! cookie (spec 050). Refuses, rather than mints, on a build whose `std::random_device` is
+//! deterministic (MinGW before GCC 9.2 - a supported target); see the definition for why the device
+//! and not duckdb's own utilities. Three copies of this once existed and only one carried the guard
+//! (the 2026-09-03 review).
+string MintRandomHex(idx_t bytes);
 
 //! Policy for one virtual relation (table or view) under one role. The resolver picks the replacement
 //! form: RENAME (subquery_form=false) swaps the name in place for a physical object - it stays a real
@@ -69,6 +139,11 @@ struct TablePolicy {
 	//! The physical columns a grant allows to be written; empty = unrestricted. Writing anything else
 	//! is refused rather than silently dropped.
 	case_insensitive_set_t write_columns;
+	//! The same columns under the names the principal knows them by, in the order the object is
+	//! published in (spec 042). duckdb matches an INSERT that names no columns by *position* against
+	//! the table's full width and never by name, while a client counts the columns spec 035 published
+	//! - so the list has to be supplied, or the client is counting columns it was never shown.
+	vector<string> write_order;
 };
 
 //! Where a principal's DDL lands (spec 016): the virtual schema the written name belongs to, the
@@ -95,6 +170,13 @@ enum class FunctionKind : uint8_t { SCALAR, TABLE };
 
 //! What a principal may do with the ACL itself (spec 009). NONE is the default: the ACL is managed
 //! by the gateway, not by the roles it serves.
+//! wingdi.h (windows.h, reached through httplib and gRPC on Windows) defines PASSTHROUGH as a GDI
+//! escape code; where it got in before this header, the macro would turn the enumerator into a
+//! number (the 2026-09-04 windows_amd64 distribution build). The embed shim leaves GDI out
+//! (NOGDI); this covers every other include order.
+#ifdef PASSTHROUGH
+#undef PASSTHROUGH
+#endif
 enum class AdminScope : uint8_t { NONE, MANAGE, PASSTHROUGH };
 
 //! Parse/print the scope names used by the admin functions, the grammar and the policy source
@@ -114,6 +196,12 @@ struct IssuerConfig {
 	//! filesystem opens - an https JWKS URL (needs httpfs) or a file an operator refreshes out of
 	//! band. Empty means `keys_json` is the whole truth.
 	string jwks_uri;
+	//! The app registration the node itself runs the OAuth password grant as (spec 064), and what
+	//! auth discovery advertises for a driver's own flow. Empty = this issuer does no ROPC here.
+	string client_id;
+	//! Only a confidential client has one; public clients (the common case) leave it empty. Never
+	//! surfaced by introspection.
+	string client_secret;
 };
 
 //! duckdb answers "what is in this catalog?" three ways - a table function, a view of the same name
@@ -177,7 +265,7 @@ struct TemplateCache {
 };
 
 namespace acl_detail {
-struct CatalogBackend; // catalog-DB policy backend (spec 006), defined in acl_policy_catalog.cpp
+struct CatalogBackend; // catalog-DB policy backend (spec 006), declared in acl_policy_catalog.hpp
 } // namespace acl_detail
 
 //! Per-database policy store: the seam the rewriter and the admin functions talk to. Two backends:
@@ -195,6 +283,54 @@ struct PolicyStore {
 	case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> scalar_functions;
 	// token -> principal (the dev stub; a JWT-shaped token takes the real verification path instead)
 	case_insensitive_map_t<Principal> tokens;
+	//! Served sessions (spec 040): a door verifies a token once and every statement afterwards carries
+	//! the handle instead. Handles are cryptographically random and case-sensitive, so this is a plain
+	//! map. In-memory and per-instance for now; the shared backends a cluster needs come later.
+	struct Session {
+		Principal principal;
+		//! A short, NON-secret id for the ops surface (spec 050): the handle is a bearer credential and
+		//! must never appear in a listing or a log, so acl_sessions()/acl_session_kill() speak this
+		//! instead. It authenticates nothing - only the handle/cookie can act as the session.
+		string id;
+		int64_t expires_at = 0; // seconds since the epoch; 0 = the token carried none (the dev stub)
+		//! When it was last opened or resolved (spec 044). `exp` bounds a credential and says nothing
+		//! about whether anyone is still there; a door sees connections that simply stop, so this is
+		//! what ends them.
+		int64_t last_used = 0;
+		//! Which door opened it (spec 069: on every event about it) and when - the close event's duration
+		string door;
+		int64_t opened_at = 0;
+		//! The session's own audit level (spec 069): -1 inherits the instance's; set by the door's
+		//! SessionPolicy at open or by the operator afterwards, never by the principal
+		int8_t audit_level = -1;
+		//! The trace the client SET on its session (spec 069): kept here, not only on the connection,
+		//! because the prefix is composed wherever the door evaluates it - quack's authorization runs
+		//! on a connection of the server's, not the client's
+		string correlation_id;
+		string traceparent;
+		//! The stream the session's last rewritten statement drained (spec 042, judged on the AST), for
+		//! the door's completion hook to tell a load's outcome from any other statement's (spec 069);
+		//! taken once
+		string drain_stream;
+	};
+	unordered_map<string, Session> sessions;
+	//! The audit pipeline of this instance (spec 069); set at load, before anything serves
+	shared_ptr<AuditPipeline> audit;
+	//! A door's own connection id -> our handle (spec 041). quack hands its `session_id` to the
+	//! authentication callback and the same value as `connection_id` on every later message, so this
+	//! is what turns "which connection is this" into "which principal is this" without the door ever
+	//! holding one.
+	unordered_map<string, string> session_bindings;
+	//! Whether a door of ours is serving on this instance (spec 043); see SetDoorOpen. Atomic, not
+	//! under `lock`: the parser override reads it on every unprefixed statement of the process.
+	std::atomic<bool> door_open {false};
+	//! Drain (spec 066): while set, SessionOpen seats nobody new; established sessions keep working.
+	//! Atomic rather than under `lock`: the doors read it on paths that must not contend with the
+	//! session map, and a flag flip needs no invariant with anything else.
+	std::atomic<bool> draining {false};
+	//! When sessions were last swept (spec 044), so the automatic sweep inside SessionOpen runs at most
+	//! once a minute rather than on every arrival.
+	int64_t last_sweep = 0;
 	// issuer registry + external->role mappings (spec 007), memory-mode counterparts of the catalog
 	case_insensitive_map_t<IssuerConfig> issuers;
 	case_insensitive_map_t<case_insensitive_map_t<vector<string>>> role_mappings; // issuer -> external -> roles
@@ -239,7 +375,12 @@ struct PolicyStore {
 	void CatalogCreate(const string &vcat, const string &comment);
 	void CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
 	                        const string &view_sql, const string &rls, const vector<std::pair<string, string>> &columns,
-	                        const string &returns = string());
+	                        const string &returns = string(), const string &pk = string(),
+	                        const case_insensitive_map_t<int8_t> &nullable_marks = {});
+	//! The declared primary key of an existing object (spec 048): empty csv drops it. Declared,
+	//! never enforced; validated against the object's declared columns where they are known.
+	void CatalogSetKey(const string &vcat, const string &vname, const string &kind, const string &pk);
+	string ExistingKeyCsv(const string &vcat, const string &vname, const string &kind);
 	//! Whether `db.schema.name` exists physically - what VIRTUAL ONLY checks before recording it
 	bool PhysicalObjectExists(const string &phys);
 	//! Record a view a role created (spec 018): its body was resolved with the author's rights, with
@@ -284,7 +425,8 @@ struct PolicyStore {
 	//! binding admin SQL at write time would touch the sources (spec 010)
 	void CatalogAddFunction(const string &vcat, const string &vname, const string &kind, const string &form,
 	                        const string &target, const string &template_sql, const string &params = string(),
-	                        const string &returns = string());
+	                        const string &returns = string(), const string &pk = string(),
+	                        const case_insensitive_map_t<int8_t> &nullable_marks = {}, bool pk_carried = false);
 	//! spec 022: a reference is a declared join path between two objects - a hint, never a constraint.
 	//! Either `pairs` ("from_col=to_col, …") or `expr` (a qualified SQL condition), never both.
 	//! `to_kind` is "relation" or "function": a table function end is fed arguments (a lateral call),
@@ -295,7 +437,7 @@ struct PolicyStore {
 	                         const string &comment);
 	void CatalogDropReference(const string &vcat, const string &name);
 	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
-	                  const string &rls = "", const string &columns = "");
+	                  const string &rls = "", const string &columns = "", bool judge_columns = true);
 	void CatalogRevoke(const string &role, const string &vcat);
 	void CatalogDropRelation(const string &vcat, const string &vname);
 	// DROP of the remaining virtual-catalog elements (spec 010). Dropping a catalog removes its own
@@ -321,7 +463,8 @@ struct PolicyStore {
 	// ALTER operations (spec 009): partial change of an EXISTING object - unlike the ADD/GRANT
 	// upserts, a missing target is an error. field names the single property being set.
 	void CatalogAlterRelation(const string &vcat, const string &vname, const string &field, const string &value,
-	                          const vector<std::pair<string, string>> &columns);
+	                          const vector<std::pair<string, string>> &columns,
+	                          const case_insensitive_map_t<int8_t> &nullable_marks = {});
 	void CatalogAlterSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path);
 	void CatalogAlterFunction(const string &vcat, const string &vname, const string &kind, const string &form,
 	                          const string &definition);
@@ -357,10 +500,163 @@ struct PolicyStore {
 	//! Instantiate an expression template: a fresh copy of the cached parsed prototype.
 	unique_ptr<ParsedExpression> InstantiateExpr(const string &expr, const ParserOptions &options);
 
+	//! Does a capability sit EXPLICITLY on the principal's MAIN catalog grant (spec 050)? Explicit
+	//! means written: an unstated caps column defaults to the data capabilities (spec 012), and
+	//! `temp` is deliberately not among them, so this answers false unless somebody granted it.
+	//! Memory mode has no catalog grants and answers false - the session-temp surface needs a policy
+	//! catalog, like the rest of the served story.
+	bool PrincipalMainCap(const Principal &principal, const string &capability);
+	bool CatalogPrincipalMainCap(const Principal &principal, const string &capability);
+
 	//! Verify a principal offline. A JWT-shaped token goes through real signature verification against
 	//! the issuer registry (spec 007, throws with a specific reason on failure); a non-JWT token is a
 	//! dev-stub lookup in the in-memory map; the ROLE form trusts the gateway.
-	bool VerifyPrincipal(bool is_token, const string &value, Principal &out);
+	bool VerifyPrincipal(bool is_token, const string &value, Principal &out, bool ignore_exp = false);
+	//! Verify a token and mint an opaque handle for it (spec 040). Empty when the token does not
+	//! verify: a door refuses rather than learning why, and the reason belongs to whoever verified.
+	string SessionOpen(const string &token, const string &door = "session");
+	//! The operator's per-session audit level (spec 069), by the ops id; -1 inherits. False = no such session.
+	bool SetSessionAuditLevel(const string &id, int8_t level);
+	//! A session's own level by handle, -1 when it inherits or the handle is unknown.
+	int8_t SessionAuditLevel(const string &handle);
+	//! The close event of a session being removed (spec 069); caller holds the lock.
+	void SessionClosed(const Session &session, const char *how, int64_t now);
+	//! The gauges the audit reads (spec 069): the policy version the caches are keyed by (-1 without a
+	//! catalog), seconds since the last successful version check (-1 = never), and per issuer the
+	//! seconds since its keys were last read successfully.
+	int64_t PolicyVersion();
+	int64_t PolicyStalenessSeconds();
+	vector<std::pair<string, int64_t>> JwksAges();
+	//! The principal behind a handle, or false with `reason` saying which of "unknown" / "expired" it
+	//! is - a client that reconnects needs to tell those apart.
+	bool SessionPrincipal(const string &handle, Principal &out, string &reason);
+	//! Is this session live right now, without touching its idle clock. The door's connection sweep
+	//! asks this for every held connection, and an observer must not keep the observed alive.
+	bool SessionAlive(const string &handle);
+	//! spec 070: a pull of a result stream is the session's activity - the same judgements as
+	//! SessionAlive, plus the bump: true if the session is live (and now used), false if it is gone
+	bool SessionTouch(const string &handle);
+	//! Why a handle is not usable, judged read-only (no bump, no erase, like SessionAlive): one of
+	//! "live", "expired" (the token's exp passed), "idle" (swept for inactivity) or "unknown" (no such
+	//! session - closed, never opened, or already swept). Spec 054: a client that reconnects needs to
+	//! tell "get a fresh token" (expired) from "reopen with the same one" (idle/unknown), which one
+	//! NULL never told it. Read-only so it survives a prior SessionSql that returned NULL.
+	string SessionReason(const string &handle);
+	//! The statement a door should run instead of the client's: the same SQL with `ACL SESSION '<h>'`
+	//! in front, or empty when the session is not usable. The whole outward contract of spec 040 in one
+	//! call, so that a second door composes it the same way the first one does rather than similarly.
+	string SessionSql(const string &handle, const string &sql);
+	//! The same, carrying the statement's trace (spec 069): `TRACE '<correlation id>'` and
+	//! `PARENT '<traceparent>'` ride between the handle and the SQL, so every event about the
+	//! statement names the request it belongs to. Empty values write no marker.
+	string SessionSql(const string &handle, const string &sql, const string &correlation_id, const string &traceparent);
+	//! What the audit says about a session (spec 069): its ops id, the door that opened it and its
+	//! own level. A lookup with no side effect - no idle bump, no erase - so an event can name a
+	//! session without keeping it alive.
+	struct SessionRef {
+		string id;
+		string door;
+		int8_t audit_level = -1;
+		Principal principal;
+	};
+	bool SessionRefOf(const string &handle, SessionRef &out);
+	//! Record the trace a session's client SET (spec 069), by ops id: `name` is acl_correlation_id or
+	//! acl_traceparent, an empty value is a RESET. False for an unknown session.
+	bool SetSessionTrace(const string &id, const string &name, const string &value);
+	//! Live sessions per door (spec 069's acl.sessions.live gauge); a door with none is not listed
+	vector<std::pair<string, int64_t>> SessionCountsByDoor();
+	//! The rewriter found the session's statement to drain `stream` (spec 042): remembered by ops id
+	//! for the completion hook, which takes it by handle - once - and ignores any statement that left
+	//! no note. What the audit calls an ingest is decided on the AST, never on a statement's text.
+	void NoteSessionDrain(const string &id, const string &stream);
+	string TakeSessionDrain(const string &handle);
+	//! The audit's seams for what is not a statement decision (spec 069). Each emits one event -
+	//! whatever the level: counted always, recorded where the level says - and never throws.
+	//! An ingest drain completed on the session behind `handle`: the rows it wrote, or why it failed
+	//! (`error` empty = it succeeded). A failure that carries our own prefix is the write policy
+	//! refusing where the value is written (spec 024) or the door's own load check; any other is the
+	//! physical source refusing the write.
+	//! `reason_code` names the failure's code where the text alone cannot (a cancelled load is
+	//! `unavailable`: the client was not there to finish it); null = classify from the text.
+	void AuditIngest(const string &handle, int64_t rows, const string &error, const char *reason_code = nullptr);
+	//! A door event: the password handshake (spec 064) or a ticket's fate (spec 047) - `detail` is
+	//! `handshake` or `ticket_issued` / `ticket_redeemed` / `ticket_expired` / `ticket_foreign`.
+	//! `handle` names the session when there is one; `principal` the one a handshake verified.
+	void AuditDoor(const string &door, const string &detail, bool allowed, const string &reason_code,
+	               const string &reason, const string &handle = string(), const Principal *principal = nullptr,
+	               int64_t rows = -1);
+	//! The policy source: `reloaded` (a version change adopted), `written` (a management write
+	//! committed), `source_error` (the source did not answer - the statement was refused)
+	void AuditPolicy(const string &detail, const string &reason);
+	//! An issuer's keys were re-read from their document (`refreshed`) or could not be (`refresh_failed`)
+	void AuditKeys(const string &issuer, bool ok, const string &error);
+	//! The store of an instance, for code that holds a connection and nothing else (the embedded
+	//! quack server's drain thread): registered in the object cache at load. Null before load.
+	static shared_ptr<PolicyStore> Of(DatabaseInstance &db);
+	//! End a session. Idempotent: closing an unknown handle is not an error, since a door may retry.
+	void SessionClose(const string &handle);
+	//! Bind a door's connection id to a handle, and look one up. Binding an id that is already bound
+	//! replaces it: a door that reconnects under the same id gets the session it just authenticated.
+	void SessionBind(const string &external_id, const string &handle);
+	bool SessionHandleFor(const string &external_id, string &handle);
+	//! Drop every session and binding, and say how many there were. What a door does when it closes:
+	//! the connections it served will never come back, and nothing else can tell that they are gone.
+	idx_t SessionCloseAll();
+
+	//! Drop every session that has expired or gone idle, and the bindings pointing at them; returns how
+	//! many went (spec 044). Runs on request through `acl_session_sweep()`, and by itself inside
+	//! SessionOpen - the operation that grows the map is the one that pays to clean it, so there is no
+	//! thread to own and no cost on a quiet instance.
+	idx_t SessionSweep();
+	//! Every issuer the policy names, for the doors' discovery documents (spec 062).
+	vector<string> ListIssuers();
+	//! One issuer's configuration, for the doors: discovery advertises its client_id and the
+	//! password handshake runs the grant as it (spec 064). The config includes the client_secret,
+	//! so a caller surfaces chosen fields, never the struct.
+	bool LookupIssuer(const string &issuer, IssuerConfig &out);
+	//! The sweep proper; the caller holds the lock and has read the settings before taking it.
+	idx_t SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp_binds);
+	//! How many sessions are live right now. Denied to a principal, like the rest of this surface.
+	idx_t SessionCount();
+	//! One live session, for the admin ops surface (spec 050) - never the handle.
+	struct SessionInfo {
+		string id;
+		string subject;
+		vector<string> roles;
+		int64_t expires_at = 0;
+		int64_t idle_seconds = 0;
+	};
+	//! A snapshot of the live sessions - admin-only (the door's, not a principal's).
+	vector<SessionInfo> SessionList();
+	//! End the session with this ops id; true if one was found. Admin-only.
+	bool SessionKill(const string &id);
+	//! Settings behind the two rules (spec 044): seconds a session may go unused before it is dead
+	//! (0 = never), and how many may live at once (0 = unlimited).
+	int64_t SessionIdleTimeout();
+	//! spec 059: true when acl_session_token_binding = every_use - the token exp is re-judged on every
+	//! use of a live session; false (connect, the default) binds freshness to establishment only.
+	bool SessionExpEveryUse();
+	int64_t MaxIngestRows();
+	//! spec 070: rows a statement may hand out through a door (0 = unlimited), and the seconds an open
+	//! Flight result stream may sit unpulled before the session's next statement supersedes it
+	int64_t MaxResultRows();
+	int64_t FlightStreamIdleSeconds();
+	int64_t MaxSessions();
+
+	//! Is an ACL door serving on this instance (spec 043)? Set by `acl_quack_serve`, cleared when the
+	//! last door stops. It gates the one thing we do to statements nobody prefixed: refusing a drained
+	//! quack stream. That refusal exists because a client *we serve* caused the statement; where no
+	//! door of ours is open, a plain quack server's own ingest is its business, and breaking it would
+	//! be us disabling an unrelated feature for anyone who merely loads this extension. Measured, not
+	//! supposed: the throughput benchmark's un-ACL'd baseline could not bulk-load at all.
+	void SetDoorOpen(bool open);
+	bool DoorOpen();
+
+	//! Drain (spec 066): stop seating new clients while established sessions keep working, so an
+	//! operator can rotate the node out gracefully. Runtime state, not configuration - a restarted
+	//! node serves. SetDraining returns the previous value (acl_resume tells whether it did anything).
+	bool SetDraining(bool value);
+	bool Draining() const;
 
 	//! Register an issuer / map an external role value (memory mode; catalog mode via the Catalog* ops)
 	void DefineIssuer(IssuerConfig config);
@@ -405,8 +701,12 @@ private:
 
 	//! The real JWT path of VerifyPrincipal (spec 007): issuer lookup -> acl_token verification ->
 	//! role mapping -> claims; throws on any failure. Defined in acl_policy.cpp.
-	void VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out);
-	bool LookupIssuer(const string &issuer, IssuerConfig &out);
+	void VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out, bool ignore_exp = false);
+	//! The memory-mode role-default claims of `out.roles`, merged under the explicit ones (the token's
+	//! win). One helper for both principal paths - the prefix (VerifyJwtPrincipal) and the session
+	//! (SessionOpen) - so the same token can never carry different claims through a door than through
+	//! a gateway (spec 040's contract; the 2026-09-03 review finding).
+	void MergeMemoryRoleDefaults(Principal &out);
 	//! spec 023: the keys to verify with. An issuer that names a JWKS URI has them read through
 	//! duckdb's filesystem and cached per instance; one that pastes a JWKS keeps using it. `kid` is
 	//! the token's, so a key that rotated in since the last read triggers one extra read.
@@ -425,6 +725,7 @@ private:
 	bool CatalogFunctionGate(const Principal &principal, const QualifiedName &name, bool &allowed);
 	void CatalogLoadRoleClaims(Principal &principal);
 	bool CatalogLookupIssuer(const string &issuer, IssuerConfig &out);
+	void CatalogListIssuers(vector<string> &out);
 	//! (external_value -> mapped roles) for the given values; also flags which candidates exist as roles
 	void CatalogMapExternalRoles(const string &issuer, const vector<string> &values,
 	                             case_insensitive_map_t<vector<string>> &mapped, case_insensitive_set_t &known_roles);
@@ -437,12 +738,45 @@ struct AclParserInfo : ParserExtensionInfo {
 	shared_ptr<PolicyStore> store;
 };
 
+//! The store's entry in the instance's object cache (spec 069): what `PolicyStore::Of(db)` reads.
+//! A weak reference - the cache must not keep the store alive past the extension's own ownership.
+//! Its destruction is also the audit's shutdown seam: the instance resets its object cache early in
+//! its own teardown, while the file system and the sinks are still whole, so the pipeline drains
+//! there - not from whatever destructor happens to release the store last.
+class PolicyStoreHandle : public ObjectCacheEntry {
+public:
+	~PolicyStoreHandle() override;
+	static string ObjectType() {
+		return "acl_policy_store";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // never evicted: a handle, not a cache
+	}
+	weak_ptr<PolicyStore> store;
+};
+
 //! Carried on each admin setup scalar function (function_info); reaches the same store at execution.
 struct AclScalarInfo : ScalarFunctionInfo {
 	explicit AclScalarInfo(shared_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
 	}
 	shared_ptr<PolicyStore> store;
 };
+
+//! What every acl_* scalar is registered with. Fallible: the function refuses at execution time - a
+//! bad predicate, a name in use, a missing target - and an unmarked function turns those refusals
+//! into INTERNAL errors. Volatile: the function changes per-instance state or reads state that
+//! changes under it, so the optimizer may not fold it at plan time - a folded call runs while the
+//! statement is planned and may run again when it executes, and the second call sees the world the
+//! first one changed (`acl_quack_stop(uri) LIKE '%closed%'` stopped the door, then reported that
+//! nobody served it).
+inline void MarkAclScalar(ScalarFunction &function, const shared_ptr<PolicyStore> &store) {
+	function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
+	function.SetFallible();
+	function.SetVolatile();
+}
 
 } // namespace acl
 } // namespace duckdb

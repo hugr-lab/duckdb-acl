@@ -102,7 +102,8 @@ it is the security-relevant half of this spec:
 | --- | --- |
 | `estimated_size` | NULL — the physical row count is not the principal's row count |
 | `column_count` | recomputed from the visible columns |
-| `database_oid`, `schema_oid`, `table_oid`, `view_oid`, `oid`, `parent_schema_oid` | NULL — identifiers of physical catalog entries |
+| `database_oid`, `schema_oid`, `table_oid`, `view_oid`, `oid` | **synthesized** — a stable hash of the virtual name, salted by kind, the same for the same object on every surface, and unrelated to any physical entry. They were NULL until quack began joining tables to schemas by oid and reading it as int64 (2026-08-26): a NULL there is a client-side internal error and an `ATTACH` that never completes |
+| `parent_schema_oid` | NULL — a nested virtual schema is still presented flat, as a dotted `schema_name` (follow-up) |
 | `index_count`, `check_constraint_count`, `has_primary_key` | NULL — properties of the physical table |
 | `internal`, `temporary` | `false` — a virtual object is neither |
 | `comment`, `tags` | the virtual object's own comment; tags empty |

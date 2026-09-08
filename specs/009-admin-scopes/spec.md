@@ -176,6 +176,21 @@ migration this spec implies.
   first. Manage is a right *over a catalog*, and the catalog grant already has the right shape
   (`PRIMARY KEY (role, vcat)`), so the two places collapsed into one.
 
+## Addendum 2026-09-03 — the same scopes through a door, decided and pinned
+
+A door's client writes after its principal exactly what a gateway's client writes after the prefix —
+`ACL <management>`, `ACL NATIVE <sql>` — and the door composes `ACL SESSION '<h>' ` in front and
+nothing else. So the gates above decide, on the session's principal with its scope resolved per
+statement, and the door lends no authority of its own. Nothing had ever driven the admin path
+through a session; `test_acl_session.cpp` now does: a session without a scope is refused management
+and native SQL alike; a `manage` scope administers (the write lands in the catalog), is refused
+native SQL, and cannot grant itself `passthrough`; a `passthrough` scope runs native SQL — including
+the node's own control surface (`acl_drain_status()` here; spec 066 made `acl_drain` reachable this
+way on purpose). **Decision**: passthrough over a door *is* the operator path, not a surface to
+narrow — a passthrough scope is god mode by definition, and a door reaching it is the same principal
+reaching it from the node's own connection. The virtual context is unchanged by any scope: the
+principal's ordinary statements still resolve inside its grants.
+
 ## Follow-ups
 
 - The full `DROP` surface (catalog, role, issuer, schema alias, function, grant) — a separate spec;

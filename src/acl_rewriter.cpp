@@ -32,6 +32,7 @@
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/set_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
@@ -40,11 +41,70 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
+#include <chrono>
+
 namespace duckdb {
 namespace acl {
+
+const char *ReasonCode(Reason reason) {
+	switch (reason) {
+	case Reason::NO_ACCESS:
+		return "no_access";
+	case Reason::CAPABILITY:
+		return "capability";
+	case Reason::READ_ONLY:
+		return "read_only";
+	case Reason::FUNCTION_DENIED:
+		return "function_denied";
+	case Reason::STATEMENT_TYPE:
+		return "statement_type";
+	case Reason::UNCHECKED_PREDICATE:
+		return "unchecked_predicate";
+	case Reason::SETTING_DENIED:
+		return "setting_denied";
+	case Reason::PARSE:
+		return "parse";
+	case Reason::PRINCIPAL:
+		return "principal";
+	case Reason::MGMT_UNAUTHORIZED:
+		return "mgmt_unauthorized";
+	case Reason::DDL_HOME:
+		return "ddl_home";
+	case Reason::DRAINING:
+		return "draining";
+	case Reason::AT_CAPACITY:
+		return "at_capacity";
+	case Reason::SOURCE_ERROR:
+		return "source_error";
+	case Reason::UNAVAILABLE:
+		return "unavailable";
+	case Reason::WRITE_POLICY:
+		return "write_policy";
+	case Reason::POLICY_ERROR:
+		return "policy_error";
+	}
+	return "policy_error";
+}
+
+static string &LastDenyReason() {
+	static thread_local string reason;
+	return reason;
+}
+
+void NoteDenyReason(Reason reason) {
+	LastDenyReason() = ReasonCode(reason);
+}
+
+string TakeDenyReason() {
+	auto out = LastDenyReason();
+	LastDenyReason().clear();
+	return out;
+}
+
 namespace {
 
-[[noreturn]] void Deny(const string &what) {
+[[noreturn]] void Deny(Reason reason, const string &what) {
+	NoteDenyReason(reason);
 	throw BinderException("acl_rewrite: %s", what);
 }
 
@@ -105,6 +165,17 @@ public:
 			RewriteQueryNode(*stmt.Cast<MergeIntoStatement>().node);
 			break;
 		case StatementType::EXPLAIN_STATEMENT: {
+			// spec 052: a plan names physical objects - the scan of a RENAME-form table is
+			// `phys.schema.table`, and EXPLAIN ANALYZE runs the query besides. That a principal who
+			// may run a query also learns where it lands is acceptable - but only to a role that was
+			// granted it. `explain` is an explicit capability on the MAIN catalog grant, never in the
+			// unstated-caps default (spec 012's rule, like `temp`); without it EXPLAIN is refused,
+			// physical names and all.
+			if (!store.PrincipalMainCap(principal, "explain")) {
+				Deny(Reason::CAPABILITY,
+				     "EXPLAIN needs the explain capability on the MAIN catalog grant: a plan names the "
+				     "physical objects a query resolves to");
+			}
 			auto &explain = stmt.Cast<ExplainStatement>();
 			RewriteStatement(*explain.stmt);
 			if (replacement) {
@@ -123,20 +194,74 @@ public:
 		case StatementType::PRAGMA_STATEMENT:
 			RewritePragmaStatement(stmt.Cast<PragmaStatement>());
 			break;
+		case StatementType::SET_STATEMENT:
+			RewriteSetStatement(stmt.Cast<SetStatement>());
+			break;
+		case StatementType::TRANSACTION_STATEMENT:
+			// BEGIN / COMMIT / ROLLBACK name no object and carry no expression, so there is nothing to
+			// rewrite and nothing to gate: they are session control, not access. A client driver cannot
+			// work without them - a quack client sends one before it reads anything - and refusing them
+			// left a served connection unable to load its own catalog (spec 041).
+			break;
 		default:
-			Deny("statement type " + StatementTypeToString(stmt.type) + " is not permitted under ACL");
+			Deny(Reason::STATEMENT_TYPE,
+			     "statement type " + StatementTypeToString(stmt.type) + " is not permitted under ACL");
 		}
 	}
 
 	//! A PRAGMA that asks what is here is the question SHOW asks in an older spelling, and it is what a
 	//! client sends before anything else (spec 031). The two that name the catalog are answered from the
 	//! principal's own; every other PRAGMA stays denied, because a PRAGMA is otherwise a setting.
+	//! Client-local settings (spec 068). A setting is process or connection state a principal has no
+	//! business in, so SET stays refused - except the two rendering settings (TimeZone, Calendar): a
+	//! TIMESTAMPTZ shown in the server's zone is a wrong answer, not a cosmetic one. Even those only
+	//! for a principal that owns its connection - a session (spec 050) - because a per-statement
+	//! prefix a gateway writes runs on a connection the gateway shares, where a setting left behind
+	//! is the next principal's wrong answer. The value must be a constant (no expression may read
+	//! anything on its way into a setting), and GLOBAL is never a principal's to set.
+	void RewriteSetStatement(SetStatement &stmt) {
+		auto &name = stmt.name.GetIdentifierName();
+		if (stmt.scope == SetScope::VARIABLE || !ClientSettingAllowed(name)) {
+			Deny(Reason::SETTING_DENIED,
+			     (stmt.set_type == SetType::SET ? "SET \"" : "RESET \"") + name +
+			         "\" is not permitted under ACL: only the client-local rendering settings (TimeZone, Calendar) "
+			         "may be set, and only on a session of the client's own");
+		}
+		if (stmt.scope == SetScope::GLOBAL) {
+			Deny(Reason::SETTING_DENIED,
+			     "SET GLOBAL \"" + name +
+			         "\" is not permitted under ACL: a global setting changes the node for every principal - set it "
+			         "for the session");
+		}
+		if (!principal.session_connection) {
+			Deny(Reason::SETTING_DENIED,
+			     "SET \"" + name +
+			         "\" needs a session of the client's own (a door's ACL SESSION): a per-statement prefix runs on a "
+			         "connection the gateway shares, where a setting would leak to the next principal");
+		}
+		string value;
+		if (stmt.set_type == SetType::SET) {
+			auto &set = stmt.Cast<SetVariableStatement>();
+			if (!set.value || set.value->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+				Deny(Reason::SETTING_DENIED, "SET \"" + name + "\" takes a constant value under ACL");
+			}
+			auto &constant = set.value->Cast<ConstantExpression>().GetValue();
+			value = constant.IsNull() ? string() : constant.ToString();
+		}
+		// the trace settings (spec 069) land on the session's record too: the door composes the prefix
+		// from there, whichever connection evaluates the composition (quack's is the server's, not
+		// the client's). A RESET clears it.
+		if (StringUtil::CIEquals(name, "acl_correlation_id") || StringUtil::CIEquals(name, "acl_traceparent")) {
+			store.SetSessionTrace(principal.session, name, value);
+		}
+	}
+
 	void RewritePragmaStatement(PragmaStatement &stmt) {
 		auto name = StringUtil::Lower(stmt.info->name.GetIdentifierName());
 		string sql;
 		if (name == "table_info") {
 			if (stmt.info->parameters.size() != 1) {
-				Deny("PRAGMA table_info needs exactly one table name");
+				Deny(Reason::STATEMENT_TYPE, "PRAGMA table_info needs exactly one table name");
 			}
 			// answered through DESCRIBE rather than through the column listing, so it goes down the
 			// read path: a name the principal has no access to is refused, not answered with no rows
@@ -147,7 +272,7 @@ public:
 		} else if (name == "show_tables") {
 			sql = "SELECT * FROM (SHOW TABLES)";
 		} else {
-			Deny("PRAGMA \"" + name + "\" is not permitted under ACL");
+			Deny(Reason::STATEMENT_TYPE, "PRAGMA \"" + name + "\" is not permitted under ACL");
 		}
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		RewriteQueryNode(*select_stmt->node); // the DESCRIBE / SHOW inside is the principal's own
@@ -171,7 +296,7 @@ public:
 			written = StringUtil::Join(parts, ".");
 		}
 		if (written.empty()) {
-			throw BinderException("acl_rewrite: PRAGMA table_info needs a table name");
+			Deny(Reason::STATEMENT_TYPE, "PRAGMA table_info needs a table name");
 		}
 		vector<string> quoted;
 		for (auto &part : StringUtil::Split(written, '.')) {
@@ -192,6 +317,201 @@ public:
 	bool drop_statement = false;
 
 private:
+	//! The `temp` capability, asked of the store once per batch (spec 050): -1 unknown, else 0/1.
+	int temp_cap_state = -1;
+
+	//===------------------------------------------------------------------===//
+	// Session temp tables (spec 050)
+	//===------------------------------------------------------------------===//
+
+	//! The `temp` capability: explicit on the principal's MAIN catalog grant, never inherited from
+	//! unstated caps (spec 012's rule holds by construction - the default set does not carry it).
+	bool TempAllowed() {
+		if (temp_cap_state < 0) {
+			temp_cap_state = store.PrincipalMainCap(principal, "temp") ? 1 : 0;
+		}
+		return temp_cap_state == 1;
+	}
+
+	//! A name the principal already aimed at the temp catalog: first qualifier `temp`. It binds only
+	//! against the connection's private temp catalog and can never reach a physical object (probed:
+	//! `temp.main.x` does not find a physical `x`, and `ATTACH ... AS temp` is refused by duckdb).
+	static bool TempQualified(const QualifiedName &name) {
+		auto parts = NameParts(name);
+		return parts.size() >= 2 && StringUtil::CIEquals(parts.front(), "temp");
+	}
+
+	//! The written parts of a name - the same view VirtualKey joins: qualifiers first, and the
+	//! object's own name as the LAST part (QualifiedName::Path() includes it).
+	static vector<string> NameParts(const QualifiedName &name) {
+		vector<string> parts;
+		for (auto &part : name.Path()) {
+			if (!part.empty()) {
+				parts.push_back(part.GetIdentifierName());
+			}
+		}
+		return parts;
+	}
+
+	//! A bare, unqualified name - the only written shape that may resolve as a session temp.
+	static bool BareName(const QualifiedName &name) {
+		return NameParts(name).size() == 1;
+	}
+
+	//! Whether a bare name resolves into the session's temp catalog. With the executing connection's
+	//! context at hand (the Flight door sets it around Prepare) the answer is authoritative - a
+	//! direct read of that connection's committed temp entries. Without one (quack owns its own
+	//! Prepare) the fallback says yes and lets the temp-qualified bind decide: a miss fails inside
+	//! the private temp catalog, reaching nothing physical - the only cost is the message ("does not
+	//! exist" instead of "no access").
+	bool TempResolves(const string &name) {
+		auto *context = TempScanContext();
+		return context ? TempCatalogHas(*context, name) : true;
+	}
+
+	//! The private temp catalog's qualified form of a bare temp name.
+	static QualifiedName TempName(const Identifier &name) {
+		vector<Identifier> path;
+		path.emplace_back("temp");
+		path.emplace_back("main");
+		return QualifiedName(std::move(path), name);
+	}
+
+	//! Point a DML target at the session's temp catalog when the name is the session's own temp.
+	//! True = handled: the caller enforces nothing further, because no grant narrows an object only
+	//! this connection can see - it is written natively and reclaimed with the connection.
+	bool TryTempDmlTarget(unique_ptr<TableRef> &target_ref, QualifiedName &target_name, const string &key) {
+		if (!TempAllowed()) {
+			return false;
+		}
+		bool base_form = target_ref && target_ref->type == TableReferenceType::BASE_TABLE;
+		const QualifiedName &written = base_form ? target_ref->Cast<BaseTableRef>().GetQualifiedName() : target_name;
+		if (TempQualified(written)) {
+			dml_target_name = key;
+			return true; // already aimed at the private temp catalog: pass through untouched
+		}
+		// a metadata surface always wins bare-name resolution on the read path, so no verb may ever
+		// read the same name as a temp - the anti-shadow rule, kept symmetric
+		if (!BareName(written) || MetadataSurfaceOf(written.Name().GetIdentifierName()) ||
+		    !TempResolves(written.Name().GetIdentifierName())) {
+			return false;
+		}
+		auto virtual_name = written.Name();
+		auto phys = TempName(virtual_name);
+		if (base_form) {
+			auto &base = target_ref->Cast<BaseTableRef>();
+			base.SetQualifiedName(phys);
+			if (base.alias.empty()) {
+				base.alias = virtual_name;
+			}
+		}
+		target_name = phys;
+		dml_target_name = key;
+		return true;
+	}
+
+	//! `CREATE TEMP TABLE` (spec 050): a native temp object on the executing connection - which a
+	//! door holds per session, so it lives exactly as long as the session and duckdb reclaims it.
+	//! Admitted only under the explicit `temp` capability; nothing is registered in the policy
+	//! catalog, because nothing outlives the connection or is visible beyond it.
+	void RewriteCreateTempTable(CreateStatement &stmt) {
+		auto &info = *stmt.info;
+		if (!TempAllowed()) {
+			Deny(Reason::CAPABILITY, "temporary objects need the temp capability on the MAIN catalog grant");
+		}
+		// only the private temp catalog may be named; any other home would be a physical write
+		auto qualifiers = NameParts(info.GetQualifiedName());
+		for (idx_t i = 0; i + 1 < qualifiers.size(); i++) {
+			auto lowered = StringUtil::Lower(qualifiers[i]);
+			if (lowered != "temp" && lowered != "main") {
+				Deny(Reason::DDL_HOME,
+				     "a temporary table lives in the session, not in a schema - write CREATE TEMP TABLE " +
+				         info.GetQualifiedName().Name().GetIdentifierName());
+			}
+		}
+		// anti-shadow: a granted virtual name always wins bare-name resolution, so a temp of the
+		// same name could never be read back - refuse the confusion where it is written
+		auto bare = info.GetQualifiedName().Name().GetIdentifierName();
+		Note(bare, "temp");
+		TablePolicy shadowed;
+		if (store.ResolveTable(principal, bare, shadowed)) {
+			Deny(Reason::DDL_HOME,
+			     "\"" + bare +
+			         "\" is a granted object of the catalog, so a temporary table of that name would be "
+			         "unreachable - pick another name");
+		}
+		if (MetadataSurfaceOf(bare)) {
+			Deny(Reason::DDL_HOME, "\"" + bare +
+			                           "\" is a metadata surface, which always wins bare-name resolution - a temporary "
+			                           "table of that name would be unreachable");
+		}
+		// CREATE TEMP TABLE ... AS SELECT reads before it writes, and that read is a read like any
+		// other - the same rule the non-temp CTAS path applies
+		auto &table_info = info.Cast<CreateTableInfo>();
+		if (table_info.query && table_info.query->node) {
+			RewriteQueryNode(*table_info.query->node);
+		}
+		// the statement itself passes through untouched: the temp catalog is the connection's own
+	}
+
+	//! DROP of a session temp, symmetric with how it resolves. True = handled (native drop).
+	bool TryTempDrop(DropInfo &info) {
+		if (!TempAllowed() || info.type != CatalogType::TABLE_ENTRY) {
+			return false; // temp views are not admitted, so there are none to drop
+		}
+		auto written = info.GetQualifiedName();
+		if (TempQualified(written)) {
+			return true; // already aimed at the private temp catalog
+		}
+		// a metadata surface always wins bare-name resolution on the read path, so no verb may ever
+		// read the same name as a temp - the anti-shadow rule, kept symmetric
+		if (!BareName(written) || MetadataSurfaceOf(written.Name().GetIdentifierName()) ||
+		    !TempResolves(written.Name().GetIdentifierName())) {
+			return false;
+		}
+		info.SetQualifiedName(TempName(written.Name()));
+		return true;
+	}
+
+	//! The session's temp names as a SQL list literal, or "" - only with the executing context at
+	//! hand (the Flight door), and only under the capability that admitted them.
+	string TempNamesList() {
+		auto *context = TempScanContext();
+		if (!context || !TempAllowed()) {
+			return string();
+		}
+		auto names = TempCatalogNames(*context);
+		if (names.empty()) {
+			return string();
+		}
+		vector<string> quoted;
+		for (auto &name : names) {
+			quoted.push_back(SqlLiteral(name));
+		}
+		return "[" + StringUtil::Join(quoted, ", ") + "]";
+	}
+
+	//! spec 050: the metadata surfaces list the session's own temp objects, for that session only.
+	//! Only the table listings - a temp's columns are read through DESCRIBE, which goes down the
+	//! read path and needs no listing row.
+	void AppendTempListing(const string &surface, string &sql) {
+		auto names = TempNamesList();
+		if (names.empty()) {
+			return;
+		}
+		if (surface == "tables") {
+			sql = "SELECT * FROM (" + sql +
+			      ") UNION ALL BY NAME (SELECT 'temp' AS table_catalog, 'main' AS table_schema, unnest(" + names +
+			      ") AS table_name, 'LOCAL TEMPORARY' AS table_type)";
+		} else if (surface == "duckdb_tables") {
+			sql = "SELECT * FROM (" + sql +
+			      ") UNION ALL BY NAME (SELECT 'temp' AS database_name, 'main' AS schema_name, unnest(" + names +
+			      ") AS table_name, true AS \"temporary\")";
+		} else if (surface == "show_tables") {
+			sql = "SELECT name FROM ((" + sql + ") UNION ALL (SELECT unnest(" + names + ") AS name)) ORDER BY 1";
+		}
+	}
+
 	//===------------------------------------------------------------------===//
 	// DDL through the ACL (spec 016)
 	//===------------------------------------------------------------------===//
@@ -211,9 +531,44 @@ private:
 		return std::move(statement);
 	}
 
+	//! spec 051: REPLACE is a drop in disguise - a role that may not drop must not replace (probed
+	//! live: a create-only role replaced a physical table and its rows). The drop must hold on the
+	//! SAME schema row that hosts the create: a parent's drop must not price a REPLACE an explicit
+	//! child grant withheld (the review's refinement finding, also probed live).
+	void RequireReplaceDroppable(const CreateInfo &info, const string &key, const DdlTarget &target) {
+		if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
+			return;
+		}
+		DdlTarget drop_target;
+		if (!store.ResolveDdlTarget(principal, key, "drop", drop_target) || drop_target.vcat != target.vcat ||
+		    drop_target.schema_path != target.schema_path) {
+			Deny(Reason::DDL_HOME,
+			     "CREATE OR REPLACE drops \"" + key +
+			         "\" before it creates, so it needs the drop capability on the schema that hosts it");
+		}
+		Note(key, "drop");
+	}
+
+	//! The conflict clause against the catalog's record (spec 051): the record writer upserts, so
+	//! this is the only place the clause can be enforced. A view record occupies a name with nothing
+	//! physical behind it, so the TABLE path needs this exactly as much as the view path (the
+	//! review's finding). True = proceed; false = IF NOT EXISTS found the name taken (a no-op).
+	bool AdmitRecordConflict(const CreateInfo &info, const string &vcat, const string &key) {
+		if (!store.CatalogObjectExists(vcat, key, "relation")) {
+			return true;
+		}
+		if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+			return false;
+		}
+		if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
+			Deny(Reason::DDL_HOME, "\"" + key + "\" already exists");
+		}
+		return true;
+	}
+
 	void RewriteCreateStatement(CreateStatement &stmt) {
 		if (!stmt.info) {
-			Deny("unsupported CREATE form");
+			Deny(Reason::STATEMENT_TYPE, "unsupported CREATE form");
 		}
 		auto &info = *stmt.info;
 		if (info.type == CatalogType::VIEW_ENTRY) {
@@ -221,10 +576,11 @@ private:
 			return;
 		}
 		if (info.type != CatalogType::TABLE_ENTRY) {
-			Deny("only tables and views can be created through the ACL");
+			Deny(Reason::STATEMENT_TYPE, "only tables and views can be created through the ACL");
 		}
 		if (info.temporary) {
-			Deny("temporary objects are not available through the ACL yet");
+			RewriteCreateTempTable(stmt);
+			return;
 		}
 		// CREATE TABLE ... AS SELECT reads before it writes, and that read is a read like any other:
 		// without this a role holding `create` could copy any physical table into its own schema
@@ -235,7 +591,16 @@ private:
 		auto key = VirtualKey(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
-			Deny("no schema of the catalog allows creating \"" + key + "\"");
+			Deny(Reason::DDL_HOME, "no schema of the catalog allows creating \"" + key + "\"");
+		}
+		Note(key, "create");
+		RequireReplaceDroppable(info, key, target);
+		// the record check guards the TABLE path too: a view record occupies the name with nothing
+		// physical behind it, so "the physical CREATE fails natively" is not enough (the review's
+		// finding - a plain CREATE TABLE clobbered a view record)
+		if (!AdmitRecordConflict(info, target.vcat, key)) {
+			drop_statement = true; // IF NOT EXISTS: the name is taken - a no-op, not an error
+			return;
 		}
 		auto name = info.GetQualifiedName().Name();
 		auto phys = target.phys_schema + "." + name.GetIdentifierName();
@@ -261,15 +626,23 @@ private:
 	void RewriteCreateView(CreateStatement &stmt) {
 		auto &info = stmt.info->Cast<CreateViewInfo>();
 		if (info.temporary) {
-			Deny("temporary objects are not available through the ACL yet");
+			Deny(Reason::DDL_HOME, "temporary objects are not available through the ACL yet");
 		}
 		if (!info.query) {
-			Deny("a view needs a query");
+			Deny(Reason::STATEMENT_TYPE, "a view needs a query");
 		}
 		auto key = VirtualKey(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
-			Deny("no schema of the catalog allows creating \"" + key + "\"");
+			Deny(Reason::DDL_HOME, "no schema of the catalog allows creating \"" + key + "\"");
+		}
+		Note(key, "create");
+		// the same rules as a table's (spec 051): REPLACE priced as a drop on the schema that hosts
+		// the create, and an existing name never overwritten by omission
+		RequireReplaceDroppable(info, key, target);
+		if (!AdmitRecordConflict(info, target.vcat, key)) {
+			drop_statement = true; // IF NOT EXISTS: the name is taken - a no-op, not an error
+			return;
 		}
 		// The body is resolved here, with its author's rights: a view is an object of the virtual
 		// catalog in its own right, and reading it is decided by the grant on the view - not by grants
@@ -285,17 +658,22 @@ private:
 
 	void RewriteDropStatement(DropStatement &stmt) {
 		if (!stmt.info) {
-			Deny("unsupported DROP form");
+			Deny(Reason::STATEMENT_TYPE, "unsupported DROP form");
 		}
 		auto &info = *stmt.info;
 		if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY) {
-			Deny("only tables and views can be dropped through the ACL");
+			Deny(Reason::STATEMENT_TYPE, "only tables and views can be dropped through the ACL");
 		}
 		auto key = VirtualKey(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "drop", target)) {
-			Deny("no schema of the catalog allows dropping \"" + key + "\"");
+			// the session's own temp table drops natively, symmetric with how it resolves (spec 050)
+			if (TryTempDrop(info)) {
+				return;
+			}
+			Deny(Reason::DDL_HOME, "no schema of the catalog allows dropping \"" + key + "\"");
 		}
+		Note(key, "drop");
 		TablePolicy existing;
 		if (store.ResolveTable(principal, key, existing) && !existing.query.empty()) {
 			// a view has no physical object behind it: the record is the whole of it
@@ -304,7 +682,8 @@ private:
 			return;
 		}
 		if (target.virtual_only) {
-			Deny("\"" + key + "\" is granted VIRTUAL ONLY, so its physical object is not this role's to drop");
+			Deny(Reason::DDL_HOME,
+			     "\"" + key + "\" is granted VIRTUAL ONLY, so its physical object is not this role's to drop");
 		}
 		auto name = info.GetQualifiedName().Name();
 		info.SetQualifiedName(ParsePhysName(target.phys_schema + "." + name.GetIdentifierName()));
@@ -374,7 +753,7 @@ private:
 			RewriteMergeNode(node.Cast<MergeQueryNode>());
 			break;
 		default:
-			Deny("query node type is not permitted under ACL");
+			Deny(Reason::STATEMENT_TYPE, "query node type is not permitted under ACL");
 		}
 		cte_scope = saved_scope;
 	}
@@ -597,7 +976,7 @@ private:
 		if (action.default_values || action.insert_columns.empty() ||
 		    action.column_order == InsertColumnOrder::INSERT_BY_NAME) {
 			// without an explicit column list we do not know which physical columns are written
-			Deny("the insert branch of a merge into \"" + vname + "\" must name its columns");
+			Deny(Reason::WRITE_POLICY, "the insert branch of a merge into \"" + vname + "\" must name its columns");
 		}
 		for (auto &column : action.insert_columns) {
 			column = MapWrittenColumn(policy, column, vname);
@@ -645,18 +1024,34 @@ private:
 			auto key = VirtualKey(base.GetQualifiedName());
 			if (auto surface = MetadataSurfaceOf(key)) {
 				// `FROM information_schema.tables` / `FROM duckdb_tables` - the view forms
+				Note(key, "select");
 				auto alias = base.alias.empty() ? base.Table() : base.alias;
 				ref = BuildMetadataSubquery(surface, alias);
 				return;
 			}
 			TablePolicy policy;
 			if (!store.ResolveTable(principal, key, policy)) {
-				Deny("no access to object \"" + key + "\"");
+				// not virtual - the session's own temp table still answers (spec 050). Virtual wins
+				// bare-name resolution, so this is reached only when no grant claims the name.
+				if (TempAllowed() && TempQualified(base.GetQualifiedName())) {
+					return; // already aimed at the private temp catalog - nothing to resolve
+				}
+				if (TempAllowed() && BareName(base.GetQualifiedName()) &&
+				    TempResolves(base.Table().GetIdentifierName())) {
+					auto virtual_name = base.Table();
+					base.SetQualifiedName(TempName(virtual_name));
+					if (base.alias.empty()) {
+						base.alias = virtual_name;
+					}
+					return;
+				}
+				Deny(Reason::NO_ACCESS, "no access to object \"" + key + "\"");
 			}
 			// the read path needs the 'select' capability, just like DML paths need theirs (spec 003):
 			// a write-only grant (e.g. an audit/ingest table) must not leak reads through either form
+			Note(key, "select");
 			if (!policy.caps.count("select")) {
-				Deny("select on \"" + key + "\" is not allowed");
+				Deny(Reason::CAPABILITY, "select on \"" + key + "\" is not allowed");
 			}
 			if (policy.subquery_form) {
 				ref = BuildTableSubquery(base.Table().GetIdentifierName(), policy, base);
@@ -700,7 +1095,7 @@ private:
 		case TableReferenceType::EXPRESSION_LIST:
 			break;
 		default:
-			Deny("table reference form is not permitted under ACL");
+			Deny(Reason::STATEMENT_TYPE, "table reference form is not permitted under ACL");
 		}
 	}
 
@@ -710,7 +1105,7 @@ private:
 	void RewriteTableFunction(unique_ptr<TableRef> &ref) {
 		auto &tf = ref->Cast<TableFunctionRef>();
 		if (!tf.function || tf.function->GetExpressionClass() != ExpressionClass::FUNCTION) {
-			Deny("unsupported table function form");
+			Deny(Reason::STATEMENT_TYPE, "unsupported table function form");
 		}
 		auto &function = tf.function->Cast<FunctionExpression>();
 		auto vname = function.FunctionName().GetIdentifierName();
@@ -719,8 +1114,9 @@ private:
 		if (store.ResolveTableFunction(principal, vname, policy)) {
 			// a call returns rows, so it is a read like any relation (spec 012). The check comes
 			// before the template is expanded: a denied call never reaches bind.
+			Note(vname, "select");
 			if (!policy.caps.count("select")) {
-				Deny("select on table function \"" + vname + "\" is not allowed");
+				Deny(Reason::CAPABILITY, "select on table function \"" + vname + "\" is not allowed");
 			}
 			RewriteFunctionArgs(function); // resolve virtual names inside the call arguments first
 			Identifier alias = tf.alias.empty() ? Identifier(vname) : tf.alias;
@@ -738,9 +1134,15 @@ private:
 			// `FROM duckdb_tables()` - the function form of the same catalog. None of these take
 			// arguments, and quietly dropping one would answer a question nobody asked.
 			if (!function.GetArguments().empty()) {
-				Deny("\"" + vname + "\" takes no arguments");
+				Deny(Reason::STATEMENT_TYPE, "\"" + vname + "\" takes no arguments");
 			}
 			ref = BuildMetadataSubquery(surface, tf.alias.empty() ? Identifier(vname) : tf.alias);
+			return;
+		}
+		if (StringUtil::CIEquals(vname, "acl_keys")) {
+			// spec 048: the principal's declared keys, substituted before the gate exactly as the
+			// references are - so it needs no hole in the gate either
+			ref = BuildKeysSubquery(function, tf.alias.empty() ? Identifier(vname) : tf.alias);
 			return;
 		}
 		if (StringUtil::CIEquals(vname, "acl_references")) {
@@ -749,9 +1151,49 @@ private:
 			ref = BuildReferencesSubquery(function, tf.alias.empty() ? Identifier(vname) : tf.alias);
 			return;
 		}
+		// A principal may drain the stream its own connection is filling, and no other (spec 042). The
+		// function stays denied by the gate - this is not a hole in it but a statement the server
+		// generated for this principal, recognised by the exact stream id the override recovered the
+		// principal from. An id that is not that one is refused by the gate below, as it should be.
+		// The drain function is acl_quack_scan_data for the embedded door (spec 063), or the legacy
+		// scan_data_from_quack_client for a co-loaded stock quack - the gate must exempt either when it
+		// is this principal's own stream. (acl_quack_scan_data also trips the acl_-prefix denial in the
+		// gate, so without this exemption the door's own drain refuses itself.)
+		if (!principal.ingest_stream.empty() &&
+		    (StringUtil::CIEquals(vname, "acl_quack_scan_data") ||
+		     StringUtil::CIEquals(vname, "scan_data_from_quack_client")) &&
+		    !function.GetArguments().empty()) {
+			// the id is the first argument; the client's call (quack f4328c5) adds the types and
+			// `ordered :=` after it, which pass through untouched
+			auto &arg = function.GetArguments()[0].GetExpression();
+			if (arg.GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+				auto &value = arg.Cast<ConstantExpression>().GetValue();
+				if (!value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR &&
+				    value.GetValue<string>() == principal.ingest_stream) {
+					// the principal's own stream: nothing to gate. The call is retargeted to the
+					// embedded door's own function (spec 063, strategy B): the client composes the stock
+					// name, and a stock quack co-loaded beside us owns that one. This - the AST, not the
+					// text - is what makes the statement a drain for the audit (spec 069): its event says
+					// so, and the session remembers the stream so the door's completion hook can tell
+					// the load's outcome from any other statement's.
+					function.SetQualifiedName(ParsePhysName("acl_quack_scan_data"));
+					if (trail) {
+						trail->detail = "drain";
+					}
+					store.NoteSessionDrain(principal.session, principal.ingest_stream);
+					return;
+				}
+			}
+		}
+		// spec 049: the Flight door's ingest INSERT reads the client's batches through arrow_scan.
+		// The function stays denied by the gate - this statement is the server's own, marked by a
+		// prefix only the door composes, and its pointers are the server's own text.
+		if (principal.arrow_ingest && StringUtil::CIEquals(vname, "arrow_scan")) {
+			return;
+		}
 		// not a virtual table function: gate by name, then rewrite arguments and any subquery argument
 		if (!store.FunctionAllowed(principal, function.GetQualifiedName())) {
-			Deny("table function \"" + vname + "\" is not allowed");
+			Deny(Reason::FUNCTION_DENIED, "table function \"" + vname + "\" is not allowed");
 		}
 		RewriteFunctionArgs(function);
 		if (tf.subquery && tf.subquery->node) {
@@ -791,7 +1233,8 @@ private:
 			// Session variables are not the principal's: only `ACL NATIVE` sets one, and `getvariable`
 			// is denied for the same reason. Answering empty would claim the principal has none, when
 			// the truth is that the ones which exist are none of its business (spec 031).
-			Deny("SHOW VARIABLES is not available under ACL: session variables are not part of a "
+			Deny(Reason::STATEMENT_TYPE,
+			     "SHOW VARIABLES is not available under ACL: session variables are not part of a "
 			     "principal's catalog");
 		}
 		if (asked == "databases" || asked == "schemas" || asked == "__show_tables_expanded" ||
@@ -802,15 +1245,16 @@ private:
 			                                                   : "show_tables";
 			string listing;
 			if (!store.MetadataListing(principal, surface, listing)) {
-				Deny("metadata is not available: this policy source cannot enumerate " + asked);
+				Deny(Reason::UNAVAILABLE, "metadata is not available: this policy source cannot enumerate " + asked);
 			}
+			AppendTempListing(surface, listing);
 			ref = SubqueryOf(listing);
 			return;
 		}
 		// SHOW TABLES [FROM <schema>] - the principal's own catalog in the shape SHOW TABLES has
 		string sql;
 		if (!store.MetadataListing(principal, "tables", sql)) {
-			Deny("metadata is not available: this policy source cannot enumerate tables");
+			Deny(Reason::UNAVAILABLE, "metadata is not available: this policy source cannot enumerate tables");
 		}
 		string filter;
 		if (show.show_type == ShowType::SHOW_FROM) {
@@ -826,7 +1270,7 @@ private:
 				parts.push_back(name);
 			}
 			if (parts.empty()) {
-				Deny("SHOW TABLES FROM needs a schema");
+				Deny(Reason::STATEMENT_TYPE, "SHOW TABLES FROM needs a schema");
 			}
 			filter = " WHERE table_schema = " + SqlLiteral(parts.back());
 			if (parts.size() > 1) {
@@ -873,7 +1317,7 @@ private:
 	unique_ptr<TableRef> BuildFunctionSubquery(const string &vname, const TablePolicy &policy,
 	                                           FunctionExpression &function, TableFunctionRef &tf) {
 		if (policy.query.empty()) {
-			Deny("virtual table function \"" + vname + "\" has no template");
+			Deny(Reason::POLICY_ERROR, "virtual table function \"" + vname + "\" has no template");
 		}
 		auto select_stmt = store.InstantiateSelect(policy.query, template_options);
 		vector<unique_ptr<ParsedExpression>> args;
@@ -927,7 +1371,8 @@ private:
 		auto &select = select_stmt->node->Cast<SelectNode>();
 		ref->alias = Identifier();
 		if (!PlaceInner(select.from_table, ref)) {
-			Deny("the grant's projection could not be applied to \"" + alias.GetIdentifierName() + "\"");
+			Deny(Reason::POLICY_ERROR,
+			     "the grant's projection could not be applied to \"" + alias.GetIdentifierName() + "\"");
 		}
 		ref = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
 	}
@@ -948,7 +1393,7 @@ private:
 			sql = policy.query; // a view: its SQL is the definition
 		} else {
 			if (policy.projection.empty() && policy.rls.empty()) {
-				Deny("object \"" + vname + "\" exposes no readable columns");
+				Deny(Reason::POLICY_ERROR, "object \"" + vname + "\" exposes no readable columns");
 			}
 			// no projection means the grant narrowed only the rows (spec 011): every column is read,
 			// renamed by name if the object renames any
@@ -989,8 +1434,10 @@ private:
 	unique_ptr<TableRef> BuildMetadataSubquery(const char *surface, const Identifier &alias) {
 		string sql;
 		if (!store.MetadataListing(principal, surface, sql)) {
-			Deny(string("metadata is not available: this policy source cannot enumerate ") + surface);
+			Deny(Reason::UNAVAILABLE,
+			     string("metadata is not available: this policy source cannot enumerate ") + surface);
 		}
+		AppendTempListing(surface, sql);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
 	}
@@ -1000,7 +1447,8 @@ private:
 	unique_ptr<TableRef> BuildReferencesSubquery(FunctionExpression &function, const Identifier &alias) {
 		auto &arguments = function.GetArguments();
 		if (arguments.size() > 1) {
-			Deny("acl_references takes at most one argument: the object to list references for");
+			Deny(Reason::STATEMENT_TYPE,
+			     "acl_references takes at most one argument: the object to list references for");
 		}
 		string object;
 		if (arguments.size() == 1) {
@@ -1008,17 +1456,44 @@ private:
 			if (argument.GetExpressionClass() != ExpressionClass::CONSTANT) {
 				// the filter is spliced into generated SQL, so it has to be known now - and the golden
 				// rule forbids adding a parameter of our own to carry it
-				Deny("acl_references needs a constant object name");
+				Deny(Reason::STATEMENT_TYPE, "acl_references needs a constant object name");
 			}
 			object = argument.Cast<ConstantExpression>().GetValue().ToString();
 		}
 		string sql;
 		if (!store.MetadataListing(principal, "references", sql)) {
-			Deny("references are not available: this policy source cannot enumerate them");
+			Deny(Reason::UNAVAILABLE, "references are not available: this policy source cannot enumerate them");
 		}
 		if (!object.empty()) {
 			auto quoted = "'" + StringUtil::Replace(object, "'", "''") + "'";
 			sql = "SELECT * FROM (" + sql + ") WHERE from_object = " + quoted + " OR to_object = " + quoted;
+		}
+		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+	}
+
+	//! `FROM acl_keys()` / `acl_keys('orders')`: the declared keys of the objects this principal can
+	//! see, optionally narrowed to one object (spec 048).
+	unique_ptr<TableRef> BuildKeysSubquery(FunctionExpression &function, const Identifier &alias) {
+		auto &arguments = function.GetArguments();
+		if (arguments.size() > 1) {
+			Deny(Reason::STATEMENT_TYPE, "acl_keys takes at most one argument: the object to list the key of");
+		}
+		string object;
+		if (arguments.size() == 1) {
+			auto &argument = arguments[0].GetExpression();
+			if (argument.GetExpressionClass() != ExpressionClass::CONSTANT) {
+				Deny(Reason::STATEMENT_TYPE, "acl_keys needs a constant object name");
+			}
+			object = argument.Cast<ConstantExpression>().GetValue().ToString();
+		}
+		string sql;
+		if (!store.MetadataListing(principal, "keys", sql)) {
+			Deny(Reason::UNAVAILABLE, "keys are not available: this policy source cannot enumerate them");
+		}
+		if (!object.empty()) {
+			auto quoted = "'" + StringUtil::Replace(object, "'", "''") + "'";
+			sql = "SELECT * FROM (" + sql + ") WHERE object = " + quoted;
 		}
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
@@ -1036,7 +1511,7 @@ private:
 	//! Map a written column name onto the physical one. A physical name that the policy renamed away
 	//! is refused: the virtual relation does not have that column any more.
 	Identifier MapWrittenColumn(const TablePolicy &policy, const Identifier &written, const string &vname) {
-		auto name = written.GetIdentifierName();
+		const auto &name = written.GetIdentifierName();
 		for (auto &rename : policy.renames) {
 			if (StringUtil::CIEquals(rename.first, name)) {
 				return Identifier(rename.second);
@@ -1044,7 +1519,7 @@ private:
 		}
 		for (auto &rename : policy.renames) {
 			if (StringUtil::CIEquals(rename.second, name)) {
-				Deny("\"" + vname + "\" has no column \"" + name + "\"");
+				Deny(Reason::WRITE_POLICY, "\"" + vname + "\" has no column \"" + name + "\"");
 			}
 		}
 		return written;
@@ -1077,7 +1552,8 @@ private:
 	//! expression that reads the row is a mask, and a mask cannot be written through (spec 011).
 	void RequireValueExpression(const ParsedExpression &expr, const string &column, const string &vname) {
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
-			Deny("column \"" + column + "\" of \"" + vname + "\" is computed from the row, so it cannot be written");
+			Deny(Reason::WRITE_POLICY,
+			     "column \"" + column + "\" of \"" + vname + "\" is computed from the row, so it cannot be written");
 		}
 		ParsedExpressionIterator::EnumerateChildren(
 		    expr, [&](const ParsedExpression &child) { RequireValueExpression(child, column, vname); });
@@ -1097,7 +1573,8 @@ private:
 		if (policy.write_columns.empty() || policy.write_columns.count(column.GetIdentifierName())) {
 			return;
 		}
-		Deny("column \"" + column.GetIdentifierName() + "\" of \"" + vname + "\" is not writable");
+		Deny(Reason::WRITE_POLICY,
+		     "column \"" + column.GetIdentifierName() + "\" of \"" + vname + "\" is not writable");
 	}
 
 	//! AND the policy's (already composed) predicate into a statement's WHERE, so an UPDATE/DELETE
@@ -1131,9 +1608,9 @@ private:
 			return;
 		}
 		if (node.columns.empty() || node.default_values || !node.select_statement) {
-			Deny("insert into \"" + vname +
-			     "\" must name its columns: the grant's predicate decides which rows "
-			     "may be written, and an unnamed column has no value to judge");
+			Deny(Reason::WRITE_POLICY, "insert into \"" + vname +
+			                               "\" must name its columns: the grant's predicate decides which rows "
+			                               "may be written, and an unnamed column has no value to judge");
 		}
 		// a predicate reading a column the row does not carry cannot be evaluated at all
 		vector<string> read;
@@ -1147,10 +1624,10 @@ private:
 				}
 			}
 			if (!written) {
-				Deny("insert into \"" + vname + "\" must supply \"" + name +
-				     "\": the grant's predicate reads it "
-				     "to decide whether the row may be "
-				     "written");
+				Deny(Reason::WRITE_POLICY, "insert into \"" + vname + "\" must supply \"" + name +
+				                               "\": the grant's predicate reads it "
+				                               "to decide whether the row may be "
+				                               "written");
 			}
 		}
 		vector<unique_ptr<ParsedExpression>> items;
@@ -1179,9 +1656,9 @@ private:
 			return;
 		}
 		if (action.default_values || action.insert_columns.empty() || action.expressions.empty()) {
-			Deny("the insert branch of a merge into \"" + vname +
-			     "\" must name its columns: the grant's predicate "
-			     "decides which rows may be written");
+			Deny(Reason::WRITE_POLICY, "the insert branch of a merge into \"" + vname +
+			                               "\" must name its columns: the grant's predicate "
+			                               "decides which rows may be written");
 		}
 		vector<string> read;
 		CollectColumnNames(*predicate, read);
@@ -1194,8 +1671,9 @@ private:
 				}
 			}
 			if (!written) {
-				Deny("the insert branch of a merge into \"" + vname + "\" must supply \"" + name +
-				     "\": the grant's predicate reads it to decide whether the row may be written");
+				Deny(Reason::WRITE_POLICY,
+				     "the insert branch of a merge into \"" + vname + "\" must supply \"" + name +
+				         "\": the grant's predicate reads it to decide whether the row may be written");
 			}
 		}
 		// the predicate names the row's columns; here they are the values about to be inserted
@@ -1310,6 +1788,100 @@ private:
 		return predicate;
 	}
 
+	//! Assign the grant's injected values into a *drained stream* (spec 042). The source is quack's
+	//! scan, whose columns are named `col0, col1, …` by position and carry none of the client's own
+	//! names - so the value is substituted by position, through `SELECT * REPLACE (<expr> AS col<i>)`.
+	//!
+	//! The `*` is what makes this safe where a named projection would not be. It keeps the source's
+	//! width, so a stream wider than the list this insert names is caught by duckdb's own width check;
+	//! and REPLACE refuses a column that is not there, so a stream too narrow to hold the position
+	//! being replaced is caught too. Both directions are errors, and neither is a shifted row.
+	void ApplyStreamInjections(InsertQueryNode &node, const TablePolicy &policy, const string &vname) {
+		auto star = make_uniq<StarExpression>();
+		auto &replacements = star->ReplaceListMutable();
+		for (auto &injection : policy.injections) {
+			idx_t position = 0;
+			bool found = false;
+			for (idx_t i = 0; i < node.columns.size(); i++) {
+				if (StringUtil::CIEquals(node.columns[i].GetIdentifierName(), injection.first)) {
+					position = i;
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				// the grant assigns a column this insert does not write: nothing to replace, and
+				// appending it would shift every position after it
+				Deny(Reason::WRITE_POLICY, "insert into \"" + vname + "\" cannot assign \"" + injection.first +
+				                               "\", which the streamed shape does not carry");
+			}
+			replacements[Identifier("__acl_c" + to_string(position))] = InjectedValue(injection, vname);
+		}
+		// The source's columns are aliased BY POSITION here, never trusted by name: since quack f4328c5
+		// the client names them (its NULL::STRUCT(...) prototype), and a client that named its second
+		// column `col2` and its third `col1` would have put the grant's value where it chose and its own
+		// value where the grant's belonged (the 2026-09-08 review). With the aliases the replacement
+		// lands on the position this insert's column list assigns, whatever the source called it; a
+		// source narrower than that position is still a REPLACE of a column that is not there, and one
+		// wider still fails the insert's own width check.
+		auto source = make_uniq<SubqueryRef>(std::move(node.select_statement), Identifier("__acl_stream"));
+		for (idx_t i = 0; i < node.columns.size(); i++) {
+			source->column_name_alias.emplace_back("__acl_c" + to_string(i));
+		}
+		auto select = make_uniq<SelectNode>();
+		select->from_table = std::move(source);
+		select->select_list.push_back(std::move(star));
+		auto statement = make_uniq<SelectStatement>();
+		statement->node = std::move(select);
+		node.select_statement = std::move(statement);
+	}
+
+	//! Whether this INSERT's source is exactly the drain of the principal's own stream (spec 042): a
+	//! bare `SELECT *` over the drain function called with the very id the prefix carried. Judged on
+	//! the AST, never on the statement's text: the text scan in the override only names the candidate
+	//! id, and a statement that merely mentions the function in a literal or an alias is not a drain
+	//! (the 2026-09-08 review). Anything else - a projection, a WHERE, another source - takes the
+	//! ordinary insert path, where a client writing by hand names its columns.
+	bool SourceIsOwnDrain(const InsertQueryNode &node) {
+		if (principal.ingest_stream.empty() || !node.select_statement || !node.select_statement->node ||
+		    node.select_statement->node->type != QueryNodeType::SELECT_NODE) {
+			return false;
+		}
+		auto &select = node.select_statement->node->Cast<SelectNode>();
+		if (select.select_list.size() != 1 || select.where_clause || !select.from_table ||
+		    select.from_table->type != TableReferenceType::TABLE_FUNCTION) {
+			return false;
+		}
+		auto &item = *select.select_list[0];
+		if (item.GetExpressionClass() != ExpressionClass::STAR) {
+			return false;
+		}
+		auto &star = item.Cast<StarExpression>();
+		if (!star.ReplaceList().empty() || !star.ExcludeList().empty()) {
+			return false;
+		}
+		auto &tf = select.from_table->Cast<TableFunctionRef>();
+		if (!tf.function || tf.function->GetExpressionClass() != ExpressionClass::FUNCTION) {
+			return false;
+		}
+		auto &function = tf.function->Cast<FunctionExpression>();
+		auto name = function.FunctionName().GetIdentifierName();
+		if (!StringUtil::CIEquals(name, "acl_quack_scan_data") &&
+		    !StringUtil::CIEquals(name, "scan_data_from_quack_client")) {
+			return false;
+		}
+		if (function.GetArguments().empty()) {
+			return false;
+		}
+		auto &arg = function.GetArguments()[0].GetExpression();
+		if (arg.GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+			return false;
+		}
+		auto &value = arg.Cast<ConstantExpression>().GetValue();
+		return !value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR &&
+		       value.GetValue<string>() == principal.ingest_stream;
+	}
+
 	//! Apply the grant's write policy to an INSERT: the written columns must be granted, and every
 	//! injected value is assigned - added when absent, overriding what the user supplied - by
 	//! projecting the source through a subquery. The row therefore belongs to the principal by
@@ -1320,21 +1892,45 @@ private:
 		if (policy.write_columns.empty()) {
 			return;
 		}
+		if (node.columns.empty() && !node.default_values && node.column_order != InsertColumnOrder::INSERT_BY_NAME &&
+		    !policy.write_order.empty() && (policy.injections.empty() || SourceIsOwnDrain(node))) {
+			// duckdb matches a listless INSERT by position against the *table's* full width, while the
+			// client is counting the columns we published (spec 035). Supplying the list closes that
+			// gap: an insert of the shape we advertised writes the columns we advertised, and a value
+			// too many is duckdb's own width error rather than a row nobody asked for.
+			//
+			// Where the grant assigns values, a client writing by hand must still name its columns: the
+			// general injection path aliases the source positionally and a source one column too wide
+			// loses that column silently, which is the failure mode this layer refuses elsewhere.
+			//
+			// A drained stream is the exception, because there is nobody to tell: the statement is the
+			// server's own (spec 042). It is safe there because the injection below takes the `* REPLACE`
+			// form for it, which keeps the source's width intact so a mismatch is an error either way -
+			// too narrow and REPLACE names a column that does not exist, too wide and the width no
+			// longer matches this list.
+			for (auto &column : policy.write_order) {
+				node.columns.emplace_back(column);
+			}
+		}
 		if (node.columns.empty() || node.default_values || node.column_order == InsertColumnOrder::INSERT_BY_NAME) {
 			// without an explicit column list we do not know which physical columns are written, so
 			// there is nothing to check the grant against
-			Deny("insert into \"" + vname + "\" must name its columns");
+			Deny(Reason::WRITE_POLICY, "insert into \"" + vname + "\" must name its columns");
 		}
 		if (node.on_conflict_info) {
-			Deny("insert into \"" + vname + "\" cannot use ON CONFLICT under a column policy");
+			Deny(Reason::WRITE_POLICY, "insert into \"" + vname + "\" cannot use ON CONFLICT under a column policy");
 		}
 		if (!node.select_statement) {
-			Deny("insert into \"" + vname + "\" has no source to apply the grant policy to");
+			Deny(Reason::WRITE_POLICY, "insert into \"" + vname + "\" has no source to apply the grant policy to");
 		}
 		for (auto &column : node.columns) {
 			RequireWritableColumn(policy, column, vname);
 		}
 		if (policy.injections.empty()) {
+			return;
+		}
+		if (SourceIsOwnDrain(node)) {
+			ApplyStreamInjections(node, policy, vname);
 			return;
 		}
 		vector<Identifier> columns;
@@ -1382,7 +1978,7 @@ private:
 
 	void RequireReadableExpr(const ParsedExpression &expr, const TablePolicy &policy, const string &vname) {
 		if (expr.GetExpressionClass() == ExpressionClass::STAR) {
-			Deny("RETURNING * on \"" + vname + "\" is not allowed under a column policy");
+			Deny(Reason::WRITE_POLICY, "RETURNING * on \"" + vname + "\" is not allowed under a column policy");
 		}
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
@@ -1398,7 +1994,7 @@ private:
 				}
 			}
 			if (masked || !policy.write_columns.count(name)) {
-				Deny("column \"" + name + "\" of \"" + vname + "\" is not readable");
+				Deny(Reason::WRITE_POLICY, "column \"" + name + "\" of \"" + vname + "\" is not readable");
 			}
 			return;
 		}
@@ -1466,6 +2062,7 @@ private:
 		// when it was written (spec 021). Without that verdict a bare name in there could resolve
 		// against the source instead, and quietly filter the wrong rows (spec 027).
 		if (policy.rls_unchecked && ContainsSubquery(*predicate)) {
+			NoteDenyReason(Reason::UNCHECKED_PREDICATE);
 			throw BinderException("acl: the predicate of \"%s\" contains a subquery and was never checked against "
 			                      "the object, so it cannot be used where a second relation is in scope - run "
 			                      "acl_refresh_schema() with the object reachable, or rewrite the grant",
@@ -1506,22 +2103,29 @@ private:
 		}
 		TablePolicy policy;
 		if (!store.ResolveTable(principal, key, policy)) {
+			// the session's own temp table is written natively, with nothing to enforce: no grant
+			// narrows an object only this connection can see (spec 050). Virtual wins - this is
+			// reached only when no grant claims the name.
+			if (TryTempDmlTarget(target_ref, target_name, key)) {
+				return TablePolicy();
+			}
 			// a name the principal *does* have, of a kind that is called rather than written: say which
 			// rather than leave an administrator reading "no access" about an object they can see
 			TablePolicy called;
 			if (store.ResolveTableFunction(principal, key, called) ||
 			    store.ResolveScalarFunction(principal, key, called)) {
-				Deny("\"" + key + "\" is a function, which is called rather than written");
+				Deny(Reason::STATEMENT_TYPE, "\"" + key + "\" is a function, which is called rather than written");
 			}
-			Deny("no access to object \"" + key + "\"");
+			Deny(Reason::NO_ACCESS, "no access to object \"" + key + "\"");
 		}
 		// a view / masked / computed relation is read-only; a grant that only narrows a real table
 		// keeps it writable - the narrowing moves onto the written values and the WHERE (spec 011)
+		Note(key, capability);
 		if (!policy.writable) {
-			Deny(capability + " into read-only relation \"" + key + "\" is not allowed");
+			Deny(Reason::READ_ONLY, capability + " into read-only relation \"" + key + "\" is not allowed");
 		}
 		if (!policy.caps.count(capability)) {
-			Deny(capability + " on \"" + key + "\" is not allowed");
+			Deny(Reason::CAPABILITY, capability + " on \"" + key + "\" is not allowed");
 		}
 		auto phys = ParsePhysName(policy.phys);
 		if (target_ref && target_ref->type == TableReferenceType::BASE_TABLE) {
@@ -1561,24 +2165,96 @@ private:
 			if (store.ResolveScalarFunction(principal, name, spolicy)) {
 				// its template is admin-authored SQL that may read a physical table, so calling it is
 				// a read too: the same capability gates it (spec 012)
+				Note(name, "select");
 				if (!spolicy.caps.count("select")) {
-					Deny("select on scalar function \"" + name + "\" is not allowed");
+					Deny(Reason::CAPABILITY, "select on scalar function \"" + name + "\" is not allowed");
 				}
 				RewriteFunctionArgs(function); // resolve virtual names inside the arguments first
 				if (spolicy.subquery_form) {
+					// the caller's alias names the select item, not the call: `tenant_tag(x) AS tag` is
+					// still the column `tag` after the macro expands (the harness demo lost it)
+					auto alias = function.GetAlias();
 					expr = BuildScalarExpr(name, spolicy, function);
+					expr->SetAlias(std::move(alias));
 				} else {
 					function.SetQualifiedName(ParsePhysName(spolicy.phys));
 				}
 				return; // handled: do not re-gate or re-recurse
 			}
+			// The session-identity functions answer as the *principal*, not as the process. A served
+			// client asks `current_database()` to learn where its bare names resolve - and the honest
+			// answer under the ACL is the principal's MAIN catalog, not the physical default the
+			// server process happens to sit in (which is also a name a principal must never see).
+			// quack's catalog load made this load-bearing: it folds the remote catalog whose name
+			// equals current_database() into the client's top level, so the physical answer un-folds
+			// the virtual catalog and every remote name grows a spurious level.
+			if (IsSessionIdentityCall(function)) {
+				auto alias = function.GetAlias(); // the select item keeps its name (see the macro above)
+				if (StringUtil::CIEquals(name, "current_schema")) {
+					// where an unqualified name lands inside the catalog - `main`, by construction
+					expr = make_uniq<ConstantExpression>(Value("main"));
+				} else if (StringUtil::CIEquals(name, "current_schemas")) {
+					vector<unique_ptr<ParsedExpression>> parts;
+					parts.push_back(make_uniq<ConstantExpression>(Value("main")));
+					expr = make_uniq<FunctionExpression>(Identifier("list_value"), std::move(parts));
+				} else {
+					expr = BuildCurrentDatabaseExpr();
+				}
+				expr->SetAlias(std::move(alias));
+				return;
+			}
 			// otherwise route it through the resolver seam (default-allow, deny readers)
 			if (!store.FunctionAllowed(principal, function.GetQualifiedName())) {
-				Deny("function \"" + name + "\" is not allowed");
+				Deny(Reason::FUNCTION_DENIED, "function \"" + name + "\" is not allowed");
 			}
 		}
 		ParsedExpressionIterator::EnumerateChildren(*expr,
 		                                            [&](unique_ptr<ParsedExpression> &child) { RewriteExpr(child); });
+	}
+
+	//! `current_database()` / `current_catalog()` / `current_schema()` / `current_schemas(...)`,
+	//! spelled bare or through the qualifiers duckdb itself accepts for them. Only the zero-argument
+	//! forms are taken (current_schemas keeps its one argument, which the substitution ignores the
+	//! way duckdb's own `include_implicit` is a hint) - a miswritten call falls through to the binder,
+	//! whose error is better than ours.
+	bool IsSessionIdentityCall(const FunctionExpression &function) {
+		const auto &qualified = function.GetQualifiedName();
+		const auto &name = qualified.Name().GetIdentifierName();
+		bool database = StringUtil::CIEquals(name, "current_database") || StringUtil::CIEquals(name, "current_catalog");
+		bool schema = StringUtil::CIEquals(name, "current_schema") || StringUtil::CIEquals(name, "current_schemas");
+		if (!database && !schema) {
+			return false;
+		}
+		if (!StringUtil::CIEquals(name, "current_schemas") && !function.GetArguments().empty()) {
+			return false;
+		}
+		auto &path = qualified.Path();
+		for (idx_t i = 0; i + 1 < path.size(); i++) { // every component but the name itself
+			auto piece = path[i].GetIdentifierName();
+			if (!piece.empty() && !StringUtil::CIEquals(piece, "main") && !StringUtil::CIEquals(piece, "system") &&
+			    !StringUtil::CIEquals(piece, "pg_catalog")) {
+				return false; // someone else's current_database is not this one
+			}
+		}
+		return true;
+	}
+
+	//! The catalog a bare name resolves in: the principal's MAIN catalog - and NULL when it is not
+	//! unique, which is exactly when bare-name resolution refuses too. Built over the same listing
+	//! `SHOW SCHEMAS` answers with, so a policy source that cannot enumerate refuses here as well.
+	unique_ptr<ParsedExpression> BuildCurrentDatabaseExpr() {
+		string sql;
+		if (!store.MetadataListing(principal, "show_schemas", sql)) {
+			Deny(Reason::UNAVAILABLE,
+			     "metadata is not available: this policy source cannot enumerate the current catalog");
+		}
+		auto wrapped = "SELECT CASE WHEN count(DISTINCT database_name) = 1 THEN min(database_name) END FROM (" + sql +
+		               ") WHERE \"current\"";
+		auto statement = store.InstantiateSelect(wrapped, template_options);
+		auto subquery = make_uniq<SubqueryExpression>();
+		subquery->SubqueryMutable() = std::move(statement);
+		subquery->GetSubqueryTypeMutable() = SubqueryType::SCALAR;
+		return subquery;
 	}
 
 	//! Expand a virtual scalar function `vfunc(args)` into its template expression, substituting the
@@ -1586,7 +2262,7 @@ private:
 	unique_ptr<ParsedExpression> BuildScalarExpr(const string &vname, const TablePolicy &policy,
 	                                             FunctionExpression &function) {
 		if (policy.query.empty()) {
-			Deny("virtual scalar function \"" + vname + "\" has no template");
+			Deny(Reason::POLICY_ERROR, "virtual scalar function \"" + vname + "\" has no template");
 		}
 		auto replacement = store.InstantiateExpr(policy.query, template_options);
 		vector<unique_ptr<ParsedExpression>> args;
@@ -1664,15 +2340,15 @@ private:
 	unique_ptr<ParsedExpression> ArgExpression(FunctionExpression &function,
 	                                           const vector<unique_ptr<ParsedExpression>> *args) {
 		if (!args) {
-			Deny("acl_arg() is only valid inside a table-function template");
+			Deny(Reason::POLICY_ERROR, "acl_arg() is only valid inside a table-function template");
 		}
 		auto &call_args = function.GetArguments();
 		if (call_args.size() != 1 || call_args[0].GetExpression().GetExpressionClass() != ExpressionClass::CONSTANT) {
-			Deny("acl_arg() expects a single constant position");
+			Deny(Reason::POLICY_ERROR, "acl_arg() expects a single constant position");
 		}
 		int64_t position = call_args[0].GetExpression().Cast<ConstantExpression>().GetValue().GetValue<int64_t>();
 		if (position < 1 || static_cast<idx_t>(position) > args->size() || !(*args)[position - 1]) {
-			Deny("acl_arg(" + std::to_string(position) + ") has no matching call argument");
+			Deny(Reason::POLICY_ERROR, "acl_arg(" + std::to_string(position) + ") has no matching call argument");
 		}
 		return (*args)[position - 1]->Copy();
 	}
@@ -1680,7 +2356,7 @@ private:
 	Value ClaimValue(FunctionExpression &function) {
 		auto &args = function.GetArguments();
 		if (args.size() != 1 || args[0].GetExpression().GetExpressionClass() != ExpressionClass::CONSTANT) {
-			Deny("acl_claim() expects a single constant claim name");
+			Deny(Reason::POLICY_ERROR, "acl_claim() expects a single constant claim name");
 		}
 		auto claim_name = args[0].GetExpression().Cast<ConstantExpression>().GetValue().ToString();
 		auto entry = principal.claims.find(claim_name);
@@ -1701,6 +2377,25 @@ private:
 	//! happening now and would mean nothing in a stored body.
 	bool keep_claim_markers = false;
 	ParserOptions template_options;
+
+public:
+	//! The audit's entry for the statement being rewritten (spec 069), or null when nobody listens
+	AuditTrail::Statement *trail = nullptr;
+
+	//! Record an object the statement touches and the capability its decision needed. Noted where
+	//! the object resolved and before the capability is judged, so a refusal's event names what it
+	//! refused; the same pair twice (a self-join) is one entry.
+	void Note(const string &name, const string &capability) {
+		if (!trail) {
+			return;
+		}
+		for (auto &object : trail->objects) {
+			if (object.name == name && object.capability == capability) {
+				return;
+			}
+		}
+		trail->objects.push_back(AuditObject {name, capability});
+	}
 	case_insensitive_set_t cte_scope;
 };
 
@@ -1723,6 +2418,11 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 		auto marker = StringUtil::Lower(function.FunctionName().GetIdentifierName());
 		if (marker == "acl_claim" || marker == "acl_arg") {
 			string type;
+			// a claim is a string by construction (the principal carries them as such), so a mask over
+			// one is VARCHAR and the probe can say so; only an argument's type has to be declared
+			if (marker == "acl_claim") {
+				type = "VARCHAR";
+			}
 			if (marker == "acl_arg") {
 				auto &args = function.GetArguments();
 				if (args.size() == 1 && args[0].GetExpression().GetExpressionClass() == ExpressionClass::CONSTANT) {
@@ -1732,12 +2432,29 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 					}
 				}
 			}
+			// The replacement is a different node, so the alias the marker carried has to be carried
+			// over: a probe reads the column *names* a projection produces, and dropping it stored a
+			// column with no name in `grant_columns` - which then appeared in every listing, sharing an
+			// ordinal with the column it was supposed to be (spec 042).
+			//
+			// The *type* is deliberately untyped where the signature does not give one: the baked
+			// template is serialised back to text, and a bare `NULL` binds against anything, which is
+			// what lets a predicate like `amount >= acl_arg(1)` be probed at all. That word is doing
+			// real work: `Value()` is the untyped SQLNULL, while `Value(LogicalType::VARCHAR)` - what
+			// stood here - is a *typed* NULL that merely used to serialise as bare `NULL` because
+			// duckdb lost the type in ToSQLString. duckdb#25002 fixed that, typed NULLs now render as
+			// `NULL::VARCHAR`, and the probe of that very predicate started refusing to bind - found
+			// by the distribution build tracking duckdb main, two days ahead of our pin.
+			auto alias = expr->GetAlias();
 			if (type.empty()) {
-				expr = make_uniq<ConstantExpression>(Value(LogicalType::VARCHAR));
+				expr = make_uniq<ConstantExpression>(Value());
 			} else {
 				// parse the cast rather than resolving the type name by hand (no context needed here)
 				auto casted = Parser::ParseExpressionList("CAST(NULL AS " + type + ")", options);
 				expr = std::move(casted[0]);
+			}
+			if (!alias.GetIdentifierName().empty()) {
+				expr->SetAlias(alias);
 			}
 			return;
 		}
@@ -1809,14 +2526,33 @@ string BakeTemplateForProbe(const string &sql, const ParserOptions &options, boo
 }
 
 void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Principal &principal,
-                       const ParserOptions &options, PolicyStore &store) {
+                       const ParserOptions &options, PolicyStore &store, AuditTrail *trail) {
 	AclRewriter rewriter(principal, options, store);
 	vector<unique_ptr<SQLStatement>> rewritten;
 	for (auto &stmt : statements) {
 		rewriter.follow_ups.clear();
 		rewriter.drop_statement = false;
 		rewriter.replacement = nullptr;
-		rewriter.RewriteStatement(*stmt);
+		if (trail) {
+			trail->statements.emplace_back();
+			trail->statements.back().statement = StringUtil::Lower(StatementTypeToString(stmt->type));
+			rewriter.trail = &trail->statements.back();
+		}
+		auto started = std::chrono::steady_clock::now();
+		auto record_cost = [&]() {
+			if (trail) {
+				auto elapsed = std::chrono::steady_clock::now() - started;
+				trail->statements.back().rewrite_us =
+				    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+			}
+		};
+		try {
+			rewriter.RewriteStatement(*stmt);
+		} catch (...) {
+			record_cost();
+			throw;
+		}
+		record_cost();
 		if (rewriter.replacement) {
 			rewritten.push_back(std::move(rewriter.replacement));
 		} else if (!rewriter.drop_statement) {

@@ -114,6 +114,13 @@ ACL TOKEN 'tok-acme' SELECT sum(amount) FROM orders;
 ----
 400
 
+# EXPLAIN is a capability (spec 052), and it lives on the MAIN catalog grant - which memory mode has
+# no notion of, so a principal here is always refused: EXPLAIN is a served-deployment surface
+statement error
+ACL TOKEN 'tok-acme' EXPLAIN SELECT id FROM orders;
+----
+<REGEX>:.*EXPLAIN needs the explain capability.*
+
 # --- column projection + masking -------------------------------------------------------------------
 
 query II

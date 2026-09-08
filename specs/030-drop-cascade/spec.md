@@ -89,6 +89,15 @@ catalog's to drop.
 - **One `DropObjectRows` covering relations and functions together.** Too blunt: a relation drop would
   take a function of the same name with it.
 
+## Addendum 2026-09-03 — the relation drop is one transaction
+
+`CatalogDropRelation` was the one writer that read outside a transaction (the record's origin, the
+same-name-function check) and then wrote twice — the rows, then the expansion tombstone. A failure
+between the two, or a concurrent grant write between the read and the delete, could leave an
+object's grant rows live after its record was gone: access the admin believed revoked. It now runs
+through `WriteWithReads` like every other writer — the reads and every DELETE and the tombstone in
+one transaction, the policy version bumped once at the end.
+
 ## Follow-ups
 
 - `role_object_caps` having no `kind` column is the reason for the shared-name guard. Adding one would

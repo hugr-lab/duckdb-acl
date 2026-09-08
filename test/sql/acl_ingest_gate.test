@@ -1,0 +1,46 @@
+# name: test/sql/acl_ingest_gate.test
+# description: arrow_scan takes three raw pointers into a table, so a principal must never reach it
+#   (spec 049) - the hole the ingest feature closes on its way in. The INGEST prefix itself is pinned
+#   in test/cpp/test_acl_ingest_prefix.cpp, where a runtime handle can be spliced into the text.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+statement error
+ACL ROLE "r" SELECT * FROM arrow_scan(NULL, NULL, NULL);
+----
+not allowed
+
+statement error
+ACL ROLE "r" SELECT * FROM arrow_scan_dumb(NULL, NULL, NULL);
+----
+not allowed
+
+# the ingest prefix demands its quoted handle, and an unknown handle is a session refusal
+statement error
+ACL INGEST INSERT INTO t VALUES (1);
+----
+quoted session handle
+
+statement error
+ACL INGEST 'nope' INSERT INTO t VALUES (1);
+----
+session

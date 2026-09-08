@@ -3,11 +3,14 @@
 
 The .sql file is the source of truth. This writes:
 
-  src/include/acl_schema_sql.hpp   every statement the extension runs, placeholders intact
+  src/acl_schema_sql.hpp           every statement the extension runs, placeholders intact - beside
+                                   its one consumer (acl_policy_catalog.cpp), not in include/: a
+                                   generated DDL is not the module's API
   schema/acl_schema.sql            the schema as it stands, names resolved - apply this to a fresh
                                    database and the extension will use what it finds
-There are no migrations yet (no release): schema/migrations/README.md holds the contract the first
-one will follow.
+The migration steps (schema/migrations/v<n>.sql) are written by hand alongside a schema change; this
+script never generates them. schema/migrations/README.md holds the contract, and `make schema-check`
+proves a migrated catalog has the shape of a fresh one.
 
 Both come from one file, so a hand-applied schema and the extension's own cannot drift apart.
 
@@ -25,7 +28,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE = os.path.join(ROOT, "schema", "policy_schema.sql")
-HEADER = os.path.join(ROOT, "src", "include", "acl_schema_sql.hpp")
+HEADER = os.path.join(ROOT, "src", "acl_schema_sql.hpp")
 APPLIABLE = os.path.join(ROOT, "schema", "acl_schema.sql")
 
 

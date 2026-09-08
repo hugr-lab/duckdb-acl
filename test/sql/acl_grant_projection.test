@@ -107,6 +107,37 @@ ACL ROLE "r" SELECT column_name, data_type FROM information_schema.columns
 marker	VARCHAR
 order_id	INTEGER
 
+# --- a mask over a marker keeps its name ----------------------------------------------------------------
+# the probe bakes `acl_claim(...)` into a NULL before binding, and the replacement used to drop the
+# alias with it - so the projection stored a column with no name, which then appeared in every listing
+# sharing an ordinal with the column it was supposed to be
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.marked AS phys.main.t;
+
+statement ok
+ACL ADMIN GRANT TABLE c.marked TO ROLE r WITH (select)
+    COLUMNS (id, tenant = acl_claim('tenant'));
+
+query III
+SELECT name, type, pos FROM acl_grant_columns() WHERE vname = 'marked' ORDER BY pos;
+----
+id	INTEGER	0
+tenant	VARCHAR	1
+
+# a claim is a string by construction, so the probe can type it - and every surface agrees
+query III
+ACL ROLE "r" SELECT column_name, data_type, column_index FROM duckdb_columns()
+WHERE table_name = 'marked' ORDER BY column_index;
+----
+id	INTEGER	1
+tenant	VARCHAR	2
+
+query I
+ACL ROLE "r" SELECT sql FROM duckdb_tables() WHERE table_name = 'marked';
+----
+CREATE TABLE "marked"("id" INTEGER, "tenant" VARCHAR);
+
 # --- a column whose name is not a bare word ------------------------------------------------------------
 # the probe builds `<source> AS <alias>`; unquoted, a name like `od''d` made the probe itself
 # unparseable, so such a column could never be granted at all

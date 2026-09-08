@@ -3,8 +3,9 @@
 # schemas with docker/docker-compose.yml via docker/init/*.sql), plus a representative macOS build
 # on merges to main and manual runs. Full platform coverage lives in release.yml.
 #
-# NOTE: the extension tracks duckdb `main` (submodule pin); everything here builds the pinned
-# submodule, so a red build means our code or the pin - never a floating upstream.
+# NOTE: the extension tracks duckdb's 2.0 release branch `v2.0-cyanoptera` (submodule pin; the
+# `v2.0.0` tag once it is cut); everything here builds the pinned submodule, so a red build means
+# our code or the pin - never a floating upstream.
 name: CI
 
 on:
@@ -16,6 +17,14 @@ on:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+# An explicit `shell: bash` is `bash -eo pipefail`; the default `bash -e` has no pipefail, so every
+# `<suite> 2>&1 | tee <log>` step below reported tee's exit code and a failing suite behind the pipe
+# passed (the Flight e2e was red on main from #117 to spec 070, green on the badge). The pipe is
+# kept - the log is what assert_ran.sh reads - and pipefail makes the step fail with the suite.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   lint:
@@ -31,6 +40,20 @@ jobs:
         run: |
           find src test/cpp \( -name '*.cpp' -o -name '*.hpp' \) -print0 \
             | xargs -0 clang-format --dry-run --Werror
+      # a malformed workflow fails here, not at the first push that runs it (release plan 3.8); the
+      # rules are .yamllint's, relaxed on purpose
+      - name: yamllint
+        run: |
+          pip install yamllint
+          yamllint .github/workflows docker/docker-compose.yml packaging
+      # the embedded quack server's acl_-renamed TUs are generated from the submodule by sync.py
+      # (spec 063); a submodule bump without regeneration, or a hand edit of a generated file, is
+      # drift this catches. Only the quack submodule itself is needed - not its nested duckdb.
+      - name: Generated quack embed sources are current
+        run: |
+          git submodule update --init --depth 1 third_party/quack
+          python3 src/quack_embed/sync.py
+          git diff --exit-code -- src/quack_embed/
 
   build-test-linux:
     name: Build + test (linux_amd64)
@@ -62,6 +85,13 @@ jobs:
     env:
       GEN: ninja
       ACL_INTEGRATION: 1
+      # the quack door is built here too (spec 041), so the live round trip runs on every PR rather
+      # than only where someone built it by hand. quack is pre-release and the callback contract is
+      # what we stand on: a change to it should arrive as a red build, not as a surprise later.
+      ACL_QUACK: 1
+      # Opting out of the Flight door keeps this job about the scanners and the quack door, which is
+      # what it is for. The flight job below builds the default configuration - the one that ships.
+      ACL_NO_FLIGHT: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
     steps:
@@ -72,7 +102,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache postgresql-client mysql-client
+          sudo apt-get install -y ninja-build ccache postgresql-client mysql-client clang libclang-rt-18-dev
 
       # scanner dependencies (libpq/openssl/roaring/...) come from vcpkg via the merged manifests
       # of the loaded extensions - the standard duckdb-extension dependency flow
@@ -102,10 +132,44 @@ jobs:
           EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
           ccache -s
 
+      # the artifact must LOAD, not only compile: copied out of the tree and loaded from another
+      # directory, as an operator would (release plan 3.3)
+      - name: The artifact loads
+        run: scripts/ci/smoke_load.sh
+
+      # vcpkg's cache only grows; drop two-week-old archives before actions/cache saves it (3.4)
+      - name: Prune the vcpkg binary cache
+        if: always()
+        run: scripts/ci/prune_vcpkg_cache.sh
+
       - name: Unit suites
         run: |
-          build/release/test/unittest test/sql/acl.test
+          build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
+          scripts/ci/assert_ran.sh suite.log 50 3000
           make test-cpp
+
+      # the first five minutes of a user, run as a test: the demo speaks the catalog model and the
+      # runner judges the transcript - exactly the four announced refusals and nothing else (plan 5.6)
+      - name: End-to-end demo (test/harness)
+        run: test/harness/run.sh
+
+      # the same C++ tests under ASan+UBSan (release plan 3.1): JWT/JWKS/OIDC parsing, the session
+      # map and the catalog RPC composition are exactly where a memory error is a security error.
+      # Separate binaries (build/test-sanitized) against the same release libduckdb.
+      - name: C++ tests under ASan+UBSan
+        run: make test-cpp SANITIZE=1
+
+      # the OIDC core's parsers under libFuzzer for a minute (release plan 3.6): the bytes an IdP or
+      # a door answers are the node's pre-authentication network input. clang carries libFuzzer;
+      # the target links the release libduckdb like the sanitized tests do.
+      - name: Fuzz the OIDC parsers
+        run: make fuzz-oidc CXX=clang++ FUZZ_SECONDS=60
+
+      # the generated policy schema (acl_schema_sql.hpp, acl_schema.sql) must match
+      # schema/policy_schema.sql, and a hand-applied copy must work: RequireSchemaVersion catches a
+      # version mismatch, never a shape mismatch at the same version - this does
+      - name: Generated schema is current
+        run: make schema-check
 
       - name: Initialize integration schemas
         run: |
@@ -113,7 +177,20 @@ jobs:
           mysql -h 127.0.0.1 -P 6433 -u acl -paclpass acltest < docker/init/mysql.sql
 
       - name: Integration tests
-        run: make test-integration
+        # PostgreSQL is a service of this job: a PG- or DuckLake-gated scenario that skips here ran
+        # nothing it was set up to run (release plan 0.3)
+        run: |
+          make test-integration 2>&1 | tee integration.log
+          scripts/ci/assert_ran.sh integration.log 8 200 'require-env ACL_(PG|DUCKLAKE)_DSN'
+
+      # spec 043 through the door: one served process, several client processes, real sources - the
+      # postgres and ducklake legs and the postgres x ducklake pair (mssql has no service here and
+      # skips by name). The harness fails by itself when no leg ran; this insists on all three.
+      - name: Door e2e (spec 043)
+        run: |
+          make test-e2e 2>&1 | tee e2e.log
+          scripts/ci/assert_ran.sh e2e.log 0 0
+          grep -E '^PASS: legs run:.* postgres .*ducklake .*pair' e2e.log
 
       - name: Upload extension artifact
         if: github.event_name != 'pull_request'
@@ -122,6 +199,100 @@ jobs:
           name: acl-linux_amd64
           path: build/release/extension/acl/acl.duckdb_extension
 
+  # The Arrow Flight SQL door (specs/045). Its own job rather than a step in the Linux one - it pulls
+  # Arrow with Flight SQL, 89 vcpkg ports that have nothing to do with the scanners - and, like the
+  # macOS job, off pull requests: a cold build of it takes an hour and a half.
+  #
+  # That it does not run on PRs is what keeps the plain Actions cache sufficient. The repository's cache
+  # budget is 10 GB with eviction by age, and this build's share of it is well over a gigabyte competing
+  # with the integration cache and seven release ccaches; a job that runs on merges and on request fills
+  # it rarely enough not to fight for room. A pull request that needs the door checked can dispatch this
+  # workflow by hand.
+  build-test-flight:
+    name: Build + test (flight door)
+    runs-on: ubuntu-24.04
+    env:
+      GEN: ninja
+      # No ACL_NO_FLIGHT: the door is what a default build produces, so this job builds the
+      # full-functionality configuration community-extensions ships - flight AND the embedded quack
+      # server (spec 063). It runs on PRs too, not only on push: 063's whole surface (the door's TLS
+      # and its OpenSSL RNG) lives on this path, so it must be a red build on a PR, not a surprise at
+      # distribution time.
+      # ACL_QUACK adds the quack *client* loadable so the embedded-door cpp test can ATTACH to itself.
+      ACL_QUACK: 1
+      # the Flight door's own sqllogictests exist only where the door does (release plan 2.3)
+      ACL_FLIGHT_TESTS: 1
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+          # the e2e client is third-party on purpose: a door is only proven by something that is not us
+          pip install pyarrow adbc_driver_flightsql adbc_driver_manager
+
+      - name: Setup vcpkg
+        run: make vcpkg-setup
+
+      # Keyed on vcpkg.json too: Arrow arrives through the `flight` manifest feature, so a change there
+      # is a change of dependencies and the old cache no longer describes this build.
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v6
+        with:
+          path: vcpkg_bincache
+          key: vcpkg-bincache-flight-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-bincache-flight-${{ hashFiles('.gitmodules', 'vcpkg.json') }}-
+            vcpkg-bincache-flight-
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ccache-flight-${{ hashFiles('.gitmodules', 'duckdb/CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-flight-${{ hashFiles('.gitmodules', 'duckdb/CMakeLists.txt') }}-
+            ccache-flight-
+
+      - name: Build (with the Flight door)
+        run: |
+          EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
+          ccache -s
+
+      # the artifact must LOAD, not only compile: copied out of the tree and loaded from another
+      # directory, as an operator would (release plan 3.3)
+      - name: The artifact loads
+        run: scripts/ci/smoke_load.sh
+
+      # vcpkg's cache only grows; drop two-week-old archives before actions/cache saves it (3.4)
+      - name: Prune the vcpkg binary cache
+        if: always()
+        run: scripts/ci/prune_vcpkg_cache.sh
+
+      # Before anything is run: an artifact that borrowed a library from the runner would work here and
+      # nowhere else, and neither of the two times that happened showed up in a build log.
+      - name: Check the artifact carries its dependencies
+        run: make check-flight-deps
+
+      - name: Unit suites
+        run: |
+          build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
+          scripts/ci/assert_ran.sh suite.log 50 3000 'require-env ACL_FLIGHT_TESTS'
+          # the embedded quack door's cpp test runs HERE, on the flight build, so its TLS + OpenSSL
+          # RNG path is exercised (the no-flight linux job above builds it cleartext-only)
+          make test-cpp
+
+      - name: Flight door end to end
+        # every e2e script exits 0 with `SKIP:` on a missing dependency - right on a dev box, a lie here
+        run: |
+          make test-flight 2>&1 | tee flight.log
+          scripts/ci/assert_ran.sh flight.log 0 0
+
   # Representative second platform; PRs stay on the Linux job to keep them fast
   build-test-osx:
     name: Build + test (osx_arm64)
@@ -129,6 +300,9 @@ jobs:
     if: ${{ github.event_name != 'pull_request' }}
     env:
       GEN: ninja
+      # A second platform for the ACL itself, not for the door - this job has no vcpkg step and does
+      # not want an hour of Arrow. The door's own job covers the default configuration.
+      ACL_NO_FLIGHT: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - uses: actions/checkout@v7
@@ -152,9 +326,20 @@ jobs:
           EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
           ccache -s
 
+      # the artifact must LOAD, not only compile: copied out of the tree and loaded from another
+      # directory, as an operator would (release plan 3.3)
+      - name: The artifact loads
+        run: scripts/ci/smoke_load.sh
+
+      # vcpkg's cache only grows; drop two-week-old archives before actions/cache saves it (3.4)
+      - name: Prune the vcpkg binary cache
+        if: always()
+        run: scripts/ci/prune_vcpkg_cache.sh
+
       - name: Unit suites
         run: |
-          build/release/test/unittest test/sql/acl.test
+          build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
+          scripts/ci/assert_ran.sh suite.log 50 3000
           make test-cpp
 
       - name: Upload extension artifact

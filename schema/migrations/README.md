@@ -1,8 +1,10 @@
 # Schema migrations
 
-Empty on purpose: duckdb-acl has not been released, so every catalog is created from
-[`../acl_schema.sql`](../acl_schema.sql) at the current version and there is nothing to migrate from.
-This file is the contract the first migration will follow (spec 034).
+The steps that take an existing policy catalog from one schema version to the next. The extension
+does not apply them itself: `acl_use_db(..., true)` refuses a catalog with an older stamp by
+version and points here - an operator applies the steps by hand, in order, against the database
+that holds the schema. A fresh catalog is always created from [`../acl_schema.sql`](../acl_schema.sql)
+complete and needs none of them. `v11.sql` (spec 048) is the first step.
 
 ## The contract
 
@@ -24,9 +26,11 @@ This file is the contract the first migration will follow (spec 034).
   exactly what the schema file would have created. That is the invariant to check when adding a step:
   a catalog migrated from `<n-1>` and one created fresh at `<n>` must have the same columns in the
   same order.
-- Every step is generated from `../policy_schema.sql` by `make schema`, like everything else here —
-  the source file is where a new column is added, and the step records how an existing catalog gets
-  there.
+- A step is written by hand alongside the change to `../policy_schema.sql` (the source file is where
+  a new column is added; `make schema` regenerates the complete current schema, never the steps), and
+  **the invariant above is checked, not assumed**: `make schema-check` builds a catalog from the
+  schema file the `main` branch ships, applies every step above its version, and diffs the column
+  shape of every `acl` table against a catalog created fresh from the current file.
 
 ## Why not "add the column if it is missing"
 

@@ -118,6 +118,31 @@ ACL ROLE "full" SELECT name FROM acl_references('rates');
 ----
 order_rate
 
+# The same columns as lists, paired by position. `string_agg` cannot be re-paired by a consumer -
+# splitting on ', ' breaks on a column name containing one - and Flight SQL's key RPCs need the pairing
+# to fill `key_sequence` (spec 046). A two-pair reference is what proves the order survives.
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.two_pairs FROM orders TO customers
+    ON (customer_id = id, secret = name);
+
+query IIII
+ACL ROLE "full" SELECT from_columns, to_columns, from_column_list, to_column_list
+    FROM acl_references() WHERE name = 'two_pairs';
+----
+customer_id, secret	id, name	[customer_id, secret]	[id, name]
+
+# and zipped, which is the shape a key listing is built from
+query III
+ACL ROLE "full" SELECT unnest(from_column_list) AS fk, unnest(to_column_list) AS pk,
+       generate_subscripts(from_column_list, 1) AS seq
+    FROM acl_references() WHERE name = 'two_pairs' ORDER BY seq;
+----
+customer_id	id	1
+secret	name	2
+
+statement ok
+ACL ADMIN DROP VIRTUAL REFERENCE c.two_pairs;
+
 # --- a reference is only as visible as its ends and its columns ---------------------------------------
 
 statement ok

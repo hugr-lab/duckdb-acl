@@ -1,5 +1,14 @@
 {
-    "dependencies": [],
+    "dependencies": [
+        {
+            "name": "arrow",
+            "default-features": false,
+            "features": [
+                "flightsql"
+            ],
+            "platform": "!wasm32"
+        }
+    ],
     "vcpkg-configuration": {
         "overlay-ports": [
             "./extension-ci-tools/vcpkg_ports"

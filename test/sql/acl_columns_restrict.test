@@ -173,6 +173,46 @@ ACL ROLE "r" SELECT string_agg(column_name, ',' ORDER BY column_name) FROM (DESC
 ----
 amount,id,note,ssn,tenant
 
+# --- an insert may take the shape we published ----------------------------------------------------------
+# duckdb matches a listless INSERT by position against the table's full width and never by name, while
+# a client counts the columns spec 035 published - so the list is supplied for it (spec 042)
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.shaped AS phys.main.t;
+
+statement ok
+ACL ADMIN GRANT TABLE c.shaped TO ROLE r WITH (select, insert) COLUMNS (id, tenant);
+
+query I
+ACL ROLE "r" SELECT sql FROM duckdb_tables() WHERE table_name = 'shaped';
+----
+CREATE TABLE "shaped"("id" INTEGER, "tenant" VARCHAR);
+
+# two values, no column list: the shape we advertised
+statement ok
+ACL ROLE "r" INSERT INTO shaped VALUES (77, 'acme');
+
+query II
+ACL ROLE "r" SELECT id, tenant FROM shaped WHERE id = 77;
+----
+77	acme
+
+# a value too many is a width error, not a row in a column nobody was shown
+statement error
+ACL ROLE "r" INSERT INTO shaped VALUES (78, 'acme', 'extra');
+----
+<REGEX>:.*expected 2 columns but 3 values were supplied.*
+
+# a column the grant does not list is still untouched by such an insert
+query I
+SELECT count(*) FROM phys.main.t WHERE id = 77 AND ssn IS NULL AND amount IS NULL;
+----
+1
+
+# leave the fixture as it was for what follows
+statement ok
+DELETE FROM phys.main.t WHERE id = 77;
+
 # --- a grant may only name what the object exposes ------------------------------------------------------
 # and it is refused where it is written, not where it is read (spec 037)
 

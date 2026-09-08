@@ -12,11 +12,14 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
 ## Technology
 
 - **Language**: C++17 (DuckDB extension standard).
-- **DuckDB**: tracks **`main`** (submodule pinned in `.gitmodules`); depends on parser/AST APIs
-  (`Identifier`, multi-level `QualifiedName`, `MergeQueryNode`, unified DML query nodes) not yet in a
-  stable release. Re-pin to a tag once those land.
+- **DuckDB**: tracks the **2.0 release branch `v2.0-cyanoptera`** (submodule pinned in
+  `.gitmodules`; until 2026-09-08 it tracked `main`, which is now `v2.1.0-dev` and already diverges in
+  the MERGE INTO API the extension ecosystem builds against). Depends on parser/AST APIs
+  (`Identifier`, multi-level `QualifiedName`, `MergeQueryNode`, unified DML query nodes) that land
+  with 2.0. Re-pin to the `v2.0.0` tag when it is cut; the scanners come from the submodule's own
+  extension pins (`.github/config/extensions/`), patches included.
 - **Dependencies**: none (no vcpkg/OpenSSL).
-- **Platforms**: Linux (GCC), macOS (Clang).
+- **Platforms**: Linux (GCC), macOS (Clang), Windows (MSVC — a release target; CI builds the first two).
 
 ## Project structure
 
@@ -24,9 +27,16 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
 src/
   acl_extension.cpp          # entry: model overview, creates the store, calls the registrations
   acl_policy.cpp             # PolicyStore + resolver methods, template cache (the resolver seam)
+  acl_policy_catalog.cpp     # the catalog backend's READ path: resolution, gate, rights, caches
+  acl_catalog_admin.cpp      #   ... its writers (PolicyStore::Catalog*), acl_metadata_listing.cpp the
+  acl_catalog_validation.cpp #   listings, and the probe/bind validators; declared in acl_policy_catalog.hpp
   acl_rewriter.cpp           # the AST walker; exposes RewriteStatements(...)
   acl_parser_override.cpp    # ACL prefix scanner + parser_override; exposes RegisterAclParser(...)
   acl_admin_functions.cpp    # acl_* admin stubs; exposes RegisterAclAdminFunctions(...)
+  acl_door_common.cpp        # what every acl_* scalar and both doors share: StoreOf/RequiredArg, PEM, JSON
+  flight/                    # the Flight SQL door (spec 045); seam RegisterAclFlightDoor(...)
+  quack_embed/               # the embedded quack server (spec 063) + acl_quack_door.cpp (serve/stop, the
+                             #   two callbacks); seam acl_quack_embed.hpp: RegisterAclQuackEmbed/Door(...)
   include/                   # acl_extension.hpp (AclExtension : Extension) + one header per module
 test/
   sql/acl.test               # sqllogictest suite (require acl)
@@ -47,18 +57,23 @@ the `PolicyStore` types); TU-local code stays in anonymous namespaces.
 ```sh
 git submodule update --init --recursive
 GEN=ninja make                      # release build of duckdb + the extension
-build/release/test/unittest test/sql/acl.test    # run the suite
-GEN=ninja make test                 # same, via the ci-tools target
+build/release/test/unittest 'test/sql/*'         # run the WHOLE suite (what CI runs; ~50 files)
+build/release/test/unittest test/sql/acl.test    # one file (acl.test is the memory-mode baseline only)
 GEN=ninja make test-cpp             # standalone C++ invariant tests (specs/002)
 test/harness/run.sh                 # end-to-end demo against the built extension
+test/live/serve.sh [--tls]          # serve one seeded node for real client tools (spec 057 runbook)
 
 # integration (specs/005): real DBs in docker + scanner-backed scenarios
 cp .env.example .env                # once
 make vcpkg-setup                    # once: scanner dependencies come from vcpkg (merged manifests)
 make docker-up                      # postgres + mysql + sqlserver (initialized)
 ACL_INTEGRATION=1 GEN=ninja make    # build incl. postgres_scanner/ducklake
+ACL_QUACK=1 GEN=ninja make          # build incl. quack (spec 041): the live door test needs it
 make test-integration               # scenarios in test/sql/integration/ (skip w/o scanner or DSN)
 ```
+
+CI builds the linux job with both flags, so the served round trip is exercised on every PR; the
+macOS job builds neither and runs the plain suite.
 
 Build outputs: CLI `build/release/duckdb`, loadable
 `build/release/extension/acl/acl.duckdb_extension`, test binary `build/release/test/unittest`.
@@ -81,7 +96,9 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
 - **Unstated caps = every data capability** (spec 012): a grant written without `CAPS` — or a driver
   row with NULL/empty caps — means `select, insert, update, delete, merge`, never `manage`; an
   explicit `'{}'` means none. An *object* grant that states nothing inherits the catalog grant's caps,
-  so a refinement never widens by omission.
+  so a refinement never widens by omission. The capabilities *outside* that default are explicit-only
+  and never inherited: `create`/`drop` on a schema (spec 016/051), `temp` (spec 050) and `explain`
+  (spec 052) on the MAIN catalog grant — each granted by name or not held.
 - **A grant's predicate confines writes too** (spec 024): it is AND-ed into the read/write `WHERE` and
   also checked against the row being written — an `INSERT`/`UPDATE`/`MERGE` that would leave a row
   outside the principal's slice is refused where the value is written (`error()` inside a `CASE`). An
@@ -105,7 +122,9 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
 - **Function gating seam**: `PolicyStore::FunctionAllowed` — denies only data-readers / rights-bypass
   functions, passes the rest. This is where a production role-aware resolver plugs in.
 - **State is per-instance**: `PolicyStore` reached via `AclParserInfo` (parser) and `AclScalarInfo`
-  (admin functions' `function_info`) — no process globals.
+  (admin functions' `function_info`) — no process globals. Every `acl_*` scalar is registered through
+  `MarkAclScalar` (fallible **and volatile**): a foldable side effect runs while the optimizer plans
+  and may run again at execution; `test/sql/acl_scalar_stability.test` lists any function that forgot.
 
 ## Admin / setup functions
 
@@ -147,6 +166,169 @@ effects) into the admin functions; anything else after `ACL ADMIN` stays native 
 `acl_grant_view`, `acl_grant_table_function[,_alias]`, `acl_grant_scalar[,_alias]`,
 `acl_deny_function`, `acl_allow_function` — without a catalog they fill the in-memory store; with one
 they write the same content into the implicit virtual catalog `default`.
+
+## Serving clients directly
+
+A gateway prefixes every statement. A client that connects for itself cannot, so a **session** turns a
+token into a principal once and a **door** attaches it to every statement after that.
+
+**Spec 040 — the session contract**: `acl_session_open(token)` mints an opaque random handle (or NULL
+if the token does not verify), `acl_session_sql(handle, sql)` returns that SQL with
+`ACL SESSION '<handle>'` in front (NULL if the session is unknown, closed or past its `exp` — judged on
+every use), `acl_session_close(handle)` ends it. `ACL SESSION '<handle>'` is a fourth prefix kind
+alongside ROLE/TOKEN/ADMIN, carrying the same markers. All three functions are denied to a principal:
+a client can neither mint a session, compose a prefix, nor close somebody else's. State is in memory
+per `DatabaseInstance`; the shared backends a cluster needs are a follow-up.
+
+**Spec 044 — sessions end when nobody ends them**: a door mints one per connection and quack calls
+nothing on disconnect, so two rules bound the map. A session dies at its token's `exp` *or* after
+`acl_session_idle_timeout` seconds unused (default 900; `0` disables) — `exp` bounds a credential and
+says nothing about whether anyone is still there. **Spec 059** relaxes the first rule by default:
+`acl_session_token_binding='connect'` (default) judges `exp` only at establishment — an open session
+works until idle/close/kill; `'every_use'` restores per-use judgment. `acl_session_sweep()` drops every dead record and
+returns how many; `SessionOpen` runs the same pass by itself, at most once a minute or whenever the map
+is at `acl_max_sessions` (default 1000; `0` unlimited). At the cap a new session is **refused**, never
+an old one evicted — making room by ending somebody's session is the worse failure. `acl_session_count()`
+reports the live total; both new functions are the door's, not a principal's.
+
+**Spec 041 — the quack door**: quack calls an authentication function per connection and an
+authorization function per statement **whose VARCHAR return replaces the executed SQL**, so serving
+under the ACL is two thin wrappers over the contract: `acl_quack_authenticate(session_id, client_token,
+server_token)` opens a session and binds it to the connection, `acl_quack_authorize(connection_id,
+query)` composes the prefix or answers NULL, which quack turns into a refusal. `acl_quack_serve(uri,
+token)` installs both and starts the listener, refusing an instance a client could step out of
+(anonymous admin on, override not `STRICT`, no server token, quack not loaded);
+`acl_quack_stop(uri)` closes the door and sweeps the sessions it served. quack's own fourteen functions
+are on the denylist — the gate is a denylist, so a loaded extension widens the surface until named.
+**Spec 062 → 063**: the door is now quack's **server compiled into acl** (`third_party/quack` submodule,
+the server object graph in `src/quack_embed/`), replacing the spec-062 loopback front. `AclQuackServer`
+binds the public address itself, terminates TLS (`acl_quack_serve(uri, token[, cert, key][, mode])`,
+inline PEM or read through the filesystem), and answers `GET /.well-known/quack-auth` from the live
+policy — so `ISSUER` in a provider secret (spec 061) is optional when its SCOPE names the door. Its SQL
+surface is `acl_quack_*`-named (settings and the `acl_quack_scan_data` drain), so a standalone quack
+co-loads without a clash; `mode := 'plain'` raises a bare, discovery-less (still acl-gated) server for
+TLS-terminating-upstream deployments. The server's token/session RNG comes from an OpenSSL-backed
+`EncryptionUtil` acl registers at serve time (only-if-empty, flight builds), so it needs neither `LOAD
+httpfs` nor `force_mbedtls_unsafe` — duckdb's bundled mbedtls RNG is a non-crypto PRNG, unfit for auth
+tokens. A namespace-alias shim (`acl_quack_httplib_ns.hpp`) lets quack's
+`duckdb_httplib::` sources compile in the OpenSSL httplib namespace; `sync.py` regenerates the few
+acl_-renamed TUs on a submodule bump; the embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
+Streamed ingest
+(`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the
+**client** — `INSERT INTO t SELECT * FROM scan_data_from_quack_client('<id>', NULL::STRUCT(…),
+ordered := …)` — and arrives through the door's authorization like any statement, under the
+session; spec 042's exemption is keyed by the exact stream id the statement carries (the registry
+is the session's own connection), and the rewriter retargets the call to `acl_quack_scan_data`.
+The unprefixed fence stays for a stock quack's server-generated drain: it carries no principal and
+is refused. Staging on quack is a **granted schema** (spec 056): a client's
+`CREATE TEMP` is its own local catalog and an attached catalog cannot hold one, so the Flight door's
+server-side temp (spec 050) is unreachable from here by construction — CREATE/drain/promote/DROP
+through specs 016/042/051 is the pattern instead.
+
+**Specs 045–053 — the Flight SQL door**: `acl_flight_serve(uri[, cert, key])` / `acl_flight_stop(uri)`
+serve the
+protocol ADBC and JDBC drivers speak. A statement is a single-use **reservation** (spec 047): parsed,
+rewritten and bound once at GetFlightInfo, redeemable at DoGet only by the principal fingerprint that
+made it. The catalog RPCs answer the principal's catalog (spec 046), bulk ingest appends under an
+`ACL INGEST` prefix only the door composes (spec 049). **Spec 050**: a session IS a duckdb
+connection — identified by the door's own CSPRNG cookie (a cookie-less call gets a per-call session;
+a client has a durable one from its second call on), held as a `Connection` per session and executed
+on under a per-session lock. On it, **session temp tables**: `CREATE TEMP TABLE` under the explicit
+`temp` capability of the MAIN catalog grant (never in the unstated default), bare names resolve
+virtual-first then via a direct no-transaction read of the connection's temp catalog (the thread-local
+exec-context seam the door sets around Prepare; without it — quack — the rewriter temp-qualifies and
+the bind decides), DML/DROP are symmetric, `SHOW TABLES`/tables listings include the session's own
+temps, and ingest `temporary = true` stages into a session temp the client then moves with plain SQL.
+duckdb reclaims everything with the connection; `acl_sessions()` / `acl_session_kill(id)` are the ops
+surface. **Spec 051**: ingest `mode=create`/`replace` builds/replaces a table in a granted physical
+home, and `CREATE OR REPLACE` is priced at `create`+`drop` (REPLACE is a drop). **Spec 052**: EXPLAIN
+is the explicit `explain` capability (a plan names physical objects); the rest of the leak-audit
+surfaces are confirmed fail-closed. **Spec 053**: `acl_flight_serve(uri, cert, key)` serves over TLS
+(`grpc+tls`, cert/key inline-PEM or read through duckdb's filesystem) and may bind any address; the
+one-arg form stays cleartext-localhost. **Spec 054**: `acl_session_reason(handle)` tells a client why
+a session is gone (live/expired/idle/unknown), read-only so it survives the NULL from
+`acl_session_sql`. **Spec 055**: transactions live on the session's connection -
+`BeginTransaction`/`EndTransaction` open and end one, `transaction_id` is validated against the
+session's own, so a driver with autocommit off (DBeaver, ADBC manual-commit) works; ingest still owns
+its own transaction. **Spec 064**: auth discovery + the IdP-gated password handshake - the
+Handshake payload `discover-auth` answers issuers/client_id/OIDC endpoints unauthenticated
+(FlightSqlServerBase seals DoAction), and a BasicAuth handshake becomes the OAuth password grant run
+as the issuer's `client_id` (`acl_define_issuer` args 8-9, `CREATE|ALTER ISSUER ... CLIENT ID|SECRET`,
+schema v12), the IdP's token verified offline and returned as the connection's bearer; no flow
+toggle of ours - the IdP's refusal is the gate; TLS-only by refusal; `acl_issuers()` never lists the
+secret.
+
+**Spec 067 — the PEG world**: duckdb's PEG parser is the parser at our pin; `parser_override` is
+intact and load-bearing upstream. Foreign syntax under the prefix is a three-way contract, pinned by
+`test/cpp/test_acl_foreign_parser.cpp`: bare — a co-loaded extension's token peeler works (loading
+acl costs nobody anything); in the virtual context — its opaque `ExtensionStatement` is
+default-denied (unenumerable ⇒ unconfinable); under `ACL NATIVE` — works, gated on the passthrough
+scope, never the syntax. Grammar-extension registration is not exposed upstream yet; when it lands,
+extended-grammar AST flows through the same inner parse (walked or denied per node) and the prefix
+itself becomes a grammar rule (design/014 spike; the upstream question is design/011/QUESTION.md).
+
+**Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
+render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
+value, a session scope, and only on a session of the client's own (`Principal::session_connection`,
+set by `ACL SESSION` alone): a per-statement prefix runs on a connection the gateway shares, where a
+setting would leak to the next principal. The Flight door's `SetSessionOptions`/`GetSessionOptions`
+apply the same list on the session's connection. The build carries `icu` for the tests.
+
+**Spec 066 — node drain**: `acl_drain()` stops seating new clients at the one seam they all cross
+(`SessionOpen` refuses; the doors say why — Flight answers UNAVAILABLE "draining", quack's discovery
+answers 503 `draining`) while established sessions keep working; repeating `acl_drain()` is the
+watch loop (it sweeps, then answers what remains - the auto-sweep rode `SessionOpen`, which drain
+turns off), stragglers go to `acl_session_kill`, then the doors stop and the process exits. `acl_resume()` / `acl_drain_status()` complete the surface; all three are denied to a
+principal. The node never waits or times out by itself — the deadline belongs to the orchestrator.
+
+**Spec 069 — audit and metrics, layered**: every decision is an event (`AuditEvent`, header-only
+contract in `acl_audit.hpp`): statement/admin (emitted by the parser override after the decision, with
+the objects the rewrite touched and the capability judged for each, `rewrite_us`, and on a refusal one
+`reason_code` of a bounded taxonomy — the `Reason` enum every `Deny` site names, carried to the
+override's catch by a thread-local note), session (open/close/refuse, with door and duration), ingest
+(rows, from both doors; quack's drain outcome comes through a `sync.py` patch of the generated server
+TU), door (Flight tickets and the password handshake), policy (reloaded/written/source_error, from the
+catalog backend's `on_policy`), keys (JWKS refreshed/refresh_failed). The `AuditPipeline`
+(`acl_audit_pipeline.hpp`, acl-internal) drains a bounded queue on one thread into registered sinks,
+a ring (`acl_audit_events()`) and a JSON-lines file (`acl_audit_sink`); counters are derived from
+the events whatever the level, gauges are readers the owners register; `acl_metrics()` answers both,
+`GET /metrics` on the quack listener when `acl_metrics_endpoint` is on. Levels
+`acl_audit_level` = off/denied/decisions/all, per-session override `acl_session_audit_level`.
+Hooks live in the ObjectCache (`AuditHooks`, `GetOrCreate` by type string — no RTTI, no acl
+symbol: a loadable extension is RTLD_LOCAL) so `acl_otel` (separate repo,
+`specs/069-audit/extension-requirements.md`) registers sinks and a `SessionPolicy` without
+linking acl. Trace: `TRACE '<id>' [PARENT '<tp>']` prefix markers, composed by every door from
+`acl_correlation_id` / `acl_traceparent` (session-scoped, on spec 068's allowlist; a session's
+value also lands on its record, since quack composes on a server connection) or Flight's
+`x-correlation-id` / `traceparent` headers; each marker once. Never a claim value, a handle or
+statement text on an event: a `parse` reason is a fixed sentence, a `principal` reason has its
+quoted values blanked, a source's ingest error keeps only its class (`AuditReasonText`,
+`AuditIngest`); reasons ≤512 bytes, traces ≤128. `acl_audit_denials_per_second` (100) bounds the
+recorded refusals per source (counted regardless). Metric attributes from bounded sets only. The
+pipeline's worker never holds the instance (settings and the file are the emitting thread's);
+`PolicyStoreHandle`'s destructor in the object cache is the shutdown seam.
+
+**Spec 070 — the Flight door streams**: `DoGet` executes with `allow_stream_result` and hands gRPC a
+`RecordBatchStream` over `AclResultReader`, which pulls ONE duckdb chunk per Arrow batch — nothing
+beyond the chunk in flight is held, whatever the result's size. The `StreamQueryResult` lives in a
+slot (`FlightDoorState::ResultStream`) the reader and the session connection share: every pull takes
+`SessionConn::exec` + `stream_lock` and releases them, so the session's next statement
+(`LockForStatement`, every former `lock_guard(exec)` site) can end a stream that sat unpulled for
+`acl_flight_stream_idle` seconds (30; 0 = never, the statement waits) from its own thread — interrupt,
+`Close()` (what releases duckdb's active query at our pin; the destructor releases nothing), drop the
+result, mark the slot `superseded` — while one being pulled makes it wait. A pull touches the session
+(`SessionTouch`) and a killed/expired durable session ends its stream at the next pull. Whatever ends
+the stream interrupts and closes the query (duckdb's own LIMIT rule): consumed, cancelled (gRPC
+destroys the reader — its destructor — or `is_cancelled()` between pulls), superseded, capped
+(`acl_max_result_rows`, 0 = unlimited: exactly N rows out, then the refusal, reason `at_capacity`),
+failed (`source_error`; the client gets the text, the audit its class; a partial result is an error,
+never a short one). Schema and batches are built from ONE `ClientProperties` snapshot taken under
+`exec` at execute. One `door` event `stream_<outcome>` with rows per stream, counter `acl.door.streams`
+(also `ingest_cancelled`), gauge `acl.door.streams_open`. Ingest mirrors it: `IngestGetNext` checks
+`is_cancelled()` between batches AND at end of stream (a dead client reads as a clean half-close), a
+client that dies rolls the load back (`ingest` event `denied/unavailable`, `door` event
+`ingest_cancelled`). The e2e is `test/e2e/flight/stream.sh` (pyarrow client; server answers read
+through its own stdin) — the 200M-row view, the ms to the first batch, and each outcome.
 
 ## Working process — per-feature specs
 

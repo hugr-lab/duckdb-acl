@@ -1,0 +1,105 @@
+# CodeQL (release plan 3.5): GitHub's C/C++ static analysis over a traced build - use-after-free,
+# taint into format strings, OOB reads - the classes a parser-override that rewrites untrusted
+# statements and a door that parses network bytes are made of. Free for a public repository.
+#
+# Push-to-main and weekly, NOT per PR: the traced build is a full duckdb build without ccache (the
+# tracer misses every compiler invocation ccache short-circuits, and those holes are silent) and
+# takes long enough to dominate PR feedback. A merge is analyzed on the next push; new queries
+# (shipped roughly monthly) reach the tree on the cron. If "Analyze (C/C++)" is ever made a required
+# check in branch protection, it will never report on a PR - keep it out of that set.
+#
+# Built with ACL_NO_FLIGHT=1: the door's Arrow dependency would not fit the 120-minute budget on a
+# cold cache, and a no-flight build needs no vcpkg at all. src/flight/** is therefore NOT analyzed
+# here - a second, dispatch-only configuration with the door is the follow-up if it earns its hour.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '32 4 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (C/C++)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    env:
+      GEN: ninja
+      ACL_NO_FLIGHT: 1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: cpp
+          # beyond the default suite: CWE-119/416/787 and friends, high-signal for native code
+          queries: security-extended
+
+      # no ccache, deliberately - see the header. The Makefile builds duckdb + the extension with
+      # the same extension_config.cmake the release uses, minus the door.
+      - name: Build (CodeQL traces the compiler)
+        run: make
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: cpp
+          # to disk first: the filter below runs before the upload. failure-only still uploads the
+          # debug artifacts when the analysis itself fails.
+          output: sarif-results
+          upload: failure-only
+
+      - name: Keep the unfiltered SARIF
+        # the filter is a denylist; if it ever drops something it should not, the raw results are
+        # what proves it
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: codeql-sarif-unfiltered
+          path: sarif-results/
+          retention-days: 14
+
+      # CodeQL analyzes every translation unit the build traced: the whole duckdb submodule, its
+      # third-party bundle, the in-tree extensions it built, and what FetchContent cloned. Those are
+      # upstream's to fix and they bury our own findings (mssql-extension counted 225 vendored alerts
+      # against 1 of theirs). `paths-ignore` in a CodeQL config does not apply to a compiled language
+      # analyzed with a build; filtering the SARIF is the supported way. A denylist, on purpose: a
+      # new first-party directory is never silently dropped - new vendored noise shows up and is
+      # added here. src/quack_embed/acl_embed_*.cpp are generated copies of quack's server (sync.py)
+      # and stay IN: a finding there is one we ship.
+      - name: Filter vendored code out of the results
+        uses: advanced-security/filter-sarif@v1
+        with:
+          patterns: |
+            -duckdb/**
+            -third_party/**
+            -vcpkg/**
+            -build/**
+          input: sarif-results/cpp.sarif
+          output: sarif-results/cpp.sarif
+
+      - name: Upload the filtered SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: sarif-results/cpp.sarif
+          # must match the analyze category, or the vendored alerts of an unfiltered upload would
+          # never be superseded by this one
+          category: cpp

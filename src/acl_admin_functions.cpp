@@ -1,4 +1,6 @@
+#include "duckdb/main/connection.hpp"
 #include "acl_admin_functions.hpp"
+#include "acl_door_common.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
@@ -13,18 +15,8 @@ namespace duckdb {
 namespace acl {
 namespace {
 
-//! Retrieve the policy store attached to the currently-executing admin setup function
-PolicyStore &StoreOf(ExpressionState &state) {
-	return *state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<AclScalarInfo>().store;
-}
-
 DatabaseInstance &DbOf(ExpressionState &state) {
 	return *state.GetContext().db;
-}
-
-string Trimmed(string value) {
-	StringUtil::Trim(value);
-	return value;
 }
 
 //! Top-level split: a comma inside quotes or parentheses belongs to an expression, not to the list
@@ -51,17 +43,74 @@ case_insensitive_map_t<string> ParseClaims(const string &csv) {
 }
 
 //! cols_csv items are `name` or `name=expr`; returned as (name, expr) pairs (empty expr = plain)
-vector<std::pair<string, string>> ParseColumns(const string &csv) {
+//! Strip a trailing NOT NULL / NULL declaration off a bare column item (spec 048): `id NOT NULL`
+//! declares, `ssn = NULL` masks - the '=' keeps the two unmistakable. Returns the bare name.
+string StripNullableSuffix(const string &item, case_insensitive_map_t<int8_t> &marks) {
+	auto words = StringUtil::Split(item, ' ');
+	if (words.size() >= 3 && StringUtil::CIEquals(words[words.size() - 2], "not") &&
+	    StringUtil::CIEquals(words.back(), "null")) {
+		auto name = Trimmed(item.substr(0, item.size() - words.back().size() - words[words.size() - 2].size() - 2));
+		marks[name] = 0; // declared NOT NULL
+		return name;
+	}
+	if (words.size() >= 2 && StringUtil::CIEquals(words.back(), "null")) {
+		auto name = Trimmed(item.substr(0, item.size() - words.back().size() - 1));
+		marks[name] = 1; // declared nullable, explicitly
+		return name;
+	}
+	return item;
+}
+
+vector<std::pair<string, string>> ParseColumns(const string &csv, case_insensitive_map_t<int8_t> *marks = nullptr) {
 	vector<std::pair<string, string>> columns;
+	case_insensitive_map_t<int8_t> local;
+	auto &out = marks ? *marks : local;
 	for (auto &item : SplitCsv(csv)) {
 		auto pos = item.find('='); // the first '=' separates the name; the rest is the expression
 		if (pos == string::npos) {
-			columns.emplace_back(item, string());
+			columns.emplace_back(StripNullableSuffix(item, out), string());
 		} else {
-			columns.emplace_back(Trimmed(item.substr(0, pos)), Trimmed(item.substr(pos + 1)));
+			auto name = Trimmed(item.substr(0, pos));
+			auto expr = Trimmed(item.substr(pos + 1));
+			// spec 048: a mask may promise NOT NULL explicitly - the one escape a computed key column
+			// has. Only this form: an expression of its own can end in "NOT NULL" only as "IS NOT
+			// NULL", which is kept whole, and a trailing bare NULL is the mask's value (`ssn = NULL`),
+			// never a mark.
+			auto words = StringUtil::Split(expr, ' ');
+			if (words.size() >= 3 && StringUtil::CIEquals(words[words.size() - 2], "not") &&
+			    StringUtil::CIEquals(words.back(), "null") && !StringUtil::CIEquals(words[words.size() - 3], "is")) {
+				out[name] = 0;
+				expr = Trimmed(expr.substr(0, expr.size() - words.back().size() - words[words.size() - 2].size() - 2));
+			}
+			columns.emplace_back(name, expr);
 		}
 	}
 	return columns;
+}
+
+//! The RETURNS declaration with nullability suffixes stripped into marks: `id INTEGER NOT NULL`
+//! must never reach the type parser whole (it would refuse), and the mark belongs beside the
+//! column either way.
+string StripDeclarationNullability(const string &declaration, case_insensitive_map_t<int8_t> &marks) {
+	vector<string> cleaned;
+	for (auto &item : SplitCsv(declaration)) {
+		auto words = StringUtil::Split(item, ' ');
+		if (words.size() >= 4 && StringUtil::CIEquals(words[words.size() - 2], "not") &&
+		    StringUtil::CIEquals(words.back(), "null")) {
+			marks[words[0]] = 0;
+			words.pop_back();
+			words.pop_back();
+			cleaned.push_back(StringUtil::Join(words, " "));
+		} else if (words.size() >= 3 && StringUtil::CIEquals(words.back(), "null") &&
+		           !StringUtil::CIEquals(words[words.size() - 2], "not")) {
+			marks[words[0]] = 1;
+			words.pop_back();
+			cleaned.push_back(StringUtil::Join(words, " "));
+		} else {
+			cleaned.push_back(item);
+		}
+	}
+	return StringUtil::Join(cleaned, ", ");
 }
 
 //! The old grant functions carry caps as a csv list; the catalog stores a JSON object
@@ -71,22 +120,6 @@ string CapsCsvToJson(const vector<string> &caps) {
 		items.push_back("\"" + StringUtil::Lower(cap) + "\": true");
 	}
 	return "{" + StringUtil::Join(items, ", ") + "}";
-}
-
-string RequiredArg(DataChunk &args, idx_t col, idx_t row, const char *what, const char *name) {
-	auto value = args.GetValue(col, row);
-	if (value.IsNull()) {
-		throw InvalidInputException("%s: %s must not be NULL", what, name);
-	}
-	return value.ToString();
-}
-
-string OptionalArg(DataChunk &args, idx_t col, idx_t row, const string &fallback) {
-	if (col >= args.ColumnCount()) {
-		return fallback;
-	}
-	auto value = args.GetValue(col, row);
-	return value.IsNull() ? fallback : value.ToString();
 }
 
 //===--------------------------------------------------------------------===//
@@ -236,15 +269,17 @@ void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		auto vcat = RequiredArg(args, 0, row, "acl_add_relation", "catalog");
 		auto vname = RequiredArg(args, 1, row, "acl_add_relation", "name");
 		auto phys = RequiredArg(args, 2, row, "acl_add_relation", "phys");
-		auto columns = ParseColumns(OptionalArg(args, 3, row, ""));
+		case_insensitive_map_t<int8_t> marks;
+		auto columns = ParseColumns(OptionalArg(args, 3, row, ""), &marks);
 		auto rls = OptionalArg(args, 4, row, "");
+		auto pk = OptionalArg(args, 7, row, "");
 		// renaming is not restricting: a pure rename list keeps the relation writable
 		auto form = rls.empty() && (columns.empty() || RenameOnlyColumns(columns)) ? "alias" : "subquery";
 		auto &store = StoreOf(state);
 		if (!AllowWrite(store, vcat, vname, "relation", OptionalArg(args, 6, row, ""))) {
 			continue;
 		}
-		store.CatalogAddRelation(vcat, vname, form, phys, "", rls, columns);
+		store.CatalogAddRelation(vcat, vname, form, phys, "", rls, columns, "", pk, marks);
 		SetInlineComment(store, vcat, vname, "relation", OptionalArg(args, 5, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -261,7 +296,9 @@ void AclAddViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		if (!AllowWrite(store, vcat, vname, "relation", OptionalArg(args, 5, row, ""))) {
 			continue;
 		}
-		store.CatalogAddRelation(vcat, vname, "view", "", sql, "", {}, OptionalArg(args, 3, row, ""));
+		case_insensitive_map_t<int8_t> marks;
+		auto returns = StripDeclarationNullability(OptionalArg(args, 3, row, ""), marks);
+		store.CatalogAddRelation(vcat, vname, "view", "", sql, "", {}, returns, OptionalArg(args, 6, row, ""), marks);
 		SetInlineComment(store, vcat, vname, "relation", OptionalArg(args, 4, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -417,9 +454,23 @@ void AddFunction(DataChunk &args, ExpressionState &state, Vector &result, const 
 		if (!AllowWrite(store, vcat, vname, kind, OptionalArg(args, 6, row, ""))) {
 			continue;
 		}
+		case_insensitive_map_t<int8_t> marks;
+		auto returns = StripDeclarationNullability(OptionalArg(args, 4, row, ""), marks);
 		store.CatalogAddFunction(vcat, vname, kind, form, is_alias ? definition : "", is_alias ? "" : definition,
-		                         OptionalArg(args, 3, row, ""), OptionalArg(args, 4, row, ""));
+		                         OptionalArg(args, 3, row, ""), returns, OptionalArg(args, 7, row, ""), marks);
 		SetInlineComment(store, vcat, vname, kind, OptionalArg(args, 5, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_set_key(vcat, vname, kind, pk_csv): the declared primary key of an existing object; an
+//! empty csv drops it (spec 048)
+void AclSetKeyFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_set_key", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_set_key", "name");
+		auto kind = RequiredArg(args, 2, row, "acl_set_key", "kind");
+		StoreOf(state).CatalogSetKey(vcat, vname, kind, OptionalArg(args, 3, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -664,8 +715,9 @@ void AclAlterRelationFunc(DataChunk &args, ExpressionState &state, Vector &resul
 		auto vname = RequiredArg(args, 1, row, "acl_alter_relation", "name");
 		auto field = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_relation", "property"));
 		auto value = OptionalArg(args, 3, row, "");
-		StoreOf(state).CatalogAlterRelation(
-		    vcat, vname, field, value, field == "columns" ? ParseColumns(value) : vector<std::pair<string, string>>());
+		case_insensitive_map_t<int8_t> marks;
+		auto columns = field == "columns" ? ParseColumns(value, &marks) : vector<std::pair<string, string>>();
+		StoreOf(state).CatalogAlterRelation(vcat, vname, field, value, columns, marks);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -724,7 +776,8 @@ void AclAlterGrantFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 }
 
 //! acl_alter_issuer(issuer, field, value): field is keys | jwks_uri | audiences | algs | role_claim |
-//! claim_map. `keys` and `jwks_uri` are alternatives, so setting either clears the other.
+//! claim_map | client_id | client_secret. `keys` and `jwks_uri` are alternatives, so setting either
+//! clears the other; an empty client value clears that credential (spec 064).
 void AclAlterIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto issuer = RequiredArg(args, 0, row, "acl_alter_issuer", "issuer");
@@ -868,10 +921,12 @@ void AclRevokeAdminFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_claim, claim_map_json[, jwks_uri]):
-//! register an offline JWT issuer (spec 007). keys_json is a JWKS (RSA n/e, EC x/y, oct k) or a PEM
-//! public key; jwks_uri (spec 023) names a document to read them from instead - an https URL or a file
-//! an operator refreshes. Exactly one of the two carries the keys.
+//! acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_claim, claim_map_json[, jwks_uri
+//! [, client_id[, client_secret]]]): register an offline JWT issuer (spec 007). keys_json is a JWKS
+//! (RSA n/e, EC x/y, oct k) or a PEM public key; jwks_uri (spec 023) names a document to read them
+//! from instead - an https URL or a file an operator refreshes. Exactly one of the two carries the
+//! keys. client_id (spec 064) is the app registration the node runs the password grant as and what
+//! auth discovery advertises; client_secret only for a confidential client.
 void AclDefineIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		IssuerConfig config;
@@ -890,6 +945,12 @@ void AclDefineIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result
 		}
 		config.role_claim = OptionalArg(args, 4, row, "roles");
 		config.claim_map = OptionalArg(args, 5, row, "");
+		config.client_id = OptionalArg(args, 7, row, "");
+		config.client_secret = OptionalArg(args, 8, row, "");
+		if (!config.client_secret.empty() && config.client_id.empty()) {
+			throw BinderException("acl_define_issuer: a client_secret without a client_id authenticates "
+			                      "nothing - state the client_id it belongs to");
+		}
 		StoreOf(state).DefineIssuer(std::move(config));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -904,6 +965,136 @@ void AclMapRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		auto external = RequiredArg(args, 2, row, "acl_map_role", "external value");
 		auto role = RequiredArg(args, 3, row, "acl_map_role", "role");
 		StoreOf(state).MapRole(issuer, source, external, role);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_session_open(token): verify a token once and mint an opaque handle for it (spec 040). NULL
+//! when it does not verify - a door refuses rather than learning why.
+void AclSessionOpenFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto token = RequiredArg(args, 0, row, "acl_session_open", "token");
+		auto handle = StoreOf(state).SessionOpen(token);
+		if (handle.empty()) {
+			result.SetValue(row, Value());
+			continue;
+		}
+		result.SetValue(row, Value(handle));
+	}
+}
+
+//! acl_session_sql(handle, sql): the statement to run, with the session's prefix in front of it.
+//! NULL when the session is not usable, which is the whole of a door's decision.
+void AclSessionSqlFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto handle = RequiredArg(args, 0, row, "acl_session_sql", "handle");
+		auto sql = RequiredArg(args, 1, row, "acl_session_sql", "sql");
+		// SessionSql, not SessionPrincipal: the latter erases a dead session on read, which would
+		// leave the follow-up acl_session_reason nothing to report but "unknown" (spec 054). SessionSql
+		// composes for a live session (bumping it) and returns "" for a dead one without erasing it.
+		// the trace rides from the caller's own settings (spec 069): a gateway sets them per request
+		string correlation_id, traceparent;
+		TraceFromContext(state.GetContext(), correlation_id, traceparent);
+		auto composed = StoreOf(state).SessionSql(handle, sql, correlation_id, traceparent);
+		result.SetValue(row, composed.empty() ? Value() : Value(composed));
+	}
+}
+
+//! acl_session_reason(handle): why a handle is not usable (spec 054) - "live", "expired", "idle" or
+//! "unknown". A client that got NULL from acl_session_sql calls this to tell "get a fresh token"
+//! (expired) from "reopen with the same one" (idle/unknown). Read-only, so the reason survives the
+//! NULL that prompted the call. The door's, not a principal's - denied like the rest of this surface.
+void AclSessionReasonFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto handle = RequiredArg(args, 0, row, "acl_session_reason", "handle");
+		result.SetValue(row, Value(StoreOf(state).SessionReason(handle)));
+	}
+}
+
+//! acl_session_sweep(): drop every session that has expired or gone idle, and say how many went
+//! (spec 044). The same pass SessionOpen runs by itself; here it is an operator's tool, and what makes
+//! sweeping observable to a test rather than inferred from behaviour.
+void AclSessionSweepFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto swept = Value::BIGINT(NumericCast<int64_t>(StoreOf(state).SessionSweep()));
+	result.Reference(swept, count_t(args.size()));
+}
+
+//! acl_session_count(): how many sessions are live. Denied to a principal like the rest of this
+//! surface - a client may not learn how many others there are.
+void AclSessionCountFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto live = Value::BIGINT(NumericCast<int64_t>(StoreOf(state).SessionCount()));
+	result.Reference(live, count_t(args.size()));
+}
+
+//! acl_drain(): stop seating new clients (spec 066) - every establishment path refuses while the
+//! flag is set, established sessions keep working. Sweeps before counting: the automatic sweep rode
+//! SessionOpen (spec 044, "the operation that grows the map pays to clean it"), and drain turns
+//! that operation off - so the drain surface pays instead, and the count it returns is what really
+//! remains, not residue. Idempotent, which makes repeating it the operator's watch loop. Denied to
+//! a principal like the rest of this surface.
+void AclDrainFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &store = StoreOf(state);
+	store.SetDraining(true);
+	store.SessionSweep();
+	auto live = Value::BIGINT(NumericCast<int64_t>(store.SessionCount()));
+	result.Reference(live, count_t(args.size()));
+}
+
+//! acl_resume(): leave drain; true when the node was draining, false when it already served.
+void AclResumeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto was_draining = Value::BOOLEAN(StoreOf(state).SetDraining(false));
+	result.Reference(was_draining, count_t(args.size()));
+}
+
+//! acl_drain_status(): 'draining' | 'serving' - what an ops probe reads.
+void AclDrainStatusFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto status = Value(StoreOf(state).Draining() ? "draining" : "serving");
+	result.Reference(status, count_t(args.size()));
+}
+
+//! acl_sessions(): the live sessions on this node, as a JSON array - the admin/front ops surface
+//! (spec 050). Never the handle (a bearer credential): each session shows its non-secret ops id, its
+//! principal (subject + roles), how long it has been idle, and its token exp. Denied to a principal
+//! like the rest of this surface - a client may not learn who else is connected.
+void AclSessionsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto sessions = StoreOf(state).SessionList();
+	string json = "[";
+	for (idx_t i = 0; i < sessions.size(); i++) {
+		auto &session = sessions[i];
+		string roles = "[";
+		for (idx_t r = 0; r < session.roles.size(); r++) {
+			roles += (r ? "," : "") + JsonQuote(session.roles[r]);
+		}
+		roles += "]";
+		json += (i ? "," : "");
+		// JsonQuote (acl_door_common), not a local escaper: a subject or role comes from a token, and
+		// a control byte in it emitted raw made this an invalid document (the 2026-09-03 review)
+		json += "{\"id\":" + JsonQuote(session.id) + ",\"subject\":" + JsonQuote(session.subject) +
+		        ",\"roles\":" + roles + ",\"idle_seconds\":" + std::to_string(session.idle_seconds) +
+		        ",\"expires_at\":" + std::to_string(session.expires_at) + "}";
+	}
+	json += "]";
+	result.Reference(Value(json), count_t(args.size()));
+}
+
+//! acl_session_kill(id): end the session with this ops id (from acl_sessions()), true if one was
+//! found. The operator's hand on a stuck connection; over SessionClose, and by the non-secret id, so
+//! nothing here handles a credential. Denied to a principal.
+void AclSessionKillFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto id = RequiredArg(args, 0, row, "acl_session_kill", "session id");
+		result.SetValue(row, Value::BOOLEAN(StoreOf(state).SessionKill(id)));
+	}
+}
+
+//! acl_session_close(handle): end it. Idempotent, so a door may retry a disconnect.
+void AclSessionCloseFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		StoreOf(state).SessionClose(RequiredArg(args, 0, row, "acl_session_close", "handle"));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -949,10 +1140,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	// register an admin setup function, attaching the shared store via its function_info
 	auto register_admin = [&](const string &name, vector<LogicalType> arguments, scalar_function_t fn) {
 		ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::BOOLEAN, fn);
-		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-		// an admin function refuses at execution time - a bad predicate, a name in use, a missing
-		// target - and an unmarked function turns those refusals into INTERNAL errors
-		function.SetFallible();
+		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);
 	};
 
@@ -961,8 +1149,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		ScalarFunctionSet set((Identifier(name)));
 		for (auto &arguments : signatures) {
 			ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::BOOLEAN, fn);
-			function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-			function.SetFallible();
+			MarkAclScalar(function, store);
 			set.AddFunction(function);
 		}
 		loader.RegisterFunction(set);
@@ -976,9 +1163,13 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	// the trailing argument of the object writers is the write mode of spec 013 (create/replace/skip);
 	// omitted, it is the legacy upsert every ADD form promises
 	register_admin_set("acl_create_catalog", {{v}, {v, v}, {v, v, v}}, AclCreateCatalogFunc);
-	register_admin_set("acl_add_relation", {{v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
+	register_admin_set("acl_set_key", {{v, v, v}, {v, v, v, v}}, AclSetKeyFunc);
+	register_admin_set("acl_add_relation",
+	                   {{v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v}},
 	                   AclAddRelationFunc);
-	register_admin_set("acl_add_view", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}}, AclAddViewFunc);
+	register_admin_set("acl_add_view",
+	                   {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
+	                   AclAddViewFunc);
 	register_admin_set("acl_add_schema_alias", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclAddSchemaAliasFunc);
 	register_admin_set("acl_expand_schema", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclExpandSchemaFunc);
 	register_admin_set("acl_grant_schema", {{v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v, b}}, AclGrantSchemaFunc);
@@ -987,9 +1178,10 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_register_view", {v, v, v}, AclRegisterViewFunc);
 	register_admin("acl_revoke_schema", {v, v, v}, AclRevokeSchemaFunc);
 	register_admin_set("acl_rematerialize_schema_caps", {{v}, {v, v}}, AclRematerializeSchemaCapsFunc);
-	register_admin_set("acl_add_table_function",
-	                   {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
-	                   AclAddTableFunctionFunc);
+	register_admin_set(
+	    "acl_add_table_function",
+	    {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v}},
+	    AclAddTableFunctionFunc);
 	register_admin_set("acl_add_table_function_alias", {{v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
 	                   AclAddTableFunctionAliasFunc);
 	register_admin_set("acl_add_scalar", {{v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v}, {v, v, v, v, v, v, v}},
@@ -1027,8 +1219,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	auto register_refresh = [&](vector<LogicalType> arguments) {
 		ScalarFunction function(Identifier("acl_refresh_schema"), std::move(arguments), LogicalType::BIGINT,
 		                        AclRefreshSchemaFunc);
-		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-		function.SetFallible();
+		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);
 	};
 	register_refresh({v});
@@ -1037,8 +1228,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	auto register_refresh_objects = [&](vector<LogicalType> arguments) {
 		ScalarFunction function(Identifier("acl_refresh_schema_objects"), std::move(arguments), LogicalType::BIGINT,
 		                        AclRefreshSchemaObjectsFunc);
-		function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
-		function.SetFallible();
+		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);
 	};
 	register_refresh_objects({v, v});
@@ -1052,10 +1242,43 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_grant_scalar_alias", {v, v, v}, AclGrantScalarAliasFunc);
 	register_admin("acl_deny_function", {v}, AclDenyFunctionFunc);
 	register_admin("acl_allow_function", {v}, AclAllowFunctionFunc);
+	// the session contract both doors stand on (spec 040): open once, prefix every statement, close
+	auto register_session_text = [&](const string &name, vector<LogicalType> arguments, scalar_function_t fn) {
+		ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::VARCHAR, fn);
+		MarkAclScalar(function, store);
+		loader.RegisterFunction(function);
+	};
+	// the quack door's own four (serve/stop and quack's two callbacks) are registered by
+	// src/quack_embed/acl_quack_door.cpp, beside the server they drive
+	register_session_text("acl_session_open", {v}, AclSessionOpenFunc);
+	register_session_text("acl_sessions", {}, AclSessionsFunc); // the ops listing (spec 050), never the handle
+	register_session_text("acl_session_sql", {v, v}, AclSessionSqlFunc);
+	register_session_text("acl_session_reason", {v}, AclSessionReasonFunc); // spec 054: why a NULL
+	register_admin("acl_session_close", {v}, AclSessionCloseFunc);
+	// the bound on all of the above (spec 044): sweeping and counting, both the door's, never a client's
+	auto register_session_bigint = [&](const string &name, scalar_function_t fn) {
+		ScalarFunction function(Identifier(name), {}, LogicalType::BIGINT, fn);
+		MarkAclScalar(function, store);
+		loader.RegisterFunction(function);
+	};
+	register_session_bigint("acl_session_sweep", AclSessionSweepFunc);
+	register_session_bigint("acl_session_count", AclSessionCountFunc);
+	// drain (spec 066): the operator's graceful-stop surface, denied to a principal like the rest
+	register_session_bigint("acl_drain", AclDrainFunc);
+	register_admin("acl_resume", {}, AclResumeFunc);
+	register_session_text("acl_drain_status", {}, AclDrainStatusFunc);
+	{
+		ScalarFunction kill(Identifier("acl_session_kill"), {v}, LogicalType::BOOLEAN, AclSessionKillFunc);
+		MarkAclScalar(kill, store);
+		loader.RegisterFunction(kill);
+	}
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);
 	register_admin_set("acl_define_role", {{v, v}, {v, v, v}}, AclDefineRoleFunc);
 	// offline JWT verification (spec 007)
-	register_admin_set("acl_define_issuer", {{v, v, v, v, v, v}, {v, v, v, v, v, v, v}}, AclDefineIssuerFunc);
+	register_admin_set(
+	    "acl_define_issuer",
+	    {{v, v, v, v, v, v}, {v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v, v}},
+	    AclDefineIssuerFunc);
 	register_admin("acl_map_role", {v, v, v, v}, AclMapRoleFunc);
 	// ALTER of existing objects (spec 009)
 	register_admin("acl_alter_relation", {v, v, v, v}, AclAlterRelationFunc);

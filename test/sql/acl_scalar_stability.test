@@ -1,0 +1,28 @@
+# name: test/sql/acl_scalar_stability.test
+# description: every acl_* scalar is volatile - none is folded at plan time
+# group: [acl]
+
+require acl
+
+# The optimizer evaluates a foldable call while it plans the statement, and the executor may evaluate
+# it again: for a function that changes per-instance state (serve, stop, open, close, drain, every
+# policy writer) the second call sees the world the first one changed. Found through
+# `acl_quack_stop(uri) LIKE '%session(s) closed%'` - the door was stopped by the first call and the
+# second reported that nobody served the uri. The readers are volatile too: a session count folded
+# at PREPARE would be frozen at that moment. This lists the offenders, so a future function
+# registered without MarkAclScalar fails here by name.
+
+query I
+SELECT function_name
+FROM duckdb_functions()
+WHERE function_type = 'scalar' AND function_name LIKE 'acl\_%' ESCAPE '\' AND stability <> 'VOLATILE'
+ORDER BY 1;
+----
+
+# and the listing does see them, so an empty result above means volatile, not absent
+query I
+SELECT count(DISTINCT function_name) > 40
+FROM duckdb_functions()
+WHERE function_type = 'scalar' AND function_name LIKE 'acl\_%' ESCAPE '\';
+----
+true

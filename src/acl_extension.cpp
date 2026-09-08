@@ -1,15 +1,26 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "acl_extension.hpp"
+#ifdef ACL_QUACK_EMBED_ENABLED
+#include "acl_quack_embed.hpp"
+#endif
+#include "acl_oidc_secret.hpp"
+
+#ifdef ACL_FLIGHT_ENABLED
+#include "acl_flight_door.hpp"
+#endif
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/settings.hpp"
 
 #include "acl_admin_functions.hpp"
+#include "acl_audit_pipeline.hpp"
 #include "acl_introspection.hpp"
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
 #include "duckdb/common/helper.hpp"
+
+#include <chrono>
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -65,10 +76,122 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          "enabled - the gateway's own escape hatch (spec 009)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_jwt_clock_skew", "acl: allowed clock skew in seconds for JWT exp/nbf checks",
-	                          LogicalType::BIGINT, Value::BIGINT(60));
+	                          LogicalType::BIGINT, Value::BIGINT(60), nullptr, SetScope::GLOBAL);
+	// the audit (spec 069): the instance's level, the pipeline's bounds, the base file sink, the node's
+	// name on every event, the Prometheus rendering on the embedded listener - all read through the
+	// instance by the audit thread and the emitting seams, so GLOBAL
+	config.AddExtensionOption(
+	    "acl_audit_level",
+	    "acl: what is recorded - off, denied (refusals only), decisions (every "
+	    "statement/admin/ingest decision), all (plus the session and door lifecycle)",
+	    LogicalType::VARCHAR, Value("decisions"),
+	    [](ClientContext &, SetScope, Value &value) {
+		    // refused at SET time: a level nobody meant must not quietly become `decisions`
+		    acl::AuditLevel parsed;
+		    if (value.IsNull() || !acl::ParseAuditLevel(value.ToString(), parsed)) {
+			    throw InvalidInputException("acl_audit_level: unknown level \"%s\" (off, denied, decisions, all)",
+			                                value.IsNull() ? "NULL" : value.ToString());
+		    }
+	    },
+	    SetScope::GLOBAL);
+	config.AddExtensionOption("acl_audit_buffer",
+	                          "acl: how many of the newest audit events acl_audit_events() holds (0 = none)",
+	                          LogicalType::BIGINT, Value::BIGINT(10000), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_audit_queue",
+	                          "acl: events waiting for the audit thread before new ones are dropped and counted",
+	                          LogicalType::BIGINT, Value::BIGINT(10000), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_audit_sink",
+	                          "acl: a path or URI the audit appends one JSON line per event to ('' = none); read "
+	                          "through duckdb's filesystem, so an object store rides httpfs",
+	                          LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);
+	// spec 070: the Flight door streams. What a statement may hand out (0 = unlimited), and how long
+	// an open result stream may sit unpulled before the session's next statement supersedes it.
+	config.AddExtensionOption("acl_max_result_rows",
+	                          "acl: rows a statement may hand out through the Flight door (0 = unlimited); "
+	                          "exactly that many go out, then the stream ends in a refusal",
+	                          LogicalType::BIGINT, Value::BIGINT(0), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_flight_stream_idle",
+	                          "acl: seconds an open Flight result stream may sit unpulled before the session's "
+	                          "next statement ends it and runs (0 = never: the statement waits for the stream)",
+	                          LogicalType::BIGINT, Value::BIGINT(30), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_audit_denials_per_second",
+	                          "acl: refusals RECORDED per second per source (a session, a principal, a door); "
+	                          "the rest are counted only, as dropped where=rate_limit (0 = unlimited)",
+	                          LogicalType::BIGINT, Value::BIGINT(100), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_node_id",
+	                          "acl: the node's name on every audit event and metric ('' = <hostname>:<pid>)",
+	                          LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_metrics_endpoint",
+	                          "acl: serve GET /metrics (Prometheus text) on the embedded quack listener",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
+	// the two client-local trace settings (spec 069): session scope, and the one pair a principal may
+	// SET on a session of its own (spec 068's allowlist) - a door composes them into the prefix
+	config.AddExtensionOption("acl_correlation_id",
+	                          "acl: the correlation id the audit events of this session's statements carry",
+	                          LogicalType::VARCHAR, Value(""));
+	config.AddExtensionOption("acl_traceparent",
+	                          "acl: the W3C traceparent the audit events of this session's statements carry",
+	                          LogicalType::VARCHAR, Value(""));
 	config.AddExtensionOption("acl_jwks_refresh_interval",
 	                          "acl: seconds a fetched JWKS is used before it is read again (spec 023)",
 	                          LogicalType::BIGINT, Value::BIGINT(300), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "acl_session_idle_timeout",
+	    "acl: seconds a session may go unused before it is dead, whatever its "
+	    "token's exp says; 0 disables the rule (spec 044) - refused while "
+	    "acl_session_token_binding='connect', where idle is the only automatic reaper (spec 059)",
+	    LogicalType::BIGINT, Value::BIGINT(900),
+	    [](ClientContext &context, SetScope, Value &parameter) {
+		    if (!parameter.IsNull() && parameter.GetValue<int64_t>() == 0) {
+			    Value binding;
+			    auto have = context.TryGetCurrentSetting("acl_session_token_binding", binding);
+			    auto value = have && !binding.IsNull() ? StringUtil::Lower(binding.ToString()) : string("connect");
+			    if (value == "connect") {
+				    throw InvalidInputException(
+				        "acl_session_idle_timeout=0 would leave no automatic session reaper under "
+				        "acl_session_token_binding='connect' - set the binding to 'every_use' first (spec 059)");
+			    }
+		    }
+	    },
+	    SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "acl_session_token_binding",
+	    "acl: when the token's exp is judged - 'connect' (default) gates only session establishment, "
+	    "so a session opened with a fresh token keeps working until idle/close/kill; 'every_use' "
+	    "re-judges exp on every use (spec 059)",
+	    LogicalType::VARCHAR, Value("connect"),
+	    [](ClientContext &context, SetScope scope, Value &parameter) {
+		    if (scope != SetScope::GLOBAL) {
+			    // a session-scoped value would validate, show in current_setting() and be ignored by
+			    // the judgment, which reads the global - refuse the false comfort outright
+			    throw InvalidInputException("acl_session_token_binding is global - use SET GLOBAL");
+		    }
+		    auto value = StringUtil::Lower(parameter.ToString());
+		    if (value != "connect" && value != "every_use") {
+			    throw InvalidInputException("acl_session_token_binding accepts 'connect' or 'every_use', not '%s'",
+			                                parameter.ToString());
+		    }
+		    if (value == "connect") {
+			    // under 'connect' the idle rule is the ONLY automatic reaper; with it disabled every
+			    // abandoned session would pin acl_max_sessions forever (spec 059)
+			    Value idle;
+			    if (context.TryGetCurrentSetting("acl_session_idle_timeout", idle) && !idle.IsNull() &&
+			        idle.GetValue<int64_t>() == 0) {
+				    throw InvalidInputException("acl_session_token_binding='connect' needs a live idle reaper: "
+				                                "set acl_session_idle_timeout > 0 first (it is currently 0/disabled)");
+			    }
+		    }
+	    },
+	    SetScope::GLOBAL);
+	config.AddExtensionOption("acl_max_sessions",
+	                          "acl: how many sessions may live at once; at the cap a new one is refused "
+	                          "rather than an old one evicted, and 0 means unlimited (spec 044). Each "
+	                          "session holds a duckdb connection (spec 050), so this bounds held "
+	                          "connections too - 1000 is a deliberately conservative default",
+	                          LogicalType::BIGINT, Value::BIGINT(1000), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_max_ingest_rows",
+	                          "acl: maximum rows one Flight ingest may stream (0 = unlimited, spec 049)",
+	                          LogicalType::BIGINT, Value::BIGINT(0), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_jwks_max_stale",
 	                          "acl: seconds a JWKS that can no longer be read may still be used; past "
 	                          "that a token is refused rather than verified against keys of unknown age",
@@ -89,8 +212,47 @@ void LoadInternal(ExtensionLoader &loader) {
 
 	// one policy store per database instance, shared by the parser override and the admin functions
 	auto store = make_shared_ptr<acl::PolicyStore>();
+	acl::RegisterQuackOidcProvider(loader); // spec 061: CREATE SECRET (TYPE quack, PROVIDER oidc, ...)
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
+#ifdef ACL_QUACK_EMBED_ENABLED
+	// The embedded quack door (spec 063): the acl_quack_* server settings and the acl_quack_scan_data
+	// drain the server INSERTs through, then the door itself - serve/stop and the two callbacks the
+	// server calls (src/quack_embed/acl_quack_door.cpp, the shape of the Flight door below). Present in
+	// every non-WASM build unless ACL_NO_QUACK_EMBED; without it there is no acl_quack_* function at all.
+	acl::RegisterAclQuackEmbed(loader);
+	acl::RegisterAclQuackDoor(loader, store);
+#endif
+#ifdef ACL_FLIGHT_ENABLED
+	// The Flight SQL door (spec 045), present only in an ACL_FLIGHT=1 build. Registered here so the
+	// seam is real rather than declared: if Arrow ever fails to link, it fails at build time and not
+	// the first time somebody opens a door.
+	acl::RegisterAclFlightDoor(loader, store);
+#endif
+	// The audit and observability hooks (spec 069): one registry per instance, reached through the
+	// object cache so an extension loaded before or after us finds the same one; attached to the store,
+	// which emits the session events, and registered with its SQL surface.
+	auto hooks = db.GetObjectCache().GetOrCreate<acl::AuditHooks>(acl::AuditHooks::ObjectType());
+	auto pipeline = make_shared_ptr<acl::AuditPipeline>(hooks);
+	pipeline->Attach(db);
+	store->audit = pipeline;
+	acl::RegisterAclAudit(loader, store, pipeline);
+	// the node's own gauges (spec 069): how long it has been up, and which build it is
+	{
+		string version;
+#ifdef EXT_VERSION_ACL
+		version = EXT_VERSION_ACL;
+#endif
+		auto loaded = std::chrono::steady_clock::now();
+		hooks->Gauges().Register("acl.node.uptime", {}, "s", "seconds since the extension loaded", [loaded]() {
+			return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - loaded).count();
+		});
+		hooks->Gauges().Register("acl.node.info", {{"version", version.empty() ? "dev" : version}}, "1",
+		                         "always 1; the build in the attributes", []() { return int64_t(1); });
+	}
+	// the store's own handle in the cache (weak): what PolicyStore::Of(db) answers to code that holds a
+	// connection and nothing else - the embedded quack server's drain thread (spec 069)
+	db.GetObjectCache().GetOrCreate<acl::PolicyStoreHandle>(acl::PolicyStoreHandle::ObjectType())->store = store;
 	acl::RegisterAclAdminFunctions(loader, std::move(store));
 }
 

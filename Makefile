@@ -7,18 +7,40 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # Local integration-test environment config (specs/005); see .env.example
 -include .env
 
-# Integration builds (ACL_INTEGRATION=1) add the source scanners. Their build dependencies come from
+# Integration builds (ACL_INTEGRATION=1) add the source scanners, and ACL_QUACK=1 adds the quack
+# extension the door is tested against. Their build dependencies come from
 # vcpkg, like every duckdb extension: the merged-manifest step collects the vcpkg.json of each loaded
 # extension (libpq/openssl from duckdb-postgres, roaring from ducklake, ...), so nothing is listed
 # here by hand. Bootstrap once with `make vcpkg-setup`, or point VCPKG_TOOLCHAIN_PATH at an existing
 # vcpkg checkout.
-ifdef ACL_INTEGRATION
+#
+# The Flight SQL door is part of the extension, not an option - it is what a client with an ADBC or
+# JDBC driver connects to, and it ships through community-extensions like any other feature. So Arrow
+# is an ordinary dependency and every build installs it, the way `airport` does.
+#
+# ACL_NO_FLIGHT=1 is the way out, for a fast local loop: it drops the door *and* the vcpkg step with
+# it, since nothing else in a plain build needs vcpkg.
+ifeq ($(ACL_NO_FLIGHT),)
+ACL_NEEDS_VCPKG := 1
+endif
+ifneq ($(or $(ACL_INTEGRATION),$(ACL_QUACK)),)
+ACL_NEEDS_VCPKG := 1
+endif
+ifneq ($(ACL_NEEDS_VCPKG),)
 USE_MERGED_VCPKG_MANIFEST := 1
 VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
 GOALS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)
+# Only the goals that actually configure cmake need a toolchain, and naming those is a short, closed
+# list. The guard used to name the exceptions instead, and that list was wrong twice in one day: the
+# distribution workflow runs `make set_duckdb_version` in its checkout phase and `make configure_ci`
+# (a documented no-op in extension-ci-tools) in its setup phase, both before any vcpkg exists - and on
+# linux one never exists beside the source at all, because the build runs inside a container carrying
+# its own. An $(error) at parse time failed the build on both. What needs vcpkg is ours to enumerate;
+# what does not is somebody else's list, and it grows without telling us (specs/045).
+ACL_VCPKG_GOALS := all release debug reldebug relassert wasm_mvp wasm_eh wasm_threads
 ifeq ($(wildcard $(VCPKG_TOOLCHAIN_PATH)),)
-ifneq ($(filter-out vcpkg-setup docker-up docker-down docker-status,$(GOALS)),)
-$(error ACL_INTEGRATION build needs vcpkg: run 'make vcpkg-setup' first, or set VCPKG_TOOLCHAIN_PATH)
+ifneq ($(filter $(ACL_VCPKG_GOALS),$(GOALS)),)
+$(error this build needs vcpkg: run 'make vcpkg-setup' first, or set VCPKG_TOOLCHAIN_PATH)
 endif
 endif
 endif
@@ -32,11 +54,31 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # build (GEN=ninja make test-cpp).
 
 TEST_CPP_SOURCES := $(wildcard test/cpp/test_*.cpp)
-TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,build/test/%,$(TEST_CPP_SOURCES))
 
-# match the release archives (-O2 -DNDEBUG), so D_ASSERT is compiled out of the test TUs too
+# match the release archives (-O2 -DNDEBUG), so D_ASSERT is compiled out of the test TUs too.
+# SANITIZE=1 (release plan 3.1) builds them under ASan+UBSan instead - -O1 with frame pointers, no
+# -DNDEBUG so the asserts ARE the checks, first report fatal - into their own directory so the two
+# flavours never share a stale binary. The binaries link the uninstrumented release libduckdb, which
+# is fine: the instrumented executable puts the sanitizer runtime first. LSan stays off: libduckdb's
+# static initialisers hold allocations for the process lifetime and would report as leaks.
+# Linux only in practice: on current macOS (Darwin 25.6 observed, 25.5 in mssql-extension's notes)
+# an ASan-instrumented binary hangs at process init before main - so CI's linux job is where this
+# runs, and a dev box on macOS gets the plain flavour.
+ifeq ($(SANITIZE),1)
+TEST_CPP_FLAGS := -std=c++17 -g -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all -pthread
+TEST_CPP_DIR := build/test-sanitized
+TEST_CPP_RUN_ENV := ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+else
 TEST_CPP_FLAGS := -std=c++17 -O2 -DNDEBUG -pthread
-TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include
+TEST_CPP_DIR := build/test
+TEST_CPP_RUN_ENV :=
+endif
+# after the flavour is chosen: `:=` expands TEST_CPP_DIR here and now
+TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,$(TEST_CPP_DIR)/%,$(TEST_CPP_SOURCES))
+# `src/include` so a test can reach a seam the extension exposes to itself - spec 046's catalog
+# statement composition is a free function, and checking the text it produces needs its header.
+TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include \
+	-I duckdb/third_party/httplib -I duckdb/third_party/yyjson/include
 
 # Link against the shared libduckdb, exactly like duckdb's own unittest: it already carries the
 # statically linked extensions (acl, core_functions, ... and the scanners of an integration build)
@@ -48,9 +90,24 @@ TEST_CPP_DUCKDB_LIB := build/release/src/libduckdb.so
 endif
 TEST_CPP_LINK = -L build/release/src -lduckdb -Wl,-rpath,$(abspath build/release/src)
 
-build/test/%: test/cpp/%.cpp test/cpp/acl_test_util.hpp $(TEST_CPP_DUCKDB_LIB)
-	@mkdir -p build/test
-	$(CXX) $(TEST_CPP_FLAGS) $(TEST_CPP_INCLUDES) $< $(TEST_CPP_LINK) -o $@
+# A test may need one of the extension's own translation units compiled into it. The extension's
+# internals are not exported from libduckdb, and widening their visibility so a test could reach them
+# would be the wrong way round - the test links the source instead. (spec 046)
+$(TEST_CPP_DIR)/test_acl_catalog_rpc: src/acl_catalog_rpc.cpp
+$(TEST_CPP_DIR)/test_acl_catalog_rpc: TEST_CPP_EXTRA := src/acl_catalog_rpc.cpp
+
+# the OIDC core (spec 060) is duckdb-free by design, so its test compiles the module plus the
+# bundled yyjson directly - the fake IdP inside the test is the bundled httplib's own Server
+$(TEST_CPP_DIR)/test_acl_oidc: src/oidc/acl_oidc.cpp src/include/acl_oidc.hpp
+$(TEST_CPP_DIR)/test_acl_oidc: TEST_CPP_EXTRA := src/oidc/acl_oidc.cpp duckdb/third_party/yyjson/yyjson.cpp
+
+# the embedded-door test drives discovery through the core's HttpGet (spec 063)
+$(TEST_CPP_DIR)/test_acl_quack_embed: src/oidc/acl_oidc.cpp src/include/acl_oidc.hpp
+$(TEST_CPP_DIR)/test_acl_quack_embed: TEST_CPP_EXTRA := src/oidc/acl_oidc.cpp duckdb/third_party/yyjson/yyjson.cpp
+
+$(TEST_CPP_DIR)/%: test/cpp/%.cpp test/cpp/acl_test_util.hpp $(TEST_CPP_DUCKDB_LIB)
+	@mkdir -p $(TEST_CPP_DIR)
+	$(CXX) $(TEST_CPP_FLAGS) $(TEST_CPP_INCLUDES) $< $(TEST_CPP_EXTRA) $(TEST_CPP_LINK) -o $@
 
 # Deliberately NOT depending on `release`: in the distribution CI the build runs inside a docker
 # container and the tests on the host, so re-triggering cmake against the container-made cache fails
@@ -63,18 +120,28 @@ test-cpp:
 
 test-cpp-run: $(TEST_CPP_BINS)
 	@test -n "$(TEST_CPP_BINS)" || { echo "test-cpp: no test/cpp/test_*.cpp sources found" >&2; exit 1; }
-	@fail=0; \
+	@fail=0; out=$$(mktemp); \
 	for b in $(TEST_CPP_BINS); do \
-		if $$b >$$b.out 2>&1; then echo "  PASS $$(basename $$b)"; \
-		else echo "  FAIL $$(basename $$b)"; cat $$b.out; fail=1; fi; \
+		if $(TEST_CPP_RUN_ENV) $$b >$$out 2>&1; then echo "  PASS $$(basename $$b)"; \
+		else echo "  FAIL $$(basename $$b)"; cat $$out; fail=1; fi; \
 	done; \
+	rm -f $$out; \
 	exit $$fail
 
 # CI runs `make test_release` (extension-ci-tools); chain the C++ tests into it on the platforms
-# that can build and run them (not Windows, not wasm cross-builds)
+# that can build and run them (not Windows, not wasm cross-builds).
+#
+# On linux the distribution build runs `make test_release` twice against the same mounted tree: once
+# inside the container that built it, then again on the host. The second run is theirs to make - it
+# exercises the extension outside the container - but our C++ binaries cannot join it. They were
+# linked in the container with an rpath naming a container path, and the tree they would have to
+# relink into belongs to root. So the container's run is the one that counts, and LINUX_CI_IN_DOCKER=0
+# (which is set only for that host pass) means step aside.
 ifneq ($(OS),Windows_NT)
 ifeq ($(findstring wasm,$(DUCKDB_PLATFORM)),)
+ifneq ($(LINUX_CI_IN_DOCKER),0)
 test_release: test-cpp
+endif
 endif
 endif
 
@@ -104,7 +171,7 @@ ACL_MSSQL_DB ?= acltest
 # directory-derived project name and adopt an unrelated project's containers (spec 033)
 DOCKER_COMPOSE := docker compose -p duckdb-acl -f docker/docker-compose.yml
 
-.PHONY: docker-up docker-down docker-status test-integration
+.PHONY: docker-up docker-down docker-status test-integration test-e2e
 # --wait would treat the one-shot sqlserver-init container as a failure; wait on the servers, then
 # run the init separately (it only starts once sqlserver is healthy anyway)
 docker-up:
@@ -127,6 +194,67 @@ test-integration:
 	ACL_MYSQL_DSN="host=$(ACL_MYSQL_HOST) port=$(ACL_MYSQL_PORT) user=$(ACL_MYSQL_USER) passwd=$(ACL_MYSQL_PASS) db=$(ACL_MYSQL_DB)" \
 	ACL_MSSQL_DSN="Server=$(ACL_MSSQL_HOST),$(ACL_MSSQL_PORT);Database=$(ACL_MSSQL_DB);User Id=$(ACL_MSSQL_USER);Password=$(ACL_MSSQL_PASS)" \
 	build/release/test/unittest "test/sql/integration/*"
+
+# The Flight SQL door's dependency check (specs/045): does the built extension carry everything it
+# needs, or did it pick something up from the machine? Run it after a build with the door in (the
+# default; ACL_NO_FLIGHT=1 leaves it out) - it is the only thing standing between us and an artifact
+# that works here and nowhere else.
+.PHONY: check-flight-deps test-flight
+check-flight-deps:
+	./scripts/check_flight_deps.sh
+
+# The Flight SQL door end to end (specs/045): one duckdb serves, a third-party pyarrow client reads its
+# own slice through it. Needs a build with the door in (GEN=ninja make, without ACL_NO_FLIGHT=1) and
+# pyarrow; skips itself, saying why, when either is missing.
+test-flight:
+	test/e2e/flight/run.sh
+	test/e2e/flight/adbc.sh
+	test/e2e/flight/tls.sh
+	test/e2e/flight/auth.sh
+	test/e2e/flight/drain.sh
+	test/e2e/flight/stream.sh
+
+# --- libFuzzer over the OIDC core's parsers (release plan 3.6) -----------------------------------
+# The bytes an IdP or a door answers are the node's pre-authentication network input. The module
+# takes nothing from duckdb but its bundled httplib and yyjson (spec 060), so the target is one TU
+# plus the bundled yyjson and test/fuzz/fuzz_oidc_parse.cpp, under -fsanitize=fuzzer,address,undefined
+# - clang only. It links the built libduckdb for the few helpers httplib itself reaches for (re2);
+# like the sanitized C++ tests, the instrumented executable puts the sanitizer runtime first.
+# FUZZ_SECONDS bounds the run; the seed corpus in test/fuzz/corpus grows in place. CI runs it on
+# every PR after the build (the linux job).
+FUZZ_SECONDS ?= 30
+.PHONY: fuzz-oidc
+fuzz-oidc:
+	@test -f $(TEST_CPP_DUCKDB_LIB) || { \
+		echo "fuzz-oidc: $(TEST_CPP_DUCKDB_LIB) missing - run 'GEN=ninja make' first" >&2; exit 1; }
+	@mkdir -p build/fuzz
+	$(CXX) -std=c++17 -g -O1 -pthread -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
+		-I src/include -I duckdb/src/include -I duckdb/third_party/fmt/include \
+		-I duckdb/third_party/httplib -I duckdb/third_party/yyjson/include \
+		test/fuzz/fuzz_oidc_parse.cpp src/oidc/acl_oidc.cpp duckdb/third_party/yyjson/yyjson.cpp \
+		$(TEST_CPP_LINK) -o build/fuzz/fuzz_oidc_parse
+	build/fuzz/fuzz_oidc_parse -max_total_time=$(FUZZ_SECONDS) -max_len=4096 -print_final_stats=1 test/fuzz/corpus
+
+# The live-validation node (spec 057): one seeded server for real client tools, held until Ctrl+C.
+# The VS Code tasks in .vscode/tasks.json run the same commands.
+.PHONY: serve-flight serve-quack serve-live
+serve-flight:
+	test/live/serve.sh flight
+serve-quack:
+	test/live/serve.sh quack
+serve-live:
+	test/live/serve.sh all
+
+# The door end-to-end (specs/043): a served instance with real sources and several client processes.
+# Needs the same docker databases plus a quack build:
+#   ACL_INTEGRATION=1 ACL_QUACK=1 GEN=ninja make      (add ACL_INTEGRATION_MSSQL=1 for the mssql leg)
+# Each source is a leg that skips itself, with the reason, when it cannot run - and the run fails if
+# no leg ran at all, so "everything skipped" can never read as a pass.
+test-e2e:
+	ACL_PG_DSN="dbname=$(ACL_PG_DB) user=$(ACL_PG_USER) password=$(ACL_PG_PASS) host=$(ACL_PG_HOST) port=$(ACL_PG_PORT)" \
+	ACL_DUCKLAKE_DSN="ducklake:postgres:dbname=$(ACL_DUCKLAKE_CATALOG_DB) user=$(ACL_PG_USER) password=$(ACL_PG_PASS) host=$(ACL_PG_HOST) port=$(ACL_PG_PORT)" \
+	ACL_MSSQL_DSN="Server=$(ACL_MSSQL_HOST),$(ACL_MSSQL_PORT);Database=$(ACL_MSSQL_DB);User Id=$(ACL_MSSQL_USER);Password=$(ACL_MSSQL_PASS)" \
+	test/e2e/door/run.sh
 
 # --- The managed policy schema (spec 034) ---------------------------------
 # schema/policy_schema.sql is the source of truth; everything else is rendered from it, so what an

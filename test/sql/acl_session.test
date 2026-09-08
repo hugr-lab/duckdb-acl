@@ -1,0 +1,473 @@
+# name: test/sql/acl_session.test
+# description: the session contract both doors stand on (spec 040) - open a token once, prefix every
+#   statement with the handle, close it; and refuse an unknown, closed or expired one
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme'), (2, 'globex');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders RLS 'tenant = acl_claim(''tenant'')';
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- open: a verified token becomes an opaque handle ------------------------------------------------
+
+statement ok
+CREATE TABLE live AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS handle;
+
+# 128 bits of hex, and nothing of the token in it
+query II
+SELECT length(handle), handle SIMILAR TO '[0-9A-Fa-f]+' FROM live;
+----
+32	true
+
+# a token that does not verify gives NULL rather than an error carrying detail
+query I
+SELECT acl_session_open('not.a.jwt') IS NULL;
+----
+true
+
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.wrongsignaturewrongsignaturewrongsignaturewro') IS NULL;
+----
+true
+
+# --- acl_session_sql: the whole of a door's decision --------------------------------------------------
+
+query I
+SELECT acl_session_sql((SELECT handle FROM live), 'SELECT * FROM orders')
+     = 'ACL SESSION ''' || (SELECT handle FROM live) || ''' SELECT * FROM orders' FROM live;
+----
+true
+
+# an unknown handle is not usable, and neither is one that was closed
+query I
+SELECT acl_session_sql('00000000000000000000000000000000', 'SELECT 1') IS NULL;
+----
+true
+
+statement ok
+CREATE TABLE closed AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS handle;
+
+query I
+SELECT acl_session_sql((SELECT handle FROM closed), 'SELECT 1') IS NOT NULL;
+----
+true
+
+statement ok
+SELECT acl_session_close((SELECT handle FROM closed));
+
+query I
+SELECT acl_session_sql((SELECT handle FROM closed), 'SELECT 1') IS NULL;
+----
+true
+
+# closing again is not an error: a door may retry a disconnect
+statement ok
+SELECT acl_session_close((SELECT handle FROM closed));
+
+# two sessions from one token are two sessions
+query I
+SELECT (SELECT handle FROM live) <> (SELECT handle FROM closed);
+----
+true
+
+# --- expiry is judged on every use under acl_session_token_binding='every_use' (specs 044/059) --------
+# a token whose `exp` is in the past, accepted with a wide skew and then judged with none; the default
+# 'connect' binding would keep the session working (pinned at the end of this file), so the strict
+# rule is switched on for this block
+
+statement ok
+SET GLOBAL acl_session_token_binding='every_use';
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=315360000;
+
+statement ok
+CREATE TABLE stale AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc4NzM0MzU0Mywic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.zF2pHtZ_Dh8LawCZuqgMhqztPebyHkyPJEZq4Q0S72k') AS handle;
+
+query I
+SELECT acl_session_sql((SELECT handle FROM stale), 'SELECT 1') IS NOT NULL;
+----
+true
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=0;
+
+query I
+SELECT acl_session_sql((SELECT handle FROM stale), 'SELECT 1') IS NULL;
+----
+true
+
+# spec 054: the NULL says nothing on its own - acl_session_reason says why, and it survives the NULL
+# (resolving no longer erases the record), so a client learns to fetch a fresh token rather than reopen
+query I
+SELECT acl_session_reason((SELECT handle FROM stale)) = 'expired';
+----
+true
+
+# a live session reads as live; a handle nobody had reads as unknown
+query I
+SELECT acl_session_reason((SELECT handle FROM live)) = 'live';
+----
+true
+
+query I
+SELECT acl_session_reason('00000000000000000000000000000000') = 'unknown';
+----
+true
+
+
+# --- the prefix itself ---------------------------------------------------------------------------------
+# a handle a client invents resolves to nothing, and says which of the two reasons it is
+
+statement error
+ACL SESSION '00000000000000000000000000000000' SELECT * FROM orders;
+----
+<REGEX>:.*session unknown.*
+
+statement error
+ACL SESSION 'deadbeef' SELECT 1;
+----
+<REGEX>:.*session unknown.*
+
+# the form still demands a quoted value, like ROLE and TOKEN do
+statement error
+ACL SESSION SELECT 1;
+----
+<REGEX>:.*requires a quoted value.*
+
+# and a client writing its own session prefix inside a query does not become another principal
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg' ACL SESSION 'whatever' SELECT 1;
+----
+<REGEX>:.*administration scope.*
+
+# --- sessions end when nobody ends them (spec 044) -------------------------------------------------
+# Everything above closes what it opens. A door does not: quack calls the authentication function per
+# connection and nothing on disconnect, so what is left behind is what this section is about.
+#
+# Counted as deltas from whatever this file has already left live - and that a live session survives a
+# sweep is itself the first assertion, since a sweeper that took working sessions would be worse than
+# none at all.
+
+statement ok
+CREATE TABLE base AS SELECT acl_session_count() AS n;
+
+statement ok
+SELECT acl_session_sweep();
+
+query I
+SELECT acl_session_count() = n FROM base;
+----
+true
+
+# counting follows opening and closing
+statement ok
+CREATE TABLE counted AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS handle;
+
+query I
+SELECT acl_session_count() - n FROM base;
+----
+1
+
+statement ok
+SELECT acl_session_close(handle) FROM counted;
+
+query I
+SELECT acl_session_count() - n FROM base;
+----
+0
+
+# an expired session goes in the sweep rather than waiting to be asked for. Opened under a wide skew so
+# it exists at all, judged with none - the same trick the expiry test above uses.
+statement ok
+SET GLOBAL acl_jwt_clock_skew=315360000;
+
+statement ok
+CREATE TABLE swept AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc4NzM0MzU0Mywic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.zF2pHtZ_Dh8LawCZuqgMhqztPebyHkyPJEZq4Q0S72k') AS handle;
+
+query I
+SELECT acl_session_count() - n FROM base;
+----
+1
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=0;
+
+query I
+SELECT acl_session_sweep();
+----
+1
+
+query I
+SELECT acl_session_count() - n FROM base;
+----
+0
+
+statement ok
+SET GLOBAL acl_session_token_binding='connect';
+
+# --- the cap refuses rather than evicts ---------------------------------------------------------------
+# Making room by ending somebody else's session would let an arriving stranger disconnect a working
+# client. At the cap a new session is refused, and NULL is what a door already handles.
+
+# one live session, then a cap that is already reached: the arithmetic stays out of it, since SET takes
+# no subquery and the count carried in from earlier in this file is not ours to predict
+statement ok
+CREATE TABLE capped AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS h;
+
+statement ok
+SET GLOBAL acl_max_sessions=1;
+
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NULL;
+----
+true
+
+# the session already open is untouched by the refusal - nothing was evicted to make room
+query I
+SELECT acl_session_count() - n FROM base;
+----
+1
+
+statement ok
+SET GLOBAL acl_max_sessions=1000;
+
+# and with room again, opening works
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NOT NULL;
+----
+true
+
+statement ok
+SELECT acl_session_close(h) FROM capped;
+
+# --- both are the door's, not a principal's -----------------------------------------------------------
+
+statement error
+ACL ROLE "r" SELECT acl_session_sweep();
+----
+<REGEX>:.*acl_session_sweep.*not allowed.*
+
+statement error
+ACL ROLE "r" SELECT acl_session_count();
+----
+<REGEX>:.*acl_session_count.*not allowed.*
+
+statement error
+ACL ROLE "r" SELECT acl_session_reason('whatever');
+----
+<REGEX>:.*acl_session_reason.*not allowed.*
+
+# --- spec 059: the token's freshness gates establishment, not the established session ----------------
+# The lever: a hugely negative clock skew makes every exp look past-due to the *judgment* without
+# waiting - the session below was opened while the skew was sane, so only the per-use rule changes.
+
+statement ok
+CREATE TEMP TABLE bind AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS h;
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=-9999999999;
+
+# default 'connect': the session keeps answering though its token's exp is (per the skew) long past
+query I
+SELECT acl_session_sql(h, 'SELECT 1') IS NOT NULL FROM bind;
+----
+true
+
+query I
+SELECT acl_session_reason(h) FROM bind;
+----
+live
+
+# ...and the sweep does not reap it either
+query I
+SELECT acl_session_sweep();
+----
+0
+
+# 'every_use' restores the pre-059 rule: the same session is now refused, named, and swept
+statement ok
+SET GLOBAL acl_session_token_binding='every_use';
+
+query I
+SELECT acl_session_sql(h, 'SELECT 1') IS NULL FROM bind;
+----
+true
+
+query I
+SELECT acl_session_reason(h) FROM bind;
+----
+expired
+
+# the sweep reaps it (and possibly other long-lived sessions this file left open - under this skew
+# every 2100-exp token looks past-due, so the count is a floor, and the bind session's own fate is
+# pinned by name right after)
+query I
+SELECT acl_session_sweep() >= 1;
+----
+true
+
+query I
+SELECT acl_session_reason(h) FROM bind;
+----
+unknown
+
+# the value is validated where it is set, not silently accepted
+statement error
+SET GLOBAL acl_session_token_binding='sometimes';
+----
+<REGEX>:.*accepts 'connect' or 'every_use'.*
+
+# an expired token still cannot OPEN a session under either binding - establishment is always gated
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NULL;
+----
+true
+
+statement ok
+SET GLOBAL acl_session_token_binding='connect';
+
+# ...and under 'connect' too: establishment is always gated, the binding never weakens the open
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NULL;
+----
+true
+
+# a session-scoped value would validate, display, and be ignored by the judgment - refused instead
+statement error
+SET acl_session_token_binding='every_use';
+----
+<REGEX>:.*is global.*
+
+# under 'connect' the idle rule is the only automatic reaper - disabling it is refused...
+statement error
+SET GLOBAL acl_session_idle_timeout=0;
+----
+<REGEX>:.*no automatic session reaper.*
+
+# ...and so is entering 'connect' while it is already disabled
+statement ok
+SET GLOBAL acl_session_token_binding='every_use';
+
+statement ok
+SET GLOBAL acl_session_idle_timeout=0;
+
+statement error
+SET GLOBAL acl_session_token_binding='connect';
+----
+<REGEX>:.*needs a live idle reaper.*
+
+statement ok
+SET GLOBAL acl_session_idle_timeout=900;
+
+statement ok
+SET GLOBAL acl_session_token_binding='connect';
+
+statement ok
+SET GLOBAL acl_jwt_clock_skew=60;
+
+# --- acl_jwt_clock_skew is a GLOBAL setting (the 2026-09-03 review) ----------------------------------
+# The store reads it through the instance, so a session-scoped registration made `SET` report success
+# and change nothing. A token that expired on 2026-01-01 is refused by the default skew and admitted
+# by a skew wide enough to cover it - which a plain SET must reach.
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc2NzIyNTYwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.MFWp7qAyuQXdxbmhheIS1GHzdCuIiU-o-89r26BBvr8' SELECT count(*) FROM orders;
+----
+<REGEX>:.*token expired.*
+
+statement ok
+SET acl_jwt_clock_skew = 10000000000;
+
+query I
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc2NzIyNTYwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.MFWp7qAyuQXdxbmhheIS1GHzdCuIiU-o-89r26BBvr8' SELECT count(*) FROM orders;
+----
+1
+
+statement ok
+RESET acl_jwt_clock_skew;
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6MTc2NzIyNTYwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.MFWp7qAyuQXdxbmhheIS1GHzdCuIiU-o-89r26BBvr8' SELECT count(*) FROM orders;
+----
+<REGEX>:.*token expired.*
+
+# --- acl_sessions() is valid JSON whatever a token carries (the 2026-09-03 review) --------------------
+# A subject or a role comes from a token; one escaper emitted control bytes raw and the listing was
+# an invalid document on the first odd byte. This subject carries 0x01 and a double quote, and the
+# listing must show them as JSON escapes (\u0001, \") - checked as text, so the pin needs no json
+# extension (a mid-file `require json` would silently stop the file where the extension is absent).
+
+statement ok
+CREATE TABLE odd AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoiY3RsXHUwMDAxXCJxIiwicm9sZXMiOlsiciJdLCJ0aWQiOiJhY21lIn0.h83QtvahuRlc8Df2p1980c19zdlpz_VkH3IxJo_2jg4') AS handle;
+
+query I
+SELECT handle IS NOT NULL FROM odd;
+----
+true
+
+query I
+SELECT acl_sessions() LIKE '%"subject":"ctl\u0001\"q"%';
+----
+true
+
+# and no raw control byte anywhere in the document
+query I
+SELECT position(chr(1) IN acl_sessions()) = 0;
+----
+true
+
+statement ok
+SELECT acl_session_close((SELECT handle FROM odd));
+
+# --- stopping a door nobody serves ends nothing (found writing docs/serving.md) -------------------------
+# acl_quack_stop answered "No server found" and then, with no quack door open on the instance, ran the
+# last-door path anyway - closing every session of the instance, the Flight door's included.
+
+statement ok
+CREATE TABLE survivor AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS handle;
+
+query I
+SELECT acl_quack_stop('quack:localhost:31997') LIKE 'No server found listening on %';
+----
+true
+
+query I
+SELECT acl_session_sql((SELECT handle FROM survivor), 'SELECT 1') IS NOT NULL;
+----
+true
+
+statement ok
+SELECT acl_session_close((SELECT handle FROM survivor));

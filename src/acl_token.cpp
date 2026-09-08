@@ -319,7 +319,7 @@ bool JwksHasKid(const string &keys_json, const string &kid) {
 	return false;
 }
 
-JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clock_skew_seconds) {
+JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clock_skew_seconds, bool ignore_exp) {
 	ParsedJwt jwt;
 	if (!SplitJwt(token, jwt)) {
 		Reject("not a JWT");
@@ -354,7 +354,8 @@ JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clo
 	if (!exp || !duckdb_yyjson::yyjson_is_num(exp)) {
 		Reject("missing exp claim");
 	}
-	if (duckdb_yyjson::yyjson_get_sint(exp) + clock_skew_seconds < now) {
+	auto expires_at = duckdb_yyjson::yyjson_get_sint(exp);
+	if (!ignore_exp && expires_at + clock_skew_seconds < now) {
 		Reject("token expired");
 	}
 	auto nbf = duckdb_yyjson::yyjson_obj_get(payload.Root(), "nbf");
@@ -390,7 +391,14 @@ JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clo
 	}
 
 	JwtClaims result;
+	// kept so a session minted from this token can be refused once it passes (spec 040)
+	result.expires_at = expires_at;
 	result.issuer = config.issuer;
+	// the subject: identity within the issuer, so two different users who happen to share roles and
+	// claims are not one principal (spec 050 F5 - it goes into the fingerprint)
+	if (auto sub = JsonPath(payload.Root(), "sub")) {
+		result.subject = JsonString(sub);
+	}
 
 	// the roles claim: a string or an array of strings at the configured dot path
 	auto roles = JsonPath(payload.Root(), config.role_claim.empty() ? "roles" : config.role_claim);

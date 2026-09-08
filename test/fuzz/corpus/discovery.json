@@ -1,0 +1,1 @@
+1{"issuer":"https://issuer.test","token_endpoint":"https://issuer.test/oauth2/token","device_authorization_endpoint":"https://issuer.test/oauth2/device","jwks_uri":"https://issuer.test/keys"}
