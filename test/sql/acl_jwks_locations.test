@@ -15,8 +15,9 @@ SELECT acl_use_db('store', 'acl', true);
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
+# refusals are recorded at `denied` already (spec 069)
 statement ok
-SET GLOBAL acl_audit_level = 'all';
+SET GLOBAL acl_audit_level = 'denied';
 
 statement ok
 COPY (SELECT '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AS c)
@@ -51,13 +52,42 @@ SELECT count(*) FROM acl_issuers();
 ----
 0
 
+# the setting is the operator's and global: a session-scoped value would be shown and ignored
+statement error
+SET acl_jwks_locations = '/';
+----
+<REGEX>:.*acl_jwks_locations is global - use SET GLOBAL.*
+
 # --- the deployment vouches for its directory by name --------------------------------------------
 statement ok
 SET GLOBAL acl_jwks_locations = 'https://, __TEST_DIR__/';
 
+# ...and ".." walks out of any directory, so no location may carry it
+statement error
+ACL ADMIN CREATE ISSUER 'https://issuer.test/walk' KEYS FROM '__TEST_DIR__/../elsewhere/jwks.json'
+    AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
+----
+<REGEX>:.*contains "\.\.", which no location may.*
+
 statement ok
 ACL ADMIN CREATE ISSUER 'https://issuer.test/hs' KEYS FROM '__TEST_DIR__/loc_jwks.json'
     AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
+
+# a repoint outside the list is refused the same way, by either form, and changes nothing
+statement error
+SELECT acl_alter_issuer('https://issuer.test/hs', 'jwks_uri', '/etc/acl/keys.json');
+----
+<REGEX>:.*KEYS FROM "/etc/acl/keys.json" is outside acl_jwks_locations.*
+
+statement error
+ACL ADMIN ALTER ISSUER 'https://issuer.test/hs' SET KEYS FROM 'http://kc.internal/certs';
+----
+<REGEX>:.*is outside acl_jwks_locations.*
+
+query I
+SELECT jwks_uri LIKE '%loc_jwks.json' FROM acl_issuers() WHERE issuer = 'https://issuer.test/hs';
+----
+true
 
 statement ok
 ACL ADMIN CREATE ROLE analyst;
@@ -69,10 +99,10 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
 
 # nothing read yet: the row is there, the cache is not
-query IIIIII
-SELECT issuer, location LIKE '%loc_jwks.json', allowed, fetched_at IS NULL, keys IS NULL, error IS NULL FROM acl_jwks_cache();
+query IIIIIII
+SELECT issuer, location LIKE '%loc_jwks.json', allowed, fetched_at IS NULL, last_tried_at IS NULL, keys IS NULL, error IS NULL FROM acl_jwks_cache();
 ----
-https://issuer.test/hs	true	true	true	true	true
+https://issuer.test/hs	true	true	true	true	true	true
 
 query I
 ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
@@ -80,10 +110,10 @@ ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50
 1
 
 # read once: one key, no kid, an age, no error
-query IIIIII
-SELECT allowed, fetched_at IS NOT NULL, age_seconds >= 0, last_tried_at IS NOT NULL, keys, kids FROM acl_jwks_cache();
+query IIIIIII
+SELECT allowed, fetched_at IS NOT NULL, age_seconds >= 0, last_tried_at IS NOT NULL, error IS NULL, keys, kids FROM acl_jwks_cache();
 ----
-true	true	true	true	1	[]
+true	true	true	true	true	1	[]
 
 # --- taken off the list, the location is not read, and the cached document is not used either ----
 statement ok
@@ -92,21 +122,23 @@ SET GLOBAL acl_jwks_locations = 'https://';
 statement error
 ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
 ----
-<REGEX>:.*token rejected: the keys of issuer "https://issuer.test/hs" are at "[^"]*loc_jwks.json" is outside acl_jwks_locations \(https://\) - list its prefix there, or paste the keys.*
+<REGEX>:.*token rejected: the keys of issuer "https://issuer.test/hs" cannot be read: "[^"]*loc_jwks.json" is outside acl_jwks_locations \(https://\) - list its prefix there, or paste the keys.*
 
-query II
-SELECT allowed, keys FROM acl_jwks_cache();
+# the refusal is the entry's last attempt: the document stays cached but unused, the error is on the row
+query IIII
+SELECT allowed, keys, error LIKE '%is outside acl_jwks_locations (https://)', last_tried_at IS NOT NULL FROM acl_jwks_cache();
 ----
-false	1
+false	1	true	true
 
-# the refusal is a keys event with the reason (the audit at `denied`), never a client's to see
+# ...and one keys event with the reason - a policy that names a source this node does not read
+# from, not a source that failed - recorded at `denied`, and never a client's to see
 statement ok
 SELECT acl_audit_flush();
 
-query III
-SELECT detail, reason_code, reason LIKE '%outside acl_jwks_locations%' FROM acl_audit_events() WHERE kind = 'keys' ORDER BY seq DESC LIMIT 1;
+query IIII
+SELECT detail, verdict, reason_code, reason LIKE '%is outside acl_jwks_locations%' FROM acl_audit_events() WHERE kind = 'keys' ORDER BY seq DESC LIMIT 1;
 ----
-refresh_failed	source_error	true
+location_refused	denied	policy_error	true
 
 # back on the list, the cached document serves
 statement ok
@@ -120,7 +152,7 @@ ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50
 # --- acl_jwks_refresh drops what the node trusted; the next token re-reads ----------------------
 # a rotated document is not seen while the cache is fresh (acl_jwks_refresh_interval at 300 s)...
 statement ok
-COPY (SELECT '{"keys":[{"kty":"oct","kid":"k2","k":"ZGlmZmVyZW50LXNlY3JldA"}]}' AS c)
+COPY (SELECT '{"keys":[{"kty":"oct","kid":"b","k":"ZGlmZmVyZW50LXNlY3JldA"},{"kty":"oct","kid":"a","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AS c)
     TO '__TEST_DIR__/loc_jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
 
 query I
@@ -128,7 +160,8 @@ ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50
 ----
 1
 
-# ...until the operator drops it: the old secret's token is refused, the document's new kid is listed
+# ...until the operator drops it: the next token re-reads - two keys now, kids in the document's
+# order, and a token without a kid cannot pick between them (spec 023's rule)
 query I
 SELECT acl_jwks_refresh();
 ----
@@ -142,12 +175,12 @@ true
 statement error
 ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
 ----
-<REGEX>:.*token rejected.*
+<REGEX>:.*token rejected: no usable HS256 key for this issuer.*
 
-query II
-SELECT keys, kids FROM acl_jwks_cache();
+query IIII
+SELECT fetched_at IS NOT NULL, error IS NULL, keys, kids FROM acl_jwks_cache();
 ----
-1	[k2]
+true	true	2	[b, a]
 
 query I
 SELECT acl_jwks_refresh('https://issuer.test/hs');
@@ -159,7 +192,7 @@ SELECT acl_jwks_refresh('https://issuer.test/nobody');
 ----
 0
 
-# --- '' admits nothing: keys are pasted or nothing -------------------------------------------------
+# --- '' admits nothing: keys are pasted or nothing, and a location already written is not read ---
 statement ok
 SET GLOBAL acl_jwks_locations = '';
 
@@ -168,6 +201,11 @@ ACL ADMIN CREATE ISSUER 'https://issuer.test/none' KEYS FROM 'https://kc.corp/re
     AUDIENCES ('api://acl-test') ALGS (RS256) ROLE CLAIM 'roles';
 ----
 <REGEX>:.*is outside acl_jwks_locations \(\).*
+
+statement error
+ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+----
+<REGEX>:.*cannot be read: "[^"]*loc_jwks.json" is outside acl_jwks_locations \(\).*
 
 statement ok
 ACL ADMIN CREATE ISSUER 'https://issuer.test/pasted' KEYS '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}'
@@ -194,6 +232,6 @@ ACL ROLE "analyst" SELECT acl_jwks_refresh();
 <REGEX>:.*function "acl_jwks_refresh" is not allowed.*
 
 statement error
-ACL ROLE "analyst" SET acl_jwks_locations = '/';
+ACL ROLE "analyst" SET GLOBAL acl_jwks_locations = '/';
 ----
-<REGEX>:.*SET.*
+<REGEX>:.*SET "acl_jwks_locations" is not permitted under ACL.*

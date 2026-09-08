@@ -342,6 +342,7 @@ report success and change nothing):
 | `acl_version_check_interval` | 1000 | milliseconds between `policy_version` re-reads of the policy catalog (`0` = every batch) |
 | `acl_jwks_refresh_interval` | 300 | seconds a fetched JWKS is used before it is read again |
 | `acl_jwks_max_stale` | 3600 | seconds a JWKS that can no longer be read may still be used; `0` = a failed read is fatal at once |
+| `acl_jwks_locations` | `https://` | prefixes a `KEYS FROM` location (and an issuer's discovery URL) may start with; refused outside them where written and where read; `''` admits none (spec 071) |
 | `acl_allow_anonymous_admin` | false | a bare `ACL ADMIN` with no principal; must be off to serve |
 
 ## Graceful shutdown (spec 066)

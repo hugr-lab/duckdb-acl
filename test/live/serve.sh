@@ -79,6 +79,7 @@ fi
 # roles come from realm_access.roles (spec 007), and a `tenant` user attribute drives the RLS.
 KC_ISSUER="-- ACL_LIVE_KEYCLOAK not set: only the demo HS256 issuer is defined"
 KC_PRELOAD=""
+KC_LOCATIONS=""
 if [ -n "${ACL_LIVE_KEYCLOAK:-}" ]; then
 	KC_REALM="${ACL_LIVE_KEYCLOAK%/}"
 	KC_AUD="${ACL_LIVE_KC_AUDIENCE:-account}"
@@ -86,12 +87,14 @@ if [ -n "${ACL_LIVE_KEYCLOAK:-}" ]; then
 	KC_PRELOAD="$HTTPFS_LOAD"  # the issuer define reads the JWKS at verify time
 	# the realm's own URL is the one location this node reads keys from (spec 071): a local
 	# Keycloak over http is admitted by name, never by scheme
-	KC_ISSUER=\"SET GLOBAL acl_jwks_locations = 'https://, $KC_REALM/'; ACL ADMIN CREATE ISSUER '$KC_REALM' KEYS FROM '$KC_REALM/protocol/openid-connect/certs' AUDIENCES ('$KC_AUD') ALGS (RS256) ROLE CLAIM 'realm_access.roles' CLAIM MAP '{\"$KC_TENANT\": \"tenant\"}';"
+	KC_LOCATIONS="SET GLOBAL acl_jwks_locations = 'https://, $KC_REALM/';"
+	KC_ISSUER="ACL ADMIN CREATE ISSUER '$KC_REALM' KEYS FROM '$KC_REALM/protocol/openid-connect/certs' AUDIENCES ('$KC_AUD') ALGS (RS256) ROLE CLAIM 'realm_access.roles' CLAIM MAP '{\"$KC_TENANT\": \"tenant\"}';"
 fi
 
 {
 	echo "LOAD '$ACL_EXT';"
 	[ -n "$KC_PRELOAD" ] && echo "$KC_PRELOAD"
+	[ -n "$KC_LOCATIONS" ] && echo "$KC_LOCATIONS"
 	sed -e "s|\${LIVE_FLIGHT_SERVE}|$FLIGHT_SERVE|" -e "s|\${LIVE_QUACK_SERVE}|$QUACK_SERVE|" \
 	    -e "s|\${LIVE_KEYCLOAK_ISSUER}|$KC_ISSUER|" "$HERE/bootstrap.sql"
 } >"$TMP/server.sql"

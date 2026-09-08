@@ -599,7 +599,10 @@ struct PolicyStore {
 	//! committed), `source_error` (the source did not answer - the statement was refused)
 	void AuditPolicy(const string &detail, const string &reason);
 	//! An issuer's keys were re-read from their document (`refreshed`) or could not be (`refresh_failed`)
-	void AuditKeys(const string &issuer, bool ok, const string &error);
+	//! `detail` and `reason_code` override the defaults (refreshed / refresh_failed, source_error) -
+	//! spec 071's location_refused / policy_error is the one other shape
+	void AuditKeys(const string &issuer, bool ok, const string &error, const char *detail = nullptr,
+	               const char *reason_code = nullptr);
 	//! The store of an instance, for code that holds a connection and nothing else (the embedded
 	//! quack server's drain thread): registered in the object cache at load. Null before load.
 	static shared_ptr<PolicyStore> Of(DatabaseInstance &db);

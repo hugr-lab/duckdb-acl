@@ -651,17 +651,18 @@ void PolicyStore::AuditPolicy(const string &detail, const string &reason) {
 	audit->Emit(std::move(event));
 }
 
-void PolicyStore::AuditKeys(const string &issuer, bool ok, const string &error) {
+void PolicyStore::AuditKeys(const string &issuer, bool ok, const string &error, const char *detail,
+                            const char *reason_code) {
 	if (!audit) {
 		return;
 	}
 	AuditEvent event;
 	event.kind = "keys";
 	event.objects.push_back(AuditObject {issuer, "keys"});
-	event.detail = ok ? "refreshed" : "refresh_failed";
+	event.detail = detail ? detail : (ok ? "refreshed" : "refresh_failed");
 	event.allowed = ok;
 	if (!ok) {
-		event.reason_code = "source_error";
+		event.reason_code = reason_code ? reason_code : "source_error";
 		event.reason = error;
 	}
 	event.level = ok ? AuditLevel::ALL : AuditLevel::DENIED;
