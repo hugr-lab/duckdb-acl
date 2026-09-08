@@ -641,9 +641,11 @@ void PolicyStore::AuditPolicy(const string &detail, const string &reason) {
 	AuditEvent event;
 	event.kind = "policy";
 	event.detail = detail;
-	event.allowed = detail != "source_error";
+	// a source that did not answer, or a build mistake (an extension from another acl_audit.hpp,
+	// spec 069's contract stamp): both are refusals the operator must see, at `denied` already
+	event.allowed = detail != "source_error" && detail != "contract_mismatch";
 	if (!event.allowed) {
-		event.reason_code = "source_error";
+		event.reason_code = detail == "source_error" ? "source_error" : "policy_error";
 		event.reason = reason;
 	}
 	event.level = event.allowed ? AuditLevel::ALL : AuditLevel::DENIED;

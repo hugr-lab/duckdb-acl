@@ -64,7 +64,7 @@ One record per decision:
 | `rewrite_us` | INTEGER | the decision's own cost |
 | `rows` | BIGINT | `ingest` only: rows the completed drain wrote (a number, not data); NULL elsewhere |
 | `duration_us` | BIGINT | `session` close events only: how long the session lived; NULL elsewhere |
-| `detail` | VARCHAR | a bounded word for `policy` / `keys` / `session` events: `reloaded`, `source_error`, `refreshed`, `refresh_failed`, `idle`, `expired`, `killed`, `door_stopped`, `client` |
+| `detail` | VARCHAR | a bounded word for `policy` / `keys` / `session` events: `reloaded`, `source_error`, `contract_mismatch` (a `policy_error` refusal at load: the registry was stamped by another acl_audit.hpp, see the hooks), `refreshed`, `refresh_failed`, `idle`, `expired`, `killed`, `door_stopped`, `client` |
 
 **Reason codes** (the taxonomy every `Deny` site names; the text after the prefix stays free):
 `no_access`, `capability`, `read_only`, `function_denied`, `statement_type`, `unchecked_predicate`,
@@ -141,7 +141,19 @@ client-local allowlist.
 ### The hooks - the base's public C++ surface
 
 One header, `src/include/acl_audit.hpp`, is what an extended extension compiles against. It carries
-no duckdb-internal types beyond `string`, `vector`, `shared_ptr` and our own `Principal`:
+no duckdb-internal types beyond `string`, `vector`, `shared_ptr` and our own `Principal`.
+
+**The contract is stamped.** Header-only cuts both ways: each extension carries its own compiled copy
+of these types, and two copies built from different revisions of the header would read one object
+through two layouts. So `AuditHooks::CONTRACT_VERSION` is written into the registry by whoever
+creates it - the first member, a fixed offset whatever else moves - and `AuditHooks::Reach(cache,
+why)` is how both sides get the registry: `GetOrCreate`, then the stamp compared. A registry stamped
+otherwise is never dereferenced: the base keeps a **private** registry (its own sinks, ring and file
+work as ever; the doors' gauges land on it) and says so in the gauge `acl.audit.contract`
+(`registry=shared|private`, the reason as an attribute; value = the version this build speaks);
+the extension refuses to attach and says so in its status. The version is bumped on ANY change to
+what the header lays out; the pin rule (same duckdb, same header revision, bumped together) makes
+a mismatch a build mistake, and the stamp makes it a visible one instead of a silent one.
 
 ```cpp
 namespace duckdb { namespace acl {
@@ -365,6 +377,14 @@ of what was recorded. Not an OTel SDK dependency in this repo.
   headers win over the session's settings.
 
 ## Testing
+
+- The stamp: `test_acl_audit_hooks` - a registry stamped with another contract version is refused by
+  `Reach` with both versions named, and handed out again once the stamp matches; `acl_audit.test` -
+  `acl.audit.contract{registry=shared}` = the version. The whole round trip (acl loading beside a
+  stale registry and auditing on a private one, the extension refusing to attach) needs two real
+  loadables in one process, which the base's own test binary cannot stage (acl is statically linked
+  into it): it is acl-otel's `test_acl_otel_contract`, run there on every PR against the base's
+  artifact.
 
 - sqllogictest: after a handful of prefixed statements at each level, `acl_audit_events()` shows
   exactly what the level admits - an allowed `SELECT` with `[{orders, select}]` at `decisions` and

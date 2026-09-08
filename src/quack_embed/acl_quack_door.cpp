@@ -260,7 +260,7 @@ void RegisterAclQuackDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store
 	// registry in the object cache, which exists before the pipeline is attached.
 	{
 		auto &db = loader.GetDatabaseInstance();
-		auto hooks = db.GetObjectCache().GetOrCreate<AuditHooks>(AuditHooks::ObjectType());
+		auto hooks = store->hooks; // the instance's registry, or the private one (AuditHooks::Reach)
 		weak_ptr<DatabaseInstance> weak_db = db.shared_from_this();
 		hooks->Gauges().Register("acl.door.state", {{"door", "quack"}}, "1", "listeners serving right now",
 		                         [weak_db]() -> int64_t {

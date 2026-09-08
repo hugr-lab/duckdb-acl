@@ -140,6 +140,13 @@ WHERE name IN ('acl.node.info', 'acl.node.uptime') ORDER BY name;
 acl.node.info	true	true
 acl.node.uptime	false	true
 
+# the audit contract this build speaks, and the registry it audits on: the instance's shared one -
+# `private` would mean an extension built from another acl_audit.hpp created it first (acl_audit.hpp)
+query II
+SELECT attributes, value >= 1 FROM acl_metrics() WHERE name = 'acl.audit.contract';
+----
+{"registry":"shared"}	true
+
 query I
 SELECT value FROM acl_metrics() WHERE name = 'acl.door.state' AND attributes = '{"door":"quack"}';
 ----

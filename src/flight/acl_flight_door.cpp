@@ -2286,7 +2286,7 @@ void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> stor
 	// registry in the object cache, which exists before the pipeline is attached.
 	{
 		auto &db = loader.GetDatabaseInstance();
-		auto hooks = db.GetObjectCache().GetOrCreate<AuditHooks>(AuditHooks::ObjectType());
+		auto hooks = store->hooks; // the instance's registry, or the private one (AuditHooks::Reach)
 		weak_ptr<DatabaseInstance> weak_db = db.shared_from_this();
 		hooks->Gauges().Register("acl.door.state", {{"door", "flight"}}, "1", "doors serving right now",
 		                         [weak_db]() -> int64_t {

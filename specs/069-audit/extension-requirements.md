@@ -21,7 +21,8 @@ never slow or stop one.
 | promise | detail |
 | --- | --- |
 | **C1 one header** | `acl_audit.hpp`: `AuditLevel`, `AuditObject`, `AuditEvent`, `AuditSink`, `SessionPolicy`, `AuditCounters`, `AuditGauges`, `AuditHooks`, plus `Principal` from `acl_policy.hpp`. Same duckdb pin as the base it is loaded with. |
-| **C2 the registry** | `db.GetObjectCache().GetOrCreate<AuditHooks>("acl_audit_hooks")` from either extension, in either load order; one registry per `DatabaseInstance`. |
+| **C2 the registry** | `AuditHooks::Reach(db.GetObjectCache(), why)` from either extension, in either load order; one registry per `DatabaseInstance`. It is `GetOrCreate<AuditHooks>("acl_audit_hooks")` plus the stamp check below; null with `why` means: do not attach. |
+| **C2a the stamp** | the registry carries `AuditHooks::CONTRACT_VERSION` at a fixed offset, written by its creator; both sides refuse a registry stamped otherwise (the base audits on a private one and reports `acl.audit.contract{registry=private}`; the extension must not attach and must say so in `acl_otel_status()`). The version changes with any change to the header's layout; the pin rule keeps the two in step. |
 | **C3 delivery** | `AuditSink::OnEvent` is called on the base's single audit thread, in `seq` order, never on the decision path; a sink that blocks costs dropped events (counted), a sink that throws is counted in `sink_errors` and skipped for that event. `Flush()` is called when the level or a setting changes and at shutdown. |
 | **C4 the stream is sufficient** | every countable occurrence is an event (decisions with `reason_code`, session open/close with `how` and `duration_us`, ingest completion with `rows`, policy reloads and source errors, keys refreshes); only states are gauges. |
 | **C5 the event is safe** | no statement text, parameters, rows or physical names; claim values are present **in memory only** (`principal.claims`) and never in a base sink. |
@@ -134,7 +135,9 @@ never slow or stop one.
 ### R8 - lifecycle
 
 - R8.1 `LOAD acl_otel` before or after `LOAD acl`; the sink and the policy are registered at load
-  through C2; exporting starts when the endpoint is configured.
+  through C2; exporting starts when the endpoint is configured. A registry `Reach` refuses (C2a) is
+  not attached to: `acl_otel_status()` says `attached: false` with the reason, `acl_otel_start()`
+  answers false, and nothing of the extension's is ever called through it.
 - R8.2 `acl_otel_stop()` flushes, detaches the sink and the policy (`RemoveSink` /
   `SetSessionPolicy(nullptr)`), and is idempotent; `acl_otel_start()` re-attaches. duckdb has no
   extension unload, so this is the only way out.

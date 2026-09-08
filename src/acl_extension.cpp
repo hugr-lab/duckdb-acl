@@ -232,6 +232,17 @@ void LoadInternal(ExtensionLoader &loader) {
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
 	acl::RegisterAclMaintenance(loader, store); // spec 039: acl_check_catalog / acl_repair_relation
+	// The audit and observability hooks (spec 069): one registry per instance, reached through the
+	// object cache so an extension loaded before or after us finds the same one - unless the one
+	// there was stamped with another contract version (an extension built from another revision of
+	// acl_audit.hpp): then a private registry, whose sinks are only ours, and a gauge that says so.
+	// Reached before the doors register, which put their gauges on it.
+	string contract_mismatch;
+	auto hooks = acl::AuditHooks::Reach(db.GetObjectCache(), contract_mismatch);
+	if (!hooks) {
+		hooks = make_shared_ptr<acl::AuditHooks>();
+	}
+	store->hooks = hooks;
 #ifdef ACL_QUACK_EMBED_ENABLED
 	// The embedded quack door (spec 063): the acl_quack_* server settings and the acl_quack_scan_data
 	// drain the server INSERTs through, then the door itself - serve/stop and the two callbacks the
@@ -246,13 +257,14 @@ void LoadInternal(ExtensionLoader &loader) {
 	// the first time somebody opens a door.
 	acl::RegisterAclFlightDoor(loader, store);
 #endif
-	// The audit and observability hooks (spec 069): one registry per instance, reached through the
-	// object cache so an extension loaded before or after us finds the same one; attached to the store,
-	// which emits the session events, and registered with its SQL surface.
-	auto hooks = db.GetObjectCache().GetOrCreate<acl::AuditHooks>(acl::AuditHooks::ObjectType());
+	// attached to the store, which emits the session events, and registered with its SQL surface
 	auto pipeline = make_shared_ptr<acl::AuditPipeline>(hooks);
 	pipeline->Attach(db);
 	store->audit = pipeline;
+	if (!contract_mismatch.empty()) {
+		// the full reason, once, where the operator reads refusals (the ring, the file, a sink of ours)
+		store->AuditPolicy("contract_mismatch", contract_mismatch);
+	}
 	acl::RegisterAclAudit(loader, store, pipeline);
 	// the node's own gauges (spec 069): how long it has been up, and which build it is
 	{
@@ -266,6 +278,16 @@ void LoadInternal(ExtensionLoader &loader) {
 		});
 		hooks->Gauges().Register("acl.node.info", {{"version", version.empty() ? "dev" : version}}, "1",
 		                         "always 1; the build in the attributes", []() { return int64_t(1); });
+		// the contract the registry speaks (acl_audit.hpp): `shared` is the normal state; `private`
+		// means an extension loaded here was built from another revision (`found` = its stamp, 0 =
+		// none) and hears nothing - bounded attributes, the full reason is in the audit file below
+		vector<std::pair<string, string>> contract {{"registry", contract_mismatch.empty() ? "shared" : "private"}};
+		if (!contract_mismatch.empty()) {
+			contract.emplace_back("found", std::to_string(acl::AuditHooks::StampOf(db.GetObjectCache())));
+		}
+		hooks->Gauges().Register("acl.audit.contract", contract, "1",
+		                         "the audit contract version this build speaks; the registry's state in the attributes",
+		                         []() { return int64_t(acl::AuditHooks::CONTRACT_VERSION); });
 	}
 	// the store's own handle in the cache (weak): what PolicyStore::Of(db) answers to code that holds a
 	// connection and nothing else - the embedded quack server's drain thread (spec 069)

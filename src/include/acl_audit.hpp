@@ -18,6 +18,17 @@
 // pipeline behind the registry - the queue, the audit thread, the ring, the
 // file - is acl's own (acl_audit_pipeline.hpp) and is never called from outside.
 //
+// The flip side of header-only: BOTH extensions carry their own compiled copy
+// of these types, and two copies built from different revisions of this header
+// would read one object through two layouts. So the registry is stamped with
+// AuditHooks::CONTRACT_VERSION by whoever creates it, at a fixed offset (the
+// first member), and AuditHooks::Reach() is how both sides get it: a registry
+// stamped with another version is refused - the base keeps a private one and
+// says so in a gauge, the extension refuses to attach and says so in its
+// status - never dereferenced. Bump the version on ANY change to what this
+// header lays out: AuditEvent, AuditObject, AuditLevel, Principal, the
+// interfaces, AuditCounters, AuditGauges, AuditHooks.
+//
 // Delivery is decoupled from the decision: the emitting seam composes the
 // event and pushes it onto one bounded queue; the audit thread pops and hands
 // each event to every sink in turn, then to the base's own ring and file. A
@@ -280,11 +291,51 @@ private:
 //! registers and reads; what the base's pipeline drains. Header-only.
 class AuditHooks : public ObjectCacheEntry {
 public:
+	//! The layout contract of this header (see the header comment): bumped on any change to what
+	//! an extension compiles from here. Written by whoever creates the registry, as the first two
+	//! members so the other side reads them at the same offset whatever else moved: a magic that
+	//! says "stamped at all" (a registry created by a build from before the stamp has other bytes
+	//! here), then the version.
+	static constexpr int32_t CONTRACT_MAGIC = 0x41434C41; // "ACLA"
+	static constexpr int32_t CONTRACT_VERSION = 1;
+	int32_t contract_magic = CONTRACT_MAGIC;
+	int32_t contract_version = CONTRACT_VERSION;
+
 	static string ObjectType() {
 		return "acl_audit_hooks";
 	}
 	string GetObjectType() override {
 		return ObjectType();
+	}
+	//! The registry of an instance, from either extension in either load order (C2) - created here
+	//! when absent, and checked: null with `why` when the object under the key was stamped with
+	//! another contract version (the two extensions were built from different revisions of this
+	//! header) or is not a registry at all. The caller must not use such a registry.
+	static shared_ptr<AuditHooks> Reach(ObjectCache &cache, string &why) {
+		auto hooks = cache.GetOrCreate<AuditHooks>(ObjectType());
+		if (!hooks) {
+			why = "the object cache holds something else under '" + ObjectType() + "'";
+			return nullptr;
+		}
+		if (hooks->contract_magic != CONTRACT_MAGIC) {
+			why = "the audit registry carries no contract stamp - created by an extension built from an acl_audit.hpp "
+			      "older than the stamp; this build speaks contract version " +
+			      std::to_string(CONTRACT_VERSION);
+			return nullptr;
+		}
+		if (hooks->contract_version != CONTRACT_VERSION) {
+			why = "the audit registry is stamped with contract version " + std::to_string(hooks->contract_version) +
+			      ", this build speaks " + std::to_string(CONTRACT_VERSION) +
+			      " - acl and its extension were built from different revisions of acl_audit.hpp";
+			return nullptr;
+		}
+		why.clear();
+		return hooks;
+	}
+	//! What a refused registry was stamped with, for a gauge attribute: its version, or 0 for none
+	static int32_t StampOf(ObjectCache &cache) {
+		auto hooks = cache.GetOrCreate<AuditHooks>(ObjectType());
+		return hooks && hooks->contract_magic == CONTRACT_MAGIC ? hooks->contract_version : 0;
 	}
 	//! Never evicted: a sink registration must outlive any cache pressure.
 	optional_idx GetEstimatedCacheMemory() const override {
