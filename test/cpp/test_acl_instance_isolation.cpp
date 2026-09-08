@@ -69,11 +69,19 @@ void Run() {
 			Exec(con, "SELECT acl_use_db('store','acl',true)");
 			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
 		};
-		DuckDB a(nullptr);
+		// httpfs below is loaded by path, and a path is an unsigned extension: the instances have to
+		// allow that or the load throws and takes the scenario with it. `acl` itself is linked into
+		// this binary and needs no permission - which is why a build tree WITHOUT httpfs (CI's macOS
+		// job) never noticed.
+		DBConfig unsigned_ok;
+		unsigned_ok.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+		DuckDB a(nullptr, &unsigned_ok);
 		Connection ca(a);
 		Exec(ca, "LOAD acl");
 		serving_setup(ca);
-		DuckDB b(nullptr);
+		DBConfig unsigned_ok_b;
+		unsigned_ok_b.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+		DuckDB b(nullptr, &unsigned_ok_b);
 		Connection cb(b);
 		Exec(cb, "LOAD acl");
 		serving_setup(cb);
