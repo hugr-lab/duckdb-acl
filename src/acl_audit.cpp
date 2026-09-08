@@ -270,6 +270,8 @@ void AuditPipeline::Count(const AuditEvent &event) {
 	} else if (event.kind == "door") {
 		if (event.detail.compare(0, 7, "ticket_") == 0) {
 			counters.Add("acl.door.tickets", {{"door", event.door}, {"outcome", event.detail.substr(7)}});
+		} else if (event.detail.compare(0, 7, "stream_") == 0) {
+			counters.Add("acl.door.streams", {{"door", event.door}, {"outcome", event.detail.substr(7)}});
 		} else {
 			counters.Add("acl.door.handshakes", {{"door", event.door}, {"result", verdict}});
 		}

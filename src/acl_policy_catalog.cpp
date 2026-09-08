@@ -1453,6 +1453,20 @@ int64_t PolicyStore::MaxIngestRows() {
 	return 0;
 }
 
+int64_t PolicyStore::MaxResultRows() {
+	if (catalog) {
+		return catalog->SettingInt64("acl_max_result_rows", 0);
+	}
+	return 0;
+}
+
+int64_t PolicyStore::FlightStreamIdleSeconds() {
+	if (catalog) {
+		return catalog->SettingInt64("acl_flight_stream_idle", 30);
+	}
+	return 30;
+}
+
 int64_t PolicyStore::MaxSessions() {
 	if (catalog) {
 		return catalog->SettingInt64("acl_max_sessions", 1000); // the registered default (spec 044)

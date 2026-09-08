@@ -308,6 +308,23 @@ recorded refusals per source (counted regardless). Metric attributes from bounde
 pipeline's worker never holds the instance (settings and the file are the emitting thread's);
 `PolicyStoreHandle`'s destructor in the object cache is the shutdown seam.
 
+**Spec 070 — the Flight door streams**: `DoGet` executes with `allow_stream_result` and hands gRPC a
+`RecordBatchStream` over `AclResultReader`, which pulls ONE duckdb chunk per Arrow batch — nothing
+beyond the chunk in flight is held, whatever the result's size. The `StreamQueryResult` lives in a
+slot (`FlightDoorState::ResultStream`) the reader and the session connection share: every pull takes
+`SessionConn::exec` + `stream_lock` and releases them, so the session's next statement
+(`LockForStatement`, every former `lock_guard(exec)` site) can end a stream that sat unpulled for
+`acl_flight_stream_idle` seconds (30) from its own thread — interrupt, drop the result, mark the slot
+`superseded` — while one being pulled makes it wait. Whatever ends the stream interrupts the query
+(`ClientContext::Interrupt`, duckdb's own LIMIT rule): consumed, cancelled (gRPC destroys the reader —
+its destructor — or `is_cancelled()` between pulls), superseded, capped (`acl_max_result_rows`, 0 =
+unlimited, reason `at_capacity`), failed (`source_error`; a partial result is an error, never a short
+one). One `door` event `stream_<outcome>` with rows per stream, counter `acl.door.streams`, gauge
+`acl.door.streams_open`. Ingest mirrors it: `IngestGetNext` checks `is_cancelled()` between batches,
+a client that dies rolls the load back (`ingest` event `denied/unavailable`, `door` event
+`ingest_cancelled`). The e2e is `test/e2e/flight/stream.sh` (pyarrow client; server answers read
+through its own stdin) — the 200M-row view, the ms to the first batch, and each outcome.
+
 ## Working process — per-feature specs
 
 We do **not** run full spec-kit. Instead, each feature gets one lightweight spec under `specs/` (see

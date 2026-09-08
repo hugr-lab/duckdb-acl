@@ -1,6 +1,6 @@
 # Spec 070: the Flight door streams - results out, ingest in, and a client that stops is heard
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-09-08
 - **Author**: hugr-lab
 
@@ -59,27 +59,37 @@ transport.
   (`AclResultReader`): `ReadNext` fetches ONE duckdb chunk (`QueryResult::Fetch`), converts it
   (`ArrowConverter::ToArrowArray` → `ImportRecordBatch`) and returns it. Nothing is buffered beyond
   the chunk in flight; duckdb's pipeline runs as the reader pulls.
-- **The reader owns the execution.** It holds the reservation (`shared_ptr<Reservation>`: the
-  statement, the session connection) and a `std::unique_lock` on `SessionConn::exec` for its whole
-  life - a `StreamQueryResult` is bound to the connection's active query, and duckdb invalidates it
-  the moment another query starts on that connection, so the lock is what keeps "one statement at a
-  time per connection" true across the stream. The lock is released when the reader is destroyed.
-- **The end of the stream interrupts the query.** Three ways a stream ends, one mechanism:
-  - *consumed*: `Fetch` returns null; the reader reports end of stream, the result is closed, the
-    lock released;
+- **The result lives in a slot the reader and the connection share** (`FlightDoorState::ResultStream`:
+  the `StreamQueryResult` and a `superseded` mark; `SessionConn::stream` points at the current one).
+  A reader lives as long as its gRPC call, which a client that forgot its cursor never ends, so the
+  execution lock cannot be the reader's for the stream's life: instead **every pull takes
+  `SessionConn::exec` + `stream_lock` and releases them** - a statement of the session never runs in
+  the middle of a pull (duckdb invalidates a `StreamQueryResult` the moment another query starts on
+  its connection), and the session's next statement can end the stream from its own thread. Every
+  place a statement used to take `exec` now goes through `LockForStatement`: it takes `exec`, and if a
+  stream is open on the connection either ends it (idle past `acl_flight_stream_idle`: interrupt,
+  drop the result, mark the slot superseded) or lets go and looks again 20 ms later (the stream is
+  being pulled). The slot is the stream's own, so a newer stream on the same connection never
+  overwrites what an older reader will read about itself.
+- **The end of the stream interrupts the query.** Five ways a stream ends, one mechanism
+  (`AclResultReader::End`, once per stream: interrupt unless consumed, drop the result, one event):
+  - *consumed*: `Fetch` returns an empty chunk; the reader reports end of stream, the result is
+    closed;
   - *cancelled*: the client cancels the call or closes the reader early (a LIMIT it applied, a
     cursor closed, a process gone). gRPC stops pulling and destroys the `FlightDataStream`; the
     reader's destructor runs with the query still active → `ClientContext::Interrupt()` on the
-    session connection, the `StreamQueryResult` is destroyed (duckdb tears the pipeline down), the
-    lock is released. Between batches the reader also polls `ServerCallContext::is_cancelled()` and
-    ends the stream itself rather than compute one more chunk for nobody;
+    session connection, the `StreamQueryResult` is destroyed (duckdb tears the pipeline down).
+    Between batches the reader also polls `ServerCallContext::is_cancelled()` and ends the stream
+    itself rather than compute one more chunk for nobody;
   - *superseded*: a new statement of the same session arrives (GetFlightInfo / DoPut / ...) while
-    a stream is open on its connection. The newer statement takes the exec lock only when the older
-    stream is gone; to keep a client that forgot a cursor from hanging its own session, the door
-    interrupts an open stream that has not been pulled for `acl_flight_stream_idle` seconds
-    (default 30) before the new statement waits on the lock - duckdb's own rule ("a new query
-    invalidates the previous stream result"), made explicit and bounded. A driver that pulls
-    sequentially never sees this.
+    a stream is open on its connection and unpulled for `acl_flight_stream_idle` seconds (default
+    30): the statement ends it and runs - duckdb's own rule ("a new query invalidates the previous
+    stream result"), made explicit and bounded. A driver that pulls sequentially never sees this; a
+    statement arriving while the stream is being pulled waits for it. The reader learns of it at
+    its next pull (a `Cancelled` status carrying `acl: the stream was superseded by the session's
+    next statement`) or in its destructor, and records `stream_superseded` either way. A session
+    that dies with a stream open (`SweepConnsLocked`) ends it the same way;
+  - *capped* and *failed*: below.
 - **`acl_max_result_rows`** (GLOBAL, default 0 = unlimited): rows a statement may hand out through
   the door; counted as they are streamed, and the stream ends in a refusal
   (`acl: the result exceeds acl_max_result_rows (N)`) the moment the count passes it - after N rows
@@ -94,9 +104,13 @@ transport.
 
 ### Ingest: the client that stops sending is heard
 
-- `IngestGetNext` checks `context.is_cancelled()` before every `reader->Next()`: a cancelled DoPut
-  ends the scan with `acl: the client cancelled the ingest`, which fails the INSERT, which rolls the
-  load back - spec 049's "one batch, one outcome" unchanged, now with a name for it.
+- `IngestGetNext` checks `context.is_cancelled()` before every `reader->Next()`, after a failed one,
+  and **at the end of the stream**: a client that died mid-load reads as a clean end of stream (gRPC's
+  `Read` returns false for a torn-down call exactly as for a half-close), and only the call's
+  cancelled flag tells a finished load from a dead sender - committing what arrived before the death
+  would make a partial load. A cancelled DoPut ends the scan with `acl: the client cancelled the
+  ingest`, which fails the INSERT, which rolls the load back - spec 049's "one batch, one outcome"
+  unchanged, now with a name for it.
 - A server-side refusal mid-stream (the row cap, a policy `error()` on a row) already fails the
   INSERT and rolls back; the DoPut answer carries it, which is what makes the client stop. Nothing
   new there beyond the event.
@@ -115,10 +129,15 @@ transport.
 
 ### Data structures
 
-- `FlightDoorState::Reservation` gains nothing; the reader holds it.
-- `SessionConn` gains `std::atomic<int64_t> stream_last_pull` (the idle clock) and
-  `std::atomic<bool> stream_open`, read by the supersede rule and the gauge.
-- Settings `acl_max_result_rows` (BIGINT, 0), `acl_flight_stream_idle` (BIGINT seconds, 30).
+- `FlightDoorState::Reservation` gains nothing; the reader holds it (the statement and the session
+  connection stay alive as long as the stream).
+- `FlightDoorState::ResultStream` (the slot: `unique_ptr<QueryResult> result`, `bool superseded`);
+  `SessionConn` gains `std::mutex stream_lock`, `shared_ptr<ResultStream> stream`,
+  `std::atomic<int64_t> stream_last_pull` (the idle clock, steady-clock milliseconds),
+  `StreamOpen()` and `EndStreamLocked()`; `FlightDoorState` gains `LockForStatement(conn)` and the
+  `open_streams` counter behind the gauge.
+- Settings `acl_max_result_rows` (BIGINT, 0), `acl_flight_stream_idle` (BIGINT seconds, 30);
+  `PolicyStore::MaxResultRows()` / `FlightStreamIdleSeconds()` read them through the instance.
 
 ### Interaction
 
@@ -134,12 +153,14 @@ transport.
 - Nothing about *what* a statement returns changes: the statement was parsed, rewritten and bound
   at GetFlightInfo (spec 047) and is executed as bound. Streaming changes when the rows are
   computed, not which.
-- The exec lock held for the stream's life is the invariant that keeps a `StreamQueryResult` from
-  ever reading another statement's connection state: one statement per connection, enforced by the
-  lock, whichever RPC asks. A reader that outlives its call cannot exist - gRPC destroys the
-  `FlightDataStream` with the call.
+- `exec` taken per pull and by every statement (`LockForStatement`) is the invariant that keeps a
+  `StreamQueryResult` from ever reading another statement's connection state: one statement per
+  connection at any instant, whichever RPC asks, and a stream is ended before a statement runs on
+  its connection - never invalidated underneath a pull. A reader that outlives its call cannot
+  exist - gRPC destroys the `FlightDataStream` with the call.
 - The interrupt is the session connection's own (`ClientContext::Interrupt`), reached only through
-  a reader that owns that connection's lock: no path interrupts another session's query.
+  that connection's reader, a statement of the same session holding its `exec`, or the sweep of a
+  dead session: no path interrupts another session's query.
 - `acl_max_result_rows` is a GLOBAL setting; a principal cannot raise it (spec 068's gate).
 - A stream that fails mid-way (a source error at chunk k) ends in a Flight error carrying our
   prefix; the batches already sent are the client's - a partial result is an error, never a silent
@@ -150,27 +171,46 @@ transport.
 
 ## Testing
 
-- **C++ (`make test-cpp`, flight build)**: `test_acl_flight_stream.cpp` with an in-process
-  `arrow::flight::sql::FlightSqlClient` against `acl_flight_serve` on loopback:
-  - *first batch before the last*: `SELECT i FROM range(200000000)`; the first batch arrives in
-    well under the time the whole scan takes (measured: the reader is pulled once, timed);
-  - *cancel is heard*: read one batch, close the reader; within a second the session's next
-    statement runs (the lock was released) and `acl_audit_events()` has a `door` event
-    `stream_cancelled` with `rows` = the batch's size; `acl.door.streams{outcome=cancelled}` = 1;
-  - *supersede*: open a stream, do not pull, send the next statement with `acl_flight_stream_idle`
-    = 1: it runs; the old stream's event is `stream_superseded`;
-  - *cap*: `SET GLOBAL acl_max_result_rows = 1000`, a 5000-row result ends in the refusal after the
-    cap, event `stream_capped`, the client sees `acl: the result exceeds acl_max_result_rows (1000)`;
-  - *consumed*: a full read ends with `stream_consumed` and `rows` = the count;
-  - *a source error mid-stream* (a table function that throws at row k) reaches the client as an
-    error, not a short result;
-  - *ingest cancel*: a DoPut of 1M rows cancelled after the first batch: the target has none of
-    them (rollback), event `ingest_cancelled`, the ingest event `denied / unavailable`.
-- **e2e (`make test-flight`)**: `adbc_client.py` gains a LIMIT-shaped read (fetch one batch of a
-  large result, close) and asserts the server's next statement on the same connection is prompt;
-  `client.py` the ingest cancel.
+- **e2e (`make test-flight`, `test/e2e/flight/stream.sh` + `stream_client.py`)**: a third-party
+  pyarrow Flight client against the served node (a duckdb CLI fed through a fifo, whose own stdin
+  answers what the server heard - `acl_audit_events()`), over a virtual view of 200M rows nobody
+  stores (`range(200000000)` with a cast per row - a materialization would take seconds and
+  gigabytes):
+  - *first batch before the last*: `SELECT * FROM big`, the first `read_chunk` within 3 s (measured
+    ~30 ms), then `reader.cancel()`; the last `door` event is `stream_cancelled` with rows > 0 - the
+    cancel was heard and the query interrupted;
+  - *consumed*: the tenant's five rows end as `stream_consumed,5`;
+  - *supersede*: read one batch, keep the reader open and unpulled, run `SELECT 1` on the same
+    session (a cookie; warmed up first, since the cookie arrives with the first answer) with
+    `acl_flight_stream_idle = 2`: it answers after ≥ 1.5 s and < 10 s, and one `stream_superseded`
+    event lands once gRPC tears the old call down;
+  - *cap*: `SET GLOBAL acl_max_result_rows = 1000`; the read ends in `acl: the result exceeds
+    acl_max_result_rows (1000)`, event `stream_capped` with rows ≥ 1000;
+  - *ingest cancel*: a DoPut streaming 10k-row batches forever, `kill -9` after 30k sent: one
+    `door` event `ingest_cancelled`, zero of its rows stored, the ingest event `denied / unavailable`.
+- A source error mid-stream reaches the client as an error, not a short result, by construction
+  (`RecordBatchReader::ReadNext` returns the status; `RecordBatchStream` propagates it); the
+  existing Flight e2e and the C++ door tests keep every other RPC where it was.
 - The memory claim is pinned by construction (no vector of batches exists in the code) and by
   the first-batch timing; an RSS measurement is a bench (`test/bench/`), not a test.
+
+## Found on the way
+
+- **The CI's e2e steps could not fail.** `make test-flight 2>&1 | tee flight.log` under GitHub's
+  default `bash -e` (no pipefail) reported tee's exit code; `assert_ran.sh flight.log 0 0` checked
+  only for `SKIP:` lines. The Flight e2e had been red on main since the spec 069 review (#117,
+  2026-09-04) - `SessionOpen` now swallows a verification failure into a `session refused` event and
+  the door answers `authentication failed`, which the run.sh check from the 046 review (the keys
+  *could not be read* in the client's refusal) contradicted - and every run was green. Fixed here:
+  `defaults: run: shell: bash` (= `bash -eo pipefail`) for the whole workflow, `assert_ran.sh`
+  fails on a `FAIL:` line too, and the check asserts spec 069's contract: the client gets the named
+  refusal and no reason, the audit gets the reason (`source_error`, the text).
+- **A dead ingest client reads as a clean end of stream.** gRPC's `Read` returns false for a
+  torn-down call exactly as for a half-close, so without the `is_cancelled()` check at end of stream
+  the load of a client killed mid-way was *committed* - a partial load nobody asked for. The
+  end-of-stream check is what turns it into the rollback.
+- **The idle clock in whole seconds** made a 2 s threshold fire after 1.2 s; the clock is
+  steady-clock milliseconds.
 
 ## Alternatives considered
 

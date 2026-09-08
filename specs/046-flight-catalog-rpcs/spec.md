@@ -177,8 +177,12 @@ path shares the skeleton rather than copying it. `SchemasFor` does its duckdb wo
 transaction and its Arrow work outside, where a failure is a `Status` and never an abort.
 
 The e2e pins it from the outside: a token naming a file-backed issuer whose document does not exist
-gets a refusal that says the keys *could not be read*, not `Unexpected error`, and after every
-refusal and throw of the run `acl_session_count()` is zero.
+gets a named refusal, not `Unexpected error`, and after every refusal and throw of the run
+`acl_session_count()` is zero. (Since spec 069 that refusal is `acl: authentication failed` - the
+door tells a client no more about a token than spec 040 allows, and the reason, *the keys could not
+be read*, is a `session` event `refused` with reason_code `source_error` in the audit; the e2e
+asserts both. The check had asserted the older text from the 069 review until spec 070, unnoticed:
+the CI step behind `| tee` had no pipefail.)
 
 **A table with no visible columns is promised an empty schema, and that is the honest answer.** It is
 exactly what `information_schema.columns` says about it, so the two Flight answers agree with each

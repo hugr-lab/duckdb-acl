@@ -573,12 +573,15 @@ struct PolicyStore {
 	//! (`error` empty = it succeeded). A failure that carries our own prefix is the write policy
 	//! refusing where the value is written (spec 024) or the door's own load check; any other is the
 	//! physical source refusing the write.
-	void AuditIngest(const string &handle, int64_t rows, const string &error);
+	//! `reason_code` names the failure's code where the text alone cannot (a cancelled load is
+	//! `unavailable`: the client was not there to finish it); null = classify from the text.
+	void AuditIngest(const string &handle, int64_t rows, const string &error, const char *reason_code = nullptr);
 	//! A door event: the password handshake (spec 064) or a ticket's fate (spec 047) - `detail` is
 	//! `handshake` or `ticket_issued` / `ticket_redeemed` / `ticket_expired` / `ticket_foreign`.
 	//! `handle` names the session when there is one; `principal` the one a handshake verified.
 	void AuditDoor(const string &door, const string &detail, bool allowed, const string &reason_code,
-	               const string &reason, const string &handle = string(), const Principal *principal = nullptr);
+	               const string &reason, const string &handle = string(), const Principal *principal = nullptr,
+	               int64_t rows = -1);
 	//! The policy source: `reloaded` (a version change adopted), `written` (a management write
 	//! committed), `source_error` (the source did not answer - the statement was refused)
 	void AuditPolicy(const string &detail, const string &reason);
@@ -631,6 +634,10 @@ struct PolicyStore {
 	//! use of a live session; false (connect, the default) binds freshness to establishment only.
 	bool SessionExpEveryUse();
 	int64_t MaxIngestRows();
+	//! spec 070: rows a statement may hand out through a door (0 = unlimited), and the seconds an open
+	//! Flight result stream may sit unpulled before the session's next statement supersedes it
+	int64_t MaxResultRows();
+	int64_t FlightStreamIdleSeconds();
 	int64_t MaxSessions();
 
 	//! Is an ACL door serving on this instance (spec 043)? Set by `acl_quack_serve`, cleared when the

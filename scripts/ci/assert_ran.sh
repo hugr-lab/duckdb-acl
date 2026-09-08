@@ -19,6 +19,13 @@ if grep -qE '^SKIP:' "$log"; then
 	grep -E '^SKIP:' "$log" >&2
 	exit 1
 fi
+# an e2e script's own failure line - belt and braces beside the step's pipefail: a `FAIL:` that
+# reached the log must never sit under a green step, whatever the pipe reported
+if grep -qE '^FAIL:' "$log"; then
+	echo "assert_ran: a script failed on this runner:" >&2
+	grep -E '^FAIL:' "$log" >&2
+	exit 1
+fi
 
 if [ "$min_cases" -eq 0 ] && [ "$min_assertions" -eq 0 ]; then
 	exit 0 # an e2e log: the SKIP check above is the whole floor

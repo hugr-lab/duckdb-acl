@@ -16,6 +16,7 @@
 #include "duckdb/common/error_data.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <arrow/util/config.h>
 
@@ -97,18 +98,83 @@ struct FlightDoorState {
 	//! the session lives, so what a connection owns - temp tables, in time a transaction - survives
 	//! across the session's RPCs and is visible to nobody else's. ~7KB idle, measured; destroying
 	//! the entry reclaims all of it natively.
+	//! spec 070: one result stream - the slot its reader and the connection share (see SessionConn)
+	struct ResultStream {
+		unique_ptr<QueryResult> result;
+		bool superseded = false;
+	};
 	struct SessionConn {
 		unique_ptr<Connection> con;
 		//! One execution at a time per connection: neither a Connection nor a PreparedStatement is
-		//! a concurrent object, and every reservation of a session now shares this one.
+		//! a concurrent object, and every reservation of a session now shares this one. A result
+		//! stream holds it for its whole life (spec 070), which is what keeps a StreamQueryResult from
+		//! ever seeing another statement's connection state.
 		std::mutex exec;
 		//! The open transaction's id (spec 055), or "" for none. A session's connection holds at most
 		//! one transaction - BeginTransaction opens it, EndTransaction ends it, and destroying the
 		//! connection (session end) rolls it back natively. Guarded by `exec`, like the connection.
 		string txn_id;
+		//! spec 070: the result stream open on this connection, REACHABLE FROM HERE rather than owned by
+		//! its reader alone - a reader lives as long as its gRPC call, which a client that forgot its
+		//! cursor never ends, so the session's next statement must be able to end the stream from its
+		//! own thread. The reader pulls one chunk at a time under `exec` and `stream_lock`; a statement
+		//! that holds `exec` therefore sees no pull in flight, and one that finds the stream idle past
+		//! acl_flight_stream_idle interrupts the query and drops the result - the reader's next pull
+		//! (or its end) finds its slot empty and says `superseded`. The slot is the stream's own, so a
+		//! newer stream on the connection never overwrites what an older reader will read.
+		//! `stream_last_pull` is the idle clock.
+		std::mutex stream_lock;
+		shared_ptr<ResultStream> stream;
+		std::atomic<int64_t> stream_last_pull {0};
+		bool StreamOpen() {
+			std::lock_guard<std::mutex> guard(stream_lock);
+			return stream && stream->result;
+		}
+		//! Ends the open stream from another thread - the session's next statement, the session's end:
+		//! the query is interrupted, the result dropped, and the reader finds `superseded` in its slot.
+		//! Caller holds `stream_lock`.
+		void EndStreamLocked() {
+			if (stream && stream->result) {
+				con->context->Interrupt();
+				stream->result.reset();
+				stream->superseded = true;
+			}
+			stream.reset();
+		}
 	};
 	std::unordered_map<string, shared_ptr<SessionConn>> session_conns;
 	int64_t last_conn_sweep = 0;
+	//! spec 070: result streams open right now on this door's connections (the gauge)
+	std::atomic<int64_t> open_streams {0};
+
+	//! The lock every statement takes on its session's connection (spec 070). A result stream holds
+	//! `exec` for as long as its client pulls; a statement arriving behind it waits - a driver that
+	//! consumes sequentially never does - unless the stream has sat unpulled for
+	//! acl_flight_stream_idle seconds, a cursor somebody forgot: then it is interrupted (duckdb's own
+	//! rule, "a new query invalidates the previous stream result", made explicit and bounded), its
+	//! reader ends the stream and releases `exec`, and the statement runs.
+	std::unique_lock<std::mutex> LockForStatement(SessionConn &conn) {
+		for (;;) {
+			std::unique_lock<std::mutex> guard(conn.exec);
+			{
+				std::lock_guard<std::mutex> stream(conn.stream_lock);
+				if (!conn.stream || !conn.stream->result) {
+					return guard; // no stream on this connection: the statement runs
+				}
+				auto idle = store->FlightStreamIdleSeconds();
+				if (idle >= 0 && NowMillis() - conn.stream_last_pull.load() >= idle * 1000) {
+					// a cursor somebody forgot: ended here, from this thread. The interrupt stops
+					// whatever the query still runs, the result goes, and the reader finds it gone on
+					// its next pull (if there ever is one)
+					conn.EndStreamLocked();
+					return guard;
+				}
+			}
+			// being pulled: the reader needs `exec` for its next chunk, so let go and look again
+			guard.unlock();
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		}
+	}
 
 	//! The reservation (design 010 §10.3, applied to one instance): a statement PARSED, REWRITTEN
 	//! AND BOUND exactly once, held on its session's own connection, redeemable only by the
@@ -148,6 +214,13 @@ struct FlightDoorState {
 
 	static int64_t NowSeconds() {
 		return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+		    .count();
+	}
+	//! The idle clock of a result stream (spec 070): milliseconds on the steady clock, so a
+	//! two-second idle is two seconds and not "the second changed"
+	static int64_t NowMillis() {
+		return std::chrono::duration_cast<std::chrono::milliseconds>(
+		           std::chrono::steady_clock::now().time_since_epoch())
 		    .count();
 	}
 
@@ -255,6 +328,13 @@ struct FlightDoorState {
 	void SweepConnsLocked() {
 		for (auto it = session_conns.begin(); it != session_conns.end();) {
 			if (!store->SessionAlive(it->first)) {
+				// a stream still open on a dead session's connection ends now, not when its client
+				// notices (spec 070): the reader keeps the connection alive until it does
+				{
+					auto &conn = *it->second;
+					std::lock_guard<std::mutex> stream(conn.stream_lock);
+					conn.EndStreamLocked();
+				}
 				it = session_conns.erase(it);
 			} else {
 				++it;
@@ -267,6 +347,144 @@ struct FlightDoorState {
 		std::lock_guard<std::mutex> guard(lock);
 		session_conns.clear();
 	}
+};
+
+//! spec 070: the pull stream behind DoGet. The statement executed with a streaming result under
+//! the session connection's `exec`; the result lives in a slot the CONNECTION can reach (`stream`),
+//! and this reader turns it into Arrow one chunk per pull - each pull under `exec` and `stream_lock`, so a
+//! statement of the session never runs in the middle of one, and the session's next statement can
+//! end an idle stream from its own thread (a reader lives as long as its gRPC call, which a client
+//! that forgot its cursor never ends). Its end, however it comes, interrupts the query: consumed
+//! (the last chunk), cancelled (the client closed or cancelled the call - gRPC destroys the reader,
+//! whose destructor interrupts what still runs), superseded (the session's next statement found it
+//! idle and ended it, or the session died), capped (acl_max_result_rows), failed (the source). One
+//! audit event per stream, with the rows that went out.
+class AclResultReader : public arrow::RecordBatchReader {
+public:
+	AclResultReader(shared_ptr<FlightDoorState> state_p, shared_ptr<FlightDoorState::Reservation> reservation_p,
+	                shared_ptr<FlightDoorState::ResultStream> slot_p, std::shared_ptr<arrow::Schema> schema_p,
+	                const flight::ServerCallContext &context_p, string handle_p)
+	    : state(std::move(state_p)), reservation(std::move(reservation_p)), slot(std::move(slot_p)),
+	      schema_(std::move(schema_p)), context(context_p), handle(std::move(handle_p)),
+	      cap(state->store->MaxResultRows()) {
+		reservation->conn->stream_last_pull.store(FlightDoorState::NowMillis());
+		state->open_streams++;
+	}
+	~AclResultReader() override {
+		// a stream gRPC tore down mid-way (a no-op for one that ended itself): the client cancelled
+		// it - unless the session's next statement, or the session's end, had already ended it
+		bool superseded;
+		{
+			std::lock_guard<std::mutex> stream(reservation->conn->stream_lock);
+			superseded = slot->superseded;
+		}
+		End(superseded ? "superseded" : "cancelled");
+	}
+
+	std::shared_ptr<arrow::Schema> schema() const override {
+		return schema_;
+	}
+
+	arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override {
+		*batch = nullptr;
+		if (ended) {
+			return arrow::Status::OK();
+		}
+		auto &conn = *reservation->conn;
+		conn.stream_last_pull.store(FlightDoorState::NowMillis());
+		if (context.is_cancelled()) {
+			End("cancelled");
+			return arrow::Status::OK();
+		}
+		unique_ptr<DataChunk> chunk;
+		string error;
+		bool gone = false;
+		bool superseded = false;
+		{
+			std::lock_guard<std::mutex> exec(conn.exec);
+			std::lock_guard<std::mutex> stream(conn.stream_lock);
+			if (!slot->result) {
+				gone = true;
+				superseded = slot->superseded;
+			} else {
+				try {
+					chunk = slot->result->Fetch();
+				} catch (std::exception &ex) {
+					error = ErrorData(ex).RawMessage(); // an interrupt surfaces here or below
+				}
+				if (error.empty() && slot->result->HasError()) {
+					error = slot->result->GetError();
+				}
+			}
+		}
+		if (gone) {
+			// ended from another thread: the session's next statement (idle), or the session's end
+			End(superseded ? "superseded" : "cancelled");
+			return superseded
+			           ? arrow::Status::Cancelled("acl: the stream was superseded by the session's next statement")
+			           : arrow::Status::OK();
+		}
+		if (!error.empty()) {
+			if (context.is_cancelled()) {
+				End("cancelled");
+				return arrow::Status::OK();
+			}
+			End("failed", error);
+			return StatusFromDuck("acl", error); // a partial result is an error, never a short one
+		}
+		if (!chunk || chunk->size() == 0) {
+			End("consumed");
+			return arrow::Status::OK();
+		}
+		rows += NumericCast<int64_t>(chunk->size());
+		if (cap > 0 && rows > cap) {
+			auto message = "acl: the result exceeds acl_max_result_rows (" + std::to_string(cap) + ")";
+			End("capped", message);
+			return arrow::Status::Invalid(message);
+		}
+		ArrowArray array;
+		ArrowConverter::ToArrowArray(*chunk, &array, conn.con->context->GetClientProperties(), {});
+		ARROW_ASSIGN_OR_RAISE(*batch, arrow::ImportRecordBatch(&array, schema_));
+		return arrow::Status::OK();
+	}
+
+private:
+	//! Once. Interrupts a query still running for nobody, drops the result off the connection, and
+	//! records the stream with what went out.
+	void End(const string &outcome, const string &message = string()) {
+		if (ended) {
+			return;
+		}
+		ended = true;
+		auto &conn = *reservation->conn;
+		{
+			std::lock_guard<std::mutex> exec(conn.exec);
+			std::lock_guard<std::mutex> stream(conn.stream_lock);
+			if (slot->result) {
+				if (outcome != "consumed") {
+					conn.con->context->Interrupt();
+				}
+				slot->result.reset();
+			}
+			if (conn.stream == slot) {
+				conn.stream.reset();
+			}
+		}
+		state->open_streams--;
+		bool allowed = outcome == "consumed" || outcome == "cancelled" || outcome == "superseded";
+		string code = outcome == "capped" ? "at_capacity" : (outcome == "failed" ? "source_error" : string());
+		state->store->AuditDoor("flight", "stream_" + outcome, allowed, code, message, handle, nullptr, rows);
+	}
+
+	shared_ptr<FlightDoorState> state;
+	shared_ptr<FlightDoorState::Reservation> reservation;
+	shared_ptr<FlightDoorState::ResultStream> slot;
+	std::shared_ptr<arrow::Schema> schema_;
+	const flight::ServerCallContext &context;
+	string handle;
+	int64_t cap;
+	int64_t rows = 0;
+	bool ended = false;
 };
 
 //! Who a principal *is*, for owning door state across calls: the sorted roles and claims. Two tokens
@@ -622,7 +840,7 @@ public:
 				                        "session cookie (a client has one from its second call on)");
 			                    }
 			                    auto conn = state->ConnFor(handle);
-			                    std::lock_guard<std::mutex> execution(conn->exec);
+			                    auto execution = state->LockForStatement(*conn);
 			                    if (!conn->txn_id.empty()) {
 				                    return arrow::Status::Invalid(
 				                        "acl: a transaction is already open on this session - commit or roll it "
@@ -646,7 +864,7 @@ public:
 	                             const flightsql::ActionEndTransactionRequest &request) override {
 		auto ended = UnderSession(context, [&](const string &handle) -> arrow::Result<bool> {
 			auto conn = state->ConnFor(handle);
-			std::lock_guard<std::mutex> execution(conn->exec);
+			auto execution = state->LockForStatement(*conn);
 			if (conn->txn_id.empty() || conn->txn_id != request.transaction_id) {
 				return arrow::Status::KeyError("acl: unknown transaction");
 			}
@@ -684,7 +902,7 @@ public:
 			auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
 			reservation->conn = conn;
 			{
-				std::lock_guard<std::mutex> execution(reservation->conn->exec);
+				auto execution = state->LockForStatement(*reservation->conn);
 				ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, command.transaction_id));
 				TempScanScope temp_scan(reservation->conn->con->context.get());
 				reservation->stmt = reservation->conn->con->Prepare(prefixed);
@@ -728,13 +946,9 @@ public:
 				                    return arrow::Status::KeyError("acl: unknown or already fetched ticket");
 			                    }
 			                    state->store->AuditDoor("flight", "ticket_redeemed", true, string(), string(), caller);
-			                    std::lock_guard<std::mutex> execution(reservation->conn->exec);
+			                    auto execution = state->LockForStatement(*reservation->conn);
 			                    vector<Value> values;
-			                    auto result = reservation->stmt->Execute(values, false);
-			                    if (result->HasError()) {
-				                    return StatusFromDuck("acl", result->GetError());
-			                    }
-			                    return StreamRows(*reservation->conn->con, *result);
+			                    return StreamStatement(context, std::move(reservation), values, caller);
 		                    });
 	}
 
@@ -751,7 +965,7 @@ public:
 			if (prefixed.empty()) {
 				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			}
-			std::lock_guard<std::mutex> execution(conn->exec);
+			auto execution = state->LockForStatement(*conn);
 			ARROW_RETURN_NOT_OK(ValidateTxnLocked(*conn, command.transaction_id));
 			TempScanScope temp_scan(conn->con->context.get());
 			auto stmt = conn->con->Prepare(prefixed);
@@ -786,6 +1000,9 @@ public:
 		int64_t cap = 0;
 		int64_t rows = 0;
 		std::string error;
+		//! spec 070: the call, asked before every batch whether its client is still there
+		const flight::ServerCallContext *context = nullptr;
+		bool cancelled = false;
 	};
 	static int IngestGetSchema(struct ArrowArrayStream *stream, struct ArrowSchema *out) {
 		auto &ingest = *reinterpret_cast<IngestStreamState *>(stream->private_data);
@@ -798,12 +1015,36 @@ public:
 	}
 	static int IngestGetNext(struct ArrowArrayStream *stream, struct ArrowArray *out) {
 		auto &ingest = *reinterpret_cast<IngestStreamState *>(stream->private_data);
+		// a client that cancelled the call is heard here, between batches, rather than as whatever
+		// the reader says once gRPC tears the call down (spec 070): the scan fails, the INSERT with
+		// it, the load rolls back - one batch, one outcome (spec 049)
+		if (ingest.context && ingest.context->is_cancelled()) {
+			ingest.error = "acl: the client cancelled the ingest";
+			ingest.cancelled = true;
+			return EINVAL;
+		}
 		auto chunk = ingest.reader->Next();
 		if (!chunk.ok()) {
+			// a client that vanished mid-stream may surface as the reader's error before the call
+			// reads as cancelled: the same outcome, named the same way
+			if (ingest.context && ingest.context->is_cancelled()) {
+				ingest.error = "acl: the client cancelled the ingest";
+				ingest.cancelled = true;
+				return EINVAL;
+			}
 			ingest.error = chunk.status().ToString();
 			return EINVAL;
 		}
 		if (!chunk->data) {
+			// the stream ended - by the client's half-close (a finished load), or because the call was
+			// torn down under it: a client that died mid-load reads as a clean end of stream here, and
+			// only the call's own cancelled flag tells the two apart. Committing what arrived before the
+			// death would make a partial load - so it is the cancel, and the rollback
+			if (ingest.context && ingest.context->is_cancelled()) {
+				ingest.error = "acl: the client cancelled the ingest";
+				ingest.cancelled = true;
+				return EINVAL;
+			}
 			out->release = nullptr; // end of stream
 			return 0;
 		}
@@ -929,6 +1170,7 @@ public:
 			ingest.reader = reader;
 			ingest.schema = schema;
 			ingest.cap = state->store->MaxIngestRows();
+			ingest.context = &context; // spec 070: a cancelled call is heard between batches
 			ArrowArrayStream stream;
 			stream.get_schema = IngestGetSchema;
 			stream.get_next = IngestGetNext;
@@ -954,7 +1196,7 @@ public:
 			}
 			auto prefixed = "ACL INGEST '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
 			auto conn = state->ConnFor(handle);
-			std::lock_guard<std::mutex> execution(conn->exec);
+			auto execution = state->LockForStatement(*conn);
 			TempScanScope temp_scan(conn->con->context.get());
 			auto &con = *conn->con;
 			auto stmt = con.Prepare(prefixed);
@@ -981,12 +1223,20 @@ public:
 			}
 			// `audit_text` is the RAW error, not the status the client gets: the audit keeps only our
 			// own refusals whole and reduces a source's error to its class (spec 069)
-			auto fail = [&](arrow::Status status, const string &audit_text) -> arrow::Status {
+			auto fail = [&](arrow::Status status, const string &audit_text,
+			                const char *reason_code = nullptr) -> arrow::Status {
 				con.Query("ROLLBACK");
-				state->store->AuditIngest(handle, -1, audit_text);
+				state->store->AuditIngest(handle, -1, audit_text, reason_code);
 				return status;
 			};
 			auto result = stmt->Execute(values, false);
+			if (ingest.cancelled) {
+				// the client stopped sending (spec 070): the scan refused the next batch and the INSERT
+				// failed with it - the load rolls back, the door says which side stopped, and the ingest
+				// event is `unavailable` (the client was not there to finish it), not a write policy
+				state->store->AuditDoor("flight", "ingest_cancelled", false, "unavailable", ingest.error, handle);
+				return fail(arrow::Status::Cancelled(ingest.error), ingest.error, "unavailable");
+			}
 			if (result->HasError()) {
 				return fail(StatusFromDuck("acl", result->GetError()), result->GetError());
 			}
@@ -1042,7 +1292,7 @@ public:
 			    auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
 			    reservation->conn = conn;
 			    {
-				    std::lock_guard<std::mutex> execution(reservation->conn->exec);
+				    auto execution = state->LockForStatement(*reservation->conn);
 				    ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, request.transaction_id));
 				    TempScanScope temp_scan(reservation->conn->con->context.get());
 				    reservation->stmt = reservation->conn->con->Prepare(prefixed);
@@ -1084,7 +1334,7 @@ public:
 			if (!reservation) {
 				return arrow::Status::KeyError("acl: unknown prepared statement");
 			}
-			std::lock_guard<std::mutex> execution(reservation->conn->exec);
+			auto execution = state->LockForStatement(*reservation->conn);
 			reservation->parameter_rows = std::move(rows);
 			return true;
 		});
@@ -1104,7 +1354,7 @@ public:
 			std::shared_ptr<arrow::Schema> dataset_schema;
 			std::shared_ptr<arrow::Schema> parameter_schema;
 			{
-				std::lock_guard<std::mutex> execution(reservation->conn->exec);
+				auto execution = state->LockForStatement(*reservation->conn);
 				auto bound = reservation->parameter_rows.empty() ? nullptr : &reservation->parameter_rows.front();
 				ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->stmt, bound, dataset_schema, parameter_schema));
 			}
@@ -1128,7 +1378,7 @@ public:
 			    if (!reservation) {
 				    return arrow::Status::KeyError("acl: unknown prepared statement");
 			    }
-			    std::lock_guard<std::mutex> execution(reservation->conn->exec);
+			    auto execution = state->LockForStatement(*reservation->conn);
 			    if (reservation->parameter_rows.size() > 1) {
 				    // answering from the first row alone is a silently wrong result; batches are
 				    // the update path's business
@@ -1139,11 +1389,7 @@ public:
 			    if (!reservation->parameter_rows.empty()) {
 				    values = reservation->parameter_rows.front();
 			    }
-			    auto result = reservation->stmt->Execute(values, false);
-			    if (result->HasError()) {
-				    return StatusFromDuck("acl", result->GetError());
-			    }
-			    return StreamRows(*reservation->conn->con, *result);
+			    return StreamStatement(context, std::move(reservation), values, caller);
 		    });
 	}
 
@@ -1157,7 +1403,7 @@ public:
 				return arrow::Status::KeyError("acl: unknown prepared statement");
 			}
 			ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader, FlightDoorState::MAX_PARAM_ROWS));
-			std::lock_guard<std::mutex> execution(reservation->conn->exec);
+			auto execution = state->LockForStatement(*reservation->conn);
 			// executemany semantics, DBAPI's: once per parameter row. Zero rows with declared
 			// parameters is zero executions - not one; only a parameterless statement runs once.
 			if (rows.empty()) {
@@ -1265,23 +1511,31 @@ public:
 
 	//! A finished result as one Flight stream - the tail every data-returning RPC shares. (The
 	//! statement path predates it and still carries its own copy; folding that is cleanup, not now.)
-	arrow::Result<std::unique_ptr<flight::FlightDataStream>> StreamRows(Connection &con, QueryResult &result) {
-		std::shared_ptr<arrow::Schema> schema;
-		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result.GetTypes(), result.GetNames()));
-
-		std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
-		auto properties = con.context->GetClientProperties();
-		while (true) {
-			auto chunk = result.Fetch();
-			if (!chunk || chunk->size() == 0) {
-				break;
-			}
-			ArrowArray array;
-			ArrowConverter::ToArrowArray(*chunk, &array, properties, {});
-			ARROW_ASSIGN_OR_RAISE(auto batch, arrow::ImportRecordBatch(&array, schema));
-			batches.push_back(std::move(batch));
+	//! spec 070: the rows go out as duckdb produces them. The statement executes with a streaming
+	//! result, and gRPC pulls one chunk per batch through AclResultReader, which owns the execution
+	//! - the reservation, the connection's `exec` lock, the result - for exactly as long as the
+	//! client pulls. Its end, however it comes, interrupts the query: nothing is computed for a client
+	//! that stopped listening, and nothing is held in RAM beyond the chunk in flight.
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
+	StreamStatement(const flight::ServerCallContext &context, shared_ptr<FlightDoorState::Reservation> reservation,
+	                vector<Value> &values, const string &handle) {
+		// under the caller's `exec`: the statement executes here; its result goes onto the connection,
+		// where the reader pulls it and the session's next statement can end it (spec 070)
+		auto result = reservation->stmt->Execute(values, true);
+		if (result->HasError()) {
+			return StatusFromDuck("acl", result->GetError());
 		}
-		ARROW_ASSIGN_OR_RAISE(auto reader, arrow::RecordBatchReader::Make(std::move(batches), schema));
+		std::shared_ptr<arrow::Schema> schema;
+		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result->GetTypes(), result->GetNames()));
+		auto slot = make_shared_ptr<FlightDoorState::ResultStream>();
+		slot->result = std::move(result);
+		{
+			auto &conn = *reservation->conn;
+			std::lock_guard<std::mutex> stream(conn.stream_lock);
+			conn.stream = slot; // LockForStatement let this statement in: no live stream sits here
+		}
+		auto reader = std::make_shared<AclResultReader>(state, std::move(reservation), std::move(slot),
+		                                                std::move(schema), context, handle);
 		return std::make_unique<flight::RecordBatchStream>(std::move(reader));
 	}
 
@@ -1342,7 +1596,7 @@ public:
 			    // the same rewriter with the executing context set, so the session's temp tables
 			    // appear in GetTables exactly as they do in SHOW TABLES
 			    auto conn = state->ConnFor(handle);
-			    std::lock_guard<std::mutex> execution(conn->exec);
+			    auto execution = state->LockForStatement(*conn);
 			    TempScanScope temp_scan(conn->con->context.get());
 			    ARROW_ASSIGN_OR_RAISE(auto tables,
 			                          RunCatalogQuery(*state->store, *conn->con, handle,
@@ -1462,7 +1716,7 @@ private:
 		return CatalogStream(
 		    context, schema, [&](const string &handle) -> arrow::Result<std::shared_ptr<arrow::RecordBatch>> {
 			    auto conn = state->ConnFor(handle);
-			    std::lock_guard<std::mutex> execution(conn->exec);
+			    auto execution = state->LockForStatement(*conn);
 			    TempScanScope temp_scan(conn->con->context.get());
 			    ARROW_ASSIGN_OR_RAISE(auto rows, RunCatalogQuery(*state->store, *conn->con, handle, query));
 			    return BatchFrom(schema, *rows, nullptr);
@@ -1621,7 +1875,7 @@ private:
 				                              "door's session cookie (a client has one from its second call on)");
 			}
 			auto conn = state->ConnFor(handle);
-			std::lock_guard<std::mutex> execution(conn->exec);
+			auto execution = state->LockForStatement(*conn);
 			flight::SetSessionOptionsResult result;
 			for (auto &option : request.session_options) {
 				if (!ClientSettingAllowed(option.first)) {
@@ -1656,7 +1910,7 @@ private:
 				return result; // a per-call session holds nothing
 			}
 			auto conn = state->ConnFor(handle);
-			std::lock_guard<std::mutex> execution(conn->exec);
+			auto execution = state->LockForStatement(*conn);
 			for (const char *name : {"TimeZone", "Calendar"}) {
 				auto value = conn->con->Query(string("SELECT current_setting('") + name + "')");
 				if (!value->HasError() && value->RowCount() == 1 && !value->GetValue(0, 0).IsNull()) {
@@ -1950,6 +2204,24 @@ void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> stor
 				                         }
 			                         }
 			                         return count;
+		                         });
+		// spec 070: result streams open right now, across this instance's doors - a fleet of
+		// forgotten cursors shows here before it shows as a session that will not run its next statement
+		hooks->Gauges().Register("acl.door.streams_open", {{"door", "flight"}}, "1",
+		                         "result streams being pulled right now", [weak_db]() -> int64_t {
+			                         auto locked = weak_db.lock();
+			                         if (!locked) {
+				                         return 0;
+			                         }
+			                         auto &doors = ServedDoors::Get();
+			                         std::lock_guard<std::mutex> guard(doors.lock);
+			                         int64_t open = 0;
+			                         for (auto &entry : doors.doors) {
+				                         if (entry.second.owner.lock().get() == locked.get() && entry.second.state) {
+					                         open += entry.second.state->open_streams.load();
+				                         }
+			                         }
+			                         return open;
 		                         });
 	}
 	auto v = LogicalType::VARCHAR;
