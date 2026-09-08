@@ -16,5 +16,11 @@ namespace acl {
 //! Register the ACL parser override on the database config, carrying the shared policy store
 void RegisterAclParser(DBConfig &config, shared_ptr<PolicyStore> store);
 
+//! Whether a statement drains a quack client's data stream - calls `acl_quack_scan_data` (the
+//! embedded door's name, spec 063) or `scan_data_from_quack_client` (a stock quack's). The same
+//! reading the override applies to every unprefixed statement (spec 042); the door's statement
+//! hook asks it to tell an ingest from any other statement (spec 069).
+bool StatementDrainsQuackStream(const string &sql);
+
 } // namespace acl
 } // namespace duckdb

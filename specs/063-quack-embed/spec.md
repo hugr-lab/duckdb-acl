@@ -26,7 +26,7 @@ take quack as a submodule and run its **original** server inside acl, adapting o
 ### Build — the embedded server graph
 
 - **Submodule** `third_party/quack` (upstream `duckdb/duckdb-quack`, pinned at
-  `f28823ddb9b6b9c22e72176f2b8db00cbc8b6e9b`). Only quack's transport-agnostic **server** object graph
+  `f4328c5333e88756a97a3e53118a695252befb4e` since 2026-09-08 - the duckdb 2.0 pin; see the addendum). Only quack's transport-agnostic **server** object graph
   is compiled into acl's `EXTENSION_SOURCES` (protocol machinery: message/serialize, data stream,
   fetch ahead/collector, result cache, rebalancer, uri, log, and `quack_server`). The whole
   client/storage half, the extension entrypoint, `quack_start_stop` and the client admin table
@@ -124,6 +124,20 @@ armed and A's sessions were never closed. Both take the calling instance now —
 refused, the count is the instance's own. The serve preconditions moved to the shared
 `RefuseUnlessServable` the same day (spec 053's cleartext rule now holds here too, with `plain` as
 the explicit opt-out). Pinned by `test_acl_instance_isolation.cpp`.
+
+## Addendum 2026-09-08 — the duckdb 2.0 pin (quack f4328c5)
+
+The submodule moved from `f28823d` to `f4328c5` - the commit duckdb's 2.0 release branch pins for
+the quack loadable (with its `0001-table-catalog-entry-columns.patch`, applied to the loadable via
+`APPLY_PATCHES`; the embed compiles none of the client/storage TUs the patch touches). What changed
+for the embed: quack's server was split (`quack_data_stream.cpp` is gone - `QuackInsertStream` lives
+in a header, `quack_random.cpp` carries the token RNG through `GetEncryptionUtil`, which the
+OpenSSL-backed util acl registers at serve time still serves), the pristine list in `CMakeLists.txt`
+follows; the response writer starts the body at `RawPayloadStart()` (ported into
+`acl_quack_http_server.cpp`); and the drain is the client's statement (spec 042's addendum), so the
+`sync.py` patches are two again: the include, and the statement-completion hook in `DriveQuery`
+(`AclQuackStatementCompleted`) that the audit's ingest event rides on. The `RENAMES`/`FILES` guard
+held unchanged - every renamed literal still lives in the TU it did.
 
 ## Follow-ups
 

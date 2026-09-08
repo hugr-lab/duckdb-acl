@@ -8,7 +8,8 @@
 #
 #   - it builds against `duckdb_version`, checking the submodule out to that version rather than to our
 #     pin. That is what community-extensions does, and it is why our code has to compile against a
-#     duckdb we do not choose. Tracking `main` here is the early warning for that.
+#     duckdb we do not choose. Tracking the 2.0 release branch here (`v2.0-cyanoptera`; `v2.0.0` once
+#     the tag is cut) is the early warning for that - duckdb `main` is 2.1-dev now and diverges.
 #   - it covers the platforms they cover, with their triplets - including MinGW and musl, which our own
 #     matrix never had.
 #
@@ -42,7 +43,7 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       extension_name: acl
-      duckdb_version: main
+      duckdb_version: v2.0-cyanoptera
       ci_tools_version: main
       # No exclusions: WASM gets the extension without the door, because the Arrow dependency carries
       # `"platform": "!wasm32"` and CMakeLists guards on WASM_ENABLED (specs/045).

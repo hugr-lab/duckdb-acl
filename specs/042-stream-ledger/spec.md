@@ -190,6 +190,35 @@ the write is the write policy rather than the transport.
 - **Refuse ingest permanently and tell clients to use `INSERT … VALUES`.** Honest, and gives up the
   reason to have a bulk protocol at all.
 
+## Addendum 2026-09-08 — the client composes the drain (quack f4328c5, the duckdb 2.0 pin)
+
+quack's send-path rework (duckdb-quack #252, in the commit duckdb 2.0 pins) moved the drain statement
+to the **client**: it now composes `INSERT INTO <remote name> SELECT * FROM
+scan_data_from_quack_client('<uuid>', NULL::STRUCT(...), ordered := true|false)` and sends it as an
+ordinary `PREPARE_REQUEST`, so it arrives through the door's authorization callback and is prefixed
+`ACL SESSION '<h>'` like every other statement. The stream id is a bare uuid ("the connection id is
+the secret"), and the stream registry lives on the session's own connection - a stream another
+session filled is not findable from this one. Consequences here:
+
+- **No principal to recover**: the statement is already the session's. The exemption stays what it
+  was - the exact stream id the statement carries, compared constant-for-constant at the call - but
+  the override sets `Principal::ingest_stream` from the prefixed statement itself when a `SESSION`
+  prefix carries a drain call (`ExtractStreamId` reads the first argument; the two that follow pass
+  through untouched). A `ROLE`/`TOKEN` prefix (a gateway's shared connection) gets no exemption: the
+  drain function stays denied there, as it should - no connection of that principal's is filling any
+  stream.
+- **Strategy B kept**: the client composes the stock name; the rewriter retargets the exempted call to
+  `acl_quack_scan_data`, the embedded door's own function, so a stock quack co-loaded beside us still
+  owns `scan_data_from_quack_client`.
+- **The unprefixed fence stays** for a server-generated drain (a stock quack serving beside us): it
+  carries no principal and is refused, as before. With bare uuids the "connection" recovery can never
+  succeed, so the refusal is what remains of that path.
+- **The audit's ingest event** (spec 069) now comes from the server's statement driver (a `sync.py`
+  patch on `DriveQuery`): a completed drain reports its row count, a failed one its error class.
+- The refusals a client sees are unchanged in text (`insert into read-only relation ...`, `must name
+  its columns ...`), but arrive at `PREPARE` rather than at the end of the stream - the early answer
+  the first follow-up below asked for, for free.
+
 ## Follow-ups
 
 - **The probe now passes**, and takes the ordinary path rather than a special case: it is prefixed like

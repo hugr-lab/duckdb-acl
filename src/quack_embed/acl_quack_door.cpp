@@ -12,6 +12,7 @@
 #include "acl_quack_embed.hpp"
 
 #include "acl_audit_pipeline.hpp"
+#include "acl_parser_override.hpp"
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
 #include "acl_quack_server.hpp"
@@ -218,28 +219,32 @@ void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &resu
 
 } // namespace
 
-void AclQuackDrainCompleted(Connection &connection, const string &stream_id, MaterializedQueryResult &result) {
-	// The stream id is `<connection id>:<uuid>`, and the connection id is what acl_quack_authenticate
-	// bound to a session - the same key the override used to decide this very INSERT (spec 042). A
-	// stream nobody bound was refused at parse and has nothing to complete.
-	auto store = PolicyStore::Of(*connection.context->db);
-	if (!store) {
-		return;
+void AclQuackStatementCompleted(Connection &connection, const string &connection_id, const string &sql,
+                                QueryResult &result) {
+	if (!StatementDrainsQuackStream(sql)) {
+		return; // an ordinary statement: its decision is the override's event
 	}
-	auto colon = stream_id.find(':');
+	// the connection id is what acl_quack_authenticate bound to a session; a drain on a connection
+	// nobody bound was refused at parse and has nothing to complete
+	auto store = PolicyStore::Of(*connection.context->db);
 	string handle;
-	if (colon == string::npos || colon == 0 || !store->SessionHandleFor(stream_id.substr(0, colon), handle)) {
+	if (!store || !store->SessionHandleFor(connection_id, handle)) {
 		return;
 	}
 	if (result.HasError()) {
 		store->AuditIngest(handle, -1, result.GetError());
 		return;
 	}
+	// an INSERT answers one count row through the default (materialized) collector; read it without
+	// consuming it - the server still sends it to the client after this
 	int64_t rows = -1;
-	if (result.RowCount() == 1 && result.ColumnCount() == 1) {
-		auto count = result.GetValue(0, 0);
-		if (!count.IsNull()) {
-			rows = count.GetValue<int64_t>();
+	if (result.GetResultType() == QueryResultType::MATERIALIZED_RESULT) {
+		auto &materialized = result.Cast<MaterializedQueryResult>();
+		if (materialized.RowCount() == 1 && materialized.ColumnCount() == 1) {
+			auto count = materialized.GetValue(0, 0);
+			if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
+				rows = count.GetValue<int64_t>();
+			}
 		}
 	}
 	store->AuditIngest(handle, rows, string());

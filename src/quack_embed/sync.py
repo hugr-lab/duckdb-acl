@@ -48,39 +48,19 @@ RENAMES = {
 # patched site is re-audited rather than silently dropped. Keep these few and small.
 PATCHES = {
     "quack_server.cpp": [
-        # spec 069: the audit hears the outcome of a client's drained insert (rows, or the error)
+        # spec 069: the audit hears the outcome of every statement the server drives - the drain of a
+        # client's streamed insert among them (its rows, or the error), which since quack f4328c5 is a
+        # statement the CLIENT composes and the server runs like any other
         (
             '#include "duckdb/main/client_config.hpp"\n',
             '#include "duckdb/main/client_config.hpp"\n#include "acl_quack_embed.hpp"\n',
         ),
         (
-            "\t\tauto result = connection.duckdb_connection->Query(sql);\n"
-            "\t\tif (result->HasError()) {\n"
-            "\t\t\tstream->SetError(result->GetErrorObject());\n"
-            "\t\t}\n",
-            "\t\tauto result = connection.duckdb_connection->Query(sql);\n"
-            "\t\tif (result->HasError()) {\n"
-            "\t\t\tstream->SetError(result->GetErrorObject());\n"
-            "\t\t}\n"
-            "\t\tacl::AclQuackDrainCompleted(*connection.duckdb_connection, stream_id, *result);\n",
-        ),
-        # a refused drain: the error is read from the stream this handler holds BEFORE the finalize -
-        # a second SEND_DATA racing this one finds the insert already finalized (no stream) and would
-        # answer the client an empty error (a CI flake on the read-only refusal, 2026-09-04)
-        (
-            "\t\tif (stream->HasError()) {\n"
-            "\t\t\tauto error = connection.insert.Finalize();\n"
-            "\t\t\treturn make_uniq<ErrorResponse>(error);\n"
-            "\t\t}\n"
-            "\t\treturn make_uniq<SendDataResponseMessage>();",
-            "\t\tif (stream->HasError()) {\n"
-            "\t\t\t// acl: read from the stream this handler holds, before the finalize - a second SEND_DATA\n"
-            "\t\t\t// racing this one finds the insert already finalized and would answer an empty error\n"
-            "\t\t\tauto error = stream->GetError();\n"
-            "\t\t\tconnection.insert.Finalize();\n"
-            "\t\t\treturn make_uniq<ErrorResponse>(error);\n"
-            "\t\t}\n"
-            "\t\treturn make_uniq<SendDataResponseMessage>();",
+            "\t\tconfig.get_result_collector = nullptr;\n"
+            "\t\tif (result->HasError()) {\n",
+            "\t\tconfig.get_result_collector = nullptr;\n"
+            "\t\tacl::AclQuackStatementCompleted(*connection.duckdb_connection, connection.session_id, sql, *result);\n"
+            "\t\tif (result->HasError()) {\n",
         ),
     ],
 }

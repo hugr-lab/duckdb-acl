@@ -1162,13 +1162,19 @@ private:
 		if (!principal.ingest_stream.empty() &&
 		    (StringUtil::CIEquals(vname, "acl_quack_scan_data") ||
 		     StringUtil::CIEquals(vname, "scan_data_from_quack_client")) &&
-		    function.GetArguments().size() == 1) {
+		    !function.GetArguments().empty()) {
+			// the id is the first argument; the client's call (quack f4328c5) adds the types and
+			// `ordered :=` after it, which pass through untouched
 			auto &arg = function.GetArguments()[0].GetExpression();
 			if (arg.GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
 				auto &value = arg.Cast<ConstantExpression>().GetValue();
 				if (!value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR &&
 				    value.GetValue<string>() == principal.ingest_stream) {
-					return; // the principal's own stream: nothing to gate and nothing to rewrite
+					// the principal's own stream: nothing to gate. The call is retargeted to the
+					// embedded door's own function (spec 063, strategy B): the client composes the stock
+					// name, and a stock quack co-loaded beside us owns that one
+					function.SetQualifiedName(ParsePhysName("acl_quack_scan_data"));
+					return;
 				}
 			}
 		}

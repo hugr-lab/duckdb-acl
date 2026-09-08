@@ -12,9 +12,12 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
 ## Technology
 
 - **Language**: C++17 (DuckDB extension standard).
-- **DuckDB**: tracks **`main`** (submodule pinned in `.gitmodules`); depends on parser/AST APIs
-  (`Identifier`, multi-level `QualifiedName`, `MergeQueryNode`, unified DML query nodes) not yet in a
-  stable release. Re-pin to a tag once those land.
+- **DuckDB**: tracks the **2.0 release branch `v2.0-cyanoptera`** (submodule pinned in
+  `.gitmodules`; until 2026-09-08 it tracked `main`, which is now `v2.1.0-dev` and already diverges in
+  the MERGE INTO API the extension ecosystem builds against). Depends on parser/AST APIs
+  (`Identifier`, multi-level `QualifiedName`, `MergeQueryNode`, unified DML query nodes) that land
+  with 2.0. Re-pin to the `v2.0.0` tag when it is cut; the scanners come from the submodule's own
+  extension pins (`.github/config/extensions/`), patches included.
 - **Dependencies**: none (no vcpkg/OpenSSL).
 - **Platforms**: Linux (GCC), macOS (Clang), Windows (MSVC — a release target; CI builds the first two).
 
@@ -211,9 +214,13 @@ tokens. A namespace-alias shim (`acl_quack_httplib_ns.hpp`) lets quack's
 `duckdb_httplib::` sources compile in the OpenSSL httplib namespace; `sync.py` regenerates the few
 acl_-renamed TUs on a submodule bump; the embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
 Streamed ingest
-(`SEND_DATA`) is generated **unprefixed** by the server; spec 042 recovers the principal from the
-stream id the statement itself carries and enforces the write as that principal's — the refusal
-remains only where recovery fails. Staging on quack is a **granted schema** (spec 056): a client's
+(`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the
+**client** — `INSERT INTO t SELECT * FROM scan_data_from_quack_client('<id>', NULL::STRUCT(…),
+ordered := …)` — and arrives through the door's authorization like any statement, under the
+session; spec 042's exemption is keyed by the exact stream id the statement carries (the registry
+is the session's own connection), and the rewriter retargets the call to `acl_quack_scan_data`.
+The unprefixed fence stays for a stock quack's server-generated drain: it carries no principal and
+is refused. Staging on quack is a **granted schema** (spec 056): a client's
 `CREATE TEMP` is its own local catalog and an attached catalog cannot hold one, so the Flight door's
 server-side temp (spec 050) is unreachable from here by construction — CREATE/drain/promote/DROP
 through specs 016/042/051 is the pattern instead.
