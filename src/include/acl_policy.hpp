@@ -449,6 +449,16 @@ struct PolicyStore {
 	                       const string &comment);
 	//! Re-derive the stored column schema of query-defined objects: one object, or a whole catalog
 	idx_t CatalogRefreshSchema(const string &vcat, const string &vname);
+	//! spec 039: one finding of acl_check_catalog - what no longer holds, and the repair it wants
+	struct CatalogFinding {
+		string vcat, kind, object, role, problem, detail, repair;
+	};
+	//! spec 039: probe every stored fact of a catalog (every catalog when `only` is empty) against
+	//! the source, off the query path, and answer what no longer holds; writes nothing
+	vector<CatalogFinding> CatalogCheck(const string &only);
+	//! spec 039: mend a declared COLUMNS list on purpose - `remap` (spec: "name = expression, ..."),
+	//! `drop_missing`, `drop_missing_and_masks`; returns the entries changed
+	int64_t CatalogRepairRelation(const string &vcat, const string &vname, const string &action, const string &spec);
 	void CatalogDropCatalog(const string &vcat, bool cascade);
 	void CatalogDropSchemaAlias(const string &vcat, const string &alias_path, bool cascade = false);
 	void CatalogDropFunction(const string &vcat, const string &vname, const string &kind);

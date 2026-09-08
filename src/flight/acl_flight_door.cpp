@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <arrow/table.h> // arrow::Schema is complete here, not in the flight headers alone
 #include <arrow/util/config.h>
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -32,7 +33,6 @@
 #include "duckdb/main/stream_query_result.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include <thread>
 
 #include <arrow/c/bridge.h>
@@ -43,7 +43,6 @@
 #include <arrow/flight/sql/server.h>
 #include <arrow/record_batch.h>
 #include <arrow/status.h>
-#include <arrow/table.h>
 #include <mutex>
 #include <unordered_map>
 

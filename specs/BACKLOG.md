@@ -79,11 +79,10 @@ before if cheap; **later** — development, after the release.
   ducklake 7f2f82c, 2026-09-01, the metadata batches split). Our postgres patch is retired (the
   duckdb 2.0 branch pins fffcb35); ducklake is pinned ahead of the submodule (7f0ece3) with one patch
   of the branch's own (the columns virtual) until the submodule's ducklake pin passes 7f2f82c.
-- **The listing marks a broken object** instead of narrowing it: while a declared-list object is dead
-  (a source column vanished), `duckdb_columns()` quietly describes a narrower object no query
-  returns. The cheap two-thirds of spec 039.
-- **Spec 039 — catalog maintenance** (`acl_check_catalog([vcat])`, `acl_repair_relation(…)`): the
-  named compensating control for spec 065's accepted risk. **The spec file does not exist yet.**
+- ~~**The listing marks a broken object**~~ — done in spec 039 (2026-09-08): the tables surfaces
+  carry the mark in the object's comment.
+- ~~**Spec 039 — catalog maintenance**~~ — implemented 2026-09-08: `acl_check_catalog([vcat])` /
+  `CHECK VIRTUAL CATALOG`, `acl_repair_relation(…)` / `REPAIR VIRTUAL TABLE`.
 - **A principal's functions surface** (`duckdb_functions()` / `information_schema.routines`): a
   virtual table function is callable but appears in no listing, so an agent browsing the catalog
   cannot learn it exists or its signature; params and result columns are already stored.

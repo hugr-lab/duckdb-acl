@@ -233,8 +233,9 @@ TokenSet ParseTokenResponse(const HttpResult &response) {
 		out.access_token = json.Str("access_token");
 		out.refresh_token = json.Str("refresh_token");
 		auto expires_in = json.Int("expires_in");
-		if (expires_in > 366 * 86400) { // a year: past that the value is nonsense, and unclamped it
-			expires_in = 366 * 86400;   // could overflow the epoch arithmetic (the review's finding)
+		static constexpr int64_t A_YEAR = int64_t(366) * 86400;
+		if (expires_in > A_YEAR) { // a year: past that the value is nonsense, and unclamped it
+			expires_in = A_YEAR;   // could overflow the epoch arithmetic (the review's finding)
 		}
 		out.expires_at = expires_in > 0 ? NowSeconds() + expires_in : 0;
 		if (out.access_token.empty()) {

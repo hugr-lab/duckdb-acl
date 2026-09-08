@@ -7,19 +7,16 @@
 
 #include "acl_scan_util.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
-#include "duckdb/common/exception/parser_exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
-#include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/parsed_data/create_info.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 
-#include <algorithm>
 #include <cstring>
 #include <unordered_map>
 
@@ -389,6 +386,23 @@ unique_ptr<SQLStatement> MakeAdminCall(const string &function, vector<Value> arg
 	return std::move(statement);
 }
 
+//! `SELECT * FROM acl_<fn>(...)`: the compiled form of a management statement that answers rows
+//! (CHECK VIRTUAL CATALOG, spec 039); authorized by the same name-and-catalog rule as a scalar call
+unique_ptr<SQLStatement> MakeAdminTableCall(const string &function, vector<Value> args) {
+	vector<unique_ptr<ParsedExpression>> children;
+	for (auto &arg : args) {
+		children.push_back(make_uniq<ConstantExpression>(std::move(arg)));
+	}
+	auto node = make_uniq<SelectNode>();
+	node->select_list.push_back(make_uniq<StarExpression>());
+	auto ref = make_uniq<TableFunctionRef>();
+	ref->function = make_uniq<FunctionExpression>(Identifier(function), std::move(children));
+	node->from_table = std::move(ref);
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(node);
+	return std::move(statement);
+}
+
 //! True when the ADMIN remainder starts with a management form (decides the whole batch)
 
 } // namespace
@@ -399,6 +413,12 @@ bool IsMgmtStart(const string &text) {
 	if (StringUtil::CIEquals(first, "add") || StringUtil::CIEquals(first, "grant") ||
 	    StringUtil::CIEquals(first, "revoke") || StringUtil::CIEquals(first, "map")) {
 		return true;
+	}
+	if (StringUtil::CIEquals(first, "check") || StringUtil::CIEquals(first, "repair")) {
+		// CHECK VIRTUAL CATALOG / REPAIR VIRTUAL TABLE (spec 039): ours always name a VIRTUAL target
+		AdminScanner ahead(text);
+		ahead.Word("keyword");
+		return StringUtil::CIEquals(ahead.PeekWord(), "virtual");
 	}
 	if (StringUtil::CIEquals(first, "comment") || StringUtil::CIEquals(first, "analyze")) {
 		// duckdb owns COMMENT ON <object> and ANALYZE: ours always name a VIRTUAL target
@@ -1063,6 +1083,32 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		auto kind = schema ? "schema" : (scalar ? "scalar" : (table_function ? "table" : "relation"));
 		return MakeAdminCall("acl_comment", {Value(vcat), Value(vname), Value(kind), Value(column), Value(comment)});
 	}
+	if (StringUtil::CIEquals(keyword, "check")) {
+		// CHECK VIRTUAL CATALOG c: what no longer holds against the source (spec 039), one row each
+		s.Expect("virtual");
+		s.Expect("catalog");
+		return MakeAdminTableCall("acl_check_catalog", {Value(s.Word("a catalog name"))});
+	}
+	if (StringUtil::CIEquals(keyword, "repair")) {
+		// REPAIR VIRTUAL TABLE c.n REMAP (v = expr, ...) | DROP MISSING COLUMNS [AND MASKS] (spec 039)
+		s.Expect("virtual");
+		s.Expect("table");
+		string vcat, vname;
+		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+		if (s.Accept("remap")) {
+			return MakeAdminCall("acl_repair_relation", {Value(vcat), Value(vname), Value("remap"),
+			                                             Value(UnquoteColumnsList(s.List("remap list")))});
+		}
+		s.Expect("drop");
+		s.Expect("missing");
+		s.Expect("columns");
+		string action = "drop_missing";
+		if (s.Accept("and")) {
+			s.Expect("masks");
+			action = "drop_missing_and_masks";
+		}
+		return MakeAdminCall("acl_repair_relation", {Value(vcat), Value(vname), Value(action)});
+	}
 	if (StringUtil::CIEquals(keyword, "analyze")) {
 		// ANALYZE VIRTUAL CATALOG c [TABLE|VIEW|... v.n]: re-derive stored schemas
 		s.Expect("virtual");
@@ -1176,44 +1222,30 @@ struct MgmtProvenance {
 MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	// name -> index of the constant argument holding the catalog; -1 = none
 	static const std::unordered_map<string, int> CATALOG_ARG = {
-	    {"acl_create_catalog", 0},
-	    {"acl_add_relation", 0},
-	    {"acl_add_view", 0},
-	    {"acl_add_schema_alias", 0},
-	    {"acl_add_table_function", 0},
-	    {"acl_add_table_function_alias", 0},
-	    {"acl_add_scalar", 0},
-	    {"acl_add_scalar_alias", 0},
-	    {"acl_drop_relation", 0},
-	    {"acl_grant_catalog", 1},
-	    {"acl_revoke_catalog", 1},
-	    {"acl_grant_object", 1},
-	    {"acl_define_role", -1},
-	    {"acl_define_issuer", -1},
-	    {"acl_map_role", -1},
-	    {"acl_alter_relation", 0},
-	    {"acl_alter_schema_alias", 0},
-	    {"acl_alter_function", 0},
-	    {"acl_alter_catalog", 0},
-	    {"acl_alter_grant", 1},
-	    {"acl_alter_role", -1},
-	    {"acl_alter_issuer", -1},
-	    {"acl_drop_schema_alias", 0},
-	    {"acl_drop_function", 0},
-	    {"acl_drop_role", -1},
-	    {"acl_drop_issuer", -1},
-	    {"acl_drop_role_mapping", -1},
-	    {"acl_comment", 0},
-	    {"acl_refresh_schema", 0},
-	    {"acl_expand_schema", 0},
-	    {"acl_refresh_schema_objects", 0},
-	    {"acl_grant_schema", 1},
-	    {"acl_revoke_schema", 1},
-	    {"acl_rematerialize_schema_caps", 0},
+	    {"acl_create_catalog", 0},   {"acl_add_relation", 0},       {"acl_add_view", 0},
+	    {"acl_add_schema_alias", 0}, {"acl_add_table_function", 0}, {"acl_add_table_function_alias", 0},
+	    {"acl_add_scalar", 0},       {"acl_add_scalar_alias", 0},   {"acl_drop_relation", 0},
+	    {"acl_grant_catalog", 1},    {"acl_revoke_catalog", 1},     {"acl_grant_object", 1},
+	    {"acl_define_role", -1},     {"acl_define_issuer", -1},     {"acl_map_role", -1},
+	    {"acl_alter_relation", 0},   {"acl_alter_schema_alias", 0}, {"acl_alter_function", 0},
+	    {"acl_alter_catalog", 0},    {"acl_alter_grant", 1},        {"acl_alter_role", -1},
+	    {"acl_alter_issuer", -1},    {"acl_drop_schema_alias", 0},  {"acl_drop_function", 0},
+	    {"acl_drop_role", -1},       {"acl_drop_issuer", -1},       {"acl_drop_role_mapping", -1},
+	    {"acl_comment", 0},          {"acl_refresh_schema", 0},     {"acl_check_catalog", 0},
+	    {"acl_repair_relation", 0},  {"acl_expand_schema", 0},      {"acl_refresh_schema_objects", 0},
+	    {"acl_grant_schema", 1},     {"acl_revoke_schema", 1},      {"acl_rematerialize_schema_caps", 0},
 	};
 	MgmtProvenance provenance;
 	auto &select = statement.Cast<SelectStatement>().node->Cast<SelectNode>();
-	auto &call = select.select_list[0]->Cast<FunctionExpression>();
+	// the one compiled form that is a table function in FROM (CHECK VIRTUAL CATALOG, spec 039) is
+	// judged exactly like a scalar call: by its name and the catalog its first argument names
+	auto call_of = [&]() -> FunctionExpression & {
+		if (select.from_table && select.from_table->type == TableReferenceType::TABLE_FUNCTION) {
+			return select.from_table->Cast<TableFunctionRef>().function->Cast<FunctionExpression>();
+		}
+		return select.select_list[0]->Cast<FunctionExpression>();
+	};
+	auto &call = call_of();
 	auto name = StringUtil::Lower(call.FunctionName().GetIdentifierName());
 	if (name == "acl_grant_admin" || name == "acl_revoke_admin") {
 		provenance.escalates = true;
@@ -1232,7 +1264,9 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 		// a management call this table does not know: refuse rather than treat it as unscoped
 		throw BinderException("acl admin: cannot authorize the management call \"%s\"", name);
 	}
-	if (entry->second >= 0) {
+	if (entry->second >= 0 && NumericCast<idx_t>(entry->second) < call.GetArguments().size()) {
+		// a call without the catalog argument (acl_check_catalog() over every catalog) stays
+		// unscoped, which the caller reads as "needs an unrestricted manage scope"
 		auto &argument = call.GetArguments()[NumericCast<idx_t>(entry->second)].GetExpression();
 		provenance.vcat = argument.Cast<ConstantExpression>().GetValue().ToString();
 	}

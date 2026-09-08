@@ -1328,6 +1328,38 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 			declared_keys.insert(declared->GetValue(0, row).ToString() + "\x1f" +
 			                     declared->GetValue(1, row).ToString());
 		}
+		// What a re-derivation must not lose: the declared nullability marks (spec 048) and the
+		// column comments (spec 010) ride in object_columns beside the derived schema, and the schema
+		// statements rewrite the rows - so both are read first and written back after (spec 039
+		// review: ANALYZE used to drop them).
+		auto rederive = [&](const string &object, const string &kind, const vector<std::pair<string, string>> &schema,
+		                    bool derived, case_insensitive_map_t<int8_t> marks) {
+			auto kept = read("SELECT \"name\", \"nullable\", \"comment\" FROM " + catalog->Tbl("object_columns") +
+			                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(object) + " AND \"kind\" = " +
+			                 Lit(kind) + " AND (\"nullable\" IS NOT NULL OR \"comment\" IS NOT NULL)");
+			vector<std::pair<string, string>> comments;
+			for (idx_t i = 0; i < kept->RowCount(); i++) {
+				auto name = kept->GetValue(0, i).ToString();
+				auto nullable = kept->GetValue(1, i);
+				if (!nullable.IsNull() && marks.find(name) == marks.end()) {
+					marks[name] = nullable.GetValue<bool>() ? 1 : 0;
+				}
+				auto comment = kept->GetValue(2, i);
+				if (!comment.IsNull()) {
+					comments.emplace_back(name, comment.ToString());
+				}
+			}
+			for (auto &statement : catalog->ColumnSchemaStatements(vcat, object, kind, schema, derived, marks)) {
+				statements.push_back(statement);
+			}
+			for (auto &comment : comments) {
+				statements.push_back("UPDATE " + catalog->Tbl("object_columns") +
+				                     " SET \"comment\" = " + Lit(comment.second) + " WHERE \"vcat\" = " + Lit(vcat) +
+				                     " AND \"vname\" = " + Lit(object) + " AND \"kind\" = " + Lit(kind) +
+				                     " AND \"name\" = " + Lit(comment.first));
+			}
+			refreshed++;
+		};
 		// only query-defined objects have a derived schema; an alias reads the physical catalog live
 		auto views = read("SELECT \"vname\", \"view_sql\" FROM " + catalog->Tbl("relations") +
 		                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"form\" = 'view'" + name_filter);
@@ -1339,10 +1371,45 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 			auto sql = views->GetValue(1, row);
 			vector<std::pair<string, string>> schema;
 			bool derived = !sql.IsNull() && catalog->ProbeSchema(sql.ToString(), false, {}, schema);
-			for (auto &statement : catalog->ColumnSchemaStatements(vcat, object, "relation", schema, derived)) {
-				statements.push_back(statement);
+			rederive(object, "relation", schema, derived, {});
+		}
+		// spec 039: a declared-list table's projection schema is derived at write exactly as a view's
+		// (RelationStatements binds `expr AS name` over the source once) and drifts exactly as a
+		// view's - a retyped source column - so ANALYZE re-derives it the same way. The declared
+		// marks on the list itself are carried too.
+		auto projections = read(
+		    "SELECT r.\"vname\", r.\"phys\" FROM " + catalog->Tbl("relations") + " r WHERE r.\"vcat\" = " + Lit(vcat) +
+		    " AND r.\"form\" IN ('alias', 'subquery')" + " AND r.\"phys\" IS NOT NULL AND EXISTS (SELECT 1 FROM " +
+		    catalog->Tbl("relation_columns") + " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\")" +
+		    (vname.empty() ? string() : " AND r.\"vname\" = " + Lit(vname)));
+		for (idx_t row = 0; row < projections->RowCount(); row++) {
+			auto object = projections->GetValue(0, row).ToString();
+			if (declared_keys.count(object + "\x1frelation")) {
+				continue;
 			}
-			refreshed++;
+			auto phys = projections->GetValue(1, row).ToString();
+			auto columns =
+			    read("SELECT \"name\", \"expr\", \"nullable\" FROM " + catalog->Tbl("relation_columns") +
+			         " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(object) + " ORDER BY \"pos\"");
+			vector<string> items;
+			vector<std::pair<string, string>> names_only;
+			case_insensitive_map_t<int8_t> marks;
+			for (idx_t i = 0; i < columns->RowCount(); i++) {
+				auto name = columns->GetValue(0, i).ToString();
+				auto expr = columns->GetValue(1, i);
+				items.push_back(expr.IsNull() || expr.ToString().empty()
+				                    ? acl_detail::Ident(name)
+				                    : expr.ToString() + " AS " + acl_detail::Ident(name));
+				names_only.emplace_back(name, string());
+				auto nullable = columns->GetValue(2, i);
+				if (!nullable.IsNull()) {
+					marks[name] = nullable.GetValue<bool>() ? 1 : 0;
+				}
+			}
+			vector<std::pair<string, string>> schema;
+			bool derived =
+			    catalog->ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + phys, false, {}, schema);
+			rederive(object, "relation", derived ? schema : names_only, derived, marks);
 		}
 		auto macros = read("SELECT \"vname\", \"kind\", \"template\", \"params\" FROM " + catalog->Tbl("functions") +
 		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"form\" = 'macro'" + name_filter);
@@ -1359,10 +1426,7 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 			               catalog->ProbeSchema(
 			                   sql.ToString(), kind == "scalar",
 			                   CatalogBackend::DeclaredTypes(params.IsNull() ? string() : params.ToString()), schema);
-			for (auto &statement : catalog->ColumnSchemaStatements(vcat, object, kind, schema, derived)) {
-				statements.push_back(statement);
-			}
-			refreshed++;
+			rederive(object, kind, schema, derived, {});
 		}
 		// spec 027: the verdicts, not only the schemas. A predicate written while its object could not
 		// be bound was accepted unchecked (spec 021), and a grant's projection was left unprobed for

@@ -1570,8 +1570,7 @@ string PolicyStore::ResolveIssuerKeys(const IssuerConfig &config, const string &
 		NoteDenyReason(Reason::SOURCE_ERROR); // the same cause as above: the keys' source, not the principal
 		throw BinderException("acl_rewrite: token rejected: the keys of issuer \"%s\" were last read %lld seconds "
 		                      "ago and \"%s\" is still unreadable (%s); acl_jwks_max_stale is %lld",
-		                      config.issuer, static_cast<long long>(now - entry.fetched_at), config.jwks_uri,
-		                      entry.error, static_cast<long long>(max_stale));
+		                      config.issuer, now - entry.fetched_at, config.jwks_uri, entry.error, max_stale);
 	}
 	return entry.keys_json;
 }

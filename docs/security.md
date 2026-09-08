@@ -349,8 +349,10 @@ are name leaks bounded to an already-granted principal.
   cleanly (`acl_rewrite: object "orders" exposes no readable columns`, pinned in
   `test/sql/acl_listing_truth.test`), and "declaring the shape upgrades any given object to clean
   refusals". A mask whose column is gone surfaces duckdb's `Column "ssn" in REPLACE list not found`
-  (spec 038). The named compensating control, `acl_check_catalog` (spec 039), **does not exist
-  yet** (`specs/BACKLOG.md`).
+  (spec 038). The named compensating control is `acl_check_catalog` (spec 039): run by the administrator, off
+  the query path, it probes every stored fact against the source and names what no longer holds -
+  the dead declared column included - with the repair each finding wants; the tables listings mark
+  a broken object rather than describe a narrower one.
 - **A write-path binder error cites the physical leaf table name (spec 052, accepted).** An
   `INSERT`/`UPDATE` naming a nonexistent column gets duckdb's `Table "orders_physical" does not have
   column …`: the principal "already holds a write capability on *this exact object*, learns only its
@@ -448,8 +450,10 @@ Three consequences, stated as the decision:
    Repair is the administrator's, by rewriting the object's list (`ALTER VIRTUAL TABLE … SET
    COLUMNS`): a refresh (`acl_refresh_schema` / `ANALYZE VIRTUAL CATALOG`, spec 010) re-probes
    verdicts and derived schemas but does not heal a declared list - healing it automatically would
-   drop a mask silently, which spec 038 refuses. The check-and-repair procedure is spec 039 (not
-   yet written).
+   drop a mask silently, which spec 038 refuses. The check-and-repair procedure is spec 039: `CHECK VIRTUAL CATALOG` finds the dead entry,
+   `REPAIR VIRTUAL TABLE … REMAP (…)` mends a column that moved, `… DROP MISSING COLUMNS` removes one
+   that is gone - and refuses while an object grant masks it, unless told `AND MASKS`, which removes
+   the mask by name and counts it.
 3. **Expansions record objects; aliases do not.** `CREATE VIRTUAL SCHEMA … FROM` is "a snapshot plus
    edits"; new source tables need `REFRESH`, an excluded object stays excluded, and this is the only
    way to exclude a single table (spec 014: "nothing about this is dynamic-with-exceptions").

@@ -30,6 +30,7 @@ src/
   acl_policy_catalog.cpp     # the catalog backend's READ path: resolution, gate, rights, caches
   acl_catalog_admin.cpp      #   ... its writers (PolicyStore::Catalog*), acl_metadata_listing.cpp the
   acl_catalog_validation.cpp #   listings, and the probe/bind validators; declared in acl_policy_catalog.hpp
+  acl_catalog_maintenance.cpp # spec 039: acl_check_catalog (table function) + acl_repair_relation; seam acl_maintenance.hpp
   acl_rewriter.cpp           # the AST walker; exposes RewriteStatements(...)
   acl_parser_override.cpp    # ACL prefix scanner + parser_override; exposes RegisterAclParser(...)
   acl_admin_functions.cpp    # acl_* admin stubs; exposes RegisterAclAdminFunctions(...)
@@ -60,6 +61,7 @@ GEN=ninja make                      # release build of duckdb + the extension
 build/release/test/unittest 'test/sql/*'         # run the WHOLE suite (what CI runs; ~50 files)
 build/release/test/unittest test/sql/acl.test    # one file (acl.test is the memory-mode baseline only)
 GEN=ninja make test-cpp             # standalone C++ invariant tests (specs/002)
+make tidy                           # clang-tidy (the repo config) over our sources; needs LLVM's clang-tidy
 test/harness/run.sh                 # end-to-end demo against the built extension
 test/live/serve.sh [--tls]          # serve one seeded node for real client tools (spec 057 runbook)
 
@@ -157,6 +159,22 @@ function; for a function the parenthesis after its name is the argument substitu
 on its result — either may stand alone. A hint an agent reads, never enforced and
 granting nothing; visible only when both ends and every column it names are. A principal reads its own
 through `acl_references([object])`, substituted before the function gate.
+**Spec 039 — catalog maintenance**: the source drifts and nothing on the query path may look (spec 065),
+so `acl_check_catalog([vcat])` / `ACL ADMIN CHECK VIRTUAL CATALOG c` (a table function, the operator's,
+catalog-scoped under a role's `manage`) probes every stored fact against the source off the query path
+and answers one row per finding — `source_missing`, `column_missing`, `definition_broken`, `schema_stale`,
+`rls_broken/unchecked`, `grant_column_missing`, `mask_broken`, `schema_missing`, `expansion_stale`,
+`reference_dangling` — each with the repair statement to paste. `acl_repair_relation(vcat, vname,
+action[, spec])` / `REPAIR VIRTUAL TABLE c.n REMAP (…) | DROP MISSING COLUMNS [AND MASKS]` mends a
+declared list: `remap` probes each new expression to bind first; `drop_missing` refuses while an
+object grant masks a name it would drop (never a silent loss of protection, spec 038); `AND MASKS`
+removes those mask items by name and counts them; a catalog grant's mask is never touched (it
+protects the column elsewhere; the object's reads refuse per 038 and the check says `mask_broken`).
+The tables listings mark a broken declared-list object in its comment (`acl: broken - declared
+column(s) … no longer exist in the source`) by a join, never a probe; the columns surface keeps the
+contract as written. A role whose grant masks the vanished column keeps its rows (the mask never
+reads it). `MgmtCallName`/`ProvenanceOf` know the one compiled form that is a table function in FROM.
+
 **Spec 008**: `acl_use_functions('{"slot": "fn", ...}')` — the function-driver policy source
 (registered table-function callbacks, explicit slot map, read-only); and management SQL —
 `ACL ADMIN CREATE VIRTUAL CATALOG / CREATE ROLE / CREATE ISSUER / ADD TABLE|VIEW|SCHEMA|... /

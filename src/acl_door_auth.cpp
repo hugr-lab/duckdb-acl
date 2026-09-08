@@ -5,8 +5,6 @@
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
 
-#include "duckdb/common/string_util.hpp"
-
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
@@ -16,8 +14,12 @@ namespace acl {
 
 namespace {
 
-std::mutex discovery_cache_lock;
-std::unordered_map<string, std::pair<oidc::Endpoints, std::chrono::steady_clock::time_point>> discovery_cache;
+// process-wide on purpose: a discovery document is the issuer's public metadata, the same for every
+// database instance in the process, and fetching it once per instance would only multiply the round
+// trips - nothing per-principal or per-instance lives here
+std::mutex discovery_cache_lock; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::unordered_map<string, std::pair<oidc::Endpoints, std::chrono::steady_clock::time_point>>
+    discovery_cache; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 } // namespace
 

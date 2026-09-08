@@ -16,6 +16,7 @@
 #include "acl_admin_functions.hpp"
 #include "acl_audit_pipeline.hpp"
 #include "acl_introspection.hpp"
+#include "acl_maintenance.hpp"
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
 #include "duckdb/common/helper.hpp"
@@ -215,6 +216,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	acl::RegisterQuackOidcProvider(loader); // spec 061: CREATE SECRET (TYPE quack, PROVIDER oidc, ...)
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
+	acl::RegisterAclMaintenance(loader, store); // spec 039: acl_check_catalog / acl_repair_relation
 #ifdef ACL_QUACK_EMBED_ENABLED
 	// The embedded quack door (spec 063): the acl_quack_* server settings and the acl_quack_scan_data
 	// drain the server INSERTs through, then the door itself - serve/stop and the two callbacks the

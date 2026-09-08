@@ -9,18 +9,16 @@
 #include "duckdb/common/exception/parser_exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
-#include "duckdb/parser/tableref/emptytableref.hpp"
 
 #include <algorithm>
 #include <cstring>
-#include <unordered_map>
 
 namespace duckdb {
 namespace acl {
@@ -288,6 +286,14 @@ string MgmtCallName(SQLStatement &stmt) {
 		return string();
 	}
 	auto &select = node.Cast<SelectNode>();
+	if (select.from_table && select.from_table->type == TableReferenceType::TABLE_FUNCTION) {
+		// the compiled form that answers rows (`SELECT * FROM acl_check_catalog(...)`, spec 039)
+		auto &function = select.from_table->Cast<TableFunctionRef>().function;
+		if (function && function->GetExpressionClass() == ExpressionClass::FUNCTION) {
+			return function->Cast<FunctionExpression>().FunctionName().GetIdentifierName();
+		}
+		return string();
+	}
 	if (select.select_list.size() != 1 || select.select_list[0]->GetExpressionClass() != ExpressionClass::FUNCTION) {
 		return string();
 	}

@@ -1631,12 +1631,12 @@ private:
 			}
 		}
 		vector<unique_ptr<ParsedExpression>> items;
-		for (idx_t i = 0; i < node.columns.size(); i++) {
-			unique_ptr<ParsedExpression> item = make_uniq<ColumnRefExpression>(node.columns[i]);
-			if (i == 0) {
-				item = GuardedValue(std::move(item), std::move(predicate), vname);
-			}
-			items.push_back(std::move(item));
+		for (auto &column : node.columns) {
+			items.push_back(make_uniq<ColumnRefExpression>(column));
+		}
+		// the guard rides the first column: one CASE per row, judged before anything is written
+		if (!items.empty()) {
+			items[0] = GuardedValue(std::move(items[0]), std::move(predicate), vname);
 		}
 		auto source = make_uniq<SubqueryRef>(std::move(node.select_statement), Identifier("__acl_check"));
 		source->column_name_alias = node.columns;
