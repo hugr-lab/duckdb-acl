@@ -142,6 +142,10 @@ run_leg() {
 		globex) token="$TOKEN_GLOBEX"; base=2000000; own="id IN (2)" ;;
 		esac
 		own="$own OR (id >= $base AND id < $((base + ROWS)))"
+		# the victim below writes as globex too, from id 3000000: its rows are globex's own by tenant,
+		# and whether they are there when this client reads last depends on the race the leg stages
+		# (a fast source lands them before the kill) - so they are own, never foreign
+		[ "$who" != globex ] || own="$own OR id >= 3000000"
 		{
 			echo "$L"
 			render "$HERE/client.sql" \
@@ -281,7 +285,13 @@ run_leg() {
 		[ "$before" = "$seeded" ] || fail "$name: client $who saw $before rows before its load, expected $seeded"
 		after="$(grep "^seen_after," "$TMP/$name.$who.out" | cut -d, -f2)"
 		expected=$((ROWS + seeded))
-		[ "$after" = "$expected" ] || fail "$name: client $who sees $after rows after its load, expected $expected"
+		# globex may also see the victim's whole load (its own tenant, all or nothing) - or none of it
+		if [ "$who" = globex ]; then
+			[ "$after" = "$expected" ] || [ "$after" = "$((expected + VICTIM_ROWS))" ] ||
+				fail "$name: client $who sees $after rows after its load, expected $expected or $((expected + VICTIM_ROWS))"
+		else
+			[ "$after" = "$expected" ] || fail "$name: client $who sees $after rows after its load, expected $expected"
+		fi
 	done
 
 	# --- what the reader saw, tick by tick ---
