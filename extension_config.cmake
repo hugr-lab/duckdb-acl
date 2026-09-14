@@ -89,7 +89,7 @@ if(DEFINED ENV{ACL_QUACK} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(quack
         DONT_LINK
         GIT_URL https://github.com/duckdb/duckdb-quack
-        GIT_TAG f4328c5333e88756a97a3e53118a695252befb4e
+        GIT_TAG 984d45d27e4042906328fb2bd0cdb631d0e602a7
         SUBMODULES extension-ci-tools
         APPLY_PATCHES
     )
