@@ -249,6 +249,41 @@ int main(int argc, char *argv[]) {
 			      "the ISSUER-less secret mints via the door: " + (minted->HasError() ? minted->GetError() : ""));
 		});
 
+		// LAST on this door: it breaks the policy source under it on purpose
+		Scenario("a source that stops answering is 'Authentication failed', never its own text", [&] {
+			// Since quack f4328c5 the server hands a failed callback's error back to the client, and a
+			// policy source fails with a message that can name a DSN or a catalog (spec 041). The
+			// callback catches: the client learns the refusal, the operator learns the reason.
+			Exec(con, "SET GLOBAL acl_audit_level='all'");
+			Exec(con, "SET GLOBAL acl_version_check_interval=0");
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
+			// renamed away rather than dropped: the scenarios after this one share the store
+			Exec(con, "ALTER TABLE store.acl.meta RENAME TO meta_gone");
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
+			auto refused =
+			    con.Query("ATTACH 'quack:localhost:31975' AS broken (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
+			Check(refused->HasError(), "the client's ATTACH is refused");
+			auto text = refused->HasError() ? refused->GetError() : std::string();
+			Check(text.find("Authentication failed") != std::string::npos, "...with the flat refusal: " + text);
+			Check(text.find("meta") == std::string::npos && text.find("acl catalog") == std::string::npos &&
+			          text.find("Catalog Error") == std::string::npos,
+			      "...and nothing of what the source said: " + text);
+			Exec(con, "SELECT acl_audit_flush()");
+			auto event = con.Query("SELECT count(*)::BIGINT FROM acl_audit_events() WHERE kind = 'door' AND "
+			                       "door = 'quack' AND detail = 'authenticate' AND reason_code = 'policy_error'");
+			if (CheckOk(*event, "the audit is asked for the reason")) {
+				Check(event->GetValue(0, 0).GetValue<int64_t>() >= 1,
+				      "...and carries it as a door event: policy_error");
+			}
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
+			Exec(con, "ALTER TABLE store.acl.meta_gone RENAME TO meta");
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
+			Exec(con, "SET GLOBAL acl_version_check_interval=1000");
+			// the door itself is proven healthy again by the scenarios below, which serve from this
+			// same store (the token's issuer was dropped above, so re-attaching here would refuse for
+			// a different reason and prove nothing)
+		});
+
 		Exec(con, "SELECT acl_quack_stop('quack:localhost:31975')");
 
 		Scenario("the TLS server serves the same discovery over https", [&] {
