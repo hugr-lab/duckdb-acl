@@ -28,14 +28,20 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
     # ducklake: pinned AHEAD of the submodule's own pin (eb7b95d, 2026-07-23), which flushes its postgres
     # metadata as ONE multi-command string - refused by a prepared statement since duckdb-postgres #552,
     # and duckdb-postgres fffcb35's `prepare := false` is an opt-in the caller must take. ducklake took
-    # it in 7f2f82c (2026-09-01, the batches split); 7f0ece3 is that plus its test. It targets duckdb
-    # 1b3c92a - an ancestor of the 2.0 branch - and needs TWO of the branch's ducklake patches (0010,
-    # the merge-into action pipelines; 0011, the TableCatalogEntry columns virtual), carried in
-    # patches/ducklake/ and applied through
+    # it in 7f2f82c (2026-09-01, the batches split). c0a2060 is ducklake's main of 2026-09-10, 64
+    # commits past the 7f0ece3 we carried before. It targets duckdb 1b3c92a - an ancestor of the 2.0
+    # branch - and needs TWO of the branch's ducklake patches (0010, the merge-into action pipelines;
+    # 0011, the TableCatalogEntry columns virtual), carried in patches/ducklake/ and applied through
     # the FetchContent pre-declare (CMake keeps the first declare for a content name; the loader below
-    # has no patch-dir parameter). Drop all of this for the submodule's include once the submodule's
-    # own pin passes 7f2f82c. (A pin change trips FetchContent's git-update on a stale _deps clone:
-    # wipe build/*/_deps/ducklake_extension_fc-* and rebuild - CI is always fresh.)
+    # has no patch-dir parameter). Both still apply, so upstream has grown neither. Drop all of this
+    # for the submodule's include once the submodule's own pin passes 7f2f82c.
+    # (A pin change trips FetchContent's git-update on a stale _deps clone: wipe
+    # build/*/_deps/ducklake_extension_fc-* and rebuild - CI is always fresh.)
+    # Local caveat: this pin changed the layout of metadata version `1.1-dev1` in place - it added
+    # min_is_exact/max_is_exact to ducklake_file_column_stats and did not bump the version string - so
+    # a lake a previous pin wrote is unreadable ("Referenced column \"min_is_exact\" not found"). CI
+    # starts its postgres empty; a developer's persistent catalog must be recreated
+    # (`DROP DATABASE ducklake_catalog; CREATE DATABASE ducklake_catalog;`).
     include(FetchContent)
     if(NOT Python3_EXECUTABLE)
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -43,7 +49,7 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
     FetchContent_Declare(
         ducklake_extension_fc
         GIT_REPOSITORY https://github.com/duckdb/ducklake
-        GIT_TAG 7f0ece3aa1f5a7a9b3777874613c5c630eb9e98f
+        GIT_TAG c0a206009090ad14109261e4d5730ee50771cf0d
         GIT_SUBMODULES ""
         # 0001/0002 are ours to keep until upstream grows the equivalents; 0003 is TEMPORARY - it
         # migrates ducklake to duckdb's Literal API, which ducklake has not done itself (2026-09-14),
@@ -53,7 +59,7 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
     )
     duckdb_extension_load(ducklake
         GIT_URL https://github.com/duckdb/ducklake
-        GIT_TAG 7f0ece3aa1f5a7a9b3777874613c5c630eb9e98f
+        GIT_TAG c0a206009090ad14109261e4d5730ee50771cf0d
     )
     # mysql_scanner is currently disabled at the submodule pin ("patches do not apply"); flip its
     # gate here the moment the submodule re-enables it.

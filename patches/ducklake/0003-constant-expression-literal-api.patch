@@ -9,11 +9,17 @@ Null factory for building, `GetLiteral().ToValue()` for reading. It also adds on
 constant_expression.hpp pulled in columnref_expression.hpp transitively and the new one does not,
 so ducklake_catalog.cpp stopped seeing a complete ColumnRefExpression.
 
+One nuance the new API forces, noted so nobody reads it as a bug: a TYPED null is no longer a
+constant - `FromValue(Value(type))` returns `CAST(NULL AS <type>)`. ducklake builds one of those for
+a column whose default was dropped, and its own ExtractDefaultValue then records that column as an
+`expression` rather than a NULL `literal`. The default is NULL either way, and the read path parses
+it back; only the recorded text differs from what an unpatched ducklake would write.
+
 How to know it can go: the build stops needing it. Drop this file, bump the ducklake pin, and if
 `ACL_INTEGRATION=1 GEN=ninja make` is green, upstream has caught up.
 
 diff --git a/src/storage/ducklake_catalog.cpp b/src/storage/ducklake_catalog.cpp
-index 5404b024..2210d09b 100644
+index 4353b578..a9781ad9 100644
 --- a/src/storage/ducklake_catalog.cpp
 +++ b/src/storage/ducklake_catalog.cpp
 @@ -10,6 +10,7 @@
@@ -24,7 +30,7 @@ index 5404b024..2210d09b 100644
  #include "duckdb/parser/parsed_data/create_schema_info.hpp"
  #include "duckdb/parser/parsed_data/create_table_info.hpp"
  #include "duckdb/parser/parsed_data/create_view_info.hpp"
-@@ -377,10 +378,10 @@ static unique_ptr<DuckLakeFieldId> TransformColumnType(DuckLakeColumnInfo &col)
+@@ -388,10 +389,10 @@ static unique_ptr<DuckLakeFieldId> TransformColumnType(DuckLakeColumnInfo &col)
  		auto col_type = DuckLakeTypes::FromString(col.type);
  		col_data.initial_default = col.initial_default.DefaultCastAs(col_type);
  		if (col.default_value.IsNull()) {
@@ -37,10 +43,10 @@ index 5404b024..2210d09b 100644
  			} else if (col.default_value_type == "expression") {
  				auto sql_expr = Parser::ParseExpressionList(col.default_value.GetValue<string>());
  				if (sql_expr.size() != 1) {
-@@ -478,7 +479,7 @@ unique_ptr<CreateMacroInfo> CreateMacroInfoFromDucklake(ClientContext &context,
- 			auto expr_type = DuckLakeTypes::FromString(param.default_value_type);
+@@ -490,7 +491,7 @@ unique_ptr<CreateMacroInfo> CreateMacroInfoFromDucklake(ClientContext &context,
  			if (expr_type.id() != LogicalTypeId::UNKNOWN) {
- 				auto casted_value = param.default_value.CastAs(context, expr_type);
+ 				auto casted_value =
+ 				    expr_type.id() == LogicalTypeId::SQLNULL ? Value() : param.default_value.CastAs(context, expr_type);
 -				auto casted_expr = make_uniq<ConstantExpression>(std::move(casted_value));
 +				auto casted_expr = ConstantExpression::FromValue(casted_value);
  				macro_function->default_parameters.insert(Identifier(param.parameter_name), std::move(casted_expr));
@@ -69,10 +75,10 @@ index 021bf487..33dbb94e 100644
  
  unique_ptr<DuckLakeFieldId> DuckLakeFieldId::FieldIdFromType(const string &name, const LogicalType &type,
 diff --git a/src/storage/ducklake_multi_file_reader.cpp b/src/storage/ducklake_multi_file_reader.cpp
-index 58fa584e..7a00a369 100644
+index 8f956207..7bdbd4f2 100644
 --- a/src/storage/ducklake_multi_file_reader.cpp
 +++ b/src/storage/ducklake_multi_file_reader.cpp
-@@ -190,9 +190,9 @@ MultiFileColumnDefinition CreateColumnFromFieldId(const DuckLakeFieldId &field_i
+@@ -211,9 +211,9 @@ MultiFileColumnDefinition CreateColumnFromFieldId(const DuckLakeFieldId &field_i
  	MultiFileColumnDefinition column(field_id.Name(), field_id.Type());
  	auto &column_data = field_id.GetColumnData();
  	if (column_data.initial_default.IsNull()) {
@@ -84,7 +90,7 @@ index 58fa584e..7a00a369 100644
  	}
  	column.identifier = Value::INTEGER(NumericCast<int32_t>(field_id.GetFieldIndex().index));
  	for (auto &child : field_id.Children()) {
-@@ -499,7 +499,7 @@ vector<MultiFileColumnDefinition> MapColumns(ClientContext &context, MultiFileRe
+@@ -523,7 +523,7 @@ vector<MultiFileColumnDefinition> MapColumns(ClientContext &context, MultiFileRe
  			// Use GetValue to handle NULL values (__HIVE_DEFAULT_PARTITION__) and type casting
  			Value partition_val =
  			    HivePartitioning::GetValue(context, column_map->source_name, entry->second, result_col.type);
@@ -93,11 +99,25 @@ index 58fa584e..7a00a369 100644
  			continue;
  		}
  
+diff --git a/src/storage/ducklake_schema_entry.cpp b/src/storage/ducklake_schema_entry.cpp
+index ad90e63a..100c0687 100644
+--- a/src/storage/ducklake_schema_entry.cpp
++++ b/src/storage/ducklake_schema_entry.cpp
+@@ -146,7 +146,8 @@ optional_ptr<CatalogEntry> DuckLakeSchemaEntry::CreateFunction(CatalogTransactio
+ 		}
+ 		for (auto &entry : macro->default_parameters) {
+ 			if (entry.second->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+-				DuckLakeTypes::CheckSupportedType(entry.second->Cast<ConstantExpression>().GetValue().type(), version);
++				DuckLakeTypes::CheckSupportedType(entry.second->Cast<ConstantExpression>().GetLiteral().ToValue().type(),
++				                                  version);
+ 			}
+ 		}
+ 	}
 diff --git a/src/storage/ducklake_table_entry.cpp b/src/storage/ducklake_table_entry.cpp
-index c159c06b..166fecb7 100644
+index 9e4d2fb1..0442ac1f 100644
 --- a/src/storage/ducklake_table_entry.cpp
 +++ b/src/storage/ducklake_table_entry.cpp
-@@ -563,7 +563,7 @@ DuckLakePartitionField GetPartitionField(DuckLakeTableEntry &table, ParsedExpres
+@@ -553,7 +553,7 @@ DuckLakePartitionField GetPartitionField(const DuckLakeCatalog &ducklake_catalog
  			}
  
  			auto &bucket_expr = args[0].GetExpressionMutable()->Cast<ConstantExpression>();
@@ -106,7 +126,7 @@ index c159c06b..166fecb7 100644
  			if (!bucket_value) {
  				throw InvalidInputException("Bucket count must be an integer");
  			}
-@@ -822,7 +822,7 @@ unique_ptr<CatalogEntry> DuckLakeTableEntry::AlterTable(ClientContext &context,
+@@ -829,7 +829,7 @@ unique_ptr<CatalogEntry> DuckLakeTableEntry::AlterTable(ClientContext &context,
  			auto &default_expr = info.new_column.DefaultValue();
  			if (default_expr.GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
  				auto &constant_expr = default_expr.Cast<ConstantExpression>();
@@ -115,7 +135,7 @@ index c159c06b..166fecb7 100644
  			}
  		}
  
-@@ -1126,7 +1126,7 @@ static void ExtractDefaultValue(const DuckLakeColumnData &col_data, DuckLakeColu
+@@ -1138,7 +1138,7 @@ static void ExtractDefaultValue(const DuckLakeColumnData &col_data, DuckLakeColu
  	if (col_data.default_value) {
  		if (col_data.default_value->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
  			auto &constant_value = col_data.default_value->Cast<ConstantExpression>();
@@ -125,7 +145,7 @@ index c159c06b..166fecb7 100644
  		} else {
  			info.default_value = col_data.default_value->ToString();
 diff --git a/src/storage/ducklake_transaction_state.cpp b/src/storage/ducklake_transaction_state.cpp
-index 088081ef..c94e9009 100644
+index 6fa11029..3de68012 100644
 --- a/src/storage/ducklake_transaction_state.cpp
 +++ b/src/storage/ducklake_transaction_state.cpp
 @@ -512,8 +512,9 @@ void GetNewMacroInfo(DuckLakeCommitState &commit_state, reference<CatalogEntry>
