@@ -201,7 +201,9 @@ A gateway prefixes every statement. A client that connects for itself cannot, so
 token into a principal once and a **door** attaches it to every statement after that.
 
 **Spec 040 — the session contract**: `acl_session_open(token)` mints an opaque random handle (or NULL
-if the token does not verify), `acl_session_sql(handle, sql)` returns that SQL with
+if the token does not verify; a policy source that throws is a NULL *for a door* - one `session
+refused` event with `source_error` and no text out - while `acl_session_open()` itself still raises,
+since the gateway is the trusted side and has to know), `acl_session_sql(handle, sql)` returns that SQL with
 `ACL SESSION '<handle>'` in front (NULL if the session is unknown, closed or past its `exp` — judged on
 every use), `acl_session_close(handle)` ends it. `ACL SESSION '<handle>'` is a fourth prefix kind
 alongside ROLE/TOKEN/ADMIN, carrying the same markers. All three functions are denied to a principal:

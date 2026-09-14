@@ -1,9 +1,10 @@
 # name: test/sql/acl_quack_door_fail_closed.test
-# description: the quack door's callbacks answer with their own refusal when something throws under
-#   them (specs 041/063). Since quack f4328c5 the embedded server puts a failed callback's error text
-#   in front of the client, so an exception escaping here would tell somebody who has not
-#   authenticated yet what our policy source said - a DSN, a catalog name. The reason is the
-#   operator's, and reaches them through the audit (spec 069).
+# description: a policy source that stops answering is a refusal at every door, and an explanation
+#   only for the operator (spec 040 addendum). SessionOpen catches its own: a DOOR gets an empty
+#   handle and a `session refused` event carrying source_error, while acl_session_open() - the
+#   gateway's own call, the trusted side - still throws so somebody can debug the source. The quack
+#   callbacks keep their own catch as the belt to that brace: since quack f4328c5 the embedded server
+#   puts a failed callback's error text in front of the client, and that text can name a DSN.
 # group: [sql]
 
 require acl
@@ -61,8 +62,7 @@ SET GLOBAL acl_version_check_interval=0;
 statement ok
 DROP TABLE store.acl.meta;
 
-# what would otherwise escape as an exception (and travel to the client as text) is the refusal this
-# callback already speaks
+# the door's answer: false, not an exception - and no text about the source travels with it
 query I
 SELECT acl_quack_authenticate('conn-2',
     'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc',
@@ -76,11 +76,20 @@ SELECT acl_quack_authorize('conn-never-seen', 'SELECT 1') IS NULL;
 ----
 true
 
+# the operator's own call is the exception, in both senses: acl_session_open() is the gateway's, and
+# whoever is debugging a source that stopped answering needs to read what it said
+statement error
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+<REGEX>:.*acl catalog.*
+
 statement ok
 SELECT acl_audit_flush();
 
-# the reason the client never learns is the one the operator's record carries
+# the reason the client never learns is the one the operator's record carries: one refusal per door
+# call, in the session taxonomy every other refusal at this seam uses
 query IIIII
-SELECT kind, detail, verdict, reason_code, door FROM acl_audit_events() WHERE kind = 'door' ORDER BY seq;
+SELECT kind, detail, verdict, reason_code, door FROM acl_audit_events()
+WHERE kind = 'session' AND detail = 'refused' ORDER BY seq;
 ----
-door	authenticate	denied	policy_error	quack
+session	refused	denied	source_error	quack

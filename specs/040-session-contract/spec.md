@@ -125,6 +125,35 @@ Same review, same family: `acl_jwt_clock_skew` was registered session-scoped whi
 it through the instance — `SET` reported success and changed nothing; it is GLOBAL now, like every
 sibling, and `acl_session.test` pins that a plain `SET` admits a token the default skew refuses.
 
+### Addendum 2026-09-14 — a source that stops answering refuses a door, and explains to the operator
+
+`SessionOpen` reads the policy source three times over - the issuer, the role mapping, the role
+claims - and a source fails by throwing, with a message that can carry a DSN host or a catalog name.
+That exception used to leave through whichever door had called: the Flight door's RPC boundary turned
+it into a Status the client reads, and quack, since its f4328c5, hands a failed callback's error text
+back over the wire. So a client that had not authenticated yet could read what our policy database
+said, and no `session refused` event was written for a refusal that plainly happened.
+
+One try around the whole of `SessionOpen` now, because the rule belongs at the seam every door
+crosses and not in each door:
+
+- **A door** (`flight`, `quack`, anything but the operator's own call) gets the empty handle it
+  already knows how to answer - Flight says `acl: authentication failed`, quack answers `false` - and
+  the audit gets one `session` `refused` event with `source_error` and the source's text. The same
+  division `SessionOpen` already kept for a JWKS document it cannot read.
+- **`acl_session_open()`** still throws. Its `door` is `session`, it is the gateway's own call, and
+  the gateway is the trusted side by the deployment invariant - an operator staring at a dead source
+  needs to read what it said, not a NULL.
+- The drain refusal is untouched: it returns normally with its own code, so the try never sees it.
+
+The quack callbacks keep their own catch (spec 041) as the belt to this brace - `SessionBind`,
+`SessionSql` and the argument checks live outside `SessionOpen`, and the server would put any text
+they raise in front of the client.
+
+`test/sql/acl_quack_door_fail_closed.test` breaks the source under an open door - the version check
+at zero, the meta table gone - and pins both halves: the door answers `false` with one
+`session refused` / `source_error` event behind it, and `acl_session_open()` still raises.
+
 ## Testing
 
 `test/sql/acl_session.test` (33 assertions):

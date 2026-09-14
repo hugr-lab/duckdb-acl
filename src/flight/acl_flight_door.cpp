@@ -825,43 +825,52 @@ public:
 			                               "acl: the password handshake needs a TLS door "
 			                               "(acl_flight_serve with a certificate) - refused over cleartext");
 		}
-		string refusal = "acl: no issuer here carries a CLIENT ID, so the door cannot run the "
-		                 "password grant - authenticate with a bearer token instead";
-		for (auto &issuer : state->store->ListIssuers()) {
-			IssuerConfig config;
-			if (!state->store->LookupIssuer(issuer, config) || config.client_id.empty()) {
-				continue; // an issuer with no client_id cannot do ROPC and is skipped (spec 064)
+		// Every store read below goes to the policy source, and a source fails by throwing a message
+		// that can name a DSN or a catalog (spec 040 addendum). This handshake answers a caller who has
+		// not authenticated yet - by construction, it is how they try to - so the text stays in the
+		// audit and the client gets the same flat refusal a wrong password gets.
+		try {
+			string refusal = "acl: no issuer here carries a CLIENT ID, so the door cannot run the "
+			                 "password grant - authenticate with a bearer token instead";
+			for (auto &issuer : state->store->ListIssuers()) {
+				IssuerConfig config;
+				if (!state->store->LookupIssuer(issuer, config) || config.client_id.empty()) {
+					continue; // an issuer with no client_id cannot do ROPC and is skipped (spec 064)
+				}
+				auto ep = DiscoverEndpointsCached(*state->store, issuer);
+				if (!ep.Ok()) {
+					refusal = "acl: OIDC discovery against " + issuer + " failed: " + ep.error;
+					continue;
+				}
+				auto tokens = oidc::PasswordGrant(ep, config.client_id, config.client_secret, user, password);
+				if (!tokens.Ok()) {
+					// the IdP's own refusal IS the gate: unsupported_grant_type means ROPC is off there
+					refusal = "acl: the IdP at " + issuer + " refused the password grant: " + tokens.error;
+					continue;
+				}
+				Principal principal;
+				bool verified = false;
+				try {
+					verified = state->store->VerifyPrincipal(true, tokens.access_token, principal);
+				} catch (std::exception &) {
+					verified = false;
+				}
+				if (!verified) {
+					refusal = "acl: the token the IdP at " + issuer +
+					          " answered does not verify against "
+					          "this door's issuers";
+					continue;
+				}
+				*middleware = std::make_shared<PasswordHandshakeMiddleware>(tokens.access_token);
+				state->store->AuditDoor("flight", "handshake", true, string(), string(), string(), &principal);
+				return arrow::Status::OK();
 			}
-			auto ep = DiscoverEndpointsCached(*state->store, issuer);
-			if (!ep.Ok()) {
-				refusal = "acl: OIDC discovery against " + issuer + " failed: " + ep.error;
-				continue;
-			}
-			auto tokens = oidc::PasswordGrant(ep, config.client_id, config.client_secret, user, password);
-			if (!tokens.Ok()) {
-				// the IdP's own refusal IS the gate: unsupported_grant_type means ROPC is off there
-				refusal = "acl: the IdP at " + issuer + " refused the password grant: " + tokens.error;
-				continue;
-			}
-			Principal principal;
-			bool verified = false;
-			try {
-				verified = state->store->VerifyPrincipal(true, tokens.access_token, principal);
-			} catch (std::exception &) {
-				verified = false;
-			}
-			if (!verified) {
-				refusal = "acl: the token the IdP at " + issuer +
-				          " answered does not verify against "
-				          "this door's issuers";
-				continue;
-			}
-			*middleware = std::make_shared<PasswordHandshakeMiddleware>(tokens.access_token);
-			state->store->AuditDoor("flight", "handshake", true, string(), string(), string(), &principal);
-			return arrow::Status::OK();
+			state->store->AuditDoor("flight", "handshake", false, "principal", refusal);
+			return flight::MakeFlightError(flight::FlightStatusCode::Unauthenticated, refusal);
+		} catch (std::exception &ex) {
+			state->store->AuditDoor("flight", "handshake", false, "source_error", ErrorData(ex).RawMessage());
+			return flight::MakeFlightError(flight::FlightStatusCode::Unauthenticated, "acl: authentication failed");
 		}
-		state->store->AuditDoor("flight", "handshake", false, "principal", refusal);
-		return flight::MakeFlightError(flight::FlightStatusCode::Unauthenticated, refusal);
 	}
 
 private:

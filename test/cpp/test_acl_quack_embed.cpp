@@ -252,8 +252,9 @@ int main(int argc, char *argv[]) {
 		// LAST on this door: it breaks the policy source under it on purpose
 		Scenario("a source that stops answering is 'Authentication failed', never its own text", [&] {
 			// Since quack f4328c5 the server hands a failed callback's error back to the client, and a
-			// policy source fails with a message that can name a DSN or a catalog (spec 041). The
-			// callback catches: the client learns the refusal, the operator learns the reason.
+			// policy source fails with a message that can name a DSN or a catalog. SessionOpen catches
+			// its own (spec 040 addendum): the client learns the refusal, the operator learns the
+			// reason. This is the client's half of it - what actually crosses the wire.
 			Exec(con, "SET GLOBAL acl_audit_level='all'");
 			Exec(con, "SET GLOBAL acl_version_check_interval=0");
 			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
@@ -269,11 +270,11 @@ int main(int argc, char *argv[]) {
 			          text.find("Catalog Error") == std::string::npos,
 			      "...and nothing of what the source said: " + text);
 			Exec(con, "SELECT acl_audit_flush()");
-			auto event = con.Query("SELECT count(*)::BIGINT FROM acl_audit_events() WHERE kind = 'door' AND "
-			                       "door = 'quack' AND detail = 'authenticate' AND reason_code = 'policy_error'");
+			auto event = con.Query("SELECT count(*)::BIGINT FROM acl_audit_events() WHERE kind = 'session' AND "
+			                       "detail = 'refused' AND door = 'quack' AND reason_code = 'source_error'");
 			if (CheckOk(*event, "the audit is asked for the reason")) {
 				Check(event->GetValue(0, 0).GetValue<int64_t>() >= 1,
-				      "...and carries it as a door event: policy_error");
+				      "...and carries it where every refusal at this seam goes: session refused, source_error");
 			}
 			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
 			Exec(con, "ALTER TABLE store.acl.meta_gone RENAME TO meta");
