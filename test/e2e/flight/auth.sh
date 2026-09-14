@@ -175,16 +175,16 @@ esac
 # client asks for the document far more often than it logs in (spec 069)
 cat >&3 <<SQL
 SELECT 'COUNTER ' || name || ' ' || attributes || ' ' || value AS line FROM acl_metrics()
-WHERE name IN ('acl.door.discovery', 'acl.door.handshakes') ORDER BY name;
+WHERE name IN ('acl.door.discoveries', 'acl.door.handshakes') ORDER BY name;
 SQL
 counted=""
 for _ in $(seq 1 20); do
-	grep -q "COUNTER acl.door.discovery" "$TMP/server.log" && { counted=1; break; }
+	grep -q "COUNTER acl.door.discoveries" "$TMP/server.log" && { counted=1; break; }
 	sleep 0.5
 done
 [ -n "$counted" ] || { tail -20 "$TMP/server.log" >&2; fail "the discovery refusal was not counted"; }
-grep -q 'COUNTER acl.door.discovery.*"result":"denied".*1' "$TMP/server.log" \
-	|| { grep COUNTER "$TMP/server.log" >&2; fail "acl.door.discovery does not carry the denied probe"; }
+grep -q 'COUNTER acl.door.discoveries.*"result":"denied".*1' "$TMP/server.log" \
+	|| { grep COUNTER "$TMP/server.log" >&2; fail "acl.door.discoveries does not carry the denied probe"; }
 
 echo "SELECT acl_flight_stop('$URI'); SELECT acl_flight_stop('$PLAIN_URI');" >&3
 

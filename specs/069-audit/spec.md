@@ -266,7 +266,7 @@ The OTel extension reads the same two structs directly in C++ on its own scrape 
 | `acl.denials` | `reason_code`, `door` |
 | `acl.sessions.opened`, `acl.sessions.refused` (`reason_code`), `acl.sessions.closed` (`how`) | `door` |
 | `acl.door.handshakes` (`result`), `acl.door.tickets` (`outcome`: issued / redeemed / expired / foreign) | `door` |
-| `acl.door.discovery` (`result`) - the pre-auth document, counted apart: a client asks for it far more often than it authenticates, and a source outage would otherwise read as a wave of failed logins | `door` |
+| `acl.door.discoveries` (`result`) - the pre-auth document, counted apart: a client asks for it far more often than it authenticates, and a source outage would otherwise read as a wave of failed logins | `door` |
 | `acl.ingest.statements` | `door`, `verdict` |
 | `acl.admin.statements` | `verdict`, `scope`: anonymous / manage / passthrough |
 | `acl.policy.reloads`, `acl.policy.source_errors`, `acl.policy.writes` | - |

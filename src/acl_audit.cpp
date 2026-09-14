@@ -279,7 +279,7 @@ void AuditPipeline::Count(const AuditEvent &event) {
 			// the pre-auth document (spec 040 addendum) is not a handshake, and a client may ask for it
 			// far more often than it authenticates - counting the two together would read as a wave of
 			// failed logins whenever the policy source is down
-			counters.Add("acl.door.discovery", {{"door", event.door}, {"result", verdict}});
+			counters.Add("acl.door.discoveries", {{"door", event.door}, {"result", verdict}});
 		} else {
 			// what is left is the door deciding about a client: Flight's password handshake, and
 			// quack's authenticate/authorize callbacks when their own catch fires (spec 041)
