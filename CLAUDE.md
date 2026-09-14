@@ -265,7 +265,8 @@ exec-context seam the door sets around Prepare; without it — quack — the rew
 the bind decides), DML/DROP are symmetric, `SHOW TABLES`/tables listings include the session's own
 temps, and ingest `temporary = true` stages into a session temp the client then moves with plain SQL.
 duckdb reclaims everything with the connection; `acl_sessions()` / `acl_session_kill(id)` are the ops
-surface. **Spec 051**: ingest `mode=create`/`replace` builds/replaces a table in a granted physical
+surface (each session also shows its door, the audit level in force and which of instance / policy /
+override decided it - spec 069's addendum, and the answer to acl_otel's spec 004). **Spec 051**: ingest `mode=create`/`replace` builds/replaces a table in a granted physical
 home, and `CREATE OR REPLACE` is priced at `create`+`drop` (REPLACE is a drop). **Spec 052**: EXPLAIN
 is the explicit `explain` capability (a plan names physical objects); the rest of the leak-audit
 surfaces are confirmed fail-closed. **Spec 053**: `acl_flight_serve(uri, cert, key)` serves over TLS

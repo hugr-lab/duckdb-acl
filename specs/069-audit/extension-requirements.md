@@ -103,9 +103,14 @@ never slow or stop one.
 ### R4 - logging on a connection
 
 - R4.1 "Enable logging for this connection" is R3 applied at open, plus the operator's override for
-  a session already open; the extension exposes both in one place: `acl_otel_session_level(<ops
-  id>, <level>)` delegating to the base, and `acl_otel_sessions()` listing sessions with their
-  effective level and where it came from (rule / override / instance).
+  a session already open. **Answered by the base as of 2026-09-14, not by the extension**:
+  `acl_sessions()` lists every live session with its `door`, the `level` in force and the
+  `level_source` that decided it (`instance` / `policy` / `override`), and
+  `acl_session_audit_level(<ops id>, <level>)` is the override. The extension cannot answer this
+  itself - the contract carries events, counters and gauges, and a session list is none of the
+  three; re-applying its own rules to guess would produce a number that is wrong whenever an
+  operator has overridden one, and C6 says the override wins. An extension may still wrap the two
+  functions for convenience, but nothing here requires it.
 - R4.2 A level change takes effect on the session's next statement.
 
 ### R5 - enrichment

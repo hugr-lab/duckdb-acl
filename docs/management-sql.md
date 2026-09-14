@@ -815,6 +815,6 @@ are registered elsewhere and documented with the Flight door.
 | `acl_quack_authenticate(session_id, client_token, server_token)`, `acl_quack_authorize(connection_id, query)` | BOOLEAN, VARCHAR | the door's per-connection and per-statement callbacks (prefixed SQL, or NULL to refuse) |
 | `acl_session_open(token)`, `acl_session_sql(handle, sql)`, `acl_session_reason(handle)` | VARCHAR | mint a handle (NULL if the token fails), prefix a statement (NULL if unusable), `live`/`expired`/`idle`/`unknown` |
 | `acl_session_close(handle)`, `acl_session_kill(id)`                        | BOOLEAN  | end a session by handle, or by the ops id `acl_sessions()` shows |
-| `acl_sessions()`                                                           | VARCHAR  | live sessions as JSON (ops ids, never handles)                  |
+| `acl_sessions()`                                                           | VARCHAR  | live sessions as JSON: ops ids (never handles), door, audit level in force and its source |
 | `acl_session_sweep()`, `acl_session_count()`                               | BIGINT   | drop dead sessions / count live ones                            |
 | `acl_drain()`, `acl_resume()`, `acl_drain_status()`                        | BIGINT, BOOLEAN, VARCHAR | stop seating new clients, resume, `draining`/`serving` |

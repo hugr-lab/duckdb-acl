@@ -517,6 +517,9 @@ idx_t PolicyStore::SessionCount() {
 
 vector<PolicyStore::SessionInfo> PolicyStore::SessionList() {
 	auto now = NowSeconds();
+	// the instance level is read BEFORE the lock: it reaches for a setting, and a session's own
+	// level is only meaningful next to the one it falls back to
+	auto instance = audit ? audit->InstanceLevel() : AuditLevel::DECISIONS;
 	lock_guard<mutex> guard(lock);
 	vector<SessionInfo> out;
 	out.reserve(sessions.size());
@@ -527,6 +530,13 @@ vector<PolicyStore::SessionInfo> PolicyStore::SessionList() {
 		info.roles = entry.second.principal.roles;
 		info.expires_at = entry.second.expires_at;
 		info.idle_seconds = now - entry.second.last_used;
+		info.door = entry.second.door;
+		// the level IN FORCE, and which of the three decided it. A session with none of its own is
+		// the instance's, whoever last cleared it: `source` describes where the level comes from
+		// now, not who touched it last.
+		auto own = entry.second.audit_level;
+		info.level = AuditLevelName(own < 0 ? instance : static_cast<AuditLevel>(own));
+		info.level_source = own < 0 ? "instance" : (entry.second.level_from_operator ? "override" : "policy");
 		out.push_back(std::move(info));
 	}
 	return out;
@@ -901,6 +911,10 @@ bool PolicyStore::SetSessionAuditLevel(const string &id, int8_t level) {
 	for (auto &entry : sessions) {
 		if (entry.second.id == id) {
 			entry.second.audit_level = level;
+			// what `acl_sessions()` reports as the source from here on: the operator outranks the
+			// policy's answer (C6), and a level cleared back to the instance's says `instance`
+			// whoever cleared it
+			entry.second.level_from_operator = true;
 			return true;
 		}
 	}
