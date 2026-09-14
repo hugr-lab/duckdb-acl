@@ -60,11 +60,11 @@ string HostPid() {
 //===--------------------------------------------------------------------===//
 
 AuditPipeline::AuditPipeline(shared_ptr<AuditHooks> hooks_p) : hooks(std::move(hooks_p)) {
-	hooks->Gauges().Register("acl.audit.queue_fill", {}, "1", "events waiting on the audit thread", [this]() {
+	hooks->Gauges().Register("acl.audit.queue_fill", {}, "{event}", "events waiting on the audit thread", [this]() {
 		std::lock_guard<std::mutex> guard(queue_lock);
 		return int64_t(queue.size());
 	});
-	hooks->Gauges().Register("acl.audit.ring_fill", {}, "1", "events held in the ring", [this]() {
+	hooks->Gauges().Register("acl.audit.ring_fill", {}, "{event}", "events held in the ring", [this]() {
 		std::lock_guard<std::mutex> guard(ring_lock);
 		return int64_t(ring.size());
 	});
@@ -752,7 +752,7 @@ void RegisterAclAudit(ExtensionLoader &loader, const shared_ptr<PolicyStore> &st
 			return locked ? read(*locked) : -1;
 		};
 	};
-	gauges.RegisterDynamic("acl.sessions.live", "1", "sessions alive right now, per door", [weak_store]() {
+	gauges.RegisterDynamic("acl.sessions.live", "{session}", "sessions alive right now, per door", [weak_store]() {
 		vector<std::pair<vector<std::pair<string, string>>, int64_t>> out;
 		auto locked = weak_store.lock();
 		if (!locked) {
@@ -763,11 +763,11 @@ void RegisterAclAudit(ExtensionLoader &loader, const shared_ptr<PolicyStore> &st
 		}
 		return out;
 	});
-	gauges.Register("acl.sessions.max", {}, "1", "acl_max_sessions",
+	gauges.Register("acl.sessions.max", {}, "{session}", "acl_max_sessions",
 	                with_store([](PolicyStore &s) { return s.MaxSessions(); }));
-	gauges.Register("acl.node.draining", {}, "1", "1 while acl_drain() is in effect",
+	gauges.Register("acl.node.draining", {}, "", "1 while acl_drain() is in effect",
 	                with_store([](PolicyStore &s) { return int64_t(s.Draining() ? 1 : 0); }));
-	gauges.Register("acl.policy.version", {}, "1", "the policy version the caches are keyed by (-1: no catalog)",
+	gauges.Register("acl.policy.version", {}, "", "the policy version the caches are keyed by (-1: no catalog)",
 	                with_store([](PolicyStore &s) { return s.PolicyVersion(); }));
 	gauges.Register("acl.policy.staleness", {}, "s",
 	                "seconds since the last successful policy version check (-1: never)",

@@ -281,7 +281,7 @@ void RegisterAclQuackDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store
 		auto &db = loader.GetDatabaseInstance();
 		auto hooks = store->hooks; // the instance's registry, or the private one (AuditHooks::Reach)
 		weak_ptr<DatabaseInstance> weak_db = db.shared_from_this();
-		hooks->Gauges().Register("acl.door.state", {{"door", "quack"}}, "1", "listeners serving right now",
+		hooks->Gauges().Register("acl.door.state", {{"door", "quack"}}, "{door}", "listeners serving right now",
 		                         [weak_db]() -> int64_t {
 			                         auto locked = weak_db.lock();
 			                         return locked ? int64_t(AclQuackServerCount(*locked)) : 0;

@@ -276,7 +276,7 @@ void LoadInternal(ExtensionLoader &loader) {
 		hooks->Gauges().Register("acl.node.uptime", {}, "s", "seconds since the extension loaded", [loaded]() {
 			return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - loaded).count();
 		});
-		hooks->Gauges().Register("acl.node.info", {{"version", version.empty() ? "dev" : version}}, "1",
+		hooks->Gauges().Register("acl.node.info", {{"version", version.empty() ? "dev" : version}}, "",
 		                         "always 1; the build in the attributes", []() { return int64_t(1); });
 		// the contract the registry speaks (acl_audit.hpp): `shared` is the normal state; `private`
 		// means an extension loaded here was built from another revision (`found` = its stamp, 0 =
@@ -285,7 +285,7 @@ void LoadInternal(ExtensionLoader &loader) {
 		if (!contract_mismatch.empty()) {
 			contract.emplace_back("found", std::to_string(acl::AuditHooks::StampOf(db.GetObjectCache())));
 		}
-		hooks->Gauges().Register("acl.audit.contract", contract, "1",
+		hooks->Gauges().Register("acl.audit.contract", contract, "",
 		                         "the audit contract version this build speaks; the registry's state in the attributes",
 		                         []() { return int64_t(acl::AuditHooks::CONTRACT_VERSION); });
 	}
