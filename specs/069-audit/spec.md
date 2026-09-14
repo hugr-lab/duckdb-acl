@@ -113,6 +113,14 @@ the operator afterwards: `acl_session_audit_level('<ops id>', 'all')`, denied to
 rest of the ops surface. A client never lowers its own level: `acl_audit_level` is not on spec 068's
 client-local allowlist.
 
+**Which level a session is at, and why** (2026-09-14): `acl_sessions()` carries `door`, the `level`
+in force and `level_source` - `instance` when the session has none of its own, `policy` when the
+registered `SessionPolicy` answered at open, `override` when an operator set one afterwards. A
+session cleared back to `''` reads `instance` again: the source describes where the level in force
+comes from now, not who touched it last. This lives in the base because a consumer of the contract
+cannot see the sessions at all, and guessing the level from its own rules would be wrong exactly
+when an operator has overridden one (`acl_otel`'s spec 004 asked for it and is answered here).
+
 ### Where decisions are made - the seams that emit
 
 - **The rewriter** (`RewriteStatements`): one event per statement of the batch. The walker records

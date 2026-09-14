@@ -1058,6 +1058,13 @@ void AclDrainStatusFunc(DataChunk &args, ExpressionState &state, Vector &result)
 //! (spec 050). Never the handle (a bearer credential): each session shows its non-secret ops id, its
 //! principal (subject + roles), how long it has been idle, and its token exp. Denied to a principal
 //! like the rest of this surface - a client may not learn who else is connected.
+//!
+//! Also the door that opened it and the audit level in force with where it came from (spec 069
+//! addendum): "turn logging on for that connection, and tell me why this other one is already
+//! verbose" is one question, and it is answered here rather than in an extension - a consumer of
+//! the audit contract cannot see the sessions at all (the contract carries events, counters and
+//! gauges), and asking it to guess the level from its own rules would be a number that is wrong
+//! whenever an operator has overridden one.
 void AclSessionsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto sessions = StoreOf(state).SessionList();
 	string json = "[";
@@ -1073,7 +1080,8 @@ void AclSessionsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		// a control byte in it emitted raw made this an invalid document (the 2026-09-03 review)
 		json += "{\"id\":" + JsonQuote(session.id) + ",\"subject\":" + JsonQuote(session.subject) +
 		        ",\"roles\":" + roles + ",\"idle_seconds\":" + std::to_string(session.idle_seconds) +
-		        ",\"expires_at\":" + std::to_string(session.expires_at) + "}";
+		        ",\"expires_at\":" + std::to_string(session.expires_at) + ",\"door\":" + JsonQuote(session.door) +
+		        ",\"level\":" + JsonQuote(session.level) + ",\"level_source\":" + JsonQuote(session.level_source) + "}";
 	}
 	json += "]";
 	result.Reference(Value(json), count_t(args.size()));

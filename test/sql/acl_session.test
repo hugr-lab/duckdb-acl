@@ -449,6 +449,59 @@ SELECT position(chr(1) IN acl_sessions()) = 0;
 ----
 true
 
+# --- the level in force, and where it came from (spec 069 addendum) ------------------------------
+# "Turn logging on for that connection, and tell me why this other one is already verbose" is one
+# question. It is answered here rather than in acl_otel: a consumer of the audit contract cannot see
+# the sessions at all, and guessing the level from its own rules would be a number that is wrong
+# whenever an operator has overridden one.
+
+# with no session policy registered and nothing overridden, a session runs at the instance's level
+statement ok
+SET GLOBAL acl_audit_level = 'denied';
+
+query II
+SELECT acl_sessions() LIKE '%"level":"denied"%', acl_sessions() LIKE '%"level_source":"instance"%';
+----
+true	true
+
+# ... and follows the instance when that changes: the session has no level of its own to keep
+statement ok
+SET GLOBAL acl_audit_level = 'all';
+
+query II
+SELECT acl_sessions() LIKE '%"level":"all"%', acl_sessions() LIKE '%"level_source":"instance"%';
+----
+true	true
+
+# the operator's override outranks everything and says so
+statement ok
+SELECT acl_session_audit_level((SELECT regexp_extract(acl_sessions(), '"id":"([^"]+)"', 1)), 'decisions');
+
+query II
+SELECT acl_sessions() LIKE '%"level":"decisions"%', acl_sessions() LIKE '%"level_source":"override"%';
+----
+true	true
+
+# cleared back to '' the session is the instance's again - `source` says where the level in force
+# comes from NOW, not who touched it last
+statement ok
+SELECT acl_session_audit_level((SELECT regexp_extract(acl_sessions(), '"id":"([^"]+)"', 1)), '');
+
+query II
+SELECT acl_sessions() LIKE '%"level":"all"%', acl_sessions() LIKE '%"level_source":"instance"%';
+----
+true	true
+
+# the door that opened it - `session` for one minted through the contract itself (spec 040), which
+# is what a rule matching on `door` is matched against
+query I
+SELECT acl_sessions() LIKE '%"door":"session"%';
+----
+true
+
+statement ok
+SET GLOBAL acl_audit_level = 'decisions';
+
 statement ok
 SELECT acl_session_close((SELECT handle FROM odd));
 

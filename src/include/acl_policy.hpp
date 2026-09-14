@@ -304,6 +304,10 @@ struct PolicyStore {
 		//! The session's own audit level (spec 069): -1 inherits the instance's; set by the door's
 		//! SessionPolicy at open or by the operator afterwards, never by the principal
 		int8_t audit_level = -1;
+		//! Which of the two set it, so `acl_sessions()` can say where the level in force came from
+		//! (spec 069 addendum): an operator's `acl_session_audit_level` outranks the policy's answer
+		//! (C6), and an operator debugging a node needs to see that it did.
+		bool level_from_operator = false;
 		//! The trace the client SET on its session (spec 069): kept here, not only on the connection,
 		//! because the prefix is composed wherever the door evaluates it - quack's authorization runs
 		//! on a connection of the server's, not the client's
@@ -643,6 +647,12 @@ struct PolicyStore {
 		vector<string> roles;
 		int64_t expires_at = 0;
 		int64_t idle_seconds = 0;
+		//! spec 069 addendum: the door that opened it, the audit level IN FORCE (the session's own,
+		//! or the instance's when it has none) and which of the three decided - `instance`,
+		//! `policy` (the extended extension's rule) or `override` (the operator's).
+		string door;
+		string level;
+		string level_source;
 	};
 	//! A snapshot of the live sessions - admin-only (the door's, not a principal's).
 	vector<SessionInfo> SessionList();
