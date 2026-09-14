@@ -136,7 +136,8 @@ when an operator has overridden one (`acl_otel`'s spec 004 asked for it and is a
   `native`.
 - **`SessionOpen`** and the doors: kind `session` at level `all` - opened, refused with the reason a
   client never sees (`token rejected: …`, `draining`, `at acl_max_sessions`), expired, killed. Kind
-  `door` for the password handshake and its refusals (spec 064).
+  `door` for the password handshake and its refusals (spec 064), and for the discovery document
+  when the policy source cannot be read (`discovery`, `source_error` - spec 040 addendum).
 - **Ingest** (specs 042/049): kind `ingest`, emitted **when the drain completes**, not when it is
   admitted - both doors run the ingest INSERT themselves, so the row count is theirs to know and no
   duckdb execution hook is needed: the target with `insert`, `allowed` with `rows`, or `denied`
@@ -265,6 +266,7 @@ The OTel extension reads the same two structs directly in C++ on its own scrape 
 | `acl.denials` | `reason_code`, `door` |
 | `acl.sessions.opened`, `acl.sessions.refused` (`reason_code`), `acl.sessions.closed` (`how`) | `door` |
 | `acl.door.handshakes` (`result`), `acl.door.tickets` (`outcome`: issued / redeemed / expired / foreign) | `door` |
+| `acl.door.discovery` (`result`) - the pre-auth document, counted apart: a client asks for it far more often than it authenticates, and a source outage would otherwise read as a wave of failed logins | `door` |
 | `acl.ingest.statements` | `door`, `verdict` |
 | `acl.admin.statements` | `verdict`, `scope`: anonymous / manage / passthrough |
 | `acl.policy.reloads`, `acl.policy.source_errors`, `acl.policy.writes` | - |

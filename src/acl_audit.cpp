@@ -275,7 +275,14 @@ void AuditPipeline::Count(const AuditEvent &event) {
 		} else if (event.detail.compare(0, 7, "ingest_") == 0) {
 			// the stream in the other direction (spec 070): a load its client cancelled
 			counters.Add("acl.door.streams", {{"door", event.door}, {"outcome", event.detail}});
+		} else if (event.detail == "discovery") {
+			// the pre-auth document (spec 040 addendum) is not a handshake, and a client may ask for it
+			// far more often than it authenticates - counting the two together would read as a wave of
+			// failed logins whenever the policy source is down
+			counters.Add("acl.door.discovery", {{"door", event.door}, {"result", verdict}});
 		} else {
+			// what is left is the door deciding about a client: Flight's password handshake, and
+			// quack's authenticate/authorize callbacks when their own catch fires (spec 041)
 			counters.Add("acl.door.handshakes", {{"door", event.door}, {"result", verdict}});
 		}
 	} else if (event.kind == "policy") {
