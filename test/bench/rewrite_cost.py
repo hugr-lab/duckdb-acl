@@ -49,10 +49,20 @@ CREATE TABLE phys.main.orders AS
 """
 
 
-def setup_sql(acl_ext: str, rows: int) -> str:
-    """Physical data, and two objects over it: one a pure rename, one carrying a real policy."""
+def setup_sql(acl_ext: str, rows: int, extra_ext: str = "", audit_level: str = "",
+              extra_setup: str = "") -> str:
+    """Physical data, and two objects over it: one a pure rename, one carrying a real policy.
+
+    `extra_ext` loads a second extension beside acl - an audit consumer, say - so its cost on the
+    decision path can be measured rather than asserted; `audit_level` sets the instance's level,
+    since a sink is only called for the events a level records.
+    """
+    extra = f"LOAD '{extra_ext}';\n" if extra_ext else ""
+    level = f"SET GLOBAL acl_audit_level = '{audit_level}';\n" if audit_level else ""
+    more = f"{extra_setup}\n" if extra_setup else ""
     return f"""
 LOAD '{acl_ext}';
+{extra}{level}{more}
 ATTACH ':memory:' AS phys;
 CREATE TABLE phys.main.orders AS
     SELECT i AS id, 'acme' AS tenant, i % 997 AS amount, 'ssn-' || i AS ssn
@@ -154,6 +164,13 @@ def main() -> int:
     ap.add_argument("--rows", type=int, default=100000, help="rows in the physical table (default 100k)")
     ap.add_argument("--repeats", type=int, default=3, help="runs per measurement, best wins (default 3)")
     ap.add_argument("--json", help="also write the numbers here")
+    ap.add_argument("--extra-extension", default="",
+                    help="load this extension beside acl and measure with it (an audit consumer)")
+    ap.add_argument("--extra-setup", default="",
+                    help="extra SQL to run after the extensions load (configure the consumer)")
+    ap.add_argument("--audit-level", default="",
+                    help="set acl_audit_level for the measured runs (a sink is called only for "
+                         "what a level records)")
     args = ap.parse_args()
 
     duckdb = str(BUILD / "duckdb")
@@ -163,10 +180,16 @@ def main() -> int:
             print(f"SKIP: {path} is missing - run 'GEN=ninja make' first")
             return 0
 
-    setup = setup_sql(acl_ext, args.rows)
+    if args.extra_extension and not pathlib.Path(args.extra_extension).exists():
+        print(f"SKIP: {args.extra_extension} is missing")
+        return 0
+    setup = setup_sql(acl_ext, args.rows, args.extra_extension, args.audit_level, args.extra_setup)
 
     print(f"acl rewrite cost: n={args.n} statements per measurement, {args.rows} rows, "
           f"best of {args.repeats}")
+    if args.extra_extension:
+        print(f"beside acl: {pathlib.Path(args.extra_extension).name}"
+              f"{f', acl_audit_level={args.audit_level}' if args.audit_level else ''}")
     print()
     print(f"{'case':<8} {'unloaded':>10} {'loaded':>10} {'toll':>8} "
           f"{'rename':>10} {'+cost':>9} {'policy':>10} {'+cost':>9}")

@@ -348,9 +348,27 @@ extension does can slow or stop a decision.
 
 Composing an event is a handful of small strings and one queue push under a mutex; everything else
 is on the audit thread. Against the 25–70 µs the rewrite itself costs (spec 043's measurement) this
-is noise at `decisions`; `test/bench/rewrite_cost.py` gets a column for "with audit" to keep it
-honest. A level of `off` still composes and counts (the counters are a state of the node whatever
-the level) - it records nothing.
+is noise at `decisions`. A level of `off` still composes and counts (the counters are a state of the
+node whatever the level) - it records nothing.
+
+**Measured, 2026-09-14** (`test/bench/rewrite_cost.py --extra-extension --audit-level`, n=300, 20k
+rows, best of 3, one laptop). The question was whether a registered consumer costs a decision
+anything - `acl_otel` was loaded beside acl, attached, at `acl_audit_level = decisions`:
+
+| | effect across all six cases |
+| --- | --- |
+| the method's own noise (the same configuration measured twice) | ±33 µs |
+| acl_otel attached, nothing configured | −20 µs … +36 µs |
+| acl_otel with an endpoint nobody listens on, every export failing | −24 µs … +40 µs |
+
+Against 282–1315 µs per statement the effect is **smaller than the repeat-to-repeat spread and
+changes sign between cases**, which is the honest way of saying this method cannot see it. The
+third row is the one worth having: a consumer whose backend is down does not reach the decision
+path either - the network is behind a bounded queue and a worker thread, exactly as R10.1 asks.
+
+What this does not measure: a consumer that blocks *inside* `OnEvent`. The contract permits it and
+the base's own answer is C3 - a slow sink costs dropped events, not latency - which
+`test_acl_audit_hooks` pins with a sink that sleeps 150 ms per event.
 
 **One source cannot drown the others.** A refusal is cheap to cause and an event each, so a
 principal - or an unauthenticated client presenting refused tokens - could push everybody else's
