@@ -2288,7 +2288,7 @@ void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> stor
 		auto &db = loader.GetDatabaseInstance();
 		auto hooks = store->hooks; // the instance's registry, or the private one (AuditHooks::Reach)
 		weak_ptr<DatabaseInstance> weak_db = db.shared_from_this();
-		hooks->Gauges().Register("acl.door.state", {{"door", "flight"}}, "1", "doors serving right now",
+		hooks->Gauges().Register("acl.door.state", {{"door", "flight"}}, "{door}", "doors serving right now",
 		                         [weak_db]() -> int64_t {
 			                         auto locked = weak_db.lock();
 			                         if (!locked) {
@@ -2306,7 +2306,7 @@ void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> stor
 		                         });
 		// spec 070: result streams open right now, across this instance's doors - a fleet of
 		// forgotten cursors shows here before it shows as a session that will not run its next statement
-		hooks->Gauges().Register("acl.door.streams_open", {{"door", "flight"}}, "1",
+		hooks->Gauges().Register("acl.door.streams_open", {{"door", "flight"}}, "{stream}",
 		                         "result streams being pulled right now", [weak_db]() -> int64_t {
 			                         auto locked = weak_db.lock();
 			                         if (!locked) {

@@ -248,6 +248,15 @@ the issuer.
 
 `acl_metrics()` is a table function over `AuditHooks::Counters()` and `Gauges()`:
 `name`, `kind` (`counter` / `gauge`), `attributes` (a JSON object), `value`, `unit`, `description`.
+
+**Units are UCUM, and `"1"` is a trap** (found on a Grafana bench, 2026-09-14): the
+OpenTelemetry-to-Prometheus convention turns a gauge whose unit is `1` into `<name>_ratio`, so
+`acl.sessions.live` arrived as `acl_sessions_live_ratio` and `acl.node.info` as
+`acl_node_info_ratio` - neither is a ratio, and a dashboard built on those names reads wrong. Every
+gauge here now carries either a UCUM annotation, which adds no suffix (`{session}`, `{door}`,
+`{stream}`, `{event}`), or an empty unit where the number is a flag or a version. Counters keep
+`"1"`: the same convention gives them `_total` and no `_ratio`, and their unit is set in the
+header every consumer compiles, which is not worth touching for cosmetics.
 The OTel extension reads the same two structs directly in C++ on its own scrape interval.
 
 | counter | attributes |
