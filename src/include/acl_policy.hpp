@@ -533,6 +533,13 @@ struct PolicyStore {
 	bool VerifyPrincipal(bool is_token, const string &value, Principal &out, bool ignore_exp = false);
 	//! Verify a token and mint an opaque handle for it (spec 040). Empty when the token does not
 	//! verify: a door refuses rather than learning why, and the reason belongs to whoever verified.
+	//!
+	//! The same holds for a policy source that is not answering (spec 040 addendum): the read of the
+	//! issuer, the role mapping and the role claims all go to the source, and a source fails with a
+	//! message that can name a DSN or a catalog. For a DOOR that is one more refusal - an empty
+	//! handle and a `session refused` event carrying `source_error` - never an exception a client
+	//! reads. `acl_session_open()` (door `session`) is the operator's own call and still throws: the
+	//! gateway is the trusted side by the deployment invariant, and it is the one that has to know.
 	string SessionOpen(const string &token, const string &door = "session");
 	//! The operator's per-session audit level (spec 069), by the ops id; -1 inherits. False = no such session.
 	bool SetSessionAuditLevel(const string &id, int8_t level);
@@ -739,6 +746,12 @@ struct PolicyStore {
 	string ParserOverrideMode();
 
 private:
+	//! Everything SessionOpen does, including what can throw against the policy source. Split out so
+	//! the caller is one try and this stays readable; `principal` is filled as far as verification
+	//! got, so a refusal event can still name who was trying. PRIVATE on purpose: calling it
+	//! directly is how the guard above would be bypassed, and a door must never be able to.
+	string SessionOpenBody(const string &token, const string &door, Principal &principal);
+
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);
 

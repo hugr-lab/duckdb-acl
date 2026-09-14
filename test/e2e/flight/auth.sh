@@ -133,6 +133,44 @@ PY
 got="$(ask "$URI" bearer "$TOKEN" "SELECT count(*) AS n FROM orders" --tls-roots "$TMP/cert.pem")"
 echo "$got" | grep -q "'n': \[3\]" || fail "the plain bearer path regressed: $got"
 
+# --- a policy source that stops answering refuses, and says nothing about itself -------------------
+# spec 040 addendum: the handshake and the bearer path both read the source before anyone is
+# authenticated, and a source fails with a message that can name a DSN or a catalog. Break it under
+# the live door - the version check at zero, the meta table renamed away - and read what crosses the
+# wire. The reason belongs to the operator's audit; the client gets the flat refusal.
+cat >&3 <<SQL
+SET GLOBAL acl_version_check_interval=0;
+SET GLOBAL acl_allow_anonymous_admin=true;
+ALTER TABLE store.acl.meta RENAME TO meta_gone;
+SET GLOBAL acl_allow_anonymous_admin=false;
+SELECT 1;
+SQL
+
+broken=""
+for _ in $(seq 1 40); do
+	got="$(ask "$URI" bearer "$TOKEN" "SELECT 1" --tls-roots "$TMP/cert.pem")"
+	case "$got" in *"authentication failed"*) broken=1; break;; esac
+	sleep 0.5
+done
+[ -n "$broken" ] || fail "the bearer path did not refuse once the source was broken: $got"
+case "$got" in
+*meta_gone* | *"Catalog Error"* | *"acl catalog"*) fail "the source's own error crossed the wire: $got";;
+esac
+
+got="$(ask "$URI" password alice wonder "SELECT 1" --tls-roots "$TMP/cert.pem")"
+case "$got" in *"authentication failed"*) ;; *) fail "the handshake did not refuse on a broken source: $got";; esac
+case "$got" in
+*meta_gone* | *"Catalog Error"* | *"acl catalog"*) fail "the handshake leaked the source's own error: $got";;
+esac
+
+# discovery is the third pre-auth path and reads the same source: it answers the document it can
+# still honestly build - a node that cannot read its issuers names none - and never the error
+got="$(ask "$URI" discover --tls-roots "$TMP/cert.pem")"
+case "$got" in *'"issuers":[]'*) ;; *) fail "discovery on a broken source did not answer an empty list: $got";; esac
+case "$got" in
+*meta_gone* | *"Catalog Error"* | *"acl catalog"*) fail "discovery leaked the source's own error: $got";;
+esac
+
 echo "SELECT acl_flight_stop('$URI'); SELECT acl_flight_stop('$PLAIN_URI');" >&3
 
-echo "PASS: discovery answered unauthenticated from the live policy, the password handshake earned the tenant's slice, the IdP's refusals were surfaced, the cleartext door refused, and the bearer path held"
+echo "PASS: discovery answered unauthenticated from the live policy, the password handshake earned the tenant's slice, the IdP's refusals were surfaced, the cleartext door refused, the bearer path held, and a broken policy source refused both paths without a word about itself"

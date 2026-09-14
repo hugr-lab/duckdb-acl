@@ -22,7 +22,13 @@ oidc::Endpoints DiscoverEndpointsCached(PolicyStore &store, const string &issuer
 //! The discovery document: {"issuers":[{"issuer":…,"client_id":…,"token_endpoint":…,
 //! "device_authorization_endpoint":…}]}. client_id is included (a public identifier); the
 //! client_secret never is. An issuer whose IdP cannot be reached is still named, endpoint-less.
-string DoorAuthJson(PolicyStore &store);
+//!
+//! Both doors answer this to a caller who has not authenticated - that is what it is for - and it
+//! reads the policy source to build it. A source that fails must therefore not answer with its own
+//! text (spec 040 addendum): the document comes back with no issuers, which is what a node that
+//! cannot read them honestly knows, and the reason goes to the audit as a `door` event named by
+//! `door`.
+string DoorAuthJson(PolicyStore &store, const char *door);
 
 } // namespace acl
 } // namespace duckdb

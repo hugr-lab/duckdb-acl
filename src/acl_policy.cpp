@@ -262,7 +262,32 @@ string MintRandomHex(idx_t bytes) {
 	return out;
 }
 
+//! Spec 040 addendum (2026-09-14): one try around everything that talks to the policy source. The
+//! issuer lookup, the role mapping and the role claims are all reads of it, and a source fails with
+//! an exception whose text can name a DSN or a catalog - which the doors used to hand straight to a
+//! client that had not authenticated yet (Flight as a Status message; quack, since its f4328c5, as
+//! the callback's error). A door gets the refusal it already knows how to speak, and the operator
+//! gets the reason in the audit. `acl_session_open()` is the exception, in both senses: the gateway
+//! calls it for itself, it is the trusted side, and an operator debugging a dead source needs the
+//! text - so that one still throws.
+//!
+//! The catch is deliberately every exception, not the source's alone, and every one of them is
+//! `source_error` to a door: a door must not learn the difference between a catalog that is down and
+//! a bug of ours, and the audit keeps the text either way.
 string PolicyStore::SessionOpen(const string &token, const string &door) {
+	Principal principal; // as far as verification got, so a refusal can still name who was trying
+	try {
+		return SessionOpenBody(token, door, principal);
+	} catch (std::exception &ex) {
+		if (door == "session") {
+			throw; // the operator's own call (acl_session_open): they are who the reason is for
+		}
+		SessionEvent(audit.get(), principal, door, "", -1, "refused", "source_error", ErrorData(ex).RawMessage(), -1);
+		return string();
+	}
+}
+
+string PolicyStore::SessionOpenBody(const string &token, const string &door, Principal &principal) {
 	// a refusal is a session event too (spec 069): the reason a client never learns is what the
 	// operator's record carries
 	auto refused = [&](const Principal &who, const char *code, const string &reason) {
@@ -275,7 +300,6 @@ string PolicyStore::SessionOpen(const string &token, const string &door) {
 	if (draining.load(std::memory_order_relaxed)) {
 		return refused(Principal(), "draining", "acl: node is draining - not accepting new sessions");
 	}
-	Principal principal;
 	int64_t expires_at = 0;
 	string issuer;
 	if (LooksLikeJwt(token, issuer)) {
