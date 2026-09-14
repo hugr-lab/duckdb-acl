@@ -1,0 +1,86 @@
+# name: test/sql/acl_quack_door_fail_closed.test
+# description: the quack door's callbacks answer with their own refusal when something throws under
+#   them (specs 041/063). Since quack f4328c5 the embedded server puts a failed callback's error text
+#   in front of the client, so an exception escaping here would tell somebody who has not
+#   authenticated yet what our policy source said - a DSN, a catalog name. The reason is the
+#   operator's, and reaches them through the audit (spec 069).
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+SET GLOBAL acl_audit_level='all';
+
+# the healthy source: the callback opens a session and binds the connection
+query I
+SELECT acl_quack_authenticate('conn-1',
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc',
+    'the server token, ignored');
+----
+true
+
+# --- the source stops answering under the door --------------------------------------------------------
+# every read is judged against the source's version, so with the interval at zero the next call goes
+# to a catalog whose meta table is gone - which is how a policy source fails in practice
+
+statement ok
+SET GLOBAL acl_version_check_interval=0;
+
+statement ok
+DROP TABLE store.acl.meta;
+
+# what would otherwise escape as an exception (and travel to the client as text) is the refusal this
+# callback already speaks
+query I
+SELECT acl_quack_authenticate('conn-2',
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc',
+    'the server token, ignored');
+----
+false
+
+# a connection nobody bound is NULL, source or no source: the authorize callback's own refusal
+query I
+SELECT acl_quack_authorize('conn-never-seen', 'SELECT 1') IS NULL;
+----
+true
+
+statement ok
+SELECT acl_audit_flush();
+
+# the reason the client never learns is the one the operator's record carries
+query IIIII
+SELECT kind, detail, verdict, reason_code, door FROM acl_audit_events() WHERE kind = 'door' ORDER BY seq;
+----
+door	authenticate	denied	policy_error	quack

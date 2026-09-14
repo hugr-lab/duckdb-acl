@@ -20,6 +20,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -173,17 +174,27 @@ void AclQuackStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 //! carries.
 void AclQuackAuthenticateFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &store = StoreOf(state);
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto session_id = RequiredArg(args, 0, row, "acl_quack_authenticate", "session id");
-		auto token = RequiredArg(args, 1, row, "acl_quack_authenticate", "client token");
-		auto &store = StoreOf(state);
-		auto handle = store.SessionOpen(token, "quack");
-		if (handle.empty()) {
+		// Since quack f4328c5 the server hands a failed callback's error text back over the wire, so
+		// an exception here would tell a client that has not authenticated yet what our policy source
+		// said - a DSN, a catalog name. Fail closed and keep the reason where it belongs: the audit
+		// (spec 069 - the door refuses, it does not learn why; the same rule SessionOpen follows for
+		// a JWKS document it cannot read).
+		try {
+			auto session_id = RequiredArg(args, 0, row, "acl_quack_authenticate", "session id");
+			auto token = RequiredArg(args, 1, row, "acl_quack_authenticate", "client token");
+			auto handle = store.SessionOpen(token, "quack");
+			if (handle.empty()) {
+				result.SetValue(row, Value::BOOLEAN(false));
+				continue;
+			}
+			store.SessionBind(session_id, handle);
+			result.SetValue(row, Value::BOOLEAN(true));
+		} catch (std::exception &ex) {
+			store.AuditDoor("quack", "authenticate", false, "policy_error", ErrorData(ex).RawMessage());
 			result.SetValue(row, Value::BOOLEAN(false));
-			continue;
 		}
-		store.SessionBind(session_id, handle);
-		result.SetValue(row, Value::BOOLEAN(true));
 	}
 }
 
@@ -199,21 +210,29 @@ void AclQuackAuthenticateFunc(DataChunk &args, ExpressionState &state, Vector &r
 //! never run, because if quack ever does run it, it runs through the ACL rather than around it.
 void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &store = StoreOf(state);
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto connection_id = RequiredArg(args, 0, row, "acl_quack_authorize", "connection id");
-		auto sql = RequiredArg(args, 1, row, "acl_quack_authorize", "query");
-		auto &store = StoreOf(state);
-		string handle;
-		if (!store.SessionHandleFor(connection_id, handle)) {
+		// NULL is the refusal this callback speaks, and it is also what an exception has to become:
+		// the server would otherwise put our error text in front of the client (see the note in
+		// acl_quack_authenticate)
+		try {
+			auto connection_id = RequiredArg(args, 0, row, "acl_quack_authorize", "connection id");
+			auto sql = RequiredArg(args, 1, row, "acl_quack_authorize", "query");
+			string handle;
+			if (!store.SessionHandleFor(connection_id, handle)) {
+				result.SetValue(row, Value());
+				continue;
+			}
+			// SessionSql is the one place the prefix is composed, so every door spells it the same way;
+			// the trace is whatever the client SET on its connection (spec 069)
+			string correlation_id, traceparent;
+			TraceFromContext(state.GetContext(), correlation_id, traceparent);
+			auto prefixed = store.SessionSql(handle, sql, correlation_id, traceparent);
+			result.SetValue(row, prefixed.empty() ? Value() : Value(prefixed));
+		} catch (std::exception &ex) {
+			store.AuditDoor("quack", "authorize", false, "policy_error", ErrorData(ex).RawMessage());
 			result.SetValue(row, Value());
-			continue;
 		}
-		// SessionSql is the one place the prefix is composed, so every door spells it the same way;
-		// the trace is whatever the client SET on its connection (spec 069)
-		string correlation_id, traceparent;
-		TraceFromContext(state.GetContext(), correlation_id, traceparent);
-		auto prefixed = store.SessionSql(handle, sql, correlation_id, traceparent);
-		result.SetValue(row, prefixed.empty() ? Value() : Value(prefixed));
 	}
 }
 
