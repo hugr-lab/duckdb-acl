@@ -45,6 +45,9 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
         GIT_REPOSITORY https://github.com/duckdb/ducklake
         GIT_TAG 7f0ece3aa1f5a7a9b3777874613c5c630eb9e98f
         GIT_SUBMODULES ""
+        # 0001/0002 are ours to keep until upstream grows the equivalents; 0003 is TEMPORARY - it
+        # migrates ducklake to duckdb's Literal API, which ducklake has not done itself (2026-09-14),
+        # and goes away the moment a ducklake pin builds without it
         PATCH_COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/duckdb/scripts/apply_extension_patches.py ${CMAKE_CURRENT_LIST_DIR}/patches/ducklake/
         SOURCE_SUBDIR __duckdb_no_add_subdirectory__
     )
