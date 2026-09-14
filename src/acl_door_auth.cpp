@@ -2,6 +2,7 @@
 // acl_door_auth.cpp — the auth-discovery document (spec 064), shared by the doors
 //===----------------------------------------------------------------------===//
 
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
@@ -55,7 +56,8 @@ oidc::Endpoints DiscoverEndpointsCached(PolicyStore &store, const string &issuer
 	return ep;
 }
 
-string DoorAuthJson(PolicyStore &store) {
+//! The document itself; the guard below is what every caller gets.
+static string DoorAuthDocument(PolicyStore &store) {
 	string json = "{\"issuers\":[";
 	auto issuers = store.ListIssuers();
 	for (idx_t i = 0; i < issuers.size(); i++) {
@@ -78,6 +80,16 @@ string DoorAuthJson(PolicyStore &store) {
 	}
 	json += "]}";
 	return json;
+}
+
+string DoorAuthJson(PolicyStore &store, const char *door) {
+	try {
+		return DoorAuthDocument(store);
+	} catch (std::exception &ex) {
+		// the one place both doors build it, so the guard belongs here rather than at each call
+		store.AuditDoor(door, "discovery", false, "source_error", ErrorData(ex).RawMessage());
+		return "{\"issuers\":[]}";
+	}
 }
 
 } // namespace acl

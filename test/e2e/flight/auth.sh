@@ -163,6 +163,14 @@ case "$got" in
 *meta_gone* | *"Catalog Error"* | *"acl catalog"*) fail "the handshake leaked the source's own error: $got";;
 esac
 
+# discovery is the third pre-auth path and reads the same source: it answers the document it can
+# still honestly build - a node that cannot read its issuers names none - and never the error
+got="$(ask "$URI" discover --tls-roots "$TMP/cert.pem")"
+case "$got" in *'"issuers":[]'*) ;; *) fail "discovery on a broken source did not answer an empty list: $got";; esac
+case "$got" in
+*meta_gone* | *"Catalog Error"* | *"acl catalog"*) fail "discovery leaked the source's own error: $got";;
+esac
+
 echo "SELECT acl_flight_stop('$URI'); SELECT acl_flight_stop('$PLAIN_URI');" >&3
 
 echo "PASS: discovery answered unauthenticated from the live policy, the password handshake earned the tenant's slice, the IdP's refusals were surfaced, the cleartext door refused, the bearer path held, and a broken policy source refused both paths without a word about itself"

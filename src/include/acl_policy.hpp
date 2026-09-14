@@ -541,10 +541,6 @@ struct PolicyStore {
 	//! reads. `acl_session_open()` (door `session`) is the operator's own call and still throws: the
 	//! gateway is the trusted side by the deployment invariant, and it is the one that has to know.
 	string SessionOpen(const string &token, const string &door = "session");
-	//! Everything SessionOpen does, including what can throw against the policy source. Split out so
-	//! the caller above is one try and this stays readable; `principal` is filled as far as
-	//! verification got, so a refusal event can still name who was trying.
-	string SessionOpenBody(const string &token, const string &door, Principal &principal);
 	//! The operator's per-session audit level (spec 069), by the ops id; -1 inherits. False = no such session.
 	bool SetSessionAuditLevel(const string &id, int8_t level);
 	//! A session's own level by handle, -1 when it inherits or the handle is unknown.
@@ -750,6 +746,12 @@ struct PolicyStore {
 	string ParserOverrideMode();
 
 private:
+	//! Everything SessionOpen does, including what can throw against the policy source. Split out so
+	//! the caller is one try and this stays readable; `principal` is filled as far as verification
+	//! got, so a refusal event can still name who was trying. PRIVATE on purpose: calling it
+	//! directly is how the guard above would be bypassed, and a door must never be able to.
+	string SessionOpenBody(const string &token, const string &door, Principal &principal);
+
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);
 

@@ -726,7 +726,7 @@ public:
 			payload.clear(); // a client that sent nothing is the JDBC/ADBC path: connect, nothing more
 		}
 		if (payload == "discover-auth") {
-			return outgoing->Write(DoorAuthJson(*state->store));
+			return outgoing->Write(DoorAuthJson(*state->store, "flight"));
 		}
 		return arrow::Status::OK();
 	}

@@ -94,7 +94,7 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		// per request, so the discovery document tracks an issuer added or dropped after the serve;
 		// the document is spec 064's - the same one the Flight door answers to `discover-auth`
 		cfg.wellknown = [shared_store] {
-			return DoorAuthJson(*shared_store);
+			return DoorAuthJson(*shared_store, "quack");
 		};
 		// spec 066: while draining, the discovery route answers 503 - the LB's take-me-out signal
 		cfg.draining = [shared_store] {

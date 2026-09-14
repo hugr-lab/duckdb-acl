@@ -270,6 +270,10 @@ string MintRandomHex(idx_t bytes) {
 //! gets the reason in the audit. `acl_session_open()` is the exception, in both senses: the gateway
 //! calls it for itself, it is the trusted side, and an operator debugging a dead source needs the
 //! text - so that one still throws.
+//!
+//! The catch is deliberately every exception, not the source's alone, and every one of them is
+//! `source_error` to a door: a door must not learn the difference between a catalog that is down and
+//! a bug of ours, and the audit keeps the text either way.
 string PolicyStore::SessionOpen(const string &token, const string &door) {
 	Principal principal; // as far as verification got, so a refusal can still name who was trying
 	try {

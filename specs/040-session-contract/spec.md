@@ -150,6 +150,14 @@ The quack callbacks keep their own catch (spec 041) as the belt to this brace - 
 `SessionSql` and the argument checks live outside `SessionOpen`, and the server would put any text
 they raise in front of the client.
 
+The same review found the other two pre-auth paths, and both are closed the same way. The **password
+handshake** (spec 064) reads the issuer registry and runs OIDC discovery from a middleware whose
+exceptions have nowhere good to go: one try, `door handshake` / `source_error` in the audit,
+`authentication failed` on the wire. The **discovery document** is built by one function both doors
+call (`DoorAuthJson`), so the guard lives there: a source that fails answers `{"issuers":[]}` - what
+a node that cannot read its issuers honestly knows - with a `door discovery` / `source_error` event
+behind it. The three paths are the whole of what a client can reach before it has authenticated.
+
 `test/sql/acl_quack_door_fail_closed.test` breaks the source under an open door - the version check
 at zero, the meta table gone - and pins both halves: the door answers `false` with one
 `session refused` / `source_error` event behind it, and `acl_session_open()` still raises.
