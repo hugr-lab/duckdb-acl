@@ -15,8 +15,11 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
 - **DuckDB**: tracks the **2.0 release branch `v2.0-cyanoptera`** (submodule pinned in
   `.gitmodules`; until 2026-09-08 it tracked `main`, which is now `v2.1.0-dev` and already diverges in
   the MERGE INTO API the extension ecosystem builds against). Depends on parser/AST APIs
-  (`Identifier`, multi-level `QualifiedName`, `MergeQueryNode`, unified DML query nodes) that land
-  with 2.0. Re-pin to the `v2.0.0` tag when it is cut; the scanners come from the submodule's own
+  (`Identifier`, multi-level `QualifiedName`, `MergeQueryNode`, unified DML query nodes, and since
+  2026-09-14 `Literal`) that land with 2.0. **A constant is a `Literal`, not a `Value`**: the
+  literal is the text as written and the binder turns it into a value, so build one with
+  `ConstantExpression::FromValue(v)` or the `String`/`Integer`/`Null` factories, and read one with
+  `GetLiteral().ToValue()` - which returns by value, not by reference. Re-pin to the `v2.0.0` tag when it is cut; the scanners come from the submodule's own
   extension pins (`.github/config/extensions/`), patches included.
 - **Dependencies**: none (no vcpkg/OpenSSL).
 - **Platforms**: Linux (GCC), macOS (Clang), Windows (MSVC — a release target; CI builds the first two).

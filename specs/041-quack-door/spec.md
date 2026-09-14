@@ -159,10 +159,17 @@ thing that returns.)
 
 ## Enforcement & security
 
-- **A refusal at either callback is a refusal.** quack turns an error or a non-true answer from the
+- **A refusal at either callback is a refusal.** quack turns a non-true answer from the
   authentication function into "Authentication failed", and NULL from the authorization function into
-  "Authorization failed" — both fail-closed by quack's own construction (`EvaluateAuthQuery` returns
-  `Value(false)` on any error).
+  "Authorization failed".
+- **An exception under a callback is a refusal too, and ours to make.** Until quack f4328c5 the server
+  swallowed a failed callback's error (`EvaluateAuthQuery` returned `Value(false)` on any error); since
+  that commit it hands the text back to the client, and a policy source fails with a message that can
+  name a DSN or a catalog. So both callbacks now catch: `acl_quack_authenticate` answers `false`,
+  `acl_quack_authorize` answers NULL, and the reason goes to the audit as a `door` event
+  (`authenticate` / `authorize`, `policy_error`) — the same division SessionOpen already keeps for a
+  JWKS document it cannot read: the door refuses, it does not learn why.
+  Pinned by `test/sql/acl_quack_door_fail_closed.test`.
 - **Answering a question quack asks is not the same as enforcing the statement it runs.** The ingest
   probe is the one place where the two came apart, and it is the reason for the fence in the parser
   override: what enforces a statement is the rewrite, so a path that does not carry our rewritten SQL

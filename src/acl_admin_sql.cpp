@@ -373,10 +373,10 @@ void GrantPolicyClauses(AdminScanner &s, string &caps, string &rls, string &colu
 	}
 }
 
-unique_ptr<SQLStatement> MakeAdminCall(const string &function, vector<Value> args) {
+unique_ptr<SQLStatement> MakeAdminCall(const string &function, const vector<Value> &args) {
 	vector<unique_ptr<ParsedExpression>> children;
 	for (auto &arg : args) {
-		children.push_back(make_uniq<ConstantExpression>(std::move(arg)));
+		children.push_back(ConstantExpression::FromValue(arg));
 	}
 	auto node = make_uniq<SelectNode>();
 	node->select_list.push_back(make_uniq<FunctionExpression>(Identifier(function), std::move(children)));
@@ -388,10 +388,10 @@ unique_ptr<SQLStatement> MakeAdminCall(const string &function, vector<Value> arg
 
 //! `SELECT * FROM acl_<fn>(...)`: the compiled form of a management statement that answers rows
 //! (CHECK VIRTUAL CATALOG, spec 039); authorized by the same name-and-catalog rule as a scalar call
-unique_ptr<SQLStatement> MakeAdminTableCall(const string &function, vector<Value> args) {
+unique_ptr<SQLStatement> MakeAdminTableCall(const string &function, const vector<Value> &args) {
 	vector<unique_ptr<ParsedExpression>> children;
 	for (auto &arg : args) {
-		children.push_back(make_uniq<ConstantExpression>(std::move(arg)));
+		children.push_back(ConstantExpression::FromValue(arg));
 	}
 	auto node = make_uniq<SelectNode>();
 	node->select_list.push_back(make_uniq<StarExpression>());
@@ -644,7 +644,7 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 		if (!scalar) {
 			call_args.push_back(Value(pk)); // a scalar result has no key to declare
 		}
-		return MakeAdminCall(scalar ? "acl_add_scalar" : "acl_add_table_function", std::move(call_args));
+		return MakeAdminCall(scalar ? "acl_add_scalar" : "acl_add_table_function", call_args);
 	}
 	// CREATE VIRTUAL TABLE v.n AS <phys> [COLUMNS (…)] [RLS (…)] [COMMENT '…']
 	s.Expect("as");
@@ -1268,7 +1268,7 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 		// a call without the catalog argument (acl_check_catalog() over every catalog) stays
 		// unscoped, which the caller reads as "needs an unrestricted manage scope"
 		auto &argument = call.GetArguments()[NumericCast<idx_t>(entry->second)].GetExpression();
-		provenance.vcat = argument.Cast<ConstantExpression>().GetValue().ToString();
+		provenance.vcat = argument.Cast<ConstantExpression>().GetLiteral().ToValue().ToString();
 	}
 	return provenance;
 }

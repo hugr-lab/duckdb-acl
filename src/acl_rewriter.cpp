@@ -245,7 +245,7 @@ public:
 			if (!set.value || set.value->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 				Deny(Reason::SETTING_DENIED, "SET \"" + name + "\" takes a constant value under ACL");
 			}
-			auto &constant = set.value->Cast<ConstantExpression>().GetValue();
+			auto constant = set.value->Cast<ConstantExpression>().GetLiteral().ToValue();
 			value = constant.IsNull() ? string() : constant.ToString();
 		}
 		// the trace settings (spec 069) land on the session's record too: the door composes the prefix
@@ -284,7 +284,7 @@ public:
 	static string PragmaTargetName(const ParsedExpression &parameter) {
 		string written;
 		if (parameter.GetExpressionClass() == ExpressionClass::CONSTANT) {
-			auto &value = parameter.Cast<ConstantExpression>().GetValue();
+			auto value = parameter.Cast<ConstantExpression>().GetLiteral().ToValue();
 			if (!value.IsNull()) {
 				written = value.ToString();
 			}
@@ -518,10 +518,10 @@ private:
 
 	//! `SELECT acl_…(args)` as a statement of the batch. Built here, never written by a principal:
 	//! every acl_* name is denied in a principal's own query (spec 009).
-	unique_ptr<SQLStatement> AclCall(const string &function, vector<Value> arguments) {
+	unique_ptr<SQLStatement> AclCall(const string &function, const vector<Value> &arguments) {
 		vector<unique_ptr<ParsedExpression>> children;
 		for (auto &argument : arguments) {
-			children.push_back(make_uniq<ConstantExpression>(std::move(argument)));
+			children.push_back(ConstantExpression::FromValue(argument));
 		}
 		auto select = make_uniq<SelectNode>();
 		select->select_list.push_back(make_uniq<FunctionExpression>(Identifier(function), std::move(children)));
@@ -1167,7 +1167,7 @@ private:
 			// `ordered :=` after it, which pass through untouched
 			auto &arg = function.GetArguments()[0].GetExpression();
 			if (arg.GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
-				auto &value = arg.Cast<ConstantExpression>().GetValue();
+				auto value = arg.Cast<ConstantExpression>().GetLiteral().ToValue();
 				if (!value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR &&
 				    value.GetValue<string>() == principal.ingest_stream) {
 					// the principal's own stream: nothing to gate. The call is retargeted to the
@@ -1458,7 +1458,7 @@ private:
 				// rule forbids adding a parameter of our own to carry it
 				Deny(Reason::STATEMENT_TYPE, "acl_references needs a constant object name");
 			}
-			object = argument.Cast<ConstantExpression>().GetValue().ToString();
+			object = argument.Cast<ConstantExpression>().GetLiteral().ToValue().ToString();
 		}
 		string sql;
 		if (!store.MetadataListing(principal, "references", sql)) {
@@ -1485,7 +1485,7 @@ private:
 			if (argument.GetExpressionClass() != ExpressionClass::CONSTANT) {
 				Deny(Reason::STATEMENT_TYPE, "acl_keys needs a constant object name");
 			}
-			object = argument.Cast<ConstantExpression>().GetValue().ToString();
+			object = argument.Cast<ConstantExpression>().GetLiteral().ToValue().ToString();
 		}
 		string sql;
 		if (!store.MetadataListing(principal, "keys", sql)) {
@@ -1766,8 +1766,8 @@ private:
 	unique_ptr<ParsedExpression> GuardedValue(unique_ptr<ParsedExpression> value,
 	                                          unique_ptr<ParsedExpression> predicate, const string &vname) {
 		vector<unique_ptr<ParsedExpression>> message;
-		message.push_back(make_uniq<ConstantExpression>(
-		    Value("acl_rewrite: the row does not satisfy the grant on \"" + vname + "\", so it cannot be written")));
+		message.push_back(ConstantExpression::String("acl_rewrite: the row does not satisfy the grant on \"" + vname +
+		                                             "\", so it cannot be written"));
 		auto raise = make_uniq<FunctionExpression>(Identifier("error"), std::move(message));
 		auto guard = make_uniq<CaseExpression>();
 		CaseCheck check;
@@ -1877,7 +1877,7 @@ private:
 		if (arg.GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 			return false;
 		}
-		auto &value = arg.Cast<ConstantExpression>().GetValue();
+		auto value = arg.Cast<ConstantExpression>().GetLiteral().ToValue();
 		return !value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR &&
 		       value.GetValue<string>() == principal.ingest_stream;
 	}
@@ -2192,10 +2192,10 @@ private:
 				auto alias = function.GetAlias(); // the select item keeps its name (see the macro above)
 				if (StringUtil::CIEquals(name, "current_schema")) {
 					// where an unqualified name lands inside the catalog - `main`, by construction
-					expr = make_uniq<ConstantExpression>(Value("main"));
+					expr = ConstantExpression::String("main");
 				} else if (StringUtil::CIEquals(name, "current_schemas")) {
 					vector<unique_ptr<ParsedExpression>> parts;
-					parts.push_back(make_uniq<ConstantExpression>(Value("main")));
+					parts.push_back(ConstantExpression::String("main"));
 					expr = make_uniq<FunctionExpression>(Identifier("list_value"), std::move(parts));
 				} else {
 					expr = BuildCurrentDatabaseExpr();
@@ -2324,7 +2324,7 @@ private:
 				// the marker may be the whole select item (`acl_claim('tenant') AS tenant`), so its
 				// alias has to survive the replacement - otherwise the column loses its name
 				auto alias = expr->GetAlias();
-				expr = marker == "acl_claim" ? make_uniq<ConstantExpression>(ClaimValue(function))
+				expr = marker == "acl_claim" ? ConstantExpression::FromValue(ClaimValue(function))
 				                             : ArgExpression(function, args);
 				if (!alias.GetIdentifierName().empty()) {
 					expr->SetAlias(alias);
@@ -2346,7 +2346,8 @@ private:
 		if (call_args.size() != 1 || call_args[0].GetExpression().GetExpressionClass() != ExpressionClass::CONSTANT) {
 			Deny(Reason::POLICY_ERROR, "acl_arg() expects a single constant position");
 		}
-		int64_t position = call_args[0].GetExpression().Cast<ConstantExpression>().GetValue().GetValue<int64_t>();
+		int64_t position =
+		    call_args[0].GetExpression().Cast<ConstantExpression>().GetLiteral().ToValue().GetValue<int64_t>();
 		if (position < 1 || static_cast<idx_t>(position) > args->size() || !(*args)[position - 1]) {
 			Deny(Reason::POLICY_ERROR, "acl_arg(" + std::to_string(position) + ") has no matching call argument");
 		}
@@ -2358,7 +2359,7 @@ private:
 		if (args.size() != 1 || args[0].GetExpression().GetExpressionClass() != ExpressionClass::CONSTANT) {
 			Deny(Reason::POLICY_ERROR, "acl_claim() expects a single constant claim name");
 		}
-		auto claim_name = args[0].GetExpression().Cast<ConstantExpression>().GetValue().ToString();
+		auto claim_name = args[0].GetExpression().Cast<ConstantExpression>().GetLiteral().ToValue().ToString();
 		auto entry = principal.claims.find(claim_name);
 		if (entry == principal.claims.end()) {
 			return Value(LogicalType::VARCHAR); // absent claim -> NULL (fail closed)
@@ -2426,7 +2427,8 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 			if (marker == "acl_arg") {
 				auto &args = function.GetArguments();
 				if (args.size() == 1 && args[0].GetExpression().GetExpressionClass() == ExpressionClass::CONSTANT) {
-					auto position = args[0].GetExpression().Cast<ConstantExpression>().GetValue().GetValue<int64_t>();
+					auto position =
+					    args[0].GetExpression().Cast<ConstantExpression>().GetLiteral().ToValue().GetValue<int64_t>();
 					if (position >= 1 && static_cast<idx_t>(position) <= param_types.size()) {
 						type = param_types[NumericCast<idx_t>(position - 1)];
 					}
@@ -2447,7 +2449,7 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 			// by the distribution build tracking duckdb main, two days ahead of our pin.
 			auto alias = expr->GetAlias();
 			if (type.empty()) {
-				expr = make_uniq<ConstantExpression>(Value());
+				expr = ConstantExpression::Null();
 			} else {
 				// parse the cast rather than resolving the type name by hand (no context needed here)
 				auto casted = Parser::ParseExpressionList("CAST(NULL AS " + type + ")", options);
