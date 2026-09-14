@@ -136,6 +136,19 @@ WASM; only the *door* cannot be there. So the Arrow dependency carries `"platfor
 produces a working extension. `packaging/community-extensions/description.yml` therefore excludes
 nothing: all thirteen platforms get the ACL, and the ten that are not WASM get the door with it.
 
+> **Superseded 2026-09-14 - we DO take the opt-out, for WASM and for osx_amd64.** The paragraph above
+> is right that the extension *builds* in WASM and wrong about what that is worth. This model enforces
+> anything only where the query's author cannot cross the boundary: a gateway process they do not
+> control, or a door they reach over a socket. A browser tab is neither - the page composes the prefix
+> itself, and can as easily skip loading acl or set `allow_parser_override_extension` to DEFAULT. Since
+> spec 063 the second door is the embedded quack *server*, which has nothing to listen on there either,
+> so the claim two paragraphs up that "a WASM artifact carries the ACL and the whole quack door" is now
+> only half true: the four functions are registered, and `acl_quack_serve` cannot serve. What would
+> ship is a rewriter with no boundary behind it, and shipping it invites the one use that cannot be
+> secure. `exclude_archs` / `excluded_platforms` now name the three WASM targets and `osx_amd64` (a
+> server is not run on an Intel Mac, the reason acl_otel gave first). The catalog-as-a-convenience-layer
+> idea for the browser is real but unrequested: `design/BACKLOG.md` keeps it.
+
 **Contained, and the way round is worth writing down.** The merged-manifest step keeps only
 `dependencies` from each extension's `vcpkg.json` and drops manifest *features*, so declaring Arrow as
 a plain dependency would make every integration build install 89 ports for a door it is not opening.

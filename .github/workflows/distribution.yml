@@ -10,8 +10,8 @@
 #     pin. That is what community-extensions does, and it is why our code has to compile against a
 #     duckdb we do not choose. Tracking the 2.0 release branch here (`v2.0-cyanoptera`; `v2.0.0` once
 #     the tag is cut) is the early warning for that - duckdb `main` is 2.1-dev now and diverges.
-#   - it covers the platforms they cover, with their triplets - including MinGW and musl, which our own
-#     matrix never had.
+#   - it covers the platforms they cover, with their triplets - including MinGW, which our own matrix
+#     never had.
 #
 # The Flight SQL door needs Arrow, so the vcpkg binary cache is what keeps this in minutes rather than
 # hours: see docs/vcpkg-cache-r2.md. Without the secrets (a fork, for instance) it falls back to
@@ -19,9 +19,9 @@
 name: Distribution build
 
 # Run it on every merge to main, on a release tag, and when we ask. Not on a schedule: this matrix
-# builds Arrow and gRPC on nine platforms, and a nightly one would spend that on days when nothing
+# builds Arrow and gRPC on five platforms, and a nightly one would spend that on days when nothing
 # changed - a merge is exactly the day something did. Merge-time runs are what give Windows (MSVC and
-# MinGW), musl and wasm their coverage at all: the PR jobs stay on Linux and macOS to keep PRs fast,
+# MinGW) its coverage at all: the PR jobs stay on Linux and macOS to keep PRs fast,
 # and the early warning about duckdb `main` drift arrives with the change that has to live with it.
 on:
   workflow_dispatch:
@@ -45,8 +45,19 @@ jobs:
       extension_name: acl
       duckdb_version: v2.0-cyanoptera
       ci_tools_version: main
-      # No exclusions: WASM gets the extension without the door, because the Arrow dependency carries
-      # `"platform": "!wasm32"` and CMakeLists guards on WASM_ENABLED (specs/045).
+      # WASM is out (owner's decision 2026-09-14, superseding specs/045): the extension builds there,
+      # but what it would enforce is nothing. The model needs a boundary the query's author cannot
+      # cross - a gateway process, or a door - and a browser tab has none: the page composes the
+      # prefix itself, and can equally not load acl or set `allow_parser_override_extension` to
+      # DEFAULT. Both doors are absent there anyway (Arrow carries `"platform": "!wasm32"`, and the
+      # embedded quack server has nothing to listen on), so the artifact would be a rewriter with no
+      # boundary behind it - an invitation to a use that cannot be secure. The virtual catalog as a
+      # convenience layer in a browser is a real but unrequested idea; design/BACKLOG.md holds it.
+      #
+      # osx_amd64 is out for the reason acl_otel gave first: nobody runs a server on an Intel Mac,
+      # and this extension exists to be served from. It costs an Intel-Mac user `INSTALL acl FROM
+      # community` - they build from source - and it keeps the two repositories' matrices identical.
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;osx_amd64'
       #
       # macOS ships bison 2.3, which cannot parse thrift's grammar - and thrift comes with Arrow.
       # This asks for a modern bison and flex; the same string goes into description.yml as
@@ -59,7 +70,7 @@ jobs:
       VCPKG_CACHING_AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
       VCPKG_CACHING_AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
 
-  # Release mechanics (release plan 5.3): on a v* tag, the nine artifacts the distribution built become
+  # Release mechanics (release plan 5.3): on a v* tag, the five artifacts the distribution built become
   # a GitHub release - one file per platform, a SHA256SUMS.txt beside them, and a build-provenance
   # attestation for each, so a downloaded .duckdb_extension can be traced to the workflow run that
   # produced it. An extension that IS the authorization boundary is the one artifact a tampered copy
