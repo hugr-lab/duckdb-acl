@@ -171,6 +171,21 @@ case "$got" in
 *meta_gone* | *"Catalog Error"* | *"acl catalog"*) fail "discovery leaked the source's own error: $got";;
 esac
 
+# and the operator's side of it: the discovery refusal is counted apart from a handshake, because a
+# client asks for the document far more often than it logs in (spec 069)
+cat >&3 <<SQL
+SELECT 'COUNTER ' || name || ' ' || attributes || ' ' || value AS line FROM acl_metrics()
+WHERE name IN ('acl.door.discoveries', 'acl.door.handshakes') ORDER BY name;
+SQL
+counted=""
+for _ in $(seq 1 20); do
+	grep -q "COUNTER acl.door.discoveries" "$TMP/server.log" && { counted=1; break; }
+	sleep 0.5
+done
+[ -n "$counted" ] || { tail -20 "$TMP/server.log" >&2; fail "the discovery refusal was not counted"; }
+grep -q 'COUNTER acl.door.discoveries.*"result":"denied".*1' "$TMP/server.log" \
+	|| { grep COUNTER "$TMP/server.log" >&2; fail "acl.door.discoveries does not carry the denied probe"; }
+
 echo "SELECT acl_flight_stop('$URI'); SELECT acl_flight_stop('$PLAIN_URI');" >&3
 
 echo "PASS: discovery answered unauthenticated from the live policy, the password handshake earned the tenant's slice, the IdP's refusals were surfaced, the cleartext door refused, the bearer path held, and a broken policy source refused both paths without a word about itself"
