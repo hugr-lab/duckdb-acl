@@ -39,6 +39,8 @@ so each was probed against a live principal rather than reasoned about from its 
 | runtime error (arithmetic, …) | duckdb | no object name cited | safe |
 | Flight `GetSqlInfo` / `GetXdbcTypeInfo` | the door's SqlInfo registry | server capabilities, no data | out of scope: server metadata, not a principal's catalog (noted, not a leak) |
 | Flight catalog RPCs (`GetTables`, …) | composed SQL under the prefix | the principal's own catalog | safe (spec 046) |
+| `json_execute_serialized_sql(<serialized>)` | json extension, executes the statement | rows of any physical table - the statement is never parsed, so never rewritten | **bypass → fixed (addendum 2026-09-15)** |
+| `json_serialize_plan('<sql>')` | json extension, binds against the physical catalog | table, column and type names no grant shows | **leaked → fixed (addendum 2026-09-15)** |
 
 So the audit's yield is one finding fixed here (EXPLAIN) and one low residual accepted (below); the
 rest is a record that the gate and the surface replacements already cover what they must - kept as a
@@ -66,6 +68,39 @@ rather than a surprise; a scrub could ride the write path later if a deployment 
   query, so it is at least as sensitive and wants at least the same gate.
 - The gate is at the outermost EXPLAIN, so it also covers `EXPLAIN` of a PRAGMA that spec 031 answers
   as a SELECT (whose plan would name the policy catalog's own tables) - one rule, no special cases.
+
+### Addendum 2026-09-15 - two functions that take SQL past the parser override
+
+The inventory above is a checklist of *surfaces*, and it missed a class: functions whose argument is
+itself a statement. Found in a live check of the whole stack (both doors, acl_otel beside, the local
+Grafana bench) by probing every table function a real node has - 148 with the extensions the build
+links - under a principal holding one grant on an empty catalog.
+
+- **`json_execute_serialized_sql`** executes a statement from its serialized JSON form. The parser
+  override never sees it, so nothing rewrites it: under the principal it returned every row of a
+  physical table no grant names. The whole model, gone in one call - and the serialized form is
+  plain JSON anyone writes by hand, so `json_serialize_sql` being reachable is not the hole and
+  denying it would guard nothing.
+- **`json_serialize_plan`** binds its SQL against the physical catalog to build a plan, and the
+  plan names tables, columns and types the principal was never shown. EXPLAIN by another name, and
+  EXPLAIN is the explicit capability this spec made it.
+
+Both are **hard-denied in `FunctionAllowed` ahead of the catalog gate**, beside `arrow_scan` and for
+its reason: an `acl_allow_function` row must not be able to re-open them. The PRAGMA form of the
+executor was already refused as a PRAGMA. `test/sql/acl_serialized_sql_gate.test` pins all of it,
+including the allow-row attempt and the control that plain serialization still works; built without
+the fix, its first assertion fails with the payroll rows in hand.
+
+What the same probe says about the rest of the 63 table functions that pass the gate: 29 fail in the
+binder on the empty argument list the probe used (`range`, `unnest`, `repeat`, `parquet_*`,
+`read_duckdb`, the json readers - the file readers among them are the denylist's 2026-09-14 backlog
+item, unchanged), 34 ran - the listings the rewriter substitutes (`duckdb_tables/columns/schemas/
+databases`, spec 035), read-only node facts (`duckdb_keywords`, `pragma_platform`,
+`icu_calendar_names`, `pg_timezone_names`), and three that act on the node rather than read it:
+`enable_logging` / `disable_logging` / `truncate_duckdb_logs`, `enable_profiling` /
+`disable_profiling`, and `checkpoint` / `force_checkpoint`. None of those reads data; each is a
+principal reaching the operator's knobs, and they belong to the allowlist redesign in the backlog
+rather than to this addendum - this one closes the two that read.
 
 ## Enforcement & security
 
