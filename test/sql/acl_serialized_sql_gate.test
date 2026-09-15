@@ -1,0 +1,72 @@
+# name: test/sql/acl_serialized_sql_gate.test
+# description: the functions that take SQL past the parser override are never a principal's (spec 052 addendum)
+# group: [sql]
+
+require acl
+
+require json
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+CREATE TABLE memory.main.payroll AS SELECT * FROM (VALUES ('alice', 50000), ('carol', 120000)) t(name, salary);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select) MAIN;
+
+# a serialized statement is executed without ever being parsed, so it is never rewritten either: this
+# returned the physical payroll to a role with an empty catalog before it was denied
+statement error
+ACL ROLE "r" SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT name, salary FROM memory.main.payroll'));
+----
+<REGEX>:.*json_execute_serialized_sql.*not allowed.*
+
+# a plan is bound against the physical catalog - names, columns, types - which is EXPLAIN by another
+# name, and EXPLAIN is an explicit capability
+statement error
+ACL ROLE "r" SELECT json_serialize_plan('SELECT name, salary FROM memory.main.payroll');
+----
+<REGEX>:.*json_serialize_plan.*not allowed.*
+
+# the pragma form of the executor is refused as a PRAGMA, before any name is looked at
+statement error
+ACL ROLE "r" PRAGMA json_execute_serialized_sql('{}');
+----
+<REGEX>:.*PRAGMA.*not permitted.*
+
+# ahead of the catalog gate: an operator's allow row cannot re-open either one
+statement ok
+SELECT acl_allow_function('json_execute_serialized_sql');
+
+statement ok
+SELECT acl_allow_function('json_serialize_plan');
+
+statement error
+ACL ROLE "r" SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'));
+----
+<REGEX>:.*json_execute_serialized_sql.*not allowed.*
+
+statement error
+ACL ROLE "r" SELECT json_serialize_plan('SELECT 1');
+----
+<REGEX>:.*json_serialize_plan.*not allowed.*
+
+# the control: serializing alone only parses, and stays a principal's - denying it would guard nothing,
+# since a serialized statement is plain JSON anyone can write by hand
+query I
+ACL ROLE "r" SELECT length(json_serialize_sql('SELECT 1')) > 0;
+----
+true

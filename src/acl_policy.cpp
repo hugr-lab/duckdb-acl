@@ -1321,6 +1321,18 @@ bool PolicyStore::FunctionAllowed(const Principal &principal, const QualifiedNam
 	if (lowered == "arrow_scan" || lowered == "arrow_scan_dumb") {
 		return false;
 	}
+	// spec 052 addendum (2026-09-15): the two functions that take SQL past the parser override. The
+	// json extension's json_execute_serialized_sql runs a statement from its serialized form, so it
+	// is never parsed and never rewritten - under a principal it returned rows of a physical table no
+	// grant names, which is the whole model gone in one call. json_serialize_plan binds its SQL against
+	// the PHYSICAL catalog to build a plan, so it names tables, columns and types a principal was never
+	// shown: EXPLAIN by another name, and EXPLAIN is an explicit capability (spec 052). Hard-denied
+	// here, ahead of the catalog gate, for the reason arrow_scan is: an acl_allow_function row must not
+	// be able to re-open either. json_serialize_sql stays allowed - it only parses, and a serialized
+	// payload is plain JSON anyone can write by hand, so denying it would guard nothing.
+	if (lowered == "json_execute_serialized_sql" || lowered == "json_serialize_plan") {
+		return false;
+	}
 	if (catalog) {
 		bool allowed;
 		if (CatalogFunctionGate(principal, name, allowed)) {
