@@ -365,6 +365,15 @@ client that dies rolls the load back (`ingest` event `denied/unavailable`, `door
 `ingest_cancelled`). The e2e is `test/e2e/flight/stream.sh` (pyarrow client; server answers read
 through its own stdin) — the 200M-row view, the ms to the first batch, and each outcome.
 
+## Security testing is part of development here
+
+duckdb-acl is an access-control product, and we are its authors. Verifying enforcement means running
+queries as a restricted principal and checking that the gate refuses what it must: functions,
+macros, catalog listings, paths. A gap found this way is a bug in our own code - it gets a fix, a
+regression test that fails without the fix, and a line in the relevant spec. Probe results live in
+tests and specs, never as standalone "how to extract data" notes. Name things for what they check:
+a "gate coverage probe" or a "negative test", not an exploit.
+
 ## Working process — per-feature specs
 
 We do **not** run full spec-kit. Instead, each feature gets one lightweight spec under `specs/` (see
