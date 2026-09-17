@@ -21,6 +21,15 @@ as it stands (`portfile.cmake`, `vcpkg.json` and the two registry patches are by
 Retire it when upstream thrift (or the vcpkg port) makes the same check, or when the duckdb images
 carry a newer bison.
 
+## mimalloc
+
+mimalloc 3.3.2 (the same baseline; 2.2.4 before it) names `ERROR_COMMITMENT_MINIMUM` in its Windows
+out-of-memory check, a WinError.h constant the mingw-w64 headers of the MinGW image (rtools42) do not
+have - so the `windows_amd64_mingw` job failed at `prim.c` (arrow depends on mimalloc on every
+platform). `mingw-error-commitment-minimum.patch` defines it (635L, WinError.h's value) when the
+headers do not; everything else is the registry's port. Upstream still has the bare use (v3.5.3);
+retire the port when a mimalloc guards it, or when the image's mingw-w64 knows the constant.
+
 ## Overlay triplets (`vcpkg_triplets/`)
 
 `x64-mingw-static`: the registry's community triplet plus `-Wa,-mbig-obj` - grpc 1.76 (the same
