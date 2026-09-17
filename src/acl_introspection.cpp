@@ -293,7 +293,8 @@ void AclFunctionsScan(ClientContext &, TableFunctionInput &data, DataChunk &outp
 
 void RegisterAclIntrospection(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {
 	{
-		// spec 072: acl_function_status() / acl_function_status(role) - acl_functions() is the virtual functions listing
+		// spec 072: acl_function_status() / acl_function_status(role) - acl_functions() is the virtual functions
+		// listing
 		TableFunctionSet set((Identifier("acl_function_status")));
 		for (auto &arguments : vector<vector<LogicalType>> {{}, {LogicalType::VARCHAR}}) {
 			TableFunction function(Identifier("acl_function_status"), arguments, AclFunctionsScan, AclFunctionsBind,
