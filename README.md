@@ -66,9 +66,15 @@ Per object the resolver picks one of two replacement forms:
 
 Virtual **table functions** and **scalar functions** resolve the same way: a RENAME-alias of a
 physical/system function, or a template macro whose call arguments are substituted via `acl_arg(n)` and
-whose claims are baked via `acl_claim('<name>')`. Everything else routes through a resolver seam that
-denies only data-reading / rights-bypass functions (`read_csv`, `postgres_query`, `getvariable`, …) and
-passes the rest.
+whose claims are baked via `acl_claim('<name>')`. Everything else goes through the **function gate**
+(spec 072): a function's key is `(database, schema, name, kind)`, a **category** is a named set of
+keys in the policy catalog, and a call is admitted when its key is in a category granted to one of the
+principal's roles or is granted by name - a deny anywhere wins, a key in no category is refused. The
+shipped categories put ordinary SQL (`base`, `json`, `spatial`, …) in every role's hands from the start
+and keep the readers (`read_csv`, `read_parquet`, …), the listings, the environment and the node's
+knobs for an explicit grant; a freshly loaded extension's functions are in no category until the
+operator puts them somewhere (`acl_function_status()` shows them). A never set - `acl_*`, `query`,
+`json_execute_serialized_sql`, a scanner's `*_query`, … - is code and no grant re-opens it.
 
 ## Administration
 

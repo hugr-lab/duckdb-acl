@@ -243,7 +243,8 @@ query)` per statement, whose VARCHAR return **replaces the executed SQL** - the 
 NULL, which quack turns into its refusal. Both are the defaults of `acl_quack_authentication_function`
 / `acl_quack_authorization_function`, so a plain serve needs no `SET`. quack's own functions
 (`quack_serve`, `quack_query`, `quack_active_connections`, `scan_data_from_quack_client`,
-`acl_quack_scan_data`, ...) are on the principal denylist. Streamed bulk ingest (`SEND_DATA`) is
+`acl_quack_scan_data`, ...) are in the function gate's never set (spec 072): refused under a principal
+whatever the policy says. Streamed bulk ingest (`SEND_DATA`) is
 generated unprefixed by the server; the parser override recovers the principal from the stream id
 (spec 042) and enforces the write as that principal's, and refuses where recovery fails.
 

@@ -84,7 +84,9 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 | `role_schemas` | schema grants: caps, whether inherited, `into` (the physical home for `create`), `virtual_only` |
 | `role_object_caps` | object grants: caps, RLS, column list |
 | `grant_columns` | the columns a grant's projection produces (a mask that changes a type, a computed column) - spec 026 |
-| `function_gate` | per-role or global (`role = ''`) allow/deny rows over function names; the built-in denylist applies otherwise |
+| `function_categories` | the function categories (spec 072): name, comment, `builtin` (seeded at creation - never touched by the extension again) |
+| `function_category_members` | a category's keys: `database, schema, name, kind` (`scalar` / `table`) |
+| `function_grants` | per-role or every role's (`role = ''`) grants and denies on a category (key columns `''`) or on a function by name (category `''`); a deny anywhere wins |
 | `admins` | global administration scopes: `manage` or `passthrough`, optionally per catalog |
 | `issuers` | JWT issuers: keys or `jwks_uri`, audiences, algs, role claim, claim map, `client_id`, `client_secret` |
 | `role_mappings` | external value → role, per issuer and source (`group` / `claim-value`) |
@@ -160,7 +162,9 @@ SELECT acl_use_functions('{
   "schema_aliases":   "my_schema_aliases",
   "functions":        "my_functions",
   "object_caps":      "my_object_caps",      -- optional
-  "function_gate":    "my_function_gate",    -- optional
+  "function_categories":       "my_function_categories",  -- optional, the three together (spec 072)
+  "function_category_members": "my_function_members",
+  "function_grants":           "my_function_grants",
   "role_claims":      "my_role_claims",      -- optional
   "issuer":           "my_issuer",           -- optional
   "role_mappings":    "my_role_mappings",    -- optional
@@ -183,7 +187,9 @@ arguments arrive as `VARCHAR[]` literals):
 | `schema_aliases` | `(catalogs)` | `(vcat, alias_path, phys_path)` |
 | `functions` | `(catalogs, names)` | `(vcat, vname, kind, form, target, template)` |
 | `object_caps` | `(roles, catalogs, names)` | `(role, vcat, vname, caps)`; absent = catalog-default caps only |
-| `function_gate` | `(roles, names)` | `(role, name, kind, allowed)`, `''` role = global; absent = built-in denylist |
+| `function_categories` | `()` | `(category, comment, builtin)` - spec 072: the three category slots are declared together or not at all; absent = the shipped categories decide |
+| `function_category_members` | `()` | `(category, database, schema, name, kind)` |
+| `function_grants` | `()` | `(role, category, database, schema, name, kind, allowed)`, `''` role = every role |
 | `role_claims` | `(roles)` | `(role, claim, value)`; absent = no role-default claims |
 | `issuer` | `(iss)` | `(issuer, keys_json, audiences, algs, role_claim, claim_map[, jwks_uri[, client_id, client_secret]])`; absent = no JWT issuers |
 | `role_mappings` | `(issuer, external_values)` | `(external_value, role)`; absent = no external mapping - an unmapped value counts as a role iff `role_catalogs([value])` grants it something |
@@ -206,7 +212,11 @@ a principal's query - *"table function "acl_issuers" is not allowed"*): `acl_cat
 `acl_functions()`, `acl_references()`, `acl_reference_columns()`, `acl_roles()`, `acl_role_claims()`,
 `acl_grants()` (from `role_catalogs`), `acl_schema_grants()` (from `role_schemas`),
 `acl_object_grants()` (from `role_object_caps`), `acl_grant_columns()`, `acl_admins()`,
-`acl_issuers()`, `acl_role_mappings()`, `acl_function_gate()`, and `acl_status()`.
+`acl_issuers()`, `acl_role_mappings()`, `acl_function_categories()`, `acl_function_category_members()`,
+`acl_function_grants()`, and `acl_status()` - plus `acl_function_status([role])`, which joins the
+node's own `duckdb_functions()` with the categories (spec 072): every function with its categories
+and status (`never` / `categorized` / `uncategorized`), and with a role, whether it may call it and
+what decided. The three category listings answer in every mode, the seed included.
 
 The column names and types come from the storage at bind, so a listing cannot drift from the tables;
 the rows are read per execution, so a prepared statement shows the policy as it is now. Two
