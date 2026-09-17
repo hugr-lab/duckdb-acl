@@ -5,8 +5,8 @@
  
  # Create flex and bison files and build the lib parse static library
 -BISON_TARGET(thrifty ${CMAKE_CURRENT_SOURCE_DIR}/src/thrift/thrifty.yy ${CMAKE_CURRENT_BINARY_DIR}/thrift/thrifty.cc COMPILE_FLAGS "--file-prefix-map=${CMAKE_BINARY_DIR}='' --file-prefix-map=${CMAKE_SOURCE_DIR}=''")
-+# --file-prefix-map is a bison 3.8 option; an older bison rejects the whole command line
-+if(BISON_VERSION VERSION_GREATER_EQUAL "3.8")
++# --file-prefix-map is a bison 3.7 option (2020); an older bison rejects the whole command line
++if(BISON_VERSION VERSION_GREATER_EQUAL "3.7")
 +    set(thrifty_BISON_FLAGS "--file-prefix-map=${CMAKE_BINARY_DIR}='' --file-prefix-map=${CMAKE_SOURCE_DIR}=''")
 +else()
 +    set(thrifty_BISON_FLAGS "")
