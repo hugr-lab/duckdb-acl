@@ -1662,18 +1662,20 @@ void PolicyStore::CatalogDefineRole(const string &role, const case_insensitive_m
 	catalog->Write(statements);
 }
 
-// spec 072: the function categories' writers. A key's name is stored lowercased - function names
-// compare case-insensitively - and its database and schema as written.
+// spec 072: the function categories' writers. A key is stored lowercased throughout - function,
+// schema and catalog names compare case-insensitively in duckdb, and the table's primary key does not,
+// so `SYSTEM.main.x` and `system.main.x` must be one row.
 namespace {
 
 string KeyWhere(const FunctionKey &key) {
-	return " \"database\" = " + Lit(key.database) + " AND \"schema\" = " + Lit(key.schema) +
+	return " \"database\" = " + Lit(StringUtil::Lower(key.database)) +
+	       " AND \"schema\" = " + Lit(StringUtil::Lower(key.schema)) +
 	       " AND \"name\" = " + Lit(StringUtil::Lower(key.name)) + " AND \"kind\" = " + Lit(FunctionKindName(key.kind));
 }
 
 string KeyValues(const FunctionKey &key) {
-	return Lit(key.database) + ", " + Lit(key.schema) + ", " + Lit(StringUtil::Lower(key.name)) + ", " +
-	       Lit(FunctionKindName(key.kind));
+	return Lit(StringUtil::Lower(key.database)) + ", " + Lit(StringUtil::Lower(key.schema)) + ", " +
+	       Lit(StringUtil::Lower(key.name)) + ", " + Lit(FunctionKindName(key.kind));
 }
 
 } // namespace

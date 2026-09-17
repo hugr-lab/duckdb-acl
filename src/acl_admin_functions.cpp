@@ -684,6 +684,9 @@ void AclGrantScalarAliasFunc(DataChunk &args, ExpressionState &state, Vector &re
 FunctionKey ParseFunctionSpec(const string &spec_p, const char *fn) {
 	auto spec = spec_p;
 	StringUtil::Trim(spec);
+	if (spec.empty()) {
+		throw BinderException("%s: a function name is required", fn);
+	}
 	FunctionKey key;
 	key.kind = FunctionKind::SCALAR;
 	auto space = spec.find_last_of(" \t");
