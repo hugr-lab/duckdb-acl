@@ -40,11 +40,16 @@ concurrency:
 jobs:
   build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    # Pinned, not `main`: extension-ci-tools' 2026-09-16 vcpkg bump (#407) brought a thrift port that
+    # passes bison `--file-prefix-map`, which the bison in the duckdb/linux_arm64 image (el8, 3.0.4)
+    # does not know - every distribution build on main went red from 13eb8ab on, with nothing of ours
+    # changed. This is the last commit before the bump; move it forward once upstream builds thrift
+    # on arm64 again (the same pin belongs in acl-otel, which tracks main the same way).
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@1a59d9e8a2c0119ef6e8b8173c55f21dafdbe467
     with:
       extension_name: acl
       duckdb_version: v2.0-cyanoptera
-      ci_tools_version: main
+      ci_tools_version: 1a59d9e8a2c0119ef6e8b8173c55f21dafdbe467
       # WASM is out (owner's decision 2026-09-14, superseding specs/045): the extension builds there,
       # but what it would enforce is nothing. The model needs a boundary the query's author cannot
       # cross - a gateway process, or a door - and a browser tab has none: the page composes the
