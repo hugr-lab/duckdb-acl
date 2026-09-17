@@ -6,7 +6,7 @@ one change named here; drop a port once the registry carries the fix.
 
 ## thrift
 
-thrift 0.24.0 (vcpkg baseline 2026.06.24, the one extension-ci-tools `main` moved to on 2026-09-16)
+thrift 0.23.0 (vcpkg baseline 2026.06.24, the one extension-ci-tools `main` moved to on 2026-09-16)
 passes bison `--file-prefix-map` unconditionally in `compiler/cpp/CMakeLists.txt` - an option bison
 gained in 3.8. The `duckdb/linux_amd64` / `linux_arm64` images build with the distribution's bison
 3.0.4 (el8), which rejects the whole command line, so every distribution build that pulls thrift
