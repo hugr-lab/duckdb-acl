@@ -1,7 +1,7 @@
 --- a/src/prim/windows/prim.c
 +++ b/src/prim/windows/prim.c
 @@ -272,6 +272,11 @@
-   return 0;
+   return VirtualAlloc(addr, size, flags, PAGE_READWRITE);
  }
  
 +// mingw-w64 headers older than the Windows 10 SDK know no ERROR_COMMITMENT_MINIMUM (WinError.h: 635L)
