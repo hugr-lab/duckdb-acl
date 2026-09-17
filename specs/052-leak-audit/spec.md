@@ -102,6 +102,43 @@ databases`, spec 035), read-only node facts (`duckdb_keywords`, `pragma_platform
 principal reaching the operator's knobs, and they belong to the allowlist redesign in the backlog
 rather than to this addendum - this one closes the two that read.
 
+### Addendum 2026-09-17 - three expressions the walker did not visit
+
+Found while probing the function surface for design 072, then by a probe over every position an
+expression can sit in (`test/sql/acl_expression_positions.test` keeps that probe): the walker gates
+what it visits, and three things sat where it did not look.
+
+- **VALUES rows** - the serious one. `RewriteTableRef` treated an expression list as having nothing
+  to rewrite, so `SELECT * FROM (VALUES (getvariable('x')))`, `INSERT INTO mine VALUES
+  ((SELECT ssn FROM phys.main.secrets LIMIT 1))` and a multi-row list each passed a denied reader or
+  a subquery over an ungranted physical table straight to the binder: the function gate and the
+  "unknown object is refused" rule both stood only in the positions the walker reached. VALUES rows
+  are now walked like a select list. The probe pinned the other forty positions - WHERE, ORDER/GROUP
+  BY, HAVING, QUALIFY, window, LIMIT/OFFSET, DML SET/WHERE/RETURNING, ON CONFLICT, MERGE, `* REPLACE`,
+  lambdas, CASE, IN, aggregate ORDER BY/FILTER, table-function arguments, CTEs, DISTINCT ON,
+  UNION, join conditions, CTAS into a session temp - all refusing; PIVOT/UNPIVOT are refused as forms.
+- **The keyword spelling of the session identity.** `SELECT current_catalog` - no parentheses - is a
+  single-part column reference to the parser; the binder turns it into the call only when no column
+  of that name binds (`Binder::GetSQLValueFunction`), after the rewrite, so the call it made was the
+  physical one: under the principal it answered `memory`, the server's default database, where
+  `current_catalog()` answered `sales`. Same for `current_schema`. The rewriter substitutes the
+  keyword where it substitutes the call. A bare single-part name is the identity, as SQL reads it; a
+  column that carries the name is reached qualified (`t.current_catalog`) and left to the binder,
+  and the bare spelling never binds to a column under a principal - so a relation cannot shadow the
+  keyword to reach the physical default either. The other SQL value keywords (`current_user`,
+  `session_user`, `current_role`, `user`, the date/time ones) expand to duckdb's own constants or
+  clocks, not to a physical name, and are left alone; when function categories (design 072) land,
+  the keyword forms are converted to calls ahead of the gate so a keyword cannot bypass what its
+  call is denied.
+- **The header of the substituted call.** The substitution carried the caller's alias and nothing
+  else, so `SELECT current_database()` under a principal named its column after the expression that
+  replaced it - the whole listing query, policy tables and all, rendered into a column header. The
+  select item now keeps the name duckdb gives the expression as written (`current_database()`,
+  `current_schemas(true)`, `current_catalog`), so a client sees the same header prefixed or not.
+
+`test/sql/acl_metadata_leak.test` pins the keyword forms and the headers; the positions probe pins
+VALUES beside everything else.
+
 ## Enforcement & security
 
 - Fail-closed: no `explain` capability → EXPLAIN refused, physical names and all. The capability is

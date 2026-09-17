@@ -1,0 +1,287 @@
+# name: test/sql/acl_expression_positions.test
+# description: gate coverage over every position an expression can sit in (spec 052 addendum
+#   2026-09-17). The canary is getvariable('secret_var') - a denied reader - and a scalar subquery
+#   over a physical table no grant names; each position must refuse both. VALUES rows were the
+#   position the walker stepped over: in FROM, in INSERT, and multi-row.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.notes(n INT PRIMARY KEY, v VARCHAR);
+
+statement ok
+INSERT INTO phys.main.notes VALUES (1, 'one'), (2, 'two');
+
+statement ok
+CREATE TABLE phys.main.hidden(x INT);
+
+statement ok
+INSERT INTO phys.main.hidden VALUES (7), (8), (9);
+
+statement ok
+SET VARIABLE secret_var = 'VAR-LEAK';
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.notes AS phys.main.notes;
+
+statement ok
+ACL ADMIN CREATE ROLE w;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE w WITH (select, insert, update, delete, merge, temp) MAIN;
+
+# --- the control: the select list, and a subquery in it ------------------------------------------
+
+statement error
+ACL ROLE "w" SELECT getvariable('secret_var');
+----
+<REGEX>:.*function "getvariable" is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT (SELECT count(*) FROM phys.main.hidden);
+----
+<REGEX>:.*no access to object.*
+
+# --- VALUES: the rows the walker used to step over -------------------------------------------------
+
+statement error
+ACL ROLE "w" SELECT * FROM (VALUES (getvariable('secret_var'))) t(x);
+----
+<REGEX>:.*function "getvariable" is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT * FROM (VALUES ('a'), (getvariable('secret_var'))) t(x);
+----
+<REGEX>:.*function "getvariable" is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT * FROM (VALUES ((SELECT count(*) FROM phys.main.hidden))) t(x);
+----
+<REGEX>:.*no access to object.*
+
+statement error
+ACL ROLE "w" INSERT INTO notes VALUES (10, getvariable('secret_var'));
+----
+<REGEX>:.*function "getvariable" is not allowed.*
+
+statement error
+ACL ROLE "w" INSERT INTO notes VALUES (10, (SELECT max(x)::VARCHAR FROM phys.main.hidden));
+----
+<REGEX>:.*no access to object.*
+
+# nothing landed
+query I
+ACL ROLE "w" SELECT count(*) FROM notes;
+----
+2
+
+# a VALUES row that carries nothing to gate still works, as a source and as an insert
+query I
+ACL ROLE "w" SELECT x FROM (VALUES ('plain')) t(x);
+----
+plain
+
+statement ok
+ACL ROLE "w" INSERT INTO notes VALUES (3, 'three');
+
+query I
+ACL ROLE "w" SELECT v FROM notes WHERE n = 3;
+----
+three
+
+# --- every other position, pinned so a new form is noticed when it stops refusing -------------------
+
+statement error
+ACL ROLE "w" SELECT n FROM notes WHERE v = getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT n FROM notes ORDER BY getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT count(*) FROM notes GROUP BY getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT count(*) FROM notes GROUP BY n HAVING count(*) > length(getvariable('secret_var'));
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT n FROM notes QUALIFY row_number() OVER (ORDER BY getvariable('secret_var')) = 1;
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT sum(n) OVER (PARTITION BY getvariable('secret_var')) FROM notes;
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT n FROM notes LIMIT length(getvariable('secret_var'));
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT n FROM notes ORDER BY n OFFSET length(getvariable('secret_var'));
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" UPDATE notes SET v = getvariable('secret_var') WHERE n = 1;
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" UPDATE notes SET v = 'x' WHERE v = getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" DELETE FROM notes WHERE v = getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" INSERT INTO notes VALUES (1, 'dup') ON CONFLICT (n) DO UPDATE SET v = getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" MERGE INTO notes USING (SELECT 2 AS n) s ON notes.n = s.n WHEN MATCHED THEN UPDATE SET v = getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT * REPLACE (getvariable('secret_var') AS v) FROM notes;
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT list_transform([1], x -> getvariable('secret_var'));
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT CASE WHEN n = 2 THEN getvariable('secret_var') END FROM notes;
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT n FROM notes WHERE v IN (getvariable('secret_var'));
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT list(v ORDER BY getvariable('secret_var')) FROM notes;
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT count(*) FILTER (WHERE v = getvariable('secret_var')) FROM notes;
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT count(*) FROM range(length(getvariable('secret_var')));
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" WITH x AS (SELECT getvariable('secret_var') AS s) SELECT * FROM x;
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" WITH RECURSIVE r(s) AS (SELECT 'x' UNION ALL SELECT getvariable('secret_var') FROM r WHERE s = 'x') SELECT * FROM r;
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT DISTINCT ON (getvariable('secret_var')) n FROM notes;
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" INSERT INTO notes VALUES (11, 'r') RETURNING getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" DELETE FROM notes WHERE n = 3 RETURNING getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT unnest([getvariable('secret_var')]);
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT 1 WHERE EXISTS (SELECT getvariable('secret_var'));
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT {'a': getvariable('secret_var')};
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" CREATE TEMP TABLE leak AS SELECT getvariable('secret_var') AS s;
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT 'a' UNION ALL SELECT getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT a.n FROM notes a JOIN notes b ON a.v = getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" INSERT INTO notes SELECT 12, getvariable('secret_var');
+----
+<REGEX>:.*is not allowed.*
+
+# PIVOT / UNPIVOT are refused as forms, so their expressions never reach a gate to bypass
+statement error
+ACL ROLE "w" PIVOT notes ON v USING max(getvariable('secret_var'));
+----
+<REGEX>:.*not permitted under ACL.*
+
+statement error
+ACL ROLE "w" UNPIVOT notes ON v INTO NAME k VALUE val;
+----
+<REGEX>:.*not permitted under ACL.*
+
+# the rows are what they were: the refusals wrote nothing
+query II
+ACL ROLE "w" SELECT n, v FROM notes ORDER BY n;
+----
+1	one
+2	two
+3	three

@@ -36,6 +36,7 @@
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/showref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
@@ -1092,8 +1093,20 @@ private:
 			RewriteShowRef(ref);
 			break;
 		case TableReferenceType::EMPTY_FROM:
-		case TableReferenceType::EXPRESSION_LIST:
 			break;
+		case TableReferenceType::EXPRESSION_LIST: {
+			// A VALUES row is expressions like a select list: a function, a subquery over a physical
+			// table, the identity keyword all sit there as they would anywhere else - and the walker
+			// stepped over the whole list, so getvariable() and a scalar subquery over an ungranted
+			// table both came through `VALUES (...)`, in FROM and in INSERT (spec 052 addendum 2026-09-17)
+			auto &list = ref->Cast<ExpressionListRef>();
+			for (auto &row : list.values) {
+				for (auto &value : row) {
+					RewriteExpr(value);
+				}
+			}
+			break;
+		}
 		default:
 			Deny(Reason::STATEMENT_TYPE, "table reference form is not permitted under ACL");
 		}
@@ -2157,6 +2170,21 @@ private:
 				RewriteQueryNode(*subquery.SubqueryMutable()->node);
 			}
 		}
+		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			// The keyword spelling of the session identity: `current_catalog` / `current_schema` without
+			// parentheses is a column reference to the parser, and the binder turns it into the call
+			// only when no column of that name binds (Binder::GetSQLValueFunction) - after the rewrite,
+			// so the call it made was the physical one: under a principal the keyword answered the
+			// server's default database where the call answered the virtual catalog (spec 052 addendum
+			// 2026-09-17). A bare single-part name is the keyword, as SQL reads it; a column that
+			// carries the name is reached qualified, and that is left to the binder.
+			auto &column_ref = expr->Cast<ColumnRefExpression>();
+			if (IsSessionIdentityKeyword(column_ref)) {
+				auto name = column_ref.ColumnNames()[0].GetIdentifierName();
+				SubstituteSessionIdentity(expr, name);
+				return;
+			}
+		}
 		if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 			auto &function = expr->Cast<FunctionExpression>();
 			auto name = function.FunctionName().GetIdentifierName();
@@ -2189,18 +2217,7 @@ private:
 			// equals current_database() into the client's top level, so the physical answer un-folds
 			// the virtual catalog and every remote name grows a spurious level.
 			if (IsSessionIdentityCall(function)) {
-				auto alias = function.GetAlias(); // the select item keeps its name (see the macro above)
-				if (StringUtil::CIEquals(name, "current_schema")) {
-					// where an unqualified name lands inside the catalog - `main`, by construction
-					expr = ConstantExpression::String("main");
-				} else if (StringUtil::CIEquals(name, "current_schemas")) {
-					vector<unique_ptr<ParsedExpression>> parts;
-					parts.push_back(ConstantExpression::String("main"));
-					expr = make_uniq<FunctionExpression>(Identifier("list_value"), std::move(parts));
-				} else {
-					expr = BuildCurrentDatabaseExpr();
-				}
-				expr->SetAlias(std::move(alias));
+				SubstituteSessionIdentity(expr, name);
 				return;
 			}
 			// otherwise route it through the resolver seam (default-allow, deny readers)
@@ -2237,6 +2254,39 @@ private:
 			}
 		}
 		return true;
+	}
+
+	//! The keyword spellings of the same identity: a bare `current_catalog` / `current_schema` is a
+	//! single-part column reference to the parser. The other SQL value keywords (`current_user`,
+	//! `session_user`, `current_role`, `user`, the date/time ones) expand to duckdb's own constants
+	//! or clocks, never to a physical name, and are left alone.
+	bool IsSessionIdentityKeyword(const ColumnRefExpression &column_ref) {
+		auto &names = column_ref.ColumnNames();
+		if (names.size() != 1) {
+			return false;
+		}
+		auto &name = names[0].GetIdentifierName();
+		return StringUtil::CIEquals(name, "current_catalog") || StringUtil::CIEquals(name, "current_schema");
+	}
+
+	//! What both spellings become: `main` for the schema (where an unqualified name lands inside the
+	//! catalog, by construction), the principal's MAIN catalog for the database. The select item keeps
+	//! the name it had - the caller's alias, or the name duckdb gives the expression as written
+	//! (`current_database()`, `current_catalog`) - so a client sees the same column header it would see
+	//! unprefixed. Without that the header was the substitution's own text: the whole listing query,
+	//! policy tables and all, rendered into a column name (spec 052 addendum 2026-09-17).
+	void SubstituteSessionIdentity(unique_ptr<ParsedExpression> &expr, const string &name) {
+		auto alias = expr->GetName();
+		if (StringUtil::CIEquals(name, "current_schema")) {
+			expr = ConstantExpression::String("main");
+		} else if (StringUtil::CIEquals(name, "current_schemas")) {
+			vector<unique_ptr<ParsedExpression>> parts;
+			parts.push_back(ConstantExpression::String("main"));
+			expr = make_uniq<FunctionExpression>(Identifier("list_value"), std::move(parts));
+		} else {
+			expr = BuildCurrentDatabaseExpr();
+		}
+		expr->SetAlias(std::move(alias));
 	}
 
 	//! The catalog a bare name resolves in: the principal's MAIN catalog - and NULL when it is not

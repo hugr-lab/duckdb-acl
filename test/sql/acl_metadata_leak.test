@@ -140,9 +140,58 @@ ACL ROLE "analyst" SELECT t.db FROM (SELECT current_database() AS db) t;
 ----
 sales
 
+# the keyword spellings are the same identity (spec 052 addendum 2026-09-17): to the parser a bare
+# `current_catalog` is a column reference, and the binder turns it into the call only after the
+# rewrite - so it used to answer the server's default database, `memory`, where the call answered `sales`
+query I
+ACL ROLE "analyst" SELECT current_catalog;
+----
+sales
+
+query I
+ACL ROLE "analyst" SELECT current_schema;
+----
+main
+
+query I
+ACL ROLE "analyst" SELECT 'db=' || current_catalog;
+----
+db=sales
+
+# the select item is named as duckdb names the expression, so a client sees the same header either
+# way - the call's header used to be the substitution's own text, the whole listing query rendered
+# into a column name
+query I
+ACL ROLE "analyst" SELECT column_name FROM (DESCRIBE SELECT current_catalog, current_schema, current_catalog AS c, current_database(), current_schemas(true), current_schema() AS s);
+----
+current_catalog
+current_schema
+c
+current_database()
+current_schemas(true)
+s
+
+# a column that carries the keyword's name is reached qualified, and that is left to the binder
+query I
+ACL ROLE "analyst" SELECT t.current_catalog FROM (SELECT 'a column' AS current_catalog) t;
+----
+a column
+
+# ... while the bare spelling is the keyword, as SQL reads it - under a principal it never binds to a
+# column, so the physical default cannot be reached through a relation that shadows the name either
+query I
+ACL ROLE "analyst" SELECT current_catalog FROM (SELECT 'a column' AS current_catalog) t;
+----
+sales
+
 # unprefixed stays the process's own answer - the ACL rewrites principals, not the instance
 query I
 SELECT current_database();
+----
+memory
+
+query I
+SELECT current_catalog;
 ----
 memory
 

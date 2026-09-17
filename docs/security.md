@@ -145,8 +145,12 @@ surface, and this gate is a denylist - so its failure mode is the thing nobody n
   answered through `DESCRIBE` and every other PRAGMA "stays denied, because a PRAGMA is otherwise a
   setting" (spec 031).
 - The session-identity functions answer as the principal: `current_database()`,
-  `current_catalog()`, `current_schema()`, `current_schemas()` return the MAIN virtual catalog
-  (`test/sql/acl_metadata_leak.test`, spec 010 part 3).
+  `current_catalog()`, `current_schema()`, `current_schemas()` return the MAIN virtual catalog - and
+  so do the keyword spellings `current_catalog` / `current_schema`, which the parser hands over as
+  column references (`test/sql/acl_metadata_leak.test`, spec 010 part 3, spec 052 addendum 2026-09-17).
+- The walker visits every position an expression can sit in - `VALUES` rows included, in FROM and in
+  INSERT - so the function gate and the unknown-object refusal hold there as in a select list
+  (`test/sql/acl_expression_positions.test`, spec 052 addendum 2026-09-17).
 - A grant's projection is probed where it is written and stored in `grant_columns`, "so
   `information_schema.columns` describes what the role reads" (spec 026). `duckdb_tables().sql` is
   never NULL and `is_insertable_into` "follows the grant, not the physical row" (spec 065,
