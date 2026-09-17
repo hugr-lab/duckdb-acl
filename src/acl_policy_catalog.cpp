@@ -901,21 +901,29 @@ shared_ptr<const FunctionCategoryModel> CatalogBackend::FunctionModel() {
 			return function_model;
 		}
 	}
-	if (function_mode) {
-		// spec 072 slice 3 brings the slots; until then a function-driver source has no categories of
-		// its own and the seed decides (the store falls back to it on nullptr)
+	if (function_mode && !HasSlot("function_categories")) {
+		// a function-driver source without the category slots (spec 072 slice 3): no categories of its
+		// own, and the seed decides (the store falls back to it on nullptr). EnableFunctions refused a
+		// map that declares only some of the three, so one absent means all absent.
 		return nullptr;
 	}
-	// the three tables, whole: a few thousand rows, read once per policy version
+	// the three sources, whole: a few thousand rows, read once per policy version. In table mode the
+	// tables; in function mode the slots, each a listing with no arguments and the positional
+	// contract the tables have.
+	auto rows = [&](const char *name, const string &columns) {
+		if (function_mode) {
+			return Query("SELECT * FROM " + Slot(name) + "()");
+		}
+		return Query("SELECT " + columns + " FROM " + Tbl(name));
+	};
 	auto model = make_shared_ptr<FunctionCategoryModel>();
-	auto categories = Query("SELECT \"category\", \"comment\", \"builtin\" FROM " + Tbl("function_categories"));
+	auto categories = rows("function_categories", "\"category\", \"comment\", \"builtin\"");
 	for (idx_t row = 0; row < categories->RowCount(); row++) {
 		auto builtin = categories->GetValue(2, row);
 		model->AddCategory(categories->GetValue(0, row).ToString(), categories->GetValue(1, row).ToString(),
 		                   !builtin.IsNull() && builtin.GetValue<bool>());
 	}
-	auto members = Query("SELECT \"category\", \"database\", \"schema\", \"name\", \"kind\" FROM " +
-	                     Tbl("function_category_members"));
+	auto members = rows("function_category_members", "\"category\", \"database\", \"schema\", \"name\", \"kind\"");
 	for (idx_t row = 0; row < members->RowCount(); row++) {
 		FunctionKey key;
 		key.database = members->GetValue(1, row).ToString();
@@ -927,8 +935,7 @@ shared_ptr<const FunctionCategoryModel> CatalogBackend::FunctionModel() {
 		model->AddMember(members->GetValue(0, row).ToString(), key);
 	}
 	auto grants =
-	    Query("SELECT \"role\", \"category\", \"database\", \"schema\", \"name\", \"kind\", \"allowed\" FROM " +
-	          Tbl("function_grants"));
+	    rows("function_grants", "\"role\", \"category\", \"database\", \"schema\", \"name\", \"kind\", \"allowed\"");
 	for (idx_t row = 0; row < grants->RowCount(); row++) {
 		auto allowed_value = grants->GetValue(6, row);
 		bool allowed = !allowed_value.IsNull() && allowed_value.GetValue<bool>();
@@ -1371,6 +1378,19 @@ void PolicyStore::EnableFunctions(DatabaseInstance &db, const string &slots_json
 		if (!backend->HasSlot(required)) {
 			throw BinderException("acl_use_functions: required slot \"%s\" is missing", required);
 		}
+	}
+	// spec 072: the three category slots come together or not at all - a source that lists the
+	// members but not the grants would read as "nothing is granted", which is a refusal of every
+	// function, not a policy anyone wrote
+	idx_t category_slots = 0;
+	for (auto name : {"function_categories", "function_category_members", "function_grants"}) {
+		if (backend->HasSlot(name)) {
+			category_slots++;
+		}
+	}
+	if (category_slots != 0 && category_slots != 3) {
+		throw BinderException("acl_use_functions: the function category slots (function_categories, "
+		                      "function_category_members, function_grants) are declared together or not at all");
 	}
 	for (auto &slot : slots) {
 		auto exists = backend->Query("SELECT count(*) FROM duckdb_functions() WHERE \"function_name\" = " +

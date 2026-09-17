@@ -35,7 +35,9 @@ SELECT acl_use_functions('{
   "schema_aliases":   "my_schema_aliases",
   "functions":        "my_functions",
   "object_caps":      "my_object_caps",      -- optional: absent = catalog-default caps only
-  "function_gate":    "my_function_gate",    -- optional: absent = built-in denylist
+  "function_categories":        "my_function_categories",  -- optional, the three together (spec 072):
+  "function_category_members":  "my_function_members",     --   absent = the shipped categories decide
+  "function_grants":            "my_function_grants",
   "issuer":           "my_issuer",           -- optional: absent = no JWT issuers
   "role_mappings":    "my_role_mappings"     -- optional: absent = no external role mapping
 }');
@@ -56,7 +58,11 @@ SELECT acl_use_functions('{
   `schema_aliases(catalogs) → (vcat, alias_path, phys_path)`;
   `functions(catalogs, names) → (vcat, vname, kind, form, target, template)`;
   `object_caps(roles, catalogs, names) → (role, vcat, vname, caps)`;
-  `function_gate(roles, names) → (role, name, kind, allowed)` ('' role = global);
+  `function_categories() → (category, comment, builtin)`, `function_category_members() → (category,
+  database, schema, name, kind)`, `function_grants() → (role, category, database, schema, name, kind,
+  allowed)` (spec 072: whole listings, no arguments - the model is built once per policy version,
+  so a keyed lookup would buy nothing; '' role = every role; the pre-072 `function_gate` slot is
+  no longer read);
   `role_claims(roles) → (role, claim, value)` (optional: absent = no role-default claims);
   `issuer(iss) → (issuer, keys_json, audiences, algs, role_claim, claim_map)`;
   `role_mappings(issuer, external_values) → (external_value, role)`.

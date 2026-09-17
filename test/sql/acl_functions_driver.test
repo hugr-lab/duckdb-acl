@@ -119,9 +119,9 @@ ACL ROLE "analyst" SELECT id, amount FROM report(150) ORDER BY id;
 ----
 3	300
 
-# the function gate (spec 072): a function-driver source carries no categories until its slots land
-# (spec 072 slice 3), so the shipped seed decides - the legacy `function_gate` slot in the map above
-# is not read. `environment` is nobody's from the start...
+# the function gate (spec 072): a function-driver source without the three category slots carries no
+# categories of its own, so the shipped seed decides - the legacy `function_gate` slot in the map
+# above is not read. `environment` is nobody's from the start...
 statement ok
 ACL ADMIN SET VARIABLE probe = 7;
 
@@ -135,6 +135,60 @@ statement error
 ACL ROLE "analyst" SELECT * FROM read_csv('/etc/passwd');
 ----
 <REGEX>:.*not allowed.*
+
+# --- the category slots (spec 072 slice 3): three listings with no arguments, the tables' columns ---
+
+statement ok
+CREATE MACRO pol_fcats() AS TABLE SELECT * FROM (VALUES ('compute', 'what this source allows', false)) t(category, comment, builtin);
+
+statement ok
+CREATE MACRO pol_fmembers() AS TABLE SELECT * FROM (VALUES ('compute', 'system', 'main', 'lower', 'scalar'), ('compute', 'system', 'main', 'getvariable', 'scalar'), ('compute', 'system', 'main', '+', 'scalar')) t(category, database, schema, name, kind);
+
+statement ok
+CREATE MACRO pol_fgrants() AS TABLE SELECT * FROM (VALUES ('', 'compute', '', '', '', '', true), ('analyst', '', 'system', 'main', 'lower', 'scalar', false)) t(role, category, database, schema, name, kind, allowed);
+
+# declared together or not at all
+statement error
+SELECT acl_use_functions('{"policy_version": "pol_version", "role_catalogs": "pol_role_catalogs", "relations": "pol_relations", "relation_columns": "pol_columns", "schema_aliases": "pol_aliases", "functions": "pol_functions", "role_claims": "pol_claims", "function_categories": "pol_fcats"}');
+----
+<REGEX>:.*declared together or not at all.*
+
+statement ok
+SELECT acl_use_functions('{"policy_version": "pol_version", "role_catalogs": "pol_role_catalogs", "relations": "pol_relations", "relation_columns": "pol_columns", "schema_aliases": "pol_aliases", "functions": "pol_functions", "role_claims": "pol_claims", "function_categories": "pol_fcats", "function_category_members": "pol_fmembers", "function_grants": "pol_fgrants"}');
+
+# the source's own categories decide now, not the seed: getvariable is `compute` here and every
+# role holds compute...
+query I
+ACL ROLE "analyst" SELECT getvariable('probe');
+----
+7
+
+# ...a deny by name from the source wins over it...
+statement error
+ACL ROLE "analyst" SELECT lower('AB');
+----
+<REGEX>:.*lower.*not allowed.*
+
+# ...and a builtin the source never listed is in no category, seed or not
+statement error
+ACL ROLE "analyst" SELECT upper('ab');
+----
+<REGEX>:.*upper.*not allowed.*
+
+query I
+ACL ROLE "analyst" SELECT 1 + 1;
+----
+2
+
+query II
+SELECT category, builtin FROM acl_function_categories();
+----
+compute	false
+
+query I
+SELECT count(*) FROM acl_function_category_members();
+----
+3
 
 # unknown names and physical names stay refused
 statement error
