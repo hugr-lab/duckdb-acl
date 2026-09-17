@@ -23,6 +23,9 @@ statement ok
 INSERT INTO phys.main.wide VALUES ('east', 10, 20, 7), ('west', 5, NULL, 8), ('hidden', 1, 1, 9);
 
 statement ok
+CREATE TABLE phys.main.report(region VARCHAR, q1 HUGEINT, q2 HUGEINT);
+
+statement ok
 SET VARIABLE secret_var = 'VAR-LEAK';
 
 statement ok
@@ -47,10 +50,16 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.wide AS phys.main.wide;
 
 statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.report AS phys.main.report;
+
+statement ok
 ACL ADMIN CREATE ROLE analyst;
 
 statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, temp) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.report TO ROLE analyst WITH (select, insert);
 
 statement ok
 ACL ADMIN GRANT TABLE c.sales TO ROLE analyst WITH (select) RLS (region <> 'hidden') COLUMNS (region, quarter, amount, margin = NULL);
@@ -82,11 +91,42 @@ region
 q1
 q2
 
-# the audit names what the principal wrote, not the multi-statement shape the parser gave it
-query II
-SELECT statement, objects FROM acl_audit_events() WHERE kind = 'statement' AND verdict = 'allowed' ORDER BY seq DESC LIMIT 1;
+# the audit keeps the statement's own class, and says in the detail that the parser shaped it as a pivot
+query III
+SELECT statement, detail, objects FROM acl_audit_events() WHERE kind = 'statement' AND verdict = 'allowed' ORDER BY seq DESC LIMIT 1;
 ----
-pivot	[{'name': sales, 'capability': select}]
+select	pivot	[{'name': sales, 'capability': select}]
+
+# the statement the implicit pivot sits in can be an INSERT or a CTAS: the same enum steps run ahead
+# of it, under the same confinement, so the shape it writes is the principal's (no q9 column)
+statement ok
+ACL ROLE "analyst" INSERT INTO report SELECT * FROM (PIVOT sales ON quarter USING sum(amount) GROUP BY region);
+
+query III
+ACL ROLE "analyst" SELECT * FROM report ORDER BY region;
+----
+east	10	20
+west	5	NULL
+
+query III
+SELECT statement, detail, objects FROM acl_audit_events() WHERE kind = 'statement' AND statement = 'insert' ORDER BY seq DESC LIMIT 1;
+----
+insert	pivot	[{'name': sales, 'capability': select}, {'name': report, 'capability': insert}]
+
+statement ok
+ACL ROLE "analyst" CREATE TEMP TABLE pivoted AS PIVOT sales ON quarter USING sum(amount) GROUP BY region;
+
+query III
+ACL ROLE "analyst" SELECT * FROM pivoted ORDER BY region;
+----
+east	10	20
+west	5	NULL
+
+# EXPLAIN of a pivot is EXPLAIN: the capability gates it before any enum step runs
+statement error
+ACL ROLE "analyst" EXPLAIN PIVOT sales ON quarter USING sum(amount) GROUP BY region;
+----
+<REGEX>:.*explain capability.*
 
 # --- the explicit forms: a column the caller names exists, and a hidden row still feeds it nothing ---
 

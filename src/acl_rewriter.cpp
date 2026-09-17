@@ -224,7 +224,7 @@ public:
 	//! becomes a column. Nothing else that arrives as a MultiStatement is admitted - ALTER's forms are
 	//! refused by the per-statement dispatch, and a CREATE TYPE written by hand is refused there too.
 	void RewriteMultiStatement(MultiStatement &multi) {
-		if (multi.statements.empty() || multi.statements.back()->type != StatementType::SELECT_STATEMENT) {
+		if (multi.statements.size() < 2) {
 			Deny(Reason::STATEMENT_TYPE, "statement type MULTI is not permitted under ACL");
 		}
 		for (idx_t i = 0; i + 1 < multi.statements.size(); i++) {
@@ -236,9 +236,21 @@ public:
 			auto &info = sub.Cast<CreateStatement>().info->Cast<CreateTypeInfo>();
 			RewriteQueryNode(*info.query->Cast<SelectStatement>().node);
 		}
-		RewriteStatement(*multi.statements.back());
+		// the statement the pivot sits in - a SELECT, or an INSERT / CTAS whose source it is - goes
+		// through its own dispatch, admitted or refused as it would be standing alone
+		auto &last = *multi.statements.back();
+		RewriteStatement(last);
+		if (replacement || drop_statement || !follow_ups.empty()) {
+			// a statement the rewrite would replace, drop or follow up (a PRAGMA answered as a SELECT,
+			// a DDL with a catalog record) has no place behind the parser's enum steps: they would be
+			// left without it, or it without them. Refused rather than reshaped.
+			Deny(Reason::STATEMENT_TYPE,
+			     "statement type " + StatementTypeToString(last.type) + " is not permitted with an implicit PIVOT");
+		}
 		if (trail) {
-			trail->statement = "pivot"; // what the principal wrote, not the shape the parser gave it
+			// the class is the statement's own; the shape the parser gave it is the detail
+			trail->statement = StringUtil::Lower(StatementTypeToString(last.type));
+			trail->detail = "pivot";
 		}
 	}
 

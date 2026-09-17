@@ -44,10 +44,14 @@ bind against the rewritten source, so a column the grant does not list is not th
 
 `RewriteStatement` gains `MULTI_STATEMENT`: every statement but the last must be the parser's enum step
 - `IsPivotEnumCreate`: a `CREATE` of a `TYPE_ENTRY` that is temporary, unqualified, named
-`__pivot_enum_*` and defined by a SELECT - and its query is rewritten with `RewriteQueryNode`; the last
-must be a SELECT and is rewritten as one. Anything else in a multi-statement is refused with the
-statement type it is (ALTER's multi forms come this way and stay refused). The audit's statement
-class for the whole is `pivot` - what the principal wrote, not the shape the parser gave it.
+`__pivot_enum_*` and defined by a SELECT - and its query is rewritten with `RewriteQueryNode`. The last
+is the statement the pivot sits in - a SELECT, or an INSERT / CTAS whose source it is - and goes
+through its own dispatch, admitted or refused as it would be standing alone; one whose rewrite would
+replace, drop or follow it up (a PRAGMA answered as a SELECT, a DDL with a catalog record) is refused
+rather than reshaped, since the enum steps ahead of it would be left without it. Anything else in a
+multi-statement is refused with the statement type it is (ALTER's multi forms come this way and stay
+refused). The audit keeps the statement's own class (`select`, `insert`, ...) and says `pivot` in the
+detail - the shape the parser gave it, not a class of its own.
 
 **What this is not.** A `CREATE TYPE` a principal spells by hand - `__pivot_enum_` prefix or not - goes
 through `RewriteCreateStatement` and is refused there as it always was; the enum step is admitted only
@@ -77,7 +81,9 @@ as the parser emits it, inside the multi-statement, where its query is ours to r
 ## Testing
 
 `test/sql/acl_pivot.test`: the implicit form under RLS (the hidden row's `q9` is no column, checked by
-value and by `DESCRIBE`), the audit class `pivot` with the source as its object, the explicit list with
+value and by `DESCRIBE`), the audit's `select` / `insert` class with `pivot` in the detail and the
+source among its objects, the implicit form inside an INSERT and a CTAS into a session temp (the
+written shape is the principal's), EXPLAIN of a pivot gated by the capability, the explicit list with
 a hidden value named, the SQL-standard form, `IN (SELECT ...)` over the virtual and refused over the
 physical source, a masked column's aggregate, a hidden column refused at bind, UNPIVOT in its three
 spellings with `COLUMNS(*)` seeing only the granted columns, the gate in the aggregate, the ON
