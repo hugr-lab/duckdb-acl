@@ -159,7 +159,7 @@ private:
 	string Named(const string &vname) const {
 		return vcat + "." + vname;
 	}
-	unique_ptr<MaterializedQueryResult> Read(const string &sql) {
+	unique_ptr<QueryResult> Read(const string &sql) {
 		return catalog.Query(sql);
 	}
 

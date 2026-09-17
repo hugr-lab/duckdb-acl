@@ -269,6 +269,31 @@ transport.
 - **Schema and batches from different properties** (review): the schema came from a fresh
   connection at execute, each batch from the session connection at pull time; one snapshot now.
 
+## Addendum 2026-09-17 — the unified `QueryResult`
+
+duckdb #25477 (on `v2.0-cyanoptera` since 2026-09-16, our pin since 2026-09-17) replaced
+`MaterializedQueryResult` / `StreamQueryResult` / `PendingQueryResult` with one `QueryResult` and a
+`QueryResultStream`. The mechanism above is unchanged; the names in it map as follows.
+
+- `Execute(values, allow_stream_result = true)` → `PreparedStatement::Submit(values)`: a handle that
+  runs on the workers but decides nothing until a `QueryResultStream` is opened on it (draining,
+  bounded buffer, chunks released as the reader takes them - the streaming form) or a retained-side
+  call is made. A statement duckdb completes before it answers (`ResultEagerness::FORCED` in its
+  `StatementProperties` - a count) refuses a stream; the door runs it with `Execute(values)` and reads
+  the handle. `FlightDoorState::ResultStream` holds either (`stream` / `handle`) behind `Open()`,
+  `Fetch()`, `HasError()`, `GetError()`, `Close()`; every site of the mechanism reads the slot, not
+  the duckdb type.
+- `PendingQuery(values, false)` in the prepare-time schema probe → `Submit(values)` on a non-FORCED
+  statement only, closed unread after its types are taken.
+- `~StreamQueryResult` releasing nothing was the reason for the explicit `Close()`; `~QueryResult`
+  closes now, but the slot outlives its reader by design (an idle cookie's next statement never
+  comes), so the query is still ended explicitly, where its outcome is known.
+- `RunCatalogQuery` (spec 046) no longer asks for a materialized result and checks the type:
+  `Execute` retains, and `RowCount`/`GetValue` read the retained rows.
+
+Verified by the same means: the whole suite, `test/e2e/flight/run.sh` and `stream.sh` (every
+outcome), and the distribution build against the branch head.
+
 ## Alternatives considered
 
 - **Keep materializing, bound it** (`acl_max_result_rows` alone): bounds the damage, keeps the

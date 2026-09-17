@@ -65,19 +65,20 @@ int main(int argc, char *argv[]) {
 		});
 
 		Scenario("the gate stays closed outside the prefix", [&]() {
-			auto by_session = con.Query("ACL SESSION '" + handle + "' SELECT * FROM arrow_scan(NULL, NULL, NULL)");
+			auto by_session = con.Query("ACL SESSION '" + handle + "' SELECT * FROM arrow_scan()");
 			ErrorContains(*by_session, "not allowed", "arrow_scan under ACL SESSION is denied");
-			auto by_role = con.Query("ACL ROLE \"r\" SELECT * FROM arrow_scan(NULL, NULL, NULL)");
+			auto by_role = con.Query("ACL ROLE \"r\" SELECT * FROM arrow_scan()");
 			ErrorContains(*by_role, "not allowed", "arrow_scan under ACL ROLE is denied");
 		});
 
 		Scenario("the exemption opens exactly the composed shape", [&]() {
 			// under the INGEST prefix the gate passes arrow_scan, so the refusal that comes back is
-			// duckdb's own binder error about the pointers - which is what proves the gate opened
+			// duckdb's own binder error about the missing stream - bind input only the door attaches
+			// (duckdb #25726) - which is what proves the gate opened
 			auto composed = con.Query("ACL INGEST '" + handle +
 			                          "' INSERT INTO orders (id, tenant, amount)"
-			                          " SELECT id, tenant, amount FROM arrow_scan(NULL, NULL, NULL)");
-			ErrorContains(*composed, "pointers cannot be null", "the gate passed arrow_scan to duckdb's own check");
+			                          " SELECT id, tenant, amount FROM arrow_scan()");
+			ErrorContains(*composed, "ArrowScanFactory bind input", "the gate passed arrow_scan to duckdb's own check");
 			// and only arrow_scan: its dumb sibling stays denied even here
 			auto dumb = con.Query("ACL INGEST '" + handle +
 			                      "' INSERT INTO orders (id) SELECT id FROM arrow_scan_dumb(NULL, NULL, NULL)");

@@ -214,3 +214,18 @@ in CI alongside the existing door tests.
   test pins the parallel plan specifically yet.
 - Transactions: `transaction_id` on ingest waits for the cluster-era transaction work with every
   other write path.
+
+## Addendum 2026-09-17 — the stream is bind input, not three pointers
+
+duckdb #25726 (on `v2.0-cyanoptera`, our pin since 2026-09-17) took the pointer arguments away from
+`arrow_scan`: the scan's factory (`ArrowScanFactory`, a `TableFunctionInfo`) travels as
+process-local **bind input** on the `TableFunctionRef` (`bind_info`, retained by `Copy`, refused by
+serialization), never as SQL text. The composed statement is now `… FROM arrow_scan()` with no
+parameters at all; the door sets the factory (`IngestScanFactory` over the DoPut stream) on the
+calling thread around its one `Prepare` (`ArrowIngestScope`, the seam next to spec 050's
+`TempScanContext`), and the rewriter attaches it to the composed `arrow_scan()` under the INGEST
+prefix - taken once, so nothing else on the thread can meet it. Without a factory the ref binds to
+nothing: duckdb's own "requires an ArrowScanFactory bind input" is the same closed gate, and the C++
+contract test pins that text. `ParamRowsFrom` (spec 047) hands its stream the same way. The
+enforcement above is unchanged: the prefix is still the door's alone, the function stays in the
+never set, and a client's `arrow_scan()` is refused before bind.

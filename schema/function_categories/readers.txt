@@ -23,6 +23,8 @@ read_avro TABLE
 read_blob TABLE
 read_csv TABLE
 read_csv_auto TABLE
+# duckdb bb13cfaa (v2.0-cyanoptera, 2026-09-17): the per-file reader read_csv is being moved onto
+read_single_csv_file TABLE
 read_duckdb TABLE
 read_json TABLE
 read_json_auto TABLE

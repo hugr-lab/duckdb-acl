@@ -126,8 +126,8 @@ struct ColumnBuilder {
 
 //! One statement, composed and run under the caller's session. The session is judged on every use
 //! (spec 040), so an expired one refuses here rather than returning a stale answer.
-arrow::Result<unique_ptr<MaterializedQueryResult>> RunCatalogQuery(PolicyStore &store, Connection &con,
-                                                                   const string &handle, const CatalogQuery &query) {
+arrow::Result<unique_ptr<QueryResult>> RunCatalogQuery(PolicyStore &store, Connection &con, const string &handle,
+                                                       const CatalogQuery &query) {
 	auto prefixed = store.SessionSql(handle, query.sql);
 	if (prefixed.empty()) {
 		return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
@@ -137,26 +137,20 @@ arrow::Result<unique_ptr<MaterializedQueryResult>> RunCatalogQuery(PolicyStore &
 		return arrow::Status::Invalid("acl: " + prepared->GetError());
 	}
 	vector<Value> parameters = query.parameters;
-	// `allow_stream_result` defaults to *true*, and a streaming result cast to a materialized one is
-	// undefined behaviour rather than a wrong answer - it segfaulted the server on the first catalog
-	// fetch. A catalog answer is small and is read twice on the include_schema path (the rows, then
-	// the per-table schemas), so materialized is what this wants; it is asked for explicitly, and
-	// checked rather than assumed.
-	auto result = prepared->Execute(parameters, false);
+	// Execute runs the statement to completion and retains its rows: a catalog answer is small and is
+	// read twice on the include_schema path (the rows, then the per-table schemas)
+	auto result = prepared->Execute(parameters);
 	if (result->HasError()) {
 		return arrow::Status::Invalid("acl: " + result->GetError());
 	}
-	if (result->GetResultType() != QueryResultType::MATERIALIZED_RESULT) {
-		return arrow::Status::Invalid("acl: a catalog answer must be materialized");
-	}
-	return unique_ptr<MaterializedQueryResult>(static_cast<MaterializedQueryResult *>(result.release()));
+	return result;
 }
 
 //! Rows into the protocol's shape, by position: the composed statement produces the schema's columns
 //! in the schema's order, and `extra` - the serialized per-table schema of `include_schema` - is
 //! appended after them when the shape has one.
-arrow::Result<std::shared_ptr<arrow::RecordBatch>>
-BatchFrom(const std::shared_ptr<arrow::Schema> &schema, MaterializedQueryResult &result, const vector<string> *extra) {
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> BatchFrom(const std::shared_ptr<arrow::Schema> &schema,
+                                                             QueryResult &result, const vector<string> *extra) {
 	auto sql_columns = static_cast<idx_t>(schema->num_fields()) - (extra ? 1 : 0);
 	if (result.ColumnCount() != sql_columns) {
 		return arrow::Status::Invalid("acl: catalog statement produced " + std::to_string(result.ColumnCount()) +
@@ -202,8 +196,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> EmptyBatch(const std::shared_
 //! client opens its sidebar, and it could never describe a table function at all. The `data_type`
 //! strings are parsed by duckdb's own `TransformStringToLogicalType` - the inverse of the
 //! `ToString()` that produced them - so no type mapping is re-implemented here.
-arrow::Result<vector<string>> SchemasFor(ClientContext &context, MaterializedQueryResult &tables,
-                                         MaterializedQueryResult &columns) {
+arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &tables, QueryResult &columns) {
 	// (catalog, schema, name) -> the row range in `columns`, which the statement returned in order
 	std::map<std::tuple<string, string, string>, vector<idx_t>> by_object;
 	for (idx_t row = 0; row < columns.RowCount(); row++) {
@@ -272,20 +265,23 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, MaterializedQue
 
 namespace {
 
-//! The two adapters `arrow_scan` wants around a C stream. Produce moves the stream into duckdb's
-//! wrapper - called once per scan, and the source is spent after it; GetSchema hands out the fresh
-//! copy the C ABI contract already makes ours to own.
-unique_ptr<ArrowArrayStreamWrapper> ParamStreamProduce(uintptr_t stream_ptr, ArrowStreamParameters &) {
-	auto stream = reinterpret_cast<ArrowArrayStream *>(stream_ptr);
-	auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
-	wrapper->arrow_array_stream = *stream;
-	stream->release = nullptr;
-	return wrapper;
-}
-
-void ParamStreamGetSchema(ArrowArrayStream *stream, ArrowSchema &schema) {
-	stream->get_schema(stream, &schema);
-}
+//! What `arrow_scan` wants around a C stream (duckdb #25726: process-local bind input on the ref).
+//! Produce moves the stream into duckdb's wrapper - called once per scan, and the source is spent
+//! after it; GetSchema hands out the fresh copy the C ABI contract already makes ours to own.
+struct ParamScanFactory : public ArrowScanFactory {
+	explicit ParamScanFactory(ArrowArrayStream &stream_p) : stream(stream_p) {
+	}
+	void GetSchema(ArrowSchema &schema) override {
+		stream.get_schema(&stream, &schema);
+	}
+	unique_ptr<ArrowArrayStreamWrapper> ProduceStream(ArrowStreamParameters &) override {
+		auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
+		wrapper->arrow_array_stream = stream;
+		stream.release = nullptr;
+		return wrapper;
+	}
+	ArrowArrayStream &stream;
+};
 
 } // namespace
 
@@ -315,11 +311,9 @@ arrow::Result<vector<vector<Value>>> ParamRowsFrom(DatabaseInstance &db, flight:
 	vector<vector<Value>> rows;
 	try {
 		Connection con(db);
-		auto result =
-		    con.TableFunction("arrow_scan", {Value::POINTER(reinterpret_cast<uintptr_t>(&stream)),
-		                                     Value::POINTER(reinterpret_cast<uintptr_t>(ParamStreamProduce)),
-		                                     Value::POINTER(reinterpret_cast<uintptr_t>(ParamStreamGetSchema))})
-		        ->Execute();
+		auto result = con.TableFunction("arrow_scan", vector<Value>(), named_parameter_map_t(),
+		                                make_shared_ptr<ParamScanFactory>(stream))
+		                  ->Execute();
 		if (result->HasError()) {
 			if (stream.release) {
 				stream.release(&stream);

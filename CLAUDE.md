@@ -19,8 +19,17 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   2026-09-14 `Literal`) that land with 2.0. **A constant is a `Literal`, not a `Value`**: the
   literal is the text as written and the binder turns it into a value, so build one with
   `ConstantExpression::FromValue(v)` or the `String`/`Integer`/`Null` factories, and read one with
-  `GetLiteral().ToValue()` - which returns by value, not by reference. Re-pin to the `v2.0.0` tag when it is cut; the scanners come from the submodule's own
-  extension pins (`.github/config/extensions/`), patches included.
+  `GetLiteral().ToValue()` - which returns by value, not by reference. **A result is a `QueryResult`**
+  (since the 2026-09-17 pin, duckdb #25477): `MaterializedQueryResult` / `StreamQueryResult` /
+  `PendingQueryResult` are gone - `Connection::Query` and `PreparedStatement::Execute` answer a
+  retained result (`RowCount`, `GetValue`, `Fetch` read it), `Submit` answers a handle that runs on
+  the workers but decides nothing, and a `QueryResultStream` opened on a handle is the one streaming
+  form (it refuses a `ResultEagerness::FORCED` statement - a count - which is read from the handle).
+  Re-pin to the `v2.0.0` tag when it is cut; the scanners come from the submodule's own
+  extension pins (`.github/config/extensions/`), patches included - ducklake's too, since 2026-09-17
+  (the three patches we carried in `patches/ducklake/` are upstream). quack is pinned one commit past
+  the submodule's own (#212), with the four patches duckdb carries for it applied to the loadable
+  (`APPLY_PATCHES`) and, by `sync.py`, to the embedded server's copies alike.
 - **Dependencies**: none (no vcpkg/OpenSSL).
 - **Platforms**: Linux (GCC), macOS (Clang), Windows (MSVC — a release target; CI builds the first two).
 
@@ -268,7 +277,14 @@ TLS-terminating-upstream deployments. The server's token/session RNG comes from 
 httpfs` nor `force_mbedtls_unsafe` — duckdb's bundled mbedtls RNG is a non-crypto PRNG, unfit for auth
 tokens. A namespace-alias shim (`acl_quack_httplib_ns.hpp`) lets quack's
 `duckdb_httplib::` sources compile in the OpenSSL httplib namespace; `sync.py` regenerates the few
-acl_-renamed TUs on a submodule bump; the embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
+acl_-renamed TUs on a submodule bump - from a copy carrying duckdb's own quack patches, plus the
+embed's one patch: the statement driver. Since the unified `QueryResult` (duckdb #25477) the server
+delegates no result collector - a delegated submission that fails ends its query twice inside
+duckdb (a null dereference, INTERNAL, the whole database invalidated by a refused INSERT), and
+upstream quack has not met that duckdb yet - so the driver submits the statement and drains it
+through a `QueryResultStream` in batches of `acl_quack_target_batch_bytes` (several statements at
+once, the parser's implicit PIVOT, run through `Query()` materialized), with spec 069's audit hook
+inside; the embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
 Streamed ingest
 (`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the
 **client** — `INSERT INTO t SELECT * FROM scan_data_from_quack_client('<id>', NULL::STRUCT(…),
@@ -369,14 +385,17 @@ recorded refusals per source (counted regardless). Metric attributes from bounde
 pipeline's worker never holds the instance (settings and the file are the emitting thread's);
 `PolicyStoreHandle`'s destructor in the object cache is the shutdown seam.
 
-**Spec 070 — the Flight door streams**: `DoGet` executes with `allow_stream_result` and hands gRPC a
-`RecordBatchStream` over `AclResultReader`, which pulls ONE duckdb chunk per Arrow batch — nothing
-beyond the chunk in flight is held, whatever the result's size. The `StreamQueryResult` lives in a
+**Spec 070 — the Flight door streams**: `DoGet` submits the statement (`PreparedStatement::Submit`,
+a handle; a `ResultEagerness::FORCED` statement - a count - runs to completion instead) and hands
+gRPC a `RecordBatchStream` over `AclResultReader`, which pulls ONE duckdb chunk per Arrow batch
+through the `QueryResultStream` opened on the handle — nothing beyond the chunk in flight is held,
+whatever the result's size. The stream lives in a
 slot (`FlightDoorState::ResultStream`) the reader and the session connection share: every pull takes
 `SessionConn::exec` + `stream_lock` and releases them, so the session's next statement
 (`LockForStatement`, every former `lock_guard(exec)` site) can end a stream that sat unpulled for
 `acl_flight_stream_idle` seconds (30; 0 = never, the statement waits) from its own thread — interrupt,
-`Close()` (what releases duckdb's active query at our pin; the destructor releases nothing), drop the
+`Close()` (what releases duckdb's active query; the destructor does it too since the unified
+`QueryResult`, but the slot outlives its reader, so it is done where the outcome is known), drop the
 result, mark the slot `superseded` — while one being pulled makes it wait. A pull touches the session
 (`SessionTouch`) and a killed/expired durable session ends its stream at the next pull. Whatever ends
 the stream interrupts and closes the query (duckdb's own LIMIT rule): consumed, cancelled (gRPC

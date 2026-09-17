@@ -73,11 +73,12 @@ json	true
 node_facts	true
 spatial	true
 
-# every function of this build is in a category or in the never set: nothing is uncategorized
+# every function of this build is in a category or in the never set: nothing is uncategorized (the
+# names, so a build that grows one says which - a platform-specific one shows on one leg only)
 query I
-SELECT count(*) FROM acl_function_status() WHERE status = 'uncategorized' AND present;
+SELECT coalesce(list(database || '.' || schema || '.' || name || ' ' || kind ORDER BY 1), []) FROM acl_function_status() WHERE status = 'uncategorized' AND present;
 ----
-0
+[]
 
 # --- ordinary SQL is base, and base is everyone's --------------------------------------------------
 

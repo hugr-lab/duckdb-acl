@@ -150,3 +150,27 @@ held unchanged - every renamed literal still lives in the TU it did.
   cost, not a correctness risk.
 - A bump of `third_party/quack` means re-running `src/quack_embed/sync.py` and re-checking the one-line
   namespace assumption; the sync guards fail loudly if a renamed literal has moved.
+
+## Addendum 2026-09-17 — the driver submits, the collector is not delegated
+
+duckdb #25477 (the unified `QueryResult`, our pin since 2026-09-17) changed what a delegated result
+collector gets: a submission with `ClientConfig::get_result_collector` set creates no result buffer
+- the delegate owns its result - and a delegated submission whose statement FAILS ends its query
+twice inside duckdb (`FailQueryInternal` within `CompleteDelegatedInternal`, then the "query failed:
+abort now" branch of `SubmitStatementInternal`, whose own comment admits the query may already be
+gone): a null dereference, an INTERNAL error, and the whole database invalidated - by nothing more
+than a principal's INSERT refused at the predicate (spec 024). quack's own pin of duckdb predates
+the change and duckdb's CI does not run quack's tests, so the embed met it first.
+
+The embed's `DriveQuery` (the one `sync.py` patch on `quack_server.cpp`) therefore delegates
+nothing: the statement is `Submit`ted, and a result-returning one is drained through a
+`QueryResultStream` on the driver thread - the bounded buffer releases chunks as they go out, so the
+memory profile is the collector's - into `QuackFetchPayload` batches of about
+`acl_quack_target_batch_bytes` (dense indexes from 1, `announced_total` at the end, the same
+`PushBatch`/`Finish` contract the fetch collector honoured, so the result cache and reconnects are
+untouched). A statement duckdb completes before it answers (a count) is read from the handle, as
+before; a text of several statements (the parser's implicit PIVOT, spec 075) cannot be submitted and
+runs through `Query()`, materialized. Spec 069's audit hook sits at the same site. The quack fetch
+collector and rebalancer sink are still generated (upstream may return to them) but nothing
+installs them. Pinned by the quack integration scenarios (`acl_quack_ingest*`, `acl_quack_staging`,
+`acl_quack_door`): rows land and a refused write refuses cleanly, with the node intact.
