@@ -1,0 +1,206 @@
+# name: test/sql/acl_pivot.test
+# description: PIVOT / UNPIVOT under a principal (spec 075) - the source is a relation like any other
+#   (resolved, confined, masked), everything the pivot computes is gated, and the implicit form's
+#   enum discovery runs under the same confinement, so a value only a hidden row carries never becomes
+#   a column
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.sales(region VARCHAR, quarter VARCHAR, amount INT, margin INT);
+
+statement ok
+INSERT INTO phys.main.sales VALUES ('east', 'q1', 10, 1), ('east', 'q2', 20, 2), ('west', 'q1', 5, 3), ('hidden', 'q9', 99, 9);
+
+statement ok
+CREATE TABLE phys.main.wide(region VARCHAR, q1 INT, q2 INT, secret INT);
+
+statement ok
+INSERT INTO phys.main.wide VALUES ('east', 10, 20, 7), ('west', 5, NULL, 8), ('hidden', 1, 1, 9);
+
+statement ok
+SET VARIABLE secret_var = 'VAR-LEAK';
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET GLOBAL acl_audit_level='decisions';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.sales AS phys.main.sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.wide AS phys.main.wide;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.sales TO ROLE analyst WITH (select) RLS (region <> 'hidden') COLUMNS (region, quarter, amount, margin = NULL);
+
+statement ok
+ACL ADMIN GRANT TABLE c.wide TO ROLE analyst WITH (select) RLS (region <> 'hidden') COLUMNS (region, q1, q2);
+
+# --- the implicit form: the column set is discovered from the principal's slice ------------------
+# unprefixed, the hidden row contributes a q9 column; under the principal the enum query is confined
+# like any read, so there is no q9 - not as a column, not as a NULL
+
+query IIII
+PIVOT phys.main.sales ON quarter USING sum(amount) GROUP BY region ORDER BY region;
+----
+east	10	20	NULL
+hidden	NULL	NULL	99
+west	5	NULL	NULL
+
+query III
+ACL ROLE "analyst" PIVOT sales ON quarter USING sum(amount) GROUP BY region ORDER BY region;
+----
+east	10	20
+west	5	NULL
+
+query I
+ACL ROLE "analyst" SELECT column_name FROM (DESCRIBE SELECT * FROM (PIVOT sales ON quarter USING sum(amount) GROUP BY region));
+----
+region
+q1
+q2
+
+# the audit names what the principal wrote, not the multi-statement shape the parser gave it
+query II
+SELECT statement, objects FROM acl_audit_events() WHERE kind = 'statement' AND verdict = 'allowed' ORDER BY seq DESC LIMIT 1;
+----
+pivot	[{'name': sales, 'capability': select}]
+
+# --- the explicit forms: a column the caller names exists, and a hidden row still feeds it nothing ---
+
+query IIII
+ACL ROLE "analyst" PIVOT sales ON quarter IN ('q1', 'q2', 'q9') USING sum(amount) GROUP BY region ORDER BY region;
+----
+east	10	20	NULL
+west	5	NULL	NULL
+
+# the SQL-standard form keeps every other column as a group: the masked `margin` is there, as NULL
+query IIII
+ACL ROLE "analyst" SELECT * FROM sales PIVOT (sum(amount) FOR quarter IN ('q1', 'q2')) ORDER BY region;
+----
+east	NULL	10	20
+west	NULL	5	NULL
+
+# IN (SELECT ...) is a read of its own, rewritten like the source
+query III
+ACL ROLE "analyst" PIVOT sales ON quarter IN (SELECT DISTINCT quarter FROM sales ORDER BY 1) USING sum(amount) GROUP BY region ORDER BY region;
+----
+east	10	20
+west	5	NULL
+
+statement error
+ACL ROLE "analyst" PIVOT sales ON quarter IN (SELECT DISTINCT quarter FROM phys.main.sales) USING sum(amount) GROUP BY region;
+----
+<REGEX>:.*no access to object.*
+
+# --- masks and hidden columns hold through the pivot ---------------------------------------------
+
+# a masked column aggregates as the principal reads it
+query III
+ACL ROLE "analyst" PIVOT sales ON quarter USING sum(margin) GROUP BY region ORDER BY region;
+----
+east	NULL	NULL
+west	NULL	NULL
+
+# a column the grant does not list is not there to pivot on
+statement error
+ACL ROLE "analyst" PIVOT wide ON region USING sum(secret);
+----
+<REGEX>:.*secret.*
+
+# --- UNPIVOT: the same source rules, in the other direction ----------------------------------------
+
+query III
+ACL ROLE "analyst" UNPIVOT wide ON q1, q2 INTO NAME quarter VALUE amount ORDER BY region, quarter;
+----
+east	q1	10
+east	q2	20
+west	q1	5
+
+# COLUMNS(*) sees the rewritten source: region, q1, q2 - never secret
+query III
+ACL ROLE "analyst" UNPIVOT wide ON COLUMNS(* EXCLUDE (region)) INTO NAME quarter VALUE amount ORDER BY region, quarter;
+----
+east	q1	10
+east	q2	20
+west	q1	5
+
+query III
+ACL ROLE "analyst" SELECT * FROM wide UNPIVOT (amount FOR quarter IN (q1, q2)) ORDER BY region, quarter;
+----
+east	q1	10
+east	q2	20
+west	q1	5
+
+# --- the gate stands in every part of the pivot ---------------------------------------------------
+
+statement error
+ACL ROLE "analyst" PIVOT sales ON quarter USING max(getvariable('secret_var')) GROUP BY region;
+----
+<REGEX>:.*function "getvariable" is not allowed.*
+
+statement error
+ACL ROLE "analyst" PIVOT sales ON quarter || getvariable('secret_var') USING sum(amount) GROUP BY region;
+----
+<REGEX>:.*function "getvariable" is not allowed.*
+
+statement error
+ACL ROLE "analyst" PIVOT phys.main.sales ON quarter USING sum(amount) GROUP BY region;
+----
+<REGEX>:.*no access to object.*
+
+statement error
+ACL ROLE "analyst" UNPIVOT phys.main.wide ON q1, q2 INTO NAME quarter VALUE amount;
+----
+<REGEX>:.*no access to object.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM phys.main.sales PIVOT (sum(amount) FOR quarter IN ('q1'));
+----
+<REGEX>:.*no access to object.*
+
+# the enum step is admitted only as the parser emits it, inside the pivot: spelled by hand, a CREATE
+# TYPE is what it always was under a principal
+statement error
+ACL ROLE "analyst" CREATE TEMP TYPE __pivot_enum_by_hand AS ENUM (SELECT DISTINCT quarter FROM phys.main.sales);
+----
+<REGEX>:.*only tables and views can be created.*
+
+statement error
+ACL ROLE "analyst" CREATE TYPE __pivot_enum_by_hand AS ENUM ('a', 'b');
+----
+<REGEX>:.*only tables and views can be created.*
+
+# a refusal inside the enum step refuses the whole statement: nothing was created, so a second try
+# under a wider grant is not answered from a stale enum
+statement ok
+ACL ADMIN GRANT TABLE c.sales TO ROLE analyst WITH (select) COLUMNS (region, quarter, amount, margin = NULL);
+
+query IIII
+ACL ROLE "analyst" PIVOT sales ON quarter USING sum(amount) GROUP BY region ORDER BY region;
+----
+east	10	20	NULL
+hidden	NULL	NULL	99
+west	5	NULL	NULL

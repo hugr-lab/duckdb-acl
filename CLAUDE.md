@@ -115,6 +115,10 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
   `DESCRIBE (SELECT * FROM <name>)`, so the description is of the rewritten relation — a hidden column
   is hidden from it too; `SHOW TABLES [FROM s]` is the principal's `information_schema.tables` in the
   shape `SHOW TABLES` returns.
+- **`PIVOT` / `UNPIVOT` are admitted** (spec 075): the `PivotRef`'s source, aggregates, pivot
+  expressions and `IN (SELECT ...)` are walked like any FROM and expression; the implicit form arrives
+  as a `MultiStatement` (the parser's `CREATE TEMP TYPE __pivot_enum_* AS ENUM (SELECT DISTINCT ...)`
+  per column, then the SELECT) and only that shape is admitted, each enum query rewritten as a read.
 - **A grant's projection is probed where it is written** (spec 026): a mask that changes a column's
   type and a computed column the object never had are stored in `grant_columns`, so
   `information_schema.columns` and `DESCRIBE` describe the same thing — what the role reads.

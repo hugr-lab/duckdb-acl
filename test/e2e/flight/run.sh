@@ -96,6 +96,16 @@ echo "$got" | grep -q "no access to object" || fail "the physical name was not r
 got="$(ask "EXPLAIN SELECT * FROM orders")"
 echo "$got" | grep -q "explain capability" || fail "EXPLAIN was not gated by the capability: $got"
 
+# --- PIVOT through the door (spec 075): the explicit form prepares like any SELECT and answers the
+# principal's slice - five acme rows, and nothing for the tenant it cannot see; the implicit form is
+# a multi-statement duckdb itself cannot prepare, so the door answers duckdb's own refusal
+got="$(ask "SELECT * FROM (SELECT tenant FROM orders) PIVOT (count(*) FOR tenant IN ('acme', 'globex'))")"
+echo "$got" | grep -q "'acme': \[5\]" || fail "the explicit PIVOT did not answer the tenant's slice: $got"
+echo "$got" | grep -q "'globex': \[5\]" && fail "the explicit PIVOT counted another tenant's rows: $got"
+
+got="$(ask "PIVOT orders ON tenant USING count(*)")"
+echo "$got" | grep -qi "prepare multiple statements" || fail "the implicit PIVOT was not refused as unpreparable: $got"
+
 # --- a statement carrying a transaction id that names no open transaction is refused (spec 055) ----
 # the security-critical ValidateTxnLocked path: a stolen/invented id cannot ride into a transaction
 got="$(ask "@txnq:deadbeefdeadbeefdeadbeefdeadbeef:SELECT 1")"

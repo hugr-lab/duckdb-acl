@@ -22,6 +22,7 @@
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_type_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
@@ -31,6 +32,7 @@
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
+#include "duckdb/parser/statement/multi_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/set_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
@@ -38,6 +40,7 @@
 #include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/parser/tableref/showref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -204,10 +207,58 @@ public:
 			// work without them - a quack client sends one before it reads anything - and refusing them
 			// left a served connection unable to load its own catalog (spec 041).
 			break;
+		case StatementType::MULTI_STATEMENT:
+			RewriteMultiStatement(stmt.Cast<MultiStatement>());
+			break;
 		default:
 			Deny(Reason::STATEMENT_TYPE,
 			     "statement type " + StatementTypeToString(stmt.type) + " is not permitted under ACL");
 		}
+	}
+
+	//! `PIVOT source ON col USING agg` with no IN list arrives as a MultiStatement (spec 075): duckdb's
+	//! parser discovers the column set from the data first, so it emits one `CREATE TEMP TYPE
+	//! __pivot_enum_<uuid> AS ENUM (SELECT DISTINCT col FROM source ...)` per pivot column and then the
+	//! SELECT whose PivotRef names the enum. The enum query reads the source, so it is rewritten like any
+	//! read: under RLS the enum holds the principal's slice, and a value only a hidden row carries never
+	//! becomes a column. Nothing else that arrives as a MultiStatement is admitted - ALTER's forms are
+	//! refused by the per-statement dispatch, and a CREATE TYPE written by hand is refused there too.
+	void RewriteMultiStatement(MultiStatement &multi) {
+		if (multi.statements.empty() || multi.statements.back()->type != StatementType::SELECT_STATEMENT) {
+			Deny(Reason::STATEMENT_TYPE, "statement type MULTI is not permitted under ACL");
+		}
+		for (idx_t i = 0; i + 1 < multi.statements.size(); i++) {
+			auto &sub = *multi.statements[i];
+			if (!IsPivotEnumCreate(sub)) {
+				Deny(Reason::STATEMENT_TYPE,
+				     "statement type " + StatementTypeToString(sub.type) + " is not permitted under ACL");
+			}
+			auto &info = sub.Cast<CreateStatement>().info->Cast<CreateTypeInfo>();
+			RewriteQueryNode(*info.query->Cast<SelectStatement>().node);
+		}
+		RewriteStatement(*multi.statements.back());
+		if (trail) {
+			trail->statement = "pivot"; // what the principal wrote, not the shape the parser gave it
+		}
+	}
+
+	//! The enum step of a parser-generated PIVOT, and only that: a temporary type named by the parser,
+	//! unqualified, defined by a query. A CREATE TYPE spelled by a principal never comes through here.
+	bool IsPivotEnumCreate(const SQLStatement &stmt) {
+		if (stmt.type != StatementType::CREATE_STATEMENT) {
+			return false;
+		}
+		auto &create = stmt.Cast<CreateStatement>();
+		if (!create.info || create.info->type != CatalogType::TYPE_ENTRY || !create.info->temporary) {
+			return false;
+		}
+		auto &info = create.info->Cast<CreateTypeInfo>();
+		auto &qualified = info.GetQualifiedName();
+		if (!qualified.Catalog().empty() || !qualified.Schema().empty()) {
+			return false;
+		}
+		return StringUtil::StartsWith(qualified.Name().GetIdentifierName(), "__pivot_enum_") && info.query &&
+		       info.query->type == StatementType::SELECT_STATEMENT && info.query->Cast<SelectStatement>().node;
 	}
 
 	//! A PRAGMA that asks what is here is the question SHOW asks in an older spelling, and it is what a
@@ -1092,6 +1143,30 @@ private:
 		case TableReferenceType::SHOW_REF:
 			RewriteShowRef(ref);
 			break;
+		case TableReferenceType::PIVOT: {
+			// PIVOT / UNPIVOT (spec 075): the source is a relation like any other - resolved, confined,
+			// masked - and everything the pivot computes over it is an expression like any other: the
+			// USING aggregates, the ON expressions, an IN list's entries and an IN (SELECT ...) subquery
+			// all go through the gate. The names (groups, unpivot names) bind against the rewritten
+			// source, so a column the grant hides is not there to pivot on.
+			auto &pivot = ref->Cast<PivotRef>();
+			RewriteTableRef(pivot.source);
+			for (auto &aggregate : pivot.aggregates) {
+				RewriteExpr(aggregate);
+			}
+			for (auto &column : pivot.pivots) {
+				for (auto &expr : column.pivot_expressions) {
+					RewriteExpr(expr);
+				}
+				for (auto &entry : column.entries) {
+					RewriteExpr(entry.expr);
+				}
+				if (column.subquery) {
+					RewriteQueryNode(*column.subquery);
+				}
+			}
+			break;
+		}
 		case TableReferenceType::EMPTY_FROM:
 			break;
 		case TableReferenceType::EXPRESSION_LIST: {
