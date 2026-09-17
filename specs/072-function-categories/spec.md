@@ -1,6 +1,6 @@
 # Spec 072: function categories - what a principal may call
 
-- **Status**: implemented - slices 1-3 (2026-09-18: the model, the seed, the gate; the management syntax; the function-driver slots); slice 4 (docs pass) open
+- **Status**: implemented (2026-09-18, four slices: the model, the seed and the gate - #136; the management syntax - #137; the function-driver slots - #138; the docs pass)
 - **Date**: 2026-09-18
 - **Author**: hugr lab
 

@@ -352,7 +352,7 @@ instance is open (`store.DoorOpen()`), any unprefixed statement that *calls* `ac
 `scan_data_from_quack_client` is either rewritten under the principal recovered from the stream id
 (`connection_id:uuid` → session → principal) or refused: "The refusal is the default and the rewrite
 is the exception". The recovered principal carries `ingest_stream` set to that exact id, so the
-denylisted scan passes "for that principal and nothing else". With no door open the fence is off -
+never-set scan passes "for that principal and nothing else". With no door open the fence is off -
 a stock quack's own ingest "is its own business".
 
 **The Flight ingest** (spec 049): the door composes `INSERT … SELECT … FROM arrow_scan($1,$2,$3)`
