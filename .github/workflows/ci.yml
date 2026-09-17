@@ -49,9 +49,11 @@ jobs:
       # the embedded quack server's acl_-renamed TUs are generated from the submodule by sync.py
       # (spec 063); a submodule bump without regeneration, or a hand edit of a generated file, is
       # drift this catches. Only the quack submodule itself is needed - not its nested duckdb.
+      # sync.py copies from the quack submodule with duckdb's own quack patches applied, so the
+      # duckdb submodule has to be there too (shallow: the patches are all it reads)
       - name: Generated quack embed sources are current
         run: |
-          git submodule update --init --depth 1 third_party/quack
+          git submodule update --init --depth 1 third_party/quack duckdb
           python3 src/quack_embed/sync.py
           git diff --exit-code -- src/quack_embed/
 

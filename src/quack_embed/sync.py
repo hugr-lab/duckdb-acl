@@ -191,9 +191,13 @@ BANNER = (
 
 def patched_source() -> pathlib.Path:
     """A scratch copy of the submodule's `src` with duckdb's quack patches applied (the caller removes it)."""
+    patches = sorted(DUCKDB_PATCHES.glob("*.patch"))
+    if not patches:
+        # a copy made without them would compile against the wrong duckdb and pass the sync
+        sys.exit(f"SYNC FAILED: no quack patches under {DUCKDB_PATCHES} - is the duckdb submodule checked out?")
     scratch = pathlib.Path(tempfile.mkdtemp(prefix="acl-quack-sync-"))
     shutil.copytree(SUB, scratch / "src")
-    for patch in sorted(DUCKDB_PATCHES.glob("*.patch")):
+    for patch in patches:
         subprocess.run(["patch", "-p1", "-s", "-N", "-d", str(scratch), "-i", str(patch)], check=True)
         print(f"applied {patch.relative_to(ROOT)}")
     return scratch / "src"
