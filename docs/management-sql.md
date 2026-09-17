@@ -64,14 +64,18 @@ SELECT acl_use_db('aclcat');                 -- read policy from the ATTACHed da
 SELECT acl_use_db('aclcat', 'acl', true);    -- init := true creates/migrates the managed schema first
 SELECT acl_use_functions('{"policy_version": "pol_version", "role_catalogs": "pol_role_catalogs",
   "relations": "pol_relations", "relation_columns": "pol_columns", "schema_aliases": "pol_aliases",
-  "functions": "pol_functions", "function_gate": "pol_gate", "role_claims": "pol_claims"}');
+  "functions": "pol_functions", "role_claims": "pol_claims",
+  "function_categories": "pol_fcats", "function_category_members": "pol_fmembers", "function_grants": "pol_fgrants"}');
 ```
 
 - `acl_use_db(db[, schema[, init]])` - `schema` defaults to `acl`; `init` defaults to false. A
   catalog whose `schema_version` does not match the build is refused by name.
 - `acl_use_functions(slot_map_json)` - the six slots `policy_version`, `role_catalogs`, `relations`,
   `relation_columns`, `schema_aliases`, `functions` are required; every named function must be a
-  registered table function. The two sources are exclusive: the last call wins.
+  registered table function. The two sources are exclusive: the last call wins. The three function
+  category slots (spec 072) - `function_categories()`, `function_category_members()`,
+  `function_grants()`, listings with no arguments and the columns the tables have - are declared
+  together or not at all; without them the shipped seed decides what a principal may call.
 - Both refuse while `allow_parser_override_extension` is `DEFAULT`, because nothing would be enforced.
 
 ## Virtual catalogs

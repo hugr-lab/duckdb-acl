@@ -1,6 +1,6 @@
 # Spec 072: function categories - what a principal may call
 
-- **Status**: implemented - slices 1-2 (2026-09-18: the model, the seed, the gate; the management syntax); slices 3-4 open
+- **Status**: implemented - slices 1-3 (2026-09-18: the model, the seed, the gate; the management syntax; the function-driver slots); slice 4 (docs pass) open
 - **Date**: 2026-09-18
 - **Author**: hugr lab
 
@@ -349,6 +349,20 @@ proves a migrated catalog and a fresh one have the same shape (spec 034).
   a builtin, an admin's macro and an operator, the write-time check and the explicit-kind escape,
   the never set in every form, `DROP … IF EXISTS`, duckdb's `CREATE FUNCTION` staying native, the
   scope).
+
+## Implementation notes (slice 3, 2026-09-18)
+
+- The function-driver source (spec 008) reads its categories from three slots -
+  `function_categories()`, `function_category_members()`, `function_grants()` - each a listing with
+  no arguments and the columns the tables have. Not the keyed lookups the draft named: the model is
+  built once per policy version from the whole set, so a keyed contract would have bought nothing
+  and cost a source call per name. `CatalogBackend::FunctionModel` builds from the slots exactly as
+  from the tables; the slots are declared together or not at all (`acl_use_functions` refuses a
+  partial set at enable - members without grants would read as "nothing granted"), and a source
+  without them reads as the seed. The pre-072 `function_gate` slot is not read.
+- `acl_functions_driver.test` covers the partial map, a source whose own categories decide (a builtin
+  the source never listed is refused, seed or not), a deny by name from the source, and the listings
+  answering from the source's rows.
 
 ## Implementation plan (for agreement)
 
