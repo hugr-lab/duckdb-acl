@@ -4,6 +4,8 @@
 #include "acl_rewriter.hpp"
 #include "acl_token.hpp"
 #include "duckdb/common/error_data.hpp"
+
+#include <algorithm>
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -1289,7 +1291,31 @@ FunctionDecision PolicyStore::ResolveFunction(const Principal &principal, const 
 	// addendum), a scanner's SQL under the node's credentials - each refused ahead of the data, so no
 	// grant can re-open one.
 	auto model = FunctionModel();
-	return model->Resolve(principal.roles, name, kind);
+	// the cache key: the roles (sorted, so two orderings are one principal), the name as written and
+	// the kind. The verdict for one principal and one spelling never changes under one model.
+	auto roles = principal.roles;
+	std::sort(roles.begin(), roles.end());
+	string cache_key = StringUtil::Join(roles, "\x1e") + "\x1f" + name.ToString() + "\x1f" + FunctionKindName(kind);
+	{
+		lock_guard<mutex> guard(lock);
+		if (function_decisions.model == model) {
+			auto entry = function_decisions.decisions.find(cache_key);
+			if (entry != function_decisions.decisions.end()) {
+				return entry->second;
+			}
+		}
+	}
+	auto decision = model->Resolve(principal.roles, name, kind);
+	lock_guard<mutex> guard(lock);
+	if (function_decisions.model != model) {
+		function_decisions.model = model;
+		function_decisions.decisions.clear();
+	}
+	if (function_decisions.decisions.size() >= FunctionDecisionCache::CAPACITY) {
+		function_decisions.decisions.clear();
+	}
+	function_decisions.decisions[cache_key] = decision;
+	return decision;
 }
 
 bool PolicyStore::Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space,

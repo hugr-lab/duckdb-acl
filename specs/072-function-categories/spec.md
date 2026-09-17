@@ -1,6 +1,6 @@
 # Spec 072: function categories - what a principal may call
 
-- **Status**: implemented - slice 1 (2026-09-18: the model, the seed, the gate); slices 2-4 open
+- **Status**: implemented - slices 1-2 (2026-09-18: the model, the seed, the gate; the management syntax); slices 3-4 open
 - **Date**: 2026-09-18
 - **Author**: hugr lab
 
@@ -325,6 +325,30 @@ proves a migrated catalog and a fresh one have the same shape (spec 034).
   `uncategorized AND present` count, which is 0 for this build. The existing suite needed two
   changes: the never set refused where an allow is written (`acl_serialized_sql_gate.test`), and a
   function-driver source without the slots deciding by the seed (`acl_functions_driver.test`).
+
+## Implementation notes (slice 2, 2026-09-18)
+
+- The management grammar (`acl_admin_sql.cpp`): `CREATE FUNCTION CATEGORY c [COMMENT '…']`, `ALTER
+  FUNCTION CATEGORY c ADD (…) | DROP (…)`, `DROP FUNCTION CATEGORY [IF EXISTS] c`, `GRANT | DENY |
+  REVOKE FUNCTION [CATEGORY] … TO | FROM ROLE r | ALL ROLES` - each compiled into the slice-1 admin
+  functions. `DENY` is a new first keyword (duckdb has none); `CREATE/ALTER/DROP FUNCTION CATEGORY` is
+  told apart from duckdb's own `CREATE FUNCTION` (a macro) by the third word, so `ACL ADMIN CREATE
+  FUNCTION f(x) AS …` stays native. A function spec is a dotted name or a double-quoted operator with
+  an optional `TABLE`/`SCALAR`, passed to the admin function as written. Every one is "not
+  catalog-specific" in `ProvenanceOf`: a catalog-scoped manage is refused.
+- The write-time check (`RequireFunctionOnNode`): a member or an admitting grant names a function this
+  node has - read off `duckdb_functions()` on a connection of its own, with the calls in the check
+  query qualified (`system.main.lower`), since an admin's macro named `lower` in the default catalog
+  answered the first version of it. Skipped when the kind was written explicitly; a deny or a revoke
+  never checks.
+- The per-role decision cache the owner asked for: `PolicyStore::ResolveFunction` caches the verdict
+  per sorted role set, name as written and kind, against the model it was made with (4096 entries,
+  cleared when the model swaps or the cap is hit). The model itself was already one lookup; this
+  skips even that.
+- Tests: `acl_function_syntax.test` (every form, `ALL ROLES`, a deny and a revoke, grants by name on
+  a builtin, an admin's macro and an operator, the write-time check and the explicit-kind escape,
+  the never set in every form, `DROP … IF EXISTS`, duckdb's `CREATE FUNCTION` staying native, the
+  scope).
 
 ## Implementation plan (for agreement)
 

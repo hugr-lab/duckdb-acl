@@ -414,6 +414,12 @@ bool IsMgmtStart(const string &text) {
 	    StringUtil::CIEquals(first, "revoke") || StringUtil::CIEquals(first, "map")) {
 		return true;
 	}
+	if (StringUtil::CIEquals(first, "deny")) {
+		// DENY FUNCTION [CATEGORY] … (spec 072): duckdb has no DENY at all
+		AdminScanner ahead(text);
+		ahead.Word("keyword");
+		return StringUtil::CIEquals(ahead.PeekWord(), "function");
+	}
 	if (StringUtil::CIEquals(first, "check") || StringUtil::CIEquals(first, "repair")) {
 		// CHECK VIRTUAL CATALOG / REPAIR VIRTUAL TABLE (spec 039): ours always name a VIRTUAL target
 		AdminScanner ahead(text);
@@ -435,6 +441,15 @@ bool IsMgmtStart(const string &text) {
 		AdminScanner ahead(text);
 		ahead.Word("keyword");
 		auto second = ahead.PeekWord();
+		// CREATE/ALTER/DROP FUNCTION CATEGORY (spec 072): duckdb's CREATE FUNCTION is a macro, so the
+		// third word is what tells ours apart
+		auto function_category = [&]() {
+			if (!StringUtil::CIEquals(second, "function")) {
+				return false;
+			}
+			ahead.Word("function");
+			return StringUtil::CIEquals(ahead.PeekWord(), "category");
+		};
 		if (StringUtil::CIEquals(first, "create")) {
 			if (StringUtil::CIEquals(second, "or")) {
 				// CREATE OR REPLACE VIRTUAL … - look past the modifier for the marker
@@ -443,18 +458,19 @@ bool IsMgmtStart(const string &text) {
 				second = ahead.PeekWord();
 			}
 			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
-			       StringUtil::CIEquals(second, "issuer");
+			       StringUtil::CIEquals(second, "issuer") || function_category();
 		}
 		if (StringUtil::CIEquals(first, "alter")) {
 			// duckdb owns ALTER TABLE/VIEW/...: our object forms carry the VIRTUAL marker, and
 			// ALTER ROLE/ISSUER/GRANT do not exist in duckdb at all
 			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
-			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "grant");
+			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "grant") ||
+			       function_category();
 		}
 		// DROP: our own forms carry VIRTUAL, and duckdb has no DROP ROLE/ISSUER/MAP/RELATION
 		return StringUtil::CIEquals(second, "relation") || StringUtil::CIEquals(second, "virtual") ||
 		       StringUtil::CIEquals(second, "role") || StringUtil::CIEquals(second, "issuer") ||
-		       StringUtil::CIEquals(second, "map") || StringUtil::CIEquals(second, "reference");
+		       StringUtil::CIEquals(second, "map") || StringUtil::CIEquals(second, "reference") || function_category();
 	}
 	return false;
 }
@@ -674,8 +690,52 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 	                                          Value(comment), Value(mode), Value(pk)});
 }
 
+//! spec 072: a function as a grant or a member names it - `read_parquet`, `lake.main.peek`, a
+//! double-quoted operator (`"+"`, `"IS DISTINCT FROM"`) - optionally followed by TABLE (or SCALAR,
+//! the default); the text goes to the admin function as one spec, which parses it once more with
+//! the same rules the function form takes
+string FunctionSpecText(AdminScanner &s) {
+	string spec;
+	s.Skip();
+	if (s.pos < s.text.size() && s.text[s.pos] == '"') {
+		spec = "\"" + s.Quoted("a function name") + "\"";
+	} else {
+		spec = s.Dotted("a function name");
+	}
+	if (s.Accept("table")) {
+		spec += " TABLE";
+	} else if (s.Accept("scalar")) {
+		spec += " SCALAR";
+	}
+	return spec;
+}
+
+//! `TO|FROM ROLE r` names the role, `TO|FROM ALL ROLES` is the role '' - every role's
+string RoleOrAllRoles(AdminScanner &s, const char *preposition) {
+	s.Expect(preposition);
+	if (s.Accept("all")) {
+		s.Expect("roles");
+		return string();
+	}
+	s.Expect("role");
+	return s.Word("a role name");
+}
+
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	auto keyword = s.Word("a management keyword");
+	if (StringUtil::CIEquals(keyword, "deny")) {
+		// DENY FUNCTION CATEGORY c TO ROLE r | ALL ROLES; DENY FUNCTION f [TABLE] TO ROLE r | ALL ROLES
+		// (spec 072): a grant row with allowed = false, which wins over every grant
+		s.Expect("function");
+		if (s.Accept("category")) {
+			auto category = s.Word("a category name");
+			auto role = RoleOrAllRoles(s, "to");
+			return MakeAdminCall("acl_grant_function_category", {Value(role), Value(category), Value("false")});
+		}
+		auto spec = FunctionSpecText(s);
+		auto role = RoleOrAllRoles(s, "to");
+		return MakeAdminCall("acl_grant_function", {Value(role), Value(spec), Value("false")});
+	}
 	if (StringUtil::CIEquals(keyword, "create")) {
 		// what the statement promises about an existing object: CREATE refuses to overwrite one,
 		// OR REPLACE overwrites, IF NOT EXISTS keeps it (spec 013). The legacy ADD forms upsert.
@@ -701,6 +761,17 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 				claims = s.AtParen() ? ClaimsListToCsv(s.Parens()) : s.Quoted("claims list");
 			}
 			return MakeAdminCall("acl_define_role", {Value(role), Value(claims), Value(mode)});
+		}
+		if (s.Accept("function")) {
+			// CREATE FUNCTION CATEGORY c [COMMENT '…'] (spec 072): the operator's own category; a
+			// re-create keeps the members and grants and takes the new comment
+			s.Expect("category");
+			auto category = s.Word("a category name");
+			string comment;
+			if (s.Accept("comment")) {
+				comment = s.Quoted("comment");
+			}
+			return MakeAdminCall("acl_create_function_category", {Value(category), Value(comment)});
 		}
 		s.Expect("issuer");
 		auto issuer = s.Quoted("issuer");
@@ -829,6 +900,18 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			auto role = s.Word("a role name");
 			return MakeAdminCall("acl_grant_admin", {Value(role), Value(scope)});
 		}
+		if (s.Accept("function")) {
+			// GRANT FUNCTION CATEGORY c TO ROLE r | ALL ROLES; GRANT FUNCTION f [TABLE] TO ROLE r | ALL
+			// ROLES (spec 072) - a grant by name admits the key whatever its categories
+			if (s.Accept("category")) {
+				auto category = s.Word("a category name");
+				auto role = RoleOrAllRoles(s, "to");
+				return MakeAdminCall("acl_grant_function_category", {Value(role), Value(category), Value("true")});
+			}
+			auto spec = FunctionSpecText(s);
+			auto role = RoleOrAllRoles(s, "to");
+			return MakeAdminCall("acl_grant_function", {Value(role), Value(spec), Value("true")});
+		}
 		// GRANT SCHEMA v.path TO ROLE r WITH (…) [COMMENT '…'] - the middle level (spec 015)
 		if (s.Accept("schema")) {
 			string vcat, path;
@@ -895,6 +978,18 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			s.Expect("role");
 			return MakeAdminCall("acl_revoke_schema", {Value(s.Word("a role name")), Value(vcat), Value(path)});
 		}
+		if (s.Accept("function")) {
+			// REVOKE FUNCTION CATEGORY c FROM ROLE r | ALL ROLES; REVOKE FUNCTION f [TABLE] FROM ROLE r |
+			// ALL ROLES (spec 072): the row goes, grant or deny alike
+			if (s.Accept("category")) {
+				auto category = s.Word("a category name");
+				auto role = RoleOrAllRoles(s, "from");
+				return MakeAdminCall("acl_revoke_function_category", {Value(role), Value(category)});
+			}
+			auto spec = FunctionSpecText(s);
+			auto role = RoleOrAllRoles(s, "from");
+			return MakeAdminCall("acl_revoke_function", {Value(role), Value(spec)});
+		}
 		s.Expect("catalog");
 		auto vcat = s.Word("a catalog name");
 		s.Expect("from");
@@ -918,6 +1013,23 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		                     {Value(issuer), Value(is_group ? "group" : "claim-value"), Value(external), Value(role)});
 	}
 	if (StringUtil::CIEquals(keyword, "alter")) {
+		if (s.Accept("function")) {
+			// ALTER FUNCTION CATEGORY c ADD (f [TABLE], db.schema.f TABLE, "+") | DROP (…) (spec 072):
+			// the list goes to the admin function as written, which parses each spec
+			s.Expect("category");
+			auto category = s.Word("a category name");
+			bool add = s.Accept("add");
+			if (!add) {
+				s.Expect("drop");
+			}
+			auto members = s.Parens();
+			if (members.empty()) {
+				throw BinderException("acl admin: ALTER FUNCTION CATEGORY %s the members in parentheses",
+				                      add ? "ADD takes" : "DROP takes");
+			}
+			return MakeAdminCall(add ? "acl_function_category_add" : "acl_function_category_remove",
+			                     {Value(category), Value(members)});
+		}
 		if (s.Accept("role")) { // ALTER ROLE r SET CLAIMS (...) | '...'
 			auto role = s.Word("a role name");
 			s.Expect("set");
@@ -1136,6 +1248,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname), Value(mode)});
 		}
+		if (s.Accept("function")) {
+			// DROP FUNCTION CATEGORY [IF EXISTS] c (spec 072): the members and every grant on it go too
+			s.Expect("category");
+			if_exists(s);
+			return MakeAdminCall("acl_drop_function_category", {Value(s.Word("a category name")), Value(mode)});
+		}
 		if (s.Accept("reference")) {
 			if_exists(s);
 			string vcat, name;
@@ -1222,18 +1340,52 @@ struct MgmtProvenance {
 MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	// name -> index of the constant argument holding the catalog; -1 = none
 	static const std::unordered_map<string, int> CATALOG_ARG = {
-	    {"acl_create_catalog", 0},   {"acl_add_relation", 0},       {"acl_add_view", 0},
-	    {"acl_add_schema_alias", 0}, {"acl_add_table_function", 0}, {"acl_add_table_function_alias", 0},
-	    {"acl_add_scalar", 0},       {"acl_add_scalar_alias", 0},   {"acl_drop_relation", 0},
-	    {"acl_grant_catalog", 1},    {"acl_revoke_catalog", 1},     {"acl_grant_object", 1},
-	    {"acl_define_role", -1},     {"acl_define_issuer", -1},     {"acl_map_role", -1},
-	    {"acl_alter_relation", 0},   {"acl_alter_schema_alias", 0}, {"acl_alter_function", 0},
-	    {"acl_alter_catalog", 0},    {"acl_alter_grant", 1},        {"acl_alter_role", -1},
-	    {"acl_alter_issuer", -1},    {"acl_drop_schema_alias", 0},  {"acl_drop_function", 0},
-	    {"acl_drop_role", -1},       {"acl_drop_issuer", -1},       {"acl_drop_role_mapping", -1},
-	    {"acl_comment", 0},          {"acl_refresh_schema", 0},     {"acl_check_catalog", 0},
-	    {"acl_repair_relation", 0},  {"acl_expand_schema", 0},      {"acl_refresh_schema_objects", 0},
-	    {"acl_grant_schema", 1},     {"acl_revoke_schema", 1},      {"acl_rematerialize_schema_caps", 0},
+	    {"acl_create_catalog", 0},
+	    {"acl_add_relation", 0},
+	    {"acl_add_view", 0},
+	    {"acl_add_schema_alias", 0},
+	    {"acl_add_table_function", 0},
+	    {"acl_add_table_function_alias", 0},
+	    {"acl_add_scalar", 0},
+	    {"acl_add_scalar_alias", 0},
+	    {"acl_drop_relation", 0},
+	    {"acl_grant_catalog", 1},
+	    {"acl_revoke_catalog", 1},
+	    {"acl_grant_object", 1},
+	    {"acl_define_role", -1},
+	    {"acl_define_issuer", -1},
+	    {"acl_map_role", -1},
+	    {"acl_alter_relation", 0},
+	    {"acl_alter_schema_alias", 0},
+	    {"acl_alter_function", 0},
+	    {"acl_alter_catalog", 0},
+	    {"acl_alter_grant", 1},
+	    {"acl_alter_role", -1},
+	    {"acl_alter_issuer", -1},
+	    {"acl_drop_schema_alias", 0},
+	    {"acl_drop_function", 0},
+	    {"acl_drop_role", -1},
+	    {"acl_drop_issuer", -1},
+	    {"acl_drop_role_mapping", -1},
+	    {"acl_comment", 0},
+	    {"acl_refresh_schema", 0},
+	    {"acl_check_catalog", 0},
+	    {"acl_repair_relation", 0},
+	    {"acl_expand_schema", 0},
+	    {"acl_refresh_schema_objects", 0},
+	    {"acl_grant_schema", 1},
+	    {"acl_revoke_schema", 1},
+	    {"acl_rematerialize_schema_caps", 0},
+	    // spec 072: a category acts in every catalog a role holds, so none of these is catalog-specific -
+	    // an unrestricted manage scope, never a catalog-scoped one
+	    {"acl_create_function_category", -1},
+	    {"acl_drop_function_category", -1},
+	    {"acl_function_category_add", -1},
+	    {"acl_function_category_remove", -1},
+	    {"acl_grant_function_category", -1},
+	    {"acl_revoke_function_category", -1},
+	    {"acl_grant_function", -1},
+	    {"acl_revoke_function", -1},
 	};
 	MgmtProvenance provenance;
 	auto &select = statement.Cast<SelectStatement>().node->Cast<SelectNode>();
