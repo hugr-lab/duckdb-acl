@@ -151,6 +151,10 @@ surface, and this gate is a denylist - so its failure mode is the thing nobody n
 - The walker visits every position an expression can sit in - `VALUES` rows included, in FROM and in
   INSERT - so the function gate and the unknown-object refusal hold there as in a select list
   (`test/sql/acl_expression_positions.test`, spec 052 addendum 2026-09-17).
+- `PIVOT` / `UNPIVOT` go through the same gate (spec 075): the source is resolved and confined like any
+  relation, the aggregates and pivot expressions are gated, and the implicit form's column discovery
+  (the parser's `CREATE TEMP TYPE ... AS ENUM (SELECT DISTINCT ...)`) runs under the same RLS, so a
+  value only a hidden row carries never becomes a column (`test/sql/acl_pivot.test`).
 - A grant's projection is probed where it is written and stored in `grant_columns`, "so
   `information_schema.columns` describes what the role reads" (spec 026). `duckdb_tables().sql` is
   never NULL and `is_insertable_into` "follows the grant, not the physical row" (spec 065,

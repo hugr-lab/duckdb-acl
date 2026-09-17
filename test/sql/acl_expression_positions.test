@@ -267,16 +267,26 @@ ACL ROLE "w" INSERT INTO notes SELECT 12, getvariable('secret_var');
 ----
 <REGEX>:.*is not allowed.*
 
-# PIVOT / UNPIVOT are refused as forms, so their expressions never reach a gate to bypass
+# PIVOT / UNPIVOT (spec 075): the aggregates and the ON expressions are positions like any other
 statement error
 ACL ROLE "w" PIVOT notes ON v USING max(getvariable('secret_var'));
 ----
-<REGEX>:.*not permitted under ACL.*
+<REGEX>:.*is not allowed.*
 
 statement error
-ACL ROLE "w" UNPIVOT notes ON v INTO NAME k VALUE val;
+ACL ROLE "w" PIVOT notes ON v || getvariable('secret_var') USING count(*);
 ----
-<REGEX>:.*not permitted under ACL.*
+<REGEX>:.*is not allowed.*
+
+statement error
+ACL ROLE "w" SELECT * FROM notes PIVOT (max(getvariable('secret_var')) FOR v IN ('one'));
+----
+<REGEX>:.*is not allowed.*
+
+query III
+ACL ROLE "w" UNPIVOT notes ON v INTO NAME k VALUE val ORDER BY n LIMIT 1;
+----
+1	v	one
 
 # the rows are what they were: the refusals wrote nothing
 query II
