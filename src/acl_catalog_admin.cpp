@@ -1662,15 +1662,107 @@ void PolicyStore::CatalogDefineRole(const string &role, const case_insensitive_m
 	catalog->Write(statements);
 }
 
-void PolicyStore::CatalogSetFunctionGate(const string &name, bool allowed, bool remove) {
-	RequireCatalog(catalog, "acl_deny_function/acl_allow_function");
-	vector<string> statements = {"DELETE FROM " + catalog->Tbl("function_gate") +
-	                             " WHERE \"role\" = '' AND \"name\" = " + Lit(StringUtil::Lower(name))};
-	if (!remove) {
-		statements.push_back("INSERT INTO " + catalog->Tbl("function_gate") + " VALUES ('', " +
-		                     Lit(StringUtil::Lower(name)) + ", '', " + (allowed ? "true" : "false") + ")");
+// spec 072: the function categories' writers. A key is stored lowercased throughout - function,
+// schema and catalog names compare case-insensitively in duckdb, and the table's primary key does not,
+// so `SYSTEM.main.x` and `system.main.x` must be one row.
+namespace {
+
+string KeyWhere(const FunctionKey &key) {
+	return " \"database\" = " + Lit(StringUtil::Lower(key.database)) +
+	       " AND \"schema\" = " + Lit(StringUtil::Lower(key.schema)) +
+	       " AND \"name\" = " + Lit(StringUtil::Lower(key.name)) + " AND \"kind\" = " + Lit(FunctionKindName(key.kind));
+}
+
+string KeyValues(const FunctionKey &key) {
+	return Lit(StringUtil::Lower(key.database)) + ", " + Lit(StringUtil::Lower(key.schema)) + ", " +
+	       Lit(StringUtil::Lower(key.name)) + ", " + Lit(FunctionKindName(key.kind));
+}
+
+} // namespace
+
+void PolicyStore::CatalogCreateFunctionCategory(const string &name, const string &comment) {
+	RequireCatalog(catalog, "acl_create_function_category");
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto exists =
+		    read("SELECT 1 FROM " + catalog->Tbl("function_categories") + " WHERE \"category\" = " + Lit(name));
+		if (exists->RowCount() > 0) {
+			// the comment is the one thing a re-create may change; the members and grants stay
+			statements.push_back("UPDATE " + catalog->Tbl("function_categories") +
+			                     " SET \"comment\" = " + Lit(comment) + " WHERE \"category\" = " + Lit(name));
+			return;
+		}
+		statements.push_back("INSERT INTO " + catalog->Tbl("function_categories") + " VALUES (" + Lit(name) + ", " +
+		                     Lit(comment) + ", false)");
+	});
+}
+
+void PolicyStore::CatalogDropFunctionCategory(const string &name) {
+	RequireCatalog(catalog, "acl_drop_function_category");
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto exists =
+		    read("SELECT 1 FROM " + catalog->Tbl("function_categories") + " WHERE \"category\" = " + Lit(name));
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: function category \"%s\" does not exist", name);
+		}
+		// its members and every grant on it go with it: a grant on a category that is gone would be a
+		// row nothing reads, and a member of it a key nobody could reach through it
+		statements.push_back("DELETE FROM " + catalog->Tbl("function_grants") + " WHERE \"category\" = " + Lit(name));
+		statements.push_back("DELETE FROM " + catalog->Tbl("function_category_members") +
+		                     " WHERE \"category\" = " + Lit(name));
+		statements.push_back("DELETE FROM " + catalog->Tbl("function_categories") +
+		                     " WHERE \"category\" = " + Lit(name));
+	});
+}
+
+void PolicyStore::CatalogFunctionCategoryMembers(const string &name, const vector<FunctionKey> &keys, bool add) {
+	RequireCatalog(catalog, add ? "acl_function_category_add" : "acl_function_category_remove");
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		auto exists =
+		    read("SELECT 1 FROM " + catalog->Tbl("function_categories") + " WHERE \"category\" = " + Lit(name));
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: function category \"%s\" does not exist", name);
+		}
+		for (auto &key : keys) {
+			statements.push_back("DELETE FROM " + catalog->Tbl("function_category_members") +
+			                     " WHERE \"category\" = " + Lit(name) + " AND" + KeyWhere(key));
+			if (add) {
+				statements.push_back("INSERT INTO " + catalog->Tbl("function_category_members") + " VALUES (" +
+				                     Lit(name) + ", " + KeyValues(key) + ")");
+			}
+		}
+	});
+}
+
+void PolicyStore::CatalogWriteFunctionGrant(const string &role, const string &category,
+                                            optional_ptr<const FunctionKey> key, bool allowed, bool remove) {
+	RequireCatalog(catalog, "acl_grant_function");
+	string where = " WHERE \"role\" = " + Lit(role) + " AND \"category\" = " + Lit(category) + " AND";
+	string values = Lit(role) + ", " + Lit(category) + ", ";
+	if (key) {
+		where += KeyWhere(*key);
+		values += KeyValues(*key);
+	} else {
+		where += " \"database\" = '' AND \"schema\" = '' AND \"name\" = '' AND \"kind\" = ''";
+		values += "'', '', '', ''";
 	}
-	catalog->Write(statements);
+	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
+	                            vector<string> &statements) {
+		if (!category.empty() && !remove) {
+			auto exists =
+			    read("SELECT 1 FROM " + catalog->Tbl("function_categories") + " WHERE \"category\" = " + Lit(category));
+			if (exists->RowCount() == 0) {
+				throw BinderException("acl admin: function category \"%s\" does not exist", category);
+			}
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("function_grants") + where);
+		if (!remove) {
+			statements.push_back("INSERT INTO " + catalog->Tbl("function_grants") + " VALUES (" + values + ", " +
+			                     (allowed ? "true" : "false") + ")");
+		}
+	});
 }
 
 namespace {

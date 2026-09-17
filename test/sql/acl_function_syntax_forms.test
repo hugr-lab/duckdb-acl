@@ -1,0 +1,154 @@
+# name: test/sql/acl_function_syntax_forms.test
+# description: ordinary SQL under the function categories (spec 072) - a principal holding only the
+#   auto categories runs every syntactic form the parser turns into a function call: operators, the
+#   names the parser rewrites syntax into, windows, lambdas, comprehensions, method calls, the
+#   pg-compatibility functions by bare name - and the result columns keep the names duckdb gives them
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t AS SELECT i AS n, 's' || i AS s, [i, i + 1] AS l, {'a': i} AS st FROM range(1, 4) r(i);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+# operators are functions to the parser: + - * / % || ~~ (LIKE) and the rest
+query IIIII
+ACL ROLE "analyst" SELECT n + 1, n * 2, s || '!', s LIKE 's%', n % 2 FROM t ORDER BY n LIMIT 1;
+----
+2	2	s1!	true	1
+
+# what the parser rewrites syntax into: count_star, list_value, struct_pack, date_part, factorial,
+# regexp_full_match (SIMILAR TO), list_apply (a comprehension), position
+query IIIIIII
+ACL ROLE "analyst" SELECT count(*), [1, 2], {'a': 1}, EXTRACT(year FROM DATE '2020-05-06'), 5!, 'ab' SIMILAR TO 'a.', POSITION('b' IN 'abc') FROM t;
+----
+3	[1, 2]	{'a': 1}	2020	120	true	2
+
+query I
+ACL ROLE "analyst" SELECT [v + 1 FOR v IN l] FROM t ORDER BY n LIMIT 1;
+----
+[2, 3]
+
+# windows, plain and with a frame; a window over an aggregate; a lambda; a nested lambda
+query IIII
+ACL ROLE "analyst" SELECT row_number() OVER (ORDER BY n), sum(n) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), lag(n) OVER (ORDER BY n), list_transform(l, lambda x: x * 2) FROM t ORDER BY n LIMIT 2;
+----
+1	1	NULL	[2, 4]
+2	3	1	[4, 6]
+
+query I
+ACL ROLE "analyst" SELECT list_filter(l, lambda x: list_contains([2, 3], x)) FROM t ORDER BY n LIMIT 1;
+----
+[2]
+
+# the method-call spelling, one and two qualifiers deep
+query II
+ACL ROLE "analyst" SELECT s.upper(), t.s.length() FROM t ORDER BY n LIMIT 1;
+----
+S1	2
+
+# struct and list access are operators, not calls; a struct field read is not a function either
+query III
+ACL ROLE "analyst" SELECT l[1], l[1:2], st.a FROM t ORDER BY n LIMIT 1;
+----
+1	[1, 2]	1
+
+# aggregates with modifiers: ORDER BY inside, FILTER, DISTINCT
+query III
+ACL ROLE "analyst" SELECT list(s ORDER BY n DESC), count(*) FILTER (WHERE n > 1), count(DISTINCT n % 2) FROM t;
+----
+[s3, s2, s1]	2	2
+
+# the pg-compatibility functions by their bare names: they live in system.pg_catalog
+query II
+ACL ROLE "analyst" SELECT pg_typeof(1), format_pg_type('INTEGER', 'x') IS NOT NULL;
+----
+integer	true
+
+# the identity functions and their keyword spellings, substituted ahead of the gate
+query IIII
+ACL ROLE "analyst" SELECT current_database(), current_schema(), current_catalog, current_schema;
+----
+c	main	c	main
+
+# the clocks are base (the date/time keywords resolve to them in the binder; icu adds `today` and
+# `current_date` to this build's loadable set, so the core clock stands in here)
+query I
+ACL ROLE "analyst" SELECT get_current_timestamp() IS NOT NULL;
+----
+true
+
+# the result columns keep the names duckdb gives them - the method-call spelling included, which
+# duckdb names as written - and the qualification is not in the header
+query I
+ACL ROLE "analyst" SELECT column_name FROM (DESCRIBE SELECT lower(s), n + 1, s.upper(), sum(n) OVER () FROM t);
+----
+lower(s)
+(n + 1)
+s.upper()
+sum(n) OVER ()
+
+query I
+ACL ROLE "analyst" SELECT column_name FROM (DESCRIBE SELECT count(*), max(s) FROM t);
+----
+count_star()
+max(s)
+
+# a table function in FROM, and a generator over a lambda-shaped argument
+query II
+ACL ROLE "analyst" SELECT count(*), max(range) FROM range(5);
+----
+5	4
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM generate_series(1, 3);
+----
+3
+
+query I
+ACL ROLE "analyst" SELECT * FROM unnest([1, 2]) ORDER BY 1 LIMIT 1;
+----
+1
+
+# a window function that is no aggregate, qualified like the rest, and NTILE with an argument
+query II
+ACL ROLE "analyst" SELECT ntile(2) OVER (ORDER BY n), first_value(s) OVER (ORDER BY n) FROM t ORDER BY n LIMIT 1;
+----
+1	s1
+
+# a window function denied for a role is refused where the window is
+statement ok
+SELECT acl_grant_function('analyst', 'row_number', 'false');
+
+statement error
+ACL ROLE "analyst" SELECT row_number() OVER () FROM t;
+----
+<REGEX>:.*row_number.*not allowed.*
+
+query I
+ACL ROLE "analyst" SELECT rank() OVER (ORDER BY n) FROM t LIMIT 1;
+----
+1

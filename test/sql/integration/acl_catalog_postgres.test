@@ -13,6 +13,11 @@ require-env ACL_PG_DSN
 statement ok
 ATTACH '${ACL_PG_DSN}' AS pg (TYPE postgres);
 
+# the container outlives a schema version (spec 034: an older catalog is migrated, never
+# re-initialised), and this test is about creating one through the scanner - so it starts from none
+statement ok
+DROP SCHEMA IF EXISTS pg.acl CASCADE;
+
 statement ok
 SET allow_parser_override_extension='fallback';
 

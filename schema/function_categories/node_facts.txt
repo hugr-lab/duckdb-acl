@@ -1,0 +1,13 @@
+duckdb_available_metrics TABLE
+duckdb_coordinate_systems TABLE
+duckdb_dialects TABLE
+duckdb_external_resource_types TABLE
+duckdb_grammar_extensions TABLE
+duckdb_keywords TABLE
+duckdb_optimizers TABLE
+duckdb_secret_type_parameters TABLE
+duckdb_secret_types TABLE
+pragma_collations TABLE
+pragma_platform TABLE
+pragma_user_agent TABLE
+pragma_version TABLE

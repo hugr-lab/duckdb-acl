@@ -47,12 +47,13 @@ ACL ROLE "r" PRAGMA json_execute_serialized_sql('{}');
 ----
 <REGEX>:.*PRAGMA.*not permitted.*
 
-# ahead of the catalog gate: an operator's allow row cannot re-open either one
-statement ok
+# ahead of the catalog gate: an operator's allow row cannot re-open the executor - since spec 072 the
+# never set is refused where the grant is written, and json_serialize_plan is the `plan` category,
+# granted to nobody here
+statement error
 SELECT acl_allow_function('json_execute_serialized_sql');
-
-statement ok
-SELECT acl_allow_function('json_serialize_plan');
+----
+<REGEX>:.*never callable.*
 
 statement error
 ACL ROLE "r" SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'));

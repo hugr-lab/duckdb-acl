@@ -1,0 +1,15 @@
+check_peg_parser TABLE
+generate_series TABLE
+range TABLE
+repeat TABLE
+repeat_row TABLE
+sql_tokenize TABLE
+summary TABLE
+test_all_types TABLE
+test_vector_types TABLE
+tpcds_answers TABLE
+tpcds_queries TABLE
+tpch_answers TABLE
+tpch_queries TABLE
+unnest TABLE
+unnest

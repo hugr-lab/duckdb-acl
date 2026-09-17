@@ -1,0 +1,9 @@
+murmurhash3_128
+murmurhash3_32
+murmurhash3_x64_128
+rapidhash
+xxh32
+xxh3_128
+xxh3_128_hex
+xxh3_64
+xxh64

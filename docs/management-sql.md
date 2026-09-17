@@ -803,7 +803,12 @@ catalog `default`, granted to the role as its main catalog.
 | `acl_grant_table_function_alias(role, vname, target)`           | **legacy**: table-function alias                                 |
 | `acl_grant_scalar(role, vname, expr_template)`                  | **legacy**: scalar macro                                         |
 | `acl_grant_scalar_alias(role, vname, target)`                   | **legacy**: scalar alias                                         |
-| `acl_deny_function(name)` / `acl_allow_function(name)`          | **legacy**: deny/allow a physical function by name (in memory without a source, a `function_gate` row with a catalog) |
+| `acl_deny_function(name)` / `acl_allow_function(name)`          | **legacy**: a grant by name to every role, denied or allowed, for both kinds (spec 072) |
+| `acl_create_function_category(name[, comment])` / `acl_drop_function_category(name)` | spec 072: a category of the operator's own; dropping one takes its members and grants with it |
+| `acl_function_category_add(category, members)` / `acl_function_category_remove(category, members)` | spec 072: members as a list or a csv of `[db.schema.]name [TABLE]` (default `system.main`, default scalar); the never set is refused |
+| `acl_grant_function_category(role, category[, allowed])` / `acl_revoke_function_category(role, category)` | spec 072: role `''` is every role; `allowed = 'false'` is a deny, which wins |
+| `acl_grant_function(role, spec[, allowed])` / `acl_revoke_function(role, spec)` | spec 072: a grant by name admits the key whatever its categories (an admin's macro: `'lake.main.peek TABLE'`); a deny by name refuses it whatever they grant |
+| `acl_function_status([role])` (table function) | spec 072: every function of the node with its categories and status (`never` / `categorized` / `uncategorized`), `present` for members this node has no function for; with a role, `allowed` and `decided_by` |
 
 **Doors and sessions** - registered alongside the admin functions; they are the operator's and the
 door's, never a principal's, and have no management-SQL form. `acl_flight_serve` / `acl_flight_stop`

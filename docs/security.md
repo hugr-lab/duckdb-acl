@@ -106,27 +106,48 @@ share sessions" (spec 040).
   "virtual-first" and a miss "keeps today's `Deny("no access")`"; a temp over a granted virtual name
   is refused (spec 050).
 
-### Functions (`PolicyStore::FunctionAllowed`, `src/acl_policy.cpp`)
+### Functions (`PolicyStore::ResolveFunction`, `src/acl_function_categories.cpp`, spec 072)
 
-The gate is a **denylist**, evaluated in this order:
+The gate is **default-deny by category**. A function's key is `(database, schema, name, kind)`; a
+category is a named set of keys, a row of the policy catalog; a call is admitted when its key is in
+a category granted to one of the principal's roles (or to `''`, every role) or is granted by name;
+a deny anywhere among the roles - by name or on a category - wins; a key in no category is refused.
+Evaluated in this order:
 
-1. every function whose name starts with `acl_` is denied to a principal - "otherwise one statement
-   (`SELECT acl_grant_admin('me','passthrough')`) defeats the whole model" - and stays available in
-   the native context; a granted virtual function named `acl_*` still resolves before the seam;
-2. `arrow_scan` / `arrow_scan_dumb` are hard-denied "AHEAD of the catalog gate, so an
-   `acl_allow_function` row can never re-open a pointer-dereference primitive" (spec 049); the one
-   exemption is the door's own `ACL INGEST` statement;
-3. the policy catalog's allow/deny rows (`acl_allow_function` / `acl_deny_function`), then
-4. `DefaultDeniedFunctions()`: file and blob readers (`read_csv`, `read_parquet`, `read_json*`,
-   `read_text`, `read_blob`, `glob`, …), spatial readers, external-source scanners and SQL
-   passthroughs (`postgres_query`, `postgres_scan`, `mysql_*`, `mssql_*`, `sqlite_*`, `iceberg_*`,
-   `delta_scan`, `query`, `query_table`), session and secret state (`getvariable`, `which_secret`,
-   `current_setting`, `current_query`), every `duckdb_*` / `pragma_*` / `show_*` metadata function
-   that "enumerate[s] every attached database", quack's own surface (`quack_query`, `quack_cancel`,
-   `quack_serve`, `scan_data_from_quack_client`, …), `acl_quack_scan_data` and `whoami`.
+1. the **never set**, in code: `acl_*` ("otherwise one statement `SELECT
+   acl_grant_admin('me','passthrough')` defeats the whole model"), `ducklake_*`, `quack_*`, `uc_*`,
+   `arrow_scan` / `arrow_scan_dumb` / `seq_scan` (pointers, spec 049; the one exemption is the door's
+   own `ACL INGEST` statement), `query` / `query_table` / `json_execute_serialized_sql` (SQL past the
+   rewriter), a scanner's `*_query` / `*_execute` / `*_attach` (SQL under the node's credentials on
+   another server), the engine's `__internal_*` helpers. No grant re-opens one: the write refuses
+   the name;
+2. the key: a bare name resolves among the members of that name and kind - `system.main` first,
+   then `system.pg_catalog`, then any other system schema, then a physical catalog's; two physical
+   candidates refuse as ambiguous; a qualified name is its own key; a qualified name that is no
+   member is duckdb's method-call spelling (`x.lower()`) and becomes the call over the column;
+3. the verdict, flat: any deny by name or on a category holding the key → refused; a grant by
+   name, or a grant on any category holding the key → admitted; else refused, and the text says
+   whether the key is in no category at all;
+4. the admitted call is emitted **qualified** to its key - `lower(x)` reaches the binder as
+   `system.main.lower(x)` - so a macro named like a builtin in a physical catalog cannot take a
+   principal's call; result columns keep the names duckdb gives them.
 
-The consequence is stated in spec 041 and holds today: "loading an extension extends the function
-surface, and this gate is a denylist - so its failure mode is the thing nobody named."
+The shipped categories (`schema/function_categories/`, seeded once when a catalog is created and
+never touched by the extension again): every role's from the start - `base` (core compute, the
+operators, the names the parser rewrites syntax into), `generators`, `node_facts`, `json`, `icu`,
+`spatial`, `inet`, `h3`, `hashfuncs`, `a5`, `geosilo`; nobody's until granted - `readers` (files,
+URLs, object stores, other databases: unconfined by construction), `meta` (the `duckdb_*` listings the
+rewriter does not substitute, `pragma_*`, the pg-compatibility readers such as `pg_get_viewdef`,
+`histogram_values`, `stats`), `environment` (`getenv`, `current_setting`, `getvariable`,
+`which_secret`, `duckdb_secrets`, …), `node` (checkpoints, logging, profiling, sequences, external
+resources, servers), `plan` (`json_serialize_plan`, substrait). A function of a newly loaded
+extension, a builtin a pin bump adds, an admin's macro, a macro in a ducklake catalog: in no
+category, refused, until the operator puts it somewhere. `acl_function_status([role])` is the screen
+that shows them (`status = 'uncategorized'`).
+
+What spec 041 said of the denylist - "loading an extension extends the function surface, and this
+gate is a denylist - so its failure mode is the thing nobody named" - no longer holds: the failure
+mode of default-deny is a refusal, and the refusal names the function.
 
 ### Metadata
 
@@ -395,8 +416,9 @@ are name leaks bounded to an already-granted principal.
   statement is an opaque `ExtensionStatement`: "an AST we cannot enumerate is an AST we cannot
   confine". It works only under `ACL NATIVE` (passthrough). An **unprefixed** foreign query "runs
   without the ACL - the same property every unprefixed query has" (spec 017).
-- **The function gate is a denylist** (spec 041): a newly loaded extension's functions are allowed
-  until named. Quack's fourteen functions and `arrow_scan` were added when found.
+- **The function gate is default-deny by category** (spec 072): a newly loaded extension's functions
+  are refused until the operator puts them in a category; quack's functions and `arrow_scan` are in
+  the never set, which no grant re-opens.
 - **The listing narrows while a declared object is dead.** Verified today (section 7): after the
   source drops a mapped column, `SELECT *` fails with the binder error above while
   `information_schema.columns` lists the remaining columns. `specs/BACKLOG.md` (pre-release): "The
@@ -541,8 +563,9 @@ Before a node serves anyone:
 - [ ] Explicit-only capabilities are granted by name and reviewed: `create`, `drop`, `temp`,
       `explain`, `manage`. `EXPLAIN` shows physical names to whoever holds `explain`.
 - [ ] `merge` is not granted on tables whose key space is shared across tenants (spec 020).
-- [ ] Every loaded extension's functions are reviewed against the denylist - the gate is a
-      denylist, and a new extension widens the surface until named (`acl_deny_function`).
+- [ ] Every loaded extension's functions have been placed in a category or deliberately left out:
+      `SELECT * FROM acl_function_status() WHERE status = 'uncategorized'` is the review list
+      (spec 072); a name left there is refused, which is the safe side.
 - [ ] Grants' predicates and projections carry a `true` verdict (`acl_relations()`,
       `acl_object_grants()` show `rls_checked`); run `acl_refresh_schema` with every source attached
       (spec 027).
