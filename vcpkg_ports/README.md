@@ -20,3 +20,10 @@ gates the flag on `BISON_VERSION VERSION_GREATER_EQUAL 3.7`; everything else is 
 as it stands (`portfile.cmake`, `vcpkg.json` and the two registry patches are byte-identical to it).
 Retire it when upstream thrift (or the vcpkg port) makes the same check, or when the duckdb images
 carry a newer bison.
+
+## Overlay triplets (`vcpkg_triplets/`)
+
+`x64-mingw-static`: the registry's community triplet plus `-Wa,-mbig-obj` - grpc 1.76 (the same
+baseline) no longer fits a COFF object on MinGW without it - and `VCPKG_BUILD_TYPE release`, since
+the extension links release alone. Listed first in `vcpkg.json`'s `overlay-triplets`; the same file
+lives in acl-otel, whose graph carries grpc too.
