@@ -70,6 +70,8 @@ table named by argument and belongs to `meta`; the aggregate `histogram(x)` to `
 
 `builtin` marks provenance only. The operator edits a shipped category exactly like an own one;
 nothing re-seeds or re-syncs it later (owner's rule: nothing is ever added automatically).
+An alias is a member of its own (`read_csv_auto` beside `read_csv`, `len` beside `length`): nothing
+follows an alias to its target, in the seed or later - the name written is the name checked.
 
 ### The seed
 
@@ -313,6 +315,10 @@ in a day each.
    candidates the rewriter cannot know which the principal meant.
 8. **Auto categories are seeded `''` grants** (proposed): visible in `acl_function_grants`, revocable
    for all or denied per role, no second mechanism.
+9. **Aliases are names** (owner, 2026-09-18): a function's alias is its own member, seeded and
+   granted by hand exactly like the function - nothing follows an alias to its target at any point,
+   in the seed, in the writer or in the rewriter. Simpler, and it keeps the one rule: what is in the
+   category is what is callable, by the name written.
 
 ## Alternatives considered
 
