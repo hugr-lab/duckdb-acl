@@ -315,9 +315,11 @@ struct CatalogBackend {
 	// result caches, invalidated on a version bump; maps are size-capped by ClearIfOversized().
 	// keys carry the principal's sorted role set: the effective policy depends on it.
 	static constexpr idx_t CACHE_CAPACITY = 4096;
-	std::unordered_map<string, std::pair<bool, TablePolicy>> objects;    // rolesig \x1f written name
-	std::unordered_map<string, std::pair<bool, TablePolicy>> functions;  // rolesig \x1f kind \x1f name
-	std::unordered_map<string, std::pair<bool, bool>> gates;             // rolesig \x1f name -> decided, allowed
+	std::unordered_map<string, std::pair<bool, TablePolicy>> objects;   // rolesig \x1f written name
+	std::unordered_map<string, std::pair<bool, TablePolicy>> functions; // rolesig \x1f kind \x1f name
+	//! spec 072: the function categories of this policy version, built from the three tables on first
+	//! use and dropped on a version bump; nullptr until then (and always in function mode, for now)
+	shared_ptr<const FunctionCategoryModel> function_model;
 	case_insensitive_map_t<case_insensitive_map_t<string>> claims_cache; // role -> claims
 	case_insensitive_set_t claims_loaded;
 	case_insensitive_map_t<std::pair<bool, IssuerConfig>> issuer_cache; // issuer -> (found, config)
@@ -455,7 +457,8 @@ struct CatalogBackend {
 	//! Targeted gate lookup: only the rows for this name and these roles leave the database ('' as
 	//! role means a global row - NULL cannot be part of the primary key). Role-specific rows beat
 	//! global rows; among role rows an explicit deny wins.
-	bool FunctionGate(const Principal &principal, const string &name, bool &allowed);
+	//! spec 072: the model of the function categories, or nullptr when this source has none
+	shared_ptr<const FunctionCategoryModel> FunctionModel();
 
 	void LoadRoleClaims(Principal &principal);
 

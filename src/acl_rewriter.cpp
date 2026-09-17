@@ -5,6 +5,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -822,7 +823,30 @@ private:
 		cte_scope = saved_scope;
 	}
 
+	//! A result column keeps the name duckdb would give it as written. The gate qualifies every
+	//! admitted call (spec 072), and a header of `"system".main.lower(x)` where the principal wrote
+	//! `lower(x)` is a wrong answer to a client that reads column names - so an item without an alias
+	//! is given the name it has now, before the rewrite touches it. What duckdb names a column is the
+	//! item's own GetName(), so this reproduces the header exactly.
+	void KeepItemNames(vector<unique_ptr<ParsedExpression>> &items) {
+		for (auto &item : items) {
+			if (!item || !item->GetAlias().empty()) {
+				continue;
+			}
+			auto expression_class = item->GetExpressionClass();
+			if (expression_class == ExpressionClass::STAR || expression_class == ExpressionClass::COLUMN_REF ||
+			    expression_class == ExpressionClass::CONSTANT) {
+				// a star expands, a column or a constant is its own name - and a bare column reference
+				// aliased to itself is a self-reference to the binder when it is a keyword it resolves
+				// late (`SELECT current_date`)
+				continue;
+			}
+			item->SetAlias(item->GetName());
+		}
+	}
+
 	void RewriteSelectNode(SelectNode &node) {
+		KeepItemNames(node.select_list);
 		RewriteTableRef(node.from_table);
 		for (auto &item : node.select_list) {
 			RewriteExpr(item);
@@ -1291,10 +1315,9 @@ private:
 		if (principal.arrow_ingest && StringUtil::CIEquals(vname, "arrow_scan")) {
 			return;
 		}
-		// not a virtual table function: gate by name, then rewrite arguments and any subquery argument
-		if (!store.FunctionAllowed(principal, function.GetQualifiedName())) {
-			Deny(Reason::FUNCTION_DENIED, "table function \"" + vname + "\" is not allowed");
-		}
+		// not a virtual table function: the gate decides by its key (spec 072), and the call is emitted
+		// qualified to the key that admitted it; then the arguments and any subquery argument
+		GateFunction(function.GetQualifiedNameMutable(), FunctionKind::TABLE, "table function \"" + vname + "\"");
 		RewriteFunctionArgs(function);
 		if (tf.subquery && tf.subquery->node) {
 			RewriteQueryNode(*tf.subquery->node);
@@ -2307,13 +2330,52 @@ private:
 				SubstituteSessionIdentity(expr, name);
 				return;
 			}
-			// otherwise route it through the resolver seam (default-allow, deny readers)
-			if (!store.FunctionAllowed(principal, function.GetQualifiedName())) {
-				Deny(Reason::FUNCTION_DENIED, "function \"" + name + "\" is not allowed");
+			// otherwise the gate decides by its key (spec 072). A qualified name that is no member is
+			// duckdb's method-call spelling - `x.lower()` parses as `lower` in schema `x` - and becomes
+			// the call over the column before it is judged as a bare name.
+			if (!GateFunction(function.GetQualifiedNameMutable(), FunctionKind::SCALAR, "function \"" + name + "\"",
+			                  true)) {
+				auto &path = function.GetQualifiedName().Path();
+				vector<Identifier> column;
+				for (idx_t i = 0; i + 1 < path.size(); i++) {
+					column.push_back(path[i]);
+				}
+				auto &arguments = function.GetArgumentsMutable();
+				arguments.insert(arguments.begin(),
+				                 FunctionArgument(make_uniq<ColumnRefExpression>(std::move(column))));
+				function.SetQualifiedName(QualifiedName(function.FunctionName()));
+				GateFunction(function.GetQualifiedNameMutable(), FunctionKind::SCALAR, "function \"" + name + "\"");
 			}
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::WINDOW) {
+			// `sum(x) OVER (...)` is a WINDOW node, not a FUNCTION one; its function goes through the
+			// same gate (spec 072 - the first time a window function is gated at all)
+			auto &window = expr->Cast<WindowExpression>();
+			auto name = window.FunctionName().GetIdentifierName();
+			GateFunction(window.GetQualifiedNameMutable(), FunctionKind::SCALAR, "function \"" + name + "\"");
 		}
 		ParsedExpressionIterator::EnumerateChildren(*expr,
 		                                            [&](unique_ptr<ParsedExpression> &child) { RewriteExpr(child); });
+	}
+
+	//! The function gate (spec 072): resolves the name as written to its key and the principal's
+	//! verdict, refuses on anything but an admission, and rewrites the name to the key that admitted
+	//! it - `lower(x)` goes to the binder as `system.main.lower(x)`, so a macro of that name in a
+	//! physical catalog cannot take the call. `method_call_probe`: a qualified name that is no member
+	//! is reported (false) instead of refused, for the caller to retry as a method call.
+	bool GateFunction(QualifiedName &qualified, FunctionKind kind, const string &shown,
+	                  bool method_call_probe = false) {
+		auto decision = store.ResolveFunction(principal, qualified, kind);
+		if (decision.verdict == FunctionVerdict::UNKNOWN_QUALIFIED && method_call_probe &&
+		    qualified.Path().size() >= 2) {
+			return false;
+		}
+		if (decision.verdict != FunctionVerdict::ADMITTED) {
+			Deny(Reason::FUNCTION_DENIED, decision.Why(shown));
+		}
+		qualified = QualifiedName(Identifier(decision.key.database), Identifier(decision.key.schema),
+		                          Identifier(decision.key.name));
+		return true;
 	}
 
 	//! `current_database()` / `current_catalog()` / `current_schema()` / `current_schemas(...)`,

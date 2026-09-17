@@ -30,6 +30,7 @@ set(EXTENSION_SOURCES
     src/acl_door_common.cpp
     src/oidc/acl_oidc.cpp
     src/oidc/acl_oidc_secret.cpp
+    src/acl_function_categories.cpp
     src/acl_policy.cpp
     src/acl_policy_catalog.cpp
     src/acl_catalog_admin.cpp

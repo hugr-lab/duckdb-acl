@@ -1,0 +1,21 @@
+# The shipped function categories (spec 072): name, whether every role holds it from the start
+# ("auto" = a seed grant to the role ''), and a comment. One line per category, tab-separated.
+# The members are in <name>.txt beside this file: one per line, `[database.schema.]name [TABLE]`
+# (default system.main, default kind scalar). scripts/gen_schema.py renders all of it into the
+# seed statements of the schema; `make schema` after any change here.
+base	auto	core scalars, aggregates, windows, the compute macros, the operators - what ordinary SQL is made of
+generators	auto	table functions that make rows from their arguments: range, unnest, repeat, ...
+node_facts	auto	read-only facts about the node that name no object: keywords, collations, platform, time zones
+json	auto	the json extension's compute: parse, extract, transform, serialize; not its readers or executor
+icu	auto	icu's collations and sort keys
+spatial	auto	spatial's compute; not its readers or driver listing
+inet	auto	inet's address functions
+h3	auto	h3's cell functions
+hashfuncs	auto	hashfuncs' hash functions
+a5	auto	a5's cell functions
+geosilo	auto	geosilo's encoding functions
+readers	grant	functions that read outside the query: files, URLs, object stores, other databases - unconfined by construction
+meta	grant	listings and probes of the catalog and the node: duckdb_*, pragma_*, the pg-compatibility readers, stats
+environment	grant	the process's secrets, settings and variables
+node	grant	the operator's knobs: checkpoints, logging, profiling, sequences, external resources, servers
+plan	grant	functions that answer a query plan, which names physical objects

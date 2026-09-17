@@ -1,0 +1,10 @@
+current_query
+current_setting
+getenv
+getvariable
+in_search_path
+duckdb_secrets TABLE
+duckdb_settings TABLE
+duckdb_variables TABLE
+which_secret TABLE
+system.pg_catalog.current_query

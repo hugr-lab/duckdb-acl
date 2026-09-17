@@ -47,8 +47,17 @@ CREATE TABLE IF NOT EXISTS <role_catalogs>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_T
 
 CREATE TABLE IF NOT EXISTS <role_object_caps>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "caps" VARCHAR, "rls" VARCHAR, "columns" VARCHAR, "rls_checked" BOOLEAN, PRIMARY KEY ("role", "vcat", "vname"));
 
--- '' as role/kind means "global"/"any kind": NULL cannot be part of the primary key
-CREATE TABLE IF NOT EXISTS <function_gate>("role" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "allowed" BOOLEAN, PRIMARY KEY ("role", "name", "kind"));
+-- spec 072: what a principal may call. A function's key is (database, schema, name, kind) - kind is
+-- 'scalar' or 'table', what the rewriter knows before bind - and a category is a named set of keys.
+-- The shipped rows are seeded once, when the catalog is created (schema/function_categories/), and
+-- never touched again by the extension; `builtin` marks provenance only.
+CREATE TABLE IF NOT EXISTS <function_categories>("category" ACL_KEY_TEXT PRIMARY KEY, "comment" VARCHAR, "builtin" BOOLEAN);
+
+CREATE TABLE IF NOT EXISTS <function_category_members>("category" ACL_KEY_TEXT, "database" ACL_KEY_TEXT, "schema" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, PRIMARY KEY ("category", "database", "schema", "name", "kind"));
+
+-- a grant to role '' is every role's; a row names either a category (key columns '') or a function
+-- (category ''); allowed = false is a deny, and a deny anywhere among a principal's roles wins
+CREATE TABLE IF NOT EXISTS <function_grants>("role" ACL_KEY_TEXT, "category" ACL_KEY_TEXT, "database" ACL_KEY_TEXT, "schema" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "allowed" BOOLEAN, PRIMARY KEY ("role", "category", "database", "schema", "name", "kind"));
 
 CREATE TABLE IF NOT EXISTS <issuers>("issuer" ACL_KEY_TEXT PRIMARY KEY, "keys_json" VARCHAR, "audiences" VARCHAR, "algs" VARCHAR, "role_claim" VARCHAR, "claim_map" VARCHAR, "jwks_uri" VARCHAR, "client_id" VARCHAR, "client_secret" VARCHAR);
 
@@ -84,7 +93,16 @@ CREATE TABLE IF NOT EXISTS <keys>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "ki
 -- something the role does not read.
 CREATE TABLE IF NOT EXISTS <grant_columns>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, PRIMARY KEY ("role", "vcat", "vname", "pos"));
 
-INSERT INTO <meta> SELECT 'schema_version', '13' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+-- @section seed
+-- The shipped function categories (spec 072), rendered by scripts/gen_schema.py from
+-- schema/function_categories/: the categories, their members, and the grants to the role '' of the
+-- categories every role holds from the start. Written once - the `function_seed` stamp in meta says
+-- it happened, and nothing re-seeds a catalog that carries it, so what the operator removed stays
+-- removed. The statements are generated in place of this marker; do not edit them here.
+-- @seed function_categories
+
+-- @section schema
+INSERT INTO <meta> SELECT 'schema_version', '14' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');

@@ -128,8 +128,21 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
   many catalogs per role, independent of `select`), or a global `manage`/`passthrough` in
   `acl.admins`; never self-escalating, and only `passthrough` leaves the virtual catalog.
 - **Golden rule**: the rewriter adds no query parameters — a user's `$1`/`?` is the only parameter.
-- **Function gating seam**: `PolicyStore::FunctionAllowed` — denies only data-readers / rights-bypass
-  functions, passes the rest. This is where a production role-aware resolver plugs in.
+- **Function gating seam**: `PolicyStore::ResolveFunction` (spec 072) — a call is admitted when its
+  key `(database, schema, name, kind)` is in a **category** granted to one of the principal's roles
+  (or to `''`, every role) or is granted by name; a deny anywhere wins; a key in no category is
+  refused; the **never set** (`acl_*`, `ducklake_*`, `quack_*`, `arrow_scan*`, `query*`,
+  `json_execute_serialized_sql`, scanners' `*_query/_execute/_attach`, the engine's `__internal_*`
+  helpers) is code and no grant re-opens it. Categories live in the policy catalog
+  (`function_categories` / `function_category_members` / `function_grants`, seeded ONCE at creation
+  from `schema/function_categories/*.txt` - nothing is ever added automatically after that) or, in
+  memory mode, in the seed (`src/acl_function_seed.hpp`, generated). The model
+  (`acl_function_categories.hpp`) is built when the policy loads and never reads the source on the
+  query path. Every admitted call is emitted **qualified** to its key (`system.main.lower(x)`), so a
+  macro named like a builtin in a physical catalog cannot take a principal's call; result columns
+  keep the names duckdb gives them (`KeepItemNames`). `acl_function_status([role])` is the operator's
+  screen: every function of the node with its categories and status (`never` / `categorized` /
+  `uncategorized` - the last is what a freshly loaded extension shows).
 - **State is per-instance**: `PolicyStore` reached via `AclParserInfo` (parser) and `AclScalarInfo`
   (admin functions' `function_info`) — no process globals. Every `acl_*` scalar is registered through
   `MarkAclScalar` (fallible **and volatile**): a foldable side effect runs while the optimizer plans
@@ -197,7 +210,13 @@ effects) into the admin functions; anything else after `ACL ADMIN` stays native 
 `acl_define_token` (memory-only until JWT lands, spec 007), `acl_define_role`, `acl_grant_table`,
 `acl_grant_view`, `acl_grant_table_function[,_alias]`, `acl_grant_scalar[,_alias]`,
 `acl_deny_function`, `acl_allow_function` — without a catalog they fill the in-memory store; with one
-they write the same content into the implicit virtual catalog `default`.
+they write the same content into the implicit virtual catalog `default` (the last two are now wrappers
+over spec 072's grants by name to every role, for both kinds). **Spec 072** adds the category admin
+functions: `acl_create_function_category(name[, comment])`, `acl_drop_function_category(name)`,
+`acl_function_category_add/remove(category, members)` (a list or a csv of `[db.schema.]name [TABLE]`),
+`acl_grant_function_category(role, category[, allowed])` / `acl_revoke_function_category(role, category)`,
+`acl_grant_function(role, spec[, allowed])` / `acl_revoke_function(role, spec)`; role `''` is every
+role; the never set is refused where the grant is written.
 
 ## Serving clients directly
 
@@ -232,8 +251,8 @@ server_token)` opens a session and binds it to the connection, `acl_quack_author
 query)` composes the prefix or answers NULL, which quack turns into a refusal. `acl_quack_serve(uri,
 token)` installs both and starts the listener, refusing an instance a client could step out of
 (anonymous admin on, override not `STRICT`, no server token, quack not loaded);
-`acl_quack_stop(uri)` closes the door and sweeps the sessions it served. quack's own fourteen functions
-are on the denylist — the gate is a denylist, so a loaded extension widens the surface until named.
+`acl_quack_stop(uri)` closes the door and sweeps the sessions it served. quack's own functions are in
+spec 072's never set — refused under a principal whatever the data says.
 **Spec 062 → 063**: the door is now quack's **server compiled into acl** (`third_party/quack` submodule,
 the server object graph in `src/quack_embed/`), replacing the spec-062 loopback front. `AclQuackServer`
 binds the public address itself, terminates TLS (`acl_quack_serve(uri, token[, cert, key][, mode])`,

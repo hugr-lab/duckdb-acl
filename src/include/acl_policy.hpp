@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "acl_function_categories.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -166,9 +167,6 @@ struct IntrospectionRows {
 	vector<vector<Value>> rows;
 };
 
-//! Whether a function reference is a scalar/aggregate (expression position) or a table function (FROM)
-enum class FunctionKind : uint8_t { SCALAR, TABLE };
-
 //! What a principal may do with the ACL itself (spec 009). NONE is the default: the ACL is managed
 //! by the gateway, not by the roles it serves.
 //! wingdi.h (windows.h, reached through httplib and gRPC on Windows) defines PASSTHROUGH as a GDI
@@ -221,15 +219,6 @@ vector<string> SplitTopLevel(const string &text, char delimiter);
 //! it a read-only subquery. Since spec 029 both restrict alike, so this decides writability only -
 //! and it is shared, because ADD and ALTER giving the same list two different forms is a bug.
 bool RenameOnlyColumns(const vector<std::pair<string, string>> &columns);
-
-//! Which functions are gated is a policy question, not the rewriter's: every function reference is
-//! routed through the resolver, which decides. Most functions - the vast majority extensions add -
-//! are pure transforms (e.g. ST_AsGeoJSON) and pass; only functions that read external data or route
-//! queries past the ACL are denied (source readers like ST_Read/read_csv, cross-source scanners and
-//! SQL passthrough like postgres_query/mssql_scan/query, session/secret access like getvariable). This
-//! default denylist is a stub for the future role-aware ACL callback, which may classify differently
-//! (and, for table functions it does not recognize, should lean to default-deny).
-case_insensitive_set_t DefaultDeniedFunctions();
 
 //! A small bounded LRU of parsed template prototypes. On a hit it returns a fresh Copy() of the
 //! prototype (so the caller may bake markers into the copy); on a miss it parses via `parse`, caches the
@@ -357,8 +346,10 @@ struct PolicyStore {
 		string error;
 	};
 	case_insensitive_map_t<JwksEntry> jwks_cache;
-	// gateway-wide function denylist (readers / rights-bypass); everything else passes
-	case_insensitive_set_t denied_functions = DefaultDeniedFunctions();
+	//! spec 072: what a principal may call in memory mode - the shipped categories and their auto
+	//! grants, edited by the legacy acl_deny_function / acl_allow_function and the category admin
+	//! functions. Immutable once built; a writer copies, edits and swaps (EditMemoryFunctions).
+	shared_ptr<const FunctionCategoryModel> memory_functions;
 	// parsed rewrite-template prototypes, so a template is parsed once and only copied per request
 	TemplateCache<QueryNode> select_cache;      // relation / table-function subquery templates
 	TemplateCache<ParsedExpression> expr_cache; // scalar macro templates
@@ -476,8 +467,16 @@ struct PolicyStore {
 	void CatalogDropRoleMapping(const string &issuer, const string &source, const string &external_value,
 	                            const string &role);
 	void CatalogDefineRole(const string &role, const case_insensitive_map_t<string> &claims);
-	//! remove=true deletes the gate row (fall back to the default denylist); otherwise upserts it
-	void CatalogSetFunctionGate(const string &name, bool allowed, bool remove);
+	// spec 072: the function categories' writers (acl_catalog_admin.cpp). Every one bumps the policy
+	// version, so the next statement resolves against a model rebuilt from the rows.
+	void CatalogCreateFunctionCategory(const string &name, const string &comment);
+	void CatalogDropFunctionCategory(const string &name);
+	//! add=true inserts the keys as members (the category must exist), add=false removes them
+	void CatalogFunctionCategoryMembers(const string &name, const vector<FunctionKey> &keys, bool add);
+	//! A grant row on a category (key == nullptr) or on a function by name; remove=true deletes the row
+	//! whatever its verdict, otherwise upserts it with `allowed`
+	void CatalogWriteFunctionGrant(const string &role, const string &category, optional_ptr<const FunctionKey> key,
+	                               bool allowed, bool remove);
 	void CatalogDefineIssuer(const IssuerConfig &config);
 	// ALTER operations (spec 009): partial change of an EXISTING object - unlike the ADD/GRANT
 	// upserts, a missing target is an error. field names the single property being set.
@@ -735,11 +734,16 @@ struct PolicyStore {
 	bool ResolveTableFunction(const Principal &principal, const string &vname, TablePolicy &out);
 	bool ResolveScalarFunction(const Principal &principal, const string &vname, TablePolicy &out);
 
-	//! The resolver seam every non-virtual function flows through. Catalog backend: function_gate rows
-	//! (per-role, then global) decide first; otherwise the built-in denylist passes everything except
-	//! source readers / rights-bypass functions (matching the last name component, so a qualified alias
-	//! db.schema.read_csv cannot slip past).
-	bool FunctionAllowed(const Principal &principal, const QualifiedName &name);
+	//! spec 072: the resolver seam every non-virtual function flows through. The categories and the
+	//! grants come from the policy source - the catalog's three tables, or the shipped seed in memory
+	//! mode and for a function-driver source without the category slots - and the never set is code.
+	//! `name` is the function as the principal wrote it, `kind` where it sits. A lookup in a model
+	//! built when the policy loaded: nothing on the query path reads the source (spec 065).
+	FunctionDecision ResolveFunction(const Principal &principal, const QualifiedName &name, FunctionKind kind);
+	//! The model the resolver reads right now - a snapshot; a policy change swaps a new one in
+	shared_ptr<const FunctionCategoryModel> FunctionModel();
+	//! Memory mode's writers: edit a copy of the model and swap it in. With a catalog, write rows instead.
+	void EditMemoryFunctions(const std::function<void(FunctionCategoryModel &)> &edit);
 
 	//! The current `allow_parser_override_extension` value. DEFAULT means duckdb skips every parser
 	//! override, so no `ACL …` statement parses and nothing is enforced (spec 017).
@@ -777,8 +781,9 @@ private:
 	// catalog-backend bridges, defined in acl_policy_catalog.cpp (the backend type stays private there)
 	bool CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out);
 	bool CatalogResolveFunction(const Principal &principal, const string &vname, bool table_kind, TablePolicy &out);
-	//! returns true when a gate row decides; `allowed` then carries the verdict
-	bool CatalogFunctionGate(const Principal &principal, const QualifiedName &name, bool &allowed);
+	//! spec 072: the backend's model of the function categories; nullptr when the source has none (a
+	//! function-driver source without the slots), which reads as the seed
+	shared_ptr<const FunctionCategoryModel> CatalogFunctionModel();
 	void CatalogLoadRoleClaims(Principal &principal);
 	bool CatalogLookupIssuer(const string &issuer, IssuerConfig &out);
 	void CatalogListIssuers(vector<string> &out);

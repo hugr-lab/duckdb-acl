@@ -114,45 +114,6 @@ vector<string> SplitTopLevel(const string &text, char delimiter) {
 	return parts;
 }
 
-case_insensitive_set_t DefaultDeniedFunctions() {
-	return {// file / blob readers
-	        "read_csv", "read_csv_auto", "read_parquet", "parquet_scan", "read_json", "read_json_auto",
-	        "read_json_objects", "read_ndjson", "read_ndjson_objects", "read_text", "read_blob", "sniff_csv", "glob",
-	        // spatial readers
-	        "st_read", "st_readosm", "st_read_meta",
-	        // external-source scanners / SQL passthrough (bypass the gateway's ACL)
-	        "postgres_query", "postgres_scan", "postgres_scan_pushdown", "postgres_execute", "mysql_query",
-	        "mysql_scan", "mysql_execute", "mssql_query", "mssql_scan", "mssql_execute", "sqlite_scan", "sqlite_query",
-	        "iceberg_scan", "iceberg_metadata", "delta_scan", "query", "query_table",
-	        // spec 049: three raw pointers into a table. The ingest source - the door's own composed
-	        // statement is exempted by Principal::arrow_ingest - and nobody else's.
-	        "arrow_scan", "arrow_scan_dumb",
-	        // session / secret state
-	        "getvariable", "which_secret", "current_setting", "current_query",
-	        // metadata surfaces: they enumerate every attached database, so under a principal they are
-	        // a listing of the physical catalog the ACL exists to hide. Denied until spec 010 part 3
-	        // replaces them with a listing filtered by the principal's grants - a denial keeps tooling
-	        // blind, a leak keeps it informed about other people's tables.
-	        "duckdb_databases", "duckdb_schemas", "duckdb_tables", "duckdb_views", "duckdb_columns",
-	        "duckdb_constraints", "duckdb_indexes", "duckdb_functions", "duckdb_types", "duckdb_sequences",
-	        "duckdb_secrets", "duckdb_settings", "duckdb_extensions", "duckdb_dependencies", "duckdb_temporary_files",
-	        "duckdb_memory", "duckdb_optimizers", "duckdb_variables", "duckdb_log_contexts", "duckdb_logs",
-	        "pragma_database_size", "pragma_show", "pragma_storage_info", "pragma_table_info", "pragma_metadata_info",
-	        "pragma_user_agent", "pragma_version", "show_databases", "show_tables", "show_tables_expanded",
-	        "sql_auto_complete", "test_all_types",
-	        // the quack door's own surface (spec 041): loading an extension extends the function
-	        // surface, and this gate is a denylist - so its failure mode is the thing nobody named.
-	        // Between them these read other sessions and their SQL, run arbitrary SQL against another
-	        // server, cancel another principal's query, start and stop servers, and read a client's
-	        // data stream by id.
-	        "quack_active_connections", "quack_server_list", "quack_query", "quack_query_by_name", "quack_cancel",
-	        "quack_serve", "quack_stop", "quack_clear_cache", "quack_identify", "quack_uri_parser",
-	        "quack_connection_id", "quack_check_token", "quack_nop_authorization", "scan_data_from_quack_client",
-	        // spec 063: the embedded door registers the drain under an acl_ name; both are barred, so a
-	        // principal cannot call it whether the server here is embedded or a co-loaded stock quack.
-	        "acl_quack_scan_data", "whoami"};
-}
-
 unique_ptr<SelectStatement> PolicyStore::InstantiateSelect(const string &sql, const ParserOptions &options) {
 	auto node = select_cache.GetCopy(sql, [&]() -> unique_ptr<QueryNode> {
 		Parser parser(options);
@@ -1298,49 +1259,37 @@ bool PolicyStore::ResolveScalarFunction(const Principal &principal, const string
 	return Resolve(scalar_functions, principal, vname, out);
 }
 
-bool PolicyStore::FunctionAllowed(const Principal &principal, const QualifiedName &name) {
+shared_ptr<const FunctionCategoryModel> PolicyStore::FunctionModel() {
+	if (catalog) {
+		auto model = CatalogFunctionModel();
+		if (model) {
+			return model;
+		}
+		// a source without the category slots (spec 008): the seed, exactly as memory mode starts
+	}
+	lock_guard<mutex> guard(lock);
+	return memory_functions;
+}
+
+void PolicyStore::EditMemoryFunctions(const std::function<void(FunctionCategoryModel &)> &edit) {
+	lock_guard<mutex> guard(lock);
+	auto copy = make_shared_ptr<FunctionCategoryModel>(*memory_functions);
+	edit(*copy);
+	memory_functions = std::move(copy);
+}
+
+FunctionDecision PolicyStore::ResolveFunction(const Principal &principal, const QualifiedName &name,
+                                              FunctionKind kind) {
 	// The extension's own functions administer the ACL, so a principal's query may never call them:
 	// otherwise one statement (`SELECT acl_grant_admin('me','passthrough')`) defeats the whole model.
 	// They stay available in the native context (ACL ADMIN / ACL NATIVE), which is not rewritten, and
-	// virtual names resolve before this seam, so a granted vfunc called acl_* still works.
-	auto lowered = StringUtil::Lower(name.Name().GetIdentifierName());
-	if (StringUtil::StartsWith(lowered, "acl_")) {
-		return false;
-	}
-	// ducklake's own functions are the lakehouse operator's - snapshots, expiry, file cleanup,
-	// merges, metadata listings (ducklake_snapshots, ducklake_expire_snapshots, ...): every one reads
-	// or changes the physical lake behind the virtual catalog, and the gate is a denylist, so the
-	// prefix is named rather than each of them (the 2026-09-08 review)
-	if (StringUtil::StartsWith(lowered, "ducklake_")) {
-		return false;
-	}
-	// spec 049: arrow_scan / arrow_scan_dumb turn three raw pointers into a table - memory-unsafe in a
-	// principal's hands. The one ingest exemption is Principal::arrow_ingest, honored in the rewriter
-	// before this seam is reached; here they are hard-denied AHEAD of the catalog gate, so an
-	// acl_allow_function row can never re-open a pointer-dereference primitive (the review's finding).
-	if (lowered == "arrow_scan" || lowered == "arrow_scan_dumb") {
-		return false;
-	}
-	// spec 052 addendum (2026-09-15): the two functions that take SQL past the parser override. The
-	// json extension's json_execute_serialized_sql runs a statement from its serialized form, so it
-	// is never parsed and never rewritten - under a principal it returned rows of a physical table no
-	// grant names, which is the whole model gone in one call. json_serialize_plan binds its SQL against
-	// the PHYSICAL catalog to build a plan, so it names tables, columns and types a principal was never
-	// shown: EXPLAIN by another name, and EXPLAIN is an explicit capability (spec 052). Hard-denied
-	// here, ahead of the catalog gate, for the reason arrow_scan is: an acl_allow_function row must not
-	// be able to re-open either. json_serialize_sql stays allowed - it only parses, and a serialized
-	// payload is plain JSON anyone can write by hand, so denying it would guard nothing.
-	if (lowered == "json_execute_serialized_sql" || lowered == "json_serialize_plan") {
-		return false;
-	}
-	if (catalog) {
-		bool allowed;
-		if (CatalogFunctionGate(principal, name, allowed)) {
-			return allowed;
-		}
-	}
-	lock_guard<mutex> guard(lock);
-	return denied_functions.count(name.Name().GetIdentifierName()) == 0;
+	// virtual names resolve before this seam, so a granted vfunc called acl_* still works. The same
+	// holds for everything else in the never set (spec 072): ducklake's and quack's own surface, the
+	// pointer scans of spec 049, the two functions that take SQL past the parser override (spec 052
+	// addendum), a scanner's SQL under the node's credentials - each refused ahead of the data, so no
+	// grant can re-open one.
+	auto model = FunctionModel();
+	return model->Resolve(principal.roles, name, kind);
 }
 
 bool PolicyStore::Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space,

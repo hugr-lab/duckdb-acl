@@ -1,0 +1,85 @@
+current_connection_id
+current_query_id
+current_transaction_id
+get_block_size
+stats
+duckdb_approx_database_count TABLE
+duckdb_columns TABLE
+duckdb_connection_count TABLE
+duckdb_constraints TABLE
+duckdb_databases TABLE
+duckdb_dependencies TABLE
+duckdb_eviction_queues TABLE
+duckdb_extension_repositories TABLE
+duckdb_extensions TABLE
+duckdb_external_file_cache TABLE
+duckdb_external_resources TABLE
+duckdb_functions TABLE
+duckdb_indexes TABLE
+duckdb_log_contexts TABLE
+duckdb_logs TABLE
+duckdb_logs_parsed TABLE
+duckdb_memory TABLE
+duckdb_prepared_statements TABLE
+duckdb_profiling_settings TABLE
+duckdb_schemas TABLE
+duckdb_sequences TABLE
+duckdb_table_sample TABLE
+duckdb_tables TABLE
+duckdb_temporary_files TABLE
+duckdb_triggers TABLE
+duckdb_types TABLE
+duckdb_views TABLE
+histogram TABLE
+histogram_values TABLE
+pragma_database_size TABLE
+pragma_metadata_info TABLE
+pragma_show TABLE
+pragma_storage_info TABLE
+pragma_table_info TABLE
+shell_history TABLE
+show_databases TABLE
+show_tables TABLE
+show_tables_expanded TABLE
+sql_auto_complete TABLE
+st_drivers TABLE
+st_list_proj_crs TABLE
+system.pg_catalog.col_description
+system.pg_catalog.format_type
+system.pg_catalog.has_any_column_privilege
+system.pg_catalog.has_column_privilege
+system.pg_catalog.has_database_privilege
+system.pg_catalog.has_foreign_data_wrapper_privilege
+system.pg_catalog.has_function_privilege
+system.pg_catalog.has_language_privilege
+system.pg_catalog.has_schema_privilege
+system.pg_catalog.has_sequence_privilege
+system.pg_catalog.has_server_privilege
+system.pg_catalog.has_table_privilege
+system.pg_catalog.has_tablespace_privilege
+system.pg_catalog.inet_client_addr
+system.pg_catalog.inet_client_port
+system.pg_catalog.inet_server_addr
+system.pg_catalog.inet_server_port
+system.pg_catalog.obj_description
+system.pg_catalog.pg_collation_is_visible
+system.pg_catalog.pg_conf_load_time
+system.pg_catalog.pg_conversion_is_visible
+system.pg_catalog.pg_function_is_visible
+system.pg_catalog.pg_get_constraintdef
+system.pg_catalog.pg_get_expr
+system.pg_catalog.pg_get_viewdef
+system.pg_catalog.pg_has_role
+system.pg_catalog.pg_is_other_temp_schema
+system.pg_catalog.pg_my_temp_schema
+system.pg_catalog.pg_opclass_is_visible
+system.pg_catalog.pg_operator_is_visible
+system.pg_catalog.pg_opfamily_is_visible
+system.pg_catalog.pg_postmaster_start_time
+system.pg_catalog.pg_table_is_visible
+system.pg_catalog.pg_ts_config_is_visible
+system.pg_catalog.pg_ts_dict_is_visible
+system.pg_catalog.pg_ts_parser_is_visible
+system.pg_catalog.pg_ts_template_is_visible
+system.pg_catalog.pg_type_is_visible
+system.pg_catalog.shobj_description

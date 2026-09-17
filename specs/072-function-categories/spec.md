@@ -1,6 +1,6 @@
 # Spec 072: function categories - what a principal may call
 
-- **Status**: draft (for agreement: syntax and implementation plan first, code after)
+- **Status**: implemented - slice 1 (2026-09-18: the model, the seed, the gate); slices 2-4 open
 - **Date**: 2026-09-18
 - **Author**: hugr lab
 
@@ -44,7 +44,14 @@ scalars, so duckdb offers no classification to lean on; and a name is not a key 
 ### The model in one sentence
 
 > A call is admitted when its resolved key is in a category granted to the principal, or is granted
-> by name; a deny anywhere among the principal's roles wins; everything else is refused.
+> by name; a deny anywhere among the principal's roles - by name or on a category, for a role or for
+> every role - wins over any grant; a key in no category is refused.
+
+The seed puts every function in exactly one category, so the shipped model reads as a partition:
+`st_read` is `readers`, not `spatial`; `getenv` is `environment`, not `base`. The operator may put a
+key in more than one category - a grant on any of them admits it, a deny on any refuses it - and may
+split a shipped category into finer ones without duplicating anything (owner's decision, 2026-09-18).
+No deny row is ever seeded: what nobody should hold from the start is simply not granted to `''`.
 
 ### Data - schema v14
 
@@ -94,22 +101,22 @@ role may be denied and every role may lose (`REVOKE ... FROM ALL ROLES`), not a 
 | `spatial` | `st_*` except the readers and `st_drivers` | yes |
 | `inet`, `h3`, `hashfuncs`, `a5`, `geosilo` | one per extension, all pure compute (`geosilo`'s `ST_*` overloads are `spatial`'s names) | yes |
 | `readers` | `read_csv*`, `sniff_csv`, `read_text`, `read_blob`, `glob`, `read_duckdb`, `read_parquet`, `parquet_scan`, `parquet_*metadata`, `parquet_schema`, `parquet_bloom_probe`, `read_json*`, `read_ndjson*`, `read_single_json_file`, `st_read*`, `read_xlsx`, `read_avro`, `read_vortex`, `lance_*`, `delta_scan`, `delta_list_files`, `delta_get_transaction_version`, `iceberg_scan`, `iceberg_metadata`, `iceberg_snapshots`, `vss_join`, `vss_match`, the scanners' `*_scan*` | no |
-| `meta` | the `duckdb_*` listings the rewriter does not substitute (spec 035 substitutes tables/columns/schemas/databases/views), `pragma_database_size/metadata_info/show/storage_info/table_info`, `show_databases/show_tables/show_tables_expanded`, `sql_auto_complete`, `histogram_values`, the table macro `histogram`, `stats`, `st_drivers`, the pg-compatibility macros that read the catalog (`pg_get_viewdef`, `pg_get_expr`, `pg_get_constraintdef`, `obj_description`, `col_description`, `shobj_description`, `has_*_privilege`, `pg_*_is_visible`, `current_user`, `user`, `session_user`, `current_role`, `inet_client_*`, `inet_server_*`, `pg_postmaster_start_time`, `pg_conf_load_time`), `current_connection_id`, `current_query_id`, `current_transaction_id` | no |
+| `meta` | the `duckdb_*` listings the rewriter does not substitute (spec 035 substitutes tables/columns/schemas/databases/views), `pragma_database_size/metadata_info/show/storage_info/table_info`, `show_databases/show_tables/show_tables_expanded`, `sql_auto_complete`, `histogram_values`, the table macro `histogram`, `stats`, `st_drivers`, the pg-compatibility macros that read the catalog (`pg_get_viewdef`, `pg_get_expr`, `pg_get_constraintdef`, `obj_description`, `col_description`, `shobj_description`, `has_*_privilege`, `pg_*_is_visible`, `inet_client_*`, `inet_server_*`, `pg_postmaster_start_time`, `pg_conf_load_time`, `format_type`), `current_connection_id`, `current_query_id`, `current_transaction_id` | no |
 | `environment` | `getenv`, `current_setting`, `getvariable`, `which_secret`, `current_query`, `duckdb_secrets`, `duckdb_settings`, `duckdb_variables` | no |
 | `node` | `checkpoint`, `force_checkpoint`, `enable/disable_logging`, `truncate_duckdb_logs`, `enable/disable_profiling`, `write_log`, `sleep_ms`, `pg_sleep`, `nextval`, `currval`, `setval`, `create/register/deregister/destroy_external_resource`, `register_external_resource_type`, `dbgen`, `dsdgen`, `load_aws_credentials`, `start_ui*`, `stop_ui_server`, `notify_ui`, `delta_set_transaction_version`, `iceberg_to_ducklake`, `unity_catalog_checkpoint_table` | no |
 | `plan` | `json_serialize_plan`, `get_substrait`, `from_substrait` | no |
 
 Names of extensions the node does not carry are in the seed anyway: a member without a function
 admits nothing, and loading the extension later needs nobody's hand for what the seed already
-decided. Not in any category, by design: the `__internal_*` optimizer helpers, `error`,
-`constant_or_null`, `create_sort_key`, `invoke`, `combine`/`finalize`/`to_aggregate_state` - not for a
-principal to call by name.
+decided.
 
 **Never** - a set in code, not in data, shown as the category `never` by the admin function and
 refused at write time ("only ACL NATIVE can run these"): `acl_*`, `ducklake_*`, `quack_*`,
-`arrow_scan`, `arrow_scan_dumb`, `query`, `query_table`, `json_execute_serialized_sql`, `tpch`,
-`tpcds`, `sqlsmith`, `fuzzyduck`, `reduce_sql_statement`, `fuzz_all_functions`, `uc_*`, and the
-scanners' `*_query`, `*_execute`, `*_attach`, `*_clear_cache`. Each either runs SQL past the rewriter
+`arrow_scan`, `arrow_scan_dumb`, `seq_scan`, `query`, `query_table`, `json_execute_serialized_sql`,
+`tpch`, `tpcds`, `sqlsmith`, `fuzzyduck`, `reduce_sql_statement`, `fuzz_all_functions`, `uc_*`, the
+scanners' `*_query`, `*_execute`, `*_attach`, `*_clear_cache` and pool/connection knobs, and the
+engine's own helpers no statement spells by name - `__internal_*`, `error`, `constant_or_null`,
+`create_sort_key`, `invoke`, `combine`, `finalize`, `to_aggregate_state`. Each either runs SQL past the rewriter
 (here or on another server under the node's credentials) or dereferences a pointer: whoever needs one
 needs `ACL NATIVE`, and has it. In data it could be edited away; in code it cannot.
 
@@ -128,10 +135,12 @@ door exemptions (spec 042's own drain, spec 049's own ingest), which stay as the
    A qualified name that is no member is a method call (`x.lower()` parses as `lower` in schema `x`,
    `t.x.lower()` as catalog `t`, schema `x`): rewritten to `lower(x)` over the column reference and
    resolved as bare; if `x` is not a column the binder says so.
-3. **Verdict**, over the principal's roles plus `''`: any deny by name → refused; any deny on a
-   category holding the key → refused; a grant by name → admitted; the key in a category granted to
-   any of them → admitted; else refused (`Reason::FUNCTION_DENIED`, the text names the function as
-   written and the key it resolved to, or "in no category").
+3. **Verdict**, over the principal's roles plus `''`, flat - no precedence ladder: any deny by
+   name → refused; any deny on a category holding the key → refused; otherwise a grant by name, or a
+   grant on any category holding the key → admitted; else refused (`Reason::FUNCTION_DENIED`, the
+   text names the function as written and the key it resolved to, or "in no category"). "All readers
+   but `read_text`" is a grant on `readers` and a deny on the name; "`read_parquet` and nothing else"
+   is a grant on the name and no grant on `readers` - both directions without a ladder.
 4. **The call is emitted qualified** to the key that admitted it: `lower(x)` → `system.main.lower(x)`,
    `pg_typeof(x)` → `system.pg_catalog.pg_typeof(x)`, `peek()` granted as `lake.main.peek` →
    `lake.main.peek()`. This is what makes a grant on `system.main.lower` mean that function: an admin
@@ -141,9 +150,11 @@ door exemptions (spec 042's own drain, spec 049's own ingest), which stay as the
    functions in FROM.
 5. **The keyword spellings** (`current_user`, `session_user`, `current_role`, `user`, `current_date`,
    `current_time`, `current_timestamp`, `localtime`, `localtimestamp`) are column references to the
-   parser; the binder turns them into calls only after the rewrite (spec 052 addendum 2026-09-17 did
-   `current_catalog` / `current_schema`). They are converted to their calls ahead of the gate, so a
-   keyword cannot bypass what its call is denied - `current_user` is in `meta`.
+   parser; the binder turns them into calls only after the rewrite, and only when no column of that
+   name binds. They are left alone: every one resolves to a `base` function that answers a constant
+   (`'duckdb'`) or a clock, so there is nothing to reach through them, while converting them ahead of
+   the gate would make a column named `user` lose to the keyword - a worse trade than a deny on
+   `current_user` not reaching its keyword spelling, which is documented instead.
 
 The per-principal table - name/kind → admitted key - is built when the policy loads (roles' grants
 ∪ `''`), cached per role signature like `gates` today, and invalidated by `policy_version`. One
@@ -198,7 +209,7 @@ name, <both kinds>, false|true)` - what `test/sql/acl.test` and the harness use 
 
 ### What the admin sees
 
-- `acl_functions([role])` - the node's `duckdb_functions()` collapsed to keys `FULL JOIN` the members:
+- `acl_function_status([role])` - the node's `duckdb_functions()` collapsed to keys `FULL JOIN` the members:
   `database, schema, name, kind, function_type, internal, categories LIST, status ∈ {never,
   categorized, uncategorized}, present BOOLEAN` (a member with no function on this node),
   `shadows_system BOOLEAN`; with a role: `allowed BOOLEAN, decided_by` (`name:<role>`,
@@ -276,10 +287,44 @@ proves a migrated catalog and a fresh one have the same shape (spec 034).
 8. `make schema-check`: the seed renders identically into the three outputs; `v14.sql` from a v13
    catalog with `function_gate` rows gives the converted grants and the same shape as a fresh
    catalog.
-9. Management syntax round trips (`acl_ddl_syntax.test` style) and the `acl_functions()` screen:
+9. Management syntax round trips (`acl_ddl_syntax.test` style) and the `acl_function_status()` screen:
    `uncategorized` after a synthetic `CREATE MACRO`, `never` for `query_table`, `decided_by` for a
    role.
 10. Harness and both doors' e2e unchanged: the demo's functions are all `base`.
+
+## Implementation notes (slice 1, 2026-09-18)
+
+- The model is `FunctionCategoryModel` (`src/include/acl_function_categories.hpp`,
+  `src/acl_function_categories.cpp`): built from rows, immutable, swapped whole. The catalog backend
+  builds it from the three tables on first use after a policy-version bump (`CatalogBackend::
+  FunctionModel`); memory mode starts from the seed (`src/acl_function_seed.hpp`, generated by
+  `gen_schema.py` beside the schema) and a writer copies, edits and swaps (`EditMemoryFunctions`);
+  a function-driver source without the slots reads as the seed until slice 3.
+- `PolicyStore::ResolveFunction` replaced `FunctionAllowed`; `DefaultDeniedFunctions` and the
+  `function_gate` table are gone (`schema/migrations/v14.sql` converts its rows to grants by name for
+  both kinds and seeds the categories exactly as a fresh catalog is - the region between
+  `@seed-begin` / `@seed-end` is generated).
+- The rewriter gates `FunctionExpression`, `WindowExpression` (first time a window function is gated)
+  and the table function in FROM through one `GateFunction`, which rewrites the admitted call to its
+  key; a qualified name that is no member is retried as duckdb's method-call spelling (`x.lower()`
+  → `lower(x)`). Result columns keep the names duckdb gives them: `KeepItemNames` aliases every
+  select item that is not a star, a column reference or a constant with its own name before the
+  rewrite - a column reference aliased to itself is a self-reference to the binder when it is a
+  keyword resolved late (`SELECT current_date`), hence the exclusion.
+- `unnest` in the select list is the scalar position of a table function: the seed carries
+  `unnest` in `generators` for both kinds. The operator's screen is `acl_function_status([role])` -
+  `acl_functions()` was already the listing of virtual functions. `current_user`, `user`,
+  `session_user`, `current_role` are `base` (they answer `'duckdb'`, a constant), not `meta`.
+- The never set gained the engine's own helpers (`__internal_*`, `error`, `constant_or_null`,
+  `create_sort_key`, `invoke`, `combine`, `finalize`, `to_aggregate_state`): no statement spells
+  them by name, and "uncategorized" would have listed them on every node forever.
+- Tests: `acl_function_categories.test` (the rules, the seed, the never set at write, an admin's
+  macro, the shadowing macro, the method call, the operator's own category, the legacy pair, the
+  status screen), `acl_function_syntax_forms.test` (every syntactic form the parser turns into a
+  call, the headers, a denied window function); the drift check is the status screen's
+  `uncategorized AND present` count, which is 0 for this build. The existing suite needed two
+  changes: the never set refused where an allow is written (`acl_serialized_sql_gate.test`), and a
+  function-driver source without the slots deciding by the seed (`acl_functions_driver.test`).
 
 ## Implementation plan (for agreement)
 
@@ -315,6 +360,11 @@ in a day each.
    candidates the rewriter cannot know which the principal meant.
 8. **Auto categories are seeded `''` grants** (proposed): visible in `acl_function_grants`, revocable
    for all or denied per role, no second mechanism.
+10. **Union, not intersection** (owner, 2026-09-18): a key in several categories is admitted by a
+   grant on any of them and refused by a deny on any; the seed keeps categories disjoint (one per
+   function), and a shipped category can be split into finer ones without duplicating a member. The
+   alternative - every category a key sits in must be granted - was considered and set aside: it
+   reads as a requirement rather than a permission, and disjoint categories give the same control.
 9. **Aliases are names** (owner, 2026-09-18): a function's alias is its own member, seeded and
    granted by hand exactly like the function - nothing follows an alias to its target at any point,
    in the seed, in the writer or in the rewriter. Simpler, and it keeps the one rule: what is in the

@@ -545,6 +545,47 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 using acl_detail::CatalogBackend;
 using acl_detail::Lit;
 
+namespace {
+
+//! The three category listings answered from a model rather than from tables (spec 072)
+IntrospectionRows FunctionListing(const string &listing, const FunctionCategoryModel &model) {
+	IntrospectionRows out;
+	if (StringUtil::CIEquals(listing, "function_categories")) {
+		out.names = {"category", "comment", "builtin"};
+		out.types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN};
+		for (auto &row : model.Categories()) {
+			out.rows.push_back({Value(row.name), Value(row.comment), Value::BOOLEAN(row.builtin)});
+		}
+		return out;
+	}
+	if (StringUtil::CIEquals(listing, "function_category_members")) {
+		out.names = {"category", "database", "schema", "name", "kind"};
+		out.types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+		             LogicalType::VARCHAR};
+		for (auto &member : model.Members()) {
+			out.rows.push_back({Value(member.first), Value(member.second.database), Value(member.second.schema),
+			                    Value(member.second.name), Value(FunctionKindName(member.second.kind))});
+		}
+		return out;
+	}
+	out.names = {"role", "category", "database", "schema", "name", "kind", "allowed"};
+	out.types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	             LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN};
+	for (auto &grant : model.Grants()) {
+		if (grant.IsCategory()) {
+			out.rows.push_back({Value(grant.role), Value(grant.category), Value(""), Value(""), Value(""), Value(""),
+			                    Value::BOOLEAN(grant.allowed)});
+		} else {
+			out.rows.push_back({Value(grant.role), Value(""), Value(grant.key.database), Value(grant.key.schema),
+			                    Value(grant.key.name), Value(FunctionKindName(grant.key.kind)),
+			                    Value::BOOLEAN(grant.allowed)});
+		}
+	}
+	return out;
+}
+
+} // namespace
+
 IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	// what an operator may read of the policy source itself. The issuer's keys are deliberately absent:
 	// a listing describes the policy, and an HS256 key is a shared secret, not metadata.
@@ -575,7 +616,10 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"issuers", "SELECT \"issuer\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\", \"jwks_uri\","
 	                " \"client_id\" FROM %s"},
 	    {"role_mappings", "SELECT \"issuer\", \"source\", \"external_value\", \"role\" FROM %s"},
-	    {"function_gate", "SELECT \"role\", \"name\", \"kind\", \"allowed\" FROM %s"},
+	    {"function_categories", "SELECT \"category\", \"comment\", \"builtin\" FROM %s"},
+	    {"function_category_members", "SELECT \"category\", \"database\", \"schema\", \"name\", \"kind\" FROM %s"},
+	    {"function_grants",
+	     "SELECT \"role\", \"category\", \"database\", \"schema\", \"name\", \"kind\", \"allowed\" FROM %s"},
 	};
 	static const case_insensitive_map_t<string> TABLES = {
 	    {"catalogs", "catalogs"},
@@ -596,7 +640,9 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"admins", "admins"},
 	    {"issuers", "issuers"},
 	    {"role_mappings", "role_mappings"},
-	    {"function_gate", "function_gate"},
+	    {"function_categories", "function_categories"},
+	    {"function_category_members", "function_category_members"},
+	    {"function_grants", "function_grants"},
 	};
 	IntrospectionRows out;
 	if (StringUtil::CIEquals(listing, "status")) {
@@ -618,6 +664,15 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	auto entry = LISTINGS.find(listing);
 	if (entry == LISTINGS.end()) {
 		throw BinderException("acl: there is no listing called \"%s\"", listing);
+	}
+	if (!catalog || catalog->FunctionMode()) {
+		// spec 072: the function categories exist in every mode - the seed in memory and behind a
+		// function-driver source without the slots - so these three answer from the model itself
+		if (StringUtil::CIEquals(listing, "function_categories") ||
+		    StringUtil::CIEquals(listing, "function_category_members") ||
+		    StringUtil::CIEquals(listing, "function_grants")) {
+			return FunctionListing(listing, *FunctionModel());
+		}
 	}
 	if (!catalog) {
 		throw BinderException("acl: no policy source is active, so there is nothing to list - run acl_use_db() or "

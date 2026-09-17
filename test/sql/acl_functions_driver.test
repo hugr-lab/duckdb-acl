@@ -119,16 +119,18 @@ ACL ROLE "analyst" SELECT id, amount FROM report(150) ORDER BY id;
 ----
 3	300
 
-# gate callback: an explicit allow row overrides the default denylist...
+# the function gate (spec 072): a function-driver source carries no categories until its slots land
+# (spec 072 slice 3), so the shipped seed decides - the legacy `function_gate` slot in the map above
+# is not read. `environment` is nobody's from the start...
 statement ok
 ACL ADMIN SET VARIABLE probe = 7;
 
-query I
+statement error
 ACL ROLE "analyst" SELECT getvariable('probe');
 ----
-7
+<REGEX>:.*getvariable.*not allowed.*
 
-# ...while names without a gate row keep the default denylist
+# ...and so are the readers
 statement error
 ACL ROLE "analyst" SELECT * FROM read_csv('/etc/passwd');
 ----

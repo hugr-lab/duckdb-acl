@@ -174,7 +174,7 @@ void CatalogBackend::EnsureFresh() {
 		version = current;
 		objects.clear();
 		functions.clear();
-		gates.clear();
+		function_model.reset();
 		claims_cache.clear();
 		claims_loaded.clear();
 		issuer_cache.clear();
@@ -893,58 +893,65 @@ bool CatalogBackend::DdlTarget(const Principal &principal, const string &vname, 
 	return false;
 }
 
-bool CatalogBackend::FunctionGate(const Principal &principal, const string &name, bool &allowed) {
+shared_ptr<const FunctionCategoryModel> CatalogBackend::FunctionModel() {
 	EnsureFresh();
-	auto lowered = StringUtil::Lower(name);
-	auto key = RoleSig(principal) + "\x1f" + lowered;
 	{
 		lock_guard<mutex> guard(lock);
-		auto entry = gates.find(key);
-		if (entry != gates.end()) {
-			allowed = entry->second.second;
-			return entry->second.first;
+		if (function_model) {
+			return function_model;
 		}
 	}
-	idx_t role_col = 0, allowed_col = 1;
-	unique_ptr<MaterializedQueryResult> result;
 	if (function_mode) {
-		if (!HasSlot("function_gate")) { // no gate source: fall back to the built-in denylist
-			lock_guard<mutex> guard(lock);
-			gates[key] = {false, true};
-			return false;
-		}
-		// positional contract: (role, name, kind, allowed)
-		result = Query("SELECT * FROM " + Slot("function_gate") + "(" + ListLit(principal.roles) + ", " +
-		               ListLit({lowered}) + ")");
-		allowed_col = 3;
-	} else {
-		string role_filter = "\"role\" = ''";
-		if (!principal.roles.empty()) {
-			role_filter += " OR \"role\" IN (" + LitList(principal.roles) + ")";
-		}
-		result = Query("SELECT \"role\", \"allowed\" FROM " + Tbl("function_gate") +
-		               " WHERE lower(\"name\") = " + Lit(lowered) + " AND (" + role_filter + ")");
+		// spec 072 slice 3 brings the slots; until then a function-driver source has no categories of
+		// its own and the seed decides (the store falls back to it on nullptr)
+		return nullptr;
 	}
-	bool have_role_row = false, role_allowed = true;
-	bool have_global_row = false, global_allowed = true;
-	for (idx_t row = 0; row < result->RowCount(); row++) {
-		auto verdict_value = result->GetValue(allowed_col, row);
-		bool verdict = !verdict_value.IsNull() && verdict_value.GetValue<bool>();
-		if (result->GetValue(role_col, row).ToString().empty()) {
-			have_global_row = true;
-			global_allowed = verdict;
-		} else {
-			have_role_row = true;
-			role_allowed = role_allowed && verdict;
-		}
+	// the three tables, whole: a few thousand rows, read once per policy version
+	auto model = make_shared_ptr<FunctionCategoryModel>();
+	auto categories = Query("SELECT \"category\", \"comment\", \"builtin\" FROM " + Tbl("function_categories"));
+	for (idx_t row = 0; row < categories->RowCount(); row++) {
+		auto builtin = categories->GetValue(2, row);
+		model->AddCategory(categories->GetValue(0, row).ToString(), categories->GetValue(1, row).ToString(),
+		                   !builtin.IsNull() && builtin.GetValue<bool>());
 	}
-	bool decided = have_role_row || have_global_row;
-	bool verdict = have_role_row ? role_allowed : global_allowed;
+	auto members = Query("SELECT \"category\", \"database\", \"schema\", \"name\", \"kind\" FROM " +
+	                     Tbl("function_category_members"));
+	for (idx_t row = 0; row < members->RowCount(); row++) {
+		FunctionKey key;
+		key.database = members->GetValue(1, row).ToString();
+		key.schema = members->GetValue(2, row).ToString();
+		key.name = members->GetValue(3, row).ToString();
+		if (!ParseFunctionKind(members->GetValue(4, row).ToString(), key.kind)) {
+			continue; // a kind this build does not know is no key it can resolve
+		}
+		model->AddMember(members->GetValue(0, row).ToString(), key);
+	}
+	auto grants =
+	    Query("SELECT \"role\", \"category\", \"database\", \"schema\", \"name\", \"kind\", \"allowed\" FROM " +
+	          Tbl("function_grants"));
+	for (idx_t row = 0; row < grants->RowCount(); row++) {
+		auto allowed_value = grants->GetValue(6, row);
+		bool allowed = !allowed_value.IsNull() && allowed_value.GetValue<bool>();
+		auto role = grants->GetValue(0, row).ToString();
+		auto category = grants->GetValue(1, row).ToString();
+		if (!category.empty()) {
+			model->AddCategoryGrant(role, category, allowed);
+			continue;
+		}
+		FunctionKey key;
+		key.database = grants->GetValue(2, row).ToString();
+		key.schema = grants->GetValue(3, row).ToString();
+		key.name = grants->GetValue(4, row).ToString();
+		if (!ParseFunctionKind(grants->GetValue(5, row).ToString(), key.kind)) {
+			continue;
+		}
+		model->AddNameGrant(role, key, allowed);
+	}
 	lock_guard<mutex> guard(lock);
-	ClearIfOversized(gates);
-	gates[key] = {decided, verdict};
-	allowed = verdict;
-	return decided;
+	if (!function_model) {
+		function_model = std::move(model);
+	}
+	return function_model;
 }
 
 void CatalogBackend::LoadRoleClaims(Principal &principal) {
@@ -1331,7 +1338,7 @@ void CatalogBackend::InitSchema() {
 using acl_detail::CatalogBackend;
 using acl_detail::Lit;
 
-PolicyStore::PolicyStore() {
+PolicyStore::PolicyStore() : memory_functions(FunctionCategoryModel::Seed()) {
 }
 
 PolicyStore::~PolicyStore() {
@@ -1387,8 +1394,8 @@ bool PolicyStore::CatalogResolveFunction(const Principal &principal, const strin
 	return catalog->ResolveFunction(principal, vname, table_kind, out);
 }
 
-bool PolicyStore::CatalogFunctionGate(const Principal &principal, const QualifiedName &name, bool &allowed) {
-	return catalog->FunctionGate(principal, name.Name().GetIdentifierName(), allowed);
+shared_ptr<const FunctionCategoryModel> PolicyStore::CatalogFunctionModel() {
+	return catalog->FunctionModel();
 }
 
 bool PolicyStore::CatalogPrincipalMainCap(const Principal &principal, const string &capability) {

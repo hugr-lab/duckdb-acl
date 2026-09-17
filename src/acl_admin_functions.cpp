@@ -672,22 +672,265 @@ void AclGrantScalarAliasFunc(DataChunk &args, ExpressionState &state, Vector &re
 	GrantFunctionWrapper(args, state, result, "acl_grant_scalar_alias", "scalar", true, &PolicyStore::scalar_functions);
 }
 
-//! acl_deny_function(fname) / acl_allow_function(fname): gate a function (scalar or table) by name.
-//! With a catalog: an explicit gate row (allow overrides the default denylist); in memory: the
-//! denylist set is edited directly.
-void SetFunctionGate(DataChunk &args, ExpressionState &state, Vector &result, const char *what, bool allowed) {
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto fname = RequiredArg(args, 0, row, what, "name");
-		auto &store = StoreOf(state);
-		if (store.CatalogEnabled()) {
-			store.CatalogSetFunctionGate(fname, allowed, false);
+//===--------------------------------------------------------------------===//
+// spec 072: the function categories' admin functions - what the management SQL compiles into and
+// what an operator calls by hand from the native context. With a catalog each writes rows and
+// bumps the policy version; in memory each swaps a new model in.
+//===--------------------------------------------------------------------===//
+
+//! A member or grant target as written: `name`, `db.schema.name`, a double-quoted name with spaces
+//! (`"IS DISTINCT FROM"`), each optionally followed by TABLE (default scalar; SCALAR is accepted).
+//! A bare name is system.main. Refused when it names something in the never set.
+FunctionKey ParseFunctionSpec(const string &spec_p, const char *fn) {
+	auto spec = spec_p;
+	StringUtil::Trim(spec);
+	FunctionKey key;
+	key.kind = FunctionKind::SCALAR;
+	auto space = spec.find_last_of(" \t");
+	if (space != string::npos && spec.front() != '"') {
+		auto suffix = spec.substr(space + 1);
+		if (ParseFunctionKind(suffix, key.kind)) {
+			spec = spec.substr(0, space);
+			StringUtil::Trim(spec);
+		}
+	} else if (space != string::npos) {
+		// a quoted name: the kind, if any, follows the closing quote
+		auto close = spec.find('"', 1);
+		if (close != string::npos && close + 1 < spec.size()) {
+			auto suffix = spec.substr(close + 1);
+			StringUtil::Trim(suffix);
+			if (ParseFunctionKind(suffix, key.kind)) {
+				spec = spec.substr(0, close + 1);
+			}
+		}
+	}
+	if (spec.size() >= 2 && spec.front() == '"' && spec.back() == '"') {
+		key.database = "system";
+		key.schema = "main";
+		key.name = spec.substr(1, spec.size() - 2);
+	} else {
+		auto parts = SplitTopLevel(spec, '.');
+		if (parts.size() == 1) {
+			key.database = "system";
+			key.schema = "main";
+			key.name = parts[0];
+		} else if (parts.size() == 2) {
+			key.database = "system";
+			key.schema = parts[0];
+			key.name = parts[1];
+		} else if (parts.size() == 3) {
+			key.database = parts[0];
+			key.schema = parts[1];
+			key.name = parts[2];
+		} else {
+			throw BinderException("%s: a function is written as name, schema.name or database.schema.name, "
+			                      "optionally followed by TABLE: \"%s\"",
+			                      fn, spec_p);
+		}
+	}
+	if (key.name.empty()) {
+		throw BinderException("%s: a function name is required", fn);
+	}
+	key.name = StringUtil::Lower(key.name);
+	if (FunctionNeverCallable(key.name)) {
+		throw BinderException("%s: \"%s\" is never callable under a principal - it runs SQL past the rewriter or "
+		                      "reads memory by pointer - and only ACL NATIVE may run it; no category or grant "
+		                      "can hold it",
+		                      fn, key.name);
+	}
+	return key;
+}
+
+//! The members argument: a list of specs, or one VARCHAR holding a comma-separated list
+vector<FunctionKey> ParseFunctionSpecs(DataChunk &args, idx_t col, idx_t row, const char *fn) {
+	vector<FunctionKey> keys;
+	auto value = args.GetValue(col, row);
+	if (value.IsNull()) {
+		throw BinderException("%s: the members are required", fn);
+	}
+	vector<string> specs;
+	if (value.type().id() == LogicalTypeId::LIST) {
+		for (auto &child : ListValue::GetChildren(value)) {
+			if (!child.IsNull()) {
+				specs.push_back(child.ToString());
+			}
+		}
+	} else {
+		specs = SplitTopLevel(value.ToString(), ',');
+	}
+	for (auto &spec : specs) {
+		auto trimmed = spec;
+		StringUtil::Trim(trimmed);
+		if (trimmed.empty()) {
 			continue;
 		}
-		lock_guard<mutex> guard(store.lock);
-		if (allowed) {
-			store.denied_functions.erase(fname);
-		} else {
-			store.denied_functions.insert(fname);
+		keys.push_back(ParseFunctionSpec(trimmed, fn));
+	}
+	if (keys.empty()) {
+		throw BinderException("%s: the members are required", fn);
+	}
+	return keys;
+}
+
+//! acl_create_function_category(name[, comment])
+void AclCreateFunctionCategoryFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto name = RequiredArg(args, 0, row, "acl_create_function_category", "category");
+		auto comment = OptionalArg(args, 1, row, "");
+		auto &store = StoreOf(state);
+		if (store.CatalogEnabled()) {
+			store.CatalogCreateFunctionCategory(name, comment);
+			continue;
+		}
+		store.EditMemoryFunctions([&](FunctionCategoryModel &model) { model.AddCategory(name, comment, false); });
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_drop_function_category(name): the category, its members and every grant on it
+void AclDropFunctionCategoryFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto name = RequiredArg(args, 0, row, "acl_drop_function_category", "category");
+		auto &store = StoreOf(state);
+		if (store.CatalogEnabled()) {
+			store.CatalogDropFunctionCategory(name);
+			continue;
+		}
+		bool found = false;
+		store.EditMemoryFunctions([&](FunctionCategoryModel &model) { found = model.RemoveCategory(name); });
+		if (!found) {
+			throw BinderException("acl admin: function category \"%s\" does not exist", name);
+		}
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_function_category_add(category, members) / acl_function_category_remove(category, members)
+void FunctionCategoryMembers(DataChunk &args, ExpressionState &state, Vector &result, const char *fn, bool add) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto name = RequiredArg(args, 0, row, fn, "category");
+		auto keys = ParseFunctionSpecs(args, 1, row, fn);
+		auto &store = StoreOf(state);
+		if (store.CatalogEnabled()) {
+			store.CatalogFunctionCategoryMembers(name, keys, add);
+			continue;
+		}
+		bool known = true;
+		store.EditMemoryFunctions([&](FunctionCategoryModel &model) {
+			if (!model.HasCategory(name)) {
+				known = false;
+				return;
+			}
+			for (auto &key : keys) {
+				if (add) {
+					model.AddMember(name, key);
+				} else {
+					model.RemoveMember(name, key);
+				}
+			}
+		});
+		if (!known) {
+			throw BinderException("acl admin: function category \"%s\" does not exist", name);
+		}
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclFunctionCategoryAddFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	FunctionCategoryMembers(args, state, result, "acl_function_category_add", true);
+}
+
+void AclFunctionCategoryRemoveFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	FunctionCategoryMembers(args, state, result, "acl_function_category_remove", false);
+}
+
+//! acl_grant_function_category(role, category[, allowed]) / acl_revoke_function_category(role, category):
+//! role '' is every role; allowed = false is a deny, which wins over any grant
+void FunctionCategoryGrant(DataChunk &args, ExpressionState &state, Vector &result, const char *fn, bool remove) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = OptionalArg(args, 0, row, "");
+		auto category = RequiredArg(args, 1, row, fn, "category");
+		auto allowed = OptionalArg(args, 2, row, "true");
+		bool verdict = !StringUtil::CIEquals(allowed, "false");
+		auto &store = StoreOf(state);
+		if (store.CatalogEnabled()) {
+			store.CatalogWriteFunctionGrant(role, category, nullptr, verdict, remove);
+			continue;
+		}
+		bool known = true;
+		store.EditMemoryFunctions([&](FunctionCategoryModel &model) {
+			if (remove) {
+				model.RemoveCategoryGrant(role, category);
+				return;
+			}
+			if (!model.HasCategory(category)) {
+				known = false;
+				return;
+			}
+			model.AddCategoryGrant(role, category, verdict);
+		});
+		if (!known) {
+			throw BinderException("acl admin: function category \"%s\" does not exist", category);
+		}
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclGrantFunctionCategoryFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	FunctionCategoryGrant(args, state, result, "acl_grant_function_category", false);
+}
+
+void AclRevokeFunctionCategoryFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	FunctionCategoryGrant(args, state, result, "acl_revoke_function_category", true);
+}
+
+//! acl_grant_function(role, spec[, allowed]) / acl_revoke_function(role, spec): a grant by name -
+//! admits the key whatever its categories, or with allowed = false denies it whatever they grant
+void FunctionNameGrant(DataChunk &args, ExpressionState &state, Vector &result, const char *fn, bool remove) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = OptionalArg(args, 0, row, "");
+		auto key = ParseFunctionSpec(RequiredArg(args, 1, row, fn, "function"), fn);
+		auto allowed = OptionalArg(args, 2, row, "true");
+		bool verdict = !StringUtil::CIEquals(allowed, "false");
+		auto &store = StoreOf(state);
+		if (store.CatalogEnabled()) {
+			store.CatalogWriteFunctionGrant(role, string(), &key, verdict, remove);
+			continue;
+		}
+		store.EditMemoryFunctions([&](FunctionCategoryModel &model) {
+			if (remove) {
+				model.RemoveNameGrant(role, key);
+			} else {
+				model.AddNameGrant(role, key, verdict);
+			}
+		});
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void AclGrantFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	FunctionNameGrant(args, state, result, "acl_grant_function", false);
+}
+
+void AclRevokeFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	FunctionNameGrant(args, state, result, "acl_revoke_function", true);
+}
+
+//! acl_deny_function(fname) / acl_allow_function(fname) - the legacy pair, kept as wrappers: a grant
+//! by name to every role, denied or allowed, for both kinds (the old gate never knew the kind)
+void SetFunctionGate(DataChunk &args, ExpressionState &state, Vector &result, const char *what, bool allowed) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto spec = RequiredArg(args, 0, row, what, "name");
+		auto &store = StoreOf(state);
+		for (auto kind : {FunctionKind::SCALAR, FunctionKind::TABLE}) {
+			auto key = ParseFunctionSpec(spec, what);
+			key.kind = kind;
+			if (store.CatalogEnabled()) {
+				store.CatalogWriteFunctionGrant(string(), string(), &key, allowed, false);
+				continue;
+			}
+			store.EditMemoryFunctions(
+			    [&](FunctionCategoryModel &model) { model.AddNameGrant(string(), key, allowed); });
 		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -1249,6 +1492,16 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_grant_scalar_alias", {v, v, v}, AclGrantScalarAliasFunc);
 	register_admin("acl_deny_function", {v}, AclDenyFunctionFunc);
 	register_admin("acl_allow_function", {v}, AclAllowFunctionFunc);
+	// the function categories (spec 072): the compile targets of the category management SQL
+	const LogicalType list_v = LogicalType::LIST(LogicalType::VARCHAR);
+	register_admin_set("acl_create_function_category", {{v}, {v, v}}, AclCreateFunctionCategoryFunc);
+	register_admin("acl_drop_function_category", {v}, AclDropFunctionCategoryFunc);
+	register_admin_set("acl_function_category_add", {{v, v}, {v, list_v}}, AclFunctionCategoryAddFunc);
+	register_admin_set("acl_function_category_remove", {{v, v}, {v, list_v}}, AclFunctionCategoryRemoveFunc);
+	register_admin_set("acl_grant_function_category", {{v, v}, {v, v, v}}, AclGrantFunctionCategoryFunc);
+	register_admin("acl_revoke_function_category", {v, v}, AclRevokeFunctionCategoryFunc);
+	register_admin_set("acl_grant_function", {{v, v}, {v, v, v}}, AclGrantFunctionFunc);
+	register_admin("acl_revoke_function", {v, v}, AclRevokeFunctionFunc);
 	// the session contract both doors stand on (spec 040): open once, prefix every statement, close
 	auto register_session_text = [&](const string &name, vector<LogicalType> arguments, const scalar_function_t &fn) {
 		ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::VARCHAR, fn);

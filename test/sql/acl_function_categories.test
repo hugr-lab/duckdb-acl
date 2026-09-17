@@ -1,0 +1,373 @@
+# name: test/sql/acl_function_categories.test
+# description: function categories (spec 072) - a principal calls a function only through a category
+#   granted to one of its roles or a grant by name; a deny anywhere wins; a key is (database, schema,
+#   name, kind); the never set is code; the call is emitted qualified to the key that admitted it
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.payroll(name VARCHAR, salary INT);
+
+statement ok
+INSERT INTO phys.main.payroll VALUES ('alice', 250000), ('bob', 90000);
+
+statement ok
+CREATE SEQUENCE phys.main.seq;
+
+statement ok
+SET VARIABLE secret_var = 'VAR-LEAK';
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET GLOBAL acl_version_check_interval=0;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.payroll AS phys.main.payroll;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE ROLE etl;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE etl WITH (select) MAIN;
+
+# --- the seed: what a fresh catalog carries -------------------------------------------------------
+
+query I
+SELECT count(*) > 1000 FROM acl_function_category_members();
+----
+true
+
+query II
+SELECT category, allowed FROM acl_function_grants() WHERE role = '' ORDER BY category;
+----
+a5	true
+base	true
+generators	true
+geosilo	true
+h3	true
+hashfuncs	true
+icu	true
+inet	true
+json	true
+node_facts	true
+spatial	true
+
+# every function of this build is in a category or in the never set: nothing is uncategorized
+query I
+SELECT count(*) FROM acl_function_status() WHERE status = 'uncategorized' AND present;
+----
+0
+
+# --- ordinary SQL is base, and base is everyone's --------------------------------------------------
+
+query IIII
+ACL ROLE "analyst" SELECT lower('AB'), 1 + 2, count(*) OVER (), list_transform([1], lambda x: x + 1) FROM payroll LIMIT 1;
+----
+ab	3	2	[2]
+
+query I
+ACL ROLE "analyst" SELECT sum(salary) FROM payroll;
+----
+340000
+
+# --- the sensitive categories are nobody's until granted -------------------------------------------
+
+statement error
+ACL ROLE "analyst" SELECT getvariable('secret_var');
+----
+<REGEX>:.*getvariable.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM read_text('README.md');
+----
+<REGEX>:.*read_text.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT stats(salary) FROM payroll;
+----
+<REGEX>:.*stats.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT nextval('phys.main.seq');
+----
+<REGEX>:.*nextval.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM checkpoint();
+----
+<REGEX>:.*checkpoint.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT pg_get_viewdef(1);
+----
+<REGEX>:.*pg_get_viewdef.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM histogram_values(payroll, salary);
+----
+<REGEX>:.*histogram_values.*not allowed.*
+
+# --- a grant on a category, a grant by name, a deny by name, a deny on a category ------------------
+
+statement ok
+SELECT acl_grant_function_category('etl', 'readers');
+
+query I
+ACL ROLE "etl" SELECT count(*) > 0 FROM read_text('README.md');
+----
+true
+
+# readers, but not read_text: the deny by name wins over the category grant
+statement ok
+SELECT acl_grant_function('etl', 'read_text TABLE', 'false');
+
+statement error
+ACL ROLE "etl" SELECT * FROM read_text('README.md');
+----
+<REGEX>:.*read_text.*not allowed.*
+
+query I
+ACL ROLE "etl" SELECT count(*) FROM read_csv('README.md', header := false, columns := {'line': 'VARCHAR'}) WHERE false;
+----
+0
+
+# one function and nothing else: a grant by name admits whatever its categories
+statement ok
+SELECT acl_grant_function('analyst', 'getvariable');
+
+query I
+ACL ROLE "analyst" SELECT getvariable('secret_var');
+----
+VAR-LEAK
+
+statement error
+ACL ROLE "analyst" SELECT current_setting('threads');
+----
+<REGEX>:.*current_setting.*not allowed.*
+
+# a deny on a category takes it from a role that holds it through ''
+statement ok
+SELECT acl_grant_function_category('analyst', 'base', 'false');
+
+statement error
+ACL ROLE "analyst" SELECT lower('AB');
+----
+<REGEX>:.*lower.*not allowed.*
+
+statement ok
+SELECT acl_revoke_function_category('analyst', 'base');
+
+query I
+ACL ROLE "analyst" SELECT lower('AB');
+----
+ab
+
+# --- the kind is part of the key: range the table function and range the scalar are two keys -------
+
+statement ok
+SELECT acl_grant_function('analyst', 'range TABLE', 'false');
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM range(3);
+----
+<REGEX>:.*range.*not allowed.*
+
+query I
+ACL ROLE "analyst" SELECT range(1, 3);
+----
+[1, 2]
+
+statement ok
+SELECT acl_revoke_function('analyst', 'range TABLE');
+
+# --- the never set: not in the data, refused at write time, refused whatever a grant says -----------
+
+statement error
+SELECT acl_grant_function('etl', 'query_table TABLE');
+----
+<REGEX>:.*never callable.*
+
+statement error
+SELECT acl_function_category_add('readers', 'query TABLE');
+----
+<REGEX>:.*never callable.*
+
+statement error
+ACL ROLE "etl" SELECT * FROM query_table('phys.main.payroll');
+----
+<REGEX>:.*query_table.*not allowed.*
+
+query I
+SELECT status FROM acl_function_status() WHERE name = 'query_table' AND kind = 'table';
+----
+never
+
+# --- an admin's macro is a key of its own, admitted only by a grant on that key ---------------------
+
+statement ok
+CREATE MACRO phys.main.peek() AS TABLE SELECT * FROM phys.main.payroll;
+
+statement ok
+CREATE MACRO phys.main.top_salary() AS (SELECT max(salary) FROM phys.main.payroll);
+
+statement error
+ACL ROLE "analyst" SELECT * FROM peek();
+----
+<REGEX>:.*peek.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT top_salary();
+----
+<REGEX>:.*top_salary.*not allowed.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM phys.main.peek();
+----
+<REGEX>:.*peek.*not allowed.*
+
+query I
+SELECT status FROM acl_function_status() WHERE name = 'peek';
+----
+uncategorized
+
+statement ok
+SELECT acl_grant_function('analyst', 'phys.main.peek TABLE');
+
+query II
+ACL ROLE "analyst" SELECT * FROM peek() ORDER BY name;
+----
+alice	250000
+bob	90000
+
+# --- a macro that shadows a builtin does not take the principal's call: the call is qualified ------
+
+statement ok
+CREATE MACRO lower(v) AS (SELECT max(name) FROM phys.main.payroll);
+
+query I
+ACL ROLE "analyst" SELECT lower('AB');
+----
+ab
+
+query I
+SELECT lower('AB');
+----
+bob
+
+# --- the method-call spelling is the call over the column ------------------------------------------
+
+query I
+ACL ROLE "analyst" SELECT name.upper() FROM payroll ORDER BY 1 LIMIT 1;
+----
+ALICE
+
+query I
+ACL ROLE "analyst" SELECT p.name.upper() FROM payroll p ORDER BY 1 LIMIT 1;
+----
+ALICE
+
+# --- a category of the operator's own ---------------------------------------------------------------
+
+statement ok
+SELECT acl_create_function_category('sequences', 'the sequence functions');
+
+statement ok
+SELECT acl_function_category_add('sequences', ['nextval', 'currval', 'setval']);
+
+query I
+SELECT list_sort(categories) FROM acl_function_status() WHERE name = 'nextval';
+----
+[node, sequences]
+
+statement ok
+SELECT acl_grant_function_category('etl', 'sequences');
+
+query I
+ACL ROLE "etl" SELECT nextval('phys.main.seq');
+----
+1
+
+statement error
+ACL ROLE "analyst" SELECT nextval('phys.main.seq');
+----
+<REGEX>:.*nextval.*not allowed.*
+
+statement ok
+SELECT acl_function_category_remove('sequences', 'setval');
+
+query I
+SELECT count(*) FROM acl_function_category_members() WHERE category = 'sequences';
+----
+2
+
+statement ok
+SELECT acl_drop_function_category('sequences');
+
+statement error
+ACL ROLE "etl" SELECT nextval('phys.main.seq');
+----
+<REGEX>:.*nextval.*not allowed.*
+
+query I
+SELECT count(*) FROM acl_function_grants() WHERE category = 'sequences';
+----
+0
+
+# --- the legacy pair still works, as a grant by name to every role for both kinds ------------------
+
+statement ok
+SELECT acl_deny_function('md5');
+
+statement error
+ACL ROLE "analyst" SELECT md5('x');
+----
+<REGEX>:.*md5.*not allowed.*
+
+statement ok
+SELECT acl_allow_function('md5');
+
+query I
+ACL ROLE "analyst" SELECT md5('x');
+----
+9dd4e461268c8034f5c8564e155c67a6
+
+# --- what the admin sees ---------------------------------------------------------------------------
+
+query IIII
+SELECT name, kind, categories, status FROM acl_function_status() WHERE name IN ('read_parquet', 'st_area') ORDER BY name;
+----
+read_parquet	table	[readers]	categorized
+st_area	scalar	[spatial]	categorized
+
+query II
+SELECT present, function_type IS NULL FROM acl_function_status() WHERE name = 'st_area';
+----
+false	true
+
+query III
+SELECT name, allowed, decided_by FROM acl_function_status('etl') WHERE "database" = 'system' AND name IN ('read_text', 'read_parquet', 'lower') AND (name <> 'lower' OR kind = 'scalar') ORDER BY name;
+----
+lower	true	category:base@
+read_parquet	true	category:readers@etl
+read_text	false	name:etl

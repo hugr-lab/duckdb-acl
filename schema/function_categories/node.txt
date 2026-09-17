@@ -1,0 +1,28 @@
+currval
+nextval
+setval
+sleep_ms
+write_log
+checkpoint TABLE
+create_external_resource TABLE
+dbgen TABLE
+delta_set_transaction_version TABLE
+deregister_external_resource TABLE
+destroy_external_resource TABLE
+disable_logging TABLE
+disable_profiling TABLE
+dsdgen TABLE
+enable_logging TABLE
+enable_profiling TABLE
+force_checkpoint TABLE
+iceberg_to_ducklake TABLE
+load_aws_credentials TABLE
+notify_ui TABLE
+register_external_resource TABLE
+register_external_resource_type TABLE
+start_ui TABLE
+start_ui_server TABLE
+stop_ui_server TABLE
+truncate_duckdb_logs TABLE
+unity_catalog_checkpoint_table TABLE
+system.pg_catalog.pg_sleep
