@@ -1,0 +1,289 @@
+# name: test/sql/acl_function_syntax.test
+# description: the management SQL of the function categories (spec 072, slice 2) - CREATE / ALTER /
+#   DROP FUNCTION CATEGORY, GRANT / DENY / REVOKE FUNCTION [CATEGORY] to a role or to all roles - each
+#   compiled into the admin functions and visible in the listings; the write-time check that a member
+#   or an admitting grant names a function this node has; the scope it takes
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.people(name VARCHAR, salary INT);
+
+statement ok
+INSERT INTO phys.main.people VALUES ('alice', 250000), ('bob', 90000);
+
+statement ok
+CREATE MACRO phys.main.peek() AS TABLE SELECT * FROM phys.main.people;
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET GLOBAL acl_version_check_interval=0;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.people AS phys.main.people;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE ROLE gis;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE gis WITH (select) MAIN;
+
+# --- a category of the operator's own ---------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE FUNCTION CATEGORY sequences COMMENT 'the sequence functions';
+
+query III
+SELECT category, comment, builtin FROM acl_function_categories() WHERE category = 'sequences';
+----
+sequences	the sequence functions	false
+
+statement ok
+ACL ADMIN ALTER FUNCTION CATEGORY sequences ADD (nextval, currval, setval);
+
+query I
+SELECT list_sort(list(name)) FROM acl_function_category_members() WHERE category = 'sequences';
+----
+[currval, nextval, setval]
+
+statement ok
+ACL ADMIN ALTER FUNCTION CATEGORY sequences DROP (setval);
+
+query I
+SELECT count(*) FROM acl_function_category_members() WHERE category = 'sequences';
+----
+2
+
+# a re-create keeps the members and takes the new comment
+statement ok
+ACL ADMIN CREATE FUNCTION CATEGORY sequences COMMENT 'sequences, read and advance';
+
+query II
+SELECT comment, (SELECT count(*) FROM acl_function_category_members() WHERE category = 'sequences') FROM acl_function_categories() WHERE category = 'sequences';
+----
+sequences, read and advance	2
+
+# --- grants: to a role, to all roles, a deny, a revoke ----------------------------------------------
+
+statement error
+ACL ROLE "analyst" SELECT nextval('phys.main.people_seq');
+----
+<REGEX>:.*nextval.*not allowed.*
+
+statement ok
+ACL ADMIN GRANT FUNCTION CATEGORY sequences TO ROLE analyst;
+
+query III
+SELECT role, category, allowed FROM acl_function_grants() WHERE category = 'sequences';
+----
+analyst	sequences	true
+
+statement ok
+CREATE SEQUENCE phys.main.people_seq;
+
+query I
+ACL ROLE "analyst" SELECT nextval('phys.main.people_seq');
+----
+1
+
+statement ok
+ACL ADMIN GRANT FUNCTION CATEGORY sequences TO ALL ROLES;
+
+query I
+ACL ROLE "gis" SELECT nextval('phys.main.people_seq');
+----
+2
+
+statement ok
+ACL ADMIN DENY FUNCTION CATEGORY sequences TO ROLE gis;
+
+statement error
+ACL ROLE "gis" SELECT nextval('phys.main.people_seq');
+----
+<REGEX>:.*nextval.*not allowed.*
+
+query II
+SELECT role, allowed FROM acl_function_grants() WHERE category = 'sequences' ORDER BY role;
+----
+(empty)	true
+analyst	true
+gis	false
+
+statement ok
+ACL ADMIN REVOKE FUNCTION CATEGORY sequences FROM ROLE gis;
+
+statement ok
+ACL ADMIN REVOKE FUNCTION CATEGORY sequences FROM ALL ROLES;
+
+query I
+SELECT list(role ORDER BY role) FROM acl_function_grants() WHERE category = 'sequences';
+----
+[analyst]
+
+# --- grants by name: a builtin, an admin's macro, an operator, a table function ---------------------
+
+statement ok
+ACL ADMIN GRANT FUNCTION getvariable TO ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT FUNCTION phys.main.peek TABLE TO ROLE gis;
+
+query II
+ACL ROLE "gis" SELECT * FROM peek() ORDER BY name LIMIT 1;
+----
+alice	250000
+
+statement ok
+ACL ADMIN DENY FUNCTION "+" TO ROLE gis;
+
+statement error
+ACL ROLE "gis" SELECT 1 + 1;
+----
+<REGEX>:.*not allowed.*
+
+query I
+ACL ROLE "analyst" SELECT 1 + 1;
+----
+2
+
+statement ok
+ACL ADMIN REVOKE FUNCTION "+" FROM ROLE gis;
+
+query I
+ACL ROLE "gis" SELECT 1 + 1;
+----
+2
+
+query IIIII
+SELECT role, database, schema, name, kind FROM acl_function_grants() WHERE category = '' ORDER BY role, name;
+----
+analyst	system	main	getvariable	scalar
+gis	phys	main	peek	table
+
+statement ok
+ACL ADMIN REVOKE FUNCTION getvariable FROM ROLE analyst;
+
+statement ok
+ACL ADMIN DENY FUNCTION read_parquet TABLE TO ALL ROLES;
+
+query III
+SELECT role, name, allowed FROM acl_function_grants() WHERE name = 'read_parquet';
+----
+(empty)	read_parquet	false
+
+# --- the write-time check: a member or an admitting grant names a function this node has ------------
+
+statement error
+ACL ADMIN ALTER FUNCTION CATEGORY sequences ADD (nextvall);
+----
+<REGEX>:.*this node has no scalar function system.main.nextvall.*
+
+# a table function written without TABLE is the scalar key, which this node has no function for
+statement error
+ACL ADMIN GRANT FUNCTION read_text TO ROLE analyst;
+----
+<REGEX>:.*this node has no scalar function system.main.read_text.*
+
+# ... and naming the kind records a function this node does not carry: a fleet catalog may need it
+statement ok
+ACL ADMIN GRANT FUNCTION st_read TABLE TO ROLE gis;
+
+query II
+SELECT present, status FROM acl_function_status('gis') WHERE name = 'st_read' AND kind = 'table';
+----
+false	categorized
+
+# a deny and a revoke may name anything: taking away what is not there is not an error
+statement ok
+ACL ADMIN DENY FUNCTION no_such_function TO ROLE gis;
+
+statement ok
+ACL ADMIN REVOKE FUNCTION no_such_function FROM ROLE gis;
+
+# the never set is refused where it is written, in every form
+statement error
+ACL ADMIN GRANT FUNCTION query_table TABLE TO ROLE analyst;
+----
+<REGEX>:.*never callable.*
+
+statement error
+ACL ADMIN ALTER FUNCTION CATEGORY sequences ADD (arrow_scan TABLE);
+----
+<REGEX>:.*never callable.*
+
+# --- DROP, with and without IF EXISTS -------------------------------------------------------------
+
+statement ok
+ACL ADMIN DROP FUNCTION CATEGORY sequences;
+
+query I
+SELECT count(*) FROM acl_function_categories() WHERE category = 'sequences';
+----
+0
+
+query I
+SELECT count(*) FROM acl_function_grants() WHERE category = 'sequences';
+----
+0
+
+statement error
+ACL ADMIN DROP FUNCTION CATEGORY sequences;
+----
+<REGEX>:.*does not exist.*
+
+statement ok
+ACL ADMIN DROP FUNCTION CATEGORY IF EXISTS sequences;
+
+# duckdb's own CREATE FUNCTION (a macro) is not ours: it stays a native statement under ADMIN
+statement ok
+ACL ADMIN CREATE FUNCTION plus_one(x) AS x + 1;
+
+query I
+SELECT plus_one(1);
+----
+2
+
+# --- the scope: a catalog-scoped manage cannot touch the categories ---------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE catalog_admin;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE catalog_admin CAPS '{"manage": true}';
+
+statement error
+ACL ROLE "catalog_admin" ACL GRANT FUNCTION CATEGORY readers TO ROLE analyst;
+----
+<REGEX>:.*not catalog-specific.*
+
+statement ok
+ACL ADMIN GRANT ADMIN manage TO ROLE catalog_admin;
+
+statement ok
+ACL ROLE "catalog_admin" ACL GRANT FUNCTION CATEGORY readers TO ROLE analyst;
+
+query I
+SELECT count(*) FROM acl_function_grants() WHERE category = 'readers' AND role = 'analyst';
+----
+1

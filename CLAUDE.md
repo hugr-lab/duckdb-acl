@@ -216,7 +216,10 @@ functions: `acl_create_function_category(name[, comment])`, `acl_drop_function_c
 `acl_function_category_add/remove(category, members)` (a list or a csv of `[db.schema.]name [TABLE]`),
 `acl_grant_function_category(role, category[, allowed])` / `acl_revoke_function_category(role, category)`,
 `acl_grant_function(role, spec[, allowed])` / `acl_revoke_function(role, spec)`; role `''` is every
-role; the never set is refused where the grant is written.
+role; the never set is refused where the grant is written, and a member or an admitting grant must
+name a function the node has unless its kind is written. The SQL forms: `CREATE | ALTER … ADD|DROP (…)
+| DROP [IF EXISTS] FUNCTION CATEGORY c`, `GRANT | DENY | REVOKE FUNCTION [CATEGORY] … TO | FROM ROLE r
+| ALL ROLES` (unrestricted `manage` only; see docs/management-sql.md).
 
 ## Serving clients directly
 

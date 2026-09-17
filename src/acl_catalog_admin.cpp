@@ -1697,13 +1697,16 @@ void PolicyStore::CatalogCreateFunctionCategory(const string &name, const string
 	});
 }
 
-void PolicyStore::CatalogDropFunctionCategory(const string &name) {
+void PolicyStore::CatalogDropFunctionCategory(const string &name, bool if_exists) {
 	RequireCatalog(catalog, "acl_drop_function_category");
 	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
 	                            vector<string> &statements) {
 		auto exists =
 		    read("SELECT 1 FROM " + catalog->Tbl("function_categories") + " WHERE \"category\" = " + Lit(name));
 		if (exists->RowCount() == 0) {
+			if (if_exists) {
+				return; // IF EXISTS: nothing to drop is not an error
+			}
 			throw BinderException("acl admin: function category \"%s\" does not exist", name);
 		}
 		// its members and every grant on it go with it: a grant on a category that is gone would be a

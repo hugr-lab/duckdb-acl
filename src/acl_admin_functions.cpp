@@ -1,4 +1,3 @@
-#include "duckdb/main/connection.hpp"
 #include "acl_admin_functions.hpp"
 #include "acl_door_common.hpp"
 
@@ -6,6 +5,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -681,18 +681,27 @@ void AclGrantScalarAliasFunc(DataChunk &args, ExpressionState &state, Vector &re
 //! A member or grant target as written: `name`, `db.schema.name`, a double-quoted name with spaces
 //! (`"IS DISTINCT FROM"`), each optionally followed by TABLE (default scalar; SCALAR is accepted).
 //! A bare name is system.main. Refused when it names something in the never set.
-FunctionKey ParseFunctionSpec(const string &spec_p, const char *fn) {
+//! A spec as parsed: the key, and whether the kind was written - which is how a fleet catalog records
+//! a function of an extension the writing node does not carry (the existence check stands down)
+struct FunctionSpec {
+	FunctionKey key;
+	bool kind_explicit = false;
+};
+
+FunctionSpec ParseFunctionSpec(const string &spec_p, const char *fn) {
 	auto spec = spec_p;
 	StringUtil::Trim(spec);
 	if (spec.empty()) {
 		throw BinderException("%s: a function name is required", fn);
 	}
-	FunctionKey key;
+	FunctionSpec out;
+	auto &key = out.key;
 	key.kind = FunctionKind::SCALAR;
 	auto space = spec.find_last_of(" \t");
 	if (space != string::npos && spec.front() != '"') {
 		auto suffix = spec.substr(space + 1);
 		if (ParseFunctionKind(suffix, key.kind)) {
+			out.kind_explicit = true;
 			spec = spec.substr(0, space);
 			StringUtil::Trim(spec);
 		}
@@ -703,6 +712,7 @@ FunctionKey ParseFunctionSpec(const string &spec_p, const char *fn) {
 			auto suffix = spec.substr(close + 1);
 			StringUtil::Trim(suffix);
 			if (ParseFunctionKind(suffix, key.kind)) {
+				out.kind_explicit = true;
 				spec = spec.substr(0, close + 1);
 			}
 		}
@@ -735,18 +745,55 @@ FunctionKey ParseFunctionSpec(const string &spec_p, const char *fn) {
 		throw BinderException("%s: a function name is required", fn);
 	}
 	key.name = StringUtil::Lower(key.name);
+	key.database = StringUtil::Lower(key.database);
+	key.schema = StringUtil::Lower(key.schema);
 	if (FunctionNeverCallable(key.name)) {
 		throw BinderException("%s: \"%s\" is never callable under a principal - it runs SQL past the rewriter or "
 		                      "reads memory by pointer - and only ACL NATIVE may run it; no category or grant "
 		                      "can hold it",
 		                      fn, key.name);
 	}
-	return key;
+	return out;
+}
+
+//! spec 072: a member or an admitting grant names a function this node has, unless its kind was
+//! written explicitly. Read off duckdb_functions() on a connection of its own, at write time only -
+//! the query path never looks. A typo, or a table function written without TABLE, is refused here
+//! rather than recorded as a key nothing will ever resolve to.
+void RequireFunctionOnNode(ClientContext &context, const FunctionSpec &spec, const char *fn) {
+	if (spec.kind_explicit) {
+		return;
+	}
+	auto &key = spec.key;
+	// the calls are qualified: an admin's macro named `lower` in the default catalog would answer
+	// this query too (the shadowing the gate protects a principal from, spec 072 §"known residual")
+	Connection con(DatabaseInstance::GetDatabase(context));
+	auto prepared =
+	    con.Prepare("SELECT 1 FROM duckdb_functions() WHERE system.main.lower(function_name) = $1 AND "
+	                "system.main.lower(database_name) = $2 AND system.main.lower(schema_name) = $3 AND (CASE WHEN "
+	                "function_type IN ('table', 'table_macro') THEN 'table' WHEN function_type = 'pragma' THEN "
+	                "'pragma' ELSE 'scalar' END) = $4 LIMIT 1");
+	if (prepared->HasError()) {
+		throw BinderException("%s: cannot read the node's functions: %s", fn, prepared->GetError());
+	}
+	auto result =
+	    prepared->Execute(Value(key.name), Value(key.database), Value(key.schema), Value(FunctionKindName(key.kind)));
+	if (result->HasError()) {
+		throw BinderException("%s: cannot read the node's functions: %s", fn, result->GetError());
+	}
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		throw BinderException("%s: this node has no %s function %s - a table function is written with TABLE after "
+		                      "its name, and a function this node does not carry is recorded by naming its kind "
+		                      "explicitly (\"%s %s\")",
+		                      fn, FunctionKindName(key.kind), key.ToString(), key.name,
+		                      key.kind == FunctionKind::TABLE ? "TABLE" : "SCALAR");
+	}
 }
 
 //! The members argument: a list of specs, or one VARCHAR holding a comma-separated list
-vector<FunctionKey> ParseFunctionSpecs(DataChunk &args, idx_t col, idx_t row, const char *fn) {
-	vector<FunctionKey> keys;
+vector<FunctionSpec> ParseFunctionSpecs(DataChunk &args, idx_t col, idx_t row, const char *fn) {
+	vector<FunctionSpec> keys;
 	auto value = args.GetValue(col, row);
 	if (value.IsNull()) {
 		throw BinderException("%s: the members are required", fn);
@@ -790,18 +837,20 @@ void AclCreateFunctionCategoryFunc(DataChunk &args, ExpressionState &state, Vect
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_drop_function_category(name): the category, its members and every grant on it
+//! acl_drop_function_category(name[, mode]): the category, its members and every grant on it; mode
+//! 'skip' (IF EXISTS) makes a missing one a no-op rather than an error
 void AclDropFunctionCategoryFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto name = RequiredArg(args, 0, row, "acl_drop_function_category", "category");
+		bool if_exists = StringUtil::CIEquals(OptionalArg(args, 1, row, ""), "skip");
 		auto &store = StoreOf(state);
 		if (store.CatalogEnabled()) {
-			store.CatalogDropFunctionCategory(name);
+			store.CatalogDropFunctionCategory(name, if_exists);
 			continue;
 		}
 		bool found = false;
 		store.EditMemoryFunctions([&](FunctionCategoryModel &model) { found = model.RemoveCategory(name); });
-		if (!found) {
+		if (!found && !if_exists) {
 			throw BinderException("acl admin: function category \"%s\" does not exist", name);
 		}
 	}
@@ -812,7 +861,14 @@ void AclDropFunctionCategoryFunc(DataChunk &args, ExpressionState &state, Vector
 void FunctionCategoryMembers(DataChunk &args, ExpressionState &state, Vector &result, const char *fn, bool add) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto name = RequiredArg(args, 0, row, fn, "category");
-		auto keys = ParseFunctionSpecs(args, 1, row, fn);
+		auto specs = ParseFunctionSpecs(args, 1, row, fn);
+		vector<FunctionKey> keys;
+		for (auto &spec : specs) {
+			if (add) {
+				RequireFunctionOnNode(state.GetContext(), spec, fn);
+			}
+			keys.push_back(spec.key);
+		}
 		auto &store = StoreOf(state);
 		if (store.CatalogEnabled()) {
 			store.CatalogFunctionCategoryMembers(name, keys, add);
@@ -892,9 +948,14 @@ void AclRevokeFunctionCategoryFunc(DataChunk &args, ExpressionState &state, Vect
 void FunctionNameGrant(DataChunk &args, ExpressionState &state, Vector &result, const char *fn, bool remove) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = OptionalArg(args, 0, row, "");
-		auto key = ParseFunctionSpec(RequiredArg(args, 1, row, fn, "function"), fn);
+		auto spec = ParseFunctionSpec(RequiredArg(args, 1, row, fn, "function"), fn);
 		auto allowed = OptionalArg(args, 2, row, "true");
 		bool verdict = !StringUtil::CIEquals(allowed, "false");
+		if (!remove && verdict) {
+			// an admitting grant names something callable; a deny or a revoke may name anything
+			RequireFunctionOnNode(state.GetContext(), spec, fn);
+		}
+		auto &key = spec.key;
 		auto &store = StoreOf(state);
 		if (store.CatalogEnabled()) {
 			store.CatalogWriteFunctionGrant(role, string(), &key, verdict, remove);
@@ -926,7 +987,7 @@ void SetFunctionGate(DataChunk &args, ExpressionState &state, Vector &result, co
 		auto spec = RequiredArg(args, 0, row, what, "name");
 		auto &store = StoreOf(state);
 		for (auto kind : {FunctionKind::SCALAR, FunctionKind::TABLE}) {
-			auto key = ParseFunctionSpec(spec, what);
+			auto key = ParseFunctionSpec(spec, what).key;
 			key.kind = kind;
 			if (store.CatalogEnabled()) {
 				store.CatalogWriteFunctionGrant(string(), string(), &key, allowed, false);
@@ -1498,7 +1559,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	// the function categories (spec 072): the compile targets of the category management SQL
 	const LogicalType list_v = LogicalType::LIST(LogicalType::VARCHAR);
 	register_admin_set("acl_create_function_category", {{v}, {v, v}}, AclCreateFunctionCategoryFunc);
-	register_admin("acl_drop_function_category", {v}, AclDropFunctionCategoryFunc);
+	register_admin_set("acl_drop_function_category", {{v}, {v, v}}, AclDropFunctionCategoryFunc);
 	register_admin_set("acl_function_category_add", {{v, v}, {v, list_v}}, AclFunctionCategoryAddFunc);
 	register_admin_set("acl_function_category_remove", {{v, v}, {v, list_v}}, AclFunctionCategoryRemoveFunc);
 	register_admin_set("acl_grant_function_category", {{v, v}, {v, v, v}}, AclGrantFunctionCategoryFunc);

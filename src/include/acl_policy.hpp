@@ -350,6 +350,14 @@ struct PolicyStore {
 	//! grants, edited by the legacy acl_deny_function / acl_allow_function and the category admin
 	//! functions. Immutable once built; a writer copies, edits and swaps (EditMemoryFunctions).
 	shared_ptr<const FunctionCategoryModel> memory_functions;
+	//! spec 072: decisions cached per role signature and name as written, against the model they
+	//! were made with - a policy change swaps the model, and every cached decision goes with it
+	struct FunctionDecisionCache {
+		static constexpr idx_t CAPACITY = 4096;
+		shared_ptr<const FunctionCategoryModel> model;
+		std::unordered_map<string, FunctionDecision> decisions;
+	};
+	FunctionDecisionCache function_decisions; // guarded by `lock`
 	// parsed rewrite-template prototypes, so a template is parsed once and only copied per request
 	TemplateCache<QueryNode> select_cache;      // relation / table-function subquery templates
 	TemplateCache<ParsedExpression> expr_cache; // scalar macro templates
@@ -470,7 +478,7 @@ struct PolicyStore {
 	// spec 072: the function categories' writers (acl_catalog_admin.cpp). Every one bumps the policy
 	// version, so the next statement resolves against a model rebuilt from the rows.
 	void CatalogCreateFunctionCategory(const string &name, const string &comment);
-	void CatalogDropFunctionCategory(const string &name);
+	void CatalogDropFunctionCategory(const string &name, bool if_exists);
 	//! add=true inserts the keys as members (the category must exist), add=false removes them
 	void CatalogFunctionCategoryMembers(const string &name, const vector<FunctionKey> &keys, bool add);
 	//! A grant row on a category (key == nullptr) or on a function by name; remove=true deletes the row

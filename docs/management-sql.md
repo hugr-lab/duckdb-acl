@@ -495,6 +495,58 @@ ACL ADMIN GRANT TABLE sales.shout TO ROLE ingest CAPS '{"select": true}';   -- r
 
 Function: `acl_grant_object(role, vcat, vname, caps_json[, rls, columns])`.
 
+## Function categories
+
+What a principal may call (spec 072). A function's key is `database.schema.name` plus its kind -
+`scalar` (the default: scalars, aggregates, windows, macros) or `TABLE` (a function in FROM). A
+**category** is a named set of keys; a call is admitted when its key is in a category granted to one
+of the principal's roles (or to all roles) or is granted by name; a deny anywhere wins; a key in no
+category is refused. The shipped categories are seeded once, when the catalog is created, and never
+touched again by the extension: `base`, `generators`, `node_facts`, `json`, `icu`, `spatial`, `inet`,
+`h3`, `hashfuncs`, `a5`, `geosilo` are every role's from the start; `readers`, `meta`, `environment`,
+`node`, `plan` are nobody's until granted. A function of a newly loaded extension, a builtin a pin
+bump adds, a macro an admin creates: in no category, refused, until put somewhere -
+`SELECT * FROM acl_function_status() WHERE status = 'uncategorized'` is the screen.
+
+```sql
+CREATE FUNCTION CATEGORY <name> [COMMENT '<text>']
+ALTER FUNCTION CATEGORY <name> ADD (<function> [, …]) | DROP (<function> [, …])
+DROP FUNCTION CATEGORY [IF EXISTS] <name>
+
+GRANT  FUNCTION CATEGORY <name> TO ROLE <role> | TO ALL ROLES
+DENY   FUNCTION CATEGORY <name> TO ROLE <role> | TO ALL ROLES
+REVOKE FUNCTION CATEGORY <name> FROM ROLE <role> | FROM ALL ROLES
+
+GRANT  FUNCTION <function> TO ROLE <role> | TO ALL ROLES
+DENY   FUNCTION <function> TO ROLE <role> | TO ALL ROLES
+REVOKE FUNCTION <function> FROM ROLE <role> | FROM ALL ROLES
+```
+
+A `<function>` is `name`, `schema.name` or `database.schema.name` - a bare name is `system.main`,
+where every builtin lives - optionally followed by `TABLE`; an operator is double-quoted (`"+"`,
+`"IS DISTINCT FROM"`). A member or an admitting grant must name a function this node has, unless the
+kind was written explicitly: that is how a fleet-shared catalog records a function of an extension
+the writing node does not carry. The never set - `acl_*`, `ducklake_*`, `quack_*`, `arrow_scan*`,
+`query`, `query_table`, `json_execute_serialized_sql`, a scanner's `*_query` / `*_execute` /
+`*_attach` - is refused where it is written: only `ACL NATIVE` runs those.
+
+```sql
+ACL ADMIN CREATE FUNCTION CATEGORY sequences COMMENT 'read and advance a sequence';
+ACL ADMIN ALTER FUNCTION CATEGORY sequences ADD (nextval, currval, setval);
+ACL ADMIN GRANT FUNCTION CATEGORY sequences TO ROLE etl;
+ACL ADMIN GRANT FUNCTION CATEGORY readers TO ROLE etl;          -- unconfined: any path the node can read
+ACL ADMIN DENY FUNCTION read_text TABLE TO ROLE etl;            -- readers, but not this one
+ACL ADMIN GRANT FUNCTION lake.main.peek TABLE TO ROLE analyst;  -- an admin's macro: only by a grant on its key
+ACL ADMIN DENY FUNCTION CATEGORY base TO ROLE quarantine;       -- takes back what every role holds
+ACL ADMIN REVOKE FUNCTION CATEGORY spatial FROM ALL ROLES;      -- spatial is nobody's from now on
+ACL ADMIN DROP FUNCTION CATEGORY IF EXISTS sequences;           -- with its members and grants
+```
+
+The bulk form is the native mode: `ACL NATIVE SELECT acl_function_category_add('myext', list(function_name))
+FROM duckdb_functions() WHERE function_name LIKE 'myext_%';`. A category acts in every catalog a role
+holds, so these statements take an unrestricted `manage` scope - a catalog-scoped one is refused as
+"not catalog-specific".
+
 ## Administration scopes
 
 ```
