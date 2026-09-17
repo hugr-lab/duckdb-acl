@@ -404,6 +404,8 @@ parse_dirname
 parse_dirpath
 parse_duckdb_log_message
 parse_filename
+# duckdb ed4f0376 (v2.0-cyanoptera, 2026-09-17): the hive partition path component of a value - pure string compute
+hive_partition_component
 parse_formatted_bytes
 parse_path
 path_join
