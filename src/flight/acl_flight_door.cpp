@@ -30,9 +30,10 @@
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
 #include "acl_oidc.hpp"
-#include "duckdb/main/stream_query_result.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/common/enums/result_eagerness.hpp"
+#include "duckdb/main/query_result_stream.hpp"
 #include <thread>
 
 #include <arrow/c/bridge.h>
@@ -82,6 +83,21 @@ struct TempScanScope {
 	}
 };
 
+//! The ingest seam (spec 049), held the same way around the one Prepare that composes an ingest:
+//! the rewriter takes the factory when it meets the composed `arrow_scan()` under the INGEST
+//! prefix. `Taken()` after the Prepare says whether it did.
+struct ArrowIngestScope {
+	explicit ArrowIngestScope(shared_ptr<TableFunctionInfo> factory) {
+		SetArrowIngestFactory(std::move(factory));
+	}
+	bool Taken() {
+		return TakeArrowIngestFactory() == nullptr;
+	}
+	~ArrowIngestScope() {
+		SetArrowIngestFactory(nullptr);
+	}
+};
+
 //! Everything one served instance needs: the database the statements run against, the store that
 //! resolves sessions, and the statements whose tickets are outstanding.
 struct FlightDoorState {
@@ -98,16 +114,55 @@ struct FlightDoorState {
 	//! the session lives, so what a connection owns - temp tables, in time a transaction - survives
 	//! across the session's RPCs and is visible to nobody else's. ~7KB idle, measured; destroying
 	//! the entry reclaims all of it natively.
-	//! spec 070: one result stream - the slot its reader and the connection share (see SessionConn)
+	//! spec 070: one result stream - the slot its reader and the connection share (see SessionConn).
+	//! A submitted statement is a handle (duckdb's unified QueryResult): a QueryResultStream opened
+	//! on it drains chunks through a bounded buffer as the reader takes them, so nothing beyond the
+	//! chunk in flight is held. A statement that completes before it answers - a count,
+	//! ResultEagerness::FORCED - refuses a stream and is read from the handle instead, complete by
+	//! then and one row long.
 	struct ResultStream {
-		unique_ptr<QueryResult> result;
+		unique_ptr<QueryResultStream> stream;
+		unique_ptr<QueryResult> handle;
 		bool superseded = false;
+
+		bool Open() const {
+			return stream || handle;
+		}
+		//! Takes the result a statement just produced: a stream where duckdb can drain it, else the handle
+		void Take(unique_ptr<QueryResult> result) {
+			if (result->GetStatementProperties().result_eagerness != ResultEagerness::FORCED &&
+			    result->HasBufferedData()) {
+				stream = make_uniq<QueryResultStream>(std::move(result));
+			} else {
+				handle = std::move(result);
+			}
+		}
+		unique_ptr<DataChunk> Fetch() {
+			return stream ? stream->Fetch() : handle->Fetch();
+		}
+		bool HasError() const {
+			return stream ? stream->HasError() : handle->HasError();
+		}
+		const string &GetError() const {
+			return stream ? stream->GetError() : handle->GetError();
+		}
+		//! Ends the query (idempotent) and drops it: the slot reads as gone from here on
+		void Close() {
+			if (stream) {
+				stream->Close();
+			}
+			if (handle) {
+				handle->Close();
+			}
+			stream.reset();
+			handle.reset();
+		}
 	};
 	struct SessionConn {
 		unique_ptr<Connection> con;
 		//! One execution at a time per connection: neither a Connection nor a PreparedStatement is
 		//! a concurrent object, and every reservation of a session now shares this one. A result
-		//! stream holds it for its whole life (spec 070), which is what keeps a StreamQueryResult from
+		//! stream holds it for its whole life (spec 070), which is what keeps a result stream from
 		//! ever seeing another statement's connection state.
 		std::mutex exec;
 		//! The open transaction's id (spec 055), or "" for none. A session's connection holds at most
@@ -130,26 +185,23 @@ struct FlightDoorState {
 		//! the query is interrupted and closed, the result dropped, and the reader finds `superseded`
 		//! in its slot. Caller holds `stream_lock`, so no pull is in flight.
 		void EndStreamLocked() {
-			if (stream && stream->result) {
-				CloseResult(*stream->result, true);
-				stream->result.reset();
+			if (stream && stream->Open()) {
+				CloseResult(*stream, true);
 				stream->superseded = true;
 			}
 			stream.reset();
 		}
 		//! What ends a query on this connection, whoever ends it: the interrupt stops the pipeline's
 		//! tasks where they are, Close() waits for them and RELEASES the active query - the executor
-		//! and every operator's intermediate state (a sort's runs, a hash table). At our pin the
-		//! result's destructor releases nothing: without Close() an abandoned query's memory stays on
-		//! the connection until the session's next statement, which a client holding an idle cookie
-		//! never sends.
-		void CloseResult(QueryResult &result, bool interrupt) {
+		//! and every operator's intermediate state (a sort's runs, a hash table). The unified
+		//! QueryResult's destructor closes too, but the slot outlives its reader by design (a client
+		//! holding an idle cookie never sends the next statement), so the query is ended here, the
+		//! moment its outcome is known, never left to a destructor that runs who knows when.
+		void CloseResult(ResultStream &slot, bool interrupt) {
 			if (interrupt) {
 				con->context->Interrupt();
 			}
-			if (result.GetResultType() == QueryResultType::STREAM_RESULT) {
-				result.Cast<StreamQueryResult>().Close();
-			}
+			slot.Close();
 		}
 	};
 	std::unordered_map<string, shared_ptr<SessionConn>> session_conns;
@@ -169,7 +221,7 @@ struct FlightDoorState {
 			std::unique_lock<std::mutex> guard(conn.exec);
 			{
 				std::lock_guard<std::mutex> stream(conn.stream_lock);
-				if (!conn.stream || !conn.stream->result) {
+				if (!conn.stream || !conn.stream->Open()) {
 					return guard; // no stream on this connection: the statement runs
 				}
 				auto idle = store->FlightStreamIdleSeconds();
@@ -442,17 +494,17 @@ public:
 		{
 			std::lock_guard<std::mutex> exec(conn.exec);
 			std::lock_guard<std::mutex> stream(conn.stream_lock);
-			if (!slot->result) {
+			if (!slot->Open()) {
 				gone = true;
 				superseded = slot->superseded;
 			} else {
 				try {
-					chunk = slot->result->Fetch();
+					chunk = slot->Fetch();
 				} catch (std::exception &ex) {
 					error = ErrorData(ex).RawMessage(); // an interrupt surfaces here or below
 				}
-				if (error.empty() && slot->result->HasError()) {
-					error = slot->result->GetError();
+				if (error.empty() && slot->HasError()) {
+					error = slot->GetError();
 				}
 			}
 			// the idle clock: time since the last pull RETURNED - a chunk that takes long to compute is
@@ -520,9 +572,8 @@ private:
 		{
 			std::lock_guard<std::mutex> exec(conn.exec);
 			std::lock_guard<std::mutex> stream(conn.stream_lock);
-			if (slot->result) {
-				conn.CloseResult(*slot->result, outcome != "consumed");
-				slot->result.reset();
+			if (slot->Open()) {
+				conn.CloseResult(*slot, outcome != "consumed");
 			} else if (slot->superseded && outcome == "cancelled") {
 				outcome = "superseded"; // the connection's side ended it first
 			}
@@ -1064,7 +1115,7 @@ public:
 				return StatusFromDuck("acl", stmt->GetError());
 			}
 			vector<Value> values;
-			auto result = stmt->Execute(values, false);
+			auto result = stmt->Execute(values);
 			if (result->HasError()) {
 				return StatusFromDuck("acl", result->GetError());
 			}
@@ -1158,18 +1209,23 @@ public:
 	static void IngestRelease(struct ArrowArrayStream *stream) {
 		stream->release = nullptr; // owned by the DoPut frame
 	}
-	//! The two adapters arrow_scan wants (the ParamRowsFrom pattern): produce moves the C stream into
-	//! duckdb's wrapper, get-schema asks the stream itself.
-	static unique_ptr<ArrowArrayStreamWrapper> IngestStreamProduce(uintptr_t stream_ptr, ArrowStreamParameters &) {
-		auto source = reinterpret_cast<ArrowArrayStream *>(stream_ptr);
-		auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
-		wrapper->arrow_array_stream = *source;
-		source->release = nullptr;
-		return wrapper;
-	}
-	static void IngestStreamGetSchema(ArrowArrayStream *stream, ArrowSchema &schema) {
-		stream->get_schema(stream, &schema);
-	}
+	//! What arrow_scan wants around the DoPut stream (the ParamRowsFrom pattern; duckdb #25726 makes
+	//! it process-local bind input on the composed ref): the schema is the stream's own, and produce
+	//! moves the C stream into duckdb's wrapper - once per scan, the source spent after it.
+	struct IngestScanFactory : public ArrowScanFactory {
+		explicit IngestScanFactory(ArrowArrayStream &stream_p) : stream(stream_p) {
+		}
+		void GetSchema(ArrowSchema &schema) override {
+			stream.get_schema(&stream, &schema);
+		}
+		unique_ptr<ArrowArrayStreamWrapper> ProduceStream(ArrowStreamParameters &) override {
+			auto wrapper = make_uniq<ArrowArrayStreamWrapper>();
+			wrapper->arrow_array_stream = stream;
+			stream.release = nullptr;
+			return wrapper;
+		}
+		ArrowArrayStream &stream;
+	};
 
 	//! Flight SQL bulk ingestion (spec 049): the client streams batches at a named table, the server
 	//! composes `INSERT INTO <target>(<the stream's own column names>) SELECT ... FROM arrow_scan(...)`
@@ -1268,35 +1324,44 @@ public:
 			stream.get_last_error = IngestLastError;
 			stream.release = IngestRelease;
 			stream.private_data = &ingest;
-			// the three pointers travel as the door's own bound parameters - POINTER has no literal
-			// form in SQL text, and this statement carries no parameters of anybody else's, so the
-			// golden rule stands: the rewriter adds none, and no user numbering exists to shift
+			// the stream travels as process-local bind input on the arrow_scan ref (duckdb #25726 -
+			// the POINTER parameters went with it), set on this thread for the Prepare below and
+			// attached by the rewriter under the INGEST prefix; the statement carries no parameters
+			// at all, so the golden rule stands: the rewriter adds none, no user numbering exists
 			string sql;
 			if (create_form) {
 				// one composition for both homes: the session's temp catalog (spec 050) or the
 				// granted physical schema the rewriter resolves (spec 051)
 				sql = string("CREATE ") + (replace_form ? "OR REPLACE " : "") +
 				      (command.temporary ? "TEMP TABLE " + quote(command.table) : "TABLE " + target) +
-				      " AS SELECT * FROM arrow_scan($1, $2, $3)";
+				      " AS SELECT * FROM arrow_scan()";
 			} else {
 				if (command.temporary) {
 					// append into the session's own staging table, never anywhere else
 					target = "temp.main." + quote(command.table);
 				}
-				sql = "INSERT INTO " + target + " (" + columns + ") SELECT " + columns + " FROM arrow_scan($1, $2, $3)";
+				sql = "INSERT INTO " + target + " (" + columns + ") SELECT " + columns + " FROM arrow_scan()";
 			}
 			auto prefixed = "ACL INGEST '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
 			auto conn = state->ConnFor(handle);
 			auto execution = state->LockForStatement(*conn);
 			TempScanScope temp_scan(conn->con->context.get());
 			auto &con = *conn->con;
-			auto stmt = con.Prepare(prefixed);
+			unique_ptr<PreparedStatement> stmt;
+			bool source_attached = false;
+			{
+				ArrowIngestScope ingest_scan(make_shared_ptr<IngestScanFactory>(stream));
+				stmt = con.Prepare(prefixed);
+				source_attached = ingest_scan.Taken();
+			}
 			if (stmt->HasError()) {
 				return StatusFromDuck("acl", stmt->GetError());
 			}
-			vector<Value> values {Value::POINTER(reinterpret_cast<uintptr_t>(&stream)),
-			                      Value::POINTER(reinterpret_cast<uintptr_t>(&IngestStreamProduce)),
-			                      Value::POINTER(reinterpret_cast<uintptr_t>(&IngestStreamGetSchema))};
+			if (!source_attached) {
+				// the rewriter never met the composed arrow_scan: not a shape this code writes
+				return arrow::Status::Invalid("acl: the ingest statement lost its source");
+			}
+			vector<Value> values;
 			// the row cross-check has to decide BEFORE the write commits, or a false mismatch reports
 			// failure on data that already landed and a retry double-loads (the review's finding). So
 			// the load runs in a transaction this call OWNS. A held connection means a client's own
@@ -1320,7 +1385,7 @@ public:
 				state->store->AuditIngest(handle, -1, audit_text, reason_code);
 				return status;
 			};
-			auto result = stmt->Execute(values, false);
+			auto result = stmt->Execute(values);
 			if (ingest.cancelled) {
 				// the client stopped sending (spec 070): the scan refused the next batch and the INSERT
 				// failed with it - the load rolls back, the door says which side stopped, and the ingest
@@ -1518,7 +1583,7 @@ public:
 			}
 			int64_t total = 0;
 			for (auto &row : rows) {
-				auto result = reservation->stmt->Execute(row, false);
+				auto result = reservation->stmt->Execute(row);
 				if (result->HasError()) {
 					if (owns_txn) {
 						con.Query("ROLLBACK");
@@ -1569,14 +1634,18 @@ public:
 				unresolved = true;
 			}
 		}
-		if (unresolved && bound_row) {
+		if (unresolved && bound_row && stmt.GetStatementProperties().result_eagerness != ResultEagerness::FORCED) {
+			// a submitted handle carries the types the binder resolved with the row, and is closed
+			// unread; a statement that completes before it answers (FORCED) is never submitted for
+			// its schema - its types never ride on a parameter anyway
 			vector<Value> values = *bound_row;
-			auto pending = stmt.PendingQuery(values, false);
-			if (!pending->HasError()) {
-				ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaFor(pending->GetTypes(), pending->GetNames()));
+			auto submitted = stmt.Submit(values);
+			if (!submitted->HasError()) {
+				ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaFor(submitted->GetTypes(), submitted->GetNames()));
 			} else {
 				ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaOf(stmt));
 			}
+			submitted->Close();
 		} else {
 			ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaOf(stmt));
 		}
@@ -1612,7 +1681,11 @@ public:
 	                vector<Value> &values, const string &handle) {
 		// under the caller's `exec`: the statement executes here; its result goes onto the connection,
 		// where the reader pulls it and the session's next statement can end it (spec 070)
-		auto result = reservation->stmt->Execute(values, true);
+		// a statement that completes before it answers (a count - ResultEagerness::FORCED) runs to
+		// completion here; anything else is submitted, and the reader drains it chunk by chunk
+		auto &stmt = *reservation->stmt;
+		auto result = stmt.GetStatementProperties().result_eagerness == ResultEagerness::FORCED ? stmt.Execute(values)
+		                                                                                        : stmt.Submit(values);
 		if (result->HasError()) {
 			return StatusFromDuck("acl", result->GetError());
 		}
@@ -1624,7 +1697,7 @@ public:
 		std::shared_ptr<arrow::Schema> schema;
 		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result->GetTypes(), result->GetNames(), properties));
 		auto slot = make_shared_ptr<FlightDoorState::ResultStream>();
-		slot->result = std::move(result);
+		slot->Take(std::move(result));
 		{
 			auto &conn = *reservation->conn;
 			std::lock_guard<std::mutex> stream(conn.stream_lock);

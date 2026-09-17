@@ -1311,8 +1311,15 @@ private:
 		}
 		// spec 049: the Flight door's ingest INSERT reads the client's batches through arrow_scan.
 		// The function stays denied by the gate - this statement is the server's own, marked by a
-		// prefix only the door composes, and its pointers are the server's own text.
+		// prefix only the door composes, and its source is the door's own bind input.
 		if (principal.arrow_ingest && StringUtil::CIEquals(vname, "arrow_scan")) {
+			// duckdb #25726: the stream is process-local bind input on the ref, never SQL text. The
+			// door set it on this thread for this Prepare; without one duckdb's own bind refuses
+			// ("requires an ArrowScanFactory bind input") - the same closed gate.
+			auto factory = TakeArrowIngestFactory();
+			if (factory) {
+				tf.bind_info = std::move(factory);
+			}
 			return;
 		}
 		// not a virtual table function: the gate decides by its key (spec 072), and the call is emitted

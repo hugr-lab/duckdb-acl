@@ -10,12 +10,15 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/valid_checker.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/temporary_file_manager.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/common/enums/result_eagerness.hpp"
+#include "duckdb/main/query_result_stream.hpp"
 #include "acl_quack_embed.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 
@@ -142,21 +145,71 @@ static void DriveQuery(QuackConnection &connection, shared_ptr<QuackResultStream
 		unique_lock<mutex> guard(connection.statement_lock);
 		auto &context = *connection.duckdb_connection->context;
 
-		// MakeQuackFetchCollector sends the FIRST statement that returns a result into the stream.
-		// Every other statement keeps the default collector.
-		auto &config = ClientConfig::GetConfig(context);
-		config.get_result_collector = [stream](ClientContext &ctx, PreparedStatementData &data) {
-			return MakeQuackFetchCollector(ctx, data, stream);
-		};
-		unique_ptr<QueryResult> result;
-		try {
+		// acl (duckdb #25477): no collector hook - a delegated submission that fails ends its query
+		// twice in duckdb (INTERNAL, the database invalidated). The statement is submitted and its
+		// result drained here through a QueryResultStream; several statements at once (the
+		// parser's implicit PIVOT) cannot be submitted and run through Query(), materialized.
+		unique_ptr<QueryResult> result = connection.duckdb_connection->Submit(sql);
+		if (result->HasError() && result->GetError().find("multiple statements") != string::npos) {
 			result = connection.duckdb_connection->Query(sql);
-		} catch (...) {
-			// leave no collector hook on the connection's config
-			config.get_result_collector = nullptr;
-			throw;
 		}
-		config.get_result_collector = nullptr;
+		if (!result->HasError() && result->GetStatementProperties().return_type == StatementReturnType::QUERY_RESULT &&
+		    result->GetStatementProperties().result_eagerness != ResultEagerness::FORCED && result->HasBufferedData()) {
+			// the stream carries this statement: its shape is known at submission, its chunks go
+			// out in batches of about the target size as duckdb produces them
+			vector<string> result_names;
+			for (auto &col_name : result->GetNames()) {
+				result_names.push_back(col_name.GetIdentifierName());
+			}
+			auto types = result->GetTypes();
+			QueryResultStream reader(std::move(result));
+			stream->SignalBound(types, std::move(result_names));
+			auto target_bytes = MaxValue<idx_t>(
+			    1, QuackGetUBigintSetting(context, "acl_quack_target_batch_bytes", QUACK_TARGET_BATCH_BYTES_DEFAULT));
+			unique_ptr<QuackChunkPayloadWriter> writer;
+			idx_t batch_index = 1;
+			idx_t rows = 0;
+			idx_t last_size = 0;
+			auto flush = [&]() {
+				if (!writer) {
+					return;
+				}
+				auto sealed = writer->Seal();
+				QuackFetchPayload entry;
+				entry.payload = std::move(sealed.payload);
+				entry.payload_size = sealed.payload_size;
+				entry.chunk_count = sealed.chunk_count;
+				entry.rows = rows;
+				last_size = entry.payload_size;
+				auto bytes = entry.payload_size;
+				stream->buffer.PushBatch(batch_index++, std::move(entry), bytes);
+				writer.reset();
+				rows = 0;
+			};
+			while (auto chunk = reader.Fetch()) {
+				if (chunk->size() == 0) {
+					continue;
+				}
+				if (!writer) {
+					writer = make_uniq<QuackChunkPayloadWriter>(last_size);
+				}
+				writer->AppendChunk(*chunk);
+				rows += chunk->size();
+				if (writer->AllocatedBytes() >= target_bytes) {
+					flush();
+				}
+			}
+			if (reader.HasError()) {
+				result = make_uniq<QueryResult>(reader.GetErrorObject());
+			} else {
+				flush();
+				stream->announced_total = batch_index - 1;
+				// a stand-in for the handle the stream consumed: successful, empty, bound already
+				result = make_uniq<QueryResult>(
+				    StatementType::SELECT_STATEMENT, StatementProperties(), vector<Identifier>(),
+				    make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator()), context.GetClientProperties());
+			}
+		}
 		acl::AclQuackStatementCompleted(*connection.duckdb_connection, connection.session_id, sql, *result);
 		if (result->HasError()) {
 			stream->buffer.SetError(result->GetErrorObject());
@@ -520,11 +573,39 @@ bool MessageRequiresConnection(MessageType type) {
 	}
 }
 
-// main switcheroo happens here
 unique_ptr<QuackMessage> QuackServer::HandleMessage(MemoryStream &read_stream) {
+	unique_ptr<QuackMessage> response;
+	try {
+		response = DispatchMessage(read_stream);
+	} catch (std::exception &ex) {
+		// Letting this escape to httplib would make it an HTTP 500, which the client can only report as a
+		// transport failure ("Failed to send message"). Exceptions from HANDLING a message are caught below,
+		// where they can still be logged; this catches the ones from decoding it.
+		response = make_uniq<ErrorResponse>(ErrorData(ex));
+	} catch (...) {
+		response = make_uniq<ErrorResponse>("Unknown error while handling request");
+	}
+	if (response->Type() == MessageType::ERROR_RESPONSE) {
+		// tell the client whether we are still usable - ask the database rather than guess from the exception
+		// type, it is the one that decides it has been invalidated
+		auto db = db_ptr.lock();
+		response->Cast<ErrorResponse>().SetMustInvalidate(!db || ValidChecker::IsInvalidated(*db));
+	}
+	return response;
+}
+
+// main switcheroo happens here
+unique_ptr<QuackMessage> QuackServer::DispatchMessage(MemoryStream &read_stream) {
 	auto db = db_ptr.lock();
 	if (!db) {
 		return make_uniq<ErrorResponse>("Database was closed");
+	}
+	if (ValidChecker::IsInvalidated(*db)) {
+		// bail out before touching the database: the authentication query cannot run either, so a client
+		// reconnecting to an invalidated server would otherwise be told its token was rejected
+		return make_uniq<ErrorResponse>("The server database has been invalidated and the server must be "
+		                                "restarted before it can be used again. Original error: \"%s\"",
+		                                ValidChecker::Get(*db).InvalidatedMessage());
 	}
 	auto &logger = Logger::Get(*db);
 	bool should_log = logger.ShouldLog(QuackLogType::NAME, QuackLogType::LEVEL);
@@ -567,8 +648,14 @@ unique_ptr<QuackMessage> QuackServer::HandleMessage(MemoryStream &read_stream) {
 		}
 	}
 
-	// process the message
-	auto response = HandleMessageInternal(*db, *received_message, connection);
+	// an exception raised while handling the message becomes the response, so it reaches the client with the
+	// type it was raised with (and still shows up in the log below)
+	unique_ptr<QuackMessage> response;
+	try {
+		response = HandleMessageInternal(*db, *received_message, connection);
+	} catch (std::exception &ex) {
+		response = make_uniq<ErrorResponse>(ErrorData(ex));
+	}
 
 	if (should_log) {
 		auto duration_ms = QuackNowMillis() - start_time;

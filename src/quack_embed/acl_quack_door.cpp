@@ -18,7 +18,7 @@
 #include "acl_quack_server.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/main/materialized_query_result.hpp"
+#include "duckdb/main/query_result.hpp"
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -259,16 +259,14 @@ void AclQuackStatementCompleted(Connection &connection, const string &connection
 		store->AuditIngest(handle, -1, result.GetError());
 		return;
 	}
-	// an INSERT answers one count row through the default (materialized) collector; read it without
-	// consuming it - the server still sends it to the client after this
+	// an INSERT answers one count row through the default collector, complete by the time the server
+	// hands it here (Query is blocking); RowCount/GetValue read the retained rows without moving the
+	// cursor the server's own Fetch loop uses next
 	int64_t rows = -1;
-	if (result.GetResultType() == QueryResultType::MATERIALIZED_RESULT) {
-		auto &materialized = result.Cast<MaterializedQueryResult>();
-		if (materialized.RowCount() == 1 && materialized.ColumnCount() == 1) {
-			auto count = materialized.GetValue(0, 0);
-			if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
-				rows = count.GetValue<int64_t>();
-			}
+	if (result.RowCount() == 1 && result.ColumnCount() == 1) {
+		auto count = result.GetValue(0, 0);
+		if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
+			rows = count.GetValue<int64_t>();
 		}
 	}
 	store->AuditIngest(handle, rows, string());

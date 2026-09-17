@@ -48,7 +48,10 @@ skip_leg() { SKIPPED="$SKIPPED $1($2)"; echo "  skip $1: $2"; }
 [ -x "$DUCKDB" ] || { echo "SKIP: no duckdb CLI at $DUCKDB"; exit 0; }
 [ -f "$ACL_EXT" ] || { echo "SKIP: no acl extension at $ACL_EXT"; exit 0; }
 
-QUACK_EXT="$(ls "$BUILD"/repository/*/*/quack.duckdb_extension 2>/dev/null | head -1 || true)"
+# The extension repository is keyed by duckdb's source id: a tree that has seen several pins holds
+# several, and only the one the CLI was built from loads. Ask the CLI; fall back to the glob.
+SOURCE_ID="$("$DUCKDB" -noheader -csv -c "SELECT source_id FROM pragma_version();" 2>/dev/null || true)"
+QUACK_EXT="$(ls "$BUILD"/repository/"${SOURCE_ID:-*}"/*/quack.duckdb_extension 2>/dev/null | head -1 || true)"
 [ -n "$QUACK_EXT" ] || { echo "SKIP: quack is not built - rebuild with ACL_QUACK=1"; exit 0; }
 EXT_DIR="$(dirname "$QUACK_EXT")"
 

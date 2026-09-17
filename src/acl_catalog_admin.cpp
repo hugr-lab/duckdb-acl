@@ -216,7 +216,7 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 //! the `grant_columns` rows for one grant. Shared by the write path, where a projection that cannot
 //! bind is a mistake worth refusing, and by `acl_refresh_schema`, where it is only a fact that has
 //! not become true yet (spec 027) - `strict` picks between the two.
-using ReadFn = std::function<unique_ptr<MaterializedQueryResult>(const string &)>;
+using ReadFn = std::function<unique_ptr<QueryResult>(const string &)>;
 
 //! A grant hides and masks; naming, computing and ordering belong to the virtual catalog (spec 037).
 //! So a grant's column list may only name columns the object exposes, and the order it was written in
@@ -365,8 +365,7 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
                                      const string &pk, const case_insensitive_map_t<int8_t> &nullable_marks) {
 	RequireCatalog(catalog, "acl_add_relation");
 	RequireNotReserved(vname);
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto existing = read("SELECT \"comment\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname));
 		string comment;
@@ -449,8 +448,7 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 		                            "takes",
 		                            name);
 	}
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		// a reference between objects that do not exist describes nothing
 		auto require_relation = [&](const string &end) {
 			auto found = read("SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -649,8 +647,7 @@ void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_
 	RequireCatalog(catalog, "acl_add_schema_alias");
 	// a schema is one row either way (spec 014): with a physical path it is a live alias, without one
 	// it is a schema whose content is the catalog's own records. The comment survives a redefinition.
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto where = " WHERE \"vcat\" = " + Lit(vcat) + " AND \"path\" = " + Lit(alias_path);
 		auto current = read("SELECT \"comment\" FROM " + catalog->Tbl("schemas") + where);
 		string comment = "NULL";
@@ -728,8 +725,7 @@ void PolicyStore::CatalogRegisterView(const string &vcat, const string &vname, c
 	RequireCatalog(catalog, "acl_register_view");
 	RequireNotReserved(vname);
 	// fixed shape, like the record of a created table: a body and nothing else to choose
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		statements = RelationStatements(*catalog, vcat, vname, "view", "", body, "", {}, "", "");
 	});
 }
@@ -739,8 +735,7 @@ void PolicyStore::CatalogRegisterCreated(const string &vcat, const string &vname
 	RequireCatalog(catalog, "acl_register_created");
 	// fixed shape: an alias-form record of the object just created, stamped with the schema's origin
 	// so REFRESH and PRUNE own it like the rest of the expansion
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		statements = RelationStatements(*catalog, vcat, vname, "alias", phys, "", "", {}, "", "", origin);
 		// creating a name that was dropped on purpose earlier makes it current again
 		auto dot = vname.rfind('.');
@@ -801,8 +796,7 @@ void PolicyStore::CatalogRematerializeSchemaCaps(const string &vcat, const strin
 	RequireCatalog(catalog, "acl_rematerialize_schema_caps");
 	// One idempotent operation, many callers: granting, revoking, schema DDL and drift repair all
 	// reduce to "rebuild this subtree from the nearest ancestor that states capabilities" (spec 015).
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto prefix = path.empty() ? string() : path + ".";
 		auto in_subtree = [&](const string &column) {
 			return path.empty() ? string("true")
@@ -872,8 +866,7 @@ void PolicyStore::CatalogExpandSchema(const string &vcat, const string &path, co
 	// the schema itself carries no physical path: what is visible inside it are the records below,
 	// each of which can then be altered, dropped or granted on its own
 	CatalogAddSchemaAlias(vcat, path, "", phys_path);
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		for (auto &name : names) {
 			auto vname = path + "." + name;
 			auto exists = read("SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -909,8 +902,7 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 	auto origin = origin_value.ToString();
 	auto names = PhysicalObjects(*catalog, origin);
 	int64_t changed = 0;
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		changed = 0;
 		for (auto &name : names) {
 			auto vname = path + "." + name;
@@ -1161,8 +1153,7 @@ void PolicyStore::CatalogGrant(const string &role, const string &vcat, const str
 	}
 	// the verdict is read on the connection that writes it (spec 027), so what it judges the predicate
 	// against is the catalog this grant commits into
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto checked = catalog->CatalogPredicateChecked(read, vcat, rls);
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) +
 		                     " AND \"vcat\" = " + Lit(vcat));
@@ -1240,8 +1231,7 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 	// drop that read outside and wrote twice could leave the object's grants live after its record
 	// was gone - access the admin believed revoked. The other writers already use this shape.
 	auto pred = ExactName(vname);
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		statements.push_back("DELETE FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname));
 		statements.push_back("DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -1277,8 +1267,7 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, const string &kind, const string &column,
                                     const string &comment) {
 	RequireCatalog(catalog, "acl_comment");
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto value = comment.empty() ? string("NULL") : Lit(comment);
 		if (!column.empty()) {
 			auto exists = read("SELECT 1 FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -1317,8 +1306,7 @@ void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, con
 idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname) {
 	RequireCatalog(catalog, "acl_refresh_schema");
 	idx_t refreshed = 0;
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		string name_filter = vname.empty() ? string() : " AND \"vname\" = " + Lit(vname);
 		// a declared schema is never re-derived: it is the admin's statement of fact
 		auto declared = read("SELECT \"vname\", \"kind\" FROM " + catalog->Tbl("object_columns") +
@@ -1506,8 +1494,7 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 
 void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 	RequireCatalog(catalog, "acl_drop_catalog");
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto exists = read("SELECT 1 FROM " + catalog->Tbl("catalogs") + " WHERE \"vcat\" = " + Lit(vcat));
 		if (exists->RowCount() == 0) {
 			throw BinderException("acl admin: catalog \"%s\" does not exist", vcat);
@@ -1538,8 +1525,7 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 
 void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias_path, bool cascade) {
 	RequireCatalog(catalog, "acl_drop_schema_alias");
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto where = " WHERE \"vcat\" = " + Lit(vcat) + " AND \"path\" = " + Lit(alias_path);
 		auto exists = read("SELECT 1 FROM " + catalog->Tbl("schemas") + where);
 		if (exists->RowCount() == 0) {
@@ -1577,8 +1563,7 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 
 void PolicyStore::CatalogDropFunction(const string &vcat, const string &vname, const string &kind) {
 	RequireCatalog(catalog, "acl_drop_function");
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto exists = read("SELECT 1 FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                   " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
 		if (exists->RowCount() == 0) {
@@ -1605,8 +1590,7 @@ void PolicyStore::CatalogDropFunction(const string &vcat, const string &vname, c
 
 void PolicyStore::CatalogDropRole(const string &role) {
 	RequireCatalog(catalog, "acl_drop_role");
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto exists = read("SELECT 1 FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
 		if (exists->RowCount() == 0) {
 			throw BinderException("acl admin: role \"%s\" does not exist", role);
@@ -1622,8 +1606,7 @@ void PolicyStore::CatalogDropRole(const string &role) {
 
 void PolicyStore::CatalogDropIssuer(const string &issuer) {
 	RequireCatalog(catalog, "acl_drop_issuer");
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto exists = read("SELECT 1 FROM " + catalog->Tbl("issuers") + " WHERE \"issuer\" = " + Lit(issuer));
 		if (exists->RowCount() == 0) {
 			throw BinderException("acl admin: issuer \"%s\" does not exist", issuer);
@@ -1636,8 +1619,7 @@ void PolicyStore::CatalogDropIssuer(const string &issuer) {
 void PolicyStore::CatalogDropRoleMapping(const string &issuer, const string &source, const string &external_value,
                                          const string &role) {
 	RequireCatalog(catalog, "acl_drop_role_mapping");
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto where = " WHERE \"issuer\" = " + Lit(issuer) + " AND \"source\" = " + Lit(source) +
 		             " AND \"external_value\" = " + Lit(external_value) + " AND \"role\" = " + Lit(role);
 		auto exists = read("SELECT 1 FROM " + catalog->Tbl("role_mappings") + where);
@@ -1682,8 +1664,7 @@ string KeyValues(const FunctionKey &key) {
 
 void PolicyStore::CatalogCreateFunctionCategory(const string &name, const string &comment) {
 	RequireCatalog(catalog, "acl_create_function_category");
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto exists =
 		    read("SELECT 1 FROM " + catalog->Tbl("function_categories") + " WHERE \"category\" = " + Lit(name));
 		if (exists->RowCount() > 0) {
@@ -1699,8 +1680,7 @@ void PolicyStore::CatalogCreateFunctionCategory(const string &name, const string
 
 void PolicyStore::CatalogDropFunctionCategory(const string &name, bool if_exists) {
 	RequireCatalog(catalog, "acl_drop_function_category");
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto exists =
 		    read("SELECT 1 FROM " + catalog->Tbl("function_categories") + " WHERE \"category\" = " + Lit(name));
 		if (exists->RowCount() == 0) {
@@ -1721,8 +1701,7 @@ void PolicyStore::CatalogDropFunctionCategory(const string &name, bool if_exists
 
 void PolicyStore::CatalogFunctionCategoryMembers(const string &name, const vector<FunctionKey> &keys, bool add) {
 	RequireCatalog(catalog, add ? "acl_function_category_add" : "acl_function_category_remove");
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto exists =
 		    read("SELECT 1 FROM " + catalog->Tbl("function_categories") + " WHERE \"category\" = " + Lit(name));
 		if (exists->RowCount() == 0) {
@@ -1751,8 +1730,7 @@ void PolicyStore::CatalogWriteFunctionGrant(const string &role, const string &ca
 		where += " \"database\" = '' AND \"schema\" = '' AND \"name\" = '' AND \"kind\" = ''";
 		values += "'', '', '', ''";
 	}
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		if (!category.empty() && !remove) {
 			auto exists =
 			    read("SELECT 1 FROM " + catalog->Tbl("function_categories") + " WHERE \"category\" = " + Lit(category));
@@ -1771,7 +1749,7 @@ void PolicyStore::CatalogWriteFunctionGrant(const string &role, const string &ca
 namespace {
 
 //! ALTER targets must exist: read the single row, or fail with a specific message
-unique_ptr<MaterializedQueryResult> RequireRow(CatalogBackend &catalog, const string &sql, const string &what) {
+unique_ptr<QueryResult> RequireRow(CatalogBackend &catalog, const string &sql, const string &what) {
 	auto result = catalog.Query(sql);
 	if (result->RowCount() == 0) {
 		throw BinderException("acl admin: %s does not exist", what);
@@ -1785,8 +1763,7 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
                                        const string &value, const vector<std::pair<string, string>> &columns,
                                        const case_insensitive_map_t<int8_t> &nullable_marks) {
 	RequireCatalog(catalog, "acl_alter_relation");
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto current = read("SELECT \"form\", \"phys\", \"view_sql\", \"rls\" FROM " + catalog->Tbl("relations") +
 		                    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
 		if (current->RowCount() == 0) {
@@ -2116,8 +2093,7 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 			}
 		}
 	}
-	catalog->WriteWithReads([&](const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                            vector<string> &statements) {
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		// the grant's predicate is checked against the object it filters, here rather than at query
 		// time (spec 021) - a predicate that cannot bind is a mistake, whoever eventually runs into it
 		bool checked = false;

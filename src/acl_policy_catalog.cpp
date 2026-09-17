@@ -35,7 +35,7 @@ shared_ptr<DatabaseInstance> CatalogBackend::Db() {
 	return instance;
 }
 
-unique_ptr<MaterializedQueryResult> CatalogBackend::Query(const string &sql) {
+unique_ptr<QueryResult> CatalogBackend::Query(const string &sql) {
 	auto instance = Db();
 	Connection con(*instance);
 	auto result = con.Query(sql);
@@ -46,8 +46,7 @@ unique_ptr<MaterializedQueryResult> CatalogBackend::Query(const string &sql) {
 }
 
 void CatalogBackend::WriteWithReads(
-    const std::function<void(const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &,
-                             vector<string> &)> &body) {
+    const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &, vector<string> &)> &body) {
 	auto instance = Db();
 	Connection con(*instance);
 	auto begin = con.Query("BEGIN");
@@ -372,7 +371,7 @@ string CatalogBackend::GrantPolicyExprs() {
 	                       " oc.\"rls\" AS orls, oc.\"columns\" AS ocols, oc.\"rls_checked\" AS ochk";
 }
 
-GrantPolicy CatalogBackend::RowPolicy(MaterializedQueryResult &result, idx_t row, idx_t first_column) {
+GrantPolicy CatalogBackend::RowPolicy(QueryResult &result, idx_t row, idx_t first_column) {
 	auto text = [&](idx_t column) {
 		auto value = result.GetValue(column, row);
 		return value.IsNull() ? string() : value.ToString();
@@ -1049,7 +1048,7 @@ bool CatalogBackend::LookupIssuer(const string &issuer, IssuerConfig &out) {
 			return entry->second.first;
 		}
 	}
-	unique_ptr<MaterializedQueryResult> result;
+	unique_ptr<QueryResult> result;
 	idx_t base = 0;
 	if (function_mode) {
 		if (!HasSlot("issuer")) { // optional slot: no JWT issuers through this source
@@ -1161,7 +1160,7 @@ void CatalogBackend::AdminScopes(const Principal &principal, vector<std::pair<st
 		return;
 	}
 	EnsureFresh();
-	unique_ptr<MaterializedQueryResult> result;
+	unique_ptr<QueryResult> result;
 	if (function_mode) {
 		if (!HasSlot("admin_scopes")) { // optional slot: no admin grants through this source
 			return;

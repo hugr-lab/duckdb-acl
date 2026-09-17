@@ -14,6 +14,7 @@
 #include "duckdb/parser/query_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/storage/object_cache.hpp"
+#include "duckdb/function/table_function.hpp"
 
 #include <atomic>
 #include <functional>
@@ -83,6 +84,13 @@ string TruncateUtf8(const string &text, idx_t max_bytes);
 //! live catalog lookup during the statement's own parse throws - this seam is what remains.
 void SetTempScanContext(ClientContext *context);
 ClientContext *TempScanContext();
+
+//! The ingest seam (spec 049; duckdb #25726 made arrow_scan's stream process-local bind input on
+//! the ref, never SQL text): the door sets the factory of the DoPut it is composing on the calling
+//! thread around its Prepare, and the rewriter attaches it to the composed `arrow_scan()` under the
+//! INGEST prefix. Taken once - the second call, and any other thread, answers null.
+void SetArrowIngestFactory(shared_ptr<TableFunctionInfo> factory);
+shared_ptr<TableFunctionInfo> TakeArrowIngestFactory();
 //! Whether this connection's private temp catalog holds a table of this name - a direct read of the
 //! committed entries via the no-context, no-transaction DuckCatalog scan (~70ns, measured;
 //! independent of attached-catalog size). Safe on the parse thread: the door holds the connection's

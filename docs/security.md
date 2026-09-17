@@ -355,7 +355,8 @@ is the exception". The recovered principal carries `ingest_stream` set to that e
 never-set scan passes "for that principal and nothing else". With no door open the fence is off -
 a stock quack's own ingest "is its own business".
 
-**The Flight ingest** (spec 049): the door composes `INSERT … SELECT … FROM arrow_scan($1,$2,$3)`
+**The Flight ingest** (spec 049): the door composes `INSERT … SELECT … FROM arrow_scan()` - the
+client's stream attached to that ref as process-local bind input (duckdb #25726), never as SQL text -
 under `ACL INGEST '<handle>'`, a prefix "composed only by the door's own C++"; it admits "exactly one
 INSERT or CREATE TABLE statement" (the CREATE form is spec 050/051's staging and create/replace). A
 client cannot author it: "every door wraps client text as `ACL SESSION '<handle>' <text>`, so an

@@ -84,9 +84,8 @@ string CatalogBackend::PredicateError(const string &source, const string &rls, b
 	return string();
 }
 
-bool CatalogBackend::CatalogPredicateChecked(
-    const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read, const string &vcat,
-    const string &rls) {
+bool CatalogBackend::CatalogPredicateChecked(const std::function<unique_ptr<QueryResult>(const string &)> &read,
+                                             const string &vcat, const string &rls) {
 	if (rls.empty()) {
 		return true; // nothing to judge
 	}

@@ -1199,6 +1199,19 @@ ClientContext *TempScanContext() {
 	return temp_scan_context;
 }
 
+//! The ingest seam (spec 049), the same discipline: set on the thread that calls Prepare, taken by
+//! the rewriter during that Prepare's parse, cleared before the exec lock is released.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+static thread_local shared_ptr<TableFunctionInfo> arrow_ingest_factory;
+
+void SetArrowIngestFactory(shared_ptr<TableFunctionInfo> factory) {
+	arrow_ingest_factory = std::move(factory);
+}
+
+shared_ptr<TableFunctionInfo> TakeArrowIngestFactory() {
+	return std::move(arrow_ingest_factory);
+}
+
 //! Walk the connection's private temp catalog through the NO-context, NO-transaction overloads:
 //! committed entries only, which is exactly right - a name only becomes resolvable once the
 //! statement that created it has finished. A live Catalog::GetEntry here would throw "no active

@@ -12,6 +12,13 @@ Run after bumping the `third_party/quack` submodule:  python3 src/quack_embed/sy
 It overwrites src/quack_embed/<file> and fails loudly if an expected literal is gone
 (upstream moved it — re-audit the read sites before trusting the rename).
 
+duckdb carries patches for quack (`.github/patches/extensions/quack/`), applied to the loadable
+client through APPLY_PATCHES; the embedded server is the same commit and must build against the
+same duckdb, so the copies are taken from a scratch copy of the submodule's `src` with those
+patches applied first — the two never diverge, and a patch that stops applying fails the sync.
+PATCHES below are the embed's own: the statement driver (no delegated collector - duckdb #25477
+ends a failing delegated query twice) with spec 069's audit hook inside it.
+
 The http server (acl_quack_http_server.cpp) is NOT generated here: it carries real
 logic changes (TLS, /.well-known, public bind, registry) and is hand-maintained.
 """
@@ -19,10 +26,12 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SUB = ROOT / "third_party" / "quack" / "src"
 OUT = ROOT / "src" / "quack_embed"
+DUCKDB_PATCHES = ROOT / "duckdb" / ".github" / "patches" / "extensions" / "quack"
 
 # Exact literal renames applied to every generated file. Setting names and the drain
 # function name only — never a blanket quack_ -> acl_quack_ (that would corrupt error
@@ -48,17 +57,107 @@ RENAMES = {
 # patched site is re-audited rather than silently dropped. Keep these few and small.
 PATCHES = {
     "quack_server.cpp": [
-        # spec 069: the audit hears the outcome of every statement the server drives - the drain of a
-        # client's streamed insert among them (its rows, or the error), which since quack f4328c5 is a
-        # statement the CLIENT composes and the server runs like any other
         (
             '#include "duckdb/main/client_config.hpp"\n',
-            '#include "duckdb/main/client_config.hpp"\n#include "acl_quack_embed.hpp"\n',
+            '#include "duckdb/main/client_config.hpp"\n'
+            '#include "duckdb/common/enums/result_eagerness.hpp"\n'
+            '#include "duckdb/main/query_result_stream.hpp"\n'
+            '#include "acl_quack_embed.hpp"\n',
         ),
+        # duckdb #25477 (the unified QueryResult, our pin since 2026-09-17) and the delegated collector:
+        # a submission that delegates its collector (get_result_collector set) and then FAILS ends the
+        # query twice in duckdb - FailQueryInternal inside CompleteDelegatedInternal, then the "query
+        # failed: abort now" branch of SubmitStatementInternal, whose own comment admits the query may
+        # already be gone - a null dereference, an INTERNAL error, and with it the whole database
+        # invalidated by nothing more than a principal's refused INSERT. quack's own pin of duckdb
+        # predates the change and duckdb's CI does not run quack's tests, so the embed drives the
+        # statement itself: submitted, its result drained through a QueryResultStream (a bounded
+        # buffer, chunks released as they go out - the collector's memory profile, on the driver
+        # thread); a text of several statements (the parser's implicit PIVOT) cannot be submitted and
+        # runs through Query(), materialized. spec 069's audit hook rides the same site: the outcome
+        # of every statement the server drives, the drain of a client's streamed insert among them.
         (
+            "\t\t// MakeQuackFetchCollector sends the FIRST statement that returns a result into the stream.\n"
+            "\t\t// Every other statement keeps the default collector.\n"
+            "\t\tauto &config = ClientConfig::GetConfig(context);\n"
+            "\t\tconfig.get_result_collector = [stream](ClientContext &ctx, PreparedStatementData &data) {\n"
+            "\t\t\treturn MakeQuackFetchCollector(ctx, data, stream);\n"
+            "\t\t};\n"
+            "\t\tunique_ptr<QueryResult> result;\n"
+            "\t\ttry {\n"
+            "\t\t\tresult = connection.duckdb_connection->Query(sql);\n"
+            "\t\t} catch (...) {\n"
+            "\t\t\t// leave no collector hook on the connection's config\n"
+            "\t\t\tconfig.get_result_collector = nullptr;\n"
+            "\t\t\tthrow;\n"
+            "\t\t}\n"
             "\t\tconfig.get_result_collector = nullptr;\n"
             "\t\tif (result->HasError()) {\n",
-            "\t\tconfig.get_result_collector = nullptr;\n"
+            "\t\t// acl (duckdb #25477): no collector hook - a delegated submission that fails ends its query\n"
+            "\t\t// twice in duckdb (INTERNAL, the database invalidated). The statement is submitted and its\n"
+            "\t\t// result drained here through a QueryResultStream; several statements at once (the\n"
+            "\t\t// parser's implicit PIVOT) cannot be submitted and run through Query(), materialized.\n"
+            "\t\tunique_ptr<QueryResult> result = connection.duckdb_connection->Submit(sql);\n"
+            "\t\tif (result->HasError() && result->GetError().find(\"multiple statements\") != string::npos) {\n"
+            "\t\t\tresult = connection.duckdb_connection->Query(sql);\n"
+            "\t\t}\n"
+            "\t\tif (!result->HasError() && result->GetStatementProperties().return_type == StatementReturnType::QUERY_RESULT &&\n"
+            "\t\t    result->GetStatementProperties().result_eagerness != ResultEagerness::FORCED && result->HasBufferedData()) {\n"
+            "\t\t\t// the stream carries this statement: its shape is known at submission, its chunks go\n"
+            "\t\t\t// out in batches of about the target size as duckdb produces them\n"
+            "\t\t\tvector<string> result_names;\n"
+            "\t\t\tfor (auto &col_name : result->GetNames()) {\n"
+            "\t\t\t\tresult_names.push_back(col_name.GetIdentifierName());\n"
+            "\t\t\t}\n"
+            "\t\t\tauto types = result->GetTypes();\n"
+            "\t\t\tQueryResultStream reader(std::move(result));\n"
+            "\t\t\tstream->SignalBound(types, std::move(result_names));\n"
+            "\t\t\tauto target_bytes = MaxValue<idx_t>(\n"
+            "\t\t\t    1, QuackGetUBigintSetting(context, \"acl_quack_target_batch_bytes\", QUACK_TARGET_BATCH_BYTES_DEFAULT));\n"
+            "\t\t\tunique_ptr<QuackChunkPayloadWriter> writer;\n"
+            "\t\t\tidx_t batch_index = 1;\n"
+            "\t\t\tidx_t rows = 0;\n"
+            "\t\t\tidx_t last_size = 0;\n"
+            "\t\t\tauto flush = [&]() {\n"
+            "\t\t\t\tif (!writer) {\n"
+            "\t\t\t\t\treturn;\n"
+            "\t\t\t\t}\n"
+            "\t\t\t\tauto sealed = writer->Seal();\n"
+            "\t\t\t\tQuackFetchPayload entry;\n"
+            "\t\t\t\tentry.payload = std::move(sealed.payload);\n"
+            "\t\t\t\tentry.payload_size = sealed.payload_size;\n"
+            "\t\t\t\tentry.chunk_count = sealed.chunk_count;\n"
+            "\t\t\t\tentry.rows = rows;\n"
+            "\t\t\t\tlast_size = entry.payload_size;\n"
+            "\t\t\t\tauto bytes = entry.payload_size;\n"
+            "\t\t\t\tstream->buffer.PushBatch(batch_index++, std::move(entry), bytes);\n"
+            "\t\t\t\twriter.reset();\n"
+            "\t\t\t\trows = 0;\n"
+            "\t\t\t};\n"
+            "\t\t\twhile (auto chunk = reader.Fetch()) {\n"
+            "\t\t\t\tif (chunk->size() == 0) {\n"
+            "\t\t\t\t\tcontinue;\n"
+            "\t\t\t\t}\n"
+            "\t\t\t\tif (!writer) {\n"
+            "\t\t\t\t\twriter = make_uniq<QuackChunkPayloadWriter>(last_size);\n"
+            "\t\t\t\t}\n"
+            "\t\t\t\twriter->AppendChunk(*chunk);\n"
+            "\t\t\t\trows += chunk->size();\n"
+            "\t\t\t\tif (writer->AllocatedBytes() >= target_bytes) {\n"
+            "\t\t\t\t\tflush();\n"
+            "\t\t\t\t}\n"
+            "\t\t\t}\n"
+            "\t\t\tif (reader.HasError()) {\n"
+            "\t\t\t\tresult = make_uniq<QueryResult>(reader.GetErrorObject());\n"
+            "\t\t\t} else {\n"
+            "\t\t\t\tflush();\n"
+            "\t\t\t\tstream->announced_total = batch_index - 1;\n"
+            "\t\t\t\t// a stand-in for the handle the stream consumed: successful, empty, bound already\n"
+            "\t\t\t\tresult = make_uniq<QueryResult>(StatementType::SELECT_STATEMENT, StatementProperties(), vector<Identifier>(),\n"
+            "\t\t\t\t                                make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator()),\n"
+            "\t\t\t\t                                context.GetClientProperties());\n"
+            "\t\t\t}\n"
+            "\t\t}\n"
             "\t\tacl::AclQuackStatementCompleted(*connection.duckdb_connection, connection.session_id, sql, *result);\n"
             "\t\tif (result->HasError()) {\n",
         ),
@@ -90,10 +189,21 @@ BANNER = (
 )
 
 
+def patched_source() -> pathlib.Path:
+    """A scratch copy of the submodule's `src` with duckdb's quack patches applied (the caller removes it)."""
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="acl-quack-sync-"))
+    shutil.copytree(SUB, scratch / "src")
+    for patch in sorted(DUCKDB_PATCHES.glob("*.patch")):
+        subprocess.run(["patch", "-p1", "-s", "-N", "-d", str(scratch), "-i", str(patch)], check=True)
+        print(f"applied {patch.relative_to(ROOT)}")
+    return scratch / "src"
+
+
 def main():
     failures = []
+    source = patched_source()
     for name, required in FILES.items():
-        src = SUB / name
+        src = source / name
         if not src.exists():
             failures.append(f"{name}: source missing at {src}")
             continue
@@ -117,6 +227,7 @@ def main():
         if shutil.which("clang-format"):
             subprocess.run(["clang-format", "-i", str(dest)], check=True)
         print(f"generated {dest.relative_to(ROOT)}")
+    shutil.rmtree(source.parent, ignore_errors=True)
     if failures:
         print("\nSYNC FAILED:", file=sys.stderr)
         for f in failures:

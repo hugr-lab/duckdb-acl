@@ -11,6 +11,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/query_result.hpp"
 #include "duckdb/main/database.hpp"
 #include "yyjson.hpp"
 
@@ -333,15 +334,14 @@ struct CatalogBackend {
 	shared_ptr<DatabaseInstance> Db();
 
 	//! Run one read query on a fresh connection; throws on error
-	unique_ptr<MaterializedQueryResult> Query(const string &sql);
+	unique_ptr<QueryResult> Query(const string &sql);
 
 	//! Run a read-modify-write as ONE transaction on ONE connection: `body` receives a query callback
 	//! (its reads see the same snapshot the writes commit into) and the statement sink. Without this,
 	//! two concurrent ALTERs of the same object read the same pre-image and the second whole-row
 	//! rewrite silently discards the first - which can drop an RLS predicate or a column mask.
-	void
-	WriteWithReads(const std::function<void(const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &,
-	                                        vector<string> &)> &body);
+	void WriteWithReads(const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &,
+	                                             vector<string> &)> &body);
 
 	//! Run admin write statements + the policy_version bump in one transaction
 	void Write(const vector<string> &statements);
@@ -406,7 +406,7 @@ struct CatalogBackend {
 	//! Fold the six policy columns of one result row into the chain of one role. A NULL `rls_checked`
 	//! is a row written before spec 027 existed, and counts as unchecked: `acl_refresh_schema` judges
 	//! those and fills the verdict in.
-	static GrantPolicy RowPolicy(MaterializedQueryResult &result, idx_t row, idx_t first_column);
+	static GrantPolicy RowPolicy(QueryResult &result, idx_t row, idx_t first_column);
 
 	//! Split a written name into its qualified interpretation; empty head = no qualified branch
 	static void SplitName(const string &vname, string &head, string &rest);
@@ -522,8 +522,8 @@ struct CatalogBackend {
 	//! that binds at all accepted it. Unlike an object's own predicate this never refuses the write - a
 	//! catalog predicate that does not fit one object is a real (if questionable) configuration, and it
 	//! was allowed before the flag existed.
-	bool CatalogPredicateChecked(const std::function<unique_ptr<MaterializedQueryResult>(const string &)> &read,
-	                             const string &vcat, const string &rls);
+	bool CatalogPredicateChecked(const std::function<unique_ptr<QueryResult>(const string &)> &read, const string &vcat,
+	                             const string &rls);
 
 	//! What an object exposes, in its own order: the column list it declares, or - when it declares
 	//! none - the columns of the source it stands for. False when the source cannot be bound here, in
