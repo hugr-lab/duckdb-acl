@@ -560,6 +560,8 @@ bool PolicyStore::SessionRefOf(const string &handle, SessionRef &out) {
 	out.door = entry->second.door;
 	out.audit_level = entry->second.audit_level;
 	out.principal = entry->second.principal;
+	out.correlation_id = entry->second.correlation_id;
+	out.traceparent = entry->second.traceparent;
 	return true;
 }
 

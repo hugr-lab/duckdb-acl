@@ -149,6 +149,7 @@ static void DriveQuery(QuackConnection &connection, shared_ptr<QuackResultStream
 		// twice in duckdb (INTERNAL, the database invalidated). The statement is submitted and its
 		// result drained here through a QueryResultStream; several statements at once (the
 		// parser's implicit PIVOT) cannot be submitted and run through Query(), materialized.
+		acl::AclQuackStatementStarting(*connection.duckdb_connection, connection.session_id);
 		unique_ptr<QueryResult> result = connection.duckdb_connection->Submit(sql);
 		if (result->HasError() && result->GetError().find("multiple statements") != string::npos) {
 			result = connection.duckdb_connection->Query(sql);

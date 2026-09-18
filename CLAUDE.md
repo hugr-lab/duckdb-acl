@@ -385,6 +385,28 @@ recorded refusals per source (counted regardless). Metric attributes from bounde
 pipeline's worker never holds the instance (settings and the file are the emitting thread's);
 `PolicyStoreHandle`'s destructor in the object cache is the shutdown seam.
 
+**Spec 074 — the execution profile**: what the audit decided is one event; what then *happened* is
+another - kind `profile`, one per decided statement executed (success or failure), emitted from a
+`ClientContextState::QueryEnd` on every connection of the instance (`acl_profile.cpp`; the state
+registered at load for the connections already open and by `OnConnectionOpened` after). It carries
+`decision_seq` (the statement event's `seq`), `exec_us`, `cpu_us` (thread time summed), rows, bytes,
+the memory peaks, `sources[]` (the rollup per attached database the rewrite resolved - `Table` from
+the profile matched against the tail of a physical name, never a parse of scanner strings - and per
+scanner kind, with the pushdown's *shape*: filters and projections counted, `dynamic_filters` seen)
+and `plan[]` (the tree, preorder, ≤256 nodes / depth 32, `truncated` past that; the rollup is over
+the whole tree). Never the statement's text, a literal, a path or a claim value - the texts of
+`Filters`/`Projections`/`Filename(s)` are counted or ignored. Levels `acl_profile_level` = off
+(default) | sampled (the caller's `traceparent` sampled flag) | all, GLOBAL; the session hook
+`SessionPolicy::ProfileFor` (slice 3). The note that links execution to decision is the override's
+(one per decided statement, with the hash of the statement's text), taken onto the connection by the
+batch's first `QueryBegin` and by each statement **whose text matches** - a PREPARE keeps it for the
+executions of the prepared text (Flight carries it in the reservation), a statement nobody decided
+has no profile, and an unprefixed parse ends what was kept. The profiler is switched per connection
+by whoever runs the statement (`ProfileConnectionFor`: the Flight door before each execution, quack's
+driver before it submits, `QueryBegin` on the gateway path) and never over a client's own setting.
+Contract `AuditHooks::CONTRACT_VERSION` = 2. duckdb resets the profiler at an autocommit rollback
+before any hook: a failed statement's profile has its outcome, class and wall time, not the tree.
+
 **Spec 070 — the Flight door streams**: `DoGet` submits the statement (`PreparedStatement::Submit`,
 a handle; a `ResultEagerness::FORCED` statement - a count - runs to completion instead) and hands
 gRPC a `RecordBatchStream` over `AclResultReader`, which pulls ONE duckdb chunk per Arrow batch

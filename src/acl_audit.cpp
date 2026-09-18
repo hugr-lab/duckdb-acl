@@ -117,6 +117,27 @@ AuditLevel AuditPipeline::InstanceLevel() {
 	return AuditLevel::DECISIONS;
 }
 
+ProfileLevel AuditPipeline::InstanceProfileLevel() {
+	ProfileLevel parsed;
+	if (ParseProfileLevel(Setting("acl_profile_level", "off"), parsed)) {
+		return parsed;
+	}
+	return ProfileLevel::OFF;
+}
+
+bool AuditPipeline::ProfileForSession(const Principal &principal, const string &door, ProfileLevel &out) {
+	auto policy = hooks->Policy();
+	if (!policy) {
+		return false;
+	}
+	try {
+		return policy->ProfileFor(principal, door, out);
+	} catch (...) {
+		hooks->Counters().Add("acl.audit.sink_errors", {{"sink", "policy"}});
+		return false;
+	}
+}
+
 bool AuditPipeline::Records(AuditLevel level, int8_t session_level) {
 	auto effective = session_level >= 0 ? static_cast<AuditLevel>(session_level) : InstanceLevel();
 	return effective != AuditLevel::OFF && static_cast<uint8_t>(level) <= static_cast<uint8_t>(effective);
@@ -135,7 +156,8 @@ bool AuditPipeline::LevelForSession(const Principal &principal, const string &do
 	}
 }
 
-void AuditPipeline::Emit(AuditEvent event) {
+int64_t AuditPipeline::Emit(AuditEvent event) {
+	int64_t assigned = 0;
 	// Every setting is read HERE, on the emitting thread - which runs inside the instance - and
 	// carried to the worker. The worker must never take a reference to the instance: a worker that
 	// held its last one would run the instance's teardown, and this pipeline's own Stop(), on
@@ -158,16 +180,17 @@ void AuditPipeline::Emit(AuditEvent event) {
 	{
 		std::lock_guard<std::mutex> guard(queue_lock);
 		if (stopping) {
-			return;
+			return 0;
 		}
 		if (cap > 0 && int64_t(queue.size()) >= cap) {
 			dropped++;
 			hooks->Counters().Add("acl.audit.dropped", {{"where", "queue"}});
-			return;
+			return 0;
 		}
 		// under the lock: the sequence is the queue's order, which is what a sink is promised
 		event.ts_us = NowMicros();
 		event.seq = ++seq;
+		assigned = event.seq;
 		queue.push_back(std::move(event));
 		enqueued++;
 		if (!worker.joinable()) {
@@ -180,11 +203,12 @@ void AuditPipeline::Emit(AuditEvent event) {
 				enqueued--;
 				dropped++;
 				hooks->Counters().Add("acl.audit.dropped", {{"where", "queue"}});
-				return;
+				return 0;
 			}
 		}
 	}
 	queue_cv.notify_one();
+	return assigned;
 }
 
 bool AuditPipeline::AdmitDenial(const AuditEvent &event, int64_t per_second) {
@@ -258,6 +282,15 @@ void AuditPipeline::Count(const AuditEvent &event) {
 		}
 		if (event.kind == "ingest") {
 			counters.Add("acl.ingest.statements", {{"door", event.door}, {"verdict", verdict}});
+		}
+	} else if (event.kind == "profile") {
+		// spec 074: what ran, and how much of it each source took - the attribute sets are the
+		// doors, the statement classes and the attached catalogs, all bounded
+		counters.Add("acl.exec.statements",
+		             {{"door", event.door}, {"statement", event.statement}, {"result", event.error ? "error" : "ok"}});
+		for (auto &source : event.sources) {
+			counters.Add("acl.exec.rows", {{"source", source.source}, {"kind", source.kind}}, source.rows);
+			counters.Add("acl.exec.time_us", {{"source", source.source}, {"kind", source.kind}}, source.timing_us);
 		}
 	} else if (event.kind == "session") {
 		if (event.detail == "opened") {
@@ -484,6 +517,47 @@ string AuditReasonText(const string &reason_code, const string &text) {
 // JSON lines
 //===--------------------------------------------------------------------===//
 
+//! What the event's outcome is called: a decision is allowed or denied; an execution (spec 074)
+//! ran ok or failed - `error` says which, and a failure was never a refusal.
+const char *VerdictOf(const AuditEvent &event) {
+	if (event.kind == "profile") {
+		return event.error ? "error" : "ok";
+	}
+	return event.allowed ? "allowed" : "denied";
+}
+
+//! spec 074: the rollup and the tree as JSON arrays - names quoted, numbers bare; the same text the
+//! file sink writes and the ring's two JSON columns hold.
+string AuditSourcesJson(const vector<AuditSource> &sources) {
+	string out = "[";
+	for (idx_t i = 0; i < sources.size(); i++) {
+		auto &s = sources[i];
+		out += string(i ? "," : "") + "{\"source\":" + JsonQuote(s.source) + ",\"kind\":" + JsonQuote(s.kind) +
+		       ",\"scans\":" + std::to_string(s.scans) + ",\"rows\":" + std::to_string(s.rows) +
+		       ",\"rows_scanned\":" + std::to_string(s.rows_scanned) + ",\"timing_us\":" + std::to_string(s.timing_us) +
+		       ",\"bytes\":" + std::to_string(s.bytes) + ",\"filters\":" + std::to_string(s.filters) +
+		       ",\"projections\":" + std::to_string(s.projections) +
+		       ",\"dynamic_filters\":" + (s.dynamic_filters ? "true" : "false") + "}";
+	}
+	return out + "]";
+}
+
+string AuditPlanJson(const vector<AuditPlanNode> &plan) {
+	string out = "[";
+	for (idx_t i = 0; i < plan.size(); i++) {
+		auto &n = plan[i];
+		out += string(i ? "," : "") + "{\"id\":" + std::to_string(n.id) + ",\"parent\":" + std::to_string(n.parent) +
+		       ",\"depth\":" + std::to_string(n.depth) + ",\"type\":" + JsonQuote(n.type) +
+		       ",\"kind\":" + JsonQuote(n.kind) + ",\"source\":" + JsonQuote(n.source) +
+		       ",\"rows\":" + std::to_string(n.rows) + ",\"rows_scanned\":" + std::to_string(n.rows_scanned) +
+		       ",\"timing_us\":" + std::to_string(n.timing_us) + ",\"bytes\":" + std::to_string(n.bytes) +
+		       ",\"peak_memory_observed\":" + std::to_string(n.peak_memory_observed) +
+		       ",\"filters\":" + std::to_string(n.filters) + ",\"projections\":" + std::to_string(n.projections) +
+		       ",\"dynamic_filters\":" + (n.dynamic_filters ? "true" : "false") + "}";
+	}
+	return out + "]";
+}
+
 string AuditEventJson(const AuditEvent &event) {
 	string out = "{";
 	auto field = [&](const char *name, const string &value, bool quoted = true) {
@@ -515,7 +589,7 @@ string AuditEventJson(const AuditEvent &event) {
 	}
 	objects += "]";
 	field("objects", objects, false);
-	field("verdict", event.allowed ? "allowed" : "denied");
+	field("verdict", VerdictOf(event));
 	field("reason_code", event.reason_code);
 	field("reason", event.reason);
 	field("correlation_id", event.correlation_id);
@@ -524,6 +598,22 @@ string AuditEventJson(const AuditEvent &event) {
 	field("rows", std::to_string(event.rows), false);
 	field("duration_us", std::to_string(event.duration_us), false);
 	field("detail", event.detail);
+	if (event.kind == "profile") {
+		field("decision_seq", std::to_string(event.decision_seq), false);
+		field("error", event.error ? "true" : "false", false);
+		field("exec_us", std::to_string(event.exec_us), false);
+		field("cpu_us", std::to_string(event.cpu_us), false);
+		field("rows_scanned", std::to_string(event.rows_scanned), false);
+		field("rows_out", std::to_string(event.rows_out), false);
+		field("bytes_read", std::to_string(event.bytes_read), false);
+		field("bytes_written", std::to_string(event.bytes_written), false);
+		field("peak_memory", std::to_string(event.peak_memory), false);
+		field("memory_allocated", std::to_string(event.memory_allocated), false);
+		field("blocked_us", std::to_string(event.blocked_us), false);
+		field("truncated", event.truncated ? "true" : "false", false);
+		field("sources", AuditSourcesJson(event.sources), false);
+		field("plan", AuditPlanJson(event.plan), false);
+	}
 	out += "}";
 	return out;
 }
@@ -595,6 +685,20 @@ unique_ptr<FunctionData> AuditEventsBind(ClientContext &, TableFunctionBindInput
 	column("rows", LogicalType::BIGINT);
 	column("duration_us", LogicalType::BIGINT);
 	column("detail", LogicalType::VARCHAR);
+	// spec 074: the profile's numbers, NULL on every other kind; the rollup and the tree as JSON
+	column("decision_seq", LogicalType::BIGINT);
+	column("exec_us", LogicalType::BIGINT);
+	column("cpu_us", LogicalType::BIGINT);
+	column("rows_scanned", LogicalType::BIGINT);
+	column("rows_out", LogicalType::BIGINT);
+	column("bytes_read", LogicalType::BIGINT);
+	column("bytes_written", LogicalType::BIGINT);
+	column("peak_memory", LogicalType::BIGINT);
+	column("memory_allocated", LogicalType::BIGINT);
+	column("blocked_us", LogicalType::BIGINT);
+	column("truncated", LogicalType::BOOLEAN);
+	column("sources", LogicalType::JSON());
+	column("plan", LogicalType::JSON());
 	return make_uniq<AuditBindData>(info.pipeline);
 }
 
@@ -642,7 +746,7 @@ void AuditEventsScan(ClientContext &, TableFunctionInput &data, DataChunk &outpu
 			objects.push_back(Value::STRUCT(std::move(fields)));
 		}
 		output.data[col++].SetValue(count, Value::LIST(object_type, std::move(objects)));
-		output.data[col++].SetValue(count, Value(event.allowed ? "allowed" : "denied"));
+		output.data[col++].SetValue(count, Value(VerdictOf(event)));
 		output.data[col++].SetValue(count, NullableVarchar(event.reason_code));
 		output.data[col++].SetValue(count, NullableVarchar(event.reason));
 		output.data[col++].SetValue(count, NullableVarchar(event.correlation_id));
@@ -653,6 +757,21 @@ void AuditEventsScan(ClientContext &, TableFunctionInput &data, DataChunk &outpu
 		output.data[col++].SetValue(count, NullableBigint(event.rows));
 		output.data[col++].SetValue(count, NullableBigint(event.duration_us));
 		output.data[col++].SetValue(count, NullableVarchar(event.detail));
+		bool profile = event.kind == "profile";
+		output.data[col++].SetValue(count, NullableBigint(event.decision_seq));
+		output.data[col++].SetValue(count, NullableBigint(event.exec_us));
+		output.data[col++].SetValue(count, NullableBigint(event.cpu_us));
+		output.data[col++].SetValue(count, NullableBigint(event.rows_scanned));
+		output.data[col++].SetValue(count, NullableBigint(event.rows_out));
+		output.data[col++].SetValue(count, NullableBigint(event.bytes_read));
+		output.data[col++].SetValue(count, NullableBigint(event.bytes_written));
+		output.data[col++].SetValue(count, NullableBigint(event.peak_memory));
+		output.data[col++].SetValue(count, NullableBigint(event.memory_allocated));
+		output.data[col++].SetValue(count, NullableBigint(event.blocked_us));
+		output.data[col++].SetValue(count, profile ? Value::BOOLEAN(event.truncated) : Value(LogicalType::BOOLEAN));
+		output.data[col++].SetValue(count,
+		                            profile ? Value(AuditSourcesJson(event.sources)) : Value(LogicalType::VARCHAR));
+		output.data[col++].SetValue(count, profile ? Value(AuditPlanJson(event.plan)) : Value(LogicalType::VARCHAR));
 		count++;
 	}
 	output.SetChildCardinality(count);

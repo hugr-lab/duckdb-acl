@@ -30,6 +30,7 @@
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
 #include "acl_oidc.hpp"
+#include "acl_profile.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/enums/result_eagerness.hpp"
@@ -265,6 +266,10 @@ struct FlightDoorState {
 		int64_t last_used = 0;
 		bool single_use = false;
 		vector<vector<Value>> parameter_rows;
+		//! spec 074: the profile note the Prepare left (the decision's seq, the resolved names),
+		//! given back to the connection for each execution
+		bool has_profile = false;
+		acl::ProfileNote profile;
 	};
 	std::unordered_map<string, shared_ptr<Reservation>> reservations;
 	//! Refuse a new reservation rather than evict somebody's old one: an evicted one is a mid-flight
@@ -1048,6 +1053,7 @@ public:
 				ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, command.transaction_id));
 				TempScanScope temp_scan(reservation->conn->con->context.get());
 				reservation->stmt = reservation->conn->con->Prepare(prefixed);
+				ProfileOfPrepare(*reservation);
 			}
 			if (reservation->stmt->HasError()) {
 				return StatusFromDuck("acl", reservation->stmt->GetError());
@@ -1110,8 +1116,10 @@ public:
 			auto execution = state->LockForStatement(*conn);
 			ARROW_RETURN_NOT_OK(ValidateTxnLocked(*conn, command.transaction_id));
 			TempScanScope temp_scan(conn->con->context.get());
+			ArmProfile(handle, *conn, nullptr, traceparent); // the Prepare's note serves the Execute
 			auto stmt = conn->con->Prepare(prefixed);
 			if (stmt->HasError()) {
+				acl::ClearProfileNotes();
 				return StatusFromDuck("acl", stmt->GetError());
 			}
 			vector<Value> values;
@@ -1349,12 +1357,14 @@ public:
 			auto &con = *conn->con;
 			unique_ptr<PreparedStatement> stmt;
 			bool source_attached = false;
+			ArmProfile(handle, *conn, nullptr, string()); // no trace rides on an ingest: `all` profiles it
 			{
 				ArrowIngestScope ingest_scan(make_shared_ptr<IngestScanFactory>(stream));
 				stmt = con.Prepare(prefixed);
 				source_attached = ingest_scan.Taken();
 			}
 			if (stmt->HasError()) {
+				acl::ClearProfileNotes();
 				return StatusFromDuck("acl", stmt->GetError());
 			}
 			if (!source_attached) {
@@ -1452,6 +1462,7 @@ public:
 				    ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, request.transaction_id));
 				    TempScanScope temp_scan(reservation->conn->con->context.get());
 				    reservation->stmt = reservation->conn->con->Prepare(prefixed);
+				    ProfileOfPrepare(*reservation);
 			    }
 			    if (reservation->stmt->HasError()) {
 				    return StatusFromDuck("acl", reservation->stmt->GetError());
@@ -1581,6 +1592,7 @@ public:
 					return StatusFromDuck("acl", begun->GetError());
 				}
 			}
+			ArmProfile(caller, *reservation->conn, reservation.get(), string()); // one note, every row's execution
 			int64_t total = 0;
 			for (auto &row : rows) {
 				auto result = reservation->stmt->Execute(row);
@@ -1676,6 +1688,39 @@ public:
 	//! - the reservation, the connection's `exec` lock, the result - for exactly as long as the
 	//! client pulls. Its end, however it comes, interrupts the query: nothing is computed for a client
 	//! that stopped listening, and nothing is held in RAM beyond the chunk in flight.
+	//! spec 074: what a Prepare leaves for its executions - the override's note, kept on the
+	//! connection past the PREPARE (whose tree is its own), taken into the reservation so another
+	//! Prepare on the session cannot replace it. A Prepare that failed before it began (several
+	//! statements) left its notes on the thread: dropped, nothing executes them.
+	static void ProfileOfPrepare(FlightDoorState::Reservation &reservation) {
+		if (reservation.stmt->HasError()) {
+			acl::ClearProfileNotes();
+			reservation.has_profile = false;
+			return;
+		}
+		reservation.has_profile = acl::TakeConnectionProfileNote(*reservation.conn->con->context, reservation.profile);
+	}
+
+	//! spec 074: before an execution on the session's connection - the reservation's note back on
+	//! the connection (the execution takes it: its text is the prepared one) and the profiler set
+	//! for the session's principal by the level and the trace the note carries.
+	void ArmProfile(const string &handle, FlightDoorState::SessionConn &conn,
+	                optional_ptr<FlightDoorState::Reservation> reservation, const string &traceparent) {
+		auto &context = *conn.con->context;
+		string trace = traceparent;
+		if (reservation && reservation->has_profile) {
+			acl::SetConnectionProfileNote(context, reservation->profile);
+			if (trace.empty()) {
+				trace = reservation->profile.proto.traceparent;
+			}
+		}
+		PolicyStore::SessionRef ref;
+		if (!state->store->SessionRefOf(handle, ref)) {
+			return;
+		}
+		acl::ProfileConnectionFor(context, state->store->audit, ref.principal, "flight", trace);
+	}
+
 	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
 	StreamStatement(const flight::ServerCallContext &context, shared_ptr<FlightDoorState::Reservation> reservation,
 	                vector<Value> &values, const string &handle) {
@@ -1684,6 +1729,7 @@ public:
 		// a statement that completes before it answers (a count - ResultEagerness::FORCED) runs to
 		// completion here; anything else is submitted, and the reader drains it chunk by chunk
 		auto &stmt = *reservation->stmt;
+		ArmProfile(handle, *reservation->conn, reservation.get(), string());
 		auto result = stmt.GetStatementProperties().result_eagerness == ResultEagerness::FORCED ? stmt.Execute(values)
 		                                                                                        : stmt.Submit(values);
 		if (result->HasError()) {

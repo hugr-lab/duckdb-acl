@@ -54,6 +54,41 @@ namespace acl {
 //! Ordered: a level records every event at or below itself.
 enum class AuditLevel : uint8_t { OFF = 0, DENIED = 1, DECISIONS = 2, ALL = 3 };
 
+//! spec 074: whether a node profiles what it executes - nothing, statements the caller's trace
+//! context marks as sampled, or every statement.
+enum class ProfileLevel : uint8_t { OFF = 0, SAMPLED = 1, ALL = 2 };
+
+inline const char *ProfileLevelName(ProfileLevel level) {
+	switch (level) {
+	case ProfileLevel::OFF:
+		return "off";
+	case ProfileLevel::SAMPLED:
+		return "sampled";
+	default:
+		return "all";
+	}
+}
+
+//! Parses `off` / `sampled` / `all` (case-insensitive, trimmed); false on anything else.
+inline bool ParseProfileLevel(const string &text, ProfileLevel &out) {
+	string lowered;
+	for (auto c : text) {
+		if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+			lowered += static_cast<char>((c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c);
+		}
+	}
+	if (lowered == "off") {
+		out = ProfileLevel::OFF;
+	} else if (lowered == "sampled") {
+		out = ProfileLevel::SAMPLED;
+	} else if (lowered == "all") {
+		out = ProfileLevel::ALL;
+	} else {
+		return false;
+	}
+	return true;
+}
+
 inline const char *AuditLevelName(AuditLevel level) {
 	switch (level) {
 	case AuditLevel::OFF:
@@ -95,6 +130,40 @@ struct AuditObject {
 	string capability;
 };
 
+//! spec 074: one source of an executed statement - an attached database the rewrite resolved a
+//! scan to, or a file format - rolled up over its scans. Numbers only: a source's name is the
+//! attached catalog's, a kind is the scanner's; the pushdown is counted, never quoted.
+struct AuditSource {
+	string source;     // the attached database (`pg`, `lake`, `memory`); empty for a file scan
+	string kind;       // the scanner: table_scan, postgres_scan, ducklake_scan, read_parquet, ...
+	int64_t scans = 0; // scan operators; for a file format, the files read
+	int64_t rows = 0;  // rows the scans returned
+	int64_t rows_scanned = 0;
+	int64_t timing_us = 0; // cumulative thread time of the scans - may exceed the statement's wall time
+	int64_t bytes = 0;     // intermediate bytes the scans produced
+	int64_t filters = 0;   // conjuncts pushed to the scans, summed
+	int64_t projections = 0;
+	bool dynamic_filters = false; // a join filter reached at least one of the scans
+};
+
+//! spec 074: one operator of the executed plan, in preorder; `parent` is -1 at the root.
+struct AuditPlanNode {
+	int64_t id = 0;
+	int64_t parent = -1;
+	int64_t depth = 0;
+	string type;   // duckdb's operator type (TABLE_SCAN, HASH_JOIN, ...)
+	string kind;   // for a scan: as AuditSource::kind; else empty
+	string source; // for a scan: as AuditSource::source; else empty
+	int64_t rows = 0;
+	int64_t rows_scanned = 0;
+	int64_t timing_us = 0; // cumulative thread time
+	int64_t bytes = 0;
+	int64_t peak_memory_observed = 0; // the node's buffer-pool peak seen while this operator ran
+	int64_t filters = 0;
+	int64_t projections = 0;
+	bool dynamic_filters = false;
+};
+
 //! One decision, or one lifecycle occurrence. Never the statement text, parameters, rows or
 //! physical names; claim values are here in memory (`principal.claims`) for a sink to filter, and
 //! never written by a base sink.
@@ -106,7 +175,7 @@ struct AuditEvent {
 	string door;                              // flight / quack / gateway / admin / session
 	string session;                           // the ops id, never the handle; empty off a session
 	Principal principal;
-	string kind;      // statement / admin / session / ingest / door / policy / keys
+	string kind;      // statement / admin / session / ingest / door / policy / keys / profile
 	string statement; // the statement class, or MANAGEMENT / NATIVE; empty for lifecycle kinds
 	vector<AuditObject> objects;
 	bool allowed = true;
@@ -119,6 +188,23 @@ struct AuditEvent {
 	int64_t duration_us = -1; // session close: how long it lived
 	string detail;            // policy / keys / session: reloaded, source_error, refreshed, refresh_failed,
 	                          // client, idle, expired, killed, door_stopped
+	//! spec 074, kind `profile`: the execution of a decided statement, emitted when it ends. Every
+	//! number is duckdb's own measure (see the spec for what each one is and is not); the tree and
+	//! the rollup carry names of attached catalogs and operator types, never text of the statement.
+	int64_t decision_seq = -1; // the statement event whose execution this is; -1 = unlinked
+	bool error = false;        // the execution failed; `detail` carries the error's class
+	int64_t exec_us = -1;      // wall time, the statement's begin to its end
+	int64_t cpu_us = -1;       // thread time summed over operators
+	int64_t rows_scanned = -1;
+	int64_t rows_out = -1;
+	int64_t bytes_read = -1;
+	int64_t bytes_written = -1;
+	int64_t peak_memory = -1;      // the buffer pool's peak during the statement
+	int64_t memory_allocated = -1; // bytes the statement allocated in total
+	int64_t blocked_us = -1;       // thread time spent blocked
+	bool truncated = false;        // `plan` was cut at its limit; `sources` is rolled up over the whole tree
+	vector<AuditSource> sources;
+	vector<AuditPlanNode> plan;
 	//! False when the effective level did not record this event: it is then counted (metrics are a
 	//! state of the node, whatever the level) and never handed to a sink, the ring or the file - so a
 	//! sink only ever sees `true`.
@@ -139,6 +225,15 @@ struct AuditSink {
 struct SessionPolicy {
 	virtual ~SessionPolicy() = default;
 	virtual bool LevelFor(const Principal &principal, const string &door, AuditLevel &out) = 0;
+	//! spec 074: the profile level of a session (the same "per role, per user, per door" rule);
+	//! `false` = no opinion, the instance's `acl_profile_level` applies. Not pure: an extension that
+	//! has no rule for it keeps attaching.
+	virtual bool ProfileFor(const Principal &principal, const string &door, ProfileLevel &out) {
+		(void)principal;
+		(void)door;
+		(void)out;
+		return false;
+	}
 };
 
 //! One metric row, as a scrape wants it.
@@ -297,7 +392,7 @@ public:
 	//! says "stamped at all" (a registry created by a build from before the stamp has other bytes
 	//! here), then the version.
 	static constexpr int32_t CONTRACT_MAGIC = 0x41434C41; // "ACLA"
-	static constexpr int32_t CONTRACT_VERSION = 1;
+	static constexpr int32_t CONTRACT_VERSION = 2;        // 2: spec 074 - the profile event, ProfileFor
 	int32_t contract_magic = CONTRACT_MAGIC;
 	int32_t contract_version = CONTRACT_VERSION;
 

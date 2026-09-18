@@ -1,6 +1,6 @@
 # Spec 074: the execution profile - what went to which source, and what it cost
 
-- **Status**: draft
+- **Status**: implemented (slice 1: the base, contract v2)
 - **Date**: 2026-09-18
 - **Author**: hugr lab
 
@@ -69,7 +69,13 @@ statement's text, a literal, a path or a claim value.
 
 ### The event: kind `profile`
 
-One event per executed statement (success or error), emitted from `QueryEnd`:
+One event per executed statement (success or error), emitted from `QueryEnd`. A statement that
+failed carries its outcome, the error's class and the wall time; whether it also carries the tree
+is duckdb's: in autocommit the rollback at the statement's end resets the profiler
+(`TransactionContext::Rollback`, before any state hook), so the tree is gone - inside a
+transaction the client owns, nothing is rolled back there and the tree of the failed execution is
+in the event. A failure at bind (an allowed statement duckdb then refused) has no tree either
+way, and is the one place the audit records that the allowed statement did not run.
 
 | field | meaning |
 | --- | --- |
@@ -86,8 +92,8 @@ One event per executed statement (success or error), emitted from `QueryEnd`:
 | `truncated` | `plan` was cut at a limit |
 
 - `source` is the **database** of the physical name the rewriter resolved for the scan (`pg`,
-  `lake`, `memory`); `kind` is the scanner (`postgres_scan`, `ducklake_scan`, `seq_scan`, `parquet`,
-  `csv`, ...). File scans have no catalog: `source` is empty, `kind` says the format and `scans`
+  `lake`, `memory`); `kind` is the scanner (`postgres_scan`, `ducklake_scan`, `table_scan`, `parquet_scan`,
+  `read_csv`, ...). File scans have no catalog: `source` is empty, `kind` says the format and `scans`
   counts the files read. `sources[]` is what the owner asked for and it is small: bounded by the
   number of attached catalogs plus the file formats.
 - **The pushdown's shape, never its text** (the owner's decision): `filters` = the number of
@@ -113,17 +119,23 @@ The statement event is emitted after the rewrite, before execution; `profile` af
 on `decision_seq`:
 
 - **Gateway prefix, quack**: parse and execution are one `Query()` on one thread. The override
-  leaves a thread-local note `{seq, statement class, resolved physical names}` (the `Reason` note's
-  mechanism); the state's `QueryBegin` takes it into the connection and clears it; `QueryEnd`
-  uses it. It cannot go stale: the note lives until the next `QueryBegin` on that thread.
-  `AuditPipeline::Emit` (acl-internal) returns the `seq` it assigned, so the override can note it.
-- **Flight**: the reservation was rewritten at GetFlightInfo and is executed at DoGet - another
-  call, possibly another thread. The door holds the reservation and sets the note on the session
-  connection's state itself, at `LockForStatement`.
-- **Prepared on a gateway connection**: executed later, no note - `decision_seq = -1`;
-  `correlation_id` / `traceparent` are read in `QueryEnd` from the connection's session settings
-  (the spec 068 pair, `TryGetCurrentSetting`), which a session has whatever the thread. An honest
-  "unlinked", never a guess.
+  leaves one thread-local note per decided statement `{seq, the hash of the statement's text,
+  statement class, objects, resolved physical names}` (the `Reason` note's mechanism); the first
+  `QueryBegin` after the parse - the batch's first statement, on the connection that parsed it,
+  before anything it runs on another connection of the thread - takes the whole queue onto the
+  connection. Each statement then takes the queue's front note **only if the text matches**
+  (`SQLStatement::query`, what duckdb reports as the current query): a follow-up the rewrite
+  appended, a nested query, another connection's statement take none. `AuditPipeline::Emit`
+  (acl-internal) returns the `seq` it assigned, so the override can note it.
+- **A statement nobody decided has no profile**: the gateway's own reads (`acl_audit_events()`
+  itself - which would otherwise profile its own reading), a door's `BEGIN`. The override marks an
+  unprefixed parse with a boundary note, so a note kept on the connection cannot outlive it.
+- **Prepared, then executed** (Flight's reservation; a gateway's `Prepare` + `Execute`): the
+  PREPARE's own tree is skipped and its note **kept** on the connection; an execution takes it when
+  its text is the prepared one (an EXECUTE reports the prepared text) - every execution of the
+  prepared statement is linked to the one decision, and a statement of another text drops it. The
+  Flight door takes the note into the reservation after the Prepare and gives it back before each
+  execution, so another Prepare on the same session cannot replace it in between.
 
 ### Switching it on: three layers, as the audit has
 
@@ -133,12 +145,14 @@ on `decision_seq`:
 | session | `SessionPolicy::ProfileFor(principal, door, out)` - the spec 069 hook, extended (acl_otel specs 004/007: rules per role, per door); ops: a column in `acl_sessions()`, `acl_session_profile(id, on\|off)` | rules / the operator (slice 3) |
 | statement | `sampled` = the sampled flag of the caller's `traceparent` - already on every statement (`TRACE ... PARENT` from the doors, Flight's headers, `acl_traceparent` on a session) | the caller, the OTel way |
 
-The mechanism is one: before `Query()` a door sets on its connection `enable_profiler = true`,
-`profiler_print_format = 'no_output'`, `profiling_coverage = ALL`, and restores them after. A
-connection whose client or gateway enabled profiling itself is left alone - both ways. On a bare
-gateway connection with no door only `all` (or the gateway's own `SET`) profiles; the docs say so.
-acl_otel's sampler (spec 005) applies to `profile` as to the decision: sampled together, by one
-`decision_seq`.
+The mechanism is one (`ProfileConnectionFor`): `enable_profiler = true`, `profiler_print_format =
+'no_output'`, `profiling_coverage = ALL` on the connection, switched off again only by the one who
+switched it on - a connection whose client or gateway enabled profiling itself is left alone, both
+ways. A door decides before each execution it runs (Flight before an execute, quack's driver
+before it submits). On the gateway path the state's own `QueryBegin` decides, per decided
+statement, from the level and the note's trace: duckdb starts the profiler at plan, after
+`QueryBegin`, so the decision is in time for the statement itself. acl_otel's sampler (spec 005)
+applies to `profile` as to the decision: sampled together, by one `decision_seq`.
 
 ### Where it goes
 
@@ -146,8 +160,9 @@ acl_otel's sampler (spec 005) applies to `profile` as to the decision: sampled t
   `cpu_us`, `rows_scanned`, `rows_out`, `bytes_read`, `bytes_written`, `peak_memory`,
   `memory_allocated`, `blocked_us`, `truncated`, and two JSON columns `sources`, `plan` (the ring
   keeps the event whole; the limits above keep it small). The file sink writes the event as it is.
-  Counters derived from events: `acl.exec.statements{door,statement}`, `acl.exec.rows{source}`,
-  `acl.exec.time_us{source}` - attribute sets bounded by the attached catalogs. No histograms in the
+  Counters derived from events: `acl.exec.statements{door,statement,result}`,
+  `acl.exec.rows{source,kind}`, `acl.exec.time_us{source,kind}` - attribute sets bounded by the
+  attached catalogs and the scanners. The ring's `verdict` reads `ok` / `error` for a profile. No histograms in the
   base (spec 003 is acl_otel's).
 - **acl_otel spec 009** (the owner accepted this shape, 2026-09-17): the **execution span**
   `[ts_us - exec_us, ts_us]` - both ends measured - linked (an OTel span link, not only an
@@ -183,24 +198,39 @@ on both sides, as today.
   gateway's own settings are never overwritten, in either direction.
 - Nothing here changes a decision: the profile is emitted after the fact, off the decision path,
   through the same bounded pipeline.
+- A principal cannot switch the profiler (`SET enable_profiling` is refused under a principal,
+  spec 068) and cannot read a profile. Under `sampled` a client that marks every trace sampled
+  has every statement of its own profiled: the cost is the profiler's (measured above, noise) and
+  one event per statement into the bounded queue - what the operator chose over `off`.
+- A statement nobody decided is never profiled, so the ring's own reads (`acl_audit_events()`)
+  cannot feed themselves, and a gateway's unprefixed traffic costs nothing.
 
 ## Testing
 
-1. sqllogic: `SET GLOBAL acl_profile_level='all'` → after `ACL ROLE ... SELECT` over a parquet file
-   joined to a table, `acl_audit_events()` has a `profile` event: `sources` has exactly two entries
-   whose `rows` match `count(*)`; `plan` has one root and consistent `parent`s; a DML statement
-   profiles too (coverage ALL); `filters` / `projections` match what EXPLAIN shows for the scan.
-2. Redaction: the RLS literal and the claim value are in no event byte; no `Filename(s)`; no
-   `query.sql`.
-3. Correlation: `decision_seq` equals the statement event's `seq` under the gateway prefix; a
-   prepared statement gives -1 with the session's `correlation_id` in place.
-4. Flight e2e (`stream.sh`): the profile arrives when the stream ends, `rows_out` = the rows sent;
-   a cancelled stream gives a profile with `error`.
-5. Levels: `off` emits nothing; `sampled` emits only under a sampled `traceparent`;
-   `acl_session_profile` (slice 3).
-6. Truncation: a plan of more than 256 operators (a UNION ALL of 300 scans) → `truncated`, and
-   `sources` complete.
-7. The cost note above (numbers, not a test).
+`test/sql/acl_profile.test` (memory mode, an attached `pg` catalog under RLS joined to a local
+table):
+
+1. `off` emits nothing; `all` emits one `profile` per decided statement, `decision_seq` = the
+   statement event's `seq`, `rows_out` the top operator's rows, `sources` = the attached database
+   the rewrite resolved (`pg`) and the local one, `plan` a tree (one root, `HASH_JOIN` in it, not
+   truncated), the pushdown counted (`filters`: the RLS predicate on `pg`, the WHERE on `memory`;
+   `dynamic_filters` where the join filter reached the scan).
+2. Redaction: the claim value, the predicate's column name and the WHERE's literal appear in no
+   byte of `sources` or `plan`.
+3. Failures: a run-time error (autocommit: outcome, class, wall time, no tree - duckdb's reset at
+   rollback), a bind error (allowed, then refused by duckdb: no tree), a run-time error inside a
+   client-owned transaction (the tree, with its scans); never the error's text.
+4. A batch: one profile per statement, each linked to its own decision, in order.
+5. A statement nobody decided (the gateway's own read) leaves no event.
+6. `sampled`: of three statements only the one whose `traceparent` has the sampled flag profiles,
+   and it carries its trace.
+7. Truncation: a UNION ALL of 300 scans → `truncated`, `plan` ≤ 256 nodes, `sources` counts all
+   300 scans.
+8. The level is validated where it is set.
+
+Flight e2e (`stream.sh`): a consumed stream's profile arrives when the stream ends, under
+`door = flight`, linked to its decision, with `rows_out` = the rows sent. `acl_session_profile`
+(slice 3) and the cost note above (numbers) are not tests.
 
 ## Alternatives considered
 
@@ -244,6 +274,14 @@ on both sides, as today.
   explicitly), for a prepared statement per execution.
 - `AuditPipeline::Emit` returns the assigned `seq` (a signature change of an acl-internal class);
   the override notes it beside the reason note.
-- Profiling coverage and format are set through `ClientConfig::GetConfig(context)` on the door's
-  connection around the statement; the door's `LockForStatement` and quack's `DriveQuery` are the
-  two sites.
+- Profiling coverage and format are set through `ClientConfig::GetConfig(context)`
+  (`ProfileConnectionFor`): the Flight door's `ArmProfile` before every execution (`StreamStatement`,
+  the executemany loop, the direct update's and the ingest's Prepare) and `AclQuackStatementStarting`
+  in quack's `DriveQuery` (the `sync.py` patch) are the sites; the gateway path is `QueryBegin`.
+- Connections open before the load (the one loading, a gateway's pool) get their state at
+  registration (`ConnectionManager::GetConnectionList`); `OnConnectionOpened` covers the rest.
+- `TransactionContext::Rollback` calls `profiler->Reset()` before the state hooks run: an
+  autocommit statement that failed has no tree at `QueryEnd` (the event still says it failed, its
+  class and its wall time). An upstream question for later - the hooks after the reset.
+- The scanner's name in `sources[].kind` is the operator's (`PhysicalTableScan::GetName()`, the
+  function's name lower-cased): `table_scan` for a duckdb table, `postgres_scan`, `read_parquet`.

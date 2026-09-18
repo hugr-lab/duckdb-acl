@@ -13,6 +13,7 @@
 
 #include "acl_audit_pipeline.hpp"
 #include "acl_parser_override.hpp"
+#include "acl_profile.hpp"
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
 #include "acl_quack_server.hpp"
@@ -237,6 +238,20 @@ void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &resu
 }
 
 } // namespace
+
+void AclQuackStatementStarting(Connection &connection, const string &connection_id) {
+	try {
+		auto store = PolicyStore::Of(*connection.context->db);
+		string handle;
+		PolicyStore::SessionRef ref;
+		if (!store || !store->SessionHandleFor(connection_id, handle) || !store->SessionRefOf(handle, ref)) {
+			return;
+		}
+		ProfileConnectionFor(*connection.context, store->audit, ref.principal, ref.door, ref.traceparent);
+	} catch (...) {
+		// a profile is never worth the statement
+	}
+}
 
 void AclQuackStatementCompleted(Connection &connection, const string &connection_id, const string &sql,
                                 QueryResult &result) {

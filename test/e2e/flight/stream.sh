@@ -44,6 +44,7 @@ trap cleanup EXIT INT TERM
 	echo "ACL ADMIN CREATE VIRTUAL VIEW c.big AS SELECT i, i::VARCHAR AS s FROM range(200000000) t(i);"
 	echo "SET GLOBAL acl_allow_anonymous_admin=false;"
 	echo "SET GLOBAL acl_audit_level='all';"
+	echo "SET GLOBAL acl_profile_level='all';"
 	echo "SET GLOBAL acl_flight_stream_idle=2;"
 	echo ".mode csv"
 	echo ".headers off"
@@ -114,6 +115,11 @@ got="$(client consume "SELECT * FROM orders")"
 echo "$got" | grep -q "'rows': 5" || fail "the tenant's five rows: $got"
 ended="$(await_stream "^stream_consumed,5$" "a full read is stream_consumed with its rows")"
 echo "  pass a full read is consumed ($ended)"
+# spec 074: the profile of that statement arrived when the stream ended - under the door, linked to
+# the decision that admitted it, with the rows the client received
+profile="$(server_says "SELECT door, statement, verdict, rows_out, decision_seq > 0 FROM acl_audit_events() WHERE kind = 'profile' ORDER BY seq DESC LIMIT 1")"
+[ "$profile" = "flight,select,ok,5,true" ] || fail "the consumed stream's profile: $profile"
+echo "  pass the stream's profile is linked and counts its rows ($profile)"
 
 # --- a forgotten cursor is superseded by the session's next statement ---------------------------
 got="$(client supersede "SELECT * FROM big")"
