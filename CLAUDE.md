@@ -280,8 +280,8 @@ tokens. A namespace-alias shim (`acl_quack_httplib_ns.hpp`) lets quack's
 acl_-renamed TUs on a submodule bump - from a copy carrying duckdb's own quack patches, plus the
 embed's one patch: the statement driver. Since the unified `QueryResult` (duckdb #25477) the server
 delegates no result collector - a delegated submission that fails ends its query twice inside
-duckdb (a null dereference, INTERNAL, the whole database invalidated by a refused INSERT), and
-upstream quack has not met that duckdb yet - so the driver submits the statement and drains it
+duckdb (a null dereference, INTERNAL, the whole database invalidated by a refused INSERT; duckdb
+#25887), and upstream quack has not met that duckdb yet - so the driver submits the statement and drains it
 through a `QueryResultStream` in batches of `acl_quack_target_batch_bytes` (several statements at
 once, the parser's implicit PIVOT, run through `Query()` materialized), with spec 069's audit hook
 inside; the embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).

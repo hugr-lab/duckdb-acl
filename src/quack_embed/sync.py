@@ -76,6 +76,7 @@ PATCHES = {
         # thread); a text of several statements (the parser's implicit PIVOT) cannot be submitted and
         # runs through Query(), materialized. spec 069's audit hook rides the same site: the outcome
         # of every statement the server drives, the drain of a client's streamed insert among them.
+        # The double end is reported upstream as duckdb #25887 (2026-09-18).
         (
             "\t\t// MakeQuackFetchCollector sends the FIRST statement that returns a result into the stream.\n"
             "\t\t// Every other statement keeps the default collector.\n"
