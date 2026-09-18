@@ -160,7 +160,8 @@ twice inside duckdb (`FailQueryInternal` within `CompleteDelegatedInternal`, the
 abort now" branch of `SubmitStatementInternal`, whose own comment admits the query may already be
 gone): a null dereference, an INTERNAL error, and the whole database invalidated - by nothing more
 than a principal's INSERT refused at the predicate (spec 024). quack's own pin of duckdb predates
-the change and duckdb's CI does not run quack's tests, so the embed met it first.
+the change and duckdb's CI does not run quack's tests, so the embed met it first - reported as
+duckdb #25887 (2026-09-18), with the repro and the one-line guard.
 
 The embed's `DriveQuery` (the one `sync.py` patch on `quack_server.cpp`) therefore delegates
 nothing: the statement is `Submit`ted, and a result-returning one is drained through a
