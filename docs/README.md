@@ -16,6 +16,9 @@ and quack. The development guide is [CLAUDE.md](../CLAUDE.md); per-feature specs
   mapping, how a token is judged, sessions and token binding, how clients get a token.
 - [serving.md](serving.md) - serving clients directly: the Flight SQL and quack doors, sessions and
   the ops surface, graceful shutdown, client-local settings, hardening, troubleshooting.
+- [observability.md](observability.md) - the audit, the metrics and the execution profile: what
+  each number is and is not, how profiling is switched on (node, connection, policy, session) and
+  where it goes.
 - [deployment.md](deployment.md) - one node, TLS, behind a proxy; where the fleet story lives.
 - clients/ - how each client connects: [DBeaver / JDBC](clients/dbeaver.md),
   [ADBC (python)](clients/adbc.md), [duckdb + quack](clients/quack.md),
