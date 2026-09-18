@@ -22,7 +22,7 @@ class ExtensionLoader;
 
 namespace acl {
 class AuditPipeline;
-class PolicyStore;
+struct PolicyStore;
 
 //! What the override knows at decision time and the profile needs at execution time: the seq of
 //! the statement event, the batch's shared identity (door, session, principal, trace ids), the
