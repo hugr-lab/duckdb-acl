@@ -123,12 +123,14 @@ run_leg() {
 			fail "$name: the server exited before it was serving"
 		fi
 		if echo "$L SELECT * FROM quack_query('quack:localhost:$port', 'SELECT 1', token := '$TOKEN_ACME');" \
-		   | "$DUCKDB" -unsigned >/dev/null 2>&1; then
+		   | "$DUCKDB" -unsigned >/dev/null 2>"$TMP/$name.probe.err"; then
 			ready=1; break
 		fi
 		sleep 0.5
 	done
 	if [ -z "$ready" ]; then
+		# the probe's own refusal is the reason more often than the server's log is
+		echo "--- $name last probe ---" >&2; cat "$TMP/$name.probe.err" >&2
 		echo "--- $name server log ---" >&2; cat "$TMP/$name.server.log" >&2
 		fail "$name: the door never came up on port $port"
 	fi

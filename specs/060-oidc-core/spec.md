@@ -1,6 +1,10 @@
 # Spec 060: the OIDC client core - acquisition primitives, shared
 
-- **Status**: implemented
+- **Status**: implemented; **the core moved to duckdb-ext-common** (its spec 002, our spec 076,
+  2026-09-18) - `oidc/include/oidc_core.hpp` + `oidc/src/oidc_core.cpp` there, compiled into this
+  extension under `DUCKDB_EXT_COMMON_OIDC_NAMESPACE=acl` so the names below are unchanged; the door's
+  quack-auth discovery (`DoorAuth`, `FetchQuackAuth`, `ParseQuackAuthDocument`) stayed here as
+  `src/oidc/acl_quack_auth.{hpp,cpp}`; the core's test and the fuzzer of its parsers run there
 - **Date**: 2026-08-31
 - **Author**: hugr-lab
 

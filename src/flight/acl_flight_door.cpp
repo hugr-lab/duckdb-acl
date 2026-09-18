@@ -29,7 +29,7 @@
 #include "duckdb/common/types/blob.hpp"
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
-#include "acl_oidc.hpp"
+#include "oidc_core.hpp"
 #include "acl_profile.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"

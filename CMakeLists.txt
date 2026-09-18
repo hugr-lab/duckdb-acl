@@ -14,9 +14,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(src/include)
 # vendored P-256 ECDSA (ES256 verify; duckdb's trimmed mbedtls carries no ECDSA)
 include_directories(third_party/p256-m)
-# the OIDC client core (spec 060) compiles duckdb's bundled httplib in its one TU and parses
-# responses with the bundled yyjson
-include_directories(duckdb/third_party/httplib duckdb/third_party/yyjson/include)
+# the shared repository (duckdb-ext-common, spec 076): the audit contract and Principal come from
+# its contracts/ (header-only, the same header acl-otel compiles), and the OIDC client core (spec 060,
+# moved there by its spec 002) is compiled into this extension from its source list, under OUR
+# namespace - `duckdb::acl::oidc`, exactly the names the call sites always had - with duckdb's
+# bundled httplib and yyjson from our own tree
+include(duckdb-ext-common/oidc/oidc.cmake)
+include_directories(duckdb-ext-common/contracts ${DUCKDB_EXT_COMMON_OIDC_INCLUDE}
+                    duckdb/third_party/httplib duckdb/third_party/yyjson/include)
 
 set(EXTENSION_SOURCES
     src/acl_admin_functions.cpp
@@ -29,7 +34,7 @@ set(EXTENSION_SOURCES
     src/acl_parser_override.cpp
     src/acl_door_auth.cpp
     src/acl_door_common.cpp
-    src/oidc/acl_oidc.cpp
+    src/oidc/acl_quack_auth.cpp
     src/oidc/acl_oidc_secret.cpp
     src/acl_function_categories.cpp
     src/acl_policy.cpp
@@ -150,7 +155,7 @@ if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_QUACK_EMBED})
         set(ACL_QUACK_EMBED_COMPILE_OPTS
             "-include;${QUACK_EMBED}/include/acl_quack_httplib_ns.hpp;-fvisibility=hidden;-fvisibility-inlines-hidden")
     endif()
-    # TLS is compiled in exactly when the flight build's OpenSSL is present (same gate as ACL_OIDC_TLS).
+    # TLS is compiled in exactly when the flight build's OpenSSL is present (same gate as DUCKDB_EXT_COMMON_OIDC_TLS).
     if(NOT DEFINED ENV{ACL_NO_FLIGHT})
         set(ACL_QUACK_EMBED_DEFS "CPPHTTPLIB_OPENSSL_SUPPORT")
     endif()
@@ -161,12 +166,20 @@ if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_QUACK_EMBED})
     set(ACL_QUACK_EMBED_ENABLED 1)
 endif()
 
+list(APPEND EXTENSION_SOURCES ${DUCKDB_EXT_COMMON_OIDC_SOURCES})
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# the OIDC core's namespace is the consumer's (duckdb-ext-common charter R13): ours is `acl`, so the
+# module's names are `duckdb::acl::oidc::...` in this image and nobody else's
+foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
+    target_compile_definitions(${target} PRIVATE DUCKDB_EXT_COMMON_OIDC_NAMESPACE=acl)
+endforeach()
+
 if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_FLIGHT})
     foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
-        target_compile_definitions(${target} PRIVATE ACL_FLIGHT_ENABLED=1 ACL_OIDC_TLS=1)
+        target_compile_definitions(${target} PRIVATE ACL_FLIGHT_ENABLED=1 DUCKDB_EXT_COMMON_OIDC_TLS=1)
         target_link_libraries(${target}
             ArrowFlightSql::arrow_flight_sql_static
             ArrowFlight::arrow_flight_static

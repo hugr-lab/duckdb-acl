@@ -11,7 +11,7 @@
 
 #include "acl_test_util.hpp"
 
-#include "acl_oidc.hpp"
+#include "oidc_core.hpp"
 
 #include "httplib.hpp"
 

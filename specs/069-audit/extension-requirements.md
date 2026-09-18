@@ -12,7 +12,9 @@
 A separate duckdb extension, loaded beside `acl` on the same instance, that turns the base's audit
 events and counters into OpenTelemetry **logs** and **metrics**, decides the audit level **per role,
 per user and per door** (which is how logging gets switched on for a connection by rule), enriches,
-samples, and reports its own health. It compiles against one header, `acl_audit.hpp`, and reaches
+samples, and reports its own health. It compiles against one header, `acl_audit.hpp` (since spec 076
+in the shared repository `duckdb-ext-common`, `contracts/acl_audit.hpp` + `acl_principal.hpp` - a
+consumer takes that submodule, never this one), and reaches
 the base through duckdb's object cache. It contains no enforcement, changes no decision, and can
 never slow or stop one.
 
