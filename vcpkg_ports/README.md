@@ -26,12 +26,14 @@ carry a newer bison.
 
 ## mimalloc
 
-mimalloc 3.3.2 (the same baseline; 2.2.4 before it) names `ERROR_COMMITMENT_MINIMUM` in its Windows
-out-of-memory check, a WinError.h constant the mingw-w64 headers of the MinGW image (rtools42) do not
-have - so the `windows_amd64_mingw` job failed at `prim.c` (arrow depends on mimalloc on every
-platform). `mingw-error-commitment-minimum.patch` defines it (635L, WinError.h's value) when the
-headers do not; everything else is the registry's port. Upstream still has the bare use (v3.5.3);
-retire the port when a mimalloc guards it, or when the image's mingw-w64 knows the constant.
+mimalloc names `ERROR_COMMITMENT_MINIMUM` in its Windows out-of-memory check - a WinError.h constant
+mingw-w64 defines from 10.0.0 on (mimalloc #910, 2024, closed as a toolchain limitation) and the
+MinGW image's (rtools42) headers do not have. It was never built for MinGW here before: arrow 21
+(the old baseline) had mimalloc as an optional feature nobody enabled, arrow 24 (this baseline)
+depends on it outright, so it entered the `windows_amd64_mingw` graph and failed at `prim.c`.
+`mingw-error-commitment-minimum.patch` defines the constant (635L, WinError.h's value) when the
+headers do not; everything else is the registry's port (3.3.2). Upstream still has the bare use
+(v3.5.3); retire the port when a mimalloc guards it, or when the image's mingw-w64 is ≥ 10.
 
 ## Overlay triplets (`vcpkg_triplets/`)
 
