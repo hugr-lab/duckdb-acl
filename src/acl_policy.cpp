@@ -507,24 +507,52 @@ vector<PolicyStore::SessionInfo> PolicyStore::SessionList() {
 	// the instance level is read BEFORE the lock: it reaches for a setting, and a session's own
 	// level is only meaningful next to the one it falls back to
 	auto instance = audit ? audit->InstanceLevel() : AuditLevel::DECISIONS;
-	lock_guard<mutex> guard(lock);
+	auto instance_profile = audit ? audit->InstanceProfileLevel() : ProfileLevel::OFF;
+	// spec 074 slice 3: the profile level in force is the operator's override, else the registered
+	// policy's answer for this principal and door, else the instance's - and the policy is another
+	// extension's code, asked AFTER the lock is released, never under it
+	struct ProfileAsk {
+		idx_t index;
+		Principal principal;
+		string door;
+	};
+	vector<ProfileAsk> asks;
 	vector<SessionInfo> out;
-	out.reserve(sessions.size());
-	for (auto &entry : sessions) {
-		SessionInfo info;
-		info.id = entry.second.id;
-		info.subject = entry.second.principal.subject;
-		info.roles = entry.second.principal.roles;
-		info.expires_at = entry.second.expires_at;
-		info.idle_seconds = now - entry.second.last_used;
-		info.door = entry.second.door;
-		// the level IN FORCE, and which of the three decided it. A session with none of its own is
-		// the instance's, whoever last cleared it: `source` describes where the level comes from
-		// now, not who touched it last.
-		auto own = entry.second.audit_level;
-		info.level = AuditLevelName(own < 0 ? instance : static_cast<AuditLevel>(own));
-		info.level_source = own < 0 ? "instance" : (entry.second.level_from_operator ? "override" : "policy");
-		out.push_back(std::move(info));
+	{
+		lock_guard<mutex> guard(lock);
+		out.reserve(sessions.size());
+		for (auto &entry : sessions) {
+			SessionInfo info;
+			auto own_profile = entry.second.profile_override;
+			if (own_profile >= 0) {
+				info.profile_level = ProfileLevelName(static_cast<ProfileLevel>(own_profile));
+				info.profile_source = "override";
+			} else {
+				info.profile_level = ProfileLevelName(instance_profile);
+				info.profile_source = "instance";
+				asks.push_back(ProfileAsk {out.size(), entry.second.principal, entry.second.door});
+			}
+			info.id = entry.second.id;
+			info.subject = entry.second.principal.subject;
+			info.roles = entry.second.principal.roles;
+			info.expires_at = entry.second.expires_at;
+			info.idle_seconds = now - entry.second.last_used;
+			info.door = entry.second.door;
+			// the level IN FORCE, and which of the three decided it. A session with none of its own is
+			// the instance's, whoever last cleared it: `source` describes where the level comes from
+			// now, not who touched it last.
+			auto own = entry.second.audit_level;
+			info.level = AuditLevelName(own < 0 ? instance : static_cast<AuditLevel>(own));
+			info.level_source = own < 0 ? "instance" : (entry.second.level_from_operator ? "override" : "policy");
+			out.push_back(std::move(info));
+		}
+	}
+	for (auto &ask : asks) {
+		ProfileLevel policy_level;
+		if (audit && audit->ProfileForSession(ask.principal, ask.door, policy_level)) {
+			out[ask.index].profile_level = ProfileLevelName(policy_level);
+			out[ask.index].profile_source = "policy";
+		}
 	}
 	return out;
 }
@@ -562,7 +590,19 @@ bool PolicyStore::SessionRefOf(const string &handle, SessionRef &out) {
 	out.principal = entry->second.principal;
 	out.correlation_id = entry->second.correlation_id;
 	out.traceparent = entry->second.traceparent;
+	out.profile_override = entry->second.profile_override;
 	return true;
+}
+
+bool PolicyStore::SetSessionProfile(const string &id, int8_t level) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			entry.second.profile_override = level;
+			return true;
+		}
+	}
+	return false;
 }
 
 void PolicyStore::AuditIngest(const string &handle, int64_t rows, const string &error, const char *reason_code) {

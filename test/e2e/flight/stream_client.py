@@ -140,6 +140,12 @@ def main():
             reader = open_stream(arg)
             chunk = reader.read_chunk()
             held = chunk.data.num_rows
+            # with ACL_STREAM_PAUSE set, say so and hold before the next statement: stream.sh acts on
+            # the live session in between (spec 074: the operator's profile switch)
+            if os.environ.get("ACL_STREAM_PAUSE"):
+                sys.stdout.write("held\n")
+                sys.stdout.flush()
+                time.sleep(float(os.environ["ACL_STREAM_PAUSE"]))
             # the stream stays open and unpulled; the session's next statement must still run
             started = time.monotonic()
             probe = open_stream("SELECT 1 AS ok").read_all().to_pydict()

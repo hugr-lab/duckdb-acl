@@ -1707,18 +1707,23 @@ public:
 	void ArmProfile(const string &handle, FlightDoorState::SessionConn &conn,
 	                optional_ptr<FlightDoorState::Reservation> reservation, const string &traceparent) {
 		auto &context = *conn.con->context;
+		PolicyStore::SessionRef ref;
+		bool known = state->store->SessionRefOf(handle, ref);
 		string trace = traceparent;
 		if (reservation && reservation->has_profile) {
+			if (known) {
+				// the note was written at Prepare: the execution is judged by the switch as it is now
+				reservation->profile.session_profile_override = ref.profile_override;
+			}
 			acl::SetConnectionProfileNote(context, reservation->profile);
 			if (trace.empty()) {
 				trace = reservation->profile.proto.traceparent;
 			}
 		}
-		PolicyStore::SessionRef ref;
-		if (!state->store->SessionRefOf(handle, ref)) {
+		if (!known) {
 			return;
 		}
-		acl::ProfileConnectionFor(context, state->store->audit, ref.principal, "flight", trace);
+		acl::ProfileConnectionFor(context, state->store->audit, ref.principal, "flight", trace, ref.profile_override);
 	}
 
 	arrow::Result<std::unique_ptr<flight::FlightDataStream>>

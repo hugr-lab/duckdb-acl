@@ -865,6 +865,27 @@ void SessionAuditLevelFunc(DataChunk &args, ExpressionState &state, Vector &resu
 	}
 }
 
+//! acl_session_profile(id, level): the operator's profile level on a session (spec 074 slice 3):
+//! off / sampled / all, or '' to clear it back to the policy's and the instance's (as
+//! acl_session_audit_level). In force from the session's next statement: the door decides before
+//! each execution it runs.
+void SessionProfileFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto id = RequiredArg(args, 0, row, "acl_session_profile", "session id");
+		auto text = RequiredArg(args, 1, row, "acl_session_profile", "level");
+		int8_t level = -1;
+		if (!Trimmed(text).empty()) {
+			ProfileLevel parsed;
+			if (!ParseProfileLevel(text, parsed)) {
+				throw InvalidInputException("acl_session_profile: unknown level \"%s\" (off, sampled, all)", text);
+			}
+			level = static_cast<int8_t>(parsed);
+		}
+		result.SetValue(row, Value::BOOLEAN(StoreOf(state).SetSessionProfile(id, level)));
+	}
+}
+
 } // namespace
 
 void RegisterAclAudit(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store,
@@ -942,6 +963,13 @@ void RegisterAclAudit(ExtensionLoader &loader, const shared_ptr<PolicyStore> &st
 		                     LogicalType::BOOLEAN, SessionAuditLevelFunc);
 		MarkAclScalar(level, store);
 		loader.RegisterFunction(level);
+	}
+	{
+		// spec 074 slice 3: the operator's profile level on a session; '' clears it
+		ScalarFunction profile(Identifier("acl_session_profile"), {LogicalType::VARCHAR, LogicalType::VARCHAR},
+		                       LogicalType::BOOLEAN, SessionProfileFunc);
+		MarkAclScalar(profile, store);
+		loader.RegisterFunction(profile);
 	}
 }
 

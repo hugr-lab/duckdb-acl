@@ -396,8 +396,12 @@ scanner kind, with the pushdown's *shape*: filters and projections counted, `dyn
 and `plan[]` (the tree, preorder, ≤256 nodes / depth 32, `truncated` past that; the rollup is over
 the whole tree). Never the statement's text, a literal, a path or a claim value - the texts of
 `Filters`/`Projections`/`Filename(s)` are counted or ignored. Levels `acl_profile_level` = off
-(default) | sampled (the caller's `traceparent` sampled flag) | all, GLOBAL; the session hook
-`SessionPolicy::ProfileFor` (slice 3). The note that links execution to decision is the override's
+(default) | sampled (the caller's `traceparent` sampled flag) | all, GLOBAL; the level in force for a
+statement (`ProfileLevelFor`) is, first answer wins: the operator's override on the session
+(`acl_session_profile(id, level)` / `PROFILE SESSION CURRENT | '<id>' ON | SAMPLED | OFF`, unrestricted
+manage, `''`/OFF clears; `acl_sessions()` shows `profile_level` + `profile_source`), the registered
+`SessionPolicy::ProfileFor` rule, the connection's own `SET SESSION acl_profile_level` (an operator's
+connection), the GLOBAL. The note that links execution to decision is the override's
 (one per decided statement, with the hash of the statement's text), taken onto the connection by the
 batch's first `QueryBegin` and by each statement **whose text matches** - a PREPARE keeps it for the
 executions of the prepared text (Flight carries it in the reservation), a statement nobody decided

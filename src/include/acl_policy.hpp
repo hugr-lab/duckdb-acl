@@ -305,6 +305,10 @@ struct PolicyStore {
 		//! (spec 069 addendum): an operator's `acl_session_audit_level` outranks the policy's answer
 		//! (C6), and an operator debugging a node needs to see that it did.
 		bool level_from_operator = false;
+		//! spec 074 slice 3: the operator's profile level for this session (-1 none): outranks the
+		//! registered policy's answer and the instance's level, read by whoever runs the session's
+		//! next statement; set by `acl_session_profile`, never by the principal
+		int8_t profile_override = -1;
 		//! The trace the client SET on its session (spec 069): kept here, not only on the connection,
 		//! because the prefix is composed wherever the door evaluates it - quack's authorization runs
 		//! on a connection of the server's, not the client's
@@ -601,8 +605,12 @@ struct PolicyStore {
 		Principal principal;
 		string correlation_id;
 		string traceparent;
+		int8_t profile_override = -1;
 	};
 	bool SessionRefOf(const string &handle, SessionRef &out);
+	//! spec 074 slice 3: the operator's profile level on a session by its ops id (-1 clears it);
+	//! false for an unknown session.
+	bool SetSessionProfile(const string &id, int8_t level);
 	//! Record the trace a session's client SET (spec 069), by ops id: `name` is acl_correlation_id or
 	//! acl_traceparent, an empty value is a RESET. False for an unknown session.
 	bool SetSessionTrace(const string &id, const string &name, const string &value);
@@ -677,6 +685,9 @@ struct PolicyStore {
 		string door;
 		string level;
 		string level_source;
+		//! spec 074 slice 3: the profile level IN FORCE and which of the three decided it
+		string profile_level;
+		string profile_source;
 	};
 	//! A snapshot of the live sessions - admin-only (the door's, not a principal's).
 	vector<SessionInfo> SessionList();

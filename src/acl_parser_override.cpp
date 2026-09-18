@@ -216,6 +216,7 @@ struct StatementAudit {
 	AuditPipeline *audit;
 	AuditEvent proto; // what every event of the batch shares: door, session, principal, trace
 	int8_t session_level = -1;
+	int8_t session_profile = -1; // spec 074 slice 3: the operator's profile level on the session
 	AuditTrail trail;
 	//! What the override was doing when an exception nobody noted escaped: it names the code
 	Reason phase = Reason::PARSE;
@@ -228,6 +229,7 @@ struct StatementAudit {
 			proto.session = ref.id;
 			proto.principal = ref.principal; // known before anything is judged: a parse refusal names it too
 			session_level = ref.audit_level;
+			session_profile = ref.profile_override;
 		}
 	}
 
@@ -253,6 +255,7 @@ struct StatementAudit {
 			ProfileNote note;
 			note.decision_seq = seq;
 			note.text_hash = stmt.text_hash;
+			note.session_profile_override = session_profile;
 			note.proto = proto;
 			note.statement = stmt.statement;
 			note.objects = stmt.objects;
@@ -525,7 +528,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	if (mode == AclPrefix::Mode::MANAGE) {
 		// the management grammar (spec 008): compiled to admin-function calls, no native parse
 		audit.phase = Reason::PARSE;
-		auto statements = ParseMgmtBatch(prefix.rest);
+		auto statements = ParseMgmtBatch(prefix.rest, audit.proto.session); // CURRENT is this session
 		for (auto &stmt : statements) {
 			audit.trail.statements.emplace_back();
 			audit.trail.statements.back().statement = "manage";

@@ -245,3 +245,169 @@ statement error
 SET GLOBAL acl_profile_level='verbose';
 ----
 <REGEX>:.*acl_profile_level: unknown level.*
+
+# --- slice 3: the operator switches a session's profiling - another session, or the caller's own -------
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+SET VARIABLE h = (SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc'));
+
+statement ok
+SET VARIABLE sid = (SELECT unnest(regexp_extract_all(acl_sessions(), '"id":\s*"([^"]+)"', 1)));
+
+# the level in force and who decided it: the instance's (off) until the operator says otherwise
+query I
+SELECT acl_sessions() LIKE '%"profile_level":"off","profile_source":"instance"%';
+----
+true
+
+query I
+SELECT acl_session_profile(getvariable('sid'), 'all');
+----
+true
+
+query I
+SELECT acl_sessions() LIKE '%"profile_level":"all","profile_source":"override"%';
+----
+true
+
+query I
+SELECT acl_session_profile(getvariable('sid'), '');
+----
+true
+
+query I
+SELECT acl_sessions() LIKE '%"profile_level":"off","profile_source":"instance"%';
+----
+true
+
+query I
+SELECT acl_session_profile('no-such-session', 'all');
+----
+false
+
+statement error
+SELECT acl_session_profile(getvariable('sid'), 'loud');
+----
+<REGEX>:.*acl_session_profile: unknown level.*
+
+# never a principal's: the ops surface, like acl_session_kill
+statement error
+ACL ROLE "analyst" SELECT acl_session_profile('x', 'off');
+----
+<REGEX>:.*acl_session_profile.*
+
+# the management form, over another session by its ops id (the call's value is read, not counted:
+# an unread projection is pruned by the optimizer and the call never runs)
+statement ok
+SET VARIABLE mgmt = 'ACL ADMIN PROFILE SESSION ''' || getvariable('sid') || ''' SAMPLED';
+
+query I
+SELECT * FROM query(getvariable('mgmt'));
+----
+true
+
+query I
+SELECT acl_sessions() LIKE '%"profile_level":"sampled","profile_source":"override"%';
+----
+true
+
+statement ok
+SET VARIABLE mgmt = 'ACL ADMIN PROFILE SESSION ''' || getvariable('sid') || ''' OFF';
+
+query I
+SELECT * FROM query(getvariable('mgmt'));
+----
+true
+
+query I
+SELECT acl_sessions() LIKE '%"profile_level":"off","profile_source":"instance"%';
+----
+true
+
+# CURRENT needs a session: off one it is a refusal, under the caller's own session it names it
+statement error
+ACL ADMIN PROFILE SESSION CURRENT ON;
+----
+<REGEX>:.*PROFILE SESSION CURRENT needs a session.*
+
+statement error
+ACL ADMIN PROFILE SESSION 'x' LOUD;
+----
+<REGEX>:.*PROFILE SESSION expects.*
+
+statement ok
+SELECT acl_grant_admin('analyst', 'manage');
+
+query I
+SELECT * FROM query(acl_session_sql(getvariable('h'), 'ACL PROFILE SESSION CURRENT ON'));
+----
+true
+
+query I
+SELECT acl_sessions() LIKE '%"profile_level":"all","profile_source":"override"%';
+----
+true
+
+query I
+SELECT * FROM query(acl_session_sql(getvariable('h'), 'ACL PROFILE SESSION CURRENT OFF'));
+----
+true
+
+query I
+SELECT acl_sessions() LIKE '%"profile_level":"off","profile_source":"instance"%';
+----
+true
+
+statement ok
+SELECT acl_revoke_admin('analyst');
+
+# a role without manage cannot: the form is administration
+statement error
+ACL ROLE "analyst" ACL PROFILE SESSION 'x' ON;
+----
+<REGEX>:.*no ACL administration scope.*
+
+statement ok
+SELECT acl_session_close(getvariable('h'));
+
+# --- slice 3: the operator's own connection - SET SESSION outranks the instance's GLOBAL -------------
+
+statement ok
+SET SESSION acl_profile_level='all';
+
+statement ok
+ACL ROLE "analyst" SELECT count(*) FROM payroll;
+
+statement ok
+SELECT acl_audit_flush();
+
+query II
+SELECT statement, decision_seq > 0 FROM acl_audit_events() WHERE kind = 'profile' ORDER BY seq DESC LIMIT 1;
+----
+select	true
+
+statement ok
+SET SESSION acl_profile_level='off';
+
+statement ok
+ACL ROLE "analyst" SELECT count(*) FROM lookup;
+
+statement ok
+SELECT acl_audit_flush();
+
+# the newest profile is still the payroll one: the lookup statement ran unprofiled
+query II
+SELECT statement, objects::VARCHAR FROM acl_audit_events() WHERE kind = 'profile' ORDER BY seq DESC LIMIT 1;
+----
+select	[{'name': payroll, 'capability': select}]
+
+statement ok
+RESET SESSION acl_profile_level;
