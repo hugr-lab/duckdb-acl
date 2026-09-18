@@ -1,6 +1,6 @@
 # Spec 074: the execution profile - what went to which source, and what it cost
 
-- **Status**: implemented (slice 1: the base, contract v2)
+- **Status**: implemented (slices 1 and 3: the base, contract v2; the operator's per-session switch)
 - **Date**: 2026-09-18
 - **Author**: hugr lab
 
@@ -142,7 +142,8 @@ on `decision_seq`:
 | layer | knob | who decides |
 | --- | --- | --- |
 | node | `acl_profile_level` = **`off`** (default) \| `sampled` \| `all` (GLOBAL) | the operator |
-| session | `SessionPolicy::ProfileFor(principal, door, out)` - the spec 069 hook, extended (acl_otel specs 004/007: rules per role, per door); ops: a column in `acl_sessions()`, `acl_session_profile(id, on\|off)` | rules / the operator (slice 3) |
+| session | the operator's override `acl_session_profile(id, level)` / `PROFILE SESSION CURRENT \| '<id>' ON \| SAMPLED \| OFF` (outranks the policy, as the audit level's C6), else `SessionPolicy::ProfileFor(principal, door, out)` - the spec 069 hook, extended (acl_otel specs 004/007: rules per role, per door); `acl_sessions()` shows `profile_level` and `profile_source` (`instance` / `policy` / `override`) | the operator / rules |
+| connection | `SET SESSION acl_profile_level` on an operator's own connection (no session) outranks the GLOBAL there; a principal cannot SET it (spec 068) | the operator |
 | statement | `sampled` = the sampled flag of the caller's `traceparent` - already on every statement (`TRACE ... PARENT` from the doors, Flight's headers, `acl_traceparent` on a session) | the caller, the OTel way |
 
 The mechanism is one (`ProfileConnectionFor`): `enable_profiler = true`, `profiler_print_format =
@@ -253,8 +254,19 @@ Flight e2e (`stream.sh`): a consumed stream's profile arrives when the stream en
    limits. Contract v2.
 2. **acl_otel spec 009**: the execution span, span events, the log record with the tree, the
    histograms; `sampled` through the trace flag; opt-in operator spans.
-3. **Per-session rules**: `SessionPolicy::ProfileFor`, `acl_session_profile`, the `acl_sessions()`
-   column.
+3. **Per-session switch** (implemented 2026-09-18, the owner's follow-up): the precedence
+   `ProfileLevelFor` = operator's override on the session > `SessionPolicy::ProfileFor` > the
+   connection's own `acl_profile_level` (SET SESSION) > GLOBAL. `acl_session_profile(id, level)`
+   (`''` clears; the ops surface, denied to a principal); the management form `PROFILE SESSION
+   CURRENT | '<ops id>' ON | ALL | SAMPLED | OFF` (unrestricted `manage`; `CURRENT` is the session
+   the `ACL SESSION` prefix names, a refusal off one), so an administrator connected through a door
+   switches their own session or another open one; `acl_sessions()` gains `profile_level` and
+   `profile_source`. The override rides on the session record (`profile_override`) and reaches the
+   decision through `SessionRef` (the doors) and the profile note (the gateway path); it is in force
+   from the session's next statement, since whoever runs the statement decides before it. Tests in
+   `acl_profile.test` (the function, the listing, both management forms, the refusals, the
+   connection-local SET) and `stream.sh` (the door: a session switched off leaves no profile for its
+   next stream, switched on again profiles).
 4. **Docs**: `docs/observability.md` - cumulative time, "observed" memory, three signals for three
    questions.
 

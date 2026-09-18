@@ -122,10 +122,30 @@ profile="$(server_says "SELECT door, statement, verdict, rows_out, decision_seq 
 echo "  pass the stream's profile is linked and counts its rows ($profile)"
 
 # --- a forgotten cursor is superseded by the session's next statement ---------------------------
-got="$(client supersede "SELECT * FROM big")"
+# spec 074 slice 3 rides on this: while the session's second statement waits for the idle stream
+# (2s), the operator switches the session's profiling off - the superseded stream's own profile
+# (armed before it ran) still lands, the statement that superseded it leaves none
+ACL_STREAM_PAUSE=1 python3 "$HERE/stream_client.py" "$URI" supersede "SELECT * FROM big" >"$TMP/supersede.out" 2>&1 &
+SUPERSEDE_PID=$!
+for _ in $(seq 1 100); do
+	grep -q "^held" "$TMP/supersede.out" 2>/dev/null && break
+	sleep 0.1
+done
+grep -q "^held" "$TMP/supersede.out" || { cat "$TMP/supersede.out" >&2; fail "the supersede client never held its stream"; }
+switched="$(server_says "SELECT count(*) FROM (SELECT acl_session_profile(id, 'off') AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\s*\"([^\"]+)\"', 1)) AS id)) WHERE k")"
+[ "$switched" -ge 1 ] || fail "no live session took the profile switch: $switched"
+listed="$(server_says "SELECT count(*) FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"profile_source\":\"(override)\"', 1)) AS s)")"
+[ "$listed" -ge 1 ] || fail "acl_sessions() does not show the override: $listed"
+# from here on: the client's warm-up and its stream's open are behind (both profiled, the level
+# was `all`); what follows is the statement it runs under the switched-off session
+seq_before="$(server_says "SELECT coalesce(max(seq), 0) FROM acl_audit_events()")"
+wait "$SUPERSEDE_PID" 2>/dev/null || true
+got="$(tail -1 "$TMP/supersede.out")"
 echo "$got" | grep -q "'ok': \[1\]" || fail "the next statement of a session with an open stream did not run: $got"
 waited="$(echo "$got" | sed -n "s/.*'waited_ms': \([0-9]*\).*/\1/p")"
-[ "$waited" -ge 1500 ] && [ "$waited" -lt 10000 ] || fail "the wait was ${waited}ms; acl_flight_stream_idle is 2s"
+# the client held its stream 1s (ACL_STREAM_PAUSE) before its next statement, which then waited the
+# rest of the 2s idle window: the two together are the idle timeout, never an immediate answer
+[ "$((waited + 1000))" -ge 1500 ] && [ "$waited" -lt 10000 ] || fail "the wait was ${waited}ms after a 1s hold; acl_flight_stream_idle is 2s"
 # the superseded stream's own event lands when gRPC tears its call down - a moment after the client is gone
 for _ in $(seq 1 50); do
 	ended="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'door' AND detail = 'stream_superseded'")"
@@ -134,6 +154,15 @@ for _ in $(seq 1 50); do
 done
 [ "$ended" = "1" ] || fail "the idle stream was not recorded as superseded: $ended"
 echo "  pass an idle stream is superseded after ${waited}ms, the next statement runs"
+# the statement that ran under the switched-off session (SELECT 1: the one statement of this window
+# that touches no object) left no profile; the superseded stream's own (armed before it ran, on the
+# `big` view) did land - an earlier stream's profile may land late here too, so the check is by
+# shape, not by count
+unprofiled="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile' AND seq > $seq_before AND objects::VARCHAR = '[]'")"
+[ "$unprofiled" = "0" ] || fail "the switched-off session's statement was profiled ($unprofiled event(s))"
+streams="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile' AND seq > $seq_before AND objects::VARCHAR LIKE '%big%'")"
+[ "$streams" -ge 1 ] || fail "the superseded stream left no profile"
+echo "  pass the operator's switch on a live session holds at the door (the stream's profile, none for the switched-off statement)"
 
 # --- a session the operator kills takes its stream with it at the next pull ----------------------
 ACL_STREAM_PAUSE=3 python3 "$HERE/stream_client.py" "$URI" killed "SELECT * FROM big" >"$TMP/killed.out" 2>&1 &

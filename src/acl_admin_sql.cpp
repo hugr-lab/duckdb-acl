@@ -426,6 +426,12 @@ bool IsMgmtStart(const string &text) {
 		ahead.Word("keyword");
 		return StringUtil::CIEquals(ahead.PeekWord(), "virtual");
 	}
+	if (StringUtil::CIEquals(first, "profile")) {
+		// PROFILE SESSION ... (spec 074 slice 3): duckdb has no PROFILE statement
+		AdminScanner ahead(text);
+		ahead.Word("keyword");
+		return StringUtil::CIEquals(ahead.PeekWord(), "session");
+	}
 	if (StringUtil::CIEquals(first, "comment") || StringUtil::CIEquals(first, "analyze")) {
 		// duckdb owns COMMENT ON <object> and ANALYZE: ours always name a VIRTUAL target
 		AdminScanner ahead(text);
@@ -721,8 +727,36 @@ string RoleOrAllRoles(AdminScanner &s, const char *preposition) {
 	return s.Word("a role name");
 }
 
-unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
+unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &current_session) {
 	auto keyword = s.Word("a management keyword");
+	if (StringUtil::CIEquals(keyword, "profile")) {
+		// PROFILE SESSION CURRENT | '<id>' ON | ALL | SAMPLED | OFF (spec 074 slice 3): the operator's
+		// profile level on a session - the caller's own (the session the prefix names) or another
+		// open one by its ops id from acl_sessions(); OFF clears it back to the policy and the node
+		s.Expect("session");
+		string id;
+		if (s.Accept("current")) {
+			if (current_session.empty()) {
+				throw BinderException("acl admin: PROFILE SESSION CURRENT needs a session - the statement runs "
+				                      "under no ACL SESSION prefix");
+			}
+			id = current_session;
+		} else {
+			id = s.Quoted("a session id");
+		}
+		auto word = StringUtil::Lower(s.Word("a profile level (ON, ALL, SAMPLED, OFF)"));
+		string level;
+		if (word == "on" || word == "all") {
+			level = "all";
+		} else if (word == "sampled") {
+			level = "sampled";
+		} else if (word == "off") {
+			level = "";
+		} else {
+			throw BinderException("acl admin: PROFILE SESSION expects ON, ALL, SAMPLED or OFF, not \"%s\"", word);
+		}
+		return MakeAdminCall("acl_session_profile", {Value(id), Value(level)});
+	}
 	if (StringUtil::CIEquals(keyword, "deny")) {
 		// DENY FUNCTION CATEGORY c TO ROLE r | ALL ROLES; DENY FUNCTION f [TABLE] TO ROLE r | ALL ROLES
 		// (spec 072): a grant row with allowed = false, which wins over every grant
@@ -1386,6 +1420,8 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	    {"acl_revoke_function_category", -1},
 	    {"acl_grant_function", -1},
 	    {"acl_revoke_function", -1},
+	    // spec 074 slice 3: a session is the node's, not a catalog's - an unrestricted manage scope
+	    {"acl_session_profile", -1},
 	};
 	MgmtProvenance provenance;
 	auto &select = statement.Cast<SelectStatement>().node->Cast<SelectNode>();
@@ -1429,7 +1465,7 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 
 } // namespace
 
-vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text) {
+vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session) {
 	vector<unique_ptr<SQLStatement>> statements;
 	AdminScanner scanner(text);
 	while (!scanner.Done()) {
@@ -1437,7 +1473,7 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text) {
 			scanner.pos++;
 			continue;
 		}
-		statements.push_back(ParseMgmtStatement(scanner));
+		statements.push_back(ParseMgmtStatement(scanner, current_session));
 		scanner.Skip();
 		if (scanner.pos < text.size() && text[scanner.pos] != ';') {
 			throw BinderException("acl admin: unexpected trailing text at position %llu", scanner.pos);

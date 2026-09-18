@@ -22,7 +22,9 @@ bool IsMgmtStart(const string &text);
 
 //! Compile a management batch (statements separated by `;`) into admin-function calls. Parse-time
 //! only: nothing is written until the statements execute. A syntax error throws a ParserException.
-vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text);
+//! `current_session` is the ops id of the session the batch runs under ('' off a session): what
+//! `PROFILE SESSION CURRENT` names (spec 074 slice 3).
+vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session = string());
 
 //! The authorization gate of spec 009: every compiled call is judged against `rights` - the
 //! catalog it acts on, whether it hands out access or scopes - and a refusal anywhere in the batch

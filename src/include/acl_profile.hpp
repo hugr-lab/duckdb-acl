@@ -33,6 +33,8 @@ struct ProfileNote {
 	//! duckdb reports as the current query while it runs - the same for a PREPARE and each of its
 	//! executions): the note is taken by the execution whose text it is, and by nothing else.
 	uint64_t text_hash = 0;
+	//! spec 074 slice 3: the operator's profile level on the statement's session (-1 none)
+	int8_t session_profile_override = -1;
 	AuditEvent proto;
 	string statement;
 	vector<AuditObject> objects;
@@ -59,12 +61,19 @@ void PushProfileBoundary();
 bool TakeConnectionProfileNote(ClientContext &context, ProfileNote &out);
 void SetConnectionProfileNote(ClientContext &context, ProfileNote note);
 
-//! A door, before a statement on a connection it owns: decides from the level (the instance's, or
-//! the registered policy's for this principal and door) and the caller's trace context whether the
-//! statement is profiled, and sets the connection's profiler accordingly - never over a client's
-//! own `enable_profiling`, in either direction.
+//! A door, before a statement on a connection it owns: decides from the level in force (see
+//! ProfileLevelFor) and the caller's trace context whether the statement is profiled, and sets the
+//! connection's profiler accordingly - never over a client's own `enable_profiling`, in either
+//! direction. `session_override` is the operator's level on the session (-1 none).
 void ProfileConnectionFor(ClientContext &context, const shared_ptr<AuditPipeline> &pipeline, const Principal &principal,
-                          const string &door, const string &traceparent);
+                          const string &door, const string &traceparent, int8_t session_override);
+
+//! The level in force for a statement (spec 074 slice 3), first answer wins: the operator's
+//! override on the session (`acl_session_profile`), the registered policy's rule for this principal
+//! and door, the connection's own `acl_profile_level` (a SET SESSION on an operator's connection,
+//! else the instance's GLOBAL).
+ProfileLevel ProfileLevelFor(ClientContext &context, AuditPipeline &pipeline, const Principal &principal,
+                             const string &door, int8_t session_override);
 
 //! The sampled flag of a W3C traceparent (`00-<trace>-<span>-<flags>`): flags & 1. False when the
 //! text is not one.

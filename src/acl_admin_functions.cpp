@@ -1388,7 +1388,9 @@ void AclSessionsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		json += "{\"id\":" + JsonQuote(session.id) + ",\"subject\":" + JsonQuote(session.subject) +
 		        ",\"roles\":" + roles + ",\"idle_seconds\":" + std::to_string(session.idle_seconds) +
 		        ",\"expires_at\":" + std::to_string(session.expires_at) + ",\"door\":" + JsonQuote(session.door) +
-		        ",\"level\":" + JsonQuote(session.level) + ",\"level_source\":" + JsonQuote(session.level_source) + "}";
+		        ",\"level\":" + JsonQuote(session.level) + ",\"level_source\":" + JsonQuote(session.level_source) +
+		        ",\"profile_level\":" + JsonQuote(session.profile_level) +
+		        ",\"profile_source\":" + JsonQuote(session.profile_source) + "}";
 	}
 	json += "]";
 	result.Reference(Value(json), count_t(args.size()));

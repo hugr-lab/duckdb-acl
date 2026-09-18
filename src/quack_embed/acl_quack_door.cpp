@@ -247,7 +247,8 @@ void AclQuackStatementStarting(Connection &connection, const string &connection_
 		if (!store || !store->SessionHandleFor(connection_id, handle) || !store->SessionRefOf(handle, ref)) {
 			return;
 		}
-		ProfileConnectionFor(*connection.context, store->audit, ref.principal, ref.door, ref.traceparent);
+		ProfileConnectionFor(*connection.context, store->audit, ref.principal, ref.door, ref.traceparent,
+		                     ref.profile_override);
 	} catch (...) {
 		// a profile is never worth the statement
 	}

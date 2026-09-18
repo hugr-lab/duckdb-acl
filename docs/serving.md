@@ -448,6 +448,12 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
   and keys lifecycle. `acl_session_audit_level(<ops id>, <level>)` overrides it for one live session
   (the operator's call, never the principal's). Whatever the level, the **counters count**: metrics
   are a state of the node, audit is a record of it.
+- **Profiles** (spec 074) - `SET GLOBAL acl_profile_level = 'off' | 'sampled' | 'all'` (default
+  `off`): one `profile` event per decided statement executed, with the time, rows, bytes, memory,
+  the per-source rollup and the plan - never the statement's text. `acl_session_profile(<ops id>,
+  <level>)` or the management form `PROFILE SESSION CURRENT | '<ops id>' ON | SAMPLED | OFF`
+  overrides it for one live session from its next statement; `SET SESSION acl_profile_level` does
+  it for an operator's own connection; `acl_sessions()` shows the level in force and its source.
 - **Where it goes** - a ring of the last `acl_audit_buffer` events (default 10000), read with
   `acl_audit_events()`; optionally one JSON line per event appended to `acl_audit_sink` (a path or
   URI through duckdb's filesystem, so an object store rides httpfs); and any sink an extension
@@ -493,7 +499,8 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
   prefix is a parse refusal, not a replacement of the one the door composed.
 
 The whole surface - `acl_audit_events()`, `acl_metrics()`, `acl_session_audit_level`,
-`acl_audit_flush`, `acl_audit_dropped`, the settings - is the operator's: denied to a principal.
+`acl_session_profile`, `acl_audit_flush`, `acl_audit_dropped`, the settings - is the operator's:
+denied to a principal.
 
 ## Deployment invariants and hardening checklist
 

@@ -571,6 +571,31 @@ ACL ADMIN REVOKE ADMIN FROM ROLE sales_owner;
 
 Functions: `acl_grant_admin(role, scope)`, `acl_revoke_admin(role)`.
 
+## Profiling a session
+
+```
+PROFILE SESSION CURRENT | '<ops id>' ON | ALL | SAMPLED | OFF
+```
+
+The operator's profile level on one live session (spec 074): what its statements' execution
+profiles are recorded at from its next statement on - `ON` / `ALL` every statement, `SAMPLED` the
+ones whose trace context carries the sampled flag, `OFF` clears the override so the registered
+policy's rule and the node's `acl_profile_level` decide again. `CURRENT` is the session the
+statement runs under (an `ACL SESSION` prefix - a client connected through a door); off a session
+it is a refusal. Another session is named by its ops id from `acl_sessions()`, which also shows the
+level in force and who decided it (`profile_level`, `profile_source` = `instance` / `policy` /
+`override`). A session is the node's, not a catalog's: the statement needs an unrestricted `manage`
+scope. An operator's own connection (no session) uses `SET SESSION acl_profile_level = ...`
+instead, which outranks the node's `SET GLOBAL` on that connection alone.
+
+```sql
+ACL SESSION 'h…' ACL PROFILE SESSION CURRENT ON;
+ACL ADMIN PROFILE SESSION '62F31C2A7615' SAMPLED;
+ACL ADMIN PROFILE SESSION '62F31C2A7615' OFF;
+```
+
+Function: `acl_session_profile(id, level)` (`''` clears).
+
 ## Comments
 
 ```
@@ -832,6 +857,7 @@ section.
 | `acl_grant_object(role, vcat, vname, caps_json[, rls, columns])`               | object grant (table, view or function)                                    |
 | `acl_grant_admin(role, scope)`                                                 | global scope `manage` / `passthrough`                                     |
 | `acl_revoke_admin(role)`                                                       | drop the role's global scope                                              |
+| `acl_session_profile(id, level)`                                               | the operator's profile level on a live session; `''` clears (spec 074)    |
 
 **Principals**
 

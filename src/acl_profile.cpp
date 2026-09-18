@@ -271,11 +271,8 @@ public:
 		}
 		// the gateway path: the profiler starts at plan, after this, so the level decides here -
 		// per statement, from the note's own trace when the level samples
-		auto level = locked->InstanceProfileLevel();
-		ProfileLevel session_level;
-		if (locked->ProfileForSession(note.proto.principal, note.proto.door, session_level)) {
-			level = session_level;
-		}
+		auto level =
+		    ProfileLevelFor(context, *locked, note.proto.principal, note.proto.door, note.session_profile_override);
 		bool wanted =
 		    level == ProfileLevel::ALL || (level == ProfileLevel::SAMPLED && TraceSampled(note.proto.traceparent));
 		if (wanted) {
@@ -345,11 +342,8 @@ private:
 				return; // a Prepare: the note is the execution's, which follows on this connection
 			}
 		}
-		auto level = locked->InstanceProfileLevel();
-		ProfileLevel session_level;
-		if (locked->ProfileForSession(note.proto.principal, note.proto.door, session_level)) {
-			level = session_level;
-		}
+		auto level =
+		    ProfileLevelFor(context, *locked, note.proto.principal, note.proto.door, note.session_profile_override);
 		if (level == ProfileLevel::OFF) {
 			return;
 		}
@@ -476,16 +470,31 @@ bool TraceSampled(const string &traceparent) {
 	}
 }
 
+ProfileLevel ProfileLevelFor(ClientContext &context, AuditPipeline &pipeline, const Principal &principal,
+                             const string &door, int8_t session_override) {
+	if (session_override >= 0) {
+		return static_cast<ProfileLevel>(session_override);
+	}
+	ProfileLevel level;
+	if (pipeline.ProfileForSession(principal, door, level)) {
+		return level;
+	}
+	// the connection's own value first (a SET SESSION by an operator on the connection it runs),
+	// then the instance's GLOBAL - what duckdb answers for the connection
+	Value value;
+	if (context.TryGetCurrentSetting(Identifier("acl_profile_level"), value) && !value.IsNull() &&
+	    ParseProfileLevel(value.ToString(), level)) {
+		return level;
+	}
+	return pipeline.InstanceProfileLevel();
+}
+
 void ProfileConnectionFor(ClientContext &context, const shared_ptr<AuditPipeline> &pipeline, const Principal &principal,
-                          const string &door, const string &traceparent) {
+                          const string &door, const string &traceparent, int8_t session_override) {
 	if (!pipeline) {
 		return;
 	}
-	auto level = pipeline->InstanceProfileLevel();
-	ProfileLevel session_level;
-	if (pipeline->ProfileForSession(principal, door, session_level)) {
-		level = session_level;
-	}
+	auto level = ProfileLevelFor(context, *pipeline, principal, door, session_override);
 	bool wanted = level == ProfileLevel::ALL || (level == ProfileLevel::SAMPLED && TraceSampled(traceparent));
 	auto state = context.registered_state->GetOrCreate<AclProfileState>(STATE_KEY, weak_ptr<AuditPipeline>(pipeline));
 	if (state->pipeline.expired()) {
