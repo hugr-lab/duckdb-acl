@@ -2,6 +2,7 @@
 
 #include "acl_admin_sql.hpp"
 #include "acl_audit_pipeline.hpp"
+#include "acl_profile.hpp"
 #include "acl_rewriter.hpp"
 #include "acl_scan_util.hpp"
 #include "duckdb/common/error_data.hpp"
@@ -206,7 +207,8 @@ void ResolvePrincipal(PolicyStore &store, const AclPrefix &prefix, Principal &ou
 //! level (the counters are a state of the node) and recorded only where the level says so.
 struct StatementAudit {
 	explicit StatementAudit(AuditPipeline *audit) : audit(audit) {
-		TakeDenyReason(); // a stale note from a refusal nobody audited must not name this one
+		TakeDenyReason();    // a stale note from a refusal nobody audited must not name this one
+		ClearProfileNotes(); // spec 074: nor may a note of a statement nobody executed
 		proto.kind = "statement";
 		proto.door = "gateway";
 	}
@@ -245,7 +247,18 @@ struct StatementAudit {
 		event.allowed = allowed;
 		event.reason_code = code;
 		event.reason = reason;
-		audit->Emit(std::move(event));
+		auto seq = audit->Emit(std::move(event));
+		if (allowed && stmt.executes) {
+			// spec 074: what the execution's profile needs to name this decision and its sources
+			ProfileNote note;
+			note.decision_seq = seq;
+			note.text_hash = stmt.text_hash;
+			note.proto = proto;
+			note.statement = stmt.statement;
+			note.objects = stmt.objects;
+			note.physical = stmt.physical;
+			PushProfileNote(std::move(note));
+		}
 	}
 
 	void Allowed() {
@@ -558,6 +571,10 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	}
 
 	if (mode == AclPrefix::Mode::NATIVE) {
+		if (!statements.empty()) {
+			// spec 074: the batch's one entry is its first statement's execution
+			audit.trail.statements.back().text_hash = StatementTextHash(statements[0]->query);
+		}
 		return ParserOverrideResult(std::move(statements)); // no rewrite: the native context
 	}
 
@@ -636,6 +653,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 				throw;
 			}
 		}
+		PushProfileBoundary();         // spec 074: nobody's statement follows on this thread
 		return ParserOverrideResult(); // fall through to the native parser
 	}
 

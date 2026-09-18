@@ -1,0 +1,247 @@
+# name: test/sql/acl_profile.test
+# description: spec 074 - the execution profile: one `profile` event per executed statement, with the
+#   sources it read (attributed to the attached database the rewrite resolved), the plan, and numbers
+#   only - never the statement's text, a literal or a claim value
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS pg;
+
+statement ok
+CREATE TABLE pg.main.payroll(id INT, tenant VARCHAR, salary INT);
+
+statement ok
+INSERT INTO pg.main.payroll SELECT i, CASE WHEN i % 2 = 0 THEN 'acme' ELSE 'globex' END, i * 10 FROM range(1000) t(i);
+
+statement ok
+CREATE TABLE lookup(id INT, dept VARCHAR);
+
+statement ok
+INSERT INTO lookup SELECT i, 'd' || (i % 7) FROM range(1000) t(i);
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+# the policy: payroll confined to the tenant of the claim, lookup open
+statement ok
+SELECT acl_define_role('analyst', 'tenant=acme');
+
+statement ok
+SELECT acl_grant_table('analyst', 'payroll', 'pg.main.payroll', '', 'tenant = acl_claim(''tenant'')', 'select');
+
+statement ok
+SELECT acl_grant_table('analyst', 'lookup', 'memory.main.lookup', '', '', 'select');
+
+# --- off: nothing ----------------------------------------------------------------------------------
+
+statement ok
+ACL ROLE "analyst" SELECT count(*) FROM payroll;
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile';
+----
+0
+
+# --- all: the gateway path profiles from the connection's next statement on -------------------------
+
+statement ok
+SET GLOBAL acl_profile_level='all';
+
+statement ok
+SELECT 1;
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM payroll p JOIN lookup l ON l.id = p.id WHERE l.dept = 'd3';
+----
+71
+
+statement ok
+SELECT acl_audit_flush();
+
+# one profile, of a select, linked to its decision, with two sources: the attached database the
+# rewrite resolved payroll to, and the local one
+query IIII
+SELECT kind, statement, decision_seq = (SELECT max(seq) FROM acl_audit_events() WHERE kind = 'statement'), exec_us >= 0
+FROM acl_audit_events() WHERE kind = 'profile';
+----
+profile	select	true	true
+
+query I
+SELECT rows_out FROM acl_audit_events() WHERE kind = 'profile';
+----
+1
+
+query II
+SELECT sources::VARCHAR LIKE '%"source":"pg"%', sources::VARCHAR LIKE '%"source":"memory"%' FROM acl_audit_events() WHERE kind = 'profile';
+----
+true	true
+
+# the plan is a tree: one root, every other node names a parent, nothing was cut
+query III
+SELECT plan::VARCHAR LIKE '%"parent":-1%', plan::VARCHAR LIKE '%"type":"HASH_JOIN"%', truncated
+FROM acl_audit_events() WHERE kind = 'profile';
+----
+true	true	false
+
+# the redaction: the claim value, the predicate's column, the literal of the WHERE - none of it is in
+# the event; the pushdown is counted, not quoted
+query IIII
+SELECT sources::VARCHAR NOT LIKE '%acme%', plan::VARCHAR NOT LIKE '%acme%', plan::VARCHAR NOT LIKE '%d3%',
+       plan::VARCHAR NOT LIKE '%tenant%'
+FROM acl_audit_events() WHERE kind = 'profile';
+----
+true	true	true	true
+
+query I
+SELECT sources::VARCHAR LIKE '%"filters":1%' OR plan::VARCHAR LIKE '%"filters":1%' FROM acl_audit_events() WHERE kind = 'profile';
+----
+true
+
+# --- a failure profiles too, with the error's class and never its text -------------------------------
+
+# at run time: the cast fails on a row (the concatenation keeps the optimizer from folding it). In
+# autocommit duckdb resets the profiler when it rolls the statement back, before any hook runs: the
+# event carries the outcome, the class and the wall time, not the tree
+statement error
+ACL ROLE "analyst" SELECT CAST(tenant || CAST(id AS VARCHAR) AS INTEGER) FROM payroll;
+----
+<REGEX>:.*Conversion Error.*
+
+# at plan time: the column does not exist - the statement was allowed, then duckdb refused it
+statement error
+ACL ROLE "analyst" SELECT nope FROM payroll;
+----
+<REGEX>:.*Binder Error.*
+
+# inside a transaction the client owns nothing is rolled back at the statement's end: the tree
+# of the failed execution is there, and the scans it did are in it
+statement ok
+BEGIN;
+
+statement error
+ACL ROLE "analyst" SELECT CAST(tenant || CAST(id AS VARCHAR) AS INTEGER) FROM payroll;
+----
+<REGEX>:.*Conversion Error.*
+
+statement ok
+ROLLBACK;
+
+statement ok
+SELECT acl_audit_flush();
+
+query IIIII
+SELECT verdict, detail, decision_seq > 0, plan::VARCHAR <> '[]', exec_us >= 0
+FROM acl_audit_events() WHERE kind = 'profile' AND seq > (SELECT min(seq) FROM acl_audit_events() WHERE kind = 'profile') ORDER BY seq;
+----
+error	Conversion	true	false	true
+error	Binder	true	false	true
+error	Conversion	true	true	true
+
+query I
+SELECT sources::VARCHAR LIKE '%"source":"pg"%' FROM acl_audit_events() WHERE kind = 'profile' ORDER BY seq DESC LIMIT 1;
+----
+true
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile' AND (reason LIKE '%acme%' OR reason LIKE '%nope%' OR detail LIKE '%nope%');
+----
+0
+
+# --- a batch: one profile per statement, each linked to its own decision, in order -------------------
+
+statement ok
+ACL ROLE "analyst" SELECT count(*) FROM payroll; SELECT count(*) FROM lookup;
+
+statement ok
+SELECT acl_audit_flush();
+
+query II
+SELECT p.statement, s.objects::VARCHAR
+FROM acl_audit_events() p JOIN acl_audit_events() s ON s.seq = p.decision_seq
+WHERE p.kind = 'profile' AND p.seq > (SELECT max(seq) FROM acl_audit_events() WHERE kind = 'profile' AND verdict = 'error')
+ORDER BY p.seq;
+----
+select	[{'name': payroll, 'capability': select}]
+select	[{'name': lookup, 'capability': select}]
+
+# --- a statement nobody decided is nobody's profile: the gateway's own reads leave no event ----------
+
+statement ok
+SELECT count(*) FROM lookup;
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile';
+----
+6
+
+# --- sampled: the caller's traceparent decides, per statement -----------------------------------------
+
+statement ok
+SET GLOBAL acl_profile_level='sampled';
+
+statement ok
+ACL ROLE "analyst" TRACE 'req-1' PARENT '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00' SELECT count(*) FROM payroll;
+
+statement ok
+ACL ROLE "analyst" TRACE 'req-2' PARENT '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203332-01' SELECT count(*) FROM payroll;
+
+statement ok
+ACL ROLE "analyst" SELECT count(*) FROM payroll;
+
+statement ok
+SELECT acl_audit_flush();
+
+# of the three, the one whose trace is sampled - and it is the only profile that carries a trace
+query II
+SELECT correlation_id, traceparent FROM acl_audit_events() WHERE kind = 'profile' AND correlation_id IS NOT NULL ORDER BY seq;
+----
+req-2	00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203332-01
+
+# --- the plan has a ceiling: past it `truncated` says so, and the rollup is over the whole tree ------
+
+statement ok
+SET GLOBAL acl_profile_level='all';
+
+statement ok
+ACL ROLE "analyst" SELECT count(*) FROM (SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup UNION ALL SELECT id FROM lookup) t;
+
+statement ok
+SELECT acl_audit_flush();
+
+query III
+SELECT truncated, (length(plan::VARCHAR) - length(replace(plan::VARCHAR, '"id":', ''))) / 5 <= 256,
+       sources::VARCHAR LIKE '%"scans":300%'
+FROM acl_audit_events() WHERE kind = 'profile' ORDER BY seq DESC LIMIT 1;
+----
+true	true	true
+
+# --- off again: nothing more -------------------------------------------------------------------------
+
+statement ok
+SET GLOBAL acl_profile_level='off';
+
+statement ok
+ACL ROLE "analyst" SELECT count(*) FROM payroll;
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile';
+----
+8
+
+# --- the level is validated where it is set --------------------------------------------------------
+
+statement error
+SET GLOBAL acl_profile_level='verbose';
+----
+<REGEX>:.*acl_profile_level: unknown level.*

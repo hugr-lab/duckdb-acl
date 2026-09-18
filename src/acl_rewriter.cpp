@@ -1,5 +1,7 @@
 #include "acl_rewriter.hpp"
 
+#include "acl_profile.hpp"
+
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -1153,6 +1155,7 @@ private:
 				// Keep the virtual name as an alias so qualified references (vname.col) still resolve.
 				auto virtual_name = base.Table();
 				base.SetQualifiedName(ParsePhysName(policy.phys));
+				NotePhysical(policy.phys);
 				if (base.alias.empty()) {
 					base.alias = virtual_name;
 				}
@@ -1538,6 +1541,7 @@ private:
 				sql += " WHERE " + policy.rls;
 			}
 		}
+		NotePhysical(policy.phys);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		BakeMarkersInNode(*select_stmt->node, nullptr);
 
@@ -1552,6 +1556,7 @@ private:
 	//! writable relation
 	unique_ptr<TableRef> BuildRenamedSubquery(const string &vname, const TablePolicy &policy, BaseTableRef &original) {
 		auto sql = "SELECT * RENAME (" + StringUtil::Join(RenameItems(policy), ", ") + ") FROM " + policy.phys;
+		NotePhysical(policy.phys);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		Identifier alias = original.alias.empty() ? Identifier(vname) : original.alias;
 		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
@@ -2258,6 +2263,7 @@ private:
 			Deny(Reason::CAPABILITY, capability + " on \"" + key + "\" is not allowed");
 		}
 		auto phys = ParsePhysName(policy.phys);
+		NotePhysical(policy.phys);
 		if (target_ref && target_ref->type == TableReferenceType::BASE_TABLE) {
 			// Keep the virtual name as an alias, exactly as the read path does: a statement that
 			// qualifies its own columns still resolves after the swap, and MERGE's ON clause has no
@@ -2603,6 +2609,18 @@ public:
 		}
 		trail->objects.push_back(AuditObject {name, capability});
 	}
+	//! spec 074: the physical name a relation resolved to, for the profile's attribution of scans
+	void NotePhysical(const string &phys) {
+		if (!trail || phys.empty()) {
+			return;
+		}
+		for (auto &known : trail->physical) {
+			if (known == phys) {
+				return;
+			}
+		}
+		trail->physical.push_back(phys);
+	}
 	case_insensitive_set_t cte_scope;
 };
 
@@ -2761,6 +2779,17 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 			throw;
 		}
 		record_cost();
+		if (trail) {
+			// spec 074: the execution profile matches its note by the text the statement carries
+			auto &entry = trail->statements.back();
+			if (rewriter.replacement) {
+				entry.text_hash = StatementTextHash(rewriter.replacement->query);
+			} else if (!rewriter.drop_statement) {
+				entry.text_hash = StatementTextHash(stmt->query);
+			} else {
+				entry.executes = false;
+			}
+		}
 		if (rewriter.replacement) {
 			rewritten.push_back(std::move(rewriter.replacement));
 		} else if (!rewriter.drop_statement) {

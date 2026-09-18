@@ -599,6 +599,8 @@ struct PolicyStore {
 		string door;
 		int8_t audit_level = -1;
 		Principal principal;
+		string correlation_id;
+		string traceparent;
 	};
 	bool SessionRefOf(const string &handle, SessionRef &out);
 	//! Record the trace a session's client SET (spec 069), by ops id: `name` is acl_correlation_id or

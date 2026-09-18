@@ -98,6 +98,7 @@ PATCHES = {
             "\t\t// twice in duckdb (INTERNAL, the database invalidated). The statement is submitted and its\n"
             "\t\t// result drained here through a QueryResultStream; several statements at once (the\n"
             "\t\t// parser's implicit PIVOT) cannot be submitted and run through Query(), materialized.\n"
+            "\t\tacl::AclQuackStatementStarting(*connection.duckdb_connection, connection.session_id);\n"
             "\t\tunique_ptr<QueryResult> result = connection.duckdb_connection->Submit(sql);\n"
             "\t\tif (result->HasError() && result->GetError().find(\"multiple statements\") != string::npos) {\n"
             "\t\t\tresult = connection.duckdb_connection->Query(sql);\n"

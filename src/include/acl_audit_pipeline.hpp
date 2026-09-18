@@ -44,7 +44,13 @@ public:
 	//! none, and never refuses a session).
 	bool LevelForSession(const Principal &principal, const string &door, AuditLevel &out);
 	//! Enqueue. Fills node, seq and ts; drops and counts when the queue is full. Never blocks.
-	void Emit(AuditEvent event);
+	//! Answers the `seq` it assigned - what a later event names to say "this decision" (spec 074's
+	//! `decision_seq`) - or 0 when the event was dropped.
+	int64_t Emit(AuditEvent event);
+	//! spec 074: the instance's profile level, read from `acl_profile_level` on every call.
+	ProfileLevel InstanceProfileLevel();
+	//! spec 074: the registered policy's profile level for a session; false = no opinion.
+	bool ProfileForSession(const Principal &principal, const string &door, ProfileLevel &out);
 	//! The events of the ring, oldest first.
 	vector<AuditEvent> Ring();
 	int64_t Dropped() const;

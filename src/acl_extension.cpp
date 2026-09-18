@@ -19,6 +19,7 @@
 #include "acl_maintenance.hpp"
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
+#include "acl_profile.hpp"
 #include "duckdb/common/helper.hpp"
 
 #include <chrono>
@@ -91,6 +92,21 @@ void LoadInternal(ExtensionLoader &loader) {
 		    acl::AuditLevel parsed;
 		    if (value.IsNull() || !acl::ParseAuditLevel(value.ToString(), parsed)) {
 			    throw InvalidInputException("acl_audit_level: unknown level \"%s\" (off, denied, decisions, all)",
+			                                value.IsNull() ? "NULL" : value.ToString());
+		    }
+	    },
+	    SetScope::GLOBAL);
+	// spec 074: whether the node profiles what it executes - off (nothing), sampled (statements the
+	// caller's trace context marks as sampled), all; read before each decided statement, by the
+	// door that runs it or by the connection's own state on the gateway path
+	config.AddExtensionOption(
+	    "acl_profile_level",
+	    "acl: what is profiled (spec 074) - off, sampled (statements whose traceparent is sampled), all",
+	    LogicalType::VARCHAR, Value("off"),
+	    [](ClientContext &, SetScope, Value &value) {
+		    acl::ProfileLevel parsed;
+		    if (value.IsNull() || !acl::ParseProfileLevel(value.ToString(), parsed)) {
+			    throw InvalidInputException("acl_profile_level: unknown level \"%s\" (off, sampled, all)",
 			                                value.IsNull() ? "NULL" : value.ToString());
 		    }
 	    },
@@ -266,6 +282,7 @@ void LoadInternal(ExtensionLoader &loader) {
 		store->AuditPolicy("contract_mismatch", contract_mismatch);
 	}
 	acl::RegisterAclAudit(loader, store, pipeline);
+	acl::RegisterAclProfile(loader, store); // spec 074: the execution profile, on every connection
 	// the node's own gauges (spec 069): how long it has been up, and which build it is
 	{
 		string version;

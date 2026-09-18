@@ -42,6 +42,10 @@ void RegisterAclQuackDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store
 //! Any other statement is ignored here (its decision was audited by the override). Never throws.
 void AclQuackStatementCompleted(Connection &connection, const string &connection_id, const string &sql,
                                 QueryResult &result);
+//! The server's statement driver, before it submits a statement on a connection (spec 074): decides
+//! from the level and the session's trace whether the execution is profiled, and sets the
+//! connection's profiler so. A connection nobody bound is left alone. Never throws.
+void AclQuackStatementStarting(Connection &connection, const string &connection_id);
 
 } // namespace acl
 } // namespace duckdb

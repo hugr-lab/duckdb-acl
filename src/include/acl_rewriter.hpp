@@ -53,6 +53,14 @@ struct AuditTrail {
 		vector<AuditObject> objects;
 		int64_t rewrite_us = -1;
 		string detail; // what the walk found the statement to be beyond its class: `drain`
+		//! spec 074: the physical names the rewrite resolved the statement's relations to - what a
+		//! scan in the execution profile is attributed to (its attached database), never emitted
+		vector<string> physical;
+		//! spec 074: whether an execution follows (a dropped statement has none) and the hash of the
+		//! text the executing statement carries - what the profile matches its execution by, so a
+		//! follow-up, a nested query or a later statement never takes this one's note
+		bool executes = true;
+		uint64_t text_hash = 0;
 	};
 	vector<Statement> statements;
 };
