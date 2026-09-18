@@ -1,0 +1,93 @@
+# name: test/sql/acl_secure_views.test
+# description: spec 052, addendum 2026-09-18 (design 073) - a gate coverage probe over statistics
+#   and plans: `stats()` is grant-only because it answers over rows the role cannot see; a SECURE
+#   view as the physical object keeps the plan to one name and the statistics to nothing
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.people(id INT, s VARCHAR, salary INT);
+
+statement ok
+INSERT INTO phys.main.people SELECT i, CASE WHEN i < 3 THEN i::VARCHAR ELSE 'hidden' || i END, i * 1000 FROM range(1000) t(i);
+
+statement ok
+CREATE SECURE VIEW phys.main.people_secure AS SELECT * FROM phys.main.people;
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+# the same slice over the table and over the secure view in front of it
+statement ok
+SELECT acl_add_relation('c', 'people', 'phys.main.people', '', 'id < 3');
+
+statement ok
+SELECT acl_add_relation('c', 'people_s', 'phys.main.people_secure', '', 'id < 3');
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select) MAIN;
+
+query II
+ACL ROLE "r" SELECT count(*), max(salary) FROM people;
+----
+3	2000
+
+query II
+ACL ROLE "r" SELECT count(*), max(salary) FROM people_s;
+----
+3	2000
+
+# --- stats() is grant-only: refused in a role's default ---------------------------------------------
+
+statement error
+ACL ROLE "r" SELECT stats(salary) FROM people;
+----
+<REGEX>:.*stats.*not allowed.*
+
+# granted `meta`, the role reads facts about the data - and over the RLS subquery the fact is the
+# physical table whole: the max of rows the role cannot see. This is the measured leak, pinned so
+# the grant stays the operator's decision and never a default.
+statement ok
+SELECT acl_grant_function_category('r', 'meta');
+
+query I
+ACL ROLE "r" SELECT DISTINCT stats(salary)::VARCHAR LIKE '%999000%' FROM people;
+----
+true
+
+# behind a SECURE view the barrier is duckdb's: no min, no max, no distinct count
+query II
+ACL ROLE "r" SELECT DISTINCT stats(salary)::VARCHAR LIKE '%999000%', stats(salary)::VARCHAR LIKE '%max%' FROM people_s;
+----
+false	false
+
+# --- a plan under `explain`: the physical name over the table, one view name over the secure view ---
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select, explain) MAIN;
+
+query II
+ACL ROLE "r" EXPLAIN SELECT id FROM people;
+----
+physical_plan	<REGEX>:.*phys.main.people.*
+
+query II
+ACL ROLE "r" EXPLAIN SELECT id FROM people_s;
+----
+physical_plan	<REGEX>:.*Secure View.*people_secure.*

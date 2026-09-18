@@ -139,6 +139,45 @@ what it visits, and three things sat where it did not look.
 `test/sql/acl_metadata_leak.test` pins the keyword forms and the headers; the positions probe pins
 VALUES beside everything else.
 
+### Addendum 2026-09-18 - SECURE VIEW as the physical object, and `stats` (design 073)
+
+duckdb 2.0 has `CREATE [TEMP] SECURE VIEW` (storage v2.0.0 on disk; anywhere in memory): the
+expanded body sits under one `LogicalSecureView` node that is a **barrier** - `EXPLAIN` shows the
+view's name and the caller's own filters, nothing inside; statistics derived from the content
+(min/max, nulls, distinct counts, cardinality) are erased at the boundary
+(`propagate_secure_view`); a predicate pushed inside is wrapped in `__internal_barrier` so an
+expression that can throw never sees a filtered-out row. Our SUBQUERY form (RLS, masks, computed
+columns, a view's body) is an ordinary subquery and is **not** a barrier.
+
+Measured under a principal (2026-09-16, `people` 1000 rows, three visible by `id < 3`, a role with
+`select` and `explain`):
+
+- the type-cast oracle (`WHERE s::INT = 2` over hidden non-numeric rows) did **not** reproduce
+  through any of our forms - a property of today's plans, not a guarantee: the same shape in plain
+  SQL leaks, as upstream's own test shows;
+- `stats(<column>)` **did** leak: over the RLS subquery, `min 0, max 999000, approx_unique 1000` -
+  the physical table whole; over a physical plain view behind the virtual table, `approx_unique
+  1000`; over a physical **SECURE** view, nothing but the null flags.
+
+What follows:
+
+1. **`stats` is in the `meta` category** (spec 072, grant-only): a function that by definition
+   answers facts about data stands beside the `duckdb_*` listings and is never in a role's default.
+   Pinned by `test/sql/acl_secure_views.test`: refused without the grant, and with it the answer
+   is the leak above - which is why the grant is the operator's decision, not a default.
+2. **Recommendation, not a mechanism**: where a role holds `explain`, or `meta`, make the physical
+   object behind the virtual relation a SECURE view (`ACL ADMIN CREATE VIRTUAL TABLE c.x AS
+   phys.main.x_secure`). Then `EXPLAIN` shows one name and `stats` shows nothing - the barrier is
+   duckdb's, real, and free. `docs/security.md` says so. An `acl_check_catalog` advisory finding
+   ("granted `explain`, physical object not secure") waits for `duckdb_views()` to expose the
+   security type, which it does not at the pin.
+3. **No barrier of our own yet.** Wrapping a principal's predicates in `__internal_barrier` inside
+   the SUBQUERY form is possible (the function is callable from SQL) but is a layer on the hot
+   path for a leak that has not reproduced through our forms; the name is internal and may move
+   with a pin bump. Deferred until a reproduction exists; what to measure next is in design 073 §4
+   (masks with `error()`, predicates over computed columns, joins of two virtual relations with
+   different RLS, the ingest paths, `SET disabled_optimizers`).
+
 ## Enforcement & security
 
 - Fail-closed: no `explain` capability → EXPLAIN refused, physical names and all. The capability is
