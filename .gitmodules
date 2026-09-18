@@ -10,3 +10,6 @@
 	path = third_party/quack
 	url = https://github.com/duckdb/duckdb-quack
 	shallow = true
+[submodule "duckdb-ext-common"]
+	path = duckdb-ext-common
+	url = https://github.com/hugr-lab/duckdb-ext-common

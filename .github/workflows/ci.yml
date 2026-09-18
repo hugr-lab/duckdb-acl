@@ -161,10 +161,11 @@ jobs:
       - name: C++ tests under ASan+UBSan
         run: make test-cpp SANITIZE=1
 
-      # the OIDC core's parsers under libFuzzer for a minute (release plan 3.6): the bytes an IdP or
-      # a door answers are the node's pre-authentication network input. clang carries libFuzzer;
-      # the target links the release libduckdb like the sanitized tests do.
-      - name: Fuzz the OIDC parsers
+      # the door's auth-discovery parser under libFuzzer for a minute (release plan 3.6): the bytes a
+      # door answers are a client's pre-authentication network input. The OIDC core's own parsers
+      # are fuzzed where the core lives now (duckdb-ext-common). clang carries libFuzzer; the target
+      # links the release libduckdb like the sanitized tests do.
+      - name: Fuzz the quack-auth parser
         run: make fuzz-oidc CXX=clang++ FUZZ_SECONDS=60
 
       # the generated policy schema (acl_schema_sql.hpp, acl_schema.sql) must match

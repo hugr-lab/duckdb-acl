@@ -11,6 +11,7 @@
 #pragma once
 
 #include "acl_audit.hpp"
+#include "acl_policy.hpp"
 
 #include "duckdb/common/file_system.hpp"
 

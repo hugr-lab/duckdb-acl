@@ -9,7 +9,7 @@
 #pragma once
 
 #include "acl_policy.hpp"
-#include "acl_oidc.hpp"
+#include "oidc_core.hpp"
 
 namespace duckdb {
 namespace acl {

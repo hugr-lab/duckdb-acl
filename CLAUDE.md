@@ -30,7 +30,13 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   (the three patches we carried in `patches/ducklake/` are upstream). quack is pinned one commit past
   the submodule's own (#212), with the four patches duckdb carries for it applied to the loadable
   (`APPLY_PATCHES`) and, by `sync.py`, to the embedded server's copies alike.
-- **Dependencies**: none (no vcpkg/OpenSSL).
+- **Dependencies**: none (no vcpkg/OpenSSL). The **shared repository** `duckdb-ext-common` is a
+  submodule (spec 076): the audit contract (`contracts/acl_audit.hpp` + `acl_principal.hpp`, the same
+  header acl-otel compiles - moved as is, contract version unchanged) and the OIDC client core
+  (`oidc/`, compiled into the extension from its source list under OUR namespace,
+  `DUCKDB_EXT_COMMON_OIDC_NAMESPACE=acl`, so the names stay `duckdb::acl::oidc::...`; TLS by
+  `DUCKDB_EXT_COMMON_OIDC_TLS` in the flight build). Pinned to a tag; a change to the contract is a
+  PR there first (its charter R4: any layout change bumps `CONTRACT_VERSION`), then a re-pin here.
 - **Platforms**: Linux (GCC), macOS (Clang), Windows (MSVC — a release target; CI builds the first two).
 
 ## Project structure
@@ -50,7 +56,10 @@ src/
   flight/                    # the Flight SQL door (spec 045); seam RegisterAclFlightDoor(...)
   quack_embed/               # the embedded quack server (spec 063) + acl_quack_door.cpp (serve/stop, the
                              #   two callbacks); seam acl_quack_embed.hpp: RegisterAclQuackEmbed/Door(...)
+  oidc/                      # acl_quack_auth.cpp (the door's discovery document, spec 062/064) and the quack
+                             #   PROVIDER oidc secret (spec 061); the OIDC core itself is duckdb-ext-common's
   include/                   # acl_extension.hpp (AclExtension : Extension) + one header per module
+duckdb-ext-common/           # submodule (spec 076): contracts/acl_audit.hpp + acl_principal.hpp, oidc/
 test/
   sql/acl.test               # sqllogictest suite (require acl)
   sql/integration/           # scenarios against live databases (make test-integration; skip w/o env)
@@ -355,7 +364,8 @@ turns off), stragglers go to `acl_session_kill`, then the doors stop and the pro
 principal. The node never waits or times out by itself — the deadline belongs to the orchestrator.
 
 **Spec 069 — audit and metrics, layered**: every decision is an event (`AuditEvent`, header-only
-contract in `acl_audit.hpp`): statement/admin (emitted by the parser override after the decision, with
+contract in `acl_audit.hpp` - since spec 076 in `duckdb-ext-common/contracts/`, with `Principal` beside
+it in `acl_principal.hpp`): statement/admin (emitted by the parser override after the decision, with
 the objects the rewrite touched and the capability judged for each, `rewrite_us`, and on a refusal one
 `reason_code` of a bounded taxonomy — the `Reason` enum every `Deny` site names, carried to the
 override's catch by a thread-local note), session (open/close/refuse, with door and duration), ingest

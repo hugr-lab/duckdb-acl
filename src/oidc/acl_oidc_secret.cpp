@@ -22,7 +22,7 @@
 
 #include "acl_oidc_secret.hpp"
 
-#include "acl_oidc.hpp"
+#include "acl_quack_auth.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/string_util.hpp"
