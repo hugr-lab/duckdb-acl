@@ -2,7 +2,10 @@
 
 vcpkg ports this repository carries on top of the registry, listed ahead of extension-ci-tools' own
 in `vcpkg.json`. Each is the registry's port at the baseline the distribution build uses, plus the
-one change named here; drop a port once the registry carries the fix.
+one change named here; drop a port once the registry carries the fix. All three findings of the
+2026.06.24 baseline (thrift, the MinGW triplet, mimalloc) are reported upstream as
+extension-ci-tools #413, with the overlays here as the recipe - retire each once ci-tools carries it
+or moves its images.
 
 An overlay holds its port at the copied version whatever baseline ci-tools moves to: a baseline
 whose other ports need a newer one fails loudly at vcpkg's resolve step (a version constraint, not a
