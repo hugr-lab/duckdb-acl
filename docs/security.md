@@ -391,13 +391,15 @@ are name leaks bounded to an already-granted principal.
 - **A plan names physical objects - by grant (spec 052).** `EXPLAIN` under the `explain`
   capability shows `phys.schema.table`; "that a principal who may run a query also learns where it
   lands is acceptable *behavior*, but it belongs to a role that was granted it". A **SECURE view**
-  as the physical object (duckdb 2.0) keeps the plan to the view's one name and the statistics to
-  nothing: recommended behind any relation a role reads with `explain` or `meta` (spec 052,
-  addendum 2026-09-18).
+  as the physical object (duckdb 2.0) keeps the plan to the view's one name: recommended behind any
+  relation a role reads with `explain` (spec 052, addendum 2026-09-18). It does not keep the
+  statistics of a view that only projects: those pass through since duckdb #25969, and our
+  row-level predicate is outside the view.
 - **`stats()` answers over rows the role cannot see (spec 052, addendum 2026-09-18).** Over a
-  RENAME or an RLS subquery, duckdb's `stats(<column>)` reports the physical table's min/max and
-  distinct count. It is in the grant-only `meta` category (spec 072): never in a role's default,
-  and a grant of `meta` is the operator saying that role may read facts about the data.
+  RENAME or an RLS subquery - and over a secure view that only projects - duckdb's `stats(<column>)`
+  reports the physical table's min/max and distinct count. It is in the grant-only `meta` category
+  (spec 072): never in a role's default, and a grant of `meta` is the operator saying that role may
+  read facts about the data. That grant is the control.
 - **Upsert against an invisible row (spec 020).** Under RLS a `MERGE` may insert beside a row the
   principal cannot see; where a unique constraint exists "the failure does disclose that *some* row
   with that key exists outside the principal's slice … a deployment that cares should not grant

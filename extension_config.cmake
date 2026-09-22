@@ -65,14 +65,16 @@ endif()
 # quack needs json + autocomplete (core) and httpfs, which it pins itself; we take duckdb's own pin
 # so everything builds against the commit we track.
 #
-# quack's pin is ONE commit past the duckdb submodule's own (984d45d in
-# `.github/config/extensions/quack.cmake`): fa3f82c, quack #212 of 2026-09-14, which surfaces error
-# types to the client. It builds with the four patches duckdb carries for its own pin (APPLY_PATCHES:
-# the TableCatalogEntry columns virtual, a binder include, the Literal API, the unified QueryResult),
-# which apply to #212 unchanged (checked 2026-09-17) - and the embedded server (third_party/quack) is
-# the same commit, its copies patched the same way by sync.py. DONT_LINK is ours: the client must
-# stay a loadable, or its symbols and the embed's (both define duckdb::QuackServer & co.) meet in one
-# static link (spec 063, strategy B).
+# quack's pin is the duckdb submodule's own (`.github/config/extensions/quack.cmake`): fa3f82c, quack
+# #212 of 2026-09-14, which surfaces error types to the client - duckdb caught up with it in #25978
+# (2026-09-22, the fix of our #25887), so the one-commit lead we carried since 2026-09-17 is gone. It
+# builds with the patches duckdb carries for that pin (APPLY_PATCHES: the TableCatalogEntry columns
+# virtual, a binder include, the Literal API, the unified QueryResult; 0003 touches a test only) - and
+# the embedded server (third_party/quack) is the same commit, its copies patched the same way by
+# sync.py. The block is ours rather than an include of duckdb's file for two words: DONT_LINK (the
+# client must stay a loadable, or its symbols and the embed's - both define duckdb::QuackServer & co.
+# - meet in one static link, spec 063 strategy B), and no LOAD_TESTS (quack's own sqllogic suite is
+# duckdb's CI's business, not ours).
 if(DEFINED ENV{ACL_QUACK} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(json)
     duckdb_extension_load(autocomplete)

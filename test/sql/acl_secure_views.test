@@ -18,6 +18,11 @@ INSERT INTO phys.main.people SELECT i, CASE WHEN i < 3 THEN i::VARCHAR ELSE 'hid
 statement ok
 CREATE SECURE VIEW phys.main.people_secure AS SELECT * FROM phys.main.people;
 
+# a secure view that filters rows itself - the only kind whose barrier still erases statistics since
+# duckdb #25969 (2026-09-21): a view that only projects "hides columns, not rows" and passes them
+statement ok
+CREATE SECURE VIEW phys.main.people_secure_slice AS SELECT * FROM phys.main.people WHERE id < 3;
+
 statement ok
 ATTACH ':memory:' AS aclcat;
 
@@ -36,6 +41,9 @@ SELECT acl_add_relation('c', 'people', 'phys.main.people', '', 'id < 3');
 
 statement ok
 SELECT acl_add_relation('c', 'people_s', 'phys.main.people_secure', '', 'id < 3');
+
+statement ok
+SELECT acl_add_relation('c', 'people_sf', 'phys.main.people_secure_slice', '', 'id < 3');
 
 statement ok
 ACL ADMIN CREATE ROLE r;
@@ -71,9 +79,17 @@ ACL ROLE "r" SELECT DISTINCT stats(salary)::VARCHAR LIKE '%999000%' FROM people;
 ----
 true
 
-# behind a SECURE view the barrier is duckdb's: no min, no max, no distinct count
+# behind a SECURE view that only projects, the statistics pass through as the table's own since
+# duckdb #25969 (2026-09-21) - on 62ee922 they were erased. Our predicate sits OUTSIDE the view, so
+# the view's barrier does not know it hides anything: the grant of `meta` is the control, not the view
 query II
 ACL ROLE "r" SELECT DISTINCT stats(salary)::VARCHAR LIKE '%999000%', stats(salary)::VARCHAR LIKE '%max%' FROM people_s;
+----
+true	true
+
+# a secure view that filters rows itself still erases them: no min, no max, no distinct count
+query II
+ACL ROLE "r" SELECT DISTINCT stats(salary)::VARCHAR LIKE '%999000%', stats(salary)::VARCHAR LIKE '%max%' FROM people_sf;
 ----
 false	false
 

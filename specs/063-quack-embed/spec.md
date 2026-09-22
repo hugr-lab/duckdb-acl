@@ -163,6 +163,17 @@ than a principal's INSERT refused at the predicate (spec 024). quack's own pin o
 the change and duckdb's CI does not run quack's tests, so the embed met it first - reported as
 duckdb #25887 (2026-09-18), with the repro and the one-line guard.
 
+**2026-09-22: fixed upstream.** duckdb #25978 (Mytherin, on `v2.0-cyanoptera`, our pin since the same
+day) guards the second end (`if (active_query)` before the "abort now" branch's `EndQueryInternal`)
+and decides delegation by what the hook hands back (`PhysicalResultCollector::BuildsOwnResult()`: a
+hook returning the default sink is served through a buffer like any query - which was the other
+half of the report, the count of a delegated INSERT that never arrived). The issue's repro, extended
+with that second case, aborts on the old pin (62ee922) and passes on the new one (d4e7256): the
+failed statement answers its error, the connection runs the next one, the database stays valid.
+The driver below is kept: it streams (measured), it is where the audit (069) and profile (074)
+hooks ride, and quack's own delegated collector has not been re-measured on the new pin - a
+follow-up, not a precondition.
+
 The embed's `DriveQuery` (the one `sync.py` patch on `quack_server.cpp`) therefore delegates
 nothing: the statement is `Submit`ted, and a result-returning one is drained through a
 `QueryResultStream` on the driver thread - the bounded buffer releases chunks as they go out, so the

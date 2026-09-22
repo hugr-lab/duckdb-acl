@@ -23,6 +23,7 @@ The http server (acl_quack_http_server.cpp) is NOT generated here: it carries re
 logic changes (TLS, /.well-known, public bind, registry) and is hand-maintained.
 """
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -76,7 +77,9 @@ PATCHES = {
         # thread); a text of several statements (the parser's implicit PIVOT) cannot be submitted and
         # runs through Query(), materialized. spec 069's audit hook rides the same site: the outcome
         # of every statement the server drives, the drain of a client's streamed insert among them.
-        # The double end is reported upstream as duckdb #25887 (2026-09-18).
+        # The double end was reported upstream as duckdb #25887 (2026-09-18) and fixed in #25978
+        # (2026-09-22, our pin since): the driver stays ours - it streams, and it carries the audit
+        # (069) and profile (074) hooks - and going back to the delegated collector is a follow-up.
         (
             "\t\t// MakeQuackFetchCollector sends the FIRST statement that returns a result into the stream.\n"
             "\t\t// Every other statement keeps the default collector.\n"
@@ -199,9 +202,20 @@ def patched_source() -> pathlib.Path:
         sys.exit(f"SYNC FAILED: no quack patches under {DUCKDB_PATCHES} - is the duckdb submodule checked out?")
     scratch = pathlib.Path(tempfile.mkdtemp(prefix="acl-quack-sync-"))
     shutil.copytree(SUB, scratch / "src")
+    applied = 0
     for patch in patches:
+        # the scratch holds quack's `src` only: a patch that touches nothing under it (a test of
+        # quack's own, 0003 of 2026-09-22) is not ours to apply - skipped, and said so. A patch that
+        # touches `src` and something else is applied to the part we carry, and must apply cleanly.
+        targets = re.findall(r"^\+\+\+ b/(\S+)", patch.read_text(), flags=re.M)
+        if targets and not any(t.startswith("src/") for t in targets):
+            print(f"skipped {patch.relative_to(ROOT)} (touches only {', '.join(targets)})")
+            continue
         subprocess.run(["patch", "-p1", "-s", "-N", "-d", str(scratch), "-i", str(patch)], check=True)
         print(f"applied {patch.relative_to(ROOT)}")
+        applied += 1
+    if applied == 0:
+        sys.exit(f"SYNC FAILED: none of the patches under {DUCKDB_PATCHES} touches quack's src")
     return scratch / "src"
 
 
