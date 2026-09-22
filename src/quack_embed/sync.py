@@ -16,8 +16,9 @@ duckdb carries patches for quack (`.github/patches/extensions/quack/`), applied 
 client through APPLY_PATCHES; the embedded server is the same commit and must build against the
 same duckdb, so the copies are taken from a scratch copy of the submodule's `src` with those
 patches applied first — the two never diverge, and a patch that stops applying fails the sync.
-PATCHES below are the embed's own: the statement driver (no delegated collector - duckdb #25477
-ends a failing delegated query twice) with spec 069's audit hook inside it.
+PATCHES below are the embed's own: two calls around quack's statement driver - spec 074's profile
+arming before the statement, spec 069's audit hook after it. (From 2026-09-17 to 2026-09-22 the
+driver itself was ours, while duckdb ended a failing delegated query twice - #25887, fixed in #25978.)
 
 The http server (acl_quack_http_server.cpp) is NOT generated here: it carries real
 logic changes (TLS, /.well-known, public bind, registry) and is hand-maintained.
@@ -61,32 +62,20 @@ PATCHES = {
         (
             '#include "duckdb/main/client_config.hpp"\n',
             '#include "duckdb/main/client_config.hpp"\n'
-            '#include "duckdb/common/enums/result_eagerness.hpp"\n'
-            '#include "duckdb/main/query_result_stream.hpp"\n'
             '#include "acl_quack_embed.hpp"\n',
         ),
-        # duckdb #25477 (the unified QueryResult, our pin since 2026-09-17) and the delegated collector:
-        # a submission that delegates its collector (get_result_collector set) and then FAILS ends the
-        # query twice in duckdb - FailQueryInternal inside CompleteDelegatedInternal, then the "query
-        # failed: abort now" branch of SubmitStatementInternal, whose own comment admits the query may
-        # already be gone - a null dereference, an INTERNAL error, and with it the whole database
-        # invalidated by nothing more than a principal's refused INSERT. quack's own pin of duckdb
-        # predates the change and duckdb's CI does not run quack's tests, so the embed drives the
-        # statement itself: submitted, its result drained through a QueryResultStream (a bounded
-        # buffer, chunks released as they go out - the collector's memory profile, on the driver
-        # thread); a text of several statements (the parser's implicit PIVOT) cannot be submitted and
-        # runs through Query(), materialized. spec 069's audit hook rides the same site: the outcome
-        # of every statement the server drives, the drain of a client's streamed insert among them.
-        # The double end was reported upstream as duckdb #25887 (2026-09-18) and fixed in #25978
-        # (2026-09-22, our pin since): the driver stays ours - it streams, and it carries the audit
-        # (069) and profile (074) hooks - and going back to the delegated collector is a follow-up.
+        # The driver is quack's own: MakeQuackFetchCollector, delegated through get_result_collector,
+        # carries the first result into the stream from the executor's own sink - parallel, and a full
+        # buffer parks the producing TASK (backpressure without a thread held; the stream's capacity is
+        # acl_quack_fetch_producer_buffer_bytes, at most a quarter of the memory limit). From duckdb
+        # #25477 to #25978 (2026-09-17..22) a delegated submission that failed ended its query twice
+        # (our #25887) and the driver was ours; since the fix it is quack's again, measured by
+        # test/bench/door_stream.py (spec 063). What stays ours is two calls around the statement:
+        # spec 074's profile arming before it (the profiler starts at plan), spec 069's audit hook
+        # after it - the outcome of every statement the server drives, a client's streamed-insert
+        # drain among them (an INSERT is not claimed by the collector: its count comes back through
+        # the default sink, buffered since #25978).
         (
-            "\t\t// MakeQuackFetchCollector sends the FIRST statement that returns a result into the stream.\n"
-            "\t\t// Every other statement keeps the default collector.\n"
-            "\t\tauto &config = ClientConfig::GetConfig(context);\n"
-            "\t\tconfig.get_result_collector = [stream](ClientContext &ctx, PreparedStatementData &data) {\n"
-            "\t\t\treturn MakeQuackFetchCollector(ctx, data, stream);\n"
-            "\t\t};\n"
             "\t\tunique_ptr<QueryResult> result;\n"
             "\t\ttry {\n"
             "\t\t\tresult = connection.duckdb_connection->Query(sql);\n"
@@ -97,72 +86,18 @@ PATCHES = {
             "\t\t}\n"
             "\t\tconfig.get_result_collector = nullptr;\n"
             "\t\tif (result->HasError()) {\n",
-            "\t\t// acl (duckdb #25477): no collector hook - a delegated submission that fails ends its query\n"
-            "\t\t// twice in duckdb (INTERNAL, the database invalidated). The statement is submitted and its\n"
-            "\t\t// result drained here through a QueryResultStream; several statements at once (the\n"
-            "\t\t// parser's implicit PIVOT) cannot be submitted and run through Query(), materialized.\n"
+            "\t\t// acl (spec 074): whether this statement is profiled is decided before it runs\n"
             "\t\tacl::AclQuackStatementStarting(*connection.duckdb_connection, connection.session_id);\n"
-            "\t\tunique_ptr<QueryResult> result = connection.duckdb_connection->Submit(sql);\n"
-            "\t\tif (result->HasError() && result->GetError().find(\"multiple statements\") != string::npos) {\n"
+            "\t\tunique_ptr<QueryResult> result;\n"
+            "\t\ttry {\n"
             "\t\t\tresult = connection.duckdb_connection->Query(sql);\n"
+            "\t\t} catch (...) {\n"
+            "\t\t\t// leave no collector hook on the connection's config\n"
+            "\t\t\tconfig.get_result_collector = nullptr;\n"
+            "\t\t\tthrow;\n"
             "\t\t}\n"
-            "\t\tif (!result->HasError() && result->GetStatementProperties().return_type == StatementReturnType::QUERY_RESULT &&\n"
-            "\t\t    result->GetStatementProperties().result_eagerness != ResultEagerness::FORCED && result->HasBufferedData()) {\n"
-            "\t\t\t// the stream carries this statement: its shape is known at submission, its chunks go\n"
-            "\t\t\t// out in batches of about the target size as duckdb produces them\n"
-            "\t\t\tvector<string> result_names;\n"
-            "\t\t\tfor (auto &col_name : result->GetNames()) {\n"
-            "\t\t\t\tresult_names.push_back(col_name.GetIdentifierName());\n"
-            "\t\t\t}\n"
-            "\t\t\tauto types = result->GetTypes();\n"
-            "\t\t\tQueryResultStream reader(std::move(result));\n"
-            "\t\t\tstream->SignalBound(types, std::move(result_names));\n"
-            "\t\t\tauto target_bytes = MaxValue<idx_t>(\n"
-            "\t\t\t    1, QuackGetUBigintSetting(context, \"acl_quack_target_batch_bytes\", QUACK_TARGET_BATCH_BYTES_DEFAULT));\n"
-            "\t\t\tunique_ptr<QuackChunkPayloadWriter> writer;\n"
-            "\t\t\tidx_t batch_index = 1;\n"
-            "\t\t\tidx_t rows = 0;\n"
-            "\t\t\tidx_t last_size = 0;\n"
-            "\t\t\tauto flush = [&]() {\n"
-            "\t\t\t\tif (!writer) {\n"
-            "\t\t\t\t\treturn;\n"
-            "\t\t\t\t}\n"
-            "\t\t\t\tauto sealed = writer->Seal();\n"
-            "\t\t\t\tQuackFetchPayload entry;\n"
-            "\t\t\t\tentry.payload = std::move(sealed.payload);\n"
-            "\t\t\t\tentry.payload_size = sealed.payload_size;\n"
-            "\t\t\t\tentry.chunk_count = sealed.chunk_count;\n"
-            "\t\t\t\tentry.rows = rows;\n"
-            "\t\t\t\tlast_size = entry.payload_size;\n"
-            "\t\t\t\tauto bytes = entry.payload_size;\n"
-            "\t\t\t\tstream->buffer.PushBatch(batch_index++, std::move(entry), bytes);\n"
-            "\t\t\t\twriter.reset();\n"
-            "\t\t\t\trows = 0;\n"
-            "\t\t\t};\n"
-            "\t\t\twhile (auto chunk = reader.Fetch()) {\n"
-            "\t\t\t\tif (chunk->size() == 0) {\n"
-            "\t\t\t\t\tcontinue;\n"
-            "\t\t\t\t}\n"
-            "\t\t\t\tif (!writer) {\n"
-            "\t\t\t\t\twriter = make_uniq<QuackChunkPayloadWriter>(last_size);\n"
-            "\t\t\t\t}\n"
-            "\t\t\t\twriter->AppendChunk(*chunk);\n"
-            "\t\t\t\trows += chunk->size();\n"
-            "\t\t\t\tif (writer->AllocatedBytes() >= target_bytes) {\n"
-            "\t\t\t\t\tflush();\n"
-            "\t\t\t\t}\n"
-            "\t\t\t}\n"
-            "\t\t\tif (reader.HasError()) {\n"
-            "\t\t\t\tresult = make_uniq<QueryResult>(reader.GetErrorObject());\n"
-            "\t\t\t} else {\n"
-            "\t\t\t\tflush();\n"
-            "\t\t\t\tstream->announced_total = batch_index - 1;\n"
-            "\t\t\t\t// a stand-in for the handle the stream consumed: successful, empty, bound already\n"
-            "\t\t\t\tresult = make_uniq<QueryResult>(StatementType::SELECT_STATEMENT, StatementProperties(), vector<Identifier>(),\n"
-            "\t\t\t\t                                make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator()),\n"
-            "\t\t\t\t                                context.GetClientProperties());\n"
-            "\t\t\t}\n"
-            "\t\t}\n"
+            "\t\tconfig.get_result_collector = nullptr;\n"
+            "\t\t// acl (spec 069): the outcome of every statement the server drives\n"
             "\t\tacl::AclQuackStatementCompleted(*connection.duckdb_connection, connection.session_id, sql, *result);\n"
             "\t\tif (result->HasError()) {\n",
         ),

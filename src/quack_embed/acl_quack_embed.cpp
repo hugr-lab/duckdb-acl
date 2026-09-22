@@ -19,6 +19,9 @@
 #include "quack_rebalancer_sink.hpp"
 
 namespace duckdb {
+
+//! The embedded door's wire batch (see the registration below for why it is not quack's 32 MiB)
+static constexpr idx_t ACL_QUACK_TARGET_BATCH_BYTES_DEFAULT = 8ULL * 1024ULL * 1024ULL;
 namespace acl {
 
 void RegisterAclQuackEmbed(ExtensionLoader &loader) {
@@ -47,9 +50,15 @@ void RegisterAclQuackEmbed(ExtensionLoader &loader) {
 	config.AddExtensionOption("acl_quack_debug_emit_delay_ms",
 	                          "acl embedded door: DEBUG max random ms delay before the collector publishes a batch",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
+	// 8 MiB, not quack's 32: a quack client keeps 64 FETCHes in flight and, on a LIMIT met or a
+	// cursor closed early, waits for all of them before its CANCEL - so the first answer of a big
+	// result costs the server 64 batches whatever the client wanted. Measured on the delegated
+	// collector (test/bench/door_stream.py, spec 063): LIMIT 1 over 1B rows 2.4 s and +2.3 GiB at
+	// 32 MiB, 0.66 s and +0.5 GiB at 8; the full read keeps its speed and its per-thread fragments
+	// shrink with the batch (+215 MiB -> +56 MiB on 300M rows).
 	config.AddExtensionOption("acl_quack_target_batch_bytes",
 	                          "acl embedded door: target in-memory size of one rebalanced wire batch",
-	                          LogicalType::UBIGINT, Value::UBIGINT(QUACK_TARGET_BATCH_BYTES_DEFAULT));
+	                          LogicalType::UBIGINT, Value::UBIGINT(ACL_QUACK_TARGET_BATCH_BYTES_DEFAULT));
 	config.AddExtensionOption("acl_quack_rebalance_buffer_bytes",
 	                          "acl embedded door: pending bytes the rebalancer buffers before gating producers",
 	                          LogicalType::UBIGINT, Value::UBIGINT(QUACK_REBALANCE_BUFFER_BYTES_DEFAULT));
