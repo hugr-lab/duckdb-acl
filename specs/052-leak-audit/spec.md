@@ -165,10 +165,14 @@ What follows:
    answers facts about data stands beside the `duckdb_*` listings and is never in a role's default.
    Pinned by `test/sql/acl_secure_views.test`: refused without the grant, and with it the answer
    is the leak above - which is why the grant is the operator's decision, not a default.
-2. **Recommendation, not a mechanism**: where a role holds `explain`, or `meta`, make the physical
-   object behind the virtual relation a SECURE view (`ACL ADMIN CREATE VIRTUAL TABLE c.x AS
-   phys.main.x_secure`). Then `EXPLAIN` shows one name and `stats` shows nothing - the barrier is
-   duckdb's, real, and free. `docs/security.md` says so. An `acl_check_catalog` advisory finding
+2. **Recommendation, not a mechanism**: where a role holds `explain`, make the physical object
+   behind the virtual relation a SECURE view (`ACL ADMIN CREATE VIRTUAL TABLE c.x AS
+   phys.main.x_secure`). Then `EXPLAIN` shows one name - the barrier is duckdb's, real, and free.
+   `docs/security.md` says so. **Amended 2026-09-22** (pin d4e7256): since duckdb #25969 a secure
+   view that only projects columns passes their statistics through ("hides columns, not rows"),
+   and our predicate sits outside the view, so behind such a view `stats` answers the table's
+   min/max again; only a secure view that filters rows itself still erases them. For `stats` the
+   control is the grant of `meta`, not the view - the probe pins both cases. An `acl_check_catalog` advisory finding
    ("granted `explain`, physical object not secure") waits for `duckdb_views()` to expose the
    security type, which it does not at the pin.
 3. **No barrier of our own yet.** Wrapping a principal's predicates in `__internal_barrier` inside

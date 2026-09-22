@@ -27,9 +27,10 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   form (it refuses a `ResultEagerness::FORCED` statement - a count - which is read from the handle).
   Re-pin to the `v2.0.0` tag when it is cut; the scanners come from the submodule's own
   extension pins (`.github/config/extensions/`), patches included - ducklake's too, since 2026-09-17
-  (the three patches we carried in `patches/ducklake/` are upstream). quack is pinned one commit past
-  the submodule's own (#212), with the four patches duckdb carries for it applied to the loadable
-  (`APPLY_PATCHES`) and, by `sync.py`, to the embedded server's copies alike.
+  (the three patches we carried in `patches/ducklake/` are upstream). quack is the submodule's own pin
+  (#212 - duckdb caught up with our one-commit lead in #25978, 2026-09-22), with the patches duckdb
+  carries for it applied to the loadable (`APPLY_PATCHES`) and, by `sync.py`, to the embedded
+  server's copies alike (a patch that touches only quack's tests is skipped there, and says so).
 - **Dependencies**: none (no vcpkg/OpenSSL). The **shared repository** `duckdb-ext-common` is a
   submodule (spec 076): the audit contract (`contracts/acl_audit.hpp` + `acl_principal.hpp`, the same
   header acl-otel compiles - moved as is, contract version unchanged) and the OIDC client core
@@ -288,12 +289,16 @@ tokens. A namespace-alias shim (`acl_quack_httplib_ns.hpp`) lets quack's
 `duckdb_httplib::` sources compile in the OpenSSL httplib namespace; `sync.py` regenerates the few
 acl_-renamed TUs on a submodule bump - from a copy carrying duckdb's own quack patches, plus the
 embed's one patch: the statement driver. Since the unified `QueryResult` (duckdb #25477) the server
-delegates no result collector - a delegated submission that fails ends its query twice inside
-duckdb (a null dereference, INTERNAL, the whole database invalidated by a refused INSERT; duckdb
-#25887), and upstream quack has not met that duckdb yet - so the driver submits the statement and drains it
-through a `QueryResultStream` in batches of `acl_quack_target_batch_bytes` (several statements at
-once, the parser's implicit PIVOT, run through `Query()` materialized), with spec 069's audit hook
-inside; the embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
+delegates no result collector: a delegated submission that failed ended its query twice inside
+duckdb (a null dereference, INTERNAL, the whole database invalidated by a refused INSERT) - our
+duckdb #25887, **fixed in #25978 and in our pin since 2026-09-22** (the second end is guarded, and a
+hook that hands back the default sink is served through a buffer again). The driver stays ours all
+the same: it submits the statement and drains it through a `QueryResultStream` in batches of
+`acl_quack_target_batch_bytes` (several statements at once, the parser's implicit PIVOT, run through
+`Query()` materialized), which streams (measured, spec 063), and it is the one site where spec 069's
+audit hook and spec 074's profile arming ride. Going back to quack's delegated collector is possible
+now and is a follow-up, to be measured for streaming first. The embed is default-on (escape hatch
+`ACL_NO_QUACK_EMBED`).
 Streamed ingest
 (`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the
 **client** — `INSERT INTO t SELECT * FROM scan_data_from_quack_client('<id>', NULL::STRUCT(…),
