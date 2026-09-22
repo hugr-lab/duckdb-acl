@@ -191,6 +191,19 @@ MiB at 32 MiB is +114 / +56 / +32 at 16 / 8 / 4). The driver patch
 became two calls around quack's `Query()`; a "stop producing into an aborted stream" patch was
 tried and dropped, having measured nothing.
 
+The server cannot cap the client's 64 through the protocol. The depth is the client's own setting
+(`quack_fetch_read_ahead`, 0 = its async threads), the protocol carries no server limit, and each
+FETCH names a batch the server must answer. An answer without chunks ends the stream for the
+client. An error fails the query. A FETCH held until the client acks more hangs an early stop,
+because the client waits for every outstanding answer before it cancels. The protocol fix, a server
+limit announced in the handshake next to its heartbeat, is suggested on #277. Within today's
+protocol, spec 077 bounds the cost from the server's side: past a window of batches with rows, a
+FETCH is answered with an empty batch.
+
+**Follow-up.** When #277 is fixed in the quack we pin, re-run `test/bench/door_stream.py` with the
+window at 0 and `acl_quack_target_batch_bytes = 33554432`. If `LIMIT 1` stays cheap, restore quack's
+32 MiB (`ACL_QUACK_TARGET_BATCH_BYTES_DEFAULT`) and let spec 077's window default to 0.
+
 **2026-09-22: fixed upstream.** duckdb #25978 (Mytherin, on `v2.0-cyanoptera`, our pin since the same
 day) guards the second end (`if (active_query)` before the "abort now" branch's `EndQueryInternal`)
 and decides delegation by what the hook hands back (`PhysicalResultCollector::BuildsOwnResult()`: a

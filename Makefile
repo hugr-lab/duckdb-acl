@@ -79,6 +79,7 @@ TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,$(TEST_CPP_DIR)/%,$(TEST_CPP_SOURCES)
 # `src/include` so a test can reach a seam the extension exposes to itself - spec 046's catalog
 # statement composition is a free function, and checking the text it produces needs its header.
 TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include \
+	-I src/quack_embed/include \
 	-I duckdb-ext-common/contracts -I duckdb-ext-common/oidc/include \
 	-I duckdb/third_party/httplib -I duckdb/third_party/yyjson/include
 

@@ -18,6 +18,7 @@
 
 #include "duckdb/main/client_config.hpp"
 #include "acl_quack_embed.hpp"
+#include "acl_quack_fetch_window.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 
 #include "quack_server.hpp"
@@ -833,6 +834,8 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		// payloads stay until the client acks them, so a transport retry gets the SAME batch.
 		auto dense_index = fetch_request_message.batch_index + stream->prepare_batches;
 		auto dense_ack = fetch_request_message.ack_index + stream->prepare_batches;
+		// acl (spec 077): past the client's window an index is answered by an empty batch
+		auto window = acl::AclQuackFetchWindowFor(*connection.duckdb_connection->context, stream, db);
 		{
 			lock_guard<mutex> guard(stream->serve_lock);
 			// The client has everything up to the ack and cannot ask for it again. A result cache
@@ -851,6 +854,10 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			QuackFetchPayload entry;
 			shared_ptr<MemoryStream> served_batch;
 			idx_t served_start = 0;
+			// acl (spec 077): the produced batch this index gets, and the empties the total counts
+			idx_t source_index = dense_index;
+			idx_t empty_batches = 0;
+			auto refused = acl::AclFetchWindowPlan::Kind::BATCH;
 			{
 				// One critical section for the check, the pop and the retain. A concurrent retry of the
 				// same index cannot reach FINISHED while the first serve runs.
@@ -861,7 +868,24 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 					served_batch = retained->second.payload;
 					served_start = retained->second.body_start;
 				} else {
-					status = stream->buffer.TryPopClaimed(dense_index, entry);
+					auto answer = window->plan.Decide(dense_index, dense_ack, stream->prepare_batches);
+					if (answer.kind == acl::AclFetchWindowPlan::Kind::GONE ||
+					    answer.kind == acl::AclFetchWindowPlan::Kind::TOO_FAR) {
+						refused = answer.kind;
+					} else if (answer.kind == acl::AclFetchWindowPlan::Kind::EMPTY) {
+						served_batch =
+						    acl::AclQuackEmptyBatch(*window, *stream, fetch_request_message.batch_index, served_start);
+						stream->served.emplace(dense_index,
+						                       QuackResultStream::RetainedPayload {served_batch, served_start, 0});
+					} else {
+						source_index = answer.source;
+						status = stream->buffer.TryPopClaimed(source_index, entry);
+						if (status == QuackClaimPopStatus::FINISHED) {
+							// the terminal answer's total counts the empties: no more of them
+							window->plan.Close();
+						}
+					}
+					empty_batches = window->plan.EmptyBatches();
 					if (status == QuackClaimPopStatus::BATCH) {
 						// write the header with the client-visible index, then keep the payload for a retry
 						FetchResponseMessage header_message;
@@ -875,6 +899,12 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 						served_batch = std::move(payload);
 					}
 				}
+			}
+			if (refused == acl::AclFetchWindowPlan::Kind::GONE) {
+				return make_uniq<ErrorResponse>("FETCH_REQUEST names a batch the client already acknowledged");
+			}
+			if (refused == acl::AclFetchWindowPlan::Kind::TOO_FAR) {
+				return make_uniq<ErrorResponse>("FETCH_REQUEST names a batch too far ahead of its acknowledgement");
 			}
 			if (served_batch) {
 				// outside serve_lock, because the connection's state lock guards the cache
@@ -893,11 +923,12 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 				}
 				auto response = make_uniq<FetchResponseMessage>();
 				if (stream->announced_total.IsValid()) {
-					response->SetTotalBatches(stream->announced_total.GetIndex() - stream->prepare_batches);
+					response->SetTotalBatches(stream->announced_total.GetIndex() - stream->prepare_batches +
+					                          empty_batches);
 				}
 				return std::move(response);
 			}
-			stream->buffer.WaitForBatch(dense_index);
+			stream->buffer.WaitForBatch(source_index);
 		}
 	}
 

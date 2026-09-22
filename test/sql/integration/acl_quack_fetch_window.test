@@ -1,0 +1,190 @@
+# name: test/sql/integration/acl_quack_fetch_window.test
+# description: the quack door's fetch window (spec 077). A quack client keeps its whole read-ahead of
+#   FETCHes in flight; past acl_quack_fetch_window batches with rows above its ack the door answers
+#   a FETCH with an empty batch and moves the produced batches to the indices after it. Whatever the
+#   window, the client reads every row, once, in order, and its own count of the batches holds. Here
+#   the batches are tiny (one chunk each) and the window is fixed at 2 against a read-ahead of 16, so
+#   most answers are empty; the client's FETCH count says they were. A window that grows while the
+#   client reads (no cap) outgrows the read-ahead, and the empty answers stop.
+# group: [integration]
+
+require acl
+
+require httpfs
+
+require quack
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.seq AS SELECT i FROM range(200000) t(i);
+
+# the empty batch is a chunk of the result's own types: text, NULLs and a nested type among them
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.mixed AS
+    SELECT i, i::VARCHAR AS s, CASE WHEN i % 7 = 0 THEN NULL ELSE [i, i + 1] END AS l,
+        {'a': i % 3, 'b': 'x' || (i % 5)::VARCHAR} AS st
+    FROM range(100000) t(i);
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+# one chunk per batch, a window fixed at 2, a client that asks 16 ahead
+statement ok
+SET GLOBAL acl_quack_target_batch_bytes = 16384;
+
+statement ok
+SET GLOBAL acl_quack_fetch_window = 2;
+
+statement ok
+SET GLOBAL acl_quack_fetch_window_max = 2;
+
+statement ok
+SET quack_fetch_read_ahead = 16;
+
+query I
+SELECT acl_quack_serve('quack:localhost:31492', 'window-server-token');
+----
+quack:localhost:31492
+
+statement ok
+CALL enable_logging(['Quack'], storage := 'memory');
+
+# --- every row, once, in order ---------------------------------------------------------------------
+
+statement ok
+CREATE TABLE got AS SELECT * FROM quack_query('quack:localhost:31492', 'SELECT i FROM seq ORDER BY i',
+    token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+query IIII
+SELECT count(*), sum(i), min(i), max(i) FROM got;
+----
+200000	19999900000	0	199999
+
+# the rows arrived in the order the server produced them
+query I
+SELECT count(*) FROM (SELECT i, lag(i) OVER (ORDER BY rowid) AS p FROM got) WHERE p IS NOT NULL AND i <> p + 1;
+----
+0
+
+# ~98 batches: with the window most FETCHes were answered empty (about read-ahead / window per batch)
+query I
+SELECT count(*) > 300 FROM duckdb_logs
+WHERE message LIKE '%FETCH_REQUEST%' AND message LIKE '%''server'': ''http%';
+----
+true
+
+# --- the result's own types survive the empty answers ------------------------------------------------
+
+query IIIII
+SELECT count(*), sum(i), sum(length(s)), count(l), sum(st.a)
+FROM quack_query('quack:localhost:31492', 'SELECT * FROM mixed ORDER BY i', token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+100000	4999950000	488890	85714	99999
+
+# --- an early stop, an empty result, a small one ----------------------------------------------------
+
+query I
+SELECT * FROM quack_query('quack:localhost:31492', 'SELECT i FROM seq ORDER BY i', token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc') LIMIT 3;
+----
+0
+1
+2
+
+query I
+SELECT count(*) FROM quack_query('quack:localhost:31492', 'SELECT i FROM seq WHERE i < 0', token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+0
+
+query I
+SELECT * FROM quack_query('quack:localhost:31492', 'SELECT 42', token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+42
+
+# --- a result the server retains for a reconnect keeps the empty answers too ---------------------------
+
+statement ok
+SET GLOBAL acl_quack_enable_reconnects = true;
+
+query II
+SELECT count(*), sum(i) FROM quack_query('quack:localhost:31492', 'SELECT i FROM seq ORDER BY i', token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+200000	19999900000
+
+statement ok
+SET GLOBAL acl_quack_enable_reconnects = false;
+
+# --- a window that grows (from 2, no cap) outgrows the read-ahead: the empty answers stop ---------------
+
+statement ok
+SET GLOBAL acl_quack_fetch_window_max = 0;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE TABLE grown AS SELECT * FROM quack_query('quack:localhost:31492', 'SELECT i FROM seq ORDER BY i',
+    token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+query II
+SELECT count(*), sum(i) FROM grown;
+----
+200000	19999900000
+
+query I
+SELECT count(*) FROM (SELECT i, lag(i) OVER (ORDER BY rowid) AS p FROM grown) WHERE p IS NOT NULL AND i <> p + 1;
+----
+0
+
+query I
+SELECT count(*) < 200 FROM duckdb_logs
+WHERE message LIKE '%FETCH_REQUEST%' AND message LIKE '%''server'': ''http%';
+----
+true
+
+# --- a window of 0 is quack's own behaviour: one FETCH per batch, plus the read-ahead past the end ------
+
+statement ok
+SET GLOBAL acl_quack_fetch_window = 0;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE TABLE got0 AS SELECT * FROM quack_query('quack:localhost:31492', 'SELECT i FROM seq ORDER BY i',
+    token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+query II
+SELECT count(*), sum(i) FROM got0;
+----
+200000	19999900000
+
+query I
+SELECT count(*) < 150 FROM duckdb_logs
+WHERE message LIKE '%FETCH_REQUEST%' AND message LIKE '%''server'': ''http%';
+----
+true
+
+statement ok
+SELECT acl_quack_stop('quack:localhost:31492');

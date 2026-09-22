@@ -127,6 +127,7 @@ if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_QUACK_EMBED})
         ${QUACK_EMBED}/acl_quack_http_server.cpp
         ${QUACK_EMBED}/acl_quack_door.cpp
         ${QUACK_EMBED}/acl_quack_embed.cpp
+        ${QUACK_EMBED}/acl_quack_fetch_window.cpp
         ${QUACK_EMBED}/acl_embed_server.cpp
         ${QUACK_EMBED}/acl_embed_result_cache.cpp
         ${QUACK_EMBED}/acl_embed_fetch_collector.cpp

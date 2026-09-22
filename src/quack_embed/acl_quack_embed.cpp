@@ -14,6 +14,7 @@
 #include "duckdb/main/config.hpp"
 
 #include "acl_quack_embed.hpp"
+#include "acl_quack_fetch_window.hpp"
 
 #include "quack_scan_from_client.hpp"
 #include "quack_rebalancer_sink.hpp"
@@ -56,7 +57,8 @@ void RegisterAclQuackEmbed(ExtensionLoader &loader) {
 	// collector (test/bench/door_stream.py, spec 063): LIMIT 1 over 1B rows 2.4 s and +2.3 GiB at
 	// 32 MiB, 0.66 s and +0.5 GiB at 8; the full read keeps its speed and its per-thread fragments
 	// shrink with the batch (+215 MiB -> +56 MiB on 300M rows). The client's own cost is larger still
-	// (7.9 GiB resident at 32 MiB on stock quack): duckdb-quack #277.
+	// (7.9 GiB resident at 32 MiB on stock quack): duckdb-quack #277. Once that is fixed in the pinned
+	// quack, re-measure and go back to 32 MiB (spec 063's follow-up).
 	config.AddExtensionOption("acl_quack_target_batch_bytes",
 	                          "acl embedded door: target in-memory size of one rebalanced wire batch",
 	                          LogicalType::UBIGINT, Value::UBIGINT(ACL_QUACK_TARGET_BATCH_BYTES_DEFAULT));
@@ -66,6 +68,19 @@ void RegisterAclQuackEmbed(ExtensionLoader &loader) {
 	config.AddExtensionOption("acl_quack_fetch_producer_buffer_bytes",
 	                          "acl embedded door: server-side cap on bytes the fetch collector buffers ahead",
 	                          LogicalType::UBIGINT, Value::UBIGINT(QUACK_FETCH_PRODUCER_BUFFER_BYTES_DEFAULT));
+	// spec 077: what the server does about #277 itself - past the window's batches with rows above the
+	// client's ack, a FETCH is answered at once with an empty batch, so an early stop costs the window;
+	// the window doubles while the client keeps reading, up to the max
+	config.AddExtensionOption("acl_quack_fetch_window",
+	                          "acl embedded door: batches with rows a quack client may have in flight when its "
+	                          "result starts; its further FETCHes are answered with empty batches (0 = no window)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(acl::ACL_QUACK_FETCH_WINDOW_DEFAULT), nullptr,
+	                          SetScope::GLOBAL);
+	config.AddExtensionOption("acl_quack_fetch_window_max",
+	                          "acl embedded door: the most the fetch window grows to while a client keeps reading "
+	                          "(0 = no cap)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(acl::ACL_QUACK_FETCH_WINDOW_MAX_DEFAULT), nullptr,
+	                          SetScope::GLOBAL);
 	config.AddExtensionOption("acl_quack_enable_reconnects",
 	                          "acl embedded door: cache the last result until acknowledged (reconnect support)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
