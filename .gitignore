@@ -20,3 +20,7 @@ design/
 # local vcpkg checkout + artifacts (make vcpkg-setup)
 vcpkg/
 vcpkg_installed/
+
+# python bytecode (test/bench, scripts)
+__pycache__/
+*.pyc

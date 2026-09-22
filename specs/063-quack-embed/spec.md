@@ -163,6 +163,34 @@ than a principal's INSERT refused at the predicate (spec 024). quack's own pin o
 the change and duckdb's CI does not run quack's tests, so the embed met it first - reported as
 duckdb #25887 (2026-09-18), with the repro and the one-line guard.
 
+**2026-09-22, later the same day: back to quack's driver.** With the fix in the pin, the delegated
+collector was measured against our driver (`test/bench/door_stream.py`: a virtual view of N rows of
+an integer and its text, a fresh server per read, the server's resident set sampled every 100 ms;
+16 threads, macOS arm64):
+
+| read | our driver | quack's, 32 MiB batches | quack's, 8 MiB batches |
+| --- | --- | --- | --- |
+| `LIMIT 1` over 1B rows | 0.58 s, +530 MiB | 2.44 s, +2.3 GiB | 0.66 s, +521 MiB |
+| full read, 300M rows | 5.6 s, +150 MiB | 3.7 s, +215 MiB | 3.73 s, +56 MiB |
+| slow client, 50M rows | 10.4 s, +585 MiB | 10.6 s, +620 MiB | 10.5 s, +192 MiB |
+
+Both stream: behind a slow client both hold the server back (quack's by parking the producing task,
+ours by duckdb's bounded result buffer). The early stop was the one loss, and the protocol log says
+why: on a LIMIT met, the quack client waits for all 64 FETCHes it keeps in flight before it sends
+CANCEL (the server's cancel then takes 2-3 ms either way) - so the client pulls 64 batches it will
+discard, 64 x 32 MiB = 2 GiB with quack's batch. The client pays more than the server: on stock
+quack alone (`quack_serve`, no acl) the same LIMIT 1 costs the server +2.35 GiB and the client **7.9
+GiB** of resident memory at 32 MiB batches, +542 MiB and 2 GiB at 8 MiB, and 0.23 s / 4 FETCHes / 772
+MiB with the client's `quack_fetch_read_ahead = 4`. The first batch lands at 140 ms; the client's
+query does not finish until all 64 FETCHes are answered, and the CANCEL comes from the scan's bind
+data after that - sending it earlier, from the fetcher's `StopAndDrain`, was tried and changes
+nothing, because the fetcher is torn down only after the wait. Reported as duckdb-quack #277
+(2026-09-22). The server's lever is the batch: the embed registers `acl_quack_target_batch_bytes`
+with 8 MiB, and the per-thread fragments of the parallel sink shrink with it (the full read's +215
+MiB at 32 MiB is +114 / +56 / +32 at 16 / 8 / 4). The driver patch
+became two calls around quack's `Query()`; a "stop producing into an aborted stream" patch was
+tried and dropped, having measured nothing.
+
 **2026-09-22: fixed upstream.** duckdb #25978 (Mytherin, on `v2.0-cyanoptera`, our pin since the same
 day) guards the second end (`if (active_query)` before the "abort now" branch's `EndQueryInternal`)
 and decides delegation by what the hook hands back (`PhysicalResultCollector::BuildsOwnResult()`: a
@@ -170,9 +198,8 @@ hook returning the default sink is served through a buffer like any query - whic
 half of the report, the count of a delegated INSERT that never arrived). The issue's repro, extended
 with that second case, aborts on the old pin (62ee922) and passes on the new one (d4e7256): the
 failed statement answers its error, the connection runs the next one, the database stays valid.
-The driver below is kept: it streams (measured), it is where the audit (069) and profile (074)
-hooks ride, and quack's own delegated collector has not been re-measured on the new pin - a
-follow-up, not a precondition.
+The driver described below was kept for that one afternoon; the measurement above replaced it with
+quack's own (the two hooks stay).
 
 The embed's `DriveQuery` (the one `sync.py` patch on `quack_server.cpp`) therefore delegates
 nothing: the statement is `Submit`ted, and a result-returning one is drained through a

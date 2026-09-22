@@ -288,17 +288,17 @@ httpfs` nor `force_mbedtls_unsafe` — duckdb's bundled mbedtls RNG is a non-cry
 tokens. A namespace-alias shim (`acl_quack_httplib_ns.hpp`) lets quack's
 `duckdb_httplib::` sources compile in the OpenSSL httplib namespace; `sync.py` regenerates the few
 acl_-renamed TUs on a submodule bump - from a copy carrying duckdb's own quack patches, plus the
-embed's one patch: the statement driver. Since the unified `QueryResult` (duckdb #25477) the server
-delegates no result collector: a delegated submission that failed ended its query twice inside
-duckdb (a null dereference, INTERNAL, the whole database invalidated by a refused INSERT) - our
-duckdb #25887, **fixed in #25978 and in our pin since 2026-09-22** (the second end is guarded, and a
-hook that hands back the default sink is served through a buffer again). The driver stays ours all
-the same: it submits the statement and drains it through a `QueryResultStream` in batches of
-`acl_quack_target_batch_bytes` (several statements at once, the parser's implicit PIVOT, run through
-`Query()` materialized), which streams (measured, spec 063), and it is the one site where spec 069's
-audit hook and spec 074's profile arming ride. Going back to quack's delegated collector is possible
-now and is a follow-up, to be measured for streaming first. The embed is default-on (escape hatch
-`ACL_NO_QUACK_EMBED`).
+embed's one patch: two calls around quack's own statement driver - spec 074's profile arming before
+the statement, spec 069's audit hook after it. The driver is quack's delegated collector
+(`MakeQuackFetchCollector`: the executor's parallel sink encodes batches and a full stream buffer
+parks the producing task) - from 2026-09-17 to 2026-09-22 it was ours, while duckdb ended a failing
+delegated query twice (our #25887, fixed in #25978). Measured side by side
+(`test/bench/door_stream.py`, spec 063): the full read 1.5x faster than our single-thread drain, and
+with our default **`acl_quack_target_batch_bytes` = 8 MiB** (quack's is 32) the early stop costs what
+it did: a quack client keeps 64 FETCHes in flight and waits for all of them before its CANCEL on a
+LIMIT met, so the first answer of a big result costs 64 batches - LIMIT 1 over 1B rows 0.66 s and
++0.5 GiB at 8 MiB, 2.4 s and +2.3 GiB at 32 (and the client 7.9 GiB; duckdb-quack #277, a client
+fix). The embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
 Streamed ingest
 (`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the
 **client** — `INSERT INTO t SELECT * FROM scan_data_from_quack_client('<id>', NULL::STRUCT(…),

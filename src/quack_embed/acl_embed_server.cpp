@@ -17,8 +17,6 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 
 #include "duckdb/main/client_config.hpp"
-#include "duckdb/common/enums/result_eagerness.hpp"
-#include "duckdb/main/query_result_stream.hpp"
 #include "acl_quack_embed.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 
@@ -145,72 +143,24 @@ static void DriveQuery(QuackConnection &connection, shared_ptr<QuackResultStream
 		unique_lock<mutex> guard(connection.statement_lock);
 		auto &context = *connection.duckdb_connection->context;
 
-		// acl (duckdb #25477): no collector hook - a delegated submission that fails ends its query
-		// twice in duckdb (INTERNAL, the database invalidated). The statement is submitted and its
-		// result drained here through a QueryResultStream; several statements at once (the
-		// parser's implicit PIVOT) cannot be submitted and run through Query(), materialized.
+		// MakeQuackFetchCollector sends the FIRST statement that returns a result into the stream.
+		// Every other statement keeps the default collector.
+		auto &config = ClientConfig::GetConfig(context);
+		config.get_result_collector = [stream](ClientContext &ctx, PreparedStatementData &data) {
+			return MakeQuackFetchCollector(ctx, data, stream);
+		};
+		// acl (spec 074): whether this statement is profiled is decided before it runs
 		acl::AclQuackStatementStarting(*connection.duckdb_connection, connection.session_id);
-		unique_ptr<QueryResult> result = connection.duckdb_connection->Submit(sql);
-		if (result->HasError() && result->GetError().find("multiple statements") != string::npos) {
+		unique_ptr<QueryResult> result;
+		try {
 			result = connection.duckdb_connection->Query(sql);
+		} catch (...) {
+			// leave no collector hook on the connection's config
+			config.get_result_collector = nullptr;
+			throw;
 		}
-		if (!result->HasError() && result->GetStatementProperties().return_type == StatementReturnType::QUERY_RESULT &&
-		    result->GetStatementProperties().result_eagerness != ResultEagerness::FORCED && result->HasBufferedData()) {
-			// the stream carries this statement: its shape is known at submission, its chunks go
-			// out in batches of about the target size as duckdb produces them
-			vector<string> result_names;
-			for (auto &col_name : result->GetNames()) {
-				result_names.push_back(col_name.GetIdentifierName());
-			}
-			auto types = result->GetTypes();
-			QueryResultStream reader(std::move(result));
-			stream->SignalBound(types, std::move(result_names));
-			auto target_bytes = MaxValue<idx_t>(
-			    1, QuackGetUBigintSetting(context, "acl_quack_target_batch_bytes", QUACK_TARGET_BATCH_BYTES_DEFAULT));
-			unique_ptr<QuackChunkPayloadWriter> writer;
-			idx_t batch_index = 1;
-			idx_t rows = 0;
-			idx_t last_size = 0;
-			auto flush = [&]() {
-				if (!writer) {
-					return;
-				}
-				auto sealed = writer->Seal();
-				QuackFetchPayload entry;
-				entry.payload = std::move(sealed.payload);
-				entry.payload_size = sealed.payload_size;
-				entry.chunk_count = sealed.chunk_count;
-				entry.rows = rows;
-				last_size = entry.payload_size;
-				auto bytes = entry.payload_size;
-				stream->buffer.PushBatch(batch_index++, std::move(entry), bytes);
-				writer.reset();
-				rows = 0;
-			};
-			while (auto chunk = reader.Fetch()) {
-				if (chunk->size() == 0) {
-					continue;
-				}
-				if (!writer) {
-					writer = make_uniq<QuackChunkPayloadWriter>(last_size);
-				}
-				writer->AppendChunk(*chunk);
-				rows += chunk->size();
-				if (writer->AllocatedBytes() >= target_bytes) {
-					flush();
-				}
-			}
-			if (reader.HasError()) {
-				result = make_uniq<QueryResult>(reader.GetErrorObject());
-			} else {
-				flush();
-				stream->announced_total = batch_index - 1;
-				// a stand-in for the handle the stream consumed: successful, empty, bound already
-				result = make_uniq<QueryResult>(
-				    StatementType::SELECT_STATEMENT, StatementProperties(), vector<Identifier>(),
-				    make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator()), context.GetClientProperties());
-			}
-		}
+		config.get_result_collector = nullptr;
+		// acl (spec 069): the outcome of every statement the server drives
 		acl::AclQuackStatementCompleted(*connection.duckdb_connection, connection.session_id, sql, *result);
 		if (result->HasError()) {
 			stream->buffer.SetError(result->GetErrorObject());
