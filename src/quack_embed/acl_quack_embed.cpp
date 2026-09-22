@@ -55,7 +55,8 @@ void RegisterAclQuackEmbed(ExtensionLoader &loader) {
 	// result costs the server 64 batches whatever the client wanted. Measured on the delegated
 	// collector (test/bench/door_stream.py, spec 063): LIMIT 1 over 1B rows 2.4 s and +2.3 GiB at
 	// 32 MiB, 0.66 s and +0.5 GiB at 8; the full read keeps its speed and its per-thread fragments
-	// shrink with the batch (+215 MiB -> +56 MiB on 300M rows).
+	// shrink with the batch (+215 MiB -> +56 MiB on 300M rows). The client's own cost is larger still
+	// (7.9 GiB resident at 32 MiB on stock quack): duckdb-quack #277.
 	config.AddExtensionOption("acl_quack_target_batch_bytes",
 	                          "acl embedded door: target in-memory size of one rebalanced wire batch",
 	                          LogicalType::UBIGINT, Value::UBIGINT(ACL_QUACK_TARGET_BATCH_BYTES_DEFAULT));

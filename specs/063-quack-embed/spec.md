@@ -178,10 +178,16 @@ Both stream: behind a slow client both hold the server back (quack's by parking 
 ours by duckdb's bounded result buffer). The early stop was the one loss, and the protocol log says
 why: on a LIMIT met, the quack client waits for all 64 FETCHes it keeps in flight before it sends
 CANCEL (the server's cancel then takes 2-3 ms either way) - so the client pulls 64 batches it will
-discard, 64 x 32 MiB = 2 GiB with quack's batch. The server's lever is the batch: the embed
-registers `acl_quack_target_batch_bytes` with 8 MiB, and the per-thread fragments of the parallel
-sink shrink with it (the full read's +215 MiB at 32 MiB is +114 / +56 / +32 at 16 / 8 / 4). A
-client-side fix - cancel before draining the read-ahead - is quack's to make. The driver patch
+discard, 64 x 32 MiB = 2 GiB with quack's batch. The client pays more than the server: on stock
+quack alone (`quack_serve`, no acl) the same LIMIT 1 costs the server +2.35 GiB and the client **7.9
+GiB** of resident memory at 32 MiB batches, +542 MiB and 2 GiB at 8 MiB, and 0.23 s / 4 FETCHes / 772
+MiB with the client's `quack_fetch_read_ahead = 4`. The first batch lands at 140 ms; the client's
+query does not finish until all 64 FETCHes are answered, and the CANCEL comes from the scan's bind
+data after that - sending it earlier, from the fetcher's `StopAndDrain`, was tried and changes
+nothing, because the fetcher is torn down only after the wait. Reported as duckdb-quack #277
+(2026-09-22). The server's lever is the batch: the embed registers `acl_quack_target_batch_bytes`
+with 8 MiB, and the per-thread fragments of the parallel sink shrink with it (the full read's +215
+MiB at 32 MiB is +114 / +56 / +32 at 16 / 8 / 4). The driver patch
 became two calls around quack's `Query()`; a "stop producing into an aborted stream" patch was
 tried and dropped, having measured nothing.
 

@@ -297,8 +297,8 @@ delegated query twice (our #25887, fixed in #25978). Measured side by side
 with our default **`acl_quack_target_batch_bytes` = 8 MiB** (quack's is 32) the early stop costs what
 it did: a quack client keeps 64 FETCHes in flight and waits for all of them before its CANCEL on a
 LIMIT met, so the first answer of a big result costs 64 batches - LIMIT 1 over 1B rows 0.66 s and
-+0.5 GiB at 8 MiB, 2.4 s and +2.3 GiB at 32. The embed is default-on (escape hatch
-`ACL_NO_QUACK_EMBED`).
++0.5 GiB at 8 MiB, 2.4 s and +2.3 GiB at 32 (and the client 7.9 GiB; duckdb-quack #277, a client
+fix). The embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
 Streamed ingest
 (`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the
 **client** — `INSERT INTO t SELECT * FROM scan_data_from_quack_client('<id>', NULL::STRUCT(…),
