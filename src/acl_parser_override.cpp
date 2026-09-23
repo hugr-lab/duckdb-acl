@@ -216,7 +216,9 @@ struct StatementAudit {
 	AuditPipeline *audit;
 	AuditEvent proto; // what every event of the batch shares: door, session, principal, trace
 	int8_t session_level = -1;
-	int8_t session_profile = -1; // spec 074 slice 3: the operator's profile level on the session
+	int8_t session_profile = -1;   // spec 074 slice 3: the operator's profile level on the session
+	int64_t session_opened_at = 0; // spec 078: for the statement's AclConnection
+	int64_t session_expires_at = 0;
 	AuditTrail trail;
 	//! What the override was doing when an exception nobody noted escaped: it names the code
 	Reason phase = Reason::PARSE;
@@ -230,6 +232,8 @@ struct StatementAudit {
 			proto.principal = ref.principal; // known before anything is judged: a parse refusal names it too
 			session_level = ref.audit_level;
 			session_profile = ref.profile_override;
+			session_opened_at = ref.opened_at;
+			session_expires_at = ref.expires_at;
 		}
 	}
 
@@ -256,6 +260,8 @@ struct StatementAudit {
 			note.decision_seq = seq;
 			note.text_hash = stmt.text_hash;
 			note.session_profile_override = session_profile;
+			note.session_opened_at = session_opened_at;
+			note.session_expires_at = session_expires_at;
 			note.proto = proto;
 			note.statement = stmt.statement;
 			note.objects = stmt.objects;

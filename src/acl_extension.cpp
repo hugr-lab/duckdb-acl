@@ -259,6 +259,14 @@ void LoadInternal(ExtensionLoader &loader) {
 		hooks = make_shared_ptr<acl::AuditHooks>();
 	}
 	store->hooks = hooks;
+	// spec 078: the session observers of acl_connection.hpp (tresor's delegation), reached the same
+	// way; a registry stamped with another contract gets nothing from us, and says so below
+	string session_contract_mismatch;
+	auto session_hooks = acl::AclSessionHooks::Reach(db.GetObjectCache(), session_contract_mismatch);
+	store->session_notices.Attach(session_hooks);
+	if (!session_hooks) {
+		store->session_notices.MarkRefused();
+	}
 #ifdef ACL_QUACK_EMBED_ENABLED
 	// The embedded quack door (spec 063): the acl_quack_* server settings and the acl_quack_scan_data
 	// drain the server INSERTs through, then the door itself - serve/stop and the two callbacks the
@@ -280,6 +288,28 @@ void LoadInternal(ExtensionLoader &loader) {
 	if (!contract_mismatch.empty()) {
 		// the full reason, once, where the operator reads refusals (the ring, the file, a sink of ours)
 		store->AuditPolicy("contract_mismatch", contract_mismatch);
+	}
+	if (!session_contract_mismatch.empty()) {
+		store->AuditPolicy("contract_mismatch", session_contract_mismatch);
+	}
+	{
+		// spec 078: the observers of session opens and closes, and what their calls cost
+		weak_ptr<acl::PolicyStore> weak_store = store;
+		auto read = [weak_store](int64_t (acl::SessionNotifier::*what)() const) {
+			return [weak_store, what]() {
+				auto locked = weak_store.lock();
+				return locked ? ((locked->session_notices).*what)() : int64_t(0);
+			};
+		};
+		hooks->Gauges().Register("acl.sessions.observers", {}, "{observer}",
+		                         "session observers registered (acl_connection.hpp); -1 = another contract version",
+		                         read(&acl::SessionNotifier::ObserverCount));
+		hooks->Gauges().Register("acl.sessions.observer_failures", {}, "{call}",
+		                         "session observer calls that threw (the session opened or closed regardless)",
+		                         read(&acl::SessionNotifier::Failures));
+		hooks->Gauges().Register("acl.sessions.observer_slow", {}, "{call}",
+		                         "session observer calls slower than 100 ms (a client's connect waits on an open)",
+		                         read(&acl::SessionNotifier::Slow));
 	}
 	acl::RegisterAclAudit(loader, store, pipeline);
 	acl::RegisterAclProfile(loader, store); // spec 074: the execution profile, on every connection

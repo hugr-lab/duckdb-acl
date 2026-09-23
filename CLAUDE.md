@@ -36,7 +36,8 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   header acl-otel compiles - moved as is, contract version unchanged) and the OIDC client core
   (`oidc/`, compiled into the extension from its source list under OUR namespace,
   `DUCKDB_EXT_COMMON_OIDC_NAMESPACE=acl`, so the names stay `duckdb::acl::oidc::...`; TLS by
-  `DUCKDB_EXT_COMMON_OIDC_TLS` in the flight build). Pinned to a tag; a change to the contract is a
+  `DUCKDB_EXT_COMMON_OIDC_TLS` in the flight build), and since v0.4.0 `contracts/acl_connection.hpp`
+  (spec 078: the session a statement runs under, session open/close observers - tresor's). Pinned to a tag; a change to the contract is a
   PR there first (its charter R4: any layout change bumps `CONTRACT_VERSION`), then a re-pin here.
 - **Platforms**: Linux (GCC), macOS (Clang), Windows (MSVC — a release target; CI builds the first two).
 
@@ -444,6 +445,21 @@ by whoever runs the statement (`ProfileConnectionFor`: the Flight door before ea
 driver before it submits, `QueryBegin` on the gateway path) and never over a client's own setting.
 Contract `AuditHooks::CONTRACT_VERSION` = 2. duckdb resets the profiler at an autocommit rollback
 before any hook: a failed statement's profile has its outcome, class and wall time, not the tree.
+
+**Spec 078 — the acl_connection contract** (duckdb-ext-common spec 005, `contracts/acl_connection.hpp`,
+magic `ACLC` v1, tag v0.4.0; consumer tresor's delegation): `AclConnection` (a ClientContextState,
+key `acl_connection`) names the session a statement runs under - published at QueryBegin from the
+override's note (`proto.session`, set only by `ACL SESSION`; the note carries opened/expires from
+`SessionRefOf`) and withdrawn at QueryEnd whatever ended it, so a gateway's shared connection never
+shows one principal's session to the next; `AclSessionHooks` (ObjectCache) holds `SessionObserver`s
+that `SessionNotifier` (`acl_session_hooks.{hpp,cpp}`, a store member) calls: `OnSessionOpen` after
+verification, before the handle is returned, outside the store lock, the verified token by reference
+for the call only; `OnSessionClose` exactly once per open, after it (a close racing its open waits),
+queued in `SessionClosed` - every removal's seam - and flushed after the lock by
+`DeliverSessionNotices` declared before each closing method's lock_guard; reasons client / idle /
+expired / killed / door_stopped / shutdown (the store's destructor). An observer that throws is
+counted, never fails an open; gauges `acl.sessions.observers` (-1 = another contract version),
+`.observer_failures`, `.observer_slow` (>100 ms). Never the handle, never a stored token.
 
 **Spec 070 — the Flight door streams**: `DoGet` submits the statement (`PreparedStatement::Submit`,
 a handle; a `ResultEagerness::FORCED` statement - a count - runs to completion instead) and hands

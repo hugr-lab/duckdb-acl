@@ -1348,6 +1348,19 @@ PolicyStore::PolicyStore() : memory_functions(FunctionCategoryModel::Seed()) {
 }
 
 PolicyStore::~PolicyStore() {
+	// spec 078: every session an observer heard open hears its close - the instance going away ends
+	// the ones still open. No audit event: the pipeline may already be gone.
+	try {
+		{
+			lock_guard<mutex> guard(lock);
+			for (auto &entry : sessions) {
+				session_notices.QueueClose(entry.second.id, "shutdown");
+			}
+		}
+		session_notices.Flush();
+	} catch (...) {
+		// a destructor never throws; the observers' own failures are already caught per call
+	}
 }
 
 void PolicyStore::EnableCatalog(DatabaseInstance &db, const string &db_name, const string &schema, bool init) {
