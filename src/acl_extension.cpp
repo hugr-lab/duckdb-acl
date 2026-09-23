@@ -267,6 +267,15 @@ void LoadInternal(ExtensionLoader &loader) {
 	store->session_notices.Attach(session_hooks);
 	if (!session_hooks) {
 		store->session_notices.MarkRefused();
+	} else {
+		// spec 081: the publisher mark - a consumer that must act for sessions tells this node, where
+		// sessions are published, from one without acl (either way no statement would show a session)
+		string build;
+#ifdef EXT_VERSION_ACL
+		build = EXT_VERSION_ACL;
+#endif
+		session_hooks->MarkPublisher("duckdb-acl " + (build.empty() ? string("dev") : build) + " (ACLC " +
+		                             std::to_string(acl::AclConnectionContract::VERSION) + ")");
 	}
 #ifdef ACL_QUACK_EMBED_ENABLED
 	// The embedded quack door (spec 063): the acl_quack_* server settings and the acl_quack_scan_data

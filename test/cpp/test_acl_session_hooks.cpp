@@ -350,6 +350,17 @@ int main(int argc, char *argv[]) {
 			      "the first instance's observer heard nothing of the second's");
 		});
 
+		Scenario("acl marks the registry as its publisher; an instance without acl has no mark", [&] {
+			string who;
+			Check(hooks->Publisher(who) && who.find("duckdb-acl") == 0 &&
+			          who.find("(ACLC " + std::to_string(AclConnectionContract::VERSION) + ")") != string::npos,
+			      "marked at load: " + who);
+			// acl is static in this libduckdb, so every instance loads it; an unmarked registry is a fresh
+			// object in the cache - what a consumer reaches on a node without acl
+			auto nobody = make_shared_ptr<AclSessionHooks>();
+			Check(!nobody->Publisher(who) && who.empty(), "a registry nobody marked says so");
+		});
+
 		Scenario("a registry stamped with another contract is refused by Reach", [&] {
 			// acl is linked statically into the libduckdb this binary uses, so it reaches the registry when
 			// the instance is created - before a test could stamp one otherwise. What is checkable here is

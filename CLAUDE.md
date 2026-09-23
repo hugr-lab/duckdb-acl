@@ -463,7 +463,7 @@ Contract `AuditHooks::CONTRACT_VERSION` = 2. duckdb resets the profiler at an au
 before any hook: a failed statement's profile has its outcome, class and wall time, not the tree.
 
 **Spec 078 — the acl_connection contract** (duckdb-ext-common spec 005, `contracts/acl_connection.hpp`,
-magic `ACLC` v1, tag v0.4.0; consumer tresor's delegation): `AclConnection` (a ClientContextState,
+magic `ACLC` v2 since spec 081 / tag v0.6.0; consumer tresor's delegation): `AclConnection` (a ClientContextState,
 key `acl_connection`) names the session a statement runs under - published at QueryBegin from the
 override's note (`proto.session`, set only by `ACL SESSION`; the note carries opened/expires from
 `SessionRefOf`) and withdrawn at QueryEnd whatever ended it, so a gateway's shared connection never
@@ -475,7 +475,9 @@ queued in `SessionClosed` - every removal's seam - and flushed after the lock by
 `DeliverSessionNotices` declared before each closing method's lock_guard; reasons client / idle /
 expired / killed / door_stopped / shutdown (the store's destructor). An observer that throws is
 counted, never fails an open; gauges `acl.sessions.observers` (-1 = another contract version),
-`.observer_failures`, `.observer_slow` (>100 ms). Never the handle, never a stored token.
+`.observer_failures`, `.observer_slow` (>100 ms). Never the handle, never a stored token. **Spec 081**: acl marks the
+registry at load (`MarkPublisher("duckdb-acl <build> (ACLC 2)")`), so a consumer that must act for
+sessions refuses on a node where nobody publishes them.
 
 **Spec 070 — the Flight door streams**: `DoGet` submits the statement (`PreparedStatement::Submit`,
 a handle; a `ResultEagerness::FORCED` statement - a count - runs to completion instead) and hands
