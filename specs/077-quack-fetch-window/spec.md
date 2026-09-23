@@ -80,9 +80,12 @@ into its buffer under its index, counts it, acknowledges it, and its scan skips 
   below a batch still on its way, every new index is empty too, so the client spins FETCHes for as
   long as that batch takes. A sort before its first batch can take seconds, and past `MAX_AHEAD` the
   query fails. Two holds, neither waiting on the client alone:
-  - **Production.** A batch with rows below is not yet answered. The empty answer waits for any pop
-    of the stream's buffer, so it is released by the server's own progress. After the producer is
-    done, it polls instead, because a finished buffer wakes nobody.
+  - **Production.** A batch with rows below is not yet answered, and its own FETCH has arrived. The
+    empty answer waits for any pop of the stream's buffer, so it is released by the server's own
+    progress. After the producer is done, it polls instead, because a finished buffer wakes nobody.
+    If a batch below has not been requested here yet, the hold is on the timer instead: at the
+    connection cap its FETCH may have been shed, and without a timer the empties above it would
+    wait for the client's 30-second read timeout (found by the concurrency bench, below).
   - **Acknowledgement.** The batches below are answered but not acknowledged: in transit, or the
     client stopped. A reading client sends the ack as soon as it consumes the batch. A client that
     stopped early sends nothing more and waits for these answers before it cancels, so the hold
@@ -186,6 +189,39 @@ first fix alone would spin for as long as the sort ran. The bench is unchanged a
 cost on an early stop: `LIMIT 1` over 1B rows 0.144 s and +56 MiB, the full read 3.79 s and
 +57 MiB, the slow read 10.44 s and +408 MiB.
 
+**Addendum 2026-09-23: many clients at once** (`test/bench/door_concurrent.py`). N separate quack
+clients start together against one server. Their kinds are assigned in turn: full reads of 50M rows,
+`LIMIT 1`, slow single-thread readers and `LIMIT 10` over a sort. Every client checks its own answer.
+Three runs per cell, one 16-core machine:
+
+| clients | window | LIMIT 1 | full read | wall | server peak |
+| --- | --- | --- | --- | --- | --- |
+| 8 | 8 | 0.17-0.25 s | 0.73-0.84 s | 1.30-1.35 s | +2.5-2.8 GiB |
+| 8 | 0 | 0.84-0.95 s | 0.81-0.89 s | 1.37-1.55 s | +3.4 GiB |
+| 16 | 8 | 0.25-0.43 s | 1.02-1.36 s | 1.75-1.95 s | +4.4-4.8 GiB |
+| 16 | 0 | 1.46-1.87 s | 1.52-1.82 s | 2.12-2.27 s | +5.8-6.2 GiB |
+
+- **Within capacity.** Every answer was right in every run. Under contention the window wins nearly
+  everywhere, because the server stops producing batches for clients that stopped.
+- **Past capacity.** The door's worker pool, quack's own ElasticThreadPool copied as is, keeps one
+  thread per keep-alive connection up to `acl_quack_server_max_connections` (1024). At the cap it
+  sheds a new connection, and the client's query fails with "Server returned nothing". A quack
+  client keeps one connection per FETCH in flight, 64 by default, so the door seats about 16
+  clients at once. With 24 clients, some queries failed in both modes: 1-2 per run with the window,
+  3 without. With the clients' `quack_fetch_read_ahead = 8`, 32 clients all passed. The window
+  cannot change this: the connections are the client's.
+- **The fix it found.** With the window, some over-capacity clients hung for 30 s before failing.
+  An empty answer was held for production below a batch whose FETCH had been shed. The hold for
+  production now needs that FETCH to have arrived (above). With the fix, no 30 s stalls occur in
+  three runs of 24 clients, or on a pool of 64.
+- **Memory has no global bound.** The server's peak grows with the clients, because each stream may
+  buffer `acl_quack_fetch_producer_buffer_bytes` (256 MiB, at most a quarter of the memory limit)
+  and its producer's threads hold their fragments. The window lowers it by about a quarter. A
+  budget across streams belongs with the resource groups follow-up.
+- **A tooling note.** With `-csv` or `-list` output, the duckdb CLI printed nothing for an error
+  raised while a result streamed, such as a FETCH that fails. The client looked like it answered
+  nothing. Box mode prints the error, and the bench uses box mode.
+
 ## Alternatives considered
 
 - **Hold a FETCH beyond the window until the client acknowledges more.** This hangs every early
@@ -201,6 +237,11 @@ cost on an early stop: `LIMIT 1` over 1B rows 0.144 s and +56 MiB, the full read
 
 ## Follow-ups
 
+- **The door's capacity.** About 16 quack clients at once with the default read-ahead. The options
+  are a larger `acl_quack_server_max_connections`, where a thread per connection is the price; a
+  pool that does not pin a thread per idle keep-alive connection, which is quack's and httplib's
+  design; or a server-announced read-ahead, as suggested on duckdb-quack #277. The last one also
+  caps the connections a client opens.
 - **Resource groups.** The window and its cap are GLOBAL today. Binding them, and the batch size, to
   a profile per role or per token is future work: the cap is the per-client number of batches a
   class of service may hold. The seam is `AclQuackFetchWindowFor`, which reads both when a stream's

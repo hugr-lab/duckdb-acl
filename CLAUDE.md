@@ -305,14 +305,18 @@ decided in index order whatever the arrival order (`AclFetchWindowPlan`, header-
 `test/cpp/test_acl_quack_fetch_window.cpp`), the terminal total counting the empties and no empty
 after the first terminal, so the client's own batch-count check holds; a FETCH > 65536 above the ack
 is refused. An empty answer is HELD while a batch with rows below it is unacknowledged - until it is
-produced (a pop wakes it), then until the ack moves or 20 ms (doubling to 500 ms while the ack stays
-stuck): the client's scan threads each claim their own index, and without the hold they spin empty
+produced (a pop wakes it; only when that batch's own FETCH has arrived - one shed at the connection
+cap is waited for on the timer), then until the ack moves or 20 ms (doubling to 500 ms while the ack
+stays stuck): the client's scan threads each claim their own index, and without the hold they spin empty
 FETCHes for as long as a batch takes (a sort: seconds, then MAX_AHEAD fails the query) - #152
 shipped without it, the addendum measures both. The window starts at `acl_quack_fetch_window` (8; 0 = quack's behaviour) and doubles per
 window acknowledged up to `acl_quack_fetch_window_max` (0 = no cap; equal = fixed): LIMIT 1 over 1B
 rows 0.126 s / +55 MiB, the full read unchanged (a fixed 8 halves it - the client decodes a batch per
 thread). Four hunks of the FETCH handler in `sync.py`, the window per stream on the session's
-connection. GLOBAL for now; a profile per role/token (resource groups) is the follow-up.
+connection. GLOBAL for now; a profile per role/token (resource groups) is the follow-up. Many clients at once
+(`test/bench/door_concurrent.py`): the door seats ~16 quack clients (`acl_quack_server_max_connections`
+1024 / a client's 64 keep-alive connections, one per FETCH in flight); past that quack's pool sheds
+connections and queries fail, with or without the window.
 The embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
 Streamed ingest
 (`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the
