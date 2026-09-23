@@ -18,6 +18,8 @@
 #include "quack_message.hpp"
 #include "quack_rebalancer_sink.hpp"
 
+#include <chrono>
+
 namespace duckdb {
 namespace acl {
 
@@ -76,6 +78,19 @@ AclQuackFetchWindowFor(ClientContext &context, const shared_ptr<QuackResultStrea
 	}
 	auto windows = context.registered_state->GetOrCreate<AclQuackFetchWindows>("acl_quack_fetch_windows");
 	return windows->For(stream, start, max);
+}
+
+AclFetchWindowPlan::Hold AclQuackEmptyHold(AclQuackFetchWindow &window, QuackResultStream &stream, idx_t dense_index) {
+	auto now =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+	        .count();
+	auto hold = window.plan.EmptyHold(dense_index, static_cast<uint64_t>(now));
+	if (hold == AclFetchWindowPlan::Hold::PRODUCTION && stream.buffer.Finished()) {
+		// everything is produced: the batch below waits only for its own FETCH to arrive, and a finished
+		// buffer wakes no waiter - the handler polls, as it does for an acknowledgement
+		return AclFetchWindowPlan::Hold::ACKNOWLEDGEMENT;
+	}
+	return hold;
 }
 
 shared_ptr<MemoryStream> AclQuackEmptyBatch(AclQuackFetchWindow &window, const QuackResultStream &stream,

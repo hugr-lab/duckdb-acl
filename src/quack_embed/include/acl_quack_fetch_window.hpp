@@ -7,8 +7,21 @@
 // "fewer" (duckdb-quack #277), so the window answers within it: at most the window's indices above
 // the client's ack carry rows; a FETCH beyond that is answered at once with an EMPTY batch - one
 // chunk of zero rows, which the client's scan skips - and the produced batches move to the indices
-// after it. The client holds an answered FETCH's slot until its scan consumes it, so the empty
-// answers cost a round trip per slot the consumer passes, never a loop.
+// after it.
+//
+// An empty answer is HELD while a batch with rows below it is not yet acknowledged. The client's scan
+// threads each claim their own index: a thread holding an empty index would consume it, free its slot
+// and ask again - and with the ack stuck below the batch still on its way, every new index is empty
+// too, so the client would spin FETCHes for as long as that batch takes (a sort before its first
+// batch: seconds; past MAX_AHEAD the query fails). Two holds, neither waiting on the client alone:
+//   - PRODUCTION: a batch with rows below is not yet answered (being produced). Released by the
+//     server's own progress - the batch is answered when it exists.
+//   - ACKNOWLEDGEMENT: the batches below are answered but not acknowledged (in transit, or the
+//     client stopped). Released by the ack a reading client sends as soon as it consumes the batch,
+//     or after a time: a client that stopped early sends no more FETCHes and waits for these answers
+//     before it cancels, so the hold must end by itself. The time starts at ACK_HOLD_MS and doubles
+//     (to ACK_HOLD_MAX_MS) each time a hold runs out with the ack still stuck - a client starved of
+//     CPU, receiving slowly - and the next ack that moves resets it.
 //
 // The window starts at `acl_quack_fetch_window` and doubles each time the client acknowledges a
 // window's worth of batches with rows, up to `acl_quack_fetch_window_max` (0 = no cap): an early
@@ -30,6 +43,7 @@
 #include "duckdb/common/vector.hpp"
 
 #include <map>
+#include <set>
 
 namespace duckdb {
 
@@ -66,6 +80,16 @@ public:
 	//! ahead (its async threads by default, one HTTP connection each); the plan decides every index
 	//! up to the one named, so this bounds what one request can make it do.
 	static constexpr idx_t MAX_AHEAD = 65536;
+	//! How long an empty answer waits for the acknowledgement of the batches below it, at first ...
+	static constexpr uint64_t ACK_HOLD_MS = 20;
+	//! ... and at most, after holds ran out with the ack stuck.
+	static constexpr uint64_t ACK_HOLD_MAX_MS = 500;
+
+	enum class Hold : uint8_t {
+		NONE,           //! answer it now
+		PRODUCTION,     //! a batch with rows below is still being produced
+		ACKNOWLEDGEMENT //! the batches below are answered, not yet acknowledged
+	};
 	struct Answer {
 		Kind kind;
 		idx_t source;
@@ -82,11 +106,14 @@ public:
 		}
 		if (ack > acked) {
 			acked = ack;
+			ack_hold_ms = ACK_HOLD_MS; // the client is receiving: holds are short again
 			for (auto it = answers.begin(); it != answers.end() && it->first <= acked;) {
 				if (it->second != EMPTY_MARK) {
-					open_batches--;
+					open_real.erase(it->first);
 					acked_batches++;
+					unanswered.erase(it->first);
 				}
+				held_since.erase(it->first);
 				it = answers.erase(it);
 			}
 			// the client keeps reading: a window's worth acknowledged doubles it, up to the cap
@@ -100,13 +127,14 @@ public:
 		}
 		while (decided < index) {
 			auto next = decided + 1;
-			if (!closed && open_batches >= width) {
+			if (!closed && open_real.size() >= width) {
 				answers.emplace(next, EMPTY_MARK);
 				empties++;
 			} else {
 				// the produced batches keep their order: each goes to the next index that carries rows
 				answers.emplace(next, next - empties);
-				open_batches++;
+				open_real.insert(next);
+				unanswered.insert(next);
 			}
 			decided = next;
 		}
@@ -118,6 +146,31 @@ public:
 			return Answer {Kind::EMPTY, 0};
 		}
 		return Answer {Kind::BATCH, entry->second};
+	}
+
+	//! The index carrying rows has been answered: its batch served, or the terminal sent.
+	void Answered(idx_t index) {
+		unanswered.erase(index);
+	}
+
+	//! Whether an EMPTY index may be answered now (`now_ms` on any monotonic clock).
+	Hold EmptyHold(idx_t index, uint64_t now_ms) {
+		if (open_real.empty() || *open_real.begin() > index) {
+			held_since.erase(index);
+			return Hold::NONE; // every batch with rows below it is acknowledged
+		}
+		if (!unanswered.empty() && *unanswered.begin() < index) {
+			return Hold::PRODUCTION;
+		}
+		// the hold's length is fixed when it starts, so the indices held together are released together
+		auto held = held_since.emplace(index, std::make_pair(now_ms, ack_hold_ms)).first->second;
+		if (now_ms >= held.first + held.second) {
+			held_since.erase(index);
+			// it ran out with the ack stuck: the next holds wait longer
+			ack_hold_ms = MinValue<uint64_t>(held.second * 2, ACK_HOLD_MAX_MS);
+			return Hold::NONE;
+		}
+		return Hold::ACKNOWLEDGEMENT;
 	}
 
 	//! A terminal answer is being sent: its total counts EmptyBatches(), so no index is made empty
@@ -151,9 +204,14 @@ private:
 	idx_t empties = 0;
 	bool closed = false;
 	//! Indices above the ack that carry rows.
-	idx_t open_batches = 0;
+	std::set<idx_t> open_real;
 	//! The answers above the ack: the produced batch, or EMPTY_MARK.
 	std::map<idx_t, idx_t> answers;
+	//! Indices carrying rows that are decided and not yet answered.
+	std::set<idx_t> unanswered;
+	//! When an EMPTY index was first held for an acknowledgement, and for how long.
+	std::map<idx_t, std::pair<uint64_t, uint64_t>> held_since;
+	uint64_t ack_hold_ms = ACK_HOLD_MS;
 };
 
 //! One stream's window: the plan, and the empty batch it answers with. Both are guarded by the
@@ -172,6 +230,12 @@ struct AclQuackFetchWindow {
 //! stream. The seam where a profile per role or token (resource groups) would decide them.
 shared_ptr<AclQuackFetchWindow>
 AclQuackFetchWindowFor(ClientContext &context, const shared_ptr<QuackResultStream> &stream, DatabaseInstance &db);
+
+//! Whether the EMPTY `dense_index` of `stream` may be answered now: the plan's EmptyHold on the steady
+//! clock, held after the producer is done too (the batches below may still be in transit), where a
+//! PRODUCTION hold becomes a poll (ACKNOWLEDGEMENT) since a finished buffer wakes nobody. Under the
+//! stream's serve_lock.
+AclFetchWindowPlan::Hold AclQuackEmptyHold(AclQuackFetchWindow &window, QuackResultStream &stream, idx_t dense_index);
 
 //! A FETCH_RESPONSE payload of one zero-row chunk for the client's index `client_index`, its header
 //! written the way the server writes a produced batch's; `body_start` is where the wire body starts.

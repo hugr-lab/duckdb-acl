@@ -304,7 +304,11 @@ batch (a zero-row chunk the client's scan skips) and the produced batches move t
 decided in index order whatever the arrival order (`AclFetchWindowPlan`, header-only, simulated in
 `test/cpp/test_acl_quack_fetch_window.cpp`), the terminal total counting the empties and no empty
 after the first terminal, so the client's own batch-count check holds; a FETCH > 65536 above the ack
-is refused. The window starts at `acl_quack_fetch_window` (8; 0 = quack's behaviour) and doubles per
+is refused. An empty answer is HELD while a batch with rows below it is unacknowledged - until it is
+produced (a pop wakes it), then until the ack moves or 20 ms (doubling to 500 ms while the ack stays
+stuck): the client's scan threads each claim their own index, and without the hold they spin empty
+FETCHes for as long as a batch takes (a sort: seconds, then MAX_AHEAD fails the query) - #152
+shipped without it, the addendum measures both. The window starts at `acl_quack_fetch_window` (8; 0 = quack's behaviour) and doubles per
 window acknowledged up to `acl_quack_fetch_window_max` (0 = no cap; equal = fixed): LIMIT 1 over 1B
 rows 0.126 s / +55 MiB, the full read unchanged (a fixed 8 halves it - the client decodes a batch per
 thread). Four hunks of the FETCH handler in `sync.py`, the window per stream on the session's

@@ -858,6 +858,7 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			idx_t source_index = dense_index;
 			idx_t empty_batches = 0;
 			auto refused = acl::AclFetchWindowPlan::Kind::BATCH;
+			auto hold = acl::AclFetchWindowPlan::Hold::NONE;
 			{
 				// One critical section for the check, the pop and the retain. A concurrent retry of the
 				// same index cannot reach FINISHED while the first serve runs.
@@ -873,13 +874,23 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 					    answer.kind == acl::AclFetchWindowPlan::Kind::TOO_FAR) {
 						refused = answer.kind;
 					} else if (answer.kind == acl::AclFetchWindowPlan::Kind::EMPTY) {
-						served_batch =
-						    acl::AclQuackEmptyBatch(*window, *stream, fetch_request_message.batch_index, served_start);
-						stream->served.emplace(dense_index,
-						                       QuackResultStream::RetainedPayload {served_batch, served_start, 0});
+						hold = acl::AclQuackEmptyHold(*window, *stream, dense_index);
+						if (hold == acl::AclFetchWindowPlan::Hold::NONE) {
+							served_batch = acl::AclQuackEmptyBatch(*window, *stream, fetch_request_message.batch_index,
+							                                       served_start);
+							stream->served.emplace(dense_index,
+							                       QuackResultStream::RetainedPayload {served_batch, served_start, 0});
+						} else {
+							// held (see the plan): for production, until any pop or the end - never a produced
+							// index this one does not own; for an acknowledgement, a few ms at a time
+							source_index = DConstants::INVALID_INDEX;
+						}
 					} else {
 						source_index = answer.source;
 						status = stream->buffer.TryPopClaimed(source_index, entry);
+						if (status == QuackClaimPopStatus::BATCH || status == QuackClaimPopStatus::FINISHED) {
+							window->plan.Answered(dense_index);
+						}
 						if (status == QuackClaimPopStatus::FINISHED) {
 							// the terminal answer's total counts the empties: no more of them
 							window->plan.Close();
@@ -905,6 +916,10 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			}
 			if (refused == acl::AclFetchWindowPlan::Kind::TOO_FAR) {
 				return make_uniq<ErrorResponse>("FETCH_REQUEST names a batch too far ahead of its acknowledgement");
+			}
+			if (hold == acl::AclFetchWindowPlan::Hold::ACKNOWLEDGEMENT) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(2));
+				continue;
 			}
 			if (served_batch) {
 				// outside serve_lock, because the connection's state lock guards the cache
