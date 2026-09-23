@@ -4,6 +4,8 @@
 // refusal of a non-administrator is tresor's and tested there. Here: the catalog choice, what
 // GRANT / REVOKE SECRET compile to, CREATE / DROP SECRET landing in the service and never in the
 // node's own secret manager, the function gate over a direct call, and no secret value on any event.
+// The secrets are of duckdb's own `http` type: no extension to load, so the distribution build (no
+// httpfs linked) runs this as it is.
 // Build + run via `GEN=ninja make test-cpp`.
 
 #include "acl_test_util.hpp"
@@ -194,23 +196,26 @@ int main(int argc, char *argv[]) {
 		});
 
 		Scenario("CREATE / DROP SECRET land in the service, never in the node's own secret manager", [&] {
-			Exec(con, "ACL ROLE \"keeper\" CREATE SECRET lake_key (TYPE s3, KEY_ID 'AKIA-ID-082', "
-			          "SECRET 'value-that-must-not-leak-082', SCOPE ['s3://lake/a', 's3://lake/b'], REGION 'eu')");
+			Exec(con, "ACL ROLE \"keeper\" CREATE SECRET lake_key (TYPE http, "
+			          "HTTP_PROXY_USERNAME 'AKIA-ID-082', BEARER_TOKEN 'value-that-must-not-leak-082', "
+			          "SCOPE ['s3://lake/a', 's3://lake/b'], VERIFY_SSL true)");
 			Check(One(con, "SELECT storage FROM duckdb_secrets() WHERE name = 'lake_key'") == "corp",
 			      "kept by the service's storage");
 			Check(One(con, "SELECT count(*) FROM duckdb_secrets() WHERE storage <> 'corp'") == "0",
 			      "and nothing in the node's own: " +
 			          One(con, "SELECT string_agg(name || '@' || storage, ',') FROM duckdb_secrets()"));
-			Exec(con, "ACL ROLE \"keeper\" CREATE PERSISTENT SECRET IN corp (TYPE s3, PROVIDER config, KEY_ID 'x')");
-			Check(One(con, "SELECT storage FROM duckdb_secrets() WHERE name = '__default_s3'") == "corp",
+			Exec(con,
+			     "ACL ROLE \"keeper\" CREATE PERSISTENT SECRET IN corp (TYPE http, PROVIDER config, BEARER_TOKEN 'x')");
+			Check(One(con, "SELECT storage FROM duckdb_secrets() WHERE name = '__default_http'") == "corp",
 			      "PERSISTENT ... IN the service, named: the same place");
 			Exec(con, "ACL ROLE \"keeper\" DROP SECRET lake_key");
-			Exec(con, "ACL ROLE \"keeper\" DROP PERSISTENT SECRET __default_s3 FROM corp");
+			Exec(con, "ACL ROLE \"keeper\" DROP PERSISTENT SECRET __default_http FROM corp");
 			Check(One(con, "SELECT count(*) FROM duckdb_secrets()") == "0", "both dropped from the service");
-			Refused(con, "ACL ROLE \"plain\" CREATE SECRET s (TYPE s3, KEY_ID 'k')", "needs the secrets capability");
-			Refused(con, "ACL ROLE \"keeper\" CREATE TEMPORARY SECRET s (TYPE s3, KEY_ID 'k')",
+			Refused(con, "ACL ROLE \"plain\" CREATE SECRET s (TYPE http, BEARER_TOKEN 'k')",
+			        "needs the secrets capability");
+			Refused(con, "ACL ROLE \"keeper\" CREATE TEMPORARY SECRET s (TYPE http, BEARER_TOKEN 'k')",
 			        "a temporary secret is kept by this node");
-			Refused(con, "ACL ROLE \"keeper\" CREATE SECRET s IN memory (TYPE s3, KEY_ID 'k')",
+			Refused(con, "ACL ROLE \"keeper\" CREATE SECRET s IN memory (TYPE http, BEARER_TOKEN 'k')",
 			        "\"memory\" is not a secrets service");
 		});
 
@@ -229,12 +234,13 @@ int main(int argc, char *argv[]) {
 			Exec(con, "ATTACH '' AS vault (TYPE tresor)");
 			Refused(con, "ACL ROLE \"keeper\" ACL GRANT SECRET lake TO ROLE analysts",
 			        "several secrets services are attached to this node (corp, vault)");
-			Refused(con, "ACL ROLE \"keeper\" CREATE SECRET s (TYPE s3, KEY_ID 'k')", "several secrets services");
+			Refused(con, "ACL ROLE \"keeper\" CREATE SECRET s (TYPE http, BEARER_TOKEN 'k')",
+			        "several secrets services");
 			Check(One(con, "ACL ROLE \"keeper\" ACL GRANT SECRET lake TO ROLE analysts FROM vault") == "true",
 			      "FROM names it");
 			auto seen = TakeCalls();
 			Check(!seen.empty() && seen.back() == "grant_secret(lake, role:analysts, [use])", "in vault");
-			Exec(con, "ACL ROLE \"keeper\" CREATE SECRET s IN vault (TYPE s3, KEY_ID 'k')");
+			Exec(con, "ACL ROLE \"keeper\" CREATE SECRET s IN vault (TYPE http, BEARER_TOKEN 'k')");
 			Check(One(con, "SELECT storage FROM duckdb_secrets() WHERE name = 's'") == "vault", "IN names it");
 			Exec(con, "ACL ROLE \"keeper\" DROP SECRET s FROM vault");
 			Exec(con, "DETACH vault");
