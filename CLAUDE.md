@@ -298,7 +298,18 @@ with our default **`acl_quack_target_batch_bytes` = 8 MiB** (quack's is 32) the 
 it did: a quack client keeps 64 FETCHes in flight and waits for all of them before its CANCEL on a
 LIMIT met, so the first answer of a big result costs 64 batches - LIMIT 1 over 1B rows 0.66 s and
 +0.5 GiB at 8 MiB, 2.4 s and +2.3 GiB at 32 (and the client 7.9 GiB; duckdb-quack #277, a client
-fix). The embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
+fix). **Spec 077 - the fetch window** bounds that from the server's side within the protocol: past
+the window's batches with rows above the client's ack, a FETCH is answered at once with an EMPTY
+batch (a zero-row chunk the client's scan skips) and the produced batches move to the next indices -
+decided in index order whatever the arrival order (`AclFetchWindowPlan`, header-only, simulated in
+`test/cpp/test_acl_quack_fetch_window.cpp`), the terminal total counting the empties and no empty
+after the first terminal, so the client's own batch-count check holds; a FETCH > 65536 above the ack
+is refused. The window starts at `acl_quack_fetch_window` (8; 0 = quack's behaviour) and doubles per
+window acknowledged up to `acl_quack_fetch_window_max` (0 = no cap; equal = fixed): LIMIT 1 over 1B
+rows 0.126 s / +55 MiB, the full read unchanged (a fixed 8 halves it - the client decodes a batch per
+thread). Four hunks of the FETCH handler in `sync.py`, the window per stream on the session's
+connection. GLOBAL for now; a profile per role/token (resource groups) is the follow-up.
+The embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
 Streamed ingest
 (`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the
 **client** — `INSERT INTO t SELECT * FROM scan_data_from_quack_client('<id>', NULL::STRUCT(…),

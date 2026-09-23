@@ -21,6 +21,7 @@ machine (`--artifacts` points at a directory holding `duckdb`, `acl.duckdb_exten
 `quack.duckdb_extension`), not for sizing a deployment.
 
 Usage:  test/bench/door_stream.py [--rows 300000000] [--slow-rows 50000000] [--artifacts DIR]
+                                  [--set acl_quack_fetch_window=0 ...]
 """
 
 import argparse
@@ -53,7 +54,8 @@ def artifacts(directory: pathlib.Path) -> tuple:
     return str(duckdb), f"LOAD '{acl}'; LOAD '{quack}';"
 
 
-def server_script(loads: str, port: int, rows: int, slow_rows: int) -> str:
+def server_script(loads: str, port: int, rows: int, slow_rows: int, settings: list) -> str:
+    sets = "".join(f"SET GLOBAL {s};\n" for s in settings)
     return f"""
 {loads}
 ATTACH ':memory:' AS store;
@@ -68,7 +70,7 @@ ACL ADMIN CREATE VIRTUAL VIEW c.slow AS SELECT i, i::VARCHAR AS s FROM range({sl
 ACL ADMIN CREATE ROLE analyst;
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
 SET GLOBAL acl_allow_anonymous_admin=false;
-SELECT acl_quack_serve('quack:localhost:{port}', '{SERVER_TOKEN}');
+{sets}SELECT acl_quack_serve('quack:localhost:{port}', '{SERVER_TOKEN}');
 """
 
 
@@ -132,10 +134,12 @@ def main() -> int:
     ap.add_argument("--label", default="build")
     ap.add_argument("--port", type=int, default=31900)
     ap.add_argument("--json", help="also write the numbers here")
+    ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                    help="a server setting (SET GLOBAL), e.g. acl_quack_fetch_window=0; repeatable")
     args = ap.parse_args()
 
     duckdb, loads = artifacts(pathlib.Path(args.artifacts))
-    results = {"label": args.label, "rows": args.rows, "slow_rows": args.slow_rows}
+    results = {"label": args.label, "rows": args.rows, "slow_rows": args.slow_rows, "settings": args.set}
     q = "SELECT {cols} FROM quack_query('quack:localhost:%d', '{src}', token := '%s')" % (args.port, TOKEN)
     reads = {
         "first": q.format(cols="*", src="SELECT * FROM big") + " LIMIT 1;",
@@ -148,7 +152,7 @@ def main() -> int:
         # are freed, so a second read on the same server would carry the first one's peak
         server = subprocess.Popen([duckdb, "-unsigned"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT, text=True)
-        server.stdin.write(server_script(loads, args.port, args.rows, args.slow_rows))
+        server.stdin.write(server_script(loads, args.port, args.rows, args.slow_rows, args.set))
         server.stdin.flush()
         try:
             wait_ready(duckdb, loads, args.port, server)

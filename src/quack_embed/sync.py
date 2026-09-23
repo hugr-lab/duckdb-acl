@@ -17,8 +17,10 @@ client through APPLY_PATCHES; the embedded server is the same commit and must bu
 same duckdb, so the copies are taken from a scratch copy of the submodule's `src` with those
 patches applied first — the two never diverge, and a patch that stops applying fails the sync.
 PATCHES below are the embed's own: two calls around quack's statement driver - spec 074's profile
-arming before the statement, spec 069's audit hook after it. (From 2026-09-17 to 2026-09-22 the
-driver itself was ours, while duckdb ended a failing delegated query twice - #25887, fixed in #25978.)
+arming before the statement, spec 069's audit hook after it - and spec 077's fetch window in the
+FETCH handler. (From 2026-09-17 to 2026-09-22 the driver itself was ours, while duckdb ended a
+failing delegated query twice - #25887, fixed in #25978.) PRISTINE_GUARDS name quack text acl
+repeats rather than patches (the wire options of the window's empty batch): a change fails the sync.
 
 The http server (acl_quack_http_server.cpp) is NOT generated here: it carries real
 logic changes (TLS, /.well-known, public bind, registry) and is hand-maintained.
@@ -62,7 +64,8 @@ PATCHES = {
         (
             '#include "duckdb/main/client_config.hpp"\n',
             '#include "duckdb/main/client_config.hpp"\n'
-            '#include "acl_quack_embed.hpp"\n',
+            '#include "acl_quack_embed.hpp"\n'
+            '#include "acl_quack_fetch_window.hpp"\n',
         ),
         # The driver is quack's own: MakeQuackFetchCollector, delegated through get_result_collector,
         # carries the first result into the stream from the executor's own sink - parallel, and a full
@@ -101,6 +104,85 @@ PATCHES = {
             "\t\tacl::AclQuackStatementCompleted(*connection.duckdb_connection, connection.session_id, sql, *result);\n"
             "\t\tif (result->HasError()) {\n",
         ),
+        # spec 077, the fetch window: a quack client keeps 64 FETCHes in flight and waits for all of
+        # them before it cancels an early stop, so past `acl_quack_fetch_window` batches above its ack
+        # an index is answered at once by an empty batch (acl_quack_fetch_window.hpp has the plan). The
+        # handler asks the plan which produced batch an index gets - the retry path (`served`), the
+        # pop, the header and the retain stay quack's - and the terminal total counts the empties.
+        (
+            "\t\tauto dense_ack = fetch_request_message.ack_index + stream->prepare_batches;\n",
+            "\t\tauto dense_ack = fetch_request_message.ack_index + stream->prepare_batches;\n"
+            "\t\t// acl (spec 077): past the client's window an index is answered by an empty batch\n"
+            "\t\tauto window = acl::AclQuackFetchWindowFor(*connection.duckdb_connection->context, stream, db);\n",
+        ),
+        (
+            "\t\t\tshared_ptr<MemoryStream> served_batch;\n"
+            "\t\t\tidx_t served_start = 0;\n"
+            "\t\t\t{\n",
+            "\t\t\tshared_ptr<MemoryStream> served_batch;\n"
+            "\t\t\tidx_t served_start = 0;\n"
+            "\t\t\t// acl (spec 077): the produced batch this index gets, and the empties the total counts\n"
+            "\t\t\tidx_t source_index = dense_index;\n"
+            "\t\t\tidx_t empty_batches = 0;\n"
+            "\t\t\tauto refused = acl::AclFetchWindowPlan::Kind::BATCH;\n"
+            "\t\t\t{\n",
+        ),
+        (
+            "\t\t\t\t} else {\n"
+            "\t\t\t\t\tstatus = stream->buffer.TryPopClaimed(dense_index, entry);\n",
+            "\t\t\t\t} else {\n"
+            "\t\t\t\t\tauto answer = window->plan.Decide(dense_index, dense_ack, stream->prepare_batches);\n"
+            "\t\t\t\t\tif (answer.kind == acl::AclFetchWindowPlan::Kind::GONE ||\n"
+            "\t\t\t\t\t    answer.kind == acl::AclFetchWindowPlan::Kind::TOO_FAR) {\n"
+            "\t\t\t\t\t\trefused = answer.kind;\n"
+            "\t\t\t\t\t} else if (answer.kind == acl::AclFetchWindowPlan::Kind::EMPTY) {\n"
+            "\t\t\t\t\t\tserved_batch = acl::AclQuackEmptyBatch(*window, *stream, fetch_request_message.batch_index,\n"
+            "\t\t\t\t\t\t                                      served_start);\n"
+            "\t\t\t\t\t\tstream->served.emplace(dense_index,\n"
+            "\t\t\t\t\t\t                       QuackResultStream::RetainedPayload {served_batch, served_start, 0});\n"
+            "\t\t\t\t\t} else {\n"
+            "\t\t\t\t\t\tsource_index = answer.source;\n"
+            "\t\t\t\t\t\tstatus = stream->buffer.TryPopClaimed(source_index, entry);\n"
+            "\t\t\t\t\t\tif (status == QuackClaimPopStatus::FINISHED) {\n"
+            "\t\t\t\t\t\t\t// the terminal answer's total counts the empties: no more of them\n"
+            "\t\t\t\t\t\t\twindow->plan.Close();\n"
+            "\t\t\t\t\t\t}\n"
+            "\t\t\t\t\t}\n"
+            "\t\t\t\t\tempty_batches = window->plan.EmptyBatches();\n",
+        ),
+        (
+            "\t\t\tif (served_batch) {\n"
+            "\t\t\t\t// outside serve_lock, because the connection's state lock guards the cache\n",
+            "\t\t\tif (refused == acl::AclFetchWindowPlan::Kind::GONE) {\n"
+            "\t\t\t\treturn make_uniq<ErrorResponse>(\"FETCH_REQUEST names a batch the client already acknowledged\");\n"
+            "\t\t\t}\n"
+            "\t\t\tif (refused == acl::AclFetchWindowPlan::Kind::TOO_FAR) {\n"
+            "\t\t\t\treturn make_uniq<ErrorResponse>(\"FETCH_REQUEST names a batch too far ahead of its acknowledgement\");\n"
+            "\t\t\t}\n"
+            "\t\t\tif (served_batch) {\n"
+            "\t\t\t\t// outside serve_lock, because the connection's state lock guards the cache\n",
+        ),
+        (
+            "\t\t\t\t\tresponse->SetTotalBatches(stream->announced_total.GetIndex() - stream->prepare_batches);\n",
+            "\t\t\t\t\tresponse->SetTotalBatches(stream->announced_total.GetIndex() - stream->prepare_batches +\n"
+            "\t\t\t\t\t                          empty_batches);\n",
+        ),
+        (
+            "\t\t\tstream->buffer.WaitForBatch(dense_index);\n",
+            "\t\t\tstream->buffer.WaitForBatch(source_index);\n",
+        ),
+    ],
+}
+
+# Text that must stay as it is in quack's PRISTINE sources, because acl repeats it: the empty batch
+# of spec 077 is a chunk blob serialized with quack's wire options (file-static in quack_message.cpp).
+PRISTINE_GUARDS = {
+    "quack_message.cpp": [
+        "static SerializationOptions QuackWireSerializationOptions() {\n"
+        "\tSerializationOptions options;\n"
+        "\toptions.storage_compatibility = StorageCompatibility::FromIndex(StorageVersion::V2_0_0);\n"
+        "\treturn options;\n"
+        "}\n",
     ],
 }
 
@@ -182,6 +264,11 @@ def main():
         if shutil.which("clang-format"):
             subprocess.run(["clang-format", "-i", str(dest)], check=True)
         print(f"generated {dest.relative_to(ROOT)}")
+    for name, texts in PRISTINE_GUARDS.items():
+        text = (source / name).read_text() if (source / name).exists() else ""
+        for guarded in texts:
+            if guarded not in text:
+                failures.append(f"{name}: acl repeats {guarded.splitlines()[0]!r} and quack changed it - re-audit")
     shutil.rmtree(source.parent, ignore_errors=True)
     if failures:
         print("\nSYNC FAILED:", file=sys.stderr)

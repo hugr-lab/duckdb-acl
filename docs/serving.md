@@ -274,11 +274,32 @@ The embedded server's settings (registered with the door; UBIGINT unless noted):
 | `acl_quack_cache_max_rows` | 100000 | GLOBAL | rows retained in the result cache (0 = unlimited) |
 | `acl_quack_result_ttl` | 3600 | GLOBAL | seconds an idle cached result is kept (0 = never) |
 | `acl_quack_prepare_inline_rows` | 24576 | any | rows returned inline in a PREPARE response |
-| `acl_quack_target_batch_bytes` | 33554432 | any | target size of one wire batch |
+| `acl_quack_target_batch_bytes` | 8388608 | any | target size of one wire batch (quack's own is 32 MiB; spec 063) |
 | `acl_quack_rebalance_buffer_bytes` | 0 | any | pending bytes before producers are gated |
 | `acl_quack_fetch_producer_buffer_bytes` | 268435456 | any | server-side fetch-ahead cap |
+| `acl_quack_fetch_window` | 8 | GLOBAL | batches with rows a client may have in flight when its result starts (0 = no window) |
+| `acl_quack_fetch_window_max` | 0 | GLOBAL | the most the window grows to while the client keeps reading (0 = no cap) |
 | `acl_quack_enable_reconnects` (BOOLEAN) | false | any | keep the last result until acknowledged |
 | `acl_quack_debug_emit_delay_ms` | 0 | any | debug: random delay before a batch is published |
+
+**The fetch window** (spec 077). A quack client keeps its whole read-ahead of FETCHes in flight
+(64 on a 16-core client). When its query stops early, on a `LIMIT` or a cursor closed, it waits for
+all of them before it cancels. Without a window, one `LIMIT 1` over a large result makes the server
+produce and send 64 batches.
+
+The door answers a FETCH past the window with an empty batch: a chunk of zero rows that the client
+skips. The produced batches move to the indices after it, so the client still reads every row once,
+in order. The window starts at `acl_quack_fetch_window` and doubles each time the client acknowledges
+a full window of batches. It stops at `acl_quack_fetch_window_max`, or keeps growing when that is 0.
+So an early stop costs the window a result starts with, while a long read reaches the client's full
+parallelism within a few windows.
+
+- **A fixed window.** Set both settings to the same value to hold a client to that many batches in
+  flight for the whole result. Below the client's cores, a full read slows down, because the client
+  decodes one batch per thread.
+- **No window.** `acl_quack_fetch_window = 0` is quack's own behaviour.
+
+The window works within the protocol and needs nothing from the client. Measurements are in spec 077.
 
 Client recipe: [clients/quack.md](clients/quack.md) (`ATTACH 'quack:<host>:<port>' AS remote (TYPE
 quack, TOKEN '<token>')`, or a secret).
