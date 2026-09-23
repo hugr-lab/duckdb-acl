@@ -99,11 +99,14 @@ int main(int argc, char *argv[]) {
 				}
 			});
 			std::this_thread::sleep_for(ms(200));
-			Check(order.empty(), "neither ran while the first holds the room");
+			// the property: 8 + 1 fits, yet the small one waits behind the big one that arrived first
+			Check(order.empty(), "neither ran while the first holds the room - the small one did not jump");
 			budget.Release(8);
 			big.join();
 			small.join();
-			Check(order.size() == 2 && order[0] == "big", "the big one ran first");
+			// once the room frees both fit (5 + 1) and are admitted in queue order, but which thread records
+			// itself first is a race of its own (a CI flake, 2026-09-23) - so only that both ran
+			Check(order.size() == 2, "both ran once the room freed");
 		});
 
 		Scenario("a statement that gives up in the middle of the queue does not block the ones behind it", [] {

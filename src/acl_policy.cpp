@@ -15,6 +15,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/database_manager.hpp"
 
 #include <chrono>
 #include <random>
@@ -1339,6 +1340,43 @@ bool PolicyStore::PrincipalMainCap(const Principal &principal, const string &cap
 	}
 	// memory mode has no catalog grants, so nothing explicit can sit on one - fail closed
 	return false;
+}
+
+string PolicyStore::SecretService(const string &named) {
+	vector<string> services;
+	auto db = instance.lock();
+	if (db) {
+		for (auto &attached : DatabaseManager::Get(*db).GetDatabases()) {
+			if (!attached->IsSystem() && !attached->IsTemporary() &&
+			    attached->GetCatalog().GetCatalogType() == "tresor") {
+				services.push_back(attached->GetName().GetIdentifierName());
+			}
+		}
+	}
+	std::sort(services.begin(), services.end());
+	if (!named.empty()) {
+		for (auto &service : services) {
+			if (StringUtil::CIEquals(service, named)) {
+				return service;
+			}
+		}
+		NoteDenyReason(Reason::UNAVAILABLE);
+		throw BinderException("acl: \"%s\" is not a secrets service attached to this node - secrets are managed "
+		                      "through the ACL only in a catalog of type tresor",
+		                      named);
+	}
+	if (services.empty()) {
+		NoteDenyReason(Reason::UNAVAILABLE);
+		throw BinderException("acl: no secrets service is attached to this node (a catalog of type tresor) - "
+		                      "secrets are not managed through the ACL here");
+	}
+	if (services.size() > 1) {
+		NoteDenyReason(Reason::STATEMENT_TYPE);
+		throw BinderException("acl: several secrets services are attached to this node (%s) - name one: "
+		                      "IN <catalog> (CREATE SECRET), FROM <catalog> (DROP / GRANT / REVOKE SECRET)",
+		                      StringUtil::Join(services, ", "));
+	}
+	return services[0];
 }
 
 bool PolicyStore::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {

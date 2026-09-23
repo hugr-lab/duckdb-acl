@@ -295,6 +295,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	auto pipeline = make_shared_ptr<acl::AuditPipeline>(hooks);
 	pipeline->Attach(db);
 	store->audit = pipeline;
+	store->instance = db.shared_from_this();
 	if (!contract_mismatch.empty()) {
 		// the full reason, once, where the operator reads refusals (the ring, the file, a sink of ours)
 		store->AuditPolicy("contract_mismatch", contract_mismatch);

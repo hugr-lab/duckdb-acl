@@ -1485,6 +1485,121 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 	return statements;
 }
 
+//===--------------------------------------------------------------------===//
+// The node's secrets service (spec 082)
+//===--------------------------------------------------------------------===//
+
+bool IsSecretsStart(const string &text) {
+	AdminScanner scanner(text);
+	if (!scanner.Accept("grant") && !scanner.Accept("revoke")) {
+		return false; // never throws: it only decides which grammar the text is
+	}
+	return StringUtil::CIEquals(scanner.PeekWord(), "secret");
+}
+
+namespace {
+
+//! A name as written: quoted (either quote) or a bare word
+string SecretsName(AdminScanner &s, const char *what) {
+	s.Skip();
+	if (s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"')) {
+		return s.Quoted(what);
+	}
+	return s.Word(what);
+}
+
+//! `GRANT SECRET <name> TO ROLE|GROUP <principal> [FROM|IN <catalog>]` /
+//! `REVOKE SECRET <name> FROM ROLE|GROUP <principal> [FROM|IN <catalog>]` ->
+//! `SELECT * FROM <catalog>.main.grant_secret('<name>', 'role:<r>', ['use'])` /
+//! `... revoke_secret('<name>', 'role:<r>')` - the service's own calls (tresor spec 009), which it
+//! refuses to anyone it does not know as an administrator.
+struct SecretsStatement {
+	bool grant = false;
+	string name;
+	string principal;
+	string named; // the catalog the statement names ('' = none)
+};
+
+SecretsStatement ParseSecretsStatement(AdminScanner &s) {
+	SecretsStatement out;
+	auto verb = StringUtil::Lower(s.Word("GRANT or REVOKE"));
+	bool grant = verb == "grant";
+	out.grant = grant;
+	s.Expect("secret");
+	auto name = SecretsName(s, "secret name");
+	s.Expect(grant ? "to" : "from");
+	string kind;
+	if (s.Accept("role")) {
+		kind = "role";
+	} else if (s.Accept("group")) {
+		kind = "group";
+	} else {
+		throw BinderException("acl admin: a secret is granted to a ROLE or a GROUP, never to one user");
+	}
+	out.name = name;
+	out.principal = kind + ":" + SecretsName(s, "role or group");
+	if (s.Accept("from") || s.Accept("in")) {
+		out.named = SecretsName(s, "catalog");
+	}
+	return out;
+}
+
+unique_ptr<SQLStatement> CompileSecretsStatement(const SecretsStatement &parsed, PolicyStore &store) {
+	auto service = store.SecretService(parsed.named);
+	bool grant = parsed.grant;
+	auto &name = parsed.name;
+	auto &principal = parsed.principal;
+
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(ConstantExpression::FromValue(Value(name)));
+	children.push_back(ConstantExpression::FromValue(Value(principal)));
+	if (grant) {
+		children.push_back(ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, {Value("use")})));
+	}
+	auto call = grant ? "grant_secret" : "revoke_secret";
+	auto function = make_uniq<FunctionExpression>(Identifier(call), std::move(children));
+	function->SetQualifiedName(Identifier(service), Identifier("main"), Identifier(call));
+	auto node = make_uniq<SelectNode>();
+	node->select_list.push_back(make_uniq<StarExpression>());
+	auto ref = make_uniq<TableFunctionRef>();
+	ref->function = std::move(function);
+	node->from_table = std::move(ref);
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(node);
+	return std::move(statement);
+}
+
+} // namespace
+
+vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicyStore &store) {
+	// the whole batch is read before any service is chosen: a malformed batch says so first
+	vector<SecretsStatement> parsed;
+	AdminScanner scanner(text);
+	while (!scanner.Done()) {
+		if (scanner.AtSemicolon()) {
+			scanner.pos++;
+			continue;
+		}
+		auto at = scanner.pos;
+		if (!IsSecretsStart(text.substr(at))) {
+			throw BinderException("acl admin: a GRANT / REVOKE SECRET batch holds nothing else");
+		}
+		parsed.push_back(ParseSecretsStatement(scanner));
+		scanner.Skip();
+		if (scanner.pos < text.size() && text[scanner.pos] != ';') {
+			throw BinderException("acl admin: unexpected trailing text at position %llu", scanner.pos);
+		}
+	}
+	vector<unique_ptr<SQLStatement>> statements;
+	for (auto &statement : parsed) {
+		statements.push_back(CompileSecretsStatement(statement, store));
+	}
+	if (statements.empty()) {
+		throw BinderException("acl admin: empty management batch");
+	}
+	return statements;
+}
+
 //! Authorize a management batch against the principal's rights (spec 009). A catalog-scoped MANAGE
 //! edits the content of its own catalogs; handing out access or admin scopes is privilege
 //! administration and needs an unrestricted manage / passthrough. PASSTHROUGH may do anything.

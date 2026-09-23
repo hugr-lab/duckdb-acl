@@ -301,6 +301,8 @@ struct PolicyStore {
 	unordered_map<string, Session> sessions;
 	//! The audit pipeline of this instance (spec 069); set at load, before anything serves
 	shared_ptr<AuditPipeline> audit;
+	//! The instance, set at load (spec 082): what the parse path reads the attached catalogs from
+	weak_ptr<DatabaseInstance> instance;
 	//! The audit registry the pipeline drains and the doors register their gauges on (spec 069):
 	//! the instance's shared one, or a private one when the shared one was stamped with another
 	//! contract version (AuditHooks::Reach). Set at load before the doors register.
@@ -545,6 +547,11 @@ struct PolicyStore {
 	//! catalog, like the rest of the served story.
 	bool PrincipalMainCap(const Principal &principal, const string &capability);
 	bool CatalogPrincipalMainCap(const Principal &principal, const string &capability);
+
+	//! spec 082: the node's secrets service a statement acts on - an attached catalog of type
+	//! `tresor`. `named` (the statement's IN / FROM, '' when none) must be one; unnamed, exactly one
+	//! must be attached. Anything else throws, with the reason noted, and says what to write.
+	string SecretService(const string &named);
 
 	//! Verify a principal offline. A JWT-shaped token goes through real signature verification against
 	//! the issuer registry (spec 007, throws with a specific reason on failure); a non-JWT token is a

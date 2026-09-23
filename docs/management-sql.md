@@ -401,7 +401,8 @@ The grant that makes a catalog resolve for a role. Clauses after the role come i
   nothing holds every data capability - `select`, `insert`, `update`, `delete`, `merge` - and never
   `manage`; `CAPS '{}'` holds none. The capabilities outside that default are explicit-only and never
   implied: `manage` (administer this catalog, see below), `create`/`drop` (create/drop schemas in it),
-  `temp` (session temp tables on the Flight door) and `explain` (EXPLAIN), each held only when named.
+  `temp` (session temp tables on the Flight door), `explain` (EXPLAIN) and `secrets` (the node's
+  secrets service, see below), each held only when named.
   An unknown name is stored as written and enforces nothing.
 - **`MAIN`** marks the catalog whose objects the role addresses unqualified. A principal with more than
   one main catalog across its roles resolves only qualified names.
@@ -550,6 +551,40 @@ The bulk form is the native mode: `ACL NATIVE SELECT acl_function_category_add('
 FROM duckdb_functions() WHERE function_name LIKE 'myext_%';`. A category acts in every catalog a role
 holds, so these statements take an unrestricted `manage` scope - a catalog-scoped one is refused as
 "not catalog-specific".
+
+## Secrets
+
+The node's secrets are kept by a secrets service attached to it - a catalog of type `tresor`
+(`ATTACH 'tresor:<host>' AS corp`) - never by the node's own secret manager. A principal manages them
+under the explicit **`secrets`** capability of its MAIN catalog grant (`WITH (select, secrets) MAIN`);
+an administration scope does not include it (spec 082):
+
+```sql
+ACL GRANT  SECRET <name> TO   ROLE | GROUP <principal> [FROM | IN <catalog>]
+ACL REVOKE SECRET <name> FROM ROLE | GROUP <principal> [FROM | IN <catalog>]
+CREATE [PERSISTENT] SECRET [<name>] [IN <catalog>] (TYPE …, …)
+DROP [PERSISTENT] SECRET <name> [FROM <catalog>]
+```
+
+- **The catalog** is the one written, which must be a secrets service; otherwise the one attached. None,
+  or several unnamed, is refused with what to write.
+- **GRANT / REVOKE SECRET** follow the principal prefix with the `ACL` marker (`ACL TOKEN '…' ACL GRANT
+  SECRET …`; unmarked after the gateway's `ACL ADMIN`) and compile to the service's own calls,
+  `<catalog>.main.grant_secret('<name>', 'role:<r>', ['use'])` / `revoke_secret(…)`. A secret is granted
+  to a role or a group, never to one user, and only its use. A batch holds nothing else.
+- **CREATE / DROP SECRET** keep the secret in the service. `TEMPORARY` is refused (a temporary secret
+  would serve every statement on the node after it), and so is any storage that is not a service.
+  A secret's parameters are constants - literals and lists of them: duckdb evaluates them on the node,
+  so a call there (`SECRET getenv('…')`) would store what the node knows.
+- **The service decides too.** It manages only for a principal it knows as an administrator (tresor's
+  spec 009); the capability is acl's half of the gate.
+- **A direct call** into the service catalog (`corp.whoami()`, `corp.main.secrets()`) is the function
+  gate's like any other: the operator puts what a role may call in a category - `ALTER FUNCTION CATEGORY
+  secrets_service ADD (corp.main.whoami TABLE, corp.main.secrets TABLE)` - and grants it. Manage through
+  the statements above, which also need `secrets`, rather than by categorizing `grant_secret`. quack's
+  own `whoami()` (the system catalog's) stays never callable.
+- No secret value is written to an audit or profile event: a decision names the service and the
+  secret's name with capability `secrets`.
 
 ## Administration scopes
 

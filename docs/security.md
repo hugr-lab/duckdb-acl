@@ -189,7 +189,7 @@ mode of default-deny is a refusal, and the refusal names the function.
 | --- | --- |
 | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE INTO` | rewritten (sections above) |
 | `EXPLAIN [ANALYZE]` | needs the explicit `explain` capability on the MAIN grant, then the inner statement is rewritten (spec 052) |
-| `CREATE`, `DROP` | tables and views only, under `create`/`drop`/`temp` (above) |
+| `CREATE`, `DROP` | tables and views under `create`/`drop`/`temp` (above); `SECRET` under the explicit `secrets` capability, kept only in the attached secrets service - never `TEMPORARY`, constant parameters only (spec 082) |
 | `PRAGMA` | `table_info`, `show_tables` answered; the rest denied by name (spec 031) |
 | `SET` / `RESET` | `TimeZone`, `Calendar` only, session scope, constant value, only on an `ACL SESSION` connection (spec 068) |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | pass through: "they are session control, not access" |
