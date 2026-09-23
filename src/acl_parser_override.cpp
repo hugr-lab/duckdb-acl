@@ -551,9 +551,14 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		audit.phase = Reason::PARSE;
 		auto statements = ParseSecretsBatch(prefix.rest, store);
 		for (auto &stmt : statements) {
+			// the execution must find its decision (spec 074's note, matched by the text the statement
+			// carries): that note is what puts the session on the connection while the service's call
+			// runs (spec 078) - without it the call reaches the service as the node's own work
+			stmt->query = stmt->ToString();
 			audit.trail.statements.emplace_back();
 			audit.trail.statements.back().statement = "secrets";
 			audit.trail.statements.back().objects.push_back(AuditObject {MgmtCallName(*stmt), "secrets"});
+			audit.trail.statements.back().text_hash = StatementTextHash(stmt->query);
 		}
 		return ParserOverrideResult(std::move(statements));
 	}
@@ -606,9 +611,15 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	}
 
 	if (mode == AclPrefix::Mode::NATIVE) {
-		if (!statements.empty()) {
-			// spec 074: the batch's one entry is its first statement's execution
-			audit.trail.statements.back().text_hash = StatementTextHash(statements[0]->query);
+		// spec 074 / 078: each statement's execution finds its decision by its text - the note is also
+		// what shows the session on the connection while it runs, so a statement of the batch past the
+		// first must not run as the node's own work (spec 083): one entry per statement
+		for (idx_t i = 0; i < statements.size(); i++) {
+			if (i > 0) {
+				audit.trail.statements.emplace_back();
+				audit.trail.statements.back().statement = "native";
+			}
+			audit.trail.statements.back().text_hash = StatementTextHash(statements[i]->query);
 		}
 		return ParserOverrideResult(std::move(statements)); // no rewrite: the native context
 	}
