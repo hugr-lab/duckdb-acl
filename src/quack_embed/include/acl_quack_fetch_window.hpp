@@ -14,8 +14,11 @@
 // and ask again - and with the ack stuck below the batch still on its way, every new index is empty
 // too, so the client would spin FETCHes for as long as that batch takes (a sort before its first
 // batch: seconds; past MAX_AHEAD the query fails). Two holds, neither waiting on the client alone:
-//   - PRODUCTION: a batch with rows below is not yet answered (being produced). Released by the
-//     server's own progress - the batch is answered when it exists.
+//   - PRODUCTION: a batch with rows below is not yet answered, and its FETCH is here, waiting for
+//     the producer. Released by the server's own progress - the batch is answered when it exists.
+//     A batch below whose FETCH has not arrived is held for on a timer, like an acknowledgement:
+//     at the server's connection cap that FETCH may have been shed, and the client retries or fails
+//     it - an empty answer waiting on it with no timer would hang until the client's read timeout.
 //   - ACKNOWLEDGEMENT: the batches below are answered but not acknowledged (in transit, or the
 //     client stopped). Released by the ack a reading client sends as soon as it consumes the batch,
 //     or after a time: a client that stopped early sends no more FETCHes and waits for these answers
@@ -112,6 +115,7 @@ public:
 					open_real.erase(it->first);
 					acked_batches++;
 					unanswered.erase(it->first);
+					arrived.erase(it->first);
 				}
 				held_since.erase(it->first);
 				it = answers.erase(it);
@@ -145,12 +149,16 @@ public:
 		if (entry->second == EMPTY_MARK) {
 			return Answer {Kind::EMPTY, 0};
 		}
+		if (unanswered.count(index)) {
+			arrived.insert(index); // its FETCH is here: what is left is the producer's
+		}
 		return Answer {Kind::BATCH, entry->second};
 	}
 
 	//! The index carrying rows has been answered: its batch served, or the terminal sent.
 	void Answered(idx_t index) {
 		unanswered.erase(index);
+		arrived.erase(index);
 	}
 
 	//! Whether an EMPTY index may be answered now (`now_ms` on any monotonic clock).
@@ -159,8 +167,17 @@ public:
 			held_since.erase(index);
 			return Hold::NONE; // every batch with rows below it is acknowledged
 		}
-		if (!unanswered.empty() && *unanswered.begin() < index) {
-			return Hold::PRODUCTION;
+		bool below = false;
+		bool all_here = true;
+		for (auto real : unanswered) {
+			if (real >= index) {
+				break;
+			}
+			below = true;
+			all_here = all_here && arrived.count(real) > 0;
+		}
+		if (below && all_here) {
+			return Hold::PRODUCTION; // every batch below is requested and waiting for the producer
 		}
 		// the hold's length is fixed when it starts, so the indices held together are released together
 		auto held = held_since.emplace(index, std::make_pair(now_ms, ack_hold_ms)).first->second;
@@ -209,7 +226,9 @@ private:
 	std::map<idx_t, idx_t> answers;
 	//! Indices carrying rows that are decided and not yet answered.
 	std::set<idx_t> unanswered;
-	//! When an EMPTY index was first held for an acknowledgement, and for how long.
+	//! Indices carrying rows whose own FETCH has arrived (and is not answered yet).
+	std::set<idx_t> arrived;
+	//! When an EMPTY index was first held on a timer, and for how long.
 	std::map<idx_t, std::pair<uint64_t, uint64_t>> held_since;
 	uint64_t ack_hold_ms = ACK_HOLD_MS;
 };

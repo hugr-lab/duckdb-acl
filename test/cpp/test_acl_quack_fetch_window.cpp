@@ -45,6 +45,8 @@ struct Sim {
 	idx_t threads = 1;       // scan threads, each with its own claimed index
 	idx_t produce_every = 0; // steps per produced batch (0 = everything is produced at once)
 	bool hold = true;        // the server holds an empty answer below an unacknowledged batch with rows
+	idx_t shed_every = 0;    // the server drops every Nth request it takes (a full worker pool), and
+	idx_t retry_after = 300; // the client sends it again this many steps later
 	uint32_t seed = 1;
 };
 
@@ -81,6 +83,7 @@ Outcome Run(const Sim &sim) {
 	// the wire
 	struct Request {
 		idx_t index, ack;
+		idx_t ready_at = 0; // a shed request comes back at this step
 	};
 	struct Response {
 		idx_t index;
@@ -100,7 +103,7 @@ Outcome Run(const Sim &sim) {
 	};
 	auto top_up = [&]() {
 		while (!no_more && !stopped && outstanding < sim.depth) {
-			requests.push_back(Request {next_request++, contiguous()});
+			requests.push_back(Request {next_request++, contiguous(), 0});
 			outstanding++;
 			out.fetches++;
 		}
@@ -136,6 +139,7 @@ Outcome Run(const Sim &sim) {
 		}
 	};
 
+	idx_t taken = 0;
 	for (idx_t step = 0; step < 4000000; step++) {
 		if (sim.produce_every && step % sim.produce_every == 0 && produced < sim.total) {
 			produced++;
@@ -154,6 +158,14 @@ Outcome Run(const Sim &sim) {
 			for (idx_t n = 0; n < requests.size() && !served; n++) {
 				auto pick = (offset + n) % requests.size();
 				auto request = requests[pick];
+				if (request.ready_at > step) {
+					continue; // shed: the client has not sent it again yet
+				}
+				if (sim.shed_every && ++taken % sim.shed_every == 0) {
+					requests[pick].ready_at = step + sim.retry_after; // dropped before the handler saw it
+					served = true;
+					break;
+				}
 				auto dense = request.index + sim.first;
 				auto answer = plan.Decide(dense, request.ack + sim.first, sim.first);
 				if (answer.kind == Kind::GONE || answer.kind == Kind::TOO_FAR) {
@@ -352,6 +364,40 @@ int main() {
 				Check(spun.refused || spun.fetches > 5 * held.fetches,
 				      label + ", without the hold: the client spins (" + std::to_string(spun.fetches) + " FETCHes" +
 				          (spun.refused ? ", refused past MAX_AHEAD" : "") + ")");
+			}
+		});
+
+		Scenario("a batch whose FETCH never arrived holds the empties above it on a timer, not forever", [] {
+			// at the connection cap a FETCH can be shed before any handler sees it: an empty answer
+			// waiting on that batch's production would wait for a FETCH that may never come
+			AclFetchWindowPlan plan(2, 2);
+			Check(plan.Decide(3, 0, 0).kind == Kind::EMPTY, "3 is past the window");
+			Check(plan.EmptyHold(3, 1000) == AclFetchWindowPlan::Hold::ACKNOWLEDGEMENT,
+			      "1 and 2 were never requested here: a timed hold");
+			Check(plan.EmptyHold(3, 1000 + AclFetchWindowPlan::ACK_HOLD_MS) == AclFetchWindowPlan::Hold::NONE,
+			      "...that runs out");
+			plan.Decide(1, 0, 0);
+			plan.Decide(2, 0, 0);
+			Check(plan.Decide(4, 0, 0).kind == Kind::EMPTY, "4 is past the window too");
+			Check(plan.EmptyHold(4, 5000) == AclFetchWindowPlan::Hold::PRODUCTION,
+			      "1 and 2 are requested and not produced: the producer's hold, no timer");
+			plan.Answered(1);
+			plan.Answered(2);
+			Check(plan.EmptyHold(4, 5000) == AclFetchWindowPlan::Hold::ACKNOWLEDGEMENT,
+			      "answered, not acknowledged: the timed hold again");
+			// and a whole stream with a server that sheds one request in seven, the client re-sending
+			for (idx_t threads : {1, 16}) {
+				for (uint32_t seed = 1; seed <= 8; seed++) {
+					Sim sim;
+					sim.depth = 16, sim.start = 2, sim.total = 150, sim.threads = threads, sim.produce_every = 5;
+					sim.shed_every = 7, sim.seed = seed;
+					auto out = Run(sim);
+					if (!Check(!out.refused && ReadsEverythingInOrder(out, 0, 150) && out.pushed == out.expected_total,
+					           "a shedding server: every batch, in order, the count holds (" + std::to_string(threads) +
+					               " threads, seed " + std::to_string(seed) + ")")) {
+						return;
+					}
+				}
 			}
 		});
 
