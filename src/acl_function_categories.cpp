@@ -32,7 +32,7 @@ string FunctionKey::Serialize() const {
 	       "\x1f" + FunctionKindName(kind);
 }
 
-bool FunctionNeverCallable(const string &name) {
+bool FunctionNeverCallable(const string &name, const string &database) {
 	// the extension's own surface, the lakehouse's, the door's, unity catalog's - and the optimizer's
 	// own helpers, which no statement spells by name
 	for (auto prefix : {"acl_", "ducklake_", "quack_", "uc_", "__internal_"}) {
@@ -44,11 +44,13 @@ bool FunctionNeverCallable(const string &name) {
 	static const case_insensitive_set_t NAMES = {
 	    "arrow_scan", "arrow_scan_dumb", "seq_scan", "query", "query_table", "json_execute_serialized_sql", "tpch",
 	    "tpcds", "sqlsmith", "fuzzyduck", "reduce_sql_statement", "fuzz_all_functions", "scan_data_from_quack_client",
-	    "whoami",
 	    // the engine's own: how it invokes, combines and
 	    // finalizes, and what a mask says with error()
 	    "error", "constant_or_null", "create_sort_key", "invoke", "combine", "finalize", "to_aggregate_state"};
 	if (NAMES.count(name)) {
+		return true;
+	}
+	if (FunctionNeverOnlyInSystem(name) && (database.empty() || StringUtil::CIEquals(database, "system"))) {
 		return true;
 	}
 	// a scanner's SQL-under-the-node's-credentials and connection surface: <scanner>_query, _execute,
@@ -75,6 +77,12 @@ bool FunctionNeverCallable(const string &name) {
 		}
 	}
 	return false;
+}
+
+bool FunctionNeverOnlyInSystem(const string &name) {
+	// quack's whoami() - the node's identity settings - is the system catalog's; a secrets service's
+	// whoami() in its own attached catalog (tresor, spec 082) is not this function
+	return name == "whoami";
 }
 
 string FunctionDecision::Why(const string &label) const {
@@ -364,11 +372,18 @@ FunctionDecision FunctionCategoryModel::Resolve(const vector<string> &roles, con
 	out.key.kind = kind;
 	out.key.database = "system";
 	out.key.schema = "main";
-	if (FunctionNeverCallable(name)) {
+	if (FunctionNeverCallable(name) && !FunctionNeverOnlyInSystem(name)) {
 		out.verdict = FunctionVerdict::NEVER;
 		out.decided_by = "never";
 		return out;
 	}
+	// a name that is never only as the system catalog's is judged on the key it resolves to
+	auto never_by_key = [&]() {
+		if (FunctionNeverCallable(out.key.name, out.key.database)) {
+			out.verdict = FunctionVerdict::NEVER;
+			out.decided_by = "never";
+		}
+	};
 	auto &by_kind = ByKind(kind);
 	auto entry = by_kind.find(name);
 	auto &path = written.Path();
@@ -394,6 +409,17 @@ FunctionDecision FunctionCategoryModel::Resolve(const vector<string> &roles, con
 					found = &candidate;
 				}
 			}
+			if (!found && catalog.empty()) {
+				// `x.f` where x is no schema of a member: duckdb reads it as database x's default schema
+				// too (spec 082 - `corp.whoami()` of an attached service)
+				for (auto &candidate : entry->second) {
+					if (StringUtil::CIEquals(candidate.key.database, schema) &&
+					    StringUtil::CIEquals(candidate.key.schema, "main")) {
+						found = &candidate;
+						break;
+					}
+				}
+			}
 		}
 		if (!found) {
 			out.verdict = FunctionVerdict::UNKNOWN_QUALIFIED;
@@ -403,11 +429,13 @@ FunctionDecision FunctionCategoryModel::Resolve(const vector<string> &roles, con
 			return out;
 		}
 		Judge(roles, *found, out);
+		never_by_key();
 		return out;
 	}
 	if (entry == by_kind.end() || entry->second.empty()) {
 		out.verdict = FunctionVerdict::UNCATEGORIZED;
 		out.decided_by = "none";
+		never_by_key(); // a bare name nobody categorized is the system catalog's
 		return out;
 	}
 	// a bare name: the best-ranked candidate; two equally ranked non-system ones are ambiguous
@@ -430,6 +458,7 @@ FunctionDecision FunctionCategoryModel::Resolve(const vector<string> &roles, con
 		return out;
 	}
 	Judge(roles, *best, out);
+	never_by_key();
 	return out;
 }
 

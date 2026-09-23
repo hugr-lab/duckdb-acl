@@ -503,6 +503,10 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		mode = AclPrefix::Mode::MANAGE;
 	}
 
+	// spec 082: GRANT / REVOKE SECRET manage the node's secrets service, not the ACL - judged by the
+	// explicit `secrets` capability below, never by an administration scope
+	bool secrets = mode == AclPrefix::Mode::MANAGE && IsSecretsStart(prefix.rest);
+
 	Principal principal;
 	PolicyStore::AdminRights rights;
 	rights.scope = AdminScope::PASSTHROUGH; // the anonymous hatch is god mode by definition
@@ -514,6 +518,16 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 			NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
 			throw BinderException("acl admin: a bare ACL ADMIN is disabled - authenticate the principal "
 			                      "(ACL TOKEN '<jwt>' ACL ...) or SET GLOBAL acl_allow_anonymous_admin=true");
+		}
+	} else if (secrets) {
+		audit.phase = Reason::PRINCIPAL;
+		ResolvePrincipal(store, prefix, principal);
+		audit.proto.principal = principal;
+		audit.proto.detail = "secrets";
+		if (!store.PrincipalMainCap(principal, "secrets")) {
+			NoteDenyReason(Reason::CAPABILITY);
+			throw BinderException("acl: managing secrets needs the secrets capability - granted by name on the "
+			                      "principal's MAIN catalog grant, never implied");
 		}
 	} else if (mode != AclPrefix::Mode::QUERY) {
 		// leaving the virtual catalog - as management or as native SQL - is a granted capability
@@ -531,6 +545,18 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		audit.proto.kind = "admin"; // management, or native SQL outside the virtual catalog
 	}
 
+	if (secrets) {
+		// compiled to the service catalog's own calls, which the service authorizes once more: it
+		// manages only for a principal it knows as an administrator (tresor spec 009)
+		audit.phase = Reason::PARSE;
+		auto statements = ParseSecretsBatch(prefix.rest, store);
+		for (auto &stmt : statements) {
+			audit.trail.statements.emplace_back();
+			audit.trail.statements.back().statement = "secrets";
+			audit.trail.statements.back().objects.push_back(AuditObject {MgmtCallName(*stmt), "secrets"});
+		}
+		return ParserOverrideResult(std::move(statements));
+	}
 	if (mode == AclPrefix::Mode::MANAGE) {
 		// the management grammar (spec 008): compiled to admin-function calls, no native parse
 		audit.phase = Reason::PARSE;

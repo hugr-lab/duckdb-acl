@@ -747,7 +747,7 @@ FunctionSpec ParseFunctionSpec(const string &spec_p, const char *fn) {
 	key.name = StringUtil::Lower(key.name);
 	key.database = StringUtil::Lower(key.database);
 	key.schema = StringUtil::Lower(key.schema);
-	if (FunctionNeverCallable(key.name)) {
+	if (FunctionNeverCallable(key.name, key.database)) {
 		throw BinderException("%s: \"%s\" is never callable under a principal - it runs SQL past the rewriter or "
 		                      "reads memory by pointer - and only ACL NATIVE may run it; no category or grant "
 		                      "can hold it",

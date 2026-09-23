@@ -583,8 +583,8 @@ denied to a principal.
   new sessions, not open ones; `every_use` ends them at the next statement at the price of long tokens
   or reconnects.
 - **Explicit capabilities only where meant.** `temp` (session temp tables), `explain` (a plan names
-  physical objects), `create`/`drop` (ingest create/replace, staging) are never in the unstated
-  default; grant them by name.
+  physical objects), `create`/`drop` (ingest create/replace, staging), `secrets` (the attached secrets
+  service, spec 082) are never in the unstated default; grant them by name.
 - **Stop before close.** Drain, watch, kill stragglers, stop the doors, then close duckdb.
 - **A ready node to look at**: `test/live/serve.sh [flight|quack|all] [--tls]` seeds a demo policy
   and prints URIs and tokens; `test/live/RUNBOOK.md` walks DBeaver, ADBC and a quack client through it

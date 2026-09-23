@@ -233,8 +233,9 @@ unique_ptr<GlobalTableFunctionState> AclFunctionsInit(ClientContext &context, Ta
 		for (auto &category : categories) {
 			category_values.emplace_back(category);
 		}
-		string status =
-		    FunctionNeverCallable(key.name) ? "never" : (categories.empty() ? "uncategorized" : "categorized");
+		string status = FunctionNeverCallable(key.name, key.database)
+		                    ? "never"
+		                    : (categories.empty() ? "uncategorized" : "categorized");
 		Value allowed;
 		Value decided_by;
 		if (bind.with_role) {

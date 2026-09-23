@@ -48,8 +48,13 @@ struct FunctionKey {
 //! The set that is never callable under a principal, whatever the data says: each of these either
 //! runs SQL past the rewriter - here or on another server under the node's credentials - or
 //! dereferences a pointer. Whoever needs one needs ACL NATIVE, and has it. In code, not in data, so
-//! that no grant can re-open one (the review's finding on arrow_scan, kept).
-bool FunctionNeverCallable(const string &lowered_name);
+//! that no grant can re-open one (the review's finding on arrow_scan, kept). `database` is the key's
+//! ('' = the system catalog): a few names are never only as the system catalog's - quack's
+//! `whoami()` - and an attached catalog's function of that name (tresor's) is categorized like any
+//! other (spec 082).
+bool FunctionNeverCallable(const string &lowered_name, const string &database = string());
+//! Whether `lowered_name` is never callable only as the system catalog's (quack's `whoami`)
+bool FunctionNeverOnlyInSystem(const string &lowered_name);
 
 enum class FunctionVerdict : uint8_t {
 	ADMITTED,          // call it, qualified to `key`

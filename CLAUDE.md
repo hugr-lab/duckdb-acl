@@ -122,8 +122,8 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
   row with NULL/empty caps — means `select, insert, update, delete, merge`, never `manage`; an
   explicit `'{}'` means none. An *object* grant that states nothing inherits the catalog grant's caps,
   so a refinement never widens by omission. The capabilities *outside* that default are explicit-only
-  and never inherited: `create`/`drop` on a schema (spec 016/051), `temp` (spec 050) and `explain`
-  (spec 052) on the MAIN catalog grant — each granted by name or not held.
+  and never inherited: `create`/`drop` on a schema (spec 016/051), `temp` (spec 050), `explain`
+  (spec 052) and `secrets` (spec 082) on the MAIN catalog grant — each granted by name or not held.
 - **A grant's predicate confines writes too** (spec 024): it is AND-ed into the read/write `WHERE` and
   also checked against the row being written — an `INSERT`/`UPDATE`/`MERGE` that would leave a row
   outside the principal's slice is refused where the value is written (`error()` inside a `CASE`). An
@@ -389,6 +389,17 @@ default-denied (unenumerable ⇒ unconfinable); under `ACL NATIVE` — works, ga
 scope, never the syntax. Grammar-extension registration is not exposed upstream yet; when it lands,
 extended-grammar AST flows through the same inner parse (walked or denied per node) and the prefix
 itself becomes a grammar rule (design/014 spike; the upstream question is design/011/QUESTION.md).
+
+**Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
+attached catalog of type `tresor`, never its own secret manager. Under the explicit `secrets`
+capability of the MAIN grant (never implied, not by `manage` either): `ACL GRANT|REVOKE SECRET n TO|FROM
+ROLE|GROUP p [FROM|IN c]` compiles in `Prefixed` (ahead of the admin-scope check) to
+`c.main.grant_secret('n','role:p',['use'])` / `revoke_secret`; `CREATE [PERSISTENT] SECRET` / `DROP
+SECRET` are retargeted to the service (`TEMPORARY` refused, parameters constants only - duckdb evaluates
+calls there on the node). `PolicyStore::SecretService(named)` picks the catalog (named, else the one
+attached; none/several refused with what to write) from the instance the store keeps since load. A
+direct `corp.whoami()` is the function gate's (a category the operator grants); `whoami` is never only
+as the system catalog's (quack's), and the resolver reads `x.f` as `x.main.f` when x is no schema.
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant

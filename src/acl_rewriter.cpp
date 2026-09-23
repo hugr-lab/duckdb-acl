@@ -23,7 +23,10 @@
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
+#include "duckdb/parser/parsed_data/create_secret_info.hpp"
+#include "duckdb/parser/parsed_data/extra_drop_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_type_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
@@ -642,6 +645,10 @@ private:
 			RewriteCreateView(stmt);
 			return;
 		}
+		if (info.type == CatalogType::SECRET_ENTRY) {
+			RewriteCreateSecret(info.Cast<CreateSecretInfo>());
+			return;
+		}
 		if (info.type != CatalogType::TABLE_ENTRY) {
 			Deny(Reason::STATEMENT_TYPE, "only tables and views can be created through the ACL");
 		}
@@ -688,6 +695,98 @@ private:
 		}
 	}
 
+	//===------------------------------------------------------------------===//
+	// Secrets, in the node's secrets service (spec 082)
+	//===------------------------------------------------------------------===//
+
+	//! A secret is the service's to keep, never the node's: the explicit `secrets` capability, and the
+	//! one service catalog (PolicyStore::SecretService) - a TEMPORARY secret would sit in this node's
+	//! own secret manager, for every principal's statements after it, so it is refused.
+	void RequireSecrets(const char *verb) {
+		if (!store.PrincipalMainCap(principal, "secrets")) {
+			Deny(Reason::CAPABILITY, string(verb) + " a secret needs the secrets capability - granted by name on the "
+			                                        "principal's MAIN catalog grant, never implied");
+		}
+	}
+
+	//! A secret's parameters are constants. duckdb evaluates them on the node when it binds - its
+	//! ConstantBinder refuses columns and subqueries, not function calls - so `SECRET getenv('...')`
+	//! would store what the node knows in the service. Literals, and lists / structs / maps of them.
+	void RequireSecretConstant(const ParsedExpression &expr) {
+		switch (expr.GetExpressionClass()) {
+		case ExpressionClass::CONSTANT:
+			return;
+		case ExpressionClass::CAST:
+			RequireSecretConstant(expr.Cast<CastExpression>().Child());
+			return;
+		case ExpressionClass::FUNCTION: {
+			auto &function = expr.Cast<FunctionExpression>();
+			auto &path = function.GetQualifiedName().Path();
+			bool builtin = true;
+			for (idx_t i = 0; i + 1 < path.size(); i++) {
+				auto piece = path[i].GetIdentifierName();
+				if (!piece.empty() && !StringUtil::CIEquals(piece, "system") && !StringUtil::CIEquals(piece, "main")) {
+					builtin = false;
+				}
+			}
+			auto name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+			bool shape = name == "list_value" || name == "array_value" || name == "struct_pack" || name == "row" ||
+			             name == "map" || (name == "-" && function.GetArguments().size() == 1);
+			if (builtin && shape && !function.Distinct() && !function.Filter() &&
+			    (!function.OrderBy() || function.OrderBy()->orders.empty())) {
+				for (auto &argument : function.GetArguments()) {
+					RequireSecretConstant(argument.GetExpression());
+				}
+				return;
+			}
+			break;
+		}
+		default:
+			break;
+		}
+		Deny(Reason::STATEMENT_TYPE, "a secret's parameters are constants - literals, or lists of them");
+	}
+
+	void RewriteCreateSecret(CreateSecretInfo &info) {
+		RequireSecrets("creating");
+		if (info.persist_type == SecretPersistType::TEMPORARY || info.persist_type == SecretPersistType::TRANSACTION) {
+			Deny(Reason::STATEMENT_TYPE, "a temporary secret is kept by this node, not by its secrets service - "
+			                             "CREATE [PERSISTENT] SECRET keeps it in the service");
+		}
+		for (auto expr : {info.type.get(), info.provider.get(), info.scope.get()}) {
+			if (expr) {
+				RequireSecretConstant(*expr);
+			}
+		}
+		for (auto &option : info.options) {
+			RequireSecretConstant(*option.second);
+		}
+		auto service = store.SecretService(info.storage_type.GetIdentifierName());
+		info.storage_type = Identifier(service);
+		Note(service + "." + info.GetSecretName().GetIdentifierName(), "secrets");
+	}
+
+	void RewriteDropSecret(DropInfo &info) {
+		RequireSecrets("dropping");
+		string named;
+		auto persist = SecretPersistType::DEFAULT;
+		if (info.extra_drop_info) {
+			auto &extra = info.extra_drop_info->Cast<ExtraDropSecretInfo>();
+			named = extra.secret_storage;
+			persist = extra.persist_mode;
+		}
+		if (persist == SecretPersistType::TEMPORARY || persist == SecretPersistType::TRANSACTION) {
+			Deny(Reason::STATEMENT_TYPE, "a temporary secret is this node's, not its secrets service's - "
+			                             "DROP [PERSISTENT] SECRET drops from the service");
+		}
+		auto service = store.SecretService(named);
+		auto extra = make_uniq<ExtraDropSecretInfo>();
+		extra->persist_mode = persist;
+		extra->secret_storage = service;
+		info.extra_drop_info = std::move(extra);
+		Note(service + "." + info.GetQualifiedName().Name().GetIdentifierName(), "secrets");
+	}
+
 	//! `CREATE VIEW v AS <query>` saves the query, in the virtual names it was written in. Nothing
 	//! physical is made: the body is a record, and every read resolves it through the reader (spec 018).
 	void RewriteCreateView(CreateStatement &stmt) {
@@ -728,6 +827,10 @@ private:
 			Deny(Reason::STATEMENT_TYPE, "unsupported DROP form");
 		}
 		auto &info = *stmt.info;
+		if (info.type == CatalogType::SECRET_ENTRY) {
+			RewriteDropSecret(info);
+			return;
+		}
 		if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY) {
 			Deny(Reason::STATEMENT_TYPE, "only tables and views can be dropped through the ACL");
 		}
