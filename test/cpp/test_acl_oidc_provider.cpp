@@ -219,6 +219,25 @@ int main(int argc, char *argv[]) {
 			}
 		});
 
+		Scenario("an https issuer is reached over TLS in a build that carries OpenSSL", [&] {
+			// spec 076 regression: the shared core tested a macro nobody defined (ACL_OIDC_TLS) until
+			// duckdb-ext-common v0.2.0, so every https issuer failed with "https needs a TLS-enabled
+			// build" in the very build that has TLS. Port 1 refuses: the error must be the network's.
+			auto flight = con.Query("SELECT count(*)::BIGINT FROM duckdb_functions() WHERE function_name = "
+			                        "'acl_flight_serve'");
+			if (!CheckOk(*flight, "duckdb_functions answers") || flight->GetValue(0, 0).GetValue<int64_t>() == 0) {
+				std::cout << "  note: a build without the flight door carries no OpenSSL - https is refused there\n";
+				return;
+			}
+			auto refused = con.Query("CREATE SECRET tls_probe (TYPE quack, PROVIDER oidc, SCOPE 'quack:tls', FLOW "
+			                         "'client_credentials', ISSUER 'https://127.0.0.1:1', CLIENT_ID 'svc', "
+			                         "CLIENT_SECRET 's')");
+			auto error = refused->HasError() ? refused->GetError() : std::string("it passed");
+			Check(refused->HasError() && error.find("TLS-enabled build") == std::string::npos &&
+			          error.find("https request failed") != std::string::npos,
+			      "the https request went out and the network refused it: " + error);
+		});
+
 		Scenario("a replace re-mints FRESH - through the refresh token, never a cached access token", [&] {
 			auto before_refresh = idp.refresh_grants.load();
 			auto before_password = idp.password_grants.load();
