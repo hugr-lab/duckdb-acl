@@ -54,6 +54,8 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 
 	string quack = "null";
 	bool quack_room = false;
+	string streams = "null";
+	bool stream_room = true;
 #ifdef ACL_QUACK_EMBED_ENABLED
 	{
 		auto per_client = SettingOf(db, "acl_quack_client_depth", ACL_QUACK_CLIENT_DEPTH_DEFAULT);
@@ -68,12 +70,22 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 		}
 		quack = "{\"slots\":" + std::to_string(slots) + ",\"per_client\":" + std::to_string(per_client) +
 		        ",\"seats\":" + std::to_string(seats) + ",\"doors\":[" + doors + "]}";
+		// spec 080: the stream budget - what producing quack statements reserve, and who waits for room
+		auto budget = AclNodeStreamBudget(db);
+		auto reserve = AclQuackStreamReserve(db);
+		auto now = store.stream_budget.Now();
+		stream_room = now.queued == 0 && (now.reserved == 0 || now.reserved + reserve <= budget);
+		streams = "{\"budget_bytes\":" + std::to_string(budget) + ",\"reserve_bytes\":" + std::to_string(reserve) +
+		          ",\"reserved_bytes\":" + std::to_string(now.reserved) +
+		          ",\"producing\":" + std::to_string(now.producing) + ",\"queued\":" + std::to_string(now.queued) +
+		          ",\"refused\":" + std::to_string(now.refused) + "}";
 	}
 #endif
 	return "{\"draining\":" + string(draining ? "true" : "false") + ",\"sessions\":{\"live\":" + std::to_string(live) +
 	       ",\"max\":" + std::to_string(max_sessions) + ",\"by_door\":{" + by_door + "}},\"quack\":" + quack +
-	       ",\"admit\":{\"new_session\":" + (session_room ? "true" : "false") +
-	       ",\"new_quack_client\":" + (session_room && quack_room ? "true" : "false") + "}}";
+	       ",\"streams\":" + streams + ",\"admit\":{\"new_session\":" + (session_room ? "true" : "false") +
+	       ",\"new_quack_client\":" + (session_room && quack_room ? "true" : "false") +
+	       ",\"new_stream\":" + (stream_room ? "true" : "false") + "}}";
 }
 
 void RegisterAclNodeLoad(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {

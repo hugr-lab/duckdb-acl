@@ -8,6 +8,7 @@
 #include "acl_function_categories.hpp"
 #include "acl_principal.hpp"
 #include "acl_session_hooks.hpp"
+#include "acl_stream_budget.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -304,6 +305,8 @@ struct PolicyStore {
 	//! the instance's shared one, or a private one when the shared one was stamped with another
 	//! contract version (AuditHooks::Reach). Set at load before the doors register.
 	shared_ptr<AuditHooks> hooks;
+	//! spec 080: the memory the node's quack streams reserve while they produce
+	StreamBudget stream_budget;
 	//! spec 079: quack clients between the seat check and their connection (AclQuackSeatClaim)
 	mutex quack_seat_lock;
 	idx_t quack_seats_claimed = 0;
