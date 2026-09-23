@@ -5,7 +5,8 @@
 #   window, the client reads every row, once, in order, and its own count of the batches holds. Here
 #   the batches are tiny (one chunk each) and the window is fixed at 2 against a read-ahead of 16, so
 #   most answers are empty; the client's FETCH count says they were. A window that grows while the
-#   client reads (no cap) outgrows the read-ahead, and the empty answers stop.
+#   client reads (no cap) outgrows the read-ahead, and the empty answers stop: well under half the
+#   fixed window's FETCHes on the same machine.
 # group: [integration]
 
 require acl
@@ -89,9 +90,12 @@ SELECT count(*) FROM (SELECT i, lag(i) OVER (ORDER BY rowid) AS p FROM got) WHER
 0
 
 # ~98 batches: with the window most FETCHes were answered empty (about read-ahead / window per batch)
-query I
-SELECT count(*) > 300 FROM duckdb_logs
+statement ok
+CREATE TABLE fixed_fetches AS SELECT count(*) AS n FROM duckdb_logs
 WHERE message LIKE '%FETCH_REQUEST%' AND message LIKE '%''server'': ''http%';
+
+query I
+SELECT n > 300 FROM fixed_fetches;
 ----
 true
 
@@ -157,8 +161,10 @@ SELECT count(*) FROM (SELECT i, lag(i) OVER (ORDER BY rowid) AS p FROM grown) WH
 ----
 0
 
+# how fast it grows depends on how soon the acks come back (a loaded machine is slower), so the check
+# is against the fixed window's count on the same machine: well under half of it
 query I
-SELECT count(*) < 200 FROM duckdb_logs
+SELECT count(*) * 2 < (SELECT n FROM fixed_fetches) FROM duckdb_logs
 WHERE message LIKE '%FETCH_REQUEST%' AND message LIKE '%''server'': ''http%';
 ----
 true

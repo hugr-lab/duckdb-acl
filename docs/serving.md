@@ -299,6 +299,10 @@ parallelism within a few windows.
   decodes one batch per thread.
 - **No window.** `acl_quack_fetch_window = 0` is quack's own behaviour.
 
+An empty answer waits while a batch with rows below it is still on its way: first until it is
+produced, then until the client acknowledges it or 20 ms pass. Without that wait, the client's scan
+threads would spin on empty answers for as long as a slow batch takes.
+
 The window works within the protocol and needs nothing from the client. Measurements are in spec 077.
 
 Client recipe: [clients/quack.md](clients/quack.md) (`ATTACH 'quack:<host>:<port>' AS remote (TYPE

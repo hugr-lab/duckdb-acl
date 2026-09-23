@@ -63,4 +63,6 @@ SET GLOBAL acl_allow_anonymous_admin = false;
 ACL ADMIN SELECT count(*) FROM phys.main.orders;
 
 .print '--- the audit counted every refusal above under its code (spec 069) ---'
+-- the counters are the audit pipeline's, derived on its worker: wait for the last refusal to reach it
+SELECT acl_audit_flush() AS flushed;
 SELECT name, attributes, value FROM acl_metrics() WHERE name = 'acl.denials' ORDER BY attributes;

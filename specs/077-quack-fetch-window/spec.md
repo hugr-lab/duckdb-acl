@@ -74,10 +74,24 @@ into its buffer under its index, counts it, acknowledges it, and its scan skips 
   The retry path, the pop, the header and the retain stay quack's. The empty batch is serialized once
   per stream, with quack's wire options. Those options are file-static in quack, so acl repeats them,
   and `sync.py` fails if quack's definition changes (`PRISTINE_GUARDS`).
-- **What it costs.** Each empty answer is a FETCH round trip carrying a few hundred bytes. The client
-  holds an answered slot until its scan consumes it, so empties never loop. Under a fixed window W, a
-  client of depth D makes about D / W FETCHes per batch with rows, most of them empty. A growing
-  window stops sending empties once it reaches D.
+- **The hold** (addendum of 2026-09-23). An empty answer is held while a batch with rows below it
+  is not yet acknowledged. The client's scan threads each claim their own index. Without the hold,
+  a thread holding an empty index consumes it, frees its slot and asks again. With the ack stuck
+  below a batch still on its way, every new index is empty too, so the client spins FETCHes for as
+  long as that batch takes. A sort before its first batch can take seconds, and past `MAX_AHEAD` the
+  query fails. Two holds, neither waiting on the client alone:
+  - **Production.** A batch with rows below is not yet answered. The empty answer waits for any pop
+    of the stream's buffer, so it is released by the server's own progress. After the producer is
+    done, it polls instead, because a finished buffer wakes nobody.
+  - **Acknowledgement.** The batches below are answered but not acknowledged: in transit, or the
+    client stopped. A reading client sends the ack as soon as it consumes the batch. A client that
+    stopped early sends nothing more and waits for these answers before it cancels, so the hold
+    also ends after a time. The time starts at 20 ms and doubles, up to 500 ms, each time it runs
+    out with the ack still stuck (a client starved of CPU). The next ack that moves resets it.
+- **What it costs.** Each empty answer is a FETCH round trip carrying a few hundred bytes. Under a
+  fixed window W, a client of depth D makes about D / W FETCHes per batch with rows, most of them
+  empty. A growing window stops sending empties once it reaches D. An early stop waits up to one
+  acknowledgement hold, 20 ms, for the empties past the window.
 - **A bound on the work of one FETCH.** The plan decides every index up to the one requested, so a
   FETCH more than 65536 indices above the ack is refused (`TOO_FAR`) before anything is decided.
   Without that limit, one request naming index 10⁹ would make the server decide a billion indices.
@@ -104,6 +118,10 @@ authenticated request cannot make the server decide an unbounded number of indic
   - `LIMIT 1` receives at most the starting window after the stop, a fixed window bounds a stop in
     the middle of the stream, a capped one bounds it by its cap, and window 0 pulls the read-ahead;
   - a growing window stops the empties, a fixed one keeps them, and growth stops at the cap;
+  - with sixteen scan threads and a slow producer, FETCHes stay near read-ahead / window per batch,
+    and the same client against a server without the hold spins, 9 to 12 times as many FETCHes;
+  - the correctness invariants hold for one or sixteen scan threads, with everything produced at
+    once or at a slow pace;
   - a FETCH far above the ack is refused and decides nothing;
   - a shuffled first burst yields the same plan;
   - an acknowledged index is GONE;
@@ -149,6 +167,24 @@ rows at the client's full speed. The slow read is 50M rows on one client thread,
 - **The batch size.** 8 MiB stays the default. Under the window it is at least as good as 32 MiB on
   every read here, with a quarter of the memory. Quack's 32 MiB is meant for fewer round trips on a
   slow network, which this local bench does not model.
+
+**Addendum 2026-09-23: the spin, measured.** Spec 077 shipped without the hold (#152). Under a
+saturated CPU (16 busy processes on 16 cores), the first fix held empties only for production. That
+still let one read of 98 one-chunk batches take up to 9335 FETCHes, because the holds were bypassed
+once the producer had finished, and this small result finishes at once. With both holds, ten loaded
+runs stay flat. Counts are FETCHes for about 98 batches:
+
+| window | idle | loaded, 10 runs |
+| --- | --- | --- |
+| fixed 2 | 725-727 | 642-698 |
+| from 2, growing | 163-175 | 136-167 |
+| from 8, growing | 131-140 | 110-139 |
+| 0 | 95-97 | 95-100 |
+
+`LIMIT 10` over a 100M-row sort through the door takes 64 FETCHes, one per client slot, where the
+first fix alone would spin for as long as the sort ran. The bench is unchanged apart from the hold's
+cost on an early stop: `LIMIT 1` over 1B rows 0.144 s and +56 MiB, the full read 3.79 s and
++57 MiB, the slow read 10.44 s and +408 MiB.
 
 ## Alternatives considered
 
