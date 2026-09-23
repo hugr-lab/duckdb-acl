@@ -23,7 +23,7 @@ belongs to neither producer nor consumer; the core to no one extension.
 ## Design
 
 - **`.gitmodules`**: `duckdb-ext-common` (no submodules of its own, so `recursive` pulls nothing
-  extra), pinned to its tag `v0.1.0`.
+  extra), pinned to its tag `v0.1.0` (`v0.2.0` since 2026-09-23, see the addendum).
 - **The contract**: `duckdb-ext-common/contracts/` on the include path; `acl_policy.hpp` includes
   `acl_principal.hpp` for `Principal` instead of defining it. Every `#include "acl_audit.hpp"` in
   the sources and tests resolves there unchanged. `Principal` being part of the contract's layout
@@ -58,6 +58,24 @@ belongs to neither producer nor consumer; the core to no one extension.
 The whole gate on the moved code: `test/sql/*`, `make test-cpp` (with `test_acl_quack_embed` on the
 module from the submodule), the harness, `make test-flight`, `make test-e2e`, CI's sanitized tests
 and `make fuzz-oidc` (now the quack-auth parser). No new test: the change is where the code lives.
+
+## Addendum 2026-09-23: v0.2.0, and the https regression the move made
+
+The move lost TLS. Our own core had tested `ACL_OIDC_TLS`, a macro our CMake defined. The module
+documents `DUCKDB_EXT_COMMON_OIDC_TLS`, and our CMake defines that one. But v0.1.0's code still tested
+the old name, which nobody defines any more.
+
+From #148 (2026-09-18) to this re-pin, every https request of the OIDC core failed in the flight
+build, the one that carries OpenSSL, with "https needs a TLS-enabled build". That covered discovery,
+the password handshake (spec 064) and the quack provider secret (spec 061). The tests missed it
+because every fake IdP here is http. The paragraph above that says "no new test" was wrong.
+
+- **The fix.** duckdb-ext-common v0.2.0 (its spec 003) tests the documented macro. This re-pin brings
+  it. The tag also adds the authorization-code flow with PKCE, which tresor needs, and nothing that
+  changes for us. The contract is unchanged (`ACLA` version 2).
+- **The regression test.** `test/cpp/test_acl_oidc_provider.cpp` points a provider secret at
+  `https://127.0.0.1:1` in a build with the flight door. The error must be the network's refusal,
+  never the no-TLS message. It fails on v0.1.0 and passes on v0.2.0.
 
 ## Alternatives considered
 
