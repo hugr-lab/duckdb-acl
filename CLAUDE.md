@@ -325,8 +325,15 @@ refused BEFORE authentication with `acl: node at capacity ...` (session refused,
 DISCONNECT or a lapsed lease ends the bound acl session at once (`SessionEndBound`, reasons
 client / idle). `acl_node_load()` (`acl_node_load.{hpp,cpp}`) is the load report - sessions per door,
 each quack door's seats, draining, admit flags - also `GET /.well-known/acl-node` and the Flight
-Handshake payload `node-load`, both behind `acl_metrics_endpoint`. The stream-memory budget is
-design 076 P1b, next.
+Handshake payload `node-load`, both behind `acl_metrics_endpoint`. **Spec 080 - the stream budget**:
+a producing quack statement reserves (`AclQuackStreamSlot` in the driver patch, inside the `try`
+around `Query()`, released when it returns) `acl_quack_stream_reserve_bytes` (0 = producer buffer +
+window cap or client depth x batch, 768 MiB default) against `acl_node_stream_budget` (0 = half the
+memory limit); a full budget makes the statement WAIT in arrival order (`StreamBudget`, header-only,
+tickets; a lone oversized stream is admitted; an abandoned ticket is skipped) up to
+`acl_stream_queue_timeout` (25 s - under the quack client's 30 s http_timeout), then fail with the
+reason as the stream's error, which PREPARE answers; the load report's `streams` + `admit.new_stream`,
+gauges `acl.streams.*`. Flight holds one chunk per stream and does not reserve.
 The embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
 Streamed ingest
 (`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the

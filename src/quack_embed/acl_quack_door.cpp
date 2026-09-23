@@ -10,6 +10,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "acl_quack_embed.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
+#include "quack_fetch_collector.hpp"
+#include "quack_rebalancer_sink.hpp"
+#include "acl_quack_fetch_window.hpp"
 #include "acl_node_load.hpp"
 
 #include "acl_audit_pipeline.hpp"
@@ -246,6 +250,83 @@ void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &resu
 }
 
 } // namespace
+
+namespace {
+
+idx_t SettingOr(DatabaseInstance &db, const char *name, idx_t fallback) {
+	Value value;
+	if (!DBConfig::GetConfig(db).TryGetCurrentSetting(name, value) || value.IsNull()) {
+		return fallback;
+	}
+	return value.GetValue<idx_t>();
+}
+
+} // namespace
+
+idx_t AclQuackStreamReserve(DatabaseInstance &db) {
+	auto fixed = SettingOr(db, "acl_quack_stream_reserve_bytes", 0);
+	if (fixed > 0) {
+		return fixed;
+	}
+	// what the server lets one stream hold: its producer buffer (as the server caps it: at most a
+	// quarter of the operator memory limit), and the batches in flight - the window's cap, or the
+	// client's whole read-ahead when the window grows without one
+	auto producer = SettingOr(db, "acl_quack_fetch_producer_buffer_bytes", QUACK_FETCH_PRODUCER_BUFFER_BYTES_DEFAULT);
+	auto memory_cap = BufferManager::GetBufferManager(db).GetOperatorMemoryLimit() / 4;
+	if (producer > 0 && memory_cap > 0) {
+		producer = MinValue<idx_t>(producer, memory_cap);
+	}
+	auto window = SettingOr(db, "acl_quack_fetch_window_max", ACL_QUACK_FETCH_WINDOW_MAX_DEFAULT);
+	if (window == 0) {
+		window = SettingOr(db, "acl_quack_client_depth", ACL_QUACK_CLIENT_DEPTH_DEFAULT);
+	}
+	if (window == 0) {
+		window = ACL_QUACK_CLIENT_DEPTH_DEFAULT;
+	}
+	auto batch = SettingOr(db, "acl_quack_target_batch_bytes", 8ULL * 1024ULL * 1024ULL);
+	return producer + window * batch;
+}
+
+idx_t AclNodeStreamBudget(DatabaseInstance &db) {
+	auto budget = SettingOr(db, "acl_node_stream_budget", 0);
+	if (budget > 0) {
+		return budget;
+	}
+	return BufferManager::GetBufferManager(db).GetOperatorMemoryLimit() / 2;
+}
+
+AclQuackStreamSlot::AclQuackStreamSlot(Connection &connection) {
+	auto &db = *connection.context->db;
+	store = PolicyStore::Of(db);
+	if (!store) {
+		return;
+	}
+	auto want = AclQuackStreamReserve(db);
+	auto budget = AclNodeStreamBudget(db);
+	auto timeout = std::chrono::seconds(SettingOr(db, "acl_stream_queue_timeout", 25));
+	auto &context = *connection.context;
+	bool interrupted = false;
+	if (!store->stream_budget.Acquire(
+	        want, budget, timeout, [&context]() { return context.IsInterrupted(); }, interrupted)) {
+		if (interrupted) {
+			throw InterruptException();
+		}
+		auto now = store->stream_budget.Now();
+		throw InvalidInputException("acl: node at capacity - the stream memory budget stayed full for %llu s (%s of %s "
+		                            "reserved by %llu producing statements, %s wanted); try again or another node",
+		                            NumericCast<idx_t>(timeout.count()),
+		                            StringUtil::BytesToHumanReadableString(now.reserved),
+		                            StringUtil::BytesToHumanReadableString(budget), now.producing,
+		                            StringUtil::BytesToHumanReadableString(want));
+	}
+	bytes = want;
+}
+
+AclQuackStreamSlot::~AclQuackStreamSlot() {
+	if (store && bytes > 0) {
+		store->stream_budget.Release(bytes);
+	}
+}
 
 AclQuackSeatClaim::AclQuackSeatClaim(DatabaseInstance &db_p, idx_t seated, string &refusal) : db(db_p) {
 	auto store = PolicyStore::Of(db);

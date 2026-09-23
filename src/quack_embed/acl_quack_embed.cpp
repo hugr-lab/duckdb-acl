@@ -89,6 +89,21 @@ void RegisterAclQuackEmbed(ExtensionLoader &loader) {
 	                          "acl_quack_server_max_connections / this many clients (0 = no seat accounting)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(acl::ACL_QUACK_CLIENT_DEPTH_DEFAULT), nullptr,
 	                          SetScope::GLOBAL);
+	// spec 080: the node's stream budget - what a producing quack statement reserves, the node's total,
+	// and how long a statement waits for room before it fails with the reason (25 s: the quack
+	// client's own HTTP timeout is duckdb's http_timeout, 30 s, and the refusal must reach it first)
+	config.AddExtensionOption("acl_node_stream_budget",
+	                          "acl: bytes the node's producing quack streams may reserve together (0 = half of "
+	                          "memory_limit)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(0), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_quack_stream_reserve_bytes",
+	                          "acl embedded door: bytes one producing quack stream reserves (0 = its producer "
+	                          "buffer + window cap (or client depth) x batch)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(0), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("acl_stream_queue_timeout",
+	                          "acl: seconds a statement waits for room in the stream budget before it is refused "
+	                          "(0 = refused at once)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(25), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_quack_enable_reconnects",
 	                          "acl embedded door: cache the last result until acknowledged (reconnect support)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));

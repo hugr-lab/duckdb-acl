@@ -60,6 +60,27 @@ bool AclQuackAdmit(DatabaseInstance &db, idx_t seated, string &refusal);
 //! AND the ones between the check and their connection's creation, so a burst of connects cannot all
 //! pass the check at once. Held for the connect handler's scope - released when the connection is
 //! created or refused, an exception included.
+//! spec 080: a statement's place in the node's stream budget, for as long as it produces - taken in
+//! the server's statement driver before Query() (waiting in arrival order up to
+//! `acl_stream_queue_timeout`), released when production ends. Throws the refusal when the wait
+//! runs out, and an interrupt when the client went away meanwhile; the driver turns either into the
+//! stream's error, which the client's PREPARE answers.
+class AclQuackStreamSlot {
+public:
+	explicit AclQuackStreamSlot(Connection &connection);
+	~AclQuackStreamSlot();
+	AclQuackStreamSlot(const AclQuackStreamSlot &) = delete;
+	AclQuackStreamSlot &operator=(const AclQuackStreamSlot &) = delete;
+
+private:
+	shared_ptr<PolicyStore> store;
+	idx_t bytes = 0;
+};
+
+//! spec 080: what one quack stream reserves, and the node's budget, as the settings say now
+idx_t AclQuackStreamReserve(DatabaseInstance &db);
+idx_t AclNodeStreamBudget(DatabaseInstance &db);
+
 class AclQuackSeatClaim {
 public:
 	AclQuackSeatClaim(DatabaseInstance &db, idx_t seated, string &refusal);

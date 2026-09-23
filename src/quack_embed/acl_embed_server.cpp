@@ -154,6 +154,9 @@ static void DriveQuery(QuackConnection &connection, shared_ptr<QuackResultStream
 		acl::AclQuackStatementStarting(*connection.duckdb_connection, connection.session_id);
 		unique_ptr<QueryResult> result;
 		try {
+			// acl (spec 080): a place in the node's stream budget while the statement produces - it
+			// waits here for room (the client's PREPARE waits with it), fails with the reason
+			acl::AclQuackStreamSlot acl_stream_slot(*connection.duckdb_connection);
 			result = connection.duckdb_connection->Query(sql);
 		} catch (...) {
 			// leave no collector hook on the connection's config

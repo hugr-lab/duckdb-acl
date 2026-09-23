@@ -279,6 +279,9 @@ The embedded server's settings (registered with the door; UBIGINT unless noted):
 | `acl_quack_fetch_producer_buffer_bytes` | 268435456 | any | server-side fetch-ahead cap |
 | `acl_quack_fetch_window` | 8 | GLOBAL | batches with rows a client may have in flight when its result starts (0 = no window) |
 | `acl_quack_fetch_window_max` | 0 | GLOBAL | the most the window grows to while the client keeps reading (0 = no cap) |
+| `acl_node_stream_budget` | 0 | GLOBAL | bytes the node's producing quack streams reserve together (0 = half the memory limit) |
+| `acl_quack_stream_reserve_bytes` | 0 | GLOBAL | what one producing stream reserves (0 = producer buffer + window cap, or client depth, × batch) |
+| `acl_stream_queue_timeout` | 25 | GLOBAL | seconds a statement waits for room in the stream budget, then is refused (0 = at once) |
 | `acl_quack_client_depth` | 64 | GLOBAL | workers one quack client reserves (its read-ahead); the door seats `acl_quack_server_max_connections` / this many clients and refuses the next at connect (0 = no seat accounting) |
 | `acl_quack_enable_reconnects` (BOOLEAN) | false | any | keep the last result until acknowledged |
 | `acl_quack_debug_emit_delay_ms` | 0 | any | debug: random delay before a batch is published |
@@ -323,6 +326,13 @@ client would be admitted. An orchestrator reads the same document in two places 
 
 - `GET /.well-known/acl-node` on the quack listener;
 - the Flight Handshake payload `node-load`.
+
+**The stream budget** (spec 080). A producing quack statement reserves the memory its stream can
+hold, its producer buffer plus its batches in flight, against `acl_node_stream_budget`. That budget
+defaults to half the memory limit. A statement that finds the budget full waits on the node, in
+arrival order, for up to `acl_stream_queue_timeout`. It then fails with the reason: `acl: node at
+capacity - the stream memory budget stayed full ...`. The load report's `streams` section and
+`admit.new_stream` show the budget, and so do the `acl.streams.*` gauges.
 
 Client recipe: [clients/quack.md](clients/quack.md) (`ATTACH 'quack:<host>:<port>' AS remote (TYPE
 quack, TOKEN '<token>')`, or a secret).

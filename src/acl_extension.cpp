@@ -308,6 +308,29 @@ void LoadInternal(ExtensionLoader &loader) {
 		hooks->Gauges().Register("acl.sessions.observer_failures", {}, "{call}",
 		                         "session observer calls that threw (the session opened or closed regardless)",
 		                         read(&acl::SessionNotifier::Failures));
+		// spec 080: the stream budget
+		auto budget = [weak_store](const char *which) {
+			return [weak_store, which]() -> int64_t {
+				auto locked = weak_store.lock();
+				if (!locked) {
+					return 0;
+				}
+				auto now = locked->stream_budget.Now();
+				string what(which);
+				return what == "reserved"    ? NumericCast<int64_t>(now.reserved)
+				       : what == "producing" ? NumericCast<int64_t>(now.producing)
+				       : what == "queued"    ? NumericCast<int64_t>(now.queued)
+				                             : now.refused;
+			};
+		};
+		hooks->Gauges().Register("acl.streams.reserved_bytes", {}, "By",
+		                         "stream memory reserved by producing quack statements (spec 080)", budget("reserved"));
+		hooks->Gauges().Register("acl.streams.producing", {}, "{statement}",
+		                         "quack statements producing under the stream budget", budget("producing"));
+		hooks->Gauges().Register("acl.streams.queued", {}, "{statement}",
+		                         "quack statements waiting for room in the stream budget", budget("queued"));
+		hooks->Gauges().Register("acl.streams.refused", {}, "{statement}",
+		                         "quack statements refused after waiting for the stream budget", budget("refused"));
 		hooks->Gauges().Register("acl.sessions.observer_slow", {}, "{call}",
 		                         "session observer calls slower than 100 ms (a client's connect waits on an open)",
 		                         read(&acl::SessionNotifier::Slow));
