@@ -360,6 +360,26 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 	return handle;
 }
 
+void PolicyStore::SessionEndBound(const string &external_id, const char *how) {
+	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
+	auto now = NowSeconds();
+	lock_guard<mutex> guard(lock);
+	auto binding = session_bindings.find(external_id);
+	if (binding == session_bindings.end()) {
+		return;
+	}
+	auto entry = sessions.find(binding->second);
+	if (entry != sessions.end()) {
+		SessionClosed(entry->second, how, now);
+		sessions.erase(entry);
+	}
+	session_bindings.erase(binding);
+}
+
+void PolicyStore::AuditSessionRefused(const string &door, const char *reason_code, const string &reason) {
+	SessionEvent(audit.get(), Principal(), door, "", -1, "refused", reason_code, reason, -1);
+}
+
 //! The close event of a session being removed (spec 069): how it ended, and for how long it lived.
 //! Caller holds the lock; the event itself takes nothing of the store's.
 void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now) {

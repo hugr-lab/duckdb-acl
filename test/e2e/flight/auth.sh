@@ -103,6 +103,20 @@ echo "$got" | grep -q "\"token_endpoint\":\"$IDP/token\"" || fail "discovery doe
 echo "$got" | grep -q "\"device_authorization_endpoint\":\"$IDP/device\"" || fail "the device endpoint the IdP advertises is missing: $got"
 case "$got" in *client_secret*) fail "discovery leaked a client secret field: $got";; esac
 
+# --- spec 079: the load report over the Handshake, behind the /metrics switch ---------------------------
+got="$(ask "$URI" node-load --tls-roots "$TMP/cert.pem")"
+case "$got" in *"load report is off"*) ;; *) fail "the load report answered while acl_metrics_endpoint is off: $got";; esac
+echo "SET GLOBAL acl_metrics_endpoint = true;" >&3
+for _ in $(seq 1 40); do
+	got="$(ask "$URI" node-load --tls-roots "$TMP/cert.pem")"
+	case "$got" in *'"admit"'*) break;; esac
+	sleep 0.25
+done
+echo "$got" | grep -q '"new_session":true' || fail "the load report does not admit a new session: $got"
+echo "$got" | grep -q '"by_door":{"flight":' || fail "the load report does not count sessions per door: $got"
+case "$got" in *alice*|*analyst*) fail "the load report names a principal: $got";; esac
+echo "SET GLOBAL acl_metrics_endpoint = false;" >&3
+
 # --- B3: the password handshake earns the slice ----------------------------------------------------
 got="$(ask "$URI" password alice wonder "SELECT count(*) AS n FROM orders" --tls-roots "$TMP/cert.pem")"
 echo "$got" | grep -q "'n': \[3\]" || fail "the password handshake did not read the tenant's slice: $got"

@@ -185,6 +185,74 @@ PATCHES = {
             "\t\t\tstream->buffer.WaitForBatch(dense_index);\n",
             "\t\t\tstream->buffer.WaitForBatch(source_index);\n",
         ),
+        # spec 079, the node's seats: a quack client reserves its read-ahead of the door's workers
+        # (a thread per keep-alive connection), so past acl_quack_server_max_connections /
+        # acl_quack_client_depth seated clients a connect is refused HERE, with the reason - before
+        # authentication opens a session, and instead of the pool shedding a socket mid-query. The
+        # connections whose heartbeat lease ran out are swept first (quack only notices them when
+        # they send again), so a client that vanished frees its seat.
+        (
+            "\t\tstring session_id = GenerateSessionId();\n"
+            "\t\tauto auth = EvaluateAuthQuery(\n",
+            "\t\t// acl (spec 079): the node's seats, decided before a session is opened\n"
+            "\t\tidx_t acl_seated = 0;\n"
+            "\t\t{\n"
+            "\t\t\tvector<shared_ptr<QuackConnection>> lapsed;\n"
+            "\t\t\t{\n"
+            "\t\t\t\tstd::lock_guard<std::mutex> guard(active_connections_mutex);\n"
+            "\t\t\t\tauto now = steady_clock::now();\n"
+            "\t\t\t\tfor (auto entry = active_connections.begin(); entry != active_connections.end();) {\n"
+            "\t\t\t\t\tbool expired;\n"
+            "\t\t\t\t\t{\n"
+            "\t\t\t\t\t\tannotated_lock_guard<annotated_mutex> lease(entry->second->lease_lock);\n"
+            "\t\t\t\t\t\texpired = entry->second->LeaseExpiredLocked(now);\n"
+            "\t\t\t\t\t}\n"
+            "\t\t\t\t\tif (expired) {\n"
+            "\t\t\t\t\t\tlapsed.push_back(std::move(entry->second));\n"
+            "\t\t\t\t\t\tentry = active_connections.erase(entry);\n"
+            "\t\t\t\t\t} else {\n"
+            "\t\t\t\t\t\tacl_seated++;\n"
+            "\t\t\t\t\t\t++entry;\n"
+            "\t\t\t\t\t}\n"
+            "\t\t\t\t}\n"
+            "\t\t\t}\n"
+            "\t\t\tfor (auto &connection : lapsed) {\n"
+            "\t\t\t\tCleanupExpiredConnection(*connection);\n"
+            "\t\t\t\tacl::AclQuackConnectionGone(db, connection->session_id, \"idle\");\n"
+            "\t\t\t}\n"
+            "\t\t}\n"
+            "\t\t// held until this handler returns: the connection below is created or refused by then\n"
+            "\t\tstring acl_refusal;\n"
+            "\t\tacl::AclQuackSeatClaim acl_seat(db, acl_seated, acl_refusal);\n"
+            "\t\tif (!acl_seat.Granted()) {\n"
+            "\t\t\treturn make_uniq<ErrorResponse>(acl_refusal);\n"
+            "\t\t}\n"
+            "\t\tstring session_id = GenerateSessionId();\n"
+            "\t\tauto auth = EvaluateAuthQuery(\n",
+        ),
+        # spec 079: a connection the server drops ends its acl session at once - quack's own DISCONNECT
+        # and a heartbeat lease noticed expired - instead of the session waiting out
+        # acl_session_idle_timeout (15 min) with no client behind it
+        (
+            "\t\tif (!DisconnectConnection(connection.session_id)) {\n"
+            "\t\t\treturn make_uniq<ErrorResponse>(\"Connection does not exist / already disconnected\");\n"
+            "\t\t}\n",
+            "\t\tif (!DisconnectConnection(connection.session_id)) {\n"
+            "\t\t\treturn make_uniq<ErrorResponse>(\"Connection does not exist / already disconnected\");\n"
+            "\t\t}\n"
+            "\t\t// acl (spec 079): the session bound to the connection ends with it\n"
+            "\t\tacl::AclQuackConnectionGone(db, connection.session_id, \"client\");\n",
+        ),
+        (
+            "\tCleanupExpiredConnection(*expired_connection);\n"
+            "\treturn false;\n",
+            "\tCleanupExpiredConnection(*expired_connection);\n"
+            "\t// acl (spec 079): the session bound to the lapsed connection ends with it\n"
+            "\tif (auto db = db_ptr.lock()) {\n"
+            "\t\tacl::AclQuackConnectionGone(*db, connection_id, \"idle\");\n"
+            "\t}\n"
+            "\treturn false;\n",
+        ),
     ],
 }
 

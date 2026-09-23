@@ -304,6 +304,9 @@ struct PolicyStore {
 	//! the instance's shared one, or a private one when the shared one was stamped with another
 	//! contract version (AuditHooks::Reach). Set at load before the doors register.
 	shared_ptr<AuditHooks> hooks;
+	//! spec 079: quack clients between the seat check and their connection (AclQuackSeatClaim)
+	mutex quack_seat_lock;
+	idx_t quack_seats_claimed = 0;
 	//! spec 078: the session opens and closes, delivered to acl_connection.hpp's observers
 	SessionNotifier session_notices;
 	//! Declared BEFORE a method's lock_guard, so its destructor runs after the lock is released: the
@@ -669,6 +672,12 @@ struct PolicyStore {
 	idx_t SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp_binds);
 	//! How many sessions are live right now. Denied to a principal, like the rest of this surface.
 	idx_t SessionCount();
+	//! A door refused a client before any session (spec 079: the node's seats): the `session refused`
+	//! event, with nobody's principal, so the counters and the audit see it like any other refusal.
+	void AuditSessionRefused(const string &door, const char *reason_code, const string &reason);
+	//! A door's connection is gone (spec 079: quack's DISCONNECT, or its heartbeat lease ran out): the
+	//! session bound to it (SessionBind) ends now with `how`, instead of waiting out the idle timeout.
+	void SessionEndBound(const string &external_id, const char *how);
 	//! One live session, for the admin ops surface (spec 050) - never the handle.
 	struct SessionInfo {
 		string id;

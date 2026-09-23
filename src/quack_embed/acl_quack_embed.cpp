@@ -81,6 +81,14 @@ void RegisterAclQuackEmbed(ExtensionLoader &loader) {
 	                          "(0 = no cap)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(acl::ACL_QUACK_FETCH_WINDOW_MAX_DEFAULT), nullptr,
 	                          SetScope::GLOBAL);
+	// spec 079: the workers one quack client reserves - its read-ahead, one keep-alive connection per
+	// FETCH in flight (64 = quack's default on 16 cores); the door seats max_connections / this many
+	// clients and refuses the next at connect. 0 = no seat accounting.
+	config.AddExtensionOption("acl_quack_client_depth",
+	                          "acl embedded door: workers a quack client reserves (its read-ahead); the door seats "
+	                          "acl_quack_server_max_connections / this many clients (0 = no seat accounting)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(acl::ACL_QUACK_CLIENT_DEPTH_DEFAULT), nullptr,
+	                          SetScope::GLOBAL);
 	config.AddExtensionOption("acl_quack_enable_reconnects",
 	                          "acl embedded door: cache the last result until acknowledged (reconnect support)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));

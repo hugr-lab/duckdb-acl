@@ -259,6 +259,10 @@ bool QuackServer::RenewConnectionLease(const string &connection_id, const shared
 		active_connections.erase(entry);
 	}
 	CleanupExpiredConnection(*expired_connection);
+	// acl (spec 079): the session bound to the lapsed connection ends with it
+	if (auto db = db_ptr.lock()) {
+		acl::AclQuackConnectionGone(*db, connection_id, "idle");
+	}
 	return false;
 }
 
@@ -641,6 +645,39 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			return make_uniq<ErrorResponse>(StringUtil::Format(
 			    "heartbeat_timeout out of range - must be between 1 and %llu seconds", MAX_HEARTBEAT_TIMEOUT_SECONDS));
 		}
+		// acl (spec 079): the node's seats, decided before a session is opened
+		idx_t acl_seated = 0;
+		{
+			vector<shared_ptr<QuackConnection>> lapsed;
+			{
+				std::lock_guard<std::mutex> guard(active_connections_mutex);
+				auto now = steady_clock::now();
+				for (auto entry = active_connections.begin(); entry != active_connections.end();) {
+					bool expired;
+					{
+						annotated_lock_guard<annotated_mutex> lease(entry->second->lease_lock);
+						expired = entry->second->LeaseExpiredLocked(now);
+					}
+					if (expired) {
+						lapsed.push_back(std::move(entry->second));
+						entry = active_connections.erase(entry);
+					} else {
+						acl_seated++;
+						++entry;
+					}
+				}
+			}
+			for (auto &connection : lapsed) {
+				CleanupExpiredConnection(*connection);
+				acl::AclQuackConnectionGone(db, connection->session_id, "idle");
+			}
+		}
+		// held until this handler returns: the connection below is created or refused by then
+		string acl_refusal;
+		acl::AclQuackSeatClaim acl_seat(db, acl_seated, acl_refusal);
+		if (!acl_seat.Granted()) {
+			return make_uniq<ErrorResponse>(acl_refusal);
+		}
 		string session_id = GenerateSessionId();
 		auto auth = EvaluateAuthQuery(
 		    db, StringUtil::Format("SELECT %s(?, ?, ?)", GetSettingString(db, "acl_quack_authentication_function")),
@@ -660,6 +697,8 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		if (!DisconnectConnection(connection.session_id)) {
 			return make_uniq<ErrorResponse>("Connection does not exist / already disconnected");
 		}
+		// acl (spec 079): the session bound to the connection ends with it
+		acl::AclQuackConnectionGone(db, connection.session_id, "client");
 		return make_uniq<SuccessResponse>();
 	}
 	case MessageType::PREPARE_REQUEST: {

@@ -317,7 +317,16 @@ thread). Four hunks of the FETCH handler in `sync.py`, the window per stream on 
 connection. GLOBAL for now; a profile per role/token (resource groups) is the follow-up. Many clients at once
 (`test/bench/door_concurrent.py`): the door seats ~16 quack clients (`acl_quack_server_max_connections`
 1024 / a client's 64 keep-alive connections, one per FETCH in flight); past that quack's pool sheds
-connections and queries fail, with or without the window.
+connections and queries fail, with or without the window. **Spec 079 - the node's seats**: the connect
+handler (a `sync.py` patch) sweeps lapsed leases, counts live connections and asks `AclQuackSeatClaim`
+(seated + clients still authenticating, under the store's `quack_seat_lock`) against
+`acl_quack_server_max_connections / acl_quack_client_depth` (64; 0 = off) - past it the connect is
+refused BEFORE authentication with `acl: node at capacity ...` (session refused, `at_capacity`); a
+DISCONNECT or a lapsed lease ends the bound acl session at once (`SessionEndBound`, reasons
+client / idle). `acl_node_load()` (`acl_node_load.{hpp,cpp}`) is the load report - sessions per door,
+each quack door's seats, draining, admit flags - also `GET /.well-known/acl-node` and the Flight
+Handshake payload `node-load`, both behind `acl_metrics_endpoint`. The stream-memory budget is
+design 076 P1b, next.
 The embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
 Streamed ingest
 (`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the

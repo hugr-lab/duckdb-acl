@@ -20,6 +20,7 @@
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
 #include "acl_profile.hpp"
+#include "acl_node_load.hpp"
 #include "duckdb/common/helper.hpp"
 
 #include <chrono>
@@ -312,7 +313,8 @@ void LoadInternal(ExtensionLoader &loader) {
 		                         read(&acl::SessionNotifier::Slow));
 	}
 	acl::RegisterAclAudit(loader, store, pipeline);
-	acl::RegisterAclProfile(loader, store); // spec 074: the execution profile, on every connection
+	acl::RegisterAclProfile(loader, store);  // spec 074: the execution profile, on every connection
+	acl::RegisterAclNodeLoad(loader, store); // spec 079: acl_node_load(), the orchestrator's report
 	// the node's own gauges (spec 069): how long it has been up, and which build it is
 	{
 		string version;

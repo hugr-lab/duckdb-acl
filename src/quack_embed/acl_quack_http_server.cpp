@@ -238,7 +238,7 @@ class AclQuackServer : public QuackServer {
 public:
 	AclQuackServer(ClientContext &context, const QuackUri &uri_p, const string &token_p, const string &cert_pem,
 	               const string &key_pem, std::function<string()> wellknown, std::function<bool()> draining,
-	               std::function<string()> metrics, bool discovery);
+	               std::function<string()> metrics, std::function<string()> node_load, bool discovery);
 	~AclQuackServer() override;
 
 	void StopAccepting() override;
@@ -267,6 +267,7 @@ private:
 	std::function<string()> wellknown;
 	std::function<bool()> draining;
 	std::function<string()> metrics;
+	std::function<string()> node_load;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 	X509 *tls_cert = nullptr;
 	EVP_PKEY *tls_key = nullptr;
@@ -275,9 +276,10 @@ private:
 
 AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, const string &token_p,
                                const string &cert_pem, const string &key_pem, std::function<string()> wellknown_p,
-                               std::function<bool()> draining_p, std::function<string()> metrics_p, bool discovery)
+                               std::function<bool()> draining_p, std::function<string()> metrics_p,
+                               std::function<string()> node_load_p, bool discovery)
     : QuackServer(context, uri_p, token_p), wellknown(std::move(wellknown_p)), draining(std::move(draining_p)),
-      metrics(std::move(metrics_p)) {
+      metrics(std::move(metrics_p)), node_load(std::move(node_load_p)) {
 	if (!cert_pem.empty() || !key_pem.empty()) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 		if (cert_pem.empty() || key_pem.empty()) {
@@ -351,6 +353,21 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 				return;
 			}
 			res.set_content(text, "text/plain; version=0.0.4; charset=utf-8");
+		});
+	}
+
+	// spec 079: GET /.well-known/acl-node, the load report an orchestrator routes by - behind the same
+	// switch as /metrics (`acl_metrics_endpoint`), 404 while off; counts and states, like /metrics
+	if (node_load) {
+		auto nl = node_load;
+		server->Get("/.well-known/acl-node", [nl](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
+			auto text = nl();
+			if (text.empty()) {
+				res.status = 404;
+				res.set_content("not found\n", "text/plain");
+				return;
+			}
+			res.set_content(text, "application/json");
 		});
 	}
 
@@ -505,7 +522,7 @@ string StartAclQuackServer(ClientContext &context, const AclQuackServeConfig &cf
 		}
 
 		auto server = make_uniq<AclQuackServer>(context, listen_uri, cfg.token, cfg.cert_pem, cfg.key_pem,
-		                                        cfg.wellknown, cfg.draining, cfg.metrics, cfg.discovery);
+		                                        cfg.wellknown, cfg.draining, cfg.metrics, cfg.node_load, cfg.discovery);
 		auto key = server->ListenUri().CanonicalUri();
 		actual_uri_out = server->ListenUri().Uri();
 		std::lock_guard<std::mutex> guard(g_servers_lock);
@@ -555,6 +572,20 @@ bool StopAclQuackServer(const DatabaseInstance &caller, const string &uri) {
 	gone->StopAccepting();
 	gone.reset();
 	return true;
+}
+
+vector<AclQuackDoorLoad> AclQuackDoorLoads(const DatabaseInstance &db) {
+	std::lock_guard<std::mutex> guard(g_servers_lock);
+	vector<AclQuackDoorLoad> loads;
+	for (auto &entry : g_servers) {
+		if (entry.second->OwnedBy(db)) {
+			AclQuackDoorLoad load;
+			load.uri = entry.second->ListenUri().CanonicalUri();
+			load.seated = entry.second->ActiveConnectionCount();
+			loads.push_back(std::move(load));
+		}
+	}
+	return loads;
 }
 
 idx_t AclQuackServerCount(const DatabaseInstance &db) {
