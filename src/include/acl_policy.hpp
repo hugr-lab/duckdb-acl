@@ -7,6 +7,7 @@
 
 #include "acl_function_categories.hpp"
 #include "acl_principal.hpp"
+#include "acl_session_hooks.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -303,6 +304,22 @@ struct PolicyStore {
 	//! the instance's shared one, or a private one when the shared one was stamped with another
 	//! contract version (AuditHooks::Reach). Set at load before the doors register.
 	shared_ptr<AuditHooks> hooks;
+	//! spec 078: the session opens and closes, delivered to acl_connection.hpp's observers
+	SessionNotifier session_notices;
+	//! Declared BEFORE a method's lock_guard, so its destructor runs after the lock is released: the
+	//! closes the method queued are delivered outside the store's lock.
+	struct DeliverSessionNotices {
+		explicit DeliverSessionNotices(SessionNotifier &notices_p) : notices(notices_p) {
+		}
+		~DeliverSessionNotices() {
+			try {
+				notices.Flush();
+			} catch (...) {
+				// may run while an exception unwinds (acl_session_open rethrows): never a second one
+			}
+		}
+		SessionNotifier &notices;
+	};
 	//! A door's own connection id -> our handle (spec 041). quack hands its `session_id` to the
 	//! authentication callback and the same value as `connection_id` on every later message, so this
 	//! is what turns "which connection is this" into "which principal is this" without the door ever
@@ -583,6 +600,9 @@ struct PolicyStore {
 		string correlation_id;
 		string traceparent;
 		int8_t profile_override = -1;
+		//! spec 078: what a statement's AclConnection says about the session
+		int64_t opened_at = 0;
+		int64_t expires_at = 0;
 	};
 	bool SessionRefOf(const string &handle, SessionRef &out);
 	//! spec 074 slice 3: the operator's profile level on a session by its ops id (-1 clears it);
@@ -760,7 +780,7 @@ private:
 	//! the caller is one try and this stays readable; `principal` is filled as far as verification
 	//! got, so a refusal event can still name who was trying. PRIVATE on purpose: calling it
 	//! directly is how the guard above would be bypassed, and a door must never be able to.
-	string SessionOpenBody(const string &token, const string &door, Principal &principal);
+	string SessionOpenBody(const string &token, const string &door, Principal &principal, SessionOpenInfo &opened);
 
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);

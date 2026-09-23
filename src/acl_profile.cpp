@@ -2,6 +2,7 @@
 // acl_profile.cpp - spec 074: the execution profile
 //===----------------------------------------------------------------------===//
 #include "acl_profile.hpp"
+#include "acl_session_hooks.hpp"
 
 #include "acl_audit_pipeline.hpp"
 #include "acl_policy.hpp"
@@ -238,6 +239,8 @@ public:
 	string their_format;
 	ProfilingCoverage their_coverage = ProfilingCoverage::SELECT;
 	int64_t began_us = 0;
+	//! spec 078: this state put a session on the connection's AclConnection for the running statement
+	bool published_session = false;
 
 	void QueryBegin(ClientContext &context) override {
 		if (!pending_notes.empty()) {
@@ -259,6 +262,22 @@ public:
 			has_note = false;
 		}
 		began_us = NowMicros();
+		// spec 078: a statement under a session shows it on its connection while it runs, and nothing
+		// else does - on a gateway's shared connection the next statement may be another principal's
+		if (has_note && !note.proto.session.empty()) {
+			AclSessionView view;
+			view.session_id = note.proto.session;
+			view.principal = note.proto.principal;
+			view.door = note.proto.door;
+			view.opened_at = note.session_opened_at;
+			view.expires_at = note.session_expires_at;
+			view.correlation_id = note.proto.correlation_id;
+			view.traceparent = note.proto.traceparent;
+			published_session = PublishStatementSession(context, std::move(view));
+		} else if (published_session) {
+			WithdrawStatementSession(context);
+			published_session = false;
+		}
 		if (!has_note) {
 			return; // nobody's statement: the profiler stays as the last decided one left it
 		}
@@ -283,6 +302,11 @@ public:
 	}
 
 	void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
+		if (published_session) {
+			// spec 078: whatever ended the statement - done, failed, interrupted - its session comes off
+			WithdrawStatementSession(context);
+			published_session = false;
+		}
 		try {
 			Emit(context, error);
 		} catch (...) {

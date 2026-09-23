@@ -35,6 +35,10 @@ struct ProfileNote {
 	uint64_t text_hash = 0;
 	//! spec 074 slice 3: the operator's profile level on the statement's session (-1 none)
 	int8_t session_profile_override = -1;
+	//! spec 078: the session's open and expiry (unix seconds) - with proto's session id, principal,
+	//! door and trace, what the statement's AclConnection says while it runs (no session: empty id)
+	int64_t session_opened_at = 0;
+	int64_t session_expires_at = 0;
 	AuditEvent proto;
 	string statement;
 	vector<AuditObject> objects;

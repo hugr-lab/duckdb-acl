@@ -238,9 +238,17 @@ string MintRandomHex(idx_t bytes) {
 //! `source_error` to a door: a door must not learn the difference between a catalog that is down and
 //! a bug of ours, and the audit keeps the text either way.
 string PolicyStore::SessionOpen(const string &token, const string &door) {
+	DeliverSessionNotices deliver(session_notices); // a sweep inside may have ended sessions
 	Principal principal; // as far as verification got, so a refusal can still name who was trying
 	try {
-		return SessionOpenBody(token, door, principal);
+		SessionOpenInfo opened;
+		auto handle = SessionOpenBody(token, door, principal, opened);
+		if (!handle.empty()) {
+			// spec 078: the observers, before the handle is anyone's - outside the store's lock, the
+			// verified token by reference for the call only
+			session_notices.Opened(opened, token);
+		}
+		return handle;
 	} catch (std::exception &ex) {
 		if (door == "session") {
 			throw; // the operator's own call (acl_session_open): they are who the reason is for
@@ -250,7 +258,8 @@ string PolicyStore::SessionOpen(const string &token, const string &door) {
 	}
 }
 
-string PolicyStore::SessionOpenBody(const string &token, const string &door, Principal &principal) {
+string PolicyStore::SessionOpenBody(const string &token, const string &door, Principal &principal,
+                                    SessionOpenInfo &opened) {
 	// a refusal is a session event too (spec 069): the reason a client never learns is what the
 	// operator's record carries
 	auto refused = [&](const Principal &who, const char *code, const string &reason) {
@@ -335,6 +344,14 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 		               "acl: at acl_max_sessions - a new session is refused, never an old one ended");
 	}
 	SessionEvent(audit.get(), principal, door, id, session_level, "opened", "", "", -1);
+	// spec 078: from here a close of this session waits for its open to reach the observers
+	session_notices.BeginOpen(id);
+	opened.session_id = id;
+	opened.principal = principal;
+	opened.door = door;
+	opened.token_issuer = issuer;
+	opened.opened_at = now;
+	opened.expires_at = expires_at;
 	Session session {std::move(principal), id, expires_at, now};
 	session.door = door;
 	session.opened_at = now;
@@ -346,11 +363,13 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 //! The close event of a session being removed (spec 069): how it ended, and for how long it lived.
 //! Caller holds the lock; the event itself takes nothing of the store's.
 void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now) {
+	session_notices.QueueClose(session.id, how); // spec 078: delivered once the lock is released
 	auto lived = session.opened_at > 0 ? (now - session.opened_at) * 1000000 : -1;
 	SessionEvent(audit.get(), session.principal, session.door, session.id, session.audit_level, how, "", "", lived);
 }
 
 bool PolicyStore::SessionPrincipal(const string &handle, Principal &out, string &reason) {
+	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	// Read before the lock, for the reason SweepLocked gives.
 	auto now = NowSeconds();
 	auto skew = JwtClockSkew();
@@ -474,6 +493,7 @@ idx_t PolicyStore::SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp
 }
 
 idx_t PolicyStore::SessionSweep() {
+	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();
 	auto skew = JwtClockSkew();
 	auto idle = SessionIdleTimeout();
@@ -558,6 +578,7 @@ vector<PolicyStore::SessionInfo> PolicyStore::SessionList() {
 }
 
 bool PolicyStore::SessionKill(const string &id) {
+	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
 	for (auto entry = sessions.begin(); entry != sessions.end(); ++entry) {
@@ -591,6 +612,8 @@ bool PolicyStore::SessionRefOf(const string &handle, SessionRef &out) {
 	out.correlation_id = entry->second.correlation_id;
 	out.traceparent = entry->second.traceparent;
 	out.profile_override = entry->second.profile_override;
+	out.opened_at = entry->second.opened_at;
+	out.expires_at = entry->second.expires_at;
 	return true;
 }
 
@@ -884,6 +907,7 @@ bool PolicyStore::Draining() const {
 }
 
 void PolicyStore::SessionClose(const string &handle) {
+	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
 	auto entry = sessions.find(handle);
@@ -897,6 +921,7 @@ void PolicyStore::SessionClose(const string &handle) {
 }
 
 void PolicyStore::SessionBind(const string &external_id, const string &handle) {
+	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
 	// Ending what this replaces, rather than leaving it behind: a connection that authenticates again
@@ -914,6 +939,7 @@ void PolicyStore::SessionBind(const string &external_id, const string &handle) {
 }
 
 idx_t PolicyStore::SessionCloseAll() {
+	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();
 	lock_guard<mutex> guard(lock);
 	auto closed = sessions.size();
