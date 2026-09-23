@@ -29,6 +29,7 @@
 #include "duckdb/common/types/blob.hpp"
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
+#include "acl_node_load.hpp"
 #include "oidc_core.hpp"
 #include "acl_profile.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -769,6 +770,7 @@ public:
 
 //! The door's auth handler: what the Handshake RPC does. A payload-less handshake stays the no-op
 //! success of spec 058 (the per-call Bearer header is the real gate, and IsValid refuses nobody);
+//! the payload `node-load` answers the load report (spec 079), while `acl_metrics_endpoint` is on;
 //! the payload `discover-auth` answers the discovery document - the Handshake is the protocol's own
 //! unauthenticated pre-auth exchange, and FlightSqlServerBase seals DoAction against custom actions.
 class AclDoorAuthHandler : public flight::ServerAuthHandler {
@@ -783,6 +785,14 @@ public:
 		}
 		if (payload == "discover-auth") {
 			return outgoing->Write(DoorAuthJson(*state->store, "flight"));
+		}
+		if (payload == "node-load") {
+			// spec 079: the load report an orchestrator routes by, behind the same switch as the quack
+			// listener's /metrics (`acl_metrics_endpoint`): counts and states, never an identity
+			if (!NodeLoadServed(state->db)) {
+				return arrow::Status::NotImplemented("acl: the load report is off (acl_metrics_endpoint)");
+			}
+			return outgoing->Write(NodeLoadJson(state->db, *state->store));
 		}
 		return arrow::Status::OK();
 	}

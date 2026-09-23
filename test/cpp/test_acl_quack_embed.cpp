@@ -199,6 +199,25 @@ int main(int argc, char *argv[]) {
 			Check(again.status == 404, "off again: 404 - the setting is read per request");
 		});
 
+		Scenario("GET /.well-known/acl-node is the load report, behind the /metrics switch (spec 079)", [&] {
+			auto off = duckdb::acl::oidc::HttpGet("http://localhost:31975/.well-known/acl-node");
+			Check(off.status == 404, "off with acl_metrics_endpoint: 404 (" + std::to_string(off.status) + ")");
+			Exec(con, "SET GLOBAL acl_metrics_endpoint = true");
+			auto on = duckdb::acl::oidc::HttpGet("http://localhost:31975/.well-known/acl-node");
+			Check(on.Ok() && on.status == 200, "on: the report answers: " + on.error);
+			Check(on.body.find("\"uri\":\"quack:localhost:31975\"") != std::string::npos &&
+			          on.body.find("\"seats\":16") != std::string::npos,
+			      "it names this door and its seats (1024 / 64): " + on.body);
+			// the same document acl_node_load() answers, never an identity
+			auto sql = con.Query("SELECT acl_node_load()");
+			if (CheckOk(*sql, "acl_node_load() answers")) {
+				Check(sql->GetValue(0, 0).ToString() == on.body, "the route and the function are one document");
+			}
+			Check(on.body.find("analyst") == std::string::npos && on.body.find("\"sub") == std::string::npos,
+			      "no role or subject in it");
+			Exec(con, "SET GLOBAL acl_metrics_endpoint = false");
+		});
+
 		Scenario("a draining node refuses new clients while the established one finishes (spec 066)", [&] {
 			Exec(con, "ATTACH 'quack:localhost:31975' AS before (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
 			auto rows = con.Query("SELECT count(*)::BIGINT FROM before.main.orders");

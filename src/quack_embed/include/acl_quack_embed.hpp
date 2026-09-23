@@ -22,9 +22,13 @@ namespace duckdb {
 
 class ExtensionLoader;
 class Connection;
+class DatabaseInstance;
 class QueryResult;
 
 namespace acl {
+
+//! spec 079: the workers a quack client reserves by default - its default read-ahead (64 on 16 cores)
+static constexpr idx_t ACL_QUACK_CLIENT_DEPTH_DEFAULT = 64;
 
 //! Register the embedded server's SQL surface: the acl_quack_* server settings the embedded graph
 //! reads, and the acl_quack_scan_data drain table function.
@@ -46,6 +50,34 @@ void AclQuackStatementCompleted(Connection &connection, const string &connection
 //! from the level and the session's trace whether the execution is profiled, and sets the
 //! connection's profiler so. A connection nobody bound is left alone. Never throws.
 void AclQuackStatementStarting(Connection &connection, const string &connection_id);
+//! The server's connect, before authentication opens a session (spec 079): true when the door has
+//! a seat for one more client - `seated` quack clients each reserving `acl_quack_client_depth` of
+//! the `acl_quack_server_max_connections` workers. False with the reason to answer, audited as a
+//! `session refused` with `at_capacity`. Never throws.
+bool AclQuackAdmit(DatabaseInstance &db, idx_t seated, string &refusal);
+
+//! A seat held for a client while it authenticates (spec 079): admission counts the clients seated
+//! AND the ones between the check and their connection's creation, so a burst of connects cannot all
+//! pass the check at once. Held for the connect handler's scope - released when the connection is
+//! created or refused, an exception included.
+class AclQuackSeatClaim {
+public:
+	AclQuackSeatClaim(DatabaseInstance &db, idx_t seated, string &refusal);
+	~AclQuackSeatClaim();
+	AclQuackSeatClaim(const AclQuackSeatClaim &) = delete;
+	AclQuackSeatClaim &operator=(const AclQuackSeatClaim &) = delete;
+	bool Granted() const {
+		return granted;
+	}
+
+private:
+	DatabaseInstance &db;
+	bool granted = false;
+	bool counted = false;
+};
+//! The server dropped a client connection (spec 079): its DISCONNECT (`how` = client) or a heartbeat
+//! lease that ran out (`idle`). The acl session bound to it ends now. Never throws.
+void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how);
 
 } // namespace acl
 } // namespace duckdb

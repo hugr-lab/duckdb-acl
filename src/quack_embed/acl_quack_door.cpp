@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "acl_quack_embed.hpp"
+#include "acl_node_load.hpp"
 
 #include "acl_audit_pipeline.hpp"
 #include "acl_parser_override.hpp"
@@ -115,6 +116,13 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 				return string();
 			}
 			return RenderPrometheus(shared_store->audit->Hooks());
+		};
+		cfg.node_load = [shared_store, weak_db]() -> string {
+			auto db = weak_db.lock();
+			if (!db || !NodeLoadServed(*db)) {
+				return string();
+			}
+			return NodeLoadJson(*db, *shared_store);
 		};
 		string actual_uri;
 		// a bind or PEM failure inside is an IOException that carries this function's prefix and passes
@@ -238,6 +246,77 @@ void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &resu
 }
 
 } // namespace
+
+AclQuackSeatClaim::AclQuackSeatClaim(DatabaseInstance &db_p, idx_t seated, string &refusal) : db(db_p) {
+	auto store = PolicyStore::Of(db);
+	if (!store) {
+		granted = true; // no acl state to account against: quack's own pool is the bound
+		return;
+	}
+	lock_guard<mutex> guard(store->quack_seat_lock);
+	granted = AclQuackAdmit(db, seated + store->quack_seats_claimed, refusal);
+	if (granted) {
+		store->quack_seats_claimed++;
+		counted = true;
+	}
+}
+
+AclQuackSeatClaim::~AclQuackSeatClaim() {
+	if (!counted) {
+		return;
+	}
+	try {
+		if (auto store = PolicyStore::Of(db)) {
+			lock_guard<mutex> guard(store->quack_seat_lock);
+			if (store->quack_seats_claimed > 0) {
+				store->quack_seats_claimed--;
+			}
+		}
+	} catch (...) {
+	}
+}
+
+bool AclQuackAdmit(DatabaseInstance &db, idx_t seated, string &refusal) {
+	try {
+		auto &config = DBConfig::GetConfig(db);
+		auto read = [&](const char *name, idx_t fallback) {
+			Value value;
+			if (!config.TryGetCurrentSetting(name, value) || value.IsNull()) {
+				return fallback;
+			}
+			return value.GetValue<idx_t>();
+		};
+		auto per_client = read("acl_quack_client_depth", ACL_QUACK_CLIENT_DEPTH_DEFAULT);
+		if (per_client == 0) {
+			return true; // no seat accounting: quack's own pool is the only bound
+		}
+		auto slots = read("acl_quack_server_max_connections", 1024);
+		auto seats = MaxValue<idx_t>(1, slots / per_client);
+		if (seated < seats) {
+			return true;
+		}
+		refusal = StringUtil::Format("acl: node at capacity - %llu of %llu quack clients seated "
+		                             "(acl_quack_server_max_connections %llu / acl_quack_client_depth %llu); "
+		                             "try another node",
+		                             seated, seats, slots, per_client);
+		if (auto store = PolicyStore::Of(db)) {
+			store->AuditSessionRefused("quack", "at_capacity", refusal);
+		}
+		return false;
+	} catch (...) {
+		return true; // accounting that fails never refuses a client: the pool still bounds the node
+	}
+}
+
+void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how) {
+	try {
+		if (auto store = PolicyStore::Of(db)) {
+			store->SessionEndBound(connection_id, how);
+		}
+	} catch (...) {
+		// the idle timeout still ends it
+	}
+}
 
 void AclQuackStatementStarting(Connection &connection, const string &connection_id) {
 	try {

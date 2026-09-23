@@ -11,6 +11,7 @@
 
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/string.hpp"
+#include "duckdb/common/vector.hpp"
 
 #include <functional>
 
@@ -41,6 +42,9 @@ struct AclQuackServeConfig {
 	//! while `acl_metrics_endpoint` is off - the route then answers 404, like one that is not there.
 	//! Unset = no route at all.
 	std::function<string()> metrics;
+	//! spec 079: the load report for GET /.well-known/acl-node, composed per request, or "" while
+	//! `acl_metrics_endpoint` is off (404). Unset = no route at all.
+	std::function<string()> node_load;
 	//! Default (true): advertise /.well-known/quack-auth so an acl-aware client discovers the issuers.
 	//! `mode := 'plain'` sets false - a bare quack server (no discovery route), for a stock client or
 	//! when TLS is terminated by a reverse proxy upstream. Still acl-gated; still cleartext-only here.
@@ -60,6 +64,14 @@ bool StopAclQuackServer(const DatabaseInstance &caller, const string &uri);
 //! Number of embedded servers THIS database instance has open (the "last door" judgement of
 //! acl_quack_stop): another instance's servers must not keep this one's fence armed.
 idx_t AclQuackServerCount(const DatabaseInstance &db);
+
+//! A quack door of this instance as the load report shows it (spec 079): where it listens, and the
+//! clients it holds (connections whose lease has not been swept - a lapsed one goes at the next connect).
+struct AclQuackDoorLoad {
+	string uri;
+	idx_t seated = 0;
+};
+vector<AclQuackDoorLoad> AclQuackDoorLoads(const DatabaseInstance &db);
 
 } // namespace acl
 } // namespace duckdb

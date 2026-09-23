@@ -4,6 +4,7 @@
 Usage: auth_client.py <uri> <check> [args...] [--tls-roots cert.pem]
 Checks:
   discover                 print the discovery JSON the door answers to the 'discover-auth' payload
+  node-load                print the load report the door answers to the 'node-load' payload (spec 079)
   password <user> <pass> <sql>   authenticate with BasicAuth, run sql under the earned bearer, print rows
   bearer <jwt> <sql>       plain bearer call (the path that must stay unaffected)
 """
@@ -61,6 +62,21 @@ if check == "discover":
     handler = Discover()
     client.authenticate(handler)
     print(handler.doc.decode())
+elif check == "node-load":
+    class NodeLoad(fl.ClientAuthHandler):
+        def authenticate(self, outgoing, incoming):
+            outgoing.write(b"node-load")
+            self.doc = incoming.read()
+
+        def get_token(self):
+            return b""
+
+    handler = NodeLoad()
+    try:
+        client.authenticate(handler)
+        print(handler.doc.decode())
+    except fl.FlightError as e:
+        print("refused: " + str(e))
 elif check == "password":
     user, password, sql = args[2], args[3], args[4]
     pair = client.authenticate_basic_token(user, password)

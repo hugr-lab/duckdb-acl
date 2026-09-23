@@ -28,6 +28,7 @@ set(EXTENSION_SOURCES
     src/acl_audit.cpp
     src/acl_profile.cpp
     src/acl_session_hooks.cpp
+    src/acl_node_load.cpp
     src/acl_catalog_rpc.cpp
     src/acl_extension.cpp
     src/acl_introspection.cpp

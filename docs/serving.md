@@ -279,6 +279,7 @@ The embedded server's settings (registered with the door; UBIGINT unless noted):
 | `acl_quack_fetch_producer_buffer_bytes` | 268435456 | any | server-side fetch-ahead cap |
 | `acl_quack_fetch_window` | 8 | GLOBAL | batches with rows a client may have in flight when its result starts (0 = no window) |
 | `acl_quack_fetch_window_max` | 0 | GLOBAL | the most the window grows to while the client keeps reading (0 = no cap) |
+| `acl_quack_client_depth` | 64 | GLOBAL | workers one quack client reserves (its read-ahead); the door seats `acl_quack_server_max_connections` / this many clients and refuses the next at connect (0 = no seat accounting) |
 | `acl_quack_enable_reconnects` (BOOLEAN) | false | any | keep the last result until acknowledged |
 | `acl_quack_debug_emit_delay_ms` | 0 | any | debug: random delay before a batch is published |
 
@@ -304,6 +305,24 @@ produced, then until the client acknowledges it or 20 ms pass. Without that wait
 threads would spin on empty answers for as long as a slow batch takes.
 
 The window works within the protocol and needs nothing from the client. Measurements are in spec 077.
+
+**Seats and the load report** (spec 079). The door keeps a worker thread per keep-alive connection,
+and a quack client keeps one connection per FETCH in flight, which is its read-ahead: 64 by default.
+So the door seats `acl_quack_server_max_connections / acl_quack_client_depth` clients, 16 by default.
+The next client is refused at connect with the reason: `acl: node at capacity - 16 of 16 quack
+clients seated (...); try another node`. A client that disconnects, or whose heartbeat lease runs
+out, frees its seat, and its session ends with it.
+
+Clients that set `quack_fetch_read_ahead = 8` let a node seat eight times as many. Setting
+`acl_quack_client_depth = 8` to match makes the door count them that way.
+
+`acl_node_load()` answers the numbers admission decides with: sessions against `acl_max_sessions`,
+each quack door's seated clients against its seats, draining, and whether a new session or quack
+client would be admitted. An orchestrator reads the same document in two places while
+`acl_metrics_endpoint` is on:
+
+- `GET /.well-known/acl-node` on the quack listener;
+- the Flight Handshake payload `node-load`.
 
 Client recipe: [clients/quack.md](clients/quack.md) (`ATTACH 'quack:<host>:<port>' AS remote (TYPE
 quack, TOKEN '<token>')`, or a secret).

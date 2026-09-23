@@ -1,0 +1,154 @@
+# name: test/sql/integration/acl_quack_seats.test
+# description: the node's seats and its load report (spec 079). A quack client reserves its read-ahead
+#   of the door's workers (acl_quack_client_depth), so the door seats acl_quack_server_max_connections
+#   / acl_quack_client_depth clients and refuses the next one AT CONNECT, with the reason - never by
+#   shedding a socket mid-query. A client that disconnects frees its seat and ends its session at once.
+#   acl_node_load() reports the numbers admission decides with.
+# group: [integration]
+
+require acl
+
+require httpfs
+
+require quack
+
+require json
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t(i INTEGER);
+
+statement ok
+INSERT INTO phys.main.t VALUES (1), (2);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+# --- no door yet: the report says so --------------------------------------------------------------------
+
+query II
+SELECT json_array_length(acl_node_load()::JSON->'quack'->'doors'), (acl_node_load()::JSON->'admit'->>'new_quack_client')::BOOLEAN;
+----
+0	false
+
+# --- two seats: 1024 workers, 512 per client -------------------------------------------------------------
+
+statement ok
+SET GLOBAL acl_quack_client_depth = 512;
+
+statement ok
+SELECT acl_quack_serve('quack:localhost:31493', 'seats-server-token');
+
+statement ok
+ATTACH 'quack:localhost:31493' AS r1 (TYPE quack, TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+statement ok
+ATTACH 'quack:localhost:31493' AS r2 (TYPE quack, TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+query IIIII
+SELECT j->'quack'->>'seats', j->'quack'->'doors'->0->>'seated', j->'quack'->'doors'->0->>'seats_left',
+    (j->'admit'->>'new_quack_client')::BOOLEAN, (j->'admit'->>'new_session')::BOOLEAN
+FROM (SELECT acl_node_load()::JSON AS j);
+----
+2	2	0	false	true
+
+# the third is refused at connect, and told why
+statement error
+ATTACH 'quack:localhost:31493' AS r3 (TYPE quack, TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+<REGEX>:.*acl: node at capacity - 2 of 2 quack clients seated.*acl_quack_client_depth 512.*try another node.*
+
+# counted like every refusal, under its code
+query I
+SELECT value FROM acl_metrics() WHERE name = 'acl.sessions.refused' AND attributes LIKE '%at_capacity%';
+----
+1
+
+# the seated clients keep working
+query I
+SELECT count(*) FROM r2.t;
+----
+2
+
+# --- a client that leaves frees its seat, and its session ends with it ---------------------------------
+
+statement ok
+DETACH r1;
+
+query II
+SELECT j->'quack'->'doors'->0->>'seated', j->'sessions'->'by_door'->>'quack'
+FROM (SELECT acl_node_load()::JSON AS j);
+----
+1	1
+
+statement ok
+ATTACH 'quack:localhost:31493' AS r3 (TYPE quack, TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+query I
+SELECT count(*) FROM r3.t;
+----
+2
+
+# --- a draining node admits nobody new, whatever the seats --------------------------------------------
+
+statement ok
+SELECT acl_drain();
+
+query II
+SELECT (j->'admit'->>'new_session')::BOOLEAN, (j->>'draining')::BOOLEAN FROM (SELECT acl_node_load()::JSON AS j);
+----
+false	true
+
+statement ok
+SELECT acl_resume();
+
+# --- 0 turns the seat accounting off: quack's own pool is the only bound ------------------------------
+
+statement ok
+SET GLOBAL acl_quack_client_depth = 0;
+
+statement ok
+ATTACH 'quack:localhost:31493' AS r4 (TYPE quack, TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+
+statement ok
+DETACH r2;
+
+statement ok
+DETACH r3;
+
+statement ok
+DETACH r4;
+
+statement ok
+SELECT acl_quack_stop('quack:localhost:31493');
+
+statement ok
+SET GLOBAL acl_quack_client_depth = 64;
