@@ -49,8 +49,26 @@ int64_t NowMicros() {
 
 //! The notes of the statements the override decided on this thread, in the order their executions
 //! come (a batch executes its statements in order, on the thread that parsed it).
+//!
+//! A POINTER, never the deque itself (spec 088): a thread_local with a non-trivial destructor is
+//! destroyed at thread exit, and on MinGW (winpthreads' emulated TLS) that destructor ran on freed
+//! storage - a worker thread joined by ~DatabaseInstance crashed in ~deque, about one run in thirty.
+//! The deque lives only while notes are pending and is freed when they are taken, so a thread ends
+//! holding nothing to destroy; one that ends with notes still pending leaks them, a few hundred bytes.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-thread_local std::deque<ProfileNote> pending_notes;
+thread_local std::deque<ProfileNote> *pending_notes = nullptr;
+
+std::deque<ProfileNote> &PendingNotes() {
+	if (!pending_notes) {
+		pending_notes = new std::deque<ProfileNote>(); // NOLINT(cppcoreguidelines-owning-memory): see above
+	}
+	return *pending_notes;
+}
+
+void DropPendingNotes() {
+	delete pending_notes; // NOLINT(cppcoreguidelines-owning-memory)
+	pending_notes = nullptr;
+}
 
 string Bounded(const string &text) {
 	return text.size() <= MAX_TEXT ? text : text.substr(0, MAX_TEXT);
@@ -243,11 +261,11 @@ public:
 	bool published_session = false;
 
 	void QueryBegin(ClientContext &context) override {
-		if (!pending_notes.empty()) {
+		if (pending_notes && !pending_notes->empty()) {
 			// a new parse on this thread, and this statement is its first: what an earlier batch
 			// left, and the note kept for re-executions, are over
-			batch = std::move(pending_notes);
-			pending_notes.clear();
+			batch = std::move(*pending_notes);
+			DropPendingNotes();
 			has_note = false;
 		}
 		// the note is the execution's only when the text is: a follow-up the rewrite appended, a
@@ -449,16 +467,17 @@ uint64_t StatementTextHash(const string &text) {
 }
 
 void PushProfileNote(ProfileNote note) {
-	pending_notes.push_back(std::move(note));
+	PendingNotes().push_back(std::move(note));
 }
 
 void ClearProfileNotes() {
-	pending_notes.clear();
+	DropPendingNotes();
 }
 
 void PushProfileBoundary() {
-	pending_notes.clear();
-	pending_notes.emplace_back(); // text hash 0: taken by no execution, ends what was kept
+	auto &notes = PendingNotes();
+	notes.clear();
+	notes.emplace_back(); // text hash 0: taken by no execution, ends what was kept
 }
 
 bool TakeConnectionProfileNote(ClientContext &context, ProfileNote &out) {

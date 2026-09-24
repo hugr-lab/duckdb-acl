@@ -1327,15 +1327,26 @@ ClientContext *TempScanContext() {
 
 //! The ingest seam (spec 049), the same discipline: set on the thread that calls Prepare, taken by
 //! the rewriter during that Prepare's parse, cleared before the exec lock is released.
+// A pointer to a heap shared_ptr, never the shared_ptr itself (spec 088): a thread_local with a
+// non-trivial destructor is not safe at thread exit on MinGW. It is set and taken within one Prepare.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-static thread_local shared_ptr<TableFunctionInfo> arrow_ingest_factory;
-
-void SetArrowIngestFactory(shared_ptr<TableFunctionInfo> factory) {
-	arrow_ingest_factory = std::move(factory);
-}
+static thread_local shared_ptr<TableFunctionInfo> *arrow_ingest_factory = nullptr;
 
 shared_ptr<TableFunctionInfo> TakeArrowIngestFactory() {
-	return std::move(arrow_ingest_factory);
+	if (!arrow_ingest_factory) {
+		return nullptr;
+	}
+	auto out = std::move(*arrow_ingest_factory);
+	delete arrow_ingest_factory; // NOLINT(cppcoreguidelines-owning-memory)
+	arrow_ingest_factory = nullptr;
+	return out;
+}
+
+void SetArrowIngestFactory(shared_ptr<TableFunctionInfo> factory) {
+	TakeArrowIngestFactory(); // what was set before goes, so a thread holds at most one
+	if (factory) {
+		arrow_ingest_factory = new shared_ptr<TableFunctionInfo>(std::move(factory)); // NOLINT
+	}
 }
 
 //! Walk the connection's private temp catalog through the NO-context, NO-transaction overloads:
