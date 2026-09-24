@@ -117,40 +117,28 @@ jobs:
       - name: Run the suspect under gdb
         shell: bash
         env:
-          ITERATIONS: ${{ inputs.iterations || '40' }}
+          ITERATIONS: ${{ inputs.iterations || '150' }}
         run: |
-          set -u
+          set +e -u   # a crash is what we are looking for: never stop the loop on one
           GDB=/c/msys64/mingw64/bin/gdb.exe
           UT="$(ls build/*/test/unittest.exe | head -1)"
           echo "unittest: $UT"
           mkdir -p crash
           ALONE="test/sql/acl_listing_rls_only.test"
-          # the batch the distribution ran it in (run_tests.py, batch of 10), in that order
-          BATCH="test/sql/acl_grant_scope.test,test/sql/acl_grant_validation.test,test/sql/acl_ingest_gate.test,test/sql/acl_interleave.test,test/sql/acl_introspection.test,test/sql/acl_issuer_client.test,test/sql/acl_jwks.test,test/sql/acl_jwks_locations.test,test/sql/acl_jwt.test,test/sql/acl_listing_rls_only.test"
-          crashes=0
-          for case in alone batch; do
-            args="$ALONE"; [ "$case" = batch ] && args="$BATCH"
-            # plain runs first: the exit code a crash leaves (0xC0000005 = 3221225477 ...)
-            for i in $(seq 1 "$ITERATIONS"); do
-              "$UT" "$args" > "crash/plain-$case-$i.log" 2>&1; rc=$?
-              if [ "$rc" != 0 ]; then echo "plain $case run $i: exit $rc"; crashes=$((crashes+1)); else rm -f "crash/plain-$case-$i.log"; fi
-            done
-            # then under gdb: any signal stops it and prints every thread's stack
-            for i in $(seq 1 "$ITERATIONS"); do
-              "$GDB" -q -batch -ex "set pagination off" -ex "set print thread-events off" -ex run \
-                -ex "info signals SIGSEGV" -ex "thread apply all bt 40" --args "$UT" "$args" \
-                > "crash/gdb-$case-$i.log" 2>&1
-              if grep -qE "received signal|Program terminated|exception" "crash/gdb-$case-$i.log"; then
-                echo "=== gdb $case run $i caught it ==="; crashes=$((crashes+1))
-                sed -n '/received signal/,$p' "crash/gdb-$case-$i.log" | head -200
-              else
-                rm -f "crash/gdb-$case-$i.log"
-              fi
-            done
+          # the first run of 2026-09-24 crashed alone on its 26th plain run, mid-test (no exit-time crash):
+          # every run under gdb now, and the first one caught is the answer
+          for i in $(seq 1 "$ITERATIONS"); do
+            "$GDB" -q -batch -ex "set pagination off" -ex "set print thread-events off" -ex run \
+              -ex "info registers rip" -ex "x/6i \$pc" -ex "thread apply all bt 60" --args "$UT" "$ALONE" \
+              > "crash/gdb-alone-$i.log" 2>&1
+            if grep -qE "received signal|Program terminated with signal" "crash/gdb-alone-$i.log"; then
+              echo "=== gdb run $i caught it ==="
+              sed -n '/received signal/,$p' "crash/gdb-alone-$i.log" | head -400
+              break
+            fi
+            rm -f "crash/gdb-alone-$i.log"
           done
-          echo "crashes seen: $crashes"
           ls crash
-
       - uses: actions/upload-artifact@v4
         if: always()
         with:
