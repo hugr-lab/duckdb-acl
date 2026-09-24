@@ -334,6 +334,20 @@ arrival order, for up to `acl_stream_queue_timeout`. It then fails with the reas
 capacity - the stream memory budget stayed full ...`. The load report's `streams` section and
 `admit.new_stream` show the budget, and so do the `acl.streams.*` gauges.
 
+**Resource groups** (spec 085). A group is a set of named limits, bound to roles
+([management-sql.md](management-sql.md#resource-groups)).
+
+- **When it applies.** A session takes its groups' limits when it opens and keeps them until it ends.
+  A grant or a drop applies to the sessions opened after it.
+- **quack.** A group's `window_start` / `window_max` shape the fetch window, and `batch_bytes` is the
+  batch target on the door's connection. A statement's stream-budget reservation is priced by those
+  limits, and it waits in the budget's line by `queue_priority`. A waiting statement gains one level
+  per 5 s, so nothing waits past the timeout because of priority alone.
+- **Flight.** `max_result_rows` caps the session's streams.
+- **Everywhere.** `max_sessions` refuses a new session of the group at open, with `at_capacity`.
+- **In the load report.** `sessions.by_group` counts the group's live sessions against its max. That
+  names the groups to whoever may read the report, so do not name a group after anything secret.
+
 Client recipe: [clients/quack.md](clients/quack.md) (`ATTACH 'quack:<host>:<port>' AS remote (TYPE
 quack, TOKEN '<token>')`, or a secret).
 

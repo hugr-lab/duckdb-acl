@@ -197,7 +197,11 @@ void AclQuackAuthenticateFunc(DataChunk &args, ExpressionState &state, Vector &r
 		try {
 			auto session_id = RequiredArg(args, 0, row, "acl_quack_authenticate", "session id");
 			auto token = RequiredArg(args, 1, row, "acl_quack_authenticate", "client token");
-			auto handle = store.SessionOpen(token, "quack");
+			// spec 085: a re-authentication replaces the connection's session, so a group at its
+			// max_sessions does not refuse the connection its own token refresh
+			string replacing;
+			store.SessionHandleFor(session_id, replacing);
+			auto handle = store.SessionOpen(token, "quack", replacing);
 			if (handle.empty()) {
 				result.SetValue(row, Value::BOOLEAN(false));
 				continue;
@@ -263,7 +267,15 @@ idx_t SettingOr(DatabaseInstance &db, const char *name, idx_t fallback) {
 
 } // namespace
 
-idx_t AclQuackStreamReserve(DatabaseInstance &db) {
+shared_ptr<const ResourceLimits> AclQuackLimitsOf(ClientContext &context) {
+	auto state = context.registered_state->Get<AclQuackSessionLimits>(AclQuackSessionLimits::KEY);
+	if (!state) {
+		return nullptr;
+	}
+	return state->Get();
+}
+
+idx_t AclQuackStreamReserve(DatabaseInstance &db, const ResourceLimits *limits) {
 	auto fixed = SettingOr(db, "acl_quack_stream_reserve_bytes", 0);
 	if (fixed > 0) {
 		return fixed;
@@ -276,14 +288,18 @@ idx_t AclQuackStreamReserve(DatabaseInstance &db) {
 	if (producer > 0 && memory_cap > 0) {
 		producer = MinValue<idx_t>(producer, memory_cap);
 	}
-	auto window = SettingOr(db, "acl_quack_fetch_window_max", ACL_QUACK_FETCH_WINDOW_MAX_DEFAULT);
+	auto window = limits && limits->window_max.IsValid()
+	                  ? limits->window_max.GetIndex()
+	                  : SettingOr(db, "acl_quack_fetch_window_max", ACL_QUACK_FETCH_WINDOW_MAX_DEFAULT);
 	if (window == 0) {
 		window = SettingOr(db, "acl_quack_client_depth", ACL_QUACK_CLIENT_DEPTH_DEFAULT);
 	}
 	if (window == 0) {
 		window = ACL_QUACK_CLIENT_DEPTH_DEFAULT;
 	}
-	auto batch = SettingOr(db, "acl_quack_target_batch_bytes", 8ULL * 1024ULL * 1024ULL);
+	auto batch = limits && limits->batch_bytes.IsValid()
+	                 ? limits->batch_bytes.GetIndex()
+	                 : SettingOr(db, "acl_quack_target_batch_bytes", 8ULL * 1024ULL * 1024ULL);
 	return producer + window * batch;
 }
 
@@ -301,13 +317,16 @@ AclQuackStreamSlot::AclQuackStreamSlot(Connection &connection) {
 	if (!store) {
 		return;
 	}
-	auto want = AclQuackStreamReserve(db);
+	auto &context = *connection.context;
+	auto limits = AclQuackLimitsOf(context);
+	auto want = AclQuackStreamReserve(db, limits.get());
 	auto budget = AclNodeStreamBudget(db);
 	auto timeout = std::chrono::seconds(SettingOr(db, "acl_stream_queue_timeout", 25));
-	auto &context = *connection.context;
 	bool interrupted = false;
+	// spec 085: the session's group's priority orders the line (aging keeps a low one from starving)
+	auto priority = limits ? limits->queue_priority : 0;
 	if (!store->stream_budget.Acquire(
-	        want, budget, timeout, [&context]() { return context.IsInterrupted(); }, interrupted)) {
+	        want, budget, timeout, [&context]() { return context.IsInterrupted(); }, interrupted, priority)) {
 		if (interrupted) {
 			throw InterruptException();
 		}
@@ -399,6 +418,28 @@ void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, c
 	}
 }
 
+namespace {
+
+//! spec 085: the session's limits onto the server connection its statement runs on - the connection
+//! is the door's (a client cannot SET on it: spec 068), so its session-scoped batch setting is ours
+//! to set, and to clear for a session whose groups name none
+void ApplySessionLimits(ClientContext &context, const ResourceLimits &limits) {
+	context.registered_state->GetOrCreate<AclQuackSessionLimits>(AclQuackSessionLimits::KEY)->Set(limits);
+	optional_ptr<const ConfigurationOption> option;
+	auto index = DBConfig::GetConfig(context).TryGetSettingIndex(Identifier("acl_quack_target_batch_bytes"), option);
+	if (!index.IsValid()) {
+		return;
+	}
+	auto &settings = ClientConfig::GetConfig(context).user_settings;
+	if (limits.batch_bytes.IsValid()) {
+		settings.SetUserSetting(index.GetIndex(), Value::UBIGINT(limits.batch_bytes.GetIndex()));
+	} else {
+		settings.ClearSetting(index.GetIndex());
+	}
+}
+
+} // namespace
+
 void AclQuackStatementStarting(Connection &connection, const string &connection_id) {
 	try {
 		auto store = PolicyStore::Of(*connection.context->db);
@@ -409,6 +450,7 @@ void AclQuackStatementStarting(Connection &connection, const string &connection_
 		}
 		ProfileConnectionFor(*connection.context, store->audit, ref.principal, ref.door, ref.traceparent,
 		                     ref.profile_override);
+		ApplySessionLimits(*connection.context, ref.limits);
 	} catch (...) {
 		// a profile is never worth the statement
 	}

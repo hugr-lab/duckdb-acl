@@ -1597,7 +1597,7 @@ void PolicyStore::CatalogDropRole(const string &role) {
 		}
 		// everything that points at a role goes with it - nothing may dangle
 		for (auto table : {"role_claims", "role_catalogs", "role_object_caps", "grant_columns", "role_schemas",
-		                   "admins", "role_mappings"}) {
+		                   "admins", "role_mappings", "role_resource_groups"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"role\" = " + Lit(role));
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
@@ -1714,6 +1714,64 @@ void PolicyStore::CatalogFunctionCategoryMembers(const string &name, const vecto
 				statements.push_back("INSERT INTO " + catalog->Tbl("function_category_members") + " VALUES (" +
 				                     Lit(name) + ", " + KeyValues(key) + ")");
 			}
+		}
+	});
+}
+
+void PolicyStore::CatalogCreateResourceGroup(const string &name, const case_insensitive_map_t<int64_t> &limits,
+                                             const string &comment) {
+	RequireCatalog(catalog, "acl_create_resource_group");
+	vector<string> values {Lit(name)};
+	for (auto limit : RESOURCE_LIMIT_NAMES) {
+		auto it = limits.find(limit);
+		values.push_back(it == limits.end() ? string("NULL") : std::to_string(it->second));
+	}
+	values.push_back(Lit(comment));
+	catalog->WriteWithReads([&](const ReadFn &, vector<string> &statements) {
+		// a re-create replaces the limits and the comment; the roles bound to it stay bound
+		statements.push_back("DELETE FROM " + catalog->Tbl("resource_groups") + " WHERE \"group\" = " + Lit(name));
+		statements.push_back("INSERT INTO " + catalog->Tbl("resource_groups") +
+		                     " (\"group\", \"window_start\", \"window_max\", \"batch_bytes\", \"max_result_rows\", "
+		                     "\"queue_priority\", \"max_sessions\", \"comment\") VALUES (" +
+		                     StringUtil::Join(values, ", ") + ")");
+	});
+}
+
+void PolicyStore::CatalogDropResourceGroup(const string &name, bool if_exists) {
+	RequireCatalog(catalog, "acl_drop_resource_group");
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		auto exists = read("SELECT 1 FROM " + catalog->Tbl("resource_groups") + " WHERE \"group\" = " + Lit(name));
+		if (exists->RowCount() == 0) {
+			if (if_exists) {
+				return;
+			}
+			throw BinderException("acl admin: resource group \"%s\" does not exist", name);
+		}
+		// its bindings go with it: a role bound to a group that is gone would be a row nothing reads
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_resource_groups") + " WHERE \"group\" = " + Lit(name));
+		statements.push_back("DELETE FROM " + catalog->Tbl("resource_groups") + " WHERE \"group\" = " + Lit(name));
+	});
+}
+
+void PolicyStore::CatalogBindResourceGroup(const string &role, const string &group, bool remove) {
+	RequireCatalog(catalog, remove ? "acl_revoke_resource_group" : "acl_grant_resource_group");
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		if (!remove) {
+			auto group_exists =
+			    read("SELECT 1 FROM " + catalog->Tbl("resource_groups") + " WHERE \"group\" = " + Lit(group));
+			if (group_exists->RowCount() == 0) {
+				throw BinderException("acl admin: resource group \"%s\" does not exist", group);
+			}
+			auto role_exists = read("SELECT 1 FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
+			if (role_exists->RowCount() == 0) {
+				throw BinderException("acl admin: role \"%s\" does not exist", role);
+			}
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_resource_groups") + " WHERE \"role\" = " + Lit(role) +
+		                     " AND \"group\" = " + Lit(group));
+		if (!remove) {
+			statements.push_back("INSERT INTO " + catalog->Tbl("role_resource_groups") + " VALUES (" + Lit(role) +
+			                     ", " + Lit(group) + ")");
 		}
 	});
 }

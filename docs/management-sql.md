@@ -586,6 +586,44 @@ DROP [PERSISTENT] SECRET <name> [FROM <catalog>]
 - No secret value is written to an audit or profile event: a decision names the service and the
   secret's name with capability `secrets`.
 
+## Resource groups
+
+```sql
+CREATE [OR REPLACE] RESOURCE GROUP <group> [WITH] (<limit> <value>, …) [COMMENT '<text>']
+DROP RESOURCE GROUP [IF EXISTS] <group>
+GRANT  RESOURCE GROUP <group> TO   ROLE <role>
+REVOKE RESOURCE GROUP <group> FROM ROLE <role>
+```
+
+A resource group is a set of named limits bound to roles (spec 085). It is resolved once when a
+session opens, and a limit it does not name is the node's setting.
+
+| limit | what it limits | 0 means |
+| --- | --- | --- |
+| `window_start` | the quack fetch window at the start of a stream (`acl_quack_fetch_window`) | no window |
+| `window_max` | how far that window grows (`acl_quack_fetch_window_max`) | no cap |
+| `batch_bytes` | the quack batch target (`acl_quack_target_batch_bytes`); a size like `'32MiB'` is accepted | - |
+| `max_result_rows` | the rows a Flight stream hands out before its refusal (`acl_max_result_rows`) | unlimited |
+| `queue_priority` | the order in the stream budget's line; higher goes first, and waiting raises it | - |
+| `max_sessions` | the live sessions charged to this group | unlimited |
+
+- **Validation.** A name outside the table is refused, and so is a negative value. Only
+  `queue_priority` may be negative.
+- **Several groups.** A principal whose roles are in several groups gets the most generous value of
+  each limit, the same rule capabilities follow. The session is charged to the group that allows the
+  most sessions. A group that limits none leaves the session uncharged.
+- **Node settings.** A group may exceed the node's settings. The node's capacity bounds, which are
+  `acl_node_stream_budget`, the quack seats and `acl_max_sessions`, still hold for everyone.
+- **Re-creating.** A re-create replaces the group's limits, and the roles bound to it stay bound. A
+  drop removes the group's bindings, and so does dropping a role.
+- **Authorization.** A group acts on the whole node, so these statements need an unrestricted `manage`
+  scope.
+- **Listings.** `acl_resource_groups()` and `acl_role_resource_groups()` list the groups and their
+  bindings. `acl_sessions()` shows each session's `groups` and its `charged_group`.
+- **Functions.** The admin functions behind the statements are `acl_create_resource_group(group,
+  limits_json[, comment])`, `acl_drop_resource_group(group[, 'skip'])`,
+  `acl_grant_resource_group(role, group)` and `acl_revoke_resource_group(role, group)`.
+
 ## Administration scopes
 
 ```

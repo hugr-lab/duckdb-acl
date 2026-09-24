@@ -1434,6 +1434,87 @@ bool PolicyStore::CatalogPrincipalMainCap(const Principal &principal, const stri
 	return catalog->PrincipalMainCap(principal, capability);
 }
 
+ResourceLimits CatalogBackend::ResourceLimitsOf(const Principal &principal) {
+	ResourceLimits out;
+	if (principal.roles.empty() || function_mode) {
+		return out;
+	}
+	EnsureFresh();
+	vector<string> roles;
+	for (auto &role : principal.roles) {
+		roles.push_back(Lit(role));
+	}
+	auto result = Query("SELECT DISTINCT g.\"group\", g.\"window_start\", g.\"window_max\", g.\"batch_bytes\", "
+	                    "g.\"max_result_rows\", g.\"queue_priority\", g.\"max_sessions\" FROM " +
+	                    Tbl("role_resource_groups") + " rg JOIN " + Tbl("resource_groups") +
+	                    " g ON g.\"group\" = rg.\"group\" WHERE rg.\"role\" IN (" + StringUtil::Join(roles, ", ") +
+	                    ") ORDER BY 1");
+	// the most generous value per limit: where 0 means unlimited / off, 0 wins; otherwise the largest
+	auto generous = [](optional_idx &into, const Value &value, bool zero_is_unlimited) {
+		if (value.IsNull()) {
+			return;
+		}
+		auto v = NumericCast<idx_t>(MaxValue<int64_t>(value.GetValue<int64_t>(), 0));
+		if (!into.IsValid()) {
+			into = v;
+		} else if (zero_is_unlimited && (v == 0 || into.GetIndex() == 0)) {
+			into = 0;
+		} else if (v > into.GetIndex()) {
+			into = v;
+		}
+	};
+	bool any_priority = false;
+	bool unlimited_sessions = false;
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		auto group = result->GetValue(0, row).ToString();
+		out.groups.push_back(group);
+		generous(out.window_start, result->GetValue(1, row), true);
+		generous(out.window_max, result->GetValue(2, row), true);
+		generous(out.batch_bytes, result->GetValue(3, row), false);
+		generous(out.max_result_rows, result->GetValue(4, row), true);
+		auto priority = result->GetValue(5, row);
+		if (!priority.IsNull()) {
+			auto p = priority.GetValue<int64_t>();
+			out.queue_priority = any_priority ? MaxValue(out.queue_priority, p) : p;
+			any_priority = true;
+		}
+		// a group that states no max_sessions, or 0, limits nothing: the session is charged to none
+		auto max_sessions = result->GetValue(6, row);
+		if (max_sessions.IsNull() || max_sessions.GetValue<int64_t>() <= 0) {
+			unlimited_sessions = true;
+		} else if (!unlimited_sessions) {
+			auto m = NumericCast<idx_t>(max_sessions.GetValue<int64_t>());
+			if (out.charged.empty() || m > out.charged_max) {
+				out.charged = group; // rows come ordered by name: the first of equals keeps it
+				out.charged_max = m;
+			}
+		}
+	}
+	if (unlimited_sessions) {
+		out.charged.clear();
+		out.charged_max = 0;
+	}
+	return out;
+}
+
+ResourceLimits PolicyStore::ResolveResourceLimits(const Principal &principal) {
+	if (!catalog) {
+		return ResourceLimits(); // memory mode has no groups
+	}
+	return catalog->ResourceLimitsOf(principal);
+}
+
+int64_t PolicyStore::MaxResultRowsFor(const string &handle) {
+	{
+		lock_guard<mutex> guard(lock);
+		auto entry = sessions.find(handle);
+		if (entry != sessions.end() && entry->second.limits.max_result_rows.IsValid()) {
+			return NumericCast<int64_t>(entry->second.limits.max_result_rows.GetIndex());
+		}
+	}
+	return MaxResultRows();
+}
+
 void PolicyStore::CatalogLoadRoleClaims(Principal &principal) {
 	catalog->LoadRoleClaims(principal);
 }

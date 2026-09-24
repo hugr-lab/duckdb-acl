@@ -87,6 +87,8 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 | `function_categories` | the function categories (spec 072): name, comment, `builtin` (seeded at creation - never touched by the extension again) |
 | `function_category_members` | a category's keys: `database, schema, name, kind` (`scalar` / `table`) |
 | `function_grants` | per-role or every role's (`role = ''`) grants and denies on a category (key columns `''`) or on a function by name (category `''`); a deny anywhere wins |
+| `resource_groups` | spec 085: a group's limits (`window_start`, `window_max`, `batch_bytes`, `max_result_rows`, `queue_priority`, `max_sessions`; NULL = the node's setting) and comment |
+| `role_resource_groups` | which roles are in which groups |
 | `admins` | global administration scopes: `manage` or `passthrough`, optionally per catalog |
 | `issuers` | JWT issuers: keys or `jwks_uri`, audiences, algs, role claim, claim map, `client_id`, `client_secret` |
 | `role_mappings` | external value → role, per issuer and source (`group` / `claim-value`) |
@@ -95,15 +97,15 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 
 ## Schema versions and migration (spec 034)
 
-The catalog says which shape it is - `meta.schema_version`, currently **13** - and a build reads
+The catalog says which shape it is - `meta.schema_version`, currently **15** - and a build reads
 exactly one shape. The check happens where the catalog is chosen, not in the middle of somebody's
 query:
 
 - `acl_use_db(db, schema, false)` on another version: *"acl catalog: "db"."schema" is schema
-  version 9, this build reads 13 - apply the matching schema/acl_schema.sql, or let acl_use_db(...,
+  version 9, this build reads 15 - apply the matching schema/acl_schema.sql, or let acl_use_db(...,
   true) create it"*.
 - `acl_use_db(db, schema, true)` on an older stamp: *"... is schema version 9 and this build creates
-  13 - an older catalog is migrated (schema/migrations/v<n>.sql for every version above 9, in order),
+  15 - an older catalog is migrated (schema/migrations/v<n>.sql for every version above 9, in order),
   not re-initialised"*. `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that exists, so
   replaying the schema is not a migration.
 - No stamp at all: *"... has no schema_version - it is not an acl policy schema, or it was applied
@@ -117,7 +119,8 @@ query:
    holds the schema. Each step ends by stamping its own number, so a catalog at 12 runs only `v13`.
    Shipped steps: `v11.sql` (spec 048: `nullable` on the column tables, the `keys` table),
    `v12.sql` (spec 064: `client_id` / `client_secret` on `issuers`), `v13.sql` (drops the unused
-   `schema_aliases` table).
+   `schema_aliases` table), `v14.sql` (spec 072: the function categories, seeded as a fresh catalog is),
+   `v15.sql` (spec 085: `resource_groups` and `role_resource_groups`, empty).
 3. Re-open with `acl_use_db(..., false)`.
 
 The steps are written in duckdb dialect; on another engine translate them as you did the schema. A

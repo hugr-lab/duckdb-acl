@@ -123,6 +123,61 @@ int main(int argc, char *argv[]) {
 			Check(got, "the one behind the quitter got the room");
 		});
 
+		Scenario("priority: a higher-priority statement is served before an earlier, lower one (spec 085)", [] {
+			StreamBudget budget;
+			Take(budget, 8, 10, ms(0));
+			std::vector<std::string> order;
+			std::mutex order_lock;
+			auto waiter = [&](const char *name, int64_t priority) {
+				bool interrupted = false;
+				// 5 each: after the first is admitted the second no longer fits, so the order is the queue's
+				if (budget.Acquire(5, 10, ms(3000), nullptr, interrupted, priority)) {
+					{
+						std::lock_guard<std::mutex> guard(order_lock);
+						order.emplace_back(name);
+					}
+					std::this_thread::sleep_for(ms(50));
+					budget.Release(5);
+				}
+			};
+			std::thread low([&] { waiter("low", 0); });
+			std::this_thread::sleep_for(ms(100));
+			std::thread high([&] { waiter("high", 10); });
+			std::this_thread::sleep_for(ms(100));
+			budget.Release(8);
+			low.join();
+			high.join();
+			Check(order.size() == 2 && order[0] == "high", "the later, higher one went first");
+		});
+
+		Scenario("aging: a statement that waited long enough overtakes a higher priority (spec 085)", [] {
+			StreamBudget budget;
+			budget.age_step = ms(100); // one level per 100 ms here; 5 s on a node
+			Take(budget, 8, 10, ms(0));
+			std::vector<std::string> order;
+			std::mutex order_lock;
+			auto waiter = [&](const char *name, int64_t priority) {
+				bool interrupted = false;
+				if (budget.Acquire(5, 10, ms(5000), nullptr, interrupted, priority)) {
+					{
+						std::lock_guard<std::mutex> guard(order_lock);
+						order.emplace_back(name);
+					}
+					std::this_thread::sleep_for(ms(50));
+					budget.Release(5);
+				}
+			};
+			std::thread old_low([&] { waiter("old", 0); });
+			std::this_thread::sleep_for(ms(700)); // aged 7 levels
+			std::thread fresh_high([&] { waiter("fresh", 3); });
+			std::this_thread::sleep_for(ms(50));
+			budget.Release(8);
+			old_low.join();
+			fresh_high.join();
+			Check(order.size() == 2 && order[0] == "old",
+			      "the long waiter went first: " + (order.empty() ? std::string("none") : order[0]));
+		});
+
 		// --- the door ------------------------------------------------------------------------------
 		auto quack_ext = std::string("build/release/extension/quack/quack.duckdb_extension");
 		auto httpfs_ext = std::string("build/release/extension/httpfs/httpfs.duckdb_extension");

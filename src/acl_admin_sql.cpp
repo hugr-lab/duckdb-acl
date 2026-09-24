@@ -5,6 +5,7 @@
 
 #include "acl_admin_sql.hpp"
 
+#include "acl_door_common.hpp"
 #include "acl_scan_util.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/helper.hpp"
@@ -464,7 +465,8 @@ bool IsMgmtStart(const string &text) {
 				second = ahead.PeekWord();
 			}
 			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
-			       StringUtil::CIEquals(second, "issuer") || function_category();
+			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "resource") ||
+			       function_category();
 		}
 		if (StringUtil::CIEquals(first, "alter")) {
 			// duckdb owns ALTER TABLE/VIEW/...: our object forms carry the VIRTUAL marker, and
@@ -476,7 +478,8 @@ bool IsMgmtStart(const string &text) {
 		// DROP: our own forms carry VIRTUAL, and duckdb has no DROP ROLE/ISSUER/MAP/RELATION
 		return StringUtil::CIEquals(second, "relation") || StringUtil::CIEquals(second, "virtual") ||
 		       StringUtil::CIEquals(second, "role") || StringUtil::CIEquals(second, "issuer") ||
-		       StringUtil::CIEquals(second, "map") || StringUtil::CIEquals(second, "reference") || function_category();
+		       StringUtil::CIEquals(second, "map") || StringUtil::CIEquals(second, "reference") ||
+		       StringUtil::CIEquals(second, "resource") || function_category();
 	}
 	return false;
 }
@@ -796,6 +799,42 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			}
 			return MakeAdminCall("acl_define_role", {Value(role), Value(claims), Value(mode)});
 		}
+		if (s.Accept("resource")) {
+			// CREATE [OR REPLACE] RESOURCE GROUP g [WITH] (window_max 64, batch_bytes '32MiB', …)
+			// [COMMENT '…'] (spec 085): a re-create replaces the limits; the roles bound to it stay
+			s.Expect("group");
+			auto group = s.Word("a group name");
+			s.Accept("with");
+			string limits = "{}";
+			if (s.AtParen()) {
+				vector<string> entries;
+				for (auto &item : SplitTopLevel(s.Parens(), ',')) {
+					auto text = item;
+					StringUtil::Trim(text);
+					if (text.empty()) {
+						continue;
+					}
+					auto space = text.find_first_of(" \t=");
+					if (space == string::npos) {
+						throw BinderException("acl admin: a limit is written as name value, got \"%s\"", text);
+					}
+					auto name = text.substr(0, space);
+					auto value = text.substr(space + 1);
+					StringUtil::Trim(value);
+					if (!value.empty() && value[0] == '=') {
+						value = value.substr(1);
+					}
+					value = Unquoted(value);
+					entries.push_back(JsonQuote(StringUtil::Lower(name)) + ": " + JsonQuote(value));
+				}
+				limits = "{" + StringUtil::Join(entries, ", ") + "}";
+			}
+			string comment;
+			if (s.Accept("comment")) {
+				comment = s.Quoted("comment");
+			}
+			return MakeAdminCall("acl_create_resource_group", {Value(group), Value(limits), Value(comment)});
+		}
 		if (s.Accept("function")) {
 			// CREATE FUNCTION CATEGORY c [COMMENT '…'] (spec 072): the operator's own category; a
 			// re-create keeps the members and grants and takes the new comment
@@ -925,6 +964,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		return MakeAdminCall("acl_add_relation", {Value(vcat), Value(vname), Value(phys), Value(columns), Value(rls)});
 	}
 	if (StringUtil::CIEquals(keyword, "grant")) {
+		if (s.Accept("resource")) {
+			// GRANT RESOURCE GROUP g TO ROLE r (spec 085)
+			s.Expect("group");
+			auto group = s.Word("a group name");
+			s.Expect("to");
+			s.Expect("role");
+			return MakeAdminCall("acl_grant_resource_group", {Value(s.Word("a role name")), Value(group)});
+		}
 		if (s.Accept("admin")) {
 			// GRANT ADMIN <scope> TO ROLE r - the GLOBAL scope; managing one catalog is granted with
 			// GRANT CATALOG c TO ROLE r CAPS '{"manage": true}'
@@ -1004,6 +1051,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			s.Expect("role");
 			auto role = s.Word("a role name");
 			return MakeAdminCall("acl_revoke_admin", {Value(role)});
+		}
+		if (s.Accept("resource")) {
+			// REVOKE RESOURCE GROUP g FROM ROLE r (spec 085)
+			s.Expect("group");
+			auto group = s.Word("a group name");
+			s.Expect("from");
+			s.Expect("role");
+			return MakeAdminCall("acl_revoke_resource_group", {Value(s.Word("a role name")), Value(group)});
 		}
 		if (s.Accept("schema")) { // REVOKE SCHEMA v.path FROM ROLE r
 			string vcat, path;
@@ -1282,6 +1337,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname), Value(mode)});
 		}
+		if (s.Accept("resource")) {
+			// DROP RESOURCE GROUP [IF EXISTS] g (spec 085): its role bindings go too
+			s.Expect("group");
+			if_exists(s);
+			return MakeAdminCall("acl_drop_resource_group", {Value(s.Word("a group name")), Value(mode)});
+		}
 		if (s.Accept("function")) {
 			// DROP FUNCTION CATEGORY [IF EXISTS] c (spec 072): the members and every grant on it go too
 			s.Expect("category");
@@ -1422,6 +1483,11 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	    {"acl_revoke_function", -1},
 	    // spec 074 slice 3: a session is the node's, not a catalog's - an unrestricted manage scope
 	    {"acl_session_profile", -1},
+	    // spec 085: a resource group limits a role's sessions on the whole node - unrestricted manage
+	    {"acl_create_resource_group", -1},
+	    {"acl_drop_resource_group", -1},
+	    {"acl_grant_resource_group", -1},
+	    {"acl_revoke_resource_group", -1},
 	};
 	MgmtProvenance provenance;
 	auto &select = statement.Cast<SelectStatement>().node->Cast<SelectNode>();
