@@ -194,6 +194,28 @@ cap="$(server_says "SELECT current_setting('acl_max_result_rows')")"
 [ "$cap" = "0" ] || fail "the cap was not lifted: $cap"
 echo "  pass the row cap hands out exactly 1000 rows, then refuses"
 
+# --- spec 085: a resource group's row cap, for the sessions its role opens after the grant ------------
+{
+	echo "SET GLOBAL acl_allow_anonymous_admin=true;"
+	echo "ACL ADMIN CREATE RESOURCE GROUP capped WITH (max_result_rows 500);"
+	echo "ACL ADMIN GRANT RESOURCE GROUP capped TO ROLE analyst;"
+	echo "SET GLOBAL acl_allow_anonymous_admin=false;"
+} >&3
+bound="$(server_says "SELECT count(*) FROM acl_role_resource_groups() WHERE \"group\" = 'capped'")"
+[ "$bound" = "1" ] || fail "the group was not bound: $bound"
+got="$(client consume "SELECT * FROM big")"
+echo "$got" | grep -q "exceeds acl_max_result_rows (500)" || fail "the group's cap was not applied: $got"
+echo "$got" | grep -q "'rows': 500," || fail "the client did not receive exactly the group's 500 rows: $got"
+ended="$(await_stream "^stream_capped,500$" "the group's cap was not recorded with exactly its rows")"
+{
+	echo "SET GLOBAL acl_allow_anonymous_admin=true;"
+	echo "ACL ADMIN DROP RESOURCE GROUP capped;"
+	echo "SET GLOBAL acl_allow_anonymous_admin=false;"
+} >&3
+gone="$(server_says "SELECT count(*) FROM acl_resource_groups()")"
+[ "$gone" = "0" ] || fail "the group was not dropped: $gone"
+echo "  pass a resource group's row cap hands out exactly its 500 rows, then refuses"
+
 # --- a bulk load whose client dies mid-stream is rolled back and named ---------------------------
 python3 "$HERE/stream_client.py" "$URI" ingest orders >"$TMP/ingest.out" 2>&1 &
 INGEST_PID=$!

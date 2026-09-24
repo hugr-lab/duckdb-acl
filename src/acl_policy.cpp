@@ -18,6 +18,7 @@
 #include "duckdb/main/database_manager.hpp"
 
 #include <chrono>
+#include <map>
 #include <random>
 #include "duckdb/parser/parser.hpp"
 
@@ -238,12 +239,12 @@ string MintRandomHex(idx_t bytes) {
 //! The catch is deliberately every exception, not the source's alone, and every one of them is
 //! `source_error` to a door: a door must not learn the difference between a catalog that is down and
 //! a bug of ours, and the audit keeps the text either way.
-string PolicyStore::SessionOpen(const string &token, const string &door) {
+string PolicyStore::SessionOpen(const string &token, const string &door, const string &replacing) {
 	DeliverSessionNotices deliver(session_notices); // a sweep inside may have ended sessions
 	Principal principal; // as far as verification got, so a refusal can still name who was trying
 	try {
 		SessionOpenInfo opened;
-		auto handle = SessionOpenBody(token, door, principal, opened);
+		auto handle = SessionOpenBody(token, door, principal, opened, replacing);
 		if (!handle.empty()) {
 			// spec 078: the observers, before the handle is anyone's - outside the store's lock, the
 			// verified token by reference for the call only
@@ -260,7 +261,7 @@ string PolicyStore::SessionOpen(const string &token, const string &door) {
 }
 
 string PolicyStore::SessionOpenBody(const string &token, const string &door, Principal &principal,
-                                    SessionOpenInfo &opened) {
+                                    SessionOpenInfo &opened, const string &replacing) {
 	// a refusal is a session event too (spec 069): the reason a client never learns is what the
 	// operator's record carries
 	auto refused = [&](const Principal &who, const char *code, const string &reason) {
@@ -322,6 +323,9 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 	if (audit && audit->LevelForSession(principal, door, chosen)) {
 		session_level = static_cast<int8_t>(chosen);
 	}
+	// spec 085: the principal's resource groups, resolved once for the session's whole life - a read of
+	// the policy, so before the lock (a source that fails is the door's source_error, above)
+	auto limits = ResolveResourceLimits(principal);
 	// Minted before the lock because it needs none, so that checking the cap and inserting happen in
 	// ONE critical section: doing them in two let concurrent opens step over the cap between them.
 	auto now = NowSeconds();
@@ -344,6 +348,21 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 		return refused(principal, "at_capacity",
 		               "acl: at acl_max_sessions - a new session is refused, never an old one ended");
 	}
+	if (!limits.charged.empty()) {
+		// spec 085: the group's own cap, in the same critical section as the node's
+		idx_t live = 0;
+		for (auto &entry : sessions) {
+			// the session this open replaces (a quack connection re-authenticating) is ending, not live
+			if (entry.second.limits.charged == limits.charged && entry.first != replacing) {
+				live++;
+			}
+		}
+		if (live >= limits.charged_max) {
+			return refused(principal, "at_capacity",
+			               "acl: resource group \"" + limits.charged + "\" is at its max_sessions (" +
+			                   std::to_string(limits.charged_max) + ") - a new session is refused");
+		}
+	}
 	SessionEvent(audit.get(), principal, door, id, session_level, "opened", "", "", -1);
 	// spec 078: from here a close of this session waits for its open to reach the observers
 	session_notices.BeginOpen(id);
@@ -357,6 +376,7 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 	session.door = door;
 	session.opened_at = now;
 	session.audit_level = session_level;
+	session.limits = std::move(limits);
 	sessions[handle] = std::move(session);
 	return handle;
 }
@@ -575,6 +595,8 @@ vector<PolicyStore::SessionInfo> PolicyStore::SessionList() {
 			}
 			info.id = entry.second.id;
 			info.subject = entry.second.principal.subject;
+			info.groups = entry.second.limits.groups;
+			info.charged_group = entry.second.limits.charged;
 			info.roles = entry.second.principal.roles;
 			info.expires_at = entry.second.expires_at;
 			info.idle_seconds = now - entry.second.last_used;
@@ -635,7 +657,22 @@ bool PolicyStore::SessionRefOf(const string &handle, SessionRef &out) {
 	out.profile_override = entry->second.profile_override;
 	out.opened_at = entry->second.opened_at;
 	out.expires_at = entry->second.expires_at;
+	out.limits = entry->second.limits;
 	return true;
+}
+
+vector<std::pair<string, std::pair<idx_t, idx_t>>> PolicyStore::SessionCountsByGroup() {
+	lock_guard<mutex> guard(lock);
+	std::map<string, std::pair<idx_t, idx_t>> counts;
+	for (auto &entry : sessions) {
+		auto &limits = entry.second.limits;
+		if (!limits.charged.empty()) {
+			auto &count = counts[limits.charged];
+			count.first++;
+			count.second = limits.charged_max;
+		}
+	}
+	return vector<std::pair<string, std::pair<idx_t, idx_t>>>(counts.begin(), counts.end());
 }
 
 bool PolicyStore::SetSessionProfile(const string &id, int8_t level) {

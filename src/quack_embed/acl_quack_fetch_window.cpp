@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "acl_quack_fetch_window.hpp"
+#include "acl_quack_embed.hpp"
 
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
@@ -70,6 +71,14 @@ shared_ptr<AclQuackFetchWindow>
 AclQuackFetchWindowFor(ClientContext &context, const shared_ptr<QuackResultStream> &stream, DatabaseInstance &db) {
 	auto start = QuackGetUBigintSetting(db, "acl_quack_fetch_window", ACL_QUACK_FETCH_WINDOW_DEFAULT);
 	auto max = QuackGetUBigintSetting(db, "acl_quack_fetch_window_max", ACL_QUACK_FETCH_WINDOW_MAX_DEFAULT);
+	// spec 085: the session's resource groups may name either
+	auto limits = AclQuackLimitsOf(context);
+	if (limits && limits->window_start.IsValid()) {
+		start = limits->window_start.GetIndex();
+	}
+	if (limits && limits->window_max.IsValid()) {
+		max = limits->window_max.GetIndex();
+	}
 	// the types are written when the statement binds (under the stream's bind lock, which Bound()
 	// takes); a stream that is not bound yet - a drain waiting for the client's data - or has no
 	// columns answers one count, and gets no window

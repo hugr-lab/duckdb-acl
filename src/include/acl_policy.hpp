@@ -11,6 +11,7 @@
 #include "acl_stream_budget.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/mutex.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/qualified_name.hpp"
@@ -250,6 +251,25 @@ struct CatalogBackend; // catalog-DB policy backend (spec 006), declared in acl_
 //! (spec 006) reading policy from an ATTACHed database in standard duckdb dialect. Owned by
 //! AclParserInfo (reached from the parser override) and shared with the admin setup functions via
 //! ScalarFunctionInfo - no process-global state, so DB instances stay isolated.
+//! spec 085: what a session's resource groups allow, resolved once when it opens. An unset limit (an
+//! invalid optional_idx) means the node's setting applies. Across a principal's groups each limit
+//! takes the most generous value (0 = unlimited / off wins where 0 means that); `max_sessions` is
+//! charged to the one group that allows the most.
+struct ResourceLimits {
+	vector<string> groups; // every group the principal's roles are in, sorted
+	string charged;        // the group this session counts against ('' = none limits it)
+	idx_t charged_max = 0; // that group's max_sessions
+	optional_idx window_start;
+	optional_idx window_max;
+	optional_idx batch_bytes;
+	optional_idx max_result_rows;
+	int64_t queue_priority = 0;
+};
+
+//! The limits a resource group states, as written (spec 085): the names a group may carry
+static constexpr const char *RESOURCE_LIMIT_NAMES[] = {"window_start",    "window_max",     "batch_bytes",
+                                                       "max_result_rows", "queue_priority", "max_sessions"};
+
 struct PolicyStore {
 	mutex lock;
 	// role -> virtual name -> policy (tables and views share one namespace)
@@ -297,6 +317,8 @@ struct PolicyStore {
 		//! the door's completion hook to tell a load's outcome from any other statement's (spec 069);
 		//! taken once
 		string drain_stream;
+		//! spec 085: what its resource groups allow, resolved at open
+		ResourceLimits limits;
 	};
 	unordered_map<string, Session> sessions;
 	//! The audit pipeline of this instance (spec 069); set at load, before anything serves
@@ -492,6 +514,16 @@ struct PolicyStore {
 	// spec 072: the function categories' writers (acl_catalog_admin.cpp). Every one bumps the policy
 	// version, so the next statement resolves against a model rebuilt from the rows.
 	void CatalogCreateFunctionCategory(const string &name, const string &comment);
+	//! spec 085: resource groups. `limits` maps a name of RESOURCE_LIMIT_NAMES to its value (a
+	//! re-create replaces them all); a drop takes the group's role bindings with it.
+	void CatalogCreateResourceGroup(const string &name, const case_insensitive_map_t<int64_t> &limits,
+	                                const string &comment);
+	void CatalogDropResourceGroup(const string &name, bool if_exists);
+	void CatalogBindResourceGroup(const string &role, const string &group, bool remove);
+	//! The limits of the principal's groups, merged (catalog mode; memory mode has no groups)
+	ResourceLimits ResolveResourceLimits(const Principal &principal);
+	//! Live sessions per charged group, with that group's max (the load report, acl_resource_groups)
+	vector<std::pair<string, std::pair<idx_t, idx_t>>> SessionCountsByGroup();
 	void CatalogDropFunctionCategory(const string &name, bool if_exists);
 	//! add=true inserts the keys as members (the category must exist), add=false removes them
 	void CatalogFunctionCategoryMembers(const string &name, const vector<FunctionKey> &keys, bool add);
@@ -566,7 +598,7 @@ struct PolicyStore {
 	//! handle and a `session refused` event carrying `source_error` - never an exception a client
 	//! reads. `acl_session_open()` (door `session`) is the operator's own call and still throws: the
 	//! gateway is the trusted side by the deployment invariant, and it is the one that has to know.
-	string SessionOpen(const string &token, const string &door = "session");
+	string SessionOpen(const string &token, const string &door = "session", const string &replacing = string());
 	//! The operator's per-session audit level (spec 069), by the ops id; -1 inherits. False = no such session.
 	bool SetSessionAuditLevel(const string &id, int8_t level);
 	//! A session's own level by handle, -1 when it inherits or the handle is unknown.
@@ -616,6 +648,8 @@ struct PolicyStore {
 		//! spec 078: what a statement's AclConnection says about the session
 		int64_t opened_at = 0;
 		int64_t expires_at = 0;
+		//! spec 085: its resource groups' limits
+		ResourceLimits limits;
 	};
 	bool SessionRefOf(const string &handle, SessionRef &out);
 	//! spec 074 slice 3: the operator's profile level on a session by its ops id (-1 clears it);
@@ -704,6 +738,9 @@ struct PolicyStore {
 		//! spec 074 slice 3: the profile level IN FORCE and which of the three decided it
 		string profile_level;
 		string profile_source;
+		//! spec 085: the resource groups its roles are in, and the one it is charged to
+		vector<string> groups;
+		string charged_group;
 	};
 	//! A snapshot of the live sessions - admin-only (the door's, not a principal's).
 	vector<SessionInfo> SessionList();
@@ -734,6 +771,8 @@ struct PolicyStore {
 	//! spec 071: drop the cached document of one issuer ("" = every issuer); the next token re-reads
 	int64_t JwksDropCache(const string &issuer);
 	int64_t MaxResultRows();
+	//! spec 085: the row cap of a session's statements - its groups' `max_result_rows`, else the node's
+	int64_t MaxResultRowsFor(const string &handle);
 	int64_t FlightStreamIdleSeconds();
 	int64_t MaxSessions();
 
@@ -799,7 +838,8 @@ private:
 	//! the caller is one try and this stays readable; `principal` is filled as far as verification
 	//! got, so a refusal event can still name who was trying. PRIVATE on purpose: calling it
 	//! directly is how the guard above would be bypassed, and a door must never be able to.
-	string SessionOpenBody(const string &token, const string &door, Principal &principal, SessionOpenInfo &opened);
+	string SessionOpenBody(const string &token, const string &door, Principal &principal, SessionOpenInfo &opened,
+	                       const string &replacing);
 
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);

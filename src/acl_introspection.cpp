@@ -338,6 +338,8 @@ void RegisterAclIntrospection(ExtensionLoader &loader, const shared_ptr<PolicySt
 	                                 "function_categories",
 	                                 "function_category_members",
 	                                 "function_grants",
+	                                 "resource_groups",
+	                                 "role_resource_groups",
 	                                 "status"};
 	for (auto listing : LISTINGS) {
 		TableFunction function(Identifier(string("acl_") + listing), {}, AclIntrospectionScan, AclIntrospectionBind,

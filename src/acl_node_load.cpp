@@ -51,6 +51,13 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 	for (auto &door : store.SessionCountsByDoor()) {
 		by_door += (by_door.empty() ? "" : ",") + JsonQuote(door.first) + ":" + std::to_string(door.second);
 	}
+	// spec 085: sessions per resource group that caps them - what an orchestrator routes a tenant by
+	string groups;
+	for (auto &group : store.SessionCountsByGroup()) {
+		groups += (groups.empty() ? "" : ",") + JsonQuote(group.first) +
+		          ":{\"live\":" + std::to_string(group.second.first) +
+		          ",\"max\":" + std::to_string(group.second.second) + "}";
+	}
 
 	string quack = "null";
 	bool quack_room = false;
@@ -82,8 +89,9 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 	}
 #endif
 	return "{\"draining\":" + string(draining ? "true" : "false") + ",\"sessions\":{\"live\":" + std::to_string(live) +
-	       ",\"max\":" + std::to_string(max_sessions) + ",\"by_door\":{" + by_door + "}},\"quack\":" + quack +
-	       ",\"streams\":" + streams + ",\"admit\":{\"new_session\":" + (session_room ? "true" : "false") +
+	       ",\"max\":" + std::to_string(max_sessions) + ",\"by_door\":{" + by_door + "},\"by_group\":{" + groups +
+	       "}},\"quack\":" + quack + ",\"streams\":" + streams +
+	       ",\"admit\":{\"new_session\":" + (session_room ? "true" : "false") +
 	       ",\"new_quack_client\":" + (session_room && quack_room ? "true" : "false") +
 	       ",\"new_stream\":" + (stream_room ? "true" : "false") + "}}";
 }

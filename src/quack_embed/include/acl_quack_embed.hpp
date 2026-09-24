@@ -77,8 +77,34 @@ private:
 	idx_t bytes = 0;
 };
 
-//! spec 080: what one quack stream reserves, and the node's budget, as the settings say now
-idx_t AclQuackStreamReserve(DatabaseInstance &db);
+//! spec 085: the resource limits of the session a door connection's statement runs under - put on the
+//! server connection by AclQuackStatementStarting, read by the stream slot and the fetch window of
+//! that statement. A connection nobody bound carries none (the node's settings apply).
+class AclQuackSessionLimits : public ClientContextState {
+public:
+	static constexpr const char *KEY = "acl_quack_session_limits";
+	//! Swapped whole under the lock: a FETCH of the previous statement's stream may read while the
+	//! next statement puts its session's limits here
+	void Set(ResourceLimits limits_p) {
+		auto next = make_shared_ptr<const ResourceLimits>(std::move(limits_p));
+		lock_guard<mutex> guard(lock);
+		limits = std::move(next);
+	}
+	shared_ptr<const ResourceLimits> Get() const {
+		lock_guard<mutex> guard(lock);
+		return limits;
+	}
+
+private:
+	mutable mutex lock;
+	shared_ptr<const ResourceLimits> limits;
+};
+//! The limits on `context`'s connection now, or null
+shared_ptr<const ResourceLimits> AclQuackLimitsOf(ClientContext &context);
+
+//! spec 080: what one quack stream reserves, and the node's budget, as the settings say now; spec 085:
+//! a session's group may name the window cap and the batch the reservation is priced by
+idx_t AclQuackStreamReserve(DatabaseInstance &db, const ResourceLimits *limits = nullptr);
 idx_t AclNodeStreamBudget(DatabaseInstance &db);
 
 class AclQuackSeatClaim {

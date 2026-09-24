@@ -1,0 +1,133 @@
+# name: test/sql/integration/acl_quack_resource_groups.test
+# description: a session's resource group on the quack door (spec 085). The node fixes the fetch window
+#   at 2 against a read-ahead of 16, so most FETCHes are answered empty (spec 077); a group that names
+#   window_start 0 gives its sessions quack's own behaviour instead - one FETCH per batch - and a group's
+#   batch_bytes is the target the session's statements are cut to, on the door's connection only.
+#   Groups resolve when a session opens: each quack_query below is a new connection, a new session.
+# group: [integration]
+
+require acl
+
+require httpfs
+
+require quack
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.seq AS SELECT i FROM range(200000) t(i);
+
+# what the door's connection has as its batch target while the session's statement runs
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.batch AS SELECT current_setting('acl_quack_target_batch_bytes')::BIGINT AS b;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP wide WITH (window_start 0, batch_bytes 32768);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+statement ok
+SET GLOBAL acl_quack_target_batch_bytes = 16384;
+
+statement ok
+SET GLOBAL acl_quack_fetch_window = 2;
+
+statement ok
+SET GLOBAL acl_quack_fetch_window_max = 2;
+
+statement ok
+SET quack_fetch_read_ahead = 16;
+
+query I
+SELECT acl_quack_serve('quack:localhost:31496', 'groups-server-token');
+----
+quack:localhost:31496
+
+statement ok
+CALL enable_logging(['Quack'], storage := 'memory');
+
+# --- no group: the node's window and batch ---------------------------------------------------------
+
+query I
+SELECT b FROM quack_query('quack:localhost:31496', 'SELECT b FROM batch', token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+16384
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i) FROM quack_query('quack:localhost:31496', 'SELECT i FROM seq ORDER BY i', token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+200000	19999900000
+
+statement ok
+CREATE TABLE node_fetches AS SELECT count(*) AS n FROM duckdb_logs
+WHERE message LIKE '%FETCH_REQUEST%' AND message LIKE '%''server'': ''http%';
+
+query I
+SELECT n > 300 FROM node_fetches;
+----
+true
+
+# --- the group's window (none) and batch, for the sessions that open after the grant ---------------
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP wide TO ROLE analyst;
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+query I
+SELECT b FROM quack_query('quack:localhost:31496', 'SELECT b FROM batch', token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+32768
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i) FROM quack_query('quack:localhost:31496', 'SELECT i FROM seq ORDER BY i', token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+----
+200000	19999900000
+
+# one FETCH per (twice as large) batch plus the read-ahead past the end: far under the node's count
+query I
+SELECT count(*) * 3 < (SELECT n FROM node_fetches) FROM duckdb_logs
+WHERE message LIKE '%FETCH_REQUEST%' AND message LIKE '%''server'': ''http%';
+----
+true
+
+# the node's own connection never took the group's batch
+query I
+SELECT current_setting('acl_quack_target_batch_bytes');
+----
+16384
+
+statement ok
+SELECT acl_quack_stop('quack:localhost:31496');

@@ -338,6 +338,14 @@ gauges `acl.streams.*`. Flight holds one chunk per stream and does not reserve.
 instance, and a static map tore the instance down among the static destructors (an attached quack
 client's curl destructor on a dead mutex, abort); at exit an `atexit` stops accepting, nothing more,
 so an unstopped door's instance gets no final checkpoint - stop the doors before closing.
+**Spec 085 - resource groups**: `CREATE RESOURCE GROUP g (window_start|window_max|batch_bytes|
+max_result_rows|queue_priority|max_sessions …)` / `GRANT RESOURCE GROUP g TO ROLE r` (unrestricted
+manage; schema v15 `resource_groups` + `role_resource_groups`), resolved ONCE at `SessionOpenBody` into
+the session's `ResourceLimits` (most generous per limit, 0 = unlimited wins; `max_sessions` charged to
+the group allowing most, checked beside `acl_max_sessions`). quack: `AclQuackStatementStarting` puts
+them on the door connection (`AclQuackSessionLimits` state + the session-scoped batch setting), the
+window and the stream slot read them; `StreamBudget` orders by priority then arrival, +1 level per 5 s
+waited. Flight: `MaxResultRowsFor(handle)`. Load report `sessions.by_group`, `acl_sessions()` groups.
 The embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
 Streamed ingest
 (`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the

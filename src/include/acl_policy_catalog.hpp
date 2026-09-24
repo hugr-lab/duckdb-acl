@@ -460,6 +460,8 @@ struct CatalogBackend {
 	//! spec 072: the model of the function categories, or nullptr when this source has none
 	shared_ptr<const FunctionCategoryModel> FunctionModel();
 
+	//! spec 085: the merged limits of the principal's resource groups (none in the driver contract)
+	ResourceLimits ResourceLimitsOf(const Principal &principal);
 	void LoadRoleClaims(Principal &principal);
 
 	bool SettingBool(const char *name, bool fallback);

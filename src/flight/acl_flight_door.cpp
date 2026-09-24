@@ -446,7 +446,7 @@ public:
 	                bool durable_p)
 	    : state(std::move(state_p)), reservation(std::move(reservation_p)), slot(std::move(slot_p)),
 	      schema_(std::move(schema_p)), properties(std::move(properties_p)), context(context_p),
-	      handle(std::move(handle_p)), durable(durable_p), cap(state->store->MaxResultRows()) {
+	      handle(std::move(handle_p)), durable(durable_p), cap(state->store->MaxResultRowsFor(handle)) {
 		reservation->conn->stream_last_pull.store(FlightDoorState::NowMillis());
 		state->open_streams++;
 	}

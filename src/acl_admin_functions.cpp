@@ -8,6 +8,8 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/config.hpp"
+#include "yyjson.hpp"
 
 namespace duckdb {
 namespace acl {
@@ -980,6 +982,119 @@ void AclRevokeFunctionFunc(DataChunk &args, ExpressionState &state, Vector &resu
 	FunctionNameGrant(args, state, result, "acl_revoke_function", true);
 }
 
+//===--------------------------------------------------------------------===//
+// Resource groups (spec 085)
+//===--------------------------------------------------------------------===//
+
+//! `{"window_max": 64, "batch_bytes": "32MiB", ...}` -> the limits a group states. Every name must be
+//! one a group carries - unlike a capability, a limit written wrong would silently limit nothing - and
+//! every value a non-negative integer (a priority may be negative); `batch_bytes` also takes a size.
+case_insensitive_map_t<int64_t> ParseResourceLimits(const string &json, const char *fn) {
+	using namespace duckdb_yyjson; // NOLINT
+	case_insensitive_map_t<int64_t> limits;
+	auto doc = yyjson_read(json.c_str(), json.size(), 0);
+	if (!doc) {
+		throw BinderException("%s: the limits are a JSON object, got \"%s\"", fn, json);
+	}
+	auto root = yyjson_doc_get_root(doc);
+	try {
+		if (!yyjson_is_obj(root)) {
+			throw BinderException("%s: the limits are a JSON object", fn);
+		}
+		yyjson_val *key, *val;
+		yyjson_obj_iter iter = yyjson_obj_iter_with(root);
+		while ((key = yyjson_obj_iter_next(&iter))) {
+			val = yyjson_obj_iter_get_val(key);
+			auto name = StringUtil::Lower(yyjson_get_str(key));
+			bool known = false;
+			for (auto limit : RESOURCE_LIMIT_NAMES) {
+				known = known || name == limit;
+			}
+			if (!known) {
+				throw BinderException("%s: \"%s\" is not a limit a resource group carries (%s)", fn, name,
+				                      "window_start, window_max, batch_bytes, max_result_rows, queue_priority, "
+				                      "max_sessions");
+			}
+			if (yyjson_is_null(val)) {
+				continue; // unset: the node's setting applies
+			}
+			int64_t value = 0;
+			if (yyjson_is_int(val)) {
+				value = yyjson_get_sint(val);
+			} else if (yyjson_is_str(val)) {
+				string text = yyjson_get_str(val);
+				StringUtil::Trim(text);
+				bool digits = !text.empty();
+				for (idx_t i = 0; i < text.size(); i++) {
+					digits = digits && (StringUtil::CharacterIsDigit(text[i]) || (i == 0 && text[i] == '-'));
+				}
+				if (digits) {
+					value = std::stoll(text);
+				} else if (name == "batch_bytes") {
+					value = NumericCast<int64_t>(DBConfig::ParseMemoryLimit(text));
+				} else {
+					throw BinderException("%s: %s is a number, got \"%s\"", fn, name, text);
+				}
+			} else {
+				throw BinderException("%s: %s is a number", fn, name);
+			}
+			if (value < 0 && name != "queue_priority") {
+				throw BinderException("%s: %s cannot be negative", fn, name);
+			}
+			if (value == 0 && name == "batch_bytes") {
+				throw BinderException("%s: batch_bytes must be at least 1", fn);
+			}
+			limits[name] = value;
+		}
+	} catch (...) {
+		yyjson_doc_free(doc);
+		throw;
+	}
+	yyjson_doc_free(doc);
+	auto start = limits.find("window_start");
+	auto max = limits.find("window_max");
+	if (start != limits.end() && max != limits.end() && max->second > 0 && start->second > max->second) {
+		throw BinderException("%s: window_start (%lld) is above window_max (%lld)", fn, start->second, max->second);
+	}
+	return limits;
+}
+
+//! acl_create_resource_group(name, limits_json[, comment]): a re-create replaces the limits
+void AclCreateResourceGroupFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto name = RequiredArg(args, 0, row, "acl_create_resource_group", "group");
+		auto limits = ParseResourceLimits(OptionalArg(args, 1, row, "{}"), "acl_create_resource_group");
+		StoreOf(state).CatalogCreateResourceGroup(name, limits, OptionalArg(args, 2, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_drop_resource_group(name[, mode]): mode 'skip' (IF EXISTS) makes a missing one a no-op
+void AclDropResourceGroupFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto name = RequiredArg(args, 0, row, "acl_drop_resource_group", "group");
+		StoreOf(state).CatalogDropResourceGroup(name, StringUtil::CIEquals(OptionalArg(args, 1, row, ""), "skip"));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+void BindResourceGroup(DataChunk &args, ExpressionState &state, Vector &result, const char *fn, bool remove) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = RequiredArg(args, 0, row, fn, "role");
+		auto group = RequiredArg(args, 1, row, fn, "group");
+		StoreOf(state).CatalogBindResourceGroup(role, group, remove);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_grant_resource_group(role, group) / acl_revoke_resource_group(role, group)
+void AclGrantResourceGroupFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	BindResourceGroup(args, state, result, "acl_grant_resource_group", false);
+}
+void AclRevokeResourceGroupFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	BindResourceGroup(args, state, result, "acl_revoke_resource_group", true);
+}
+
 //! acl_deny_function(fname) / acl_allow_function(fname) - the legacy pair, kept as wrappers: a grant
 //! by name to every role, denied or allowed, for both kinds (the old gate never knew the kind)
 void SetFunctionGate(DataChunk &args, ExpressionState &state, Vector &result, const char *what, bool allowed) {
@@ -1381,6 +1496,10 @@ void AclSessionsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		for (idx_t r = 0; r < session.roles.size(); r++) {
 			roles += (r ? "," : "") + JsonQuote(session.roles[r]);
 		}
+		string groups;
+		for (idx_t g = 0; g < session.groups.size(); g++) {
+			groups += (g ? "," : "") + JsonQuote(session.groups[g]);
+		}
 		roles += "]";
 		json += (i ? "," : "");
 		// JsonQuote (acl_door_common), not a local escaper: a subject or role comes from a token, and
@@ -1390,7 +1509,9 @@ void AclSessionsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		        ",\"expires_at\":" + std::to_string(session.expires_at) + ",\"door\":" + JsonQuote(session.door) +
 		        ",\"level\":" + JsonQuote(session.level) + ",\"level_source\":" + JsonQuote(session.level_source) +
 		        ",\"profile_level\":" + JsonQuote(session.profile_level) +
-		        ",\"profile_source\":" + JsonQuote(session.profile_source) + "}";
+		        ",\"profile_source\":" + JsonQuote(session.profile_source) + ",\"groups\":[" + groups +
+		        "],\"charged_group\":" +
+		        (session.charged_group.empty() ? string("null") : JsonQuote(session.charged_group)) + "}";
 	}
 	json += "]";
 	result.Reference(Value(json), count_t(args.size()));
@@ -1568,6 +1689,11 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_revoke_function_category", {v, v}, AclRevokeFunctionCategoryFunc);
 	register_admin_set("acl_grant_function", {{v, v}, {v, v, v}}, AclGrantFunctionFunc);
 	register_admin("acl_revoke_function", {v, v}, AclRevokeFunctionFunc);
+	// resource groups (spec 085): the compile targets of CREATE / DROP / GRANT / REVOKE RESOURCE GROUP
+	register_admin_set("acl_create_resource_group", {{v, v}, {v, v, v}}, AclCreateResourceGroupFunc);
+	register_admin_set("acl_drop_resource_group", {{v}, {v, v}}, AclDropResourceGroupFunc);
+	register_admin("acl_grant_resource_group", {v, v}, AclGrantResourceGroupFunc);
+	register_admin("acl_revoke_resource_group", {v, v}, AclRevokeResourceGroupFunc);
 	// the session contract both doors stand on (spec 040): open once, prefix every statement, close
 	auto register_session_text = [&](const string &name, vector<LogicalType> arguments, const scalar_function_t &fn) {
 		ScalarFunction function(Identifier(name), std::move(arguments), LogicalType::VARCHAR, fn);

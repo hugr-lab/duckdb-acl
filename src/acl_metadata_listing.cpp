@@ -620,6 +620,9 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"function_category_members", "SELECT \"category\", \"database\", \"schema\", \"name\", \"kind\" FROM %s"},
 	    {"function_grants",
 	     "SELECT \"role\", \"category\", \"database\", \"schema\", \"name\", \"kind\", \"allowed\" FROM %s"},
+	    {"resource_groups", "SELECT \"group\", \"window_start\", \"window_max\", \"batch_bytes\", "
+	                        "\"max_result_rows\", \"queue_priority\", \"max_sessions\", \"comment\" FROM %s"},
+	    {"role_resource_groups", "SELECT \"role\", \"group\" FROM %s"},
 	};
 	static const case_insensitive_map_t<string> TABLES = {
 	    {"catalogs", "catalogs"},
@@ -643,6 +646,8 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"function_categories", "function_categories"},
 	    {"function_category_members", "function_category_members"},
 	    {"function_grants", "function_grants"},
+	    {"resource_groups", "resource_groups"},
+	    {"role_resource_groups", "role_resource_groups"},
 	};
 	IntrospectionRows out;
 	if (StringUtil::CIEquals(listing, "status")) {

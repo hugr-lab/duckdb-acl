@@ -1,0 +1,227 @@
+# name: test/sql/acl_resource_groups.test
+# description: resource groups (spec 085) - named limits bound to roles, resolved once when a session
+#   opens: the management surface and its checks, the most generous merge across a principal's groups,
+#   and max_sessions refused at open, per group, in the load report and the sessions listing
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('https://issuer.test/s',
+    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
+    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- the management surface -----------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP interactive WITH (window_max 8, max_result_rows 100000, max_sessions 1) COMMENT 'people';
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP etl (window_start 16, window_max 64, batch_bytes '32MiB', queue_priority 10);
+
+query IIIIIIII
+SELECT * FROM acl_resource_groups() ORDER BY 1;
+----
+etl	16	64	33554432	NULL	10	NULL	(empty)
+interactive	NULL	8	NULL	100000	NULL	1	people
+
+# a limit written wrong would limit nothing: refused, with the names a group carries
+statement error
+ACL ADMIN CREATE RESOURCE GROUP bad WITH (windowmax 8);
+----
+<REGEX>:.*"windowmax" is not a limit a resource group carries.*
+
+statement error
+ACL ADMIN CREATE RESOURCE GROUP bad WITH (max_sessions -1);
+----
+<REGEX>:.*max_sessions cannot be negative.*
+
+statement error
+ACL ADMIN CREATE RESOURCE GROUP bad WITH (window_start 32, window_max 8);
+----
+<REGEX>:.*window_start \(32\) is above window_max \(8\).*
+
+statement error
+ACL ADMIN CREATE RESOURCE GROUP bad WITH (max_result_rows 'lots');
+----
+<REGEX>:.*max_result_rows is a number.*
+
+statement error
+ACL ADMIN GRANT RESOURCE GROUP nosuch TO ROLE r;
+----
+<REGEX>:.*resource group "nosuch" does not exist.*
+
+statement error
+ACL ADMIN GRANT RESOURCE GROUP etl TO ROLE nosuch;
+----
+<REGEX>:.*role "nosuch" does not exist.*
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP interactive TO ROLE r;
+
+query II
+SELECT * FROM acl_role_resource_groups();
+----
+r	interactive
+
+# a re-create replaces the limits and keeps the binding
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP interactive WITH (window_max 8, max_result_rows 100000, max_sessions 1) COMMENT 'people';
+
+query I
+SELECT count(*) FROM acl_role_resource_groups();
+----
+1
+
+# a catalog-scoped manage does not reach a node-wide limit
+statement ok
+ACL ADMIN CREATE ROLE owner;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE owner CAPS '{"select": true, "manage": true}' MAIN;
+
+statement error
+ACL ROLE "owner" ACL GRANT RESOURCE GROUP etl TO ROLE r;
+----
+<REGEX>:.*not catalog-specific and needs an unrestricted manage scope.*
+
+# --- max_sessions: refused at open, per group ------------------------------------------------------
+
+statement ok
+CREATE TABLE first AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS handle;
+
+query I
+SELECT handle IS NOT NULL FROM first;
+----
+true
+
+# the second session of the same group: over its max_sessions, refused - never the first one ended
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NULL;
+----
+true
+
+query I
+SELECT acl_session_sql(handle, 'SELECT 1') IS NOT NULL FROM first;
+----
+true
+
+# the load report counts it per group; the sessions listing names the groups and the one charged
+query I
+SELECT acl_node_load() LIKE '%"by_group":{"interactive":{"live":1,"max":1}}%';
+----
+true
+
+query I
+SELECT acl_sessions() LIKE '%"groups":["interactive"],"charged_group":"interactive"%';
+----
+true
+
+# a quack connection that re-authenticates replaces its own session: its token refresh is not a second
+# session of the group (the first session above still holds the group's one place)
+statement ok
+SELECT acl_session_close(handle) FROM first;
+
+query I
+SELECT acl_quack_authenticate('conn-1', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg', 'ignored');
+----
+true
+
+query I
+SELECT acl_quack_authenticate('conn-1', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg', 'ignored');
+----
+true
+
+# another connection of the group is a second session: refused
+query I
+SELECT acl_quack_authenticate('conn-2', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg', 'ignored');
+----
+false
+
+# --- the most generous merge: a group that limits no sessions frees the principal ----------------
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP etl TO ROLE r;
+
+query I
+SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NOT NULL;
+----
+true
+
+query I
+SELECT acl_sessions() LIKE '%"groups":["etl","interactive"],"charged_group":null%';
+----
+true
+
+# --- drop: a group's bindings go with it, and so do a dropped role's -------------------------------
+
+statement ok
+ACL ADMIN DROP RESOURCE GROUP interactive;
+
+query I
+SELECT group_concat("group") FROM acl_role_resource_groups();
+----
+etl
+
+statement ok
+ACL ADMIN DROP RESOURCE GROUP IF EXISTS interactive;
+
+statement error
+ACL ADMIN DROP RESOURCE GROUP interactive;
+----
+<REGEX>:.*resource group "interactive" does not exist.*
+
+statement ok
+ACL ADMIN REVOKE RESOURCE GROUP etl FROM ROLE r;
+
+query I
+SELECT count(*) FROM acl_role_resource_groups();
+----
+0
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP etl TO ROLE owner;
+
+statement ok
+ACL ADMIN DROP ROLE owner;
+
+query I
+SELECT count(*) FROM acl_role_resource_groups();
+----
+0
+
+# the function forms are the same surface
+statement ok
+SELECT acl_create_resource_group('plain', '{"max_sessions": 5, "batch_bytes": 1048576}');
+
+query II
+SELECT max_sessions, batch_bytes FROM acl_resource_groups() WHERE "group" = 'plain';
+----
+5	1048576
