@@ -10,6 +10,8 @@
 
 #include "acl_test_util.hpp"
 
+#include "acl_connection.hpp"
+
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -57,7 +59,7 @@ public:
 };
 
 struct CallData : public TableFunctionData {
-	bool done = false;
+	vector<string> inputs;
 };
 
 unique_ptr<FunctionData> ServiceBind(ClientContext &context, TableFunctionBindInput &input,
@@ -66,10 +68,25 @@ unique_ptr<FunctionData> ServiceBind(ClientContext &context, TableFunctionBindIn
 	for (idx_t i = 0; i < input.inputs.size(); i++) {
 		call += (i ? ", " : "") + input.inputs[i].ToString();
 	}
-	Record(call + ")");
+	call += ")";
+	// whom the call goes as: the session published on the connection (tresor's actor reads the same)
+	string why;
+	auto connection = acl::AclConnection::Reach(context, why);
+	acl::AclSessionView view;
+	if (connection && connection->Current(view)) {
+		call += " as session " + view.session_id;
+	}
+	Record(call);
+	if (!input.inputs.empty() && input.inputs[0].ToString() == "missing") {
+		throw InvalidInputException("service: no secret missing");
+	}
 	return_types.push_back(LogicalType::BOOLEAN);
 	names.emplace_back("ok");
-	return make_uniq<CallData>();
+	auto data = make_uniq<CallData>();
+	for (auto &value : input.inputs) {
+		data->inputs.push_back(value.ToString());
+	}
+	return std::move(data);
 }
 
 struct CallState : public GlobalTableFunctionState {
@@ -86,6 +103,11 @@ void ServiceScan(ClientContext &context, TableFunctionInput &input, DataChunk &o
 		return;
 	}
 	state.done = true;
+	// the service's refusal may come while the call runs, not only when it binds (tresor's does)
+	auto &inputs = input.bind_data->Cast<CallData>().inputs;
+	if (!inputs.empty() && inputs[0] == "refused_late") {
+		throw InvalidInputException("service: no secret refused_late");
+	}
 	output.data[0].Append(Value::BOOLEAN(true));
 }
 
@@ -170,6 +192,11 @@ int main(int argc, char *argv[]) {
 		Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders");
 		Exec(con, "ACL ADMIN CREATE ROLE keeper");
 		Exec(con, "ACL ADMIN CREATE ROLE plain");
+		Exec(con, "ACL ADMIN CREATE ROLE analyst");
+		Exec(con, "SELECT acl_define_issuer('https://issuer.test/s',"
+		          "'{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
+		          "'api://acl-test','HS256','roles','{\"tid\": \"tenant\"}')");
+		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, secrets) MAIN");
 		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE keeper WITH (select, secrets) MAIN");
 		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE plain WITH (select) MAIN");
 		Exec(con, "SET GLOBAL acl_audit_level='all'");
@@ -244,6 +271,50 @@ int main(int argc, char *argv[]) {
 			Check(One(con, "SELECT storage FROM duckdb_secrets() WHERE name = 's'") == "vault", "IN names it");
 			Exec(con, "ACL ROLE \"keeper\" DROP SECRET s FROM vault");
 			Exec(con, "DETACH vault");
+		});
+
+		Scenario("under a session, the service's call goes as the session - and its refusal reaches the client", [&] {
+			const std::string token =
+			    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2w"
+			    "tdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj"
+			    "5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc";
+			auto handle = One(con, "SELECT acl_session_open('" + token + "')");
+			auto under = [&](const std::string &sql) {
+				return One(con,
+				           "SELECT acl_session_sql('" + handle + "', '" + StringUtil::Replace(sql, "'", "''") + "')");
+			};
+			Check(One(con, under("ACL GRANT SECRET lake TO ROLE analysts")) == "true", "the grant ran");
+			Check(One(con, under("ACL REVOKE SECRET lake FROM GROUP g")) == "true", "the revoke ran");
+			auto seen = TakeCalls();
+			const std::string grant = "grant_secret(lake, role:analysts, [use]) as session ";
+			const std::string revoke = "revoke_secret(lake, group:g) as session ";
+			bool as_session = seen.size() == 2 && seen[0].rfind(grant, 0) == 0 && seen[0].size() > grant.size() &&
+			                  seen[1].rfind(revoke, 0) == 0 &&
+			                  seen[0].substr(grant.size()) == seen[1].substr(revoke.size());
+			Check(as_session,
+			      "both reached the service as the one session: " + (seen.empty() ? std::string("nothing") : seen[0]) +
+			          (seen.size() > 1 ? " | " + seen[1] : ""));
+			Check(One(con, "ACL ROLE \"keeper\" ACL GRANT SECRET lake TO ROLE analysts") == "true" &&
+			          TakeCalls() == std::vector<std::string> {"grant_secret(lake, role:analysts, [use])"},
+			      "and a gateway's per-statement prefix names no session");
+			// a passthrough administrator's native batch: every statement of it runs as the session
+			Exec(con, "ACL ADMIN GRANT ADMIN passthrough TO ROLE analyst");
+			Exec(con, under("ACL NATIVE SELECT * FROM corp.main.grant_secret('a', 'role:r', ['use']); "
+			                "SELECT * FROM corp.main.grant_secret('b', 'role:r', ['use'])"));
+			seen = TakeCalls();
+			Check(seen.size() == 2 && seen[0].find(" as session ") != std::string::npos &&
+			          seen[1].find(" as session ") != std::string::npos,
+			      "both statements of a native batch went as the session: " +
+			          (seen.size() > 1 ? seen[0] + " | " + seen[1] : std::string("fewer calls")));
+			Exec(con, "ACL ADMIN REVOKE ADMIN FROM ROLE analyst");
+			auto refused = One(con, under("ACL GRANT SECRET missing TO ROLE analysts"));
+			Check(refused.find("service: no secret missing") != std::string::npos,
+			      "the service's refusal reaches the client as it is: " + refused);
+			auto late = One(con, under("ACL GRANT SECRET refused_late TO ROLE analysts"));
+			Check(late.find("service: no secret refused_late") != std::string::npos,
+			      "and so does one raised while the call runs: " + late);
+			TakeCalls();
+			Exec(con, "SELECT acl_session_close('" + handle + "')");
 		});
 
 		Scenario("a direct call into the service catalog is the function gate's: a category, or nothing", [&] {
