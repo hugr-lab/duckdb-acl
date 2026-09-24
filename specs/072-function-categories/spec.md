@@ -369,9 +369,9 @@ proves a migrated catalog and a fresh one have the same shape (spec 034).
 | slice | what | touches |
 | --- | --- | --- |
 | 1 | schema v14 + seed files + generator + migration; `PolicyStore` resolution (catalog, memory), the rewriter's key/qualification/windows/keywords/method call; `DefaultDeniedFunctions` and `function_gate` go; tests 1-8 | `schema/policy_schema.sql`, `schema/function_categories/*.txt`, `scripts/gen_schema.py`, `schema/migrations/v14.sql`, `src/acl_schema_sql.hpp` (generated), `acl_policy.cpp/.hpp`, `acl_policy_catalog.cpp/.hpp`, `acl_rewriter.cpp`, tests |
-| 2 | management syntax, admin functions, `acl_functions` / `acl_function_categories`, introspection listings; test 9; `docs/management-sql.md` | `acl_admin_sql.cpp`, `acl_admin_functions.cpp`, `acl_catalog_admin.cpp`, `acl_metadata_listing.cpp`, `acl_introspection.cpp`, docs |
+| 2 | management syntax, admin functions, `acl_functions` / `acl_function_categories`, introspection listings; test 9; `website/docs/management-sql.md` | `acl_admin_sql.cpp`, `acl_admin_functions.cpp`, `acl_catalog_admin.cpp`, `acl_metadata_listing.cpp`, `acl_introspection.cpp`, docs |
 | 3 | function-driver slots | `acl_policy_catalog.cpp`, spec 008 test |
-| 4 | `docs/security.md`, CLAUDE.md, README | docs |
+| 4 | `website/docs/security.md`, CLAUDE.md, README | docs |
 
 Size: the seed is ~1,400 member rows (largest: `base` ~600 with operators, `icu` 289, `spatial`
 ~176); the code is ~600 lines in the store and rewriter, ~500 in syntax and admin functions, plus

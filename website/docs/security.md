@@ -2,7 +2,7 @@
 
 What the extension enforces, how, what it deliberately does not, and what a client may rely on in an
 error. Every statement here is taken from a spec or from the source; where a behaviour was verified
-by running it, the section says so. Specs are cited as `spec NNN` and live in [`specs/`](../specs/).
+by running it, the section says so. Specs are cited as `spec NNN` and live in [`specs/`](https://github.com/hugr-lab/duckdb-acl/tree/main/specs/).
 
 ## 1. The model in one page
 

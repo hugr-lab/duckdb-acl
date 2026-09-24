@@ -24,3 +24,11 @@ vcpkg_installed/
 # python bytecode (test/bench, scripts)
 __pycache__/
 *.pyc
+
+# the docs site (website/): installed and built locally, deployed by pages.yml
+node_modules/
+.docusaurus/
+website/build/
+website/versioned_docs/
+website/versioned_sidebars/
+website/versions.json

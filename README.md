@@ -6,6 +6,10 @@ verifies the principal, resolves virtual names to physical objects, applies row-
 column masking, gates functions, and hands real `SQLStatement`s back to the normal
 bind → optimize → execute path — so both `SELECT` and DML work naturally.
 
+**Documentation: [hugr-lab.github.io/duckdb-acl](https://hugr-lab.github.io/duckdb-acl/)**. The pages
+are built from [`website/docs/`](website/docs/): getting started, concepts, the management SQL
+reference, serving clients, security, observability.
+
 > **Status: pre-release.** The first release follows duckdb 2.0; the extension tracks duckdb's
 > **2.0 release branch (`v2.0-cyanoptera`)** and will pin the `v2.0.0` tag when it is cut (it depends
 > on parser/AST APIs — the `Identifier` type, multi-level `QualifiedName`, `MergeQueryNode`, unified
@@ -102,9 +106,9 @@ else is rendered from it by `make schema`:
 | `schema/acl_schema.sql` | the schema as it stands, ready to run — then `acl_use_db('<db>', 'acl', false)` |
 | `src/acl_schema_sql.hpp` | what the extension runs when it initialises a catalog |
 
-There are no migrations yet — duckdb-acl has not been released, so every catalog is created at the
-current version. [`schema/migrations/README.md`](schema/migrations/README.md) is the contract the
-first one will follow.
+A catalog from an older schema version is migrated by hand, one step per version, from
+[`schema/migrations/`](schema/migrations/); [its README](schema/migrations/README.md) is the contract
+and [the policy catalog page](website/docs/policy-catalog.md) the procedure.
 
 Because both come from one file, a hand-applied schema and the extension's own cannot drift
 apart; `make schema-check` fails if they have, and applies the file to an empty database to confirm
@@ -146,9 +150,10 @@ policy, and runs `ACL ROLE`/`ACL TOKEN` queries showing RLS, masking, virtual fu
 
 ## The gateway
 
-Deployment invariant: **only the gateway connects to DuckDB.** The gateway authenticates the caller,
-resolves role/claims (online token introspection lives there), prefixes the query, and forwards it. A
-reference gateway (Arrow Flight SQL server embedding DuckDB) is planned separately.
+Deployment invariant: **only a gateway or a door connects to DuckDB.** A gateway authenticates the
+caller, resolves role/claims, prefixes the query, and forwards it. The extension's own doors - the
+Arrow Flight SQL server and the embedded quack server - do the same for clients that connect for
+themselves ([serving clients](website/docs/serving.md)).
 
 ## License
 

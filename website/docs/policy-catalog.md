@@ -41,7 +41,7 @@ Two ways to get the schema there:
 - **`init := true`** creates every table (`CREATE TABLE IF NOT EXISTS`, one statement each) and
   stamps the version. Re-running it on a current catalog is cheap and changes nothing. It refuses a
   catalog stamped with an older version (below) rather than replaying DDL over it.
-- **By hand**: apply [`schema/acl_schema.sql`](../schema/acl_schema.sql) with your own tooling - the
+- **By hand**: apply [`schema/acl_schema.sql`](https://github.com/hugr-lab/duckdb-acl/blob/main/schema/acl_schema.sql) with your own tooling - the
   duckdb-dialect rendering, ready to run, creating schema `acl` in the database it runs against -
   and then `acl_use_db('store', 'acl', false)`. This is how the catalog lives in a database the node
   is not allowed to create tables in, under somebody else's migration tooling and grants. Whoever
@@ -66,7 +66,7 @@ boolean type work.
 Every table carries a primary key (sources without rowids need one for `DELETE`/`UPDATE`); `''`
 stands in for "global" / "any" wherever NULL cannot be part of a key. `caps` columns hold a flat JSON
 object of booleans (`{"select": true, "manage": true}`), extensible without a migration. From
-[`schema/policy_schema.sql`](../schema/policy_schema.sql), the source of truth:
+[`schema/policy_schema.sql`](https://github.com/hugr-lab/duckdb-acl/blob/main/schema/policy_schema.sql), the source of truth:
 
 | table | holds |
 | --- | --- |

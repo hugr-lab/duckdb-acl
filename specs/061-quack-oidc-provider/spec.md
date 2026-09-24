@@ -80,7 +80,7 @@ Follow-up spec material; the provider test uses the grant-borne shape meanwhile.
   `invalid_client` no longer evicts a good chain.
 - **The device poll is cancellable**: it checks the querying connection's interrupt between polls
   and sleeps in one-second slices, so Ctrl-C ends the wait instead of the IdP's deadline.
-- Documented (docs/clients/quack.md): the stale-stored-token failure mode and its re-mint lever;
+- Documented (website/docs/clients/quack.md): the stale-stored-token failure mode and its re-mint lever;
   PERSISTENT secrets write the minted token to disk and revive stale; the CREATE SECRET statement
   text itself carries credentials, so it belongs on a local, unlogged connection.
 

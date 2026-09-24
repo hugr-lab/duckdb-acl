@@ -22,7 +22,7 @@ broken object instead of quietly describing a narrower one nobody can read. Mana
 
 ## Problem
 
-The drift matrix (design/BACKLOG.md, probed 2026-08-21; docs/security.md "Accepted risk"):
+The drift matrix (design/BACKLOG.md, probed 2026-08-21; website/docs/security.md "Accepted risk"):
 
 1. **A declared-list object dies and stays dead.** `c.customers AS phys.main.customers COLUMNS (id
    = pk, ssn = ssn_raw)`; the source drops `ssn_raw`. Every read fails with duckdb's binder error
@@ -46,7 +46,7 @@ The drift matrix (design/BACKLOG.md, probed 2026-08-21; docs/security.md "Accept
 
 The reverse direction is fine and stays so: a column *added* to a source becomes visible through a
 plain alias or a schema alias, which is what "live" means (spec 014). It is a written decision now
-(docs/security.md), not a finding.
+(website/docs/security.md), not a finding.
 
 ## Design
 

@@ -2376,7 +2376,7 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		if (!init.ok()) {
 			// Init binds the listen address (and loads the TLS material): what fails here is the
 			// environment - a port in use, an address that is not ours - not the policy, so it is an
-			// IO error (the error contract, docs/security.md section 8)
+			// IO error (the error contract, website/docs/security.md section 8)
 			throw IOException("acl_flight_serve: %s", init.ToString());
 		}
 		// Serve() blocks for the life of the door, so it gets a thread of its own; Shutdown() is what

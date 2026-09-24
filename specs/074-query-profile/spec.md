@@ -267,7 +267,7 @@ Flight e2e (`stream.sh`): a consumed stream's profile arrives when the stream en
    `acl_profile.test` (the function, the listing, both management forms, the refusals, the
    connection-local SET) and `stream.sh` (the door: a session switched off leaves no profile for its
    next stream, switched on again profiles).
-4. **Docs**: `docs/observability.md` - cumulative time, "observed" memory, three signals for three
+4. **Docs**: `website/docs/observability.md` - cumulative time, "observed" memory, three signals for three
    questions.
 
 ## Implementation notes (at pin 62ee922)
