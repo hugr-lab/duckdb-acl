@@ -457,7 +457,7 @@ quoted values blanked, a source's ingest error keeps only its class (`AuditReaso
 `AuditIngest`); reasons ≤512 bytes, traces ≤128. `acl_audit_denials_per_second` (100) bounds the
 recorded refusals per source (counted regardless). Metric attributes from bounded sets only. The
 pipeline's worker never holds the instance (settings and the file are the emitting thread's);
-`PolicyStoreHandle`'s destructor in the object cache is the shutdown seam.
+`PolicyStoreHandle`'s destructor in the object cache is the shutdown seam. The gauges' readers run under the registry's lock (ext-common spec 009, v0.7.1): `Remove()` waits for a running snapshot, so a reader must not call back into the gauges nor take a lock held around `Register`/`Remove`.
 
 **Spec 074 — the execution profile**: what the audit decided is one event; what then *happened* is
 another - kind `profile`, one per decided statement executed (success or failure), emitted from a
