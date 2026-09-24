@@ -67,6 +67,8 @@ test/
   sql/integration/           # scenarios against live databases (make test-integration; skip w/o env)
   cpp/                       # standalone C++ invariant tests (make test-cpp), one main() per file
   harness/                   # runnable end-to-end demo (demo.sql + run.sh)
+website/                     # the docs site (Docusaurus): website/docs/*.md are THE user docs, published by
+                             #   pages.yml to hugr-lab.github.io/duckdb-acl, built on PRs by docs-build.yml
 docker/                      # integration databases: compose + per-DB init SQL (specs/005)
 specs/                       # one lightweight spec per feature, NNN-slug/spec.md (see specs/README.md)
 design/                      # LOCAL, gitignored: numbered research topics NNN-topic/ (our scratch)
@@ -239,7 +241,7 @@ functions: `acl_create_function_category(name[, comment])`, `acl_drop_function_c
 role; the never set is refused where the grant is written, and a member or an admitting grant must
 name a function the node has unless its kind is written. The SQL forms: `CREATE | ALTER … ADD|DROP (…)
 | DROP [IF EXISTS] FUNCTION CATEGORY c`, `GRANT | DENY | REVOKE FUNCTION [CATEGORY] … TO | FROM ROLE r
-| ALL ROLES` (unrestricted `manage` only; see docs/management-sql.md).
+| ALL ROLES` (unrestricted `manage` only; see website/docs/management-sql.md).
 
 ## Serving clients directly
 

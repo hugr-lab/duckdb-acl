@@ -505,7 +505,7 @@ SET GLOBAL acl_audit_level = 'decisions';
 statement ok
 SELECT acl_session_close((SELECT handle FROM odd));
 
-# --- stopping a door nobody serves ends nothing (found writing docs/serving.md) -------------------------
+# --- stopping a door nobody serves ends nothing (found writing website/docs/serving.md) -------------------------
 # acl_quack_stop answered "No server found" and then, with no quack door open on the instance, ran the
 # last-door path anyway - closing every session of the instance, the Flight door's included.
 

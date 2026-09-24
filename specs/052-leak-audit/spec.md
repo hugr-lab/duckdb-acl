@@ -168,7 +168,7 @@ What follows:
 2. **Recommendation, not a mechanism**: where a role holds `explain`, make the physical object
    behind the virtual relation a SECURE view (`ACL ADMIN CREATE VIRTUAL TABLE c.x AS
    phys.main.x_secure`). Then `EXPLAIN` shows one name - the barrier is duckdb's, real, and free.
-   `docs/security.md` says so. **Amended 2026-09-22** (pin d4e7256): since duckdb #25969 a secure
+   `website/docs/security.md` says so. **Amended 2026-09-22** (pin d4e7256): since duckdb #25969 a secure
    view that only projects columns passes their statistics through ("hides columns, not rows"),
    and our predicate sits outside the view, so behind such a view `stats` answers the table's
    min/max again; only a secure view that filters rows itself still erases them. For `stats` the

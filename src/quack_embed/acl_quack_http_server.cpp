@@ -567,7 +567,7 @@ string StartAclQuackServer(ClientContext &context, const AclQuackServeConfig &cf
 		return "";
 	} catch (IOException &) {
 		// a bind or PEM failure is the environment's, not the policy's: it keeps its IO class all the
-		// way to the caller (the error contract, docs/security.md section 8)
+		// way to the caller (the error contract, website/docs/security.md section 8)
 		throw;
 	} catch (std::exception &ex) {
 		string message = ex.what();

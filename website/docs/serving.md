@@ -2,7 +2,7 @@
 
 How one node serves clients that connect for themselves: the two doors, the sessions behind them, the
 operator's control surface, graceful shutdown, and the invariants a served deployment must hold. The
-per-client connection recipes live in [clients/](clients/) and are linked, not repeated; the token
+per-client connection recipes live in [clients/](index.md#reference) and are linked, not repeated; the token
 model is [authentication.md](authentication.md); the one-page shape of a node is
 [deployment.md](deployment.md).
 
@@ -163,7 +163,7 @@ What the door serves, every RPC authenticated per call from the `authorization: 
   back first (savepoints are a follow-up)`). A session that ends mid-transaction is rolled back by
   connection teardown. Use either the protocol's actions or raw `BEGIN`/`COMMIT`, not both.
 - **Session options** (spec 068): `SetSessionOptions`/`GetSessionOptions` for `TimeZone` and
-  `Calendar` - see [Client-local settings](#client-local-settings).
+  `Calendar` - see [Client-local settings](#client-local-settings-spec-068).
 - **Auth discovery** (spec 064): a `Handshake` whose payload is `discover-auth` answers, without
   credentials, the issuers the node trusts, each issuer's `client_id` and the endpoints the IdP's own
   OIDC discovery names (`token_endpoint`, `device_authorization_endpoint` when present). The same

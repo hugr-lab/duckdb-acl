@@ -86,7 +86,7 @@ before if cheap; **later** — development, after the release.
 - **A principal's functions surface** (`duckdb_functions()` / `information_schema.routines`): a
   virtual table function is callable but appears in no listing, so an agent browsing the catalog
   cannot learn it exists or its signature; params and result columns are already stored.
-- ~~**Error-prefix contract**~~ — written down in `docs/security.md` §8 (the prefix is the contract,
+- ~~**Error-prefix contract**~~ — written down in `website/docs/security.md` §8 (the prefix is the contract,
   the exception class says which kind of thing went wrong, the wording is not promised); file and
   socket failures of a serve are `IOException`. `acl_rewrite: token rejected` never leaves
   `SessionOpen` - it is caught there and a door gets NULL/false.

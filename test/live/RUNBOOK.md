@@ -113,7 +113,7 @@ set `{"api":{"requestedAccessTokenVersion":2}}` via a Graph PATCH on the applica
 generic `az ad app update --set` cannot reach it) and expect minutes of propagation, or simply trust
 whatever `iss` the token actually carries; a machine token has no tenant attribute, so claim-driven
 RLS applies to user flows, not client_credentials. In Fabric/Azure the environment mints the token
-instead - see docs/clients/powerbi-fabric.md.
+instead - see website/docs/clients/powerbi-fabric.md.
 
 ## DBeaver (the Arrow Flight SQL JDBC driver - what spec 047 targets)
 
