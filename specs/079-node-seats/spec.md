@@ -141,3 +141,5 @@ This is not an enforcement feature, but it changes what an unauthenticated calle
   so the instance is destroyed only by the static destructors. There httpfs's client destructor
   throws on a mutex already gone: `mutex lock failed: Invalid argument`. This is spec 063's
   "a server outlives its instance", and it wants an instance-close hook that stops the doors.
+  **Fixed by spec 084**: the registry is never destroyed (quack's own shape) and a door stops
+  accepting at exit.
