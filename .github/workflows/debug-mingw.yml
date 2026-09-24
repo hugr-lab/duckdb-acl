@@ -1,0 +1,156 @@
+name: Debug MinGW crash
+
+# A diagnostic, run by hand only. The windows_amd64_mingw leg of the distribution build twice died with
+# no error text in test/sql/acl_listing_rls_only.test (2026-09-22 and 2026-09-24), and the next commit's
+# build was green both times: a crash that some builds expose, not a flaky runner. This builds that leg
+# exactly as the distribution does (extension-ci-tools' ci_phase.py, the same runner, toolchain and
+# triplet), then runs the suspect test - alone, and in the batch it failed in - many times, every run
+# under gdb, and keeps the backtrace of whatever crashes. Nothing here gates anything.
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: runs of each case under gdb
+        default: '40'
+      build_type:
+        description: release (as the distribution) or relwithdebinfo (names and lines in the backtrace)
+        default: release
+
+permissions:
+  contents: read
+
+env:
+  VCPKG_BINARY_SOURCES: ${{ vars.VCPKG_BINARY_SOURCES == '' && 'clear;http,https://vcpkg-cache.duckdb.org,read' || vars.VCPKG_BINARY_SOURCES }}
+  CI_EXTENSION_NAME: acl
+  DUCKDB_VERSION: v2.0-cyanoptera
+  CI_EXTRA_TOOLCHAINS: parser_tools
+  CI_VCPKG_URL: https://github.com/microsoft/vcpkg.git
+  CI_VCPKG_COMMIT: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+  CI_VCPKG_OVERLAY_PORTS: extension-ci-tools/vcpkg_ports
+  CI_VCPKG_OVERLAY_TRIPLETS: extension-ci-tools/toolchains
+  CI_BUILD_DUCKDB_SHELL: true
+  CI_BUILD_TYPE: ${{ inputs.build_type }}
+  CI_TEST_CONFIG: '{}'
+
+jobs:
+  mingw:
+    name: windows_amd64_mingw under gdb
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 240
+    env:
+      VCPKG_TARGET_TRIPLET: x64-mingw-static
+      VCPKG_HOST_TRIPLET: x64-mingw-static
+      VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/extension-ci-tools/vcpkg_ports
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/extension-ci-tools/toolchains
+      AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
+      AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      BUILD_SHELL: '1'
+      DUCKDB_PLATFORM: windows_amd64_mingw
+      CC: gcc
+      CXX: g++
+      GEN: ninja
+      CI_PLATFORM: windows
+      CI_MATRIX_RUNNER: windows-2025-vs2026
+    steps:
+      - name: Checkout / Configure line endings
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: actions/checkout@v4
+        with:
+          path: extension-ci-tools
+          ref: main
+          repository: duckdb/extension-ci-tools
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Checkout / Prepare sources
+        id: prepare_sources
+        run: python extension-ci-tools/scripts/ci_phase.py checkout
+
+      - name: Setup / Rtools
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: devel
+          update-rtools: true
+          rtools-version: '42'
+
+      - name: Setup / Short vcpkg path
+        shell: pwsh
+        run: |
+          $basePath = Split-Path -Path (Split-Path -Path $env:GITHUB_WORKSPACE -Parent) -Parent
+          $vcpkgRoot = "$basePath/vcpkg"
+          echo "VCPKG_WINDOWS_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
+          echo "VCPKG_TOOLCHAIN_PATH=$vcpkgRoot/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
+
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.CI_VCPKG_COMMIT }}
+          vcpkgGitURL: ${{ env.CI_VCPKG_URL }}
+          vcpkgDirectory: ${{ env.VCPKG_WINDOWS_ROOT }}
+
+      - name: Setup
+        run: python extension-ci-tools/scripts/ci_phase.py setup
+
+      - name: Build
+        run: python extension-ci-tools/scripts/ci_phase.py build
+
+      - name: Install gdb (MSYS2)
+        shell: pwsh
+        run: C:\msys64\usr\bin\pacman.exe -S --noconfirm --needed mingw-w64-x86_64-gdb
+
+      - name: Run the suspect under gdb
+        shell: bash
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+        run: |
+          set -u
+          GDB=/c/msys64/mingw64/bin/gdb.exe
+          UT="$(ls build/*/test/unittest.exe | head -1)"
+          echo "unittest: $UT"
+          mkdir -p crash
+          ALONE="test/sql/acl_listing_rls_only.test"
+          # the batch the distribution ran it in (run_tests.py, batch of 10), in that order
+          BATCH="test/sql/acl_grant_scope.test,test/sql/acl_grant_validation.test,test/sql/acl_ingest_gate.test,test/sql/acl_interleave.test,test/sql/acl_introspection.test,test/sql/acl_issuer_client.test,test/sql/acl_jwks.test,test/sql/acl_jwks_locations.test,test/sql/acl_jwt.test,test/sql/acl_listing_rls_only.test"
+          crashes=0
+          for case in alone batch; do
+            args="$ALONE"; [ "$case" = batch ] && args="$BATCH"
+            # plain runs first: the exit code a crash leaves (0xC0000005 = 3221225477 ...)
+            for i in $(seq 1 "$ITERATIONS"); do
+              "$UT" "$args" > "crash/plain-$case-$i.log" 2>&1; rc=$?
+              if [ "$rc" != 0 ]; then echo "plain $case run $i: exit $rc"; crashes=$((crashes+1)); else rm -f "crash/plain-$case-$i.log"; fi
+            done
+            # then under gdb: any signal stops it and prints every thread's stack
+            for i in $(seq 1 "$ITERATIONS"); do
+              "$GDB" -q -batch -ex "set pagination off" -ex "set print thread-events off" -ex run \
+                -ex "info signals SIGSEGV" -ex "thread apply all bt 40" --args "$UT" "$args" \
+                > "crash/gdb-$case-$i.log" 2>&1
+              if grep -qE "received signal|Program terminated|exception" "crash/gdb-$case-$i.log"; then
+                echo "=== gdb $case run $i caught it ==="; crashes=$((crashes+1))
+                sed -n '/received signal/,$p' "crash/gdb-$case-$i.log" | head -200
+              else
+                rm -f "crash/gdb-$case-$i.log"
+              fi
+            done
+          done
+          echo "crashes seen: $crashes"
+          ls crash
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mingw-crash-logs
+          path: crash/
+          if-no-files-found: ignore
