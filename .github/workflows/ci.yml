@@ -40,6 +40,9 @@ jobs:
         run: |
           find src test/cpp \( -name '*.cpp' -o -name '*.hpp' \) -print0 \
             | xargs -0 clang-format --dry-run --Werror
+      # spec 088: no thread_local with a non-trivial destructor - MinGW destroys one on freed storage
+      - name: thread_local is trivially destructible
+        run: python3 scripts/ci/check_thread_local.py
       # a malformed workflow fails here, not at the first push that runs it (release plan 3.8); the
       # rules are .yamllint's, relaxed on purpose
       - name: yamllint

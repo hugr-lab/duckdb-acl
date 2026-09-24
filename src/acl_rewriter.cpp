@@ -96,18 +96,23 @@ const char *ReasonCode(Reason reason) {
 	return "policy_error";
 }
 
-static string &LastDenyReason() {
-	static thread_local string reason;
-	return reason;
-}
+//! A fixed buffer, never a string (spec 088): a thread_local with a non-trivial destructor is not
+//! safe at thread exit on MinGW. Every code is a short name from ReasonCode().
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+static thread_local char last_deny_reason[32] = {0};
 
 void NoteDenyReason(Reason reason) {
-	LastDenyReason() = ReasonCode(reason);
+	auto code = ReasonCode(reason);
+	idx_t i = 0;
+	for (; code[i] && i + 1 < sizeof(last_deny_reason); i++) {
+		last_deny_reason[i] = code[i];
+	}
+	last_deny_reason[i] = 0;
 }
 
 string TakeDenyReason() {
-	auto out = LastDenyReason();
-	LastDenyReason().clear();
+	string out(last_deny_reason);
+	last_deny_reason[0] = 0;
 	return out;
 }
 
