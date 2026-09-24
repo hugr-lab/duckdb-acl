@@ -39,6 +39,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -482,8 +483,39 @@ AclQuackServer::~AclQuackServer() {
 
 //! Process-wide registry of embedded servers, keyed by canonical uri (host:port). Mirrors quack's own
 //! per-instance map, but acl's door is one-per-process by uri and the ops surface stays tiny.
-std::mutex g_servers_lock;
-std::map<string, unique_ptr<AclQuackServer>> g_servers;
+//!
+//! Never destroyed (spec 084). A server's connections hold its instance, so a door nobody stopped keeps
+//! the instance alive until the process ends - quack's own per-instance map is the same cycle, and a
+//! leak at exit there. A static map would instead be destroyed among the static destructors, and the
+//! instance with it: closing an attached quack client's catalog then runs httpfs's curl client
+//! destructor on a mutex already gone ("mutex lock failed: Invalid argument", abort). The mutex is
+//! leaked for the same reason - it may be taken after its static twin would have died.
+std::mutex &ServersLock() {
+	static auto *lock = new std::mutex();
+	return *lock;
+}
+std::map<string, unique_ptr<AclQuackServer>> &Servers() {
+	static auto *servers = new std::map<string, unique_ptr<AclQuackServer>>();
+	return *servers;
+}
+
+//! At exit, a door still open stops accepting: the listener ends and the port is released before the
+//! static destructors run, and nothing else is torn down - the instance behind it is left as the
+//! process leaves it (spec 084). Registered once, at the first serve.
+void StopAcceptingAtExit() {
+	std::lock_guard<std::mutex> guard(ServersLock());
+	for (auto &entry : Servers()) {
+		try {
+			entry.second->StopAccepting();
+		} catch (...) { // NOLINT: nothing may escape an exit handler
+		}
+	}
+}
+
+void RegisterExitStop() {
+	static std::once_flag once;
+	std::call_once(once, [] { std::atexit(StopAcceptingAtExit); });
+}
 
 } // namespace
 
@@ -505,14 +537,14 @@ string StartAclQuackServer(ClientContext &context, const AclQuackServeConfig &cf
 		{
 			unique_ptr<AclQuackServer> zombie;
 			{
-				std::lock_guard<std::mutex> guard(g_servers_lock);
-				auto existing = g_servers.find(listen_uri.CanonicalUri());
-				if (existing != g_servers.end()) {
+				std::lock_guard<std::mutex> guard(ServersLock());
+				auto existing = Servers().find(listen_uri.CanonicalUri());
+				if (existing != Servers().end()) {
 					if (!existing->second->OwnerExpired()) {
 						return "a server is already listening on " + listen_uri.CanonicalUri();
 					}
 					zombie = std::move(existing->second);
-					g_servers.erase(existing);
+					Servers().erase(existing);
 				}
 			}
 			if (zombie) {
@@ -525,12 +557,13 @@ string StartAclQuackServer(ClientContext &context, const AclQuackServeConfig &cf
 		                                        cfg.wellknown, cfg.draining, cfg.metrics, cfg.node_load, cfg.discovery);
 		auto key = server->ListenUri().CanonicalUri();
 		actual_uri_out = server->ListenUri().Uri();
-		std::lock_guard<std::mutex> guard(g_servers_lock);
-		if (g_servers.find(key) != g_servers.end()) {
+		RegisterExitStop();
+		std::lock_guard<std::mutex> guard(ServersLock());
+		if (Servers().find(key) != Servers().end()) {
 			// another serve took this address between our reclaim and our bind
 			return "a server is already listening on " + key;
 		}
-		g_servers.emplace(key, std::move(server));
+		Servers().emplace(key, std::move(server));
 		return "";
 	} catch (IOException &) {
 		// a bind or PEM failure is the environment's, not the policy's: it keeps its IO class all the
@@ -553,17 +586,17 @@ string StartAclQuackServer(ClientContext &context, const AclQuackServeConfig &cf
 bool StopAclQuackServer(const DatabaseInstance &caller, const string &uri) {
 	unique_ptr<AclQuackServer> gone;
 	{
-		std::lock_guard<std::mutex> guard(g_servers_lock);
+		std::lock_guard<std::mutex> guard(ServersLock());
 		QuackUri parsed(uri, false);
-		auto it = g_servers.find(parsed.CanonicalUri());
-		if (it == g_servers.end()) {
+		auto it = Servers().find(parsed.CanonicalUri());
+		if (it == Servers().end()) {
 			return false;
 		}
 		if (!it->second->OwnedBy(caller)) {
 			throw BinderException("acl_quack_stop: the server on %s belongs to another database instance", uri);
 		}
 		gone = std::move(it->second);
-		g_servers.erase(it);
+		Servers().erase(it);
 	}
 	// Stop accepting (frees the port), then tear down fully and SYNCHRONOUSLY - joining the listener
 	// and the worker pool here rather than on a detached thread. The detach saved the caller a moment
@@ -575,9 +608,9 @@ bool StopAclQuackServer(const DatabaseInstance &caller, const string &uri) {
 }
 
 vector<AclQuackDoorLoad> AclQuackDoorLoads(const DatabaseInstance &db) {
-	std::lock_guard<std::mutex> guard(g_servers_lock);
+	std::lock_guard<std::mutex> guard(ServersLock());
 	vector<AclQuackDoorLoad> loads;
-	for (auto &entry : g_servers) {
+	for (auto &entry : Servers()) {
 		if (entry.second->OwnedBy(db)) {
 			AclQuackDoorLoad load;
 			load.uri = entry.second->ListenUri().CanonicalUri();
@@ -589,9 +622,9 @@ vector<AclQuackDoorLoad> AclQuackDoorLoads(const DatabaseInstance &db) {
 }
 
 idx_t AclQuackServerCount(const DatabaseInstance &db) {
-	std::lock_guard<std::mutex> guard(g_servers_lock);
+	std::lock_guard<std::mutex> guard(ServersLock());
 	idx_t count = 0;
-	for (auto &entry : g_servers) {
+	for (auto &entry : Servers()) {
 		if (entry.second->OwnedBy(db)) {
 			count++;
 		}

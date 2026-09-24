@@ -334,6 +334,10 @@ tickets; a lone oversized stream is admitted; an abandoned ticket is skipped) up
 `acl_stream_queue_timeout` (25 s - under the quack client's 30 s http_timeout), then fail with the
 reason as the stream's error, which PREPARE answers; the load report's `streams` + `admit.new_stream`,
 gauges `acl.streams.*`. Flight holds one chunk per stream and does not reserve.
+**Spec 084**: the doors' registry (`Servers()`) is never destroyed - a door's connections hold its
+instance, and a static map tore the instance down among the static destructors (an attached quack
+client's curl destructor on a dead mutex, abort); at exit an `atexit` stops accepting, nothing more,
+so an unstopped door's instance gets no final checkpoint - stop the doors before closing.
 The embed is default-on (escape hatch `ACL_NO_QUACK_EMBED`).
 Streamed ingest
 (`SEND_DATA`): since quack f4328c5 (the duckdb 2.0 pin) the drain statement is composed by the
