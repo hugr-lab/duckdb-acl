@@ -7,6 +7,9 @@ name: Debug MinGW crash
 # triplet), then runs the suspect test - alone, and in the batch it failed in - many times, every run
 # under gdb, and keeps the backtrace of whatever crashes. Nothing here gates anything.
 on:
+  # a push to this branch runs it from the branch itself (a dispatch needs the file on main)
+  push:
+    branches: [debug-mingw-crash]
   workflow_dispatch:
     inputs:
       iterations:
@@ -29,7 +32,7 @@ env:
   CI_VCPKG_OVERLAY_PORTS: extension-ci-tools/vcpkg_ports
   CI_VCPKG_OVERLAY_TRIPLETS: extension-ci-tools/toolchains
   CI_BUILD_DUCKDB_SHELL: true
-  CI_BUILD_TYPE: ${{ inputs.build_type }}
+  CI_BUILD_TYPE: ${{ inputs.build_type || 'release' }}
   CI_TEST_CONFIG: '{}'
 
 jobs:
@@ -114,7 +117,7 @@ jobs:
       - name: Run the suspect under gdb
         shell: bash
         env:
-          ITERATIONS: ${{ inputs.iterations }}
+          ITERATIONS: ${{ inputs.iterations || '40' }}
         run: |
           set -u
           GDB=/c/msys64/mingw64/bin/gdb.exe
