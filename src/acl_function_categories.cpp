@@ -44,6 +44,9 @@ bool FunctionNeverCallable(const string &name, const string &database) {
 	static const case_insensitive_set_t NAMES = {
 	    "arrow_scan", "arrow_scan_dumb", "seq_scan", "query", "query_table", "json_execute_serialized_sql", "tpch",
 	    "tpcds", "sqlsmith", "fuzzyduck", "reduce_sql_statement", "fuzz_all_functions", "scan_data_from_quack_client",
+	    // spec 092: a secrets service's switch that makes the node act for every acl session (tresor spec
+	    // 015) - the node's own bootstrap calls it, in whatever catalog the service is attached as
+	    "act_for_sessions",
 	    // the engine's own: how it invokes, combines and
 	    // finalizes, and what a mask says with error()
 	    "error", "constant_or_null", "create_sort_key", "invoke", "combine", "finalize", "to_aggregate_state"};

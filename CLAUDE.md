@@ -163,7 +163,7 @@ enforcement off â€” the `acl_*` functions still configure policy, but no `ACL â€
   (or to `''`, every role) or is granted by name; a deny anywhere wins; a key in no category is
   refused; the **never set** (`acl_*`, `ducklake_*`, `quack_*`, `arrow_scan*`, `query*`,
   `json_execute_serialized_sql`, scanners' `*_query/_execute/_attach`, the engine's `__internal_*`
-  helpers) is code and no grant re-opens it. Categories live in the policy catalog
+  helpers, a secrets service's `act_for_sessions` - spec 092) is code and no grant re-opens it. Categories live in the policy catalog
   (`function_categories` / `function_category_members` / `function_grants`, seeded ONCE at creation
   from `schema/function_categories/*.txt` - nothing is ever added automatically after that) or, in
   memory mode, in the seed (`src/acl_function_seed.hpp`, generated). The model

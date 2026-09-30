@@ -123,7 +123,10 @@ public:
 		auto transaction = CatalogTransaction::GetSystemTransaction(GetDatabase());
 		auto text = LogicalType::VARCHAR;
 		vector<std::pair<const char *, vector<LogicalType>>> signatures {
-		    {"grant_secret", {text, text, LogicalType::LIST(text)}}, {"revoke_secret", {text, text}}, {"whoami", {}}};
+		    {"grant_secret", {text, text, LogicalType::LIST(text)}},
+		    {"revoke_secret", {text, text}},
+		    {"whoami", {}},
+		    {"act_for_sessions", {}}};
 		vector<TableFunction> functions;
 		for (auto &signature : signatures) {
 			functions.emplace_back(Identifier(signature.first), signature.second, ServiceScan, ServiceBind,
@@ -343,5 +346,16 @@ int main(int argc, char *argv[]) {
 			Check(One(con, "ACL ROLE \"keeper\" SELECT * FROM corp.main.whoami()") == "true" && TakeCalls().size() == 1,
 			      "and so is the fully qualified one");
 		});
+
+		Scenario(
+		    "the service's act_for_sessions is never callable under a principal, whatever is granted (spec 092)", [&] {
+			    Refused(con, "ACL ADMIN ALTER FUNCTION CATEGORY secrets_service ADD (corp.main.act_for_sessions TABLE)",
+			            "never callable");
+			    Refused(con, "ACL ADMIN GRANT FUNCTION corp.main.act_for_sessions TABLE TO ROLE keeper",
+			            "never callable");
+			    Refused(con, "ACL ROLE \"keeper\" SELECT * FROM corp.act_for_sessions()", "is not allowed");
+			    Refused(con, "ACL ROLE \"keeper\" SELECT * FROM corp.main.act_for_sessions()", "is not allowed");
+			    Check(TakeCalls().empty(), "the service heard nothing");
+		    });
 	});
 }
