@@ -5,10 +5,15 @@ duckdb_extension_load(acl
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
     LOAD_TESTS
 )
+# Since duckdb #26189 (the 2026-09-30 pin, spec 091) an extension is linked into duckdb only when a
+# config names it with duckdb_extension_statically_link - the default flipped, DONT_LINK is gone. The
+# test binary carries acl (and each opt-in block below names what it linked before the flip).
+duckdb_extension_statically_link(acl)
 
 # icu: the client-local rendering settings a session may set (spec 068 - TimeZone, Calendar) are
 # ICU's, so the test binary carries it; a deployed duckdb autoloads it. In-tree, no vcpkg.
 duckdb_extension_load(icu)
+duckdb_extension_statically_link(icu)
 
 # Integration builds (specs/005): also build the source scanners the integration scenarios attach
 # through. Opt-in via ACL_INTEGRATION=1 so regular/release builds stay lean. Pins and patches come
@@ -40,6 +45,7 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
     # ("Referenced column ... not found"); CI starts its postgres empty, a developer's persistent
     # catalog is recreated (`DROP DATABASE ducklake_catalog; CREATE DATABASE ducklake_catalog;`).
     include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/ducklake.cmake)
+    duckdb_extension_statically_link(ducklake)
     # mysql_scanner is currently disabled at the submodule pin ("patches do not apply"); flip its
     # gate here the moment the submodule re-enables it.
     set(MYSQL_SCANNER_ENABLED OFF)
@@ -52,7 +58,6 @@ endif()
 # scenarios need something newer.
 if(DEFINED ENV{ACL_INTEGRATION_MSSQL} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(mssql
-        DONT_LINK
         GIT_URL https://github.com/hugr-lab/mssql-extension
         GIT_TAG 1d74ae2c0e6c3fc963d3915784a36a7d06f0b6d1
     )
@@ -71,16 +76,17 @@ endif()
 # the patches duckdb carries for that pin (APPLY_PATCHES: the function-signature options; 0001
 # touches a test only) - and
 # the embedded server (third_party/quack) is the same commit, its copies patched the same way by
-# sync.py. The block is ours rather than an include of duckdb's file for two words: DONT_LINK (the
-# client must stay a loadable, or its symbols and the embed's - both define duckdb::QuackServer & co.
-# - meet in one static link, spec 063 strategy B), and no LOAD_TESTS (quack's own sqllogic suite is
-# duckdb's CI's business, not ours).
+# sync.py. The block is ours rather than an include of duckdb's file for two reasons: quack is never
+# named in duckdb_extension_statically_link (the client must stay a loadable, or its symbols and the
+# embed's - both define duckdb::QuackServer & co. - meet in one static link, spec 063 strategy B; it
+# was DONT_LINK before duckdb #26189), and no LOAD_TESTS (quack's own sqllogic suite is duckdb's CI's
+# business, not ours).
 if(DEFINED ENV{ACL_QUACK} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(json)
     duckdb_extension_load(autocomplete)
     include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/httpfs.cmake)
+    duckdb_extension_statically_link(json autocomplete httpfs)
     duckdb_extension_load(quack
-        DONT_LINK
         GIT_URL https://github.com/duckdb/duckdb-quack
         GIT_TAG 974927a394b188755284682b73398ed50e86316c
         SUBMODULES extension-ci-tools
