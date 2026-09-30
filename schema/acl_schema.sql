@@ -87,6 +87,16 @@ CREATE TABLE IF NOT EXISTS acl."resource_groups"("group" VARCHAR PRIMARY KEY, "w
 
 CREATE TABLE IF NOT EXISTS acl."role_resource_groups"("role" VARCHAR, "group" VARCHAR, PRIMARY KEY ("role", "group"));
 
+-- spec 093 (schema v16): the cluster profile - the shared part of every node's bootstrap, as desired
+-- state only (no history: who changed what is the audit's, the previous state the orchestrator's).
+-- `scope` '' is the whole cluster, otherwise a resource group; `spec` is JSON and never a credential;
+-- `class` is how a change of the item is applied (hot / drain / restart); `version` is the
+-- config_version that last wrote it; `pos` orders sources that no dependency orders.
+CREATE TABLE IF NOT EXISTS acl."cluster_items"("scope" VARCHAR, "kind" VARCHAR, "name" VARCHAR, "spec" VARCHAR, "class" VARCHAR, "version" BIGINT, "pos" BIGINT, "comment" VARCHAR, PRIMARY KEY ("scope", "kind", "name"));
+
+-- spec 093: a source that needs another source attached first (the start order is topological)
+CREATE TABLE IF NOT EXISTS acl."cluster_deps"("scope" VARCHAR, "name" VARCHAR, "depends_on" VARCHAR, PRIMARY KEY ("scope", "name", "depends_on"));
+
 -- The shipped function categories (spec 072), rendered by scripts/gen_schema.py from
 -- schema/function_categories/: the categories, their members, and the grants to the role '' of the
 -- categories every role holds from the start. Written once - the `function_seed` stamp in meta says
@@ -118,6 +128,8 @@ INSERT INTO acl."function_grants" SELECT * FROM (VALUES ('', 'base', '', '', '',
 
 INSERT INTO acl."meta" SELECT 'function_seed', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'function_seed');
 
-INSERT INTO acl."meta" SELECT 'schema_version', '15' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
+INSERT INTO acl."meta" SELECT 'schema_version', '16' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
 
 INSERT INTO acl."meta" SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'policy_version');
+
+INSERT INTO acl."meta" SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'config_version');

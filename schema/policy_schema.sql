@@ -100,6 +100,16 @@ CREATE TABLE IF NOT EXISTS <resource_groups>("group" ACL_KEY_TEXT PRIMARY KEY, "
 
 CREATE TABLE IF NOT EXISTS <role_resource_groups>("role" ACL_KEY_TEXT, "group" ACL_KEY_TEXT, PRIMARY KEY ("role", "group"));
 
+-- spec 093 (schema v16): the cluster profile - the shared part of every node's bootstrap, as desired
+-- state only (no history: who changed what is the audit's, the previous state the orchestrator's).
+-- `scope` '' is the whole cluster, otherwise a resource group; `spec` is JSON and never a credential;
+-- `class` is how a change of the item is applied (hot / drain / restart); `version` is the
+-- config_version that last wrote it; `pos` orders sources that no dependency orders.
+CREATE TABLE IF NOT EXISTS <cluster_items>("scope" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "spec" VARCHAR, "class" VARCHAR, "version" BIGINT, "pos" BIGINT, "comment" VARCHAR, PRIMARY KEY ("scope", "kind", "name"));
+
+-- spec 093: a source that needs another source attached first (the start order is topological)
+CREATE TABLE IF NOT EXISTS <cluster_deps>("scope" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "depends_on" ACL_KEY_TEXT, PRIMARY KEY ("scope", "name", "depends_on"));
+
 -- @section seed
 -- The shipped function categories (spec 072), rendered by scripts/gen_schema.py from
 -- schema/function_categories/: the categories, their members, and the grants to the role '' of the
@@ -109,7 +119,8 @@ CREATE TABLE IF NOT EXISTS <role_resource_groups>("role" ACL_KEY_TEXT, "group" A
 -- @seed function_categories
 
 -- @section schema
-INSERT INTO <meta> SELECT 'schema_version', '15' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '16' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');
+INSERT INTO <meta> SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'config_version');

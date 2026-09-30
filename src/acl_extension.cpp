@@ -17,6 +17,7 @@
 #include "acl_audit_pipeline.hpp"
 #include "acl_introspection.hpp"
 #include "acl_maintenance.hpp"
+#include "acl_cluster.hpp"
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
 #include "acl_profile.hpp"
@@ -249,6 +250,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
 	acl::RegisterAclMaintenance(loader, store); // spec 039: acl_check_catalog / acl_repair_relation
+	acl::RegisterAclCluster(loader, store);     // spec 093: the cluster profile
 	// The audit and observability hooks (spec 069): one registry per instance, reached through the
 	// object cache so an extension loaded before or after us finds the same one - unless the one
 	// there was stamped with another contract version (an extension built from another revision of

@@ -48,6 +48,12 @@ unique_ptr<QueryResult> CatalogBackend::Query(const string &sql) {
 
 void CatalogBackend::WriteWithReads(
     const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &, vector<string> &)> &body) {
+	WriteWithReads(body, "policy_version", nullptr);
+}
+
+int64_t CatalogBackend::WriteWithReads(
+    const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &, vector<string> &)> &body,
+    const char *version_key, const std::function<void(int64_t)> &before_commit) {
 	auto instance = Db();
 	Connection con(*instance);
 	auto begin = con.Query("BEGIN");
@@ -80,10 +86,27 @@ void CatalogBackend::WriteWithReads(
 	}
 	auto bump = con.Query("UPDATE " + Tbl("meta") +
 	                      " SET \"value\" = CAST(CAST(\"value\" AS BIGINT) + 1 AS VARCHAR)"
-	                      " WHERE \"key\" = 'policy_version'");
+	                      " WHERE \"key\" = " +
+	                      Lit(version_key));
 	if (bump->HasError()) {
 		rollback();
 		throw BinderException("acl catalog: version bump failed: %s", bump->GetError());
+	}
+	int64_t version = 0;
+	auto read_back =
+	    con.Query("SELECT CAST(\"value\" AS BIGINT) FROM " + Tbl("meta") + " WHERE \"key\" = " + Lit(version_key));
+	if (read_back->HasError() || read_back->RowCount() != 1) {
+		rollback();
+		throw BinderException("acl catalog: the catalog has no %s - migrate it (schema/migrations)", version_key);
+	}
+	version = read_back->Collection().GetValue(0, 0).GetValue<int64_t>();
+	if (before_commit) {
+		try {
+			before_commit(version);
+		} catch (...) {
+			rollback();
+			throw;
+		}
 	}
 	auto commit = con.Query("COMMIT");
 	if (commit->HasError()) {
@@ -91,6 +114,7 @@ void CatalogBackend::WriteWithReads(
 	}
 	lock_guard<mutex> guard(lock);
 	checked_once = false;
+	return version;
 }
 
 void CatalogBackend::Write(const vector<string> &statements) {

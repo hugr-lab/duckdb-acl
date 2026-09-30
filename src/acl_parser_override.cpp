@@ -11,6 +11,7 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
@@ -322,6 +323,29 @@ string MgmtCallName(SQLStatement &stmt) {
 	return select.select_list[0]->Cast<FunctionExpression>().FunctionName().GetIdentifierName();
 }
 
+//! spec 093: the audit object of a compiled `ACL CLUSTER` call - the item's identity, never its spec
+//! (a source's path is a physical name, and the audit carries none): `<kind>:<name>`
+AuditObject ClusterAuditObject(SQLStatement &stmt, const string &call) {
+	auto &select = stmt.Cast<SelectStatement>().node->Cast<SelectNode>();
+	auto &args = select.select_list[0]->Cast<FunctionExpression>().GetArguments();
+	auto arg = [&](idx_t i) {
+		return i < args.size() ? args[i].GetExpression().Cast<ConstantExpression>().GetLiteral().ToValue().ToString()
+		                       : string();
+	};
+	string kind, name;
+	if (call == "acl_cluster_extension") {
+		kind = "extension";
+		name = arg(2);
+	} else if (call == "acl_cluster_attach" || call == "acl_cluster_detach") {
+		kind = "source";
+		name = arg(1);
+	} else {
+		kind = "setting";
+		name = arg(2);
+	}
+	return AuditObject {kind + ":" + name, "cluster"};
+}
+
 //! Is `name_lower` *called* anywhere in the query - the identifier followed by its open parenthesis?
 //! Allocation-free, because every unprefixed statement passes through here, so it must not copy the
 //! query to lowercase.
@@ -569,7 +593,10 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		for (auto &stmt : statements) {
 			audit.trail.statements.emplace_back();
 			audit.trail.statements.back().statement = "manage";
-			audit.trail.statements.back().objects.push_back(AuditObject {MgmtCallName(*stmt), "manage"});
+			auto call = MgmtCallName(*stmt);
+			audit.trail.statements.back().objects.push_back(StringUtil::StartsWith(call, "acl_cluster_")
+			                                                    ? ClusterAuditObject(*stmt, call)
+			                                                    : AuditObject {call, "manage"});
 		}
 		audit.phase = Reason::MGMT_UNAUTHORIZED;
 		AuthorizeMgmt(statements, rights);

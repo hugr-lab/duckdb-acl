@@ -344,6 +344,12 @@ struct CatalogBackend {
 	//! rewrite silently discards the first - which can drop an RLS predicate or a column mask.
 	void WriteWithReads(const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &,
 	                                             vector<string> &)> &body);
+	//! spec 093: the same transaction, bumping `version_key` of meta instead of policy_version, running
+	//! `before_commit` after the writes and before COMMIT (a throw there rolls the write back), and
+	//! answering the counter's new value
+	int64_t WriteWithReads(const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &,
+	                                                vector<string> &)> &body,
+	                       const char *version_key, const std::function<void(int64_t)> &before_commit);
 
 	//! Run admin write statements + the policy_version bump in one transaction
 	void Write(const vector<string> &statements);
