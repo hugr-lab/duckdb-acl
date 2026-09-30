@@ -436,6 +436,15 @@ before LOAD, a mismatch removes the file), sources ordered by `DEPENDS ON`, DETA
 dependent (CASCADE) or the policy (FORCE) reads through it. Audit: object `<kind>:<name>`, capability
 `cluster`, never the spec. `acl_cluster_items([group])`, `acl_cluster_version()`.
 
+**Spec 094 — the schema window**: a catalog carries `schema_version` and `min_reader_version` (the
+oldest build that may read it, declared per step as `-- min_reader: <n>` in schema/migrations and
+checked by `make schema`). A build judges the pair at open, at init and at every freshness check
+(`JudgeSchema`): its own version serves + writes; newer inside the window serves and NEVER writes
+(`compat_read_only`, and `Write`/`WriteWithReads` re-check `schema_version` inside the transaction);
+newer outside it, or older, is refused (fail closed; older says `acl_migrate_catalog`). The steps are
+embedded (`ACL_SCHEMA_STEPS`) and `acl_migrate_catalog(db[, schema])` applies them in one transaction -
+never automatically. `acl_catalog_schema()` reports build/catalog/window/mode.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

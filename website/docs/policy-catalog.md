@@ -70,7 +70,7 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 
 | table | holds |
 | --- | --- |
-| `meta` | `schema_version` (the shape of these tables) and `policy_version` (bumped on every write) |
+| `meta` | `schema_version` (the shape of these tables), `min_reader_version` (the oldest build that may read it, spec 094), `policy_version` (bumped on every policy write) and `config_version` (on every cluster profile write, spec 093) |
 | `catalogs` | the virtual catalogs and their comments |
 | `relations` | virtual tables and views: `form` (`alias` / `subquery` / `view`), physical target, view SQL, inline RLS, origin, whether the RLS was checked |
 | `relation_columns` | an object's own projection: position, name, expression, nullability |
@@ -95,45 +95,67 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 | `references` / `reference_columns` | declared join paths between objects and the columns each end names (spec 022) |
 | `keys` | a declared primary key per object - a hint, never enforced (spec 048) |
 
-## Schema versions and migration (spec 034)
+## Schema versions and migration (specs 034, 094)
 
-The catalog says which shape it is - `meta.schema_version`, currently **15** - and a build reads
-exactly one shape. The check happens where the catalog is chosen, not in the middle of somebody's
-query:
+The catalog says which shape it is: `meta.schema_version`, currently **16**. It also says the oldest
+build that may still read it: `meta.min_reader_version`, currently **15**. A build judges the pair
+where the catalog is chosen (`acl_use_db`) and again at every freshness check (below), so a catalog
+migrated under a running node is noticed without a restart.
 
-- `acl_use_db(db, schema, false)` on another version: *"acl catalog: "db"."schema" is schema
-  version 9, this build reads 15 - apply the matching schema/acl_schema.sql, or let acl_use_db(...,
-  true) create it"*.
-- `acl_use_db(db, schema, true)` on an older stamp: *"... is schema version 9 and this build creates
-  15 - an older catalog is migrated (schema/migrations/v<n>.sql for every version above 9, in order),
-  not re-initialised"*. `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that exists, so
-  replaying the schema is not a migration.
-- No stamp at all: *"... has no schema_version - it is not an acl policy schema, or it was applied
-  without the version stamp (see schema/acl_schema.sql)"*. A stamp that is not a number: *"... has
-  schema_version "ten", which is not a number"*; `init := true` repairs an unreadable stamp.
+| the catalog is | the node | message |
+| --- | --- | --- |
+| the build's version | serves and writes | - |
+| newer, and `min_reader_version` ≤ the build | **serves, never writes** (read-only) | a write: *"… is schema version 17 and this node's build writes 16 - policy is written from a node of the catalog's build …"* |
+| newer, outside that window | refuses every statement (fail closed) | *"… is schema version 17, readable from build 17 on, and this build is 16 - upgrade the node"* |
+| older | refuses, and says what to do | *"… is schema version 15 and this build reads 16 - migrate it first: SELECT acl_migrate_catalog('store', 'acl') on a node of this build"* |
 
-**The extension never applies migrations itself.** To bring an older catalog forward:
+A catalog without a stamp is not an acl schema. A stamp that is not a number is refused, and
+`init := true` repairs an unreadable one.
 
-1. Read the stamp: `SELECT value FROM store.acl.meta WHERE key = 'schema_version'`.
-2. Apply every `schema/migrations/v<n>.sql` with `<n>` above it, in order, against the database that
-   holds the schema. Each step ends by stamping its own number, so a catalog at 12 runs only `v13`.
-   Shipped steps: `v11.sql` (spec 048: `nullable` on the column tables, the `keys` table),
-   `v12.sql` (spec 064: `client_id` / `client_secret` on `issuers`), `v13.sql` (drops the unused
-   `schema_aliases` table), `v14.sql` (spec 072: the function categories, seeded as a fresh catalog is),
-   `v15.sql` (spec 085: `resource_groups` and `role_resource_groups`, empty).
-3. Re-open with `acl_use_db(..., false)`.
+**Migrating: `acl_migrate_catalog(db[, schema])`.** A build carries its migration steps (from v11 on)
+and applies every step above the catalog's version in **one transaction**, then answers what it did:
+*"… migrated from schema version 15 to 16 (readable from build 15 on)"*.
+- It is idempotent: *"… is already schema version 16"*.
+- It refuses a newer catalog, because a catalog only moves forward.
+- It refuses a catalog older than the build's first step: migrate with an older build first.
+- Like every `acl_*` function it is denied to a principal. It is the operator's or the node agent's
+  step, run on the node's own connection.
 
-The steps are written in duckdb dialect; on another engine translate them as you did the schema. A
-*newer* stamp than the build reads means a newer build wrote it - upgrade the extension, do not
-downgrade the catalog.
+**A rolling upgrade across a schema change**, for a step that keeps older builds in its window:
 
-The contract behind this (`schema/migrations/README.md`): `acl_schema.sql` always creates the current
-version complete, a fresh catalog never replays history, and a migrated catalog must be identical to
-a fresh one. Developers keep it honest with two targets: `make schema` renders
-`schema/policy_schema.sql` into the C++ header the extension runs and into `schema/acl_schema.sql`;
-`make schema-check` fails when those are stale, applies the hand-file to an empty database and serves
-a policy from it with init disabled, and builds a catalog from the schema `origin/main` ships, applies
-every step above its version, and diffs every `acl` table's column shape against a fresh catalog.
+1. Run `acl_migrate_catalog` from one node or job of the new build. The old nodes keep serving from the
+   migrated catalog, and they refuse policy writes.
+2. Roll the nodes to the new build.
+3. Write policy again. Every node is now of the catalog's build.
+
+A step that cannot keep older builds reading (`min_reader` equal to its own version) turns the old
+nodes off at their next freshness check. That upgrade is a switch-over, not a rolling one.
+
+**The window is declared, never assumed.** Each step in `schema/migrations/` states
+`-- min_reader: <n>` in its header. Only its author knows whether an older build that ignores what the
+step adds can ever admit more. A new column that *narrows* access, read by the new build only, would
+widen access on an old node that ignores it, so such a step must declare its own version. v16 only
+adds the cluster profile's tables, so it keeps v15 readers. Every step before it is strict.
+
+The steps are also kept as files (`schema/migrations/v<n>.sql`, duckdb dialect) for applying by hand on
+another engine. The shipped steps are:
+
+| step | spec | what it does |
+| --- | --- | --- |
+| `v11` | 048 | adds `nullable` to the column tables and adds `keys` |
+| `v12` | 064 | adds `client_id` and `client_secret` to `issuers` |
+| `v13` | - | drops the unused `schema_aliases` table |
+| `v14` | 072 | adds the function categories, seeded |
+| `v15` | 085 | adds the resource groups |
+| `v16` | 093 | adds the cluster profile; stamps `min_reader_version` 15 |
+
+The contract behind this is in `schema/migrations/README.md`:
+- `acl_schema.sql` always creates the current version complete, and a migrated catalog must be
+  identical to a fresh one.
+- `make schema` renders `schema/policy_schema.sql` into the C++ header (with the steps embedded) and
+  into `schema/acl_schema.sql`.
+- `make schema-check` builds a catalog from the schema `origin/main` ships, applies every step above
+  it, and diffs every `acl` table's column shape against a fresh catalog.
 
 ## Staleness: `policy_version` and `acl_version_check_interval`
 

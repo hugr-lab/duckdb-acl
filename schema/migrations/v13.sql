@@ -1,4 +1,5 @@
 -- duckdb-acl schema migration: v12 -> v13 (the 2026-09-03 release review).
+-- min_reader: 13 - a build older than v13 does not read this catalog (spec 094: the window is declared per step, never assumed)
 -- Run against the database that holds the `acl` policy schema, then re-open with acl_use_db.
 -- Written for the duckdb dialect; see schema/acl_schema.sql for what another engine may need changing.
 -- `schema_aliases` was the pre-spec-015 alias table, kept "in step for one version so a rollback still

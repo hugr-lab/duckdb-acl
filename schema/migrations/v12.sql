@@ -1,4 +1,5 @@
 -- duckdb-acl schema migration: v11 -> v12 (spec 064, the Flight door's auth discovery + password handshake).
+-- min_reader: 12 - a build older than v12 does not read this catalog (spec 094: the window is declared per step, never assumed)
 -- Run against the database that holds the `acl` policy schema, then re-open with acl_use_db.
 -- Written for the duckdb dialect; see schema/acl_schema.sql for what another engine may need changing.
 -- client_id is the app registration the node runs the password grant as (and what discovery

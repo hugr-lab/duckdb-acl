@@ -35,15 +35,21 @@ UPDATE store.acl.meta SET "value" = '9' WHERE "key" = 'schema_version';
 statement error
 SELECT acl_use_db('store', 'acl', false);
 ----
-<REGEX>:.*is schema version 9, this build reads [0-9]+.*apply the matching.*
+<REGEX>:.*is schema version 9 and this build reads [0-9]+ - migrate it first: SELECT acl_migrate_catalog.*
 
 # init refuses an older stamp rather than re-stamping it: CREATE TABLE IF NOT EXISTS cannot add
 # a column to a table that already exists, so replaying the schema is not a migration - the honest
-# way up is schema/migrations/v<n>.sql, in order (spec 048 review)
+# way up is the migration steps, in order (spec 048 review; since spec 094 embedded in the build)
 statement error
 SELECT acl_use_db('store', 'acl', true);
 ----
-<REGEX>:.*is schema version 9 and this build creates [0-9]+.*schema/migrations.*
+<REGEX>:.*is schema version 9 and this build reads [0-9]+ - migrate it first.*
+
+# the build carries its steps from v11 on: an older catalog takes an older build first (spec 094)
+statement error
+SELECT acl_migrate_catalog('store', 'acl');
+----
+<REGEX>:.*carries no step from schema version 9 to 10 - migrate with an older build first.*
 
 # or, for a catalog with nothing worth keeping, a fresh schema
 statement ok

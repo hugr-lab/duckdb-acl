@@ -1,0 +1,177 @@
+# name: test/sql/acl_schema_window.test
+# description: the schema compatibility window (spec 094) - a catalog newer than the build but inside
+#   the window it declares is served from and never written, re-judged under a running node; outside
+#   it the node refuses (fail closed); an older catalog is migrated forward by the steps the build
+#   carries (acl_migrate_catalog), in one transaction
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1), (2);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET GLOBAL acl_version_check_interval=0;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+query T
+SELECT acl_catalog_schema();
+----
+{'build': 16, 'build_min_reader': 15, 'catalog': 16, 'min_reader': 15, 'mode': current}
+
+# --- a newer catalog inside its window, migrated under the running node: served, never written ---
+
+statement ok
+UPDATE store.acl.meta SET "value" = '17' WHERE "key" = 'schema_version';
+
+statement ok
+UPDATE store.acl.meta SET "value" = '16' WHERE "key" = 'min_reader_version';
+
+query I
+ACL ROLE "r" SELECT count(*) FROM orders;
+----
+2
+
+query T
+SELECT acl_catalog_schema().mode;
+----
+read_only
+
+statement error
+ACL ADMIN CREATE ROLE other;
+----
+<REGEX>:.*schema version 17 and this node's build writes 16 - policy is written from a node of the catalog's build.*
+
+statement error
+ACL ADMIN CLUSTER SET threads = 2;
+----
+<REGEX>:.*this node's build writes 16.*
+
+# the refused write wrote nothing
+query I
+SELECT count(*) FROM store.acl.roles WHERE "role" = 'other';
+----
+0
+
+# --- outside the window: the running node stops serving (fail closed) -----------------------------
+
+statement ok
+UPDATE store.acl.meta SET "value" = '17' WHERE "key" = 'min_reader_version';
+
+statement error
+ACL ROLE "r" SELECT count(*) FROM orders;
+----
+<REGEX>:.*schema version 17, readable from build 17 on, and this build is 16 - upgrade the node.*
+
+statement error
+SELECT acl_use_db('store', 'acl', false);
+----
+<REGEX>:.*upgrade the node \(at open\).*
+
+# a catalog is only ever migrated forward, by a node of the newer build
+statement error
+SELECT acl_migrate_catalog('store', 'acl');
+----
+<REGEX>:.*newer than this build.*migrated forward.*
+
+# --- an older catalog: refused with what to do, then migrated by the embedded steps ------------------
+
+statement ok
+UPDATE store.acl.meta SET "value" = '16' WHERE "key" = 'schema_version';
+
+statement ok
+UPDATE store.acl.meta SET "value" = '15' WHERE "key" = 'min_reader_version';
+
+statement ok
+SELECT acl_use_db('store', 'acl', false);
+
+# make it a v15 catalog: without what v16 added
+statement ok
+DROP TABLE store.acl.cluster_items;
+
+statement ok
+DROP TABLE store.acl.cluster_deps;
+
+statement ok
+DELETE FROM store.acl.meta WHERE "key" IN ('config_version', 'min_reader_version');
+
+statement ok
+UPDATE store.acl.meta SET "value" = '15' WHERE "key" = 'schema_version';
+
+statement error
+SELECT acl_use_db('store', 'acl', false);
+----
+<REGEX>:.*schema version 15 and this build reads 16 - migrate it first: SELECT acl_migrate_catalog\('store', 'acl'\).*
+
+statement error
+SELECT acl_use_db('store', 'acl', true);
+----
+<REGEX>:.*migrate it first.*
+
+query T
+SELECT acl_migrate_catalog('store', 'acl');
+----
+"store"."acl" migrated from schema version 15 to 16 (readable from build 15 on)
+
+query T
+SELECT acl_migrate_catalog('store');
+----
+"store"."acl" is already schema version 16
+
+statement ok
+SELECT acl_use_db('store', 'acl', false);
+
+query T
+SELECT acl_catalog_schema();
+----
+{'build': 16, 'build_min_reader': 15, 'catalog': 16, 'min_reader': 15, 'mode': current}
+
+# what v16 added is there, and the policy is intact
+query I
+SELECT acl_cluster_version();
+----
+0
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 2;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM orders;
+----
+2
+
+# --- not an acl catalog -----------------------------------------------------------------------------
+
+statement ok
+ATTACH ':memory:' AS empty;
+
+statement error
+SELECT acl_migrate_catalog('empty', 'acl');
+----
+<REGEX>:.*is not an acl policy schema.*

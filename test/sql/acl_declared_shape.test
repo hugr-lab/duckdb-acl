@@ -374,4 +374,4 @@ UPDATE old_store.acl.meta SET "value" = '10' WHERE "key" = 'schema_version';
 statement error
 SELECT acl_use_db('old_store', 'acl', true);
 ----
-schema/migrations
+migrate it first
