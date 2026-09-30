@@ -624,6 +624,82 @@ session opens, and a limit it does not name is the node's setting.
   limits_json[, comment])`, `acl_drop_resource_group(group[, 'skip'])`,
   `acl_grant_resource_group(role, group)` and `acl_revoke_resource_group(role, group)`.
 
+## Cluster profile
+
+```sql
+CLUSTER INSTALL EXTENSION <name> VERSION '<v>' [FROM <repository>] [SHA256 '<hex>'] [IN GROUP <group>] [COMMENT '<text>']
+CLUSTER UPDATE  EXTENSION <name> VERSION '<v>' [SHA256 '<hex>'] [IN GROUP <group>]
+CLUSTER REMOVE  EXTENSION <name> [IN GROUP <group>]
+CLUSTER ATTACH '<path>' AS <alias> (TYPE <type> [, SECRET <secret>] [, <option> [<value>]] …)
+        [DEPENDS ON (<alias>, …)] [IN GROUP <group>] [COMMENT '<text>']
+CLUSTER DETACH <alias> [CASCADE] [FORCE] [IN GROUP <group>]
+CLUSTER SET <setting> = <value> [IN GROUP <group>]
+CLUSTER RESET <setting> [IN GROUP <group>]
+```
+
+The cluster profile is the shared part of every node's bootstrap (spec 093): which extensions a node
+runs, which sources it attaches and which settings it carries. It lives in the policy catalog as
+desired state, next to the policy, and a `config_version` counts its changes. With `IN GROUP` an item
+belongs to the nodes of one resource group; without it, to the whole cluster.
+
+A statement does four things:
+
+1. It checks the change. A refusal writes nothing.
+2. It writes the item and bumps `config_version`, in one catalog transaction.
+3. It applies the change **on this node** when that can be done live.
+4. It answers `{version, class, applied_here, note}`.
+
+If the live apply fails, the write is rolled back. So an item reaches the cluster only once it has
+worked on the node that wrote it.
+
+The class says how each kind of change reaches a running node:
+
+| change | class |
+| --- | --- |
+| `INSTALL EXTENSION`, `ATTACH`, `DETACH` of an unused source | hot, applied here at once |
+| `ATTACH` over an existing alias (re-pointing), `DETACH` of a source in use | drain |
+| `UPDATE` / `REMOVE EXTENSION`, `SET` / `RESET` | restart |
+
+duckdb cannot unload an extension from a running process. A node's configuration is locked after its
+bootstrap. The node agent rolls drain and restart changes out; acl only describes them.
+
+- **No credentials, anywhere.** A path with a credential key is refused. That covers a conninfo
+  `password=`, a URI's `user:password@`, a SAS `sig=` and the like, and so does an option with such a
+  key. A postgres, mysql or mssql source must name a `SECRET`, and the node resolves it from its
+  secrets service. The refusal names the key, never its value.
+- **The node's hardening is not a profile item.** `allow_unsigned_extensions`, `lock_configuration`,
+  `allow_persistent_secrets`, `allow_extension_repositories`, the extension and secret directories
+  and the like are refused. Only a GLOBAL setting may be profiled.
+- **Extensions come from a trusted repository.** `FROM` names a repository created with duckdb's
+  `CREATE EXTENSION REPOSITORY`; with exactly one, it may be left out. A path, a URL, `core` and
+  `community` are refused, and `VERSION` is required.
+  - duckdb installs such an extension under `repositories/<repository>/` and loads it with
+    `LOAD <name> FROM <repository>`.
+  - `SHA256` is checked after the download and before `LOAD`. On a mismatch the downloaded file is
+    removed.
+- **Start order.** A node applies the profile in this order: settings, extensions, secrets, sources,
+  the policy catalog.
+  - Sources are ordered by `DEPENDS ON`, and by creation order where nothing orders them.
+  - A dependency on an unknown source, or one that would make a cycle, is refused.
+  - A source's extension follows from its `TYPE`, and `REMOVE EXTENSION` is refused while a source
+    needs it.
+- **Removing a source.**
+  - `DETACH` is refused while another source depends on it. `CASCADE` removes the dependents too.
+  - It is also refused while the policy reads through it: a virtual table, schema or function over
+    `<alias>.…`. `FORCE` detaches anyway, and `acl_check_catalog` then reports `source_missing`.
+- **Authorization.** The profile is the cluster's infrastructure, so every `CLUSTER` statement needs
+  a **passthrough** scope. `manage` is not enough.
+- **Audit.** Each statement is one `admin` event. Its object is the item, as `source:<alias>`,
+  `extension:<name>` or `setting:<name>`, with capability `cluster`. The item's spec is never in the
+  event, because a path is a physical name.
+- **Listings.** `acl_cluster_items([group])` lists the profile: scope, kind, name, spec (JSON),
+  class, version, depends_on and comment. `acl_cluster_version()` answers the counter.
+- **Functions.** The admin functions behind the statements are:
+  - `acl_cluster_extension(verb, group, name, version, repository, sha256, comment)`;
+  - `acl_cluster_attach(group, alias, path, type, secret, options_json, depends_on_csv, comment)`;
+  - `acl_cluster_detach(group, alias, cascade, force)`;
+  - `acl_cluster_setting(verb, group, name, value)`.
+
 ## Administration scopes
 
 ```

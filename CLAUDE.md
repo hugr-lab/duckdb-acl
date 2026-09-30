@@ -423,6 +423,19 @@ attached; none/several refused with what to write) from the instance the store k
 direct `corp.whoami()` is the function gate's (a category the operator grants); `whoami` is never only
 as the system catalog's (quack's), and the resolver reads `x.f` as `x.main.f` when x is no schema.
 
+**Spec 093 — the cluster profile**: the shared part of every node's bootstrap, in the policy catalog as
+desired state (`cluster_items` + `cluster_deps`, schema v16, its own `config_version`; no history -
+who changed what is the audit's, the previous state the orchestrator's). `ACL CLUSTER INSTALL|UPDATE|
+REMOVE EXTENSION / ATTACH / DETACH / SET / RESET … [IN GROUP g]` (passthrough only) compiles to
+`acl_cluster_*` (`acl_cluster.cpp`, seam `RegisterAclCluster`): check, write + bump in one transaction
+(`WriteWithReads(…, "config_version", before_commit)`), apply a hot change on this node before the
+commit (a failure rolls the write back). Never a credential (keys linted in the path and options, a
+SECRET required for postgres/mysql/mssql), never the hardening settings, extensions only from a
+trusted repository (`LOAD … FROM <repo>` - duckdb installs them under `repositories/<repo>/`; sha256
+before LOAD, a mismatch removes the file), sources ordered by `DEPENDS ON`, DETACH refused while a
+dependent (CASCADE) or the policy (FORCE) reads through it. Audit: object `<kind>:<name>`, capability
+`cluster`, never the spec. `acl_cluster_items([group])`, `acl_cluster_version()`.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

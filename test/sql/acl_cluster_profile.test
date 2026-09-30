@@ -1,0 +1,316 @@
+# name: test/sql/acl_cluster_profile.test
+# description: the cluster profile (spec 093) - ACL CLUSTER writes the shared part of the node bootstrap
+#   into the policy catalog (desired state, config_version), applies a hot change on this node before
+#   the commit, never holds a credential, never touches the node's hardening, orders sources by
+#   dependency and refuses to remove what something still reads through
+# group: [sql]
+
+require acl
+
+# --- no catalog, no profile -------------------------------------------------------------------------
+
+statement error
+SELECT acl_cluster_version();
+----
+<REGEX>:.*cluster profile lives in a policy catalog.*
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+query I
+SELECT acl_cluster_version();
+----
+0
+
+# --- ATTACH: written, applied here, versioned ------------------------------------------------------
+
+query IIIT
+SELECT r.version, r.class, r.applied_here, r.note FROM (SELECT acl_cluster_attach('', 'src_a', ':memory:', 'duckdb', '', '{}', '', 'first') AS r);
+----
+1	hot	true	NULL
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'src_a';
+----
+1
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS src_b (TYPE duckdb, STORAGE_VERSION 'v1.0.0') DEPENDS ON (src_a) COMMENT 'reads a';
+
+query I
+SELECT acl_cluster_version();
+----
+2
+
+query TTTTI
+SELECT scope, kind, name, class, version FROM acl_cluster_items() ORDER BY name;
+----
+(empty)	source	src_a	hot	1
+(empty)	source	src_b	hot	2
+
+query T
+SELECT depends_on FROM acl_cluster_items() WHERE name = 'src_b';
+----
+[src_a]
+
+query I
+SELECT spec LIKE '%"options": {"STORAGE_VERSION": "v1.0.0"}%' FROM acl_cluster_items() WHERE name = 'src_b';
+----
+true
+
+# re-pointing an existing source is drain class: described, not applied here
+query TT
+SELECT r.class, r.applied_here FROM (SELECT acl_cluster_attach('', 'src_b', ':memory:', 'duckdb', '', '{}', 'src_a', '') AS r);
+----
+drain	false
+
+# --- dependencies: an unknown source, a cycle ------------------------------------------------------
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS src_c (TYPE duckdb) DEPENDS ON (nowhere);
+----
+<REGEX>:.*DEPENDS ON "nowhere" - no such source.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS src_a (TYPE duckdb) DEPENDS ON (src_b);
+----
+<REGEX>:.*would make a cycle.*
+
+# a refused write writes nothing
+query I
+SELECT acl_cluster_version();
+----
+3
+
+# --- no credential, anywhere -----------------------------------------------------------------------
+
+statement error
+ACL ADMIN CLUSTER ATTACH 'host=db dbname=sales user=u password=p' AS pg (TYPE postgres, SECRET pg_sales);
+----
+<REGEX>:.*"password" in the source's path is a credential.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH 'postgresql://u:p@db/sales' AS pg (TYPE postgres, SECRET pg_sales);
+----
+<REGEX>:.*user:password@.*credential.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH 'https://acct.blob.core.windows.net/c/x.duckdb?sv=2024&sig=abc' AS blob (TYPE duckdb);
+----
+<REGEX>:.*"sig" in the source's path is a credential.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH 'host=db dbname=sales' AS pg (TYPE postgres, SECRET pg_sales, PASSWORD 'p');
+----
+<REGEX>:.*"PASSWORD" in the source's options is a credential.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH 'host=db dbname=sales' AS pg (TYPE postgres);
+----
+<REGEX>:.*connects with a credential - name the secret.*
+
+# the refusal names the key, never the value
+statement error
+ACL ADMIN CLUSTER ATTACH 'host=db password=hunter2' AS pg (TYPE postgres, SECRET s);
+----
+<REGEX>:^Binder Error: acl cluster: "password" in the source's path is a credential, and the cluster profile never holds one - create a secret \(in the node's secrets service\) and name it with SECRET <name>\s*$
+
+# what goes into the ATTACH as written is a plain identifier - nothing else reaches the node's SQL
+statement error
+SELECT acl_cluster_attach('', 'x', ':memory:', 'duckdb); DROP TABLE t; --', '', '{}', '', '');
+----
+<REGEX>:.*the source's TYPE .* is not a plain identifier.*
+
+statement error
+SELECT acl_cluster_attach('', 'x', ':memory:', 'duckdb', '', '{"BLOCK_SIZE 1); DROP TABLE t; --": "1"}', '', '');
+----
+<REGEX>:.*an ATTACH option .* is not a plain identifier.*
+
+# the policy catalog's own database is never the profile's
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS store (TYPE duckdb);
+----
+<REGEX>:.*"store" is the policy catalog's database.*
+
+statement error
+ACL ADMIN CLUSTER DETACH store;
+----
+<REGEX>:.*"store" is the policy catalog's database.*
+
+# --- settings: GLOBAL ones only, never the hardening, restart class -------------------------------
+
+query TT
+SELECT r.class, r.applied_here FROM (SELECT acl_cluster_setting('set', '', 'threads', '4') AS r);
+----
+restart	false
+
+statement ok
+ACL ADMIN CLUSTER SET memory_limit = '2GB';
+
+query T
+SELECT spec FROM acl_cluster_items() WHERE kind = 'setting' AND name = 'memory_limit';
+----
+{"value": "2GB"}
+
+statement error
+ACL ADMIN CLUSTER SET allow_unsigned_extensions = true;
+----
+<REGEX>:.*node's hardening, fixed by its bootstrap.*
+
+statement error
+ACL ADMIN CLUSTER SET lock_configuration = true;
+----
+<REGEX>:.*node's hardening.*
+
+statement error
+ACL ADMIN CLUSTER SET no_such_setting = 1;
+----
+<REGEX>:.*not a setting of this node.*
+
+statement ok
+ACL ADMIN CLUSTER RESET threads;
+
+query I
+SELECT count(*) FROM acl_cluster_items() WHERE kind = 'setting';
+----
+1
+
+# --- group scope -----------------------------------------------------------------------------------
+
+statement error
+ACL ADMIN CLUSTER SET threads = 8 IN GROUP nobody;
+----
+<REGEX>:.*resource group "nobody" does not exist.*
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP analytics WITH (max_sessions 10);
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 8 IN GROUP analytics;
+
+query TTT
+SELECT scope, name, spec FROM acl_cluster_items('analytics');
+----
+analytics	threads	{"value": "8"}
+
+# --- extensions: a trusted repository and a version, never a path --------------------------------
+
+statement error
+ACL ADMIN CLUSTER INSTALL EXTENSION spatial VERSION 'v1.4.2';
+----
+<REGEX>:.*name the repository with FROM <name> - this node trusts no user-provided repository.*
+
+statement error
+ACL ADMIN CLUSTER INSTALL EXTENSION spatial VERSION 'v1.4.2' FROM core;
+----
+<REGEX>:.*"core" is not a trusted repository of this node.*
+
+statement error
+SELECT acl_cluster_extension('install', '', '/tmp/evil.duckdb_extension', 'v1', 'hugr', '', '');
+----
+<REGEX>:.*not an extension name.*never by a path or URL.*
+
+statement error
+SELECT acl_cluster_extension('install', '', 'spatial', '', 'hugr', '', '');
+----
+<REGEX>:.*names its VERSION.*
+
+statement error
+ACL ADMIN CLUSTER REMOVE EXTENSION spatial;
+----
+<REGEX>:.*extension "spatial" is not in the profile.*
+
+# --- DETACH: dependents need CASCADE, a policy reading through it needs FORCE --------------------
+
+statement ok
+CREATE TABLE src_a.main.t(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS src_a.main.t;
+
+# a physical name stored quoted reads through the source too
+statement ok
+SELECT acl_add_relation('c', 't2', '"src_a".main.t', '', '');
+
+statement error
+ACL ADMIN CLUSTER DETACH src_a;
+----
+<REGEX>:.*source "src_b" DEPENDS ON "src_a".*CASCADE.*
+
+statement error
+ACL ADMIN CLUSTER DETACH src_a CASCADE;
+----
+<REGEX>:.*the policy reads through src_a, src_b: c.t, c.t2.*FORCE.*
+
+statement ok
+ACL ADMIN CLUSTER DETACH src_a CASCADE FORCE;
+
+query I
+SELECT count(*) FROM acl_cluster_items() WHERE kind = 'source';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('src_a', 'src_b');
+----
+0
+
+statement error
+ACL ADMIN CLUSTER DETACH src_a;
+----
+<REGEX>:.*source "src_a" is not in the profile.*
+
+# --- who may: the cluster's infrastructure is a passthrough scope's alone ------------------------
+
+statement ok
+SELECT acl_grant_admin('ops_manage', 'manage');
+
+statement ok
+SELECT acl_grant_admin('ops_infra', 'passthrough');
+
+statement error
+ACL ROLE "ops_manage" ACL CLUSTER SET threads = 2;
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*requires a passthrough scope.*
+
+statement ok
+ACL ROLE "ops_infra" ACL CLUSTER SET threads = 2;
+
+# --- the audit names the item, never its path -----------------------------------------------------
+
+statement ok
+SET GLOBAL acl_audit_level='decisions';
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS audited (TYPE duckdb);
+
+statement ok
+SELECT acl_audit_flush();
+
+query TT
+SELECT objects, verdict FROM acl_audit_events() WHERE kind = 'admin' ORDER BY seq DESC LIMIT 1;
+----
+[{'name': 'source:audited', 'capability': cluster}]	allowed
+
+# --- a live apply that fails rolls the write back --------------------------------------------------
+
+statement ok
+SET VARIABLE v0 = acl_cluster_version();
+
+statement error
+ACL ADMIN CLUSTER ATTACH '__TEST_DIR__/no/such/dir/x.duckdb' AS broken (TYPE duckdb, READ_ONLY);
+----
+
+query II
+SELECT acl_cluster_version() = getvariable('v0'), (SELECT count(*) FROM acl_cluster_items() WHERE name = 'broken');
+----
+true	0

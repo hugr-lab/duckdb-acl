@@ -43,6 +43,7 @@ set(EXTENSION_SOURCES
     src/acl_policy_catalog.cpp
     src/acl_catalog_admin.cpp
     src/acl_catalog_maintenance.cpp
+    src/acl_cluster.cpp
     src/acl_metadata_listing.cpp
     src/acl_catalog_validation.cpp
     src/acl_rewriter.cpp

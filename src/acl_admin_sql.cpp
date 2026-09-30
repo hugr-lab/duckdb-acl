@@ -412,7 +412,8 @@ bool IsMgmtStart(const string &text) {
 	AdminScanner scanner(text);
 	auto first = scanner.PeekWord();
 	if (StringUtil::CIEquals(first, "add") || StringUtil::CIEquals(first, "grant") ||
-	    StringUtil::CIEquals(first, "revoke") || StringUtil::CIEquals(first, "map")) {
+	    StringUtil::CIEquals(first, "revoke") || StringUtil::CIEquals(first, "map") ||
+	    StringUtil::CIEquals(first, "cluster")) { // CLUSTER (spec 093): duckdb has no CLUSTER statement
 		return true;
 	}
 	if (StringUtil::CIEquals(first, "deny")) {
@@ -730,8 +731,130 @@ string RoleOrAllRoles(AdminScanner &s, const char *preposition) {
 	return s.Word("a role name");
 }
 
+//! `ACL CLUSTER …` (spec 093): the cluster profile. Compiled to acl_cluster_* calls; the authorization
+//! (a passthrough scope - it changes the cluster's infrastructure) is AuthorizeMgmt's.
+unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
+	auto group = [&]() -> string {
+		if (s.Accept("in")) {
+			s.Expect("group");
+			return s.Name("a resource group name");
+		}
+		return string();
+	};
+	auto comment = [&]() -> string {
+		return s.Accept("comment") ? s.Quoted("comment") : string();
+	};
+	auto verb = StringUtil::Lower(s.Word("INSTALL, UPDATE, REMOVE, ATTACH, DETACH, SET or RESET"));
+	if (verb == "install" || verb == "update" || verb == "remove") {
+		s.Expect("extension");
+		auto name = s.Name("an extension name");
+		string version, repository, sha256;
+		for (;;) {
+			if (verb != "remove" && s.Accept("version")) {
+				version = s.Quoted("version");
+			} else if (verb == "install" && s.Accept("from")) {
+				repository = s.Name("a repository name");
+			} else if (verb != "remove" && s.Accept("sha256")) {
+				sha256 = s.Quoted("sha256");
+			} else {
+				break;
+			}
+		}
+		auto scope = group();
+		auto note = comment();
+		return MakeAdminCall("acl_cluster_extension", {Value(verb), Value(scope), Value(name), Value(version),
+		                                               Value(repository), Value(sha256), Value(note)});
+	}
+	if (verb == "attach") {
+		auto path = s.Quoted("the source's path");
+		s.Expect("as");
+		auto alias = s.Name("the source's alias");
+		string type, secret;
+		vector<std::pair<string, string>> options;
+		if (s.AtParen()) {
+			for (auto &item : SplitTopLevel(s.Parens(), ',')) {
+				auto text = item;
+				StringUtil::Trim(text);
+				if (text.empty()) {
+					continue;
+				}
+				auto space = text.find_first_of(" \t");
+				auto key = space == string::npos ? text : text.substr(0, space);
+				auto value = space == string::npos ? string("true") : Unquoted(text.substr(space + 1));
+				if (StringUtil::CIEquals(key, "type")) {
+					type = StringUtil::Lower(value);
+				} else if (StringUtil::CIEquals(key, "secret")) {
+					secret = value;
+				} else {
+					options.emplace_back(StringUtil::Upper(key), value);
+				}
+			}
+		}
+		string deps;
+		if (s.Accept("depends")) {
+			s.Expect("on");
+			vector<string> names;
+			for (auto &item : SplitTopLevel(s.Parens(), ',')) {
+				auto name = Unquoted(item);
+				if (!name.empty()) {
+					names.push_back(name);
+				}
+			}
+			deps = StringUtil::Join(names, ",");
+		}
+		auto scope = group();
+		auto note = comment();
+		vector<string> json;
+		for (auto &option : options) {
+			json.push_back(JsonQuote(option.first) + ": " + JsonQuote(option.second));
+		}
+		return MakeAdminCall("acl_cluster_attach",
+		                     {Value(scope), Value(alias), Value(path), Value(type), Value(secret),
+		                      Value("{" + StringUtil::Join(json, ", ") + "}"), Value(deps), Value(note)});
+	}
+	if (verb == "detach") {
+		auto alias = s.Name("the source's alias");
+		bool cascade = false, force = false;
+		for (;;) {
+			if (s.Accept("cascade")) {
+				cascade = true;
+			} else if (s.Accept("force")) {
+				force = true;
+			} else {
+				break;
+			}
+		}
+		auto scope = group();
+		return MakeAdminCall("acl_cluster_detach", {Value(scope), Value(alias), Value(cascade ? "true" : "false"),
+		                                            Value(force ? "true" : "false")});
+	}
+	if (verb == "set" || verb == "reset") {
+		auto name = s.Word("a setting name");
+		string value;
+		if (verb == "set") {
+			s.Skip();
+			if (s.pos < s.text.size() && s.text[s.pos] == '=') {
+				s.pos++;
+			} else {
+				s.Expect("to");
+			}
+			s.Skip();
+			value = s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"') ? s.Quoted("a value")
+			                                                                                 : s.Word("a value");
+		}
+		auto scope = group();
+		return MakeAdminCall("acl_cluster_setting", {Value(verb), Value(scope), Value(name), Value(value)});
+	}
+	throw BinderException("acl admin: ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET "
+	                      "or RESET, not \"%s\"",
+	                      verb);
+}
+
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &current_session) {
 	auto keyword = s.Word("a management keyword");
+	if (StringUtil::CIEquals(keyword, "cluster")) {
+		return ParseCluster(s);
+	}
 	if (StringUtil::CIEquals(keyword, "profile")) {
 		// PROFILE SESSION CURRENT | '<id>' ON | ALL | SAMPLED | OFF (spec 074 slice 3): the operator's
 		// profile level on a session - the caller's own (the session the prefix names) or another
@@ -1430,6 +1553,8 @@ struct MgmtProvenance {
 	//! catalog grants: handing out access is privilege administration, so a catalog-scoped manage
 	//! may not grant read on the catalog it manages (to itself or to anyone else)
 	bool hands_out = false;
+	//! spec 093: the cluster profile - the node's infrastructure, a passthrough scope's alone
+	bool infrastructure = false;
 };
 
 MgmtProvenance ProvenanceOf(SQLStatement &statement) {
@@ -1503,6 +1628,10 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	auto name = StringUtil::Lower(call.FunctionName().GetIdentifierName());
 	if (name == "acl_grant_admin" || name == "acl_revoke_admin") {
 		provenance.escalates = true;
+		return provenance;
+	}
+	if (StringUtil::StartsWith(name, "acl_cluster_")) {
+		provenance.infrastructure = true;
 		return provenance;
 	}
 	if (name == "acl_grant_catalog" || name == "acl_revoke_catalog" || name == "acl_grant_object" ||
@@ -1678,6 +1807,11 @@ void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, const PolicySto
 		auto provenance = ProvenanceOf(*statement);
 		if (provenance.escalates) {
 			throw BinderException("acl admin: granting admin scopes requires a passthrough scope");
+		}
+		if (provenance.infrastructure) {
+			throw BinderException("acl admin: ACL CLUSTER changes the cluster's infrastructure (extensions, sources, "
+			                      "settings) and requires a passthrough scope - manage administers the ACL, not the "
+			                      "nodes");
 		}
 		if (provenance.hands_out && !rights.unrestricted_manage) {
 			throw BinderException("acl admin: granting access to a catalog requires an unrestricted manage "

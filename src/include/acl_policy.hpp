@@ -520,6 +520,29 @@ struct PolicyStore {
 	                                const string &comment);
 	void CatalogDropResourceGroup(const string &name, bool if_exists);
 	void CatalogBindResourceGroup(const string &role, const string &group, bool remove);
+	//! spec 093: the cluster profile. Each change checks, writes the item and bumps config_version in
+	//! one catalog transaction, and applies a `hot` change on this node before the commit - a failure
+	//! there rolls the write back. `scope` "" is the whole cluster, otherwise a resource group.
+	struct ClusterAnswer {
+		int64_t version = 0;
+		string item_class;
+		bool applied_here = false;
+		string note;
+	};
+	struct ClusterItem {
+		string scope, kind, name, spec, item_class, comment;
+		int64_t version = 0;
+		vector<string> depends_on;
+	};
+	ClusterAnswer ClusterExtension(const string &verb, const string &scope, const string &name, const string &version,
+	                               const string &repository, const string &sha256, const string &comment);
+	ClusterAnswer ClusterAttach(const string &scope, const string &alias, const string &path, const string &type,
+	                            const string &secret, const string &options_json, const vector<string> &depends_on,
+	                            const string &comment);
+	ClusterAnswer ClusterDetach(const string &scope, const string &alias, bool cascade, bool force);
+	ClusterAnswer ClusterSetting(const string &verb, const string &scope, const string &name, const string &value);
+	int64_t ClusterVersion();
+	vector<ClusterItem> ClusterItems(const string &scope);
 	//! The limits of the principal's groups, merged (catalog mode; memory mode has no groups)
 	ResourceLimits ResolveResourceLimits(const Principal &principal);
 	//! Live sessions per charged group, with that group's max (the load report, acl_resource_groups)
