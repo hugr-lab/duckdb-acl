@@ -230,11 +230,12 @@ int main(int argc, char *argv[]) {
 			heavy.join();
 			Check(heavy_ok, "the holder finished");
 			auto after = second.Query(through("light"));
-			Check(!after->HasError() && after->RowCount() == 1 && after->GetValue(0, 0).GetValue<int32_t>() == 42,
+			Check(!after->HasError() && after->RowCount() == 1 &&
+			          after->Collection().GetValue(0, 0).GetValue<int32_t>() == 42,
 			      "the same statement runs once the room is free");
 			auto load = con.Query("SELECT acl_node_load()::VARCHAR");
 			if (CheckOk(*load, "acl_node_load answers")) {
-				auto json = load->GetValue(0, 0).ToString();
+				auto json = load->Collection().GetValue(0, 0).ToString();
 				Check(json.find("\"refused\":1") != std::string::npos &&
 				          json.find("\"producing\":0") != std::string::npos,
 				      "the report counts the refusal and nothing producing now: " + json);

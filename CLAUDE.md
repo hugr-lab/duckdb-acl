@@ -25,10 +25,14 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   retained result (`RowCount`, `GetValue`, `Fetch` read it), `Submit` answers a handle that runs on
   the workers but decides nothing, and a `QueryResultStream` opened on a handle is the one streaming
   form (it refuses a `ResultEagerness::FORCED` statement - a count - which is read from the handle).
+  **A result has a format** (since the 2026-09-30 pin, spec 090): `QueryResult` has no `GetValue`;
+  `Collection().GetValue(c, r)` rebuilds every row per call, so a loop over rows reads a `ResultRows`
+  (`acl_result_rows.hpp`) built once; the stream is `QueryResultStream<>` (the chunk format), and a
+  table function's parameters are its `FunctionSignature` (`GetName()` on a bound one).
   Re-pin to the `v2.0.0` tag when it is cut; the scanners come from the submodule's own
   extension pins (`.github/config/extensions/`), patches included - ducklake's too, since 2026-09-17
   (the three patches we carried in `patches/ducklake/` are upstream). quack is the submodule's own pin
-  (#212 - duckdb caught up with our one-commit lead in #25978, 2026-09-22), with the patches duckdb
+  (974927a since the 2026-09-30 pin, spec 090), with the patches duckdb
   carries for it applied to the loadable (`APPLY_PATCHES`) and, by `sync.py`, to the embedded
   server's copies alike (a patch that touches only quack's tests is skipped there, and says so).
 - **Dependencies**: none (no vcpkg/OpenSSL). The **shared repository** `duckdb-ext-common` is a

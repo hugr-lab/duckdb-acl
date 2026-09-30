@@ -26,7 +26,7 @@ std::string OpenSession(Connection &con, const std::string &token) {
 	if (result->HasError() || result->RowCount() == 0) {
 		return std::string();
 	}
-	auto value = result->GetValue(0, 0);
+	auto value = result->Collection().GetValue(0, 0);
 	return value.IsNull() ? std::string() : value.ToString();
 }
 
@@ -58,7 +58,7 @@ void ComposedSqlIsTheQuery(Connection &con) {
 	if (!CheckOk(*composed, "acl_session_sql composes")) {
 		return;
 	}
-	auto sql = composed->GetValue(0, 0);
+	auto sql = composed->Collection().GetValue(0, 0);
 	if (!Check(!sql.IsNull(), "a live session composes rather than refusing")) {
 		return;
 	}
@@ -78,7 +78,7 @@ void ClosingEndsIt(Connection &con) {
 	Exec(con, "SELECT acl_session_close('" + handle + "')");
 	auto composed = con.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
 	if (CheckOk(*composed, "acl_session_sql answers for a closed handle")) {
-		Check(composed->GetValue(0, 0).IsNull(), "a closed session composes nothing");
+		Check(composed->Collection().GetValue(0, 0).IsNull(), "a closed session composes nothing");
 	}
 	auto result = con.Query("ACL SESSION '" + handle + "' SELECT id FROM orders");
 	Check(result->HasError(), "a closed handle is refused by the prefix too");
@@ -89,10 +89,10 @@ void ClosingEndsIt(Connection &con) {
 //! prompts it, and a live session reports "live".
 std::string ReasonOf(Connection &con, const std::string &handle) {
 	auto result = con.Query("SELECT acl_session_reason('" + handle + "')");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	if (result->HasError() || result->RowCount() == 0 || result->Collection().GetValue(0, 0).IsNull()) {
 		return std::string();
 	}
-	return result->GetValue(0, 0).ToString();
+	return result->Collection().GetValue(0, 0).ToString();
 }
 
 void SessionEndReason(Connection &con) {
@@ -111,7 +111,7 @@ void SessionEndReason(Connection &con) {
 	std::this_thread::sleep_for(std::chrono::milliseconds(2200));
 	auto composed = con.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
 	if (CheckOk(*composed, "acl_session_sql answers for an idle handle")) {
-		Check(composed->GetValue(0, 0).IsNull(), "an idle session composes nothing");
+		Check(composed->Collection().GetValue(0, 0).IsNull(), "an idle session composes nothing");
 	}
 	Check(ReasonOf(con, handle) == "idle", "and the reason after the NULL is idle, not unknown");
 	Exec(con, "SET GLOBAL acl_session_idle_timeout=900");
@@ -134,7 +134,7 @@ void InstancesDoNotShareSessions(Connection &first, const std::string &extension
 	Exec(con, "LOAD '" + extension + "'");
 	auto composed = con.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
 	if (CheckOk(*composed, "the other instance answers")) {
-		Check(composed->GetValue(0, 0).IsNull(), "another instance does not know this handle");
+		Check(composed->Collection().GetValue(0, 0).IsNull(), "another instance does not know this handle");
 	}
 }
 
@@ -142,14 +142,14 @@ void InstancesDoNotShareSessions(Connection &first, const std::string &extension
 //! acl_session_kill(id) ends one. Both are the door's - a principal is refused.
 void OpsSurfaceListsAndKills(Connection &con) {
 	auto open = con.Query("SELECT acl_session_open('opstok')");
-	if (!Check(!open->HasError() && !open->GetValue(0, 0).IsNull(), "a session opens for the ops test")) {
+	if (!Check(!open->HasError() && !open->Collection().GetValue(0, 0).IsNull(), "a session opens for the ops test")) {
 		return;
 	}
 	auto listed = con.Query("SELECT acl_sessions()");
 	if (!CheckOk(*listed, "acl_sessions() answers")) {
 		return;
 	}
-	auto json = listed->GetValue(0, 0).ToString();
+	auto json = listed->Collection().GetValue(0, 0).ToString();
 	Check(json.find("\"analyst\"") != std::string::npos, "the listing carries the principal's role");
 	Check(json.find("opstok") == std::string::npos, "the listing never carries the handle");
 	// pull the non-secret ops id out of the JSON and kill by it
@@ -162,10 +162,10 @@ void OpsSurfaceListsAndKills(Connection &con) {
 	auto id = json.substr(start, end - start);
 	auto killed = con.Query("SELECT acl_session_kill('" + id + "')");
 	if (CheckOk(*killed, "acl_session_kill runs")) {
-		Check(killed->GetValue(0, 0).GetValue<bool>(), "it reports the session was found");
+		Check(killed->Collection().GetValue(0, 0).GetValue<bool>(), "it reports the session was found");
 	}
 	auto again = con.Query("SELECT acl_session_kill('" + id + "')");
-	Check(!again->HasError() && !again->GetValue(0, 0).GetValue<bool>(),
+	Check(!again->HasError() && !again->Collection().GetValue(0, 0).GetValue<bool>(),
 	      "killing a gone session is false, not an error");
 	// a principal may not see or end sessions - the acl_ gate denies the whole surface
 	auto denied = con.Query("ACL ROLE \"analyst\" SELECT acl_sessions()");
@@ -217,8 +217,8 @@ int main(int argc, char *argv[]) {
 		Check(!handle.empty(), "the claim-less token opens a session");
 		auto by_session = con.Query("ACL SESSION '" + handle + "' SELECT count(*)::BIGINT FROM orders");
 		if (CheckOk(*by_token, "the prefix path answers") && CheckOk(*by_session, "the session path answers")) {
-			auto prefix_rows = by_token->GetValue(0, 0).GetValue<int64_t>();
-			auto session_rows = by_session->GetValue(0, 0).GetValue<int64_t>();
+			auto prefix_rows = by_token->Collection().GetValue(0, 0).GetValue<int64_t>();
+			auto session_rows = by_session->Collection().GetValue(0, 0).GetValue<int64_t>();
 			Check(prefix_rows == 2,
 			      "the prefix path sees the role's default slice (acme): " + std::to_string(prefix_rows));
 			Check(session_rows == prefix_rows,
@@ -241,7 +241,7 @@ int main(int argc, char *argv[]) {
 		auto prefix = "ACL SESSION '" + handle + "' ";
 		auto render = [&]() {
 			auto shown = con.Query(prefix + "SELECT '2026-01-01 00:00:00+00'::TIMESTAMPTZ::VARCHAR");
-			return shown->HasError() ? "ERROR: " + shown->GetError() : shown->GetValue(0, 0).ToString();
+			return shown->HasError() ? "ERROR: " + shown->GetError() : shown->Collection().GetValue(0, 0).ToString();
 		};
 		auto set = con.Query(prefix + "SET TimeZone = 'Asia/Tokyo'");
 		if (CheckOk(*set, "the session sets its time zone")) {
@@ -271,12 +271,14 @@ int main(int argc, char *argv[]) {
 			// server's (the 2026-09-04 review)
 			Connection other(db);
 			auto composed = other.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
-			auto text = composed->HasError() ? "ERROR: " + composed->GetError() : composed->GetValue(0, 0).ToString();
+			auto text = composed->HasError() ? "ERROR: " + composed->GetError()
+			                                 : composed->Collection().GetValue(0, 0).ToString();
 			Check(text.find("TRACE 'req-from-session' SELECT 1") != std::string::npos,
 			      "...and the composed prefix carries it, from any connection: " + text);
 			Exec(con, prefix + "RESET acl_correlation_id");
 			auto reset = other.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
-			auto after = reset->HasError() ? "ERROR: " + reset->GetError() : reset->GetValue(0, 0).ToString();
+			auto after =
+			    reset->HasError() ? "ERROR: " + reset->GetError() : reset->Collection().GetValue(0, 0).ToString();
 			Check(after.find("TRACE") == std::string::npos, "...and a RESET clears it: " + after);
 		}
 		Exec(con, "SELECT acl_session_close('" + handle + "')");
@@ -349,7 +351,7 @@ int main(int argc, char *argv[]) {
 		auto made = con.Query(prefix + "ACL CREATE ROLE made_over_session");
 		if (CheckOk(*made, "a manage scope administers over a session")) {
 			auto rows = con.Query("SELECT count(*)::BIGINT FROM store.acl.roles WHERE \"role\" = 'made_over_session'");
-			Check(!rows->HasError() && rows->GetValue(0, 0).GetValue<int64_t>() == 1,
+			Check(!rows->HasError() && rows->Collection().GetValue(0, 0).GetValue<int64_t>() == 1,
 			      "...and the policy write landed in the catalog");
 		}
 		refused_with("ACL NATIVE SELECT acl_drain_status()", "requires a passthrough scope",
@@ -365,11 +367,12 @@ int main(int argc, char *argv[]) {
 		Exec(con, "SELECT acl_grant_admin('analyst', 'passthrough')");
 		auto native = con.Query(prefix + "ACL NATIVE SELECT acl_drain_status()");
 		if (CheckOk(*native, "a passthrough scope runs native SQL over a session")) {
-			Check(native->GetValue(0, 0).ToString() == "serving", "...including the node's control surface");
+			Check(native->Collection().GetValue(0, 0).ToString() == "serving",
+			      "...including the node's control surface");
 		}
 		// the virtual context is unchanged by the scope: the same session still reads its slice
 		auto slice = con.Query(prefix + "SELECT count(*)::BIGINT FROM orders");
-		Check(!slice->HasError() && slice->GetValue(0, 0).GetValue<int64_t>() == 2,
+		Check(!slice->HasError() && slice->Collection().GetValue(0, 0).GetValue<int64_t>() == 2,
 		      "the virtual context still confines the passthrough principal's ordinary statements");
 		Exec(con, "SELECT acl_revoke_admin('analyst')");
 		Exec(con, "ACL ADMIN DROP ROLE made_over_session");

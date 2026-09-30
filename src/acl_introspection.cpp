@@ -9,6 +9,7 @@
 // Reachability: every `acl_*` name is denied inside a principal's query (spec 009), so these are for
 // the native context and for the gateway's own connection.
 
+#include "acl_result_rows.hpp"
 #include "acl_introspection.hpp"
 
 #include "acl_door_common.hpp"
@@ -261,13 +262,14 @@ unique_ptr<GlobalTableFunctionState> AclFunctionsInit(ClientContext &context, Ta
 	if (result->HasError()) {
 		result->ThrowError("acl_function_status: ");
 	}
+	ResultRows result_rows(*result);
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		FunctionKey key;
-		key.database = result->GetValue(0, row).ToString();
-		key.schema = result->GetValue(1, row).ToString();
-		key.name = StringUtil::Lower(result->GetValue(2, row).ToString());
-		ParseFunctionKind(result->GetValue(3, row).ToString(), key.kind);
-		emit(key, result->GetValue(4, row), true);
+		key.database = result_rows.GetValue(0, row).ToString();
+		key.schema = result_rows.GetValue(1, row).ToString();
+		key.name = StringUtil::Lower(result_rows.GetValue(2, row).ToString());
+		ParseFunctionKind(result_rows.GetValue(3, row).ToString(), key.kind);
+		emit(key, result_rows.GetValue(4, row), true);
 	}
 	// members this node has no function for: an extension not loaded here, or a name the seed
 	// carries for a node that has it

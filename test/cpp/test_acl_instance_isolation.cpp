@@ -62,7 +62,7 @@ void Run() {
 	Scenario("doors-belong-to-the-instance-that-opened-them", [&]() {
 		auto has_function = [](Connection &con, const string &name) {
 			auto probe = con.Query("SELECT count(*) FROM duckdb_functions() WHERE function_name = '" + name + "'");
-			return !probe->HasError() && probe->GetValue(0, 0).GetValue<int64_t>() > 0;
+			return !probe->HasError() && probe->Collection().GetValue(0, 0).GetValue<int64_t>() > 0;
 		};
 		auto serving_setup = [](Connection &con) {
 			Exec(con, "ATTACH ':memory:' AS store");
@@ -114,9 +114,10 @@ void Run() {
 				      "...nor open one on the same address while A's is live");
 				auto own_stop = ca.Query("SELECT acl_quack_stop('quack:localhost:31990')");
 				if (CheckOk(*own_stop, "instance A stops its own quack door")) {
-					Check(own_stop->GetValue(0, 0).ToString().find("session(s) closed") != std::string::npos,
+					Check(own_stop->Collection().GetValue(0, 0).ToString().find("session(s) closed") !=
+					          std::string::npos,
 					      "...and it was A's last door, so A's sessions closed: " +
-					          own_stop->GetValue(0, 0).ToString());
+					          own_stop->Collection().GetValue(0, 0).ToString());
 				}
 			}
 		} else {

@@ -142,7 +142,7 @@ std::string Scalar(Connection &con, const std::string &sql) {
 	if (result->RowCount() == 0) {
 		return "(no rows)";
 	}
-	auto value = result->GetValue(0, 0);
+	auto value = result->Collection().GetValue(0, 0);
 	return value.IsNull() ? "NULL" : value.ToString();
 }
 

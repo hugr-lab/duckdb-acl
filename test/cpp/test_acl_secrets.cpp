@@ -64,7 +64,7 @@ struct CallData : public TableFunctionData {
 
 unique_ptr<FunctionData> ServiceBind(ClientContext &context, TableFunctionBindInput &input,
                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
-	std::string call = input.table_function.name.GetIdentifierName() + "(";
+	std::string call = input.table_function.GetName().GetIdentifierName() + "(";
 	for (idx_t i = 0; i < input.inputs.size(); i++) {
 		call += (i ? ", " : "") + input.inputs[i].ToString();
 	}
@@ -156,7 +156,7 @@ std::string One(Connection &con, const std::string &sql) {
 	if (result->HasError()) {
 		return "ERROR: " + result->GetError();
 	}
-	return result->RowCount() ? result->GetValue(0, 0).ToString() : "";
+	return result->RowCount() ? result->Collection().GetValue(0, 0).ToString() : "";
 }
 
 bool Refused(Connection &con, const std::string &sql, const std::string &why) {

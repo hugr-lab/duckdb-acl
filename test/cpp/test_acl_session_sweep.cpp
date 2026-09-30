@@ -27,7 +27,7 @@ std::string OpenSession(Connection &con) {
 	if (result->HasError() || result->RowCount() == 0) {
 		return std::string();
 	}
-	auto value = result->GetValue(0, 0);
+	auto value = result->Collection().GetValue(0, 0);
 	return value.IsNull() ? std::string() : value.ToString();
 }
 
@@ -36,7 +36,7 @@ int64_t Scalar(Connection &con, const std::string &sql) {
 	if (result->HasError() || result->RowCount() == 0) {
 		return -1;
 	}
-	auto value = result->GetValue(0, 0);
+	auto value = result->Collection().GetValue(0, 0);
 	return value.IsNull() ? -1 : value.GetValue<int64_t>();
 }
 
@@ -62,9 +62,9 @@ void IdleGoesAndUsedStays(Connection &con) {
 	Check(Scalar(con, "SELECT acl_session_count()") == 1, "one session left");
 	// and the survivor is the one that was used, not merely the one that was luckier
 	auto composed = con.Query("SELECT acl_session_sql('" + kept + "', 'SELECT 1')");
-	Check(!composed->HasError() && !composed->GetValue(0, 0).IsNull(), "the used session still composes");
+	Check(!composed->HasError() && !composed->Collection().GetValue(0, 0).IsNull(), "the used session still composes");
 	auto gone = con.Query("SELECT acl_session_sql('" + idle + "', 'SELECT 1')");
-	Check(!gone->HasError() && gone->GetValue(0, 0).IsNull(), "the idle one no longer composes");
+	Check(!gone->HasError() && gone->Collection().GetValue(0, 0).IsNull(), "the idle one no longer composes");
 
 	Exec(con, "SELECT acl_session_close('" + kept + "')");
 	Exec(con, "SET GLOBAL acl_session_idle_timeout=900");
@@ -80,11 +80,11 @@ void IdleIsRefusedBeforeAnySweep(Connection &con) {
 	}
 	std::this_thread::sleep_for(std::chrono::milliseconds(2500));
 	auto composed = con.Query("SELECT acl_session_sql('" + handle + "', 'SELECT 1')");
-	Check(!composed->HasError() && composed->GetValue(0, 0).IsNull(), "an idle session composes nothing");
+	Check(!composed->HasError() && composed->Collection().GetValue(0, 0).IsNull(), "an idle session composes nothing");
 	// Resolving it no longer erases it (spec 054): the record survives so acl_session_reason can still
 	// say *why* it was refused - "idle", not "unknown". The sweep is what drops it.
 	auto reason = con.Query("SELECT acl_session_reason('" + handle + "')");
-	Check(!reason->HasError() && reason->GetValue(0, 0).ToString() == "idle",
+	Check(!reason->HasError() && reason->Collection().GetValue(0, 0).ToString() == "idle",
 	      "and the reason is still there to read after the NULL");
 	Check(Scalar(con, "SELECT acl_session_sweep()") == 1, "the sweep drops the idle record");
 	Check(Scalar(con, "SELECT acl_session_count()") == 0, "and then it is gone");

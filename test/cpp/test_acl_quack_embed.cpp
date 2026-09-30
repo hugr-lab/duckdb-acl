@@ -167,7 +167,8 @@ int main(int argc, char *argv[]) {
 			Exec(con, "ATTACH 'quack:localhost:31975' AS remote (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
 			auto rows = con.Query("SELECT count(*)::BIGINT FROM remote.main.orders");
 			if (CheckOk(*rows, "the ATTACH answers")) {
-				Check(rows->GetValue(0, 0).GetValue<int64_t>() == 2, "...with the acme slice (RLS applied)");
+				Check(rows->Collection().GetValue(0, 0).GetValue<int64_t>() == 2,
+				      "...with the acme slice (RLS applied)");
 			}
 			Exec(con, "DETACH remote");
 		});
@@ -186,7 +187,8 @@ int main(int argc, char *argv[]) {
 			auto opened = con.Query("SELECT value FROM acl_metrics() WHERE name = 'acl.sessions.opened' AND "
 			                        "attributes = '{\"door\":\"quack\"}'");
 			if (CheckOk(*opened, "acl_metrics() has the sessions the door opened") && opened->RowCount() == 1) {
-				auto line = "acl_sessions_opened{door=\"quack\"} " + opened->GetValue(0, 0).ToString() + "\n";
+				auto line =
+				    "acl_sessions_opened{door=\"quack\"} " + opened->Collection().GetValue(0, 0).ToString() + "\n";
 				Check(on.body.find(line) != std::string::npos, "...and the endpoint renders the same row: " + line);
 			}
 			Check(on.body.find("acl_decisions{") != std::string::npos, "...and the decisions the client's reads were");
@@ -211,7 +213,8 @@ int main(int argc, char *argv[]) {
 			// the same document acl_node_load() answers, never an identity
 			auto sql = con.Query("SELECT acl_node_load()");
 			if (CheckOk(*sql, "acl_node_load() answers")) {
-				Check(sql->GetValue(0, 0).ToString() == on.body, "the route and the function are one document");
+				Check(sql->Collection().GetValue(0, 0).ToString() == on.body,
+				      "the route and the function are one document");
 			}
 			Check(on.body.find("analyst") == std::string::npos && on.body.find("\"sub") == std::string::npos,
 			      "no role or subject in it");
@@ -225,7 +228,7 @@ int main(int argc, char *argv[]) {
 			Exec(con, "SELECT acl_drain()");
 			rows = con.Query("SELECT count(*)::BIGINT FROM before.main.orders");
 			if (CheckOk(*rows, "...and its connection still answers during the drain")) {
-				Check(rows->GetValue(0, 0).GetValue<int64_t>() == 2, "...the same acme slice");
+				Check(rows->Collection().GetValue(0, 0).GetValue<int64_t>() == 2, "...the same acme slice");
 			}
 			// the discovery route is the LB's take-me-out signal
 			auto wk = duckdb::acl::oidc::HttpGet("http://localhost:31975/.well-known/quack-auth");
@@ -292,7 +295,7 @@ int main(int argc, char *argv[]) {
 			auto event = con.Query("SELECT count(*)::BIGINT FROM acl_audit_events() WHERE kind = 'session' AND "
 			                       "detail = 'refused' AND door = 'quack' AND reason_code = 'source_error'");
 			if (CheckOk(*event, "the audit is asked for the reason")) {
-				Check(event->GetValue(0, 0).GetValue<int64_t>() >= 1,
+				Check(event->Collection().GetValue(0, 0).GetValue<int64_t>() >= 1,
 				      "...and carries it where every refusal at this seam goes: session refused, source_error");
 			}
 			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
@@ -356,7 +359,8 @@ int main(int argc, char *argv[]) {
 			Exec(con, "ATTACH 'quack:localhost:31978' AS bare (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
 			auto rows = con.Query("SELECT count(*)::BIGINT FROM bare.main.orders");
 			if (CheckOk(*rows, "a client still ATTACHes to the bare server")) {
-				Check(rows->GetValue(0, 0).GetValue<int64_t>() == 2, "...and the acl gate still applies (acme slice)");
+				Check(rows->Collection().GetValue(0, 0).GetValue<int64_t>() == 2,
+				      "...and the acl gate still applies (acme slice)");
 			}
 			Exec(con, "DETACH bare");
 			Exec(con, "SELECT acl_quack_stop('quack:localhost:31978')");

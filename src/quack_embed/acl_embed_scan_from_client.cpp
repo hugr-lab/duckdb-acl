@@ -16,6 +16,7 @@
 
 #include "quack_fetch_collector.hpp"
 #include "quack_insert_stream.hpp"
+#include "quack_session_state.hpp"
 
 namespace duckdb {
 
@@ -248,10 +249,13 @@ static OperatorPartitionData QuackScanFromClientGetPartitionData(ClientContext &
 }
 
 TableFunction QuackScanFromClientFunction::GetFunction() {
-	TableFunction fun("acl_quack_scan_data", {LogicalType::VARCHAR, LogicalType::ANY}, QuackScanFromClient,
-	                  QuackScanFromClientBind, QuackScanFromClientInitGlobal, QuackScanFromClientInitLocal);
+	FunctionSignature signature;
+	signature.AddParameter("stream_id", LogicalType::VARCHAR)
+	    .AddParameter("prototype", LogicalType::ANY)
+	    .WithTypedKwargs("options", [&](TypedKwargs &options) { options.Add("ordered", LogicalType::BOOLEAN); });
+	TableFunction fun("acl_quack_scan_data", std::move(signature), QuackScanFromClient, QuackScanFromClientBind,
+	                  QuackScanFromClientInitGlobal, QuackScanFromClientInitLocal);
 	fun.get_partition_data = QuackScanFromClientGetPartitionData;
-	fun.named_parameters["ordered"] = LogicalType::BOOLEAN;
 	return fun;
 }
 
