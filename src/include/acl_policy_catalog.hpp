@@ -17,6 +17,7 @@
 
 #include <set>
 
+#include <atomic>
 #include <chrono>
 
 namespace duckdb {
@@ -311,6 +312,10 @@ struct CatalogBackend {
 	int64_t version = -1;
 	std::chrono::steady_clock::time_point last_check;
 	bool checked_once = false;
+	//! spec 094: the catalog is newer than this build, inside the window it declares - served from,
+	//! never written. Re-judged at every freshness check, so a catalog migrated under a running node
+	//! moves it here (or out of service) without a restart.
+	std::atomic<bool> compat_read_only {false};
 	//! The audit's ear on the source (spec 069): `reloaded` when a version change is adopted, `written`
 	//! when a write commits, `source_error` (with the reason) when the source did not answer. Set by
 	//! the store that owns the backend; unset = nobody listens.
@@ -575,6 +580,15 @@ struct CatalogBackend {
 	//! is the case that makes them differ, and the failure without this check is a missing column in
 	//! the middle of somebody's query rather than a word at the moment the catalog is chosen.
 	void RequireSchemaVersion();
+	//! spec 094: judge a stamp - this build's version, a newer one inside the window (read only), or
+	//! one this build does not read (throws, naming what to do). `on` names the moment for the message.
+	void JudgeSchema(int64_t stamped, int64_t min_reader, const char *on);
+	//! spec 094: inside a write's transaction - the catalog must be exactly this build's version, or a
+	//! whole-row rewrite of an older build drops what a newer step added
+	void RequireWritableSchema(Connection &con);
+	//! spec 094: take this catalog forward to the build's version with the embedded steps, in one
+	//! transaction; answers what it did
+	string Migrate();
 
 	//! What a key column is declared as, by the kind of catalog it lives in. Everywhere but SQL Server
 	//! that is a plain VARCHAR; the mssql scanner maps every VARCHAR - length or not - to

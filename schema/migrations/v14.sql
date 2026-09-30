@@ -1,4 +1,5 @@
 -- duckdb-acl schema migration: v13 -> v14 (spec 072, function categories).
+-- min_reader: 14 - a build older than v14 does not read this catalog (spec 094: the window is declared per step, never assumed)
 -- Run against the database that holds the `acl` policy schema, then re-open with acl_use_db.
 -- Written for the duckdb dialect; see schema/acl_schema.sql for what another engine may need changing.
 -- The function gate becomes categories: three tables, seeded with the shipped categories exactly as

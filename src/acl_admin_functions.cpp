@@ -1059,6 +1059,23 @@ case_insensitive_map_t<int64_t> ParseResourceLimits(const string &json, const ch
 	return limits;
 }
 
+//! spec 094: acl_migrate_catalog(database[, schema]) - take an older policy catalog to this build's schema
+//! version with the steps the build carries, in one transaction. Denied to a principal (acl_*): the
+//! orchestrator's step, or an operator's on the node's own connection.
+void AclMigrateCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto database = RequiredArg(args, 0, row, "acl_migrate_catalog", "database");
+		auto schema = OptionalArg(args, 1, row, "acl");
+		auto &db = DatabaseInstance::GetDatabase(state.GetContext());
+		result.SetValue(row, Value(StoreOf(state).CatalogMigrate(db, database, schema)));
+	}
+}
+
+//! spec 094: acl_catalog_schema() - this build's schema version and window, the catalog's, and the mode
+void AclCatalogSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.Reference(StoreOf(state).CatalogSchemaState(), count_t(args.size()));
+}
+
 //! acl_create_resource_group(name, limits_json[, comment]): a re-create replaces the limits
 void AclCreateResourceGroupFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -1702,6 +1719,25 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	};
 	// the quack door's own four (serve/stop and quack's two callbacks) are registered by
 	// src/quack_embed/acl_quack_door.cpp, beside the server they drive
+	{
+		ScalarFunctionSet migrate((Identifier("acl_migrate_catalog")));
+		for (auto &arguments : {vector<LogicalType> {v}, vector<LogicalType> {v, v}}) {
+			ScalarFunction function(Identifier("acl_migrate_catalog"), arguments, LogicalType::VARCHAR,
+			                        AclMigrateCatalogFunc);
+			MarkAclScalar(function, store);
+			migrate.AddFunction(function);
+		}
+		loader.RegisterFunction(migrate);
+		child_list_t<LogicalType> shape {{"build", LogicalType::BIGINT},
+		                                 {"build_min_reader", LogicalType::BIGINT},
+		                                 {"catalog", LogicalType::BIGINT},
+		                                 {"min_reader", LogicalType::BIGINT},
+		                                 {"mode", LogicalType::VARCHAR}};
+		ScalarFunction schema_state(Identifier("acl_catalog_schema"), {}, LogicalType::STRUCT(std::move(shape)),
+		                            AclCatalogSchemaFunc);
+		MarkAclScalar(schema_state, store);
+		loader.RegisterFunction(schema_state);
+	}
 	register_session_text("acl_session_open", {v}, AclSessionOpenFunc);
 	register_session_text("acl_sessions", {}, AclSessionsFunc); // the ops listing (spec 050), never the handle
 	register_session_text("acl_session_sql", {v, v}, AclSessionSqlFunc);

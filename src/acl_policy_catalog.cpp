@@ -65,6 +65,7 @@ int64_t CatalogBackend::WriteWithReads(
 	};
 	vector<string> statements;
 	try {
+		RequireWritableSchema(con);
 		auto read = [&](const string &sql) {
 			auto result = con.Query(sql);
 			if (result->HasError()) {
@@ -127,6 +128,12 @@ void CatalogBackend::Write(const vector<string> &statements) {
 	if (begin->HasError()) {
 		throw BinderException("acl catalog: %s", begin->GetError());
 	}
+	try {
+		RequireWritableSchema(con);
+	} catch (...) {
+		con.Query("ROLLBACK");
+		throw;
+	}
 	for (auto &sql : statements) {
 		auto result = con.Query(sql);
 		if (result->HasError()) {
@@ -181,6 +188,19 @@ void CatalogBackend::EnsureFresh() {
 			                      result->RowCount());
 		}
 		current = result->Collection().GetValue(0, 0).GetValue<int64_t>();
+		if (!function_mode) {
+			// spec 094: a catalog migrated under a running node - into its window (served, never
+			// written) or out of it (refused, fail closed)
+			auto stamp = Query("SELECT \"key\", \"value\" FROM " + Tbl("meta") +
+			                   " WHERE \"key\" IN ('schema_version', 'min_reader_version')");
+			int64_t stamped = -1, min_reader = -1;
+			for (idx_t row = 0; row < stamp->RowCount(); row++) {
+				auto key = stamp->Collection().GetValue(0, row).ToString();
+				auto value = std::stoll(stamp->Collection().GetValue(1, row).ToString());
+				(key == "schema_version" ? stamped : min_reader) = value;
+			}
+			JudgeSchema(stamped, min_reader, "at a freshness check");
+		}
 	} catch (std::exception &ex) {
 		// the source did not answer: the statement that asked is refused (fail closed), the refusal
 		// names the source rather than the principal, and the node's counters see it (spec 069)
@@ -1311,11 +1331,136 @@ void CatalogBackend::RequireSchemaVersion() {
 		throw BinderException("acl catalog: \"%s\".\"%s\" has schema_version \"%s\", which is not a number", db_name,
 		                      schema, stored);
 	}
-	if (version != ACL_SCHEMA_VERSION) {
-		throw BinderException("acl catalog: \"%s\".\"%s\" is schema version %lld, this build reads %d - apply "
-		                      "the matching schema/acl_schema.sql, or let acl_use_db(..., true) create it",
-		                      db_name, schema, version, ACL_SCHEMA_VERSION);
+	int64_t min_reader = -1;
+	auto declared = MetaValue("min_reader_version");
+	if (!declared.empty()) {
+		try {
+			min_reader = std::stoll(declared);
+		} catch (std::exception &) {
+			min_reader = -1;
+		}
 	}
+	JudgeSchema(version, min_reader, "at open");
+}
+
+void CatalogBackend::JudgeSchema(int64_t stamped, int64_t min_reader, const char *on) {
+	if (stamped < 0) {
+		throw BinderException("acl catalog: \"%s\".\"%s\" has no schema_version (%s)", db_name, schema, on);
+	}
+	if (min_reader < 0) {
+		min_reader = stamped; // a catalog from before spec 094 declares no window: exactly its own build
+	}
+	if (stamped == ACL_SCHEMA_VERSION) {
+		compat_read_only = false;
+		return;
+	}
+	if (stamped < ACL_SCHEMA_VERSION) {
+		throw BinderException("acl catalog: \"%s\".\"%s\" is schema version %lld and this build reads %d - migrate "
+		                      "it first: SELECT acl_migrate_catalog('%s', '%s') on a node of this build (%s)",
+		                      db_name, schema, stamped, ACL_SCHEMA_VERSION, db_name, schema, on);
+	}
+	if (min_reader <= ACL_SCHEMA_VERSION) {
+		compat_read_only = true; // a newer catalog inside its window: served from, never written
+		return;
+	}
+	throw BinderException("acl catalog: \"%s\".\"%s\" is schema version %lld, readable from build %lld on, and "
+	                      "this build is %d - upgrade the node (%s)",
+	                      db_name, schema, stamped, min_reader, ACL_SCHEMA_VERSION, on);
+}
+
+void CatalogBackend::RequireWritableSchema(Connection &con) {
+	auto result = con.Query("SELECT \"value\" FROM " + Tbl("meta") + " WHERE \"key\" = 'schema_version'");
+	if (result->HasError() || result->RowCount() != 1) {
+		throw BinderException("acl catalog: the catalog's schema_version cannot be read - nothing is written");
+	}
+	auto stamped = result->Collection().GetValue(0, 0).ToString();
+	if (stamped != std::to_string(ACL_SCHEMA_VERSION)) {
+		throw BinderException("acl catalog: \"%s\".\"%s\" is schema version %s and this node's build writes %d - "
+		                      "policy is written from a node of the catalog's build (spec 094); this node only "
+		                      "serves from it",
+		                      db_name, schema, stamped, ACL_SCHEMA_VERSION);
+	}
+}
+
+string CatalogBackend::Migrate() {
+	string stored;
+	try {
+		stored = MetaValue("schema_version");
+	} catch (std::exception &) {
+	}
+	if (stored.empty()) {
+		throw BinderException("acl_migrate_catalog: \"%s\".\"%s\" is not an acl policy schema - acl_use_db(..., "
+		                      "true) creates one",
+		                      db_name, schema);
+	}
+	int64_t from = 0;
+	try {
+		from = std::stoll(stored);
+	} catch (std::exception &) {
+		throw BinderException("acl_migrate_catalog: schema_version \"%s\" is not a number", stored);
+	}
+	if (from == ACL_SCHEMA_VERSION) {
+		return StringUtil::Format("\"%s\".\"%s\" is already schema version %d", db_name, schema, ACL_SCHEMA_VERSION);
+	}
+	if (from > ACL_SCHEMA_VERSION) {
+		throw BinderException("acl_migrate_catalog: \"%s\".\"%s\" is schema version %lld, newer than this build "
+		                      "(%d) - a catalog is only ever migrated forward, by a node of the newer build",
+		                      db_name, schema, from, ACL_SCHEMA_VERSION);
+	}
+	auto instance = Db();
+	Connection con(*instance);
+	auto begin = con.Query("BEGIN");
+	if (begin->HasError()) {
+		throw BinderException("acl_migrate_catalog: %s", begin->GetError());
+	}
+	int64_t at = from;
+	int min_reader = static_cast<int>(from);
+	try {
+		for (auto &step : ACL_SCHEMA_STEPS) {
+			if (step.version <= from) {
+				continue;
+			}
+			if (step.version != at + 1) {
+				throw BinderException("acl_migrate_catalog: this build carries no step from schema version %lld to "
+				                      "%lld - migrate with an older build first",
+				                      at, at + 1);
+			}
+			for (int i = 0; i < step.count; i++) {
+				auto result = con.Query(ResolveSchemaNames(step.statements[i]));
+				if (result->HasError()) {
+					throw BinderException("acl_migrate_catalog: step v%d failed: %s", step.version, result->GetError());
+				}
+			}
+			for (auto sql : {"DELETE FROM " + Tbl("meta") + " WHERE \"key\" = 'min_reader_version'",
+			                 "INSERT INTO " + Tbl("meta") + " VALUES ('min_reader_version', '" +
+			                     std::to_string(step.min_reader) + "')"}) {
+				auto result = con.Query(sql);
+				if (result->HasError()) {
+					throw BinderException("acl_migrate_catalog: %s", result->GetError());
+				}
+			}
+			at = step.version;
+			min_reader = step.min_reader;
+		}
+		if (at != ACL_SCHEMA_VERSION) {
+			throw BinderException("acl_migrate_catalog: the steps end at %lld, this build is %d", at,
+			                      ACL_SCHEMA_VERSION);
+		}
+		auto stamp = con.Query("SELECT \"value\" FROM " + Tbl("meta") + " WHERE \"key\" = 'schema_version'");
+		if (stamp->HasError() || stamp->RowCount() != 1 ||
+		    stamp->Collection().GetValue(0, 0).ToString() != std::to_string(ACL_SCHEMA_VERSION)) {
+			throw BinderException("acl_migrate_catalog: the steps did not stamp schema version %d", ACL_SCHEMA_VERSION);
+		}
+	} catch (...) {
+		con.Query("ROLLBACK");
+		throw;
+	}
+	auto commit = con.Query("COMMIT");
+	if (commit->HasError()) {
+		throw BinderException("acl_migrate_catalog: %s", commit->GetError());
+	}
+	return StringUtil::Format("\"%s\".\"%s\" migrated from schema version %lld to %d (readable from build %d on)",
+	                          db_name, schema, from, ACL_SCHEMA_VERSION, min_reader);
 }
 
 string CatalogBackend::KeyColumnType() {
@@ -1352,10 +1497,17 @@ void CatalogBackend::InitSchema() {
 		stamped = -1;
 	}
 	if (stamped >= 0 && stamped != ACL_SCHEMA_VERSION) {
-		throw BinderException("acl catalog: \"%s\".\"%s\" is schema version %lld and this build creates %d - "
-		                      "an older catalog is migrated (schema/migrations/v<n>.sql for every version "
-		                      "above %lld, in order), not re-initialised",
-		                      db_name, schema, stamped, ACL_SCHEMA_VERSION, stamped);
+		// spec 094: an older catalog is migrated, never re-initialised; a newer one inside its window is
+		// served as it is (nothing to apply); one outside it is refused
+		int64_t min_reader = -1;
+		try {
+			auto declared = MetaValue("min_reader_version");
+			min_reader = declared.empty() ? -1 : std::stoll(declared);
+		} catch (std::exception &) {
+			min_reader = -1;
+		}
+		JudgeSchema(stamped, min_reader, "at init");
+		return;
 	}
 	vector<string> ddl;
 	for (auto statement : ACL_SCHEMA_SQL) {
@@ -1869,6 +2021,47 @@ bool PolicyStore::ResolveDdlTarget(const Principal &principal, const string &vna
 		return false; // the memory store has no schema grants (dev/tests)
 	}
 	return catalog->DdlTarget(principal, vname, capability, out);
+}
+
+} // namespace acl
+} // namespace duckdb
+
+namespace duckdb {
+namespace acl {
+
+string PolicyStore::CatalogMigrate(DatabaseInstance &db, const string &db_name, const string &schema) {
+	acl_detail::CatalogBackend backend(db, db_name, schema);
+	auto answer = backend.Migrate();
+	lock_guard<mutex> guard(lock);
+	if (catalog && !catalog->function_mode && StringUtil::CIEquals(catalog->db_name, db_name) &&
+	    StringUtil::CIEquals(catalog->schema, schema)) {
+		lock_guard<mutex> catalog_guard(catalog->lock);
+		catalog->checked_once = false; // the next statement re-reads the stamp
+	}
+	return answer;
+}
+
+Value PolicyStore::CatalogSchemaState() {
+	Value stamped(LogicalType::BIGINT), min_reader(LogicalType::BIGINT);
+	string mode = "none";
+	if (catalog && !catalog->function_mode) {
+		auto version = catalog->MetaValue("schema_version");
+		auto declared = catalog->MetaValue("min_reader_version");
+		if (!version.empty()) {
+			stamped = Value::BIGINT(std::stoll(version));
+		}
+		min_reader =
+		    Value::BIGINT(declared.empty() ? (version.empty() ? 0 : std::stoll(version)) : std::stoll(declared));
+		mode = version == std::to_string(ACL_SCHEMA_VERSION) ? "current"
+		       : catalog->compat_read_only                   ? "read_only"
+		                                                     : "refused";
+	}
+	child_list_t<Value> children {{"build", Value::BIGINT(ACL_SCHEMA_VERSION)},
+	                              {"build_min_reader", Value::BIGINT(ACL_SCHEMA_MIN_READER)},
+	                              {"catalog", stamped},
+	                              {"min_reader", min_reader},
+	                              {"mode", Value(mode)}};
+	return Value::STRUCT(std::move(children));
 }
 
 } // namespace acl

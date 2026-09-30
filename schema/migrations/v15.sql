@@ -1,4 +1,5 @@
 -- duckdb-acl schema migration: v14 -> v15 (spec 085, resource groups).
+-- min_reader: 15 - a build older than v15 does not read this catalog (spec 094: the window is declared per step, never assumed)
 -- Run against the database that holds the `acl` policy schema, then re-open with acl_use_db.
 -- Written for the duckdb dialect; see schema/acl_schema.sql for what another engine may need changing.
 -- Two new tables, empty: no role is in a group until an operator puts it there.

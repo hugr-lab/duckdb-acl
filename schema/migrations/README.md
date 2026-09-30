@@ -1,9 +1,9 @@
 # Schema migrations
 
-The steps that take an existing policy catalog from one schema version to the next. The extension
-does not apply them itself: `acl_use_db(..., true)` refuses a catalog with an older stamp by
-version and points here - an operator applies the steps by hand, in order, against the database
-that holds the schema. A fresh catalog is always created from [`../acl_schema.sql`](../acl_schema.sql)
+The steps that take an existing policy catalog from one schema version to the next. Since spec 094
+the build **embeds** them (`make schema` renders them into `src/acl_schema_sql.hpp`) and applies them
+with `acl_migrate_catalog(db[, schema])`, every step above the catalog's version in one transaction.
+The files stay the source, and what an operator applies by hand on another engine. A fresh catalog is always created from [`../acl_schema.sql`](../acl_schema.sql)
 complete and needs none of them. `v11.sql` (spec 048) is the first step.
 
 ## The contract
@@ -31,6 +31,32 @@ complete and needs none of them. `v11.sql` (spec 048) is the first step.
   **the invariant above is checked, not assumed**: `make schema-check` builds a catalog from the
   schema file the `main` branch ships, applies every step above its version, and diffs the column
   shape of every `acl` table against a catalog created fresh from the current file.
+
+## The compatibility window (spec 094)
+
+Every step declares, in its header, the oldest build that may still read the catalog it produces:
+
+```sql
+-- min_reader: 15 - v16 only adds the cluster profile's tables; a v15 build that ignores them serves the same policy (spec 094)
+```
+
+The extension stamps it into `meta.min_reader_version`. A build older than the catalog but at or
+above that number **serves from it and never writes** (a write would rewrite rows without what the
+newer step added). A build below it refuses. This is what makes a rolling upgrade possible: migrate
+first, and the old nodes keep serving until they are replaced.
+
+**The number is the author's judgment, not a formula.** The test is whether an older build that
+ignores what the step adds can ever admit more than the new build would:
+- A new table or column the old build never reads is usually safe.
+- A new column that narrows access (a restriction the new build enforces) is not: an old node
+  ignoring it would widen access. Such a step declares its own version.
+
+The rules for a step that keeps older readers:
+- It only adds: tables, or columns appended at the end.
+- It never renames, drops or retypes. Reads name their columns, but an old build's `INSERT … VALUES`
+  is positional; writes are refused anyway.
+- `make schema` refuses a step without a declaration, and `policy_schema.sql`'s own
+  `min_reader_version` must equal the latest step's.
 
 ## Why not "add the column if it is missing"
 

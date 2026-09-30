@@ -542,6 +542,11 @@ struct PolicyStore {
 	ClusterAnswer ClusterDetach(const string &scope, const string &alias, bool cascade, bool force);
 	ClusterAnswer ClusterSetting(const string &verb, const string &scope, const string &name, const string &value);
 	int64_t ClusterVersion();
+	//! spec 094: take the catalog in (db_name, schema) to this build's schema version, then have the
+	//! store's own catalog - if it is that one - re-judged at its next check
+	string CatalogMigrate(DatabaseInstance &db, const string &db_name, const string &schema);
+	//! spec 094: {build, catalog, min_reader, mode}: mode current | read_only | none
+	Value CatalogSchemaState();
 	vector<ClusterItem> ClusterItems(const string &scope);
 	//! The limits of the principal's groups, merged (catalog mode; memory mode has no groups)
 	ResourceLimits ResolveResourceLimits(const Principal &principal);

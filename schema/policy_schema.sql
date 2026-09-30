@@ -124,3 +124,6 @@ INSERT INTO <meta> SELECT 'schema_version', '16' WHERE NOT EXISTS (SELECT 1 FROM
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');
 INSERT INTO <meta> SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'config_version');
+-- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
+-- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
+INSERT INTO <meta> SELECT 'min_reader_version', '15' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');

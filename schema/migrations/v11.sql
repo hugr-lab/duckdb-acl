@@ -1,4 +1,5 @@
 -- duckdb-acl schema migration: v10 -> v11 (spec 048, the declared shape of an object).
+-- min_reader: 11 - a build older than v11 does not read this catalog (spec 094: the window is declared per step, never assumed)
 -- Run against the database that holds the `acl` policy schema, then re-open with acl_use_db.
 -- Written for the duckdb dialect; see schema/acl_schema.sql for what another engine may need
 -- changing (a key column is indexed, so SQL Server wants NVARCHAR(255), not MAX).

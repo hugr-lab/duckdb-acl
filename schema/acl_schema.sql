@@ -133,3 +133,7 @@ INSERT INTO acl."meta" SELECT 'schema_version', '16' WHERE NOT EXISTS (SELECT 1 
 INSERT INTO acl."meta" SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'policy_version');
 
 INSERT INTO acl."meta" SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'config_version');
+
+-- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
+-- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
+INSERT INTO acl."meta" SELECT 'min_reader_version', '15' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'min_reader_version');
