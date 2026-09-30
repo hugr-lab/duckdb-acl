@@ -54,7 +54,8 @@ int Child(const std::string &extension) {
 		}
 	}
 	auto answer = con.Query("SELECT * FROM remote.light");
-	if (answer->HasError() || answer->RowCount() != 1 || answer->GetValue(0, 0).GetValue<int32_t>() != 42) {
+	if (answer->HasError() || answer->RowCount() != 1 ||
+	    answer->Collection().GetValue(0, 0).GetValue<int32_t>() != 42) {
 		std::cerr << "child: the door did not answer: " << (answer->HasError() ? answer->GetError() : "") << "\n";
 		return 3;
 	}

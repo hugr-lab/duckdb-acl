@@ -215,7 +215,7 @@ int main(int argc, char *argv[]) {
 			      "no flow and no token is refused with guidance");
 			auto listed = con.Query("SELECT count(*)::BIGINT FROM duckdb_secrets() WHERE type='quack'");
 			if (CheckOk(*listed, "duckdb_secrets answers")) {
-				Check(listed->GetValue(0, 0).GetValue<int64_t>() >= 3, "the provider secrets stand");
+				Check(listed->Collection().GetValue(0, 0).GetValue<int64_t>() >= 3, "the provider secrets stand");
 			}
 		});
 
@@ -225,7 +225,8 @@ int main(int argc, char *argv[]) {
 			// build" in the very build that has TLS. Port 1 refuses: the error must be the network's.
 			auto flight = con.Query("SELECT count(*)::BIGINT FROM duckdb_functions() WHERE function_name = "
 			                        "'acl_flight_serve'");
-			if (!CheckOk(*flight, "duckdb_functions answers") || flight->GetValue(0, 0).GetValue<int64_t>() == 0) {
+			if (!CheckOk(*flight, "duckdb_functions answers") ||
+			    flight->Collection().GetValue(0, 0).GetValue<int64_t>() == 0) {
 				std::cout << "  note: a build without the flight door carries no OpenSSL - https is refused there\n";
 				return;
 			}
@@ -277,8 +278,9 @@ int main(int argc, char *argv[]) {
 				Exec(con, "ATTACH 'quack:localhost:31961' AS remote (TYPE quack)");
 				auto rows = con.Query("SELECT count(*)::BIGINT FROM remote.main.orders");
 				if (CheckOk(*rows, "the TOKEN-less ATTACH answers")) {
-					Check(rows->GetValue(0, 0).GetValue<int64_t>() == 2,
-					      "...with the acme slice the minted token names: " + rows->GetValue(0, 0).ToString());
+					Check(rows->Collection().GetValue(0, 0).GetValue<int64_t>() == 2,
+					      "...with the acme slice the minted token names: " +
+					          rows->Collection().GetValue(0, 0).ToString());
 				}
 				Exec(con, "DETACH remote");
 				Exec(con, "SELECT acl_quack_stop('quack:localhost:31961')");

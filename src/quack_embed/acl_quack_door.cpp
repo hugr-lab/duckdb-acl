@@ -482,7 +482,7 @@ void AclQuackStatementCompleted(Connection &connection, const string &connection
 	// cursor the server's own Fetch loop uses next
 	int64_t rows = -1;
 	if (result.RowCount() == 1 && result.ColumnCount() == 1) {
-		auto count = result.GetValue(0, 0);
+		auto count = result.Collection().GetValue(0, 0);
 		if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
 			rows = count.GetValue<int64_t>();
 		}

@@ -33,7 +33,7 @@ class HonkFunction : public TableFunction {
 public:
 	HonkFunction() {
 		name = "honk";
-		arguments.push_back(LogicalType::BIGINT);
+		GetSignature().AddParameter("honks", LogicalType::BIGINT);
 		bind = HonkBind;
 		init_global = HonkInit;
 		function = HonkFunc;
@@ -143,7 +143,7 @@ void Run() {
 	Scenario("foreign syntax parses bare: loading acl costs nobody the peeler", [&] {
 		auto rows = con.Query("honk honk honk");
 		if (CheckOk(*rows, "the toy statement answers")) {
-			Check(rows->RowCount() == 3 && rows->GetValue(0, 0).ToString() == "honk!",
+			Check(rows->RowCount() == 3 && rows->Collection().GetValue(0, 0).ToString() == "honk!",
 			      "...one row per honk: " + std::to_string(rows->RowCount()));
 		}
 	});

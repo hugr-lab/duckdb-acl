@@ -13,6 +13,7 @@
 // a listing of tens of rows and removes the question.
 //===----------------------------------------------------------------------===//
 
+#include "acl_result_rows.hpp"
 #include "acl_flight_catalog.hpp"
 
 #include "acl_catalog_rpc.hpp"
@@ -156,6 +157,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> BatchFrom(const std::shared_p
 		return arrow::Status::Invalid("acl: catalog statement produced " + std::to_string(result.ColumnCount()) +
 		                              " columns, the protocol wants " + std::to_string(sql_columns));
 	}
+	ResultRows result_rows(result);
 	vector<unique_ptr<ColumnBuilder>> builders;
 	for (int field = 0; field < schema->num_fields(); field++) {
 		builders.push_back(make_uniq<ColumnBuilder>(schema->field(field)->type()));
@@ -163,7 +165,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> BatchFrom(const std::shared_p
 	idx_t rows = 0;
 	for (idx_t row = 0; row < result.RowCount(); row++) {
 		for (idx_t column = 0; column < sql_columns; column++) {
-			ARROW_RETURN_NOT_OK(builders[column]->Append(result.GetValue(column, row)));
+			ARROW_RETURN_NOT_OK(builders[column]->Append(result_rows.GetValue(column, row)));
 		}
 		if (extra) {
 			ARROW_RETURN_NOT_OK(builders[sql_columns]->AppendBinary((*extra)[row]));
@@ -197,11 +199,13 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> EmptyBatch(const std::shared_
 //! strings are parsed by duckdb's own `TransformStringToLogicalType` - the inverse of the
 //! `ToString()` that produced them - so no type mapping is re-implemented here.
 arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &tables, QueryResult &columns) {
+	ResultRows table_rows(tables);
+	ResultRows column_rows(columns);
 	// (catalog, schema, name) -> the row range in `columns`, which the statement returned in order
 	std::map<std::tuple<string, string, string>, vector<idx_t>> by_object;
 	for (idx_t row = 0; row < columns.RowCount(); row++) {
-		auto key = std::make_tuple(columns.GetValue(0, row).ToString(), columns.GetValue(1, row).ToString(),
-		                           columns.GetValue(2, row).ToString());
+		auto key = std::make_tuple(column_rows.GetValue(0, row).ToString(), column_rows.GetValue(1, row).ToString(),
+		                           column_rows.GetValue(2, row).ToString());
 		by_object[key].push_back(row);
 	}
 
@@ -219,8 +223,8 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &ta
 	vector<ParsedTableSchema> parsed;
 	context.RunFunctionInTransaction([&]() {
 		for (idx_t row = 0; row < tables.RowCount(); row++) {
-			auto key = std::make_tuple(tables.GetValue(0, row).ToString(), tables.GetValue(1, row).ToString(),
-			                           tables.GetValue(2, row).ToString());
+			auto key = std::make_tuple(table_rows.GetValue(0, row).ToString(), table_rows.GetValue(1, row).ToString(),
+			                           table_rows.GetValue(2, row).ToString());
 			vector<string> names;
 			vector<LogicalType> types;
 			vector<bool> non_nullable;
@@ -232,9 +236,10 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &ta
 			auto found = by_object.find(key);
 			if (found != by_object.end()) {
 				for (auto column_row : found->second) {
-					names.push_back(columns.GetValue(3, column_row).ToString());
-					types.push_back(TransformStringToLogicalType(columns.GetValue(4, column_row).ToString(), context));
-					auto nullable = columns.GetValue(5, column_row);
+					names.push_back(column_rows.GetValue(3, column_row).ToString());
+					types.push_back(
+					    TransformStringToLogicalType(column_rows.GetValue(4, column_row).ToString(), context));
+					auto nullable = column_rows.GetValue(5, column_row);
 					non_nullable.push_back(!nullable.IsNull() && nullable.ToString() == "NO");
 				}
 			}

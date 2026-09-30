@@ -13,6 +13,7 @@
 // PolicyStore methods that delegate to them. The writers, the metadata listings and the validators
 // are the other three units of the module (release plan 4.2).
 
+#include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_rewriter.hpp"
 #include "acl_schema_sql.hpp"
@@ -155,7 +156,7 @@ void CatalogBackend::EnsureFresh() {
 			throw BinderException("acl catalog: the policy_version source returned %lld rows, expected 1",
 			                      result->RowCount());
 		}
-		current = result->GetValue(0, 0).GetValue<int64_t>();
+		current = result->Collection().GetValue(0, 0).GetValue<int64_t>();
 	} catch (std::exception &ex) {
 		// the source did not answer: the statement that asked is refused (fail closed), the refusal
 		// names the source rather than the principal, and the node's counters see it (spec 069)
@@ -225,6 +226,7 @@ vector<CatalogBackend::GrantRow> CatalogBackend::Grants(const vector<string> &ro
 	if (!missing.empty()) {
 		// positional contract: (role, vcat, is_main, caps)
 		auto result = Query("SELECT * FROM " + Slot("role_catalogs") + "(" + ListLit(missing) + ")");
+		ResultRows result_rows(*result);
 		lock_guard<mutex> guard(lock);
 		for (auto &role : missing) {
 			fn_grants_loaded.insert(role);
@@ -232,11 +234,11 @@ vector<CatalogBackend::GrantRow> CatalogBackend::Grants(const vector<string> &ro
 		}
 		for (idx_t row = 0; row < result->RowCount(); row++) {
 			GrantRow grant;
-			grant.role = result->GetValue(0, row).ToString();
-			grant.vcat = result->GetValue(1, row).ToString();
-			auto is_main = result->GetValue(2, row);
+			grant.role = result_rows.GetValue(0, row).ToString();
+			grant.vcat = result_rows.GetValue(1, row).ToString();
+			auto is_main = result_rows.GetValue(2, row);
 			grant.is_main = !is_main.IsNull() && is_main.GetValue<bool>();
-			auto caps = result->GetValue(3, row);
+			auto caps = result_rows.GetValue(3, row);
 			grant.caps = caps.IsNull() ? string() : caps.ToString();
 			fn_grants[grant.role].push_back(grant);
 		}
@@ -319,7 +321,9 @@ bool CatalogBackend::FunctionMode() const {
 
 string CatalogBackend::MetaValue(const char *key) {
 	auto result = Query("SELECT \"value\" FROM " + Tbl("meta") + " WHERE \"key\" = " + Lit(key));
-	return result->RowCount() == 0 || result->GetValue(0, 0).IsNull() ? string() : result->GetValue(0, 0).ToString();
+	return result->RowCount() == 0 || result->Collection().GetValue(0, 0).IsNull()
+	           ? string()
+	           : result->Collection().GetValue(0, 0).ToString();
 }
 
 bool CatalogBackend::HasObjectCaps() {
@@ -371,13 +375,13 @@ string CatalogBackend::GrantPolicyExprs() {
 	                       " oc.\"rls\" AS orls, oc.\"columns\" AS ocols, oc.\"rls_checked\" AS ochk";
 }
 
-GrantPolicy CatalogBackend::RowPolicy(QueryResult &result, idx_t row, idx_t first_column) {
+GrantPolicy CatalogBackend::RowPolicy(const ResultRows &result_rows, idx_t row, idx_t first_column) {
 	auto text = [&](idx_t column) {
-		auto value = result.GetValue(column, row);
+		auto value = result_rows.GetValue(column, row);
 		return value.IsNull() ? string() : value.ToString();
 	};
 	auto flag = [&](idx_t column) {
-		auto value = result.GetValue(column, row);
+		auto value = result_rows.GetValue(column, row);
 		return !value.IsNull() && value.GetValue<bool>();
 	};
 	GrantPolicy policy;
@@ -463,23 +467,24 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	    // order rather than in whatever order the store returned (spec 036)
 	    ") ORDER BY prio, g.\"role\"";
 	auto result = Query(sql);
+	ResultRows result_rows(*result);
 	if (result->RowCount() == 0) {
 		return false;
 	}
-	auto prio = result->GetValue(11, 0).GetValue<int64_t>();
-	auto form = result->GetValue(0, 0).ToString();
-	auto phys = result->GetValue(1, 0);
-	auto view_sql = result->GetValue(2, 0);
-	auto rls = result->GetValue(3, 0);
+	auto prio = result->Collection().GetValue(11, 0).GetValue<int64_t>();
+	auto form = result->Collection().GetValue(0, 0).ToString();
+	auto phys = result->Collection().GetValue(1, 0);
+	auto view_sql = result->Collection().GetValue(2, 0);
+	auto rls = result->Collection().GetValue(3, 0);
 	out.phys = phys.IsNull() ? string() : phys.ToString();
 	out.query = view_sql.IsNull() ? string() : view_sql.ToString();
 	out.rls = rls.IsNull() ? string() : rls.ToString();
-	auto rchk = result->GetValue(13, 0);
+	auto rchk = result->Collection().GetValue(13, 0);
 	out.rls_unchecked = !out.rls.empty() && (rchk.IsNull() || !rchk.GetValue<bool>());
 	out.subquery_form = form != "alias";
 	out.writable = form == "alias"; // a real table stays writable, however a grant narrows it
 	vector<std::pair<string, string>> object_columns;
-	auto cols = result->GetValue(12, 0);
+	auto cols = result->Collection().GetValue(12, 0);
 	if (!cols.IsNull() && form != "view") {
 		for (auto &item : ListValue::GetChildren(cols)) {
 			auto &fields = StructValue::GetChildren(item);
@@ -506,14 +511,14 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	// policies of their grant chains (spec 011)
 	GrantUnion grants;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		if (result->GetValue(11, row).GetValue<int64_t>() != prio) {
+		if (result_rows.GetValue(11, row).GetValue<int64_t>() != prio) {
 			break; // ordered by prio; the losing interpretation starts here
 		}
-		auto caps = result->GetValue(4, row);
+		auto caps = result_rows.GetValue(4, row);
 		for (auto &cap : EffectiveCaps(caps)) {
 			out.caps.insert(cap);
 		}
-		grants.Add(RowPolicy(*result, row, 5));
+		grants.Add(RowPolicy(result_rows, row, 5));
 	}
 	ApplyGrantPolicy(vname, grants, object_columns, out);
 	return true;
@@ -690,28 +695,29 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 	           prefix_match(Lit(vname), "sa.\"alias_path\"") +
 	           ") ORDER BY prio, length(sa.\"alias_path\") DESC, g.\"role\"";
 	auto result = Query(sql);
+	ResultRows result_rows(*result);
 	if (result->RowCount() == 0) {
 		return false;
 	}
-	auto prio = result->GetValue(10, 0).GetValue<int64_t>();
-	auto vcat = result->GetValue(0, 0).ToString();
-	auto alias_path = result->GetValue(1, 0).ToString();
+	auto prio = result->Collection().GetValue(10, 0).GetValue<int64_t>();
+	auto vcat = result->Collection().GetValue(0, 0).ToString();
+	auto alias_path = result->Collection().GetValue(1, 0).ToString();
 	auto &path = prio == 1 ? rest : vname;
 	out.subquery_form = false;
 	out.writable = true; // an aliased schema maps onto real tables
-	out.phys = result->GetValue(2, 0).ToString() + path.substr(alias_path.size());
+	out.phys = result->Collection().GetValue(2, 0).ToString() + path.substr(alias_path.size());
 	// rows of the same winning alias differ only by role: union their caps and grant policies
 	GrantUnion grants;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		if (result->GetValue(10, row).GetValue<int64_t>() != prio || result->GetValue(0, row).ToString() != vcat ||
-		    result->GetValue(1, row).ToString() != alias_path) {
+		if (result_rows.GetValue(10, row).GetValue<int64_t>() != prio ||
+		    result_rows.GetValue(0, row).ToString() != vcat || result_rows.GetValue(1, row).ToString() != alias_path) {
 			continue;
 		}
-		auto caps = result->GetValue(3, row);
+		auto caps = result_rows.GetValue(3, row);
 		for (auto &cap : EffectiveCaps(caps)) {
 			out.caps.insert(cap);
 		}
-		grants.Add(RowPolicy(*result, row, 4));
+		grants.Add(RowPolicy(result_rows, row, 4));
 	}
 	vector<std::pair<string, string>> no_columns;
 	ApplyGrantPolicy(vname, grants, no_columns, out);
@@ -755,14 +761,15 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 	           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND f.\"vname\" = " + Lit(vname) +
 	           ")) ORDER BY prio, g.\"role\"";
 	auto result = Query(sql);
+	ResultRows result_rows(*result);
 	TablePolicy policy;
 	bool found = result->RowCount() > 0;
 	if (found) {
-		auto vcat = result->GetValue(0, 0).ToString();
-		auto form = result->GetValue(1, 0).ToString();
-		auto target = result->GetValue(2, 0);
-		auto template_sql = result->GetValue(3, 0);
-		auto prio = result->GetValue(11, 0).GetValue<int64_t>();
+		auto vcat = result->Collection().GetValue(0, 0).ToString();
+		auto form = result->Collection().GetValue(1, 0).ToString();
+		auto target = result->Collection().GetValue(2, 0);
+		auto template_sql = result->Collection().GetValue(3, 0);
+		auto prio = result->Collection().GetValue(11, 0).GetValue<int64_t>();
 		policy.subquery_form = form != "alias";
 		policy.phys = target.IsNull() ? string() : target.ToString();
 		policy.query = template_sql.IsNull() ? string() : template_sql.ToString();
@@ -770,14 +777,15 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 		// call is a read, so it needs one) and their grant policies
 		GrantUnion grants;
 		for (idx_t row = 0; row < result->RowCount(); row++) {
-			if (result->GetValue(11, row).GetValue<int64_t>() != prio || result->GetValue(0, row).ToString() != vcat) {
+			if (result_rows.GetValue(11, row).GetValue<int64_t>() != prio ||
+			    result_rows.GetValue(0, row).ToString() != vcat) {
 				continue;
 			}
-			auto caps = result->GetValue(4, row);
+			auto caps = result_rows.GetValue(4, row);
 			for (auto &cap : EffectiveCaps(caps)) {
 				policy.caps.insert(cap);
 			}
-			grants.Add(RowPolicy(*result, row, 5));
+			grants.Add(RowPolicy(result_rows, row, 5));
 		}
 		ApplyFunctionGrantPolicy(vname, table_kind, grants, policy);
 	}
@@ -839,8 +847,9 @@ bool CatalogBackend::PrincipalMainCap(const Principal &principal, const string &
 	auto sql = GrantsCte(principal) +
 	           "SELECT \"caps\" FROM grants WHERE \"is_main\" = true AND (SELECT unique_main FROM main_ok)";
 	auto result = Query(sql);
+	ResultRows result_rows(*result);
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		if (EffectiveCaps(result->GetValue(0, row)).count(capability)) {
+		if (EffectiveCaps(result_rows.GetValue(0, row)).count(capability)) {
 			return true;
 		}
 	}
@@ -863,17 +872,18 @@ bool CatalogBackend::DdlTarget(const Principal &principal, const string &vname, 
 	           ", 1, length(s.\"path\") + 1) = s.\"path\" || '.'"
 	           " ORDER BY length(s.\"path\") DESC";
 	auto result = Query(sql);
+	ResultRows result_rows(*result);
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		auto caps_value = result->GetValue(4, row);
+		auto caps_value = result_rows.GetValue(4, row);
 		if (!EffectiveCaps(caps_value).count(capability)) {
 			continue; // this role may not; another role of the principal still might
 		}
-		auto phys_path = result->GetValue(2, row);
-		auto origin = result->GetValue(3, row);
-		auto into = result->GetValue(5, row);
-		auto only = result->GetValue(6, row);
-		out.vcat = result->GetValue(0, row).ToString();
-		out.schema_path = result->GetValue(1, row).ToString();
+		auto phys_path = result_rows.GetValue(2, row);
+		auto origin = result_rows.GetValue(3, row);
+		auto into = result_rows.GetValue(5, row);
+		auto only = result_rows.GetValue(6, row);
+		out.vcat = result_rows.GetValue(0, row).ToString();
+		out.schema_path = result_rows.GetValue(1, row).ToString();
 		out.origin = origin.IsNull() ? string() : origin.ToString();
 		// an alias shows the physical schema live, so nothing has to be recorded; an expansion
 		// shows only its own records, so a new object needs one
@@ -887,7 +897,8 @@ bool CatalogBackend::DdlTarget(const Principal &principal, const string &vname, 
 		return true;
 	}
 	if (result->RowCount() > 0) {
-		throw BinderException("acl: %s on schema \"%s\" is not allowed", capability, result->GetValue(1, 0).ToString());
+		throw BinderException("acl: %s on schema \"%s\" is not allowed", capability,
+		                      result->Collection().GetValue(1, 0).ToString());
 	}
 	return false;
 }
@@ -917,38 +928,41 @@ shared_ptr<const FunctionCategoryModel> CatalogBackend::FunctionModel() {
 	};
 	auto model = make_shared_ptr<FunctionCategoryModel>();
 	auto categories = rows("function_categories", "\"category\", \"comment\", \"builtin\"");
+	ResultRows categories_rows(*categories);
 	for (idx_t row = 0; row < categories->RowCount(); row++) {
-		auto builtin = categories->GetValue(2, row);
-		model->AddCategory(categories->GetValue(0, row).ToString(), categories->GetValue(1, row).ToString(),
+		auto builtin = categories_rows.GetValue(2, row);
+		model->AddCategory(categories_rows.GetValue(0, row).ToString(), categories_rows.GetValue(1, row).ToString(),
 		                   !builtin.IsNull() && builtin.GetValue<bool>());
 	}
 	auto members = rows("function_category_members", "\"category\", \"database\", \"schema\", \"name\", \"kind\"");
+	ResultRows members_rows(*members);
 	for (idx_t row = 0; row < members->RowCount(); row++) {
 		FunctionKey key;
-		key.database = members->GetValue(1, row).ToString();
-		key.schema = members->GetValue(2, row).ToString();
-		key.name = members->GetValue(3, row).ToString();
-		if (!ParseFunctionKind(members->GetValue(4, row).ToString(), key.kind)) {
+		key.database = members_rows.GetValue(1, row).ToString();
+		key.schema = members_rows.GetValue(2, row).ToString();
+		key.name = members_rows.GetValue(3, row).ToString();
+		if (!ParseFunctionKind(members_rows.GetValue(4, row).ToString(), key.kind)) {
 			continue; // a kind this build does not know is no key it can resolve
 		}
-		model->AddMember(members->GetValue(0, row).ToString(), key);
+		model->AddMember(members_rows.GetValue(0, row).ToString(), key);
 	}
 	auto grants =
 	    rows("function_grants", "\"role\", \"category\", \"database\", \"schema\", \"name\", \"kind\", \"allowed\"");
+	ResultRows grants_rows(*grants);
 	for (idx_t row = 0; row < grants->RowCount(); row++) {
-		auto allowed_value = grants->GetValue(6, row);
+		auto allowed_value = grants_rows.GetValue(6, row);
 		bool allowed = !allowed_value.IsNull() && allowed_value.GetValue<bool>();
-		auto role = grants->GetValue(0, row).ToString();
-		auto category = grants->GetValue(1, row).ToString();
+		auto role = grants_rows.GetValue(0, row).ToString();
+		auto category = grants_rows.GetValue(1, row).ToString();
 		if (!category.empty()) {
 			model->AddCategoryGrant(role, category, allowed);
 			continue;
 		}
 		FunctionKey key;
-		key.database = grants->GetValue(2, row).ToString();
-		key.schema = grants->GetValue(3, row).ToString();
-		key.name = grants->GetValue(4, row).ToString();
-		if (!ParseFunctionKind(grants->GetValue(5, row).ToString(), key.kind)) {
+		key.database = grants_rows.GetValue(2, row).ToString();
+		key.schema = grants_rows.GetValue(3, row).ToString();
+		key.name = grants_rows.GetValue(4, row).ToString();
+		if (!ParseFunctionKind(grants_rows.GetValue(5, row).ToString(), key.kind)) {
 			continue;
 		}
 		model->AddNameGrant(role, key, allowed);
@@ -979,14 +993,15 @@ void CatalogBackend::LoadRoleClaims(Principal &principal) {
 		auto result = function_mode ? Query("SELECT * FROM " + Slot("role_claims") + "(" + ListLit(missing) + ")")
 		                            : Query("SELECT \"role\", \"claim\", \"value\" FROM " + Tbl("role_claims") +
 		                                    " WHERE \"role\" IN (" + LitList(missing) + ")");
+		ResultRows result_rows(*result);
 		lock_guard<mutex> guard(lock);
 		for (auto &role : missing) {
 			claims_loaded.insert(role);
 			claims_cache[role];
 		}
 		for (idx_t row = 0; row < result->RowCount(); row++) {
-			claims_cache[result->GetValue(0, row).ToString()][result->GetValue(1, row).ToString()] =
-			    result->GetValue(2, row).ToString();
+			claims_cache[result_rows.GetValue(0, row).ToString()][result_rows.GetValue(1, row).ToString()] =
+			    result_rows.GetValue(2, row).ToString();
 		}
 	}
 	lock_guard<mutex> guard(lock);
@@ -1033,8 +1048,9 @@ void CatalogBackend::ListIssuers(vector<string> &out) {
 	}
 	EnsureFresh();
 	auto result = Query("SELECT \"issuer\" FROM " + Tbl("issuers") + " ORDER BY 1");
+	ResultRows result_rows(*result);
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		out.push_back(result->GetValue(0, row).ToString());
+		out.push_back(result_rows.GetValue(0, row).ToString());
 	}
 }
 
@@ -1068,36 +1084,36 @@ bool CatalogBackend::LookupIssuer(const string &issuer, IssuerConfig &out) {
 	bool found = result->RowCount() > 0;
 	if (found) {
 		config.issuer = issuer;
-		auto keys = result->GetValue(base + 0, 0);
+		auto keys = result->Collection().GetValue(base + 0, 0);
 		config.keys_json = keys.IsNull() ? string() : keys.ToString();
-		auto audiences = result->GetValue(base + 1, 0);
+		auto audiences = result->Collection().GetValue(base + 1, 0);
 		for (auto &aud : StringUtil::Split(audiences.IsNull() ? string() : audiences.ToString(), ',')) {
 			StringUtil::Trim(aud);
 			if (!aud.empty()) {
 				config.audiences.push_back(aud);
 			}
 		}
-		auto algs = result->GetValue(base + 2, 0);
+		auto algs = result->Collection().GetValue(base + 2, 0);
 		for (auto &alg : StringUtil::Split(algs.IsNull() ? string() : algs.ToString(), ',')) {
 			StringUtil::Trim(alg);
 			if (!alg.empty()) {
 				config.algs.insert(alg);
 			}
 		}
-		auto role_claim = result->GetValue(base + 3, 0);
+		auto role_claim = result->Collection().GetValue(base + 3, 0);
 		config.role_claim = role_claim.IsNull() ? string() : role_claim.ToString();
-		auto claim_map = result->GetValue(base + 4, 0);
+		auto claim_map = result->Collection().GetValue(base + 4, 0);
 		config.claim_map = claim_map.IsNull() ? string() : claim_map.ToString();
 		// the function-driver slot has no jwks_uri column: its platform hands over the keys itself
 		if (result->ColumnCount() > base + 5) {
-			auto jwks_uri = result->GetValue(base + 5, 0);
+			auto jwks_uri = result->Collection().GetValue(base + 5, 0);
 			config.jwks_uri = jwks_uri.IsNull() ? string() : jwks_uri.ToString();
 		}
 		// spec 064: the node-side OAuth client; the function-driver slot may omit both columns
 		if (result->ColumnCount() > base + 7) {
-			auto client_id = result->GetValue(base + 6, 0);
+			auto client_id = result->Collection().GetValue(base + 6, 0);
 			config.client_id = client_id.IsNull() ? string() : client_id.ToString();
-			auto client_secret = result->GetValue(base + 7, 0);
+			auto client_secret = result->Collection().GetValue(base + 7, 0);
 			config.client_secret = client_secret.IsNull() ? string() : client_secret.ToString();
 		}
 	}
@@ -1146,9 +1162,10 @@ void CatalogBackend::ManageCatalogs(const Principal &principal, std::set<string>
 	}
 	auto result = Query("SELECT \"vcat\", \"caps\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
 	                    LitList(principal.roles) + ")");
+	ResultRows result_rows(*result);
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		auto caps = result->GetValue(1, row);
-		auto vcat = result->GetValue(0, row).ToString();
+		auto caps = result_rows.GetValue(1, row);
+		auto vcat = result_rows.GetValue(0, row).ToString();
 		if (!vcat.empty() && ParseCaps(caps.IsNull() ? string() : caps.ToString()).count("manage")) {
 			out.insert(vcat);
 		}
@@ -1171,9 +1188,10 @@ void CatalogBackend::AdminScopes(const Principal &principal, vector<std::pair<st
 		result = Query("SELECT \"role\", \"scope\", \"vcat\" FROM " + Tbl("admins") + " WHERE \"role\" IN (" +
 		               LitList(principal.roles) + ")");
 	}
+	ResultRows result_rows(*result);
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		auto vcat = result->GetValue(2, row);
-		out.emplace_back(result->GetValue(1, row).ToString(), vcat.IsNull() ? string() : vcat.ToString());
+		auto vcat = result_rows.GetValue(2, row);
+		out.emplace_back(result_rows.GetValue(1, row).ToString(), vcat.IsNull() ? string() : vcat.ToString());
 	}
 }
 
@@ -1189,8 +1207,9 @@ void CatalogBackend::MapExternalRoles(const string &issuer, const vector<string>
 			// positional contract: (external_value, role)
 			auto result =
 			    Query("SELECT * FROM " + Slot("role_mappings") + "(" + Lit(issuer) + ", " + ListLit(values) + ")");
+			ResultRows result_rows(*result);
 			for (idx_t row = 0; row < result->RowCount(); row++) {
-				mapped[result->GetValue(0, row).ToString()].push_back(result->GetValue(1, row).ToString());
+				mapped[result_rows.GetValue(0, row).ToString()].push_back(result_rows.GetValue(1, row).ToString());
 			}
 		}
 		// a raw value is a known role iff the role_catalogs callback grants it anything
@@ -1201,14 +1220,16 @@ void CatalogBackend::MapExternalRoles(const string &issuer, const vector<string>
 	}
 	auto result = Query("SELECT \"external_value\", \"role\" FROM " + Tbl("role_mappings") +
 	                    " WHERE \"issuer\" = " + Lit(issuer) + " AND \"external_value\" IN (" + LitList(values) + ")");
+	ResultRows result_rows(*result);
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		mapped[result->GetValue(0, row).ToString()].push_back(result->GetValue(1, row).ToString());
+		mapped[result_rows.GetValue(0, row).ToString()].push_back(result_rows.GetValue(1, row).ToString());
 	}
 	auto known = Query("SELECT \"role\" FROM " + Tbl("roles") + " WHERE \"role\" IN (" + LitList(values) +
 	                   ") UNION SELECT DISTINCT \"role\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
 	                   LitList(values) + ")");
+	ResultRows known_rows(*known);
 	for (idx_t row = 0; row < known->RowCount(); row++) {
-		known_roles.insert(known->GetValue(0, row).ToString());
+		known_roles.insert(known_rows.GetValue(0, row).ToString());
 	}
 }
 
@@ -1224,11 +1245,11 @@ bool CatalogBackend::ReadText(const string &uri, string &out, string &error) {
 		error = "there is no document there";
 		return false;
 	}
-	if (result->RowCount() != 1 || result->GetValue(0, 0).IsNull()) {
+	if (result->RowCount() != 1 || result->Collection().GetValue(0, 0).IsNull()) {
 		error = "the location holds no single document";
 		return false;
 	}
-	out = result->GetValue(0, 0).ToString();
+	out = result->Collection().GetValue(0, 0).ToString();
 	return true;
 }
 
@@ -1275,8 +1296,8 @@ void CatalogBackend::RequireSchemaVersion() {
 
 string CatalogBackend::KeyColumnType() {
 	auto result = Query("SELECT \"type\" FROM duckdb_databases() WHERE \"database_name\" = " + Lit(db_name));
-	if (result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
-	    StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "mssql")) {
+	if (result->RowCount() > 0 && !result->Collection().GetValue(0, 0).IsNull() &&
+	    StringUtil::CIEquals(result->Collection().GetValue(0, 0).ToString(), "mssql")) {
 		return "MSSQL_VARCHAR(255)";
 	}
 	return "VARCHAR";
@@ -1407,7 +1428,7 @@ void PolicyStore::EnableFunctions(DatabaseInstance &db, const string &slots_json
 	for (auto &slot : slots) {
 		auto exists = backend->Query("SELECT count(*) FROM duckdb_functions() WHERE \"function_name\" = " +
 		                             acl_detail::Lit(slot.second));
-		if (exists->GetValue(0, 0).GetValue<int64_t>() == 0) {
+		if (exists->Collection().GetValue(0, 0).GetValue<int64_t>() == 0) {
 			throw BinderException("acl_use_functions: slot \"%s\" names an unknown function \"%s\"", slot.first,
 			                      slot.second);
 		}
@@ -1449,6 +1470,7 @@ ResourceLimits CatalogBackend::ResourceLimitsOf(const Principal &principal) {
 	                    Tbl("role_resource_groups") + " rg JOIN " + Tbl("resource_groups") +
 	                    " g ON g.\"group\" = rg.\"group\" WHERE rg.\"role\" IN (" + StringUtil::Join(roles, ", ") +
 	                    ") ORDER BY 1");
+	ResultRows result_rows(*result);
 	// the most generous value per limit: where 0 means unlimited / off, 0 wins; otherwise the largest
 	auto generous = [](optional_idx &into, const Value &value, bool zero_is_unlimited) {
 		if (value.IsNull()) {
@@ -1466,20 +1488,20 @@ ResourceLimits CatalogBackend::ResourceLimitsOf(const Principal &principal) {
 	bool any_priority = false;
 	bool unlimited_sessions = false;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		auto group = result->GetValue(0, row).ToString();
+		auto group = result_rows.GetValue(0, row).ToString();
 		out.groups.push_back(group);
-		generous(out.window_start, result->GetValue(1, row), true);
-		generous(out.window_max, result->GetValue(2, row), true);
-		generous(out.batch_bytes, result->GetValue(3, row), false);
-		generous(out.max_result_rows, result->GetValue(4, row), true);
-		auto priority = result->GetValue(5, row);
+		generous(out.window_start, result_rows.GetValue(1, row), true);
+		generous(out.window_max, result_rows.GetValue(2, row), true);
+		generous(out.batch_bytes, result_rows.GetValue(3, row), false);
+		generous(out.max_result_rows, result_rows.GetValue(4, row), true);
+		auto priority = result_rows.GetValue(5, row);
 		if (!priority.IsNull()) {
 			auto p = priority.GetValue<int64_t>();
 			out.queue_priority = any_priority ? MaxValue(out.queue_priority, p) : p;
 			any_priority = true;
 		}
 		// a group that states no max_sessions, or 0, limits nothing: the session is charged to none
-		auto max_sessions = result->GetValue(6, row);
+		auto max_sessions = result_rows.GetValue(6, row);
 		if (max_sessions.IsNull() || max_sessions.GetValue<int64_t>() <= 0) {
 			unlimited_sessions = true;
 		} else if (!unlimited_sessions) {
@@ -1687,11 +1709,12 @@ vector<PolicyStore::JwksCacheRow> PolicyStore::JwksCacheRows() {
 	}
 	auto issuers = catalog->Query("SELECT \"issuer\", \"jwks_uri\" FROM " + catalog->Tbl("issuers") +
 	                              " WHERE \"jwks_uri\" IS NOT NULL AND \"jwks_uri\" <> '' ORDER BY 1");
+	ResultRows issuers_rows(*issuers);
 	lock_guard<mutex> guard(lock);
 	for (idx_t i = 0; i < issuers->RowCount(); i++) {
 		JwksCacheRow row;
-		row.issuer = issuers->GetValue(0, i).ToString();
-		row.location = issuers->GetValue(1, i).ToString();
+		row.issuer = issuers_rows.GetValue(0, i).ToString();
+		row.location = issuers_rows.GetValue(1, i).ToString();
 		string why;
 		row.allowed = JwksLocationAllowed(row.location, why);
 		auto cached = jwks_cache.find(row.issuer);

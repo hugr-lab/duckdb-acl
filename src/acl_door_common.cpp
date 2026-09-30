@@ -65,10 +65,10 @@ string ReadPemArg(ClientContext &context, const string &arg, const char *what, c
 	if (result->HasError()) {
 		throw IOException("%s: could not read the %s from \"%s\": %s", fn, what, trimmed, result->GetError());
 	}
-	if (result->RowCount() != 1 || result->GetValue(0, 0).IsNull()) {
+	if (result->RowCount() != 1 || result->Collection().GetValue(0, 0).IsNull()) {
 		throw IOException("%s: the %s location \"%s\" holds no single document", fn, what, trimmed);
 	}
-	auto content = result->GetValue(0, 0).ToString();
+	auto content = result->Collection().GetValue(0, 0).ToString();
 	// a path to the wrong file is a common mistake; say so here rather than let it reach the TLS
 	// stack as the cryptic init error this helper exists to avoid
 	auto head = content;

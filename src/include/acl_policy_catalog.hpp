@@ -21,6 +21,8 @@
 
 namespace duckdb {
 namespace acl {
+
+class ResultRows;
 namespace acl_detail {
 
 inline string Ident(const string &value) {
@@ -406,7 +408,7 @@ struct CatalogBackend {
 	//! Fold the six policy columns of one result row into the chain of one role. A NULL `rls_checked`
 	//! is a row written before spec 027 existed, and counts as unchecked: `acl_refresh_schema` judges
 	//! those and fills the verdict in.
-	static GrantPolicy RowPolicy(QueryResult &result, idx_t row, idx_t first_column);
+	static GrantPolicy RowPolicy(const ResultRows &result_rows, idx_t row, idx_t first_column);
 
 	//! Split a written name into its qualified interpretation; empty head = no qualified branch
 	static void SplitName(const string &vname, string &head, string &rest);

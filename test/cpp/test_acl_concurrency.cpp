@@ -83,7 +83,7 @@ std::string OpenSession(Connection &con, const std::string &token) {
 	if (result->HasError() || result->RowCount() == 0) {
 		return std::string();
 	}
-	auto value = result->GetValue(0, 0);
+	auto value = result->Collection().GetValue(0, 0);
 	return value.IsNull() ? std::string() : value.ToString();
 }
 

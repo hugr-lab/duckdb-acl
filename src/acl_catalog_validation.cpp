@@ -3,6 +3,7 @@
 // declaration's shape - so a stored policy never carries a name nothing judged. Split from
 // acl_policy_catalog.cpp (plan 4.2).
 
+#include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_rewriter.hpp"
 
@@ -91,10 +92,11 @@ bool CatalogBackend::CatalogPredicateChecked(const std::function<unique_ptr<Quer
 	}
 	auto rows =
 	    read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat));
+	ResultRows rows_rows(*rows);
 	bool any = false;
 	for (idx_t row = 0; row < rows->RowCount(); row++) {
 		auto text = [&](idx_t column) {
-			auto value = rows->GetValue(column, row);
+			auto value = rows_rows.GetValue(column, row);
 			return value.IsNull() ? string() : value.ToString();
 		};
 		auto form = text(0);

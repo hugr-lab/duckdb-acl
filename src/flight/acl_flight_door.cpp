@@ -123,7 +123,7 @@ struct FlightDoorState {
 	//! ResultEagerness::FORCED - refuses a stream and is read from the handle instead, complete by
 	//! then and one row long.
 	struct ResultStream {
-		unique_ptr<QueryResultStream> stream;
+		unique_ptr<QueryResultStream<>> stream;
 		unique_ptr<QueryResult> handle;
 		bool superseded = false;
 
@@ -134,7 +134,7 @@ struct FlightDoorState {
 		void Take(unique_ptr<QueryResult> result) {
 			if (result->GetStatementProperties().result_eagerness != ResultEagerness::FORCED &&
 			    result->HasBufferedData()) {
-				stream = make_uniq<QueryResultStream>(std::move(result));
+				stream = make_uniq<QueryResultStream<>>(std::move(result));
 			} else {
 				handle = std::move(result);
 			}
@@ -2150,8 +2150,8 @@ private:
 			auto execution = state->LockForStatement(*conn);
 			for (const char *name : {"TimeZone", "Calendar"}) {
 				auto value = conn->con->Query(string("SELECT current_setting('") + name + "')");
-				if (!value->HasError() && value->RowCount() == 1 && !value->GetValue(0, 0).IsNull()) {
-					result.session_options[name] = value->GetValue(0, 0).ToString();
+				if (!value->HasError() && value->RowCount() == 1 && !value->Collection().GetValue(0, 0).IsNull()) {
+					result.session_options[name] = value->Collection().GetValue(0, 0).ToString();
 				}
 			}
 			return result;

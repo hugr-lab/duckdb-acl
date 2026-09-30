@@ -5,6 +5,7 @@
 // acl_repair_relation(vcat, vname, action[, spec]) mends a declared COLUMNS list on purpose, never
 // dropping a mask silently (spec 038's rule, applied to the repair).
 
+#include "acl_result_rows.hpp"
 #include "acl_maintenance.hpp"
 
 #include "acl_door_common.hpp"
@@ -79,9 +80,10 @@ Columns StoredSchema(CatalogBackend &catalog, const string &vcat, const string &
 	auto rows = catalog.Query("SELECT \"name\", \"type\", \"derived\" FROM " + catalog.Tbl("object_columns") +
 	                          " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
 	                          " AND \"kind\" = " + Lit(kind) + " ORDER BY \"pos\"");
+	ResultRows rows_rows(*rows);
 	for (idx_t row = 0; row < rows->RowCount(); row++) {
-		stored.emplace_back(rows->GetValue(0, row).ToString(), Text(rows->GetValue(1, row)));
-		auto flag = rows->GetValue(2, row);
+		stored.emplace_back(rows_rows.GetValue(0, row).ToString(), Text(rows_rows.GetValue(1, row)));
+		auto flag = rows_rows.GetValue(2, row);
 		derived = derived || (!flag.IsNull() && flag.GetValue<bool>());
 	}
 	return stored;
@@ -166,20 +168,22 @@ private:
 	void CheckRelations() {
 		auto rows = Read("SELECT \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"rls_checked\" FROM " +
 		                 catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"vname\"");
+		ResultRows rows_rows(*rows);
 		for (idx_t row = 0; row < rows->RowCount(); row++) {
 			Relation relation;
-			relation.vname = rows->GetValue(0, row).ToString();
-			relation.form = Text(rows->GetValue(1, row));
-			relation.phys = Text(rows->GetValue(2, row));
-			relation.view_sql = Text(rows->GetValue(3, row));
-			auto rls = Text(rows->GetValue(4, row));
-			auto rls_checked = rows->GetValue(5, row);
+			relation.vname = rows_rows.GetValue(0, row).ToString();
+			relation.form = Text(rows_rows.GetValue(1, row));
+			relation.phys = Text(rows_rows.GetValue(2, row));
+			relation.view_sql = Text(rows_rows.GetValue(3, row));
+			auto rls = Text(rows_rows.GetValue(4, row));
+			auto rls_checked = rows_rows.GetValue(5, row);
 			auto declared = Read("SELECT \"name\", \"expr\" FROM " + catalog.Tbl("relation_columns") +
 			                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(relation.vname) +
 			                     " ORDER BY \"pos\"");
+			ResultRows declared_rows(*declared);
 			for (idx_t i = 0; i < declared->RowCount(); i++) {
-				auto name = declared->GetValue(0, i).ToString();
-				auto expr = Text(declared->GetValue(1, i));
+				auto name = declared_rows.GetValue(0, i).ToString();
+				auto expr = Text(declared_rows.GetValue(1, i));
 				relation.declared.emplace_back(name, expr);
 				relation.own[name] = expr;
 				relation.known.push_back(name);
@@ -274,13 +278,14 @@ private:
 	void CheckFunctions() {
 		auto rows = Read("SELECT \"vname\", \"kind\", \"form\", \"target\", \"template\", \"params\" FROM " +
 		                 catalog.Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"vname\", \"kind\"");
+		ResultRows rows_rows(*rows);
 		for (idx_t row = 0; row < rows->RowCount(); row++) {
-			auto vname = rows->GetValue(0, row).ToString();
-			auto kind = Text(rows->GetValue(1, row));
-			auto form = Text(rows->GetValue(2, row));
-			auto target = Text(rows->GetValue(3, row));
-			auto sql = Text(rows->GetValue(4, row));
-			auto params = Text(rows->GetValue(5, row));
+			auto vname = rows_rows.GetValue(0, row).ToString();
+			auto kind = Text(rows_rows.GetValue(1, row));
+			auto form = Text(rows_rows.GetValue(2, row));
+			auto target = Text(rows_rows.GetValue(3, row));
+			auto sql = Text(rows_rows.GetValue(4, row));
+			auto params = Text(rows_rows.GetValue(5, row));
 			bool scalar = kind == "scalar";
 			if (form == "alias") {
 				// the target is a function of this instance: gone with its extension, or renamed
@@ -395,12 +400,13 @@ private:
 		auto objects =
 		    Read("SELECT \"role\", \"vname\", \"caps\", \"rls\", \"columns\", \"rls_checked\" FROM " +
 		         catalog.Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"role\", \"vname\"");
+		ResultRows objects_rows(*objects);
 		for (idx_t row = 0; row < objects->RowCount(); row++) {
-			auto role = objects->GetValue(0, row).ToString();
-			auto vname = objects->GetValue(1, row).ToString();
-			auto caps = Text(objects->GetValue(2, row));
-			auto rls = Text(objects->GetValue(3, row));
-			auto columns = Text(objects->GetValue(4, row));
+			auto role = objects_rows.GetValue(0, row).ToString();
+			auto vname = objects_rows.GetValue(1, row).ToString();
+			auto caps = Text(objects_rows.GetValue(2, row));
+			auto rls = Text(objects_rows.GetValue(3, row));
+			auto columns = Text(objects_rows.GetValue(4, row));
 			auto found = relations.find(vname);
 			if (found == relations.end() || found->second.dead) {
 				continue; // a function's grant, or an object whose own finding says it all
@@ -413,7 +419,7 @@ private:
 				       Lit(caps) + ", " + Lit(rls) + ", " + Lit(columns_text) + ")";
 			};
 			if (!rls.empty()) {
-				JudgePredicate("grant", relation, role, rls, objects->GetValue(5, row),
+				JudgePredicate("grant", relation, role, rls, objects_rows.GetValue(5, row),
 				               regrant(columns) + "  -- with a predicate that binds");
 			}
 			if (!columns.empty()) {
@@ -426,11 +432,12 @@ private:
 		}
 		auto catalogs = Read("SELECT \"role\", \"rls\", \"columns\", \"rls_checked\" FROM " +
 		                     catalog.Tbl("role_catalogs") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"role\"");
+		ResultRows catalogs_rows(*catalogs);
 		for (idx_t row = 0; row < catalogs->RowCount(); row++) {
-			auto role = catalogs->GetValue(0, row).ToString();
-			auto rls = Text(catalogs->GetValue(1, row));
-			auto columns = Text(catalogs->GetValue(2, row));
-			auto rls_checked = catalogs->GetValue(3, row);
+			auto role = catalogs_rows.GetValue(0, row).ToString();
+			auto rls = Text(catalogs_rows.GetValue(1, row));
+			auto columns = Text(catalogs_rows.GetValue(2, row));
+			auto rls_checked = catalogs_rows.GetValue(3, row);
 			auto items = ParseColumnList(columns);
 			case_insensitive_set_t matched;
 			for (auto &entry : relations) {
@@ -478,10 +485,11 @@ private:
 		// in origin (spec 014) - either way, that is the physical schema the check asks about
 		auto rows = Read("SELECT \"path\", \"phys_path\", \"origin\" FROM " + catalog.Tbl("schemas") +
 		                 " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"path\"");
+		ResultRows rows_rows(*rows);
 		for (idx_t row = 0; row < rows->RowCount(); row++) {
-			auto path = rows->GetValue(0, row).ToString();
-			auto origin = Text(rows->GetValue(2, row));
-			auto phys_path = Text(rows->GetValue(1, row));
+			auto path = rows_rows.GetValue(0, row).ToString();
+			auto origin = Text(rows_rows.GetValue(2, row));
+			auto phys_path = Text(rows_rows.GetValue(1, row));
 			if (phys_path.empty()) {
 				phys_path = origin;
 			}
@@ -509,23 +517,26 @@ private:
 			         " AND schema_name = " + Lit(schema) +
 			         " UNION SELECT view_name FROM duckdb_views() WHERE database_name = " + Lit(database) +
 			         " AND schema_name = " + Lit(schema) + " AND NOT internal ORDER BY 1");
+			ResultRows listing_rows(*listing);
 			case_insensitive_set_t source_names;
 			vector<string> unrecorded, gone;
 			auto recorded =
 			    Read("SELECT \"vname\" FROM " + catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 			         " AND \"origin\" = " + Lit(origin) + " AND substr(\"vname\", 1, " +
 			         std::to_string(path.size() + 1) + ") = " + Lit(path + ".") + " ORDER BY 1");
+			ResultRows recorded_rows(*recorded);
 			auto dropped = Read("SELECT \"name\" FROM " + catalog.Tbl("schema_dropped") +
 			                    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"path\" = " + Lit(path));
+			ResultRows dropped_rows(*dropped);
 			case_insensitive_set_t recorded_names, dropped_names;
 			for (idx_t i = 0; i < recorded->RowCount(); i++) {
-				recorded_names.insert(recorded->GetValue(0, i).ToString().substr(path.size() + 1));
+				recorded_names.insert(recorded_rows.GetValue(0, i).ToString().substr(path.size() + 1));
 			}
 			for (idx_t i = 0; i < dropped->RowCount(); i++) {
-				dropped_names.insert(dropped->GetValue(0, i).ToString());
+				dropped_names.insert(dropped_rows.GetValue(0, i).ToString());
 			}
 			for (idx_t i = 0; i < listing->RowCount(); i++) {
-				auto name = listing->GetValue(0, i).ToString();
+				auto name = listing_rows.GetValue(0, i).ToString();
 				source_names.insert(name);
 				if (!recorded_names.count(name) && !dropped_names.count(name)) {
 					unrecorded.push_back(name);
@@ -557,11 +568,12 @@ private:
 	void CheckReferences() {
 		auto rows = Read("SELECT \"name\", \"from_vname\", \"to_vname\", \"to_kind\" FROM " +
 		                 catalog.Tbl("references") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"name\"");
+		ResultRows rows_rows(*rows);
 		for (idx_t row = 0; row < rows->RowCount(); row++) {
-			auto name = rows->GetValue(0, row).ToString();
-			auto from = Text(rows->GetValue(1, row));
-			auto to = Text(rows->GetValue(2, row));
-			auto to_kind = Text(rows->GetValue(3, row));
+			auto name = rows_rows.GetValue(0, row).ToString();
+			auto from = Text(rows_rows.GetValue(1, row));
+			auto to = Text(rows_rows.GetValue(2, row));
+			auto to_kind = Text(rows_rows.GetValue(3, row));
 			auto repair = "DROP VIRTUAL REFERENCE " + Named(name);
 			vector<string> problems;
 			if (relations.find(from) == relations.end()) {
@@ -582,9 +594,10 @@ private:
 			auto columns =
 			    Read("SELECT \"side\", \"column\" FROM " + catalog.Tbl("reference_columns") +
 			         " WHERE \"vcat\" = " + Lit(vcat) + " AND \"name\" = " + Lit(name) + " ORDER BY \"pos\"");
+			ResultRows columns_rows(*columns);
 			for (idx_t i = 0; i < columns->RowCount(); i++) {
-				auto side = columns->GetValue(0, i).ToString();
-				auto column = Text(columns->GetValue(1, i));
+				auto side = columns_rows.GetValue(0, i).ToString();
+				auto column = Text(columns_rows.GetValue(1, i));
 				bool from_side = StringUtil::CIEquals(side, "from");
 				auto end = from_side ? from : to;
 				if (!from_side && to_function) {
@@ -624,11 +637,12 @@ vector<PolicyStore::CatalogFinding> PolicyStore::CatalogCheck(const string &only
 	vector<CatalogFinding> out;
 	auto catalogs = catalog->Query("SELECT \"vcat\" FROM " + catalog->Tbl("catalogs") +
 	                               (only.empty() ? string() : " WHERE \"vcat\" = " + Lit(only)) + " ORDER BY 1");
+	ResultRows catalogs_rows(*catalogs);
 	if (!only.empty() && catalogs->RowCount() == 0) {
 		throw BinderException("acl admin: catalog \"%s\" does not exist", only);
 	}
 	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
-		CatalogChecker checker(*catalog, catalogs->GetValue(0, row).ToString(), out);
+		CatalogChecker checker(*catalog, catalogs_rows.GetValue(0, row).ToString(), out);
 		checker.Run();
 	}
 	return out;
@@ -645,15 +659,16 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 	if (shape->RowCount() == 0) {
 		throw BinderException("acl admin: relation \"%s.%s\" does not exist", vcat, vname);
 	}
-	if (Text(shape->GetValue(0, 0)) == "view") {
+	if (Text(shape->Collection().GetValue(0, 0)) == "view") {
 		throw BinderException("acl admin: \"%s.%s\" is a view - ANALYZE VIRTUAL VIEW re-derives its schema, CREATE OR "
 		                      "REPLACE VIRTUAL VIEW redefines it",
 		                      vcat, vname);
 	}
-	auto phys = Text(shape->GetValue(1, 0));
+	auto phys = Text(shape->Collection().GetValue(1, 0));
 	auto rows =
 	    catalog->Query("SELECT \"name\", \"expr\", \"nullable\" FROM " + catalog->Tbl("relation_columns") +
 	                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+	ResultRows rows_rows(*rows);
 	if (rows->RowCount() == 0) {
 		throw BinderException("acl admin: \"%s.%s\" declares no COLUMNS list - a bare alias reads the source live and "
 		                      "has nothing to repair (declare COLUMNS to give it a shape)",
@@ -662,9 +677,9 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 	Columns columns;
 	case_insensitive_map_t<int8_t> marks;
 	for (idx_t row = 0; row < rows->RowCount(); row++) {
-		auto name = rows->GetValue(0, row).ToString();
-		columns.emplace_back(name, Text(rows->GetValue(1, row)));
-		auto nullable = rows->GetValue(2, row);
+		auto name = rows_rows.GetValue(0, row).ToString();
+		columns.emplace_back(name, Text(rows_rows.GetValue(1, row)));
+		auto nullable = rows_rows.GetValue(2, row);
 		if (!nullable.IsNull()) {
 			marks[name] = nullable.GetValue<bool>() ? 1 : 0;
 		}
@@ -712,6 +727,7 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 		auto grants =
 		    catalog->Query("SELECT \"role\", \"caps\", \"rls\", \"columns\" FROM " + catalog->Tbl("role_object_caps") +
 		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"role\"");
+		ResultRows grants_rows(*grants);
 		struct Affected {
 			string role, caps, rls;
 			Columns items;
@@ -719,8 +735,8 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 		vector<Affected> affected;
 		vector<string> orphaned;
 		for (idx_t row = 0; row < grants->RowCount(); row++) {
-			Affected grant {grants->GetValue(0, row).ToString(), Text(grants->GetValue(1, row)),
-			                Text(grants->GetValue(2, row)), ParseColumnList(Text(grants->GetValue(3, row)))};
+			Affected grant {grants_rows.GetValue(0, row).ToString(), Text(grants_rows.GetValue(1, row)),
+			                Text(grants_rows.GetValue(2, row)), ParseColumnList(Text(grants_rows.GetValue(3, row)))};
 			bool touched = false;
 			for (auto &item : grant.items) {
 				if (!item.second.empty() && missing.count(item.first)) {

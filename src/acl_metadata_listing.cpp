@@ -2,6 +2,7 @@
 // principal's information_schema / duckdb_* / SHOW listings from the policy it is granted, and the
 // acl_* introspection rows an administrator reads. Split from acl_policy_catalog.cpp (plan 4.2).
 
+#include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
 
 namespace duckdb {
@@ -691,6 +692,7 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	}
 	auto table = TABLES.find(listing)->second;
 	auto result = catalog->Query(StringUtil::Replace(entry->second, "%s", catalog->Tbl(table.c_str())));
+	ResultRows result_rows(*result);
 	for (auto &name : result->GetNames()) {
 		out.names.push_back(name.GetIdentifierName());
 	}
@@ -698,7 +700,7 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		vector<Value> values;
 		for (idx_t col = 0; col < result->ColumnCount(); col++) {
-			values.push_back(result->GetValue(col, row));
+			values.push_back(result_rows.GetValue(col, row));
 		}
 		out.rows.push_back(std::move(values));
 	}

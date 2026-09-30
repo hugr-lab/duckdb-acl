@@ -65,11 +65,11 @@ endif()
 # quack needs json + autocomplete (core) and httpfs, which it pins itself; we take duckdb's own pin
 # so everything builds against the commit we track.
 #
-# quack's pin is the duckdb submodule's own (`.github/config/extensions/quack.cmake`): fa3f82c, quack
-# #212 of 2026-09-14, which surfaces error types to the client - duckdb caught up with it in #25978
-# (2026-09-22, the fix of our #25887), so the one-commit lead we carried since 2026-09-17 is gone. It
-# builds with the patches duckdb carries for that pin (APPLY_PATCHES: the TableCatalogEntry columns
-# virtual, a binder include, the Literal API, the unified QueryResult; 0003 touches a test only) - and
+# quack's pin is the duckdb submodule's own (`.github/config/extensions/quack.cmake`): 974927a, quack
+# #278 of 2026-09-29 (CONNECT out of the transaction mechanism, the self-CONNECT guard, duckdb's
+# v2.0-cyanoptera patches applied) - taken with the 2026-09-30 duckdb pin (spec 090). It builds with
+# the patches duckdb carries for that pin (APPLY_PATCHES: the function-signature options; 0001
+# touches a test only) - and
 # the embedded server (third_party/quack) is the same commit, its copies patched the same way by
 # sync.py. The block is ours rather than an include of duckdb's file for two words: DONT_LINK (the
 # client must stay a loadable, or its symbols and the embed's - both define duckdb::QuackServer & co.
@@ -82,7 +82,7 @@ if(DEFINED ENV{ACL_QUACK} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(quack
         DONT_LINK
         GIT_URL https://github.com/duckdb/duckdb-quack
-        GIT_TAG fa3f82c53cf587838d55efbd24f31b0c055684a9
+        GIT_TAG 974927a394b188755284682b73398ed50e86316c
         SUBMODULES extension-ci-tools
         APPLY_PATCHES
     )

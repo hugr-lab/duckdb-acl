@@ -3,6 +3,7 @@
 // write is validated where it is written (acl_catalog_validation.cpp) and lands in one
 // transaction. Split from acl_policy_catalog.cpp (plan 4.2).
 
+#include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_rewriter.hpp"
 
@@ -235,7 +236,7 @@ string NormaliseGrantColumns(CatalogBackend &catalog, const ReadFn &read, const 
 		return columns;
 	}
 	auto text = [&](idx_t column) {
-		auto value = shape->GetValue(column, 0);
+		auto value = shape->Collection().GetValue(column, 0);
 		return value.IsNull() ? string() : value.ToString();
 	};
 	auto form = text(0);
@@ -246,8 +247,9 @@ string NormaliseGrantColumns(CatalogBackend &catalog, const ReadFn &read, const 
 	vector<string> declared;
 	auto rows = read("SELECT \"name\" FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                 " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+	ResultRows rows_rows(*rows);
 	for (idx_t i = 0; i < rows->RowCount(); i++) {
-		declared.push_back(rows->GetValue(0, i).ToString());
+		declared.push_back(rows_rows.GetValue(0, i).ToString());
 	}
 	vector<string> exposed;
 	if (!catalog.ExposedColumns(source, declared, exposed)) {
@@ -299,7 +301,7 @@ void GrantProjectionStatements(CatalogBackend &catalog, const ReadFn &read, cons
 		return;
 	}
 	auto text = [&](idx_t column) {
-		auto value = shape->GetValue(column, 0);
+		auto value = shape->Collection().GetValue(column, 0);
 		return value.IsNull() ? string() : value.ToString();
 	};
 	auto form = text(0);
@@ -311,9 +313,10 @@ void GrantProjectionStatements(CatalogBackend &catalog, const ReadFn &read, cons
 	if (form != "view") {
 		auto rows = read("SELECT \"name\", \"expr\" FROM " + catalog.Tbl("relation_columns") +
 		                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		ResultRows rows_rows(*rows);
 		for (idx_t i = 0; i < rows->RowCount(); i++) {
-			own[rows->GetValue(0, i).ToString()] =
-			    rows->GetValue(1, i).IsNull() ? string() : rows->GetValue(1, i).ToString();
+			own[rows_rows.GetValue(0, i).ToString()] =
+			    rows_rows.GetValue(1, i).IsNull() ? string() : rows_rows.GetValue(1, i).ToString();
 		}
 	}
 	vector<std::pair<string, string>> derived;
@@ -369,8 +372,8 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 		auto existing = read("SELECT \"comment\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname));
 		string comment;
-		if (existing->RowCount() > 0 && !existing->GetValue(0, 0).IsNull()) {
-			comment = existing->GetValue(0, 0).ToString();
+		if (existing->RowCount() > 0 && !existing->Collection().GetValue(0, 0).IsNull()) {
+			comment = existing->Collection().GetValue(0, 0).ToString();
 		}
 		// a replace that states no key keeps the one declared before, exactly as the comment is kept: a
 		// redeclaration is not a reason to lose it. It lapses only when the new shape no longer supports
@@ -380,9 +383,10 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 		if (pk.empty()) {
 			auto keyed = read("SELECT \"column\" FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
 			                  " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation' ORDER BY \"pos\"");
+			ResultRows keyed_rows(*keyed);
 			vector<string> parts;
 			for (idx_t row = 0; row < keyed->RowCount(); row++) {
-				parts.push_back(keyed->GetValue(0, row).ToString());
+				parts.push_back(keyed_rows.GetValue(0, row).ToString());
 			}
 			kept_pk = StringUtil::Join(parts, ", ");
 			pk_carried = !kept_pk.empty();
@@ -470,8 +474,9 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 				throw InvalidInputException("acl: reference \"%s\": \"%s\" is not a table function of \"%s\"", name,
 				                            to_vname, vcat);
 			}
-			if (!found->GetValue(0, 0).IsNull()) {
-				for (auto &parameter : CatalogBackend::ParseDeclaration(found->GetValue(0, 0).ToString())) {
+			if (!found->Collection().GetValue(0, 0).IsNull()) {
+				for (auto &parameter :
+				     CatalogBackend::ParseDeclaration(found->Collection().GetValue(0, 0).ToString())) {
 					if (!parameter.first.empty()) {
 						parameters.push_back(parameter.first);
 					}
@@ -581,7 +586,8 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 				auto known = read("SELECT count(*) FILTER (WHERE \"name\" = " + Lit(column_name) + "), count(*) FROM " +
 				                  catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 				                  " AND \"kind\" = 'table' AND \"vname\" = " + Lit(to_vname));
-				if (known->GetValue(1, 0).GetValue<int64_t>() > 0 && known->GetValue(0, 0).GetValue<int64_t>() == 0) {
+				if (known->Collection().GetValue(1, 0).GetValue<int64_t>() > 0 &&
+				    known->Collection().GetValue(0, 0).GetValue<int64_t>() == 0) {
 					missing();
 				}
 				continue;
@@ -589,8 +595,8 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 			auto declared = read("SELECT count(*) FILTER (WHERE \"name\" = " + Lit(column_name) + "), count(*) FROM " +
 			                     catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 			                     " AND \"vname\" = " + Lit(end));
-			if (declared->GetValue(1, 0).GetValue<int64_t>() > 0) {
-				if (declared->GetValue(0, 0).GetValue<int64_t>() == 0) {
+			if (declared->Collection().GetValue(1, 0).GetValue<int64_t>() > 0) {
+				if (declared->Collection().GetValue(0, 0).GetValue<int64_t>() == 0) {
 					missing();
 				}
 				continue;
@@ -598,18 +604,18 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 			auto probed = read("SELECT count(*) FILTER (WHERE \"name\" = " + Lit(column_name) + "), count(*) FROM " +
 			                   catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 			                   " AND \"kind\" = 'relation' AND \"vname\" = " + Lit(end));
-			if (probed->GetValue(1, 0).GetValue<int64_t>() > 0) {
-				if (probed->GetValue(0, 0).GetValue<int64_t>() == 0) {
+			if (probed->Collection().GetValue(1, 0).GetValue<int64_t>() > 0) {
+				if (probed->Collection().GetValue(0, 0).GetValue<int64_t>() == 0) {
 					missing();
 				}
 				continue;
 			}
 			auto phys = read("SELECT \"phys\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 			                 " AND \"vname\" = " + Lit(end));
-			if (phys->RowCount() == 0 || phys->GetValue(0, 0).IsNull()) {
+			if (phys->RowCount() == 0 || phys->Collection().GetValue(0, 0).IsNull()) {
 				continue;
 			}
-			auto source = phys->GetValue(0, 0).ToString();
+			auto source = phys->Collection().GetValue(0, 0).ToString();
 			if (!catalog->ColumnBinds(source, column_name)) {
 				missing();
 			}
@@ -651,8 +657,8 @@ void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_
 		auto where = " WHERE \"vcat\" = " + Lit(vcat) + " AND \"path\" = " + Lit(alias_path);
 		auto current = read("SELECT \"comment\" FROM " + catalog->Tbl("schemas") + where);
 		string comment = "NULL";
-		if (current->RowCount() > 0 && !current->GetValue(0, 0).IsNull()) {
-			comment = Lit(current->GetValue(0, 0).ToString());
+		if (current->RowCount() > 0 && !current->Collection().GetValue(0, 0).IsNull()) {
+			comment = Lit(current->Collection().GetValue(0, 0).ToString());
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("schemas") + where);
 		statements.push_back("INSERT INTO " + catalog->Tbl("schemas") +
@@ -695,9 +701,10 @@ vector<string> PhysicalObjects(acl_detail::CatalogBackend &catalog, const string
 	                  " AND schema_name = " + Lit(schema) +
 	                  " UNION SELECT view_name FROM duckdb_views() WHERE database_name = " + Lit(database) +
 	                  " AND schema_name = " + Lit(schema) + " AND NOT internal ORDER BY 1");
+	ResultRows listing_rows(*listing);
 	vector<string> names;
 	for (idx_t row = 0; row < listing->RowCount(); row++) {
-		names.push_back(listing->GetValue(0, row).ToString());
+		names.push_back(listing_rows.GetValue(0, row).ToString());
 	}
 	return names;
 }
@@ -805,12 +812,14 @@ void PolicyStore::CatalogRematerializeSchemaCaps(const string &vcat, const strin
 		};
 		auto schemas = read("SELECT \"path\" FROM " + catalog->Tbl("schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                    " AND " + in_subtree("\"path\"") + " ORDER BY length(\"path\")");
+		ResultRows schemas_rows(*schemas);
 		// every explicit grant of the catalog, per role, longest path first: the first ancestor in
 		// that order is the nearest one, which is also what makes an explicit row stop the cascade
 		auto rows = read("SELECT \"role\", \"schema_path\", \"caps\", \"into\", \"virtual_only\" FROM " +
 		                 catalog->Tbl("role_schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                 " AND NOT \"inherited\""
 		                 " ORDER BY \"role\", length(\"schema_path\") DESC");
+		ResultRows rows_rows(*rows);
 		struct SchemaGrant {
 			string path;
 			string caps;
@@ -820,14 +829,14 @@ void PolicyStore::CatalogRematerializeSchemaCaps(const string &vcat, const strin
 		vector<string> roles;
 		case_insensitive_map_t<vector<SchemaGrant>> granted;
 		for (idx_t row = 0; row < rows->RowCount(); row++) {
-			auto role = rows->GetValue(0, row).ToString();
-			auto caps = rows->GetValue(2, row);
-			auto into = rows->GetValue(3, row);
-			auto only = rows->GetValue(4, row);
+			auto role = rows_rows.GetValue(0, row).ToString();
+			auto caps = rows_rows.GetValue(2, row);
+			auto into = rows_rows.GetValue(3, row);
+			auto only = rows_rows.GetValue(4, row);
 			if (!granted.count(role)) {
 				roles.push_back(role);
 			}
-			granted[role].push_back({rows->GetValue(1, row).ToString(), caps.IsNull() ? string() : caps.ToString(),
+			granted[role].push_back({rows_rows.GetValue(1, row).ToString(), caps.IsNull() ? string() : caps.ToString(),
 			                         into.IsNull() ? string() : into.ToString(),
 			                         !only.IsNull() && only.GetValue<bool>()});
 		}
@@ -835,7 +844,7 @@ void PolicyStore::CatalogRematerializeSchemaCaps(const string &vcat, const strin
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"inherited\" AND " + in_subtree("\"schema_path\""));
 		for (idx_t row = 0; row < schemas->RowCount(); row++) {
-			auto schema_path = schemas->GetValue(0, row).ToString();
+			auto schema_path = schemas_rows.GetValue(0, row).ToString();
 			for (auto &role : roles) {
 				for (auto &grant : granted[role]) {
 					if (grant.path == schema_path) {
@@ -893,7 +902,7 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 	if (source->RowCount() == 0) {
 		throw BinderException("acl admin: schema \"%s.%s\" does not exist", vcat, path);
 	}
-	auto origin_value = source->GetValue(0, 0);
+	auto origin_value = source->Collection().GetValue(0, 0);
 	if (origin_value.IsNull()) {
 		throw BinderException("acl admin: schema \"%s.%s\" is a live alias, so it has nothing to refresh - it "
 		                      "already shows what the source holds",
@@ -926,8 +935,9 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 		auto stale = read("SELECT \"vname\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                  " AND \"origin\" = " + Lit(origin) + " AND substr(\"vname\", 1, " +
 		                  std::to_string(path.size() + 1) + ") = " + Lit(path + "."));
+		ResultRows stale_rows(*stale);
 		for (idx_t row = 0; row < stale->RowCount(); row++) {
-			auto vname = stale->GetValue(0, row).ToString();
+			auto vname = stale_rows.GetValue(0, row).ToString();
 			auto name = vname.substr(path.size() + 1);
 			if (std::find(names.begin(), names.end(), name) != names.end()) {
 				continue;
@@ -952,9 +962,10 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 string PolicyStore::ExistingKeyCsv(const string &vcat, const string &vname, const string &kind) {
 	auto rows = catalog->Query("SELECT \"column\" FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                           " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind) + " ORDER BY \"pos\"");
+	ResultRows rows_rows(*rows);
 	vector<string> columns;
 	for (idx_t row = 0; row < rows->RowCount(); row++) {
-		columns.push_back(rows->GetValue(0, row).ToString());
+		columns.push_back(rows_rows.GetValue(0, row).ToString());
 	}
 	return StringUtil::Join(columns, ", ");
 }
@@ -980,8 +991,9 @@ void PolicyStore::CatalogSetKey(const string &vcat, const string &vname, const s
 	auto rows =
 	    catalog->Query("SELECT \"name\" FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                   " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind));
+	ResultRows rows_rows(*rows);
 	for (idx_t row = 0; row < rows->RowCount(); row++) {
-		known.push_back(StringUtil::Lower(rows->GetValue(0, row).ToString()));
+		known.push_back(StringUtil::Lower(rows_rows.GetValue(0, row).ToString()));
 	}
 	// the declared marks and the projection's expressions: an explicitly nullable or a masked column
 	// is refused as a key here exactly as it is where the object is declared (spec 048)
@@ -989,20 +1001,22 @@ void PolicyStore::CatalogSetKey(const string &vcat, const string &vname, const s
 	auto marked = catalog->Query("SELECT \"name\", \"nullable\" FROM " + catalog->Tbl("object_columns") +
 	                             " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
 	                             " AND \"kind\" = " + Lit(kind) + " AND \"nullable\" IS NOT NULL");
+	ResultRows marked_rows(*marked);
 	for (idx_t row = 0; row < marked->RowCount(); row++) {
-		marks[marked->GetValue(0, row).ToString()] = marked->GetValue(1, row).GetValue<bool>() ? 1 : 0;
+		marks[marked_rows.GetValue(0, row).ToString()] = marked_rows.GetValue(1, row).GetValue<bool>() ? 1 : 0;
 	}
 	vector<std::pair<string, string>> masked;
 	if (StringUtil::CIEquals(kind, "relation")) {
 		auto declared =
 		    catalog->Query("SELECT \"name\", \"expr\", \"nullable\" FROM " + catalog->Tbl("relation_columns") +
 		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+		ResultRows declared_rows(*declared);
 		vector<string> projected;
 		for (idx_t row = 0; row < declared->RowCount(); row++) {
-			auto name = declared->GetValue(0, row).ToString();
-			auto expr = declared->GetValue(1, row);
+			auto name = declared_rows.GetValue(0, row).ToString();
+			auto expr = declared_rows.GetValue(1, row);
 			masked.emplace_back(name, expr.IsNull() ? string() : expr.ToString());
-			auto nullable = declared->GetValue(2, row);
+			auto nullable = declared_rows.GetValue(2, row);
 			if (!nullable.IsNull()) {
 				marks[name] = nullable.GetValue<bool>() ? 1 : 0;
 			}
@@ -1017,8 +1031,8 @@ void PolicyStore::CatalogSetKey(const string &vcat, const string &vname, const s
 	if (known.empty() && StringUtil::CIEquals(kind, "relation")) {
 		auto phys_row = catalog->Query("SELECT \"phys\" FROM " + catalog->Tbl("relations") +
 		                               " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
-		if (phys_row->RowCount() > 0 && !phys_row->GetValue(0, 0).IsNull()) {
-			auto phys = phys_row->GetValue(0, 0).ToString();
+		if (phys_row->RowCount() > 0 && !phys_row->Collection().GetValue(0, 0).IsNull()) {
+			auto phys = phys_row->Collection().GetValue(0, 0).ToString();
 			vector<std::pair<string, string>> probed;
 			if (!phys.empty() && catalog->ProbeSchema("SELECT * FROM " + phys, false, {}, probed)) {
 				for (auto &entry : probed) {
@@ -1253,7 +1267,7 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 		// aliasing it
 		auto origin = read("SELECT \"origin\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                   " AND \"vname\" = " + Lit(vname));
-		if (origin->RowCount() > 0 && !origin->GetValue(0, 0).IsNull()) {
+		if (origin->RowCount() > 0 && !origin->Collection().GetValue(0, 0).IsNull()) {
 			auto dot = vname.rfind('.');
 			if (dot != string::npos) {
 				statements.push_back("INSERT OR IGNORE INTO " + catalog->Tbl("schema_dropped") + " VALUES (" +
@@ -1311,10 +1325,11 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 		// a declared schema is never re-derived: it is the admin's statement of fact
 		auto declared = read("SELECT \"vname\", \"kind\" FROM " + catalog->Tbl("object_columns") +
 		                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"derived\" = false" + name_filter);
+		ResultRows declared_rows(*declared);
 		case_insensitive_set_t declared_keys;
 		for (idx_t row = 0; row < declared->RowCount(); row++) {
-			declared_keys.insert(declared->GetValue(0, row).ToString() + "\x1f" +
-			                     declared->GetValue(1, row).ToString());
+			declared_keys.insert(declared_rows.GetValue(0, row).ToString() + "\x1f" +
+			                     declared_rows.GetValue(1, row).ToString());
 		}
 		// What a re-derivation must not lose: the declared nullability marks (spec 048) and the
 		// column comments (spec 010) ride in object_columns beside the derived schema, and the schema
@@ -1325,14 +1340,15 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 			auto kept = read("SELECT \"name\", \"nullable\", \"comment\" FROM " + catalog->Tbl("object_columns") +
 			                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(object) + " AND \"kind\" = " +
 			                 Lit(kind) + " AND (\"nullable\" IS NOT NULL OR \"comment\" IS NOT NULL)");
+			ResultRows kept_rows(*kept);
 			vector<std::pair<string, string>> comments;
 			for (idx_t i = 0; i < kept->RowCount(); i++) {
-				auto name = kept->GetValue(0, i).ToString();
-				auto nullable = kept->GetValue(1, i);
+				auto name = kept_rows.GetValue(0, i).ToString();
+				auto nullable = kept_rows.GetValue(1, i);
 				if (!nullable.IsNull() && marks.find(name) == marks.end()) {
 					marks[name] = nullable.GetValue<bool>() ? 1 : 0;
 				}
-				auto comment = kept->GetValue(2, i);
+				auto comment = kept_rows.GetValue(2, i);
 				if (!comment.IsNull()) {
 					comments.emplace_back(name, comment.ToString());
 				}
@@ -1351,12 +1367,13 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 		// only query-defined objects have a derived schema; an alias reads the physical catalog live
 		auto views = read("SELECT \"vname\", \"view_sql\" FROM " + catalog->Tbl("relations") +
 		                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"form\" = 'view'" + name_filter);
+		ResultRows views_rows(*views);
 		for (idx_t row = 0; row < views->RowCount(); row++) {
-			auto object = views->GetValue(0, row).ToString();
+			auto object = views_rows.GetValue(0, row).ToString();
 			if (declared_keys.count(object + "\x1frelation")) {
 				continue;
 			}
-			auto sql = views->GetValue(1, row);
+			auto sql = views_rows.GetValue(1, row);
 			vector<std::pair<string, string>> schema;
 			bool derived = !sql.IsNull() && catalog->ProbeSchema(sql.ToString(), false, {}, schema);
 			rederive(object, "relation", schema, derived, {});
@@ -1370,26 +1387,28 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 		    " AND r.\"form\" IN ('alias', 'subquery')" + " AND r.\"phys\" IS NOT NULL AND EXISTS (SELECT 1 FROM " +
 		    catalog->Tbl("relation_columns") + " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\")" +
 		    (vname.empty() ? string() : " AND r.\"vname\" = " + Lit(vname)));
+		ResultRows projections_rows(*projections);
 		for (idx_t row = 0; row < projections->RowCount(); row++) {
-			auto object = projections->GetValue(0, row).ToString();
+			auto object = projections_rows.GetValue(0, row).ToString();
 			if (declared_keys.count(object + "\x1frelation")) {
 				continue;
 			}
-			auto phys = projections->GetValue(1, row).ToString();
+			auto phys = projections_rows.GetValue(1, row).ToString();
 			auto columns =
 			    read("SELECT \"name\", \"expr\", \"nullable\" FROM " + catalog->Tbl("relation_columns") +
 			         " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(object) + " ORDER BY \"pos\"");
+			ResultRows columns_rows(*columns);
 			vector<string> items;
 			vector<std::pair<string, string>> names_only;
 			case_insensitive_map_t<int8_t> marks;
 			for (idx_t i = 0; i < columns->RowCount(); i++) {
-				auto name = columns->GetValue(0, i).ToString();
-				auto expr = columns->GetValue(1, i);
+				auto name = columns_rows.GetValue(0, i).ToString();
+				auto expr = columns_rows.GetValue(1, i);
 				items.push_back(expr.IsNull() || expr.ToString().empty()
 				                    ? acl_detail::Ident(name)
 				                    : expr.ToString() + " AS " + acl_detail::Ident(name));
 				names_only.emplace_back(name, string());
-				auto nullable = columns->GetValue(2, i);
+				auto nullable = columns_rows.GetValue(2, i);
 				if (!nullable.IsNull()) {
 					marks[name] = nullable.GetValue<bool>() ? 1 : 0;
 				}
@@ -1401,14 +1420,15 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 		}
 		auto macros = read("SELECT \"vname\", \"kind\", \"template\", \"params\" FROM " + catalog->Tbl("functions") +
 		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"form\" = 'macro'" + name_filter);
+		ResultRows macros_rows(*macros);
 		for (idx_t row = 0; row < macros->RowCount(); row++) {
-			auto object = macros->GetValue(0, row).ToString();
-			auto kind = macros->GetValue(1, row).ToString();
+			auto object = macros_rows.GetValue(0, row).ToString();
+			auto kind = macros_rows.GetValue(1, row).ToString();
 			if (declared_keys.count(object + "\x1f" + kind)) {
 				continue;
 			}
-			auto sql = macros->GetValue(2, row);
-			auto params = macros->GetValue(3, row);
+			auto sql = macros_rows.GetValue(2, row);
+			auto params = macros_rows.GetValue(3, row);
 			vector<std::pair<string, string>> schema;
 			bool derived = !sql.IsNull() &&
 			               catalog->ProbeSchema(
@@ -1422,10 +1442,11 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 		// the physical world is looked at again.
 		auto shapes = read("SELECT \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\" FROM " +
 		                   catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) + name_filter);
+		ResultRows shapes_rows(*shapes);
 		case_insensitive_map_t<string> sources;
 		for (idx_t row = 0; row < shapes->RowCount(); row++) {
 			auto text = [&](idx_t column) {
-				auto value = shapes->GetValue(column, row);
+				auto value = shapes_rows.GetValue(column, row);
 				return value.IsNull() ? string() : value.ToString();
 			};
 			auto object = text(0);
@@ -1447,9 +1468,10 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 		}
 		auto grants = read("SELECT \"role\", \"vname\", \"rls\", \"columns\" FROM " + catalog->Tbl("role_object_caps") +
 		                   " WHERE \"vcat\" = " + Lit(vcat) + name_filter);
+		ResultRows grants_rows(*grants);
 		for (idx_t row = 0; row < grants->RowCount(); row++) {
 			auto text = [&](idx_t column) {
-				auto value = grants->GetValue(column, row);
+				auto value = grants_rows.GetValue(column, row);
 				return value.IsNull() ? string() : value.ToString();
 			};
 			auto role = text(0);
@@ -1479,9 +1501,10 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 		if (vname.empty()) {
 			auto catalog_grants = read("SELECT \"role\", \"rls\" FROM " + catalog->Tbl("role_catalogs") +
 			                           " WHERE \"vcat\" = " + Lit(vcat) + " AND \"rls\" IS NOT NULL AND \"rls\" <> ''");
+			ResultRows catalog_grants_rows(*catalog_grants);
 			for (idx_t row = 0; row < catalog_grants->RowCount(); row++) {
-				auto role = catalog_grants->GetValue(0, row).ToString();
-				auto rls = catalog_grants->GetValue(1, row).ToString();
+				auto role = catalog_grants_rows.GetValue(0, row).ToString();
+				auto rls = catalog_grants_rows.GetValue(1, row).ToString();
 				statements.push_back("UPDATE " + catalog->Tbl("role_catalogs") + " SET \"rls_checked\" = " +
 				                     (catalog->CatalogPredicateChecked(read, vcat, rls) ? "true" : "false") +
 				                     " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat));
@@ -1501,10 +1524,11 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 		}
 		auto holders = read("SELECT \"role\" FROM " + catalog->Tbl("role_catalogs") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                    " ORDER BY \"role\"");
+		ResultRows holders_rows(*holders);
 		if (holders->RowCount() > 0 && !cascade) {
 			vector<string> roles;
 			for (idx_t row = 0; row < holders->RowCount(); row++) {
-				roles.push_back(holders->GetValue(0, row).ToString());
+				roles.push_back(holders_rows.GetValue(0, row).ToString());
 			}
 			throw BinderException("acl admin: catalog \"%s\" is still granted to %s - repeat with CASCADE to "
 			                      "drop those grants too",
@@ -1538,7 +1562,7 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 		auto records = read("SELECT (SELECT count(*) FROM " + catalog->Tbl("relations") +
 		                    " WHERE \"vcat\" = " + Lit(vcat) + prefix + ") + (SELECT count(*) FROM " +
 		                    catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) + prefix + ")");
-		auto count = records->GetValue(0, 0).GetValue<int64_t>();
+		auto count = records->Collection().GetValue(0, 0).GetValue<int64_t>();
 		if (count > 0 && !cascade) {
 			throw BinderException("acl admin: schema \"%s.%s\" still holds %lld object(s) - repeat with CASCADE to "
 			                      "drop them too",
@@ -1827,7 +1851,7 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		if (current->RowCount() == 0) {
 			throw BinderException("acl admin: relation \"%s.%s\" does not exist", vcat, vname);
 		}
-		auto form = current->GetValue(0, 0).ToString();
+		auto form = current->Collection().GetValue(0, 0).ToString();
 		// the statement kind must match what the object is: silently turning a masked/RLS table into
 		// a view (or vice versa) would drop enforcement while the catalog still shows it
 		bool target_is_view = form == "view";
@@ -1835,9 +1859,9 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 			throw BinderException("acl admin: \"%s.%s\" is %s - use ALTER VIRTUAL %s", vcat, vname,
 			                      target_is_view ? "a view" : "a table", target_is_view ? "VIEW" : "TABLE");
 		}
-		auto phys = current->GetValue(1, 0);
-		auto view_sql = current->GetValue(2, 0);
-		auto rls = current->GetValue(3, 0);
+		auto phys = current->Collection().GetValue(1, 0);
+		auto view_sql = current->Collection().GetValue(2, 0);
+		auto rls = current->Collection().GetValue(3, 0);
 		string new_phys = phys.IsNull() ? string() : phys.ToString();
 		string new_view = view_sql.IsNull() ? string() : view_sql.ToString();
 		string new_rls = rls.IsNull() ? string() : rls.ToString();
@@ -1848,11 +1872,12 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		} else { // keep the current projection - and its nullability marks - when another property is set
 			auto rows = read("SELECT \"name\", \"expr\", \"nullable\" FROM " + catalog->Tbl("relation_columns") +
 			                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+			ResultRows rows_rows(*rows);
 			for (idx_t row = 0; row < rows->RowCount(); row++) {
-				auto expr = rows->GetValue(1, row);
-				auto name = rows->GetValue(0, row).ToString();
+				auto expr = rows_rows.GetValue(1, row);
+				auto name = rows_rows.GetValue(0, row).ToString();
 				new_columns.emplace_back(name, expr.IsNull() ? string() : expr.ToString());
-				auto nullable = rows->GetValue(2, row);
+				auto nullable = rows_rows.GetValue(2, row);
 				if (!nullable.IsNull()) {
 					kept_marks[name] = nullable.GetValue<bool>() ? 1 : 0;
 				}
@@ -1862,10 +1887,11 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 			auto declared = read("SELECT \"name\", \"nullable\" FROM " + catalog->Tbl("object_columns") +
 			                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
 			                     " AND \"kind\" = 'relation' AND \"nullable\" IS NOT NULL");
+			ResultRows declared_rows(*declared);
 			for (idx_t row = 0; row < declared->RowCount(); row++) {
-				auto name = declared->GetValue(0, row).ToString();
+				auto name = declared_rows.GetValue(0, row).ToString();
 				if (kept_marks.find(name) == kept_marks.end()) {
-					kept_marks[name] = declared->GetValue(1, row).GetValue<bool>() ? 1 : 0;
+					kept_marks[name] = declared_rows.GetValue(1, row).GetValue<bool>() ? 1 : 0;
 				}
 			}
 		}
@@ -1888,14 +1914,14 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
 		string comment, origin;
 		if (stored->RowCount() > 0) {
-			if (!stored->GetValue(0, 0).IsNull()) {
-				comment = stored->GetValue(0, 0).ToString();
+			if (!stored->Collection().GetValue(0, 0).IsNull()) {
+				comment = stored->Collection().GetValue(0, 0).ToString();
 			}
 			// editing a record an expansion produced does not take it out of the expansion: REFRESH
 			// still leaves it alone (it never rewrites), and PRUNE still removes it if its source is
 			// gone - which is right, because it would then point at nothing
-			if (!stored->GetValue(1, 0).IsNull()) {
-				origin = stored->GetValue(1, 0).ToString();
+			if (!stored->Collection().GetValue(1, 0).IsNull()) {
+				origin = stored->Collection().GetValue(1, 0).ToString();
 			}
 		}
 		// ALTER keeps the stored schema policy: a declared result is re-declared explicitly, not here
@@ -1904,9 +1930,10 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		{
 			auto key_rows = read("SELECT \"column\" FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
 			                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation' ORDER BY \"pos\"");
+			ResultRows key_rows_rows(*key_rows);
 			vector<string> parts;
 			for (idx_t key_row = 0; key_row < key_rows->RowCount(); key_row++) {
-				parts.push_back(key_rows->GetValue(0, key_row).ToString());
+				parts.push_back(key_rows_rows.GetValue(0, key_row).ToString());
 			}
 			kept_pk = StringUtil::Join(parts, ", ");
 		}
@@ -1939,8 +1966,9 @@ void PolicyStore::CatalogAlterFunction(const string &vcat, const string &vname, 
 	auto declared = catalog->Query("SELECT \"name\", \"nullable\" FROM " + catalog->Tbl("object_columns") +
 	                               " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
 	                               " AND \"kind\" = " + Lit(kind) + " AND \"nullable\" IS NOT NULL");
+	ResultRows declared_rows(*declared);
 	for (idx_t row = 0; row < declared->RowCount(); row++) {
-		marks[declared->GetValue(0, row).ToString()] = declared->GetValue(1, row).GetValue<bool>() ? 1 : 0;
+		marks[declared_rows.GetValue(0, row).ToString()] = declared_rows.GetValue(1, row).GetValue<bool>() ? 1 : 0;
 	}
 	CatalogAddFunction(vcat, vname, kind, form, is_alias ? definition : "", is_alias ? "" : definition, "", "", pk,
 	                   marks, true);
@@ -1967,10 +1995,10 @@ void PolicyStore::CatalogAlterGrant(const string &role, const string &vcat, cons
 	               "SELECT \"is_main\", \"caps\", \"rls\", \"columns\" FROM " + catalog->Tbl("role_catalogs") +
 	                   " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat),
 	               "grant of catalog \"" + vcat + "\" to role \"" + role + "\"");
-	auto is_main_value = current->GetValue(0, 0);
+	auto is_main_value = current->Collection().GetValue(0, 0);
 	bool is_main = !is_main_value.IsNull() && is_main_value.GetValue<bool>();
 	auto text = [&](idx_t column) {
-		auto stored = current->GetValue(column, 0);
+		auto stored = current->Collection().GetValue(column, 0);
 		return stored.IsNull() ? string() : stored.ToString();
 	};
 	string caps = text(1); // NULL stays unspecified rather than becoming an explicit "{}"
@@ -2063,9 +2091,10 @@ void PolicyStore::CatalogRevokeAdmin(const string &role) {
 	// per-catalog manage capabilities, which live in the catalog grants
 	auto grants = catalog->Query("SELECT \"vcat\", \"caps\" FROM " + catalog->Tbl("role_catalogs") +
 	                             " WHERE \"role\" = " + Lit(role));
+	ResultRows grants_rows(*grants);
 	vector<string> statements = {"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role)};
 	for (idx_t row = 0; row < grants->RowCount(); row++) {
-		auto caps_value = grants->GetValue(1, row);
+		auto caps_value = grants_rows.GetValue(1, row);
 		auto caps = acl_detail::ParseCaps(caps_value.IsNull() ? string() : caps_value.ToString());
 		if (!caps.erase("manage")) {
 			continue;
@@ -2076,7 +2105,7 @@ void PolicyStore::CatalogRevokeAdmin(const string &role) {
 		}
 		statements.push_back("UPDATE " + catalog->Tbl("role_catalogs") + " SET \"caps\" = " +
 		                     Lit("{" + StringUtil::Join(kept, ", ") + "}") + " WHERE \"role\" = " + Lit(role) +
-		                     " AND \"vcat\" = " + Lit(grants->GetValue(0, row).ToString()));
+		                     " AND \"vcat\" = " + Lit(grants_rows.GetValue(0, row).ToString()));
 	}
 	catalog->Write(statements);
 }
@@ -2159,9 +2188,13 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 			auto shape = read("SELECT \"form\", \"phys\", \"view_sql\" FROM " + catalog->Tbl("relations") +
 			                  " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
 			if (shape->RowCount() > 0) {
-				auto form = shape->GetValue(0, 0).IsNull() ? string() : shape->GetValue(0, 0).ToString();
-				auto phys = shape->GetValue(1, 0).IsNull() ? string() : shape->GetValue(1, 0).ToString();
-				auto view_sql = shape->GetValue(2, 0).IsNull() ? string() : shape->GetValue(2, 0).ToString();
+				auto form = shape->Collection().GetValue(0, 0).IsNull() ? string()
+				                                                        : shape->Collection().GetValue(0, 0).ToString();
+				auto phys = shape->Collection().GetValue(1, 0).IsNull() ? string()
+				                                                        : shape->Collection().GetValue(1, 0).ToString();
+				auto view_sql = shape->Collection().GetValue(2, 0).IsNull()
+				                    ? string()
+				                    : shape->Collection().GetValue(2, 0).ToString();
 				auto source = form == "view" ? "(" + view_sql + ")" : phys;
 				auto error = catalog->PredicateError(source, rls, &checked);
 				if (!error.empty()) {
@@ -2226,12 +2259,13 @@ void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vn
 	    " UNION ALL SELECT CASE WHEN \"path\" = " + Lit(vname) + " THEN 'alias' ELSE 'relation' END FROM " +
 	    catalog->Tbl("schemas") + " WHERE \"vcat\" = " + Lit(vcat) + " AND (\"path\" = " + Lit(vname) + " OR substr(" +
 	    Lit(vname) + ", 1, length(\"path\") + 1) = \"path\" || '.')");
+	ResultRows result_rows(*result);
 	if (result->RowCount() == 0) {
 		throw BinderException("acl admin: object \"%s.%s\" does not exist", vcat, vname);
 	}
 	case_insensitive_set_t kinds;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
-		kinds.insert(result->GetValue(0, row).ToString());
+		kinds.insert(result_rows.GetValue(0, row).ToString());
 	}
 	if (kinds.count("relation") || kinds.count("table")) {
 		return; // rows to narrow, and capabilities that resolution will find
