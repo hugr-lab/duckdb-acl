@@ -818,6 +818,13 @@ bool BasicFromHeaders(const flight::ServerCallContext &context, string &user, st
 			return false;
 		}
 		auto encoded = value.substr(strlen(BASIC));
+		// spec 089: arrow-go (so ADBC's Go and Python drivers) encodes without the `=` padding
+		// (RawStdEncoding), which duckdb's decoder refuses - restore it; a length that is 1 mod 4 is no
+		// base64 either way
+		if (encoded.size() % 4 == 1) {
+			return false;
+		}
+		encoded.append((4 - encoded.size() % 4) % 4, '=');
 		string decoded;
 		try {
 			string_t blob(encoded.c_str(), NumericCast<uint32_t>(encoded.size()));

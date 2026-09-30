@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """A fake OIDC IdP for the auth e2e (spec 064): discovery + a password grant.
 
-Answers /.well-known/openid-configuration and /token. alice/wonder earns an HS256
+Answers /.well-known/openid-configuration and /token. alice/wonder (and bob/builder, whose
+'bob:builder' is 11 bytes: base64 with padding, spec 089) earns an HS256
 token signed with the same oct key the door's issuer trusts; a wrong password is
 invalid_grant; the user 'noropc' models an IdP that has the password flow off
 (unsupported_grant_type). Stdlib only - the point is that nothing here shares
@@ -72,8 +73,8 @@ class Handler(BaseHTTPRequestHandler):
         elif user == "noropc":
             # the IdP with ROPC switched off: the door must surface exactly this refusal
             self._json(400, {"error": "unsupported_grant_type"})
-        elif user == "alice" and password == "wonder":
-            self._json(200, {"access_token": mint("alice"), "token_type": "Bearer", "expires_in": 3600})
+        elif (user, password) in (("alice", "wonder"), ("bob", "builder")):
+            self._json(200, {"access_token": mint(user), "token_type": "Bearer", "expires_in": 3600})
         else:
             self._json(400, {"error": "invalid_grant"})
 

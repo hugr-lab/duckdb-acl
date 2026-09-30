@@ -121,6 +121,11 @@ echo "SET GLOBAL acl_metrics_endpoint = false;" >&3
 got="$(ask "$URI" password alice wonder "SELECT count(*) AS n FROM orders" --tls-roots "$TMP/cert.pem")"
 echo "$got" | grep -q "'n': \[3\]" || fail "the password handshake did not read the tenant's slice: $got"
 
+# spec 089: arrow-go (ADBC's Go and Python drivers) sends the Basic value without '=' padding;
+# 'bob:builder' is 11 bytes, so its padded form ends in '=' and the unpadded one is what the door gets
+got="$(ask "$URI" password-raw bob builder "SELECT count(*) AS n FROM orders" --tls-roots "$TMP/cert.pem")"
+echo "$got" | grep -q "'n': \[3\]" || fail "an unpadded BasicAuth (arrow-go's encoding) earned no bearer: $got"
+
 # a wrong password is the IdP's refusal, surfaced - not a mystery timeout, not a success
 got="$(ask "$URI" password alice nope "SELECT 1" --tls-roots "$TMP/cert.pem")"
 case "$got" in *"refused the password grant"*) ;; *) fail "a wrong password was not refused with the IdP's answer: $got";; esac
