@@ -294,7 +294,8 @@ The Handshake RPC answers two pre-auth questions unauthenticated:
   password grant, run by the node against each issuer that carries a `CLIENT ID`, in listing order.
   The IdP's access token is verified offline exactly like any bearer and handed back in the response
   header `authorization: Bearer <token>` - where stock JDBC, ADBC and pyarrow's
-  `authenticate_basic_token` read it. The password is used once, neither logged nor stored. Refusals
+  `authenticate_basic_token` read it. The base64 may come with or without its `=` padding (spec 089:
+  arrow-go, under ADBC's Go and Python drivers, sends none). The password is used once, neither logged nor stored. Refusals
   are named: *"the password handshake needs a TLS door (acl_flight_serve with a certificate) -
   refused over cleartext"*, *"no issuer here carries a CLIENT ID, so the door cannot run the password
   grant - authenticate with a bearer token instead"*, *"OIDC discovery against X failed: ..."*, *"the
