@@ -127,9 +127,9 @@ string StringOf(yyjson_val *value, const char *key) {
 
 const char *OpName(ClaimCondition::Op op) {
 	switch (op) {
-	case ClaimCondition::Op::EQ:
+	case ClaimCondition::Op::EQUALS:
 		return "eq";
-	case ClaimCondition::Op::IN:
+	case ClaimCondition::Op::ONE_OF:
 		return "in";
 	case ClaimCondition::Op::CONTAINS:
 		return "contains";
@@ -140,10 +140,10 @@ const char *OpName(ClaimCondition::Op op) {
 
 ClaimCondition::Op ParseOp(const string &name) {
 	if (StringUtil::CIEquals(name, "eq") || name == "=") {
-		return ClaimCondition::Op::EQ;
+		return ClaimCondition::Op::EQUALS;
 	}
 	if (StringUtil::CIEquals(name, "in")) {
-		return ClaimCondition::Op::IN;
+		return ClaimCondition::Op::ONE_OF;
 	}
 	if (StringUtil::CIEquals(name, "contains")) {
 		return ClaimCondition::Op::CONTAINS;
@@ -175,7 +175,7 @@ vector<ClaimCondition> ConditionsOf(yyjson_val *value) {
 		if (condition.path.empty() || condition.values.empty()) {
 			Bad("a REQUIRE condition names a claim path and at least one value");
 		}
-		if (condition.op != ClaimCondition::Op::IN && condition.values.size() != 1) {
+		if (condition.op != ClaimCondition::Op::ONE_OF && condition.values.size() != 1) {
 			Bad("only IN compares a claim against a list - =, contains and LIKE take one value");
 		}
 		out.push_back(std::move(condition));
@@ -630,10 +630,10 @@ bool ClientAccepts(const IdentityClient &client, const vector<string> &audiences
 		auto values = claims.Strings(condition.path);
 		bool holds = false;
 		switch (condition.op) {
-		case ClaimCondition::Op::EQ:
+		case ClaimCondition::Op::EQUALS:
 			holds = values.size() == 1 && values[0] == condition.values[0];
 			break;
-		case ClaimCondition::Op::IN:
+		case ClaimCondition::Op::ONE_OF:
 			holds = values.size() == 1 && Contains(condition.values, values[0]);
 			break;
 		case ClaimCondition::Op::CONTAINS:

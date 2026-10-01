@@ -23,9 +23,9 @@ struct IdentityIssuer {
 
 //! One condition of a client's REQUIRE: all of a client's must hold
 struct ClaimCondition {
-	enum class Op : uint8_t { EQ, IN, CONTAINS, LIKE };
+	enum class Op : uint8_t { EQUALS, ONE_OF, CONTAINS, LIKE }; // not EQ/IN: windows.h defines IN
 	string path;
-	Op op = Op::EQ;
+	Op op = Op::EQUALS;
 	vector<string> values; // EQ / CONTAINS / LIKE: one; IN: the list
 };
 

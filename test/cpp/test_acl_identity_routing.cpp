@@ -111,13 +111,13 @@ void Acceptance() {
 	Check(!acl::ClientAccepts(client, {"api://x"}, claims, "JWT", why), "azp outside the list");
 	client.azp = {"other", "app"};
 	Check(acl::ClientAccepts(client, {"api://x"}, claims, "JWT", why), "azp in the list");
-	client.conditions = {{"tid", ClaimCondition::Op::IN, {"t1", "t2"}},
+	client.conditions = {{"tid", ClaimCondition::Op::ONE_OF, {"t1", "t2"}},
 	                     {"groups", ClaimCondition::Op::CONTAINS, {"admin"}},
 	                     {"sub", ClaimCondition::Op::LIKE, {"svc-%"}},
-	                     {"nested.k", ClaimCondition::Op::EQ, {"v"}},
-	                     {"https://claims/tenant", ClaimCondition::Op::EQ, {"acme"}}};
+	                     {"nested.k", ClaimCondition::Op::EQUALS, {"v"}},
+	                     {"https://claims/tenant", ClaimCondition::Op::EQUALS, {"acme"}}};
 	Check(acl::ClientAccepts(client, {"api://x"}, claims, "JWT", why), "every condition holds: " + why);
-	client.conditions.push_back({"groups", ClaimCondition::Op::EQ, {"staff"}});
+	client.conditions.push_back({"groups", ClaimCondition::Op::EQUALS, {"staff"}});
 	Check(!acl::ClientAccepts(client, {"api://x"}, claims, "JWT", why),
 	      "= on an array claim does not hold (it is not one value): " + why);
 	client.conditions.pop_back();
@@ -207,9 +207,9 @@ void StoredShapes() {
 	Check(legacy.size() == 2 && legacy[0].name == "tenant" && legacy[0].paths[0] == "tid", "a v16 claim map");
 	auto attributes = acl::ParseStoredAttributes(acl::StoredAttributes(legacy));
 	Check(attributes.size() == 2 && attributes[1].name == "user_id", "attributes round trip");
-	vector<ClaimCondition> conditions {{"tid", ClaimCondition::Op::IN, {"a", "b"}}};
+	vector<ClaimCondition> conditions {{"tid", ClaimCondition::Op::ONE_OF, {"a", "b"}}};
 	auto back = acl::ParseStoredConditions(acl::StoredConditions(conditions));
-	Check(back.size() == 1 && back[0].op == ClaimCondition::Op::IN && back[0].values.size() == 2, "conditions");
+	Check(back.size() == 1 && back[0].op == ClaimCondition::Op::ONE_OF && back[0].values.size() == 2, "conditions");
 }
 
 IdentityCheckContext NoSecrets() {
@@ -259,8 +259,8 @@ void Writes() {
 	overlap.clients[1].azp = {"app-b", "app-a"};
 	Refuses(overlap, context, "would accept the same tokens");
 	overlap.clients[1].azp.clear();
-	overlap.clients[1].conditions = {{"sub", ClaimCondition::Op::EQ, {"x"}}};
-	overlap.clients[0].conditions = {{"tid", ClaimCondition::Op::EQ, {"y"}}};
+	overlap.clients[1].conditions = {{"sub", ClaimCondition::Op::EQUALS, {"x"}}};
+	overlap.clients[0].conditions = {{"tid", ClaimCondition::Op::EQUALS, {"y"}}};
 	acl::ValidateIdentity(overlap, context);
 	Check(true, "REQUIRE is judged at use, not at write");
 
