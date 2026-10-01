@@ -492,3 +492,39 @@ statement error
 ACL ADMIN DROP RESOURCE GROUP etl;
 ----
 <REGEX>:.*resource group "etl" has cluster profile items \(setting threads, source etl_src\) - remove them.*
+
+# --- a re-authentication takes no second seat (the node's cap as the group's) ---------------------------
+
+statement ok
+SET GLOBAL acl_node_group = '';
+
+statement ok
+SELECT acl_session_sweep();
+
+query I
+SELECT acl_session_count();
+----
+7
+
+statement ok
+SET GLOBAL acl_max_sessions = 7;
+
+# conn-analyst authenticates again: its new session replaces its own, so the full node admits it...
+query I
+SELECT acl_quack_authenticate('conn-analyst', 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJhbmFseXN0Il19.RPD7WZXscyjtSETOfilmFNkrBXqC0P_SMLTmWOzAPxKydzv6BEnQud-W60LY1mixyyZvFI_-DjznCAWOZvm5C5wZR64ynr6RkbZxinJwWXWS6-NmTX4BANU7PFwTF9nSAESaMdbxJ-F_hpeAtnUikd_Hd1m5f6QhLjT4rRgotxRenvsxJmKSqNSqeLNlKXPz_-ZXOB-5vfxD_Vp4yxN9x9HMGGV7OTo1ZHJcZGSE0ZP6O6ZE5FIbiuUJ7nEJCD1Szcjqdeol8Y3ihnFgPeQUGq4vcZ_ETviwVJCr9awk0klK5fhGCys2wCaPA4W0b5tPwGzPJl5Orq_PkXcH8skW5g', 'ignored');
+----
+true
+
+query I
+SELECT acl_session_count();
+----
+7
+
+# ...and a new connection is still refused at the cap
+query I
+SELECT acl_quack_authenticate('conn-new', 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJhbmFseXN0Il19.RPD7WZXscyjtSETOfilmFNkrBXqC0P_SMLTmWOzAPxKydzv6BEnQud-W60LY1mixyyZvFI_-DjznCAWOZvm5C5wZR64ynr6RkbZxinJwWXWS6-NmTX4BANU7PFwTF9nSAESaMdbxJ-F_hpeAtnUikd_Hd1m5f6QhLjT4rRgotxRenvsxJmKSqNSqeLNlKXPz_-ZXOB-5vfxD_Vp4yxN9x9HMGGV7OTo1ZHJcZGSE0ZP6O6ZE5FIbiuUJ7nEJCD1Szcjqdeol8Y3ihnFgPeQUGq4vcZ_ETviwVJCr9awk0klK5fhGCys2wCaPA4W0b5tPwGzPJl5Orq_PkXcH8skW5g', 'ignored');
+----
+false
+
+statement ok
+SET GLOBAL acl_max_sessions = 1000;

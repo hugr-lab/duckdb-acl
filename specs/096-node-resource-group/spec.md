@@ -186,6 +186,20 @@ itself. It holds no policy of its own; the node's refusal (§2) is the backstop 
 - **A refusal names groups**, which the load report already shows to its readers; nothing else about
   the principal is in the door's answer.
 
+## Fixed alongside: a refused swap ends nothing
+
+A Flight client that presents another principal's token on its durable session (spec 050) swaps
+sessions. The door used to close the old one and then open the new one, so anything that refused the
+new one - placement, both caps, a policy source down; only a drain was checked before the close -
+left the client with neither. The swap now opens first (`SessionOpen(…, replacing)`, as quack's
+re-authentication always did) and only an opened session ends the old one (`SessionBind`, then the
+old connection is dropped); a refusal leaves the old principal's session working until it leaves by
+itself, as a drain always did. The session being replaced holds no seat against `acl_max_sessions`
+either (it already held none against its group's `max_sessions`), so a re-authentication on a full
+node is not refused. Tests: `test/e2e/flight/run.sh` (a refused swap on a grouped node, then the old
+principal's statement on the same cookie), `acl_node_group.test` (a quack re-authentication at the
+node's cap is admitted, a new connection refused).
+
 ## Known limitations
 
 - **Two defaults under a race on a READ COMMITTED backend.** "At most one default" is checked inside the
@@ -193,9 +207,6 @@ itself. It holds no policy of its own; the node's refusal (§2) is the backstop 
   runs REPEATABLE READ); MySQL / SQL Server under read committed could commit two concurrent `SET
   DEFAULT`s on different groups - the same exposure every check-then-write path of the catalog has.
   Placement then takes the first by name; `acl_resource_groups()` shows both.
-- **A Flight session swap is not undone.** A client that presents a new token on a durable session
-  (spec 050) has the old one closed before the new one is opened; if placement refuses the new one,
-  the client has neither and retries elsewhere - which is what `UNAVAILABLE` tells it to do.
 - **Mid-rollout limits.** A v17 build reads a v18 catalog (the window) but knows no default group: it
   serves ungrouped principals without the default group's limits, while v18 nodes apply them. A v17
   build cannot be set to a group either (it has no `acl_node_group`), so it never misplaces anyone.

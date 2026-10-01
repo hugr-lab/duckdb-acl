@@ -445,8 +445,9 @@ flag, so a door that forgot to check still could not seat anyone:
 
 - Flight: a new client, and a seated connection re-authenticating as a *different* principal, get
   `acl: node is draining - not accepting new sessions` (UNAVAILABLE - a load balancer and a driver
-  both read it as "go elsewhere"). The swap is refused *before* the old session would have closed, so
-  drain never ends a session. The password handshake is refused the same way.
+  both read it as "go elsewhere"). A swap opens the new session *before* it ends the old one, so a
+  refusal - this one or any other - never ends a session. The password handshake is refused the same
+  way.
 - quack: the authentication callback answers NULL, which quack turns into its own refusal;
   `GET /.well-known/quack-auth` answers **503** `draining` - the health-check shape a load balancer
   already watches.

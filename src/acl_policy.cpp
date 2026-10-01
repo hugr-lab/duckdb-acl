@@ -336,7 +336,9 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 	if (now - last_sweep >= SWEEP_INTERVAL_SECONDS || (cap > 0 && sessions.size() >= static_cast<idx_t>(cap))) {
 		SweepLocked(now, skew, idle_timeout, exp_binds);
 	}
-	if (cap > 0 && sessions.size() >= static_cast<idx_t>(cap)) {
+	// the session this open replaces (a door's re-authentication) ends with it: it holds no seat
+	idx_t occupied = sessions.size() - (!replacing.empty() && sessions.count(replacing) ? 1 : 0);
+	if (cap > 0 && occupied >= static_cast<idx_t>(cap)) {
 		// Refusing rather than evicting: making room by ending somebody else's session would let an
 		// arriving stranger disconnect a working client, which is the worse of the two failures
 		// (spec 044). A door turns this into "Authentication failed", which a client already handles.
