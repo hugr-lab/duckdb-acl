@@ -8,8 +8,9 @@
 # (shipped roughly monthly) reach the tree on the cron. If "Analyze (C/C++)" is ever made a required
 # check in branch protection, it will never report on a PR - keep it out of that set.
 #
-# Built with ACL_NO_FLIGHT=1: the door's Arrow dependency would not fit the 120-minute budget on a
-# cold cache, and a no-flight build needs no vcpkg at all. src/flight/** is therefore NOT analyzed
+# Built with ACL_NO_FLIGHT=1: the door's Arrow dependency would not fit the budget on a cold cache,
+# and a no-flight build needs no vcpkg at all. The budget is 180 minutes: by 2026-10 the no-flight
+# analysis took 81-116 minutes and two runs on main hit the former 120-minute cap. src/flight/** is therefore NOT analyzed
 # here - a second, dispatch-only configuration with the door is the follow-up if it earns its hour.
 name: CodeQL
 
@@ -28,7 +29,7 @@ jobs:
   analyze:
     name: Analyze (C/C++)
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     permissions:
       actions: read
       contents: read
