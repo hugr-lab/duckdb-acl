@@ -312,6 +312,8 @@ struct CatalogBackend {
 	int64_t version = -1;
 	std::chrono::steady_clock::time_point last_check;
 	bool checked_once = false;
+	//! spec 096: writes this node committed - a cache of what the catalog says is stale past one
+	std::atomic<uint64_t> local_writes {0};
 	//! spec 094: the catalog is newer than this build, inside the window it declares - served from,
 	//! never written. Re-judged at every freshness check, so a catalog migrated under a running node
 	//! moves it here (or out of service) without a restart.
@@ -476,7 +478,7 @@ struct CatalogBackend {
 	shared_ptr<const FunctionCategoryModel> FunctionModel();
 
 	//! spec 085: the merged limits of the principal's resource groups (none in the driver contract)
-	ResourceLimits ResourceLimitsOf(const Principal &principal);
+	ResourceLimits ResourceLimitsOf(const Principal &principal, const string &node_group);
 	void LoadRoleClaims(Principal &principal);
 
 	bool SettingBool(const char *name, bool fallback);

@@ -1715,8 +1715,20 @@ void PolicyStore::CatalogFunctionCategoryMembers(const string &name, const vecto
 	});
 }
 
+//! spec 096: at most one group is the default - marking a second one is refused, naming the current
+static void RequireNoOtherDefault(CatalogBackend &catalog, const ReadFn &read, const string &name) {
+	auto current = read("SELECT \"group\" FROM " + catalog.Tbl("resource_groups") +
+	                    " WHERE \"is_default\" = true AND \"group\" <> " + Lit(name));
+	if (current->RowCount() > 0) {
+		auto other = current->Collection().GetValue(0, 0).ToString();
+		throw BinderException("acl admin: resource group \"%s\" is already the default - ALTER RESOURCE GROUP %s DROP "
+		                      "DEFAULT first (moving every principal without a group is a change made on purpose)",
+		                      other, other);
+	}
+}
+
 void PolicyStore::CatalogCreateResourceGroup(const string &name, const case_insensitive_map_t<int64_t> &limits,
-                                             const string &comment) {
+                                             const string &comment, const string &is_default) {
 	RequireCatalog(catalog, "acl_create_resource_group");
 	vector<string> values {Lit(name)};
 	for (auto limit : RESOURCE_LIMIT_NAMES) {
@@ -1724,13 +1736,39 @@ void PolicyStore::CatalogCreateResourceGroup(const string &name, const case_inse
 		values.push_back(it == limits.end() ? string("NULL") : std::to_string(it->second));
 	}
 	values.push_back(Lit(comment));
-	catalog->WriteWithReads([&](const ReadFn &, vector<string> &statements) {
-		// a re-create replaces the limits and the comment; the roles bound to it stay bound
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		// a re-create replaces the limits and the comment; the roles bound to it stay bound, and it stays
+		// the default (or not) unless the statement says DEFAULT (spec 096)
+		string marked = is_default;
+		if (marked.empty()) {
+			auto was = read("SELECT \"is_default\" FROM " + catalog->Tbl("resource_groups") +
+			                " WHERE \"group\" = " + Lit(name) + " AND \"is_default\" = true");
+			marked = was->RowCount() > 0 ? "true" : "false";
+		}
+		if (marked == "true") {
+			RequireNoOtherDefault(*catalog, read, name);
+		}
+		values.push_back(marked == "true" ? "true" : "NULL");
 		statements.push_back("DELETE FROM " + catalog->Tbl("resource_groups") + " WHERE \"group\" = " + Lit(name));
 		statements.push_back("INSERT INTO " + catalog->Tbl("resource_groups") +
 		                     " (\"group\", \"window_start\", \"window_max\", \"batch_bytes\", \"max_result_rows\", "
-		                     "\"queue_priority\", \"max_sessions\", \"comment\") VALUES (" +
+		                     "\"queue_priority\", \"max_sessions\", \"comment\", \"is_default\") VALUES (" +
 		                     StringUtil::Join(values, ", ") + ")");
+	});
+}
+
+void PolicyStore::CatalogSetDefaultResourceGroup(const string &name, bool is_default) {
+	RequireCatalog(catalog, "acl_alter_resource_group");
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		auto exists = read("SELECT 1 FROM " + catalog->Tbl("resource_groups") + " WHERE \"group\" = " + Lit(name));
+		if (exists->RowCount() == 0) {
+			throw BinderException("acl admin: resource group \"%s\" does not exist", name);
+		}
+		if (is_default) {
+			RequireNoOtherDefault(*catalog, read, name);
+		}
+		statements.push_back("UPDATE " + catalog->Tbl("resource_groups") + " SET \"is_default\" = " +
+		                     (is_default ? "true" : "NULL") + " WHERE \"group\" = " + Lit(name));
 	});
 }
 
@@ -1743,6 +1781,20 @@ void PolicyStore::CatalogDropResourceGroup(const string &name, bool if_exists) {
 				return;
 			}
 			throw BinderException("acl admin: resource group \"%s\" does not exist", name);
+		}
+		// spec 096: its part of the cluster profile is its nodes' bootstrap - removed first, on purpose,
+		// never orphaned (a scope nothing can write to again, revived by a group of the same name)
+		auto items = read("SELECT \"kind\" || ' ' || \"name\" FROM " + catalog->Tbl("cluster_items") +
+		                  " WHERE \"scope\" = " + Lit(name) + " ORDER BY 1");
+		ResultRows item_rows(*items);
+		if (item_rows.Count() > 0) {
+			vector<string> named;
+			for (idx_t i = 0; i < item_rows.Count(); i++) {
+				named.push_back(item_rows.GetValue(0, i).ToString());
+			}
+			throw BinderException("acl admin: resource group \"%s\" has cluster profile items (%s) - remove them "
+			                      "(ACL CLUSTER … IN GROUP %s) first",
+			                      name, StringUtil::Join(named, ", "), name);
 		}
 		// its bindings go with it: a role bound to a group that is gone would be a row nothing reads
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_resource_groups") + " WHERE \"group\" = " + Lit(name));

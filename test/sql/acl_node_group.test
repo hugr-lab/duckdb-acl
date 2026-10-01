@@ -1,0 +1,494 @@
+# name: test/sql/acl_node_group.test
+# description: a node's resource group (spec 096) - membership by acl_node_group, placement of sessions
+#   (a node of g serves principals that hold g, with g's limits only), the default group for principals
+#   bound to none, an unknown group failing closed, the group's part of the cluster profile (written,
+#   applied only on the group's nodes, acl_cluster_effective), and what the load report says.
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+# --- memory mode has no groups: a node there with a group serves nobody new ----------------------
+
+statement ok
+ACL ADMIN CREATE ISSUER 'test/idp/s' AUDIENCES ('api://acl-test') ROLE CLAIM 'roles';
+
+statement ok
+SELECT acl_define_role('analyst', '');
+
+statement ok
+SET GLOBAL acl_node_group = 'interactive';
+
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJhbmFseXN0Il19.RPD7WZXscyjtSETOfilmFNkrBXqC0P_SMLTmWOzAPxKydzv6BEnQud-W60LY1mixyyZvFI_-DjznCAWOZvm5C5wZR64ynr6RkbZxinJwWXWS6-NmTX4BANU7PFwTF9nSAESaMdbxJ-F_hpeAtnUikd_Hd1m5f6QhLjT4rRgotxRenvsxJmKSqNSqeLNlKXPz_-ZXOB-5vfxD_Vp4yxN9x9HMGGV7OTo1ZHJcZGSE0ZP6O6ZE5FIbiuUJ7nEJCD1Szcjqdeol8Y3ihnFgPeQUGq4vcZ_ETviwVJCr9awk0klK5fhGCys2wCaPA4W0b5tPwGzPJl5Orq_PkXcH8skW5g') IS NULL;
+----
+true
+
+statement ok
+SET GLOBAL acl_node_group = '';
+
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJhbmFseXN0Il19.RPD7WZXscyjtSETOfilmFNkrBXqC0P_SMLTmWOzAPxKydzv6BEnQud-W60LY1mixyyZvFI_-DjznCAWOZvm5C5wZR64ynr6RkbZxinJwWXWS6-NmTX4BANU7PFwTF9nSAESaMdbxJ-F_hpeAtnUikd_Hd1m5f6QhLjT4rRgotxRenvsxJmKSqNSqeLNlKXPz_-ZXOB-5vfxD_Vp4yxN9x9HMGGV7OTo1ZHJcZGSE0ZP6O6ZE5FIbiuUJ7nEJCD1Szcjqdeol8Y3ihnFgPeQUGq4vcZ_ETviwVJCr9awk0klK5fhGCys2wCaPA4W0b5tPwGzPJl5Orq_PkXcH8skW5g') IS NOT NULL;
+----
+true
+
+# --- the catalog -------------------------------------------------------------------------------------
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET GLOBAL acl_audit_level='all';
+
+statement ok
+ACL ADMIN CREATE ISSUER 'test/idp/s' AUDIENCES ('api://acl-test') ROLE CLAIM 'roles';
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE ROLE loader;
+
+statement ok
+ACL ADMIN CREATE ROLE plain;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE plain MAIN;
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP interactive (max_sessions 5, max_result_rows 100);
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP etl (max_sessions 50, max_result_rows 0);
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP interactive TO ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP etl TO ROLE loader;
+
+# --- a node without a group serves everyone (the single-node installation) -----------------------------
+
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJwbGFpbiJdfQ.a7leR6-nf1r8uq_fJ9N0h1hFJZhcn14DNjaXpIC21UrzwxgY1bZXZS33xdVwHM97g5BoXvJGV9Lg04MKb8PcwggFe5xUeZUHaojmiN9JWDFKxQQT_c-WqczCbcV_xq8W0D7VnCwX3ND0Z0wJWgCEJMHQ_aOEWbiEy_IO7XZef57hqEt1o6SFeD_Yt0RWCzAVfwuNGXa7Wn3kY3eT1V-V_FWoyDVtrwA0xT4UmL7f1zV2Wn5SFba5eA52HV_fzi9WBut8OmcXVTBZVZ58_MeHVTTIRf2CKiiYIbBLGzE_ZJ8tMxVoSVx-Dzb3BpLc5nnOhRTLCxahownp3zXq1nfOxw') IS NOT NULL AND acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJsb2FkZXIiXX0.KBUJ0x6sTWEBPnV9XTyWa9QZfdpTOeW98-qnon42Mpov52h-0v5-Wf--4XhCZVme-y18Ypzkw4b2JKboR51ecQkIeJNRHjt7xI5CQ9a8CZ6zBNfLQZ-LbSr1v7v2g_t6u78loyJHm-5jYwo_ZWwZh-_1mwC8PpPD7Yi9pAkA0EfiG7QY_qr5Nu1mwFVW2FpAk0x4ZaKQvKiO9JvjaapvAeqPqGKNHWzp6LNKBh9mTEB6HV6FZTAaj9iTN0j2_A_JU-zynqs0g8j0jP41A0ZM13VFF_htNbr3q394J6Do2PKuYexmWA1Ds1juzbg5za4WLjKZW8WJmXfGzdgfoRfRyQ') IS NOT NULL;
+----
+true
+
+query I
+SELECT acl_node_load() LIKE '%"group":null,"group_known":true,%';
+----
+true
+
+# --- a node of `interactive` ---------------------------------------------------------------------------
+
+statement ok
+SET GLOBAL acl_node_group = 'interactive';
+
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJhbmFseXN0Il19.RPD7WZXscyjtSETOfilmFNkrBXqC0P_SMLTmWOzAPxKydzv6BEnQud-W60LY1mixyyZvFI_-DjznCAWOZvm5C5wZR64ynr6RkbZxinJwWXWS6-NmTX4BANU7PFwTF9nSAESaMdbxJ-F_hpeAtnUikd_Hd1m5f6QhLjT4rRgotxRenvsxJmKSqNSqeLNlKXPz_-ZXOB-5vfxD_Vp4yxN9x9HMGGV7OTo1ZHJcZGSE0ZP6O6ZE5FIbiuUJ7nEJCD1Szcjqdeol8Y3ihnFgPeQUGq4vcZ_ETviwVJCr9awk0klK5fhGCys2wCaPA4W0b5tPwGzPJl5Orq_PkXcH8skW5g') IS NOT NULL;
+----
+true
+
+# a principal of another group is refused - and told which group serves it
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJsb2FkZXIiXX0.KBUJ0x6sTWEBPnV9XTyWa9QZfdpTOeW98-qnon42Mpov52h-0v5-Wf--4XhCZVme-y18Ypzkw4b2JKboR51ecQkIeJNRHjt7xI5CQ9a8CZ6zBNfLQZ-LbSr1v7v2g_t6u78loyJHm-5jYwo_ZWwZh-_1mwC8PpPD7Yi9pAkA0EfiG7QY_qr5Nu1mwFVW2FpAk0x4ZaKQvKiO9JvjaapvAeqPqGKNHWzp6LNKBh9mTEB6HV6FZTAaj9iTN0j2_A_JU-zynqs0g8j0jP41A0ZM13VFF_htNbr3q394J6Do2PKuYexmWA1Ds1juzbg5za4WLjKZW8WJmXfGzdgfoRfRyQ') IS NULL;
+----
+true
+
+# one with no group, and no default group: refused
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJwbGFpbiJdfQ.a7leR6-nf1r8uq_fJ9N0h1hFJZhcn14DNjaXpIC21UrzwxgY1bZXZS33xdVwHM97g5BoXvJGV9Lg04MKb8PcwggFe5xUeZUHaojmiN9JWDFKxQQT_c-WqczCbcV_xq8W0D7VnCwX3ND0Z0wJWgCEJMHQ_aOEWbiEy_IO7XZef57hqEt1o6SFeD_Yt0RWCzAVfwuNGXa7Wn3kY3eT1V-V_FWoyDVtrwA0xT4UmL7f1zV2Wn5SFba5eA52HV_fzi9WBut8OmcXVTBZVZ58_MeHVTTIRf2CKiiYIbBLGzE_ZJ8tMxVoSVx-Dzb3BpLc5nnOhRTLCxahownp3zXq1nfOxw') IS NULL;
+----
+true
+
+statement ok
+SELECT acl_audit_flush();
+
+query II
+SELECT reason_code, reason FROM acl_audit_events() WHERE kind = 'session' AND detail = 'refused' ORDER BY seq DESC LIMIT 2;
+----
+wrong_resource_group	acl: this node serves resource group "interactive" - no resource group serves your roles (and there is no default group)
+wrong_resource_group	acl: this node serves resource group "interactive" - your roles are served by "etl"
+
+# a principal in both groups is served here within `interactive` - charged to it, not to the more
+# generous `etl` (whose one session is the loader's, opened on the ungrouped node)
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJhbmFseXN0IiwibG9hZGVyIl19.VRtjrwj94fyVDwtYuwhhiUHSRyzjKGyr8AfP1Jofiza_G4nlepwsr1DqQGne9mCX4wpbOby3FUPzUtLRhCzUQJ8Uz7AqP25gxx0CfcvqyKdYngv61l1I9ecEN216SPzq6GfoFe190DKPNMwSnDIxukqTP77Or96lEboQlLK_E4s9iYNL4jPF4bothGY5zL72lo2u6tf7srTze0xGMq2X_j9MPUhiaS8IjovFaDmqciKK1iFsNglXFHWN3R7ylQ6kM3sAYmIIBrDDNinQNdotCWApkSBFVB_2x-uwjC4FEpYuHXBtYuCldE5mxjs19XAFn5lHdIXlJMSFO7IrnobGfg') IS NOT NULL;
+----
+true
+
+query II
+SELECT acl_node_load() LIKE '%"interactive":{"live":2,%', acl_node_load() LIKE '%"etl":{"live":1,%';
+----
+true	true
+
+# --- the default group --------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP general (max_sessions 10) DEFAULT COMMENT 'everyone else';
+
+query II
+SELECT "group", is_default FROM acl_resource_groups() WHERE is_default;
+----
+general	true
+
+statement error
+ACL ADMIN CREATE RESOURCE GROUP other DEFAULT;
+----
+<REGEX>:.*resource group "general" is already the default - ALTER RESOURCE GROUP general DROP DEFAULT first.*
+
+# the ungrouped principal is a member of `general`: not served by `interactive`'s nodes...
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJwbGFpbiJdfQ.a7leR6-nf1r8uq_fJ9N0h1hFJZhcn14DNjaXpIC21UrzwxgY1bZXZS33xdVwHM97g5BoXvJGV9Lg04MKb8PcwggFe5xUeZUHaojmiN9JWDFKxQQT_c-WqczCbcV_xq8W0D7VnCwX3ND0Z0wJWgCEJMHQ_aOEWbiEy_IO7XZef57hqEt1o6SFeD_Yt0RWCzAVfwuNGXa7Wn3kY3eT1V-V_FWoyDVtrwA0xT4UmL7f1zV2Wn5SFba5eA52HV_fzi9WBut8OmcXVTBZVZ58_MeHVTTIRf2CKiiYIbBLGzE_ZJ8tMxVoSVx-Dzb3BpLc5nnOhRTLCxahownp3zXq1nfOxw') IS NULL;
+----
+true
+
+statement ok
+SET GLOBAL acl_node_group = 'general';
+
+# ...served by `general`'s, and charged to it
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJwbGFpbiJdfQ.a7leR6-nf1r8uq_fJ9N0h1hFJZhcn14DNjaXpIC21UrzwxgY1bZXZS33xdVwHM97g5BoXvJGV9Lg04MKb8PcwggFe5xUeZUHaojmiN9JWDFKxQQT_c-WqczCbcV_xq8W0D7VnCwX3ND0Z0wJWgCEJMHQ_aOEWbiEy_IO7XZef57hqEt1o6SFeD_Yt0RWCzAVfwuNGXa7Wn3kY3eT1V-V_FWoyDVtrwA0xT4UmL7f1zV2Wn5SFba5eA52HV_fzi9WBut8OmcXVTBZVZ58_MeHVTTIRf2CKiiYIbBLGzE_ZJ8tMxVoSVx-Dzb3BpLc5nnOhRTLCxahownp3zXq1nfOxw') IS NOT NULL;
+----
+true
+
+query I
+SELECT acl_node_load() LIKE '%"general":{"live":1,%';
+----
+true
+
+# a principal with a group is not a member of the default by implication
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJhbmFseXN0Il19.RPD7WZXscyjtSETOfilmFNkrBXqC0P_SMLTmWOzAPxKydzv6BEnQud-W60LY1mixyyZvFI_-DjznCAWOZvm5C5wZR64ynr6RkbZxinJwWXWS6-NmTX4BANU7PFwTF9nSAESaMdbxJ-F_hpeAtnUikd_Hd1m5f6QhLjT4rRgotxRenvsxJmKSqNSqeLNlKXPz_-ZXOB-5vfxD_Vp4yxN9x9HMGGV7OTo1ZHJcZGSE0ZP6O6ZE5FIbiuUJ7nEJCD1Szcjqdeol8Y3ihnFgPeQUGq4vcZ_ETviwVJCr9awk0klK5fhGCys2wCaPA4W0b5tPwGzPJl5Orq_PkXcH8skW5g') IS NULL;
+----
+true
+
+# a re-create without DEFAULT keeps the mark; DROP DEFAULT takes it away
+statement ok
+ACL ADMIN CREATE OR REPLACE RESOURCE GROUP general (max_sessions 20);
+
+query I
+SELECT is_default FROM acl_resource_groups() WHERE "group" = 'general';
+----
+true
+
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP general DROP DEFAULT;
+
+query I
+SELECT count(*) FROM acl_resource_groups() WHERE is_default;
+----
+0
+
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJwbGFpbiJdfQ.a7leR6-nf1r8uq_fJ9N0h1hFJZhcn14DNjaXpIC21UrzwxgY1bZXZS33xdVwHM97g5BoXvJGV9Lg04MKb8PcwggFe5xUeZUHaojmiN9JWDFKxQQT_c-WqczCbcV_xq8W0D7VnCwX3ND0Z0wJWgCEJMHQ_aOEWbiEy_IO7XZef57hqEt1o6SFeD_Yt0RWCzAVfwuNGXa7Wn3kY3eT1V-V_FWoyDVtrwA0xT4UmL7f1zV2Wn5SFba5eA52HV_fzi9WBut8OmcXVTBZVZ58_MeHVTTIRf2CKiiYIbBLGzE_ZJ8tMxVoSVx-Dzb3BpLc5nnOhRTLCxahownp3zXq1nfOxw') IS NULL;
+----
+true
+
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP general SET DEFAULT;
+
+# --- a node whose group the policy does not have serves nobody new --------------------------------------
+
+statement ok
+SET GLOBAL acl_node_group = 'nosuch';
+
+query I
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJwbGFpbiJdfQ.a7leR6-nf1r8uq_fJ9N0h1hFJZhcn14DNjaXpIC21UrzwxgY1bZXZS33xdVwHM97g5BoXvJGV9Lg04MKb8PcwggFe5xUeZUHaojmiN9JWDFKxQQT_c-WqczCbcV_xq8W0D7VnCwX3ND0Z0wJWgCEJMHQ_aOEWbiEy_IO7XZef57hqEt1o6SFeD_Yt0RWCzAVfwuNGXa7Wn3kY3eT1V-V_FWoyDVtrwA0xT4UmL7f1zV2Wn5SFba5eA52HV_fzi9WBut8OmcXVTBZVZ58_MeHVTTIRf2CKiiYIbBLGzE_ZJ8tMxVoSVx-Dzb3BpLc5nnOhRTLCxahownp3zXq1nfOxw') IS NULL AND acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJhbmFseXN0Il19.RPD7WZXscyjtSETOfilmFNkrBXqC0P_SMLTmWOzAPxKydzv6BEnQud-W60LY1mixyyZvFI_-DjznCAWOZvm5C5wZR64ynr6RkbZxinJwWXWS6-NmTX4BANU7PFwTF9nSAESaMdbxJ-F_hpeAtnUikd_Hd1m5f6QhLjT4rRgotxRenvsxJmKSqNSqeLNlKXPz_-ZXOB-5vfxD_Vp4yxN9x9HMGGV7OTo1ZHJcZGSE0ZP6O6ZE5FIbiuUJ7nEJCD1Szcjqdeol8Y3ihnFgPeQUGq4vcZ_ETviwVJCr9awk0klK5fhGCys2wCaPA4W0b5tPwGzPJl5Orq_PkXcH8skW5g') IS NULL;
+----
+true
+
+query II
+SELECT acl_node_load() LIKE '%"group":"nosuch","group_known":false,%', acl_node_load() LIKE '%"new_session":false%';
+----
+true	true
+
+statement ok
+SET GLOBAL acl_node_group = 'interactive';
+
+query I
+SELECT acl_node_load() LIKE '%"new_session":true%';
+----
+true
+
+# --- the membership is the deployment's ---------------------------------------------------------------
+
+statement error
+SET acl_node_group = 'etl';
+----
+<REGEX>:.*acl_node_group is global - use SET GLOBAL.*
+
+statement error
+ACL ROLE "plain" SET GLOBAL acl_node_group = 'etl';
+----
+<REGEX>:.*SET "acl_node_group" is not permitted under ACL.*
+
+# --- the group's part of the profile -----------------------------------------------------------------
+
+# an item of another group is written, never applied on this node
+query II
+SELECT r.applied_here, r.note FROM (SELECT acl_cluster_attach('etl', 'etl_src', ':memory:', 'duckdb', '', '{}', '', '') AS r);
+----
+false	item of resource group etl - this node is in group interactive; the group's nodes roll it out
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'etl_src';
+----
+0
+
+# one of this node's group is applied here
+query I
+SELECT r.applied_here FROM (SELECT acl_cluster_attach('interactive', 'ia_src', ':memory:', 'duckdb', '', '{}', '', '') AS r);
+----
+true
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 4;
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 2 IN GROUP interactive;
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 8 IN GROUP etl;
+
+# what applies to THIS node: the cluster's items with its group's over them
+query IIII
+SELECT scope, kind, name, spec FROM acl_cluster_effective() ORDER BY kind, name;
+----
+interactive	setting	threads	{"value": "2"}
+interactive	source	ia_src	{"type": "duckdb", "path": ":memory:", "secret": "", "options": {}}
+
+# while every group's items stay stored: two sources, and threads for the cluster and two groups
+query I
+SELECT count(*) FROM acl_cluster_items();
+----
+5
+
+# the agent reports what it applied; the report shows target and applied
+query I
+SELECT acl_cluster_applied(acl_cluster_version() - 1) = acl_cluster_version() - 1;
+----
+true
+
+query I
+SELECT acl_node_load() LIKE '%"config":{"target":' || acl_cluster_version() || ',"applied":' || (acl_cluster_version() - 1) || '}%';
+----
+true
+
+statement error
+SELECT acl_cluster_applied(acl_cluster_version() + 1);
+----
+<REGEX>:.*is not one of the profile's.*
+
+statement error
+ACL ROLE "plain" SELECT acl_cluster_applied(0);
+----
+<REGEX>:.*acl_cluster_applied.*not allowed.*
+
+# the setting written for another group is not applied here either, and says so
+query II
+SELECT r.applied_here, r.note FROM (SELECT acl_cluster_setting('set', 'etl', 'threads', '6') AS r);
+----
+false	item of resource group etl - this node is in group interactive; the group's nodes roll it out
+
+# acl_cluster_effective() is in the profile's order whatever the scope: settings, extensions, sources
+statement ok
+ACL ADMIN CLUSTER SET checkpoint_threshold = '64MB' IN GROUP interactive;
+
+statement ok
+SELECT acl_cluster_attach('', 'src1', ':memory:', 'duckdb', '', '{}', '', '');
+
+query II
+SELECT kind, name FROM acl_cluster_effective();
+----
+setting	threads
+setting	checkpoint_threshold
+source	src1
+source	ia_src
+
+# --- a group's source of a cluster source's name overrides it; a detach follows the scope -------------
+
+statement ok
+SELECT acl_cluster_attach('', 'src2', ':memory:', 'duckdb', '', '{}', 'src1', '');
+
+# etl has no src1 of its own: its src3 depends on the cluster's
+statement ok
+SELECT acl_cluster_attach('etl', 'src3', ':memory:', 'duckdb', '', '{}', 'src1', '');
+
+# interactive's own src1, on a node where the cluster's is attached: a re-point, the agent's
+query III
+SELECT r.applied_here, r."class", r.note FROM (SELECT acl_cluster_attach('interactive', 'src1', ':memory:', 'duckdb', '', '{}', '', '') AS r);
+----
+false	drain	drain class - it overrides the cluster's source of that name on this group's nodes; re-pointing an attached source is DETACH + ATTACH under the same name; the node agent applies it through drain
+
+# removing the override: nothing depends on IT (the cluster's src2 depends on the cluster's src1), and
+# the cluster's src1 is in effect again - re-pointed, never detached
+query III
+SELECT r.applied_here, r."class", r.note FROM (SELECT acl_cluster_detach('interactive', 'src1', 'false', 'false') AS r);
+----
+false	drain	the cluster's source of that name is in effect again on this node: src1 - the node agent re-points it through drain
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('src1', 'src2');
+----
+2
+
+query II
+SELECT r.applied_here, r."class" FROM (SELECT acl_cluster_attach('interactive', 'src1', ':memory:', 'duckdb', '', '{}', '', '') AS r);
+----
+false	drain
+
+statement error
+SELECT acl_cluster_detach('', 'src1', 'false', 'false');
+----
+<REGEX>:.*source "src2" DEPENDS ON "src1" - detach it first, or DETACH src1 CASCADE.*
+
+# the cluster's src1 with what depends on it - its own src2 and etl's src3; on this node interactive's
+# src1 stays, the cluster's src2 goes
+query II
+SELECT r.applied_here, r.note FROM (SELECT acl_cluster_detach('', 'src1', 'true', 'false') AS r);
+----
+false	cluster item overridden by resource group interactive's own on this node - not applied here; detached with it: src2, src3 (group etl)
+
+query I
+SELECT string_agg(database_name, ',' ORDER BY database_name) FROM duckdb_databases() WHERE database_name IN ('src1', 'src2');
+----
+src1
+
+query II
+SELECT (SELECT string_agg(scope || ':' || name, ',') FROM acl_cluster_items() WHERE name LIKE 'src%'), (SELECT count(*) FROM store.acl.cluster_deps);
+----
+interactive:src1	0
+
+# --- the quack door: the same placement, refused with the sentence ------------------------------------
+
+statement error
+SELECT acl_quack_authenticate('conn-loader', 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJsb2FkZXIiXX0.KBUJ0x6sTWEBPnV9XTyWa9QZfdpTOeW98-qnon42Mpov52h-0v5-Wf--4XhCZVme-y18Ypzkw4b2JKboR51ecQkIeJNRHjt7xI5CQ9a8CZ6zBNfLQZ-LbSr1v7v2g_t6u78loyJHm-5jYwo_ZWwZh-_1mwC8PpPD7Yi9pAkA0EfiG7QY_qr5Nu1mwFVW2FpAk0x4ZaKQvKiO9JvjaapvAeqPqGKNHWzp6LNKBh9mTEB6HV6FZTAaj9iTN0j2_A_JU-zynqs0g8j0jP41A0ZM13VFF_htNbr3q394J6Do2PKuYexmWA1Ds1juzbg5za4WLjKZW8WJmXfGzdgfoRfRyQ', 'ignored');
+----
+<REGEX>:.*acl: this node serves resource group "interactive" - your roles are served by "etl".*
+
+query I
+SELECT acl_quack_authenticate('conn-analyst', 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJhbmFseXN0Il19.RPD7WZXscyjtSETOfilmFNkrBXqC0P_SMLTmWOzAPxKydzv6BEnQud-W60LY1mixyyZvFI_-DjznCAWOZvm5C5wZR64ynr6RkbZxinJwWXWS6-NmTX4BANU7PFwTF9nSAESaMdbxJ-F_hpeAtnUikd_Hd1m5f6QhLjT4rRgotxRenvsxJmKSqNSqeLNlKXPz_-ZXOB-5vfxD_Vp4yxN9x9HMGGV7OTo1ZHJcZGSE0ZP6O6ZE5FIbiuUJ7nEJCD1Szcjqdeol8Y3ihnFgPeQUGq4vcZ_ETviwVJCr9awk0klK5fhGCys2wCaPA4W0b5tPwGzPJl5Orq_PkXcH8skW5g', 'ignored');
+----
+true
+
+# --- the grammar and the functions refuse what they do not know --------------------------------------
+
+statement error
+ACL ADMIN ALTER RESOURCE GROUP general SET LIMITS;
+----
+<REGEX>:.*expected default.*
+
+statement error
+ACL ADMIN ALTER RESOURCE GROUP nosuch SET DEFAULT;
+----
+<REGEX>:.*resource group "nosuch" does not exist.*
+
+statement error
+ACL ADMIN CREATE RESOURCE GROUP twice (max_sessions 1) DEFAULT DEFAULT;
+----
+<REGEX>:.*acl admin: unexpected trailing text.*
+
+statement error
+SELECT acl_alter_resource_group('general', 'limits', 'true');
+----
+<REGEX>:.*the property is 'default', true or false - got limits = true.*
+
+statement error
+SELECT acl_create_resource_group('maybe', '{}', '', 'perhaps');
+----
+<REGEX>:.*is_default is true or false, got "perhaps".*
+
+# group names compare as written: `General` is not `general`
+statement error
+ACL ADMIN ALTER RESOURCE GROUP General DROP DEFAULT;
+----
+<REGEX>:.*resource group "General" does not exist.*
+
+# --- more of DETACH's scope rules ----------------------------------------------------------------------
+
+# a group's item over its OWN source of a name is not a dependent of the cluster's source of that name
+statement ok
+SELECT acl_cluster_attach('', 'src1', ':memory:', 'duckdb', '', '{}', '', '');
+
+statement ok
+SELECT acl_cluster_attach('interactive', 'src4', ':memory:', 'duckdb', '', '{}', 'src1', '');
+
+query II
+SELECT r.applied_here, r.note FROM (SELECT acl_cluster_detach('', 'src1', 'false', 'false') AS r);
+----
+false	cluster item overridden by resource group interactive's own on this node - not applied here
+
+query I
+SELECT string_agg(scope || ':' || name, ',' ORDER BY name) FROM acl_cluster_items() WHERE name IN ('src1', 'src4');
+----
+interactive:src1,interactive:src4
+
+# a group's source with no cluster fallback keeps its group's dependents: refused, or cascaded
+statement ok
+SELECT acl_cluster_attach('interactive', 'src5', ':memory:', 'duckdb', '', '{}', '', '');
+
+statement ok
+SELECT acl_cluster_attach('interactive', 'src6', ':memory:', 'duckdb', '', '{}', 'src5', '');
+
+statement error
+SELECT acl_cluster_detach('interactive', 'src5', 'false', 'false');
+----
+<REGEX>:.*source "src6" of group interactive DEPENDS ON "src5" - detach it first, or DETACH src5 CASCADE.*
+
+query II
+SELECT r.applied_here, r.note FROM (SELECT acl_cluster_detach('interactive', 'src5', 'true', 'false') AS r);
+----
+true	detached with it: src6 (group interactive)
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('src5', 'src6');
+----
+0
+
+# CASCADE to a fixpoint: etl's `a` falls back to the cluster's `a` only while the cluster keeps it - when
+# the cascade takes the cluster's too, etl's `a` and what depends on it (etl's `c`) go
+statement ok
+SELECT acl_cluster_attach('', 'x', ':memory:', 'duckdb', '', '{}', '', '');
+
+statement ok
+SELECT acl_cluster_attach('', 'a', ':memory:', 'duckdb', '', '{}', 'x', '');
+
+statement ok
+SELECT acl_cluster_attach('etl', 'a', ':memory:', 'duckdb', '', '{}', 'x', '');
+
+statement ok
+SELECT acl_cluster_attach('etl', 'c', ':memory:', 'duckdb', '', '{}', 'a', '');
+
+query II
+SELECT r.applied_here, r.note LIKE '%c (group etl)%' FROM (SELECT acl_cluster_detach('', 'x', 'true', 'false') AS r);
+----
+true	true
+
+query II
+SELECT (SELECT count(*) FROM acl_cluster_items() WHERE name IN ('x', 'a', 'c')), (SELECT count(*) FROM store.acl.cluster_deps WHERE name IN ('a', 'c'));
+----
+0	0
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('x', 'a');
+----
+0
+
+# --- a group with profile items is not dropped from under them -----------------------------------------
+
+statement error
+ACL ADMIN DROP RESOURCE GROUP etl;
+----
+<REGEX>:.*resource group "etl" has cluster profile items \(setting threads, source etl_src\) - remove them.*

@@ -1078,12 +1078,32 @@ void AclCatalogSchemaFunc(DataChunk &args, ExpressionState &state, Vector &resul
 	result.Reference(StoreOf(state).CatalogSchemaState(), count_t(args.size()));
 }
 
-//! acl_create_resource_group(name, limits_json[, comment]): a re-create replaces the limits
+//! acl_create_resource_group(name, limits_json[, comment[, is_default]]): a re-create replaces the limits;
+//! is_default 'true' marks it the default group (spec 096), omitted keeps what it was
 void AclCreateResourceGroupFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto name = RequiredArg(args, 0, row, "acl_create_resource_group", "group");
 		auto limits = ParseResourceLimits(OptionalArg(args, 1, row, "{}"), "acl_create_resource_group");
-		StoreOf(state).CatalogCreateResourceGroup(name, limits, OptionalArg(args, 2, row, ""));
+		auto is_default = StringUtil::Lower(OptionalArg(args, 3, row, ""));
+		if (!is_default.empty() && is_default != "true" && is_default != "false") {
+			throw BinderException("acl_create_resource_group: is_default is true or false, got \"%s\"", is_default);
+		}
+		StoreOf(state).CatalogCreateResourceGroup(name, limits, OptionalArg(args, 2, row, ""), is_default);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_alter_resource_group(name, field, value) (spec 096): field 'default', value true | false
+void AclAlterResourceGroupFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto name = RequiredArg(args, 0, row, "acl_alter_resource_group", "group");
+		auto field = StringUtil::Lower(RequiredArg(args, 1, row, "acl_alter_resource_group", "property"));
+		auto value = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_resource_group", "value"));
+		if (field != "default" || (value != "true" && value != "false")) {
+			throw BinderException("acl_alter_resource_group: the property is 'default', true or false - got %s = %s",
+			                      field, value);
+		}
+		StoreOf(state).CatalogSetDefaultResourceGroup(name, value == "true");
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -1991,7 +2011,8 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_grant_function", {{v, v}, {v, v, v}}, AclGrantFunctionFunc);
 	register_admin("acl_revoke_function", {v, v}, AclRevokeFunctionFunc);
 	// resource groups (spec 085): the compile targets of CREATE / DROP / GRANT / REVOKE RESOURCE GROUP
-	register_admin_set("acl_create_resource_group", {{v, v}, {v, v, v}}, AclCreateResourceGroupFunc);
+	register_admin_set("acl_create_resource_group", {{v, v}, {v, v, v}, {v, v, v, v}}, AclCreateResourceGroupFunc);
+	register_admin("acl_alter_resource_group", {v, v, v}, AclAlterResourceGroupFunc);
 	register_admin_set("acl_drop_resource_group", {{v}, {v, v}}, AclDropResourceGroupFunc);
 	register_admin("acl_grant_resource_group", {v, v}, AclGrantResourceGroupFunc);
 	register_admin("acl_revoke_resource_group", {v, v}, AclRevokeResourceGroupFunc);

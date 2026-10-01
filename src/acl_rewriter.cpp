@@ -84,6 +84,8 @@ const char *ReasonCode(Reason reason) {
 		return "draining";
 	case Reason::AT_CAPACITY:
 		return "at_capacity";
+	case Reason::WRONG_RESOURCE_GROUP:
+		return "wrong_resource_group";
 	case Reason::SOURCE_ERROR:
 		return "source_error";
 	case Reason::UNAVAILABLE:

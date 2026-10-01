@@ -48,11 +48,11 @@ ACL ADMIN CREATE RESOURCE GROUP interactive WITH (window_max 8, max_result_rows 
 statement ok
 ACL ADMIN CREATE RESOURCE GROUP etl (window_start 16, window_max 64, batch_bytes '32MiB', queue_priority 10);
 
-query IIIIIIII
+query IIIIIIIII
 SELECT * FROM acl_resource_groups() ORDER BY 1;
 ----
-etl	16	64	33554432	NULL	10	NULL	(empty)
-interactive	NULL	8	NULL	100000	NULL	1	people
+etl	16	64	33554432	NULL	10	NULL	(empty)	NULL
+interactive	NULL	8	NULL	100000	NULL	1	people	NULL
 
 # a limit written wrong would limit nothing: refused, with the names a group carries
 statement error

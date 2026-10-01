@@ -217,6 +217,18 @@ void LoadInternal(ExtensionLoader &loader) {
 		    }
 	    },
 	    SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "acl_node_group",
+	    "acl: the resource group this node belongs to (spec 096) - it serves the sessions of principals "
+	    "that hold the group (or are in none and it is the default); '' serves everyone. Set by the "
+	    "deployment, never by the policy",
+	    LogicalType::VARCHAR, Value(""),
+	    [](ClientContext &, SetScope scope, Value &) {
+		    if (scope != SetScope::GLOBAL) {
+			    throw InvalidInputException("acl_node_group is global - use SET GLOBAL");
+		    }
+	    },
+	    SetScope::GLOBAL);
 	config.AddExtensionOption("acl_max_sessions",
 	                          "acl: how many sessions may live at once; at the cap a new one is refused "
 	                          "rather than an old one evicted, and 0 means unlimited (spec 044). Each "

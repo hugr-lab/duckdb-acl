@@ -322,8 +322,8 @@ Clients that set `quack_fetch_read_ahead = 8` let a node seat eight times as man
 `acl_quack_client_depth = 8` to match makes the door count them that way.
 
 `acl_node_load()` answers the numbers admission decides with: sessions against `acl_max_sessions`,
-each quack door's seated clients against its seats, draining, and whether a new session or quack
-client would be admitted. An orchestrator reads the same document in two places while
+each quack door's seated clients against its seats, draining, the node's resource group (spec 096),
+and whether a new session or quack client would be admitted. An orchestrator reads the same document in two places while
 `acl_metrics_endpoint` is on:
 
 - `GET /.well-known/acl-node` on the quack listener;
@@ -349,6 +349,15 @@ capacity - the stream memory budget stayed full ...`. The load report's `streams
 - **Everywhere.** `max_sessions` refuses a new session of the group at open, with `at_capacity`.
 - **In the load report.** `sessions.by_group` counts the group's live sessions against its max. That
   names the groups to whoever may read the report, so do not name a group after anything secret.
+- **Placement** (spec 096). A node set to a group with `acl_node_group` serves only principals that
+  hold the group (or, bound to none, the default group's members), with that group's limits only.
+  Anyone else gets a refusal a front acts on: Flight answers `UNAVAILABLE` with `acl: this node serves
+  resource group "g" - your roles are served by "h"`, quack refuses the connect (its client shows the
+  same sentence inside its authentication error),
+  and the session event's `reason_code` is `wrong_resource_group`. The load report says `group`,
+  `group_known` (a group the policy does not have admits nobody: `admit.new_session` is false) and
+  `config` - the profile version the node targets and the one its agent reported applied. A node
+  without a group serves everyone, exactly as before.
 
 Client recipe: [clients/quack.md](clients/quack.md) (`ATTACH 'quack:<host>:<port>' AS remote (TYPE
 quack, TOKEN '<token>')`, or a secret).
@@ -510,8 +519,8 @@ handshake, a policy reload or source error, a keys refresh. An event carries who
 id - never the handle), what (the statement class - never the text), the verdict, and on a refusal
 one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only`, `function_denied`,
 `statement_type`, `unchecked_predicate`, `setting_denied`, `parse`, `principal`,
-`mgmt_unauthorized`, `ddl_home`, `draining`, `at_capacity`, `source_error`, `unavailable`,
-`write_policy`, `policy_error`) plus the refusal text.
+`mgmt_unauthorized`, `ddl_home`, `draining`, `at_capacity`, `wrong_resource_group`, `source_error`,
+`unavailable`, `write_policy`, `policy_error`) plus the refusal text.
 
 - **Levels** - `SET GLOBAL acl_audit_level = 'off' | 'denied' | 'decisions' | 'all'` (default
   `decisions`): refusals only; every statement/admin/ingest decision; plus the session, door, policy

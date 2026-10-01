@@ -474,7 +474,8 @@ bool IsMgmtStart(const string &text) {
 			// ALTER ROLE/ISSUER/GRANT do not exist in duckdb at all
 			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
 			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "client") ||
-			       StringUtil::CIEquals(second, "grant") || function_category();
+			       StringUtil::CIEquals(second, "grant") || StringUtil::CIEquals(second, "resource") ||
+			       function_category();
 		}
 		// DROP: our own forms carry VIRTUAL, and duckdb has no DROP ROLE/ISSUER/MAP/RELATION
 		return StringUtil::CIEquals(second, "relation") || StringUtil::CIEquals(second, "virtual") ||
@@ -1354,11 +1355,19 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 				}
 				limits = "{" + StringUtil::Join(entries, ", ") + "}";
 			}
-			string comment;
-			if (s.Accept("comment")) {
-				comment = s.Quoted("comment");
+			// DEFAULT (spec 096): principals bound to no group are its members; before or after COMMENT
+			string comment, is_default;
+			bool commented = false;
+			for (int clause = 0; clause < 2; clause++) {
+				if (is_default.empty() && s.Accept("default")) {
+					is_default = "true";
+				} else if (!commented && s.Accept("comment")) {
+					comment = s.Quoted("comment");
+					commented = true;
+				}
 			}
-			return MakeAdminCall("acl_create_resource_group", {Value(group), Value(limits), Value(comment)});
+			return MakeAdminCall("acl_create_resource_group",
+			                     {Value(group), Value(limits), Value(comment), Value(is_default)});
 		}
 		if (s.Accept("function")) {
 			// CREATE FUNCTION CATEGORY c [COMMENT '…'] (spec 072): the operator's own category; a
@@ -1598,6 +1607,17 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			}
 			return MakeAdminCall(add ? "acl_function_category_add" : "acl_function_category_remove",
 			                     {Value(category), Value(members)});
+		}
+		if (s.Accept("resource")) { // spec 096: ALTER RESOURCE GROUP g SET DEFAULT | DROP DEFAULT
+			s.Expect("group");
+			auto group = s.Word("a group name");
+			bool set = s.Accept("set");
+			if (!set) {
+				s.Expect("drop");
+			}
+			s.Expect("default");
+			return MakeAdminCall("acl_alter_resource_group",
+			                     {Value(group), Value("default"), Value(set ? "true" : "false")});
 		}
 		if (s.Accept("role")) { // ALTER ROLE r SET CLAIMS (...) | '...'
 			auto role = s.Word("a role name");
@@ -1941,6 +1961,7 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	    {"acl_session_profile", -1},
 	    // spec 085: a resource group limits a role's sessions on the whole node - unrestricted manage
 	    {"acl_create_resource_group", -1},
+	    {"acl_alter_resource_group", -1},
 	    {"acl_drop_resource_group", -1},
 	    {"acl_grant_resource_group", -1},
 	    {"acl_revoke_resource_group", -1},

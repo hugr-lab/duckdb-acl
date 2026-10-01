@@ -471,6 +471,22 @@ newer outside it, or older, is refused (fail closed; older says `acl_migrate_cat
 embedded (`ACL_SCHEMA_STEPS`) and `acl_migrate_catalog(db[, schema])` applies them in one transaction -
 never automatically. `acl_catalog_schema()` reports build/catalog/window/mode.
 
+**Spec 096 — a node's resource group**: a 085 resource group is also a set of NODES. A node belongs to
+the group its deployment names (`SET GLOBAL acl_node_group`, GLOBAL-only, never the policy's); it
+serves only principals that hold the group (bound, or - bound to none - members of the DEFAULT group,
+`CREATE RESOURCE GROUP g … DEFAULT` / `ALTER RESOURCE GROUP g SET|DROP DEFAULT`, at most one, schema
+v18 `is_default`) with THAT group's limits only, and refuses others in `SessionOpenBody` (every door)
+with `wrong_resource_group` naming the groups that serve them (Flight `UNAVAILABLE`, quack connect
+error; `SessionOpen(…, &placement)`); a group the policy lacks fails closed. Decision is header-only
+`acl_placement.hpp` (`Place`). No group = serves everyone (a single node needs nothing). The gateway
+prefix path is not placed; admins are placed like anyone. Cluster items `IN GROUP g` apply live only
+on g's nodes (`NotThisNodesScope`; a group item overrides the cluster's of that kind+name, so the
+cluster's is not applied there either); a group source named like a cluster's is a re-point (drain),
+and DETACH/CASCADE follow the scope (an edge is its dependent's scope's; a group item depends on the
+cluster's source only while the group has none of that name). `acl_cluster_effective()` (kind order),
+`acl_cluster_applied(version)`; the load report adds `group`, `group_known`, `config.{target,applied}`
+(catalog reads cached 2 s, keyed on `CatalogBackend::local_writes`).
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

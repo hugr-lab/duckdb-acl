@@ -607,7 +607,8 @@ DROP [PERSISTENT] SECRET <name> [FROM <catalog>]
 ## Resource groups
 
 ```sql
-CREATE [OR REPLACE] RESOURCE GROUP <group> [WITH] (<limit> <value>, …) [COMMENT '<text>']
+CREATE [OR REPLACE] RESOURCE GROUP <group> [WITH] (<limit> <value>, …) [DEFAULT] [COMMENT '<text>']
+ALTER RESOURCE GROUP <group> SET DEFAULT | DROP DEFAULT
 DROP RESOURCE GROUP [IF EXISTS] <group>
 GRANT  RESOURCE GROUP <group> TO   ROLE <role>
 REVOKE RESOURCE GROUP <group> FROM ROLE <role>
@@ -636,11 +637,31 @@ session opens, and a limit it does not name is the node's setting.
   drop removes the group's bindings, and so does dropping a role.
 - **Authorization.** A group acts on the whole node, so these statements need an unrestricted `manage`
   scope.
-- **Listings.** `acl_resource_groups()` and `acl_role_resource_groups()` list the groups and their
-  bindings. `acl_sessions()` shows each session's `groups` and its `charged_group`.
+- **Listings.** `acl_resource_groups()` and `acl_role_resource_groups()` list the groups (with
+  `is_default`) and their bindings. `acl_sessions()` shows each session's `groups` and its
+  `charged_group`.
 - **Functions.** The admin functions behind the statements are `acl_create_resource_group(group,
-  limits_json[, comment])`, `acl_drop_resource_group(group[, 'skip'])`,
-  `acl_grant_resource_group(role, group)` and `acl_revoke_resource_group(role, group)`.
+  limits_json[, comment[, is_default]])`, `acl_alter_resource_group(group, 'default', 'true' |
+  'false')`, `acl_drop_resource_group(group[, 'skip'])`, `acl_grant_resource_group(role, group)` and
+  `acl_revoke_resource_group(role, group)`.
+
+**A group is also a set of nodes** (spec 096). A node belongs to the group its deployment names with
+`SET GLOBAL acl_node_group = '<group>'` (in its bootstrap; never from the policy, never under a
+principal). A node of a group serves the sessions of principals that hold the group, **with that
+group's limits only**, and refuses the others with `wrong_resource_group`, naming the groups that
+would serve them - so a front sends the client to the right node. A node without a group serves
+everyone, as before: a single node needs none of this. A node whose group the policy does not have
+serves nobody new until it does (fail closed). The gateway's `ACL TOKEN` / `ACL ROLE` path is not
+placed; `manage` and `passthrough` are placed like anyone.
+
+- **The default group** (`DEFAULT`, or `ALTER RESOURCE GROUP g SET DEFAULT`): a principal whose roles
+  are in no group is its member - for placement and for its limits. At most one group is the
+  default: marking a second is refused, naming the current one. A re-create without `DEFAULT` keeps
+  the mark; `DROP DEFAULT` removes it. Without a default group, ungrouped principals are served by
+  ungrouped nodes only.
+- **Dropping a group** with cluster profile items (`IN GROUP g`) is refused, naming them: remove its
+  part of the profile first.
+- **Names compare as written**: `General` is not `general`, in `acl_node_group` as in the bindings.
 
 ## Cluster profile
 
@@ -658,7 +679,18 @@ CLUSTER RESET <setting> [IN GROUP <group>]
 The cluster profile is the shared part of every node's bootstrap (spec 093): which extensions a node
 runs, which sources it attaches and which settings it carries. It lives in the policy catalog as
 desired state, next to the policy, and a `config_version` counts its changes. With `IN GROUP` an item
-belongs to the nodes of one resource group; without it, to the whole cluster.
+belongs to the nodes of one resource group (spec 096: the nodes whose `acl_node_group` it is); without
+it, to the whole cluster. A group's item overrides the cluster's item of the same kind and name, and
+is applied live only on a node of that group - written from any other node, it answers
+`applied_here = false` with the note "item of resource group g - …; the group's nodes roll it out".
+A group's source named like a cluster's is a re-point on the group's nodes (drain class), and
+detaching it brings the cluster's back there, never a `DETACH`; a detach (and its `CASCADE`) follows
+the scope - a group's item depends on the cluster's source of a name only while the group has none of
+its own.
+`acl_cluster_effective()` lists what applies to *this* node (the cluster's items with its group's over
+them, each with the scope it came from); `acl_cluster_applied(version)` is the node agent saying which
+profile version this node has converged to, which the load report shows (`config.applied` against
+`config.target`).
 
 A statement does four things:
 

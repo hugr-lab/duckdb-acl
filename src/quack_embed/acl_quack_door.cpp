@@ -189,6 +189,7 @@ void AclQuackAuthenticateFunc(DataChunk &args, ExpressionState &state, Vector &r
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &store = StoreOf(state);
 	for (idx_t row = 0; row < args.size(); row++) {
+		string placement;
 		// Since quack f4328c5 the server hands a failed callback's error text back over the wire, so
 		// an exception here would tell a client that has not authenticated yet what our policy source
 		// said - a DSN, a catalog name. Fail closed and keep the reason where it belongs: the audit
@@ -201,16 +202,23 @@ void AclQuackAuthenticateFunc(DataChunk &args, ExpressionState &state, Vector &r
 			// max_sessions does not refuse the connection its own token refresh
 			string replacing;
 			store.SessionHandleFor(session_id, replacing);
-			auto handle = store.SessionOpen(token, "quack", replacing);
-			if (handle.empty()) {
+			auto handle = store.SessionOpen(token, "quack", replacing, &placement);
+			if (handle.empty() && placement.empty()) {
 				result.SetValue(row, Value::BOOLEAN(false));
 				continue;
 			}
-			store.SessionBind(session_id, handle);
-			result.SetValue(row, Value::BOOLEAN(true));
+			if (!handle.empty()) {
+				store.SessionBind(session_id, handle);
+				result.SetValue(row, Value::BOOLEAN(true));
+			}
 		} catch (std::exception &ex) {
 			store.AuditDoor("quack", "authenticate", false, "policy_error", ErrorData(ex).RawMessage());
 			result.SetValue(row, Value::BOOLEAN(false));
+		}
+		if (!placement.empty()) {
+			// spec 096: the one refusal a client should act on - go to a node of its resource group. The
+			// server hands this text to the client (quack f4328c5); it names groups and nothing else.
+			throw InvalidInputException(placement);
 		}
 	}
 }

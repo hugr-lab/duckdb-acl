@@ -45,7 +45,41 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 	auto draining = store.Draining();
 	auto live = store.SessionCount();
 	auto max_sessions = SettingOf(db, "acl_max_sessions", 1000);
-	bool session_room = !draining && (max_sessions == 0 || live < max_sessions);
+	// spec 096: the node's resource group and the profile version it targets / has applied. Read from
+	// the policy, so guarded: the report answers callers that are not authenticated, and a source that
+	// does not answer reads as "unknown", never as its own text
+	auto group = store.NodeGroup();
+	bool group_known = group.empty();
+	string target = "null";
+	auto now = std::chrono::steady_clock::now();
+	uint64_t writes = store.CatalogLocalWrites();
+	bool cached = false;
+	{
+		lock_guard<mutex> guard(store.lock);
+		auto &policy = store.node_load_policy;
+		if (policy.valid && policy.group == group && policy.writes == writes &&
+		    now - policy.at < std::chrono::seconds(2)) {
+			group_known = policy.group_known;
+			target = policy.target;
+			cached = true;
+		}
+	}
+	if (!cached) {
+		// a catalog this build may not read (spec 094) admits nobody: neither known nor targeted
+		try {
+			group_known = store.NodeGroupKnown();
+		} catch (std::exception &) {
+			group_known = false;
+		}
+		try {
+			target = std::to_string(store.ClusterVersion());
+		} catch (std::exception &) {
+		}
+		lock_guard<mutex> guard(store.lock);
+		store.node_load_policy = {now, group, group_known, target, writes, true};
+	}
+	auto applied = store.cluster_applied.load();
+	bool session_room = !draining && group_known && (max_sessions == 0 || live < max_sessions);
 
 	string by_door;
 	for (auto &door : store.SessionCountsByDoor()) {
@@ -88,10 +122,13 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 		          ",\"refused\":" + std::to_string(now.refused) + "}";
 	}
 #endif
-	return "{\"draining\":" + string(draining ? "true" : "false") + ",\"sessions\":{\"live\":" + std::to_string(live) +
-	       ",\"max\":" + std::to_string(max_sessions) + ",\"by_door\":{" + by_door + "},\"by_group\":{" + groups +
-	       "}},\"quack\":" + quack + ",\"streams\":" + streams +
-	       ",\"admit\":{\"new_session\":" + (session_room ? "true" : "false") +
+	return "{\"draining\":" + string(draining ? "true" : "false") +
+	       ",\"group\":" + (group.empty() ? string("null") : JsonQuote(group)) +
+	       ",\"group_known\":" + (group_known ? "true" : "false") + ",\"config\":{\"target\":" + target +
+	       ",\"applied\":" + (applied < 0 ? string("null") : std::to_string(applied)) + "}" +
+	       ",\"sessions\":{\"live\":" + std::to_string(live) + ",\"max\":" + std::to_string(max_sessions) +
+	       ",\"by_door\":{" + by_door + "},\"by_group\":{" + groups + "}},\"quack\":" + quack +
+	       ",\"streams\":" + streams + ",\"admit\":{\"new_session\":" + (session_room ? "true" : "false") +
 	       ",\"new_quack_client\":" + (session_room && quack_room ? "true" : "false") +
 	       ",\"new_stream\":" + (stream_room ? "true" : "false") + "}}";
 }
