@@ -196,9 +196,9 @@ int main(int argc, char *argv[]) {
 		Exec(con, "ACL ADMIN CREATE ROLE keeper");
 		Exec(con, "ACL ADMIN CREATE ROLE plain");
 		Exec(con, "ACL ADMIN CREATE ROLE analyst");
-		Exec(con, "SELECT acl_define_issuer('https://issuer.test/s',"
-		          "'{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
-		          "'api://acl-test','HS256','roles','{\"tid\": \"tenant\"}')");
+		Exec(con, "SET GLOBAL acl_jwks_locations = 'test/idp/'");
+		Exec(con, "SELECT acl_define_issuer('test/idp/s', '{\"url\": \"test/idp/s\", \"client\": {\"audiences\": "
+		          "[\"api://acl-test\"], \"roles_from\": [\"roles\"], \"attributes\": {\"tid\": \"tenant\"}}}')");
 		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, secrets) MAIN");
 		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE keeper WITH (select, secrets) MAIN");
 		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE plain WITH (select) MAIN");
@@ -278,9 +278,12 @@ int main(int argc, char *argv[]) {
 
 		Scenario("under a session, the service's call goes as the session - and its refusal reaches the client", [&] {
 			const std::string token =
-			    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2w"
-			    "tdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj"
-			    "5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc";
+			    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+			    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C"
+			    "2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDu"
+			    "SvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH"
+			    "8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Ty"
+			    "sjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A";
 			auto handle = One(con, "SELECT acl_session_open('" + token + "')");
 			auto under = [&](const std::string &sql) {
 				return One(con,

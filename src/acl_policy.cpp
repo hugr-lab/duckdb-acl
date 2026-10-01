@@ -280,39 +280,27 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 		// the real path: whatever refuses a token in the prefix refuses it here, and for the same
 		// reason - a session must never be a way to get in with something a prefix would reject
 		TakeDenyReason(); // a note a refusal nobody audited left on this thread must not name this one
-		IssuerConfig config;
-		if (!LookupIssuer(issuer, config)) {
-			return refused(Principal(), "principal", "acl_rewrite: token rejected: unknown issuer \"" + issuer + "\"");
-		}
-		JwtClaims verified;
+		// the source's own failure is the door's source_error (SessionOpen's guard), so the model is
+		// read before the try below; inside it everything is the token's or its keys'
+		Identity();
 		try {
-			config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
-			verified = VerifyJwt(token, config, JwtClockSkew());
+			VerifyJwtPrincipal(token, issuer, principal, false, &expires_at);
 		} catch (std::exception &ex) {
 			// the door refuses; it does not learn why. The audit does: the keys' source, when that is
-			// what failed (a note the read left), else the principal
+			// what failed (a note the read left), else the principal - as far as it was verified
 			CountJwt(audit.get(), "failed");
 			auto code = TakeDenyReason();
-			return refused(Principal(), code.empty() ? "principal" : code.c_str(), ErrorData(ex).RawMessage());
+			return refused(principal, code.empty() ? "principal" : code.c_str(), ErrorData(ex).RawMessage());
 		}
 		CountJwt(audit.get(), "ok");
-		principal.subject = verified.subject;
-		principal.issuer = issuer;
-		principal.roles = MapExternalRoles(issuer, verified.raw_roles);
-		if (principal.roles.empty()) {
-			return refused(principal, "principal", "acl_rewrite: token rejected: no recognized roles");
-		}
-		principal.claims = verified.claims;
 		// The role-default claims, exactly as the ACL TOKEN path merges them (VerifyPrincipal): a
 		// session is what `ACL SESSION` replays verbatim, so a claim the prefix path would carry and
 		// the session lacked made the SAME token answer differently through a door than through a
 		// gateway - an RLS predicate on a role default baked NULL and returned nothing (the 2026-09-03
-		// review). Explicit token claims win, both here and there.
-		MergeMemoryRoleDefaults(principal);
+		// review). Explicit token claims win, both here and there; the memory side is merged inside.
 		if (catalog) {
 			CatalogLoadRoleClaims(principal);
 		}
-		expires_at = verified.expires_at;
 	} else if (!VerifyPrincipal(true, token, principal)) {
 		return refused(Principal(), "principal", "acl_rewrite: token verification failed"); // the dev stub
 	}
@@ -773,6 +761,23 @@ void PolicyStore::AuditPolicy(const string &detail, const string &reason) {
 	audit->Emit(std::move(event));
 }
 
+void PolicyStore::AuditConnection(const string &kind, const string &name, const string &fingerprint) {
+	if (!audit) {
+		return;
+	}
+	// spec 095: what the secrets service changed under the policy - whom this node lets in may differ
+	// now. The object and a fingerprint of the connection, never a value of it.
+	AuditEvent event;
+	event.kind = "policy";
+	event.detail = "connection_changed";
+	event.allowed = true;
+	event.objects.push_back(AuditObject {name, kind});
+	event.reason = kind + " " + name + " now resolves to connection " + fingerprint;
+	event.level = AuditLevel::DECISIONS;
+	event.recorded = audit->Records(event.level, -1);
+	audit->Emit(std::move(event));
+}
+
 void PolicyStore::AuditKeys(const string &issuer, bool ok, const string &error, const char *detail,
                             const char *reason_code) {
 	if (!audit) {
@@ -1087,31 +1092,6 @@ bool PolicyStore::VerifyPrincipal(bool is_token, const string &value, Principal 
 	return true;
 }
 
-void PolicyStore::VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out, bool ignore_exp) {
-	IssuerConfig config;
-	if (!LookupIssuer(issuer, config)) {
-		throw BinderException("acl_rewrite: token rejected: unknown issuer \"%s\"", issuer);
-	}
-	// the keys may come from a document rather than the row (spec 023); the token's kid decides
-	// whether a cached one is still enough
-	config.keys_json = ResolveIssuerKeys(config, JwtKid(token));
-	auto verified = VerifyJwt(token, config, JwtClockSkew(), ignore_exp);
-	if (verified.raw_roles.empty() && verified.groups_overage) {
-		throw BinderException("acl_rewrite: token rejected: groups overage - the groups claim was replaced "
-		                      "by a Graph link; resolve groups at the gateway and use the ROLE form");
-	}
-	out.subject = verified.subject;
-	out.issuer = issuer;
-	out.roles = MapExternalRoles(issuer, verified.raw_roles);
-	if (out.roles.empty()) {
-		throw BinderException("acl_rewrite: token rejected: no recognized roles");
-	}
-	out.claims = std::move(verified.claims);
-	// role-default claims of the mapped roles (explicit token claims win); the catalog side is
-	// merged by the caller via CatalogLoadRoleClaims
-	MergeMemoryRoleDefaults(out);
-}
-
 void PolicyStore::MergeMemoryRoleDefaults(Principal &out) {
 	lock_guard<mutex> guard(lock);
 	for (auto &role : out.roles) {
@@ -1125,92 +1105,6 @@ void PolicyStore::MergeMemoryRoleDefaults(Principal &out) {
 			}
 		}
 	}
-}
-
-vector<string> PolicyStore::ListIssuers() {
-	// the discovery document's content (spec 062): issuer URLs only - public by nature, the same
-	// class of fact OIDC discovery itself publishes
-	vector<string> out;
-	if (catalog) {
-		CatalogListIssuers(out);
-		return out;
-	}
-	lock_guard<mutex> guard(lock);
-	for (auto &entry : issuers) {
-		out.push_back(entry.second.issuer);
-	}
-	return out;
-}
-
-bool PolicyStore::LookupIssuer(const string &issuer, IssuerConfig &out) {
-	// like every resolver: an enabled catalog is the only source (a stale memory entry must not
-	// shadow the catalog registry)
-	if (catalog) {
-		return CatalogLookupIssuer(issuer, out);
-	}
-	lock_guard<mutex> guard(lock);
-	auto entry = issuers.find(issuer);
-	if (entry == issuers.end()) {
-		return false;
-	}
-	out = entry->second;
-	return true;
-}
-
-vector<string> PolicyStore::MapExternalRoles(const string &issuer, const vector<string> &raw_roles) {
-	case_insensitive_map_t<vector<string>> mapped;
-	case_insensitive_set_t known;
-	if (catalog) {
-		CatalogMapExternalRoles(issuer, raw_roles, mapped, known);
-	}
-	lock_guard<mutex> guard(lock);
-	auto issuer_map = role_mappings.find(issuer);
-	vector<string> roles;
-	case_insensitive_set_t seen;
-	auto add = [&](const string &role) {
-		if (!seen.count(role)) {
-			seen.insert(role);
-			roles.push_back(role);
-		}
-	};
-	for (auto &raw : raw_roles) {
-		bool matched = false;
-		if (issuer_map != role_mappings.end()) {
-			auto entry = issuer_map->second.find(raw);
-			if (entry != issuer_map->second.end()) {
-				for (auto &role : entry->second) {
-					add(role);
-				}
-				matched = true;
-			}
-		}
-		auto catalog_entry = mapped.find(raw);
-		if (catalog_entry != mapped.end()) {
-			for (auto &role : catalog_entry->second) {
-				add(role);
-			}
-			matched = true;
-		}
-		if (matched) {
-			continue;
-		}
-		// unmapped: accept the raw value as an internal role only if that role is actually known -
-		// unknown values are ignored (fail closed via the "no recognized roles" check)
-		if (known.count(raw) || tables.count(raw) || table_functions.count(raw) || scalar_functions.count(raw) ||
-		    role_claims.count(raw)) {
-			add(raw);
-		}
-	}
-	return roles;
-}
-
-void PolicyStore::DefineIssuer(IssuerConfig config) {
-	if (catalog) {
-		CatalogDefineIssuer(config);
-		return;
-	}
-	lock_guard<mutex> guard(lock);
-	issuers[config.issuer] = std::move(config);
 }
 
 AdminScope ParseAdminScope(const string &scope) {
@@ -1299,16 +1193,6 @@ bool PolicyStore::AnonymousAdminAllowed() {
 	// the in-memory dev mode keeps the historical behavior; a real policy source means production,
 	// where the gateway's own escape hatch must be turned on deliberately
 	return !catalog || CatalogAnonymousAdminAllowed();
-}
-
-void PolicyStore::MapRole(const string &issuer, const string &source, const string &external_value,
-                          const string &role) {
-	if (catalog) {
-		CatalogMapRole(issuer, source, external_value, role);
-		return;
-	}
-	lock_guard<mutex> guard(lock);
-	role_mappings[issuer][external_value].push_back(role);
 }
 
 //! The exec-context seam (spec 050). Thread-local: the door sets it on the thread that calls

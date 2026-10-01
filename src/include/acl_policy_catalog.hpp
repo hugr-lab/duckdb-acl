@@ -330,7 +330,9 @@ struct CatalogBackend {
 	shared_ptr<const FunctionCategoryModel> function_model;
 	case_insensitive_map_t<case_insensitive_map_t<string>> claims_cache; // role -> claims
 	case_insensitive_set_t claims_loaded;
-	case_insensitive_map_t<std::pair<bool, IssuerConfig>> issuer_cache; // issuer -> (found, config)
+	//! spec 095: the identity model of this policy version (issuers, clients, role mappings), read
+	//! whole on first use and dropped on a version bump; nullptr until then
+	shared_ptr<const IdentityModel> identity_model;
 	//! rolesig -> (manage catalogs, acl.admins rows); administration statements hit this per batch
 	std::unordered_map<string, std::pair<std::set<string>, vector<std::pair<string, string>>>> rights_cache;
 	case_insensitive_map_t<vector<GrantRow>> fn_grants; // function mode: role -> rows
@@ -482,11 +484,11 @@ struct CatalogBackend {
 	string SettingString(const char *name, const char *fallback);
 	int64_t SettingInt64(const char *name, int64_t fallback);
 
-	//! Every issuer the policy names - the discovery document's content (spec 062). Function-driver
-	//! mode has no issuers table to enumerate, so discovery is empty there rather than guessed.
-	void ListIssuers(vector<string> &out);
-
-	bool LookupIssuer(const string &issuer, IssuerConfig &out);
+	//! spec 095: the identity model in force - the three tables, or the function driver's optional
+	//! `issuers` / `clients` / `role_mappings` slots (no arguments, the tables' columns in order)
+	shared_ptr<const IdentityModel> Identity();
+	//! The model from rows already read (the write path reads them inside its own transaction)
+	static IdentityModel IdentityFromRows(QueryResult *issuers, QueryResult *clients, QueryResult *mappings);
 
 	//! Load (and cache) both administration sources for the principal in one go
 	void LoadRights(const Principal &principal, std::set<string> &catalogs, vector<std::pair<string, string>> &scopes);
@@ -498,9 +500,8 @@ struct CatalogBackend {
 	//! The admin scopes of the principal's roles; the function-driver may serve them through a slot
 	void AdminScopes(const Principal &principal, vector<std::pair<string, string>> &out);
 
-	//! One query maps external role values and checks which raw values exist as internal roles
-	void MapExternalRoles(const string &issuer, const vector<string> &values,
-	                      case_insensitive_map_t<vector<string>> &mapped, case_insensitive_set_t &known_roles);
+	//! spec 095: which of these values exist as roles (UNMAPPED AS ROLE keeps only those)
+	void KnownRoles(const vector<string> &values, case_insensitive_set_t &known_roles);
 
 	//! Bind a template (markers baked to NULL) without reading data, and return its column schema.
 	//! Runs on the write path, so introspection later costs nothing; a failure is not fatal - the
@@ -552,10 +553,6 @@ struct CatalogBackend {
 	//! same two steps as a predicate's check (spec 021), for the same reason.
 	string ProjectionSchema(const string &source, const string &column_csv, const case_insensitive_map_t<string> &own,
 	                        vector<std::pair<string, string>> &out, bool *checked = nullptr);
-
-	//! Read a document through duckdb's own filesystem (spec 023). A local path works out of the box;
-	//! an https URL needs httpfs, and duckdb says so itself - which is the error an operator needs.
-	bool ReadText(const string &uri, string &out, string &error);
 
 	//! Whether a relation has a column of that name. False only when the relation itself binds and the
 	//! column does not: a source that cannot be reached at all answers true, since it cannot answer.

@@ -16,9 +16,12 @@ namespace {
 
 //! An HS256 token for the issuer the fixture defines: roles ["analyst"], tid=acme, exp in 2100.
 const char *const TOKEN =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2w"
-    "tdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj"
-    "5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc";
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C"
+    "2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDu"
+    "SvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH"
+    "8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Ty"
+    "sjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A";
 
 //! The handle a door would hold, or "" when the token did not verify
 std::string OpenSession(Connection &con, const std::string &token) {
@@ -187,9 +190,9 @@ int main(int argc, char *argv[]) {
 	Exec(con, "INSERT INTO phys.main.orders VALUES (1,'acme'),(2,'acme'),(3,'globex')");
 	Exec(con, "SELECT acl_use_db('store','acl',true)");
 	Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
-	Exec(con, "SELECT acl_define_issuer('https://issuer.test/s',"
-	          "'{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
-	          "'api://acl-test','HS256','roles','{\"tid\": \"tenant\"}')");
+	Exec(con, "SET GLOBAL acl_jwks_locations = 'test/idp/'");
+	Exec(con, "SELECT acl_define_issuer('test/idp/s', '{\"url\": \"test/idp/s\", \"client\": {\"audiences\": "
+	          "[\"api://acl-test\"], \"roles_from\": [\"roles\"], \"attributes\": {\"tid\": \"tenant\"}}}')");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG c");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders "
 	          "RLS 'tenant = acl_claim(''tenant'')'");
@@ -209,9 +212,12 @@ int main(int argc, char *argv[]) {
 		Exec(con, "ACL ADMIN CREATE ROLE defaulted CLAIMS (tenant = 'acme')");
 		Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE defaulted MAIN");
 		const std::string no_tid =
-		    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wt"
-		    "dGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoiZCIsInJvbGVzIjpbImRlZmF1bHRlZCJdfQ."
-		    "hBRUGp4u7kgSswo0DSb-3yDV_ZxBpluov1IpAdZ-5nk";
+		    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+		    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImQiLCJyb2xlcyI6WyJkZWZhdWx0ZWQiXX0.HsheMejWlDHBYH6v"
+		    "sSbL8n9Q5o1JBFoG1vChQqCsBc4UYFQIbGkuWGOrOwpvB1zSqRHvWGVX_45N903CMdkQC_xB9HyjcGMZl3jNUBsShX-uiyOyCw3U"
+		    "y286WwiiqBJPwXD4E4x0tDxzUQwNa9L3D3Mc6t-Il_-TiwFnDoDEe9SLBPQHBx17AoCUOH6QdyvxdwwJOqKMiZ60OkTUb8lTGIWJ"
+		    "acoYBNCtjf5ZrV_EBEU2ylYM-lD5WSqsj_IG7FMx-Ej2poabmrVLUsoeTxluGRNFA7ztT1vaUtnyQbZlahLVVVD4SYRKjiM2N_8P"
+		    "eRetvA-g_tgeupcJQBCNsuIm5A";
 		auto by_token = con.Query("ACL TOKEN '" + no_tid + "' SELECT count(*)::BIGINT FROM orders");
 		auto handle = OpenSession(con, no_tid);
 		Check(!handle.empty(), "the claim-less token opens a session");

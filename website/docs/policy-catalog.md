@@ -12,8 +12,7 @@ resolver:
 
 `acl_status()` says which is active: `backend` (`memory` / `catalog` / `functions`),
 `schema_version`, `policy_version`, `version_check_interval`, `enumerates`. Both doors refuse to serve
-without a policy source, and a `KEYS FROM` issuer cannot read its document in memory mode
-([authentication.md](authentication.md)).
+without a policy source ([authentication.md](authentication.md)).
 
 Both enablers refuse while enforcement is off: *"acl: allow_parser_override_extension is DEFAULT, so
 no `ACL …` statement is parsed and nothing is enforced - SET GLOBAL
@@ -90,15 +89,16 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 | `resource_groups` | spec 085: a group's limits (`window_start`, `window_max`, `batch_bytes`, `max_result_rows`, `queue_priority`, `max_sessions`; NULL = the node's setting) and comment |
 | `role_resource_groups` | which roles are in which groups |
 | `admins` | global administration scopes: `manage` or `passthrough`, optionally per catalog |
-| `issuers` | JWT issuers: keys or `jwks_uri`, audiences, algs, role claim, claim map, `client_id`, `client_secret` |
-| `role_mappings` | external value → role, per issuer and source (`group` / `claim-value`) |
+| `issuers` | JWT issuers (spec 095): name, URL, and the name of an `oidc_issuer` secret with its service - never a key |
+| `clients` | which tokens of an issuer count and what they become: audiences, azp, requires, roles from/constant, unmapped, attributes, subject, token type, client id, flows, an `oidc_client` secret's name, implicit - never a credential |
+| `role_mappings` | external value → role, scoped to a client or an issuer (`scope_kind`, `scope_name`), per source (`group` / `claim-value`) |
 | `references` / `reference_columns` | declared join paths between objects and the columns each end names (spec 022) |
 | `keys` | a declared primary key per object - a hint, never enforced (spec 048) |
 
 ## Schema versions and migration (specs 034, 094)
 
-The catalog says which shape it is: `meta.schema_version`, currently **16**. It also says the oldest
-build that may still read it: `meta.min_reader_version`, currently **15**. A build judges the pair
+The catalog says which shape it is: `meta.schema_version`, currently **17**. It also says the oldest
+build that may still read it: `meta.min_reader_version`, currently **17**. A build judges the pair
 where the catalog is chosen (`acl_use_db`) and again at every freshness check (below), so a catalog
 migrated under a running node is noticed without a restart.
 
@@ -135,7 +135,8 @@ nodes off at their next freshness check. That upgrade is a switch-over, not a ro
 `-- min_reader: <n>` in its header. Only its author knows whether an older build that ignores what the
 step adds can ever admit more. A new column that *narrows* access, read by the new build only, would
 widen access on an old node that ignores it, so such a step must declare its own version. v16 only
-adds the cluster profile's tables, so it keeps v15 readers. Every step before it is strict.
+adds the cluster profile's tables, so it keeps v15 readers. Every other step is strict - v17 rebuilds
+the identity tables.
 
 The steps are also kept as files (`schema/migrations/v<n>.sql`, duckdb dialect) for applying by hand on
 another engine. The shipped steps are:
@@ -148,6 +149,7 @@ another engine. The shipped steps are:
 | `v14` | 072 | adds the function categories, seeded |
 | `v15` | 085 | adds the resource groups |
 | `v16` | 093 | adds the cluster profile; stamps `min_reader_version` 15 |
+| `v17` | 095 | rebuilds `issuers` (name, URL, secret), adds `clients`, scopes `role_mappings`; each issuer becomes the short form (an issuer named by its URL and its implicit client); keys, algs, `jwks_uri` and `client_secret` are **dropped** - an issuer that relied on them needs an `oidc_issuer` / `oidc_client` secret or reads its keys by discovery; an audience `*` no longer means "any" |
 
 The contract behind this is in `schema/migrations/README.md`:
 - `acl_schema.sql` always creates the current version complete, and a migrated catalog must be
@@ -191,7 +193,8 @@ SELECT acl_use_functions('{
   "function_category_members": "my_function_members",
   "function_grants":           "my_function_grants",
   "role_claims":      "my_role_claims",      -- optional
-  "issuer":           "my_issuer",           -- optional
+  "issuers":          "my_issuers",          -- optional, spec 095
+  "clients":          "my_clients",          -- optional, spec 095
   "role_mappings":    "my_role_mappings",    -- optional
   "admin_scopes":     "my_admin_scopes"      -- optional
 }');
@@ -216,15 +219,16 @@ arguments arrive as `VARCHAR[]` literals):
 | `function_category_members` | `()` | `(category, database, schema, name, kind)` |
 | `function_grants` | `()` | `(role, category, database, schema, name, kind, allowed)`, `''` role = every role |
 | `role_claims` | `(roles)` | `(role, claim, value)`; absent = no role-default claims |
-| `issuer` | `(iss)` | `(issuer, keys_json, audiences, algs, role_claim, claim_map[, jwks_uri[, client_id, client_secret]])`; absent = no JWT issuers |
-| `role_mappings` | `(issuer, external_values)` | `(external_value, role)`; absent = no external mapping - an unmapped value counts as a role iff `role_catalogs([value])` grants it something |
+| `issuers` | `()` | `(name, url, secret_service, secret)`; absent = no JWT issuers (spec 095) |
+| `clients` | `()` | the `clients` table's columns in order (`name, issuer, audiences, azp, requires, roles_from, roles_constant, unmapped, attributes, subject, token_type, client_id, flows, secret_service, secret, implicit`; lists as JSON arrays); absent = no clients, so no token verifies |
+| `role_mappings` | `()` | `(scope_kind, scope_name, source, external_value, role)`; absent = no mappings - an unmapped value counts as a role (for a client with `UNMAPPED AS ROLE`) iff `role_catalogs([value])` grants it something |
 | `admin_scopes` | `(roles)` | `(role, scope, vcat)`; absent = no global admin scopes |
 
 What the driver does *not* have: a schema level (no schema grants, no `create`/`drop` homes), any
 write path (*"acl catalog: the function-driver policy source is read-only"* on every admin write),
 and enumeration - the introspection listings refuse (*"this policy source does not expose
 enumeration ..."*), `acl_status()` reports `enumerates = false` with no versions, and the doors'
-auth discovery lists no issuers, so the Flight password handshake finds no `CLIENT ID` to run as.
+auth discovery lists what the `issuers` and `clients` slots answer (nothing without them).
 Staleness and caches are the catalog's (`acl_version_check_interval` applies to the
 `policy_version` callback). `test/sql/acl_functions_driver.test` mocks the whole contract with
 `CREATE MACRO ... AS TABLE` over `VALUES`, which is the quickest way to see the shapes in use.
@@ -237,16 +241,16 @@ a principal's query - *"table function "acl_issuers" is not allowed"*): `acl_cat
 `acl_functions()`, `acl_references()`, `acl_reference_columns()`, `acl_roles()`, `acl_role_claims()`,
 `acl_grants()` (from `role_catalogs`), `acl_schema_grants()` (from `role_schemas`),
 `acl_object_grants()` (from `role_object_caps`), `acl_grant_columns()`, `acl_admins()`,
-`acl_issuers()`, `acl_role_mappings()`, `acl_function_categories()`, `acl_function_category_members()`,
+`acl_issuers()`, `acl_clients()`, `acl_role_mappings()`, `acl_function_categories()`, `acl_function_category_members()`,
 `acl_function_grants()`, and `acl_status()` - plus `acl_function_status([role])`, which joins the
 node's own `duckdb_functions()` with the categories (spec 072): every function with its categories
 and status (`never` / `categorized` / `uncategorized`), and with a role, whether it may call it and
 what decided. The three category listings answer in every mode, the seed included.
 
 The column names and types come from the storage at bind, so a listing cannot drift from the tables;
-the rows are read per execution, so a prepared statement shows the policy as it is now. Two
-deliberate omissions: `acl_issuers()` has no `keys_json` (an HS256 key is a shared secret, not
-metadata) and no `client_secret`. Without a source the listings refuse rather than answer nothing -
+the rows are read per execution, so a prepared statement shows the policy as it is now. No key and no
+credential is in them to begin with: an issuer's keys and a client's secret live in the secrets
+service (spec 095), and the listings show the secret's name. Without a source the listings refuse rather than answer nothing -
 *"no policy source is active, so there is nothing to list - run acl_use_db() or acl_use_functions()
 first"* - because on an admin surface silence reads as "nothing is configured"; `acl_status()` always
 answers.
@@ -268,8 +272,9 @@ To move a catalog, attach it under its new home and point the node at it with in
 whatever it was created as; `acl_schema.sql` renders `acl` and an operator wanting another name edits
 the applied copy.
 
-What is **not** in the catalog, and does not travel with it: sessions (per node, in memory), the JWKS
-cache and the OIDC discovery cache (per node / per process), the settings (`SET GLOBAL` per node -
+What is **not** in the catalog, and does not travel with it: sessions (per node, in memory), the
+discovery/JWKS document cache and the doors' OIDC endpoint cache (per node / per process), the
+issuers' and clients' secrets (the secrets service's), the settings (`SET GLOBAL` per node -
 `acl_version_check_interval`, `acl_jwt_clock_skew`, the JWKS and session settings), and everything the
 memory-mode stubs hold (`acl_define_token`, an issuer defined before `acl_use_db`).
 
@@ -284,7 +289,8 @@ Nodes are identical and share nothing but the catalog:
   routes must keep a client on one node (the Flight door's session cookie, quack's per-connection
   binding). There is no shared session backend, by decision.
 - Issuer keys are re-read per node (`acl_jwks_refresh_interval`), so an IdP rotation reaches each
-  node independently; a `kid` a node has not seen triggers its own re-read.
+  node independently; a `kid` a node has not seen triggers its own re-read. A secret's change reaches
+  each node at its next read through the service's cache, with no policy write.
 - Settings are per node; set them identically, or accept that a node with `every_use` and another
   with `connect` judge the same session differently.
 - A read-only replica of the catalog database serves a node that never writes; administration goes

@@ -84,10 +84,9 @@ make_user viewer1 "${ACL_KC_VIEWER1_PASS:-viewer1-pass}" acme viewer
 cat <<INFO
 
 realm ready: $KC/realms/$REALM
-  issuer for the node:  SET GLOBAL acl_jwks_locations = 'https://, $KC/realms/$REALM/';   -- spec 071
+  issuer for the node:  SET GLOBAL acl_jwks_locations = 'https://, $KC/realms/$REALM/';   -- specs 071, 095
                         ACL ADMIN CREATE ISSUER '$KC/realms/$REALM'
-                          KEYS FROM '$KC/realms/$REALM/protocol/openid-connect/certs'
-                          AUDIENCES ('account') ALGS (RS256)
+                          AUDIENCES ('account')
                           ROLE CLAIM 'realm_access.roles' CLAIM MAP '{"tenant": "tenant"}';
   provider secret:      CREATE SECRET kc (TYPE quack, PROVIDER oidc, SCOPE 'quack:<host>:<port>',
                           ISSUER '$KC/realms/$REALM', CLIENT_ID 'acl-cli',

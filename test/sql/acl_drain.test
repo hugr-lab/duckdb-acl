@@ -6,6 +6,10 @@
 require acl
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS store;
 
 statement ok
@@ -24,9 +28,7 @@ statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
 statement ok
-SELECT acl_define_issuer('https://issuer.test/d',
-    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
-    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+SELECT acl_define_issuer('test/idp/d', '{"url": "test/idp/d", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
 
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG c;
@@ -56,7 +58,7 @@ false
 # --- a session opened before the drain ---------------------------------------------------------------
 
 statement ok
-CREATE TABLE live AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2QiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.gstZBDzIufL6uJz88zCxoRtnuoCHhnvaqFIPbaIDCyM') AS handle;
+CREATE TABLE live AS SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9kIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.aPBrtcgDKpBFx79Ko8KlU6Y7are0gcq2Y9vgEqT2Gf5nst5QaDZGzcw_t9vyi0EmBbnB8dgagSh6VsH7P7vqm08RdVAdVYqVolxtZWMxAk2FbCCEoOdGoZ-Fa9bV45HC70xIF1gxoe2GUA4APh3ZL19gmXXHYbjtzgC86sdZ4koOfo2juuGyddJ0dbxgnNqciGuIsVozV9jh5lKky6wrXAxCjxuXAiBGiwGs153I0uA30CjTjQT576A7gXz0qmaEkVj89UOG5yhNkMkJ1_Buskxu0EBCQMrKoLp_JNZFBRvKb_U8WiGt6-XJOklkhVX4HAwUma40fep-5rhuiNhsRw') AS handle;
 
 query I
 SELECT handle IS NOT NULL FROM live;
@@ -78,7 +80,7 @@ draining
 
 # the same, perfectly valid token that opened `live` is refused now - a draining node seats nobody new
 query I
-SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2QiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.gstZBDzIufL6uJz88zCxoRtnuoCHhnvaqFIPbaIDCyM') IS NULL;
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9kIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.aPBrtcgDKpBFx79Ko8KlU6Y7are0gcq2Y9vgEqT2Gf5nst5QaDZGzcw_t9vyi0EmBbnB8dgagSh6VsH7P7vqm08RdVAdVYqVolxtZWMxAk2FbCCEoOdGoZ-Fa9bV45HC70xIF1gxoe2GUA4APh3ZL19gmXXHYbjtzgC86sdZ4koOfo2juuGyddJ0dbxgnNqciGuIsVozV9jh5lKky6wrXAxCjxuXAiBGiwGs153I0uA30CjTjQT576A7gXz0qmaEkVj89UOG5yhNkMkJ1_Buskxu0EBCQMrKoLp_JNZFBRvKb_U8WiGt6-XJOklkhVX4HAwUma40fep-5rhuiNhsRw') IS NULL;
 ----
 true
 
@@ -114,7 +116,7 @@ SELECT acl_drain_status();
 serving
 
 query I
-SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2QiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.gstZBDzIufL6uJz88zCxoRtnuoCHhnvaqFIPbaIDCyM') IS NOT NULL;
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9kIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.aPBrtcgDKpBFx79Ko8KlU6Y7are0gcq2Y9vgEqT2Gf5nst5QaDZGzcw_t9vyi0EmBbnB8dgagSh6VsH7P7vqm08RdVAdVYqVolxtZWMxAk2FbCCEoOdGoZ-Fa9bV45HC70xIF1gxoe2GUA4APh3ZL19gmXXHYbjtzgC86sdZ4koOfo2juuGyddJ0dbxgnNqciGuIsVozV9jh5lKky6wrXAxCjxuXAiBGiwGs153I0uA30CjTjQT576A7gXz0qmaEkVj89UOG5yhNkMkJ1_Buskxu0EBCQMrKoLp_JNZFBRvKb_U8WiGt6-XJOklkhVX4HAwUma40fep-5rhuiNhsRw') IS NOT NULL;
 ----
 true
 

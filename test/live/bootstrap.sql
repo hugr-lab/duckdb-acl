@@ -18,9 +18,7 @@ ATTACH ':memory:' AS store;
 SELECT acl_use_db('store', 'acl', true);
 
 SET GLOBAL acl_allow_anonymous_admin=true;
-SELECT acl_define_issuer('https://issuer.test/s',
-    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
-    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+SELECT acl_define_issuer('test/idp/s', '{"url": "test/idp/s", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
 ACL ADMIN CREATE VIRTUAL CATALOG c;
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders PRIMARY KEY (id);
 ACL ADMIN CREATE VIRTUAL TABLE c.customers AS memory.main.customers;

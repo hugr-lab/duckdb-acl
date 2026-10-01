@@ -2,7 +2,7 @@
 # description: the schema compatibility window (spec 094) - a catalog newer than the build but inside
 #   the window it declares is served from and never written, re-judged under a running node; outside
 #   it the node refuses (fail closed); an older catalog is migrated forward by the steps the build
-#   carries (acl_migrate_catalog), in one transaction
+#   carries (acl_migrate_catalog), in one transaction - here v16 to v17, spec 095's identity tables
 # group: [sql]
 
 require acl
@@ -43,15 +43,15 @@ ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
 query T
 SELECT acl_catalog_schema();
 ----
-{'build': 16, 'build_min_reader': 15, 'catalog': 16, 'min_reader': 15, 'mode': current}
+{'build': 17, 'build_min_reader': 17, 'catalog': 17, 'min_reader': 17, 'mode': current}
 
 # --- a newer catalog inside its window, migrated under the running node: served, never written ---
 
 statement ok
-UPDATE store.acl.meta SET "value" = '17' WHERE "key" = 'schema_version';
+UPDATE store.acl.meta SET "value" = '18' WHERE "key" = 'schema_version';
 
 statement ok
-UPDATE store.acl.meta SET "value" = '16' WHERE "key" = 'min_reader_version';
+UPDATE store.acl.meta SET "value" = '17' WHERE "key" = 'min_reader_version';
 
 query I
 ACL ROLE "r" SELECT count(*) FROM orders;
@@ -66,12 +66,12 @@ read_only
 statement error
 ACL ADMIN CREATE ROLE other;
 ----
-<REGEX>:.*schema version 17 and this node's build writes 16 - policy is written from a node of the catalog's build.*
+<REGEX>:.*schema version 18 and this node's build writes 17 - policy is written from a node of the catalog's build.*
 
 statement error
 ACL ADMIN CLUSTER SET threads = 2;
 ----
-<REGEX>:.*this node's build writes 16.*
+<REGEX>:.*this node's build writes 17.*
 
 # the refused write wrote nothing
 query I
@@ -82,12 +82,12 @@ SELECT count(*) FROM store.acl.roles WHERE "role" = 'other';
 # --- outside the window: the running node stops serving (fail closed) -----------------------------
 
 statement ok
-UPDATE store.acl.meta SET "value" = '17' WHERE "key" = 'min_reader_version';
+UPDATE store.acl.meta SET "value" = '18' WHERE "key" = 'min_reader_version';
 
 statement error
 ACL ROLE "r" SELECT count(*) FROM orders;
 ----
-<REGEX>:.*schema version 17, readable from build 17 on, and this build is 16 - upgrade the node.*
+<REGEX>:.*schema version 18, readable from build 18 on, and this build is 17 - upgrade the node.*
 
 statement error
 SELECT acl_use_db('store', 'acl', false);
@@ -103,31 +103,51 @@ SELECT acl_migrate_catalog('store', 'acl');
 # --- an older catalog: refused with what to do, then migrated by the embedded steps ------------------
 
 statement ok
+UPDATE store.acl.meta SET "value" = '17' WHERE "key" = 'schema_version';
+
+statement ok
+UPDATE store.acl.meta SET "value" = '17' WHERE "key" = 'min_reader_version';
+
+statement ok
+SELECT acl_use_db('store', 'acl', false);
+
+# make it a v16 catalog: the identity tables as v16 had them - an issuer row with pasted keys and a
+# client secret, and a mapping keyed by the issuer
+statement ok
+DROP TABLE store.acl.clients;
+
+statement ok
+DROP TABLE store.acl.issuers;
+
+statement ok
+DROP TABLE store.acl.role_mappings;
+
+statement ok
+CREATE TABLE store.acl.issuers("issuer" VARCHAR PRIMARY KEY, "keys_json" VARCHAR, "audiences" VARCHAR, "algs" VARCHAR, "role_claim" VARCHAR, "claim_map" VARCHAR, "jwks_uri" VARCHAR, "client_id" VARCHAR, "client_secret" VARCHAR);
+
+statement ok
+INSERT INTO store.acl.issuers VALUES ('test/idp/rs', '{"keys":[{"kty":"oct","k":"c2VjcmV0"}]}', 'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}', NULL, 'door-app', 'super-secret-value');
+
+# and one v16 allowed that v17 does not: no audiences (v16 checked none)
+statement ok
+INSERT INTO store.acl.issuers VALUES ('test/idp/a', NULL, '', 'RS256', 'roles', NULL, NULL, NULL, NULL);
+
+statement ok
+CREATE TABLE store.acl.role_mappings("issuer" VARCHAR, "source" VARCHAR, "external_value" VARCHAR, "role" VARCHAR, PRIMARY KEY ("issuer", "source", "external_value", "role"));
+
+statement ok
+INSERT INTO store.acl.role_mappings VALUES ('test/idp/rs', 'claim-value', 'analyst-x', 'r');
+
+statement ok
 UPDATE store.acl.meta SET "value" = '16' WHERE "key" = 'schema_version';
 
 statement ok
 UPDATE store.acl.meta SET "value" = '15' WHERE "key" = 'min_reader_version';
 
-statement ok
-SELECT acl_use_db('store', 'acl', false);
-
-# make it a v15 catalog: without what v16 added
-statement ok
-DROP TABLE store.acl.cluster_items;
-
-statement ok
-DROP TABLE store.acl.cluster_deps;
-
-statement ok
-DELETE FROM store.acl.meta WHERE "key" IN ('config_version', 'min_reader_version');
-
-statement ok
-UPDATE store.acl.meta SET "value" = '15' WHERE "key" = 'schema_version';
-
 statement error
 SELECT acl_use_db('store', 'acl', false);
 ----
-<REGEX>:.*schema version 15 and this build reads 16 - migrate it first: SELECT acl_migrate_catalog\('store', 'acl'\).*
+<REGEX>:.*schema version 16 and this build reads 17 - migrate it first: SELECT acl_migrate_catalog\('store', 'acl'\).*
 
 statement error
 SELECT acl_use_db('store', 'acl', true);
@@ -137,12 +157,12 @@ SELECT acl_use_db('store', 'acl', true);
 query T
 SELECT acl_migrate_catalog('store', 'acl');
 ----
-"store"."acl" migrated from schema version 15 to 16 (readable from build 15 on)
+"store"."acl" migrated from schema version 16 to 17 (readable from build 17 on)
 
 query T
 SELECT acl_migrate_catalog('store');
 ----
-"store"."acl" is already schema version 16
+"store"."acl" is already schema version 17
 
 statement ok
 SELECT acl_use_db('store', 'acl', false);
@@ -150,21 +170,54 @@ SELECT acl_use_db('store', 'acl', false);
 query T
 SELECT acl_catalog_schema();
 ----
-{'build': 16, 'build_min_reader': 15, 'catalog': 16, 'min_reader': 15, 'mode': current}
+{'build': 17, 'build_min_reader': 17, 'catalog': 17, 'min_reader': 17, 'mode': current}
 
-# what v16 added is there, and the policy is intact
+# spec 095: the issuer became the short form - its keys, algorithms and client secret are gone, the
+# rest is its implicit client, and its mapping is scoped to that client (its only one)
+query IIII
+SELECT name, url, secret_service, secret FROM store.acl.issuers ORDER BY name;
+----
+test/idp/a	test/idp/a	NULL	NULL
+test/idp/rs	test/idp/rs	NULL	NULL
+
+query IIIIIIII
+SELECT name, issuer, audiences, roles_from, attributes, client_id, flows, implicit FROM store.acl.clients WHERE name = 'test/idp/rs';
+----
+test/idp/rs	test/idp/rs	api://acl-test	roles	{"tid": "tenant"}	door-app	password	true
+
 query I
-SELECT acl_cluster_version();
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'store' AND schema_name = 'acl'
+    AND column_name IN ('keys_json', 'algs', 'jwks_uri', 'client_secret');
 ----
 0
 
+query IIIII
+SELECT scope_kind, scope_name, source, external_value, role FROM store.acl.role_mappings;
+----
+client	test/idp/rs	claim-value	analyst-x	r
+
+# and it verifies: the keys by the issuer's discovery, the role by the migrated mapping
 statement ok
-ACL ADMIN CLUSTER SET threads = 2;
+SET GLOBAL acl_jwks_locations = 'test/idp/';
 
 query I
-ACL ROLE "r" SELECT count(*) FROM orders;
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJtMSIsInJvbGVzIjpbImFuYWx5c3QteCJdLCJ0aWQiOiJhY21lIn0.FRL2WE6j_ssYTn6Cz1YxwVryvGJhPtfr430Sr7GzDGr4hsRjR9cuFUPiNsR62TmFmJzZm1f73GSNNemR-KLpxA3gAFHhid1xjiaddanwCbKAHBv5pRhwXSRu8Dv2kOsAoHcb0P23qpKqykG0GX8Iv3QJMoMYawYDZBuUmSo6rQmHt95tJR4EGOnwahaLU0KyEZtixFRUZhlHeZGK8UMf0x1BKbsKlq7wvzzNBOLrFeJ1pkO3kbmqDDCwGwhWkwz3lbxfmlXHTQzmsTH_MPKFeuGqirUVb8TMV0ZEqKGOMMrpFtoBaJPFZNOGjhbBXevbiLaSME3_EprdurFnYMw0kQ' SELECT count(*) FROM orders;
 ----
 2
+
+# the migrated client without audiences accepts nothing (fail closed) - and does not block other
+# writes; naming its audiences is the repair
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN MAP CLAIM 'more' FROM ISSUER 'test/idp/rs' TO ROLE r;
+
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET AUDIENCES ('api://acl-test');
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 2;
 
 # --- not an acl catalog -----------------------------------------------------------------------------
 

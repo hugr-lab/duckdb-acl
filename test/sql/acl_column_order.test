@@ -7,6 +7,10 @@
 require acl
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS store;
 
 statement ok
@@ -25,9 +29,7 @@ statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
 statement ok
-SELECT acl_define_issuer('https://issuer.test/order',
-    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
-    'api://acl-test', 'HS256', 'roles', '');
+SELECT acl_define_issuer('test/idp/order', '{"url": "test/idp/order", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"]}}');
 
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG c;
@@ -59,13 +61,13 @@ ACL ADMIN GRANT OBJECT c.orders TO ROLE rb COLUMNS (id, amount, tag);
 # --- the read path ---------------------------------------------------------------------------------
 
 query III
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmEiLCJyYiJdfQ.MH46abRthAGV7khkVQfbeFqEpOLXgB54l4tv4tWKl-nQPALtrBQaWmHyKAGS_f_G59noaTWj3Mhhr5SvKsVQHywqnRRWomG29rL1UzaLgbJefs_PYtAdJi_iaCVeTV_GBOrTTAYFUTyxJRYhCZ9DWmlFpJNM0I_jdvBKh4HcgCCmt_555RsPEvuHNC3gPMLuVB6QDU_jksrTqIxLmqkY8xbuS77tAT1lEOkvisZtl0_tgGjeYgUVNO6p6Ystvnt-b0SjZfNBc23iLnnpTdA0Xg3bZKvcFkBYLf-_VpHEhIH-VpKnfjzSlSYMsHP6kRC8owGjU6381vIzHPk4USEEhA'
 SELECT * FROM orders;
 ----
 1	acme	100
 
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmEiLCJyYiJdfQ.MH46abRthAGV7khkVQfbeFqEpOLXgB54l4tv4tWKl-nQPALtrBQaWmHyKAGS_f_G59noaTWj3Mhhr5SvKsVQHywqnRRWomG29rL1UzaLgbJefs_PYtAdJi_iaCVeTV_GBOrTTAYFUTyxJRYhCZ9DWmlFpJNM0I_jdvBKh4HcgCCmt_555RsPEvuHNC3gPMLuVB6QDU_jksrTqIxLmqkY8xbuS77tAT1lEOkvisZtl0_tgGjeYgUVNO6p6Ystvnt-b0SjZfNBc23iLnnpTdA0Xg3bZKvcFkBYLf-_VpHEhIH-VpKnfjzSlSYMsHP6kRC8owGjU6381vIzHPk4USEEhA'
 SELECT string_agg(column_name, ',') FROM (DESCRIBE orders);
 ----
 id,tag,amount
@@ -73,27 +75,27 @@ id,tag,amount
 # --- the listings say the same, in the same order ----------------------------------------------------
 
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmEiLCJyYiJdfQ.MH46abRthAGV7khkVQfbeFqEpOLXgB54l4tv4tWKl-nQPALtrBQaWmHyKAGS_f_G59noaTWj3Mhhr5SvKsVQHywqnRRWomG29rL1UzaLgbJefs_PYtAdJi_iaCVeTV_GBOrTTAYFUTyxJRYhCZ9DWmlFpJNM0I_jdvBKh4HcgCCmt_555RsPEvuHNC3gPMLuVB6QDU_jksrTqIxLmqkY8xbuS77tAT1lEOkvisZtl0_tgGjeYgUVNO6p6Ystvnt-b0SjZfNBc23iLnnpTdA0Xg3bZKvcFkBYLf-_VpHEhIH-VpKnfjzSlSYMsHP6kRC8owGjU6381vIzHPk4USEEhA'
 SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns();
 ----
 id,tag,amount
 
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmEiLCJyYiJdfQ.MH46abRthAGV7khkVQfbeFqEpOLXgB54l4tv4tWKl-nQPALtrBQaWmHyKAGS_f_G59noaTWj3Mhhr5SvKsVQHywqnRRWomG29rL1UzaLgbJefs_PYtAdJi_iaCVeTV_GBOrTTAYFUTyxJRYhCZ9DWmlFpJNM0I_jdvBKh4HcgCCmt_555RsPEvuHNC3gPMLuVB6QDU_jksrTqIxLmqkY8xbuS77tAT1lEOkvisZtl0_tgGjeYgUVNO6p6Ystvnt-b0SjZfNBc23iLnnpTdA0Xg3bZKvcFkBYLf-_VpHEhIH-VpKnfjzSlSYMsHP6kRC8owGjU6381vIzHPk4USEEhA'
 SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns;
 ----
 id,tag,amount
 
 # the DDL a client parses and then projects positionally against
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmEiLCJyYiJdfQ.MH46abRthAGV7khkVQfbeFqEpOLXgB54l4tv4tWKl-nQPALtrBQaWmHyKAGS_f_G59noaTWj3Mhhr5SvKsVQHywqnRRWomG29rL1UzaLgbJefs_PYtAdJi_iaCVeTV_GBOrTTAYFUTyxJRYhCZ9DWmlFpJNM0I_jdvBKh4HcgCCmt_555RsPEvuHNC3gPMLuVB6QDU_jksrTqIxLmqkY8xbuS77tAT1lEOkvisZtl0_tgGjeYgUVNO6p6Ystvnt-b0SjZfNBc23iLnnpTdA0Xg3bZKvcFkBYLf-_VpHEhIH-VpKnfjzSlSYMsHP6kRC8owGjU6381vIzHPk4USEEhA'
 SELECT sql FROM duckdb_tables();
 ----
 CREATE TABLE "orders"("id" INTEGER, "tag" VARCHAR, "amount" INTEGER);
 
 # positions are 1..N with no gaps, whatever names the merge dropped as duplicates
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYSIsInJiIl19.YGGoDY7-77k5dM8Px5lUOdJ36w_Hel_FKIscsrR3bTw'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmEiLCJyYiJdfQ.MH46abRthAGV7khkVQfbeFqEpOLXgB54l4tv4tWKl-nQPALtrBQaWmHyKAGS_f_G59noaTWj3Mhhr5SvKsVQHywqnRRWomG29rL1UzaLgbJefs_PYtAdJi_iaCVeTV_GBOrTTAYFUTyxJRYhCZ9DWmlFpJNM0I_jdvBKh4HcgCCmt_555RsPEvuHNC3gPMLuVB6QDU_jksrTqIxLmqkY8xbuS77tAT1lEOkvisZtl0_tgGjeYgUVNO6p6Ystvnt-b0SjZfNBc23iLnnpTdA0Xg3bZKvcFkBYLf-_VpHEhIH-VpKnfjzSlSYMsHP6kRC8owGjU6381vIzHPk4USEEhA'
 SELECT string_agg(column_index::VARCHAR, ',' ORDER BY column_index) FROM duckdb_columns();
 ----
 1,2,3
@@ -102,19 +104,19 @@ SELECT string_agg(column_index::VARCHAR, ',' ORDER BY column_index) FROM duckdb_
 # roles ["rb","ra"] instead of ["ra","rb"]: same principal, same answer
 
 query III
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYiIsInJhIl19.qiyN1EYYd8dRQZPjHz00AiodxA9ZJTd7QEk1hYP0QRI'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmIiLCJyYSJdfQ.KmBPS_C1OcnbSjayCcCWjpcluVzqUF7A3Zad0wDI7G13M-_FCE6oNUzr_fd1dAbDUddZ-jMa7Yqyo7oHkjAHijxdODa3aJPQ-ck0JmH1KY5yjxVSlf6gY_GnU4_zgfynrokeEA4cnlfEaXeng-NTwKXyTY_rV5zQK-dZirPBYdgUWW3GjUyBjLS9fmfjYPNQNizKoXkX62MHZ9xDDRLV21ppLndZDqqgDZ7kY0p-Wzct-3J-HypHvafr7TfS3JCCCycXMqhPzrjB9YoGJx5aYMikgDG0M-bG4tJONjDQce16VrTIH0aGeEX5aOGqrMuTCTtCMd8vEjUbcmdfGyWfOQ'
 SELECT * FROM orders;
 ----
 1	acme	100
 
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYiIsInJhIl19.qiyN1EYYd8dRQZPjHz00AiodxA9ZJTd7QEk1hYP0QRI'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmIiLCJyYSJdfQ.KmBPS_C1OcnbSjayCcCWjpcluVzqUF7A3Zad0wDI7G13M-_FCE6oNUzr_fd1dAbDUddZ-jMa7Yqyo7oHkjAHijxdODa3aJPQ-ck0JmH1KY5yjxVSlf6gY_GnU4_zgfynrokeEA4cnlfEaXeng-NTwKXyTY_rV5zQK-dZirPBYdgUWW3GjUyBjLS9fmfjYPNQNizKoXkX62MHZ9xDDRLV21ppLndZDqqgDZ7kY0p-Wzct-3J-HypHvafr7TfS3JCCCycXMqhPzrjB9YoGJx5aYMikgDG0M-bG4tJONjDQce16VrTIH0aGeEX5aOGqrMuTCTtCMd8vEjUbcmdfGyWfOQ'
 SELECT string_agg(column_name, ',') FROM (DESCRIBE orders);
 ----
 id,tag,amount
 
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYiIsInJhIl19.qiyN1EYYd8dRQZPjHz00AiodxA9ZJTd7QEk1hYP0QRI'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmIiLCJyYSJdfQ.KmBPS_C1OcnbSjayCcCWjpcluVzqUF7A3Zad0wDI7G13M-_FCE6oNUzr_fd1dAbDUddZ-jMa7Yqyo7oHkjAHijxdODa3aJPQ-ck0JmH1KY5yjxVSlf6gY_GnU4_zgfynrokeEA4cnlfEaXeng-NTwKXyTY_rV5zQK-dZirPBYdgUWW3GjUyBjLS9fmfjYPNQNizKoXkX62MHZ9xDDRLV21ppLndZDqqgDZ7kY0p-Wzct-3J-HypHvafr7TfS3JCCCycXMqhPzrjB9YoGJx5aYMikgDG0M-bG4tJONjDQce16VrTIH0aGeEX5aOGqrMuTCTtCMd8vEjUbcmdfGyWfOQ'
 SELECT sql FROM duckdb_tables();
 ----
 CREATE TABLE "orders"("id" INTEGER, "tag" VARCHAR, "amount" INTEGER);
@@ -173,19 +175,19 @@ statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE rd WITH (select) MAIN;
 
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYyIsInJkIl19.w6ZV8MIubCKzMG30PnMNFiFoGzBNXJ3p1BkwbsOuwVw'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmMiLCJyZCJdfQ.UJ1LDNUv6c-OVi1aYB_LLh99Hl_YcsZu6sKOm4A5MH-VsJSUcArtplHJOsrNCL_EvGV6N_0crB-CHC_Misr6g_2D6L6tlwsEVWaFDJ0Xw1E_Zrfqi4biMu9iP_9z3UXFyppFhHaAIW5_LgDKgnjzKjFnfNyXMXhEmfANj53iK6HRCc65nppNLpg3eb-ZR5hqaxI5hrjzvmuXEReDVV2xbQv9eouaMZLp11J2ITEOMH3dsqEuLo5pTEeDbDj0UgCKyZQsyU8WaYs2sR1O0UN38h3bqEluA7sORhJz8kTf5d7Mr11_Nv0y7SVJFohmhhcWtqN9jbjbLs8cWYxz6D9jZg'
 SELECT string_agg(column_name, ',') FROM (DESCRIBE orders);
 ----
 id,tag,amount,note
 
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYyIsInJkIl19.w6ZV8MIubCKzMG30PnMNFiFoGzBNXJ3p1BkwbsOuwVw'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmMiLCJyZCJdfQ.UJ1LDNUv6c-OVi1aYB_LLh99Hl_YcsZu6sKOm4A5MH-VsJSUcArtplHJOsrNCL_EvGV6N_0crB-CHC_Misr6g_2D6L6tlwsEVWaFDJ0Xw1E_Zrfqi4biMu9iP_9z3UXFyppFhHaAIW5_LgDKgnjzKjFnfNyXMXhEmfANj53iK6HRCc65nppNLpg3eb-ZR5hqaxI5hrjzvmuXEReDVV2xbQv9eouaMZLp11J2ITEOMH3dsqEuLo5pTEeDbDj0UgCKyZQsyU8WaYs2sR1O0UN38h3bqEluA7sORhJz8kTf5d7Mr11_Nv0y7SVJFohmhhcWtqN9jbjbLs8cWYxz6D9jZg'
 SELECT string_agg(column_name || '@' || column_index, ',' ORDER BY column_index) FROM duckdb_columns();
 ----
 id@1,tag@2,amount@3,note@4
 
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L29yZGVyIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyYyIsInJkIl19.w6ZV8MIubCKzMG30PnMNFiFoGzBNXJ3p1BkwbsOuwVw'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9vcmRlciIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicmMiLCJyZCJdfQ.UJ1LDNUv6c-OVi1aYB_LLh99Hl_YcsZu6sKOm4A5MH-VsJSUcArtplHJOsrNCL_EvGV6N_0crB-CHC_Misr6g_2D6L6tlwsEVWaFDJ0Xw1E_Zrfqi4biMu9iP_9z3UXFyppFhHaAIW5_LgDKgnjzKjFnfNyXMXhEmfANj53iK6HRCc65nppNLpg3eb-ZR5hqaxI5hrjzvmuXEReDVV2xbQv9eouaMZLp11J2ITEOMH3dsqEuLo5pTEeDbDj0UgCKyZQsyU8WaYs2sR1O0UN38h3bqEluA7sORhJz8kTf5d7Mr11_Nv0y7SVJFohmhhcWtqN9jbjbLs8cWYxz6D9jZg'
 SELECT sql FROM duckdb_tables();
 ----
 CREATE TABLE "orders"("id" INTEGER, "tag" VARCHAR, "amount" INTEGER, "note" VARCHAR);

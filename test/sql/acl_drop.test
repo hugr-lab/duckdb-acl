@@ -6,6 +6,10 @@
 require acl
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS phys;
 
 statement ok
@@ -53,10 +57,10 @@ statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{"select": true}' MAIN;
 
 statement ok
-ACL ADMIN CREATE ISSUER 'https://issuer.test/d' KEYS '{"keys":[]}' AUDIENCES 'api://d' ALGS 'RS256' ROLE CLAIM 'groups';
+ACL ADMIN CREATE ISSUER 'test/idp/d' AUDIENCES 'api://d' ROLE CLAIM 'groups';
 
 statement ok
-ACL ADMIN MAP GROUP 'g-1' FROM ISSUER 'https://issuer.test/d' TO ROLE analyst;
+ACL ADMIN MAP GROUP 'g-1' FROM ISSUER 'test/idp/d' TO ROLE analyst;
 
 query I
 ACL ROLE "analyst" SELECT count(*) FROM orders;
@@ -153,7 +157,7 @@ SELECT count(*) FROM aclcat.acl.functions WHERE vcat = 'sales';
 # --- roles, issuers and mappings ------------------------------------------------------------------
 
 statement ok
-ACL ADMIN DROP MAP GROUP 'g-1' FROM ISSUER 'https://issuer.test/d' TO ROLE analyst;
+ACL ADMIN DROP MAP GROUP 'g-1' FROM ISSUER 'test/idp/d' TO ROLE analyst;
 
 query I
 SELECT count(*) FROM aclcat.acl.role_mappings;
@@ -161,7 +165,7 @@ SELECT count(*) FROM aclcat.acl.role_mappings;
 0
 
 statement error
-ACL ADMIN DROP MAP GROUP 'g-1' FROM ISSUER 'https://issuer.test/d' TO ROLE analyst;
+ACL ADMIN DROP MAP GROUP 'g-1' FROM ISSUER 'test/idp/d' TO ROLE analyst;
 ----
 <REGEX>:.*no mapping of group "g-1".*
 
@@ -202,10 +206,10 @@ statement ok
 ACL ADMIN CREATE ROLE analyst2;
 
 statement ok
-ACL ADMIN MAP CLAIM 'ops' FROM ISSUER 'https://issuer.test/d' TO ROLE analyst2;
+ACL ADMIN MAP CLAIM 'ops' FROM ISSUER 'test/idp/d' TO ROLE analyst2;
 
 statement ok
-ACL ADMIN DROP ISSUER 'https://issuer.test/d';
+ACL ADMIN DROP ISSUER 'test/idp/d';
 
 # the issuer's mappings went with it
 query I

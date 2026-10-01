@@ -71,12 +71,11 @@ Anything the grant does not cover is refused before it runs. For example, the ph
 ## 5. Real tokens
 
 In production the principal comes from a verified OIDC token, not a role name. Register the issuer
-once; its keys can come from its JWKS document. See [Authentication](authentication.md).
+once; the node finds its keys by the IdP's OIDC discovery. See [Authentication](authentication.md).
 
 ```sql
 ACL ADMIN CREATE ISSUER 'https://login.example.com/realm'
-    KEYS FROM 'https://login.example.com/realm/protocol/openid-connect/certs'
-    AUDIENCES ('duckdb') ALGS (RS256) ROLE CLAIM 'roles';
+    AUDIENCES ('duckdb') ROLE CLAIM 'roles';
 
 ACL TOKEN 'eyJhbGciOi…' SELECT * FROM orders;
 ```

@@ -7,6 +7,10 @@
 require acl
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS store;
 
 statement ok
@@ -22,9 +26,7 @@ statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
 statement ok
-SELECT acl_define_issuer('https://issuer.test/s',
-    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
-    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+SELECT acl_define_issuer('test/idp/s', '{"url": "test/idp/s", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
 
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG c;
@@ -115,7 +117,7 @@ ACL ROLE "owner" ACL GRANT RESOURCE GROUP etl TO ROLE r;
 # --- max_sessions: refused at open, per group ------------------------------------------------------
 
 statement ok
-CREATE TABLE first AS SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') AS handle;
+CREATE TABLE first AS SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.YX4sX651QcVUG5Nk_4PFAJ-xoES-PILeC0DwgFPRWdx7T92n9HKl49TkesaBJXgIde9H4fhUxgvNTCdGsWIHHwOXfyIuIhS5qhhwNOgFFFKJtRNZ_sgzVeSQrAcDeDQuI9EP9igUxhiKVEadVmQiOQdREddBVV-emQC1TQvR-qvDKDnlyzsdoR46X052B9IDz-C2adrCEOvO-ygoC57nZGDVRQsvySh5gn8cHahS6A0CR7hQYqScyVrNY1emC3GBt2QSvQDm3b0Tz6U30tdVl3jvFkNR2uniYbiKwnzYeG2WWIa7mWjksUZUgvece6OKA77i5qQAWu5aXjjXlMYRVA') AS handle;
 
 query I
 SELECT handle IS NOT NULL FROM first;
@@ -124,7 +126,7 @@ true
 
 # the second session of the same group: over its max_sessions, refused - never the first one ended
 query I
-SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NULL;
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.YX4sX651QcVUG5Nk_4PFAJ-xoES-PILeC0DwgFPRWdx7T92n9HKl49TkesaBJXgIde9H4fhUxgvNTCdGsWIHHwOXfyIuIhS5qhhwNOgFFFKJtRNZ_sgzVeSQrAcDeDQuI9EP9igUxhiKVEadVmQiOQdREddBVV-emQC1TQvR-qvDKDnlyzsdoR46X052B9IDz-C2adrCEOvO-ygoC57nZGDVRQsvySh5gn8cHahS6A0CR7hQYqScyVrNY1emC3GBt2QSvQDm3b0Tz6U30tdVl3jvFkNR2uniYbiKwnzYeG2WWIa7mWjksUZUgvece6OKA77i5qQAWu5aXjjXlMYRVA') IS NULL;
 ----
 true
 
@@ -150,18 +152,18 @@ statement ok
 SELECT acl_session_close(handle) FROM first;
 
 query I
-SELECT acl_quack_authenticate('conn-1', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg', 'ignored');
+SELECT acl_quack_authenticate('conn-1', 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.YX4sX651QcVUG5Nk_4PFAJ-xoES-PILeC0DwgFPRWdx7T92n9HKl49TkesaBJXgIde9H4fhUxgvNTCdGsWIHHwOXfyIuIhS5qhhwNOgFFFKJtRNZ_sgzVeSQrAcDeDQuI9EP9igUxhiKVEadVmQiOQdREddBVV-emQC1TQvR-qvDKDnlyzsdoR46X052B9IDz-C2adrCEOvO-ygoC57nZGDVRQsvySh5gn8cHahS6A0CR7hQYqScyVrNY1emC3GBt2QSvQDm3b0Tz6U30tdVl3jvFkNR2uniYbiKwnzYeG2WWIa7mWjksUZUgvece6OKA77i5qQAWu5aXjjXlMYRVA', 'ignored');
 ----
 true
 
 query I
-SELECT acl_quack_authenticate('conn-1', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg', 'ignored');
+SELECT acl_quack_authenticate('conn-1', 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.YX4sX651QcVUG5Nk_4PFAJ-xoES-PILeC0DwgFPRWdx7T92n9HKl49TkesaBJXgIde9H4fhUxgvNTCdGsWIHHwOXfyIuIhS5qhhwNOgFFFKJtRNZ_sgzVeSQrAcDeDQuI9EP9igUxhiKVEadVmQiOQdREddBVV-emQC1TQvR-qvDKDnlyzsdoR46X052B9IDz-C2adrCEOvO-ygoC57nZGDVRQsvySh5gn8cHahS6A0CR7hQYqScyVrNY1emC3GBt2QSvQDm3b0Tz6U30tdVl3jvFkNR2uniYbiKwnzYeG2WWIa7mWjksUZUgvece6OKA77i5qQAWu5aXjjXlMYRVA', 'ignored');
 ----
 true
 
 # another connection of the group is a second session: refused
 query I
-SELECT acl_quack_authenticate('conn-2', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg', 'ignored');
+SELECT acl_quack_authenticate('conn-2', 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.YX4sX651QcVUG5Nk_4PFAJ-xoES-PILeC0DwgFPRWdx7T92n9HKl49TkesaBJXgIde9H4fhUxgvNTCdGsWIHHwOXfyIuIhS5qhhwNOgFFFKJtRNZ_sgzVeSQrAcDeDQuI9EP9igUxhiKVEadVmQiOQdREddBVV-emQC1TQvR-qvDKDnlyzsdoR46X052B9IDz-C2adrCEOvO-ygoC57nZGDVRQsvySh5gn8cHahS6A0CR7hQYqScyVrNY1emC3GBt2QSvQDm3b0Tz6U30tdVl3jvFkNR2uniYbiKwnzYeG2WWIa7mWjksUZUgvece6OKA77i5qQAWu5aXjjXlMYRVA', 'ignored');
 ----
 false
 
@@ -171,7 +173,7 @@ statement ok
 ACL ADMIN GRANT RESOURCE GROUP etl TO ROLE r;
 
 query I
-SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIiXSwidGlkIjoiYWNtZSJ9.vMoy286r56sfLeeWOxSblexeQrChn5sb_QAZH_x_Hvg') IS NOT NULL;
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.YX4sX651QcVUG5Nk_4PFAJ-xoES-PILeC0DwgFPRWdx7T92n9HKl49TkesaBJXgIde9H4fhUxgvNTCdGsWIHHwOXfyIuIhS5qhhwNOgFFFKJtRNZ_sgzVeSQrAcDeDQuI9EP9igUxhiKVEadVmQiOQdREddBVV-emQC1TQvR-qvDKDnlyzsdoR46X052B9IDz-C2adrCEOvO-ygoC57nZGDVRQsvySh5gn8cHahS6A0CR7hQYqScyVrNY1emC3GBt2QSvQDm3b0Tz6U30tdVl3jvFkNR2uniYbiKwnzYeG2WWIa7mWjksUZUgvece6OKA77i5qQAWu5aXjjXlMYRVA') IS NOT NULL;
 ----
 true
 

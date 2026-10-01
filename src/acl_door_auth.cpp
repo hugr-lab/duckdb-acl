@@ -56,27 +56,44 @@ oidc::Endpoints DiscoverEndpointsCached(PolicyStore &store, const string &issuer
 	return ep;
 }
 
-//! The document itself; the guard below is what every caller gets.
+//! The document itself; the guard below is what every caller gets. Spec 095: each issuer the node
+//! can resolve now, by name and URL, its endpoints, and the clients a driver can run a flow as - a
+//! client id is public; a client secret is never here.
 static string DoorAuthDocument(PolicyStore &store) {
 	string json = "{\"issuers\":[";
-	auto issuers = store.ListIssuers();
-	for (idx_t i = 0; i < issuers.size(); i++) {
-		if (i > 0) {
+	idx_t written = 0;
+	for (auto &issuer : store.DoorIssuers()) {
+		if (written++ > 0) {
 			json += ",";
 		}
-		json += "{\"issuer\":" + JsonQuote(issuers[i]);
-		IssuerConfig config;
-		if (store.LookupIssuer(issuers[i], config) && !config.client_id.empty()) {
-			json += ",\"client_id\":" + JsonQuote(config.client_id);
-		}
-		auto ep = DiscoverEndpointsCached(store, issuers[i]);
+		json += "{\"name\":" + JsonQuote(issuer.name) + ",\"issuer\":" + JsonQuote(issuer.url);
+		auto ep = DiscoverEndpointsCached(store, issuer.url);
 		if (ep.Ok()) {
 			json += ",\"token_endpoint\":" + JsonQuote(ep.token_endpoint);
 			if (!ep.device_authorization_endpoint.empty()) {
 				json += ",\"device_authorization_endpoint\":" + JsonQuote(ep.device_authorization_endpoint);
 			}
+			if (!ep.authorization_endpoint.empty()) {
+				json += ",\"authorization_endpoint\":" + JsonQuote(ep.authorization_endpoint);
+			}
 		}
-		json += "}";
+		json += ",\"clients\":[";
+		idx_t listed = 0;
+		for (auto &client : issuer.clients) {
+			vector<string> flows;
+			for (auto &flow : client.flows) {
+				if (IsDriverFlow(flow)) {
+					flows.push_back(JsonQuote(flow));
+				}
+			}
+			if (flows.empty() || client.client_id.empty()) {
+				continue; // nothing a driver can run as: not advertised
+			}
+			json += string(listed++ ? "," : "") + "{\"name\":" + JsonQuote(client.name) +
+			        ",\"client_id\":" + JsonQuote(client.client_id) + ",\"flows\":[" + StringUtil::Join(flows, ",") +
+			        "]}";
+		}
+		json += "]}";
 	}
 	json += "]}";
 	return json;
@@ -84,7 +101,22 @@ static string DoorAuthDocument(PolicyStore &store) {
 
 string DoorAuthJson(PolicyStore &store, const char *door) {
 	try {
-		return DoorAuthDocument(store);
+		// cached for a few seconds within one policy version: the callers are unauthenticated, and a
+		// document that names secret-held URLs and client ids is a read of the secrets service
+		store.Identity(); // the freshness check first, so the version below is the source's, not a stale one
+		auto version = store.PolicyVersion();
+		auto now = std::chrono::steady_clock::now();
+		{
+			lock_guard<mutex> guard(store.lock);
+			auto &cached = store.door_document;
+			if (cached.policy_version == version && now - cached.at < std::chrono::seconds(10)) {
+				return cached.document;
+			}
+		}
+		auto document = DoorAuthDocument(store);
+		lock_guard<mutex> guard(store.lock);
+		store.door_document = {version, now, document};
+		return document;
 	} catch (std::exception &ex) {
 		// the one place both doors build it, so the guard belongs here rather than at each call
 		store.AuditDoor(door, "discovery", false, "source_error", ErrorData(ex).RawMessage());

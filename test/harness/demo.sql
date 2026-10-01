@@ -29,17 +29,19 @@ ACL ADMIN CREATE VIRTUAL SCALAR sales.tenant_tag(v VARCHAR) RETURNS VARCHAR AS a
 --    the role, with a default claim for the bare ROLE form, and its grant on the catalog
 ACL ADMIN CREATE ROLE analyst CLAIMS (tenant = 'globex');
 ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select, insert) MAIN;
---    an issuer whose tokens verify offline (HS256 here; RS256/ES256 or KEYS FROM a JWKS in production):
---    the token's `roles` claim names the role, its `tid` claim becomes acl_claim('tenant')
-ACL ADMIN CREATE ISSUER 'https://issuer.demo' KEYS '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}'
-    ALGS (HS256) ROLE CLAIM 'roles' CLAIM MAP (tid => tenant);
+--    an issuer whose tokens verify offline: its keys are found by its OIDC discovery (here a fixture
+--    under test/idp/, which this node is told it may read; in production the IdP's https URL). The
+--    token's `aud` must be one of the AUDIENCES, its `roles` claim names the role, and its `tid` claim
+--    becomes acl_claim('tenant')
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+ACL ADMIN CREATE ISSUER 'test/idp/demo' AUDIENCES ('api://acl-demo') ROLE CLAIM 'roles' CLAIM MAP (tid => tenant);
 
 -- 4) from here the gateway prefixes every statement with the principal
 .print '--- ROLE analyst (default claim tenant=globex): RLS keeps only globex rows, ssn masked ---'
 ACL ROLE "analyst" SELECT id, amount, ssn FROM orders ORDER BY id;
 
 .print '--- TOKEN (a JWT with tid=acme, roles=[analyst]): a different claim, the same policy ---'
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5kZW1vIiwic3ViIjoidXNlci0xIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.F14wQi-RR1pxrcuHYhIeHcqM9GeIM1d9qnP9m6EDvy8' SELECT id, amount, ssn FROM orders ORDER BY id;
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9kZW1vIiwiYXVkIjoiYXBpOi8vYWNsLWRlbW8iLCJzdWIiOiJ1c2VyLTEiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6NDEwMjQ0NDgwMH0.fR5MGrMp9sa8e-LYuLfXCLLyC0nS4zp_JqitcnsAJn8twM2m5LMfgvERbUi85tbvWGxOwFS1qdxcTK1pVE3Ix1-Kx-H6iS2AwB2bhPgr8mF7J14IXulKeCsDFPvEWtJKRmbBMj-h2D-q5wugm6POrWxN-AG6GiTkAZ-iR2x8hc60fdxtQO9by-NsU9VMaOiddk7En8Qud1B9gEXxko0wWLJEpBZjq7DOZMFd5cL-wPU9Osh3PiYE8zxKL2J2uoadkqmkZYrMeTPN33IKoDA-p96JEwhXw_0F_AM2P9DtBNjrcA02feZvRV4E7xLnwyun3ySnex-h2Z36eU_9cm-PEA' SELECT id, amount, ssn FROM orders ORDER BY id;
 
 .print '--- (refused 1/4) a physical name is not in the virtual catalog ---'
 ACL ROLE "analyst" SELECT * FROM phys.main.orders;

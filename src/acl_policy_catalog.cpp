@@ -221,7 +221,7 @@ void CatalogBackend::EnsureFresh() {
 		function_model.reset();
 		claims_cache.clear();
 		claims_loaded.clear();
-		issuer_cache.clear();
+		identity_model.reset();
 		rights_cache.clear();
 		fn_grants.clear();
 		fn_grants_loaded.clear();
@@ -1086,85 +1086,106 @@ int64_t CatalogBackend::SettingInt64(const char *name, int64_t fallback) {
 	return fallback;
 }
 
-void CatalogBackend::ListIssuers(vector<string> &out) {
-	if (function_mode) {
-		return;
-	}
-	EnsureFresh();
-	auto result = Query("SELECT \"issuer\" FROM " + Tbl("issuers") + " ORDER BY 1");
-	ResultRows result_rows(*result);
-	for (idx_t row = 0; row < result->RowCount(); row++) {
-		out.push_back(result_rows.GetValue(0, row).ToString());
-	}
+namespace {
+
+string Cell(ResultRows &rows, idx_t col, idx_t row) {
+	auto value = rows.GetValue(col, row);
+	return value.IsNull() ? string() : value.ToString();
 }
 
-bool CatalogBackend::LookupIssuer(const string &issuer, IssuerConfig &out) {
+} // namespace
+
+IdentityModel CatalogBackend::IdentityFromRows(QueryResult *issuers, QueryResult *clients, QueryResult *mappings) {
+	IdentityModel model;
+	if (issuers) {
+		ResultRows rows(*issuers);
+		for (idx_t row = 0; row < issuers->RowCount(); row++) {
+			IdentityIssuer issuer;
+			issuer.name = Cell(rows, 0, row);
+			issuer.url = Cell(rows, 1, row);
+			issuer.secret_service = Cell(rows, 2, row);
+			issuer.secret = Cell(rows, 3, row);
+			model.issuers.push_back(std::move(issuer));
+		}
+	}
+	if (clients) {
+		ResultRows rows(*clients);
+		for (idx_t row = 0; row < clients->RowCount(); row++) {
+			IdentityClient client;
+			client.name = Cell(rows, 0, row);
+			client.issuer = Cell(rows, 1, row);
+			client.audiences = ParseStoredList(Cell(rows, 2, row));
+			client.azp = ParseStoredList(Cell(rows, 3, row));
+			client.conditions = ParseStoredConditions(Cell(rows, 4, row));
+			client.roles_from = ParseStoredList(Cell(rows, 5, row));
+			client.roles_constant = ParseStoredList(Cell(rows, 6, row));
+			client.unmapped_as_role = Cell(rows, 7, row) == "as_role";
+			client.attributes = ParseStoredAttributes(Cell(rows, 8, row));
+			client.subject = ParseStoredList(Cell(rows, 9, row));
+			client.token_type = Cell(rows, 10, row);
+			client.client_id = Cell(rows, 11, row);
+			client.flows = ParseStoredList(Cell(rows, 12, row));
+			client.secret_service = Cell(rows, 13, row);
+			client.secret = Cell(rows, 14, row);
+			auto implicit = rows.GetValue(15, row);
+			client.implicit = !implicit.IsNull() && BooleanValue::Get(implicit.DefaultCastAs(LogicalType::BOOLEAN));
+			model.clients.push_back(std::move(client));
+		}
+	}
+	if (mappings) {
+		ResultRows rows(*mappings);
+		for (idx_t row = 0; row < mappings->RowCount(); row++) {
+			IdentityMapping mapping;
+			mapping.scope_kind = Cell(rows, 0, row);
+			mapping.scope_name = Cell(rows, 1, row);
+			mapping.source = Cell(rows, 2, row);
+			mapping.external_value = Cell(rows, 3, row);
+			mapping.role = Cell(rows, 4, row);
+			model.mappings.push_back(std::move(mapping));
+		}
+	}
+	return model;
+}
+
+shared_ptr<const IdentityModel> CatalogBackend::Identity() {
 	EnsureFresh();
+	int64_t read_at = -1;
 	{
 		lock_guard<mutex> guard(lock);
-		auto entry = issuer_cache.find(issuer);
-		if (entry != issuer_cache.end()) {
-			out = entry->second.second;
-			return entry->second.first;
+		if (identity_model) {
+			return identity_model;
 		}
+		read_at = version;
 	}
-	unique_ptr<QueryResult> result;
-	idx_t base = 0;
+	unique_ptr<QueryResult> issuers, clients, mappings;
 	if (function_mode) {
-		if (!HasSlot("issuer")) { // optional slot: no JWT issuers through this source
-			lock_guard<mutex> guard(lock);
-			issuer_cache[issuer] = {false, IssuerConfig()};
-			return false;
+		// optional slots: a source without them trusts no tokens
+		if (HasSlot("issuers")) {
+			issuers = Query("SELECT * FROM " + Slot("issuers") + "()");
 		}
-		// positional contract: (issuer, keys_json, audiences, algs, role_claim, claim_map)
-		result = Query("SELECT * FROM " + Slot("issuer") + "(" + Lit(issuer) + ")");
-		base = 1;
+		if (HasSlot("clients")) {
+			clients = Query("SELECT * FROM " + Slot("clients") + "()");
+		}
+		if (HasSlot("role_mappings")) {
+			mappings = Query("SELECT * FROM " + Slot("role_mappings") + "()");
+		}
 	} else {
-		result = Query("SELECT \"keys_json\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\","
-		               " \"jwks_uri\", \"client_id\", \"client_secret\" FROM " +
-		               Tbl("issuers") + " WHERE \"issuer\" = " + Lit(issuer));
+		issuers = Query("SELECT \"name\", \"url\", \"secret_service\", \"secret\" FROM " + Tbl("issuers") +
+		                " ORDER BY \"name\"");
+		clients = Query("SELECT \"name\", \"issuer\", \"audiences\", \"azp\", \"requires\", \"roles_from\","
+		                " \"roles_constant\", \"unmapped\", \"attributes\", \"subject\", \"token_type\","
+		                " \"client_id\", \"flows\", \"secret_service\", \"secret\", \"implicit\" FROM " +
+		                Tbl("clients") + " ORDER BY \"issuer\", \"name\"");
+		mappings = Query("SELECT \"scope_kind\", \"scope_name\", \"source\", \"external_value\", \"role\" FROM " +
+		                 Tbl("role_mappings"));
 	}
-	IssuerConfig config;
-	bool found = result->RowCount() > 0;
-	if (found) {
-		config.issuer = issuer;
-		auto keys = result->Collection().GetValue(base + 0, 0);
-		config.keys_json = keys.IsNull() ? string() : keys.ToString();
-		auto audiences = result->Collection().GetValue(base + 1, 0);
-		for (auto &aud : StringUtil::Split(audiences.IsNull() ? string() : audiences.ToString(), ',')) {
-			StringUtil::Trim(aud);
-			if (!aud.empty()) {
-				config.audiences.push_back(aud);
-			}
-		}
-		auto algs = result->Collection().GetValue(base + 2, 0);
-		for (auto &alg : StringUtil::Split(algs.IsNull() ? string() : algs.ToString(), ',')) {
-			StringUtil::Trim(alg);
-			if (!alg.empty()) {
-				config.algs.insert(alg);
-			}
-		}
-		auto role_claim = result->Collection().GetValue(base + 3, 0);
-		config.role_claim = role_claim.IsNull() ? string() : role_claim.ToString();
-		auto claim_map = result->Collection().GetValue(base + 4, 0);
-		config.claim_map = claim_map.IsNull() ? string() : claim_map.ToString();
-		// the function-driver slot has no jwks_uri column: its platform hands over the keys itself
-		if (result->ColumnCount() > base + 5) {
-			auto jwks_uri = result->Collection().GetValue(base + 5, 0);
-			config.jwks_uri = jwks_uri.IsNull() ? string() : jwks_uri.ToString();
-		}
-		// spec 064: the node-side OAuth client; the function-driver slot may omit both columns
-		if (result->ColumnCount() > base + 7) {
-			auto client_id = result->Collection().GetValue(base + 6, 0);
-			config.client_id = client_id.IsNull() ? string() : client_id.ToString();
-			auto client_secret = result->Collection().GetValue(base + 7, 0);
-			config.client_secret = client_secret.IsNull() ? string() : client_secret.ToString();
-		}
-	}
+	auto model = make_shared_ptr<const IdentityModel>(IdentityFromRows(issuers.get(), clients.get(), mappings.get()));
 	lock_guard<mutex> guard(lock);
-	issuer_cache[issuer] = {found, config};
-	out = config;
-	return found;
+	if (version == read_at) {
+		// a reload that adopted a newer version meanwhile must not get an older model cached under it
+		identity_model = model;
+	}
+	return model;
 }
 
 void CatalogBackend::LoadRights(const Principal &principal, std::set<string> &catalogs,
@@ -1239,34 +1260,17 @@ void CatalogBackend::AdminScopes(const Principal &principal, vector<std::pair<st
 	}
 }
 
-void CatalogBackend::MapExternalRoles(const string &issuer, const vector<string> &values,
-                                      case_insensitive_map_t<vector<string>> &mapped,
-                                      case_insensitive_set_t &known_roles) {
+void CatalogBackend::KnownRoles(const vector<string> &values, case_insensitive_set_t &known_roles) {
 	if (values.empty()) {
 		return;
 	}
 	EnsureFresh();
 	if (function_mode) {
-		if (HasSlot("role_mappings")) {
-			// positional contract: (external_value, role)
-			auto result =
-			    Query("SELECT * FROM " + Slot("role_mappings") + "(" + Lit(issuer) + ", " + ListLit(values) + ")");
-			ResultRows result_rows(*result);
-			for (idx_t row = 0; row < result->RowCount(); row++) {
-				mapped[result_rows.GetValue(0, row).ToString()].push_back(result_rows.GetValue(1, row).ToString());
-			}
-		}
 		// a raw value is a known role iff the role_catalogs callback grants it anything
 		for (auto &grant : Grants(values)) {
 			known_roles.insert(grant.role);
 		}
 		return;
-	}
-	auto result = Query("SELECT \"external_value\", \"role\" FROM " + Tbl("role_mappings") +
-	                    " WHERE \"issuer\" = " + Lit(issuer) + " AND \"external_value\" IN (" + LitList(values) + ")");
-	ResultRows result_rows(*result);
-	for (idx_t row = 0; row < result->RowCount(); row++) {
-		mapped[result_rows.GetValue(0, row).ToString()].push_back(result_rows.GetValue(1, row).ToString());
 	}
 	auto known = Query("SELECT \"role\" FROM " + Tbl("roles") + " WHERE \"role\" IN (" + LitList(values) +
 	                   ") UNION SELECT DISTINCT \"role\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
@@ -1275,26 +1279,6 @@ void CatalogBackend::MapExternalRoles(const string &issuer, const vector<string>
 	for (idx_t row = 0; row < known->RowCount(); row++) {
 		known_roles.insert(known_rows.GetValue(0, row).ToString());
 	}
-}
-
-bool CatalogBackend::ReadText(const string &uri, string &out, string &error) {
-	auto instance = Db();
-	Connection con(*instance);
-	auto result = con.Query("SELECT content FROM read_text(" + Lit(uri) + ")");
-	if (result->HasError()) {
-		error = result->GetError();
-		return false;
-	}
-	if (result->RowCount() == 0) {
-		error = "there is no document there";
-		return false;
-	}
-	if (result->RowCount() != 1 || result->Collection().GetValue(0, 0).IsNull()) {
-		error = "the location holds no single document";
-		return false;
-	}
-	out = result->Collection().GetValue(0, 0).ToString();
-	return true;
 }
 
 string CatalogBackend::ResolveSchemaNames(const string &sql) {
@@ -1717,18 +1701,12 @@ void PolicyStore::CatalogLoadRoleClaims(Principal &principal) {
 	catalog->LoadRoleClaims(principal);
 }
 
-bool PolicyStore::CatalogLookupIssuer(const string &issuer, IssuerConfig &out) {
-	return catalog->LookupIssuer(issuer, out);
+shared_ptr<const IdentityModel> PolicyStore::CatalogIdentity() {
+	return catalog->Identity();
 }
 
-void PolicyStore::CatalogListIssuers(vector<string> &out) {
-	catalog->ListIssuers(out);
-}
-
-void PolicyStore::CatalogMapExternalRoles(const string &issuer, const vector<string> &values,
-                                          case_insensitive_map_t<vector<string>> &mapped,
-                                          case_insensitive_set_t &known_roles) {
-	catalog->MapExternalRoles(issuer, values, mapped, known_roles);
+void PolicyStore::CatalogKnownRoles(const vector<string> &values, case_insensitive_set_t &known_roles) {
+	catalog->KnownRoles(values, known_roles);
 }
 
 string PolicyStore::ParserOverrideMode() {
@@ -1738,11 +1716,19 @@ string PolicyStore::ParserOverrideMode() {
 	return catalog->SettingString("allow_parser_override_extension", "DEFAULT");
 }
 
+//! spec 095: a setting of the instance the store belongs to - what the memory mode reads now that it
+//! verifies through discovery like any other (the catalog reads its own the same way)
+static bool InstanceSetting(const weak_ptr<DatabaseInstance> &instance, const char *name, Value &out) {
+	auto db = instance.lock();
+	return db && db->TryGetCurrentSetting(name, out) && !out.IsNull();
+}
+
 int64_t PolicyStore::JwtClockSkew() {
 	if (catalog) {
 		return catalog->SettingInt64("acl_jwt_clock_skew", 60);
 	}
-	return 60; // the memory mode has no database handle to read the setting from
+	Value value;
+	return InstanceSetting(instance, "acl_jwt_clock_skew", value) ? value.GetValue<int64_t>() : 60;
 }
 
 int64_t PolicyStore::SessionIdleTimeout() {
@@ -1818,21 +1804,24 @@ int64_t PolicyStore::PolicyStalenessSeconds() {
 
 int64_t PolicyStore::JwksRefreshInterval() {
 	if (!catalog) {
-		return 300;
+		Value value;
+		return InstanceSetting(instance, "acl_jwks_refresh_interval", value) ? value.GetValue<int64_t>() : 300;
 	}
 	return catalog->SettingInt64("acl_jwks_refresh_interval", 300);
 }
 
 int64_t PolicyStore::JwksMaxStale() {
 	if (!catalog) {
-		return 3600;
+		Value value;
+		return InstanceSetting(instance, "acl_jwks_max_stale", value) ? value.GetValue<int64_t>() : 3600;
 	}
 	return catalog->SettingInt64("acl_jwks_max_stale", 3600);
 }
 
 string PolicyStore::JwksLocations() {
 	if (!catalog) {
-		return "https://";
+		Value value;
+		return InstanceSetting(instance, "acl_jwks_locations", value) ? value.ToString() : "https://";
 	}
 	return catalog->SettingString("acl_jwks_locations", "https://");
 }
@@ -1857,162 +1846,6 @@ bool PolicyStore::JwksLocationAllowed(const string &uri, string &why) {
 	}
 	why = "\"" + uri + "\" is outside acl_jwks_locations (" + setting + ")";
 	return false;
-}
-
-vector<PolicyStore::JwksCacheRow> PolicyStore::JwksCacheRows() {
-	vector<JwksCacheRow> rows;
-	if (!catalog) {
-		return rows; // memory mode reads no documents and caches none
-	}
-	if (catalog->function_mode) {
-		// the function driver enumerates nothing (spec 008): the cache is the listing
-		lock_guard<mutex> guard(lock);
-		for (auto &cached : jwks_cache) {
-			JwksCacheRow row;
-			row.issuer = cached.first;
-			row.location = cached.second.uri;
-			string why;
-			row.allowed = JwksLocationAllowed(row.location, why);
-			row.fetched_at = cached.second.fetched_at;
-			row.tried_at = cached.second.tried_at;
-			row.error = cached.second.error;
-			if (!cached.second.keys_json.empty()) {
-				row.keys = JwksKeyIds(cached.second.keys_json, row.kids);
-			}
-			rows.push_back(std::move(row));
-		}
-		return rows;
-	}
-	auto issuers = catalog->Query("SELECT \"issuer\", \"jwks_uri\" FROM " + catalog->Tbl("issuers") +
-	                              " WHERE \"jwks_uri\" IS NOT NULL AND \"jwks_uri\" <> '' ORDER BY 1");
-	ResultRows issuers_rows(*issuers);
-	lock_guard<mutex> guard(lock);
-	for (idx_t i = 0; i < issuers->RowCount(); i++) {
-		JwksCacheRow row;
-		row.issuer = issuers_rows.GetValue(0, i).ToString();
-		row.location = issuers_rows.GetValue(1, i).ToString();
-		string why;
-		row.allowed = JwksLocationAllowed(row.location, why);
-		auto cached = jwks_cache.find(row.issuer);
-		if (cached != jwks_cache.end() && cached->second.uri == row.location) {
-			row.fetched_at = cached->second.fetched_at;
-			row.tried_at = cached->second.tried_at;
-			row.error = cached->second.error;
-			if (!cached->second.keys_json.empty()) {
-				row.keys = JwksKeyIds(cached->second.keys_json, row.kids);
-			}
-		}
-		rows.push_back(std::move(row));
-	}
-	return rows;
-}
-
-int64_t PolicyStore::JwksDropCache(const string &issuer) {
-	lock_guard<mutex> guard(lock);
-	if (issuer.empty()) {
-		auto dropped = NumericCast<int64_t>(jwks_cache.size());
-		jwks_cache.clear();
-		return dropped;
-	}
-	return NumericCast<int64_t>(jwks_cache.erase(issuer));
-}
-
-//! spec 023: the key set a token is judged against. An issuer that pastes a JWKS keeps it; one that
-//! names a URI has it read through duckdb's filesystem, cached here, and re-read when the TTL expires
-//! or when the token names a key the cached document does not have.
-string PolicyStore::ResolveIssuerKeys(const IssuerConfig &config, const string &kid) {
-	if (config.jwks_uri.empty()) {
-		return config.keys_json;
-	}
-	if (!catalog) {
-		throw BinderException("acl_rewrite: token rejected: issuer \"%s\" reads its keys from \"%s\", which needs "
-		                      "a policy catalog - the in-memory store cannot read documents",
-		                      config.issuer, config.jwks_uri);
-	}
-	auto now =
-	    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-	static constexpr int64_t RETRY_FLOOR_SECONDS = 10;
-	// spec 071: judged against the setting as it is on THIS node, now, before any document is opened
-	// - and a cached document from a location no longer on the list is not used either: an operator
-	// who took a location off the list meant now, not after acl_jwks_max_stale. The refusal is the
-	// entry's last attempt (acl_jwks_cache shows it) and one keys event per retry floor, not per token.
-	string why;
-	if (!JwksLocationAllowed(config.jwks_uri, why)) {
-		bool record = false;
-		{
-			lock_guard<mutex> guard(lock);
-			auto &entry = jwks_cache[config.issuer];
-			if (entry.uri != config.jwks_uri) {
-				entry = JwksEntry();
-				entry.uri = config.jwks_uri;
-			}
-			// the first refusal is recorded at once; the same refusal again, once per floor
-			record = entry.error != why || now - entry.tried_at >= RETRY_FLOOR_SECONDS;
-			entry.tried_at = now;
-			entry.error = why;
-		}
-		if (record) {
-			AuditKeys(config.issuer, false, why, "location_refused", "policy_error");
-		}
-		NoteDenyReason(Reason::POLICY_ERROR); // the policy names a source this node does not read from
-		throw BinderException("acl_rewrite: token rejected: the keys of issuer \"%s\" cannot be read: %s - list its "
-		                      "prefix there, or paste the keys",
-		                      config.issuer, why);
-	}
-	auto refresh = JwksRefreshInterval();
-	JwksEntry entry;
-	{
-		lock_guard<mutex> guard(lock);
-		auto found = jwks_cache.find(config.issuer);
-		// an issuer repointed at another location starts from nothing: keys read from the old one say
-		// nothing about the new one, and waiting out the TTL is not what an operator repointing it means
-		if (found != jwks_cache.end() && found->second.uri == config.jwks_uri) {
-			entry = found->second;
-		}
-	}
-	entry.uri = config.jwks_uri;
-	bool expired = entry.keys_json.empty() || now - entry.fetched_at >= refresh;
-	// a key that rotated in since the last read: worth one more read, but not once per token, so the
-	// same floor as any other retry applies
-	bool rotated = !expired && !JwksHasKid(entry.keys_json, kid);
-	if ((expired || rotated) && now - entry.tried_at >= (rotated ? RETRY_FLOOR_SECONDS : 0)) {
-		string document, error;
-		entry.tried_at = now;
-		if (catalog->ReadText(config.jwks_uri, document, error)) {
-			entry.keys_json = std::move(document);
-			entry.fetched_at = now;
-			entry.error.clear();
-		} else {
-			entry.error = std::move(error);
-		}
-		AuditKeys(config.issuer, entry.error.empty(), entry.error);
-		lock_guard<mutex> guard(lock);
-		if (!entry.error.empty() && jwks_cache.find(config.issuer) == jwks_cache.end()) {
-			// acl_jwks_refresh dropped the entry while this read was in flight and the read failed:
-			// the copy in hand carries the old document, and writing it back would serve it until
-			// acl_jwks_max_stale - exactly what the drop meant to end. The attempt is recorded, the
-			// document is not (spec 071 review).
-			entry.keys_json.clear();
-			entry.fetched_at = 0;
-		}
-		jwks_cache[config.issuer] = entry;
-	}
-	if (entry.keys_json.empty()) {
-		NoteDenyReason(Reason::SOURCE_ERROR); // the source of the keys, not the principal, is what failed
-		throw BinderException("acl_rewrite: token rejected: the keys of issuer \"%s\" could not be read from "
-		                      "\"%s\": %s",
-		                      config.issuer, config.jwks_uri, entry.error);
-	}
-	// keys that can no longer be read are used for a bounded while and then stop being trusted: an
-	// issuer that has been unreachable for a day says nothing about a key that may have been revoked
-	auto max_stale = JwksMaxStale();
-	if (!entry.error.empty() && (max_stale <= 0 || now - entry.fetched_at > max_stale)) {
-		NoteDenyReason(Reason::SOURCE_ERROR); // the same cause as above: the keys' source, not the principal
-		throw BinderException("acl_rewrite: token rejected: the keys of issuer \"%s\" were last read %lld seconds "
-		                      "ago and \"%s\" is still unreadable (%s); acl_jwks_max_stale is %lld",
-		                      config.issuer, now - entry.fetched_at, config.jwks_uri, entry.error, max_stale);
-	}
-	return entry.keys_json;
 }
 
 bool PolicyStore::ResolveDdlTarget(const Principal &principal, const string &vname, const string &capability,

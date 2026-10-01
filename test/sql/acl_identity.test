@@ -1,0 +1,518 @@
+# name: test/sql/acl_identity.test
+# description: issuers and clients (spec 095) - the short form and its implicit client, explicit
+#   clients told apart by azp, routing by specificity (ties refused at write or at use), REQUIRE,
+#   ROLES CONSTANT, ATTRIBUTES with a constant ceiling, UNMAPPED, privileged roles reached only through
+#   the client's own mapping, TOKEN TYPE, one issuer per URL, no key or credential in the policy, and
+#   what DROP takes with it. Keys are found by the issuers' discovery under test/idp/; tokens are
+#   signed with the committed fixture keys (test/scripts/idp_fixtures.py mint).
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme'), (2, 'acme'), (3, 'globex');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders RLS 'tenant = acl_claim(''tenant'')';
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN;
+
+statement ok
+ACL ADMIN CREATE ROLE auditor CLAIMS (tenant = 'globex');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor MAIN;
+
+# a role that administers: reached only through an explicit mapping of a client
+statement ok
+ACL ADMIN CREATE ROLE boss;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE boss MAIN;
+
+statement ok
+SELECT acl_grant_admin('boss', 'manage');
+
+# --- no key and no credential is ever written into the policy -------------------------------------
+
+statement error
+ACL ADMIN CREATE ISSUER 'test/idp/a' KEYS '{"keys":[]}' AUDIENCES ('api://acl-test');
+----
+<REGEX>:.*keys and algorithms are never written into the policy.*
+
+statement error
+ACL ADMIN CREATE ISSUER 'test/idp/a' AUDIENCES ('api://acl-test') CLIENT ID 'door-app' CLIENT SECRET 'super-secret-value';
+----
+<REGEX>:.*a client secret is never written into the policy.*
+
+# --- the short form: one issuer, one application -----------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ISSUER 'test/idp/a' AUDIENCES ('api://acl-test') ROLE CLAIM 'roles' CLAIM MAP (tid => tenant) CLIENT ID 'door-app';
+
+query IIII
+SELECT name, url, secret_service, secret FROM acl_issuers();
+----
+test/idp/a	test/idp/a	NULL	NULL
+
+# its implicit client: named after the issuer, unmapped values that name a role are that role, and a
+# public client id runs the drivers' flows - the password flow is only ever written
+query IIIIIII
+SELECT name, issuer, audiences, roles_from, unmapped, flows, implicit FROM acl_clients();
+----
+test/idp/a	test/idp/a	["api://acl-test"]	["roles"]	as_role	["authcode","device"]	true
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvYSIsInN1YiI6InMxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.WvNonDgH9hYONICXqRDNLUmUJEF7tXZe64mVd3kfess-S9uFPYCsMNlnTAUhPMxan35AtoSW-cKRuRDSWr-vHCeGjailX8MCmHVHP8PAB3cHKxChyemxR5LPsNp1pVuAzTISGZBKSa2X11DPicMj4IxeBJ1LHxAUgafrYPWrHZlzdQMSAKMNdEWLuD5A3JTwhOStxmUbvVLpHCojCp8yyCcl2GKXA4AKFe5CfpKmz3QuSM0uhXTZzqjEE3dfE6ybn42qHarCw3IgDpq6qJSCnzdgk71CHc6P937EIYy6r2z8MmCTY3EyI2eVS47JzXb9EJW4tvU257JFFf28uk19eQ' SELECT count(*) FROM orders;
+----
+2
+
+# CREATE refuses to overwrite; OR REPLACE and IF NOT EXISTS say what they do (spec 013)
+statement error
+ACL ADMIN CREATE ISSUER 'test/idp/a' AUDIENCES ('api://acl-test');
+----
+<REGEX>:.*issuer "test/idp/a" already exists.*
+
+statement ok
+ACL ADMIN CREATE ISSUER IF NOT EXISTS 'test/idp/a' AUDIENCES ('api://other');
+
+query I
+SELECT audiences FROM acl_clients() WHERE name = 'test/idp/a';
+----
+["api://acl-test"]
+
+# a bare name needs its URL
+statement error
+ACL ADMIN CREATE ISSUER kc AUDIENCES ('api://acl-test');
+----
+<REGEX>:.*issuer "kc" needs its URL.*
+
+# a role that administers is never an unmapped value of the same name - not even for the short form
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvYSIsInN1YiI6ImIyIiwicm9sZXMiOlsiYm9zcyJdLCJ0aWQiOiJhY21lIn0.PI_ECEOC0ZzM0jYABKq1VqFq58ucvLIgaXLkYanQQZipAFmDSMdVubxClZDoFLP5rdgZvJicb4UOvMqig17AkUP6edzbJxoobKpRbPKLz8wN0gs7ZbFr2Q_dcNJFZouiqAFj95Yn7WKyeWFpf318sqxXCsoyhozajmNL8cEaRUuFw4MGQEc9ITEbGTBijNk3Gf7zRadkYo9dZRahH2R8iLyO_j3x6U7XPTjt5yvapYUkOAoFgbDNfQXzyBUahI2hjh5sd3J3zY9gGYl7XNzgMhxS2TCd_ihpbSYX4kDhelRitmvJW27m66wosQmQn6OGDq021WN0hmSrBEWdukty-Q' SELECT count(*) FROM orders;
+----
+<REGEX>:.*no recognized roles.*
+
+# nor is it mapped for every client of an issuer
+statement error
+ACL ADMIN MAP CLAIM 'boss' FROM ISSUER 'test/idp/a' TO ROLE boss;
+----
+<REGEX>:.*holds an administration scope, so it is mapped FROM CLIENT only.*
+
+# the client's own mapping is the one way
+statement ok
+ACL ADMIN MAP CLAIM 'boss' FROM CLIENT 'test/idp/a' TO ROLE boss;
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvYSIsInN1YiI6ImIyIiwicm9sZXMiOlsiYm9zcyJdLCJ0aWQiOiJhY21lIn0.PI_ECEOC0ZzM0jYABKq1VqFq58ucvLIgaXLkYanQQZipAFmDSMdVubxClZDoFLP5rdgZvJicb4UOvMqig17AkUP6edzbJxoobKpRbPKLz8wN0gs7ZbFr2Q_dcNJFZouiqAFj95Yn7WKyeWFpf318sqxXCsoyhozajmNL8cEaRUuFw4MGQEc9ITEbGTBijNk3Gf7zRadkYo9dZRahH2R8iLyO_j3x6U7XPTjt5yvapYUkOAoFgbDNfQXzyBUahI2hjh5sd3J3zY9gGYl7XNzgMhxS2TCd_ihpbSYX4kDhelRitmvJW27m66wosQmQn6OGDq021WN0hmSrBEWdukty-Q' SELECT count(*) FROM orders;
+----
+2
+
+# --- an explicit issuer and two applications of it --------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ISSUER kc URL 'test/idp/two';
+
+# one IdP is one issuer
+statement error
+ACL ADMIN CREATE ISSUER kc_again URL 'test/idp/two';
+----
+<REGEX>:.*have the same URL "test/idp/two" - one IdP is one issuer.*
+
+statement error
+ACL ADMIN CREATE CLIENT nowhere ISSUER kc ROLES FROM ('roles');
+----
+<REGEX>:.*accepts no audience - AUDIENCES is required.*
+
+statement ok
+ACL ADMIN CREATE CLIENT desktop ISSUER kc AUDIENCES ('api://acl-test') AZP ('acl-desktop')
+    ROLES FROM ('realm_access.roles') ATTRIBUTES (tenant = 'tenant', mail = ('upn', 'email'))
+    SUBJECT ('email', 'sub') CLIENT ID 'acl-desktop' FLOWS (authcode, device);
+
+statement ok
+ACL ADMIN CREATE CLIENT door ISSUER kc AUDIENCES ('api://acl-test') AZP ('acl-door')
+    ROLES FROM ('groups') ATTRIBUTES (tenant = CONSTANT 'globex');
+
+# an explicit client keeps unmapped values out (UNMAPPED IGNORE): `analyst` is a role here, but the
+# client maps nothing yet
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoiZDEiLCJhenAiOiJhY2wtZGVza3RvcCIsInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJhbmFseXN0Il19LCJ0ZW5hbnQiOiJhY21lIiwiZW1haWwiOiJkMUBhY21lLnRlc3QifQ.WLGOGKm2ToWTfkOdtd2iwtUAQpFStL7EIVxL49X-iseG3h-kXy0r-PKZ6eXM0IoyWXaAEquteRi-3WcodM0l0yks0LvLmkbl21cKyvzEGkoAqMgRxygru-fFf_oZAii2MNtVccN3-tohOFKHU7jg45Jy37RUpYivdV9giFIYJKhU-K8DHNBahPS4ma1phfZqGqgRqLvLiWOYYJZNbYIcOitp46mab7U6l3pcbiFPeQ3GjqcQpplcjvC6OKavusBXRrfO_569mK2SF78iZpiXp5J0Dn6JN-CMq311SUeGHeimrxg1rh1WDtbQ9Lsm98HRPNSBNkxSLepOaAZtV1fQpw' SELECT count(*) FROM orders;
+----
+<REGEX>:.*no recognized roles.*
+
+statement ok
+ACL ADMIN MAP CLAIM 'analyst' FROM CLIENT desktop TO ROLE analyst;
+
+statement ok
+ACL ADMIN MAP GROUP 'g-fin' FROM CLIENT door TO ROLE analyst;
+
+# the same issuer, two shapes: each token through its own client, with its own attributes
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoiZDEiLCJhenAiOiJhY2wtZGVza3RvcCIsInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJhbmFseXN0Il19LCJ0ZW5hbnQiOiJhY21lIiwiZW1haWwiOiJkMUBhY21lLnRlc3QifQ.WLGOGKm2ToWTfkOdtd2iwtUAQpFStL7EIVxL49X-iseG3h-kXy0r-PKZ6eXM0IoyWXaAEquteRi-3WcodM0l0yks0LvLmkbl21cKyvzEGkoAqMgRxygru-fFf_oZAii2MNtVccN3-tohOFKHU7jg45Jy37RUpYivdV9giFIYJKhU-K8DHNBahPS4ma1phfZqGqgRqLvLiWOYYJZNbYIcOitp46mab7U6l3pcbiFPeQ3GjqcQpplcjvC6OKavusBXRrfO_569mK2SF78iZpiXp5J0Dn6JN-CMq311SUeGHeimrxg1rh1WDtbQ9Lsm98HRPNSBNkxSLepOaAZtV1fQpw' SELECT count(*) FROM orders;
+----
+2
+
+# a CONSTANT attribute is the ceiling a token cannot pass: the token says acme, the client says globex
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoiZzEiLCJhenAiOiJhY2wtZG9vciIsImdyb3VwcyI6WyJnLWZpbiJdLCJ0ZW5hbnQiOiJhY21lIn0.OiKdrPGSoMfu-fFF91rHlyVMy5hnKsOCwJWLpTCZOV6J0NpDbj4osMYU-KnLV3nBQMSME0c2v5cJKhNFNWBjqKzLB9a3oarhqil-lr2sRlQwoiJYlMT2JvA2enSKwrKlzSjwuk5-VeawlJSMm0Q5RjXlpSUa4YlZ0FhsqStMJFlzRapC_hTnf0iVnAVualhI8b2dqqKiOFxFtgHp6U1KP3kOokyHj6bFaTlmKSmwb5MI3fwoSx_2GXpEZlZUVGNn5kp8grfnyWMICXRVpM5h6Ra4E9RnH7R8ZZX5VsMDHNXZ0bvMby7CIy_Ns8xstvN9o6JikrF4FQe7Mw3Lcf_72Q' SELECT count(*) FROM orders;
+----
+1
+
+# the subject is the client's first path present - the audit's and the session's identity, never a
+# grant's; the issuer beside it is the IdP's URL
+statement ok
+SET GLOBAL acl_audit_level='all';
+
+statement ok
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoiZDEiLCJhenAiOiJhY2wtZGVza3RvcCIsInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJhbmFseXN0Il19LCJ0ZW5hbnQiOiJhY21lIiwiZW1haWwiOiJkMUBhY21lLnRlc3QifQ.WLGOGKm2ToWTfkOdtd2iwtUAQpFStL7EIVxL49X-iseG3h-kXy0r-PKZ6eXM0IoyWXaAEquteRi-3WcodM0l0yks0LvLmkbl21cKyvzEGkoAqMgRxygru-fFf_oZAii2MNtVccN3-tohOFKHU7jg45Jy37RUpYivdV9giFIYJKhU-K8DHNBahPS4ma1phfZqGqgRqLvLiWOYYJZNbYIcOitp46mab7U6l3pcbiFPeQ3GjqcQpplcjvC6OKavusBXRrfO_569mK2SF78iZpiXp5J0Dn6JN-CMq311SUeGHeimrxg1rh1WDtbQ9Lsm98HRPNSBNkxSLepOaAZtV1fQpw');
+
+statement ok
+SELECT acl_audit_flush();
+
+query II
+SELECT subject, issuer FROM acl_audit_events() WHERE kind = 'session' AND detail = 'opened';
+----
+d1@acme.test	test/idp/two
+
+statement ok
+SET GLOBAL acl_audit_level='denied';
+
+# a mapping names a client or an issuer that exists
+statement error
+ACL ADMIN MAP CLAIM 'x' FROM CLIENT nosuch TO ROLE analyst;
+----
+<REGEX>:.*client "nosuch" does not exist.*
+
+# --- routing: the most specific client, never two -----------------------------------------------------
+
+# two clients that would accept the same tokens are refused where they are written
+statement error
+ACL ADMIN CREATE CLIENT desktop2 ISSUER kc AUDIENCES ('api://acl-test') AZP ('acl-desktop', 'more') ROLES FROM ('roles');
+----
+<REGEX>:.*clients "desktop" and "desktop2" of issuer "kc" would accept the same tokens.*
+
+# no client accepts a token of another application
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoibzEiLCJhenAiOiJzb21lb25lLWVsc2UiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRlbmFudCI6ImFjbWUifQ.Oe5EOQ2cXhBO8eA9DUvGTg4OsHkJDM5cbmZD7dDK6Jq1mV5aMbEdgMJtPxNS4vzRJGxOxPaG-9C7KaBpMmCy6WnTFyZnaFtjfXZg0yDgLNN4BUs2TcoU6gMPngHsT0yAtebAWRx_5LWPJYJtEVDQn6xy1wvyqWIMLosIi6tBVem0IXUoOUHykfTwb47QovxOlS3Y3qXTRNdQDGT6u4hzVjmRzr83-7XRLl8V9FSVDbAAoVUpg19Yb5UVdz5ZrC19tUC_whvmX3XfY1DbZmtKu0hdEuNSFxfYxstVAsiV0he-xaMDfbfhHfnCR6iulqWdyx_Tu-EFzGZbntL2gGouUw' SELECT count(*) FROM orders;
+----
+<REGEX>:.*no client of issuer "kc" accepts this token \(authorized party \(azp\) not accepted\).*
+
+# a client without AZP or REQUIRE takes what no more specific client takes - and only that
+statement ok
+ACL ADMIN CREATE CLIENT catchall ISSUER kc AUDIENCES ('api://acl-test') ROLES FROM ('roles') UNMAPPED AS ROLE ATTRIBUTES (tenant = 'tenant');
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoibzEiLCJhenAiOiJzb21lb25lLWVsc2UiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRlbmFudCI6ImFjbWUifQ.Oe5EOQ2cXhBO8eA9DUvGTg4OsHkJDM5cbmZD7dDK6Jq1mV5aMbEdgMJtPxNS4vzRJGxOxPaG-9C7KaBpMmCy6WnTFyZnaFtjfXZg0yDgLNN4BUs2TcoU6gMPngHsT0yAtebAWRx_5LWPJYJtEVDQn6xy1wvyqWIMLosIi6tBVem0IXUoOUHykfTwb47QovxOlS3Y3qXTRNdQDGT6u4hzVjmRzr83-7XRLl8V9FSVDbAAoVUpg19Yb5UVdz5ZrC19tUC_whvmX3XfY1DbZmtKu0hdEuNSFxfYxstVAsiV0he-xaMDfbfhHfnCR6iulqWdyx_Tu-EFzGZbntL2gGouUw' SELECT count(*) FROM orders;
+----
+2
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoiZzEiLCJhenAiOiJhY2wtZG9vciIsImdyb3VwcyI6WyJnLWZpbiJdLCJ0ZW5hbnQiOiJhY21lIn0.OiKdrPGSoMfu-fFF91rHlyVMy5hnKsOCwJWLpTCZOV6J0NpDbj4osMYU-KnLV3nBQMSME0c2v5cJKhNFNWBjqKzLB9a3oarhqil-lr2sRlQwoiJYlMT2JvA2enSKwrKlzSjwuk5-VeawlJSMm0Q5RjXlpSUa4YlZ0FhsqStMJFlzRapC_hTnf0iVnAVualhI8b2dqqKiOFxFtgHp6U1KP3kOokyHj6bFaTlmKSmwb5MI3fwoSx_2GXpEZlZUVGNn5kp8grfnyWMICXRVpM5h6Ra4E9RnH7R8ZZX5VsMDHNXZ0bvMby7CIy_Ns8xstvN9o6JikrF4FQe7Mw3Lcf_72Q' SELECT count(*) FROM orders;
+----
+1
+
+# conditions cannot be compared where they are written: two clients whose REQUIRE both hold for one
+# token are refused where the token is judged
+statement ok
+ACL ADMIN CREATE CLIENT svc_by_sub ISSUER kc AUDIENCES ('api://svc') REQUIRE (sub LIKE 'svc-%') ROLES FROM ('roles') UNMAPPED AS ROLE;
+
+statement ok
+ACL ADMIN CREATE CLIENT svc_by_tenant ISSUER kc AUDIENCES ('api://svc') REQUIRE (tenant = 'acme') ROLES CONSTANT ('auditor');
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9zdmMiLCJleHAiOjQxMDI0NDQ4MDAsImlzcyI6InRlc3QvaWRwL3R3byIsInN1YiI6InN2Yy0xIiwidGVuYW50IjoiYWNtZSIsInJvbGVzIjpbImFuYWx5c3QiXX0.Hl4INl3O-JleoLodyEBw-v7AlUBcIik6OXjE4AqoqDpUKN5T-ud_h52CQdXibx23kapFIW8z6HJdsykZeBwno84tNrOSyc7_2yVKeYqSOyn3JeQnMTLYYm8Qfa8NBa92bzsTnzd5y6w7d9slfqwhuGeUmO2mAAsOAx3vIVbPu64rZ2Eq813jrBM-IdnODyT-twluFF62xSpL7CGm_l_nSXSocIkxqubhK_Gz0JRZZYd2c6Y9ZWPeA5KBMDtuq-nQVZYnFoxGRrbAKX9W0e8dM_bFnWxj2_fHdryE15gWWm6wFZxcRngZGT5jxScuXPfnVZ-2KJ6bJVeYGhPibWC9NQ' SELECT count(*) FROM orders;
+----
+<REGEX>:.*the token fits clients svc_by_sub, svc_by_tenant of issuer "kc" equally.*
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9zdmMiLCJleHAiOjQxMDI0NDQ4MDAsImlzcyI6InRlc3QvaWRwL3R3byIsInN1YiI6InN2Yy0yIiwidGVuYW50IjoiZ2xvYmV4Iiwicm9sZXMiOlsiYW5hbHlzdCJdfQ.MU7g7G0eCcJ49fxI2DSQpB4lctZ2kNuBVwXFHcpLoN06b8cq13u831iB9NnQRBHN8TOk3OWbPqVuWW8moBmBpgFFdQJKQW9Jydexb8caGRED11kL6ncMdmrVwTxsFOsSku96UQKJGzamHbOsaBMUD7_7iq9b6wLsxkQpi5pWIb2_dwZE80bAotJr25_YM0Xt8O1RZNSEXxIvvttEhRE5liHlmxjCi_Mh4mx68EVPGASfgcHcP8aveW3O9qu2ewNlN4ZlFFxG6n35qWAyN1T2n6_pce2jxCHESbaV2No53-Ol9tbHROxQ8431xcKDaqGI26SWkZXNv7aY6lB62wgr4g' SELECT count(*) FROM orders;
+----
+0
+
+# --- REQUIRE: =, IN, contains, LIKE --------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE CLIENT ops ISSUER kc AUDIENCES ('api://ops')
+    REQUIRE (tid IN ('t1', 't2'), 'admin' IN groups, sub LIKE '%@acme.test') ROLES CONSTANT ('auditor');
+
+# ROLES CONSTANT: every token of the client is that role (whose default claims follow it)
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9vcHMiLCJleHAiOjQxMDI0NDQ4MDAsImlzcyI6InRlc3QvaWRwL3R3byIsInN1YiI6InUxQGFjbWUudGVzdCIsInRpZCI6InQyIiwiZ3JvdXBzIjpbInN0YWZmIiwiYWRtaW4iXX0.OZwooonfvsGqyxYR_QZehcB62198m-Z1Pd01UJESM55zgeMvxPceY23JnneYGjRNmIKyvAbgOzz0t5SRDh6owHF3J-Nw72PLcEgzkZq5Hq_gbje8Orqxevh7w0-3h-QykIwyYCkh5yS0CA4YMw9QiO2t3R6yMg3pZpl4I5U3vBTWWjqSODQToJg2DUVmvd1H4SXpJQ-MpDctCyQmnrP3_oHlPM_7Q6RXAArVDtB7oOzBGvq3KXkiU_7qjdDvEqqKLE9XVE2fwJxS33Glcm7wmXxkxm2QISIxj5aS4qxJfr1PCC8jNARxTYzFsqbiTHPG2MByfgcyH0K0cD39W5gL1g' SELECT count(*) FROM orders;
+----
+1
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9vcHMiLCJleHAiOjQxMDI0NDQ4MDAsImlzcyI6InRlc3QvaWRwL3R3byIsInN1YiI6InUxQGFjbWUudGVzdCIsInRpZCI6InQ5IiwiZ3JvdXBzIjpbInN0YWZmIiwiYWRtaW4iXX0.IOnExIIwWPQgcc3_Pr8T11fuw3JjLpssg9DszM2kga2pyzIXERnuiTez0UeWQWw_AmmUQOUyectUa-UWrIs_Aq3lilM6q4KtSyWvz3w1gMTABZq3HVzfKtSznpE1MM4GQp492k8tS2NbjGrX-KjRmfkIKiaN6A4dnGvITIu8ullU_NcAY1r5kkoTl4uAfPxzArFOLzsIDZ-13lstoKV_05UA1RfRtpZVC1ifLVbSc3TBnvwe63rysk0w_BmleySGQ-DR1VnijspewZ7C__pM9Brhpv5dtkfgEPBMNzGBytTtsJcxTE0MNZb-URVTMttMLSocqMKNhgp1f0ZoErvhgg' SELECT 1;
+----
+<REGEX>:.*the condition on "tid" does not hold.*
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9vcHMiLCJleHAiOjQxMDI0NDQ4MDAsImlzcyI6InRlc3QvaWRwL3R3byIsInN1YiI6InUxQGFjbWUudGVzdCIsInRpZCI6InQyIiwiZ3JvdXBzIjpbInN0YWZmIl19.dpFvePlw8GLH1MwczT6ND59octO-TqIUTSFCest1QfnXR1ZqbPhUwH-kB6e5Fe3AM5vCPXS83AlaNzF6zQ41t3ToaYSfE6miyJtYz6oTqSF0bnUlJ9YDvcRfSRJIc2eHukqK-Gz2nZc-IA4hDi1lFbSwwvpjpE4xJ3_XNrdmzo-wZxORTXrGx3dLL_M722Ir22tTZHeZNu_6hL0qmkN_hzZVmHTnMbAHgwBS6jZcgcyPN4s_qwwgxDnm_yjqgX1ZJFBoFIBgd1bn6So3SPJckOI02Zck_0-aoioc0JrjgxcTNOXeDhiEBJVVMaljjbQtCrP3e9ZQsi8JskSu1VzoOw' SELECT 1;
+----
+<REGEX>:.*the condition on "groups" does not hold.*
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9vcHMiLCJleHAiOjQxMDI0NDQ4MDAsImlzcyI6InRlc3QvaWRwL3R3byIsInN1YiI6InUxQGV2aWwudGVzdCIsInRpZCI6InQyIiwiZ3JvdXBzIjpbImFkbWluIl19.IxqY4ooX0VbCg2ciIuB_-bYHdrfjCR01W7253It1MJG0g7c2gEAZD70ZrVbdNgNI5Mb_rPxQkw9-ZjdZHem41Ig932099SJazcN2sUAkfJJnftOMjcZ_m0IiiJXbSOEuS6ltiV9X8jKo6G7Il5fcN72GcZxWP1au2bIUe_VmxaR3gWR49hN7kVoobloBEwy60fzfia3YtPFw27gtjUYLmw9fwgXTwJ8ny4C6RVUZvKiRe1OCH6YoLc1Omm2qlenJuAwOswWu4Wv2cDXSYbMZsD2GXFxU_keFYWw2LD2Kp6wmwMnAg7Mka8StFHhTLkVEKUZk8UpwNZ6Lzg6bicW0dg' SELECT 1;
+----
+<REGEX>:.*the condition on "sub" does not hold.*
+
+statement error
+ACL ADMIN CREATE CLIENT bad ISSUER kc AUDIENCES ('api://bad') REQUIRE (sub ~ 'x') ROLES FROM ('roles');
+----
+<REGEX>:.*a REQUIRE condition is path = value.*
+
+# a privileged role is never a constant
+statement error
+ACL ADMIN CREATE CLIENT bad ISSUER kc AUDIENCES ('api://bad') ROLES CONSTANT ('boss');
+----
+<REGEX>:.*ROLES CONSTANT names "boss", which holds an administration scope.*
+
+# ... nor an unmapped value: the client maps it, or the token does not have it
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoiYjEiLCJhenAiOiJhY2wtZGVza3RvcCIsInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJib3NzIl19LCJ0ZW5hbnQiOiJhY21lIn0.VNG330ILaot-h0-u3KRUmH1dKWxRRJd9LIK9kD6c71DbPpJ3WgfPjWPs363DYuo0rRe-lro14Bgrcs8YjINK4wMooaTg6yWVjQHbIF6gHesNUc_BMRuSgN3_QBJVqBSlfnOVwvamGPb00N9k8v7bclYVVwRlc1DoZNSEIFzHwOMpT7jsI7FjM-O0GySTa5jhybMNqLN6lP0hiCFHXy4Kef0TvlGl-YTXAxYwbIweoCJVUryS3qip0UvY8LX0fA7V7RzOwPIYitqjyfJRUD5aFajGre4EBAf1HUIO0Tupwlv0F_jGp4BvvuRV7il9a3AXBXXvaQoRD-K3PaJAqnAhHQ' SELECT count(*) FROM orders;
+----
+<REGEX>:.*no recognized roles.*
+
+statement ok
+ACL ADMIN MAP CLAIM 'boss' FROM CLIENT desktop TO ROLE boss;
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoiYjEiLCJhenAiOiJhY2wtZGVza3RvcCIsInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJib3NzIl19LCJ0ZW5hbnQiOiJhY21lIn0.VNG330ILaot-h0-u3KRUmH1dKWxRRJd9LIK9kD6c71DbPpJ3WgfPjWPs363DYuo0rRe-lro14Bgrcs8YjINK4wMooaTg6yWVjQHbIF6gHesNUc_BMRuSgN3_QBJVqBSlfnOVwvamGPb00N9k8v7bclYVVwRlc1DoZNSEIFzHwOMpT7jsI7FjM-O0GySTa5jhybMNqLN6lP0hiCFHXy4Kef0TvlGl-YTXAxYwbIweoCJVUryS3qip0UvY8LX0fA7V7RzOwPIYitqjyfJRUD5aFajGre4EBAf1HUIO0Tupwlv0F_jGp4BvvuRV7il9a3AXBXXvaQoRD-K3PaJAqnAhHQ' SELECT count(*) FROM orders;
+----
+2
+
+# --- TOKEN TYPE: an access token, not an id token (RFC 9068) -------------------------------------------
+
+statement ok
+ACL ADMIN CREATE CLIENT typed ISSUER kc AUDIENCES ('api://typed') TOKEN TYPE 'at+jwt' ROLES FROM ('roles') UNMAPPED AS ROLE ATTRIBUTES (tenant = 'tenant');
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly90eXBlZCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoidDEiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRlbmFudCI6ImFjbWUifQ.iLl9jfP93DQrBOxvVJioacxrDI-diaNFEn3iG_0T1qEg3JTCG96UaWmVKNWNxVPEkd-ZBCc39pyXe2FMrEF9pCMAG-5fmUteVYX6qSo4ReK0NAIqICsxFTNvFPJrDs3xo5zSkA3XfGO85gzPFzjusz07x31bHXKYB-NZM6htGNz5AwVIb8ABMT0WEc1Gi3AC1j-FV9Vd7kjur7AsWIvaLNyH5fAXLZgs-r_apIC3UH6hqgbzTYr_r8tLmEesyc_MKNpju-dTGH_28JsEQyAsXmePJyJxfT1lAuqi8z3tnywTA_qHi7bgRvqNoTkJApicGTq020QpMR3EA2AR4sS-tg' SELECT count(*) FROM orders;
+----
+2
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly90eXBlZCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoidDEiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRlbmFudCI6ImFjbWUifQ.FBgkukY4uZhCsHyqpfN8DgBRYLGvtX4JOVSMGeshofEvDtfEPlf7YwDv9PHcTv2ETXPWaOCmj6oIG1sbtTN2yDtZbwq301UY6-9WgO2pK1V_1eUHaAreZr_rwop_jjld8oRzohEJaz046hUdbVyz4mAuiGBF8gDagRfgSRors_1NamwXN-p2iwTNufjlyu1E-gkV8TdoWB2XfZF_Jw1tniC4AiqZkNgJI81UecogYzwYJURHjemPdOhHHjJXWvA6i4UqcEZNg5eT6tHTce8DWtmDYlge90aOdsuCKpVddQKjjwCSRss3eLe03_B319sWZJweJ8SdNvynAEjxBCQvIw' SELECT 1;
+----
+<REGEX>:.*token type "JWT" is not at\+jwt.*
+
+# --- ALTER ----------------------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN ALTER CLIENT typed SET AUDIENCES ('api://typed', 'api://typed2') FLOWS (client_credentials) CLIENT ID 'typed-app';
+
+query III
+SELECT audiences, flows, client_id FROM acl_clients() WHERE name = 'typed';
+----
+["api://typed","api://typed2"]	["client_credentials"]	typed-app
+
+# the implicit client is the issuer's: changed through ALTER ISSUER
+statement error
+ACL ADMIN ALTER CLIENT 'test/idp/a' SET FLOWS (password);
+----
+<REGEX>:.*is the client of issuer "test/idp/a"'s short form - ALTER ISSUER changes it.*
+
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET FLOWS (password) UNMAPPED IGNORE;
+
+query II
+SELECT flows, unmapped FROM acl_clients() WHERE name = 'test/idp/a';
+----
+["password"]	ignore
+
+statement error
+ACL ADMIN ALTER ISSUER nosuch SET URL 'test/idp/x';
+----
+<REGEX>:.*issuer "nosuch" does not exist.*
+
+# --- the secrets service: FROM SECRET names a secret of an attached tresor ------------------------------
+# (the service itself is test/cpp/test_acl_identity_secrets.cpp)
+
+statement error
+ACL ADMIN CREATE ISSUER corp URL 'test/idp/b' FROM SECRET corp_idp;
+----
+<REGEX>:.*no secrets service is attached to this node.*
+
+statement error
+ACL ADMIN CREATE CLIENT svc ISSUER kc FROM SECRET svc_client ROLES FROM ('roles');
+----
+<REGEX>:.*no secrets service is attached to this node.*
+
+# --- unknown issuer --------------------------------------------------------------------------------------
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvbm93aGVyZSIsInN1YiI6IngiLCJyb2xlcyI6WyJhbmFseXN0Il19.ayaKF5kGa7wHlsjWJVaQZ4YXttX4ntzfiuSnV8a9kEGgVTWlL45GUpEbtJYFGE41VbmOTnMy7eoxZEK7xnVV-I5X3mC7Pg5PDddKEnI5ddZthvTKJ1q58Do59tqdxHqsbfxwZAtpr0C9DC2sPEDs3SceQnrKwPrj9gJBp-2iH2l58V3dcQGaFvQ9SiVWnmbgyC5vfMRXG2ngE-Y56i6sQukOhWSdIUaRvf1BHmaAgNbIfO5K9VXInvpFhgaBAJw_PFkxxbRSrvJ4Hpa8ay5TMtapJBrHRqV48RUx3ZSR_uNLJlG1uhFVrHLFZeSBg_UBEBnpuH6m00RT6uEtY9AQjQ' SELECT 1;
+----
+<REGEX>:.*unknown issuer "test/idp/nowhere".*
+
+# --- grammar edges (review of spec 095) ------------------------------------------------------------------
+
+# a boolean or numeric claim is compared without quotes
+statement ok
+ACL ADMIN CREATE CLIENT flagged ISSUER kc AUDIENCES ('api://flagged') REQUIRE (email_verified = true, level IN (1, 2)) ROLES FROM ('roles');
+
+query I
+SELECT requires FROM acl_clients() WHERE name = 'flagged';
+----
+[{"path":"email_verified","op":"eq","values":["true"]},{"path":"level","op":"in","values":["1","2"]}]
+
+statement ok
+ACL ADMIN DROP CLIENT flagged;
+
+# a quoted CLAIM MAP is data, never spliced into the spec
+statement error
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET CLAIM MAP '{"a":"t"}, "unmapped": "ignore"';
+----
+<REGEX>:.*CLAIM MAP is a JSON object.*
+
+# an operator's FLOWS () stays empty through a later ALTER: defaults apply when the client is created
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET FLOWS ();
+
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET AUDIENCES ('api://acl-test', 'api://b');
+
+query I
+SELECT flows IS NULL FROM acl_clients() WHERE name = 'test/idp/a';
+----
+true
+
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET AUDIENCES ('api://acl-test');
+
+# --- a write is judged by what it changes (review of spec 095) -----------------------------------------
+
+# a role mapped for every client of an issuer, then made an administrator: the mapping stops counting
+# at use, and an unrelated write is not refused for it
+statement ok
+ACL ADMIN CREATE ROLE later_boss;
+
+statement ok
+ACL ADMIN MAP CLAIM 'lb' FROM ISSUER kc TO ROLE later_boss;
+
+statement ok
+SELECT acl_grant_admin('later_boss', 'manage');
+
+statement ok
+ACL ADMIN MAP CLAIM 'x' FROM CLIENT typed TO ROLE analyst;
+
+# a client moved to another issuer leaves its mappings behind: a value means something at one IdP
+statement ok
+ACL ADMIN CREATE ISSUER other_idp URL 'test/idp/other';
+
+statement ok
+ACL ADMIN MAP GROUP 'g-ops' FROM CLIENT ops TO ROLE boss;
+
+statement ok
+ACL ADMIN CREATE OR REPLACE CLIENT ops ISSUER other_idp AUDIENCES ('api://ops') ROLES FROM ('roles');
+
+query I
+SELECT count(*) FROM acl_role_mappings() WHERE scope_name = 'ops';
+----
+0
+
+statement ok
+ACL ADMIN DROP CLIENT ops;
+
+# a short form replaced by the long one takes what was mapped from its implicit client with it
+statement ok
+ACL ADMIN CREATE ISSUER 'test/idp/b' AUDIENCES ('api://b') ROLE CLAIM 'roles';
+
+statement ok
+ACL ADMIN MAP CLAIM 'v' FROM CLIENT 'test/idp/b' TO ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE OR REPLACE ISSUER 'test/idp/b' URL 'test/idp/b';
+
+query II
+SELECT (SELECT count(*) FROM acl_clients() WHERE issuer = 'test/idp/b'),
+       (SELECT count(*) FROM acl_role_mappings() WHERE scope_name = 'test/idp/b');
+----
+0	0
+
+statement ok
+ACL ADMIN DROP ISSUER 'test/idp/b';
+
+statement ok
+ACL ADMIN DROP ISSUER other_idp;
+
+# --- DROP: what goes with what --------------------------------------------------------------------------
+
+# an issuer with explicit clients stays until they go
+statement error
+ACL ADMIN DROP ISSUER kc;
+----
+<REGEX>:.*issuer "kc" still has client.*
+
+# the implicit client is dropped with its issuer, not by itself
+statement error
+ACL ADMIN DROP CLIENT 'test/idp/a';
+----
+<REGEX>:.*DROP ISSUER removes it.*
+
+# a client takes its mappings with it
+statement ok
+ACL ADMIN DROP CLIENT desktop;
+
+query I
+SELECT count(*) FROM acl_role_mappings() WHERE scope_name = 'desktop';
+----
+0
+
+statement ok
+ACL ADMIN DROP CLIENT IF EXISTS desktop;
+
+# the short form's issuer takes its client and both scopes' mappings
+statement ok
+ACL ADMIN DROP ISSUER 'test/idp/a';
+
+query II
+SELECT (SELECT count(*) FROM acl_clients() WHERE issuer = 'test/idp/a'),
+       (SELECT count(*) FROM acl_role_mappings() WHERE scope_name = 'test/idp/a');
+----
+0	0
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvYSIsInN1YiI6InMxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.WvNonDgH9hYONICXqRDNLUmUJEF7tXZe64mVd3kfess-S9uFPYCsMNlnTAUhPMxan35AtoSW-cKRuRDSWr-vHCeGjailX8MCmHVHP8PAB3cHKxChyemxR5LPsNp1pVuAzTISGZBKSa2X11DPicMj4IxeBJ1LHxAUgafrYPWrHZlzdQMSAKMNdEWLuD5A3JTwhOStxmUbvVLpHCojCp8yyCcl2GKXA4AKFe5CfpKmz3QuSM0uhXTZzqjEE3dfE6ybn42qHarCw3IgDpq6qJSCnzdgk71CHc6P937EIYy6r2z8MmCTY3EyI2eVS47JzXb9EJW4tvU257JFFf28uk19eQ' SELECT 1;
+----
+<REGEX>:.*unknown issuer "test/idp/a".*
+
+# --- the model survives the round trip through the policy catalog ----------------------------------------
+
+statement ok
+SELECT acl_use_db('store', 'acl', false);
+
+query I
+SELECT string_agg(name, ',' ORDER BY name) FROM acl_clients();
+----
+catchall,door,svc_by_sub,svc_by_tenant,typed
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwiaXNzIjoidGVzdC9pZHAvdHdvIiwic3ViIjoiZzEiLCJhenAiOiJhY2wtZG9vciIsImdyb3VwcyI6WyJnLWZpbiJdLCJ0ZW5hbnQiOiJhY21lIn0.OiKdrPGSoMfu-fFF91rHlyVMy5hnKsOCwJWLpTCZOV6J0NpDbj4osMYU-KnLV3nBQMSME0c2v5cJKhNFNWBjqKzLB9a3oarhqil-lr2sRlQwoiJYlMT2JvA2enSKwrKlzSjwuk5-VeawlJSMm0Q5RjXlpSUa4YlZ0FhsqStMJFlzRapC_hTnf0iVnAVualhI8b2dqqKiOFxFtgHp6U1KP3kOokyHj6bFaTlmKSmwb5MI3fwoSx_2GXpEZlZUVGNn5kp8grfnyWMICXRVpM5h6Ra4E9RnH7R8ZZX5VsMDHNXZ0bvMby7CIy_Ns8xstvN9o6JikrF4FQe7Mw3Lcf_72Q' SELECT count(*) FROM orders;
+----
+1

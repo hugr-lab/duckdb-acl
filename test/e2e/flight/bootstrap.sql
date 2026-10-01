@@ -22,16 +22,14 @@ ATTACH ':memory:' AS store;
 SELECT acl_use_db('store', 'acl', true);
 
 SET GLOBAL acl_allow_anonymous_admin=true;
-SELECT acl_define_issuer('https://issuer.test/s',
-    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
-    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
--- A second issuer whose keys live in a document that does not exist, with a failed read fatal at
--- once. A token naming it makes SessionOpen *throw* - keys are resolved before anything is verified
+SET GLOBAL acl_jwks_locations = 'test/idp/';  -- spec 095: the fixture issuers' discovery, read from the repository root
+SELECT acl_define_issuer('test/idp/s', '{"url": "test/idp/s", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
+-- A second issuer whose discovery document does not exist, with a failed read fatal at once. A token naming it makes SessionOpen *throw* - keys are resolved before anything is verified
 -- - which is the review's case: a C++ exception from under the door's own authentication, and the
 -- one the boundary has to turn into a named refusal rather than "Unexpected error in RPC handling".
-SET GLOBAL acl_jwks_locations = 'https://, /nonexistent/';  -- the location is allowed, the document is not there (spec 071)
-ACL ADMIN CREATE ISSUER 'https://issuer.test/file' KEYS FROM '/nonexistent/acl-e2e-jwks.json'
-    AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
+-- the location is allowed, the document is not there (spec 071)
+ACL ADMIN CREATE ISSUER 'test/idp/nofile'
+    AUDIENCES ('api://acl-test') ROLE CLAIM 'roles';
 SET GLOBAL acl_jwks_max_stale = 0;
 ACL ADMIN CREATE VIRTUAL CATALOG c;
 -- the key needs no COLUMNS list (a bare list is a projection, which is read-only) - and the key

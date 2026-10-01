@@ -11,6 +11,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$ROOT" # spec 095: the fixture issuers (test/idp/) are read relative to the repository root
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD="${BUILD_DIR:-$ROOT/build/release}"
 DUCKDB="${DUCKDB_BIN:-$BUILD/duckdb}"
@@ -69,7 +70,7 @@ ATTACH ':memory:' AS store;
 SELECT acl_use_db('store','acl',true);
 SET GLOBAL acl_allow_anonymous_admin=true;
 SET GLOBAL acl_jwks_locations = 'https://, $IDP/';  -- the stub IdP is http on loopback: listed by name (spec 071)
-ACL ADMIN CREATE ISSUER '$IDP' KEYS '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AUDIENCES 'api://acl-test' ALGS 'HS256' ROLE CLAIM 'roles' CLAIM MAP (tid => tenant) CLIENT ID 'acl-door';
+ACL ADMIN CREATE ISSUER '$IDP' AUDIENCES 'api://acl-test' ROLE CLAIM 'roles' CLAIM MAP (tid => tenant) CLIENT ID 'acl-door' FLOWS (password, authcode, device);
 ACL ADMIN CREATE VIRTUAL CATALOG c;
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders;
 ACL ADMIN CREATE ROLE analyst;
@@ -139,16 +140,8 @@ got="$(ask "$PLAIN_URI" password alice wonder "SELECT 1")"
 case "$got" in *"needs a TLS door"*) ;; *) fail "a cleartext door accepted a password handshake: $got";; esac
 
 # --- and the plain bearer path is exactly as it was ------------------------------------------------
-TOKEN="$(python3 - "$IDP" <<'PY'
-import base64, hashlib, hmac, json, sys, time
-b64 = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b"=")
-h = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-c = b64(json.dumps({"iss": sys.argv[1], "aud": "api://acl-test", "exp": int(time.time()) + 3600,
-                    "sub": "direct", "roles": ["analyst"], "tid": "acme"}).encode())
-sig = b64(hmac.new(b"acl-test-hs256-secret", h + b"." + c, hashlib.sha256).digest())
-print((h + b"." + c + b"." + sig).decode())
-PY
-)"
+TOKEN="$(python3 "$ROOT/test/scripts/idp_fixtures.py" mint \
+	"{\"iss\": \"$IDP\", \"aud\": \"api://acl-test\", \"exp\": $(( $(date +%s) + 3600 )), \"sub\": \"direct\", \"roles\": [\"analyst\"], \"tid\": \"acme\"}")"
 got="$(ask "$URI" bearer "$TOKEN" "SELECT count(*) AS n FROM orders" --tls-roots "$TMP/cert.pem")"
 echo "$got" | grep -q "'n': \[3\]" || fail "the plain bearer path regressed: $got"
 

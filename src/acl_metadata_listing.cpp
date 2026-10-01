@@ -588,8 +588,8 @@ IntrospectionRows FunctionListing(const string &listing, const FunctionCategoryM
 } // namespace
 
 IntrospectionRows PolicyStore::Introspect(const string &listing) {
-	// what an operator may read of the policy source itself. The issuer's keys are deliberately absent:
-	// a listing describes the policy, and an HS256 key is a shared secret, not metadata.
+	// what an operator may read of the policy source itself. No key and no credential is in it to begin
+	// with (spec 095: they live in the secrets service).
 	static const case_insensitive_map_t<string> LISTINGS = {
 	    {"catalogs", "SELECT \"vcat\", \"comment\" FROM %s"},
 	    {"schemas", "SELECT \"vcat\", \"path\", \"phys_path\", \"origin\", \"comment\" FROM %s"},
@@ -614,9 +614,13 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	                      " FROM %s"},
 	    {"grant_columns", "SELECT \"role\", \"vcat\", \"vname\", \"pos\", \"name\", \"type\" FROM %s"},
 	    {"admins", "SELECT \"role\", \"scope\", \"vcat\" FROM %s"},
-	    {"issuers", "SELECT \"issuer\", \"audiences\", \"algs\", \"role_claim\", \"claim_map\", \"jwks_uri\","
-	                " \"client_id\" FROM %s"},
-	    {"role_mappings", "SELECT \"issuer\", \"source\", \"external_value\", \"role\" FROM %s"},
+	    // spec 095: what is stored - a value kept in a secret is NULL here, beside the secret's name;
+	    // nothing in these tables is a key or a credential
+	    {"issuers", "SELECT \"name\", \"url\", \"secret_service\", \"secret\" FROM %s ORDER BY \"name\""},
+	    {"clients", "SELECT \"name\", \"issuer\", \"audiences\", \"azp\", \"requires\", \"roles_from\","
+	                " \"roles_constant\", \"unmapped\", \"attributes\", \"subject\", \"token_type\", \"client_id\","
+	                " \"flows\", \"secret_service\", \"secret\", \"implicit\" FROM %s ORDER BY \"issuer\", \"name\""},
+	    {"role_mappings", "SELECT \"scope_kind\", \"scope_name\", \"source\", \"external_value\", \"role\" FROM %s"},
 	    {"function_categories", "SELECT \"category\", \"comment\", \"builtin\" FROM %s"},
 	    {"function_category_members", "SELECT \"category\", \"database\", \"schema\", \"name\", \"kind\" FROM %s"},
 	    {"function_grants",
@@ -643,6 +647,7 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	    {"grant_columns", "grant_columns"},
 	    {"admins", "admins"},
 	    {"issuers", "issuers"},
+	    {"clients", "clients"},
 	    {"role_mappings", "role_mappings"},
 	    {"function_categories", "function_categories"},
 	    {"function_category_members", "function_category_members"},

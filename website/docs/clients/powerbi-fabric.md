@@ -9,8 +9,8 @@ token = notebookutils.credentials.getToken("<audience of the app registration>")
 # then exactly as in adbc.md, with "Bearer " + token
 ```
 
-The node verifies the Entra token like any issuer: JWKS from
-`https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys`, RS256, the app registration's
+The node verifies the Entra token like any issuer: keys by the tenant's OIDC discovery
+(`https://login.microsoftonline.com/<tenant>/v2.0`), RS256, a client with the app registration's
 audience, app roles / groups mapped to ACL roles. No acquisition code anywhere - the platform's
 workload identity is the acquiring layer.
 

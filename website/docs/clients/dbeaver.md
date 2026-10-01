@@ -25,8 +25,9 @@ Driver setup, once:
    memory layer.
 
 Leave Username/Password empty and Connect opens the IdP's login page. Fill them in to use the
-password sign-in instead. The issuer's client (its `CLIENT ID`) must be a public client that allows
-PKCE with a `http://127.0.0.1/*` redirect, and the device grant if device codes are wanted. The
+password sign-in instead. The client the door advertises (a client with `CLIENT ID` and
+`FLOWS (authcode, device)`, spec 095) must be a public client at the IdP that allows PKCE with a
+`http://127.0.0.1/*` redirect, and the device grant if device codes are wanted. The
 repository's README has the full list of properties.
 
 ## The stock Arrow driver
@@ -37,7 +38,7 @@ artifact `org.apache.arrow:flight-sql-jdbc-driver:<current>`. URL:
 `&disableCertificateVerification=true` only against a self-signed development door.
 
 - **Username / Password** (spec 064): DBeaver's native fields. The door runs the IdP's password grant
-  as the issuer's `CLIENT ID` and hands the token back to the driver. This needs a TLS door, and the
+  as a client with `FLOWS (password)` and hands the token back to the driver. This needs a TLS door, and the
   IdP must allow the grant.
 - **A token**: driver property `token` = `<access token>`, with Username/Password left empty. It must
   be replaced when it expires.

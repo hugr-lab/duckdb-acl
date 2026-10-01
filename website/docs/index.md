@@ -33,7 +33,7 @@ JDBC/DBeaver, Power BI) and the embedded **quack** server (another DuckDB).
   categories, resource groups and secrets.
 - [Policy catalog](policy-catalog.md): where policy lives, the tables, schema versions and
   migrations, staleness, and the function-driver source.
-- [Authentication](authentication.md): the prefix forms, issuers and keys, role mapping, how a token
+- [Authentication](authentication.md): the prefix forms, issuers and clients, keys by discovery, role mapping, how a token
   is judged, sessions, and how clients get a token.
 - [Serving clients](serving.md): the Flight SQL and quack doors, sessions and the operator's
   surface, capacity, drain, and troubleshooting.

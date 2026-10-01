@@ -22,9 +22,12 @@ namespace {
 
 //! HS256 token for the fixture's issuer: roles ["analyst"], tid=acme, exp in 2100.
 const char *const TOKEN =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4"
-    "cCI6NDEwMjQ0NDgwMCwic3ViIjoidWEiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.pj_vV6OmT_k_3y1MWLBTC_SjngWPkzsFS5"
-    "K0iULL6OM";
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InVhIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0."
+    "C4MMwBC2pe1K_Q62MpY2UEruFy4S4lcW1JqpLrSPQEPUREO583DRurIoNxRMwcKNGoM5yMgHnMrb8SEPCNeY3UbEPxooUNEMbpRt"
+    "BilbyfJM3BwXCtAMhP9h7BuFlH8etT-I72KkwdN6wGylQTmX4PR1KwGtLNm7hskEjLDepqpBxO1CqQay_6Ni862pgYhOjKhOifP8"
+    "YkIr2aim8Ub8QP3q0OxRn3mOVHEj9gINIRRWYQpchraguqdlNPm49nFgmFiSR7MFGM4dGYHTlVbKGSc2aBk0tEoJSpUdMASUyaRb"
+    "4GMs8pGN5X9_xtXnPN8HLsYzje-Wtb8WTMGx-KIU8Q";
 
 //! What an OTel exporter is, minus the network: it keeps what it was handed and notes the thread.
 struct RecordingSink : acl::AuditSink {
@@ -140,9 +143,9 @@ int main(int argc, char *argv[]) {
 		Exec(con, "CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR)");
 		Exec(con, "SELECT acl_use_db('store','acl',true)");
 		Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
-		Exec(con, "SELECT acl_define_issuer('https://issuer.test/s',"
-		          "'{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
-		          "'api://acl-test','HS256','roles','{\"tid\": \"tenant\"}')");
+		Exec(con, "SET GLOBAL acl_jwks_locations = 'test/idp/'");
+		Exec(con, "SELECT acl_define_issuer('test/idp/s', '{\"url\": \"test/idp/s\", \"client\": {\"audiences\": "
+		          "[\"api://acl-test\"], \"roles_from\": [\"roles\"], \"attributes\": {\"tid\": \"tenant\"}}}')");
 		Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG c");
 		Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders");
 		Exec(con, "ACL ADMIN CREATE ROLE analyst");

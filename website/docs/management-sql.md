@@ -21,8 +21,8 @@ A statement is administered from behind one of the `ACL` prefixes:
 `ACL ADMIN` is the native context: a statement after it that is not a management form (`CREATE
 TABLE`, `INSERT`, `SELECT`, duckdb's own `ALTER TABLE` or `COMMENT ON TABLE`) is plain SQL. The
 management forms are recognized by their first words - `ADD`, `GRANT`, `REVOKE`, `MAP`, `CREATE
-[OR REPLACE] VIRTUAL|ROLE|ISSUER`, `ALTER VIRTUAL|ROLE|ISSUER|GRANT`, `DROP VIRTUAL|RELATION|
-REFERENCE|ROLE|ISSUER|MAP`, `COMMENT ON VIRTUAL`, `ANALYZE VIRTUAL`, `CHECK VIRTUAL`, `REPAIR VIRTUAL` -
+[OR REPLACE] VIRTUAL|ROLE|ISSUER|CLIENT`, `ALTER VIRTUAL|ROLE|ISSUER|CLIENT|GRANT`, `DROP VIRTUAL|RELATION|
+REFERENCE|ROLE|ISSUER|CLIENT|MAP`, `COMMENT ON VIRTUAL`, `ANALYZE VIRTUAL`, `CHECK VIRTUAL`, `REPAIR VIRTUAL` -
 and a typo after one of those
 is an error, never a fallthrough into native SQL.
 
@@ -41,7 +41,8 @@ catalog forms refuse.
   path inside it: `sales.raw.orders` is object `raw.orders` of catalog `sales`. Written bare and
   dotted; identifier characters are `A-Z a-z 0-9 _`.
 - `<phys>` - a physical path such as `phys.main.orders`, written dotted or as a quoted string.
-- `<role>`, `<catalog>` - bare words. `'<issuer>'` - always a quoted string.
+- `<role>`, `<catalog>` - bare words. An issuer or a client - a bare word, or a quoted string (an
+  issuer named by its URL).
 - Quoted values take `'…'` or `"…"`; a doubled quote is a literal one.
 - A body (after `AS` or `MACRO`) is either a quoted string or written inline to the end of the
   statement; inline text is read quote- and parenthesis-aware, so a `;` inside a literal or a
@@ -310,80 +311,97 @@ ACL ADMIN DROP ROLE IF EXISTS nobody;
 Functions: `acl_define_role(role, claims_csv[, mode])`, `acl_alter_role(role, claims_csv)`,
 `acl_drop_role(role[, mode])`.
 
-## Issuers
+## Issuers and clients
 
 ```
-CREATE ISSUER '<issuer>' KEYS '<jwks or PEM>' | KEYS FROM '<uri>'
-    [AUDIENCES ('<aud>', …) | AUDIENCES '<csv>'] [ALGS (RS256 | ES256 | HS256, …) | ALGS '<csv>']
-    [ROLE CLAIM '<path>'] [CLAIM MAP (<jwt path> => <claim>, …) | CLAIM MAP '<json>']
-    [CLIENT ID '<id>' [CLIENT SECRET '<secret>']]
-ALTER ISSUER '<issuer>' SET KEYS '<jwks or PEM>' | SET KEYS FROM '<uri>' | SET AUDIENCES '<csv>' | SET ALGS '<csv>'
-    | SET ROLE CLAIM '<path>' | SET CLAIM MAP '<json>' | SET CLIENT ID '<id>' | SET CLIENT SECRET '<secret>'
-DROP ISSUER [IF EXISTS] '<issuer>'
+CREATE [OR REPLACE] ISSUER [IF NOT EXISTS] <name | '<url>'> [URL '<url>'] [FROM SECRET <s> [IN <service>]]
+    [<client clause> …] [CLIENT FROM SECRET <s> [IN <service>]]
+ALTER ISSUER <name> SET [URL '<url>'] [FROM SECRET <s> [IN <service>]] [<client clause> …]
+ALTER ISSUER <name> DROP FROM SECRET | DROP CLIENT FROM SECRET
+DROP ISSUER [IF EXISTS] <name>
+
+CREATE [OR REPLACE] CLIENT [IF NOT EXISTS] <name> ISSUER <issuer> <client clause> … [FROM SECRET <s> [IN <service>]]
+ALTER CLIENT <name> SET <client clause> … | DROP FROM SECRET
+DROP CLIENT [IF EXISTS] <name>
+
+<client clause> := AUDIENCES ('<aud>', …) | AZP ('<azp>', …)
+    | REQUIRE (<path> = '<v>' | <path> IN ('<v>', …) | '<v>' IN <path> | <path> LIKE '<p>', …)
+    | ROLES FROM ('<path>', …) | ROLES CONSTANT ('<role>', …) | ROLE CLAIM '<path>'
+    | UNMAPPED IGNORE | UNMAPPED AS ROLE
+    | ATTRIBUTES (<name> = '<path>' | <name> = ('<path>', …) | <name> = CONSTANT '<v>', …)
+    | CLAIM MAP (<jwt path> => <name>, …) | CLAIM MAP '<json>'
+    | SUBJECT '<path>' | SUBJECT ('<path>', …) | TOKEN TYPE '<typ>'
+    | CLIENT ID '<id>' | FLOWS (password | authcode | device | client_credentials, …)
 ```
 
-An issuer is what makes an `ACL TOKEN '<jwt>'` verify offline. The clauses come in the order shown.
+An issuer is the trust anchor of one IdP (spec 095); a client is which of its tokens count and what
+they become. The model, the routing and the role rules are in
+[authentication.md](authentication.md#issuers-and-clients-spec-095).
 
-- `KEYS` pastes a JWKS (RSA `n`/`e`, EC P-256 `x`/`y`, `oct` `k`) or a PEM public key; `KEYS FROM`
-  names a document to read them from through duckdb's own filesystem - an `https` URL (needs
-  `httpfs`) or a file refreshed out of band. Exactly one of the two; setting either with `ALTER`
-  clears the other. A fetched document is reused for `acl_jwks_refresh_interval` seconds (300),
-  re-read on an unknown `kid`, and kept up to `acl_jwks_max_stale` seconds (3600) after a failed read.
-- `AUDIENCES` is the allowlist the token's `aud` must intersect; omitted, no audience check is made.
-  `ALTER … SET AUDIENCES` refuses an empty list - write `'*'` to accept any audience deliberately.
-- `ALGS` defaults to `RS256`; anything outside the allowlist, including `none`, is refused.
-- `ROLE CLAIM` is the dot path to the roles claim (`roles`, `realm_access.roles`, `groups`); default
-  `roles`. Its values are the external names `MAP …` translates.
-- `CLAIM MAP` says which token claims become `acl_claim()` values: `(tid => tenant)` makes the
-  token's `tid` answer `acl_claim('tenant')`.
-- `CLIENT ID` is the app registration the node runs the OAuth password grant as and what auth
-  discovery advertises; `CLIENT SECRET` only for a confidential client and never without an id.
-  Clearing the id clears the secret. `acl_issuers()` lists the id and never the secret.
-- `CREATE ISSUER` has no write mode: an issuer of the same name is redefined (`CREATE OR REPLACE
-  ISSUER` is accepted and means the same; `IF NOT EXISTS` is not). `exp`/`nbf` are judged with the
-  global setting `acl_jwt_clock_skew` (60 s).
+- **The short form.** A quoted URL in place of a name, with client clauses, is one issuer and its
+  implicit client of the same name - `UNMAPPED AS ROLE`, flows `authcode, device` for a public client
+  id (`password` when its `CLIENT FROM SECRET` carries a `CLIENT_SECRET`), set when it is created.
+  The door's password flow is otherwise written explicitly, and only one client of a node may run it.
+  `ALTER ISSUER` changes the implicit client too; `ALTER CLIENT` / `DROP CLIENT` refuse it.
+- **No key and no credential here.** `KEYS`, `ALGS` and `CLIENT SECRET` are refused and name where
+  they go: an `oidc_issuer` (`URL`, `KEYS`, `KEYS_FROM`, `ALGS`) or `oidc_client` (`AUDIENCES`,
+  `CLIENT_ID`, `CLIENT_SECRET`) secret of the node's secrets service, named by `FROM SECRET`. Without
+  them the keys come from the issuer's OIDC discovery.
+- **Write checks**: one URL per issuer; every client has audiences (on it or in its secret); a
+  parameter is on the object or in its secret, never both; two clients of one issuer that would
+  accept the same tokens are refused (judged at use when `REQUIRE` is involved); `FLOWS` needs a
+  client id; a role with an administration scope is never a `ROLES CONSTANT` nor mapped for every
+  client of an issuer. A named secret must exist in the service, with the right type.
+- `CREATE` refuses an existing issuer or client, `OR REPLACE` overwrites it, `IF NOT EXISTS` keeps it
+  (spec 013). `DROP ISSUER` and `CREATE OR REPLACE ISSUER` take its implicit client and every mapping
+  scoped to either (`DROP` is refused while an explicit client names the issuer); `DROP CLIENT` takes
+  its mappings, and so does a `CREATE OR REPLACE CLIENT` that moves it to another issuer.
+- A write judges what it changes: a client or mapping it did not touch is not refused again (a role
+  made an administrator after it was mapped issuer-wide stops counting at use, it does not block the
+  next write).
 
 ```sql
-ACL ADMIN CREATE ISSUER 'https://issuer.test/claims' KEYS '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}'
-    AUDIENCES ('api://acl-test', 'api://other') ALGS (RS256, ES256) ROLE CLAIM 'roles' CLAIM MAP (tid => tenant, oid => user_id);
-ACL ADMIN CREATE ISSUER 'https://issuer.test/hs' KEYS FROM '/etc/acl/jwks.json'
-    AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
-ACL ADMIN ALTER ISSUER 'https://issuer.test/hs' SET CLIENT ID 'door-app';
-ACL ADMIN DROP ISSUER 'https://issuer.test/hs';
+ACL ADMIN CREATE ISSUER 'https://kc/realms/x' AUDIENCES ('account') ROLE CLAIM 'realm_access.roles'
+    CLAIM MAP (tid => tenant) CLIENT ID 'acl-cli';
+ACL ADMIN CREATE ISSUER kc URL 'https://kc/realms/y';
+ACL ADMIN CREATE CLIENT desktop ISSUER kc AUDIENCES ('account') AZP ('acl-desktop')
+    ROLES FROM ('realm_access.roles') ATTRIBUTES (tenant = 'tenant') CLIENT ID 'acl-desktop' FLOWS (authcode, device);
+ACL ADMIN CREATE CLIENT door ISSUER kc AUDIENCES ('account') AZP ('acl-door') ROLES FROM ('roles')
+    FLOWS (password) FROM SECRET kc_door IN corp;
+ACL ADMIN ALTER CLIENT desktop SET UNMAPPED AS ROLE;
+ACL ADMIN DROP CLIENT door;
 ```
 
-Functions: `acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_claim, claim_map_json[, jwks_uri[, client_id[, client_secret]]])`
-(`keys_json` empty when `jwks_uri` is given), `acl_alter_issuer(issuer, field, value)` with `field`
-one of `keys`, `jwks_uri`, `audiences`, `algs`, `role_claim`, `claim_map`, `client_id`,
-`client_secret`, `acl_drop_issuer(issuer[, mode])`.
+Functions: `acl_define_issuer(name, spec_json[, mode])`, `acl_alter_issuer(name, spec_json)`,
+`acl_drop_issuer(name[, mode])`, `acl_define_client(name, issuer, spec_json[, mode])`,
+`acl_alter_client(name, spec_json)`, `acl_drop_client(name[, mode])` - the specs are the JSON the
+SQL forms compile to (authentication.md). Listings: `acl_issuers()`, `acl_clients()`.
 
-A `KEYS FROM` location must start with one of the prefixes in `acl_jwks_locations` (GLOBAL, default
-`https://`; a local directory is listed by name, `..` is refused anywhere): a location outside the
-list is refused where it is written - `acl admin: KEYS FROM "<uri>" is outside acl_jwks_locations (…)
-- list its prefix there first, or paste the keys` - and again where the node would read it (spec 071,
-docs/authentication.md).
+Every location the node reads keys from - the discovery document, its JWKS, a secret's `KEYS_FROM` -
+must start with a prefix in `acl_jwks_locations` (GLOBAL, default `https://`; `..` is refused
+anywhere), judged where it is read (specs 071, 095).
 
 ## Role mappings
 
 ```
-MAP GROUP '<group id>' FROM ISSUER '<issuer>' TO ROLE <role>
-MAP CLAIM '<value>' FROM ISSUER '<issuer>' TO ROLE <role>
-DROP MAP GROUP | CLAIM '<value>' FROM ISSUER '<issuer>' TO ROLE <role>
+MAP GROUP | CLAIM '<value>' FROM CLIENT <client> | ISSUER <issuer> TO ROLE <role>
+DROP MAP GROUP | CLAIM '<value>' FROM CLIENT <client> | ISSUER <issuer> TO ROLE <role>
 ```
 
-A mapping turns a value found at the issuer's role claim into an internal role: `GROUP` for a group
-identifier (an EntraID GUID), `CLAIM` for a plain claim value. One value may map to several roles; a
-token's roles are the union. An unmapped value counts only if it is itself a known role; a token that
-ends with no roles is refused.
+A mapping turns a value found at a client's `ROLES FROM` paths into a role: `GROUP` for a group
+identifier (an EntraID GUID), `CLAIM` for a plain claim value - scoped to one client, or to every
+client of one issuer. One value may map to several roles; a token's roles are the union. A role that
+holds an administration scope is mapped `FROM CLIENT` only.
 
 ```sql
-ACL ADMIN MAP GROUP 'g-0001' FROM ISSUER 'https://issuer.test/x' TO ROLE analyst;
-ACL ADMIN MAP CLAIM 'ops' FROM ISSUER 'https://issuer.test/d' TO ROLE analyst2;
-ACL ADMIN DROP MAP GROUP 'g-1' FROM ISSUER 'https://issuer.test/d' TO ROLE analyst;
+ACL ADMIN MAP GROUP 'g-0001' FROM CLIENT desktop TO ROLE analyst;
+ACL ADMIN MAP CLAIM 'ops' FROM ISSUER kc TO ROLE operator;
+ACL ADMIN DROP MAP GROUP 'g-0001' FROM CLIENT desktop TO ROLE analyst;
 ```
 
-Functions: `acl_map_role(issuer, source, external_value, role)` and
-`acl_drop_role_mapping(issuer, source, external_value, role)`, `source` = `group` | `claim-value`.
+Functions: `acl_map_role(scope_kind, scope, source, external_value, role)` and
+`acl_drop_role_mapping(scope_kind, scope, source, external_value, role)`; `scope_kind` = `client` |
+`issuer`, `source` = `group` | `claim-value`. Listing: `acl_role_mappings()`.
 
 ## Catalog grants
 
@@ -883,7 +901,7 @@ forms carry the `VIRTUAL` marker so duckdb's own `ALTER TABLE` stays native.
 | `ALTER VIRTUAL TABLE FUNCTION <c>.<n> SET PRIMARY KEY (…)` / `DROP PRIMARY KEY`                  | `acl_set_key(vcat, vname, 'table', pk_csv)`                 |
 | `ALTER VIRTUAL SCALAR <c>.<n> SET MACRO <expression>` / `SET ALIAS [OF] <fn>`                    | `acl_alter_function(vcat, vname, 'scalar', 'macro' or 'alias', definition)` |
 | `ALTER ROLE <r> SET CLAIMS (…)`                                                                  | `acl_alter_role(role, claims_csv)`                          |
-| `ALTER ISSUER '<iss>' SET <field> '…'`                                                           | `acl_alter_issuer(issuer, field, value)`                    |
+| `ALTER ISSUER <i> SET …` / `ALTER CLIENT <c> SET …`                                               | `acl_alter_issuer(name, spec)` / `acl_alter_client(name, spec)` |
 | `ALTER GRANT CATALOG <c> TO ROLE <r> SET CAPS '…'` / `SET RLS '…'` / `SET COLUMNS '…'` / `SET MAIN true` / `SET MAIN false` | `acl_alter_grant(role, vcat, field, value)` |
 
 `ALTER VIRTUAL VIEW` on a table (or the reverse) is refused. The `SET PHYS`, `SET COLUMNS` and `SET
@@ -913,8 +931,9 @@ Without `IF EXISTS` a missing target is an error.
 | `DROP VIRTUAL SCALAR [IF EXISTS] <c>.<n>`                        | `acl_drop_function(vcat, vname, 'scalar', mode)`         |
 | `DROP [VIRTUAL] REFERENCE [IF EXISTS] <c>.<name>`                | `acl_drop_reference(vcat, name, mode)`                   |
 | `DROP ROLE [IF EXISTS] <r>`                                      | `acl_drop_role(role, mode)`                              |
-| `DROP ISSUER [IF EXISTS] '<iss>'`                                | `acl_drop_issuer(issuer, mode)` (takes its mappings)     |
-| `DROP MAP GROUP '<v>' FROM ISSUER '<iss>' TO ROLE <r>` (or `MAP CLAIM`) | `acl_drop_role_mapping(issuer, source, external, role)` |
+| `DROP ISSUER [IF EXISTS] <i>`                                    | `acl_drop_issuer(name, mode)` (its implicit client and mappings) |
+| `DROP CLIENT [IF EXISTS] <c>`                                    | `acl_drop_client(name, mode)` (its mappings)             |
+| `DROP MAP GROUP '<v>' FROM CLIENT|ISSUER <n> TO ROLE <r>` (or `MAP CLAIM`) | `acl_drop_role_mapping(kind, scope, source, external, role)` |
 
 `mode` is `skip` for `IF EXISTS`, otherwise empty. Dropping an object takes its stored schema,
 comments, declared key and every reference that names it with it; a schema dropped with `CASCADE`
@@ -1015,11 +1034,11 @@ section.
 | `acl_define_role(role, claims_csv[, mode])`                                                                                | role with default claims                                 |
 | `acl_alter_role(role, claims_csv)`                                                                                         | replace its claims                                       |
 | `acl_drop_role(role[, mode])`                                                                                              | drop it and everything attached to it                    |
-| `acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_claim, claim_map_json[, jwks_uri[, client_id[, client_secret]]])` | JWT issuer (exactly one of keys / location) |
-| `acl_alter_issuer(issuer, field, value)`                                                                                   | change one issuer field                                  |
-| `acl_drop_issuer(issuer[, mode])`                                                                                          | drop it and its mappings                                 |
-| `acl_map_role(issuer, source, external_value, role)`                                                                       | map `group` / `claim-value` to a role                    |
-| `acl_drop_role_mapping(issuer, source, external_value, role)`                                                              | drop a mapping                                           |
+| `acl_define_issuer(name, spec_json[, mode])`                                                                              | an issuer, and its implicit client when the spec has one (spec 095) |
+| `acl_alter_issuer(name, spec_json)` / `acl_drop_issuer(name[, mode])`                                                     | change / drop it (with its implicit client and mappings) |
+| `acl_define_client(name, issuer, spec_json[, mode])` / `acl_alter_client` / `acl_drop_client`                              | a client of an issuer                                    |
+| `acl_map_role(scope_kind, scope, source, external_value, role)`                                                           | map `group` / `claim-value` to a role, per client or issuer |
+| `acl_drop_role_mapping(scope_kind, scope, source, external_value, role)`                                                  | drop a mapping                                           |
 | `acl_define_token(token, role, claims_csv)`                                                                                | **legacy, dev**: bind a non-JWT token to a role in memory |
 
 **Legacy wrappers** - the pre-catalog API, kept for dev and test scripts. Without a policy source

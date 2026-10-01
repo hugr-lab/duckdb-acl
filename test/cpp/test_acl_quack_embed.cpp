@@ -27,9 +27,12 @@ using namespace acl_test;
 namespace {
 
 const char *const TOKEN =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2w"
-    "tdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj"
-    "5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc";
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C"
+    "2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDu"
+    "SvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH"
+    "8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Ty"
+    "sjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A";
 
 //! The same fake IdP the provider test uses, trimmed to the password grant.
 struct FakeIdp {
@@ -104,17 +107,17 @@ void SetupFixture(Connection &con, const std::string &httpfs_ext, const std::str
 	Exec(con, "INSERT INTO orders VALUES (1,'acme'),(2,'acme'),(3,'globex')");
 	Exec(con, "SELECT acl_use_db('store','acl',true)");
 	Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
-	Exec(con, "SELECT acl_define_issuer('https://issuer.test/s',"
-	          "'{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
-	          "'api://acl-test','HS256','roles','{\"tid\": \"tenant\"}')");
+	Exec(con, "SET GLOBAL acl_jwks_locations = 'test/idp/'");
+	Exec(con, "SELECT acl_define_issuer('test/idp/s', '{\"url\": \"test/idp/s\", \"client\": {\"audiences\": "
+	          "[\"api://acl-test\"], \"roles_from\": [\"roles\"], \"attributes\": {\"tid\": \"tenant\"}}}')");
 	if (!extra_issuer.empty()) {
 		// registered ONLY so door discovery would list two issuers; removed again below. Carries a
 		// client_id, so discovery must advertise it in the spec-064 shape. The stub IdP is http on
 		// loopback: the node fetches its discovery only from a location the operator listed (spec 071)
-		Exec(con, "SET GLOBAL acl_jwks_locations = 'https://, " + extra_issuer + "/'");
-		Exec(con, "SELECT acl_define_issuer('" + extra_issuer +
-		              "','{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
-		              "'api://acl-test','HS256','roles','{}','','door-app')");
+		Exec(con, "SET GLOBAL acl_jwks_locations = 'https://, test/idp/, " + extra_issuer + "/'");
+		Exec(con, "SELECT acl_define_issuer('" + extra_issuer + "', '{\"url\": \"" + extra_issuer +
+		              "\", \"client\": {\"audiences\": [\"api://acl-test\"], \"roles_from\": [\"roles\"], "
+		              "\"client_id\": \"door-app\"}}')");
 	}
 	Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG c");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders");
@@ -151,7 +154,7 @@ int main(int argc, char *argv[]) {
 		Scenario("the door advertises its issuers, unauthenticated", [&] {
 			auto answer = duckdb::acl::oidc::HttpGet("http://localhost:31975/.well-known/quack-auth");
 			Check(answer.Ok(), "the well-known answers: " + answer.error);
-			Check(answer.body.find("https://issuer.test/s") != std::string::npos &&
+			Check(answer.body.find("test/idp/s") != std::string::npos &&
 			          answer.body.find(idp.Issuer()) != std::string::npos,
 			      "...naming both configured issuers: " + answer.body);
 			// spec 064: the document is the doors' shared shape - the reachable IdP's entry carries
@@ -262,7 +265,7 @@ int main(int argc, char *argv[]) {
 
 		Scenario("with one issuer left, discovery fills ISSUER by itself", [&] {
 			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
-			Exec(con, "ACL ADMIN DROP ISSUER 'https://issuer.test/s'");
+			Exec(con, "ACL ADMIN DROP ISSUER 'test/idp/s'");
 			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
 			auto minted = con.Query("CREATE SECRET disc (TYPE quack, PROVIDER oidc, SCOPE "
 			                        "'quack:localhost:31975', CLIENT_ID 'cli', FLOW 'password', "
@@ -347,9 +350,9 @@ int main(int argc, char *argv[]) {
 		Scenario("mode := 'plain' is a bare server: no discovery route, still acl-gated", [&] {
 			// an earlier scenario dropped the token's issuer; re-add it so the client can authenticate
 			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
-			Exec(con, "SELECT acl_define_issuer('https://issuer.test/s',"
-			          "'{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
-			          "'api://acl-test','HS256','roles','{\"tid\": \"tenant\"}')");
+			Exec(con, "SET GLOBAL acl_jwks_locations = 'test/idp/'");
+			Exec(con, "SELECT acl_define_issuer('test/idp/s', '{\"url\": \"test/idp/s\", \"client\": {\"audiences\": "
+			          "[\"api://acl-test\"], \"roles_from\": [\"roles\"], \"attributes\": {\"tid\": \"tenant\"}}}')");
 			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
 			Exec(con, "SELECT acl_quack_serve('quack:localhost:31978', 'server-token', 'plain')");
 			auto disc = duckdb::acl::oidc::HttpGet("http://localhost:31978/.well-known/quack-auth");

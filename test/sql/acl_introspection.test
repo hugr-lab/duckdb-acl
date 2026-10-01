@@ -6,6 +6,10 @@
 require acl
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS phys;
 
 statement ok
@@ -114,17 +118,23 @@ SELECT vcat, vname, name FROM acl_relation_columns();
 ----
 sales	orders	id
 
-# --- an issuer's keys are secret material, so a listing does not carry them ------------------------
+# --- issuers and clients: what is stored, and never a key (spec 095: keys are discovery's or a ------
+# secret's, so there is nothing to hide)
 
 statement ok
-ACL ADMIN CREATE ISSUER 'https://issuer.test/x' KEYS '{"keys":[{"kty":"oct","k":"c3VwZXItc2VjcmV0"}]}' AUDIENCES ('api://x') ALGS (HS256) ROLE CLAIM 'roles';
+ACL ADMIN CREATE ISSUER 'test/idp/x' AUDIENCES ('api://x') ROLE CLAIM 'roles';
 
 query IIII
-SELECT issuer, audiences, algs, role_claim FROM acl_issuers();
+SELECT name, url, secret_service, secret FROM acl_issuers();
 ----
-https://issuer.test/x	api://x	HS256	roles
+test/idp/x	test/idp/x	NULL	NULL
 
-# there is no column holding the key, under any name
+query IIIII
+SELECT name, issuer, audiences, roles_from, implicit FROM acl_clients();
+----
+test/idp/x	test/idp/x	["api://x"]	["roles"]	true
+
+# there is no column holding a key, under any name
 statement error
 SELECT keys_json FROM acl_issuers();
 ----

@@ -293,8 +293,12 @@ The token model - who verifies, who acquires, the admin's flow menu, session tok
 [authentication.md](authentication.md). What matters for enforcement:
 
 - `ACL ROLE` "trusts the gateway (role + optional default claims)"; `ACL TOKEN` "verifies offline →
-  role + claims" (spec 001) - RS256/ES256/HS256, issuer, audience, `exp`/`nbf`, keys pasted or read
-  from a document (specs 007/023). "An unverified token never reaches the scope question" (spec 009).
+  role + claims" (spec 001) - RS256/ES256 (HS256 only from a key pasted into a secret), issuer,
+  `exp`/`nbf`, keys found by the issuer's OIDC discovery or named by a secret of the secrets service
+  (specs 007/023/095); then exactly one client of the issuer accepts it (audiences required, `azp`,
+  conditions - ties refused, never unioned) and makes roles and attributes of it. A role that
+  administers is reached only through the client's own explicit mapping; a `CONSTANT` attribute is
+  a ceiling the token cannot pass. "An unverified token never reaches the scope question" (spec 009).
 - A session "carries exactly the prefix's principal, both ways" (spec 040 addendum, 2026-09-03):
   `SessionOpen` now merges role-default claims exactly as `ACL TOKEN` does, so the same token answers
   the same slice through a door and through a gateway. `acl_jwt_clock_skew` is GLOBAL, like every
@@ -302,9 +306,13 @@ The token model - who verifies, who acquires, the admin's flow menu, session tok
 - `acl_session_token_binding='connect'` (default) judges `exp` at establishment only; `'every_use'`
   re-judges it on every statement (spec 059). "An expired token can never *open* a session under
   either setting" (authentication.md).
-- The Flight password handshake runs the IdP's password grant as the issuer's `client_id`; "the
-  IdP's refusal is the gate"; it is refused on a cleartext door and while draining; `acl_issuers()`
-  never lists the client secret (specs 064/066).
+- The Flight password handshake runs the IdP's password grant as the node's one client with the
+  password flow - several are refused, so a password never reaches another customer's IdP, and the
+  token endpoint must be on `acl_jwks_locations`; "the IdP's refusal is the gate"; it is refused on a
+  cleartext door and while draining. No key and
+  no client secret is ever in the policy catalog or a listing: they live in the secrets service and
+  are read at use (specs 064/066/095); a change of an issuer's or a client's connection made there is
+  a `connection_changed` policy event.
 
 ## 5. Doors and sessions
 
@@ -585,9 +593,11 @@ Before a node serves anyone:
 - [ ] Session bounds fit the deployment: `acl_max_sessions`, `acl_session_idle_timeout` (never `0`
       under `connect` binding), `acl_session_token_binding` (`every_use` where revocation latency
       matters), `acl_max_ingest_rows` where a ceiling is wanted.
-- [ ] Issuers: audiences are never `'*'` by accident; `acl_jwks_max_stale` is `0` if a failed JWKS
-      read must be fatal at once; `acl_jwks_locations` names the origins keys may be read from (the
-      default admits https only; a local JWKS directory is listed by name - spec 071).
+- [ ] Issuers and clients (spec 095): every client names the audiences its tokens carry; a client of
+      an IdP you do not run is `UNMAPPED IGNORE` (the explicit default) and maps what it grants;
+      a role that administers is mapped `FROM CLIENT` only; `acl_jwks_max_stale` is `0` if a failed
+      key read must be fatal at once; `acl_jwks_locations` names the origins keys may be read from
+      (the default admits https only; a local directory is listed by name - spec 071).
 - [ ] Stopping a node follows spec 066: `acl_drain()` → watch the count → `acl_session_kill` for
       stragglers → `acl_flight_stop` / `acl_quack_stop` → close duckdb. Stop the Flight door before
       closing the instance.

@@ -1,0 +1,4 @@
+{
+ "issuer": "test/idp/noalgs",
+ "jwks_uri": "test/idp/rs/jwks.json"
+}

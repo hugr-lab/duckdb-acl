@@ -15,6 +15,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$ROOT" # spec 095: the fixture issuers (test/idp/) are read relative to the repository root
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD="${BUILD_DIR:-$ROOT/build/release}"
 DUCKDB="${DUCKDB_BIN:-$BUILD/duckdb}"
@@ -32,10 +33,10 @@ VICTIM_ROWS="${ACL_E2E_VICTIM_ROWS:-$((ROWS * 10))}"
 KILL_AFTER="${ACL_E2E_KILL_AFTER:-1}"
 ONLY="${ACL_E2E_ONLY:-}"   # run just this leg, by name
 
-# HS256 tokens for the seeded issuer (key "acl-test-hs256-secret"), one tenant each. Minted rather than
-# random so a failure is reproducible; specs/043 records how they are made.
-TOKEN_ACME='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1hY21lIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.vzPJbHXAXfczhZwQp183JaaBLlSRSipNsSqwxoIFfng'
-TOKEN_GLOBEX='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1nbG9iZXgiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6Imdsb2JleCJ9.CitaHH8sw-ndoasm0iTvIRKq9XBJt7PDfm22IhSQZ78'
+# RS256 tokens for the seeded issuer (test/idp/s, the committed fixture key), one tenant each. Minted
+# rather than random so a failure is reproducible: test/scripts/idp_fixtures.py mint.
+TOKEN_ACME='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtYWNtZSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.UV5-WWUpQLp-Em8K2yLLkz-NEJgOyTAn9i9B1zpBWF3hNQVgorAVPVK48bxnrMiMm7NabgM3g945lDY31DFwxNeUKnVEe0QdRy1d1KbFh8td3Ak_mepOZ35CjPektGaOjVEpjUFxZUOj_uxYnse_y660xC0stlY8zxDrpSjNCOZRGv-vaxITv7ggOIDYAN07rmPntKe9oOYsb5g0ZkFcIEsKuHuXsL8z1crko6vIZzT9ido-xrph_WEejO5lKaPIxVe1QrB1-C5DUp8D8fnLWMJ3g426VNKWJwUyeSgh_nq1XzLyR8WcLchBQwaFAzkGivmLFmDdrDS7VUy49I8uLw'
+TOKEN_GLOBEX='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtZ2xvYmV4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJnbG9iZXgifQ.US9D_P5MEhrwKYF-K5NwGoeMGXBaK6mky8oKM57xfJvZObM_yIhEp1uJhBN5MmmRuF6EV330IwT3W8RtgarfaK0iTlpHqmjEowIbhyQnFD84xOmjbTeBpSHaIBDWS8F2ayNKaUcXZFqfIPZrImvmASDQSQggTwkCnEyGpxPP7F__7MAC2PkDAV73RVVOuAW1QwqbYCPoeydXS-sgMBU2v031ngk8On-UTeZ3ZaCwMhznOUMwQUpFkCtSmwdt2_OgvYn_PC_Mu6f7UGFbTf2kXXHy6ps6QwT6pCpKoILA3uc-sjTRz1ZwyPy2NuKwceBIwiXbKTxPz5PH9KoLYUD6sg'
 
 T0=$(date +%s)
 note() { [ -z "${ACL_E2E_VERBOSE:-}" ] || echo "[$(( $(date +%s) - T0 ))s] $*" >&2; }

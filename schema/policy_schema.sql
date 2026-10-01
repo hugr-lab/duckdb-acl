@@ -59,12 +59,19 @@ CREATE TABLE IF NOT EXISTS <function_category_members>("category" ACL_KEY_TEXT, 
 -- (category ''); allowed = false is a deny, and a deny anywhere among a principal's roles wins
 CREATE TABLE IF NOT EXISTS <function_grants>("role" ACL_KEY_TEXT, "category" ACL_KEY_TEXT, "database" ACL_KEY_TEXT, "schema" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "allowed" BOOLEAN, PRIMARY KEY ("role", "category", "database", "schema", "name", "kind"));
 
-CREATE TABLE IF NOT EXISTS <issuers>("issuer" ACL_KEY_TEXT PRIMARY KEY, "keys_json" VARCHAR, "audiences" VARCHAR, "algs" VARCHAR, "role_claim" VARCHAR, "claim_map" VARCHAR, "jwks_uri" VARCHAR, "client_id" VARCHAR, "client_secret" VARCHAR);
+-- spec 095: an issuer is the trust anchor (its URL, or an oidc_issuer secret of the secrets service
+-- carrying it); its keys come from OIDC discovery or that secret - never from here. A client is what of
+-- its tokens counts and what they become; the list-valued columns are JSON arrays. No credential and
+-- no key material is ever stored in this schema.
+CREATE TABLE IF NOT EXISTS <issuers>("name" ACL_KEY_TEXT PRIMARY KEY, "url" VARCHAR, "secret_service" VARCHAR, "secret" VARCHAR);
+
+CREATE TABLE IF NOT EXISTS <clients>("name" ACL_KEY_TEXT PRIMARY KEY, "issuer" VARCHAR, "audiences" VARCHAR, "azp" VARCHAR, "requires" VARCHAR, "roles_from" VARCHAR, "roles_constant" VARCHAR, "unmapped" VARCHAR, "attributes" VARCHAR, "subject" VARCHAR, "token_type" VARCHAR, "client_id" VARCHAR, "flows" VARCHAR, "secret_service" VARCHAR, "secret" VARCHAR, "implicit" BOOLEAN);
 
 -- '' as vcat means "every catalog": NULL cannot be part of the primary key
 CREATE TABLE IF NOT EXISTS <admins>("role" ACL_KEY_TEXT PRIMARY KEY, "scope" VARCHAR, "vcat" VARCHAR);
 
-CREATE TABLE IF NOT EXISTS <role_mappings>("issuer" ACL_KEY_TEXT, "source" ACL_KEY_TEXT, "external_value" ACL_KEY_TEXT, "role" ACL_KEY_TEXT, PRIMARY KEY ("issuer", "source", "external_value", "role"));
+-- spec 095: a mapping is scoped to one client or to every client of one issuer
+CREATE TABLE IF NOT EXISTS <role_mappings>("scope_kind" ACL_KEY_TEXT, "scope_name" ACL_KEY_TEXT, "source" ACL_KEY_TEXT, "external_value" ACL_KEY_TEXT, "role" ACL_KEY_TEXT, PRIMARY KEY ("scope_kind", "scope_name", "source", "external_value", "role"));
 
 -- spec 010 (schema v2): comments, and the column schema of every object - declared by an
 -- admin or derived by binding the template at write time (a query-defined object has no
@@ -119,11 +126,11 @@ CREATE TABLE IF NOT EXISTS <cluster_deps>("scope" ACL_KEY_TEXT, "name" ACL_KEY_T
 -- @seed function_categories
 
 -- @section schema
-INSERT INTO <meta> SELECT 'schema_version', '16' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '17' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');
 INSERT INTO <meta> SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'config_version');
 -- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
 -- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
-INSERT INTO <meta> SELECT 'min_reader_version', '15' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');
+INSERT INTO <meta> SELECT 'min_reader_version', '17' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');
