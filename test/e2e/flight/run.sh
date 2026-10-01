@@ -11,6 +11,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$ROOT" # spec 095: the fixture issuers (test/idp/) are read relative to the repository root
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD="${BUILD_DIR:-$ROOT/build/release}"
 DUCKDB="${DUCKDB_BIN:-$BUILD/duckdb}"
@@ -18,8 +19,8 @@ ACL_EXT="${ACL_EXT:-$BUILD/extension/acl/acl.duckdb_extension}"
 PORT="${ACL_FLIGHT_PORT:-32700}"
 URI="grpc://localhost:$PORT"
 
-# An HS256 token for the seeded issuer: role analyst, tenant acme, exp in 2100.
-TOKEN='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1hY21lIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.vzPJbHXAXfczhZwQp183JaaBLlSRSipNsSqwxoIFfng'
+# An RS256 token for the seeded issuer (test/idp/s, the committed fixture key): role analyst, tenant acme, exp in 2100.
+TOKEN='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtYWNtZSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.UV5-WWUpQLp-Em8K2yLLkz-NEJgOyTAn9i9B1zpBWF3hNQVgorAVPVK48bxnrMiMm7NabgM3g945lDY31DFwxNeUKnVEe0QdRy1d1KbFh8td3Ak_mepOZ35CjPektGaOjVEpjUFxZUOj_uxYnse_y660xC0stlY8zxDrpSjNCOZRGv-vaxITv7ggOIDYAN07rmPntKe9oOYsb5g0ZkFcIEsKuHuXsL8z1crko6vIZzT9ido-xrph_WEejO5lKaPIxVe1QrB1-C5DUp8D8fnLWMJ3g426VNKWJwUyeSgh_nq1XzLyR8WcLchBQwaFAzkGivmLFmDdrDS7VUy49I8uLw'
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -242,15 +243,15 @@ done
 # cause - spec 040), and the REASON goes where the operator reads it: a `session` event `refused`
 # with reason_code `source_error` (the keys' source failed, not the principal) and the policy's text -
 # a refusal is recorded at every audit level but `off`.
-FILE_TOKEN='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2ZpbGUiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXX0.xxxx'
+FILE_TOKEN='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ub2ZpbGUiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXX0.ZkEmtRT1TgFENMZbLY-eOR8PLbnzeOmzSDBwQg11JwYp2Ulqllk_eNxQa6TPRGBC68Tr4V83dFlRy6UpnZKeS-f11c1Mj_MorrJbBUsVcTYj1J7aMN755RHC1wY-fnpv3l8C4VlqmOI3TPlrEbk3cOOxRSK_k03tjJ-m_qno6apOqaKA8Hy8ozRO3nt1ZJhM5An8_GUS01e98PmRxK__3BivNzq_swkFSGbt9Rd3C-oZ8fKKO_uDY5c48Dk3xSkZUCox85Mnz4Ikz9iZEmiz53tbLsRtBQp-niKemQpTgCDVTOTMY-Mha0bQJVv-igdc34fkJSC65sjS4Wrnc-ky_Q'
 for probe in "SELECT 1" "@tables" "@imported:orders"; do
 	got="$(ask "$probe" "$FILE_TOKEN")"
 	case "$got" in *"Unexpected error in RPC handling"*) fail "$probe: the exception reached gRPC unnamed: $got";; esac
 	echo "$got" | grep -q "authentication failed" || fail "$probe: the refusal was not the named one: $got"
-	echo "$got" | grep -q "could not be read" && fail "$probe: the refusal told the client why (the operator's, not the client's): $got"
+	echo "$got" | grep -q "could not read" && fail "$probe: the refusal told the client why (the operator's, not the client's): $got"
 done
 echo "SELECT acl_audit_flush();" >&3
-echo "SELECT 'keysrefused=' || count(*) FROM acl_audit_events() WHERE kind = 'session' AND detail = 'refused' AND verdict = 'denied' AND reason_code = 'source_error' AND reason LIKE '%could not be read%';" >&3
+echo "SELECT 'keysrefused=' || count(*) FROM acl_audit_events() WHERE kind = 'session' AND detail = 'refused' AND verdict = 'denied' AND reason_code = 'source_error' AND reason LIKE '%could not read%';" >&3
 counted=""
 for _ in $(seq 1 40); do
 	if grep -q "keysrefused=" "$TMP/server.log"; then counted=1; break; fi
@@ -342,7 +343,7 @@ got="$(ACL_COOKIE_JAR="$TMP/otherjar" ask "SELECT * FROM scratch")"
 echo "$got" | grep -q "no access to object" || fail "another session reached the temp: $got"
 # a different principal on the stolen cookie earns nothing: the fingerprint mismatch closes the
 # old session - temp and all - and opens their own, where the name does not exist
-GLOBEX='eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJpc3MiOiAiaHR0cHM6Ly9pc3N1ZXIudGVzdC9zIiwgImF1ZCI6ICJhcGk6Ly9hY2wtdGVzdCIsICJleHAiOiA0MTAyNDQ0ODAwLCAic3ViIjogInUtZ2xvYmV4IiwgInJvbGVzIjogWyJhbmFseXN0Il0sICJ0aWQiOiAiZ2xvYmV4In0.N92ysQlqQLA2PapK-VdxsokNyXPxPlmO6YQJVQB8H6I'
+GLOBEX='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtZ2xvYmV4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJnbG9iZXgifQ.US9D_P5MEhrwKYF-K5NwGoeMGXBaK6mky8oKM57xfJvZObM_yIhEp1uJhBN5MmmRuF6EV330IwT3W8RtgarfaK0iTlpHqmjEowIbhyQnFD84xOmjbTeBpSHaIBDWS8F2ayNKaUcXZFqfIPZrImvmASDQSQggTwkCnEyGpxPP7F__7MAC2PkDAV73RVVOuAW1QwqbYCPoeydXS-sgMBU2v031ngk8On-UTeZ3ZaCwMhznOUMwQUpFkCtSmwdt2_OgvYn_PC_Mu6f7UGFbTf2kXXHy6ps6QwT6pCpKoILA3uc-sjTRz1ZwyPy2NuKwceBIwiXbKTxPz5PH9KoLYUD6sg'
 got="$(ACL_COOKIE_JAR="$TJ" ask "SELECT * FROM scratch" "$GLOBEX")"
 echo "$got" | grep -q "no access to object" || fail "a stolen cookie carried a temp across principals: $got"
 got="$(ACL_COOKIE_JAR="$TJ" ask "SELECT * FROM scratch")"

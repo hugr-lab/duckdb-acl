@@ -6,6 +6,10 @@
 require acl
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS phys;
 
 statement ok
@@ -192,12 +196,12 @@ ACL ROLE "analyst" SELECT id, amount FROM orders ORDER BY id;
 1	100
 
 statement ok
-ACL ADMIN CREATE ISSUER 'https://issuer.test/x' KEYS '{"keys":[]}' AUDIENCES ('api://hugr', 'api://other') ALGS (RS256, ES256) ROLE CLAIM 'groups' CLAIM MAP (tid => tenant, oid => user_id);
+ACL ADMIN CREATE ISSUER 'test/idp/x' AUDIENCES ('api://hugr', 'api://other') ROLE CLAIM 'groups' CLAIM MAP (tid => tenant, oid => user_id);
 
 query III
-SELECT audiences, array_to_string(list_sort(str_split(algs, ',')), '|'), claim_map FROM aclcat.acl.issuers WHERE issuer = 'https://issuer.test/x';
+SELECT audiences, roles_from, attributes FROM aclcat.acl.clients WHERE name = 'test/idp/x';
 ----
-api://hugr,api://other	ES256|RS256	{"tid": "tenant", "oid": "user_id"}
+["api://hugr","api://other"]	["groups"]	[{"name":"tenant","paths":["tid"]},{"name":"user_id","paths":["oid"]}]
 
 # an unknown capability is stored as written and enforces nothing
 statement ok

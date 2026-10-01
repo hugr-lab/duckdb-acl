@@ -1628,33 +1628,6 @@ void PolicyStore::CatalogDropRole(const string &role) {
 	});
 }
 
-void PolicyStore::CatalogDropIssuer(const string &issuer) {
-	RequireCatalog(catalog, "acl_drop_issuer");
-	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
-		auto exists = read("SELECT 1 FROM " + catalog->Tbl("issuers") + " WHERE \"issuer\" = " + Lit(issuer));
-		if (exists->RowCount() == 0) {
-			throw BinderException("acl admin: issuer \"%s\" does not exist", issuer);
-		}
-		statements.push_back("DELETE FROM " + catalog->Tbl("role_mappings") + " WHERE \"issuer\" = " + Lit(issuer));
-		statements.push_back("DELETE FROM " + catalog->Tbl("issuers") + " WHERE \"issuer\" = " + Lit(issuer));
-	});
-}
-
-void PolicyStore::CatalogDropRoleMapping(const string &issuer, const string &source, const string &external_value,
-                                         const string &role) {
-	RequireCatalog(catalog, "acl_drop_role_mapping");
-	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
-		auto where = " WHERE \"issuer\" = " + Lit(issuer) + " AND \"source\" = " + Lit(source) +
-		             " AND \"external_value\" = " + Lit(external_value) + " AND \"role\" = " + Lit(role);
-		auto exists = read("SELECT 1 FROM " + catalog->Tbl("role_mappings") + where);
-		if (exists->RowCount() == 0) {
-			throw BinderException("acl admin: no mapping of %s \"%s\" from issuer \"%s\" to role \"%s\"", source,
-			                      external_value, issuer, role);
-		}
-		statements.push_back("DELETE FROM " + catalog->Tbl("role_mappings") + where);
-	});
-}
-
 void PolicyStore::CatalogDefineRole(const string &role, const case_insensitive_map_t<string> &claims) {
 	RequireCatalog(catalog, "acl_define_role");
 	vector<string> statements;
@@ -2021,64 +1994,6 @@ void PolicyStore::CatalogAlterGrant(const string &role, const string &vcat, cons
 	CatalogGrant(role, vcat, caps, is_main, rls, columns, field == "columns");
 }
 
-void PolicyStore::CatalogAlterIssuer(const string &issuer, const string &field, const string &value) {
-	RequireCatalog(catalog, "acl_alter_issuer");
-	IssuerConfig config;
-	if (!CatalogLookupIssuer(issuer, config)) {
-		throw BinderException("acl admin: issuer \"%s\" does not exist", issuer);
-	}
-	auto split_csv = [](const string &csv) {
-		vector<string> parts;
-		for (auto &part : StringUtil::Split(csv, ',')) {
-			StringUtil::Trim(part);
-			if (!part.empty()) {
-				parts.push_back(part);
-			}
-		}
-		return parts;
-	};
-	if (field == "keys") {
-		// the two are alternatives, so setting one clears the other: an issuer whose keys were pasted
-		// and then pointed at a document must not keep verifying against the old paste
-		config.keys_json = value;
-		config.jwks_uri.clear();
-	} else if (field == "jwks_uri") {
-		config.jwks_uri = value;
-		config.keys_json.clear();
-	} else if (field == "audiences") {
-		config.audiences = split_csv(value);
-		if (config.audiences.empty()) {
-			// an empty allowlist means "accept any aud" downstream - never let that happen silently
-			throw BinderException("acl admin: AUDIENCES must list at least one audience (use '*' to "
-			                      "accept any)");
-		}
-	} else if (field == "algs") {
-		config.algs.clear();
-		for (auto &alg : split_csv(value)) {
-			config.algs.insert(alg);
-		}
-	} else if (field == "role_claim") {
-		config.role_claim = value;
-	} else if (field == "claim_map") {
-		config.claim_map = value;
-	} else if (field == "client_id") {
-		// spec 064: dropping the id drops the secret with it - a secret with no id signs nothing
-		config.client_id = value;
-		if (value.empty()) {
-			config.client_secret.clear();
-		}
-	} else if (field == "client_secret") {
-		if (!value.empty() && config.client_id.empty()) {
-			throw BinderException("acl admin: a CLIENT SECRET without a CLIENT ID authenticates nothing - "
-			                      "set the CLIENT ID first");
-		}
-		config.client_secret = value;
-	} else {
-		throw BinderException("acl admin: unknown issuer property \"%s\"", field);
-	}
-	CatalogDefineIssuer(config);
-}
-
 void PolicyStore::CatalogGrantAdmin(const string &role, const string &scope) {
 	RequireCatalog(catalog, "acl_grant_admin");
 	catalog->Write({"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role),
@@ -2119,37 +2034,108 @@ bool PolicyStore::CatalogAnonymousAdminAllowed() {
 	return catalog->SettingBool("acl_allow_anonymous_admin", false);
 }
 
-void PolicyStore::CatalogDefineIssuer(const IssuerConfig &config) {
-	RequireCatalog(catalog, "acl_define_issuer");
-	// spec 071: a location the operator did not allow is refused here, early and clearly - and
-	// again where it would be read, which is the check that binds a shared catalog to this node
-	string why;
-	if (!config.jwks_uri.empty() && !JwksLocationAllowed(config.jwks_uri, why)) {
-		throw BinderException("acl admin: KEYS FROM %s - list its prefix there first, or paste the keys", why);
-	}
-	auto audiences = StringUtil::Join(config.audiences, ",");
-	vector<string> algs_list;
-	for (auto &alg : config.algs) {
-		algs_list.push_back(alg);
-	}
-	auto algs = StringUtil::Join(algs_list, ",");
-	catalog->Write({"DELETE FROM " + catalog->Tbl("issuers") + " WHERE \"issuer\" = " + Lit(config.issuer),
-	                "INSERT INTO " + catalog->Tbl("issuers") + " VALUES (" + Lit(config.issuer) + ", " +
-	                    Lit(config.keys_json) + ", " + Lit(audiences) + ", " + Lit(algs) + ", " +
-	                    Lit(config.role_claim) + ", " + Lit(config.claim_map) + ", " +
-	                    (config.jwks_uri.empty() ? string("NULL") : Lit(config.jwks_uri)) + ", " +
-	                    (config.client_id.empty() ? string("NULL") : Lit(config.client_id)) + ", " +
-	                    (config.client_secret.empty() ? string("NULL") : Lit(config.client_secret)) + ")"});
+namespace {
+
+string LitOrNull(const string &value) {
+	return value.empty() ? string("NULL") : Lit(value);
 }
 
-void PolicyStore::CatalogMapRole(const string &issuer, const string &source, const string &external_value,
-                                 const string &role) {
-	RequireCatalog(catalog, "acl_map_role");
-	catalog->Write({"DELETE FROM " + catalog->Tbl("role_mappings") + " WHERE \"issuer\" = " + Lit(issuer) +
-	                    " AND \"source\" = " + Lit(source) + " AND \"external_value\" = " + Lit(external_value) +
-	                    " AND \"role\" = " + Lit(role),
-	                "INSERT INTO " + catalog->Tbl("role_mappings") + " VALUES (" + Lit(issuer) + ", " + Lit(source) +
-	                    ", " + Lit(external_value) + ", " + Lit(role) + ")"});
+string IssuerValues(const IdentityIssuer &issuer) {
+	return "(" + Lit(issuer.name) + ", " + LitOrNull(issuer.url) + ", " + LitOrNull(issuer.secret_service) + ", " +
+	       LitOrNull(issuer.secret) + ")";
+}
+
+string ClientValues(const IdentityClient &client) {
+	return "(" + Lit(client.name) + ", " + Lit(client.issuer) + ", " + LitOrNull(StoredList(client.audiences)) + ", " +
+	       LitOrNull(StoredList(client.azp)) + ", " + LitOrNull(StoredConditions(client.conditions)) + ", " +
+	       LitOrNull(StoredList(client.roles_from)) + ", " + LitOrNull(StoredList(client.roles_constant)) + ", " +
+	       Lit(client.unmapped_as_role ? "as_role" : "ignore") + ", " + LitOrNull(StoredAttributes(client.attributes)) +
+	       ", " + LitOrNull(StoredList(client.subject)) + ", " + LitOrNull(client.token_type) + ", " +
+	       LitOrNull(client.client_id) + ", " + LitOrNull(StoredList(client.flows)) + ", " +
+	       LitOrNull(client.secret_service) + ", " + LitOrNull(client.secret) + ", " +
+	       (client.implicit ? "true" : "false") + ")";
+}
+
+string MappingValues(const IdentityMapping &mapping) {
+	return "(" + Lit(mapping.scope_kind) + ", " + Lit(mapping.scope_name) + ", " + Lit(mapping.source) + ", " +
+	       Lit(mapping.external_value) + ", " + Lit(mapping.role) + ")";
+}
+
+//! One table's difference as statements: a row that is gone is deleted by its key, a row that is new
+//! (or changed) is inserted - a changed row is both
+void DiffRows(CatalogBackend &catalog, const char *table, const vector<std::pair<string, string>> &old_rows,
+              const vector<std::pair<string, string>> &new_rows, vector<string> &deletes, vector<string> &inserts) {
+	std::multiset<string> had, kept;
+	for (auto &row : old_rows) {
+		had.insert(row.second);
+	}
+	for (auto &row : new_rows) {
+		kept.insert(row.second);
+	}
+	for (auto &row : old_rows) {
+		if (!kept.count(row.second)) {
+			deletes.push_back("DELETE FROM " + catalog.Tbl(table) + " WHERE " + row.first);
+		}
+	}
+	for (auto &row : new_rows) {
+		if (!had.count(row.second)) {
+			inserts.push_back("INSERT INTO " + catalog.Tbl(table) + " VALUES " + row.second);
+		}
+	}
+}
+
+} // namespace
+
+void PolicyStore::CatalogEditIdentity(const std::function<void(IdentityModel &)> &apply) {
+	RequireCatalog(catalog, "acl identity");
+	if (catalog->FunctionMode()) {
+		throw BinderException("acl catalog: the function-driver policy source is read-only");
+	}
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		// read inside the write's transaction, so what is validated is what the write replaces
+		auto issuers = read("SELECT \"name\", \"url\", \"secret_service\", \"secret\" FROM " + catalog->Tbl("issuers") +
+		                    " ORDER BY \"name\"");
+		auto clients = read("SELECT \"name\", \"issuer\", \"audiences\", \"azp\", \"requires\", \"roles_from\","
+		                    " \"roles_constant\", \"unmapped\", \"attributes\", \"subject\", \"token_type\","
+		                    " \"client_id\", \"flows\", \"secret_service\", \"secret\", \"implicit\" FROM " +
+		                    catalog->Tbl("clients") + " ORDER BY \"issuer\", \"name\"");
+		auto mappings = read("SELECT \"scope_kind\", \"scope_name\", \"source\", \"external_value\", \"role\" FROM " +
+		                     catalog->Tbl("role_mappings"));
+		auto before = CatalogBackend::IdentityFromRows(issuers.get(), clients.get(), mappings.get());
+		auto after = before;
+		apply(after);
+		vector<std::pair<string, string>> old_issuers, new_issuers, old_clients, new_clients, old_maps, new_maps;
+		for (auto &issuer : before.issuers) {
+			old_issuers.emplace_back("\"name\" = " + Lit(issuer.name), IssuerValues(issuer));
+		}
+		for (auto &issuer : after.issuers) {
+			new_issuers.emplace_back("\"name\" = " + Lit(issuer.name), IssuerValues(issuer));
+		}
+		for (auto &client : before.clients) {
+			old_clients.emplace_back("\"name\" = " + Lit(client.name), ClientValues(client));
+		}
+		for (auto &client : after.clients) {
+			new_clients.emplace_back("\"name\" = " + Lit(client.name), ClientValues(client));
+		}
+		auto mapping_key = [](const IdentityMapping &mapping) {
+			return "\"scope_kind\" = " + Lit(mapping.scope_kind) + " AND \"scope_name\" = " + Lit(mapping.scope_name) +
+			       " AND \"source\" = " + Lit(mapping.source) +
+			       " AND \"external_value\" = " + Lit(mapping.external_value) + " AND \"role\" = " + Lit(mapping.role);
+		};
+		for (auto &mapping : before.mappings) {
+			old_maps.emplace_back(mapping_key(mapping), MappingValues(mapping));
+		}
+		for (auto &mapping : after.mappings) {
+			new_maps.emplace_back(mapping_key(mapping), MappingValues(mapping));
+		}
+		// every delete before any insert, so a changed row never meets its own old primary key
+		vector<string> deletes, inserts;
+		DiffRows(*catalog, "role_mappings", old_maps, new_maps, deletes, inserts);
+		DiffRows(*catalog, "clients", old_clients, new_clients, deletes, inserts);
+		DiffRows(*catalog, "issuers", old_issuers, new_issuers, deletes, inserts);
+		statements.insert(statements.end(), deletes.begin(), deletes.end());
+		statements.insert(statements.end(), inserts.begin(), inserts.end());
+	});
 }
 
 void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,
@@ -2228,8 +2214,10 @@ bool PolicyStore::CatalogObjectExists(const string &vcat, const string &vname, c
 		sql = "SELECT 1 FROM " + catalog->Tbl("catalogs") + " WHERE \"vcat\" = " + Lit(vcat);
 	} else if (kind == "role") {
 		sql = "SELECT 1 FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(vname);
-	} else if (kind == "issuer") {
-		sql = "SELECT 1 FROM " + catalog->Tbl("issuers") + " WHERE \"issuer\" = " + Lit(vname);
+	} else if (kind == "issuer" || kind == "client") {
+		// spec 095: an identity object - the model is the same in every mode, so the store answers
+		auto model = Identity();
+		return kind == "issuer" ? model->Issuer(vname) != nullptr : model->Client(vname) != nullptr;
 	} else if (kind == "schema") {
 		sql = "SELECT 1 FROM " + catalog->Tbl("schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
 		      " AND \"path\" = " + Lit(vname);

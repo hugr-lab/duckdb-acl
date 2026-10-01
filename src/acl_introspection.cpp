@@ -336,6 +336,7 @@ void RegisterAclIntrospection(ExtensionLoader &loader, const shared_ptr<PolicySt
 	                                 "grant_columns",
 	                                 "admins",
 	                                 "issuers",
+	                                 "clients",
 	                                 "role_mappings",
 	                                 "function_categories",
 	                                 "function_category_members",

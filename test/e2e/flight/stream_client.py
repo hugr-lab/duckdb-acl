@@ -24,9 +24,13 @@ import pyarrow.flight as flight
 # fail the run, not hold it: one deadline for the whole process, whatever the mode
 signal.alarm(int(os.environ.get("ACL_STREAM_DEADLINE", "120")))
 
-TOKEN = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-         "eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9."
-         "c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc")
+TOKEN = ("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYX"
+         "VkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0s"
+         "InRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC"
+         "5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm50"
+         "9omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr"
+         "2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1"
+         "A")
 
 
 def varint(n):

@@ -903,40 +903,70 @@ public:
 		// not authenticated yet - by construction, it is how they try to - so the text stays in the
 		// audit and the client gets the same flat refusal a wrong password gets.
 		try {
-			string refusal = "acl: no issuer here carries a CLIENT ID, so the door cannot run the "
-			                 "password grant - authenticate with a bearer token instead";
-			for (auto &issuer : state->store->ListIssuers()) {
-				IssuerConfig config;
-				if (!state->store->LookupIssuer(issuer, config) || config.client_id.empty()) {
-					continue; // an issuer with no client_id cannot do ROPC and is skipped (spec 064)
+			// spec 095: the ONE client of the node that runs the password flow. A user's password goes to
+			// exactly one IdP - never tried at one customer's IdP after another's (a password client per
+			// IdP would hand B's users' passwords to A's token endpoint) - so several are refused, and the
+			// door says which; a driver that names its IdP is the follow-up. Its client secret, if any,
+			// is read from the secrets service for this call only.
+			struct Candidate {
+				string url;
+				PolicyStore::DoorClient client;
+			};
+			vector<Candidate> candidates;
+			for (auto &issuer : state->store->DoorIssuers(true)) {
+				for (auto &client : issuer.clients) {
+					if (!client.client_id.empty() &&
+					    std::find(client.flows.begin(), client.flows.end(), "password") != client.flows.end()) {
+						candidates.push_back({issuer.url, client});
+					}
 				}
-				auto ep = DiscoverEndpointsCached(*state->store, issuer);
+			}
+			string refusal;
+			if (candidates.empty()) {
+				refusal = "acl: no client here runs the password flow (FLOWS (password)), so the door cannot run the "
+				          "password grant - authenticate with a bearer token instead";
+			} else if (candidates.size() > 1) {
+				vector<string> names;
+				for (auto &candidate : candidates) {
+					names.push_back(candidate.client.name);
+				}
+				refusal = "acl: several clients run the password flow (" + StringUtil::Join(names, ", ") +
+				          "), so the door cannot tell whose IdP the password is for - keep FLOWS (password) on "
+				          "one client, or authenticate with a bearer token";
+			} else {
+				auto &candidate = candidates[0];
+				auto ep = DiscoverEndpointsCached(*state->store, candidate.url);
+				string why;
 				if (!ep.Ok()) {
-					refusal = "acl: OIDC discovery against " + issuer + " failed: " + ep.error;
-					continue;
+					refusal = "acl: OIDC discovery against " + candidate.url + " failed: " + ep.error;
+				} else if (!state->store->JwksLocationAllowed(ep.token_endpoint, why)) {
+					// the password and the client secret go only where the operator lets the node go
+					refusal =
+					    "acl: the token endpoint of " + candidate.url + " is not a location this node reads: " + why;
+				} else {
+					auto tokens = oidc::PasswordGrant(ep, candidate.client.client_id, candidate.client.client_secret,
+					                                  user, password);
+					if (!tokens.Ok()) {
+						// the IdP's own refusal IS the gate: unsupported_grant_type means ROPC is off there
+						refusal = "acl: the IdP at " + candidate.url + " refused the password grant: " + tokens.error;
+					} else {
+						Principal principal;
+						bool verified = false;
+						try {
+							verified = state->store->VerifyPrincipal(true, tokens.access_token, principal);
+						} catch (std::exception &) {
+							verified = false;
+						}
+						if (verified) {
+							*middleware = std::make_shared<PasswordHandshakeMiddleware>(tokens.access_token);
+							state->store->AuditDoor("flight", "handshake", true, string(), string(), string(),
+							                        &principal);
+							return arrow::Status::OK();
+						}
+						refusal = "acl: the token the IdP at " + candidate.url +
+						          " answered does not verify against this door's issuers";
+					}
 				}
-				auto tokens = oidc::PasswordGrant(ep, config.client_id, config.client_secret, user, password);
-				if (!tokens.Ok()) {
-					// the IdP's own refusal IS the gate: unsupported_grant_type means ROPC is off there
-					refusal = "acl: the IdP at " + issuer + " refused the password grant: " + tokens.error;
-					continue;
-				}
-				Principal principal;
-				bool verified = false;
-				try {
-					verified = state->store->VerifyPrincipal(true, tokens.access_token, principal);
-				} catch (std::exception &) {
-					verified = false;
-				}
-				if (!verified) {
-					refusal = "acl: the token the IdP at " + issuer +
-					          " answered does not verify against "
-					          "this door's issuers";
-					continue;
-				}
-				*middleware = std::make_shared<PasswordHandshakeMiddleware>(tokens.access_token);
-				state->store->AuditDoor("flight", "handshake", true, string(), string(), string(), &principal);
-				return arrow::Status::OK();
 			}
 			state->store->AuditDoor("flight", "handshake", false, "principal", refusal);
 			return flight::MakeFlightError(flight::FlightStatusCode::Unauthenticated, refusal);

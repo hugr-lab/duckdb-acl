@@ -48,6 +48,8 @@ set(EXTENSION_SOURCES
     src/acl_catalog_validation.cpp
     src/acl_rewriter.cpp
     src/acl_token.cpp
+    src/acl_identity.cpp
+    src/acl_identity_store.cpp
     third_party/p256-m/p256-m.c)
 
 # The Arrow Flight SQL door (specs/045): built by default, because it is what a client with an ADBC or

@@ -4,6 +4,7 @@
 # seats clients again. Skips (exit 0, saying why) without a flight build or pyarrow.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$ROOT" # spec 095: the fixture issuers (test/idp/) are read relative to the repository root
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD="${BUILD_DIR:-$ROOT/build/release}"
 DUCKDB="${DUCKDB_BIN:-$BUILD/duckdb}"
@@ -11,7 +12,7 @@ ACL_EXT="${ACL_EXT:-$BUILD/extension/acl/acl.duckdb_extension}"
 PORT="${ACL_DRAIN_PORT:-32771}"
 URI="grpc://localhost:$PORT"
 PYBIN="${ACL_ADBC_PYTHON:-python3}"
-TOKEN='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1hY21lIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.vzPJbHXAXfczhZwQp183JaaBLlSRSipNsSqwxoIFfng'
+TOKEN='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtYWNtZSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.UV5-WWUpQLp-Em8K2yLLkz-NEJgOyTAn9i9B1zpBWF3hNQVgorAVPVK48bxnrMiMm7NabgM3g945lDY31DFwxNeUKnVEe0QdRy1d1KbFh8td3Ak_mepOZ35CjPektGaOjVEpjUFxZUOj_uxYnse_y660xC0stlY8zxDrpSjNCOZRGv-vaxITv7ggOIDYAN07rmPntKe9oOYsb5g0ZkFcIEsKuHuXsL8z1crko6vIZzT9ido-xrph_WEejO5lKaPIxVe1QrB1-C5DUp8D8fnLWMJ3g426VNKWJwUyeSgh_nq1XzLyR8WcLchBQwaFAzkGivmLFmDdrDS7VUy49I8uLw'
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 [ -x "$DUCKDB" ] || { echo "SKIP: no duckdb CLI at $DUCKDB"; exit 0; }
@@ -77,18 +78,8 @@ echo "$refusal" | grep -q "draining" || fail "the refusal does not say draining:
 
 # re-authenticating the SEATED connection as another principal is a session swap - close, then open.
 # A draining node must refuse the swap BEFORE the close: the globex token is refused...
-GLOBEX_TOKEN="$("$PYBIN" - <<'PYEOF'
-import base64, hashlib, hmac, json
-key = base64.urlsafe_b64decode("YWNsLXRlc3QtaHMyNTYtc2VjcmV0==")
-b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-header = b64(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
-payload = b64(json.dumps({"iss": "https://issuer.test/s", "aud": "api://acl-test", "exp": 4102444800,
-                          "sub": "u-globex", "roles": ["analyst"], "tid": "globex"},
-                         separators=(",", ":")).encode())
-sig = b64(hmac.new(key, f"{header}.{payload}".encode(), hashlib.sha256).digest())
-print(f"{header}.{payload}.{sig}")
-PYEOF
-)"
+GLOBEX_TOKEN="$("$PYBIN" "$ROOT/test/scripts/idp_fixtures.py" mint \
+	'{"iss": "test/idp/s", "aud": "api://acl-test", "exp": 4102444800, "sub": "u-globex", "roles": ["analyst"], "tid": "globex"}')"
 swap="$(ACL_COOKIE_JAR="$JAR" "$PYBIN" "$HERE/client.py" "$URI" "SELECT 1" "$GLOBEX_TOKEN" 2>&1)" \
 	&& fail "a session swap was allowed during the drain"
 echo "$swap" | grep -q "draining" || fail "the swap refusal does not say draining: $swap"

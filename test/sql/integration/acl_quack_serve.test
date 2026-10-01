@@ -11,6 +11,10 @@ require httpfs
 require quack
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS store;
 
 statement ok
@@ -29,9 +33,7 @@ statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
 statement ok
-SELECT acl_define_issuer('https://issuer.test/s',
-    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
-    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+SELECT acl_define_issuer('test/idp/s', '{"url": "test/idp/s", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
 
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG c;
@@ -60,7 +62,7 @@ quack:localhost:31491
 
 query II
 SELECT * FROM quack_query('quack:localhost:31491', 'SELECT * FROM orders ORDER BY id',
-    token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+    token := 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
 ----
 1	acme
 2	globex
@@ -68,14 +70,14 @@ SELECT * FROM quack_query('quack:localhost:31491', 'SELECT * FROM orders ORDER B
 # the physical object is refused by the same path that refuses it anywhere else
 statement error
 SELECT * FROM quack_query('quack:localhost:31491', 'SELECT * FROM phys.main.orders',
-    token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+    token := 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
 ----
 <REGEX>:.*no access to object "phys.main.orders".*
 
 # and the column the object does not publish is not reachable either
 statement error
 SELECT * FROM quack_query('quack:localhost:31491', 'SELECT ssn FROM orders',
-    token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+    token := 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
 ----
 <REGEX>:.*ssn.*
 
@@ -88,7 +90,7 @@ SELECT * FROM quack_query('quack:localhost:31491', 'SELECT 1', token := 'not-a-j
 
 statement error
 SELECT * FROM quack_query('quack:localhost:31491', 'SELECT 1',
-    token := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2V2aWwudGVzdCIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsiYW5hbHlzdCJdfQ.xxxx');
+    token := 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ldmlsIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il19.oq6iDCZrrE08dgZIWQtnCR9Gwxw9bA7t7upX40G9aDa2GEVlbuDGeLGq20PCngVrHLCZ85mNQ95Ou-2KzE66FumuHo8cTbFNg960qaw7YIUh1S_OsL0B4Ri5narGCFAEemtoHypNIiit-nUlsHWJwCmB7-E3mqWXlwgI_pp2PAi8ldQjL7KZ2ghTu0Fs_ki-2SX4wrDc6PoEpLVxQazTM8nCWz4U20uBFPI_waQrfcG6O8Zj0MxZNWgvpmntwxxwlhELTGj7aF5syKuNrwWoKw2nP6CDNd6osTVfdyR-D9jBPrc4wI2fz8wcLbwWBFdEezoLRkOGnRMgFQOUDFnTYw');
 ----
 <REGEX>:.*Authentication failed.*
 
@@ -96,7 +98,7 @@ SELECT * FROM quack_query('quack:localhost:31491', 'SELECT 1',
 
 statement ok
 ATTACH 'quack:localhost:31491' AS remote (TYPE quack,
-    TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+    TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
 
 query II
 SELECT * FROM remote.main.orders ORDER BY id;

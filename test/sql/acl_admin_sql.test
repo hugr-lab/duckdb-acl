@@ -6,6 +6,10 @@
 require acl
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS phys;
 
 statement ok
@@ -103,15 +107,21 @@ ACL ROLE "auditor" SELECT count(*) FROM sales.orders WHERE amount > 0;
 # --- issuers and mappings through the grammar ----------------------------------------------------
 
 statement ok
-ACL ADMIN CREATE ISSUER 'https://issuer.test/x' KEYS '{"keys":[]}' AUDIENCES 'api://x' ALGS 'RS256' ROLE CLAIM 'groups' CLAIM MAP '{"tid": "tenant"}';
+ACL ADMIN CREATE ISSUER 'test/idp/x' AUDIENCES 'api://x' ROLE CLAIM 'groups' CLAIM MAP '{"tid": "tenant"}';
 
 statement ok
-ACL ADMIN MAP GROUP 'g-0001' FROM ISSUER 'https://issuer.test/x' TO ROLE analyst;
+ACL ADMIN MAP GROUP 'g-0001' FROM ISSUER 'test/idp/x' TO ROLE analyst;
 
-query I
-SELECT count(*) FROM aclcat.acl.issuers WHERE issuer = 'https://issuer.test/x' AND role_claim = 'groups';
+# spec 095: the short form is an issuer named by its URL and its implicit client of the same name
+query II
+SELECT count(*), any_value(url) FROM aclcat.acl.issuers WHERE name = 'test/idp/x';
 ----
-1
+1	test/idp/x
+
+query IIII
+SELECT audiences, roles_from, unmapped, implicit FROM aclcat.acl.clients WHERE name = 'test/idp/x';
+----
+["api://x"]	["groups"]	as_role	true
 
 query I
 SELECT count(*) FROM aclcat.acl.role_mappings WHERE external_value = 'g-0001' AND role = 'analyst';

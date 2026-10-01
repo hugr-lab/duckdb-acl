@@ -60,6 +60,8 @@ src/
   acl_catalog_validation.cpp #   listings, and the probe/bind validators; declared in acl_policy_catalog.hpp
   acl_catalog_maintenance.cpp # spec 039: acl_check_catalog (table function) + acl_repair_relation; seam acl_maintenance.hpp
   acl_rewriter.cpp           # the AST walker; exposes RewriteStatements(...)
+  acl_identity.cpp           # spec 095: issuers/clients/mappings - the pure model + routing (acl_identity.hpp)
+  acl_identity_store.cpp     #   ... the store's side: secrets, discovery documents, VerifyJwtPrincipal, doors
   acl_parser_override.cpp    # ACL prefix scanner + parser_override; exposes RegisterAclParser(...)
   acl_admin_functions.cpp    # acl_* admin stubs; exposes RegisterAclAdminFunctions(...)
   acl_door_common.cpp        # what every acl_* scalar and both doors share: StoreOf/RequiredArg, PEM, JSON
@@ -185,21 +187,45 @@ policy catalog in any ATTACHed database (standard duckdb dialect only, source ag
 `acl_create_catalog`, `acl_add_relation/_view/_schema_alias/_table_function[_alias]/_scalar[_alias]`,
 `acl_grant_catalog(role, vcat, caps_json, is_main)`, `acl_revoke_catalog`, `acl_drop_relation`.
 Settings `acl_version_check_interval` (policy staleness) and `acl_jwt_clock_skew` (JWT exp/nbf).
-**JWT** (spec 007): `acl_define_issuer(issuer, keys_json, audiences, algs, role_claim, claim_map)`
-and `acl_map_role(issuer, source, external, role)` — a JWT-shaped `ACL TOKEN` verifies offline
-(RS256/ES256/HS256; mbedtls + vendored p256-m), roles resolve as a multi-role union.
-**Spec 023**: an issuer may name a document to read its keys from instead of pasting them —
-`KEYS FROM '<uri>'` (or the 7th argument of `acl_define_issuer`), read through duckdb's own filesystem,
-so an https JWKS (needs httpfs) and a file refreshed out of band are one mechanism. Cached per
-instance: `acl_jwks_refresh_interval` (300s), a re-read when a token names an unknown `kid`, and
-`acl_jwks_max_stale` (3600s; `0` = a failed read is fatal at once). Keys and location are alternatives.
-**Spec 071**: `acl_jwks_locations` (GLOBAL only, default `https://`) lists the prefixes a `KEYS FROM`
-location - and an issuer's discovery URL (spec 064) - may start with; `..` is refused anywhere; a
-location outside it is refused where written and again where read (the node's setting binds,
-whatever a shared catalog says; the refusal is the cache row's last attempt and a `keys` event
-`location_refused` / `policy_error`, floored); `acl_jwks_cache()` lists what the node trusts
-(location, allowed, fetched/tried, error, key count, kids - never keys), `acl_jwks_refresh([issuer])`
-drops the cache so the next token re-reads (a read in flight cannot write the old document back).
+**JWT** (spec 007): a JWT-shaped `ACL TOKEN` verifies offline (RS256/ES256/HS256; mbedtls + vendored
+p256-m), roles resolve as a multi-role union. **Spec 095 - issuers and clients** (`acl_identity.{hpp,cpp}`
+the pure model and decisions, `acl_identity_store.cpp` the store's side): an `ISSUER` is the trust
+anchor - a name, a URL (unique; a token's `iss` routes to it), its keys by OIDC discovery
+(`<url>/.well-known/openid-configuration` → `jwks_uri`, algs ∩ {RS256, ES256}) or by an `oidc_issuer`
+secret (`URL`, `KEYS`, `KEYS_FROM`, `ALGS`; HS256 only from pasted `KEYS` with `ALGS` naming it). A
+`CLIENT` is which of its tokens count and what they become: `AUDIENCES` (required), `AZP`, `REQUIRE`
+(`=`, `IN`, contains, `LIKE`), `ROLES FROM` / `ROLES CONSTANT`, `UNMAPPED IGNORE|AS ROLE`,
+`ATTRIBUTES` (paths or `CONSTANT` - the claims RLS reads), `SUBJECT`, `TOKEN TYPE`, `CLIENT ID`,
+`FLOWS`, or an `oidc_client` secret (`AUDIENCES`, `CLIENT_ID`, `CLIENT_SECRET`). A token goes to the
+MOST SPECIFIC accepting client (AZP/REQUIRE 2 > explicit 1 > implicit 0); a tie is refused, never
+unioned; overlap visible at write is refused there. Role mappings are scoped `FROM CLIENT|ISSUER`; a
+role holding an admin scope is reached ONLY through the client's own mapping (never issuer-scope,
+`AS ROLE` or a constant). The short form `CREATE ISSUER '<url>' AUDIENCES … ROLE CLAIM … [CLAIM MAP]
+[CLIENT ID]` = issuer + implicit client named after it (`UNMAPPED AS ROLE`, flows `authcode, device`
+for a public id / `password` for a confidential one, set at creation only); an explicit client
+defaults to `IGNORE`. The door's password handshake runs as THE ONE client with `FLOWS (password)`
+(several are refused - a password never goes to a second IdP); a write judges only what it touches. **No key and no credential in the policy**: they live in the secrets service
+(spec 082's tresor), named by `FROM SECRET s [IN c]`, read at use on the store's own connection (the
+node as the caller), never from the node's memory/local_file storage; a service that goes away fails
+only its issuers closed; a resolved-connection change is a `policy` event `connection_changed`.
+Functions `acl_define_issuer(name, spec_json[, mode])`, `acl_define_client(name, issuer, spec_json[,
+mode])`, `acl_alter_*`, `acl_drop_*`, `acl_map_role(scope_kind, scope, source, value, role)`; listings
+`acl_issuers()` / `acl_clients()` / `acl_role_mappings()`; schema v17 (strict). The memory store keeps
+the same model and reads discovery, documents, secrets and the `acl_jwks_*` settings through its
+instance. Tests: issuers are fixtures under `test/idp/<x>/` read relative to the repository root
+(`SET GLOBAL acl_jwks_locations = 'test/idp/'`), tokens minted by `test/scripts/idp_fixtures.py`.
+**Spec 023** (now per location): the discovery document and the JWKS are read through duckdb's own
+filesystem (an https IdP needs httpfs) and cached by location: `acl_jwks_refresh_interval` (300s), a
+re-read when a token names an unknown `kid`, and `acl_jwks_max_stale` (3600s; `0` = a failed read is
+fatal at once).
+**Spec 071**: `acl_jwks_locations` (GLOBAL only, default `https://`) lists the prefixes every location
+the node reads keys from may start with (discovery, JWKS, a secret's `KEYS_FROM`); `..` is refused
+anywhere; a location outside it is refused where read (the node's setting binds, whatever a shared
+catalog or a secret says; the refusal is the cache row's last attempt and a `keys` event
+`location_refused` / `policy_error`, floored); `acl_jwks_cache()` lists one row per location (issuer,
+location, allowed, fetched/tried, error, key count, kids - never keys), `acl_jwks_refresh([issuer])`
+drops what an issuer read so the next token re-reads (a read in flight cannot write the old document
+back).
 **Spec 009**: administering the ACL is a granted capability — `acl_grant_admin(role, 'manage'|'passthrough'[, vcat])`
 / `acl_revoke_admin(role)` (or `ACL ADMIN GRANT|REVOKE ADMIN …`), used through
 the marker the client writes after the principal prefix: `ACL <mgmt>` (manage the ACL) or
@@ -396,12 +422,12 @@ a session is gone (live/expired/idle/unknown), read-only so it survives the NULL
 `BeginTransaction`/`EndTransaction` open and end one, `transaction_id` is validated against the
 session's own, so a driver with autocommit off (DBeaver, ADBC manual-commit) works; ingest still owns
 its own transaction. **Spec 064**: auth discovery + the IdP-gated password handshake - the
-Handshake payload `discover-auth` answers issuers/client_id/OIDC endpoints unauthenticated
+Handshake payload `discover-auth` answers issuers (name, URL), their OIDC endpoints and their clients
+with a driver flow (spec 095: `clients[]` - name, client_id, flows) unauthenticated
 (FlightSqlServerBase seals DoAction), and a BasicAuth handshake becomes the OAuth password grant run
-as the issuer's `client_id` (`acl_define_issuer` args 8-9, `CREATE|ALTER ISSUER ... CLIENT ID|SECRET`,
-schema v12), the IdP's token verified offline and returned as the connection's bearer; no flow
-toggle of ours - the IdP's refusal is the gate; TLS-only by refusal; `acl_issuers()` never lists the
-secret.
+as each client with `FLOWS (password)` (its `CLIENT_SECRET` read from the secrets service for the
+call), the IdP's token verified offline and returned as the connection's bearer; no flow toggle of
+ours - the IdP's refusal is the gate; TLS-only by refusal.
 
 **Spec 067 — the PEG world**: duckdb's PEG parser is the parser at our pin; `parser_override` is
 intact and load-bearing upstream. Foreign syntax under the prefix is a three-way contract, pinned by

@@ -13,6 +13,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$ROOT" # spec 095: the demo issuer (test/idp/s) is read relative to the repository root
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD="${BUILD_DIR:-$ROOT/build/release}"
 DUCKDB="${DUCKDB_BIN:-$BUILD/duckdb}"
@@ -39,9 +40,9 @@ if [ "$MODE" = "quack" ] && [ -z "$QUACK_EXT" ]; then
 fi
 [ "$MODE" = "quack" ] && [ -n "$TLS" ] && echo "note: --tls is the Flight door's; the quack door listens in the clear behind a proxy" >&2
 
-TOKEN_ANALYST_ACME='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1hY21lIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.vzPJbHXAXfczhZwQp183JaaBLlSRSipNsSqwxoIFfng'
-TOKEN_ANALYST_GLOBEX='eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJpc3MiOiAiaHR0cHM6Ly9pc3N1ZXIudGVzdC9zIiwgImF1ZCI6ICJhcGk6Ly9hY2wtdGVzdCIsICJleHAiOiA0MTAyNDQ0ODAwLCAic3ViIjogInUtZ2xvYmV4IiwgInJvbGVzIjogWyJhbmFseXN0Il0sICJ0aWQiOiAiZ2xvYmV4In0.N92ysQlqQLA2PapK-VdxsokNyXPxPlmO6YQJVQB8H6I'
-TOKEN_VIEWER='eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJpc3MiOiAiaHR0cHM6Ly9pc3N1ZXIudGVzdC9zIiwgImF1ZCI6ICJhcGk6Ly9hY2wtdGVzdCIsICJleHAiOiA0MTAyNDQ0ODAwLCAic3ViIjogInUtdmlld2VyIiwgInJvbGVzIjogWyJ2aWV3ZXIiXSwgInRpZCI6ICJhY21lIn0.wwCW65Avnzt1nhjOcvOdZjjQmF3G-vPL1BigusZtIR8'
+TOKEN_ANALYST_ACME='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtYWNtZSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.UV5-WWUpQLp-Em8K2yLLkz-NEJgOyTAn9i9B1zpBWF3hNQVgorAVPVK48bxnrMiMm7NabgM3g945lDY31DFwxNeUKnVEe0QdRy1d1KbFh8td3Ak_mepOZ35CjPektGaOjVEpjUFxZUOj_uxYnse_y660xC0stlY8zxDrpSjNCOZRGv-vaxITv7ggOIDYAN07rmPntKe9oOYsb5g0ZkFcIEsKuHuXsL8z1crko6vIZzT9ido-xrph_WEejO5lKaPIxVe1QrB1-C5DUp8D8fnLWMJ3g426VNKWJwUyeSgh_nq1XzLyR8WcLchBQwaFAzkGivmLFmDdrDS7VUy49I8uLw'
+TOKEN_ANALYST_GLOBEX='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtZ2xvYmV4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJnbG9iZXgifQ.US9D_P5MEhrwKYF-K5NwGoeMGXBaK6mky8oKM57xfJvZObM_yIhEp1uJhBN5MmmRuF6EV330IwT3W8RtgarfaK0iTlpHqmjEowIbhyQnFD84xOmjbTeBpSHaIBDWS8F2ayNKaUcXZFqfIPZrImvmASDQSQggTwkCnEyGpxPP7F__7MAC2PkDAV73RVVOuAW1QwqbYCPoeydXS-sgMBU2v031ngk8On-UTeZ3ZaCwMhznOUMwQUpFkCtSmwdt2_OgvYn_PC_Mu6f7UGFbTf2kXXHy6ps6QwT6pCpKoILA3uc-sjTRz1ZwyPy2NuKwceBIwiXbKTxPz5PH9KoLYUD6sg'
+TOKEN_VIEWER='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtdmlld2VyIiwicm9sZXMiOlsidmlld2VyIl0sInRpZCI6ImFjbWUifQ.SiXcR8NX0S95O0FeUkCPmdaUPAt7E6D4DXT60k3a21yiIMekP5I-XGY1K5tIEr_5XttG4WPpoYTq9Dt5dF4elM365178laj6Nldj9572MpSF4v5h-lIGvBQd7p0xdyj_lghwYMniy9b7sb-MNX_VpOlQRw1NG_-A5fPD_KIlDA2aOK1d8x8boJlE6hXfpyvKeeDkccqxxs9MMZF6iincDIkvFLUoTacJdBosdpm1YgrZ7p2UId3HZYZdeQod0DkCLtkerngW61VNoAdCSGyZVabD0aJ5Pe2YfzrXpSgbz6FATFeZmKAHWp5O-pQbkNfiO1ZUOEDSxCNppJxYgaCkOw'
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
@@ -75,20 +76,22 @@ elif [ "$MODE" = "all" ] && [ -z "$QUACK_EXT" ]; then
 fi
 
 # spec 057, optional: hook a real Keycloak issuer. Set ACL_LIVE_KEYCLOAK to the realm base URL
-# (e.g. http://localhost:18070/realms/master); the JWKS is fetched over httpfs (KEYS FROM, spec 023),
-# roles come from realm_access.roles (spec 007), and a `tenant` user attribute drives the RLS.
-KC_ISSUER="-- ACL_LIVE_KEYCLOAK not set: only the demo HS256 issuer is defined"
+# (e.g. http://localhost:18070/realms/master); its keys are found by the realm's OIDC discovery over
+# httpfs (spec 095), roles come from realm_access.roles (spec 007), and a `tenant` user attribute
+# drives the RLS.
+KC_ISSUER="-- ACL_LIVE_KEYCLOAK not set: only the demo issuer is defined"
 KC_PRELOAD=""
-KC_LOCATIONS=""
+# the demo issuer's discovery is a fixture of the repository (spec 095)
+KC_LOCATIONS="SET GLOBAL acl_jwks_locations = 'test/idp/';"
 if [ -n "${ACL_LIVE_KEYCLOAK:-}" ]; then
 	KC_REALM="${ACL_LIVE_KEYCLOAK%/}"
 	KC_AUD="${ACL_LIVE_KC_AUDIENCE:-account}"
 	KC_TENANT="${ACL_LIVE_KC_TENANT_CLAIM:-tenant}"
-	KC_PRELOAD="$HTTPFS_LOAD"  # the issuer define reads the JWKS at verify time
-	# the realm's own URL is the one location this node reads keys from (spec 071): a local
+	KC_PRELOAD="$HTTPFS_LOAD"  # the realm's discovery and JWKS are read at verify time
+	# the realm's own URL is the one network location this node reads keys from (spec 071): a local
 	# Keycloak over http is admitted by name, never by scheme
-	KC_LOCATIONS="SET GLOBAL acl_jwks_locations = 'https://, $KC_REALM/';"
-	KC_ISSUER="ACL ADMIN CREATE ISSUER '$KC_REALM' KEYS FROM '$KC_REALM/protocol/openid-connect/certs' AUDIENCES ('$KC_AUD') ALGS (RS256) ROLE CLAIM 'realm_access.roles' CLAIM MAP '{\"$KC_TENANT\": \"tenant\"}';"
+	KC_LOCATIONS="SET GLOBAL acl_jwks_locations = 'https://, test/idp/, $KC_REALM/';"
+	KC_ISSUER="ACL ADMIN CREATE ISSUER '$KC_REALM' AUDIENCES ('$KC_AUD') ROLE CLAIM 'realm_access.roles' CLAIM MAP '{\"$KC_TENANT\": \"tenant\"}';"
 fi
 
 {
@@ -115,7 +118,7 @@ INFO
 fi
 cat <<INFO
 
-tokens (HS256, demo issuer, exp 2100):
+tokens (RS256, demo issuer, exp 2100):
   analyst @ acme:    $TOKEN_ANALYST_ACME
   analyst @ globex:  $TOKEN_ANALYST_GLOBEX
   viewer  @ acme:    $TOKEN_VIEWER

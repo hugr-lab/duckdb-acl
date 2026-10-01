@@ -1,0 +1,8 @@
+{
+ "issuer": "test/idp/hs",
+ "jwks_uri": "test/idp/hs/jwks.json",
+ "id_token_signing_alg_values_supported": [
+  "RS256",
+  "ES256"
+ ]
+}

@@ -30,7 +30,8 @@ Everything the node serves is decided in three places, all next to this file:
   different build. E.g. `ACL_LIVE_PORT=40000 test/live/serve.sh flight`.
 - **Tokens follow the roles**: a role you add in `bootstrap.sql` needs a token that names it -
   `test/live/mint_token.py <role>[,role2] [tenant] [subject]` mints one for the demo issuer
-  (HS256, the fixture secret). Example: `test/live/mint_token.py auditor globex`.
+  (RS256 with the committed fixture key, which the demo issuer's discovery under `test/idp/s`
+  publishes). Example: `test/live/mint_token.py auditor globex`.
 
 To change what a **VS Code task** runs (a port, a mode), edit `.vscode/tasks.json` - either the
 `command` itself or add an env block to a task:
@@ -50,11 +51,11 @@ ever sees `customers.ssn` anywhere, including in the column tree.
 
 ## Hooking a real Keycloak (optional)
 
-The demo tokens are HS256 over a fixture secret - fine for a walk-through, not what a deployment
-looks like. A real issuer is one line: start the node with `ACL_LIVE_KEYCLOAK` pointing at a realm,
-and the node defines an issuer that fetches the realm's JWKS over httpfs (spec 023), verifies RS256
-(spec 007), takes roles from `realm_access.roles`, and maps a `tenant` claim to the RLS the demo
-drives with `tid`:
+The demo tokens are signed with a key committed to this repository - fine for a walk-through, not
+what a deployment looks like. A real issuer is one line: start the node with `ACL_LIVE_KEYCLOAK`
+pointing at a realm, and the node defines an issuer whose keys it finds by the realm's OIDC discovery
+over httpfs (spec 095), verifies RS256 (spec 007), takes roles from `realm_access.roles`, and maps a
+`tenant` claim to the RLS the demo drives with `tid`:
 
 ```sh
 ACL_LIVE_KEYCLOAK=http://localhost:18070/realms/master test/live/serve.sh flight
@@ -67,8 +68,8 @@ The demo tokens keep working alongside it. The standing dev realm is scripted an
 test/live/keycloak_realm.sh      # creates/converges realm 'acl-dev' from the .env KEY_CLOAK_* creds
 ```
 
-It builds a public client `acl-cli` (password + device flow), realm roles `analyst`/`viewer` (our
-unmapped-role rule matches them to ACL roles by name), users `analyst1`(acme)/`analyst2`(globex)/
+It builds a public client `acl-cli` (password + device flow), realm roles `analyst`/`viewer` (the
+short form's implicit client keeps an unmapped value that names a role as that role, spec 095), users `analyst1`(acme)/`analyst2`(globex)/
 `viewer1`(acme) with a `tenant` attribute and its protocol mapper - and bakes in the Keycloak 26
 lessons: the declarative user profile must allow unmanaged attributes (else the tenant claim
 silently vanishes), and a user needs email/names/cleared-requiredActions or the password grant
@@ -93,11 +94,10 @@ to its own service principal gives a client_credentials token carrying `roles:["
 trusts it with:
 
 ```sql
-SET GLOBAL force_download=true;  -- Microsoft's JWKS endpoint answers HEAD/GET inconsistently,
-                                 -- and httpfs refuses the mismatch without this
+SET GLOBAL force_download=true;  -- Microsoft's discovery and JWKS endpoints answer HEAD/GET
+                                 -- inconsistently, and httpfs refuses the mismatch without this
 ACL ADMIN CREATE ISSUER 'https://login.microsoftonline.com/<tenant>/v2.0'
-  KEYS FROM 'https://login.microsoftonline.com/<tenant>/discovery/keys'
-  AUDIENCES ('<appId>') ALGS (RS256) ROLE CLAIM 'roles';
+  AUDIENCES ('<appId>') ROLE CLAIM 'roles';
 ```
 
 and the provider mints over live TLS:

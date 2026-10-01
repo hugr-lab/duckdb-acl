@@ -7,6 +7,10 @@
 require acl
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS phys;
 
 statement ok
@@ -264,28 +268,39 @@ ACL ADMIN SELECT count(*) FROM phys.main.altered;
 # --- the same door for a JWT principal (quack/ADBC clients) --------------------------------------
 
 statement ok
-SELECT acl_define_issuer('https://issuer.test/rs', '{"keys":[{"kty":"RSA","kid":"test-key","alg":"RS256","n":"jps-_RGCObZHYxFmbxIagCg0dZlIifYMV2phhdrLpkrJ8TkoTe_GQK62Nf4Ilh92YUiBofspFfi7-fT937mnN1vzVyAKjHCHA4BmnDHHvCea8QdNP0YcxDXsBReZDFx-e8uEqfG-9_uvhLS0HTwTqhRKtdlwGDrsSoH4WYnCHI1grvQ8BSo7MivppMTzx7UUWeKieKFMeY3jw-g0XgdyZKjIOOaXQTX5AeEm_Xq6OjOtq7gVIgmNfogSQIAWFk5iaMzzafzhQmN_d719rEMSJClAAnCklwpETEq2jWv5vJUhslPL6ZQPd8jnjVMcOzL8Zy9ed5U9te-EQ0IKnfnpZQ","e":"AQAB"},{"kty":"EC","crv":"P-256","kid":"test-ec","alg":"ES256","x":"DQof67TjKFht1fXEua9TTUBimcYFM1za8A06kBIgCDM","y":"RRJa8uTiLTotv77J3eZC2m3YOQSz_aHIk2mnf_5vwCg"}]}', 'api://acl-test', 'RS256', 'roles', '{"tid": "tenant"}');
+SELECT acl_define_issuer('test/idp/rs', '{"url": "test/idp/rs", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
 
 # the token's role is 'analyst' - no scope, so administering is refused
 statement error
-ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' ACL CREATE ROLE from_token;
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.IfMyuOMYT0tZCxOA9LIT5oHOYJ6rH6FBoXWU8Ly-MQnMXKKj9baF0EMSGM367Od1_uqbhDOuY0HriUhQ_ItPtywx9K3l9atFiWinQ_HAIKI5JZM_wi4sMG8ME0PQkB0HbHp8dWGY7fiqzvdtxxCMyEYCgg9Iw6W3ONxFlhSIdKOJ4Natvo0oNJpz1sbphxExRBuZN2TCN4Ri-Z2xIGdr4abw52xF6PR3str8Zxyqy0eWO_P4dJyobV2j_sXNcFTZGKZ_F_geoqlc8y-aVnxkm-0AXsi8E38b9lm_1H7uAZPuLDJJt5yDKmtnJjkMeD0mj5S5RUR7LSWiEW0XMo1Maw' ACL CREATE ROLE from_token;
 ----
 <REGEX>:.*no ACL administration scope.*
 
 statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{"select": true, "manage": true}' MAIN;
 
+# spec 095: a role that holds an administration scope is reached only through an explicit mapping of
+# the client itself - not as an unmapped value of the same name, which is how the short form's
+# client reaches every other role
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.IfMyuOMYT0tZCxOA9LIT5oHOYJ6rH6FBoXWU8Ly-MQnMXKKj9baF0EMSGM367Od1_uqbhDOuY0HriUhQ_ItPtywx9K3l9atFiWinQ_HAIKI5JZM_wi4sMG8ME0PQkB0HbHp8dWGY7fiqzvdtxxCMyEYCgg9Iw6W3ONxFlhSIdKOJ4Natvo0oNJpz1sbphxExRBuZN2TCN4Ri-Z2xIGdr4abw52xF6PR3str8Zxyqy0eWO_P4dJyobV2j_sXNcFTZGKZ_F_geoqlc8y-aVnxkm-0AXsi8E38b9lm_1H7uAZPuLDJJt5yDKmtnJjkMeD0mj5S5RUR7LSWiEW0XMo1Maw' ACL ADD TABLE phys.main.orders_physical AS sales.from_token;
+----
+<REGEX>:.*no recognized roles.*
+
 statement ok
-ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' ACL ADD TABLE phys.main.orders_physical AS sales.from_token;
+ACL ADMIN MAP CLAIM 'analyst' FROM CLIENT 'test/idp/rs' TO ROLE analyst;
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.IfMyuOMYT0tZCxOA9LIT5oHOYJ6rH6FBoXWU8Ly-MQnMXKKj9baF0EMSGM367Od1_uqbhDOuY0HriUhQ_ItPtywx9K3l9atFiWinQ_HAIKI5JZM_wi4sMG8ME0PQkB0HbHp8dWGY7fiqzvdtxxCMyEYCgg9Iw6W3ONxFlhSIdKOJ4Natvo0oNJpz1sbphxExRBuZN2TCN4Ri-Z2xIGdr4abw52xF6PR3str8Zxyqy0eWO_P4dJyobV2j_sXNcFTZGKZ_F_geoqlc8y-aVnxkm-0AXsi8E38b9lm_1H7uAZPuLDJJt5yDKmtnJjkMeD0mj5S5RUR7LSWiEW0XMo1Maw' ACL ADD TABLE phys.main.orders_physical AS sales.from_token;
 
 statement error
-ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUxIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.KmSqaoUsXoRtQrf9ca6zy3JpBQk2FoB_3eC2crZkekfKaJBx64k6CZsP30AM2KSKkTwkS0cV940DGfmRWZVtIqzfC53oARGLaIlUQzG3b-H_Bp3XFsE_3ypDnqQJkFx2DljqWXqRHPRwZFIE4Im96SSHaF-PRxxuRywZKTcv4uWSzsEsfLOT9bY4iozdblSMQdAvu6jmYYPbv2eRsWbHCLNa4SjwoONSBm4oU3UMjobW_pMqZVVFHgEdr8ErNa4tYBB6oMDHge6bYHAXh-2A3nxPAv3Bj1APMMRPl1mHMjHUsgcscl6Ch0oeglgmagi7i8kQ_be0KZ_vCS0RBFifBA' ACL ADD TABLE phys.main.orders_physical AS hr.from_token;
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.IfMyuOMYT0tZCxOA9LIT5oHOYJ6rH6FBoXWU8Ly-MQnMXKKj9baF0EMSGM367Od1_uqbhDOuY0HriUhQ_ItPtywx9K3l9atFiWinQ_HAIKI5JZM_wi4sMG8ME0PQkB0HbHp8dWGY7fiqzvdtxxCMyEYCgg9Iw6W3ONxFlhSIdKOJ4Natvo0oNJpz1sbphxExRBuZN2TCN4Ri-Z2xIGdr4abw52xF6PR3str8Zxyqy0eWO_P4dJyobV2j_sXNcFTZGKZ_F_geoqlc8y-aVnxkm-0AXsi8E38b9lm_1H7uAZPuLDJJt5yDKmtnJjkMeD0mj5S5RUR7LSWiEW0XMo1Maw' ACL ADD TABLE phys.main.orders_physical AS hr.from_token;
 ----
 <REGEX>:.*no manage scope for catalog "hr".*
 
 # an invalid token is refused before any scope question
 statement error
-ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjk0NjY4NDgwMCwic3ViIjoidTUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.d7QJzBvajOOZ4lrYQuLTFOoIdxTA2FU5laRThD0Kv3Hs4QEsDPRf00GiRsaORa9VQbyBefth45hhWpA8RSCLDX9CRFzVxxOO1ErQ84efuaXd-gvKTvqy9oa17vcL4FzUeYHH2-QbMEQZlXVfZQzvtMeR3WEwkZUJO-yhUYjofZB10aB7eWNg3G7jH0mOL6ZPP4UvOkYorJLiIiYZpt3oLWeUr31_b1e7mx6nhOfOEUPxgam4BAoG90lEIoIFzzPKuAlEYwWbURWJm_DhaS6fd6noCtH4SVqDMZHe8qKk3CRWTLc5WhopwLox754NTD7c6HMZ2N_HRzJB68f3Sk9IuQ' ACL CREATE ROLE nope;
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo5NDY2ODQ4MDAsInN1YiI6InU1Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.im4m1r-aCD0ez96m6at8Yz1y-AgP_5hFvh1NqEtI76S8AAFuR_FJjxmHiCUtrbH0Q_7hR8-CRqaegdvEu_iET9Dq2RR00o5ITEOuPELgWJTpAKuX-8Tu2MF8OANh_agU9_Ap3gbDU13A4mYTI0Pa3QOHIkBd26Kg00ECHbE8Gceo3fWvUNIKK9pPivW-4lIhIjrpH7ETgJY2iEM0uSiCXbKa86Pnls4d8KHvQS8F4cxboVDgPRjBNHroWDwP1FJQk4OMuZSet59LvUGhXAsrDG4xMz0Fw8riPskOYqoA4WrU9QC78IRH_O6SQBGasMXKu5ok3RdHBC_45Cf8TpeceQ' ACL CREATE ROLE nope;
 ----
 <REGEX>:.*token expired.*
 
@@ -535,15 +550,15 @@ ACL ADMIN SELECT count(*) FROM phys.main.native_marker;
 
 # 12. an issuer cannot silently lose its audience check
 statement ok
-ACL ADMIN CREATE ISSUER 'https://issuer.test/aud' KEYS '{"keys":[]}' AUDIENCES 'api://x' ALGS 'RS256';
+ACL ADMIN CREATE ISSUER 'test/idp/aud' AUDIENCES 'api://x';
 
 statement error
-ACL ADMIN ALTER ISSUER 'https://issuer.test/aud' SET AUDIENCES '';
+ACL ADMIN ALTER ISSUER 'test/idp/aud' SET AUDIENCES '';
 ----
-<REGEX>:.*at least one audience.*
+<REGEX>:.*accepts no audience - AUDIENCES is required.*
 
 statement ok
-ACL ADMIN ALTER ISSUER 'https://issuer.test/aud' SET AUDIENCES '*';
+ACL ADMIN ALTER ISSUER 'test/idp/aud' SET AUDIENCES ('api://x', 'api://y');
 
 # --- closing the anonymous hatch again ------------------------------------------------------------
 

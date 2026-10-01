@@ -1,22 +1,22 @@
 """Spec 047 through the real ADBC Flight SQL driver - the client DBeaver and Power BI embed.
 
 Assertions, not a survey: each check exits non-zero on the first failure and says what it saw.
-The globex token is minted here (HS256 over the test secret) so the stolen-handle check can ask
-as a different principal without a second fixture.
+The globex token is minted here (RS256 with the committed fixture key, spec 095) so the
+stolen-handle check can ask as a different principal without a second fixture.
 """
-import base64, hashlib, hmac, json, sys
+import json, os, sys
 import adbc_driver_flightsql.dbapi as dbapi
 from adbc_driver_flightsql import DatabaseOptions
 
 uri, acme_token = sys.argv[1], sys.argv[2]
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"))
+import idp_fixtures  # noqa: E402
+
 def mint(tenant):
-    b64 = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-    head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    body = b64(json.dumps({"iss": "https://issuer.test/s", "aud": "api://acl-test", "exp": 4102444800,
-                           "sub": "u-" + tenant, "roles": ["analyst"], "tid": tenant}).encode())
-    sig = b64(hmac.new(b"acl-test-hs256-secret", f"{head}.{body}".encode(), hashlib.sha256).digest())
-    return f"{head}.{body}.{sig}"
+    return idp_fixtures.sign({"alg": "RS256", "typ": "JWT", "kid": "test-key"},
+                             {"iss": "test/idp/s", "aud": "api://acl-test", "exp": 4102444800,
+                              "sub": "u-" + tenant, "roles": ["analyst"], "tid": tenant})
 
 def connect(token, autocommit=True):
     # the cookie is what makes a connection ONE session on the door (spec 050) - the same middleware

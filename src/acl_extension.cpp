@@ -246,7 +246,8 @@ void LoadInternal(ExtensionLoader &loader) {
 
 	// one policy store per database instance, shared by the parser override and the admin functions
 	auto store = make_shared_ptr<acl::PolicyStore>();
-	acl::RegisterQuackOidcProvider(loader); // spec 061: CREATE SECRET (TYPE quack, PROVIDER oidc, ...)
+	acl::RegisterQuackOidcProvider(loader);   // spec 061: CREATE SECRET (TYPE quack, PROVIDER oidc, ...)
+	acl::RegisterIdentitySecretTypes(loader); // spec 095: the oidc_issuer / oidc_client secret types
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
 	acl::RegisterAclMaintenance(loader, store); // spec 039: acl_check_catalog / acl_repair_relation

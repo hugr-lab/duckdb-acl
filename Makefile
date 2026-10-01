@@ -99,6 +99,10 @@ TEST_CPP_LINK = -L build/release/src -lduckdb -Wl,-rpath,$(abspath build/release
 $(TEST_CPP_DIR)/test_acl_catalog_rpc: src/acl_catalog_rpc.cpp
 $(TEST_CPP_DIR)/test_acl_catalog_rpc: TEST_CPP_EXTRA := src/acl_catalog_rpc.cpp
 
+# spec 095: the identity model's decisions are a translation unit of their own, compiled into their test
+$(TEST_CPP_DIR)/test_acl_identity_routing: src/acl_identity.cpp src/include/acl_identity.hpp
+$(TEST_CPP_DIR)/test_acl_identity_routing: TEST_CPP_EXTRA := src/acl_identity.cpp duckdb/third_party/yyjson/yyjson.cpp
+
 # the OIDC core lives in duckdb-ext-common (spec 076) and its own test runs there; the embedded-door
 # test drives discovery through the core's HttpGet (spec 063), so it compiles the module from the
 # submodule - under our namespace - plus the bundled yyjson, the way the extension does

@@ -466,21 +466,22 @@ bool IsMgmtStart(const string &text) {
 				second = ahead.PeekWord();
 			}
 			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
-			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "resource") ||
-			       function_category();
+			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "client") ||
+			       StringUtil::CIEquals(second, "resource") || function_category();
 		}
 		if (StringUtil::CIEquals(first, "alter")) {
 			// duckdb owns ALTER TABLE/VIEW/...: our object forms carry the VIRTUAL marker, and
 			// ALTER ROLE/ISSUER/GRANT do not exist in duckdb at all
 			return StringUtil::CIEquals(second, "virtual") || StringUtil::CIEquals(second, "role") ||
-			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "grant") ||
-			       function_category();
+			       StringUtil::CIEquals(second, "issuer") || StringUtil::CIEquals(second, "client") ||
+			       StringUtil::CIEquals(second, "grant") || function_category();
 		}
 		// DROP: our own forms carry VIRTUAL, and duckdb has no DROP ROLE/ISSUER/MAP/RELATION
 		return StringUtil::CIEquals(second, "relation") || StringUtil::CIEquals(second, "virtual") ||
 		       StringUtil::CIEquals(second, "role") || StringUtil::CIEquals(second, "issuer") ||
-		       StringUtil::CIEquals(second, "map") || StringUtil::CIEquals(second, "reference") ||
-		       StringUtil::CIEquals(second, "resource") || function_category();
+		       StringUtil::CIEquals(second, "client") || StringUtil::CIEquals(second, "map") ||
+		       StringUtil::CIEquals(second, "reference") || StringUtil::CIEquals(second, "resource") ||
+		       function_category();
 	}
 	return false;
 }
@@ -850,6 +851,407 @@ unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
 	                      verb);
 }
 
+// --- spec 095: issuers, clients, mappings --------------------------------------------------------
+
+string JsonList(const vector<string> &values) {
+	vector<string> quoted;
+	for (auto &value : values) {
+		quoted.push_back(JsonQuote(value));
+	}
+	return "[" + StringUtil::Join(quoted, ",") + "]";
+}
+
+//! A list written `(a, 'b', …)` or as the legacy quoted csv `'a,b'`; items unquoted
+vector<string> ListItems(AdminScanner &s, const char *what) {
+	vector<string> out;
+	if (s.AtParen()) {
+		for (auto &item : SplitTopLevel(s.Parens(), ',')) {
+			auto value = Unquoted(item);
+			StringUtil::Trim(value);
+			if (!value.empty()) {
+				out.push_back(value);
+			}
+		}
+		return out;
+	}
+	for (auto &item : StringUtil::Split(s.Quoted(what), ',')) {
+		StringUtil::Trim(item);
+		if (!item.empty()) {
+			out.push_back(item);
+		}
+	}
+	return out;
+}
+
+//! A claim path: a quoted string (a claim with characters a word cannot hold) or word(.word)*
+string ClaimPath(AdminScanner &s) {
+	s.Skip();
+	if (s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"')) {
+		return s.Quoted("claim path");
+	}
+	return s.Dotted("a claim path");
+}
+
+//! A REQUIRE value: a quoted string, or a bare word or number (a boolean or numeric claim, compared as
+//! the text it reads as: `true`, `42`)
+string RequireValue(AdminScanner &c) {
+	c.Skip();
+	if (c.pos < c.text.size() && (c.text[c.pos] == '\'' || c.text[c.pos] == '"')) {
+		return c.Quoted("value");
+	}
+	auto start = c.pos;
+	while (c.pos < c.text.size() && (IsWordChar(c.text[c.pos]) || c.text[c.pos] == '.' || c.text[c.pos] == '-')) {
+		c.pos++;
+	}
+	if (c.pos == start) {
+		throw BinderException("acl admin: expected a value at position %llu", start);
+	}
+	return StringUtil::Lower(c.text.substr(start, c.pos - start)) == "true" ||
+	               StringUtil::Lower(c.text.substr(start, c.pos - start)) == "false"
+	           ? StringUtil::Lower(c.text.substr(start, c.pos - start))
+	           : c.text.substr(start, c.pos - start);
+}
+
+//! REQUIRE (sub LIKE 'repo:x:%', owner = 'hugr-lab', tid IN ('a', 'b'), 'admin' IN groups)
+string RequireJson(const string &list) {
+	vector<string> conditions;
+	for (auto &item : SplitTopLevel(list, ',')) {
+		if (item.empty()) {
+			continue;
+		}
+		AdminScanner c(item);
+		string path, op;
+		vector<string> values;
+		c.Skip();
+		if (c.pos < item.size() && item[c.pos] == '\'') {
+			// 'v' IN path: the claim (an array) contains the value
+			values.push_back(c.Quoted("value"));
+			c.Expect("in");
+			path = ClaimPath(c);
+			op = "contains";
+		} else {
+			path = ClaimPath(c);
+			c.Skip();
+			if (c.pos < item.size() && item[c.pos] == '=') {
+				c.pos++;
+				op = "eq";
+				values.push_back(RequireValue(c));
+			} else if (c.Accept("in")) {
+				op = "in";
+				for (auto &value : SplitTopLevel(c.Parens(), ',')) {
+					if (!value.empty()) {
+						values.push_back(Unquoted(value));
+					}
+				}
+			} else if (c.Accept("like")) {
+				op = "like";
+				values.push_back(c.Quoted("pattern"));
+			} else {
+				throw BinderException("acl admin: a REQUIRE condition is path = value, path IN ('a', …), 'v' IN path "
+				                      "or path LIKE 'p%%' - got \"%s\"",
+				                      item);
+			}
+		}
+		if (!c.Done()) {
+			throw BinderException("acl admin: unexpected text in the REQUIRE condition \"%s\"", item);
+		}
+		conditions.push_back("{\"path\":" + JsonQuote(path) + ",\"op\":" + JsonQuote(op) +
+		                     ",\"values\":" + JsonList(values) + "}");
+	}
+	return "[" + StringUtil::Join(conditions, ",") + "]";
+}
+
+//! ATTRIBUTES (tenant = 'tenant', email = ('email', 'upn'), org = CONSTANT 'acme')
+string AttributesJson(const string &list) {
+	vector<string> attributes;
+	for (auto &item : SplitTopLevel(list, ',')) {
+		if (item.empty()) {
+			continue;
+		}
+		AdminScanner a(item);
+		auto name = a.Word("an attribute name");
+		a.Skip();
+		if (a.pos >= item.size() || item[a.pos] != '=') {
+			throw BinderException("acl admin: an attribute is written name = 'path' | ('path', …) | CONSTANT 'v' - "
+			                      "got \"%s\"",
+			                      item);
+		}
+		a.pos++;
+		if (a.Accept("constant")) {
+			attributes.push_back("{\"name\":" + JsonQuote(name) + ",\"constant\":" + JsonQuote(a.Quoted("value")) +
+			                     "}");
+		} else {
+			vector<string> paths;
+			if (a.AtParen()) {
+				for (auto &path : SplitTopLevel(a.Parens(), ',')) {
+					if (!path.empty()) {
+						paths.push_back(Unquoted(path));
+					}
+				}
+			} else {
+				paths.push_back(ClaimPath(a));
+			}
+			attributes.push_back("{\"name\":" + JsonQuote(name) + ",\"paths\":" + JsonList(paths) + "}");
+		}
+		if (!a.Done()) {
+			throw BinderException("acl admin: unexpected text in the attribute \"%s\"", item);
+		}
+	}
+	return "[" + StringUtil::Join(attributes, ",") + "]";
+}
+
+//! `FROM SECRET s [IN c]` after its FROM SECRET: the spec entries naming it
+void SecretRef(AdminScanner &s, vector<string> &entries) {
+	auto secret = s.Name("a secret name");
+	entries.push_back("\"secret\":" + JsonQuote(secret));
+	if (s.Accept("in")) {
+		entries.push_back("\"service\":" + JsonQuote(s.Word("a secrets service")));
+	}
+}
+
+//! One clause of a client (spec 095 §2), as a client-spec JSON entry. False when the next words are
+//! not a client clause. `secret_clause` is how its secret is written: FROM SECRET (a client) or
+//! CLIENT FROM SECRET (the short form, where FROM SECRET is the issuer's).
+bool ClientClause(AdminScanner &s, vector<string> &entries, bool short_form) {
+	auto saved = s.pos;
+	if (s.Accept("audiences")) {
+		entries.push_back("\"audiences\":" + JsonList(ListItems(s, "audiences")));
+	} else if (s.Accept("azp")) {
+		entries.push_back("\"azp\":" + JsonList(ListItems(s, "azp")));
+	} else if (s.Accept("require")) {
+		if (!s.AtParen()) {
+			throw BinderException("acl admin: REQUIRE takes its conditions in parentheses");
+		}
+		entries.push_back("\"require\":" + RequireJson(s.Parens()));
+	} else if (s.Accept("roles")) {
+		if (s.Accept("from")) {
+			entries.push_back("\"roles_from\":" + JsonList(ListItems(s, "claim paths")));
+		} else {
+			s.Expect("constant");
+			entries.push_back("\"roles_constant\":" + JsonList(ListItems(s, "roles")));
+		}
+	} else if (s.Accept("role")) {
+		s.Expect("claim"); // the short form's ROLE CLAIM 'path' - one source
+		entries.push_back("\"roles_from\":" + JsonList({s.Quoted("role claim path")}));
+	} else if (s.Accept("unmapped")) {
+		if (s.Accept("ignore")) {
+			entries.push_back("\"unmapped\":\"ignore\"");
+		} else {
+			s.Expect("as");
+			s.Expect("role");
+			entries.push_back("\"unmapped\":\"as_role\"");
+		}
+	} else if (s.Accept("attributes")) {
+		if (!s.AtParen()) {
+			throw BinderException("acl admin: ATTRIBUTES takes its list in parentheses");
+		}
+		entries.push_back("\"attributes\":" + AttributesJson(s.Parens()));
+	} else if (s.Accept("claim")) {
+		s.Expect("map"); // the short form's CLAIM MAP: {"<jwt path>": "<name>"}
+		auto map = s.AtParen() ? ClaimMapToJson(s.Parens()) : s.Quoted("claim map");
+		entries.push_back("\"claim_map\":" + JsonQuote(map)); // text: parsed by the spec, never spliced
+	} else if (s.Accept("subject")) {
+		vector<string> paths;
+		if (s.AtParen()) {
+			paths = ListItems(s, "subject paths");
+		} else {
+			paths.push_back(s.Quoted("subject path"));
+		}
+		entries.push_back("\"subject\":" + JsonList(paths));
+	} else if (s.Accept("token")) {
+		s.Expect("type");
+		entries.push_back("\"token_type\":" + JsonQuote(s.Quoted("token type")));
+	} else if (s.Accept("flows")) {
+		entries.push_back("\"flows\":" + JsonList(ListItems(s, "flows")));
+	} else if (s.Accept("client")) {
+		if (s.Accept("id")) {
+			entries.push_back("\"client_id\":" + JsonQuote(s.Quoted("client id")));
+		} else if (short_form && s.Accept("from")) {
+			s.Expect("secret");
+			SecretRef(s, entries);
+		} else if (s.Accept("secret")) {
+			throw BinderException("acl admin: a client secret is never written into the policy - keep it as "
+			                      "CLIENT_SECRET in an oidc_client secret of the secrets service and name that "
+			                      "secret (%s)",
+			                      short_form ? "CLIENT FROM SECRET s" : "FROM SECRET s");
+		} else {
+			s.pos = saved;
+			return false;
+		}
+	} else if (!short_form && s.Accept("from")) {
+		s.Expect("secret");
+		SecretRef(s, entries);
+	} else if (s.Accept("keys") || s.Accept("algs")) {
+		throw BinderException("acl admin: an issuer's keys and algorithms are never written into the policy - "
+		                      "the issuer's OIDC discovery supplies them, or KEYS / KEYS_FROM / ALGS in an "
+		                      "oidc_issuer secret named with FROM SECRET");
+	} else {
+		return false;
+	}
+	return true;
+}
+
+string SpecJson(const vector<string> &entries) {
+	return "{" + StringUtil::Join(entries, ",") + "}";
+}
+
+//! CREATE [OR REPLACE] ISSUER [IF NOT EXISTS] <name | '<url>'> [URL '<url>'] [FROM SECRET s [IN c]]
+//! [client clauses] - any client clause makes it the short form, with an implicit client
+unique_ptr<SQLStatement> ParseCreateIssuer(AdminScanner &s, string mode) {
+	if (s.Accept("if")) {
+		s.Expect("not");
+		s.Expect("exists");
+		if (mode == "create") {
+			mode = "skip";
+		}
+	}
+	s.Skip();
+	bool quoted = s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"');
+	auto name = quoted ? s.Quoted("issuer") : s.Word("an issuer name");
+	vector<string> issuer_entries, client_entries;
+	bool has_url = false, has_secret = false;
+	while (!s.Done() && !s.AtSemicolon()) {
+		if (s.Accept("url")) {
+			issuer_entries.push_back("\"url\":" + JsonQuote(s.Quoted("URL")));
+			has_url = true;
+			continue;
+		}
+		auto saved = s.pos;
+		if (s.Accept("from")) {
+			s.Expect("secret");
+			SecretRef(s, issuer_entries);
+			has_secret = true;
+			continue;
+		}
+		s.pos = saved;
+		if (!ClientClause(s, client_entries, true)) {
+			throw BinderException("acl admin: unexpected \"%s\" in CREATE ISSUER", s.PeekWord());
+		}
+	}
+	if (!has_url && quoted) {
+		// the short form's name IS its URL
+		issuer_entries.push_back("\"url\":" + JsonQuote(name));
+	} else if (!has_url && !has_secret) {
+		throw BinderException("acl admin: issuer \"%s\" needs its URL - URL '<url>', or the URL as its quoted name, "
+		                      "or an oidc_issuer secret carrying it (FROM SECRET s)",
+		                      name);
+	}
+	if (!client_entries.empty()) {
+		issuer_entries.push_back("\"client\":" + SpecJson(client_entries));
+	}
+	return MakeAdminCall("acl_define_issuer", {Value(name), Value(SpecJson(issuer_entries)), Value(mode)});
+}
+
+//! CREATE [OR REPLACE] CLIENT [IF NOT EXISTS] c ISSUER i <client clauses>
+unique_ptr<SQLStatement> ParseCreateClient(AdminScanner &s, string mode) {
+	if (s.Accept("if")) {
+		s.Expect("not");
+		s.Expect("exists");
+		if (mode == "create") {
+			mode = "skip";
+		}
+	}
+	auto name = s.Name("a client name");
+	s.Expect("issuer");
+	auto issuer = s.Name("an issuer name");
+	vector<string> entries;
+	while (!s.Done() && !s.AtSemicolon()) {
+		if (!ClientClause(s, entries, false)) {
+			throw BinderException("acl admin: unexpected \"%s\" in CREATE CLIENT", s.PeekWord());
+		}
+	}
+	return MakeAdminCall("acl_define_client", {Value(name), Value(issuer), Value(SpecJson(entries)), Value(mode)});
+}
+
+//! ALTER ISSUER i SET URL '…' | SET FROM SECRET s [IN c] | DROP FROM SECRET | SET <client clause> …
+//! | DROP CLIENT FROM SECRET
+unique_ptr<SQLStatement> ParseAlterIssuer(AdminScanner &s) {
+	auto name = s.Name("an issuer name");
+	vector<string> issuer_entries, client_entries;
+	if (s.Accept("drop")) {
+		if (s.Accept("client")) {
+			s.Expect("from");
+			s.Expect("secret");
+			client_entries.push_back("\"secret\":null");
+		} else {
+			s.Expect("from");
+			s.Expect("secret");
+			issuer_entries.push_back("\"secret\":null");
+		}
+	} else {
+		s.Expect("set");
+		while (!s.Done() && !s.AtSemicolon()) {
+			if (s.Accept("url")) {
+				auto url = s.Quoted("URL");
+				issuer_entries.push_back("\"url\":" + (url.empty() ? string("null") : JsonQuote(url)));
+				continue;
+			}
+			auto saved = s.pos;
+			if (s.Accept("from")) {
+				s.Expect("secret");
+				SecretRef(s, issuer_entries);
+				continue;
+			}
+			s.pos = saved;
+			if (!ClientClause(s, client_entries, true)) {
+				throw BinderException("acl admin: unexpected \"%s\" in ALTER ISSUER", s.PeekWord());
+			}
+		}
+	}
+	if (!client_entries.empty()) {
+		issuer_entries.push_back("\"client\":" + SpecJson(client_entries));
+	}
+	if (issuer_entries.empty()) {
+		throw BinderException("acl admin: ALTER ISSUER %s changes nothing", name);
+	}
+	return MakeAdminCall("acl_alter_issuer", {Value(name), Value(SpecJson(issuer_entries))});
+}
+
+//! ALTER CLIENT c SET <client clause> … | DROP FROM SECRET
+unique_ptr<SQLStatement> ParseAlterClient(AdminScanner &s) {
+	auto name = s.Name("a client name");
+	vector<string> entries;
+	if (s.Accept("drop")) {
+		s.Expect("from");
+		s.Expect("secret");
+		entries.push_back("\"secret\":null");
+	} else {
+		s.Expect("set");
+		while (!s.Done() && !s.AtSemicolon()) {
+			if (!ClientClause(s, entries, false)) {
+				throw BinderException("acl admin: unexpected \"%s\" in ALTER CLIENT", s.PeekWord());
+			}
+		}
+	}
+	if (entries.empty()) {
+		throw BinderException("acl admin: ALTER CLIENT %s changes nothing", name);
+	}
+	return MakeAdminCall("acl_alter_client", {Value(name), Value(SpecJson(entries))});
+}
+
+//! [DROP] MAP GROUP|CLAIM '<v>' FROM CLIENT|ISSUER <name> TO ROLE r
+unique_ptr<SQLStatement> ParseMapping(AdminScanner &s, const char *function) {
+	bool is_group = s.Accept("group");
+	if (!is_group) {
+		s.Expect("claim");
+	}
+	auto external = s.Quoted("external value");
+	s.Expect("from");
+	string kind;
+	if (s.Accept("client")) {
+		kind = "client";
+	} else {
+		s.Expect("issuer");
+		kind = "issuer";
+	}
+	auto scope = s.Name(kind == "client" ? "a client name" : "an issuer name");
+	s.Expect("to");
+	s.Expect("role");
+	auto role = s.Word("a role name");
+	return MakeAdminCall(
+	    function, {Value(kind), Value(scope), Value(is_group ? "group" : "claim-value"), Value(external), Value(role)});
+}
+
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &current_session) {
 	auto keyword = s.Word("a management keyword");
 	if (StringUtil::CIEquals(keyword, "cluster")) {
@@ -969,44 +1371,11 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			}
 			return MakeAdminCall("acl_create_function_category", {Value(category), Value(comment)});
 		}
-		s.Expect("issuer");
-		auto issuer = s.Quoted("issuer");
-		s.Expect("keys");
-		// KEYS '<jwks>' pastes the document; KEYS FROM '<uri>' names where to read it (spec 023)
-		string keys, jwks_uri;
-		if (s.Accept("from")) {
-			jwks_uri = s.Quoted("a JWKS location");
-		} else {
-			keys = s.Quoted("keys");
-		}
-		string audiences, algs = "RS256", role_claim = "roles", claim_map;
-		if (s.Accept("audiences")) {
-			audiences = s.AtParen() ? ValueListToCsv(s.Parens()) : s.Quoted("audiences");
-		}
-		if (s.Accept("algs")) {
-			algs = s.AtParen() ? ValueListToCsv(s.Parens()) : s.Quoted("algs");
-		}
-		if (s.Accept("role")) {
-			s.Expect("claim");
-			role_claim = s.Quoted("role claim path");
-		}
-		if (s.Accept("claim")) {
-			s.Expect("map");
-			claim_map = s.AtParen() ? ClaimMapToJson(s.Parens()) : s.Quoted("claim map");
-		}
-		// CLIENT ID '<id>' [CLIENT SECRET '<secret>'] - the node-side OAuth client (spec 064)
-		string client_id, client_secret;
 		if (s.Accept("client")) {
-			s.Expect("id");
-			client_id = s.Quoted("a client id");
-			if (s.Accept("client")) {
-				s.Expect("secret");
-				client_secret = s.Quoted("a client secret");
-			}
+			return ParseCreateClient(s, mode);
 		}
-		return MakeAdminCall("acl_define_issuer",
-		                     {Value(issuer), Value(keys), Value(audiences), Value(algs), Value(role_claim),
-		                      Value(claim_map), Value(jwks_uri), Value(client_id), Value(client_secret)});
+		s.Expect("issuer");
+		return ParseCreateIssuer(s, mode);
 	}
 	if (StringUtil::CIEquals(keyword, "add")) {
 		if (s.Accept("view")) {
@@ -1210,19 +1579,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		return MakeAdminCall("acl_revoke_catalog", {Value(role), Value(vcat)});
 	}
 	if (StringUtil::CIEquals(keyword, "map")) {
-		bool is_group = s.Accept("group");
-		if (!is_group) {
-			s.Expect("claim");
-		}
-		auto external = s.Quoted("external value");
-		s.Expect("from");
-		s.Expect("issuer");
-		auto issuer = s.Quoted("issuer");
-		s.Expect("to");
-		s.Expect("role");
-		auto role = s.Word("a role name");
-		return MakeAdminCall("acl_map_role",
-		                     {Value(issuer), Value(is_group ? "group" : "claim-value"), Value(external), Value(role)});
+		return ParseMapping(s, "acl_map_role");
 	}
 	if (StringUtil::CIEquals(keyword, "alter")) {
 		if (s.Accept("function")) {
@@ -1249,32 +1606,11 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			auto claims = s.AtParen() ? ClaimsListToCsv(s.Parens()) : s.Quoted("claims list");
 			return MakeAdminCall("acl_alter_role", {Value(role), Value(claims)});
 		}
-		if (s.Accept("issuer")) { // ALTER ISSUER '...' SET KEYS|AUDIENCES|ALGS|ROLE CLAIM|CLAIM MAP '...'
-			auto issuer = s.Quoted("issuer");
-			s.Expect("set");
-			string field;
-			if (s.Accept("keys")) {
-				field = s.Accept("from") ? "jwks_uri" : "keys";
-			} else if (s.Accept("audiences")) {
-				field = "audiences";
-			} else if (s.Accept("algs")) {
-				field = "algs";
-			} else if (s.Accept("role")) {
-				s.Expect("claim");
-				field = "role_claim";
-			} else if (s.Accept("client")) { // SET CLIENT ID | CLIENT SECRET (spec 064)
-				if (s.Accept("id")) {
-					field = "client_id";
-				} else {
-					s.Expect("secret");
-					field = "client_secret";
-				}
-			} else {
-				s.Expect("claim");
-				s.Expect("map");
-				field = "claim_map";
-			}
-			return MakeAdminCall("acl_alter_issuer", {Value(issuer), Value(field), Value(s.Quoted("value"))});
+		if (s.Accept("issuer")) { // spec 095: ALTER ISSUER i SET … | DROP [CLIENT] FROM SECRET
+			return ParseAlterIssuer(s);
+		}
+		if (s.Accept("client")) { // spec 095: ALTER CLIENT c SET … | DROP FROM SECRET
+			return ParseAlterClient(s);
 		}
 		// ALTER GRANT CATALOG c TO ROLE r SET CAPS '…' | SET RLS '…' | SET COLUMNS '…' | SET MAIN t|f
 		if (s.Accept("grant")) {
@@ -1484,22 +1820,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		}
 		if (s.Accept("issuer")) {
 			if_exists(s);
-			return MakeAdminCall("acl_drop_issuer", {Value(s.Quoted("issuer")), Value(mode)});
+			return MakeAdminCall("acl_drop_issuer", {Value(s.Name("an issuer name")), Value(mode)});
 		}
-		if (s.Accept("map")) { // DROP MAP GROUP|CLAIM '<value>' FROM ISSUER '...' TO ROLE r
-			bool is_group = s.Accept("group");
-			if (!is_group) {
-				s.Expect("claim");
-			}
-			auto external = s.Quoted("external value");
-			s.Expect("from");
-			s.Expect("issuer");
-			auto issuer = s.Quoted("issuer");
-			s.Expect("to");
-			s.Expect("role");
-			auto role = s.Word("a role name");
-			return MakeAdminCall("acl_drop_role_mapping", {Value(issuer), Value(is_group ? "group" : "claim-value"),
-			                                               Value(external), Value(role)});
+		if (s.Accept("client")) {
+			if_exists(s);
+			return MakeAdminCall("acl_drop_client", {Value(s.Name("a client name")), Value(mode)});
+		}
+		if (s.Accept("map")) { // DROP MAP GROUP|CLAIM '<value>' FROM CLIENT|ISSUER n TO ROLE r
+			return ParseMapping(s, "acl_drop_role_mapping");
 		}
 		s.Expect("virtual");
 		if (s.Accept("catalog")) { // DROP VIRTUAL CATALOG c [CASCADE]
@@ -1574,6 +1902,9 @@ MgmtProvenance ProvenanceOf(SQLStatement &statement) {
 	    {"acl_grant_object", 1},
 	    {"acl_define_role", -1},
 	    {"acl_define_issuer", -1},
+	    {"acl_define_client", -1},
+	    {"acl_alter_client", -1},
+	    {"acl_drop_client", -1},
 	    {"acl_map_role", -1},
 	    {"acl_alter_relation", 0},
 	    {"acl_alter_schema_alias", 0},

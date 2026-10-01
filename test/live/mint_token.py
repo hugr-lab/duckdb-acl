@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mint an HS256 token for the live node's demo issuer (spec 057).
+"""Mint an RS256 token for the live node's demo issuer (specs 057, 095).
 
     test/live/mint_token.py <role>[,role2,...] [tenant] [subject]
 
@@ -8,28 +8,22 @@ Examples:
     test/live/mint_token.py viewer globex u-someone
     test/live/mint_token.py analyst,auditor acme
 
-The secret is the demo fixture's ("acl-test-hs256-secret") - matching the issuer bootstrap.sql
-defines. Edit bootstrap.sql to add roles/grants, mint a token here, paste it into the tool.
-Demo-only: real deployments use a real issuer and RS256/ES256 (spec 007).
+The key is the committed fixture key; the demo issuer (test/idp/s) publishes it through its discovery
+document, which the node reads from the repository (bootstrap.sql). Edit bootstrap.sql to add
+roles/grants, mint a token here, paste it into the tool. Demo-only: a real deployment's issuer is its
+IdP, found the same way - by discovery (spec 095).
 """
-import base64
-import hashlib
-import hmac
-import json
+import os
 import sys
 
-
-def b64(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+import idp_fixtures  # noqa: E402
 
 
 roles = (sys.argv[1] if len(sys.argv) > 1 else "analyst").split(",")
 tenant = sys.argv[2] if len(sys.argv) > 2 else "acme"
 subject = sys.argv[3] if len(sys.argv) > 3 else f"u-{tenant}"
 
-head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-body = b64(json.dumps({"iss": "https://issuer.test/s", "aud": "api://acl-test",
-                       "exp": 4102444800, "sub": subject, "roles": roles,
-                       "tid": tenant}).encode())
-sig = b64(hmac.new(b"acl-test-hs256-secret", f"{head}.{body}".encode(), hashlib.sha256).digest())
-print(f"{head}.{body}.{sig}")
+print(idp_fixtures.sign({"alg": "RS256", "typ": "JWT", "kid": "test-key"},
+                        {"iss": "test/idp/s", "aud": "api://acl-test", "exp": 4102444800, "sub": subject,
+                         "roles": roles, "tid": tenant}))

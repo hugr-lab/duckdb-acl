@@ -164,18 +164,20 @@ What the door serves, every RPC authenticated per call from the `authorization: 
   connection teardown. Use either the protocol's actions or raw `BEGIN`/`COMMIT`, not both.
 - **Session options** (spec 068): `SetSessionOptions`/`GetSessionOptions` for `TimeZone` and
   `Calendar` - see [Client-local settings](#client-local-settings-spec-068).
-- **Auth discovery** (spec 064): a `Handshake` whose payload is `discover-auth` answers, without
-  credentials, the issuers the node trusts, each issuer's `client_id` and the endpoints the IdP's own
-  OIDC discovery names (`token_endpoint`, `device_authorization_endpoint` when present). The same
-  document the quack door serves at `/.well-known/quack-auth`.
+- **Auth discovery** (spec 064, spec 095): a `Handshake` whose payload is `discover-auth` answers,
+  without credentials, the issuers the node trusts (name and URL), the endpoints the IdP's own OIDC
+  discovery names, and each issuer's clients a driver can run a flow as (`name`, `client_id`,
+  `flows`). The same document the quack door serves at `/.well-known/quack-auth`.
 - **The password handshake** (spec 064): a `Handshake` carrying `authorization: Basic <user:password>`
-  becomes the OAuth password grant, run by the node as the issuer's `CLIENT ID` (`acl_define_issuer`
-  arguments 8-9, `CREATE|ALTER ISSUER ... CLIENT ID '<id>' [CLIENT SECRET '<secret>']`). The token
+  becomes the OAuth password grant, run by the node as the one client of the node with
+  `FLOWS (password)` - several are refused rather than tried in turn, so a password goes to one IdP -
+  its client secret, if any, read from the secrets service for the call only (spec 095). The token
   the IdP answers is verified offline like any bearer and returned in the response header
   `authorization: Bearer <token>`, which stock JDBC, ADBC and pyarrow read. The node has no flow
   toggle - the IdP's refusal is the gate (`acl: the IdP at <issuer> refused the password grant: ...`).
-  It needs an issuer with a client id (`acl: no issuer here carries a CLIENT ID, so the door cannot
-  run the password grant - authenticate with a bearer token instead`) and a TLS door (`acl: the
+  It needs a client with the password flow (`acl: no client here runs the password flow (FLOWS
+  (password)), so the door cannot run the password grant - authenticate with a bearer token
+  instead`) and a TLS door (`acl: the
   password handshake needs a TLS door (acl_flight_serve with a certificate) - refused over
   cleartext`). A payload-less, header-less handshake is a no-op success (spec 058) - the per-call
   bearer stays the only authority.
@@ -411,7 +413,7 @@ report success and change nothing):
 | `acl_version_check_interval` | 1000 | milliseconds between `policy_version` re-reads of the policy catalog (`0` = every batch) |
 | `acl_jwks_refresh_interval` | 300 | seconds a fetched JWKS is used before it is read again |
 | `acl_jwks_max_stale` | 3600 | seconds a JWKS that can no longer be read may still be used; `0` = a failed read is fatal at once |
-| `acl_jwks_locations` | `https://` | prefixes a `KEYS FROM` location (and an issuer's discovery URL) may start with; refused outside them where written and where read; `''` admits none (spec 071) |
+| `acl_jwks_locations` | `https://` | prefixes every location the node reads an issuer's keys from may start with (its discovery, the JWKS, a secret's `KEYS_FROM`); `''` admits none (specs 071, 095) |
 | `acl_allow_anonymous_admin` | false | a bare `ACL ADMIN` with no principal; must be off to serve |
 
 ## Graceful shutdown (spec 066)
@@ -603,7 +605,7 @@ denied to a principal.
 - **A ready node to look at**: `test/live/serve.sh [flight|quack|all] [--tls]` seeds a demo policy
   and prints URIs and tokens; `test/live/RUNBOOK.md` walks DBeaver, ADBC and a quack client through it
   (`make serve-flight` / `serve-quack` / `serve-live`). It is a validation rig, not a deployment
-  template - its issuer is a fixture HS256 secret.
+  template - its issuer is a fixture under `test/idp/` signed with a key committed to the repository.
 
 ## Troubleshooting
 
@@ -624,7 +626,8 @@ denied to a principal.
 | client: `acl: authentication failed` | no `authorization: Bearer` header, a token that does not verify (issuer, signature, audience, `nbf`), or an expired token at session open; the door says no more by design |
 | client: `acl: node is draining - not accepting new sessions` / quack discovery `503 draining` | the node is in drain; connect to another node, or `acl_resume()` |
 | client: `acl: the password handshake needs a TLS door ...` | BasicAuth on a cleartext Flight door |
-| client: `acl: no issuer here carries a CLIENT ID ...` | no issuer has a `CLIENT ID`; add one, or use a bearer |
+| client: `acl: no client here runs the password flow ...` | no client has `FLOWS (password)` and a client id; add one, or use a bearer |
+| client: `acl: several clients run the password flow (...)` | the door cannot tell whose IdP a password is for; keep the flow on one client |
 | client: `acl: the IdP at <issuer> refused the password grant: ...` | the IdP said no (wrong password, or ROPC disabled there) |
 | client: `acl: unknown transaction ...` | a stale or foreign `transaction_id`; begin one, or omit it |
 | client: `acl: a transaction needs a connection-long session ...` / `acl: a session option needs a connection-long session ...` | the client does not echo the session cookie (ADBC: enable the cookie middleware) |

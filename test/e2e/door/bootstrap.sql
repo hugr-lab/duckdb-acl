@@ -20,9 +20,8 @@ SELECT acl_use_db('store', 'acl', true);
 
 SET GLOBAL acl_allow_anonymous_admin=true;
 
-SELECT acl_define_issuer('https://issuer.test/s',
-    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
-    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+SET GLOBAL acl_jwks_locations = 'test/idp/';  -- spec 095: the fixture issuers' discovery, read from the repository root
+SELECT acl_define_issuer('test/idp/s', '{"url": "test/idp/s", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
 
 ACL ADMIN CREATE VIRTUAL CATALOG c;
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS ${ACL_E2E_TABLE};

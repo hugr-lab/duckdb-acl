@@ -21,6 +21,7 @@ would feel.
 Usage:  test/bench/rewrite_cost.py [-n 2000] [--rows 100000] [--json out.json]
 """
 
+import os
 import argparse
 import json
 import pathlib
@@ -29,13 +30,17 @@ import sys
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+os.chdir(ROOT)  # spec 095: the fixture issuers (test/idp/) are read relative to the repository root
 BUILD = ROOT / "build" / "release"
 
-# A verified HS256 token for the seeded issuer; the session mode opens a handle with it.
+# A verified RS256 token for the seeded issuer (test/idp/s, the committed fixture key); the session mode opens a handle with it.
 TOKEN = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-    "eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1hY21lIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0."
-    "vzPJbHXAXfczhZwQp183JaaBLlSRSipNsSqwxoIFfng"
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtYWNtZSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNt"
+    "ZSJ9.UV5-WWUpQLp-Em8K2yLLkz-NEJgOyTAn9i9B1zpBWF3hNQVgorAVPVK48bxnrMiMm7NabgM3g945lDY31DFwxNeUKnVEe0Q"
+    "dRy1d1KbFh8td3Ak_mepOZ35CjPektGaOjVEpjUFxZUOj_uxYnse_y660xC0stlY8zxDrpSjNCOZRGv-vaxITv7ggOIDYAN07rmP"
+    "ntKe9oOYsb5g0ZkFcIEsKuHuXsL8z1crko6vIZzT9ido-xrph_WEejO5lKaPIxVe1QrB1-C5DUp8D8fnLWMJ3g426VNKWJwUyeSg"
+    "h_nq1XzLyR8WcLchBQwaFAzkGivmLFmDdrDS7VUy49I8uLw"
 )
 
 
@@ -70,9 +75,8 @@ CREATE TABLE phys.main.orders AS
 ATTACH ':memory:' AS store;
 SELECT acl_use_db('store', 'acl', true);
 SET GLOBAL acl_allow_anonymous_admin=true;
-SELECT acl_define_issuer('https://issuer.test/s',
-    '{{"keys":[{{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}}]}}',
-    'api://acl-test', 'HS256', 'roles', '{{"tid": "tenant"}}');
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+SELECT acl_define_issuer('test/idp/s', '{{"url": "test/idp/s", "client": {{"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {{"tid": "tenant"}}}}}}');
 ACL ADMIN CREATE VIRTUAL CATALOG c;
 ACL ADMIN CREATE VIRTUAL TABLE c.plain AS phys.main.orders;
 ACL ADMIN CREATE VIRTUAL TABLE c.guarded AS phys.main.orders;

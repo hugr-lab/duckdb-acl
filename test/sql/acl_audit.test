@@ -7,6 +7,10 @@
 require acl
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS store;
 
 statement ok
@@ -22,9 +26,7 @@ statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
 statement ok
-SELECT acl_define_issuer('https://issuer.test/s',
-    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
-    'api://acl-test', 'HS256', 'roles', '{"tid": "tenant"}');
+SELECT acl_define_issuer('test/idp/s', '{"url": "test/idp/s", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
 
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG c;
@@ -52,7 +54,7 @@ statement ok
 SET GLOBAL acl_audit_level='decisions';
 
 query I
-SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc') IS NOT NULL;
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A') IS NOT NULL;
 ----
 true
 
@@ -74,7 +76,7 @@ statement ok
 SET GLOBAL acl_audit_level='all';
 
 statement ok
-SET VARIABLE h = (SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc'));
+SET VARIABLE h = (SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A'));
 
 statement ok
 SELECT acl_session_close(getvariable('h'));
@@ -95,7 +97,7 @@ session	client	allowed	session	u	true
 query IIII
 SELECT node, level, roles, issuer FROM acl_audit_events() WHERE detail = 'opened';
 ----
-node-under-test	all	[analyst]	https://issuer.test/s
+node-under-test	all	[analyst]	test/idp/s
 
 # --- the counters are a state of the node: they count whatever the level recorded -----------------
 # three opens succeeded (one unrecorded at `decisions`), one was refused
@@ -175,7 +177,7 @@ SELECT acl_audit_dropped();
 # --- the operator's per-session level: that session's later events follow it ---------------------
 
 statement ok
-SET VARIABLE h2 = (SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc'));
+SET VARIABLE h2 = (SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A'));
 
 statement ok
 SELECT acl_audit_flush();
@@ -254,7 +256,7 @@ statement ok
 SELECT acl_session_open('not-a-jwt');
 
 statement ok
-SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc');
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
 
 statement ok
 SELECT acl_audit_flush();
@@ -264,7 +266,7 @@ SELECT acl_audit_flush();
 query IIII
 SELECT content LIKE '{"ts_us":%',
        content LIKE '%"kind":"session","statement":"","objects":[],"verdict":"denied","reason_code":"principal"%',
-       content LIKE '%"subject":"u","issuer":"https://issuer.test/s","roles":["analyst"],"kind":"session"%',
+       content LIKE '%"subject":"u","issuer":"test/idp/s","roles":["analyst"],"kind":"session"%',
        content LIKE '%"detail":"opened"}' || chr(10)
 FROM read_text('__TEST_DIR__/audit.jsonl');
 ----
@@ -385,7 +387,7 @@ acl_rewrite: the statement did not parse (its text is not recorded)
 # the issuer of a token nobody verified is the caller's to make up: quoted values of a principal
 # refusal are blanked before the event
 statement error
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2V2aWwuZXhhbXBsZSIsInN1YiI6IngiLCJleHAiOjQxMDI0NDQ4MDAsInJvbGVzIjpbImFuYWx5c3QiXX0.c2ln' SELECT 1;
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ldmlsIiwic3ViIjoieCIsImV4cCI6NDEwMjQ0NDgwMCwicm9sZXMiOlsiYW5hbHlzdCJdfQ.qir1xcw6ys7UpdQ_nz8miZb8edHl28ZcY7-V5anPClz0ci5EyAe0foHL8rgBpNLB_5FQ6v5IaHJpqIVl4Z8NP4B2qNsa0T6oybvBNYPZVIN-bjbWLgkL6e9vHtThYUQKHgZTFtOn238Jadz_1n91R2OsEzSxv0-xbZ1zGYu2LQ6k1GSMIOl-CEbpAZaTMkHdBLnUFx4P5XAlQJrP20OKFULJTzmj1Cm5nYM9PqOv1AsuL9G8SvH4PzRJkKKUY6YMfMyM42jbqxs3eUMiNh7DyDQC_w0MsYKrK2N_tajiU-DYQEOgH6mg8mfoymPOBOhfPKbgWHAvseB-Zy0ZEmBGEQ' SELECT 1;
 ----
 <REGEX>:.*unknown issuer.*
 
@@ -457,7 +459,7 @@ statement ok
 SET acl_correlation_id = 'corr-7';
 
 statement ok
-SET VARIABLE h3 = (SELECT acl_session_open('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.c_RJ0X6_Gj5O5Z273KOaB9e11XFXVgQkEbtTCayEzJc'));
+SET VARIABLE h3 = (SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A'));
 
 query I
 SELECT acl_session_sql(getvariable('h3'), 'SELECT 1') LIKE 'ACL SESSION ''%'' TRACE ''corr-7'' SELECT 1';
@@ -584,20 +586,13 @@ SELECT value >= 1 FROM acl_metrics() WHERE name = 'acl.policy.reloads';
 ----
 true
 
-# an issuer's keys read from a document (spec 023): the read is a `keys` event naming the issuer
+# an issuer's keys found by its discovery (specs 023, 095): each document read - the discovery
+# document, then the JWKS it names - is a `keys` event naming the issuer
 statement ok
-SET GLOBAL acl_jwks_locations = 'https://, __TEST_DIR__/';
-
-statement ok
-COPY (SELECT '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}' AS c)
-    TO '__TEST_DIR__/audit_jwks.json' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
-
-statement ok
-ACL ADMIN CREATE ISSUER 'https://issuer.test/hs' KEYS FROM '__TEST_DIR__/audit_jwks.json'
-    AUDIENCES ('api://acl-test') ALGS (HS256) ROLE CLAIM 'roles';
+ACL ADMIN CREATE ISSUER 'test/idp/hs' AUDIENCES ('api://acl-test') ROLE CLAIM 'roles';
 
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ocyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1OCIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.f_22iWgOfKOinI0BsmJw0l-QXWaSE1jjvFuyM2PH1Nn94UIHH-9gC9ENG11zz7HO5f-ylp71Vo4qYSQw0uE_Zs12HTwd7ZMlP89fLHML1Ytc8PXmr4KooxUWYhHOWUGOnLPjV523aoUbGoquds1jdiOIvZNwGkcPjbfuNapyM4WiQ8VKbIRHwqhaqkTdEEM-EnViQBwzy2ae9FC50Mog8RVcMY6nQyO7-mpsFHR51rtjzsDcRNPsczZQWnaRVpKT2vW5fGkn0tXjjT3hzsQnKnWiobvtPAqrwKvQ6KC5NHtiwaecr12KpgiDpWV7InhJPEjwMIYvnXd1sKo41zd59Q' SELECT 1 AS ok;
 ----
 1
 
@@ -607,17 +602,18 @@ SELECT acl_audit_flush();
 query IIII
 SELECT kind, detail, verdict, objects FROM acl_audit_events() WHERE kind = 'keys' ORDER BY seq;
 ----
-keys	refreshed	allowed	[{'name': 'https://issuer.test/hs', 'capability': keys}]
+keys	refreshed	allowed	[{'name': test/idp/hs, 'capability': keys}]
+keys	refreshed	allowed	[{'name': test/idp/hs, 'capability': keys}]
 
-# repointed at a document that is not there: the read fails, and the token is refused as
-# source_error - the source of the keys, not the principal, is what failed
+# an issuer whose discovery is not there: the read fails, and the token is refused as source_error -
+# the source of the keys, not the principal, is what failed
 statement ok
-ACL ADMIN ALTER ISSUER 'https://issuer.test/hs' SET KEYS FROM '__TEST_DIR__/missing_jwks.json';
+ACL ADMIN CREATE ISSUER 'test/idp/nodoc' AUDIENCES ('api://acl-test') ROLE CLAIM 'roles';
 
 statement error
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L2hzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InU4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0.GAd8icsdg891l7-NVJ8bBuz01d2M2nyNU6uGT6FradM' SELECT 1 AS ok;
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ub2RvYyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1OCIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.gTabrAyoSoIzRQ45VMpD0INNt9LGqjEU2DSe8N5B2USQK9TaojigwrJbQpSyyE41GTgnYonVD7m73Bjib5S7HNm-cKjCSOosUSBn_hPzDWr3GaAYORk7A13n_RI-EABRF9wS6RdlAnQCly3YHOSMaseILx7Q19tiP7REUFk3z0HT0KgQXmvoRMvgvHo-okQOmpGa462B8D3MBVz8FEHNEz2nnD0S7krQ59SiIiSXdFT5o9F_WMnmjwvKumMoe2a0eUJVdO_QklrKNV53FQjG-Bxt9ioqX6bj8XZ2jN5vt5MXqV3cJUuuXVuFIE3uNHkV1Ob8dMbHuPpF6Xf5G06JAg' SELECT 1 AS ok;
 ----
-<REGEX>:.*could not be read.*
+<REGEX>:.*could not read.*
 
 statement ok
 SELECT acl_audit_flush();

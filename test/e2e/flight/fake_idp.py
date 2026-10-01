@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """A fake OIDC IdP for the auth e2e (spec 064): discovery + a password grant.
 
-Answers /.well-known/openid-configuration and /token. alice/wonder (and bob/builder, whose
-'bob:builder' is 11 bytes: base64 with padding, spec 089) earns an HS256
-token signed with the same oct key the door's issuer trusts; a wrong password is
-invalid_grant; the user 'noropc' models an IdP that has the password flow off
-(unsupported_grant_type). Stdlib only - the point is that nothing here shares
-code with the door.
+Answers /.well-known/openid-configuration, /jwks and /token. alice/wonder (and bob/builder, whose
+'bob:builder' is 11 bytes: base64 with padding, spec 089) earns an RS256 token signed with the
+committed fixture key; the door finds the key itself, through this discovery's jwks_uri (spec 095),
+like it does with a real IdP. A wrong password is invalid_grant; the user 'noropc' models an IdP that
+has the password flow off (unsupported_grant_type). Stdlib and the openssl CLI only - the point is
+that nothing here shares code with the door.
 """
 import base64
-import hashlib
-import hmac
 import json
+import os
+import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -19,7 +19,9 @@ from urllib.parse import parse_qs
 
 BASE = sys.argv[1]          # the issuer URL the door was configured with, e.g. http://localhost:32795
 PORT = int(sys.argv[2])
-SECRET = b"acl-test-hs256-secret"  # base64url: YWNsLXRlc3QtaHMyNTYtc2VjcmV0
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+KEY = os.path.join(ROOT, "test", "scripts", "fixtures", "rs256_key.pem")
+JWKS = json.load(open(os.path.join(ROOT, "test", "idp", "rs", "jwks.json")))
 
 
 def b64url(raw: bytes) -> bytes:
@@ -27,13 +29,14 @@ def b64url(raw: bytes) -> bytes:
 
 
 def mint(sub: str) -> str:
-    header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "test-key"}).encode())
     claims = b64url(json.dumps({
         "iss": BASE, "aud": "api://acl-test", "exp": int(time.time()) + 3600,
         "sub": sub, "roles": ["analyst"], "tid": "acme",
     }).encode())
     signing = header + b"." + claims
-    sig = b64url(hmac.new(SECRET, signing, hashlib.sha256).digest())
+    sig = b64url(subprocess.run(["openssl", "dgst", "-sha256", "-sign", KEY], input=signing,
+                                capture_output=True, check=True).stdout)
     return (signing + b"." + sig).decode()
 
 
@@ -55,7 +58,11 @@ class Handler(BaseHTTPRequestHandler):
                 "issuer": BASE,
                 "token_endpoint": BASE + "/token",
                 "device_authorization_endpoint": BASE + "/device",
+                "jwks_uri": BASE + "/jwks",
+                "id_token_signing_alg_values_supported": ["RS256"],
             })
+        elif self.path == "/jwks":
+            self._json(200, JWKS)
         else:
             self._json(404, {"error": "not_found"})
 

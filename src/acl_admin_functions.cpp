@@ -11,6 +11,8 @@
 #include "duckdb/main/config.hpp"
 #include "yyjson.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 namespace acl {
 namespace {
@@ -1212,19 +1214,6 @@ void AclAlterGrantFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_alter_issuer(issuer, field, value): field is keys | jwks_uri | audiences | algs | role_claim |
-//! claim_map | client_id | client_secret. `keys` and `jwks_uri` are alternatives, so setting either
-//! clears the other; an empty client value clears that credential (spec 064).
-void AclAlterIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto issuer = RequiredArg(args, 0, row, "acl_alter_issuer", "issuer");
-		auto field = StringUtil::Lower(RequiredArg(args, 1, row, "acl_alter_issuer", "property"));
-		auto value = OptionalArg(args, 2, row, "");
-		StoreOf(state).CatalogAlterIssuer(issuer, field, value);
-	}
-	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
-}
-
 //! acl_comment(vcat, vname, kind, column, comment): document a virtual object or one of its columns
 void AclCommentFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -1315,28 +1304,6 @@ void AclDropRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-void AclDropIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto issuer = RequiredArg(args, 0, row, "acl_drop_issuer", "issuer");
-		auto &store = StoreOf(state);
-		if (AllowDrop(store, "", issuer, "issuer", OptionalArg(args, 1, row, ""))) {
-			store.CatalogDropIssuer(issuer);
-		}
-	}
-	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
-}
-
-void AclDropRoleMappingFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto issuer = RequiredArg(args, 0, row, "acl_drop_role_mapping", "issuer");
-		auto source = RequiredArg(args, 1, row, "acl_drop_role_mapping", "source");
-		auto external = RequiredArg(args, 2, row, "acl_drop_role_mapping", "external value");
-		auto role = RequiredArg(args, 3, row, "acl_drop_role_mapping", "role");
-		StoreOf(state).CatalogDropRoleMapping(issuer, source, external, role);
-	}
-	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
-}
-
 //! acl_grant_admin(role, scope): a GLOBAL administration scope (spec 009) - 'manage' (the management
 //! grammar over every catalog, plus the statements that belong to no catalog) or 'passthrough'
 //! (anything, including native SQL - god mode). Managing ONE catalog is not granted here: it is a
@@ -1358,50 +1325,367 @@ void AclRevokeAdminFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_define_issuer(issuer, keys_json, audiences_csv, algs_csv, role_claim, claim_map_json[, jwks_uri
-//! [, client_id[, client_secret]]]): register an offline JWT issuer (spec 007). keys_json is a JWKS
-//! (RSA n/e, EC x/y, oct k) or a PEM public key; jwks_uri (spec 023) names a document to read them
-//! from instead - an https URL or a file an operator refreshes. Exactly one of the two carries the
-//! keys. client_id (spec 064) is the app registration the node runs the password grant as and what
-//! auth discovery advertises; client_secret only for a confidential client.
+//! What CREATE promises about an object that exists (spec 013): create refuses, replace overwrites,
+//! skip keeps it
+void IdentityMode(const string &mode, bool exists, const char *kind, const string &name, bool &write) {
+	write = true;
+	if (!exists) {
+		return;
+	}
+	if (mode == "skip") {
+		write = false;
+		return;
+	}
+	if (mode != "replace") {
+		throw BinderException("acl admin: %s \"%s\" already exists - CREATE OR REPLACE to overwrite it, or ALTER it",
+		                      kind, name);
+	}
+}
+
+//! The implicit client of an issuer's short form (spec 095 §6): named after the issuer, unmapped
+//! values that name a role are that role, and - unless FLOWS says otherwise - a public client id runs
+//! the drivers' flows (authcode, device) and a confidential one the door's password grant. Defaults
+//! apply when the client is created, never on a later ALTER: an operator's `FLOWS ()` stays empty.
+void ApplyImplicitClient(PolicyStore &store, IdentityModel &model, const IdentityIssuer &issuer,
+                         const string &client_spec) {
+	IdentityClient *client = nullptr;
+	for (auto &existing : model.clients) {
+		if (StringUtil::CIEquals(existing.issuer, issuer.name) && existing.implicit) {
+			client = &existing;
+		}
+	}
+	bool fresh = client == nullptr;
+	if (fresh) {
+		IdentityClient created;
+		created.name = issuer.name;
+		created.issuer = issuer.name;
+		created.implicit = true;
+		created.unmapped_as_role = true;
+		created.roles_from = {"roles"};
+		model.clients.push_back(std::move(created));
+		client = &model.clients.back();
+	}
+	case_insensitive_set_t written;
+	ApplyClientSpec(*client, client_spec, &written);
+	if (!fresh || written.count("flows")) {
+		return;
+	}
+	string client_id = client->client_id;
+	bool confidential = false;
+	if (!client->secret.empty()) {
+		case_insensitive_map_t<string> fields;
+		if (store.ReadIdentitySecret(client->secret_service.empty() ? store.SecretService("") : client->secret_service,
+		                             client->secret, "oidc_client", fields)) {
+			auto id = fields.find("client_id");
+			if (id != fields.end() && !id->second.empty()) {
+				client_id = id->second;
+			}
+			auto secret = fields.find("client_secret");
+			confidential = secret != fields.end() && !secret->second.empty();
+		}
+	}
+	if (!client_id.empty()) {
+		client->flows = confidential ? vector<string> {"password"} : vector<string> {"authcode", "device"};
+	}
+}
+
+//! acl_define_issuer(name, spec_json[, mode]) (spec 095): an issuer - {"url", "secret", "service"} -
+//! and, when the spec carries "client", its implicit client (the short form). mode: create (refuse an
+//! existing one) | replace | skip.
 void AclDefineIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		IssuerConfig config;
-		config.issuer = RequiredArg(args, 0, row, "acl_define_issuer", "issuer");
-		config.keys_json = OptionalArg(args, 1, row, "");
-		config.jwks_uri = OptionalArg(args, 6, row, "");
-		if (config.keys_json.empty() == config.jwks_uri.empty()) {
-			throw BinderException("acl_define_issuer: an issuer carries its keys either as a document or as a "
-			                      "location to read one from, and must state exactly one of them");
-		}
-		for (auto &aud : SplitCsv(OptionalArg(args, 2, row, ""))) {
-			config.audiences.push_back(aud);
-		}
-		for (auto &alg : SplitCsv(OptionalArg(args, 3, row, "RS256"))) {
-			config.algs.insert(alg);
-		}
-		config.role_claim = OptionalArg(args, 4, row, "roles");
-		config.claim_map = OptionalArg(args, 5, row, "");
-		config.client_id = OptionalArg(args, 7, row, "");
-		config.client_secret = OptionalArg(args, 8, row, "");
-		if (!config.client_secret.empty() && config.client_id.empty()) {
-			throw BinderException("acl_define_issuer: a client_secret without a client_id authenticates "
-			                      "nothing - state the client_id it belongs to");
-		}
-		StoreOf(state).DefineIssuer(std::move(config));
+		auto name = RequiredArg(args, 0, row, "acl_define_issuer", "issuer");
+		auto spec = OptionalArg(args, 1, row, "");
+		auto mode = OptionalArg(args, 2, row, "replace");
+		auto &store = StoreOf(state);
+		store.EditIdentity("acl_define_issuer", [&](IdentityModel &model) {
+			bool write = true;
+			IdentityMode(mode, model.Issuer(name) != nullptr, "issuer", name, write);
+			if (!write) {
+				return;
+			}
+			// a replaced issuer starts over, like a dropped one: its implicit client and the mappings scoped
+			// to the issuer or to that client go (explicit clients stay, with theirs) - a replace may point
+			// the name at another IdP, where the old values mean nothing
+			model.mappings.erase(std::remove_if(model.mappings.begin(), model.mappings.end(),
+			                                    [&](const IdentityMapping &m) {
+				                                    return StringUtil::CIEquals(m.scope_name, name) &&
+				                                           (m.scope_kind == "issuer" ||
+				                                            (m.scope_kind == "client" && model.Client(name) &&
+				                                             model.Client(name)->implicit));
+			                                    }),
+			                     model.mappings.end());
+			model.issuers.erase(
+			    std::remove_if(model.issuers.begin(), model.issuers.end(),
+			                   [&](const IdentityIssuer &i) { return StringUtil::CIEquals(i.name, name); }),
+			    model.issuers.end());
+			model.clients.erase(std::remove_if(model.clients.begin(), model.clients.end(),
+			                                   [&](const IdentityClient &c) {
+				                                   return c.implicit && StringUtil::CIEquals(c.issuer, name);
+			                                   }),
+			                    model.clients.end());
+			IdentityIssuer issuer;
+			issuer.name = name;
+			string client_spec;
+			ApplyIssuerSpec(issuer, spec, client_spec);
+			model.issuers.push_back(issuer);
+			if (!client_spec.empty()) {
+				ApplyImplicitClient(store, model, issuer, client_spec);
+			}
+		});
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_map_role(issuer, source, external_value, role): map a claim value or an EntraID group GUID
-//! to an internal role; one external value may map to several roles
+//! acl_alter_issuer(name, spec_json): change an existing issuer - the keys present set, a null
+//! clears; "client" changes (or starts) its implicit client
+void AclAlterIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto name = RequiredArg(args, 0, row, "acl_alter_issuer", "issuer");
+		auto spec = RequiredArg(args, 1, row, "acl_alter_issuer", "spec");
+		auto &store = StoreOf(state);
+		store.EditIdentity("acl_alter_issuer", [&](IdentityModel &model) {
+			IdentityIssuer *issuer = nullptr;
+			for (auto &existing : model.issuers) {
+				if (StringUtil::CIEquals(existing.name, name)) {
+					issuer = &existing;
+				}
+			}
+			if (!issuer) {
+				throw BinderException("acl admin: issuer \"%s\" does not exist", name);
+			}
+			string client_spec;
+			ApplyIssuerSpec(*issuer, spec, client_spec);
+			if (!client_spec.empty()) {
+				ApplyImplicitClient(store, model, *issuer, client_spec);
+			}
+		});
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_drop_issuer(name[, mode]): the issuer, its implicit client and the mappings scoped to either;
+//! refused while an explicit client names it
+void AclDropIssuerFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto name = RequiredArg(args, 0, row, "acl_drop_issuer", "issuer");
+		auto mode = OptionalArg(args, 1, row, "");
+		StoreOf(state).EditIdentity("acl_drop_issuer", [&](IdentityModel &model) {
+			if (!model.Issuer(name)) {
+				if (mode == "skip") {
+					return;
+				}
+				throw BinderException("acl admin: issuer \"%s\" does not exist", name);
+			}
+			case_insensitive_set_t gone_clients;
+			for (auto &client : model.clients) {
+				if (!StringUtil::CIEquals(client.issuer, name)) {
+					continue;
+				}
+				if (!client.implicit) {
+					throw BinderException("acl admin: issuer \"%s\" still has client \"%s\" - drop the client first",
+					                      name, client.name);
+				}
+				gone_clients.insert(client.name);
+			}
+			model.mappings.erase(
+			    std::remove_if(model.mappings.begin(), model.mappings.end(),
+			                   [&](const IdentityMapping &m) {
+				                   return (m.scope_kind == "issuer" && StringUtil::CIEquals(m.scope_name, name)) ||
+				                          (m.scope_kind == "client" && gone_clients.count(m.scope_name));
+			                   }),
+			    model.mappings.end());
+			model.clients.erase(std::remove_if(model.clients.begin(), model.clients.end(),
+			                                   [&](const IdentityClient &c) { return gone_clients.count(c.name) > 0; }),
+			                    model.clients.end());
+			model.issuers.erase(
+			    std::remove_if(model.issuers.begin(), model.issuers.end(),
+			                   [&](const IdentityIssuer &i) { return StringUtil::CIEquals(i.name, name); }),
+			    model.issuers.end());
+		});
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_define_client(name, issuer, spec_json[, mode]) (spec 095): which tokens of the issuer count and
+//! what they become. An explicit client keeps unmapped values out (UNMAPPED IGNORE) unless it says so.
+void AclDefineClientFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto name = RequiredArg(args, 0, row, "acl_define_client", "client");
+		auto issuer = RequiredArg(args, 1, row, "acl_define_client", "issuer");
+		auto spec = OptionalArg(args, 2, row, "");
+		auto mode = OptionalArg(args, 3, row, "replace");
+		StoreOf(state).EditIdentity("acl_define_client", [&](IdentityModel &model) {
+			auto existing = model.Client(name);
+			if (existing && existing->implicit) {
+				throw BinderException("acl admin: \"%s\" is the client of issuer \"%s\"'s short form - ALTER ISSUER "
+				                      "changes it",
+				                      name, existing->issuer);
+			}
+			bool write = true;
+			IdentityMode(mode, existing != nullptr, "client", name, write);
+			if (!write) {
+				return;
+			}
+			if (existing && !StringUtil::CIEquals(existing->issuer, issuer)) {
+				// a client moved to another issuer starts without mappings: a group id or a claim value
+				// means something only at the IdP it came from
+				model.mappings.erase(std::remove_if(model.mappings.begin(), model.mappings.end(),
+				                                    [&](const IdentityMapping &m) {
+					                                    return m.scope_kind == "client" &&
+					                                           StringUtil::CIEquals(m.scope_name, name);
+				                                    }),
+				                     model.mappings.end());
+			}
+			model.clients.erase(
+			    std::remove_if(model.clients.begin(), model.clients.end(),
+			                   [&](const IdentityClient &c) { return StringUtil::CIEquals(c.name, name); }),
+			    model.clients.end());
+			auto anchor = model.Issuer(issuer);
+			if (!anchor) {
+				throw BinderException("acl admin: issuer \"%s\" does not exist", issuer);
+			}
+			IdentityClient client;
+			client.name = name;
+			client.issuer = anchor->name;
+			ApplyClientSpec(client, spec);
+			model.clients.push_back(std::move(client));
+		});
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_alter_client(name, spec_json): change an existing explicit client
+void AclAlterClientFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto name = RequiredArg(args, 0, row, "acl_alter_client", "client");
+		auto spec = RequiredArg(args, 1, row, "acl_alter_client", "spec");
+		StoreOf(state).EditIdentity("acl_alter_client", [&](IdentityModel &model) {
+			for (auto &client : model.clients) {
+				if (!StringUtil::CIEquals(client.name, name)) {
+					continue;
+				}
+				if (client.implicit) {
+					throw BinderException("acl admin: \"%s\" is the client of issuer \"%s\"'s short form - ALTER "
+					                      "ISSUER changes it",
+					                      name, client.issuer);
+				}
+				ApplyClientSpec(client, spec);
+				return;
+			}
+			throw BinderException("acl admin: client \"%s\" does not exist", name);
+		});
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_drop_client(name[, mode]): an explicit client and the mappings scoped to it
+void AclDropClientFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto name = RequiredArg(args, 0, row, "acl_drop_client", "client");
+		auto mode = OptionalArg(args, 1, row, "");
+		StoreOf(state).EditIdentity("acl_drop_client", [&](IdentityModel &model) {
+			auto existing = model.Client(name);
+			if (!existing) {
+				if (mode == "skip") {
+					return;
+				}
+				throw BinderException("acl admin: client \"%s\" does not exist", name);
+			}
+			if (existing->implicit) {
+				throw BinderException("acl admin: \"%s\" is the client of issuer \"%s\"'s short form - DROP ISSUER "
+				                      "removes it",
+				                      name, existing->issuer);
+			}
+			model.mappings.erase(std::remove_if(model.mappings.begin(), model.mappings.end(),
+			                                    [&](const IdentityMapping &m) {
+				                                    return m.scope_kind == "client" &&
+				                                           StringUtil::CIEquals(m.scope_name, name);
+			                                    }),
+			                     model.mappings.end());
+			model.clients.erase(
+			    std::remove_if(model.clients.begin(), model.clients.end(),
+			                   [&](const IdentityClient &c) { return StringUtil::CIEquals(c.name, name); }),
+			    model.clients.end());
+		});
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! The scope a mapping is written under, normalised: client | issuer, and the object's own name
+void MappingScope(const IdentityModel &model, const string &kind_in, const string &name_in, string &kind,
+                  string &name) {
+	kind = StringUtil::Lower(kind_in);
+	if (kind == "client") {
+		auto client = model.Client(name_in);
+		if (!client) {
+			throw BinderException("acl admin: client \"%s\" does not exist", name_in);
+		}
+		name = client->name;
+	} else if (kind == "issuer") {
+		auto issuer = model.Issuer(name_in);
+		if (!issuer) {
+			throw BinderException("acl admin: issuer \"%s\" does not exist", name_in);
+		}
+		name = issuer->name;
+	} else {
+		throw BinderException("acl admin: a mapping is scoped to a client or an issuer, not \"%s\"", kind_in);
+	}
+}
+
+//! acl_map_role(scope_kind, scope_name, source, external_value, role) (spec 095): map a claim value or
+//! a group id to a role, for one client or every client of one issuer; one value may map to several
 void AclMapRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto issuer = RequiredArg(args, 0, row, "acl_map_role", "issuer");
-		auto source = RequiredArg(args, 1, row, "acl_map_role", "source");
-		auto external = RequiredArg(args, 2, row, "acl_map_role", "external value");
-		auto role = RequiredArg(args, 3, row, "acl_map_role", "role");
-		StoreOf(state).MapRole(issuer, source, external, role);
+		auto kind = RequiredArg(args, 0, row, "acl_map_role", "scope kind");
+		auto scope = RequiredArg(args, 1, row, "acl_map_role", "scope");
+		auto source = RequiredArg(args, 2, row, "acl_map_role", "source");
+		auto external = RequiredArg(args, 3, row, "acl_map_role", "external value");
+		auto role = RequiredArg(args, 4, row, "acl_map_role", "role");
+		StoreOf(state).EditIdentity("acl_map_role", [&](IdentityModel &model) {
+			IdentityMapping mapping;
+			MappingScope(model, kind, scope, mapping.scope_kind, mapping.scope_name);
+			mapping.source = source;
+			mapping.external_value = external;
+			mapping.role = role;
+			for (auto &existing : model.mappings) {
+				if (existing.scope_kind == mapping.scope_kind &&
+				    StringUtil::CIEquals(existing.scope_name, mapping.scope_name) && existing.source == source &&
+				    existing.external_value == external && StringUtil::CIEquals(existing.role, role)) {
+					return; // already mapped
+				}
+			}
+			model.mappings.push_back(std::move(mapping));
+		});
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_drop_role_mapping(scope_kind, scope_name, source, external_value, role)
+void AclDropRoleMappingFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto kind = RequiredArg(args, 0, row, "acl_drop_role_mapping", "scope kind");
+		auto scope = RequiredArg(args, 1, row, "acl_drop_role_mapping", "scope");
+		auto source = RequiredArg(args, 2, row, "acl_drop_role_mapping", "source");
+		auto external = RequiredArg(args, 3, row, "acl_drop_role_mapping", "external value");
+		auto role = RequiredArg(args, 4, row, "acl_drop_role_mapping", "role");
+		StoreOf(state).EditIdentity("acl_drop_role_mapping", [&](IdentityModel &model) {
+			string scope_kind, scope_name;
+			MappingScope(model, kind, scope, scope_kind, scope_name);
+			auto before = model.mappings.size();
+			model.mappings.erase(std::remove_if(model.mappings.begin(), model.mappings.end(),
+			                                    [&](const IdentityMapping &m) {
+				                                    return m.scope_kind == scope_kind &&
+				                                           StringUtil::CIEquals(m.scope_name, scope_name) &&
+				                                           m.source == source && m.external_value == external &&
+				                                           StringUtil::CIEquals(m.role, role);
+			                                    }),
+			                     model.mappings.end());
+			if (model.mappings.size() == before) {
+				throw BinderException("acl admin: no mapping of %s \"%s\" from %s \"%s\" to role \"%s\"", source,
+				                      external, scope_kind, scope_name, role);
+			}
+		});
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -1654,7 +1938,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_drop_function", {{v, v, v}, {v, v, v, v}}, AclDropFunctionFunc);
 	register_admin_set("acl_drop_role", {{v}, {v, v}}, AclDropRoleFunc);
 	register_admin_set("acl_drop_issuer", {{v}, {v, v}}, AclDropIssuerFunc);
-	register_admin("acl_drop_role_mapping", {v, v, v, v}, AclDropRoleMappingFunc);
+	register_admin("acl_drop_role_mapping", {v, v, v, v, v}, AclDropRoleMappingFunc);
 	// spec 022: declared join paths
 	register_admin_set("acl_add_reference",
 	                   {{v, v, v, v},
@@ -1763,11 +2047,12 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);
 	register_admin_set("acl_define_role", {{v, v}, {v, v, v}}, AclDefineRoleFunc);
 	// offline JWT verification (spec 007)
-	register_admin_set(
-	    "acl_define_issuer",
-	    {{v, v, v, v, v, v}, {v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v}, {v, v, v, v, v, v, v, v, v}},
-	    AclDefineIssuerFunc);
-	register_admin("acl_map_role", {v, v, v, v}, AclMapRoleFunc);
+	// issuers, clients and scoped role mappings (spec 095)
+	register_admin_set("acl_define_issuer", {{v}, {v, v}, {v, v, v}}, AclDefineIssuerFunc);
+	register_admin_set("acl_define_client", {{v, v}, {v, v, v}, {v, v, v, v}}, AclDefineClientFunc);
+	register_admin("acl_alter_client", {v, v}, AclAlterClientFunc);
+	register_admin_set("acl_drop_client", {{v}, {v, v}}, AclDropClientFunc);
+	register_admin("acl_map_role", {v, v, v, v, v}, AclMapRoleFunc);
 	// ALTER of existing objects (spec 009)
 	register_admin("acl_alter_relation", {v, v, v, v}, AclAlterRelationFunc);
 	register_admin("acl_alter_schema_alias", {v, v, v}, AclAlterSchemaAliasFunc);
@@ -1775,7 +2060,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_alter_catalog", {v, v}, AclAlterCatalogFunc);
 	register_admin("acl_alter_role", {v, v}, AclAlterRoleFunc);
 	register_admin("acl_alter_grant", {v, v, v, v}, AclAlterGrantFunc);
-	register_admin("acl_alter_issuer", {v, v, v}, AclAlterIssuerFunc);
+	register_admin("acl_alter_issuer", {v, v}, AclAlterIssuerFunc);
 	// ACL administration scopes (spec 009)
 	register_admin("acl_grant_admin", {v, v}, AclGrantAdminFunc);
 	register_admin("acl_revoke_admin", {v}, AclRevokeAdminFunc);

@@ -6,6 +6,7 @@
 #pragma once
 
 #include "acl_function_categories.hpp"
+#include "acl_identity.hpp"
 #include "acl_principal.hpp"
 #include "acl_session_hooks.hpp"
 #include "acl_stream_budget.hpp"
@@ -21,6 +22,7 @@
 #include "duckdb/function/table_function.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <list>
 #include <set>
@@ -29,6 +31,7 @@
 namespace duckdb {
 class DatabaseInstance;
 class ClientContext;
+class ExtensionLoader;
 
 namespace acl {
 
@@ -169,27 +172,6 @@ enum class AdminScope : uint8_t { NONE, MANAGE, PASSTHROUGH };
 //! Parse/print the scope names used by the admin functions, the grammar and the policy source
 AdminScope ParseAdminScope(const string &scope);
 const char *AdminScopeName(AdminScope scope);
-
-//! One issuer's offline JWT verification config (spec 007): a row of acl.issuers, or the in-memory
-//! issuer map. Keys are data, never fetched: the gateway/admin rotates them.
-struct IssuerConfig {
-	string issuer;
-	string keys_json;            // JWKS ({"keys":[...]}: RSA n/e, EC P-256 x/y, oct k) or a PEM public key
-	vector<string> audiences;    // allowlist; the token's aud (string or array) must intersect
-	case_insensitive_set_t algs; // allowlist of {RS256, ES256, HS256}; anything else (incl. none) is refused
-	string role_claim;           // dot path to the roles claim ("roles", "realm_access.roles", "groups")
-	string claim_map;            // JSON: {"<jwt dot path>": "<acl_claim name>"}
-	//! Where the keys are read from when they are not pasted in (spec 023): anything duckdb's own
-	//! filesystem opens - an https JWKS URL (needs httpfs) or a file an operator refreshes out of
-	//! band. Empty means `keys_json` is the whole truth.
-	string jwks_uri;
-	//! The app registration the node itself runs the OAuth password grant as (spec 064), and what
-	//! auth discovery advertises for a driver's own flow. Empty = this issuer does no ROPC here.
-	string client_id;
-	//! Only a confidential client has one; public clients (the common case) leave it empty. Never
-	//! surfaced by introspection.
-	string client_secret;
-};
 
 //! duckdb answers "what is in this catalog?" three ways - a table function, a view of the same name
 //! and `information_schema` - and under a principal all three are replaced by a listing of the
@@ -365,17 +347,23 @@ struct PolicyStore {
 	//! When sessions were last swept (spec 044), so the automatic sweep inside SessionOpen runs at most
 	//! once a minute rather than on every arrival.
 	int64_t last_sweep = 0;
-	// issuer registry + external->role mappings (spec 007), memory-mode counterparts of the catalog
-	case_insensitive_map_t<IssuerConfig> issuers;
-	case_insensitive_map_t<case_insensitive_map_t<vector<string>>> role_mappings; // issuer -> external -> roles
+	//! spec 095: issuers, clients and role mappings in memory mode - immutable once built; a writer
+	//! copies, edits, validates and swaps under identity_write_lock (EditIdentity)
+	shared_ptr<const IdentityModel> memory_identity;
+	mutex identity_write_lock;
+	//! spec 095: the last resolved connection of each issuer / client that reads one from a secret,
+	//! as a fingerprint - a change made in the secrets service is a `connection_changed` policy event
+	case_insensitive_map_t<string> connection_fingerprints; // guarded by `lock`
 	// role -> global administration scope (spec 009); per-catalog manage lives in the catalog grant
 	case_insensitive_map_t<AdminScope> admin_scopes;
 	// role -> default claims (used by the ROLE form, which carries no token)
 	case_insensitive_map_t<case_insensitive_map_t<string>> role_claims;
-	//! What an issuer's JWKS URI last yielded (spec 023). Reading is the whole mechanism: a TTL says
-	//! when to read again, and a bounded staleness says how long a failed read may be survived.
+	//! What a document location last yielded - an issuer's discovery document or its JWKS (specs 023,
+	//! 095), keyed by location. Reading is the whole mechanism: a TTL says when to read again, and a
+	//! bounded staleness says how long a failed read may be survived.
 	struct JwksEntry {
-		string uri; // what these keys were read from: a different location is a different cache entry
+		string uri;    // the location (the map's key)
+		string issuer; // the issuer that read it last - what acl_jwks_cache() and acl_jwks_refresh() name
 		string keys_json;
 		int64_t fetched_at = 0; // seconds since epoch of the last successful read; 0 = never
 		int64_t tried_at = 0;   // last attempt, successful or not - the floor under retries
@@ -507,9 +495,6 @@ struct PolicyStore {
 	void CatalogDropSchemaAlias(const string &vcat, const string &alias_path, bool cascade = false);
 	void CatalogDropFunction(const string &vcat, const string &vname, const string &kind);
 	void CatalogDropRole(const string &role);
-	void CatalogDropIssuer(const string &issuer);
-	void CatalogDropRoleMapping(const string &issuer, const string &source, const string &external_value,
-	                            const string &role);
 	void CatalogDefineRole(const string &role, const case_insensitive_map_t<string> &claims);
 	// spec 072: the function categories' writers (acl_catalog_admin.cpp). Every one bumps the policy
 	// version, so the next statement resolves against a model rebuilt from the rows.
@@ -559,7 +544,6 @@ struct PolicyStore {
 	//! whatever its verdict, otherwise upserts it with `allowed`
 	void CatalogWriteFunctionGrant(const string &role, const string &category, optional_ptr<const FunctionKey> key,
 	                               bool allowed, bool remove);
-	void CatalogDefineIssuer(const IssuerConfig &config);
 	// ALTER operations (spec 009): partial change of an EXISTING object - unlike the ADD/GRANT
 	// upserts, a missing target is an error. field names the single property being set.
 	void CatalogAlterRelation(const string &vcat, const string &vname, const string &field, const string &value,
@@ -571,7 +555,6 @@ struct PolicyStore {
 	void CatalogAlterCatalog(const string &vcat, const string &comment);
 	void CatalogAlterRole(const string &role, const case_insensitive_map_t<string> &claims);
 	void CatalogAlterGrant(const string &role, const string &vcat, const string &field, const string &value);
-	void CatalogAlterIssuer(const string &issuer, const string &field, const string &value);
 	void CatalogGrantAdmin(const string &role, const string &scope);
 	void CatalogRevokeAdmin(const string &role);
 	//! role -> (scope, vcat) rows of the principal; missing roles simply do not appear
@@ -581,7 +564,9 @@ struct PolicyStore {
 	void CatalogAdminRights(const Principal &principal, std::set<string> &catalogs,
 	                        vector<std::pair<string, string>> &scopes);
 	bool CatalogAnonymousAdminAllowed();
-	void CatalogMapRole(const string &issuer, const string &source, const string &external_value, const string &role);
+	//! spec 095: one identity write - `apply` changes (and validates) the model read inside the write's
+	//! transaction, and the difference is written as rows
+	void CatalogEditIdentity(const std::function<void(IdentityModel &)> &apply);
 	//! per-object grant: its capabilities and (spec 011) the policy it imposes on the object
 	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json,
 	                          const string &rls = "", const string &columns = "");
@@ -711,6 +696,8 @@ struct PolicyStore {
 	//! The policy source: `reloaded` (a version change adopted), `written` (a management write
 	//! committed), `source_error` (the source did not answer - the statement was refused)
 	void AuditPolicy(const string &detail, const string &reason);
+	//! spec 095: an issuer's or a client's resolved connection changed through its secret
+	void AuditConnection(const string &kind, const string &name, const string &fingerprint);
 	//! An issuer's keys were re-read from their document (`refreshed`) or could not be (`refresh_failed`)
 	//! `detail` and `reason_code` override the defaults (refreshed / refresh_failed, source_error) -
 	//! spec 071's location_refused / policy_error is the one other shape
@@ -734,12 +721,38 @@ struct PolicyStore {
 	//! SessionOpen - the operation that grows the map is the one that pays to clean it, so there is no
 	//! thread to own and no cost on a quiet instance.
 	idx_t SessionSweep();
-	//! Every issuer the policy names, for the doors' discovery documents (spec 062).
-	vector<string> ListIssuers();
-	//! One issuer's configuration, for the doors: discovery advertises its client_id and the
-	//! password handshake runs the grant as it (spec 064). The config includes the client_secret,
-	//! so a caller surfaces chosen fields, never the struct.
-	bool LookupIssuer(const string &issuer, IssuerConfig &out);
+	//! spec 095: what the doors advertise and run - every issuer whose connection resolves, with its
+	//! clients. `client_secret` (read from the secrets service) is for the password handshake alone:
+	//! a caller surfaces chosen fields, never the struct.
+	struct DoorClient {
+		string name, client_id, client_secret;
+		vector<string> flows;
+	};
+	struct DoorIssuer {
+		string name, url;
+		vector<DoorClient> clients;
+	};
+	//! `with_client_secrets` only for the password handshake: discovery answers unauthenticated callers
+	//! and has no use for a client secret, so it never holds one
+	vector<DoorIssuer> DoorIssuers(bool with_client_secrets = false);
+	//! The discovery document, cached briefly per policy version: unauthenticated callers must not make
+	//! every request a read of the secrets service (spec 095 review)
+	struct DoorDocumentCache {
+		int64_t policy_version = -2;
+		std::chrono::steady_clock::time_point at;
+		string document;
+	};
+	DoorDocumentCache door_document; // guarded by `lock`
+	//! spec 095: the identity model in force (memory, catalog or function driver)
+	shared_ptr<const IdentityModel> Identity();
+	//! spec 095: an identity write. `edit` changes a copy of the model; the whole result is validated
+	//! (secrets read, privileged roles judged) and stored. A function-driver source refuses.
+	void EditIdentity(const char *function, const std::function<void(IdentityModel &)> &edit);
+	//! spec 095: a secret of the node's secrets service (spec 082) by name, its fields as text. False
+	//! when the service has no secret of that name and type. Read on a connection of the store's own,
+	//! so the service sees the node as the caller - never a principal's session.
+	bool ReadIdentitySecret(const string &service, const string &name, const string &type,
+	                        case_insensitive_map_t<string> &fields);
 	//! The sweep proper; the caller holds the lock and has read the settings before taking it.
 	idx_t SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp_binds);
 	//! How many sessions are live right now. Denied to a principal, like the rest of this surface.
@@ -819,10 +832,6 @@ struct PolicyStore {
 	bool SetDraining(bool value);
 	bool Draining() const;
 
-	//! Register an issuer / map an external role value (memory mode; catalog mode via the Catalog* ops)
-	void DefineIssuer(IssuerConfig config);
-	void MapRole(const string &issuer, const string &source, const string &external_value, const string &role);
-
 	//! Grant/revoke a GLOBAL ACL-administration scope for a role (spec 009). Managing one catalog is
 	//! not granted here - it is a capability of the catalog grant itself ({"manage": true}).
 	void GrantAdmin(const string &role, AdminScope scope);
@@ -872,25 +881,51 @@ private:
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);
 
-	//! The real JWT path of VerifyPrincipal (spec 007): issuer lookup -> acl_token verification ->
-	//! role mapping -> claims; throws on any failure. Defined in acl_policy.cpp.
-	void VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out, bool ignore_exp = false);
+	//! The real JWT path of VerifyPrincipal (spec 095): route `iss` to its issuer, verify against its
+	//! keys, route the token to exactly one client, and make roles and attributes of it; throws on any
+	//! failure with the reason noted. `expires_at` gets the token's exp.
+	void VerifyJwtPrincipal(const string &token, const string &issuer, Principal &out, bool ignore_exp = false,
+	                        int64_t *expires_at = nullptr);
 	//! The memory-mode role-default claims of `out.roles`, merged under the explicit ones (the token's
 	//! win). One helper for both principal paths - the prefix (VerifyJwtPrincipal) and the session
 	//! (SessionOpen) - so the same token can never carry different claims through a door than through
 	//! a gateway (spec 040's contract; the 2026-09-03 review finding).
 	void MergeMemoryRoleDefaults(Principal &out);
-	//! spec 023: the keys to verify with. An issuer that names a JWKS URI has them read through
-	//! duckdb's filesystem and cached per instance; one that pastes a JWKS keeps using it. `kid` is
-	//! the token's, so a key that rotated in since the last read triggers one extra read.
-	string ResolveIssuerKeys(const IssuerConfig &config, const string &kid);
+	//! spec 095: an issuer's connection as resolved now - its URL, where its keys come from and which
+	//! algorithms it signs with (the secret's, else discovery's)
+	struct ResolvedIssuer {
+		string name, url;
+		string keys_json;  // pasted keys (a secret's KEYS)
+		string keys_from;  // a secret's KEYS_FROM, or discovery's jwks_uri
+		string key_source; // "secret <service>.<name>" | "discovery <location>"
+		case_insensitive_set_t algs;
+	};
+	//! The issuer's URL: its own, or its secret's; false when the secret cannot be read
+	bool IssuerUrl(const IdentityIssuer &issuer, string &url);
+	ResolvedIssuer ResolveIssuer(const IdentityIssuer &issuer, const string &url);
+	//! A client's audiences, client id and secret: its own, or its secret's
+	struct ResolvedClient {
+		vector<string> audiences;
+		string client_id, client_secret;
+	};
+	ResolvedClient ResolveClient(const IdentityClient &client);
+	//! The keys to verify with: pasted, or a document read through duckdb's filesystem and cached by
+	//! location (spec 023's rules); `kid` is the token's, so a key that rotated in triggers one re-read
+	string IssuerKeys(ResolvedIssuer &issuer, const string &kid);
+	//! A document by location through the cache - an issuer's discovery document or a JWKS. `kid`
+	//! (JWKS only) forces one early re-read when the cached document lacks it.
+	string CachedDocument(const string &location, const string &issuer, const string &kid, bool is_jwks);
+	//! Read a document through duckdb's own filesystem: a local path out of the box, https with httpfs
+	bool ReadDocumentText(const string &uri, string &out, string &error);
+	//! A `connection_changed` policy event when an object's resolved connection differs from the last
+	void NoteConnection(const string &kind, const string &name, const string &connection);
+	//! Whether a role exists (UNMAPPED AS ROLE) / holds an administration scope (spec 009)
+	bool RoleKnown(const string &role);
+	bool RolePrivileged(const string &role);
 	//! acl_jwt_clock_skew setting (seconds); the memory mode uses the 60s default (no db handle)
 	int64_t JwtClockSkew();
 	int64_t JwksRefreshInterval();
 	int64_t JwksMaxStale();
-	//! Map raw role-claim values through role_mappings; unmapped values pass only if the role exists
-	vector<string> MapExternalRoles(const string &issuer, const vector<string> &raw_roles);
-
 	// catalog-backend bridges, defined in acl_policy_catalog.cpp (the backend type stays private there)
 	bool CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out);
 	bool CatalogResolveFunction(const Principal &principal, const string &vname, bool table_kind, TablePolicy &out);
@@ -898,12 +933,13 @@ private:
 	//! function-driver source without the slots), which reads as the seed
 	shared_ptr<const FunctionCategoryModel> CatalogFunctionModel();
 	void CatalogLoadRoleClaims(Principal &principal);
-	bool CatalogLookupIssuer(const string &issuer, IssuerConfig &out);
-	void CatalogListIssuers(vector<string> &out);
-	//! (external_value -> mapped roles) for the given values; also flags which candidates exist as roles
-	void CatalogMapExternalRoles(const string &issuer, const vector<string> &values,
-	                             case_insensitive_map_t<vector<string>> &mapped, case_insensitive_set_t &known_roles);
+	shared_ptr<const IdentityModel> CatalogIdentity();
+	void CatalogKnownRoles(const vector<string> &values, case_insensitive_set_t &known_roles);
 };
+
+//! spec 095: the `oidc_issuer` and `oidc_client` secret types an issuer's and a client's connection
+//! is kept in (acl_identity_store.cpp)
+void RegisterIdentitySecretTypes(ExtensionLoader &loader);
 
 //! Carried on the parser extension (parser_info); the override reads the store from it.
 struct AclParserInfo : ParserExtensionInfo {

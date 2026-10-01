@@ -6,6 +6,10 @@
 require acl
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS store;
 
 statement ok
@@ -598,9 +602,7 @@ shown	n
 # invalid SQL - which is the one thing a client parses.
 
 statement ok
-SELECT acl_define_issuer('https://issuer.test/shapes',
-    '{"keys":[{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}]}',
-    'api://acl-test', 'HS256', 'roles', '');
+SELECT acl_define_issuer('test/idp/shapes', '{"url": "test/idp/shapes", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"]}}');
 
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG m;
@@ -629,7 +631,7 @@ ACL ADMIN GRANT OBJECT m.orders TO ROLE r2 COLUMNS (id, ssn, tag = lower(tenant)
 
 # roles ["r1","r2"]
 query II
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3NoYXBlcyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicjEiLCJyMiJdfQ.LZIn69DGDCUAENLaRnas2hSqkyZRGGgM08M6uROZbqU'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zaGFwZXMiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIxIiwicjIiXX0.dRYnjNB5cMoJNhwILxMFtPJwWwsvMhlRreZmij5MCGwhGZPvM_U20C9zusC4o8kDbISXQRLfBoRo-LFnQT8P3GaXNM1ilXEIQa5Bs7ts7UcQ_skbmqjfPVfdY1AeFe_znRiprMkvXK1bWObLLQBtmBCvgzpM2OeaMbtdZBFtqK6vwbqxvRD-tWysChrW8OTe44tj2_5cq3cXe2bwBKBUxEYu4Nrnnf--h4NFA4lxDF1dDfIlUAPa97OL6jQN1Hwua6USEcZLSvZF9Y7lzn1dO9t3ZhtNIhi0h9Z1RpkGmaQWxh0tNgw5YeAInd7BU8Sl6ZdSmfsPd4QQTq_NwiSsOg'
 SELECT column_name, count(*) FROM duckdb_columns() WHERE database_name = 'm' GROUP BY 1 ORDER BY 1;
 ----
 id	1
@@ -637,7 +639,7 @@ ssn	1
 tag	1
 
 query I
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3NoYXBlcyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicjEiLCJyMiJdfQ.LZIn69DGDCUAENLaRnas2hSqkyZRGGgM08M6uROZbqU'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zaGFwZXMiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIxIiwicjIiXX0.dRYnjNB5cMoJNhwILxMFtPJwWwsvMhlRreZmij5MCGwhGZPvM_U20C9zusC4o8kDbISXQRLfBoRo-LFnQT8P3GaXNM1ilXEIQa5Bs7ts7UcQ_skbmqjfPVfdY1AeFe_znRiprMkvXK1bWObLLQBtmBCvgzpM2OeaMbtdZBFtqK6vwbqxvRD-tWysChrW8OTe44tj2_5cq3cXe2bwBKBUxEYu4Nrnnf--h4NFA4lxDF1dDfIlUAPa97OL6jQN1Hwua6USEcZLSvZF9Y7lzn1dO9t3ZhtNIhi0h9Z1RpkGmaQWxh0tNgw5YeAInd7BU8Sl6ZdSmfsPd4QQTq_NwiSsOg'
 SELECT column_count FROM duckdb_tables() WHERE database_name = 'm';
 ----
 3
@@ -657,14 +659,14 @@ ACL ADMIN GRANT OBJECT m.orders TO ROLE r3 COLUMNS (id, tag = upper(tenant));
 
 # roles ["r1","r3"]
 query II
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3NoYXBlcyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicjEiLCJyMyJdfQ.kdyFjZ23Jtlnfh6aHtBtR4Y_D7gjpSDcMWPSxYXuorE'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zaGFwZXMiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIxIiwicjMiXX0.Vbmzj47hpahFLMN5BTXD4DB2hJj9-52ahZ7BMVbLLKMlBwKzIUaLsH7T-OUb4uTZuVItsnjdFbHbwJX_JqgDCfiRTAOEnKAYUrzC2EM7dWDzzvdNISTdQ8Wr2WOGJ0diy7HRrF3ZgKNbQ_MkJVk_o8g9ucfd_3WVDfqB0PL4X4fvYJqha0TFQ99UHXd8jBNuK2GRS-uQHYu0u8vGL-AjrPdUx3ZVU1SIliRdJ-RJMICGXx661INT35tXv787zoVvaU4imW6p0EbUS1-h1QesDjFKjJ-cJf64Dh7oEDZKXOkDw3m87Xk6QCuiSHJ8CGFd81xHHnLwye9ytulxSc6THw'
 SELECT column_name, count(*) FROM duckdb_columns() WHERE database_name = 'm' GROUP BY 1 ORDER BY 1;
 ----
 id	1
 tag	1
 
 statement error
-ACL TOKEN 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3NoYXBlcyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1Iiwicm9sZXMiOlsicjEiLCJyMyJdfQ.kdyFjZ23Jtlnfh6aHtBtR4Y_D7gjpSDcMWPSxYXuorE'
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zaGFwZXMiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidSIsInJvbGVzIjpbInIxIiwicjMiXX0.Vbmzj47hpahFLMN5BTXD4DB2hJj9-52ahZ7BMVbLLKMlBwKzIUaLsH7T-OUb4uTZuVItsnjdFbHbwJX_JqgDCfiRTAOEnKAYUrzC2EM7dWDzzvdNISTdQ8Wr2WOGJ0diy7HRrF3ZgKNbQ_MkJVk_o8g9ucfd_3WVDfqB0PL4X4fvYJqha0TFQ99UHXd8jBNuK2GRS-uQHYu0u8vGL-AjrPdUx3ZVU1SIliRdJ-RJMICGXx661INT35tXv787zoVvaU4imW6p0EbUS1-h1QesDjFKjJ-cJf64Dh7oEDZKXOkDw3m87Xk6QCuiSHJ8CGFd81xHHnLwye9ytulxSc6THw'
 SELECT * FROM orders;
 ----
 <REGEX>:.*mask column "tag" differently.*

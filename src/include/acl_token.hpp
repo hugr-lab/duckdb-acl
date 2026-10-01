@@ -1,7 +1,6 @@
-// Offline JWT verification (specs/007): parse + signature check (RS256/ES256/HS256) + standard
-// claims, with zero network IO - keys arrive in the issuer config (JWKS or PEM), rotated by the
-// gateway/admin. Pure functions over the token text; issuer lookup and role mapping stay with the
-// PolicyStore, which owns the memory/catalog backends.
+// Offline JWT verification (specs/007): parse + signature check (RS256/ES256/HS256) + time claims,
+// with zero network IO - the keys are handed in (spec 095: discovery or a secret). Pure functions
+// over the token text; routing, the client's judgement and role mapping stay with the PolicyStore.
 
 #pragma once
 
@@ -10,13 +9,11 @@
 namespace duckdb {
 namespace acl {
 
-//! The outcome of parsing + verifying one JWT against its issuer config
-struct JwtClaims {
-	string issuer;
-	string subject;                        // the token's `sub` - identity within an issuer (spec 050 F5)
-	vector<string> raw_roles;              // values of the role claim, before mapping
-	case_insensitive_map_t<string> claims; // extracted via claim_map
-	bool groups_overage = false;           // EntraID groups overage marker present
+//! A token whose signature and time claims hold (spec 095): what its client then judges
+struct VerifiedJwt {
+	string issuer;       // `iss`, as routed
+	string payload_json; // the claims, read by the client through TokenClaims
+	string token_type;   // the header's `typ`, for a client's TOKEN TYPE
 	//! The token's `exp`, as seconds since the epoch. Verified here; kept so a session minted from
 	//! this token can be refused once it passes, without holding the token itself (spec 040).
 	int64_t expires_at = 0;
@@ -38,14 +35,14 @@ bool JwksHasKid(const string &keys_json, const string &kid);
 //! in the document's order - the public names of the keys, never the keys
 int64_t JwksKeyIds(const string &keys_json, vector<string> &kids);
 
-//! Full verification: signature (per the issuer's alg/keys), exp/nbf with skew, audience, role and
-//! claim extraction. Throws BinderException with a specific reason on any failure (the gateway is
-//! trusted to see diagnostics); a denial must throw anyway (FALLBACK would silently re-parse).
-//! ignore_exp (spec 059, 'connect' binding): skip only the expiry comparison - the claim must still
-//! be present, and signature/issuer/audience/nbf are always enforced. Used exclusively to
-//! re-verify the bearer of an ALREADY OPEN session; establishment never sets it.
-JwtClaims VerifyJwt(const string &token, const IssuerConfig &config, int64_t clock_skew_seconds,
-                    bool ignore_exp = false);
+//! The signature (per the issuer's algs and keys) and exp/nbf with skew. Throws BinderException
+//! with a specific reason on any failure (the gateway is trusted to see diagnostics); a denial must
+//! throw anyway (FALLBACK would silently re-parse). ignore_exp (spec 059, 'connect' binding): skip
+//! only the expiry comparison - the claim must still be present, and signature/nbf are always
+//! enforced. Used exclusively to re-verify the bearer of an ALREADY OPEN session. Audience, roles
+//! and claims are the client's to judge (acl_identity).
+VerifiedJwt VerifyJwtSignature(const string &token, const string &keys_json, const case_insensitive_set_t &algs,
+                               int64_t clock_skew_seconds, bool ignore_exp = false);
 
 } // namespace acl
 } // namespace duckdb

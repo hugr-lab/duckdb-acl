@@ -17,6 +17,7 @@ per-statement figure for the rewrite itself, with no socket in the way, is test/
 Usage:  test/bench/door_throughput.py [--clients 4] [--reads 200] [--rows 20000]
 """
 
+import os
 import argparse
 import json
 import pathlib
@@ -26,18 +27,25 @@ import sys
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+os.chdir(ROOT)  # spec 095: the fixture issuers (test/idp/) are read relative to the repository root
 BUILD = ROOT / "build" / "release"
 
 TOKENS = {
     "acme": (
-        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-        "eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1hY21lIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0."
-        "vzPJbHXAXfczhZwQp183JaaBLlSRSipNsSqwxoIFfng"
+        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+        "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtYWNtZSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNt"
+        "ZSJ9.UV5-WWUpQLp-Em8K2yLLkz-NEJgOyTAn9i9B1zpBWF3hNQVgorAVPVK48bxnrMiMm7NabgM3g945lDY31DFwxNeUKnVEe0Q"
+        "dRy1d1KbFh8td3Ak_mepOZ35CjPektGaOjVEpjUFxZUOj_uxYnse_y660xC0stlY8zxDrpSjNCOZRGv-vaxITv7ggOIDYAN07rmP"
+        "ntKe9oOYsb5g0ZkFcIEsKuHuXsL8z1crko6vIZzT9ido-xrph_WEejO5lKaPIxVe1QrB1-C5DUp8D8fnLWMJ3g426VNKWJwUyeSg"
+        "h_nq1XzLyR8WcLchBQwaFAzkGivmLFmDdrDS7VUy49I8uLw"
     ),
     "globex": (
-        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-        "eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1nbG9iZXgiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6Imdsb2JleCJ9."
-        "CitaHH8sw-ndoasm0iTvIRKq9XBJt7PDfm22IhSQZ78"
+        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+        "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtZ2xvYmV4Iiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJn"
+        "bG9iZXgifQ.US9D_P5MEhrwKYF-K5NwGoeMGXBaK6mky8oKM57xfJvZObM_yIhEp1uJhBN5MmmRuF6EV330IwT3W8RtgarfaK0iT"
+        "lpHqmjEowIbhyQnFD84xOmjbTeBpSHaIBDWS8F2ayNKaUcXZFqfIPZrImvmASDQSQggTwkCnEyGpxPP7F__7MAC2PkDAV73RVVOu"
+        "AW1QwqbYCPoeydXS-sgMBU2v031ngk8On-UTeZ3ZaCwMhznOUMwQUpFkCtSmwdt2_OgvYn_PC_Mu6f7UGFbTf2kXXHy6ps6QwT6p"
+        "CpKoILA3uc-sjTRz1ZwyPy2NuKwceBIwiXbKTxPz5PH9KoLYUD6sg"
     ),
 }
 SERVER_TOKEN = "bench-server-token"
@@ -85,9 +93,8 @@ SELECT * FROM quack_serve('quack:localhost:{port}', token := '{SERVER_TOKEN}');
 ATTACH ':memory:' AS store;
 SELECT acl_use_db('store', 'acl', true);
 SET GLOBAL acl_allow_anonymous_admin=true;
-SELECT acl_define_issuer('https://issuer.test/s',
-    '{{"keys":[{{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}}]}}',
-    'api://acl-test', 'HS256', 'roles', '{{"tid": "tenant"}}');
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+SELECT acl_define_issuer('test/idp/s', '{{"url": "test/idp/s", "client": {{"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {{"tid": "tenant"}}}}}}');
 ACL ADMIN CREATE VIRTUAL CATALOG c;
 -- a whole physical schema behind one alias, rather than an object per table
 ACL ADMIN ADD SCHEMA memory.main AS c.raw;
@@ -100,9 +107,8 @@ SELECT acl_quack_serve('quack:localhost:{port}', '{SERVER_TOKEN}');
 ATTACH ':memory:' AS store;
 SELECT acl_use_db('store', 'acl', true);
 SET GLOBAL acl_allow_anonymous_admin=true;
-SELECT acl_define_issuer('https://issuer.test/s',
-    '{{"keys":[{{"kty":"oct","k":"YWNsLXRlc3QtaHMyNTYtc2VjcmV0"}}]}}',
-    'api://acl-test', 'HS256', 'roles', '{{"tid": "tenant"}}');
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+SELECT acl_define_issuer('test/idp/s', '{{"url": "test/idp/s", "client": {{"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {{"tid": "tenant"}}}}}}');
 ACL ADMIN CREATE VIRTUAL CATALOG c;
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders;
 ACL ADMIN CREATE ROLE analyst;

@@ -7,6 +7,10 @@
 require acl
 
 statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+
+statement ok
 ATTACH ':memory:' AS phys;
 
 statement ok
@@ -102,10 +106,10 @@ g2
 # a principal may do what any of its roles may, so a role without a narrowing grant lifts it
 
 statement ok
-ACL ADMIN CREATE ISSUER 'https://issuer.test/rs' KEYS '{"keys":[{"kty":"RSA","kid":"test-key","alg":"RS256","n":"jps-_RGCObZHYxFmbxIagCg0dZlIifYMV2phhdrLpkrJ8TkoTe_GQK62Nf4Ilh92YUiBofspFfi7-fT937mnN1vzVyAKjHCHA4BmnDHHvCea8QdNP0YcxDXsBReZDFx-e8uEqfG-9_uvhLS0HTwTqhRKtdlwGDrsSoH4WYnCHI1grvQ8BSo7MivppMTzx7UUWeKieKFMeY3jw-g0XgdyZKjIOOaXQTX5AeEm_Xq6OjOtq7gVIgmNfogSQIAWFk5iaMzzafzhQmN_d719rEMSJClAAnCklwpETEq2jWv5vJUhslPL6ZQPd8jnjVMcOzL8Zy9ed5U9te-EQ0IKnfnpZQ","e":"AQAB"}]}' AUDIENCES 'api://acl-test' ALGS 'RS256' ROLE CLAIM 'roles';
+ACL ADMIN CREATE ISSUER 'test/idp/rs' AUDIENCES 'api://acl-test' ROLE CLAIM 'roles';
 
 query I
-ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3JzIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUyIiwicm9sZXMiOlsiYW5hbHlzdCIsImF1ZGl0b3IiXSwidGlkIjoiYWNtZSJ9.guFpE40gTGSse-r_WRt80-UaF7PO4AiI7FH_Roa2c53oPOGxbUSXgrthA0H5Y5qBxwiq1nEj3cafcS5NYS9aF6A3T4tHi55ePDFNxjNJteJXP3-y7YX-MUR7BDaRumB9wTGB5SUXI0uu8m7cv7S9_u2NcxIs76DIdbU3061k5fWz_V-J0FX7XYEcOcGXr4Bdc5bmjgGG1OX_ACD2L8FtEQz2890HxnQMBoQMlcyXaVfK4qsiwes481ZxxDWWxninQZvX3dHLQtbIDjWFXu-KUQ3Isybc3K3Fd8eoGJ8lkuy_VDofJ1od3g73_IHg1FpIy1A536C_06kyz4bikH7S0w' SELECT count(*) FROM orders;
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT count(*) FROM orders;
 ----
 3
 

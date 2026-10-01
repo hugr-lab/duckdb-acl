@@ -27,16 +27,26 @@ namespace {
 //! HS256 tokens for the fixture's issuer (roles/tid; exp in 2100): two tenants of one role, and an
 //! auditor role that sees every tenant but not `amount`.
 const char *const TOKEN_ACME =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4"
-    "cCI6NDEwMjQ0NDgwMCwic3ViIjoidWEiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.pj_vV6OmT_k_3y1MWLBTC_SjngWPkzsFS5"
-    "K0iULL6OM";
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InVhIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJhY21lIn0."
+    "C4MMwBC2pe1K_Q62MpY2UEruFy4S4lcW1JqpLrSPQEPUREO583DRurIoNxRMwcKNGoM5yMgHnMrb8SEPCNeY3UbEPxooUNEMbpRt"
+    "BilbyfJM3BwXCtAMhP9h7BuFlH8etT-I72KkwdN6wGylQTmX4PR1KwGtLNm7hskEjLDepqpBxO1CqQay_6Ni862pgYhOjKhOifP8"
+    "YkIr2aim8Ub8QP3q0OxRn3mOVHEj9gINIRRWYQpchraguqdlNPm49nFgmFiSR7MFGM4dGYHTlVbKGSc2aBk0tEoJSpUdMASUyaRb"
+    "4GMs8pGN5X9_xtXnPN8HLsYzje-Wtb8WTMGx-KIU8Q";
 const char *const TOKEN_GLOBEX =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4"
-    "cCI6NDEwMjQ0NDgwMCwic3ViIjoidWciLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6Imdsb2JleCJ9.DV-dX_z7H-uxTOIX3yDXS0Q2eDP5gimr"
-    "26DeTKQaKBo";
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InVnIiwicm9sZXMiOlsiYW5hbHlzdCJdLCJ0aWQiOiJnbG9iZXgi"
+    "fQ.Mq7dJB0gSDQJzfnivtoJuSfyfXemqjngjeBSMxIiBpRQFcgHL9cvgXdEvN9VnVkxFf0VpSMwhLqGapHODegx0vXM4vZlrJ_fZ"
+    "fYNVNpBQ9ctdEWQfWmJGAaFpfWFt3QOoFGxcSp2bbu0PVlYO3QTo8yW-FPonUSx1EqrH75pe5qk4fL1zrr1jZJjWYlLLo_ySpzFG"
+    "SGszT9YqDiPHjdm5BWDn2n0-Hmk04QtM7VBOt-8ZhourBBjI5KpTcXQiEKMYk6FBTTBzK_YHsJhD_unPnOyIJJ1TWZ5zLRJMlNG5"
+    "BAg-2_filxH5GcR8XdzYqSMgCqjqLxWRsI5Wt8QkQ2eUw";
 const char *const TOKEN_AUDITOR =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci50ZXN0L3MiLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4"
-    "cCI6NDEwMjQ0NDgwMCwic3ViIjoiYXVkIiwicm9sZXMiOlsiYXVkaXRvciJdfQ.GLaMBhs876oMzP_stlzO4Vo8uYYbR7rX9r-TvAxkPvY";
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImF1ZCIsInJvbGVzIjpbImF1ZGl0b3IiXX0.AYjsFdokgleDnFJY"
+    "ezBm-kl5ozgD7_vMVd022lMhroqv4dViQzTwXJtmty6-6LfGwZC3tGr6QbyT0Eq3ktcbRf1R5JDULgxz7kO2hmGCcT8Odl1i1z9Y"
+    "LsDqfNIhm_8muhrwTsFirFzs2c9fSFY1jS_hRpL7XK-b5evkXrgFIprTauO7Np9sK4cooQF9rzM2KvoYkiWVq4tyyAzenuT7UpA7"
+    "XLynJOaIqMP7m_V2SdWzrYtHUptNmX8P-2ZFCRE7-QZitn4Mmo33ukrhnue-iPTnfvSPCDGJGkzpfHCl9BRWPTysUk6aiVEkVurI"
+    "U7UhyP9nBokcfMCDEnyUxNzToA";
 
 //! The writers' id ranges: two per tenant, RANGE ids apart; the seed rows sit below all of them.
 constexpr int64_t RANGE = 1000;
@@ -254,9 +264,9 @@ int main(int argc, char *argv[]) {
 		          "FROM range(1, 21) t(i)");
 		Exec(con, "SELECT acl_use_db('store','acl',true)");
 		Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
-		Exec(con, "SELECT acl_define_issuer('https://issuer.test/s',"
-		          "'{\"keys\":[{\"kty\":\"oct\",\"k\":\"YWNsLXRlc3QtaHMyNTYtc2VjcmV0\"}]}',"
-		          "'api://acl-test','HS256','roles','{\"tid\": \"tenant\"}')");
+		Exec(con, "SET GLOBAL acl_jwks_locations = 'test/idp/'");
+		Exec(con, "SELECT acl_define_issuer('test/idp/s', '{\"url\": \"test/idp/s\", \"client\": {\"audiences\": "
+		          "[\"api://acl-test\"], \"roles_from\": [\"roles\"], \"attributes\": {\"tid\": \"tenant\"}}}')");
 		Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG c");
 		Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders");
 		Exec(con, "ACL ADMIN CREATE ROLE analyst");

@@ -8,6 +8,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$ROOT" # spec 095: the fixture issuer (test/idp/) is read relative to the repository root
 DUCKDB_BIN="${DUCKDB_BIN:-$ROOT/build/release/duckdb}"
 ACL_EXT="${ACL_EXT:-$ROOT/build/release/extension/acl/acl.duckdb_extension}"
 
