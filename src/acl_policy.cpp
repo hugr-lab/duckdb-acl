@@ -239,12 +239,12 @@ string MintRandomHex(idx_t bytes) {
 //! The catch is deliberately every exception, not the source's alone, and every one of them is
 //! `source_error` to a door: a door must not learn the difference between a catalog that is down and
 //! a bug of ours, and the audit keeps the text either way.
-string PolicyStore::SessionOpen(const string &token, const string &door, const string &replacing) {
+string PolicyStore::SessionOpen(const string &token, const string &door, const string &replacing, string *placement) {
 	DeliverSessionNotices deliver(session_notices); // a sweep inside may have ended sessions
 	Principal principal; // as far as verification got, so a refusal can still name who was trying
 	try {
 		SessionOpenInfo opened;
-		auto handle = SessionOpenBody(token, door, principal, opened, replacing);
+		auto handle = SessionOpenBody(token, door, principal, opened, replacing, placement);
 		if (!handle.empty()) {
 			// spec 078: the observers, before the handle is anyone's - outside the store's lock, the
 			// verified token by reference for the call only
@@ -261,7 +261,7 @@ string PolicyStore::SessionOpen(const string &token, const string &door, const s
 }
 
 string PolicyStore::SessionOpenBody(const string &token, const string &door, Principal &principal,
-                                    SessionOpenInfo &opened, const string &replacing) {
+                                    SessionOpenInfo &opened, const string &replacing, string *placement) {
 	// a refusal is a session event too (spec 069): the reason a client never learns is what the
 	// operator's record carries
 	auto refused = [&](const Principal &who, const char *code, const string &reason) {
@@ -314,6 +314,13 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 	// spec 085: the principal's resource groups, resolved once for the session's whole life - a read of
 	// the policy, so before the lock (a source that fails is the door's source_error, above)
 	auto limits = ResolveResourceLimits(principal);
+	if (!limits.admitted) {
+		// spec 096: this node serves another resource group - the front sends the client elsewhere
+		if (placement) {
+			*placement = limits.refusal;
+		}
+		return refused(principal, "wrong_resource_group", limits.refusal);
+	}
 	// Minted before the lock because it needs none, so that checking the cap and inserting happen in
 	// ONE critical section: doing them in two let concurrent opens step over the cap between them.
 	auto now = NowSeconds();
@@ -329,7 +336,9 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 	if (now - last_sweep >= SWEEP_INTERVAL_SECONDS || (cap > 0 && sessions.size() >= static_cast<idx_t>(cap))) {
 		SweepLocked(now, skew, idle_timeout, exp_binds);
 	}
-	if (cap > 0 && sessions.size() >= static_cast<idx_t>(cap)) {
+	// the session this open replaces (a door's re-authentication) ends with it: it holds no seat
+	idx_t occupied = sessions.size() - (!replacing.empty() && sessions.count(replacing) ? 1 : 0);
+	if (cap > 0 && occupied >= static_cast<idx_t>(cap)) {
 		// Refusing rather than evicting: making room by ending somebody else's session would let an
 		// arriving stranger disconnect a working client, which is the worse of the two failures
 		// (spec 044). A door turns this into "Authentication failed", which a client already handles.

@@ -2089,6 +2089,7 @@ private:
 		}
 		auto cookie = CookieOf(context);
 		transient = !ClientSentCookie(context);
+		string replacing; // the connection's session a swap ends - once, and only if, the new one opens
 		if (!transient) {
 			string handle;
 			if (state->store->SessionHandleFor(cookie, handle)) {
@@ -2104,16 +2105,12 @@ private:
 					if (PrincipalFingerprint(caller) == PrincipalFingerprint(current)) {
 						return handle; // the connection's own live session, same principal
 					}
-					// Re-authenticating as somebody else is a SWAP: close this session, open
-					// another. A draining node refuses the swap BEFORE the close (spec 066):
-					// drain never ends a session, and the close without the open would be
-					// exactly that - the old principal keeps working until it leaves by itself.
-					if (state->store->Draining()) {
-						return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
-						                               "acl: node is draining - not accepting new sessions");
-					}
-					state->store->SessionClose(handle); // re-authenticated as somebody else
-					state->DropConn(handle);            // and the old principal's connection with it
+					// Re-authenticating as somebody else is a SWAP: open the new session FIRST, then
+					// end this one (SessionBind below). Whatever refuses the new one - a drain (spec
+					// 066), a cap, a group of another node (spec 096), a source down - leaves this one
+					// alone: closing it first gave the client neither, and the old principal keeps
+					// working until it leaves by itself.
+					replacing = handle;
 				}
 			}
 		}
@@ -2124,13 +2121,22 @@ private:
 			return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
 			                               "acl: node is draining - not accepting new sessions");
 		}
-		auto handle = state->store->SessionOpen(token, "flight");
+		string placement;
+		auto handle = state->store->SessionOpen(token, "flight", replacing, &placement);
 		if (handle.empty()) {
+			if (!placement.empty()) {
+				// spec 096: this node serves another resource group - UNAVAILABLE, like a drain, so a
+				// front or a driver goes elsewhere; the sentence names groups and nothing else
+				return flight::MakeFlightError(flight::FlightStatusCode::Unavailable, placement);
+			}
 			// what refuses a token in the prefix refuses it here, and says no more (spec 040)
 			return arrow::Status::UnknownError("acl: authentication failed");
 		}
 		if (!transient) {
-			state->store->SessionBind(cookie, handle);
+			state->store->SessionBind(cookie, handle); // ends the session it replaces, if any
+		}
+		if (!replacing.empty()) {
+			state->DropConn(replacing); // and the old principal's connection with it
 		}
 		return handle;
 	}

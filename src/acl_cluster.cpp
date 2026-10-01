@@ -17,6 +17,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "yyjson.hpp"
 
+#include <algorithm>
 #include <functional>
 
 namespace duckdb {
@@ -194,6 +195,56 @@ string Quoted(const string &value) {
 
 string Ident(const string &value) {
 	return "\"" + StringUtil::Replace(value, "\"", "\"\"") + "\"";
+}
+
+//! the names of (scope, name) items, a group's written `name (group g)`
+vector<string> Names(const vector<std::pair<string, string>> &items) {
+	vector<string> names;
+	for (auto &item : items) {
+		names.push_back(item.first.empty() ? item.second : item.second + " (group " + item.first + ")");
+	}
+	return names;
+}
+
+//! spec 096: whether a resource group has its own item of this kind and name (which overrides the cluster's)
+bool GroupHasItem(CatalogBackend &catalog, const string &group, const char *kind, const string &name) {
+	return catalog
+	           .Query("SELECT 1 FROM " + catalog.Tbl("cluster_items") + " WHERE \"scope\" = " + Lit(group) +
+	                  " AND \"kind\" = " + Lit(kind) + " AND lower(\"name\") = lower(" + Lit(name) + ")")
+	           ->RowCount() > 0;
+}
+
+//! spec 096: the node's resource group ('' = none), as the deployment set it
+string NodeGroupOf(DatabaseInstance &db) {
+	Value value;
+	if (db.TryGetCurrentSetting("acl_node_group", value) && !value.IsNull()) {
+		return value.ToString();
+	}
+	return string();
+}
+
+//! spec 096: an item of another group than this node's is written, never applied here - the group's
+//! nodes roll it out. True (with the answer's note) when the item is not this node's to apply now.
+bool NotThisNodesScope(DatabaseInstance &db, const string &scope, PolicyStore::ClusterAnswer &answer,
+                       const std::function<bool(const string &group)> &group_overrides = nullptr) {
+	auto node_group = NodeGroupOf(db);
+	if (scope.empty()) {
+		// a cluster item this node's own group overrides is not this node's either: its group's item is
+		// what acl_cluster_effective() says the node runs
+		if (!node_group.empty() && group_overrides && group_overrides(node_group)) {
+			answer.note =
+			    "cluster item overridden by resource group " + node_group + "'s own on this node - not applied here";
+			return true;
+		}
+		return false;
+	}
+	if (node_group == scope) {
+		return false;
+	}
+	answer.note = "item of resource group " + scope + " - this node is " +
+	              (node_group.empty() ? string("in no group") : "in group " + node_group) +
+	              "; the group's nodes roll it out";
+	return true;
 }
 
 //! A query on its own connection of the node: what the live apply and the node-side checks run on
@@ -384,6 +435,11 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
 	    },
 	    "config_version",
 	    [&](int64_t) {
+		    if (NotThisNodesScope(*db, scope, answer, [&](const string &group) {
+			        return GroupHasItem(*catalog, group, "extension", name);
+		        })) {
+			    return;
+		    }
 		    if (v != "install") {
 			    answer.note = "restart class - a running process cannot unload or reload an extension; the node agent "
 			                  "rolls it out through drain";
@@ -459,12 +515,15 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 	            JsonObjectOf(options) + "}";
 	ClusterAnswer answer;
 	bool repoint = false;
+	// a group's source named like a cluster's overrides it on the group's nodes: there it is a re-point
+	bool overrides = false;
 	answer.version = catalog->WriteWithReads(
 	    [&](const ReadFn &read, vector<string> &statements) {
 		    RequireScope(read, *catalog, scope);
 		    auto current = CurrentSpec(read, *catalog, scope, "source", alias);
 		    repoint = !current.empty();
-		    answer.item_class = repoint ? "drain" : "hot";
+		    overrides = !scope.empty() && !CurrentSpec(read, *catalog, "", "source", alias).empty();
+		    answer.item_class = repoint || overrides ? "drain" : "hot";
 		    // dependencies: sources of this scope or of the whole cluster, never a cycle
 		    for (auto &dep : depends_on) {
 			    auto exists = read("SELECT 1 FROM " + catalog->Tbl("cluster_items") +
@@ -513,9 +572,17 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 	    },
 	    "config_version",
 	    [&](int64_t) {
-		    if (repoint) {
-			    answer.note = "drain class - re-pointing an attached source is DETACH + ATTACH under the same name; "
-			                  "the node agent applies it through drain";
+		    if (NotThisNodesScope(*db, scope, answer, [&](const string &group) {
+			        return GroupHasItem(*catalog, group, "source", alias);
+		        })) {
+			    return;
+		    }
+		    if (repoint || (overrides && NodeHasDatabase(*db, alias))) {
+			    answer.note = string(overrides && !repoint ? "drain class - it overrides the cluster's source of that "
+			                                                 "name on this group's nodes; "
+			                                               : "drain class - ") +
+			                  "re-pointing an attached source is DETACH + ATTACH under the same name; the node agent "
+			                  "applies it through drain";
 			    return;
 		    }
 		    if (NodeHasDatabase(*db, alias)) {
@@ -540,35 +607,108 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 	}
 	ClusterAnswer answer;
 	answer.item_class = "hot";
-	vector<string> removed {alias};
+	// what goes, each with its scope: the source and (CASCADE) whatever depends on it
+	vector<std::pair<string, string>> removed {{scope, alias}};
+	// group items whose name the cluster also has: on the group's nodes the cluster's comes back
+	case_insensitive_set_t falls_back;
+	// what of it is in effect on THIS node (the cluster's item, unless this node's group has its own)
+	case_insensitive_set_t in_effect;
+	auto node_group = NodeGroupOf(*db);
+	auto key = [](const std::pair<string, string> &item) {
+		return item.first + "\x1f" + item.second;
+	};
 	answer.version = catalog->WriteWithReads(
 	    [&](const ReadFn &read, vector<string> &statements) {
 		    RequireScope(read, *catalog, scope);
 		    if (CurrentSpec(read, *catalog, scope, "source", alias).empty()) {
 			    throw BinderException("acl cluster: source \"%s\" is not in the profile", alias);
 		    }
-		    // who depends on it (transitively, for CASCADE)
-		    auto edges_result = read("SELECT \"name\", \"depends_on\" FROM " + catalog->Tbl("cluster_deps"));
+		    // who depends on it (transitively, for CASCADE). An edge is of its dependent's scope and names
+		    // a source of that scope, else the cluster's: a group edge depends on a cluster source only
+		    // while the group has none of that name, and a cluster edge never on a group's source.
+		    auto edges_result = read("SELECT \"scope\", \"name\", \"depends_on\" FROM " + catalog->Tbl("cluster_deps"));
 		    ResultRows edges(*edges_result);
-		    for (idx_t at = 0; at < removed.size(); at++) {
-			    for (idx_t i = 0; i < edges.Count(); i++) {
-				    auto dependent = edges.GetValue(0, i).ToString();
-				    if (StringUtil::CIEquals(edges.GetValue(1, i).ToString(), removed[at]) &&
-				        std::find_if(removed.begin(), removed.end(), [&](const string &r) {
-					        return StringUtil::CIEquals(r, dependent);
-				        }) == removed.end()) {
-					    if (!cascade) {
-						    throw BinderException("acl cluster: source \"%s\" DEPENDS ON \"%s\" - detach it first, or "
-						                          "DETACH %s CASCADE",
-						                          dependent, removed[at], alias);
-					    }
-					    removed.push_back(dependent);
+		    auto group_sources_result = read("SELECT \"scope\", lower(\"name\") FROM " + catalog->Tbl("cluster_items") +
+		                                     " WHERE \"kind\" = 'source' AND \"scope\" <> ''");
+		    ResultRows group_sources(*group_sources_result);
+		    auto group_has = [&](const string &group, const string &name) {
+			    for (idx_t i = 0; i < group_sources.Count(); i++) {
+				    if (group_sources.GetValue(0, i).ToString() == group &&
+				        StringUtil::CIEquals(group_sources.GetValue(1, i).ToString(), name)) {
+					    return true;
 				    }
+			    }
+			    return false;
+		    };
+		    auto depends_on_removed = [&](const string &edge_scope, const string &dep,
+		                                  const std::pair<string, string> &r) {
+			    if (!StringUtil::CIEquals(dep, r.second)) {
+				    return false;
+			    }
+			    if (edge_scope == r.first) {
+				    return true;
+			    }
+			    return r.first.empty() && !group_has(edge_scope, dep);
+		    };
+		    auto removing = [&](const string &item_scope, const string &name) {
+			    return std::find_if(removed.begin(), removed.end(), [&](const std::pair<string, string> &r) {
+				           return r.first == item_scope && StringUtil::CIEquals(r.second, name);
+			           }) != removed.end();
+		    };
+		    // a group's source whose name the cluster's keeps: its dependents fall back to the cluster's
+		    auto keeps_fallback = [&](const std::pair<string, string> &r) {
+			    return !r.first.empty() && !removing("", r.second) &&
+			           !CurrentSpec(read, *catalog, "", "source", r.second).empty();
+		    };
+		    auto walk_dependents = [&](idx_t at) {
+			    auto of = removed[at]; // a copy: emplace_back below may move the vector
+			    if (keeps_fallback(of)) {
+				    return;
+			    }
+			    for (idx_t i = 0; i < edges.Count(); i++) {
+				    auto edge_scope = edges.GetValue(0, i).ToString();
+				    auto dependent = edges.GetValue(1, i).ToString();
+				    if (!depends_on_removed(edge_scope, edges.GetValue(2, i).ToString(), of) ||
+				        removing(edge_scope, dependent)) {
+					    continue;
+				    }
+				    if (!cascade) {
+					    throw BinderException("acl cluster: source \"%s\"%s DEPENDS ON \"%s\" - detach it first, or "
+					                          "DETACH %s CASCADE",
+					                          dependent, edge_scope.empty() ? string() : " of group " + edge_scope,
+					                          of.second, alias);
+				    }
+				    removed.emplace_back(edge_scope, dependent);
+			    }
+		    };
+		    // to a fixpoint: a group source skipped because the cluster's of its name stays loses that
+		    // fallback when the walk reaches the cluster's later - then its dependents go too
+		    idx_t walked = 0;
+		    do {
+			    walked = removed.size();
+			    for (idx_t at = 0; at < removed.size(); at++) {
+				    walk_dependents(at);
+			    }
+		    } while (removed.size() != walked);
+		    for (auto &r : removed) {
+			    if (!r.first.empty() && !removing("", r.second) &&
+			        !CurrentSpec(read, *catalog, "", "source", r.second).empty()) {
+				    falls_back.insert(key(r));
+			    }
+			    bool here = r.first.empty() ? node_group.empty() || !group_has(node_group, r.second) ||
+			                                      removing(node_group, r.second)
+			                                : r.first == node_group;
+			    if (here) {
+				    in_effect.insert(key(r));
 			    }
 		    }
 		    // the policy reads through it: the policy goes first (design/017 §3.2a)
 		    vector<string> readers;
-		    for (auto &source : removed) {
+		    for (auto &r : removed) {
+			    if (falls_back.count(key(r))) {
+				    continue; // the cluster's source of that name stays: the policy still reads through it
+			    }
+			    auto &source = r.second;
 			    // a physical name as stored: bare (src.main.t) or quoted ("src".main.t)
 			    auto lower = StringUtil::Lower(source);
 			    auto through = [&](const char *column) {
@@ -592,32 +732,51 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 		    if (!readers.empty() && !force) {
 			    throw BinderException("acl cluster: the policy reads through %s: %s - remove those first, or DETACH %s "
 			                          "FORCE (acl_check_catalog then reports them as source_missing)",
-			                          StringUtil::Join(removed, ", "), StringUtil::Join(readers, ", "), alias);
+			                          StringUtil::Join(Names(removed), ", "), StringUtil::Join(readers, ", "), alias);
 		    }
-		    for (auto &source : removed) {
-			    statements.push_back(DeleteItem(*catalog, scope, "source", source));
-			    statements.push_back("DELETE FROM " + catalog->Tbl("cluster_deps") + " WHERE lower(\"name\") = lower(" +
-			                         Lit(source) + ")");
+		    for (auto &r : removed) {
+			    statements.push_back(DeleteItem(*catalog, r.first, "source", r.second));
+			    statements.push_back("DELETE FROM " + catalog->Tbl("cluster_deps") + " WHERE \"scope\" = " +
+			                         Lit(r.first) + " AND lower(\"name\") = lower(" + Lit(r.second) + ")");
 		    }
 	    },
 	    "config_version",
 	    [&](int64_t) {
-		    // dependents first
+		    // dependents first; only what is in effect on this node, and never a name the cluster's item
+		    // takes back on it (a re-point, the agent's through drain). The source itself may be another
+		    // group's, or a cluster item this node's group overrides, while what depends on it is here.
 		    vector<string> busy;
+		    vector<string> repointed;
 		    for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
-			    if (!NodeHasDatabase(*db, *it)) {
+			    if (!in_effect.count(key(*it)) || !NodeHasDatabase(*db, it->second)) {
+				    continue;
+			    }
+			    if (falls_back.count(key(*it))) {
+				    repointed.push_back(it->second);
 				    continue;
 			    }
 			    Connection con(*db);
-			    auto result = con.Query("DETACH " + Ident(*it));
+			    auto result = con.Query("DETACH " + Ident(it->second));
 			    if (result->HasError()) {
-				    busy.push_back(*it);
+				    busy.push_back(it->second);
 			    }
 		    }
-		    answer.applied_here = busy.empty();
+		    bool head_here = in_effect.count(key(removed[0])) > 0;
+		    if (!head_here) {
+			    NotThisNodesScope(*db, scope, answer, [&](const string &) { return true; });
+		    }
+		    answer.applied_here = head_here && busy.empty() && repointed.empty();
 		    if (removed.size() > 1) {
-			    answer.note =
-			        "detached with it: " + StringUtil::Join(vector<string>(removed.begin() + 1, removed.end()), ", ");
+			    auto names = Names(removed);
+			    answer.note += string(answer.note.empty() ? "" : "; ") + "detached with it: " +
+			                   StringUtil::Join(vector<string>(names.begin() + 1, names.end()), ", ");
+		    }
+		    if (!repointed.empty()) {
+			    answer.item_class = "drain";
+			    answer.note += string(answer.note.empty() ? "" : "; ") +
+			                   "the cluster's source of that name is in "
+			                   "effect again on this node: " +
+			                   StringUtil::Join(repointed, ", ") + " - the node agent re-points it through drain";
 		    }
 		    if (!busy.empty()) {
 			    answer.item_class = "drain";
@@ -644,6 +803,12 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 		throw BinderException("acl cluster: \"%s\" is the node's hardening, fixed by its bootstrap - never a "
 		                      "cluster profile item",
 		                      name);
+	}
+	if (StringUtil::CIEquals(name, "acl_node_group")) {
+		// spec 096: which group a node is in is its deployment's, never the policy's - a profile item
+		// would let a catalog write move nodes between groups
+		throw BinderException("acl cluster: \"acl_node_group\" is the node's own (its deployment sets it) - never a "
+		                      "cluster profile item");
 	}
 	LintKey(name, "a setting's name");
 	auto known = NodeQuery(*db, "SELECT scope FROM duckdb_settings() WHERE lower(name) = lower(" + Quoted(name) + ")");
@@ -673,10 +838,74 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 	    },
 	    "config_version",
 	    [&](int64_t) {
+		    if (NotThisNodesScope(*db, scope, answer, [&](const string &group) {
+			        return GroupHasItem(*catalog, group, "setting", StringUtil::Lower(name));
+		        })) {
+			    return;
+		    }
 		    answer.note = "restart class - the node's configuration is locked after its bootstrap; the node agent "
 		                  "rolls the change out through drain";
 	    });
 	return answer;
+}
+
+string PolicyStore::NodeGroup() {
+	auto db = instance.lock();
+	Value value;
+	if (db && db->TryGetCurrentSetting("acl_node_group", value) && !value.IsNull()) {
+		return value.ToString();
+	}
+	return string();
+}
+
+uint64_t PolicyStore::CatalogLocalWrites() {
+	return catalog ? catalog->local_writes.load() : 0;
+}
+
+bool PolicyStore::NodeGroupKnown() {
+	// the catalog judged like any read of it (spec 094): one this build may not read throws, and the
+	// report says neither the group nor the target
+	if (catalog && !catalog->FunctionMode()) {
+		catalog->EnsureFresh();
+	}
+	auto group = NodeGroup();
+	if (group.empty()) {
+		return true;
+	}
+	if (!catalog || catalog->FunctionMode()) {
+		return false;
+	}
+	return catalog->Query("SELECT 1 FROM " + catalog->Tbl("resource_groups") + " WHERE \"group\" = " + Lit(group))
+	           ->RowCount() > 0;
+}
+
+vector<PolicyStore::ClusterItem> PolicyStore::ClusterEffective() {
+	// the cluster's items, then this node's group's over them - one row per kind and name, in the
+	// profile's order (settings, extensions, sources), each with the scope it came from
+	auto group = NodeGroup();
+	vector<ClusterItem> out;
+	case_insensitive_map_t<idx_t> at;
+	for (auto &item : ClusterItems(string())) {
+		if (!item.scope.empty() && item.scope != group) {
+			continue;
+		}
+		auto key = item.kind + "\x1f" + item.name;
+		auto found = at.find(key);
+		if (found == at.end()) {
+			at[key] = out.size();
+			out.push_back(item);
+		} else if (!item.scope.empty()) {
+			out[found->second] = item; // the group's item overrides the cluster's
+		}
+	}
+	// the profile's order - settings, extensions, sources - whichever scope each came from: a group's own
+	// extension must come before the cluster's source that loads through it
+	auto rank = [](const string &kind) {
+		return kind == "setting" ? 0 : kind == "extension" ? 1 : 2;
+	};
+	std::stable_sort(out.begin(), out.end(),
+	                 [&](const ClusterItem &a, const ClusterItem &b) { return rank(a.kind) < rank(b.kind); });
+	return out;
 }
 
 int64_t PolicyStore::ClusterVersion() {
@@ -866,6 +1095,36 @@ void ItemsScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 	output.SetChildCardinality(count);
 }
 
+unique_ptr<FunctionData> EffectiveBindFn(ClientContext &context, TableFunctionBindInput &input,
+                                         vector<LogicalType> &types, vector<Identifier> &names) {
+	return ItemsBindFn(context, input, types, names);
+}
+
+unique_ptr<GlobalTableFunctionState> EffectiveInit(ClientContext &, TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<ItemsBind>();
+	auto state = make_uniq<ItemsState>();
+	state->rows = bind.store->ClusterEffective();
+	return std::move(state);
+}
+
+//! acl_cluster_applied(version) (spec 096): the node agent says which profile version this node has
+//! converged to - acl does not converge a node, it reports what the agent says (the load report's
+//! config.applied, and readiness when it equals the target)
+void ClusterAppliedFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &store = StoreOf(state);
+	for (idx_t row = 0; row < args.size(); row++) {
+		// a NULL version never arrives here: the default null handling answers NULL and records nothing
+		auto version = args.data[0].GetValue(row).GetValue<int64_t>();
+		auto target = store.ClusterVersion();
+		if (version < 0 || version > target) {
+			throw BinderException("acl_cluster_applied: version %lld is not one of the profile's (0 .. %lld)", version,
+			                      target);
+		}
+		store.cluster_applied.store(version);
+		result.SetValue(row, Value::BIGINT(version));
+	}
+}
+
 } // namespace
 
 void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {
@@ -890,6 +1149,11 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 		items.AddFunction(function);
 	}
 	loader.RegisterFunction(items);
+	// spec 096: what applies to THIS node, and the version its agent reports applied
+	TableFunction effective(Identifier("acl_cluster_effective"), {}, ItemsScan, EffectiveBindFn, EffectiveInit);
+	effective.function_info = info;
+	loader.RegisterFunction(effective);
+	scalar("acl_cluster_applied", {LogicalType::BIGINT}, ClusterAppliedFunc, LogicalType::BIGINT);
 }
 
 } // namespace acl

@@ -97,7 +97,7 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 
 ## Schema versions and migration (specs 034, 094)
 
-The catalog says which shape it is: `meta.schema_version`, currently **17**. It also says the oldest
+The catalog says which shape it is: `meta.schema_version`, currently **18**. It also says the oldest
 build that may still read it: `meta.min_reader_version`, currently **17**. A build judges the pair
 where the catalog is chosen (`acl_use_db`) and again at every freshness check (below), so a catalog
 migrated under a running node is noticed without a restart.
@@ -135,8 +135,9 @@ nodes off at their next freshness check. That upgrade is a switch-over, not a ro
 `-- min_reader: <n>` in its header. Only its author knows whether an older build that ignores what the
 step adds can ever admit more. A new column that *narrows* access, read by the new build only, would
 widen access on an old node that ignores it, so such a step must declare its own version. v16 only
-adds the cluster profile's tables, so it keeps v15 readers. Every other step is strict - v17 rebuilds
-the identity tables.
+adds the cluster profile's tables, so it keeps v15 readers, and v18 only marks a default resource group,
+so it keeps v17 readers (a v17 build has no placement to widen). Every other step is strict - v17
+rebuilds the identity tables.
 
 The steps are also kept as files (`schema/migrations/v<n>.sql`, duckdb dialect) for applying by hand on
 another engine. The shipped steps are:
@@ -150,6 +151,7 @@ another engine. The shipped steps are:
 | `v15` | 085 | adds the resource groups |
 | `v16` | 093 | adds the cluster profile; stamps `min_reader_version` 15 |
 | `v17` | 095 | rebuilds `issuers` (name, URL, secret), adds `clients`, scopes `role_mappings`; each issuer becomes the short form (an issuer named by its URL and its implicit client); keys, algs, `jwks_uri` and `client_secret` are **dropped** - an issuer that relied on them needs an `oidc_issuer` / `oidc_client` secret or reads its keys by discovery; an audience `*` no longer means "any" |
+| `v18` | 096 | adds `is_default` to `resource_groups` (the default group); keeps `min_reader_version` 17 |
 
 The contract behind this is in `schema/migrations/README.md`:
 - `acl_schema.sql` always creates the current version complete, and a migrated catalog must be

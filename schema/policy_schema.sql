@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS <grant_columns>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_T
 -- spec 085 (schema v15): resource groups - named limits bound to roles, resolved once when a session
 -- opens. A NULL limit is unset: the node's setting applies. Across a principal's groups each limit
 -- takes the most generous value; `max_sessions` is charged to the group that allows the most.
-CREATE TABLE IF NOT EXISTS <resource_groups>("group" ACL_KEY_TEXT PRIMARY KEY, "window_start" BIGINT, "window_max" BIGINT, "batch_bytes" BIGINT, "max_result_rows" BIGINT, "queue_priority" BIGINT, "max_sessions" BIGINT, "comment" VARCHAR);
+CREATE TABLE IF NOT EXISTS <resource_groups>("group" ACL_KEY_TEXT PRIMARY KEY, "window_start" BIGINT, "window_max" BIGINT, "batch_bytes" BIGINT, "max_result_rows" BIGINT, "queue_priority" BIGINT, "max_sessions" BIGINT, "comment" VARCHAR, "is_default" BOOLEAN);
 
 CREATE TABLE IF NOT EXISTS <role_resource_groups>("role" ACL_KEY_TEXT, "group" ACL_KEY_TEXT, PRIMARY KEY ("role", "group"));
 
@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS <cluster_deps>("scope" ACL_KEY_TEXT, "name" ACL_KEY_T
 -- @seed function_categories
 
 -- @section schema
-INSERT INTO <meta> SELECT 'schema_version', '17' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '18' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');

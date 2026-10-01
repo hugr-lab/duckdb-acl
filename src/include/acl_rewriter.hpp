@@ -29,6 +29,7 @@ enum class Reason : uint8_t {
 	DDL_HOME,
 	DRAINING,
 	AT_CAPACITY,
+	WRONG_RESOURCE_GROUP, // spec 096: a node of another resource group than the principal's
 	SOURCE_ERROR,
 	UNAVAILABLE,
 	WRITE_POLICY,

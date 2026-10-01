@@ -15,6 +15,7 @@
 
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_placement.hpp"
 #include "acl_rewriter.hpp"
 #include "acl_schema_sql.hpp"
 #include "acl_token.hpp"
@@ -115,6 +116,7 @@ int64_t CatalogBackend::WriteWithReads(
 	}
 	lock_guard<mutex> guard(lock);
 	checked_once = false;
+	local_writes++;
 	return version;
 }
 
@@ -157,6 +159,7 @@ void CatalogBackend::Write(const vector<string> &statements) {
 	}
 	lock_guard<mutex> guard(lock);
 	checked_once = false; // force a version re-read on the next resolve
+	local_writes++;
 }
 
 int64_t CatalogBackend::CheckIntervalMs() {
@@ -1556,6 +1559,7 @@ void PolicyStore::EnableCatalog(DatabaseInstance &db, const string &db_name, con
 	backend->EnsureFresh();          // validates reachability and the schema before switching over
 	lock_guard<mutex> guard(lock);
 	catalog = std::move(backend);
+	node_load_policy.valid = false; // spec 096: the report's reads were the old source's
 }
 
 void PolicyStore::EnableFunctions(DatabaseInstance &db, const string &slots_json) {
@@ -1596,6 +1600,7 @@ void PolicyStore::EnableFunctions(DatabaseInstance &db, const string &slots_json
 	backend->EnsureFresh(); // probes the policy_version callback before switching over
 	lock_guard<mutex> guard(lock);
 	catalog = std::move(backend);
+	node_load_policy.valid = false; // spec 096: the report's reads were the old source's
 }
 
 bool PolicyStore::CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {
@@ -1615,22 +1620,76 @@ bool PolicyStore::CatalogPrincipalMainCap(const Principal &principal, const stri
 	return catalog->PrincipalMainCap(principal, capability);
 }
 
-ResourceLimits CatalogBackend::ResourceLimitsOf(const Principal &principal) {
+ResourceLimits CatalogBackend::ResourceLimitsOf(const Principal &principal, const string &node_group) {
 	ResourceLimits out;
-	if (principal.roles.empty() || function_mode) {
+	if (function_mode) {
+		if (!node_group.empty()) {
+			out.admitted = false;
+			out.refusal = "acl: this node's resource group \"" + node_group +
+			              "\" cannot be judged - the function-driver policy source has no resource groups";
+		}
 		return out;
 	}
 	EnsureFresh();
-	vector<string> roles;
-	for (auto &role : principal.roles) {
-		roles.push_back(Lit(role));
+	static const char *COLUMNS = "g.\"group\", g.\"window_start\", g.\"window_max\", g.\"batch_bytes\", "
+	                             "g.\"max_result_rows\", g.\"queue_priority\", g.\"max_sessions\"";
+	// ONE read per open (spec 096): every group, whether the principal's roles hold it and whether it is
+	// the default - a policy has few groups, and the node's own must be among them to be known
+	string bound = "false";
+	if (!principal.roles.empty()) {
+		vector<string> roles;
+		for (auto &role : principal.roles) {
+			roles.push_back(Lit(role));
+		}
+		bound = "EXISTS (SELECT 1 FROM " + Tbl("role_resource_groups") + " rg WHERE rg.\"group\" = g.\"group\" AND " +
+		        "rg.\"role\" IN (" + StringUtil::Join(roles, ", ") + "))";
 	}
-	auto result = Query("SELECT DISTINCT g.\"group\", g.\"window_start\", g.\"window_max\", g.\"batch_bytes\", "
-	                    "g.\"max_result_rows\", g.\"queue_priority\", g.\"max_sessions\" FROM " +
-	                    Tbl("role_resource_groups") + " rg JOIN " + Tbl("resource_groups") +
-	                    " g ON g.\"group\" = rg.\"group\" WHERE rg.\"role\" IN (" + StringUtil::Join(roles, ", ") +
-	                    ") ORDER BY 1");
+	auto result = Query(string("SELECT ") + COLUMNS + ", " + bound + ", coalesce(g.\"is_default\", false) FROM " +
+	                    Tbl("resource_groups") + " g ORDER BY 1");
 	ResultRows result_rows(*result);
+	vector<vector<Value>> rows;
+	vector<Value> default_row;
+	bool known = node_group.empty();
+	for (idx_t row = 0; row < result_rows.Count(); row++) {
+		vector<Value> values;
+		for (idx_t col = 0; col < 7; col++) {
+			values.push_back(result_rows.GetValue(col, row));
+		}
+		if (values[0].ToString() == node_group) {
+			known = true;
+		}
+		if (result_rows.GetValue(7, row).GetValue<bool>()) {
+			rows.push_back(values);
+		}
+		if (default_row.empty() && result_rows.GetValue(8, row).GetValue<bool>()) {
+			default_row = std::move(values); // the first by name, should a race have left two
+		}
+	}
+	if (rows.empty() && !default_row.empty()) {
+		// a principal whose roles are in no group is a member of the default group
+		rows.push_back(std::move(default_row));
+	}
+	vector<string> groups;
+	for (auto &row : rows) {
+		groups.push_back(row[0].ToString());
+	}
+	auto placed = Place(node_group, known, groups);
+	if (!placed.admitted) {
+		out.admitted = false;
+		out.refusal = placed.refusal;
+		out.groups = groups;
+		return out;
+	}
+	if (!placed.group.empty()) {
+		// a node of a group serves the principal as a member of THAT group: its limits, nothing merged
+		vector<vector<Value>> chosen;
+		for (auto &row : rows) {
+			if (row[0].ToString() == placed.group) {
+				chosen.push_back(row);
+			}
+		}
+		rows = std::move(chosen);
+	}
 	// the most generous value per limit: where 0 means unlimited / off, 0 wins; otherwise the largest
 	auto generous = [](optional_idx &into, const Value &value, bool zero_is_unlimited) {
 		if (value.IsNull()) {
@@ -1647,21 +1706,21 @@ ResourceLimits CatalogBackend::ResourceLimitsOf(const Principal &principal) {
 	};
 	bool any_priority = false;
 	bool unlimited_sessions = false;
-	for (idx_t row = 0; row < result->RowCount(); row++) {
-		auto group = result_rows.GetValue(0, row).ToString();
+	for (auto &row : rows) {
+		auto group = row[0].ToString();
 		out.groups.push_back(group);
-		generous(out.window_start, result_rows.GetValue(1, row), true);
-		generous(out.window_max, result_rows.GetValue(2, row), true);
-		generous(out.batch_bytes, result_rows.GetValue(3, row), false);
-		generous(out.max_result_rows, result_rows.GetValue(4, row), true);
-		auto priority = result_rows.GetValue(5, row);
+		generous(out.window_start, row[1], true);
+		generous(out.window_max, row[2], true);
+		generous(out.batch_bytes, row[3], false);
+		generous(out.max_result_rows, row[4], true);
+		auto &priority = row[5];
 		if (!priority.IsNull()) {
 			auto p = priority.GetValue<int64_t>();
 			out.queue_priority = any_priority ? MaxValue(out.queue_priority, p) : p;
 			any_priority = true;
 		}
 		// a group that states no max_sessions, or 0, limits nothing: the session is charged to none
-		auto max_sessions = result_rows.GetValue(6, row);
+		auto &max_sessions = row[6];
 		if (max_sessions.IsNull() || max_sessions.GetValue<int64_t>() <= 0) {
 			unlimited_sessions = true;
 		} else if (!unlimited_sessions) {
@@ -1680,10 +1739,24 @@ ResourceLimits CatalogBackend::ResourceLimitsOf(const Principal &principal) {
 }
 
 ResourceLimits PolicyStore::ResolveResourceLimits(const Principal &principal) {
-	if (!catalog) {
-		return ResourceLimits(); // memory mode has no groups
+	string node_group;
+	{
+		Value value;
+		auto db = instance.lock();
+		if (db && db->TryGetCurrentSetting("acl_node_group", value) && !value.IsNull()) {
+			node_group = value.ToString();
+		}
 	}
-	return catalog->ResourceLimitsOf(principal);
+	if (!catalog) {
+		ResourceLimits out; // memory mode has no groups
+		if (!node_group.empty()) {
+			out.admitted = false;
+			out.refusal = "acl: this node's resource group \"" + node_group +
+			              "\" cannot be judged - the in-memory policy has no resource groups";
+		}
+		return out;
+	}
+	return catalog->ResourceLimitsOf(principal, node_group);
 }
 
 int64_t PolicyStore::MaxResultRowsFor(const string &handle) {

@@ -246,6 +246,10 @@ struct ResourceLimits {
 	optional_idx batch_bytes;
 	optional_idx max_result_rows;
 	int64_t queue_priority = 0;
+	//! spec 096: whether this node serves the principal (its resource group), and if not, why - a
+	//! sentence safe for the client and the front (group names only)
+	bool admitted = true;
+	string refusal;
 };
 
 //! The limits a resource group states, as written (spec 085): the names a group may carry
@@ -501,8 +505,10 @@ struct PolicyStore {
 	void CatalogCreateFunctionCategory(const string &name, const string &comment);
 	//! spec 085: resource groups. `limits` maps a name of RESOURCE_LIMIT_NAMES to its value (a
 	//! re-create replaces them all); a drop takes the group's role bindings with it.
+	//! spec 096: `is_default` "" keeps what the group was, "true" / "false" mark it
 	void CatalogCreateResourceGroup(const string &name, const case_insensitive_map_t<int64_t> &limits,
-	                                const string &comment);
+	                                const string &comment, const string &is_default = string());
+	void CatalogSetDefaultResourceGroup(const string &name, bool is_default);
 	void CatalogDropResourceGroup(const string &name, bool if_exists);
 	void CatalogBindResourceGroup(const string &role, const string &group, bool remove);
 	//! spec 093: the cluster profile. Each change checks, writes the item and bumps config_version in
@@ -519,6 +525,13 @@ struct PolicyStore {
 		int64_t version = 0;
 		vector<string> depends_on;
 	};
+	//! spec 096: this node's resource group (acl_node_group, '' = none), whether the policy has it, the
+	//! items that apply to this node (the cluster's, its group's over them), and the profile version the
+	//! node agent last reported applied (-1 = never)
+	string NodeGroup();
+	bool NodeGroupKnown();
+	vector<ClusterItem> ClusterEffective();
+	std::atomic<int64_t> cluster_applied {-1};
 	ClusterAnswer ClusterExtension(const string &verb, const string &scope, const string &name, const string &version,
 	                               const string &repository, const string &sha256, const string &comment);
 	ClusterAnswer ClusterAttach(const string &scope, const string &alias, const string &path, const string &type,
@@ -611,7 +624,10 @@ struct PolicyStore {
 	//! handle and a `session refused` event carrying `source_error` - never an exception a client
 	//! reads. `acl_session_open()` (door `session`) is the operator's own call and still throws: the
 	//! gateway is the trusted side by the deployment invariant, and it is the one that has to know.
-	string SessionOpen(const string &token, const string &door = "session", const string &replacing = string());
+	//! `placement` (spec 096) receives the sentence a door tells the client when the node does not serve
+	//! the principal's resource group - the one refusal a client should act on (go elsewhere).
+	string SessionOpen(const string &token, const string &door = "session", const string &replacing = string(),
+	                   string *placement = nullptr);
 	//! The operator's per-session audit level (spec 069), by the ops id; -1 inherits. False = no such session.
 	bool SetSessionAuditLevel(const string &id, int8_t level);
 	//! A session's own level by handle, -1 when it inherits or the handle is unknown.
@@ -743,6 +759,19 @@ struct PolicyStore {
 		string document;
 	};
 	DoorDocumentCache door_document; // guarded by `lock`
+	//! spec 096: what the load report reads of the policy (the group known, the profile's target),
+	//! cached a few seconds - its callers are not authenticated, and each read is a catalog query
+	struct NodeLoadPolicy {
+		std::chrono::steady_clock::time_point at;
+		string group;
+		bool group_known = false;
+		string target = "null";
+		uint64_t writes = 0; // the catalog's local_writes when read: a write here invalidates it at once
+		bool valid = false;
+	};
+	NodeLoadPolicy node_load_policy; // guarded by `lock`
+	//! the policy catalog's count of writes committed on this node (0 without a catalog)
+	uint64_t CatalogLocalWrites();
 	//! spec 095: the identity model in force (memory, catalog or function driver)
 	shared_ptr<const IdentityModel> Identity();
 	//! spec 095: an identity write. `edit` changes a copy of the model; the whole result is validated
@@ -876,7 +905,7 @@ private:
 	//! got, so a refusal event can still name who was trying. PRIVATE on purpose: calling it
 	//! directly is how the guard above would be bypassed, and a door must never be able to.
 	string SessionOpenBody(const string &token, const string &door, Principal &principal, SessionOpenInfo &opened,
-	                       const string &replacing);
+	                       const string &replacing, string *placement);
 
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);
