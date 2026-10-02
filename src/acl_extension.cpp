@@ -143,6 +143,12 @@ void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("acl_metrics_endpoint",
 	                          "acl: serve GET /metrics (Prometheus text) on the embedded quack listener",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
+	// spec 097: the load report and /metrics answer a bearer token holding `observe`; this opens them
+	// to anyone who reaches the port (a standalone node scraped without credentials) - an opt-out
+	config.AddExtensionOption("acl_observe_unauthenticated",
+	                          "acl: serve the load report and /metrics without a token (default: only to a "
+	                          "bearer token whose roles hold the observe scope)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 	// the two client-local trace settings (spec 069): session scope, and the one pair a principal may
 	// SET on a session of its own (spec 068's allowlist) - a door composes them into the prefix
 	config.AddExtensionOption("acl_correlation_id",

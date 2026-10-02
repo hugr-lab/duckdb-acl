@@ -45,6 +45,9 @@ SET GLOBAL acl_allow_anonymous_admin=false;
 -- the audit's counters through the door's own listener (spec 069): run.sh reads GET /metrics after
 -- the clients are done and checks the loads and the sessions it caused are counted
 SET GLOBAL acl_metrics_endpoint=true;
+-- spec 097: the metrics answer a bearer holding `observe`; this harness is about the door under load,
+-- not who reads its counters, so it scrapes without one - the operator's explicit opt-out
+SET GLOBAL acl_observe_unauthenticated=true;
 
 -- --- the door ------------------------------------------------------------------------------------
 SELECT acl_quack_serve('quack:localhost:${ACL_E2E_PORT}', '${ACL_E2E_SERVER_TOKEN}');

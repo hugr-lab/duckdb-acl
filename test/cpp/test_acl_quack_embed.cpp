@@ -34,6 +34,63 @@ const char *const TOKEN =
     "8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Ty"
     "sjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A";
 
+// spec 097: service principals of the same issuer - roles `observer` (GRANT ADMIN observe), `mgr`
+// (an unrestricted manage), `catmgr` (manage of one catalog only) and `pt` (passthrough)
+const char *const PASSTHROUGH_TOKEN =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InN2Yy1wdCIsInJvbGVzIjpbInB0Il19.ea3v4v03I4CVy724GyV"
+    "uOP4yfco_jaZfpBoaFGlIj7YAaNmejrf8OPfOlanQFTtwQWkHWo0tmpvNSxcpkR7EHDHq2PLTEtNOrPfxntauCAtWNIvW4gO4o7s"
+    "NcSKChiunvxuUQXPgo5sRcMtIT2mIKIeHZFwtHHYGbskLRdmbBq7YCTggf1SfRoXIp-2DVbOaqiBsTyM1k65ak5VHpxORDYALQU7"
+    "fkiHavbUsEe7TFlfu2aNLQfw0MV42ODdRnrt_gPfS7I_hoy1CA4uN7gOE8E2trm5Zv6nGyVIdqTMCr6s1cQWy0WW4TRubkSZvSik"
+    "QG01rRsPLOi5C3jNkBdalVQ";
+const char *const OBSERVER_TOKEN =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InN2Yy1vYnNlcnZlciIsInJvbGVzIjpbIm9ic2VydmVyIl19.DB5"
+    "7ToRZb-AS6ei1s17oZMJMWuafJACzI5SfYFEiDRypcaYrWAfNpELBfmOVC9dZ9U8ZpGUM5D9FfIr6FOZu09kyBwjCCwBysGVwM9c"
+    "fTgEMh_5lTVvc7XUjChnnKr1Bv3Au56agB78j5JF5ZhYgOIfjkSaZS86ACPiAsyp3z2szyCyCTfZwd9_pEewZCHtvt0DcI5mNG-I"
+    "9IuEVCzkQ_hLQOjs8c3axJj7uu345g6b0blWo8AfxcoKNErwZ8JQDBte0AG9Psvio2gvOJVF8tYkfQKgXVvfu0x2_LrQTXdlG1aJ"
+    "L7Bf5RRoCbhmfF1Wd2xuTy7R2V2TuxbQaymBGwA";
+const char *const MANAGER_TOKEN =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InN2Yy1tZ3IiLCJyb2xlcyI6WyJtZ3IiXX0.LYv-MIDAqch_cTM5"
+    "qG7hI5t-9X2rC9-klo5wNxN6X_0HzoLB6WUT4ue-Lj-_081sV0g9LVOBWzqrr_9UbtVi5yeDF1u8civJ2SO1pg-tRmJHBDvzuV8Z"
+    "Q5Te0VDC0AzXg4g7RxejGpkKZhDoCBS4EfJs1IEKWYfULaN4TM1awHU0A1uBb7MsxCSkYBnuceFdggI_xDnXyRsaR0GkKaHh1Wrj"
+    "f5tNON_pO8hUSbpJcyGfilalN-WGrmE-vEB9oW-DVB4VnDRVQ4wTHCdcVq9R3upkB1uU4UtPbUyx8t9Sddma6kCY-QABatkrk-VM"
+    "wBUMCV4CcMmBLgUDZyGjzfaWUQ";
+const char *const CATALOG_MANAGER_TOKEN =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBp"
+    "Oi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InN2Yy1jYXRtZ3IiLCJyb2xlcyI6WyJjYXRtZ3IiXX0.b0iVRlBx"
+    "6-5vWHE2F1XCYFGIjbl5fDJUH7AD4Yiid8KMboO6Xuj6MwXOTp3Hkf9bTto6cd99luOzuaz2NIqIbkMoYlNwFH2I2jfMUvgaO_8H"
+    "1ZnNApIJQjjs8S3sMynw1PZlHJCECoIvdVKwC1Kw8ZEIaI165fw6V-4XL2EP65QMtlF9JP33LrWWMEoXGgCQSlzP0oA6Ty2JSh-P"
+    "shyeNwBG1ixz6QWYXRGPxQwS-gwuLK61Ng_ZmTUqne3ckZ99cWbIyieaRR37XMwVQXLyhWMoBc8J7bgiY8MSdui201iv4o5yByth"
+    "oycYrjbhFiju4oMVnPqXfN9DwiGo2IzS9Q";
+
+struct ObservedResult {
+	int status = 0;
+	std::string body;
+	std::string error;
+	std::string www_authenticate;
+};
+
+//! spec 097: GET with an `Authorization: Bearer` header ("" = none) against the door
+ObservedResult GetObserved(const std::string &path, const std::string &token) {
+	duckdb_httplib::Client client("localhost", 31975);
+	duckdb_httplib::Headers headers;
+	if (!token.empty()) {
+		headers.emplace("Authorization", "Bearer " + token);
+	}
+	ObservedResult result;
+	auto response = client.Get(path, headers);
+	if (!response) {
+		result.error = "no response";
+		return result;
+	}
+	result.status = response->status;
+	result.body = response->body;
+	result.www_authenticate = response->get_header_value("WWW-Authenticate");
+	return result;
+}
+
 //! The same fake IdP the provider test uses, trimmed to the password grant.
 struct FakeIdp {
 	duckdb_httplib::Server server;
@@ -125,6 +182,19 @@ void SetupFixture(Connection &con, const std::string &httpfs_ext, const std::str
 	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN");
 	Exec(con, "ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{\"select\": true}' "
 	          "RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,tenant'");
+	// spec 097: who may read the load report and the metrics
+	Exec(con, "ACL ADMIN CREATE ROLE observer");
+	Exec(con, "ACL ADMIN GRANT ADMIN observe TO ROLE observer");
+	Exec(con, "ACL ADMIN CREATE ROLE mgr");
+	Exec(con, "ACL ADMIN GRANT ADMIN manage TO ROLE mgr");
+	Exec(con, "ACL ADMIN CREATE ROLE catmgr");
+	Exec(con, "ACL ADMIN GRANT CATALOG c TO ROLE catmgr CAPS '{\"manage\": true}'");
+	Exec(con, "ACL ADMIN CREATE ROLE pt");
+	Exec(con, "ACL ADMIN GRANT ADMIN passthrough TO ROLE pt");
+	// a privileged role - observe included - is reached only through the client's own mapping (spec 095)
+	for (auto role : {"observer", "mgr", "catmgr", "pt"}) {
+		Exec(con, std::string("ACL ADMIN MAP CLAIM '") + role + "' FROM CLIENT 'test/idp/s' TO ROLE " + role);
+	}
 	Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
 }
 
@@ -177,12 +247,12 @@ int main(int argc, char *argv[]) {
 		});
 
 		Scenario("GET /metrics is opt-in and renders what acl_metrics() answers (spec 069)", [&] {
-			auto off = duckdb::acl::oidc::HttpGet("http://localhost:31975/metrics");
+			auto off = GetObserved("/metrics", OBSERVER_TOKEN);
 			Check(off.status == 404,
 			      "off by default: 404, like a route that is not there (" + std::to_string(off.status) + ")");
 			Exec(con, "SET GLOBAL acl_metrics_endpoint = true");
-			auto on = duckdb::acl::oidc::HttpGet("http://localhost:31975/metrics");
-			Check(on.Ok() && on.status == 200, "on: the Prometheus text answers: " + on.error);
+			auto on = GetObserved("/metrics", OBSERVER_TOKEN);
+			Check(on.status == 200, "on: the Prometheus text answers an observer: " + on.error);
 			Check(on.body.find("# TYPE acl_sessions_live gauge\n") != std::string::npos,
 			      "...with a TYPE line per metric");
 			// the client's ATTACH above opened a session at this door: the counter names the door, and
@@ -200,16 +270,66 @@ int main(int argc, char *argv[]) {
 			          on.body.find("role=") == std::string::npos,
 			      "no principal, object or role label anywhere in the text");
 			Exec(con, "SET GLOBAL acl_metrics_endpoint = false");
-			auto again = duckdb::acl::oidc::HttpGet("http://localhost:31975/metrics");
+			auto again = GetObserved("/metrics", OBSERVER_TOKEN);
 			Check(again.status == 404, "off again: 404 - the setting is read per request");
 		});
 
+		Scenario("the load report and /metrics answer only the observe scope (spec 097)", [&] {
+			Exec(con, "SET GLOBAL acl_metrics_endpoint = true");
+			for (auto path : {"/metrics", "/.well-known/acl-node"}) {
+				auto p = std::string(path);
+				auto none = GetObserved(p, "");
+				Check(none.status == 401 && none.www_authenticate == "Bearer" && none.body == "unauthorized\n",
+				      p + ": no token is 401 with WWW-Authenticate: Bearer, and says no more (" +
+				          std::to_string(none.status) + " " + none.body + ")");
+				auto bad = GetObserved(p, "not-a-jwt");
+				Check(bad.status == 401,
+				      p + ": a token that does not verify is 401 (" + std::to_string(bad.status) + ")");
+				auto analyst = GetObserved(p, TOKEN);
+				Check(analyst.status == 403 && analyst.body == "forbidden\n",
+				      p + ": a principal without observe is 403 (" + std::to_string(analyst.status) + ")");
+				auto catalog_manager = GetObserved(p, CATALOG_MANAGER_TOKEN);
+				Check(catalog_manager.status == 403, p + ": a catalog-scoped manage does not read the node's report (" +
+				                                         std::to_string(catalog_manager.status) + ")");
+				Check(GetObserved(p, OBSERVER_TOKEN).status == 200, p + ": observe reads it");
+				Check(GetObserved(p, MANAGER_TOKEN).status == 200, p + ": an unrestricted manage implies observe");
+				Check(GetObserved(p, PASSTHROUGH_TOKEN).status == 200, p + ": passthrough implies observe");
+			}
+			// the operator's opt-out: anyone who reaches the port, and the report says which mode is in force
+			Check(GetObserved("/.well-known/acl-node", OBSERVER_TOKEN).body.find("\"observe\":\"token\"") !=
+			          std::string::npos,
+			      "the report says the token mode is in force");
+			Exec(con, "SET GLOBAL acl_observe_unauthenticated = true");
+			auto open = GetObserved("/.well-known/acl-node", "");
+			Check(open.status == 200 && open.body.find("\"observe\":\"open\"") != std::string::npos,
+			      "acl_observe_unauthenticated opens both routes without a token: " + std::to_string(open.status));
+			Check(GetObserved("/metrics", "").status == 200, ".../metrics too");
+			Exec(con, "SET GLOBAL acl_observe_unauthenticated = false");
+			Check(GetObserved("/metrics", "").status == 401, "closed again: 401 - read per request");
+			// reads are counted, refusals are recorded and counted - by surface and result, never a principal;
+			// the counters are the audit worker's, so drain it first
+			Exec(con, "SELECT acl_audit_flush()");
+			auto counted = con.Query("SELECT count(*) FROM acl_metrics() WHERE name = 'acl.door.observe' AND "
+			                         "attributes LIKE '%\"result\":\"allowed\"%'");
+			if (CheckOk(*counted, "acl.door.observe is a counter")) {
+				Check(counted->Collection().GetValue(0, 0).GetValue<int64_t>() >= 2,
+				      "...with allowed reads of both surfaces");
+			}
+			auto refused = con.Query("SELECT count(*) FROM acl_metrics() WHERE name = 'acl.door.observe' AND "
+			                         "attributes LIKE '%\"result\":\"capability\"%'");
+			if (CheckOk(*refused, "...and the refusals")) {
+				Check(refused->Collection().GetValue(0, 0).GetValue<int64_t>() >= 1,
+				      "...a refusal without the scope counted as capability");
+			}
+			Exec(con, "SET GLOBAL acl_metrics_endpoint = false");
+		});
+
 		Scenario("GET /.well-known/acl-node is the load report, behind the /metrics switch (spec 079)", [&] {
-			auto off = duckdb::acl::oidc::HttpGet("http://localhost:31975/.well-known/acl-node");
+			auto off = GetObserved("/.well-known/acl-node", OBSERVER_TOKEN);
 			Check(off.status == 404, "off with acl_metrics_endpoint: 404 (" + std::to_string(off.status) + ")");
 			Exec(con, "SET GLOBAL acl_metrics_endpoint = true");
-			auto on = duckdb::acl::oidc::HttpGet("http://localhost:31975/.well-known/acl-node");
-			Check(on.Ok() && on.status == 200, "on: the report answers: " + on.error);
+			auto on = GetObserved("/.well-known/acl-node", OBSERVER_TOKEN);
+			Check(on.status == 200, "on: the report answers: " + on.error);
 			Check(on.body.find("\"uri\":\"quack:localhost:31975\"") != std::string::npos &&
 			          on.body.find("\"seats\":16") != std::string::npos,
 			      "it names this door and its seats (1024 / 64): " + on.body);

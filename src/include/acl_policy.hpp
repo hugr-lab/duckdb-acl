@@ -167,10 +167,15 @@ struct IntrospectionRows {
 #ifdef PASSTHROUGH
 #undef PASSTHROUGH
 #endif
-enum class AdminScope : uint8_t { NONE, MANAGE, PASSTHROUGH };
+//! Ordered: a stronger scope implies what a weaker one may do. OBSERVE (spec 097) reads the node's load
+//! report and metrics and administers nothing - "may administer" is `>= MANAGE`, never `!= NONE`.
+enum class AdminScope : uint8_t { NONE, OBSERVE, MANAGE, PASSTHROUGH };
 
 //! Parse/print the scope names used by the admin functions, the grammar and the policy source
 AdminScope ParseAdminScope(const string &scope);
+//! The read path's parse (spec 097): a scope this build does not know is no scope, never an error - so
+//! a scope a later build writes cannot break an older one inside the schema window (spec 094)
+bool TryParseAdminScope(const string &scope, AdminScope &out);
 const char *AdminScopeName(AdminScope scope);
 
 //! duckdb answers "what is in this catalog?" three ways - a table function, a view of the same name
@@ -870,6 +875,12 @@ struct PolicyStore {
 	struct AdminRights {
 		AdminScope scope = AdminScope::NONE;
 		bool unrestricted_manage = false;
+		//! spec 097: may read the load report and the metrics - an `observe` grant, or implied by
+		//! passthrough and by an unrestricted manage (a catalog-scoped manage is not the node's)
+		bool observe = false;
+		//! spec 097: an `admins` row whose scope this build does not know. It grants nothing here, but
+		//! the role stays privileged (spec 095) - a later scope must not open its role to IdP group names
+		bool unknown_scope = false;
 		//! catalogs this principal may manage, compared exactly - the policy source compares vcat with
 		//! SQL `=`, so authorizing case-insensitively would authorize a different catalog
 		std::set<string> catalogs;

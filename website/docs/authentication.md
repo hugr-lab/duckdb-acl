@@ -200,8 +200,9 @@ ACL ADMIN DROP MAP CLAIM 'sales' FROM ISSUER kc TO ROLE analyst;
 SELECT acl_map_role('client' | 'issuer', scope, 'group' | 'claim-value', external_value, role);
 ```
 
-**A role that administers** - one that holds `manage` or `passthrough` (spec 009), globally or on a
-catalog - is reached **only through an explicit mapping of the client itself**: an issuer-scope
+**A role that administers** - one that holds any administration scope: `manage` or `passthrough`
+(spec 009), globally or on a catalog, `observe` (spec 097), or a scope this build does not know - is
+reached **only through an explicit mapping of the client itself**: an issuer-scope
 mapping to it is refused where written and dropped where used, `UNMAPPED AS ROLE` never yields it,
 `ROLES CONSTANT` cannot name it, and a role that becomes privileged later is dropped at use. So a
 customer's IdP can never hand out administration by naming a group `admin`.

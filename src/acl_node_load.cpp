@@ -5,6 +5,7 @@
 #include "acl_node_load.hpp"
 
 #include "acl_door_common.hpp"
+#include "acl_rewriter.hpp"
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
@@ -39,6 +40,102 @@ bool NodeLoadServed(DatabaseInstance &db) {
 	Value on;
 	return DBConfig::GetConfig(db).TryGetCurrentSetting("acl_metrics_endpoint", on) && !on.IsNull() &&
 	       on.GetValue<bool>();
+}
+
+namespace {
+
+//! spec 097: the operator's explicit opt-out - the pull surfaces answer without a token
+bool ObserveOpen(DatabaseInstance &db) {
+	Value open;
+	return DBConfig::GetConfig(db).TryGetCurrentSetting("acl_observe_unauthenticated", open) && !open.IsNull() &&
+	       open.GetValue<bool>();
+}
+
+} // namespace
+
+ObserveVerdict ObserveAuthorize(DatabaseInstance &db, PolicyStore &store, const string &authorization, const char *door,
+                                const char *surface) {
+	auto detail = string("observe_") + surface;
+	auto refuse = [&](ObserveVerdict verdict, const string &code, const string &reason, const Principal *who) {
+		try {
+			store.AuditDoor(door, detail, false, code, reason, string(), who);
+		} catch (...) { // NOLINT: the refusal stands whatever the audit does
+		}
+		return verdict;
+	};
+	// the decision cannot be made - the node's policy or keys - is 503, never the caller's 401
+	auto unavailable = [&](const string &code, const string &reason, const Principal *who) {
+		return refuse(ObserveVerdict::UNAVAILABLE, code, reason, who);
+	};
+	try {
+		if (!NodeLoadServed(db)) {
+			return ObserveVerdict::OFF;
+		}
+		if (ObserveOpen(db)) {
+			store.AuditDoor(door, detail, true, "", "");
+			return ObserveVerdict::ALLOWED;
+		}
+		// `Bearer <token>`, the scheme case-insensitive (RFC 6750); anything else is no token
+		string token;
+		auto trimmed = authorization;
+		StringUtil::Trim(trimmed);
+		if (trimmed.size() > 7 && StringUtil::CIEquals(trimmed.substr(0, 7), "bearer ")) {
+			token = trimmed.substr(7);
+			StringUtil::Trim(token);
+		}
+		if (token.empty()) {
+			return refuse(ObserveVerdict::UNAUTHENTICATED, "principal", "acl: the load report needs a bearer token",
+			              nullptr);
+		}
+		TakeDenyReason(); // a note nobody audited must not name this refusal
+		try {
+			// the identity model first, as SessionOpen reads it: a source that fails here is the node's
+			store.Identity();
+		} catch (std::exception &ex) {
+			TakeDenyReason();
+			return unavailable("source_error", ErrorData(ex).RawMessage(), nullptr);
+		}
+		Principal principal;
+		try {
+			if (!store.VerifyPrincipal(true, token, principal)) {
+				return refuse(ObserveVerdict::UNAUTHENTICATED, "principal", "acl: the bearer token did not verify",
+				              nullptr);
+			}
+		} catch (std::exception &ex) {
+			// the keys' source failing, or a policy the node cannot apply (a refused key location, an
+			// ambiguous client), is not the caller's fault: 503, and the audit says which
+			auto code = TakeDenyReason();
+			auto message = ErrorData(ex).RawMessage();
+			if (code == "source_error" || code == "policy_error") {
+				return unavailable(code, message, nullptr);
+			}
+			// a token the policy refuses always says so (`acl_rewrite: token rejected: ...`); anything
+			// else without a note is the node's - a catalog read that failed between freshness checks
+			if (code.empty() && !StringUtil::StartsWith(message, "acl_rewrite: token rejected")) {
+				return unavailable("source_error", message, nullptr);
+			}
+			return refuse(ObserveVerdict::UNAUTHENTICATED, code.empty() ? "principal" : code, message, nullptr);
+		}
+		PolicyStore::AdminRights rights;
+		try {
+			// cached per principal until the next policy version - a poll costs one signature check
+			rights = store.AdminRightsOf(principal);
+		} catch (std::exception &ex) {
+			TakeDenyReason(); // EnsureFresh's note: this thread serves the next request too
+			return unavailable("source_error", ErrorData(ex).RawMessage(), &principal);
+		}
+		if (!rights.observe) {
+			return refuse(ObserveVerdict::FORBIDDEN, "capability",
+			              "acl: reading the load report needs the observe scope (GRANT ADMIN observe)", &principal);
+		}
+		store.AuditDoor(door, detail, true, "", "", string(), &principal);
+		return ObserveVerdict::ALLOWED;
+	} catch (std::exception &ex) {
+		TakeDenyReason();
+		return unavailable("source_error", ErrorData(ex).RawMessage(), nullptr);
+	} catch (...) { // NOLINT: never into the HTTP or gRPC handler
+		return ObserveVerdict::UNAVAILABLE;
+	}
 }
 
 string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
@@ -123,6 +220,7 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 	}
 #endif
 	return "{\"draining\":" + string(draining ? "true" : "false") +
+	       ",\"observe\":" + (ObserveOpen(db) ? "\"open\"" : "\"token\"") +
 	       ",\"group\":" + (group.empty() ? string("null") : JsonQuote(group)) +
 	       ",\"group_known\":" + (group_known ? "true" : "false") + ",\"config\":{\"target\":" + target +
 	       ",\"applied\":" + (applied < 0 ? string("null") : std::to_string(applied)) + "}" +

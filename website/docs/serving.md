@@ -329,6 +329,34 @@ and whether a new session or quack client would be admitted. An orchestrator rea
 - `GET /.well-known/acl-node` on the quack listener;
 - the Flight Handshake payload `node-load`.
 
+**Who may read it** (spec 097). Both places - and `GET /metrics` - answer only a bearer token whose
+roles hold the **`observe`** scope (`GRANT ADMIN observe TO ROLE r`), or `passthrough` / an
+unrestricted `manage`, which imply it. `observe` reads; it administers nothing. The token travels as
+`Authorization: Bearer <jwt>` (on the Flight Handshake: its `authorization` header, `Bearer` or the
+bare token) and is verified like a session's, offline; no session is opened. The answers: 404 while
+`acl_metrics_endpoint` is off (Flight `NotImplemented`), 401 with `WWW-Authenticate: Bearer` for no
+token or one that does not verify (Flight `Unauthenticated`), 403 for a principal without the scope
+(Flight `Unauthorized`, gRPC PERMISSION_DENIED), 503 when the node cannot decide - its policy source or
+keys do not answer, or its identity policy cannot be applied (Flight `Unavailable`). A refusal says no more than its status; the audit records it
+(a `door` event `observe_<surface>`), and every read is counted (`acl.door.observe{door,surface,result}`).
+Like every privileged role, an `observe` role is reached only through a client's own mapping
+(`MAP CLAIM … FROM CLIENT c TO ROLE r`). For a standalone node scraped by a Prometheus without
+credentials, `SET GLOBAL acl_observe_unauthenticated = true` opens all three to anyone who reaches
+the port; the report says which mode is in force (`"observe": "token" | "open"`). The setting is the
+node's - never a cluster profile item.
+
+```yaml
+# prometheus.yml - a scrape with the observer's token
+scrape_configs:
+  - job_name: acl-node
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /var/run/secrets/acl-observer-token
+    static_configs:
+      - targets: ["node-1:8815"]
+```
+
 **The stream budget** (spec 080). A producing quack statement reserves the memory its stream can
 hold, its producer buffer plus its batches in flight, against `acl_node_stream_budget`. That budget
 defaults to half the memory limit. A statement that finds the budget full waits on the node, in
@@ -552,8 +580,10 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
   `acl.policy.version/staleness/reloads/writes/source_errors`, `acl.jwks.refreshes/age`,
   `acl.audit.events/dropped/sink_errors/queue_fill/ring_fill`, `acl.node.draining/uptime/info`.
   Attribute values come from bounded sets only - never a role, a subject or an object name.
+  `acl.door.observe{door,surface,result}` (reads of the load report and the metrics, spec 097).
   `SET GLOBAL acl_metrics_endpoint = true` adds `GET /metrics` (Prometheus text) to the quack door's
-  listener, unauthenticated like discovery; 404 while off.
+  listener, for a bearer token holding `observe` (spec 097; see the load report above); 404 while off.
+  A node running `acl_otel` exports the same counters and gauges over OTLP and needs neither.
 - **Tracing** - a statement's trace rides in the prefix as `TRACE '<correlation id>'` and
   `PARENT '<W3C traceparent>'`, written by whoever composes it: a gateway calling `acl_session_sql`
   sets `acl_correlation_id` / `acl_traceparent` on its connection first; a quack client SETs the same

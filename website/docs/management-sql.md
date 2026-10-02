@@ -753,11 +753,14 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
 ## Administration scopes
 
 ```
-GRANT ADMIN manage | passthrough TO ROLE <role>
+GRANT ADMIN observe | manage | passthrough TO ROLE <role>
 REVOKE ADMIN FROM ROLE <role>
 ```
 
-The global scopes. `manage` is the management grammar over every catalog plus the statements that
+The global scopes - a role holds one; granting another **replaces** it, so `GRANT ADMIN observe` on a
+role that holds `manage` takes the `manage` away (grant the reading scope to a role of its own).
+`observe` (spec 097) reads the node's load report and `/metrics` and administers nothing; `manage`
+and `passthrough` imply it. `manage` is the management grammar over every catalog plus the statements that
 belong to no catalog (roles, issuers, mappings, catalogs themselves, grants). `passthrough` is
 anything, including `ACL NATIVE` SQL outside the virtual catalog. Granting or revoking a scope needs
 `passthrough` - a `manage` scope never hands out scopes, and no scope is self-granted. Managing one
@@ -988,6 +991,7 @@ takes those of its expanded records too.
   | anonymous `ACL ADMIN` (where allowed)                               | everything, native SQL included                                                                                                                                 |
   | `passthrough` (`GRANT ADMIN passthrough`)                           | everything, native SQL included                                                                                                                                 |
   | global `manage` (`GRANT ADMIN manage`)                              | every management statement except `GRANT ADMIN` / `REVOKE ADMIN`; no `ACL NATIVE`                                                                               |
+  | `observe` (`GRANT ADMIN observe`)                                   | no management statement and no `ACL NATIVE` - it reads the load report and `/metrics` (spec 097)                                                               |
   | catalog-scoped `manage` (`GRANT CATALOG c … CAPS '{"manage": true}'`) | statements whose target names one of its catalogs; **not** `GRANT`/`REVOKE CATALOG`, `GRANT`/`REVOKE SCHEMA`, `GRANT TABLE`/`VIEW`/`OBJECT`, `ALTER GRANT`, `DROP VIRTUAL CATALOG` (handing out or taking away access is privilege administration), and not the statements that belong to no catalog (roles, issuers, mappings, `CREATE VIRTUAL CATALOG`) |
 
   Catalog names are compared exactly, case included. A `manage` scope can create anything the

@@ -162,7 +162,7 @@ ALTER RESOURCE GROUP general SET DEFAULT | DROP DEFAULT;
   two match; the readiness probe reads the report.
 - `admit.new_session` turns false while `group_known` is false.
 - What the report reads from the catalog (`group_known`, `config.target`) is cached for 2 s - the
-  endpoint is unauthenticated and polled - and dropped at once by a write this node commits; the
+  endpoint is polled (and, until spec 097, unauthenticated) - and dropped at once by a write this node commits; the
   catalog is judged first (spec 094), so a node outside the schema window reports neither.
 - `acl_cluster_applied(version)` is the operator's (denied to a principal, like every `acl_*`); a
   version above the target is refused.

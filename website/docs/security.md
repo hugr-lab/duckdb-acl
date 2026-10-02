@@ -262,9 +262,10 @@ A slow or throwing sink costs dropped events, counted, never a slower statement;
 still counts. One source - a session, a principal, a door - has at most
 `acl_audit_denials_per_second` refusals recorded per second (all are counted), so a flood of cheap
 refusals cannot push other principals' records out of the ring, the queue or a sink. The audit
-surface is refused to a principal like every other operator function; the Prometheus route is
-opt-in and unauthenticated by design, like discovery - it publishes counts and states, nothing a
-principal could not infer from its own refusals.
+surface is refused to a principal like every other operator function; the Prometheus route and the
+load report are opt-in (`acl_metrics_endpoint`) and answer only a bearer token whose roles hold the
+`observe` scope (spec 097) - `acl_observe_unauthenticated` is the operator's explicit opt-out for a
+private address. They publish counts and states, never a principal, a handle or an object name.
 
 ## 3. Capabilities and scopes
 
@@ -278,6 +279,7 @@ principal could not infer from its own refusals.
 | `explain` | MAIN catalog grant | **no** | `EXPLAIN [ANALYZE]` - "a plan names the physical objects a query resolves to" (spec 052) |
 | admin scope `manage` (global) | `acl.admins` via `acl_grant_admin` | - | the management grammar over every catalog plus catalog-less statements |
 | admin scope `passthrough` | `acl.admins` via `acl_grant_admin` | - | everything, including `ACL NATIVE`; the only scope that grants scopes |
+| admin scope `observe` | `acl.admins` via `acl_grant_admin` | - | reading the load report and `/metrics` (spec 097); administers nothing - implied by `passthrough` and a global `manage` |
 
 The rules behind the table (spec 012): a grant "written without `CAPS` - or a driver row with
 NULL/empty caps - means `select, insert, update, delete, merge`, never `manage`; an explicit `'{}'`
@@ -571,8 +573,8 @@ Before a node serves anyone:
 - [ ] `acl_allow_anonymous_admin` is **off** once the first `passthrough` admin exists; the doors
       refuse to open while it is on.
 - [ ] The audit goes somewhere that outlives the node (`acl_audit_sink`, or a registered sink) and
-      `acl.audit.dropped` is watched; `acl_metrics_endpoint` is on only where the listener's address
-      is not public, or the scrape is fronted (spec 069).
+      `acl.audit.dropped` is watched; the load report and `/metrics` answer only an `observe` token
+      (spec 097) - `acl_observe_unauthenticated` stays off unless the listener's address is private.
 - [ ] Admin scopes are minimal: catalog-scoped `manage` for operators of one catalog, `passthrough`
       for the platform only - it is "the actual god mode" and the only scope that runs `ACL NATIVE`.
 - [ ] Sensitive objects declare `COLUMNS (…)`; no whole-table grant sits on a live alias whose

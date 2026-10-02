@@ -4,7 +4,8 @@
 Usage: auth_client.py <uri> <check> [args...] [--tls-roots cert.pem]
 Checks:
   discover                 print the discovery JSON the door answers to the 'discover-auth' payload
-  node-load                print the load report the door answers to the 'node-load' payload (spec 079)
+  node-load [<jwt>]        print the load report the door answers to the 'node-load' payload (spec 079),
+                           the Handshake carrying `authorization: Bearer <jwt>` when given (spec 097)
   password <user> <pass> <sql>   authenticate with BasicAuth, run sql under the earned bearer, print rows
   password-raw <user> <pass> <sql>   the same as arrow-go sends it (ADBC's Go and Python drivers, spec 089):
                            the Basic value base64 WITHOUT '=' padding, the bearer read from the response
@@ -74,11 +75,13 @@ elif check == "node-load":
             return b""
 
     handler = NodeLoad()
+    bearer = args[2] if len(args) > 2 else ""
+    options = fl.FlightCallOptions(headers=[(b"authorization", b"Bearer " + bearer.encode())]) if bearer else None
     try:
-        client.authenticate(handler)
+        client.authenticate(handler, options=options)
         print(handler.doc.decode())
     except fl.FlightError as e:
-        print("refused: " + str(e))
+        print("refused: " + type(e).__name__ + ": " + str(e))
 elif check == "password":
     user, password, sql = args[2], args[3], args[4]
     pair = client.authenticate_basic_token(user, password)

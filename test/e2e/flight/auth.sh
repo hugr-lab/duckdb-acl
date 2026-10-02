@@ -108,15 +108,43 @@ case "$got" in *client_secret*) fail "discovery leaked a client secret field: $g
 got="$(ask "$URI" node-load --tls-roots "$TMP/cert.pem")"
 case "$got" in *"load report is off"*) ;; *) fail "the load report answered while acl_metrics_endpoint is off: $got";; esac
 echo "SET GLOBAL acl_metrics_endpoint = true;" >&3
+# spec 097: on, it answers only a bearer whose roles hold `observe` - first nobody's
 for _ in $(seq 1 40); do
 	got="$(ask "$URI" node-load --tls-roots "$TMP/cert.pem")"
+	case "$got" in *"load report is off"*) sleep 0.25;; *) break;; esac
+done
+case "$got" in *FlightUnauthenticatedError*"needs a valid bearer token"*) ;; *) fail "the load report answered a Handshake without a bearer: $got";; esac
+# ...then the analyst's: verified, but no observe scope
+ANALYST_JWT="$(curl -s -d 'grant_type=password&username=alice&password=wonder&client_id=acl-door' "$IDP/token" \
+	| python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+got="$(ask "$URI" node-load "$ANALYST_JWT" --tls-roots "$TMP/cert.pem")"
+case "$got" in *FlightUnauthorizedError*"needs the observe scope"*) ;; *) fail "the load report answered a bearer without observe: $got";; esac
+# ...then a watcher's: the scope, reached through the client's own mapping (a privileged role, spec 095)
+{
+	echo "SET GLOBAL acl_allow_anonymous_admin=true;"
+	echo "ACL ADMIN CREATE ROLE watcher;"
+	echo "ACL ADMIN GRANT ADMIN observe TO ROLE watcher;"
+	echo "ACL ADMIN MAP CLAIM 'analyst' FROM CLIENT '$IDP' TO ROLE analyst;"
+	echo "ACL ADMIN MAP CLAIM 'analyst' FROM CLIENT '$IDP' TO ROLE watcher;"
+	echo "SET GLOBAL acl_allow_anonymous_admin=false;"
+} >&3
+for _ in $(seq 1 40); do
+	got="$(ask "$URI" node-load "$ANALYST_JWT" --tls-roots "$TMP/cert.pem")"
 	case "$got" in *'"admit"'*) break;; esac
 	sleep 0.25
 done
 echo "$got" | grep -q '"new_session":true' || fail "the load report does not admit a new session: $got"
 echo "$got" | grep -q '"by_door":{"flight":' || fail "the load report does not count sessions per door: $got"
-case "$got" in *alice*|*analyst*) fail "the load report names a principal: $got";; esac
+echo "$got" | grep -q '"observe":"token"' || fail "the load report does not say the token mode is in force: $got"
+case "$got" in *alice*|*analyst*|*watcher*) fail "the load report names a principal: $got";; esac
 echo "SET GLOBAL acl_metrics_endpoint = false;" >&3
+# the sections below keep their principals as they were: the watcher mapping goes again
+{
+	echo "SET GLOBAL acl_allow_anonymous_admin=true;"
+	echo "ACL ADMIN DROP MAP CLAIM 'analyst' FROM CLIENT '$IDP' TO ROLE watcher;"
+	echo "ACL ADMIN DROP MAP CLAIM 'analyst' FROM CLIENT '$IDP' TO ROLE analyst;"
+	echo "SET GLOBAL acl_allow_anonymous_admin=false;"
+} >&3
 
 # --- B3: the password handshake earns the slice ----------------------------------------------------
 got="$(ask "$URI" password alice wonder "SELECT count(*) AS n FROM orders" --tls-roots "$TMP/cert.pem")"
