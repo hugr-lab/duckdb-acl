@@ -153,13 +153,24 @@ mode of default-deny is a refusal, and the refusal names the function.
 
 - The catalog surfaces are **replaced by the principal's own listing**, in duckdb's own shapes
   (specs 010/035): `information_schema.tables|columns|schemata`, `duckdb_tables`, `duckdb_views`,
-  `duckdb_columns`, `duckdb_schemas`, `duckdb_databases` (function and view forms alike). "The
-  physical world does not appear in any of them" (spec 031). `test/sql/acl_metadata_leak.test` pins
+  `duckdb_columns`, `duckdb_schemas`, `duckdb_databases` (function and view forms alike), and since
+  spec 098 `duckdb_functions()` - the function, bare or qualified (`system.main.duckdb_functions()`),
+  and the bare name in FROM. "The physical world does not appear in any of
+  them" (spec 031). `test/sql/acl_metadata_leak.test` pins
   that an ungranted table "is in none of them, under any name" and that `duckdb_databases()` does
   not list the physical database.
+- `duckdb_functions()` answers **what the principal may call** (spec 098): the engine's functions the
+  function gate admits for its roles - enumerated from the gate's own model - and the virtual
+  functions a call of the principal reaches (by bare name, in its MAIN catalog, with `select`), with
+  their parameters and comment. A virtual row names only virtual things (its catalog, `main`, its
+  comment) and never a definition; an engine row outside the `system` catalog carries no definition,
+  database, schema or the operator's comment - a macro of an attached catalog granted by name is
+  listed by name only, and only when that bare name reaches it (not when a builtin or a virtual
+  function of that name takes the call). It answers whether or not the role holds `meta`
+  (where `acl_function_status` still lists `duckdb_functions` as a member); before spec 098 a `meta`
+  grant handed out the engine's whole listing, macro definitions included.
 - Surfaces with no filtered form stay denied by the function gate: `duckdb_secrets()`,
-  `duckdb_constraints()`, `pragma_table_info(...)` as a function, `duckdb_settings()`,
-  `duckdb_functions()` (same test; spec 052).
+  `duckdb_constraints()`, `pragma_table_info(...)` as a function, `duckdb_settings()` (spec 052).
 - `DESCRIBE <name>` becomes `DESCRIBE (SELECT * FROM <name>)`, so it describes the rewritten
   relation (spec 025); `SHOW TABLES`, `SHOW DATABASES`, `SHOW SCHEMAS`, `SHOW ALL TABLES` answer
   from the listing; `SHOW VARIABLES` is refused; `PRAGMA table_info` / `PRAGMA show_tables` are

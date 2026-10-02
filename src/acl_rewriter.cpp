@@ -1226,7 +1226,7 @@ private:
 				// `FROM information_schema.tables` / `FROM duckdb_tables` - the view forms
 				Note(key, "select");
 				auto alias = base.alias.empty() ? base.Table() : base.alias;
-				ref = BuildMetadataSubquery(surface, alias);
+				ref = BuildMetadataSubquery(surface, alias, std::move(base.column_name_alias));
 				return;
 			}
 			TablePolicy policy;
@@ -1373,7 +1373,8 @@ private:
 			if (!function.GetArguments().empty()) {
 				Deny(Reason::STATEMENT_TYPE, "\"" + vname + "\" takes no arguments");
 			}
-			ref = BuildMetadataSubquery(surface, tf.alias.empty() ? Identifier(vname) : tf.alias);
+			ref = BuildMetadataSubquery(surface, tf.alias.empty() ? Identifier(vname) : tf.alias,
+			                            std::move(tf.column_name_alias));
 			return;
 		}
 		if (StringUtil::CIEquals(vname, "acl_keys")) {
@@ -1676,15 +1677,22 @@ private:
 	}
 
 	//! Replace a metadata surface with the principal's own catalog in the same shape
-	unique_ptr<TableRef> BuildMetadataSubquery(const char *surface, const Identifier &alias) {
+	unique_ptr<TableRef> BuildMetadataSubquery(const char *surface, const Identifier &alias,
+	                                           vector<Identifier> column_alias = {}) {
 		string sql;
 		if (!store.MetadataListing(principal, surface, sql)) {
 			Deny(Reason::UNAVAILABLE,
 			     string("metadata is not available: this policy source cannot enumerate ") + surface);
 		}
 		AppendTempListing(surface, sql);
-		auto select_stmt = store.InstantiateSelect(sql, template_options);
-		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+		// spec 098: the functions listing carries the principal's admitted keys as constants - tens of
+		// KB that differ per role set; parsed outside the template cache, never filling it
+		auto select_stmt = string(surface) == "duckdb_functions" ? store.InstantiateSelect(sql, template_options, false)
+		                                                         : store.InstantiateSelect(sql, template_options);
+		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+		// `FROM duckdb_tables() AS t(a, b)`: the written column aliases name the listing's columns
+		sub->column_name_alias = std::move(column_alias);
+		return std::move(sub);
 	}
 
 	//! `FROM acl_references()` / `acl_references('orders')`: the references whose both ends this

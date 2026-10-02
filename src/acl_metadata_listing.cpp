@@ -9,6 +9,45 @@ namespace duckdb {
 namespace acl {
 namespace acl_detail {
 
+vector<CatalogBackend::VisibleFunction> CatalogBackend::VisibleFunctions(const Principal &principal) {
+	vector<VisibleFunction> out;
+	if (function_mode || principal.roles.empty()) {
+		return out; // a function driver enumerates no functions (spec 008); no role holds none
+	}
+	EnsureFresh();
+	string oc_join = HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
+	                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
+	                                       " AND oc.\"vname\" = f.\"vname\""
+	                                 : string();
+	// the same visibility a call resolves with: a grant on the catalog that is not an explicit nothing
+	auto sql = GrantsCte(principal) +
+	           " SELECT DISTINCT f.\"vcat\", f.\"vname\", f.\"kind\", f.\"params\", f.\"comment\","
+	           " (SELECT c.\"type\" FROM " +
+	           Tbl("object_columns") +
+	           " c WHERE c.\"vcat\" = f.\"vcat\" AND c.\"vname\" = f.\"vname\" AND c.\"kind\" = 'scalar'"
+	           " ORDER BY c.\"pos\" LIMIT 1) FROM " +
+	           Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join + " WHERE " +
+	           FunctionVisibleExpr() +
+	           // what a call can reach: the rewriter resolves a function by its bare name, in the
+	           // principal's one MAIN catalog - a flat name there, never another catalog's or a nested one
+	           " AND g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND position('.' IN f.\"vname\") = 0"
+	           " ORDER BY 1, 2, 3";
+	auto result = Query(sql);
+	ResultRows rows(*result);
+	for (idx_t row = 0; row < rows.Count(); row++) {
+		VisibleFunction function;
+		function.vcat = rows.GetValue(0, row).ToString();
+		function.vname = rows.GetValue(1, row).ToString();
+		function.kind = rows.GetValue(2, row).ToString();
+		auto params = rows.GetValue(3, row);
+		function.params = params.IsNull() ? string() : params.ToString();
+		function.comment = rows.GetValue(4, row);
+		function.returns = function.kind == "scalar" ? rows.GetValue(5, row) : Value();
+		out.push_back(std::move(function));
+	}
+	return out;
+}
+
 string CatalogBackend::MetadataListingSql(const Principal &principal, const string &surface) {
 	if (function_mode) {
 		throw BinderException("acl: this policy source does not expose enumeration, so %s cannot be listed "
@@ -714,6 +753,10 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 }
 
 bool PolicyStore::MetadataListing(const Principal &principal, const string &surface, string &sql) {
+	if (surface == "duckdb_functions") {
+		sql = PrincipalFunctionsSql(principal); // spec 098: every mode answers the engine's half
+		return true;
+	}
 	if (!catalog) {
 		return false; // the memory store has no catalog to list; the surface stays denied
 	}

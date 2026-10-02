@@ -435,6 +435,10 @@ struct PolicyStore {
 	//! filtered to what the roles hold, with virtual names in place of physical ones. False when the
 	//! active source cannot enumerate (memory mode); the driver mode throws with the reason.
 	bool MetadataListing(const Principal &principal, const string &surface, string &sql);
+	//! spec 098: the principal's own `duckdb_functions()` - the engine's functions the gate admits for
+	//! its roles (no definition, database or schema outside the system catalog) and the virtual
+	//! functions of its catalogs, in duckdb's shape. Works in every mode; the catalog adds (b).
+	string PrincipalFunctionsSql(const Principal &principal);
 	//! Read one listing of the active policy source for an operator (spec 010 part 3). `listing` names
 	//! a table of the policy model ("relations", "grants", …) or "status". Throws when the active
 	//! source cannot enumerate - silence on an admin surface reads as "nothing is configured".
@@ -599,7 +603,8 @@ struct PolicyStore {
 
 	//! Instantiate a SELECT template: a fresh SelectStatement whose node is a copy of the cached
 	//! prototype (parsed once). The caller bakes markers into the copy.
-	unique_ptr<SelectStatement> InstantiateSelect(const string &sql, const ParserOptions &options);
+	//! `cached` false: parse once, outside the template cache (a one-off text it must not fill up with)
+	unique_ptr<SelectStatement> InstantiateSelect(const string &sql, const ParserOptions &options, bool cached = true);
 	//! Instantiate an expression template: a fresh copy of the cached parsed prototype.
 	unique_ptr<ParsedExpression> InstantiateExpr(const string &expr, const ParserOptions &options);
 

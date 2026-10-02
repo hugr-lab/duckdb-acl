@@ -502,6 +502,16 @@ off, never a cluster profile item) is the operator's opt-out; the report says `"
 unknown scope in `admins` grants nothing (`TryParseAdminScope`) but keeps the role privileged
 (`AdminRights::unknown_scope`); an `observe` row scoped to a catalog grants nothing. Nodes running `acl_otel` push the same metrics over OTLP.
 
+**Spec 098 — a principal's functions**: `duckdb_functions()` (bare or qualified; also the bare name in
+FROM - duckdb has no such view) is a metadata surface (`MetadataSurfaceOf`): under a principal it answers `PolicyStore::PrincipalFunctionsSql`
+(`acl_principal_functions.cpp`) - (a) `system.main.duckdb_functions()` filtered by a constant list of
+the keys `FunctionCategoryModel::AdmittedKeys(roles)` admits (the gate's own `Judge`, never set
+dropped, a non-system key only when its bare name resolves to it; such a row loses
+database/schema/definition/oid/comment), (b) the virtual functions a call reaches
+(`CatalogBackend::VisibleFunctions`: flat names of the unique MAIN catalog, then each confirmed with
+`Resolve*Function` + `select`; params split at depth 0, synthesized oids, no definition). Parsed
+outside the template cache (`InstantiateSelect(…, false)`); metadata surfaces honour column alias lists. A `meta` grant no longer hands out the engine's listing. Follow-up: `acl_function_columns`.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

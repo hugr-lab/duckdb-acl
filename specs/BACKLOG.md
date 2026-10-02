@@ -83,9 +83,22 @@ before if cheap; **later** — development, after the release.
   carry the mark in the object's comment.
 - ~~**Spec 039 — catalog maintenance**~~ — implemented 2026-09-08: `acl_check_catalog([vcat])` /
   `CHECK VIRTUAL CATALOG`, `acl_repair_relation(…)` / `REPAIR VIRTUAL TABLE`.
-- **A principal's functions surface** (`duckdb_functions()` / `information_schema.routines`): a
-  virtual table function is callable but appears in no listing, so an agent browsing the catalog
-  cannot learn it exists or its signature; params and result columns are already stored.
+- ~~**A principal's functions surface**~~ — implemented by spec 098: `duckdb_functions()` answers what
+  the principal may call, virtual functions with their parameters. Open: the result columns of a
+  virtual table function - a listing `acl_function_columns([name])` (owner, 2026-10-02).
+- **A virtual function call ignores its qualifier** (found by the spec 098 review): the rewriter
+  resolves calls by the bare name, so `c.main.shout()` or `phys.main.shout()` reach the MAIN catalog's
+  `shout`, and another granted catalog's functions cannot be called at all. No widening (it is the
+  principal's own function), but the written name is not the one resolved.
+- **Two parsers for one `params` column** (spec 098 review): the listing's `SplitParams` (depth-aware,
+  quoted names, defaults) and `CatalogBackend::ParseDeclaration` (splits at every comma, so
+  `DECIMAL(10, 2)` breaks; a lone word is a type) - the reference check (`TO FUNCTION f(param => col)`)
+  and the listing can disagree on names. One shared parser.
+- **`duckdb_types()` under a `meta` grant names attached databases** (spec 098 review): not a
+  substituted surface; it lists the types of every catalog with `database_name`.
+- **The listings scan every attached catalog** (`information_schema.columns` for the table surfaces,
+  `duckdb_functions()` for spec 098): an unreachable scanner catalog fails a principal's listing with
+  the scanner's own error text.
 - ~~**Error-prefix contract**~~ — written down in `website/docs/security.md` §8 (the prefix is the contract,
   the exception class says which kind of thing went wrong, the wording is not promised); file and
   socket failures of a serve are `IOException`. `acl_rewrite: token rejected` never leaves
