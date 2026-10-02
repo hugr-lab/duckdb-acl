@@ -110,6 +110,10 @@ public:
 	FunctionDecision Resolve(const vector<string> &roles, const QualifiedName &written, FunctionKind kind) const;
 	//! The categories a key sits in (empty when it is no member)
 	vector<string> CategoriesOf(const FunctionKey &key) const;
+	//! spec 098: every key this model would admit for `roles` when called by its full name - the same
+	//! judgement a call gets (deny wins, '' is every role, the never set is out), so a listing built
+	//! from it cannot advertise what the gate refuses. Never touches a database.
+	vector<FunctionKey> AdmittedKeys(const vector<string> &roles) const;
 
 	// listings, in a stable order
 	vector<CategoryRow> Categories() const;

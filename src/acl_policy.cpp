@@ -38,6 +38,7 @@ const char *MetadataSurfaceOf(const string &name) {
 	    {"duckdb_columns", "duckdb_columns"},
 	    {"duckdb_schemas", "duckdb_schemas"},
 	    {"duckdb_databases", "databases"},
+	    {"duckdb_functions", "duckdb_functions"}, // spec 098: the functions this principal may call
 	};
 	auto entry = SURFACES.find(name);
 	return entry == SURFACES.end() ? nullptr : entry->second.c_str();
@@ -118,15 +119,17 @@ vector<string> SplitTopLevel(const string &text, char delimiter) {
 	return parts;
 }
 
-unique_ptr<SelectStatement> PolicyStore::InstantiateSelect(const string &sql, const ParserOptions &options) {
-	auto node = select_cache.GetCopy(sql, [&]() -> unique_ptr<QueryNode> {
+unique_ptr<SelectStatement> PolicyStore::InstantiateSelect(const string &sql, const ParserOptions &options,
+                                                           bool cached) {
+	auto parse = [&]() -> unique_ptr<QueryNode> {
 		Parser parser(options);
 		parser.ParseQuery(sql);
 		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 			throw BinderException("acl_rewrite: rewrite template is not a single SELECT");
 		}
 		return std::move(parser.statements[0]->Cast<SelectStatement>().node);
-	});
+	};
+	auto node = cached ? select_cache.GetCopy(sql, parse) : parse();
 	auto statement = make_uniq<SelectStatement>();
 	statement->node = std::move(node);
 	return statement;

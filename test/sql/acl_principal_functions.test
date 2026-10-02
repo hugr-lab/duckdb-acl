@@ -1,0 +1,340 @@
+# name: test/sql/acl_principal_functions.test
+# description: a principal's duckdb_functions() (spec 098) - the engine's functions the gate admits for
+#   its roles and the virtual functions of its catalogs, in duckdb's shape; never a definition, a
+#   database or a schema outside the system catalog; the never set never; the listing and the gate
+#   agree key for key.
+# group: [sql]
+
+require acl
+
+# --- memory mode: the engine's half ----------------------------------------------------------------
+
+statement ok
+SELECT acl_define_role('m', '');
+
+query I
+ACL ROLE "m" SELECT count(*) > 0 FROM duckdb_functions();
+----
+true
+
+query I
+ACL ROLE "m" SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'acl_%' OR function_name IN ('query', 'query_table', 'json_execute_serialized_sql');
+----
+0
+
+# the listing and the gate are one judgement in memory mode too
+query I nosort memory_parity
+SELECT DISTINCT schema || '.' || name || '/' || kind FROM acl_function_status('m') WHERE database = 'system' AND present AND allowed ORDER BY 1;
+----
+
+query I nosort memory_parity
+ACL ROLE "m" SELECT DISTINCT schema_name || '.' || lower(function_name) || '/' || CASE WHEN function_type IN ('table', 'table_macro') THEN 'table' ELSE 'scalar' END FROM duckdb_functions() WHERE database_name = 'system' ORDER BY 1;
+----
+
+statement ok
+SELECT acl_deny_function('upper');
+
+query I
+ACL ROLE "m" SELECT count(*) FROM duckdb_functions() WHERE function_name = 'upper';
+----
+0
+
+statement ok
+SELECT acl_allow_function('upper');
+
+# --- catalog mode -------------------------------------------------------------------------------------
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, amount INTEGER);
+
+statement ok
+CREATE MACRO phys.main.secret_fn(x) AS (SELECT count(*) FROM phys.main.orders) + x;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG other;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+statement ok
+SELECT acl_add_table_function('c', 'report', 'SELECT id, amount FROM phys.main.orders WHERE amount >= acl_arg(1)', 'threshold DECIMAL(10, 2), "my name" VARCHAR', 'id INTEGER, amount INTEGER', 'the report');
+
+statement ok
+ACL ADMIN ADD SCALAR c.shout MACRO 'upper(acl_arg(1))';
+
+statement ok
+ACL ADMIN ADD SCALAR other.hidden MACRO 'lower(acl_arg(1))';
+
+# the other catalog is granted too, but not as MAIN: a call reaches a function by its bare name in
+# the one MAIN catalog only, so the listing does not offer `hidden`
+statement ok
+ACL ADMIN GRANT CATALOG other TO ROLE r;
+
+statement ok
+SELECT acl_add_table_function('c', 'edge', 'SELECT 1 AS one', '"x""y" INTEGER, z, n INTEGER := 5', 'one INTEGER', '');
+
+statement ok
+SELECT acl_add_table_function('c', 'nested.deep', 'SELECT 1 AS one', '', 'one INTEGER', '');
+
+# a category granted to every role (base) is listed; one not granted (readers) is not - until it is
+query II
+ACL ROLE "r" SELECT count(*) FILTER (WHERE function_name = 'upper') > 0, count(*) FILTER (WHERE function_name = 'read_csv') FROM duckdb_functions();
+----
+true	0
+
+statement ok
+ACL ADMIN GRANT FUNCTION CATEGORY readers TO ROLE r;
+
+query I
+ACL ROLE "r" SELECT count(*) > 0 FROM duckdb_functions() WHERE function_name = 'read_csv';
+----
+true
+
+# the listing and the gate are one judgement: the system keys the principal lists are exactly the ones
+# acl_function_status admits for its role (the operator's screen) - one result, compared by label
+query I nosort gate_parity
+SELECT DISTINCT schema || '.' || name || '/' || kind FROM acl_function_status('r') WHERE database = 'system' AND present AND allowed ORDER BY 1;
+----
+
+query I nosort gate_parity
+ACL ROLE "r" SELECT DISTINCT schema_name || '.' || lower(function_name) || '/' || CASE WHEN function_type IN ('table', 'table_macro') THEN 'table' ELSE 'scalar' END FROM duckdb_functions() WHERE database_name = 'system' ORDER BY 1;
+----
+
+# a deny takes a member away (deny wins over the every-role grant); a grant by name adds one
+statement ok
+ACL ADMIN DENY FUNCTION upper TO ROLE r;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_functions() WHERE function_name = 'upper';
+----
+0
+
+statement ok
+ACL ADMIN REVOKE FUNCTION upper FROM ROLE r;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_functions() WHERE function_name = 'secret_fn';
+----
+0
+
+statement ok
+ACL ADMIN GRANT FUNCTION phys.main.secret_fn TO ROLE r;
+
+# a function of an attached catalog: listed, with no database, schema, definition or the operator's
+# prose (a COMMENT can name physical objects too)
+statement ok
+COMMENT ON MACRO phys.main.secret_fn IS 'reads phys.main.orders';
+
+query IIIIII
+ACL ROLE "r" SELECT database_name, schema_name, function_name, parameters, macro_definition, comment FROM duckdb_functions() WHERE function_name = 'secret_fn';
+----
+NULL	NULL	secret_fn	[x]	NULL	NULL
+
+query I
+ACL ROLE "r" SELECT secret_fn(1);
+----
+1
+
+# ...but only when its bare name reaches it: a macro named like a builtin is shadowed by the builtin,
+# so it is not listed (the listing cannot give the qualification it would need)
+statement ok
+CREATE MACRO phys.main.upper(x) AS 'shadow';
+
+statement ok
+ACL ADMIN GRANT FUNCTION phys.main.upper TO ROLE r;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_functions() WHERE function_name = 'upper' AND database_name IS NULL;
+----
+0
+
+# the never set never appears
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'acl_%' OR function_name IN ('query', 'query_table', 'json_execute_serialized_sql');
+----
+0
+
+# no definition outside the system catalog
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_functions() WHERE macro_definition IS NOT NULL AND database_name IS DISTINCT FROM 'system';
+----
+0
+
+# the virtual functions of its catalogs - parameters, result type, comment - and not another catalog's
+query IIIIIII rowsort
+ACL ROLE "r" SELECT database_name, schema_name, function_name, function_type, parameters, parameter_types, comment FROM duckdb_functions() WHERE database_name = 'c';
+----
+c	main	edge	table	['x"y', z, n]	[INTEGER, NULL, INTEGER]	NULL
+c	main	report	table	[threshold, my name]	['DECIMAL(10, 2)', VARCHAR]	the report
+c	main	shout	scalar	[]	[]	NULL
+
+query I
+ACL ROLE "r" SELECT return_type FROM duckdb_functions() WHERE function_name = 'shout';
+----
+VARCHAR
+
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_functions() WHERE function_name = 'hidden' OR database_name = 'other';
+----
+0
+
+statement error
+ACL ROLE "r" SELECT hidden('X');
+----
+<REGEX>:.*hidden.*
+
+# a nested virtual schema's function is not reached by a bare call either - not listed
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('deep', 'nested.deep');
+----
+0
+
+# every listed virtual function is callable as listed
+query I
+ACL ROLE "r" SELECT shout('x');
+----
+X
+
+query I
+ACL ROLE "r" SELECT count(*) FROM report(0, 'a');
+----
+0
+
+# parameters: a doubled quote in a name, a parameter with no type, a default left out of the type
+query II
+ACL ROLE "r" SELECT parameters, parameter_types FROM duckdb_functions() WHERE function_name = 'edge';
+----
+['x"y', z, n]	[INTEGER, NULL, INTEGER]
+
+# a grant that leaves out select lists nothing a call would refuse
+statement ok
+ACL ADMIN CREATE ROLE writer;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE writer WITH (insert) MAIN;
+
+query I
+ACL ROLE "writer" SELECT count(*) FROM duckdb_functions() WHERE database_name = 'c';
+----
+0
+
+statement error
+ACL ROLE "writer" SELECT shout('x');
+----
+<REGEX>:.*select on scalar function "shout" is not allowed.*
+
+# virtual rows carry the stable oids every surface gives a virtual object (quack reads them as int64)
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_functions() WHERE database_name = 'c' AND (database_oid IS NULL OR function_oid IS NULL);
+----
+0
+
+# the view form and the qualified form answer the same listing - a `meta` grant included, which used to
+# hand out the engine's whole listing
+statement ok
+ACL ADMIN GRANT FUNCTION CATEGORY meta TO ROLE r;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_functions WHERE function_name = 'shout';
+----
+1
+
+# a column alias list names the listing's columns, on this surface as on the table listings
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_functions() AS f(db, oid, sch, fname) WHERE fname = 'shout';
+----
+1
+
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_tables() AS t(db) WHERE db = 'c';
+----
+0
+
+query I
+ACL ROLE "r" SELECT count(*) FROM system.main.duckdb_functions() WHERE function_name LIKE 'acl_%' OR macro_definition LIKE '%phys.main%';
+----
+0
+
+query I
+ACL ROLE "r" SELECT count(*) FROM system.main.duckdb_functions() WHERE function_name = 'report';
+----
+1
+
+# a catalog grant with a predicate: a call of a virtual scalar is refused under it (the grant carries a
+# policy), so it is not listed - and the rest of the listing still answers
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG tenant;
+
+statement ok
+SELECT acl_add_table_function('tenant', 'trows', 'SELECT 1 AS one', '', 'one INTEGER', '');
+
+statement ok
+ACL ADMIN ADD SCALAR tenant.tshout MACRO 'upper(acl_arg(1))';
+
+statement ok
+SELECT acl_grant_catalog('q', 'tenant', '', true, '1 = 1', '');
+
+query II rowsort
+ACL ROLE "q" SELECT function_name, function_type FROM duckdb_functions() WHERE database_name = 'tenant';
+----
+trows	table
+
+query I
+ACL ROLE "q" SELECT count(*) > 0 FROM duckdb_functions() WHERE database_name = 'system';
+----
+true
+
+# a virtual function takes the bare call of every engine function of its name and kind - those leave
+# the listing (the builtin `upper` and a physical macro granted by name alike)
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG shadow;
+
+statement ok
+ACL ADMIN ADD SCALAR shadow.upper MACRO 'lower(acl_arg(1))';
+
+statement ok
+ACL ADMIN ADD SCALAR shadow.secret_fn MACRO 'acl_arg(1) * 100';
+
+statement ok
+ACL ADMIN CREATE ROLE sh;
+
+statement ok
+ACL ADMIN GRANT CATALOG shadow TO ROLE sh MAIN;
+
+statement ok
+ACL ADMIN GRANT FUNCTION phys.main.secret_fn TO ROLE sh;
+
+query III rowsort
+ACL ROLE "sh" SELECT database_name, function_name, function_type FROM duckdb_functions() WHERE function_name IN ('upper', 'secret_fn');
+----
+shadow	secret_fn	scalar
+shadow	upper	scalar
+
+query II
+ACL ROLE "sh" SELECT upper('X'), secret_fn(1);
+----
+x	100
+
+# the operator, unprefixed, still reads the engine's own listing
+query I
+SELECT count(*) > 0 FROM duckdb_functions() WHERE function_name LIKE 'acl_%';
+----
+true

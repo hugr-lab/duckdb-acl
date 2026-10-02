@@ -529,7 +529,8 @@ touched again by the extension: `base`, `generators`, `node_facts`, `json`, `icu
 `h3`, `hashfuncs`, `a5`, `geosilo` are every role's from the start; `readers`, `meta`, `environment`,
 `node`, `plan` are nobody's until granted. A function of a newly loaded extension, a builtin a pin
 bump adds, a macro an admin creates: in no category, refused, until put somewhere -
-`SELECT * FROM acl_function_status() WHERE status = 'uncategorized'` is the screen.
+`SELECT * FROM acl_function_status() WHERE status = 'uncategorized'` is the screen. A principal reads
+its own side of it through `duckdb_functions()`: what it may call, and nothing else (spec 098).
 
 ```sql
 CREATE FUNCTION CATEGORY <name> [COMMENT '<text>']

@@ -416,6 +416,16 @@ struct CatalogBackend {
 	//! The same visibility test as an object's, written against a `functions f` row instead of a
 	//! `relations r` one - a function is granted like any other object of the catalog.
 	string FunctionVisibleExpr();
+	//! spec 098: a virtual function a principal can see - what its `duckdb_functions()` row is built of
+	struct VisibleFunction {
+		string vcat;
+		string vname; // as stored: `name`, or `schema.name` in a nested virtual schema
+		string kind;  // 'table' | 'scalar'
+		string params;
+		Value comment;
+		Value returns; // a scalar's declared result type
+	};
+	vector<VisibleFunction> VisibleFunctions(const Principal &principal);
 
 	//! The grant chain's policy columns (spec 011): the catalog grant's and the object grant's own RLS
 	//! and column list. The function-driver's slots do not carry them, so it composes to no narrowing.

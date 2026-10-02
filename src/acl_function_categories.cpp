@@ -367,6 +367,38 @@ void FunctionCategoryModel::Judge(const vector<string> &roles, const Candidate &
 	out.decided_by = "none";
 }
 
+vector<FunctionKey> FunctionCategoryModel::AdmittedKeys(const vector<string> &roles) const {
+	vector<FunctionKey> out;
+	for (auto kind : {FunctionKind::SCALAR, FunctionKind::TABLE}) {
+		for (auto &entry : ByKind(kind)) {
+			for (auto &candidate : entry.second) {
+				auto &key = candidate.key;
+				// the never set, as Resolve judges it: by name everywhere, or as one catalog's
+				if ((FunctionNeverCallable(key.name) && !FunctionNeverOnlyInSystem(key.name)) ||
+				    FunctionNeverCallable(key.name, key.database)) {
+					continue;
+				}
+				FunctionDecision decision;
+				Judge(roles, candidate, decision);
+				if (decision.verdict != FunctionVerdict::ADMITTED) {
+					continue;
+				}
+				// a function outside the system catalog is listed by its bare name only (spec 098), so it
+				// is listed only when the bare name reaches it: not when a system function of that name
+				// takes the call, nor when two candidates tie
+				if (!StringUtil::CIEquals(key.database, "system")) {
+					auto bare = Resolve(roles, QualifiedName(Identifier(key.name)), kind);
+					if (bare.verdict != FunctionVerdict::ADMITTED || !(bare.key == key)) {
+						continue;
+					}
+				}
+				out.push_back(key);
+			}
+		}
+	}
+	return out;
+}
+
 FunctionDecision FunctionCategoryModel::Resolve(const vector<string> &roles, const QualifiedName &written,
                                                 FunctionKind kind) const {
 	FunctionDecision out;
