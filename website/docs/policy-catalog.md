@@ -88,7 +88,7 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 | `function_grants` | per-role or every role's (`role = ''`) grants and denies on a category (key columns `''`) or on a function by name (category `''`); a deny anywhere wins |
 | `resource_groups` | spec 085: a group's limits (`window_start`, `window_max`, `batch_bytes`, `max_result_rows`, `queue_priority`, `max_sessions`; NULL = the node's setting) and comment |
 | `role_resource_groups` | which roles are in which groups |
-| `admins` | global administration scopes: `manage` or `passthrough`, optionally per catalog |
+| `admins` | global administration scopes: `observe`, `manage` or `passthrough` (one per role), optionally per catalog; a scope this build does not know grants nothing but keeps the role privileged |
 | `issuers` | JWT issuers (spec 095): name, URL, and the name of an `oidc_issuer` secret with its service - never a key |
 | `clients` | which tokens of an issuer count and what they become: audiences, azp, requires, roles from/constant, unmapped, attributes, subject, token type, client id, flows, an `oidc_client` secret's name, implicit - never a credential |
 | `role_mappings` | external value → role, scoped to a client or an issuer (`scope_kind`, `scope_name`), per source (`group` / `claim-value`) |

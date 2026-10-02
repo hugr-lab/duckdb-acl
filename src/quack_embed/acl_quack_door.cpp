@@ -37,6 +37,29 @@ namespace duckdb {
 namespace acl {
 namespace {
 
+//! spec 097: the verdict as the HTTP status the route answers
+AclQuackObserveAnswer ObservedAnswer(ObserveVerdict verdict) {
+	AclQuackObserveAnswer answer;
+	switch (verdict) {
+	case ObserveVerdict::ALLOWED:
+		answer.status = 200;
+		break;
+	case ObserveVerdict::UNAUTHENTICATED:
+		answer.status = 401;
+		break;
+	case ObserveVerdict::FORBIDDEN:
+		answer.status = 403;
+		break;
+	case ObserveVerdict::UNAVAILABLE:
+		answer.status = 503;
+		break;
+	case ObserveVerdict::OFF:
+		answer.status = 404;
+		break;
+	}
+	return answer;
+}
+
 //! acl_quack_serve(uri, token[, cert, key][, mode]): the safe way to open the quack door (spec 041).
 //! It starts the embedded server (spec 063) - but only from an instance a client cannot step out of,
 //! and it says which condition is missing rather than serving something half-configured. Everything
@@ -107,26 +130,29 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			return shared_store->Draining();
 		};
 		// spec 069: GET /metrics, read per request - the operator's SET GLOBAL acl_metrics_endpoint
-		// after the serve counts, and "" (404) while it is off
+		// after the serve counts, 404 while it is off; spec 097: only to a bearer token holding observe
 		weak_ptr<DatabaseInstance> weak_db = context.db;
-		cfg.metrics = [shared_store, weak_db]() -> string {
+		cfg.metrics = [shared_store, weak_db](const string &authorization) -> AclQuackObserveAnswer {
 			auto db = weak_db.lock();
 			if (!db || !shared_store->audit) {
-				return string();
+				return AclQuackObserveAnswer();
 			}
-			Value on;
-			if (!DBConfig::GetConfig(*db).TryGetCurrentSetting("acl_metrics_endpoint", on) || on.IsNull() ||
-			    !on.GetValue<bool>()) {
-				return string();
+			auto answer = ObservedAnswer(ObserveAuthorize(*db, *shared_store, authorization, "quack", "metrics"));
+			if (answer.status == 200) {
+				answer.body = RenderPrometheus(shared_store->audit->Hooks());
 			}
-			return RenderPrometheus(shared_store->audit->Hooks());
+			return answer;
 		};
-		cfg.node_load = [shared_store, weak_db]() -> string {
+		cfg.node_load = [shared_store, weak_db](const string &authorization) -> AclQuackObserveAnswer {
 			auto db = weak_db.lock();
-			if (!db || !NodeLoadServed(*db)) {
-				return string();
+			if (!db) {
+				return AclQuackObserveAnswer();
 			}
-			return NodeLoadJson(*db, *shared_store);
+			auto answer = ObservedAnswer(ObserveAuthorize(*db, *shared_store, authorization, "quack", "node_load"));
+			if (answer.status == 200) {
+				answer.body = NodeLoadJson(*db, *shared_store);
+			}
+			return answer;
 		};
 		string actual_uri;
 		// a bind or PEM failure inside is an IOException that carries this function's prefix and passes

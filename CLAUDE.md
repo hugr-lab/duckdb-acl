@@ -361,7 +361,7 @@ refused BEFORE authentication with `acl: node at capacity ...` (session refused,
 DISCONNECT or a lapsed lease ends the bound acl session at once (`SessionEndBound`, reasons
 client / idle). `acl_node_load()` (`acl_node_load.{hpp,cpp}`) is the load report - sessions per door,
 each quack door's seats, draining, admit flags - also `GET /.well-known/acl-node` and the Flight
-Handshake payload `node-load`, both behind `acl_metrics_endpoint`. **Spec 080 - the stream budget**:
+Handshake payload `node-load`, both behind `acl_metrics_endpoint` and (spec 097) an `observe` bearer. **Spec 080 - the stream budget**:
 a producing quack statement reserves (`AclQuackStreamSlot` in the driver patch, inside the `try`
 around `Query()`, released when it returns) `acl_quack_stream_reserve_bytes` (0 = producer buffer +
 window cap or client depth x batch, 768 MiB default) against `acl_node_stream_budget` (0 = half the
@@ -486,6 +486,21 @@ and DETACH/CASCADE follow the scope (an edge is its dependent's scope's; a group
 cluster's source only while the group has none of that name). `acl_cluster_effective()` (kind order),
 `acl_cluster_applied(version)`; the load report adds `group`, `group_known`, `config.{target,applied}`
 (catalog reads cached 2 s, keyed on `CatalogBackend::local_writes`).
+
+**Spec 097 — the `observe` scope**: a global admin scope (`GRANT ADMIN observe`, `AdminScope` is now
+`NONE < OBSERVE < MANAGE < PASSTHROUGH` - "may administer" is `>= MANAGE`, never `!= NONE`) that reads
+the load report and `/metrics` and administers nothing; `AdminRights::observe` = an observe row, or
+passthrough, or an unrestricted manage (a catalog-scoped manage is not the node's). `GET /metrics`,
+`GET /.well-known/acl-node` and the Flight Handshake `node-load` answer `ObserveAuthorize`
+(`acl_node_load.{hpp,cpp}`): `Authorization: Bearer <jwt>` verified like a session's, then the cached
+rights - 404 off / 401 + `WWW-Authenticate` / 403 / 503 (source), Flight `NotImplemented` /
+`Unauthenticated` / `Unauthorized` / `Unavailable` (a `policy_error` is the node's: 503, never 401); a
+`door` event `observe_<surface>` per read (principal-less refusals recorded in their own denial
+bucket `door:<door>:observe`; an unnoted failure that is not `acl_rewrite: token rejected` is a 503; reads counted: `acl.door.observe`). `acl_observe_unauthenticated` (GLOBAL, default
+off, never a cluster profile item) is the operator's opt-out; the report says `"observe": "token" |
+"open"`. An observe role is privileged (spec 095: reached only through a client's own mapping). An
+unknown scope in `admins` grants nothing (`TryParseAdminScope`) but keeps the role privileged
+(`AdminRights::unknown_scope`); an `observe` row scoped to a catalog grants nothing. Nodes running `acl_otel` push the same metrics over OTLP.
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant

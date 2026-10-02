@@ -559,8 +559,11 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		ResolvePrincipal(store, prefix, principal);
 		audit.proto.principal = principal;
 		rights = store.AdminRightsOf(principal);
-		audit.proto.detail = rights.scope == AdminScope::PASSTHROUGH ? "passthrough" : "manage";
-		if (rights.scope == AdminScope::NONE) {
+		audit.proto.detail = rights.scope == AdminScope::PASSTHROUGH ? "passthrough"
+		                     : rights.scope == AdminScope::OBSERVE   ? "observe"
+		                                                             : "manage";
+		// spec 097: observe reads the load report and administers nothing - "may administer" is MANAGE+
+		if (rights.scope < AdminScope::MANAGE) {
 			NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
 			throw BinderException("acl admin: the principal has no ACL administration scope");
 		}

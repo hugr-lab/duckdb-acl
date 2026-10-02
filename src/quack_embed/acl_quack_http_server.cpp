@@ -48,6 +48,33 @@ namespace duckdb {
 namespace acl {
 namespace {
 
+//! spec 097: a pull surface - its answer given the request's `Authorization` header
+using ObservedRoute = std::function<AclQuackObserveAnswer(const string &authorization)>;
+
+//! spec 097: a pull surface's answer onto the wire. The body of a refusal says no more than its status
+//! (the audit has the reason); a 401 names the scheme, as RFC 6750 asks.
+void RespondObserved(const AclQuackObserveAnswer &answer, const char *content_type, duckdb_httplib::Response &res) {
+	res.status = answer.status;
+	switch (answer.status) {
+	case 200:
+		res.set_content(answer.body, content_type);
+		return;
+	case 401:
+		res.set_header("WWW-Authenticate", "Bearer");
+		res.set_content("unauthorized\n", "text/plain");
+		return;
+	case 403:
+		res.set_content("forbidden\n", "text/plain");
+		return;
+	case 503:
+		res.set_content("unavailable\n", "text/plain");
+		return;
+	default:
+		res.status = 404;
+		res.set_content("not found\n", "text/plain");
+	}
+}
+
 //! Verbatim from quack_http_server.cpp: httplib hands each accepted socket to the task queue as one
 //! task spanning the connection's whole keep-alive lifetime, so a fixed pool deadlocks once idle
 //! connections pin every worker. This pool grows a thread per connection up to `max_threads` and
@@ -239,7 +266,7 @@ class AclQuackServer : public QuackServer {
 public:
 	AclQuackServer(ClientContext &context, const QuackUri &uri_p, const string &token_p, const string &cert_pem,
 	               const string &key_pem, std::function<string()> wellknown, std::function<bool()> draining,
-	               std::function<string()> metrics, std::function<string()> node_load, bool discovery);
+	               ObservedRoute metrics, ObservedRoute node_load, bool discovery);
 	~AclQuackServer() override;
 
 	void StopAccepting() override;
@@ -267,8 +294,8 @@ private:
 	AclServerState server_state = AclServerState::WAITING_TO_START;
 	std::function<string()> wellknown;
 	std::function<bool()> draining;
-	std::function<string()> metrics;
-	std::function<string()> node_load;
+	ObservedRoute metrics;
+	ObservedRoute node_load;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 	X509 *tls_cert = nullptr;
 	EVP_PKEY *tls_key = nullptr;
@@ -277,8 +304,8 @@ private:
 
 AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, const string &token_p,
                                const string &cert_pem, const string &key_pem, std::function<string()> wellknown_p,
-                               std::function<bool()> draining_p, std::function<string()> metrics_p,
-                               std::function<string()> node_load_p, bool discovery)
+                               std::function<bool()> draining_p, ObservedRoute metrics_p, ObservedRoute node_load_p,
+                               bool discovery)
     : QuackServer(context, uri_p, token_p), wellknown(std::move(wellknown_p)), draining(std::move(draining_p)),
       metrics(std::move(metrics_p)), node_load(std::move(node_load_p)) {
 	if (!cert_pem.empty() || !key_pem.empty()) {
@@ -342,18 +369,13 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 
 	// spec 069: GET /metrics, opt-in (`acl_metrics_endpoint`) - the Prometheus text of acl_metrics(),
 	// composed per request so a SET after the serve takes effect; 404 while off, like a route that is
-	// not there. Unauthenticated by design, like discovery: counts and states of the node, never a
-	// handle, a principal or an object name (the bounded attribute sets of acl_metrics()).
+	// not there. Since spec 097 only to a bearer token whose roles hold `observe` (or opened by the
+	// operator with `acl_observe_unauthenticated`): counts and states of the node, never a handle, a
+	// principal or an object name (the bounded attribute sets of acl_metrics()).
 	if (metrics) {
 		auto mt = metrics;
-		server->Get("/metrics", [mt](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
-			auto text = mt();
-			if (text.empty()) {
-				res.status = 404;
-				res.set_content("not found\n", "text/plain");
-				return;
-			}
-			res.set_content(text, "text/plain; version=0.0.4; charset=utf-8");
+		server->Get("/metrics", [mt](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+			RespondObserved(mt(req.get_header_value("Authorization")), "text/plain; version=0.0.4; charset=utf-8", res);
 		});
 	}
 
@@ -361,14 +383,8 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 	// switch as /metrics (`acl_metrics_endpoint`), 404 while off; counts and states, like /metrics
 	if (node_load) {
 		auto nl = node_load;
-		server->Get("/.well-known/acl-node", [nl](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
-			auto text = nl();
-			if (text.empty()) {
-				res.status = 404;
-				res.set_content("not found\n", "text/plain");
-				return;
-			}
-			res.set_content(text, "application/json");
+		server->Get("/.well-known/acl-node", [nl](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+			RespondObserved(nl(req.get_header_value("Authorization")), "application/json", res);
 		});
 	}
 

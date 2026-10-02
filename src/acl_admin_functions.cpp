@@ -1324,9 +1324,10 @@ void AclDropRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_grant_admin(role, scope): a GLOBAL administration scope (spec 009) - 'manage' (the management
-//! grammar over every catalog, plus the statements that belong to no catalog) or 'passthrough'
-//! (anything, including native SQL - god mode). Managing ONE catalog is not granted here: it is a
+//! acl_grant_admin(role, scope): a GLOBAL administration scope (spec 009) - 'observe' (reading the load
+//! report and /metrics, spec 097), 'manage' (the management grammar over every catalog, plus the
+//! statements that belong to no catalog) or 'passthrough' (anything, including native SQL - god mode).
+//! A role holds one: the grant replaces what it held. Managing ONE catalog is not granted here: it is a
 //! capability of the catalog grant, `acl_grant_catalog(role, vcat, '{"manage": true}')`.
 void AclGrantAdminFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {

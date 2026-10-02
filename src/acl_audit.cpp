@@ -225,6 +225,11 @@ bool AuditPipeline::AdmitDenial(const AuditEvent &event, int64_t per_second) {
 		         StringUtil::Join(event.principal.roles, ",");
 	} else {
 		source = "door:" + event.door;
+		if (event.kind == "door" && event.detail.compare(0, 8, "observe_") == 0) {
+			// spec 097: a tokenless GET /metrics is the cheapest refusal there is - its own bucket, so a
+			// flood of them never keeps the door's refused logins out of the record
+			source += ":observe";
+		}
 	}
 	auto second = NowMicros() / 1000000;
 	std::lock_guard<std::mutex> guard(rate_lock);
@@ -308,6 +313,11 @@ void AuditPipeline::Count(const AuditEvent &event) {
 		} else if (event.detail.compare(0, 7, "ingest_") == 0) {
 			// the stream in the other direction (spec 070): a load its client cancelled
 			counters.Add("acl.door.streams", {{"door", event.door}, {"outcome", event.detail}});
+		} else if (event.detail.compare(0, 8, "observe_") == 0) {
+			// spec 097: a read of the load report or the metrics - the reads are counted, not recorded
+			counters.Add("acl.door.observe", {{"door", event.door},
+			                                  {"surface", event.detail.substr(8)},
+			                                  {"result", event.allowed ? string("allowed") : event.reason_code}});
 		} else if (event.detail == "discovery") {
 			// the pre-auth document (spec 040 addendum) is not a handshake, and a client may ask for it
 			// far more often than it authenticates - counting the two together would read as a wave of

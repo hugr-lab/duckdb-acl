@@ -768,6 +768,26 @@ public:
 //! is the gate for B3 - the node carries no flow toggle of its own; an IdP that refuses ROPC refuses
 //! this handshake, and that refusal is surfaced as the answer.
 
+//! The Handshake's `authorization` header as a bearer (spec 097: `node-load`), or "". A bare token is
+//! read as a bearer, as the door's per-call `TokenFromHeaders` reads it; a Basic header is not one.
+string BearerAuthorizationOf(const flight::ServerCallContext &context) {
+	for (const auto &header : context.incoming_headers()) {
+		if (!StringUtil::CIEquals(string(header.first), AUTH_HEADER)) {
+			continue;
+		}
+		string value(header.second);
+		StringUtil::Trim(value);
+		if (value.size() > 6 && StringUtil::CIEquals(value.substr(0, 6), "basic ")) {
+			return string();
+		}
+		if (value.size() > 7 && StringUtil::CIEquals(value.substr(0, 7), "bearer ")) {
+			return value;
+		}
+		return value.empty() ? string() : "Bearer " + value;
+	}
+	return string();
+}
+
 //! The door's auth handler: what the Handshake RPC does. A payload-less handshake stays the no-op
 //! success of spec 058 (the per-call Bearer header is the real gate, and IsValid refuses nobody);
 //! the payload `node-load` answers the load report (spec 079), while `acl_metrics_endpoint` is on;
@@ -777,7 +797,7 @@ class AclDoorAuthHandler : public flight::ServerAuthHandler {
 public:
 	explicit AclDoorAuthHandler(shared_ptr<FlightDoorState> state_p) : state(std::move(state_p)) {
 	}
-	arrow::Status Authenticate(const flight::ServerCallContext &, flight::ServerAuthSender *outgoing,
+	arrow::Status Authenticate(const flight::ServerCallContext &context, flight::ServerAuthSender *outgoing,
 	                           flight::ServerAuthReader *incoming) override {
 		string payload;
 		if (!incoming->Read(&payload).ok()) {
@@ -788,11 +808,32 @@ public:
 		}
 		if (payload == "node-load") {
 			// spec 079: the load report an orchestrator routes by, behind the same switch as the quack
-			// listener's /metrics (`acl_metrics_endpoint`): counts and states, never an identity
-			if (!NodeLoadServed(state->db)) {
-				return arrow::Status::NotImplemented("acl: the load report is off (acl_metrics_endpoint)");
+			// listener's /metrics (`acl_metrics_endpoint`): counts and states, never an identity; spec
+			// 097: only to the Handshake's bearer token whose roles hold `observe`
+			switch (ObserveAuthorize(state->db, *state->store, BearerAuthorizationOf(context), "flight", "node_load")) {
+			case ObserveVerdict::ALLOWED: {
+				string report;
+				try {
+					report = NodeLoadJson(state->db, *state->store);
+				} catch (std::exception &) {
+					return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
+					                               "acl: the load report is unavailable");
+				}
+				return outgoing->Write(report);
 			}
-			return outgoing->Write(NodeLoadJson(state->db, *state->store));
+			case ObserveVerdict::OFF:
+				return arrow::Status::NotImplemented("acl: the load report is off (acl_metrics_endpoint)");
+			case ObserveVerdict::UNAUTHENTICATED:
+				return flight::MakeFlightError(flight::FlightStatusCode::Unauthenticated,
+				                               "acl: the load report needs a valid bearer token");
+			case ObserveVerdict::FORBIDDEN:
+				return flight::MakeFlightError(flight::FlightStatusCode::Unauthorized,
+				                               "acl: the load report needs the observe scope");
+			case ObserveVerdict::UNAVAILABLE:
+			default:
+				return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
+				                               "acl: the load report is unavailable");
+			}
 		}
 		return arrow::Status::OK();
 	}

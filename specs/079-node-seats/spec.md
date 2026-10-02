@@ -96,7 +96,8 @@ This is not an enforcement feature, but it changes what an unauthenticated calle
   and costs no JWKS read. It also tells an unauthenticated client that the node is full. That is the
   same information an orchestrator is meant to read, and what a draining node's discovery answer
   (503) already says.
-- **The report.** It is opt-in, with the same exposure as `/metrics`.
+- **The report.** It is opt-in, with the same exposure as `/metrics`. (Since spec 097 both answer only
+  a bearer token holding the `observe` scope.)
 
 ## Testing
 

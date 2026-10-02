@@ -63,6 +63,7 @@ const case_insensitive_set_t HARDENING_SETTINGS = {"allow_unsigned_extensions",
                                                    "extension_directory",
                                                    "extension_directories",
                                                    "home_directory",
+                                                   "acl_observe_unauthenticated",
                                                    "allowed_directories",
                                                    "allowed_paths"};
 

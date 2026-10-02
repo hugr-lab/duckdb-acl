@@ -1,0 +1,194 @@
+# name: test/sql/acl_observe.test
+# description: the observe scope (spec 097) - reading the node's load report and metrics; it administers
+#   nothing. The pull surfaces themselves (401 / 403 / 200 per route, the open mode, the counters) are
+#   test/cpp/test_acl_quack_embed.cpp and test/e2e/flight/auth.sh.
+# group: [sql]
+
+require acl
+
+# --- memory mode ------------------------------------------------------------------------------------
+
+statement ok
+SELECT acl_define_role('watcher', '');
+
+statement ok
+SELECT acl_grant_admin('watcher', 'observe');
+
+# observe never administers: neither the management grammar nor native SQL
+statement error
+ACL ROLE "watcher" ACL CREATE ROLE from_watcher;
+----
+<REGEX>:.*no ACL administration scope.*
+
+statement error
+ACL ROLE "watcher" ACL NATIVE SELECT 1;
+----
+<REGEX>:.*no ACL administration scope.*
+
+statement ok
+SELECT acl_revoke_admin('watcher');
+
+statement ok
+SELECT acl_grant_admin('watcher', 'observe');
+
+statement error
+SELECT acl_grant_admin('watcher', 'superpowers');
+----
+<REGEX>:.*unknown admin scope "superpowers" \(expected observe, manage or passthrough\).*
+
+# --- catalog mode -----------------------------------------------------------------------------------
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE observer;
+
+statement ok
+ACL ADMIN GRANT ADMIN observe TO ROLE observer;
+
+query III
+SELECT "role", "scope", "vcat" FROM store.acl.admins;
+----
+observer	observe	(empty)
+
+statement error
+ACL ROLE "observer" ACL CREATE ROLE from_observer;
+----
+<REGEX>:.*no ACL administration scope.*
+
+statement error
+ACL ROLE "observer" ACL NATIVE SELECT 1;
+----
+<REGEX>:.*no ACL administration scope.*
+
+# a role may hold observe and manage one catalog: the catalog's management still works, and only it
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE observer CAPS '{"manage": true}';
+
+statement ok
+ACL ROLE "observer" ACL ADD TABLE phys.main.orders AS c.orders;
+
+statement error
+ACL ROLE "observer" ACL CREATE ROLE from_observer;
+----
+<REGEX>:.*not catalog-specific and needs an unrestricted manage scope.*
+
+# the grammar knows the scope; a scope it does not know is refused where it is written
+statement ok
+ACL ADMIN CREATE ROLE reader;
+
+statement ok
+ACL ADMIN GRANT ADMIN OBSERVE TO ROLE reader;
+
+statement error
+ACL ADMIN GRANT ADMIN superpowers TO ROLE reader;
+----
+<REGEX>:.*unknown admin scope "superpowers".*
+
+statement ok
+ACL ADMIN REVOKE ADMIN FROM ROLE reader;
+
+query I
+SELECT count(*) FROM store.acl.admins WHERE "role" = 'reader';
+----
+0
+
+# --- a scope this build does not know is no scope, never an error (spec 094's window) ----------------
+
+statement ok
+ACL ADMIN CREATE ROLE future;
+
+statement ok
+INSERT INTO store.acl.admins VALUES ('future', 'superpowers', '');
+
+statement error
+ACL ROLE "future" ACL CREATE ROLE from_future;
+----
+<REGEX>:.*no ACL administration scope.*
+
+# --- observe - and a scope this build does not know - keeps a role privileged (spec 095) -------------
+# reached only through a client's own mapping: never an issuer-wide mapping, never an unmapped name
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ACL ADMIN CREATE ISSUER 'test/idp/s' AUDIENCES ('api://acl-test') ROLE CLAIM 'roles';
+
+statement error
+ACL ADMIN MAP CLAIM 'watchers' FROM ISSUER 'test/idp/s' TO ROLE observer;
+----
+<REGEX>:.*holds an administration scope, so it is mapped FROM CLIENT only.*
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6IncxIiwicm9sZXMiOlsib2JzZXJ2ZXIiXX0.Sq04r0UoLuIPLAnAF_0sUQDHqnW1rqkZkFEyWw7oFv-rAXWdodRdaQXNMqea9iT9CNXewARl63_QMB9xSgpocCiByDdsU-7nV6isI1Wb5okEIPjMi80pF_MWSHrZoFRkjuCOKpL8WmSDiOH5aK91SVCsrDgSAPsSQwE3nDT2Fwy9F8bPbmozB99eeVLIHu0w15hEKokFT-w5QggdQ_qIiESbVOMANf47X1qYZAAfb0Vb4BKbq3IMZ9IMOyay9aQr6E6fFcRP0_op4I5SZsEXgNipeaL3z_s60hq4aK3V8t-N54M3qd0FUFOIoEYdjWJfZkdnevxixt4qE0BVNrl7rA' SELECT 1;
+----
+<REGEX>:.*no recognized roles.*
+
+# an observe row scoped to a catalog (only a function driver writes one) reads nothing - yet the role
+# stays privileged
+statement ok
+ACL ADMIN CREATE ROLE scoped;
+
+statement ok
+INSERT INTO store.acl.admins VALUES ('scoped', 'observe', 'c');
+
+statement error
+ACL ADMIN MAP CLAIM 'scopes' FROM ISSUER 'test/idp/s' TO ROLE scoped;
+----
+<REGEX>:.*holds an administration scope, so it is mapped FROM CLIENT only.*
+
+statement error
+ACL ADMIN MAP CLAIM 'futures' FROM ISSUER 'test/idp/s' TO ROLE future;
+----
+<REGEX>:.*holds an administration scope, so it is mapped FROM CLIENT only.*
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImYxIiwicm9sZXMiOlsiZnV0dXJlIl19.IGsSVqf6QBoHnLuolZyCRw5hdLWQyzhUiV4Uyh8xZ5Z822jFNN0ZuvttDDzhRckQ9Z-hueiOAxTQaRH0M9NhR94EUppC2Y5YKLR07vWd8LB0CoxVrdKwJ_bWvC0BaFij7bQayW1ZPp0EU0-oNgJ40PVMDgwdQgtbHLwibrbAIlt_uP1Y9vGrg4MW3j0Ufs8rkqJa9KWxBw_xocstTqs_ZNjrkpDdlNBEv6b8c3_rISOcOBYTn0gje5SD3f02WDqI6gcEbDhsHWAj8gh8xQMRq1jE-4LRUAEGz7r1R7TcY8r64RLmop0xEuZQ_bKjYrkCR2SkGyF-OPzKiZjAkFFbWQ' SELECT 1;
+----
+<REGEX>:.*no recognized roles.*
+
+# --- the report says which mode is in force; the opt-out is the operator's -----------------------------
+
+query I
+SELECT acl_node_load() LIKE '%"observe":"token"%';
+----
+true
+
+statement ok
+SET GLOBAL acl_observe_unauthenticated = true;
+
+query I
+SELECT acl_node_load() LIKE '%"observe":"open"%';
+----
+true
+
+statement ok
+SET GLOBAL acl_observe_unauthenticated = false;
+
+statement error
+ACL ROLE "observer" SET GLOBAL acl_observe_unauthenticated = true;
+----
+<REGEX>:.*not permitted under ACL.*
+
+# the opt-out is the node's own: never a cluster profile item (spec 093's hardening list)
+statement error
+ACL ADMIN CLUSTER SET acl_observe_unauthenticated = true;
+----
+<REGEX>:.*"acl_observe_unauthenticated" is the node's hardening.*

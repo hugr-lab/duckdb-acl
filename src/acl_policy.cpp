@@ -1116,14 +1116,25 @@ void PolicyStore::MergeMemoryRoleDefaults(Principal &out) {
 	}
 }
 
-AdminScope ParseAdminScope(const string &scope) {
+bool TryParseAdminScope(const string &scope, AdminScope &out) {
 	if (StringUtil::CIEquals(scope, "passthrough")) {
-		return AdminScope::PASSTHROUGH;
+		out = AdminScope::PASSTHROUGH;
+	} else if (StringUtil::CIEquals(scope, "manage")) {
+		out = AdminScope::MANAGE;
+	} else if (StringUtil::CIEquals(scope, "observe")) {
+		out = AdminScope::OBSERVE;
+	} else {
+		return false;
 	}
-	if (StringUtil::CIEquals(scope, "manage")) {
-		return AdminScope::MANAGE;
+	return true;
+}
+
+AdminScope ParseAdminScope(const string &scope) {
+	AdminScope out;
+	if (!TryParseAdminScope(scope, out)) {
+		throw BinderException("acl admin: unknown admin scope \"%s\" (expected observe, manage or passthrough)", scope);
 	}
-	throw BinderException("acl admin: unknown admin scope \"%s\" (expected manage or passthrough)", scope);
+	return out;
 }
 
 const char *AdminScopeName(AdminScope scope) {
@@ -1132,6 +1143,8 @@ const char *AdminScopeName(AdminScope scope) {
 		return "passthrough";
 	case AdminScope::MANAGE:
 		return "manage";
+	case AdminScope::OBSERVE:
+		return "observe";
 	default:
 		throw BinderException("acl admin: an administration grant needs a scope");
 	}
@@ -1171,7 +1184,20 @@ PolicyStore::AdminRights PolicyStore::AdminRightsOf(const Principal &principal) 
 			raise(AdminScope::MANAGE);
 		}
 		for (auto &row : rows) {
-			auto scope = ParseAdminScope(row.first);
+			AdminScope scope;
+			if (!TryParseAdminScope(row.first, scope)) {
+				rights.unknown_scope = true; // spec 097: grants nothing here, stays privileged
+				continue;
+			}
+			if (scope == AdminScope::OBSERVE) {
+				// the report is the node's: an observe row scoped to a catalog (a function driver's) grants
+				// nothing rather than more than it says
+				if (row.second.empty()) {
+					rights.observe = true;
+				}
+				raise(scope); // and the role is privileged either way (spec 095)
+				continue;
+			}
 			if (scope == AdminScope::MANAGE && !row.second.empty()) {
 				rights.catalogs.insert(row.second); // a catalog-scoped row, not a global one
 				raise(AdminScope::MANAGE);
@@ -1182,6 +1208,7 @@ PolicyStore::AdminRights PolicyStore::AdminRightsOf(const Principal &principal) 
 			}
 			raise(scope);
 		}
+		rights.observe = rights.observe || rights.unrestricted_manage || rights.scope == AdminScope::PASSTHROUGH;
 		return rights;
 	}
 	lock_guard<mutex> guard(lock);
@@ -1195,6 +1222,8 @@ PolicyStore::AdminRights PolicyStore::AdminRightsOf(const Principal &principal) 
 		}
 		raise(entry->second);
 	}
+	// spec 097: in memory mode every manage is unrestricted, so manage and passthrough read the report
+	rights.observe = rights.scope >= AdminScope::OBSERVE;
 	return rights;
 }
 
