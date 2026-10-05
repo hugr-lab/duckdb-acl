@@ -397,6 +397,9 @@ struct CatalogBackend {
 	//! FROM-sources of the resolution queries: a table reference, or a callback invocation whose
 	//! literal arguments carry the keys (both name interpretations, the granted catalogs)
 	string RelationsSource(const Principal &principal, const vector<string> &names);
+	//! spec 099: the casts a relation's read needs - its type facts (columns 14..16 of the lookup)
+	//! under its own policy, else the node's; a view's are applied by ApplyGrantPolicy
+	void ApplyTypeFacts(ResultRows &row, TablePolicy &out);
 	string ColumnsSource(const Principal &principal, const vector<string> &names);
 	string AliasesSource(const Principal &principal);
 	string FunctionsSource(const Principal &principal, const vector<string> &names);
@@ -520,6 +523,25 @@ struct CatalogBackend {
 	//! object is stored with an unknown schema and `acl_refresh_schema` can try again.
 	bool ProbeSchema(const string &sql, bool expression, const vector<string> &param_types,
 	                 vector<std::pair<string, string>> &out);
+	//! The same probe of a relation's SQL, answering the bound types themselves
+	bool ProbeTypes(const string &sql, vector<std::pair<string, LogicalType>> &out);
+	//! What both answer from: the template bound once, its columns and their types
+	bool ProbeBound(const string &sql, bool expression, const vector<string> &param_types,
+	                vector<std::pair<string, LogicalType>> &out);
+
+	//! spec 099: the type facts of one relation - every column of its source (the physical relation,
+	//! or a view's output) whose exposed type differs from its own under some policy, as the three
+	//! exposed spellings (aliases stripped / enums as VARCHAR / both; NULL where the policy changes
+	//! nothing). Deletes the old facts first; a source that does not bind leaves none - the read is then
+	//! uncast and described uncast, and the catalog check names the source once it binds.
+	vector<string> TypeFactStatements(const string &vcat, const string &vname, const string &form, const string &phys,
+	                                  const string &view_sql);
+	//! One column's facts: the exposed spellings, empty where the policy changes nothing
+	struct TypeFact {
+		string column, as_base, as_varchar, as_both;
+	};
+	//! The facts themselves, probed now; false when the source does not bind
+	bool ProbeTypeFacts(const string &form, const string &phys, const string &view_sql, vector<TypeFact> &out);
 
 	//! A projection entry that merely renames reads the physical column as it is; anything else is
 	//! an expression whose NULL-capability the declaration cannot see (spec 048).

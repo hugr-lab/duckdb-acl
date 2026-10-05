@@ -25,7 +25,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 [ -x "$DUCKDB" ] || { echo "SKIP: no duckdb CLI at $DUCKDB"; exit 0; }
 [ -f "$ACL_EXT" ] || { echo "SKIP: no acl extension at $ACL_EXT"; exit 0; }
 have="$(echo "LOAD '$ACL_EXT'; SELECT count(*) FROM duckdb_functions() WHERE function_name='acl_flight_serve';" \
-        | "$DUCKDB" -unsigned -noheader -list 2>/dev/null | tail -1 | tr -d ' ')"
+        | "$DUCKDB" -unsigned -no-agent -noheader -list 2>/dev/null | tail -1 | tr -d ' ')"
 [ "$have" != "0" ] || { echo "SKIP: this build has no Flight door"; exit 0; }
 python3 -c "import pyarrow.flight" 2>/dev/null || { echo "SKIP: pyarrow is not installed"; exit 0; }
 command -v openssl >/dev/null 2>&1 || { echo "SKIP: openssl is not installed"; exit 0; }
@@ -66,7 +66,8 @@ SQL
 }
 
 # one-shot helper: run the setup plus one statement, capture everything, let the CLI exit
-oneshot() { { setup; echo "$1"; } | "$DUCKDB" -unsigned 2>&1 || true; }
+# -no-agent: the CLI's agent output format (eb0d9df pin) is not what these checks read
+oneshot() { { setup; echo "$1"; } | "$DUCKDB" -unsigned -no-agent 2>&1 || true; }
 
 # --- a cleartext door on a non-local address is refused (the guarantee TLS lifts) ------------------
 clear_out="$(oneshot "SELECT acl_flight_serve('grpc://0.0.0.0:$PORT');")"
@@ -102,7 +103,7 @@ esac
 { setup; echo "SELECT acl_flight_serve('grpc://0.0.0.0:$PORT', '$TMP/cert.pem', '$TMP/key.pem');"; echo "SELECT 1;"; } >"$TMP/server.sql"
 FIFO="$TMP/ctl"
 mkfifo "$FIFO"
-"$DUCKDB" -unsigned <"$FIFO" >"$TMP/server.log" 2>&1 &
+"$DUCKDB" -unsigned -no-agent <"$FIFO" >"$TMP/server.log" 2>&1 &
 SERVER_PID=$!
 exec 3>"$FIFO"
 cat "$TMP/server.sql" >&3

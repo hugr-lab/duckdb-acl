@@ -164,6 +164,29 @@ ACL ADMIN CREATE VIRTUAL VIEW sales.created_view (n BIGINT) COMMENT 'row count' 
 Function: `acl_add_view(vcat, vname, select_sql[, returns[, comment[, mode[, pk_csv]]]])` -
 `returns` is the declared column list (`day VARCHAR NOT NULL, total INTEGER`).
 
+### Column types (spec 099)
+
+How a column's type is exposed - in the rows and in every listing alike - is the node's setting,
+overridden per object:
+
+| | values | node setting (`SET GLOBAL`, or the cluster profile) | default |
+| --- | --- | --- | --- |
+| an extension's alias type (`MSSQL_VARCHAR(n)`) | `base` (its base type) / `keep` | `acl_alias_types` | `base` |
+| an ENUM, at any depth of a struct, list, map, array or union | `varchar` / `keep` | `acl_enum_types` | `keep` |
+
+```sql
+ACL ADMIN ALTER VIRTUAL TABLE c.accounts SET TYPES (enums = varchar);
+ACL ADMIN ALTER VIRTUAL TABLE c.legacy SET TYPES (aliases = keep, enums = default);  -- default = the node's
+```
+
+A key not written keeps its value; an operator's redefinition (`ALTER … SET RLS`, `CREATE OR REPLACE
+VIRTUAL …`) keeps both - a principal's own `CREATE` registers a fresh record, as it does its comment.
+The cast sits above the row filter: predicates read the physical values, the projection and masks
+the exposed ones. The types are probed where the object is written and stored (`relation_types`); `SET TYPES`
+and `ANALYZE VIRTUAL TABLE` probe them again. `base` is what lets a quack client without the source's
+extension attach the catalog at all; `keep` is for clients that have it. `varchar` hides an ENUM's
+labels from readers (see the security model).
+
 ## Virtual schemas
 
 ```
@@ -867,6 +890,10 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | `schema_missing` | a schema alias's or expansion's physical schema has no schema behind it | `ALTER VIRTUAL SCHEMA … SET PHYS` / `DROP VIRTUAL SCHEMA` |
 | `expansion_stale` | an expansion's source has tables it did not record (and did not exclude), or records whose source is gone | `ALTER VIRTUAL SCHEMA … REFRESH [PRUNE]` |
 | `reference_dangling` | a reference's end object, or a column it names, is not in the catalog (catalog facts only) | `DROP VIRTUAL REFERENCE` |
+| `types_stale` | the source's column types differ from the type facts stored with the object (spec 099) - a retyped column, or a source that did not exist when the object was written | `ANALYZE VIRTUAL TABLE …` / `… VIEW …` |
+| `enum_domain_exposed` | an object with an ENUM column whose labels are exposed (`enums = keep`) while a predicate - the object's or a grant's - narrows its rows (a view's own `WHERE` is not seen) | `ALTER VIRTUAL TABLE … SET TYPES (enums = varchar)` |
+| `types_incompatible` | a declared entry or a grant's mask that binds over the source but not over the exposed type (`enum_code(tier)` once ENUMs are VARCHAR) - every read refuses | `… SET TYPES (enums = keep)`, or rewrite the expression |
+| `types_mismatch` | a declared entry that makes a type of its own (`CAST(x AS ENUM(…))`) - described as the exposed type, read as its own | `REPAIR VIRTUAL TABLE … REMAP (n = CAST(… AS <type>))` |
 
 A bare alias (no declared list) has no contract beyond "binds", so only `source_missing` can be
 found on it - declaring `COLUMNS` is the opt-in to `column_missing`, as it is to spec 065's clean
@@ -927,6 +954,7 @@ forms carry the `VIRTUAL` marker so duckdb's own `ALTER TABLE` stays native.
 | `ALTER VIRTUAL TABLE <c>.<n> SET COLUMNS (<item>, …)`                                            | `acl_alter_relation(vcat, vname, 'columns', csv)`           |
 | `ALTER VIRTUAL TABLE <c>.<n> SET RLS (<predicate>)`                                              | `acl_alter_relation(vcat, vname, 'rls', predicate)`         |
 | `ALTER VIRTUAL TABLE <c>.<n> SET PRIMARY KEY (<column>, …)` / `DROP PRIMARY KEY`                 | `acl_set_key(vcat, vname, 'relation', pk_csv)` (empty = drop) |
+| `ALTER VIRTUAL TABLE <c>.<n> SET TYPES (aliases = …, enums = …)` (or `VIEW`)                  | `acl_alter_relation(vcat, vname, 'types', list)` (spec 099) |
 | `ALTER VIRTUAL VIEW <c>.<n> SET AS <select>`                                                     | `acl_alter_relation(vcat, vname, 'view', sql)`              |
 | `ALTER VIRTUAL VIEW <c>.<n> SET PRIMARY KEY (…)` / `DROP PRIMARY KEY`                            | `acl_set_key(vcat, vname, 'relation', pk_csv)`              |
 | `ALTER VIRTUAL SCHEMA <c>.<path> SET PHYS <phys schema>`                                         | `acl_alter_schema_alias(vcat, path, phys)`                  |

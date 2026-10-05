@@ -18,6 +18,7 @@
 #include "acl_introspection.hpp"
 #include "acl_maintenance.hpp"
 #include "acl_cluster.hpp"
+#include "acl_types.hpp"
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
 #include "acl_profile.hpp"
@@ -235,6 +236,40 @@ void LoadInternal(ExtensionLoader &loader) {
 		    }
 	    },
 	    SetScope::GLOBAL);
+	// spec 099: how a type the clients may not know is exposed - in the description and the data alike.
+	// A virtual table's own value (ALTER VIRTUAL TABLE ... SET TYPES) overrides these.
+	config.AddExtensionOption(
+	    "acl_alias_types",
+	    "acl: an extension's alias type (MSSQL_VARCHAR(n), ...) is exposed as its base type ('base', the "
+	    "default - a quack client without that extension cannot ATTACH it otherwise) or as it is ('keep')",
+	    LogicalType::VARCHAR, Value("base"),
+	    [](ClientContext &, SetScope scope, Value &value) {
+		    if (scope != SetScope::GLOBAL) {
+			    throw InvalidInputException("acl_alias_types is global - use SET GLOBAL");
+		    }
+		    auto lowered = StringUtil::Lower(value.ToString());
+		    if (lowered != "base" && lowered != "keep") {
+			    throw InvalidInputException("acl_alias_types is 'base' or 'keep'");
+		    }
+		    value = Value(lowered);
+	    },
+	    SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "acl_enum_types",
+	    "acl: an ENUM column is exposed as it is ('keep', the default) or as VARCHAR ('varchar') - an "
+	    "ENUM's description carries its whole domain, whatever RLS leaves visible",
+	    LogicalType::VARCHAR, Value("keep"),
+	    [](ClientContext &, SetScope scope, Value &value) {
+		    if (scope != SetScope::GLOBAL) {
+			    throw InvalidInputException("acl_enum_types is global - use SET GLOBAL");
+		    }
+		    auto lowered = StringUtil::Lower(value.ToString());
+		    if (lowered != "keep" && lowered != "varchar") {
+			    throw InvalidInputException("acl_enum_types is 'keep' or 'varchar'");
+		    }
+		    value = Value(lowered);
+	    },
+	    SetScope::GLOBAL);
 	config.AddExtensionOption("acl_max_sessions",
 	                          "acl: how many sessions may live at once; at the cap a new one is refused "
 	                          "rather than an old one evicted, and 0 means unlimited (spec 044). Each "
@@ -270,6 +305,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	acl::RegisterAclIntrospection(loader, store);
 	acl::RegisterAclMaintenance(loader, store); // spec 039: acl_check_catalog / acl_repair_relation
 	acl::RegisterAclCluster(loader, store);     // spec 093: the cluster profile
+	acl::RegisterAclTypes(loader, store);       // spec 099: acl_exposed_type, the listings' type rule
 	// The audit and observability hooks (spec 069): one registry per instance, reached through the
 	// object cache so an extension loaded before or after us finds the same one - unless the one
 	// there was stamped with another contract version (an extension built from another revision of

@@ -135,7 +135,7 @@ echo "$got" | grep -q "'db_schema_name': \['main', 'stage', 'stage2'\]" || fail 
 case "$got" in *memory*) fail "the physical database was listed: $got";; esac
 
 got="$(ask "@tables")"
-echo "$got" | grep -q "'table_name': \['customers', 'orders'\]" || fail "GetTables: $got"
+echo "$got" | grep -q "'table_name': \['customers', 'orders', 'typed', 'typed_v'\]" || fail "GetTables: $got"
 case "$got" in *memory*) fail "the physical database was listed: $got";; esac
 
 # A filter arrives as a parameter on our side and as a protobuf field on the client's; a field number
@@ -156,6 +156,16 @@ got="$(ask "@types")"
 got="$(ask "@tables_schema")"
 echo "$got" | grep -q "\['id:int64', 'name:string'\]" || fail "the promised schema is wrong: $got"
 case "$got" in *ssn*) fail "a column the role cannot read was in the promised schema: $got";; esac
+
+# --- spec 099: an ENUM goes out as an Arrow dictionary, or as utf8 where the table reads it as VARCHAR -----
+# the promised schema and the stream agree either way: a client never decodes what it was not told
+got="$(ACL_SHOW_SCHEMA=1 ask "SELECT tier, s FROM typed")"
+echo "$got" | grep -q "'tier:dictionary<values=string" || fail "a kept ENUM did not go out as a dictionary: $got"
+got="$(ACL_SHOW_SCHEMA=1 ask "SELECT tier, s FROM typed_v")"
+echo "$got" | grep -q "'tier:string', 's:struct<a: string>'" || fail "an ENUM read as VARCHAR went out as: $got"
+echo "$got" | grep -q "'tier': \['gold'\]" || fail "the cast ENUM's value: $got"
+got="$(ask "@tables_schema:typed_v")"
+echo "$got" | grep -q "\['id:int32', 'tier:string', 's:struct<a: string>'\]" || fail "the promised schema of typed_v: $got"
 
 # --- references are the foreign keys (spec 022) ---------------------------------------------------
 got="$(ask "@imported:orders")"

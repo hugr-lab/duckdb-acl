@@ -223,6 +223,9 @@ info = client.get_flight_info(flight.FlightDescriptor.for_command(descriptor), o
 reader = client.do_get(info.endpoints[0].ticket, options)
 table = reader.read_all()
 data = table.to_pydict()
+# spec 099: what the stream itself carries, column by column - a dictionary or a plain string
+if os.environ.get("ACL_SHOW_SCHEMA"):
+    data["__schema"] = [f"{f.name}:{f.type}" for f in table.schema]
 # `table_schema` is a serialized IPC schema, which is bytes nobody can read in a shell assertion.
 # Unpack it into the column names and types it describes, which is the thing worth asserting on.
 if "table_schema" in data:

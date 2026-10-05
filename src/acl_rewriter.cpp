@@ -24,6 +24,9 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/constraints/check_constraint.hpp"
+#include "duckdb/parser/expression/type_expression.hpp"
+#include "yyjson.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/parsed_data/create_secret_info.hpp"
 #include "duckdb/parser/parsed_data/extra_drop_info.hpp"
@@ -86,6 +89,8 @@ const char *ReasonCode(Reason reason) {
 		return "at_capacity";
 	case Reason::WRONG_RESOURCE_GROUP:
 		return "wrong_resource_group";
+	case Reason::TYPE_DENIED:
+		return "type_denied";
 	case Reason::SOURCE_ERROR:
 		return "source_error";
 	case Reason::UNAVAILABLE:
@@ -528,7 +533,8 @@ private:
 		if (table_info.query && table_info.query->node) {
 			RewriteQueryNode(*table_info.query->node);
 		}
-		// the statement itself passes through untouched: the temp catalog is the connection's own
+		RewriteColumnDefinitions(table_info);
+		// the statement itself passes through: the temp catalog is the connection's own
 	}
 
 	//! DROP of a session temp, symmetric with how it resolves. True = handled (native drop).
@@ -669,6 +675,7 @@ private:
 		if (table_info.query && table_info.query->node) {
 			RewriteQueryNode(*table_info.query->node);
 		}
+		RewriteColumnDefinitions(table_info);
 		auto key = VirtualKey(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
@@ -1255,10 +1262,10 @@ private:
 			}
 			if (policy.subquery_form) {
 				ref = BuildTableSubquery(base.Table().GetIdentifierName(), policy, base);
-			} else if (!policy.renames.empty()) {
-				// Renamed but still writable: reads go through `SELECT * RENAME (...)`, which renames BY
-				// NAME - a column added to the physical table can never shift an alias onto another
-				// column. Writes keep the real table and map the names back (ResolveDmlTarget).
+			} else if (!policy.renames.empty() || !policy.casts.empty()) {
+				// Renamed (or read through a cast, spec 099) but still writable: reads go through `SELECT * RENAME
+				// (...)`, which renames BY NAME - a column added to the physical table can never shift an alias onto
+				// another column. Writes keep the real table and map the names back (ResolveDmlTarget).
 				ref = BuildRenamedSubquery(base.Table().GetIdentifierName(), policy, base);
 			} else {
 				// RENAME: swap the name for its physical target in place; it stays a real (writable) table.
@@ -1647,10 +1654,7 @@ private:
 			} else if (!policy.renames.empty()) {
 				items = "* RENAME (" + StringUtil::Join(RenameItems(policy), ", ") + ")";
 			}
-			sql = "SELECT " + items + " FROM " + policy.phys;
-			if (!policy.rls.empty()) {
-				sql += " WHERE " + policy.rls;
-			}
+			sql = "SELECT " + items + policy.ReadFrom();
 		}
 		NotePhysical(policy.phys);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
@@ -1663,10 +1667,12 @@ private:
 		return std::move(sub);
 	}
 
-	//! `(SELECT * RENAME (phys AS virt, …) FROM <phys>) AS <alias>` - the read shape of a renamed but
-	//! writable relation
+	//! `(SELECT * RENAME (phys AS virt, …) FROM <source>) AS <alias>` - the read shape of a renamed (or
+	//! type-cast, spec 099) but writable relation
 	unique_ptr<TableRef> BuildRenamedSubquery(const string &vname, const TablePolicy &policy, BaseTableRef &original) {
-		auto sql = "SELECT * RENAME (" + StringUtil::Join(RenameItems(policy), ", ") + ") FROM " + policy.phys;
+		auto items =
+		    policy.renames.empty() ? string("*") : "* RENAME (" + StringUtil::Join(RenameItems(policy), ", ") + ")";
+		auto sql = "SELECT " + items + policy.ReadFrom();
 		NotePhysical(policy.phys);
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		Identifier alias = original.alias.empty() ? Identifier(vname) : original.alias;
@@ -2401,9 +2407,179 @@ private:
 	//===------------------------------------------------------------------===//
 	// Expressions + claim baking
 	//===------------------------------------------------------------------===//
+	//! spec 099: a type the principal wrote. Only the `system` catalog's types may be named - the
+	//! built-ins and every loaded extension's; a user type (`CREATE TYPE` in an attached database) is
+	//! the operator's schema and its definition can be data (an ENUM's labels). Every named leaf is
+	//! emitted as `system.main.<name>`, so nothing else can resolve it and nothing else can be probed;
+	//! the constructors (`STRUCT`, `LIST`, `MAP`, `UNION`, `ARRAY`) are syntax, walked, not qualified.
+	void GateTypeExpression(ParsedExpression &expr) {
+		if (expr.GetExpressionClass() != ExpressionClass::TYPE) {
+			// a constant modifier, or the field of a STRUCT / UNION carrying its type
+			for (auto &child : expr.ChildrenMutable()) {
+				if (child) {
+					GateTypeExpression(*child);
+				}
+			}
+			return;
+		}
+		auto &type = expr.Cast<TypeExpression>();
+		auto catalog = type.GetCatalog().GetIdentifierName();
+		auto schema = type.GetSchema().GetIdentifierName();
+		auto name = type.GetTypeName().GetIdentifierName();
+		if ((!catalog.empty() && !StringUtil::CIEquals(catalog, "system")) ||
+		    (!schema.empty() && !StringUtil::CIEquals(schema, "main"))) {
+			Deny(Reason::TYPE_DENIED, "type \"" + type.GetQualifiedName().ToString() +
+			                              "\" is not available: only the system catalog's types can be named");
+		}
+		static const case_insensitive_set_t CONSTRUCTORS = {"struct", "list", "map", "union", "array", "tuple", "row"};
+		if (!CONSTRUCTORS.count(name)) {
+			// a name the system catalog does not have is refused here, in the same words: left to the
+			// binder, its "Did you mean" would name a database whose type has that name
+			if (!store.SystemTypeExists(name)) {
+				Deny(Reason::TYPE_DENIED, "type \"" + type.GetQualifiedName().ToString() +
+				                              "\" is not available: only the system catalog's types can be named");
+			}
+			type.SetQualifiedName(Identifier("system"), Identifier("main"), type.GetTypeName());
+		}
+		for (auto &child : type.GetChildren()) {
+			if (child) {
+				GateTypeExpression(*child);
+			}
+		}
+	}
+
+	//! spec 099: one type written as text (a JSON structure's leaf) - parsed as a cast's target, gated
+	//! like a written one, and spelled back qualified. Anything but exactly one type is refused.
+	string GateTypeText(const string &text, const string &function) {
+		vector<unique_ptr<ParsedExpression>> parsed;
+		try {
+			parsed = Parser(template_options).ParseExpressionList("CAST(NULL AS " + text + ")");
+		} catch (std::exception &) {
+			parsed.clear();
+		}
+		if (parsed.size() != 1 || parsed[0]->GetExpressionClass() != ExpressionClass::CAST ||
+		    parsed[0]->Cast<CastExpression>().Child().GetExpressionClass() != ExpressionClass::CONSTANT) {
+			Deny(Reason::TYPE_DENIED, "the structure of " + function + " names something that is not a type");
+		}
+		auto &target = parsed[0]->Cast<CastExpression>().TargetTypeMutable();
+		GateTypeExpression(target);
+		return target.ToString();
+	}
+
+	//! A JSON structure, rebuilt with every type text gated: objects and arrays as they are, a string
+	//! leaf through GateTypeText, nothing else
+	string GateJsonStructure(duckdb_yyjson::yyjson_val *value, const string &function) {
+		using namespace duckdb_yyjson; // NOLINT
+		auto quote = [](const string &text) {
+			string out = "\"";
+			for (auto ch : text) {
+				if (ch == '"' || ch == '\\') {
+					out += '\\';
+				}
+				out += ch;
+			}
+			return out + "\"";
+		};
+		if (yyjson_is_str(value)) {
+			return quote(GateTypeText(string(yyjson_get_str(value), yyjson_get_len(value)), function));
+		}
+		vector<string> items;
+		if (yyjson_is_arr(value)) {
+			size_t index, count;
+			yyjson_val *item;
+			yyjson_arr_foreach(value, index, count, item) {
+				items.push_back(GateJsonStructure(item, function));
+			}
+			return "[" + StringUtil::Join(items, ", ") + "]";
+		}
+		if (yyjson_is_obj(value)) {
+			size_t index, count;
+			yyjson_val *key, *item;
+			yyjson_obj_foreach(value, index, count, key, item) {
+				items.push_back(quote(string(yyjson_get_str(key), yyjson_get_len(key))) + ": " +
+				                GateJsonStructure(item, function));
+			}
+			return "{" + StringUtil::Join(items, ", ") + "}";
+		}
+		Deny(Reason::TYPE_DENIED, "the structure of " + function + " names something that is not a type");
+		return string();
+	}
+
+	//! spec 099: the JSON functions that take their result type as text - `from_json(j, '{"a":
+	//! "my_db.main.secret_enum"}')` resolves the name as a cast would, so it passes the same gate: the
+	//! structure must be a constant, and every type in it is checked and emitted qualified
+	void GateTypeTextArguments(FunctionExpression &function) {
+		static const case_insensitive_set_t TYPED = {"from_json", "from_json_strict", "json_transform",
+		                                             "json_transform_strict"};
+		auto name = function.FunctionName().GetIdentifierName();
+		auto &arguments = function.GetArgumentsMutable();
+		if (!TYPED.count(name) || arguments.size() < 2) {
+			return;
+		}
+		auto &structure = arguments[1].GetExpressionMutable();
+		Value text;
+		if (structure && structure->GetExpressionClass() == ExpressionClass::CONSTANT) {
+			text = structure->Cast<ConstantExpression>().GetLiteral().ToValue();
+		}
+		if (text.IsNull() || text.type().id() != LogicalTypeId::VARCHAR) {
+			Deny(Reason::TYPE_DENIED, "the structure of " + name + " must be a constant string under the ACL");
+		}
+		auto json = text.ToString();
+		auto doc = duckdb_yyjson::yyjson_read(json.c_str(), json.size(), 0);
+		if (!doc) {
+			Deny(Reason::TYPE_DENIED, "the structure of " + name + " is not JSON");
+		}
+		string gated;
+		try {
+			gated = GateJsonStructure(duckdb_yyjson::yyjson_doc_get_root(doc), name);
+		} catch (...) {
+			duckdb_yyjson::yyjson_doc_free(doc);
+			throw;
+		}
+		duckdb_yyjson::yyjson_doc_free(doc);
+		structure = ConstantExpression::FromValue(Value(gated));
+	}
+
+	void GateLogicalType(LogicalType &type) {
+		if (type.IsUnbound()) {
+			GateTypeExpression(*UnboundType::GetTypeExpression(type));
+		}
+	}
+
+	//! spec 099: a table the principal creates - its column types, DEFAULT and generated expressions and
+	//! CHECK constraints are written by the principal, so they pass the type gate and the walker (a
+	//! function in a DEFAULT is a function call like any other)
+	void RewriteColumnDefinitions(CreateTableInfo &info) {
+		for (idx_t i = 0; i < info.columns.LogicalColumnCount(); i++) {
+			auto &column = info.columns.GetColumnMutable(LogicalIndex(i));
+			GateLogicalType(column.TypeMutable());
+			if (column.HasDefaultValue()) {
+				auto value = column.DefaultValue().Copy();
+				RewriteExpr(value);
+				column.SetDefaultValue(std::move(value));
+			}
+			if (column.Generated()) {
+				auto generated = column.GeneratedExpression().Copy();
+				RewriteExpr(generated);
+				column.SetGeneratedExpression(std::move(generated));
+			}
+		}
+		for (auto &constraint : info.constraints) {
+			if (constraint && constraint->type == ConstraintType::CHECK) {
+				RewriteExpr(constraint->Cast<CheckConstraint>().expression);
+			}
+		}
+	}
+
 	void RewriteExpr(unique_ptr<ParsedExpression> &expr) {
 		if (!expr) {
 			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::CAST) {
+			GateTypeExpression(expr->Cast<CastExpression>().TargetTypeMutable()); // spec 099
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::TYPE) {
+			GateTypeExpression(*expr);
 		}
 		if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
 			auto &subquery = expr->Cast<SubqueryExpression>();
@@ -2477,6 +2653,7 @@ private:
 				function.SetQualifiedName(QualifiedName(function.FunctionName()));
 				GateFunction(function.GetQualifiedNameMutable(), FunctionKind::SCALAR, "function \"" + name + "\"");
 			}
+			GateTypeTextArguments(function);
 		}
 		if (expr->GetExpressionClass() == ExpressionClass::WINDOW) {
 			// `sum(x) OVER (...)` is a WINDOW node, not a FUNCTION one; its function goes through the
@@ -2707,7 +2884,7 @@ private:
 	//! filtered by their own claims. `acl_arg` is still substituted - it belongs to a call that is
 	//! happening now and would mean nothing in a stored body.
 	bool keep_claim_markers = false;
-	ParserOptions template_options;
+	ParserOptions template_options = ParserOptions::Builtin();
 
 public:
 	//! The audit's entry for the statement being rewritten (spec 069), or null when nobody listens
@@ -2794,7 +2971,7 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 				expr = ConstantExpression::Null();
 			} else {
 				// parse the cast rather than resolving the type name by hand (no context needed here)
-				auto casted = Parser::ParseExpressionList("CAST(NULL AS " + type + ")", options);
+				auto casted = Parser(options).ParseExpressionList("CAST(NULL AS " + type + ")");
 				expr = std::move(casted[0]);
 			}
 			if (!alias.GetIdentifierName().empty()) {
@@ -2825,7 +3002,7 @@ void BakeNullMarkersInNode(QueryNode &node, const vector<string> &param_types, c
 vector<std::pair<string, string>> QualifiedColumnRefs(const string &expression, const ParserOptions &options) {
 	ParserOptions inner = options;
 	inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
-	auto parsed = Parser::ParseExpressionList(expression, inner);
+	auto parsed = Parser(inner).ParseExpressionList(expression);
 	if (parsed.size() != 1) {
 		throw BinderException("acl: a join expression must be a single expression");
 	}
@@ -2852,7 +3029,7 @@ string BakeTemplateForProbe(const string &sql, const ParserOptions &options, boo
 	ParserOptions inner = options;
 	inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
 	if (expression) {
-		auto expressions = Parser::ParseExpressionList(sql, inner);
+		auto expressions = Parser(inner).ParseExpressionList(sql);
 		if (expressions.size() != 1) {
 			throw BinderException("acl_rewrite: scalar template must be a single expression");
 		}

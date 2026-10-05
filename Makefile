@@ -278,8 +278,10 @@ serve-live:
 test-e2e:
 	ACL_PG_DSN="dbname=$(ACL_PG_DB) user=$(ACL_PG_USER) password=$(ACL_PG_PASS) host=$(ACL_PG_HOST) port=$(ACL_PG_PORT)" \
 	ACL_DUCKLAKE_DSN="ducklake:postgres:dbname=$(ACL_DUCKLAKE_CATALOG_DB) user=$(ACL_PG_USER) password=$(ACL_PG_PASS) host=$(ACL_PG_HOST) port=$(ACL_PG_PORT)" \
-	ACL_MSSQL_DSN="Server=$(ACL_MSSQL_HOST),$(ACL_MSSQL_PORT);Database=$(ACL_MSSQL_DB);User Id=$(ACL_MSSQL_USER);Password=$(ACL_MSSQL_PASS)" \
+	ACL_MSSQL_DSN="Server=$(ACL_MSSQL_HOST),$(ACL_MSSQL_PORT);Database=$(ACL_MSSQL_DB);User Id=$(ACL_MSSQL_USER);Password=$(ACL_MSSQL_PASS);TrustServerCertificate=true" \
 	test/e2e/door/run.sh
+	ACL_MSSQL_DSN="Server=$(ACL_MSSQL_HOST),$(ACL_MSSQL_PORT);Database=$(ACL_MSSQL_DB);User Id=$(ACL_MSSQL_USER);Password=$(ACL_MSSQL_PASS);TrustServerCertificate=true" \
+	test/e2e/door/types.sh
 
 # --- The managed policy schema (spec 034) ---------------------------------
 # schema/policy_schema.sql is the source of truth; everything else is rendered from it, so what an

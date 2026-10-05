@@ -1678,6 +1678,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 				return MakeAdminCall("acl_set_key",
 				                     {Value(vcat), Value(vname), Value("relation"), Value(s.List("key columns"))});
 			}
+			if (s.Accept("types")) { // spec 099: ALTER VIRTUAL VIEW v.n SET TYPES (aliases = ..., enums = ...)
+				return MakeAdminCall("acl_alter_relation",
+				                     {Value(vcat), Value(vname), Value("types"), Value(s.List("types list"))});
+			}
 			s.Expect("as");
 			return MakeAdminCall("acl_alter_relation",
 			                     {Value(vcat), Value(vname), Value("view"), Value(s.Body("view SQL"))});
@@ -1729,6 +1733,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			if (s.Accept("phys")) {
 				return MakeAdminCall("acl_alter_relation", {Value(vcat), Value(vname), Value("phys"),
 				                                            Value(s.Name("a physical table path"))});
+			}
+			if (s.Accept("types")) { // spec 099: SET TYPES (aliases = base|keep|default, enums = ...)
+				return MakeAdminCall("acl_alter_relation",
+				                     {Value(vcat), Value(vname), Value("types"), Value(s.List("types list"))});
 			}
 			if (s.Accept("columns")) {
 				return MakeAdminCall("acl_alter_relation", {Value(vcat), Value(vname), Value("columns"),

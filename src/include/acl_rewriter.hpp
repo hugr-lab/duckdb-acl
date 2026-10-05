@@ -30,6 +30,7 @@ enum class Reason : uint8_t {
 	DRAINING,
 	AT_CAPACITY,
 	WRONG_RESOURCE_GROUP, // spec 096: a node of another resource group than the principal's
+	TYPE_DENIED,          // spec 099: a type of a catalog other than `system`
 	SOURCE_ERROR,
 	UNAVAILABLE,
 	WRITE_POLICY,

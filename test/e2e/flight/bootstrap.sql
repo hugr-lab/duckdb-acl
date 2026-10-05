@@ -18,6 +18,10 @@ CREATE TABLE customers AS
 CREATE SCHEMA staging;
 CREATE SCHEMA staging2;
 
+-- spec 099: an ENUM column, read as it is by one virtual table and as VARCHAR by the other
+CREATE TYPE tier AS ENUM ('gold', 'silver');
+CREATE TABLE typed AS SELECT 1 AS id, 'gold'::tier AS tier, {'a': 'silver'::tier} AS s;
+
 ATTACH ':memory:' AS store;
 SELECT acl_use_db('store', 'acl', true);
 
@@ -38,6 +42,9 @@ ACL ADMIN CREATE VIRTUAL TABLE c.orders AS memory.main.orders PRIMARY KEY (id);
 ACL ADMIN CREATE VIRTUAL TABLE c.customers AS memory.main.customers;
 ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers
     ON (customer_id = id) CARDINALITY many_to_one COMMENT 'the ordering customer';
+ACL ADMIN CREATE VIRTUAL TABLE c.typed AS memory.main.typed;
+ACL ADMIN CREATE VIRTUAL TABLE c.typed_v AS memory.main.typed;
+ACL ADMIN ALTER VIRTUAL TABLE c.typed_v SET TYPES (enums = varchar);
 ACL ADMIN CREATE ROLE analyst;
 -- temp is explicit (spec 050): session temp tables ride on it, and nothing else grants them
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, temp) MAIN;

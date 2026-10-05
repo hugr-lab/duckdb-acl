@@ -194,6 +194,41 @@ mode of default-deny is a refusal, and the refusal names the function.
 - References (spec 022) are "a hint an agent reads, never enforced and granting nothing; visible
   only when both ends and every column it names are".
 
+### Types (spec 099)
+
+- **Only the system catalog's types can be named** under a principal: a cast, a `NULL::t`, a column
+  type of a table the principal creates (with its `DEFAULT`, generated column and `CHECK` gated like
+  any expression). A type of another database - a user `CREATE TYPE`, an ENUM whose labels are the
+  operator's - is refused before bind with `type "<db>.<schema>.<t>" is not available: only the system
+  catalog's types can be named` (reason `type_denied`), the same text whether the type exists or not -
+  the refusal is ours, so duckdb's "Did you mean" never names the database that has it. A type written
+  as text is a type too: `from_json` / `json_transform` (and their `_strict` forms) take a constant
+  structure only, every type in it gated the same way.
+  A bare name resolves in `system.main` only, so a same-named type of an attached database never
+  shadows a built-in. The built-ins, their aliases, `JSON` and the anonymous constructors (`STRUCT`,
+  `LIST`, `MAP`, `UNION`, an inline `ENUM('a', 'b')`) stay.
+- `duckdb_types()` answers the system catalog's types, once - never another database's, a user
+  type, or an ENUM's labels, with or without `meta`.
+- **What type a column is exposed as** is the operator's choice, and the read, the listings, the DDL
+  a quack client binds and the Flight schema always agree (the rewriter casts where the source is
+  read; every listing describes the cast type):
+  - an extension's **alias type** (`MSSQL_VARCHAR(n)`) is read as its base type by default
+    (`acl_alias_types = 'base'`) - a quack client without that extension cannot ATTACH a catalog that
+    names it; `keep` exposes it as it is;
+  - an **ENUM** (at any depth of a `STRUCT` / `LIST` / `MAP` / `ARRAY` / `UNION`) is kept by default
+    (`acl_enum_types = 'keep'`) or read as `VARCHAR` (`varchar`). **An ENUM's type carries its whole
+    domain**: whoever sees the column sees every label, whatever RLS leaves visible - `varchar` is the
+    control, and `acl_check_catalog` reports `enum_domain_exposed` where a predicate narrows a table
+    whose ENUMs are kept.
+  - The virtual table overrides the node: `ALTER VIRTUAL TABLE c.t SET TYPES (aliases = …, enums = …)`.
+    A cast changes only the read - the relation stays writable, a string still reaches the ENUM
+    column. The cast sits above the row filter: a predicate (the object's or a grant's) reads the
+    physical values - an ENUM orders by its labels' positions, a VARCHAR lexically, so a predicate
+    over the cast value would change which rows a role sees; the projection and masks read the
+    exposed values, and `acl_check_catalog` names an entry or a mask that no longer binds
+    (`types_incompatible`, e.g. `enum_code(...)`) or that makes a type of its own
+    (`types_mismatch`).
+
 ### Statements (`AclRewriter::RewriteStatement`, `src/acl_rewriter.cpp`)
 
 | statement type | under a principal |
@@ -465,6 +500,13 @@ are name leaks bounded to an already-granted principal.
   today.
 - **Memory mode** (no policy catalog) is the dev stub: the anonymous hatch is unconditionally open
   there (spec 009), and it cannot serve, list or read a JWKS.
+- **`enums = varchar` hides a domain from readers, not from writers (spec 099).** A role that may write
+  the ENUM column is told the labels by duckdb's own conversion error (`Could not convert string 'x'
+  to ENUM('a', 'b')`) - writing a value is a way to test labels anyway - and its `RETURNING` reads the
+  physical row, ENUM type included. A role that holds no write capability sees neither. The casts are facts probed
+  where the object is written (nothing on the query path reads the source): a source retyped since is
+  reported as `types_stale`, and `ANALYZE VIRTUAL TABLE` probes it again. A live schema alias, a
+  table function and the memory store are not cast: they expose the source's types as they are.
 - **`RETURNING` on a refused row** names the grant, not the row - deliberately, "a row identifier
   in the message … would leak the row to the principal" (spec 024).
 - **Sessions are per node.** There is no shared session backend; a cluster front routes by cookie.

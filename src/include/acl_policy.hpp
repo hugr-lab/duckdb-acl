@@ -137,6 +137,19 @@ struct TablePolicy {
 	//! the table's full width and never by name, while a client counts the columns spec 035 published
 	//! - so the list has to be supplied, or the client is counting columns it was never shown.
 	vector<string> write_order;
+	//! spec 099: source columns read as another type - physical column name -> the exposed type's
+	//! spelling (an extension alias as its base type, an ENUM as VARCHAR). Cast where the source is
+	//! read, so a mask, a predicate and the listing all see the exposed type; writes keep `phys`.
+	vector<std::pair<string, string>> casts;
+
+	//! What a read selects from, with its row filter: ` FROM phys [WHERE rls]`, or - with casts -
+	//! ` FROM (SELECT * REPLACE (CAST(c AS t) AS c, ...) FROM phys [WHERE rls]) AS <phys's own name>`.
+	//! The cast sits right above the filter: a predicate reads the physical values (an ENUM's order is
+	//! its labels' positions, a VARCHAR's is lexical), the projection and the masks the exposed ones.
+	//! duckdb pushes a filter through the cast into the scan (measured, spec 099 §3a).
+	string ReadFrom() const;
+	//! `* REPLACE (CAST(c AS t) AS c, ...)` - the select list that exposes `casts`
+	static string CastItems(const vector<std::pair<string, string>> &casts);
 };
 
 //! Where a principal's DDL lands (spec 016): the virtual schema the written name belongs to, the
@@ -439,6 +452,12 @@ struct PolicyStore {
 	//! its roles (no definition, database or schema outside the system catalog) and the virtual
 	//! functions of its catalogs, in duckdb's shape. Works in every mode; the catalog adds (b).
 	string PrincipalFunctionsSql(const Principal &principal);
+	//! spec 099: whether the system catalog has a type of this name (the built-ins, their aliases and
+	//! every loaded extension's). Names seen are cached; a miss reads the catalog again, since an
+	//! extension may have been loaded since.
+	bool SystemTypeExists(const string &name);
+	mutex system_types_lock;
+	case_insensitive_set_t system_types;
 	//! Read one listing of the active policy source for an operator (spec 010 part 3). `listing` names
 	//! a table of the policy model ("relations", "grants", …) or "status". Throws when the active
 	//! source cannot enumerate - silence on an admin surface reads as "nothing is configured".

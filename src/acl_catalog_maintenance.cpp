@@ -10,6 +10,7 @@
 
 #include "acl_door_common.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_types.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
@@ -166,7 +167,8 @@ private:
 	}
 
 	void CheckRelations() {
-		auto rows = Read("SELECT \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"rls_checked\" FROM " +
+		auto rows = Read("SELECT \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"rls_checked\", "
+		                 "\"enum_types\", \"alias_types\" FROM " +
 		                 catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"vname\"");
 		ResultRows rows_rows(*rows);
 		for (idx_t row = 0; row < rows->RowCount(); row++) {
@@ -249,12 +251,173 @@ private:
 					}
 				}
 			}
+			if (!relation.dead) {
+				JudgeTypes(kind, relation, rls, rows_rows.GetValue(7, row), rows_rows.GetValue(6, row));
+			}
 			if (!relation.dead && !rls.empty()) {
 				JudgePredicate(kind, relation, "", rls, rls_checked,
 				               "ALTER VIRTUAL " + string(is_view ? "VIEW " : "TABLE ") + Named(relation.vname) +
 				                   " SET RLS '<predicate>'");
 			}
 			relations[relation.vname] = std::move(relation);
+		}
+	}
+
+	//! spec 099: the type facts against the source now (`types_stale`), and an ENUM whose labels every
+	//! reader sees while some predicate narrows the rows (`enum_domain_exposed`)
+	void JudgeTypes(const string &kind, const Relation &relation, const string &rls, const Value &alias_types,
+	                const Value &enum_types) {
+		auto stored = Read("SELECT lower(\"column\"), coalesce(\"as_base\", ''), coalesce(\"as_varchar\", ''),"
+		                   " coalesce(\"as_both\", '') FROM " +
+		                   catalog.Tbl("relation_types") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                   " AND \"vname\" = " + Lit(relation.vname));
+		ResultRows stored_rows(*stored);
+		std::set<string> was, now;
+		for (idx_t i = 0; i < stored->RowCount(); i++) {
+			was.insert(stored_rows.GetValue(0, i).ToString() + "\x1f" + stored_rows.GetValue(1, i).ToString() + "\x1f" +
+			           stored_rows.GetValue(2, i).ToString() + "\x1f" + stored_rows.GetValue(3, i).ToString());
+		}
+		vector<CatalogBackend::TypeFact> facts;
+		if (!catalog.ProbeTypeFacts(relation.form, relation.phys, relation.view_sql, facts)) {
+			return; // a source that does not bind has its own finding
+		}
+		for (auto &fact : facts) {
+			now.insert(StringUtil::Lower(fact.column) + "\x1f" + fact.as_base + "\x1f" + fact.as_varchar + "\x1f" +
+			           fact.as_both);
+		}
+		if (was != now) {
+			Add(kind, relation.vname, "", "types_stale",
+			    "the stored type facts no longer match the source's column types - the read casts what the facts "
+			    "say, while the listing describes what the source has",
+			    string("ANALYZE VIRTUAL ") + (relation.form == "view" ? "VIEW " : "TABLE ") + Named(relation.vname));
+		}
+		auto instance = catalog.Db();
+		bool strip_alias = alias_types.IsNull() ? NodeStripsAliases(*instance) : Text(alias_types) == "base";
+		bool enums_to_varchar = enum_types.IsNull() ? NodeEnumsToVarchar(*instance) : Text(enum_types) == "varchar";
+		// the columns the object exposes: a declared list shows only what its entries read by name
+		auto exposed = [&](const string &column) {
+			if (relation.declared.empty()) {
+				return true;
+			}
+			for (auto &entry : relation.declared) {
+				auto reads = entry.second.empty() ? entry.first : entry.second;
+				if (StringUtil::CIEquals(reads, column) || StringUtil::CIEquals(reads, Ident(column))) {
+					return true;
+				}
+			}
+			return false;
+		};
+		bool has_enum = false;
+		bool casts_aliases = false; // what the casts in force are made of: the repair names only that
+		bool casts_enums = false;
+		vector<std::pair<string, string>> casts;
+		for (auto &fact : facts) {
+			has_enum = has_enum || (!fact.as_varchar.empty() && exposed(fact.column));
+			casts_aliases = casts_aliases || (strip_alias && !fact.as_base.empty());
+			casts_enums = casts_enums || (enums_to_varchar && !fact.as_varchar.empty());
+			string spelled;
+			if (strip_alias && enums_to_varchar) {
+				spelled = fact.as_both;
+			} else if (strip_alias) {
+				spelled = fact.as_base;
+			} else if (enums_to_varchar) {
+				spelled = fact.as_varchar;
+			}
+			if (!spelled.empty()) {
+				casts.emplace_back(fact.column, spelled);
+			}
+		}
+		if (!casts.empty()) {
+			JudgeUnderCasts(kind, relation, casts, strip_alias, enums_to_varchar, casts_aliases, casts_enums);
+		}
+		if (!has_enum || enums_to_varchar) {
+			return;
+		}
+		auto narrowed =
+		    Read("SELECT 1 FROM " + catalog.Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) +
+		         " AND \"vname\" = " + Lit(relation.vname) +
+		         " AND trim(coalesce(\"rls\", '')) <> '' UNION ALL SELECT 1 FROM " + catalog.Tbl("role_catalogs") +
+		         " WHERE \"vcat\" = " + Lit(vcat) + " AND trim(coalesce(\"rls\", '')) <> '' LIMIT 1");
+		if (rls.empty() && narrowed->RowCount() == 0) {
+			return;
+		}
+		Add(kind, relation.vname, "", "enum_domain_exposed",
+		    "an ENUM column's type carries every label, whatever the predicate leaves visible - a reader of the "
+		    "column sees the whole domain",
+		    string("ALTER VIRTUAL ") + (relation.form == "view" ? "VIEW " : "TABLE ") + Named(relation.vname) +
+		        " SET TYPES (enums = varchar)");
+	}
+
+	//! spec 099: what the casts in force do to the expressions over the source. A declared entry or a
+	//! grant's mask reads the exposed values: one that binds over the source and not over the cast
+	//! (an ENUM-only function, `enum_code(tier)`) refuses every read (`types_incompatible`); a declared
+	//! entry that binds to another type than the listing describes (it makes an ENUM of its own) would
+	//! hand a quack client data its description does not match (`types_mismatch`).
+	void JudgeUnderCasts(const string &kind, const Relation &relation, const vector<std::pair<string, string>> &casts,
+	                     bool strip_alias, bool enums_to_varchar, bool casts_aliases, bool casts_enums) {
+		auto typed = "(SELECT " + TablePolicy::CastItems(casts) + " FROM " + relation.Source() + ") AS __acl_typed";
+		auto repair_types = string("ALTER VIRTUAL ") + (relation.form == "view" ? "VIEW " : "TABLE ") +
+		                    Named(relation.vname) + " SET TYPES (" + (casts_aliases ? "aliases = keep" : "") +
+		                    (casts_aliases && casts_enums ? ", " : "") + (casts_enums ? "enums = keep" : "") +
+		                    ")  -- or rewrite the expression for the exposed type";
+		string error;
+		bool stored_derived = false;
+		auto stored = StoredSchema(catalog, vcat, relation.vname, "relation", stored_derived);
+		for (auto &entry : relation.declared) {
+			auto item = EntryItem(entry);
+			if (!ItemBinds(catalog, relation.Source(), item, error)) {
+				continue; // column_missing says it
+			}
+			if (!ItemBinds(catalog, typed, item, error)) {
+				Add(kind, relation.vname, "", "types_incompatible",
+				    "declared column \"" + entry.first +
+				        "\" does not bind once the source's types are exposed: " + error,
+				    repair_types);
+				continue;
+			}
+			Columns probed;
+			if (!catalog.ProbeSchema("SELECT " + item + " AS " + Ident(entry.first) + " FROM " + typed, false, {},
+			                         probed) ||
+			    probed.empty()) {
+				continue;
+			}
+			for (auto &column : stored) {
+				if (!StringUtil::CIEquals(column.first, entry.first) || column.second.empty()) {
+					continue;
+				}
+				auto described =
+				    Read("SELECT acl_exposed_type(" + Lit(column.second) + ", " + (strip_alias ? "true" : "false") +
+				         ", " + (enums_to_varchar ? "true" : "false") + ")");
+				ResultRows described_rows(*described);
+				auto said = described_rows.Count() ? Text(described_rows.GetValue(0, 0)) : string();
+				if (!said.empty() && !StringUtil::CIEquals(said, probed[0].second)) {
+					Add(kind, relation.vname, "", "types_mismatch",
+					    "declared column \"" + entry.first + "\" is described as " + said + " and reads as " +
+					        probed[0].second + " - an expression that makes a type of its own is not cast",
+					    "REPAIR VIRTUAL TABLE " + Named(relation.vname) + " REMAP (" + entry.first + " = CAST(" + item +
+					        " AS " + said + "))");
+				}
+			}
+		}
+		// the masks of the grants that reach this object read the exposed values like the projection
+		auto grants = Read("SELECT \"role\", \"columns\" FROM " + catalog.Tbl("role_object_caps") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(relation.vname) +
+		                   " UNION ALL SELECT \"role\", \"columns\" FROM " + catalog.Tbl("role_catalogs") +
+		                   " WHERE \"vcat\" = " + Lit(vcat));
+		ResultRows grant_rows(*grants);
+		for (idx_t row = 0; row < grant_rows.Count(); row++) {
+			auto role = grant_rows.GetValue(0, row).ToString();
+			for (auto &item : ParseColumnList(Text(grant_rows.GetValue(1, row)))) {
+				if (item.second.empty() || !ItemBinds(catalog, relation.Source(), item.second, error)) {
+					continue;
+				}
+				if (!ItemBinds(catalog, typed, item.second, error)) {
+					Add("grant", relation.vname, role, "types_incompatible",
+					    "the mask \"" + item.first + " = " + item.second +
+					        "\" does not bind once the source's types are exposed: " + error,
+					    repair_types);
+				}
+			}
 		}
 	}
 

@@ -20,9 +20,14 @@ CREATE TABLE IF NOT EXISTS acl."meta"("key" VARCHAR PRIMARY KEY, "value" VARCHAR
 
 CREATE TABLE IF NOT EXISTS acl."catalogs"("vcat" VARCHAR PRIMARY KEY, "comment" VARCHAR);
 
-CREATE TABLE IF NOT EXISTS acl."relations"("vcat" VARCHAR, "vname" VARCHAR, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, PRIMARY KEY ("vcat", "vname"));
+CREATE TABLE IF NOT EXISTS acl."relations"("vcat" VARCHAR, "vname" VARCHAR, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, "alias_types" VARCHAR, "enum_types" VARCHAR, PRIMARY KEY ("vcat", "vname"));
 
 CREATE TABLE IF NOT EXISTS acl."relation_columns"("vcat" VARCHAR, "vname" VARCHAR, "pos" INTEGER, "name" VARCHAR, "expr" VARCHAR, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "pos"));
+
+-- spec 099: the types of a relation's source columns a client may not know - an extension's alias type,
+-- an ENUM - probed when the relation is written. The type to read the column as, per policy:
+-- as_base (aliases -> base type), as_varchar (ENUMs -> VARCHAR), as_both; NULL where it changes nothing.
+CREATE TABLE IF NOT EXISTS acl."relation_types"("vcat" VARCHAR, "vname" VARCHAR, "column" VARCHAR, "as_base" VARCHAR, "as_varchar" VARCHAR, "as_both" VARCHAR, PRIMARY KEY ("vcat", "vname", "column"));
 
 CREATE TABLE IF NOT EXISTS acl."functions"("vcat" VARCHAR, "vname" VARCHAR, "kind" VARCHAR, "form" VARCHAR, "target" VARCHAR, "template" VARCHAR, "comment" VARCHAR, "params" VARCHAR, PRIMARY KEY ("vcat", "vname", "kind"));
 
@@ -135,7 +140,7 @@ INSERT INTO acl."function_grants" SELECT * FROM (VALUES ('', 'base', '', '', '',
 
 INSERT INTO acl."meta" SELECT 'function_seed', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'function_seed');
 
-INSERT INTO acl."meta" SELECT 'schema_version', '18' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
+INSERT INTO acl."meta" SELECT 'schema_version', '19' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
 
 INSERT INTO acl."meta" SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'policy_version');
 
@@ -143,4 +148,4 @@ INSERT INTO acl."meta" SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 F
 
 -- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
 -- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
-INSERT INTO acl."meta" SELECT 'min_reader_version', '17' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'min_reader_version');
+INSERT INTO acl."meta" SELECT 'min_reader_version', '18' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'min_reader_version');

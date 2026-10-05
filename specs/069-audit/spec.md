@@ -70,7 +70,7 @@ One record per decision:
 `no_access`, `capability`, `read_only`, `function_denied`, `statement_type`, `unchecked_predicate`,
 `setting_denied`, `parse`, `principal` (a token, role or session that did not verify),
 `mgmt_unauthorized`, `ddl_home`, `draining`, `at_capacity`, `wrong_resource_group` (spec 096: a node of a resource group the principal's
-roles are not in), `source_error` (the policy source or an
+roles are not in), `type_denied` (spec 099: a type outside the `system` catalog named under a principal), `source_error` (the policy source or an
 issuer's keys did not answer), `unavailable`, `write_policy` (a row refused where it is written,
 spec 024, or by the door's own load check), `policy_error` (a template or a policy row the rewriter
 could not use - the operator's, not the principal's; also the fallback for a failure under the

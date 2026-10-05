@@ -23,7 +23,9 @@ fi
 
 transcript="$(mktemp)"
 trap 'rm -f "$transcript"' EXIT
-{ echo "LOAD '$ACL_EXT';"; cat "$(dirname "$0")/demo.sql"; } | "$DUCKDB_BIN" -unsigned 2>&1 | tee "$transcript" || true
+# -no-agent: since the eb0d9df pin the CLI switches to an agent's output format when an AI coding
+# agent's environment variable is set, and the transcript is judged by its error lines
+{ echo "LOAD '$ACL_EXT';"; cat "$(dirname "$0")/demo.sql"; } | "$DUCKDB_BIN" -unsigned -no-agent 2>&1 | tee "$transcript" || true
 
 expect() { # <regex> <what>
   if ! grep -qE "$1" "$transcript"; then

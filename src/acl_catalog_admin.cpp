@@ -119,7 +119,8 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
                                   const string &phys, const string &view_sql, const string &rls,
                                   const vector<std::pair<string, string>> &columns, const string &comment,
                                   const string &returns, const string &origin = string(), const string &pk = string(),
-                                  const case_insensitive_map_t<int8_t> &nullable_marks = {}, bool pk_carried = false) {
+                                  const case_insensitive_map_t<int8_t> &nullable_marks = {}, bool pk_carried = false,
+                                  const string &alias_types = string(), const string &enum_types = string()) {
 	vector<string> statements;
 	statements.push_back("DELETE FROM " + catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                     " AND \"vname\" = " + Lit(vname));
@@ -139,12 +140,18 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 	// change is not a reason to lose an operator's documentation
 	statements.push_back("INSERT INTO " + catalog.Tbl("relations") +
 	                     "(\"vcat\", \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"comment\", \"origin\","
-	                     " \"rls_checked\")"
+	                     " \"rls_checked\", \"alias_types\", \"enum_types\")"
 	                     " VALUES (" +
 	                     Lit(vcat) + ", " + Lit(vname) + ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) +
 	                     ", " + Lit(rls) + ", " + (comment.empty() ? string("NULL") : Lit(comment)) + ", " +
 	                     (origin.empty() ? string("NULL") : Lit(origin)) + ", " +
-	                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ")");
+	                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ", " +
+	                     (alias_types.empty() ? string("NULL") : Lit(alias_types)) + ", " +
+	                     (enum_types.empty() ? string("NULL") : Lit(enum_types)) + ")");
+	// spec 099: the source's types, probed here so the read can cast them without looking
+	for (auto &statement : catalog.TypeFactStatements(vcat, vname, form, phys, view_sql)) {
+		statements.push_back(statement);
+	}
 	idx_t pos = 0;
 	for (auto &column : columns) {
 		auto mark = nullable_marks.find(column.first);
@@ -369,11 +376,15 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 	RequireCatalog(catalog, "acl_add_relation");
 	RequireNotReserved(vname);
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
-		auto existing = read("SELECT \"comment\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                     " AND \"vname\" = " + Lit(vname));
-		string comment;
-		if (existing->RowCount() > 0 && !existing->Collection().GetValue(0, 0).IsNull()) {
-			comment = existing->Collection().GetValue(0, 0).ToString();
+		auto existing = read("SELECT \"comment\", \"alias_types\", \"enum_types\" FROM " + catalog->Tbl("relations") +
+		                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		// the comment and the type policy (spec 099) are the operator's, kept across a redeclaration
+		string comment, alias_types, enum_types;
+		if (existing->RowCount() > 0) {
+			ResultRows kept(*existing);
+			comment = kept.GetValue(0, 0).IsNull() ? string() : kept.GetValue(0, 0).ToString();
+			alias_types = kept.GetValue(1, 0).IsNull() ? string() : kept.GetValue(1, 0).ToString();
+			enum_types = kept.GetValue(2, 0).IsNull() ? string() : kept.GetValue(2, 0).ToString();
 		}
 		// a replace that states no key keeps the one declared before, exactly as the comment is kept: a
 		// redeclaration is not a reason to lose it. It lapses only when the new shape no longer supports
@@ -392,7 +403,7 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 			pk_carried = !kept_pk.empty();
 		}
 		statements = RelationStatements(*catalog, vcat, vname, form, phys, view_sql, rls, columns, comment, returns,
-		                                string(), kept_pk, nullable_marks, pk_carried);
+		                                string(), kept_pk, nullable_marks, pk_carried, alias_types, enum_types);
 	});
 }
 
@@ -527,7 +538,7 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 				pos++;
 			}
 		} else if (!expr.empty()) {
-			ParserOptions options;
+			auto options = ParserOptions::Builtin();
 			auto from_tail = SplitTopLevel(from_vname, '.').back();
 			auto to_tail = SplitTopLevel(to_vname, '.').back();
 			for (auto &ref : QualifiedColumnRefs(expr, options)) {
@@ -942,7 +953,7 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 			if (std::find(names.begin(), names.end(), name) != names.end()) {
 				continue;
 			}
-			for (auto table : {"relations", "relation_columns", "role_object_caps"}) {
+			for (auto table : {"relations", "relation_columns", "relation_types", "role_object_caps"}) {
 				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat) +
 				                     " AND \"vname\" = " + Lit(vname));
 			}
@@ -1252,6 +1263,8 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'");
 		statements.push_back("DELETE FROM " + catalog->Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname));
+		statements.push_back("DELETE FROM " + catalog->Tbl("relation_types") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname));
 		statements.push_back("DELETE FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'");
 		// a function of the same name keeps the grant, because the grant row cannot tell them apart
@@ -1452,6 +1465,10 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 			auto object = text(0);
 			auto source = text(1) == "view" ? "(" + text(3) + ")" : text(2);
 			sources[object] = source;
+			// spec 099: the source's types are a fact about the physical world too
+			for (auto &statement : catalog->TypeFactStatements(vcat, object, text(1), text(2), text(3))) {
+				statements.push_back(statement);
+			}
 			auto rls = text(4);
 			if (rls.empty()) {
 				continue;
@@ -1534,8 +1551,8 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 			                      "drop those grants too",
 			                      vcat, StringUtil::Join(roles, ", "));
 		}
-		for (auto table : {"relations", "relation_columns", "schemas", "functions", "object_columns", "references",
-		                   "reference_columns", "schema_dropped", "keys"}) {
+		for (auto table : {"relations", "relation_columns", "relation_types", "schemas", "functions", "object_columns",
+		                   "references", "reference_columns", "schema_dropped", "keys"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
 		}
 		if (cascade) {
@@ -1569,7 +1586,8 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 			                      vcat, alias_path, count);
 		}
 		if (cascade) {
-			for (auto table : {"relations", "relation_columns", "object_columns", "functions", "keys"}) {
+			for (auto table :
+			     {"relations", "relation_columns", "relation_types", "object_columns", "functions", "keys"}) {
 				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat) + prefix);
 			}
 			auto under = PrefixName(alias_path);
@@ -1880,7 +1898,7 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		// the statement kind must match what the object is: silently turning a masked/RLS table into
 		// a view (or vice versa) would drop enforcement while the catalog still shows it
 		bool target_is_view = form == "view";
-		if ((field == "view") != target_is_view) {
+		if (field != "types" && (field == "view") != target_is_view) {
 			throw BinderException("acl admin: \"%s.%s\" is %s - use ALTER VIRTUAL %s", vcat, vname,
 			                      target_is_view ? "a view" : "a table", target_is_view ? "VIEW" : "TABLE");
 		}
@@ -1926,7 +1944,7 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 			new_rls = value;
 		} else if (field == "view") {
 			new_view = value;
-		} else if (field != "columns") {
+		} else if (field != "columns" && field != "types") {
 			throw BinderException("acl admin: unknown relation property \"%s\"", field);
 		}
 		// the form follows the content, exactly as it does for ADD - through the same rule, so the same
@@ -1935,18 +1953,43 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		    !new_view.empty()
 		        ? "view"
 		        : (new_rls.empty() && (new_columns.empty() || RenameOnlyColumns(new_columns)) ? "alias" : "subquery");
-		auto stored = read("SELECT \"comment\", \"origin\" FROM " + catalog->Tbl("relations") +
-		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
-		string comment, origin;
+		auto stored =
+		    read("SELECT \"comment\", \"origin\", \"alias_types\", \"enum_types\" FROM " + catalog->Tbl("relations") +
+		         " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		string comment, origin, alias_types, enum_types;
 		if (stored->RowCount() > 0) {
-			if (!stored->Collection().GetValue(0, 0).IsNull()) {
-				comment = stored->Collection().GetValue(0, 0).ToString();
+			ResultRows kept(*stored);
+			alias_types = kept.GetValue(2, 0).IsNull() ? string() : kept.GetValue(2, 0).ToString();
+			enum_types = kept.GetValue(3, 0).IsNull() ? string() : kept.GetValue(3, 0).ToString();
+			if (!kept.GetValue(0, 0).IsNull()) {
+				comment = kept.GetValue(0, 0).ToString();
 			}
 			// editing a record an expansion produced does not take it out of the expansion: REFRESH
 			// still leaves it alone (it never rewrites), and PRUNE still removes it if its source is
 			// gone - which is right, because it would then point at nothing
-			if (!stored->Collection().GetValue(1, 0).IsNull()) {
-				origin = stored->Collection().GetValue(1, 0).ToString();
+			if (!kept.GetValue(1, 0).IsNull()) {
+				origin = kept.GetValue(1, 0).ToString();
+			}
+		}
+		if (field == "types") {
+			// spec 099: SET TYPES (aliases = base|keep|default, enums = varchar|keep|default) - a key not
+			// written keeps its value, `default` hands it back to the node's setting. The rewrite below
+			// probes the source again, so this is also how the type facts are refreshed.
+			for (auto &item : StringUtil::Split(value, ',')) {
+				auto eq = item.find('=');
+				auto key = StringUtil::Lower(item.substr(0, eq == string::npos ? item.size() : eq));
+				auto setting = eq == string::npos ? string() : StringUtil::Lower(item.substr(eq + 1));
+				StringUtil::Trim(key);
+				StringUtil::Trim(setting);
+				if (key == "aliases" && (setting == "base" || setting == "keep" || setting == "default")) {
+					alias_types = setting == "default" ? string() : setting;
+				} else if (key == "enums" && (setting == "varchar" || setting == "keep" || setting == "default")) {
+					enum_types = setting == "default" ? string() : setting;
+				} else {
+					throw BinderException("acl admin: SET TYPES takes aliases = base|keep|default and enums = "
+					                      "varchar|keep|default, got \"%s\"",
+					                      item);
+				}
 			}
 		}
 		// ALTER keeps the stored schema policy: a declared result is re-declared explicitly, not here
@@ -1963,7 +2006,7 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 			kept_pk = StringUtil::Join(parts, ", ");
 		}
 		statements = RelationStatements(*catalog, vcat, vname, new_form, new_phys, new_view, new_rls, new_columns,
-		                                comment, string(), origin, kept_pk, kept_marks, true);
+		                                comment, string(), origin, kept_pk, kept_marks, true, alias_types, enum_types);
 	});
 }
 
