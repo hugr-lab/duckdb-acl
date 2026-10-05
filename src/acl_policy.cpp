@@ -39,6 +39,7 @@ const char *MetadataSurfaceOf(const string &name) {
 	    {"duckdb_schemas", "duckdb_schemas"},
 	    {"duckdb_databases", "databases"},
 	    {"duckdb_functions", "duckdb_functions"}, // spec 098: the functions this principal may call
+	    {"duckdb_types", "duckdb_types"},         // spec 099: the system catalog's types, nothing else
 	};
 	auto entry = SURFACES.find(name);
 	return entry == SURFACES.end() ? nullptr : entry->second.c_str();

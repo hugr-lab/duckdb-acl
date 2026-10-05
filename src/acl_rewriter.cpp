@@ -24,6 +24,8 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/constraints/check_constraint.hpp"
+#include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/parsed_data/create_secret_info.hpp"
 #include "duckdb/parser/parsed_data/extra_drop_info.hpp"
@@ -86,6 +88,8 @@ const char *ReasonCode(Reason reason) {
 		return "at_capacity";
 	case Reason::WRONG_RESOURCE_GROUP:
 		return "wrong_resource_group";
+	case Reason::TYPE_DENIED:
+		return "type_denied";
 	case Reason::SOURCE_ERROR:
 		return "source_error";
 	case Reason::UNAVAILABLE:
@@ -528,7 +532,8 @@ private:
 		if (table_info.query && table_info.query->node) {
 			RewriteQueryNode(*table_info.query->node);
 		}
-		// the statement itself passes through untouched: the temp catalog is the connection's own
+		RewriteColumnDefinitions(table_info);
+		// the statement itself passes through: the temp catalog is the connection's own
 	}
 
 	//! DROP of a session temp, symmetric with how it resolves. True = handled (native drop).
@@ -669,6 +674,7 @@ private:
 		if (table_info.query && table_info.query->node) {
 			RewriteQueryNode(*table_info.query->node);
 		}
+		RewriteColumnDefinitions(table_info);
 		auto key = VirtualKey(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
@@ -2401,9 +2407,81 @@ private:
 	//===------------------------------------------------------------------===//
 	// Expressions + claim baking
 	//===------------------------------------------------------------------===//
+	//! spec 099: a type the principal wrote. Only the `system` catalog's types may be named - the
+	//! built-ins and every loaded extension's; a user type (`CREATE TYPE` in an attached database) is
+	//! the operator's schema and its definition can be data (an ENUM's labels). Every named leaf is
+	//! emitted as `system.main.<name>`, so nothing else can resolve it and nothing else can be probed;
+	//! the constructors (`STRUCT`, `LIST`, `MAP`, `UNION`, `ARRAY`) are syntax, walked, not qualified.
+	void GateTypeExpression(ParsedExpression &expr) {
+		if (expr.GetExpressionClass() != ExpressionClass::TYPE) {
+			// a constant modifier, or the field of a STRUCT / UNION carrying its type
+			for (auto &child : expr.ChildrenMutable()) {
+				if (child) {
+					GateTypeExpression(*child);
+				}
+			}
+			return;
+		}
+		auto &type = expr.Cast<TypeExpression>();
+		auto catalog = type.GetCatalog().GetIdentifierName();
+		auto schema = type.GetSchema().GetIdentifierName();
+		auto name = type.GetTypeName().GetIdentifierName();
+		if ((!catalog.empty() && !StringUtil::CIEquals(catalog, "system")) ||
+		    (!schema.empty() && !StringUtil::CIEquals(schema, "main"))) {
+			Deny(Reason::TYPE_DENIED, "type \"" + type.GetQualifiedName().ToString() +
+			                              "\" is not available: only the system catalog's types can be named");
+		}
+		static const case_insensitive_set_t CONSTRUCTORS = {"struct", "list", "map", "union", "array", "tuple", "row"};
+		if (!CONSTRUCTORS.count(name)) {
+			type.SetQualifiedName(Identifier("system"), Identifier("main"), type.GetTypeName());
+		}
+		for (auto &child : type.GetChildren()) {
+			if (child) {
+				GateTypeExpression(*child);
+			}
+		}
+	}
+
+	void GateLogicalType(LogicalType &type) {
+		if (type.IsUnbound()) {
+			GateTypeExpression(*UnboundType::GetTypeExpression(type));
+		}
+	}
+
+	//! spec 099: a table the principal creates - its column types, DEFAULT and generated expressions and
+	//! CHECK constraints are written by the principal, so they pass the type gate and the walker (a
+	//! function in a DEFAULT is a function call like any other)
+	void RewriteColumnDefinitions(CreateTableInfo &info) {
+		for (idx_t i = 0; i < info.columns.LogicalColumnCount(); i++) {
+			auto &column = info.columns.GetColumnMutable(LogicalIndex(i));
+			GateLogicalType(column.TypeMutable());
+			if (column.HasDefaultValue()) {
+				auto value = column.DefaultValue().Copy();
+				RewriteExpr(value);
+				column.SetDefaultValue(std::move(value));
+			}
+			if (column.Generated()) {
+				auto generated = column.GeneratedExpression().Copy();
+				RewriteExpr(generated);
+				column.SetGeneratedExpression(std::move(generated));
+			}
+		}
+		for (auto &constraint : info.constraints) {
+			if (constraint && constraint->type == ConstraintType::CHECK) {
+				RewriteExpr(constraint->Cast<CheckConstraint>().expression);
+			}
+		}
+	}
+
 	void RewriteExpr(unique_ptr<ParsedExpression> &expr) {
 		if (!expr) {
 			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::CAST) {
+			GateTypeExpression(expr->Cast<CastExpression>().TargetTypeMutable()); // spec 099
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::TYPE) {
+			GateTypeExpression(*expr);
 		}
 		if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
 			auto &subquery = expr->Cast<SubqueryExpression>();

@@ -1,0 +1,153 @@
+# name: test/sql/acl_types.test
+# description: types under the ACL (spec 099) - only the system catalog's types can be named under a
+#   principal (a user type's labels and existence stay the operator's), duckdb_types() lists only them,
+#   and a table the principal creates has its column types, DEFAULTs and CHECKs gated like any query.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TYPE phys.main.client_tier AS ENUM ('acme_platinum', 'globex_gold');
+
+statement ok
+CREATE TYPE mood AS ENUM ('secret_a', 'secret_b');
+
+statement ok
+CREATE TABLE phys.main.t(id INTEGER, tier phys.main.client_tier);
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, 'acme_platinum');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.t AS c.t;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select, temp) MAIN;
+
+# --- a type outside the system catalog cannot be named - its labels used to answer every role ------------
+
+statement error
+ACL ROLE "r" SELECT enum_range(NULL::phys.main.client_tier);
+----
+<REGEX>:.*type "phys.main.client_tier" is not available: only the system catalog's types can be named.*
+
+statement error
+ACL ROLE "r" SELECT typeof(NULL::phys.main.client_tier);
+----
+<REGEX>:.*type "phys.main.client_tier" is not available.*
+
+# a type that does not exist is refused the same way: no probe for which types exist
+statement error
+ACL ROLE "r" SELECT NULL::phys.main.nope;
+----
+<REGEX>:.*type "phys.main.nope" is not available.*
+
+# a bare name resolves in the system catalog only: the default database's own type is not reached
+statement error
+ACL ROLE "r" SELECT enum_range(NULL::mood);
+----
+<REGEX>:.*Type with name mood does not exist.*
+
+statement error
+ACL ROLE "r" SELECT [NULL]::phys.main.client_tier[];
+----
+<REGEX>:.*type "phys.main.client_tier" is not available.*
+
+statement error
+ACL ROLE "r" SELECT {'a': NULL}::STRUCT(a phys.main.client_tier);
+----
+<REGEX>:.*type "phys.main.client_tier" is not available.*
+
+statement error
+ACL ROLE "r" SELECT TRY_CAST('x' AS phys.main.client_tier);
+----
+<REGEX>:.*type "phys.main.client_tier" is not available.*
+
+# --- the built-ins and the anonymous constructors stay (an extension's type - JSON - is the system
+# catalog's too; the CLI build checks it, the test build has no json) -----------------------------
+
+query IIIIIII
+ACL ROLE "r" SELECT 1::INTEGER, 'x'::TEXT, '00000000-0000-0000-0000-000000000000'::UUID, {'a': 1}::STRUCT(a INT), [1]::INT[], 'a'::ENUM('a', 'b'), 1::DECIMAL(10, 2);
+----
+1	x	00000000-0000-0000-0000-000000000000	{'a': 1}	[1]	a	1.00
+
+query I
+ACL ROLE "r" SELECT 1::system.main.integer;
+----
+1
+
+# reading an ENUM column is data: its value and a comparison with a string literal need no type name
+query II
+ACL ROLE "r" SELECT tier, tier = 'acme_platinum' FROM t;
+----
+acme_platinum	true
+
+# --- duckdb_types(): the system catalog's types, once - never another database or a user type -----------
+
+query I
+ACL ROLE "r" SELECT count(*) > 0 FROM duckdb_types();
+----
+true
+
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_types() WHERE database_name IS DISTINCT FROM 'system' OR type_name IN ('client_tier', 'mood') OR labels IS NOT NULL;
+----
+0
+
+# a meta grant used to hand out every database's types and every ENUM's labels
+statement ok
+ACL ADMIN GRANT FUNCTION CATEGORY meta TO ROLE r;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM system.main.duckdb_types() WHERE database_name IS DISTINCT FROM 'system';
+----
+0
+
+# --- a table the principal creates: its types, DEFAULTs and CHECKs pass the same gates --------------------
+
+statement error
+ACL ROLE "r" CREATE TEMP TABLE staged(x phys.main.client_tier);
+----
+<REGEX>:.*type "phys.main.client_tier" is not available.*
+
+# a DEFAULT is a function call like any other (it used to skip the function gate)
+statement error
+ACL ROLE "r" CREATE TEMP TABLE staged(x INTEGER DEFAULT (getvariable('x')));
+----
+<REGEX>:.*function "getvariable" is not allowed.*
+
+statement error
+ACL ROLE "r" CREATE TEMP TABLE staged(x INTEGER, CHECK (getvariable('x') IS NULL));
+----
+<REGEX>:.*function "getvariable" is not allowed.*
+
+statement error
+ACL ROLE "r" CREATE TEMP TABLE staged(x INTEGER, y INTEGER GENERATED ALWAYS AS (getvariable('x')));
+----
+<REGEX>:.*function "getvariable" is not allowed.*
+
+statement ok
+ACL ROLE "r" CREATE TEMP TABLE staged(x INTEGER, y VARCHAR DEFAULT 'a', z ENUM('p', 'q'), u UUID, CHECK (x > 0));
+
+query I
+ACL ROLE "r" SELECT count(*) FROM staged;
+----
+0

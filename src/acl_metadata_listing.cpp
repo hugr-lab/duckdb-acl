@@ -757,6 +757,12 @@ bool PolicyStore::MetadataListing(const Principal &principal, const string &surf
 		sql = PrincipalFunctionsSql(principal); // spec 098: every mode answers the engine's half
 		return true;
 	}
+	if (surface == "duckdb_types") {
+		// spec 099: the built-ins and the loaded extensions' types, once - never another database's
+		// name, a user type or an ENUM's labels; every mode, no policy needed
+		sql = "SELECT * FROM system.main.duckdb_types() WHERE database_name = 'system'";
+		return true;
+	}
 	if (!catalog) {
 		return false; // the memory store has no catalog to list; the surface stays denied
 	}
