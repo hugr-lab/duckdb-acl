@@ -538,7 +538,7 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 				pos++;
 			}
 		} else if (!expr.empty()) {
-			ParserOptions options;
+			auto options = ParserOptions::Builtin();
 			auto from_tail = SplitTopLevel(from_vname, '.').back();
 			auto to_tail = SplitTopLevel(to_vname, '.').back();
 			for (auto &ref : QualifiedColumnRefs(expr, options)) {

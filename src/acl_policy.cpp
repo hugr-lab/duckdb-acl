@@ -138,7 +138,7 @@ unique_ptr<SelectStatement> PolicyStore::InstantiateSelect(const string &sql, co
 
 unique_ptr<ParsedExpression> PolicyStore::InstantiateExpr(const string &expr, const ParserOptions &options) {
 	return expr_cache.GetCopy(expr, [&]() -> unique_ptr<ParsedExpression> {
-		auto expressions = Parser::ParseExpressionList(expr, options);
+		auto expressions = Parser(options).ParseExpressionList(expr);
 		if (expressions.size() != 1) {
 			throw BinderException("acl_rewrite: scalar template must be a single expression");
 		}

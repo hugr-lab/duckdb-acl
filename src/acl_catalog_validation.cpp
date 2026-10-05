@@ -33,7 +33,7 @@ bool CatalogBackend::ProbeBound(const string &sql, bool expression, const vector
 	auto instance = Db();
 	string probe;
 	try {
-		ParserOptions options;
+		auto options = ParserOptions::Builtin();
 		auto baked = BakeTemplateForProbe(sql, options, expression, param_types);
 		probe = expression ? "SELECT (" + baked + ") AS \"value\" WHERE false"
 		                   : "SELECT * FROM (" + baked + ") WHERE false";
@@ -135,7 +135,7 @@ string CatalogBackend::PredicateError(const string &source, const string &rls, b
 	}
 	string baked;
 	try {
-		ParserOptions options;
+		auto options = ParserOptions::Builtin();
 		baked = BakeTemplateForProbe("SELECT * FROM " + source + " WHERE (" + rls + ")", options, false, {});
 	} catch (std::exception &error) {
 		return string(error.what());

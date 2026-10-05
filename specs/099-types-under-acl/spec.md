@@ -242,8 +242,11 @@ from writers (documented in the security model's accepted risks).
 2. The table-level syntax is `SET TYPES (aliases = …, enums = …)`.
 3. `acl_alias_types` / `acl_enum_types` are cluster-profile items too (spec 093): one value for the
    cluster, a group's own on its nodes.
+4. (2026-10-05, after the review) v19 keeps `min_reader_version` 18: a rolling upgrade stays possible,
+   and during the window a v18 node ignores `enums = varchar` (it shows ENUMs as it always did) - the
+   docs say so; the switch-over alternative (min_reader 19) was declined.
 
 ## Follow-ups
 
-- Spec 100: fields of structured types per role (paths in `COLUMNS`, compiled to the masks that
+- Spec 101: fields of structured types per role (paths in `COLUMNS`, compiled to the masks that
   already work: `struct_pack` / `list_transform`).

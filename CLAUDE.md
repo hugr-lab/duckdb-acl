@@ -29,6 +29,9 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   `Collection().GetValue(c, r)` rebuilds every row per call, so a loop over rows reads a `ResultRows`
   (`acl_result_rows.hpp`) built once; the stream is `QueryResultStream<>` (the chunk format), and a
   table function's parameters are its `FunctionSignature` (`GetName()` on a bound one).
+  **A parser is an object** (since the eb0d9df pin, spec 100): `ParserOptions()` is private - options
+  without a context are `ParserOptions::Builtin()` - and parsing is `Parser(options).ParseExpressionList(x)`
+  (`ParseSingleExpression`, `ParseSelectNode` beside it), never the old static form.
   **Linking is opt-in** (since the a2af0a7 pin, spec 091, duckdb #26189): an extension is linked into
   duckdb only when `extension_config.cmake` names it with `duckdb_extension_statically_link` -
   `DONT_LINK` is gone (a FATAL_ERROR). We link acl, icu, ducklake and quack's json/autocomplete/httpfs;

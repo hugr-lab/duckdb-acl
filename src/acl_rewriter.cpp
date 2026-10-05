@@ -2453,7 +2453,7 @@ private:
 	string GateTypeText(const string &text, const string &function) {
 		vector<unique_ptr<ParsedExpression>> parsed;
 		try {
-			parsed = Parser::ParseExpressionList("CAST(NULL AS " + text + ")", template_options);
+			parsed = Parser(template_options).ParseExpressionList("CAST(NULL AS " + text + ")");
 		} catch (std::exception &) {
 			parsed.clear();
 		}
@@ -2884,7 +2884,7 @@ private:
 	//! filtered by their own claims. `acl_arg` is still substituted - it belongs to a call that is
 	//! happening now and would mean nothing in a stored body.
 	bool keep_claim_markers = false;
-	ParserOptions template_options;
+	ParserOptions template_options = ParserOptions::Builtin();
 
 public:
 	//! The audit's entry for the statement being rewritten (spec 069), or null when nobody listens
@@ -2971,7 +2971,7 @@ void BakeNullMarkers(unique_ptr<ParsedExpression> &expr, const vector<string> &p
 				expr = ConstantExpression::Null();
 			} else {
 				// parse the cast rather than resolving the type name by hand (no context needed here)
-				auto casted = Parser::ParseExpressionList("CAST(NULL AS " + type + ")", options);
+				auto casted = Parser(options).ParseExpressionList("CAST(NULL AS " + type + ")");
 				expr = std::move(casted[0]);
 			}
 			if (!alias.GetIdentifierName().empty()) {
@@ -3002,7 +3002,7 @@ void BakeNullMarkersInNode(QueryNode &node, const vector<string> &param_types, c
 vector<std::pair<string, string>> QualifiedColumnRefs(const string &expression, const ParserOptions &options) {
 	ParserOptions inner = options;
 	inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
-	auto parsed = Parser::ParseExpressionList(expression, inner);
+	auto parsed = Parser(inner).ParseExpressionList(expression);
 	if (parsed.size() != 1) {
 		throw BinderException("acl: a join expression must be a single expression");
 	}
@@ -3029,7 +3029,7 @@ string BakeTemplateForProbe(const string &sql, const ParserOptions &options, boo
 	ParserOptions inner = options;
 	inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
 	if (expression) {
-		auto expressions = Parser::ParseExpressionList(sql, inner);
+		auto expressions = Parser(inner).ParseExpressionList(sql);
 		if (expressions.size() != 1) {
 			throw BinderException("acl_rewrite: scalar template must be a single expression");
 		}
