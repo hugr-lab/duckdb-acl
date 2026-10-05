@@ -4,6 +4,7 @@
 
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_types.hpp"
 
 namespace duckdb {
 namespace acl {
@@ -96,12 +97,23 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                " ' no longer exist in the source' || CASE WHEN r.\"comment\" IS NULL OR r.\"comment\" = ''"
 	                " THEN '' ELSE '; ' || r.\"comment\" END ELSE r.\"comment\" END";
 	// the written path splits into a virtual schema and a name; a bare name sits in `main`
+	// spec 099: the type policy in force for the object - its own, else the node's - so every column
+	// row below describes what the read casts it to. The read casts only what the object's type facts
+	// name, so an object with none (its source unprobed since a migration, or nothing to cast) is
+	// described as it is read: uncast.
+	auto instance = Db();
+	string has_facts = "EXISTS (SELECT 1 FROM " + Tbl("relation_types") +
+	                   " t WHERE t.\"vcat\" = r.\"vcat\" AND t.\"vname\" = r.\"vname\")";
+	string strip_alias = "(coalesce(r.\"alias_types\" = 'base', " +
+	                     string(NodeStripsAliases(*instance) ? "true" : "false") + ") AND " + has_facts + ")";
+	string enums_to_varchar = "(coalesce(r.\"enum_types\" = 'varchar', " +
+	                          string(NodeEnumsToVarchar(*instance) ? "true" : "false") + ") AND " + has_facts + ")";
 	string objects = "objects AS (SELECT DISTINCT r.\"vcat\" AS vcat,"
 	                 " CASE WHEN position('.' IN r.\"vname\") > 0"
 	                 " THEN regexp_extract(r.\"vname\", '^(.*)[.][^.]*$', 1) ELSE 'main' END AS vschema,"
 	                 " regexp_extract(r.\"vname\", '([^.]*)$', 1) AS vname, r.\"vname\" AS stored_name,"
 	                 " r.\"form\" AS form, " +
-	                 marked +
+	                 strip_alias + " AS strip_alias, " + enums_to_varchar + " AS enums_to_varchar, " + marked +
 	                 " AS comment,"
 	                 " str_split(r.\"phys\", '.') AS parts FROM " +
 	                 relations_marked + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " + visible +
@@ -321,7 +333,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                        " THEN 'NO' ELSE i.\"is_nullable\" END";
 	string columns_sql =
 	    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
-	           " coalesce(c.\"name\", i.\"column_name\") AS column_name, ") +
+	           " coalesce(c.\"name\", i.\"column_name\") AS column_name,"
+	           " acl_exposed_type(i.\"data_type\", o.strip_alias, o.enums_to_varchar) AS data_type, ") +
 	    alias_nullable +
 	    string(" AS is_nullable)"
 	           " FROM objects o JOIN information_schema.columns i ON ") +
@@ -339,7 +352,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " ELSE o.vschema || '.' || o.vname END))"
 	    " UNION ALL BY NAME"
 	    " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
-	    " oc.\"name\" AS column_name, oc.\"pos\" + 1 AS ordinal_position, oc.\"type\" AS data_type," +
+	    " oc.\"name\" AS column_name, oc.\"pos\" + 1 AS ordinal_position,"
+	    " acl_exposed_type(oc.\"type\", o.strip_alias, o.enums_to_varchar) AS data_type," +
 	    string(" CASE WHEN oc.\"nullable\" IS NOT NULL THEN CASE WHEN oc.\"nullable\" THEN 'YES'"
 	           " ELSE 'NO' END WHEN ") +
 	    pk_implies("o.vcat", alias_vname, "oc.\"name\"") +
@@ -396,9 +410,10 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " CASE WHEN position('.' IN gp.vname) > 0 THEN regexp_extract(gp.vname, '^(.*)[.][^.]*$', 1)"
 	    " ELSE 'main' END AS table_schema,"
 	    " regexp_extract(gp.vname, '([^.]*)$', 1) AS table_name,"
-	    " gp.name AS column_name, gp.pos + 1 AS ordinal_position, gp.type AS data_type"
-	    " FROM gprojection gp WHERE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = gp.vcat AND " +
-	    path("o") + " = gp.vname)";
+	    " gp.name AS column_name, gp.pos + 1 AS ordinal_position,"
+	    " acl_exposed_type(gp.type, o.strip_alias, o.enums_to_varchar) AS data_type"
+	    " FROM gprojection gp JOIN objects o ON o.vcat = gp.vcat AND " +
+	    path("o") + " = gp.vname";
 	if (surface == "columns") {
 		return prelude + effective_columns;
 	}

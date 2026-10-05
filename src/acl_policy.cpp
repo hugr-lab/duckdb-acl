@@ -200,6 +200,44 @@ void CountJwt(AuditPipeline *hooks, const char *result) {
 
 } // namespace
 
+string TablePolicy::CastItems(const vector<std::pair<string, string>> &casts) {
+	auto quoted = [](const string &name) {
+		return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+	};
+	vector<string> items;
+	for (auto &cast : casts) {
+		items.push_back("CAST(" + quoted(cast.first) + " AS " + cast.second + ") AS " + quoted(cast.first));
+	}
+	return "* REPLACE (" + StringUtil::Join(items, ", ") + ")";
+}
+
+string TablePolicy::ReadFrom() const {
+	auto where = rls.empty() ? string() : " WHERE " + rls;
+	if (casts.empty()) {
+		return " FROM " + phys + where;
+	}
+	// the last part of the physical name, outside quotes: what a projection item may qualify a column by
+	string last;
+	bool in_quotes = false;
+	for (idx_t i = 0; i < phys.size(); i++) {
+		auto ch = phys[i];
+		if (ch == '"') {
+			if (in_quotes && i + 1 < phys.size() && phys[i + 1] == '"') {
+				last += '"';
+				i++;
+				continue;
+			}
+			in_quotes = !in_quotes;
+		} else if (ch == '.' && !in_quotes) {
+			last.clear();
+		} else {
+			last += ch;
+		}
+	}
+	return " FROM (SELECT " + CastItems(casts) + " FROM " + phys + where + ") AS \"" +
+	       StringUtil::Replace(last, "\"", "\"\"") + "\"";
+}
+
 //! `std::random_device` rather than duckdb's own utilities, deliberately: `RandomEngine` seeds from
 //! the clock off Linux, and the encryption util refuses to generate randomness unless OpenSSL arrived
 //! with httpfs (its mbedTLS fallback demands `force_mbedtls_unsafe`). On glibc, libc++ and MSVC the

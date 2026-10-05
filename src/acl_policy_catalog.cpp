@@ -15,6 +15,7 @@
 
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_types.hpp"
 #include "acl_placement.hpp"
 #include "acl_rewriter.hpp"
 #include "acl_schema_sql.hpp"
@@ -453,7 +454,10 @@ bool CatalogBackend::ResolveTable(const Principal &principal, const string &vnam
 		return false;
 	}
 	EnsureFresh();
-	auto key = RoleSig(principal) + "\x1f" + vname;
+	// spec 099: the node's type settings shape the read, so a SET GLOBAL never serves a stale one
+	auto instance = Db();
+	auto key = RoleSig(principal) + "\x1f" + vname + "\x1f" + (NodeStripsAliases(*instance) ? "b" : "k") +
+	           (NodeEnumsToVarchar(*instance) ? "v" : "k");
 	{
 		lock_guard<mutex> guard(lock);
 		auto entry = objects.find(key);
@@ -504,11 +508,15 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	    " THEN 1 ELSE 2 END AS prio,"
 	    " (SELECT list(struct_pack(cname := c.\"name\", cexpr := c.\"expr\") ORDER BY c.\"pos\") FROM " +
 	    ColumnsSource(principal, names) + " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\") AS cols, " +
-	    (function_mode ? "NULL" : "r.\"rls_checked\"") +
-	    " AS rchk"
-	    " FROM " +
-	    RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE (" +
-	    qualified_cond +
+	    (function_mode ? "NULL" : "r.\"rls_checked\"") + " AS rchk, " +
+	    // spec 099: the relation's type policy and its source's type facts (a driver has neither)
+	    (function_mode
+	         ? string("NULL, NULL, NULL")
+	         : "r.\"alias_types\", r.\"enum_types\", (SELECT list(struct_pack(tcol := t.\"column\","
+	           " tbase := t.\"as_base\", tvarchar := t.\"as_varchar\", tboth := t.\"as_both\")) FROM " +
+	               Tbl("relation_types") + " t WHERE t.\"vcat\" = r.\"vcat\" AND t.\"vname\" = r.\"vname\")") +
+	    " FROM " + RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
+	    " WHERE (" + qualified_cond +
 	    ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(unqualified) +
 	    // by role, so a principal holding several of them merges their column lists in one
 	    // order rather than in whatever order the store returned (spec 036)
@@ -530,6 +538,7 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	out.rls_unchecked = !out.rls.empty() && (rchk.IsNull() || !rchk.GetValue<bool>());
 	out.subquery_form = form != "alias";
 	out.writable = form == "alias"; // a real table stays writable, however a grant narrows it
+	ApplyTypeFacts(result_rows, out);
 	vector<std::pair<string, string>> object_columns;
 	auto cols = result->Collection().GetValue(12, 0);
 	if (!cols.IsNull() && form != "view") {
@@ -571,11 +580,47 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	return true;
 }
 
+void CatalogBackend::ApplyTypeFacts(ResultRows &row, TablePolicy &out) {
+	auto alias_types = row.GetValue(14, 0);
+	auto enum_types = row.GetValue(15, 0);
+	auto facts = row.GetValue(16, 0);
+	if (facts.IsNull()) {
+		return;
+	}
+	auto instance = Db();
+	bool strip_alias = alias_types.IsNull() ? NodeStripsAliases(*instance) : alias_types.ToString() == "base";
+	bool enums_to_varchar = enum_types.IsNull() ? NodeEnumsToVarchar(*instance) : enum_types.ToString() == "varchar";
+	if (!strip_alias && !enums_to_varchar) {
+		return;
+	}
+	idx_t field = strip_alias && enums_to_varchar ? 3 : (strip_alias ? 1 : 2);
+	for (auto &item : ListValue::GetChildren(facts)) {
+		auto &fields = StructValue::GetChildren(item);
+		if (!fields[field].IsNull()) {
+			out.casts.emplace_back(fields[0].ToString(), fields[field].ToString());
+		}
+	}
+}
+
 void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &grants,
                                       vector<std::pair<string, string>> &object_columns, TablePolicy &out) {
 	auto predicate = grants.Predicate();
 	bool restricts = grants.Restricts();
 	out.rls_unchecked = out.rls_unchecked || grants.Unchecked();
+	if (!out.query.empty() && !out.casts.empty()) {
+		// spec 099: a view's output is cast right above the grant's row filter - the predicate reads
+		// the view's own values, the grant's columns and masks the exposed ones
+		auto filtered = "SELECT " + TablePolicy::CastItems(out.casts) + " FROM (" + out.query + ") AS __acl_typed" +
+		                (predicate.empty() ? "" : " WHERE " + predicate);
+		out.casts.clear();
+		vector<string> items;
+		for (auto &column : grants.columns) {
+			items.push_back(column.second.empty() ? Ident(column.first) : column.second + " AS " + Ident(column.first));
+		}
+		out.query = restricts ? "SELECT " + StringUtil::Join(items, ", ") + " FROM (" + filtered + ") AS __acl_granted"
+		                      : filtered;
+		return;
+	}
 	if (predicate.empty() && !restricts) {
 		for (auto &column : object_columns) {
 			// the stored name is bare (spec 065 unquotes at parse), so quoting is the emitter's job
@@ -662,10 +707,7 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		if (!replaces.empty()) {
 			inner += " REPLACE (" + StringUtil::Join(replaces, ", ") + ")";
 		}
-		inner += " FROM " + out.phys;
-		if (!out.rls.empty()) {
-			inner += " WHERE " + out.rls;
-		}
+		inner += out.ReadFrom();
 		out.query = "SELECT COLUMNS(lambda __acl_col: lower(__acl_col) IN (" + StringUtil::Join(names, ", ") +
 		            ")) FROM (" + inner + ")";
 		for (auto &column : listed) {

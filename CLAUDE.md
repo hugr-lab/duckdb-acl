@@ -512,6 +512,30 @@ database/schema/definition/oid/comment), (b) the virtual functions a call reache
 `Resolve*Function` + `select`; params split at depth 0, synthesized oids, no definition). Parsed
 outside the template cache (`InstantiateSelect(…, false)`); metadata surfaces honour column alias lists. A `meta` grant no longer hands out the engine's listing. Follow-up: `acl_function_columns`.
 
+**Spec 099 — types under the ACL**: under a principal only the system catalog's types can be named
+(`GateTypeExpression` in the rewriter: casts, `TYPE` expressions, a created table's column types,
+DEFAULT/generated/CHECK; another catalog's or schema's type is `type_denied` before bind, a leaf
+builtin is emitted `system.main.<t>`, the constructors stay bare); `duckdb_types()` is the system
+catalog's rows only. What a column is EXPOSED as: `acl_alias_types` (base|keep, default base - an
+extension alias like `MSSQL_VARCHAR(n)` as its base type, else a quack client without that extension
+fails its whole ATTACH) and `acl_enum_types` (keep|varchar, default keep), GLOBAL, cluster-profile
+items, overridden per object by `ALTER VIRTUAL TABLE|VIEW c.t SET TYPES (aliases = …, enums = …)`
+(`relations.alias_types/enum_types`, NULL = the node's; schema v19). The source's types are FACTS
+probed where the object is written / ANALYZEd (`relation_types`: per column the three exposed
+spellings, `TypeFactStatements` / `ExposedType` in `acl_types.{hpp,cpp}`); `LookupRelation` turns
+them into `TablePolicy::casts`, and the read is `ReadFrom()` = `FROM (SELECT * REPLACE (CAST(c AS t)
+AS c) FROM phys WHERE rls) AS <leaf>` - the cast sits ABOVE the row filter (an ENUM orders by position,
+a VARCHAR lexically: predicates read physical values, projection and masks the exposed ones; a
+view's casts go above its grant's filter in ApplyGrantPolicy); filters push through the cast
+(measured on SQL Server), writes keep `phys`; the ResolveTable cache key carries the node settings.
+A type written as text is gated too: `from_json[_strict]` / `json_transform[_strict]` need a constant
+structure whose every type passes the gate (`GateTypeTextArguments`), and a bare name the system
+catalog lacks is refused by us (`PolicyStore::SystemTypeExists`), never by the binder's "Did you mean". Every listing passes `data_type` through `acl_exposed_type(text, strip, enums)` (in the
+never set - it binds a type by name) with the same effective flags. Not cast: live schema aliases,
+table functions, the memory store. `acl_check_catalog` adds `types_stale`, `enum_domain_exposed`, `types_incompatible` (an entry or a mask
+that does not bind over the exposed type) and `types_mismatch` (an entry that makes a type of its own).
+e2e: `test/e2e/door/types.sh` (a quack client without mssql reads an mssql table), Flight run.sh.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

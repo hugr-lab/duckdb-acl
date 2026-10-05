@@ -71,7 +71,8 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 | --- | --- |
 | `meta` | `schema_version` (the shape of these tables), `min_reader_version` (the oldest build that may read it, spec 094), `policy_version` (bumped on every policy write) and `config_version` (on every cluster profile write, spec 093) |
 | `catalogs` | the virtual catalogs and their comments |
-| `relations` | virtual tables and views: `form` (`alias` / `subquery` / `view`), physical target, view SQL, inline RLS, origin, whether the RLS was checked |
+| `relations` | virtual tables and views: `form` (`alias` / `subquery` / `view`), physical target, view SQL, inline RLS, origin, whether the RLS was checked, the object's own type policy (`alias_types`, `enum_types`; NULL = the node's, spec 099) |
+| `relation_types` | the source's column types an exposure policy changes, probed where the object is written: per column the exposed spelling with aliases stripped, with ENUMs as VARCHAR, and with both (spec 099) |
 | `relation_columns` | an object's own projection: position, name, expression, nullability |
 | `object_columns` | the declared or derived column schema (name, type, comment, nullable) of every object, keyed by kind - what `DESCRIBE` and the listings answer with (spec 010) |
 | `functions` | virtual table functions and scalars: kind, `form` (`alias` / `macro`), target, template, params |
@@ -97,8 +98,8 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 
 ## Schema versions and migration (specs 034, 094)
 
-The catalog says which shape it is: `meta.schema_version`, currently **18**. It also says the oldest
-build that may still read it: `meta.min_reader_version`, currently **17**. A build judges the pair
+The catalog says which shape it is: `meta.schema_version`, currently **19**. It also says the oldest
+build that may still read it: `meta.min_reader_version`, currently **18**. A build judges the pair
 where the catalog is chosen (`acl_use_db`) and again at every freshness check (below), so a catalog
 migrated under a running node is noticed without a restart.
 
@@ -136,8 +137,11 @@ nodes off at their next freshness check. That upgrade is a switch-over, not a ro
 step adds can ever admit more. A new column that *narrows* access, read by the new build only, would
 widen access on an old node that ignores it, so such a step must declare its own version. v16 only
 adds the cluster profile's tables, so it keeps v15 readers, and v18 only marks a default resource group,
-so it keeps v17 readers (a v17 build has no placement to widen). Every other step is strict - v17
-rebuilds the identity tables.
+so it keeps v17 readers (a v17 build has no placement to widen). v19 adds the type policy and facts
+(spec 099) and keeps v18 readers: a v18 build ignores them and exposes types exactly as it always
+did - it has no `SET TYPES` to honour, and it refuses policy writes for the window, so during a
+rolling upgrade an object set to `enums = varchar` still shows its ENUM on the old nodes until they
+are rolled. Every other step is strict - v17 rebuilds the identity tables.
 
 The steps are also kept as files (`schema/migrations/v<n>.sql`, duckdb dialect) for applying by hand on
 another engine. The shipped steps are:
@@ -152,6 +156,7 @@ another engine. The shipped steps are:
 | `v16` | 093 | adds the cluster profile; stamps `min_reader_version` 15 |
 | `v17` | 095 | rebuilds `issuers` (name, URL, secret), adds `clients`, scopes `role_mappings`; each issuer becomes the short form (an issuer named by its URL and its implicit client); keys, algs, `jwks_uri` and `client_secret` are **dropped** - an issuer that relied on them needs an `oidc_issuer` / `oidc_client` secret or reads its keys by discovery; an audience `*` no longer means "any" |
 | `v18` | 096 | adds `is_default` to `resource_groups` (the default group); keeps `min_reader_version` 17 |
+| `v19` | 099 | adds `alias_types` / `enum_types` to `relations` and the `relation_types` facts (empty until an object is written or `ANALYZE`d - `acl_check_catalog` reports `types_stale` until then); keeps `min_reader_version` 18 |
 
 The contract behind this is in `schema/migrations/README.md`:
 - `acl_schema.sql` always creates the current version complete, and a migrated catalog must be

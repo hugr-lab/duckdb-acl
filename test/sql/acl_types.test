@@ -60,11 +60,60 @@ ACL ROLE "r" SELECT NULL::phys.main.nope;
 ----
 <REGEX>:.*type "phys.main.nope" is not available.*
 
-# a bare name resolves in the system catalog only: the default database's own type is not reached
+# a bare name resolves in the system catalog only: the default database's own type is not reached,
+# and the refusal is ours - the binder's "Did you mean" would name the database that has it
 statement error
 ACL ROLE "r" SELECT enum_range(NULL::mood);
 ----
-<REGEX>:.*Type with name mood does not exist.*
+<REGEX>:.*type "mood" is not available: only the system catalog's types can be named.*
+
+statement error
+ACL ROLE "r" SELECT NULL::client_tier;
+----
+<REGEX>:^Binder Error: acl_rewrite: type "client_tier" is not available: only the system catalog's types can be named\s*$
+
+statement error
+ACL ROLE "r" SELECT NULL::main.mood;
+----
+<REGEX>:.*type "main.mood" is not available.*
+
+# --- a type written as text: the JSON functions resolve their structure as a cast would --------------
+
+statement error
+ACL ROLE "r" SELECT enum_range(from_json('null', '"phys.main.client_tier"'));
+----
+<REGEX>:.*type "phys.main.client_tier" is not available.*
+
+statement error
+ACL ROLE "r" SELECT from_json('null', '"mood"');
+----
+<REGEX>:.*type "mood" is not available.*
+
+statement error
+ACL ROLE "r" SELECT typeof(json_transform('{"a": null}', '{"a": "phys.main.client_tier"}'));
+----
+<REGEX>:.*type "phys.main.client_tier" is not available.*
+
+statement error
+ACL ROLE "r" SELECT from_json_strict('null', '{"a": ["phys.main.nope"]}');
+----
+<REGEX>:.*type "phys.main.nope" is not available.*
+
+# the structure must be a constant: a computed one cannot be judged before bind
+statement error
+ACL ROLE "r" SELECT from_json('null', '"' || 'mood' || '"');
+----
+<REGEX>:.*the structure of from_json must be a constant string under the ACL.*
+
+statement error
+ACL ROLE "r" SELECT from_json('null', '{"a": 1}');
+----
+<REGEX>:.*names something that is not a type.*
+
+statement error
+ACL ROLE "r" SELECT from_json('null', '"INTEGER) AS x, (SELECT 1"');
+----
+<REGEX>:.*names something that is not a type.*
 
 statement error
 ACL ROLE "r" SELECT [NULL]::phys.main.client_tier[];
@@ -151,3 +200,308 @@ query I
 ACL ROLE "r" SELECT count(*) FROM staged;
 ----
 0
+
+# --- spec 099 part B: what type a column is exposed as ------------------------------------------------
+# The node keeps ENUMs by default; the read, the listings and the DDL a quack client binds agree.
+
+statement ok
+CREATE TABLE phys.main.typed(id INTEGER, tier phys.main.client_tier, s STRUCT(a phys.main.client_tier, b INTEGER),
+    l phys.main.client_tier[], m MAP(VARCHAR, phys.main.client_tier), region VARCHAR);
+
+statement ok
+INSERT INTO phys.main.typed VALUES (1, 'acme_platinum', {'a': 'globex_gold', 'b': 2}, ['globex_gold'],
+    MAP {'k': 'acme_platinum'}, 'eu'), (2, 'globex_gold', NULL, NULL, NULL, 'us');
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.typed AS c.typed;
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.typed AS c.typed_rn COLUMNS (ident = id, level = tier);
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.typed AS c.typed_rls RLS 'typed.region = ''eu''';
+
+statement ok
+ACL ADMIN ADD VIEW c.typed_view AS 'SELECT id, tier FROM phys.main.typed';
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select, insert, temp) MAIN;
+
+# the facts are written with the object: one row per column a policy would change
+query IIII
+SELECT "vname", "column", "as_varchar", "as_both" FROM store.acl.relation_types WHERE "vname" = 'typed' ORDER BY 2;
+----
+typed	l	VARCHAR[]	VARCHAR[]
+typed	m	MAP(VARCHAR, VARCHAR)	MAP(VARCHAR, VARCHAR)
+typed	s	STRUCT(a VARCHAR, b INTEGER)	STRUCT(a VARCHAR, b INTEGER)
+typed	tier	VARCHAR	VARCHAR
+
+query II
+ACL ROLE "r" SELECT typeof(tier), typeof(s) FROM typed WHERE id = 1;
+----
+ENUM('acme_platinum', 'globex_gold')	STRUCT(a ENUM('acme_platinum', 'globex_gold'), b INTEGER)
+
+statement ok
+SET GLOBAL acl_enum_types = 'varchar';
+
+# the read: every ENUM is a VARCHAR, inside a STRUCT / LIST / MAP too, and a filter still filters
+query IIIIII
+ACL ROLE "r" SELECT typeof(tier), typeof(s), typeof(l), typeof(m), tier, s.a FROM typed WHERE tier = 'acme_platinum';
+----
+VARCHAR	STRUCT(a VARCHAR, b INTEGER)	VARCHAR[]	MAP(VARCHAR, VARCHAR)	acme_platinum	globex_gold
+
+# the listings say the same, and so does the DDL a quack client binds
+query II
+ACL ROLE "r" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'typed' ORDER BY ordinal_position;
+----
+id	INTEGER
+tier	VARCHAR
+s	STRUCT(a VARCHAR, b INTEGER)
+l	VARCHAR[]
+m	MAP(VARCHAR, VARCHAR)
+region	VARCHAR
+
+query I
+ACL ROLE "r" SELECT sql FROM duckdb_tables() WHERE table_name = 'typed';
+----
+CREATE TABLE "typed"("id" INTEGER, "tier" VARCHAR, "s" STRUCT(a VARCHAR, b INTEGER), "l" VARCHAR[], "m" MAP(VARCHAR, VARCHAR), "region" VARCHAR);
+
+query II
+ACL ROLE "r" SELECT column_name, column_type FROM (DESCRIBE typed) WHERE column_name = 'tier';
+----
+tier	VARCHAR
+
+# every form: a renamed projection, an RLS-only relation (its predicate qualifying by the table's
+# name), a view - and the listing of each agrees with its read
+query II
+ACL ROLE "r" SELECT typeof(level), level FROM typed_rn ORDER BY ident;
+----
+VARCHAR	acme_platinum
+VARCHAR	globex_gold
+
+query II
+ACL ROLE "r" SELECT typeof(tier), id FROM typed_rls;
+----
+VARCHAR	1
+
+query I
+ACL ROLE "r" SELECT typeof(tier) FROM typed_view WHERE id = 2;
+----
+VARCHAR
+
+query II
+ACL ROLE "r" SELECT table_name, data_type FROM information_schema.columns WHERE column_name IN ('tier', 'level') AND table_name LIKE 'typed%' ORDER BY 1;
+----
+typed	VARCHAR
+typed_rls	VARCHAR
+typed_rn	VARCHAR
+typed_view	VARCHAR
+
+# a mask over the ENUM column reads the cast value, and is described as what it reads
+statement ok
+ACL ADMIN GRANT TABLE c.typed_rn TO ROLE r COLUMNS (ident, level = CASE WHEN id = 1 THEN tier END);
+
+query II
+ACL ROLE "r" SELECT typeof(level), level FROM typed_rn ORDER BY ident;
+----
+VARCHAR	acme_platinum
+VARCHAR	NULL
+
+query I
+ACL ROLE "r" SELECT data_type FROM information_schema.columns WHERE table_name = 'typed_rn' AND column_name = 'level';
+----
+VARCHAR
+
+# a cast changes only the read: the relation stays writable, and a string reaches the ENUM column
+statement ok
+ACL ROLE "r" INSERT INTO typed(id, tier, region) VALUES (3, 'globex_gold', 'eu');
+
+query II
+SELECT id, tier FROM phys.main.typed WHERE id = 3;
+----
+3	globex_gold
+
+# a writer is told the domain by duckdb's own conversion error: `varchar` hides the labels from a
+# reader, never from a role that may write the column (spec 099, documented)
+statement error
+ACL ROLE "r" INSERT INTO typed(id, tier) VALUES (4, 'not_a_label');
+----
+<REGEX>:.*Could not convert string 'not_a_label' to ENUM.*
+
+# the table's own policy overrides the node's, and `default` hands it back
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.typed SET TYPES (enums = keep);
+
+query I
+ACL ROLE "r" SELECT typeof(tier) FROM typed WHERE id = 1;
+----
+ENUM('acme_platinum', 'globex_gold')
+
+query I
+ACL ROLE "r" SELECT data_type FROM information_schema.columns WHERE table_name = 'typed' AND column_name = 'tier';
+----
+ENUM('acme_platinum', 'globex_gold')
+
+query I
+SELECT enum_types FROM store.acl.relations WHERE vname = 'typed';
+----
+keep
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.typed SET TYPES (enums = default);
+
+query I
+ACL ROLE "r" SELECT typeof(tier) FROM typed WHERE id = 1;
+----
+VARCHAR
+
+statement error
+ACL ADMIN ALTER VIRTUAL TABLE c.typed SET TYPES (enums = bogus);
+----
+<REGEX>:.*SET TYPES takes aliases = base\|keep\|default and enums = varchar\|keep\|default.*
+
+statement error
+ACL ADMIN ALTER VIRTUAL VIEW c.typed_view SET TYPES (colors = varchar);
+----
+<REGEX>:.*SET TYPES takes.*
+
+# a redeclaration keeps the table's own policy, as it keeps the comment
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.typed_rls SET TYPES (enums = keep);
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.typed_rls SET RLS 'typed.region = ''us''';
+
+query I
+SELECT enum_types FROM store.acl.relations WHERE vname = 'typed_rls';
+----
+keep
+
+# the listings' type function is never a principal's: it binds a type by name
+statement error
+ACL ROLE "r" SELECT acl_exposed_type('phys.main.client_tier', true, false);
+----
+<REGEX>:.*function "acl_exposed_type" is not allowed.*
+
+# --- the catalog check: stale facts, and an ENUM whose labels a predicate does not hide -------------------
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.later AS c.later;
+
+statement ok
+CREATE TABLE phys.main.later(id INTEGER, tier phys.main.client_tier);
+
+query III
+SELECT object, problem, repair FROM acl_check_catalog('c') WHERE problem IN ('types_stale', 'enum_domain_exposed') ORDER BY 1, 2;
+----
+later	types_stale	ANALYZE VIRTUAL TABLE c.later
+typed_rls	enum_domain_exposed	ALTER VIRTUAL TABLE c.typed_rls SET TYPES (enums = varchar)
+
+# until it is probed, the object is read uncast - and described uncast, never as what the node's
+# setting would make it: a quack client binds the description and reads the data as it comes
+statement ok
+INSERT INTO phys.main.later VALUES (1, 'globex_gold');
+
+query II
+ACL ROLE "r" SELECT typeof(tier), (SELECT data_type FROM information_schema.columns WHERE table_name = 'later' AND column_name = 'tier') FROM later;
+----
+ENUM('acme_platinum', 'globex_gold')	ENUM('acme_platinum', 'globex_gold')
+
+# ANALYZE probes the source again; the read then casts what is there
+statement ok
+ACL ADMIN ANALYZE VIRTUAL TABLE c.later;
+
+query II
+ACL ROLE "r" SELECT typeof(tier), (SELECT data_type FROM information_schema.columns WHERE table_name = 'later' AND column_name = 'tier') FROM later;
+----
+VARCHAR	VARCHAR
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.typed_rls SET TYPES (enums = default);
+
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE problem IN ('types_stale', 'enum_domain_exposed');
+----
+0
+
+statement ok
+SET GLOBAL acl_enum_types = 'keep';
+
+query I
+SELECT object FROM acl_check_catalog('c') WHERE problem = 'enum_domain_exposed';
+----
+typed_rls
+
+statement error
+SET acl_enum_types = 'varchar';
+----
+<REGEX>:.*acl_enum_types is global.*
+
+statement error
+SET GLOBAL acl_alias_types = 'nope';
+----
+<REGEX>:.*acl_alias_types is 'base' or 'keep'.*
+
+# --- the cast sits above the row filter: a predicate reads the physical values -----------------------
+# An ENUM orders by its labels' positions, a VARCHAR lexically: a predicate over the cast value would
+# change which rows a role sees when the policy flips (review of spec 099).
+
+statement ok
+CREATE TYPE phys.main.lv AS ENUM ('low', 'mid', 'high');
+
+statement ok
+CREATE TABLE phys.main.docs(id INTEGER, lvl phys.main.lv, clearance phys.main.lv);
+
+statement ok
+INSERT INTO phys.main.docs VALUES (1, 'low', 'mid'), (2, 'high', 'low');
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.docs AS c.docs RLS (lvl <= clearance);
+
+statement ok
+ACL ADMIN ADD VIEW c.docs_view AS 'SELECT id, lvl, clearance FROM phys.main.docs';
+
+statement ok
+ACL ADMIN GRANT TABLE c.docs_view TO ROLE r RLS (lvl <= clearance);
+
+statement ok
+SET GLOBAL acl_enum_types = 'varchar';
+
+query II
+ACL ROLE "r" SELECT id, typeof(lvl) FROM docs;
+----
+1	VARCHAR
+
+query II
+ACL ROLE "r" SELECT id, typeof(lvl) FROM docs_view;
+----
+1	VARCHAR
+
+# a grant's predicate too, on a table: the same rows whatever the policy
+statement ok
+ACL ADMIN GRANT TABLE c.docs TO ROLE r RLS (clearance >= lvl AND id > 0);
+
+query I
+ACL ROLE "r" SELECT id FROM docs;
+----
+1
+
+# --- expressions that read the exposed type: what breaks or disagrees is the check's to say ---------
+
+statement ok
+CREATE TABLE phys.main.inc(id INTEGER, sev phys.main.lv, name VARCHAR);
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.inc AS c.inc_code COLUMNS (id, code = enum_code(sev));
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.inc AS c.inc_made COLUMNS (id, sev, n2 = CAST(name AS ENUM('a', 'b')));
+
+query III
+SELECT object, problem, repair FROM acl_check_catalog('c') WHERE problem IN ('types_incompatible', 'types_mismatch') ORDER BY 1;
+----
+inc_code	types_incompatible	ALTER VIRTUAL TABLE c.inc_code SET TYPES (enums = keep)  -- or rewrite the expression for the exposed type
+inc_made	types_mismatch	REPAIR VIRTUAL TABLE c.inc_made REMAP (n2 = CAST(CAST(name AS ENUM('a', 'b')) AS VARCHAR))
+
+statement ok
+SET GLOBAL acl_enum_types = 'keep';

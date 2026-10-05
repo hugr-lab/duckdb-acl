@@ -6,6 +6,7 @@
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_rewriter.hpp"
+#include "acl_types.hpp"
 
 namespace duckdb {
 namespace acl {
@@ -13,6 +14,22 @@ namespace acl_detail {
 
 bool CatalogBackend::ProbeSchema(const string &sql, bool expression, const vector<string> &param_types,
                                  vector<std::pair<string, string>> &out) {
+	vector<std::pair<string, LogicalType>> bound;
+	if (!ProbeBound(sql, expression, param_types, bound)) {
+		return false; // stored as "schema unknown"; acl_refresh_schema can try again later
+	}
+	for (auto &column : bound) {
+		out.emplace_back(column.first, column.second.ToString());
+	}
+	return true;
+}
+
+bool CatalogBackend::ProbeTypes(const string &sql, vector<std::pair<string, LogicalType>> &out) {
+	return ProbeBound(sql, false, {}, out);
+}
+
+bool CatalogBackend::ProbeBound(const string &sql, bool expression, const vector<string> &param_types,
+                                vector<std::pair<string, LogicalType>> &out) {
 	auto instance = Db();
 	string probe;
 	try {
@@ -26,13 +43,58 @@ bool CatalogBackend::ProbeSchema(const string &sql, bool expression, const vecto
 	Connection con(*instance);
 	auto result = con.Query(probe);
 	if (result->HasError()) {
-		return false; // stored as "schema unknown"; acl_refresh_schema can try again later
+		return false;
 	}
 	auto &types = result->GetTypes();
 	for (idx_t col = 0; col < result->ColumnCount(); col++) {
-		out.emplace_back(result->ColumnName(col).GetIdentifierName(), types[col].ToString());
+		out.emplace_back(result->ColumnName(col).GetIdentifierName(), types[col]);
 	}
 	return true;
+}
+
+bool CatalogBackend::ProbeTypeFacts(const string &form, const string &phys, const string &view_sql,
+                                    vector<TypeFact> &out) {
+	string source;
+	if (form == "view") {
+		source = view_sql;
+	} else if (!phys.empty()) {
+		source = "SELECT * FROM " + phys;
+	}
+	vector<std::pair<string, LogicalType>> probed;
+	if (source.empty() || !ProbeTypes(source, probed)) {
+		return false;
+	}
+	for (auto &column : probed) {
+		auto own = column.second.ToString();
+		auto spelled = [&](bool strip_alias, bool enums_to_varchar) {
+			auto exposed = ExposedType(column.second, strip_alias, enums_to_varchar).ToString();
+			return exposed == own ? string() : exposed;
+		};
+		TypeFact fact {column.first, spelled(true, false), spelled(false, true), spelled(true, true)};
+		if (!fact.as_base.empty() || !fact.as_varchar.empty() || !fact.as_both.empty()) {
+			out.push_back(std::move(fact));
+		}
+	}
+	return true;
+}
+
+vector<string> CatalogBackend::TypeFactStatements(const string &vcat, const string &vname, const string &form,
+                                                  const string &phys, const string &view_sql) {
+	vector<string> statements;
+	statements.push_back("DELETE FROM " + Tbl("relation_types") + " WHERE \"vcat\" = " + Lit(vcat) +
+	                     " AND \"vname\" = " + Lit(vname));
+	vector<TypeFact> facts;
+	ProbeTypeFacts(form, phys, view_sql, facts);
+	auto spelled = [](const string &text) {
+		return text.empty() ? string("NULL") : Lit(text);
+	};
+	for (auto &fact : facts) {
+		statements.push_back("INSERT INTO " + Tbl("relation_types") +
+		                     "(\"vcat\", \"vname\", \"column\", \"as_base\", \"as_varchar\", \"as_both\") VALUES (" +
+		                     Lit(vcat) + ", " + Lit(vname) + ", " + Lit(fact.column) + ", " + spelled(fact.as_base) +
+		                     ", " + spelled(fact.as_varchar) + ", " + spelled(fact.as_both) + ")");
+	}
+	return statements;
 }
 
 bool CatalogBackend::BareIdentifier(const string &expr) {

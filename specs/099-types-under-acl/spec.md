@@ -1,6 +1,6 @@
 # Spec 099: types under the ACL - names, aliases, enums
 
-- **Status**: accepted (owner, 2026-10-02: defaults aliases `base` / enums `keep`; `SET TYPES`; both node settings are cluster-profile items too)
+- **Status**: implemented (2026-10-05; accepted by the owner 2026-10-02: defaults aliases `base` / enums `keep`; `SET TYPES`; both node settings are cluster-profile items too)
 - **Date**: 2026-10-02
 - **Follows**: spec 072 (the function gate), spec 098 (the functions listing - the same shape of fix),
   spec 035/026 (listings describe what the role reads; a grant's projection is probed), spec 065 (the
@@ -72,6 +72,16 @@ parser's unresolved name):
 Anonymous constructors (`ENUM('a', 'b')`, `STRUCT(...)`, `DECIMAL(p, s)`) are built-in syntax and
 stay admitted.
 
+A type written as **text** is a type too: `from_json` / `json_transform` and their `_strict` forms
+resolve their structure argument as a cast would (found by the review: `enum_range(from_json('null',
+'"phys.main.salaries"'))` listed the labels). Under a principal the structure must be a constant
+string; it is parsed as JSON, every string leaf parsed as one type, gated, and the structure is
+rebuilt with the qualified names (`GateTypeTextArguments`). And a bare name the system catalog lacks
+is refused by the gate itself (`PolicyStore::SystemTypeExists`, the system catalog's `duckdb_types()`
+cached by name): left to the binder, its "Did you mean `phys.salaries`" named the database that has
+it. Table functions with a column-types parameter (`read_csv(types := …)`, `read_json(columns := …)`)
+are the file readers' category, never a role's default - a follow-up if one is granted.
+
 ### 2. `duckdb_types()`
 
 A metadata surface (spec 035/098 mechanism): substituted before the gate by
@@ -87,8 +97,10 @@ Two policies, each with a node default and a per-virtual-table override:
 | **aliases** - an extension's alias type | `base` (its base type) / `keep` | `acl_alias_types` | `base` |
 | **enums** - an ENUM column, user or anonymous | `varchar` / `keep` | `acl_enum_types` | `keep` |
 
-- **The virtual table overrides the node**: `ALTER VIRTUAL TABLE c.t SET TYPES (aliases = keep,
-  enums = varchar)` / `= default`; also on `CREATE VIRTUAL TABLE ... TYPES (...)`. Stored on the
+- **The virtual table overrides the node**: `ALTER VIRTUAL TABLE|VIEW c.t SET TYPES (aliases = keep,
+  enums = varchar)` / `= default` (a key not written keeps its value; a redefinition keeps both, as it
+  keeps the comment). No `CREATE … TYPES` clause: the node's value is the default, and an object
+  that differs is said so in one ALTER. Stored on the
   relation (`relations.alias_types`, `relations.enum_types`, NULL = the node's) - schema v19,
   `min_reader` 18 (an older build ignores the columns and keeps the types: it never exposes *less*
   than before, but it can expose more - stated in the migration note).
@@ -131,20 +143,47 @@ what makes mssql behind quack work at all.
 Nothing on the query path reads the source (spec 065), so the types are **facts the catalog stores**,
 probed where the object is written - as spec 026 probes a grant's projection:
 
-- On `ADD TABLE` / `CREATE VIRTUAL TABLE` / a view's write / `ALTER VIRTUAL TABLE … SET TYPES` /
-  `REPAIR VIRTUAL TABLE`, the object's own columns are bound once (a `LIMIT 0` read of the physical
-  relation or the view's SQL) and every column whose type is an extension alias or an ENUM - at any
-  depth of a `STRUCT` / `LIST` / `MAP` - is stored in `relation_types(vcat, vname, column, kind,
-  base_type)` with the type to expose (its base type for an alias; the same type with every ENUM
-  replaced by `VARCHAR` for an enum).
-- The rewriter reads the facts with the relation (`TablePolicy`), applies the effective policy (the
-  table's own value, else the node's setting) and casts **by output column name** in the read: `SELECT
-  * REPLACE (CAST(c AS <type>) AS c) …` for the alias and the RLS-only forms, the cast around a plain
-  column item of a declared list, the view's output wrapped the same way. A column the grant masks is
-  left as the mask produces it (the mask is the operator's expression - `CAST` it there if needed).
-- Every listing applies the same facts and the same policy, so the description and the data agree.
+- On every write of the object (`ADD TABLE` / `CREATE VIRTUAL TABLE` / a view / any `ALTER VIRTUAL
+  TABLE|VIEW`, `SET TYPES` included) and on `ANALYZE VIRTUAL …` (`acl_refresh_schema`), the object's
+  source is bound once (`SELECT * FROM (<phys or view SQL>) WHERE false`, markers baked) and every
+  column whose type an exposure policy changes - an extension alias, an ENUM, at any depth of a
+  `STRUCT` / `LIST` / `MAP` / `ARRAY` / `UNION` - is stored in `relation_types(vcat, vname, column,
+  as_base, as_varchar, as_both)`: the exposed spelling under each of the three non-trivial policy
+  pairs (NULL where that pair changes nothing). The facts do not depend on the policy, so changing
+  the node's setting needs no rewrite. `ExposedType` (`acl_types.cpp`) is the one rule: an alias
+  other than `JSON` becomes its base type, an ENUM becomes `VARCHAR`, nested types are rebuilt.
+- The resolver reads the facts with the relation (`LookupRelation`), applies the effective policy
+  (the object's own value, else the node's setting) into `TablePolicy::casts`, and the read is
+  `ReadFrom()` = `FROM (SELECT * REPLACE (CAST(c AS <type>) AS c, …) FROM <phys> WHERE <rls>) AS
+  <phys's leaf name>`: the cast sits **right above the row filter**. A predicate - the object's or a
+  grant's - reads the physical values: an ENUM orders by its labels' positions and a VARCHAR
+  lexically, so `lvl <= clearance` over the cast values would show a role other rows the moment the
+  policy flipped (found by the review: a 'high' document became visible at clearance 'low'). The
+  projection and the masks read the exposed values. Writes keep `phys`. A plain alias that needs a
+  cast is read through the subquery form and stays writable. A view's casts go above its grant's
+  filter (`ApplyGrantPolicy`). The ResolveTable cache key carries the node's two settings.
+- Expressions over the exposed type can break (`enum_code(tier)` once it is VARCHAR - the read
+  refuses, fail closed) or make a type of their own (`CAST(x AS ENUM(…))` - described as the exposed
+  type, read as its own): `acl_check_catalog` probes the declared entries and the grants' masks over
+  the cast source and reports `types_incompatible` / `types_mismatch`.
+- Every listing passes its `data_type` through `acl_exposed_type(type_text, strip_alias,
+  enums_to_varchar)` with the object's effective flags (the `objects` CTE carries them; both false
+  for an object with no type facts, which the read does not cast either - after the v19 migration,
+  until it is written or `ANALYZE`d, it is described and read as its source has it) - the
+  physical row's type, a declared/probed column's, a grant projection's alike - so a mask over an
+  ENUM column is described as `VARCHAR` exactly when it reads one. `acl_exposed_type` binds a type by
+  name, so it is in the never set (an `acl_*` name). An operator's expression that manufactures an
+  ENUM or alias type of its own is described normalized but read as written - `types_mismatch` names
+  it, with the cast to write.
+- A principal's own `CREATE` registers a record of fixed shape (no comment, no type policy); its facts
+  are probed on the store's connection after the statement - inside an explicit transaction the new
+  table is not visible there yet, and the object is then read and described uncast until `ANALYZE`.
+- `ADD SCHEMA … EXPAND` / `REFRESH` probe every table they record (one bind each, inside the write).
 - The source drifts: `acl_check_catalog` reports `types_stale` when the facts no longer match the
-  source, with the repair to paste - the facts are refreshed by `REPAIR VIRTUAL TABLE c.t REFRESH TYPES`.
+  source (or were never probed because the source did not exist yet), with the repair to paste:
+  `ANALYZE VIRTUAL TABLE c.t`.
+- Not cast: a live schema alias (no stored object to carry facts), a table function, the memory
+  store - each exposes the source's types as they are.
 - Table functions are out of this spec (their result columns come through `object_columns`): a
   follow-up if an extension type ever reaches one.
 
@@ -154,6 +193,10 @@ probed where the object is written - as spec 026 probes a grant's projection:
 where the effective policy is `keep` - with the repair to paste (`ALTER VIRTUAL TABLE c.t SET TYPES
 (enums = varchar)`). The docs say it next to the live-alias paragraph: an ENUM's labels are visible to
 anyone who can see the column, whatever RLS says.
+
+Writers: a role that may write an ENUM column learns its labels from duckdb's own conversion error
+(`Could not convert string 'x' to ENUM('a', 'b')`) - `varchar` hides the domain from readers, not
+from writers (documented in the security model's accepted risks).
 
 ## Enforcement & security
 
@@ -172,12 +215,16 @@ anyone who can see the column, whatever RLS says.
   `meta`); ENUM exposure (`keep` / `varchar` by node and by table, listings and `typeof` agree, a
   struct with an ENUM field, writes into the ENUM column still work under `varchar`);
   `enum_domain_exposed`.
-- **quack e2e** (the real client): ATTACH a catalog with `STRUCT`, `LIST`, `MAP`, `UNION`, `ENUM`,
+- `test/sql/acl_cluster_profile.test`: both settings as cluster items; `acl_schema_window.test` at
+  build 19.
+- **quack e2e** (`test/e2e/door/types.sh`, in `make test-e2e`; the real client): ATTACH a catalog with `STRUCT`, `LIST`, `MAP`, `UNION`, `ENUM`,
   `JSON` columns and read each; with `enums = varchar` the client's catalog and stream agree (no
   mismatch); a table with an alias type ATTACHes from a client without that extension under `base`.
 - **Flight**: the Arrow schema of the same table - utf8 under `varchar`, a dictionary under `keep`.
-- **mssql alias types** in the integration environment (SQL Server in docker, an mssql build): an
-  mssql source exposed through a virtual table, `base` vs `keep`, read through quack and Flight.
+- **mssql alias types**: `test/e2e/door/types.sh` (in `make test-e2e`) serves an mssql table when the
+  extension of the pin and SQL Server are there and a quack client WITHOUT mssql reads it under
+  `base`; `keep` was checked by hand (2026-10-05: `typeof` answers `MSSQL_VARCHAR(20)`, the DDL names
+  it) - it needs a client with mssql, which the e2e does not build.
 
 ## Alternatives considered
 

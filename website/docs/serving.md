@@ -237,6 +237,15 @@ mode)`; `mode` is `'embedded'` (default) or `'plain'`. The uri is quack's `quack
   force_mbedtls_unsafe='true'` before serving. (...)``.
 - A build without the embed: `acl_quack_serve: this build was compiled without the embedded door
   (ACL_NO_QUACK_EMBED or WASM)`.
+- **Types a client must bind** (spec 099): a quack client builds its tables from the served DDL
+  (`duckdb_tables().sql`) and reads the server's vectors as they come, so one type it does not know
+  fails its whole ATTACH. An extension's alias type (`MSSQL_VARCHAR(n)` over an mssql source) is
+  therefore served as its base type by default (`acl_alias_types = 'base'`) - a client without mssql
+  attaches and reads it; ENUMs are served as they are unless `acl_enum_types` / `SET TYPES (enums =
+  varchar)` says otherwise. The description and the stream always agree
+  ([management SQL: column types](management-sql.md#column-types-spec-099)); the Flight door needs
+  nothing - its Arrow schema is the result's (a kept ENUM goes out as a dictionary, a cast one as
+  utf8).
 
 How it enforces: quack calls `acl_quack_authenticate(session_id, client_token, server_token)` once
 per connection (it opens a session with the client's JWT and binds it to quack's connection id; a

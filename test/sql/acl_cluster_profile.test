@@ -158,6 +158,26 @@ SELECT spec FROM acl_cluster_items() WHERE kind = 'setting' AND name = 'memory_l
 ----
 {"value": "2GB"}
 
+# spec 099: how types are exposed is one value for the cluster (a group's own on its nodes) - a
+# GLOBAL setting like any other, rolled out by the node agent
+statement ok
+ACL ADMIN CLUSTER SET acl_enum_types = 'varchar';
+
+statement ok
+ACL ADMIN CLUSTER SET acl_alias_types = 'keep';
+
+query TT
+SELECT name, spec FROM acl_cluster_items() WHERE kind = 'setting' AND name LIKE 'acl_%_types' ORDER BY 1;
+----
+acl_alias_types	{"value": "keep"}
+acl_enum_types	{"value": "varchar"}
+
+statement ok
+ACL ADMIN CLUSTER RESET acl_enum_types;
+
+statement ok
+ACL ADMIN CLUSTER RESET acl_alias_types;
+
 statement error
 ACL ADMIN CLUSTER SET allow_unsigned_extensions = true;
 ----
