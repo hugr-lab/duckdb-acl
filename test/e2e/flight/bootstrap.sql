@@ -21,6 +21,8 @@ CREATE SCHEMA staging2;
 -- spec 099: an ENUM column, read as it is by one virtual table and as VARCHAR by the other
 CREATE TYPE tier AS ENUM ('gold', 'silver');
 CREATE TABLE typed AS SELECT 1 AS id, 'gold'::tier AS tier, {'a': 'silver'::tier} AS s;
+-- spec 102: a struct a grant narrows to one field
+CREATE TABLE nested AS SELECT 1 AS id, {'city': 'A', 'ssn': 'S1'} AS address;
 
 ATTACH ':memory:' AS store;
 SELECT acl_use_db('store', 'acl', true);
@@ -45,6 +47,7 @@ ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers
 ACL ADMIN CREATE VIRTUAL TABLE c.typed AS memory.main.typed;
 ACL ADMIN CREATE VIRTUAL TABLE c.typed_v AS memory.main.typed;
 ACL ADMIN ALTER VIRTUAL TABLE c.typed_v SET TYPES (enums = varchar);
+ACL ADMIN CREATE VIRTUAL TABLE c.nested AS memory.main.nested;
 ACL ADMIN CREATE ROLE analyst;
 -- temp is explicit (spec 050): session temp tables ride on it, and nothing else grants them
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, temp) MAIN;
@@ -53,6 +56,7 @@ ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
     CAPS '{"select": true, "insert": true}'
     RLS 'tenant = acl_claim(''tenant'')';
 ACL ADMIN GRANT TABLE c.customers TO ROLE analyst WITH (select) COLUMNS (id, name);
+ACL ADMIN GRANT TABLE c.nested TO ROLE analyst WITH (select) COLUMNS (id, address.city);
 -- spec 051: create prices CREATE, drop prices REPLACE and DROP - a live-alias schema as the home
 ACL ADMIN CREATE VIRTUAL SCHEMA c.stage AS memory.staging;
 ACL ADMIN GRANT SCHEMA c.stage TO ROLE analyst WITH (select, insert, create, drop);

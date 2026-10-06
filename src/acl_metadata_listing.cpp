@@ -373,12 +373,15 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// The names a grant states: split the list and take the part before '=' of a masked item. A
 	// mask's expression may itself contain a comma, which splits into a fragment that matches no
 	// column - harmless, since only the names on the left of '=' can ever match one.
-	// spec 102: a path names its column - the part before the first '.' or '[' (a quoted name with a
-	// dot in it is the one case this reads short)
+	// spec 102: a path names its column - a quoted head unquoted (`"odd.col"`, `"my col".city`), else
+	// the part before the first '.' or '['
 	auto stated = [](const string &column_expr) {
-		return "list_transform(str_split(" + column_expr +
-		       ", ','), lambda y: lower(trim(regexp_replace(CASE WHEN position('=' IN y) > 0"
-		       " THEN regexp_extract(y, '^([^=]*)=', 1) ELSE y END, '[.\\[].*$', ''))))";
+		string item = "trim(CASE WHEN position('=' IN y) > 0 THEN regexp_extract(y, '^([^=]*)=', 1) ELSE y END)";
+		return "list_transform(str_split(" + column_expr + ", ','), lambda y: lower(CASE WHEN starts_with(" + item +
+		       ", '\"') THEN replace(regexp_extract(" + item +
+		       ", '^\"((?:[^\"]|\"\")*)\"', 1), '\"\"', '\"')"
+		       " ELSE regexp_replace(" +
+		       item + ", '[.\\[].*$', '') END))";
 	};
 	auto keeps = [&](const string &column_expr, const string &name_expr) {
 		return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = '' OR list_contains(" +

@@ -561,6 +561,7 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 		out.subquery_form = true;
 		for (auto &column : object_columns) {
 			out.write_columns.insert(column.second.empty() ? column.first : column.second);
+			out.visible_columns.insert(column.second.empty() ? column.first : column.second);
 		}
 	}
 	// remaining rows of the winning interpretation differ only by role: union their caps, and the
@@ -620,11 +621,7 @@ struct ListedColumn {
 		auto copy = tree->Clone();
 		copy->name = root;
 		SerializeNode(*copy, ColumnTrees::RootName(*copy), items);
-		vector<string> parts;
-		for (auto &item : items) {
-			parts.push_back(item.second.empty() ? item.first : item.first + " = " + item.second);
-		}
-		return StringUtil::Join(parts, ", ");
+		return ItemsCsv(items);
 	}
 
 	//! What the role reads of the column, over `source` (its value in physical terms)
@@ -711,13 +708,16 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 	// object's (checked below), so it replaces what the object allowed rather than adding to it.
 	out.write_columns.clear();
 	out.write_order.clear();
+	out.visible_columns.clear();
+	out.narrowed_reads.clear();
 	// spec 038: where the object states its own columns, the grant is folded into them - in the
 	// object's order, so a column's position belongs to the object rather than to whoever asks. A
 	// listed name the object does not have is a *bare name* that grants nothing (it intersects
 	// away) or a *mask* that cannot be applied (it refuses): protection that is silently skipped
 	// is the one failure mode worth refusing over.
 	// spec 102: a column may be listed through paths into its fields; the tree compiles to what the
-	// role reads, over the column's physical value. A narrowed column is not written through (yet).
+	// role reads, over the column's physical value, and a write folds into the stored value
+	// (field_writes) - unless the tree steps into list elements.
 	auto listed = ListColumns(grants.columns);
 	if (!object_columns.empty()) {
 		for (auto &column : listed) {
@@ -769,6 +769,10 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		out.query = "SELECT COLUMNS(lambda __acl_col: lower(__acl_col) IN (" + StringUtil::Join(names, ", ") +
 		            ")) FROM (" + inner + ")";
 		for (auto &column : listed) {
+			out.visible_columns.insert(column.name);
+			if (column.tree) {
+				out.narrowed_reads.emplace_back(column.name, column.TreeItems(column.name));
+			}
 			if (!out.writable || !column.Writable()) {
 				continue;
 			}
@@ -804,6 +808,10 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		}
 		auto expr = column.Read(source);
 		out.projection.push_back(expr == column.name ? expr : expr + " AS " + Ident(column.name));
+		out.visible_columns.insert(source);
+		if (column.tree) {
+			out.narrowed_reads.emplace_back(source, column.TreeItems(source));
+		}
 		if (!out.writable || !column.Writable()) {
 			continue;
 		}

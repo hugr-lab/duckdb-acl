@@ -82,6 +82,12 @@ int main(int argc, char *argv[]) {
 			      "a list of structs: " + Read(con, {{"items[].price", ""}}, "items"));
 			Check(Read(con, {{"address", ""}, {"address.city", ""}}, "address").find("ssn") != std::string::npos,
 			      "the whole beats its part within one grant");
+			Check(Read(con, {{"address", ""}, {"address.geo.lat", ""}}, "address").find("'lon': 2") !=
+			          std::string::npos,
+			      "... at every depth: " + Read(con, {{"address", ""}, {"address.geo.lat", ""}}, "address"));
+			Check(Read(con, {{"items", ""}, {"items[].cost", "0"}}, "items") == "[{'price': 1, 'cost': 0}] | NULL",
+			      "a whole list with a masked element field keeps the siblings: " +
+			          Read(con, {{"items", ""}, {"items[].cost", "0"}}, "items"));
 		});
 
 		Scenario("levels intersect: a narrower grant never re-exposes", [&] {

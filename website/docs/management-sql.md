@@ -534,7 +534,8 @@ There is no `REVOKE` for an object grant; write it again with `CAPS '{}'`, or re
 ### Fields of a structured column (spec 102)
 
 A `COLUMNS` item may name **fields** of a `STRUCT` column, at any depth, and through a list of
-structs. The same items work in a catalog grant, an object grant, and an object's own `COLUMNS`.
+structs. Paths work in a catalog grant, an object grant, and an object's own `COLUMNS`. A field mask
+(`address.ssn = …`) is a grant's only.
 
 | item | the role reads |
 | --- | --- |
@@ -562,7 +563,18 @@ ACL ADMIN GRANT TABLE c.customers TO ROLE audit  COLUMNS (id, address, address.t
   - a written value that carries a field the role cannot see is refused.
 
   `RETURNING` cannot read the column. A column narrowed through `[]`, or by the object's own
-  `COLUMNS`, is read-only.
+  `COLUMNS`, is read-only. A field mask that reads the row (`left(ssn, 1) || '***'`) is a mask and not
+  an assignment, so it makes the column read-only too. `SET address = NULL` sets the visible fields to
+  NULL and keeps the hidden ones.
+- **A write statement reads what the role reads.** In an `UPDATE`'s `SET` and `WHERE`, a `DELETE`'s
+  `WHERE` and a `MERGE`'s conditions:
+  - a narrowed column has only its visible fields;
+  - a masked column is its mask;
+  - a column the grant does not list is refused.
+  
+  Beside another relation (`UPDATE … FROM`, `DELETE … USING`, `MERGE`), qualify the other relation's
+  columns. A `MERGE`'s `UPDATE SET *` / `UPDATE BY NAME` is refused under a column policy: name the
+  columns.
 
 ```sql
 ACL ADMIN GRANT TABLE c.orders TO ROLE narrow WITH (select, update, delete, merge) RLS (tenant = acl_claim('tenant'));

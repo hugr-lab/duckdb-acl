@@ -160,7 +160,8 @@ operator needs to write through an object-declared narrowing.
   - an UPDATE's SET and a MERGE's update branch: `struct_update` of the stored value;
   - an INSERT's projection and a MERGE's insert branch: `struct_pack`;
   - a drained stream, by position.
-- RETURNING refuses a narrowed column: the stored struct carries the hidden fields.
+- RETURNING refuses a narrowed column: the stored struct carries the hidden fields. SET / WHERE / ON
+  read it through its tree (section 10).
 - Listings: the type of a column a grant projects is `acl_listed_type(source_type, column,
   roles)`. It folds the roles' catalog/object lists and unites them as the resolver does, then
   applies the tree to the source's (exposed, spec 099) type; a mask's type comes from its role's
@@ -175,6 +176,58 @@ operator needs to write through an object-declared narrowing.
   It names the role's own field, never a hidden one.
 - `acl_check_catalog`: a path that no longer binds is `grant_column_missing` (bare) or `mask_broken`
   (masked).
+
+### 10. Review (2026-10-07): found and fixed
+
+Three adversarial passes. Each fix below has a regression test in `test/sql/acl_struct_fields.test`.
+
+- **A write statement read the physical row** (it predates this spec: a hidden *column* leaked the
+  same way, specs 011/020). An UPDATE's SET or WHERE, a DELETE's WHERE, and a MERGE's ON and branch
+  conditions could copy a hidden field or column into a visible one, or use it as an oracle
+  (`UPDATE c SET note = hidden`, `DELETE … WHERE address.ssn = …`). Now a DML statement's own
+  expressions see the target as the principal reads it (`MapReadable`, over
+  `TablePolicy::visible_columns` / `narrowed_reads`):
+  - a narrowed column is read through its tree, so a hidden field does not resolve;
+  - a masked column is read as its mask;
+  - a column outside the projection is refused.
+  
+  With another relation in scope (UPDATE … FROM, DELETE … USING, MERGE), an unqualified name that is
+  not one of the target's readable columns is refused: the other relation's column must be qualified,
+  since the binder would give the name to the target whenever the other relation lacks it. A lambda's
+  parameters and a subquery's body are their own scope.
+- **`MERGE … WHEN MATCHED THEN UPDATE SET *` / `UPDATE BY NAME`** wrote every column the source carried,
+  past the whole column policy (pre-existing). These forms are now refused under a column policy, like
+  a merge's listless INSERT.
+- **A field mask that reads the row** (`address.ssn = left(address.ssn, 1) || '***'`) was written
+  through and destroyed the stored value. Like a column mask (spec 011), it is a mask and not an
+  assignment, so a write through that column is refused.
+- **The listing failed open**: when the read refuses a principal (two roles masking one field
+  differently), `acl_listed_type` answered the source's full type. It now answers `"NULL"`.
+- **The wider item now wins at every depth.** `address, address.geo.lat` keeps all of `geo`, and
+  `items, items[].cost = 0` keeps `price`.
+- **A masked field that left the source** is appended by `struct_update`; the listing now describes
+  that append too. `acl_check_catalog` reports a path whose field is gone by checking the column's
+  type, at the catalog level as well: a path never intersects away silently, its reads refuse.
+- **A column named with a dot** (`"odd.col"`, common in Parquet/JSON sources) is a column, not a path.
+  The grant stores it quoted.
+  - **Compatibility:** a grant written before this spec that lists a dotted column unquoted reads as a
+    path after the upgrade. `acl_check_catalog` names it, and writing the grant again fixes it.
+- **A grant spelled in another case** (`ADDRESS.CITY`) listed the column twice, one copy with the full
+  type. The column's name is now the object's.
+- **An object's own list**:
+  - it emits a column once, whatever the order of its items;
+  - a field mask in it is refused, since a field mask belongs to a grant;
+  - a refusal names the virtual column.
+
+Behaviour, stated:
+- `UPDATE … SET address = NULL` sets the visible fields to NULL and keeps the hidden ones (an INSERT of
+  NULL inserts a NULL struct).
+- A mask that changes a field's type makes the column unwritable: the cast to the stored struct fails.
+- The written value is substituted once per field, and the NULL-stored branch repeats it per level,
+  so the generated expression grows with depth (about 2^depth for nested narrowings).
+- A principal's roles unite per object, capabilities included (spec 011). A field one role may only
+  read is writable through a role that holds `update` on the column with that field visible. That is
+  the union's rule, not a field rule.
 
 ## Enforcement & security
 

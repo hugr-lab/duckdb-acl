@@ -9,6 +9,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -1062,9 +1063,12 @@ private:
 				column = MapWrittenColumn(policy, column, vname);
 				RequireWritableColumn(policy, column, vname);
 			}
+			bool single = !node.from_table;
+			auto target = TargetAliasOf(node.table);
 			for (auto &expr : node.set_info->expressions) {
 				RewriteExpr(expr);
 				MapColumnRefs(expr, policy, vname);
+				MapReadable(expr, policy, vname, target, single);
 			}
 			// a grant's value column is assigned, not suggested: overriding the SET keeps the row
 			// inside the principal's slice, and the predicate keeps the statement there too
@@ -1081,6 +1085,7 @@ private:
 			RewriteExpr(node.set_info->condition);
 			MapColumnRefs(node.set_info->condition, policy, vname,
 			              node.from_table ? TargetAliasOf(node.table) : Identifier());
+			MapReadable(node.set_info->condition, policy, vname, target, single);
 			if (node.from_table) {
 				AndInto(node.set_info->condition, TargetPredicate(policy, TargetAliasOf(node.table), vname));
 			} else {
@@ -1103,6 +1108,7 @@ private:
 		RewriteExpr(node.condition);
 		MapColumnRefs(node.condition, policy, vname,
 		              node.using_clauses.empty() ? Identifier() : TargetAliasOf(node.table));
+		MapReadable(node.condition, policy, vname, TargetAliasOf(node.table), node.using_clauses.empty());
 		if (!node.using_clauses.empty()) {
 			AndInto(node.condition, TargetPredicate(policy, TargetAliasOf(node.table), vname));
 		} else {
@@ -1122,6 +1128,7 @@ private:
 		RewriteTableRef(node.source);
 		RewriteExpr(node.join_condition);
 		MapColumnRefs(node.join_condition, policy, vname, alias);
+		MapReadable(node.join_condition, policy, vname, alias, false);
 		// The predicate joins the target rather than filters the result: a row outside the grant is
 		// never matched, so no WHEN MATCHED branch can reach it.
 		AndInto(node.join_condition, TargetPredicate(policy, alias, vname));
@@ -1129,6 +1136,14 @@ private:
 			for (auto &action : action_set.second) {
 				RewriteExpr(action->condition);
 				MapColumnRefs(action->condition, policy, vname, alias);
+				MapReadable(action->condition, policy, vname, alias, false);
+				if (action->action_type == MergeActionType::MERGE_UPDATE && HasWritePolicy(policy) &&
+				    (!action->update_info || action->update_info->columns.empty())) {
+					// `UPDATE SET *` / `UPDATE BY NAME` writes every column the source carries - the
+					// grant's columns, values and fields are judged per named column, so name them
+					Deny(Reason::WRITE_POLICY,
+					     "the update branch of a merge into \"" + vname + "\" must name its columns");
+				}
 				if (action_set.first == MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE) {
 					// ... but "not matched" now includes every row the predicate excluded, and this
 					// branch acts on exactly those, so it needs the predicate of its own.
@@ -1142,12 +1157,14 @@ private:
 					for (auto &expr : action->update_info->expressions) {
 						RewriteExpr(expr);
 						MapColumnRefs(expr, policy, vname, alias);
+						MapReadable(expr, policy, vname, alias, false);
 					}
 					ApplySetInjections(*action->update_info, policy, vname);
 					ApplyFieldWrites(*action->update_info, policy, vname, alias);
 					ApplyUpdateCheck(*action->update_info, policy, vname, alias);
 					RewriteExpr(action->update_info->condition);
 					MapColumnRefs(action->update_info->condition, policy, vname, alias);
+					MapReadable(action->update_info->condition, policy, vname, alias, false);
 				}
 				for (auto &expr : action->expressions) {
 					RewriteExpr(expr);
@@ -1197,7 +1214,8 @@ private:
 			auto name = action.insert_columns[i].GetIdentifierName();
 			auto tree = FieldWriteTree(policy, name);
 			if (tree) {
-				action.expressions[i] = FieldWriteValue(*tree, std::move(action.expressions[i]), nullptr, name, vname);
+				action.expressions[i] = FieldWriteValue(*tree, std::move(action.expressions[i]), nullptr,
+				                                        VirtualColumn(policy, name), vname);
 			}
 		}
 		if (policy.injections.empty()) {
@@ -1818,6 +1836,106 @@ private:
 		    *expr, [&](unique_ptr<ParsedExpression> &child) { MapColumnRefs(child, policy, vname, target_alias); });
 	}
 
+	//! A DML statement's own expressions see the target as the principal reads it (spec 102 review): a
+	//! narrowed column through its tree, a masked one as its mask, a column the projection does not
+	//! list refused. Without this a SET or a WHERE reads the physical row - a hidden field copied into a
+	//! visible one, a hidden column used as an oracle. `alias` is the target's name in this statement;
+	//! `single` is whether the target is the only relation in scope, which decides an unqualified name
+	//! that is not one of the target's visible columns: refused (it can only be the target's) when
+	//! single, and refused too when not - another relation's column must then be qualified, since the
+	//! binder would otherwise give it to the target whenever the other relation lacks it.
+	void MapReadable(unique_ptr<ParsedExpression> &expr, const TablePolicy &policy, const string &vname,
+	                 const Identifier &alias, bool single, const case_insensitive_set_t &lambda_params = {}) {
+		if (!expr || policy.visible_columns.empty()) {
+			return;
+		}
+		switch (expr->GetExpressionClass()) {
+		case ExpressionClass::SUBQUERY:
+			// the operand is in this scope; the subquery's body is its own (rewritten as a read already)
+			MapReadable(expr->Cast<SubqueryExpression>().GetChildMutable(), policy, vname, alias, single,
+			            lambda_params);
+			return;
+		case ExpressionClass::LAMBDA: {
+			auto &lambda = expr->Cast<LambdaExpression>();
+			vector<string> names;
+			CollectColumnNames(lambda.Left(), names);
+			auto params = lambda_params;
+			for (auto &name : names) {
+				params.insert(name);
+			}
+			MapReadable(lambda.RightMutable(), policy, vname, alias, single, params);
+			return;
+		}
+		case ExpressionClass::COLUMN_REF:
+			break;
+		default:
+			ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+				MapReadable(child, policy, vname, alias, single, lambda_params);
+			});
+			return;
+		}
+		auto &names = expr->Cast<ColumnRefExpression>().ColumnNames();
+		if (names.empty() || lambda_params.count(names[0].GetIdentifierName())) {
+			return;
+		}
+		auto last = SplitTopLevel(vname, '.').back();
+		bool qualified =
+		    names.size() >= 2 && (StringUtil::CIEquals(names[0].GetIdentifierName(), alias.GetIdentifierName()) ||
+		                          StringUtil::CIEquals(names[0].GetIdentifierName(), last));
+		idx_t at = qualified ? 1 : 0;
+		auto column = names[at].GetIdentifierName();
+		if (!qualified && names.size() >= 2 && !policy.visible_columns.count(column)) {
+			return; // `other.x`: qualified by another relation in scope - not the target's
+		}
+		static const case_insensitive_set_t KEYWORDS = {"current_date", "current_time",   "current_timestamp",
+		                                                "localtime",    "localtimestamp", "current_user",
+		                                                "user",         "session_user",   "current_role"};
+		if (!qualified && names.size() == 1 && KEYWORDS.count(column)) {
+			return;
+		}
+		if (!policy.visible_columns.count(column)) {
+			Deny(Reason::WRITE_POLICY, single ? "column \"" + column + "\" of \"" + vname + "\" is not readable"
+			                                  : "column \"" + column + "\" is not a readable column of \"" + vname +
+			                                        "\" - a column of the other relation must be qualified");
+		}
+		// what the principal reads of the column, then any field steps after it
+		vector<Identifier> base(names.begin(), names.begin() + at + 1);
+		unique_ptr<ParsedExpression> read;
+		for (auto &injection : policy.injections) {
+			if (StringUtil::CIEquals(injection.first, column)) {
+				read = InjectedValue(injection, vname);
+				break;
+			}
+		}
+		if (!read) {
+			for (auto &narrowed : policy.narrowed_reads) {
+				if (!StringUtil::CIEquals(narrowed.first, column)) {
+					continue;
+				}
+				auto trees = acl_detail::ColumnTrees::From(acl_detail::ParseColumnList(narrowed.second));
+				auto tree = trees.Find(narrowed.first);
+				if (tree) {
+					auto parsed =
+					    Parser(template_options).ParseExpressionList(acl_detail::CompileNode(*tree, "\"__acl_read\""));
+					read = std::move(parsed[0]);
+					SubstitutePlaceholder(read, "__acl_read", ColumnRefExpression(base));
+				}
+				break;
+			}
+		}
+		if (!read) {
+			return; // read as stored
+		}
+		for (idx_t i = at + 1; i < names.size(); i++) {
+			vector<unique_ptr<ParsedExpression>> args;
+			args.push_back(std::move(read));
+			args.push_back(ConstantExpression::String(names[i].GetIdentifierName()));
+			read = make_uniq<FunctionExpression>(Identifier("struct_extract"), std::move(args));
+		}
+		read->SetAlias(expr->GetAlias());
+		expr = std::move(read);
+	}
+
 	//! A grant's value column is an assignment, so it may only be built from claims and constants: an
 	//! expression that reads the row is a mask, and a mask cannot be written through (spec 011).
 	void RequireValueExpression(const ParsedExpression &expr, const string &column, const string &vname) {
@@ -1864,11 +1982,27 @@ private:
 		}
 		auto value = std::move(parsed[0]);
 		BakeMarkers(value, nullptr); // a mask may read a claim
+		RequireFieldMasksAreValues(tree, column, vname);
 		SubstitutePlaceholder(value, "__acl_written", *written);
 		if (stored) {
 			SubstitutePlaceholder(value, "__acl_stored", *stored);
 		}
 		return value;
+	}
+
+	//! A field mask is an assignment on a write, like a column's: claims and constants only (spec 011)
+	void RequireFieldMasksAreValues(const acl_detail::FieldNode &node, const string &column, const string &vname) {
+		if (node.masked) {
+			auto mask = store.InstantiateExpr(node.mask, template_options);
+			RequireValueExpression(*mask, column, vname);
+			return;
+		}
+		for (auto &child : node.fields) {
+			RequireFieldMasksAreValues(*child, column, vname);
+		}
+		if (node.element) {
+			RequireFieldMasksAreValues(*node.element, column, vname);
+		}
 	}
 
 	static void SubstitutePlaceholder(unique_ptr<ParsedExpression> &expr, const string &name,
@@ -1902,10 +2036,20 @@ private:
 				stored_name.push_back(target);
 			}
 			stored_name.push_back(set_info.columns[i]);
-			set_info.expressions[i] =
-			    FieldWriteValue(*tree, std::move(set_info.expressions[i]),
-			                    make_uniq<ColumnRefExpression>(std::move(stored_name)), name, vname);
+			set_info.expressions[i] = FieldWriteValue(*tree, std::move(set_info.expressions[i]),
+			                                          make_uniq<ColumnRefExpression>(std::move(stored_name)),
+			                                          VirtualColumn(policy, name), vname);
 		}
+	}
+
+	//! The name the principal knows a physical column by - a refusal speaks the virtual catalog
+	static string VirtualColumn(const TablePolicy &policy, const string &physical) {
+		for (auto &rename : policy.renames) {
+			if (StringUtil::CIEquals(rename.second, physical)) {
+				return rename.first;
+			}
+		}
+		return physical;
 	}
 
 	//! Refuse a write to a column the grant does not list: silently dropping it would write a row the
@@ -2130,7 +2274,8 @@ private:
 		return predicate;
 	}
 
-	//! Assign the grant's injected values into a *drained stream* (spec 042). The source is quack's
+	//! Assign the grant's injected values - and fold its narrowed columns (spec 102) - into a *drained
+	//! stream* (spec 042). The source is quack's
 	//! scan, whose columns are named `col0, col1, …` by position and carry none of the client's own
 	//! names - so the value is substituted by position, through `SELECT * REPLACE (<expr> AS col<i>)`.
 	//!
@@ -2165,8 +2310,8 @@ private:
 			auto tree = FieldWriteTree(policy, name);
 			if (tree) {
 				auto position = Identifier("__acl_c" + to_string(i));
-				replacements[position] =
-				    FieldWriteValue(*tree, make_uniq<ColumnRefExpression>(position), nullptr, name, vname);
+				replacements[position] = FieldWriteValue(*tree, make_uniq<ColumnRefExpression>(position), nullptr,
+				                                         VirtualColumn(policy, name), vname);
 			}
 		}
 		// The source's columns are aliased BY POSITION here, never trusted by name: since quack f4328c5
@@ -2299,7 +2444,7 @@ private:
 				columns.push_back(column);
 				auto tree = FieldWriteTree(policy, column.GetIdentifierName());
 				items.push_back(tree ? FieldWriteValue(*tree, make_uniq<ColumnRefExpression>(column), nullptr,
-				                                       column.GetIdentifierName(), vname)
+				                                       VirtualColumn(policy, column.GetIdentifierName()), vname)
 				                     : make_uniq<ColumnRefExpression>(column));
 			}
 		}

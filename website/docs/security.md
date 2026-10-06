@@ -243,8 +243,13 @@ mode of default-deny is a refusal, and the refusal names the function.
   - A written value that carries a hidden field is refused with an `error()`. The message names no
     field, so it is no oracle for field names.
   - `RETURNING` refuses a narrowed column: the stored struct still holds the hidden fields.
-- A predicate reads the physical row, hidden fields included (`address.country =
-  acl_claim('country')`). A hidden column works the same way.
+- A grant's predicate reads the physical row, hidden fields included (`address.country =
+  acl_claim('country')`). A hidden column works the same way. A principal's own expressions in a write
+  statement do not: `SET`, `WHERE` and `ON` see the target as the principal reads it. A hidden field
+  or column is refused there, and a masked one reads as its mask. Before spec 102's review an
+  `UPDATE … SET visible = hidden` copied a hidden column out.
+- A `MERGE`'s `UPDATE SET *` / `UPDATE BY NAME` is refused under a column policy (it bypassed the
+  policy before).
 
 ### Statements (`AclRewriter::RewriteStatement`, `src/acl_rewriter.cpp`)
 

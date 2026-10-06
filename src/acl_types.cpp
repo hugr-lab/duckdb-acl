@@ -166,7 +166,9 @@ void ListedTypeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 			    error.Type() == ExceptionType::INTERNAL) {
 				throw;
 			}
-			result.SetValue(row, source_text); // a list that does not parse is the read's to refuse
+			// fail closed: the read refuses this principal (two roles masking one field differently, a
+			// list that does not parse) - the listing must not answer the source's full type instead
+			result.SetValue(row, Value(LogicalType(LogicalTypeId::SQLNULL).ToString()));
 		}
 	}
 }

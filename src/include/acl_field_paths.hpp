@@ -102,7 +102,9 @@ inline bool ParseFieldPath(const string &text_p, FieldPath &out, string &error) 
 inline string FieldName(const string &name) {
 	bool bare = !name.empty() && !isdigit(static_cast<unsigned char>(name[0]));
 	for (auto ch : name) {
-		if (!isalnum(static_cast<unsigned char>(ch)) && ch != '_') {
+		// the characters ParseFieldPath reads bare
+		if (!isalnum(static_cast<unsigned char>(ch)) && ch != '_' && ch != '$' &&
+		    static_cast<unsigned char>(ch) < 0x80) {
 			bare = false;
 		}
 	}
@@ -133,7 +135,15 @@ struct FieldNode {
 		}
 		return copy;
 	}
-	optional_ptr<FieldNode> Find(const string &field) const {
+	optional_ptr<FieldNode> Find(const string &field) {
+		for (auto &child : fields) {
+			if (StringUtil::CIEquals(child->name, field)) {
+				return child.get();
+			}
+		}
+		return nullptr;
+	}
+	optional_ptr<const FieldNode> Find(const string &field) const {
 		for (auto &child : fields) {
 			if (StringUtil::CIEquals(child->name, field)) {
 				return child.get();
@@ -155,6 +165,24 @@ inline unique_ptr<FieldNode> WholeNode(const string &name) {
 	node->name = name;
 	node->whole = true;
 	return node;
+}
+
+//! A side's child by name - or, under a whole node, the whole child it implies
+inline unique_ptr<FieldNode> ChildOrWhole(const FieldNode &node, const string &name) {
+	auto found = node.Find(name);
+	if (found) {
+		return found->Clone();
+	}
+	return node.whole ? WholeNode(name) : nullptr;
+}
+
+//! A field of a struct value, by name - never `value.name`, which a binder may take for table.column
+inline string FieldOf(const string &value, const string &name) {
+	return "struct_extract(" + value + ", '" + StringUtil::Replace(name, "'", "''") + "')";
+}
+
+inline string QuotedName(const string &name) {
+	return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
 }
 
 //! One grant's items for one column, as a tree. `display` names the column in a refusal.
@@ -206,6 +234,9 @@ inline void Simplify(FieldNode &node) {
 	}
 	vector<unique_ptr<FieldNode>> kept;
 	for (auto &child : node.fields) {
+		if (node.whole && !child->masked) {
+			child->whole = true; // the wider item wins: `address` + `address.geo.lat` keeps all of geo
+		}
 		Simplify(*child);
 		if (node.whole && child->Plain()) {
 			continue;
@@ -216,6 +247,9 @@ inline void Simplify(FieldNode &node) {
 	}
 	node.fields = std::move(kept);
 	if (node.element) {
+		if (node.whole && !node.element->masked) {
+			node.element->whole = true;
+		}
 		Simplify(*node.element);
 		if ((node.whole && node.element->Plain()) || node.element->Empty()) {
 			node.element.reset();
@@ -234,13 +268,6 @@ inline unique_ptr<FieldNode> IntersectNodes(const FieldNode &a, const FieldNode 
 		return result;
 	}
 	result->whole = a.whole && b.whole;
-	auto child_of = [](const FieldNode &node, const string &name) -> unique_ptr<FieldNode> {
-		auto found = node.Find(name);
-		if (found) {
-			return found->Clone();
-		}
-		return node.whole ? WholeNode(name) : nullptr;
-	};
 	vector<string> names;
 	for (auto &child : a.fields) {
 		names.push_back(child->name);
@@ -251,8 +278,8 @@ inline unique_ptr<FieldNode> IntersectNodes(const FieldNode &a, const FieldNode 
 		}
 	}
 	for (auto &name : names) {
-		auto ac = child_of(a, name);
-		auto bc = child_of(b, name);
+		auto ac = ChildOrWhole(a, name);
+		auto bc = ChildOrWhole(b, name);
 		if (!ac || !bc) {
 			continue;
 		}
@@ -278,7 +305,8 @@ inline unique_ptr<FieldNode> IntersectNodes(const FieldNode &a, const FieldNode 
 
 //! Roles (spec 011): what either lets through - a visible field beats a masked one, the whole beats a
 //! part, and two different masks of one position are refused rather than picked.
-inline unique_ptr<FieldNode> UniteNodes(const FieldNode *a, const FieldNode *b, const string &display) {
+inline unique_ptr<FieldNode> UniteNodes(optional_ptr<const FieldNode> a, optional_ptr<const FieldNode> b,
+                                        const string &display) {
 	if (!a) {
 		return b ? b->Clone() : nullptr;
 	}
@@ -303,13 +331,6 @@ inline unique_ptr<FieldNode> UniteNodes(const FieldNode *a, const FieldNode *b, 
 	auto result = make_uniq<FieldNode>();
 	result->name = a->name;
 	result->whole = a->whole || b->whole;
-	auto side = [](const FieldNode &node, const string &name) -> unique_ptr<FieldNode> {
-		auto found = node.Find(name);
-		if (found) {
-			return found->Clone();
-		}
-		return node.whole ? WholeNode(name) : nullptr;
-	};
 	vector<string> names;
 	for (auto &child : a->fields) {
 		names.push_back(child->name);
@@ -320,8 +341,8 @@ inline unique_ptr<FieldNode> UniteNodes(const FieldNode *a, const FieldNode *b, 
 		}
 	}
 	for (auto &name : names) {
-		auto ac = side(*a, name);
-		auto bc = side(*b, name);
+		auto ac = ChildOrWhole(*a, name);
+		auto bc = ChildOrWhole(*b, name);
 		auto merged = UniteNodes(ac.get(), bc.get(), display + "." + FieldName(name));
 		if (merged && !(result->whole && merged->Plain())) {
 			result->fields.push_back(std::move(merged));
@@ -362,11 +383,9 @@ inline string CompileNode(const FieldNode &node, const string &value, idx_t dept
 		return node.mask;
 	}
 	auto field_of = [&](const string &name) {
-		return "struct_extract(" + value + ", '" + StringUtil::Replace(name, "'", "''") + "')";
+		return FieldOf(value, name);
 	};
-	auto quoted = [](const string &name) {
-		return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
-	};
+	auto quoted = QuotedName;
 	auto lambda = "__acl_e" + std::to_string(depth);
 	if (node.element) {
 		// a list keeps its shape: each element through the element's tree
@@ -416,12 +435,8 @@ inline string CompileWrite(const FieldNode &node, const string &written, const s
 	if (node.masked) {
 		return node.mask;
 	}
-	auto field_of = [](const string &value, const string &name) {
-		return "struct_extract(" + value + ", '" + StringUtil::Replace(name, "'", "''") + "')";
-	};
-	auto quoted = [](const string &name) {
-		return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
-	};
+	auto field_of = FieldOf;
+	auto quoted = QuotedName;
 	auto child_write = [&](const FieldNode &child) {
 		return CompileWrite(child, field_of(written, child.name),
 		                    stored.empty() ? string() : field_of(stored, child.name), refusal, depth + 1);
@@ -499,10 +514,21 @@ inline LogicalType ProjectedType(const FieldNode &node, const LogicalType &sourc
 			                                       path + "." + FieldName(child.first.GetIdentifierName()), mask_type)
 			                       : child.second);
 		}
+		// struct_update appends a field the struct does not have - a mask whose field left the source
+		for (auto &field : node.fields) {
+			if (!type_of(field->name) && field->masked) {
+				result.emplace_back(Identifier(field->name), mask_type(path + "." + FieldName(field->name)));
+			}
+		}
 		return LogicalType::STRUCT(std::move(result));
 	}
 	for (auto &field : node.fields) {
 		auto type = type_of(field->name);
+		if (!type && field->masked) {
+			// a mask is read whatever the source has: struct_pack builds the field from it
+			result.emplace_back(Identifier(field->name), mask_type(path + "." + FieldName(field->name)));
+			continue;
+		}
 		if (!type) {
 			continue; // the grant names a field the source no longer has: the read fails, the check says so
 		}
@@ -554,7 +580,15 @@ inline bool TypeAtPath(const LogicalType &type, const string &path, LogicalType 
 struct ColumnTrees {
 	vector<unique_ptr<FieldNode>> columns; // in the order the columns first appear
 
-	optional_ptr<FieldNode> Find(const string &name) const {
+	optional_ptr<FieldNode> Find(const string &name) {
+		for (auto &column : columns) {
+			if (StringUtil::CIEquals(column->name, name)) {
+				return column.get();
+			}
+		}
+		return nullptr;
+	}
+	optional_ptr<const FieldNode> Find(const string &name) const {
 		for (auto &column : columns) {
 			if (StringUtil::CIEquals(column->name, name)) {
 				return column.get();
@@ -606,14 +640,27 @@ struct ColumnTrees {
 	//! A column is written as it was named; only one that paths step into is quoted, where needed,
 	//! so the paths read back
 	static string RootName(const FieldNode &column) {
-		return column.fields.empty() && !column.element ? column.name : FieldName(column.name);
+		bool plain_ok = column.name.find('.') == string::npos && column.name.find('[') == string::npos &&
+		                (column.name.empty() || column.name[0] != '"');
+		return column.fields.empty() && !column.element && plain_ok ? column.name : FieldName(column.name);
 	}
 };
+
+//! COLUMNS items as the csv the grant rows store
+inline string ItemsCsv(const vector<std::pair<string, string>> &items) {
+	vector<string> parts;
+	for (auto &item : items) {
+		parts.push_back(item.second.empty() ? item.first : item.first + " = " + item.second);
+	}
+	return StringUtil::Join(parts, ", ");
+}
 
 //! True when an item list names any path (not only columns) - the fast path keeps today's behaviour
 inline bool HasFieldPaths(const vector<std::pair<string, string>> &items) {
 	for (auto &item : items) {
-		if (item.first.find('.') != string::npos || item.first.find('[') != string::npos) {
+		auto name = item.first;
+		StringUtil::Trim(name);
+		if (name.find('.') != string::npos || name.find('[') != string::npos || (!name.empty() && name[0] == '"')) {
 			return true;
 		}
 	}
@@ -646,7 +693,8 @@ inline vector<std::pair<string, string>> UniteColumnItems(const vector<std::pair
 	auto tb = ColumnTrees::From(b);
 	ColumnTrees result;
 	for (auto &column : ta.columns) {
-		result.columns.push_back(UniteNodes(column.get(), tb.Find(column->name).get(), column->name));
+		auto other = tb.Find(column->name);
+		result.columns.push_back(UniteNodes(column.get(), other ? other.get() : nullptr, column->name));
 	}
 	for (auto &column : tb.columns) {
 		if (!ta.Find(column->name)) {
