@@ -221,6 +221,8 @@ instance. Tests: issuers are fixtures under `test/idp/<x>/` read relative to the
 filesystem (an https IdP needs httpfs) and cached by location: `acl_jwks_refresh_interval` (300s), a
 re-read when a token names an unknown `kid`, and `acl_jwks_max_stale` (3600s; `0` = a failed read is
 fatal at once).
+**Spec 101**: a remote document is read WHOLE (`ReadDocumentText` sets `force_download` on its own
+connection): Entra ID compresses its GET and httpfs's ranged read refused the size mismatch.
 **Spec 071**: `acl_jwks_locations` (GLOBAL only, default `https://`) lists the prefixes every location
 the node reads keys from may start with (discovery, JWKS, a secret's `KEYS_FROM`); `..` is refused
 anywhere; a location outside it is refused where read (the node's setting binds, whatever a shared

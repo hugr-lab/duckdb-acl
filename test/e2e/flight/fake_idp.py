@@ -52,6 +52,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    # spec 101: like Microsoft Entra ID, a HEAD reports the size of the uncompressed document while the
+    # GET delivers fewer bytes - httpfs refuses that for a ranged read, so the node must read the
+    # discovery document and the JWKS whole
+    def do_HEAD(self):
+        if self.path in ("/.well-known/openid-configuration", "/jwks"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "24644")
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def do_GET(self):
         if self.path == "/.well-known/openid-configuration":
             self._json(200, {

@@ -392,6 +392,13 @@ bool PolicyStore::ReadDocumentText(const string &uri, string &out, string &error
 		return false;
 	}
 	Connection con(*db);
+	// spec 101: a document is read whole. httpfs reads in ranges sized by a HEAD, and an IdP that
+	// compresses its GET (Microsoft Entra ID: HEAD 24644 bytes, GET 1964) fails that check - so the
+	// read forces one full download, on this connection only. A local location never needs it (and its
+	// SET could autoload httpfs for nothing); a remote one without httpfs fails at the read, as before.
+	if (uri.find("://") != string::npos && !StringUtil::StartsWith(StringUtil::Lower(uri), "file://")) {
+		con.Query("SET SESSION force_download = true");
+	}
 	auto result = con.Query("SELECT content FROM read_text(" + Value(uri).ToSQLString() + ")");
 	if (result->HasError()) {
 		error = result->GetError();

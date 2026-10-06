@@ -248,5 +248,5 @@ from writers (documented in the security model's accepted risks).
 
 ## Follow-ups
 
-- Spec 101: fields of structured types per role (paths in `COLUMNS`, compiled to the masks that
+- Spec 102: fields of structured types per role (paths in `COLUMNS`, compiled to the masks that
   already work: `struct_pack` / `list_transform`).
