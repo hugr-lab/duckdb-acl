@@ -232,6 +232,70 @@ using ReadFn = std::function<unique_ptr<QueryResult>(const string &)>;
 //! property of the object rather than of whoever asks. An object this cannot be judged against (not
 //! written yet, or a source that does not bind here) is left alone; the read path still refuses a
 //! column the object does not expose.
+//! The types of the columns an object exposes (spec 102's path check): its declared projection, or
+//! the source's own columns. Empty when it does not bind here - the read path decides then.
+vector<std::pair<string, LogicalType>> ExposedTypes(CatalogBackend &catalog, const ReadFn &read, const string &vcat,
+                                                    const string &vname, const string &source) {
+	auto rows = read("SELECT \"name\", \"expr\" FROM " + catalog.Tbl("relation_columns") +
+	                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+	ResultRows rows_rows(*rows);
+	vector<string> items;
+	for (idx_t i = 0; i < rows->RowCount(); i++) {
+		auto name = rows_rows.GetValue(0, i).ToString();
+		auto expr = rows_rows.GetValue(1, i);
+		items.push_back(expr.IsNull() || expr.ToString().empty() ? acl_detail::Ident(name)
+		                                                         : expr.ToString() + " AS " + acl_detail::Ident(name));
+	}
+	vector<std::pair<string, LogicalType>> types;
+	catalog.ProbeTypes("SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " + source,
+	                   types);
+	return types;
+}
+
+//! Every step of a column's tree against its type, the fields put in the type's order; a step into
+//! anything but a STRUCT field or a LIST / ARRAY element is refused (a MAP's keys are data, a UNION's
+//! members are not fields - spec 102, decision 5)
+void OrderAndCheckFields(acl_detail::FieldNode &node, const LogicalType &type, const string &vname,
+                         const string &path) {
+	if (node.masked) {
+		return;
+	}
+	if (node.element) {
+		if (type.id() != LogicalTypeId::LIST && type.id() != LogicalTypeId::ARRAY) {
+			throw InvalidInputException("acl: the grant on \"%s\" lists \"%s[]\", but \"%s\" is %s, not a list", vname,
+			                            path, path, type.ToString());
+		}
+		auto &child = type.id() == LogicalTypeId::LIST ? ListType::GetChildType(type) : ArrayType::GetChildType(type);
+		OrderAndCheckFields(*node.element, child, vname, path + "[]");
+	}
+	if (node.fields.empty()) {
+		return;
+	}
+	if (type.id() != LogicalTypeId::STRUCT) {
+		throw InvalidInputException("acl: the grant on \"%s\" lists fields of \"%s\", which is %s - only a STRUCT's "
+		                            "fields can be named (a MAP or a UNION is shown or masked whole)",
+		                            vname, path, type.ToString());
+	}
+	vector<unique_ptr<acl_detail::FieldNode>> ordered;
+	for (auto &field : StructType::GetChildTypes(type)) {
+		for (auto &child : node.fields) {
+			if (child && StringUtil::CIEquals(child->name, field.first.GetIdentifierName())) {
+				child->name = field.first.GetIdentifierName();
+				OrderAndCheckFields(*child, field.second, vname, path + "." + acl_detail::FieldName(child->name));
+				ordered.push_back(std::move(child));
+				break;
+			}
+		}
+	}
+	for (auto &child : node.fields) {
+		if (child) {
+			throw InvalidInputException("acl: the grant on \"%s\" lists \"%s.%s\", which the type %s does not have",
+			                            vname, path, child->name, type.ToString());
+		}
+	}
+	node.fields = std::move(ordered);
+}
+
 string NormaliseGrantColumns(CatalogBackend &catalog, const ReadFn &read, const string &vcat, const string &vname,
                              const string &columns) {
 	if (columns.empty()) {
@@ -263,10 +327,11 @@ string NormaliseGrantColumns(CatalogBackend &catalog, const ReadFn &read, const 
 		return columns;
 	}
 	auto listed = acl_detail::ParseColumnList(columns);
-	for (auto &column : listed) {
+	auto trees = acl_detail::ColumnTrees::From(listed);
+	for (auto &column : trees.columns) {
 		bool found = false;
 		for (auto &name : exposed) {
-			if (StringUtil::CIEquals(name, column.first)) {
+			if (StringUtil::CIEquals(name, column->name)) {
 				found = true;
 				break;
 			}
@@ -275,17 +340,32 @@ string NormaliseGrantColumns(CatalogBackend &catalog, const ReadFn &read, const 
 			throw InvalidInputException(
 			    "acl: the grant on \"%s\" lists \"%s\", which the object does not have - a grant may hide or mask a "
 			    "column, but naming, computing and ordering belong to the virtual catalog (spec 037)",
-			    vname, column.first);
+			    vname, column->name);
+		}
+	}
+	// spec 102: a path is checked against the column's type where the grant is written - every step a
+	// field of a STRUCT or `[]` of a LIST / ARRAY - and its fields are put in the source's order
+	if (acl_detail::HasFieldPaths(listed)) {
+		auto types = ExposedTypes(catalog, read, vcat, vname, source);
+		for (auto &column : trees.columns) {
+			for (auto &type : types) {
+				if (StringUtil::CIEquals(type.first, column->name)) {
+					OrderAndCheckFields(*column, type.second, vname, column->name);
+					break;
+				}
+			}
 		}
 	}
 	vector<string> parts;
 	for (auto &name : exposed) {
-		for (auto &column : listed) {
-			if (!StringUtil::CIEquals(name, column.first)) {
-				continue;
-			}
-			parts.push_back(column.second.empty() ? column.first : column.first + " = " + column.second);
-			break;
+		auto column = trees.Find(name);
+		if (!column) {
+			continue;
+		}
+		vector<std::pair<string, string>> items;
+		acl_detail::SerializeNode(*column, acl_detail::ColumnTrees::RootName(*column), items);
+		for (auto &item : items) {
+			parts.push_back(item.second.empty() ? item.first : item.first + " = " + item.second);
 		}
 	}
 	return StringUtil::Join(parts, ", ");
@@ -359,6 +439,59 @@ namespace {
 
 //! A virtual object may not take a metadata surface's name: the surface wins when the name is
 //! written, so the object would be listed and unreachable (spec 010 part 3).
+//! spec 102: a declared COLUMNS list may name fields (`address.city`): each such column becomes the
+//! expression that reads only them, checked against the source's type where it is written and in the
+//! source's field order. The relation is then the read-only projection form (writes through a
+//! narrowed column come later, spec 102 part B). Untouched when no entry is a path.
+bool CompileDeclaredPaths(CatalogBackend &catalog, const string &phys, const string &vname,
+                          vector<std::pair<string, string>> &columns) {
+	vector<std::pair<string, string>> paths;
+	for (auto &column : columns) {
+		if (column.second.empty() && acl_detail::HasFieldPaths({column})) {
+			paths.push_back(column);
+		}
+	}
+	if (paths.empty()) {
+		return false;
+	}
+	auto trees = acl_detail::ColumnTrees::From(paths);
+	vector<std::pair<string, LogicalType>> types;
+	if (!phys.empty()) {
+		catalog.ProbeTypes("SELECT * FROM " + phys, types);
+	}
+	for (auto &column : trees.columns) {
+		for (auto &type : types) {
+			if (StringUtil::CIEquals(type.first, column->name)) {
+				OrderAndCheckFields(*column, type.second, vname, column->name);
+				break;
+			}
+		}
+	}
+	vector<std::pair<string, string>> compiled;
+	for (auto &column : columns) {
+		acl_detail::FieldPath path;
+		string error;
+		if (!column.second.empty() || !acl_detail::ParseFieldPath(column.first, path, error) || path.IsColumn()) {
+			compiled.push_back(column);
+			continue;
+		}
+		bool seen = false;
+		for (auto &entry : compiled) {
+			if (StringUtil::CIEquals(entry.first, path.head)) {
+				seen = true;
+				break;
+			}
+		}
+		if (seen) {
+			continue; // the column's tree was emitted at its first path
+		}
+		auto tree = trees.Find(path.head);
+		compiled.emplace_back(path.head, acl_detail::CompileNode(*tree, acl_detail::Ident(path.head)));
+	}
+	columns = std::move(compiled);
+	return true;
+}
+
 void RequireNotReserved(const string &vname) {
 	if (MetadataSurfaceOf(vname)) {
 		throw BinderException("acl admin: \"%s\" is a metadata surface, so it cannot name a virtual object - a "
@@ -369,12 +502,17 @@ void RequireNotReserved(const string &vname) {
 
 } // namespace
 
-void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form, const string &phys,
+void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form_p, const string &phys,
                                      const string &view_sql, const string &rls,
-                                     const vector<std::pair<string, string>> &columns, const string &returns,
+                                     const vector<std::pair<string, string>> &columns_p, const string &returns,
                                      const string &pk, const case_insensitive_map_t<int8_t> &nullable_marks) {
 	RequireCatalog(catalog, "acl_add_relation");
 	RequireNotReserved(vname);
+	auto columns = columns_p;
+	auto form = form_p;
+	if (CompileDeclaredPaths(*catalog, phys, vname, columns)) {
+		form = "subquery";
+	}
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto existing = read("SELECT \"comment\", \"alias_types\", \"enum_types\" FROM " + catalog->Tbl("relations") +
 		                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
@@ -1912,6 +2050,7 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		case_insensitive_map_t<int8_t> kept_marks = nullable_marks;
 		if (field == "columns") {
 			new_columns = columns;
+			CompileDeclaredPaths(*catalog, new_phys, vname, new_columns);
 		} else { // keep the current projection - and its nullability marks - when another property is set
 			auto rows = read("SELECT \"name\", \"expr\", \"nullable\" FROM " + catalog->Tbl("relation_columns") +
 			                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");

@@ -200,17 +200,19 @@ string CatalogBackend::ProjectionSchema(const string &source, const string &colu
 		*checked = false;
 	}
 	vector<string> items;
-	for (auto &column : ParseColumnList(column_csv)) {
+	// spec 102: items are grouped by column first, so a path into one compiles to what the role reads
+	for (auto &column : ColumnTrees::From(ParseColumnList(column_csv)).columns) {
 		// the alias is an identifier and the bare source is one too - quoted, or a column whose name
 		// is not a bare word could never be granted at all, since the probe would not parse
-		if (!column.second.empty()) {
-			items.push_back(column.second + " AS " + Ident(column.first)); // the grant masks it
+		if (column->masked) {
+			items.push_back(column->mask + " AS " + Ident(column->name)); // the grant masks it
 			continue;
 		}
-		auto object = own.find(column.first);
+		auto object = own.find(column->name);
 		// a bare name is the object's column, which its own projection may have renamed
-		items.push_back((object != own.end() && !object->second.empty() ? object->second : Ident(column.first)) +
-		                " AS " + Ident(column.first));
+		auto source = object != own.end() && !object->second.empty() ? object->second : Ident(column->name);
+		auto read = column->Plain() ? source : CompileNode(*column, "(" + source + ")");
+		items.push_back(read + " AS " + Ident(column->name));
 	}
 	if (items.empty()) {
 		return string();

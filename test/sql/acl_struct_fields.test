@@ -1,0 +1,230 @@
+# name: test/sql/acl_struct_fields.test
+# description: fields of structured types per role (spec 102, part A: reads) - a COLUMNS item may be a
+#   path into a STRUCT and through a list of structs; levels intersect and roles unite field trees; the
+#   read, every listing and the DDL a quack client binds agree; a hidden field reaches nothing.
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.c(id INTEGER, region VARCHAR,
+    address STRUCT(city VARCHAR, ssn VARCHAR, zip VARCHAR, geo STRUCT(lat INTEGER, lon INTEGER)),
+    items STRUCT(price INTEGER, cost INTEGER)[], tags MAP(VARCHAR, VARCHAR));
+
+statement ok
+INSERT INTO phys.main.c VALUES
+    (1, 'eu', {'city': 'Berlin', 'ssn': 'S1', 'zip': '10115', 'geo': {'lat': 52, 'lon': 13}}, [{'price': 10, 'cost': 7}], MAP {'k': 'v'}),
+    (2, 'us', NULL, NULL, NULL);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('test/idp/rs', '{"url": "test/idp/rs", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"]}}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.c AS c.c;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN;
+
+# --- one role: paths keep fields, a NULL struct stays NULL, a list keeps its shape ---------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, items[].price, address.geo.lat, address.city);
+
+# stored in the object's column order and the source's field order
+query I
+SELECT columns FROM store.acl.role_object_caps WHERE role = 'analyst';
+----
+id, address.city, address.geo.lat, items[].price
+
+query III
+ACL ROLE "analyst" SELECT id, address, items FROM c ORDER BY id;
+----
+1	{'city': Berlin, 'geo': {'lat': 52}}	[{'price': 10}]
+2	NULL	NULL
+
+query I
+ACL ROLE "analyst" SELECT typeof(address) FROM c LIMIT 1;
+----
+STRUCT(city VARCHAR, geo STRUCT(lat INTEGER))
+
+# a hidden field reaches nothing: not the whole row as a value, not struct_extract
+query I
+ACL ROLE "analyst" SELECT count(*) FROM c AS x WHERE x::VARCHAR LIKE '%S1%' OR x::VARCHAR LIKE '%10115%' OR x::VARCHAR LIKE '%cost%';
+----
+0
+
+statement error
+ACL ROLE "analyst" SELECT address.ssn FROM c;
+----
+<REGEX>:.*ssn.*
+
+# every listing and the DDL describe what the role reads
+query II
+ACL ROLE "analyst" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'c' ORDER BY column_name;
+----
+address	STRUCT(city VARCHAR, geo STRUCT(lat INTEGER))
+id	INTEGER
+items	STRUCT(price INTEGER)[]
+
+query I
+ACL ROLE "analyst" SELECT sql FROM duckdb_tables() WHERE table_name = 'c';
+----
+CREATE TABLE "c"("id" INTEGER, "address" STRUCT(city VARCHAR, geo STRUCT(lat INTEGER)), "items" STRUCT(price INTEGER)[]);
+
+query II
+ACL ROLE "analyst" SELECT column_name, column_type FROM (DESCRIBE c) WHERE column_name = 'address';
+----
+address	STRUCT(city VARCHAR, geo STRUCT(lat INTEGER))
+
+# --- the whole struct with one field masked --------------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE auditor COLUMNS (id, address, address.ssn = '***');
+
+query II
+ACL ROLE "auditor" SELECT id, address FROM c ORDER BY id;
+----
+1	{'city': Berlin, 'ssn': ***, 'zip': 10115, 'geo': {'lat': 52, 'lon': 13}}
+2	NULL
+
+# --- two roles unite their fields, and the listing says the union --------------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE auditor COLUMNS (id, address.zip, address.ssn = '***');
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address.city);
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT typeof(address), address FROM c WHERE id = 1;
+----
+STRUCT(city VARCHAR, ssn VARCHAR, zip VARCHAR)	{'city': Berlin, 'ssn': ***, 'zip': 10115}
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT data_type FROM information_schema.columns WHERE table_name = 'c' AND column_name = 'address';
+----
+STRUCT(city VARCHAR, ssn VARCHAR, zip VARCHAR)
+
+# --- levels: an object grant narrows the catalog's, never re-exposes ----------------------------------
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) COLUMNS (id, address.city, address.zip) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address);
+
+query I
+ACL ROLE "analyst" SELECT address FROM c WHERE id = 1;
+----
+{'city': Berlin, 'zip': 10115}
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+# --- what a path may name: checked where the grant is written --------------------------------------------
+
+statement error
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address.nope);
+----
+<REGEX>:.*lists "address.nope", which the type STRUCT.* does not have.*
+
+statement error
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, region.x);
+----
+<REGEX>:.*lists fields of "region", which is VARCHAR - only a STRUCT's fields can be named.*
+
+statement error
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, tags.k);
+----
+<REGEX>:.*lists fields of "tags", which is MAP.*
+
+statement error
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address[].city);
+----
+<REGEX>:.*lists "address\[\]", but "address" is STRUCT.*not a list.*
+
+statement error
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address.city || 'x');
+----
+<REGEX>:.*lists "address.city \|\| 'x'", which the object does not have.*
+
+# two roles masking one field differently: refused, never picked
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address.ssn = 'xx');
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT address FROM c;
+----
+<REGEX>:.*mask column "address.ssn" differently.*
+
+# --- the object's own COLUMNS may name fields too ------------------------------------------------------
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.c AS c.o COLUMNS (id, address.geo.lat, address.city);
+
+statement ok
+ACL ADMIN GRANT TABLE c.o TO ROLE auditor COLUMNS (id, address.city);
+
+query II
+ACL ROLE "auditor" SELECT id, address FROM o ORDER BY id;
+----
+1	{'city': Berlin}
+2	NULL
+
+query II
+ACL ROLE "auditor" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'o' ORDER BY column_name;
+----
+address	STRUCT(city VARCHAR)
+id	INTEGER
+
+# --- the catalog check reads a path by its column, then binds it -----------------------------------------
+
+statement ok
+ALTER TABLE phys.main.c DROP COLUMN items;
+
+statement ok
+ALTER TABLE phys.main.c ADD COLUMN items STRUCT(cost INTEGER)[];
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE auditor COLUMNS (id, items[].cost);
+
+statement ok
+UPDATE phys.main.c SET items = NULL;
+
+statement ok
+ALTER TABLE phys.main.c DROP COLUMN items;
+
+statement ok
+ALTER TABLE phys.main.c ADD COLUMN items STRUCT(price INTEGER)[];
+
+query II
+SELECT object, problem FROM acl_check_catalog('c') WHERE role = 'auditor' AND problem = 'grant_column_missing';
+----
+c	grant_column_missing

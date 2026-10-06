@@ -3,6 +3,8 @@
 
 #include "acl_types.hpp"
 
+#include "acl_policy_catalog.hpp"
+
 #include "acl_result_rows.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/main/connection.hpp"
@@ -78,6 +80,94 @@ void ExposedTypeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		}
 		answered[key] = answer;
 		result.SetValue(row, Value(answer));
+	}
+}
+
+//! The node of `tree` at `path` (`""`, `.city`, `.items[]`), or nothing
+optional_ptr<const acl_detail::FieldNode> NodeAt(const acl_detail::FieldNode &tree, const string &path) {
+	acl_detail::FieldPath parsed;
+	string error;
+	if (!acl_detail::ParseFieldPath("x" + path, parsed, error)) {
+		return nullptr;
+	}
+	optional_ptr<const acl_detail::FieldNode> node = &tree;
+	for (auto &step : parsed.steps) {
+		if (step.empty()) {
+			node = node->element.get();
+		} else {
+			node = node->Find(step).get();
+		}
+		if (!node) {
+			return nullptr;
+		}
+	}
+	return node;
+}
+
+//! acl_listed_type(source_type, column, roles) - spec 102: the type a principal reads of one column,
+//! computed as the read path computes it. `roles` is one STRUCT(cat, obj, probed) per role, in the
+//! order the resolver unites them (role name): the role's catalog and object column lists, and the
+//! type its own projection was probed to (spec 026) - where a mask's type comes from.
+void ListedTypeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto source_text = args.data[0].GetValue(row);
+		auto column = args.data[1].GetValue(row);
+		auto roles = args.data[2].GetValue(row);
+		if (source_text.IsNull() || column.IsNull() || roles.IsNull()) {
+			result.SetValue(row, source_text);
+			continue;
+		}
+		try {
+			auto source = TransformStringToLogicalType(source_text.ToString(), context);
+			auto name = column.ToString();
+			acl_detail::GrantUnion grants;
+			vector<std::pair<unique_ptr<acl_detail::FieldNode>, string>> own; // each role's tree, its probe
+			for (auto &role : ListValue::GetChildren(roles)) {
+				auto &fields = StructValue::GetChildren(role);
+				auto text = [&](idx_t i) {
+					return fields[i].IsNull() ? string() : fields[i].ToString();
+				};
+				acl_detail::GrantPolicy policy;
+				policy.Narrow(string(), text(0));
+				policy.Narrow(string(), text(1));
+				grants.Add(policy);
+				auto trees = acl_detail::ColumnTrees::From(policy.columns);
+				auto node = trees.Find(name);
+				own.emplace_back(node ? node->Clone() : nullptr, text(2));
+			}
+			if (!grants.Restricts()) {
+				result.SetValue(row, source_text);
+				continue;
+			}
+			auto united = acl_detail::ColumnTrees::From(grants.columns);
+			auto node = united.Find(name);
+			if (!node) {
+				result.SetValue(row, Value());
+				continue;
+			}
+			auto mask_type = [&](const string &path) -> LogicalType {
+				for (auto &entry : own) {
+					auto at = entry.first ? NodeAt(*entry.first, path) : nullptr;
+					if (at && at->masked && !entry.second.empty()) {
+						LogicalType probed;
+						if (acl_detail::TypeAtPath(TransformStringToLogicalType(entry.second, context), path, probed)) {
+							return probed;
+						}
+					}
+				}
+				return LogicalType::SQLNULL;
+			};
+			auto type = acl_detail::ProjectedType(*node, source, string(), mask_type);
+			result.SetValue(row, Value(type.ToString()));
+		} catch (std::exception &ex) {
+			ErrorData error(ex);
+			if (error.Type() == ExceptionType::INTERRUPT || error.Type() == ExceptionType::FATAL ||
+			    error.Type() == ExceptionType::INTERNAL) {
+				throw;
+			}
+			result.SetValue(row, source_text); // a list that does not parse is the read's to refuse
+		}
 	}
 }
 
@@ -201,6 +291,14 @@ void RegisterAclTypes(ExtensionLoader &loader, const shared_ptr<PolicyStore> &st
 	MarkAclScalar(function, store);
 	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(function);
+	auto role_type = LogicalType::LIST(LogicalType::STRUCT({{Identifier("cat"), LogicalType::VARCHAR},
+	                                                        {Identifier("obj"), LogicalType::VARCHAR},
+	                                                        {Identifier("probed"), LogicalType::VARCHAR}}));
+	ScalarFunction listed(Identifier("acl_listed_type"), {LogicalType::VARCHAR, LogicalType::VARCHAR, role_type},
+	                      LogicalType::VARCHAR, ListedTypeFunc);
+	MarkAclScalar(listed, store);
+	listed.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	loader.RegisterFunction(listed);
 }
 
 } // namespace acl

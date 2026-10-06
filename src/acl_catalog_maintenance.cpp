@@ -10,6 +10,7 @@
 
 #include "acl_door_common.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_field_paths.hpp"
 #include "acl_types.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -514,6 +515,33 @@ private:
 			return;
 		}
 		for (auto &item : items) {
+			// spec 102: a path is judged by its column, then by binding it - a field the column no longer
+			// has does not bind (struct_extract), which is the bare path's or the mask's finding
+			acl_detail::FieldPath path;
+			string path_error;
+			if (acl_detail::ParseFieldPath(item.first, path, path_error) && !path.IsColumn() &&
+			    exposed.count(path.head)) {
+				Columns derived;
+				auto failed = catalog.ProjectionSchema(
+				    relation.Source(), item.second.empty() ? item.first : item.first + " = " + item.second,
+				    relation.own, derived, nullptr);
+				if (failed.empty()) {
+					if (matched) {
+						matched->insert(item.first);
+					}
+				} else if (item.second.empty() && object_grant) {
+					Add("grant", relation.vname, role, "grant_column_missing",
+					    "the COLUMNS path \"" + item.first + "\" does not bind over \"" + Named(relation.vname) +
+					        "\" (" + FirstLine(failed) + ") - the role's reads of it refuse",
+					    repair);
+				} else if (!item.second.empty()) {
+					Add("grant", relation.vname, role, "mask_broken",
+					    "the mask \"" + item.first + " = " + item.second + "\" does not bind over \"" +
+					        Named(relation.vname) + "\": " + FirstLine(failed),
+					    repair);
+				}
+				continue;
+			}
 			if (item.second.empty()) {
 				if (exposed.count(item.first)) {
 					if (matched) {
