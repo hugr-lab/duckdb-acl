@@ -137,6 +137,10 @@ struct TablePolicy {
 	//! the table's full width and never by name, while a client counts the columns spec 035 published
 	//! - so the list has to be supplied, or the client is counting columns it was never shown.
 	vector<string> write_order;
+	//! spec 102 part B: columns a grant narrows to some of their fields, still written through -
+	//! physical column -> the COLUMNS items of its tree (rooted at that name). A write keeps the hidden
+	//! fields, assigns the masked ones and refuses a hidden field in the written value.
+	vector<std::pair<string, string>> field_writes;
 	//! spec 099: source columns read as another type - physical column name -> the exposed type's
 	//! spelling (an extension alias as its base type, an ENUM as VARCHAR). Cast where the source is
 	//! read, so a mask, a predicate and the listing all see the exposed type; writes keep `phys`.

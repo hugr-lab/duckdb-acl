@@ -229,6 +229,23 @@ mode of default-deny is a refusal, and the refusal names the function.
     (`types_incompatible`, e.g. `enum_code(...)`) or that makes a type of its own
     (`types_mismatch`).
 
+### Fields of structured columns (spec 102)
+
+- A grant may narrow a `STRUCT` column to some of its fields, through lists of structs too, and mask
+  single fields. A hidden field is absent from the projection, so nothing that reads the relation
+  reaches it: `SELECT *`, the row as a value, `struct_extract`, `DESCRIBE`, the listings, the DDL a
+  quack client binds, the Arrow schema.
+- A path is parsed, never spliced: every step is a name, emitted quoted inside `struct_extract`.
+  Only the part after `=` is an expression, as with a column mask.
+- **Writes keep what the role cannot see.**
+  - A hidden field is kept (`UPDATE`) or left NULL (`INSERT`).
+  - A masked field is assigned.
+  - A written value that carries a hidden field is refused with an `error()`. The message names no
+    field, so it is no oracle for field names.
+  - `RETURNING` refuses a narrowed column: the stored struct still holds the hidden fields.
+- A predicate reads the physical row, hidden fields included (`address.country =
+  acl_claim('country')`). A hidden column works the same way.
+
 ### Statements (`AclRewriter::RewriteStatement`, `src/acl_rewriter.cpp`)
 
 | statement type | under a principal |

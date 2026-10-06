@@ -1,6 +1,6 @@
 # Spec 102: fields of structured types per role
 
-- **Status**: accepted (owner, 2026-10-06; decisions at the end)
+- **Status**: implemented (2026-10-07; accepted by the owner 2026-10-06, decisions at the end)
 - **Date**: 2026-10-06
 - **Follows**: spec 099 (types under the ACL, its follow-up), spec 011 (grant levels and the union of
   roles), spec 026 (a grant's projection is probed where it is written), spec 037/038 (a grant hides
@@ -126,11 +126,14 @@ hidden column today.
 
 ### 7. The object's own COLUMNS list
 
-The same syntax in an object's declaration (`ADD TABLE … COLUMNS (id, address.city)`) is sugar for the
-expression the operator could write today (`address = struct_pack(...)`), and it makes the
-relation's other columns keep their writability (decision 4). The parser is shared. A declared list
-whose only non-rename entries are paths stays in the writable alias form, and its narrowed columns
-are written through section 4's wrapper.
+The same syntax in an object's declaration (`ADD TABLE … COLUMNS (id, address.city)`) is compiled
+where the object is written, checked against the source's type (decision 4): the column becomes
+the expression that reads only those fields (`CompileDeclaredPaths`), and the object is the
+projection form. **As built, a column narrowed by the object's own list is read-only.** The write
+path rebuilds a tree from the grant, and the object stores the compiled expression, so writes go
+through a narrowing that a grant states over a plain alias object. Keeping the object's paths as
+paths (and teaching the listings, the drift check and the probes to read them) is a follow-up, if an
+operator needs to write through an object-declared narrowing.
 
 ### 8. The catalog check
 
@@ -138,6 +141,40 @@ are written through section 4's wrapper.
 - `grant_column_missing` - a path whose field the source no longer has, on a bare path;
 - `mask_broken` - a field mask that names a missing field, or does not bind (`types_incompatible` if it
   binds only before spec 099's casts).
+
+### 9. As built (2026-10-07)
+
+- `acl_field_paths.hpp` (header-only, `test/cpp/test_acl_field_paths.cpp`):
+  - `ParseFieldPath` and the per-column `FieldNode` tree;
+  - `IntersectNodes` (levels) and `UniteNodes` (roles);
+  - `CompileNode` (read) and `CompileWrite` (write);
+  - `ProjectedType` (what a listing describes).
+- `GrantPolicy::Narrow` and `GrantUnion::Add` take the tree path only when a list holds a path, so
+  today's column lists behave exactly as before. A name without `.` / `[`, or one that does not read
+  as a path, is a column whatever it holds (`odd name`, `od'd`). The object's check then names a
+  wrong one (spec 037's message).
+- `ApplyGrantPolicy` reads a narrowed column through the compiled tree, over its physical source.
+  A writable narrowed column goes to `TablePolicy::field_writes`. A tree with a `[]` step is not
+  writable.
+- The rewriter folds a narrowed column in four places:
+  - an UPDATE's SET and a MERGE's update branch: `struct_update` of the stored value;
+  - an INSERT's projection and a MERGE's insert branch: `struct_pack`;
+  - a drained stream, by position.
+- RETURNING refuses a narrowed column: the stored struct carries the hidden fields.
+- Listings: the type of a column a grant projects is `acl_listed_type(source_type, column,
+  roles)`. It folds the roles' catalog/object lists and unites them as the resolver does, then
+  applies the tree to the source's (exposed, spec 099) type; a mask's type comes from its role's
+  probe. Two roles narrowing one struct differently are described as the union they read. Before,
+  the listing took one role's probed type, which was also the pre-existing behaviour for two roles
+  masking one column with different result types.
+- The fields of a union come in the order the roles' lists merge (role name order, each role's
+  fields in the source's order). The description and the data agree on it.
+- A written value is read once per field it feeds (the written expression is substituted per
+  field). A volatile expression (`random()`) evaluates per field.
+- A visible field the written value lacks is duckdb's own binder error (`Could not find key "zip"`).
+  It names the role's own field, never a hidden one.
+- `acl_check_catalog`: a path that no longer binds is `grant_column_missing` (bare) or `mask_broken`
+  (masked).
 
 ## Enforcement & security
 

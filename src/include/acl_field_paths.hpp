@@ -392,6 +392,75 @@ inline string CompileNode(const FieldNode &node, const string &value, idx_t dept
 	return "CASE WHEN " + value + " IS NULL THEN NULL ELSE struct_pack(" + StringUtil::Join(packed, ", ") + ") END";
 }
 
+//! Whether a tree steps into list elements anywhere - such a column is not written through: the
+//! written list's elements cannot be matched to the stored ones (spec 102, decision 3)
+inline bool HasElementStep(const FieldNode &node) {
+	if (node.element) {
+		return true;
+	}
+	for (auto &child : node.fields) {
+		if (HasElementStep(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! spec 102 part B: the value a principal's write puts into a narrowed column. `written` is what the
+//! statement supplies, `stored` the column's current value (empty for an INSERT). A field the role
+//! sees takes the written value, a hidden field keeps the stored one (an INSERT leaves it NULL - duckdb
+//! fills a missing field by name), a masked field takes the mask, and a written value that carries a
+//! field the role cannot see is refused - never silently dropped. `refusal` is the error's message.
+inline string CompileWrite(const FieldNode &node, const string &written, const string &stored, const string &refusal,
+                           idx_t depth = 0) {
+	if (node.masked) {
+		return node.mask;
+	}
+	auto field_of = [](const string &value, const string &name) {
+		return "struct_extract(" + value + ", '" + StringUtil::Replace(name, "'", "''") + "')";
+	};
+	auto quoted = [](const string &name) {
+		return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+	};
+	auto child_write = [&](const FieldNode &child) {
+		return CompileWrite(child, field_of(written, child.name),
+		                    stored.empty() ? string() : field_of(stored, child.name), refusal, depth + 1);
+	};
+	if (node.whole) {
+		if (node.fields.empty()) {
+			return written;
+		}
+		// the whole is the role's: what it writes stands, except the masked fields, which the grant assigns
+		vector<string> updates;
+		for (auto &child : node.fields) {
+			updates.push_back(quoted(child->name) + " := " + child_write(*child));
+		}
+		return "CASE WHEN " + written + " IS NULL THEN NULL ELSE struct_update(" + written + ", " +
+		       StringUtil::Join(updates, ", ") + ") END";
+	}
+	vector<string> visible;
+	vector<string> fields;
+	for (auto &child : node.fields) {
+		visible.push_back("'" + StringUtil::Replace(StringUtil::Lower(child->name), "'", "''") + "'");
+		fields.push_back(quoted(child->name) + " := " + child_write(*child));
+	}
+	auto key = "__acl_k" + std::to_string(depth);
+	auto foreign = "len(list_filter(struct_keys(" + written + "), lambda " + key + ": lower(" + key + ") NOT IN (" +
+	               StringUtil::Join(visible, ", ") + "))) > 0";
+	auto refuse = "error('" + StringUtil::Replace(refusal, "'", "''") + "')";
+	string value;
+	if (stored.empty()) {
+		value =
+		    "CASE WHEN " + written + " IS NULL THEN NULL ELSE struct_pack(" + StringUtil::Join(fields, ", ") + ") END";
+	} else {
+		// a NULL stored struct has no hidden fields to keep: the written fields are the struct
+		auto fresh = CompileWrite(node, written, string(), refusal, depth);
+		value = "CASE WHEN " + stored + " IS NULL THEN " + fresh + " ELSE struct_update(" + stored + ", " +
+		        StringUtil::Join(fields, ", ") + ") END";
+	}
+	return "CASE WHEN " + foreign + " THEN " + refuse + " ELSE " + value + " END";
+}
+
 //! The type CompileNode's expression has over a value of type `source` - what a listing must say the
 //! role reads. `mask_type(path)` answers a masked position's type (a mask's type is the probe's).
 //! Mirrors duckdb: struct_pack builds a STRUCT in the listed order, struct_update replaces a field in

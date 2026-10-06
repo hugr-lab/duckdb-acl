@@ -531,6 +531,39 @@ is applied to an `UPDATE`'s `SET`.
 
 There is no `REVOKE` for an object grant; write it again with `CAPS '{}'`, or revoke the catalog.
 
+### Fields of a structured column (spec 102)
+
+A `COLUMNS` item may name **fields** of a `STRUCT` column, at any depth, and through a list of
+structs. The same items work in a catalog grant, an object grant, and an object's own `COLUMNS`.
+
+| item | the role reads |
+| --- | --- |
+| `address.city, address.zip` | `STRUCT(city, zip)`: only those fields (a NULL struct stays NULL) |
+| `address.geo.lat` | `STRUCT(geo STRUCT(lat))` |
+| `address, address.ssn = '***'` | the whole struct with `ssn` masked |
+| `items[].price` | `LIST(STRUCT(price))`: every element narrowed |
+
+```sql
+ACL ADMIN GRANT TABLE c.customers TO ROLE support COLUMNS (id, address.city, address.zip, orders[].total);
+ACL ADMIN GRANT TABLE c.customers TO ROLE audit  COLUMNS (id, address, address.tax_id = '***');
+```
+
+- **Checked where it is written.** Every step is checked against the column's type and must be a
+  STRUCT field or `[]` of a list. A path into a `MAP` or a `UNION` is refused: those are shown or
+  masked whole. The fields are stored in the source's order.
+- **Levels and roles.** Levels narrow: an object grant never re-exposes a field the catalog grant
+  dropped. A principal's roles unite: `{city}` and `{zip}` read `{city, zip}`, a visible field beats a
+  masked one, and two different masks on one field are refused. Every listing, `DESCRIBE`, the DDL a
+  quack client binds, and the Arrow schema describe what is read.
+- **Writes.** A column a grant narrows stays writable, and a write touches only what the role sees:
+  - an `UPDATE`/`MERGE` keeps the stored values of the hidden fields;
+  - an `INSERT` leaves them NULL;
+  - a masked field is assigned (like a column mask);
+  - a written value that carries a field the role cannot see is refused.
+
+  `RETURNING` cannot read the column. A column narrowed through `[]`, or by the object's own
+  `COLUMNS`, is read-only.
+
 ```sql
 ACL ADMIN GRANT TABLE c.orders TO ROLE narrow WITH (select, update, delete, merge) RLS (tenant = acl_claim('tenant'));
 ACL ADMIN GRANT TABLE sales.orders TO ROLE analyst WITH (select) RLS (amount > 50) COLUMNS (id, amount);

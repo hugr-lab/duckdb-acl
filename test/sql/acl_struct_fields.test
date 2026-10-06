@@ -228,3 +228,94 @@ query II
 SELECT object, problem FROM acl_check_catalog('c') WHERE role = 'auditor' AND problem = 'grant_column_missing';
 ----
 c	grant_column_missing
+
+# --- part B: writes through a narrowed column ----------------------------------------------------------
+# A field the role sees takes the written value, a hidden field keeps what is stored, a masked field
+# is assigned, a hidden field in the written value is refused; a list-element narrowing is read-only.
+
+statement ok
+CREATE TABLE phys.main.w(id INTEGER, address STRUCT(city VARCHAR, ssn VARCHAR, zip VARCHAR, tenant VARCHAR),
+    items STRUCT(price INTEGER, cost INTEGER)[]);
+
+statement ok
+INSERT INTO phys.main.w VALUES (1, {'city': 'A', 'ssn': 'S1', 'zip': 'Z1', 'tenant': 'acme'}, [{'price': 1, 'cost': 9}]), (2, NULL, NULL);
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.w AS c.w;
+
+statement ok
+ACL ADMIN CREATE ROLE writer;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE writer WITH (select, insert, update, merge) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.w TO ROLE writer COLUMNS (id, address.city, address.zip, address.tenant = 'acme', items[].price);
+
+statement ok
+ACL ROLE "writer" UPDATE w SET address = {'city': 'B', 'zip': 'Z9', 'tenant': 'evil'} WHERE id = 1;
+
+query I
+SELECT address FROM phys.main.w WHERE id = 1;
+----
+{'city': B, 'ssn': S1, 'zip': Z9, 'tenant': acme}
+
+# a NULL stored struct: the written fields make it
+statement ok
+ACL ROLE "writer" UPDATE w SET address = {'city': 'D', 'zip': 'Z2'} WHERE id = 2;
+
+query I
+SELECT address FROM phys.main.w WHERE id = 2;
+----
+{'city': D, 'ssn': NULL, 'zip': Z2, 'tenant': acme}
+
+statement ok
+ACL ROLE "writer" INSERT INTO w(id, address) VALUES (3, {'city': 'E', 'zip': 'Z3'});
+
+query I
+SELECT address FROM phys.main.w WHERE id = 3;
+----
+{'city': E, 'ssn': NULL, 'zip': Z3, 'tenant': acme}
+
+statement ok
+ACL ROLE "writer" MERGE INTO w USING (SELECT 1 AS k, {'city': 'M', 'zip': 'ZM'} AS a UNION ALL SELECT 5, {'city': 'N', 'zip': 'ZN'}) s ON w.id = s.k WHEN MATCHED THEN UPDATE SET address = s.a WHEN NOT MATCHED THEN INSERT (id, address) VALUES (s.k, s.a);
+
+query II
+SELECT id, address FROM phys.main.w WHERE id IN (1, 5) ORDER BY id;
+----
+1	{'city': M, 'ssn': S1, 'zip': ZM, 'tenant': acme}
+5	{'city': N, 'ssn': NULL, 'zip': ZN, 'tenant': acme}
+
+# a hidden field in the written value is refused, never dropped - and the refusal names no hidden field
+statement error
+ACL ROLE "writer" UPDATE w SET address = {'city': 'C', 'ssn': 'hack', 'zip': 'Z'} WHERE id = 1;
+----
+<REGEX>:^Invalid Input Error: acl_rewrite: the value written to "address" of "w" carries a field this role cannot write\s*$
+
+statement error
+ACL ROLE "writer" INSERT INTO w(id, address) VALUES (4, {'city': 'F', 'zip': 'Z4', 'ssn': 'x'});
+----
+<REGEX>:.*carries a field this role cannot write.*
+
+query I
+SELECT address.ssn FROM phys.main.w WHERE id = 1;
+----
+S1
+
+# a list narrowed through its elements is read-only; the struct is not readable back through RETURNING
+statement error
+ACL ROLE "writer" UPDATE w SET items = [{'price': 5}] WHERE id = 1;
+----
+<REGEX>:.*column "items" of "w" is not writable.*
+
+statement error
+ACL ROLE "writer" UPDATE w SET address = {'city': 'G', 'zip': 'Z'} WHERE id = 1 RETURNING address;
+----
+<REGEX>:.*column "address" of "w" is not readable.*
+
+# the role reads back what it wrote, and never the hidden field
+query II
+ACL ROLE "writer" SELECT id, address FROM w WHERE id IN (1, 3) ORDER BY id;
+----
+1	{'city': M, 'zip': ZM, 'tenant': acme}
+3	{'city': E, 'zip': Z3, 'tenant': acme}

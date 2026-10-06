@@ -610,6 +610,23 @@ struct ListedColumn {
 	string mask;                // masked whole
 	unique_ptr<FieldNode> tree; // narrowed: the fields the role reads (and masks within them)
 
+	//! A narrowed column is written through unless its tree steps into list elements (spec 102)
+	bool Writable() const {
+		return !tree || !HasElementStep(*tree);
+	}
+	//! The tree as COLUMNS items rooted at `root` - what a write rebuilds it from
+	string TreeItems(const string &root) const {
+		vector<std::pair<string, string>> items;
+		auto copy = tree->Clone();
+		copy->name = root;
+		SerializeNode(*copy, ColumnTrees::RootName(*copy), items);
+		vector<string> parts;
+		for (auto &item : items) {
+			parts.push_back(item.second.empty() ? item.first : item.first + " = " + item.second);
+		}
+		return StringUtil::Join(parts, ", ");
+	}
+
 	//! What the role reads of the column, over `source` (its value in physical terms)
 	string Read(const string &source) const {
 		if (tree) {
@@ -752,13 +769,16 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		out.query = "SELECT COLUMNS(lambda __acl_col: lower(__acl_col) IN (" + StringUtil::Join(names, ", ") +
 		            ")) FROM (" + inner + ")";
 		for (auto &column : listed) {
-			if (!out.writable || column.tree) {
+			if (!out.writable || !column.Writable()) {
 				continue;
 			}
 			out.write_columns.insert(column.name);
 			out.write_order.push_back(column.name);
 			if (!column.mask.empty()) {
 				out.injections.emplace_back(column.name, column.mask);
+			}
+			if (column.tree) {
+				out.field_writes.emplace_back(column.name, column.TreeItems(column.name));
 			}
 		}
 		out.subquery_form = true;
@@ -784,13 +804,16 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 		}
 		auto expr = column.Read(source);
 		out.projection.push_back(expr == column.name ? expr : expr + " AS " + Ident(column.name));
-		if (!out.writable || column.tree) {
+		if (!out.writable || !column.Writable()) {
 			continue;
 		}
 		out.write_columns.insert(source);
 		out.write_order.push_back(column.name);
 		if (!column.mask.empty()) {
 			out.injections.emplace_back(source, column.mask);
+		}
+		if (column.tree) {
+			out.field_writes.emplace_back(source, column.TreeItems(source));
 		}
 	}
 	out.subquery_form = true; // a narrowed read is a projection, so it needs the subquery shape
