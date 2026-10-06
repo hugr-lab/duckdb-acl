@@ -215,7 +215,8 @@ client's mappings, and an `org = CONSTANT 'acme'` attribute in the RLS. There is
 **Entra ID**: app roles arrive in `roles`; security groups need `ROLES FROM ('groups')` plus GUID
 mappings. When Entra replaces the groups claim by a Graph link (**groups overage**,
 `_claim_names.groups`) and no role results, the node refuses loudly - it is offline by design;
-resolve groups at the gateway and use the ROLE form.
+resolve groups at the gateway and use the ROLE form. Entra's HEAD answers another page than its discovery
+document; the node reads each document whole (spec 101), so no `force_download` setting is needed.
 
 ### The function forms and the listings
 
