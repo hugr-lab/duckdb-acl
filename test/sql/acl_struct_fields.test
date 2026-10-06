@@ -390,7 +390,7 @@ ACL ROLE "rv" DELETE FROM r WHERE hidden = 'H';
 statement error
 ACL ROLE "rv" UPDATE r SET note = hidden FROM (SELECT 1 AS k) s WHERE r.id = s.k;
 ----
-<REGEX>:.*"hidden" is not a readable column of "r" - a column of the other relation must be qualified.*
+<REGEX>:.*"hidden" in a write to "r" must be qualified.*
 
 # a visible field reads as the role reads it
 statement ok
@@ -484,3 +484,92 @@ statement error
 ACL ADMIN ADD TABLE phys.main.r AS c.rm COLUMNS (id, address.ssn = 'x');
 ----
 <REGEX>:.*masks a field in the object's own COLUMNS - a field mask belongs to a grant.*
+
+# --- re-review: correlated subqueries, a wholly hidden struct, a masked column read ---------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, note, address.city);
+
+statement ok
+CREATE TABLE phys.main.s2 AS SELECT 1 AS k, 5 AS x;
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.s2 AS c.s2;
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = (SELECT hidden) WHERE id = 1;
+----
+<REGEX>:.*column "hidden" of "r" is not readable.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = (SELECT address.ssn) WHERE id = 1;
+----
+<REGEX>:.*ssn.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = 'p' WHERE EXISTS (SELECT 1 WHERE hidden = 'H');
+----
+<REGEX>:.*column "hidden" of "r" is not readable.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = (SELECT max(s2.x) FROM s2 WHERE hidden = 'H') WHERE id = 1;
+----
+<REGEX>:.*"hidden" in a write to "r" must be qualified.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = (SELECT r.address.zip FROM s2 LIMIT 1) WHERE id = 1;
+----
+<REGEX>:.*zip.*
+
+statement error
+ACL ROLE "rv" DELETE FROM r WHERE 'H' IN (SELECT hidden);
+----
+<REGEX>:.*column "hidden" of "r" is not readable.*
+
+statement error
+ACL ROLE "rv" MERGE INTO r USING (SELECT 1 AS k) s ON r.id = s.k AND EXISTS (SELECT 1 WHERE r.hidden = 'H') WHEN MATCHED THEN UPDATE SET note = 'm';
+----
+<REGEX>:.*column "hidden" of "r" is not readable.*
+
+# a subquery over its own relation, qualified, still works
+statement ok
+ACL ROLE "rv" UPDATE r SET note = (SELECT max(s2.x)::VARCHAR FROM s2 WHERE s2.k = r.id) WHERE id = 1;
+
+query I
+SELECT note FROM phys.main.r WHERE id = 1;
+----
+5
+
+# a struct column hidden whole: its fields are not there either
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, note);
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = address.ssn WHERE id = 1;
+----
+<REGEX>:.*column "address" of "r" is not readable.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = 'q' WHERE address.zip = 'Z1';
+----
+<REGEX>:.*column "address" of "r" is not readable.*
+
+# a masked column reads as its mask in a WHERE, even a mask computed from the row
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, note, hidden = left(hidden, 0) || '***');
+
+statement ok
+ACL ROLE "rv" UPDATE r SET note = 'masked-match' WHERE hidden = '***';
+
+query I
+SELECT note FROM phys.main.r WHERE id = 1;
+----
+masked-match
+
+statement ok
+ACL ROLE "rv" UPDATE r SET note = 'raw-match' WHERE hidden = 'H';
+
+query I
+SELECT note FROM phys.main.r WHERE id = 1;
+----
+masked-match

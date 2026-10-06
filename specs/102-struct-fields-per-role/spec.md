@@ -191,10 +191,17 @@ Three adversarial passes. Each fix below has a regression test in `test/sql/acl_
   - a masked column is read as its mask;
   - a column outside the projection is refused.
   
-  With another relation in scope (UPDATE … FROM, DELETE … USING, MERGE), an unqualified name that is
-  not one of the target's readable columns is refused: the other relation's column must be qualified,
-  since the binder would give the name to the target whenever the other relation lacks it. A lambda's
-  parameters and a subquery's body are their own scope.
+  Where something else might own a name, an unqualified name that is not one of the target's plainly
+  readable columns is refused: it must be qualified, since the binder would give it to the target
+  whenever the other relation lacks it. "Something else" is another relation of the statement
+  (UPDATE … FROM, DELETE … USING, MERGE), or the FROM of a subquery the name sits in. A subquery in
+  SET / WHERE / ON is walked too (a second review pass found `SET note = (SELECT hidden)` and
+  `WHERE EXISTS (SELECT 1 WHERE hidden = …)` still read the row): a name it does not own is the target's
+  (correlated), judged as above. A name qualified by another relation of the statement or of the
+  subquery's FROM is left to it. A lambda's parameters are their own; a derived table's body is its own
+  scope (no LATERAL). A dotted name whose head is a hidden column (`address.ssn` with `address` not
+  granted) is that column, refused. A masked column reads as its mask (even one computed from the
+  row). A refusal names the virtual column.
 - **`MERGE … WHEN MATCHED THEN UPDATE SET *` / `UPDATE BY NAME`** wrote every column the source carried,
   past the whole column policy (pre-existing). These forms are now refused under a column policy, like
   a merge's listless INSERT.
