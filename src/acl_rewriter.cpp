@@ -1,4 +1,6 @@
 #include "acl_rewriter.hpp"
+#include "acl_field_paths.hpp"
+#include "acl_policy_catalog.hpp"
 
 #include "acl_profile.hpp"
 
@@ -7,6 +9,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -1060,9 +1063,14 @@ private:
 				column = MapWrittenColumn(policy, column, vname);
 				RequireWritableColumn(policy, column, vname);
 			}
+			bool single = !node.from_table;
+			auto target = TargetAliasOf(node.table);
+			case_insensitive_set_t others;
+			CollectRefNames(node.from_table.get(), others);
 			for (auto &expr : node.set_info->expressions) {
 				RewriteExpr(expr);
 				MapColumnRefs(expr, policy, vname);
+				MapReadable(expr, policy, vname, target, single, others);
 			}
 			// a grant's value column is assigned, not suggested: overriding the SET keeps the row
 			// inside the principal's slice, and the predicate keeps the statement there too
@@ -1074,10 +1082,12 @@ private:
 					}
 				}
 			}
+			ApplyFieldWrites(*node.set_info, policy, vname, node.from_table ? TargetAliasOf(node.table) : Identifier());
 			ApplyUpdateCheck(*node.set_info, policy, vname, node.from_table ? TargetAliasOf(node.table) : Identifier());
 			RewriteExpr(node.set_info->condition);
 			MapColumnRefs(node.set_info->condition, policy, vname,
 			              node.from_table ? TargetAliasOf(node.table) : Identifier());
+			MapReadable(node.set_info->condition, policy, vname, target, single, others);
 			if (node.from_table) {
 				AndInto(node.set_info->condition, TargetPredicate(policy, TargetAliasOf(node.table), vname));
 			} else {
@@ -1100,6 +1110,11 @@ private:
 		RewriteExpr(node.condition);
 		MapColumnRefs(node.condition, policy, vname,
 		              node.using_clauses.empty() ? Identifier() : TargetAliasOf(node.table));
+		case_insensitive_set_t others;
+		for (auto &using_ref : node.using_clauses) {
+			CollectRefNames(using_ref.get(), others);
+		}
+		MapReadable(node.condition, policy, vname, TargetAliasOf(node.table), node.using_clauses.empty(), others);
 		if (!node.using_clauses.empty()) {
 			AndInto(node.condition, TargetPredicate(policy, TargetAliasOf(node.table), vname));
 		} else {
@@ -1119,6 +1134,9 @@ private:
 		RewriteTableRef(node.source);
 		RewriteExpr(node.join_condition);
 		MapColumnRefs(node.join_condition, policy, vname, alias);
+		case_insensitive_set_t others;
+		CollectRefNames(node.source.get(), others);
+		MapReadable(node.join_condition, policy, vname, alias, false, others);
 		// The predicate joins the target rather than filters the result: a row outside the grant is
 		// never matched, so no WHEN MATCHED branch can reach it.
 		AndInto(node.join_condition, TargetPredicate(policy, alias, vname));
@@ -1126,6 +1144,14 @@ private:
 			for (auto &action : action_set.second) {
 				RewriteExpr(action->condition);
 				MapColumnRefs(action->condition, policy, vname, alias);
+				MapReadable(action->condition, policy, vname, alias, false, others);
+				if (action->action_type == MergeActionType::MERGE_UPDATE && HasWritePolicy(policy) &&
+				    (!action->update_info || action->update_info->columns.empty())) {
+					// `UPDATE SET *` / `UPDATE BY NAME` writes every column the source carries - the
+					// grant's columns, values and fields are judged per named column, so name them
+					Deny(Reason::WRITE_POLICY,
+					     "the update branch of a merge into \"" + vname + "\" must name its columns");
+				}
 				if (action_set.first == MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE) {
 					// ... but "not matched" now includes every row the predicate excluded, and this
 					// branch acts on exactly those, so it needs the predicate of its own.
@@ -1139,11 +1165,14 @@ private:
 					for (auto &expr : action->update_info->expressions) {
 						RewriteExpr(expr);
 						MapColumnRefs(expr, policy, vname, alias);
+						MapReadable(expr, policy, vname, alias, false, others);
 					}
 					ApplySetInjections(*action->update_info, policy, vname);
+					ApplyFieldWrites(*action->update_info, policy, vname, alias);
 					ApplyUpdateCheck(*action->update_info, policy, vname, alias);
 					RewriteExpr(action->update_info->condition);
 					MapColumnRefs(action->update_info->condition, policy, vname, alias);
+					MapReadable(action->update_info->condition, policy, vname, alias, false, others);
 				}
 				for (auto &expr : action->expressions) {
 					RewriteExpr(expr);
@@ -1188,6 +1217,14 @@ private:
 		for (auto &column : action.insert_columns) {
 			column = MapWrittenColumn(policy, column, vname);
 			RequireWritableColumn(policy, column, vname);
+		}
+		for (idx_t i = 0; i < action.insert_columns.size() && i < action.expressions.size(); i++) {
+			auto name = action.insert_columns[i].GetIdentifierName();
+			auto tree = FieldWriteTree(policy, name);
+			if (tree) {
+				action.expressions[i] = FieldWriteValue(*tree, std::move(action.expressions[i]), nullptr,
+				                                        VirtualColumn(policy, name), vname);
+			}
 		}
 		if (policy.injections.empty()) {
 			return;
@@ -1807,6 +1844,184 @@ private:
 		    *expr, [&](unique_ptr<ParsedExpression> &child) { MapColumnRefs(child, policy, vname, target_alias); });
 	}
 
+	//! Where MapReadable stands: the target and its readable shape, the other relations of the statement
+	//! (`others`, by the names they answer to) and of the subqueries it is inside (`inner`), and whether
+	//! one of those subqueries has a FROM of its own - where an unqualified name may be its column or,
+	//! correlated, the target's, and the parser cannot tell which.
+	struct ReadScope {
+		const TablePolicy &policy;
+		string vname;
+		Identifier alias;
+		bool single;
+		case_insensitive_set_t others;
+		case_insensitive_set_t inner;
+		bool in_from_subquery = false;
+		case_insensitive_set_t lambda_params;
+	};
+
+	//! The names a FROM's relations answer to (an alias, else the table's name)
+	static void CollectRefNames(const TableRef *ref, case_insensitive_set_t &out) {
+		if (!ref) {
+			return;
+		}
+		if (!ref->alias.empty()) {
+			out.insert(ref->alias.GetIdentifierName());
+		}
+		switch (ref->type) {
+		case TableReferenceType::BASE_TABLE:
+			out.insert(ref->Cast<BaseTableRef>().Table().GetIdentifierName());
+			break;
+		case TableReferenceType::JOIN:
+			CollectRefNames(ref->Cast<JoinRef>().left.get(), out);
+			CollectRefNames(ref->Cast<JoinRef>().right.get(), out);
+			break;
+		default:
+			break;
+		}
+	}
+
+	//! A DML statement's own expressions see the target as the principal reads it (spec 102 review): a
+	//! narrowed column through its tree, a masked one as its mask, a column the projection does not
+	//! list refused. Without this a SET or a WHERE reads the physical row - a hidden field copied into a
+	//! visible one, a hidden column used as an oracle - and so does a correlated subquery inside them.
+	//! A name is the target's when qualified by its alias, or unqualified where nothing else can own it;
+	//! where something else might (another relation of the statement, or a subquery's own FROM), a name
+	//! that is not one of the target's plainly readable columns must be qualified - the binder would
+	//! give it to the target whenever the other relation lacks it.
+	void MapReadable(unique_ptr<ParsedExpression> &expr, const TablePolicy &policy, const string &vname,
+	                 const Identifier &alias, bool single, const case_insensitive_set_t &others = {}) {
+		if (!expr || policy.visible_columns.empty()) {
+			return;
+		}
+		ReadScope scope {policy, vname, alias, single, others};
+		MapReadable(expr, scope);
+	}
+
+	void MapReadable(unique_ptr<ParsedExpression> &expr, const ReadScope &scope) {
+		if (!expr) {
+			return;
+		}
+		switch (expr->GetExpressionClass()) {
+		case ExpressionClass::SUBQUERY: {
+			auto &subquery = expr->Cast<SubqueryExpression>();
+			MapReadable(subquery.GetChildMutable(), scope);
+			if (subquery.SubqueryMutable() && subquery.SubqueryMutable()->node) {
+				MapReadableNode(*subquery.SubqueryMutable()->node, scope);
+			}
+			return;
+		}
+		case ExpressionClass::LAMBDA: {
+			auto &lambda = expr->Cast<LambdaExpression>();
+			vector<string> names;
+			CollectColumnNames(lambda.Left(), names);
+			auto inner = scope;
+			for (auto &name : names) {
+				inner.lambda_params.insert(name);
+			}
+			MapReadable(lambda.RightMutable(), inner);
+			return;
+		}
+		case ExpressionClass::COLUMN_REF:
+			break;
+		default:
+			ParsedExpressionIterator::EnumerateChildren(
+			    *expr, [&](unique_ptr<ParsedExpression> &child) { MapReadable(child, scope); });
+			return;
+		}
+		auto &policy = scope.policy;
+		auto &vname = scope.vname;
+		auto &names = expr->Cast<ColumnRefExpression>().ColumnNames();
+		if (names.empty() || scope.lambda_params.count(names[0].GetIdentifierName())) {
+			return;
+		}
+		auto head = names[0].GetIdentifierName();
+		bool qualified = names.size() >= 2 && StringUtil::CIEquals(head, scope.alias.GetIdentifierName());
+		if (!qualified && names.size() >= 2 && (scope.others.count(head) || scope.inner.count(head))) {
+			return; // `other.x`: qualified by another relation in scope - not the target's
+		}
+		static const case_insensitive_set_t KEYWORDS = {"current_date", "current_time",   "current_timestamp",
+		                                                "localtime",    "localtimestamp", "current_user",
+		                                                "user",         "session_user",   "current_role"};
+		if (!qualified && names.size() == 1 && KEYWORDS.count(head)) {
+			return;
+		}
+		idx_t at = qualified ? 1 : 0;
+		auto column = names[at].GetIdentifierName();
+		optional_ptr<const std::pair<string, string>> mask;
+		for (auto &injection : policy.injections) {
+			if (StringUtil::CIEquals(injection.first, column)) {
+				mask = &injection;
+				break;
+			}
+		}
+		optional_ptr<const std::pair<string, string>> narrowed;
+		for (auto &entry : policy.narrowed_reads) {
+			if (StringUtil::CIEquals(entry.first, column)) {
+				narrowed = &entry;
+				break;
+			}
+		}
+		bool plain = policy.visible_columns.count(column) && !mask && !narrowed;
+		if (!qualified && (scope.in_from_subquery || !scope.single) && !plain) {
+			// another relation may own the name - or, unqualified, the binder may give it to the target
+			Deny(Reason::WRITE_POLICY, "\"" + names[0].GetIdentifierName() + "\" in a write to \"" + vname +
+			                               "\" must be qualified - by the relation it belongs to, or by \"" +
+			                               scope.alias.GetIdentifierName() + "\" for a column of \"" + vname +
+			                               "\" the role may read");
+		}
+		if (!policy.visible_columns.count(column)) {
+			Deny(Reason::WRITE_POLICY,
+			     "column \"" + VirtualColumn(policy, column) + "\" of \"" + vname + "\" is not readable");
+		}
+		if (plain) {
+			return; // read as stored
+		}
+		// what the principal reads of the column, then any field steps after it
+		vector<Identifier> base(names.begin(), names.begin() + at + 1);
+		unique_ptr<ParsedExpression> read;
+		if (mask) {
+			read = store.InstantiateExpr(mask->second, template_options);
+			BakeMarkers(read, nullptr); // a read of the mask, not an assignment: it may read the row
+		} else {
+			auto trees = acl_detail::ColumnTrees::From(acl_detail::ParseColumnList(narrowed->second));
+			auto tree = trees.Find(narrowed->first);
+			if (!tree) {
+				return;
+			}
+			auto parsed =
+			    Parser(template_options).ParseExpressionList(acl_detail::CompileNode(*tree, "\"__acl_read\""));
+			read = std::move(parsed[0]);
+			SubstitutePlaceholder(read, "__acl_read", ColumnRefExpression(base));
+		}
+		for (idx_t i = at + 1; i < names.size(); i++) {
+			vector<unique_ptr<ParsedExpression>> args;
+			args.push_back(std::move(read));
+			args.push_back(ConstantExpression::String(names[i].GetIdentifierName()));
+			read = make_uniq<FunctionExpression>(Identifier("struct_extract"), std::move(args));
+		}
+		read->SetAlias(expr->GetAlias());
+		expr = std::move(read);
+	}
+
+	//! A subquery inside a write statement's expression: its own FROM names are its own, and a name it
+	//! does not own may be the target's (correlated) - judged with the scope above
+	void MapReadableNode(QueryNode &node, const ReadScope &scope) {
+		auto inner = scope;
+		if (node.type == QueryNodeType::SELECT_NODE) {
+			auto &select = node.Cast<SelectNode>();
+			if (select.from_table && select.from_table->type != TableReferenceType::EMPTY_FROM) {
+				inner.in_from_subquery = true;
+				CollectRefNames(select.from_table.get(), inner.inner);
+			}
+		}
+		ParsedExpressionIterator::EnumerateQueryNodeChildren(
+		    node, [&](unique_ptr<ParsedExpression> &child) { MapReadable(child, inner); },
+		    [&](TableRef &ref) {
+			    // a derived table's body is its own scope (no LATERAL here); a subquery in a join
+			    // condition is walked as an expression by the iterator
+		    });
+	}
+
 	//! A grant's value column is an assignment, so it may only be built from claims and constants: an
 	//! expression that reads the row is a mask, and a mask cannot be written through (spec 011).
 	void RequireValueExpression(const ParsedExpression &expr, const string &column, const string &vname) {
@@ -1824,6 +2039,103 @@ private:
 		BakeMarkers(value, nullptr);
 		RequireValueExpression(*value, injection.first, vname);
 		return value;
+	}
+
+	//! spec 102 part B: the grant's tree for a narrowed column, or nothing
+	unique_ptr<acl_detail::FieldNode> FieldWriteTree(const TablePolicy &policy, const string &column) {
+		for (auto &entry : policy.field_writes) {
+			if (StringUtil::CIEquals(entry.first, column)) {
+				auto trees = acl_detail::ColumnTrees::From(acl_detail::ParseColumnList(entry.second));
+				auto tree = trees.Find(entry.first);
+				return tree ? tree->Clone() : nullptr;
+			}
+		}
+		return nullptr;
+	}
+
+	//! The value written into a narrowed column: the statement's `written`, folded into the stored
+	//! value (`stored` = the column's own reference for an UPDATE / a MERGE's update, null for an insert)
+	unique_ptr<ParsedExpression> FieldWriteValue(const acl_detail::FieldNode &tree,
+	                                             unique_ptr<ParsedExpression> written,
+	                                             unique_ptr<ParsedExpression> stored, const string &column,
+	                                             const string &vname) {
+		auto text = acl_detail::CompileWrite(tree, "\"__acl_written\"", stored ? "\"__acl_stored\"" : string(),
+		                                     "acl_rewrite: the value written to \"" + column + "\" of \"" + vname +
+		                                         "\" carries a field this role cannot write");
+		auto parsed = Parser(template_options).ParseExpressionList(text);
+		if (parsed.size() != 1) {
+			Deny(Reason::POLICY_ERROR, "the write policy of \"" + vname + "\" did not compile");
+		}
+		auto value = std::move(parsed[0]);
+		BakeMarkers(value, nullptr); // a mask may read a claim
+		RequireFieldMasksAreValues(tree, column, vname);
+		SubstitutePlaceholder(value, "__acl_written", *written);
+		if (stored) {
+			SubstitutePlaceholder(value, "__acl_stored", *stored);
+		}
+		return value;
+	}
+
+	//! A field mask is an assignment on a write, like a column's: claims and constants only (spec 011)
+	void RequireFieldMasksAreValues(const acl_detail::FieldNode &node, const string &column, const string &vname) {
+		if (node.masked) {
+			auto mask = store.InstantiateExpr(node.mask, template_options);
+			RequireValueExpression(*mask, column, vname);
+			return;
+		}
+		for (auto &child : node.fields) {
+			RequireFieldMasksAreValues(*child, column, vname);
+		}
+		if (node.element) {
+			RequireFieldMasksAreValues(*node.element, column, vname);
+		}
+	}
+
+	static void SubstitutePlaceholder(unique_ptr<ParsedExpression> &expr, const string &name,
+	                                  const ParsedExpression &value) {
+		if (!expr) {
+			return;
+		}
+		if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = expr->Cast<ColumnRefExpression>().ColumnNames();
+			if (names.size() == 1 && names[0].GetIdentifierName() == name) {
+				expr = value.Copy();
+			}
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expr, [&](unique_ptr<ParsedExpression> &child) { SubstitutePlaceholder(child, name, value); });
+	}
+
+	//! A SET list's narrowed columns, folded into what is stored (`target` qualifies the stored value
+	//! where another relation is in scope)
+	void ApplyFieldWrites(UpdateSetInfo &set_info, const TablePolicy &policy, const string &vname,
+	                      const Identifier &target) {
+		for (idx_t i = 0; i < set_info.columns.size() && i < set_info.expressions.size(); i++) {
+			auto name = set_info.columns[i].GetIdentifierName();
+			auto tree = FieldWriteTree(policy, name);
+			if (!tree) {
+				continue;
+			}
+			vector<Identifier> stored_name;
+			if (!target.empty()) {
+				stored_name.push_back(target);
+			}
+			stored_name.push_back(set_info.columns[i]);
+			set_info.expressions[i] = FieldWriteValue(*tree, std::move(set_info.expressions[i]),
+			                                          make_uniq<ColumnRefExpression>(std::move(stored_name)),
+			                                          VirtualColumn(policy, name), vname);
+		}
+	}
+
+	//! The name the principal knows a physical column by - a refusal speaks the virtual catalog
+	static string VirtualColumn(const TablePolicy &policy, const string &physical) {
+		for (auto &rename : policy.renames) {
+			if (StringUtil::CIEquals(rename.second, physical)) {
+				return rename.first;
+			}
+		}
+		return physical;
 	}
 
 	//! Refuse a write to a column the grant does not list: silently dropping it would write a row the
@@ -1855,7 +2167,8 @@ private:
 
 	//! Whether a grant narrows what may be written at all
 	static bool HasWritePolicy(const TablePolicy &policy) {
-		return !policy.injections.empty() || !policy.write_columns.empty() || !policy.rls.empty();
+		return !policy.injections.empty() || !policy.write_columns.empty() || !policy.rls.empty() ||
+		       !policy.field_writes.empty();
 	}
 
 	//! spec 024: a grant's predicate confines what is written, not only what may be reached. Without
@@ -2047,7 +2360,8 @@ private:
 		return predicate;
 	}
 
-	//! Assign the grant's injected values into a *drained stream* (spec 042). The source is quack's
+	//! Assign the grant's injected values - and fold its narrowed columns (spec 102) - into a *drained
+	//! stream* (spec 042). The source is quack's
 	//! scan, whose columns are named `col0, col1, …` by position and carry none of the client's own
 	//! names - so the value is substituted by position, through `SELECT * REPLACE (<expr> AS col<i>)`.
 	//!
@@ -2075,6 +2389,16 @@ private:
 				                               "\", which the streamed shape does not carry");
 			}
 			replacements[Identifier("__acl_c" + to_string(position))] = InjectedValue(injection, vname);
+		}
+		// spec 102: a narrowed column of the stream, folded the same way, by its position
+		for (idx_t i = 0; i < node.columns.size(); i++) {
+			auto name = node.columns[i].GetIdentifierName();
+			auto tree = FieldWriteTree(policy, name);
+			if (tree) {
+				auto position = Identifier("__acl_c" + to_string(i));
+				replacements[position] = FieldWriteValue(*tree, make_uniq<ColumnRefExpression>(position), nullptr,
+				                                         VirtualColumn(policy, name), vname);
+			}
 		}
 		// The source's columns are aliased BY POSITION here, never trusted by name: since quack f4328c5
 		// the client names them (its NULL::STRUCT(...) prototype), and a client that named its second
@@ -2185,7 +2509,7 @@ private:
 		for (auto &column : node.columns) {
 			RequireWritableColumn(policy, column, vname);
 		}
-		if (policy.injections.empty()) {
+		if (policy.injections.empty() && policy.field_writes.empty()) {
 			return;
 		}
 		if (SourceIsOwnDrain(node)) {
@@ -2204,7 +2528,10 @@ private:
 			}
 			if (!injected) {
 				columns.push_back(column);
-				items.push_back(make_uniq<ColumnRefExpression>(column));
+				auto tree = FieldWriteTree(policy, column.GetIdentifierName());
+				items.push_back(tree ? FieldWriteValue(*tree, make_uniq<ColumnRefExpression>(column), nullptr,
+				                                       VirtualColumn(policy, column.GetIdentifierName()), vname)
+				                     : make_uniq<ColumnRefExpression>(column));
 			}
 		}
 		for (auto &injection : policy.injections) {
@@ -2249,6 +2576,12 @@ private:
 			for (auto &injection : policy.injections) {
 				if (StringUtil::CIEquals(injection.first, name)) {
 					masked = true; // the grant computes this column, so the stored value is not readable
+					break;
+				}
+			}
+			for (auto &narrowed : policy.field_writes) {
+				if (StringUtil::CIEquals(narrowed.first, name)) {
+					masked = true; // the stored struct carries the fields the role does not see
 					break;
 				}
 			}

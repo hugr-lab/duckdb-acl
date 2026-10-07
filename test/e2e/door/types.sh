@@ -67,6 +67,8 @@ ATTACH ':memory:' AS phys;
 CREATE TYPE phys.main.tier AS ENUM ('gold', 'silver');
 CREATE TABLE phys.main.typed(id INTEGER, tier phys.main.tier, s STRUCT(a phys.main.tier, b INTEGER),
     l phys.main.tier[], m MAP(VARCHAR, phys.main.tier), u UNION(n INTEGER, t phys.main.tier), j JSON);
+CREATE TABLE phys.main.nested(id INTEGER, items STRUCT(price INTEGER, cost INTEGER)[]);
+INSERT INTO phys.main.nested VALUES (1, [{'price': 10, 'cost': 7}]);
 INSERT INTO phys.main.typed VALUES (1, 'gold', {'a': 'silver', 'b': 2}, ['gold', 'silver'], MAP {'k': 'gold'},
     'silver'::phys.main.tier, '{"x": 1}');
 ATTACH ':memory:' AS store;
@@ -79,9 +81,12 @@ ACL ADMIN CREATE VIRTUAL CATALOG c;
 ACL ADMIN CREATE VIRTUAL TABLE c.typed AS phys.main.typed;
 ACL ADMIN CREATE VIRTUAL TABLE c.kept AS phys.main.typed;
 ACL ADMIN ALTER VIRTUAL TABLE c.kept SET TYPES (enums = keep);
+ACL ADMIN CREATE VIRTUAL TABLE c.narrow AS phys.main.typed COLUMNS (id, s.b, l);
 $MS_SQL
 ACL ADMIN CREATE ROLE analyst;
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+ACL ADMIN CREATE VIRTUAL TABLE c.nested AS phys.main.nested;
+ACL ADMIN GRANT TABLE c.nested TO ROLE analyst COLUMNS (id, items[].price);
 SET GLOBAL acl_allow_anonymous_admin=false;
 SELECT acl_quack_serve('quack:localhost:$PORT', '$SERVER_TOKEN');
 EOF
@@ -105,6 +110,9 @@ done
 	echo "SELECT 'typed', typeof(tier), typeof(s), typeof(l), typeof(m), typeof(u), typeof(j), tier, s.a, l[2], m['k'], u, j->>'x' FROM remote.main.typed;"
 	echo "SELECT 'filtered', count(*) FROM remote.main.typed WHERE tier = 'gold' AND s.a = 'silver';"
 	echo "SELECT 'kept', typeof(tier), tier, s.a FROM remote.main.kept;"
+	# spec 102: a struct narrowed to one field - the client's DDL and the stream agree
+	echo "SELECT 'narrow', typeof(s), s.b FROM remote.main.narrow;"
+	echo "SELECT 'nested', typeof(items), items[1].price FROM remote.main.nested;"
 	# the served listing itself, as a client that builds its catalog reads it
 	echo "SELECT 'columns', * FROM quack_query('quack:localhost:$PORT', 'SELECT data_type FROM information_schema.columns WHERE table_name = ''typed'' AND column_name = ''tier''', token := '$TOKEN');"
 	[ -z "$MS_LOAD" ] || echo "SELECT 'ms', typeof(name), typeof(uname), name, uname FROM remote.main.ms_types;"
@@ -118,6 +126,8 @@ expect "ENUMs as VARCHAR at every depth, the data as described" \
 	'typed,VARCHAR,"STRUCT(a VARCHAR, b INTEGER)",VARCHAR[],"MAP(VARCHAR, VARCHAR)","UNION(n INTEGER, t VARCHAR)",JSON,gold,silver,silver,gold,silver,1'
 expect "a filter on the cast columns" "filtered,1"
 expect "a table that keeps its ENUMs" "kept,\"ENUM('gold', 'silver')\",gold,silver"
+expect "a struct narrowed to its fields" "narrow,STRUCT(b INTEGER),2"
+expect "a grant narrowing a list of structs" "nested,STRUCT(price INTEGER)[],10"
 expect "the listing says what the read returns" "columns,VARCHAR"
 [ -z "$MS_LOAD" ] || expect "mssql alias types as their base type" "ms,VARCHAR,VARCHAR,n42,u42"
 
@@ -131,4 +141,4 @@ for _ in $(seq 1 20); do
 	kill -0 "$SERVER_PID" 2>/dev/null || break
 	sleep 0.5
 done
-echo "PASS: types through the door - ENUMs as VARCHAR in STRUCT/LIST/MAP/UNION, a kept ENUM, JSON; $MS_NOTE"
+echo "PASS: types through the door - ENUMs as VARCHAR in STRUCT/LIST/MAP/UNION, a kept ENUM, JSON, a narrowed struct; $MS_NOTE"

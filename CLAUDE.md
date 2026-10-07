@@ -542,6 +542,19 @@ table functions, the memory store. `acl_check_catalog` adds `types_stale`, `enum
 that does not bind over the exposed type) and `types_mismatch` (an entry that makes a type of its own).
 e2e: `test/e2e/door/types.sh` (a quack client without mssql reads an mssql table), Flight run.sh.
 
+**Spec 102 — fields of structured types per role**: a COLUMNS item (grant or object list) may be a
+path - `address.city`, `address.geo.lat`, `items[].price`, `address.ssn = <mask>`; a column's items
+form a tree (`acl_field_paths.hpp`: parse, `IntersectNodes` for levels, `UniteNodes` for roles - a
+visible field beats a masked one, different masks refuse - `CompileNode` read via struct_pack /
+struct_update / list_transform, NULL-preserving, fields by struct_extract). Paths are checked against
+the column's type where written (`OrderAndCheckFields`; MAP/UNION refused) and stored in the source's
+field order. Writes (owner decision): a grant-narrowed column stays writable - `field_writes` +
+`CompileWrite`: hidden fields keep the stored value (UPDATE `struct_update`, INSERT `struct_pack`, NULL
+filled by name), masks are assigned, a hidden field in the written value is refused via
+`struct_keys`/`error()`; a `[]` narrowing and an object-declared one are read-only; RETURNING refuses a
+narrowed column. Listings describe `acl_listed_type` (the read's own fold of the roles' lists over the
+source type). e2e: a narrowed struct through quack in `test/e2e/door/types.sh`.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

@@ -1,0 +1,575 @@
+# name: test/sql/acl_struct_fields.test
+# description: fields of structured types per role (spec 102) - a COLUMNS item may be a path into a
+#   STRUCT and through a list of structs; levels intersect and roles unite field trees; the read, every
+#   listing and the DDL a quack client binds agree; a hidden field reaches nothing; a write through a
+#   narrowed column keeps the hidden fields, assigns the masked ones, and refuses a hidden one.
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.c(id INTEGER, region VARCHAR,
+    address STRUCT(city VARCHAR, ssn VARCHAR, zip VARCHAR, geo STRUCT(lat INTEGER, lon INTEGER)),
+    items STRUCT(price INTEGER, cost INTEGER)[], tags MAP(VARCHAR, VARCHAR));
+
+statement ok
+INSERT INTO phys.main.c VALUES
+    (1, 'eu', {'city': 'Berlin', 'ssn': 'S1', 'zip': '10115', 'geo': {'lat': 52, 'lon': 13}}, [{'price': 10, 'cost': 7}], MAP {'k': 'v'}),
+    (2, 'us', NULL, NULL, NULL);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('test/idp/rs', '{"url": "test/idp/rs", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"]}}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.c AS c.c;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN;
+
+# --- one role: paths keep fields, a NULL struct stays NULL, a list keeps its shape ---------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, items[].price, address.geo.lat, address.city);
+
+# stored in the object's column order and the source's field order
+query I
+SELECT columns FROM store.acl.role_object_caps WHERE role = 'analyst';
+----
+id, address.city, address.geo.lat, items[].price
+
+query III
+ACL ROLE "analyst" SELECT id, address, items FROM c ORDER BY id;
+----
+1	{'city': Berlin, 'geo': {'lat': 52}}	[{'price': 10}]
+2	NULL	NULL
+
+query I
+ACL ROLE "analyst" SELECT typeof(address) FROM c LIMIT 1;
+----
+STRUCT(city VARCHAR, geo STRUCT(lat INTEGER))
+
+# a hidden field reaches nothing: not the whole row as a value, not struct_extract
+query I
+ACL ROLE "analyst" SELECT count(*) FROM c AS x WHERE x::VARCHAR LIKE '%S1%' OR x::VARCHAR LIKE '%10115%' OR x::VARCHAR LIKE '%cost%';
+----
+0
+
+statement error
+ACL ROLE "analyst" SELECT address.ssn FROM c;
+----
+<REGEX>:.*ssn.*
+
+# every listing and the DDL describe what the role reads
+query II
+ACL ROLE "analyst" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'c' ORDER BY column_name;
+----
+address	STRUCT(city VARCHAR, geo STRUCT(lat INTEGER))
+id	INTEGER
+items	STRUCT(price INTEGER)[]
+
+query I
+ACL ROLE "analyst" SELECT sql FROM duckdb_tables() WHERE table_name = 'c';
+----
+CREATE TABLE "c"("id" INTEGER, "address" STRUCT(city VARCHAR, geo STRUCT(lat INTEGER)), "items" STRUCT(price INTEGER)[]);
+
+query II
+ACL ROLE "analyst" SELECT column_name, column_type FROM (DESCRIBE c) WHERE column_name = 'address';
+----
+address	STRUCT(city VARCHAR, geo STRUCT(lat INTEGER))
+
+# --- the whole struct with one field masked --------------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE auditor COLUMNS (id, address, address.ssn = '***');
+
+query II
+ACL ROLE "auditor" SELECT id, address FROM c ORDER BY id;
+----
+1	{'city': Berlin, 'ssn': ***, 'zip': 10115, 'geo': {'lat': 52, 'lon': 13}}
+2	NULL
+
+# --- two roles unite their fields, and the listing says the union --------------------------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE auditor COLUMNS (id, address.zip, address.ssn = '***');
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address.city);
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT typeof(address), address FROM c WHERE id = 1;
+----
+STRUCT(city VARCHAR, ssn VARCHAR, zip VARCHAR)	{'city': Berlin, 'ssn': ***, 'zip': 10115}
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT data_type FROM information_schema.columns WHERE table_name = 'c' AND column_name = 'address';
+----
+STRUCT(city VARCHAR, ssn VARCHAR, zip VARCHAR)
+
+# --- levels: an object grant narrows the catalog's, never re-exposes ----------------------------------
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) COLUMNS (id, address.city, address.zip) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address);
+
+query I
+ACL ROLE "analyst" SELECT address FROM c WHERE id = 1;
+----
+{'city': Berlin, 'zip': 10115}
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+# --- what a path may name: checked where the grant is written --------------------------------------------
+
+statement error
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address.nope);
+----
+<REGEX>:.*lists "address.nope", which the type STRUCT.* does not have.*
+
+statement error
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, region.x);
+----
+<REGEX>:.*lists fields of "region", which is VARCHAR - only a STRUCT's fields can be named.*
+
+statement error
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, tags.k);
+----
+<REGEX>:.*lists fields of "tags", which is MAP.*
+
+statement error
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address[].city);
+----
+<REGEX>:.*lists "address\[\]", but "address" is STRUCT.*not a list.*
+
+statement error
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address.city || 'x');
+----
+<REGEX>:.*lists "address.city \|\| 'x'", which the object does not have.*
+
+# two roles masking one field differently: refused, never picked
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE analyst COLUMNS (id, address.ssn = 'xx');
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT address FROM c;
+----
+<REGEX>:.*mask column "address.ssn" differently.*
+
+# --- the object's own COLUMNS may name fields too ------------------------------------------------------
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.c AS c.o COLUMNS (id, address.geo.lat, address.city);
+
+statement ok
+ACL ADMIN GRANT TABLE c.o TO ROLE auditor COLUMNS (id, address.city);
+
+query II
+ACL ROLE "auditor" SELECT id, address FROM o ORDER BY id;
+----
+1	{'city': Berlin}
+2	NULL
+
+query II
+ACL ROLE "auditor" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'o' ORDER BY column_name;
+----
+address	STRUCT(city VARCHAR)
+id	INTEGER
+
+# --- the catalog check reads a path by its column, then binds it -----------------------------------------
+
+statement ok
+ALTER TABLE phys.main.c DROP COLUMN items;
+
+statement ok
+ALTER TABLE phys.main.c ADD COLUMN items STRUCT(cost INTEGER)[];
+
+statement ok
+ACL ADMIN GRANT TABLE c.c TO ROLE auditor COLUMNS (id, items[].cost);
+
+statement ok
+UPDATE phys.main.c SET items = NULL;
+
+statement ok
+ALTER TABLE phys.main.c DROP COLUMN items;
+
+statement ok
+ALTER TABLE phys.main.c ADD COLUMN items STRUCT(price INTEGER)[];
+
+query II
+SELECT object, problem FROM acl_check_catalog('c') WHERE role = 'auditor' AND problem = 'grant_column_missing';
+----
+c	grant_column_missing
+
+# --- part B: writes through a narrowed column ----------------------------------------------------------
+# A field the role sees takes the written value, a hidden field keeps what is stored, a masked field
+# is assigned, a hidden field in the written value is refused; a list-element narrowing is read-only.
+
+statement ok
+CREATE TABLE phys.main.w(id INTEGER, address STRUCT(city VARCHAR, ssn VARCHAR, zip VARCHAR, tenant VARCHAR),
+    items STRUCT(price INTEGER, cost INTEGER)[]);
+
+statement ok
+INSERT INTO phys.main.w VALUES (1, {'city': 'A', 'ssn': 'S1', 'zip': 'Z1', 'tenant': 'acme'}, [{'price': 1, 'cost': 9}]), (2, NULL, NULL);
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.w AS c.w;
+
+statement ok
+ACL ADMIN CREATE ROLE writer;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE writer WITH (select, insert, update, merge) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.w TO ROLE writer COLUMNS (id, address.city, address.zip, address.tenant = 'acme', items[].price);
+
+statement ok
+ACL ROLE "writer" UPDATE w SET address = {'city': 'B', 'zip': 'Z9', 'tenant': 'evil'} WHERE id = 1;
+
+query I
+SELECT address FROM phys.main.w WHERE id = 1;
+----
+{'city': B, 'ssn': S1, 'zip': Z9, 'tenant': acme}
+
+# a NULL stored struct: the written fields make it
+statement ok
+ACL ROLE "writer" UPDATE w SET address = {'city': 'D', 'zip': 'Z2'} WHERE id = 2;
+
+query I
+SELECT address FROM phys.main.w WHERE id = 2;
+----
+{'city': D, 'ssn': NULL, 'zip': Z2, 'tenant': acme}
+
+statement ok
+ACL ROLE "writer" INSERT INTO w(id, address) VALUES (3, {'city': 'E', 'zip': 'Z3'});
+
+query I
+SELECT address FROM phys.main.w WHERE id = 3;
+----
+{'city': E, 'ssn': NULL, 'zip': Z3, 'tenant': acme}
+
+statement ok
+ACL ROLE "writer" MERGE INTO w USING (SELECT 1 AS k, {'city': 'M', 'zip': 'ZM'} AS a UNION ALL SELECT 5, {'city': 'N', 'zip': 'ZN'}) s ON w.id = s.k WHEN MATCHED THEN UPDATE SET address = s.a WHEN NOT MATCHED THEN INSERT (id, address) VALUES (s.k, s.a);
+
+query II
+SELECT id, address FROM phys.main.w WHERE id IN (1, 5) ORDER BY id;
+----
+1	{'city': M, 'ssn': S1, 'zip': ZM, 'tenant': acme}
+5	{'city': N, 'ssn': NULL, 'zip': ZN, 'tenant': acme}
+
+# a hidden field in the written value is refused, never dropped - and the refusal names no hidden field
+statement error
+ACL ROLE "writer" UPDATE w SET address = {'city': 'C', 'ssn': 'hack', 'zip': 'Z'} WHERE id = 1;
+----
+<REGEX>:^Invalid Input Error: acl_rewrite: the value written to "address" of "w" carries a field this role cannot write\s*$
+
+statement error
+ACL ROLE "writer" INSERT INTO w(id, address) VALUES (4, {'city': 'F', 'zip': 'Z4', 'ssn': 'x'});
+----
+<REGEX>:.*carries a field this role cannot write.*
+
+query I
+SELECT address.ssn FROM phys.main.w WHERE id = 1;
+----
+S1
+
+# a list narrowed through its elements is read-only; the struct is not readable back through RETURNING
+statement error
+ACL ROLE "writer" UPDATE w SET items = [{'price': 5}] WHERE id = 1;
+----
+<REGEX>:.*column "items" of "w" is not writable.*
+
+statement error
+ACL ROLE "writer" UPDATE w SET address = {'city': 'G', 'zip': 'Z'} WHERE id = 1 RETURNING address;
+----
+<REGEX>:.*column "address" of "w" is not readable.*
+
+# the role reads back what it wrote, and never the hidden field
+query II
+ACL ROLE "writer" SELECT id, address FROM w WHERE id IN (1, 3) ORDER BY id;
+----
+1	{'city': M, 'zip': ZM, 'tenant': acme}
+3	{'city': E, 'zip': Z3, 'tenant': acme}
+
+# --- review regressions (spec 102) ---------------------------------------------------------------------
+
+statement ok
+CREATE TABLE phys.main.r(id INTEGER, note VARCHAR, hidden VARCHAR, "odd.col" INTEGER,
+    address STRUCT(city VARCHAR, ssn VARCHAR, zip VARCHAR, geo STRUCT(lat INTEGER, lon INTEGER)),
+    items STRUCT(price INTEGER, cost INTEGER)[]);
+
+statement ok
+INSERT INTO phys.main.r VALUES (1, 'n', 'H', 7, {'city': 'A', 'ssn': 'S1', 'zip': 'Z1', 'geo': {'lat': 1, 'lon': 2}}, [{'price': 1, 'cost': 9}]);
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.r AS c.r;
+
+statement ok
+ACL ADMIN CREATE ROLE rv;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE rv WITH (select, update, delete, merge, insert) MAIN;
+
+# the wider item wins at every depth; a masked nested field keeps its siblings
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, address, address.geo.lat, items, items[].cost = 0);
+
+query II
+ACL ROLE "rv" SELECT address.geo, items FROM r;
+----
+{'lat': 1, 'lon': 2}	[{'price': 1, 'cost': 0}]
+
+# a column named with a dot is a column, and a grant spelled in another case lists it once
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, "odd.col", NOTE, ADDRESS.CITY);
+
+query II
+ACL ROLE "rv" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'r' ORDER BY column_name;
+----
+address	STRUCT(city VARCHAR)
+id	INTEGER
+note	VARCHAR
+odd.col	INTEGER
+
+query I
+ACL ROLE "rv" SELECT "odd.col" FROM r;
+----
+7
+
+# a write statement reads the target as the role does: hidden fields and columns are not there
+statement error
+ACL ROLE "rv" UPDATE r SET note = address.ssn WHERE id = 1;
+----
+<REGEX>:.*ssn.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = hidden WHERE id = 1;
+----
+<REGEX>:.*column "hidden" of "r" is not readable.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = 'x' WHERE address.zip = 'Z1';
+----
+<REGEX>:.*zip.*
+
+statement error
+ACL ROLE "rv" DELETE FROM r WHERE hidden = 'H';
+----
+<REGEX>:.*column "hidden" of "r" is not readable.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = hidden FROM (SELECT 1 AS k) s WHERE r.id = s.k;
+----
+<REGEX>:.*"hidden" in a write to "r" must be qualified.*
+
+# a visible field reads as the role reads it
+statement ok
+ACL ROLE "rv" UPDATE r SET note = address.city WHERE id = 1;
+
+query I
+SELECT note FROM phys.main.r WHERE id = 1;
+----
+A
+
+# a merge's update branch must name its columns under a column policy
+statement error
+ACL ROLE "rv" MERGE INTO r USING (SELECT 1 AS id, 'x' AS hidden) s ON r.id = s.id WHEN MATCHED THEN UPDATE SET *;
+----
+<REGEX>:.*the update branch of a merge into "r" must name its columns.*
+
+statement error
+ACL ROLE "rv" MERGE INTO r USING (SELECT 1 AS id, 'x' AS hidden) s ON r.id = s.id WHEN MATCHED THEN UPDATE BY NAME;
+----
+<REGEX>:.*must name its columns.*
+
+# a field mask that reads the row is a mask, not an assignment: not written through
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, address.city, address.ssn = left(address.ssn, 1) || '***');
+
+statement error
+ACL ROLE "rv" UPDATE r SET address = {'city': 'B'} WHERE id = 1;
+----
+<REGEX>:.*computed from the row, so it cannot be written.*
+
+query I
+SELECT address.ssn FROM phys.main.r WHERE id = 1;
+----
+S1
+
+# nested writes keep the hidden nested field; NULL sets the visible fields and keeps the hidden ones
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, address.city, address.geo.lat);
+
+statement ok
+ACL ROLE "rv" UPDATE r SET address = {'city': 'C', 'geo': {'lat': 5}} WHERE id = 1;
+
+query I
+SELECT address FROM phys.main.r WHERE id = 1;
+----
+{'city': C, 'ssn': S1, 'zip': Z1, 'geo': {'lat': 5, 'lon': 2}}
+
+statement ok
+ACL ROLE "rv" INSERT INTO r(id, address) SELECT 9, {'city': 'Q', 'geo': {'lat': 3}};
+
+query I
+SELECT address FROM phys.main.r WHERE id = 9;
+----
+{'city': Q, 'ssn': NULL, 'zip': NULL, 'geo': {'lat': 3, 'lon': NULL}}
+
+# two roles masking one field differently: the read refuses, and the listing names no field
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE analyst COLUMNS (id, address.ssn = 'a');
+
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE auditor COLUMNS (id, address.ssn = 'b');
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT data_type FROM information_schema.columns WHERE table_name = 'r' AND column_name = 'address';
+----
+"NULL"
+
+# the check: a path into a field the column lost, at the catalog level too; a masked one that left
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, address, address.zip = 'z');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE writer WITH (select, insert, update, merge) COLUMNS (id, address.city, address.lat) MAIN;
+
+query III
+SELECT object, role, problem FROM acl_check_catalog('c') WHERE role IN ('rv', 'writer') AND object IN ('r', 'w') AND problem IN ('mask_broken', 'grant_column_missing') ORDER BY ALL;
+----
+r	writer	grant_column_missing
+w	writer	grant_column_missing
+
+# an object's own list: the column once whatever the order, and a field mask is a grant's
+statement ok
+ACL ADMIN ADD TABLE phys.main.r AS c.ro COLUMNS (id, address.city, address);
+
+query I
+SELECT count(*) FROM store.acl.relation_columns WHERE vname = 'ro';
+----
+2
+
+statement error
+ACL ADMIN ADD TABLE phys.main.r AS c.rm COLUMNS (id, address.ssn = 'x');
+----
+<REGEX>:.*masks a field in the object's own COLUMNS - a field mask belongs to a grant.*
+
+# --- re-review: correlated subqueries, a wholly hidden struct, a masked column read ---------------------
+
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, note, address.city);
+
+statement ok
+CREATE TABLE phys.main.s2 AS SELECT 1 AS k, 5 AS x;
+
+statement ok
+ACL ADMIN ADD TABLE phys.main.s2 AS c.s2;
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = (SELECT hidden) WHERE id = 1;
+----
+<REGEX>:.*column "hidden" of "r" is not readable.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = (SELECT address.ssn) WHERE id = 1;
+----
+<REGEX>:.*ssn.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = 'p' WHERE EXISTS (SELECT 1 WHERE hidden = 'H');
+----
+<REGEX>:.*column "hidden" of "r" is not readable.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = (SELECT max(s2.x) FROM s2 WHERE hidden = 'H') WHERE id = 1;
+----
+<REGEX>:.*"hidden" in a write to "r" must be qualified.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = (SELECT r.address.zip FROM s2 LIMIT 1) WHERE id = 1;
+----
+<REGEX>:.*zip.*
+
+statement error
+ACL ROLE "rv" DELETE FROM r WHERE 'H' IN (SELECT hidden);
+----
+<REGEX>:.*column "hidden" of "r" is not readable.*
+
+statement error
+ACL ROLE "rv" MERGE INTO r USING (SELECT 1 AS k) s ON r.id = s.k AND EXISTS (SELECT 1 WHERE r.hidden = 'H') WHEN MATCHED THEN UPDATE SET note = 'm';
+----
+<REGEX>:.*column "hidden" of "r" is not readable.*
+
+# a subquery over its own relation, qualified, still works
+statement ok
+ACL ROLE "rv" UPDATE r SET note = (SELECT max(s2.x)::VARCHAR FROM s2 WHERE s2.k = r.id) WHERE id = 1;
+
+query I
+SELECT note FROM phys.main.r WHERE id = 1;
+----
+5
+
+# a struct column hidden whole: its fields are not there either
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, note);
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = address.ssn WHERE id = 1;
+----
+<REGEX>:.*column "address" of "r" is not readable.*
+
+statement error
+ACL ROLE "rv" UPDATE r SET note = 'q' WHERE address.zip = 'Z1';
+----
+<REGEX>:.*column "address" of "r" is not readable.*
+
+# a masked column reads as its mask in a WHERE, even a mask computed from the row
+statement ok
+ACL ADMIN GRANT TABLE c.r TO ROLE rv COLUMNS (id, note, hidden = left(hidden, 0) || '***');
+
+statement ok
+ACL ROLE "rv" UPDATE r SET note = 'masked-match' WHERE hidden = '***';
+
+query I
+SELECT note FROM phys.main.r WHERE id = 1;
+----
+masked-match
+
+statement ok
+ACL ROLE "rv" UPDATE r SET note = 'raw-match' WHERE hidden = 'H';
+
+query I
+SELECT note FROM phys.main.r WHERE id = 1;
+----
+masked-match

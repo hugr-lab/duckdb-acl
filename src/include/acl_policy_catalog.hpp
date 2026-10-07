@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "acl_field_paths.hpp"
 #include "acl_policy.hpp"
 
 #include "duckdb/common/exception/binder_exception.hpp"
@@ -92,6 +93,11 @@ struct GrantPolicy {
 			columns = std::move(level);
 			return;
 		}
+		if (HasFieldPaths(columns) || HasFieldPaths(level)) {
+			// spec 102: fields narrow like columns - the levels' trees intersect
+			columns = IntersectColumnItems(columns, level);
+			return;
+		}
 		vector<std::pair<string, string>> intersected;
 		for (auto &column : columns) {
 			for (auto &narrower : level) {
@@ -143,6 +149,11 @@ struct GrantUnion {
 		}
 		if (!policy.restricts) {
 			unrestricted_columns = true;
+			return;
+		}
+		if (HasFieldPaths(columns) || HasFieldPaths(policy.columns)) {
+			// spec 102: the roles' trees unite - a visible field beats a masked one, conflicts refuse
+			columns = UniteColumnItems(columns, policy.columns);
 			return;
 		}
 		for (auto &column : policy.columns) {

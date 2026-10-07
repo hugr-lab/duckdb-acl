@@ -373,10 +373,15 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// The names a grant states: split the list and take the part before '=' of a masked item. A
 	// mask's expression may itself contain a comma, which splits into a fragment that matches no
 	// column - harmless, since only the names on the left of '=' can ever match one.
+	// spec 102: a path names its column - a quoted head unquoted (`"odd.col"`, `"my col".city`), else
+	// the part before the first '.' or '['
 	auto stated = [](const string &column_expr) {
-		return "list_transform(str_split(" + column_expr +
-		       ", ','), lambda y: lower(trim(CASE WHEN position('=' IN y) > 0"
-		       " THEN regexp_extract(y, '^([^=]*)=', 1) ELSE y END)))";
+		string item = "trim(CASE WHEN position('=' IN y) > 0 THEN regexp_extract(y, '^([^=]*)=', 1) ELSE y END)";
+		return "list_transform(str_split(" + column_expr + ", ','), lambda y: lower(CASE WHEN starts_with(" + item +
+		       ", '\"') THEN replace(regexp_extract(" + item +
+		       ", '^\"((?:[^\"]|\"\")*)\"', 1), '\"\"', '\"')"
+		       " ELSE regexp_replace(" +
+		       item + ", '[.\\[].*$', '') END))";
 	};
 	auto keeps = [&](const string &column_expr, const string &name_expr) {
 		return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = '' OR list_contains(" +
@@ -400,9 +405,22 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                     " ELSE l.table_schema || '.' || l.table_name END";
 	// A grant's own projection wins over the object's row for the names it defines - it is what the
 	// role actually reads - and adds the ones the object never had (spec 026).
+	// the object's own column rows, read once: the listing itself, and - spec 102 - the source type a
+	// grant's projection is computed over
+	prelude += ", lcols AS (" + columns_sql + ") ";
+	string source_path = "CASE WHEN s.table_schema = 'main' THEN s.table_name"
+	                     " ELSE s.table_schema || '.' || s.table_name END";
+	// spec 102: what a principal reads of a column its grants project is what the read path computes -
+	// the roles' column lists folded and united, the tree applied to the source's type - never one
+	// role's probed type: two roles narrowing a struct differently read the union of their fields
+	string roles_of = "(SELECT list(struct_pack(cat := gc.cat_columns, obj := gc.obj_columns,"
+	                  " probed := (SELECT max(pc.\"type\") FROM " +
+	                  Tbl("grant_columns") +
+	                  " pc WHERE pc.\"role\" = gc.\"role\" AND pc.\"vcat\" = gc.vcat AND pc.\"vname\" = gc.vname"
+	                  " AND pc.\"name\" = gp.name)) ORDER BY gc.\"role\") FROM gcolumns gc"
+	                  " WHERE gc.vcat = gp.vcat AND gc.vname = gp.vname)";
 	string effective_columns =
-	    "SELECT * FROM (" + columns_sql + ") l WHERE " +
-	    column_visible("l.table_catalog", listed_path, "l.column_name") +
+	    "SELECT * FROM lcols l WHERE " + column_visible("l.table_catalog", listed_path, "l.column_name") +
 	    " AND NOT EXISTS (SELECT 1 FROM gprojection gp WHERE gp.vcat = l.table_catalog AND gp.vname = " + listed_path +
 	    " AND gp.name = l.column_name)" +
 	    " UNION ALL BY NAME"
@@ -411,9 +429,13 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " ELSE 'main' END AS table_schema,"
 	    " regexp_extract(gp.vname, '([^.]*)$', 1) AS table_name,"
 	    " gp.name AS column_name, gp.pos + 1 AS ordinal_position,"
-	    " acl_exposed_type(gp.type, o.strip_alias, o.enums_to_varchar) AS data_type"
+	    " acl_exposed_type(coalesce(CASE WHEN s.data_type IS NULL THEN NULL ELSE acl_listed_type(s.data_type,"
+	    " gp.name, " +
+	    roles_of +
+	    ") END, gp.type), o.strip_alias, o.enums_to_varchar) AS data_type"
 	    " FROM gprojection gp JOIN objects o ON o.vcat = gp.vcat AND " +
-	    path("o") + " = gp.vname";
+	    path("o") + " = gp.vname LEFT JOIN lcols s ON s.table_catalog = gp.vcat AND " + source_path +
+	    " = gp.vname AND lower(s.column_name) = lower(gp.name)";
 	if (surface == "columns") {
 		return prelude + effective_columns;
 	}

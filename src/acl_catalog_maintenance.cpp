@@ -10,6 +10,7 @@
 
 #include "acl_door_common.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_field_paths.hpp"
 #include "acl_types.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -514,6 +515,47 @@ private:
 			return;
 		}
 		for (auto &item : items) {
+			// spec 102: a path is judged by its column, then by the column's type - a field it no longer
+			// has fails a bare path's reads (at either level: a path never intersects away), and a masked
+			// one is appended by struct_update instead of replacing anything. A name the object has as
+			// written (`odd.col`) is a column, not a path.
+			acl_detail::FieldPath path;
+			string path_error;
+			if (!exposed.count(item.first) && acl_detail::ParseFieldPath(item.first, path, path_error) &&
+			    !path.IsColumn() && exposed.count(path.head)) {
+				string missing;
+				auto own = relation.own.find(path.head);
+				auto value = own != relation.own.end() && !own->second.empty() ? own->second : Ident(path.head);
+				vector<std::pair<string, LogicalType>> types;
+				if (catalog.ProbeTypes("SELECT " + value + " AS c FROM " + relation.Source(), types) &&
+				    !types.empty()) {
+					string steps;
+					for (auto &step : path.steps) {
+						steps += step.empty() ? string("[]") : "." + acl_detail::FieldName(step);
+					}
+					LogicalType at;
+					if (!acl_detail::TypeAtPath(types[0].second, steps, at)) {
+						missing =
+						    "\"" + item.first + "\" names a field " + types[0].second.ToString() + " does not have";
+					}
+				}
+				if (missing.empty()) {
+					if (matched) {
+						matched->insert(item.first);
+					}
+				} else if (item.second.empty()) {
+					Add("grant", relation.vname, role, "grant_column_missing",
+					    "the COLUMNS path " + missing + " - every read of \"" + Named(relation.vname) +
+					        "\" by this role refuses",
+					    repair);
+				} else {
+					Add("grant", relation.vname, role, "mask_broken",
+					    "the mask \"" + item.first + " = " + item.second + "\": " + missing +
+					        " - the read adds the field rather than masking one",
+					    repair);
+				}
+				continue;
+			}
 			if (item.second.empty()) {
 				if (exposed.count(item.first)) {
 					if (matched) {

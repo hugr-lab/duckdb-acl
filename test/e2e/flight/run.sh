@@ -135,7 +135,7 @@ echo "$got" | grep -q "'db_schema_name': \['main', 'stage', 'stage2'\]" || fail 
 case "$got" in *memory*) fail "the physical database was listed: $got";; esac
 
 got="$(ask "@tables")"
-echo "$got" | grep -q "'table_name': \['customers', 'orders', 'typed', 'typed_v'\]" || fail "GetTables: $got"
+echo "$got" | grep -q "'table_name': \['customers', 'nested', 'orders', 'typed', 'typed_v'\]" || fail "GetTables: $got"
 case "$got" in *memory*) fail "the physical database was listed: $got";; esac
 
 # A filter arrives as a parameter on our side and as a protobuf field on the client's; a field number
@@ -166,6 +166,13 @@ echo "$got" | grep -q "'tier:string', 's:struct<a: string>'" || fail "an ENUM re
 echo "$got" | grep -q "'tier': \['gold'\]" || fail "the cast ENUM's value: $got"
 got="$(ask "@tables_schema:typed_v")"
 echo "$got" | grep -q "\['id:int32', 'tier:string', 's:struct<a: string>'\]" || fail "the promised schema of typed_v: $got"
+
+# --- spec 102: a struct narrowed to one field goes out with only that child --------------------------
+got="$(ACL_SHOW_SCHEMA=1 ask "SELECT address FROM nested")"
+echo "$got" | grep -q "'address:struct<city: string>'" || fail "the narrowed struct's Arrow schema: $got"
+case "$got" in *ssn*|*S1*) fail "a hidden field reached the Flight client: $got";; esac
+got="$(ask "@tables_schema:nested")"
+echo "$got" | grep -q "'address:struct<city: string>'" || fail "the promised schema of the narrowed struct: $got"
 
 # --- references are the foreign keys (spec 022) ---------------------------------------------------
 got="$(ask "@imported:orders")"
