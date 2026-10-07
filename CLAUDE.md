@@ -463,8 +463,9 @@ REMOVE EXTENSION / ATTACH / DETACH / SET / RESET … [IN GROUP g]` (passthrough 
 (`WriteWithReads(…, "config_version", before_commit)`), apply a hot change on this node before the
 commit (a failure rolls the write back). Never a credential (keys linted in the path and options, a
 SECRET required for postgres/mysql/mssql), never the hardening settings, extensions only from a
-trusted repository (`LOAD … FROM <repo>` - duckdb installs them under `repositories/<repo>/`; sha256
-before LOAD, a mismatch removes the file), sources ordered by `DEPENDS ON`, DETACH refused while a
+trusted repository (`LOAD … FROM <repo>` - duckdb installs them under `repositories/<repo>/`; an item is
+a version and a repository, its integrity the repository's signature - spec 103 removed `SHA256`),
+sources ordered by `DEPENDS ON`, DETACH refused while a
 dependent (CASCADE) or the policy (FORCE) reads through it. Audit: object `<kind>:<name>`, capability
 `cluster`, never the spec. `acl_cluster_items([group])`, `acl_cluster_version()`.
 

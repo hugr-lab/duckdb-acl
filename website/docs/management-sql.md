@@ -735,8 +735,8 @@ placed; `manage` and `passthrough` are placed like anyone.
 ## Cluster profile
 
 ```sql
-CLUSTER INSTALL EXTENSION <name> VERSION '<v>' [FROM <repository>] [SHA256 '<hex>'] [IN GROUP <group>] [COMMENT '<text>']
-CLUSTER UPDATE  EXTENSION <name> VERSION '<v>' [SHA256 '<hex>'] [IN GROUP <group>]
+CLUSTER INSTALL EXTENSION <name> VERSION '<v>' [FROM <repository>] [IN GROUP <group>] [COMMENT '<text>']
+CLUSTER UPDATE  EXTENSION <name> VERSION '<v>' [IN GROUP <group>]
 CLUSTER REMOVE  EXTENSION <name> [IN GROUP <group>]
 CLUSTER ATTACH '<path>' AS <alias> (TYPE <type> [, SECRET <secret>] [, <option> [<value>]] …)
         [DEPENDS ON (<alias>, …)] [IN GROUP <group>] [COMMENT '<text>']
@@ -794,8 +794,10 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
   `community` are refused, and `VERSION` is required.
   - duckdb installs such an extension under `repositories/<repository>/` and loads it with
     `LOAD <name> FROM <repository>`.
-  - `SHA256` is checked after the download and before `LOAD`. On a mismatch the downloaded file is
-    removed.
+  - Integrity is the repository's signature, which duckdb verifies against the repository's
+    pinned keys at every `INSTALL` and `LOAD`, together with a version that never changes once
+    released. A profile does not pin a hash: one would change with every key rotation of the
+    repository. `SHA256` is refused (spec 103).
 - **Start order.** A node applies the profile in this order: settings, extensions, secrets, sources,
   the policy catalog.
   - Sources are ordered by `DEPENDS ON`, and by creation order where nothing orders them.
@@ -814,7 +816,7 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
 - **Listings.** `acl_cluster_items([group])` lists the profile: scope, kind, name, spec (JSON),
   class, version, depends_on and comment. `acl_cluster_version()` answers the counter.
 - **Functions.** The admin functions behind the statements are:
-  - `acl_cluster_extension(verb, group, name, version, repository, sha256, comment)`;
+  - `acl_cluster_extension(verb, group, name, version, repository, comment)`;
   - `acl_cluster_attach(group, alias, path, type, secret, options_json, depends_on_csv, comment)`;
   - `acl_cluster_detach(group, alias, cascade, force)`;
   - `acl_cluster_setting(verb, group, name, value)`.

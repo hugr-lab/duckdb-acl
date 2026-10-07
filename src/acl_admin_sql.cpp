@@ -750,22 +750,25 @@ unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
 	if (verb == "install" || verb == "update" || verb == "remove") {
 		s.Expect("extension");
 		auto name = s.Name("an extension name");
-		string version, repository, sha256;
+		string version, repository;
 		for (;;) {
 			if (verb != "remove" && s.Accept("version")) {
 				version = s.Quoted("version");
 			} else if (verb == "install" && s.Accept("from")) {
 				repository = s.Name("a repository name");
 			} else if (verb != "remove" && s.Accept("sha256")) {
-				sha256 = s.Quoted("sha256");
+				// spec 103: refused, never ignored - a script that still pins a hash must not believe it does
+				throw BinderException("acl admin: SHA256 is no longer part of the cluster profile (spec 103) - "
+				                      "DuckDB verifies the repository's signature at every INSTALL and LOAD; name "
+				                      "the VERSION and the repository");
 			} else {
 				break;
 			}
 		}
 		auto scope = group();
 		auto note = comment();
-		return MakeAdminCall("acl_cluster_extension", {Value(verb), Value(scope), Value(name), Value(version),
-		                                               Value(repository), Value(sha256), Value(note)});
+		return MakeAdminCall("acl_cluster_extension",
+		                     {Value(verb), Value(scope), Value(name), Value(version), Value(repository), Value(note)});
 	}
 	if (verb == "attach") {
 		auto path = s.Quoted("the source's path");
