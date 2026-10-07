@@ -352,7 +352,7 @@ string JsonField(const string &json, const char *field) {
 
 PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, const string &scope, const string &name,
                                                          const string &version, const string &repository,
-                                                         const string &sha256, const string &comment) {
+                                                         const string &comment) {
 	RequireClusterCatalog(catalog, "acl_cluster_extension");
 	auto db = instance.lock();
 	if (!db) {
@@ -430,7 +430,10 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
 			    statements.push_back(DeleteItem(*catalog, scope, "extension", name));
 			    return;
 		    }
-		    auto spec = JsonObjectOf({{"version", version}, {"repository", repo}, {"sha256", sha256}});
+		    // spec 103: version and repository only - DuckDB verifies the repository's signature at every
+		    // INSTALL and LOAD, and a released version is immutable there; a hash of the signed file would
+		    // change with every key rotation and differ per channel for the same code
+		    auto spec = JsonObjectOf({{"version", version}, {"repository", repo}});
 		    statements.push_back(
 		        UpsertItem(*catalog, scope, "extension", name, spec, answer.item_class, comment, !current.empty()));
 	    },
@@ -447,35 +450,6 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
 			    return;
 		    }
 		    NodeQuery(*db, "INSTALL " + Ident(name) + " FROM " + Ident(repo) + " VERSION " + Quoted(version));
-		    if (!sha256.empty()) {
-			    // an extension from a user-provided repository is installed apart, under
-			    // <extension directory>/repositories/<repository>/ - and loaded only by LOAD ... FROM it
-			    auto &fs = FileSystem::GetFileSystem(*db);
-			    string file;
-			    for (auto &dir : ExtensionHelper::GetExtensionDirectoryPath(*db, fs)) {
-				    auto candidate = fs.JoinPath(fs.JoinPath(fs.JoinPath(dir, "repositories"), repo),
-				                                 StringUtil::Lower(name) + ".duckdb_extension");
-				    if (fs.FileExists(candidate)) {
-					    file = candidate;
-					    break;
-				    }
-			    }
-			    string got;
-			    if (!file.empty()) {
-				    auto digest = NodeQuery(*db, "SELECT sha256(content) FROM read_blob(" + Quoted(file) + ")");
-				    got = digest->RowCount() ? digest->Collection().GetValue(0, 0).ToString() : string();
-			    }
-			    if (got.empty() || !StringUtil::CIEquals(got, sha256)) {
-				    // never leave a binary the profile refused where a later LOAD could find it
-				    if (!file.empty()) {
-					    fs.TryRemoveFile(file);
-					    fs.TryRemoveFile(file + ".info");
-				    }
-				    throw BinderException("acl cluster: extension \"%s\" %s from \"%s\" has sha256 %s, the profile "
-				                          "names %s - refused before LOAD, and the downloaded file removed",
-				                          name, version, repo, got.empty() ? string("(not found)") : got, sha256);
-			    }
-		    }
 		    NodeQuery(*db, "LOAD " + Ident(name) + " FROM " + Ident(repo));
 		    answer.applied_here = true;
 	    });
@@ -984,12 +958,11 @@ void EachRow(DataChunk &args, Vector &result, FN &&fn) {
 	}
 }
 
-//! acl_cluster_extension(verb, scope, name, version, repository, sha256, comment)
+//! acl_cluster_extension(verb, scope, name, version, repository, comment)
 void ClusterExtensionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	EachRow(args, result, [&](idx_t row) {
 		return StoreOf(state).ClusterExtension(Arg(args, 0, row), Arg(args, 1, row), Arg(args, 2, row),
-		                                       Arg(args, 3, row), Arg(args, 4, row), Arg(args, 5, row),
-		                                       Arg(args, 6, row));
+		                                       Arg(args, 3, row), Arg(args, 4, row), Arg(args, 5, row));
 	});
 }
 
@@ -1136,7 +1109,7 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 		MarkAclScalar(function, store);
 		loader.RegisterFunction(function);
 	};
-	scalar("acl_cluster_extension", {v, v, v, v, v, v, v}, ClusterExtensionFunc, AnswerType());
+	scalar("acl_cluster_extension", {v, v, v, v, v, v}, ClusterExtensionFunc, AnswerType());
 	scalar("acl_cluster_attach", {v, v, v, v, v, v, v, v}, ClusterAttachFunc, AnswerType());
 	scalar("acl_cluster_detach", {v, v, v, v}, ClusterDetachFunc, AnswerType());
 	scalar("acl_cluster_setting", {v, v, v, v}, ClusterSettingFunc, AnswerType());

@@ -1,6 +1,8 @@
 // Spec 093: ACL CLUSTER INSTALL EXTENSION installs from a trusted repository (duckdb 2.0's CREATE
-// EXTENSION REPOSITORY), checks the profile's sha256 before LOAD, and writes the item only when the
-// live install worked. The repository is a local directory in duckdb's versioned layout
+// EXTENSION REPOSITORY) and writes the item only when the live install worked. Spec 103: the item is
+// a version and a repository - the repository's signature, which DuckDB verifies at every INSTALL and
+// LOAD, is the integrity check, and a SHA256 clause is refused. The repository is a local directory in duckdb's
+// versioned layout
 // (<repo>/<name>/<version>/<revision>/<platform>/<name>.duckdb_extension.gz), holding this build's
 // own postgres_scanner - a loadable built against this exact duckdb. Skipped when the build has none
 // (a plain build: postgres_scanner comes with ACL_INTEGRATION=1).
@@ -47,7 +49,7 @@ bool Refused(Connection &con, const std::string &sql, const std::string &why) {
 } // namespace
 
 int main() {
-	return RunMain("the cluster profile installs from a trusted repository (spec 093)", [] {
+	return RunMain("the cluster profile installs from a trusted repository (specs 093, 103)", [] {
 		struct stat info;
 		if (stat(LOADABLE, &info) != 0) {
 			std::cout << "  SKIP: no postgres_scanner loadable in this build (ACL_INTEGRATION=1 builds one)\n";
@@ -81,42 +83,30 @@ int main() {
 		Exec(con, "SELECT acl_use_db('store','acl',true)");
 		Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
 
-		Scenario("a sha256 that does not match refuses before LOAD and writes nothing", [&] {
+		Scenario("a SHA256 clause is refused, never ignored, and writes nothing (spec 103)", [&] {
 			Refused(con,
 			        "ACL ADMIN CLUSTER INSTALL EXTENSION postgres_scanner VERSION 'v9.9.9' FROM trusted SHA256 "
 			        "'0000000000000000000000000000000000000000000000000000000000000000'",
-			        "refused before LOAD");
-			Check(
-			    One(con, "SELECT count(*) FROM duckdb_loaded_extensions() WHERE extension_name = 'postgres_scanner'") ==
-			            "0" ||
-			        One(con, "SELECT coalesce(max(loaded::INT), 0) FROM duckdb_extensions() WHERE extension_name = "
-			                 "'postgres_scanner'") == "0",
-			    "the extension was not loaded");
-			struct stat gone;
-			Check(stat((base + "/ext/" + ExtensionHelper::GetVersionDirectoryName() + "/" + DuckDB::Platform() +
-			            "/repositories/trusted/postgres_scanner.duckdb_extension")
-			               .c_str(),
-			           &gone) != 0,
-			      "the refused download was removed");
+			        "SHA256 is no longer part of the cluster profile (spec 103)");
 			Check(One(con, "SELECT count(*) FROM acl_cluster_items()") == "0", "the profile is unchanged");
 			Check(One(con, "SELECT acl_cluster_version()") == "0", "and so is its version");
 		});
 
-		Scenario("the matching sha256 installs, loads and writes the item", [&] {
-			// the digest a repository would publish: of the uncompressed binary
-			auto digest = One(con, "SELECT sha256(content) FROM read_blob('" + std::string(LOADABLE) + "')");
-			Check(digest.size() == 64, "the binary's digest: " + digest);
-			auto answer = One(con, "ACL ADMIN CLUSTER INSTALL EXTENSION postgres_scanner VERSION 'v9.9.9' FROM trusted "
-			                       "SHA256 '" +
-			                           digest + "'");
+		Scenario("the install loads the extension and writes a version and a repository", [&] {
+			auto answer =
+			    One(con, "ACL ADMIN CLUSTER INSTALL EXTENSION postgres_scanner VERSION 'v9.9.9' FROM trusted");
 			Check(answer.find("'applied_here': true") != std::string::npos, "applied on this node: " + answer);
 			Check(One(con, "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'postgres_query'") != "0",
 			      "loaded: its functions are registered");
-			Check(One(con, "SELECT spec FROM acl_cluster_items() WHERE name = 'postgres_scanner'")
-			              .find("\"repository\": \"trusted\"") != std::string::npos,
-			      "the item names its repository");
+			auto spec = One(con, "SELECT spec FROM acl_cluster_items() WHERE name = 'postgres_scanner'");
+			Check(spec.find("\"repository\": \"trusted\"") != std::string::npos &&
+			          spec.find("\"version\": \"v9.9.9\"") != std::string::npos,
+			      "the item names its version and repository: " + spec);
+			Check(spec.find("sha256") == std::string::npos, "and no hash: " + spec);
 			Refused(con, "ACL ADMIN CLUSTER INSTALL EXTENSION postgres_scanner VERSION 'v9.9.9' FROM trusted",
 			        "already in the profile");
+			Refused(con, "ACL ADMIN CLUSTER UPDATE EXTENSION postgres_scanner VERSION 'v9.9.10' SHA256 'ab'",
+			        "spec 103");
 		});
 
 		Scenario("an update or a removal is restart class: described, not applied live", [&] {

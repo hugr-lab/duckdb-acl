@@ -65,9 +65,9 @@ infrastructure change to a reconciler, and the reverse (answers design/009's ope
 
 `spec` per kind:
 
-- `extension`: `{"version": "1.4.2", "repository": "hugr", "sha256": "…"}`. `repository` is the name
-  of a trusted repository (`duckdb_extension_repositories()`, duckdb 2.0). `sha256` is optional; when
-  written, a node refuses a binary that differs.
+- `extension`: `{"version": "1.4.2", "repository": "hugr"}`. `repository` is the name of a trusted
+  repository (`duckdb_extension_repositories()`, duckdb 2.0). (An optional `sha256` was removed by
+  spec 103: the repository's signature is the integrity check.)
 - `source`: `{"type": "postgres", "path": "host=… dbname=…", "secret": "pg_sales", "options":
   {"READ_ONLY": true}}`. `secret` names a secret the node resolves (tresor), never its material.
 - `setting`: `{"value": "48GB"}`.
@@ -78,8 +78,8 @@ The client writes it after the principal prefix, like any management form (spec 
 anonymous form is `ACL ADMIN CLUSTER …`.
 
 ```sql
-ACL CLUSTER INSTALL EXTENSION spatial VERSION '1.4.2' [FROM hugr] [SHA256 '…'] [IN GROUP g] [COMMENT '…']
-ACL CLUSTER UPDATE EXTENSION spatial VERSION '1.5.0' [SHA256 '…'] [IN GROUP g]
+ACL CLUSTER INSTALL EXTENSION spatial VERSION '1.4.2' [FROM hugr] [IN GROUP g] [COMMENT '…']
+ACL CLUSTER UPDATE EXTENSION spatial VERSION '1.5.0' [IN GROUP g]
 ACL CLUSTER REMOVE EXTENSION spatial [IN GROUP g]
 ACL CLUSTER ATTACH '<path>' AS sales (TYPE postgres, SECRET pg_sales [, READ_ONLY] [, <option> …])
     [DEPENDS ON (other_source, …)] [IN GROUP g]
@@ -181,12 +181,11 @@ Classes are fixed per verb and kind (design §3.2a):
 - **A user-provided repository's extension is installed apart.** duckdb puts it under
   `<extension directory>/repositories/<repository>/`, lists it nowhere in `duckdb_extensions()`, and
   loads it only with `LOAD <name> FROM <repository>`. So the live apply loads it that way, and so
-  must the node agent at every start. `sha256` is computed on that file. On a mismatch the file (and
-  its `.info`) is removed before the refusal, so no later `LOAD` finds a binary the profile refused.
+  must the node agent at every start.
 - **Extensions come only from a trusted repository.** `FROM` must name a USER_PROVIDED repository
   that exists on the node. A path or URL is refused, and so is the core/community fallback. The
-  install records the key fingerprint duckdb verified. `sha256`, when given, is checked after the
-  download and before `LOAD`.
+  install records the key fingerprint duckdb verified, and duckdb verifies the signature again at every
+  `LOAD`. (Spec 103 removed the optional `sha256` check.)
 - **Audit goes to OpenTelemetry, not to a table.** Each `ACL CLUSTER` statement is one `admin` event
   (spec 069), accepted or refused. Only existing fields are used, so the contract layout does not
   change:
@@ -242,10 +241,9 @@ Classes are fixed per verb and kind (design §3.2a):
   - a live ATTACH that fails rolls the write back (version and items unchanged).
 - **C++ `test_acl_cluster_install`**: a trusted repository, a local directory in duckdb's versioned
   layout holding this build's postgres_scanner:
-  - a wrong `sha256` refuses before LOAD, removes the download, and leaves the profile and its version
-    unchanged;
-  - the right one installs, `LOAD … FROM` the repository (its functions registered), and writes the
-    item;
+  - a `SHA256` clause is refused and leaves the profile and its version unchanged (spec 103);
+  - the install loads from the repository (`LOAD … FROM`, its functions registered) and writes the item
+    as a version and a repository;
   - a second INSTALL is refused;
   - UPDATE and REMOVE are restart class and not applied live.
 

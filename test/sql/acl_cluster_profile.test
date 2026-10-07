@@ -232,12 +232,12 @@ ACL ADMIN CLUSTER INSTALL EXTENSION spatial VERSION 'v1.4.2' FROM core;
 <REGEX>:.*"core" is not a trusted repository of this node.*
 
 statement error
-SELECT acl_cluster_extension('install', '', '/tmp/evil.duckdb_extension', 'v1', 'hugr', '', '');
+SELECT acl_cluster_extension('install', '', '/tmp/evil.duckdb_extension', 'v1', 'hugr', '');
 ----
 <REGEX>:.*not an extension name.*never by a path or URL.*
 
 statement error
-SELECT acl_cluster_extension('install', '', 'spatial', '', 'hugr', '', '');
+SELECT acl_cluster_extension('install', '', 'spatial', '', 'hugr', '');
 ----
 <REGEX>:.*names its VERSION.*
 

@@ -571,7 +571,7 @@ struct PolicyStore {
 	vector<ClusterItem> ClusterEffective();
 	std::atomic<int64_t> cluster_applied {-1};
 	ClusterAnswer ClusterExtension(const string &verb, const string &scope, const string &name, const string &version,
-	                               const string &repository, const string &sha256, const string &comment);
+	                               const string &repository, const string &comment);
 	ClusterAnswer ClusterAttach(const string &scope, const string &alias, const string &path, const string &type,
 	                            const string &secret, const string &options_json, const vector<string> &depends_on,
 	                            const string &comment);
