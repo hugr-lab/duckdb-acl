@@ -1,137 +1,88 @@
 # Backlog — the one list of open items
 
-Rebuilt 2026-09-03 from the two backlogs that had grown apart (this file, compiled 2026-08-30 for the
-single-node phase, and the local `design/BACKLOG.md`), cross-checked against the status of every spec
-001–067. Each spec keeps its own follow-ups; this is the list that must actually be *cleared*, in one
-place. When something is fixed, delete the entry — the spec keeps the history. The local
-`design/BACKLOG.md` carries the longer reasoning behind the open items; `design/RELEASE-PLAN.md`
-carries the order we work them in.
+Rebuilt 2026-09-03 from the two backlogs that had grown apart, cleaned 2026-10-07 against specs
+001–102: every blocker of the first list is done (the docs site, spec 087; audit, 069; v13; the
+2026-09-03 review findings; e2e and the harness in CI; the release job with SHA256SUMS and
+attestations), and what is struck below is gone. Each spec keeps its own follow-ups; this is the list
+that must actually be *cleared*. When something is fixed, delete the entry — the spec keeps the
+history. `design/RELEASE-PLAN.md` carries the order we work them in.
 
-Classes: **blocker** — before the first release (after duckdb 2.0); **pre-release** — worth doing
-before if cheap; **later** — development, after the release.
+Classes: **release** — the owner's steps to the first release (after duckdb 2.0); **platform** — the
+large pieces beyond the extension; **open** — worth doing, small to medium; **later** — when a user
+needs it.
 
 ---
 
-## Blockers
+## Release (the owner's)
 
-1. **Documentation.** `docs/` is 476 lines and covers none of: the `ACL ADMIN` grammar (all forms,
-   COLUMNS/RLS/CAPS, quoting rules of spec 065, references of spec 022) and the `acl_*` equivalents;
-   starting and stopping the doors (`acl_flight_serve/stop`, `acl_quack_serve/stop`, TLS forms,
-   preconditions, session knobs, `acl_sessions`/`acl_session_kill`, drain of spec 066); auth
-   (issuers/JWKS, client_id, discovery, the password handshake); the policy catalog (`acl_use_db`,
-   schema versions and migrations); deployment invariants; the accepted risks of spec 065; the
-   error-prefix contract; and one paragraph deciding **what a live alias means when the source
-   grows** — a catalog-wide `ssn = NULL` does not cover an `ssn_backup` added later, and a schema
-   alias shows a whole new table. Memory mode leaves the quickstart (it cannot serve, list or read a
-   JWKS); the eight legacy wrappers are labelled legacy.
-2. ~~**Spec 043 — concurrency and isolation across roles**~~ — implemented 2026-09-04: the
-   in-process half (`test_acl_concurrency.cpp`, under ASan/UBSan in CI; `acl_interleave.test`) and
-   the door harness with all seven assertions (a reader during a drain, a client killed
-   mid-statement, the cross-source join under load on a postgres × ducklake leg). The harness runs
-   locally against docker sources (`make test-e2e`); CI has the sources but does not run it yet -
-   wiring it into the linux job is the open piece. It found one bug on the way (an RLS-only
-   relation listed without columns; fixed).
-3. **Audit** (decided 2026-09-03: in the release). An event per engine decision — principal
-   (subject/roles), statement class, objects and capability, verdict with reason, a correlation id
-   supplied by the caller, **never data**; where it is written, how it is read, how it cannot become
-   a DoS vector. The cluster repo depends on this existing; it cannot reconstruct it. After 043.
-4. **One migration (v13)**: `CatalogDropRelation` reads before it writes and then writes twice,
-   outside the one-transaction shape the other writers use — a half-applied drop leaves access the
-   admin believes is gone; the write-only `schema_aliases` shadow table goes (written in four places,
-   read nowhere in table mode; "kept for a rollback" — there was no release to roll back to). Plus
-   the check the migration README promises and nothing runs: a catalog migrated from n−1 and one
-   created at n have the same columns in the same order. (The `kind` column for `role_object_caps`
-   moved to *Later*: it changes the function-driver slot contract, not only the table.)
-5. **Review findings of 2026-09-03** (each small, each real):
-   - `PolicyStore::SessionOpen`'s JWT branch does not merge role-default claims (memory
-     `role_claims` and `CatalogLoadRoleClaims`), unlike `VerifyPrincipal`/`VerifyJwtPrincipal`: the
-     same token yields different claims through a door than through a gateway prefix, and an RLS
-     predicate on a role-default claim bakes NULL — zero rows through both doors, full rows through
-     the gateway. Route `SessionOpen` through the verifier.
-   - `acl_jwt_clock_skew` is registered without a scope (session), read through the instance:
-     `SET` reports success and changes nothing. `acl_max_sessions` falls back to 10000 against a
-     registered default of 1000.
-   - Two doors, three duplicated helpers that already disagree: `JsonEscape` (`acl_sessions()`)
-     emits control bytes raw — invalid JSON from a claim value — where `JsonQuote` escapes them;
-     `ReadPem` exists twice; the serve preconditions are inline in `acl_quack_serve`, which — unlike
-     Flight — **binds a non-localhost address in the clear without refusing**. One
-     `acl_door_common` for all three.
-   - `MintId`/`MintCookieId` (the Flight session cookie is a bearer credential) mint without the
-     guard `MintHandle` carries against MinGW's deterministic `std::random_device` — a supported
-     target. One shared CSPRNG helper.
-   - The door registries are process-wide with no instance identity: `acl_flight_stop` from
-     instance B closes B's sessions while A's door dies; `AclQuackServerCount()` is process-wide, so
-     A never clears `door_open`. A `weak_ptr<DatabaseInstance>` on the door, per-instance counts, a
-     two-instance test.
-6. **Release mechanics.** No publication exists: `distribution.yml` builds nine platforms and
-   publishes nothing. A release job over its artifacts — `SHA256SUMS.txt`, GitHub release
-   (pre-release on a `-` in the tag), build-provenance attestation. Two `description.yml` with
-   different versions and a memory-mode `hello_world` become one; `README.md` teaches catalog mode;
-   the stale `ACL_FLIGHT=1` references go (the flags are default-on now). The duckdb pin: track
-   `main` until the 2.0 tag, then pin to it; first release after 2.0, community-extensions alongside.
+- Licensing: BUSL Change Date and Licence, Additional Use Grant, CLA/DCO - with counsel.
+- An rc tag through the release job (`distribution.yml`: one file per platform, `SHA256SUMS.txt`,
+  provenance attestations, pre-release on a `-`).
+- Re-pin duckdb to the `v2.0.0` tag when it is cut (and acl-otel, tresor the same day), then the
+  community-extensions submission (`packaging/community-extensions/description.yml`).
 
-## Pre-release, if cheap
+## Platform
 
-- **The schema renders only for the schema name `acl`** (`scripts/gen_schema.py` hard-substitutes
-  it); an operator with another name edits a generated file its header forbids editing.
-- ~~File the duckdb-postgres upstream issue~~ — moot: upstream fixed it from both sides without
-  us (duckdb-postgres fffcb35, 2026-09-02, "Allow non-preparable queries in postgres_query";
-  ducklake 7f2f82c, 2026-09-01, the metadata batches split). Our postgres patch is retired (the
-  duckdb 2.0 branch pins fffcb35); ducklake is pinned ahead of the submodule (7f0ece3) with one patch
-  of the branch's own (the columns virtual) until the submodule's ducklake pin passes 7f2f82c.
-- ~~**The listing marks a broken object**~~ — done in spec 039 (2026-09-08): the tables surfaces
-  carry the mark in the object's comment.
-- ~~**Spec 039 — catalog maintenance**~~ — implemented 2026-09-08: `acl_check_catalog([vcat])` /
-  `CHECK VIRTUAL CATALOG`, `acl_repair_relation(…)` / `REPAIR VIRTUAL TABLE`.
-- ~~**A principal's functions surface**~~ — implemented by spec 098: `duckdb_functions()` answers what
-  the principal may call, virtual functions with their parameters. Open: the result columns of a
-  virtual table function - a listing `acl_function_columns([name])` (owner, 2026-10-02).
-- **A virtual function call ignores its qualifier** (found by the spec 098 review): the rewriter
-  resolves calls by the bare name, so `c.main.shout()` or `phys.main.shout()` reach the MAIN catalog's
-  `shout`, and another granted catalog's functions cannot be called at all. No widening (it is the
-  principal's own function), but the written name is not the one resolved.
+Designed in `design/017-hugr-platform` (local), the owner's decisions in its §7. What duckdb-acl itself
+owes phase 1 is done: `config.applied/target` in the load report (096), the `observe` scope (097),
+the cluster profile (093) and the schema window (094). The rest lives in new repositories:
+
+- **The node agent `hugr_node`** (`hugr-lab/hugr-node`, BUSL, a C++ duckdb extension on the same pin):
+  - `hugr_node_join` under workload identity: the signed profile, applied in 009's order;
+  - the extension veto (`OnBeginExtensionLoad`) and `lock_configuration`;
+  - heartbeat; executing hot / drain→apply / restart (spec 066's `acl_drain`).
+- **The control plane** (`hugr-lab/hugr-platform`, BUSL, Go):
+  - one organisation, node pools, signed profiles, heartbeat, API (phase 1);
+  - the stateless front / router and autoscale come with phase 2.
+- **The extension repository** (`hugr-lab/duckdb-extension-repository`, open source):
+  - duckdb's versioned layout, `/.well-known/duckdb-extension-repo.json`;
+  - mirror / pull-through / publish, everything re-signed with our key;
+  - public vs private extensions (a token through an http secret, tresor-issued);
+  - air-gapped bundles.
+- **Still open with the owner**:
+  - 017 §7.4: rebuild others' extensions, or mirror the official binaries;
+  - §7.9: the repository's licence;
+  - §7.3: where the signing key lives (HSM / Key Vault) and how it rotates;
+  - the pin checks of §3.4: does `INSTALL` honour http secrets, and is it only through httpfs?
+
+## Open
+
+- **A virtual function call ignores its qualifier** (spec 098 review): the rewriter resolves calls by
+  the bare name, so `c.main.shout()` or `phys.main.shout()` reach the MAIN catalog's `shout`, and
+  another granted catalog's functions cannot be called at all. No widening (it is the principal's
+  own function), but the written name is not the one resolved.
 - **Two parsers for one `params` column** (spec 098 review): the listing's `SplitParams` (depth-aware,
   quoted names, defaults) and `CatalogBackend::ParseDeclaration` (splits at every comma, so
   `DECIMAL(10, 2)` breaks; a lone word is a type) - the reference check (`TO FUNCTION f(param => col)`)
   and the listing can disagree on names. One shared parser.
-- **`duckdb_types()` under a `meta` grant names attached databases** (spec 098 review): not a
-  substituted surface; it lists the types of every catalog with `database_name`.
 - **The listings scan every attached catalog** (`information_schema.columns` for the table surfaces,
   `duckdb_functions()` for spec 098): an unreachable scanner catalog fails a principal's listing with
   the scanner's own error text.
-- ~~**Error-prefix contract**~~ — written down in `website/docs/security.md` §8 (the prefix is the contract,
-  the exception class says which kind of thing went wrong, the wording is not promised); file and
-  socket failures of a serve are `IOException`. `acl_rewrite: token rejected` never leaves
-  `SessionOpen` - it is caught there and a door gets NULL/false.
-- **The Flight door has no sqllogictest coverage** (only e2e, skipped on PRs): serve-argument
-  validation is reachable from SQL; `DoorAuthJson` has no test at all.
-- ~~**`test/harness/run.sh` exits 1**~~ — done (#103): the demo speaks the catalog model and the
-  runner judges the transcript. Not yet wired into CI.
-- Refactors before release (design/RELEASE-PLAN.md phase 4): ~~the `ACL ADMIN` grammar out of
-  `acl_parser_override.cpp`~~ (#99); ~~`acl_policy_catalog.cpp` split into read path / admin writers /
-  listings / validators~~ (#102); the quack door lifecycle next to its server (#105);
-  ~~`door_open` atomic; `acl_schema_sql.hpp` out of the public headers~~ (done with this line).
-  Still open: the error-prefix contract (4.4).
+- **The Flight door has no sqllogictest coverage beyond `acl_flight_serve.test`**: `DoorAuthJson` has
+  no test of its own (the e2e covers it end to end).
+- **The standalone `schema/acl_schema.sql` is rendered for the schema name `acl`**: the extension
+  takes any name (`acl_use_db(db, schema)`), the file for another engine does not.
+- **Spec follow-ups**:
+  - 098: the result columns of a virtual table function, `acl_function_columns([name])`.
+  - 099: the type gate in the file readers' column-type parameters (`read_csv(types := …)`,
+    `read_json(columns := …)`) - the readers are in no role's default category.
+  - 099: the mssql leg of `test/e2e/door/types.sh` needs an mssql build of the current pin.
+  - 102: writes through an object-declared narrowing (it is read-only: the object stores the
+    compiled expression); a `[]` narrowing is read-only by design; LATERAL in a write statement's
+    subqueries is not walked; the write expression grows ~2^depth.
+- **Issue #175**: the cluster profile's `DEPENDS ON` cycle check scoped to the edges one node runs.
 
 ## Later
 
-- **The Flight door materializes every result** before streaming and holds the session's `exec`
-  lock while doing it; a lazy `RecordBatchReader` and an `acl_max_result_rows` mirroring ingest.
 - **Write-time shape inference for views and table functions** (parse + PREPARE at save, read the
   result columns) so they opt into spec 065's clean refusals without a hand-typed list.
 - **Nested virtual schemas are presented flat** (`parent_schema_oid` NULL); fine until a virtual
   catalog actually nests.
-- ~~**JWKS**: an allowlist for `KEYS FROM` locations and a listing of what the cache holds.~~ - spec 071
-  (2026-09-08): `acl_jwks_locations`, `acl_jwks_cache()`, `acl_jwks_refresh()`.
-- **Mid-ingest failure semantics**: if the process dies mid-ingest, the client must be told to
-  restart rather than silently receive a partial load.
 - **The session-identity sweep, the nice version**: `current_setting`/`getvariable` are *denied*
-  (safe); answering them under the principal is the in-statement half of settings, with item 5.
-- `oidc::TokenCache` is process-global with a dead `owner` parameter; `catalog` pointer read
+  (safe); answering them under the principal is the in-statement half of settings (spec 068).
+- `oidc::TokenCache` (duckdb-ext-common) is process-global with a dead `owner` parameter; `catalog` pointer read
   unsynchronized (setup-time only; TSan will report it); the nine mutexes have no written order;
   `FunctionAllowed`'s denylist lookup takes the store lock per function reference.
-- `acl_refresh_schema` does not re-probe grant projections; a view over a dropped object is not
-  detected; `acl_refresh_schema_objects` and an object's own list — unverified. Spec 039's family.
 - Temp objects in the columns surfaces and `SHOW ALL TABLES` (spec 050 exclusions); `GetXdbcTypeInfo`
   (spec 046) — when a tool needs them. Physical-PK import at `CREATE VIRTUAL TABLE` and
   `duckdb_constraints()` as a principal surface (spec 048).
@@ -147,12 +98,11 @@ before if cheap; **later** — development, after the release.
   if a client keys on them).
 - MySQL integration is skipped (patches do not apply at the pin); `container_name:` fixed in compose;
   255 characters for SQL Server key columns is a guess.
-- Untested drift cells (catalog-level alias, DML under drift, metadata in the dead state) — after the
-  live-alias decision in item 1.
+- Untested drift cells (catalog-level alias, DML under drift, metadata in the dead state); the
+  live-alias decision itself is written in `website/docs/security.md` §7.
 - **PEG / grammar extension — closed until upstream lands a grammar-registration API** (decision
   2026-09-03, spec 067 pinned today's semantics; no question posted). Reopen when
   `ParserCache::GetMatcher` stops building only `CreateDefault()`.
-- Licensing (BUSL Change Date and Licence, Additional Use Grant, CLA/DCO) — the owner's, with counsel.
 
 ## Done (for orientation; the specs keep the history)
 
@@ -165,4 +115,8 @@ Live validation → 057. Name-tight refusals, COLUMNS unquoting, `sql` never NUL
 prefix → 067. Client-local settings (TimeZone/Calendar on a session) → 068. Management and native SQL over a session (scope-gated, passthrough = the operator path over a door) → pinned in test_acl_session.cpp. Migration loader → resolved by decision (the extension refuses an older stamp and points
 at `v<n>.sql`; v11, v12 applied for real); schema version = 12. Distribution on every merge to main →
 PR #84. The whole `test/sql` in CI + schema-check + sync.py drift → PR #85. Windows/MSVC → covered by
-the distribution matrix on merge. PEG spike → design/014; ADBC driver spike → design/012.
+the distribution matrix on merge. PEG spike → design/014; ADBC driver spike → design/012. The first
+list's blockers: docs → 087 (website/docs), audit → 069, v13 (one-transaction drops, the shadow table gone), review findings of
+2026-09-03, e2e and harness in CI, the release job. Flight streaming and `acl_max_result_rows` → 070;
+a cancelled ingest rolls back → 070; the JWKS allowlist → 071; types under the ACL → 099; fields of
+structured types → 102; `duckdb_types()` → 099.
