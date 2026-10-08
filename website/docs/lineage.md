@@ -91,6 +91,19 @@ pipeline's run as their **parent**. The parent is OpenLineage's `OPENLINEAGE_PAR
 
 A request's headers take precedence over the session's settings.
 
+**A parent is checked where it enters** (spec 109). It must have the form `<namespace>/<job>/<runId>`,
+with a UUID as the runId: OpenLineage's parent facet requires one, and a backend refuses an event
+that carries anything else.
+
+- **The marker and `SET`.** A malformed value refuses the statement or the SET, with a message that
+  repeats nothing of the value.
+- **A Flight header.** A malformed value fails the call with `InvalidArgument`.
+- **A quack header.** quack cannot return a message here, so a malformed value is ignored: the
+  statement runs with no parent. A `door` event `lineage_parent_invalid` is written once per
+  connection, and every occurrence is counted in `acl.lineage.parent_invalid`.
+
+`JOB` is free text.
+
 - **The headers of an http secret** are set once per attached connection: put there what is constant
   for the connection (the root run, the job), and leave the parent - which changes per step - to SET.
 - **SET carries a step's own parent.** A dbt pre-hook on a quack-attached node:

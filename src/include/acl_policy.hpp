@@ -28,6 +28,7 @@
 #include <list>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace duckdb {
 class DatabaseInstance;
@@ -368,6 +369,8 @@ struct PolicyStore {
 	//! authorization callback, which may run on any of the instance's threads. Ended with the connection.
 	mutex quack_lineage_lock;
 	unordered_map<string, std::array<string, 3>> quack_lineage; // parent, root_parent, job
+	//! spec 109: the connections whose malformed parent was already reported (once each)
+	std::unordered_set<string> quack_lineage_reported;
 	//! spec 078: the session opens and closes, delivered to acl_connection.hpp's observers
 	SessionNotifier session_notices;
 	//! Declared BEFORE a method's lock_guard, so its destructor runs after the lock is released: the

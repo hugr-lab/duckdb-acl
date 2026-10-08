@@ -571,7 +571,9 @@ no run (a prepared physical write is rebound per execution).
 The walker (`acl_lineage_walker.{hpp,cpp}`) maps bindings to source fields with OpenLineage's
 transformations and spec 102 paths. Context: `LINEAGE PARENT/ROOT/JOB` prefix marker,
 `acl_lineage_parent/_root_parent/_job` (068 allowlist, session record), Flight and quack
-`x-openlineage-*` headers. Settings `acl_lineage_*` (GLOBAL); `acl_lineage_flush()`,
+`x-openlineage-*` headers - a parent / root must be `<ns>/<job>/<UUID>` (spec 109, `LineageRunRefCheck`):
+refused at the marker / SET, Flight `InvalidArgument`, quack blanked + one `door` event
+`lineage_parent_invalid`. Settings `acl_lineage_*` (GLOBAL); `acl_lineage_flush()`,
 `acl_lineage_resend([vcat])`. Transport is acl-otel's.
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two

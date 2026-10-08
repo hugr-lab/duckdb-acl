@@ -339,6 +339,14 @@ public:
 		// the client's). A RESET clears it.
 		if (StringUtil::CIEquals(name, "acl_correlation_id") || StringUtil::CIEquals(name, "acl_traceparent") ||
 		    LineageClientSetting(name)) {
+			// spec 109: a parent is judged HERE, before it lands on the record - duckdb's own check of the
+			// SET runs after the rewrite, and the record composes every later statement of the session
+			string malformed;
+			if ((StringUtil::CIEquals(name, "acl_lineage_parent") ||
+			     StringUtil::CIEquals(name, "acl_lineage_root_parent")) &&
+			    !LineageRunRefCheck(value, malformed)) {
+				Deny(Reason::SETTING_DENIED, name + ": " + malformed);
+			}
 			store.SetSessionTrace(principal.session, name, value);
 		}
 	}

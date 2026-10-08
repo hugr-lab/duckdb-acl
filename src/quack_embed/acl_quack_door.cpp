@@ -13,6 +13,7 @@
 #include "duckdb/storage/buffer_manager.hpp"
 #include "quack_fetch_collector.hpp"
 #include "quack_rebalancer_sink.hpp"
+#include "acl_lineage.hpp"
 #include "acl_quack_fetch_window.hpp"
 #include "acl_node_load.hpp"
 
@@ -202,6 +203,12 @@ void AclQuackStopFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 		// The last door is closed, so the fence on unprefixed statements lifts with it: a drained
 		// stream is once again nobody's business but quack's own (spec 043).
 		store.SetDoorOpen(false);
+		{
+			// spec 107 / 109: the connections' noted headers end with the last door
+			lock_guard<mutex> guard(store.quack_lineage_lock);
+			store.quack_lineage.clear();
+			store.quack_lineage_reported.clear();
+		}
 		auto closed = store.SessionCloseAll();
 		result.SetValue(row, Value(note + " (" + std::to_string(closed) + " session(s) closed)"));
 	}
@@ -466,8 +473,37 @@ void AclQuackNoteRequestLineage(DatabaseInstance &db, const string &connection_i
 	if (!store) {
 		return;
 	}
-	lock_guard<mutex> guard(store->quack_lineage_lock);
-	store->quack_lineage[connection_id] = {parent, root_parent, job};
+	// only a connection the door bound a session to: a request names its connection id before quack
+	// has checked it, and an id nobody authenticated would sit in the map (and report) forever
+	string handle;
+	if (!store->SessionHandleFor(connection_id, handle)) {
+		return;
+	}
+	// spec 109: a parent the transport would drop is not taken. quack's authorization cannot carry a
+	// message back, and refusing the statement for a header would read as an access refusal - so the
+	// value is left out, said once per connection as a door event, and counted
+	string error;
+	bool parent_ok = LineageRunRefCheck(parent, error);
+	bool root_ok = LineageRunRefCheck(root_parent, error);
+	bool first_report = false;
+	{
+		lock_guard<mutex> guard(store->quack_lineage_lock);
+		auto &entry = store->quack_lineage[connection_id];
+		entry = {parent_ok ? parent : string(), root_ok ? root_parent : string(), job};
+		if ((!parent_ok || !root_ok) && !store->quack_lineage_reported.count(connection_id)) {
+			store->quack_lineage_reported.insert(connection_id);
+			first_report = true;
+		}
+	}
+	if (!parent_ok || !root_ok) {
+		if (store->hooks) {
+			store->hooks->Counters().Add("acl.lineage.parent_invalid", {{"door", "quack"}});
+		}
+		if (first_report) {
+			store->AuditDoor("quack", "lineage_parent_invalid", false, "parse",
+			                 "x-openlineage-parent / -root-parent: " + error);
+		}
+	}
 }
 
 void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how) {
@@ -476,6 +512,7 @@ void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, c
 			{
 				lock_guard<mutex> guard(store->quack_lineage_lock);
 				store->quack_lineage.erase(connection_id);
+				store->quack_lineage_reported.erase(connection_id);
 			}
 			store->SessionEndBound(connection_id, how);
 		}
