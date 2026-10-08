@@ -6,8 +6,9 @@
 // from, with OpenLineage's transformation:
 //   - a column reference: DIRECT/IDENTITY; an expression: DIRECT/TRANSFORMATION; an aggregate:
 //     DIRECT/AGGREGATION;
-//   - join / filter / group / sort / window keys: INDIRECT edges to the whole target; a CASE
-//     condition: INDIRECT/CONDITIONAL on the field it decides.
+//   - join / filter / group / sort keys: INDIRECT edges to the whole target; a window's partition
+//     and order keys: INDIRECT/WINDOW on the field it computes; a CASE condition:
+//     INDIRECT/CONDITIONAL on the field it decides.
 // struct_extract / struct_extract_at with a constant key, and list_transform(l, x -> x.f), extend
 // a field path (spec 102's spelling: `address.city`, `items[].price`).
 //
@@ -63,7 +64,7 @@ struct LineageWalk {
 	vector<LineageDatasetKey> datasets;
 	//! The fields of the walked root (a query's result), or of the DML / CTAS target.
 	vector<LineageOutput> outputs;
-	//! INDIRECT edges to the whole target: filter / join / group / sort / window keys.
+	//! INDIRECT edges to the whole target: filter / join / group / sort keys.
 	vector<LineageContribution> whole_target;
 	//! The DML or CTAS target, when the root writes; `has_target` false for a query.
 	bool has_target = false;

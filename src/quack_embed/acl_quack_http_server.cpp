@@ -17,6 +17,7 @@
 // is compiled in.
 //===----------------------------------------------------------------------===//
 
+#include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
@@ -403,20 +404,24 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 			stream.WriteData((data_ptr_t)data, data_length);
 			return true;
 		});
-		// spec 107: the request's lineage context, for the authorization callback on this thread
-		QuackRequestLineage lineage;
-		lineage.parent = req.get_header_value("x-openlineage-parent");
-		lineage.root_parent = req.get_header_value("x-openlineage-root-parent");
-		lineage.job = req.get_header_value("x-openlineage-job");
-		quack_request_lineage = &lineage;
-		unique_ptr<QuackMessage> response;
-		try {
-			response = HandleMessage(stream);
-		} catch (...) {
-			quack_request_lineage = nullptr;
-			throw;
+		// spec 107: the request's lineage context, noted by its connection for the authorization callback
+		auto parent = req.get_header_value("x-openlineage-parent");
+		auto root_parent = req.get_header_value("x-openlineage-root-parent");
+		auto job = req.get_header_value("x-openlineage-job");
+		if (!parent.empty() || !root_parent.empty() || !job.empty()) {
+			try {
+				stream.Rewind();
+				BinaryDeserializer peek(stream);
+				auto header = QuackMessage::DeserializeHeader(peek);
+				auto owner = db_ptr.lock();
+				if (owner && !header.connection_id.empty()) {
+					acl::AclQuackNoteRequestLineage(*owner, header.connection_id, parent, root_parent, job);
+				}
+			} catch (...) {
+				// a message that does not parse is HandleMessage's to refuse
+			}
 		}
-		quack_request_lineage = nullptr;
+		auto response = HandleMessage(stream);
 		auto raw = response->RawPayload();
 		if (raw) {
 			// already serialized: httplib sends the bytes with no copy (quack f4328c5: the wire header

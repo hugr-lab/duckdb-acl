@@ -132,9 +132,7 @@ which every node of a cluster sees.
     that role.
   - `acl.role.<role>` = the capabilities, on the dataset.
   - `acl.role.<role>.rls` = `true` when a predicate applies.
-  - A grant mask adds its input edges with `masking=true`, tagged with the role.
-  - With `acl_lineage_roles = datasets`, the node emits one dataset per role instead: `…@<role>`, with
-    a symlink to the canonical one and only the visible edges. The default is `tags`.
+  - (Not built - see As built: a grant mask's input edges, and `acl_lineage_roles = datasets`.)
 - **Physical view.** Its body is bound at CREATE, and its lineage is taken from that plan.
 - **DROP.** `lifecycleStateChange=DROP`, no edges.
 
@@ -283,7 +281,7 @@ virtual datasets and fields it read.
     keeps its contract.
 - **Settings:**
   - `acl_lineage_level` = `off` (default) | `on` - GLOBAL, a cluster item;
-  - `acl_lineage_namespace`, `acl_lineage_identity`, `acl_lineage_sql`, `acl_lineage_roles` - GLOBAL,
+  - `acl_lineage_namespace`, `acl_lineage_identity`, `acl_lineage_sql` - GLOBAL,
     cluster items;
   - `acl_lineage_physical` = `true` (default) | `false` - drops physical datasets and edges, for a
     catalog that must not see the topology.
@@ -408,8 +406,9 @@ function proves it is never bound twice).
   The rest follows from that:
   - the DML target is a real `LogicalInsert` / `LogicalUpdate` / `LogicalMergeInto`, so no
     statement is translated into a SELECT;
-  - no foreign bind runs again on the node: a table function in the statement binds in the scratch
-    database without external access, or fails to `approximate`.
+  - a table function in the statement binds in the scratch database without external access, or
+    fails to `approximate`. The node does bind each relation's rewritten `SELECT *` once more, on the
+    worker (for a scanner: its catalog's metadata, never a row).
 
   `TablePolicy::canonical` (the `vcat.vname` a name resolved to) was added for this.
 - **The job is carried by the profile note.** `AuditTrail::Statement::lineage` → `ProfileNote::lineage`
@@ -430,10 +429,43 @@ function proves it is never bound twice).
 - **The physical job is named by its kind.** It is `physical:<operation>`, because a physical
   statement's text is not parsed again on the hook.
 
+**After the three review passes (2026-10-08):**
+
+- **Static events are the worker's too.** `NoteDefinitionLineage` / `NoteGrantLineage` queue a task;
+  the write never waits on a probe of its source, and nothing lineage does can fail a write that
+  already committed. A role whose grant no longer resolves (spec 038's mask over a vanished column)
+  gets no tags; the other roles and objects still do. `acl_lineage_flush()` waits for the tasks.
+- **The scratch database loads no extension but `core_functions`, `json`, `icu`** (one thread,
+  64 MB): never acl itself.
+- **A PREPARE is no run.** The hook marks it; a prepared physical statement is bound again by each
+  execution (`always_require_rebind`, as duckdb does for one that reads a database), and SQL `EXECUTE`
+  is captured through its rebound child.
+- **Names bind as written.** A mirror is placed under the name the statement wrote (`c.sink`, a
+  schema alias), mapped back to the canonical dataset; a target the principal may write but not read
+  is mirrored from its physical relation under the names it writes.
+- **An INSERT whose source does not bind** (the Flight door's `arrow_scan()`, a quack drain) still
+  names its target and the fields it wrote, `approximate`. A run's target lists the fields written,
+  whatever their sources.
+- **The walker**: VALUES, delim joins, a MARK join's mark, PIVOT and GROUPING() are resolved;
+  `unnest(items)` and `items[1]` read `items[]`; a field read from a struct built in the statement
+  (`struct_pack(…).a`) is not a path; MERGE's INSERT branch writes its fields.
+- **Table functions**: a virtual table function's `DATASET` (`TABLE_FUNCTION`) at add and drop - a
+  macro's body walked with its arguments as typed NULLs, an alias's declared result; re-sent with
+  its catalog. No per-role tags (a function's grant narrows no field).
+- **quack headers** are noted by the request's quack connection id, not a thread_local: the
+  authorization callback runs inside a query, on any of the instance's threads.
+- The SQL facet blanks a PIVOT's values; an ATTACH's type is a scanner's prefix or `duckdb`.
+- **Dropped from the design**: `acl_lineage_roles = datasets` and a grant mask's `masking` edges (a
+  grant is per role: its masks and predicate are the role's tags), symlinks,
+  the `dropped` notice event (drops are the counter `acl.lineage.dropped`), `acl.lineage.shadow_us`.
+  The memory store emits no lineage: only a policy catalog has the definitions to read back.
+- **Known:** a job or task in flight holds the instance until it ends: a database closed meanwhile
+  is torn down when the job finishes, on the worker's thread (bounded by one bind or one probe).
+
 **Tests:**
 
-- `test/sql/acl_lineage.test` - 216 assertions: static, runtime, physical, tags, namespaces,
-  context, privacy;
+- `test/sql/acl_lineage.test` - 336 assertions: static, runtime, physical, tags, namespaces,
+  context, privacy, and the review's regressions;
 - `test/sql/integration/acl_lineage_quack.test` - the quack door's headers and SET;
 - `test/cpp/test_acl_lineage_walker.cpp` - 25 checks.
 

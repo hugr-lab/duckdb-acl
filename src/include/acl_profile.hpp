@@ -55,6 +55,8 @@ struct ProfileNote {
 bool StatementDecidedVirtual(ClientContext &context, Principal &principal, string &door);
 //! spec 107: the running statement's physical lineage, emitted by QueryEnd with its outcome.
 void SetPhysicalLineage(ClientContext &context, shared_ptr<PhysicalLineage> lineage);
+//! spec 107: the running statement is a PREPARE - no execution, so no run at its QueryEnd.
+void MarkPreparing(ClientContext &context);
 
 //! The hash a note and an execution are matched by; never the text.
 uint64_t StatementTextHash(const string &text);

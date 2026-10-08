@@ -121,6 +121,40 @@ bool IsStructExtract(const string &name) {
 	return name == "struct_extract" || name == "struct_extract_at";
 }
 
+bool IsListElement(const string &name) {
+	return name == "list_extract" || name == "array_extract" || name == "list_element";
+}
+
+//! Whether an expression's value is a column's value or a part of it, so a field read from it extends
+//! the column's path: a column, a cast of one, a field or an element of one. A struct built here
+//! (struct_pack, a row) has no path of its own - `struct_pack(a := x).a` is x, not `x.a`.
+bool PathPreserving(const Expression &expr) {
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_COLUMN_REF:
+		return true;
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		if (BoundCastExpression::IsCast(expr)) {
+			return PathPreserving(BoundCastExpression::Child(function));
+		}
+		auto name = LowerName(function.Function().GetName().GetIdentifierName());
+		return (IsStructExtract(name) || IsListElement(name)) && !function.GetChildren().empty() &&
+		       PathPreserving(*function.GetChildren()[0]);
+	}
+	default:
+		return false;
+	}
+}
+
+//! Every DIRECT field of a lineage extended by a suffix (`.a`, `[]`).
+void ExtendFields(BindingLineage &lineage, const string &suffix) {
+	for (auto &item : lineage.direct) {
+		if (!item.field.empty()) {
+			item.field += suffix;
+		}
+	}
+}
+
 //! For a lambda body `x.a.b` over the lambda's first parameter: ".a.b"; "" when it is anything else.
 string LambdaFieldSuffix(Expression &body, const LogicalType &element) {
 	vector<string> keys;
@@ -165,6 +199,25 @@ private:
 	const LineageWalkOptions &options;
 	column_binding_map_t<BindingLineage> bindings;
 	unordered_map<idx_t, vector<ColumnBinding>> ctes; // a CTE's table index -> its definition's bindings
+	vector<vector<BindingLineage>> delim_columns;     // the enclosing delim joins' eliminated columns
+
+	//! A join's conditions, INDIRECT/JOIN on the whole target; a MARK join's mark is what they read.
+	void Joined(LogicalOperator &op) {
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		BindingLineage condition_reads;
+		for (auto &condition : join.conditions) {
+			if (condition.IsComparison()) {
+				Merge(condition_reads, Resolve(condition.GetLHS()));
+				Merge(condition_reads, Resolve(condition.GetRHS()));
+			} else {
+				Merge(condition_reads, Resolve(condition.GetJoinExpression()));
+			}
+		}
+		AddWhole(condition_reads, "JOIN");
+		if (join.join_type == JoinType::MARK) {
+			Set(ColumnBinding(join.mark_index, ProjectionIndex(0)), Transformed(condition_reads));
+		}
+	}
 
 	BindingLineage Lookup(const ColumnBinding &binding) {
 		auto entry = bindings.find(binding);
@@ -217,13 +270,23 @@ BindingLineage Walker::ResolveFunction(BoundFunctionExpression &function) {
 		auto key = StructKey(function);
 		if (!key.empty()) {
 			auto lineage = Resolve(*function.GetChildren()[0]);
-			for (auto &item : lineage.direct) {
-				if (!item.field.empty()) {
-					item.field += "." + key;
-				}
+			if (PathPreserving(*function.GetChildren()[0])) {
+				ExtendFields(lineage, "." + key);
+				return lineage;
 			}
-			return lineage;
+			return Transformed(std::move(lineage));
 		}
+	}
+	if (IsListElement(name) && function.GetChildren().size() == 2 &&
+	    function.GetChildren()[0]->GetReturnType().id() == LogicalTypeId::LIST &&
+	    PathPreserving(*function.GetChildren()[0])) {
+		// `items[1]`: an element of the list - the path says which list, the index which rows of it
+		auto lineage = Resolve(*function.GetChildren()[0]);
+		ExtendFields(lineage, "[]");
+		for (auto &item : AsIndirect(Resolve(*function.GetChildren()[1]), "CONDITIONAL")) {
+			AddUnique(lineage.indirect, item);
+		}
+		return lineage;
 	}
 	if (name == "list_transform" && !function.GetChildren().empty() &&
 	    function.GetChildren()[0]->GetReturnType().id() == LogicalTypeId::LIST) {
@@ -236,13 +299,9 @@ BindingLineage Walker::ResolveFunction(BoundFunctionExpression &function) {
 			body = function.BindInfo()->Cast<ListLambdaBindData>().lambda_expr.get();
 		}
 		auto suffix = body ? LambdaFieldSuffix(*body, element) : string();
-		if (!suffix.empty()) {
+		if (!suffix.empty() && PathPreserving(*function.GetChildren()[0])) {
 			auto lineage = Resolve(*function.GetChildren()[0]);
-			for (auto &item : lineage.direct) {
-				if (!item.field.empty()) {
-					item.field += "[]" + suffix;
-				}
-			}
+			ExtendFields(lineage, "[]" + suffix);
 			return lineage;
 		}
 	}
@@ -422,10 +481,12 @@ void Walker::VisitMerge(LogicalMergeInto &merge) {
 			} else if (action->action_type == MergeActionType::MERGE_INSERT) {
 				auto column_count = merge.table.GetColumns().PhysicalColumnCount();
 				for (idx_t physical = 0; physical < column_count; physical++) {
-					if (physical >= action->column_index_map.size()) {
-						continue;
-					}
-					auto source = action->column_index_map[PhysicalIndex(physical)];
+					// the binder keeps the map to itself and leaves one expression per physical column:
+					// an empty map is the identity
+					auto source = action->column_index_map.empty() ? physical
+					              : physical < action->column_index_map.size()
+					                  ? action->column_index_map[PhysicalIndex(physical)]
+					                  : DConstants::INVALID_INDEX;
 					if (source != DConstants::INVALID_INDEX && source < action->expressions.size()) {
 						AddOutput(TableColumnName(merge.table, physical), Resolve(*action->expressions[source]));
 					}
@@ -465,6 +526,24 @@ void Walker::Visit(LogicalOperator &op) {
 		}
 		return;
 	}
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN: {
+		// the duplicate-eliminated side first: its columns are what the other side's DELIM_GET reads
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		idx_t eliminated = join.delim_flipped ? 1 : 0;
+		if (op.children.size() == 2) {
+			Visit(*op.children[eliminated]);
+			vector<BindingLineage> columns;
+			for (auto &column : join.duplicate_eliminated_columns) {
+				columns.push_back(Resolve(*column));
+			}
+			delim_columns.push_back(std::move(columns));
+			Visit(*op.children[1 - eliminated]);
+			delim_columns.pop_back();
+			Joined(op);
+			return;
+		}
+		break;
+	}
 	default:
 		break;
 	}
@@ -492,6 +571,10 @@ void Walker::Visit(LogicalOperator &op) {
 		for (idx_t i = 0; i < aggregate.expressions.size(); i++) {
 			Set(ColumnBinding(aggregate.aggregate_index, ProjectionIndex(i)), Resolve(*aggregate.expressions[i]));
 		}
+		// GROUPING(): which grouping set a row belongs to - no value of the source
+		for (idx_t i = 0; i < aggregate.grouping_functions.size(); i++) {
+			Set(ColumnBinding(aggregate.groupings_index, ProjectionIndex(i)), BindingLineage());
+		}
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_WINDOW: {
@@ -508,15 +591,47 @@ void Walker::Visit(LogicalOperator &op) {
 		break;
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-	case LogicalOperatorType::LOGICAL_ASOF_JOIN: {
-		auto &join = op.Cast<LogicalComparisonJoin>();
-		for (auto &condition : join.conditions) {
-			if (condition.IsComparison()) {
-				AddWhole(Resolve(condition.GetLHS()), "JOIN");
-				AddWhole(Resolve(condition.GetRHS()), "JOIN");
-			} else {
-				AddWhole(Resolve(condition.GetJoinExpression()), "JOIN");
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+		Joined(op);
+		break;
+	case LogicalOperatorType::LOGICAL_EXPRESSION_GET: {
+		// VALUES: each column is what its rows' expressions read - constants read nothing
+		auto &get = op.Cast<LogicalExpressionGet>();
+		for (idx_t i = 0; i < get.expr_types.size(); i++) {
+			BindingLineage lineage;
+			for (auto &row : get.expressions) {
+				if (i < row.size()) {
+					Merge(lineage, Resolve(*row[i]));
+				}
 			}
+			Set(ColumnBinding(get.table_index, ProjectionIndex(i)), std::move(lineage));
+		}
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_DELIM_GET: {
+		auto &get = op.Cast<LogicalDelimGet>();
+		for (idx_t i = 0; i < get.chunk_types.size(); i++) {
+			BindingLineage lineage;
+			if (!delim_columns.empty() && i < delim_columns.back().size()) {
+				lineage = delim_columns.back()[i];
+			} else {
+				walk.approximate = true;
+			}
+			Set(ColumnBinding(get.table_index, ProjectionIndex(i)), std::move(lineage));
+		}
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_PIVOT: {
+		// the groups pass through; every pivoted column is an aggregate of the rest
+		auto &pivot = op.Cast<LogicalPivot>();
+		auto child = op.children.empty() ? vector<ColumnBinding>() : op.children[0]->GetColumnBindings();
+		BindingLineage aggregated;
+		for (idx_t c = pivot.bound_pivot.group_count; c < child.size(); c++) {
+			Merge(aggregated, Lookup(child[c]));
+		}
+		for (idx_t i = 0; i < pivot.bound_pivot.types.size(); i++) {
+			Set(ColumnBinding(pivot.pivot_index, ProjectionIndex(i)),
+			    i < pivot.bound_pivot.group_count && i < child.size() ? Lookup(child[i]) : aggregated);
 		}
 		break;
 	}
@@ -565,7 +680,17 @@ void Walker::Visit(LogicalOperator &op) {
 	case LogicalOperatorType::LOGICAL_UNNEST: {
 		auto &unnest = op.Cast<LogicalUnnest>();
 		for (idx_t i = 0; i < unnest.expressions.size(); i++) {
-			Set(ColumnBinding(unnest.unnest_index, ProjectionIndex(i)), Transformed(Resolve(*unnest.expressions[i])));
+			// an element of the list: `items[]`, and `.price` read from it after is `items[].price`
+			auto &expr = *unnest.expressions[i];
+			auto lineage = Resolve(expr);
+			bool element = expr.GetExpressionClass() == ExpressionClass::BOUND_UNNEST &&
+			               PathPreserving(*expr.Cast<BoundUnnestExpression>().Child());
+			if (element) {
+				ExtendFields(lineage, "[]");
+			} else {
+				lineage = Transformed(std::move(lineage));
+			}
+			Set(ColumnBinding(unnest.unnest_index, ProjectionIndex(i)), std::move(lineage));
 		}
 		break;
 	}

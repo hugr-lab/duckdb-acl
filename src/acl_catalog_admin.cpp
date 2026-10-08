@@ -610,8 +610,6 @@ std::pair<string, string> SplitProjectionItem(const string &item) {
 	return {expr, name};
 }
 
-} // namespace
-
 //! spec 107 §4: what each role holding `vcat` sees of `vcat.vname`, as OpenLineage tags - the
 //! capabilities on the dataset, `visible` / `masked` per field path, `.rls` when a predicate applies.
 //! A field the role does not see has no tag of that role. Resolved through the same policy a read
@@ -636,8 +634,12 @@ vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, co
 		Principal principal;
 		principal.roles = {role};
 		TablePolicy policy;
-		if (!store.ResolveTable(principal, vcat + "." + vname, policy) || policy.caps.empty()) {
-			continue;
+		try {
+			if (!store.ResolveTable(principal, vcat + "." + vname, policy) || policy.caps.empty()) {
+				continue;
+			}
+		} catch (std::exception &) {
+			continue; // a grant that no longer resolves (a mask over a vanished column, spec 038): no tags
 		}
 		auto key = "acl.role." + role;
 		vector<string> caps(policy.caps.begin(), policy.caps.end());
@@ -657,7 +659,7 @@ vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, co
 				return;
 			}
 			// spec 102: the column's own items - `address.city`, `address.ssn = NULL` - one tag per path
-			for (auto &item : StringUtil::Split(entry->second, ',')) {
+			for (auto item : SplitTopLevel(entry->second, ',')) {
 				StringUtil::Trim(item);
 				auto eq = item.find('=');
 				auto path = eq == string::npos ? item : item.substr(0, eq);
@@ -691,7 +693,27 @@ vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, co
 	return tags;
 }
 
+} // namespace
+
 void PolicyStore::NoteDefinitionLineage(const string &vcat, const string &vname, const string &lifecycle) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog || !lineage_worker || !LineageOn(*db)) {
+		return;
+	}
+	EnqueueLineageTask(*lineage_worker, [vcat, vname, lifecycle](PolicyStore &store) {
+		store.EmitDefinitionLineageNow(vcat, vname, lifecycle);
+	});
+}
+
+void PolicyStore::NoteGrantLineage(const string &vcat, const string &vname) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog || !lineage_worker || !LineageOn(*db)) {
+		return;
+	}
+	EnqueueLineageTask(*lineage_worker, [vcat, vname](PolicyStore &store) { store.EmitGrantLineageNow(vcat, vname); });
+}
+
+void PolicyStore::EmitDefinitionLineageNow(const string &vcat, const string &vname, const string &lifecycle) {
 	auto db = instance.lock();
 	if (!db || !audit || !catalog) {
 		return;
@@ -780,12 +802,93 @@ void PolicyStore::NoteDefinitionLineage(const string &vcat, const string &vname,
 	for (auto &output : walk.outputs) {
 		fields.push_back(output.name);
 	}
-	auto tags = RoleTags(*this, *catalog, vcat, vname, fields, source_columns);
+	vector<AuditLineageTag> tags;
+	try {
+		tags = RoleTags(*this, *catalog, vcat, vname, fields, source_columns);
+	} catch (std::exception &) {
+		tags.clear(); // the tags could not be made: the definition still goes out
+	}
 	EmitDefinitionLineage(*audit, *db, vcat, vname, form == "view" ? "VIEW" : "TABLE", lifecycle,
 	                      walked ? &walk : nullptr, tags);
 }
 
-void PolicyStore::NoteGrantLineage(const string &vcat, const string &vname) {
+void PolicyStore::NoteFunctionLineage(const string &vcat, const string &vname, const string &lifecycle) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog || !lineage_worker || !LineageOn(*db)) {
+		return;
+	}
+	EnqueueLineageTask(*lineage_worker, [vcat, vname, lifecycle](PolicyStore &store) {
+		store.EmitFunctionLineageNow(vcat, vname, lifecycle);
+	});
+}
+
+void PolicyStore::EmitFunctionLineageNow(const string &vcat, const string &vname, const string &lifecycle) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog) {
+		return;
+	}
+	auto settings = LineageSettings::Read(*db);
+	if (!settings.on) {
+		return;
+	}
+	if (lifecycle == "DROP") {
+		EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE_FUNCTION", lifecycle, nullptr);
+		return;
+	}
+	string form, template_sql, params;
+	vector<string> declared;
+	try {
+		auto row = catalog->Query("SELECT \"form\", \"template\", \"params\" FROM " + catalog->Tbl("functions") +
+		                          " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+		                          " AND \"kind\" = 'table'");
+		if (row->RowCount() == 0) {
+			return;
+		}
+		ResultRows rows(*row);
+		auto text = [&](idx_t col) {
+			return rows.GetValue(col, 0).IsNull() ? string() : rows.GetValue(col, 0).ToString();
+		};
+		form = text(0);
+		template_sql = text(1);
+		params = text(2);
+		auto columns =
+		    catalog->Query("SELECT \"name\" FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                   " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'table' ORDER BY \"pos\"");
+		ResultRows column_rows(*columns);
+		for (idx_t i = 0; i < columns->RowCount(); i++) {
+			declared.push_back(column_rows.GetValue(0, i).ToString());
+		}
+	} catch (std::exception &) {
+		EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE_FUNCTION", lifecycle, nullptr);
+		return;
+	}
+	LineageWalk walk;
+	bool walked = false;
+	if (form == "macro" && !template_sql.empty()) {
+		try {
+			// the arguments are NULLs of their declared types: the body's shape, never a value
+			walked = WalkDefinition(*db,
+			                        BakeTemplateForProbe(template_sql, ParserOptions::Builtin(), false,
+			                                             CatalogBackend::DeclaredTypes(params)),
+			                        settings.max_edges, walk);
+		} catch (std::exception &) {
+			walked = false;
+		}
+	}
+	if (!walked) {
+		// an alias of a physical function, or a body that does not bind: the declared result, no edges
+		walk = LineageWalk();
+		for (auto &name : declared) {
+			LineageOutput output;
+			output.name = name;
+			walk.outputs.push_back(std::move(output));
+		}
+		walk.approximate = true;
+	}
+	EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE_FUNCTION", lifecycle, &walk);
+}
+
+void PolicyStore::EmitGrantLineageNow(const string &vcat, const string &vname) {
 	auto db = instance.lock();
 	if (!db || !audit || !catalog || !LineageSettings::Read(*db).on) {
 		return;
@@ -806,8 +909,33 @@ void PolicyStore::NoteGrantLineage(const string &vcat, const string &vname) {
 		}
 	}
 	for (auto &object : objects) {
-		// the definition again, with the tags as they now stand; a grant is not a lifecycle change
-		NoteDefinitionLineage(vcat, object, string());
+		// the definition again, with the tags as they now stand; a grant is not a lifecycle change.
+		// One object that does not resolve (a source that drifted) costs its own event, not the rest's.
+		try {
+			EmitDefinitionLineageNow(vcat, object, string());
+		} catch (std::exception &) {
+		}
+	}
+	if (!vname.empty()) {
+		return;
+	}
+	// the catalog's table functions: their definitions (a function's grant narrows nothing per field)
+	vector<string> functions;
+	try {
+		auto rows = catalog->Query("SELECT \"vname\" FROM " + catalog->Tbl("functions") +
+		                           " WHERE \"vcat\" = " + Lit(vcat) + " AND \"kind\" = 'table' ORDER BY 1");
+		ResultRows function_rows(*rows);
+		for (idx_t i = 0; i < rows->RowCount(); i++) {
+			functions.push_back(function_rows.GetValue(0, i).ToString());
+		}
+	} catch (std::exception &) {
+		return;
+	}
+	for (auto &function : functions) {
+		try {
+			EmitFunctionLineageNow(vcat, function, string());
+		} catch (std::exception &) {
+		}
 	}
 }
 
@@ -1495,6 +1623,9 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 		statements.push_back(statement);
 	}
 	catalog->Write(statements);
+	if (kind == "table") {
+		NoteFunctionLineage(vcat, vname, "CREATE");
+	}
 }
 
 namespace {
@@ -2035,6 +2166,9 @@ void PolicyStore::CatalogDropFunction(const string &vcat, const string &vname, c
 		}
 		DropReferencesNaming(*catalog, vcat, pred, statements);
 	});
+	if (kind == "table") {
+		NoteFunctionLineage(vcat, vname, "DROP");
+	}
 }
 
 void PolicyStore::CatalogDropRole(const string &role) {

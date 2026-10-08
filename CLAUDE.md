@@ -558,13 +558,16 @@ source type). e2e: a narrowed struct through quack in `test/e2e/door/types.sh`.
 
 **Spec 107 — lineage for OpenLineage**: the node emits a `lineage` event kind (ext-common spec 014,
 `acl_audit` v3: `AuditLineage`, delivered only to sinks with `WantsLineage()` and to its own ring
-`acl_lineage_events()`, never the audit file). Static: virtual DDL (`NoteDefinitionLineage` after the
-write - the definition read back, bound, walked), grants (per-role tags `acl.role.<r>` = caps /
+`acl_lineage_events()`, never the audit file). Static: virtual DDL and table functions
+(`NoteDefinitionLineage` / `NoteFunctionLineage` after the write queue a task on the `LineageWorker` -
+the definition read back, bound, walked; a write never waits on it nor fails by it), grants (per-role tags `acl.role.<r>` = caps /
 `visible` / `masked` per field path / `.rls`), ATTACH/DETACH (`NAMESPACE`). Runtime: writes (and a read
 under a declared parent) - the override copies the statement before the rewrite onto the profile
 note, QueryEnd hands each execution to `LineageWorker`, which mirrors what the principal reads into a
 scratch DuckDB (empty tables of the exposed shapes under canonical names) and binds the statement
-there - names stay virtual. Physical statements (`ACL NATIVE`, operator SQL) from a pre-optimize hook.
+there under the names as written - names stay virtual (the scratch loads no extension but the built-in
+function sets). Physical statements (`ACL NATIVE`, operator SQL) from a pre-optimize hook; a PREPARE is
+no run (a prepared physical write is rebound per execution).
 The walker (`acl_lineage_walker.{hpp,cpp}`) maps bindings to source fields with OpenLineage's
 transformations and spec 102 paths. Context: `LINEAGE PARENT/ROOT/JOB` prefix marker,
 `acl_lineage_parent/_root_parent/_job` (068 allowlist, session record), Flight and quack

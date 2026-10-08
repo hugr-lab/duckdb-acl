@@ -80,15 +80,11 @@ struct AclQuackDoorLoad {
 vector<AclQuackDoorLoad> AclQuackDoorLoads(const DatabaseInstance &db);
 
 //! spec 107: the lineage context a quack request carried in its headers (`x-openlineage-parent` /
-//! `-root-parent` / `-job`, sent by a client through an http secret's EXTRA_HTTP_HEADERS), visible to
-//! the authorization callback that runs on the request's thread while it is handled. A pointer to the
-//! handler's own stack value - a thread_local is a pointer, never an object (spec 088).
-struct QuackRequestLineage {
-	string parent;
-	string root_parent;
-	string job;
-};
-extern thread_local const QuackRequestLineage *quack_request_lineage;
+//! `-root-parent` / `-job`, sent by a client through an http secret's EXTRA_HTTP_HEADERS), noted by
+//! the request's quack connection id for the authorization callback - which runs inside a query, on
+//! whichever of the instance's threads takes it, so nothing thread-bound can carry it.
+void AclQuackNoteRequestLineage(DatabaseInstance &db, const string &connection_id, const string &parent,
+                                const string &root_parent, const string &job);
 
 } // namespace acl
 } // namespace duckdb

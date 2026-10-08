@@ -67,9 +67,6 @@ void CheckIdentity(ClientContext &, SetScope scope, Value &value) {
 void CheckSql(ClientContext &, SetScope scope, Value &value) {
 	RequireChoice("acl_lineage_sql", scope, value, {"off", "normalized"});
 }
-void CheckRoles(ClientContext &, SetScope scope, Value &value) {
-	RequireChoice("acl_lineage_roles", scope, value, {"tags", "datasets"});
-}
 void CheckBuffer(ClientContext &, SetScope scope, Value &) {
 	RequireGlobal("acl_lineage_buffer", scope);
 }
@@ -85,6 +82,10 @@ void CheckMaxEdges(ClientContext &, SetScope scope, Value &) {
 
 } // namespace
 
+bool LineageOn(DatabaseInstance &db) {
+	return InstanceSetting(db, "acl_lineage_level", "off") == "on";
+}
+
 LineageSettings LineageSettings::Read(DatabaseInstance &db) {
 	LineageSettings settings;
 	settings.on = InstanceSetting(db, "acl_lineage_level", "off") == "on";
@@ -95,7 +96,6 @@ LineageSettings LineageSettings::Read(DatabaseInstance &db) {
 	}
 	settings.identity = InstanceSetting(db, "acl_lineage_identity", "client");
 	settings.sql = InstanceSetting(db, "acl_lineage_sql", "off") == "normalized";
-	settings.role_datasets = InstanceSetting(db, "acl_lineage_roles", "tags") == "datasets";
 	settings.physical = StringUtil::Lower(InstanceSetting(db, "acl_lineage_physical", "true")) == "true";
 	auto max_edges = InstanceSetting(db, "acl_lineage_max_edges", "4096");
 	try {
@@ -128,9 +128,6 @@ void AddLineageOptions(DBConfig &config) {
 	                          "acl: the SQL facet - off (default) or normalized (the statement as written, every "
 	                          "constant a ?)",
 	                          LogicalType::VARCHAR, Value("off"), CheckSql, SetScope::GLOBAL);
-	config.AddExtensionOption(
-	    "acl_lineage_roles", "acl: per-role visibility - tags on the canonical dataset (default) or a dataset per role",
-	    LogicalType::VARCHAR, Value("tags"), CheckRoles, SetScope::GLOBAL);
 	config.AddExtensionOption(
 	    "acl_lineage_physical",
 	    "acl: lineage may name physical datasets (default true; false drops them and their edges)",
@@ -214,6 +211,15 @@ shared_ptr<AuditLineage> LineageFromWalk(const LineageWalk &walk, const LineageS
 		auto dataset = LineageDatasetFor(walk.target, settings);
 		if (!dataset.physical || settings.physical) {
 			target = int32_t(lineage->datasets.size());
+			if (dataset.schema.empty()) {
+				// the fields written - one written from constants or from the client's stream has no
+				// edge, and is written all the same
+				for (auto &output : walk.outputs) {
+					AuditLineageField field;
+					field.name = output.name;
+					dataset.schema.push_back(std::move(field));
+				}
+			}
 			lineage->datasets.push_back(std::move(dataset));
 			lineage->outputs.push_back(target);
 		}
@@ -422,12 +428,7 @@ void EmitDefinitionLineage(AuditPipeline &pipeline, DatabaseInstance &db, const 
 		if (!dataset.physical && dataset.ns == settings.ns + "/" + vcat && dataset.name == vname) {
 			dataset.lifecycle = lifecycle;
 			dataset.dataset_type = dataset_type;
-			dataset.tags = tags;
-			for (auto &output : defined.outputs) {
-				AuditLineageField field;
-				field.name = output.name;
-				dataset.schema.push_back(std::move(field));
-			}
+			dataset.tags = tags; // its schema is the definition's outputs, filled by LineageFromWalk
 		}
 	}
 	AuditEvent event;
@@ -540,25 +541,24 @@ void LineageFlushFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 //! acl_lineage_resend([vcat]): every virtual object of a catalog (all catalogs without one) sent again
 //! as its DatasetEvent - what a transport that starts on an empty catalog asks for. Answers the count.
 void LineageResendFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &info =
-	    state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<LineageFlushInfo>();
+	auto &info = state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<LineageFlushInfo>();
 	auto store = info.store.lock();
 	if (!store || !store->catalog) {
 		throw InvalidInputException("acl_lineage_resend needs a policy catalog (acl_use_db)");
 	}
-	string only = args.ColumnCount() > 0 && !args.data[0].GetValue(0).IsNull() ? args.data[0].GetValue(0).ToString()
-	                                                                             : string();
-	auto rows = store->catalog->Query("SELECT DISTINCT \"vcat\" FROM " + store->catalog->Tbl("relations") +
-	                                  (only.empty() ? string() : " WHERE \"vcat\" = '" +
-	                                                                 StringUtil::Replace(only, "'", "''") + "'") +
-	                                  " ORDER BY 1");
+	string only =
+	    args.ColumnCount() > 0 && !args.data[0].GetValue(0).IsNull() ? args.data[0].GetValue(0).ToString() : string();
+	auto filter = only.empty() ? string() : " AND \"vcat\" = '" + StringUtil::Replace(only, "'", "''") + "'";
+	// every virtual table and view, and every table function
+	auto objects_sql = "SELECT \"vcat\" FROM " + store->catalog->Tbl("relations") + " WHERE true" + filter +
+	                   " UNION ALL SELECT \"vcat\" FROM " + store->catalog->Tbl("functions") +
+	                   " WHERE \"kind\" = 'table'" + filter;
+	auto rows = store->catalog->Query("SELECT \"vcat\", count(*) FROM (" + objects_sql + ") GROUP BY 1 ORDER BY 1");
 	int64_t count = 0;
 	for (idx_t i = 0; i < rows->RowCount(); i++) {
 		auto vcat = rows->Collection().GetValue(0, i).ToString();
-		auto objects = store->catalog->Query("SELECT count(*) FROM " + store->catalog->Tbl("relations") +
-		                                     " WHERE \"vcat\" = '" + StringUtil::Replace(vcat, "'", "''") + "'");
-		count += objects->Collection().GetValue(0, 0).GetValue<int64_t>();
-		store->NoteGrantLineage(vcat);
+		count += rows->Collection().GetValue(1, i).GetValue<int64_t>();
+		store->NoteGrantLineage(vcat); // queued: acl_lineage_flush() waits for it
 	}
 	result.Reference(Value::BIGINT(count), count_t(args.size()));
 }

@@ -21,6 +21,7 @@
 #include "duckdb/storage/object_cache.hpp"
 #include "duckdb/function/table_function.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -362,6 +363,11 @@ struct PolicyStore {
 	//! spec 079: quack clients between the seat check and their connection (AclQuackSeatClaim)
 	mutex quack_seat_lock;
 	idx_t quack_seats_claimed = 0;
+	//! spec 107: the `x-openlineage-*` headers each quack connection's requests carry (an http
+	//! secret's EXTRA_HTTP_HEADERS: the same on every request), by quack connection id - read by the
+	//! authorization callback, which may run on any of the instance's threads. Ended with the connection.
+	mutex quack_lineage_lock;
+	unordered_map<string, std::array<string, 3>> quack_lineage; // parent, root_parent, job
 	//! spec 078: the session opens and closes, delivered to acl_connection.hpp's observers
 	SessionNotifier session_notices;
 	//! Declared BEFORE a method's lock_guard, so its destructor runs after the lock is released: the
@@ -529,11 +535,21 @@ struct PolicyStore {
 	void CatalogRevoke(const string &role, const string &vcat);
 	void CatalogDropRelation(const string &vcat, const string &vname);
 	//! spec 107: after a virtual object's definition was written (or dropped), the static lineage event
-	//! - its definition as it now stands in the catalog, read back and bound; nothing when lineage is off
+	//! - its definition as it now stands in the catalog, read back and bound; nothing when lineage is off.
+	//! Queued to the lineage worker: the write never waits on a probe of the source, and nothing the
+	//! event needs can fail the write that already committed.
 	void NoteDefinitionLineage(const string &vcat, const string &vname, const string &lifecycle);
 	//! spec 107: a grant changed what the roles of `vcat` see - every object of the catalog (or the one
-	//! named) gets a DatasetEvent with its per-role tags; no lifecycle, nothing about the definition
+	//! named) gets a DatasetEvent with its per-role tags; no lifecycle, nothing about the definition.
+	//! Queued like NoteDefinitionLineage.
 	void NoteGrantLineage(const string &vcat, const string &vname = string());
+	//! The worker's side of the two above: the events made now, on the calling thread. Never throws.
+	void EmitDefinitionLineageNow(const string &vcat, const string &vname, const string &lifecycle);
+	void EmitGrantLineageNow(const string &vcat, const string &vname);
+	//! spec 107: a virtual TABLE function's static event - a macro's body bound and walked, an alias's
+	//! declared result (what it reads is the physical function's) - queued like NoteDefinitionLineage
+	void NoteFunctionLineage(const string &vcat, const string &vname, const string &lifecycle);
+	void EmitFunctionLineageNow(const string &vcat, const string &vname, const string &lifecycle);
 	// DROP of the remaining virtual-catalog elements (spec 010). Dropping a catalog removes its own
 	// definitions always; the role grants pointing at it need `cascade`, so an accidental drop cannot
 	// silently revoke people's access.

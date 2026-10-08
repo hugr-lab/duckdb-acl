@@ -13,6 +13,8 @@
 #include "acl_principal.hpp"
 #include "acl_lineage_walker.hpp"
 
+#include <functional>
+
 namespace duckdb {
 
 class DatabaseInstance;
@@ -33,7 +35,6 @@ struct LineageSettings {
 	string ns;                  // acl_lineage_namespace, or acl://<acl_node_group | default>
 	string identity = "client"; // acl_lineage_identity: none / client / subject
 	bool sql = false;           // acl_lineage_sql = normalized
-	bool role_datasets = false; // acl_lineage_roles = datasets (default tags)
 	bool physical = true;       // acl_lineage_physical
 	idx_t max_edges = 4096;     // acl_lineage_max_edges
 	static LineageSettings Read(DatabaseInstance &db);
@@ -100,6 +101,11 @@ void EnqueueLineageRun(const shared_ptr<LineageJob> &job, bool failed);
 shared_ptr<LineageWorker> StartLineageWorker(const shared_ptr<PolicyStore> &store,
                                              const shared_ptr<AuditPipeline> &pipeline, DatabaseInstance &db);
 void StopLineageWorker(LineageWorker &worker);
+//! A static event's work (spec 107: a definition read back, probed, bound; per-role tags), run on the
+//! worker with the store and the instance it holds for the job; false when the worker no longer runs.
+bool EnqueueLineageTask(LineageWorker &worker, std::function<void(PolicyStore &)> task);
+//! Whether acl_lineage_level is on - the one setting a statement's own path reads.
+bool LineageOn(DatabaseInstance &db);
 //! Wait until the jobs queued so far are done (tests: `acl_lineage_flush()`); false on timeout.
 bool FlushLineageWorker(LineageWorker &worker, int64_t timeout_ms = 30000);
 

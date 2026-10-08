@@ -32,10 +32,13 @@
 #include "duckdb/parser/query_node/list.hpp"
 #include "duckdb/parser/statement/list.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_prepare.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -68,17 +71,37 @@ public:
 	    : store(std::move(store_p)), pipeline(std::move(pipeline_p)), db(std::move(db_p)) {
 	}
 
+	//! One unit of work: a statement's run (job + outcome) or a static event's task.
+	struct Item {
+		shared_ptr<LineageJob> job;
+		bool failed = false;
+		std::function<void(PolicyStore &)> task;
+	};
+
 	void Enqueue(shared_ptr<LineageJob> job, bool failed) {
+		Item item;
+		item.job = std::move(job);
+		item.failed = failed;
+		Push(std::move(item));
+	}
+
+	bool EnqueueTask(std::function<void(PolicyStore &)> task) {
+		Item item;
+		item.task = std::move(task);
+		return Push(std::move(item));
+	}
+
+	bool Push(Item item) {
 		{
 			std::lock_guard<std::mutex> guard(lock);
 			if (stopping) {
-				return;
+				return false;
 			}
 			if (queue.size() >= 1000) {
 				pipeline->Hooks().Counters().Add("acl.lineage.dropped", {});
-				return;
+				return false;
 			}
-			queue.emplace_back(std::move(job), failed);
+			queue.push_back(std::move(item));
 			enqueued++;
 			if (!thread.joinable()) {
 				auto self = shared_from_this();
@@ -87,11 +110,12 @@ public:
 				} catch (std::exception &) {
 					queue.pop_back();
 					enqueued--;
-					return;
+					return false;
 				}
 			}
 		}
 		cv.notify_one();
+		return true;
 	}
 
 	void Stop() {
@@ -121,7 +145,7 @@ public:
 private:
 	void Run() {
 		for (;;) {
-			std::pair<shared_ptr<LineageJob>, bool> next;
+			Item next;
 			{
 				std::unique_lock<std::mutex> guard(lock);
 				cv.wait(guard, [&]() { return stopping || !queue.empty(); });
@@ -132,7 +156,11 @@ private:
 				queue.pop_front();
 			}
 			try {
-				Process(*next.first, next.second);
+				if (next.task) {
+					RunTask(next.task);
+				} else if (next.job) {
+					Process(*next.job, next.failed);
+				}
 			} catch (...) {
 				pipeline->Hooks().Counters().Add("acl.lineage.errors", {});
 			}
@@ -146,13 +174,22 @@ private:
 
 	void Process(LineageJob &job, bool failed);
 
+	void RunTask(const std::function<void(PolicyStore &)> &task) {
+		auto locked_store = store.lock();
+		auto locked_db = db.lock(); // what the task reads goes through the instance: held for the task
+		if (!locked_store || !locked_db) {
+			return;
+		}
+		task(*locked_store);
+	}
+
 	weak_ptr<PolicyStore> store;
 	shared_ptr<AuditPipeline> pipeline;
 	weak_ptr<DatabaseInstance> db;
 	std::mutex lock;
 	std::condition_variable cv;
 	std::condition_variable drained;
-	std::deque<std::pair<shared_ptr<LineageJob>, bool>> queue;
+	std::deque<Item> queue;
 	int64_t enqueued = 0;
 	int64_t handled = 0;
 	bool stopping = false;
@@ -301,20 +338,93 @@ bool Resolve(PolicyStore &store, DatabaseInstance &db, const Principal &principa
 	}
 }
 
-//! The scratch database's statements that mirror one relation: an empty table of its shape.
-void MirrorInto(Connection &scratch, case_insensitive_set_t &attached, const Mirror &mirror) {
-	if (!attached.count(mirror.vcat)) {
-		scratch.Query("ATTACH ':memory:' AS " + acl_detail::Ident(mirror.vcat));
-		attached.insert(mirror.vcat);
+//! A DML target the principal may write but not read (an insert-only sink grant): `SELECT *` under
+//! the principal refuses, so its shape is the physical relation's under the names the principal writes
+//! (spec 042's write order, spec 010's renames). Never for a relation the principal holds no write on.
+bool ResolveTarget(PolicyStore &store, DatabaseInstance &db, const Principal &principal, const NamedRelation &relation,
+                   Mirror &out) {
+	try {
+		TablePolicy policy;
+		if (!store.ResolveTable(principal, StringUtil::Join(relation.parts, "."), policy) || policy.phys.empty()) {
+			return false;
+		}
+		if (!policy.caps.count("insert") && !policy.caps.count("update") && !policy.caps.count("delete") &&
+		    !policy.caps.count("merge")) {
+			return false;
+		}
+		auto dot = policy.canonical.find('.');
+		if (dot == string::npos) {
+			return false;
+		}
+		out.vcat = policy.canonical.substr(0, dot);
+		out.vname = policy.canonical.substr(dot + 1);
+		case_insensitive_map_t<LogicalType> physical;
+		vector<string> physical_order;
+		Connection con(db);
+		con.context->RunFunctionInTransaction([&]() {
+			Parser parser(ParserOptions::Builtin());
+			parser.ParseQuery("SELECT * FROM " + policy.phys);
+			Planner planner(*con.context);
+			planner.CreatePlan(std::move(parser.statements[0]));
+			for (idx_t i = 0; i < planner.names.size() && i < planner.types.size(); i++) {
+				physical[planner.names[i].GetIdentifierName()] = planner.types[i];
+				physical_order.push_back(planner.names[i].GetIdentifierName());
+			}
+		});
+		case_insensitive_map_t<string> to_physical;
+		case_insensitive_map_t<string> to_virtual;
+		for (auto &rename : policy.renames) {
+			to_physical[rename.first] = rename.second;
+			to_virtual[rename.second] = rename.first;
+		}
+		auto type_of = [&](const string &name) {
+			auto entry = physical.find(name);
+			return entry == physical.end() ? LogicalType(LogicalType::VARCHAR) : entry->second;
+		};
+		if (!policy.write_order.empty()) {
+			for (auto &name : policy.write_order) {
+				auto renamed = to_physical.find(name);
+				out.columns.emplace_back(name, type_of(renamed == to_physical.end() ? name : renamed->second));
+			}
+		} else {
+			for (auto &name : physical_order) {
+				auto renamed = to_virtual.find(name);
+				out.columns.emplace_back(renamed == to_virtual.end() ? name : renamed->second, type_of(name));
+			}
+		}
+		return !out.columns.empty();
+	} catch (std::exception &) {
+		return false;
 	}
-	vector<string> name_parts;
-	auto dot = mirror.vname.find('.');
-	if (dot != string::npos) {
-		auto schema = mirror.vname.substr(0, dot);
-		scratch.Query("CREATE SCHEMA IF NOT EXISTS " + Quoted({mirror.vcat, schema}));
-		name_parts = {mirror.vcat, schema, mirror.vname.substr(dot + 1)};
-	} else {
-		name_parts = {mirror.vcat, "main", mirror.vname};
+}
+
+//! Where a relation lives in the scratch database: under the name AS WRITTEN (a schema alias, a
+//! two-part name bind there as they did on the node), the virtual catalog standing in for a missing one.
+//! A two-part name is `catalog.name` when it names the virtual catalog the node resolved it in, else
+//! `schema.name` (both at once would be ambiguous to the binder).
+vector<vector<string>> ScratchPlacements(const NamedRelation &relation, const string &vcat) {
+	auto &parts = relation.parts;
+	if (parts.size() >= 3) {
+		return {{parts[parts.size() - 3], parts[parts.size() - 2], parts.back()}};
+	}
+	if (parts.size() == 2) {
+		if (StringUtil::CIEquals(parts[0], vcat)) {
+			return {{vcat, "main", parts[1]}};
+		}
+		return {{vcat, parts[0], parts[1]}};
+	}
+	return {{vcat, "main", parts.back()}};
+}
+
+//! The scratch database's statements that mirror one relation: an empty table of its shape.
+void MirrorInto(Connection &scratch, case_insensitive_set_t &attached, const Mirror &mirror,
+                const vector<string> &name_parts) {
+	if (!attached.count(name_parts[0])) {
+		scratch.Query("ATTACH ':memory:' AS " + acl_detail::Ident(name_parts[0]));
+		attached.insert(name_parts[0]);
+	}
+	if (!StringUtil::CIEquals(name_parts[1], "main")) {
+		scratch.Query("CREATE SCHEMA IF NOT EXISTS " + Quoted({name_parts[0], name_parts[1]}));
 	}
 	vector<string> columns;
 	for (auto &column : mirror.columns) {
@@ -364,9 +474,33 @@ void NormalizeExpression(unique_ptr<ParsedExpression> &expr) {
 	    *expr, [&](unique_ptr<ParsedExpression> &child) { NormalizeExpression(child); });
 }
 
+//! A PIVOT's values are no expressions (`IN ('a', 'b')` is a vector of values), and its pivot and
+//! UNPIVOT expressions are not visited by the iterator: each is blanked here.
+void NormalizePivot(TableRef &ref) {
+	if (ref.type != TableReferenceType::PIVOT) {
+		return;
+	}
+	for (auto &column : ref.Cast<PivotRef>().pivots) {
+		for (auto &expr : column.pivot_expressions) {
+			NormalizeExpression(expr);
+		}
+		for (auto &entry : column.entries) {
+			for (auto &value : entry.values) {
+				value = Value("?");
+			}
+			if (entry.expr) {
+				NormalizeExpression(entry.expr);
+			}
+		}
+		if (column.subquery) {
+			NormalizeConstants(*column.subquery);
+		}
+	}
+}
+
 void NormalizeConstants(QueryNode &node) {
 	ParsedExpressionIterator::EnumerateQueryNodeChildren(
-	    node, [&](unique_ptr<ParsedExpression> &child) { NormalizeExpression(child); });
+	    node, [&](unique_ptr<ParsedExpression> &child) { NormalizeExpression(child); }, NormalizePivot);
 	ParsedExpressionIterator::EnumerateQueryNodeModifiers(
 	    node, [&](unique_ptr<ParsedExpression> &child) { NormalizeExpression(child); });
 }
@@ -405,9 +539,17 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 		return;
 	}
 	auto statement = job.statement->Copy();
+	auto statement_copy = job.statement->Copy(); // the planner consumes `statement`
 	auto root = RootNode(*statement);
 	LineageWalk walk;
 	bool walked = false;
+	// scratch table (catalog.schema.name, lower) -> the virtual object it stands for, and its columns
+	case_insensitive_map_t<LineageDatasetKey> mirrored;
+	case_insensitive_map_t<vector<std::pair<string, LogicalType>>> mirrored_columns;
+	auto Canonical = [&](const string &catalog, const string &schema, const string &name) {
+		auto found = mirrored.find(StringUtil::Lower(catalog + "." + schema + "." + name));
+		return found != mirrored.end() ? found->second : VirtualKey(catalog, schema, name);
+	};
 	if (root) {
 		RelationCollector collector;
 		collector.Node(*root);
@@ -417,26 +559,50 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 				collector.relations.push_back(FromQualified(insert.node->qualified_name));
 			}
 		}
-		// the scratch database: what the principal reads, as empty tables under the same names
+		// the scratch database: what the principal reads, as empty tables under the same names. No
+		// extension is loaded but the function sets a statement binds against - acl itself never: a
+		// second override, store and worker per job is what a scratch must not be
 		DBConfig config;
+		config.options.load_extensions = false;
 		config.SetOptionByName("enable_external_access", Value::BOOLEAN(false));
 		config.SetOptionByName("autoload_known_extensions", Value::BOOLEAN(false));
 		config.SetOptionByName("autoinstall_known_extensions", Value::BOOLEAN(false));
+		config.SetOptionByName("threads", Value::BIGINT(1));
+		config.SetOptionByName("memory_limit", Value("64MB"));
 		DuckDB scratch_db(nullptr, &config);
+		for (auto extension : {"core_functions", "json", "icu"}) {
+			try {
+				ExtensionHelper::LoadExtension(scratch_db, extension);
+			} catch (std::exception &) {
+				// not linked into this build: its functions do not bind, the walk says approximate
+			}
+		}
 		Connection scratch(scratch_db);
 		case_insensitive_set_t attached;
 		string default_catalog;
 		bool all_resolved = true;
 		for (auto &relation : collector.relations) {
 			Mirror mirror;
-			if (!Resolve(*locked_store, *locked_db, job.principal, relation, mirror)) {
+			if (!Resolve(*locked_store, *locked_db, job.principal, relation, mirror) &&
+			    !ResolveTarget(*locked_store, *locked_db, job.principal, relation, mirror)) {
 				all_resolved = false; // a CTAS target, a name the role cannot read: no mirror, maybe no bind
 				continue;
 			}
-			if (relation.parts.size() == 1 && default_catalog.empty()) {
+			if (relation.parts.size() < 3 && default_catalog.empty()) {
 				default_catalog = mirror.vcat;
 			}
-			MirrorInto(scratch, attached, mirror);
+			auto dot = mirror.vname.find('.');
+			LineageDatasetKey key;
+			key.kind = "virtual";
+			key.catalog = mirror.vcat;
+			key.name = dot != string::npos && StringUtil::CIEquals(mirror.vname.substr(0, dot), "main")
+			               ? mirror.vname.substr(dot + 1)
+			               : mirror.vname;
+			for (auto &placement : ScratchPlacements(relation, mirror.vcat)) {
+				MirrorInto(scratch, attached, mirror, placement);
+				mirrored[StringUtil::Lower(StringUtil::Join(placement, "."))] = key;
+				mirrored_columns[StringUtil::Lower(StringUtil::Join(placement, "."))] = mirror.columns;
+			}
 		}
 		if (statement->type == StatementType::CREATE_STATEMENT) {
 			// a CREATE TABLE AS writes into a granted schema: the schema must exist where it binds
@@ -457,13 +623,13 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 		}
 		LineageWalkOptions options;
 		options.max_edges = settings.max_edges;
-		options.classify = [](LogicalGet &get, LineageDatasetKey &key) {
+		options.classify = [&](LogicalGet &get, LineageDatasetKey &key) {
 			auto table = get.GetTable();
 			if (!table) {
 				return false; // a table function in the statement: a function dataset, approximate
 			}
-			key = VirtualKey(table->ParentCatalog().GetName().GetIdentifierName(),
-			                 table->ParentSchema().name.GetIdentifierName(), table->name.GetIdentifierName());
+			key = Canonical(table->ParentCatalog().GetName().GetIdentifierName(),
+			                table->ParentSchema().name.GetIdentifierName(), table->name.GetIdentifierName());
 			return true;
 		};
 		try {
@@ -480,7 +646,38 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 			walked = false;
 		}
 		if (walked && walk.has_target) {
-			walk.target = VirtualKey(walk.target.catalog, walk.target.schema, walk.target.name);
+			walk.target = Canonical(walk.target.catalog, walk.target.schema, walk.target.name);
+		}
+		if (!walked && statement_copy && statement_copy->type == StatementType::INSERT_STATEMENT) {
+			// an INSERT whose source does not bind here - a door's ingest reads the client's stream
+			// (arrow_scan, a quack drain) - still wrote its target: its fields, sources the client's
+			auto &insert = statement_copy->Cast<InsertStatement>();
+			auto target = FromQualified(insert.node->qualified_name);
+			auto placement_key =
+			    StringUtil::Lower(StringUtil::Join(ScratchPlacements(target, default_catalog)[0], "."));
+			auto found = mirrored.find(placement_key);
+			if (found != mirrored.end()) {
+				walk = LineageWalk();
+				walk.has_target = true;
+				walk.target = found->second;
+				walk.target_operation = "INSERT";
+				vector<string> names;
+				for (auto &column : insert.node->columns) {
+					names.push_back(column.GetIdentifierName());
+				}
+				if (names.empty()) {
+					for (auto &column : mirrored_columns[placement_key]) {
+						names.push_back(column.first);
+					}
+				}
+				for (auto &name : names) {
+					LineageOutput output;
+					output.name = name;
+					walk.outputs.push_back(std::move(output));
+				}
+				walk.approximate = true;
+				walked = true;
+			}
 		}
 		if (!all_resolved) {
 			walk.approximate = true;
@@ -510,6 +707,7 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 		lineage->dialect = "duckdb";
 	}
 	if (settings.identity != "none") {
+		lineage->client = client; // the door it came through: flight, quack, session, the gateway
 		lineage->issuer = job.principal.issuer;
 		lineage->roles = job.principal.roles;
 		Value group;
@@ -600,23 +798,63 @@ optional_ptr<LogicalOperator> WriteOperator(LogicalOperator &plan) {
 	}
 }
 
-void LineagePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-	if (!plan || !input.info) {
-		return;
-	}
-	// first and cheapest: a read (the overwhelming case) leaves here, before any setting is read
-	switch (plan->type) {
+//! Whether the hook captures a statement of this shape at all - the cheap test, before any setting.
+bool CapturedShape(LogicalOperator &plan) {
+	switch (plan.type) {
 	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
 	case LogicalOperatorType::LOGICAL_CREATE_VIEW:
 	case LogicalOperatorType::LOGICAL_DROP:
 	case LogicalOperatorType::LOGICAL_ALTER:
 	case LogicalOperatorType::LOGICAL_ATTACH:
 	case LogicalOperatorType::LOGICAL_DETACH:
-		break;
+		return true;
 	default:
-		if (!WriteOperator(*plan)) {
+		return WriteOperator(plan) != nullptr;
+	}
+}
+
+void CapturePhysical(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
+
+void LineagePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	if (!plan || !input.info) {
+		return;
+	}
+	if (plan->type == LogicalOperatorType::LOGICAL_PREPARE) {
+		// a PREPARE is no execution: QueryEnd must not count it as one. A physical statement it prepares
+		// is bound again by each execution - as duckdb does itself for one that reads a database - so the
+		// hook sees every execution's plan (one without parameters is otherwise never optimized again)
+		MarkPreparing(input.context);
+		if (plan->children.empty() || !CapturedShape(*plan->children[0])) {
 			return;
 		}
+		try {
+			auto &info = static_cast<LineageOptimizerInfo &>(*input.info);
+			Principal principal;
+			string door;
+			if (!info.store.lock() || StatementDecidedVirtual(input.context, principal, door) ||
+			    !LineageOn(*input.context.db)) {
+				return;
+			}
+			plan->Cast<LogicalPrepare>().prepared->properties.always_require_rebind = true;
+		} catch (...) {
+		}
+		return;
+	}
+	if (plan->type == LogicalOperatorType::LOGICAL_EXECUTE) {
+		// SQL `EXECUTE p`: the rebound plan of the prepared statement is its child (none when duckdb
+		// kept the prepared plan - then nothing was planned again and nothing is captured)
+		if (!plan->children.empty()) {
+			CapturePhysical(input, plan->children[0]);
+		}
+		return;
+	}
+	CapturePhysical(input, plan);
+}
+
+void CapturePhysical(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	// first and cheapest: a read (the overwhelming case) leaves here, before any setting is read
+	if (!CapturedShape(*plan)) {
+		return;
 	}
 	try {
 		auto &info = static_cast<LineageOptimizerInfo &>(*input.info);
@@ -696,7 +934,11 @@ void LineagePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 				try {
 					search.Set(saved, CatalogSetPathType::SET_SCHEMAS);
 				} catch (std::exception &) {
-					// the path the statement had stays what the session set; nothing else to restore
+					// a path that no longer sets (a schema the statement dropped): the default, never ours
+					try {
+						search.Reset();
+					} catch (std::exception &) {
+					}
 				}
 			}
 			if (!walked) {
@@ -738,8 +980,19 @@ void LineagePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 				}
 			}
 			if (type.empty()) {
+				// a scanner's prefix names the source; anything else - a file, s3://, https:// - is a
+				// database file wherever it lives
+				type = "duckdb";
 				auto colon = attach.path.find(':');
-				type = colon != string::npos && colon > 1 ? attach.path.substr(0, colon) : string("duckdb");
+				if (colon != string::npos && colon > 1) {
+					auto prefix = StringUtil::Lower(attach.path.substr(0, colon));
+					for (auto known : {"postgres", "postgresql", "mysql", "sqlite", "ducklake", "quack", "mssql", "md",
+					                   "motherduck"}) {
+						if (prefix == known) {
+							type = prefix;
+						}
+					}
+				}
 			}
 			captured->source_type = StringUtil::Lower(type);
 			captured->namespace_event = true;
@@ -861,10 +1114,6 @@ shared_ptr<LineageJob> CaptureLineageJob(PolicyStore &store, const SQLStatement 
 	if (!store.lineage_worker) {
 		return nullptr;
 	}
-	auto db = store.instance.lock();
-	if (!db || !LineageSettings::Read(*db).on) {
-		return nullptr;
-	}
 	bool write = false;
 	bool read = false;
 	switch (statement.type) {
@@ -886,6 +1135,10 @@ shared_ptr<LineageJob> CaptureLineageJob(PolicyStore &store, const SQLStatement 
 		break;
 	}
 	if (!write && !read) {
+		return nullptr; // a read - the overwhelming case - leaves before any setting is read
+	}
+	auto db = store.instance.lock();
+	if (!db || !LineageOn(*db)) {
 		return nullptr;
 	}
 	auto job = make_shared_ptr<LineageJob>();
@@ -917,6 +1170,10 @@ shared_ptr<LineageWorker> StartLineageWorker(const shared_ptr<PolicyStore> &stor
 
 void StopLineageWorker(LineageWorker &worker) {
 	worker.Stop();
+}
+
+bool EnqueueLineageTask(LineageWorker &worker, std::function<void(PolicyStore &)> task) {
+	return worker.EnqueueTask(std::move(task));
 }
 
 bool FlushLineageWorker(LineageWorker &worker, int64_t timeout_ms) {

@@ -38,7 +38,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.quiet AS phys.main.customers;
 
 statement ok
-SELECT acl_audit_flush();
+SELECT acl_lineage_flush();
 
 query I
 SELECT count(*) FROM acl_lineage_events();
@@ -58,7 +58,7 @@ ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders
     COLUMNS (id, total = amount * 2, ssn = NULL) RLS 'tenant = acl_claim(''tenant'')';
 
 statement ok
-SELECT acl_audit_flush();
+SELECT acl_lineage_flush();
 
 query TTT
 SELECT event_type, payload->'datasets'->(payload->'outputs'->>0)::INT->>'name',
@@ -107,7 +107,7 @@ ACL ADMIN CREATE VIRTUAL VIEW c.named AS
     SELECT o.id, upper(cu.name) AS customer_name FROM phys.main.orders o JOIN phys.main.customers cu ON o.customer = cu.id;
 
 statement ok
-SELECT acl_audit_flush();
+SELECT acl_lineage_flush();
 
 query TTTT
 SELECT e->>'target_field', (payload->'datasets'->(e->>'source')::INT->>'name') || '.' || (e->>'source_field'),
@@ -132,7 +132,7 @@ statement ok
 ACL ADMIN ALTER VIRTUAL TABLE c.orders SET RLS 'amount > 0';
 
 statement ok
-SELECT acl_audit_flush();
+SELECT acl_lineage_flush();
 
 query TT
 SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle',
@@ -145,7 +145,7 @@ statement ok
 ACL ADMIN DROP RELATION c.orders;
 
 statement ok
-SELECT acl_audit_flush();
+SELECT acl_lineage_flush();
 
 query TI
 SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle', json_array_length(payload->'edges')
@@ -169,7 +169,7 @@ statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.hidden_topology AS phys.main.customers;
 
 statement ok
-SELECT acl_audit_flush();
+SELECT acl_lineage_flush();
 
 query II
 SELECT json_array_length(payload->'datasets'), json_array_length(payload->'edges')
@@ -546,3 +546,360 @@ query I
 SELECT count(*) > 0 FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'DATASET';
 ----
 true
+
+# === review regressions (spec 107) ==========================================================================
+
+# --- VALUES read nothing: the run is exact, not approximate -------------------------------------------------
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" INSERT INTO sink VALUES (8, 'v');
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TT
+SELECT payload->>'approximate', json_array_length(payload->'outputs')
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+false	1
+
+# --- a sink grant: a role that may insert but not read still names its target and its fields ---------------
+
+statement ok
+ACL ADMIN CREATE ROLE sinker;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE sinker WITH (insert) MAIN;
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "sinker" INSERT INTO sink (a, b) VALUES (9, 'w');
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'name',
+    list_sort(list_transform(from_json(payload->'datasets'->(payload->'outputs'->>0)::INT->'schema', '[{"name":"VARCHAR"}]'), lambda f: f.name))::VARCHAR,
+    payload->>'approximate'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'RUN_COMPLETE';
+----
+sink	[a, b]	false
+
+# --- a name written with its catalog binds in the scratch mirror as it did on the node ----------------------
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" INSERT INTO c.sink (a, b) SELECT id, ssn FROM c.src;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTTT
+SELECT e->>'target_field', (payload->'datasets'->(e->>'source')::INT->>'name') || '.' || (e->>'source_field'),
+    payload->'datasets'->(payload->'outputs'->>0)::INT->>'name', payload->>'approximate'
+FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq > (SELECT seq FROM before))
+ORDER BY 1, 2;
+----
+a	src.id	sink	false
+b	src.ssn	sink	false
+
+# --- MERGE: the INSERT branch writes its fields too (the binder leaves its column map empty) ---------------
+
+statement ok
+ACL ADMIN CREATE ROLE merger;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE merger WITH (select, insert, update, delete, merge) MAIN;
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "merger" MERGE INTO sink USING (SELECT id, ssn FROM src) AS s ON sink.a = s.id
+    WHEN MATCHED THEN UPDATE SET b = s.ssn WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.ssn);
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT DISTINCT e->>'target_field', (payload->'datasets'->(e->>'source')::INT->>'name') || '.' || (e->>'source_field'),
+    e->>'type'
+FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq > (SELECT seq FROM before) AND event_type = 'RUN_COMPLETE')
+WHERE e->>'type' = 'DIRECT'
+ORDER BY 1, 2;
+----
+a	src.id	DIRECT
+b	src.ssn	DIRECT
+
+# --- DELETE: the target, its filter ----------------------------------------------------------------------
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" DELETE FROM sink WHERE a = 9;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'name', e->>'source_field', e->>'subtype'
+FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq > (SELECT seq FROM before));
+----
+sink	a	FILTER
+
+# --- a field read from an unnested list is the list's element: items[].price ------------------------------
+
+statement ok
+CREATE TABLE phys.main.carts(id INTEGER, items STRUCT(sku VARCHAR, price DOUBLE)[]);
+
+statement ok
+CREATE TABLE phys.main.prices(sku VARCHAR, price DOUBLE);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.carts AS phys.main.carts;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.prices AS phys.main.prices;
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" INSERT INTO prices SELECT i.sku, i.price FROM (SELECT unnest(items) AS i FROM carts);
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TT
+SELECT e->>'target_field', e->>'source_field'
+FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq > (SELECT seq FROM before))
+WHERE e->>'type' = 'DIRECT' ORDER BY 1;
+----
+price	items[].price
+sku	items[].sku
+
+# a struct built in the statement has no path of its own: struct_pack(x := id).x is id
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" INSERT INTO sink (a, b) SELECT struct_pack(x := id).x, ssn FROM src;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TT
+SELECT e->>'target_field', e->>'source_field'
+FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq > (SELECT seq FROM before))
+WHERE e->>'type' = 'DIRECT' ORDER BY 1;
+----
+a	id
+b	ssn
+
+# --- IN (subquery): the mark join's condition is a filter, the run exact ----------------------------------
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" INSERT INTO sink (a, b) SELECT id, ssn FROM src WHERE id IN (SELECT a FROM sink);
+
+statement ok
+SELECT acl_lineage_flush();
+
+query T
+SELECT payload->>'approximate' FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+false
+
+# --- a PREPARE is no run; each execution of a prepared physical write is one ------------------------------
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+PREPARE load_sink AS INSERT INTO phys.main.sink VALUES (5, 'p');
+
+statement ok
+EXECUTE load_sink;
+
+statement ok
+EXECUTE load_sink;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TI
+SELECT event_type, count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) GROUP BY 1;
+----
+RUN_COMPLETE	2
+
+# --- the SQL facet blanks a PIVOT's values ----------------------------------------------------------------
+
+statement ok
+SET GLOBAL acl_lineage_sql = 'normalized';
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" INSERT INTO sink (a, b) SELECT 1, 'x' FROM (PIVOT src ON ssn IN ('pivot-secret') USING sum(total));
+
+statement ok
+SELECT acl_lineage_flush();
+
+query II
+SELECT count(*), count(*) FILTER (WHERE payload->>'sql' LIKE '%pivot-secret%')
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+1	0
+
+statement ok
+SET GLOBAL acl_lineage_sql = 'off';
+
+# --- a grant on a catalog whose object drifted still succeeds, and the others still get their tags -------
+
+statement ok
+CREATE TABLE phys.main.drifting(id INTEGER, secret VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.drifting AS phys.main.drifting;
+
+statement ok
+ACL ADMIN GRANT TABLE c.drifting TO ROLE clerk COLUMNS (id, secret = NULL);
+
+statement ok
+ALTER TABLE phys.main.drifting DROP COLUMN secret;
+
+statement ok
+ACL ADMIN CREATE ROLE late;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE late WITH (select) MAIN;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query I
+SELECT count(*) > 0 FROM acl_lineage_events(), unnest(from_json(payload->'datasets'->(payload->'outputs'->>0)::INT->'tags', '["JSON"]')) AS t(tag)
+WHERE (tag->>'key') = 'acl.role.late';
+----
+true
+
+# --- lineage is the operator's: a principal can neither read it nor drive it ------------------------------
+
+statement error
+ACL ROLE "w" SELECT count(*) FROM acl_lineage_events();
+----
+
+statement error
+ACL ROLE "w" SELECT acl_lineage_flush();
+----
+
+statement error
+ACL ROLE "w" SELECT acl_lineage_resend();
+----
+
+# --- a virtual table function: its body's lineage at CREATE, a DROP ------------------------------------------
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+SELECT acl_add_table_function('c', 'big', 'SELECT id, amount * 2 AS doubled FROM phys.main.orders WHERE amount >= acl_arg(1)', 'threshold DOUBLE', '', '');
+
+statement ok
+SELECT acl_drop_function('c', 'big', 'table');
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'type',
+    payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle',
+    list_sort(list_transform(from_json(payload->'edges', '["JSON"]'), lambda e: (e->>'target_field') || '<-' || (e->>'source_field') || ':' || (e->>'subtype')))::VARCHAR
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) ORDER BY seq;
+----
+TABLE_FUNCTION	CREATE	['<-amount:FILTER', 'doubled<-amount:TRANSFORMATION', 'id<-id:IDENTITY']
+TABLE_FUNCTION	DROP	[]

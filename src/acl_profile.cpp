@@ -262,6 +262,8 @@ public:
 	bool published_session = false;
 	//! spec 107: a physical statement's lineage, captured by the pre-optimize hook, emitted at QueryEnd
 	shared_ptr<PhysicalLineage> physical_lineage;
+	//! spec 107: the running statement is a PREPARE (the hook saw LOGICAL_PREPARE): not an execution
+	bool preparing = false;
 
 	void QueryBegin(ClientContext &context) override {
 		if (pending_notes && !pending_notes->empty()) {
@@ -283,6 +285,8 @@ public:
 			has_note = false;
 		}
 		began_us = NowMicros();
+		preparing = false;
+		physical_lineage.reset();
 		// spec 078: a statement under a session shows it on its connection while it runs, and nothing
 		// else does - on a gateway's shared connection the next statement may be another principal's
 		if (has_note && !note.proto.session.empty()) {
@@ -333,24 +337,34 @@ public:
 		} catch (...) {
 			// a profile is never worth the statement; the decision event is already out
 		}
-		if (has_note && note.lineage) {
-			// spec 107: one run per execution, handed to the worker with its outcome - never waited on
-			EnqueueLineageRun(note.lineage, bool(error));
-		}
-		if (physical_lineage) {
-			auto captured = std::move(physical_lineage);
-			physical_lineage.reset();
-			auto locked = pipeline.lock();
-			if (locked) {
-				try {
-					EmitPhysicalLineage(*captured, *locked, *context.db, bool(error));
-				} catch (...) {
-					// lineage is never worth the statement
-				}
-			}
+		try {
+			EndLineage(context, error);
+		} catch (...) {
+			// lineage is never worth the statement
 		}
 		if (error) {
 			batch.clear(); // an error ends the batch: the statements after it never run
+		}
+	}
+
+	//! spec 107: one run per execution, handed to the worker with its outcome - never waited on; a
+	//! PREPARE is no execution (the hook marked it: its executions are the runs).
+	void EndLineage(ClientContext &context, optional_ptr<ErrorData> error) {
+		bool was_preparing = preparing;
+		preparing = false;
+		auto captured = std::move(physical_lineage);
+		physical_lineage.reset();
+		if (was_preparing) {
+			return;
+		}
+		if (has_note && note.lineage) {
+			EnqueueLineageRun(note.lineage, bool(error));
+		}
+		if (captured) {
+			auto locked = pipeline.lock();
+			if (locked) {
+				EmitPhysicalLineage(*captured, *locked, *context.db, bool(error));
+			}
 		}
 	}
 
@@ -502,6 +516,13 @@ void SetPhysicalLineage(ClientContext &context, shared_ptr<PhysicalLineage> line
 	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
 	if (state) {
 		state->physical_lineage = std::move(lineage);
+	}
+}
+
+void MarkPreparing(ClientContext &context) {
+	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
+	if (state) {
+		state->preparing = true;
 	}
 }
 
