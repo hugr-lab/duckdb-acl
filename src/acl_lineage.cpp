@@ -4,6 +4,7 @@
 #include "acl_audit_pipeline.hpp"
 #include "acl_door_common.hpp"
 #include "acl_policy.hpp"
+#include "acl_policy_catalog.hpp"
 
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -536,8 +537,45 @@ void LineageFlushFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value::BOOLEAN(drained), count_t(args.size()));
 }
 
+//! acl_lineage_resend([vcat]): every virtual object of a catalog (all catalogs without one) sent again
+//! as its DatasetEvent - what a transport that starts on an empty catalog asks for. Answers the count.
+void LineageResendFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &info =
+	    state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<LineageFlushInfo>();
+	auto store = info.store.lock();
+	if (!store || !store->catalog) {
+		throw InvalidInputException("acl_lineage_resend needs a policy catalog (acl_use_db)");
+	}
+	string only = args.ColumnCount() > 0 && !args.data[0].GetValue(0).IsNull() ? args.data[0].GetValue(0).ToString()
+	                                                                             : string();
+	auto rows = store->catalog->Query("SELECT DISTINCT \"vcat\" FROM " + store->catalog->Tbl("relations") +
+	                                  (only.empty() ? string() : " WHERE \"vcat\" = '" +
+	                                                                 StringUtil::Replace(only, "'", "''") + "'") +
+	                                  " ORDER BY 1");
+	int64_t count = 0;
+	for (idx_t i = 0; i < rows->RowCount(); i++) {
+		auto vcat = rows->Collection().GetValue(0, i).ToString();
+		auto objects = store->catalog->Query("SELECT count(*) FROM " + store->catalog->Tbl("relations") +
+		                                     " WHERE \"vcat\" = '" + StringUtil::Replace(vcat, "'", "''") + "'");
+		count += objects->Collection().GetValue(0, 0).GetValue<int64_t>();
+		store->NoteGrantLineage(vcat);
+	}
+	result.Reference(Value::BIGINT(count), count_t(args.size()));
+}
+
 void RegisterAclLineage(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store,
                         const shared_ptr<AuditPipeline> &pipeline) {
+	for (auto arity : {0, 1}) {
+		vector<LogicalType> arguments;
+		if (arity == 1) {
+			arguments.push_back(LogicalType::VARCHAR);
+		}
+		ScalarFunction resend(Identifier("acl_lineage_resend"), arguments, LogicalType::BIGINT, LineageResendFunc);
+		resend.SetExtraFunctionInfo(make_shared_ptr<LineageFlushInfo>(store, pipeline));
+		resend.SetFallible();
+		resend.SetVolatile();
+		loader.RegisterFunction(resend);
+	}
 	{
 		ScalarFunction flush(Identifier("acl_lineage_flush"), {}, LogicalType::BOOLEAN, LineageFlushFunc);
 		flush.SetExtraFunctionInfo(make_shared_ptr<LineageFlushInfo>(store, pipeline));

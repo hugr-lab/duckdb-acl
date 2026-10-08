@@ -525,3 +525,24 @@ statement error
 ACL ROLE "w" LINEAGE PARENT a/b/c SELECT 1;
 ----
 ACL LINEAGE PARENT requires a quoted value
+
+# === the static picture again, for a transport that starts on an empty catalog ==========================
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+query I
+SELECT acl_lineage_resend('c') > 0;
+----
+true
+
+statement ok
+SELECT acl_lineage_flush();
+
+query I
+SELECT count(*) > 0 FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'DATASET';
+----
+true

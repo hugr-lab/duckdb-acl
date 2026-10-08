@@ -391,3 +391,57 @@ function proves it is never bound twice).
   config or Airflow's `OPENLINEAGE_PARENT_ID`.
 - **The explicit lineage facet** (an OpenLineage proposal that supersedes the column-lineage facet):
   switch when it lands. The edge model is the same.
+
+## As built (2026-10-08)
+
+**Changes against the design above:**
+
+- **No shadow table function: a scratch mirror.** §5.2's `acl_lineage_shadow` would have meant
+  replacing table references inside the AST, and duckdb's iterator hands out a `TableRef&`, not the
+  owning pointer. So the worker builds a scratch in-memory DuckDB instead:
+  - it runs with no external access, no autoload, and holds no data;
+  - for every relation the statement names, `SELECT * FROM <name>` is rewritten and bound under the
+    same principal on the node, and an EMPTY table of that shape (names, types, narrowed structs) is
+    created under the object's canonical name;
+  - the statement as written is then bound there and walked, never executed.
+
+  The rest follows from that:
+  - the DML target is a real `LogicalInsert` / `LogicalUpdate` / `LogicalMergeInto`, so no
+    statement is translated into a SELECT;
+  - no foreign bind runs again on the node: a table function in the statement binds in the scratch
+    database without external access, or fails to `approximate`.
+
+  `TablePolicy::canonical` (the `vcat.vname` a name resolved to) was added for this.
+- **The job is carried by the profile note.** `AuditTrail::Statement::lineage` → `ProfileNote::lineage`
+  → `QueryEnd` enqueues one run per execution with its outcome.
+- **The pre-optimize hook takes only what no principal decided:**
+  - `ACL NATIVE` and unprefixed SQL;
+  - physical DML / CTAS as runs;
+  - CREATE TABLE / VIEW, DROP and ALTER as definitions, emitted only on success;
+  - ATTACH / DETACH as `NAMESPACE` events.
+
+  A read leaves at its first switch. The policy catalog, `system` and `temp` are bookkeeping and are
+  skipped. A physical view's body binds under the view's own catalog and schema, because duckdb strips
+  that qualifier from it.
+- **`acl_lineage([vcat])` became `acl_lineage_resend([vcat])`.** It re-sends the static picture
+  through the same channel, rather than adding a second shape of the same facts.
+- **`acl_lineage_dataset(object)` is dropped.** `acl_` is spec 072's never set, so it could not have
+  been a principal's function. The naming rule is deterministic and documented, which is enough.
+- **The physical job is named by its kind.** It is `physical:<operation>`, because a physical
+  statement's text is not parsed again on the hook.
+
+**Tests:**
+
+- `test/sql/acl_lineage.test` - 216 assertions: static, runtime, physical, tags, namespaces,
+  context, privacy;
+- `test/sql/integration/acl_lineage_quack.test` - the quack door's headers and SET;
+- `test/cpp/test_acl_lineage_walker.cpp` - 25 checks.
+
+**Docs:** `website/docs/lineage.md`.
+
+**Not yet:**
+
+- the quack drain path (spec 042's `DrainStreamUnderPrincipal`): its writes are not captured;
+- schema grants (`GRANT SCHEMA`) do not re-send tags;
+- a Flight e2e of the `x-openlineage-*` headers - the code path is the same as the trace headers';
+- the acl-otel transport (its own spec).

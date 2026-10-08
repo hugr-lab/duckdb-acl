@@ -47,6 +47,12 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
 
 ## Open
 
+- **Lineage follow-ups (spec 107):**
+  - the quack drain's writes (`DrainStreamUnderPrincipal`);
+  - schema grants re-sending tags;
+  - a Flight e2e of the `x-openlineage-*` headers;
+  - the acl-otel OpenLineage transport (its own spec, e2e against Marquez).
+
 - **A virtual function call ignores its qualifier** (spec 098 review): the rewriter resolves calls by
   the bare name, so `c.main.shout()` or `phys.main.shout()` reach the MAIN catalog's `shout`, and
   another granted catalog's functions cannot be called at all. No widening (it is the principal's
