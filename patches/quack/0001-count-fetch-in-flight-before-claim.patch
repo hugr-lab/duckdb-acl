@@ -1,0 +1,22 @@
+diff --git a/src/quack_fetch_ahead.cpp b/src/quack_fetch_ahead.cpp
+index 756a120..66f26ac 100644
+--- a/src/quack_fetch_ahead.cpp
++++ b/src/quack_fetch_ahead.cpp
+@@ -216,12 +216,16 @@ void QuackFetcher::TopUp(ClientContext &context) {
+ 		}
+ 		// Each task asks for one index, in dense order. Its payload is encoded once here, with the
+ 		// current ack, and it does not change. An HTTP retry is therefore safe.
++		// Counted in flight BEFORE the index is claimed. A terminal answer's FinishTask ends the stream
++		// when in_flight reaches 0; an index claimed but not yet counted would let it check the push
++		// count without that batch ("N-1 of N batches received"), and the batch's own answer would
++		// then be dropped by a buffer already finished.
++		++in_flight;
+ 		auto request_index = next_request++;
+ 		FetchRequestMessage fetch_msg(connection_id, query_uuid, request_index, CurrentAck());
+ 		auto request_payload = make_uniq<MemoryStream>();
+ 		QuackClient::EncodeRequest(context, fetch_msg, *request_payload);
+ 		auto request_size = request_payload->GetPosition();
+-		++in_flight;
+ 		queue->Register(make_uniq<QuackFetchDataTask>(*this, std::move(client), request_index,
+ 		                                              std::move(request_payload), request_size),
+ 		                request_size);
