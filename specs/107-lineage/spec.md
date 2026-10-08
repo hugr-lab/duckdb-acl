@@ -1,6 +1,6 @@
 # Spec 107: lineage - what the node defines and what it writes, as facts for OpenLineage
 
-- **Status**: draft
+- **Status**: accepted (2026-10-08, the owner)
 - **Date**: 2026-10-08
 - **Author**: owner + Claude
 - **Follows**: the owner's discussion of 2026-10-08 (design/021-lineage, local). The specs it builds on:
