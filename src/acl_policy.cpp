@@ -1,4 +1,5 @@
 #include "acl_policy.hpp"
+#include "acl_lineage.hpp"
 
 #include "acl_audit_pipeline.hpp"
 #include "acl_rewriter.hpp"
@@ -1008,8 +1009,11 @@ bool ClientSettingAllowed(const string &name) {
 	// Everything outside this list stays refused; growing it is a spec, not a line. The two trace
 	// settings (spec 069) name the request a session's statements belong to, and change nothing
 	// about what a statement reads or costs.
+	// spec 107 adds the client's lineage context (the job and the external run a statement is a step
+	// of): metadata of the lineage event, nothing a statement reads or costs
 	return StringUtil::CIEquals(name, "TimeZone") || StringUtil::CIEquals(name, "Calendar") ||
-	       StringUtil::CIEquals(name, "acl_correlation_id") || StringUtil::CIEquals(name, "acl_traceparent");
+	       StringUtil::CIEquals(name, "acl_correlation_id") || StringUtil::CIEquals(name, "acl_traceparent") ||
+	       LineageClientSetting(name);
 }
 
 bool PolicyStore::SetDraining(bool value) {

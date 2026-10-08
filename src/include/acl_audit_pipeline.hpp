@@ -54,6 +54,9 @@ public:
 	bool ProfileForSession(const Principal &principal, const string &door, ProfileLevel &out);
 	//! The events of the ring, oldest first.
 	vector<AuditEvent> Ring();
+	//! spec 107: the lineage events, oldest first - a ring of their own (`acl_lineage_buffer`), never
+	//! the audit ring or file.
+	vector<AuditEvent> LineageRing();
 	int64_t Dropped() const;
 	//! Wait until every event enqueued so far has been handled (tests; shutdown), then flush the sinks
 	//! and sync the file. Bounded: false when the thread did not drain in time (a sink is stuck).
@@ -103,6 +106,8 @@ private:
 	std::atomic<int64_t> ring_cap {10000};
 	std::mutex ring_lock;
 	std::deque<AuditEvent> ring;
+	std::atomic<int64_t> lineage_cap {1000};
+	std::deque<AuditEvent> lineage_ring; // under ring_lock
 
 	// the file sink: opened by path on the emitting thread, written by the worker
 	std::mutex file_lock;

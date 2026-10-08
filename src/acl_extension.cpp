@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "acl_extension.hpp"
+#include "acl_lineage.hpp"
 #ifdef ACL_QUACK_EMBED_ENABLED
 #include "acl_quack_embed.hpp"
 #endif
@@ -114,6 +115,7 @@ void LoadInternal(ExtensionLoader &loader) {
 		    }
 	    },
 	    SetScope::GLOBAL);
+	acl::AddLineageOptions(config); // spec 107: the lineage facts' settings (and the client's context)
 	config.AddExtensionOption("acl_audit_buffer",
 	                          "acl: how many of the newest audit events acl_audit_events() holds (0 = none)",
 	                          LogicalType::BIGINT, Value::BIGINT(10000), nullptr, SetScope::GLOBAL);
@@ -403,8 +405,9 @@ void LoadInternal(ExtensionLoader &loader) {
 		                         read(&acl::SessionNotifier::Slow));
 	}
 	acl::RegisterAclAudit(loader, store, pipeline);
-	acl::RegisterAclProfile(loader, store);  // spec 074: the execution profile, on every connection
-	acl::RegisterAclNodeLoad(loader, store); // spec 079: acl_node_load(), the orchestrator's report
+	acl::RegisterAclLineage(loader, pipeline); // spec 107: acl_lineage_events()
+	acl::RegisterAclProfile(loader, store);    // spec 074: the execution profile, on every connection
+	acl::RegisterAclNodeLoad(loader, store);   // spec 079: acl_node_load(), the orchestrator's report
 	// the node's own gauges (spec 069): how long it has been up, and which build it is
 	{
 		string version;
