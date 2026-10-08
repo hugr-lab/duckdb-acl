@@ -56,6 +56,10 @@ bool LineageClientSetting(const string &name);
 AuditLineageDataset LineageDatasetFor(const LineageDatasetKey &key, const LineageSettings &settings);
 //! Parse `<namespace>/<job>/<runId>`; an empty or malformed reference is empty.
 AuditLineageRunRef ParseLineageRunRef(const string &text);
+//! spec 109: whether a parent / root parent is `<namespace>/<job>/<runId>` with a UUID runId (what
+//! OpenLineage's ParentRunFacet requires); '' is no parent and passes. `error` says what is expected,
+//! never echoing the value.
+bool LineageRunRefCheck(const string &text, string &error);
 
 //! A walk's datasets and edges as the contract's payload; `writes` = the walk's target is an output.
 //! Physical datasets (and their edges) are dropped when the settings say so.

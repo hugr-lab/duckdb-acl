@@ -79,6 +79,18 @@ void CheckPhysical(ClientContext &, SetScope scope, Value &) {
 void CheckMaxEdges(ClientContext &, SetScope scope, Value &) {
 	RequireGlobal("acl_lineage_max_edges", scope);
 }
+void CheckRunRef(const char *name, const Value &value) {
+	string error;
+	if (!value.IsNull() && !LineageRunRefCheck(value.ToString(), error)) {
+		throw InvalidInputException("%s: %s", name, error);
+	}
+}
+void CheckParent(ClientContext &, SetScope, Value &value) {
+	CheckRunRef("acl_lineage_parent", value);
+}
+void CheckRootParent(ClientContext &, SetScope, Value &value) {
+	CheckRunRef("acl_lineage_root_parent", value);
+}
 
 } // namespace
 
@@ -134,14 +146,15 @@ void AddLineageOptions(DBConfig &config) {
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true), CheckPhysical, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_lineage_max_edges", "acl: edges per lineage event before it is truncated",
 	                          LogicalType::BIGINT, Value::BIGINT(4096), CheckMaxEdges, SetScope::GLOBAL);
-	// spec 107 + 068: the client's lineage context - session scope, SET only on a session of its own
+	// spec 107 + 068: the client's lineage context - session scope, SET only on a session of its own;
+	// spec 109: a parent is checked at the SET, so a client wired up wrong learns it at once
 	config.AddExtensionOption(
 	    "acl_lineage_parent",
-	    "acl: the OpenLineage parent run of this session's statements (<namespace>/<job>/<runId>)",
-	    LogicalType::VARCHAR, Value(""));
+	    "acl: the OpenLineage parent run of this session's statements (<namespace>/<job>/<runId>, a UUID runId)",
+	    LogicalType::VARCHAR, Value(""), CheckParent);
 	config.AddExtensionOption("acl_lineage_root_parent",
-	                          "acl: the OpenLineage root parent run of this session's statements", LogicalType::VARCHAR,
-	                          Value(""));
+	                          "acl: the OpenLineage root parent run of this session's statements (the same form)",
+	                          LogicalType::VARCHAR, Value(""), CheckRootParent);
 	config.AddExtensionOption("acl_lineage_job", "acl: the OpenLineage job name of this session's statements",
 	                          LogicalType::VARCHAR, Value(""));
 }
@@ -173,6 +186,28 @@ AuditLineageDataset LineageDatasetFor(const LineageDatasetKey &key, const Lineag
 		dataset.dataset_type = "FUNCTION";
 	}
 	return dataset;
+}
+
+bool LineageRunRefCheck(const string &text, string &error) {
+	if (text.empty()) {
+		return true;
+	}
+	if (text.size() > 512) {
+		// the bound every channel applies after this check: a longer value would lose its runId there
+		error = "expected <namespace>/<job>/<runId>, the runId a UUID, at most 512 bytes";
+		return false;
+	}
+	auto ref = ParseLineageRunRef(text);
+	bool uuid = ref.run_id.size() == 36;
+	for (idx_t i = 0; uuid && i < ref.run_id.size(); i++) {
+		auto c = ref.run_id[i];
+		uuid = (i == 8 || i == 13 || i == 18 || i == 23) ? c == '-' : isxdigit((unsigned char)c) != 0;
+	}
+	if (ref.ns.empty() || ref.job.empty() || !uuid) {
+		error = "expected <namespace>/<job>/<runId>, the runId a UUID (OPENLINEAGE_PARENT_ID's form)";
+		return false;
+	}
+	return true;
 }
 
 AuditLineageRunRef ParseLineageRunRef(const string &text) {

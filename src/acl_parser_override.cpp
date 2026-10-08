@@ -117,7 +117,14 @@ AclPrefix ParseAclPrefix(const string &query) {
 						throw ParserException("acl_rewrite: ACL LINEAGE %s requires a quoted value",
 						                      StringUtil::Upper(part));
 					}
-					*target = BoundLineage(ReadQuoted(query, scan));
+					auto raw = ReadQuoted(query, scan);
+					// spec 109: a parent the transport would have to drop is refused here, where the
+					// client can still hear it - judged before the bound, which would cut its runId
+					string malformed;
+					if (target != &prefix.lineage.job && !LineageRunRefCheck(raw, malformed)) {
+						throw ParserException("acl_rewrite: ACL LINEAGE %s: %s", StringUtil::Upper(part), malformed);
+					}
+					*target = BoundLineage(raw);
 					any = true;
 				}
 				if (!any) {

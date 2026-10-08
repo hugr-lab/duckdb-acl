@@ -1,6 +1,6 @@
 # Spec 109: a lineage parent is checked where it enters
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-10-08
 - **Follows**: spec 107 (lineage), acl-otel spec 018 (the OpenLineage transport)
 
@@ -55,3 +55,32 @@ and the message echoes no part of it (no reflection). The bounds of spec 107 sta
   removes.
 - **Accept any runId, and let the transport mint a UUID from it** (a v5 of the text). The run would
   then point at a parent nobody created; the backend shows a dangling link. Worse than a refusal.
+
+## As built (2026-10-08)
+
+- `LineageRunRefCheck` (`acl_lineage.cpp`) is the one check. Its message is a fixed sentence, so it
+  never echoes the value.
+- **Marker:** checked in the parser override on the raw value, before it is bounded. A value over
+  512 bytes is refused whole, because the cut would lose its runId.
+- **SET:** a check callback on `acl_lineage_parent` / `_root_parent`. Under `ACL SESSION` the rewriter
+  checks too, **before** `SetSessionTrace`: duckdb runs the callback only after the rewrite, and a
+  value already on the session's record would make every later statement of the session refused
+  (review F1).
+- **Flight:** `LineageOfCall` answers an `arrow::Status`, and its 3 callers return it as is.
+- **quack:** `AclQuackNoteRequestLineage` blanks a malformed parent or root, keeps the job, adds to
+  `acl.lineage.parent_invalid{door=quack}`, and writes the door event once per connection
+  (`PolicyStore::quack_lineage_reported`, cleared with the connection).
+  - It notes only a connection the door bound a session to. A request names its connection id before
+    quack checks it, so an id nobody authenticated would otherwise stay in the maps for good.
+  - Both maps are cleared when the last door stops.
+- **Tests:**
+  - `test/sql/acl_lineage.test`: the marker, ROOT, a two-part value, no echo, a value over 512
+    bytes, a free JOB, the SET on a bare connection;
+    the existing cases now use UUIDs;
+  - `test/sql/integration/acl_lineage_quack.test`:
+    - a malformed parent or root header gives one door event, the counter, no parent and no root,
+      and the job is kept;
+    - a malformed `SET` on the session is refused, and the next statement runs under the parent the
+      session had;
+  - `test/e2e/flight/run.sh`: a malformed header gives InvalidArgument without echo; a UUID is
+    taken. `client.py` gains `ACL_EXTRA_HEADERS`.

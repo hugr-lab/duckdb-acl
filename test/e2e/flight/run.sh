@@ -107,6 +107,15 @@ echo "$got" | grep -q "'globex': \[5\]" && fail "the explicit PIVOT counted anot
 got="$(ask "PIVOT orders ON tenant USING count(*)")"
 echo "$got" | grep -qi "prepare multiple statements" || fail "the implicit PIVOT was not refused as unpreparable: $got"
 
+# --- spec 109: a lineage parent in a header is checked where it enters - a malformed one is the call's
+# error (InvalidArgument, no part of the value echoed); a well-formed one is taken
+got="$(ACL_EXTRA_HEADERS="x-openlineage-parent=airflow/daily/not-a-uuid" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "x-openlineage-parent: expected <namespace>/<job>/<runId>" ||
+	fail "a malformed lineage parent header was not refused: $got"
+echo "$got" | grep -q "not-a-uuid" && fail "the refusal echoed the header's value: $got"
+got="$(ACL_EXTRA_HEADERS="x-openlineage-parent=airflow/daily/01929e3a-0000-7000-8000-000000000001" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "'one'" || fail "a well-formed lineage parent header was refused: $got"
+
 # --- a statement carrying a transaction id that names no open transaction is refused (spec 055) ----
 # the security-critical ValidateTxnLocked path: a stolen/invented id cannot ride into a transaction
 got="$(ask "@txnq:deadbeefdeadbeefdeadbeefdeadbeef:SELECT 1")"

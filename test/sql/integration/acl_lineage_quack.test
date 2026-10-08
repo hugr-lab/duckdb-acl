@@ -62,7 +62,7 @@ quack:localhost:31906
 # the request headers: what an http secret adds to every request to the door
 statement ok
 CREATE SECRET lineage_headers (TYPE http, SCOPE 'http://localhost:31906',
-    EXTRA_HTTP_HEADERS MAP {'x-openlineage-parent': 'airflow/nightly.load/run-h', 'x-openlineage-job': 'dbt.sink'});
+    EXTRA_HTTP_HEADERS MAP {'x-openlineage-parent': 'airflow/nightly.load/01929e3a-0000-7000-8000-00000000000a', 'x-openlineage-job': 'dbt.sink'});
 
 statement ok
 ATTACH 'quack:localhost:31906' AS r1 (TYPE quack, TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
@@ -77,11 +77,11 @@ query TTT
 SELECT job_name, payload->'parent'->>'job', payload->'parent'->>'run_id'
 FROM acl_lineage_events() WHERE event_type = 'RUN_COMPLETE' ORDER BY seq DESC LIMIT 1;
 ----
-dbt.sink	nightly.load	run-h
+dbt.sink	nightly.load	01929e3a-0000-7000-8000-00000000000a
 
 # a SET on the session: a step's own parent, over the connection's header
 statement ok
-FROM quack_query_by_name('r1', 'SET acl_lineage_parent = ''airflow/nightly.step2/run-s''');
+FROM quack_query_by_name('r1', 'SET acl_lineage_parent = ''airflow/nightly.step2/01929e3a-0000-7000-8000-00000000000b''');
 
 statement ok
 FROM quack_query_by_name('r1', 'INSERT INTO sink VALUES (2, ''s'')');
@@ -94,7 +94,7 @@ query TT
 SELECT job_name, payload->'parent'->>'run_id'
 FROM acl_lineage_events() WHERE event_type = 'RUN_COMPLETE' ORDER BY seq DESC LIMIT 1;
 ----
-dbt.sink	run-h
+dbt.sink	01929e3a-0000-7000-8000-00000000000a
 
 statement ok
 DETACH r1;
@@ -106,10 +106,23 @@ statement ok
 ATTACH 'quack:localhost:31906' AS r2 (TYPE quack, TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
 
 statement ok
-FROM quack_query_by_name('r2', 'SET acl_lineage_parent = ''airflow/nightly.step3/run-s3''');
+FROM quack_query_by_name('r2', 'SET acl_lineage_parent = ''airflow/nightly.step3/01929e3a-0000-7000-8000-00000000000c''');
 
 statement ok
 FROM quack_query_by_name('r2', 'INSERT INTO sink VALUES (3, ''t'')');
+
+statement ok
+SELECT acl_lineage_flush();
+
+# spec 109: a malformed parent SET on the session is refused, and leaves nothing on the session's
+# record - the next statement runs, still under the parent it had
+statement error
+FROM quack_query_by_name('r2', 'SET acl_lineage_parent = ''airflow/nightly.step4/not-a-uuid''');
+----
+acl_lineage_parent: expected <namespace>/<job>/<runId>
+
+statement ok
+FROM quack_query_by_name('r2', 'INSERT INTO sink VALUES (31, ''t2'')');
 
 statement ok
 SELECT acl_lineage_flush();
@@ -119,10 +132,55 @@ query T
 SELECT payload->'parent'->>'run_id'
 FROM acl_lineage_events() WHERE event_type = 'RUN_COMPLETE' ORDER BY seq DESC LIMIT 1;
 ----
-run-s3
+01929e3a-0000-7000-8000-00000000000c
 
 statement ok
 DETACH r2;
+
+# spec 109: a header whose parent is no <namespace>/<job>/<UUID> is not taken - quack cannot carry a
+# message back, so the statement runs without it, and the door says so once per connection
+statement ok
+CREATE SECRET bad_headers (TYPE http, SCOPE 'http://localhost:31906',
+    EXTRA_HTTP_HEADERS MAP {'x-openlineage-parent': 'airflow/nightly.load/not-a-uuid',
+                            'x-openlineage-root-parent': 'airflow/nightly/also-not-a-uuid',
+                            'x-openlineage-job': 'kept.job'});
+
+statement ok
+ATTACH 'quack:localhost:31906' AS r3 (TYPE quack, TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
+
+statement ok
+FROM quack_query_by_name('r3', 'INSERT INTO sink VALUES (4, ''u'')');
+
+statement ok
+FROM quack_query_by_name('r3', 'INSERT INTO sink VALUES (5, ''v'')');
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT coalesce(payload->'parent'->>'run_id', 'none'), coalesce(payload->'root_parent'->>'run_id', 'none'), job_name
+FROM acl_lineage_events() WHERE event_type = 'RUN_COMPLETE' ORDER BY seq DESC LIMIT 1;
+----
+none	none	kept.job
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE kind = 'door' AND detail = 'lineage_parent_invalid';
+----
+1
+
+query I
+SELECT sum(value) >= 2 FROM acl_metrics() WHERE name = 'acl.lineage.parent_invalid';
+----
+true
+
+statement ok
+DETACH r3;
+
+statement ok
+DROP SECRET bad_headers;
 
 statement ok
 SELECT acl_quack_stop('quack:localhost:31906');

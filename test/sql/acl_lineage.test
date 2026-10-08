@@ -479,7 +479,7 @@ statement ok
 INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
 
 statement ok
-ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.load_sink/0190-run' ROOT 'airflow/daily_load/0190-root' JOB 'dbt.sink_model' INSERT INTO sink VALUES (7, 'x');
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.load_sink/01929e3a-0000-7000-8000-000000000001' ROOT 'airflow/daily_load/01929e3a-0000-7000-8000-0000000000ff' JOB 'dbt.sink_model' INSERT INTO sink VALUES (7, 'x');
 
 statement ok
 SELECT acl_lineage_flush();
@@ -488,12 +488,12 @@ query TTTT
 SELECT job_name, payload->'parent'->>'namespace', payload->'parent'->>'job', payload->'parent'->>'run_id'
 FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
 ----
-dbt.sink_model	airflow	daily_load.load_sink	0190-run
+dbt.sink_model	airflow	daily_load.load_sink	01929e3a-0000-7000-8000-000000000001
 
 query T
 SELECT payload->'root_parent'->>'run_id' FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
 ----
-0190-root
+01929e3a-0000-7000-8000-0000000000ff
 
 # a read is emitted only as a declared step: its inputs, no target, no edges
 statement ok
@@ -503,7 +503,7 @@ statement ok
 INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
 
 statement ok
-ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/0191-run' SELECT id, total FROM src;
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT id, total FROM src;
 
 statement ok
 SELECT acl_lineage_flush();
@@ -517,9 +517,58 @@ RUN_COMPLETE	src	0	0
 
 # each marker once, and the value quoted
 statement error
-ACL ROLE "w" LINEAGE PARENT 'a/b/c' LINEAGE JOB 'x' SELECT 1;
+ACL ROLE "w" LINEAGE PARENT 'a/b/01929e3a-0000-7000-8000-000000000001' LINEAGE JOB 'x' SELECT 1;
 ----
 ACL LINEAGE may be written once
+
+# spec 109: a parent is <namespace>/<job>/<runId> with a UUID runId - refused where it enters, never
+# dropped downstream; the message echoes no part of the value
+statement error
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load/0190-run' INSERT INTO sink VALUES (1, 'x');
+----
+ACL LINEAGE PARENT: expected <namespace>/<job>/<runId>, the runId a UUID
+
+statement error
+ACL ROLE "w" LINEAGE PARENT 'daily_load/01929e3a-0000-7000-8000-000000000001' INSERT INTO sink VALUES (1, 'x');
+----
+ACL LINEAGE PARENT: expected <namespace>/<job>/<runId>
+
+statement error
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load/01929e3a-0000-7000-8000-000000000001' ROOT 'airflow//01929e3a-0000-7000-8000-000000000001' INSERT INTO sink VALUES (1, 'x');
+----
+ACL LINEAGE ROOT: expected <namespace>/<job>/<runId>
+
+statement error
+ACL ROLE "w" LINEAGE PARENT 'airflow/secret-job-name/not-a-uuid' SELECT 1;
+----
+<REGEX>:.*ACL LINEAGE PARENT: expected <namespace>/<job>/<runId>, the runId a UUID \(OPENLINEAGE_PARENT_ID's form\).*
+
+# a value over the 512-byte bound is refused whole - cut there, it would lose its runId
+statement error
+ACL ROLE "w" LINEAGE PARENT 'acl://nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn/job/01929e3a-0000-7000-8000-000000000001' SELECT 1;
+----
+at most 512 bytes
+
+# a job is free text
+statement ok
+ACL ROLE "w" LINEAGE JOB 'anything goes here' INSERT INTO sink VALUES (2, 'y');
+
+# the session settings: refused at the SET
+statement error
+SET acl_lineage_parent = 'airflow/daily_load/0190-run';
+----
+acl_lineage_parent: expected <namespace>/<job>/<runId>, the runId a UUID
+
+statement error
+SET acl_lineage_root_parent = 'nope';
+----
+acl_lineage_root_parent: expected <namespace>/<job>/<runId>
+
+statement ok
+SET acl_lineage_parent = 'airflow/daily_load/01929e3a-0000-7000-8000-000000000001';
+
+statement ok
+RESET acl_lineage_parent;
 
 statement error
 ACL ROLE "w" LINEAGE PARENT a/b/c SELECT 1;

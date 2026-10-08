@@ -12,6 +12,7 @@
 #include "acl_flight_door.hpp"
 
 #include "acl_audit.hpp"
+#include "acl_lineage.hpp"
 #include "acl_flight_catalog.hpp"
 #include "duckdb/common/error_data.hpp"
 
@@ -676,8 +677,9 @@ void TraceOfCall(const flight::ServerCallContext &context, ClientContext &sessio
 //! spec 107: the statement's lineage context - the call's `x-openlineage-parent` / `-root-parent` /
 //! `-job` headers first (a driver sets them per request, from Spark's config or Airflow's
 //! OPENLINEAGE_PARENT_ID), else what the client SET on its session's connection.
-void LineageOfCall(const flight::ServerCallContext &context, ClientContext &session_context, string &parent,
-                   string &root_parent, string &job) {
+//! spec 109: a header with a parent that is not `<namespace>/<job>/<UUID>` is the call's error.
+arrow::Status LineageOfCall(const flight::ServerCallContext &context, ClientContext &session_context, string &parent,
+                            string &root_parent, string &job) {
 	for (const auto &header : context.incoming_headers()) {
 		string name(header.first);
 		if (StringUtil::CIEquals(name, "x-openlineage-parent")) {
@@ -699,6 +701,14 @@ void LineageOfCall(const flight::ServerCallContext &context, ClientContext &sess
 	if (job.empty()) {
 		job = set_job;
 	}
+	for (auto header :
+	     {std::make_pair("x-openlineage-parent", &parent), std::make_pair("x-openlineage-root-parent", &root_parent)}) {
+		string error;
+		if (!LineageRunRefCheck(*header.second, error)) {
+			return arrow::Status::Invalid("acl: ", header.first, ": ", error);
+		}
+	}
+	return arrow::Status::OK();
 }
 
 string TokenFromHeaders(const flight::ServerCallContext &context) {
@@ -1154,7 +1164,7 @@ public:
 			auto conn = state->ConnFor(handle);
 			string correlation_id, traceparent, lineage_parent, lineage_root, lineage_job;
 			TraceOfCall(context, *conn->con->context, correlation_id, traceparent);
-			LineageOfCall(context, *conn->con->context, lineage_parent, lineage_root, lineage_job);
+			ARROW_RETURN_NOT_OK(LineageOfCall(context, *conn->con->context, lineage_parent, lineage_root, lineage_job));
 			auto prefixed = state->store->SessionSql(handle, command.query, correlation_id, traceparent, lineage_parent,
 			                                         lineage_root, lineage_job);
 			if (prefixed.empty()) {
@@ -1227,7 +1237,7 @@ public:
 			auto conn = state->ConnFor(handle);
 			string correlation_id, traceparent, lineage_parent, lineage_root, lineage_job;
 			TraceOfCall(context, *conn->con->context, correlation_id, traceparent);
-			LineageOfCall(context, *conn->con->context, lineage_parent, lineage_root, lineage_job);
+			ARROW_RETURN_NOT_OK(LineageOfCall(context, *conn->con->context, lineage_parent, lineage_root, lineage_job));
 			auto prefixed = state->store->SessionSql(handle, command.query, correlation_id, traceparent, lineage_parent,
 			                                         lineage_root, lineage_job);
 			if (prefixed.empty()) {
@@ -1571,7 +1581,8 @@ public:
 			    auto conn = state->ConnFor(handle);
 			    string correlation_id, traceparent, lineage_parent, lineage_root, lineage_job;
 			    TraceOfCall(context, *conn->con->context, correlation_id, traceparent);
-			    LineageOfCall(context, *conn->con->context, lineage_parent, lineage_root, lineage_job);
+			    ARROW_RETURN_NOT_OK(
+			        LineageOfCall(context, *conn->con->context, lineage_parent, lineage_root, lineage_job));
 			    auto prefixed = state->store->SessionSql(handle, request.query, correlation_id, traceparent,
 			                                             lineage_parent, lineage_root, lineage_job);
 			    if (prefixed.empty()) {

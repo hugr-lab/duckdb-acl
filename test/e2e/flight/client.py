@@ -207,6 +207,10 @@ if _jar:
 client = flight.FlightClient(uri, **_kw)
 # "-" means: send no credentials at all. The door must refuse that, and it is worth being able to ask.
 headers = [] if token == "-" else [(b"authorization", f"Bearer {token}".encode())]
+# spec 109: extra request headers, `name=value` pairs separated by `;` (the x-openlineage-* ones)
+for _pair in filter(None, os.environ.get("ACL_EXTRA_HEADERS", "").split(";")):
+    _name, _value = _pair.split("=", 1)
+    headers.append((_name.encode(), _value.encode()))
 options = flight.FlightCallOptions(headers=headers)
 if ask.startswith("@update:"):
     print({"count": do_update(client, options, ask[len("@update:"):])})
