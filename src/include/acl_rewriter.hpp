@@ -49,6 +49,8 @@ string TakeDenyReason();
 //! touched with the capability the decision needed, and what the decision cost. The entry of the
 //! statement being rewritten is the last one, so a refusal thrown mid-walk leaves what was decided
 //! up to it.
+struct LineageJob;
+
 struct AuditTrail {
 	struct Statement {
 		string statement;
@@ -63,6 +65,8 @@ struct AuditTrail {
 		//! follow-up, a nested query or a later statement never takes this one's note
 		bool executes = true;
 		uint64_t text_hash = 0;
+		//! spec 107: the statement's lineage job, captured before the rewrite (null when out of scope)
+		shared_ptr<LineageJob> lineage;
 	};
 	vector<Statement> statements;
 };

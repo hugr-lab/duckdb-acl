@@ -3,6 +3,7 @@
 #include "acl_admin_sql.hpp"
 #include "acl_audit_pipeline.hpp"
 #include "acl_profile.hpp"
+#include "acl_lineage.hpp"
 #include "acl_rewriter.hpp"
 #include "acl_scan_util.hpp"
 #include "duckdb/common/error_data.hpp"
@@ -45,6 +46,8 @@ struct AclPrefix {
 	//! written after the principal by whoever composes the prefix, carried onto every event about it
 	string correlation_id;
 	string traceparent;
+	//! spec 107: the client's lineage context - `LINEAGE PARENT '<ns/job/run>' [ROOT '<...>'] [JOB '<name>']`
+	LineageContext lineage;
 };
 
 AclPrefix ParseAclPrefix(const string &query) {
@@ -79,12 +82,49 @@ AclPrefix ParseAclPrefix(const string &query) {
 	auto read_trace = [&](idx_t &scan) {
 		bool seen_trace = false;
 		bool seen_parent = false;
+		bool seen_lineage = false;
 		for (;;) {
 			SkipWhitespace(query, scan);
 			auto saved = scan;
 			auto word = ReadWord(query, scan);
 			bool trace = StringUtil::CIEquals(word, "trace");
 			bool parent = StringUtil::CIEquals(word, "parent");
+			if (StringUtil::CIEquals(word, "lineage")) {
+				// spec 107: `LINEAGE [PARENT '<ns/job/run>'] [ROOT '<ns/job/run>'] [JOB '<name>']` - once
+				if (seen_lineage) {
+					throw ParserException("acl_rewrite: ACL LINEAGE may be written once in a prefix");
+				}
+				seen_lineage = true;
+				bool any = false;
+				for (;;) {
+					SkipWhitespace(query, scan);
+					auto part_start = scan;
+					auto part = ReadWord(query, scan);
+					string *target = StringUtil::CIEquals(part, "parent") ? &prefix.lineage.parent
+					                 : StringUtil::CIEquals(part, "root") ? &prefix.lineage.root_parent
+					                 : StringUtil::CIEquals(part, "job")  ? &prefix.lineage.job
+					                                                      : nullptr;
+					if (!target) {
+						scan = part_start;
+						break;
+					}
+					if (!target->empty()) {
+						throw ParserException("acl_rewrite: ACL LINEAGE %s may be written once",
+						                      StringUtil::Upper(part));
+					}
+					SkipWhitespace(query, scan);
+					if (scan >= query.size() || (query[scan] != '\'' && query[scan] != '"')) {
+						throw ParserException("acl_rewrite: ACL LINEAGE %s requires a quoted value",
+						                      StringUtil::Upper(part));
+					}
+					*target = BoundLineage(ReadQuoted(query, scan));
+					any = true;
+				}
+				if (!any) {
+					throw ParserException("acl_rewrite: ACL LINEAGE needs PARENT, ROOT or JOB");
+				}
+				continue;
+			}
 			if (!trace && !parent) {
 				scan = saved;
 				return;
@@ -267,6 +307,10 @@ struct StatementAudit {
 			note.statement = stmt.statement;
 			note.objects = stmt.objects;
 			note.physical = stmt.physical;
+			if (stmt.lineage) {
+				stmt.lineage->decision_seq = seq; // spec 107: the run names its decision
+				note.lineage = stmt.lineage;
+			}
 			PushProfileNote(std::move(note));
 		}
 	}
@@ -691,8 +735,16 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		}
 		principal.arrow_ingest = true;
 	}
+	// spec 107: a statement lineage covers is copied as written, before the rewrite renames it
+	vector<shared_ptr<LineageJob>> lineage_jobs;
+	for (auto &statement : statements) {
+		lineage_jobs.push_back(CaptureLineageJob(store, *statement, principal, audit.proto.door, prefix.lineage));
+	}
 	audit.phase = Reason::POLICY_ERROR; // an unnoted failure under the rewrite is the policy's
 	RewriteStatements(statements, principal, options, store, &audit.trail);
+	for (idx_t i = 0; i < audit.trail.statements.size() && i < lineage_jobs.size(); i++) {
+		audit.trail.statements[i].lineage = lineage_jobs[i];
+	}
 	return ParserOverrideResult(std::move(statements));
 }
 

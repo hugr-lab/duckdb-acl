@@ -5,6 +5,7 @@
 
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_lineage.hpp"
 #include "acl_rewriter.hpp"
 
 namespace duckdb {
@@ -551,9 +552,11 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 	if (CompileDeclaredPaths(*catalog, phys, vname, columns)) {
 		form = "subquery";
 	}
+	bool existed = false;
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto existing = read("SELECT \"comment\", \"alias_types\", \"enum_types\" FROM " + catalog->Tbl("relations") +
 		                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		existed = existing->RowCount() > 0;
 		// the comment and the type policy (spec 099) are the operator's, kept across a redeclaration
 		string comment, alias_types, enum_types;
 		if (existing->RowCount() > 0) {
@@ -581,6 +584,359 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 		statements = RelationStatements(*catalog, vcat, vname, form, phys, view_sql, rls, columns, comment, returns,
 		                                string(), kept_pk, nullable_marks, pk_carried, alias_types, enum_types);
 	});
+	NoteDefinitionLineage(vcat, vname, existed ? "ALTER" : "CREATE");
+}
+
+namespace {
+
+//! "expr AS name" -> (expr, name); a bare item is (name, name). The name unquoted.
+std::pair<string, string> SplitProjectionItem(const string &item) {
+	auto as = StringUtil::Lower(item).rfind(" as ");
+	if (as == string::npos) {
+		auto name = item;
+		StringUtil::Trim(name);
+		if (name.size() > 1 && name.front() == '"' && name.back() == '"') {
+			name = StringUtil::Replace(name.substr(1, name.size() - 2), "\"\"", "\"");
+		}
+		return {name, name};
+	}
+	auto expr = item.substr(0, as);
+	auto name = item.substr(as + 4);
+	StringUtil::Trim(expr);
+	StringUtil::Trim(name);
+	if (name.size() > 1 && name.front() == '"' && name.back() == '"') {
+		name = StringUtil::Replace(name.substr(1, name.size() - 2), "\"\"", "\"");
+	}
+	return {expr, name};
+}
+
+//! spec 107 §4: what each role holding `vcat` sees of `vcat.vname`, as OpenLineage tags - the
+//! capabilities on the dataset, `visible` / `masked` per field path, `.rls` when a predicate applies.
+//! A field the role does not see has no tag of that role. Resolved through the same policy a read
+//! uses, one role at a time; nothing is bound and no claim is needed (the predicate is only present).
+vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, const string &vcat, const string &vname,
+                                 const vector<string> &fields, const case_insensitive_set_t &source_columns) {
+	vector<AuditLineageTag> tags;
+	vector<string> roles;
+	try {
+		auto rows = catalog.Query("SELECT DISTINCT \"role\" FROM " + catalog.Tbl("role_catalogs") +
+		                          " WHERE \"vcat\" = " + Lit(vcat) + " UNION SELECT \"role\" FROM " +
+		                          catalog.Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                          " AND \"vname\" = " + Lit(vname) + " ORDER BY 1");
+		ResultRows role_rows(*rows);
+		for (idx_t i = 0; i < rows->RowCount(); i++) {
+			roles.push_back(role_rows.GetValue(0, i).ToString());
+		}
+	} catch (std::exception &) {
+		return tags;
+	}
+	for (auto &role : roles) {
+		Principal principal;
+		principal.roles = {role};
+		TablePolicy policy;
+		try {
+			if (!store.ResolveTable(principal, vcat + "." + vname, policy) || policy.caps.empty()) {
+				continue;
+			}
+		} catch (std::exception &) {
+			continue; // a grant that no longer resolves (a mask over a vanished column, spec 038): no tags
+		}
+		auto key = "acl.role." + role;
+		vector<string> caps(policy.caps.begin(), policy.caps.end());
+		std::sort(caps.begin(), caps.end());
+		tags.push_back(AuditLineageTag {key, StringUtil::Join(caps, ","), string()});
+		if (!policy.rls.empty()) {
+			tags.push_back(AuditLineageTag {key + ".rls", "true", string()});
+		}
+		case_insensitive_map_t<string> narrowed;
+		for (auto &entry : policy.narrowed_reads) {
+			narrowed[entry.first] = entry.second;
+		}
+		auto field_tags = [&](const string &column, bool masked) {
+			auto entry = narrowed.find(column);
+			if (entry == narrowed.end()) {
+				tags.push_back(AuditLineageTag {key, masked ? "masked" : "visible", column});
+				return;
+			}
+			// spec 102: the column's own items - `address.city`, `address.ssn = NULL` - one tag per path
+			for (auto item : SplitTopLevel(entry->second, ',')) {
+				StringUtil::Trim(item);
+				auto eq = item.find('=');
+				auto path = eq == string::npos ? item : item.substr(0, eq);
+				StringUtil::Trim(path);
+				tags.push_back(AuditLineageTag {key, eq == string::npos ? "visible" : "masked", path});
+			}
+		};
+		if (policy.projection.empty()) {
+			// a writable object a grant narrows keeps its shape: what the role reads is the grant's
+			// visible columns (all of them when it names none), a masked one carried as an injection
+			case_insensitive_set_t injected;
+			for (auto &entry : policy.injections) {
+				injected.insert(entry.first);
+			}
+			for (auto &field : fields) {
+				if (!policy.visible_columns.empty() && !policy.visible_columns.count(field) && !narrowed.count(field)) {
+					continue;
+				}
+				field_tags(field, injected.count(field) > 0);
+			}
+		} else {
+			for (auto &item : policy.projection) {
+				auto split = SplitProjectionItem(item);
+				bool masked = !StringUtil::CIEquals(split.first, split.second) &&
+				              !StringUtil::CIEquals(split.first, acl_detail::Ident(split.second)) &&
+				              source_columns.count(split.second);
+				field_tags(split.second, masked);
+			}
+		}
+	}
+	return tags;
+}
+
+} // namespace
+
+void PolicyStore::NoteDefinitionLineage(const string &vcat, const string &vname, const string &lifecycle) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog || !lineage_worker || !LineageOn(*db)) {
+		return;
+	}
+	EnqueueLineageTask(*lineage_worker, [vcat, vname, lifecycle](PolicyStore &store) {
+		store.EmitDefinitionLineageNow(vcat, vname, lifecycle);
+	});
+}
+
+void PolicyStore::NoteGrantLineage(const string &vcat, const string &vname) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog || !lineage_worker || !LineageOn(*db)) {
+		return;
+	}
+	EnqueueLineageTask(*lineage_worker, [vcat, vname](PolicyStore &store) { store.EmitGrantLineageNow(vcat, vname); });
+}
+
+void PolicyStore::EmitDefinitionLineageNow(const string &vcat, const string &vname, const string &lifecycle) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog) {
+		return;
+	}
+	auto settings = LineageSettings::Read(*db);
+	if (!settings.on) {
+		return;
+	}
+	if (lifecycle == "DROP") {
+		EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE", lifecycle, nullptr);
+		return;
+	}
+	// the definition as it now stands - read back after the commit, so every writer (add, alter,
+	// repair) reports the same thing: what a read of the object is made of
+	string form, phys, view_sql, rls;
+	vector<string> items;
+	case_insensitive_set_t masks; // `c = expr` over a column the source has: a mask, not a computed column
+	case_insensitive_set_t source_columns;
+	try {
+		auto relation =
+		    catalog->Query("SELECT \"form\", \"phys\", \"view_sql\", \"rls\" FROM " + catalog->Tbl("relations") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		if (relation->RowCount() == 0) {
+			return;
+		}
+		ResultRows row(*relation);
+		auto text = [&](idx_t col) {
+			return row.GetValue(col, 0).IsNull() ? string() : row.GetValue(col, 0).ToString();
+		};
+		form = text(0);
+		phys = text(1);
+		view_sql = text(2);
+		rls = text(3);
+		auto columns =
+		    catalog->Query("SELECT \"name\", \"expr\" FROM " + catalog->Tbl("relation_columns") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+		ResultRows column_rows(*columns);
+		if (form != "view" && !phys.empty()) {
+			vector<std::pair<string, string>> probed;
+			if (catalog->ProbeSchema("SELECT * FROM " + phys, false, {}, probed)) {
+				for (auto &entry : probed) {
+					source_columns.insert(entry.first);
+				}
+			}
+		}
+		for (idx_t i = 0; i < columns->RowCount(); i++) {
+			auto name = column_rows.GetValue(0, i).ToString();
+			auto expr = column_rows.GetValue(1, i).IsNull() ? string() : column_rows.GetValue(1, i).ToString();
+			items.push_back(expr.empty() ? acl_detail::Ident(name) : expr + " AS " + acl_detail::Ident(name));
+			if (!expr.empty() && source_columns.count(name)) {
+				masks.insert(name);
+			}
+		}
+	} catch (std::exception &) {
+		EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE", lifecycle, nullptr);
+		return;
+	}
+	string sql;
+	if (form == "view") {
+		sql = view_sql;
+	} else if (!phys.empty()) {
+		sql = "SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " + phys +
+		      (rls.empty() ? string() : " WHERE " + rls);
+	}
+	LineageWalk walk;
+	bool walked = false;
+	if (!sql.empty()) {
+		try {
+			// markers (acl_claim, acl_arg) baked the way a probe bakes them: the plan's shape, no value
+			walked = WalkDefinition(*db, BakeTemplateForProbe(sql, ParserOptions::Builtin(), false, {}),
+			                        settings.max_edges, walk);
+		} catch (std::exception &) {
+			walked = false;
+		}
+	}
+	for (auto &output : walk.outputs) {
+		if (masks.count(output.name)) {
+			for (auto &source : output.sources) {
+				if (source.type == "DIRECT") {
+					source.masking = true;
+				}
+			}
+		}
+	}
+	vector<string> fields;
+	for (auto &output : walk.outputs) {
+		fields.push_back(output.name);
+	}
+	vector<AuditLineageTag> tags;
+	try {
+		tags = RoleTags(*this, *catalog, vcat, vname, fields, source_columns);
+	} catch (std::exception &) {
+		tags.clear(); // the tags could not be made: the definition still goes out
+	}
+	EmitDefinitionLineage(*audit, *db, vcat, vname, form == "view" ? "VIEW" : "TABLE", lifecycle,
+	                      walked ? &walk : nullptr, tags);
+}
+
+void PolicyStore::NoteFunctionLineage(const string &vcat, const string &vname, const string &lifecycle) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog || !lineage_worker || !LineageOn(*db)) {
+		return;
+	}
+	EnqueueLineageTask(*lineage_worker, [vcat, vname, lifecycle](PolicyStore &store) {
+		store.EmitFunctionLineageNow(vcat, vname, lifecycle);
+	});
+}
+
+void PolicyStore::EmitFunctionLineageNow(const string &vcat, const string &vname, const string &lifecycle) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog) {
+		return;
+	}
+	auto settings = LineageSettings::Read(*db);
+	if (!settings.on) {
+		return;
+	}
+	if (lifecycle == "DROP") {
+		EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE_FUNCTION", lifecycle, nullptr);
+		return;
+	}
+	string form, template_sql, params;
+	vector<string> declared;
+	try {
+		auto row = catalog->Query("SELECT \"form\", \"template\", \"params\" FROM " + catalog->Tbl("functions") +
+		                          " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+		                          " AND \"kind\" = 'table'");
+		if (row->RowCount() == 0) {
+			return;
+		}
+		ResultRows rows(*row);
+		auto text = [&](idx_t col) {
+			return rows.GetValue(col, 0).IsNull() ? string() : rows.GetValue(col, 0).ToString();
+		};
+		form = text(0);
+		template_sql = text(1);
+		params = text(2);
+		auto columns =
+		    catalog->Query("SELECT \"name\" FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                   " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'table' ORDER BY \"pos\"");
+		ResultRows column_rows(*columns);
+		for (idx_t i = 0; i < columns->RowCount(); i++) {
+			declared.push_back(column_rows.GetValue(0, i).ToString());
+		}
+	} catch (std::exception &) {
+		EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE_FUNCTION", lifecycle, nullptr);
+		return;
+	}
+	LineageWalk walk;
+	bool walked = false;
+	if (form == "macro" && !template_sql.empty()) {
+		try {
+			// the arguments are NULLs of their declared types: the body's shape, never a value
+			walked = WalkDefinition(*db,
+			                        BakeTemplateForProbe(template_sql, ParserOptions::Builtin(), false,
+			                                             CatalogBackend::DeclaredTypes(params)),
+			                        settings.max_edges, walk);
+		} catch (std::exception &) {
+			walked = false;
+		}
+	}
+	if (!walked) {
+		// an alias of a physical function, or a body that does not bind: the declared result, no edges
+		walk = LineageWalk();
+		for (auto &name : declared) {
+			LineageOutput output;
+			output.name = name;
+			walk.outputs.push_back(std::move(output));
+		}
+		walk.approximate = true;
+	}
+	EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE_FUNCTION", lifecycle, &walk);
+}
+
+void PolicyStore::EmitGrantLineageNow(const string &vcat, const string &vname) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog || !LineageSettings::Read(*db).on) {
+		return;
+	}
+	vector<string> objects;
+	if (!vname.empty()) {
+		objects.push_back(vname);
+	} else {
+		try {
+			auto rows = catalog->Query("SELECT \"vname\" FROM " + catalog->Tbl("relations") +
+			                           " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY 1");
+			ResultRows object_rows(*rows);
+			for (idx_t i = 0; i < rows->RowCount(); i++) {
+				objects.push_back(object_rows.GetValue(0, i).ToString());
+			}
+		} catch (std::exception &) {
+			return;
+		}
+	}
+	for (auto &object : objects) {
+		// the definition again, with the tags as they now stand; a grant is not a lifecycle change.
+		// One object that does not resolve (a source that drifted) costs its own event, not the rest's.
+		try {
+			EmitDefinitionLineageNow(vcat, object, string());
+		} catch (std::exception &) {
+		}
+	}
+	if (!vname.empty()) {
+		return;
+	}
+	// the catalog's table functions: their definitions (a function's grant narrows nothing per field)
+	vector<string> functions;
+	try {
+		auto rows = catalog->Query("SELECT \"vname\" FROM " + catalog->Tbl("functions") +
+		                           " WHERE \"vcat\" = " + Lit(vcat) + " AND \"kind\" = 'table' ORDER BY 1");
+		ResultRows function_rows(*rows);
+		for (idx_t i = 0; i < rows->RowCount(); i++) {
+			functions.push_back(function_rows.GetValue(0, i).ToString());
+		}
+	} catch (std::exception &) {
+		return;
+	}
+	for (auto &function : functions) {
+		try {
+			EmitFunctionLineageNow(vcat, function, string());
+		} catch (std::exception &) {
+		}
+	}
 }
 
 namespace {
@@ -1267,6 +1623,9 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 		statements.push_back(statement);
 	}
 	catalog->Write(statements);
+	if (kind == "table") {
+		NoteFunctionLineage(vcat, vname, "CREATE");
+	}
 }
 
 namespace {
@@ -1365,6 +1724,7 @@ void PolicyStore::CatalogGrant(const string &role, const string &vcat, const str
 		                     Lit(caps_json) + ", " + Lit(rls) + ", " + Lit(columns) + ", " +
 		                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ")");
 	});
+	NoteGrantLineage(vcat); // spec 107: what the role sees changed
 }
 
 void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
@@ -1375,6 +1735,7 @@ void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
 	                    " AND \"vcat\" = " + Lit(vcat),
 	                "DELETE FROM " + catalog->Tbl("grant_columns") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat)});
+	NoteGrantLineage(vcat); // spec 107
 }
 
 namespace {
@@ -1465,6 +1826,7 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 			}
 		}
 	});
+	NoteDefinitionLineage(vcat, vname, "DROP");
 }
 
 void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, const string &kind, const string &column,
@@ -1804,6 +2166,9 @@ void PolicyStore::CatalogDropFunction(const string &vcat, const string &vname, c
 		}
 		DropReferencesNaming(*catalog, vcat, pred, statements);
 	});
+	if (kind == "table") {
+		NoteFunctionLineage(vcat, vname, "DROP");
+	}
 }
 
 void PolicyStore::CatalogDropRole(const string &role) {
@@ -2185,6 +2550,7 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		statements = RelationStatements(*catalog, vcat, vname, new_form, new_phys, new_view, new_rls, new_columns,
 		                                comment, string(), origin, kept_pk, kept_marks, true, alias_types, enum_types);
 	});
+	NoteDefinitionLineage(vcat, vname, "ALTER");
 }
 
 void PolicyStore::CatalogAlterSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path) {
@@ -2477,6 +2843,7 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 		                     Lit(rls) + ", " + Lit(listed) + ", " +
 		                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ")");
 	});
+	NoteGrantLineage(vcat, vname); // spec 107
 }
 
 bool PolicyStore::CatalogObjectExists(const string &vcat, const string &vname, const string &kind) {

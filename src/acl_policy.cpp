@@ -1,4 +1,5 @@
 #include "acl_policy.hpp"
+#include "acl_lineage.hpp"
 
 #include "acl_audit_pipeline.hpp"
 #include "acl_rewriter.hpp"
@@ -855,8 +856,24 @@ shared_ptr<PolicyStore> PolicyStore::Of(DatabaseInstance &db) {
 
 PolicyStoreHandle::~PolicyStoreHandle() {
 	auto locked = store.lock();
+	if (locked && locked->lineage_worker) {
+		StopLineageWorker(*locked->lineage_worker); // spec 107: before the audit it emits into
+	}
 	if (locked && locked->audit) {
 		locked->audit->Stop(); // the instance is going: drain now, with the file system still whole
+	}
+}
+
+void LineageFromContext(ClientContext &context, string &parent, string &root_parent, string &job) {
+	Value value;
+	if (context.TryGetCurrentSetting("acl_lineage_parent", value) && !value.IsNull()) {
+		parent = value.ToString();
+	}
+	if (context.TryGetCurrentSetting("acl_lineage_root_parent", value) && !value.IsNull()) {
+		root_parent = value.ToString();
+	}
+	if (context.TryGetCurrentSetting("acl_lineage_job", value) && !value.IsNull()) {
+		job = value.ToString();
 	}
 }
 
@@ -891,6 +908,31 @@ string BoundTrace(const string &value) {
 		}
 	}
 	return TruncateUtf8(clean, 128);
+}
+
+string BoundLineage(const string &value) {
+	// a parent names a run (`<namespace>/<job>/<runId>`), a job a name: bounded like a trace id
+	return TruncateUtf8(value, 512);
+}
+
+string LineageMarkers(const string &parent, const string &root_parent, const string &job) {
+	if (parent.empty() && root_parent.empty() && job.empty()) {
+		return string();
+	}
+	auto quoted = [](const string &value) {
+		return "'" + StringUtil::Replace(BoundLineage(value), "'", "''") + "'";
+	};
+	string out = "LINEAGE ";
+	if (!parent.empty()) {
+		out += "PARENT " + quoted(parent) + " ";
+	}
+	if (!root_parent.empty()) {
+		out += "ROOT " + quoted(root_parent) + " ";
+	}
+	if (!job.empty()) {
+		out += "JOB " + quoted(job) + " ";
+	}
+	return out;
 }
 
 string TraceMarkers(const string &correlation_id, const string &traceparent) {
@@ -956,6 +998,12 @@ bool PolicyStore::SetSessionTrace(const string &id, const string &name, const st
 			entry.second.correlation_id = BoundTrace(value);
 		} else if (StringUtil::CIEquals(name, "acl_traceparent")) {
 			entry.second.traceparent = BoundTrace(value);
+		} else if (StringUtil::CIEquals(name, "acl_lineage_parent")) {
+			entry.second.lineage_parent = BoundLineage(value);
+		} else if (StringUtil::CIEquals(name, "acl_lineage_root_parent")) {
+			entry.second.lineage_root_parent = BoundLineage(value);
+		} else if (StringUtil::CIEquals(name, "acl_lineage_job")) {
+			entry.second.lineage_job = BoundLineage(value);
 		} else {
 			return false;
 		}
@@ -966,6 +1014,12 @@ bool PolicyStore::SetSessionTrace(const string &id, const string &name, const st
 
 string PolicyStore::SessionSql(const string &handle, const string &sql, const string &correlation_id,
                                const string &traceparent) {
+	return SessionSql(handle, sql, correlation_id, traceparent, string(), string(), string());
+}
+
+string PolicyStore::SessionSql(const string &handle, const string &sql, const string &correlation_id,
+                               const string &traceparent, const string &lineage_parent,
+                               const string &lineage_root_parent, const string &lineage_job) {
 	// Judge here rather than through SessionPrincipal, for one reason: SessionPrincipal *erases* a
 	// dead session on read, which would leave a follow-up SessionReason nothing to report but
 	// "unknown" (spec 054). This bumps the live session (using it keeps it alive - the idle rule of
@@ -990,7 +1044,11 @@ string PolicyStore::SessionSql(const string &handle, const string &sql, const st
 	// client SET on the session itself, wherever the composition is evaluated
 	auto &cid = correlation_id.empty() ? entry->second.correlation_id : correlation_id;
 	auto &tp = traceparent.empty() ? entry->second.traceparent : traceparent;
-	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + TraceMarkers(cid, tp) + sql;
+	auto &lp = lineage_parent.empty() ? entry->second.lineage_parent : lineage_parent;
+	auto &lr = lineage_root_parent.empty() ? entry->second.lineage_root_parent : lineage_root_parent;
+	auto &lj = lineage_job.empty() ? entry->second.lineage_job : lineage_job;
+	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + TraceMarkers(cid, tp) +
+	       LineageMarkers(lp, lr, lj) + sql;
 }
 
 void PolicyStore::SetDoorOpen(bool open) {
@@ -1008,8 +1066,11 @@ bool ClientSettingAllowed(const string &name) {
 	// Everything outside this list stays refused; growing it is a spec, not a line. The two trace
 	// settings (spec 069) name the request a session's statements belong to, and change nothing
 	// about what a statement reads or costs.
+	// spec 107 adds the client's lineage context (the job and the external run a statement is a step
+	// of): metadata of the lineage event, nothing a statement reads or costs
 	return StringUtil::CIEquals(name, "TimeZone") || StringUtil::CIEquals(name, "Calendar") ||
-	       StringUtil::CIEquals(name, "acl_correlation_id") || StringUtil::CIEquals(name, "acl_traceparent");
+	       StringUtil::CIEquals(name, "acl_correlation_id") || StringUtil::CIEquals(name, "acl_traceparent") ||
+	       LineageClientSetting(name);
 }
 
 bool PolicyStore::SetDraining(bool value) {

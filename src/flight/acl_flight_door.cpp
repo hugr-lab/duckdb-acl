@@ -673,6 +673,34 @@ void TraceOfCall(const flight::ServerCallContext &context, ClientContext &sessio
 	}
 }
 
+//! spec 107: the statement's lineage context - the call's `x-openlineage-parent` / `-root-parent` /
+//! `-job` headers first (a driver sets them per request, from Spark's config or Airflow's
+//! OPENLINEAGE_PARENT_ID), else what the client SET on its session's connection.
+void LineageOfCall(const flight::ServerCallContext &context, ClientContext &session_context, string &parent,
+                   string &root_parent, string &job) {
+	for (const auto &header : context.incoming_headers()) {
+		string name(header.first);
+		if (StringUtil::CIEquals(name, "x-openlineage-parent")) {
+			parent = string(header.second);
+		} else if (StringUtil::CIEquals(name, "x-openlineage-root-parent")) {
+			root_parent = string(header.second);
+		} else if (StringUtil::CIEquals(name, "x-openlineage-job")) {
+			job = string(header.second);
+		}
+	}
+	string set_parent, set_root, set_job;
+	LineageFromContext(session_context, set_parent, set_root, set_job);
+	if (parent.empty()) {
+		parent = set_parent;
+	}
+	if (root_parent.empty()) {
+		root_parent = set_root;
+	}
+	if (job.empty()) {
+		job = set_job;
+	}
+}
+
 string TokenFromHeaders(const flight::ServerCallContext &context) {
 	for (const auto &header : context.incoming_headers()) {
 		if (!StringUtil::CIEquals(string(header.first), AUTH_HEADER)) {
@@ -1124,9 +1152,11 @@ public:
 		return UnderSession(context, [&](const string &handle) -> arrow::Result<std::unique_ptr<flight::FlightInfo>> {
 			ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(handle));
 			auto conn = state->ConnFor(handle);
-			string correlation_id, traceparent;
+			string correlation_id, traceparent, lineage_parent, lineage_root, lineage_job;
 			TraceOfCall(context, *conn->con->context, correlation_id, traceparent);
-			auto prefixed = state->store->SessionSql(handle, command.query, correlation_id, traceparent);
+			LineageOfCall(context, *conn->con->context, lineage_parent, lineage_root, lineage_job);
+			auto prefixed = state->store->SessionSql(handle, command.query, correlation_id, traceparent, lineage_parent,
+			                                         lineage_root, lineage_job);
 			if (prefixed.empty()) {
 				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			}
@@ -1195,9 +1225,11 @@ public:
 	                                                   const flightsql::StatementUpdate &command) override {
 		return UnderSession(context, [&](const string &handle) -> arrow::Result<int64_t> {
 			auto conn = state->ConnFor(handle);
-			string correlation_id, traceparent;
+			string correlation_id, traceparent, lineage_parent, lineage_root, lineage_job;
 			TraceOfCall(context, *conn->con->context, correlation_id, traceparent);
-			auto prefixed = state->store->SessionSql(handle, command.query, correlation_id, traceparent);
+			LineageOfCall(context, *conn->con->context, lineage_parent, lineage_root, lineage_job);
+			auto prefixed = state->store->SessionSql(handle, command.query, correlation_id, traceparent, lineage_parent,
+			                                         lineage_root, lineage_job);
 			if (prefixed.empty()) {
 				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			}
@@ -1537,9 +1569,11 @@ public:
 		    context, [&](const string &handle) -> arrow::Result<flightsql::ActionCreatePreparedStatementResult> {
 			    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(handle));
 			    auto conn = state->ConnFor(handle);
-			    string correlation_id, traceparent;
+			    string correlation_id, traceparent, lineage_parent, lineage_root, lineage_job;
 			    TraceOfCall(context, *conn->con->context, correlation_id, traceparent);
-			    auto prefixed = state->store->SessionSql(handle, request.query, correlation_id, traceparent);
+			    LineageOfCall(context, *conn->con->context, lineage_parent, lineage_root, lineage_job);
+			    auto prefixed = state->store->SessionSql(handle, request.query, correlation_id, traceparent,
+			                                             lineage_parent, lineage_root, lineage_job);
 			    if (prefixed.empty()) {
 				    return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			    }

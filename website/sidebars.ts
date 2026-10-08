@@ -19,6 +19,7 @@ const sidebars: SidebarsConfig = {
     },
     'security',
     'observability',
+    'lineage',
     'deployment',
     'development',
   ],

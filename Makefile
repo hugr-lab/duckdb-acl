@@ -103,6 +103,10 @@ $(TEST_CPP_DIR)/test_acl_catalog_rpc: TEST_CPP_EXTRA := src/acl_catalog_rpc.cpp
 $(TEST_CPP_DIR)/test_acl_identity_routing: src/acl_identity.cpp src/include/acl_identity.hpp
 $(TEST_CPP_DIR)/test_acl_identity_routing: TEST_CPP_EXTRA := src/acl_identity.cpp duckdb/third_party/yyjson/yyjson.cpp
 
+# spec 107: the lineage walker is its own translation unit, run over plans bound from SQL
+$(TEST_CPP_DIR)/test_acl_lineage_walker: src/acl_lineage_walker.cpp src/include/acl_lineage_walker.hpp
+$(TEST_CPP_DIR)/test_acl_lineage_walker: TEST_CPP_EXTRA := src/acl_lineage_walker.cpp
+
 # the OIDC core lives in duckdb-ext-common (spec 076) and its own test runs there; the embedded-door
 # test drives discovery through the core's HttpGet (spec 063), so it compiles the module from the
 # submodule - under our namespace - plus the bundled yyjson, the way the extension does

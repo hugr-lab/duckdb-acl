@@ -2,6 +2,7 @@
 // acl_profile.cpp - spec 074: the execution profile
 //===----------------------------------------------------------------------===//
 #include "acl_profile.hpp"
+#include "acl_lineage.hpp"
 #include "acl_session_hooks.hpp"
 
 #include "acl_audit_pipeline.hpp"
@@ -259,6 +260,10 @@ public:
 	int64_t began_us = 0;
 	//! spec 078: this state put a session on the connection's AclConnection for the running statement
 	bool published_session = false;
+	//! spec 107: a physical statement's lineage, captured by the pre-optimize hook, emitted at QueryEnd
+	shared_ptr<PhysicalLineage> physical_lineage;
+	//! spec 107: the running statement is a PREPARE (the hook saw LOGICAL_PREPARE): not an execution
+	bool preparing = false;
 
 	void QueryBegin(ClientContext &context) override {
 		if (pending_notes && !pending_notes->empty()) {
@@ -280,6 +285,8 @@ public:
 			has_note = false;
 		}
 		began_us = NowMicros();
+		preparing = false;
+		physical_lineage.reset();
 		// spec 078: a statement under a session shows it on its connection while it runs, and nothing
 		// else does - on a gateway's shared connection the next statement may be another principal's
 		if (has_note && !note.proto.session.empty()) {
@@ -330,8 +337,34 @@ public:
 		} catch (...) {
 			// a profile is never worth the statement; the decision event is already out
 		}
+		try {
+			EndLineage(context, error);
+		} catch (...) {
+			// lineage is never worth the statement
+		}
 		if (error) {
 			batch.clear(); // an error ends the batch: the statements after it never run
+		}
+	}
+
+	//! spec 107: one run per execution, handed to the worker with its outcome - never waited on; a
+	//! PREPARE is no execution (the hook marked it: its executions are the runs).
+	void EndLineage(ClientContext &context, optional_ptr<ErrorData> error) {
+		bool was_preparing = preparing;
+		preparing = false;
+		auto captured = std::move(physical_lineage);
+		physical_lineage.reset();
+		if (was_preparing) {
+			return;
+		}
+		if (has_note && note.lineage) {
+			EnqueueLineageRun(note.lineage, bool(error));
+		}
+		if (captured) {
+			auto locked = pipeline.lock();
+			if (locked) {
+				EmitPhysicalLineage(*captured, *locked, *context.db, bool(error));
+			}
 		}
 	}
 
@@ -464,6 +497,33 @@ struct AclProfileCallback : ExtensionCallback {
 
 uint64_t StatementTextHash(const string &text) {
 	return std::hash<string> {}(text);
+}
+
+bool StatementDecidedVirtual(ClientContext &context, Principal &principal, string &door) {
+	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
+	if (!state || !state->has_note) {
+		return false;
+	}
+	if (state->note.statement != "native") {
+		return true;
+	}
+	principal = state->note.proto.principal;
+	door = state->note.proto.door;
+	return false;
+}
+
+void SetPhysicalLineage(ClientContext &context, shared_ptr<PhysicalLineage> lineage) {
+	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
+	if (state) {
+		state->physical_lineage = std::move(lineage);
+	}
+}
+
+void MarkPreparing(ClientContext &context) {
+	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
+	if (state) {
+		state->preparing = true;
+	}
 }
 
 void PushProfileNote(ProfileNote note) {

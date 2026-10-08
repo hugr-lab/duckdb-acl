@@ -35,6 +35,7 @@
 
 namespace duckdb {
 namespace acl {
+
 namespace {
 
 //! spec 097: the verdict as the HTTP status the route answers
@@ -276,9 +277,26 @@ void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &resu
 			}
 			// SessionSql is the one place the prefix is composed, so every door spells it the same way;
 			// the trace is whatever the client SET on its connection (spec 069)
-			string correlation_id, traceparent;
+			string correlation_id, traceparent, lineage_parent, lineage_root, lineage_job;
 			TraceFromContext(state.GetContext(), correlation_id, traceparent);
-			auto prefixed = store.SessionSql(handle, sql, correlation_id, traceparent);
+			// spec 107: the lineage context of the connection (and, through SessionSql, of the session)
+			{
+				// the request's own headers first - an http secret's EXTRA_HTTP_HEADERS - then the connection's
+				lock_guard<mutex> guard(store.quack_lineage_lock);
+				auto noted = store.quack_lineage.find(connection_id);
+				if (noted != store.quack_lineage.end()) {
+					lineage_parent = noted->second[0];
+					lineage_root = noted->second[1];
+					lineage_job = noted->second[2];
+				}
+			}
+			string set_parent, set_root, set_job;
+			LineageFromContext(state.GetContext(), set_parent, set_root, set_job);
+			lineage_parent = lineage_parent.empty() ? set_parent : lineage_parent;
+			lineage_root = lineage_root.empty() ? set_root : lineage_root;
+			lineage_job = lineage_job.empty() ? set_job : lineage_job;
+			auto prefixed =
+			    store.SessionSql(handle, sql, correlation_id, traceparent, lineage_parent, lineage_root, lineage_job);
 			result.SetValue(row, prefixed.empty() ? Value() : Value(prefixed));
 		} catch (std::exception &ex) {
 			store.AuditDoor("quack", "authorize", false, "policy_error", ErrorData(ex).RawMessage());
@@ -442,9 +460,23 @@ bool AclQuackAdmit(DatabaseInstance &db, idx_t seated, string &refusal) {
 	}
 }
 
+void AclQuackNoteRequestLineage(DatabaseInstance &db, const string &connection_id, const string &parent,
+                                const string &root_parent, const string &job) {
+	auto store = PolicyStore::Of(db);
+	if (!store) {
+		return;
+	}
+	lock_guard<mutex> guard(store->quack_lineage_lock);
+	store->quack_lineage[connection_id] = {parent, root_parent, job};
+}
+
 void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how) {
 	try {
 		if (auto store = PolicyStore::Of(db)) {
+			{
+				lock_guard<mutex> guard(store->quack_lineage_lock);
+				store->quack_lineage.erase(connection_id);
+			}
 			store->SessionEndBound(connection_id, how);
 		}
 	} catch (...) {

@@ -515,8 +515,11 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	         : "r.\"alias_types\", r.\"enum_types\", (SELECT list(struct_pack(tcol := t.\"column\","
 	           " tbase := t.\"as_base\", tvarchar := t.\"as_varchar\", tboth := t.\"as_both\")) FROM " +
 	               Tbl("relation_types") + " t WHERE t.\"vcat\" = r.\"vcat\" AND t.\"vname\" = r.\"vname\")") +
-	    " FROM " + RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
-	    " WHERE (" + qualified_cond +
+	    // spec 107: where the name resolved - the object's canonical virtual name, last so no index moves
+	    ", r.\"vcat\" AS cvcat, r.\"vname\" AS cvname"
+	    " FROM " +
+	    RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE (" +
+	    qualified_cond +
 	    ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(unqualified) +
 	    // by role, so a principal holding several of them merges their column lists in one
 	    // order rather than in whatever order the store returned (spec 036)
@@ -538,6 +541,14 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	out.rls_unchecked = !out.rls.empty() && (rchk.IsNull() || !rchk.GetValue<bool>());
 	out.subquery_form = form != "alias";
 	out.writable = form == "alias"; // a real table stays writable, however a grant narrows it
+	{
+		auto ncols = result->ColumnCount();
+		auto cvcat = result->Collection().GetValue(ncols - 2, 0);
+		auto cvname = result->Collection().GetValue(ncols - 1, 0);
+		if (!cvcat.IsNull() && !cvname.IsNull()) {
+			out.canonical = cvcat.ToString() + "." + cvname.ToString();
+		}
+	}
 	ApplyTypeFacts(result_rows, out);
 	vector<std::pair<string, string>> object_columns;
 	auto cols = result->Collection().GetValue(12, 0);

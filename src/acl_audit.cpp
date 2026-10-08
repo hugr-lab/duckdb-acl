@@ -166,6 +166,7 @@ int64_t AuditPipeline::Emit(AuditEvent event) {
 	event.node = configured.empty() ? node : configured;
 	auto cap = SettingInt("acl_audit_queue", 10000);
 	ring_cap = SettingInt("acl_audit_buffer", 10000);
+	lineage_cap = SettingInt("acl_lineage_buffer", 1000);
 	OpenFileIfNeeded(Setting("acl_audit_sink", ""));
 	// what a caller could have made long is bounded here, once, for every sink: a refusal's text
 	// and the trace ids (the reason's content was already decided by its code, AuditReasonText)
@@ -185,6 +186,9 @@ int64_t AuditPipeline::Emit(AuditEvent event) {
 		if (cap > 0 && int64_t(queue.size()) >= cap) {
 			dropped++;
 			hooks->Counters().Add("acl.audit.dropped", {{"where", "queue"}});
+			if (event.kind == "lineage") {
+				hooks->Counters().Add("acl.lineage.dropped", {});
+			}
 			return 0;
 		}
 		// under the lock: the sequence is the queue's order, which is what a sink is promised
@@ -288,6 +292,12 @@ void AuditPipeline::Count(const AuditEvent &event) {
 		if (event.kind == "ingest") {
 			counters.Add("acl.ingest.statements", {{"door", event.door}, {"verdict", verdict}});
 		}
+	} else if (event.kind == "lineage" && event.lineage) {
+		// spec 107: bounded attributes - the event type and whether it is exact
+		counters.Add("acl.lineage.events", {{"event_type", event.lineage->event_type}});
+		if (event.lineage->approximate) {
+			counters.Add("acl.lineage.approximate", {});
+		}
 	} else if (event.kind == "profile") {
 		// spec 074: what ran, and how much of it each source took - the attribute sets are the
 		// doors, the statement classes and the attached catalogs, all bounded
@@ -348,6 +358,28 @@ void AuditPipeline::Handle(const AuditEvent &event) {
 	// the level decided what is recorded where the event was emitted (the session's own level is
 	// known there); an unrecorded event stops here - no sink, no ring, no file
 	if (!event.recorded) {
+		return;
+	}
+	if (event.kind == "lineage") {
+		// spec 107: lineage names physical datasets and may carry a normalized statement text, so it
+		// reaches only the sinks that ask for it, and its own ring - never the audit ring or file
+		for (auto &sink : hooks->Sinks()) {
+			try {
+				if (sink->WantsLineage()) {
+					sink->OnEvent(event);
+				}
+			} catch (...) {
+				hooks->Counters().Add("acl.audit.sink_errors", {{"sink", "extension"}});
+			}
+		}
+		auto lineage_limit = lineage_cap.load();
+		if (lineage_limit > 0) {
+			std::lock_guard<std::mutex> guard(ring_lock);
+			lineage_ring.push_back(event);
+			while (int64_t(lineage_ring.size()) > lineage_limit) {
+				lineage_ring.pop_front();
+			}
+		}
 		return;
 	}
 	for (auto &sink : hooks->Sinks()) {
@@ -427,6 +459,11 @@ void AuditPipeline::WriteFile(const AuditEvent &event) {
 vector<AuditEvent> AuditPipeline::Ring() {
 	std::lock_guard<std::mutex> guard(ring_lock);
 	return vector<AuditEvent>(ring.begin(), ring.end());
+}
+
+vector<AuditEvent> AuditPipeline::LineageRing() {
+	std::lock_guard<std::mutex> guard(ring_lock);
+	return vector<AuditEvent>(lineage_ring.begin(), lineage_ring.end());
 }
 
 int64_t AuditPipeline::Dropped() const {

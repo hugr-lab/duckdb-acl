@@ -556,6 +556,24 @@ filled by name), masks are assigned, a hidden field in the written value is refu
 narrowed column. Listings describe `acl_listed_type` (the read's own fold of the roles' lists over the
 source type). e2e: a narrowed struct through quack in `test/e2e/door/types.sh`.
 
+**Spec 107 — lineage for OpenLineage**: the node emits a `lineage` event kind (ext-common spec 014,
+`acl_audit` v3: `AuditLineage`, delivered only to sinks with `WantsLineage()` and to its own ring
+`acl_lineage_events()`, never the audit file). Static: virtual DDL and table functions
+(`NoteDefinitionLineage` / `NoteFunctionLineage` after the write queue a task on the `LineageWorker` -
+the definition read back, bound, walked; a write never waits on it nor fails by it), grants (per-role tags `acl.role.<r>` = caps /
+`visible` / `masked` per field path / `.rls`), ATTACH/DETACH (`NAMESPACE`). Runtime: writes (and a read
+under a declared parent) - the override copies the statement before the rewrite onto the profile
+note, QueryEnd hands each execution to `LineageWorker`, which mirrors what the principal reads into a
+scratch DuckDB (empty tables of the exposed shapes under canonical names) and binds the statement
+there under the names as written - names stay virtual (the scratch loads no extension but the built-in
+function sets). Physical statements (`ACL NATIVE`, operator SQL) from a pre-optimize hook; a PREPARE is
+no run (a prepared physical write is rebound per execution).
+The walker (`acl_lineage_walker.{hpp,cpp}`) maps bindings to source fields with OpenLineage's
+transformations and spec 102 paths. Context: `LINEAGE PARENT/ROOT/JOB` prefix marker,
+`acl_lineage_parent/_root_parent/_job` (068 allowlist, session record), Flight and quack
+`x-openlineage-*` headers. Settings `acl_lineage_*` (GLOBAL); `acl_lineage_flush()`,
+`acl_lineage_resend([vcat])`. Transport is acl-otel's.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

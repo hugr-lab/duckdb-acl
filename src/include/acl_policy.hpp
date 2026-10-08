@@ -21,6 +21,7 @@
 #include "duckdb/storage/object_cache.hpp"
 #include "duckdb/function/table_function.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -36,6 +37,7 @@ class ExtensionLoader;
 namespace acl {
 
 class AuditPipeline; // the audit's own side (spec 069), acl_audit_pipeline.hpp
+class LineageWorker; // spec 107, acl_lineage.hpp
 class AuditHooks;    // its registry, acl_audit.hpp
 
 // `Principal` is the audit contract's (duckdb-ext-common/contracts/acl_principal.hpp, spec 076): a
@@ -46,6 +48,11 @@ class AuditHooks;    // its registry, acl_audit.hpp
 //! statement resolves to, reads, or costs. One list for the SQL gate and the Flight door's
 //! SetSessionOptions, so the two doors can never disagree about it.
 bool ClientSettingAllowed(const string &name);
+//! spec 107: the client's lineage context as prefix markers (`LINEAGE PARENT '..' ROOT '..' JOB '..'`), bounded
+string LineageMarkers(const string &parent, const string &root_parent, const string &job);
+string BoundLineage(const string &value);
+//! spec 107: the lineage context a connection's own settings carry
+void LineageFromContext(ClientContext &context, string &parent, string &root_parent, string &job);
 
 //! The trace a caller's context carries (spec 069): the client-local settings `acl_correlation_id`
 //! and `acl_traceparent`, which a client may SET on its own session and a door composes into the
@@ -99,6 +106,7 @@ string MintRandomHex(idx_t bytes);
 struct TablePolicy {
 	bool subquery_form = true; // true: wrap a SELECT (read-only); false: rename in place (writable)
 	string phys;               // physical relation reference, e.g. "phys.main.orders_physical"
+	string canonical;          // spec 107: the virtual object the name resolved to, `vcat.vname` (catalog store)
 	vector<string> projection; // SQL select items (SUBQUERY), e.g. {"id", "NULL AS ssn", "amount*2 AS total"}
 	string rls;                // predicate template (SUBQUERY); may contain acl_claim('<name>'); empty = none
 	//! Whether some part of `rls` was never bound against this object (spec 027): the object did not
@@ -327,6 +335,11 @@ struct PolicyStore {
 		//! on a connection of the server's, not the client's
 		string correlation_id;
 		string traceparent;
+		//! spec 107: the lineage context the client SET on its session (acl_lineage_parent / _root_parent
+		//! / _job), composed into the prefix the same way as the trace
+		string lineage_parent;
+		string lineage_root_parent;
+		string lineage_job;
 		//! The stream the session's last rewritten statement drained (spec 042, judged on the AST), for
 		//! the door's completion hook to tell a load's outcome from any other statement's (spec 069);
 		//! taken once
@@ -337,6 +350,8 @@ struct PolicyStore {
 	unordered_map<string, Session> sessions;
 	//! The audit pipeline of this instance (spec 069); set at load, before anything serves
 	shared_ptr<AuditPipeline> audit;
+	//! spec 107: the lineage worker - what a decided statement read and wrote, off its path
+	shared_ptr<LineageWorker> lineage_worker;
 	//! The instance, set at load (spec 082): what the parse path reads the attached catalogs from
 	weak_ptr<DatabaseInstance> instance;
 	//! The audit registry the pipeline drains and the doors register their gauges on (spec 069):
@@ -348,6 +363,11 @@ struct PolicyStore {
 	//! spec 079: quack clients between the seat check and their connection (AclQuackSeatClaim)
 	mutex quack_seat_lock;
 	idx_t quack_seats_claimed = 0;
+	//! spec 107: the `x-openlineage-*` headers each quack connection's requests carry (an http
+	//! secret's EXTRA_HTTP_HEADERS: the same on every request), by quack connection id - read by the
+	//! authorization callback, which may run on any of the instance's threads. Ended with the connection.
+	mutex quack_lineage_lock;
+	unordered_map<string, std::array<string, 3>> quack_lineage; // parent, root_parent, job
 	//! spec 078: the session opens and closes, delivered to acl_connection.hpp's observers
 	SessionNotifier session_notices;
 	//! Declared BEFORE a method's lock_guard, so its destructor runs after the lock is released: the
@@ -514,6 +534,22 @@ struct PolicyStore {
 	                  const string &rls = "", const string &columns = "", bool judge_columns = true);
 	void CatalogRevoke(const string &role, const string &vcat);
 	void CatalogDropRelation(const string &vcat, const string &vname);
+	//! spec 107: after a virtual object's definition was written (or dropped), the static lineage event
+	//! - its definition as it now stands in the catalog, read back and bound; nothing when lineage is off.
+	//! Queued to the lineage worker: the write never waits on a probe of the source, and nothing the
+	//! event needs can fail the write that already committed.
+	void NoteDefinitionLineage(const string &vcat, const string &vname, const string &lifecycle);
+	//! spec 107: a grant changed what the roles of `vcat` see - every object of the catalog (or the one
+	//! named) gets a DatasetEvent with its per-role tags; no lifecycle, nothing about the definition.
+	//! Queued like NoteDefinitionLineage.
+	void NoteGrantLineage(const string &vcat, const string &vname = string());
+	//! The worker's side of the two above: the events made now, on the calling thread. Never throws.
+	void EmitDefinitionLineageNow(const string &vcat, const string &vname, const string &lifecycle);
+	void EmitGrantLineageNow(const string &vcat, const string &vname);
+	//! spec 107: a virtual TABLE function's static event - a macro's body bound and walked, an alias's
+	//! declared result (what it reads is the physical function's) - queued like NoteDefinitionLineage
+	void NoteFunctionLineage(const string &vcat, const string &vname, const string &lifecycle);
+	void EmitFunctionLineageNow(const string &vcat, const string &vname, const string &lifecycle);
 	// DROP of the remaining virtual-catalog elements (spec 010). Dropping a catalog removes its own
 	// definitions always; the role grants pointing at it need `cascade`, so an accidental drop cannot
 	// silently revoke people's access.
@@ -702,6 +738,10 @@ struct PolicyStore {
 	//! `PARENT '<traceparent>'` ride between the handle and the SQL, so every event about the
 	//! statement names the request it belongs to. Empty values write no marker.
 	string SessionSql(const string &handle, const string &sql, const string &correlation_id, const string &traceparent);
+	//! spec 107: the same, with the caller's lineage context (a Flight call's x-openlineage-* headers, a
+	//! quack request's); each part the caller leaves empty falls back to what the client SET on the session
+	string SessionSql(const string &handle, const string &sql, const string &correlation_id, const string &traceparent,
+	                  const string &lineage_parent, const string &lineage_root_parent, const string &lineage_job);
 	//! What the audit says about a session (spec 069): its ops id, the door that opened it and its
 	//! own level. A lookup with no side effect - no idle bump, no erase - so an event can name a
 	//! session without keeping it alive.
