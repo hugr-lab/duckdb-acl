@@ -1,5 +1,24 @@
 # This file is included by DuckDB's build system. It specifies which extension to load
 
+# Spec 106: clang-cl with MSVC-built libraries.
+#
+# The mismatch. Since extension-ci-tools #428 (2026-10-07), windows_amd64 is compiled by clang-cl,
+# while vcpkg's ports (Arrow, gRPC, ...) stay MSVC builds. Both put a string literal into a COMDAT of
+# the same name (`??_C@...`), and the linker keeps one copy. MSVC aligns its copy to 16 bytes and
+# reads it with `movaps`; clang-cl aligns its copy to 1.
+#
+# The crash. When clang-cl's copy wins and lands off a 16-byte boundary, Arrow's static initializer of
+# `base64_chars` (the alphabet duckdb's blob.hpp also spells) faults before main. It comes and goes
+# with the layout of .rdata.
+#
+# The fix. /GF- turns string pooling off for what clang-cl compiles, so its literals stay private to
+# each object and every pooled literal the link selects is an MSVC one. This file is included at the
+# top level before duckdb adds src/, so the option reaches duckdb's own objects, where the shared
+# alphabet lives. Upstream: duckdb/extension-ci-tools#430.
+if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    add_compile_options(/GF-)
+endif()
+
 # Extension from this repo
 duckdb_extension_load(acl
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
