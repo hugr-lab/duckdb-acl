@@ -1,6 +1,6 @@
 # Spec 108: pin extension-ci-tools to f3fccb8 until #431's resource compiler is fixed
 
-- **Status**: implemented
+- **Status**: superseded by 110
 - **Date**: 2026-10-08
 - **Found by**: acl-otel's distribution build on main d689ef5 (run 37767298423), windows_amd64.
 - **Temporary**: lift once upstream fixes it (reported on duckdb/extension-ci-tools#431).
