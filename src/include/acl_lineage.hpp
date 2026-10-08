@@ -102,6 +102,25 @@ void StopLineageWorker(LineageWorker &worker);
 //! Wait until the jobs queued so far are done (tests: `acl_lineage_flush()`); false on timeout.
 bool FlushLineageWorker(LineageWorker &worker, int64_t timeout_ms = 30000);
 
+//! A statement nobody decided under a principal's virtual catalog - an operator's or a gateway's own
+//! SQL, `ACL NATIVE` - that writes or defines something physical: its lineage, taken from the bound
+//! plan by the pre-optimize hook, emitted by QueryEnd with the outcome. Physical names: there is no
+//! rewrite to undo.
+struct PhysicalLineage {
+	LineageWalk walk;
+	bool definition = false; // a DDL statement: a DatasetEvent (emitted only when it succeeded)
+	string lifecycle;        // CREATE / ALTER / DROP
+	string dataset_type;     // TABLE / VIEW
+	LineageDatasetKey object;
+	Principal principal; // `ACL NATIVE`'s principal; empty for the node's operator
+	string door;
+};
+
+//! Register the pre-optimize hook that captures physical statements (spec 107).
+void RegisterLineageOptimizer(DatabaseInstance &db, const shared_ptr<PolicyStore> &store);
+//! QueryEnd: the event of a physical statement's lineage.
+void EmitPhysicalLineage(const PhysicalLineage &lineage, AuditPipeline &pipeline, DatabaseInstance &db, bool failed);
+
 //! `acl_lineage_events()` - the operator's view of the lineage ring - and `acl_lineage_flush()`, which
 //! waits for the worker and the audit queue (tests). Never a principal's: `acl_` is spec 072's never set.
 void RegisterAclLineage(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store,

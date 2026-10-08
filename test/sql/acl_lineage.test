@@ -344,3 +344,59 @@ false	duckdb
 
 statement ok
 SET GLOBAL acl_lineage_sql = 'off';
+
+# === physical statements: the operator's own SQL, named physically (there is no rewrite to undo) ==========
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+INSERT INTO phys.main.sink SELECT id, ssn FROM phys.main.orders;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT event_type, payload->'datasets'->(payload->'outputs'->>0)::INT->>'namespace',
+    payload->'datasets'->(payload->'outputs'->>0)::INT->>'name'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+RUN_COMPLETE	acl://test/source/phys	main.sink
+
+query TT
+SELECT e->>'target_field', e->>'source_field'
+FROM (SELECT unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq > (SELECT seq FROM before))
+ORDER BY 1;
+----
+a	id
+b	ssn
+
+# a physical view: its body's lineage at CREATE, a DROP without edges
+
+statement ok
+CREATE VIEW phys.main.big_orders AS SELECT id, amount FROM phys.main.orders WHERE amount > 10;
+
+statement ok
+DROP VIEW phys.main.big_orders;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTI
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'type',
+    payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle', json_array_length(payload->'edges')
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'DATASET' ORDER BY seq;
+----
+VIEW	CREATE	3
+VIEW	DROP	0
+
+# the node's own bookkeeping - the policy catalog's writes behind every ACL ADMIN above - is nobody's lineage
+query I
+SELECT count(*) FROM acl_lineage_events(), unnest(from_json(payload->'datasets', '["JSON"]')) AS t(d)
+WHERE d->>'namespace' LIKE '%/source/store';
+----
+0

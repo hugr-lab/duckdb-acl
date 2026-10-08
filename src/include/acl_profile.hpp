@@ -24,6 +24,7 @@ namespace acl {
 class AuditPipeline;
 struct PolicyStore;
 struct LineageJob;
+struct PhysicalLineage;
 
 //! What the override knows at decision time and the profile needs at execution time: the seq of
 //! the statement event, the batch's shared identity (door, session, principal, trace ids), the
@@ -47,6 +48,13 @@ struct ProfileNote {
 	//! spec 107: the statement's lineage job; each execution of it is a run (QueryEnd)
 	shared_ptr<LineageJob> lineage;
 };
+
+//! spec 107, the pre-optimize hook: whether the running statement was decided under a principal's
+//! virtual catalog (then its lineage is the worker's). For `ACL NATIVE` it also answers its principal
+//! and door; for a statement nobody decided, both stay empty.
+bool StatementDecidedVirtual(ClientContext &context, Principal &principal, string &door);
+//! spec 107: the running statement's physical lineage, emitted by QueryEnd with its outcome.
+void SetPhysicalLineage(ClientContext &context, shared_ptr<PhysicalLineage> lineage);
 
 //! The hash a note and an execution are matched by; never the text.
 uint64_t StatementTextHash(const string &text);

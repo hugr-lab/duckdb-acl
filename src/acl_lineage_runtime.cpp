@@ -35,6 +35,19 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/parser/parsed_data/alter_info.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/planner/operator/logical_alter.hpp"
+#include "duckdb/planner/operator/logical_create.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_drop.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 
 #include <condition_variable>
 #include <deque>
@@ -509,6 +522,274 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 	event.decision_seq = job.decision_seq;
 	event.lineage = std::move(lineage);
 	pipeline->Emit(std::move(event));
+}
+
+namespace {
+
+struct LineageOptimizerInfo : OptimizerExtensionInfo {
+	explicit LineageOptimizerInfo(weak_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
+	}
+	weak_ptr<PolicyStore> store;
+};
+
+//! A physical object's key, its catalog filled in from the connection's default when the SQL left it out.
+LineageDatasetKey PhysicalKey(ClientContext &context, const QualifiedName &name) {
+	LineageDatasetKey key;
+	key.kind = "physical";
+	key.catalog = name.Catalog().GetIdentifierName();
+	if (key.catalog.empty()) {
+		key.catalog = DatabaseManager::GetDefaultDatabase(context).GetIdentifierName();
+	}
+	key.schema = name.Schema().GetIdentifierName().empty() ? string("main") : name.Schema().GetIdentifierName();
+	key.name = name.Name().GetIdentifierName();
+	return key;
+}
+
+//! The node's own bookkeeping is nobody's lineage: the policy catalog, the system and temp catalogs.
+bool Bookkeeping(PolicyStore &store, const string &catalog) {
+	if (StringUtil::CIEquals(catalog, "system") || StringUtil::CIEquals(catalog, "temp")) {
+		return true;
+	}
+	return store.catalog && StringUtil::CIEquals(catalog, store.catalog->db_name);
+}
+
+LineageWalkOptions PhysicalOptions(idx_t max_edges) {
+	LineageWalkOptions options;
+	options.max_edges = max_edges;
+	options.classify = [](LogicalGet &get, LineageDatasetKey &key) {
+		auto table = get.GetTable();
+		if (!table) {
+			return false;
+		}
+		key.kind = "physical";
+		key.catalog = table->ParentCatalog().GetName().GetIdentifierName();
+		key.schema = table->ParentSchema().name.GetIdentifierName();
+		key.name = table->name.GetIdentifierName();
+		return true;
+	};
+	return options;
+}
+
+//! The DML / CTAS operator under a plan's root (a RETURNING puts a projection above it), or null.
+optional_ptr<LogicalOperator> WriteOperator(LogicalOperator &plan) {
+	reference<LogicalOperator> current(plan);
+	for (;;) {
+		switch (current.get().type) {
+		case LogicalOperatorType::LOGICAL_INSERT:
+		case LogicalOperatorType::LOGICAL_UPDATE:
+		case LogicalOperatorType::LOGICAL_DELETE:
+		case LogicalOperatorType::LOGICAL_MERGE_INTO:
+			return &current.get();
+		case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+			return current.get().children.empty() ? nullptr : &current.get();
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+			if (current.get().children.size() != 1) {
+				return nullptr;
+			}
+			current = *current.get().children[0];
+			continue;
+		default:
+			return nullptr;
+		}
+	}
+}
+
+void LineagePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	if (!plan || !input.info) {
+		return;
+	}
+	// first and cheapest: a read (the overwhelming case) leaves here, before any setting is read
+	switch (plan->type) {
+	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+	case LogicalOperatorType::LOGICAL_CREATE_VIEW:
+	case LogicalOperatorType::LOGICAL_DROP:
+	case LogicalOperatorType::LOGICAL_ALTER:
+		break;
+	default:
+		if (!WriteOperator(*plan)) {
+			return;
+		}
+	}
+	try {
+		auto &info = static_cast<LineageOptimizerInfo &>(*input.info);
+		auto store = info.store.lock();
+		if (!store) {
+			return;
+		}
+		// a statement decided under a principal's virtual catalog is the worker's, in its own names
+		Principal principal;
+		string door;
+		if (StatementDecidedVirtual(input.context, principal, door)) {
+			return;
+		}
+		auto &db = *input.context.db;
+		auto settings = LineageSettings::Read(db);
+		if (!settings.on) {
+			return;
+		}
+		auto captured = make_shared_ptr<PhysicalLineage>();
+		captured->principal = principal;
+		captured->door = door;
+		if (auto write = WriteOperator(*plan)) {
+			captured->walk = WalkLineage(*plan, PhysicalOptions(settings.max_edges));
+			if (!captured->walk.has_target || Bookkeeping(*store, captured->walk.target.catalog)) {
+				return;
+			}
+			(void)write;
+			SetPhysicalLineage(input.context, std::move(captured));
+			return;
+		}
+		switch (plan->type) {
+		case LogicalOperatorType::LOGICAL_CREATE_TABLE: {
+			auto &create = plan->Cast<LogicalCreateTable>();
+			auto &base = create.info->Base();
+			captured->object =
+			    PhysicalKey(input.context, QualifiedName(base.GetQualifiedName().Catalog(),
+			                                             base.GetQualifiedName().Schema(), base.GetTableName()));
+			for (auto &column : base.columns.Logical()) {
+				LineageOutput output;
+				output.name = column.Name().GetIdentifierName();
+				captured->walk.outputs.push_back(std::move(output));
+			}
+			captured->dataset_type = "TABLE";
+			captured->lifecycle = "CREATE";
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_CREATE_VIEW: {
+			auto &view = plan->Cast<LogicalCreate>().info->Cast<CreateViewInfo>();
+			captured->object = PhysicalKey(input.context, view.GetQualifiedName());
+			bool walked = false;
+			if (view.query) {
+				// bound right here, in the statement's own transaction: what the view reads may have
+				// been created by this very transaction
+				// duckdb strips the view's own catalog from its body (BindCreateViewInfo), so the body
+				// binds against the view's catalog and schema - as duckdb binds it - then the path is back
+				auto &search = *ClientData::Get(input.context).catalog_search_path;
+				auto saved = search.GetSetPaths();
+				auto view_catalog = view.GetQualifiedName().Catalog().GetIdentifierName().empty()
+				                        ? DatabaseManager::GetDefaultDatabase(input.context)
+				                        : view.GetQualifiedName().Catalog();
+				auto view_schema = view.GetQualifiedName().Schema().GetIdentifierName().empty()
+				                       ? Identifier("main")
+				                       : view.GetQualifiedName().Schema();
+				try {
+					search.Set(CatalogSearchEntry(view_catalog, view_schema), CatalogSetPathType::SET_SCHEMA);
+					Planner planner(input.context);
+					planner.CreatePlan(view.query->Copy());
+					auto options = PhysicalOptions(settings.max_edges);
+					for (auto &name : planner.names) {
+						options.output_names.push_back(name.GetIdentifierName());
+					}
+					captured->walk = WalkLineage(*planner.plan, options);
+					walked = true;
+				} catch (std::exception &) {
+					walked = false;
+				}
+				try {
+					search.Set(saved, CatalogSetPathType::SET_SCHEMAS);
+				} catch (std::exception &) {
+					// the path the statement had stays what the session set; nothing else to restore
+				}
+			}
+			if (!walked) {
+				captured->walk = LineageWalk();
+				captured->walk.approximate = true;
+			}
+			captured->dataset_type = "VIEW";
+			captured->lifecycle = "CREATE";
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_DROP: {
+			auto &drop = *plan->Cast<LogicalDrop>().info;
+			if (drop.type != CatalogType::TABLE_ENTRY && drop.type != CatalogType::VIEW_ENTRY) {
+				return;
+			}
+			captured->object = PhysicalKey(input.context, drop.GetQualifiedName());
+			captured->dataset_type = drop.type == CatalogType::VIEW_ENTRY ? "VIEW" : "TABLE";
+			captured->lifecycle = "DROP";
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_ALTER: {
+			auto &alter = *plan->Cast<LogicalAlter>().info;
+			if (alter.type != AlterType::ALTER_TABLE && alter.type != AlterType::ALTER_VIEW) {
+				return;
+			}
+			captured->object = PhysicalKey(input.context, alter.GetQualifiedName());
+			captured->dataset_type = alter.type == AlterType::ALTER_VIEW ? "VIEW" : "TABLE";
+			captured->lifecycle = "ALTER";
+			break;
+		}
+		default:
+			return;
+		}
+		if (Bookkeeping(*store, captured->object.catalog)) {
+			return;
+		}
+		captured->definition = true;
+		SetPhysicalLineage(input.context, std::move(captured));
+	} catch (...) {
+		// the hook is never worth the statement
+	}
+}
+
+} // namespace
+
+void RegisterLineageOptimizer(DatabaseInstance &db, const shared_ptr<PolicyStore> &store) {
+	OptimizerExtension extension;
+	extension.pre_optimize_function = LineagePreOptimize;
+	extension.optimizer_info = make_shared_ptr<LineageOptimizerInfo>(store);
+	OptimizerExtension::Register(DBConfig::GetConfig(db), extension);
+}
+
+void EmitPhysicalLineage(const PhysicalLineage &captured, AuditPipeline &pipeline, DatabaseInstance &db, bool failed) {
+	auto settings = LineageSettings::Read(db);
+	if (!settings.on) {
+		return;
+	}
+	if (captured.definition && failed) {
+		return; // a definition that did not happen defines nothing
+	}
+	LineageWalk walk = captured.walk;
+	if (captured.definition) {
+		walk.has_target = true;
+		walk.target = captured.object;
+		walk.target_operation = captured.lifecycle;
+	}
+	auto lineage = LineageFromWalk(walk, settings);
+	if (captured.definition) {
+		lineage->event_type = "DATASET";
+		for (auto &dataset : lineage->datasets) {
+			auto expected = LineageDatasetFor(captured.object, settings);
+			if (dataset.ns == expected.ns && dataset.name == expected.name) {
+				dataset.lifecycle = captured.lifecycle;
+				dataset.dataset_type = captured.dataset_type;
+				for (auto &output : captured.walk.outputs) {
+					AuditLineageField field;
+					field.name = output.name;
+					dataset.schema.push_back(std::move(field));
+				}
+			}
+		}
+	} else {
+		lineage->event_type = failed ? "RUN_FAIL" : "RUN_COMPLETE";
+		lineage->run_id = LineageRunId();
+		lineage->job_ns = settings.ns + "/client/" + (captured.door.empty() ? string("operator") : captured.door);
+		lineage->job_name = "physical:" + walk.target_operation;
+	}
+	if (settings.identity != "none" && !captured.principal.roles.empty()) {
+		lineage->issuer = captured.principal.issuer;
+		lineage->roles = captured.principal.roles;
+		if (settings.identity == "subject") {
+			lineage->subject = captured.principal.subject;
+		}
+	}
+	AuditEvent event;
+	event.kind = "lineage";
+	event.door = captured.door;
+	event.level = AuditLevel::ALL;
+	event.recorded = true;
+	event.lineage = std::move(lineage);
+	pipeline.Emit(std::move(event));
 }
 
 shared_ptr<LineageJob> CaptureLineageJob(PolicyStore &store, const SQLStatement &statement, const Principal &principal,
