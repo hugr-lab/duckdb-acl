@@ -113,6 +113,9 @@ struct PhysicalLineage {
 	string lifecycle;        // CREATE / ALTER / DROP
 	string dataset_type;     // TABLE / VIEW
 	LineageDatasetKey object;
+	//! ATTACH / DETACH (and the cluster items that run them): a source's namespace, its type
+	bool namespace_event = false;
+	string source_type;
 	Principal principal; // `ACL NATIVE`'s principal; empty for the node's operator
 	string door;
 };

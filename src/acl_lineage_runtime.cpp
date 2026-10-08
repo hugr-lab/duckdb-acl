@@ -37,6 +37,8 @@
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
@@ -44,6 +46,10 @@
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_alter.hpp"
+#include "duckdb/planner/operator/logical_attach.hpp"
+#include "duckdb/planner/operator/logical_detach.hpp"
+#include "duckdb/parser/parsed_data/attach_info.hpp"
+#include "duckdb/parser/parsed_data/detach_info.hpp"
 #include "duckdb/planner/operator/logical_create.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_drop.hpp"
@@ -604,6 +610,8 @@ void LineagePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 	case LogicalOperatorType::LOGICAL_CREATE_VIEW:
 	case LogicalOperatorType::LOGICAL_DROP:
 	case LogicalOperatorType::LOGICAL_ALTER:
+	case LogicalOperatorType::LOGICAL_ATTACH:
+	case LogicalOperatorType::LOGICAL_DETACH:
 		break;
 	default:
 		if (!WriteOperator(*plan)) {
@@ -719,10 +727,42 @@ void LineagePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 			captured->lifecycle = "ALTER";
 			break;
 		}
+		case LogicalOperatorType::LOGICAL_ATTACH: {
+			auto &attach = *plan->Cast<LogicalAttach>().info;
+			captured->object.kind = "physical";
+			captured->object.catalog = attach.name.GetIdentifierName();
+			string type;
+			for (auto &option : attach.options) {
+				if (StringUtil::CIEquals(option.first, "type") && !option.second.IsNull()) {
+					type = option.second.ToString();
+				}
+			}
+			if (type.empty()) {
+				auto colon = attach.path.find(':');
+				type = colon != string::npos && colon > 1 ? attach.path.substr(0, colon) : string("duckdb");
+			}
+			captured->source_type = StringUtil::Lower(type);
+			captured->namespace_event = true;
+			captured->lifecycle = "CREATE";
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_DETACH: {
+			auto &detach = *plan->Cast<LogicalDetach>().info;
+			captured->object.kind = "physical";
+			captured->object.catalog = detach.name.GetIdentifierName();
+			// still attached while the plan is made: its type is the catalog's own
+			auto attached = DatabaseManager::Get(input.context).GetDatabase(input.context, detach.name);
+			if (attached) {
+				captured->source_type = StringUtil::Lower(attached->GetCatalog().GetCatalogType());
+			}
+			captured->namespace_event = true;
+			captured->lifecycle = "DROP";
+			break;
+		}
 		default:
 			return;
 		}
-		if (Bookkeeping(*store, captured->object.catalog)) {
+		if (captured->object.catalog.empty() || Bookkeeping(*store, captured->object.catalog)) {
 			return;
 		}
 		captured->definition = true;
@@ -748,6 +788,30 @@ void EmitPhysicalLineage(const PhysicalLineage &captured, AuditPipeline &pipelin
 	}
 	if (captured.definition && failed) {
 		return; // a definition that did not happen defines nothing
+	}
+	if (captured.namespace_event) {
+		// a source's namespace (spec 107 §3): nothing finer is derived - the operator relates it to the
+		// real address in the catalog itself
+		auto lineage = make_shared_ptr<AuditLineage>();
+		lineage->event_type = "NAMESPACE";
+		AuditLineageDataset source;
+		source.ns = settings.ns + "/source/" + captured.object.catalog;
+		source.dataset_type = StringUtil::Upper(captured.source_type.empty() ? string("source") : captured.source_type);
+		source.physical = true;
+		source.lifecycle = captured.lifecycle;
+		lineage->datasets.push_back(std::move(source));
+		lineage->outputs.push_back(0);
+		if (!settings.physical) {
+			return;
+		}
+		AuditEvent event;
+		event.kind = "lineage";
+		event.door = captured.door;
+		event.level = AuditLevel::ALL;
+		event.recorded = true;
+		event.lineage = std::move(lineage);
+		pipeline.Emit(std::move(event));
+		return;
 	}
 	LineageWalk walk = captured.walk;
 	if (captured.definition) {

@@ -451,3 +451,21 @@ WHERE seq = (SELECT max(seq) FROM acl_lineage_events()
              WHERE (payload->'datasets'->(payload->'outputs'->>0)::INT->>'name') = 'people');
 ----
 -
+
+# === sources: ATTACH / DETACH register a namespace (the operator relates it to a real address) ==========
+
+statement ok
+ATTACH ':memory:' AS warehouse;
+
+statement ok
+DETACH warehouse;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT payload->'datasets'->0->>'namespace', payload->'datasets'->0->>'type', payload->'datasets'->0->>'lifecycle'
+FROM acl_lineage_events() WHERE event_type = 'NAMESPACE' ORDER BY seq DESC LIMIT 2;
+----
+acl://test/source/warehouse	DUCKDB	DROP
+acl://test/source/warehouse	DUCKDB	CREATE
