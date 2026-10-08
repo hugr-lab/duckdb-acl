@@ -106,7 +106,7 @@ if(DEFINED ENV{ACL_QUACK} AND NOT MINGW AND NOT ${WASM_ENABLED})
     include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/httpfs.cmake)
     duckdb_extension_statically_link(json autocomplete httpfs)
     # Spec 105: our own patches to the quack CLIENT, on top of duckdb's (APPLY_PATCHES reads only duckdb's
-    # directory). Each is upstream-bound and leaves when quack takes it.
+    # directory). Each is upstream-bound and leaves when quack takes it (0001: duckdb/duckdb-quack#299).
     #   0001: count a FETCH in flight before claiming its index - the client could end a stream one batch
     #         short ("N-1 of N batches received"): CI's acl_quack_fetch_window.test, 2026-10-07.
     # duckdb's patch step refuses a clone with changes beyond its own patches ("Detected local changes"),

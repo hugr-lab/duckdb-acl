@@ -51,7 +51,7 @@ It is not our server, and spec 077's window has nothing to do with it:
   tree. It is left alone, with a warning.
 - The embedded server (`third_party/quack`, `sync.py`) does not compile the fetcher, so the patch
   touches only the loadable client.
-- The patch leaves when quack takes the fix. The issue for quack carries the same diff.
+- The patch leaves when quack takes the fix: duckdb/duckdb-quack#299 carries the same diff.
 
 ## Testing
 
