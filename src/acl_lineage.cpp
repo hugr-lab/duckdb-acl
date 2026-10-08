@@ -8,7 +8,13 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/planner.hpp"
 
 namespace duckdb {
 namespace acl {
@@ -348,6 +354,83 @@ string AuditLineageJson(const AuditLineage &lineage) {
 
 string LineageRunId() {
 	return UUID::ToString(UUID::GenerateRandomUUID());
+}
+
+bool WalkDefinition(DatabaseInstance &db, const string &sql, idx_t max_edges, LineageWalk &out) {
+	try {
+		Parser parser(ParserOptions::Builtin());
+		parser.ParseQuery(sql);
+		if (parser.statements.size() != 1) {
+			return false;
+		}
+		Connection con(db);
+		LineageWalkOptions options;
+		options.max_edges = max_edges;
+		options.classify = [](LogicalGet &get, LineageDatasetKey &key) {
+			auto table = get.GetTable();
+			if (!table) {
+				return false;
+			}
+			key.kind = "physical";
+			key.catalog = table->ParentCatalog().GetName().GetIdentifierName();
+			key.schema = table->ParentSchema().name.GetIdentifierName();
+			key.name = table->name.GetIdentifierName();
+			return true;
+		};
+		bool walked = false;
+		con.context->RunFunctionInTransaction([&]() {
+			Planner planner(*con.context);
+			planner.CreatePlan(std::move(parser.statements[0]));
+			for (auto &name : planner.names) {
+				options.output_names.push_back(name.GetIdentifierName());
+			}
+			out = WalkLineage(*planner.plan, options);
+			walked = true;
+		});
+		return walked;
+	} catch (std::exception &) {
+		return false;
+	}
+}
+
+void EmitDefinitionLineage(AuditPipeline &pipeline, DatabaseInstance &db, const string &vcat, const string &vname,
+                           const string &dataset_type, const string &lifecycle, const LineageWalk *walk) {
+	auto settings = LineageSettings::Read(db);
+	if (!settings.on) {
+		return;
+	}
+	LineageWalk defined;
+	if (walk) {
+		defined = *walk;
+	} else {
+		defined.approximate = lifecycle != "DROP";
+	}
+	// the object is the walk's target: its fields are the definition's outputs
+	defined.has_target = true;
+	defined.target.kind = "virtual";
+	defined.target.catalog = vcat;
+	defined.target.name = vname;
+	defined.target_operation = lifecycle;
+	auto lineage = LineageFromWalk(defined, settings);
+	lineage->event_type = "DATASET";
+	for (auto &dataset : lineage->datasets) {
+		if (!dataset.physical && dataset.ns == settings.ns + "/" + vcat && dataset.name == vname) {
+			dataset.lifecycle = lifecycle;
+			dataset.dataset_type = dataset_type;
+			for (auto &output : defined.outputs) {
+				AuditLineageField field;
+				field.name = output.name;
+				dataset.schema.push_back(std::move(field));
+			}
+		}
+	}
+	AuditEvent event;
+	event.kind = "lineage";
+	event.door = "admin";
+	event.level = AuditLevel::ALL;
+	event.recorded = true;
+	event.lineage = std::move(lineage);
+	pipeline.Emit(std::move(event));
 }
 
 namespace {

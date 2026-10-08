@@ -5,6 +5,7 @@
 
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_lineage.hpp"
 #include "acl_rewriter.hpp"
 
 namespace duckdb {
@@ -551,9 +552,11 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 	if (CompileDeclaredPaths(*catalog, phys, vname, columns)) {
 		form = "subquery";
 	}
+	bool existed = false;
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto existing = read("SELECT \"comment\", \"alias_types\", \"enum_types\" FROM " + catalog->Tbl("relations") +
 		                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		existed = existing->RowCount() > 0;
 		// the comment and the type policy (spec 099) are the operator's, kept across a redeclaration
 		string comment, alias_types, enum_types;
 		if (existing->RowCount() > 0) {
@@ -581,6 +584,74 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 		statements = RelationStatements(*catalog, vcat, vname, form, phys, view_sql, rls, columns, comment, returns,
 		                                string(), kept_pk, nullable_marks, pk_carried, alias_types, enum_types);
 	});
+	NoteDefinitionLineage(vcat, vname, existed ? "ALTER" : "CREATE");
+}
+
+void PolicyStore::NoteDefinitionLineage(const string &vcat, const string &vname, const string &lifecycle) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog) {
+		return;
+	}
+	auto settings = LineageSettings::Read(*db);
+	if (!settings.on) {
+		return;
+	}
+	if (lifecycle == "DROP") {
+		EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE", lifecycle, nullptr);
+		return;
+	}
+	// the definition as it now stands - read back after the commit, so every writer (add, alter,
+	// repair) reports the same thing: what a read of the object is made of
+	string form, phys, view_sql, rls;
+	vector<string> items;
+	try {
+		auto relation =
+		    catalog->Query("SELECT \"form\", \"phys\", \"view_sql\", \"rls\" FROM " + catalog->Tbl("relations") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+		if (relation->RowCount() == 0) {
+			return;
+		}
+		ResultRows row(*relation);
+		auto text = [&](idx_t col) {
+			return row.GetValue(col, 0).IsNull() ? string() : row.GetValue(col, 0).ToString();
+		};
+		form = text(0);
+		phys = text(1);
+		view_sql = text(2);
+		rls = text(3);
+		auto columns =
+		    catalog->Query("SELECT \"name\", \"expr\" FROM " + catalog->Tbl("relation_columns") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
+		ResultRows column_rows(*columns);
+		for (idx_t i = 0; i < columns->RowCount(); i++) {
+			auto name = column_rows.GetValue(0, i).ToString();
+			auto expr = column_rows.GetValue(1, i).IsNull() ? string() : column_rows.GetValue(1, i).ToString();
+			items.push_back(expr.empty() ? acl_detail::Ident(name) : expr + " AS " + acl_detail::Ident(name));
+		}
+	} catch (std::exception &) {
+		EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE", lifecycle, nullptr);
+		return;
+	}
+	string sql;
+	if (form == "view") {
+		sql = view_sql;
+	} else if (!phys.empty()) {
+		sql = "SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " + phys +
+		      (rls.empty() ? string() : " WHERE " + rls);
+	}
+	LineageWalk walk;
+	bool walked = false;
+	if (!sql.empty()) {
+		try {
+			// markers (acl_claim, acl_arg) baked the way a probe bakes them: the plan's shape, no value
+			walked = WalkDefinition(*db, BakeTemplateForProbe(sql, ParserOptions::Builtin(), false, {}),
+			                        settings.max_edges, walk);
+		} catch (std::exception &) {
+			walked = false;
+		}
+	}
+	EmitDefinitionLineage(*audit, *db, vcat, vname, form == "view" ? "VIEW" : "TABLE", lifecycle,
+	                      walked ? &walk : nullptr);
 }
 
 namespace {
@@ -1465,6 +1536,7 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 			}
 		}
 	});
+	NoteDefinitionLineage(vcat, vname, "DROP");
 }
 
 void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, const string &kind, const string &column,
@@ -2185,6 +2257,7 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		statements = RelationStatements(*catalog, vcat, vname, new_form, new_phys, new_view, new_rls, new_columns,
 		                                comment, string(), origin, kept_pk, kept_marks, true, alias_types, enum_types);
 	});
+	NoteDefinitionLineage(vcat, vname, "ALTER");
 }
 
 void PolicyStore::CatalogAlterSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path) {

@@ -61,6 +61,16 @@ string AuditLineageJson(const AuditLineage &lineage);
 //! A random v4 UUID for a run.
 string LineageRunId();
 
+//! Bind `sql` (a definition: a view's SQL, an object's projection over its source - markers already
+//! baked) on a fresh connection of `db`, without executing it, and walk the plan. Tables are physical
+//! datasets (their attached catalog, schema, name); false when it does not bind.
+bool WalkDefinition(DatabaseInstance &db, const string &sql, idx_t max_edges, LineageWalk &out);
+
+//! A static event: what a virtual object of `vcat` is defined as (`walk` may be null: a DROP, or a
+//! definition that did not bind - then `approximate`). Emitted only when acl_lineage_level is on.
+void EmitDefinitionLineage(AuditPipeline &pipeline, DatabaseInstance &db, const string &vcat, const string &vname,
+                           const string &dataset_type, const string &lifecycle, const LineageWalk *walk);
+
 //! `acl_lineage_events()` - the operator's view of the lineage ring (never a principal's: `acl_` is in
 //! spec 072's never set).
 void RegisterAclLineage(ExtensionLoader &loader, const shared_ptr<AuditPipeline> &pipeline);

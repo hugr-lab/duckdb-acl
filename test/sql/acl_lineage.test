@@ -1,0 +1,193 @@
+# name: test/sql/acl_lineage.test
+# description: lineage facts (spec 107) - what the node defines and what it writes, as OpenLineage-shaped
+#   payloads in acl_lineage_events(). This part: the static events of virtual DDL - a definition's
+#   fields and their edges to the physical columns, the lifecycle, and nothing while lineage is off.
+# group: [sql]
+
+require acl
+
+require json
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, customer INTEGER, amount DOUBLE, ssn VARCHAR, tenant VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.customers(id INTEGER, name VARCHAR);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+# --- off by default: a definition emits nothing -----------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.quiet AS phys.main.customers;
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_lineage_events();
+----
+0
+
+statement ok
+SET GLOBAL acl_lineage_level = 'on';
+
+statement ok
+SET GLOBAL acl_lineage_namespace = 'acl://test';
+
+# --- a table with declared columns: identity, a computed column, a mask, the predicate as a filter --------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders
+    COLUMNS (id, total = amount * 2, ssn = NULL) RLS 'tenant = acl_claim(''tenant'')';
+
+statement ok
+SELECT acl_audit_flush();
+
+query TTT
+SELECT event_type, payload->'datasets'->(payload->'outputs'->>0)::INT->>'name',
+    payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle'
+FROM acl_lineage_events() ORDER BY seq DESC LIMIT 1;
+----
+DATASET	orders	CREATE
+
+# the target's namespace is the virtual catalog's, its sources the attached source's
+query TT
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'namespace',
+    payload->'datasets'->(payload->'inputs'->>0)::INT->>'namespace'
+FROM acl_lineage_events() ORDER BY seq DESC LIMIT 1;
+----
+acl://test/c	acl://test/source/phys
+
+# the edges: id as it is, total transformed from amount, the mask has no source, the predicate filters
+query TTTT
+SELECT e->>'target_field', e->>'source_field', e->>'type', e->>'subtype'
+FROM (SELECT unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq = (SELECT max(seq) FROM acl_lineage_events()))
+ORDER BY 1, 2;
+----
+(empty)	tenant	INDIRECT	FILTER
+id	id	DIRECT	IDENTITY
+total	amount	DIRECT	TRANSFORMATION
+
+# the target's schema names the fields the definition makes
+query T
+SELECT list_transform(from_json(payload->'datasets'->(payload->'outputs'->>0)::INT->'schema', '[{"name":"VARCHAR"}]'), lambda f: f.name)
+FROM acl_lineage_events() ORDER BY seq DESC LIMIT 1;
+----
+[id, total, ssn]
+
+# no literal, no claim, no predicate text anywhere in the payload
+query I
+SELECT count(*) FROM acl_lineage_events()
+WHERE payload::VARCHAR LIKE '%acl_claim%' OR payload::VARCHAR LIKE '%tenant =%';
+----
+0
+
+# --- a view over a join: the join keys are INDIRECT/JOIN on the whole view --------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.named AS
+    SELECT o.id, upper(cu.name) AS customer_name FROM phys.main.orders o JOIN phys.main.customers cu ON o.customer = cu.id;
+
+statement ok
+SELECT acl_audit_flush();
+
+query TTTT
+SELECT e->>'target_field', (payload->'datasets'->(e->>'source')::INT->>'name') || '.' || (e->>'source_field'),
+    e->>'type', e->>'subtype'
+FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq = (SELECT max(seq) FROM acl_lineage_events()))
+ORDER BY 1, 2;
+----
+(empty)	main.customers.id	INDIRECT	JOIN
+(empty)	main.orders.customer	INDIRECT	JOIN
+customer_name	main.customers.name	DIRECT	TRANSFORMATION
+id	main.orders.id	DIRECT	IDENTITY
+
+query T
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'type' FROM acl_lineage_events() ORDER BY seq DESC LIMIT 1;
+----
+VIEW
+
+# --- ALTER and DROP: the lifecycle, a drop without edges --------------------------------------------------
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.orders SET RLS 'amount > 0';
+
+statement ok
+SELECT acl_audit_flush();
+
+query TT
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle',
+    list_filter(from_json(payload->'edges', '["JSON"]'), lambda e: e->>'subtype' = 'FILTER')[1]->>'source_field'
+FROM acl_lineage_events() ORDER BY seq DESC LIMIT 1;
+----
+ALTER	amount
+
+statement ok
+ACL ADMIN DROP RELATION c.orders;
+
+statement ok
+SELECT acl_audit_flush();
+
+query TI
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle', json_array_length(payload->'edges')
+FROM acl_lineage_events() ORDER BY seq DESC LIMIT 1;
+----
+DROP	0
+
+# --- the audit stream never carries lineage --------------------------------------------------------------
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE kind = 'lineage';
+----
+0
+
+# --- physical datasets can be turned off: the definition's sources go, and their edges with them ----------
+
+statement ok
+SET GLOBAL acl_lineage_physical = false;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.hidden_topology AS phys.main.customers;
+
+statement ok
+SELECT acl_audit_flush();
+
+query II
+SELECT json_array_length(payload->'datasets'), json_array_length(payload->'edges')
+FROM acl_lineage_events() ORDER BY seq DESC LIMIT 1;
+----
+1	0
+
+statement ok
+SET GLOBAL acl_lineage_physical = true;
+
+# --- the settings are the node's: global only, and a choice is checked -----------------------------------
+
+statement error
+SET acl_lineage_level = 'on';
+----
+acl_lineage_level is global
+
+statement error
+SET GLOBAL acl_lineage_level = 'sometimes';
+----
+acl_lineage_level is one of off, on

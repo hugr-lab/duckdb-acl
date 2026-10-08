@@ -514,6 +514,9 @@ struct PolicyStore {
 	                  const string &rls = "", const string &columns = "", bool judge_columns = true);
 	void CatalogRevoke(const string &role, const string &vcat);
 	void CatalogDropRelation(const string &vcat, const string &vname);
+	//! spec 107: after a virtual object's definition was written (or dropped), the static lineage event
+	//! - its definition as it now stands in the catalog, read back and bound; nothing when lineage is off
+	void NoteDefinitionLineage(const string &vcat, const string &vname, const string &lifecycle);
 	// DROP of the remaining virtual-catalog elements (spec 010). Dropping a catalog removes its own
 	// definitions always; the role grants pointing at it need `cascade`, so an accidental drop cannot
 	// silently revoke people's access.
