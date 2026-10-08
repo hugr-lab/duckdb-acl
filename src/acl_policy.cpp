@@ -864,6 +864,19 @@ PolicyStoreHandle::~PolicyStoreHandle() {
 	}
 }
 
+void LineageFromContext(ClientContext &context, string &parent, string &root_parent, string &job) {
+	Value value;
+	if (context.TryGetCurrentSetting("acl_lineage_parent", value) && !value.IsNull()) {
+		parent = value.ToString();
+	}
+	if (context.TryGetCurrentSetting("acl_lineage_root_parent", value) && !value.IsNull()) {
+		root_parent = value.ToString();
+	}
+	if (context.TryGetCurrentSetting("acl_lineage_job", value) && !value.IsNull()) {
+		job = value.ToString();
+	}
+}
+
 void TraceFromContext(ClientContext &context, string &correlation_id, string &traceparent) {
 	Value value;
 	if (context.TryGetCurrentSetting("acl_correlation_id", value) && !value.IsNull()) {
@@ -895,6 +908,31 @@ string BoundTrace(const string &value) {
 		}
 	}
 	return TruncateUtf8(clean, 128);
+}
+
+string BoundLineage(const string &value) {
+	// a parent names a run (`<namespace>/<job>/<runId>`), a job a name: bounded like a trace id
+	return TruncateUtf8(value, 512);
+}
+
+string LineageMarkers(const string &parent, const string &root_parent, const string &job) {
+	if (parent.empty() && root_parent.empty() && job.empty()) {
+		return string();
+	}
+	auto quoted = [](const string &value) {
+		return "'" + StringUtil::Replace(BoundLineage(value), "'", "''") + "'";
+	};
+	string out = "LINEAGE ";
+	if (!parent.empty()) {
+		out += "PARENT " + quoted(parent) + " ";
+	}
+	if (!root_parent.empty()) {
+		out += "ROOT " + quoted(root_parent) + " ";
+	}
+	if (!job.empty()) {
+		out += "JOB " + quoted(job) + " ";
+	}
+	return out;
 }
 
 string TraceMarkers(const string &correlation_id, const string &traceparent) {
@@ -960,6 +998,12 @@ bool PolicyStore::SetSessionTrace(const string &id, const string &name, const st
 			entry.second.correlation_id = BoundTrace(value);
 		} else if (StringUtil::CIEquals(name, "acl_traceparent")) {
 			entry.second.traceparent = BoundTrace(value);
+		} else if (StringUtil::CIEquals(name, "acl_lineage_parent")) {
+			entry.second.lineage_parent = BoundLineage(value);
+		} else if (StringUtil::CIEquals(name, "acl_lineage_root_parent")) {
+			entry.second.lineage_root_parent = BoundLineage(value);
+		} else if (StringUtil::CIEquals(name, "acl_lineage_job")) {
+			entry.second.lineage_job = BoundLineage(value);
 		} else {
 			return false;
 		}
@@ -970,6 +1014,12 @@ bool PolicyStore::SetSessionTrace(const string &id, const string &name, const st
 
 string PolicyStore::SessionSql(const string &handle, const string &sql, const string &correlation_id,
                                const string &traceparent) {
+	return SessionSql(handle, sql, correlation_id, traceparent, string(), string(), string());
+}
+
+string PolicyStore::SessionSql(const string &handle, const string &sql, const string &correlation_id,
+                               const string &traceparent, const string &lineage_parent,
+                               const string &lineage_root_parent, const string &lineage_job) {
 	// Judge here rather than through SessionPrincipal, for one reason: SessionPrincipal *erases* a
 	// dead session on read, which would leave a follow-up SessionReason nothing to report but
 	// "unknown" (spec 054). This bumps the live session (using it keeps it alive - the idle rule of
@@ -994,7 +1044,11 @@ string PolicyStore::SessionSql(const string &handle, const string &sql, const st
 	// client SET on the session itself, wherever the composition is evaluated
 	auto &cid = correlation_id.empty() ? entry->second.correlation_id : correlation_id;
 	auto &tp = traceparent.empty() ? entry->second.traceparent : traceparent;
-	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + TraceMarkers(cid, tp) + sql;
+	auto &lp = lineage_parent.empty() ? entry->second.lineage_parent : lineage_parent;
+	auto &lr = lineage_root_parent.empty() ? entry->second.lineage_root_parent : lineage_root_parent;
+	auto &lj = lineage_job.empty() ? entry->second.lineage_job : lineage_job;
+	return "ACL SESSION '" + StringUtil::Replace(handle, "'", "''") + "' " + TraceMarkers(cid, tp) +
+	       LineageMarkers(lp, lr, lj) + sql;
 }
 
 void PolicyStore::SetDoorOpen(bool open) {

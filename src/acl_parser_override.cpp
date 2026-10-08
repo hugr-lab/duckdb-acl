@@ -82,12 +82,49 @@ AclPrefix ParseAclPrefix(const string &query) {
 	auto read_trace = [&](idx_t &scan) {
 		bool seen_trace = false;
 		bool seen_parent = false;
+		bool seen_lineage = false;
 		for (;;) {
 			SkipWhitespace(query, scan);
 			auto saved = scan;
 			auto word = ReadWord(query, scan);
 			bool trace = StringUtil::CIEquals(word, "trace");
 			bool parent = StringUtil::CIEquals(word, "parent");
+			if (StringUtil::CIEquals(word, "lineage")) {
+				// spec 107: `LINEAGE [PARENT '<ns/job/run>'] [ROOT '<ns/job/run>'] [JOB '<name>']` - once
+				if (seen_lineage) {
+					throw ParserException("acl_rewrite: ACL LINEAGE may be written once in a prefix");
+				}
+				seen_lineage = true;
+				bool any = false;
+				for (;;) {
+					SkipWhitespace(query, scan);
+					auto part_start = scan;
+					auto part = ReadWord(query, scan);
+					string *target = StringUtil::CIEquals(part, "parent") ? &prefix.lineage.parent
+					                 : StringUtil::CIEquals(part, "root") ? &prefix.lineage.root_parent
+					                 : StringUtil::CIEquals(part, "job")  ? &prefix.lineage.job
+					                                                      : nullptr;
+					if (!target) {
+						scan = part_start;
+						break;
+					}
+					if (!target->empty()) {
+						throw ParserException("acl_rewrite: ACL LINEAGE %s may be written once",
+						                      StringUtil::Upper(part));
+					}
+					SkipWhitespace(query, scan);
+					if (scan >= query.size() || (query[scan] != '\'' && query[scan] != '"')) {
+						throw ParserException("acl_rewrite: ACL LINEAGE %s requires a quoted value",
+						                      StringUtil::Upper(part));
+					}
+					*target = BoundLineage(ReadQuoted(query, scan));
+					any = true;
+				}
+				if (!any) {
+					throw ParserException("acl_rewrite: ACL LINEAGE needs PARENT, ROOT or JOB");
+				}
+				continue;
+			}
 			if (!trace && !parent) {
 				scan = saved;
 				return;

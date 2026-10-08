@@ -1,4 +1,5 @@
 #include "acl_rewriter.hpp"
+#include "acl_lineage.hpp"
 #include "acl_field_paths.hpp"
 #include "acl_policy_catalog.hpp"
 
@@ -336,7 +337,8 @@ public:
 		// the trace settings (spec 069) land on the session's record too: the door composes the prefix
 		// from there, whichever connection evaluates the composition (quack's is the server's, not
 		// the client's). A RESET clears it.
-		if (StringUtil::CIEquals(name, "acl_correlation_id") || StringUtil::CIEquals(name, "acl_traceparent")) {
+		if (StringUtil::CIEquals(name, "acl_correlation_id") || StringUtil::CIEquals(name, "acl_traceparent") ||
+		    LineageClientSetting(name)) {
 			store.SetSessionTrace(principal.session, name, value);
 		}
 	}

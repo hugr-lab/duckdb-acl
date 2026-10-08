@@ -1,0 +1,128 @@
+# name: test/sql/integration/acl_lineage_quack.test
+# description: spec 107 over the quack door - a client's lineage context reaches the run: the request
+#   headers an http secret adds (EXTRA_HTTP_HEADERS, read by httpfs into every request to the door),
+#   and a SET on the session through quack_query_by_name (spec 068's allowlist, the session's record).
+# group: [integration]
+
+require acl
+
+require httpfs
+
+require quack
+
+require json
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.sink(a INTEGER, b VARCHAR);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('test/idp/s', '{"url": "test/idp/s", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.sink AS phys.main.sink;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+statement ok
+SET GLOBAL acl_lineage_level = 'on';
+
+statement ok
+SET GLOBAL acl_lineage_namespace = 'acl://it';
+
+query I
+SELECT acl_quack_serve('quack:localhost:31906', 'lineage-server-token');
+----
+quack:localhost:31906
+
+# the request headers: what an http secret adds to every request to the door
+statement ok
+CREATE SECRET lineage_headers (TYPE http, SCOPE 'http://localhost:31906',
+    EXTRA_HTTP_HEADERS MAP {'x-openlineage-parent': 'airflow/nightly.load/run-h', 'x-openlineage-job': 'dbt.sink'});
+
+statement ok
+ATTACH 'quack:localhost:31906' AS r1 (TYPE quack, TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
+
+statement ok
+FROM quack_query_by_name('r1', 'INSERT INTO sink VALUES (1, ''h'')');
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT job_name, payload->'parent'->>'job', payload->'parent'->>'run_id'
+FROM acl_lineage_events() WHERE event_type = 'RUN_COMPLETE' ORDER BY seq DESC LIMIT 1;
+----
+dbt.sink	nightly.load	run-h
+
+# a SET on the session: a step's own parent, over the connection's header
+statement ok
+FROM quack_query_by_name('r1', 'SET acl_lineage_parent = ''airflow/nightly.step2/run-s''');
+
+statement ok
+FROM quack_query_by_name('r1', 'INSERT INTO sink VALUES (2, ''s'')');
+
+statement ok
+SELECT acl_lineage_flush();
+
+# the header still wins where it is set (it is the request's own); the job is the header's too
+query TT
+SELECT job_name, payload->'parent'->>'run_id'
+FROM acl_lineage_events() WHERE event_type = 'RUN_COMPLETE' ORDER BY seq DESC LIMIT 1;
+----
+dbt.sink	run-h
+
+statement ok
+DETACH r1;
+
+statement ok
+DROP SECRET lineage_headers;
+
+statement ok
+ATTACH 'quack:localhost:31906' AS r2 (TYPE quack, TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
+
+statement ok
+FROM quack_query_by_name('r2', 'SET acl_lineage_parent = ''airflow/nightly.step3/run-s3''');
+
+statement ok
+FROM quack_query_by_name('r2', 'INSERT INTO sink VALUES (3, ''t'')');
+
+statement ok
+SELECT acl_lineage_flush();
+
+# without a header, the session's SET is the parent
+query T
+SELECT payload->'parent'->>'run_id'
+FROM acl_lineage_events() WHERE event_type = 'RUN_COMPLETE' ORDER BY seq DESC LIMIT 1;
+----
+run-s3
+
+statement ok
+DETACH r2;
+
+statement ok
+SELECT acl_quack_stop('quack:localhost:31906');

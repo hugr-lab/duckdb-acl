@@ -395,7 +395,7 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 		res.status = 204;
 	});
 
-	server->Post("/quack", [&](const duckdb_httplib::Request &, duckdb_httplib::Response &res,
+	server->Post("/quack", [&](const duckdb_httplib::Request &req, duckdb_httplib::Response &res,
 	                           const duckdb_httplib::ContentReader &content_reader) {
 		res.set_header("Access-Control-Allow-Origin", "*");
 		MemoryStream stream;
@@ -403,7 +403,20 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 			stream.WriteData((data_ptr_t)data, data_length);
 			return true;
 		});
-		auto response = HandleMessage(stream);
+		// spec 107: the request's lineage context, for the authorization callback on this thread
+		QuackRequestLineage lineage;
+		lineage.parent = req.get_header_value("x-openlineage-parent");
+		lineage.root_parent = req.get_header_value("x-openlineage-root-parent");
+		lineage.job = req.get_header_value("x-openlineage-job");
+		quack_request_lineage = &lineage;
+		unique_ptr<QuackMessage> response;
+		try {
+			response = HandleMessage(stream);
+		} catch (...) {
+			quack_request_lineage = nullptr;
+			throw;
+		}
+		quack_request_lineage = nullptr;
 		auto raw = response->RawPayload();
 		if (raw) {
 			// already serialized: httplib sends the bytes with no copy (quack f4328c5: the wire header

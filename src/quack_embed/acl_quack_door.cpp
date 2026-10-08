@@ -35,6 +35,9 @@
 
 namespace duckdb {
 namespace acl {
+
+thread_local const QuackRequestLineage *quack_request_lineage = nullptr;
+
 namespace {
 
 //! spec 097: the verdict as the HTTP status the route answers
@@ -276,9 +279,22 @@ void AclQuackAuthorizeFunc(DataChunk &args, ExpressionState &state, Vector &resu
 			}
 			// SessionSql is the one place the prefix is composed, so every door spells it the same way;
 			// the trace is whatever the client SET on its connection (spec 069)
-			string correlation_id, traceparent;
+			string correlation_id, traceparent, lineage_parent, lineage_root, lineage_job;
 			TraceFromContext(state.GetContext(), correlation_id, traceparent);
-			auto prefixed = store.SessionSql(handle, sql, correlation_id, traceparent);
+			// spec 107: the lineage context of the connection (and, through SessionSql, of the session)
+			if (quack_request_lineage) {
+				// the request's own headers first - an http secret's EXTRA_HTTP_HEADERS - then the connection's
+				lineage_parent = quack_request_lineage->parent;
+				lineage_root = quack_request_lineage->root_parent;
+				lineage_job = quack_request_lineage->job;
+			}
+			string set_parent, set_root, set_job;
+			LineageFromContext(state.GetContext(), set_parent, set_root, set_job);
+			lineage_parent = lineage_parent.empty() ? set_parent : lineage_parent;
+			lineage_root = lineage_root.empty() ? set_root : lineage_root;
+			lineage_job = lineage_job.empty() ? set_job : lineage_job;
+			auto prefixed =
+			    store.SessionSql(handle, sql, correlation_id, traceparent, lineage_parent, lineage_root, lineage_job);
 			result.SetValue(row, prefixed.empty() ? Value() : Value(prefixed));
 		} catch (std::exception &ex) {
 			store.AuditDoor("quack", "authorize", false, "policy_error", ErrorData(ex).RawMessage());
