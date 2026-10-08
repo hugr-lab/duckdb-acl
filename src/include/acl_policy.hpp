@@ -521,6 +521,9 @@ struct PolicyStore {
 	//! spec 107: after a virtual object's definition was written (or dropped), the static lineage event
 	//! - its definition as it now stands in the catalog, read back and bound; nothing when lineage is off
 	void NoteDefinitionLineage(const string &vcat, const string &vname, const string &lifecycle);
+	//! spec 107: a grant changed what the roles of `vcat` see - every object of the catalog (or the one
+	//! named) gets a DatasetEvent with its per-role tags; no lifecycle, nothing about the definition
+	void NoteGrantLineage(const string &vcat, const string &vname = string());
 	// DROP of the remaining virtual-catalog elements (spec 010). Dropping a catalog removes its own
 	// definitions always; the role grants pointing at it need `cascade`, so an accidental drop cannot
 	// silently revoke people's access.

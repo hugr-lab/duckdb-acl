@@ -587,6 +587,110 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 	NoteDefinitionLineage(vcat, vname, existed ? "ALTER" : "CREATE");
 }
 
+namespace {
+
+//! "expr AS name" -> (expr, name); a bare item is (name, name). The name unquoted.
+std::pair<string, string> SplitProjectionItem(const string &item) {
+	auto as = StringUtil::Lower(item).rfind(" as ");
+	if (as == string::npos) {
+		auto name = item;
+		StringUtil::Trim(name);
+		if (name.size() > 1 && name.front() == '"' && name.back() == '"') {
+			name = StringUtil::Replace(name.substr(1, name.size() - 2), "\"\"", "\"");
+		}
+		return {name, name};
+	}
+	auto expr = item.substr(0, as);
+	auto name = item.substr(as + 4);
+	StringUtil::Trim(expr);
+	StringUtil::Trim(name);
+	if (name.size() > 1 && name.front() == '"' && name.back() == '"') {
+		name = StringUtil::Replace(name.substr(1, name.size() - 2), "\"\"", "\"");
+	}
+	return {expr, name};
+}
+
+} // namespace
+
+//! spec 107 §4: what each role holding `vcat` sees of `vcat.vname`, as OpenLineage tags - the
+//! capabilities on the dataset, `visible` / `masked` per field path, `.rls` when a predicate applies.
+//! A field the role does not see has no tag of that role. Resolved through the same policy a read
+//! uses, one role at a time; nothing is bound and no claim is needed (the predicate is only present).
+vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, const string &vcat, const string &vname,
+                                 const vector<string> &fields, const case_insensitive_set_t &source_columns) {
+	vector<AuditLineageTag> tags;
+	vector<string> roles;
+	try {
+		auto rows = catalog.Query("SELECT DISTINCT \"role\" FROM " + catalog.Tbl("role_catalogs") +
+		                          " WHERE \"vcat\" = " + Lit(vcat) + " UNION SELECT \"role\" FROM " +
+		                          catalog.Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                          " AND \"vname\" = " + Lit(vname) + " ORDER BY 1");
+		ResultRows role_rows(*rows);
+		for (idx_t i = 0; i < rows->RowCount(); i++) {
+			roles.push_back(role_rows.GetValue(0, i).ToString());
+		}
+	} catch (std::exception &) {
+		return tags;
+	}
+	for (auto &role : roles) {
+		Principal principal;
+		principal.roles = {role};
+		TablePolicy policy;
+		if (!store.ResolveTable(principal, vcat + "." + vname, policy) || policy.caps.empty()) {
+			continue;
+		}
+		auto key = "acl.role." + role;
+		vector<string> caps(policy.caps.begin(), policy.caps.end());
+		std::sort(caps.begin(), caps.end());
+		tags.push_back(AuditLineageTag {key, StringUtil::Join(caps, ","), string()});
+		if (!policy.rls.empty()) {
+			tags.push_back(AuditLineageTag {key + ".rls", "true", string()});
+		}
+		case_insensitive_map_t<string> narrowed;
+		for (auto &entry : policy.narrowed_reads) {
+			narrowed[entry.first] = entry.second;
+		}
+		auto field_tags = [&](const string &column, bool masked) {
+			auto entry = narrowed.find(column);
+			if (entry == narrowed.end()) {
+				tags.push_back(AuditLineageTag {key, masked ? "masked" : "visible", column});
+				return;
+			}
+			// spec 102: the column's own items - `address.city`, `address.ssn = NULL` - one tag per path
+			for (auto &item : StringUtil::Split(entry->second, ',')) {
+				StringUtil::Trim(item);
+				auto eq = item.find('=');
+				auto path = eq == string::npos ? item : item.substr(0, eq);
+				StringUtil::Trim(path);
+				tags.push_back(AuditLineageTag {key, eq == string::npos ? "visible" : "masked", path});
+			}
+		};
+		if (policy.projection.empty()) {
+			// a writable object a grant narrows keeps its shape: what the role reads is the grant's
+			// visible columns (all of them when it names none), a masked one carried as an injection
+			case_insensitive_set_t injected;
+			for (auto &entry : policy.injections) {
+				injected.insert(entry.first);
+			}
+			for (auto &field : fields) {
+				if (!policy.visible_columns.empty() && !policy.visible_columns.count(field) && !narrowed.count(field)) {
+					continue;
+				}
+				field_tags(field, injected.count(field) > 0);
+			}
+		} else {
+			for (auto &item : policy.projection) {
+				auto split = SplitProjectionItem(item);
+				bool masked = !StringUtil::CIEquals(split.first, split.second) &&
+				              !StringUtil::CIEquals(split.first, acl_detail::Ident(split.second)) &&
+				              source_columns.count(split.second);
+				field_tags(split.second, masked);
+			}
+		}
+	}
+	return tags;
+}
+
 void PolicyStore::NoteDefinitionLineage(const string &vcat, const string &vname, const string &lifecycle) {
 	auto db = instance.lock();
 	if (!db || !audit || !catalog) {
@@ -605,6 +709,7 @@ void PolicyStore::NoteDefinitionLineage(const string &vcat, const string &vname,
 	string form, phys, view_sql, rls;
 	vector<string> items;
 	case_insensitive_set_t masks; // `c = expr` over a column the source has: a mask, not a computed column
+	case_insensitive_set_t source_columns;
 	try {
 		auto relation =
 		    catalog->Query("SELECT \"form\", \"phys\", \"view_sql\", \"rls\" FROM " + catalog->Tbl("relations") +
@@ -624,7 +729,6 @@ void PolicyStore::NoteDefinitionLineage(const string &vcat, const string &vname,
 		    catalog->Query("SELECT \"name\", \"expr\" FROM " + catalog->Tbl("relation_columns") +
 		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
 		ResultRows column_rows(*columns);
-		case_insensitive_set_t source_columns;
 		if (form != "view" && !phys.empty()) {
 			vector<std::pair<string, string>> probed;
 			if (catalog->ProbeSchema("SELECT * FROM " + phys, false, {}, probed)) {
@@ -672,8 +776,39 @@ void PolicyStore::NoteDefinitionLineage(const string &vcat, const string &vname,
 			}
 		}
 	}
+	vector<string> fields;
+	for (auto &output : walk.outputs) {
+		fields.push_back(output.name);
+	}
+	auto tags = RoleTags(*this, *catalog, vcat, vname, fields, source_columns);
 	EmitDefinitionLineage(*audit, *db, vcat, vname, form == "view" ? "VIEW" : "TABLE", lifecycle,
-	                      walked ? &walk : nullptr);
+	                      walked ? &walk : nullptr, tags);
+}
+
+void PolicyStore::NoteGrantLineage(const string &vcat, const string &vname) {
+	auto db = instance.lock();
+	if (!db || !audit || !catalog || !LineageSettings::Read(*db).on) {
+		return;
+	}
+	vector<string> objects;
+	if (!vname.empty()) {
+		objects.push_back(vname);
+	} else {
+		try {
+			auto rows = catalog->Query("SELECT \"vname\" FROM " + catalog->Tbl("relations") +
+			                           " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY 1");
+			ResultRows object_rows(*rows);
+			for (idx_t i = 0; i < rows->RowCount(); i++) {
+				objects.push_back(object_rows.GetValue(0, i).ToString());
+			}
+		} catch (std::exception &) {
+			return;
+		}
+	}
+	for (auto &object : objects) {
+		// the definition again, with the tags as they now stand; a grant is not a lifecycle change
+		NoteDefinitionLineage(vcat, object, string());
+	}
 }
 
 namespace {
@@ -1458,6 +1593,7 @@ void PolicyStore::CatalogGrant(const string &role, const string &vcat, const str
 		                     Lit(caps_json) + ", " + Lit(rls) + ", " + Lit(columns) + ", " +
 		                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ")");
 	});
+	NoteGrantLineage(vcat); // spec 107: what the role sees changed
 }
 
 void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
@@ -1468,6 +1604,7 @@ void PolicyStore::CatalogRevoke(const string &role, const string &vcat) {
 	                    " AND \"vcat\" = " + Lit(vcat),
 	                "DELETE FROM " + catalog->Tbl("grant_columns") + " WHERE \"role\" = " + Lit(role) +
 	                    " AND \"vcat\" = " + Lit(vcat)});
+	NoteGrantLineage(vcat); // spec 107
 }
 
 namespace {
@@ -2572,6 +2709,7 @@ void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, c
 		                     Lit(rls) + ", " + Lit(listed) + ", " +
 		                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ")");
 	});
+	NoteGrantLineage(vcat, vname); // spec 107
 }
 
 bool PolicyStore::CatalogObjectExists(const string &vcat, const string &vname, const string &kind) {

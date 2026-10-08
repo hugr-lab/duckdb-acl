@@ -74,7 +74,8 @@ bool WalkDefinition(DatabaseInstance &db, const string &sql, idx_t max_edges, Li
 //! A static event: what a virtual object of `vcat` is defined as (`walk` may be null: a DROP, or a
 //! definition that did not bind - then `approximate`). Emitted only when acl_lineage_level is on.
 void EmitDefinitionLineage(AuditPipeline &pipeline, DatabaseInstance &db, const string &vcat, const string &vname,
-                           const string &dataset_type, const string &lifecycle, const LineageWalk *walk);
+                           const string &dataset_type, const string &lifecycle, const LineageWalk *walk,
+                           const vector<AuditLineageTag> &tags = {});
 
 //! A statement the override decided that lineage covers (a write, or a read under a declared parent):
 //! what the worker needs to say, off the statement's path, what it read and wrote in the principal's

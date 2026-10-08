@@ -397,7 +397,8 @@ bool WalkDefinition(DatabaseInstance &db, const string &sql, idx_t max_edges, Li
 }
 
 void EmitDefinitionLineage(AuditPipeline &pipeline, DatabaseInstance &db, const string &vcat, const string &vname,
-                           const string &dataset_type, const string &lifecycle, const LineageWalk *walk) {
+                           const string &dataset_type, const string &lifecycle, const LineageWalk *walk,
+                           const vector<AuditLineageTag> &tags) {
 	auto settings = LineageSettings::Read(db);
 	if (!settings.on) {
 		return;
@@ -420,6 +421,7 @@ void EmitDefinitionLineage(AuditPipeline &pipeline, DatabaseInstance &db, const 
 		if (!dataset.physical && dataset.ns == settings.ns + "/" + vcat && dataset.name == vname) {
 			dataset.lifecycle = lifecycle;
 			dataset.dataset_type = dataset_type;
+			dataset.tags = tags;
 			for (auto &output : defined.outputs) {
 				AuditLineageField field;
 				field.name = output.name;

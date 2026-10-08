@@ -400,3 +400,54 @@ SELECT count(*) FROM acl_lineage_events(), unnest(from_json(payload->'datasets',
 WHERE d->>'namespace' LIKE '%/source/store';
 ----
 0
+
+# === per-role visibility: tags on the canonical dataset, sent again when a grant changes ==================
+
+statement ok
+CREATE TABLE phys.main.people(id INTEGER, name VARCHAR, ssn VARCHAR, address STRUCT(city VARCHAR, zip VARCHAR));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.people AS phys.main.people;
+
+statement ok
+ACL ADMIN CREATE ROLE clerk;
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE clerk WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.people TO ROLE clerk COLUMNS (id, name, ssn = NULL, address.city);
+
+statement ok
+SELECT acl_lineage_flush();
+
+# the newest event of c.people carries clerk's tags: what it reads, masked or plain, field by field
+query TTT
+SELECT t->>'key', coalesce(t->>'field', '-'), t->>'value'
+FROM (SELECT unnest(from_json(payload->'datasets'->(payload->'outputs'->>0)::INT->'tags', '["JSON"]')) AS t
+      FROM acl_lineage_events()
+      WHERE seq = (SELECT max(seq) FROM acl_lineage_events()
+                   WHERE (payload->'datasets'->(payload->'outputs'->>0)::INT->>'name') = 'people'))
+WHERE (t->>'key') = 'acl.role.clerk'
+ORDER BY 2;
+----
+acl.role.clerk	-	select
+acl.role.clerk	address.city	visible
+acl.role.clerk	id	visible
+acl.role.clerk	name	visible
+acl.role.clerk	ssn	masked
+
+# a grant change is no lifecycle change
+query T
+SELECT coalesce(payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle', '-')
+FROM acl_lineage_events()
+WHERE seq = (SELECT max(seq) FROM acl_lineage_events()
+             WHERE (payload->'datasets'->(payload->'outputs'->>0)::INT->>'name') = 'people');
+----
+-
