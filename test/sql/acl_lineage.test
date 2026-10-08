@@ -191,3 +191,156 @@ statement error
 SET GLOBAL acl_lineage_level = 'sometimes';
 ----
 acl_lineage_level is one of off, on
+
+# === runtime: a write under a principal, named in the principal's own (virtual) names ====================
+
+statement ok
+CREATE TABLE phys.main.sink(a INTEGER, b VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.sink AS phys.main.sink;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.src AS phys.main.orders COLUMNS (id, total = amount * 2, ssn = left(ssn, 1) || '***');
+
+statement ok
+SELECT acl_lineage_flush();
+
+# a mask (an item over a column the source has) is masking=true; a computed column is not
+query TTT
+SELECT e->>'target_field', e->>'source_field', (e->>'masking')::BOOLEAN
+FROM (SELECT unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq = (SELECT max(seq) FROM acl_lineage_events()))
+WHERE e->>'type' = 'DIRECT' ORDER BY 1, 2;
+----
+id	id	false
+ssn	ssn	true
+total	amount	false
+
+statement ok
+ACL ADMIN CREATE ROLE w;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE w WITH (select, insert, update, delete) MAIN;
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 1, 10, 'S1', 't1'), (2, 1, 20, 'S2', 't1');
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+CREATE TEMP TABLE before AS SELECT coalesce(max(seq), 0) AS seq FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" INSERT INTO sink (a, b) SELECT id, upper(total::VARCHAR) || coalesce(ssn, '') FROM src WHERE total > 5;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT event_type, job_namespace, starts_with(job_name, 'sql:')
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+RUN_COMPLETE	acl://test/client/gateway	true
+
+# the target and the sources are the VIRTUAL objects, never the physical tables behind them (that `ssn` is a
+# mask is the static event's to say: src.ssn is masking=true there)
+query TT
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'namespace',
+    payload->'datasets'->(payload->'outputs'->>0)::INT->>'name'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+acl://test/c	sink
+
+query TTTT
+SELECT e->>'target_field', (payload->'datasets'->(e->>'source')::INT->>'name') || '.' || (e->>'source_field'),
+    e->>'type', e->>'subtype'
+FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq > (SELECT seq FROM before))
+ORDER BY 1, 2;
+----
+(empty)	src.total	INDIRECT	FILTER
+a	src.id	DIRECT	IDENTITY
+b	src.ssn	DIRECT	TRANSFORMATION
+b	src.total	DIRECT	TRANSFORMATION
+
+query I
+SELECT count(*) FROM acl_lineage_events(), unnest(from_json(payload->'datasets', '["JSON"]')) AS t(d)
+WHERE seq > (SELECT seq FROM before) AND (d->>'physical')::BOOLEAN;
+----
+0
+
+# the identity facet: the roles (client level), no subject
+query TT
+SELECT payload->>'roles', payload->>'subject' FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+["w"]	NULL
+
+# --- a plain SELECT is not a lineage event -----------------------------------------------------------------
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" SELECT * FROM src;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query I
+SELECT count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+0
+
+# --- UPDATE: the field from its expression, the WHERE as a filter -----------------------------------------
+
+statement ok
+ACL ROLE "w" UPDATE sink SET b = lower(b) WHERE a = 1;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTTT
+SELECT e->>'target_field', (payload->'datasets'->(e->>'source')::INT->>'name') || '.' || (e->>'source_field'),
+    e->>'type', e->>'subtype'
+FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq > (SELECT seq FROM before))
+ORDER BY 1, 2;
+----
+(empty)	sink.a	INDIRECT	FILTER
+b	sink.b	DIRECT	TRANSFORMATION
+
+# --- the SQL facet: off by default; normalized, it carries no literal --------------------------------------
+
+query I
+SELECT count(*) FROM acl_lineage_events() WHERE payload->>'sql' IS NOT NULL;
+----
+0
+
+statement ok
+SET GLOBAL acl_lineage_sql = 'normalized';
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" INSERT INTO sink VALUES (42, 'a-secret-value');
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TT
+SELECT payload->>'sql' LIKE '%a-secret-value%' OR payload->>'sql' LIKE '%42%', payload->>'dialect'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+false	duckdb
+
+statement ok
+SET GLOBAL acl_lineage_sql = 'off';

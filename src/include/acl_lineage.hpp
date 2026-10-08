@@ -10,6 +10,7 @@
 #pragma once
 
 #include "acl_audit.hpp"
+#include "acl_principal.hpp"
 #include "acl_lineage_walker.hpp"
 
 namespace duckdb {
@@ -18,9 +19,13 @@ class DatabaseInstance;
 class ExtensionLoader;
 struct DBConfig;
 
+class SQLStatement;
+
 namespace acl {
 
 class AuditPipeline;
+struct PolicyStore;
+class LineageWorker;
 
 //! The node's lineage settings (all GLOBAL, all cluster-profile items), read where an event is made.
 struct LineageSettings {
@@ -71,9 +76,36 @@ bool WalkDefinition(DatabaseInstance &db, const string &sql, idx_t max_edges, Li
 void EmitDefinitionLineage(AuditPipeline &pipeline, DatabaseInstance &db, const string &vcat, const string &vname,
                            const string &dataset_type, const string &lifecycle, const LineageWalk *walk);
 
-//! `acl_lineage_events()` - the operator's view of the lineage ring (never a principal's: `acl_` is in
-//! spec 072's never set).
-void RegisterAclLineage(ExtensionLoader &loader, const shared_ptr<AuditPipeline> &pipeline);
+//! A statement the override decided that lineage covers (a write, or a read under a declared parent):
+//! what the worker needs to say, off the statement's path, what it read and wrote in the principal's
+//! own names. Made at decision time, run once per execution (QueryEnd) with its outcome.
+struct LineageJob {
+	unique_ptr<SQLStatement> statement; // the statement as written, before the rewrite
+	Principal principal;
+	LineageContext context;
+	string door;
+	int64_t decision_seq = -1;
+	bool declared_read = false; // a SELECT under a parent: inputs only
+	weak_ptr<LineageWorker> worker;
+};
+
+//! The override, before the rewrite: a job when lineage is on and the statement is in scope (DML, a
+//! CREATE TABLE AS, a read when `context.parent` is set), else null. Copies the statement.
+shared_ptr<LineageJob> CaptureLineageJob(PolicyStore &store, const SQLStatement &statement, const Principal &principal,
+                                         const string &door, const LineageContext &context);
+//! QueryEnd: hand one execution of a job to the worker (never blocks; a full queue drops, counted).
+void EnqueueLineageRun(const shared_ptr<LineageJob> &job, bool failed);
+//! The store's worker: started at load, stopped by the store's teardown (from any thread, its own too).
+shared_ptr<LineageWorker> StartLineageWorker(const shared_ptr<PolicyStore> &store,
+                                             const shared_ptr<AuditPipeline> &pipeline, DatabaseInstance &db);
+void StopLineageWorker(LineageWorker &worker);
+//! Wait until the jobs queued so far are done (tests: `acl_lineage_flush()`); false on timeout.
+bool FlushLineageWorker(LineageWorker &worker, int64_t timeout_ms = 30000);
+
+//! `acl_lineage_events()` - the operator's view of the lineage ring - and `acl_lineage_flush()`, which
+//! waits for the worker and the audit queue (tests). Never a principal's: `acl_` is spec 072's never set.
+void RegisterAclLineage(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store,
+                        const shared_ptr<AuditPipeline> &pipeline);
 
 } // namespace acl
 } // namespace duckdb

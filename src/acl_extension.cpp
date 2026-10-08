@@ -355,6 +355,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	pipeline->Attach(db);
 	store->audit = pipeline;
 	store->instance = db.shared_from_this();
+	store->lineage_worker = acl::StartLineageWorker(store, pipeline, db); // spec 107
 	if (!contract_mismatch.empty()) {
 		// the full reason, once, where the operator reads refusals (the ring, the file, a sink of ours)
 		store->AuditPolicy("contract_mismatch", contract_mismatch);
@@ -405,9 +406,9 @@ void LoadInternal(ExtensionLoader &loader) {
 		                         read(&acl::SessionNotifier::Slow));
 	}
 	acl::RegisterAclAudit(loader, store, pipeline);
-	acl::RegisterAclLineage(loader, pipeline); // spec 107: acl_lineage_events()
-	acl::RegisterAclProfile(loader, store);    // spec 074: the execution profile, on every connection
-	acl::RegisterAclNodeLoad(loader, store);   // spec 079: acl_node_load(), the orchestrator's report
+	acl::RegisterAclLineage(loader, store, pipeline); // spec 107: acl_lineage_events()
+	acl::RegisterAclProfile(loader, store);           // spec 074: the execution profile, on every connection
+	acl::RegisterAclNodeLoad(loader, store);          // spec 079: acl_node_load(), the orchestrator's report
 	// the node's own gauges (spec 069): how long it has been up, and which build it is
 	{
 		string version;

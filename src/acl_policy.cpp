@@ -856,6 +856,9 @@ shared_ptr<PolicyStore> PolicyStore::Of(DatabaseInstance &db) {
 
 PolicyStoreHandle::~PolicyStoreHandle() {
 	auto locked = store.lock();
+	if (locked && locked->lineage_worker) {
+		StopLineageWorker(*locked->lineage_worker); // spec 107: before the audit it emits into
+	}
 	if (locked && locked->audit) {
 		locked->audit->Stop(); // the instance is going: drain now, with the file system still whole
 	}

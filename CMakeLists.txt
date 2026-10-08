@@ -47,6 +47,7 @@ set(EXTENSION_SOURCES
     src/acl_types.cpp
     src/acl_lineage_walker.cpp
     src/acl_lineage.cpp
+    src/acl_lineage_runtime.cpp
     src/acl_metadata_listing.cpp
     src/acl_principal_functions.cpp
     src/acl_catalog_validation.cpp

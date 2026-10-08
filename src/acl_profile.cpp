@@ -2,6 +2,7 @@
 // acl_profile.cpp - spec 074: the execution profile
 //===----------------------------------------------------------------------===//
 #include "acl_profile.hpp"
+#include "acl_lineage.hpp"
 #include "acl_session_hooks.hpp"
 
 #include "acl_audit_pipeline.hpp"
@@ -329,6 +330,10 @@ public:
 			Emit(context, error);
 		} catch (...) {
 			// a profile is never worth the statement; the decision event is already out
+		}
+		if (has_note && note.lineage) {
+			// spec 107: one run per execution, handed to the worker with its outcome - never waited on
+			EnqueueLineageRun(note.lineage, bool(error));
 		}
 		if (error) {
 			batch.clear(); // an error ends the batch: the statements after it never run

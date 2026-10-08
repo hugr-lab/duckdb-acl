@@ -3,6 +3,7 @@
 #include "acl_admin_sql.hpp"
 #include "acl_audit_pipeline.hpp"
 #include "acl_profile.hpp"
+#include "acl_lineage.hpp"
 #include "acl_rewriter.hpp"
 #include "acl_scan_util.hpp"
 #include "duckdb/common/error_data.hpp"
@@ -45,6 +46,8 @@ struct AclPrefix {
 	//! written after the principal by whoever composes the prefix, carried onto every event about it
 	string correlation_id;
 	string traceparent;
+	//! spec 107: the client's lineage context - `LINEAGE PARENT '<ns/job/run>' [ROOT '<...>'] [JOB '<name>']`
+	LineageContext lineage;
 };
 
 AclPrefix ParseAclPrefix(const string &query) {
@@ -267,6 +270,10 @@ struct StatementAudit {
 			note.statement = stmt.statement;
 			note.objects = stmt.objects;
 			note.physical = stmt.physical;
+			if (stmt.lineage) {
+				stmt.lineage->decision_seq = seq; // spec 107: the run names its decision
+				note.lineage = stmt.lineage;
+			}
 			PushProfileNote(std::move(note));
 		}
 	}
@@ -691,8 +698,16 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		}
 		principal.arrow_ingest = true;
 	}
+	// spec 107: a statement lineage covers is copied as written, before the rewrite renames it
+	vector<shared_ptr<LineageJob>> lineage_jobs;
+	for (auto &statement : statements) {
+		lineage_jobs.push_back(CaptureLineageJob(store, *statement, principal, audit.proto.door, prefix.lineage));
+	}
 	audit.phase = Reason::POLICY_ERROR; // an unnoted failure under the rewrite is the policy's
 	RewriteStatements(statements, principal, options, store, &audit.trail);
+	for (idx_t i = 0; i < audit.trail.statements.size() && i < lineage_jobs.size(); i++) {
+		audit.trail.statements[i].lineage = lineage_jobs[i];
+	}
 	return ParserOverrideResult(std::move(statements));
 }
 

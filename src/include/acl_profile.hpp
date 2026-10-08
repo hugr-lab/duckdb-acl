@@ -23,6 +23,7 @@ class ExtensionLoader;
 namespace acl {
 class AuditPipeline;
 struct PolicyStore;
+struct LineageJob;
 
 //! What the override knows at decision time and the profile needs at execution time: the seq of
 //! the statement event, the batch's shared identity (door, session, principal, trace ids), the
@@ -43,6 +44,8 @@ struct ProfileNote {
 	string statement;
 	vector<AuditObject> objects;
 	vector<string> physical;
+	//! spec 107: the statement's lineage job; each execution of it is a run (QueryEnd)
+	shared_ptr<LineageJob> lineage;
 };
 
 //! The hash a note and an execution are matched by; never the text.

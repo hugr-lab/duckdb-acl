@@ -36,6 +36,7 @@ class ExtensionLoader;
 namespace acl {
 
 class AuditPipeline; // the audit's own side (spec 069), acl_audit_pipeline.hpp
+class LineageWorker; // spec 107, acl_lineage.hpp
 class AuditHooks;    // its registry, acl_audit.hpp
 
 // `Principal` is the audit contract's (duckdb-ext-common/contracts/acl_principal.hpp, spec 076): a
@@ -99,6 +100,7 @@ string MintRandomHex(idx_t bytes);
 struct TablePolicy {
 	bool subquery_form = true; // true: wrap a SELECT (read-only); false: rename in place (writable)
 	string phys;               // physical relation reference, e.g. "phys.main.orders_physical"
+	string canonical;          // spec 107: the virtual object the name resolved to, `vcat.vname` (catalog store)
 	vector<string> projection; // SQL select items (SUBQUERY), e.g. {"id", "NULL AS ssn", "amount*2 AS total"}
 	string rls;                // predicate template (SUBQUERY); may contain acl_claim('<name>'); empty = none
 	//! Whether some part of `rls` was never bound against this object (spec 027): the object did not
@@ -337,6 +339,8 @@ struct PolicyStore {
 	unordered_map<string, Session> sessions;
 	//! The audit pipeline of this instance (spec 069); set at load, before anything serves
 	shared_ptr<AuditPipeline> audit;
+	//! spec 107: the lineage worker - what a decided statement read and wrote, off its path
+	shared_ptr<LineageWorker> lineage_worker;
 	//! The instance, set at load (spec 082): what the parse path reads the attached catalogs from
 	weak_ptr<DatabaseInstance> instance;
 	//! The audit registry the pipeline drains and the doors register their gauges on (spec 069):

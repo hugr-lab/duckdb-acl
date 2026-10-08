@@ -3,9 +3,12 @@
 
 #include "acl_audit_pipeline.hpp"
 #include "acl_door_common.hpp"
+#include "acl_policy.hpp"
 
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -512,7 +515,34 @@ void LineageEventsScan(ClientContext &, TableFunctionInput &data, DataChunk &out
 
 } // namespace
 
-void RegisterAclLineage(ExtensionLoader &loader, const shared_ptr<AuditPipeline> &pipeline) {
+struct LineageFlushInfo : ScalarFunctionInfo {
+	LineageFlushInfo(weak_ptr<PolicyStore> store_p, shared_ptr<AuditPipeline> pipeline_p)
+	    : store(std::move(store_p)), pipeline(std::move(pipeline_p)) {
+	}
+	weak_ptr<PolicyStore> store;
+	shared_ptr<AuditPipeline> pipeline;
+};
+
+void LineageFlushFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &info = state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<LineageFlushInfo>();
+	bool drained = true;
+	auto store = info.store.lock();
+	if (store && store->lineage_worker) {
+		drained = FlushLineageWorker(*store->lineage_worker);
+	}
+	drained = info.pipeline->Flush() && drained;
+	result.Reference(Value::BOOLEAN(drained), count_t(args.size()));
+}
+
+void RegisterAclLineage(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store,
+                        const shared_ptr<AuditPipeline> &pipeline) {
+	{
+		ScalarFunction flush(Identifier("acl_lineage_flush"), {}, LogicalType::BOOLEAN, LineageFlushFunc);
+		flush.SetExtraFunctionInfo(make_shared_ptr<LineageFlushInfo>(store, pipeline));
+		flush.SetFallible();
+		flush.SetVolatile();
+		loader.RegisterFunction(flush);
+	}
 	TableFunction events(Identifier("acl_lineage_events"), {}, LineageEventsScan, LineageEventsBind, LineageEventsInit);
 	events.function_info = make_shared_ptr<LineageFunctionInfo>(pipeline);
 	loader.RegisterFunction(events);

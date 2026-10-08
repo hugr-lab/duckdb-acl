@@ -604,6 +604,7 @@ void PolicyStore::NoteDefinitionLineage(const string &vcat, const string &vname,
 	// repair) reports the same thing: what a read of the object is made of
 	string form, phys, view_sql, rls;
 	vector<string> items;
+	case_insensitive_set_t masks; // `c = expr` over a column the source has: a mask, not a computed column
 	try {
 		auto relation =
 		    catalog->Query("SELECT \"form\", \"phys\", \"view_sql\", \"rls\" FROM " + catalog->Tbl("relations") +
@@ -623,10 +624,22 @@ void PolicyStore::NoteDefinitionLineage(const string &vcat, const string &vname,
 		    catalog->Query("SELECT \"name\", \"expr\" FROM " + catalog->Tbl("relation_columns") +
 		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
 		ResultRows column_rows(*columns);
+		case_insensitive_set_t source_columns;
+		if (form != "view" && !phys.empty()) {
+			vector<std::pair<string, string>> probed;
+			if (catalog->ProbeSchema("SELECT * FROM " + phys, false, {}, probed)) {
+				for (auto &entry : probed) {
+					source_columns.insert(entry.first);
+				}
+			}
+		}
 		for (idx_t i = 0; i < columns->RowCount(); i++) {
 			auto name = column_rows.GetValue(0, i).ToString();
 			auto expr = column_rows.GetValue(1, i).IsNull() ? string() : column_rows.GetValue(1, i).ToString();
 			items.push_back(expr.empty() ? acl_detail::Ident(name) : expr + " AS " + acl_detail::Ident(name));
+			if (!expr.empty() && source_columns.count(name)) {
+				masks.insert(name);
+			}
 		}
 	} catch (std::exception &) {
 		EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE", lifecycle, nullptr);
@@ -648,6 +661,15 @@ void PolicyStore::NoteDefinitionLineage(const string &vcat, const string &vname,
 			                        settings.max_edges, walk);
 		} catch (std::exception &) {
 			walked = false;
+		}
+	}
+	for (auto &output : walk.outputs) {
+		if (masks.count(output.name)) {
+			for (auto &source : output.sources) {
+				if (source.type == "DIRECT") {
+					source.masking = true;
+				}
+			}
 		}
 	}
 	EmitDefinitionLineage(*audit, *db, vcat, vname, form == "view" ? "VIEW" : "TABLE", lifecycle,
