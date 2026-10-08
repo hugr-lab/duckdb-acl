@@ -14,7 +14,7 @@
 # The fix. /GF- turns string pooling off for what clang-cl compiles, so its literals stay private to
 # each object and every pooled literal the link selects is an MSVC one. This file is included at the
 # top level before duckdb adds src/, so the option reaches duckdb's own objects, where the shared
-# alphabet lives.
+# alphabet lives. Upstream: duckdb/extension-ci-tools#430.
 if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     add_compile_options(/GF-)
 endif()

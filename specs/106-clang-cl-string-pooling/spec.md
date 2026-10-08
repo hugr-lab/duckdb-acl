@@ -41,7 +41,7 @@ platforms are untouched.
   so the option reaches duckdb's own objects, where the shared alphabet lives.
 - The cost is a little duplicated read-only data per object.
 - When extension-ci-tools builds the ports with the same compiler, or fixes this itself, the option
-  can go. The issue for extension-ci-tools is drafted with the evidence.
+  can go: duckdb/extension-ci-tools#430 has the evidence.
 
 ## Testing
 
