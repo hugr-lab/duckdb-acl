@@ -275,68 +275,6 @@ bool ParseAttachLineage(const string &text, ParserOptions &options, vector<uniqu
 	return true;
 }
 
-//! spec 114: `USE SCHEMA <name>[;]` as the one statement of the text -> `SET acl_use_schema = '<name>'`,
-//! which the rewriter reads as USE of that schema in the session's catalog. Any other text unchanged.
-string UseSchemaAsSet(const string &text) {
-	idx_t i = 0;
-	auto skip_space = [&]() {
-		while (i < text.size() && StringUtil::CharacterIsSpace(text[i])) {
-			i++;
-		}
-	};
-	auto word = [&](const char *expected) {
-		auto size = strlen(expected);
-		if (i + size > text.size() || !StringUtil::CIEquals(text.substr(i, size), expected)) {
-			return false;
-		}
-		if (i + size < text.size() && !StringUtil::CharacterIsSpace(text[i + size])) {
-			return false;
-		}
-		i += size;
-		return true;
-	};
-	skip_space();
-	if (!word("use")) {
-		return text;
-	}
-	skip_space();
-	if (!word("schema")) {
-		return text;
-	}
-	skip_space();
-	string name;
-	if (i < text.size() && text[i] == '"') {
-		for (i++; i < text.size(); i++) {
-			if (text[i] == '"' && i + 1 < text.size() && text[i + 1] == '"') {
-				name += '"';
-				i++;
-			} else if (text[i] == '"') {
-				break;
-			} else {
-				name += text[i];
-			}
-		}
-		if (i >= text.size()) {
-			return text;
-		}
-		i++;
-		name = "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
-	} else {
-		while (i < text.size() && (StringUtil::CharacterIsAlphaNumeric(text[i]) || text[i] == '_')) {
-			name += text[i++];
-		}
-	}
-	skip_space();
-	if (i < text.size() && text[i] == ';') {
-		i++;
-	}
-	skip_space();
-	if (name.empty() || i != text.size()) {
-		return text;
-	}
-	return "SET acl_use_schema = '" + StringUtil::Replace(name, "'", "''") + "'";
-}
-
 //! The principal a prefix stands for. A role is itself, a token is verified here, and a session is a
 //! handle a door already exchanged a token for (spec 040) - so this is the one place that turns any
 //! of the three into a principal, and the one place that refuses.
@@ -867,6 +805,10 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	RewriteStatements(statements, principal, options, store, &audit.trail);
 	for (idx_t i = 0; i < audit.trail.statements.size() && i < lineage_jobs.size(); i++) {
 		audit.trail.statements[i].lineage = lineage_jobs[i];
+		if (lineage_jobs[i]) {
+			lineage_jobs[i]->use_catalog = audit.trail.statements[i].use_catalog; // spec 114
+			lineage_jobs[i]->use_schema = audit.trail.statements[i].use_schema;
+		}
 	}
 	return ParserOverrideResult(std::move(statements));
 }
@@ -931,6 +873,83 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 }
 
 } // namespace
+
+//! spec 114: `USE SCHEMA <name>[;]` as the one statement of the text -> `SET acl_use_schema = '<name>'`,
+//! which the rewriter reads as USE of that schema in the session's catalog. Any other text unchanged.
+string UseSchemaAsSet(const string &text) {
+	idx_t i = 0;
+	auto skip_space = [&]() { // whitespace and comments, as the parser skips them
+		while (i < text.size()) {
+			if (StringUtil::CharacterIsSpace(text[i])) {
+				i++;
+			} else if (text.compare(i, 2, "--") == 0) {
+				auto end = text.find('\n', i);
+				i = end == string::npos ? text.size() : end + 1;
+			} else if (text.compare(i, 2, "/*") == 0) {
+				auto end = text.find("*/", i + 2);
+				if (end == string::npos) {
+					return; // unterminated: not ours to read
+				}
+				i = end + 2;
+			} else {
+				return;
+			}
+		}
+	};
+	auto word = [&](const char *expected) {
+		auto size = strlen(expected);
+		if (i + size > text.size() || !StringUtil::CIEquals(text.substr(i, size), expected)) {
+			return false;
+		}
+		if (i + size < text.size() && !StringUtil::CharacterIsSpace(text[i + size]) && text[i + size] != '-' &&
+		    text[i + size] != '/') {
+			return false;
+		}
+		i += size;
+		return true;
+	};
+	skip_space();
+	if (!word("use")) {
+		return text;
+	}
+	skip_space();
+	if (!word("schema")) {
+		return text;
+	}
+	skip_space();
+	string name;
+	if (i < text.size() && text[i] == '"') {
+		for (i++; i < text.size(); i++) {
+			if (text[i] == '"' && i + 1 < text.size() && text[i + 1] == '"') {
+				name += '"';
+				i++;
+			} else if (text[i] == '"') {
+				break;
+			} else {
+				name += text[i];
+			}
+		}
+		if (i >= text.size()) {
+			return text;
+		}
+		i++;
+		name = "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+	} else {
+		while (i < text.size() && (StringUtil::CharacterIsAlphaNumeric(text[i]) || text[i] == '_' ||
+		                           static_cast<unsigned char>(text[i]) >= 0x80)) {
+			name += text[i++];
+		}
+	}
+	skip_space();
+	if (i < text.size() && text[i] == ';') {
+		i++;
+	}
+	skip_space();
+	if (name.empty() || i != text.size()) {
+		return text;
+	}
+	return "SET acl_use_schema = '" + StringUtil::Replace(name, "'", "''") + "'";
+}
 
 void RegisterAclParser(DBConfig &config, shared_ptr<PolicyStore> store) {
 	ParserExtension extension;

@@ -110,6 +110,10 @@ struct LineageJob {
 	string door;
 	int64_t decision_seq = -1;
 	bool declared_read = false; // a SELECT under a parent: inputs only
+	//! spec 114: the session's USE when the statement was decided (empty = none) - its short names are
+	//! read in that catalog / schema, as the rewrite read them
+	string use_catalog;
+	string use_schema;
 	weak_ptr<LineageWorker> worker;
 };
 

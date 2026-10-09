@@ -173,10 +173,19 @@ public:
 		// re-parse rewrite templates with the native parser, never re-entering this override
 		template_options = options;
 		template_options.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
-		// spec 114: the catalog / schema the session chose with USE - read once per statement
-		if (principal.session_connection && !principal.session.empty()) {
+		// spec 114: the catalog / schema the session chose with USE - read once per batch; a door's ingest
+		// runs under the session too (only setting a USE needs the client's own connection)
+		if (!principal.session.empty()) {
 			session_id = principal.session; // the ops id
 			store.SessionUseOf(session_id, use_catalog, use_schema);
+		}
+	}
+
+	//! spec 114: the USE a statement is read under, for its lineage job (the worker runs later)
+	void NoteUseInForce(AuditTrail::Statement &entry) {
+		if (!use_catalog.empty() || !use_schema.empty()) {
+			entry.use_catalog = UseCatalog();
+			entry.use_schema = use_schema;
 		}
 	}
 
@@ -317,8 +326,9 @@ public:
 	//! anything on its way into a setting), and GLOBAL is never a principal's to set.
 	void RewriteSetStatement(SetStatement &stmt) {
 		auto &name = stmt.name.GetIdentifierName();
-		if (StringUtil::CIEquals(name, "schema") || StringUtil::CIEquals(name, "acl_use_schema")) {
-			RewriteUse(stmt); // spec 114: USE
+		if ((StringUtil::CIEquals(name, "schema") || StringUtil::CIEquals(name, "acl_use_schema")) &&
+		    (stmt.scope == SetScope::AUTOMATIC || stmt.scope == SetScope::SESSION)) {
+			RewriteUse(stmt); // spec 114: USE (a GLOBAL or a VARIABLE of that name stays refused below)
 			return;
 		}
 		if (stmt.scope == SetScope::VARIABLE || !ClientSettingAllowed(name)) {
@@ -543,7 +553,12 @@ private:
 		auto bare = info.GetQualifiedName().Name().GetIdentifierName();
 		Note(bare, "temp");
 		TablePolicy shadowed;
-		if (store.ResolveTable(principal, bare, shadowed)) {
+		// spec 114: and in the session's catalog, where a bare name is read after a USE
+		auto in_session = use_catalog.empty() && use_schema.empty()
+		                      ? string()
+		                      : UseCatalog() + (use_schema.empty() ? string() : "." + use_schema) + "." + bare;
+		if (store.ResolveTable(principal, bare, shadowed) ||
+		    (!in_session.empty() && store.ResolveTable(principal, in_session, shadowed))) {
 			Deny(Reason::DDL_HOME,
 			     "\"" + bare +
 			         "\" is a granted object of the catalog, so a temporary table of that name would be "
@@ -748,8 +763,9 @@ private:
 	//! schema of the session's catalog, which is refused rather than guessed (spec 113's rule).
 	string Key(const QualifiedName &name) {
 		auto key = VirtualKey(name);
-		if ((use_catalog.empty() && use_schema.empty()) || key.empty() || MetadataSurfaceOf(key)) {
-			return key;
+		if ((use_catalog.empty() && use_schema.empty()) || key.empty() || MetadataSurfaceOf(key) ||
+		    TempQualified(name)) {
+			return key; // `temp.…` is the session's own temp catalog, never a schema of a virtual one
 		}
 		auto catalog = UseCatalog();
 		if (catalog.empty()) {
@@ -762,12 +778,15 @@ private:
 			}
 		}
 		if (parts.size() >= 2 && HoldsCatalog(parts[0])) {
-			string vcat, path;
-			if (store.ResolveHeldSchema(principal, catalog + "." + parts[0], vcat, path) &&
-			    StringUtil::CIEquals(vcat, catalog)) {
-				Deny(Reason::DDL_HOME, "\"" + key + "\" is ambiguous - catalog \"" + parts[0] + "\" or schema \"" +
-				                           parts[0] + "\" of the session's catalog " + catalog +
-				                           "; write the catalog in front to mean the schema");
+			// the other reading: the whole path to the object as a schema of the session's catalog
+			string vcat, path, schema_path = catalog;
+			for (idx_t i = 0; i + 1 < parts.size(); i++) {
+				schema_path += "." + parts[i];
+			}
+			if (store.ResolveHeldSchema(principal, schema_path, vcat, path) && StringUtil::CIEquals(vcat, catalog)) {
+				Deny(Reason::NO_ACCESS, "\"" + key + "\" is ambiguous - catalog \"" + parts[0] + "\" or schema \"" +
+				                            parts[0] + "\" of the session's catalog " + catalog +
+				                            "; write the catalog in front to mean the schema");
 			}
 			return key;
 		}
@@ -777,9 +796,18 @@ private:
 		return catalog + "." + key;
 	}
 
+	//! The role's MAIN catalog, read once per batch (not per name)
+	string PrincipalMain() {
+		if (!main_loaded) {
+			main_catalog = store.PrincipalMainCatalog(principal);
+			main_loaded = true;
+		}
+		return main_catalog;
+	}
+
 	//! The session's catalog: the one it USEd, else the role's MAIN one
 	string UseCatalog() {
-		return use_catalog.empty() ? store.PrincipalMainCatalog(principal) : use_catalog;
+		return use_catalog.empty() ? PrincipalMain() : use_catalog;
 	}
 
 	bool HoldsCatalog(const string &name) {
@@ -851,11 +879,14 @@ private:
 			schema = path;
 		}
 		Note(schema.empty() ? catalog : catalog + "." + schema, "use");
-		if (schema.empty() && StringUtil::CIEquals(catalog, store.PrincipalMainCatalog(principal))) {
+		if (schema.empty() && StringUtil::CIEquals(catalog, PrincipalMain())) {
 			catalog.clear(); // back where the session began
 		}
 		drop_statement = true;
 		follow_ups.push_back(AclCall("acl_session_use", {Value(session_id), Value(catalog), Value(schema)}));
+		// the statements after it in the same batch read under it too
+		use_catalog = catalog;
+		use_schema = schema;
 	}
 
 	//! `a.b` / `"a.b".c` (what duckdb's USE transform renders) into its identifiers
@@ -910,8 +941,9 @@ private:
 	void RewriteCreateSchema(CreateInfo &info) {
 		RequireUndottedParts(info.GetQualifiedName());
 		auto written = VirtualKey(info.GetQualifiedName());
-		if (!use_catalog.empty() && written.find('.') == string::npos) {
-			written = use_catalog + "." + written; // spec 114: a bare schema name is the session catalog's
+		if (!use_catalog.empty() && !written.empty() &&
+		    (written.find('.') == string::npos || !HoldsCatalog(written.substr(0, written.find('.'))))) {
+			written = use_catalog + "." + written; // spec 114: a schema path is the session catalog's
 		}
 		string vcat, path;
 		if (written.empty() || !store.ResolveHeldSchema(principal, written, vcat, path)) {
@@ -1068,6 +1100,13 @@ private:
 		RequireUndottedParts(info.GetQualifiedName());
 		auto key = Key(info.GetQualifiedName());
 		DdlTarget target;
+		TablePolicy visible;
+		if (key != VirtualKey(info.GetQualifiedName()) && !store.ResolveTable(principal, key, visible) &&
+		    TryTempDrop(info)) {
+			// spec 114: a bare name the session's schema has no object for is the session's temp, as a read
+			// finds it - not a drop in the home the USE made the default
+			return;
+		}
 		if (!store.ResolveDdlTarget(principal, key, "drop", target)) {
 			// the session's own temp table drops natively, symmetric with how it resolves (spec 050)
 			if (TryTempDrop(info)) {
@@ -1828,8 +1867,11 @@ private:
 			     "SHOW VARIABLES is not available under ACL: session variables are not part of a "
 			     "principal's catalog");
 		}
+		// spec 114: under a USE a bare SHOW TABLES is the session's schema - the filtered listing below
+		auto bare_under_use =
+		    asked == "tables" && show.show_type != ShowType::SHOW_FROM && (!use_catalog.empty() || !use_schema.empty());
 		if (asked == "databases" || asked == "schemas" || asked == "__show_tables_expanded" ||
-		    (asked == "tables" && show.show_type != ShowType::SHOW_FROM)) {
+		    (asked == "tables" && show.show_type != ShowType::SHOW_FROM && !bare_under_use)) {
 			auto surface = asked == "databases"                ? "show_databases"
 			               : asked == "schemas"                ? "show_schemas"
 			               : asked == "__show_tables_expanded" ? "show_tables_expanded"
@@ -1866,7 +1908,13 @@ private:
 			filter = " WHERE table_schema = " + SqlLiteral(parts.back());
 			if (parts.size() > 1) {
 				filter += " AND table_catalog = " + SqlLiteral(parts[parts.size() - 2]);
+			} else if (!use_catalog.empty() || !use_schema.empty()) {
+				filter += " AND table_catalog = " + SqlLiteral(UseCatalog()); // spec 114: the session's catalog
 			}
+		} else if (!use_catalog.empty() || !use_schema.empty()) {
+			// spec 114: bare SHOW TABLES is the schema the session USEd, in its catalog
+			filter = " WHERE table_catalog = " + SqlLiteral(UseCatalog()) +
+			         " AND table_schema = " + SqlLiteral(use_schema.empty() ? string("main") : use_schema);
 		} else {
 			// bare SHOW TABLES is the current schema, which for a principal is the default one
 			filter = " WHERE table_schema = 'main'";
@@ -3378,8 +3426,8 @@ private:
 			vector<unique_ptr<ParsedExpression>> parts;
 			parts.push_back(ConstantExpression::String(schema));
 			expr = make_uniq<FunctionExpression>(Identifier("list_value"), std::move(parts));
-		} else if (!use_catalog.empty()) {
-			expr = ConstantExpression::String(use_catalog);
+		} else if (!use_catalog.empty() && HoldsCatalog(use_catalog)) {
+			expr = ConstantExpression::String(use_catalog); // a catalog since revoked is not claimed
 		} else {
 			expr = BuildCurrentDatabaseExpr();
 		}
@@ -3522,6 +3570,8 @@ private:
 	string session_id;
 	vector<string> held_catalogs;
 	bool held_loaded = false;
+	string main_catalog;
+	bool main_loaded = false;
 	PolicyStore &store;
 	//! the virtual name of the DML target currently being rewritten (for diagnostics and mapping)
 	string dml_target_name;
@@ -3704,6 +3754,7 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 			trail->statements.emplace_back();
 			trail->statements.back().statement = StringUtil::Lower(StatementTypeToString(stmt->type));
 			rewriter.trail = &trail->statements.back();
+			rewriter.NoteUseInForce(trail->statements.back());
 		}
 		auto started = std::chrono::steady_clock::now();
 		auto record_cost = [&]() {

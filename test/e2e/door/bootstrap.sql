@@ -36,6 +36,11 @@ ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
     RLS 'tenant = acl_claim(''tenant'')'
     COLUMNS 'id,tenant=acl_claim(''tenant''),amount';
 
+-- spec 114: a second catalog the role holds (not MAIN), for a client's USE through the door
+ACL ADMIN CREATE VIRTUAL CATALOG m;
+ACL ADMIN CREATE VIRTUAL VIEW m.hello AS 'SELECT 7 AS v';
+ACL ADMIN GRANT CATALOG m TO ROLE analyst WITH (select);
+
 -- A leg may publish a second object over another source (the cross-source join under load): run.sh
 -- renders the statements here, or nothing.
 ${ACL_E2E_EXTRA}

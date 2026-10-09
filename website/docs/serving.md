@@ -591,7 +591,13 @@ USE sales;             -- the role's MAIN catalog: back where the session began
 - It is kept on the session, so every door carries it: on Flight `USE` is a statement like any other
   (it runs at `GetFlightInfo`, so ADBC's unfetched `execute` keeps it); on quack a plain `USE` is the
   client's own catalog - send it to the node with `FROM quack_query_by_name('<alias>', 'USE mart')`.
-- `current_database()` / `current_schema()` answer the session's catalog and schema.
+- `current_database()` / `current_schema()` answer the session's catalog and schema; a bare `SHOW
+  TABLES` lists the session's schema. `information_schema.*` still lists every catalog you hold.
+- A `USE` in a batch applies to the statements after it; `USE SCHEMA s` must be a request of its own.
+  A `USE` is not undone by `ROLLBACK`.
+- A schema is `USE`d only when you hold a grant on it (`GRANT SCHEMA`); function names still resolve in
+  the MAIN catalog. Under `USE <catalog>.<schema alias>` a session temp table is `temp.main.<name>` -
+  the alias claims every bare name in it.
 
 ## Audit and metrics (spec 069)
 

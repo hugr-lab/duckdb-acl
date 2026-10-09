@@ -402,7 +402,12 @@ bool Resolve(PolicyStore &store, DatabaseInstance &db, const Principal &principa
 		Parser parser(ParserOptions::Builtin());
 		parser.ParseQuery("SELECT * FROM " + Quoted(relation.parts));
 		AuditTrail trail;
-		RewriteStatements(parser.statements, principal, ParserOptions::Builtin(), store, &trail);
+		// the name comes qualified as the decision read it (spec 114): the session's USE of now is not
+		// what this job ran under
+		auto plain = principal;
+		plain.session.clear();
+		plain.session_connection = false;
+		RewriteStatements(parser.statements, plain, ParserOptions::Builtin(), store, &trail);
 		// the object the name resolves to for this principal - what the rewrite above also resolved
 		TablePolicy policy;
 		if (!store.ResolveTable(principal, StringUtil::Join(relation.parts, "."), policy)) {
@@ -633,6 +638,33 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 	}
 	auto statement = job.statement->Copy();
 	auto statement_copy = job.statement->Copy(); // the planner consumes `statement`
+	// spec 114: a name as the session read it when the statement was decided - AclRewriter::Key's rule
+	vector<string> held;
+	bool held_loaded = false;
+	auto session_name = [&](NamedRelation relation) {
+		auto &parts = relation.parts;
+		if (job.use_catalog.empty() || parts.empty() || MetadataName(parts)) {
+			return relation;
+		}
+		if (!held_loaded) {
+			held = locked_store->PrincipalCatalogs(job.principal);
+			held_loaded = true;
+		}
+		if (parts.size() >= 2) {
+			for (auto &catalog : held) {
+				if (StringUtil::CIEquals(catalog, parts[0])) {
+					return relation; // a held catalog in front: as written
+				}
+			}
+		}
+		vector<string> qualified {job.use_catalog};
+		if (parts.size() == 1 && !job.use_schema.empty()) {
+			qualified.push_back(job.use_schema);
+		}
+		qualified.insert(qualified.end(), parts.begin(), parts.end());
+		parts = std::move(qualified);
+		return relation;
+	};
 	auto root = RootNode(*statement);
 	LineageWalk walk;
 	bool walked = false;
@@ -655,6 +687,9 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 			if (insert.node && !insert.node->table_ref) {
 				collector.relations.push_back(FromQualified(insert.node->qualified_name));
 			}
+		}
+		for (auto &relation : collector.relations) {
+			relation = session_name(relation);
 		}
 		// the scratch database: what the principal reads, as empty tables under the same names. No
 		// extension is loaded but the function sets a statement binds against - acl itself never: a
@@ -679,7 +714,8 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 		}
 		Connection scratch(scratch_db);
 		case_insensitive_set_t attached;
-		string default_catalog;
+		// the session's USE is the scratch's default too (spec 114), so its short names bind as they did
+		string default_catalog = job.use_catalog;
 		bool all_resolved = true;
 		for (auto &relation : collector.relations) {
 			Mirror mirror;
@@ -724,7 +760,16 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 			}
 		}
 		if (!default_catalog.empty()) {
-			scratch.Query("USE " + acl_detail::Ident(default_catalog));
+			if (!attached.count(default_catalog)) {
+				scratch.Query("ATTACH ':memory:' AS " + acl_detail::Ident(default_catalog));
+				attached.insert(default_catalog);
+			}
+			if (!job.use_schema.empty()) {
+				scratch.Query("CREATE SCHEMA IF NOT EXISTS " + Quoted({default_catalog, job.use_schema}));
+				scratch.Query("USE " + Quoted({default_catalog, job.use_schema}));
+			} else {
+				scratch.Query("USE " + acl_detail::Ident(default_catalog));
+			}
 		}
 		LineageWalkOptions options;
 		options.max_edges = settings.max_edges;
@@ -767,7 +812,7 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 			// an INSERT whose source does not bind here - a door's ingest reads the client's stream
 			// (arrow_scan, a quack drain) - still wrote its target: its fields, sources the client's
 			auto &insert = statement_copy->Cast<InsertStatement>();
-			auto target = FromQualified(insert.node->qualified_name);
+			auto target = session_name(FromQualified(insert.node->qualified_name));
 			auto placement_key =
 			    StringUtil::Lower(StringUtil::Join(ScratchPlacements(target, default_catalog)[0], "."));
 			auto found = mirrored.find(placement_key);
@@ -808,7 +853,8 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 			// are what the principal reads of it
 			auto &info = statement_copy->Cast<CreateStatement>().info->Cast<CreateTableInfo>();
 			Mirror created;
-			if (Resolve(*locked_store, *locked_db, job.principal, FromQualified(info.GetQualifiedName()), created)) {
+			if (Resolve(*locked_store, *locked_db, job.principal, session_name(FromQualified(info.GetQualifiedName())),
+			            created)) {
 				walk = LineageWalk();
 				walk.has_target = true;
 				walk.target = VirtualKey(created.vcat, string(), created.vname);
@@ -840,7 +886,7 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 		           info.Cast<AlterViewInfo>().alter_view_type == AlterViewType::RENAME_VIEW) {
 			renamed_to = info.Cast<RenameViewInfo>().new_view_name;
 		}
-		auto old_relation = FromQualified(info.GetQualifiedName());
+		auto old_relation = session_name(FromQualified(info.GetQualifiedName()));
 		auto new_relation = old_relation;
 		new_relation.parts.back() = renamed_to.GetIdentifierName();
 		// the record (if any) moves in the statement right after this one, so the new name is found the

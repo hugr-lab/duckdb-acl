@@ -25,7 +25,7 @@ catalog; `USE <vcat>.<schema>;` also sets its default schema.**
 
 1. **What it does.** On the principal's session, the named virtual catalog takes the MAIN catalog's
    part: short names (`orders`, `dbt_home.m`) resolve there - reads, writes, spec 113's DDL reading and
-   its ambiguity rule, `information_schema` / `SHOW TABLES` with no catalog. `USE` of the role's MAIN
+   its ambiguity rule, a bare `SHOW TABLES` (and `SHOW TABLES FROM <schema>`). `USE` of the role's MAIN
    catalog goes back.
    - **`USE <vcat>.<schema>`** also makes that schema the default: a bare name (`m`) resolves in it -
      as duckdb's own `USE db.schema` does, nowhere else (an object of the catalog's `main` is then
@@ -65,13 +65,17 @@ name refuse, as a written one would). Never on a shared connection.
 
 ## Testing
 
-- `test/sql/acl_session_catalog.test`: `USE` on an `ACL SESSION` principal - short names in the second
-  catalog, back to MAIN, `USE vcat.schema` - a bare name read and created in the schema, `main.x`
-  still reached, `USE vcat` resetting it, `USE SCHEMA s` in the current catalog; a catalog or schema not held refused, refused on a
-  per-statement prefix, the ambiguity rule against the session's catalog, the resolver cache not shared
-  across catalogs; `current_database()`.
-- Flight e2e: ADBC sends `USE`, a short name reads the second catalog.
-- quack: `USE` through `quack_query_by_name`.
+- `test/cpp/test_acl_session_use.cpp` (a handle is minted at runtime): `USE` on an `ACL SESSION`
+  principal - short names in the second catalog, back to MAIN, `USE vcat.schema` - a bare name read,
+  created, inserted into, viewed, renamed and dropped in the schema, `main.x` still reached, `USE vcat`
+  resetting it, `USE SCHEMA s` in the current catalog (comments around it too); `SHOW TABLES`; the
+  ambiguity rule against the session's catalog; quoted and differently cased names; a USE inside a
+  batch; another session's own; `SET GLOBAL|VARIABLE schema` still refused; temps under a USE; lineage
+  names under a USE (a batch's too); a revoked catalog; `current_database()`.
+- `test/sql/acl_session_use.test`: refusals on a per-statement prefix, `acl_session_use` is no
+  principal's.
+- Flight e2e: ADBC sends `USE SCHEMA` / `USE`, a bare CREATE lands in the schema and a bare read reads it.
+- quack: `USE m` through `quack_query_by_name`, a short name reads `m`, `USE c` goes back.
 
 ## Alternatives considered
 
@@ -90,9 +94,29 @@ name refuse, as a written one would). Never on a shared connection.
 - **Applied in the rewriter** (`AclRewriter::Key`): a short name is qualified with the session's
   catalog (and, for a bare name, its schema) before the resolver sees it, so the resolver, its caches
   and spec 113's DDL rules are untouched - a qualified name was already resolved in any catalog the
-  principal holds. Metadata surfaces stay as written. The same qualification serves reads, DML targets,
-  CREATE / DROP / RENAME and a bare `CREATE SCHEMA IF NOT EXISTS`. Not qualified: virtual table / scalar
-  function names (they still resolve in the role's MAIN catalog) - a follow-up if a client needs it.
+  principal holds. Metadata surfaces stay as written (`information_schema.*` lists every catalog the
+  principal holds, as before; a bare `SHOW TABLES` is the session's schema). `temp.…` stays the
+  session's temp catalog. The same qualification serves reads, DML targets (a door's ingest too - it
+  runs under the session), CREATE / DROP / RENAME and `CREATE SCHEMA` (a path whose first part is no
+  held catalog is the session catalog's). Not qualified: virtual table / scalar function names (they
+  still resolve in the role's MAIN catalog) - a follow-up if a client needs it.
+- **A USE inside a batch** applies to the statements after it (`USE mart; SELECT … FROM facts`), and
+  each statement's lineage job carries the USE it was read under (`AuditTrail::Statement::use_*`): the
+  worker qualifies the job's names by `Key`'s rule and binds the statement in a scratch that `USE`s the
+  same catalog / schema - the session's USE of the moment it runs is not what the statement ran under.
+  `USE SCHEMA s` is read only as a statement on its own (a request of its own); `USE <vcat>[.<s>]` is
+  duckdb's grammar and may stand in a batch. Only an automatic or `SESSION` scope is a USE: `SET GLOBAL
+  schema` / `SET VARIABLE schema` stay refused as before.
+- **Temps** (spec 050): `CREATE TEMP TABLE` is refused when the name is an object of the MAIN catalog or
+  of the session's schema (the anti-shadow rule); a bare DROP of a name the session's schema has no
+  object for is the temp's. A schema alias claims every name in it, so under `USE <vcat>.<alias>` a temp
+  created before is reached as `temp.main.<x>`.
+- **Not transactional**: a USE is the session's, like duckdb's own `USE`; a ROLLBACK does not undo it.
+- **A schema needs a schema grant to be USEd** (`role_schemas`, as `CREATE SCHEMA IF NOT EXISTS` reads
+  it); a catalog only reachable through schema grants cannot be `USE`d - refused, never widened. The
+  ambiguity rule weighs the same held schemas.
+- **JDBC**: a client `CREATE VIEW` / `ALTER` / `DROP` prepared through Flight is now announced with an
+  empty dataset schema (it runs at GetFlightInfo), so JDBC takes its update path for it.
 - **`USE SCHEMA s`** is compiled by the parser override into `SET acl_use_schema = 's'` (duckdb has no
   such grammar); duckdb's `USE x[.y]` is its own `SET schema = '…'`. Both go to `RewriteUse`.
 - **Flight**: a client statement that is a command (`SET`/`USE`, `CREATE`, `DROP`, `ALTER`) runs at

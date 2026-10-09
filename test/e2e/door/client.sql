@@ -34,6 +34,8 @@ SELECT 'seen_after' AS label, count(*) AS n,
 FROM remote.main.orders;
 
 -- spec 114: a quack client's own USE is its local catalog; the node's is set through quack_query_by_name
--- and kept on this client's session
-FROM quack_query_by_name('remote', 'USE SCHEMA main');
-SELECT 'use' AS label, * FROM quack_query_by_name('remote', 'SELECT current_database() || ''.'' || current_schema()');
+-- and kept on this client's session - a short name then reads the catalog it chose
+FROM quack_query_by_name('remote', 'USE m');
+SELECT 'use' AS label, * FROM quack_query_by_name('remote', 'SELECT current_database() || ''.'' || v FROM hello');
+FROM quack_query_by_name('remote', 'USE c');
+SELECT 'use_back' AS label, * FROM quack_query_by_name('remote', 'SELECT current_database()');

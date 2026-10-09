@@ -40,6 +40,7 @@
 #include "acl_node_load.hpp"
 #include "oidc_core.hpp"
 #include "acl_profile.hpp"
+#include "acl_parser_override.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/enums/result_eagerness.hpp"
@@ -1948,7 +1949,7 @@ public:
 	static bool ClientStatementIsCommand(const string &query) {
 		try {
 			Parser parser(ParserOptions::Builtin());
-			parser.ParseQuery(UseSchemaClientText(query));
+			parser.ParseQuery(UseSchemaAsSet(query)); // `USE SCHEMA s` is the SET it compiles to
 			if (parser.statements.size() != 1) {
 				return false;
 			}
@@ -1967,16 +1968,6 @@ public:
 		} catch (std::exception &) {
 			return false;
 		}
-	}
-
-	//! `USE SCHEMA s` is no duckdb grammar - read as the SET it compiles to (the override's spec 114 form)
-	static string UseSchemaClientText(const string &query) {
-		auto text = query;
-		StringUtil::Trim(text);
-		if (StringUtil::StartsWith(StringUtil::Lower(text), "use schema ")) {
-			return "SET acl_use_schema = 'x'";
-		}
-		return query;
 	}
 
 	static bool AnswersOnlyCount(const FlightDoorState::Reservation &reservation) {

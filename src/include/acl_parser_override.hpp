@@ -16,5 +16,9 @@ namespace acl {
 //! Register the ACL parser override on the database config, carrying the shared policy store
 void RegisterAclParser(DBConfig &config, shared_ptr<PolicyStore> store);
 
+//! spec 114: `USE SCHEMA <name>[;]` as the one statement of the text -> `SET acl_use_schema = '<name>'`
+//! (no duckdb grammar has it); any other text unchanged. The override and the Flight door read it alike.
+string UseSchemaAsSet(const string &text);
+
 } // namespace acl
 } // namespace duckdb

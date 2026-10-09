@@ -606,8 +606,11 @@ it to `SET acl_use_schema`) on a session of the client's own (`ACL SESSION`) set
 schema - kept on the session record by the follow-up `acl_session_use(<ops id>, …)`, applied by
 `AclRewriter::Key` qualifying short names (the resolver and its caches untouched; a held catalog in
 front wins, ambiguous with a schema of the session's catalog = refused); `current_database()` /
-`current_schema()` answer them. On Flight a client command (SET/USE/CREATE/DROP/ALTER) runs at
-GetFlightInfo (`ClientStatementIsCommand`) whatever the rewrite made of it.
+`current_schema()` and a bare `SHOW TABLES` answer them. A USE applies to the rest of its batch; each
+statement's lineage job carries the USE it was read under (`AuditTrail::Statement::use_*`, qualified by
+the worker and `USE`d in its scratch); an ingest reads it too. On Flight a client command
+(SET/USE/CREATE/DROP/ALTER) runs at GetFlightInfo (`ClientStatementIsCommand`) whatever the rewrite
+made of it.
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
