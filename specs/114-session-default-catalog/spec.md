@@ -48,6 +48,9 @@ catalog; `USE <vcat>.<schema>;` also sets its default schema.**
 5. **`current_database()` / `current_schema()`** under a principal answer the session's virtual catalog and schema (today the node's
    own, which names nothing a principal can use).
 
+Going back: `USE SCHEMA main` returns the default schema to the catalog's root; `USE <vcat>` (no
+schema) does that too, and `USE <the role's MAIN catalog>` returns the session to where it began.
+
 A catalog has no default schema of its own (owner, 2026-10-09): its root - the objects stored under a
 bare name, called `main` - is the default; a session picks another with `USE SCHEMA`.
 
