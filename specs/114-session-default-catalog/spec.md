@@ -1,6 +1,6 @@
 # Spec 114: the session's default catalog
 
-- **Status**: draft
+- **Status**: accepted (owner, 2026-10-09)
 - **Date**: 2026-10-09
 - **Follows**: spec 113 (DDL names; its "Next" section), spec 068 (client-local settings), spec 050 (a
   Flight session is a connection)
@@ -47,6 +47,9 @@ catalog; `USE <vcat>.<schema>;` also sets its default schema.**
    the resolver; caches keyed by the principal's roles are keyed by it too.
 5. **`current_database()` / `current_schema()`** under a principal answer the session's virtual catalog and schema (today the node's
    own, which names nothing a principal can use).
+
+A catalog has no default schema of its own (owner, 2026-10-09): its root - the objects stored under a
+bare name, called `main` - is the default; a session picks another with `USE SCHEMA`.
 
 Not in this spec: JDBC `setCatalog` / ADBC's catalog option (Flight session options) -
 a client sends `USE` instead.
