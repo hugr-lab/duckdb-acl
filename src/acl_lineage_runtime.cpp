@@ -13,6 +13,7 @@
 // for one job; nothing the principal wrote is executed anywhere. All of it runs on the worker's
 // thread, after the statement's own execution ended: the statement never waits on lineage.
 #include "acl_lineage.hpp"
+#include "acl_attach_lineage.hpp"
 
 #include "acl_audit_pipeline.hpp"
 #include "acl_policy.hpp"
@@ -995,6 +996,7 @@ void CapturePhysical(OptimizerExtensionInput &input, unique_ptr<LogicalOperator>
 				}
 			}
 			captured->source_type = StringUtil::Lower(type);
+			captured->declared_identity = AttachLineageIdentity(input.context.GetCurrentQuery());
 			captured->namespace_event = true;
 			captured->lifecycle = "CREATE";
 			break;
@@ -1049,6 +1051,11 @@ void EmitPhysicalLineage(const PhysicalLineage &captured, AuditPipeline &pipelin
 		lineage->event_type = "NAMESPACE";
 		AuditLineageDataset source;
 		source.ns = settings.ns + "/source/" + captured.object.catalog;
+		string identity_ns, identity_name;
+		if (LineageSourceNameFor(db, captured.object.catalog, string(), string(), identity_ns, identity_name,
+		                         captured.declared_identity)) {
+			source.ns = identity_ns; // spec 112 §9: the source's own name, from its provider or its operator
+		}
 		source.dataset_type = StringUtil::Upper(captured.source_type.empty() ? string("source") : captured.source_type);
 		source.physical = true;
 		source.lifecycle = captured.lifecycle;

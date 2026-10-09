@@ -795,6 +795,10 @@ unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
 				}
 			}
 		}
+		string lineage; // spec 112 §9: the name the source is known by, declared where it is attached
+		if (s.Accept("lineage")) {
+			lineage = s.Quoted("the source's lineage identity");
+		}
 		string deps;
 		if (s.Accept("depends")) {
 			s.Expect("on");
@@ -813,9 +817,9 @@ unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
 		for (auto &option : options) {
 			json.push_back(JsonQuote(option.first) + ": " + JsonQuote(option.second));
 		}
-		return MakeAdminCall("acl_cluster_attach",
-		                     {Value(scope), Value(alias), Value(path), Value(type), Value(secret),
-		                      Value("{" + StringUtil::Join(json, ", ") + "}"), Value(deps), Value(note)});
+		return MakeAdminCall("acl_cluster_attach", {Value(scope), Value(alias), Value(path), Value(type), Value(secret),
+		                                            Value("{" + StringUtil::Join(json, ", ") + "}"), Value(deps),
+		                                            Value(note), Value(lineage)});
 	}
 	if (verb == "detach") {
 		auto alias = s.Name("the source's alias");

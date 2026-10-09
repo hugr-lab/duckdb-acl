@@ -45,11 +45,41 @@ SELECT count(*) FROM acl_lineage_events();
 ----
 0
 
+query T
+SELECT acl_lineage_status();
+----
+off
+
 statement ok
 SET GLOBAL acl_lineage_level = 'on';
 
+# spec 112: no namespace, no lineage - nothing guessed for the operator, the status says what is missing
+query T
+SELECT acl_lineage_status() LIKE 'no namespace:%';
+----
+true
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.unnamed AS phys.main.customers;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query I
+SELECT count(*) FROM acl_lineage_events();
+----
+0
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c.unnamed;
+
 statement ok
 SET GLOBAL acl_lineage_namespace = 'acl://test';
+
+query T
+SELECT acl_lineage_status();
+----
+on
 
 # --- a table with declared columns: identity, a computed column, a mask, the predicate as a filter --------
 
@@ -65,7 +95,7 @@ SELECT event_type, payload->'datasets'->(payload->'outputs'->>0)::INT->>'name',
     payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle'
 FROM acl_lineage_events() ORDER BY seq DESC LIMIT 1;
 ----
-DATASET	orders	CREATE
+DATASET	c.main.orders	CREATE
 
 # the target's namespace is the virtual catalog's, its sources the attached source's
 query TT
@@ -73,7 +103,7 @@ SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'namespace',
     payload->'datasets'->(payload->'inputs'->>0)::INT->>'namespace'
 FROM acl_lineage_events() ORDER BY seq DESC LIMIT 1;
 ----
-acl://test/c	acl://test/source/phys
+acl://test	acl://test/source/phys
 
 # the edges: id as it is, total transformed from amount, the mask has no source, the predicate filters
 query TTTT
@@ -251,7 +281,7 @@ SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'namespace',
     payload->'datasets'->(payload->'outputs'->>0)::INT->>'name'
 FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
 ----
-acl://test/c	sink
+acl://test	c.main.sink
 
 query TTTT
 SELECT e->>'target_field', (payload->'datasets'->(e->>'source')::INT->>'name') || '.' || (e->>'source_field'),
@@ -260,10 +290,10 @@ FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM 
       WHERE seq > (SELECT seq FROM before))
 ORDER BY 1, 2;
 ----
-(empty)	src.total	INDIRECT	FILTER
-a	src.id	DIRECT	IDENTITY
-b	src.ssn	DIRECT	TRANSFORMATION
-b	src.total	DIRECT	TRANSFORMATION
+(empty)	c.main.src.total	INDIRECT	FILTER
+a	c.main.src.id	DIRECT	IDENTITY
+b	c.main.src.ssn	DIRECT	TRANSFORMATION
+b	c.main.src.total	DIRECT	TRANSFORMATION
 
 query I
 SELECT count(*) FROM acl_lineage_events(), unnest(from_json(payload->'datasets', '["JSON"]')) AS t(d)
@@ -311,8 +341,8 @@ FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM 
       WHERE seq > (SELECT seq FROM before))
 ORDER BY 1, 2;
 ----
-(empty)	sink.a	INDIRECT	FILTER
-b	sink.b	DIRECT	TRANSFORMATION
+(empty)	c.main.sink.a	INDIRECT	FILTER
+b	c.main.sink.b	DIRECT	TRANSFORMATION
 
 # --- the SQL facet: off by default; normalized, it carries no literal --------------------------------------
 
@@ -433,7 +463,7 @@ SELECT t->>'key', coalesce(t->>'field', '-'), t->>'value'
 FROM (SELECT unnest(from_json(payload->'datasets'->(payload->'outputs'->>0)::INT->'tags', '["JSON"]')) AS t
       FROM acl_lineage_events()
       WHERE seq = (SELECT max(seq) FROM acl_lineage_events()
-                   WHERE (payload->'datasets'->(payload->'outputs'->>0)::INT->>'name') = 'people'))
+                   WHERE (payload->'datasets'->(payload->'outputs'->>0)::INT->>'name') = 'c.main.people'))
 WHERE (t->>'key') = 'acl.role.clerk'
 ORDER BY 2;
 ----
@@ -448,7 +478,7 @@ query T
 SELECT coalesce(payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle', '-')
 FROM acl_lineage_events()
 WHERE seq = (SELECT max(seq) FROM acl_lineage_events()
-             WHERE (payload->'datasets'->(payload->'outputs'->>0)::INT->>'name') = 'people');
+             WHERE (payload->'datasets'->(payload->'outputs'->>0)::INT->>'name') = 'c.main.people');
 ----
 -
 
@@ -469,6 +499,255 @@ FROM acl_lineage_events() WHERE event_type = 'NAMESPACE' ORDER BY seq DESC LIMIT
 ----
 acl://test/source/warehouse	DUCKDB	DROP
 acl://test/source/warehouse	DUCKDB	CREATE
+
+# === spec 112 §9: a source's identity - the name everyone else knows it by ==============================
+
+statement ok
+ATTACH ':memory:' AS dwh;
+
+statement ok
+CREATE TABLE dwh.main.facts(id INTEGER, v DOUBLE);
+
+statement ok
+SELECT acl_lineage_source('dwh', 'postgres://db.corp:5432/analytics');
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.facts AS dwh.main.facts;
+
+statement ok
+SELECT acl_lineage_flush();
+
+# the source dataset is named as the source's own (OpenLineage's postgres naming), not by the alias
+query TT
+SELECT payload->'datasets'->(payload->'inputs'->>0)::INT->>'namespace',
+    payload->'datasets'->(payload->'inputs'->>0)::INT->>'name'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'DATASET';
+----
+postgres://db.corp:5432	analytics.main.facts
+
+# an identity is a name, never a credential; and it describes an attached database
+statement error
+SELECT acl_lineage_source('dwh', 'postgres://u:secret@db.corp:5432/analytics');
+----
+never a credential
+
+statement error
+SELECT acl_lineage_source('dwh', 'db.corp');
+----
+<scheme>://
+
+statement error
+SELECT acl_lineage_source('system', 'postgres://db.corp:5432/x');
+----
+no attached source
+
+# a DETACH ends it: the same alias attached again is named by its alias until declared again
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c.facts;
+
+statement ok
+DETACH dwh;
+
+statement ok
+ATTACH ':memory:' AS dwh;
+
+statement ok
+CREATE TABLE dwh.main.facts(id INTEGER, v DOUBLE);
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.facts AS dwh.main.facts;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TT
+SELECT payload->'datasets'->(payload->'inputs'->>0)::INT->>'namespace',
+    payload->'datasets'->(payload->'inputs'->>0)::INT->>'name'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'DATASET';
+----
+acl://test/source/dwh	main.facts
+
+# declared before its ATTACH (a bootstrap's order is its own): it names the attachment it meets
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c.facts;
+
+statement ok
+DETACH dwh;
+
+statement ok
+SELECT acl_lineage_source('dwh', 'postgres://db.corp:5432/analytics');
+
+statement ok
+ATTACH ':memory:' AS dwh;
+
+statement ok
+CREATE TABLE dwh.main.facts(id INTEGER, v DOUBLE);
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.facts AS dwh.main.facts;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TT
+SELECT payload->'datasets'->(payload->'inputs'->>0)::INT->>'namespace',
+    payload->'datasets'->(payload->'inputs'->>0)::INT->>'name'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'DATASET';
+----
+postgres://db.corp:5432	analytics.main.facts
+
+# NULL clears a declaration
+query T
+SELECT acl_lineage_source('dwh', NULL);
+----
+(empty)
+
+statement ok
+SELECT acl_lineage_resend('c');
+
+statement ok
+SELECT acl_lineage_flush();
+
+query T
+SELECT payload->'datasets'->(payload->'inputs'->>0)::INT->>'namespace'
+FROM acl_lineage_events() WHERE event_type = 'DATASET'
+    AND (payload->'datasets'->(payload->'outputs'->>0)::INT->>'name') = 'c.main.facts' ORDER BY seq DESC LIMIT 1;
+----
+acl://test/source/dwh
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c.facts;
+
+statement ok
+DETACH dwh;
+
+# --- ATTACH … LINEAGE '<identity>': the same, written where the source is attached ---------------------
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ATTACH ':memory:' AS mart (READ_ONLY false) LINEAGE 'mysql://mart.corp:3306/sales';
+
+statement ok
+SELECT acl_lineage_flush();
+
+# the NAMESPACE event of the ATTACH already names the source as itself
+query TT
+SELECT payload->'datasets'->0->>'namespace', payload->'datasets'->0->>'lifecycle'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'NAMESPACE';
+----
+mysql://mart.corp:3306	CREATE
+
+statement ok
+DETACH mart;
+
+# a failed ATTACH declares nothing: the call after it never runs
+statement error
+ATTACH 'no/such/dir/x.db' AS lost LINEAGE 'postgres://lost:5432';
+----
+
+statement ok
+ATTACH ':memory:' AS lost;
+
+statement ok
+CREATE TABLE lost.main.t(i INTEGER);
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.lost AS lost.main.t;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query T
+SELECT payload->'datasets'->(payload->'inputs'->>0)::INT->>'namespace'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'DATASET';
+----
+acl://test/source/lost
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c.lost;
+
+statement ok
+DETACH lost;
+
+# the marker names the alias it describes, ends an ATTACH, and is a literal; a batch keeps its order
+statement error
+ATTACH ':memory:' LINEAGE 'postgres://x:5432';
+----
+write AS <alias>
+
+statement error
+SELECT 1 LINEAGE 'postgres://x:5432';
+----
+
+statement ok
+ATTACH ':memory:' AS m1 LINEAGE 'postgres://m1:5432'; CREATE TABLE m1.main.t AS SELECT 1 AS i;
+
+query I
+SELECT count(*) FROM m1.main.t;
+----
+1
+
+statement ok
+DETACH m1;
+
+# a word in a literal or a comment is no marker
+query T
+SELECT 'ATTACH x LINEAGE ''y''' -- LINEAGE 'z'
+;
+----
+ATTACH x LINEAGE 'y'
+
+# under ACL NATIVE (passthrough) the same sugar
+statement ok
+ACL ADMIN ACL NATIVE ATTACH ':memory:' AS m2 LINEAGE 'postgres://m2:5432';
+
+query T
+SELECT acl_lineage_source('m2', 'postgres://m2:5432/other');
+----
+postgres://m2:5432/other
+
+statement ok
+DETACH m2;
+
+# a principal neither declares an identity nor reads the status: acl_* is the never set
+statement error
+ACL ROLE "w" SELECT acl_lineage_source('phys', 'postgres://x:5432');
+----
+acl_lineage_source
+
+statement error
+ACL ROLE "w" SELECT acl_lineage_status();
+----
+acl_lineage_status
 
 # === the client's context: a step of an external job (OPENLINEAGE_PARENT_ID's format) ====================
 
@@ -513,7 +792,7 @@ SELECT event_type, payload->'datasets'->(payload->'inputs'->>0)::INT->>'name',
     json_array_length(payload->'outputs'), json_array_length(payload->'edges')
 FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
 ----
-RUN_COMPLETE	src	0	0
+RUN_COMPLETE	c.main.src	0	0
 
 # each marker once, and the value quoted
 statement error
@@ -650,7 +929,7 @@ SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'name',
     payload->>'approximate'
 FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'RUN_COMPLETE';
 ----
-sink	[a, b]	false
+c.main.sink	[a, b]	false
 
 # --- a name written with its catalog binds in the scratch mirror as it did on the node ----------------------
 
@@ -676,8 +955,8 @@ FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM 
       WHERE seq > (SELECT seq FROM before))
 ORDER BY 1, 2;
 ----
-a	src.id	sink	false
-b	src.ssn	sink	false
+a	c.main.src.id	c.main.sink	false
+b	c.main.src.ssn	c.main.sink	false
 
 # --- MERGE: the INSERT branch writes its fields too (the binder leaves its column map empty) ---------------
 
@@ -711,8 +990,8 @@ FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM 
 WHERE e->>'type' = 'DIRECT'
 ORDER BY 1, 2;
 ----
-a	src.id	DIRECT
-b	src.ssn	DIRECT
+a	c.main.src.id	DIRECT
+b	c.main.src.ssn	DIRECT
 
 # --- DELETE: the target, its filter ----------------------------------------------------------------------
 
@@ -736,7 +1015,7 @@ SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'name', e->>'source_
 FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
       WHERE seq > (SELECT seq FROM before));
 ----
-sink	a	FILTER
+c.main.sink	a	FILTER
 
 # --- a field read from an unnested list is the list's element: items[].price ------------------------------
 

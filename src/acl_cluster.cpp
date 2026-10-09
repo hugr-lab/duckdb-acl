@@ -7,6 +7,7 @@
 #include "acl_cluster.hpp"
 
 #include "acl_door_common.hpp"
+#include "acl_lineage.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_result_rows.hpp"
 
@@ -263,9 +264,10 @@ bool NodeHasDatabase(DatabaseInstance &db, const string &alias) {
 	return result->RowCount() > 0;
 }
 
-//! The ATTACH this item stands for, as the node runs it
+//! The ATTACH this item stands for, as the node runs it (spec 112 §9: LINEAGE names the source, the
+//! parser override's sugar declares it)
 string AttachStatement(const string &alias, const string &path, const string &type, const string &secret,
-                       const vector<std::pair<string, string>> &options) {
+                       const vector<std::pair<string, string>> &options, const string &lineage) {
 	vector<string> parts;
 	if (!type.empty()) {
 		parts.push_back("TYPE " + type);
@@ -281,7 +283,8 @@ string AttachStatement(const string &alias, const string &path, const string &ty
 		}
 	}
 	return "ATTACH " + Quoted(path) + " AS " + Ident(alias) +
-	       (parts.empty() ? string() : " (" + StringUtil::Join(parts, ", ") + ")");
+	       (parts.empty() ? string() : " (" + StringUtil::Join(parts, ", ") + ")") +
+	       (lineage.empty() ? string() : " LINEAGE " + Quoted(lineage));
 }
 
 void RequireClusterCatalog(const unique_ptr<CatalogBackend> &catalog, const char *what) {
@@ -459,7 +462,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
 PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const string &alias, const string &path,
                                                       const string &type, const string &secret,
                                                       const string &options_json, const vector<string> &depends_on,
-                                                      const string &comment) {
+                                                      const string &comment, const string &lineage) {
 	RequireClusterCatalog(catalog, "acl_cluster_attach");
 	auto db = instance.lock();
 	if (!db) {
@@ -480,6 +483,10 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 		RequireIdentifier(option.first, "an ATTACH option");
 		LintKey(option.first, "the source's options");
 	}
+	if (!lineage.empty() && (lineage.find("://") == string::npos || !LineageIdentityClean(lineage))) {
+		throw BinderException("acl cluster: LINEAGE names the source as others know it, "
+		                      "<scheme>://<host:port>[/<database>] - never a credential (no user:password@)");
+	}
 	if (secret.empty() && TYPES_NEEDING_SECRET.count(type)) {
 		throw BinderException("acl cluster: a %s source connects with a credential - name the secret that holds it: "
 		                      "(TYPE %s, SECRET <name>)",
@@ -487,7 +494,8 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 	}
 	auto spec = "{" + JsonQuote("type") + ": " + JsonQuote(type) + ", " + JsonQuote("path") + ": " + JsonQuote(path) +
 	            ", " + JsonQuote("secret") + ": " + JsonQuote(secret) + ", " + JsonQuote("options") + ": " +
-	            JsonObjectOf(options) + "}";
+	            JsonObjectOf(options) +
+	            (lineage.empty() ? string() : ", " + JsonQuote("lineage") + ": " + JsonQuote(lineage)) + "}";
 	ClusterAnswer answer;
 	bool repoint = false;
 	// a group's source named like a cluster's overrides it on the group's nodes: there it is a re-point
@@ -562,9 +570,13 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 		    }
 		    if (NodeHasDatabase(*db, alias)) {
 			    answer.note = "\"" + alias + "\" is already attached on this node - the profile now describes it";
+			    if (!lineage.empty()) {
+				    NodeQuery(*db, "SELECT acl_lineage_source(" + Quoted(alias) + ", " + Quoted(lineage) + ")");
+				    answer.note += "; its lineage identity is declared";
+			    }
 			    return;
 		    }
-		    NodeQuery(*db, AttachStatement(alias, path, type, secret, options));
+		    NodeQuery(*db, AttachStatement(alias, path, type, secret, options, lineage));
 		    answer.applied_here = true;
 	    });
 	return answer;
@@ -966,7 +978,7 @@ void ClusterExtensionFunc(DataChunk &args, ExpressionState &state, Vector &resul
 	});
 }
 
-//! acl_cluster_attach(scope, alias, path, type, secret, options_json, depends_on_csv, comment)
+//! acl_cluster_attach(scope, alias, path, type, secret, options_json, depends_on_csv, comment[, lineage])
 void ClusterAttachFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	EachRow(args, result, [&](idx_t row) {
 		vector<string> deps;
@@ -978,7 +990,8 @@ void ClusterAttachFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			}
 		}
 		return StoreOf(state).ClusterAttach(Arg(args, 0, row), Arg(args, 1, row), Arg(args, 2, row), Arg(args, 3, row),
-		                                    Arg(args, 4, row), Arg(args, 5, row), deps, Arg(args, 7, row));
+		                                    Arg(args, 4, row), Arg(args, 5, row), deps, Arg(args, 7, row),
+		                                    args.ColumnCount() > 8 ? Arg(args, 8, row) : string());
 	});
 }
 
@@ -1111,6 +1124,7 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	};
 	scalar("acl_cluster_extension", {v, v, v, v, v, v}, ClusterExtensionFunc, AnswerType());
 	scalar("acl_cluster_attach", {v, v, v, v, v, v, v, v}, ClusterAttachFunc, AnswerType());
+	scalar("acl_cluster_attach", {v, v, v, v, v, v, v, v, v}, ClusterAttachFunc, AnswerType());
 	scalar("acl_cluster_detach", {v, v, v, v}, ClusterDetachFunc, AnswerType());
 	scalar("acl_cluster_setting", {v, v, v, v}, ClusterSettingFunc, AnswerType());
 	scalar("acl_cluster_version", {}, ClusterVersionFunc, LogicalType::BIGINT);

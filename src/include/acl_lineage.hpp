@@ -31,14 +31,30 @@ class LineageWorker;
 
 //! The node's lineage settings (all GLOBAL, all cluster-profile items), read where an event is made.
 struct LineageSettings {
-	bool on = false;            // acl_lineage_level = on
-	string ns;                  // acl_lineage_namespace, or acl://<acl_node_group | default>
+	//! acl_lineage_level = on AND a namespace is set (spec 112: no namespace, no lineage - the switch)
+	bool on = false;
+	string ns;                  // acl_lineage_namespace: the cluster's (a cluster-profile item); no default
 	string identity = "client"; // acl_lineage_identity: none / client / subject
 	bool sql = false;           // acl_lineage_sql = normalized
 	bool physical = true;       // acl_lineage_physical
 	idx_t max_edges = 4096;     // acl_lineage_max_edges
+	//! spec 112 §9: the instance the settings were read from - where a physical source's name is
+	//! asked (the provider registry, the declared identities); valid while the reader holds it
+	optional_ptr<DatabaseInstance> db;
 	static LineageSettings Read(DatabaseInstance &db);
 };
+
+//! spec 112: why lineage is or is not sent - `on`, `off`, or `no namespace: …`
+string LineageStatus(DatabaseInstance &db);
+
+//! spec 112 §9: a physical dataset's name from its source's identity - a provider of the
+//! acl_lineage_sources registry (hugr_node), then the identity the operator declared
+//! (acl_lineage_source / ATTACH … LINEAGE); false = neither, the alias form stands. `schema` and
+//! `name` empty ask about the catalog itself (its namespace).
+bool LineageSourceNameFor(DatabaseInstance &db, const string &catalog, const string &schema, const string &name,
+                          string &out_ns, string &out_name, const string &declared = string());
+//! An identity has no userinfo (`user:pass@`): it is a name, never a credential.
+bool LineageIdentityClean(const string &identity);
 
 //! The client's lineage context of one statement: the job and the external run it is a step of.
 struct LineageContext {
@@ -126,6 +142,9 @@ struct PhysicalLineage {
 	//! ATTACH / DETACH (and the cluster items that run them): a source's namespace, its type
 	bool namespace_event = false;
 	string source_type;
+	//! spec 112 §9: the identity an `ATTACH … LINEAGE '<x>'` declares - its own NAMESPACE event is
+	//! named by it already (the declaring call runs after the ATTACH)
+	string declared_identity;
 	Principal principal; // `ACL NATIVE`'s principal; empty for the node's operator
 	string door;
 };
