@@ -58,6 +58,23 @@ void SetPhysicalLineage(ClientContext &context, shared_ptr<PhysicalLineage> line
 //! spec 107: the running statement is a PREPARE - no execution, so no run at its QueryEnd.
 void MarkPreparing(ClientContext &context);
 
+//! spec 112 §2: a door executing one prepared statement over a batch of parameter rows (Flight's
+//! DoPut) - every execution inside the scope counts towards ONE run, handed on at the scope's end,
+//! RUN_FAIL if any execution failed. A scope that executed nothing hands nothing on.
+void LineageBatchBegin(ClientContext &context);
+//! spec 112: a door around its own Connection::Prepare - that is no execution, so no run (a SQL
+//! `PREPARE` the hook sees; the door's Prepare it does not)
+struct LineagePrepareScope {
+	explicit LineagePrepareScope(ClientContext &context);
+	~LineagePrepareScope();
+	LineagePrepareScope(const LineagePrepareScope &) = delete;
+	LineagePrepareScope &operator=(const LineagePrepareScope &) = delete;
+
+private:
+	ClientContext &context;
+};
+void LineageBatchEnd(ClientContext &context);
+
 //! The hash a note and an execution are matched by; never the text.
 uint64_t StatementTextHash(const string &text);
 

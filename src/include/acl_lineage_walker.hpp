@@ -20,6 +20,7 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/types.hpp"
 
 #include <functional>
 
@@ -57,6 +58,8 @@ struct LineageContribution {
 //! A target field and what it is made of.
 struct LineageOutput {
 	string name;
+	//! spec 112 §7: the field's type as the walked plan has it (INVALID = unknown)
+	LogicalType type = LogicalType::INVALID;
 	vector<LineageContribution> sources;
 };
 

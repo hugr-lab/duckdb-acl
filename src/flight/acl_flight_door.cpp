@@ -1194,7 +1194,10 @@ public:
 				auto execution = state->LockForStatement(*reservation->conn);
 				ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, command.transaction_id));
 				TempScanScope temp_scan(reservation->conn->con->context.get());
-				reservation->stmt = reservation->conn->con->Prepare(prefixed);
+				{
+					LineagePrepareScope preparing(*reservation->conn->con->context);
+					reservation->stmt = reservation->conn->con->Prepare(prefixed);
+				}
 				ProfileOfPrepare(*reservation);
 			}
 			if (reservation->stmt->HasError()) {
@@ -1272,7 +1275,11 @@ public:
 			ARROW_RETURN_NOT_OK(ValidateTxnLocked(*conn, command.transaction_id));
 			TempScanScope temp_scan(conn->con->context.get());
 			ArmProfile(handle, *conn, nullptr, traceparent); // the Prepare's note serves the Execute
-			auto stmt = conn->con->Prepare(prefixed);
+			unique_ptr<PreparedStatement> stmt;
+			{
+				LineagePrepareScope preparing(*conn->con->context);
+				stmt = conn->con->Prepare(prefixed);
+			}
 			if (stmt->HasError()) {
 				acl::ClearProfileNotes();
 				return StatusFromDuck("acl", stmt->GetError());
@@ -1505,8 +1512,13 @@ public:
 				}
 				sql = "INSERT INTO " + target + " (" + columns + ") SELECT " + columns + " FROM arrow_scan()";
 			}
-			auto prefixed = "ACL INGEST '" + StringUtil::Replace(handle, "'", "''") + "' " + sql;
 			auto conn = state->ConnFor(handle);
+			// spec 112 §4: an ingest is a write like any other - its run has the call's lineage
+			// context (the headers, else the session's SET), checked as spec 109 checks a statement's
+			string lineage_parent, lineage_root, lineage_job;
+			ARROW_RETURN_NOT_OK(LineageOfCall(context, *conn->con->context, lineage_parent, lineage_root, lineage_job));
+			auto prefixed = "ACL INGEST '" + StringUtil::Replace(handle, "'", "''") + "' " +
+			                LineageMarkers(lineage_parent, lineage_root, lineage_job) + sql;
 			auto execution = state->LockForStatement(*conn);
 			TempScanScope temp_scan(conn->con->context.get());
 			auto &con = *conn->con;
@@ -1515,6 +1527,7 @@ public:
 			ArmProfile(handle, *conn, nullptr, string()); // no trace rides on an ingest: `all` profiles it
 			{
 				ArrowIngestScope ingest_scan(make_shared_ptr<IngestScanFactory>(stream));
+				LineagePrepareScope preparing(*con.context);
 				stmt = con.Prepare(prefixed);
 				source_attached = ingest_scan.Taken();
 			}
@@ -1538,9 +1551,16 @@ public:
 				return arrow::Status::Invalid(
 				    "acl: ingest inside an open transaction is not supported - commit or roll back first");
 			}
+			// the note the Prepare left (spec 074 / 107): the BEGIN below is a parse nobody decided, which
+			// ends what the connection kept - so it is taken first and given back to the execution
+			ProfileNote note;
+			bool noted = TakeConnectionProfileNote(*con.context, note);
 			auto begun = con.Query("BEGIN TRANSACTION");
 			if (begun->HasError()) {
 				return StatusFromDuck("acl", begun->GetError());
+			}
+			if (noted) {
+				SetConnectionProfileNote(*con.context, std::move(note));
 			}
 			// `audit_text` is the RAW error, not the status the client gets: the audit keeps only our
 			// own refusals whole and reduces a source's error to its class (spec 069)
@@ -1620,6 +1640,7 @@ public:
 				    auto execution = state->LockForStatement(*reservation->conn);
 				    ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, request.transaction_id));
 				    TempScanScope temp_scan(reservation->conn->con->context.get());
+				    LineagePrepareScope preparing(*reservation->conn->con->context);
 				    reservation->stmt = reservation->conn->con->Prepare(prefixed);
 				    ProfileOfPrepare(*reservation);
 			    }
@@ -1627,8 +1648,8 @@ public:
 				    return StatusFromDuck("acl", reservation->stmt->GetError());
 			    }
 			    flightsql::ActionCreatePreparedStatementResult result;
-			    ARROW_RETURN_NOT_OK(
-			        SchemasFromStatement(*reservation->stmt, nullptr, result.dataset_schema, result.parameter_schema));
+			    ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->conn->con->context, *reservation->stmt, nullptr,
+			                                             result.dataset_schema, result.parameter_schema));
 			    if (AnswersOnlyCount(*reservation)) {
 				    // spec 111: a statement that answers only a count is announced as an update - JDBC reads
 				    // an empty dataset schema as one and executes it through DoPut, in one call (the field
@@ -1689,7 +1710,8 @@ public:
 			{
 				auto execution = state->LockForStatement(*reservation->conn);
 				auto bound = reservation->parameter_rows.empty() ? nullptr : &reservation->parameter_rows.front();
-				ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->stmt, bound, dataset_schema, parameter_schema));
+				ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->conn->con->context, *reservation->stmt, bound,
+				                                         dataset_schema, parameter_schema));
 				// spec 111: GetFlightInfo IS the execution of a count; the next DoGet answers it (not before
 				// the declared parameters are bound: then it answers the schema, as before, and DoGet runs)
 				if (reservation->parameter_rows.size() <= 1 && (bound || reservation->stmt->GetParameterCount() == 0)) {
@@ -1765,10 +1787,15 @@ public:
 				}
 			}
 			ArmProfile(caller, *reservation->conn, reservation.get(), string()); // one note, every row's execution
+			// spec 112 §2: the rows are one run - ended before the transaction is, so a commit hands
+			// it on and a rollback aborts it
+			auto &context = *con.context;
+			LineageBatchBegin(context);
 			int64_t total = 0;
 			for (auto &row : rows) {
 				auto result = reservation->stmt->Execute(row);
 				if (result->HasError()) {
+					LineageBatchEnd(context);
 					if (owns_txn) {
 						con.Query("ROLLBACK");
 					}
@@ -1783,6 +1810,7 @@ public:
 					}
 				}
 			}
+			LineageBatchEnd(context);
 			if (owns_txn) {
 				auto committed = con.Query("COMMIT");
 				if (committed->HasError()) {
@@ -1809,7 +1837,7 @@ public:
 	//! Both schemas the protocol wants, from an already-prepared statement: the result's (a
 	//! parameter-riding UNKNOWN resolved by *planning* with the bound row when one exists - planning
 	//! executes nothing) and the parameters', from duckdb's own binder, ordered by position.
-	arrow::Status SchemasFromStatement(PreparedStatement &stmt, const vector<Value> *bound_row,
+	arrow::Status SchemasFromStatement(ClientContext &context, PreparedStatement &stmt, const vector<Value> *bound_row,
 	                                   std::shared_ptr<arrow::Schema> &dataset_schema,
 	                                   std::shared_ptr<arrow::Schema> &parameter_schema) {
 		bool unresolved = false;
@@ -1818,10 +1846,20 @@ public:
 				unresolved = true;
 			}
 		}
-		if (unresolved && bound_row && stmt.GetStatementProperties().result_eagerness != ResultEagerness::FORCED) {
+		// a write is never submitted for its schema (spec 112): with its parameters unbound duckdb has not
+		// settled it as a count, and a submitted INSERT runs on the workers - closing it unread does not
+		// promise it wrote nothing. Its schema is its own (a count, or RETURNING's), from the statement.
+		auto kind = stmt.GetStatementType();
+		bool writes = kind == StatementType::INSERT_STATEMENT || kind == StatementType::UPDATE_STATEMENT ||
+		              kind == StatementType::DELETE_STATEMENT || kind == StatementType::MERGE_INTO_STATEMENT;
+		if (unresolved && bound_row && !writes &&
+		    stmt.GetStatementProperties().result_eagerness != ResultEagerness::FORCED) {
 			// a submitted handle carries the types the binder resolved with the row, and is closed
 			// unread; a statement that completes before it answers (FORCED) is never submitted for
-			// its schema - its types never ride on a parameter anyway
+			// its schema - its types never ride on a parameter anyway. The probe is no execution: the
+			// connection's note (spec 074 / 107) is kept off it and given back for the real one.
+			ProfileNote note;
+			bool noted = TakeConnectionProfileNote(context, note);
 			vector<Value> values = *bound_row;
 			auto submitted = stmt.Submit(values);
 			if (!submitted->HasError()) {
@@ -1830,6 +1868,9 @@ public:
 				ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaOf(stmt));
 			}
 			submitted->Close();
+			if (noted) {
+				SetConnectionProfileNote(context, std::move(note));
+			}
 		} else {
 			ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaOf(stmt));
 		}

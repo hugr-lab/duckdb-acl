@@ -162,8 +162,9 @@ AclPrefix ParseAclPrefix(const string &query) {
 	}
 	if (StringUtil::CIEquals(mode, "ingest")) {
 		// spec 049: the door's own composition for its ingest INSERT - a session handle, then the
-		// statement. No markers ride here: the remainder must be the INSERT itself, and an embedded
-		// `ACL ...` is mid-statement garbage exactly as it is after any other prefix.
+		// statement. Only the trace and lineage markers ride here (spec 112 §4: an ingest's run has
+		// its call's context); no mode marker - the remainder must be the INSERT itself, and an
+		// embedded `ACL ...` is mid-statement garbage exactly as it is after any other prefix.
 		SkipWhitespace(query, pos);
 		if (pos >= query.size() || (query[pos] != '\'' && query[pos] != '"')) {
 			throw ParserException("acl_rewrite: ACL INGEST requires a quoted session handle");

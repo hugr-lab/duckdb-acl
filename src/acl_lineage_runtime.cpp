@@ -36,6 +36,10 @@
 #include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/planner/operator/logical_prepare.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/main/config.hpp"
@@ -75,14 +79,14 @@ public:
 	//! One unit of work: a statement's run (job + outcome) or a static event's task.
 	struct Item {
 		shared_ptr<LineageJob> job;
-		bool failed = false;
+		LineageOutcome outcome = LineageOutcome::COMPLETE;
 		std::function<void(PolicyStore &)> task;
 	};
 
-	void Enqueue(shared_ptr<LineageJob> job, bool failed) {
+	void Enqueue(shared_ptr<LineageJob> job, LineageOutcome outcome) {
 		Item item;
 		item.job = std::move(job);
-		item.failed = failed;
+		item.outcome = outcome;
 		Push(std::move(item));
 	}
 
@@ -160,7 +164,7 @@ private:
 				if (next.task) {
 					RunTask(next.task);
 				} else if (next.job) {
-					Process(*next.job, next.failed);
+					Process(*next.job, next.outcome);
 				}
 			} catch (...) {
 				pipeline->Hooks().Counters().Add("acl.lineage.errors", {});
@@ -173,7 +177,7 @@ private:
 		}
 	}
 
-	void Process(LineageJob &job, bool failed);
+	void Process(LineageJob &job, LineageOutcome outcome);
 
 	void RunTask(const std::function<void(PolicyStore &)> &task) {
 		auto locked_store = store.lock();
@@ -232,6 +236,10 @@ class RelationCollector {
 public:
 	vector<NamedRelation> relations;
 	case_insensitive_set_t ctes;
+	//! spec 112 §5: the table functions it calls in FROM, by the name written (the surfaces among them)
+	vector<string> functions;
+	//! a DESCRIBE / SHOW / SUMMARIZE: a description, whatever it describes
+	bool show = false;
 
 	void Node(QueryNode &node) {
 		for (auto &entry : node.cte_map.map) {
@@ -252,6 +260,18 @@ private:
 		ParsedExpressionIterator::EnumerateChildren(expr, [&](ParsedExpression &child) { Expression(child); });
 	}
 	void Ref(TableRef &ref) {
+		if (ref.type == TableReferenceType::SHOW_REF) {
+			show = true;
+		}
+		if (ref.type == TableReferenceType::TABLE_FUNCTION) {
+			auto &call = ref.Cast<TableFunctionRef>().function;
+			if (call && call->GetExpressionClass() == ExpressionClass::FUNCTION) {
+				functions.push_back(call->Cast<FunctionExpression>().FunctionName().GetIdentifierName());
+			} else {
+				functions.emplace_back();
+			}
+			return;
+		}
 		if (ref.type != TableReferenceType::BASE_TABLE) {
 			return;
 		}
@@ -267,6 +287,47 @@ private:
 		relations.push_back(std::move(relation));
 	}
 };
+
+//! spec 112 §5: a declared read that reads nothing is no run - only the node's metadata surfaces
+//! (a client's catalog refresh, `duckdb_tables()`, `information_schema`), or nothing at all.
+bool ReadsOnlyMetadata(const RelationCollector &collector) {
+	if (collector.show) {
+		return true;
+	}
+	for (auto &relation : collector.relations) {
+		if (!MetadataSurfaceOf(StringUtil::Join(relation.parts, "."))) {
+			return false;
+		}
+	}
+	for (auto &function : collector.functions) {
+		if (function.empty() || !MetadataSurfaceOf(function)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! spec 112 §5: the optimized plan of a read cannot return a row - a WHERE folded to false (a
+//! client's schema probe, `WHERE 1=0`), `LIMIT 0` - judged down the plan's single-child spine
+bool YieldsNoRows(LogicalOperator &plan) {
+	optional_ptr<LogicalOperator> op = &plan;
+	while (op) {
+		if (op->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
+			return true;
+		}
+		if (op->type == LogicalOperatorType::LOGICAL_LIMIT) {
+			auto &limit = op->Cast<LogicalLimit>();
+			if (limit.limit_val.Type() == LimitNodeType::CONSTANT_VALUE && limit.limit_val.GetConstantValue() == 0) {
+				return true;
+			}
+		}
+		if (op->children.size() != 1) {
+			return false;
+		}
+		op = op->children[0].get();
+	}
+	return false;
+}
 
 //! The root query node of a statement in scope, or null.
 optional_ptr<QueryNode> RootNode(SQLStatement &statement) {
@@ -529,7 +590,7 @@ string Hex(uint64_t value) {
 
 } // namespace
 
-void LineageWorker::Process(LineageJob &job, bool failed) {
+void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 	auto locked_store = store.lock();
 	auto locked_db = db.lock();
 	if (!locked_store || !locked_db || !job.statement) {
@@ -551,9 +612,13 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 		auto found = mirrored.find(StringUtil::Lower(catalog + "." + schema + "." + name));
 		return found != mirrored.end() ? found->second : VirtualKey(catalog, schema, name);
 	};
+	bool reads_nothing = false;
 	if (root) {
 		RelationCollector collector;
 		collector.Node(*root);
+		if (job.declared_read && ReadsOnlyMetadata(collector)) {
+			return; // a catalog refresh under a declared parent is no step of the job
+		}
 		if (statement->type == StatementType::INSERT_STATEMENT) {
 			auto &insert = statement->Cast<InsertStatement>();
 			if (insert.node && !insert.node->table_ref) {
@@ -609,8 +674,13 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 			// a CREATE TABLE AS writes into a granted schema: the schema must exist where it binds
 			auto &info = statement->Cast<CreateStatement>().info->Cast<CreateTableInfo>();
 			auto &qualified = info.GetQualifiedName();
-			if (!qualified.Catalog().GetIdentifierName().empty() && !qualified.Schema().GetIdentifierName().empty()) {
-				auto catalog = qualified.Catalog().GetIdentifierName();
+			// spec 112 §3: `CREATE TABLE home.model AS …` names no catalog - the schema (a schema alias,
+			// where dbt writes) is the default catalog's, the virtual catalog the statement resolved in
+			auto catalog = qualified.Catalog().GetIdentifierName();
+			if (catalog.empty()) {
+				catalog = default_catalog;
+			}
+			if (!catalog.empty() && !qualified.Schema().GetIdentifierName().empty()) {
 				if (!attached.count(catalog)) {
 					scratch.Query("ATTACH ':memory:' AS " + acl_detail::Ident(catalog));
 					attached.insert(catalog);
@@ -642,6 +712,11 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 				}
 				walk = WalkLineage(*planner.plan, options);
 				walked = true;
+				if (job.declared_read) {
+					Optimizer optimizer(*planner.binder, *scratch.context);
+					auto optimized = optimizer.Optimize(std::move(planner.plan));
+					reads_nothing = optimized && YieldsNoRows(*optimized);
+				}
 			});
 		} catch (std::exception &) {
 			walked = false;
@@ -671,9 +746,38 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 						names.push_back(column.first);
 					}
 				}
+				case_insensitive_map_t<LogicalType> types; // what the principal reads of the target
+				for (auto &column : mirrored_columns[placement_key]) {
+					types[column.first] = column.second;
+				}
 				for (auto &name : names) {
 					LineageOutput output;
 					output.name = name;
+					auto type = types.find(name);
+					if (type != types.end()) {
+						output.type = type->second;
+					}
+					walk.outputs.push_back(std::move(output));
+				}
+				walk.approximate = true;
+				walked = true;
+			}
+		}
+		if (!walked && statement_copy && statement_copy->type == StatementType::CREATE_STATEMENT) {
+			// spec 112 §4: a door's ingest that creates its target (`CREATE TABLE t AS SELECT * FROM
+			// arrow_scan()`) - the source is the client's stream; the target exists now, and its fields
+			// are what the principal reads of it
+			auto &info = statement_copy->Cast<CreateStatement>().info->Cast<CreateTableInfo>();
+			Mirror created;
+			if (Resolve(*locked_store, *locked_db, job.principal, FromQualified(info.GetQualifiedName()), created)) {
+				walk = LineageWalk();
+				walk.has_target = true;
+				walk.target = VirtualKey(created.vcat, string(), created.vname);
+				walk.target_operation = "CREATE_TABLE_AS";
+				for (auto &column : created.columns) {
+					LineageOutput output;
+					output.name = column.first;
+					output.type = column.second;
 					walk.outputs.push_back(std::move(output));
 				}
 				walk.approximate = true;
@@ -683,6 +787,9 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 		if (!all_resolved) {
 			walk.approximate = true;
 		}
+	}
+	if (reads_nothing) {
+		return; // a probe (`WHERE 1=0`, `LIMIT 0`): it reads no row, so it is no step either
 	}
 	if (!walked) {
 		walk = LineageWalk();
@@ -695,7 +802,7 @@ void LineageWorker::Process(LineageJob &job, bool failed) {
 		walk.whole_target.clear();
 	}
 	auto lineage = LineageFromWalk(walk, settings);
-	lineage->event_type = failed ? "RUN_FAIL" : "RUN_COMPLETE";
+	lineage->event_type = LineageRunEventType(outcome);
 	lineage->run_id = LineageRunId();
 	auto client = job.door.empty() ? string("gateway") : job.door;
 	lineage->job_ns = settings.ns + "/client/" + client;
@@ -896,6 +1003,7 @@ void CapturePhysical(OptimizerExtensionInput &input, unique_ptr<LogicalOperator>
 			for (auto &column : base.columns.Logical()) {
 				LineageOutput output;
 				output.name = column.Name().GetIdentifierName();
+				output.type = column.Type();
 				captured->walk.outputs.push_back(std::move(output));
 			}
 			captured->dataset_type = "TABLE";
@@ -1036,13 +1144,14 @@ void RegisterLineageOptimizer(DatabaseInstance &db, const shared_ptr<PolicyStore
 	OptimizerExtension::Register(DBConfig::GetConfig(db), extension);
 }
 
-void EmitPhysicalLineage(const PhysicalLineage &captured, AuditPipeline &pipeline, DatabaseInstance &db, bool failed) {
+void EmitPhysicalLineage(const PhysicalLineage &captured, AuditPipeline &pipeline, DatabaseInstance &db,
+                         LineageOutcome outcome) {
 	auto settings = LineageSettings::Read(db);
 	if (!settings.on) {
 		return;
 	}
-	if (captured.definition && failed) {
-		return; // a definition that did not happen defines nothing
+	if (captured.definition && outcome != LineageOutcome::COMPLETE) {
+		return; // a definition that did not happen (failed, or rolled back) defines nothing
 	}
 	if (captured.namespace_event) {
 		// a source's namespace (spec 107 §3): nothing finer is derived - the operator relates it to the
@@ -1088,14 +1197,12 @@ void EmitPhysicalLineage(const PhysicalLineage &captured, AuditPipeline &pipelin
 				dataset.lifecycle = captured.lifecycle;
 				dataset.dataset_type = captured.dataset_type;
 				for (auto &output : captured.walk.outputs) {
-					AuditLineageField field;
-					field.name = output.name;
-					dataset.schema.push_back(std::move(field));
+					dataset.schema.push_back(LineageFieldOf(output.name, output.type));
 				}
 			}
 		}
 	} else {
-		lineage->event_type = failed ? "RUN_FAIL" : "RUN_COMPLETE";
+		lineage->event_type = LineageRunEventType(outcome);
 		lineage->run_id = LineageRunId();
 		lineage->job_ns = settings.ns + "/client/" + (captured.door.empty() ? string("operator") : captured.door);
 		lineage->job_name = "physical:" + walk.target_operation;
@@ -1160,13 +1267,13 @@ shared_ptr<LineageJob> CaptureLineageJob(PolicyStore &store, const SQLStatement 
 	return job;
 }
 
-void EnqueueLineageRun(const shared_ptr<LineageJob> &job, bool failed) {
+void EnqueueLineageRun(const shared_ptr<LineageJob> &job, LineageOutcome outcome) {
 	if (!job) {
 		return;
 	}
 	auto worker = job->worker.lock();
 	if (worker) {
-		worker->Enqueue(job, failed);
+		worker->Enqueue(job, outcome);
 	}
 }
 

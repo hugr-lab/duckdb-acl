@@ -878,6 +878,8 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 	out.subquery_form = false;
 	out.writable = true; // an aliased schema maps onto real tables
 	out.phys = result->Collection().GetValue(2, 0).ToString() + path.substr(alias_path.size());
+	// spec 112 §3: the object a live alias reaches is named like any other - where dbt writes
+	out.canonical = vcat + "." + path;
 	// rows of the same winning alias differ only by role: union their caps and grant policies
 	GrantUnion grants;
 	for (idx_t row = 0; row < result->RowCount(); row++) {

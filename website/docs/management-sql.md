@@ -739,7 +739,7 @@ CLUSTER INSTALL EXTENSION <name> VERSION '<v>' [FROM <repository>] [IN GROUP <gr
 CLUSTER UPDATE  EXTENSION <name> VERSION '<v>' [IN GROUP <group>]
 CLUSTER REMOVE  EXTENSION <name> [IN GROUP <group>]
 CLUSTER ATTACH '<path>' AS <alias> (TYPE <type> [, SECRET <secret>] [, <option> [<value>]] …)
-        [DEPENDS ON (<alias>, …)] [IN GROUP <group>] [COMMENT '<text>']
+        [LINEAGE '<identity>'] [DEPENDS ON (<alias>, …)] [IN GROUP <group>] [COMMENT '<text>']
 CLUSTER DETACH <alias> [CASCADE] [FORCE] [IN GROUP <group>]
 CLUSTER SET <setting> = <value> [IN GROUP <group>]
 CLUSTER RESET <setting> [IN GROUP <group>]
@@ -756,6 +756,9 @@ A group's source named like a cluster's is a re-point on the group's nodes (drai
 detaching it brings the cluster's back there, never a `DETACH`; a detach (and its `CASCADE`) follows
 the scope - a group's item depends on the cluster's source of a name only while the group has none of
 its own.
+`LINEAGE '<scheme>://<host:port>[/<database>]'` names the source in lineage as others know it (spec
+112, [lineage](lineage.md#a-sources-identity)): the item's spec carries it as `lineage`, and a node
+attaches the source with it (`ATTACH … LINEAGE '…'`). It is a name, never a credential.
 `acl_cluster_effective()` lists what applies to *this* node (the cluster's items with its group's over
 them, each with the scope it came from); `acl_cluster_applied(version)` is the node agent saying which
 profile version this node has converged to, which the load report shows (`config.applied` against

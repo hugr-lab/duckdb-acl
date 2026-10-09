@@ -53,6 +53,8 @@ string LineageStatus(DatabaseInstance &db);
 //! `name` empty ask about the catalog itself (its namespace).
 bool LineageSourceNameFor(DatabaseInstance &db, const string &catalog, const string &schema, const string &name,
                           string &out_ns, string &out_name, const string &declared = string());
+//! spec 112 §7: a dataset field with its type - a struct's fields nested, `[]` for each list level
+AuditLineageField LineageFieldOf(const string &name, const LogicalType &type);
 //! An identity has no userinfo (`user:pass@`): it is a name, never a credential.
 bool LineageIdentityClean(const string &identity);
 
@@ -116,7 +118,17 @@ struct LineageJob {
 shared_ptr<LineageJob> CaptureLineageJob(PolicyStore &store, const SQLStatement &statement, const Principal &principal,
                                          const string &door, const LineageContext &context);
 //! QueryEnd: hand one execution of a job to the worker (never blocks; a full queue drops, counted).
-void EnqueueLineageRun(const shared_ptr<LineageJob> &job, bool failed);
+//! How a run ended (spec 112 §6): its statement completed or failed, or the transaction it wrote in
+//! was rolled back - OpenLineage's COMPLETE / FAIL / ABORT
+enum class LineageOutcome : uint8_t { COMPLETE, FAIL, ABORT };
+
+inline const char *LineageRunEventType(LineageOutcome outcome) {
+	return outcome == LineageOutcome::FAIL    ? "RUN_FAIL"
+	       : outcome == LineageOutcome::ABORT ? "RUN_ABORT"
+	                                          : "RUN_COMPLETE";
+}
+
+void EnqueueLineageRun(const shared_ptr<LineageJob> &job, LineageOutcome outcome);
 //! The store's worker: started at load, stopped by the store's teardown (from any thread, its own too).
 shared_ptr<LineageWorker> StartLineageWorker(const shared_ptr<PolicyStore> &store,
                                              const shared_ptr<AuditPipeline> &pipeline, DatabaseInstance &db);
@@ -152,7 +164,8 @@ struct PhysicalLineage {
 //! Register the pre-optimize hook that captures physical statements (spec 107).
 void RegisterLineageOptimizer(DatabaseInstance &db, const shared_ptr<PolicyStore> &store);
 //! QueryEnd: the event of a physical statement's lineage.
-void EmitPhysicalLineage(const PhysicalLineage &lineage, AuditPipeline &pipeline, DatabaseInstance &db, bool failed);
+void EmitPhysicalLineage(const PhysicalLineage &lineage, AuditPipeline &pipeline, DatabaseInstance &db,
+                         LineageOutcome outcome);
 
 //! `acl_lineage_events()` - the operator's view of the lineage ring - and `acl_lineage_flush()`, which
 //! waits for the worker and the audit queue (tests). Never a principal's: `acl_` is spec 072's never set.

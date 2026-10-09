@@ -123,6 +123,13 @@ FROM acl_lineage_events() ORDER BY seq DESC LIMIT 1;
 ----
 [id, total, ssn]
 
+# spec 112 §7: ... with their types - the computed column's and the mask's as the definition makes them
+query T
+SELECT array_to_string(list_transform(from_json(payload->'datasets'->(payload->'outputs'->>0)::INT->'schema', '[{"name":"VARCHAR","type":"VARCHAR"}]'), lambda f: f.name || ':' || coalesce(nullif(f.type, ''), '?')), ' ')
+FROM acl_lineage_events() ORDER BY seq DESC LIMIT 1;
+----
+id:INTEGER total:DOUBLE ssn:?
+
 # no literal, no claim, no predicate text anywhere in the payload
 query I
 SELECT count(*) FROM acl_lineage_events()
@@ -326,6 +333,188 @@ SELECT count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
 ----
 0
 
+# --- spec 112 §6: a write in a client's transaction is a run when the transaction ends ---------------------
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+BEGIN;
+
+statement ok
+ACL ROLE "w" INSERT INTO sink VALUES (100, 'x');
+
+statement ok
+ACL ROLE "w" INSERT INTO sink VALUES (101, 'y');
+
+statement ok
+SELECT acl_lineage_flush();
+
+# nothing yet: the transaction may still roll back
+query I
+SELECT count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TI
+SELECT event_type, count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) GROUP BY ALL;
+----
+RUN_ABORT	2
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+BEGIN;
+
+statement ok
+ACL ROLE "w" INSERT INTO sink VALUES (102, 'z');
+
+statement ok
+COMMIT;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TI
+SELECT event_type, count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) GROUP BY ALL;
+----
+RUN_COMPLETE	1
+
+# a failed statement is final at once; what the transaction did before it is aborted with it
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+BEGIN;
+
+statement ok
+ACL ROLE "w" INSERT INTO sink VALUES (103, 'q');
+
+statement error
+ACL ROLE "w" INSERT INTO sink VALUES ('not a number', 'q');
+----
+
+statement ok
+ROLLBACK;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TI
+SELECT event_type, count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) GROUP BY ALL ORDER BY 1;
+----
+RUN_ABORT	1
+RUN_FAIL	1
+
+statement ok
+ACL ROLE "w" DELETE FROM sink WHERE a >= 100;
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+# --- spec 112 §3: a write into a schema alias (where dbt writes) has its target and its edges ------------
+
+statement ok
+CREATE SCHEMA phys.home;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.home AS phys.home;
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.home TO ROLE w WITH (select, insert, create, drop);
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" CREATE TABLE home.model AS SELECT id, total FROM src;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT event_type, payload->'datasets'->(payload->'outputs'->>0)::INT->>'name', approximate
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+RUN_COMPLETE	c.home.model	false
+
+query TTT
+SELECT e->>'target_field', (payload->'datasets'->(e->>'source')::INT->>'name') || '.' || (e->>'source_field'), e->>'type'
+FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq > (SELECT seq FROM before))
+ORDER BY 1, 2;
+----
+id	c.main.src.id	DIRECT
+total	c.main.src.total	DIRECT
+
+# the fields the run wrote, typed
+query T
+SELECT array_to_string(list_transform(from_json(payload->'datasets'->(payload->'outputs'->>0)::INT->'schema', '[{"name":"VARCHAR","type":"VARCHAR"}]'), lambda f: f.name || ':' || coalesce(nullif(f.type, ''), '?')), ' ')
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+id:INTEGER total:DOUBLE
+
+# an INSERT into the object the CTAS made, through the alias
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" INSERT INTO home.model SELECT id, total FROM src WHERE total > 5;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTTT
+SELECT e->>'target_field', (payload->'datasets'->(e->>'source')::INT->>'name') || '.' || (e->>'source_field'),
+    e->>'type', payload->'datasets'->(payload->'outputs'->>0)::INT->>'name'
+FROM (SELECT payload, unnest(from_json(payload->'edges', '["JSON"]')) AS e FROM acl_lineage_events()
+      WHERE seq > (SELECT seq FROM before))
+ORDER BY 1, 2;
+----
+(empty)	c.main.src.total	INDIRECT	c.home.model
+id	c.main.src.id	DIRECT	c.home.model
+total	c.main.src.total	DIRECT	c.home.model
+
+statement ok
+ACL ROLE "w" DROP TABLE home.model;
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
 # --- UPDATE: the field from its expression, the WHERE as a filter -----------------------------------------
 
 statement ok
@@ -438,6 +627,20 @@ CREATE TABLE phys.main.people(id INTEGER, name VARCHAR, ssn VARCHAR, address STR
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.people AS phys.main.people;
+
+statement ok
+SELECT acl_lineage_flush();
+
+# spec 112 §7: a struct's fields are nested in its field
+query TT
+SELECT f->>'type', array_to_string(list_transform(from_json(f->'fields', '[{"name":"VARCHAR","type":"VARCHAR"}]'), lambda c: c.name || ':' || c.type), ' ')
+FROM (SELECT unnest(from_json(payload->'datasets'->(payload->'outputs'->>0)::INT->'schema', '["JSON"]')) AS f
+      FROM acl_lineage_events()
+      WHERE seq = (SELECT max(seq) FROM acl_lineage_events()
+                   WHERE (payload->'datasets'->(payload->'outputs'->>0)::INT->>'name') = 'c.main.people'))
+WHERE (f->>'name') = 'address';
+----
+STRUCT	city:VARCHAR zip:VARCHAR
 
 statement ok
 ACL ADMIN CREATE ROLE clerk;
@@ -793,6 +996,54 @@ SELECT event_type, payload->'datasets'->(payload->'inputs'->>0)::INT->>'name',
 FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
 ----
 RUN_COMPLETE	c.main.src	0	0
+
+# spec 112 §5: what reads nothing is no step - a catalog refresh, a description, a probe of no rows
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT * FROM duckdb_tables();
+
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT table_name FROM information_schema.tables;
+
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' DESCRIBE src;
+
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT * FROM src WHERE 1=0;
+
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT 1 FROM src WHERE false;
+
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT id FROM src LIMIT 0;
+
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT 1;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query I
+SELECT count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+0
+
+# ... while a read of rows, even next to a surface, still is
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT s.id FROM src s, duckdb_tables() t WHERE t.table_name = 'x' LIMIT 1;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query I
+SELECT count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+1
 
 # each marker once, and the value quoted
 statement error

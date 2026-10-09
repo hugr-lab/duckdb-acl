@@ -335,6 +335,31 @@ AuditLineageRunRef ParseLineageRunRef(const string &text) {
 	return ref;
 }
 
+AuditLineageField LineageFieldOf(const string &name, const LogicalType &type) {
+	AuditLineageField field;
+	field.name = name;
+	if (type.id() == LogicalTypeId::INVALID || type.id() == LogicalTypeId::UNKNOWN ||
+	    type.id() == LogicalTypeId::SQLNULL) {
+		return field; // unknown - a NULL literal (a mask's) has no type of its own
+	}
+	// a struct (or a list of them) carries its fields, the way OpenLineage's schema facet nests them
+	auto element = type;
+	string suffix;
+	while (element.id() == LogicalTypeId::LIST) {
+		element = ListType::GetChildType(element);
+		suffix += "[]";
+	}
+	if (element.id() == LogicalTypeId::STRUCT) {
+		field.type = "STRUCT" + suffix;
+		for (auto &child : StructType::GetChildTypes(element)) {
+			field.fields.push_back(LineageFieldOf(child.first.GetIdentifierName(), child.second));
+		}
+		return field;
+	}
+	field.type = type.ToString();
+	return field;
+}
+
 shared_ptr<AuditLineage> LineageFromWalk(const LineageWalk &walk, const LineageSettings &settings) {
 	auto lineage = make_shared_ptr<AuditLineage>();
 	vector<int32_t> index(walk.datasets.size(), -1);
@@ -356,9 +381,7 @@ shared_ptr<AuditLineage> LineageFromWalk(const LineageWalk &walk, const LineageS
 				// the fields written - one written from constants or from the client's stream has no
 				// edge, and is written all the same
 				for (auto &output : walk.outputs) {
-					AuditLineageField field;
-					field.name = output.name;
-					dataset.schema.push_back(std::move(field));
+					dataset.schema.push_back(LineageFieldOf(output.name, output.type));
 				}
 			}
 			lineage->datasets.push_back(std::move(dataset));
