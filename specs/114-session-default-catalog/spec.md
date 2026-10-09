@@ -20,18 +20,22 @@ refusal:
 
 ## Design
 
-The simplest form (owner, 2026-10-09): **the client sends `USE <vcat>;`, and that changes its default
-catalog.**
+The simplest form (owner, 2026-10-09): **the client sends `USE <vcat>;` and that changes its default
+catalog; `USE <vcat>.<schema>;` also sets its default schema.**
 
 1. **What it does.** On the principal's session, the named virtual catalog takes the MAIN catalog's
    part: short names (`orders`, `dbt_home.m`) resolve there - reads, writes, spec 113's DDL reading and
    its ambiguity rule, `information_schema` / `SHOW TABLES` with no catalog. `USE` of the role's MAIN
-   catalog goes back. Only a catalog: `USE <vcat>.<schema>` is refused (a default schema is not part of
-   this spec).
+   catalog goes back.
+   - **`USE <vcat>.<schema>`** also makes that schema the default: a bare name (`m`) resolves in it -
+     as duckdb's own `USE db.schema` does, nowhere else (an object of the catalog's `main` is then
+     `main.orders`) - and a bare `CREATE TABLE m` lands there. A two-part name is read as before.
+     `USE <vcat>` alone resets the schema to the catalog's `main`.
 2. **Who may.** Only on a session of the client's own (a door's `ACL SESSION`, spec 068's
    `Principal::session_connection`): a gateway's per-statement prefix shares its connection, where the
    choice would be the next principal's. Only a catalog the principal holds a grant on; anything else
-   is refused, naming the catalogs it holds. It grants nothing - a short name reaches what the name
+   is refused, naming the catalogs it holds; a schema the principal holds no grant on is refused the
+   same way. It grants nothing - a short name reaches what the name
    written in full reaches, under the same grants.
 3. **Through every door alike** - it is a statement: Flight (ADBC, JDBC: `USE sales` as SQL), quack
    (`FROM quack_query_by_name('<alias>', 'USE sales')` - a plain `USE` there is the client's own).
@@ -40,7 +44,7 @@ catalog.**
 5. **`current_database()`** under a principal answers the session's virtual catalog (today the node's
    own, which names nothing a principal can use).
 
-Not in this spec: a default schema; JDBC `setCatalog` / ADBC's catalog option (Flight session options) -
+Not in this spec: JDBC `setCatalog` / ADBC's catalog option (Flight session options) -
 a client sends `USE` instead.
 
 ## Enforcement & security
@@ -52,7 +56,8 @@ name refuse, as a written one would). Never on a shared connection.
 ## Testing
 
 - `test/sql/acl_session_catalog.test`: `USE` on an `ACL SESSION` principal - short names in the second
-  catalog, back to MAIN, `USE vcat.schema` refused, a catalog not held refused, refused on a
+  catalog, back to MAIN, `USE vcat.schema` - a bare name read and created in the schema, `main.x`
+  still reached, `USE vcat` resetting it; a catalog or schema not held refused, refused on a
   per-statement prefix, the ambiguity rule against the session's catalog, the resolver cache not shared
   across catalogs; `current_database()`.
 - Flight e2e: ADBC sends `USE`, a short name reads the second catalog.
