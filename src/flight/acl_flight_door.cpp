@@ -14,6 +14,12 @@
 #include "acl_audit.hpp"
 #include "acl_lineage.hpp"
 #include "acl_flight_catalog.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/list.hpp"
+#include "duckdb/parser/statement/delete_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/common/error_data.hpp"
 
 #include <algorithm>
@@ -272,6 +278,13 @@ struct FlightDoorState {
 		//! given back to the connection for each execution
 		bool has_profile = false;
 		acl::ProfileNote profile;
+		//! spec 111: a statement that answers only a count (ResultEagerness::FORCED: DML, DDL) runs at
+		//! GetFlightInfo - Flight SQL's "GetFlightInfo: execute the query" - and its result waits here
+		//! for the DoGet, which answers it without running again
+		unique_ptr<QueryResult> executed;
+		//! the client's statement as it sent it - what spec 111 reads when duckdb could not settle the
+		//! statement's properties at Prepare (a parameter it could not type)
+		string query;
 	};
 	std::unordered_map<string, shared_ptr<Reservation>> reservations;
 	//! Refuse a new reservation rather than evict somebody's old one: an evicted one is a mid-flight
@@ -1176,6 +1189,7 @@ public:
 			// left to do but execute.
 			auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
 			reservation->conn = conn;
+			reservation->query = command.query; // spec 111
 			{
 				auto execution = state->LockForStatement(*reservation->conn);
 				ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, command.transaction_id));
@@ -1190,9 +1204,20 @@ public:
 			ARROW_ASSIGN_OR_RAISE(schema, SchemaOf(*reservation->stmt));
 			reservation->owner = owner;
 			reservation->single_use = true;
+			auto held = reservation;
 			auto ticket_id = state->PutReservation(std::move(reservation), state->store->SessionIdleTimeout());
 			if (ticket_id.empty()) {
 				return arrow::Status::Invalid("acl: too many open tickets - fetch or retry later");
+			}
+			// spec 111: a count is the statement's whole answer - it runs now, its ticket already held (a
+			// full ticket map refuses above, before anything is written); a failure takes the ticket back
+			{
+				auto execution = state->LockForStatement(*held->conn);
+				auto ran = ExecuteCountNow(handle, *held, nullptr);
+				if (!ran.ok()) {
+					state->CloseReservation(ticket_id, owner);
+					return ran;
+				}
 			}
 			state->store->AuditDoor("flight", "ticket_issued", true, string(), string(), handle);
 			ARROW_ASSIGN_OR_RAISE(auto ticket, flightsql::CreateStatementQueryTicket(ticket_id));
@@ -1590,6 +1615,7 @@ public:
 			    }
 			    auto reservation = make_shared_ptr<FlightDoorState::Reservation>();
 			    reservation->conn = conn;
+			    reservation->query = request.query; // spec 111
 			    {
 				    auto execution = state->LockForStatement(*reservation->conn);
 				    ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, request.transaction_id));
@@ -1603,6 +1629,12 @@ public:
 			    flightsql::ActionCreatePreparedStatementResult result;
 			    ARROW_RETURN_NOT_OK(
 			        SchemasFromStatement(*reservation->stmt, nullptr, result.dataset_schema, result.parameter_schema));
+			    if (AnswersOnlyCount(*reservation)) {
+				    // spec 111: a statement that answers only a count is announced as an update - JDBC reads
+				    // an empty dataset schema as one and executes it through DoPut, in one call (the field
+				    // Flight SQL added for this, is_update, is set once the Arrow pin carries it)
+				    result.dataset_schema = arrow::schema(arrow::FieldVector {});
+			    }
 			    reservation->owner = owner;
 			    auto id = state->PutReservation(std::move(reservation), state->store->SessionIdleTimeout());
 			    if (id.empty()) {
@@ -1636,6 +1668,7 @@ public:
 			}
 			auto execution = state->LockForStatement(*reservation->conn);
 			reservation->parameter_rows = std::move(rows);
+			reservation->executed.reset(); // spec 111: a count kept for the old parameters is not this one's
 			return true;
 		});
 		return bound.status();
@@ -1657,6 +1690,11 @@ public:
 				auto execution = state->LockForStatement(*reservation->conn);
 				auto bound = reservation->parameter_rows.empty() ? nullptr : &reservation->parameter_rows.front();
 				ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->stmt, bound, dataset_schema, parameter_schema));
+				// spec 111: GetFlightInfo IS the execution of a count; the next DoGet answers it (not before
+				// the declared parameters are bound: then it answers the schema, as before, and DoGet runs)
+				if (reservation->parameter_rows.size() <= 1 && (bound || reservation->stmt->GetParameterCount() == 0)) {
+					ARROW_RETURN_NOT_OK(ExecuteCountNow(handle, *reservation, bound));
+				}
 			}
 			// the ticket is the protocol's own command, which carries the handle - nothing is
 			// remembered between the two calls that is not already in the reservation
@@ -1704,6 +1742,7 @@ public:
 			}
 			ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader, FlightDoorState::MAX_PARAM_ROWS));
 			auto execution = state->LockForStatement(*reservation->conn);
+			reservation->executed.reset(); // spec 111: this call executes; a count an earlier GetFlightInfo kept goes
 			// executemany semantics, DBAPI's: once per parameter row. Zero rows with declared
 			// parameters is zero executions - not one; only a parameterless statement runs once.
 			if (rows.empty()) {
@@ -1859,6 +1898,74 @@ public:
 		acl::ProfileConnectionFor(context, state->store->audit, ref.principal, "flight", trace, ref.profile_override);
 	}
 
+	//! spec 111: a statement that returns no rows - DML answers its changed rows (CHANGED_ROWS), DDL
+	//! nothing - as duckdb knows it once bound, parameters or not (the result eagerness of a prepared
+	//! statement is not settled until it runs). `INSERT ... RETURNING` returns rows: not one of these.
+	static bool AnswersOnlyCount(const FlightDoorState::Reservation &reservation) {
+		auto &stmt = *reservation.stmt;
+		auto properties = stmt.GetStatementProperties();
+		if (properties.bound_all_parameters) {
+			return properties.return_type != StatementReturnType::QUERY_RESULT;
+		}
+		// a parameter duckdb could not type (a grant's predicate wraps the VALUES: spec 024) leaves the
+		// properties unsettled until the parameters bind - then the statement's kind and the client's
+		// own text decide: a DML without RETURNING answers a count, anything else is a query
+		switch (stmt.GetStatementType()) {
+		case StatementType::INSERT_STATEMENT:
+		case StatementType::UPDATE_STATEMENT:
+		case StatementType::DELETE_STATEMENT:
+		case StatementType::MERGE_INTO_STATEMENT:
+			break;
+		default:
+			return false;
+		}
+		try {
+			Parser parser(ParserOptions::Builtin());
+			parser.ParseQuery(reservation.query);
+			if (parser.statements.size() != 1) {
+				return false;
+			}
+			auto &parsed = *parser.statements[0];
+			switch (parsed.type) {
+			case StatementType::INSERT_STATEMENT:
+				return parsed.Cast<InsertStatement>().node->returning_list.empty();
+			case StatementType::UPDATE_STATEMENT:
+				return parsed.Cast<UpdateStatement>().node->returning_list.empty();
+			case StatementType::DELETE_STATEMENT:
+				return parsed.Cast<DeleteStatement>().node->returning_list.empty();
+			case StatementType::MERGE_INTO_STATEMENT:
+				return parsed.Cast<MergeIntoStatement>().node->returning_list.empty();
+			default:
+				return false;
+			}
+		} catch (std::exception &) {
+			return false; // not ours to judge: it stays a query, executed lazily as before
+		}
+	}
+
+	//! spec 111: run a statement whose whole answer is a count (ResultEagerness::FORCED) right away,
+	//! under the caller's statement lock, and keep the result for the DoGet; a statement that streams
+	//! rows is left for DoGet to submit. A failure is the caller's answer now.
+	arrow::Status ExecuteCountNow(const string &handle, FlightDoorState::Reservation &reservation,
+	                              const vector<Value> *bound) {
+		auto &stmt = *reservation.stmt;
+		if (!AnswersOnlyCount(reservation)) {
+			return arrow::Status::OK();
+		}
+		ArmProfile(handle, *reservation.conn, &reservation, string());
+		vector<Value> values;
+		if (bound) {
+			values = *bound;
+		}
+		auto result = stmt.Execute(values);
+		if (result->HasError()) {
+			reservation.executed.reset();
+			return StatusFromDuck("acl", result->GetError());
+		}
+		reservation.executed = std::move(result);
+		return arrow::Status::OK();
+	}
+
 	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
 	StreamStatement(const flight::ServerCallContext &context, shared_ptr<FlightDoorState::Reservation> reservation,
 	                vector<Value> &values, const string &handle) {
@@ -1867,9 +1974,14 @@ public:
 		// a statement that completes before it answers (a count - ResultEagerness::FORCED) runs to
 		// completion here; anything else is submitted, and the reader drains it chunk by chunk
 		auto &stmt = *reservation->stmt;
-		ArmProfile(handle, *reservation->conn, reservation.get(), string());
-		auto result = stmt.GetStatementProperties().result_eagerness == ResultEagerness::FORCED ? stmt.Execute(values)
-		                                                                                        : stmt.Submit(values);
+		unique_ptr<QueryResult> result;
+		if (reservation->executed) {
+			result = std::move(reservation->executed); // spec 111: it ran at GetFlightInfo
+		} else {
+			ArmProfile(handle, *reservation->conn, reservation.get(), string());
+			result = stmt.GetStatementProperties().result_eagerness == ResultEagerness::FORCED ? stmt.Execute(values)
+			                                                                                   : stmt.Submit(values);
+		}
 		if (result->HasError()) {
 			return StatusFromDuck("acl", result->GetError());
 		}

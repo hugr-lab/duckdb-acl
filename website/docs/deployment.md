@@ -28,3 +28,22 @@ SELECT acl_quack_serve('quack:localhost:31700', server_token); -- quack door (cl
 
 **The fleet** (many nodes behind a front that routes, reconciles configuration, and can terminate
 authentication) is a separate product; nodes are identical either way, which is the point.
+
+**Several nodes behind a front.** What a front must keep:
+
+- **A session stays on one node.** Its connection, its transaction, its temp tables and its Flight
+  tickets live on the node that opened it.
+  - `GetFlightInfo` and its `DoGet` must reach the **same node**: the front routes by the session
+    cookie, `arrow_flight_session_id`. A front that spreads one session over nodes breaks the ticket
+    (`acl: unknown or already fetched ticket`).
+  - quack keeps its own connection id, so a quack client is sticky by construction.
+- **DML is safest over `DoPut`.** It is one RPC, so there is no window between two calls. `JDBC
+  executeUpdate`, prepared DML (announced as an update), `executemany` and `adbc_ingest` all take it.
+- **A retried write may double** (spec 111). DML sent through the query path runs at `GetFlightInfo`.
+  If the node dies, or the answer is lost, before the `DoGet`, the write may already be committed
+  while the client sees an error.
+  - Any DML RPC whose answer is lost after the commit is in the same position, `DoPut` included.
+  - Writes a client may retry must be idempotent (MERGE, a key) or held in the client's own
+    transaction (`BeginTransaction`), which the node rolls back with the session.
+- **Draining** (`acl_drain()`) keeps established sessions, unfetched tickets included, until they end
+  or their idle timeout passes. The orchestrator owns the deadline.

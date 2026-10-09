@@ -216,6 +216,28 @@ echo "$got" | grep -q "{'count': 1}" || fail "the update wire did not land one r
 got="$(ask "@update:INSERT INTO orders (id, tenant, amount, customer_id) VALUES (501, 'globex', 5, 0)")"
 case "$got" in *"does not satisfy the grant"*) ;; *) fail "a cross-tenant update-wire row was not refused: $got";; esac
 
+# --- spec 111: DML sent as a query runs at GetFlightInfo ("GetFlightInfo: execute the query") - a
+# client that never fetches does not lose the write; one that fetches gets its count once; a refusal
+# is the execute's own error
+got="$(ask "@nofetch:INSERT INTO orders (id, tenant, amount, customer_id) VALUES (520, 'acme', 5, 0)")"
+echo "$got" | grep -q "'endpoints': 1" || fail "an unfetched DML query did not answer its FlightInfo: $got"
+got="$(ask "SELECT count(*) AS n FROM orders WHERE id = 520")"
+echo "$got" | grep -q "'n': \[1\]" || fail "an unfetched DML was lost: $got"
+got="$(ask "INSERT INTO orders (id, tenant, amount, customer_id) VALUES (521, 'acme', 5, 0)")"
+echo "$got" | grep -q "\[1\]" || fail "a fetched DML query did not answer its count: $got"
+got="$(ask "SELECT count(*) AS n FROM orders WHERE id = 521")"
+echo "$got" | grep -q "'n': \[1\]" || fail "a fetched DML query ran other than once: $got"
+got="$(ask "@nofetch:INSERT INTO orders (id, tenant, amount, customer_id) VALUES (522, 'globex', 5, 0)")"
+case "$got" in *"does not satisfy the grant"*) ;; *) fail "a refused DML query did not fail at its execute: $got";; esac
+# a prepared DML announces itself as an update (an empty dataset schema: JDBC takes DoPut); a prepared
+# SELECT keeps its columns
+got="$(ask "@prepared_fields:INSERT INTO orders (id, tenant, amount, customer_id) VALUES (?, 'acme', 1, 0)")"
+echo "$got" | grep -q "'fields': 0" || fail "a prepared DML did not announce an empty dataset schema: $got"
+got="$(ask "@prepared_fields:SELECT id, amount FROM orders")"
+echo "$got" | grep -q "'fields': 2" || fail "a prepared SELECT lost its dataset schema: $got"
+got="$(ask "@prepared_fields:INSERT INTO orders (id, tenant, amount, customer_id) VALUES (?, 'acme', 1, 0) RETURNING id")"
+echo "$got" | grep -q "'fields': [1-9]" || fail "a prepared DML with RETURNING was announced as an update: $got"
+
 # --- bulk ingestion through DoPut(CommandStatementIngest) - spec 049 ------------------------------
 got="$(ask "@ingest:orders:append:id,tenant,amount,customer_id:700,acme,7,0;701,acme,8,1")"
 echo "$got" | grep -q "{'count': 2}" || fail "the ingest did not land two rows: $got"

@@ -308,6 +308,12 @@ arrow::Result<vector<vector<Value>>> ParamRowsFrom(DatabaseInstance &db, flight:
 		batches.push_back(std::move(chunk.data));
 	}
 	ARROW_ASSIGN_OR_RAISE(auto schema, reader.GetSchema());
+	if (schema->num_fields() == 0) {
+		// a statement without parameters, executed through DoPut: Arrow's JDBC sends a batch with no
+		// columns (spec 111 announces a prepared DML as an update, so every parameterless one comes
+		// this way) - no parameters, and the statement runs once
+		return vector<vector<Value>>();
+	}
 	ARROW_ASSIGN_OR_RAISE(auto table, arrow::Table::FromRecordBatches(schema, batches));
 	auto batch_reader = std::make_shared<arrow::TableBatchReader>(*table);
 	ArrowArrayStream stream;
