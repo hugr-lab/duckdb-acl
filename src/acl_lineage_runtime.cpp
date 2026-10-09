@@ -643,7 +643,8 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 	bool held_loaded = false;
 	auto session_name = [&](NamedRelation relation) {
 		auto &parts = relation.parts;
-		if (job.use_catalog.empty() || parts.empty() || MetadataName(parts)) {
+		if (job.use_catalog.empty() || parts.empty() || MetadataName(parts) ||
+		    (parts.size() >= 2 && StringUtil::CIEquals(parts[0], "temp"))) {
 			return relation;
 		}
 		if (!held_loaded) {

@@ -108,9 +108,11 @@ name refuse, as a written one would). Never on a shared connection.
   duckdb's grammar and may stand in a batch. Only an automatic or `SESSION` scope is a USE: `SET GLOBAL
   schema` / `SET VARIABLE schema` stay refused as before.
 - **Temps** (spec 050): `CREATE TEMP TABLE` is refused when the name is an object of the MAIN catalog or
-  of the session's schema (the anti-shadow rule); a bare DROP of a name the session's schema has no
-  object for is the temp's. A schema alias claims every name in it, so under `USE <vcat>.<alias>` a temp
-  created before is reached as `temp.main.<x>`.
+  a stored object of the session's schema (the anti-shadow rule; a live schema alias claims every name,
+  which is no object - the temp is then `temp.main.<x>`, as a door's ingest addresses it). A bare DROP of
+  a name the session's schema has no object for is the temp's only where the temp catalog is known (the
+  Flight door's context); elsewhere it is the home's, as before. A bare `SHOW TABLES` still lists the
+  session's temps.
 - **Not transactional**: a USE is the session's, like duckdb's own `USE`; a ROLLBACK does not undo it.
 - **A schema needs a schema grant to be USEd** (`role_schemas`, as `CREATE SCHEMA IF NOT EXISTS` reads
   it); a catalog only reachable through schema grants cannot be `USE`d - refused, never widened. The

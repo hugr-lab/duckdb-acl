@@ -66,6 +66,8 @@ int main(int argc, char *argv[]) {
 	Exec(con, "CREATE TABLE phys.main.orders AS SELECT 1 AS id");
 	Exec(con, "CREATE TABLE phys.main.facts AS SELECT 2 AS id");
 	Exec(con, "CREATE TABLE phys.other.t AS SELECT 3 AS id");
+	Exec(con, "CREATE SCHEMA phys.exp");
+	Exec(con, "CREATE TABLE phys.exp.loose AS SELECT 1 AS id");
 	Exec(con, "CREATE SCHEMA phys.shadow");
 	Exec(con, "CREATE TABLE phys.shadow.orders AS SELECT 99 AS id");
 	Exec(con, "SELECT acl_use_db('store','acl',true)");
@@ -81,12 +83,14 @@ int main(int argc, char *argv[]) {
 	Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA mart.out AS phys.other");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA mart.home AS phys.home");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA mart.sales AS phys.shadow");
+	Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA mart.exp FROM phys.exp");
 	Exec(con, "ACL ADMIN CREATE ROLE analyst");
 	Exec(con, "ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select, temp) MAIN");
 	Exec(con, "ACL ADMIN GRANT CATALOG mart TO ROLE analyst WITH (select)");
 	Exec(con, "ACL ADMIN GRANT SCHEMA mart.out TO ROLE analyst WITH (select)");
 	Exec(con, "ACL ADMIN GRANT SCHEMA mart.home TO ROLE analyst WITH (select, insert, create, drop)");
 	Exec(con, "ACL ADMIN GRANT SCHEMA mart.sales TO ROLE analyst WITH (select)");
+	Exec(con, "ACL ADMIN GRANT SCHEMA mart.exp TO ROLE analyst WITH (select, insert, create, drop)");
 
 	auto handle = OpenSession(con);
 	if (!Check(!handle.empty(), "a session opens")) {
@@ -177,6 +181,24 @@ int main(int argc, char *argv[]) {
 		Check(One(con, session + "SELECT id FROM temp.main.scratch") == "5", "temp.main.scratch is the temp");
 		CheckOk(*con.Query(session + "DROP TABLE temp.main.scratch"), "DROP of the temp by its name");
 		Check(One(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'scratch'") == "0", "the temp is gone");
+		CheckOk(*con.Query(session + "CREATE TEMP TABLE staged AS SELECT 6 AS id"),
+		        "a temp under a schema alias (which claims every name) shadows no object");
+		Check(One(con, session + "SELECT id FROM temp.main.staged") == "6", "reached by its own catalog's name");
+		CheckOk(*con.Query(session + "DROP TABLE temp.main.staged"), "and dropped so");
+		CheckOk(*con.Query(session + "USE sales"), "back");
+	});
+
+	Scenario("a bare DROP under a USE is the home's, not a guessed temp", [&]() {
+		auto phys_count = [&](const std::string &name) {
+			return One(con, "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'phys' AND schema_name = "
+			                "'exp' AND table_name = '" +
+			                    name + "'");
+		};
+		CheckOk(*con.Query(session + "USE mart.exp"), "USE mart.exp");
+		CheckOk(*con.Query(session + "CREATE TABLE y AS SELECT 1 AS id; DROP TABLE y"), "CREATE + DROP in one batch");
+		Check(phys_count("y") == "0", "y is dropped in phys.exp");
+		CheckOk(*con.Query(session + "DROP TABLE IF EXISTS loose"), "DROP IF EXISTS of a table with no record");
+		Check(phys_count("loose") == "0", "loose is dropped in phys.exp");
 		CheckOk(*con.Query(session + "USE sales"), "back");
 	});
 

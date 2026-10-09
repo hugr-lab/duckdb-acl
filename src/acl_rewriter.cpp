@@ -557,8 +557,11 @@ private:
 		auto in_session = use_catalog.empty() && use_schema.empty()
 		                      ? string()
 		                      : UseCatalog() + (use_schema.empty() ? string() : "." + use_schema) + "." + bare;
+		// a live schema alias claims every name, so its "object" is no object - the temp is then reached as
+		// temp.main.<x>, which is how a door's ingest addresses it anyway
 		if (store.ResolveTable(principal, bare, shadowed) ||
-		    (!in_session.empty() && store.ResolveTable(principal, in_session, shadowed))) {
+		    (!in_session.empty() && store.ResolveTable(principal, in_session, shadowed) &&
+		     !shadowed.from_schema_alias)) {
 			Deny(Reason::DDL_HOME,
 			     "\"" + bare +
 			         "\" is a granted object of the catalog, so a temporary table of that name would be "
@@ -1101,10 +1104,13 @@ private:
 		auto key = Key(info.GetQualifiedName());
 		DdlTarget target;
 		TablePolicy visible;
-		if (key != VirtualKey(info.GetQualifiedName()) && !store.ResolveTable(principal, key, visible) &&
-		    TryTempDrop(info)) {
-			// spec 114: a bare name the session's schema has no object for is the session's temp, as a read
-			// finds it - not a drop in the home the USE made the default
+		auto *temp_context = TempScanContext();
+		if (key != VirtualKey(info.GetQualifiedName()) && temp_context && BareName(info.GetQualifiedName()) &&
+		    TempCatalogHas(*temp_context, info.GetQualifiedName().Name().GetIdentifierName()) &&
+		    !store.ResolveTable(principal, key, visible) && TryTempDrop(info)) {
+			// spec 114: a bare name the session's schema has no object for and the session's temp catalog
+			// has is the temp, as a read finds it. Only where that is known (the Flight door's context):
+			// elsewhere the drop is the home's, as before
 			return;
 		}
 		if (!store.ResolveDdlTarget(principal, key, "drop", target)) {
@@ -1920,6 +1926,9 @@ private:
 			filter = " WHERE table_schema = 'main'";
 		}
 		sql = "SELECT table_name AS name FROM (" + sql + ")" + filter + " ORDER BY 1";
+		if (show.show_type != ShowType::SHOW_FROM) {
+			AppendTempListing("show_tables", sql); // spec 050: the session's own temps, under a USE too
+		}
 		ref = SubqueryOf(sql);
 	}
 

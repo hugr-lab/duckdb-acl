@@ -491,7 +491,11 @@ bool CatalogBackend::ResolveTable(const Principal &principal, const string &vnam
 		}
 	}
 	TablePolicy policy;
-	bool found = LookupRelation(principal, vname, policy) || LookupSchemaAlias(principal, vname, policy);
+	bool found = LookupRelation(principal, vname, policy);
+	if (!found && LookupSchemaAlias(principal, vname, policy)) {
+		found = true;
+		policy.from_schema_alias = true;
+	}
 	lock_guard<mutex> guard(lock);
 	ClearIfOversized(objects);
 	objects[key] = {found, policy};

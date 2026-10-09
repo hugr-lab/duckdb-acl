@@ -134,6 +134,8 @@ struct TablePolicy {
 	//! predicate and injected values force the read-only *shape* on reads, while writes still go to
 	//! the physical table with the predicate AND-ed in and the values assigned.
 	bool writable = false;
+	//! Found through a live schema alias (which claims every name under it), not a stored object
+	bool from_schema_alias = false;
 	//! Columns a grant assigns on writes: physical column name -> value template (claims/constants
 	//! only). On INSERT the value is added when absent and overridden when supplied; on UPDATE a SET
 	//! of the column is overridden - so a row cannot be written outside the grant's slice.
