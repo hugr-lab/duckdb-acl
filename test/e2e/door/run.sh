@@ -285,6 +285,9 @@ run_leg() {
 			foreign="$(echo "$line" | cut -d, -f3)"
 			[ "$foreign" = "0" ] || fail "$name: client $who saw $foreign rows of another tenant at $label"
 		done
+		# spec 114: USE through quack_query_by_name reached the client's session on the node
+		grep -q "^use,c.main$" "$TMP/$name.$who.out" ||
+			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: USE through the door did not answer c.main"; }
 		# the bootstrap seeds two acme rows and one globex row, so each client's own total differs
 		case "$who" in acme) seeded=2 ;; globex) seeded=1 ;; esac
 		before="$(grep "^seen_before," "$TMP/$name.$who.out" | cut -d, -f2)"

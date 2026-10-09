@@ -1,6 +1,6 @@
 # Spec 114: the session's default catalog
 
-- **Status**: accepted (owner, 2026-10-09)
+- **Status**: implemented (accepted by the owner 2026-10-09)
 - **Date**: 2026-10-09
 - **Follows**: spec 113 (DDL names; its "Next" section), spec 068 (client-local settings), spec 050 (a
   Flight session is a connection)
@@ -80,3 +80,25 @@ name refuse, as a written one would). Never on a shared connection.
 - **Flight session options / `SET acl_session_catalog`**: more surfaces for the same thing; `USE` is
   what every SQL client already sends.
 - **Accept `USE` as a no-op**: a client would believe it switched and read the wrong catalog.
+
+## As built
+
+- **Kept on the session record** (`Session::use_catalog` / `use_schema`), set by the follow-up
+  `acl_session_use(<ops id>, vcat, schema)` the rewriter composes after its checks - at execution, by
+  the session's non-secret ops id (`Principal::session`), never at parse and never by the handle. No
+  change to the ext-common `Principal` contract.
+- **Applied in the rewriter** (`AclRewriter::Key`): a short name is qualified with the session's
+  catalog (and, for a bare name, its schema) before the resolver sees it, so the resolver, its caches
+  and spec 113's DDL rules are untouched - a qualified name was already resolved in any catalog the
+  principal holds. Metadata surfaces stay as written. The same qualification serves reads, DML targets,
+  CREATE / DROP / RENAME and a bare `CREATE SCHEMA IF NOT EXISTS`. Not qualified: virtual table / scalar
+  function names (they still resolve in the role's MAIN catalog) - a follow-up if a client needs it.
+- **`USE SCHEMA s`** is compiled by the parser override into `SET acl_use_schema = 's'` (duckdb has no
+  such grammar); duckdb's `USE x[.y]` is its own `SET schema = '…'`. Both go to `RewriteUse`.
+- **Flight**: a client statement that is a command (`SET`/`USE`, `CREATE`, `DROP`, `ALTER`) runs at
+  `GetFlightInfo` (`ClientStatementIsCommand` in `AnswersOnlyCount`), whatever the rewrite made of it -
+  found by the e2e: `USE` became the record's `SELECT acl_session_use(…)`, a query, left to a DoGet ADBC
+  never sends. The same held for a `CREATE VIEW` (`SELECT acl_register_view(…)`) and a view RENAME.
+- **Tests**: `test/cpp/test_acl_session_use.cpp` (the positive path - a handle is minted at runtime),
+  `test/sql/acl_session_use.test` (refusals on a per-statement prefix, the function is no principal's),
+  the Flight e2e (ADBC `USE SCHEMA` / `USE`), the door e2e (quack through `quack_query_by_name`).

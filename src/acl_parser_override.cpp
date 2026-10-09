@@ -275,6 +275,68 @@ bool ParseAttachLineage(const string &text, ParserOptions &options, vector<uniqu
 	return true;
 }
 
+//! spec 114: `USE SCHEMA <name>[;]` as the one statement of the text -> `SET acl_use_schema = '<name>'`,
+//! which the rewriter reads as USE of that schema in the session's catalog. Any other text unchanged.
+string UseSchemaAsSet(const string &text) {
+	idx_t i = 0;
+	auto skip_space = [&]() {
+		while (i < text.size() && StringUtil::CharacterIsSpace(text[i])) {
+			i++;
+		}
+	};
+	auto word = [&](const char *expected) {
+		auto size = strlen(expected);
+		if (i + size > text.size() || !StringUtil::CIEquals(text.substr(i, size), expected)) {
+			return false;
+		}
+		if (i + size < text.size() && !StringUtil::CharacterIsSpace(text[i + size])) {
+			return false;
+		}
+		i += size;
+		return true;
+	};
+	skip_space();
+	if (!word("use")) {
+		return text;
+	}
+	skip_space();
+	if (!word("schema")) {
+		return text;
+	}
+	skip_space();
+	string name;
+	if (i < text.size() && text[i] == '"') {
+		for (i++; i < text.size(); i++) {
+			if (text[i] == '"' && i + 1 < text.size() && text[i + 1] == '"') {
+				name += '"';
+				i++;
+			} else if (text[i] == '"') {
+				break;
+			} else {
+				name += text[i];
+			}
+		}
+		if (i >= text.size()) {
+			return text;
+		}
+		i++;
+		name = "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+	} else {
+		while (i < text.size() && (StringUtil::CharacterIsAlphaNumeric(text[i]) || text[i] == '_')) {
+			name += text[i++];
+		}
+	}
+	skip_space();
+	if (i < text.size() && text[i] == ';') {
+		i++;
+	}
+	skip_space();
+	if (name.empty() || i != text.size()) {
+		return text;
+	}
+	return "SET acl_use_schema = '" + StringUtil::Replace(name, "'", "''") + "'";
+}
+
 //! The principal a prefix stands for. A role is itself, a token is verified here, and a session is a
 //! handle a door already exchanged a token for (spec 040) - so this is the one place that turns any
 //! of the three into a principal, and the one place that refuses.
@@ -739,7 +801,9 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	if (mode != AclPrefix::Mode::NATIVE || !ParseAttachLineage(prefix.rest, inner, statements)) {
 		AclParseGuard guard;
 		Parser parser(inner);
-		parser.ParseQuery(prefix.rest);
+		// spec 114: `USE SCHEMA s` - a form duckdb's grammar lacks - is the session's default schema
+		auto rest = mode == AclPrefix::Mode::QUERY ? UseSchemaAsSet(prefix.rest) : prefix.rest;
+		parser.ParseQuery(rest);
 		statements = std::move(parser.statements);
 	}
 

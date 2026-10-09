@@ -660,6 +660,29 @@ vector<PolicyStore::SessionInfo> PolicyStore::SessionList() {
 	return out;
 }
 
+bool PolicyStore::SessionUse(const string &id, const string &vcat, const string &schema) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			entry.second.use_catalog = vcat;
+			entry.second.use_schema = schema;
+			return true;
+		}
+	}
+	return false;
+}
+
+void PolicyStore::SessionUseOf(const string &id, string &vcat, string &schema) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			vcat = entry.second.use_catalog;
+			schema = entry.second.use_schema;
+			return;
+		}
+	}
+}
+
 bool PolicyStore::SessionKill(const string &id) {
 	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();

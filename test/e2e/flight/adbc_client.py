@@ -179,6 +179,15 @@ with connect(acme_token) as conn:
     cur = conn.cursor()
     cur.execute("SELECT 1")  # the first call earns the cookie; a session option needs the session
     cur.fetchall()
+    # spec 114: USE through the door - the session's default schema, kept on the session
+    cur.execute("USE SCHEMA stage")
+    cur.execute("SELECT current_schema()")
+    shown = cur.fetchall()[0][0]
+    check("USE SCHEMA sets the session's default schema", shown == "stage", shown)
+    cur.execute("USE c")
+    cur.execute("SELECT current_schema(), current_database()")
+    shown = cur.fetchall()[0]
+    check("USE <catalog> resets it to the catalog's root", shown == ("main", "c"), shown)
     tz_option = ConnectionOptions.OPTION_SESSION_OPTION_PREFIX.value + "TimeZone"
     conn.adbc_connection.set_options(**{tz_option: "Asia/Tokyo"})
     cur.execute("SELECT '2026-01-01 00:00:00+00'::TIMESTAMPTZ::VARCHAR")

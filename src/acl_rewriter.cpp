@@ -173,6 +173,11 @@ public:
 		// re-parse rewrite templates with the native parser, never re-entering this override
 		template_options = options;
 		template_options.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
+		// spec 114: the catalog / schema the session chose with USE - read once per statement
+		if (principal.session_connection && !principal.session.empty()) {
+			session_id = principal.session; // the ops id
+			store.SessionUseOf(session_id, use_catalog, use_schema);
+		}
 	}
 
 	void RewriteStatement(SQLStatement &stmt) {
@@ -312,6 +317,10 @@ public:
 	//! anything on its way into a setting), and GLOBAL is never a principal's to set.
 	void RewriteSetStatement(SetStatement &stmt) {
 		auto &name = stmt.name.GetIdentifierName();
+		if (StringUtil::CIEquals(name, "schema") || StringUtil::CIEquals(name, "acl_use_schema")) {
+			RewriteUse(stmt); // spec 114: USE
+			return;
+		}
 		if (stmt.scope == SetScope::VARIABLE || !ClientSettingAllowed(name)) {
 			Deny(Reason::SETTING_DENIED,
 			     (stmt.set_type == SetType::SET ? "SET \"" : "RESET \"") + name +
@@ -699,7 +708,7 @@ private:
 		}
 		RewriteColumnDefinitions(table_info);
 		RequireUndottedParts(info.GetQualifiedName());
-		auto key = VirtualKey(info.GetQualifiedName());
+		auto key = Key(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
 			Deny(Reason::DDL_HOME, "no schema of the catalog allows creating \"" + key + "\"");
@@ -732,6 +741,152 @@ private:
 		}
 	}
 
+	//! spec 114: a name as the session reads it. With no USE in force, as written. Otherwise a short name
+	//! is read in the session's catalog (its default schema first for a bare name, as duckdb's own
+	//! `USE db.schema`): `orders` -> `<vcat>.<schema>.orders`, `dbt_home.m` -> `<vcat>.dbt_home.m`. A name
+	//! whose first part is a catalog the principal holds stays as written - unless that part is also a
+	//! schema of the session's catalog, which is refused rather than guessed (spec 113's rule).
+	string Key(const QualifiedName &name) {
+		auto key = VirtualKey(name);
+		if ((use_catalog.empty() && use_schema.empty()) || key.empty() || MetadataSurfaceOf(key)) {
+			return key;
+		}
+		auto catalog = UseCatalog();
+		if (catalog.empty()) {
+			return key;
+		}
+		vector<string> parts;
+		for (auto &part : name.Path()) {
+			if (!part.empty()) {
+				parts.push_back(part.GetIdentifierName());
+			}
+		}
+		if (parts.size() >= 2 && HoldsCatalog(parts[0])) {
+			string vcat, path;
+			if (store.ResolveHeldSchema(principal, catalog + "." + parts[0], vcat, path) &&
+			    StringUtil::CIEquals(vcat, catalog)) {
+				Deny(Reason::DDL_HOME, "\"" + key + "\" is ambiguous - catalog \"" + parts[0] + "\" or schema \"" +
+				                           parts[0] + "\" of the session's catalog " + catalog +
+				                           "; write the catalog in front to mean the schema");
+			}
+			return key;
+		}
+		if (parts.size() == 1 && !use_schema.empty()) {
+			return catalog + "." + use_schema + "." + key;
+		}
+		return catalog + "." + key;
+	}
+
+	//! The session's catalog: the one it USEd, else the role's MAIN one
+	string UseCatalog() {
+		return use_catalog.empty() ? store.PrincipalMainCatalog(principal) : use_catalog;
+	}
+
+	bool HoldsCatalog(const string &name) {
+		if (!held_loaded) {
+			held_catalogs = store.PrincipalCatalogs(principal);
+			held_loaded = true;
+		}
+		for (auto &held : held_catalogs) {
+			if (StringUtil::CIEquals(held, name)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! spec 114: `USE <vcat>[.<schema>]` (duckdb's `SET schema = '...'`) and `USE SCHEMA <schema>` (the
+	//! override's `SET acl_use_schema = '...'`): the session's default catalog / schema. Only on a session
+	//! of the client's own, only what the principal holds; it grants nothing. Recorded by the follow-up
+	//! `acl_session_use(<ops id>, ...)` - at execution, never at parse - by the session's non-secret id.
+	void RewriteUse(SetStatement &stmt) {
+		auto use_schema_form = StringUtil::CIEquals(stmt.name.GetIdentifierName(), "acl_use_schema");
+		if (!principal.session_connection || session_id.empty()) {
+			Deny(Reason::SETTING_DENIED, "USE needs a session of the client's own (a door's ACL SESSION): a "
+			                             "per-statement prefix runs on a connection the gateway shares, where "
+			                             "the choice would be the next principal's");
+		}
+		if (stmt.set_type != SetType::SET) {
+			Deny(Reason::SETTING_DENIED, "RESET of the schema is USE <catalog> under ACL");
+		}
+		auto &set = stmt.Cast<SetVariableStatement>();
+		if (!set.value || set.value->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+			Deny(Reason::SETTING_DENIED, "USE takes a name");
+		}
+		auto parts = SplitIdentifierPath(set.value->Cast<ConstantExpression>().GetLiteral().ToValue().ToString());
+		string catalog, schema;
+		if (use_schema_form) {
+			if (parts.size() != 1) {
+				Deny(Reason::SETTING_DENIED, "USE SCHEMA takes one schema name");
+			}
+			catalog = UseCatalog();
+			schema = parts[0];
+		} else {
+			if (parts.empty() || parts.size() > 2) {
+				Deny(Reason::SETTING_DENIED, "USE takes <catalog> or <catalog>.<schema>");
+			}
+			catalog = parts[0];
+			schema = parts.size() == 2 ? parts[1] : string();
+		}
+		if (catalog.empty() || !HoldsCatalog(catalog)) {
+			HoldsCatalog(string());
+			Deny(Reason::SETTING_DENIED, "USE: \"" + catalog + "\" is no catalog of the principal - it holds: " +
+			                                 StringUtil::Join(held_catalogs, ", "));
+		}
+		for (auto &held : held_catalogs) {
+			if (StringUtil::CIEquals(held, catalog)) {
+				catalog = held; // as the policy spells it
+			}
+		}
+		if (StringUtil::CIEquals(schema, "main")) {
+			schema.clear(); // the catalog's root
+		}
+		if (!schema.empty()) {
+			string vcat, path;
+			if (!store.ResolveHeldSchema(principal, catalog + "." + schema, vcat, path) ||
+			    !StringUtil::CIEquals(vcat, catalog)) {
+				Deny(Reason::SETTING_DENIED,
+				     "USE: \"" + catalog + "." + schema + "\" is no schema the principal holds");
+			}
+			schema = path;
+		}
+		Note(schema.empty() ? catalog : catalog + "." + schema, "use");
+		if (schema.empty() && StringUtil::CIEquals(catalog, store.PrincipalMainCatalog(principal))) {
+			catalog.clear(); // back where the session began
+		}
+		drop_statement = true;
+		follow_ups.push_back(AclCall("acl_session_use", {Value(session_id), Value(catalog), Value(schema)}));
+	}
+
+	//! `a.b` / `"a.b".c` (what duckdb's USE transform renders) into its identifiers
+	static vector<string> SplitIdentifierPath(const string &text) {
+		vector<string> parts;
+		string current;
+		bool quoted = false;
+		for (idx_t i = 0; i < text.size(); i++) {
+			auto c = text[i];
+			if (quoted) {
+				if (c == '"' && i + 1 < text.size() && text[i + 1] == '"') {
+					current += '"';
+					i++;
+				} else if (c == '"') {
+					quoted = false;
+				} else {
+					current += c;
+				}
+			} else if (c == '"') {
+				quoted = true;
+			} else if (c == '.') {
+				parts.push_back(current);
+				current.clear();
+			} else {
+				current += c;
+			}
+		}
+		parts.push_back(current);
+		return parts;
+	}
+
 	//! spec 113: a DDL name is resolved and rebuilt as a dotted path, so a part with a dot of its own
 	//! (`"sub.t"`) would name another, nested object - one the grant never covered (the review's
 	//! finding: a RENAME to `"sub.t"` re-pointed a record at a hidden nested table). Refused.
@@ -755,6 +910,9 @@ private:
 	void RewriteCreateSchema(CreateInfo &info) {
 		RequireUndottedParts(info.GetQualifiedName());
 		auto written = VirtualKey(info.GetQualifiedName());
+		if (!use_catalog.empty() && written.find('.') == string::npos) {
+			written = use_catalog + "." + written; // spec 114: a bare schema name is the session catalog's
+		}
 		string vcat, path;
 		if (written.empty() || !store.ResolveHeldSchema(principal, written, vcat, path)) {
 			Deny(Reason::STATEMENT_TYPE, "only tables and views can be created through the ACL - a schema is "
@@ -870,7 +1028,7 @@ private:
 			Deny(Reason::STATEMENT_TYPE, "a view needs a query");
 		}
 		RequireUndottedParts(info.GetQualifiedName());
-		auto key = VirtualKey(info.GetQualifiedName());
+		auto key = Key(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
 			Deny(Reason::DDL_HOME, "no schema of the catalog allows creating \"" + key + "\"");
@@ -908,7 +1066,7 @@ private:
 			Deny(Reason::STATEMENT_TYPE, "only tables and views can be dropped through the ACL");
 		}
 		RequireUndottedParts(info.GetQualifiedName());
-		auto key = VirtualKey(info.GetQualifiedName());
+		auto key = Key(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "drop", target)) {
 			// the session's own temp table drops natively, symmetric with how it resolves (spec 050)
@@ -966,7 +1124,7 @@ private:
 		}
 		RequireUndottedParts(info.GetQualifiedName());
 		RequireUndotted(new_name);
-		auto key = VirtualKey(info.GetQualifiedName());
+		auto key = Key(info.GetQualifiedName());
 		auto dot = key.rfind('.');
 		auto new_key = (dot == string::npos ? string() : key.substr(0, dot + 1)) + new_name.GetIdentifierName();
 		DdlTarget from, to;
@@ -1410,7 +1568,7 @@ private:
 			if (IsCteName(base)) {
 				return; // a CTE reference, not a catalog object
 			}
-			auto key = VirtualKey(base.GetQualifiedName());
+			auto key = Key(base.GetQualifiedName());
 			if (auto surface = MetadataSurfaceOf(key)) {
 				// `FROM information_schema.tables` / `FROM duckdb_tables` - the view forms
 				Note(key, "select");
@@ -2834,9 +2992,9 @@ private:
 	                             const string &capability) {
 		string key;
 		if (target_ref && target_ref->type == TableReferenceType::BASE_TABLE) {
-			key = VirtualKey(target_ref->Cast<BaseTableRef>().GetQualifiedName());
+			key = Key(target_ref->Cast<BaseTableRef>().GetQualifiedName());
 		} else {
-			key = VirtualKey(target_name);
+			key = Key(target_name);
 		}
 		TablePolicy policy;
 		if (!store.ResolveTable(principal, key, policy)) {
@@ -3212,12 +3370,16 @@ private:
 	//! policy tables and all, rendered into a column name (spec 052 addendum 2026-09-17).
 	void SubstituteSessionIdentity(unique_ptr<ParsedExpression> &expr, const string &name) {
 		auto alias = expr->GetName();
+		// spec 114: what the session USEd, else the role's MAIN catalog and its root
+		auto schema = use_schema.empty() ? string("main") : use_schema;
 		if (StringUtil::CIEquals(name, "current_schema")) {
-			expr = ConstantExpression::String("main");
+			expr = ConstantExpression::String(schema);
 		} else if (StringUtil::CIEquals(name, "current_schemas")) {
 			vector<unique_ptr<ParsedExpression>> parts;
-			parts.push_back(ConstantExpression::String("main"));
+			parts.push_back(ConstantExpression::String(schema));
 			expr = make_uniq<FunctionExpression>(Identifier("list_value"), std::move(parts));
+		} else if (!use_catalog.empty()) {
+			expr = ConstantExpression::String(use_catalog);
 		} else {
 			expr = BuildCurrentDatabaseExpr();
 		}
@@ -3354,6 +3516,12 @@ private:
 
 private:
 	const Principal &principal;
+	//! spec 114: the session's USE (empty = the role's MAIN catalog / the catalog's root), its ops id
+	string use_catalog;
+	string use_schema;
+	string session_id;
+	vector<string> held_catalogs;
+	bool held_loaded = false;
 	PolicyStore &store;
 	//! the virtual name of the DML target currently being rewritten (for diagnostics and mapping)
 	string dml_target_name;

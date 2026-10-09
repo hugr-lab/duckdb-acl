@@ -570,6 +570,29 @@ connection - the door's read; `current_setting` stays denied to principals. On q
 `SET TimeZone = 'Asia/Tokyo'` is plain SQL through `acl_quack_authorize` and the gate is the whole
 mechanism. duckdb autoloads `icu` for the settings themselves.
 
+## The session's catalog and schema (spec 114)
+
+A short name (`orders`, `dbt_home.m`) resolves in the role's MAIN catalog. A client chooses another for
+its session with plain SQL:
+
+```sql
+USE mart;              -- the default catalog: `facts` is mart.facts, `out.t` is mart.out.t
+USE SCHEMA out;        -- the default schema in it: a bare `t` is mart.out.t, the root is main.<x>
+USE mart.out;          -- both at once (duckdb's own form)
+USE SCHEMA main;       -- back to the catalog's root
+USE sales;             -- the role's MAIN catalog: back where the session began
+```
+
+- Only on a session of the client's own (`ACL SESSION`, a door's client) - a gateway's per-statement
+  prefix is refused, as a `SET` is - and only a catalog or schema the principal holds a grant on; it
+  grants nothing, a short name reaches what the full one does. A name whose first part is a catalog
+  the principal holds stays that catalog's; if that part is also a schema of the session's catalog,
+  the statement is refused as ambiguous.
+- It is kept on the session, so every door carries it: on Flight `USE` is a statement like any other
+  (it runs at `GetFlightInfo`, so ADBC's unfetched `execute` keeps it); on quack a plain `USE` is the
+  client's own catalog - send it to the node with `FROM quack_query_by_name('<alias>', 'USE mart')`.
+- `current_database()` / `current_schema()` answer the session's catalog and schema.
+
 ## Audit and metrics (spec 069)
 
 Every decision the node makes about a principal is one **event**: a statement admitted or refused

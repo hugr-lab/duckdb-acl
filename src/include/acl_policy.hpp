@@ -342,6 +342,10 @@ struct PolicyStore {
 		string lineage_parent;
 		string lineage_root_parent;
 		string lineage_job;
+		//! spec 114: the default catalog / schema the client chose with `USE` (empty = the role's MAIN
+		//! catalog / the catalog's root)
+		string use_catalog;
+		string use_schema;
 		//! The stream the session's last rewritten statement drained (spec 042, judged on the AST), for
 		//! the door's completion hook to tell a load's outcome from any other statement's (spec 069);
 		//! taken once
@@ -921,6 +925,13 @@ struct PolicyStore {
 	vector<SessionInfo> SessionList();
 	//! End the session with this ops id; true if one was found. Admin-only.
 	bool SessionKill(const string &id);
+	//! spec 114: a session's `USE`, by its ops id (Principal::session - never the handle)
+	bool SessionUse(const string &id, const string &vcat, const string &schema);
+	void SessionUseOf(const string &id, string &vcat, string &schema);
+	//! spec 114: the virtual catalogs the principal holds a grant on, and its MAIN one ('' when not
+	//! unique); empty in memory mode
+	vector<string> PrincipalCatalogs(const Principal &principal);
+	string PrincipalMainCatalog(const Principal &principal);
 	//! Settings behind the two rules (spec 044): seconds a session may go unused before it is dead
 	//! (0 = never), and how many may live at once (0 = unlimited).
 	int64_t SessionIdleTimeout();

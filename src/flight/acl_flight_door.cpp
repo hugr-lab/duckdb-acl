@@ -15,6 +15,7 @@
 #include "acl_lineage.hpp"
 #include "acl_flight_catalog.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/query_node/list.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
@@ -1944,8 +1945,48 @@ public:
 	//! spec 111: a statement that returns no rows - DML answers its changed rows (CHANGED_ROWS), DDL
 	//! nothing - as duckdb knows it once bound, parameters or not (the result eagerness of a prepared
 	//! statement is not settled until it runs). `INSERT ... RETURNING` returns rows: not one of these.
+	static bool ClientStatementIsCommand(const string &query) {
+		try {
+			Parser parser(ParserOptions::Builtin());
+			parser.ParseQuery(UseSchemaClientText(query));
+			if (parser.statements.size() != 1) {
+				return false;
+			}
+			switch (parser.statements[0]->type) {
+			case StatementType::SET_STATEMENT:
+			case StatementType::DROP_STATEMENT:
+			case StatementType::ALTER_STATEMENT:
+				return true;
+			case StatementType::CREATE_STATEMENT: {
+				auto &info = parser.statements[0]->Cast<CreateStatement>().info;
+				return info && info->type != CatalogType::SECRET_ENTRY;
+			}
+			default:
+				return false;
+			}
+		} catch (std::exception &) {
+			return false;
+		}
+	}
+
+	//! `USE SCHEMA s` is no duckdb grammar - read as the SET it compiles to (the override's spec 114 form)
+	static string UseSchemaClientText(const string &query) {
+		auto text = query;
+		StringUtil::Trim(text);
+		if (StringUtil::StartsWith(StringUtil::Lower(text), "use schema ")) {
+			return "SET acl_use_schema = 'x'";
+		}
+		return query;
+	}
+
 	static bool AnswersOnlyCount(const FlightDoorState::Reservation &reservation) {
 		auto &stmt = *reservation.stmt;
+		// a client's USE / SET / CREATE / DROP / ALTER answers no rows, whatever the rewrite made of it: a
+		// USE or a CREATE VIEW becomes the record's `SELECT acl_…(…)` (a query to duckdb), and left to the
+		// DoGet a client that never fetches it - ADBC's execute - would lose it (spec 114)
+		if (ClientStatementIsCommand(reservation.query)) {
+			return true;
+		}
 		auto properties = stmt.GetStatementProperties();
 		if (properties.bound_all_parameters) {
 			return properties.return_type != StatementReturnType::QUERY_RESULT;

@@ -32,3 +32,8 @@ INSERT INTO remote.main.orders SELECT * FROM payload;
 SELECT 'seen_after' AS label, count(*) AS n,
        count(*) FILTER (WHERE NOT (${ACL_E2E_OWN})) AS foreign_rows
 FROM remote.main.orders;
+
+-- spec 114: a quack client's own USE is its local catalog; the node's is set through quack_query_by_name
+-- and kept on this client's session
+FROM quack_query_by_name('remote', 'USE SCHEMA main');
+SELECT 'use' AS label, * FROM quack_query_by_name('remote', 'SELECT current_database() || ''.'' || current_schema()');
