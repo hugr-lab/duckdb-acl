@@ -577,6 +577,41 @@ FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 
 c.exp.model__tmp	DROP
 c.exp.model	CREATE
 
+# ... and the rename is a run of the client's: the old name in, the new name out, each field as it is
+query TTTT
+SELECT payload->'datasets'->(payload->'inputs'->>0)::INT->>'name', payload->'datasets'->(payload->'outputs'->>0)::INT->>'name',
+    (SELECT string_agg(e->>'target_field' || ':' || (e->>'subtype'), ',' ORDER BY e->>'target_field')
+     FROM (SELECT unnest(from_json(payload->'edges', '["JSON"]')) AS e)), job_name LIKE 'sql:%'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'RUN_COMPLETE';
+----
+c.exp.model__tmp	c.exp.model	id:IDENTITY,total:IDENTITY	true
+
+# a live alias's object (no record, so no DATASET event of the new name) is followed by the run alike
+statement ok
+ACL ROLE "w" CREATE TABLE home.alias__tmp AS SELECT id FROM src;
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" ALTER TABLE home.alias__tmp RENAME TO alias_model;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT event_type, payload->'datasets'->(payload->'inputs'->>0)::INT->>'name', payload->'datasets'->(payload->'outputs'->>0)::INT->>'name'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) ORDER BY 1;
+----
+DATASET	NULL	c.home.alias__tmp
+RUN_COMPLETE	c.home.alias__tmp	c.home.alias_model
+
 statement ok
 DELETE FROM before;
 

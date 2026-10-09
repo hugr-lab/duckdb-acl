@@ -1345,9 +1345,10 @@ bool PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname,
 			                     " AND \"name\" = " + Lit(new_vname.substr(dot + 1)));
 		}
 	});
+	// lineage (spec 107/113): the old name ends, the new one begins - the backend follows a swap. The
+	// rename itself is also a run (the worker's), from the old name to the new, field by field
+	NoteDefinitionLineage(vcat, vname, "DROP");
 	if (had_record) {
-		// lineage (spec 107/113): the old name ends, the new one begins - the backend follows a swap
-		NoteDefinitionLineage(vcat, vname, "DROP");
 		NoteDefinitionLineage(vcat, new_vname, "CREATE");
 	}
 	return had_record;
