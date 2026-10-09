@@ -180,6 +180,12 @@ with connect(acme_token) as conn:
     cur.execute("SELECT 1")  # the first call earns the cookie; a session option needs the session
     cur.fetchall()
     # spec 114: USE through the door - the session's default schema, kept on the session
+    # spec 115: a driver reads the full type off the field metadata
+    cur.execute("SELECT 1.5::DECIMAL(9,2) AS d, {'a': 1} AS s")
+    md = {f.name: dict(f.metadata or {}) for f in cur.fetch_arrow_table().schema}
+    shown = (md["d"].get(b"ARROW:FLIGHT:SQL:TYPE_NAME"), md["d"].get(b"ARROW:FLIGHT:SQL:PRECISION"),
+             md["s"].get(b"ARROW:FLIGHT:SQL:TYPE_NAME"))
+    check("ADBC reads TYPE_NAME / PRECISION", shown == (b"DECIMAL(9,2)", b"9", b"STRUCT(a INTEGER)"), shown)
     cur.execute("USE SCHEMA stage")
     cur.execute("SELECT current_schema()")
     shown = cur.fetchall()[0][0]

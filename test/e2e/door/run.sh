@@ -288,6 +288,8 @@ run_leg() {
 		# spec 114: USE through quack_query_by_name reached the client's session on the node
 		grep -q "^use,m.7$" "$TMP/$name.$who.out" ||
 			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: USE m through the door did not read m.hello"; }
+		grep -q "^nested,8$" "$TMP/$name.$who.out" ||
+			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: a nested schema read through quack's catalog"; }
 		grep -q "^use_back,c$" "$TMP/$name.$who.out" ||
 			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: USE c did not go back"; }
 		# the bootstrap seeds two acme rows and one globex row, so each client's own total differs

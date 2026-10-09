@@ -440,6 +440,17 @@ struct CatalogBackend {
 		string params;
 		Value comment;
 		Value returns; // a scalar's declared result type
+		//! spec 115: a bare call reaches it (a flat name of the one MAIN catalog) - it then shadows an
+		//! engine function of its name and kind; any other is called qualified (`c.f`, `c.a.b.f`)
+		bool bare = false;
+		//! a table function's declared result columns, in order (spec 115: `acl_function_columns`)
+		struct Column {
+			string name;
+			string type;
+			Value nullable;
+			Value comment;
+		};
+		vector<Column> columns;
 	};
 	vector<VisibleFunction> VisibleFunctions(const Principal &principal);
 

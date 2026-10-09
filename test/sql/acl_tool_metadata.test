@@ -1,0 +1,280 @@
+# name: test/sql/acl_tool_metadata.test
+# description: spec 115 - what a tool reads to build its tree: a principal's virtual functions in every
+#   catalog it holds (called qualified, listed with catalog and schema path, a table function's result
+#   type), acl_function_columns() (parameters, result columns, a scalar's return), and duckdb_schemas
+#   with parents and functions-only schemas. A function the principal cannot call is never listed.
+# group: [sql]
+
+require acl
+
+# memory mode (no policy catalog): no virtual function, so no rows - and the shape is the same
+statement ok
+SELECT acl_define_role('m', '');
+
+query I
+ACL ROLE "m" SELECT count(*) FROM acl_function_columns();
+----
+0
+
+query I
+ACL ROLE "m" SELECT column_name FROM (DESCRIBE SELECT * FROM acl_function_columns()) ORDER BY ALL LIMIT 2;
+----
+column_kind
+column_name
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG other;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG closed;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG other TO ROLE r;
+
+statement ok
+ACL ADMIN ADD SCALAR other.hidden MACRO 'lower(acl_arg(1))';
+
+statement ok
+SELECT acl_add_table_function('c', 'nested.deep', 'SELECT 1 AS one', '', 'one INTEGER', '');
+
+statement ok
+SELECT acl_add_table_function('c', 'raw.eu.feed', 'SELECT 3 AS three', '', 'three INTEGER', '');
+
+statement ok
+SELECT acl_add_table_function('other', 'tf', 'SELECT 2 AS two, ''x'' AS "Name"', 'n INTEGER', 'two INTEGER, "Name" VARCHAR', 'tf comment');
+
+statement ok
+SELECT acl_add_table_function('other', 'nocaps', 'SELECT 4 AS four', '', 'four INTEGER', '');
+
+statement ok
+ACL ADMIN GRANT OBJECT other.nocaps TO ROLE r CAPS '{}';
+
+# a table function whose grant narrows its result to one column (spec 011)
+statement ok
+SELECT acl_add_table_function('other', 'rep', 'SELECT 1 AS id, ''S'' AS ssn, 2 AS amount', '', 'id INTEGER, ssn VARCHAR, amount INTEGER', '');
+
+statement ok
+ACL ADMIN GRANT OBJECT other.rep TO ROLE r CAPS '{"select": true}' COLUMNS 'id,ssn = ''***''';
+
+# the same name in two held catalogs: bare is MAIN's, qualified is each catalog's own
+statement ok
+ACL ADMIN ADD SCALAR c.shout MACRO 'upper(acl_arg(1))';
+
+statement ok
+ACL ADMIN ADD SCALAR other.shout MACRO 'lower(acl_arg(1))';
+
+# a root function and one in a nested schema literally called `main`: never merged (`c.main.f` is the
+# nested one, the root one is `c.f`), and a deny on one does not open or close the other
+statement ok
+SELECT acl_add_table_function('c', 'f', 'SELECT ''root'' AS w', '', 'w VARCHAR', '');
+
+statement ok
+SELECT acl_add_table_function('c', 'main.f', 'SELECT ''nested'' AS w', '', 'w VARCHAR', '');
+
+statement ok
+ACL ADMIN GRANT OBJECT c.main.f TO ROLE r CAPS '{}';
+
+statement ok
+SELECT acl_add_table_function('closed', 'secret', 'SELECT 5 AS five', '', 'five INTEGER', '');
+
+# --- a function of any held catalog is called by its qualified name ----------------------------------
+
+query I
+ACL ROLE "r" SELECT other.hidden('X');
+----
+x
+
+query I
+ACL ROLE "r" SELECT * FROM c.nested.deep();
+----
+1
+
+query I
+ACL ROLE "r" SELECT * FROM c.raw.eu.feed();
+----
+3
+
+query II
+ACL ROLE "r" SELECT * FROM other.tf(1);
+----
+2	x
+
+# `<vcat>.main.<f>` is the catalog's root, as for a relation
+query II
+ACL ROLE "r" SELECT * FROM other.main.tf(1);
+----
+2	x
+
+# a bare call still reaches only the MAIN catalog
+statement error
+ACL ROLE "r" SELECT hidden('X');
+----
+<REGEX>:.*hidden.*
+
+statement error
+ACL ROLE "r" SELECT * FROM other.nocaps();
+----
+<REGEX>:.*nocaps.*
+
+query I
+ACL ROLE "r" SELECT shout('X');
+----
+X
+
+query I
+ACL ROLE "r" SELECT other.shout('X');
+----
+x
+
+query I
+ACL ROLE "r" SELECT * FROM c.f();
+----
+root
+
+statement error
+ACL ROLE "r" SELECT * FROM c.main.f();
+----
+<REGEX>:.*select on table function "c.main.f" is not allowed.*
+
+# `c.MAIN.f` reads the same way (case-insensitive), still never the root
+statement error
+ACL ROLE "r" SELECT * FROM c.MAIN.f();
+----
+<REGEX>:.*table function "f" is not allowed.*
+
+query II
+ACL ROLE "r" SELECT * FROM other.rep();
+----
+1	***
+
+statement error
+ACL ROLE "r" SELECT * FROM closed.secret();
+----
+<REGEX>:.*secret.*
+
+# --- duckdb_functions(): every held catalog, schema path, a table function's result type -------------
+
+query IIIII rowsort
+ACL ROLE "r" SELECT database_name, schema_name, function_name, function_type, return_type FROM duckdb_functions() WHERE database_name IN ('c', 'other', 'closed');
+----
+c	main	f	table	TABLE(w VARCHAR)
+c	main	shout	scalar	VARCHAR
+c	nested	deep	table	TABLE(one INTEGER)
+c	raw.eu	feed	table	TABLE(three INTEGER)
+other	main	hidden	scalar	VARCHAR
+other	main	rep	table	TABLE(id INTEGER, ssn VARCHAR)
+other	main	shout	scalar	VARCHAR
+other	main	tf	table	TABLE(two INTEGER, "Name" VARCHAR)
+
+query I
+ACL ROLE "r" SELECT comment FROM duckdb_functions() WHERE function_name = 'tf';
+----
+tf comment
+
+# --- acl_function_columns(): parameters, result columns, a scalar's return --------------------------
+
+query IIIIIIII
+ACL ROLE "r" SELECT database_name, schema_name, function_name, column_kind, position, column_name, data_type, comment FROM acl_function_columns() WHERE function_name NOT IN ('f', 'shout', 'rep') ORDER BY ALL;
+----
+c	nested	deep	column	1	one	INTEGER	NULL
+c	raw.eu	feed	column	1	three	INTEGER	NULL
+other	main	hidden	return	0	NULL	VARCHAR	NULL
+other	main	tf	column	1	two	INTEGER	NULL
+other	main	tf	column	2	Name	VARCHAR	NULL
+other	main	tf	param	1	n	INTEGER	NULL
+
+query III
+ACL ROLE "r" SELECT column_kind, position, column_name FROM acl_function_columns('other', 'main', 'tf') ORDER BY ALL;
+----
+column	1	two
+column	2	Name
+param	1	n
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_function_columns('closed');
+----
+0
+
+# what the grant hides is not listed: `amount` is gone; the masked `ssn` has the type the mask gives
+# (bound over the declared columns, as the call reads it - spec 026)
+query IIII
+ACL ROLE "r" SELECT column_kind, position, column_name, data_type FROM acl_function_columns('other', 'main', 'rep') ORDER BY ALL;
+----
+column	1	id	INTEGER
+column	2	ssn	VARCHAR
+
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_functions() WHERE return_type LIKE '%amount%';
+----
+0
+
+statement error
+ACL ROLE "r" SELECT * FROM acl_function_columns(current_date::VARCHAR);
+----
+<REGEX>:.*constant arguments.*
+
+# the operator's own connection reads nothing of it: it is a principal's surface, never a real function
+statement error
+SELECT * FROM acl_function_columns();
+----
+Table Function with name acl_function_columns does not exist
+
+# --- duckdb_schemas(): parents, and a schema that holds only functions ------------------------------
+
+# duckdb's own shape: the leaf as schema_name, the parent's leaf and oid
+query III
+ACL ROLE "r" SELECT database_name, schema_name, parent_schema FROM duckdb_schemas() ORDER BY ALL;
+----
+c	eu	raw
+c	main	NULL
+c	nested	NULL
+c	raw	NULL
+other	main	NULL
+
+# quack's own catalog load (QuackSchemaSet::GetLoadQuery) builds each schema's path through the parent
+# oids - a nested schema must come back as [raw, eu], never [raw, raw.eu]
+query II
+ACL ROLE "r" WITH RECURSIVE schema_tree AS (SELECT oid, database_name, [schema_name] AS schema_path FROM duckdb_schemas() WHERE parent_schema_oid IS NULL UNION ALL SELECT nested.oid, nested.database_name, list_append(parent.schema_path, nested.schema_name) FROM duckdb_schemas() nested JOIN schema_tree parent ON nested.parent_schema_oid = parent.oid) SELECT database_name, schema_path FROM schema_tree ORDER BY ALL;
+----
+c	[main]
+c	[nested]
+c	[raw]
+c	[raw, eu]
+other	[main]
+
+# the other listings take the same schemas: a parent and a functions-only schema are a tree's nodes
+query II
+ACL ROLE "r" SELECT catalog_name, schema_name FROM information_schema.schemata ORDER BY ALL;
+----
+c	main
+c	nested
+c	raw
+c	raw.eu
+other	main
+
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_schemas() WHERE parent_schema_oid IS NOT NULL AND parent_schema_oid = (SELECT oid FROM duckdb_schemas() WHERE database_name = 'c' AND schema_name = 'raw');
+----
+1
+

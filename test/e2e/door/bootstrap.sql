@@ -39,6 +39,8 @@ ACL ADMIN GRANT TABLE c.orders TO ROLE analyst
 -- spec 114: a second catalog the role holds (not MAIN), for a client's USE through the door
 ACL ADMIN CREATE VIRTUAL CATALOG m;
 ACL ADMIN CREATE VIRTUAL VIEW m.hello AS 'SELECT 7 AS v';
+-- spec 115: a nested schema, as quack loads it (through the parent oids)
+ACL ADMIN CREATE VIRTUAL VIEW m.raw.eu.deep AS 'SELECT 8 AS v';
 ACL ADMIN GRANT CATALOG m TO ROLE analyst WITH (select);
 
 -- A leg may publish a second object over another source (the cross-source join under load): run.sh

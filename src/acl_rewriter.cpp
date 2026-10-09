@@ -808,6 +808,30 @@ private:
 		return main_catalog;
 	}
 
+	//! spec 115: resolve a function call as written - `f`, `c.f`, `c.main.f`, `c.a.b.f` - and, for a short
+	//! name under a USE (spec 114), in the session's catalog first. The name the call was resolved by is
+	//! returned in `key` (for the audit and messages); false when no virtual function answers, and the
+	//! caller then judges the call as an engine function by the gate.
+	bool ResolveVirtualFunction(const QualifiedName &name, bool table_kind, TablePolicy &policy, string &key) {
+		auto written = VirtualKey(name);
+		auto resolve = [&](const string &candidate) {
+			return table_kind ? store.ResolveTableFunction(principal, candidate, policy)
+			                  : store.ResolveScalarFunction(principal, candidate, policy);
+		};
+		if (!use_catalog.empty() || !use_schema.empty()) {
+			auto in_session = Key(name);
+			if (in_session != written && resolve(in_session)) {
+				key = in_session;
+				return true;
+			}
+		}
+		if (resolve(written)) {
+			key = written;
+			return true;
+		}
+		return false;
+	}
+
 	//! The session's catalog: the one it USEd, else the role's MAIN one
 	string UseCatalog() {
 		return use_catalog.empty() ? PrincipalMain() : use_catalog;
@@ -1738,9 +1762,13 @@ private:
 		}
 		auto &function = tf.function->Cast<FunctionExpression>();
 		auto vname = function.FunctionName().GetIdentifierName();
+		auto leaf = vname;
 
 		TablePolicy policy;
-		if (store.ResolveTableFunction(principal, vname, policy)) {
+		string resolved_name;
+		if (ResolveVirtualFunction(function.GetQualifiedName(), true, policy, resolved_name)) {
+			vname = resolved_name; // the name the call resolved by: the audit's and the messages'; the alias
+			                       // stays the written leaf
 			// a call returns rows, so it is a read like any relation (spec 012). The check comes
 			// before the template is expanded: a denied call never reaches bind.
 			Note(vname, "select");
@@ -1748,9 +1776,9 @@ private:
 				Deny(Reason::CAPABILITY, "select on table function \"" + vname + "\" is not allowed");
 			}
 			RewriteFunctionArgs(function); // resolve virtual names inside the call arguments first
-			Identifier alias = tf.alias.empty() ? Identifier(vname) : tf.alias;
+			Identifier alias = tf.alias.empty() ? Identifier(leaf) : tf.alias;
 			if (policy.subquery_form) {
-				ref = BuildFunctionSubquery(vname, policy, function, tf);
+				ref = BuildFunctionSubquery(leaf, policy, function, tf);
 			} else {
 				// RENAME-alias: retarget the call to a physical/system function, keep the arguments
 				function.SetQualifiedName(ParsePhysName(policy.phys));
@@ -1773,6 +1801,12 @@ private:
 			// spec 048: the principal's declared keys, substituted before the gate exactly as the
 			// references are - so it needs no hole in the gate either
 			ref = BuildKeysSubquery(function, tf.alias.empty() ? Identifier(vname) : tf.alias);
+			return;
+		}
+		if (StringUtil::CIEquals(vname, "acl_function_columns")) {
+			// spec 115: parameters and result columns of the functions the principal can call - substituted
+			// before the gate like acl_keys, so no hole in it either
+			ref = BuildFunctionColumnsSubquery(function, tf.alias.empty() ? Identifier(vname) : tf.alias);
 			return;
 		}
 		if (StringUtil::CIEquals(vname, "acl_references")) {
@@ -2152,6 +2186,34 @@ private:
 			sql = "SELECT * FROM (" + sql + ") WHERE object = " + quoted;
 		}
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+	}
+
+	//! `FROM acl_function_columns([catalog[, schema[, function]]])` (spec 115): the principal's own
+	//! functions' parameters and result columns, narrowed by constant arguments
+	unique_ptr<TableRef> BuildFunctionColumnsSubquery(FunctionExpression &function, const Identifier &alias) {
+		auto &arguments = function.GetArguments();
+		if (arguments.size() > 3) {
+			Deny(Reason::STATEMENT_TYPE,
+			     "acl_function_columns takes at most three arguments: catalog, schema, function");
+		}
+		static const char *const COLUMNS[] = {"database_name", "schema_name", "function_name"};
+		auto sql = store.PrincipalFunctionColumnsSql(principal);
+		vector<string> filters;
+		for (idx_t i = 0; i < arguments.size(); i++) {
+			auto &argument = arguments[i].GetExpression();
+			if (argument.GetExpressionClass() != ExpressionClass::CONSTANT) {
+				Deny(Reason::STATEMENT_TYPE, "acl_function_columns needs constant arguments");
+			}
+			auto value = argument.Cast<ConstantExpression>().GetLiteral().ToValue();
+			if (!value.IsNull()) {
+				filters.push_back(string(COLUMNS[i]) + " = " + SqlLiteral(value.ToString()));
+			}
+		}
+		if (!filters.empty()) {
+			sql = "SELECT * FROM (" + sql + ") WHERE " + StringUtil::Join(filters, " AND ");
+		}
+		auto select_stmt = store.InstantiateSelect(sql, template_options, false);
 		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
 	}
 
@@ -3300,12 +3362,13 @@ private:
 			auto name = function.FunctionName().GetIdentifierName();
 			// a virtual scalar function for this role: expand it (expr-macro) or retarget it (alias)
 			TablePolicy spolicy;
-			if (store.ResolveScalarFunction(principal, name, spolicy)) {
+			string resolved_name;
+			if (ResolveVirtualFunction(function.GetQualifiedName(), false, spolicy, resolved_name)) {
 				// its template is admin-authored SQL that may read a physical table, so calling it is
 				// a read too: the same capability gates it (spec 012)
-				Note(name, "select");
+				Note(resolved_name, "select");
 				if (!spolicy.caps.count("select")) {
-					Deny(Reason::CAPABILITY, "select on scalar function \"" + name + "\" is not allowed");
+					Deny(Reason::CAPABILITY, "select on scalar function \"" + resolved_name + "\" is not allowed");
 				}
 				RewriteFunctionArgs(function); // resolve virtual names inside the arguments first
 				if (spolicy.subquery_form) {

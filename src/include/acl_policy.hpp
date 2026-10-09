@@ -510,7 +510,12 @@ struct PolicyStore {
 	//! spec 098: the principal's own `duckdb_functions()` - the engine's functions the gate admits for
 	//! its roles (no definition, database or schema outside the system catalog) and the virtual
 	//! functions of its catalogs, in duckdb's shape. Works in every mode; the catalog adds (b).
+	//! spec 115: a function by name, then `<vcat>.main.<f>` as the catalog's root (as ResolveTable does)
+	bool ResolveFunctionNamed(const Principal &principal, const string &vname, bool table_kind, TablePolicy &out);
 	string PrincipalFunctionsSql(const Principal &principal);
+	//! spec 115: `acl_function_columns()` under a principal - parameters and result columns of the
+	//! functions it can call (constants, never a parameter)
+	string PrincipalFunctionColumnsSql(const Principal &principal);
 	//! spec 099: whether the system catalog has a type of this name (the built-ins, their aliases and
 	//! every loaded extension's). Names seen are cached; a miss reads the catalog again, since an
 	//! extension may have been loaded since.

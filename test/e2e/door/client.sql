@@ -38,4 +38,6 @@ FROM remote.main.orders;
 FROM quack_query_by_name('remote', 'USE m');
 SELECT 'use' AS label, * FROM quack_query_by_name('remote', 'SELECT current_database() || ''.'' || v FROM hello');
 FROM quack_query_by_name('remote', 'USE c');
+-- spec 115: another catalog's nested schema, read through quack's own catalog (remote.<vcat>.<a>.<b>.<t>)
+SELECT 'nested' AS label, v FROM remote.m.raw.eu.deep;
 SELECT 'use_back' AS label, * FROM quack_query_by_name('remote', 'SELECT current_database()');

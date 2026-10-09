@@ -618,7 +618,11 @@ touched again by the extension: `base`, `generators`, `node_facts`, `json`, `icu
 `node`, `plan` are nobody's until granted. A function of a newly loaded extension, a builtin a pin
 bump adds, a macro an admin creates: in no category, refused, until put somewhere -
 `SELECT * FROM acl_function_status() WHERE status = 'uncategorized'` is the screen. A principal reads
-its own side of it through `duckdb_functions()`: what it may call, and nothing else (spec 098).
+its own side of it through `duckdb_functions()`: what it may call, and nothing else (spec 098) -
+the virtual functions of every catalog it holds (spec 115), each called by its qualified name
+(`other.f(…)`, `FROM c.raw.eu.feed()`; a flat name of the MAIN catalog also bare, and under a
+session's `USE` a short name is read in its catalog first), and `acl_function_columns([catalog[,
+schema[, function]]])` lists their parameters, result columns and a scalar's return type.
 
 ```sql
 CREATE FUNCTION CATEGORY <name> [COMMENT '<text>']

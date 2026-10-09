@@ -1485,24 +1485,41 @@ bool PolicyStore::ResolveTable(const Principal &principal, const string &vname, 
 	// spec 112: `<vcat>.main.<object>` is the object of the catalog's default schema - the name lineage
 	// gives it (OpenLineage's three parts), so a client that copies it from a data catalog reaches it
 	auto parts = StringUtil::Split(vname, '.');
-	if (parts.size() == 3 && StringUtil::CIEquals(parts[1], "main")) {
+	if (parts.size() == 3 && parts[1] == "main") { // as written (spec 115): see ResolveFunctionNamed
 		return resolve(parts[0] + "." + parts[2]);
 	}
 	return false;
 }
 
 bool PolicyStore::ResolveTableFunction(const Principal &principal, const string &vname, TablePolicy &out) {
-	if (catalog) {
-		return CatalogResolveFunction(principal, vname, true, out);
-	}
-	return Resolve(table_functions, principal, vname, out);
+	return ResolveFunctionNamed(principal, vname, true, out);
 }
 
 bool PolicyStore::ResolveScalarFunction(const Principal &principal, const string &vname, TablePolicy &out) {
-	if (catalog) {
-		return CatalogResolveFunction(principal, vname, false, out);
+	return ResolveFunctionNamed(principal, vname, false, out);
+}
+
+bool PolicyStore::ResolveFunctionNamed(const Principal &principal, const string &vname, bool table_kind,
+                                       TablePolicy &out) {
+	auto resolve = [&](const string &name) {
+		if (catalog) {
+			return CatalogResolveFunction(principal, name, table_kind, out);
+		}
+		return Resolve(table_kind ? table_functions : scalar_functions, principal, name, out);
+	};
+	if (resolve(vname)) {
+		return true;
 	}
-	return Resolve(scalar_functions, principal, vname, out);
+	// spec 115: `<vcat>.main.<f>` is the function at the catalog's root - only when no function is stored
+	// under that very name (`main.f`, a nested schema called main): two functions are never merged
+	auto dot = vname.find('.');
+	// (the segment as written, `main`: a stored name is matched exactly, so `c.MAIN.f` must not miss a
+	// nested `main.f` and then land on the root `f`)
+	if (dot != string::npos && StringUtil::StartsWith(vname.substr(dot + 1), "main.") &&
+	    vname.find('.', dot + 6) == string::npos) {
+		return resolve(vname.substr(0, dot) + "." + vname.substr(dot + 6));
+	}
+	return false;
 }
 
 shared_ptr<const FunctionCategoryModel> PolicyStore::FunctionModel() {

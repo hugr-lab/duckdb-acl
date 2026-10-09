@@ -83,8 +83,8 @@ ACL ADMIN ADD SCALAR c.shout MACRO 'upper(acl_arg(1))';
 statement ok
 ACL ADMIN ADD SCALAR other.hidden MACRO 'lower(acl_arg(1))';
 
-# the other catalog is granted too, but not as MAIN: a call reaches a function by its bare name in
-# the one MAIN catalog only, so the listing does not offer `hidden`
+# the other catalog is granted too, but not as MAIN: a bare call reaches a function in the one MAIN
+# catalog only, a qualified one (`other.hidden`) any catalog it holds (spec 115) - listed with its catalog
 statement ok
 ACL ADMIN GRANT CATALOG other TO ROLE r;
 
@@ -185,27 +185,38 @@ ACL ROLE "r" SELECT database_name, schema_name, function_name, function_type, pa
 c	main	edge	table	['x"y', z, n]	[INTEGER, NULL, INTEGER]	NULL
 c	main	report	table	[threshold, my name]	['DECIMAL(10, 2)', VARCHAR]	the report
 c	main	shout	scalar	[]	[]	NULL
+c	nested	deep	table	[]	[]	NULL
 
 query I
 ACL ROLE "r" SELECT return_type FROM duckdb_functions() WHERE function_name = 'shout';
 ----
 VARCHAR
 
-query I
-ACL ROLE "r" SELECT count(*) FROM duckdb_functions() WHERE function_name = 'hidden' OR database_name = 'other';
+query III
+ACL ROLE "r" SELECT database_name, schema_name, function_name FROM duckdb_functions() WHERE function_name = 'hidden' OR database_name = 'other';
 ----
-0
+other	main	hidden
 
 statement error
 ACL ROLE "r" SELECT hidden('X');
 ----
 <REGEX>:.*hidden.*
 
-# a nested virtual schema's function is not reached by a bare call either - not listed
 query I
-ACL ROLE "r" SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('deep', 'nested.deep');
+ACL ROLE "r" SELECT other.hidden('X');
 ----
-0
+x
+
+# a nested virtual schema's function is listed under its schema and called by its path (spec 115)
+query II
+ACL ROLE "r" SELECT schema_name, function_name FROM duckdb_functions() WHERE function_name IN ('deep', 'nested.deep');
+----
+nested	deep
+
+query I
+ACL ROLE "r" SELECT * FROM c.nested.deep();
+----
+1
 
 # every listed virtual function is callable as listed
 query I

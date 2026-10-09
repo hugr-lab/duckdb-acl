@@ -84,6 +84,8 @@ int main(int argc, char *argv[]) {
 	Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA mart.home AS phys.home");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA mart.sales AS phys.shadow");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA mart.exp FROM phys.exp");
+	Exec(con, "ACL ADMIN ADD SCALAR mart.shout MACRO 'upper(acl_arg(1))'");
+	Exec(con, "SELECT acl_add_table_function('mart', 'out.rows', 'SELECT 9 AS nine', '', 'nine INTEGER', '')");
 	Exec(con, "ACL ADMIN CREATE ROLE analyst");
 	Exec(con, "ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select, temp) MAIN");
 	Exec(con, "ACL ADMIN GRANT CATALOG mart TO ROLE analyst WITH (select)");
@@ -257,6 +259,18 @@ int main(int argc, char *argv[]) {
 		Check(last_run("inputs") == "mart.main.facts", "the batch's input is mart.main.facts");
 		CheckOk(*con.Query(session + "DROP TABLE mart.home.lin"), "drop it");
 		Exec(con, "SET GLOBAL acl_lineage_level = 'off'");
+	});
+
+	Scenario("a function's short name is read in the session's catalog too (spec 115)", [&]() {
+		Check(Contains(One(con, session + "SELECT shout('a')"), "shout"), "shout is not in sales");
+		Check(One(con, session + "SELECT mart.shout('a')") == "A", "qualified, it is called from anywhere");
+		CheckOk(*con.Query(session + "USE mart"), "USE mart");
+		Check(One(con, session + "SELECT shout('a')") == "A", "under USE mart the bare name reaches mart.shout");
+		Check(One(con, session + "SELECT upper('a')") == "A", "an engine function is still itself");
+		Check(One(con, session + "SELECT * FROM out.rows()") == "9", "a two-part name is read in mart");
+		CheckOk(*con.Query(session + "USE SCHEMA out"), "USE SCHEMA out");
+		Check(One(con, session + "SELECT * FROM rows()") == "9", "a bare name is read in mart.out");
+		CheckOk(*con.Query(session + "USE sales"), "back");
 	});
 
 	Scenario("a revoked catalog is no longer the session's", [&]() {
