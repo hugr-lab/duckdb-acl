@@ -1036,18 +1036,59 @@ bool CatalogBackend::DdlTarget(const Principal &principal, const string &vname, 
 		return false; // the driver contract has no schema grants, so it has no DDL target
 	}
 	EnsureFresh();
+	// spec 113: `[<vcat>.]<schema path>.<object>` - the first part is a catalog when it names one the
+	// principal holds a grant on (any of them); otherwise the whole name is a path. The home is the
+	// longest granted schema prefix (nested schemas). A name both readings fit is refused, never guessed.
+	string head, rest;
+	SplitName(vname, head, rest);
+	// the home is the object's own parent: `vs.x.m` with no schema `vs.x` has no home (it is not `vs`'s
+	// object `x.m` - the review's finding), and only a real parent makes a reading fit
+	auto prefix_of = [](const string &name) {
+		return "(substr(" + Lit(name) + ", 1, length(s.\"path\") + 1) = s.\"path\" || '.' AND strpos(substr(" +
+		       Lit(name) + ", length(s.\"path\") + 2), '.') = 0)";
+	};
+	auto qualified = head.empty() ? string("false") : "(s.\"vcat\" = " + Lit(head) + " AND " + prefix_of(rest) + ")";
+	// the unqualified reading is the MAIN catalog's - as names resolve in reads - so the same name never
+	// lands in different homes depending on which catalogs happen to declare its schema
+	auto unqualified = "(g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND " + prefix_of(vname) + ")";
 	auto sql = GrantsCte(principal) +
 	           "SELECT s.\"vcat\", s.\"path\", s.\"phys_path\", s.\"origin\", rs.\"caps\", rs.\"into\","
-	           " rs.\"virtual_only\" FROM " +
-	           Tbl("schemas") + " s JOIN grants g ON g.\"vcat\" = s.\"vcat\" JOIN " + Tbl("role_schemas") +
+	           " rs.\"virtual_only\", " +
+	           qualified + " AS qualified, " + unqualified + " AS unqualified FROM " + Tbl("schemas") +
+	           " s JOIN grants g ON g.\"vcat\" = s.\"vcat\" JOIN " + Tbl("role_schemas") +
 	           " rs ON rs.\"role\" = g.\"role\" AND rs.\"vcat\" = s.\"vcat\""
-	           " AND rs.\"schema_path\" = s.\"path\" WHERE substr(" +
-	           Lit(vname) +
-	           ", 1, length(s.\"path\") + 1) = s.\"path\" || '.'"
-	           " ORDER BY length(s.\"path\") DESC";
+	           " AND rs.\"schema_path\" = s.\"path\" WHERE " +
+	           unqualified + " OR " + qualified + " ORDER BY length(s.\"path\") DESC";
 	auto result = Query(sql);
 	ResultRows result_rows(*result);
+	bool any_qualified = false;
+	bool any_unqualified = false;
+	string unqualified_home;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
+		if (result_rows.GetValue(7, row).GetValue<bool>()) {
+			any_qualified = true;
+		}
+		if (result_rows.GetValue(8, row).GetValue<bool>()) {
+			any_unqualified = true;
+			unqualified_home = result_rows.GetValue(0, row).ToString() + "." + result_rows.GetValue(1, row).ToString();
+		}
+	}
+	if (any_qualified && any_unqualified) {
+		throw BinderException("acl: \"%s\" is ambiguous - catalog \"%s\" or schema %s of the MAIN catalog; prefix "
+		                      "the MAIN catalog's name to mean the schema (the catalog reading needs the operator "
+		                      "to rename one of them)",
+		                      vname, head, unqualified_home);
+	}
+	auto chosen = any_qualified ? 7 : 8;
+	auto object_name = any_qualified ? rest : vname;
+	idx_t first_chosen = DConstants::INVALID_INDEX;
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		if (!result_rows.GetValue(chosen, row).GetValue<bool>()) {
+			continue;
+		}
+		if (first_chosen == DConstants::INVALID_INDEX) {
+			first_chosen = row;
+		}
 		auto caps_value = result_rows.GetValue(4, row);
 		if (!EffectiveCaps(caps_value).count(capability)) {
 			continue; // this role may not; another role of the principal still might
@@ -1057,6 +1098,7 @@ bool CatalogBackend::DdlTarget(const Principal &principal, const string &vname, 
 		auto into = result_rows.GetValue(5, row);
 		auto only = result_rows.GetValue(6, row);
 		out.vcat = result_rows.GetValue(0, row).ToString();
+		out.vname = object_name;
 		out.schema_path = result_rows.GetValue(1, row).ToString();
 		out.origin = origin.IsNull() ? string() : origin.ToString();
 		// an alias shows the physical schema live, so nothing has to be recorded; an expansion
@@ -1070,11 +1112,54 @@ bool CatalogBackend::DdlTarget(const Principal &principal, const string &vname, 
 		}
 		return true;
 	}
-	if (result->RowCount() > 0) {
+	if (first_chosen != DConstants::INVALID_INDEX) {
 		throw BinderException("acl: %s on schema \"%s\" is not allowed", capability,
-		                      result->Collection().GetValue(1, 0).ToString());
+		                      result_rows.GetValue(1, first_chosen).ToString());
 	}
 	return false;
+}
+
+bool CatalogBackend::HeldSchema(const Principal &principal, const string &written, string &vcat, string &path) {
+	if (principal.roles.empty() || function_mode) {
+		return false;
+	}
+	EnsureFresh();
+	string head, rest;
+	SplitName(written, head, rest);
+	auto qualified =
+	    head.empty() ? string("false") : "(s.\"vcat\" = " + Lit(head) + " AND s.\"path\" = " + Lit(rest) + ")";
+	auto unqualified =
+	    "(g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND s.\"path\" = " + Lit(written) + ")";
+	auto sql = GrantsCte(principal) + "SELECT s.\"vcat\", s.\"path\", " + qualified +
+	           " AS qualified, rs.\"caps\" FROM " + Tbl("schemas") +
+	           " s JOIN grants g ON g.\"vcat\" = s.\"vcat\" JOIN " + Tbl("role_schemas") +
+	           " rs ON rs.\"role\" = g.\"role\" AND rs.\"vcat\" = s.\"vcat\" AND rs.\"schema_path\" = s.\"path\""
+	           " WHERE " +
+	           unqualified + " OR " + qualified + " ORDER BY 3 DESC";
+	auto result = Query(sql);
+	ResultRows rows(*result);
+	bool any_qualified = false, any_unqualified = false;
+	idx_t held = DConstants::INVALID_INDEX;
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		if (EffectiveCaps(rows.GetValue(3, row)).empty()) {
+			continue; // `CAPS '{}'` holds nothing: such a schema is not the principal's to ask about
+		}
+		(rows.GetValue(2, row).GetValue<bool>() ? any_qualified : any_unqualified) = true;
+		if (held == DConstants::INVALID_INDEX) {
+			held = row;
+		}
+	}
+	if (any_qualified && any_unqualified) {
+		throw BinderException("acl: \"%s\" is ambiguous - a schema of catalog \"%s\" or a schema named so; write "
+		                      "the name the other way to choose",
+		                      written, head);
+	}
+	if (held == DConstants::INVALID_INDEX) {
+		return false;
+	}
+	vcat = rows.GetValue(0, held).ToString();
+	path = rows.GetValue(1, held).ToString();
+	return true;
 }
 
 shared_ptr<const FunctionCategoryModel> CatalogBackend::FunctionModel() {
@@ -2046,6 +2131,10 @@ bool PolicyStore::JwksLocationAllowed(const string &uri, string &why) {
 	}
 	why = "\"" + uri + "\" is outside acl_jwks_locations (" + setting + ")";
 	return false;
+}
+
+bool PolicyStore::ResolveHeldSchema(const Principal &principal, const string &written, string &vcat, string &path) {
+	return catalog && catalog->HeldSchema(principal, written, vcat, path);
 }
 
 bool PolicyStore::ResolveDdlTarget(const Principal &principal, const string &vname, const string &capability,

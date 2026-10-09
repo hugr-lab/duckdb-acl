@@ -590,6 +590,17 @@ transaction (`AclProfileState` TransactionCommit/Rollback → `RUN_ABORT`, `Line
 Flight ingest carries `LINEAGE` markers (the note survives its BEGIN), a declared read of only metadata
 or of no rows is no run, fields carry types (`LineageFieldOf`). acl-otel spec 020 renders `ABORT`.
 
+**Spec 113 — dbt's own statements**: DDL names are `[<vcat>.]<schema path>.<object>` -
+`CatalogBackend::DdlTarget` reads the first part as a catalog the principal holds a grant on, else the
+whole name as a path in the MAIN catalog; the home is the object's own parent schema (nested), a name
+both readings fit is refused as ambiguous, and `DdlTarget::vname` is the object's name inside its
+catalog. A DDL name part with a dot is refused. `CREATE SCHEMA IF NOT EXISTS` on a held schema (with a
+capability) is a no-op (`HeldSchema`); a batch of no-ops answers one empty SELECT. `ALTER TABLE|VIEW …
+RENAME TO` in the same home at `create` + `drop` (`RewriteAlterStatement` → `acl_rename_relation`):
+not onto a record, not an object carrying the operator's declarations (`CatalogRelationDeclared`), not
+a record declared over another object; the record moves back at the client's ROLLBACK
+(`RecordRenameUndo`). DROP's CASCADE is taken off. Every other ALTER stays refused.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

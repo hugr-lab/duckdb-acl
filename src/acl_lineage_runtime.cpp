@@ -30,6 +30,8 @@
 #include "duckdb/parser/expression/parameter_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/alter_statement.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/common_table_expression_info.hpp"
 #include "duckdb/parser/query_node/list.hpp"
 #include "duckdb/parser/statement/list.hpp"
@@ -825,6 +827,76 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 			walk.approximate = true;
 		}
 	}
+	if (!walked && statement_copy && statement_copy->type == StatementType::ALTER_STATEMENT) {
+		// spec 113: a RENAME (dbt's swap) is a run from the old name to the new - each field as it is -
+		// so the chain CTAS -> `m__dbt_tmp` -> RENAME -> `m` holds in the graph, a live alias's object
+		// (which has no record, so no DATASET event) included
+		auto &info = *statement_copy->Cast<AlterStatement>().info;
+		Identifier renamed_to;
+		if (info.type == AlterType::ALTER_TABLE &&
+		    info.Cast<AlterTableInfo>().alter_table_type == AlterTableType::RENAME_TABLE) {
+			renamed_to = info.Cast<RenameTableInfo>().new_table_name;
+		} else if (info.type == AlterType::ALTER_VIEW &&
+		           info.Cast<AlterViewInfo>().alter_view_type == AlterViewType::RENAME_VIEW) {
+			renamed_to = info.Cast<RenameViewInfo>().new_view_name;
+		}
+		auto old_relation = FromQualified(info.GetQualifiedName());
+		auto new_relation = old_relation;
+		new_relation.parts.back() = renamed_to.GetIdentifierName();
+		// the record (if any) moves in the statement right after this one, so the new name is found the
+		// way the DDL found it - its home - and its fields on the physical object itself; a view record
+		// (nothing physical) by the name, once its record has moved
+		Mirror renamed;
+		DdlTarget home;
+		bool found = false;
+		if (!renamed_to.GetIdentifierName().empty() &&
+		    locked_store->ResolveDdlTarget(job.principal, StringUtil::Join(new_relation.parts, "."), "create", home)) {
+			try {
+				Connection con(*locked_db);
+				con.context->RunFunctionInTransaction([&]() {
+					Parser parser(ParserOptions::Builtin());
+					parser.ParseQuery("SELECT * FROM " + home.phys_schema + "." +
+					                  acl_detail::Ident(renamed_to.GetIdentifierName()));
+					Planner planner(*con.context);
+					planner.CreatePlan(std::move(parser.statements[0]));
+					for (idx_t i = 0; i < planner.names.size() && i < planner.types.size(); i++) {
+						renamed.columns.emplace_back(planner.names[i].GetIdentifierName(), planner.types[i]);
+					}
+				});
+				renamed.vcat = home.vcat;
+				renamed.vname = home.vname;
+				found = true;
+			} catch (std::exception &) {
+				found = false;
+			}
+		}
+		if (!found && !renamed_to.GetIdentifierName().empty()) {
+			found = Resolve(*locked_store, *locked_db, job.principal, new_relation, renamed);
+		}
+		if (found) {
+			auto dot = renamed.vname.rfind('.');
+			auto old_vname =
+			    (dot == string::npos ? string() : renamed.vname.substr(0, dot + 1)) + old_relation.parts.back();
+			walk = LineageWalk();
+			auto source = walk.DatasetIndex(VirtualKey(renamed.vcat, string(), old_vname));
+			walk.has_target = true;
+			walk.target = VirtualKey(renamed.vcat, string(), renamed.vname);
+			walk.target_operation = "RENAME";
+			for (auto &column : renamed.columns) {
+				LineageOutput output;
+				output.name = column.first;
+				output.type = column.second;
+				LineageContribution item;
+				item.dataset = source;
+				item.field = column.first;
+				item.type = "DIRECT";
+				item.subtype = "IDENTITY";
+				output.sources.push_back(std::move(item));
+				walk.outputs.push_back(std::move(output));
+			}
+			walked = true;
+		}
+	}
 	if (reads_nothing) {
 		return; // a probe (`WHERE 1=0`, `LIMIT 0`): it reads no row, so it is no step either
 	}
@@ -1284,6 +1356,15 @@ shared_ptr<LineageJob> CaptureLineageJob(PolicyStore &store, const SQLStatement 
 	case StatementType::CREATE_STATEMENT: {
 		auto &info = statement.Cast<CreateStatement>().info;
 		write = info && info->type == CatalogType::TABLE_ENTRY && info->Cast<CreateTableInfo>().query;
+		break;
+	}
+	case StatementType::ALTER_STATEMENT: {
+		// spec 113: a RENAME inside a granted home moves a dataset to a new name
+		auto &info = statement.Cast<AlterStatement>().info;
+		write = info && ((info->type == AlterType::ALTER_TABLE &&
+		                  info->Cast<AlterTableInfo>().alter_table_type == AlterTableType::RENAME_TABLE) ||
+		                 (info->type == AlterType::ALTER_VIEW &&
+		                  info->Cast<AlterViewInfo>().alter_view_type == AlterViewType::RENAME_VIEW));
 		break;
 	}
 	case StatementType::SELECT_STATEMENT: {
