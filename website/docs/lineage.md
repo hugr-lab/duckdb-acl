@@ -176,7 +176,7 @@ A pipeline's own events and the node's join in the backend only when both name a
 - **A Python job** (or anything that emits for itself) uses the node's names directly.
 
 Without a parent, a run belongs to the job `acl_lineage_job`, or `sql:<hash of the normalized
-statement>`, in the namespace `acl://<ns>/client/<door>`.
+statement>`, in the namespace `<ns>/client/<door>` (`acl://dev/client/flight` for the namespace `acl://dev`).
 
 ## Settings
 
