@@ -260,6 +260,12 @@ ACL ADMIN CREATE ROLE w;
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE w WITH (select, insert, update, delete) MAIN;
 
+# spec 112: the name lineage gives an object - `<vcat>.main.<object>` - is a name the principal can use
+query I
+ACL ROLE "w" SELECT count(*) FROM c.main.quiet;
+----
+0
+
 statement ok
 INSERT INTO phys.main.orders VALUES (1, 1, 10, 'S1', 't1'), (2, 1, 20, 'S2', 't1');
 
@@ -422,8 +428,9 @@ SELECT event_type, count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FR
 RUN_ABORT	1
 RUN_FAIL	1
 
+# (the three-part name is the same object, written through as well)
 statement ok
-ACL ROLE "w" DELETE FROM sink WHERE a >= 100;
+ACL ROLE "w" DELETE FROM c.main.sink WHERE a >= 100;
 
 statement ok
 SELECT acl_lineage_flush();

@@ -1453,10 +1453,19 @@ string PolicyStore::SecretService(const string &named) {
 }
 
 bool PolicyStore::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {
-	if (catalog) {
-		return CatalogResolveTable(principal, vname, out);
+	auto resolve = [&](const string &name) {
+		return catalog ? CatalogResolveTable(principal, name, out) : Resolve(tables, principal, name, out);
+	};
+	if (resolve(vname)) {
+		return true;
 	}
-	return Resolve(tables, principal, vname, out);
+	// spec 112: `<vcat>.main.<object>` is the object of the catalog's default schema - the name lineage
+	// gives it (OpenLineage's three parts), so a client that copies it from a data catalog reaches it
+	auto parts = StringUtil::Split(vname, '.');
+	if (parts.size() == 3 && StringUtil::CIEquals(parts[1], "main")) {
+		return resolve(parts[0] + "." + parts[2]);
+	}
+	return false;
 }
 
 bool PolicyStore::ResolveTableFunction(const Principal &principal, const string &vname, TablePolicy &out) {
