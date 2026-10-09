@@ -491,8 +491,9 @@ struct PolicyStore {
 	                            const string &origin = string());
 	//! spec 113: a principal's RENAME inside a granted schema - the record (if the object has one)
 	//! follows the object, in one transaction; `new_phys` empty for a view record (nothing physical)
-	void CatalogRenameRelation(const string &vcat, const string &vname, const string &new_vname,
-	                           const string &new_phys);
+	//! Answers whether the object had a record, and its phys before the rename (to undo it).
+	bool CatalogRenameRelation(const string &vcat, const string &vname, const string &new_vname, const string &new_phys,
+	                           string *old_phys = nullptr);
 	//! spec 113: the object carries the operator's own declarations - a predicate, a column list, keys,
 	//! references, or a grant on it by name: its name is what they are tied to, so no principal renames it
 	bool CatalogRelationDeclared(const string &vcat, const string &vname);

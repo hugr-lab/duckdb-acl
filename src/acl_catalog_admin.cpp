@@ -1313,8 +1313,8 @@ bool PolicyStore::CatalogRelationDeclared(const string &vcat, const string &vnam
 	       is("references", "(\"from_vname\" = " + Lit(vname) + " OR \"to_vname\" = " + Lit(vname) + ")");
 }
 
-void PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname, const string &new_vname,
-                                        const string &new_phys) {
+bool PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname, const string &new_vname,
+                                        const string &new_phys, string *old_phys) {
 	RequireCatalog(catalog, "acl_rename_relation");
 	RequireNotReserved(new_vname);
 	bool had_record = false;
@@ -1322,7 +1322,12 @@ void PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname,
 		auto where = [&](const string &name) {
 			return " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(name);
 		};
-		had_record = read("SELECT 1 FROM " + catalog->Tbl("relations") + where(vname))->RowCount() > 0;
+		auto current = read("SELECT \"phys\" FROM " + catalog->Tbl("relations") + where(vname));
+		had_record = current->RowCount() > 0;
+		if (had_record && old_phys) {
+			auto phys = ResultRows(*current).GetValue(0, 0);
+			*old_phys = phys.IsNull() ? string() : phys.ToString();
+		}
 		if (!had_record) {
 			return; // a live alias's object: nothing recorded, the physical rename is the whole of it
 		}
@@ -1345,6 +1350,7 @@ void PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname,
 		NoteDefinitionLineage(vcat, vname, "DROP");
 		NoteDefinitionLineage(vcat, new_vname, "CREATE");
 	}
+	return had_record;
 }
 
 void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, const string &path,

@@ -78,7 +78,7 @@ resolution does not accept the virtual catalog's own name in front.
 
 ## Testing
 
-- `test/sql/acl_ddl.test`: three-part CREATE / CTAS / CREATE OR REPLACE / DROP [IF EXISTS] [CASCADE]
+- `test/sql/acl_ddl_dbt.test`: three-part CREATE / CTAS / CREATE OR REPLACE / DROP [IF EXISTS] [CASCADE]
   in the MAIN catalog and in a second catalog of the role; a nested path (longest granted prefix); an
   ambiguous first part refused; a first part the role holds no grant on refused;
   CREATE SCHEMA IF NOT EXISTS (held, not held, without IF NOT EXISTS); RENAME of a table and a view in
@@ -144,4 +144,11 @@ dbt does not need it (it qualifies every name), which is why it is not part of t
   `view` materializations created and swapped on every run; `incremental` with `append` works; with a
   `unique_key` (delete+insert) the quack client fails with `PlanDelete not implemented` before the
   node sees anything - a client limitation, documented.
+- **Review findings (pass 1), fixed with tests:** a RENAME of a name the operator declared over an
+  object elsewhere would have renamed the home's own object of that name and re-pointed the record at
+  it - refused now (`… is declared over <phys>`); `CREATE SCHEMA IF NOT EXISTS` answered for a schema
+  held with `CAPS '{}'` (an existence oracle) - only a schema held with a capability answers; the
+  new name is checked against the metadata surfaces too. **Decision on an operator's view without
+  declarations** in a granted home: a rename moves it, as `drop` already removes it (rename = drop +
+  create, spec 016's model) - pinned by a test.
 - **Lineage test for the rename pair** lands with the rebase onto spec 112 (its names).

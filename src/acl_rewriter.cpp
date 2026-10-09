@@ -698,6 +698,7 @@ private:
 			RewriteQueryNode(*table_info.query->node);
 		}
 		RewriteColumnDefinitions(table_info);
+		RequireUndottedParts(info.GetQualifiedName());
 		auto key = VirtualKey(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
@@ -731,10 +732,28 @@ private:
 		}
 	}
 
+	//! spec 113: a DDL name is resolved and rebuilt as a dotted path, so a part with a dot of its own
+	//! (`"sub.t"`) would name another, nested object - one the grant never covered (the review's
+	//! finding: a RENAME to `"sub.t"` re-pointed a record at a hidden nested table). Refused.
+	void RequireUndottedParts(const QualifiedName &name) {
+		for (auto &part : name.Path()) {
+			RequireUndotted(part);
+		}
+	}
+
+	void RequireUndotted(const Identifier &part) {
+		if (part.GetIdentifierName().find('.') != string::npos) {
+			Deny(Reason::DDL_HOME, "\"" + part.GetIdentifierName() +
+			                           "\" has a dot in it - a name part of a DDL statement under the ACL is one "
+			                           "identifier, never a path");
+		}
+	}
+
 	//! spec 113: a client (dbt) makes sure its schema exists before it writes. A virtual schema the
 	//! principal holds already does: IF NOT EXISTS is a no-op, without it duckdb's own answer. Creating
 	//! a schema stays the operator's - one the principal does not hold is refused as before.
 	void RewriteCreateSchema(CreateInfo &info) {
+		RequireUndottedParts(info.GetQualifiedName());
 		auto written = VirtualKey(info.GetQualifiedName());
 		string vcat, path;
 		if (written.empty() || !store.ResolveHeldSchema(principal, written, vcat, path)) {
@@ -850,6 +869,7 @@ private:
 		if (!info.query) {
 			Deny(Reason::STATEMENT_TYPE, "a view needs a query");
 		}
+		RequireUndottedParts(info.GetQualifiedName());
 		auto key = VirtualKey(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
@@ -887,6 +907,7 @@ private:
 		if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY) {
 			Deny(Reason::STATEMENT_TYPE, "only tables and views can be dropped through the ACL");
 		}
+		RequireUndottedParts(info.GetQualifiedName());
 		auto key = VirtualKey(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "drop", target)) {
@@ -943,6 +964,8 @@ private:
 			Deny(Reason::STATEMENT_TYPE,
 			     "statement type ALTER is not permitted under ACL - only RENAME TO inside a granted schema");
 		}
+		RequireUndottedParts(info.GetQualifiedName());
+		RequireUndotted(new_name);
 		auto key = VirtualKey(info.GetQualifiedName());
 		auto dot = key.rfind('.');
 		auto new_key = (dot == string::npos ? string() : key.substr(0, dot + 1)) + new_name.GetIdentifierName();
@@ -973,8 +996,20 @@ private:
 			                           "\" carries the operator's declarations (a predicate, columns, keys, references "
 			                           "or grants by name), which are tied to its name - it is not renamed");
 		}
+		if (MetadataSurfaceOf(to.vname)) {
+			Deny(Reason::DDL_HOME, "\"" + new_key + "\" is a metadata surface's name");
+		}
 		TablePolicy existing;
-		if (store.ResolveTable(principal, key, existing) && !existing.query.empty()) {
+		bool resolved = store.ResolveTable(principal, key, existing);
+		if (resolved && existing.query.empty() && !existing.phys.empty() &&
+		    !StringUtil::CIEquals(existing.phys,
+		                          from.phys_schema + "." + info.GetQualifiedName().Name().GetIdentifierName())) {
+			// a record declared over an object elsewhere: renaming the home's object of that name would
+			// re-point the record at it (the review's finding) - the record is the operator's
+			Deny(Reason::DDL_HOME, "\"" + key + "\" is declared over " + existing.phys +
+			                           ", not over this schema's own object - it is not renamed");
+		}
+		if (resolved && !existing.query.empty()) {
 			// a view record: nothing physical, the record is the whole of it
 			if (!view_form) {
 				Deny(Reason::DDL_HOME, "\"" + key + "\" is a view - ALTER VIEW renames it");

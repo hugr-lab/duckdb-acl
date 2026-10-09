@@ -349,14 +349,54 @@ void AclRegisterViewFunc(DataChunk &args, ExpressionState &state, Vector &result
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! spec 113: the record a RENAME moved is written on the store's own connection, so it does not ride
+//! the client's transaction - dbt swaps inside one. A rollback moves it back (newest first); a commit
+//! keeps it. The physical rename was the client's, and rolls back with it.
+struct RecordRenameUndo : ClientContextState {
+	struct Step {
+		string vcat, from, to, phys;
+	};
+	weak_ptr<PolicyStore> store;
+	vector<Step> steps;
+
+	explicit RecordRenameUndo(weak_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
+	}
+	void TransactionCommit(MetaTransaction &, ClientContext &) override {
+		steps.clear();
+	}
+	void TransactionRollback(MetaTransaction &, ClientContext &, optional_ptr<ErrorData>) override {
+		auto locked = store.lock();
+		auto undo = std::move(steps);
+		steps.clear();
+		if (!locked) {
+			return;
+		}
+		for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
+			try {
+				locked->CatalogRenameRelation(it->vcat, it->from, it->to, it->phys);
+			} catch (...) {
+				// the record stays as the rename left it; acl_check_catalog reports it (source_missing)
+			}
+		}
+	}
+};
+
 //! acl_rename_relation(vcat, vname, new_vname[, new_phys]): the write a principal's own RENAME performs
 //! (spec 113), composed by the rewriter after its checks - unreachable from a principal's query
 void AclRenameRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = RequiredArg(args, 0, row, "acl_rename_relation", "catalog");
 		auto vname = RequiredArg(args, 1, row, "acl_rename_relation", "name");
 		auto new_vname = RequiredArg(args, 2, row, "acl_rename_relation", "new name");
-		StoreOf(state).CatalogRenameRelation(vcat, vname, new_vname, OptionalArg(args, 3, row, ""));
+		auto store = SharedStoreOf(state);
+		string old_phys;
+		if (store->CatalogRenameRelation(vcat, vname, new_vname, OptionalArg(args, 3, row, ""), &old_phys) &&
+		    context.transaction.HasActiveTransaction() && !context.transaction.IsAutoCommit()) {
+			auto undo = context.registered_state->GetOrCreate<RecordRenameUndo>("acl_record_rename_undo",
+			                                                                    weak_ptr<PolicyStore>(store));
+			undo->steps.push_back({vcat, new_vname, vname, old_phys});
+		}
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }

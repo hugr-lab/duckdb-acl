@@ -441,7 +441,8 @@ The grant that makes a catalog resolve for a role. Clauses after the role come i
 - **Capabilities.** `WITH (…)` is the list form of `CAPS '{"select": true, …}'`. A grant that states
   nothing holds every data capability - `select`, `insert`, `update`, `delete`, `merge` - and never
   `manage`; `CAPS '{}'` holds none. The capabilities outside that default are explicit-only and never
-  implied: `manage` (administer this catalog, see below), `create`/`drop` (create/drop schemas in it),
+  implied: `manage` (administer this catalog, see below), `create`/`drop` (reserved - a principal never creates
+  a schema, spec 113),
   `temp` (session temp tables on the Flight door), `explain` (EXPLAIN) and `secrets` (the node's
   secrets service, see below), each held only when named.
   An unknown name is stored as written and enforces nothing.
@@ -487,8 +488,8 @@ that does, and the inheritance is materialised when a grant or a schema changes.
 the subtree at the next ancestor. A schema grant does not make names resolve - the role still needs
 the catalog grant.
 
-`create`/`drop` on a schema grant are the right to create/drop **objects** in it (on the catalog
-grant they mean schemas; neither implies the other). Where a role's `CREATE` lands is the grant's
+`create`/`drop` on a schema grant are the right to create/drop **objects** in it (neither implies the
+other; schemas themselves are the operator's). Where a role's `CREATE` lands is the grant's
 decision: `INTO <phys schema>` names the physical schema (checked to exist); `VIRTUAL ONLY` lets the
 role only register objects that already exist physically; neither follows the schema declaration (an
 alias creates in what it aliases, an expansion in its origin). A principal's own DDL then records the

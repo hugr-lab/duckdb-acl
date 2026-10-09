@@ -90,6 +90,23 @@ SELECT count(*) FROM duckdb_schemas() WHERE schema_name IN ('dbt_home', 'somewhe
 ----
 0
 
+# a schema held with no capability (`CAPS '{}'`) is none of the principal's: no answer about it
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.hidden AS phys.lake;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.hidden TO ROLE dbt CAPS '{}';
+
+statement error
+ACL ROLE "dbt" CREATE SCHEMA IF NOT EXISTS hidden;
+----
+a schema is the operator's to declare
+
+# a batch of no-ops still answers (the quack client refuses a statement with nothing to answer)
+query I
+ACL ROLE "dbt" CREATE SCHEMA IF NOT EXISTS dbt_home;
+----
+
 # --- names: the catalog in front, in the MAIN catalog and in another catalog of the role ------------------
 
 statement ok
@@ -112,16 +129,39 @@ ACL ROLE "dbt" SELECT id, amount FROM sales.dbt_home.m;
 ----
 1	20
 
-# a catalog the role holds no grant on is no catalog to it
+# a catalog the role holds no grant on is no catalog to it - even where another role may create
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG secret;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA secret.dbt_home AS phys.home;
+
+statement ok
+ACL ADMIN CREATE ROLE other_team;
+
+statement ok
+ACL ADMIN GRANT CATALOG secret TO ROLE other_team WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA secret.dbt_home TO ROLE other_team WITH (select, create, drop);
 
 statement error
 ACL ROLE "dbt" CREATE TABLE secret.dbt_home.x AS SELECT 1 AS i;
 ----
-no schema of the catalog allows creating
+no schema of the catalog allows creating "secret.dbt_home.x"
 
-# --- DROP: three-part, IF EXISTS, CASCADE never reaches past the object ----------------------------------
+statement error
+ACL ROLE "dbt" DROP TABLE secret.dbt_home.m;
+----
+no schema of the catalog allows dropping "secret.dbt_home.m"
+
+statement error
+ACL ROLE "dbt" ALTER TABLE secret.dbt_home.m RENAME TO m9;
+----
+no schema of the catalog allows renaming "secret.dbt_home.m"
+
+# --- DROP: three-part, IF EXISTS; CASCADE is taken off (duckdb's own takes nothing more - a view over the
+# table stays; the point is a home in another engine, where it would drop the dependents) ---------------
 
 statement ok
 ACL ROLE "dbt" DROP TABLE IF EXISTS "mart"."out"."m" CASCADE;
@@ -227,6 +267,27 @@ ACL ROLE "dbt" SELECT id, amount FROM dbt_home.m;
 ----
 1	40
 
+# a schema without create
+statement ok
+ACL ADMIN CREATE ROLE dropper;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE dropper WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.dbt_home TO ROLE dropper WITH (select, drop);
+
+statement error
+ACL ROLE "dropper" ALTER TABLE dbt_home.n RENAME TO n2;
+----
+create on schema "dbt_home" is not allowed
+
+# across schemas: duckdb's grammar has no such RENAME
+statement error
+ACL ROLE "dbt" ALTER TABLE dbt_home.n RENAME TO vs.n;
+----
+syntax error
+
 # a schema without drop
 statement ok
 ACL ADMIN CREATE ROLE builder;
@@ -254,6 +315,43 @@ ACL ROLE "dbt" ALTER TABLE dbt_home.declared RENAME TO declared2;
 ----
 carries the operator's declarations
 
+# onto a name the catalog declares
+statement error
+ACL ROLE "dbt" ALTER TABLE dbt_home.n RENAME TO declared;
+----
+"dbt_home.declared" already exists
+
+# a record the operator declared over another object: renaming the home's object of that name would
+# re-point the record at it - refused (the review's finding)
+statement ok
+CREATE TABLE phys.home.rec AS SELECT 99 AS id;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.dbt_home.rec AS phys.main.orders;
+
+statement error
+ACL ROLE "dbt" ALTER TABLE dbt_home.rec RENAME TO rec2;
+----
+is declared over phys.main.orders
+
+query I
+ACL ROLE "dbt" SELECT id FROM dbt_home.rec;
+----
+1
+
+# an operator's view in the home, with no declarations of its own, is the schema's like any object:
+# drop already removes it, so a rename (drop + create) may move it
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW sales.dbt_home.opview AS SELECT id FROM phys.main.orders;
+
+statement ok
+ACL ROLE "dbt" ALTER VIEW dbt_home.opview RENAME TO opview2;
+
+query I
+ACL ROLE "dbt" SELECT count(*) FROM dbt_home.opview2;
+----
+1
+
 # a relation outside every granted home
 statement error
 ACL ROLE "dbt" ALTER TABLE orders RENAME TO orders2;
@@ -274,10 +372,15 @@ ACL ADMIN CREATE VIRTUAL SCHEMA sales.mart AS phys.lake;
 statement ok
 ACL ADMIN GRANT SCHEMA sales.mart TO ROLE dbt WITH (select, create, drop);
 
-statement error
+# the schema reading fits only a real parent: sales.mart's object would be `out.z`, so this is mart's
+statement ok
 ACL ROLE "dbt" CREATE TABLE mart.out.z AS SELECT 1 AS i;
+
+# ... and a middle schema that does not exist is no home (not sales.mart's object `nope.z`)
+statement error
+ACL ROLE "dbt" CREATE TABLE mart.nope.z AS SELECT 1 AS i;
 ----
-is ambiguous
+no schema of the catalog allows creating "mart.nope.z"
 
 # a schema names itself whole: `mart.out` would be a nested schema of sales.mart only if one were
 # declared, so it is mart's `out` - held, and a no-op
@@ -293,6 +396,21 @@ ACL ADMIN GRANT SCHEMA sales.mart.out TO ROLE dbt WITH (select);
 
 statement error
 ACL ROLE "dbt" CREATE SCHEMA IF NOT EXISTS mart.out;
+----
+is ambiguous
+
+statement error
+ACL ROLE "dbt" CREATE TABLE mart.out.z9 AS SELECT 1 AS i;
+----
+is ambiguous
+
+statement error
+ACL ROLE "dbt" DROP TABLE mart.out.z;
+----
+is ambiguous
+
+statement error
+ACL ROLE "dbt" ALTER TABLE mart.out.z RENAME TO z2;
 ----
 is ambiguous
 
@@ -324,3 +442,89 @@ SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'phys'
 ----
 deep	t
 other	t
+
+# --- a name part with a dot in it names another, nested object: refused in every DDL (the review's
+# finding - a RENAME to "sub.t" re-pointed a record at a hidden nested table) -----------------------------
+
+statement ok
+CREATE SCHEMA phys.lake.sub;
+
+statement ok
+CREATE TABLE phys.lake.sub.t AS SELECT 'hidden' AS s;
+
+statement ok
+ACL ROLE "dbt" CREATE TABLE vs.mine AS SELECT 1 AS i;
+
+statement error
+ACL ROLE "dbt" ALTER TABLE vs.mine RENAME TO "sub.t";
+----
+has a dot in it
+
+statement error
+ACL ROLE "dbt" CREATE TABLE vs."sub.t2" AS SELECT 1 AS i;
+----
+has a dot in it
+
+statement error
+ACL ROLE "dbt" DROP TABLE vs."sub.t";
+----
+has a dot in it
+
+statement error
+ACL ROLE "dbt" CREATE VIEW vs."sub.v" AS SELECT 1 AS i;
+----
+has a dot in it
+
+query I
+SELECT count(*) FROM phys.lake.sub.t;
+----
+1
+
+# --- an unqualified name is a path in the MAIN catalog only ------------------------------------------------
+
+# mart.out is mart's - written without its catalog it is no home of the MAIN catalog (sales)
+statement error
+ACL ROLE "dbt" CREATE TABLE out.z5 AS SELECT 1 AS i;
+----
+no schema of the catalog allows creating "out.z5"
+
+
+# --- a RENAME the client rolls back: the physical rename goes back with the transaction, and the record
+# it moved (written on the store's own connection) is moved back too ---------------------------------------
+
+statement ok
+ACL ROLE "dbt" CREATE TABLE vs.keep AS SELECT 7 AS i;
+
+statement ok
+BEGIN;
+
+statement ok
+ACL ROLE "dbt" ALTER TABLE vs.keep RENAME TO keep2;
+
+statement ok
+ROLLBACK;
+
+query TT
+SELECT vname, phys FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname LIKE 'vs.keep%';
+----
+vs.keep	phys.lake.keep
+
+query I
+ACL ROLE "dbt" SELECT i FROM vs.keep;
+----
+7
+
+# ... and a committed one stays
+statement ok
+BEGIN;
+
+statement ok
+ACL ROLE "dbt" ALTER TABLE vs.keep RENAME TO keep2;
+
+statement ok
+COMMIT;
+
+query I
+ACL ROLE "dbt" SELECT i FROM vs.keep2;
+----
+7
