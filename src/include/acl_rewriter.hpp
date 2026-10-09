@@ -67,6 +67,10 @@ struct AuditTrail {
 		uint64_t text_hash = 0;
 		//! spec 107: the statement's lineage job, captured before the rewrite (null when out of scope)
 		shared_ptr<LineageJob> lineage;
+		//! spec 114: the session's catalog / schema the statement was read under (a USE earlier in the
+		//! batch included); empty = none in force
+		string use_catalog;
+		string use_schema;
 	};
 	vector<Statement> statements;
 };

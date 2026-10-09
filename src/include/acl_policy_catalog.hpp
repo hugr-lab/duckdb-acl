@@ -400,6 +400,8 @@ struct CatalogBackend {
 
 	//! The granted catalogs of the principal (function mode; callback arguments need them)
 	vector<string> GrantedCatalogs(const Principal &principal);
+	string MainCatalog(const Principal &principal);
+	vector<string> HeldCatalogs(const Principal &principal); // spec 114, either source mode
 
 	//! The shared query prelude: the principal's grants and the unique-main guard, computed in SQL.
 	//! Table mode scans role_catalogs; function mode embeds the prefetched grants as VALUES.

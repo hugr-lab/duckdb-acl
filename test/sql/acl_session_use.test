@@ -1,0 +1,82 @@
+# name: test/sql/acl_session_use.test
+# description: a session's default catalog (spec 114) - the SQL gate's side. USE / USE SCHEMA set a
+#   session's default catalog and schema, and only on a session of the client's own: a per-statement
+#   prefix (what a gateway writes on a connection it shares) may never leave one behind. The positive
+#   path needs a live session handle and is pinned in test/cpp/test_acl_session_use.cpp.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t(id INTEGER);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG d;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG d TO ROLE r;
+
+# --- a per-statement prefix shares its connection: no USE of any form --------------------------------------
+
+statement error
+ACL ROLE "r" USE d;
+----
+USE needs a session of the client's own
+
+statement error
+ACL ROLE "r" USE d.main;
+----
+USE needs a session of the client's own
+
+statement error
+ACL ROLE "r" USE SCHEMA main;
+----
+USE needs a session of the client's own
+
+statement error
+ACL ROLE "r" SET schema = 'd';
+----
+USE needs a session of the client's own
+
+# --- and the session's operator function is no principal's ------------------------------------------------
+
+statement error
+ACL ROLE "r" SELECT acl_session_use('x', 'd', '');
+----
+acl_session_use
+
+# --- without USE, the names and the identity are the role's MAIN catalog's, as before ----------------------
+
+query T
+ACL ROLE "r" SELECT current_database();
+----
+c
+
+query T
+ACL ROLE "r" SELECT current_schema();
+----
+main

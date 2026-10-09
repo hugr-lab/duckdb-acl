@@ -601,6 +601,17 @@ not onto a record, not an object carrying the operator's declarations (`CatalogR
 a record declared over another object; the record moves back at the client's ROLLBACK
 (`RecordRenameUndo`). DROP's CASCADE is taken off. Every other ALTER stays refused.
 
+**Spec 114 — the session's catalog**: `USE <vcat>[.<schema>]` / `USE SCHEMA <s>` (the override compiles
+it to `SET acl_use_schema`) on a session of the client's own (`ACL SESSION`) set its default catalog /
+schema - kept on the session record by the follow-up `acl_session_use(<ops id>, …)`, applied by
+`AclRewriter::Key` qualifying short names (the resolver and its caches untouched; a held catalog in
+front wins, ambiguous with a schema of the session's catalog = refused); `current_database()` /
+`current_schema()` and a bare `SHOW TABLES` answer them. A USE applies to the rest of its batch; each
+statement's lineage job carries the USE it was read under (`AuditTrail::Statement::use_*`, qualified by
+the worker and `USE`d in its scratch); an ingest reads it too. On Flight a client command
+(SET/USE/CREATE/DROP/ALTER) runs at GetFlightInfo (`ClientStatementIsCommand`) whatever the rewrite
+made of it.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

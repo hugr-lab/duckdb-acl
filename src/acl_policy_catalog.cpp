@@ -315,6 +315,30 @@ vector<string> CatalogBackend::GrantedCatalogs(const Principal &principal) {
 	return catalogs;
 }
 
+vector<string> CatalogBackend::HeldCatalogs(const Principal &principal) {
+	vector<string> catalogs;
+	if (principal.roles.empty()) {
+		return catalogs;
+	}
+	EnsureFresh();
+	auto result = Query(GrantsCte(principal) + "SELECT DISTINCT \"vcat\" FROM grants ORDER BY 1");
+	ResultRows rows(*result);
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		catalogs.push_back(rows.GetValue(0, row).ToString());
+	}
+	return catalogs;
+}
+
+string CatalogBackend::MainCatalog(const Principal &principal) {
+	if (principal.roles.empty()) {
+		return string();
+	}
+	EnsureFresh();
+	auto result = Query(GrantsCte(principal) + "SELECT DISTINCT \"vcat\" FROM grants WHERE \"is_main\" = true AND "
+	                                           "(SELECT unique_main FROM main_ok)");
+	return result->RowCount() == 1 ? ResultRows(*result).GetValue(0, 0).ToString() : string();
+}
+
 string CatalogBackend::GrantsCte(const Principal &principal) {
 	string grants;
 	if (!function_mode) {
@@ -467,7 +491,11 @@ bool CatalogBackend::ResolveTable(const Principal &principal, const string &vnam
 		}
 	}
 	TablePolicy policy;
-	bool found = LookupRelation(principal, vname, policy) || LookupSchemaAlias(principal, vname, policy);
+	bool found = LookupRelation(principal, vname, policy);
+	if (!found && LookupSchemaAlias(principal, vname, policy)) {
+		found = true;
+		policy.from_schema_alias = true;
+	}
 	lock_guard<mutex> guard(lock);
 	ClearIfOversized(objects);
 	objects[key] = {found, policy};
@@ -2131,6 +2159,14 @@ bool PolicyStore::JwksLocationAllowed(const string &uri, string &why) {
 	}
 	why = "\"" + uri + "\" is outside acl_jwks_locations (" + setting + ")";
 	return false;
+}
+
+vector<string> PolicyStore::PrincipalCatalogs(const Principal &principal) {
+	return catalog ? catalog->HeldCatalogs(principal) : vector<string>();
+}
+
+string PolicyStore::PrincipalMainCatalog(const Principal &principal) {
+	return catalog ? catalog->MainCatalog(principal) : string();
 }
 
 bool PolicyStore::ResolveHeldSchema(const Principal &principal, const string &written, string &vcat, string &path) {

@@ -1901,6 +1901,16 @@ void AclSessionKillFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	}
 }
 
+//! acl_session_use(id, vcat, schema): what a principal's `USE` performs (spec 114), composed by the
+//! rewriter after its checks, by the session's non-secret ops id - unreachable from a principal's query
+void AclSessionUseFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto id = RequiredArg(args, 0, row, "acl_session_use", "session id");
+		result.SetValue(row, Value::BOOLEAN(StoreOf(state).SessionUse(id, OptionalArg(args, 1, row, ""),
+		                                                              OptionalArg(args, 2, row, ""))));
+	}
+}
+
 //! acl_session_close(handle): end it. Idempotent, so a door may retry a disconnect.
 void AclSessionCloseFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -2114,6 +2124,11 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_session_bigint("acl_drain", AclDrainFunc);
 	register_admin("acl_resume", {}, AclResumeFunc);
 	register_session_text("acl_drain_status", {}, AclDrainStatusFunc);
+	{
+		ScalarFunction use(Identifier("acl_session_use"), {v, v, v}, LogicalType::BOOLEAN, AclSessionUseFunc);
+		MarkAclScalar(use, store);
+		loader.RegisterFunction(use);
+	}
 	{
 		ScalarFunction kill(Identifier("acl_session_kill"), {v}, LogicalType::BOOLEAN, AclSessionKillFunc);
 		MarkAclScalar(kill, store);
