@@ -1100,6 +1100,36 @@ public:
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_CANCEL, false);
 		// specs 049/051: DoPutCommandStatementIngest below - append, create or replace under the ACL
 		RegisterSqlInfo(Info::FLIGHT_SQL_SERVER_BULK_INGESTION, true);
+		// spec 115: how a tool builds names and what it may offer. Static facts of the build - no
+		// principal and no policy in them. duckdb folds identifiers case-insensitively, quoted or not.
+		RegisterSqlInfo(Info::SQL_IDENTIFIER_QUOTE_CHAR, string("\""));
+		RegisterSqlInfo(Info::SQL_IDENTIFIER_CASE, int32_t(Info::SQL_CASE_SENSITIVITY_CASE_INSENSITIVE));
+		RegisterSqlInfo(Info::SQL_QUOTED_IDENTIFIER_CASE, int32_t(Info::SQL_CASE_SENSITIVITY_CASE_INSENSITIVE));
+		RegisterSqlInfo(Info::SQL_CATALOG_TERM, string("catalog"));
+		RegisterSqlInfo(Info::SQL_SCHEMA_TERM, string("schema"));
+		RegisterSqlInfo(Info::SQL_PROCEDURE_TERM, string("function"));
+		RegisterSqlInfo(Info::SQL_CATALOG_AT_START, true);
+		RegisterSqlInfo(Info::SQL_SEARCH_STRING_ESCAPE, string("\\"));
+		RegisterSqlInfo(Info::SQL_TRANSACTIONS_SUPPORTED, true); // spec 055 - what JDBC's supportsTransactions reads
+		RegisterSqlInfo(Info::SQL_KEYWORDS, Keywords());
+	}
+
+	//! duckdb's reserved words and the management grammar's own (spec 115: a tool highlights them)
+	static std::vector<std::string> Keywords() {
+		std::vector<std::string> words;
+		for (auto &keyword : Parser::KeywordList()) {
+			if (StringUtil::CIEquals(keyword.category, "reserved")) {
+				words.push_back(StringUtil::Upper(keyword.name));
+			}
+		}
+		for (auto word : {"ACL", "NATIVE", "VIRTUAL", "ISSUER", "CLIENT", "MAP", "CATALOG", "GRANT", "REVOKE", "DENY",
+		                  "ROLE", "CLUSTER", "RESOURCE", "REFERENCE"}) {
+			if (std::find(words.begin(), words.end(), word) == words.end()) {
+				words.push_back(word);
+			}
+		}
+		std::sort(words.begin(), words.end());
+		return words;
 	}
 
 	//! A statement's transaction_id, checked against the session's open transaction (spec 055). Empty
@@ -2168,6 +2198,20 @@ public:
 		                     BuildCatalogListing(CatalogListing::TABLE_TYPES, CatalogFilter()));
 	}
 
+	// spec 115: the type list a tool offers (JDBC getTypeInfo, ADBC) - static facts of the build, still
+	// answered under the caller's session like every catalog RPC
+	arrow::Result<std::unique_ptr<flight::FlightInfo>>
+	GetFlightInfoXdbcTypeInfo(const flight::ServerCallContext &context, const flightsql::GetXdbcTypeInfo &command,
+	                          const flight::FlightDescriptor &descriptor) override {
+		return CatalogInfo(context, flightsql::SqlSchema::GetXdbcTypeInfoSchema(), descriptor);
+	}
+
+	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
+	DoGetXdbcTypeInfo(const flight::ServerCallContext &context, const flightsql::GetXdbcTypeInfo &command) override {
+		return CatalogStream(context, flightsql::SqlSchema::GetXdbcTypeInfoSchema(),
+		                     [&](const string &) { return XdbcTypeInfoBatch(command.data_type); });
+	}
+
 	arrow::Result<std::unique_ptr<flight::FlightInfo>>
 	GetFlightInfoPrimaryKeys(const flight::ServerCallContext &context, const flightsql::GetPrimaryKeys &command,
 	                         const flight::FlightDescriptor &descriptor) override {
@@ -2534,7 +2578,8 @@ private:
 		}
 		ArrowSchema schema;
 		ArrowConverter::ToArrowSchema(&schema, types, plain, properties);
-		return arrow::ImportSchema(&schema);
+		ARROW_ASSIGN_OR_RAISE(auto imported, arrow::ImportSchema(&schema));
+		return WithTypeNames(imported, types, {}); // spec 115: the type a tool shows
 	}
 
 	shared_ptr<FlightDoorState> state;

@@ -217,6 +217,27 @@ Clients: [DBeaver / JDBC](clients/dbeaver.md), [ADBC (python)](clients/adbc.md),
 [Power BI / Fabric](clients/powerbi-fabric.md). The cookie middleware
 (`DatabaseOptions.WITH_COOKIE_MIDDLEWARE` in ADBC) is what makes a connection one session.
 
+### What a tool reads (spec 115)
+
+A database tool (DBeaver, DataGrip, an ADBC or JDBC driver) builds its tree and its SQL from the
+door's metadata, all of it answered for the connected principal:
+
+- **GetSqlInfo** - `"` as the identifier quote, `catalog` / `schema` / `function` as the terms, the
+  catalog at the start of a name, `\` as the search escape, transactions supported, and the reserved
+  words (duckdb's and the management grammar's: `ACL`, `NATIVE`, `VIRTUAL`, …).
+- **Type names** - every field the door describes (GetTables `include_schema`, a statement's result,
+  a prepared statement's parameters) carries Flight SQL's `ARROW:FLIGHT:SQL:TYPE_NAME` with duckdb's
+  type text (`STRUCT(city VARCHAR)`, `INTEGER[]`, `DECIMAL(9,2)` plus precision and scale) - what the
+  role reads, a narrowed struct included.
+- **GetXdbcTypeInfo** - the system catalog's types (a principal names no other, spec 099).
+- **Functions** - Flight SQL has no RPC for them; a tool reads `duckdb_functions()` (every catalog
+  the principal holds, a table function's result as `TABLE(…)`) and `acl_function_columns()`
+  (parameters and result columns). `duckdb_schemas()` names each nested schema's `parent_schema`
+  and lists a schema that holds only functions, so the tree can be built - every schema listing
+  (`information_schema.schemata`, SHOW SCHEMAS, Flight GetDbSchemas) takes those nodes too. A table
+  function's result columns are the ones the call returns to the role (a grant's hidden column is
+  not listed).
+
 ## The quack door
 
 ```sql

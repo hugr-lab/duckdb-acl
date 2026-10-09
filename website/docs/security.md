@@ -161,9 +161,10 @@ mode of default-deny is a refusal, and the refusal names the function.
   not list the physical database.
 - `duckdb_functions()` answers **what the principal may call** (spec 098): the engine's functions the
   function gate admits for its roles - enumerated from the gate's own model - and the virtual
-  functions a call of the principal reaches (by bare name, in its MAIN catalog, with `select`), with
-  their parameters and comment. A virtual row names only virtual things (its catalog, `main`, its
-  comment) and never a definition; an engine row outside the `system` catalog carries no definition,
+  functions a call of the principal reaches (with `select`; since spec 115 in every catalog it holds -
+  a flat name of the MAIN catalog by its bare name, any other qualified: `c.f`, `c.a.b.f`), with
+  their parameters, a table function's `TABLE(…)` result type and comment. A virtual row names only
+  virtual things (its catalog, its schema path, its comment) and never a definition; an engine row outside the `system` catalog carries no definition,
   database, schema or the operator's comment - a macro of an attached catalog granted by name is
   listed by name only, and only when that bare name reaches it (not when a builtin or a virtual
   function of that name takes the call). It answers whether or not the role holds `meta`

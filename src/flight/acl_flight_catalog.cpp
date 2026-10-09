@@ -26,8 +26,10 @@
 #include "duckdb/main/connection.hpp"
 
 #include <arrow/array/builder_binary.h>
+#include <arrow/array/builder_nested.h>
 #include <arrow/array/builder_primitive.h>
 #include <arrow/c/bridge.h>
+#include <arrow/flight/sql/column_metadata.h>
 #include <arrow/ipc/writer.h>
 #include <arrow/record_batch.h>
 #include <arrow/table.h>
@@ -198,6 +200,131 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> EmptyBatch(const std::shared_
 //! client opens its sidebar, and it could never describe a table function at all. The `data_type`
 //! strings are parsed by duckdb's own `TransformStringToLogicalType` - the inverse of the
 //! `ToString()` that produced them - so no type mapping is re-implemented here.
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> XdbcTypeInfoBatch(std::optional<int> data_type) {
+	// xdbc codes are JDBC's java.sql.Types (Flight SQL's XdbcDataType)
+	struct TypeRow {
+		const char *name;
+		int32_t code;
+		int32_t size; // max characters / precision; 0 = none
+		const char *prefix;
+		const char *suffix;
+		const char *params; // create params, comma-separated; "" = none
+		bool case_sensitive;
+		int32_t searchable; // 0 none, 1 char (LIKE only), 2 basic, 3 full
+		bool is_unsigned;
+		int32_t radix;
+	};
+	static const TypeRow ROWS[] = {
+	    {"BOOLEAN", -7, 1, nullptr, nullptr, "", false, 2, false, 0},
+	    {"TINYINT", -6, 3, nullptr, nullptr, "", false, 2, false, 10},
+	    {"SMALLINT", 5, 5, nullptr, nullptr, "", false, 2, false, 10},
+	    {"INTEGER", 4, 10, nullptr, nullptr, "", false, 2, false, 10},
+	    {"BIGINT", -5, 19, nullptr, nullptr, "", false, 2, false, 10},
+	    {"HUGEINT", 2, 39, nullptr, nullptr, "", false, 2, false, 10},
+	    {"UTINYINT", -6, 3, nullptr, nullptr, "", false, 2, true, 10},
+	    {"USMALLINT", 5, 5, nullptr, nullptr, "", false, 2, true, 10},
+	    {"UINTEGER", 4, 10, nullptr, nullptr, "", false, 2, true, 10},
+	    {"UBIGINT", -5, 20, nullptr, nullptr, "", false, 2, true, 10},
+	    {"UHUGEINT", 2, 39, nullptr, nullptr, "", false, 2, true, 10},
+	    {"FLOAT", 7, 24, nullptr, nullptr, "", false, 2, false, 2},
+	    {"DOUBLE", 8, 53, nullptr, nullptr, "", false, 2, false, 2},
+	    {"DECIMAL", 3, 38, nullptr, nullptr, "precision,scale", false, 2, false, 10},
+	    {"VARCHAR", 12, 0, "'", "'", "", true, 3, false, 0},
+	    {"BLOB", -3, 0, "'", "'::BLOB", "", false, 2, false, 0},
+	    {"DATE", 91, 10, "DATE '", "'", "", false, 2, false, 0},
+	    {"TIME", 92, 15, "TIME '", "'", "", false, 2, false, 0},
+	    {"TIMESTAMP", 93, 26, "TIMESTAMP '", "'", "", false, 2, false, 0},
+	    {"TIMESTAMP WITH TIME ZONE", 2014, 32, "TIMESTAMPTZ '", "'", "", false, 2, false, 0},
+	    {"INTERVAL", 1111, 0, "INTERVAL '", "'", "", false, 2, false, 0},
+	    {"UUID", 1, 36, "'", "'::UUID", "", false, 2, false, 0},
+	    {"JSON", 12, 0, "'", "'::JSON", "", true, 3, false, 0},
+	    {"BIT", -7, 0, "'", "'::BIT", "", false, 2, false, 0},
+	    {"LIST", 2003, 0, nullptr, nullptr, "element type", false, 0, false, 0},
+	    {"ARRAY", 2003, 0, nullptr, nullptr, "element type,size", false, 0, false, 0},
+	    {"STRUCT", 2002, 0, nullptr, nullptr, "fields", false, 0, false, 0},
+	    {"MAP", 1111, 0, nullptr, nullptr, "key type,value type", false, 0, false, 0},
+	    {"UNION", 1111, 0, nullptr, nullptr, "members", false, 0, false, 0},
+	};
+	auto &schema = arrow::flight::sql::SqlSchema::GetXdbcTypeInfoSchema();
+	arrow::StringBuilder type_name, prefix, suffix, local_name;
+	arrow::Int32Builder code, size, nullable, searchable, min_scale, max_scale, sql_code, subcode, radix, interval;
+	arrow::BooleanBuilder case_sensitive, is_unsigned, fixed, auto_increment;
+	auto params_values = std::make_shared<arrow::StringBuilder>();
+	arrow::ListBuilder params(arrow::default_memory_pool(), params_values,
+	                          arrow::list(arrow::field("item", arrow::utf8(), false)));
+	for (auto &row : ROWS) {
+		if (data_type && *data_type != row.code) {
+			continue;
+		}
+		ARROW_RETURN_NOT_OK(type_name.Append(row.name));
+		ARROW_RETURN_NOT_OK(code.Append(row.code));
+		ARROW_RETURN_NOT_OK(row.size ? size.Append(row.size) : size.AppendNull());
+		ARROW_RETURN_NOT_OK(row.prefix ? prefix.Append(row.prefix) : prefix.AppendNull());
+		ARROW_RETURN_NOT_OK(row.suffix ? suffix.Append(row.suffix) : suffix.AppendNull());
+		ARROW_RETURN_NOT_OK(params.Append());
+		if (*row.params) { // duckdb's Split("") is {""}: a type with no params has an empty list
+			for (auto &param : StringUtil::Split(row.params, ",")) {
+				ARROW_RETURN_NOT_OK(params_values->Append(param));
+			}
+		}
+		ARROW_RETURN_NOT_OK(nullable.Append(1)); // columnNullable
+		ARROW_RETURN_NOT_OK(case_sensitive.Append(row.case_sensitive));
+		ARROW_RETURN_NOT_OK(searchable.Append(row.searchable));
+		ARROW_RETURN_NOT_OK(row.radix ? is_unsigned.Append(row.is_unsigned) : is_unsigned.AppendNull());
+		ARROW_RETURN_NOT_OK(fixed.Append(string(row.name) == "DECIMAL"));
+		ARROW_RETURN_NOT_OK(auto_increment.Append(false));
+		ARROW_RETURN_NOT_OK(local_name.Append(row.name));
+		ARROW_RETURN_NOT_OK(string(row.name) == "DECIMAL" ? min_scale.Append(0) : min_scale.AppendNull());
+		ARROW_RETURN_NOT_OK(string(row.name) == "DECIMAL" ? max_scale.Append(38) : max_scale.AppendNull());
+		ARROW_RETURN_NOT_OK(sql_code.Append(row.code));
+		ARROW_RETURN_NOT_OK(subcode.AppendNull());
+		ARROW_RETURN_NOT_OK(row.radix ? radix.Append(row.radix) : radix.AppendNull());
+		ARROW_RETURN_NOT_OK(interval.AppendNull());
+	}
+	std::vector<std::shared_ptr<arrow::Array>> columns(19);
+	ARROW_RETURN_NOT_OK(type_name.Finish(&columns[0]));
+	ARROW_RETURN_NOT_OK(code.Finish(&columns[1]));
+	ARROW_RETURN_NOT_OK(size.Finish(&columns[2]));
+	ARROW_RETURN_NOT_OK(prefix.Finish(&columns[3]));
+	ARROW_RETURN_NOT_OK(suffix.Finish(&columns[4]));
+	ARROW_RETURN_NOT_OK(params.Finish(&columns[5]));
+	ARROW_RETURN_NOT_OK(nullable.Finish(&columns[6]));
+	ARROW_RETURN_NOT_OK(case_sensitive.Finish(&columns[7]));
+	ARROW_RETURN_NOT_OK(searchable.Finish(&columns[8]));
+	ARROW_RETURN_NOT_OK(is_unsigned.Finish(&columns[9]));
+	ARROW_RETURN_NOT_OK(fixed.Finish(&columns[10]));
+	ARROW_RETURN_NOT_OK(auto_increment.Finish(&columns[11]));
+	ARROW_RETURN_NOT_OK(local_name.Finish(&columns[12]));
+	ARROW_RETURN_NOT_OK(min_scale.Finish(&columns[13]));
+	ARROW_RETURN_NOT_OK(max_scale.Finish(&columns[14]));
+	ARROW_RETURN_NOT_OK(sql_code.Finish(&columns[15]));
+	ARROW_RETURN_NOT_OK(subcode.Finish(&columns[16]));
+	ARROW_RETURN_NOT_OK(radix.Finish(&columns[17]));
+	ARROW_RETURN_NOT_OK(interval.Finish(&columns[18]));
+	auto rows = columns[0]->length();
+	return arrow::RecordBatch::Make(schema, rows, std::move(columns));
+}
+
+arrow::Result<std::shared_ptr<arrow::Schema>> WithTypeNames(const std::shared_ptr<arrow::Schema> &schema,
+                                                            const vector<LogicalType> &types,
+                                                            const vector<string> &type_texts) {
+	auto out = schema;
+	for (idx_t i = 0; i < types.size() && i < idx_t(out->num_fields()); i++) {
+		auto text = i < type_texts.size() && !type_texts[i].empty() ? type_texts[i] : types[i].ToString();
+		auto builder = arrow::flight::sql::ColumnMetadata::Builder();
+		builder.TypeName(text);
+		if (types[i].id() == LogicalTypeId::DECIMAL) {
+			builder.Precision(int32_t(DecimalType::GetWidth(types[i])));
+			builder.Scale(int32_t(DecimalType::GetScale(types[i])));
+		}
+		auto field = out->field(NumericCast<int>(i));
+		// merged, never replaced: duckdb's converter may already carry an extension type's metadata
+		ARROW_ASSIGN_OR_RAISE(
+		    out, out->SetField(NumericCast<int>(i), field->WithMergedMetadata(builder.Build().metadata_map())));
+	}
+	return out;
+}
+
 arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &tables, QueryResult &columns) {
 	ResultRows table_rows(tables);
 	ResultRows column_rows(columns);
@@ -219,6 +346,7 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &ta
 		vector<string> names;
 		vector<LogicalType> types;
 		vector<bool> non_nullable;
+		vector<string> texts; // the listing's own type text (spec 115)
 	};
 	vector<ParsedTableSchema> parsed;
 	context.RunFunctionInTransaction([&]() {
@@ -228,6 +356,7 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &ta
 			vector<string> names;
 			vector<LogicalType> types;
 			vector<bool> non_nullable;
+			vector<string> texts;
 			// A table with no rows in the columns listing gets an empty schema, and that is the honest
 			// answer rather than a gap to paper over: it is exactly what information_schema.columns
 			// says about it, so the two Flight answers agree with each other and with SQL. The case
@@ -237,13 +366,14 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &ta
 			if (found != by_object.end()) {
 				for (auto column_row : found->second) {
 					names.push_back(column_rows.GetValue(3, column_row).ToString());
-					types.push_back(
-					    TransformStringToLogicalType(column_rows.GetValue(4, column_row).ToString(), context));
+					texts.push_back(column_rows.GetValue(4, column_row).ToString());
+					types.push_back(TransformStringToLogicalType(texts.back(), context));
 					auto nullable = column_rows.GetValue(5, column_row);
 					non_nullable.push_back(!nullable.IsNull() && nullable.ToString() == "NO");
 				}
 			}
-			parsed.push_back(ParsedTableSchema {std::move(names), std::move(types), std::move(non_nullable)});
+			parsed.push_back(
+			    ParsedTableSchema {std::move(names), std::move(types), std::move(non_nullable), std::move(texts)});
 		}
 	});
 
@@ -252,7 +382,8 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &ta
 	for (auto &entry : parsed) {
 		ArrowSchema exported;
 		ArrowConverter::ToArrowSchema(&exported, entry.types, entry.names, properties);
-		ARROW_ASSIGN_OR_RAISE(auto schema, arrow::ImportSchema(&exported));
+		ARROW_ASSIGN_OR_RAISE(auto imported, arrow::ImportSchema(&exported));
+		ARROW_ASSIGN_OR_RAISE(auto schema, WithTypeNames(imported, entry.types, entry.texts));
 		// duckdb's converter marks every field nullable (it has nowhere to learn otherwise);
 		// a declared NOT NULL is the door's to carry into the promise (spec 048)
 		for (idx_t field = 0; field < entry.non_nullable.size(); field++) {

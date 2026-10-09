@@ -183,6 +183,36 @@ case "$got" in *ssn*|*S1*) fail "a hidden field reached the Flight client: $got"
 got="$(ask "@tables_schema:nested")"
 echo "$got" | grep -q "'address:struct<city: string>'" || fail "the promised schema of the narrowed struct: $got"
 
+# --- spec 115: what a tool reads to build names, types and its tree -----------------------------------
+# SqlInfo, each value by its id: 504 identifier quote, 531 catalog term, 532 catalog at start, 513 search
+# escape, 563 transactions supported
+got="$(ask "@sqlinfo:504,513,531,532,563")"
+echo "$got" | grep -q "504: '\"'" || fail "GetSqlInfo 504 (identifier quote): $got"
+echo "$got" | grep -q "513: '\\\\\\\\'" || fail "GetSqlInfo 513 (search escape): $got"
+echo "$got" | grep -q "531: 'catalog'" || fail "GetSqlInfo 531 (catalog term): $got"
+echo "$got" | grep -q "532: True" || fail "GetSqlInfo 532 (catalog at start): $got"
+echo "$got" | grep -q "563: True" || fail "GetSqlInfo 563 (transactions supported): $got"
+got="$(ask "@sqlinfo:508")"
+echo "$got" | grep -q "'NATIVE'" || fail "GetSqlInfo: keywords lack the management grammar's: $got"
+echo "$got" | grep -q "'QUALIFY'" || fail "GetSqlInfo: keywords lack duckdb's reserved words: $got"
+# the escape announced is the escape applied: `_` in a pattern is a literal underscore when escaped
+got="$(ask '@tables:typed\_v')"
+echo "$got" | grep -q "'table_name': \['typed_v'\]" || fail "GetTables with an escaped underscore: $got"
+got="$(ask "@xdbc")"
+echo "$got" | grep -q "'VARCHAR'" || fail "GetXdbcTypeInfo: $got"
+echo "$got" | grep -q "'STRUCT'" || fail "GetXdbcTypeInfo lacks STRUCT: $got"
+got="$(ask "@xdbc:3")"
+echo "$got" | grep -q "'type_name': \['DECIMAL'\]" || fail "GetXdbcTypeInfo filtered by data_type: $got"
+# the full type text on every field - the statement's schema and the promised one
+got="$(ACL_SHOW_TYPE_NAMES=1 ask "SELECT id, address FROM nested")"
+echo "$got" | grep -q "'id:INTEGER', 'address:STRUCT(city VARCHAR)'" || fail "TYPE_NAME on a result: $got"
+got="$(ACL_SHOW_TYPE_NAMES=1 ask "@tables_schema:nested")"
+echo "$got" | grep -q "'address:STRUCT(city VARCHAR)'" || fail "TYPE_NAME in include_schema (the narrowed type): $got"
+got="$(ACL_SHOW_TYPE_NAMES=1 ask "SELECT 1.5::DECIMAL(9,2) AS d, [1, 2] AS l, MAP {'k': 1} AS m")"
+echo "$got" | grep -q "'d:DECIMAL(9,2)/9/2', 'l:INTEGER\[\]', 'm:MAP(VARCHAR, INTEGER)'" || fail "TYPE_NAME of DECIMAL/LIST/MAP: $got"
+got="$(ACL_SHOW_PARAM_TYPE_NAMES=1 ask "@prepared_fields:SELECT id FROM orders WHERE amount > ?::DECIMAL(9,2)")"
+echo "$got" | grep -q "DECIMAL(9,2)/9/2" || fail "TYPE_NAME on a prepared statement's parameter: $got"
+
 # --- references are the foreign keys (spec 022) ---------------------------------------------------
 got="$(ask "@imported:orders")"
 echo "$got" | grep -q "'fk_column_name': \['customer_id'\]" || fail "imported keys: $got"

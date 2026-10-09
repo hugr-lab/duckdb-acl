@@ -20,21 +20,23 @@ vector<CatalogBackend::VisibleFunction> CatalogBackend::VisibleFunctions(const P
 	                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
 	                                       " AND oc.\"vname\" = f.\"vname\""
 	                                 : string();
-	// the same visibility a call resolves with: a grant on the catalog that is not an explicit nothing
-	auto sql = GrantsCte(principal) +
-	           " SELECT DISTINCT f.\"vcat\", f.\"vname\", f.\"kind\", f.\"params\", f.\"comment\","
-	           " (SELECT c.\"type\" FROM " +
-	           Tbl("object_columns") +
-	           " c WHERE c.\"vcat\" = f.\"vcat\" AND c.\"vname\" = f.\"vname\" AND c.\"kind\" = 'scalar'"
-	           " ORDER BY c.\"pos\" LIMIT 1) FROM " +
-	           Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join + " WHERE " +
-	           FunctionVisibleExpr() +
-	           // what a call can reach: the rewriter resolves a function by its bare name, in the
-	           // principal's one MAIN catalog - a flat name there, never another catalog's or a nested one
-	           " AND g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND position('.' IN f.\"vname\") = 0"
-	           " ORDER BY 1, 2, 3";
+	// the same visibility a call resolves with: a grant on the catalog that is not an explicit nothing.
+	// Every catalog the principal holds (spec 115): a call reaches any of them qualified; a flat name of
+	// the one MAIN catalog is also reached bare
+	auto sql =
+	    GrantsCte(principal) +
+	    " SELECT f.\"vcat\", f.\"vname\", f.\"kind\", any_value(f.\"params\"), any_value(f.\"comment\"),"
+	    " (SELECT c.\"type\" FROM " +
+	    Tbl("object_columns") +
+	    " c WHERE c.\"vcat\" = f.\"vcat\" AND c.\"vname\" = f.\"vname\" AND c.\"kind\" = 'scalar'"
+	    " ORDER BY c.\"pos\" LIMIT 1),"
+	    " bool_or(g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND position('.' IN f.\"vname\") = 0)"
+	    " FROM " +
+	    Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join + " WHERE " + FunctionVisibleExpr() +
+	    " GROUP BY 1, 2, 3 ORDER BY 1, 2, 3";
 	auto result = Query(sql);
 	ResultRows rows(*result);
+	case_insensitive_map_t<idx_t> table_functions; // vcat \x1f vname -> index in out
 	for (idx_t row = 0; row < rows.Count(); row++) {
 		VisibleFunction function;
 		function.vcat = rows.GetValue(0, row).ToString();
@@ -44,7 +46,32 @@ vector<CatalogBackend::VisibleFunction> CatalogBackend::VisibleFunctions(const P
 		function.params = params.IsNull() ? string() : params.ToString();
 		function.comment = rows.GetValue(4, row);
 		function.returns = function.kind == "scalar" ? rows.GetValue(5, row) : Value();
+		auto bare = rows.GetValue(6, row);
+		function.bare = !bare.IsNull() && bare.GetValue<bool>();
+		if (function.kind == "table") {
+			table_functions[function.vcat + "\x1f" + function.vname] = out.size();
+		}
 		out.push_back(std::move(function));
+	}
+	if (!table_functions.empty()) {
+		// the declared result columns of the visible table functions - one read for all of them
+		auto columns = Query("SELECT \"vcat\", \"vname\", \"name\", \"type\", \"nullable\", \"comment\" FROM " +
+		                     Tbl("object_columns") + " WHERE \"kind\" = 'table' ORDER BY \"vcat\", \"vname\", \"pos\"");
+		ResultRows column_rows(*columns);
+		for (idx_t row = 0; row < column_rows.Count(); row++) {
+			auto entry = table_functions.find(column_rows.GetValue(0, row).ToString() + "\x1f" +
+			                                  column_rows.GetValue(1, row).ToString());
+			if (entry == table_functions.end()) {
+				continue;
+			}
+			VisibleFunction::Column column;
+			column.name = column_rows.GetValue(2, row).ToString();
+			auto type = column_rows.GetValue(3, row);
+			column.type = type.IsNull() ? string() : type.ToString();
+			column.nullable = column_rows.GetValue(4, row);
+			column.comment = column_rows.GetValue(5, row);
+			out[entry->second].columns.push_back(std::move(column));
+		}
 	}
 	return out;
 }
@@ -132,8 +159,25 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                 " s JOIN grants g ON g.\"vcat\" = s.\"vcat\""
 	                 " WHERE s.\"phys_path\" IS NOT NULL AND " +
 	                 schema_visible + ")";
-	// a schema exists for the principal when something inside it does
-	string schemas = "vschemas AS (SELECT vcat, path FROM aliases UNION SELECT vcat, vschema FROM objects)";
+	// a schema exists for the principal when something inside it does - a relation, an alias, or a
+	// function it can see (spec 115) - and so does every schema above a nested one, so a tool can build
+	// the tree from the parents
+	string function_schemas =
+	    "fschemas AS (SELECT DISTINCT f.\"vcat\" AS vcat,"
+	    " CASE WHEN position('.' IN f.\"vname\") > 0 THEN regexp_extract(f.\"vname\", '^(.*)[.][^.]*$', 1)"
+	    " ELSE 'main' END AS path FROM " +
+	    Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" +
+	    (HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
+	                           " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
+	                           " AND oc.\"vname\" = f.\"vname\""
+	                     : string()) +
+	    " WHERE " + FunctionVisibleExpr() + ")";
+	string schemas = function_schemas +
+	                 ", leafschemas AS (SELECT vcat, path FROM aliases UNION SELECT vcat, vschema FROM objects"
+	                 " UNION SELECT vcat, path FROM fschemas),"
+	                 " vschemas AS (SELECT vcat, path FROM leafschemas UNION SELECT vcat, unnest(list_transform("
+	                 "range(1, len(str_split(path, '.'))), lambda i: array_to_string(str_split(path, '.')[1:i], '.')))"
+	                 " FROM leafschemas WHERE position('.' IN path) > 0)";
 	// spec 011 narrows columns per grant level, and the listing has to narrow with it: the object
 	// row is kept per role here (unlike `objects`, which collapses them) so that "visible for at
 	// least one role" can be asked column by column.
@@ -229,8 +273,11 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		return prelude + "SELECT " + schema_oid("vcat", "path") + " AS oid, vcat AS database_name, " +
 		       database_oid("vcat") + " AS database_oid, path AS schema_name, NULL::VARCHAR AS comment, " + empty_map +
 		       " AS tags, false AS internal, NULL::VARCHAR AS sql,"
-		       " NULL::VARCHAR AS parent_schema, NULL::BIGINT AS parent_schema_oid"
-		       " FROM (SELECT DISTINCT vcat, path FROM vschemas)";
+		       // spec 115: a nested schema names its parent, so a tool can build the tree
+		       " parent AS parent_schema, CASE WHEN parent IS NULL THEN NULL ELSE " +
+		       schema_oid("vcat", "parent") +
+		       " END AS parent_schema_oid FROM (SELECT DISTINCT vcat, path, CASE WHEN position('.' IN path) > 0 THEN"
+		       " regexp_extract(path, '^(.*)[.][^.]*$', 1) END AS parent FROM vschemas)";
 	}
 	// spec 031: the SHOW forms, each in the shape duckdb answers it with. They are the same catalog
 	// the information_schema surfaces describe - only a client asking `SHOW DATABASES` wants one

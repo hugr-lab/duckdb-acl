@@ -612,6 +612,15 @@ the worker and `USE`d in its scratch); an ingest reads it too. On Flight a clien
 (SET/USE/CREATE/DROP/ALTER) runs at GetFlightInfo (`ClientStatementIsCommand`) whatever the rewrite
 made of it.
 
+**Spec 115 — metadata for tools**: GetSqlInfo carries quoting/terms/catalog-at-start/keywords/
+`SQL_TRANSACTIONS_SUPPORTED`; every Arrow field the door describes carries `ARROW:FLIGHT:SQL:TYPE_NAME`
+(`WithTypeNames`); GetXdbcTypeInfo answers the system types. A virtual function of ANY held catalog is
+callable qualified (`c.f`, `c.a.b.f`, `c.main.f`; `AclRewriter::ResolveVirtualFunction` - the rewriter
+used to drop the qualifier), a short name under `USE` is read in the session's catalog first; bare =
+MAIN only. `duckdb_functions()` lists every held catalog's (schema path, `TABLE(…)` result type),
+`acl_function_columns([c[, s[, f]]])` their params/columns/return; `duckdb_schemas` gives
+`parent_schema` and functions-only schemas. Phase 0 of design/079 (DBeaver console).
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

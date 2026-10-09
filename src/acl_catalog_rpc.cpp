@@ -87,7 +87,7 @@ CatalogQuery BuildCatalogListing(CatalogListing listing, const CatalogFilter &fi
 	case CatalogListing::DB_SCHEMAS:
 		AppendCatalogFilter(query, conditions, filter, "catalog_name");
 		if (filter.has_db_schema_pattern) {
-			conditions.push_back("schema_name LIKE " + Bind(query, Value(filter.db_schema_pattern)));
+			conditions.push_back("schema_name LIKE " + Bind(query, Value(filter.db_schema_pattern)) + " ESCAPE '\\'");
 		}
 		query.sql = "SELECT catalog_name, schema_name AS db_schema_name FROM information_schema.schemata" +
 		            Where(conditions) + " ORDER BY 1, 2";
@@ -96,10 +96,10 @@ CatalogQuery BuildCatalogListing(CatalogListing listing, const CatalogFilter &fi
 	case CatalogListing::TABLES:
 		AppendCatalogFilter(query, conditions, filter, "table_catalog");
 		if (filter.has_db_schema_pattern) {
-			conditions.push_back("table_schema LIKE " + Bind(query, Value(filter.db_schema_pattern)));
+			conditions.push_back("table_schema LIKE " + Bind(query, Value(filter.db_schema_pattern)) + " ESCAPE '\\'");
 		}
 		if (filter.has_table_pattern) {
-			conditions.push_back("table_name LIKE " + Bind(query, Value(filter.table_pattern)));
+			conditions.push_back("table_name LIKE " + Bind(query, Value(filter.table_pattern)) + " ESCAPE '\\'");
 		}
 		if (!filter.table_types.empty()) {
 			vector<string> placeholders;
@@ -120,10 +120,10 @@ CatalogQuery BuildCatalogListing(CatalogListing listing, const CatalogFilter &fi
 		// listing by (catalog, schema, name).
 		AppendCatalogFilter(query, conditions, filter, "table_catalog");
 		if (filter.has_db_schema_pattern) {
-			conditions.push_back("table_schema LIKE " + Bind(query, Value(filter.db_schema_pattern)));
+			conditions.push_back("table_schema LIKE " + Bind(query, Value(filter.db_schema_pattern)) + " ESCAPE '\\'");
 		}
 		if (filter.has_table_pattern) {
-			conditions.push_back("table_name LIKE " + Bind(query, Value(filter.table_pattern)));
+			conditions.push_back("table_name LIKE " + Bind(query, Value(filter.table_pattern)) + " ESCAPE '\\'");
 		}
 		// is_nullable rides along for the promised Arrow schema (spec 048): duckdb's converter
 		// cannot say non-nullable, so the door clears the flag itself from this very column

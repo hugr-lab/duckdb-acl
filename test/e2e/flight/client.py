@@ -156,7 +156,22 @@ def prepared_dataset_fields(client, options, sql: str) -> int:
         close = command("ActionClosePreparedStatementRequest", field(1, handle))
         list(client.do_action(flight.Action("ClosePreparedStatement", close), options))
     schema = inner.get(2, b"")
+    if os.environ.get("ACL_SHOW_PARAM_TYPE_NAMES"):  # spec 115: parameter_schema = 3
+        params = inner.get(3, b"")
+        return type_names(pa.ipc.read_schema(pa.py_buffer(params))) if params else []
     return len(pa.ipc.read_schema(pa.py_buffer(schema))) if schema else 0
+
+
+def type_names(schema):
+    """spec 115: `name:TYPE_NAME[/precision/scale]` from each field's Flight SQL column metadata"""
+    out = []
+    for f in schema:
+        md = f.metadata or {}
+        text_ = f"{f.name}:{md.get(b'ARROW:FLIGHT:SQL:TYPE_NAME', b'-').decode()}"
+        if b"ARROW:FLIGHT:SQL:PRECISION" in md:
+            text_ += f"/{md[b'ARROW:FLIGHT:SQL:PRECISION'].decode()}/{md.get(b'ARROW:FLIGHT:SQL:SCALE', b'-').decode()}"
+        out.append(text_)
+    return out
 
 
 def catalog_command(spec: str) -> bytes:
@@ -185,6 +200,13 @@ def catalog_command(spec: str) -> bytes:
         pk_table, fk_table = argument.split(",")
         # pk_catalog = 1, pk_db_schema = 2, pk_table = 3, fk_catalog = 4, fk_db_schema = 5, fk_table = 6
         return command("CommandGetCrossReference", text(3, pk_table) + text(6, fk_table))
+    if name == "sqlinfo":
+        # repeated uint32 info = 1 (packed) - spec 115
+        ids = b"".join(varint(int(i)) for i in argument.split(",")) if argument else b""
+        return command("CommandGetSqlInfo", field(1, ids) if ids else b"")
+    if name == "xdbc":
+        # optional int32 data_type = 1 - spec 115
+        return command("CommandGetXdbcTypeInfo", enum_field(1, int(argument)) if argument else b"")
     raise SystemExit(f"unknown catalog command: {spec}")
 
 
@@ -265,6 +287,9 @@ data = table.to_pydict()
 # spec 099: what the stream itself carries, column by column - a dictionary or a plain string
 if os.environ.get("ACL_SHOW_SCHEMA"):
     data["__schema"] = [f"{f.name}:{f.type}" for f in table.schema]
+# spec 115: the type a tool shows - Flight SQL's ARROW:FLIGHT:SQL:TYPE_NAME on each field
+if os.environ.get("ACL_SHOW_TYPE_NAMES"):
+    data["__type_names"] = type_names(table.schema)
 # `table_schema` is a serialized IPC schema, which is bytes nobody can read in a shell assertion.
 # Unpack it into the column names and types it describes, which is the thing worth asserting on.
 if "table_schema" in data:
@@ -272,6 +297,12 @@ if "table_schema" in data:
     unpacked = []
     for blob in data["table_schema"]:
         schema = pa.ipc.read_schema(pa.BufferReader(blob))
+        if os.environ.get("ACL_SHOW_TYPE_NAMES"):
+            unpacked.append(type_names(schema))
+            continue
         unpacked.append([f"{f.name}:{f.type}" + ("" if f.nullable else " NOT NULL") for f in schema])
     data["table_schema"] = unpacked
+# spec 115: GetSqlInfo as id -> value, so an assertion ties each value to its id
+if ask.startswith("@sqlinfo"):
+    data = {"info": {i: v for i, v in zip(data["info_name"], data["value"])}}
 print(data)

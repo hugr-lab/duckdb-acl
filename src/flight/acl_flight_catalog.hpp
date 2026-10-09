@@ -26,12 +26,23 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> EmptyBatch(const std::shared_
 
 arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &tables, QueryResult &columns);
 
+//! spec 115: each field carries duckdb's type text as Flight SQL's `ARROW:FLIGHT:SQL:TYPE_NAME` (and a
+//! DECIMAL its precision and scale) - what a JDBC driver's getColumns / a tool's tree shows instead of
+//! a generic JAVA_OBJECT / ARRAY. `type_texts[i]` is the text to show (empty = the type's own ToString)
+arrow::Result<std::shared_ptr<arrow::Schema>> WithTypeNames(const std::shared_ptr<arrow::Schema> &schema,
+                                                            const vector<LogicalType> &types,
+                                                            const vector<string> &type_texts);
+
 //! The parameter rows a client bound to a prepared statement, read back as duckdb values (spec 047).
 //! The batches are exposed as an ArrowArrayStream and read through `arrow_scan` - duckdb's own
 //! conversion, the same mechanism its in-tree ADBC layer uses - so no second Arrow-to-duckdb type
 //! mapping exists in this codebase.
 arrow::Result<vector<vector<Value>>> ParamRowsFrom(DatabaseInstance &db, arrow::flight::FlightMessageReader &reader,
                                                    idx_t max_rows);
+
+//! spec 115: GetXdbcTypeInfo - the types a principal may name (the system catalog's, spec 099), one row
+//! each, in Flight SQL's fixed schema; `data_type` narrows to one xdbc code. Static per build.
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> XdbcTypeInfoBatch(std::optional<int> data_type);
 
 CatalogFilter FilterFrom(const arrow::flight::sql::GetTables &command);
 CatalogFilter FilterFrom(const arrow::flight::sql::GetDbSchemas &command);

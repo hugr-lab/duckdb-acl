@@ -15,6 +15,7 @@
 
 #include "acl_policy.hpp"
 #include "acl_policy_catalog.hpp"
+#include "duckdb/main/connection.hpp"
 
 #include <set>
 
@@ -131,7 +132,143 @@ string OidOf(const string &kind, const string &name) {
 	return "(hash(" + Quote(kind) + " || chr(31) || " + Quote(name) + ") >> 1)::BIGINT";
 }
 
+//! a declared column name as the operator wrote it (`"Name"`) -> the name itself (`Name`)
+string Unquoted(const string &name) {
+	if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
+		return StringUtil::Replace(name.substr(1, name.size() - 2), "\"\"", "\"");
+	}
+	return name;
+}
+
+//! a column name as SQL writes it: bare when it is a plain lower-case identifier, else quoted
+string QuoteIdentifier(const string &name) {
+	bool plain = !name.empty() && (StringUtil::CharacterIsAlpha(name[0]) || name[0] == '_');
+	for (auto c : name) {
+		plain = plain && (StringUtil::CharacterIsAlphaNumeric(c) || c == '_') && !(c >= 'A' && c <= 'Z');
+	}
+	return plain ? name : "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+}
+
+//! The result columns a call returns to this principal: the declared ones, narrowed by the grant's
+//! projection the way the read narrows them (spec 011 - WrapWithGrantPolicy). The projection is bound,
+//! on the node's own connection, over an empty relation of the declared columns, so names and types are
+//! the binder's - a mask's included. A projection that does not bind here (a claim marker, a call the
+//! node lacks) withholds the list: nothing rather than more than the call returns.
+vector<acl_detail::CatalogBackend::VisibleFunction::Column>
+NarrowedColumns(DatabaseInstance *db, const TablePolicy &policy,
+                const vector<acl_detail::CatalogBackend::VisibleFunction::Column> &declared) {
+	using Column = acl_detail::CatalogBackend::VisibleFunction::Column;
+	if (policy.wrap_sql.empty() && policy.projection.empty()) {
+		return declared;
+	}
+	if (!db || declared.empty()) {
+		return vector<Column>();
+	}
+	vector<string> items;
+	for (auto &column : declared) {
+		if (column.type.empty()) {
+			return vector<Column>();
+		}
+		items.push_back("NULL::" + column.type + " AS " + QuoteIdentifier(Unquoted(column.name)));
+	}
+	auto inner = "(SELECT " + StringUtil::Join(items, ", ") + " WHERE false)";
+	auto sql = !policy.wrap_sql.empty()
+	               ? policy.wrap_sql
+	               : "SELECT " + StringUtil::Join(policy.projection, ", ") + " FROM \"__acl_inner\"";
+	sql = StringUtil::Replace(sql, "\"__acl_inner\"", inner);
+	vector<Column> out;
+	try {
+		Connection con(*db);
+		auto described = con.Query("DESCRIBE " + sql);
+		if (described->HasError()) {
+			return vector<Column>();
+		}
+		for (idx_t row = 0; row < described->RowCount(); row++) {
+			Column column;
+			column.name = described->Collection().GetValue(0, row).ToString();
+			column.type = described->Collection().GetValue(1, row).ToString();
+			for (auto &candidate : declared) {
+				if (StringUtil::CIEquals(Unquoted(candidate.name), column.name)) {
+					column.comment = candidate.comment;
+				}
+			}
+			out.push_back(std::move(column));
+		}
+	} catch (std::exception &) {
+		return vector<Column>();
+	}
+	return out;
+}
+
+//! The virtual functions a call of this principal reaches, in every catalog it holds (spec 115), each
+//! resolved the way a call is - by the qualified name it can always be called with - and kept only with
+//! `select` (a call is a read)
+vector<acl_detail::CatalogBackend::VisibleFunction>
+CallableFunctions(PolicyStore &store, acl_detail::CatalogBackend *catalog, const Principal &principal) {
+	vector<acl_detail::CatalogBackend::VisibleFunction> out;
+	if (!catalog) {
+		return out;
+	}
+	auto db = store.instance.lock();
+	for (auto &function : catalog->VisibleFunctions(principal)) {
+		TablePolicy policy;
+		bool resolved = false;
+		auto qualified = function.vcat + "." + function.vname;
+		try {
+			resolved = function.kind == "table" ? store.ResolveTableFunction(principal, qualified, policy)
+			                                    : store.ResolveScalarFunction(principal, qualified, policy);
+		} catch (BinderException &) {
+			// what refuses the call (a scalar under a grant that carries a policy) keeps it out of
+			// the listing - never the whole listing out with it
+			continue;
+		}
+		if (!resolved || !policy.caps.count("select")) {
+			continue; // a call needs select (spec 012)
+		}
+		function.columns = NarrowedColumns(db.get(), policy, function.columns);
+		out.push_back(std::move(function));
+	}
+	return out;
+}
+
 } // namespace
+
+string PolicyStore::PrincipalFunctionColumnsSql(const Principal &principal) {
+	// spec 115: one row per parameter and per declared result column of every function the principal
+	// can call - what a JDBC driver's getFunctionColumns / getProcedureColumns read. Constants only.
+	vector<string> rows;
+	for (auto &function : CallableFunctions(*this, catalog.get(), principal)) {
+		auto dot = function.vname.rfind('.');
+		auto schema = dot == string::npos ? string("main") : function.vname.substr(0, dot);
+		auto leaf = dot == string::npos ? function.vname : function.vname.substr(dot + 1);
+		auto head = Quote(function.vcat) + ", " + Quote(schema) + ", " + Quote(leaf) + ", " + Quote(function.kind);
+		vector<string> names;
+		vector<string> types;
+		SplitParams(function.params, names, types);
+		for (idx_t i = 0; i < names.size(); i++) {
+			rows.push_back("(" + head + ", 'param', " + std::to_string(i + 1) + ", " + Quote(names[i]) + ", " +
+			               (types[i].empty() ? string("NULL") : Quote(types[i])) + ", NULL, NULL)");
+		}
+		for (idx_t i = 0; i < function.columns.size(); i++) {
+			auto &column = function.columns[i];
+			rows.push_back("(" + head + ", 'column', " + std::to_string(i + 1) + ", " + Quote(Unquoted(column.name)) +
+			               ", " + (column.type.empty() ? string("NULL") : Quote(column.type)) + ", " +
+			               (column.nullable.IsNull() ? string("NULL") : column.nullable.ToString()) + ", " +
+			               QuoteOrNull(column.comment) + ")");
+		}
+		if (function.kind == "scalar" && !function.returns.IsNull()) {
+			rows.push_back("(" + head + ", 'return', 0, NULL, " + Quote(function.returns.ToString()) + ", NULL, NULL)");
+		}
+	}
+	string shape = "SELECT NULL::VARCHAR AS database_name, NULL::VARCHAR AS schema_name, NULL::VARCHAR AS "
+	               "function_name, NULL::VARCHAR AS function_type, NULL::VARCHAR AS column_kind, NULL::INTEGER AS "
+	               "position, NULL::VARCHAR AS column_name, NULL::VARCHAR AS data_type, NULL::BOOLEAN AS is_nullable, "
+	               "NULL::VARCHAR AS comment WHERE false";
+	if (rows.empty()) {
+		return shape;
+	}
+	return shape + " UNION ALL SELECT * FROM (VALUES " + StringUtil::Join(rows, ", ") + ")";
+}
 
 string PolicyStore::PrincipalFunctionsSql(const Principal &principal) {
 	// (b) first: the virtual functions a call of this principal reaches, each resolved the way a call
@@ -139,34 +276,34 @@ string PolicyStore::PrincipalFunctionsSql(const Principal &principal) {
 	// (the rewriter resolves virtual functions first, by bare name), so those leave (a).
 	vector<string> rows;
 	std::set<string> shadowed; // kind \x1f name
-	if (catalog) {
-		for (auto &function : catalog->VisibleFunctions(principal)) {
-			TablePolicy policy;
-			bool resolved = false;
-			try {
-				resolved = function.kind == "table" ? ResolveTableFunction(principal, function.vname, policy)
-				                                    : ResolveScalarFunction(principal, function.vname, policy);
-			} catch (BinderException &) {
-				// what refuses the call (a scalar under a grant that carries a policy) keeps it out of
-				// the listing - never the whole listing out with it
-				continue;
-			}
-			if (!resolved || !policy.caps.count("select")) {
-				continue; // a call needs select (spec 012)
-			}
+	for (auto &function : CallableFunctions(*this, catalog.get(), principal)) {
+		if (function.bare) {
 			shadowed.insert(function.kind + "\x1f" + StringUtil::Lower(function.vname));
-			vector<string> names;
-			vector<string> types;
-			SplitParams(function.params, names, types);
-			rows.push_back("SELECT " + Quote(function.vcat) + "::VARCHAR, " + OidOf("database", function.vcat) +
-			               "::VARCHAR, 'main'::VARCHAR, " + Quote(function.vname) + "::VARCHAR, NULL::VARCHAR, " +
-			               Quote(function.kind) + "::VARCHAR, NULL::VARCHAR, " + QuoteOrNull(function.comment) +
-			               "::VARCHAR, MAP {}::MAP(VARCHAR, VARCHAR), " + QuoteOrNull(function.returns) +
-			               "::VARCHAR, " + ListLiteral(names) + ", " + ListLiteral(types) +
-			               ", NULL::VARCHAR, NULL::VARCHAR, NULL::BOOLEAN, false, NULL::VARCHAR, " +
-			               OidOf("function", function.vcat + "\x1f" + function.vname + "\x1f" + function.kind) +
-			               ", []::VARCHAR[], NULL::VARCHAR, []::VARCHAR[]");
 		}
+		vector<string> names;
+		vector<string> types;
+		SplitParams(function.params, names, types);
+		auto dot = function.vname.rfind('.');
+		auto schema = dot == string::npos ? string("main") : function.vname.substr(0, dot);
+		auto leaf = dot == string::npos ? function.vname : function.vname.substr(dot + 1);
+		// spec 115: a table function's declared result columns are its result type
+		Value returns = function.returns;
+		if (function.kind == "table" && !function.columns.empty()) {
+			vector<string> items;
+			for (auto &column : function.columns) {
+				items.push_back(QuoteIdentifier(Unquoted(column.name)) +
+				                (column.type.empty() ? "" : " " + column.type));
+			}
+			returns = Value("TABLE(" + StringUtil::Join(items, ", ") + ")");
+		}
+		rows.push_back("SELECT " + Quote(function.vcat) + "::VARCHAR, " + OidOf("database", function.vcat) +
+		               "::VARCHAR, " + Quote(schema) + "::VARCHAR, " + Quote(leaf) + "::VARCHAR, NULL::VARCHAR, " +
+		               Quote(function.kind) + "::VARCHAR, NULL::VARCHAR, " + QuoteOrNull(function.comment) +
+		               "::VARCHAR, MAP {}::MAP(VARCHAR, VARCHAR), " + QuoteOrNull(returns) + "::VARCHAR, " +
+		               ListLiteral(names) + ", " + ListLiteral(types) +
+		               ", NULL::VARCHAR, NULL::VARCHAR, NULL::BOOLEAN, false, NULL::VARCHAR, " +
+		               OidOf("function", function.vcat + "\x1f" + function.vname + "\x1f" + function.kind) +
+		               ", []::VARCHAR[], NULL::VARCHAR, []::VARCHAR[]");
 	}
 
 	// (a) the engine's functions the gate admits and a bare call reaches - one string key each,
