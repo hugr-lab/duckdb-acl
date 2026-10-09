@@ -107,8 +107,13 @@ What the door serves, every RPC authenticated per call from the `authorization: 
 - **Where a statement runs** (spec 111), as Flight SQL defines it: "GetFlightInfo: execute the query".
   - **Rows.** A statement that returns rows (SELECT, `... RETURNING`) is planned at `GetFlightInfo` and
     streamed lazily at `DoGet`. Nothing is held for a client that never pulls.
-    - A `DML ... RETURNING` is one of these. It runs only when its rows are fetched, so a client must
-      fetch it.
+    - A `DML ... RETURNING`, and a write inside a CTE (`WITH w AS (INSERT … RETURNING …) SELECT …`),
+      is one of these. It runs at `DoGet`, when its rows are fetched: a client that writes in this form
+      reads its rows, and one that never fetches never writes.
+    - A parameter that decides a result column of such a write is given its type
+      (`SELECT id, ?::VARCHAR AS tag FROM w`). Untyped, its column has no type before execution, and the
+      door does not execute a write to learn one (spec 112) - a driver that needs the schema up front
+      (ADBC) refuses the statement. A read with an untyped parameter is unaffected.
   - **A count.** A statement that answers only a count (INSERT / UPDATE / DELETE / MERGE without
     RETURNING, DDL) **runs at `GetFlightInfo`**. Its count waits for the `DoGet`, and a refusal is the
     execute call's own error.

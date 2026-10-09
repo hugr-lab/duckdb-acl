@@ -45,8 +45,9 @@ with connect(parent) as conn:
 
 # a write inside a CTE, prepared with a parameter its result type rides on: the door does not submit it
 # to learn its schema (that ran the INSERT a second time). Its schema stays unknown, which this driver
-# refuses - the write may fail, but it never lands twice (the review's finding)
-with connect(parent) as conn:
+# refuses - the write may fail, but it never lands twice (the review's finding). Under a parent of its
+# own: the runs of the parent above are counted exactly
+with connect("airflow/daily.cte/01929e3a-0000-7000-8000-0000000001c7") as conn:
     cur = conn.cursor()
     try:
         cur.execute("WITH w AS (INSERT INTO orders (id, tenant, amount, customer_id) VALUES (930, 'acme', 1, 0) "
@@ -57,6 +58,15 @@ with connect(parent) as conn:
     cur.execute("SELECT count(*) FROM orders WHERE id = 930")
     n = cur.fetchall()
     check("a CTE write prepared with a parameter never lands twice", n in ([(0,)], [(1,)]), n)
+    # the documented form: the parameter cast to its type gives the statement a schema - it runs once
+    # and its rows come back
+    cur.execute("WITH w AS (INSERT INTO orders (id, tenant, amount, customer_id) VALUES (931, 'acme', 1, 0) "
+                "RETURNING id) SELECT id, ?::VARCHAR AS tag FROM w", ("t",))
+    got = cur.fetchall()
+    cur.execute("SELECT count(*) FROM orders WHERE id = 931")
+    n = cur.fetchall()
+    check("a CTE write with a typed parameter returns its rows and lands once", got == [(931, "t")] and n == [(1,)],
+          (got, n))
 
 # spec 109 on the ingest path: a malformed parent is the call's error, the stream never lands
 with connect("airflow/daily/not-a-uuid") as conn:
