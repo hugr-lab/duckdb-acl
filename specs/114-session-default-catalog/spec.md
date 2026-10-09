@@ -31,6 +31,10 @@ catalog; `USE <vcat>.<schema>;` also sets its default schema.**
      as duckdb's own `USE db.schema` does, nowhere else (an object of the catalog's `main` is then
      `main.orders`) - and a bare `CREATE TABLE m` lands there. A two-part name is read as before.
      `USE <vcat>` alone resets the schema to the catalog's `main`.
+   - **`USE SCHEMA <schema>`** sets the default schema in the current default catalog (the session's,
+     else MAIN). duckdb's parser does not know this form, so the parser override reads it under a
+     principal prefix and compiles it like `USE <vcat>.<schema>`. `USE <x>` alone always names a catalog
+     - never a schema - so the two never mean each other.
 2. **Who may.** Only on a session of the client's own (a door's `ACL SESSION`, spec 068's
    `Principal::session_connection`): a gateway's per-statement prefix shares its connection, where the
    choice would be the next principal's. Only a catalog the principal holds a grant on; anything else
@@ -57,7 +61,7 @@ name refuse, as a written one would). Never on a shared connection.
 
 - `test/sql/acl_session_catalog.test`: `USE` on an `ACL SESSION` principal - short names in the second
   catalog, back to MAIN, `USE vcat.schema` - a bare name read and created in the schema, `main.x`
-  still reached, `USE vcat` resetting it; a catalog or schema not held refused, refused on a
+  still reached, `USE vcat` resetting it, `USE SCHEMA s` in the current catalog; a catalog or schema not held refused, refused on a
   per-statement prefix, the ambiguity rule against the session's catalog, the resolver cache not shared
   across catalogs; `current_database()`.
 - Flight e2e: ADBC sends `USE`, a short name reads the second catalog.
