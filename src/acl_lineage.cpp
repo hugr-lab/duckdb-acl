@@ -5,12 +5,16 @@
 #include "acl_door_common.hpp"
 #include "acl_policy.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_lineage_sources.hpp"
 
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
@@ -95,17 +99,27 @@ void CheckRootParent(ClientContext &, SetScope, Value &value) {
 } // namespace
 
 bool LineageOn(DatabaseInstance &db) {
-	return InstanceSetting(db, "acl_lineage_level", "off") == "on";
+	// spec 112: the namespace is the cluster's, and there is no default - without it nothing is sent
+	return InstanceSetting(db, "acl_lineage_level", "off") == "on" &&
+	       !InstanceSetting(db, "acl_lineage_namespace", "").empty();
+}
+
+string LineageStatus(DatabaseInstance &db) {
+	if (InstanceSetting(db, "acl_lineage_level", "off") != "on") {
+		return "off";
+	}
+	if (InstanceSetting(db, "acl_lineage_namespace", "").empty()) {
+		return "no namespace: set acl_lineage_namespace (the cluster's, e.g. ACL CLUSTER SET acl_lineage_namespace = "
+		       "'acl://prod')";
+	}
+	return "on";
 }
 
 LineageSettings LineageSettings::Read(DatabaseInstance &db) {
 	LineageSettings settings;
-	settings.on = InstanceSetting(db, "acl_lineage_level", "off") == "on";
+	settings.db = &db;
 	settings.ns = InstanceSetting(db, "acl_lineage_namespace", "");
-	if (settings.ns.empty()) {
-		auto group = InstanceSetting(db, "acl_node_group", "");
-		settings.ns = "acl://" + (group.empty() ? string("default") : group);
-	}
+	settings.on = InstanceSetting(db, "acl_lineage_level", "off") == "on" && !settings.ns.empty();
 	settings.identity = InstanceSetting(db, "acl_lineage_identity", "client");
 	settings.sql = InstanceSetting(db, "acl_lineage_sql", "off") == "normalized";
 	settings.physical = StringUtil::Lower(InstanceSetting(db, "acl_lineage_physical", "true")) == "true";
@@ -164,15 +178,122 @@ bool LineageClientSetting(const string &name) {
 	       StringUtil::CIEquals(name, "acl_lineage_job");
 }
 
+bool LineageIdentityClean(const string &identity) {
+	// `<scheme>://<host[:port]>[/<path>]` and nothing else: no userinfo, no query, no fragment - a name,
+	// never a credential, wherever in the text one would hide (the review's finding: `?password=`)
+	auto scheme = identity.find("://");
+	if (scheme == string::npos || scheme == 0 || scheme + 3 >= identity.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < scheme; i++) {
+		auto c = identity[i];
+		if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '+' && c != '-' && c != '.') {
+			return false;
+		}
+	}
+	for (auto c : identity) {
+		if (c == '@' || c == '?' || c == '#' || c == '\\' || c == '%' || static_cast<unsigned char>(c) <= ' ' ||
+		    c == 0x7f) {
+			return false;
+		}
+	}
+	return identity[scheme + 3] != '/';
+}
+
+bool LineageSourceNameFor(DatabaseInstance &db, const string &catalog, const string &schema, const string &name,
+                          string &out_ns, string &out_name, const string &declared) {
+	auto attached = DatabaseManager::Get(db).GetDatabase(Identifier(catalog));
+	// 1. a provider that owns the source (hugr_node: the platform's real addresses, a federated cluster)
+	string why;
+	auto sources = AclLineageSources::Reach(db.GetObjectCache(), why);
+	if (sources) {
+		LineageSourceDataset query;
+		query.catalog = catalog;
+		query.schema = schema;
+		query.name = name;
+		if (attached) {
+			query.catalog_type = attached->GetCatalog().GetCatalogType();
+		}
+		LineageSourceName answer;
+		if (sources->Name(query, answer) && LineageIdentityClean(answer.ns)) {
+			out_ns = answer.ns;
+			out_name = answer.name;
+			return true;
+		}
+	}
+	// 2. the identity the operator declared for the alias: `<scheme>://<host:port>[/<prefix>]`
+	auto store = PolicyStore::Of(db);
+	string identity;
+	if (store && attached) {
+		lock_guard<mutex> guard(store->lineage_sources_lock);
+		auto entry = store->lineage_sources.find(catalog);
+		if (entry != store->lineage_sources.end()) {
+			if (!entry->second.bound && !declared.empty()) {
+				// the ATTACH … LINEAGE being executed names it itself: its call replaces the pending one
+			} else if (!entry->second.bound) {
+				entry->second.bound = true; // declared before its ATTACH: this is the attachment it meant
+				entry->second.attached = attached;
+				identity = entry->second.identity;
+			} else if (entry->second.attached.lock().get() == attached.get()) {
+				identity = entry->second.identity;
+			} else {
+				store->lineage_sources.erase(entry); // declared for an attachment that is gone
+			}
+		}
+	}
+	if (identity.empty() && LineageIdentityClean(declared) && declared.find("://") != string::npos) {
+		identity = declared; // the ATTACH … LINEAGE being executed, its declaring call still to come
+	}
+	if (identity.empty()) {
+		return false;
+	}
+	auto scheme = identity.find("://");
+	auto path = identity.find('/', scheme == string::npos ? 0 : scheme + 3);
+	out_ns = path == string::npos ? identity : identity.substr(0, path);
+	auto prefix = path == string::npos ? string() : identity.substr(path + 1);
+	while (!prefix.empty() && prefix.back() == '/') {
+		prefix.pop_back();
+	}
+	prefix = StringUtil::Replace(prefix, "/", ".");
+	vector<string> parts;
+	for (auto &part : {prefix, schema, name}) {
+		if (!part.empty()) {
+			parts.push_back(part);
+		}
+	}
+	out_name = StringUtil::Join(parts, ".");
+	return true;
+}
+
 AuditLineageDataset LineageDatasetFor(const LineageDatasetKey &key, const LineageSettings &settings) {
 	AuditLineageDataset dataset;
 	if (key.kind == "virtual") {
-		dataset.ns = settings.ns + "/" + key.catalog;
-		dataset.name = key.schema.empty() ? key.name : key.schema + "." + key.name;
+		// spec 112: the cluster's namespace, the object as `<vcat>.<schema>.<object>` - OpenLineage's own
+		// convention for a SQL endpoint, the schema always written
+		string schema = key.schema;
+		string object = key.name;
+		if (schema.empty()) {
+			auto dot = object.find('.');
+			if (dot != string::npos) {
+				schema = object.substr(0, dot);
+				object = object.substr(dot + 1);
+			}
+		}
+		dataset.ns = settings.ns;
+		dataset.name = key.catalog + "." + (schema.empty() ? string("main") : schema) + "." + object;
 		dataset.dataset_type = "TABLE";
 	} else if (key.kind == "physical") {
 		dataset.ns = settings.ns + "/source/" + key.catalog;
 		dataset.name = key.schema.empty() ? key.name : key.schema + "." + key.name;
+		auto db = settings.db; // the settings are const; the instance they were read from is not
+		if (db) {
+			// spec 112 §9: the source's identity, when its provider or its operator gave one
+			string ns, name;
+			if (LineageSourceNameFor(*db, key.catalog, key.schema, key.name, ns, name)) {
+				dataset.ns = ns;
+				dataset.name = name;
+			}
+		}
 		dataset.dataset_type = "TABLE";
 		dataset.physical = true;
 	} else if (key.kind == "file") {
@@ -229,6 +350,32 @@ AuditLineageRunRef ParseLineageRunRef(const string &text) {
 	return ref;
 }
 
+AuditLineageField LineageFieldOf(const string &name, const LogicalType &type) {
+	AuditLineageField field;
+	field.name = name;
+	if (type.id() == LogicalTypeId::INVALID || type.id() == LogicalTypeId::UNKNOWN ||
+	    type.id() == LogicalTypeId::SQLNULL) {
+		return field; // unknown - a NULL literal (a mask's) has no type of its own
+	}
+	// a struct (or a list of them) carries its fields, the way OpenLineage's schema facet nests them
+	auto element = type;
+	string suffix;
+	while (element.id() == LogicalTypeId::LIST || element.id() == LogicalTypeId::ARRAY) {
+		element =
+		    element.id() == LogicalTypeId::LIST ? ListType::GetChildType(element) : ArrayType::GetChildType(element);
+		suffix += "[]";
+	}
+	if (element.id() == LogicalTypeId::STRUCT) {
+		field.type = "STRUCT" + suffix;
+		for (auto &child : StructType::GetChildTypes(element)) {
+			field.fields.push_back(LineageFieldOf(child.first.GetIdentifierName(), child.second));
+		}
+		return field;
+	}
+	field.type = type.ToString();
+	return field;
+}
+
 shared_ptr<AuditLineage> LineageFromWalk(const LineageWalk &walk, const LineageSettings &settings) {
 	auto lineage = make_shared_ptr<AuditLineage>();
 	vector<int32_t> index(walk.datasets.size(), -1);
@@ -250,9 +397,7 @@ shared_ptr<AuditLineage> LineageFromWalk(const LineageWalk &walk, const LineageS
 				// the fields written - one written from constants or from the client's stream has no
 				// edge, and is written all the same
 				for (auto &output : walk.outputs) {
-					AuditLineageField field;
-					field.name = output.name;
-					dataset.schema.push_back(std::move(field));
+					dataset.schema.push_back(LineageFieldOf(output.name, output.type));
 				}
 			}
 			lineage->datasets.push_back(std::move(dataset));
@@ -459,8 +604,9 @@ void EmitDefinitionLineage(AuditPipeline &pipeline, DatabaseInstance &db, const 
 	defined.target_operation = lifecycle;
 	auto lineage = LineageFromWalk(defined, settings);
 	lineage->event_type = "DATASET";
+	auto defined_as = LineageDatasetFor(defined.target, settings);
 	for (auto &dataset : lineage->datasets) {
-		if (!dataset.physical && dataset.ns == settings.ns + "/" + vcat && dataset.name == vname) {
+		if (!dataset.physical && dataset.ns == defined_as.ns && dataset.name == defined_as.name) {
 			dataset.lifecycle = lifecycle;
 			dataset.dataset_type = dataset_type;
 			dataset.tags = tags; // its schema is the definition's outputs, filled by LineageFromWalk
@@ -598,8 +744,79 @@ void LineageResendFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	result.Reference(Value::BIGINT(count), count_t(args.size()));
 }
 
+//! acl_lineage_status(): why lineage is or is not sent (spec 112) - the operator's
+void LineageStatusFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.Reference(Value(LineageStatus(*context.db)), count_t(args.size()));
+}
+
+//! acl_lineage_source(alias, identity): the identity the operator declares for an attached source
+//! (spec 112 §9) - `<scheme>://<host:port>[/<prefix>]`, the name everyone else knows it by; NULL
+//! clears it. Kept in the instance's memory, like the ATTACH it describes. Answers the identity now
+//! in force for the alias ('' for none).
+void LineageSourceFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &info = state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<LineageFlushInfo>();
+	auto store = info.store.lock();
+	if (!store) {
+		throw InvalidInputException("acl_lineage_source: the policy store is gone");
+	}
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto alias_value = args.data[0].GetValue(row);
+		if (alias_value.IsNull() || alias_value.ToString().empty()) {
+			throw InvalidInputException("acl_lineage_source: the alias of an attached source is required");
+		}
+		auto alias = alias_value.ToString();
+		// may come before its ATTACH (a bootstrap's order is its own); never names the node's own catalogs
+		auto attached = DatabaseManager::Get(*state.GetContext().db).GetDatabase(Identifier(alias));
+		if (attached && (attached->IsSystem() || attached->IsTemporary())) {
+			throw InvalidInputException("acl_lineage_source: '%s' is no attached source", alias);
+		}
+		auto identity_value = args.data[1].GetValue(row);
+		string identity = identity_value.IsNull() ? string() : identity_value.ToString();
+		StringUtil::Trim(identity);
+		if (!identity.empty()) {
+			if (identity.find("://") == string::npos) {
+				throw InvalidInputException("acl_lineage_source: the identity is a source's address, "
+				                            "<scheme>://<host:port>[/<database>] (OpenLineage's naming)");
+			}
+			if (!LineageIdentityClean(identity)) {
+				throw InvalidInputException("acl_lineage_source: the identity names a source, never a credential - "
+				                            "no user:password@ in it");
+			}
+		}
+		{
+			lock_guard<mutex> guard(store->lineage_sources_lock);
+			if (identity.empty()) {
+				store->lineage_sources.erase(alias);
+			} else {
+				PolicyStore::LineageSourceIdentity declared;
+				declared.identity = identity;
+				declared.bound = attached != nullptr;
+				declared.attached = attached;
+				store->lineage_sources[alias] = std::move(declared);
+			}
+		}
+		result.SetValue(row, Value(identity));
+	}
+}
+
 void RegisterAclLineage(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store,
                         const shared_ptr<AuditPipeline> &pipeline) {
+	{
+		ScalarFunction status(Identifier("acl_lineage_status"), {}, LogicalType::VARCHAR, LineageStatusFunc);
+		status.SetFallible();
+		status.SetVolatile();
+		loader.RegisterFunction(status);
+	}
+	{
+		ScalarFunction source(Identifier("acl_lineage_source"), {LogicalType::VARCHAR, LogicalType::VARCHAR},
+		                      LogicalType::VARCHAR, LineageSourceFunc);
+		source.SetExtraFunctionInfo(make_shared_ptr<LineageFlushInfo>(store, pipeline));
+		source.SetFallible();
+		source.SetVolatile();
+		source.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		loader.RegisterFunction(source);
+	}
 	for (auto arity : {0, 1}) {
 		vector<LogicalType> arguments;
 		if (arity == 1) {

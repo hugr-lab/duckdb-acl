@@ -239,9 +239,10 @@ private:
 			AddUnique(walk.whole_target, item);
 		}
 	}
-	void AddOutput(const string &name, const BindingLineage &lineage) {
+	void AddOutput(const string &name, const BindingLineage &lineage, const LogicalType &type = LogicalType::INVALID) {
 		LineageOutput output;
 		output.name = name;
+		output.type = type;
 		for (auto items : {&lineage.direct, &lineage.indirect}) {
 			for (auto &item : *items) {
 				if (walk.EdgeCount() + output.sources.size() >= options.max_edges) {
@@ -262,6 +263,7 @@ private:
 	void VisitMerge(LogicalMergeInto &merge);
 	void SetTarget(TableCatalogEntry &table, const string &operation);
 	string TableColumnName(TableCatalogEntry &table, idx_t physical);
+	LogicalType TableColumnType(TableCatalogEntry &table, idx_t physical);
 };
 
 BindingLineage Walker::ResolveFunction(BoundFunctionExpression &function) {
@@ -423,6 +425,10 @@ void Walker::VisitGet(LogicalGet &get) {
 	}
 }
 
+LogicalType Walker::TableColumnType(TableCatalogEntry &table, idx_t physical) {
+	return table.GetColumns().GetColumn(PhysicalIndex(physical)).Type();
+}
+
 string Walker::TableColumnName(TableCatalogEntry &table, idx_t physical) {
 	return table.GetColumns().GetColumn(PhysicalIndex(physical)).Name().GetIdentifierName();
 }
@@ -441,7 +447,7 @@ void Walker::VisitInsert(LogicalInsert &insert) {
 	if (insert.children.empty()) {
 		// VALUES bound into the operator: constants, no sources - the columns are still written
 		for (auto &column : insert.table.GetColumns().Physical()) {
-			AddOutput(column.Name().GetIdentifierName(), BindingLineage());
+			AddOutput(column.Name().GetIdentifierName(), BindingLineage(), column.Type());
 		}
 		return;
 	}
@@ -456,14 +462,15 @@ void Walker::VisitInsert(LogicalInsert &insert) {
 		if (source != DConstants::INVALID_INDEX && source < child_bindings.size()) {
 			lineage = Lookup(child_bindings[source]);
 		}
-		AddOutput(TableColumnName(insert.table, physical), lineage);
+		AddOutput(TableColumnName(insert.table, physical), lineage, TableColumnType(insert.table, physical));
 	}
 }
 
 void Walker::VisitUpdate(LogicalUpdate &update) {
 	SetTarget(update.table, "UPDATE");
 	for (idx_t i = 0; i < update.columns.size() && i < update.expressions.size(); i++) {
-		AddOutput(TableColumnName(update.table, update.columns[i].index), Resolve(*update.expressions[i]));
+		AddOutput(TableColumnName(update.table, update.columns[i].index), Resolve(*update.expressions[i]),
+		          TableColumnType(update.table, update.columns[i].index));
 	}
 }
 
@@ -476,7 +483,8 @@ void Walker::VisitMerge(LogicalMergeInto &merge) {
 			}
 			if (action->action_type == MergeActionType::MERGE_UPDATE) {
 				for (idx_t i = 0; i < action->columns.size() && i < action->expressions.size(); i++) {
-					AddOutput(TableColumnName(merge.table, action->columns[i].index), Resolve(*action->expressions[i]));
+					AddOutput(TableColumnName(merge.table, action->columns[i].index), Resolve(*action->expressions[i]),
+					          TableColumnType(merge.table, action->columns[i].index));
 				}
 			} else if (action->action_type == MergeActionType::MERGE_INSERT) {
 				auto column_count = merge.table.GetColumns().PhysicalColumnCount();
@@ -488,7 +496,8 @@ void Walker::VisitMerge(LogicalMergeInto &merge) {
 					                  ? action->column_index_map[PhysicalIndex(physical)]
 					                  : DConstants::INVALID_INDEX;
 					if (source != DConstants::INVALID_INDEX && source < action->expressions.size()) {
-						AddOutput(TableColumnName(merge.table, physical), Resolve(*action->expressions[source]));
+						AddOutput(TableColumnName(merge.table, physical), Resolve(*action->expressions[source]),
+						          TableColumnType(merge.table, physical));
 					}
 				}
 			}
@@ -736,7 +745,7 @@ void Walker::Visit(LogicalOperator &op) {
 			idx_t i = 0;
 			for (auto &column : base.columns.Logical()) {
 				AddOutput(column.Name().GetIdentifierName(),
-				          i < child_bindings.size() ? Lookup(child_bindings[i]) : BindingLineage());
+				          i < child_bindings.size() ? Lookup(child_bindings[i]) : BindingLineage(), column.Type());
 				i++;
 			}
 		}
@@ -754,6 +763,12 @@ void Walker::FinishRoot(LogicalOperator &root) {
 	if (walk.has_target) {
 		return;
 	}
+	if (root.types.empty()) {
+		try {
+			root.ResolveOperatorTypes(); // spec 112 §7: the fields' types
+		} catch (std::exception &) {
+		}
+	}
 	auto root_bindings = root.GetColumnBindings();
 	for (idx_t i = 0; i < root_bindings.size(); i++) {
 		string name;
@@ -765,7 +780,7 @@ void Walker::FinishRoot(LogicalOperator &root) {
 		} else {
 			name = "col" + std::to_string(i);
 		}
-		AddOutput(name, Lookup(root_bindings[i]));
+		AddOutput(name, Lookup(root_bindings[i]), i < root.types.size() ? root.types[i] : LogicalType::INVALID);
 	}
 }
 

@@ -1,6 +1,7 @@
 #include "acl_parser_override.hpp"
 
 #include "acl_admin_sql.hpp"
+#include "acl_attach_lineage.hpp"
 #include "acl_audit_pipeline.hpp"
 #include "acl_profile.hpp"
 #include "acl_lineage.hpp"
@@ -17,6 +18,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/attach_statement.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 
@@ -160,8 +162,9 @@ AclPrefix ParseAclPrefix(const string &query) {
 	}
 	if (StringUtil::CIEquals(mode, "ingest")) {
 		// spec 049: the door's own composition for its ingest INSERT - a session handle, then the
-		// statement. No markers ride here: the remainder must be the INSERT itself, and an embedded
-		// `ACL ...` is mid-statement garbage exactly as it is after any other prefix.
+		// statement. Only the trace and lineage markers ride here (spec 112 §4: an ingest's run has
+		// its call's context); no mode marker - the remainder must be the INSERT itself, and an
+		// embedded `ACL ...` is mid-statement garbage exactly as it is after any other prefix.
 		SkipWhitespace(query, pos);
 		if (pos >= query.size() || (query[pos] != '\'' && query[pos] != '"')) {
 			throw ParserException("acl_rewrite: ACL INGEST requires a quoted session handle");
@@ -222,6 +225,55 @@ struct AclParseGuard {
 		InAclParse() = false;
 	}
 };
+
+//! Spec 112 §9: a batch with `ATTACH … LINEAGE '<identity>'` - each marked ATTACH parsed as the native
+//! statement it is, followed by `SELECT acl_lineage_source('<alias>', '<identity>')`. Nothing happens
+//! here: the call runs only if the ATTACH did (a batch stops at its first failure). False = no marker,
+//! the text is the native parser's untouched.
+bool ParseAttachLineage(const string &text, ParserOptions &options, vector<unique_ptr<SQLStatement>> &out) {
+	if (!MayCarryAttachLineage(text)) {
+		return false;
+	}
+	bool found = false;
+	auto segments = SplitAttachLineage(text, found);
+	if (!found) {
+		return false;
+	}
+	AclParseGuard guard;
+	for (auto &segment : segments) {
+		Parser parser(options);
+		parser.ParseQuery(segment.text);
+		if (!segment.marked) {
+			for (auto &statement : parser.statements) {
+				out.push_back(std::move(statement));
+			}
+			continue;
+		}
+		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::ATTACH_STATEMENT) {
+			throw ParserException("LINEAGE '<identity>' ends an ATTACH statement");
+		}
+		auto &info = *parser.statements[0]->Cast<AttachStatement>().info;
+		auto alias = info.name.GetIdentifierName();
+		if (alias.empty()) {
+			throw ParserException("ATTACH … LINEAGE names the source it describes: write AS <alias>");
+		}
+		if (segment.identity.empty()) {
+			throw ParserException("ATTACH … LINEAGE: the identity is empty - leave LINEAGE out instead");
+		}
+		// the ATTACH keeps its text as written: the lineage hook reads the identity back from it, so the
+		// ATTACH's own NAMESPACE event already names the source as itself
+		parser.statements[0]->query = segment.original;
+		out.push_back(std::move(parser.statements[0]));
+		auto call = "SELECT acl_lineage_source(" + Value(alias).ToSQLString() + ", " +
+		            Value(segment.identity).ToSQLString() + ")";
+		Parser call_parser(options);
+		call_parser.ParseQuery(call);
+		for (auto &statement : call_parser.statements) {
+			out.push_back(std::move(statement));
+		}
+	}
+	return true;
+}
 
 //! The principal a prefix stands for. A role is itself, a token is verified here, and a session is a
 //! handle a door already exchanged a token for (spec 040) - so this is the one place that turns any
@@ -684,7 +736,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
 	}
 	vector<unique_ptr<SQLStatement>> statements;
-	{
+	if (mode != AclPrefix::Mode::NATIVE || !ParseAttachLineage(prefix.rest, inner, statements)) {
 		AclParseGuard guard;
 		Parser parser(inner);
 		parser.ParseQuery(prefix.rest);
@@ -788,7 +840,11 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 				throw;
 			}
 		}
-		PushProfileBoundary();         // spec 074: nobody's statement follows on this thread
+		PushProfileBoundary(); // spec 074: nobody's statement follows on this thread
+		vector<unique_ptr<SQLStatement>> attach;
+		if (ParseAttachLineage(query, options, attach)) {
+			return ParserOverrideResult(std::move(attach)); // spec 112 §9: the operator's ATTACH, named
+		}
 		return ParserOverrideResult(); // fall through to the native parser
 	}
 

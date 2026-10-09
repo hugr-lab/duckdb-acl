@@ -178,6 +178,19 @@ ACL ADMIN CLUSTER RESET acl_enum_types;
 statement ok
 ACL ADMIN CLUSTER RESET acl_alias_types;
 
+# spec 112: the lineage namespace is the cluster's - every node names a virtual dataset alike - a
+# setting like any other, rolled out by the node agent
+statement ok
+ACL ADMIN CLUSTER SET acl_lineage_namespace = 'acl://cluster';
+
+query T
+SELECT spec FROM acl_cluster_items() WHERE kind = 'setting' AND name = 'acl_lineage_namespace';
+----
+{"value": "acl://cluster"}
+
+statement ok
+ACL ADMIN CLUSTER RESET acl_lineage_namespace;
+
 statement error
 ACL ADMIN CLUSTER SET allow_unsigned_extensions = true;
 ----
@@ -334,3 +347,43 @@ query II
 SELECT acl_cluster_version() = getvariable('v0'), (SELECT count(*) FROM acl_cluster_items() WHERE name = 'broken');
 ----
 true	0
+
+# spec 112 §9: LINEAGE names the source as others know it - in the item, and applied with the ATTACH
+statement ok
+SET GLOBAL acl_lineage_level = 'on';
+
+statement ok
+SET GLOBAL acl_lineage_namespace = 'acl://cluster-test';
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS src_l (TYPE duckdb) LINEAGE 'postgres://pg.corp:5432/sales' COMMENT 'named';
+
+query I
+SELECT spec LIKE '%"lineage": "postgres://pg.corp:5432/sales"%' FROM acl_cluster_items() WHERE name = 'src_l';
+----
+true
+
+statement ok
+SELECT acl_lineage_flush();
+
+query I
+SELECT payload::VARCHAR LIKE '%"namespace":"postgres://pg.corp:5432"%' FROM acl_lineage_events()
+WHERE event_type = 'NAMESPACE' ORDER BY seq DESC LIMIT 1;
+----
+true
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS src_m (TYPE duckdb) LINEAGE 'postgres://u:pw@pg.corp:5432/sales';
+----
+never a credential
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS src_m (TYPE duckdb) LINEAGE 'pg.corp';
+----
+<scheme>://
+
+statement ok
+ACL ADMIN CLUSTER DETACH src_l;
+
+statement ok
+SET GLOBAL acl_lineage_level = 'off';

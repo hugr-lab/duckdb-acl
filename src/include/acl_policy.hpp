@@ -369,6 +369,17 @@ struct PolicyStore {
 	//! authorization callback, which may run on any of the instance's threads. Ended with the connection.
 	mutex quack_lineage_lock;
 	unordered_map<string, std::array<string, 3>> quack_lineage; // parent, root_parent, job
+	//! spec 112 §9: the lineage identity the operator declared per attached source (alias ->
+	//! `<scheme>://<host:port>[/<prefix>]`): acl_lineage_source / ATTACH … LINEAGE. Tied to the
+	//! attachment it was declared for (one declared before the ATTACH, to the first it meets): after a
+	//! DETACH, or a new ATTACH under the alias, it says nothing and is dropped
+	struct LineageSourceIdentity {
+		string identity;
+		bool bound = false;
+		weak_ptr<AttachedDatabase> attached;
+	};
+	mutex lineage_sources_lock;
+	case_insensitive_map_t<LineageSourceIdentity> lineage_sources;
 	//! spec 109: the connections whose malformed parent was already reported (once each)
 	std::unordered_set<string> quack_lineage_reported;
 	//! spec 078: the session opens and closes, delivered to acl_connection.hpp's observers
@@ -613,7 +624,7 @@ struct PolicyStore {
 	                               const string &repository, const string &comment);
 	ClusterAnswer ClusterAttach(const string &scope, const string &alias, const string &path, const string &type,
 	                            const string &secret, const string &options_json, const vector<string> &depends_on,
-	                            const string &comment);
+	                            const string &comment, const string &lineage = string());
 	ClusterAnswer ClusterDetach(const string &scope, const string &alias, bool cascade, bool force);
 	ClusterAnswer ClusterSetting(const string &verb, const string &scope, const string &name, const string &value);
 	int64_t ClusterVersion();

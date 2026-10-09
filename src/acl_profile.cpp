@@ -264,6 +264,18 @@ public:
 	shared_ptr<PhysicalLineage> physical_lineage;
 	//! spec 107: the running statement is a PREPARE (the hook saw LOGICAL_PREPARE): not an execution
 	bool preparing = false;
+	//! spec 112: a door's Connection::Prepare is running - its QueryEnd is no execution (duckdb plans
+	//! it as a PREPARE whose own plan the optimizer hook never sees, so `preparing` cannot say so)
+	idx_t door_preparing = 0;
+	//! spec 112 §2: a door's batch scope - the run its executions count towards, and whether any failed
+	bool batch_open = false;
+	shared_ptr<LineageJob> batch_job;
+	uint64_t batch_text = 0; // the batch's statement, by its text: a rebind parses it again (a new job)
+	bool batch_failed = false;
+	//! spec 112 §6: the runs of a client's explicit transaction, waiting for its end - commit hands
+	//! them on as they are, rollback as RUN_ABORT. A definition (physical DDL) waits the same way.
+	vector<shared_ptr<LineageJob>> held_runs;
+	vector<shared_ptr<PhysicalLineage>> held_physical;
 
 	void QueryBegin(ClientContext &context) override {
 		if (pending_notes && !pending_notes->empty()) {
@@ -354,18 +366,89 @@ public:
 		preparing = false;
 		auto captured = std::move(physical_lineage);
 		physical_lineage.reset();
-		if (was_preparing) {
+		if (was_preparing || door_preparing > 0) {
 			return;
 		}
 		if (has_note && note.lineage) {
-			EnqueueLineageRun(note.lineage, bool(error));
-		}
-		if (captured) {
-			auto locked = pipeline.lock();
-			if (locked) {
-				EmitPhysicalLineage(*captured, *locked, *context.db, bool(error));
+			if (batch_open && (!batch_job || batch_text == note.text_hash)) {
+				if (!batch_job) {
+					batch_job = note.lineage; // one run for the batch, however many rows it executes
+					batch_text = note.text_hash;
+				}
+				batch_failed = batch_failed || error;
+			} else {
+				SettleRun(context, note.lineage, bool(error));
 			}
 		}
+		if (captured) {
+			if (!error && InExplicitTransaction(context)) {
+				held_physical.push_back(std::move(captured));
+			} else {
+				EmitPhysical(context, *captured, error ? LineageOutcome::FAIL : LineageOutcome::COMPLETE);
+			}
+		}
+	}
+
+	//! A finished run: a failure is final at once; a success inside a client's transaction waits for it
+	void SettleRun(ClientContext &context, const shared_ptr<LineageJob> &job, bool failed) {
+		if (!failed && InExplicitTransaction(context)) {
+			held_runs.push_back(job);
+			return;
+		}
+		EnqueueLineageRun(job, failed ? LineageOutcome::FAIL : LineageOutcome::COMPLETE);
+	}
+
+	void BatchBegin() {
+		batch_open = true;
+		batch_job.reset();
+		batch_text = 0;
+		batch_failed = false;
+	}
+
+	void BatchEnd(ClientContext &context) {
+		batch_open = false;
+		auto job = std::move(batch_job);
+		batch_job.reset();
+		if (job) {
+			SettleRun(context, job, batch_failed);
+		}
+	}
+
+	static bool InExplicitTransaction(ClientContext &context) {
+		// at QueryEnd an autocommit statement's transaction has already ended (committed or not)
+		return context.transaction.HasActiveTransaction() && !context.transaction.IsAutoCommit();
+	}
+
+	void EmitPhysical(ClientContext &context, const PhysicalLineage &captured, LineageOutcome outcome) {
+		auto locked = pipeline.lock();
+		if (locked) {
+			EmitPhysicalLineage(captured, *locked, *context.db, outcome);
+		}
+	}
+
+	void ReleaseHeld(ClientContext &context, LineageOutcome outcome) {
+		auto runs = std::move(held_runs);
+		held_runs.clear();
+		auto physical = std::move(held_physical);
+		held_physical.clear();
+		try {
+			for (auto &job : runs) {
+				EnqueueLineageRun(job, outcome);
+			}
+			for (auto &captured : physical) {
+				EmitPhysical(context, *captured, outcome);
+			}
+		} catch (...) {
+			// lineage is never worth the transaction
+		}
+	}
+
+	void TransactionCommit(MetaTransaction &, ClientContext &context) override {
+		ReleaseHeld(context, LineageOutcome::COMPLETE);
+	}
+
+	void TransactionRollback(MetaTransaction &, ClientContext &context, optional_ptr<ErrorData>) override {
+		ReleaseHeld(context, LineageOutcome::ABORT);
 	}
 
 	//! Switch the profiler on for what this connection runs next, unless somebody else did.
@@ -516,6 +599,38 @@ void SetPhysicalLineage(ClientContext &context, shared_ptr<PhysicalLineage> line
 	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
 	if (state) {
 		state->physical_lineage = std::move(lineage);
+	}
+}
+
+LineagePrepareScope::LineagePrepareScope(ClientContext &context_p) : context(context_p) {
+	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
+	if (state) {
+		state->door_preparing++;
+	}
+}
+
+LineagePrepareScope::~LineagePrepareScope() {
+	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
+	if (state && state->door_preparing > 0) {
+		state->door_preparing--;
+	}
+}
+
+void LineageBatchBegin(ClientContext &context) {
+	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
+	if (state) {
+		state->BatchBegin();
+	}
+}
+
+void LineageBatchEnd(ClientContext &context) {
+	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
+	if (state) {
+		try {
+			state->BatchEnd(context);
+		} catch (...) {
+			// lineage is never worth the statement
+		}
 	}
 }
 

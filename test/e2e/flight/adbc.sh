@@ -48,5 +48,34 @@ done
 [ -n "$ready" ] || { cat "$TMP/server.log" >&2; fail "the door never came up on $URI"; }
 
 "$PYBIN" "$HERE/adbc_client.py" "$URI" "$TOKEN" || fail "adbc assertions failed"
+
+# --- spec 112: a job's writes in lineage - one run per executemany, an ingest with its parent ---------
+# Ask the serving process itself (its stdin is ours): one marked query, the marked csv lines back.
+server_says() { # <sql> -> the csv lines of that answer
+	local mark="m$$_$RANDOM$RANDOM"
+	echo "SELECT acl_lineage_flush();" >&3
+	echo "SELECT '$mark' AS m, * FROM ($1);" >&3
+	local i
+	for i in $(seq 1 100); do
+		if grep -q "^$mark," "$TMP/server.log"; then
+			sleep 0.2
+			grep "^$mark," "$TMP/server.log" | cut -d, -f2- | tr -d '\r '
+			return 0
+		fi
+		sleep 0.1
+	done
+	cat "$TMP/server.log" >&2
+	fail "the serving process did not answer check $mark"
+}
+PARENT_RUN="01929e3a-0000-7000-8000-0000000001a2"
+{ echo ".mode csv"; echo "SET GLOBAL acl_lineage_level = 'on';"; echo "SET GLOBAL acl_lineage_namespace = 'acl://e2e';"; } >&3
+"$PYBIN" "$HERE/lineage_client.py" "$URI" "$TOKEN" "airflow/daily.load/$PARENT_RUN" || fail "lineage assertions failed"
+# under the parent, into c.main.orders: ONE run for the five-row executemany, the ingest's run
+# (`approximate` - its source is the client's stream) and ONE RUN_FAIL for the refused batch
+runs="$(server_says "SELECT event_type, payload->'datasets'->(payload->'outputs'->>0)::INT->>'name' AS target, approximate, count(*) AS n FROM acl_lineage_events() WHERE (payload->'parent'->>'run_id') = '$PARENT_RUN' GROUP BY ALL")"
+for want in "RUN_COMPLETE,c.main.orders,false,1" "RUN_COMPLETE,c.main.orders,true,1" "RUN_FAIL,c.main.orders,false,1"; do
+	echo "$runs" | grep -qx "$want" || fail "under one parent, expected the run $want: $runs"
+done
+echo "  ok:   one run per executemany, a refused batch is one RUN_FAIL, and the ingest is a run with its parent"
 echo "SELECT acl_flight_stop('$URI');" >&3
 echo "PASS: the real ADBC driver prepared, parameterized, bulk-inserted, staged through a session temp, and was confined to its slice"

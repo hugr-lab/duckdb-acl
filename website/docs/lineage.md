@@ -12,7 +12,8 @@ renders them as OpenLineage events and facets. A data catalog
 The node only makes the facts. The transport to an OpenLineage backend belongs to
 [acl-otel](https://github.com/hugr-lab/acl-otel). Nothing a statement or an admin write does waits on
 it: the work runs on one worker thread of the node; the statement's own thread only copies the
-statement, and only when the statement is in scope. Lineage needs a policy catalog (`acl_use_db`).
+statement, and only when the statement is in scope. Lineage needs a policy catalog (`acl_use_db`)
+and a namespace (`acl_lineage_namespace`, below): without one nothing is sent, whatever the level.
 
 ## What is emitted
 
@@ -21,28 +22,65 @@ statement, and only when the statement is in scope. Lineage needs a policy catal
 | `DATASET` | a virtual table, view or table function is created, altered, repaired or dropped | the object's fields and their edges to the physical columns, its lifecycle, the per-role tags |
 | `DATASET` (no lifecycle) | a catalog or object grant changes | the affected objects again, with the new per-role tags |
 | `DATASET` | the operator's own SQL (or `ACL NATIVE`) creates, alters or drops a physical table or view | a physical view's body lineage; a table's schema |
-| `NAMESPACE` | `ATTACH` / `DETACH` of a source - the operator's, or a cluster item's | `acl://<ns>/source/<alias>` and the source's type |
-| `RUN_COMPLETE` / `RUN_FAIL` | a write - INSERT / UPDATE / DELETE / MERGE / CREATE TABLE AS, one per execution (a `PREPARE` is none) | the target's fields and where each came from |
-| `RUN_COMPLETE` / `RUN_FAIL` | Flight ingest | the target and the fields written - their source is the client's stream (`approximate`) |
+| `NAMESPACE` | `ATTACH` / `DETACH` of a source - the operator's, or a cluster item's | the source's namespace (below) and its type |
+| `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | a write - INSERT / UPDATE / DELETE / MERGE / CREATE TABLE AS, one per execution (a `PREPARE` is none) | the target's fields, typed, and where each came from |
+| `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | a Flight `executemany` (one DoPut of N parameter rows) | ONE run for the batch - `RUN_FAIL` if any row failed |
+| `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | Flight ingest (`adbc_ingest`), with the call's lineage headers | the target and the fields written - their source is the client's stream (`approximate`) |
 | `RUN_COMPLETE` / `RUN_FAIL` (inputs only) | a SELECT that declared itself a step of an external job | the datasets it read |
 
-A plain SELECT, DESCRIBE, SHOW, EXPLAIN, a listing and `COPY TO` are never emitted. Not yet emitted:
-writes through the quack door's streamed ingest (`SEND_DATA`), and a `GRANT SCHEMA` does not re-send
-the tags.
+**Transactions.** A write inside a client's explicit transaction is sent when the transaction ends:
+`COMMIT` sends its runs as they are, `ROLLBACK` sends them as `RUN_ABORT` (OpenLineage's `ABORT`). A
+statement that fails is `RUN_FAIL` at once. In autocommit the statement is its transaction.
+
+A plain SELECT, DESCRIBE, SHOW, EXPLAIN, a listing and `COPY TO` are never emitted. Under a declared
+parent, a read that reads nothing is not a run either: one of only the metadata surfaces
+(`duckdb_tables()`, `information_schema`, a DESCRIBE - a client's catalog refresh), and one whose plan
+cannot return a row (`WHERE 1=0`, `LIMIT 0` - a client's schema probe). Not yet emitted: writes through
+the quack door's streamed ingest (`SEND_DATA`), and a `GRANT SCHEMA` does not re-send the tags.
 
 ## Names
 
 - **A runtime event speaks the principal's names**: the virtual catalog, table and columns as the
   client wrote them. How a virtual object is built from physical ones is already in the catalog, from
   its `DATASET` event.
-- **Datasets** (namespace + name):
-  - virtual: `<ns>/<vcat>` + `<object>`, or `<schema>.<object>` for an object in a schema of the
-    virtual catalog;
-  - physical: `<ns>/source/<alias>` + `<schema>.<table>`.
-  - `<ns>` is `acl_lineage_namespace`, by default `acl://<acl_node_group or "default">` - so a virtual
-    table reads `acl://default/sales` + `orders`.
-- **Sources.** Each source is a namespace of its own. Relate it to the real address (host, database)
-  in your catalog; the node does not know it - it may live in a secret.
+- **Datasets** (namespace + name), OpenLineage's convention for a SQL endpoint:
+  - virtual: `<ns>` + `<vcat>.<schema>.<object>`, the schema always written - `acl://prod` +
+    `sales.main.orders`; a virtual table function the same, of type `TABLE_FUNCTION`;
+  - physical: `<ns>/source/<alias>` + `<schema>.<table>`, or the source's own name when it has an
+    identity (below).
+- **The namespace is the cluster's.** `<ns>` is `acl_lineage_namespace`. It has no default: with none
+  the node sends **no lineage**, and `acl_lineage_status()` says so (`on`, `off`, or `no namespace:
+  …`). Set it once for the cluster - `ACL CLUSTER SET acl_lineage_namespace = 'acl://prod'` - or in a
+  single node's bootstrap with `SET GLOBAL`. Clearing it is the cluster-wide off switch (a setting item: each node takes it as the node agent rolls the profile out), and it keeps
+  two clusters from merging their virtual catalogs in one backend by accident. The node group is in
+  the run's facet, not in the name.
+- **Job namespaces** are `<ns>/client/<door>`.
+- **Renamed?** Re-send the static picture under the new names with `acl_lineage_resend()`. The old
+  names stay in the backend as orphans; delete them in the backend's own way.
+
+## A source's identity
+
+Others fill a source too - Spark, the operator's ETL - and name it by its real address, per
+OpenLineage's naming (`postgres://pg.prod:5432` + `sales.public.orders`), while the node knows it by
+its ATTACH alias. Declare the address, and the node names the source's datasets the same way:
+
+```sql
+ATTACH 'dbname=sales host=pg.prod' AS pg (TYPE postgres, SECRET pg_reader)
+    LINEAGE 'postgres://pg.prod:5432/sales';
+-- or, separately (before or after the ATTACH):
+SELECT acl_lineage_source('pg', 'postgres://pg.prod:5432/sales');
+```
+
+Then `pg.public.orders` is `postgres://pg.prod:5432` + `sales.public.orders`, in every edge, run and
+`NAMESPACE` event. The identity is `<scheme>://<host:port>[/<database>]`; it is a name and never a
+credential - userinfo, a query string or a fragment (`user:password@`, `?password=`, `#…`) is refused. The node never derives it from a DSN or a secret: a host
+behind a proxy is not the host others see.
+
+- It lives in the node's memory, like the ATTACH it describes: the bootstrap declares it at every
+  start. `acl_lineage_source(alias, NULL)` clears it, and a `DETACH` ends it.
+- In a cluster profile: `ACL CLUSTER ATTACH '…' AS pg (TYPE postgres, SECRET s) LINEAGE '…'`.
+- A platform extension may name sources itself through the `acl_lineage_sources` registry
+  (duckdb-ext-common); its answer comes first, then the declared identity, then the alias form.
 
 ## An edge
 
@@ -114,6 +152,29 @@ that carries anything else.
 
   A plain `SET` would run on the client.
 
+### Lining the names up
+
+A pipeline's own events and the node's join in the backend only when both name a dataset the same.
+
+- **Spark** (OpenLineage's Spark integration, through the acl JDBC driver `jdbc:acl://<door>`) names a
+  table `acl://<host>:<port>` + the name it was given. Write table names in three parts
+  (`sales.main.orders`), and add a namespace resolver that maps the door's address to the node's
+  namespace - for `acl_lineage_namespace = 'acl://prod'`:
+
+  ```properties
+  spark.openlineage.dataset.namespaceResolvers.prod.type=pattern
+  spark.openlineage.dataset.namespaceResolvers.prod.regex=door\.corp:32010
+  ```
+
+  The matched part is replaced by the resolver's name, so `acl://door.corp:32010` becomes `acl://prod`
+  - the node's namespace. (`hostList` keeps the port.) Spark's reads and writes are then the node's
+  datasets.
+- **dbt** (dbt-ol, the duckdb adapter with the node attached through quack) names a model
+  `duckdb://<path>` + `<attach alias>.<schema>.<table>`. Attach the node under the virtual catalog's
+  name (`alias: sales`), and the names are the node's; the namespace is dbt-ol's own, to be related to
+  the node's in the catalog.
+- **A Python job** (or anything that emits for itself) uses the node's names directly.
+
 Without a parent, a run belongs to the job `acl_lineage_job`, or `sql:<hash of the normalized
 statement>`, in the namespace `acl://<ns>/client/<door>`.
 
@@ -122,7 +183,7 @@ statement>`, in the namespace `acl://<ns>/client/<door>`.
 | setting | default | |
 | --- | --- | --- |
 | `acl_lineage_level` | `off` | `on` emits |
-| `acl_lineage_namespace` | `''` | the namespace prefix; `''` = `acl://<acl_node_group or default>` |
+| `acl_lineage_namespace` | `''` | the cluster's namespace, e.g. `acl://prod`; `''` = no lineage is sent |
 | `acl_lineage_identity` | `client` | `none`; `client` = the door, issuer, roles, node group; `subject` adds the token's `sub` |
 | `acl_lineage_sql` | `off` | `normalized`: the SQL facet, the statement as written with every constant a `?` |
 | `acl_lineage_physical` | `true` | `false` drops physical datasets and their edges |
@@ -133,6 +194,8 @@ All are GLOBAL and can be cluster-profile items.
 
 ## For the operator
 
+- `acl_lineage_status()` - `on`, `off`, or why nothing is sent.
+- `acl_lineage_source(alias, identity)` - a source's identity (above).
 - `acl_lineage_events()` - the ring: one row per event, the payload as JSON.
 - `acl_lineage_flush()` - waits for the worker (runs and static events) and the audit queue.
 - `acl_lineage_resend([vcat])` - sends every object's `DATASET` event again (tables, views, table

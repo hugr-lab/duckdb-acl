@@ -91,7 +91,8 @@ edge = target(dataset, field_path) <- source(dataset, field_path),
 - An RLS or grant predicate is `INDIRECT/FILTER` from the columns it reads. Never its text, never a
   claim.
 
-**Dataset names:**
+**Dataset names** (superseded by spec 112 §1: virtual `<ns>` + `<vcat>.<schema>.<object>`, no default
+namespace, no symlinks - Marquez ignores them for identity):
 
 - **virtual:** `acl://<namespace>/<vcat>` + `<schema>.<object>`;
 - **physical:** `acl://<namespace>/source/<alias>` + `<schema>.<table>`;
