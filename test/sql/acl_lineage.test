@@ -541,6 +541,48 @@ DELETE FROM before;
 statement ok
 INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
 
+# --- spec 113: a RENAME in a granted home is a DROP of the old name and a CREATE of the new one ----------
+
+statement ok
+CREATE SCHEMA phys.exp;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.exp FROM phys.exp;
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.exp TO ROLE w WITH (select, insert, create, drop);
+
+statement ok
+ACL ROLE "w" CREATE TABLE exp.model__tmp AS SELECT id, total FROM src;
+
+statement ok
+SELECT acl_lineage_flush();
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" ALTER TABLE exp.model__tmp RENAME TO model;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TT
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'name', payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'DATASET' ORDER BY seq;
+----
+c.exp.model__tmp	DROP
+c.exp.model	CREATE
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
 # --- UPDATE: the field from its expression, the WHERE as a filter -----------------------------------------
 
 statement ok

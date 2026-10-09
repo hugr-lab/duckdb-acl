@@ -151,4 +151,22 @@ dbt does not need it (it qualifies every name), which is why it is not part of t
   new name is checked against the metadata surfaces too. **Decision on an operator's view without
   declarations** in a granted home: a rename moves it, as `drop` already removes it (rename = drop +
   create, spec 016's model) - pinned by a test.
-- **Lineage test for the rename pair** lands with the rebase onto spec 112 (its names).
+- **Review passes 2 and 3, fixed with tests:**
+  - **a name part with a dot** (`"sub.t"`) was rebuilt as a dotted physical path and named a nested
+    object the grant never covered - a RENAME to it re-pointed a record at a hidden nested table, and
+    CREATE / DROP (spec 016, pre-existing) reached it too. Every DDL name part, and the RENAME target,
+    must be one identifier (`… has a dot in it`);
+  - **the home is the object's own parent**: `vs.x.m` with no schema `vs.x` used to land in `vs` as
+    object `x.m`; it has no home now, and a reading fits only a real parent (which also removed a false
+    ambiguity);
+  - **an unqualified name is the MAIN catalog's** (as the spec says, and as reads resolve): before, a
+    two-part name matched the schema in any granted catalog and a tie was arbitrary;
+  - **a rolled-back RENAME** left the record moved (it is written on the store's connection) while the
+    physical rename went back - the record is moved back at the client's ROLLBACK
+    (`RecordRenameUndo`, a ClientContextState, newest first); a commit keeps it. CREATE's record has
+    the same split (pre-existing: a dangling record after a rollback, fail closed).
+- **Lineage**: a RENAME in an expansion is `DATASET` `DROP` of the old name + `CREATE` of the new
+  (`test/sql/acl_lineage.test`).
+- **Flight**: a prepared statement that is a no-op (`CREATE SCHEMA IF NOT EXISTS`) now prepares as the
+  empty `SELECT`, so it is announced as a query, not as an update.
+- **Spike, final build**: two `dbt run`s in a row - `table`, `view`, `incremental` (`append`) - all OK.
