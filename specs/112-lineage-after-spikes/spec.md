@@ -1,6 +1,6 @@
 # Spec 112: lineage, after the client spikes
 
-- **Status**: accepted
+- **Status**: implemented
 - **Date**: 2026-10-09
 - **Follows**: spec 107 (lineage), spec 109 (the parent), acl-otel spec 018 (the transport)
 - **Found by**: the Spark / dbt / Python spikes of 2026-10-09 (a node with acl + acl-otel, Marquez)
@@ -204,3 +204,58 @@ end with the connection.
   the engines' addresses.
 - **Dropping a rolled-back run.** The run did happen and failed to commit. `ABORT` is OpenLineage's
   word for it.
+
+## As built
+
+- **Names (§1).** `LineageDatasetFor` names a virtual dataset `<ns>` :: `<vcat>.<schema|main>.<object>`.
+  `acl_lineage_namespace` has no default; `LineageSettings::on` needs the level and a namespace, and
+  `acl_lineage_status()` says which is missing. **Deviation:** no notice row in `acl_lineage_events()`
+  for "no namespace" - the ring stays lineage only (a row nobody can render would reach the sinks too);
+  the status function is the visible answer. `ACL CLUSTER SET acl_lineage_namespace` is an ordinary
+  restart-class setting item.
+- **The name is usable** (found by the Spark re-run): a client copies `sales.main.orders` from the
+  catalog and the node refused it. `PolicyStore::ResolveTable` now retries `<vcat>.main.<object>` as
+  `<vcat>.<object>` when the three-part name resolves to nothing (a refusal still names what was
+  written).
+- **§2 one run per DoPut.** `LineageBatchBegin/End` around `DoPutPreparedStatementUpdate`'s rows, ended
+  before the door's own COMMIT/ROLLBACK; executions are matched by the statement's text hash (a rebind
+  parses again and makes a new job object).
+- **§3 schema alias.** Two root causes: `LookupSchemaAlias` set no `canonical` (the worker could not
+  mirror an object reached through a live alias), and a CTAS into `home.model` names no catalog (the
+  scratch database never got the schema). Both fixed; CTAS and INSERT through the alias have edges.
+- **§4 ingest.** The call's lineage context (`LineageOfCall`, spec 109's check) rides as `LINEAGE`
+  markers on the `ACL INGEST` prefix. Found on the way: the ingest's `BEGIN TRANSACTION` ended the
+  note its Prepare left, so an ingest had neither a run nor (spec 074) a profile - the note is now
+  taken before the BEGIN and given back to the execution. A `create`-mode ingest's target is resolved
+  after the write.
+- **Phantom runs (found by the e2e).** A door's `Connection::Prepare` is planned as a PREPARE whose own
+  plan the optimizer hook never sees, so every Flight prepared statement had an extra run since spec
+  107 - `LineagePrepareScope` around the door's Prepares. And `SchemasFromStatement` never submits a
+  write for its schema any more (duckdb leaves an unbound DML's properties unsettled; a submitted
+  INSERT runs on the workers, and closing it unread promises nothing); the read it still submits is
+  kept off the connection's note.
+- **§5 noise.** In the worker, for a declared read: only metadata surfaces / a SHOW / nothing →
+  no run; the scratch plan optimized, a `LOGICAL_EMPTY_RESULT` or `LIMIT 0` down the single-child
+  spine → no run.
+- **§6 transactions.** `AclProfileState` holds a successful run (and a physical definition) while the
+  connection is in an explicit transaction; `TransactionCommit` hands them on, `TransactionRollback`
+  sends `RUN_ABORT` (a definition that rolled back sends nothing). A failure is `RUN_FAIL` at once.
+  `LineageOutcome` replaces the bool. acl-otel spec 020 renders `ABORT`.
+- **§7 types.** `LineageOutput::type` from the walked plan (table columns, CTAS columns, the root's
+  types) and the mirror; `LineageFieldOf` nests a struct's fields (`STRUCT`, `STRUCT[]` for lists); a
+  NULL literal (a mask) has no type.
+- **§9 identity.** `acl_lineage_source(alias, identity)` (the never set: `acl_*`) keeps it per
+  attachment - a `weak_ptr<AttachedDatabase>`, bound at declaration or, declared before the ATTACH, to
+  the first attachment it meets; a DETACH (or a new ATTACH) ends it without a hook. `ATTACH …
+  LINEAGE '<x>'` (parser override, unprefixed or `ACL NATIVE`): a quote/comment-aware split
+  (`acl_attach_lineage.hpp`) compiles each marked ATTACH to itself + `SELECT acl_lineage_source(…)`;
+  the ATTACH keeps its text with the marker, which the lineage hook reads back, so its own NAMESPACE
+  event already carries the identity. `ACL CLUSTER ATTACH … LINEAGE '<x>'`: the item's spec carries
+  `lineage`; the hot apply attaches through the sugar.
+- **Re-run spikes (2026-10-09).** Python: five steps under the parent, the job and the node's runs in one
+  graph around `acl://spike` :: `sales.main.py_out`, typed fields. Spark: with three-part names and a
+  `pattern` resolver (`hostList` keeps the port) its datasets are the node's; one run per partition's
+  DoPut, the `WHERE 1=0` probes gone. dbt: one run per model, the CTAS into the schema alias with its
+  edges; names match, dbt-ol's namespace stays its own (`duckdb://<path>`).
+- **Not done here:** a runtime call of a *virtual table function* still does not bind in the scratch
+  (approximate); quack's `executemany` is not batched (one statement per row on that protocol).

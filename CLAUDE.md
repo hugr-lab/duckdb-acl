@@ -576,6 +576,20 @@ refused at the marker / SET, Flight `InvalidArgument`, quack blanked + one `door
 `lineage_parent_invalid`. Settings `acl_lineage_*` (GLOBAL); `acl_lineage_flush()`,
 `acl_lineage_resend([vcat])`. Transport is acl-otel's.
 
+**Spec 112 — lineage after the client spikes**: names are OpenLineage's for a SQL endpoint - virtual
+`<acl_lineage_namespace>` :: `<vcat>.<schema|main>.<object>` (and `<vcat>.main.<object>` resolves, a
+fallback in `PolicyStore::ResolveTable`); the namespace is the cluster's (`ACL CLUSTER SET`), with no
+default: none = no lineage (`acl_lineage_status()`). A source's identity (`<scheme>://<host:port>[/db]`,
+never userinfo) names its physical datasets: the ext-common `acl_lineage_sources` registry first (hugr
+node), then `acl_lineage_source(alias, identity)` / `ATTACH … LINEAGE '<x>'` (parser-override sugar,
+`acl_attach_lineage.hpp`; the ATTACH keeps the marker in its text so its NAMESPACE event is named) /
+`ACL CLUSTER ATTACH … LINEAGE`, kept per attachment (`weak_ptr<AttachedDatabase>`: a DETACH ends it).
+Runs: one per Flight DoPut batch (`LineageBatchBegin/End`, by text hash), held in a client's explicit
+transaction (`AclProfileState` TransactionCommit/Rollback → `RUN_ABORT`, `LineageOutcome`), a door's
+`Connection::Prepare` is no run (`LineagePrepareScope`), a write is never Submitted for its schema,
+Flight ingest carries `LINEAGE` markers (the note survives its BEGIN), a declared read of only metadata
+or of no rows is no run, fields carry types (`LineageFieldOf`). acl-otel spec 020 renders `ABORT`.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

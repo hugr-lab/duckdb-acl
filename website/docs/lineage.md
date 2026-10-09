@@ -152,6 +152,29 @@ that carries anything else.
 
   A plain `SET` would run on the client.
 
+### Lining the names up
+
+A pipeline's own events and the node's join in the backend only when both name a dataset the same.
+
+- **Spark** (OpenLineage's Spark integration, through the acl JDBC driver `jdbc:acl://<door>`) names a
+  table `acl://<host>:<port>` + the name it was given. Write table names in three parts
+  (`sales.main.orders`), and add a namespace resolver that maps the door's address to the node's
+  namespace - for `acl_lineage_namespace = 'acl://prod'`:
+
+  ```properties
+  spark.openlineage.dataset.namespaceResolvers.prod.type=pattern
+  spark.openlineage.dataset.namespaceResolvers.prod.regex=door\.corp:32010
+  ```
+
+  The matched part is replaced by the resolver's name, so `acl://door.corp:32010` becomes `acl://prod`
+  - the node's namespace. (`hostList` keeps the port.) Spark's reads and writes are then the node's
+  datasets.
+- **dbt** (dbt-ol, the duckdb adapter with the node attached through quack) names a model
+  `duckdb://<path>` + `<attach alias>.<schema>.<table>`. Attach the node under the virtual catalog's
+  name (`alias: sales`), and the names are the node's; the namespace is dbt-ol's own, to be related to
+  the node's in the catalog.
+- **A Python job** (or anything that emits for itself) uses the node's names directly.
+
 Without a parent, a run belongs to the job `acl_lineage_job`, or `sql:<hash of the normalized
 statement>`, in the namespace `acl://<ns>/client/<door>`.
 
