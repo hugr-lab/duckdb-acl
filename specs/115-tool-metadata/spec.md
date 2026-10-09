@@ -169,3 +169,9 @@ standard shape.
   virtual `f` now takes the virtual function (it fails closed when the arguments do not fit); under a
   session's `USE` the session catalog's flat functions also shadow engine functions, which the
   listing's `bare` flag (MAIN only) does not mark.
+- **duckdb_schemas in duckdb's own shape** (found before the merge, from quack's catalog load): the
+  leaf as `schema_name`, the parent's leaf as `parent_schema` and its oid - quack builds each schema's
+  path through `parent_schema_oid` and joins tables by `schema_oid`; a full path in `schema_name` with
+  a parent doubled the levels (`raw` → `raw.eu`). `information_schema.schemata` and every other
+  surface keep the full dotted path. Tested by quack's own load query under a principal
+  (acl_tool_metadata.test) and a nested schema of another catalog read through quack (door e2e).

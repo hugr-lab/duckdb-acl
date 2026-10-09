@@ -242,14 +242,26 @@ Table Function with name acl_function_columns does not exist
 
 # --- duckdb_schemas(): parents, and a schema that holds only functions ------------------------------
 
+# duckdb's own shape: the leaf as schema_name, the parent's leaf and oid
 query III
 ACL ROLE "r" SELECT database_name, schema_name, parent_schema FROM duckdb_schemas() ORDER BY ALL;
 ----
+c	eu	raw
 c	main	NULL
 c	nested	NULL
 c	raw	NULL
-c	raw.eu	raw
 other	main	NULL
+
+# quack's own catalog load (QuackSchemaSet::GetLoadQuery) builds each schema's path through the parent
+# oids - a nested schema must come back as [raw, eu], never [raw, raw.eu]
+query II
+ACL ROLE "r" WITH RECURSIVE schema_tree AS (SELECT oid, database_name, [schema_name] AS schema_path FROM duckdb_schemas() WHERE parent_schema_oid IS NULL UNION ALL SELECT nested.oid, nested.database_name, list_append(parent.schema_path, nested.schema_name) FROM duckdb_schemas() nested JOIN schema_tree parent ON nested.parent_schema_oid = parent.oid) SELECT database_name, schema_path FROM schema_tree ORDER BY ALL;
+----
+c	[main]
+c	[nested]
+c	[raw]
+c	[raw, eu]
+other	[main]
 
 # the other listings take the same schemas: a parent and a functions-only schema are a tree's nodes
 query II

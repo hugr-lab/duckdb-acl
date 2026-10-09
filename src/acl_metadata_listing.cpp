@@ -270,11 +270,16 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		                 " FROM vschemas";
 	}
 	if (surface == "duckdb_schemas") {
+		// spec 115: duckdb's own shape for a nested schema - the leaf as schema_name, the parent's leaf as
+		// parent_schema and its oid: a client (quack) builds the tree by the oids, and a full path there
+		// doubled its levels (`raw` -> `raw.eu`). The oid stays the full path's, as every other surface's
+		// schema_oid is.
 		return prelude + "SELECT " + schema_oid("vcat", "path") + " AS oid, vcat AS database_name, " +
-		       database_oid("vcat") + " AS database_oid, path AS schema_name, NULL::VARCHAR AS comment, " + empty_map +
+		       database_oid("vcat") +
+		       " AS database_oid, regexp_extract(path, '([^.]*)$') AS schema_name, NULL::VARCHAR AS comment, " +
+		       empty_map +
 		       " AS tags, false AS internal, NULL::VARCHAR AS sql,"
-		       // spec 115: a nested schema names its parent, so a tool can build the tree
-		       " parent AS parent_schema, CASE WHEN parent IS NULL THEN NULL ELSE " +
+		       " regexp_extract(parent, '([^.]*)$') AS parent_schema, CASE WHEN parent IS NULL THEN NULL ELSE " +
 		       schema_oid("vcat", "parent") +
 		       " END AS parent_schema_oid FROM (SELECT DISTINCT vcat, path, CASE WHEN position('.' IN path) > 0 THEN"
 		       " regexp_extract(path, '^(.*)[.][^.]*$', 1) END AS parent FROM vschemas)";
