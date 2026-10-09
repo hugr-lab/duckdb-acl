@@ -179,11 +179,25 @@ bool LineageClientSetting(const string &name) {
 }
 
 bool LineageIdentityClean(const string &identity) {
+	// `<scheme>://<host[:port]>[/<path>]` and nothing else: no userinfo, no query, no fragment - a name,
+	// never a credential, wherever in the text one would hide (the review's finding: `?password=`)
 	auto scheme = identity.find("://");
-	auto start = scheme == string::npos ? 0 : scheme + 3;
-	auto end = identity.find_first_of("/?#", start);
-	auto at = identity.find('@', start);
-	return at == string::npos || (end != string::npos && at > end);
+	if (scheme == string::npos || scheme == 0 || scheme + 3 >= identity.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < scheme; i++) {
+		auto c = identity[i];
+		if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '+' && c != '-' && c != '.') {
+			return false;
+		}
+	}
+	for (auto c : identity) {
+		if (c == '@' || c == '?' || c == '#' || c == '\\' || c == '%' || static_cast<unsigned char>(c) <= ' ' ||
+		    c == 0x7f) {
+			return false;
+		}
+	}
+	return identity[scheme + 3] != '/';
 }
 
 bool LineageSourceNameFor(DatabaseInstance &db, const string &catalog, const string &schema, const string &name,
@@ -214,12 +228,13 @@ bool LineageSourceNameFor(DatabaseInstance &db, const string &catalog, const str
 		lock_guard<mutex> guard(store->lineage_sources_lock);
 		auto entry = store->lineage_sources.find(catalog);
 		if (entry != store->lineage_sources.end()) {
-			if (!entry->second.bound) {
+			if (!entry->second.bound && !declared.empty()) {
+				// the ATTACH … LINEAGE being executed names it itself: its call replaces the pending one
+			} else if (!entry->second.bound) {
 				entry->second.bound = true; // declared before its ATTACH: this is the attachment it meant
 				entry->second.attached = attached;
-			}
-			auto declared_for = entry->second.attached.lock();
-			if (declared_for.get() == attached.get()) {
+				identity = entry->second.identity;
+			} else if (entry->second.attached.lock().get() == attached.get()) {
 				identity = entry->second.identity;
 			} else {
 				store->lineage_sources.erase(entry); // declared for an attachment that is gone
@@ -345,8 +360,9 @@ AuditLineageField LineageFieldOf(const string &name, const LogicalType &type) {
 	// a struct (or a list of them) carries its fields, the way OpenLineage's schema facet nests them
 	auto element = type;
 	string suffix;
-	while (element.id() == LogicalTypeId::LIST) {
-		element = ListType::GetChildType(element);
+	while (element.id() == LogicalTypeId::LIST || element.id() == LogicalTypeId::ARRAY) {
+		element =
+		    element.id() == LogicalTypeId::LIST ? ListType::GetChildType(element) : ArrayType::GetChildType(element);
 		suffix += "[]";
 	}
 	if (element.id() == LogicalTypeId::STRUCT) {

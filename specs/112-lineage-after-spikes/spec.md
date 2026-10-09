@@ -257,5 +257,21 @@ end with the connection.
   `pattern` resolver (`hostList` keeps the port) its datasets are the node's; one run per partition's
   DoPut, the `WHERE 1=0` probes gone. dbt: one run per model, the CTAS into the schema alias with its
   edges; names match, dbt-ol's namespace stays its own (`duckdb://<path>`).
+- **Three adversarial review passes** (correctness, security, semantics) found, all fixed with tests:
+  - the identity lint let a credential through after `?` / `#` - an identity is now exactly
+    `<scheme>://<host[:port]>[/<path>]`, no `@ ? # % \` or control character anywhere;
+  - a write inside a CTE (`WITH w AS (INSERT … RETURNING …) SELECT …, ?`) was still submitted for its
+    schema (statement kind SELECT) - the probe is now refused for any statement whose properties say it
+    modifies a database; such a statement's result schema then stays unknown and a driver may refuse
+    it, but it never writes twice (e2e). Its lineage was a read: a CTE that writes makes the
+    statement a write, and the collector names the CTE's INSERT target;
+  - the scratch mirror is empty, so its statistics folded every filter to false and dropped nearly
+    every filtered declared read - `STATISTICS_PROPAGATION` is off in the scratch; the optimizer step
+    has its own try (it never discards a walk); SUMMARIZE is a read (duckdb's iterator does not enter
+    a SHOW_REF's query - the collector does); a DESCRIBE no longer hides the other relations; metadata
+    spelled qualified (`main.duckdb_tables()`) or any `duckdb_*()` counts as metadata;
+  - a DETACH's NAMESPACE event is named by the identity resolved while still attached; an `ATTACH …
+    LINEAGE` wins over a pending unbound declaration; `ARRAY` nests like `LIST`;
+  - the batch scope and the probe's note are restored on every way out (`LineageBatchScope`).
 - **Not done here:** a runtime call of a *virtual table function* still does not bind in the scratch
-  (approximate); quack's `executemany` is not batched (one statement per row on that protocol).
+  (approximate); a CTE write with a parameter in its result binds nowhere in the scratch (approximate, no target); a declared-before-ATTACH identity binds lazily (at the first lineage lookup); quack's `executemany` is not batched (one statement per row on that protocol).

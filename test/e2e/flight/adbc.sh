@@ -70,11 +70,12 @@ server_says() { # <sql> -> the csv lines of that answer
 PARENT_RUN="01929e3a-0000-7000-8000-0000000001a2"
 { echo ".mode csv"; echo "SET GLOBAL acl_lineage_level = 'on';"; echo "SET GLOBAL acl_lineage_namespace = 'acl://e2e';"; } >&3
 "$PYBIN" "$HERE/lineage_client.py" "$URI" "$TOKEN" "airflow/daily.load/$PARENT_RUN" || fail "lineage assertions failed"
-# two runs into c.main.orders under the parent, of two jobs: the executemany's (one for its five rows)
-# and the ingest's - whose run is `approximate` (its source is the client's stream)
-runs="$(server_says "SELECT event_type, payload->'datasets'->(payload->'outputs'->>0)::INT->>'name' AS target, approximate, count(*) AS n FROM acl_lineage_events() WHERE (payload->'parent'->>'run_id') = '$PARENT_RUN' GROUP BY ALL ORDER BY approximate")"
-[ "$runs" = "$(printf 'RUN_COMPLETE,c.main.orders,false,1\nRUN_COMPLETE,c.main.orders,true,1')" ] ||
-	fail "an executemany and an ingest under one parent are not one run each into c.main.orders: $runs"
-echo "  ok:   one run per executemany, and the ingest is a run with its parent"
+# under the parent, into c.main.orders: ONE run for the five-row executemany, the ingest's run
+# (`approximate` - its source is the client's stream) and ONE RUN_FAIL for the refused batch
+runs="$(server_says "SELECT event_type, payload->'datasets'->(payload->'outputs'->>0)::INT->>'name' AS target, approximate, count(*) AS n FROM acl_lineage_events() WHERE (payload->'parent'->>'run_id') = '$PARENT_RUN' GROUP BY ALL")"
+for want in "RUN_COMPLETE,c.main.orders,false,1" "RUN_COMPLETE,c.main.orders,true,1" "RUN_FAIL,c.main.orders,false,1"; do
+	echo "$runs" | grep -qx "$want" || fail "under one parent, expected the run $want: $runs"
+done
+echo "  ok:   one run per executemany, a refused batch is one RUN_FAIL, and the ingest is a run with its parent"
 echo "SELECT acl_flight_stop('$URI');" >&3
 echo "PASS: the real ADBC driver prepared, parameterized, bulk-inserted, staged through a session temp, and was confined to its slice"

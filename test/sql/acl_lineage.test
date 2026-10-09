@@ -428,6 +428,25 @@ SELECT event_type, count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FR
 RUN_ABORT	1
 RUN_FAIL	1
 
+# a write inside a CTE is a write, not a read: its run has the target
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" WITH x AS (INSERT INTO sink VALUES (150, 'c') RETURNING a) SELECT * FROM x;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TT
+SELECT event_type, payload->'datasets'->(payload->'outputs'->>0)::INT->>'name'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+RUN_COMPLETE	c.main.sink
+
 # (the three-part name is the same object, written through as well)
 statement ok
 ACL ROLE "w" DELETE FROM c.main.sink WHERE a >= 100;
@@ -747,6 +766,27 @@ SELECT acl_lineage_source('dwh', 'postgres://u:secret@db.corp:5432/analytics');
 ----
 never a credential
 
+# ... nor anywhere else in the text: a query string, a fragment, an escape (the review's finding)
+statement error
+SELECT acl_lineage_source('dwh', 'postgres://db.corp:5432?password=s3cret');
+----
+never a credential
+
+statement error
+SELECT acl_lineage_source('dwh', 'postgres://db.corp/analytics?user=u&password=p');
+----
+never a credential
+
+statement error
+ATTACH ':memory:' AS z LINEAGE 'postgres://h#u:p@x';
+----
+never a credential
+
+statement error
+SELECT acl_lineage_source('dwh', 'postgres://u%3Ap%40db.corp:5432');
+----
+never a credential
+
 statement error
 SELECT acl_lineage_source('dwh', 'db.corp');
 ----
@@ -872,6 +912,17 @@ mysql://mart.corp:3306	CREATE
 
 statement ok
 DETACH mart;
+
+statement ok
+SELECT acl_lineage_flush();
+
+# ... and its DETACH is named the same, though nothing knows the identity once it is gone
+query TT
+SELECT payload->'datasets'->0->>'namespace', payload->'datasets'->0->>'lifecycle'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'NAMESPACE' ORDER BY seq;
+----
+mysql://mart.corp:3306	CREATE
+mysql://mart.corp:3306	DROP
 
 # a failed ATTACH declares nothing: the call after it never runs
 statement error
@@ -1040,9 +1091,8 @@ SELECT count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
 ----
 0
 
-# ... while a read of rows, even next to a surface, still is
 statement ok
-ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT s.id FROM src s, duckdb_tables() t WHERE t.table_name = 'x' LIMIT 1;
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT * FROM main.duckdb_tables();
 
 statement ok
 SELECT acl_lineage_flush();
@@ -1050,7 +1100,32 @@ SELECT acl_lineage_flush();
 query I
 SELECT count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
 ----
-1
+0
+
+# ... while a read of rows still is: next to a surface, under a filter (the mirror is empty - its
+# statistics must not make every filter a probe), and a SUMMARIZE (it reads every row)
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT s.id FROM src s, duckdb_tables() t WHERE t.table_name = 'x' LIMIT 1;
+
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT id FROM src WHERE total > 5;
+
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT id FROM src WHERE ssn IS NULL AND id = 3;
+
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SUMMARIZE src;
+
+statement ok
+ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT s.id FROM src s, (DESCRIBE src) d WHERE d.column_name = 'id';
+
+statement ok
+SELECT acl_lineage_flush();
+
+query I
+SELECT count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+----
+5
 
 # each marker once, and the value quoted
 statement error

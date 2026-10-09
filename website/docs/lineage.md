@@ -51,7 +51,7 @@ the quack door's streamed ingest (`SEND_DATA`), and a `GRANT SCHEMA` does not re
 - **The namespace is the cluster's.** `<ns>` is `acl_lineage_namespace`. It has no default: with none
   the node sends **no lineage**, and `acl_lineage_status()` says so (`on`, `off`, or `no namespace:
   …`). Set it once for the cluster - `ACL CLUSTER SET acl_lineage_namespace = 'acl://prod'` - or in a
-  single node's bootstrap with `SET GLOBAL`. Clearing it is the cluster-wide off switch, and it keeps
+  single node's bootstrap with `SET GLOBAL`. Clearing it is the cluster-wide off switch (a setting item: each node takes it as the node agent rolls the profile out), and it keeps
   two clusters from merging their virtual catalogs in one backend by accident. The node group is in
   the run's facet, not in the name.
 - **Job namespaces** are `<ns>/client/<door>`.
@@ -73,7 +73,7 @@ SELECT acl_lineage_source('pg', 'postgres://pg.prod:5432/sales');
 
 Then `pg.public.orders` is `postgres://pg.prod:5432` + `sales.public.orders`, in every edge, run and
 `NAMESPACE` event. The identity is `<scheme>://<host:port>[/<database>]`; it is a name and never a
-credential (`user:password@` is refused). The node never derives it from a DSN or a secret: a host
+credential - userinfo, a query string or a fragment (`user:password@`, `?password=`, `#…`) is refused. The node never derives it from a DSN or a secret: a host
 behind a proxy is not the host others see.
 
 - It lives in the node's memory, like the ATTACH it describes: the bootstrap declares it at every

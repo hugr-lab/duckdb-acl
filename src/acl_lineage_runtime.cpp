@@ -30,10 +30,12 @@
 #include "duckdb/parser/expression/parameter_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/common_table_expression_info.hpp"
 #include "duckdb/parser/query_node/list.hpp"
 #include "duckdb/parser/statement/list.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/pivotref.hpp"
+#include "duckdb/parser/tableref/showref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
@@ -244,6 +246,15 @@ public:
 	void Node(QueryNode &node) {
 		for (auto &entry : node.cte_map.map) {
 			ctes.insert(entry.first.GetIdentifierName());
+			// an INSERT's target is a name, not a FROM, and duckdb's iterator does not hand it over:
+			// a CTE that inserts (`WITH w AS (INSERT …)`) names its target here
+			auto &cte = entry.second;
+			if (cte && cte->query_node && cte->query_node->type == QueryNodeType::INSERT_QUERY_NODE) {
+				auto &insert = cte->query_node->Cast<InsertQueryNode>();
+				if (!insert.table_ref) {
+					Add(FromQualified(insert.qualified_name));
+				}
+			}
 		}
 		ParsedExpressionIterator::EnumerateQueryNodeChildren(
 		    node, [&](unique_ptr<ParsedExpression> &child) { Expression(*child); }, [&](TableRef &ref) { Ref(ref); });
@@ -261,7 +272,15 @@ private:
 	}
 	void Ref(TableRef &ref) {
 		if (ref.type == TableReferenceType::SHOW_REF) {
-			show = true;
+			auto &shown = ref.Cast<ShowRef>();
+			if (shown.show_type != ShowType::SUMMARY) {
+				show = true; // a description - SUMMARIZE reads every row, and is a read like any other
+			} else if (shown.query) {
+				Node(*shown.query); // duckdb's iterator does not descend into a SHOW_REF's query
+			} else if (!shown.GetTableName().empty()) {
+				Add(FromQualified(shown.qualified_name));
+			}
+			return;
 		}
 		if (ref.type == TableReferenceType::TABLE_FUNCTION) {
 			auto &call = ref.Cast<TableFunctionRef>().function;
@@ -275,7 +294,9 @@ private:
 		if (ref.type != TableReferenceType::BASE_TABLE) {
 			return;
 		}
-		auto relation = FromQualified(ref.Cast<BaseTableRef>().GetQualifiedName());
+		Add(FromQualified(ref.Cast<BaseTableRef>().GetQualifiedName()));
+	}
+	void Add(NamedRelation relation) {
 		if (relation.parts.size() == 1 && ctes.count(relation.parts[0])) {
 			return;
 		}
@@ -290,17 +311,25 @@ private:
 
 //! spec 112 §5: a declared read that reads nothing is no run - only the node's metadata surfaces
 //! (a client's catalog refresh, `duckdb_tables()`, `information_schema`), or nothing at all.
-bool ReadsOnlyMetadata(const RelationCollector &collector) {
-	if (collector.show) {
-		return true;
+bool MetadataName(vector<string> parts) {
+	// spelled qualified too: `system.information_schema.tables`, `main.duckdb_tables`
+	while (parts.size() > 1 && (StringUtil::CIEquals(parts[0], "system") || StringUtil::CIEquals(parts[0], "main"))) {
+		parts.erase(parts.begin());
 	}
+	auto name = StringUtil::Join(parts, ".");
+	return MetadataSurfaceOf(name) || (parts.size() == 1 && StringUtil::StartsWith(StringUtil::Lower(name), "duckdb_"));
+}
+
+bool ReadsOnlyMetadata(const RelationCollector &collector) {
+	// a DESCRIBE's relation is described, not read (the collector does not enter it): what else the
+	// statement names still counts
 	for (auto &relation : collector.relations) {
-		if (!MetadataSurfaceOf(StringUtil::Join(relation.parts, "."))) {
+		if (!MetadataName(relation.parts)) {
 			return false;
 		}
 	}
 	for (auto &function : collector.functions) {
-		if (function.empty() || !MetadataSurfaceOf(function)) {
+		if (function.empty() || !MetadataName({function})) {
 			return false;
 		}
 	}
@@ -635,6 +664,9 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 		config.SetOptionByName("autoinstall_known_extensions", Value::BOOLEAN(false));
 		config.SetOptionByName("threads", Value::BIGINT(1));
 		config.SetOptionByName("memory_limit", Value("64MB"));
+		// the mirror's tables are empty: their statistics would fold every filter to false and make each
+		// filtered read look like a probe (spec 112 §5 judges the statement's own constants, not the data)
+		config.options.disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
 		DuckDB scratch_db(nullptr, &config);
 		for (auto extension : {"core_functions", "json", "icu"}) {
 			try {
@@ -713,9 +745,14 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 				walk = WalkLineage(*planner.plan, options);
 				walked = true;
 				if (job.declared_read) {
-					Optimizer optimizer(*planner.binder, *scratch.context);
-					auto optimized = optimizer.Optimize(std::move(planner.plan));
-					reads_nothing = optimized && YieldsNoRows(*optimized);
+					// the walk stands whatever the optimizer makes of the empty mirror
+					try {
+						Optimizer optimizer(*planner.binder, *scratch.context);
+						auto optimized = optimizer.Optimize(std::move(planner.plan));
+						reads_nothing = optimized && YieldsNoRows(*optimized);
+					} catch (std::exception &) {
+						reads_nothing = false;
+					}
 				}
 			});
 		} catch (std::exception &) {
@@ -1117,6 +1154,11 @@ void CapturePhysical(OptimizerExtensionInput &input, unique_ptr<LogicalOperator>
 			auto attached = DatabaseManager::Get(input.context).GetDatabase(input.context, detach.name);
 			if (attached) {
 				captured->source_type = StringUtil::Lower(attached->GetCatalog().GetCatalogType());
+				// named as it was while attached: after the DETACH nothing knows the identity any more
+				string ns, name;
+				if (LineageSourceNameFor(*input.context.db, captured->object.catalog, string(), string(), ns, name)) {
+					captured->resolved_ns = ns;
+				}
 			}
 			captured->namespace_event = true;
 			captured->lifecycle = "DROP";
@@ -1161,8 +1203,10 @@ void EmitPhysicalLineage(const PhysicalLineage &captured, AuditPipeline &pipelin
 		AuditLineageDataset source;
 		source.ns = settings.ns + "/source/" + captured.object.catalog;
 		string identity_ns, identity_name;
-		if (LineageSourceNameFor(db, captured.object.catalog, string(), string(), identity_ns, identity_name,
-		                         captured.declared_identity)) {
+		if (!captured.resolved_ns.empty()) {
+			source.ns = captured.resolved_ns;
+		} else if (LineageSourceNameFor(db, captured.object.catalog, string(), string(), identity_ns, identity_name,
+		                                captured.declared_identity)) {
 			source.ns = identity_ns; // spec 112 §9: the source's own name, from its provider or its operator
 		}
 		source.dataset_type = StringUtil::Upper(captured.source_type.empty() ? string("source") : captured.source_type);
@@ -1242,9 +1286,22 @@ shared_ptr<LineageJob> CaptureLineageJob(PolicyStore &store, const SQLStatement 
 		write = info && info->type == CatalogType::TABLE_ENTRY && info->Cast<CreateTableInfo>().query;
 		break;
 	}
-	case StatementType::SELECT_STATEMENT:
-		read = !context.parent.empty();
+	case StatementType::SELECT_STATEMENT: {
+		// a SELECT whose CTE writes (`WITH w AS (INSERT … RETURNING …) SELECT …`) is a write
+		auto &node = statement.Cast<SelectStatement>().node;
+		if (node) {
+			for (auto &entry : node->cte_map.map) {
+				auto &cte = entry.second;
+				auto kind = cte && cte->query_node ? cte->query_node->type : QueryNodeType::SELECT_NODE;
+				if (kind == QueryNodeType::INSERT_QUERY_NODE || kind == QueryNodeType::UPDATE_QUERY_NODE ||
+				    kind == QueryNodeType::DELETE_QUERY_NODE || kind == QueryNodeType::MERGE_QUERY_NODE) {
+					write = true;
+				}
+			}
+		}
+		read = !write && !context.parent.empty();
 		break;
+	}
 	default:
 		break;
 	}

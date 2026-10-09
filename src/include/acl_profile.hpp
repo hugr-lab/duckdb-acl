@@ -62,6 +62,28 @@ void MarkPreparing(ClientContext &context);
 //! DoPut) - every execution inside the scope counts towards ONE run, handed on at the scope's end,
 //! RUN_FAIL if any execution failed. A scope that executed nothing hands nothing on.
 void LineageBatchBegin(ClientContext &context);
+void LineageBatchEnd(ClientContext &context);
+//! The scope form: begun at construction, ended by End() or the destructor, once
+struct LineageBatchScope {
+	explicit LineageBatchScope(ClientContext &context_p) : context(context_p) {
+		LineageBatchBegin(context);
+	}
+	~LineageBatchScope() {
+		End();
+	}
+	void End() {
+		if (open) {
+			open = false;
+			LineageBatchEnd(context);
+		}
+	}
+	LineageBatchScope(const LineageBatchScope &) = delete;
+	LineageBatchScope &operator=(const LineageBatchScope &) = delete;
+
+private:
+	ClientContext &context;
+	bool open = true;
+};
 //! spec 112: a door around its own Connection::Prepare - that is no execution, so no run (a SQL
 //! `PREPARE` the hook sees; the door's Prepare it does not)
 struct LineagePrepareScope {
@@ -73,7 +95,6 @@ struct LineagePrepareScope {
 private:
 	ClientContext &context;
 };
-void LineageBatchEnd(ClientContext &context);
 
 //! The hash a note and an execution are matched by; never the text.
 uint64_t StatementTextHash(const string &text);

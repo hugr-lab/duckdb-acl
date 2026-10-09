@@ -157,6 +157,8 @@ struct PhysicalLineage {
 	//! spec 112 §9: the identity an `ATTACH … LINEAGE '<x>'` declares - its own NAMESPACE event is
 	//! named by it already (the declaring call runs after the ATTACH)
 	string declared_identity;
+	//! a DETACH's source namespace, resolved while the source was still attached
+	string resolved_ns;
 	Principal principal; // `ACL NATIVE`'s principal; empty for the node's operator
 	string door;
 };

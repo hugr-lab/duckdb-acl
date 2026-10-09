@@ -1790,12 +1790,12 @@ public:
 			// spec 112 §2: the rows are one run - ended before the transaction is, so a commit hands
 			// it on and a rollback aborts it
 			auto &context = *con.context;
-			LineageBatchBegin(context);
+			LineageBatchScope batch(context); // ends on every way out - an exception too
 			int64_t total = 0;
 			for (auto &row : rows) {
 				auto result = reservation->stmt->Execute(row);
 				if (result->HasError()) {
-					LineageBatchEnd(context);
+					batch.End();
 					if (owns_txn) {
 						con.Query("ROLLBACK");
 					}
@@ -1810,7 +1810,7 @@ public:
 					}
 				}
 			}
-			LineageBatchEnd(context);
+			batch.End();
 			if (owns_txn) {
 				auto committed = con.Query("COMMIT");
 				if (committed->HasError()) {
@@ -1849,9 +1849,13 @@ public:
 		// a write is never submitted for its schema (spec 112): with its parameters unbound duckdb has not
 		// settled it as a count, and a submitted INSERT runs on the workers - closing it unread does not
 		// promise it wrote nothing. Its schema is its own (a count, or RETURNING's), from the statement.
+		// a write is judged by what the binder says it modifies, not by the statement kind: a SELECT whose
+		// CTE is an INSERT … RETURNING writes too (the review's finding)
 		auto kind = stmt.GetStatementType();
-		bool writes = kind == StatementType::INSERT_STATEMENT || kind == StatementType::UPDATE_STATEMENT ||
-		              kind == StatementType::DELETE_STATEMENT || kind == StatementType::MERGE_INTO_STATEMENT;
+		auto properties = stmt.GetStatementProperties();
+		bool writes = !properties.IsReadOnly() || kind == StatementType::INSERT_STATEMENT ||
+		              kind == StatementType::UPDATE_STATEMENT || kind == StatementType::DELETE_STATEMENT ||
+		              kind == StatementType::MERGE_INTO_STATEMENT;
 		if (unresolved && bound_row && !writes &&
 		    stmt.GetStatementProperties().result_eagerness != ResultEagerness::FORCED) {
 			// a submitted handle carries the types the binder resolved with the row, and is closed
@@ -1862,15 +1866,13 @@ public:
 			bool noted = TakeConnectionProfileNote(context, note);
 			vector<Value> values = *bound_row;
 			auto submitted = stmt.Submit(values);
-			if (!submitted->HasError()) {
-				ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaFor(submitted->GetTypes(), submitted->GetNames()));
-			} else {
-				ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaOf(stmt));
-			}
+			auto probed =
+			    !submitted->HasError() ? SchemaFor(submitted->GetTypes(), submitted->GetNames()) : SchemaOf(stmt);
 			submitted->Close();
 			if (noted) {
-				SetConnectionProfileNote(context, std::move(note));
+				SetConnectionProfileNote(context, std::move(note)); // given back on every way out
 			}
+			ARROW_ASSIGN_OR_RAISE(dataset_schema, std::move(probed));
 		} else {
 			ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaOf(stmt));
 		}
