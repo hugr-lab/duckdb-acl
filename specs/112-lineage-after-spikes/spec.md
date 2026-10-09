@@ -263,7 +263,9 @@ end with the connection.
   - a write inside a CTE (`WITH w AS (INSERT … RETURNING …) SELECT …, ?`) was still submitted for its
     schema (statement kind SELECT) - the probe is now refused for any statement whose properties say it
     modifies a database; such a statement's result schema then stays unknown and a driver may refuse
-    it, but it never writes twice (e2e). Its lineage was a read: a CTE that writes makes the
+    it, but it never writes twice (e2e). Owner, 2026-10-09: a write that returns rows stays at `DoGet`
+    (whoever writes RETURNING reads it); the documented form types the parameter (`?::VARCHAR`),
+    which the e2e proves returns its rows and writes once. Its lineage was a read: a CTE that writes makes the
     statement a write, and the collector names the CTE's INSERT target;
   - the scratch mirror is empty, so its statistics folded every filter to false and dropped nearly
     every filtered declared read - `STATISTICS_PROPAGATION` is off in the scratch; the optimizer step
