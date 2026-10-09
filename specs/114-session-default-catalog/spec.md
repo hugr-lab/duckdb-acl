@@ -45,7 +45,7 @@ catalog; `USE <vcat>.<schema>;` also sets its default schema.**
    (`FROM quack_query_by_name('<alias>', 'USE sales')` - a plain `USE` there is the client's own).
 4. **Where it is kept.** On the session's record, so every statement of the session carries it into
    the resolver; caches keyed by the principal's roles are keyed by it too.
-5. **`current_database()`** under a principal answers the session's virtual catalog (today the node's
+5. **`current_database()` / `current_schema()`** under a principal answer the session's virtual catalog and schema (today the node's
    own, which names nothing a principal can use).
 
 Not in this spec: JDBC `setCatalog` / ADBC's catalog option (Flight session options) -
