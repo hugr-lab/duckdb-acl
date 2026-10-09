@@ -104,6 +104,25 @@ What the door serves, every RPC authenticated per call from the `authorization: 
   client's `$1`/`?` are the only parameters in the composed statement (the rewriter adds none), so
   parameter batches bind one-to-one. Text DML rides `DoPut(CommandStatementUpdate)` (JDBC
   `executeUpdate`); `executemany` runs as one batch, rolled back whole on a mid-batch refusal.
+- **Where a statement runs** (spec 111), as Flight SQL defines it: "GetFlightInfo: execute the query".
+  - **Rows.** A statement that returns rows (SELECT, `... RETURNING`) is planned at `GetFlightInfo` and
+    streamed lazily at `DoGet`. Nothing is held for a client that never pulls.
+    - A `DML ... RETURNING` is one of these. It runs only when its rows are fetched, so a client must
+      fetch it.
+  - **A count.** A statement that answers only a count (INSERT / UPDATE / DELETE / MERGE without
+    RETURNING, DDL) **runs at `GetFlightInfo`**. Its count waits for the `DoGet`, and a refusal is the
+    execute call's own error.
+    - DBAPI's `cursor.execute("INSERT ...")` sends DML down the query path and never fetches. The ADBC
+      driver cancels the unread `DoGet`, which used to lose the write silently; it no longer does.
+    - A schema without execution is `GetSchema`, which runs nothing.
+  - **DoPut.** It is the main path for DML and DDL: one RPC, nothing left behind on the node.
+    - A prepared DML or DDL is announced with an **empty dataset schema**, which JDBC reads as an update
+      and executes through `DoPut`.
+      - JDBC's `executeQuery("INSERT …")` therefore writes the row and then throws `Statement did not
+        return a result set`, as JDBC defines for a statement that is not a query. The exception does
+        not mean nothing was written.
+    - Flight SQL's `is_update` flag (Arrow ≥ the release carrying apache/arrow#49498) will be set too,
+      once the Arrow pin carries it.
 - **The catalog RPCs** (spec 046): `GetCatalogs`, `GetDbSchemas`, `GetTables` (with
   `include_schema`), `GetTableTypes`, `GetPrimaryKeys` (declared virtual keys, spec 048),
   `GetImportedKeys`/`GetExportedKeys`/`GetCrossReference` (declared references, spec 022). Every one

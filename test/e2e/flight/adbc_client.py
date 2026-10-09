@@ -98,9 +98,25 @@ with connect(acme_token) as conn:
     check("the session reads its own staging table", cur.fetchall() == [(2,)])
     cur.execute("INSERT INTO orders (id, tenant, amount, customer_id) "
                 "SELECT id, tenant, amount, customer_id FROM stage")
-    cur.fetchall()  # a DML through the query wire executes on the fetch - redeem the ticket
+    cur.fetchall()  # a fetched DML answers its count once
     cur.execute("SELECT count(*) FROM orders WHERE id IN (510, 511)")
     check("staged rows moved into the granted table as ordinary SQL", cur.fetchall() == [(2,)])
+    # spec 111: DBAPI's execute of a DML, never fetched - the driver cancels the DoGet when the cursor
+    # moves on, and the write used to be lost without a word; it runs at GetFlightInfo now
+    cur.execute("INSERT INTO orders (id, tenant, amount, customer_id) VALUES (512, 'acme', 1, 0)")
+    cur.execute("SELECT count(*) FROM orders WHERE id = 512")
+    check("a DML executed and never fetched is written", cur.fetchall() == [(1,)])
+    # ...and a parameterized one (DBAPI: prepare, bind, GetFlightInfo, the DoGet cancelled)
+    cur.execute("INSERT INTO orders (id, tenant, amount, customer_id) VALUES (?, 'acme', 1, 0)", (513,))
+    cur.execute("SELECT count(*) FROM orders WHERE id = 513")
+    check("a parameterized DML executed and never fetched is written", cur.fetchall() == [(1,)])
+    # a prepared DML without parameters executed through DoPut (what JDBC does with the empty dataset
+    # schema spec 111 announces): Arrow sends a batch with no columns - no parameters, one execution
+    cur.adbc_statement.set_sql_query("INSERT INTO orders (id, tenant, amount, customer_id) VALUES (514, 'acme', 1, 0)")
+    cur.adbc_statement.prepare()
+    cur.adbc_statement.execute_update()
+    cur.execute("SELECT count(*) FROM orders WHERE id = 514")
+    check("a parameterless prepared DML through DoPut runs once", cur.fetchall() == [(1,)])
     with connect(acme_token) as other:
         try:
             other.cursor().execute("SELECT * FROM stage")
@@ -117,11 +133,10 @@ with connect(acme_token) as conn:
 # EndTransaction - all on the one session the cookie pins, so the transaction spans the RPCs.
 with connect(acme_token, autocommit=False) as conn:
     cur = conn.cursor()
-    # a DML through the query path executes on the server when its result is read, so each write is
-    # followed by fetchall() to force the DoGet inside the transaction rather than let the driver
-    # defer it past the commit/rollback (an ADBC dbapi lazy-execution quirk, not a server one)
+    # spec 111: a DML through the query path executes at GetFlightInfo - inside the transaction it was
+    # sent in, fetched or not (it used to wait for the DoGet, which the driver defers or cancels)
     def write(sql):
-        cur.execute(sql); cur.fetchall()
+        cur.execute(sql)
     write("INSERT INTO orders (id, tenant, amount, customer_id) VALUES (600, 'acme', 1, 0)")
     conn.rollback()
     cur.execute("SELECT count(*) FROM orders WHERE id = 600")

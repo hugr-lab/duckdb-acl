@@ -131,6 +131,34 @@ def do_update(client, options, sql: str) -> int:
     return -1
 
 
+def prepared_dataset_fields(client, options, sql: str) -> int:
+    """spec 111: CreatePreparedStatement's answer, read by hand - how many fields the dataset schema
+    it announces has (an update announces none, which JDBC takes as "execute through DoPut")."""
+    import pyarrow as pa
+    request = command("ActionCreatePreparedStatementRequest", text(1, sql))
+    results = list(client.do_action(flight.Action("CreatePreparedStatement", request), options))
+    any_bytes = results[0].body.to_pybytes()
+    def fields_of(payload):
+        out, at = {}, 0
+        while at < len(payload):
+            key, at = read_varint(payload, at)
+            number, wire = key >> 3, key & 7
+            if wire == 2:
+                length, at = read_varint(payload, at)
+                out[number] = payload[at:at + length]
+                at += length
+            else:
+                _, at = read_varint(payload, at)
+        return out
+    inner = fields_of(fields_of(any_bytes)[2])  # Any.value -> ActionCreatePreparedStatementResult
+    handle = inner.get(1, b"")  # prepared_statement_handle = 1, dataset_schema = 2
+    if handle:  # close it again: the probe leaves nothing behind
+        close = command("ActionClosePreparedStatementRequest", field(1, handle))
+        list(client.do_action(flight.Action("ClosePreparedStatement", close), options))
+    schema = inner.get(2, b"")
+    return len(pa.ipc.read_schema(pa.py_buffer(schema))) if schema else 0
+
+
 def catalog_command(spec: str) -> bytes:
     """`@name` or `@name:arg` - the catalog RPCs, in the terms the protocol uses."""
     name, _, argument = spec[1:].partition(":")
@@ -217,6 +245,13 @@ if ask.startswith("@update:"):
     raise SystemExit(0)
 if ask.startswith("@ingest:"):
     print({"count": do_ingest(client, options, ask[len("@ingest:"):])})
+    raise SystemExit(0)
+if ask.startswith("@prepared_fields:"):  # spec 111: the dataset schema CreatePreparedStatement announces
+    print({"fields": prepared_dataset_fields(client, options, ask[len("@prepared_fields:"):])})
+    raise SystemExit(0)
+if ask.startswith("@nofetch:"):  # spec 111: a query whose result is never fetched - GetFlightInfo only
+    info = client.get_flight_info(flight.FlightDescriptor.for_command(statement_query(ask[len("@nofetch:"):])), options)
+    print({"endpoints": len(info.endpoints)})
     raise SystemExit(0)
 if ask.startswith("@txnq:"):  # @txnq:<transaction_id>:<sql> - a statement carrying a transaction id
     _txn, _sql = ask[len("@txnq:"):].split(":", 1)

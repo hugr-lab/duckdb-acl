@@ -665,6 +665,13 @@ counted, never fails an open; gauges `acl.sessions.observers` (-1 = another cont
 registry at load (`MarkPublisher("duckdb-acl <build> (ACLC 2)")`), so a consumer that must act for
 sessions refuses on a node where nobody publishes them.
 
+**Spec 111 — where a Flight statement runs** (Flight SQL's own rule, "GetFlightInfo: execute the
+query"): a statement that answers only a count (DML without RETURNING, DDL - `AnswersOnlyCount`: the
+bound return type, or for a parameter duckdb could not type the statement kind + the client's text)
+runs AT GetFlightInfo (ad-hoc and prepared), its result kept on the reservation for the DoGet; a
+DBAPI `execute` never fetched (ADBC cancels the DoGet) used to lose the write silently. A prepared
+one is announced with an empty dataset schema (JDBC then takes DoPut); Flight SQL's `is_update` when
+the Arrow pin carries it. Rows still stream lazily at DoGet.
 **Spec 070 — the Flight door streams**: `DoGet` submits the statement (`PreparedStatement::Submit`,
 a handle; a `ResultEagerness::FORCED` statement - a count - runs to completion instead) and hands
 gRPC a `RecordBatchStream` over `AclResultReader`, which pulls ONE duckdb chunk per Arrow batch
