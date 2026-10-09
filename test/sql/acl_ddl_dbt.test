@@ -1,0 +1,326 @@
+# name: test/sql/acl_ddl_dbt.test
+# description: dbt's own statements under the ACL (spec 113) - names `[<vcat>.]<schema path>.<object>`
+#   in DDL, CREATE SCHEMA IF NOT EXISTS on a held schema, and RENAME inside a granted home, so a stock
+#   dbt materialization (create tmp, rename old away, rename tmp in, drop old) runs unchanged
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.home;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE SCHEMA phys.other;
+
+statement ok
+CREATE TABLE phys.main.orders AS SELECT 1 AS id, 10 AS amount;
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG mart;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders;
+
+# a live alias (dbt's home), an expansion, and a schema of the second catalog
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.dbt_home AS phys.home;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.vs FROM phys.lake;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA mart.out AS phys.other;
+
+statement ok
+ACL ADMIN CREATE ROLE dbt;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE dbt WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG mart TO ROLE dbt WITH (select);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.dbt_home TO ROLE dbt WITH (select, insert, create, drop);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.vs TO ROLE dbt WITH (select, insert, create, drop);
+
+statement ok
+ACL ADMIN GRANT SCHEMA mart.out TO ROLE dbt WITH (select, insert, create, drop);
+
+# --- CREATE SCHEMA: a held schema exists already ---------------------------------------------------------
+
+statement ok
+ACL ROLE "dbt" CREATE SCHEMA IF NOT EXISTS "sales"."dbt_home";
+
+statement ok
+ACL ROLE "dbt" CREATE SCHEMA IF NOT EXISTS dbt_home;
+
+statement error
+ACL ROLE "dbt" CREATE SCHEMA dbt_home;
+----
+schema "dbt_home" already exists
+
+statement error
+ACL ROLE "dbt" CREATE SCHEMA IF NOT EXISTS somewhere_new;
+----
+a schema is the operator's to declare
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE schema_name IN ('dbt_home', 'somewhere_new');
+----
+0
+
+# --- names: the catalog in front, in the MAIN catalog and in another catalog of the role ------------------
+
+statement ok
+ACL ROLE "dbt" CREATE TABLE "sales"."dbt_home"."m" AS (SELECT id, amount FROM orders);
+
+statement ok
+ACL ROLE "dbt" CREATE TABLE "mart"."out"."m" AS (SELECT id FROM sales.orders);
+
+query TT
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'phys' AND table_name = 'm' ORDER BY 1;
+----
+home	m
+other	m
+
+statement ok
+ACL ROLE "dbt" CREATE OR REPLACE TABLE sales.dbt_home.m AS SELECT id, amount * 2 AS amount FROM orders;
+
+query II
+ACL ROLE "dbt" SELECT id, amount FROM sales.dbt_home.m;
+----
+1	20
+
+# a catalog the role holds no grant on is no catalog to it
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG secret;
+
+statement error
+ACL ROLE "dbt" CREATE TABLE secret.dbt_home.x AS SELECT 1 AS i;
+----
+no schema of the catalog allows creating
+
+# --- DROP: three-part, IF EXISTS, CASCADE never reaches past the object ----------------------------------
+
+statement ok
+ACL ROLE "dbt" DROP TABLE IF EXISTS "mart"."out"."m" CASCADE;
+
+statement ok
+ACL ROLE "dbt" DROP TABLE IF EXISTS "mart"."out"."m" CASCADE;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'phys' AND schema_name = 'other';
+----
+0
+
+# --- RENAME: dbt's table swap, in the live alias ---------------------------------------------------------
+
+statement ok
+ACL ROLE "dbt" CREATE TABLE "sales"."dbt_home"."m__dbt_tmp" AS (SELECT id, amount * 3 AS amount FROM orders);
+
+statement ok
+ACL ROLE "dbt" ALTER TABLE "sales"."dbt_home"."m" RENAME TO "m__dbt_backup";
+
+statement ok
+ACL ROLE "dbt" ALTER TABLE "sales"."dbt_home"."m__dbt_tmp" RENAME TO "m";
+
+statement ok
+ACL ROLE "dbt" DROP TABLE IF EXISTS "sales"."dbt_home"."m__dbt_backup" CASCADE;
+
+query II
+ACL ROLE "dbt" SELECT id, amount FROM sales.dbt_home.m;
+----
+1	30
+
+query T
+SELECT string_agg(table_name, ',' ORDER BY table_name) FROM duckdb_tables() WHERE database_name = 'phys' AND schema_name = 'home';
+----
+m
+
+# ... in an expansion the record follows the object
+statement ok
+ACL ROLE "dbt" CREATE TABLE vs.e AS SELECT id FROM orders;
+
+statement ok
+ACL ROLE "dbt" ALTER TABLE vs.e RENAME TO e2;
+
+query TT
+SELECT vname, phys FROM aclcat.acl.relations WHERE vcat = 'sales' AND vname LIKE 'vs.e%';
+----
+vs.e2	phys.lake.e2
+
+query I
+ACL ROLE "dbt" SELECT count(*) FROM vs.e2;
+----
+1
+
+# ... and a view (a record, nothing physical)
+statement ok
+ACL ROLE "dbt" CREATE VIEW dbt_home.v__dbt_tmp AS SELECT id FROM orders;
+
+statement ok
+ACL ROLE "dbt" ALTER VIEW dbt_home.v__dbt_tmp RENAME TO v;
+
+query I
+ACL ROLE "dbt" SELECT count(*) FROM dbt_home.v;
+----
+1
+
+statement error
+ACL ROLE "dbt" ALTER TABLE dbt_home.v RENAME TO v3;
+----
+is a view - ALTER VIEW renames it
+
+# --- RENAME refusals --------------------------------------------------------------------------------------
+
+# the new name is taken
+statement ok
+ACL ROLE "dbt" CREATE TABLE dbt_home.n AS SELECT 1 AS i;
+
+statement error
+ACL ROLE "dbt" ALTER TABLE dbt_home.n RENAME TO m;
+----
+already exists
+
+# ... and the swap works inside a client's transaction, as dbt runs it
+statement ok
+BEGIN;
+
+statement ok
+ACL ROLE "dbt" CREATE TABLE dbt_home.m__dbt_tmp AS SELECT id, amount * 4 AS amount FROM orders;
+
+statement ok
+ACL ROLE "dbt" ALTER TABLE dbt_home.m RENAME TO m__dbt_backup;
+
+statement ok
+ACL ROLE "dbt" ALTER TABLE dbt_home.m__dbt_tmp RENAME TO m;
+
+statement ok
+ACL ROLE "dbt" DROP TABLE dbt_home.m__dbt_backup;
+
+statement ok
+COMMIT;
+
+query II
+ACL ROLE "dbt" SELECT id, amount FROM dbt_home.m;
+----
+1	40
+
+# a schema without drop
+statement ok
+ACL ADMIN CREATE ROLE builder;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE builder WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.dbt_home TO ROLE builder WITH (select, create);
+
+statement error
+ACL ROLE "builder" ALTER TABLE dbt_home.n RENAME TO n2;
+----
+drop on schema "dbt_home" is not allowed
+
+# an object the operator declared, with its own grant, keeps its name
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.dbt_home.declared AS phys.home.n;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.dbt_home.declared TO ROLE dbt WITH (select);
+
+statement error
+ACL ROLE "dbt" ALTER TABLE dbt_home.declared RENAME TO declared2;
+----
+carries the operator's declarations
+
+# a relation outside every granted home
+statement error
+ACL ROLE "dbt" ALTER TABLE orders RENAME TO orders2;
+----
+no schema of the catalog allows renaming
+
+# every other ALTER stays refused
+statement error
+ACL ROLE "dbt" ALTER TABLE dbt_home.m ADD COLUMN x INTEGER;
+----
+only RENAME TO inside a granted schema
+
+# --- ambiguity: a first part that is a catalog of the role and a schema of its MAIN catalog -----------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.mart AS phys.lake;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.mart TO ROLE dbt WITH (select, create, drop);
+
+statement error
+ACL ROLE "dbt" CREATE TABLE mart.out.z AS SELECT 1 AS i;
+----
+is ambiguous
+
+# a schema names itself whole: `mart.out` would be a nested schema of sales.mart only if one were
+# declared, so it is mart's `out` - held, and a no-op
+statement ok
+ACL ROLE "dbt" CREATE SCHEMA IF NOT EXISTS mart.out;
+
+# ... while a declared nested `sales.mart.out` makes it ambiguous
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.mart.out AS phys.lake;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.mart.out TO ROLE dbt WITH (select);
+
+statement error
+ACL ROLE "dbt" CREATE SCHEMA IF NOT EXISTS mart.out;
+----
+is ambiguous
+
+# --- nested schemas: the home is the longest granted prefix ----------------------------------------------
+
+statement ok
+CREATE SCHEMA phys.deep;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.other;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw.inner AS phys.deep;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE dbt WITH (select, create, drop);
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw.inner TO ROLE dbt WITH (select, create, drop);
+
+statement ok
+ACL ROLE "dbt" CREATE TABLE sales.raw.inner.t AS SELECT 1 AS i;
+
+statement ok
+ACL ROLE "dbt" CREATE TABLE raw.t AS SELECT 2 AS i;
+
+query TT
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'phys' AND table_name = 't' ORDER BY 1;
+----
+deep	t
+other	t

@@ -1297,6 +1297,56 @@ void PolicyStore::CatalogRegisterCreated(const string &vcat, const string &vname
 	});
 }
 
+bool PolicyStore::CatalogRelationDeclared(const string &vcat, const string &vname) {
+	if (!catalog) {
+		return false;
+	}
+	auto is = [&](const char *table, const string &extra) {
+		return catalog
+		           ->Query("SELECT 1 FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat) + " AND " + extra +
+		                   " LIMIT 1")
+		           ->RowCount() > 0;
+	};
+	auto named = "\"vname\" = " + Lit(vname);
+	return is("relations", named + " AND coalesce(\"rls\", '') <> ''") || is("relation_columns", named) ||
+	       is("keys", named) || is("role_object_caps", named) || is("grant_columns", named) ||
+	       is("references", "(\"from_vname\" = " + Lit(vname) + " OR \"to_vname\" = " + Lit(vname) + ")");
+}
+
+void PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname, const string &new_vname,
+                                        const string &new_phys) {
+	RequireCatalog(catalog, "acl_rename_relation");
+	RequireNotReserved(new_vname);
+	bool had_record = false;
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		auto where = [&](const string &name) {
+			return " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(name);
+		};
+		had_record = read("SELECT 1 FROM " + catalog->Tbl("relations") + where(vname))->RowCount() > 0;
+		if (!had_record) {
+			return; // a live alias's object: nothing recorded, the physical rename is the whole of it
+		}
+		statements.push_back("UPDATE " + catalog->Tbl("relations") + " SET \"vname\" = " + Lit(new_vname) +
+		                     (new_phys.empty() ? string() : ", \"phys\" = " + Lit(new_phys)) + where(vname));
+		for (auto table : {"relation_types", "object_columns"}) {
+			statements.push_back("UPDATE " + string(catalog->Tbl(table)) + " SET \"vname\" = " + Lit(new_vname) +
+			                     where(vname));
+		}
+		// the new name is current; the old one is gone on purpose and must not come back by REFRESH
+		auto dot = new_vname.rfind('.');
+		if (dot != string::npos) {
+			statements.push_back("DELETE FROM " + catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " + Lit(vcat) +
+			                     " AND \"path\" = " + Lit(new_vname.substr(0, dot)) +
+			                     " AND \"name\" = " + Lit(new_vname.substr(dot + 1)));
+		}
+	});
+	if (had_record) {
+		// lineage (spec 107/113): the old name ends, the new one begins - the backend follows a swap
+		NoteDefinitionLineage(vcat, vname, "DROP");
+		NoteDefinitionLineage(vcat, new_vname, "CREATE");
+	}
+}
+
 void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, const string &path,
                                      const string &caps_json, const string &comment, const string &into,
                                      bool virtual_only) {

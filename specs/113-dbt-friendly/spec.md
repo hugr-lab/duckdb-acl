@@ -1,6 +1,6 @@
 # Spec 113: dbt's own statements under the ACL
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-10-09
 - **Follows**: specs 016 / 051 (create and drop in a granted schema), 112 (the lineage spikes)
 - **Found by**: the dbt spike of 2026-10-09 (dbt-duckdb, the node attached through quack under the
@@ -119,3 +119,29 @@ dbt does not need it (it qualifies every name), which is why it is not part of t
 - Spark's `truncate` (JDBC `TRUNCATE TABLE`, needs a JDBC dialect in acl-clients) - a client recipe.
 - dbt snapshots (MERGE-based) and `incremental` strategies beyond append / delete+insert / merge are
   checked in the spike, not designed here.
+
+## As built
+
+- **Names.** `CatalogBackend::DdlTarget` reads `[<vcat>.]<path>.<object>`: rows of both readings are
+  fetched, a name both fit is refused (`… is ambiguous - catalog … or schema …`), the longest granted
+  prefix of the chosen reading is the home, and `DdlTarget::vname` is the object's name inside its
+  catalog - what records, conflicts and drops use (the written name only names the audit object).
+  `HeldSchema` is the same rule for `CREATE SCHEMA` (a schema names itself whole: exact path).
+- **CASCADE** is taken off the physical DROP (`info.cascade = false`): duckdb's own CASCADE takes no
+  other entry (a view over the table stays, a referencing FK refuses), but a home in another engine
+  would drop its dependents there.
+- **No-op batches.** A batch whose every statement became a no-op (`CREATE SCHEMA IF NOT EXISTS`, a
+  taken `CREATE … IF NOT EXISTS`) used to reach the client as no statement at all - the quack client
+  fails "Query did not return any columns". It is now one empty `SELECT`.
+- **RENAME.** `RewriteAlterStatement`: RENAME TABLE / RENAME VIEW only; the old name's `drop` home and
+  the new name's `create` home must be the same schema row; a view record renames its record
+  (`acl_rename_relation`, nothing physical); a table renames physically, then its record if it has
+  one. "Taken" is a catalog record only: dbt swaps inside its own transaction, which a look from the
+  store's connection does not see - the physical clash is the native ALTER's own error, judged in the
+  client's transaction. `CatalogRelationDeclared`: a predicate, relation columns, keys, references,
+  an object grant or grant columns on the name.
+- **Spike (2026-10-09, dbt-duckdb through quack, no macros but `generate_schema_name`):** `table` and
+  `view` materializations created and swapped on every run; `incremental` with `append` works; with a
+  `unique_key` (delete+insert) the quack client fails with `PlanDelete not implemented` before the
+  node sees anything - a client limitation, documented.
+- **Lineage test for the rename pair** lands with the rebase onto spec 112 (its names).

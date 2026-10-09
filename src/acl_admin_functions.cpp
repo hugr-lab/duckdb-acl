@@ -349,6 +349,18 @@ void AclRegisterViewFunc(DataChunk &args, ExpressionState &state, Vector &result
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! acl_rename_relation(vcat, vname, new_vname[, new_phys]): the write a principal's own RENAME performs
+//! (spec 113), composed by the rewriter after its checks - unreachable from a principal's query
+void AclRenameRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto vcat = RequiredArg(args, 0, row, "acl_rename_relation", "catalog");
+		auto vname = RequiredArg(args, 1, row, "acl_rename_relation", "name");
+		auto new_vname = RequiredArg(args, 2, row, "acl_rename_relation", "new name");
+		StoreOf(state).CatalogRenameRelation(vcat, vname, new_vname, OptionalArg(args, 3, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
 //! acl_register_existing(vcat, vname, phys, origin): the VIRTUAL ONLY form of the above - it records
 //! an object that must already exist physically, and refuses if it does not (spec 016)
 void AclRegisterExistingFunc(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -1934,6 +1946,7 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_grant_schema", {{v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v, b}}, AclGrantSchemaFunc);
 	register_admin_set("acl_register_created", {{v, v, v}, {v, v, v, v}}, AclRegisterCreatedFunc);
 	register_admin_set("acl_register_existing", {{v, v, v}, {v, v, v, v}}, AclRegisterExistingFunc);
+	register_admin_set("acl_rename_relation", {{v, v, v}, {v, v, v, v}}, AclRenameRelationFunc);
 	register_admin("acl_register_view", {v, v, v}, AclRegisterViewFunc);
 	register_admin("acl_revoke_schema", {v, v, v}, AclRevokeSchemaFunc);
 	register_admin_set("acl_rematerialize_schema_caps", {{v}, {v, v}}, AclRematerializeSchemaCapsFunc);

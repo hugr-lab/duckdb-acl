@@ -175,6 +175,7 @@ struct TablePolicy {
 //! physical schema its grant creates in, and whether the catalog needs a record for what is made.
 struct DdlTarget {
 	string vcat;        // the virtual catalog
+	string vname;       // spec 113: the object's name inside it (`schema.name`), whatever the name written
 	string schema_path; // the virtual schema inside it
 	string phys_schema; // `db.schema` the object is created in / dropped from
 	bool needs_record;  // an expansion shows only its records, so a new object needs one
@@ -488,6 +489,13 @@ struct PolicyStore {
 	//! origin, nothing else to choose
 	void CatalogRegisterCreated(const string &vcat, const string &vname, const string &phys,
 	                            const string &origin = string());
+	//! spec 113: a principal's RENAME inside a granted schema - the record (if the object has one)
+	//! follows the object, in one transaction; `new_phys` empty for a view record (nothing physical)
+	void CatalogRenameRelation(const string &vcat, const string &vname, const string &new_vname,
+	                           const string &new_phys);
+	//! spec 113: the object carries the operator's own declarations - a predicate, a column list, keys,
+	//! references, or a grant on it by name: its name is what they are tied to, so no principal renames it
+	bool CatalogRelationDeclared(const string &vcat, const string &vname);
 	//! The SQL behind a metadata surface for this principal (spec 010 part 3): duckdb's own shape,
 	//! filtered to what the roles hold, with virtual names in place of physical ones. False when the
 	//! active source cannot enumerate (memory mode); the driver mode throws with the reason.
@@ -510,6 +518,9 @@ struct PolicyStore {
 	//! (`create` or `drop`) on the virtual schema that owns the name (spec 016). False = no such
 	//! schema for this principal; a schema without the capability throws.
 	bool ResolveDdlTarget(const Principal &principal, const string &vname, const string &capability, DdlTarget &out);
+	//! spec 113: the virtual schema `[<vcat>.]<path>` names, when the principal holds it (any capability) -
+	//! what `CREATE SCHEMA IF NOT EXISTS` asks. The naming rule and the ambiguity refusal of DdlTarget.
+	bool ResolveHeldSchema(const Principal &principal, const string &written, string &vcat, string &path);
 	//! Grant/revoke one schema to a role (spec 015): capabilities only, `manage` refused. Both
 	//! rematerialise the subtree, so the stored rows always show what a role effectively has.
 	void CatalogGrantSchema(const string &role, const string &vcat, const string &path, const string &caps_json,

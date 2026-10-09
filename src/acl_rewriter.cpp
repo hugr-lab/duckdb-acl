@@ -31,6 +31,7 @@
 #include "duckdb/parser/constraints/check_constraint.hpp"
 #include "duckdb/parser/expression/type_expression.hpp"
 #include "yyjson.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/parsed_data/create_secret_info.hpp"
 #include "duckdb/parser/parsed_data/extra_drop_info.hpp"
@@ -38,6 +39,7 @@
 #include "duckdb/parser/parsed_data/create_type_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/statement/alter_statement.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
@@ -216,6 +218,9 @@ public:
 			break;
 		case StatementType::DROP_STATEMENT:
 			RewriteDropStatement(stmt.Cast<DropStatement>());
+			break;
+		case StatementType::ALTER_STATEMENT:
+			RewriteAlterStatement(stmt.Cast<AlterStatement>());
 			break;
 		case StatementType::PRAGMA_STATEMENT:
 			RewritePragmaStatement(stmt.Cast<PragmaStatement>());
@@ -675,6 +680,10 @@ private:
 			RewriteCreateSecret(info.Cast<CreateSecretInfo>());
 			return;
 		}
+		if (info.type == CatalogType::SCHEMA_ENTRY) {
+			RewriteCreateSchema(info);
+			return;
+		}
 		if (info.type != CatalogType::TABLE_ENTRY) {
 			Deny(Reason::STATEMENT_TYPE, "only tables and views can be created through the ACL");
 		}
@@ -699,7 +708,7 @@ private:
 		// the record check guards the TABLE path too: a view record occupies the name with nothing
 		// physical behind it, so "the physical CREATE fails natively" is not enough (the review's
 		// finding - a plain CREATE TABLE clobbered a view record)
-		if (!AdmitRecordConflict(info, target.vcat, key)) {
+		if (!AdmitRecordConflict(info, target.vcat, target.vname)) {
 			drop_statement = true; // IF NOT EXISTS: the name is taken - a no-op, not an error
 			return;
 		}
@@ -709,17 +718,34 @@ private:
 			// the role registers what exists; it never materialises. The CREATE itself is dropped
 			// from the batch, so nothing physical happens.
 			drop_statement = true;
-			follow_ups.push_back(
-			    AclCall("acl_register_existing", {Value(target.vcat), Value(key), Value(phys), Value(target.origin)}));
+			follow_ups.push_back(AclCall("acl_register_existing",
+			                             {Value(target.vcat), Value(target.vname), Value(phys), Value(target.origin)}));
 			return;
 		}
 		info.SetQualifiedName(ParsePhysName(phys));
 		if (target.needs_record) {
 			// an expansion shows only its own records, so the new object needs one - written after
 			// the CREATE, so a failure leaves nothing behind
-			follow_ups.push_back(
-			    AclCall("acl_register_created", {Value(target.vcat), Value(key), Value(phys), Value(target.origin)}));
+			follow_ups.push_back(AclCall("acl_register_created",
+			                             {Value(target.vcat), Value(target.vname), Value(phys), Value(target.origin)}));
 		}
+	}
+
+	//! spec 113: a client (dbt) makes sure its schema exists before it writes. A virtual schema the
+	//! principal holds already does: IF NOT EXISTS is a no-op, without it duckdb's own answer. Creating
+	//! a schema stays the operator's - one the principal does not hold is refused as before.
+	void RewriteCreateSchema(CreateInfo &info) {
+		auto written = VirtualKey(info.GetQualifiedName());
+		string vcat, path;
+		if (written.empty() || !store.ResolveHeldSchema(principal, written, vcat, path)) {
+			Deny(Reason::STATEMENT_TYPE, "only tables and views can be created through the ACL - a schema is "
+			                             "the operator's to declare");
+		}
+		Note(vcat + "." + path, "schema");
+		if (info.on_conflict != OnCreateConflict::IGNORE_ON_CONFLICT) {
+			Deny(Reason::DDL_HOME, "schema \"" + written + "\" already exists");
+		}
+		drop_statement = true; // it exists: nothing to do
 	}
 
 	//===------------------------------------------------------------------===//
@@ -833,7 +859,7 @@ private:
 		// the same rules as a table's (spec 051): REPLACE priced as a drop on the schema that hosts
 		// the create, and an existing name never overwritten by omission
 		RequireReplaceDroppable(info, key, target);
-		if (!AdmitRecordConflict(info, target.vcat, key)) {
+		if (!AdmitRecordConflict(info, target.vcat, target.vname)) {
 			drop_statement = true; // IF NOT EXISTS: the name is taken - a no-op, not an error
 			return;
 		}
@@ -846,7 +872,7 @@ private:
 		keep_claim_markers = false;
 		auto body = info.query->ToString();
 		drop_statement = true;
-		follow_ups.push_back(AclCall("acl_register_view", {Value(target.vcat), Value(key), Value(body)}));
+		follow_ups.push_back(AclCall("acl_register_view", {Value(target.vcat), Value(target.vname), Value(body)}));
 	}
 
 	void RewriteDropStatement(DropStatement &stmt) {
@@ -875,7 +901,8 @@ private:
 		if (store.ResolveTable(principal, key, existing) && !existing.query.empty()) {
 			// a view has no physical object behind it: the record is the whole of it
 			drop_statement = true;
-			follow_ups.push_back(AclCall("acl_drop_relation", {Value(target.vcat), Value(key), Value("skip")}));
+			follow_ups.push_back(
+			    AclCall("acl_drop_relation", {Value(target.vcat), Value(target.vname), Value("skip")}));
 			return;
 		}
 		if (target.virtual_only) {
@@ -884,10 +911,83 @@ private:
 		}
 		auto name = info.GetQualifiedName().Name();
 		info.SetQualifiedName(ParsePhysName(target.phys_schema + "." + name.GetIdentifierName()));
+		// spec 113: the drop stays the one object the capability covers. duckdb's own CASCADE takes no
+		// other entry, but a home in another engine (postgres) would drop what depends on it there:
+		// the cascade is taken off, and an object with dependents refuses natively
+		info.cascade = false;
 		if (target.needs_record) {
 			// the record goes with the object it described; 'skip' because a name may have none
-			follow_ups.push_back(AclCall("acl_drop_relation", {Value(target.vcat), Value(key), Value("skip")}));
+			follow_ups.push_back(
+			    AclCall("acl_drop_relation", {Value(target.vcat), Value(target.vname), Value("skip")}));
 		}
+	}
+
+	//! spec 113: `ALTER TABLE|VIEW <name> RENAME TO <new>` inside a granted schema - how dbt swaps a
+	//! model in. A rename drops the old name and creates the new one, so it is priced at both on the one
+	//! schema that hosts it; every other ALTER stays refused.
+	void RewriteAlterStatement(AlterStatement &stmt) {
+		if (!stmt.info) {
+			Deny(Reason::STATEMENT_TYPE, "unsupported ALTER form");
+		}
+		auto &info = *stmt.info;
+		Identifier new_name;
+		bool view_form = false;
+		if (info.type == AlterType::ALTER_TABLE &&
+		    info.Cast<AlterTableInfo>().alter_table_type == AlterTableType::RENAME_TABLE) {
+			new_name = info.Cast<RenameTableInfo>().new_table_name;
+		} else if (info.type == AlterType::ALTER_VIEW &&
+		           info.Cast<AlterViewInfo>().alter_view_type == AlterViewType::RENAME_VIEW) {
+			new_name = info.Cast<RenameViewInfo>().new_view_name;
+			view_form = true;
+		} else {
+			Deny(Reason::STATEMENT_TYPE,
+			     "statement type ALTER is not permitted under ACL - only RENAME TO inside a granted schema");
+		}
+		auto key = VirtualKey(info.GetQualifiedName());
+		auto dot = key.rfind('.');
+		auto new_key = (dot == string::npos ? string() : key.substr(0, dot + 1)) + new_name.GetIdentifierName();
+		DdlTarget from, to;
+		if (!store.ResolveDdlTarget(principal, key, "drop", from)) {
+			Deny(Reason::DDL_HOME, "no schema of the catalog allows renaming \"" + key + "\"");
+		}
+		if (!store.ResolveDdlTarget(principal, new_key, "create", to) || to.vcat != from.vcat ||
+		    to.schema_path != from.schema_path) {
+			Deny(Reason::DDL_HOME, "RENAME drops \"" + key + "\" and creates \"" + new_key +
+			                           "\", so it needs create and drop on the schema that hosts both");
+		}
+		Note(key, "drop");
+		Note(new_key, "create");
+		if (from.virtual_only) {
+			Deny(Reason::DDL_HOME,
+			     "\"" + key + "\" is granted VIRTUAL ONLY, so its physical object is not this role's to rename");
+		}
+		// a live alias resolves any name under it, so "taken" is a record of the catalog; a physical
+		// object of that name makes the ALTER itself fail - judged inside the client's own transaction
+		// (dbt swaps in one), which a look from the store's connection would not see
+		auto new_phys = from.phys_schema + "." + new_name.GetIdentifierName();
+		if (store.CatalogObjectExists(to.vcat, to.vname, "relation")) {
+			Deny(Reason::DDL_HOME, "\"" + new_key + "\" already exists");
+		}
+		if (store.CatalogRelationDeclared(from.vcat, from.vname)) {
+			Deny(Reason::DDL_HOME, "\"" + key +
+			                           "\" carries the operator's declarations (a predicate, columns, keys, references "
+			                           "or grants by name), which are tied to its name - it is not renamed");
+		}
+		TablePolicy existing;
+		if (store.ResolveTable(principal, key, existing) && !existing.query.empty()) {
+			// a view record: nothing physical, the record is the whole of it
+			if (!view_form) {
+				Deny(Reason::DDL_HOME, "\"" + key + "\" is a view - ALTER VIEW renames it");
+			}
+			drop_statement = true;
+			follow_ups.push_back(
+			    AclCall("acl_rename_relation", {Value(from.vcat), Value(from.vname), Value(to.vname)}));
+			return;
+		}
+		auto name = info.GetQualifiedName().Name();
+		info.SetQualifiedName(ParsePhysName(from.phys_schema + "." + name.GetIdentifierName()));
+		follow_ups.push_back(
+		    AclCall("acl_rename_relation", {Value(from.vcat), Value(from.vname), Value(to.vname), Value(new_phys)}));
 	}
 
 	//===------------------------------------------------------------------===//
@@ -3437,6 +3537,14 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 		for (auto &follow_up : rewriter.follow_ups) {
 			rewritten.push_back(std::move(follow_up));
 		}
+	}
+	if (rewritten.empty() && !statements.empty()) {
+		// spec 113: every statement was a no-op (CREATE SCHEMA IF NOT EXISTS on a held schema, CREATE …
+		// IF NOT EXISTS on a taken name). A client still gets an answer - a door's protocol (quack) refuses
+		// a statement list with nothing to answer - one empty result, executed like any read
+		Parser parser(ParserOptions::Builtin());
+		parser.ParseQuery("SELECT true AS \"Success\" WHERE false");
+		rewritten.push_back(std::move(parser.statements[0]));
 	}
 	statements = std::move(rewritten);
 }

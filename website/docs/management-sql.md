@@ -503,6 +503,25 @@ ACL ADMIN GRANT SCHEMA sales.vs TO ROLE curator WITH (select, create) VIRTUAL ON
 ACL ADMIN REVOKE SCHEMA sales.raw.eu FROM ROLE analyst;
 ```
 
+**What a principal's DDL may say** (spec 113 - so a stock dbt project runs unchanged):
+
+- **Names** are `[<vcat>.]<schema path>.<object>`. The first part is a catalog when it names one the
+  principal holds a grant on (any of them, not only the MAIN one - with several catalogs the
+  three-part name picks one); otherwise the name is a path in the MAIN catalog. Schemas nest: the
+  object's home is the longest granted schema prefix. A first part that is both a catalog of the
+  principal and a schema of its MAIN catalog is refused as ambiguous.
+- **`CREATE [OR REPLACE] TABLE|VIEW`** and **`DROP TABLE|VIEW [IF EXISTS]`** in the home; `CASCADE`
+  is taken off, so a drop never reaches past the one object (an object with dependents refuses).
+- **`CREATE SCHEMA IF NOT EXISTS`** on a schema the principal holds is a no-op; without `IF NOT
+  EXISTS` it is "already exists"; a schema it does not hold is refused - schemas are the operator's.
+- **`ALTER TABLE|VIEW … RENAME TO`** in the same home, priced at `create` + `drop` on it: the new name
+  must not be a record of the catalog, an object carrying the operator's declarations (a predicate,
+  columns, keys, references, a grant by name) keeps its name, an expansion's record follows the
+  object, and a rename is a lineage `DROP` + `CREATE`. Every other `ALTER` is refused.
+- dbt through quack: the `table`, `view` and `incremental` (`append`) materializations run as they
+  are. `delete+insert` / `merge` incremental strategies fail in the quack client itself (`DELETE`
+  through an attached quack catalog is not planned there), before the node sees them.
+
 Functions: `acl_grant_schema(role, vcat, path, caps_json[, comment[, into, virtual_only]])`,
 `acl_revoke_schema(role, vcat, path)`, and the repair call
 `acl_rematerialize_schema_caps(vcat[, path])`, which rebuilds a subtree's inherited rows from the

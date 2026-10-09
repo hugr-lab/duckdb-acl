@@ -487,6 +487,7 @@ struct CatalogBackend {
 	//! virtual schema prefix of the name that the principal's roles hold, with the grant that states
 	//! the capability - so a schema nobody granted, or granted without it, simply does not answer.
 	bool DdlTarget(const Principal &principal, const string &vname, const string &capability, acl::DdlTarget &out);
+	bool HeldSchema(const Principal &principal, const string &written, string &vcat, string &path);
 
 	//! The SQL behind a metadata surface (spec 010 part 3): the principal's own catalog, in the shape
 	//! duckdb's own metadata has. The shape is not rebuilt by hand - the physical row is joined and its
