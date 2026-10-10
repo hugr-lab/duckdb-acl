@@ -7,6 +7,7 @@
 
 #include "acl_result_rows.hpp"
 #include "acl_maintenance.hpp"
+#include "acl_platform.hpp"
 
 #include "acl_door_common.hpp"
 #include "acl_policy_catalog.hpp"
@@ -153,6 +154,7 @@ public:
 		CheckGrants();
 		CheckSchemas();
 		CheckReferences();
+		CheckBodies();
 	}
 
 private:
@@ -439,6 +441,84 @@ private:
 			Add(kind, relation.vname, role, "rls_unchecked",
 			    "the predicate" + who + " was accepted unchecked when it was written (spec 027) and binds now",
 			    "ANALYZE VIRTUAL CATALOG " + NamePath::KeyToGrammar(vcat));
+		}
+	}
+
+	//! spec 117 review D1: a body stored before its author's function gate judged it - one that calls a
+	//! function of the never set (acl_*, query*, a scanner's *_query ...) runs as the node when read, and is
+	//! refused where it is written now. Judged by the never set (the author is not recorded).
+	void CheckBody(const string &kind, const string &object, const string &role, const string &what, const string &text,
+	               BodyShape shape) {
+		if (text.empty()) {
+			return;
+		}
+		vector<string> denied;
+		try {
+			WalkBodyCalls(text, shape, [&](const QualifiedName &name, FunctionKind) {
+				auto &path = name.Path();
+				auto database = path.size() >= 3 ? path[0].GetIdentifierName() : string();
+				if (FunctionNeverCallable(StringUtil::Lower(name.Name().GetIdentifierName()),
+				                          StringUtil::Lower(database))) {
+					denied.push_back(name.Name().GetIdentifierName());
+				}
+			});
+		} catch (std::exception &) {
+			return; // a body that does not parse is definition_broken's finding, where it applies
+		}
+		if (denied.empty()) {
+			return;
+		}
+		Add(kind, object, role, "body_function_denied",
+		    what + " calls " + StringUtil::Join(denied, ", ") +
+		        " - a function no principal may call, which a stored body runs as the node",
+		    "redefine it without the call (the write refuses it since spec 117), or drop it");
+	}
+
+	void CheckBodies() {
+		auto relations = Read("SELECT \"vname\", \"form\", \"view_sql\", \"rls\" FROM " + catalog.Tbl("relations") +
+		                      " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"vname\"");
+		ResultRows relation_rows(*relations);
+		for (idx_t row = 0; row < relation_rows.Count(); row++) {
+			auto vname = relation_rows.GetValue(0, row).ToString();
+			auto is_view = Text(relation_rows.GetValue(1, row)) == "view";
+			CheckBody(is_view ? "view" : "table", vname, "", "the view's SQL", Text(relation_rows.GetValue(2, row)),
+			          BodyShape::SELECT);
+			CheckBody(is_view ? "view" : "table", vname, "", "the RLS", Text(relation_rows.GetValue(3, row)),
+			          BodyShape::EXPRESSION);
+		}
+		auto columns = Read("SELECT \"vname\", \"expr\" FROM " + catalog.Tbl("relation_columns") +
+		                    " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"vname\", \"pos\"");
+		ResultRows column_rows(*columns);
+		for (idx_t row = 0; row < column_rows.Count(); row++) {
+			CheckBody("table", column_rows.GetValue(0, row).ToString(), "", "a declared column",
+			          Text(column_rows.GetValue(1, row)), BodyShape::EXPRESSION);
+		}
+		auto functions = Read("SELECT \"vname\", \"kind\", \"form\", \"target\", \"template\" FROM " +
+		                      catalog.Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY \"vname\"");
+		ResultRows function_rows(*functions);
+		for (idx_t row = 0; row < function_rows.Count(); row++) {
+			auto vname = function_rows.GetValue(0, row).ToString();
+			auto kind = Text(function_rows.GetValue(1, row));
+			if (Text(function_rows.GetValue(2, row)) == "alias") {
+				CheckBody("function", vname, "", "the alias", Text(function_rows.GetValue(3, row)),
+				          BodyShape::FUNCTION_NAME);
+			} else {
+				CheckBody("function", vname, "", "the template", Text(function_rows.GetValue(4, row)),
+				          kind == "table" ? BodyShape::SELECT : BodyShape::EXPRESSION);
+			}
+		}
+		auto grants = Read("SELECT \"role\", '' AS vname, \"rls\", \"columns\" FROM " + catalog.Tbl("role_catalogs") +
+		                   " WHERE \"vcat\" = " + Lit(vcat) +
+		                   " UNION ALL SELECT \"role\", \"vname\", \"rls\", \"columns\" FROM " +
+		                   catalog.Tbl("role_object_caps") + " WHERE \"vcat\" = " + Lit(vcat) + " ORDER BY 1, 2");
+		ResultRows grant_rows(*grants);
+		for (idx_t row = 0; row < grant_rows.Count(); row++) {
+			auto role = grant_rows.GetValue(0, row).ToString();
+			auto object = grant_rows.GetValue(1, row).ToString();
+			CheckBody("grant", object, role, "the grant's RLS", Text(grant_rows.GetValue(2, row)),
+			          BodyShape::EXPRESSION);
+			CheckBody("grant", object, role, "the grant's column list", Text(grant_rows.GetValue(3, row)),
+			          BodyShape::COLUMNS);
 		}
 	}
 

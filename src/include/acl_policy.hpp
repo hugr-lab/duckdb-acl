@@ -27,6 +27,7 @@
 #include <chrono>
 #include <functional>
 #include <list>
+#include <map>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -203,9 +204,14 @@ struct IntrospectionRows {
 #ifdef PASSTHROUGH
 #undef PASSTHROUGH
 #endif
-//! Ordered: a stronger scope implies what a weaker one may do. OBSERVE (spec 097) reads the node's load
-//! report and metrics and administers nothing - "may administer" is `>= MANAGE`, never `!= NONE`.
-enum class AdminScope : uint8_t { NONE, OBSERVE, MANAGE, PASSTHROUGH };
+//! The built-in administration bundles (spec 117) - fixed sets of the `platform` catalog's objects,
+//! held as a SET (a role holds several): there is no order between them, so no site may compare two
+//! (the linear `NONE < OBSERVE < MANAGE < PASSTHROUGH` of spec 097 is gone). OBSERVE reads the node
+//! views (and the load report / metrics, spec 097); POLICY reads the policy views and calls every policy
+//! function but the admin grants; PASSTHROUGH is everything - `ACL NATIVE`, grants on `platform` and the
+//! bundles. MANAGE is the name spec 009 wrote: a global row reads as POLICY + OBSERVE, a row scoped to
+//! a catalog as that catalog's administration.
+enum class AdminScope : uint8_t { OBSERVE, POLICY, MANAGE, PASSTHROUGH };
 
 //! Parse/print the scope names used by the admin functions, the grammar and the policy source
 AdminScope ParseAdminScope(const string &scope);
@@ -428,8 +434,17 @@ struct PolicyStore {
 	//! spec 095: the last resolved connection of each issuer / client that reads one from a secret,
 	//! as a fingerprint - a change made in the secrets service is a `connection_changed` policy event
 	case_insensitive_map_t<string> connection_fingerprints; // guarded by `lock`
-	// role -> global administration scope (spec 009); per-catalog manage lives in the catalog grant
-	case_insensitive_map_t<AdminScope> admin_scopes;
+	// role -> its global administration bundles (spec 009 / 117); per-catalog manage lives in the
+	// catalog grant
+	case_insensitive_map_t<std::set<string>> admin_scopes;
+	//! spec 117: point grants on the `platform` catalog's objects, memory mode (role, kind, object)
+	struct PlatformGrantRow {
+		string role;
+		string object;
+		string kind; // view | function
+		bool allowed = true;
+	};
+	vector<PlatformGrantRow> platform_grants;
 	// role -> default claims (used by the ROLE form, which carries no token)
 	case_insensitive_map_t<case_insensitive_map_t<string>> role_claims;
 	//! What a document location last yielded - an issuer's discovery document or its JWKS (specs 023,
@@ -698,13 +713,17 @@ struct PolicyStore {
 	void CatalogAlterRole(const string &role, const case_insensitive_map_t<string> &claims);
 	void CatalogAlterGrant(const string &role, const string &vcat, const string &field, const string &value);
 	void CatalogGrantAdmin(const string &role, const string &scope);
-	void CatalogRevokeAdmin(const string &role);
+	void CatalogRevokeAdmin(const string &role, const string &scope);
+	//! spec 117: platform_grants - one row (role, object, kind) upserted, or removed
+	void CatalogWritePlatformGrant(const string &role, const string &kind, const string &object, bool allowed,
+	                               bool remove);
 	//! role -> (scope, vcat) rows of the principal; missing roles simply do not appear
-	//! Both administration sources of the principal, version-cached: the catalogs whose grant carries
-	//! the "manage" capability, and the (scope, vcat) rows of acl.admins (a non-empty vcat restricts
-	//! a manage scope to that catalog; the driver may return several rows per role)
+	//! Every administration source of the principal, version-cached: the catalogs whose grant carries
+	//! the "manage" capability, the (scope, vcat) rows of acl.admins (a non-empty vcat restricts
+	//! a manage scope to that catalog; the driver may return several rows per role) and (spec 117) the
+	//! point grants on `platform` as (kind:object, allowed)
 	void CatalogAdminRights(const Principal &principal, std::set<string> &catalogs,
-	                        vector<std::pair<string, string>> &scopes);
+	                        vector<std::pair<string, string>> &scopes, vector<std::pair<string, bool>> &platform);
 	bool CatalogAnonymousAdminAllowed();
 	//! spec 095: one identity write - `apply` changes (and validates) the model read inside the write's
 	//! transaction, and the difference is written as rows
@@ -953,6 +972,8 @@ struct PolicyStore {
 	//! spec 114: a session's `USE`, by its ops id (Principal::session - never the handle)
 	bool SessionUse(const string &id, const string &vcat, const string &schema);
 	void SessionUseOf(const string &id, string &vcat, string &schema);
+	//! spec 117: the door a session was opened by, by its ops id ('' = none / unknown)
+	string SessionDoorOf(const string &id);
 	//! spec 114: the virtual catalogs the principal holds a grant on, and its MAIN one ('' when not
 	//! unique); empty in memory mode
 	vector<string> PrincipalCatalogs(const Principal &principal);
@@ -1002,27 +1023,58 @@ struct PolicyStore {
 	bool SetDraining(bool value);
 	bool Draining() const;
 
-	//! Grant/revoke a GLOBAL ACL-administration scope for a role (spec 009). Managing one catalog is
-	//! not granted here - it is a capability of the catalog grant itself ({"manage": true}).
+	//! Grant/revoke a GLOBAL ACL-administration bundle for a role (spec 009 / 117). Managing one catalog
+	//! is not granted here - it is a capability of the catalog grant itself ({"manage": true}). A role
+	//! holds several bundles; RevokeAdmin with no scope takes every one of them, the per-catalog manage
+	//! capabilities and the point grants on `platform` - de-privileging a role takes all of it.
 	void GrantAdmin(const string &role, AdminScope scope);
-	void RevokeAdmin(const string &role);
-	//! What a principal may do with the ACL. `unrestricted_manage` is a separate flag rather than a
-	//! sentinel inside `catalogs`: an empty/odd catalog name must never widen a grant (spec 009).
+	void RevokeAdmin(const string &role, const string &scope = string());
+	//! spec 117: a point grant on one object of the `platform` catalog (kind view | function), or a
+	//! deny (allowed = false), and its revoke. Only a passthrough scope writes them (the authorizer).
+	void GrantPlatform(const string &role, const string &kind, const string &object, bool allowed);
+	void RevokePlatform(const string &role, const string &kind, const string &object);
+	//! What a principal may do with the ACL - a SET of bundles, never an order (spec 117).
+	//! `unrestricted_manage` is a separate flag rather than a sentinel inside `catalogs`: an empty/odd
+	//! catalog name must never widen a grant (spec 009).
 	struct AdminRights {
-		AdminScope scope = AdminScope::NONE;
+		//! the break-glass: everything, `ACL NATIVE`, grants on `platform` and the bundles
+		bool passthrough = false;
+		//! the `policy` bundle - spec 009's unrestricted `manage`: the policy views and functions
 		bool unrestricted_manage = false;
-		//! spec 097: may read the load report and the metrics - an `observe` grant, or implied by
-		//! passthrough and by an unrestricted manage (a catalog-scoped manage is not the node's)
+		//! spec 097: may read the load report and the metrics, and (spec 117) the node views - the
+		//! `observe` bundle, or implied by passthrough and by a global `manage` row (a catalog-scoped
+		//! manage and the `policy` bundle are not the node's)
 		bool observe = false;
-		//! spec 097: an `admins` row whose scope this build does not know. It grants nothing here, but
-		//! the role stays privileged (spec 095) - a later scope must not open its role to IdP group names
+		//! spec 097: an `admins` row whose scope this build does not know, or one that grants nothing
+		//! here (an observe row scoped to a catalog). It grants nothing, but the role stays privileged
+		//! (spec 095) - a later scope must not open its role to IdP group names
 		bool unknown_scope = false;
 		//! catalogs this principal may manage, compared case-insensitively (spec 116): the policy holds one
 		//! spelling per catalog name and a write lands on it
 		std::set<string> catalogs;
+		//! spec 117: the point grants on `platform` - `<kind>:<object>` (lowercase) -> allowed; a deny
+		//! (false) anywhere among the roles wins
+		std::map<string, bool> platform;
+
+		//! the policy bundle or the break-glass
+		bool Policy() const {
+			return passthrough || unrestricted_manage;
+		}
+		//! a point grant: 1 granted, 0 denied, -1 none
+		int PlatformGrant(const string &kind, const string &object) const;
+		//! may run a management statement at all (spec 097's "may administer"): a bundle that writes, a
+		//! catalog's manage, or a point grant on a platform function - never observe alone
+		bool MayAdminister() const;
+		//! spec 095 / 117: a role holding any of it is reached only through a client's own mapping
+		bool Privileged() const;
+		//! the bundles held, by name, for console_info
+		vector<string> Bundles() const;
 	};
 	//! The principal's effective rights: the strongest over its roles and its catalog grants
 	AdminRights AdminRightsOf(const Principal &principal);
+	//! spec 095 / 117: the role holds any administration (a bundle, a catalog's manage, a point grant on
+	//! platform) - reached only through a client's own mapping, mapped only by passthrough
+	bool RolePrivileged(const string &role);
 	//! Whether an anonymous `ACL ADMIN` (no principal) is still permitted: always in the in-memory
 	//! dev mode, and with a policy source only when acl_allow_anonymous_admin is on (spec 009).
 	bool AnonymousAdminAllowed();
@@ -1095,9 +1147,8 @@ private:
 	bool ReadDocumentText(const string &uri, string &out, string &error);
 	//! A `connection_changed` policy event when an object's resolved connection differs from the last
 	void NoteConnection(const string &kind, const string &name, const string &connection);
-	//! Whether a role exists (UNMAPPED AS ROLE) / holds an administration scope (spec 009)
+	//! Whether a role exists (UNMAPPED AS ROLE); RolePrivileged above says whether it administers
 	bool RoleKnown(const string &role);
-	bool RolePrivileged(const string &role);
 	//! acl_jwt_clock_skew setting (seconds); the memory mode uses the 60s default (no db handle)
 	int64_t JwtClockSkew();
 	int64_t JwksRefreshInterval();

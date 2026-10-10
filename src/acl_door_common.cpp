@@ -1,4 +1,5 @@
 #include "acl_door_common.hpp"
+#include "acl_platform.hpp"
 #include "acl_name_path.hpp"
 
 #include "duckdb/common/string_util.hpp"
@@ -47,6 +48,12 @@ string CatalogKey(const string &text, const char *fn, const char *what) {
 		throw InvalidInputException("%s: a %s is one identifier - write \"%s\" in double quotes for a name with a "
 		                            "dot in it",
 		                            fn, what, text);
+	}
+	if (IsPlatformCatalog(key)) {
+		// spec 117: the system catalog of administration is synthesized - no call names it as a catalog
+		throw InvalidInputException("%s: \"%s\" is the reserved system catalog of administration, not a virtual "
+		                            "catalog",
+		                            fn, text);
 	}
 	return key;
 }

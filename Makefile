@@ -223,6 +223,7 @@ test-flight:
 	test/e2e/flight/auth.sh
 	test/e2e/flight/drain.sh
 	test/e2e/flight/stream.sh
+	test/e2e/flight/admin.sh
 
 # --- libFuzzer over the OIDC core's parsers (release plan 3.6) -----------------------------------
 # The bytes an IdP or a door answers are the node's pre-authentication network input. The module

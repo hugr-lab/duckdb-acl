@@ -238,6 +238,23 @@ door's metadata, all of it answered for the connected principal:
   function's result columns are the ones the call returns to the role (a grant's hidden column is
   not listed).
 
+### Administering through the door (spec 117)
+
+An administrator connects like any client and manages the node without `ACL NATIVE`. The
+[platform catalog](platform-catalog.md) answers the catalog RPCs like any other catalog: GetCatalogs
+lists `platform` to a principal holding a bundle, a catalog's `manage` or a point grant on it,
+GetDbSchemas its schema `main`, GetTables its views (with `include_schema`, their typed columns) - and
+only the objects that principal holds; a principal without administration sees no `platform` at all.
+Its views are read with plain `SELECT` (`SELECT * FROM platform.sessions`), its operations are called at
+the top level (`SELECT platform.grant_catalog('analyst', 'sales', caps := ['select'])`), and the
+management grammar is written without the `ACL` marker (`GRANT CATALOG sales TO ROLE analyst WITH
+(select)`), ad-hoc or prepared; a prepared call may bind its payload arguments (`comment := ?`), never
+the ones that carry authorization. A management statement or call is a change, not a query: like a
+DML without `RETURNING` (spec 111) it runs at GetFlightInfo, its answer kept for the DoGet, so a client
+that executes and never fetches (a DBAPI `execute`, ADBC) keeps the change. In
+DBeaver or DataGrip over the JDBC driver `platform` is one more catalog in the tree, its views under
+*Views* and its functions under *Functions*.
+
 ## The quack door
 
 ```sql
@@ -253,6 +270,11 @@ address itself, terminates TLS, and speaks the quack protocol with no proxy in b
 shapes: `(uri, token)`, `(uri, token, mode)`, `(uri, token, cert, key)`, `(uri, token, cert, key,
 mode)`; `mode` is `'embedded'` (default) or `'plain'`. The uri is quack's `quack:<host>:<port>`
 (`:0` picks a free port; the function returns the uri actually bound).
+
+The [platform catalog](platform-catalog.md) is **absent on this door** (spec 117): quack loads a
+catalog whole at `ATTACH`, so `platform` is neither listed nor readable over a quack session; an
+administrator here manages with the grammar (`GRANT …`, `CREATE ROLE …`, no `ACL` marker needed), and
+reads the policy and the node through the Flight door.
 
 - **The server token is required**, and it is quack's own shared token, not what admits a client -
   the client's JWT is. `acl_quack_serve: pass a server token explicitly. It is not what admits a

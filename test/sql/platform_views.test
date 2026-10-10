@@ -1,0 +1,433 @@
+# name: test/sql/platform_views.test
+# description: the platform catalog's views (spec 117) - each view's shape with typed columns (caps a
+#   STRUCT, lists VARCHAR[], a client's conditions and attributes LIST(STRUCT), a cluster spec a MAP),
+#   rows per scope (passthrough, policy, a catalog admin, observe, none - the catalog absent), never a
+#   secret; and the view comment (spec 117 §7) in duckdb_views / information_schema.tables, the stored
+#   catalog and schema comments in duckdb_databases / duckdb_schemas.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.staff(id INTEGER, name VARCHAR);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales COMMENT 'the sales mart';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG hr;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders COLUMNS (id, tenant) RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW sales.recent COMMENT 'the last orders' AS SELECT 1 AS id;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.raw AS phys.main COMMENT 'the raw source';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE hr.staff AS phys.main.staff;
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE cat;
+
+statement ok
+ACL ADMIN CREATE ROLE obs;
+
+statement ok
+ACL ADMIN CREATE ROLE reader CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN observe TO ROLE obs;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE cat CAPS '{"manage": true}';
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE reader MAIN WITH (select, insert) COLUMNS (id);
+
+statement ok
+ACL ADMIN GRANT CATALOG hr TO ROLE reader;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.orders TO ROLE reader WITH (select);
+
+statement ok
+ACL ADMIN CREATE ISSUER kc URL 'test/idp/two';
+
+statement ok
+ACL ADMIN CREATE CLIENT door ISSUER kc AUDIENCES ('api://acl-test', 'api://b') AZP ('acl-door') REQUIRE (tid IN ('a', 'b')) ROLES FROM ('roles') ATTRIBUTES (tenant = 'tenant', org = CONSTANT 'acme') CLIENT ID 'door-app' FLOWS (password);
+
+# a secret is named in the policy, never held: the view shows the name it is read by
+statement ok
+INSERT INTO store.acl.issuers VALUES ('vaulted', 'test/idp/b', 'tresor', 'corp_idp');
+
+# --- the shape: typed columns, no packed JSON or csv -------------------------------------------------
+
+query TTT
+ACL ROLE "root" SELECT column_name, data_type, ordinal_position FROM information_schema.columns WHERE table_catalog = 'platform' AND table_name = 'grants' ORDER BY ordinal_position;
+----
+role	VARCHAR	1
+catalog	VARCHAR	2
+is_main	BOOLEAN	3
+caps	STRUCT("select" BOOLEAN, "insert" BOOLEAN, "update" BOOLEAN, "delete" BOOLEAN, "merge" BOOLEAN, "create" BOOLEAN, "drop" BOOLEAN, "temp" BOOLEAN, "explain" BOOLEAN, secrets BOOLEAN, manage BOOLEAN)	4
+rls	VARCHAR	5
+rls_checked	BOOLEAN	6
+columns	VARCHAR[]	7
+
+# what the listing says is what the view answers: DESCRIBE reads the view itself
+query TT
+ACL ROLE "root" SELECT column_name, column_type FROM (DESCRIBE platform.grants);
+----
+role	VARCHAR
+catalog	VARCHAR
+is_main	BOOLEAN
+caps	STRUCT("select" BOOLEAN, "insert" BOOLEAN, "update" BOOLEAN, "delete" BOOLEAN, "merge" BOOLEAN, "create" BOOLEAN, "drop" BOOLEAN, "temp" BOOLEAN, "explain" BOOLEAN, secrets BOOLEAN, manage BOOLEAN)
+rls	VARCHAR
+rls_checked	BOOLEAN
+columns	VARCHAR[]
+
+# every listed column of every view is the column the view answers, type for type
+query I
+ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform';
+----
+232
+
+foreach view catalogs relations relation_columns schemas functions function_columns references reference_columns keys roles role_claims grants schema_grants object_grants grant_columns admins platform_grants issuers clients role_mappings jwks_cache function_categories function_category_members function_grants function_status resource_groups role_resource_groups cluster_items cluster_effective catalog_schema sessions node_load node_doors node_streams drain lineage_status
+
+query I
+ACL ROLE "root" SELECT (SELECT list(column_name || ' ' || data_type ORDER BY ordinal_position) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_name = '{view}') = (SELECT list(column_name || ' ' || column_type) FROM (DESCRIBE platform.{view}));
+----
+true
+
+endloop
+
+query TTTT
+ACL ROLE "root" SELECT role, catalog, caps."select", caps.insert FROM platform.grants WHERE role = 'reader' ORDER BY catalog;
+----
+reader	hr	NULL	NULL
+reader	sales	true	true
+
+query TT
+ACL ROLE "root" SELECT columns, caps.manage FROM platform.main.grants WHERE role IN ('reader', 'cat') AND catalog = 'sales' ORDER BY role;
+----
+[]	true
+[id]	false
+
+query TTT
+ACL ROLE "root" SELECT object, caps."select", caps.insert FROM platform.object_grants;
+----
+orders	true	false
+
+query TT
+ACL ROLE "root" SELECT name, columns FROM (SELECT r.name, list(c.name ORDER BY c.pos) AS columns FROM platform.relations r JOIN platform.relation_columns c ON c.catalog = r.catalog AND c.relation = r.name GROUP BY ALL) ORDER BY ALL;
+----
+orders	[id, tenant]
+
+query TTT
+ACL ROLE "root" SELECT catalog, path, comment FROM platform.schemas;
+----
+sales	raw	the raw source
+
+query TTTTTT
+ACL ROLE "root" SELECT name, audiences, azp, requires, attributes, flows FROM platform.clients WHERE name = 'door';
+----
+door	['api://acl-test', 'api://b']	[acl-door]	[{'path': tid, 'op': in, 'values': [a, b]}]	[{'name': tenant, 'paths': [tenant], 'constant': NULL}, {'name': org, 'paths': [], 'constant': acme}]	[password]
+
+query TTTT
+ACL ROLE "root" SELECT a.name, a.paths, a.constant, a.name IS NOT NULL FROM (SELECT unnest(attributes) AS a FROM platform.clients WHERE name = 'door') ORDER BY 1;
+----
+org	[]	acme	true
+tenant	[tenant]	NULL	true
+
+# never a secret: the issuer shows the secret's name and its service, nothing it holds
+query TTTT
+ACL ROLE "root" SELECT name, url, secret_service, secret FROM platform.issuers ORDER BY name;
+----
+kc	test/idp/two	NULL	NULL
+vaulted	test/idp/b	tresor	corp_idp
+
+query I
+ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform' AND column_name IN ('client_secret', 'password', 'token', 'keys_json', 'jwks', 'handle', 'key_material');
+----
+0
+
+query TTT
+ACL ROLE "root" SELECT role, scope, catalog FROM platform.admins ORDER BY role, scope;
+----
+obs	observe	NULL
+pol	policy	NULL
+root	passthrough	NULL
+
+query T
+ACL ROLE "root" SELECT count(*) > 0 FROM platform.function_categories;
+----
+true
+
+query TT
+ACL ROLE "root" SELECT status, present FROM platform.function_status WHERE name = 'lower' AND kind = 'scalar';
+----
+categorized	true
+
+query TTTTT
+ACL ROLE "root" SELECT build, build_min_reader, catalog, min_reader, mode FROM platform.catalog_schema;
+----
+21	21	21	21	current
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 2;
+
+query TTTT
+ACL ROLE "root" SELECT kind, name, spec['value'], typeof(spec) FROM platform.cluster_items;
+----
+setting	threads	2	MAP(VARCHAR, VARCHAR)
+
+query TTT
+ACL ROLE "root" SELECT kind, name, spec['value'] FROM platform.cluster_effective;
+----
+setting	threads	2
+
+statement ok
+ACL ADMIN CLUSTER RESET threads;
+
+# --- the node views (observe) -------------------------------------------------------------------------
+
+query TTTT
+ACL ROLE "obs" SELECT draining, sessions_live, sessions_max, typeof(sessions_by_door) FROM platform.node_load;
+----
+false	0	1000	MAP(VARCHAR, BIGINT)
+
+query TT
+ACL ROLE "obs" SELECT draining, sessions FROM platform.drain;
+----
+false	0
+
+query TT
+ACL ROLE "obs" SELECT status, sending FROM platform.lineage_status;
+----
+off	false
+
+statement ok
+SELECT acl_session_open('');
+
+statement ok
+SELECT acl_define_token('dev-token', 'reader', 'tenant=acme');
+
+statement ok
+SELECT acl_session_open('dev-token');
+
+query TTTT
+ACL ROLE "obs" SELECT subject, roles, door, typeof(expires_at) FROM platform.sessions;
+----
+NULL	[reader]	session	TIMESTAMP
+
+query I
+ACL ROLE "obs" SELECT count(*) FROM platform.node_streams WHERE budget_bytes > 0;
+----
+1
+
+# --- rows per scope -------------------------------------------------------------------------------------
+
+# passthrough: everything
+query I
+ACL ROLE "root" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform';
+----
+36
+
+# policy: the policy views, all rows - never the node's, nor (until spec 118's cluster bundle) the
+# cluster profile's
+query I
+ACL ROLE "pol" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform';
+----
+28
+
+statement error
+ACL ROLE "pol" SELECT * FROM platform.cluster_items;
+----
+<REGEX>:.*no access to object "platform.cluster_items".*
+
+statement error
+ACL ROLE "pol" SELECT * FROM platform.cluster_effective;
+----
+<REGEX>:.*no access to object "platform.cluster_effective".*
+
+# nor a session's profile (spec 118's operate bundle)
+statement error
+ACL ROLE "pol" PROFILE SESSION 'any' ON;
+----
+<REGEX>:.*a session's profile is the node's operation and requires a passthrough scope.*
+
+statement error
+ACL ROLE "pol" SELECT platform.session_profile('any', 'all');
+----
+<REGEX>:.*a session's profile is the node's operation and requires a passthrough scope.*
+
+statement error
+ACL ADMIN GRANT FUNCTION platform.session_profile TO ROLE pol;
+----
+<REGEX>:.*platform.session_profile is the passthrough scope's alone.*
+
+query T
+ACL ROLE "pol" SELECT list(catalog ORDER BY catalog) FROM platform.catalogs;
+----
+[hr, sales]
+
+statement error
+ACL ROLE "pol" SELECT * FROM platform.sessions;
+----
+<REGEX>:.*no access to object "platform.sessions".*
+
+# a catalog admin: its catalogs' objects, schemas, references, keys, the grants on them and the names of
+# the roles holding them - no identity, categories, resource groups, cluster, node
+query T
+ACL ROLE "cat" SELECT list(table_name ORDER BY table_name) FROM information_schema.tables WHERE table_catalog = 'platform';
+----
+[catalogs, function_columns, functions, grant_columns, grants, keys, object_grants, reference_columns, references, relation_columns, relations, roles, schema_grants, schemas]
+
+query TT
+ACL ROLE "cat" SELECT catalog, comment FROM platform.catalogs;
+----
+sales	the sales mart
+
+query T
+ACL ROLE "cat" SELECT list(name ORDER BY name) FROM platform.relations;
+----
+[orders, recent]
+
+query TT
+ACL ROLE "cat" SELECT role, catalog FROM platform.grants ORDER BY role;
+----
+cat	sales
+reader	sales
+
+query TT
+ACL ROLE "cat" SELECT role, comment FROM platform.roles ORDER BY role;
+----
+cat	NULL
+reader	NULL
+
+statement error
+ACL ROLE "cat" SELECT * FROM platform.issuers;
+----
+<REGEX>:.*no access to object "platform.issuers".*
+
+statement error
+ACL ROLE "cat" SELECT * FROM platform.admins;
+----
+<REGEX>:.*no access to object "platform.admins".*
+
+# observe: the node views only
+query T
+ACL ROLE "obs" SELECT list(table_name ORDER BY table_name) FROM information_schema.tables WHERE table_catalog = 'platform';
+----
+[drain, lineage_status, node_doors, node_load, node_streams, sessions]
+
+statement error
+ACL ROLE "obs" SELECT * FROM platform.catalogs;
+----
+<REGEX>:.*no access to object "platform.catalogs".*
+
+# none: the catalog is absent - not listed, not readable
+query I
+ACL ROLE "reader" SELECT count(*) FROM information_schema.schemata WHERE catalog_name = 'platform';
+----
+0
+
+query T
+ACL ROLE "reader" SELECT list(database_name ORDER BY database_name) FROM duckdb_databases();
+----
+[hr, sales]
+
+statement error
+ACL ROLE "reader" SELECT * FROM platform.catalogs;
+----
+<REGEX>:.*no access to object "platform.catalogs".*
+
+statement error
+ACL ROLE "reader" SELECT * FROM platform.console_info();
+----
+<REGEX>:.*no access to table function "platform.console_info".*
+
+# the catalog in the tree of an admin, with its schema
+query TT
+ACL ROLE "pol" SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = 'platform';
+----
+platform	main
+
+query TT
+ACL ROLE "pol" SELECT database_name, comment FROM duckdb_databases() WHERE database_name = 'platform';
+----
+platform	the system catalog of administration (spec 117)
+
+# --- console_info --------------------------------------------------------------------------------------
+
+query TTTTTT
+ACL ROLE "cat" SELECT audit_contract, connection_contract, schema_catalog, bundles, admin_catalogs, len(views) FROM platform.console_info();
+----
+3	2	21	[]	[sales]	36
+
+query T
+ACL ROLE "cat" SELECT list_contains(my_views, 'grants') AND NOT list_contains(my_views, 'issuers') AND list_contains(my_functions, 'add_relation') AND NOT list_contains(my_functions, 'grant_catalog') FROM platform.console_info();
+----
+true
+
+query T
+ACL ROLE "obs" SELECT bundles FROM platform.console_info();
+----
+[observe]
+
+# --- the view comment (spec 117 §7) and the stored catalog / schema comments ---------------------------
+
+query TT
+ACL ROLE "reader" SELECT view_name, comment FROM duckdb_views();
+----
+recent	the last orders
+
+query TTT
+ACL ROLE "reader" SELECT table_name, table_type, "TABLE_COMMENT" FROM information_schema.tables WHERE table_catalog = 'sales' AND table_schema = 'main' ORDER BY ALL;
+----
+orders	BASE TABLE	NULL
+recent	VIEW	the last orders
+
+query TT
+ACL ROLE "reader" SELECT database_name, comment FROM duckdb_databases() ORDER BY 1;
+----
+hr	NULL
+sales	the sales mart
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.raw TO ROLE reader WITH (select);
+
+query TT
+ACL ROLE "reader" SELECT schema_name, comment FROM duckdb_schemas() WHERE database_name = 'sales' ORDER BY 1;
+----
+main	NULL
+raw	the raw source

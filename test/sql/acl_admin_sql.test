@@ -175,4 +175,4 @@ ACL ADMIN ADD TABLE phys.main.orders_physical AS plainname;
 statement error
 ACL ADMIN CREATE ROLE r2; SELECT 1;
 ----
-<REGEX>:.*unknown management statement.*
+<REGEX>:.*a batch mixing management statements and queries is refused.*

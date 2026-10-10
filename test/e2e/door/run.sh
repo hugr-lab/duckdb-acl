@@ -296,6 +296,32 @@ run_leg() {
 			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: a quoted name through the door, any case"; }
 		grep -q "^use_back,c$" "$TMP/$name.$who.out" ||
 			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: USE c did not go back"; }
+		# spec 117: no platform on the quack door - the role's grant on it notwithstanding
+		grep -q "^platform_tree,0$" "$TMP/$name.$who.out" ||
+			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: platform is in the catalog quack loaded"; }
+		grep -q "^platform_listed,0$" "$TMP/$name.$who.out" ||
+			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: the node listed platform to a quack client"; }
+		# and its view is no object there: a refusal, in a client of its own (an error ends a client's run)
+		{
+			echo "$L"
+			echo "ATTACH 'quack:localhost:$port' AS remote (TYPE quack, TOKEN '$TOKEN_ACME');"
+			echo "SELECT 'platform_view' AS label, * FROM quack_query_by_name('remote', 'SELECT count(*) FROM platform.sessions');"
+		} >"$TMP/$name.platform.sql"
+		"$DUCKDB" -unsigned -csv <"$TMP/$name.platform.sql" >"$TMP/$name.platform.out" 2>&1 || true
+		if grep -q "^platform_view," "$TMP/$name.platform.out"; then
+			cat "$TMP/$name.platform.out" >&2; fail "$name: a platform view answered over quack"
+		fi
+		grep -q 'no access to object .*platform.sessions' "$TMP/$name.platform.out" ||
+			{ cat "$TMP/$name.platform.out" >&2; fail "$name: the platform view was not refused over quack"; }
+		# nor its functions: the grammar is how a quack client administers
+		{
+			echo "$L"
+			echo "ATTACH 'quack:localhost:$port' AS remote (TYPE quack, TOKEN '$TOKEN_ACME');"
+			echo "SELECT 'platform_call' AS label, * FROM quack_query_by_name('remote', 'SELECT platform.create_role(''over_quack'')');"
+		} >"$TMP/$name.platform_call.sql"
+		"$DUCKDB" -unsigned -csv <"$TMP/$name.platform_call.sql" >"$TMP/$name.platform_call.out" 2>&1 || true
+		grep -q 'not served on the quack door' "$TMP/$name.platform_call.out" ||
+			{ cat "$TMP/$name.platform_call.out" >&2; fail "$name: a platform call was not refused over quack"; }
 		# the bootstrap seeds two acme rows and one globex row, so each client's own total differs
 		case "$who" in acme) seeded=2 ;; globex) seeded=1 ;; esac
 		before="$(grep "^seen_before," "$TMP/$name.$who.out" | cut -d, -f2)"

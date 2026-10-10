@@ -2,6 +2,7 @@
 #include "acl_lineage.hpp"
 #include "acl_field_paths.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_platform.hpp"
 
 #include "acl_profile.hpp"
 
@@ -40,6 +41,7 @@
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/statement/alter_statement.hpp"
+#include "duckdb/parser/statement/call_statement.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
@@ -243,10 +245,71 @@ public:
 		case StatementType::MULTI_STATEMENT:
 			RewriteMultiStatement(stmt.Cast<MultiStatement>());
 			break;
+		case StatementType::CALL_STATEMENT:
+			RewriteCallStatement(stmt.Cast<CallStatement>());
+			break;
 		default:
 			Deny(Reason::STATEMENT_TYPE,
 			     "statement type " + StatementTypeToString(stmt.type) + " is not permitted under ACL");
 		}
+	}
+
+	//! spec 117: `CALL platform.<read function>(…)` is `SELECT * FROM platform.<read function>(…)`; a
+	//! management function there was compiled by the override already, and any other CALL is refused
+	void RewriteCallStatement(CallStatement &stmt) {
+		if (!stmt.function || stmt.function->GetExpressionClass() != ExpressionClass::FUNCTION) {
+			Deny(Reason::STATEMENT_TYPE, "statement type CALL is not permitted under ACL");
+		}
+		auto &function = stmt.function->Cast<FunctionExpression>();
+		string leaf;
+		auto platform_function =
+		    PlatformObjectName(NameParts(function.GetQualifiedName()), leaf) ? FindPlatformFunction(leaf) : nullptr;
+		if (!platform_function || !platform_function->table) {
+			Deny(Reason::STATEMENT_TYPE, "statement type CALL is not permitted under ACL");
+		}
+		auto node = make_uniq<SelectNode>();
+		node->select_list.push_back(make_uniq<StarExpression>());
+		auto ref = make_uniq<TableFunctionRef>();
+		ref->function = std::move(stmt.function);
+		node->from_table = std::move(ref);
+		RewriteTableRef(node->from_table);
+		auto select = make_uniq<SelectStatement>();
+		select->node = std::move(node);
+		select->query = select->ToString();
+		replacement = std::move(select);
+	}
+
+	//! spec 117: the principal's administration, once per batch
+	const PolicyStore::AdminRights &AdminRights() {
+		if (!rights_loaded) {
+			admin_rights = store.AdminRightsOf(principal);
+			rights_loaded = true;
+		}
+		return admin_rights;
+	}
+
+	//! spec 117: the platform catalog is absent on the quack door - quack loads a catalog whole, and the
+	//! console is Flight / JDBC
+	bool PlatformHidden() {
+		if (platform_hidden < 0) { // the session's door, read once per batch
+			platform_hidden = !principal.session.empty() && store.SessionDoorOf(principal.session) == "quack" ? 1 : 0;
+		}
+		return platform_hidden == 1;
+	}
+
+	//! spec 117: `FROM platform.<view>` - the view's SQL for this principal, substituted before the gate
+	//! like a metadata surface; a view it does not hold does not exist for it
+	unique_ptr<TableRef> BuildPlatformView(const string &leaf, const string &key, const Identifier &alias,
+	                                       vector<Identifier> column_alias) {
+		string sql;
+		if (PlatformHidden() || !PlatformViewSql(store, AdminRights(), leaf, sql)) {
+			Deny(Reason::NO_ACCESS, "no access to object " + Shown(key));
+		}
+		Note("platform.main." + StringUtil::Lower(leaf), "select");
+		auto select_stmt = store.InstantiateSelect(sql, template_options, false);
+		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+		sub->column_name_alias = std::move(column_alias);
+		return std::move(sub);
 	}
 
 	//! `PIVOT source ON col USING agg` with no IN list arrives as a MultiStatement (spec 075): duckdb's
@@ -848,6 +911,18 @@ private:
 	//! `acl_session_use(<ops id>, ...)` - at execution, never at parse - by the session's non-secret id.
 	void RewriteUse(SetStatement &stmt) {
 		auto use_schema_form = StringUtil::CIEquals(stmt.name.GetIdentifierName(), "acl_use_schema");
+		if (!use_schema_form && stmt.set_type == SetType::SET) {
+			auto &written = stmt.Cast<SetVariableStatement>();
+			if (written.value && written.value->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+				auto parts =
+				    SplitIdentifierPath(written.value->Cast<ConstantExpression>().GetLiteral().ToValue().ToString());
+				if (!parts.empty() && IsPlatformCatalog(parts[0])) {
+					// spec 117: a session's default catalog is a data catalog - platform is named, never USEd
+					Deny(Reason::SETTING_DENIED, "USE: platform is the system catalog of administration, not a "
+					                             "session's default catalog - name its objects as platform.<view>");
+				}
+			}
+		}
 		if (!principal.session_connection || session_id.empty()) {
 			Deny(Reason::SETTING_DENIED, "USE needs a session of the client's own (a door's ACL SESSION): a "
 			                             "per-statement prefix runs on a connection the gateway shares, where "
@@ -1626,6 +1701,17 @@ private:
 			if (IsCteName(base)) {
 				return; // a CTE reference, not a catalog object
 			}
+			{
+				// spec 117: `platform.<view>` / `platform.main.<view>` - the system catalog, before any
+				// virtual resolution (its name is reserved, so no virtual catalog can take it)
+				string leaf;
+				if (PlatformObjectName(NameParts(base.GetQualifiedName()), leaf)) {
+					auto written = VirtualKey(base.GetQualifiedName());
+					auto alias = base.alias.empty() ? base.Table() : base.alias;
+					ref = BuildPlatformView(leaf, written, alias, std::move(base.column_name_alias));
+					return;
+				}
+			}
 			auto key = Key(base.GetQualifiedName());
 			if (auto surface = MetadataSurfaceOf(key)) {
 				// `FROM information_schema.tables` / `FROM duckdb_tables` - the view forms
@@ -1753,6 +1839,15 @@ private:
 		auto &function = tf.function->Cast<FunctionExpression>();
 		auto vname = function.FunctionName().GetIdentifierName();
 		auto leaf = vname;
+		{
+			// spec 117: `FROM platform.check_catalog(…)` / `platform.console_info()` - the read functions of the
+			// system catalog; a management function in FROM is refused (it is called at the top level only)
+			string platform_leaf;
+			if (PlatformObjectName(NameParts(function.GetQualifiedName()), platform_leaf)) {
+				RewritePlatformTableFunction(ref, function, platform_leaf, tf);
+				return;
+			}
+		}
 
 		TablePolicy policy;
 		string resolved_name;
@@ -1859,6 +1954,43 @@ private:
 		if (tf.subquery && tf.subquery->node) {
 			RewriteQueryNode(*tf.subquery->node);
 		}
+	}
+
+	void RewritePlatformTableFunction(unique_ptr<TableRef> &ref, FunctionExpression &function, const string &leaf,
+	                                  TableFunctionRef &tf) {
+		auto shown = "platform." + leaf;
+		auto platform_function = FindPlatformFunction(leaf);
+		if (platform_function && !platform_function->table) {
+			Deny(Reason::STATEMENT_TYPE, shown +
+			                                 " is a management function - call it at the top level of a "
+			                                 "statement: SELECT " +
+			                                 shown + "(…) or CALL " + shown + "(…)");
+		}
+		if (!platform_function || PlatformHidden()) {
+			Deny(Reason::NO_ACCESS, "no access to table function \"" + shown + "\"");
+		}
+		vector<Value> arguments;
+		for (auto &argument : function.GetArguments()) {
+			if (argument.HasName() || argument.GetExpression().GetExpressionClass() != ExpressionClass::CONSTANT) {
+				// the arguments are judged (a catalog) or spliced into generated SQL before the call runs
+				Deny(Reason::STATEMENT_TYPE, shown + " takes constant arguments");
+			}
+			arguments.push_back(argument.GetExpression().Cast<ConstantExpression>().GetLiteral().ToValue());
+		}
+		string sql;
+		try {
+			if (!PlatformReadFunctionSql(store, principal, AdminRights(), leaf, arguments, sql)) {
+				Deny(Reason::NO_ACCESS, "no access to table function \"" + shown + "\"");
+			}
+		} catch (BinderException &) {
+			NoteDenyReason(Reason::MGMT_UNAUTHORIZED); // the authorizer's refusal, as the grammar's
+			throw;
+		}
+		Note("platform.main." + StringUtil::Lower(leaf), "select");
+		auto select_stmt = store.InstantiateSelect(sql, template_options, false);
+		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), tf.alias.empty() ? Identifier(leaf) : tf.alias);
+		sub->column_name_alias = std::move(tf.column_name_alias);
+		ref = std::move(sub);
 	}
 
 	//! `DESCRIBE` / `SUMMARIZE` / `SHOW TABLES` (spec 025). These are what a client sends before it
@@ -3363,6 +3495,21 @@ private:
 		if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 			auto &function = expr->Cast<FunctionExpression>();
 			auto name = function.FunctionName().GetIdentifierName();
+			string platform_leaf;
+			if (PlatformObjectName(NameParts(function.GetQualifiedName()), platform_leaf) &&
+			    !FindPlatformFunction(platform_leaf)) {
+				// the reserved catalog's name: `platform.<x>` is never a method call nor another catalog's
+				Deny(Reason::NO_ACCESS, "the platform catalog has no function \"" + platform_leaf + "\"");
+			}
+			if (IsPlatformFunctionName(NameParts(function.GetQualifiedName()))) {
+				// spec 117: a management call is one statement, one change, one audit event - never per row
+				// of another selection, in a subquery or a FROM: the override compiled the top-level form
+				// already, so whatever reaches here is somewhere else
+				Deny(Reason::STATEMENT_TYPE, "platform." + name +
+				                                 " is a management function - call it at the top level of a "
+				                                 "statement: SELECT platform." +
+				                                 name + "(…) or CALL platform." + name + "(…)");
+			}
 			// a virtual scalar function for this role: expand it (expr-macro) or retarget it (alias)
 			TablePolicy spolicy;
 			string resolved_name;
@@ -3648,6 +3795,10 @@ private:
 	bool held_loaded = false;
 	string main_catalog;
 	bool main_loaded = false;
+	//! spec 117: the principal's administration, read once per batch, for the platform catalog
+	PolicyStore::AdminRights admin_rights;
+	bool rights_loaded = false;
+	int platform_hidden = -1;
 	PolicyStore &store;
 	//! the virtual name of the DML target currently being rewritten (for diagnostics and mapping)
 	string dml_target_name;

@@ -402,7 +402,7 @@ ACL ROLE "analyst" SELECT count(*) FROM sales.batch_ok2;
 statement error
 ACL ROLE "platform" ACL CREATE ROLE mixed_a; SELECT 1;
 ----
-<REGEX>:.*unknown management statement.*
+<REGEX>:.*a batch mixing management statements and queries is refused.*
 
 statement error
 ACL ROLE "platform" ACL NATIVE SELECT 1; CREATE ROLE mixed_b;
@@ -413,7 +413,7 @@ ACL ROLE "platform" ACL NATIVE SELECT 1; CREATE ROLE mixed_b;
 statement error
 ACL ROLE "analyst" SELECT 1; ACL NATIVE DROP TABLE phys.main.orders_physical;
 ----
-<REGEX>:.*(syntax|Parser).*
+<REGEX>:.*(syntax|Parser|one ACL prefix per batch).*
 
 query I
 ACL ADMIN SELECT count(*) FROM phys.main.orders_physical;

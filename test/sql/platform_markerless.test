@@ -1,0 +1,316 @@
+# name: test/sql/platform_markerless.test
+# description: the management grammar without the ACL marker under a principal prefix (spec 117 §4) -
+#   each form under ROLE and TOKEN as a DBMS takes it (SESSION: test/cpp/test_acl_session.cpp);
+#   `ACL <mgmt>` still accepted; a batch mixing management statements and queries refused (either order, the grammar or a platform call);
+#   no data statement captured by a leading phrase (COMMENT ON TABLE, ANALYZE t, CREATE FUNCTION,
+#   CREATE TABLE in a granted home, DROP TABLE) - each answered as it was before.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+CREATE SCHEMA phys.home;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE pol MAIN;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.home AS phys.home;
+
+statement ok
+ACL ADMIN GRANT SCHEMA sales.home TO ROLE pol WITH (select, insert, create, drop);
+
+statement ok
+ACL ADMIN CREATE ROLE reader;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE reader MAIN;
+
+# --- each form, bare, under ACL ROLE ----------------------------------------------------------------------
+
+statement ok
+ACL ROLE "pol" CREATE VIRTUAL CATALOG mart COMMENT 'the mart';
+
+statement ok
+ACL ROLE "pol" CREATE VIRTUAL TABLE mart.orders AS phys.main.orders;
+
+statement ok
+ACL ROLE "pol" CREATE OR REPLACE VIRTUAL VIEW mart.one AS SELECT 1 AS x;
+
+statement ok
+ACL ROLE "pol" ADD TABLE phys.main.orders AS mart.added;
+
+statement ok
+ACL ROLE "pol" ALTER VIRTUAL CATALOG mart SET COMMENT 'still the mart';
+
+statement ok
+ACL ROLE "pol" COMMENT ON VIRTUAL TABLE mart.orders IS 'the orders';
+
+statement ok
+ACL ROLE "pol" ANALYZE VIRTUAL CATALOG mart;
+
+statement ok
+ACL ROLE "pol" CREATE ROLE clerk CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ROLE "pol" ALTER ROLE clerk SET CLAIMS (tenant = 'globex');
+
+statement ok
+ACL ROLE "pol" GRANT CATALOG mart TO ROLE clerk WITH (select) MAIN;
+
+statement ok
+ACL ROLE "pol" ALTER GRANT CATALOG mart TO ROLE clerk SET MAIN false;
+
+statement ok
+ACL ROLE "pol" GRANT TABLE mart.orders TO ROLE clerk WITH (select);
+
+statement ok
+ACL ROLE "pol" REVOKE CATALOG mart FROM ROLE clerk;
+
+statement ok
+ACL ROLE "pol" CREATE ISSUER kc URL 'test/idp/two';
+
+statement ok
+ACL ROLE "pol" CREATE CLIENT door ISSUER kc AUDIENCES ('api://acl-test') ROLES FROM ('roles');
+
+statement ok
+ACL ROLE "pol" ALTER CLIENT door SET AZP ('acl-door');
+
+statement ok
+ACL ROLE "pol" MAP CLAIM 'c' FROM CLIENT door TO ROLE clerk;
+
+statement ok
+ACL ROLE "pol" DROP MAP CLAIM 'c' FROM CLIENT door TO ROLE clerk;
+
+statement ok
+ACL ROLE "pol" DROP CLIENT door;
+
+statement ok
+ACL ROLE "pol" ALTER ISSUER kc SET URL 'test/idp/two';
+
+statement ok
+ACL ROLE "pol" DROP ISSUER kc;
+
+statement ok
+ACL ROLE "pol" CREATE FUNCTION CATEGORY mine COMMENT 'mine';
+
+statement ok
+ACL ROLE "pol" ALTER FUNCTION CATEGORY mine ADD (lower);
+
+statement ok
+ACL ROLE "pol" GRANT FUNCTION CATEGORY mine TO ROLE clerk;
+
+statement ok
+ACL ROLE "pol" DENY FUNCTION upper TO ROLE clerk;
+
+statement ok
+ACL ROLE "pol" REVOKE FUNCTION upper FROM ROLE clerk;
+
+statement ok
+ACL ROLE "pol" DROP FUNCTION CATEGORY mine;
+
+statement ok
+ACL ROLE "pol" CREATE RESOURCE GROUP small (max_sessions 4);
+
+statement ok
+ACL ROLE "pol" GRANT RESOURCE GROUP small TO ROLE clerk;
+
+statement ok
+ACL ROLE "pol" ALTER RESOURCE GROUP small SET DEFAULT;
+
+statement ok
+ACL ROLE "pol" REVOKE RESOURCE GROUP small FROM ROLE clerk;
+
+statement ok
+ACL ROLE "pol" DROP RESOURCE GROUP small;
+
+query IIIIIII
+ACL ROLE "pol" CHECK VIRTUAL CATALOG mart;
+----
+
+statement ok
+ACL ROLE "pol" DROP VIRTUAL VIEW mart.one;
+
+statement ok
+ACL ROLE "pol" DROP RELATION mart.added;
+
+statement ok
+ACL ROLE "pol" DROP ROLE clerk;
+
+statement ok
+ACL ROLE "pol" DROP VIRTUAL CATALOG mart CASCADE;
+
+query T
+SELECT count(*) FROM store.acl.catalogs WHERE vcat = 'mart';
+----
+0
+
+# the marker is still accepted
+statement ok
+ACL ROLE "pol" ACL CREATE ROLE marked;
+
+# --- under ACL TOKEN --------------------------------------------------------------------------------------
+
+statement ok
+SELECT acl_define_token('pol-token', 'pol', '');
+
+statement ok
+ACL TOKEN 'pol-token' CREATE ROLE via_token;
+
+# (under ACL SESSION - a door's client, the prefix composed by acl_session_sql - in
+# test/cpp/test_acl_session.cpp: a sqllogictest cannot run a statement it composes)
+
+query T
+SELECT list("role" ORDER BY "role") FROM store.acl.roles WHERE "role" LIKE 'via_%' OR "role" = 'marked';
+----
+[marked, via_token]
+
+# --- without a scope the bare form is refused like the marked one --------------------------------------
+
+statement error
+ACL ROLE "reader" CREATE ROLE sneaky;
+----
+<REGEX>:.*the principal has no ACL administration scope.*
+
+statement error
+ACL ROLE "reader" GRANT CATALOG sales TO ROLE reader WITH (select, manage);
+----
+<REGEX>:.*the principal has no ACL administration scope.*
+
+# --- a batch is all management or all queries -----------------------------------------------------------
+
+statement error
+ACL ROLE "pol" CREATE ROLE mixed_a; SELECT 1;
+----
+<REGEX>:.*a batch mixing management statements and queries is refused.*
+
+statement error
+ACL ROLE "pol" SELECT 1; CREATE ROLE mixed_b;
+----
+<REGEX>:.*a batch mixing management statements and queries is refused.*
+
+statement error
+ACL ROLE "pol" SELECT count(*) FROM orders; -- a comment; with a semicolon
+	GRANT CATALOG sales TO ROLE reader;
+----
+<REGEX>:.*a batch mixing management statements and queries is refused.*
+
+statement error
+ACL ROLE "pol" SELECT platform.create_role('mixed_c'); SELECT 1;
+----
+<REGEX>:.*a batch mixing management statements and queries is refused.*
+
+statement error
+ACL ROLE "pol" CREATE ROLE mixed_d; SELECT platform.create_role('mixed_e');
+----
+<REGEX>:.*a batch mixing management statements and queries is refused.*
+
+query I
+SELECT count(*) FROM store.acl.roles WHERE "role" LIKE 'mixed_%';
+----
+0
+
+# a batch of management statements runs whole; a batch of queries too - a phrase inside a literal is text
+statement ok
+ACL ROLE "pol" CREATE ROLE batch_a; CREATE ROLE batch_b;
+
+# a comment in front of a statement says nothing: the batch is still management, and still one kind
+statement ok
+ACL ROLE "pol" /* the onboarding */ CREATE ROLE commented_a; -- and one more
+	CREATE ROLE commented_b;
+
+statement error
+ACL ROLE "pol" /* a note */ CREATE ROLE commented_c; SELECT 1;
+----
+<REGEX>:.*a batch mixing management statements and queries is refused.*
+
+query T
+SELECT list("role" ORDER BY "role") FROM store.acl.roles WHERE "role" LIKE 'commented_%';
+----
+[commented_a, commented_b]
+
+statement ok
+ACL ROLE "pol" SELECT count(*) FROM orders WHERE tenant <> 'x; GRANT CATALOG sales TO ROLE reader'; SELECT 2;
+
+query I
+SELECT count(*) FROM store.acl.roles WHERE "role" LIKE 'batch_%';
+----
+2
+
+# --- no data statement is captured by a leading phrase ---------------------------------------------------
+
+statement error
+ACL ROLE "pol" COMMENT ON TABLE orders IS 'x';
+----
+<REGEX>:.*statement type ALTER is not permitted under ACL.*
+
+statement error
+ACL ROLE "pol" ANALYZE orders;
+----
+<REGEX>:.*statement type VACUUM is not permitted under ACL.*
+
+statement error
+ACL ROLE "pol" CREATE FUNCTION f(x) AS x + 1;
+----
+<REGEX>:.*only tables and views can be created through the ACL.*
+
+statement error
+ACL ROLE "pol" DROP FUNCTION f;
+----
+<REGEX>:.*only tables and views can be dropped through the ACL.*
+
+statement ok
+ACL ROLE "pol" CREATE TABLE home.mine(i INTEGER);
+
+statement ok
+ACL ROLE "pol" INSERT INTO home.mine VALUES (1);
+
+statement ok
+ACL ROLE "pol" ALTER TABLE home.mine RENAME TO yours;
+
+query I
+ACL ROLE "pol" SELECT count(*) FROM home.yours;
+----
+1
+
+statement ok
+ACL ROLE "pol" DROP TABLE home.yours;
+
+# ACL ADMIN (the gateway's anonymous form) and ACL NATIVE (the physical mode) unchanged
+statement ok
+ACL ADMIN SELECT 1;
+
+statement error
+ACL ROLE "pol" ACL NATIVE SELECT 1;
+----
+<REGEX>:.*native SQL outside the virtual catalog requires a passthrough scope.*

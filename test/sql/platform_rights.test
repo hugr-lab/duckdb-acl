@@ -1,0 +1,566 @@
+# name: test/sql/platform_rights.test
+# description: rights on the platform catalog (spec 117 §5) - the built-in bundles (observe, policy,
+#   passthrough; spec 009's manage = policy + observe) held as a set; point grants (and denies) on one
+#   view or function, written only by passthrough, never to every role, never on the passthrough
+#   scope's own functions; REVOKE ADMIN per bundle and whole; spec 095 extended - a role holding a
+#   bundle, a point grant on platform or a catalog's manage is reached only through a client's own
+#   mapping; the old admins rows read as bundles after the v21 migration.
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE legacy;
+
+statement ok
+ACL ADMIN CREATE ROLE support;
+
+statement ok
+ACL ADMIN CREATE ROLE helper;
+
+statement ok
+ACL ADMIN CREATE ROLE multi;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN manage TO ROLE legacy;
+
+# --- bundles: a set, never an order ---------------------------------------------------------------------
+
+# a role holds several - the second grant adds, it does not replace
+statement ok
+ACL ADMIN GRANT ADMIN observe TO ROLE multi;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE multi;
+
+query TT
+SELECT "scope", "vcat" FROM store.acl.admins WHERE "role" = 'multi' ORDER BY ALL;
+----
+observe	(empty)
+policy	(empty)
+
+query T
+ACL ROLE "multi" SELECT bundles FROM platform.console_info();
+----
+[observe, policy]
+
+query I
+ACL ROLE "multi" SELECT count(*) FROM platform.drain;
+----
+1
+
+query I
+ACL ROLE "multi" SELECT count(*) FROM platform.catalogs;
+----
+1
+
+# policy alone reads no node view; spec 009's manage is policy + observe
+statement error
+ACL ROLE "pol" SELECT * FROM platform.drain;
+----
+<REGEX>:.*no access to object "platform.drain".*
+
+query I
+ACL ROLE "legacy" SELECT count(*) FROM platform.drain;
+----
+1
+
+query T
+ACL ROLE "legacy" SELECT bundles FROM platform.console_info();
+----
+[observe, policy]
+
+# REVOKE ADMIN <bundle> takes that one; REVOKE ADMIN takes them all
+statement ok
+ACL ADMIN REVOKE ADMIN observe FROM ROLE multi;
+
+query T
+ACL ROLE "multi" SELECT bundles FROM platform.console_info();
+----
+[policy]
+
+statement error
+ACL ADMIN REVOKE ADMIN superpowers FROM ROLE multi;
+----
+<REGEX>:.*unknown admin scope "superpowers".*
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE multi CAPS '{"select": true, "manage": true}';
+
+statement ok
+ACL ADMIN GRANT VIEW platform.sessions TO ROLE multi;
+
+statement ok
+ACL ADMIN REVOKE ADMIN FROM ROLE multi;
+
+query III
+SELECT (SELECT count(*) FROM store.acl.admins WHERE "role" = 'multi'), (SELECT count(*) FROM store.acl.platform_grants WHERE "role" = 'multi'), (SELECT caps FROM store.acl.role_catalogs WHERE "role" = 'multi');
+----
+0	0	{"select": true}
+
+statement error
+ACL ROLE "multi" SELECT * FROM platform.console_info();
+----
+<REGEX>:.*no access to table function "platform.console_info".*
+
+# --- point grants on one view or function ---------------------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT VIEW platform.sessions TO ROLE support;
+
+statement ok
+ACL ADMIN GRANT FUNCTION platform.create_role TO ROLE helper;
+
+query TTTT
+SELECT "role", "object", "kind", "allowed" FROM store.acl.platform_grants ORDER BY ALL;
+----
+helper	create_role	function	true
+support	sessions	view	true
+
+# the view whole - and nothing else of platform
+query T
+ACL ROLE "support" SELECT list(table_name) FROM information_schema.tables WHERE table_catalog = 'platform';
+----
+[sessions]
+
+query I
+ACL ROLE "support" SELECT count(*) FROM platform.main.sessions;
+----
+0
+
+statement error
+ACL ROLE "support" SELECT * FROM platform.node_load;
+----
+<REGEX>:.*no access to object "platform.node_load".*
+
+# a view grant administers nothing
+statement error
+ACL ROLE "support" ACL CREATE ROLE x;
+----
+<REGEX>:.*the principal has no ACL administration scope.*
+
+# a function granted by name: called directly or through the grammar - and only it
+statement ok
+ACL ROLE "helper" SELECT platform.create_role('made_by_helper');
+
+statement ok
+ACL ROLE "helper" CREATE ROLE made_by_grammar;
+
+statement error
+ACL ROLE "helper" SELECT platform.drop_role('made_by_helper');
+----
+<REGEX>:.*this statement is not catalog-specific and needs an unrestricted manage scope.*
+
+statement error
+ACL ROLE "helper" SELECT * FROM platform.roles;
+----
+<REGEX>:.*no access to object "platform.roles".*
+
+query T
+ACL ROLE "helper" SELECT list(function_name ORDER BY function_name) FROM duckdb_functions() WHERE database_name = 'platform';
+----
+[console_info, create_role]
+
+# a deny wins over a bundle - but not over the break-glass
+statement ok
+ACL ADMIN DENY VIEW platform.issuers TO ROLE pol;
+
+statement ok
+ACL ADMIN DENY FUNCTION platform.create_role TO ROLE pol;
+
+statement error
+ACL ROLE "pol" SELECT * FROM platform.issuers;
+----
+<REGEX>:.*no access to object "platform.issuers".*
+
+query I
+ACL ROLE "pol" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_name = 'issuers';
+----
+0
+
+statement error
+ACL ROLE "pol" CREATE ROLE denied;
+----
+<REGEX>:.*platform.create_role is denied to the principal.*
+
+statement error
+ACL ROLE "pol" SELECT platform.create_role('denied');
+----
+<REGEX>:.*platform.create_role is denied to the principal.*
+
+statement ok
+ACL ADMIN DENY VIEW platform.issuers TO ROLE root;
+
+query I
+ACL ROLE "root" SELECT count(*) FROM platform.issuers;
+----
+0
+
+statement ok
+ACL ADMIN REVOKE VIEW platform.issuers FROM ROLE root;
+
+statement ok
+ACL ADMIN REVOKE VIEW platform.issuers FROM ROLE pol;
+
+statement ok
+ACL ADMIN REVOKE FUNCTION platform.create_role FROM ROLE pol;
+
+query I
+ACL ROLE "pol" SELECT count(*) FROM platform.issuers;
+----
+0
+
+# --- only passthrough grants on platform (and the bundles) -----------------------------------------------
+
+statement error
+ACL ROLE "pol" GRANT VIEW platform.sessions TO ROLE pol;
+----
+<REGEX>:.*grants on the platform catalog require a passthrough scope.*
+
+statement error
+ACL ROLE "pol" SELECT platform.grant_platform('pol', 'view', 'sessions');
+----
+<REGEX>:.*grants on the platform catalog require a passthrough scope.*
+
+statement error
+ACL ROLE "pol" GRANT ADMIN observe TO ROLE pol;
+----
+<REGEX>:.*granting admin scopes requires a passthrough scope.*
+
+statement ok
+ACL ROLE "root" GRANT VIEW platform.drain TO ROLE support;
+
+# never to every role, never the passthrough scope's own functions, only what platform has
+statement error
+ACL ADMIN GRANT VIEW platform.sessions TO ALL ROLES;
+----
+<REGEX>:.*names one role - never every role.*
+
+statement error
+ACL ADMIN GRANT FUNCTION platform.grant_admin TO ROLE helper;
+----
+<REGEX>:.*platform.grant_admin is the passthrough scope's alone - it is never granted by name.*
+
+statement error
+ACL ADMIN GRANT FUNCTION platform.cluster_setting TO ROLE helper;
+----
+<REGEX>:.*platform.cluster_setting is the passthrough scope's alone.*
+
+statement error
+ACL ADMIN GRANT VIEW platform.nothing TO ROLE helper;
+----
+<REGEX>:.*the platform catalog has no view "nothing".*
+
+statement error
+SELECT acl_grant_platform('helper', 'table', 'sessions');
+----
+<REGEX>:.*the kind is view or function.*
+
+# never through a category or a function grant (spec 072's) - those could hand platform to every role
+statement error
+SELECT acl_grant_function('', 'platform.main.create_role TABLE');
+----
+<REGEX>:.*names the platform catalog, whose functions are granted on platform itself.*
+
+statement error
+SELECT acl_function_category_add('basic', 'platform.main.create_role');
+----
+<REGEX>:.*names the platform catalog.*
+
+# --- spec 095: a role holding anything on platform is privileged -----------------------------------------
+
+statement ok
+ACL ADMIN CREATE ISSUER kc URL 'test/idp/two';
+
+statement ok
+ACL ADMIN CREATE CLIENT catchall ISSUER kc AUDIENCES ('api://acl-test') ROLES FROM ('roles', 'groups') UNMAPPED AS ROLE;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE support MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE helper MAIN;
+
+# an IdP's role value named like the role does not reach it (UNMAPPED AS ROLE)
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC90d28iLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1zdXBwb3J0Iiwicm9sZXMiOlsic3VwcG9ydCJdfQ.hbLHMgnUyxhn66Orarf47U9PEKRTwKHa_TYimW0T2MxvzdTWsOzQJ1TRJS6zIbBrU96wjiQJIAsN6LOzisqj15IlvKzgDyqYUdiIG4UKYY9gSOVgjTDOdds2MVQSgX-yM2i_1XQcM3vgydLyuhLOK-wsUgGGA8nA2DFosMhJ2zX-36jxA7wbWBB8_gUIqdXd-f9j3fsSPDZi2VsgmVvpuzWUyL8umUepjlomo8ehOuImDH_K2CqrKzQG8IqK5rUCP7slpq_EkaQXomLtkh2utpm6hF4Max18ZhO30DR5zR9opd-ieVBPsbr0itUzxYX-yojoLrQK1EYK-FjDTFhCLQ' SELECT count(*) FROM orders;
+----
+<REGEX>:.*no recognized roles.*
+
+# nor an issuer-wide mapping, nor a constant
+statement error
+ACL ADMIN MAP GROUP 'g-sup' FROM ISSUER kc TO ROLE support;
+----
+<REGEX>:.*holds an administration scope, so it is mapped FROM CLIENT only.*
+
+statement error
+ACL ADMIN CREATE CLIENT fixed ISSUER kc AUDIENCES ('api://fixed') ROLES CONSTANT ('helper');
+----
+<REGEX>:.*ROLES CONSTANT names "helper", which holds an administration scope.*
+
+# the client's own mapping is the one way
+statement ok
+ACL ADMIN MAP GROUP 'g-sup' FROM CLIENT catchall TO ROLE support;
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC90d28iLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1nIiwiZ3JvdXBzIjpbImctc3VwIl19.O64C93wQTB4mz0WiJu84AQKj4ZoOoU0pzxCzboV1d5W8lfIRsmZRhPEZ-eaZklKSKSNd524rpkpvXQzIpZmzUEJXzZGLroS3ZMHTZDb3-AYfaRvAtNRcCMp7iD_8WV2QiCq6Z_vQtWBxmaUDT4e2HoUFrAnevOB4ljctJjrI_ZFLvZ1qZd0PvZmQgz7UaLaCCJemgsV5yUfhlF0cbCUkCJ_q4RnsnUINsieRhyfps1OxSqH3I_P_BZ5J-MDZFwzJEV_u-dR-QWHyearCOOAWGkOJWGljUW_Y7GiQa1nZDmE0mh7GKHtAusSPEnZr6TcHLMrIdTIibzcFEndA7oM65w' SELECT count(*) FROM platform.sessions;
+----
+0
+
+# judged at use: a role mapped issuer-wide BEFORE its point grant stops counting at the next token
+statement ok
+ACL ADMIN CREATE ROLE late;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE late MAIN;
+
+statement ok
+ACL ADMIN MAP CLAIM 'late' FROM ISSUER kc TO ROLE late;
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC90d28iLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1sYXRlIiwicm9sZXMiOlsibGF0ZSJdfQ.J9lR_hgKH2mCD9lLwpcVrmpeHrCHu0HSYXBhmO5EN4eYjsFPhKjl8txwB52FRqkPJCa2tgb25nOfwn-Rb7mrrwNyhSnFVF542pJMNtWbAr3QnzvRH23S__EcWmQ4bz5uLVDrDCPXFDv1QuZGxf8W41cbX6-nR3bmw6E5wIr6Z7mWuPHfLQtWfneQwXAx6Y-mRJ_3u0JGmPIDVTRm-GzZY5gtRUUx_1f2iNj4Bzz1JK2Gg56e-qx_QLIUqzehn-ZdzFcMdf7UfkwCVvGL4QZnLWB3oUAFrO549oW2xtXdy6HIkG0VvYkhQ79zI2Of_-SrDU0EasJSybqzaiSppUOM8w' SELECT count(*) FROM orders;
+----
+0
+
+statement ok
+ACL ADMIN GRANT FUNCTION platform.create_role TO ROLE late;
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC90d28iLCJhdWQiOiJhcGk6Ly9hY2wtdGVzdCIsImV4cCI6NDEwMjQ0NDgwMCwic3ViIjoidS1sYXRlIiwicm9sZXMiOlsibGF0ZSJdfQ.J9lR_hgKH2mCD9lLwpcVrmpeHrCHu0HSYXBhmO5EN4eYjsFPhKjl8txwB52FRqkPJCa2tgb25nOfwn-Rb7mrrwNyhSnFVF542pJMNtWbAr3QnzvRH23S__EcWmQ4bz5uLVDrDCPXFDv1QuZGxf8W41cbX6-nR3bmw6E5wIr6Z7mWuPHfLQtWfneQwXAx6Y-mRJ_3u0JGmPIDVTRm-GzZY5gtRUUx_1f2iNj4Bzz1JK2Gg56e-qx_QLIUqzehn-ZdzFcMdf7UfkwCVvGL4QZnLWB3oUAFrO549oW2xtXdy6HIkG0VvYkhQ79zI2Of_-SrDU0EasJSybqzaiSppUOM8w' SELECT count(*) FROM orders;
+----
+<REGEX>:.*no recognized roles.*
+
+# --- the review of spec 117: no definition reaches the policy store; no policy holder maps to an admin ------
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE pol WITH (select, insert, manage) MAIN;
+
+# a virtual table over the store's own admins would let its writer insert itself a passthrough row
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE sales.a AS store.acl.admins;
+----
+<REGEX>:.*the relation reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE sales.a AS store.acl."Admins";
+----
+<REGEX>:.*reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL VIEW sales.v AS SELECT * FROM query_table('store' || '.acl.issuers');
+----
+<REGEX>:.*(the relation reads the policy store itself|query_table", which its author may not call).*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL VIEW sales.v AS SELECT * FROM store.acl.role_catalogs;
+----
+<REGEX>:.*reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL SCHEMA sales.raw AS store.acl;
+----
+<REGEX>:.*the schema alias reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE sales.leak AS phys.main.orders COLUMNS (id, tenant = (SELECT max(secret) FROM store.acl.issuers));
+----
+<REGEX>:.*the relation's RLS or column list reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE sales.leak AS phys.main.orders RLS (EXISTS (SELECT 1 FROM store.acl.admins));
+----
+<REGEX>:.*the relation's RLS or column list reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" ALTER VIRTUAL TABLE sales.orders SET PHYS store.acl.admins;
+----
+<REGEX>:.*reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE FUNCTION sales.f() AS SELECT * FROM store.acl.admins;
+----
+<REGEX>:.*the function's template reads the policy store itself.*
+
+# a catalog admin is refused the same way
+statement ok
+ACL ADMIN CREATE ROLE pointy;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE pointy CAPS '{"select": true, "insert": true, "manage": true}';
+
+statement error
+ACL ROLE "pointy" CREATE VIRTUAL TABLE sales.adm2 AS store.acl.admins;
+----
+<REGEX>:.*reads the policy store itself.*
+
+query I
+SELECT count(*) FROM store.acl.relations WHERE phys LIKE 'store.acl.%';
+----
+0
+
+# mapping a claim to a role that administers hands the administration out: passthrough's alone
+statement error
+ACL ROLE "pol" MAP CLAIM 'x' FROM CLIENT catchall TO ROLE root;
+----
+<REGEX>:.*"root" holds administration, so mapping a claim to it hands that administration out.*
+
+statement error
+ACL ROLE "pol" SELECT platform.map_role('client', 'catchall', 'claim-value', 'x', 'support');
+----
+<REGEX>:.*"support" holds administration.*
+
+statement ok
+ACL ROLE "root" MAP CLAIM 'x' FROM CLIENT catchall TO ROLE support;
+
+# a bundle another row carries is not revoked alone - it would answer true and change nothing
+statement error
+ACL ADMIN REVOKE ADMIN policy FROM ROLE legacy;
+----
+<REGEX>:.*role "legacy" holds manage, which carries policy - revoke manage.*
+
+statement error
+ACL ADMIN REVOKE ADMIN observe FROM ROLE root;
+----
+<REGEX>:.*role "root" holds passthrough, which carries observe.*
+
+# --- the old admins rows read as bundles after v21 ---------------------------------------------------------
+
+# a v20 catalog: admins keyed by the role alone, no platform_grants - spec 009's rows
+statement ok
+ATTACH ':memory:' AS old;
+
+statement ok
+SELECT acl_use_db('old', 'acl', true);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE was_manage;
+
+statement ok
+ACL ADMIN CREATE ROLE was_catalog;
+
+statement ok
+ACL ADMIN CREATE ROLE was_observe;
+
+statement ok
+ACL ADMIN CREATE ROLE was_passthrough;
+
+statement ok
+DROP TABLE old.acl.admins;
+
+statement ok
+DROP TABLE old.acl.platform_grants;
+
+statement ok
+CREATE TABLE old.acl.admins("role" VARCHAR PRIMARY KEY, "scope" VARCHAR, "vcat" VARCHAR);
+
+statement ok
+INSERT INTO old.acl.admins VALUES ('was_manage', 'manage', ''), ('was_catalog', 'manage', 'sales'), ('was_observe', 'observe', ''), ('was_passthrough', 'passthrough', '');
+
+statement ok
+UPDATE old.acl.meta SET "value" = '20' WHERE "key" IN ('schema_version', 'min_reader_version');
+
+statement error
+SELECT acl_use_db('old', 'acl', false);
+----
+<REGEX>:.*schema version 20 and this build reads 21 - migrate it first.*
+
+# the reserved name: the step refuses while a catalog carries it
+statement ok
+INSERT INTO old.acl.catalogs VALUES ('Platform', NULL);
+
+statement error
+SELECT acl_migrate_catalog('old', 'acl');
+----
+<REGEX>:.*step v21 failed.*reserves the catalog name platform.*catalogs.*
+
+statement ok
+DELETE FROM old.acl.catalogs WHERE vcat = 'Platform';
+
+query T
+SELECT acl_migrate_catalog('old', 'acl');
+----
+"old"."acl" migrated from schema version 20 to 21 (readable from build 21 on)
+
+statement ok
+SELECT acl_use_db('old', 'acl', false);
+
+query TTT
+SELECT "role", "scope", "vcat" FROM old.acl.admins ORDER BY ALL;
+----
+was_catalog	manage	sales
+was_manage	manage	(empty)
+was_observe	observe	(empty)
+was_passthrough	passthrough	(empty)
+
+# spec 009's global manage: policy + observe
+query T
+ACL ROLE "was_manage" SELECT bundles FROM platform.console_info();
+----
+[observe, policy]
+
+# a catalog-scoped manage: that catalog
+query TT
+ACL ROLE "was_catalog" SELECT bundles, admin_catalogs FROM platform.console_info();
+----
+[]	[sales]
+
+query T
+ACL ROLE "was_observe" SELECT bundles FROM platform.console_info();
+----
+[observe]
+
+query T
+ACL ROLE "was_passthrough" SELECT bundles FROM platform.console_info();
+----
+[observe, passthrough]
+
+# and the key is the row now: a second bundle beside the first
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE was_observe;
+
+query T
+ACL ROLE "was_observe" SELECT bundles FROM platform.console_info();
+----
+[observe, policy]

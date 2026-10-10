@@ -670,6 +670,16 @@ void PolicyStore::SessionUseOf(const string &id, string &vcat, string &schema) {
 	}
 }
 
+string PolicyStore::SessionDoorOf(const string &id) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			return entry.second.door;
+		}
+	}
+	return string();
+}
+
 bool PolicyStore::SessionKill(const string &id) {
 	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();
@@ -1234,6 +1244,8 @@ bool TryParseAdminScope(const string &scope, AdminScope &out) {
 		out = AdminScope::PASSTHROUGH;
 	} else if (StringUtil::CIEquals(scope, "manage")) {
 		out = AdminScope::MANAGE;
+	} else if (StringUtil::CIEquals(scope, "policy")) {
+		out = AdminScope::POLICY;
 	} else if (StringUtil::CIEquals(scope, "observe")) {
 		out = AdminScope::OBSERVE;
 	} else {
@@ -1245,7 +1257,8 @@ bool TryParseAdminScope(const string &scope, AdminScope &out) {
 AdminScope ParseAdminScope(const string &scope) {
 	AdminScope out;
 	if (!TryParseAdminScope(scope, out)) {
-		throw BinderException("acl admin: unknown admin scope \"%s\" (expected observe, manage or passthrough)", scope);
+		throw BinderException("acl admin: unknown admin scope \"%s\" (expected observe, policy, manage or passthrough)",
+		                      scope);
 	}
 	return out;
 }
@@ -1256,11 +1269,12 @@ const char *AdminScopeName(AdminScope scope) {
 		return "passthrough";
 	case AdminScope::MANAGE:
 		return "manage";
+	case AdminScope::POLICY:
+		return "policy";
 	case AdminScope::OBSERVE:
 		return "observe";
-	default:
-		throw BinderException("acl admin: an administration grant needs a scope");
 	}
+	throw BinderException("acl admin: an administration grant needs a scope");
 }
 
 void PolicyStore::GrantAdmin(const string &role, AdminScope scope) {
@@ -1269,74 +1283,163 @@ void PolicyStore::GrantAdmin(const string &role, AdminScope scope) {
 		return;
 	}
 	lock_guard<mutex> guard(lock);
-	admin_scopes[role] = scope;
+	admin_scopes[role].insert(AdminScopeName(scope));
 }
 
-void PolicyStore::RevokeAdmin(const string &role) {
+void PolicyStore::RevokeAdmin(const string &role, const string &scope) {
 	if (catalog) {
-		CatalogRevokeAdmin(role);
+		CatalogRevokeAdmin(role, scope);
 		return;
 	}
 	lock_guard<mutex> guard(lock);
-	admin_scopes.erase(role);
+	if (scope.empty()) {
+		admin_scopes.erase(role);
+		// every administration of the role: its point grants on `platform` too (spec 117)
+		vector<PlatformGrantRow> kept;
+		for (auto &grant : platform_grants) {
+			if (!StringUtil::CIEquals(grant.role, role)) {
+				kept.push_back(grant);
+			}
+		}
+		platform_grants = std::move(kept);
+		return;
+	}
+	auto entry = admin_scopes.find(role);
+	if (entry == admin_scopes.end()) {
+		throw BinderException("acl admin: role \"%s\" does not hold %s - nothing to revoke", role, scope);
+	}
+	{
+		auto name = string(AdminScopeName(ParseAdminScope(scope)));
+		for (auto &holds : entry->second) {
+			bool implies = (holds == "manage" && (name == "policy" || name == "observe")) ||
+			               (holds == "passthrough" && name != "passthrough");
+			if (implies) {
+				throw BinderException("acl admin: role \"%s\" holds %s, which carries %s - revoke %s (and grant what "
+				                      "should stay)",
+				                      role, holds, name, holds);
+			}
+		}
+		if (!entry->second.count(name)) {
+			throw BinderException("acl admin: role \"%s\" does not hold %s - nothing to revoke", role, name);
+		}
+		entry->second.erase(name);
+		if (entry->second.empty()) {
+			admin_scopes.erase(entry);
+		}
+	}
 }
+
+void PolicyStore::GrantPlatform(const string &role, const string &kind, const string &object, bool allowed) {
+	if (catalog) {
+		CatalogWritePlatformGrant(role, kind, object, allowed, false);
+		return;
+	}
+	lock_guard<mutex> guard(lock);
+	for (auto &grant : platform_grants) {
+		if (StringUtil::CIEquals(grant.role, role) && StringUtil::CIEquals(grant.kind, kind) &&
+		    StringUtil::CIEquals(grant.object, object)) {
+			grant.allowed = allowed;
+			return;
+		}
+	}
+	platform_grants.push_back(PlatformGrantRow {role, object, kind, allowed});
+}
+
+void PolicyStore::RevokePlatform(const string &role, const string &kind, const string &object) {
+	if (catalog) {
+		CatalogWritePlatformGrant(role, kind, object, true, true);
+		return;
+	}
+	lock_guard<mutex> guard(lock);
+	vector<PlatformGrantRow> kept;
+	for (auto &grant : platform_grants) {
+		if (!(StringUtil::CIEquals(grant.role, role) && StringUtil::CIEquals(grant.kind, kind) &&
+		      StringUtil::CIEquals(grant.object, object))) {
+			kept.push_back(grant);
+		}
+	}
+	platform_grants = std::move(kept);
+}
+
+namespace {
+
+//! One `admins` row read into the rights (spec 097 / 117). The bundles are a SET: each row adds what it
+//! says, and no row is compared with another.
+void ApplyAdminRow(PolicyStore::AdminRights &rights, const string &scope_text, const string &vcat) {
+	AdminScope scope;
+	if (!TryParseAdminScope(scope_text, scope)) {
+		rights.unknown_scope = true; // spec 097: grants nothing here, stays privileged
+		return;
+	}
+	switch (scope) {
+	case AdminScope::OBSERVE:
+		// the report is the node's: an observe row scoped to a catalog (a function driver's) grants
+		// nothing rather than more than it says - and the role is privileged either way (spec 095)
+		if (vcat.empty()) {
+			rights.observe = true;
+		} else {
+			rights.unknown_scope = true;
+		}
+		return;
+	case AdminScope::MANAGE:
+	case AdminScope::POLICY:
+		if (!vcat.empty()) {
+			rights.catalogs.insert(vcat); // a catalog-scoped row, not a global one
+			return;
+		}
+		rights.unrestricted_manage = true;
+		if (scope == AdminScope::MANAGE) {
+			rights.observe = true; // spec 117: spec 009's global manage reads as policy + observe
+		}
+		return;
+	case AdminScope::PASSTHROUGH:
+		rights.passthrough = true;
+		rights.observe = true;
+		return;
+	}
+}
+
+} // namespace
 
 PolicyStore::AdminRights PolicyStore::AdminRightsOf(const Principal &principal) {
 	AdminRights rights;
-	auto raise = [&](AdminScope scope) {
-		if (scope > rights.scope) {
-			rights.scope = scope;
+	auto point = [&](const string &key, bool allowed) {
+		auto entry = rights.platform.find(key);
+		if (entry == rights.platform.end()) {
+			rights.platform[key] = allowed;
+		} else {
+			entry->second = entry->second && allowed; // a deny anywhere among the roles wins
 		}
 	};
 	if (catalog) {
 		// per-catalog management is a capability of the catalog grant, so a role manages as many
-		// catalogs as it was granted; acl.admins carries the global scopes
+		// catalogs as it was granted; acl.admins carries the global bundles, platform_grants the point
+		// grants on the system catalog (spec 117)
 		vector<std::pair<string, string>> rows;
-		CatalogAdminRights(principal, rights.catalogs, rows);
-		if (!rights.catalogs.empty()) {
-			raise(AdminScope::MANAGE);
-		}
+		vector<std::pair<string, bool>> platform;
+		CatalogAdminRights(principal, rights.catalogs, rows, platform);
 		for (auto &row : rows) {
-			AdminScope scope;
-			if (!TryParseAdminScope(row.first, scope)) {
-				rights.unknown_scope = true; // spec 097: grants nothing here, stays privileged
-				continue;
-			}
-			if (scope == AdminScope::OBSERVE) {
-				// the report is the node's: an observe row scoped to a catalog (a function driver's) grants
-				// nothing rather than more than it says
-				if (row.second.empty()) {
-					rights.observe = true;
-				}
-				raise(scope); // and the role is privileged either way (spec 095)
-				continue;
-			}
-			if (scope == AdminScope::MANAGE && !row.second.empty()) {
-				rights.catalogs.insert(row.second); // a catalog-scoped row, not a global one
-				raise(AdminScope::MANAGE);
-				continue;
-			}
-			if (scope == AdminScope::MANAGE) {
-				rights.unrestricted_manage = true;
-			}
-			raise(scope);
+			ApplyAdminRow(rights, row.first, row.second);
 		}
-		rights.observe = rights.observe || rights.unrestricted_manage || rights.scope == AdminScope::PASSTHROUGH;
+		for (auto &grant : platform) {
+			point(grant.first, grant.second);
+		}
 		return rights;
 	}
 	lock_guard<mutex> guard(lock);
 	for (auto &role : principal.roles) {
 		auto entry = admin_scopes.find(role);
-		if (entry == admin_scopes.end()) {
-			continue;
+		if (entry != admin_scopes.end()) {
+			for (auto &scope : entry->second) {
+				ApplyAdminRow(rights, scope, string()); // the memory mode has no catalogs to scope to
+			}
 		}
-		if (entry->second == AdminScope::MANAGE) {
-			rights.unrestricted_manage = true; // the memory mode has no catalogs to scope to
+		for (auto &grant : platform_grants) {
+			if (StringUtil::CIEquals(grant.role, role)) {
+				point(StringUtil::Lower(grant.kind) + ":" + StringUtil::Lower(grant.object), grant.allowed);
+			}
 		}
-		raise(entry->second);
 	}
-	// spec 097: in memory mode every manage is unrestricted, so manage and passthrough read the report
-	rights.observe = rights.scope >= AdminScope::OBSERVE;
 	return rights;
 }
 

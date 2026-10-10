@@ -332,6 +332,55 @@ combined with a certificate. Both doors require cert **and** key together.
   grammar's `phys` targets are not themselves restricted … manage scopes belong to trusted
   operators".
 
+### The platform catalog (spec 117)
+
+- **The scopes are a set of bundles, never an order.** `observe`, `policy` and `passthrough` (spec
+  009's global `manage` reads as `policy` + `observe`; a catalog's `manage` capability is that catalog's
+  administration) are held side by side; every check asks the set ("may administer" = a bundle that
+  writes, a catalog's `manage` or a point grant on a platform function - never `observe` alone), so a
+  scope added later cannot be compared into rights it does not carry.
+- **Rights on administration are grants on `platform`'s objects**: a bundle, or a point grant / deny on
+  one view or function (`platform_grants`, its own table - never a catalog grant, a function grant or a
+  category, which could spread it into every listing or hand it to every role). **Only `passthrough`
+  grants on `platform` and grants the bundles** - a grantor that can grant everything is everything;
+  never to every role, never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting`, `session_profile` - the passthrough scope's own - and `console_info` (every holder's). A deny wins over every bundle but `passthrough`.
+- **A stored body holds only what its author may call** (the review of spec 117): a view, a macro
+  template, an alias target, an RLS, a column or mask expression, a grant's policy runs as the node when
+  read, so an author who is not `passthrough` may store only calls its own function gate admits (its
+  roles' categories and grants by name; the never set always refused) - judged where it is written.
+  `acl_check_catalog` names a body stored before (`body_function_denied`). No definition names the
+  policy catalog's own tables, under any reading of the name. A change to an issuer or a client behind
+  a mapping to an administering role, a mapping to such a role, and a catalog's `manage` for a role a
+  mapping reaches are `passthrough`'s.
+- **One authorizer.** The grammar and a direct `platform.<op>(…)` compile to the same `acl_*` call and
+  are judged by the same table of rights per operation (CATALOG / POLICY / HANDS_OUT / ESCALATES /
+  INFRASTRUCTURE), before anything runs; an operation the table does not know is refused.
+- **Management calls run at the top level only** - `SELECT platform.f(…)` with one item and nothing
+  else, or `CALL platform.f(…)`; in FROM, a subquery, a WHERE, a CTE or per row of another selection
+  they are refused at rewrite, and a batch mixing management and queries is refused. One call is one
+  change and one `admin` audit event.
+- **Arguments that carry authorization are constants** (a catalog, a role, an object, a scope): they are
+  judged before the call runs, which a `?` parameter cannot be. Other arguments may be parameters, and
+  the compiled call carries exactly the user's parameters (the golden rule).
+- **The views widen nothing**: they answer what the `acl_*` listings answered a passthrough operator,
+  narrowed by scope - a catalog admin reads its catalogs' rows and the names of the roles holding them,
+  nothing of identity, categories, resource groups, the cluster or the node. No view carries a secret or
+  a handle (an issuer / client shows the secret's name). A missing grant fails closed: the object is not
+  listed and is `no access`.
+- **No definition reads the policy store itself**: a virtual table, schema alias, expansion, view or
+  macro body, RLS or column expression naming the policy catalog's tables is refused where it is written
+  - otherwise whoever may write the object could write their own `admins` row. And mapping a claim to a
+  role that administers is `passthrough`'s alone, as granting the bundle is.
+- **The name is reserved** and synthesized: no virtual catalog takes it, no management call names it,
+  a function-driver source answering it is refused on every read, `USE platform` is refused, and the
+  v21 migration refuses while a catalog carries it.
+- **Absent on the quack door**: quack loads a catalog whole at `ATTACH`; `platform` is listed and read
+  only on the Flight door and under the gateway's prefixes.
+- **The grammar needs no marker under a principal prefix**, recognized by its leading phrase only; a
+  principal holds no physical rights, so a `GRANT` there can only mean ours. Data DDL (`CREATE TABLE`,
+  `DROP TABLE`, `ALTER … RENAME`) and duckdb's `COMMENT ON TABLE` / `ANALYZE` / `CREATE FUNCTION` are not
+  captured.
+
 ### Audit (spec 069)
 
 Every decision is an event emitted **after** it is made, off the decision path: the parser override
@@ -368,9 +417,10 @@ private address. They publish counts and states, never a principal, a handle or 
 | `create`, `drop` | schema (or catalog) grant | **no** | `CREATE TABLE|VIEW` into the granted physical home; `DROP`; `CREATE OR REPLACE` = both (specs 016/051) |
 | `temp` | MAIN catalog grant | **no** | `CREATE TEMP TABLE` and temp-name resolution on a session connection (spec 050) |
 | `explain` | MAIN catalog grant | **no** | `EXPLAIN [ANALYZE]` - "a plan names the physical objects a query resolves to" (spec 052) |
-| admin scope `manage` (global) | `acl.admins` via `acl_grant_admin` | - | the management grammar over every catalog plus catalog-less statements |
-| admin scope `passthrough` | `acl.admins` via `acl_grant_admin` | - | everything, including `ACL NATIVE`; the only scope that grants scopes |
-| admin scope `observe` | `acl.admins` via `acl_grant_admin` | - | reading the load report and `/metrics` (spec 097); administers nothing - implied by `passthrough` and a global `manage` |
+| bundle `policy` (global; spec 009's `manage` = `policy` + `observe`) | `acl.admins` via `acl_grant_admin` | - | the management grammar and the platform functions over every catalog plus catalog-less statements; the policy views (spec 117) |
+| bundle `passthrough` | `acl.admins` via `acl_grant_admin` | - | everything, including `ACL NATIVE`; the only scope that grants bundles and grants on `platform` |
+| bundle `observe` | `acl.admins` via `acl_grant_admin` | - | the node views, the load report and `/metrics` (spec 097); administers nothing - implied by `passthrough` and a global `manage` |
+| point grant on `platform.<view|function>` | `platform_grants` via `GRANT VIEW|FUNCTION platform.x` (passthrough) | - | one view (whole) or one function; a deny wins over bundles, not over `passthrough` (spec 117) |
 
 The rules behind the table (spec 012): a grant "written without `CAPS` - or a driver row with
 NULL/empty caps - means `select, insert, update, delete, merge`, never `manage`; an explicit `'{}'`
@@ -390,7 +440,9 @@ The token model - who verifies, who acquires, the admin's flow menu, session tok
   `exp`/`nbf`, keys found by the issuer's OIDC discovery or named by a secret of the secrets service
   (specs 007/023/095); then exactly one client of the issuer accepts it (audiences required, `azp`,
   conditions - ties refused, never unioned) and makes roles and attributes of it. A role that
-  administers is reached only through the client's own explicit mapping; a `CONSTANT` attribute is
+  administers - any bundle, any point grant on `platform` (grant or deny) or the `manage` capability on
+  a catalog (spec 117) - is reached only through the client's own explicit mapping, never an
+  issuer-wide mapping, `UNMAPPED AS ROLE` or `ROLES CONSTANT`, judged at use; a `CONSTANT` attribute is
   a ceiling the token cannot pass. "An unverified token never reaches the scope question" (spec 009).
 - A session "carries exactly the prefix's principal, both ways" (spec 040 addendum, 2026-09-03):
   `SessionOpen` now merges role-default claims exactly as `ACL TOKEN` does, so the same token answers

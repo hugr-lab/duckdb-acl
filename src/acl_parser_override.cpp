@@ -1,6 +1,7 @@
 #include "acl_parser_override.hpp"
 
 #include "acl_admin_sql.hpp"
+#include "acl_platform.hpp"
 #include "acl_attach_lineage.hpp"
 #include "acl_audit_pipeline.hpp"
 #include "acl_profile.hpp"
@@ -322,6 +323,8 @@ struct StatementAudit {
 	AuditTrail trail;
 	//! What the override was doing when an exception nobody noted escaped: it names the code
 	Reason phase = Reason::PARSE;
+	//! spec 117: the class a refusal names when it came before any statement was compiled (`manage`)
+	string refused_statement;
 
 	//! The batch runs under a session: its door, its ops id and its own level name the events
 	void OnSession(PolicyStore &store, const string &handle) {
@@ -386,7 +389,9 @@ struct StatementAudit {
 			code = ReasonCode(phase);
 		}
 		AuditTrail::Statement last;
-		if (!trail.statements.empty()) {
+		if (trail.statements.empty()) {
+			last.statement = refused_statement;
+		} else {
 			last = trail.statements.back();
 			if (proto.kind == "admin") {
 				// a management batch is authorized as a whole: the refusal names every call in it
@@ -618,16 +623,61 @@ ParserOverrideResult DrainStreamUnderPrincipal(PolicyStore &store, const string 
 	return ParserOverrideResult(std::move(statements));
 }
 
+//! What the audit's detail says of an administrator: the strongest of what it holds, by name
+const char *RightsDetail(const PolicyStore::AdminRights &rights) {
+	if (rights.passthrough) {
+		return "passthrough";
+	}
+	if (rights.MayAdminister()) {
+		return "manage";
+	}
+	return rights.observe ? "observe" : "none";
+}
+
+//! The audit trail of a compiled management batch: one `manage` entry per call (a cluster item by its
+//! identity), and the text the execution's profile note is matched by (spec 074 / 117) - the call's own
+void NoteManagement(vector<unique_ptr<SQLStatement>> &statements, StatementAudit &audit) {
+	for (auto &stmt : statements) {
+		stmt->query = stmt->ToString();
+		audit.trail.statements.emplace_back();
+		auto &entry = audit.trail.statements.back();
+		entry.statement = "manage";
+		auto call = MgmtCallName(*stmt);
+		entry.objects.push_back(StringUtil::StartsWith(call, "acl_cluster_") ? ClusterAuditObject(*stmt, call)
+		                                                                     : AuditObject {call, "manage"});
+		entry.text_hash = StatementTextHash(stmt->query);
+	}
+}
+
 //! One prefixed batch, decided. Every refusal throws; the caller turns the outcome into the audit's
 //! events, so this only has to say what it is doing (`audit.phase`) and whom it is doing it for.
 ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, ParserOptions &options,
                               StatementAudit &audit) {
 	auto mode = prefix.mode;
 	bool anonymous = prefix.kind == AclPrefix::Kind::ADMIN;
-	if (anonymous && !prefix.marked && IsMgmtStart(prefix.rest)) {
-		// the trusted gateway may write management statements unmarked; an explicit `ACL NATIVE`
-		// means "plain SQL, do not interpret it" and must never be re-routed here
+	bool principal_prefix = prefix.kind == AclPrefix::Kind::ROLE || prefix.kind == AclPrefix::Kind::TOKEN ||
+	                        prefix.kind == AclPrefix::Kind::SESSION;
+	if ((anonymous || principal_prefix) && !prefix.marked && StartsWithMgmt(prefix.rest)) {
+		// the trusted gateway may write management statements unmarked, and (spec 117) so may a principal:
+		// under its prefix the leading phrase is ours whatever duckdb's grammar grows - a principal holds no
+		// physical rights for a GRANT of duckdb's to mean. An explicit `ACL NATIVE` means "plain SQL, do not
+		// interpret it" and must never be re-routed here.
 		mode = AclPrefix::Mode::MANAGE;
+	}
+	if (mode == AclPrefix::Mode::MANAGE || (principal_prefix && mode == AclPrefix::Mode::QUERY)) {
+		RefuseRepeatedPrefix(prefix.rest);
+	}
+	if (mode != AclPrefix::Mode::QUERY) {
+		// management, or native SQL outside the virtual catalog - an event of its own kind from the first
+		// refusal on, whoever is refused (spec 117: the grammar and the call are audited alike)
+		audit.proto.kind = "admin";
+		audit.refused_statement = mode == AclPrefix::Mode::MANAGE ? "manage" : "native";
+	}
+	if (principal_prefix && mode == AclPrefix::Mode::QUERY && BatchHasMgmtStatement(prefix.rest)) {
+		// spec 117: the first statement is a query and a later one management - refused, never split
+		NoteDenyReason(Reason::STATEMENT_TYPE);
+		throw BinderException("acl admin: a batch mixing management statements and queries is refused - send each "
+		                      "kind in a batch of its own");
 	}
 
 	// spec 082: GRANT / REVOKE SECRET manage the node's secrets service, not the ACL - judged by the
@@ -636,8 +686,9 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 
 	Principal principal;
 	PolicyStore::AdminRights rights;
-	rights.scope = AdminScope::PASSTHROUGH; // the anonymous hatch is god mode by definition
+	rights.passthrough = true; // the anonymous hatch is god mode by definition
 	rights.unrestricted_manage = true;
+	rights.observe = true;
 	if (anonymous) {
 		audit.proto.door = "admin";
 		audit.proto.detail = "anonymous";
@@ -662,19 +713,14 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		ResolvePrincipal(store, prefix, principal);
 		audit.proto.principal = principal;
 		rights = store.AdminRightsOf(principal);
-		audit.proto.detail = rights.scope == AdminScope::PASSTHROUGH ? "passthrough"
-		                     : rights.scope == AdminScope::OBSERVE   ? "observe"
-		                                                             : "manage";
-		// spec 097: observe reads the load report and administers nothing - "may administer" is MANAGE+
-		if (rights.scope < AdminScope::MANAGE) {
+		audit.proto.detail = RightsDetail(rights);
+		// spec 097 / 117: observe reads and administers nothing - "may administer" is a bundle that writes,
+		// a catalog's manage or a point grant on a platform function, asked of the set, never an order
+		if (!rights.MayAdminister()) {
 			NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
 			throw BinderException("acl admin: the principal has no ACL administration scope");
 		}
 	}
-	if (mode != AclPrefix::Mode::QUERY) {
-		audit.proto.kind = "admin"; // management, or native SQL outside the virtual catalog
-	}
-
 	if (secrets) {
 		// compiled to the service catalog's own calls, which the service authorizes once more: it
 		// manages only for a principal it knows as an administrator (tresor spec 009)
@@ -696,22 +742,17 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		// the management grammar (spec 008): compiled to admin-function calls, no native parse
 		audit.phase = Reason::PARSE;
 		auto statements = ParseMgmtBatch(prefix.rest, audit.proto.session); // CURRENT is this session
-		for (auto &stmt : statements) {
-			audit.trail.statements.emplace_back();
-			audit.trail.statements.back().statement = "manage";
-			auto call = MgmtCallName(*stmt);
-			audit.trail.statements.back().objects.push_back(StringUtil::StartsWith(call, "acl_cluster_")
-			                                                    ? ClusterAuditObject(*stmt, call)
-			                                                    : AuditObject {call, "manage"});
-		}
+		NoteManagement(statements, audit);
 		audit.phase = Reason::MGMT_UNAUTHORIZED;
 		AuthorizeMgmt(statements, rights);
+		AuthorizeRoleTargets(statements, rights, store);
+		AuthorizeBodies(statements, rights, store, principal);
 		return ParserOverrideResult(std::move(statements));
 	}
 	if (mode == AclPrefix::Mode::NATIVE) {
 		audit.trail.statements.emplace_back();
 		audit.trail.statements.back().statement = "native";
-		if (rights.scope != AdminScope::PASSTHROUGH) {
+		if (!rights.passthrough) {
 			// a manage scope administers the ACL; running SQL outside the virtual catalog is god mode
 			NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
 			throw BinderException("acl admin: native SQL outside the virtual catalog requires a passthrough scope");
@@ -743,6 +784,63 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		auto rest = mode == AclPrefix::Mode::QUERY ? UseSchemaAsSet(prefix.rest) : prefix.rest;
 		parser.ParseQuery(rest);
 		statements = std::move(parser.statements);
+	}
+
+	if (mode == AclPrefix::Mode::QUERY && principal_prefix) {
+		// spec 117: `SELECT platform.f(…)` / `CALL platform.f(…)` at the top level is a management call - the
+		// same acl_* call the grammar compiles to, judged by the same authorizer. Anywhere else in a query the
+		// rewriter refuses it; a batch of calls and queries is refused here.
+		vector<unique_ptr<SQLStatement>> compiled(statements.size());
+		idx_t calls = 0;
+		try {
+			for (idx_t i = 0; i < statements.size(); i++) {
+				if (CompilePlatformCall(*statements[i], compiled[i])) {
+					calls++;
+				}
+			}
+		} catch (std::exception &) {
+			// a call written wrongly (a parameter where authorization is carried, an argument it does not take)
+			// is a management refusal of a known principal - audited as the grammar's would be
+			audit.proto.kind = "admin";
+			audit.refused_statement = "manage";
+			try {
+				ResolvePrincipal(store, prefix, principal);
+				audit.proto.principal = principal;
+			} catch (std::exception &) { // NOLINT: the principal's own refusal is not this one's
+			}
+			NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
+			throw;
+		}
+		if (calls > 0) {
+			if (calls != statements.size()) {
+				NoteDenyReason(Reason::STATEMENT_TYPE);
+				throw BinderException("acl admin: a batch mixing management statements and queries is refused - "
+				                      "send each kind in a batch of its own");
+			}
+			audit.proto.kind = "admin";
+			audit.refused_statement = "manage";
+			audit.phase = Reason::PRINCIPAL;
+			ResolvePrincipal(store, prefix, principal);
+			audit.proto.principal = principal;
+			if (!principal.session.empty() && store.SessionDoorOf(principal.session) == "quack") {
+				// the platform catalog is absent on the quack door - its functions too; the grammar stays
+				NoteDenyReason(Reason::NO_ACCESS);
+				throw BinderException("acl_rewrite: the platform catalog is not served on the quack door - write the "
+				                      "management statement itself (GRANT ..., CREATE ROLE ...)");
+			}
+			rights = store.AdminRightsOf(principal);
+			audit.proto.detail = RightsDetail(rights);
+			if (!rights.MayAdminister()) {
+				NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
+				throw BinderException("acl admin: the principal has no ACL administration scope");
+			}
+			NoteManagement(compiled, audit);
+			audit.phase = Reason::MGMT_UNAUTHORIZED;
+			AuthorizeMgmt(compiled, rights);
+			AuthorizeRoleTargets(compiled, rights, store);
+			AuthorizeBodies(compiled, rights, store, principal);
+			return ParserOverrideResult(std::move(compiled));
+		}
 	}
 
 	if (mode == AclPrefix::Mode::NATIVE) {

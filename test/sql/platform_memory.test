@@ -1,0 +1,110 @@
+# name: test/sql/platform_memory.test
+# description: the platform catalog in the in-memory store (spec 117) - the bundles and the point grants
+#   live in the store; the node views, the function views and console_info answer, the views that read
+#   the policy catalog's tables refuse with what to do; the management calls work as the grammar does.
+# group: [sql]
+
+require acl
+
+statement ok
+SELECT acl_define_role('pol', '');
+
+statement ok
+SELECT acl_define_role('obs', '');
+
+statement ok
+SELECT acl_define_role('sup', '');
+
+statement ok
+SELECT acl_grant_admin('pol', 'policy');
+
+statement ok
+SELECT acl_grant_admin('obs', 'observe');
+
+# a second bundle adds
+statement ok
+SELECT acl_grant_admin('obs', 'policy');
+
+query T
+ACL ROLE "obs" SELECT bundles FROM platform.console_info();
+----
+[observe, policy]
+
+statement ok
+SELECT acl_revoke_admin('obs', 'policy');
+
+query T
+ACL ROLE "obs" SELECT bundles FROM platform.console_info();
+----
+[observe]
+
+query TT
+ACL ROLE "obs" SELECT draining, sessions FROM platform.drain;
+----
+false	0
+
+query T
+ACL ROLE "pol" SELECT count(*) > 0 FROM platform.function_categories;
+----
+true
+
+statement error
+ACL ROLE "pol" SELECT * FROM platform.catalogs;
+----
+<REGEX>:.*platform.catalogs needs a policy catalog - this policy source cannot enumerate it \(acl_use_db\).*
+
+statement error
+ACL ROLE "obs" SELECT * FROM platform.catalogs;
+----
+<REGEX>:.*no access to object "platform.catalogs".*
+
+# the calls and the bare grammar, as in a catalog
+statement ok
+ACL ROLE "pol" SELECT platform.create_role('made_by_call', claims := 'tenant=acme');
+
+statement ok
+ACL ROLE "pol" CREATE ROLE made_by_grammar;
+
+statement error
+ACL ROLE "obs" SELECT platform.create_role('nope');
+----
+<REGEX>:.*the principal has no ACL administration scope.*
+
+# point grants in the store: one view, whole; a deny wins over a bundle
+statement ok
+SELECT acl_grant_platform('sup', 'view', 'drain');
+
+query T
+ACL ROLE "sup" SELECT draining FROM platform.drain;
+----
+false
+
+statement error
+ACL ROLE "sup" SELECT * FROM platform.sessions;
+----
+<REGEX>:.*no access to object "platform.sessions".*
+
+statement ok
+SELECT acl_grant_platform('obs', 'view', 'drain', 'false');
+
+statement error
+ACL ROLE "obs" SELECT * FROM platform.drain;
+----
+<REGEX>:.*no access to object "platform.drain".*
+
+statement ok
+SELECT acl_revoke_platform('obs', 'view', 'drain');
+
+query T
+ACL ROLE "obs" SELECT draining FROM platform.drain;
+----
+false
+
+# REVOKE ADMIN with no bundle takes the point grants too
+statement ok
+SELECT acl_revoke_admin('sup');
+
+statement error
+ACL ROLE "sup" SELECT * FROM platform.drain;
+----
+<REGEX>:.*no access to object "platform.drain".*

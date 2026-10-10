@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS <function_category_members>("category" ACL_KEY_TEXT, 
 
 -- a grant to role '' is every role's; a row names either a category (key columns '') or a function
 -- (category ''); allowed = false is a deny, and a deny anywhere among a principal's roles wins
-CREATE TABLE IF NOT EXISTS <function_grants>("role" ACL_KEY_TEXT, "category" ACL_KEY_TEXT, "database" ACL_KEY_TEXT, "schema" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "allowed" BOOLEAN, PRIMARY KEY ("role", "category", "database", "schema", "name", "kind"));
+CREATE TABLE IF NOT EXISTS <function_grants>("role" ACL_KEY_TEXT, "category" ACL_KEY_TEXT, "database" ACL_KEY_TEXT, "schema" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "allowed" BOOLEAN NOT NULL DEFAULT true, PRIMARY KEY ("role", "category", "database", "schema", "name", "kind"));
 
 -- spec 095: an issuer is the trust anchor (its URL, or an oidc_issuer secret of the secrets service
 -- carrying it); its keys come from OIDC discovery or that secret - never from here. A client is what of
@@ -72,8 +72,15 @@ CREATE TABLE IF NOT EXISTS <issuers>("name" ACL_KEY_TEXT PRIMARY KEY, "url" VARC
 
 CREATE TABLE IF NOT EXISTS <clients>("name" ACL_KEY_TEXT PRIMARY KEY, "issuer" VARCHAR, "audiences" VARCHAR, "azp" VARCHAR, "requires" VARCHAR, "roles_from" VARCHAR, "roles_constant" VARCHAR, "unmapped" VARCHAR, "attributes" VARCHAR, "subject" VARCHAR, "token_type" VARCHAR, "client_id" VARCHAR, "flows" VARCHAR, "secret_service" VARCHAR, "secret" VARCHAR, "implicit" BOOLEAN);
 
--- '' as vcat means "every catalog": NULL cannot be part of the primary key
-CREATE TABLE IF NOT EXISTS <admins>("role" ACL_KEY_TEXT PRIMARY KEY, "scope" VARCHAR, "vcat" VARCHAR);
+-- '' as vcat means "every catalog": NULL cannot be part of the primary key. Spec 117: a role holds
+-- several bundles (observe, policy, passthrough; manage is spec 009's policy + observe), so the key is the row
+CREATE TABLE IF NOT EXISTS <admins>("role" ACL_KEY_TEXT, "scope" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, PRIMARY KEY ("role", "scope", "vcat"));
+
+-- spec 117: point grants on the platform catalog's objects (kind view | function); allowed = false is a
+-- deny, which wins over every bundle but passthrough. Never in role_catalogs / role_object_caps /
+-- function_grants: a row there would spread into every listing, and a category could hand platform's
+-- keys to every role
+CREATE TABLE IF NOT EXISTS <platform_grants>("role" ACL_KEY_TEXT, "object" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "allowed" BOOLEAN NOT NULL DEFAULT true, PRIMARY KEY ("role", "object", "kind"));
 
 -- spec 095: a mapping is scoped to one client or to every client of one issuer
 CREATE TABLE IF NOT EXISTS <role_mappings>("scope_kind" ACL_KEY_TEXT, "scope_name" ACL_KEY_TEXT, "source" ACL_KEY_TEXT, "external_value" ACL_KEY_TEXT, "role" ACL_KEY_TEXT, PRIMARY KEY ("scope_kind", "scope_name", "source", "external_value", "role"));
@@ -131,11 +138,11 @@ CREATE TABLE IF NOT EXISTS <cluster_deps>("scope" ACL_KEY_TEXT, "name" ACL_KEY_T
 -- @seed function_categories
 
 -- @section schema
-INSERT INTO <meta> SELECT 'schema_version', '20' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '21' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');
 INSERT INTO <meta> SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'config_version');
 -- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
 -- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
-INSERT INTO <meta> SELECT 'min_reader_version', '20' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');
+INSERT INTO <meta> SELECT 'min_reader_version', '21' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'min_reader_version');

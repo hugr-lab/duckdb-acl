@@ -115,6 +115,62 @@ void ParamsThroughInjectedInsert() {
 	}
 }
 
+//! spec 117: a platform call's arguments are constants where they carry authorization - judged before the
+//! call runs, which a parameter cannot be - and may be the user's parameters elsewhere; the compiled acl_*
+//! call carries exactly the user's parameters, still none of the rewrite's own
+void PlatformCallParameters() {
+	DuckDB db(nullptr);
+	Connection con(db);
+	Exec(con, "LOAD acl");
+	Exec(con, "ATTACH ':memory:' AS store");
+	Exec(con, "SELECT acl_use_db('store', 'acl', true)");
+	Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
+	Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG sales");
+	Exec(con, "ACL ADMIN CREATE ROLE pol");
+	Exec(con, "ACL ADMIN GRANT ADMIN policy TO ROLE pol");
+
+	auto authz = con.Prepare("ACL ROLE \"pol\" SELECT platform.create_role(?)");
+	Check(authz->HasError() &&
+	          authz->GetError().find("carries authorization and must be a constant") != std::string::npos,
+	      "a parameter for the role is refused: " + (authz->HasError() ? authz->GetError() : "it prepared"));
+	auto catalog = con.Prepare("ACL ROLE \"pol\" SELECT platform.alter_catalog($1, 'x')");
+	Check(catalog->HasError() &&
+	          catalog->GetError().find("carries authorization and must be a constant") != std::string::npos,
+	      "...and for the catalog: " + (catalog->HasError() ? catalog->GetError() : "it prepared"));
+
+	auto payload = con.Prepare("ACL ROLE \"pol\" SELECT platform.alter_catalog('sales', comment := ?)");
+	if (!CheckOk(*payload, "a parameter for the comment prepares")) {
+		return;
+	}
+	Check(payload->GetParameterCount() == 1, "the compiled call carries exactly the user's parameter");
+	auto first = payload->Execute("the first");
+	CheckOk(*first, "...and executes");
+	auto stored = con.Query("SELECT comment FROM store.acl.catalogs WHERE vcat = 'sales'");
+	Check(!stored->HasError() && stored->Collection().GetValue(0, 0).ToString() == "the first",
+	      "the bound value is what the call wrote");
+	auto second = payload->Execute("the second");
+	CheckOk(*second, "...and re-executes with another value");
+	stored = con.Query("SELECT comment FROM store.acl.catalogs WHERE vcat = 'sales'");
+	Check(!stored->HasError() && stored->Collection().GetValue(0, 0).ToString() == "the second",
+	      "each execution is its own change");
+
+	// the call keeps the column alias it was written with; the grammar answers under the call's name
+	auto aliased = con.Query("ACL ROLE \"pol\" SELECT platform.create_role('aliased_role') AS made");
+	Check(!aliased->HasError() && aliased->ColumnName(0).GetIdentifierName() == "made",
+	      "a call keeps its alias: " +
+	          (aliased->HasError() ? aliased->GetError() : aliased->ColumnName(0).GetIdentifierName()));
+	auto named = con.Query("ACL ROLE \"pol\" CREATE ROLE named_role");
+	Check(!named->HasError() && named->ColumnName(0).GetIdentifierName() == "create_role",
+	      "the grammar answers as the call is named: " +
+	          (named->HasError() ? named->GetError() : named->ColumnName(0).GetIdentifierName()));
+	// the grammar's compiled call prepares the same way (and carries no parameter of its own)
+	auto grammar = con.Prepare("ACL ROLE \"pol\" CREATE ROLE prepared_role");
+	if (CheckOk(*grammar, "a management statement prepares")) {
+		Check(grammar->GetParameterCount() == 0, "...with no parameter");
+		CheckOk(*grammar->Execute(), "...and executes");
+	}
+}
+
 void Run() {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -139,6 +195,7 @@ void Run() {
 	// its own instance: the grant policy needs a policy catalog, and switching the store mid-test
 	// would change what the scenarios above resolve against
 	Scenario("params-through-injected-insert", []() { ParamsThroughInjectedInsert(); });
+	Scenario("platform-call-parameters", []() { PlatformCallParameters(); });
 }
 
 } // namespace

@@ -190,6 +190,20 @@ def cpp_literal(text):
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def key_columns(sql):
+    """A step's CREATE TABLE as the extension applies it: its primary-key columns written as ACL_KEY_TEXT,
+    which the runner turns into the key type the catalog's kind needs (spec 033 - SQL Server cannot index
+    NVARCHAR(MAX)). The step files stay plain VARCHAR, so an operator applies them by hand as they are."""
+    match = re.match(r'(CREATE TABLE (?:IF NOT EXISTS )?<[a-z_]+>\()(.*), PRIMARY KEY \(([^)]*)\)\)$', sql)
+    if not match:
+        return sql
+    keys = [k.strip() for k in match.group(3).split(",")]
+    columns = match.group(2)
+    for key in keys:
+        columns = re.sub(r'(%s) VARCHAR\b' % re.escape(key), r"\1 ACL_KEY_TEXT", columns)
+    return match.group(1) + columns + ", PRIMARY KEY (" + match.group(3) + "))"
+
+
 def read_migrations():
     """spec 094: every step of schema/migrations/ as (version, min_reader, statements), the names
     turned back into placeholders (`acl."meta"` -> `<meta>`) so the extension applies a step to
@@ -212,7 +226,7 @@ def read_migrations():
             raise SystemExit("gen_schema: %s declares min_reader %d above its own version" % (name, min_reader))
         body = []
         for _, _, sql in read_statements(path):
-            body.append(re.sub(r'acl\."([a-z_]+)"', r"<\1>", sql))
+            body.append(key_columns(re.sub(r'acl\."([a-z_]+)"', r"<\1>", sql)))
         steps.append((version, min_reader, body))
     return steps
 
