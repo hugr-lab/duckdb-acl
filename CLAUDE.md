@@ -658,7 +658,7 @@ statement's parameter map carried over) in the override, refused anywhere else b
 functions `check_catalog([c])` / `console_info()` in FROM. **ONE authorizer**: `AuthorizeMgmt` /
 `AuthorizeAdminCall` (moved from acl_admin_sql.cpp) judge every compiled call - grammar or call - by its
 `PlatformRight` (CATALOG / POLICY / HANDS_OUT / ESCALATES / INFRASTRUCTURE / OPERATE / OPEN); OPERATE is
-spec 118's `operate` bundle, and until 118.2 the cluster views (`PlatformViewClass::CLUSTER`) are passthrough's,
+spec 118's `operate` bundle, INFRASTRUCTURE and the cluster views (`PlatformViewClass::CLUSTER`) its `cluster` bundle,
 and no definition may name the policy store's own tables (`RequireNotPolicyStore`), nor may a non-passthrough
 map a claim to a privileged role, repoint an issuer / client behind such a mapping or give a mapped role a
 catalog's manage (`AuthorizeRoleTargets`); every stored body (view, template, alias, RLS, mask, a grant's
@@ -679,7 +679,7 @@ a retained result is read from the handle. The view comment and the stored catal
 reach the listings. Tests: `platform_{views,calls,rights,markerless,reserved,memory}.test`,
 `test_acl_session.cpp` / `test_acl_params_passthrough.cpp`, `test/e2e/flight/admin.sh`, the door e2e.
 
-**Spec 118 — node and cluster management** (in stages; 118.1 built): the `operate` bundle
+**Spec 118 — node and cluster management** (in stages; 118.1 and 118.2 built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
 point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`
 (a single-quoted id - duckdb's `SET SESSION <setting>` is never captured), `PROFILE SESSION`, `DRAIN NODE`,
@@ -691,8 +691,15 @@ refused there - a node's divergence is shown (118.2's drift, the audit), never b
 with NO secrets service attached keeps a principal's `CREATE / DROP SECRET` (naming no storage) itself by
 duckdb's rule (`PERSISTENT` to its files, else memory; `LocalSecrets` in the rewriter). The cluster DETACH
 counts a virtual view whose `view_sql` names the source as a qualifier (`SqlNamesSource`, text: over-reading
-blocks, FORCE answers). Next: 118.2 (`acl_deployment`, `cluster`, drift), 118.3 (`platform.attached`, `GRANT
-SOURCE`).
+blocks, FORCE answers; macro bodies too). 118.2: `acl_deployment` = standalone (default) | cluster
+(GLOBAL-only, never a profile item; `PolicyStore::ClusterNode()`): a standalone node refuses every `ACL CLUSTER`
+write (`RequireClusterDeployment`; the listings read) and keeps local secrets; a cluster node keeps secrets only
+in its service. The `cluster` bundle (`AdminScope::CLUSTER`, `AdminRights::cluster` ⊇ operate ⊇ observe; passthrough
+implies it) = INFRASTRUCTURE and the CLUSTER views, never a point grant, never a data-path setting
+(`ClusterSettingIsDataPath` - passthrough's). `platform.drift` (`acl_platform_drift()`, `PolicyStore::ClusterDrift`):
+per database / loaded extension / profiled setting a state same | differs | node_only | profile_only | bootstrap;
+showing only. Cluster parts stay in acl_cluster.cpp (to move to hugr_node). Next: 118.3 (`platform.attached`,
+`GRANT SOURCE`).
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant

@@ -346,6 +346,17 @@ void RequireClusterCatalog(const unique_ptr<CatalogBackend> &catalog, const char
 	}
 }
 
+//! spec 118: a standalone node has no cluster profile - its bootstrap SQL and its admin's ACL NATIVE
+//! configure it; the profile is a cluster node's (acl_deployment, set by the deployment)
+void RequireClusterDeployment(PolicyStore &store, const char *what) {
+	if (!store.ClusterNode()) {
+		throw BinderException("%s: this node is standalone (acl_deployment) - it has no cluster profile; its "
+		                      "bootstrap and ACL NATIVE configure it, or its deployment starts it with SET GLOBAL "
+		                      "acl_deployment = 'cluster'",
+		                      what);
+	}
+}
+
 using ReadFn = std::function<unique_ptr<QueryResult>(const string &)>;
 
 void RequireScope(const ReadFn &read, CatalogBackend &catalog, const string &scope) {
@@ -403,10 +414,18 @@ string JsonField(const string &json, const char *field) {
 
 } // namespace
 
+bool ClusterSettingIsDataPath(const string &name) {
+	static const case_insensitive_set_t DATA_PATH_SETTINGS = {
+	    "http_proxy",     "http_proxy_username", "http_proxy_password", "ca_cert_file",    "custom_user_agent",
+	    "log_query_path", "profile_output",      "temp_directory",      "logging_storage", "duckdb_api"};
+	return DATA_PATH_SETTINGS.count(name) > 0;
+}
+
 PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, const string &scope, const string &name,
                                                          const string &version, const string &repository,
                                                          const string &comment) {
 	RequireClusterCatalog(catalog, "acl_cluster_extension");
+	RequireClusterDeployment(*this, "acl_cluster_extension");
 	auto db = instance.lock();
 	if (!db) {
 		throw BinderException("acl cluster: the instance is gone");
@@ -514,6 +533,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
                                                       const string &options_json, const vector<string> &depends_on,
                                                       const string &comment, const string &lineage) {
 	RequireClusterCatalog(catalog, "acl_cluster_attach");
+	RequireClusterDeployment(*this, "acl_cluster_attach");
 	auto db = instance.lock();
 	if (!db) {
 		throw BinderException("acl cluster: the instance is gone");
@@ -635,6 +655,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const string &alias, bool cascade,
                                                       bool force) {
 	RequireClusterCatalog(catalog, "acl_cluster_detach");
+	RequireClusterDeployment(*this, "acl_cluster_detach");
 	auto db = instance.lock();
 	if (!db) {
 		throw BinderException("acl cluster: the instance is gone");
@@ -841,6 +862,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const string &scope, const string &name,
                                                        const string &value) {
 	RequireClusterCatalog(catalog, "acl_cluster_setting");
+	RequireClusterDeployment(*this, "acl_cluster_setting");
 	auto db = instance.lock();
 	if (!db) {
 		throw BinderException("acl cluster: the instance is gone");
@@ -853,6 +875,10 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 		throw BinderException("acl cluster: \"%s\" is the node's hardening, fixed by its bootstrap - never a "
 		                      "cluster profile item",
 		                      name);
+	}
+	if (StringUtil::CIEquals(name, "acl_deployment")) {
+		throw BinderException("acl cluster: \"acl_deployment\" is the node's own (its deployment sets it) - never a "
+		                      "cluster profile item");
 	}
 	if (StringUtil::CIEquals(name, "acl_node_group")) {
 		// spec 096: which group a node is in is its deployment's, never the policy's - a profile item
@@ -897,6 +923,109 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 		                  "rolls the change out through drain";
 	    });
 	return answer;
+}
+
+bool PolicyStore::ClusterNode() {
+	auto db = instance.lock();
+	Value value;
+	return db && db->TryGetCurrentSetting("acl_deployment", value) && !value.IsNull() &&
+	       StringUtil::CIEquals(value.ToString(), "cluster");
+}
+
+vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
+	RequireClusterCatalog(catalog, "acl_platform_drift");
+	if (!ClusterNode()) {
+		throw BinderException("acl_platform_drift: this node is standalone (acl_deployment) - drift is a cluster "
+		                      "node's, measured against its cluster profile");
+	}
+	auto db = instance.lock();
+	if (!db) {
+		throw BinderException("acl cluster: the instance is gone");
+	}
+	vector<DriftRow> out;
+	auto effective = ClusterEffective();
+	case_insensitive_map_t<const ClusterItem *> profile[3]; // setting, extension, source
+	auto slot = [](const string &kind) {
+		return kind == "setting" ? 0 : kind == "extension" ? 1 : 2;
+	};
+	for (auto &item : effective) {
+		profile[slot(item.kind)][item.name] = &item;
+	}
+	// databases: bootstrap (the default, the policy's, a secrets service) or compared with the sources
+	string default_db;
+	{
+		auto current = NodeQuery(*db, "SELECT current_database()");
+		if (current->RowCount() > 0) {
+			default_db = current->Collection().GetValue(0, 0).ToString();
+		}
+	}
+	auto databases = NodeQuery(*db, "SELECT database_name, coalesce(path, ':memory:'), type FROM duckdb_databases() "
+	                                "WHERE NOT internal");
+	ResultRows database_rows(*databases);
+	case_insensitive_set_t on_node;
+	for (idx_t i = 0; i < database_rows.Count(); i++) {
+		auto name = database_rows.GetValue(0, i).ToString();
+		auto path = database_rows.GetValue(1, i).ToString();
+		auto type = database_rows.GetValue(2, i).ToString();
+		on_node.insert(name);
+		auto source = profile[2].find(name);
+		if (source != profile[2].end()) {
+			auto wanted = JsonField(source->second->spec, "path");
+			out.push_back({"database", name, wanted == path ? "same" : "differs", path, wanted, source->second->scope});
+			continue;
+		}
+		bool bootstrap = StringUtil::CIEquals(name, default_db) || StringUtil::CIEquals(type, "tresor") ||
+		                 (catalog && StringUtil::CIEquals(name, catalog->db_name));
+		out.push_back({"database", name, bootstrap ? "bootstrap" : "node_only", path, "", ""});
+	}
+	for (auto &source : profile[2]) {
+		if (!on_node.count(source.first)) {
+			out.push_back({"database", source.first, "profile_only", "", JsonField(source.second->spec, "path"),
+			               source.second->scope});
+		}
+	}
+	// extensions: the loaded ones; statically linked and acl itself are the build's
+	auto extensions = NodeQuery(*db, "SELECT extension_name, coalesce(extension_version, ''), install_mode::VARCHAR "
+	                                 "FROM duckdb_extensions() WHERE loaded");
+	ResultRows extension_rows(*extensions);
+	case_insensitive_set_t loaded;
+	for (idx_t i = 0; i < extension_rows.Count(); i++) {
+		auto name = extension_rows.GetValue(0, i).ToString();
+		auto version = extension_rows.GetValue(1, i).ToString();
+		auto mode = extension_rows.GetValue(2, i).ToString();
+		loaded.insert(name);
+		auto item = profile[1].find(name);
+		if (item != profile[1].end()) {
+			auto wanted = JsonField(item->second->spec, "version");
+			bool same = wanted.empty() || StringUtil::CIEquals(wanted, version);
+			out.push_back({"extension", name, same ? "same" : "differs", version, wanted, item->second->scope});
+			continue;
+		}
+		bool bootstrap = StringUtil::CIEquals(name, "acl") || StringUtil::Contains(StringUtil::Upper(mode), "STATIC");
+		out.push_back({"extension", name, bootstrap ? "bootstrap" : "node_only", version, "", ""});
+	}
+	for (auto &item : profile[1]) {
+		if (!loaded.count(item.first)) {
+			out.push_back({"extension", item.first, "profile_only", "", JsonField(item.second->spec, "version"),
+			               item.second->scope});
+		}
+	}
+	// settings: the profile's compared (a setting the profile does not name has no "desired" value to be
+	// told from), and the deployment's own listed as bootstrap
+	for (auto &item : profile[0]) {
+		auto current =
+		    NodeQuery(*db, "SELECT value FROM duckdb_settings() WHERE lower(name) = lower(" + Quoted(item.first) + ")");
+		auto value = current->RowCount() > 0 ? current->Collection().GetValue(0, 0).ToString() : string();
+		auto wanted = JsonField(item.second->spec, "value");
+		out.push_back({"setting", item.first, StringUtil::CIEquals(value, wanted) ? "same" : "differs", value, wanted,
+		               item.second->scope});
+	}
+	for (auto name : {"acl_deployment", "acl_node_group"}) {
+		Value value;
+		db->TryGetCurrentSetting(name, value);
+		out.push_back({"setting", name, "bootstrap", value.IsNull() ? string() : value.ToString(), "", ""});
+	}
+	return out;
 }
 
 string PolicyStore::NodeGroup() {
@@ -1157,6 +1286,48 @@ unique_ptr<GlobalTableFunctionState> EffectiveInit(ClientContext &, TableFunctio
 	return std::move(state);
 }
 
+//! acl_platform_drift() (spec 118): platform.drift's body - this cluster node against its profile
+struct DriftState : public GlobalTableFunctionState {
+	vector<PolicyStore::DriftRow> rows;
+	idx_t next = 0;
+};
+
+unique_ptr<FunctionData> DriftBindFn(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+                                     vector<Identifier> &names) {
+	for (auto name : {"kind", "name", "state", "node_value", "profile_value", "scope"}) {
+		names.push_back(Identifier(name));
+		types.push_back(LogicalType::VARCHAR);
+	}
+	auto bind = make_uniq<ItemsBind>();
+	bind->store = input.info->Cast<ClusterInfo>().store;
+	return std::move(bind);
+}
+
+unique_ptr<GlobalTableFunctionState> DriftInit(ClientContext &, TableFunctionInitInput &input) {
+	auto state = make_uniq<DriftState>();
+	state->rows = input.bind_data->Cast<ItemsBind>().store->ClusterDrift();
+	return std::move(state);
+}
+
+void DriftScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<DriftState>();
+	idx_t count = 0;
+	auto text = [](const string &value) {
+		return value.empty() ? Value(LogicalType::VARCHAR) : Value(value);
+	};
+	while (state.next < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows[state.next++];
+		output.data[0].SetValue(count, Value(row.kind));
+		output.data[1].SetValue(count, Value(row.name));
+		output.data[2].SetValue(count, Value(row.state));
+		output.data[3].SetValue(count, text(row.node_value));
+		output.data[4].SetValue(count, text(row.profile_value));
+		output.data[5].SetValue(count, Value(row.scope));
+		count++;
+	}
+	output.SetChildCardinality(count);
+}
+
 //! acl_cluster_applied(version) (spec 096): the node agent says which profile version this node has
 //! converged to - acl does not converge a node, it reports what the agent says (the load report's
 //! config.applied, and readiness when it equals the target)
@@ -1205,6 +1376,9 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	effective.function_info = info;
 	loader.RegisterFunction(effective);
 	scalar("acl_cluster_applied", {LogicalType::BIGINT}, ClusterAppliedFunc, LogicalType::BIGINT);
+	TableFunction drift(Identifier("acl_platform_drift"), {}, DriftScan, DriftBindFn, DriftInit);
+	drift.function_info = info;
+	loader.RegisterFunction(drift);
 }
 
 } // namespace acl

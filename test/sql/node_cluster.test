@@ -1,0 +1,187 @@
+# name: test/sql/node_cluster.test
+# description: spec 118.2 - two deployments (acl_deployment): a standalone node has no cluster profile, a
+#   cluster node's profile is what the fleet runs and platform.drift shows what this node carries against
+#   it - ACL NATIVE stays unrestricted, its effect is shown, never refused
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ADMIN CREATE ROLE fleet;
+
+statement ok
+ACL ADMIN GRANT ADMIN cluster TO ROLE fleet;
+
+statement ok
+ACL ADMIN CREATE ROLE keeper;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE keeper WITH (select, secrets) MAIN;
+
+# --- the deployment's setting: GLOBAL, two values, never a profile item ---------------------------------
+
+query I
+SELECT current_setting('acl_deployment');
+----
+standalone
+
+statement error
+SET acl_deployment = 'cluster';
+----
+<REGEX>:.*acl_deployment is global.*
+
+statement error
+SET GLOBAL acl_deployment = 'fleet';
+----
+<REGEX>:.*acl_deployment is 'standalone' or 'cluster'.*
+
+# --- standalone: no cluster profile, no drift ---------------------------------------------------------
+
+statement error
+ACL ADMIN CLUSTER SET threads = 2;
+----
+<REGEX>:.*this node is standalone \(acl_deployment\) - it has no cluster profile.*
+
+statement error
+ACL ROLE "root" CLUSTER ATTACH ':memory:' AS src (TYPE duckdb);
+----
+<REGEX>:.*this node is standalone.*
+
+statement error
+ACL ROLE "root" SELECT * FROM platform.drift;
+----
+<REGEX>:.*this node is standalone \(acl_deployment\) - drift is a cluster node's.*
+
+# reading the (empty) profile stays possible
+query I
+SELECT acl_cluster_version();
+----
+0
+
+# a standalone node keeps a principal's secret itself (spec 118.1)
+statement ok
+ACL ROLE "keeper" CREATE SECRET s (TYPE http, BEARER_TOKEN 'v');
+
+statement ok
+ACL ROLE "keeper" DROP SECRET s;
+
+# --- a cluster node ----------------------------------------------------------------------------------
+
+statement ok
+SET GLOBAL acl_deployment = 'CLUSTER';
+
+query I
+SELECT current_setting('acl_deployment');
+----
+cluster
+
+statement error
+ACL ADMIN CLUSTER SET acl_deployment = 'standalone';
+----
+<REGEX>:.*"acl_deployment" is the node's own.*never a cluster profile item.*
+
+# secrets only in the secrets service: without one, refused
+statement error
+ACL ROLE "keeper" CREATE SECRET s (TYPE http, BEARER_TOKEN 'v');
+----
+<REGEX>:.*no secrets service is attached to this node.*
+
+# the profile: a source, a setting, an extension it names
+statement ok
+ACL ROLE "fleet" CLUSTER ATTACH ':memory:' AS src (TYPE duckdb);
+
+statement ok
+ACL ROLE "fleet" CLUSTER SET threads = 3;
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 3;
+
+# ACL NATIVE is the break-glass: a one-off ATTACH works - and drift shows it
+statement ok
+ACL ROLE "root" ACL NATIVE ATTACH ':memory:' AS oneoff;
+
+statement ok
+ACL ROLE "root" ACL NATIVE SET GLOBAL threads = 5;
+
+query TTTTT
+ACL ROLE "fleet" SELECT kind, name, state, node_value, profile_value FROM platform.drift WHERE kind <> 'extension' AND state <> 'bootstrap' ORDER BY kind, name;
+----
+database	oneoff	node_only	:memory:	NULL
+database	src	same	:memory:	:memory:
+setting	threads	differs	5	3
+
+# bootstrap: the deployment's own, listed so nothing is silently hidden
+query TT
+ACL ROLE "fleet" SELECT name, state FROM platform.drift WHERE state = 'bootstrap' AND kind IN ('database', 'setting') ORDER BY name;
+----
+acl_deployment	bootstrap
+acl_node_group	bootstrap
+memory	bootstrap
+store	bootstrap
+
+# the profile names what the node lacks: profile_only
+statement ok
+ACL ROLE "root" ACL NATIVE DETACH src;
+
+query TT
+ACL ROLE "fleet" SELECT name, state FROM platform.drift WHERE kind = 'database' AND name = 'src';
+----
+src	profile_only
+
+# showing only: nothing was reverted
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'oneoff';
+----
+1
+
+# who reads it: the cluster bundle and passthrough - not policy, not operate
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE ops;
+
+statement ok
+ACL ADMIN GRANT ADMIN operate TO ROLE ops;
+
+statement error
+ACL ROLE "pol" SELECT * FROM platform.drift;
+----
+<REGEX>:.*no access to object "platform.drift".*
+
+statement error
+ACL ROLE "ops" SELECT * FROM platform.drift;
+----
+<REGEX>:.*no access to object "platform.drift".*
+
+query I
+ACL ROLE "root" SELECT count(*) > 0 FROM platform.drift;
+----
+true
+
+statement ok
+SET GLOBAL threads = 3;

@@ -711,8 +711,11 @@ DROP [PERSISTENT] SECRET <name> [FROM <catalog>]
   service's and are refused; a storage named (`IN memory`, `IN local_file`) must still be a service.
   The node keeps no owner per secret: there, **`secrets` is the administration of the node's own
   secrets** - the operator's included (a `DROP`, a `CREATE OR REPLACE`, a longer `SCOPE` that the node's
-  reads then pick) - so grant it only to whoever administers the node. A secrets service is where a
-  secret has an owner and its own admin check.
+  reads then pick) - so grant it only to whoever administers the node. Where secrets need an owner and
+  an admin check, a standalone node attaches a secrets service too, logged in as its own service
+  identity: the service then decides who may create, drop and grant (its administrators), and records
+  the owner - the session's user when the node acts for an ACL session (tresor's delegation), the node's
+  identity otherwise (spec 082). A cluster node always does.
 - **GRANT / REVOKE SECRET** follow the principal prefix with the `ACL` marker (`ACL TOKEN '…' ACL GRANT
   SECRET …`; unmarked after the gateway's `ACL ADMIN`) and compile to the service's own calls,
   `<catalog>.main.grant_secret('<name>', 'role:<r>', ['use'])` / `revoke_secret(…)`. A secret is granted
@@ -803,6 +806,11 @@ CLUSTER SET <setting> = <value> [IN GROUP <group>]
 CLUSTER RESET <setting> [IN GROUP <group>]
 ```
 
+**A cluster node's** (spec 118): the profile exists where the deployment starts the node with `SET
+GLOBAL acl_deployment = 'cluster'` (GLOBAL-only, never the policy's nor the profile's; default
+`standalone`). On a standalone node every `CLUSTER` write is refused - its bootstrap SQL and its admin's
+`ACL NATIVE` configure it - while the profile's listings still read.
+
 The cluster profile is the shared part of every node's bootstrap (spec 093): which extensions a node
 runs, which sources it attaches and which settings it carries. It lives in the policy catalog as
 desired state, next to the policy, and a `config_version` counts its changes. With `IN GROUP` an item
@@ -868,9 +876,22 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
 - **Removing a source.**
   - `DETACH` is refused while another source depends on it. `CASCADE` removes the dependents too.
   - It is also refused while the policy reads through it: a virtual table, schema or function over
-    `<alias>.…`. `FORCE` detaches anyway, and `acl_check_catalog` then reports `source_missing`.
-- **Authorization.** The profile is the cluster's infrastructure, so every `CLUSTER` statement needs
-  a **passthrough** scope. `manage` is not enough.
+    `<alias>.…`, or a virtual view or macro whose body names `<alias>.` (spec 118 - read as text, so an
+    unrelated name spelled the same also blocks). `FORCE` detaches anyway, and `acl_check_catalog` then
+    reports `source_missing`.
+- **Authorization.** The profile is the cluster's infrastructure: every `CLUSTER` statement needs the
+  **`cluster`** bundle (spec 118; `passthrough` carries it) - `manage` / `policy` and `operate` are not
+  enough, and no point grant stands in. A setting that is a data path - `http_proxy*`, `ca_cert_file`,
+  `custom_user_agent`, `log_query_path`, `profile_output`, `temp_directory`, `logging_storage`,
+  `duckdb_api` - is `passthrough`'s alone. `acl_deployment` and `acl_node_group` are the deployment's,
+  never items.
+- **Drift** (spec 118): `platform.drift` (the `cluster` bundle) lists what this node carries against its
+  effective profile - per database, loaded extension and profiled setting a `state`: `same`, `differs`
+  (`node_value` / `profile_value`), `node_only` (an `ACL NATIVE` ATTACH, say), `profile_only` (the node
+  lacks it) or `bootstrap` (the default database, the policy's, a secrets service, statically linked
+  extensions and acl, `acl_deployment` / `acl_node_group` - listed so nothing is hidden). A setting the
+  profile does not name is not compared. Showing only: the node reverts nothing; `ACL NATIVE` stays the
+  unrestricted break-glass.
 - **Audit.** Each statement is one `admin` event. Its object is the item, as `source:<alias>`,
   `extension:<name>` or `setting:<name>`, with capability `cluster`. The item's spec is never in the
   event, because a path is a physical name.
@@ -885,8 +906,8 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
 ## Administration scopes
 
 ```
-GRANT ADMIN observe | policy | manage | passthrough TO ROLE <role>
-REVOKE ADMIN [observe | policy | manage | passthrough] FROM ROLE <role>
+GRANT ADMIN observe | operate | cluster | policy | manage | passthrough TO ROLE <role>
+REVOKE ADMIN [observe | operate | cluster | policy | manage | passthrough] FROM ROLE <role>
 GRANT | DENY VIEW platform.<view> TO ROLE <role>
 GRANT | DENY FUNCTION platform.<function> TO ROLE <role>
 REVOKE VIEW | FUNCTION platform.<object> FROM ROLE <role>

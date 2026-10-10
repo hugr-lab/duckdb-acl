@@ -51,6 +51,7 @@ is "stronger" than another:
 | --- | --- | --- | --- |
 | `observe` | `GRANT ADMIN observe TO ROLE r` | the node views (`sessions`, `node_load`, `node_doors`, `node_streams`, `drain`, `lineage_status`, `audit_events`); also the load report and `/metrics` (spec 097) | nothing |
 | `operate` (spec 118) | `GRANT ADMIN operate TO ROLE r` | `observe` | the node's runtime: `kill_session`, `session_audit_level`, `session_profile`, `drain`, `resume` - and their grammar (`KILL SESSION`, `SET SESSION … AUDIT LEVEL`, `PROFILE SESSION`, `DRAIN NODE`, `RESUME NODE`) |
+| `cluster` (spec 118, a cluster node's) | `GRANT ADMIN cluster TO ROLE r` | `operate` + the cluster profile's views (`cluster_items`, `cluster_effective`, `drift`) | `operate` + the cluster profile (`cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` - not a data-path setting); never `ACL NATIVE`, never a source's data |
 | `policy` | `GRANT ADMIN policy TO ROLE r` | every policy view, all rows - not the cluster profile's | every policy function except the admin grants, the cluster profile and the node's runtime (`operate`'s) |
 | `passthrough` | `GRANT ADMIN passthrough TO ROLE r` | everything | everything, plus `ACL NATIVE`, the bundles and the grants on `platform` (the break-glass) |
 | `manage` (spec 009's name) | `GRANT ADMIN manage TO ROLE r` | `policy` + `observe` | `policy` |
@@ -173,8 +174,9 @@ Node views (the `observe` bundle):
 | `lineage_status` | status, sending BOOLEAN, level, namespace |
 | `audit_events` | ts TIMESTAMPTZ, seq BIGINT, kind, level, door, session, subject, issuer, roles VARCHAR[], statement, objects `STRUCT(name VARCHAR, capability VARCHAR)[]`, verdict, reason_code, reason, correlation_id, traceparent, rows, duration_us (BIGINT), detail - the node's recent events, its ring (spec 069); the history is the sinks' |
 
-† the cluster profile's views are `passthrough`'s (or a point grant's) until spec 118's `cluster` bundle -
-not the `policy` bundle's: the policy admin has no cluster or node operations.
+† the cluster profile's views are the `cluster` bundle's (spec 118; or a point grant's) - not the `policy`
+bundle's: the policy admin has no cluster or node operations. `drift` (kind, name, state, node_value,
+profile_value, scope) is this node against its profile; on a standalone node it is refused.
 
 Unmarked columns are VARCHAR. The views that read the policy catalog's tables need a catalog policy
 source (`acl_use_db`); in memory mode and behind a function driver they refuse with a clear error, while
@@ -226,9 +228,10 @@ SELECT platform.alter_catalog('sales', comment := ?);
 ### The functions and the right each needs
 
 Right: **CATALOG** - `policy`, or `manage` on the catalog its `catalog` argument names; **POLICY** -
-`policy`; **HANDS_OUT** - `policy` (handing out access); **ESCALATES** / **INFRASTRUCTURE** -
-`passthrough` only; **OPERATE** (the node's runtime) - the `operate` bundle (spec 118). A point grant on
-the function stands in for a bundle, except for ESCALATES and INFRASTRUCTURE.
+`policy`; **HANDS_OUT** - `policy` (handing out access); **ESCALATES** - `passthrough` only;
+**INFRASTRUCTURE** - the `cluster` bundle (spec 118; a data-path setting `passthrough`'s); **OPERATE** (the
+node's runtime) - the `operate` bundle (spec 118). A point grant on the function stands in for a bundle, except for
+ESCALATES and INFRASTRUCTURE.
 
 | Function | Parameters (\* authorization, a constant) | Right |
 | --- | --- | --- |

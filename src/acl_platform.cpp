@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "acl_platform.hpp"
+#include "acl_cluster.hpp"
 
 #include "acl_connection.hpp"
 #include "acl_door_common.hpp"
@@ -374,6 +375,11 @@ vector<PlatformView> BuildViews() {
 	      {"depends_on", LV},
 	      {"comment", V}},
 	     "what of the cluster profile applies to this node (spec 096)"},
+	    {"drift",
+	     PV::CLUSTER,
+	     {{"kind", V}, {"name", V}, {"state", V}, {"node_value", V}, {"profile_value", V}, {"scope", V}},
+	     "what this cluster node carries against its profile: same, differs, node_only, profile_only, bootstrap "
+	     "(spec 118)"},
 	    {"catalog_schema",
 	     PV::POLICY,
 	     {{"build", I}, {"build_min_reader", I}, {"catalog", I}, {"min_reader", I}, {"mode", V}},
@@ -1140,7 +1146,7 @@ int PolicyStore::AdminRights::PlatformGrant(const string &kind, const string &ob
 }
 
 bool PolicyStore::AdminRights::MayAdminister() const {
-	if (passthrough || unrestricted_manage || operate || !catalogs.empty()) {
+	if (passthrough || unrestricted_manage || operate || cluster || !catalogs.empty()) {
 		return true;
 	}
 	for (auto &grant : platform) {
@@ -1154,7 +1160,7 @@ bool PolicyStore::AdminRights::MayAdminister() const {
 }
 
 bool PolicyStore::AdminRights::Privileged() const {
-	return passthrough || unrestricted_manage || observe || operate || unknown_scope || !catalogs.empty() ||
+	return passthrough || unrestricted_manage || observe || operate || cluster || unknown_scope || !catalogs.empty() ||
 	       !platform.empty();
 }
 
@@ -1165,6 +1171,9 @@ vector<string> PolicyStore::AdminRights::Bundles() const {
 	}
 	if (operate) {
 		out.emplace_back("operate");
+	}
+	if (cluster) {
+		out.emplace_back("cluster");
 	}
 	if (unrestricted_manage) {
 		out.emplace_back("policy");
@@ -1196,7 +1205,7 @@ bool PlatformAccess::ReadsView(const PlatformView &view, bool &rows_scoped) cons
 	case PlatformViewClass::POLICY:
 		return rights->unrestricted_manage;
 	case PlatformViewClass::CLUSTER:
-		return false; // passthrough's (above) until spec 118's cluster bundle - or a point grant
+		return rights->cluster; // spec 118: the cluster bundle - or a point grant
 	case PlatformViewClass::CATALOG:
 	case PlatformViewClass::ROLES:
 		if (rights->unrestricted_manage) {
@@ -1227,8 +1236,9 @@ bool PlatformAccess::CallsFunction(const PlatformFunction &function) const {
 	}
 	switch (function.right) {
 	case PlatformRight::ESCALATES:
-	case PlatformRight::INFRASTRUCTURE:
 		return false; // passthrough's alone - a point grant never reaches them
+	case PlatformRight::INFRASTRUCTURE:
+		return rights->cluster; // the cluster bundle's (spec 118) - never a point grant
 	default:
 		break;
 	}
@@ -1354,8 +1364,17 @@ void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights 
 		}
 		throw BinderException("acl admin: granting admin scopes requires a passthrough scope");
 	case PlatformRight::INFRASTRUCTURE:
+		// spec 118: the cluster bundle - never a point grant, and never a setting that is a data path
+		if (rights.cluster) {
+			if (name == "acl_cluster_setting" && ClusterSettingIsDataPath(ConstantArgument(call, 2, function->name))) {
+				throw BinderException("acl admin: \"%s\" is a data path (where the node's data goes) - setting it "
+				                      "requires a passthrough scope, not the cluster bundle",
+				                      ConstantArgument(call, 2, function->name));
+			}
+			return;
+		}
 		throw BinderException("acl admin: ACL CLUSTER changes the cluster's infrastructure (extensions, sources, "
-		                      "settings) and requires a passthrough scope - manage administers the ACL, not the "
+		                      "settings) and requires the cluster bundle - manage administers the ACL, not the "
 		                      "nodes");
 	case PlatformRight::OPERATE:
 		// spec 118: the node's runtime - the operate bundle (or a point grant), never the policy bundle
@@ -2218,6 +2237,9 @@ string FunctionBody(const string &view) {
 	if (view == "function_status") {
 		return "SELECT \"database\", \"schema\", \"name\", \"kind\", \"function_type\", \"categories\", \"status\","
 		       " \"present\" FROM acl_function_status()";
+	}
+	if (view == "drift") {
+		return "SELECT * FROM acl_platform_drift()";
 	}
 	if (view == "cluster_items" || view == "cluster_effective") {
 		return "SELECT \"scope\", \"kind\", \"name\", acl_platform_map(\"spec\") AS \"spec\", \"class\", \"version\","

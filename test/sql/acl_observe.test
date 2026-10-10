@@ -34,7 +34,7 @@ SELECT acl_grant_admin('watcher', 'observe');
 statement error
 SELECT acl_grant_admin('watcher', 'superpowers');
 ----
-<REGEX>:.*unknown admin scope "superpowers" \(expected observe, operate, policy, manage or passthrough\).*
+<REGEX>:.*unknown admin scope "superpowers" \(expected observe, operate, cluster, policy, manage or passthrough\).*
 
 # --- catalog mode -----------------------------------------------------------------------------------
 
@@ -188,6 +188,9 @@ ACL ROLE "observer" SET GLOBAL acl_observe_unauthenticated = true;
 <REGEX>:.*not permitted under ACL.*
 
 # the opt-out is the node's own: never a cluster profile item (spec 093's hardening list)
+statement ok
+SET GLOBAL acl_deployment = 'cluster';
+
 statement error
 ACL ADMIN CLUSTER SET acl_observe_unauthenticated = true;
 ----

@@ -1250,6 +1250,8 @@ bool TryParseAdminScope(const string &scope, AdminScope &out) {
 		out = AdminScope::OBSERVE;
 	} else if (StringUtil::CIEquals(scope, "operate")) {
 		out = AdminScope::OPERATE;
+	} else if (StringUtil::CIEquals(scope, "cluster")) {
+		out = AdminScope::CLUSTER;
 	} else {
 		return false;
 	}
@@ -1260,7 +1262,8 @@ AdminScope ParseAdminScope(const string &scope) {
 	AdminScope out;
 	if (!TryParseAdminScope(scope, out)) {
 		throw BinderException(
-		    "acl admin: unknown admin scope \"%s\" (expected observe, operate, policy, manage or passthrough)", scope);
+		    "acl admin: unknown admin scope \"%s\" (expected observe, operate, cluster, policy, manage or passthrough)",
+		    scope);
 	}
 	return out;
 }
@@ -1277,6 +1280,8 @@ const char *AdminScopeName(AdminScope scope) {
 		return "observe";
 	case AdminScope::OPERATE:
 		return "operate";
+	case AdminScope::CLUSTER:
+		return "cluster";
 	}
 	throw BinderException("acl admin: an administration grant needs a scope");
 }
@@ -1317,6 +1322,7 @@ void PolicyStore::RevokeAdmin(const string &role, const string &scope) {
 		for (auto &holds : entry->second) {
 			bool implies = (holds == "manage" && (name == "policy" || name == "observe")) ||
 			               (holds == "operate" && name == "observe") ||
+			               (holds == "cluster" && (name == "operate" || name == "observe")) ||
 			               (holds == "passthrough" && name != "passthrough");
 			if (implies) {
 				throw BinderException("acl admin: role \"%s\" holds %s, which carries %s - revoke %s (and grant what "
@@ -1395,6 +1401,16 @@ void ApplyAdminRow(PolicyStore::AdminRights &rights, const string &scope_text, c
 			rights.unknown_scope = true;
 		}
 		return;
+	case AdminScope::CLUSTER:
+		// the node's and the fleet's (spec 118): scoped to a catalog it grants nothing
+		if (vcat.empty()) {
+			rights.cluster = true;
+			rights.operate = true;
+			rights.observe = true;
+		} else {
+			rights.unknown_scope = true;
+		}
+		return;
 	case AdminScope::MANAGE:
 	case AdminScope::POLICY:
 		if (!vcat.empty()) {
@@ -1408,6 +1424,7 @@ void ApplyAdminRow(PolicyStore::AdminRights &rights, const string &scope_text, c
 		return;
 	case AdminScope::PASSTHROUGH:
 		rights.passthrough = true;
+		rights.cluster = true;
 		rights.operate = true;
 		rights.observe = true;
 		return;

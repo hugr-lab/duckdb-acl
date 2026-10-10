@@ -1,6 +1,6 @@
 # Spec 118: node and cluster management - operate / cluster, drift, the physical tree
 
-- **Status**: accepted (by the owner 2026-10-10); **118.1 implemented** (see *As built*); aligned after the comparison with Trino, Snowflake, Databricks UC,
+- **Status**: accepted (by the owner 2026-10-10); **118.1 and 118.2 implemented** (see *As built*); aligned after the comparison with Trino, Snowflake, Databricks UC,
   ClickHouse, PostgreSQL, SQL Server - design/079 App. A)
 - **Date**: 2026-10-10
 - **Author**: Claude (design/079 with the owner)
@@ -84,6 +84,11 @@ console works there; what makes a node differ from its profile is shown (drift, 
   The docs say plainly that a persistent local secret is a file on the node's disk, and that the node
   keeps no owner per secret: locally `secrets` administers every secret of the node (the operator's
   included - drop, replace, a longer scope) - grant it to the node's administrator only (review 118.1).
+  Where secrets need an owner, a standalone node attaches tresor too, logged in as its own service
+  identity (owner, 2026-10-10): tresor's administrators decide who may manage; the owner it records is the
+  session's user under a delegation (tresor spec 008), the node's identity otherwise; a cluster node
+  always does. Follow-up (tresor research): variables have no ACL grammar and no seeded category - today
+  an operator categorizes `variable()` / `set_variable` for a role.
 - Under `ACL NATIVE`: duckdb as is (§2).
 - tresor **variables** and `corp.*` management calls are the service's (its admin check, the function
   gate); unchanged here.
@@ -211,3 +216,22 @@ catalog; over-reading blocks, FORCE is the operator's answer). Who reads what pe
   operate holder may set any session's audit level (OFF too); a node drained through a door is resumed from
   a session it already holds (the console's) or the operator's connection - drain seats no new one.
   Low, left: a source named like a common table alias blocks views using that alias (FORCE answers).
+
+### 118.2 (2026-10-10)
+- `acl_deployment` (GLOBAL-only, `standalone` | `cluster`, case folded, default standalone; refused as a profile
+  item like `acl_node_group`). Standalone: every `acl_cluster_extension / _attach / _detach / _setting` refused
+  (`RequireClusterDeployment`) - the operator's direct calls too, the profile's listings read; `ACL NATIVE`
+  configures it. Cluster: `LocalSecrets` is off - secrets only in the service.
+- `cluster` bundle: `AdminScope::CLUSTER`; ⊇ operate ⊇ observe (a revoke of a carried bundle refused);
+  INFRASTRUCTURE = the bundle (never a point grant - the refusal names "the cluster bundle's alone"); the CLUSTER
+  view class reads `cluster_items`, `cluster_effective`, `drift`. A data-path setting (`ClusterSettingIsDataPath`:
+  http_proxy*, ca_cert_file, custom_user_agent, log_query_path, profile_output, temp_directory, logging_storage,
+  duckdb_api) is refused to the bundle in the authorizer, passthrough's.
+- `platform.drift` = `acl_platform_drift()`: databases (not internal), loaded extensions, the profile's settings,
+  each `same` / `differs` / `node_only` / `profile_only` / `bootstrap` (the default database, the policy's, a tresor,
+  statically linked extensions and acl, `acl_deployment` / `acl_node_group`); a setting the profile does not name
+  is not compared (no desired value); the full list with `same` rows, so a console shows one table. Refused on a
+  standalone node.
+- Tests: `node_cluster.test` (new), `acl_cluster_profile.test` (the bundle, data paths, point grants); the profile
+  tests and `test_acl_cluster_install.cpp` set `acl_deployment = 'cluster'`.
+

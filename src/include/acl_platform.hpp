@@ -39,7 +39,7 @@ enum class PlatformViewClass : uint8_t {
 	POLICY,  //! the policy - the policy bundle, all rows
 	CATALOG, //! the policy - the policy bundle (all rows), or a catalog admin (its catalogs' rows)
 	ROLES,   //! role names - the policy bundle (every role), or a catalog admin (the roles holding its catalogs)
-	CLUSTER  //! the cluster profile - passthrough alone until spec 118's `cluster` bundle
+	CLUSTER  //! the cluster profile and its drift - the cluster bundle (spec 118)
 };
 
 //! The right a management operation requires (what spec 009's provenance table said, as a class)
@@ -48,7 +48,7 @@ enum class PlatformRight : uint8_t {
 	POLICY,         //! the policy bundle (not catalog-specific)
 	HANDS_OUT,      //! the policy bundle: handing out access is privilege administration
 	ESCALATES,      //! passthrough only: the admin scopes and the grants on `platform`
-	INFRASTRUCTURE, //! passthrough only: the cluster profile (spec 093) - until spec 118's `cluster`
+	INFRASTRUCTURE, //! the cluster bundle (spec 118): the cluster profile (spec 093) - never a point grant
 	OPERATE,        //! the operate bundle (spec 118): the node's runtime - sessions, drain / resume
 	OPEN            //! every principal holding anything on `platform` (console_info)
 };

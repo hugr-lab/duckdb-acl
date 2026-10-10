@@ -20,6 +20,10 @@ ATTACH ':memory:' AS store;
 statement ok
 SELECT acl_use_db('store', 'acl', true);
 
+# a cluster node (spec 118): the profile is a cluster node's
+statement ok
+SET GLOBAL acl_deployment = 'cluster';
+
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
@@ -302,7 +306,7 @@ ACL ADMIN CLUSTER DETACH src_a;
 ----
 <REGEX>:.*source "src_a" is not in the profile.*
 
-# --- who may: the cluster's infrastructure is a passthrough scope's alone ------------------------
+# --- who may: the cluster's infrastructure is the cluster bundle's (spec 118) and passthrough's ------
 
 statement ok
 SELECT acl_grant_admin('ops_manage', 'manage');
@@ -310,13 +314,71 @@ SELECT acl_grant_admin('ops_manage', 'manage');
 statement ok
 SELECT acl_grant_admin('ops_infra', 'passthrough');
 
+statement ok
+SELECT acl_grant_admin('ops_cluster', 'cluster');
+
+statement ok
+SELECT acl_grant_admin('ops_operate', 'operate');
+
 statement error
 ACL ROLE "ops_manage" ACL CLUSTER SET threads = 2;
 ----
-<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*requires a passthrough scope.*
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*requires the cluster bundle.*
+
+statement error
+ACL ROLE "ops_operate" CLUSTER SET threads = 2;
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*requires the cluster bundle.*
 
 statement ok
 ACL ROLE "ops_infra" ACL CLUSTER SET threads = 2;
+
+statement ok
+ACL ROLE "ops_cluster" CLUSTER SET threads = 2;
+
+# a setting that is a data path is not the cluster bundle's - passthrough's
+statement error
+ACL ROLE "ops_cluster" CLUSTER SET http_proxy = 'proxy.example:3128';
+----
+<REGEX>:.*"http_proxy" is a data path.*requires a passthrough scope, not the cluster bundle.*
+
+statement error
+ACL ROLE "ops_cluster" SELECT platform.cluster_setting('set', '', 'temp_directory', '/tmp/x');
+----
+<REGEX>:.*"temp_directory" is a data path.*
+
+# the cluster bundle reads the profile's views, never the policy's, and has no ACL NATIVE
+query I
+ACL ROLE "ops_cluster" SELECT count(*) > 0 FROM platform.cluster_items;
+----
+true
+
+statement error
+ACL ROLE "ops_cluster" SELECT * FROM platform.grants;
+----
+<REGEX>:.*no access to object "platform.grants".*
+
+statement error
+ACL ROLE "ops_cluster" ACL NATIVE SELECT 1;
+----
+<REGEX>:.*requires a passthrough scope.*
+
+statement error
+ACL ROLE "ops_cluster" CREATE ROLE by_cluster;
+----
+<REGEX>:.*unrestricted manage.*
+
+# a point grant never stands in for it
+statement error
+ACL ADMIN GRANT FUNCTION platform.cluster_setting TO ROLE ops_operate;
+----
+<REGEX>:.*platform.cluster_setting is the cluster bundle's alone.*
+
+# cluster carries operate and observe
+statement error
+SELECT acl_revoke_admin('ops_cluster', 'operate');
+----
+<REGEX>:.*holds cluster, which carries operate.*
 
 # --- the audit names the item, never its path -----------------------------------------------------
 
