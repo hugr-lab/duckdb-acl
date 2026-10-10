@@ -244,6 +244,21 @@ SELECT count(*) FROM store.acl.roles WHERE "role" LIKE 'mixed_%';
 statement ok
 ACL ROLE "pol" CREATE ROLE batch_a; CREATE ROLE batch_b;
 
+# a comment in front of a statement says nothing: the batch is still management, and still one kind
+statement ok
+ACL ROLE "pol" /* the onboarding */ CREATE ROLE commented_a; -- and one more
+	CREATE ROLE commented_b;
+
+statement error
+ACL ROLE "pol" /* a note */ CREATE ROLE commented_c; SELECT 1;
+----
+<REGEX>:.*a batch mixing management statements and queries is refused.*
+
+query T
+SELECT list("role" ORDER BY "role") FROM store.acl.roles WHERE "role" LIKE 'commented_%';
+----
+[commented_a, commented_b]
+
 statement ok
 ACL ROLE "pol" SELECT count(*) FROM orders WHERE tenant <> 'x; GRANT CATALOG sales TO ROLE reader'; SELECT 2;
 

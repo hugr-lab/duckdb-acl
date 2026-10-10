@@ -2176,15 +2176,12 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		                      "kind in a batch of its own");
 	}
 	vector<unique_ptr<SQLStatement>> statements;
-	AdminScanner scanner(text);
-	while (!scanner.Done()) {
-		if (scanner.AtSemicolon()) {
-			scanner.pos++;
-			continue;
-		}
+	// statement by statement, as the batch splits (quotes, comments and parentheses respected): a comment
+	// in front of a statement says nothing, and a `;` inside a body's literal ends nothing
+	for (auto &piece : SplitBatchText(text)) {
+		AdminScanner scanner(piece);
 		statements.push_back(ParseMgmtStatement(scanner, current_session));
-		scanner.Skip();
-		if (scanner.pos < text.size() && text[scanner.pos] != ';') {
+		if (!scanner.Done()) {
 			throw BinderException("acl admin: unexpected trailing text at position %llu", scanner.pos);
 		}
 	}
@@ -2192,6 +2189,11 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		throw BinderException("acl admin: empty management batch");
 	}
 	return statements;
+}
+
+bool StartsWithMgmt(const string &text) {
+	auto statements = SplitBatchText(text);
+	return !statements.empty() && IsMgmtStart(statements[0]);
 }
 
 //===--------------------------------------------------------------------===//

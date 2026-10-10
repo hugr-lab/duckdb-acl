@@ -48,7 +48,14 @@ bool IsPlatformCatalog(const string &name) {
 	if (name.empty()) {
 		return false;
 	}
-	return NamePath::KeyEquals(name, PLATFORM_CATALOG) || StringUtil::CIEquals(name, PLATFORM_CATALOG);
+	if (StringUtil::CIEquals(name, PLATFORM_CATALOG)) {
+		return true;
+	}
+	// a key that quotes its one part (`"platform"`) names the same catalog
+	NamePath path;
+	string error;
+	return NamePath::TryFromKey(name, path, error) && path.Size() == 1 &&
+	       StringUtil::CIEquals(path.Parts()[0], PLATFORM_CATALOG);
 }
 
 namespace {
@@ -1581,15 +1588,6 @@ bool CompilePlatformCall(SQLStatement &statement, unique_ptr<SQLStatement> &comp
 	compiled->has_anonymous_parameters = statement.has_anonymous_parameters;
 	compiled->stmt_location = statement.stmt_location;
 	return true;
-}
-
-bool IsPlatformCallStatement(SQLStatement &statement) {
-	unique_ptr<SQLStatement> ignored;
-	try {
-		return CompilePlatformCall(statement, ignored);
-	} catch (std::exception &) {
-		return true; // a platform call written wrongly is still one
-	}
 }
 
 //===--------------------------------------------------------------------===//

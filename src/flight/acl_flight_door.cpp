@@ -1993,8 +1993,8 @@ public:
 			    StringUtil::CharacterIsSpace(rest[3])) {
 				rest = rest.substr(4);
 			}
-			if (acl::IsMgmtStart(rest) || acl::IsSecretsStart(rest)) {
-				return true;
+			if (acl::StartsWithMgmt(rest)) {
+				return true; // (GRANT / REVOKE SECRET open with a management phrase too)
 			}
 		}
 		try {

@@ -118,9 +118,6 @@ void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights 
 //! throws when it is one written wrongly (an unknown function, a parameter where authorization is
 //! carried, an argument it does not take).
 bool CompilePlatformCall(SQLStatement &statement, unique_ptr<SQLStatement> &compiled);
-//! Whether a statement names a `platform` management function anywhere (the call that is not at the top
-//! level is refused by the rewriter; this is the mixed-batch test of the override)
-bool IsPlatformCallStatement(SQLStatement &statement);
 
 //! spec 117: whether a written function name is one of `platform`'s management functions
 bool IsPlatformFunctionName(const vector<string> &parts);

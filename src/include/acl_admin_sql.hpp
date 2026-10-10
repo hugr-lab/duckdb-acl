@@ -41,6 +41,9 @@ vector<string> SplitBatchText(const string &text);
 bool BatchHasMgmtStatement(const string &text);
 //! spec 117: whether every statement of the batch opens with a management form
 bool BatchIsAllMgmt(const string &text);
+//! spec 117: whether the batch's first statement - past what opens it but says nothing (whitespace,
+//! comments) - opens with a management form: what decides a batch is management
+bool StartsWithMgmt(const string &text);
 
 // The authorization gate (spec 009) moved to acl_platform.hpp (spec 117): AuthorizeMgmt is the one
 // authorizer of the grammar and of a direct platform.<op>(…) call alike.

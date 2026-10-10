@@ -653,7 +653,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	bool anonymous = prefix.kind == AclPrefix::Kind::ADMIN;
 	bool principal_prefix = prefix.kind == AclPrefix::Kind::ROLE || prefix.kind == AclPrefix::Kind::TOKEN ||
 	                        prefix.kind == AclPrefix::Kind::SESSION;
-	if ((anonymous || principal_prefix) && !prefix.marked && IsMgmtStart(prefix.rest)) {
+	if ((anonymous || principal_prefix) && !prefix.marked && StartsWithMgmt(prefix.rest)) {
 		// the trusted gateway may write management statements unmarked, and (spec 117) so may a principal:
 		// under its prefix the leading phrase is ours whatever duckdb's grammar grows - a principal holds no
 		// physical rights for a GRANT of duckdb's to mean. An explicit `ACL NATIVE` means "plain SQL, do not
