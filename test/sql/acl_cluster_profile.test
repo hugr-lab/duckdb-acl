@@ -336,16 +336,114 @@ ACL ROLE "ops_infra" ACL CLUSTER SET threads = 2;
 statement ok
 ACL ROLE "ops_cluster" CLUSTER SET threads = 2;
 
-# a setting that is a data path is not the cluster bundle's - passthrough's
-statement error
-ACL ROLE "ops_cluster" CLUSTER SET http_proxy = 'proxy.example:3128';
-----
-<REGEX>:.*"http_proxy" is a data path.*requires a passthrough scope, not the cluster bundle.*
+# the cluster bundle sets the node's resources and tuning only (an allowlist): a data path, a trust or
+# an audit setting is passthrough's (review 118.2)
+statement ok
+ACL ROLE "ops_cluster" CLUSTER SET acl_max_sessions = 500;
+
 
 statement error
-ACL ROLE "ops_cluster" SELECT platform.cluster_setting('set', '', 'temp_directory', '/tmp/x');
+ACL ROLE "ops_cluster" CLUSTER SET http_proxy = 'x';
 ----
-<REGEX>:.*"temp_directory" is a data path.*
+<REGEX>:.*"http_proxy" is not among the settings the cluster bundle sets.*passthrough scope's.*
+
+
+statement error
+ACL ROLE "ops_cluster" CLUSTER SET temp_directory = 'x';
+----
+<REGEX>:.*"temp_directory" is not among the settings the cluster bundle sets.*passthrough scope's.*
+
+
+statement error
+ACL ROLE "ops_cluster" CLUSTER SET acl_audit_level = 'x';
+----
+<REGEX>:.*"acl_audit_level" is not among the settings the cluster bundle sets.*passthrough scope's.*
+
+
+statement error
+ACL ROLE "ops_cluster" CLUSTER SET acl_audit_sink = 'x';
+----
+<REGEX>:.*"acl_audit_sink" is not among the settings the cluster bundle sets.*passthrough scope's.*
+
+
+statement error
+ACL ROLE "ops_cluster" CLUSTER SET acl_jwks_locations = 'x';
+----
+<REGEX>:.*"acl_jwks_locations" is not among the settings the cluster bundle sets.*passthrough scope's.*
+
+
+statement error
+ACL ROLE "ops_cluster" CLUSTER SET acl_session_token_binding = 'x';
+----
+<REGEX>:.*"acl_session_token_binding" is not among the settings the cluster bundle sets.*passthrough scope's.*
+
+
+statement error
+ACL ROLE "ops_cluster" CLUSTER SET acl_metrics_endpoint = 'x';
+----
+<REGEX>:.*"acl_metrics_endpoint" is not among the settings the cluster bundle sets.*passthrough scope's.*
+
+
+statement error
+ACL ROLE "ops_cluster" CLUSTER SET s3_endpoint = 'x';
+----
+<REGEX>:.*"s3_endpoint" is not among the settings the cluster bundle sets.*passthrough scope's.*
+
+
+statement error
+ACL ROLE "ops_cluster" CLUSTER SET custom_extension_repository = 'x';
+----
+<REGEX>:.*"custom_extension_repository" is not among the settings the cluster bundle sets.*passthrough scope's.*
+
+
+statement error
+ACL ROLE "ops_cluster" SELECT platform.cluster_setting('reset', '', 'TEMP_DIRECTORY', NULL);
+----
+<REGEX>:.*"TEMP_DIRECTORY" is not among the settings the cluster bundle sets.*
+
+# the node's trust is no profile item for anyone - passthrough included (hardening)
+
+statement error
+ACL ROLE "ops_infra" CLUSTER SET acl_allow_anonymous_admin = 'x';
+----
+<REGEX>:.*"acl_allow_anonymous_admin" is the node's hardening.*
+
+
+statement error
+ACL ROLE "ops_infra" CLUSTER SET acl_quack_authorization_function = 'x';
+----
+<REGEX>:.*"acl_quack_authorization_function" is the node's hardening.*
+
+
+statement error
+ACL ROLE "ops_infra" CLUSTER SET acl_quack_authentication_function = 'x';
+----
+<REGEX>:.*"acl_quack_authentication_function" is the node's hardening.*
+
+
+statement error
+ACL ROLE "ops_infra" CLUSTER SET enable_server_cert_verification = 'x';
+----
+<REGEX>:.*"enable_server_cert_verification" is the node's hardening.*
+
+
+statement error
+ACL ROLE "ops_infra" CLUSTER SET enable_curl_server_cert_verification = 'x';
+----
+<REGEX>:.*"enable_curl_server_cert_verification" is the node's hardening.*
+
+
+statement error
+ACL ROLE "ops_infra" CLUSTER SET disabled_filesystems = 'x';
+----
+<REGEX>:.*"disabled_filesystems" is the node's hardening.*
+
+
+# a credential as a setting's value: refused by its name
+statement error
+ACL ROLE "ops_infra" CLUSTER SET s3_secret_access_key = 'x';
+----
+<REGEX>:.*credential.*
 
 # the cluster bundle reads the profile's views, never the policy's, and has no ACL NATIVE
 query I

@@ -1009,7 +1009,7 @@ vector<PlatformFunction> BuildFunctions() {
 	     false,
 	     B,
 	     "revoke a point grant on platform"},
-	    // the cluster profile (spec 093): the node's infrastructure, passthrough's until spec 118
+	    // the cluster profile (spec 093): the node's infrastructure - the cluster bundle's (spec 118)
 	    {"cluster_extension",
 	     "acl_cluster_extension",
 	     {A("verb"), A("scope"), A("name"), P("version"), A("repository"), comment},
@@ -1364,11 +1364,12 @@ void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights 
 		}
 		throw BinderException("acl admin: granting admin scopes requires a passthrough scope");
 	case PlatformRight::INFRASTRUCTURE:
-		// spec 118: the cluster bundle - never a point grant, and never a setting that is a data path
+		// spec 118: the cluster bundle - never a point grant, and only the settings of the node's resources
 		if (rights.cluster) {
-			if (name == "acl_cluster_setting" && ClusterSettingIsDataPath(ConstantArgument(call, 2, function->name))) {
-				throw BinderException("acl admin: \"%s\" is a data path (where the node's data goes) - setting it "
-				                      "requires a passthrough scope, not the cluster bundle",
+			if (name == "acl_cluster_setting" && !ClusterBundleMaySet(ConstantArgument(call, 2, function->name))) {
+				throw BinderException("acl admin: \"%s\" is not among the settings the cluster bundle sets (the "
+				                      "node's resources and tuning) - a data path, a trust or audit setting is a "
+				                      "passthrough scope's",
 				                      ConstantArgument(call, 2, function->name));
 			}
 			return;

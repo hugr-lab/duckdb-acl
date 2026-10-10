@@ -140,6 +140,23 @@ acl_node_group	bootstrap
 memory	bootstrap
 store	bootstrap
 
+# a value is compared as duckdb shows it (review 118.2: '4GB' reads back as GiB), a source by its type
+# (a relative file path shows absolute)
+statement ok
+ACL ADMIN CLUSTER SET memory_limit = '4GB';
+
+statement ok
+SET GLOBAL memory_limit = '4GB';
+
+statement ok
+ACL ADMIN CLUSTER ATTACH '__TEST_DIR__/drift_file.db' AS filesrc (TYPE duckdb);
+
+query TT
+ACL ROLE "fleet" SELECT name, state FROM platform.drift WHERE name IN ('memory_limit', 'filesrc') ORDER BY name;
+----
+filesrc	same
+memory_limit	same
+
 # the profile names what the node lacks: profile_only
 statement ok
 ACL ROLE "root" ACL NATIVE DETACH src;

@@ -51,14 +51,15 @@ is "stronger" than another:
 | --- | --- | --- | --- |
 | `observe` | `GRANT ADMIN observe TO ROLE r` | the node views (`sessions`, `node_load`, `node_doors`, `node_streams`, `drain`, `lineage_status`, `audit_events`); also the load report and `/metrics` (spec 097) | nothing |
 | `operate` (spec 118) | `GRANT ADMIN operate TO ROLE r` | `observe` | the node's runtime: `kill_session`, `session_audit_level`, `session_profile`, `drain`, `resume` - and their grammar (`KILL SESSION`, `SET SESSION … AUDIT LEVEL`, `PROFILE SESSION`, `DRAIN NODE`, `RESUME NODE`) |
-| `cluster` (spec 118, a cluster node's) | `GRANT ADMIN cluster TO ROLE r` | `operate` + the cluster profile's views (`cluster_items`, `cluster_effective`, `drift`) | `operate` + the cluster profile (`cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` - not a data-path setting); never `ACL NATIVE`, never a source's data |
+| `cluster` (spec 118, a cluster node's) | `GRANT ADMIN cluster TO ROLE r` | `operate` + the cluster profile's views (`cluster_items`, `cluster_effective`, `drift`) | `operate` + the cluster profile (`cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` - resources and tuning only); never `ACL NATIVE`, never a source's data |
 | `policy` | `GRANT ADMIN policy TO ROLE r` | every policy view, all rows - not the cluster profile's | every policy function except the admin grants, the cluster profile and the node's runtime (`operate`'s) |
 | `passthrough` | `GRANT ADMIN passthrough TO ROLE r` | everything | everything, plus `ACL NATIVE`, the bundles and the grants on `platform` (the break-glass) |
 | `manage` (spec 009's name) | `GRANT ADMIN manage TO ROLE r` | `policy` + `observe` | `policy` |
 | a catalog admin | `GRANT CATALOG c TO ROLE r CAPS '{"manage": true}'` | the catalog-scoped views, narrowed to its catalogs (below) | the functions that take a catalog, on its catalogs; `check_catalog` on its catalogs |
 
 `REVOKE ADMIN <bundle> FROM ROLE r` takes one bundle (not one another carries: `observe` from a role holding
-`operate`, `manage` or `passthrough` is refused - revoke the carrier); `REVOKE ADMIN FROM ROLE r` takes every bundle,
+`operate`, `cluster`, `manage` or `passthrough`, or `operate` from one holding `cluster` or `passthrough`, is
+refused - revoke the carrier); `REVOKE ADMIN FROM ROLE r` takes every bundle,
 the `manage` capability of its catalog grants and its point grants on `platform`. Functions:
 `acl_grant_admin(role, scope)`, `acl_revoke_admin(role[, scope])`.
 
@@ -83,7 +84,7 @@ REVOKE VIEW platform.sessions FROM ROLE support;        -- the grant or the deny
   catalog.
 - **Only `passthrough` grants on `platform`** (and the bundles) - never `policy`: a grantor that can
   grant everything is everything.
-- Never to every role (`TO ALL ROLES` / role `''` is refused); never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting`, `migrate_catalog` - the passthrough scope's own - and `console_info` (every holder's); only on an
+- Never to every role (`TO ALL ROLES` / role `''` is refused); never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `migrate_catalog` (the passthrough scope's own), `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` (the cluster bundle's alone) and `console_info` (every holder's); only on an
   object `platform` has.
 - The grants live in their own table, `platform_grants(role, object, kind, allowed)` - never in the
   catalog grants or spec 072's function grants and categories.
@@ -229,7 +230,7 @@ SELECT platform.alter_catalog('sales', comment := ?);
 
 Right: **CATALOG** - `policy`, or `manage` on the catalog its `catalog` argument names; **POLICY** -
 `policy`; **HANDS_OUT** - `policy` (handing out access); **ESCALATES** - `passthrough` only;
-**INFRASTRUCTURE** - the `cluster` bundle (spec 118; a data-path setting `passthrough`'s); **OPERATE** (the
+**INFRASTRUCTURE** - the `cluster` bundle (spec 118; a setting outside resources and tuning `passthrough`'s); **OPERATE** (the
 node's runtime) - the `operate` bundle (spec 118). A point grant on the function stands in for a bundle, except for
 ESCALATES and INFRASTRUCTURE.
 

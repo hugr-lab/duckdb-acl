@@ -98,25 +98,23 @@ const case_insensitive_set_t CREDENTIAL_KEYS = {"password",
                                                 "sig",
                                                 "private_key",
                                                 "connection_string",
-                                                "aws_secret_access_key"};
+                                                "aws_secret_access_key",
+                                                "s3_secret_access_key",
+                                                "s3_access_key_id",
+                                                "s3_session_token",
+                                                "http_proxy_password"};
 
 //! The node's hardening, fixed by its bootstrap - never a profile item
-const case_insensitive_set_t HARDENING_SETTINGS = {"allow_unsigned_extensions",
-                                                   "allow_community_extensions",
-                                                   "allow_extension_repositories",
-                                                   "allow_persistent_secrets",
-                                                   "allow_unredacted_secrets",
-                                                   "lock_configuration",
-                                                   "extension_repository_directory",
-                                                   "allow_parser_override_extension",
-                                                   "enable_external_access",
-                                                   "secret_directory",
-                                                   "extension_directory",
-                                                   "extension_directories",
-                                                   "home_directory",
-                                                   "acl_observe_unauthenticated",
-                                                   "allowed_directories",
-                                                   "allowed_paths"};
+const case_insensitive_set_t HARDENING_SETTINGS = {
+    "allow_unsigned_extensions", "allow_community_extensions", "allow_extension_repositories",
+    "allow_persistent_secrets", "allow_unredacted_secrets", "lock_configuration", "extension_repository_directory",
+    "allow_parser_override_extension", "enable_external_access", "secret_directory", "extension_directory",
+    "extension_directories", "home_directory", "acl_observe_unauthenticated", "allowed_directories", "allowed_paths",
+    // spec 118 review: the node's trust - who authorizes a door's
+    // statement, whether the anonymous hatch opens, what a TLS peer
+    // must prove, which filesystems exist
+    "acl_allow_anonymous_admin", "acl_quack_authentication_function", "acl_quack_authorization_function",
+    "enable_server_cert_verification", "enable_curl_server_cert_verification", "disabled_filesystems"};
 
 //! Source types whose connection needs a credential: written without SECRET, refused
 const case_insensitive_set_t TYPES_NEEDING_SECRET = {"postgres", "postgres_scanner", "mysql", "mysql_scanner", "mssql"};
@@ -414,11 +412,25 @@ string JsonField(const string &json, const char *field) {
 
 } // namespace
 
-bool ClusterSettingIsDataPath(const string &name) {
-	static const case_insensitive_set_t DATA_PATH_SETTINGS = {
-	    "http_proxy",     "http_proxy_username", "http_proxy_password", "ca_cert_file",    "custom_user_agent",
-	    "log_query_path", "profile_output",      "temp_directory",      "logging_storage", "duckdb_api"};
-	return DATA_PATH_SETTINGS.count(name) > 0;
+bool ClusterBundleMaySet(const string &name) {
+	// an allowlist (review 118.2: a denylist of data paths left the ACL's own trust settings open) - the
+	// node's resources and tuning; everything else is passthrough's
+	static const case_insensitive_set_t TUNING_SETTINGS = {
+	    // duckdb: resources, durability, ordering, the http client's patience, rendering
+	    "threads", "worker_threads", "memory_limit", "max_memory", "max_temp_directory_size",
+	    "preserve_insertion_order", "checkpoint_threshold", "wal_autocheckpoint", "default_order", "default_null_order",
+	    "enable_object_cache", "http_timeout", "http_retries", "http_retry_wait_ms", "http_retry_backoff",
+	    "http_keep_alive", "timezone", "calendar", "arrow_large_buffer_size",
+	    // acl: limits, windows, timeouts, exposure and lineage naming
+	    "acl_alias_types", "acl_enum_types", "acl_flight_stream_idle", "acl_lineage_namespace", "acl_lineage_level",
+	    "acl_lineage_max_edges", "acl_lineage_buffer", "acl_max_result_rows", "acl_max_ingest_rows", "acl_max_sessions",
+	    "acl_node_stream_budget", "acl_profile_level", "acl_quack_cache_max_rows", "acl_quack_client_depth",
+	    "acl_quack_fetch_producer_buffer_bytes", "acl_quack_fetch_window", "acl_quack_fetch_window_max",
+	    "acl_quack_prepare_inline_rows", "acl_quack_rebalance_buffer_bytes", "acl_quack_result_ttl",
+	    "acl_quack_server_keep_alive_timeout", "acl_quack_server_max_connections", "acl_quack_stream_reserve_bytes",
+	    "acl_quack_target_batch_bytes", "acl_session_idle_timeout", "acl_stream_queue_timeout",
+	    "acl_version_check_interval"};
+	return TUNING_SETTINGS.count(name) > 0;
 }
 
 PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, const string &scope, const string &name,
@@ -962,6 +974,12 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 	auto databases = NodeQuery(*db, "SELECT database_name, coalesce(path, ':memory:'), type FROM duckdb_databases() "
 	                                "WHERE NOT internal");
 	ResultRows database_rows(*databases);
+	// review 118.2: a path is shown only for a file database - another type's path may be a DSN the operator
+	// wrote with its credential (an ACL NATIVE ATTACH); a source is compared by its type (duckdb shows a
+	// relative path absolute and a ducklake one without its prefix, so a path compare would say differs)
+	auto shown = [](const string &type, const string &path) {
+		return StringUtil::CIEquals(type, "duckdb") || StringUtil::CIEquals(type, "sqlite") ? path : "(" + type + ")";
+	};
 	case_insensitive_set_t on_node;
 	for (idx_t i = 0; i < database_rows.Count(); i++) {
 		auto name = database_rows.GetValue(0, i).ToString();
@@ -970,13 +988,16 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 		on_node.insert(name);
 		auto source = profile[2].find(name);
 		if (source != profile[2].end()) {
-			auto wanted = JsonField(source->second->spec, "path");
-			out.push_back({"database", name, wanted == path ? "same" : "differs", path, wanted, source->second->scope});
+			auto wanted = JsonField(source->second->spec, "type");
+			bool same = StringUtil::CIEquals(wanted.empty() ? "duckdb" : wanted, type) ||
+			            StringUtil::CIEquals(ExtensionOfType(wanted), type);
+			out.push_back({"database", name, same ? "same" : "differs", shown(type, path),
+			               JsonField(source->second->spec, "path"), source->second->scope});
 			continue;
 		}
 		bool bootstrap = StringUtil::CIEquals(name, default_db) || StringUtil::CIEquals(type, "tresor") ||
 		                 (catalog && StringUtil::CIEquals(name, catalog->db_name));
-		out.push_back({"database", name, bootstrap ? "bootstrap" : "node_only", path, "", ""});
+		out.push_back({"database", name, bootstrap ? "bootstrap" : "node_only", shown(type, path), "", ""});
 	}
 	for (auto &source : profile[2]) {
 		if (!on_node.count(source.first)) {
@@ -1012,13 +1033,38 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 	}
 	// settings: the profile's compared (a setting the profile does not name has no "desired" value to be
 	// told from), and the deployment's own listed as bootstrap
-	for (auto &item : profile[0]) {
-		auto current =
-		    NodeQuery(*db, "SELECT value FROM duckdb_settings() WHERE lower(name) = lower(" + Quoted(item.first) + ")");
-		auto value = current->RowCount() > 0 ? current->Collection().GetValue(0, 0).ToString() : string();
-		auto wanted = JsonField(item.second->spec, "value");
-		out.push_back({"setting", item.first, StringUtil::CIEquals(value, wanted) ? "same" : "differs", value, wanted,
-		               item.second->scope});
+	if (!profile[0].empty()) {
+		// one read of the node's values; the profile's value as duckdb would show it - set on a scratch
+		// instance (`4GB` reads back as `3.7 GiB`) - else as written (an extension's setting the scratch lacks)
+		case_insensitive_map_t<string> node_values;
+		auto values = NodeQuery(*db, "SELECT name, value FROM duckdb_settings()");
+		ResultRows value_rows(*values);
+		for (idx_t i = 0; i < value_rows.Count(); i++) {
+			auto value = value_rows.GetValue(1, i);
+			node_values[value_rows.GetValue(0, i).ToString()] = value.IsNull() ? string() : value.ToString();
+		}
+		DBConfig scratch_config; // no extension - acl itself never (a second store and override)
+		scratch_config.options.load_extensions = false;
+		scratch_config.SetOptionByName("enable_external_access", Value::BOOLEAN(false));
+		scratch_config.SetOptionByName("autoload_known_extensions", Value::BOOLEAN(false));
+		scratch_config.SetOptionByName("autoinstall_known_extensions", Value::BOOLEAN(false));
+		DuckDB scratch(nullptr, &scratch_config);
+		Connection scratch_con(scratch);
+		for (auto &item : profile[0]) {
+			auto value = node_values[item.first];
+			auto wanted = JsonField(item.second->spec, "value");
+			auto shown_wanted = wanted;
+			auto set = scratch_con.Query("SET GLOBAL " + Ident(item.first) + " = " + Quoted(wanted));
+			if (!set->HasError()) {
+				// duckdb_settings(), not current_setting(): the scratch loads no core_functions
+				auto read = scratch_con.Query("SELECT value FROM duckdb_settings() WHERE name = " + Quoted(item.first));
+				if (!read->HasError() && read->RowCount() > 0) {
+					shown_wanted = read->Collection().GetValue(0, 0).ToString();
+				}
+			}
+			bool same = StringUtil::CIEquals(value, shown_wanted) || StringUtil::CIEquals(value, wanted);
+			out.push_back({"setting", item.first, same ? "same" : "differs", value, wanted, item.second->scope});
+		}
 	}
 	for (auto name : {"acl_deployment", "acl_node_group"}) {
 		Value value;

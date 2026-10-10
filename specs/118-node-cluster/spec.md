@@ -46,7 +46,7 @@ console works there; what makes a node differ from its profile is shown (drift, 
 ### 0. Two deployments (owner, 2026-10-10)
 - **Standalone node** (the open duckdb-acl): configured by its bootstrap SQL and its admin's `ACL NATIVE`;
   secrets local (duckdb's secret manager) or in tresor, by choice; no cluster profile, no drift, no
-  `cluster` bundle; `ACL CLUSTER …` is refused there with a clear message.
+  `cluster` bundle; `ACL CLUSTER` writes are refused there with a clear message (the profile's listings read).
 - **Cluster node** (the platform - BUSL, with the orchestrator): tresor required, the profile is how
   the fleet is configured, drift (§3), `operate` + `cluster`.
 - The mode is a deployment setting `acl_deployment = 'standalone' | 'cluster'` (GLOBAL-only, set at
@@ -203,7 +203,7 @@ catalog; over-reading blocks, FORCE is the operator's answer). Who reads what pe
 - `platform.audit_events` (NODE class): the ring's decision columns (no profile numbers).
 - Secrets: `LocalSecrets` - no service attached and no storage named → duckdb's own handling (TEMPORARY too,
   memory); capability and constants unchanged; GRANT / REVOKE SECRET and identity `FROM SECRET` still need a
-  service. 118.2's cluster mode will refuse the local path.
+  service. 118.2's cluster mode refuses the local path.
 - DETACH: `SqlNamesSource` over `relations.view_sql`.
 - Tests: `node_operate.test`, `acl_secrets.test` (the local block; type `http` - the suite loads no httpfs),
   `acl_cluster_profile.test` (views; fails without the fix), `platform_views` / `platform_rights` /
@@ -224,9 +224,7 @@ catalog; over-reading blocks, FORCE is the operator's answer). Who reads what pe
   configures it. Cluster: `LocalSecrets` is off - secrets only in the service.
 - `cluster` bundle: `AdminScope::CLUSTER`; ⊇ operate ⊇ observe (a revoke of a carried bundle refused);
   INFRASTRUCTURE = the bundle (never a point grant - the refusal names "the cluster bundle's alone"); the CLUSTER
-  view class reads `cluster_items`, `cluster_effective`, `drift`. A data-path setting (`ClusterSettingIsDataPath`:
-  http_proxy*, ca_cert_file, custom_user_agent, log_query_path, profile_output, temp_directory, logging_storage,
-  duckdb_api) is refused to the bundle in the authorizer, passthrough's.
+  view class reads `cluster_items`, `cluster_effective`, `drift`. Its settings: an allowlist of resources and tuning (`ClusterBundleMaySet`, review below); the rest passthrough's.
 - `platform.drift` = `acl_platform_drift()`: databases (not internal), loaded extensions, the profile's settings,
   each `same` / `differs` / `node_only` / `profile_only` / `bootstrap` (the default database, the policy's, a tresor,
   statically linked extensions and acl, `acl_deployment` / `acl_node_group`); a setting the profile does not name
@@ -234,4 +232,12 @@ catalog; over-reading blocks, FORCE is the operator's answer). Who reads what pe
   standalone node.
 - Tests: `node_cluster.test` (new), `acl_cluster_profile.test` (the bundle, data paths, point grants); the profile
   tests and `test_acl_cluster_install.cpp` set `acl_deployment = 'cluster'`.
+- Review (three passes): the data-path denylist left the ACL's trust settings open to the bundle (the anonymous
+  hatch, the quack door's authorizer, certificate checks, key locations, the audit) - replaced by an allowlist of
+  the node's resources and tuning (`ClusterBundleMaySet`), and the node's trust joined HARDENING (no profile item
+  for anyone); `s3_*` keys joined the credential names. Drift: a source compared by type (duckdb shows a file path
+  absolute, a ducklake one without its prefix), a setting by the value a scratch instance shows for it (no
+  extension loaded; read through duckdb_settings()), one settings read, a non-file database's path never shown
+  (a native attach may carry a credential). Docs: the bundles everywhere, the point-grant lists.
+  Low, left: source names that are canonical keys with a dot compared as raw names; drift in group scope untested.
 

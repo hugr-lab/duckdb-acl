@@ -679,7 +679,7 @@ struct PolicyStore {
 	bool NodeGroupKnown();
 	vector<ClusterItem> ClusterEffective();
 	//! spec 118: what this cluster node carries that its effective profile lacks and the other way round -
-	//! kind (database | extension | setting), name, state (node_only | profile_only | differs | bootstrap),
+	//! kind (database | extension | setting), name, state (same | differs | node_only | profile_only | bootstrap),
 	//! the node's value and the profile's, the item's scope. Showing only: nothing is reverted
 	struct DriftRow {
 		string kind, name, state, node_value, profile_value, scope;

@@ -162,7 +162,7 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
   call argument's AST. Never registered as real functions ⇒ a missed marker fails closed at bind.
 - **Administration is a capability** (spec 009): `{"manage": true}` in a catalog grant (per catalog,
   many catalogs per role, independent of `select`), or global bundles in `acl.admins` (spec 117: a set -
-  `observe`, `policy`, `passthrough`; `manage` = policy + observe), or point grants on the `platform`
+  `observe`, `operate`, `cluster`, `policy`, `passthrough`; `manage` = policy + observe), or point grants on the `platform`
   catalog; never self-escalating, and only `passthrough` leaves the virtual catalog.
 - **Golden rule**: the rewriter adds no query parameters — a user's `$1`/`?` is the only parameter.
 - **Function gating seam**: `PolicyStore::ResolveFunction` (spec 072) — a call is admitted when its
@@ -460,7 +460,8 @@ as the system catalog's (quack's), and the resolver reads `x.f` as `x.main.f` wh
 **Spec 093 — the cluster profile**: the shared part of every node's bootstrap, in the policy catalog as
 desired state (`cluster_items` + `cluster_deps`, schema v16, its own `config_version`; no history -
 who changed what is the audit's, the previous state the orchestrator's). `ACL CLUSTER INSTALL|UPDATE|
-REMOVE EXTENSION / ATTACH / DETACH / SET / RESET … [IN GROUP g]` (passthrough only) compiles to
+REMOVE EXTENSION / ATTACH / DETACH / SET / RESET … [IN GROUP g]` (the `cluster` bundle, spec 118; a cluster
+node only - a standalone one refuses the writes) compiles to
 `acl_cluster_*` (`acl_cluster.cpp`, seam `RegisterAclCluster`): check, write + bump in one transaction
 (`WriteWithReads(…, "config_version", before_commit)`), apply a hot change on this node before the
 commit (a failure rolls the write back). Never a credential (keys linted in the path and options, a
@@ -580,7 +581,8 @@ refused at the marker / SET, Flight `InvalidArgument`, quack blanked + one `door
 
 **Spec 112 — lineage after the client spikes**: names are OpenLineage's for a SQL endpoint - virtual
 `<acl_lineage_namespace>` :: `<vcat>.<schema|main>.<object>` (and `<vcat>.main.<object>` resolves, a
-fallback in `PolicyStore::ResolveTable`); the namespace is the cluster's (`ACL CLUSTER SET`), with no
+fallback in `PolicyStore::ResolveTable`); the namespace is the cluster's (`ACL CLUSTER SET` on a cluster node, `SET GLOBAL` in a standalone node's
+bootstrap), with no
 default: none = no lineage (`acl_lineage_status()`). A source's identity (`<scheme>://<host:port>[/db]`,
 never userinfo) names its physical datasets: the ext-common `acl_lineage_sources` registry first (hugr
 node), then `acl_lineage_source(alias, identity)` / `ATTACH … LINEAGE '<x>'` (parser-override sugar,
@@ -664,7 +666,7 @@ map a claim to a privileged role, repoint an issuer / client behind such a mappi
 catalog's manage (`AuthorizeRoleTargets`); every stored body (view, template, alias, RLS, mask, a grant's
 policy) is judged by its AUTHOR's function gate at write (`AuthorizeBodies`, `WalkBodyCalls`; the check's
 `body_function_denied` for older ones). Steps' key columns are ACL_KEY_TEXT (gen_schema, the runner). Rights: `AdminRights`
-is a SET (`passthrough`, `unrestricted_manage` = policy, `observe`, `catalogs`, `platform` point grants
+is a SET (`passthrough`, `unrestricted_manage` = policy, `observe`, `operate`, `cluster`, `catalogs`, `platform` point grants
 `<kind>:<object>` -> allowed; `MayAdminister()`, `Policy()`, `Privileged()` - spec 095's privileged roles
 include any point grant); `platform_grants(role, object, kind, allowed)` written only by passthrough
 (`GRANT|DENY|REVOKE VIEW|FUNCTION platform.x`, `acl_grant_platform` / `acl_revoke_platform`), never to
@@ -695,8 +697,8 @@ blocks, FORCE answers; macro bodies too). 118.2: `acl_deployment` = standalone (
 (GLOBAL-only, never a profile item; `PolicyStore::ClusterNode()`): a standalone node refuses every `ACL CLUSTER`
 write (`RequireClusterDeployment`; the listings read) and keeps local secrets; a cluster node keeps secrets only
 in its service. The `cluster` bundle (`AdminScope::CLUSTER`, `AdminRights::cluster` ⊇ operate ⊇ observe; passthrough
-implies it) = INFRASTRUCTURE and the CLUSTER views, never a point grant, never a data-path setting
-(`ClusterSettingIsDataPath` - passthrough's). `platform.drift` (`acl_platform_drift()`, `PolicyStore::ClusterDrift`):
+implies it) = INFRASTRUCTURE and the CLUSTER views, never a point grant; its settings an allowlist of resources
+and tuning (`ClusterBundleMaySet` - the rest passthrough's); the node's trust settings are HARDENING. `platform.drift` (`acl_platform_drift()`, `PolicyStore::ClusterDrift`):
 per database / loaded extension / profiled setting a state same | differs | node_only | profile_only | bootstrap;
 showing only. Cluster parts stay in acl_cluster.cpp (to move to hugr_node). Next: 118.3 (`platform.attached`,
 `GRANT SOURCE`).
