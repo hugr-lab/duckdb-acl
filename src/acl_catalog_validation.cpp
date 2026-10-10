@@ -58,7 +58,7 @@ bool CatalogBackend::ProbeTypeFacts(const string &form, const string &phys, cons
 	if (form == "view") {
 		source = view_sql;
 	} else if (!phys.empty()) {
-		source = "SELECT * FROM " + phys;
+		source = "SELECT * FROM " + NamePath::KeyToSql(phys);
 	}
 	vector<std::pair<string, LogicalType>> probed;
 	if (source.empty() || !ProbeTypes(source, probed)) {
@@ -162,7 +162,7 @@ bool CatalogBackend::CatalogPredicateChecked(const std::function<unique_ptr<Quer
 			return value.IsNull() ? string() : value.ToString();
 		};
 		auto form = text(0);
-		auto source = form == "view" ? "(" + text(2) + ")" : text(1);
+		auto source = form == "view" ? "(" + text(2) + ")" : NamePath::KeyToSql(text(1));
 		bool checked = false;
 		auto error = PredicateError(source, rls, &checked);
 		if (!checked) {

@@ -413,9 +413,8 @@ string CatalogBackend::SchemaCapsExpr(const string &name_expr, const string &vca
 		return string(); // the driver contract has no schema level
 	}
 	return "(SELECT nullif(trim(sc.\"caps\"), '') FROM " + Tbl("role_schemas") +
-	       " sc WHERE sc.\"role\" = g.\"role\" AND sc.\"vcat\" = " + vcat_expr + " AND substr(" + name_expr +
-	       ", 1, length(sc.\"schema_path\") + 1) = sc.\"schema_path\" || '.'"
-	       " ORDER BY length(sc.\"schema_path\") DESC LIMIT 1)";
+	       " sc WHERE sc.\"role\" = g.\"role\" AND sc.\"vcat\" = " + vcat_expr + " AND " +
+	       KeyPrefixSql(name_expr, "sc.\"schema_path\"") + " ORDER BY length(sc.\"schema_path\") DESC LIMIT 1)";
 }
 
 string CatalogBackend::CapsExpr(const string &name_expr, const string &vcat_expr) {
@@ -463,14 +462,8 @@ GrantPolicy CatalogBackend::RowPolicy(const ResultRows &result_rows, idx_t row, 
 }
 
 void CatalogBackend::SplitName(const string &vname, string &head, string &rest) {
-	auto dot = vname.find('.');
-	if (dot == string::npos) {
-		head.clear();
-		rest.clear();
-	} else {
-		head = vname.substr(0, dot);
-		rest = vname.substr(dot + 1);
-	}
+	// spec 116: a key's first part and the rest, both keys (a part may hold a quoted `.`)
+	NamePath::SplitHeadKey(vname, head, rest);
 }
 
 bool CatalogBackend::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {
@@ -480,8 +473,8 @@ bool CatalogBackend::ResolveTable(const Principal &principal, const string &vnam
 	EnsureFresh();
 	// spec 099: the node's type settings shape the read, so a SET GLOBAL never serves a stale one
 	auto instance = Db();
-	auto key = RoleSig(principal) + "\x1f" + vname + "\x1f" + (NodeStripsAliases(*instance) ? "b" : "k") +
-	           (NodeEnumsToVarchar(*instance) ? "v" : "k");
+	auto key = RoleSig(principal) + "\x1f" + StringUtil::Lower(vname) + "\x1f" +
+	           (NodeStripsAliases(*instance) ? "b" : "k") + (NodeEnumsToVarchar(*instance) ? "v" : "k");
 	{
 		lock_guard<mutex> guard(lock);
 		auto entry = objects.find(key);
@@ -508,15 +501,16 @@ bool CatalogBackend::ResolveTable(const Principal &principal, const string &vnam
 bool CatalogBackend::LookupRelation(const Principal &principal, const string &vname, TablePolicy &out) {
 	string head, rest;
 	SplitName(vname, head, rest);
-	string qualified_cond =
-	    head.empty() ? string("false") : "r.\"vcat\" = " + Lit(head) + " AND r.\"vname\" = " + Lit(rest);
+	string qualified_cond = head.empty()
+	                            ? string("false")
+	                            : KeyEqSql("r.\"vcat\"", Lit(head)) + " AND " + KeyEqSql("r.\"vname\"", Lit(rest));
 	// An object of the default schema is stored under a bare name, so `main.orders` names the same
 	// thing `orders` does. A client that loaded a catalog addresses tables that way - it is what a
 	// quack client pushes to the server - and refusing it left a served connection unable to read
 	// its own objects (spec 041). The qualified interpretation still wins, so a catalog actually
 	// named `main` is unaffected.
 	string unqualified = vname;
-	if (StringUtil::CIEquals(head, "main")) {
+	if (StringUtil::CIEquals(head, "main") && !rest.empty()) {
 		unqualified = rest;
 	}
 	vector<string> names = head.empty() ? vector<string> {vname} : vector<string> {vname, rest};
@@ -527,37 +521,58 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = r.\"vcat\""
 	                                       " AND oc.\"vname\" = r.\"vname\""
 	                                 : string();
-	auto sql =
-	    GrantsCte(principal) + "SELECT r.\"form\", r.\"phys\", r.\"view_sql\", r.\"rls\", " + CapsExpr() +
-	    " AS caps, " + GrantPolicyExprs() +
-	    ","
-	    " CASE WHEN " +
-	    qualified_cond +
-	    " THEN 1 ELSE 2 END AS prio,"
-	    " (SELECT list(struct_pack(cname := c.\"name\", cexpr := c.\"expr\") ORDER BY c.\"pos\") FROM " +
-	    ColumnsSource(principal, names) + " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\") AS cols, " +
-	    (function_mode ? "NULL" : "r.\"rls_checked\"") + " AS rchk, " +
-	    // spec 099: the relation's type policy and its source's type facts (a driver has neither)
-	    (function_mode
-	         ? string("NULL, NULL, NULL")
-	         : "r.\"alias_types\", r.\"enum_types\", (SELECT list(struct_pack(tcol := t.\"column\","
-	           " tbase := t.\"as_base\", tvarchar := t.\"as_varchar\", tboth := t.\"as_both\")) FROM " +
-	               Tbl("relation_types") + " t WHERE t.\"vcat\" = r.\"vcat\" AND t.\"vname\" = r.\"vname\")") +
-	    // spec 107: where the name resolved - the object's canonical virtual name, last so no index moves
-	    ", r.\"vcat\" AS cvcat, r.\"vname\" AS cvname"
-	    " FROM " +
-	    RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE (" +
-	    qualified_cond +
-	    ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND r.\"vname\" = " + Lit(unqualified) +
-	    // by role, so a principal holding several of them merges their column lists in one
-	    // order rather than in whatever order the store returned (spec 036)
-	    ") ORDER BY prio, g.\"role\"";
+	auto sql = GrantsCte(principal) + "SELECT r.\"form\", r.\"phys\", r.\"view_sql\", r.\"rls\", " + CapsExpr() +
+	           " AS caps, " + GrantPolicyExprs() +
+	           ","
+	           " CASE WHEN " +
+	           qualified_cond +
+	           " THEN 1 ELSE 2 END AS prio,"
+	           " (SELECT list(struct_pack(cname := c.\"name\", cexpr := c.\"expr\") ORDER BY c.\"pos\") FROM " +
+	           ColumnsSource(principal, names) +
+	           " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\") AS cols, " +
+	           (function_mode ? "NULL" : "r.\"rls_checked\"") + " AS rchk, " +
+	           // spec 099: the relation's type policy and its source's type facts (a driver has neither)
+	           (function_mode
+	                ? string("NULL, NULL, NULL")
+	                : "r.\"alias_types\", r.\"enum_types\", (SELECT list(struct_pack(tcol := t.\"column\","
+	                  " tbase := t.\"as_base\", tvarchar := t.\"as_varchar\", tboth := t.\"as_both\")) FROM " +
+	                      Tbl("relation_types") + " t WHERE t.\"vcat\" = r.\"vcat\" AND t.\"vname\" = r.\"vname\")") +
+	           // spec 107: where the name resolved - the object's canonical virtual name, last so no index moves
+	           ", r.\"vcat\" AS cvcat, r.\"vname\" AS cvname"
+	           " FROM " +
+	           RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
+	           " WHERE (" + qualified_cond + ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND " +
+	           KeyEqSql("r.\"vname\"", Lit(unqualified)) +
+	           // by role, so a principal holding several of them merges their column lists in one
+	           // order rather than in whatever order the store returned (spec 036)
+	           ") ORDER BY prio, g.\"role\"";
 	auto result = Query(sql);
 	ResultRows result_rows(*result);
 	if (result->RowCount() == 0) {
 		return false;
 	}
 	auto prio = result->Collection().GetValue(11, 0).GetValue<int64_t>();
+	{
+		// spec 116: the winning reading names ONE object - two that match it equally (a driver's
+		// `Orders` and `orders`, a catalog that predates the one-spelling rule) are refused, never merged
+		auto ncols = result->ColumnCount();
+		auto object_of = [&](idx_t row) {
+			return result_rows.GetValue(ncols - 2, row).ToString() + "\x1f" +
+			       result_rows.GetValue(ncols - 1, row).ToString();
+		};
+		auto first = object_of(0);
+		for (idx_t row = 1; row < result->RowCount(); row++) {
+			if (result_rows.GetValue(11, row).GetValue<int64_t>() != prio) {
+				break;
+			}
+			if (object_of(row) != first) {
+				NoteDenyReason(Reason::NO_ACCESS);
+				throw BinderException("acl: ambiguous name \"%s\" - it matches more than one object of the policy "
+				                      "(names compare case-insensitively)",
+				                      vname);
+			}
+		}
+	}
 	auto form = result->Collection().GetValue(0, 0).ToString();
 	auto phys = result->Collection().GetValue(1, 0);
 	auto view_sql = result->Collection().GetValue(2, 0);
@@ -805,8 +820,8 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 			inner += " REPLACE (" + StringUtil::Join(replaces, ", ") + ")";
 		}
 		inner += out.ReadFrom();
-		out.query = "SELECT COLUMNS(lambda __acl_col: lower(__acl_col) IN (" + StringUtil::Join(names, ", ") +
-		            ")) FROM (" + inner + ")";
+		out.query = "SELECT COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") + " IN (" +
+		            StringUtil::Join(names, ", ") + ")) FROM (" + inner + ")";
 		for (auto &column : listed) {
 			out.visible_columns.insert(column.name);
 			if (column.tree) {
@@ -870,18 +885,17 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 	string head, rest;
 	SplitName(vname, head, rest);
 	auto prefix_match = [](const string &path, const string &alias_expr) {
-		return "substr(" + path + ", 1, length(" + alias_expr + ") + 1) = " + alias_expr + " || '.'";
+		return KeyPrefixSql(path, alias_expr);
 	};
-	string qualified_cond = head.empty()
-	                            ? string("false")
-	                            : "sa.\"vcat\" = " + Lit(head) + " AND " + prefix_match(Lit(rest), "sa.\"alias_path\"");
-	auto path_case = "CASE WHEN sa.\"vcat\" = " + (head.empty() ? Lit("") : Lit(head)) + " THEN " + Lit(rest) +
+	string qualified_cond =
+	    head.empty() ? string("false")
+	                 : KeyEqSql("sa.\"vcat\"", Lit(head)) + " AND " + prefix_match(Lit(rest), "sa.\"alias_path\"");
+	auto path_case = "CASE WHEN " + KeyEqSql("sa.\"vcat\"", head.empty() ? Lit("") : Lit(head)) + " THEN " + Lit(rest) +
 	                 " ELSE " + Lit(vname) + " END";
 	vector<string> names = head.empty() ? vector<string> {vname} : vector<string> {vname, rest};
 	string oc_join = HasObjectCaps() ? " LEFT JOIN " + ObjectCapsSource(principal, names) +
-	                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = sa.\"vcat\""
-	                                       " AND oc.\"vname\" = " +
-	                                       path_case
+	                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = sa.\"vcat\" AND " +
+	                                       KeyEqSql("oc.\"vname\"", path_case)
 	                                 : string();
 	auto sql = GrantsCte(principal) + "SELECT sa.\"vcat\", sa.\"alias_path\", sa.\"phys_path\", " +
 	           CapsExpr(path_case, "sa.\"vcat\"") + " AS caps, " + GrantPolicyExprs() +
@@ -903,11 +917,35 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 	auto vcat = result->Collection().GetValue(0, 0).ToString();
 	auto alias_path = result->Collection().GetValue(1, 0).ToString();
 	auto &path = prio == 1 ? rest : vname;
+	// spec 116: one object or none - two aliases of the winning reading that match equally (a driver's
+	// `Raw` and `raw`) are refused, never merged
+	for (idx_t row = 1; row < result->RowCount(); row++) {
+		if (result_rows.GetValue(10, row).GetValue<int64_t>() != prio ||
+		    NamePath::KeySize(result_rows.GetValue(1, row).ToString()) != NamePath::KeySize(alias_path)) {
+			break; // ordered by prio, then by the alias's length: a shorter alias loses to the longest
+		}
+		if (result_rows.GetValue(0, row).ToString() != vcat || result_rows.GetValue(1, row).ToString() != alias_path) {
+			NoteDenyReason(Reason::NO_ACCESS);
+			throw BinderException(
+			    "acl: ambiguous name \"%s\" - it matches schema %s and schema %s of the policy", vname,
+			    NamePath::JoinKeys(vcat, alias_path),
+			    NamePath::JoinKeys(result_rows.GetValue(0, row).ToString(), result_rows.GetValue(1, row).ToString()));
+		}
+	}
+	// spec 116: the tail below the alias by PARTS - a fold that changed a length must never move the cut
+	auto written = NamePath::FromKey(path);
+	auto alias_parts = NamePath::KeySize(alias_path);
+	if (alias_parts == 0 || written.Size() <= alias_parts) {
+		return false;
+	}
+	auto tail =
+	    NamePath(vector<string>(written.Parts().begin() + NumericCast<int64_t>(alias_parts), written.Parts().end()))
+	        .ToKey();
 	out.subquery_form = false;
 	out.writable = true; // an aliased schema maps onto real tables
-	out.phys = result->Collection().GetValue(2, 0).ToString() + path.substr(alias_path.size());
+	out.phys = NamePath::JoinKeys(result->Collection().GetValue(2, 0).ToString(), tail);
 	// spec 112 §3: the object a live alias reaches is named like any other - where dbt writes
-	out.canonical = vcat + "." + path;
+	out.canonical = NamePath::JoinKeys(vcat, NamePath::JoinKeys(alias_path, tail));
 	// rows of the same winning alias differ only by role: union their caps and grant policies
 	GrantUnion grants;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
@@ -933,7 +971,7 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 	}
 	EnsureFresh();
 	auto kind = table_kind ? "table" : "scalar";
-	auto key = RoleSig(principal) + "\x1f" + kind + "\x1f" + vname;
+	auto key = RoleSig(principal) + "\x1f" + kind + "\x1f" + StringUtil::Lower(vname);
 	{
 		lock_guard<mutex> guard(lock);
 		auto entry = functions.find(key);
@@ -944,8 +982,9 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 	}
 	string head, rest;
 	SplitName(vname, head, rest);
-	string qualified_cond =
-	    head.empty() ? string("false") : "f.\"vcat\" = " + Lit(head) + " AND f.\"vname\" = " + Lit(rest);
+	string qualified_cond = head.empty()
+	                            ? string("false")
+	                            : KeyEqSql("f.\"vcat\"", Lit(head)) + " AND " + KeyEqSql("f.\"vname\"", Lit(rest));
 	vector<string> names = head.empty() ? vector<string> {vname} : vector<string> {vname, rest};
 	string oc_join = HasObjectCaps() ? " LEFT JOIN " + ObjectCapsSource(principal, names) +
 	                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
@@ -956,12 +995,12 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 	           ","
 	           " CASE WHEN " +
 	           qualified_cond +
-	           " THEN 1 ELSE 2 END AS prio"
+	           " THEN 1 ELSE 2 END AS prio, f.\"vname\" AS fvname"
 	           " FROM " +
 	           FunctionsSource(principal, names) + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join +
 	           " WHERE f.\"kind\" = '" + kind + "' AND ((" + qualified_cond +
-	           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND f.\"vname\" = " + Lit(vname) +
-	           ")) ORDER BY prio, g.\"role\"";
+	           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND " +
+	           KeyEqSql("f.\"vname\"", Lit(vname)) + ")) ORDER BY prio, g.\"role\"";
 	auto result = Query(sql);
 	ResultRows result_rows(*result);
 	TablePolicy policy;
@@ -972,6 +1011,19 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 		auto target = result->Collection().GetValue(2, 0);
 		auto template_sql = result->Collection().GetValue(3, 0);
 		auto prio = result->Collection().GetValue(11, 0).GetValue<int64_t>();
+		// spec 116: one function or none (see LookupRelation)
+		auto fvname = result_rows.GetValue(12, 0).ToString();
+		for (idx_t row = 1; row < result->RowCount(); row++) {
+			if (result_rows.GetValue(11, row).GetValue<int64_t>() != prio) {
+				break;
+			}
+			if (result_rows.GetValue(0, row).ToString() != vcat || result_rows.GetValue(12, row).ToString() != fvname) {
+				NoteDenyReason(Reason::NO_ACCESS);
+				throw BinderException("acl: ambiguous name \"%s\" - it matches more than one %s function of the "
+				                      "policy (names compare case-insensitively)",
+				                      vname, kind);
+			}
+		}
 		policy.subquery_form = form != "alias";
 		policy.phys = target.IsNull() ? string() : target.ToString();
 		policy.query = template_sql.IsNull() ? string() : template_sql.ToString();
@@ -1037,8 +1089,8 @@ void CatalogBackend::ApplyFunctionGrantPolicy(const string &vname, bool table_ki
 	if (!out.rls.empty()) {
 		inner += " WHERE " + out.rls;
 	}
-	out.wrap_sql = "SELECT COLUMNS(lambda __acl_col: lower(__acl_col) IN (" + StringUtil::Join(names, ", ") +
-	               ")) FROM (" + inner + ")";
+	out.wrap_sql = "SELECT COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") + " IN (" +
+	               StringUtil::Join(names, ", ") + ")) FROM (" + inner + ")";
 }
 
 bool CatalogBackend::PrincipalMainCap(const Principal &principal, const string &capability) {
@@ -1071,11 +1123,13 @@ bool CatalogBackend::DdlTarget(const Principal &principal, const string &vname, 
 	SplitName(vname, head, rest);
 	// the home is the object's own parent: `vs.x.m` with no schema `vs.x` has no home (it is not `vs`'s
 	// object `x.m` - the review's finding), and only a real parent makes a reading fit
+	// (spec 116: keys, compared case-insensitively; the rest after the home is one part)
 	auto prefix_of = [](const string &name) {
-		return "(substr(" + Lit(name) + ", 1, length(s.\"path\") + 1) = s.\"path\" || '.' AND strpos(substr(" +
-		       Lit(name) + ", length(s.\"path\") + 2), '.') = 0)";
+		return "(" + KeyPrefixSql(Lit(name), "s.\"path\"") + " AND NOT " +
+		       KeyNestedSql("substr(" + Lit(name) + ", length(s.\"path\") + 2)") + ")";
 	};
-	auto qualified = head.empty() ? string("false") : "(s.\"vcat\" = " + Lit(head) + " AND " + prefix_of(rest) + ")";
+	auto qualified =
+	    head.empty() ? string("false") : "(" + KeyEqSql("s.\"vcat\"", Lit(head)) + " AND " + prefix_of(rest) + ")";
 	// the unqualified reading is the MAIN catalog's - as names resolve in reads - so the same name never
 	// lands in different homes depending on which catalogs happen to declare its schema
 	auto unqualified = "(g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND " + prefix_of(vname) + ")";
@@ -1126,8 +1180,11 @@ bool CatalogBackend::DdlTarget(const Principal &principal, const string &vname, 
 		auto into = result_rows.GetValue(5, row);
 		auto only = result_rows.GetValue(6, row);
 		out.vcat = result_rows.GetValue(0, row).ToString();
-		out.vname = object_name;
 		out.schema_path = result_rows.GetValue(1, row).ToString();
+		// the record lands under the home as the policy spells it (spec 116): one spelling per name
+		string written_home, leaf;
+		NamePath::SplitLeaf(object_name, written_home, leaf);
+		out.vname = NamePath::ChildKey(out.schema_path, leaf);
 		out.origin = origin.IsNull() ? string() : origin.ToString();
 		// an alias shows the physical schema live, so nothing has to be recorded; an expansion
 		// shows only its own records, so a new object needs one
@@ -1154,10 +1211,11 @@ bool CatalogBackend::HeldSchema(const Principal &principal, const string &writte
 	EnsureFresh();
 	string head, rest;
 	SplitName(written, head, rest);
-	auto qualified =
-	    head.empty() ? string("false") : "(s.\"vcat\" = " + Lit(head) + " AND s.\"path\" = " + Lit(rest) + ")";
+	auto qualified = head.empty()
+	                     ? string("false")
+	                     : "(" + KeyEqSql("s.\"vcat\"", Lit(head)) + " AND " + KeyEqSql("s.\"path\"", Lit(rest)) + ")";
 	auto unqualified =
-	    "(g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND s.\"path\" = " + Lit(written) + ")";
+	    "(g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND " + KeyEqSql("s.\"path\"", Lit(written)) + ")";
 	auto sql = GrantsCte(principal) + "SELECT s.\"vcat\", s.\"path\", " + qualified +
 	           " AS qualified, rs.\"caps\" FROM " + Tbl("schemas") +
 	           " s JOIN grants g ON g.\"vcat\" = s.\"vcat\" JOIN " + Tbl("role_schemas") +

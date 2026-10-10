@@ -1641,3 +1641,49 @@ FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) ORDER BY seq;
 ----
 TABLE_FUNCTION	CREATE	['<-amount:FILTER', 'doubled<-amount:TRANSFORMATION', 'id<-id:IDENTITY']
 TABLE_FUNCTION	DROP	[]
+
+# --- spec 116: quoted names - a dataset's name is the key of its parts, unquoted unless a part holds a
+# `.` or a `"`, so it stays parseable and equal to the policy's own key ---------------------------------------
+
+statement ok
+CREATE SCHEMA phys."Raw Data";
+
+statement ok
+CREATE TABLE phys."Raw Data"."Order Items"(id INTEGER, "Qty" INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c."Order Items" AS phys."Raw Data"."Order Items";
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c."a.b"."Sink" AS phys."Raw Data"."Order Items";
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'name',
+    payload->'datasets'->(payload->'inputs'->>0)::INT->>'name',
+    payload->'datasets'->(payload->'inputs'->>0)::INT->>'namespace'
+FROM acl_lineage_events() WHERE event_type = 'DATASET' ORDER BY seq DESC LIMIT 2;
+----
+c."a.b".Sink	Raw Data.Order Items	acl://test/source/phys
+c.main.Order Items	Raw Data.Order Items	acl://test/source/phys
+
+statement ok
+DELETE FROM before;
+
+statement ok
+INSERT INTO before SELECT coalesce(max(seq), 0) FROM acl_lineage_events();
+
+statement ok
+ACL ROLE "w" INSERT INTO c."A.B".sink SELECT id, "Qty" FROM "ORDER ITEMS";
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TT
+SELECT payload->'datasets'->(payload->'outputs'->>0)::INT->>'name',
+    payload->'datasets'->(payload->'inputs'->>0)::INT->>'name'
+FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'RUN_COMPLETE';
+----
+c."a.b".Sink	c.main.Order Items

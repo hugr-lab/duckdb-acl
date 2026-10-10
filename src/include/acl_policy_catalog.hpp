@@ -374,6 +374,16 @@ struct CatalogBackend {
 	//! Run admin write statements + the policy_version bump in one transaction
 	void Write(const vector<string> &statements);
 
+	//! spec 116: the stored spelling of a name among `names` (keys) - see PolicyStore::SpellName
+	static string Spell(const string &key, const vector<string> &names, bool creating, const char *what);
+	string StoredCatalog(const string &vcat, bool creating);
+	string StoredName(const string &vcat, const string &key, bool creating);
+	//! every stored name (key) of `vcat` under one first part - what Spell reads
+	vector<string> NamesUnder(const string &vcat, const string &first_key);
+	//! whether a NEW `key` would be a second spelling of a stored name
+	static bool CaseSibling(const string &key, const vector<string> &names);
+	string StoredReference(const string &vcat, const string &name, bool creating);
+
 	int64_t CheckIntervalMs();
 
 	//! Re-read policy_version at most once per interval; a bump clears every cache (fail-fresh)

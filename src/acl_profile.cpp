@@ -116,14 +116,18 @@ string SourceOf(const string &table, const vector<string> &physical) {
 		auto dot = qualified.find('.');
 		return dot == string::npos ? string() : qualified.substr(0, dot);
 	};
-	for (auto &quoted : physical) {
-		auto phys = StringUtil::Replace(quoted, "\"", ""); // a name written quoted matches unquoted
-		if (StringUtil::CIEquals(phys, table)) {
-			return database_of(phys);
+	for (auto &key : physical) {
+		// spec 116: a physical name is a stored key - its parts, whatever they hold
+		NamePath phys;
+		string error;
+		if (!NamePath::TryFromKey(key, phys, error)) {
+			continue;
 		}
-		if (phys.size() > table.size() + 1 && phys[phys.size() - table.size() - 1] == '.' &&
-		    StringUtil::CIEquals(phys.substr(phys.size() - table.size()), table)) {
-			return database_of(phys);
+		auto joined = StringUtil::Join(phys.Parts(), ".");
+		if (StringUtil::CIEquals(joined, table) || StringUtil::CIEquals(phys.Leaf(), table) ||
+		    (joined.size() > table.size() + 1 && joined[joined.size() - table.size() - 1] == '.' &&
+		     StringUtil::CIEquals(joined.substr(joined.size() - table.size()), table))) {
+			return phys.Size() > 1 ? phys.Head() : string();
 		}
 	}
 	if (std::count(table.begin(), table.end(), '.') == 2) {

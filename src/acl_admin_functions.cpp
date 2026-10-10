@@ -198,10 +198,11 @@ bool AllowWrite(PolicyStore &store, const string &vcat, const string &vname, con
 //! condition, which for a function end names columns of its result.
 void AclAddReferenceFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_add_reference", "catalog");
-		auto name = RequiredArg(args, 1, row, "acl_add_reference", "name");
-		auto from_vname = RequiredArg(args, 2, row, "acl_add_reference", "from");
-		auto to_vname = RequiredArg(args, 3, row, "acl_add_reference", "to");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_add_reference", "catalog"));
+		auto name = StoreOf(state).SpellReference(vcat, KeyArg(args, 1, row, "acl_add_reference", "name"),
+		                                          OptionalArg(args, 12, row, "") != "skip");
+		auto from_vname = StoreOf(state).SpellName(vcat, KeyArg(args, 2, row, "acl_add_reference", "from"));
+		auto to_vname = StoreOf(state).SpellName(vcat, KeyArg(args, 3, row, "acl_add_reference", "to"));
 		auto &store = StoreOf(state);
 		if (!AllowWrite(store, vcat, name, "reference", OptionalArg(args, 12, row, ""))) {
 			continue;
@@ -219,8 +220,8 @@ void AclAddReferenceFunc(DataChunk &args, ExpressionState &state, Vector &result
 //! acl_drop_reference(vcat, name [, mode]): remove a declared join path
 void AclDropReferenceFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_drop_reference", "catalog");
-		auto name = RequiredArg(args, 1, row, "acl_drop_reference", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_drop_reference", "catalog"));
+		auto name = StoreOf(state).SpellReference(vcat, KeyArg(args, 1, row, "acl_drop_reference", "name"));
 		auto &store = StoreOf(state);
 		auto mode = OptionalArg(args, 2, row, "");
 		if (mode == "skip" && !store.CatalogObjectExists(vcat, name, "reference")) {
@@ -237,7 +238,8 @@ void AclDropReferenceFunc(DataChunk &args, ExpressionState &state, Vector &resul
 //! acl_create_catalog(vcat [, comment]): register a virtual catalog (a shared tree of virtual names)
 void AclCreateCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_create_catalog", "catalog");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_create_catalog", "catalog"),
+		                                        OptionalArg(args, 2, row, "") != "skip");
 		auto &store = StoreOf(state);
 		if (!AllowWrite(store, vcat, vcat, "catalog", OptionalArg(args, 2, row, ""))) {
 			continue;
@@ -268,9 +270,10 @@ void SetInlineComment(PolicyStore &store, const string &vcat, const string &vnam
 //! virtual catalog; no columns and no RLS -> a writable alias (RENAME), otherwise a read-only subquery
 void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_add_relation", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_add_relation", "name");
-		auto phys = RequiredArg(args, 2, row, "acl_add_relation", "phys");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_add_relation", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_add_relation", "name"),
+		                                      OptionalArg(args, 6, row, "") != "skip");
+		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_add_relation", "phys"));
 		case_insensitive_map_t<int8_t> marks;
 		auto columns = ParseColumns(OptionalArg(args, 3, row, ""), &marks);
 		auto rls = OptionalArg(args, 4, row, "");
@@ -290,8 +293,9 @@ void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result)
 //! acl_add_view(vcat, vname, select_sql): a virtual view (full SQL definition, read-only)
 void AclAddViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_add_view", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_add_view", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_add_view", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_add_view", "name"),
+		                                      OptionalArg(args, 5, row, "") != "skip");
 		auto sql = RequiredArg(args, 2, row, "acl_add_view", "SQL");
 		// a declared column list (the CREATE VIEW shape) is stored as-is instead of being probed
 		auto &store = StoreOf(state);
@@ -310,9 +314,10 @@ void AclAddViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 //! prefix; any name below it RENAMEs in place, existence is the binder's business
 void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_add_schema_alias", "catalog");
-		auto alias = RequiredArg(args, 1, row, "acl_add_schema_alias", "alias path");
-		auto phys = RequiredArg(args, 2, row, "acl_add_schema_alias", "phys path");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_add_schema_alias", "catalog"));
+		auto alias = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_add_schema_alias", "alias path"),
+		                                      OptionalArg(args, 4, row, "") != "skip");
+		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_add_schema_alias", "phys path"));
 		auto &store = StoreOf(state);
 		if (!AllowWrite(store, vcat, alias, "schema", OptionalArg(args, 4, row, ""))) {
 			continue;
@@ -329,9 +334,9 @@ void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &resu
 //! query, where every acl_* name is denied (spec 009).
 void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_register_created", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_register_created", "name");
-		auto phys = RequiredArg(args, 2, row, "acl_register_created", "phys");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_created", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_created", "name"), true);
+		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_register_created", "phys"));
 		StoreOf(state).CatalogRegisterCreated(vcat, vname, phys, OptionalArg(args, 3, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -341,8 +346,8 @@ void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &res
 //! the body as written, in virtual names, and nothing else to choose
 void AclRegisterViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_register_view", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_register_view", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_view", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_view", "name"), true);
 		auto body = RequiredArg(args, 2, row, "acl_register_view", "body");
 		StoreOf(state).CatalogRegisterView(vcat, vname, body);
 	}
@@ -373,6 +378,9 @@ struct RecordRenameUndo : ClientContextState {
 		}
 		for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
 			try {
+				// spec 116: the name it goes back to may have been taken meanwhile under another case - then
+				// the step is skipped, never a second spelling (acl_check_catalog reports what is left)
+				locked->SpellName(it->vcat, it->to, true);
 				locked->CatalogRenameRelation(it->vcat, it->from, it->to, it->phys);
 			} catch (...) {
 				// the record stays as the rename left it; acl_check_catalog reports it (source_missing)
@@ -386,9 +394,9 @@ struct RecordRenameUndo : ClientContextState {
 void AclRenameRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_rename_relation", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_rename_relation", "name");
-		auto new_vname = RequiredArg(args, 2, row, "acl_rename_relation", "new name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_rename_relation", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_rename_relation", "name"));
+		auto new_vname = StoreOf(state).SpellName(vcat, KeyArg(args, 2, row, "acl_rename_relation", "new name"), true);
 		auto store = SharedStoreOf(state);
 		string old_phys;
 		if (store->CatalogRenameRelation(vcat, vname, new_vname, OptionalArg(args, 3, row, ""), &old_phys) &&
@@ -405,9 +413,9 @@ void AclRenameRelationFunc(DataChunk &args, ExpressionState &state, Vector &resu
 //! an object that must already exist physically, and refuses if it does not (spec 016)
 void AclRegisterExistingFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_register_existing", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_register_existing", "name");
-		auto phys = RequiredArg(args, 2, row, "acl_register_existing", "phys");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_existing", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_existing", "name"), true);
+		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_register_existing", "phys"));
 		auto &store = StoreOf(state);
 		if (!store.PhysicalObjectExists(phys)) {
 			throw BinderException("acl: \"%s\" does not exist - this role may register objects, not create them "
@@ -424,8 +432,8 @@ void AclRegisterExistingFunc(DataChunk &args, ExpressionState &state, Vector &re
 void AclGrantSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_grant_schema", "role");
-		auto vcat = RequiredArg(args, 1, row, "acl_grant_schema", "catalog");
-		auto path = RequiredArg(args, 2, row, "acl_grant_schema", "schema path");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_grant_schema", "catalog"));
+		auto path = StoreOf(state).SpellName(vcat, KeyArg(args, 2, row, "acl_grant_schema", "schema path"));
 		auto &store = StoreOf(state);
 		store.CatalogEnsureGrant(role, vcat, false);
 		bool virtual_only = false;
@@ -433,8 +441,9 @@ void AclGrantSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result)
 			auto value = args.GetValue(6, row);
 			virtual_only = !value.IsNull() && value.GetValue<bool>();
 		}
-		store.CatalogGrantSchema(role, vcat, path, OptionalArg(args, 3, row, ""), OptionalArg(args, 4, row, ""),
-		                         OptionalArg(args, 5, row, ""), virtual_only);
+		store.CatalogGrantSchema(
+		    role, vcat, path, OptionalArg(args, 3, row, ""), OptionalArg(args, 4, row, ""),
+		    store.SpellPhysical(NameKey(OptionalArg(args, 5, row, ""), "acl_grant_schema", "into")), virtual_only);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -442,8 +451,8 @@ void AclGrantSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result)
 void AclRevokeSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_revoke_schema", "role");
-		auto vcat = RequiredArg(args, 1, row, "acl_revoke_schema", "catalog");
-		auto path = RequiredArg(args, 2, row, "acl_revoke_schema", "schema path");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_revoke_schema", "catalog"));
+		auto path = StoreOf(state).SpellName(vcat, KeyArg(args, 2, row, "acl_revoke_schema", "schema path"));
 		StoreOf(state).CatalogRevokeSchema(role, vcat, path);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -453,8 +462,9 @@ void AclRevokeSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result
 //! call for a materialisation that drifted (spec 015)
 void AclRematerializeSchemaCapsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_rematerialize_schema_caps", "catalog");
-		StoreOf(state).CatalogRematerializeSchemaCaps(vcat, OptionalArg(args, 1, row, ""));
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_rematerialize_schema_caps", "catalog"));
+		StoreOf(state).CatalogRematerializeSchemaCaps(
+		    vcat, NameKey(OptionalArg(args, 1, row, ""), "acl_rematerialize_schema_caps", "schema path"));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -463,9 +473,10 @@ void AclRematerializeSchemaCapsFunc(DataChunk &args, ExpressionState &state, Vec
 //! the physical schema holds right now (spec 014)
 void AclExpandSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_expand_schema", "catalog");
-		auto path = RequiredArg(args, 1, row, "acl_expand_schema", "schema path");
-		auto phys = RequiredArg(args, 2, row, "acl_expand_schema", "phys path");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_expand_schema", "catalog"));
+		auto path = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_expand_schema", "schema path"),
+		                                     OptionalArg(args, 4, row, "") != "skip");
+		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_expand_schema", "phys path"));
 		auto &store = StoreOf(state);
 		if (!AllowWrite(store, vcat, path, "schema", OptionalArg(args, 4, row, ""))) {
 			continue;
@@ -481,8 +492,8 @@ void AclExpandSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result
 void AclRefreshSchemaObjectsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	vector<Value> counts;
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_refresh_schema_objects", "catalog");
-		auto path = RequiredArg(args, 1, row, "acl_refresh_schema_objects", "schema path");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_refresh_schema_objects", "catalog"));
+		auto path = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_refresh_schema_objects", "schema path"));
 		bool prune = false;
 		if (args.ColumnCount() > 2) {
 			auto value = args.GetValue(2, row);
@@ -498,10 +509,12 @@ void AclRefreshSchemaObjectsFunc(DataChunk &args, ExpressionState &state, Vector
 void AddFunction(DataChunk &args, ExpressionState &state, Vector &result, const char *what, const char *kind,
                  const char *form) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, what, "catalog");
-		auto vname = RequiredArg(args, 1, row, what, "name");
-		auto definition = RequiredArg(args, 2, row, what, "definition");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, what, "catalog"));
+		auto vname =
+		    StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, what, "name"), OptionalArg(args, 6, row, "") != "skip");
 		bool is_alias = string(form) == "alias";
+		auto definition =
+		    is_alias ? KeyArg(args, 2, row, what, "target") : RequiredArg(args, 2, row, what, "definition");
 		// the declared signature and result (the CREATE MACRO shape): the signature types the probe's
 		// NULLs, and a declared result replaces the probe entirely
 		auto &store = StoreOf(state);
@@ -521,8 +534,8 @@ void AddFunction(DataChunk &args, ExpressionState &state, Vector &result, const 
 //! empty csv drops it (spec 048)
 void AclSetKeyFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_set_key", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_set_key", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_set_key", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_set_key", "name"));
 		auto kind = RequiredArg(args, 2, row, "acl_set_key", "kind");
 		StoreOf(state).CatalogSetKey(vcat, vname, kind, OptionalArg(args, 3, row, ""));
 	}
@@ -550,7 +563,7 @@ void AclAddScalarAliasCatalogFunc(DataChunk &args, ExpressionState &state, Vecto
 void AclGrantCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_grant_catalog", "role");
-		auto vcat = RequiredArg(args, 1, row, "acl_grant_catalog", "catalog");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_grant_catalog", "catalog"));
 		// an omitted caps argument is "unspecified", which the resolver reads as the read-only
 		// default; an explicit '{}' is "no capabilities" (spec 012)
 		auto caps = OptionalArg(args, 2, row, "");
@@ -570,8 +583,8 @@ void AclGrantCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result
 void AclGrantObjectFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_grant_object", "role");
-		auto vcat = RequiredArg(args, 1, row, "acl_grant_object", "catalog");
-		auto vname = RequiredArg(args, 2, row, "acl_grant_object", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_grant_object", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 2, row, "acl_grant_object", "name"));
 		auto caps = OptionalArg(args, 3, row, "");
 		auto rls = OptionalArg(args, 4, row, "");
 		auto columns = OptionalArg(args, 5, row, "");
@@ -587,7 +600,7 @@ void AclGrantObjectFunc(DataChunk &args, ExpressionState &state, Vector &result)
 void AclRevokeCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_revoke_catalog", "role");
-		auto vcat = RequiredArg(args, 1, row, "acl_revoke_catalog", "catalog");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_revoke_catalog", "catalog"));
 		StoreOf(state).CatalogRevoke(role, vcat);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -595,8 +608,8 @@ void AclRevokeCatalogFunc(DataChunk &args, ExpressionState &state, Vector &resul
 
 void AclDropRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_drop_relation", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_drop_relation", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_drop_relation", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_drop_relation", "name"));
 		auto &store = StoreOf(state);
 		if (AllowDrop(store, vcat, vname, "relation", OptionalArg(args, 2, row, ""))) {
 			store.CatalogDropRelation(vcat, vname);
@@ -616,8 +629,8 @@ void AclDropRelationFunc(DataChunk &args, ExpressionState &state, Vector &result
 void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_grant_table", "role");
-		auto vname = RequiredArg(args, 1, row, "acl_grant_table", "name");
-		auto phys = RequiredArg(args, 2, row, "acl_grant_table", "phys");
+		auto vname = StoreOf(state).SpellName("default", KeyArg(args, 1, row, "acl_grant_table", "name"));
+		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_grant_table", "phys"));
 		auto columns = ParseColumns(OptionalArg(args, 3, row, ""));
 		auto rls = OptionalArg(args, 4, row, "");
 		auto cap_list = SplitCsv(OptionalArg(args, 5, row, "select"));
@@ -656,7 +669,7 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 void AclGrantViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_grant_view", "role");
-		auto vname = RequiredArg(args, 1, row, "acl_grant_view", "name");
+		auto vname = StoreOf(state).SpellName("default", KeyArg(args, 1, row, "acl_grant_view", "name"));
 		auto sql = RequiredArg(args, 2, row, "acl_grant_view", "SQL");
 		auto &store = StoreOf(state);
 		if (store.CatalogEnabled()) {
@@ -680,8 +693,9 @@ void GrantFunctionWrapper(DataChunk &args, ExpressionState &state, Vector &resul
                           case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> PolicyStore::*space) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, what, "role");
-		auto vname = RequiredArg(args, 1, row, what, "name");
-		auto definition = RequiredArg(args, 2, row, what, "definition");
+		auto vname = StoreOf(state).SpellName("default", KeyArg(args, 1, row, what, "name"));
+		auto definition =
+		    is_alias ? KeyArg(args, 2, row, what, "target") : RequiredArg(args, 2, row, what, "definition");
 		auto &store = StoreOf(state);
 		if (store.CatalogEnabled()) {
 			store.CatalogEnsureGrant(role, "default", true);
@@ -812,6 +826,8 @@ FunctionSpec ParseFunctionSpec(const string &spec_p, const char *fn) {
 	return out;
 }
 
+#define FOLD_SQL(column) "system.main.translate(" column ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+
 //! spec 072: a member or an admitting grant names a function this node has, unless its kind was
 //! written explicitly. Read off duckdb_functions() on a connection of its own, at write time only -
 //! the query path never looks. A typo, or a table function written without TABLE, is refused here
@@ -825,10 +841,12 @@ void RequireFunctionOnNode(ClientContext &context, const FunctionSpec &spec, con
 	// this query too (the shadowing the gate protects a principal from, spec 072 §"known residual")
 	Connection con(DatabaseInstance::GetDatabase(context));
 	auto prepared =
-	    con.Prepare("SELECT 1 FROM duckdb_functions() WHERE system.main.lower(function_name) = $1 AND "
-	                "system.main.lower(database_name) = $2 AND system.main.lower(schema_name) = $3 AND (CASE WHEN "
-	                "function_type IN ('table', 'table_macro') THEN 'table' WHEN function_type = 'pragma' THEN "
-	                "'pragma' ELSE 'scalar' END) = $4 LIMIT 1");
+	    // (spec 116: the ASCII fold the key was lowered with - SQL's lower() folds Unicode)
+	    con.Prepare("SELECT 1 FROM duckdb_functions() WHERE " FOLD_SQL("function_name") " = $1 AND " FOLD_SQL(
+	        "database_name") " = $2 AND " FOLD_SQL("schema_name") " = $3 AND (CASE WHEN "
+	                                                              "function_type IN ('table', 'table_macro') THEN "
+	                                                              "'table' WHEN function_type = 'pragma' THEN "
+	                                                              "'pragma' ELSE 'scalar' END) = $4 LIMIT 1");
 	if (prepared->HasError()) {
 		throw BinderException("%s: cannot read the node's functions: %s", fn, prepared->GetError());
 	}
@@ -1222,10 +1240,13 @@ void AclAllowFunctionFunc(DataChunk &args, ExpressionState &state, Vector &resul
 //! acl_alter_relation(vcat, vname, field, value): field is phys | columns | rls | view
 void AclAlterRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_alter_relation", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_alter_relation", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_alter_relation", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_alter_relation", "name"));
 		auto field = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_relation", "property"));
 		auto value = OptionalArg(args, 3, row, "");
+		if (field == "phys") {
+			value = StoreOf(state).SpellPhysical(NameKey(value, "acl_alter_relation", "phys"));
+		}
 		case_insensitive_map_t<int8_t> marks;
 		auto columns = field == "columns" ? ParseColumns(value, &marks) : vector<std::pair<string, string>>();
 		StoreOf(state).CatalogAlterRelation(vcat, vname, field, value, columns, marks);
@@ -1236,9 +1257,9 @@ void AclAlterRelationFunc(DataChunk &args, ExpressionState &state, Vector &resul
 //! acl_alter_schema_alias(vcat, alias_path, phys_path): retarget an existing schema alias
 void AclAlterSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_alter_schema_alias", "catalog");
-		auto alias = RequiredArg(args, 1, row, "acl_alter_schema_alias", "alias path");
-		auto phys = RequiredArg(args, 2, row, "acl_alter_schema_alias", "phys path");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_alter_schema_alias", "catalog"));
+		auto alias = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_alter_schema_alias", "alias path"));
+		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_alter_schema_alias", "phys path"));
 		StoreOf(state).CatalogAlterSchemaAlias(vcat, alias, phys);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -1247,11 +1268,14 @@ void AclAlterSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &re
 //! acl_alter_function(vcat, vname, kind, form, definition): redefine an existing virtual function
 void AclAlterFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_alter_function", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_alter_function", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_alter_function", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_alter_function", "name"));
 		auto kind = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_function", "kind"));
 		auto form = StringUtil::Lower(RequiredArg(args, 3, row, "acl_alter_function", "form"));
 		auto definition = RequiredArg(args, 4, row, "acl_alter_function", "definition");
+		if (form == "alias") {
+			definition = NameKey(definition, "acl_alter_function", "target");
+		}
 		StoreOf(state).CatalogAlterFunction(vcat, vname, kind, form, definition);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -1260,7 +1284,7 @@ void AclAlterFunctionFunc(DataChunk &args, ExpressionState &state, Vector &resul
 //! acl_alter_catalog(vcat, comment) / acl_alter_role(role, claims_csv)
 void AclAlterCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_alter_catalog", "catalog");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_alter_catalog", "catalog"));
 		StoreOf(state).CatalogAlterCatalog(vcat, OptionalArg(args, 1, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -1278,7 +1302,7 @@ void AclAlterRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 void AclAlterGrantFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_alter_grant", "role");
-		auto vcat = RequiredArg(args, 1, row, "acl_alter_grant", "catalog");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_alter_grant", "catalog"));
 		auto field = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_grant", "property"));
 		auto value = OptionalArg(args, 3, row, "");
 		StoreOf(state).CatalogAlterGrant(role, vcat, field, value);
@@ -1289,8 +1313,8 @@ void AclAlterGrantFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 //! acl_comment(vcat, vname, kind, column, comment): document a virtual object or one of its columns
 void AclCommentFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_comment", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_comment", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_comment", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_comment", "name"));
 		auto kind = StringUtil::Lower(OptionalArg(args, 2, row, "relation"));
 		auto column = OptionalArg(args, 3, row, "");
 		auto comment = OptionalArg(args, 4, row, "");
@@ -1304,9 +1328,9 @@ void AclCommentFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 void AclRefreshSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	vector<Value> counts;
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_refresh_schema", "catalog");
-		counts.push_back(Value::BIGINT(
-		    NumericCast<int64_t>(StoreOf(state).CatalogRefreshSchema(vcat, OptionalArg(args, 1, row, "")))));
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_refresh_schema", "catalog"));
+		counts.push_back(Value::BIGINT(NumericCast<int64_t>(StoreOf(state).CatalogRefreshSchema(
+		    vcat, NameKey(OptionalArg(args, 1, row, ""), "acl_refresh_schema", "name")))));
 	}
 	for (idx_t row = 0; row < args.size(); row++) {
 		result.SetValue(row, counts[row]);
@@ -1321,7 +1345,7 @@ void AclRefreshSchemaFunc(DataChunk &args, ExpressionState &state, Vector &resul
 //! acl_drop_catalog(vcat [, cascade]): definitions always; the role grants need cascade
 void AclDropCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_drop_catalog", "catalog");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_drop_catalog", "catalog"));
 		bool cascade = false;
 		if (args.ColumnCount() > 1) {
 			auto value = args.GetValue(1, row);
@@ -1337,8 +1361,8 @@ void AclDropCatalogFunc(DataChunk &args, ExpressionState &state, Vector &result)
 
 void AclDropSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_drop_schema_alias", "catalog");
-		auto alias = RequiredArg(args, 1, row, "acl_drop_schema_alias", "alias path");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_drop_schema_alias", "catalog"));
+		auto alias = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_drop_schema_alias", "alias path"));
 		auto &store = StoreOf(state);
 		bool cascade = false;
 		if (args.ColumnCount() > 3) {
@@ -1354,8 +1378,8 @@ void AclDropSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &res
 
 void AclDropFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_drop_function", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_drop_function", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_drop_function", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_drop_function", "name"));
 		auto kind = StringUtil::Lower(RequiredArg(args, 2, row, "acl_drop_function", "kind"));
 		auto &store = StoreOf(state);
 		if (AllowDrop(store, vcat, vname, kind, OptionalArg(args, 3, row, ""))) {

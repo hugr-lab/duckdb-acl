@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "acl_name_path.hpp"
 #include "acl_function_categories.hpp"
 #include "acl_identity.hpp"
 #include "acl_principal.hpp"
@@ -474,6 +475,23 @@ struct PolicyStore {
 	bool CatalogEnabled() const {
 		return catalog != nullptr;
 	}
+
+	//! spec 116: the policy's own spelling of a catalog name / of an in-catalog name (a key), so a write
+	//! naming an existing record lands on it whatever case it was written in. Each part takes the
+	//! spelling a stored name already gives that part (a parent schema, the object itself); a part no
+	//! stored name has stays as written. `creating`: the name is a NEW object's, and one that differs
+	//! from a stored one only by case is refused (one spelling per name, as duckdb has one entry).
+	//! The memory store keeps every map case-insensitive and answers the name as given.
+	string SpellCatalog(const string &vcat, bool creating = false);
+	string SpellName(const string &vcat, const string &key, bool creating = false);
+	//! spec 116: a physical name (a key) as the engine's catalog spells it - each part that the attached
+	//! database, its schema and its table answer to (folded as duckdb folds, ASCII) takes their spelling,
+	//! so the exact joins on information_schema / duckdb_tables match it. An exact match wins (a
+	//! case-sensitive source - postgres - may hold `Orders` and `orders`); several answers and none exact,
+	//! or nothing there yet (a CREATE in the client's open transaction), keep the part as written.
+	string SpellPhysical(const string &key);
+	//! The same over a catalog's references (their own namespace, spec 022)
+	string SpellReference(const string &vcat, const string &name, bool creating = false);
 
 	// catalog admin operations (spec 006); each throws unless the catalog backend is enabled.
 	// columns are (name, expr) pairs with an empty expr for a plain projected column.
@@ -999,8 +1017,8 @@ struct PolicyStore {
 		//! spec 097: an `admins` row whose scope this build does not know. It grants nothing here, but
 		//! the role stays privileged (spec 095) - a later scope must not open its role to IdP group names
 		bool unknown_scope = false;
-		//! catalogs this principal may manage, compared exactly - the policy source compares vcat with
-		//! SQL `=`, so authorizing case-insensitively would authorize a different catalog
+		//! catalogs this principal may manage, compared case-insensitively (spec 116): the policy holds one
+		//! spelling per catalog name and a write lands on it
 		std::set<string> catalogs;
 	};
 	//! The principal's effective rights: the strongest over its roles and its catalog grants

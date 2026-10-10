@@ -6,6 +6,7 @@
 #include "acl_admin_sql.hpp"
 
 #include "acl_door_common.hpp"
+#include "acl_name_path.hpp"
 #include "acl_scan_util.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/helper.hpp"
@@ -159,11 +160,24 @@ struct AdminScanner {
 		return Rest(what);
 	}
 
-	//! A name written either way: bare (`range`, `pg.public.orders`) or as the legacy quoted string
-	string Name(const char *what) {
+	//! A name that is a VALUE, not an SQL identifier (an issuer, a client, a resource group, a secret, an
+	//! extension, a source's alias - spec 116 §3): bare (`range`, `a.b`) or quoted either way, as written
+	string NameValue(const char *what) {
 		Skip();
 		if (pos < text.size() && (text[pos] == '\'' || text[pos] == '"')) {
 			return Quoted(what);
+		}
+		return DottedWords(what);
+	}
+
+	//! A virtual or physical name, as its canonical key (spec 116): written as SQL writes one
+	//! (`pg."Raw Data".orders`, each part a word or a double-quoted identifier), or as the legacy
+	//! single-quoted string holding a whole path (`'pg.public.orders'`), read with the key rules
+	string PathName(const char *what) {
+		Skip();
+		if (pos < text.size() && text[pos] == '\'') {
+			auto written = Quoted(what);
+			return NamePath::FromKey(written, what).ToKey();
 		}
 		return Dotted(what);
 	}
@@ -177,8 +191,8 @@ struct AdminScanner {
 		return Quoted(what);
 	}
 
-	//! a bare identifier path: word(.word)*
-	string Dotted(const char *what) {
+	//! words joined by `.`, as written - a claim path, a value; never a SQL name (that is Path)
+	string DottedWords(const char *what) {
 		auto path = Word(what);
 		while (pos < text.size() && text[pos] == '.') {
 			pos++;
@@ -186,16 +200,68 @@ struct AdminScanner {
 		}
 		return path;
 	}
+
+	//! One SQL identifier (spec 116): a word, or a double-quoted identifier with `""` for a quote - any
+	//! case, spaces, a dot inside. The raw name, unquoted.
+	string Ident(const char *what) {
+		Skip();
+		if (pos < text.size() && text[pos] == '"') {
+			auto start = pos;
+			pos++;
+			string name;
+			bool closed = false;
+			while (pos < text.size()) {
+				if (text[pos] == '"') {
+					if (pos + 1 < text.size() && text[pos + 1] == '"') {
+						name += '"';
+						pos += 2;
+						continue;
+					}
+					pos++;
+					closed = true;
+					break;
+				}
+				name += text[pos++];
+			}
+			if (!closed) {
+				throw BinderException("acl admin: an unterminated quoted identifier at position %llu", start);
+			}
+			if (name.empty()) {
+				throw BinderException("acl admin: an empty quoted identifier at position %llu - %s cannot be empty",
+				                      start, what);
+			}
+			return name;
+		}
+		return Word(what);
+	}
+
+	//! Identifiers joined by `.` (spec 116): `c."Raw Data".sub."T"` - each part one identifier
+	NamePath Path(const char *what) {
+		vector<string> parts;
+		parts.push_back(Ident(what));
+		while (pos < text.size() && text[pos] == '.') {
+			pos++;
+			parts.push_back(Ident(what));
+		}
+		return NamePath(std::move(parts));
+	}
+
+	//! A path as its canonical key
+	string Dotted(const char *what) {
+		return Path(what).ToKey();
+	}
+
+	//! One identifier as the key of a one-part name (a catalog: `"Sales Mart"`, `"a.b"`)
+	string IdentKey(const char *what) {
+		return NamePath::QuotePart(Ident(what));
+	}
 };
 
-//! vcat.vname: the first component is the catalog, the rest the in-catalog path
+//! vcat.vname (a key): the first part is the catalog, the rest the in-catalog path - both as keys
 void SplitVirtual(const string &path, string &vcat, string &vname) {
-	auto dot = path.find('.');
-	if (dot == string::npos) {
+	if (!NamePath::SplitHeadKey(path, vcat, vname)) {
 		throw BinderException("acl admin: \"%s\" must be written as <catalog>.<name>", path);
 	}
-	vcat = path.substr(0, dot);
-	vname = path.substr(dot + 1);
 }
 
 //! `(select, insert)` -> `{"select": true, "insert": true}`. The list form is what a person writes;
@@ -514,7 +580,7 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 	};
 	if (s.Accept("catalog")) {
 		if_not_exists(s);
-		auto vcat = s.Word("a catalog name");
+		auto vcat = s.IdentKey("a catalog name");
 		string comment;
 		comment_clause(s, comment);
 		return MakeAdminCall("acl_create_catalog", {Value(vcat), Value(comment), Value(mode)});
@@ -529,9 +595,8 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 		//! an endpoint may be written with or without the reference's own catalog in front of it
 		auto endpoint = [&s, &vcat]() {
 			auto written = s.Dotted("an object name");
-			auto prefix = vcat + ".";
-			if (written.size() > prefix.size() && StringUtil::CIEquals(written.substr(0, prefix.size()), prefix)) {
-				return written.substr(prefix.size());
+			if (NamePath::KeyUnder(written, vcat)) {
+				return written.substr(vcat.size() + 1);
 			}
 			return written;
 		};
@@ -596,7 +661,7 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 		if (!expand) {
 			s.Expect("as");
 		}
-		auto phys = s.Name("a physical schema path");
+		auto phys = s.PathName("a physical schema path");
 		string comment;
 		comment_clause(s, comment);
 		return MakeAdminCall(expand ? "acl_expand_schema" : "acl_add_schema_alias",
@@ -659,7 +724,7 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 		comment_clause(s, comment);
 		if (s.Accept("alias")) {
 			s.Expect("of");
-			auto target = s.Name("a target function");
+			auto target = s.PathName("a target function");
 			comment_clause(s, comment); // an alias has no body, so the comment may also come last
 			return MakeAdminCall(
 			    scalar ? "acl_add_scalar_alias" : "acl_add_table_function_alias",
@@ -676,7 +741,7 @@ unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 	}
 	// CREATE VIRTUAL TABLE v.n AS <phys> [COLUMNS (…)] [RLS (…)] [COMMENT '…']
 	s.Expect("as");
-	auto phys = s.Name("a physical table path");
+	auto phys = s.PathName("a physical table path");
 	string columns, rls, comment, pk;
 	for (bool more = true; more;) {
 		more = false;
@@ -730,7 +795,7 @@ string RoleOrAllRoles(AdminScanner &s, const char *preposition) {
 		return string();
 	}
 	s.Expect("role");
-	return s.Word("a role name");
+	return s.Ident("a role name");
 }
 
 //! `ACL CLUSTER …` (spec 093): the cluster profile. Compiled to acl_cluster_* calls; the authorization
@@ -739,7 +804,7 @@ unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
 	auto group = [&]() -> string {
 		if (s.Accept("in")) {
 			s.Expect("group");
-			return s.Name("a resource group name");
+			return s.NameValue("a resource group name");
 		}
 		return string();
 	};
@@ -749,13 +814,13 @@ unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
 	auto verb = StringUtil::Lower(s.Word("INSTALL, UPDATE, REMOVE, ATTACH, DETACH, SET or RESET"));
 	if (verb == "install" || verb == "update" || verb == "remove") {
 		s.Expect("extension");
-		auto name = s.Name("an extension name");
+		auto name = s.NameValue("an extension name");
 		string version, repository;
 		for (;;) {
 			if (verb != "remove" && s.Accept("version")) {
 				version = s.Quoted("version");
 			} else if (verb == "install" && s.Accept("from")) {
-				repository = s.Name("a repository name");
+				repository = s.NameValue("a repository name");
 			} else if (verb != "remove" && s.Accept("sha256")) {
 				// spec 103: refused, never ignored - a script that still pins a hash must not believe it does
 				throw BinderException("acl admin: SHA256 is no longer part of the cluster profile (spec 103) - "
@@ -773,7 +838,7 @@ unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
 	if (verb == "attach") {
 		auto path = s.Quoted("the source's path");
 		s.Expect("as");
-		auto alias = s.Name("the source's alias");
+		auto alias = s.NameValue("the source's alias");
 		string type, secret;
 		vector<std::pair<string, string>> options;
 		if (s.AtParen()) {
@@ -822,7 +887,7 @@ unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
 		                                            Value(note), Value(lineage)});
 	}
 	if (verb == "detach") {
-		auto alias = s.Name("the source's alias");
+		auto alias = s.NameValue("the source's alias");
 		bool cascade = false, force = false;
 		for (;;) {
 			if (s.Accept("cascade")) {
@@ -897,7 +962,7 @@ string ClaimPath(AdminScanner &s) {
 	if (s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"')) {
 		return s.Quoted("claim path");
 	}
-	return s.Dotted("a claim path");
+	return s.DottedWords("a claim path");
 }
 
 //! A REQUIRE value: a quoted string, or a bare word or number (a boolean or numeric claim, compared as
@@ -1010,10 +1075,10 @@ string AttributesJson(const string &list) {
 
 //! `FROM SECRET s [IN c]` after its FROM SECRET: the spec entries naming it
 void SecretRef(AdminScanner &s, vector<string> &entries) {
-	auto secret = s.Name("a secret name");
+	auto secret = s.NameValue("a secret name");
 	entries.push_back("\"secret\":" + JsonQuote(secret));
 	if (s.Accept("in")) {
-		entries.push_back("\"service\":" + JsonQuote(s.Word("a secrets service")));
+		entries.push_back("\"service\":" + JsonQuote(s.Ident("a secrets service")));
 	}
 }
 
@@ -1115,7 +1180,7 @@ unique_ptr<SQLStatement> ParseCreateIssuer(AdminScanner &s, string mode) {
 	}
 	s.Skip();
 	bool quoted = s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"');
-	auto name = quoted ? s.Quoted("issuer") : s.Word("an issuer name");
+	auto name = quoted ? s.Quoted("issuer") : s.Ident("an issuer name");
 	vector<string> issuer_entries, client_entries;
 	bool has_url = false, has_secret = false;
 	while (!s.Done() && !s.AtSemicolon()) {
@@ -1159,9 +1224,9 @@ unique_ptr<SQLStatement> ParseCreateClient(AdminScanner &s, string mode) {
 			mode = "skip";
 		}
 	}
-	auto name = s.Name("a client name");
+	auto name = s.NameValue("a client name");
 	s.Expect("issuer");
-	auto issuer = s.Name("an issuer name");
+	auto issuer = s.NameValue("an issuer name");
 	vector<string> entries;
 	while (!s.Done() && !s.AtSemicolon()) {
 		if (!ClientClause(s, entries, false)) {
@@ -1174,7 +1239,7 @@ unique_ptr<SQLStatement> ParseCreateClient(AdminScanner &s, string mode) {
 //! ALTER ISSUER i SET URL '…' | SET FROM SECRET s [IN c] | DROP FROM SECRET | SET <client clause> …
 //! | DROP CLIENT FROM SECRET
 unique_ptr<SQLStatement> ParseAlterIssuer(AdminScanner &s) {
-	auto name = s.Name("an issuer name");
+	auto name = s.NameValue("an issuer name");
 	vector<string> issuer_entries, client_entries;
 	if (s.Accept("drop")) {
 		if (s.Accept("client")) {
@@ -1217,7 +1282,7 @@ unique_ptr<SQLStatement> ParseAlterIssuer(AdminScanner &s) {
 
 //! ALTER CLIENT c SET <client clause> … | DROP FROM SECRET
 unique_ptr<SQLStatement> ParseAlterClient(AdminScanner &s) {
-	auto name = s.Name("a client name");
+	auto name = s.NameValue("a client name");
 	vector<string> entries;
 	if (s.Accept("drop")) {
 		s.Expect("from");
@@ -1252,10 +1317,10 @@ unique_ptr<SQLStatement> ParseMapping(AdminScanner &s, const char *function) {
 		s.Expect("issuer");
 		kind = "issuer";
 	}
-	auto scope = s.Name(kind == "client" ? "a client name" : "an issuer name");
+	auto scope = s.NameValue(kind == "client" ? "a client name" : "an issuer name");
 	s.Expect("to");
 	s.Expect("role");
-	auto role = s.Word("a role name");
+	auto role = s.Ident("a role name");
 	return MakeAdminCall(
 	    function, {Value(kind), Value(scope), Value(is_group ? "group" : "claim-value"), Value(external), Value(role)});
 }
@@ -1298,7 +1363,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		// (spec 072): a grant row with allowed = false, which wins over every grant
 		s.Expect("function");
 		if (s.Accept("category")) {
-			auto category = s.Word("a category name");
+			auto category = s.Ident("a category name");
 			auto role = RoleOrAllRoles(s, "to");
 			return MakeAdminCall("acl_grant_function_category", {Value(role), Value(category), Value("false")});
 		}
@@ -1325,7 +1390,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 					mode = "skip";
 				}
 			}
-			auto role = s.Word("a role name");
+			auto role = s.Ident("a role name");
 			string claims;
 			if (s.Accept("claims")) {
 				claims = s.AtParen() ? ClaimsListToCsv(s.Parens()) : s.Quoted("claims list");
@@ -1336,7 +1401,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			// CREATE [OR REPLACE] RESOURCE GROUP g [WITH] (window_max 64, batch_bytes '32MiB', …)
 			// [COMMENT '…'] (spec 085): a re-create replaces the limits; the roles bound to it stay
 			s.Expect("group");
-			auto group = s.Word("a group name");
+			auto group = s.Ident("a group name");
 			s.Accept("with");
 			string limits = "{}";
 			if (s.AtParen()) {
@@ -1380,7 +1445,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			// CREATE FUNCTION CATEGORY c [COMMENT '…'] (spec 072): the operator's own category; a
 			// re-create keeps the members and grants and takes the new comment
 			s.Expect("category");
-			auto category = s.Word("a category name");
+			auto category = s.Ident("a category name");
 			string comment;
 			if (s.Accept("comment")) {
 				comment = s.Quoted("comment");
@@ -1425,7 +1490,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 				s.Expect("alias");
 				s.Accept("of"); // ALIAS OF <fn> and the older ALIAS <fn> are the same thing
 			}
-			auto definition = is_macro ? s.Body("expression template") : s.Name("a target function");
+			auto definition = is_macro ? s.Body("expression template") : s.PathName("a target function");
 			if (!is_macro) {
 				return MakeAdminCall("acl_add_scalar_alias", {Value(vcat), Value(vname), Value(definition)});
 			}
@@ -1451,7 +1516,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 				s.Expect("alias");
 				s.Accept("of"); // ALIAS OF <fn> and the older ALIAS <fn> are the same thing
 			}
-			auto definition = is_macro ? s.Body("SQL template") : s.Name("a target function");
+			auto definition = is_macro ? s.Body("SQL template") : s.PathName("a target function");
 			if (!is_macro) {
 				return MakeAdminCall("acl_add_table_function_alias", {Value(vcat), Value(vname), Value(definition)});
 			}
@@ -1475,10 +1540,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		if (s.Accept("resource")) {
 			// GRANT RESOURCE GROUP g TO ROLE r (spec 085)
 			s.Expect("group");
-			auto group = s.Word("a group name");
+			auto group = s.Ident("a group name");
 			s.Expect("to");
 			s.Expect("role");
-			return MakeAdminCall("acl_grant_resource_group", {Value(s.Word("a role name")), Value(group)});
+			return MakeAdminCall("acl_grant_resource_group", {Value(s.Ident("a role name")), Value(group)});
 		}
 		if (s.Accept("admin")) {
 			// GRANT ADMIN <scope> TO ROLE r - the GLOBAL scope; managing one catalog is granted with
@@ -1486,14 +1551,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			auto scope = s.Word("an admin scope");
 			s.Expect("to");
 			s.Expect("role");
-			auto role = s.Word("a role name");
+			auto role = s.Ident("a role name");
 			return MakeAdminCall("acl_grant_admin", {Value(role), Value(scope)});
 		}
 		if (s.Accept("function")) {
 			// GRANT FUNCTION CATEGORY c TO ROLE r | ALL ROLES; GRANT FUNCTION f [TABLE] TO ROLE r | ALL
 			// ROLES (spec 072) - a grant by name admits the key whatever its categories
 			if (s.Accept("category")) {
-				auto category = s.Word("a category name");
+				auto category = s.Ident("a category name");
 				auto role = RoleOrAllRoles(s, "to");
 				return MakeAdminCall("acl_grant_function_category", {Value(role), Value(category), Value("true")});
 			}
@@ -1507,12 +1572,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			SplitVirtual(s.Dotted("a virtual schema path"), vcat, path);
 			s.Expect("to");
 			s.Expect("role");
-			auto role = s.Word("a role name");
+			auto role = s.Ident("a role name");
 			string caps, rls, columns, comment, into;
 			bool virtual_only = false;
 			GrantPolicyClauses(s, caps, rls, columns);
 			if (s.Accept("into")) { // where this role creates - the grant decides, not the schema
-				into = s.Name("a physical schema path");
+				into = s.PathName("a physical schema path");
 			} else if (s.Accept("virtual")) {
 				s.Expect("only");
 				virtual_only = true;
@@ -1534,7 +1599,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 			s.Expect("to");
 			s.Expect("role");
-			auto role = s.Word("a role name");
+			auto role = s.Ident("a role name");
 			// no CAPS clause = unspecified, which resolves to the read-only default; an explicit
 			// CAPS '{}' still means "no capabilities" (spec 012)
 			string caps, rls, columns;
@@ -1543,10 +1608,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			                     {Value(role), Value(vcat), Value(vname), Value(caps), Value(rls), Value(columns)});
 		}
 		s.Expect("catalog");
-		auto vcat = s.Word("a catalog name");
+		auto vcat = s.IdentKey("a catalog name");
 		s.Expect("to"); // GRANT CATALOG c TO ROLE r
 		s.Expect("role");
-		auto role = s.Word("a role name");
+		auto role = s.Ident("a role name");
 		string caps, rls, columns;
 		bool main = false;
 		GrantPolicyClauses(s, caps, rls, columns, &main);
@@ -1557,29 +1622,29 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		if (s.Accept("admin")) { // REVOKE ADMIN FROM ROLE r
 			s.Expect("from");
 			s.Expect("role");
-			auto role = s.Word("a role name");
+			auto role = s.Ident("a role name");
 			return MakeAdminCall("acl_revoke_admin", {Value(role)});
 		}
 		if (s.Accept("resource")) {
 			// REVOKE RESOURCE GROUP g FROM ROLE r (spec 085)
 			s.Expect("group");
-			auto group = s.Word("a group name");
+			auto group = s.Ident("a group name");
 			s.Expect("from");
 			s.Expect("role");
-			return MakeAdminCall("acl_revoke_resource_group", {Value(s.Word("a role name")), Value(group)});
+			return MakeAdminCall("acl_revoke_resource_group", {Value(s.Ident("a role name")), Value(group)});
 		}
 		if (s.Accept("schema")) { // REVOKE SCHEMA v.path FROM ROLE r
 			string vcat, path;
 			SplitVirtual(s.Dotted("a virtual schema path"), vcat, path);
 			s.Expect("from");
 			s.Expect("role");
-			return MakeAdminCall("acl_revoke_schema", {Value(s.Word("a role name")), Value(vcat), Value(path)});
+			return MakeAdminCall("acl_revoke_schema", {Value(s.Ident("a role name")), Value(vcat), Value(path)});
 		}
 		if (s.Accept("function")) {
 			// REVOKE FUNCTION CATEGORY c FROM ROLE r | ALL ROLES; REVOKE FUNCTION f [TABLE] FROM ROLE r |
 			// ALL ROLES (spec 072): the row goes, grant or deny alike
 			if (s.Accept("category")) {
-				auto category = s.Word("a category name");
+				auto category = s.Ident("a category name");
 				auto role = RoleOrAllRoles(s, "from");
 				return MakeAdminCall("acl_revoke_function_category", {Value(role), Value(category)});
 			}
@@ -1588,10 +1653,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			return MakeAdminCall("acl_revoke_function", {Value(role), Value(spec)});
 		}
 		s.Expect("catalog");
-		auto vcat = s.Word("a catalog name");
+		auto vcat = s.IdentKey("a catalog name");
 		s.Expect("from");
 		s.Expect("role");
-		auto role = s.Word("a role name");
+		auto role = s.Ident("a role name");
 		return MakeAdminCall("acl_revoke_catalog", {Value(role), Value(vcat)});
 	}
 	if (StringUtil::CIEquals(keyword, "map")) {
@@ -1602,7 +1667,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			// ALTER FUNCTION CATEGORY c ADD (f [TABLE], db.schema.f TABLE, "+") | DROP (…) (spec 072):
 			// the list goes to the admin function as written, which parses each spec
 			s.Expect("category");
-			auto category = s.Word("a category name");
+			auto category = s.Ident("a category name");
 			bool add = s.Accept("add");
 			if (!add) {
 				s.Expect("drop");
@@ -1617,7 +1682,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		}
 		if (s.Accept("resource")) { // spec 096: ALTER RESOURCE GROUP g SET DEFAULT | DROP DEFAULT
 			s.Expect("group");
-			auto group = s.Word("a group name");
+			auto group = s.Ident("a group name");
 			bool set = s.Accept("set");
 			if (!set) {
 				s.Expect("drop");
@@ -1627,7 +1692,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			                     {Value(group), Value("default"), Value(set ? "true" : "false")});
 		}
 		if (s.Accept("role")) { // ALTER ROLE r SET CLAIMS (...) | '...'
-			auto role = s.Word("a role name");
+			auto role = s.Ident("a role name");
 			s.Expect("set");
 			s.Expect("claims");
 			auto claims = s.AtParen() ? ClaimsListToCsv(s.Parens()) : s.Quoted("claims list");
@@ -1642,10 +1707,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		// ALTER GRANT CATALOG c TO ROLE r SET CAPS '…' | SET RLS '…' | SET COLUMNS '…' | SET MAIN t|f
 		if (s.Accept("grant")) {
 			s.Expect("catalog");
-			auto vcat = s.Word("a catalog name");
+			auto vcat = s.IdentKey("a catalog name");
 			s.Expect("to");
 			s.Expect("role");
-			auto role = s.Word("a role name");
+			auto role = s.Ident("a role name");
 			s.Expect("set");
 			if (s.Accept("caps")) {
 				return MakeAdminCall("acl_alter_grant",
@@ -1666,7 +1731,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		// the object forms carry the VIRTUAL marker, so they never shadow duckdb's own ALTER
 		s.Expect("virtual");
 		if (s.Accept("catalog")) { // ALTER VIRTUAL CATALOG c SET COMMENT '...'
-			auto vcat = s.Word("a catalog name");
+			auto vcat = s.IdentKey("a catalog name");
 			s.Expect("set");
 			s.Expect("comment");
 			return MakeAdminCall("acl_alter_catalog", {Value(vcat), Value(s.Quoted("comment"))});
@@ -1734,12 +1799,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 				return MakeAdminCall("acl_alter_function",
 				                     {Value(vcat), Value(vname), Value(scalar ? "scalar" : "table"),
 				                      Value(is_macro ? "macro" : "alias"),
-				                      Value(is_macro ? s.Body("definition") : s.Name("a target function"))});
+				                      Value(is_macro ? s.Body("definition") : s.PathName("a target function"))});
 			}
 			// ALTER VIRTUAL TABLE v.n SET PHYS <path> | SET COLUMNS '...' | SET RLS '...'
 			if (s.Accept("phys")) {
 				return MakeAdminCall("acl_alter_relation", {Value(vcat), Value(vname), Value("phys"),
-				                                            Value(s.Name("a physical table path"))});
+				                                            Value(s.PathName("a physical table path"))});
 			}
 			if (s.Accept("types")) { // spec 099: SET TYPES (aliases = base|keep|default, enums = ...)
 				return MakeAdminCall("acl_alter_relation",
@@ -1771,7 +1836,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
 		string column;
 		if (s.Accept("column")) {
-			column = s.Word("a column name");
+			column = s.Ident("a column name");
 		}
 		s.Expect("is");
 		auto comment = s.Quoted("comment");
@@ -1782,7 +1847,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		// CHECK VIRTUAL CATALOG c: what no longer holds against the source (spec 039), one row each
 		s.Expect("virtual");
 		s.Expect("catalog");
-		return MakeAdminTableCall("acl_check_catalog", {Value(s.Word("a catalog name"))});
+		return MakeAdminTableCall("acl_check_catalog", {Value(s.IdentKey("a catalog name"))});
 	}
 	if (StringUtil::CIEquals(keyword, "repair")) {
 		// REPAIR VIRTUAL TABLE c.n REMAP (v = expr, ...) | DROP MISSING COLUMNS [AND MASKS] (spec 039)
@@ -1808,7 +1873,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		// ANALYZE VIRTUAL CATALOG c [TABLE|VIEW|... v.n]: re-derive stored schemas
 		s.Expect("virtual");
 		if (s.Accept("catalog")) {
-			return MakeAdminCall("acl_refresh_schema", {Value(s.Word("a catalog name")), Value("")});
+			return MakeAdminCall("acl_refresh_schema", {Value(s.IdentKey("a catalog name")), Value("")});
 		}
 		s.Accept("scalar") || s.Accept("view") || (s.Accept("table") && s.Accept("function"));
 		string vcat, vname;
@@ -1835,13 +1900,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			// DROP RESOURCE GROUP [IF EXISTS] g (spec 085): its role bindings go too
 			s.Expect("group");
 			if_exists(s);
-			return MakeAdminCall("acl_drop_resource_group", {Value(s.Word("a group name")), Value(mode)});
+			return MakeAdminCall("acl_drop_resource_group", {Value(s.Ident("a group name")), Value(mode)});
 		}
 		if (s.Accept("function")) {
 			// DROP FUNCTION CATEGORY [IF EXISTS] c (spec 072): the members and every grant on it go too
 			s.Expect("category");
 			if_exists(s);
-			return MakeAdminCall("acl_drop_function_category", {Value(s.Word("a category name")), Value(mode)});
+			return MakeAdminCall("acl_drop_function_category", {Value(s.Ident("a category name")), Value(mode)});
 		}
 		if (s.Accept("reference")) {
 			if_exists(s);
@@ -1851,15 +1916,15 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		}
 		if (s.Accept("role")) {
 			if_exists(s);
-			return MakeAdminCall("acl_drop_role", {Value(s.Word("a role name")), Value(mode)});
+			return MakeAdminCall("acl_drop_role", {Value(s.Ident("a role name")), Value(mode)});
 		}
 		if (s.Accept("issuer")) {
 			if_exists(s);
-			return MakeAdminCall("acl_drop_issuer", {Value(s.Name("an issuer name")), Value(mode)});
+			return MakeAdminCall("acl_drop_issuer", {Value(s.NameValue("an issuer name")), Value(mode)});
 		}
 		if (s.Accept("client")) {
 			if_exists(s);
-			return MakeAdminCall("acl_drop_client", {Value(s.Name("a client name")), Value(mode)});
+			return MakeAdminCall("acl_drop_client", {Value(s.NameValue("a client name")), Value(mode)});
 		}
 		if (s.Accept("map")) { // DROP MAP GROUP|CLAIM '<value>' FROM CLIENT|ISSUER n TO ROLE r
 			return ParseMapping(s, "acl_drop_role_mapping");
@@ -1867,7 +1932,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		s.Expect("virtual");
 		if (s.Accept("catalog")) { // DROP VIRTUAL CATALOG c [CASCADE]
 			if_exists(s);
-			auto vcat = s.Word("a catalog name");
+			auto vcat = s.IdentKey("a catalog name");
 			bool cascade = s.Accept("cascade");
 			return MakeAdminCall("acl_drop_catalog", {Value(vcat), Value::BOOLEAN(cascade), Value(mode)});
 		}
@@ -2191,9 +2256,13 @@ void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, const PolicySto
 			throw BinderException(
 			    "acl admin: this statement is not catalog-specific and needs an unrestricted manage scope");
 		}
-		// exact match: the policy source compares vcat with SQL `=`, so a case-insensitive check here
-		// would authorize writes into a genuinely different catalog
-		if (!rights.catalogs.count(provenance.vcat)) {
+		// case-insensitive (spec 116): a write lands on the catalog as the policy spells it
+		// (PolicyStore::SpellCatalog), and the policy holds one spelling per catalog name
+		bool managed = false;
+		for (auto &catalog : rights.catalogs) {
+			managed = managed || NamePath::KeyEquals(catalog, provenance.vcat);
+		}
+		if (!managed) {
 			throw BinderException("acl admin: no manage scope for catalog \"%s\"", provenance.vcat);
 		}
 	}

@@ -43,15 +43,15 @@ ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
 query T
 SELECT acl_catalog_schema();
 ----
-{'build': 19, 'build_min_reader': 18, 'catalog': 19, 'min_reader': 18, 'mode': current}
+{'build': 20, 'build_min_reader': 20, 'catalog': 20, 'min_reader': 20, 'mode': current}
 
 # --- a newer catalog inside its window, migrated under the running node: served, never written ---
 
 statement ok
-UPDATE store.acl.meta SET "value" = '20' WHERE "key" = 'schema_version';
+UPDATE store.acl.meta SET "value" = '21' WHERE "key" = 'schema_version';
 
 statement ok
-UPDATE store.acl.meta SET "value" = '19' WHERE "key" = 'min_reader_version';
+UPDATE store.acl.meta SET "value" = '20' WHERE "key" = 'min_reader_version';
 
 query I
 ACL ROLE "r" SELECT count(*) FROM orders;
@@ -66,12 +66,12 @@ read_only
 statement error
 ACL ADMIN CREATE ROLE other;
 ----
-<REGEX>:.*schema version 20 and this node's build writes 19 - policy is written from a node of the catalog's build.*
+<REGEX>:.*schema version 21 and this node's build writes 20 - policy is written from a node of the catalog's build.*
 
 statement error
 ACL ADMIN CLUSTER SET threads = 2;
 ----
-<REGEX>:.*this node's build writes 19.*
+<REGEX>:.*this node's build writes 20.*
 
 # the refused write wrote nothing
 query I
@@ -82,12 +82,12 @@ SELECT count(*) FROM store.acl.roles WHERE "role" = 'other';
 # --- outside the window: the running node stops serving (fail closed) -----------------------------
 
 statement ok
-UPDATE store.acl.meta SET "value" = '20' WHERE "key" = 'min_reader_version';
+UPDATE store.acl.meta SET "value" = '21' WHERE "key" = 'min_reader_version';
 
 statement error
 ACL ROLE "r" SELECT count(*) FROM orders;
 ----
-<REGEX>:.*schema version 20, readable from build 20 on, and this build is 19 - upgrade the node.*
+<REGEX>:.*schema version 21, readable from build 21 on, and this build is 20 - upgrade the node.*
 
 statement error
 SELECT acl_use_db('store', 'acl', false);
@@ -103,10 +103,10 @@ SELECT acl_migrate_catalog('store', 'acl');
 # --- an older catalog: refused with what to do, then migrated by the embedded steps ------------------
 
 statement ok
-UPDATE store.acl.meta SET "value" = '19' WHERE "key" = 'schema_version';
+UPDATE store.acl.meta SET "value" = '20' WHERE "key" = 'schema_version';
 
 statement ok
-UPDATE store.acl.meta SET "value" = '18' WHERE "key" = 'min_reader_version';
+UPDATE store.acl.meta SET "value" = '20' WHERE "key" = 'min_reader_version';
 
 statement ok
 SELECT acl_use_db('store', 'acl', false);
@@ -160,7 +160,7 @@ UPDATE store.acl.meta SET "value" = '15' WHERE "key" = 'min_reader_version';
 statement error
 SELECT acl_use_db('store', 'acl', false);
 ----
-<REGEX>:.*schema version 16 and this build reads 19 - migrate it first: SELECT acl_migrate_catalog\('store', 'acl'\).*
+<REGEX>:.*schema version 16 and this build reads 20 - migrate it first: SELECT acl_migrate_catalog\('store', 'acl'\).*
 
 statement error
 SELECT acl_use_db('store', 'acl', true);
@@ -170,12 +170,12 @@ SELECT acl_use_db('store', 'acl', true);
 query T
 SELECT acl_migrate_catalog('store', 'acl');
 ----
-"store"."acl" migrated from schema version 16 to 19 (readable from build 18 on)
+"store"."acl" migrated from schema version 16 to 20 (readable from build 20 on)
 
 query T
 SELECT acl_migrate_catalog('store');
 ----
-"store"."acl" is already schema version 19
+"store"."acl" is already schema version 20
 
 statement ok
 SELECT acl_use_db('store', 'acl', false);
@@ -183,7 +183,7 @@ SELECT acl_use_db('store', 'acl', false);
 query T
 SELECT acl_catalog_schema();
 ----
-{'build': 19, 'build_min_reader': 18, 'catalog': 19, 'min_reader': 18, 'mode': current}
+{'build': 20, 'build_min_reader': 20, 'catalog': 20, 'min_reader': 20, 'mode': current}
 
 # spec 095: the issuer became the short form - its keys, algorithms and client secret are gone, the
 # rest is its implicit client, and its mapping is scoped to that client (its only one)

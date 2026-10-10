@@ -387,3 +387,27 @@ ACL ADMIN CLUSTER DETACH src_l;
 
 statement ok
 SET GLOBAL acl_lineage_level = 'off';
+
+# --- spec 116: a source named with a non-ASCII capital still counts what reads through it --------------
+# (SQL's lower() folded the stored name to `src_ä`, C++ only the ASCII letters: the reader was missed and
+# the DETACH went through)
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS "SRC_Ä" (TYPE duckdb);
+
+statement ok
+CREATE TABLE "SRC_Ä".main.t(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.umlaut AS "SRC_Ä".main.t;
+
+statement error
+ACL ADMIN CLUSTER DETACH "SRC_Ä";
+----
+<REGEX>:.*the policy reads through SRC_Ä: c.umlaut.*FORCE.*
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c.umlaut;
+
+statement ok
+ACL ADMIN CLUSTER DETACH "SRC_Ä";

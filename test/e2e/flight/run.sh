@@ -140,11 +140,11 @@ got="$(ask "@catalogs")"
 [ "$got" = "{'catalog_name': ['c']}" ] || fail "GetCatalogs is not the principal's: $got"
 
 got="$(ask "@schemas")"
-echo "$got" | grep -q "'db_schema_name': \['main', 'stage', 'stage2'\]" || fail "GetDbSchemas: $got"
+echo "$got" | grep -q "'db_schema_name': \['Raw Data', 'main', 'stage', 'stage2'\]" || fail "GetDbSchemas: $got"
 case "$got" in *memory*) fail "the physical database was listed: $got";; esac
 
 got="$(ask "@tables")"
-echo "$got" | grep -q "'table_name': \['customers', 'nested', 'orders', 'typed', 'typed_v'\]" || fail "GetTables: $got"
+echo "$got" | grep -q "'table_name': \['Line Items', 'Order Items', 'customers', 'nested', 'orders', 'typed', 'typed_v'\]" || fail "GetTables: $got"
 case "$got" in *memory*) fail "the physical database was listed: $got";; esac
 
 # A filter arrives as a parameter on our side and as a protobuf field on the client's; a field number
@@ -229,6 +229,21 @@ echo "$got" | grep -q "'fk_column_name': \['customer_id'\]" || fail "cross refer
 # and the direction that is not a key is not one
 got="$(ask "@imported:customers")"
 echo "$got" | grep -q "'fk_column_name': \[\]" || fail "the parent imported something: $got"
+
+# --- spec 116: quoted names - each shown unquoted, filtered, described and keyed by the name as written --
+got="$(ask "@tables:Order%")"
+echo "$got" | grep -q "'db_schema_name': \['Raw Data'\], 'table_name': \['Order Items'\]" || fail "GetTables, a quoted name: $got"
+got="$(ask "@tables_schema:Order Items")"
+echo "$got" | grep -q "\['id:int64 NOT NULL', 'Qty:int64'\]" || fail "include_schema of a quoted table: $got"
+got="$(ask 'SELECT count(*) AS n FROM "Raw Data"."order items"')"
+echo "$got" | grep -q "'n': \[3\]" || fail "a quoted name read case-insensitively: $got"
+got="$(ask "@pk:Raw Data/Order Items")"
+echo "$got" | grep -q "'column_name': \['id'\]" || fail "GetPrimaryKeys of a quoted table: $got"
+got="$(ask "@imported:Raw Data/Line Items")"
+echo "$got" | grep -q "'pk_db_schema_name': \['Raw Data'\], 'pk_table_name': \['Order Items'\]" || fail "imported keys between quoted tables: $got"
+echo "$got" | grep -q "'fk_column_name': \['Order Id'\]" || fail "imported keys, the quoted column: $got"
+got="$(ask "@exported:Raw Data/Order Items")"
+echo "$got" | grep -q "'fk_table_name': \['Line Items'\]" || fail "exported keys of a quoted table: $got"
 
 # --- primary keys answer the DECLARED key (spec 048) ----------------------------------------------
 got="$(ask "@pk:orders")"

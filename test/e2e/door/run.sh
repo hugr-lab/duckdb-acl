@@ -290,6 +290,10 @@ run_leg() {
 			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: USE m through the door did not read m.hello"; }
 		grep -q "^nested,8$" "$TMP/$name.$who.out" ||
 			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: a nested schema read through quack's catalog"; }
+		grep -q "^quoted,9$" "$TMP/$name.$who.out" ||
+			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: a quoted catalog/schema/view through quack's catalog"; }
+		grep -q "^quoted_door,9$" "$TMP/$name.$who.out" ||
+			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: a quoted name through the door, any case"; }
 		grep -q "^use_back,c$" "$TMP/$name.$who.out" ||
 			{ cat "$TMP/$name.$who.out" >&2; fail "$name: client $who: USE c did not go back"; }
 		# the bootstrap seeds two acme rows and one globex row, so each client's own total differs

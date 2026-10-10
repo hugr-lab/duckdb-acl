@@ -410,16 +410,12 @@ bool Resolve(PolicyStore &store, DatabaseInstance &db, const Principal &principa
 		RewriteStatements(parser.statements, plain, ParserOptions::Builtin(), store, &trail);
 		// the object the name resolves to for this principal - what the rewrite above also resolved
 		TablePolicy policy;
-		if (!store.ResolveTable(principal, StringUtil::Join(relation.parts, "."), policy)) {
+		if (!store.ResolveTable(principal, NamePath(relation.parts).ToKey(), policy)) {
 			return false;
 		}
-		auto canonical = policy.canonical;
-		auto dot = canonical.find('.');
-		if (dot == string::npos || parser.statements.empty()) {
+		if (!NamePath::SplitHeadKey(policy.canonical, out.vcat, out.vname) || parser.statements.empty()) {
 			return false;
 		}
-		out.vcat = canonical.substr(0, dot);
-		out.vname = canonical.substr(dot + 1);
 		Connection con(db);
 		bool bound = false;
 		con.context->RunFunctionInTransaction([&]() {
@@ -443,25 +439,22 @@ bool ResolveTarget(PolicyStore &store, DatabaseInstance &db, const Principal &pr
                    Mirror &out) {
 	try {
 		TablePolicy policy;
-		if (!store.ResolveTable(principal, StringUtil::Join(relation.parts, "."), policy) || policy.phys.empty()) {
+		if (!store.ResolveTable(principal, NamePath(relation.parts).ToKey(), policy) || policy.phys.empty()) {
 			return false;
 		}
 		if (!policy.caps.count("insert") && !policy.caps.count("update") && !policy.caps.count("delete") &&
 		    !policy.caps.count("merge")) {
 			return false;
 		}
-		auto dot = policy.canonical.find('.');
-		if (dot == string::npos) {
+		if (!NamePath::SplitHeadKey(policy.canonical, out.vcat, out.vname)) {
 			return false;
 		}
-		out.vcat = policy.canonical.substr(0, dot);
-		out.vname = policy.canonical.substr(dot + 1);
 		case_insensitive_map_t<LogicalType> physical;
 		vector<string> physical_order;
 		Connection con(db);
 		con.context->RunFunctionInTransaction([&]() {
 			Parser parser(ParserOptions::Builtin());
-			parser.ParseQuery("SELECT * FROM " + policy.phys);
+			parser.ParseQuery("SELECT * FROM " + NamePath::KeyToSql(policy.phys));
 			Planner planner(*con.context);
 			planner.CreatePlan(std::move(parser.statements[0]));
 			for (idx_t i = 0; i < planner.names.size() && i < planner.types.size(); i++) {
@@ -541,13 +534,21 @@ void MirrorInto(Connection &scratch, case_insensitive_set_t &attached, const Mir
 	}
 }
 
-//! The canonical dataset key of a scratch table: its catalog is the virtual catalog, `main` is no schema.
-LineageDatasetKey VirtualKey(const string &catalog, const string &schema, const string &name) {
+//! The dataset key of a virtual object (spec 116: both keys - the catalog's, the name inside it)
+LineageDatasetKey VirtualKeyOf(const string &vcat, const string &vname) {
 	LineageDatasetKey key;
 	key.kind = "virtual";
-	key.catalog = catalog;
-	key.name = StringUtil::CIEquals(schema, "main") || schema.empty() ? name : schema + "." + name;
+	key.catalog = vcat;
+	key.name = vname;
 	return key;
+}
+
+//! The canonical dataset key of a scratch table (its raw names): its catalog is the virtual catalog,
+//! `main` is no schema
+LineageDatasetKey VirtualKey(const string &catalog, const string &schema, const string &name) {
+	return VirtualKeyOf(NamePath::QuotePart(catalog), StringUtil::CIEquals(schema, "main") || schema.empty()
+	                                                      ? NamePath::QuotePart(name)
+	                                                      : NamePath::ChildKey(NamePath::QuotePart(schema), name));
 }
 
 //! Every constant of the statement replaced by `?` - the SQL facet and the default job name never
@@ -653,14 +654,18 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 		}
 		if (parts.size() >= 2) {
 			for (auto &catalog : held) {
-				if (StringUtil::CIEquals(catalog, parts[0])) {
+				if (NamePath::KeyEquals(catalog, NamePath::QuotePart(parts[0]))) {
 					return relation; // a held catalog in front: as written
 				}
 			}
 		}
-		vector<string> qualified {job.use_catalog};
+		// (the session's catalog and schema are keys; a relation's parts are raw names)
+		vector<string> qualified {NamePath::Unquote(job.use_catalog)};
 		if (parts.size() == 1 && !job.use_schema.empty()) {
-			qualified.push_back(job.use_schema);
+			auto schema = NamePath::FromKey(job.use_schema); // kept: the loop reads its parts
+			for (auto &part : schema.Parts()) {
+				qualified.push_back(part);
+			}
 		}
 		qualified.insert(qualified.end(), parts.begin(), parts.end());
 		parts = std::move(qualified);
@@ -673,7 +678,7 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 	case_insensitive_map_t<LineageDatasetKey> mirrored;
 	case_insensitive_map_t<vector<std::pair<string, LogicalType>>> mirrored_columns;
 	auto Canonical = [&](const string &catalog, const string &schema, const string &name) {
-		auto found = mirrored.find(StringUtil::Lower(catalog + "." + schema + "." + name));
+		auto found = mirrored.find(NamePath({catalog, schema, name}).Fold());
 		return found != mirrored.end() ? found->second : VirtualKey(catalog, schema, name);
 	};
 	bool reads_nothing = false;
@@ -716,7 +721,7 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 		Connection scratch(scratch_db);
 		case_insensitive_set_t attached;
 		// the session's USE is the scratch's default too (spec 114), so its short names bind as they did
-		string default_catalog = job.use_catalog;
+		string default_catalog = NamePath::Unquote(job.use_catalog); // a raw name here: the scratch's catalog
 		bool all_resolved = true;
 		for (auto &relation : collector.relations) {
 			Mirror mirror;
@@ -725,20 +730,18 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 				all_resolved = false; // a CTAS target, a name the role cannot read: no mirror, maybe no bind
 				continue;
 			}
+			auto vcat = NamePath::Unquote(mirror.vcat);
 			if (relation.parts.size() < 3 && default_catalog.empty()) {
-				default_catalog = mirror.vcat;
+				default_catalog = vcat;
 			}
-			auto dot = mirror.vname.find('.');
-			LineageDatasetKey key;
-			key.kind = "virtual";
-			key.catalog = mirror.vcat;
-			key.name = dot != string::npos && StringUtil::CIEquals(mirror.vname.substr(0, dot), "main")
-			               ? mirror.vname.substr(dot + 1)
-			               : mirror.vname;
-			for (auto &placement : ScratchPlacements(relation, mirror.vcat)) {
+			auto vname = NamePath::FromKey(mirror.vname);
+			auto key = VirtualKeyOf(mirror.vcat, vname.Size() > 1 && StringUtil::CIEquals(vname.Head(), "main")
+			                                         ? vname.Rest().ToKey()
+			                                         : mirror.vname);
+			for (auto &placement : ScratchPlacements(relation, vcat)) {
 				MirrorInto(scratch, attached, mirror, placement);
-				mirrored[StringUtil::Lower(StringUtil::Join(placement, "."))] = key;
-				mirrored_columns[StringUtil::Lower(StringUtil::Join(placement, "."))] = mirror.columns;
+				mirrored[NamePath(placement).Fold()] = key;
+				mirrored_columns[NamePath(placement).Fold()] = mirror.columns;
 			}
 		}
 		if (statement->type == StatementType::CREATE_STATEMENT) {
@@ -766,8 +769,9 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 				attached.insert(default_catalog);
 			}
 			if (!job.use_schema.empty()) {
-				scratch.Query("CREATE SCHEMA IF NOT EXISTS " + Quoted({default_catalog, job.use_schema}));
-				scratch.Query("USE " + Quoted({default_catalog, job.use_schema}));
+				auto schema = NamePath({default_catalog}).Join(NamePath::FromKey(job.use_schema)).Parts();
+				scratch.Query("CREATE SCHEMA IF NOT EXISTS " + Quoted(schema));
+				scratch.Query("USE " + Quoted(schema));
 			} else {
 				scratch.Query("USE " + acl_detail::Ident(default_catalog));
 			}
@@ -814,8 +818,7 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 			// (arrow_scan, a quack drain) - still wrote its target: its fields, sources the client's
 			auto &insert = statement_copy->Cast<InsertStatement>();
 			auto target = session_name(FromQualified(insert.node->qualified_name));
-			auto placement_key =
-			    StringUtil::Lower(StringUtil::Join(ScratchPlacements(target, default_catalog)[0], "."));
+			auto placement_key = NamePath(ScratchPlacements(target, default_catalog)[0]).Fold();
 			auto found = mirrored.find(placement_key);
 			if (found != mirrored.end()) {
 				walk = LineageWalk();
@@ -858,7 +861,7 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 			            created)) {
 				walk = LineageWalk();
 				walk.has_target = true;
-				walk.target = VirtualKey(created.vcat, string(), created.vname);
+				walk.target = VirtualKeyOf(created.vcat, created.vname);
 				walk.target_operation = "CREATE_TABLE_AS";
 				for (auto &column : created.columns) {
 					LineageOutput output;
@@ -897,13 +900,13 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 		DdlTarget home;
 		bool found = false;
 		if (!renamed_to.GetIdentifierName().empty() &&
-		    locked_store->ResolveDdlTarget(job.principal, StringUtil::Join(new_relation.parts, "."), "create", home)) {
+		    locked_store->ResolveDdlTarget(job.principal, NamePath(new_relation.parts).ToKey(), "create", home)) {
 			try {
 				Connection con(*locked_db);
 				con.context->RunFunctionInTransaction([&]() {
 					Parser parser(ParserOptions::Builtin());
-					parser.ParseQuery("SELECT * FROM " + home.phys_schema + "." +
-					                  acl_detail::Ident(renamed_to.GetIdentifierName()));
+					parser.ParseQuery("SELECT * FROM " + NamePath::KeyToSql(NamePath::ChildKey(
+					                                         home.phys_schema, renamed_to.GetIdentifierName())));
 					Planner planner(*con.context);
 					planner.CreatePlan(std::move(parser.statements[0]));
 					for (idx_t i = 0; i < planner.names.size() && i < planner.types.size(); i++) {
@@ -921,13 +924,13 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 			found = Resolve(*locked_store, *locked_db, job.principal, new_relation, renamed);
 		}
 		if (found) {
-			auto dot = renamed.vname.rfind('.');
-			auto old_vname =
-			    (dot == string::npos ? string() : renamed.vname.substr(0, dot + 1)) + old_relation.parts.back();
+			string parent, leaf;
+			NamePath::SplitLeaf(renamed.vname, parent, leaf);
+			auto old_vname = NamePath::ChildKey(parent, old_relation.parts.back());
 			walk = LineageWalk();
-			auto source = walk.DatasetIndex(VirtualKey(renamed.vcat, string(), old_vname));
+			auto source = walk.DatasetIndex(VirtualKeyOf(renamed.vcat, old_vname));
 			walk.has_target = true;
-			walk.target = VirtualKey(renamed.vcat, string(), renamed.vname);
+			walk.target = VirtualKeyOf(renamed.vcat, renamed.vname);
 			walk.target_operation = "RENAME";
 			for (auto &column : renamed.columns) {
 				LineageOutput output;

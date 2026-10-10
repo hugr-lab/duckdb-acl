@@ -1,0 +1,66 @@
+# name: test/sql/acl_quoted_names_driver.test
+# description: spec 116 - a function-driver source (spec 008) that answers two objects for one name
+#   (`Orders` and `orders`, which compare as the same name) is refused as ambiguous, never merged:
+#   their capabilities and predicates would otherwise be unioned into a read neither grants.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.wide(id INT, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys.main.wide VALUES (1, 'acme'), (2, 'globex');
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+SET GLOBAL acl_version_check_interval=0;
+
+statement ok
+CREATE MACRO pol_version() AS TABLE SELECT 1::BIGINT AS version;
+
+statement ok
+CREATE MACRO pol_role_catalogs(rs) AS TABLE SELECT * FROM (VALUES ('analyst', 'sales', true, '{"select": true}')) t(role, vcat, is_main, caps) WHERE list_contains(rs, role);
+
+# the driver matches a name case-insensitively and holds two spellings of one: one filtered, one not
+statement ok
+CREATE MACRO pol_relations(cats, names) AS TABLE SELECT * FROM (VALUES ('sales', 'Orders', 'subquery', 'phys.main.wide', NULL, 'tenant = ''acme'''), ('sales', 'orders', 'alias', 'phys.main.wide', NULL, NULL), ('sales', 'Single', 'subquery', 'phys.main.wide', NULL, 'tenant = ''acme''')) t(vcat, vname, form, phys, view_sql, rls) WHERE list_contains(cats, vcat) AND list_contains(list_transform(names, lambda n: lower(n)), lower(vname));
+
+statement ok
+CREATE MACRO pol_columns(cats, names) AS TABLE SELECT * FROM (VALUES ('sales', 'none', 0, 'id', NULL)) t(vcat, vname, pos, name, expr) WHERE false;
+
+statement ok
+CREATE MACRO pol_aliases(cats) AS TABLE SELECT * FROM (VALUES ('sales', 'raw', 'phys.main')) t(vcat, alias_path, phys_path) WHERE false;
+
+statement ok
+CREATE MACRO pol_functions(cats, names) AS TABLE SELECT * FROM (VALUES ('sales', 'Report', 'table', 'macro', NULL, 'SELECT 1 AS one'), ('sales', 'report', 'table', 'macro', NULL, 'SELECT 2 AS one')) t(vcat, vname, kind, form, target, template) WHERE list_contains(cats, vcat) AND list_contains(list_transform(names, lambda n: lower(n)), lower(vname));
+
+statement ok
+SELECT acl_use_functions('{"policy_version": "pol_version", "role_catalogs": "pol_role_catalogs", "relations": "pol_relations", "relation_columns": "pol_columns", "schema_aliases": "pol_aliases", "functions": "pol_functions"}');
+
+# one object per name: the single spelling reads its own slice
+query I
+ACL ROLE "analyst" SELECT count(*) FROM single;
+----
+1
+
+# two objects for one name: refused, never the union of the alias's every row and the filtered slice
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM orders;
+----
+<REGEX>:.*ambiguous name "orders".*
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM sales.ORDERS;
+----
+<REGEX>:.*ambiguous name "sales.ORDERS".*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM report();
+----
+<REGEX>:.*ambiguous name "report".*

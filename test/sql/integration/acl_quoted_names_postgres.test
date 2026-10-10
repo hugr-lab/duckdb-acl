@@ -1,0 +1,137 @@
+# name: test/sql/integration/acl_quoted_names_postgres.test
+# description: spec 116 over a live PostgreSQL source - a mixed-case schema and table with spaces
+#   (postgres keeps them exactly as quoted), reached through a quoted virtual catalog, schema and table
+#   in a policy catalog that itself lives in postgres; names compare case-insensitively on our side
+# group: [integration]
+
+require acl
+
+require postgres_scanner
+
+require-env ACL_PG_DSN
+
+statement ok
+ATTACH '${ACL_PG_DSN}' AS pg (TYPE postgres);
+
+statement ok
+DROP SCHEMA IF EXISTS pg."Raw Data" CASCADE;
+
+statement ok
+DROP SCHEMA IF EXISTS pg.acl_q CASCADE;
+
+statement ok
+CREATE SCHEMA pg."Raw Data";
+
+statement ok
+CREATE TABLE pg."Raw Data"."Order Items"(id INTEGER, "Qty" INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO pg."Raw Data"."Order Items" VALUES (1, 10, 'acme'), (2, 20, 'other');
+
+# postgres holds the names as quoted - mixed case, with the space
+query TT
+SELECT table_schema, table_name FROM pg.information_schema.tables WHERE table_schema = 'Raw Data';
+----
+Raw Data	Order Items
+
+statement ok
+SET allow_parser_override_extension='fallback';
+
+statement ok
+SELECT acl_use_db('pg', 'acl_q', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG "Sales Mart";
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG "Sales Mart" TO ROLE analyst MAIN WITH (select, insert);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE "Sales Mart"."Order Items" AS pg."Raw Data"."Order Items" RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA "Sales Mart"."Raw Data" AS pg."Raw Data";
+
+# the policy catalog in postgres holds the canonical keys
+query TTT
+SELECT vcat, vname, phys FROM pg.acl_q.relations;
+----
+Sales Mart	Order Items	pg.Raw Data.Order Items
+
+query II
+ACL ROLE "analyst" SELECT id, "Qty" FROM "Sales Mart"."Order Items";
+----
+1	10
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM "SALES MART"."order items";
+----
+1
+
+# through the live alias: the physical name as postgres spells it
+query I
+ACL ROLE "analyst" SELECT count(*) FROM "Sales Mart"."Raw Data"."Order Items";
+----
+2
+
+statement ok
+ACL ROLE "analyst" INSERT INTO "Sales Mart"."Raw Data"."Order Items" VALUES (3, 30, 'acme');
+
+query I
+SELECT count(*) FROM pg."Raw Data"."Order Items";
+----
+3
+
+query TTT
+ACL ROLE "analyst" SELECT table_catalog, table_schema, table_name FROM information_schema.tables ORDER BY ALL;
+----
+Sales Mart	Raw Data	Order Items
+Sales Mart	main	Order Items
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE "Sales Mart"."ORDER ITEMS" AS pg."Raw Data"."Order Items";
+----
+<REGEX>:.*differs only by case.*
+
+# a case-sensitive source holds two spellings of one name: an expansion records one, and the check says so
+statement ok
+CALL postgres_execute('pg', 'CREATE TABLE "Raw Data"."Pair" (n int)');
+
+statement ok
+CALL postgres_execute('pg', 'CREATE TABLE "Raw Data"."pair" (n int)');
+
+statement ok
+CALL pg_clear_cache();
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA "Sales Mart".exp FROM pg."Raw Data";
+
+query I
+SELECT count(*) FROM pg.acl_q.relations WHERE lower(vname) = 'exp.pair';
+----
+1
+
+query I
+SELECT count(*) FROM acl_check_catalog('Sales Mart') WHERE problem = 'case_sibling';
+----
+1
+
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA "Sales Mart".exp REFRESH;
+
+query I
+SELECT count(*) FROM pg.acl_q.relations WHERE lower(vname) = 'exp.pair';
+----
+1
+
+statement ok
+DROP SCHEMA pg.acl_q CASCADE;
+
+statement ok
+DROP SCHEMA pg."Raw Data" CASCADE;

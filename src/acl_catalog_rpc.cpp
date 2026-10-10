@@ -1,5 +1,6 @@
 #include "acl_catalog_rpc.hpp"
 
+#include "acl_name_path.hpp"
 #include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
@@ -13,18 +14,17 @@ string Bind(CatalogQuery &query, Value value) {
 	return "$" + std::to_string(query.parameters.size());
 }
 
-//! The virtual path of an object as the listings spell it: bare in `main`, `schema.name` elsewhere.
+//! The virtual path of an object as the store keys it: bare in `main`, `schema.name` elsewhere.
 //! Composed in SQL rather than in C++ so it is built from the listing's own columns.
 //!
 //! This is the store's own spelling, not a convention of the door's: a relation's key *is* this path
-//! (`relations.vname`, and `from_vname`/`to_vname` on a reference), and `acl_policy_catalog.cpp`
-//! spells the same CASE in its `path()` helpers. Which is also why the obvious collision - a table
-//! named "foo.bar" in main against a table `bar` in schema `foo` - cannot arise: both would be the
-//! key `foo.bar`, and the store holds one row for it (checked, not assumed). If the store's spelling
-//! ever changes, this must change with it, or every key answer becomes silently empty.
+//! (`relations.vname`, and `from_vname`/`to_vname` on a reference). Since spec 116 a key quotes a part
+//! that holds a `.` or a `"`, and a listing shows each name unquoted (a schema holding a `.` as its
+//! key), so the path is rebuilt from the shown columns with the key rules: a table named "foo.bar" in
+//! main is the key `"foo.bar"`, never the key `foo.bar` of table `bar` in schema `foo`.
 string PathExpr(const string &schema_column, const string &name_column) {
-	return "CASE WHEN " + schema_column + " = 'main' THEN " + name_column + " ELSE " + schema_column + " || '.' || " +
-	       name_column + " END";
+	return "CASE WHEN " + schema_column + " = 'main' THEN " + KeyQuotePartSql(name_column) + " ELSE " +
+	       KeyFromDisplaySql(schema_column) + " || '.' || " + KeyQuotePartSql(name_column) + " END";
 }
 
 void AppendCatalogFilter(CatalogQuery &query, vector<string> &conditions, const CatalogFilter &filter,
@@ -53,7 +53,8 @@ void AppendTableRef(CatalogQuery &query, vector<string> &conditions, const Catal
 		conditions.push_back(row_variable + ".vcat = " + Bind(query, Value(table.catalog)));
 	}
 	auto schema = table.schema.empty() ? string("main") : table.schema;
-	auto path = schema == "main" ? table.table : schema + "." + table.table;
+	auto path = schema == "main" ? NamePath::QuotePart(table.table)
+	                             : NamePath::ChildKey(NamePath::FromDisplay(schema), table.table);
 	conditions.push_back(alias + " = " + Bind(query, Value(path)));
 }
 

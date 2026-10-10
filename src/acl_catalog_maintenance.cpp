@@ -135,7 +135,7 @@ struct Relation {
 	vector<string> known;               // the column names the catalog knows for it (declared, else stored)
 	bool dead = false;                  // its source does not bind: nothing below it can be judged
 	string Source() const {
-		return form == "view" ? "(" + view_sql + ")" : phys;
+		return form == "view" ? "(" + view_sql + ")" : NamePath::KeyToSql(phys);
 	}
 };
 
@@ -160,8 +160,9 @@ private:
 	         const string &repair) {
 		out.push_back(Finding {vcat, kind, object, role, problem, detail, repair});
 	}
+	//! The object's name as a repair statement writes it - each part quoted when it must be (spec 116)
 	string Named(const string &vname) const {
-		return vcat + "." + vname;
+		return NamePath::KeyToGrammar(NamePath::JoinKeys(vcat, vname));
 	}
 	unique_ptr<QueryResult> Read(const string &sql) {
 		return catalog.Query(sql);
@@ -216,7 +217,7 @@ private:
 						    "ANALYZE VIRTUAL VIEW " + Named(relation.vname));
 					}
 				}
-			} else if (!SourceBinds(catalog, relation.phys, error)) {
+			} else if (!SourceBinds(catalog, relation.Source(), error)) {
 				Add(kind, relation.vname, "", "source_missing",
 				    "the source \"" + relation.phys + "\" does not bind: " + error,
 				    "ALTER VIRTUAL TABLE " + Named(relation.vname) + " SET PHYS <path>  -- or DROP VIRTUAL TABLE " +
@@ -241,8 +242,9 @@ private:
 				}
 				if (!any_missing && stored_derived) {
 					Columns probed;
-					if (catalog.ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + relation.phys, false,
-					                        {}, probed)) {
+					if (catalog.ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " +
+					                            NamePath::KeyToSql(relation.phys),
+					                        false, {}, probed)) {
 						auto diff = SchemaDiff(stored, probed);
 						if (!diff.empty()) {
 							Add(kind, relation.vname, "", "schema_stale",
@@ -268,7 +270,8 @@ private:
 	//! reader sees while some predicate narrows the rows (`enum_domain_exposed`)
 	void JudgeTypes(const string &kind, const Relation &relation, const string &rls, const Value &alias_types,
 	                const Value &enum_types) {
-		auto stored = Read("SELECT lower(\"column\"), coalesce(\"as_base\", ''), coalesce(\"as_varchar\", ''),"
+		auto stored = Read("SELECT " + KeyFoldSql("\"column\"") +
+		                   ", coalesce(\"as_base\", ''), coalesce(\"as_varchar\", ''),"
 		                   " coalesce(\"as_both\", '') FROM " +
 		                   catalog.Tbl("relation_types") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                   " AND \"vname\" = " + Lit(relation.vname));
@@ -435,7 +438,7 @@ private:
 		} else if (checked && !rls_checked.IsNull() && !rls_checked.GetValue<bool>()) {
 			Add(kind, relation.vname, role, "rls_unchecked",
 			    "the predicate" + who + " was accepted unchecked when it was written (spec 027) and binds now",
-			    "ANALYZE VIRTUAL CATALOG " + vcat);
+			    "ANALYZE VIRTUAL CATALOG " + NamePath::KeyToGrammar(vcat));
 		}
 	}
 
@@ -453,8 +456,9 @@ private:
 			bool scalar = kind == "scalar";
 			if (form == "alias") {
 				// the target is a function of this instance: gone with its extension, or renamed
-				auto name = target.substr(target.rfind('.') == string::npos ? 0 : target.rfind('.') + 1);
-				auto found = Read("SELECT 1 FROM duckdb_functions() WHERE lower(function_name) = " +
+				string parent, name;
+				NamePath::SplitLeaf(target, parent, name);
+				auto found = Read("SELECT 1 FROM duckdb_functions() WHERE " + KeyFoldSql("function_name") + " = " +
 				                  Lit(StringUtil::Lower(name)) + " LIMIT 1");
 				if (found->RowCount() == 0) {
 					Add("function", vname, "", "definition_broken",
@@ -655,11 +659,13 @@ private:
 				// object's reads
 				if (!rls.empty()) {
 					JudgePredicate("grant", relation, role, rls, rls_checked,
-					               "ALTER GRANT CATALOG " + vcat + " TO ROLE " + role + " SET RLS '<predicate>'");
+					               "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " +
+					                   NamePath(vector<string> {role}).ToGrammar() + " SET RLS '<predicate>'");
 				}
 				for (auto &item : items) {
 					JudgeColumns(relation, role, {item}, false,
-					             "ALTER GRANT CATALOG " + vcat + " TO ROLE " + role + " SET COLUMNS " +
+					             "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " +
+					                 NamePath(vector<string> {role}).ToGrammar() + " SET COLUMNS " +
 					                 Lit(Without(items, item.first)),
 					             &matched);
 				}
@@ -671,7 +677,8 @@ private:
 					Add("grant", "*", role, "grant_column_missing",
 					    "the catalog-wide COLUMNS item \"" + item.first + "\" matches no column of any object of \"" +
 					        vcat + "\" - the role reads less than the grant says",
-					    "ALTER GRANT CATALOG " + vcat + " TO ROLE " + role + " SET COLUMNS " +
+					    "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " +
+					        NamePath(vector<string> {role}).ToGrammar() + " SET COLUMNS " +
 					        Lit(Without(items, item.first)));
 				}
 			}
@@ -680,9 +687,15 @@ private:
 
 	//! `database.schema` of a physical schema path - the same split the schema writers make
 	static void SplitSchema(const string &phys_path, string &database, string &schema) {
-		auto dot = phys_path.find('.');
-		database = dot == string::npos ? phys_path : phys_path.substr(0, dot);
-		schema = dot == string::npos ? string() : phys_path.substr(dot + 1);
+		NamePath path;
+		string error;
+		if (!NamePath::TryFromKey(phys_path, path, error)) {
+			database = phys_path;
+			schema.clear();
+			return;
+		}
+		database = path.Head();
+		schema = path.Size() == 2 ? path.Leaf() : (path.Size() > 2 ? path.Rest().ToKey() : string());
 	}
 
 	void CheckSchemas() {
@@ -723,27 +736,57 @@ private:
 			         " UNION SELECT view_name FROM duckdb_views() WHERE database_name = " + Lit(database) +
 			         " AND schema_name = " + Lit(schema) + " AND NOT internal ORDER BY 1");
 			ResultRows listing_rows(*listing);
-			case_insensitive_set_t source_names;
+			std::set<string> source_names; // exact: a case-sensitive source may hold two spellings
 			vector<string> unrecorded, gone;
-			auto recorded =
-			    Read("SELECT \"vname\" FROM " + catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
-			         " AND \"origin\" = " + Lit(origin) + " AND substr(\"vname\", 1, " +
-			         std::to_string(path.size() + 1) + ") = " + Lit(path + ".") + " ORDER BY 1");
+			auto recorded = Read("SELECT \"vname\" FROM " + catalog.Tbl("relations") +
+			                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"origin\" = " + Lit(origin) + " AND " +
+			                     KeyPrefixSql("\"vname\"", Lit(path)) + " ORDER BY 1");
 			ResultRows recorded_rows(*recorded);
 			auto dropped = Read("SELECT \"name\" FROM " + catalog.Tbl("schema_dropped") +
 			                    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"path\" = " + Lit(path));
 			ResultRows dropped_rows(*dropped);
-			case_insensitive_set_t recorded_names, dropped_names;
+			std::set<string> recorded_names, dropped_names;
 			for (idx_t i = 0; i < recorded->RowCount(); i++) {
-				recorded_names.insert(recorded_rows.GetValue(0, i).ToString().substr(path.size() + 1));
+				// spec 116: a record's leaf as the source names it (raw), compared with the source's listing
+				string parent, leaf;
+				NamePath::SplitLeaf(recorded_rows.GetValue(0, i).ToString(), parent, leaf);
+				if (parent == path) {
+					recorded_names.insert(leaf);
+				}
 			}
 			for (idx_t i = 0; i < dropped->RowCount(); i++) {
 				dropped_names.insert(dropped_rows.GetValue(0, i).ToString());
 			}
+			auto stored = catalog.NamesUnder(vcat, NamePath::QuotePart(NamePath::FromKey(path).Head()));
 			for (idx_t i = 0; i < listing->RowCount(); i++) {
 				auto name = listing_rows.GetValue(0, i).ToString();
 				source_names.insert(name);
 				if (!recorded_names.count(name) && !dropped_names.count(name)) {
+					auto vname = NamePath::ChildKey(path, name);
+					if (CatalogBackend::CaseSibling(vname, stored)) {
+						// spec 116: REFRESH never records a second spelling of a held name - the source's
+						// object stays out until it is renamed (or the catalog's is)
+						// the repair drops the catalog's record of the other spelling, so REFRESH records the
+						// source's object; a schema or a grant holding the name has no such one-line repair
+						auto held =
+						    Read("SELECT \"vname\", \"form\" FROM " + catalog.Tbl("relations") +
+						         " WHERE \"vcat\" = " + Lit(vcat) + " AND " + KeyEqSql("\"vname\"", Lit(vname)));
+						ResultRows held_rows(*held);
+						auto refresh = "ALTER VIRTUAL SCHEMA " + Named(path) + " REFRESH";
+						auto repair =
+						    held->RowCount() == 1
+						        ? string(held_rows.GetValue(1, 0).ToString() == "view" ? "DROP VIRTUAL VIEW "
+						                                                               : "DROP VIRTUAL TABLE ") +
+						              Named(held_rows.GetValue(0, 0).ToString()) + "; " + refresh +
+						              "  -- or rename the source object"
+						        : refresh + "  -- after the source object is renamed: a schema or a grant of the "
+						                    "catalog holds that name";
+						Add("schema", path, "", "case_sibling",
+						    "the source object \"" + name +
+						        "\" differs only by case from a name the catalog holds - it is not recorded",
+						    repair);
+						continue;
+					}
 					unrecorded.push_back(name);
 				}
 			}
@@ -1033,7 +1076,7 @@ unique_ptr<FunctionData> CheckBind(ClientContext &, TableFunctionBindInput &inpu
 	auto bind = make_uniq<CheckBindData>();
 	bind->store = input.info->Cast<MaintenanceInfo>().store;
 	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
-		bind->vcat = input.inputs[0].ToString();
+		bind->vcat = bind->store->SpellCatalog(CatalogKey(input.inputs[0].ToString(), "acl_check_catalog", "catalog"));
 	}
 	return std::move(bind);
 }
@@ -1066,8 +1109,8 @@ void CheckScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 void RepairRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	vector<Value> counts;
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_repair_relation", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_repair_relation", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_repair_relation", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_repair_relation", "name"));
 		auto action = RequiredArg(args, 2, row, "acl_repair_relation", "action");
 		auto spec = OptionalArg(args, 3, row, "");
 		counts.push_back(Value::BIGINT(StoreOf(state).CatalogRepairRelation(vcat, vname, action, spec)));

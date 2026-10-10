@@ -24,6 +24,12 @@ CREATE TABLE typed AS SELECT 1 AS id, 'gold'::tier AS tier, {'a': 'silver'::tier
 -- spec 102: a struct a grant narrows to one field
 CREATE TABLE nested AS SELECT 1 AS id, {'city': 'A', 'ssn': 'S1'} AS address;
 
+-- spec 116: a schema and tables named the way SQL allows - a space, mixed case - and a reference
+-- between them, so the catalog RPCs and the key RPCs answer quoted names
+CREATE SCHEMA "Raw Data";
+CREATE TABLE "Raw Data"."Order Items" AS SELECT i AS id, i * 2 AS "Qty" FROM range(3) t(i);
+CREATE TABLE "Raw Data"."Line Items" AS SELECT i AS line, i % 3 AS "Order Id" FROM range(6) t(i);
+
 ATTACH ':memory:' AS store;
 SELECT acl_use_db('store', 'acl', true);
 
@@ -48,6 +54,10 @@ ACL ADMIN CREATE VIRTUAL TABLE c.typed AS memory.main.typed;
 ACL ADMIN CREATE VIRTUAL TABLE c.typed_v AS memory.main.typed;
 ACL ADMIN ALTER VIRTUAL TABLE c.typed_v SET TYPES (enums = varchar);
 ACL ADMIN CREATE VIRTUAL TABLE c.nested AS memory.main.nested;
+ACL ADMIN CREATE VIRTUAL TABLE c."Raw Data"."Order Items" AS memory."Raw Data"."Order Items" PRIMARY KEY (id);
+ACL ADMIN CREATE VIRTUAL TABLE c."Raw Data"."Line Items" AS memory."Raw Data"."Line Items";
+ACL ADMIN CREATE VIRTUAL REFERENCE c."Line To Order" FROM "Raw Data"."Line Items" TO "Raw Data"."Order Items"
+    ON ("Order Id" = id);
 ACL ADMIN CREATE ROLE analyst;
 -- temp is explicit (spec 050): session temp tables ride on it, and nothing else grants them
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, temp) MAIN;
