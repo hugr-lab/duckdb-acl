@@ -3170,6 +3170,7 @@ void PolicyStore::CatalogRevokeAdmin(const string &role, const string &scope) {
 			auto holds = StringUtil::Lower(held_rows.GetValue(0, row).ToString());
 			bool implies = (holds == "manage" && (scope == "policy" || scope == "observe")) ||
 			               (holds == "operate" && scope == "observe") ||
+			               (holds == "cluster" && (scope == "operate" || scope == "observe")) ||
 			               (holds == "passthrough" && scope != "passthrough");
 			if (implies) {
 				throw BinderException("acl admin: role \"%s\" holds %s, which carries %s - revoke %s (and grant what "

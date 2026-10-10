@@ -280,7 +280,7 @@ mode of default-deny is a refusal, and the refusal names the function.
 | --- | --- |
 | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE INTO` | rewritten (sections above) |
 | `EXPLAIN [ANALYZE]` | needs the explicit `explain` capability on the MAIN grant, then the inner statement is rewritten (spec 052) |
-| `CREATE`, `DROP` | tables and views under `create`/`drop`/`temp` (above); `SECRET` under the explicit `secrets` capability, constant parameters only - kept in the attached secrets service, never `TEMPORARY` there (spec 082); with no service attached (a standalone node, spec 118) kept by the node itself, `PERSISTENT` in its secret files on disk - there `secrets` administers every secret of the node, the operator's included |
+| `CREATE`, `DROP` | tables and views under `create`/`drop`/`temp` (above); `SECRET` under the explicit `secrets` capability, constant parameters only - kept in the attached secrets service, never `TEMPORARY` there (spec 082); with no service attached (a standalone node, spec 118) kept by the node itself, `PERSISTENT` in its secret files on disk - there `secrets` administers every secret of the node, the operator's included; on a cluster node (`acl_deployment = 'cluster'`) only in the service |
 | `PRAGMA` | `table_info`, `show_tables` answered; the rest denied by name (spec 031) |
 | `SET` / `RESET` | `TimeZone`, `Calendar` only, session scope, constant value, only on an `ACL SESSION` connection (spec 068) |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | pass through: "they are session control, not access" |
@@ -334,7 +334,7 @@ combined with a certificate. Both doors require cert **and** key together.
 
 ### The platform catalog (spec 117)
 
-- **The scopes are a set of bundles, never an order.** `observe`, `policy` and `passthrough` (spec
+- **The scopes are a set of bundles, never an order.** `observe`, `operate`, `cluster`, `policy` and `passthrough` (spec
   009's global `manage` reads as `policy` + `observe`; a catalog's `manage` capability is that catalog's
   administration) are held side by side; every check asks the set ("may administer" = a bundle that
   writes, a catalog's `manage` or a point grant on a platform function - never `observe` alone), so a
@@ -343,7 +343,7 @@ combined with a certificate. Both doors require cert **and** key together.
   one view or function (`platform_grants`, its own table - never a catalog grant, a function grant or a
   category, which could spread it into every listing or hand it to every role). **Only `passthrough`
   grants on `platform` and grants the bundles** - a grantor that can grant everything is everything;
-  never to every role, never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting`, `session_profile` - the passthrough scope's own - and `console_info` (every holder's). A deny wins over every bundle but `passthrough`.
+  never to every role, never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `migrate_catalog` (the passthrough scope's own), `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` (the cluster bundle's alone) and `console_info` (every holder's). A deny wins over every bundle but `passthrough`.
 - **A stored body holds only what its author may call** (the review of spec 117): a view, a macro
   template, an alias target, an RLS, a column or mask expression, a grant's policy runs as the node when
   read, so an author who is not `passthrough` may store only calls its own function gate admits (its
@@ -421,6 +421,7 @@ private address. They publish counts and states, never a principal, a handle or 
 | bundle `passthrough` | `acl.admins` via `acl_grant_admin` | - | everything, including `ACL NATIVE`; the only scope that grants bundles and grants on `platform` |
 | bundle `observe` | `acl.admins` via `acl_grant_admin` | - | the node views, the load report and `/metrics` (spec 097); administers nothing - implied by `passthrough` and a global `manage` |
 | bundle `operate` (spec 118) | `acl.admins` via `acl_grant_admin` | - | the node's runtime: kill a session, set a session's audit level (`OFF` included - its own too) and profile, drain / resume; reads what `observe` reads; administers no policy - implied by `passthrough` |
+| bundle `cluster` (spec 118) | `acl.admins` via `acl_grant_admin` | - | `operate` + `ACL CLUSTER …` (settings: resources and tuning only), the cluster views and `drift`; never a source's data nor `ACL NATIVE`; a cluster node's - implied by `passthrough` |
 | point grant on `platform.<view|function>` | `platform_grants` via `GRANT VIEW|FUNCTION platform.x` (passthrough) | - | one view (whole) or one function; a deny wins over bundles, not over `passthrough` (spec 117) |
 
 The rules behind the table (spec 012): a grant "written without `CAPS` - or a driver row with

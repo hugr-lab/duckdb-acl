@@ -711,8 +711,11 @@ DROP [PERSISTENT] SECRET <name> [FROM <catalog>]
   service's and are refused; a storage named (`IN memory`, `IN local_file`) must still be a service.
   The node keeps no owner per secret: there, **`secrets` is the administration of the node's own
   secrets** - the operator's included (a `DROP`, a `CREATE OR REPLACE`, a longer `SCOPE` that the node's
-  reads then pick) - so grant it only to whoever administers the node. A secrets service is where a
-  secret has an owner and its own admin check.
+  reads then pick) - so grant it only to whoever administers the node. Where secrets need an owner and
+  an admin check, a standalone node attaches a secrets service too, logged in as its own service
+  identity: the service then decides who may create, drop and grant (its administrators), and records
+  the owner - the session's user when the node acts for an ACL session (tresor's delegation), the node's
+  identity otherwise (spec 082). A cluster node always does.
 - **GRANT / REVOKE SECRET** follow the principal prefix with the `ACL` marker (`ACL TOKEN '…' ACL GRANT
   SECRET …`; unmarked after the gateway's `ACL ADMIN`) and compile to the service's own calls,
   `<catalog>.main.grant_secret('<name>', 'role:<r>', ['use'])` / `revoke_secret(…)`. A secret is granted
@@ -803,6 +806,11 @@ CLUSTER SET <setting> = <value> [IN GROUP <group>]
 CLUSTER RESET <setting> [IN GROUP <group>]
 ```
 
+**A cluster node's** (spec 118): the profile exists where the deployment starts the node with `SET
+GLOBAL acl_deployment = 'cluster'` (GLOBAL-only, never the policy's nor the profile's; default
+`standalone`). On a standalone node every `CLUSTER` write is refused - its bootstrap SQL and its admin's
+`ACL NATIVE` configure it - while the profile's listings still read.
+
 The cluster profile is the shared part of every node's bootstrap (spec 093): which extensions a node
 runs, which sources it attaches and which settings it carries. It lives in the policy catalog as
 desired state, next to the policy, and a `config_version` counts its changes. With `IN GROUP` an item
@@ -849,7 +857,10 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
   secrets service. The refusal names the key, never its value.
 - **The node's hardening is not a profile item.** `allow_unsigned_extensions`, `lock_configuration`,
   `allow_persistent_secrets`, `allow_extension_repositories`, the extension and secret directories
-  and the like are refused. Only a GLOBAL setting may be profiled.
+  and the like are refused - and (spec 118) the node's trust: `acl_allow_anonymous_admin`, the quack door's
+  `acl_quack_authentication_function` / `acl_quack_authorization_function`,
+  `enable_server_cert_verification` / `enable_curl_server_cert_verification`, `disabled_filesystems`.
+  Only a GLOBAL setting may be profiled.
 - **Extensions come from a trusted repository.** `FROM` names a repository created with duckdb's
   `CREATE EXTENSION REPOSITORY`; with exactly one, it may be left out. A path, a URL, `core` and
   `community` are refused, and `VERSION` is required.
@@ -868,9 +879,29 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
 - **Removing a source.**
   - `DETACH` is refused while another source depends on it. `CASCADE` removes the dependents too.
   - It is also refused while the policy reads through it: a virtual table, schema or function over
-    `<alias>.…`. `FORCE` detaches anyway, and `acl_check_catalog` then reports `source_missing`.
-- **Authorization.** The profile is the cluster's infrastructure, so every `CLUSTER` statement needs
-  a **passthrough** scope. `manage` is not enough.
+    `<alias>.…`, or a virtual view or macro whose body names `<alias>.` (spec 118 - read as text, so an
+    unrelated name spelled the same also blocks). `FORCE` detaches anyway, and `acl_check_catalog` then
+    reports `source_missing`.
+- **Authorization.** The profile is the cluster's infrastructure: every `CLUSTER` statement needs the
+  **`cluster`** bundle (spec 118; `passthrough` carries it) - `manage` / `policy` and `operate` are not
+  enough, and no point grant stands in. The bundle sets the node's **resources and tuning** only - an
+  allowlist: `threads`, `memory_limit`, `max_temp_directory_size`, `preserve_insertion_order`, checkpoint and
+  ordering defaults, the http client's timeouts and retries, `TimeZone` / `Calendar`, and acl's limits,
+  windows and timeouts (`acl_max_sessions`, `acl_max_result_rows`, `acl_quack_*` sizes, `acl_*_timeout`,
+  `acl_alias_types` / `acl_enum_types`, `acl_lineage_namespace` / `_level`, `acl_profile_level`, ...).
+  Anything else - a data path (`http_proxy*`, `temp_directory`, an endpoint, a log or audit sink), a key
+  location, the audit, a repository - is `passthrough`'s. `acl_deployment` and `acl_node_group` are the
+  deployment's, never items.
+- **Drift** (spec 118): `platform.drift` (the `cluster` bundle) lists what this node carries against its
+  effective profile - per database, loaded extension and profiled setting a `state`: `same`, `differs`
+  (`node_value` / `profile_value`), `node_only` (an `ACL NATIVE` ATTACH, say), `profile_only` (the node
+  lacks it) or `bootstrap` (the default database, the policy's, a secrets service, statically linked
+  extensions and acl, `acl_deployment` / `acl_node_group` - listed so nothing is hidden). A source is
+  compared by its type (the path is shown, not judged: duckdb shows a file path absolute), a setting by
+  the value duckdb would show (`4GB` = `3.7 GiB`); a setting the profile does not name is not compared. A
+  database that is not a file shows its type, never its path - an attach written natively may carry a
+  credential. Showing only: the node reverts nothing; `ACL NATIVE` stays the
+  unrestricted break-glass.
 - **Audit.** Each statement is one `admin` event. Its object is the item, as `source:<alias>`,
   `extension:<name>` or `setting:<name>`, with capability `cluster`. The item's spec is never in the
   event, because a path is a physical name.
@@ -885,8 +916,8 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
 ## Administration scopes
 
 ```
-GRANT ADMIN observe | policy | manage | passthrough TO ROLE <role>
-REVOKE ADMIN [observe | policy | manage | passthrough] FROM ROLE <role>
+GRANT ADMIN observe | operate | cluster | policy | manage | passthrough TO ROLE <role>
+REVOKE ADMIN [observe | operate | cluster | policy | manage | passthrough] FROM ROLE <role>
 GRANT | DENY VIEW platform.<view> TO ROLE <role>
 GRANT | DENY FUNCTION platform.<function> TO ROLE <role>
 REVOKE VIEW | FUNCTION platform.<object> FROM ROLE <role>
@@ -894,7 +925,9 @@ REVOKE VIEW | FUNCTION platform.<object> FROM ROLE <role>
 
 The global scopes are **bundles** of the [platform catalog](platform-catalog.md) (spec 117), held as a
 set - a role holds several, a grant adds one and keeps the others. `observe` (spec 097) reads the node
-views, the load report and `/metrics` and administers nothing; `policy` is the management grammar over
+views, the load report and `/metrics` and administers nothing; `operate` (spec 118) is `observe` + the node's
+runtime; `cluster` (spec 118, a cluster node's) is `operate` + the cluster profile and its drift; `policy` is
+the management grammar over
 every catalog plus the statements that belong to no catalog (roles, issuers, mappings, categories,
 resource groups, catalogs themselves, grants) and the policy views; `manage` is spec 009's name for
 `policy` + `observe`; `passthrough` is anything, including `ACL NATIVE` SQL outside the virtual catalog,
@@ -904,7 +937,7 @@ ROLE r` takes every one, the `manage` capability of the role's catalog grants an
 
 A **point grant** gives one view (read whole) or one function (callable for any catalog) of `platform`;
 `DENY` writes a deny, which wins over every bundle but `passthrough`; `REVOKE` takes the grant or the
-deny. Never to `ALL ROLES`, and never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting`, `session_profile` - the passthrough scope's own - and `console_info` (every holder's).
+deny. Never to `ALL ROLES`, and never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `migrate_catalog` (the passthrough scope's own), `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` (the cluster bundle's alone) and `console_info` (every holder's).
 
 Granting or revoking a bundle or a point grant needs `passthrough` - `policy` never hands them out, and
 no scope is self-granted.
@@ -1177,6 +1210,7 @@ takes those of its expanded records too.
   | anonymous `ACL ADMIN` (where allowed)                               | everything, native SQL included                                                                                                                                 |
   | `passthrough` (`GRANT ADMIN passthrough`)                           | everything, native SQL included                                                                                                                                 |
   | `policy` (`GRANT ADMIN policy`; spec 009's global `manage` = `policy` + `observe`) | every management statement except `GRANT ADMIN` / `REVOKE ADMIN`, the grants on `platform`, `CLUSTER …` and the node's operations (`operate`'s); no `ACL NATIVE`                    |
+  | `cluster` (`GRANT ADMIN cluster`, spec 118, a cluster node's)       | `CLUSTER …` (settings: resources and tuning only) and what `operate` runs; reads the cluster views and `drift`; no `ACL NATIVE` |
   | `operate` (`GRANT ADMIN operate`, spec 118)                         | `KILL SESSION`, `SET SESSION … AUDIT LEVEL`, `PROFILE SESSION`, `DRAIN NODE`, `RESUME NODE`; reads what `observe` reads; no `ACL NATIVE`                     |
   | `observe` (`GRANT ADMIN observe`)                                   | no management statement and no `ACL NATIVE` - it reads the node views, the load report and `/metrics` (spec 097)                                               |
   | a point grant on `platform.<f>` (`GRANT FUNCTION platform.f`)      | that one operation (the grammar form and the call alike), for any catalog                                                                                      |

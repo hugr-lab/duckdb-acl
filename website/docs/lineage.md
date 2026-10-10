@@ -50,8 +50,8 @@ the quack door's streamed ingest (`SEND_DATA`), and a `GRANT SCHEMA` does not re
     identity (below).
 - **The namespace is the cluster's.** `<ns>` is `acl_lineage_namespace`. It has no default: with none
   the node sends **no lineage**, and `acl_lineage_status()` says so (`on`, `off`, or `no namespace:
-  …`). Set it once for the cluster - `ACL CLUSTER SET acl_lineage_namespace = 'acl://prod'` - or in a
-  single node's bootstrap with `SET GLOBAL`. Clearing it is the cluster-wide off switch (a setting item: each node takes it as the node agent rolls the profile out), and it keeps
+  …`). Set it once for the cluster - `ACL CLUSTER SET acl_lineage_namespace = 'acl://prod'` on a
+  cluster node (spec 118's `acl_deployment`) - or in a standalone node's bootstrap with `SET GLOBAL`. Clearing it is the cluster-wide off switch (a setting item: each node takes it as the node agent rolls the profile out), and it keeps
   two clusters from merging their virtual catalogs in one backend by accident. The node group is in
   the run's facet, not in the name.
 - **Job namespaces** are `<ns>/client/<door>`.

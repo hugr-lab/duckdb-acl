@@ -208,11 +208,11 @@ struct IntrospectionRows {
 //! held as a SET (a role holds several): there is no order between them, so no site may compare two
 //! (the linear `NONE < OBSERVE < MANAGE < PASSTHROUGH` of spec 097 is gone). OBSERVE reads the node
 //! views (and the load report / metrics, spec 097); OPERATE (spec 118) is observe + the node's runtime
-//! (sessions, drain / resume); POLICY reads the policy views and calls every policy function but the admin
-//! grants; PASSTHROUGH is everything - `ACL NATIVE`, grants on `platform` and the
-//! bundles. MANAGE is the name spec 009 wrote: a global row reads as POLICY + OBSERVE, a row scoped to
-//! a catalog as that catalog's administration.
-enum class AdminScope : uint8_t { OBSERVE, OPERATE, POLICY, MANAGE, PASSTHROUGH };
+//! (sessions, drain / resume); CLUSTER (spec 118) is operate + the cluster profile and its drift; POLICY reads the
+//! policy views and calls every policy function but the admin grants; PASSTHROUGH is everything - `ACL NATIVE`, grants
+//! on `platform` and the bundles. MANAGE is the name spec 009 wrote: a global row reads as POLICY + OBSERVE, a row
+//! scoped to a catalog as that catalog's administration.
+enum class AdminScope : uint8_t { OBSERVE, OPERATE, CLUSTER, POLICY, MANAGE, PASSTHROUGH };
 
 //! Parse/print the scope names used by the admin functions, the grammar and the policy source
 AdminScope ParseAdminScope(const string &scope);
@@ -674,8 +674,17 @@ struct PolicyStore {
 	//! items that apply to this node (the cluster's, its group's over them), and the profile version the
 	//! node agent last reported applied (-1 = never)
 	string NodeGroup();
+	//! spec 118: acl_deployment = 'cluster' - the deployment's, never the policy's
+	bool ClusterNode();
 	bool NodeGroupKnown();
 	vector<ClusterItem> ClusterEffective();
+	//! spec 118: what this cluster node carries that its effective profile lacks and the other way round -
+	//! kind (database | extension | setting), name, state (same | differs | node_only | profile_only | bootstrap),
+	//! the node's value and the profile's, the item's scope. Showing only: nothing is reverted
+	struct DriftRow {
+		string kind, name, state, node_value, profile_value, scope;
+	};
+	vector<DriftRow> ClusterDrift();
 	std::atomic<int64_t> cluster_applied {-1};
 	ClusterAnswer ClusterExtension(const string &verb, const string &scope, const string &name, const string &version,
 	                               const string &repository, const string &comment);
@@ -1052,6 +1061,9 @@ struct PolicyStore {
 		//! spec 118: the `operate` bundle - observe + the node's runtime (kill, a session's audit level and
 		//! profile, drain / resume); implied by passthrough
 		bool operate = false;
+		//! spec 118: the `cluster` bundle - operate + the cluster profile (ACL CLUSTER …), its views and the
+		//! drift; never a physical source's data; implied by passthrough
+		bool cluster = false;
 		//! spec 097: an `admins` row whose scope this build does not know, or one that grants nothing
 		//! here (an observe row scoped to a catalog). It grants nothing, but the role stays privileged
 		//! (spec 095) - a later scope must not open its role to IdP group names

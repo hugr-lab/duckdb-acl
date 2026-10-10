@@ -239,6 +239,26 @@ void LoadInternal(ExtensionLoader &loader) {
 		    }
 	    },
 	    SetScope::GLOBAL);
+	// spec 118: what this node is - a standalone node (its bootstrap SQL and its admin's ACL NATIVE configure
+	// it; no cluster profile) or a cluster node (the profile configures the fleet, tresor keeps its secrets).
+	// A security mode never follows from the policy's contents: the deployment sets it
+	config.AddExtensionOption(
+	    "acl_deployment",
+	    "acl: 'standalone' (the default - configured by its bootstrap, no cluster profile) or 'cluster' (the "
+	    "cluster profile, drift, secrets only in the secrets service). Set by the deployment, never by the policy",
+	    LogicalType::VARCHAR, Value("standalone"),
+	    [](ClientContext &, SetScope scope, Value &value) {
+		    if (scope != SetScope::GLOBAL) {
+			    throw InvalidInputException("acl_deployment is global - use SET GLOBAL");
+		    }
+		    auto text = StringUtil::Lower(value.ToString());
+		    if (text != "standalone" && text != "cluster") {
+			    throw InvalidInputException("acl_deployment is 'standalone' or 'cluster', not \"%s\"",
+			                                value.ToString());
+		    }
+		    value = Value(text);
+	    },
+	    SetScope::GLOBAL);
 	// spec 099: how a type the clients may not know is exposed - in the description and the data alike.
 	// A virtual table's own value (ALTER VIRTUAL TABLE ... SET TYPES) overrides these.
 	config.AddExtensionOption(

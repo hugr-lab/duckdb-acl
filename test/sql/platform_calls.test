@@ -24,6 +24,10 @@ INSERT INTO phys.main.orders VALUES (1, 'acme', 10), (2, 'globex', 20);
 statement ok
 SELECT acl_use_db('store', 'acl', true);
 
+# a cluster node (spec 118): the profile is a cluster node's
+statement ok
+SET GLOBAL acl_deployment = 'cluster';
+
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 

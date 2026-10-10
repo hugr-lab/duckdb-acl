@@ -81,6 +81,7 @@ int main() {
 		              PUBLIC_KEY + "'");
 		Exec(con, "ATTACH ':memory:' AS store");
 		Exec(con, "SELECT acl_use_db('store','acl',true)");
+		Exec(con, "SET GLOBAL acl_deployment = 'cluster'"); // spec 118: the profile is a cluster node's
 		Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
 
 		Scenario("a SHA256 clause is refused, never ignored, and writes nothing (spec 103)", [&] {

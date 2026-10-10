@@ -1486,8 +1486,9 @@ void PlatformGrantTarget(DataChunk &args, idx_t row, const char *fn, string &rol
 	if (function->right == PlatformRight::ESCALATES || function->right == PlatformRight::INFRASTRUCTURE ||
 	    function->right == PlatformRight::OPEN) {
 		throw BinderException("%s: platform.%s is %s - it is never granted by name", fn, object,
-		                      function->right == PlatformRight::OPEN ? "every holder's"
-		                                                             : "the passthrough scope's alone");
+		                      function->right == PlatformRight::OPEN             ? "every holder's"
+		                      : function->right == PlatformRight::INFRASTRUCTURE ? "the cluster bundle's alone"
+		                                                                         : "the passthrough scope's alone");
 	}
 }
 
