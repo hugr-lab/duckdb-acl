@@ -81,6 +81,10 @@ ACL ROLE "observer" ACL NATIVE SELECT 1;
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE observer CAPS '{"manage": true}';
 
+# spec 118.3: a catalog admin builds over its granted sources
+statement ok
+ACL ADMIN GRANT SOURCE phys TO ROLE observer;
+
 statement ok
 ACL ROLE "observer" ACL ADD TABLE phys.main.orders AS c.orders;
 

@@ -51,6 +51,7 @@ set(EXTENSION_SOURCES
     src/acl_metadata_listing.cpp
     src/acl_principal_functions.cpp
     src/acl_platform.cpp
+    src/acl_platform_sources.cpp
     src/acl_catalog_validation.cpp
     src/acl_rewriter.cpp
     src/acl_token.cpp

@@ -1,6 +1,6 @@
 # Spec 118: node and cluster management - operate / cluster, drift, the physical tree
 
-- **Status**: accepted (by the owner 2026-10-10); **118.1 and 118.2 implemented** (see *As built*); aligned after the comparison with Trino, Snowflake, Databricks UC,
+- **Status**: accepted (by the owner 2026-10-10); **118.1, 118.2 and 118.3 implemented** (see *As built*); aligned after the comparison with Trino, Snowflake, Databricks UC,
   ClickHouse, PostgreSQL, SQL Server - design/079 App. A)
 - **Date**: 2026-10-10
 - **Author**: Claude (design/079 with the owner)
@@ -240,4 +240,26 @@ catalog; over-reading blocks, FORCE is the operator's answer). Who reads what pe
   extension loaded; read through duckdb_settings()), one settings read, a non-file database's path never shown
   (a native attach may carry a credential). Docs: the bundles everywhere, the point-grant lists.
   Low, left: source names that are canonical keys with a dot compared as raw names; drift in group scope untested.
+
+### 118.3 (2026-10-10)
+- `src/acl_platform_sources.cpp`: `acl_platform_attached([sources])` / `acl_platform_attached_columns([sources])`
+  read each visible database through `Catalog::GetSchemas` + `Scan(TABLE_ENTRY)` (tables, views - a view's columns
+  from its binding, never its SQL); `NULL` = every source; a list = only the databases it names are read. The
+  policy store's database and tresor catalogs are never shown. `PlatformListingCtes` adds them to `pobjects` /
+  `pcolumns` (now with `path`, `type`); the listings derive the nested schemas (`attached`, `attached.<alias>`, …)
+  from the paths. A `SELECT` from `platform.attached…` is refused (no such object).
+- `GRANT | REVOKE SOURCE <db>[.<schema>] TO|FROM ROLE r` and `platform.grant_source` / `revoke_source` (HANDS_OUT:
+  policy, passthrough); written as platform_grants kind `source` (the database must be attached, the schema must
+  exist); a point grant (`acl_grant_platform`) still takes only view / function.
+- `AuthorizeSources`: for a principal that is not policy / passthrough / cluster, every stored physical name
+  (relation phys, schema alias / expansion path, a function alias' target in an attached database, ALTER … SET phys)
+  and every table a SELECT / EXPRESSION body reads (bound by `GetTableNames` on the node; a body that does not bind
+  is refused for such an author) lies in a granted source - named in full. `GetTableNames` answers a reference with
+  its alias (`pg.hr.salaries AS s`) - cut here and in spec 117's policy-store check.
+- **Not built (decided, owner's "no automatic rollback" holds without it):** the `source_not_granted` finding. Without
+  a record of who declared an object (spec 120's created_by), it would flag every object an operator or the policy
+  admin built in a catalog that also has a catalog admin. Existing objects keep working; the rule applies at write.
+- Behaviour change: a catalog admin now needs `GRANT SOURCE` to build over physical sources; the suites' catalog
+  admins got one (`acl_admin_scopes`, `acl_observe`, `platform_calls`, `platform_review`).
+- Tests: `platform_attached.test` (new).
 

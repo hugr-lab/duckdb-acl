@@ -70,6 +70,10 @@ SELECT acl_grant_admin('platform', 'passthrough');
 statement ok
 SELECT acl_grant_catalog('sales_owner', 'sales', '{"manage": true}', false);
 
+# spec 118.3: a catalog admin builds over its granted sources
+statement ok
+SELECT acl_grant_source('sales_owner', 'phys');
+
 # --- a principal without a scope cannot administer ----------------------------------------------
 
 statement error
@@ -279,6 +283,9 @@ ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiO
 statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE analyst CAPS '{"select": true, "manage": true}' MAIN;
 
+statement ok
+ACL ADMIN GRANT SOURCE phys TO ROLE analyst;
+
 # spec 095: a role that holds an administration scope is reached only through an explicit mapping of
 # the client itself - not as an unmapped value of the same name, which is how the short form's
 # client reaches every other role
@@ -485,6 +492,9 @@ statement ok
 ACL ADMIN INSERT INTO aclcat.acl.admins VALUES ('scoped', 'manage', 'sales');
 
 statement ok
+ACL ADMIN GRANT SOURCE phys TO ROLE scoped;
+
+statement ok
 ACL ROLE "scoped" ACL ADD TABLE phys.main.orders_physical AS sales.scoped_ok;
 
 statement error
@@ -516,6 +526,9 @@ ACL ADMIN CREATE ROLE caseowner;
 
 statement ok
 SELECT acl_grant_catalog('caseowner', 'SALES', '{"manage": true}', false);
+
+statement ok
+SELECT acl_grant_source('caseowner', 'PHYS');
 
 query T
 SELECT vcat FROM aclcat.acl.role_catalogs WHERE role = 'caseowner';

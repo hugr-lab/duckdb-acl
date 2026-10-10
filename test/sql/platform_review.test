@@ -58,6 +58,10 @@ ACL ADMIN CREATE ROLE cadm;
 statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE cadm CAPS '{"select": true, "insert": true, "manage": true}' MAIN;
 
+# spec 118.3: a catalog admin builds over its granted sources
+statement ok
+ACL ADMIN GRANT SOURCE phys TO ROLE cadm;
+
 statement ok
 ACL ADMIN CREATE ROLE reader;
 
@@ -107,12 +111,12 @@ ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET COLUMNS 'id, tenant 
 statement error
 ACL ROLE "cadm" CREATE VIRTUAL SCHEMA sales.r10 AS store;
 ----
-<REGEX>:.*the schema alias reads the policy store itself.*
+<REGEX>:.*(the schema alias reads the policy store itself|outside the sources granted).*
 
 statement error
 ACL ROLE "cadm" CREATE VIRTUAL SCHEMA sales.r11 AS "STORE";
 ----
-<REGEX>:.*the schema alias reads the policy store itself.*
+<REGEX>:.*((the schema alias reads the policy store itself|outside the sources granted)|outside the sources granted).*
 
 statement error
 ACL ROLE "pol" CREATE VIRTUAL SCHEMA sales.r12 AS store.acl;

@@ -904,7 +904,10 @@ void RequireNotPolicyStore(CatalogBackend &catalog, const char *what, const stri
 		auto probe = expression ? "SELECT (" + baked + ") AS \"value\"" : baked;
 		auto instance = catalog.Db();
 		Connection con(*instance);
-		for (auto &name : con.GetTableNames(probe, true)) {
+		for (auto &written : con.GetTableNames(probe, true)) {
+			// the binder answers a reference with its alias (`store.acl.admins AS a`): the name is before it
+			auto alias_at = StringUtil::Lower(written).find(" as ");
+			auto name = alias_at == string::npos ? written : written.substr(0, alias_at);
 			NamePath path;
 			string error;
 			auto parts = NamePath::TryFromKey(name, path, error) ? path.Parts() : StringUtil::Split(name, '.');

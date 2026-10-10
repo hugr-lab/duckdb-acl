@@ -427,7 +427,7 @@ ACL ADMIN GRANT CATALOG sales TO ROLE pointy CAPS '{"select": true, "insert": tr
 statement error
 ACL ROLE "pointy" CREATE VIRTUAL TABLE sales.adm2 AS store.acl.admins;
 ----
-<REGEX>:.*reads the policy store itself.*
+<REGEX>:.*((reads the policy store itself|outside the sources granted)|outside the sources granted).*
 
 query I
 SELECT count(*) FROM store.acl.relations WHERE phys LIKE 'store.acl.%';

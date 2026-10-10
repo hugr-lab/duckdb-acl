@@ -1,0 +1,222 @@
+# name: test/sql/platform_attached.test
+# description: spec 118.3 - the physical tree under platform.attached.<alias>.<schema> (metadata only, per
+#   scope), GRANT | REVOKE SOURCE, and a catalog admin that builds only over its granted sources
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS pg;
+
+statement ok
+CREATE SCHEMA pg.sales;
+
+statement ok
+CREATE SCHEMA pg.hr;
+
+statement ok
+CREATE TABLE pg.sales.orders(id INTEGER, amount INTEGER DEFAULT 42);
+
+statement ok
+CREATE VIEW pg.sales.big AS SELECT id FROM pg.sales.orders WHERE amount > 100;
+
+statement ok
+CREATE TABLE pg.hr.salaries(id INTEGER, pay INTEGER);
+
+statement ok
+CREATE TABLE pg.main.t(x INTEGER);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE obs;
+
+statement ok
+ACL ADMIN GRANT ADMIN observe TO ROLE obs;
+
+statement ok
+ACL ADMIN CREATE ROLE cadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cadm CAPS '{"select": true, "manage": true}' MAIN;
+
+# --- the tree: policy sees every source - never the policy store's database --------------------------------
+
+query TTT
+ACL ROLE "pol" SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema LIKE 'attached.%' AND table_schema NOT LIKE 'attached.memory%' ORDER BY ALL;
+----
+attached.pg.hr	salaries	BASE TABLE
+attached.pg.main	t	BASE TABLE
+attached.pg.sales	big	VIEW
+attached.pg.sales	orders	BASE TABLE
+
+query I
+ACL ROLE "pol" SELECT count(*) FROM information_schema.schemata WHERE catalog_name = 'platform' AND schema_name LIKE 'attached.store%';
+----
+0
+
+# metadata only: names and types (a default, a view's SQL never), and no row is read
+query TT
+ACL ROLE "pol" SELECT column_name, data_type FROM information_schema.columns WHERE table_catalog = 'platform' AND table_schema = 'attached.pg.sales' AND table_name = 'orders' ORDER BY ordinal_position;
+----
+id	INTEGER
+amount	INTEGER
+
+statement error
+ACL ROLE "pol" SELECT * FROM platform.attached.pg.sales.orders;
+----
+<REGEX>:.*no access to object "platform.attached.pg.sales.orders".*
+
+# the observe bundle and a catalog admin without a grant see none of it
+query I
+ACL ROLE "obs" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema LIKE 'attached.%';
+----
+0
+
+query I
+ACL ROLE "cadm" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema LIKE 'attached.%';
+----
+0
+
+# --- GRANT SOURCE: policy or passthrough hands a source to a role --------------------------------------------
+
+statement error
+ACL ROLE "cadm" GRANT SOURCE pg.sales TO ROLE cadm;
+----
+<REGEX>:.*unrestricted manage.*
+
+statement error
+ACL ROLE "pol" GRANT SOURCE nosuch TO ROLE cadm;
+----
+<REGEX>:.*"nosuch" is no source of this node.*
+
+statement error
+ACL ROLE "pol" GRANT SOURCE store TO ROLE cadm;
+----
+<REGEX>:.*"store" is no source of this node.*
+
+statement error
+ACL ROLE "pol" GRANT SOURCE pg.nosuch TO ROLE cadm;
+----
+<REGEX>:.*source "pg" has no schema "nosuch".*
+
+statement ok
+ACL ROLE "pol" GRANT SOURCE pg.sales TO ROLE cadm;
+
+# the catalog admin's tree: the granted schema only
+query TT
+ACL ROLE "cadm" SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema LIKE 'attached.%' ORDER BY ALL;
+----
+attached.pg.sales	big
+attached.pg.sales	orders
+
+query T
+ACL ROLE "cadm" SELECT list(schema_name ORDER BY schema_name) FROM duckdb_schemas() WHERE database_name = 'platform';
+----
+[attached, main, pg, sales]
+
+# --- a catalog admin builds only over its sources ---------------------------------------------------------------
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.orders AS pg.sales.orders;
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.big_orders AS 'SELECT id FROM pg.sales.orders WHERE amount > 1000';
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL SCHEMA c.s AS pg.sales;
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.pay AS pg.hr.salaries;
+----
+<REGEX>:.*the definition names "pg.hr.salaries", outside the sources granted to the principal.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.pay_v AS 'SELECT o.id, s.pay FROM pg.sales.orders o JOIN pg.hr.salaries s ON o.id = s.id';
+----
+<REGEX>:.*the definition's body names "pg.hr.salaries".*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.t_v AS 'SELECT * FROM t';
+----
+<REGEX>:.*the definition's body names.*outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL SCHEMA c.whole AS pg;
+----
+<REGEX>:.*the definition names "pg", outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.short AS orders;
+----
+<REGEX>:.*outside the sources granted.*name the source in full.*
+
+# policy builds over every source
+statement ok
+ACL ROLE "pol" CREATE VIRTUAL TABLE c.pay AS pg.hr.salaries;
+
+# a database-level grant reaches every schema of it
+statement ok
+ACL ROLE "root" GRANT SOURCE pg TO ROLE cadm;
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL SCHEMA c.whole AS pg;
+
+query I
+ACL ROLE "cadm" SELECT count(DISTINCT table_schema) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema LIKE 'attached.%';
+----
+3
+
+# --- REVOKE SOURCE: what was built keeps working (nothing is taken back automatically) ------------------------
+
+statement ok
+ACL ROLE "pol" REVOKE SOURCE pg FROM ROLE cadm;
+
+statement ok
+ACL ROLE "pol" REVOKE SOURCE pg.sales FROM ROLE cadm;
+
+query I
+ACL ROLE "cadm" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema LIKE 'attached.%';
+----
+0
+
+query I
+ACL ROLE "cadm" SELECT count(*) FROM c.orders;
+----
+0
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.again AS pg.sales.orders;
+----
+<REGEX>:.*outside the sources granted.*
+
+# the grants are platform_grants rows of kind source
+query I
+SELECT count(*) FROM store.acl.platform_grants WHERE kind = 'source';
+----
+0

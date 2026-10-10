@@ -176,5 +176,19 @@ vector<PlatformFunctionRow> PlatformFunctionRows(const PolicyStore::AdminRights 
 //! _attributes). Every one is an acl_* name - in the never set, reached only by substitution.
 void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
 
+//! spec 118.3 (acl_platform_sources.cpp): the physical tree `platform.attached.<alias>.<schema>` - its
+//! table functions acl_platform_attached[_columns]([sources]) and acl_grant_source / acl_revoke_source
+void RegisterAclPlatformSources(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
+//! the sources granted to the principal (`<alias>` or `<alias>.<schema>` keys, kind `source`)
+vector<string> GrantedSources(const PolicyStore::AdminRights &rights);
+//! passthrough, policy and the cluster bundle see - and build over - every source
+bool SeesAllSources(const PolicyStore::AdminRights &rights);
+//! a physical name (parts: `<db>.<schema>.<object>`, a schema path `<db>[.<schema>…]`) inside a granted source
+bool SourceGranted(const vector<string> &sources, const vector<string> &parts, bool schema_path);
+//! spec 118.3: a catalog admin (neither policy, passthrough nor cluster) builds only over its granted
+//! sources - every physical name and every table a stored body reads; anything else is refused at write
+void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,
+                      PolicyStore &store);
+
 } // namespace acl
 } // namespace duckdb

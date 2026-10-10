@@ -344,6 +344,10 @@ combined with a certificate. Both doors require cert **and** key together.
   category, which could spread it into every listing or hand it to every role). **Only `passthrough`
   grants on `platform` and grants the bundles** - a grantor that can grant everything is everything;
   never to every role, never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `migrate_catalog` (the passthrough scope's own), `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` (the cluster bundle's alone) and `console_info` (every holder's). A deny wins over every bundle but `passthrough`.
+- **A catalog admin builds only over its granted sources** (spec 118.3): every physical name it stores and
+  every table a body of its reads (bound on the node) lies inside a `GRANT SOURCE` of its role - handed
+  out by `policy` or `passthrough`; the physical tree it sees under `platform.attached` is the same set.
+  Delegating a catalog no longer delegates every attached database.
 - **A stored body holds only what its author may call** (the review of spec 117): a view, a macro
   template, an alias target, an RLS, a column or mask expression, a grant's policy runs as the node when
   read, so an author who is not `passthrough` may store only calls its own function gate admits (its

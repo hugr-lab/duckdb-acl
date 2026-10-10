@@ -752,6 +752,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		AuthorizeMgmt(statements, rights);
 		AuthorizeRoleTargets(statements, rights, store);
 		AuthorizeBodies(statements, rights, store, principal);
+		AuthorizeSources(statements, rights, store);
 		return ParserOverrideResult(std::move(statements));
 	}
 	if (mode == AclPrefix::Mode::NATIVE) {
@@ -844,6 +845,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 			AuthorizeMgmt(compiled, rights);
 			AuthorizeRoleTargets(compiled, rights, store);
 			AuthorizeBodies(compiled, rights, store, principal);
+			AuthorizeSources(compiled, rights, store);
 			return ParserOverrideResult(std::move(compiled));
 		}
 	}

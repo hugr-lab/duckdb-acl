@@ -913,6 +913,21 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
   - `acl_cluster_detach(group, alias, cascade, force)`;
   - `acl_cluster_setting(verb, group, name, value)`.
 
+## Sources (spec 118.3)
+
+```
+GRANT SOURCE <database>[.<schema>] TO ROLE <role>
+REVOKE SOURCE <database>[.<schema>] FROM ROLE <role>
+```
+
+A source granted to a role - by `policy` or `passthrough` - is what a catalog admin sees of the node's
+physical sources (`platform.attached.<alias>.<schema>`, metadata only) and the only physical names it may
+build over: a table, a schema alias / expansion, a function alias, the tables a view / macro / RLS / mask
+body reads - each named in full. `policy`, `passthrough` and `cluster` build over every source. Never the
+policy store's database nor a secrets service. A revoke takes back nothing already built. Functions:
+`acl_grant_source(role, source)`, `acl_revoke_source(role, source)` (`platform.grant_source` /
+`revoke_source`).
+
 ## Administration scopes
 
 ```
