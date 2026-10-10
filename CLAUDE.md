@@ -67,6 +67,7 @@ src/
   acl_identity_store.cpp     #   ... the store's side: secrets, discovery documents, VerifyJwtPrincipal, doors
   acl_parser_override.cpp    # ACL prefix scanner + parser_override; exposes RegisterAclParser(...)
   acl_admin_functions.cpp    # acl_* admin stubs; exposes RegisterAclAdminFunctions(...)
+  acl_platform.cpp           # spec 117: the platform catalog - views, functions, the ONE authorizer (acl_platform.hpp)
   acl_door_common.cpp        # what every acl_* scalar and both doors share: StoreOf/RequiredArg, PEM, JSON
   flight/                    # the Flight SQL door (spec 045); seam RegisterAclFlightDoor(...)
   quack_embed/               # the embedded quack server (spec 063) + acl_quack_door.cpp (serve/stop, the
@@ -160,8 +161,9 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
 - **Markers baked into template copies**: `acl_claim('<name>')` → claim constant; `acl_arg(n)` → n-th
   call argument's AST. Never registered as real functions ⇒ a missed marker fails closed at bind.
 - **Administration is a capability** (spec 009): `{"manage": true}` in a catalog grant (per catalog,
-  many catalogs per role, independent of `select`), or a global `manage`/`passthrough` in
-  `acl.admins`; never self-escalating, and only `passthrough` leaves the virtual catalog.
+  many catalogs per role, independent of `select`), or global bundles in `acl.admins` (spec 117: a set -
+  `observe`, `policy`, `passthrough`; `manage` = policy + observe), or point grants on the `platform`
+  catalog; never self-escalating, and only `passthrough` leaves the virtual catalog.
 - **Golden rule**: the rewriter adds no query parameters — a user's `$1`/`?` is the only parameter.
 - **Function gating seam**: `PolicyStore::ResolveFunction` (spec 072) — a call is admitted when its
   key `(database, schema, name, kind)` is in a **category** granted to one of the principal's roles
@@ -494,8 +496,8 @@ cluster's source only while the group has none of that name). `acl_cluster_effec
 `acl_cluster_applied(version)`; the load report adds `group`, `group_known`, `config.{target,applied}`
 (catalog reads cached 2 s, keyed on `CatalogBackend::local_writes`).
 
-**Spec 097 — the `observe` scope**: a global admin scope (`GRANT ADMIN observe`, `AdminScope` is now
-`NONE < OBSERVE < MANAGE < PASSTHROUGH` - "may administer" is `>= MANAGE`, never `!= NONE`) that reads
+**Spec 097 — the `observe` scope**: a global admin scope (`GRANT ADMIN observe`; since spec 117 the
+scopes are a SET of bundles - `AdminRights::MayAdminister()`, never an order) that reads
 the load report and `/metrics` and administers nothing; `AdminRights::observe` = an observe row, or
 passthrough, or an unrestricted manage (a catalog-scoped manage is not the node's). `GET /metrics`,
 `GET /.well-known/acl-node` and the Flight Handshake `node-load` answer `ObserveAuthorize`
@@ -641,6 +643,35 @@ used to drop the qualifier), a short name under `USE` is read in the session's c
 MAIN only. `duckdb_functions()` lists every held catalog's (schema path, `TABLE(…)` result type),
 `acl_function_columns([c[, s[, f]]])` their params/columns/return; `duckdb_schemas` gives
 `parent_schema` and functions-only schemas. Phase 0 of design/079 (DBeaver console).
+
+**Spec 117 — the `platform` catalog**: a synthesized system catalog (`acl_platform.{hpp,cpp}`, the
+reserved name - `IsPlatformCatalog`, refused in `CatalogKey` / `CatalogCreate` / the authorizer / a
+driver's role_catalogs, `USE platform`; the v21 step refuses one) answering an admin without `ACL
+NATIVE`: VIEWS `platform.[main.]<v>` (the registry `PlatformViews()`: typed columns - caps STRUCT via
+`acl_platform_caps`, lists via `acl_platform_list`, a client's REQUIRE / ATTRIBUTES as LIST(STRUCT), a
+cluster spec MAP; SQL over the policy tables, rows narrowed for a catalog admin by `KeyFoldSql` IN its
+catalogs; the node views read typed `acl_platform_*` table functions) substituted in the rewriter's
+BASE_TABLE before `Key()`; FUNCTIONS `platform.<op>` (`PlatformFunctions()`: the acl_* target, params with
+`authz` / fallback, arities, the right) compiled by `CompilePlatformCall` ONLY at the top level (`SELECT f(…)`
+one item, no FROM/WHERE/CTE/modifiers, or `CALL f(…)`; named args; a `?` where authz is refused; the
+statement's parameter map carried over) in the override, refused anywhere else by the rewriter; read
+functions `check_catalog([c])` / `console_info()` in FROM. **ONE authorizer**: `AuthorizeMgmt` /
+`AuthorizeAdminCall` (moved from acl_admin_sql.cpp) judge every compiled call - grammar or call - by its
+`PlatformRight` (CATALOG / POLICY / HANDS_OUT / ESCALATES / INFRASTRUCTURE / OPEN). Rights: `AdminRights`
+is a SET (`passthrough`, `unrestricted_manage` = policy, `observe`, `catalogs`, `platform` point grants
+`<kind>:<object>` -> allowed; `MayAdminister()`, `Policy()`, `Privileged()` - spec 095's privileged roles
+include any point grant); `platform_grants(role, object, kind, allowed)` written only by passthrough
+(`GRANT|DENY|REVOKE VIEW|FUNCTION platform.x`, `acl_grant_platform` / `acl_revoke_platform`), never to
+'' nor on ESCALATES/INFRASTRUCTURE/OPEN; a deny wins over a bundle, not passthrough. `admins` keyed
+`(role, scope, vcat)` (v21, min_reader 21), spec 009's rows read as bundles, nothing rewritten. Under a
+principal prefix the grammar needs no marker (`StartsWithMgmt`, the batch split by `SplitBatchText`); a
+batch mixing management and queries is refused (`BatchHasMgmtStatement`); `NoteManagement` gives each
+compiled call its text hash. Listings: `PlatformListingCtes` (pobjects/pcolumns) joined into
+`MetadataListingSql`, `PlatformFunctionRows` into duckdb_functions / acl_function_columns - absent on the
+quack door (`SessionDoorOf`). Flight: a management statement / call is a command (runs at GetFlightInfo),
+a retained result is read from the handle. The view comment and the stored catalog / schema comments
+reach the listings. Tests: `platform_{views,calls,rights,markerless,reserved,memory}.test`,
+`test_acl_session.cpp` / `test_acl_params_passthrough.cpp`, `test/e2e/flight/admin.sh`, the door e2e.
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant

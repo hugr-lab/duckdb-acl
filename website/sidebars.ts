@@ -9,7 +9,7 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Administering the ACL',
       collapsed: false,
-      items: ['management-sql', 'policy-catalog', 'authentication'],
+      items: ['management-sql', 'platform-catalog', 'policy-catalog', 'authentication'],
     },
     {
       type: 'category',

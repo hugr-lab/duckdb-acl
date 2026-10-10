@@ -1,6 +1,6 @@
 # Spec 117: the `platform` catalog - managing a node without native access
 
-- **Status**: accepted (by the owner 2026-10-09, with the recommended answers: authorization arguments are constants, `platform_grants` its own table, a catalog admin sees its catalogs + role names, policy views as SQL, REVOKE ADMIN per bundle, operate/cluster in 118, `platform` absent only on quack)
+- **Status**: implemented (accepted by the owner 2026-10-09, with the recommended answers: authorization arguments are constants, `platform_grants` its own table, a catalog admin sees its catalogs + role names, policy views as SQL, REVOKE ADMIN per bundle, operate/cluster in 118, `platform` absent only on quack; built 2026-10-10 - see *As built*)
 - **Date**: 2026-10-09
 - **Author**: Claude (design/079 with the owner)
 - **Follows**: spec 009 (administration is a capability), 097 (observe), 095 (privileged roles reached only
@@ -152,6 +152,77 @@ before it does not know the bundles).
 - **DML on the views** (`INSERT INTO platform.roles …`) - a second write surface; batch semantics and
   partial application across rows (design/079 §3.2).
 - **Grants stored in role_catalogs / function_grants** - leaks into listings and categories.
+
+## As built (2026-10-10)
+
+- **Where it lives.** `src/acl_platform.{hpp,cpp}`: the registry of the views (`PlatformViews()`, 36:
+  the spec's list plus `platform_grants`, `node_doors`, `node_streams`) and of the functions
+  (`PlatformFunctions()`: every `acl_*` writer the grammar compiles to, under its plain name, plus the read
+  functions), the one authorizer, the compilation of a top-level call, the views' SQL, the listings'
+  share and the node-state table functions (`acl_platform_sessions|node_load|node_doors|node_streams`) and
+  conversions (`acl_platform_caps|list|map|conditions|attributes`) - all `acl_*`, in the never set,
+  reached only by substitution.
+- **Typed columns.** caps is `STRUCT(select, insert, update, delete, merge, create, drop, temp, explain,
+  secrets, manage BOOLEAN)` - NULL when unstated (a catalog grant: the data capabilities; an object
+  grant: inherited); a column list, audiences, azp, roles_from/constant, subject, flows and a function's
+  params are `VARCHAR[]`; a client's REQUIRE is `LIST(STRUCT(path, op, values VARCHAR[]))` and its
+  ATTRIBUTES `LIST(STRUCT(name, paths VARCHAR[], constant))` - the spec allowed a MAP or a STRUCT; a list
+  of structs keeps the order and the several values a condition holds, which a MAP would lose; a cluster
+  spec is `MAP(VARCHAR, VARCHAR)`. Each view's SQL ends in a cast to its declared shape, so the listing
+  and `DESCRIBE platform.<v>` agree column for column (asserted for every view). `function_columns` is
+  `object_columns` of the functions; `check_findings` is the table function `check_catalog([vcat])`
+  (`CALL platform.check_catalog(…)` too). Views over the policy tables need a catalog source; in memory
+  mode and behind a function driver they refuse with the reason, while the node views, `jwks_cache`, the
+  function views, the cluster views and `catalog_schema` (all read through functions) answer.
+- **Functions.** Parameter names avoid duckdb's reserved words (`column_name`, `group_name`,
+  `into_schema`). A left-out argument (or an explicit NULL) is the target's own fallback, never NULL - the
+  admin functions' default NULL handling would make the whole call NULL. A list is accepted where the
+  target takes text (`caps := ['select']` becomes the caps JSON, `columns := [...]` the csv). Each call
+  answers what its `acl_*` target answers (BOOLEAN, BIGINT, the cluster STRUCT), named after the
+  platform function. The compiled call keeps the statement's parameter map, so a `?` in a payload
+  argument binds (the golden rule; `test_acl_params_passthrough.cpp`).
+- **The authorizer** is spec 009's table as a right per operation (CATALOG / POLICY / HANDS_OUT /
+  ESCALATES / INFRASTRUCTURE / OPEN), its refusal texts kept. Three operations the old table did not know
+  - `acl_add_reference`, `acl_drop_reference`, `acl_set_key` - were refused to every scope but
+  passthrough; they are CATALOG now, as §5 gives a catalog admin its references and keys (the one
+  widening, intended). A catalog admin still may not hand out access (`grant_catalog` & co. are
+  HANDS_OUT, policy only): spec 009's rule, unchanged - it sees the grants on its catalogs and the role
+  names, it does not grant them.
+- **Bundles.** `policy` alone reads no node view; spec 009's global `manage` row reads as policy +
+  observe, a catalog-scoped one as that catalog, as specified - the rows are kept as written, v21 rewrites
+  nothing, and `GRANT ADMIN manage` still writes `manage`. Point grants: `GRANT | DENY VIEW|FUNCTION
+  platform.<x> TO ROLE r`, `REVOKE VIEW|FUNCTION platform.<x> FROM ROLE r` (`acl_grant_platform(role,
+  kind, object[, allowed])`, `acl_revoke_platform`); a view granted by name is read whole, a function
+  granted by name is callable for any catalog and admits the management grammar (`MayAdminister`); never
+  to role `''`, never on the passthrough scope's own functions nor on `console_info`; a deny wins over a
+  bundle, not over passthrough. `REVOKE ADMIN FROM ROLE r` also removes the role's point grants.
+- **spec 095** needed no change of its own: `RolesFor` / `ValidateIdentity` ask `RolePrivileged`, which
+  now asks `AdminRights::Privileged()` - any bundle, any point grant (a deny too), a catalog's manage.
+- **The grammar** is decided on the batch's first statement past whitespace and comments
+  (`StartsWithMgmt` over `SplitBatchText`, which respects quotes, comments, `$tag$` and parentheses), and
+  `ParseMgmtBatch` parses statement by statement on the same split - so a comment in front of a
+  management statement is now allowed. The mixed-batch refusal applies to `ACL ADMIN` too (it used to be
+  `unknown management statement`). `USE platform` is refused before the session check, so under any
+  prefix.
+- **The function driver**: a `role_catalogs` row naming `platform` refuses every statement of a principal
+  holding that role, on every read (nothing of it cached) - fail closed, with the reason.
+- **Flight**: a management statement (the grammar bare or marked, a secrets grant) and a top-level
+  platform call are commands, run at GetFlightInfo (spec 111), so a client that never fetches keeps the
+  change. That exposed a bug: a statement executed at GetFlightInfo whose result has rows (a management
+  call, a USE) was opened as a stream at DoGet - refused by duckdb ("a query result that is being
+  retained"); a retained result is now read from its handle.
+- **Listings**: `platform` appears for a principal holding anything on it - one schema `main`, its views
+  as VIEW with their comments and typed columns, its functions in `duckdb_functions()` and
+  `acl_function_columns()` - and never on the quack door (`PolicyStore::SessionDoorOf`). The view comment
+  fix and the stored catalog / schema comments in `duckdb_databases` / `duckdb_schemas` (NULL for an empty
+  one) are §7.
+- **Not here** (as the spec says): the metadata row limit, the timeout and batching of design/079 §3.2в
+  (spec 119), `view_as` / effective rights / ddl (120), `operate` / `cluster` and the node operations
+  (118).
+- **Gate**: the whole sqllogictest suite, `make test-cpp`, `make schema-check` (20 -> 21), `make
+  test-integration`, the Flight e2e (`run`, `adbc`, `stream`, `drain`, `tls`, `auth`, the new `admin`),
+  `make test-e2e` (postgres, ducklake, pair; mssql skipped - not built), clang-format 11, the fold and
+  thread_local lints, `make tidy` over the changed files (no finding in a changed line).
 
 ## Follow-ups
 

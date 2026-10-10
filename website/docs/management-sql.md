@@ -14,8 +14,8 @@ A statement is administered from behind one of the `ACL` prefixes:
 | --------------------------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ACL ADMIN <management statement>` (or, marker explicit, `ACL ADMIN ACL …`) | the gateway, anonymously | in the in-memory dev store: always allowed; once a policy source is enabled (`acl_use_db` / `acl_use_functions`): `SET GLOBAL acl_allow_anonymous_admin = true` |
 | `ACL ADMIN <plain sql>` / `ACL ADMIN ACL NATIVE <sql>` | the gateway                | native SQL outside the virtual catalog, not rewritten; as above                                                                                                     |
-| `ACL ROLE "r" ACL <management statement>`           | a principal                | a `manage` or `passthrough` administration scope (see *Batches and authorization*)                                                                                  |
-| `ACL TOKEN '<jwt>' ACL <management statement>`      | a principal                | the same; `ACL SESSION '<handle>' ACL …` is the door's equivalent                                                                                                   |
+| `ACL ROLE "r" [ACL] <management statement>`         | a principal                | a bundle that administers (`policy`, `passthrough`), a catalog's `manage`, or a point grant on the function (see *Batches and authorization*) - the `ACL` marker is optional (spec 117) |
+| `ACL TOKEN '<jwt>' [ACL] <management statement>`    | a principal                | the same; `ACL SESSION '<handle>' …` is the door's equivalent                                                                                                       |
 | `ACL ROLE "r" ACL NATIVE <sql>`                     | a principal                | `passthrough` only                                                                                                                                                  |
 
 `ACL ADMIN` is the native context: a statement after it that is not a management form (`CREATE
@@ -29,6 +29,14 @@ is an error, never a fallthrough into native SQL.
 The `acl_*` functions themselves can only be called in the native context (`ACL ADMIN SELECT
 acl_…(…)`, `ACL … ACL NATIVE SELECT acl_…(…)`, or a plain connection). A principal's own query may
 not name any of them.
+
+**Under a principal prefix the marker is optional** (spec 117): `ACL ROLE "r" GRANT CATALOG sales TO
+ROLE analyst WITH (select)` is the management statement, recognized by the same leading phrases;
+everything else stays an ordinary query rewritten in the virtual catalog (`CREATE TABLE`, `DROP TABLE`,
+duckdb's `COMMENT ON TABLE`, `ANALYZE t`, `CREATE FUNCTION` are answered as before). A principal reaches
+every management operation also as a function of the system catalog, `SELECT platform.<op>(…)` at the
+top level of a statement, judged by the same authorizer, and reads the policy and the node through
+`platform`'s views - see [the platform catalog](platform-catalog.md).
 
 Writing policy needs a catalog policy source enabled with `acl_use_db`. The function driver
 (`acl_use_functions`) is read-only and refuses every write; without any source the store is
@@ -868,25 +876,41 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
 ## Administration scopes
 
 ```
-GRANT ADMIN observe | manage | passthrough TO ROLE <role>
-REVOKE ADMIN FROM ROLE <role>
+GRANT ADMIN observe | policy | manage | passthrough TO ROLE <role>
+REVOKE ADMIN [observe | policy | manage | passthrough] FROM ROLE <role>
+GRANT | DENY VIEW platform.<view> TO ROLE <role>
+GRANT | DENY FUNCTION platform.<function> TO ROLE <role>
+REVOKE VIEW | FUNCTION platform.<object> FROM ROLE <role>
 ```
 
-The global scopes - a role holds one; granting another **replaces** it, so `GRANT ADMIN observe` on a
-role that holds `manage` takes the `manage` away (grant the reading scope to a role of its own).
-`observe` (spec 097) reads the node's load report and `/metrics` and administers nothing; `manage`
-and `passthrough` imply it. `manage` is the management grammar over every catalog plus the statements that
-belong to no catalog (roles, issuers, mappings, catalogs themselves, grants). `passthrough` is
-anything, including `ACL NATIVE` SQL outside the virtual catalog. Granting or revoking a scope needs
-`passthrough` - a `manage` scope never hands out scopes, and no scope is self-granted. Managing one
-catalog is not granted here but with `GRANT CATALOG … CAPS '{"manage": true}'`.
+The global scopes are **bundles** of the [platform catalog](platform-catalog.md) (spec 117), held as a
+set - a role holds several, a grant adds one and keeps the others. `observe` (spec 097) reads the node
+views, the load report and `/metrics` and administers nothing; `policy` is the management grammar over
+every catalog plus the statements that belong to no catalog (roles, issuers, mappings, categories,
+resource groups, catalogs themselves, grants) and the policy views; `manage` is spec 009's name for
+`policy` + `observe`; `passthrough` is anything, including `ACL NATIVE` SQL outside the virtual catalog,
+the bundles and the grants on `platform`. `REVOKE ADMIN <bundle>` takes one bundle; `REVOKE ADMIN FROM
+ROLE r` takes every one, the `manage` capability of the role's catalog grants and its point grants on
+`platform`. Managing one catalog is not granted here but with `GRANT CATALOG … CAPS '{"manage": true}'`.
+
+A **point grant** gives one view (read whole) or one function (callable for any catalog) of `platform`;
+`DENY` writes a deny, which wins over every bundle but `passthrough`; `REVOKE` takes the grant or the
+deny. Never to `ALL ROLES`, never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`,
+the `cluster_*` functions or `console_info`.
+
+Granting or revoking a bundle or a point grant needs `passthrough` - `policy` never hands them out, and
+no scope is self-granted.
 
 ```sql
-ACL ROLE "platform" ACL GRANT ADMIN manage TO ROLE auditor;
+ACL ROLE "platform_admin" GRANT ADMIN policy TO ROLE auditor;
+ACL ROLE "platform_admin" GRANT VIEW platform.sessions TO ROLE support;
+ACL ADMIN REVOKE ADMIN observe FROM ROLE auditor;
 ACL ADMIN REVOKE ADMIN FROM ROLE sales_owner;
 ```
 
-Functions: `acl_grant_admin(role, scope)`, `acl_revoke_admin(role)`.
+Functions: `acl_grant_admin(role, scope)`, `acl_revoke_admin(role[, scope])`,
+`acl_grant_platform(role, 'view' | 'function', object[, allowed])`, `acl_revoke_platform(role, kind,
+object)`.
 
 ## Profiling a session
 
@@ -1097,9 +1121,11 @@ takes those of its expanded records too.
 ## Batches and authorization
 
 - **One prefix per batch.** The prefix names one principal (or the anonymous gateway) and one mode
-  for every statement after it; a second `ACL …` inside the text is not a prefix. Under `ACL ADMIN`
-  the first statement decides whether the batch is management or native SQL: `ACL ADMIN CREATE ROLE
-  r; SELECT 1;` is refused for mixing.
+  for every statement after it; a second `ACL …` inside the text is not a prefix.
+- **A batch is all management or all queries** (spec 117): `CREATE ROLE r; SELECT 1;` and `SELECT 1;
+  CREATE ROLE r;` are refused for mixing, under a principal prefix and under `ACL ADMIN` alike, and so is
+  a batch of `platform.<op>(…)` calls beside a query (`a batch mixing management statements and queries
+  is refused`).
 - **Parsed and authorized statement by statement, before anything runs.** A management batch compiles
   to one function call per statement; each call is checked against the principal's rights at parse
   time, and a refusal anywhere executes nothing. Execution itself is not atomic: a batch that passes
@@ -1110,11 +1136,12 @@ takes those of its expanded records too.
   | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
   | anonymous `ACL ADMIN` (where allowed)                               | everything, native SQL included                                                                                                                                 |
   | `passthrough` (`GRANT ADMIN passthrough`)                           | everything, native SQL included                                                                                                                                 |
-  | global `manage` (`GRANT ADMIN manage`)                              | every management statement except `GRANT ADMIN` / `REVOKE ADMIN`; no `ACL NATIVE`                                                                               |
-  | `observe` (`GRANT ADMIN observe`)                                   | no management statement and no `ACL NATIVE` - it reads the load report and `/metrics` (spec 097)                                                               |
+  | `policy` (`GRANT ADMIN policy`; spec 009's global `manage` = `policy` + `observe`) | every management statement except `GRANT ADMIN` / `REVOKE ADMIN`, the grants on `platform` and `CLUSTER …`; no `ACL NATIVE`                    |
+  | `observe` (`GRANT ADMIN observe`)                                   | no management statement and no `ACL NATIVE` - it reads the node views, the load report and `/metrics` (spec 097)                                               |
+  | a point grant on `platform.<f>` (`GRANT FUNCTION platform.f`)      | that one operation (the grammar form and the call alike), for any catalog                                                                                      |
   | catalog-scoped `manage` (`GRANT CATALOG c … CAPS '{"manage": true}'`) | statements whose target names one of its catalogs; **not** `GRANT`/`REVOKE CATALOG`, `GRANT`/`REVOKE SCHEMA`, `GRANT TABLE`/`VIEW`/`OBJECT`, `ALTER GRANT`, `DROP VIRTUAL CATALOG` (handing out or taking away access is privilege administration), and not the statements that belong to no catalog (roles, issuers, mappings, `CREATE VIRTUAL CATALOG`) |
 
-  Catalog names are compared exactly, case included. A `manage` scope can create anything the
+  Catalog names compare as names do (case-insensitively, spec 116). A `manage` scope can create anything the
   duckdb instance can reach under its catalogs, so it belongs to trusted operators.
 - **Anonymous administration** is the gateway's escape hatch: always on in the in-memory dev store,
   and off by default once a policy source is enabled (`SET GLOBAL acl_allow_anonymous_admin = true`
