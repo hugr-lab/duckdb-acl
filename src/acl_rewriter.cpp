@@ -908,6 +908,18 @@ private:
 	//! `acl_session_use(<ops id>, ...)` - at execution, never at parse - by the session's non-secret id.
 	void RewriteUse(SetStatement &stmt) {
 		auto use_schema_form = StringUtil::CIEquals(stmt.name.GetIdentifierName(), "acl_use_schema");
+		if (!use_schema_form && stmt.set_type == SetType::SET) {
+			auto &written = stmt.Cast<SetVariableStatement>();
+			if (written.value && written.value->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+				auto parts =
+				    SplitIdentifierPath(written.value->Cast<ConstantExpression>().GetLiteral().ToValue().ToString());
+				if (!parts.empty() && IsPlatformCatalog(parts[0])) {
+					// spec 117: a session's default catalog is a data catalog - platform is named, never USEd
+					Deny(Reason::SETTING_DENIED, "USE: platform is the system catalog of administration, not a "
+					                             "session's default catalog - name its objects as platform.<view>");
+				}
+			}
+		}
 		if (!principal.session_connection || session_id.empty()) {
 			Deny(Reason::SETTING_DENIED, "USE needs a session of the client's own (a door's ACL SESSION): a "
 			                             "per-statement prefix runs on a connection the gateway shares, where "
@@ -935,11 +947,6 @@ private:
 			}
 			catalog = NamePath::QuotePart(parts[0]);
 			schema = parts.size() == 2 ? NamePath::QuotePart(parts[1]) : string();
-		}
-		if (IsPlatformCatalog(catalog)) {
-			// spec 117: a session's default catalog is a data catalog - `platform` is named, never USEd
-			Deny(Reason::SETTING_DENIED, "USE: platform is the system catalog of administration, not a session's "
-			                             "default catalog - name its objects as platform.<view>");
 		}
 		if (catalog.empty() || !HoldsCatalog(catalog)) {
 			HoldsCatalog(string());

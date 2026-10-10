@@ -384,6 +384,43 @@ int main(int argc, char *argv[]) {
 		Exec(con, "ACL ADMIN DROP ROLE made_over_session");
 		Exec(con, "SELECT acl_session_close('" + handle + "')");
 	});
+	Scenario("spec 117: the platform catalog and the bare grammar over a session", [&]() {
+		// a door's client writes management as in any DBMS - no `ACL` marker - and reads the platform
+		// catalog; the session is the client's own, so USE is its to choose - but never platform
+		auto handle = OpenSession(con, TOKEN);
+		if (!Check(!handle.empty(), "a session opens for the platform check")) {
+			return;
+		}
+		auto prefix = "ACL SESSION '" + handle + "' ";
+		auto refused_with = [&](const string &sql, const string &needle, const string &what) {
+			auto result = con.Query(prefix + sql);
+			Check(result->HasError() && result->GetError().find(needle) != std::string::npos,
+			      what + ": " + (result->HasError() ? result->GetError() : "it passed"));
+		};
+		refused_with("CREATE ROLE bare_over_session", "no ACL administration scope",
+		             "without a bundle the bare form is refused like the marked one");
+		refused_with("SELECT * FROM platform.roles", "no access to object \"platform.roles\"",
+		             "...and the platform catalog does not exist for it");
+		Exec(con, "SELECT acl_grant_admin('analyst', 'policy')");
+		auto bare = con.Query(prefix + "CREATE ROLE bare_over_session");
+		CheckOk(*bare, "the policy bundle administers over a session without the ACL marker");
+		auto call = con.Query(prefix + "SELECT platform.create_role('called_over_session')");
+		CheckOk(*call, "...and through a top-level platform call");
+		auto listed = con.Query(prefix + "SELECT count(*)::BIGINT FROM platform.roles WHERE role IN "
+		                                 "('bare_over_session', 'called_over_session')");
+		Check(!listed->HasError() && listed->Collection().GetValue(0, 0).GetValue<int64_t>() == 2,
+		      "...and reads both back from platform.roles");
+		refused_with("CREATE ROLE mixed_over_session; SELECT 1", "a batch mixing management statements and queries",
+		             "a mixed batch is refused over a session too");
+		refused_with("USE platform", "platform is the system catalog of administration",
+		             "USE platform is refused - a session's default catalog is a data catalog");
+		auto use = con.Query(prefix + "USE c");
+		CheckOk(*use, "...while USE of a data catalog it holds works");
+		Exec(con, "SELECT acl_revoke_admin('analyst')");
+		Exec(con, "ACL ADMIN DROP ROLE bare_over_session");
+		Exec(con, "ACL ADMIN DROP ROLE called_over_session");
+		Exec(con, "SELECT acl_session_close('" + handle + "')");
+	});
 	Exec(con, "SELECT acl_define_token('opstok','analyst','tenant=acme')");
 	Scenario("ops-surface-lists-and-kills", [&]() { OpsSurfaceListsAndKills(con); });
 	Scenario("session-end-reason", [&]() { SessionEndReason(con); });

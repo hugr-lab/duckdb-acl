@@ -1,0 +1,198 @@
+# name: test/sql/platform_reserved.test
+# description: `platform` is the reserved name of the system catalog (spec 117 §1) - refused by
+#   CREATE VIRTUAL CATALOG (any spelling), by every catalog-naming management call (the grammar, a
+#   platform call, the acl_* function), by a function-driver source that answers it, by a category or a
+#   function grant naming it; `USE platform` is refused. The v21 step's refusal is
+#   test/sql/platform_rights.test.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE root MAIN;
+
+# --- CREATE VIRTUAL CATALOG, any spelling, any form ------------------------------------------------------
+
+foreach name platform Platform PLATFORM "platform" "PlatForm"
+
+statement error
+ACL ADMIN CREATE VIRTUAL CATALOG {name};
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+ACL ROLE "root" CREATE VIRTUAL CATALOG {name};
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+endloop
+
+statement error
+ACL ROLE "root" SELECT platform.create_catalog('Platform');
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+SELECT acl_create_catalog('platform');
+----
+<REGEX>:.*"platform" is the reserved system catalog of administration, not a virtual catalog.*
+
+query I
+SELECT count(*) FROM store.acl.catalogs WHERE translate(vcat, 'PLATFORM', 'platform') = 'platform';
+----
+0
+
+# --- every catalog-naming management call --------------------------------------------------------------
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE platform.orders AS phys.main.orders;
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+ACL ADMIN ADD TABLE phys.main.orders AS platform.orders;
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL VIEW platform.v AS SELECT 1;
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCHEMA platform.raw AS phys.main;
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+ACL ADMIN GRANT CATALOG platform TO ROLE root;
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+ACL ADMIN GRANT TABLE platform.roles TO ROLE root;
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+ACL ADMIN REVOKE CATALOG platform FROM ROLE root;
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+ACL ADMIN ALTER VIRTUAL CATALOG platform SET COMMENT 'x';
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+ACL ADMIN COMMENT ON VIRTUAL TABLE platform.roles IS 'x';
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+ACL ADMIN DROP VIRTUAL CATALOG platform;
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+ACL ADMIN CHECK VIRTUAL CATALOG platform;
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+SELECT * FROM acl_check_catalog('platform');
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+SELECT acl_grant_catalog('root', 'platform', '{"select": true}');
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+statement error
+SELECT acl_add_relation('platform', 'orders', 'phys.main.orders', '', '');
+----
+<REGEX>:.*is the reserved system catalog of administration.*
+
+# a category or a function grant never holds platform's functions
+statement error
+ACL ADMIN GRANT FUNCTION platform.main.create_role TABLE TO ALL ROLES;
+----
+<REGEX>:.*
+
+statement error
+ACL ADMIN ALTER FUNCTION CATEGORY basic ADD (platform.main.create_role);
+----
+<REGEX>:.*names the platform catalog.*
+
+# --- USE platform: a session's default catalog is a data catalog ----------------------------------------
+
+statement error
+ACL ROLE "root" USE platform;
+----
+<REGEX>:.*USE: platform is the system catalog of administration, not a session's default catalog.*
+
+statement error
+ACL ROLE "root" USE platform.main;
+----
+<REGEX>:.*USE: platform is the system catalog of administration.*
+
+# --- a function-driver source that answers the name is refused ----------------------------------------
+
+statement ok
+SET GLOBAL acl_version_check_interval=0;
+
+statement ok
+CREATE MACRO pol_version() AS TABLE SELECT 1::BIGINT AS version;
+
+statement ok
+CREATE MACRO pol_role_catalogs(rs) AS TABLE SELECT * FROM (VALUES ('fd', 'platform', true, '{"select": true, "manage": true}')) t(role, vcat, is_main, caps) WHERE list_contains(rs, role);
+
+statement ok
+CREATE MACRO pol_relations(cats, names) AS TABLE SELECT * FROM (VALUES ('platform', 'roles', 'alias', 'phys.main.orders', NULL, NULL)) t(vcat, vname, form, phys, view_sql, rls) WHERE list_contains(cats, vcat) AND list_contains(names, vname);
+
+statement ok
+CREATE MACRO pol_columns(cats, names) AS TABLE SELECT * FROM (VALUES ('platform', 'roles', 0, 'id', NULL)) t(vcat, vname, pos, name, expr) WHERE false;
+
+statement ok
+CREATE MACRO pol_aliases(cats) AS TABLE SELECT * FROM (VALUES ('platform', 'raw', 'phys.main')) t(vcat, alias_path, phys_path) WHERE false;
+
+statement ok
+CREATE MACRO pol_functions(cats, names) AS TABLE SELECT * FROM (VALUES ('platform', 'f', 'table', 'macro', NULL, 'SELECT 1')) t(vcat, vname, kind, form, target, template) WHERE false;
+
+statement ok
+SELECT acl_use_functions('{"policy_version": "pol_version", "role_catalogs": "pol_role_catalogs", "relations": "pol_relations", "relation_columns": "pol_columns", "schema_aliases": "pol_aliases", "functions": "pol_functions"}');
+
+statement error
+ACL ROLE "fd" SELECT * FROM platform.roles;
+----
+<REGEX>:.*answers a catalog named "platform" - the reserved system catalog of administration.*
+
+statement error
+ACL ROLE "fd" SELECT * FROM roles;
+----
+<REGEX>:.*answers a catalog named "platform" - the reserved system catalog of administration.*

@@ -1576,6 +1576,10 @@ bool CompilePlatformCall(SQLStatement &statement, unique_ptr<SQLStatement> &comp
 		return false; // CALL of a read function: the rewriter answers it like `SELECT * FROM platform.f(…)`
 	}
 	compiled = CompiledStatement(*function, *call);
+	// the user's parameters ride on: the compiled call carries exactly the ones written (the golden rule)
+	compiled->named_param_map = statement.named_param_map;
+	compiled->has_anonymous_parameters = statement.has_anonymous_parameters;
+	compiled->stmt_location = statement.stmt_location;
 	return true;
 }
 

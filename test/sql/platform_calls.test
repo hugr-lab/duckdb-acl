@@ -1,0 +1,551 @@
+# name: test/sql/platform_calls.test
+# description: the platform catalog's management functions (spec 117) - every one at the top level
+#   (`SELECT platform.f(…)` / `CALL platform.f(…)`, named and positional arguments, typed ones
+#   converted), refused anywhere else (in FROM, a subquery, per row of another selection, in a WHERE, a
+#   CTE, a batch beside a query); one admin audit event per call; the grammar and the call give the
+#   same result and the same refusal. A parameter where authorization is carried is refused, elsewhere
+#   it binds: test/cpp/test_acl_params_passthrough.cpp (sqllogictest has no parameter binding).
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 10), (2, 'globex', 20);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE cat;
+
+statement ok
+ACL ADMIN CREATE ROLE obs;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN observe TO ROLE obs;
+
+# --- every function at the top level, under the policy bundle --------------------------------------------
+
+query T
+ACL ROLE "pol" SELECT platform.create_catalog('sales', comment := 'the sales mart');
+----
+true
+
+query TT
+SELECT vcat, comment FROM store.acl.catalogs;
+----
+sales	the sales mart
+
+query T
+ACL ROLE "pol" SELECT platform.main.alter_catalog(catalog := 'sales', comment := 'renamed');
+----
+true
+
+query T
+ACL ROLE "pol" CALL platform.add_relation('sales', 'orders', 'phys.main.orders', columns := ['id', 'tenant', 'amount']);
+----
+true
+
+query TT
+SELECT vname, phys FROM store.acl.relations WHERE vcat = 'sales';
+----
+orders	phys.main.orders
+
+statement ok
+ACL ROLE "pol" SELECT platform.add_view('sales', 'big', 'SELECT 1 AS x', comment := 'a view');
+
+statement ok
+ACL ROLE "pol" SELECT platform.add_schema_alias('sales', 'raw', 'phys.main');
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_schema_alias('sales', 'raw', 'phys.main');
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_schema_alias('sales', 'raw');
+
+statement ok
+ACL ROLE "pol" SELECT platform.expand_schema('sales', 'lake', 'phys.main');
+
+query I
+ACL ROLE "pol" SELECT platform.refresh_schema_objects('sales', 'lake', prune := true);
+----
+0
+
+statement ok
+ACL ROLE "pol" SELECT platform.add_table_function('sales', 'report', 'SELECT id FROM phys.main.orders WHERE amount >= acl_arg(1)', params := 'threshold INTEGER');
+
+statement ok
+ACL ROLE "pol" SELECT platform.add_table_function_alias('sales', 'seq', 'range', params := 'n BIGINT', returns := 'range BIGINT', comment := 'a sequence');
+
+statement ok
+ACL ROLE "pol" SELECT platform.add_scalar('sales', 'twice', 'acl_arg(1) * 2', params := 'x INTEGER');
+
+statement ok
+ACL ROLE "pol" SELECT platform.add_scalar_alias('sales', 'up', 'upper', params := 'x VARCHAR', returns := 'VARCHAR', comment := 'upper');
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_function('sales', 'twice', 'scalar', 'macro', 'acl_arg(1) * 3');
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_function('sales', 'up', 'scalar');
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_relation('sales', 'orders', 'rls', 'amount > 0');
+
+statement ok
+ACL ROLE "pol" SELECT platform.comment('sales', 'orders', 'relation', '', 'the orders');
+
+statement ok
+ACL ROLE "pol" SELECT platform.comment('sales', 'orders', column_name := 'amount', comment := 'in cents');
+
+query T
+SELECT comment FROM store.acl.object_columns WHERE vcat = 'sales' AND vname = 'orders' AND name = 'amount';
+----
+in cents
+
+statement ok
+ACL ROLE "pol" SELECT platform.refresh_schema('sales');
+
+statement ok
+ACL ROLE "pol" SELECT platform.set_key('sales', 'orders', 'relation', 'id');
+
+statement ok
+ACL ROLE "pol" SELECT platform.add_reference('sales', 'self', 'orders', 'orders', pairs := 'id = id');
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_reference('sales', 'self');
+
+statement ok
+ACL ROLE "pol" SELECT platform.rematerialize_schema_caps('sales');
+
+query I
+ACL ROLE "pol" SELECT platform.repair_relation('sales', 'orders', 'drop_missing');
+----
+0
+
+statement ok
+ACL ROLE "pol" SELECT platform.create_role('analyst', claims := 'tenant=acme');
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_role('analyst', 'tenant=acme,unit=eu');
+
+query TT
+SELECT claim, value FROM store.acl.role_claims WHERE "role" = 'analyst' ORDER BY ALL;
+----
+tenant	acme
+unit	eu
+
+# a typed argument: a capability list is the caps the grant stores, a BOOLEAN its flag
+statement ok
+ACL ROLE "pol" SELECT platform.grant_catalog('analyst', 'sales', caps := ['select', 'insert'], main := true);
+
+query TT
+SELECT caps, is_main FROM store.acl.role_catalogs WHERE "role" = 'analyst';
+----
+{"select": true, "insert": true}	true
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM orders;
+----
+2
+
+statement ok
+ACL ROLE "pol" SELECT platform.grant_object('analyst', 'sales', 'orders', caps := ['select'], columns := ['id', 'tenant']);
+
+query T
+SELECT columns FROM store.acl.role_object_caps WHERE "role" = 'analyst';
+----
+id, tenant
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_grant('analyst', 'sales', 'main', 'true');
+
+statement ok
+ACL ROLE "pol" SELECT platform.grant_schema('analyst', 'sales', 'lake', caps := '{"select": true}');
+
+statement ok
+ACL ROLE "pol" SELECT platform.revoke_schema('analyst', 'sales', 'lake');
+
+statement ok
+ACL ROLE "pol" SELECT platform.create_catalog('scratch');
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_catalog('scratch', cascade := true);
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_relation('sales', 'big');
+
+statement ok
+ACL ROLE "pol" SELECT platform.define_issuer('kc', '{"url": "test/idp/two"}');
+
+statement ok
+ACL ROLE "pol" SELECT platform.define_client('door', 'kc', '{"audiences": ["api://acl-test"], "roles_from": ["roles"]}');
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_client('door', '{"azp": ["acl-door"]}');
+
+statement ok
+ACL ROLE "pol" SELECT platform.map_role('client', 'door', 'claim-value', 'fin', 'analyst');
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_role_mapping('client', 'door', 'claim-value', 'fin', 'analyst');
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_client('door');
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_issuer('kc', '{"url": "test/idp/two"}');
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_issuer('kc');
+
+statement ok
+ACL ROLE "pol" SELECT platform.create_function_category('mine', comment := 'my functions');
+
+statement ok
+ACL ROLE "pol" SELECT platform.function_category_add('mine', ['lower', 'upper']);
+
+statement ok
+ACL ROLE "pol" SELECT platform.function_category_remove('mine', 'upper');
+
+query T
+SELECT list(name ORDER BY name) FROM store.acl.function_category_members WHERE category = 'mine';
+----
+[lower]
+
+statement ok
+ACL ROLE "pol" SELECT platform.grant_function_category('analyst', 'mine');
+
+statement ok
+ACL ROLE "pol" SELECT platform.revoke_function_category('analyst', 'mine');
+
+statement ok
+ACL ROLE "pol" SELECT platform.grant_function('analyst', 'upper', allowed := false);
+
+query T
+SELECT allowed FROM store.acl.function_grants WHERE "role" = 'analyst' AND name = 'upper';
+----
+false
+
+statement ok
+ACL ROLE "pol" SELECT platform.revoke_function('analyst', 'upper');
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_function_category('mine');
+
+statement ok
+ACL ROLE "pol" SELECT platform.create_resource_group('small', '{"max_sessions": "4"}', comment := 'a few');
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_resource_group('small', 'default', 'true');
+
+statement ok
+ACL ROLE "pol" SELECT platform.grant_resource_group('analyst', 'small');
+
+statement ok
+ACL ROLE "pol" SELECT platform.revoke_resource_group('analyst', 'small');
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_resource_group('small');
+
+statement ok
+ACL ROLE "pol" SELECT platform.revoke_catalog('analyst', 'sales');
+
+statement ok
+ACL ROLE "pol" SELECT platform.drop_role('analyst');
+
+query T
+SELECT count(*) FROM store.acl.roles WHERE "role" = 'analyst';
+----
+0
+
+# read: a table function in FROM, judged by the same authorizer
+query I
+ACL ROLE "pol" SELECT count(*) FROM platform.check_catalog('sales');
+----
+0
+
+query IIIIIII
+ACL ROLE "pol" CALL platform.check_catalog('sales');
+----
+
+# the passthrough scope's own: the admin grants, the grants on platform, the cluster profile
+statement ok
+ACL ROLE "root" SELECT platform.grant_admin('obs', 'policy');
+
+statement ok
+ACL ROLE "root" SELECT platform.revoke_admin('obs', 'policy');
+
+statement ok
+ACL ROLE "root" SELECT platform.grant_platform('obs', 'view', 'catalogs');
+
+statement ok
+ACL ROLE "root" SELECT platform.revoke_platform('obs', 'view', 'catalogs');
+
+statement ok
+ACL ROLE "root" SELECT platform.cluster_setting('set', '', 'threads', '2');
+
+query TT
+SELECT kind, name FROM store.acl.cluster_items;
+----
+setting	threads
+
+statement ok
+ACL ROLE "root" SELECT platform.cluster_setting('reset', '', 'threads', '');
+
+statement ok
+ACL ROLE "root" SELECT platform.session_profile(session := 'nope', level := '');
+
+# --- anywhere but the top level, refused at rewrite --------------------------------------------------------
+
+statement error
+ACL ROLE "pol" SELECT * FROM platform.create_role('x');
+----
+<REGEX>:.*platform.create_role is a management function - call it at the top level of a statement.*
+
+statement error
+ACL ROLE "pol" SELECT (SELECT platform.create_role('x'));
+----
+<REGEX>:.*platform.create_role is a management function - call it at the top level.*
+
+statement error
+ACL ROLE "pol" SELECT platform.create_role(name) FROM (VALUES ('a'), ('b')) t(name);
+----
+<REGEX>:.*platform.create_role is a management function - call it at the top level.*
+
+statement error
+ACL ROLE "pol" SELECT 1 WHERE platform.create_role('x');
+----
+<REGEX>:.*platform.create_role is a management function - call it at the top level.*
+
+statement error
+ACL ROLE "pol" WITH t AS (SELECT 1) SELECT platform.create_role('x');
+----
+<REGEX>:.*platform.create_role is a management function - call it at the top level.*
+
+statement error
+ACL ROLE "pol" SELECT platform.create_role('x'), 1;
+----
+<REGEX>:.*platform.create_role is a management function - call it at the top level.*
+
+statement error
+ACL ROLE "pol" SELECT platform.create_role('x') ORDER BY 1;
+----
+<REGEX>:.*platform.create_role is a management function - call it at the top level.*
+
+statement error
+ACL ROLE "pol" SELECT platform.create_role('x') UNION ALL SELECT true;
+----
+<REGEX>:.*platform.create_role is a management function - call it at the top level.*
+
+statement error
+ACL ROLE "pol" INSERT INTO platform.roles VALUES ('x', NULL);
+----
+<REGEX>:.*
+
+statement error
+ACL ROLE "pol" SELECT platform.create_role('x'); SELECT 1;
+----
+<REGEX>:.*a batch mixing management statements and queries is refused.*
+
+query T
+SELECT count(*) FROM store.acl.roles WHERE "role" IN ('x', 'a', 'b');
+----
+0
+
+# an argument is a constant (or a parameter): a column, a call, a subquery is not
+statement error
+ACL ROLE "pol" SELECT platform.create_role(upper('x'));
+----
+<REGEX>:.*platform.create_role: "role" takes a constant - a management call reads no data.*
+
+statement error
+ACL ROLE "pol" SELECT platform.create_role('x', nope := 'y');
+----
+<REGEX>:.*platform.create_role takes no argument "nope" \(it takes: role, claims, mode\).*
+
+statement error
+ACL ROLE "pol" SELECT platform.create_role('x', 'a', 'create', 'extra');
+----
+<REGEX>:.*platform.create_role takes at most 3 arguments.*
+
+statement error
+ACL ROLE "pol" SELECT platform.check_catalog('sales');
+----
+<REGEX>:.*platform.check_catalog is a table function - SELECT \* FROM platform.check_catalog.*
+
+statement error
+ACL ROLE "pol" SELECT platform.nothing_here();
+----
+<REGEX>:.*
+
+# --- the grammar and the call: the same result, the same refusal ----------------------------------------
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE cat CAPS '{"manage": true}';
+
+statement ok
+ACL ROLE "cat" ACL CREATE VIRTUAL TABLE sales.g AS phys.main.orders;
+
+statement ok
+ACL ROLE "cat" SELECT platform.add_relation('sales', 'c', 'phys.main.orders', '', '');
+
+query T
+SELECT list(vname ORDER BY vname) FROM store.acl.relations WHERE vcat = 'sales' AND vname IN ('g', 'c');
+----
+[c, g]
+
+statement error
+ACL ROLE "cat" ACL GRANT CATALOG sales TO ROLE cat CAPS '{"select": true}';
+----
+<REGEX>:.*granting access to a catalog requires an unrestricted manage scope - managing a catalog does not include handing it out.*
+
+statement error
+ACL ROLE "cat" SELECT platform.grant_catalog('cat', 'sales', '{"select": true}');
+----
+<REGEX>:.*granting access to a catalog requires an unrestricted manage scope - managing a catalog does not include handing it out.*
+
+statement error
+ACL ROLE "cat" ACL CREATE ROLE intruder;
+----
+<REGEX>:.*this statement is not catalog-specific and needs an unrestricted manage scope.*
+
+statement error
+ACL ROLE "cat" SELECT platform.create_role('intruder');
+----
+<REGEX>:.*this statement is not catalog-specific and needs an unrestricted manage scope.*
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG other;
+
+statement error
+ACL ROLE "cat" ACL CREATE VIRTUAL TABLE other.t AS phys.main.orders;
+----
+<REGEX>:.*no manage scope for catalog "other".*
+
+statement error
+ACL ROLE "cat" SELECT platform.add_relation('other', 't', 'phys.main.orders', '', '');
+----
+<REGEX>:.*no manage scope for catalog "other".*
+
+statement error
+ACL ROLE "cat" SELECT * FROM platform.check_catalog('other');
+----
+<REGEX>:.*no manage scope for catalog "other".*
+
+statement error
+ACL ROLE "pol" ACL GRANT ADMIN passthrough TO ROLE pol;
+----
+<REGEX>:.*granting admin scopes requires a passthrough scope.*
+
+statement error
+ACL ROLE "pol" SELECT platform.grant_admin('pol', 'passthrough');
+----
+<REGEX>:.*granting admin scopes requires a passthrough scope.*
+
+statement error
+ACL ROLE "pol" SELECT platform.cluster_setting('set', '', 'threads', '2');
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "obs" ACL CREATE ROLE intruder;
+----
+<REGEX>:.*the principal has no ACL administration scope.*
+
+statement error
+ACL ROLE "obs" SELECT platform.create_role('intruder');
+----
+<REGEX>:.*the principal has no ACL administration scope.*
+
+# a refusal anywhere in a batch of calls runs none of them
+statement error
+ACL ROLE "cat" SELECT platform.add_relation('sales', 'batch1', 'phys.main.orders', '', ''); SELECT platform.create_role('intruder');
+----
+<REGEX>:.*not catalog-specific.*
+
+query I
+SELECT count(*) FROM store.acl.relations WHERE vname = 'batch1';
+----
+0
+
+# the reserved name, whoever calls: no call names platform as a catalog
+statement error
+ACL ROLE "root" SELECT platform.create_catalog('platform');
+----
+<REGEX>:.*"platform" is the reserved system catalog of administration.*
+
+# --- one admin audit event per call -------------------------------------------------------------------------
+
+statement ok
+SET GLOBAL acl_audit_level='decisions';
+
+statement ok
+SELECT acl_audit_flush();
+
+statement ok
+SET VARIABLE seq0 = (SELECT coalesce(max(seq), 0) FROM acl_audit_events());
+
+statement ok
+ACL ROLE "pol" SELECT platform.create_role('audited_a'); SELECT platform.create_role('audited_b');
+
+statement ok
+ACL ROLE "pol" ACL CREATE ROLE audited_c;
+
+statement error
+ACL ROLE "cat" SELECT platform.create_role('audited_d');
+----
+<REGEX>:.*not catalog-specific.*
+
+statement ok
+SELECT acl_audit_flush();
+
+query IIIIII
+SELECT kind, statement, detail, verdict, reason_code, objects FROM acl_audit_events() WHERE seq > getvariable('seq0') AND kind IN ('statement', 'admin') ORDER BY seq;
+----
+admin	manage	manage	allowed	NULL	[{'name': acl_define_role, 'capability': manage}]
+admin	manage	manage	allowed	NULL	[{'name': acl_define_role, 'capability': manage}]
+admin	manage	manage	allowed	NULL	[{'name': acl_define_role, 'capability': manage}]
+admin	manage	manage	denied	mgmt_unauthorized	[{'name': acl_define_role, 'capability': manage}]
+
+# a call is its own policy-catalog transaction: a client's ROLLBACK does not undo it
+statement ok
+ACL ROLE "pol" BEGIN;
+
+statement ok
+ACL ROLE "pol" SELECT platform.create_role('kept');
+
+statement ok
+ACL ROLE "pol" ROLLBACK;
+
+query I
+SELECT count(*) FROM store.acl.roles WHERE "role" = 'kept';
+----
+1

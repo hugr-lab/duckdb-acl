@@ -276,6 +276,17 @@ vector<CatalogBackend::GrantRow> CatalogBackend::Grants(const vector<string> &ro
 		// positional contract: (role, vcat, is_main, caps)
 		auto result = Query("SELECT * FROM " + Slot("role_catalogs") + "(" + ListLit(missing) + ")");
 		ResultRows result_rows(*result);
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			auto vcat = result_rows.GetValue(1, row).ToString();
+			if (IsPlatformCatalog(vcat)) {
+				// spec 117: the name is the system catalog's - a source that answers it is refused (on every
+				// read, nothing of it cached), never read as a virtual catalog nor as a grant on platform,
+				// which only platform_grants holds
+				throw BinderException("acl catalog: the policy source's role_catalogs answers a catalog named "
+				                      "\"%s\" - the reserved system catalog of administration; rename it there",
+				                      vcat);
+			}
+		}
 		lock_guard<mutex> guard(lock);
 		for (auto &role : missing) {
 			fn_grants_loaded.insert(role);
@@ -285,13 +296,6 @@ vector<CatalogBackend::GrantRow> CatalogBackend::Grants(const vector<string> &ro
 			GrantRow grant;
 			grant.role = result_rows.GetValue(0, row).ToString();
 			grant.vcat = result_rows.GetValue(1, row).ToString();
-			if (IsPlatformCatalog(grant.vcat)) {
-				// spec 117: the name is the system catalog's - a source that answers it is refused, never
-				// read as a virtual catalog (nor as a grant on platform, which only platform_grants holds)
-				throw BinderException("acl catalog: the policy source's role_catalogs answers a catalog named "
-				                      "\"%s\" - the reserved system catalog of administration; rename it there",
-				                      grant.vcat);
-			}
 			auto is_main = result_rows.GetValue(2, row);
 			grant.is_main = !is_main.IsNull() && is_main.GetValue<bool>();
 			auto caps = result_rows.GetValue(3, row);
