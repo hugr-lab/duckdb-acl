@@ -820,8 +820,8 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 			inner += " REPLACE (" + StringUtil::Join(replaces, ", ") + ")";
 		}
 		inner += out.ReadFrom();
-		out.query = "SELECT COLUMNS(lambda __acl_col: lower(__acl_col) IN (" + StringUtil::Join(names, ", ") +
-		            ")) FROM (" + inner + ")";
+		out.query = "SELECT COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") + " IN (" +
+		            StringUtil::Join(names, ", ") + ")) FROM (" + inner + ")";
 		for (auto &column : listed) {
 			out.visible_columns.insert(column.name);
 			if (column.tree) {
@@ -1089,8 +1089,8 @@ void CatalogBackend::ApplyFunctionGrantPolicy(const string &vname, bool table_ki
 	if (!out.rls.empty()) {
 		inner += " WHERE " + out.rls;
 	}
-	out.wrap_sql = "SELECT COLUMNS(lambda __acl_col: lower(__acl_col) IN (" + StringUtil::Join(names, ", ") +
-	               ")) FROM (" + inner + ")";
+	out.wrap_sql = "SELECT COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") + " IN (" +
+	               StringUtil::Join(names, ", ") + ")) FROM (" + inner + ")";
 }
 
 bool CatalogBackend::PrincipalMainCap(const Principal &principal, const string &capability) {

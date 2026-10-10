@@ -822,6 +822,8 @@ FunctionSpec ParseFunctionSpec(const string &spec_p, const char *fn) {
 	return out;
 }
 
+#define FOLD_SQL(column) "system.main.translate(" column ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+
 //! spec 072: a member or an admitting grant names a function this node has, unless its kind was
 //! written explicitly. Read off duckdb_functions() on a connection of its own, at write time only -
 //! the query path never looks. A typo, or a table function written without TABLE, is refused here
@@ -835,10 +837,12 @@ void RequireFunctionOnNode(ClientContext &context, const FunctionSpec &spec, con
 	// this query too (the shadowing the gate protects a principal from, spec 072 §"known residual")
 	Connection con(DatabaseInstance::GetDatabase(context));
 	auto prepared =
-	    con.Prepare("SELECT 1 FROM duckdb_functions() WHERE system.main.lower(function_name) = $1 AND "
-	                "system.main.lower(database_name) = $2 AND system.main.lower(schema_name) = $3 AND (CASE WHEN "
-	                "function_type IN ('table', 'table_macro') THEN 'table' WHEN function_type = 'pragma' THEN "
-	                "'pragma' ELSE 'scalar' END) = $4 LIMIT 1");
+	    // (spec 116: the ASCII fold the key was lowered with - SQL's lower() folds Unicode)
+	    con.Prepare("SELECT 1 FROM duckdb_functions() WHERE " FOLD_SQL("function_name") " = $1 AND " FOLD_SQL(
+	        "database_name") " = $2 AND " FOLD_SQL("schema_name") " = $3 AND (CASE WHEN "
+	                                                              "function_type IN ('table', 'table_macro') THEN "
+	                                                              "'table' WHEN function_type = 'pragma' THEN "
+	                                                              "'pragma' ELSE 'scalar' END) = $4 LIMIT 1");
 	if (prepared->HasError()) {
 		throw BinderException("%s: cannot read the node's functions: %s", fn, prepared->GetError());
 	}

@@ -130,6 +130,37 @@ int main(int argc, char *argv[]) {
 			      "KeyPrefixSql: a quoted part is a prefix whole, never the text before its dot");
 		});
 
+		Scenario("prefix, leaf and parent agree with the C++ side over letters whose Unicode folds differ", [&] {
+			// ẞ/ß, İ, the Kelvin sign, the Ohm sign, Å (and the Angstrom sign), a final sigma, the ﬀ ligature
+			std::vector<std::string> odd = {"STRA\xe1\xba\x9e\x45",
+			                                "stra\xc3\x9f\x65",
+			                                "\xc4\xb0K",
+			                                "i\xe2\x84\xaa",
+			                                "\xe2\x84\xa6",
+			                                "\xcf\x89",
+			                                "\xc3\x85",
+			                                "\xe2\x84\xab",
+			                                "\xcf\x82",
+			                                "\xce\xa3",
+			                                "\xef\xac\x80",
+			                                "ff"};
+			for (auto &a : odd) {
+				for (auto &b : odd) {
+					auto path = NamePath({a}).ToKey();
+					auto key = NamePath({b, "x.y", "t"}).ToKey();
+					auto sql = One(con, "SELECT " + duckdb::acl::KeyPrefixSql(Lit(key), Lit(path)));
+					Check(sql == (NamePath::KeyUnder(key, path) ? "true" : "false"),
+					      "KeyPrefixSql agrees with KeyUnder: " + key + " under " + path);
+				}
+				auto key = NamePath({a, "b.c", a}).ToKey();
+				std::string parent, leaf;
+				NamePath::SplitLeaf(key, parent, leaf);
+				Check(One(con, "SELECT " + duckdb::acl::KeyUnquoteSql(duckdb::acl::KeyLeafSql(Lit(key)))) == leaf &&
+				          One(con, "SELECT " + duckdb::acl::KeyParentSql(Lit(key))) == parent,
+				      "KeyLeafSql / KeyParentSql agree with SplitLeaf: " + key);
+			}
+		});
+
 		Scenario("one fold: the SQL comparison answers what C++ (and duckdb's catalog) answers", [&] {
 			std::vector<std::pair<std::string, std::string>> pairs = {
 			    {"Order Items", "order ITEMS"},

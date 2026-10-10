@@ -853,6 +853,179 @@ SELECT count(*) FROM acl_check_catalog('q cat') WHERE problem = 'grant_column_mi
 ----
 0
 
+# --- verification pass: one fold for column and field names too ---------------------------------------
+
+statement ok
+CREATE TABLE phys.main.ux(id INTEGER, "äx" INTEGER, "Äx" INTEGER);
+
+statement ok
+INSERT INTO phys.main.ux VALUES (1, 10, 20);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.ux AS phys.main.ux;
+
+statement ok
+ACL ADMIN GRANT TABLE c.ux TO ROLE m2 WITH (select) COLUMNS (id, "äx");
+
+# the hidden "Äx" is neither read nor listed: SQL's lower() made it "äx"
+query T
+ACL ROLE "m2" SELECT column_name FROM (DESCRIBE SELECT * FROM c.ux) ORDER BY ALL;
+----
+id
+äx
+
+query T
+ACL ROLE "m2" SELECT column_name FROM information_schema.columns WHERE table_catalog = 'c' AND table_name = 'ux' ORDER BY ALL;
+----
+id
+äx
+
+statement ok
+CREATE TABLE phys.main.st(id INTEGER, s STRUCT("äx" INTEGER, "Äx" INTEGER));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.st AS phys.main.st;
+
+statement ok
+ACL ADMIN GRANT TABLE c.st TO ROLE m2 WITH (select, insert) COLUMNS (id, s."äx");
+
+# a written value carrying the hidden field is refused, not folded into the visible one
+statement error
+ACL ROLE "m2" INSERT INTO c.st VALUES (1, {'äx': 1, 'Äx': 2});
+----
+<REGEX>:.*
+
+query I
+SELECT count(*) FROM phys.main.st;
+----
+0
+
+# --- verification pass: a subtree is measured in SQL, never by a C++ byte count -------------------------
+
+statement ok
+CREATE SCHEMA phys.raw;
+
+statement ok
+CREATE SCHEMA phys.eu;
+
+statement ok
+CREATE TABLE phys.eu.orders AS SELECT 1 AS id;
+
+statement ok
+ACL ADMIN CREATE ROLE g;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE g CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c."Größe" FROM phys.raw;
+
+statement ok
+ACL ADMIN GRANT SCHEMA c."Größe" TO ROLE g WITH (select);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c."Größe".eu FROM phys.eu;
+
+query TT
+SELECT schema_path, inherited FROM store.acl.role_schemas WHERE role = 'g' ORDER BY 1;
+----
+Größe	false
+Größe.eu	true
+
+query I
+ACL ROLE "g" SELECT id FROM c."Größe".eu.orders;
+----
+1
+
+statement ok
+ACL ADMIN REVOKE SCHEMA c."Größe" FROM ROLE g;
+
+query I
+SELECT count(*) FROM store.acl.role_schemas WHERE role = 'g';
+----
+0
+
+statement error
+ACL ROLE "g" SELECT id FROM c."Größe".eu.orders;
+----
+<REGEX>:.*not allowed.*
+
+# a schema whose expansion holds records goes only with CASCADE, and then with them
+statement error
+ACL ADMIN DROP VIRTUAL SCHEMA c."Größe";
+----
+<REGEX>:.*CASCADE.*
+
+statement ok
+ACL ADMIN DROP VIRTUAL SCHEMA c."Größe" CASCADE;
+
+query I
+SELECT count(*) FROM store.acl.relations WHERE vcat = 'c' AND vname LIKE 'Größe%';
+----
+0
+
+# --- verification pass: no second spelling of a held name, from the source or from a principal ---------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c."Raw Data"."Report" AS SELECT 1 AS v;
+
+# refused BEFORE the physical CREATE: nothing is left behind for a REFRESH to record
+statement error
+ACL ROLE "r" CREATE TABLE c."Raw Data".report AS SELECT 2 AS v;
+----
+<REGEX>:.*name "Raw Data.report" differs only by case from the existing "Raw Data.Report".*
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'phys' AND schema_name = 'Raw Data' AND table_name = 'report';
+----
+0
+
+# the source gains the same name in other spellings - an object, and one that collides with a schema
+statement ok
+CREATE TABLE phys."Raw Data".REPORT AS SELECT 3 AS v;
+
+statement ok
+CREATE TABLE phys."Raw Data".SUB AS SELECT 4 AS v;
+
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA c."Raw Data" REFRESH;
+
+query T
+SELECT vname FROM store.acl.relations WHERE vcat = 'c' AND (lower(vname) = 'raw data.report' OR vname = 'Raw Data.SUB') ORDER BY 1;
+----
+Raw Data.Report
+
+# every role still reads the operator's object - no `ambiguous name`
+query I
+ACL ROLE "r" SELECT v FROM c."Raw Data".REPORT;
+----
+1
+
+query T
+SELECT detail FROM acl_check_catalog('c') WHERE problem = 'case_sibling' ORDER BY 1;
+----
+the source object "REPORT" differs only by case from a name the catalog holds - it is not recorded
+the source object "SUB" differs only by case from a name the catalog holds - it is not recorded
+
+# --- verification pass: an engine function's key is folded as it is stored (ASCII) ----------------------
+
+statement ok
+CREATE MACRO "Äx"(a) AS a + 1;
+
+# the node has it: the check read it with the same fold the key was written with
+statement ok
+SELECT acl_grant_function('r', 'memory.main.Äx');
+
+query I
+ACL ROLE "r" SELECT "Äx"(1);
+----
+2
+
+query T
+ACL ROLE "r" SELECT function_name FROM duckdb_functions() WHERE function_name = 'Äx';
+----
+Äx
+
 # --- the v20 migration: refuses while one name is spelled several ways ---------------------------------
 
 statement ok

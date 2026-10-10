@@ -192,8 +192,12 @@ string CatalogBackend::StoredName(const string &vcat, const string &key, bool cr
 	if (!NamePath::TryFromKey(key, path, error)) {
 		return key;
 	}
-	// every stored name under the key's first part: the parent schemas and the object itself
-	auto first = Lit(NamePath::QuotePart(path.Head()));
+	return Spell(key, NamesUnder(vcat, NamePath::QuotePart(path.Head())), creating, "name");
+}
+
+vector<string> CatalogBackend::NamesUnder(const string &vcat, const string &first_key) {
+	// every stored name under one first part: the parent schemas and the objects themselves
+	auto first = Lit(first_key);
 	vector<std::pair<const char *, const char *>> columns = {{"relations", "vname"},
 	                                                         {"functions", "vname"},
 	                                                         {"schemas", "path"},
@@ -206,7 +210,16 @@ string CatalogBackend::StoredName(const string &vcat, const string &key, bool cr
 		                  " AND (" + KeyEqSql(name, first) + " OR " + KeyPrefixSql(name, first) + ")");
 	}
 	auto result = Query("SELECT DISTINCT n FROM (" + StringUtil::Join(sources, " UNION ALL ") + ")");
-	return Spell(key, FirstColumn(*result), creating, "name");
+	return FirstColumn(*result);
+}
+
+bool CatalogBackend::CaseSibling(const string &key, const vector<string> &names) {
+	try {
+		Spell(key, names, true, "name");
+		return false;
+	} catch (BinderException &) {
+		return true; // differs only by case from a stored name, or the policy spells a part several ways
+	}
 }
 
 string CatalogBackend::StoredReference(const string &vcat, const string &name, bool creating) {
@@ -1550,11 +1563,10 @@ void PolicyStore::CatalogRematerializeSchemaCaps(const string &vcat, const strin
 	// One idempotent operation, many callers: granting, revoking, schema DDL and drift repair all
 	// reduce to "rebuild this subtree from the nearest ancestor that states capabilities" (spec 015).
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
-		auto prefix = path.empty() ? string() : path + ".";
+		// (spec 116: a prefix in SQL is measured in SQL - a C++ byte count is no character count)
 		auto in_subtree = [&](const string &column) {
 			return path.empty() ? string("true")
-			                    : "(" + column + " = " + Lit(path) + " OR substr(" + column + ", 1, " +
-			                          std::to_string(prefix.size()) + ") = " + Lit(prefix) + ")";
+			                    : "(" + column + " = " + Lit(path) + " OR " + KeyPrefixSql(column, Lit(path)) + ")";
 		};
 		auto schemas = read("SELECT \"path\" FROM " + catalog->Tbl("schemas") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                    " AND " + in_subtree("\"path\"") + " ORDER BY length(\"path\")");
@@ -1622,8 +1634,15 @@ void PolicyStore::CatalogExpandSchema(const string &vcat, const string &path, co
 	// each of which can then be altered, dropped or granted on its own
 	CatalogAddSchemaAlias(vcat, path, "", phys_path);
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		// spec 116: a source object whose name differs only by case from one the catalog holds (a record, a
+		// schema, a grant) is not recorded - two objects for one name would make every read of it
+		// ambiguous. acl_check_catalog reports it (`case_sibling`).
+		auto stored = catalog->NamesUnder(vcat, NamePath::QuotePart(NamePath::FromKey(path).Head()));
 		for (auto &name : names) {
 			auto vname = NamePath::ChildKey(path, name);
+			if (acl_detail::CatalogBackend::CaseSibling(vname, stored)) {
+				continue;
+			}
 			auto exists = read("SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 			                   " AND \"vname\" = " + Lit(vname));
 			if (exists->RowCount() > 0) {
@@ -1660,8 +1679,12 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 	int64_t changed = 0;
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		changed = 0;
+		auto stored = catalog->NamesUnder(vcat, NamePath::QuotePart(NamePath::FromKey(path).Head()));
 		for (auto &name : names) {
 			auto vname = NamePath::ChildKey(path, name);
+			if (acl_detail::CatalogBackend::CaseSibling(vname, stored)) {
+				continue; // spec 116: never a second spelling of a held name (see CatalogExpandSchema)
+			}
 			auto known = read("SELECT 1 FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 			                  " AND \"vname\" = " + Lit(vname) + " UNION ALL SELECT 1 FROM " +
 			                  catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -1680,8 +1703,7 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 		}
 		// only records this expansion produced are pruned: what an admin registered by hand is theirs
 		auto stale = read("SELECT \"vname\" FROM " + catalog->Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
-		                  " AND \"origin\" = " + Lit(origin) + " AND substr(\"vname\", 1, " +
-		                  std::to_string(path.size() + 1) + ") = " + Lit(path + "."));
+		                  " AND \"origin\" = " + Lit(origin) + " AND " + KeyPrefixSql("\"vname\"", Lit(path)));
 		ResultRows stale_rows(*stale);
 		for (idx_t row = 0; row < stale->RowCount(); row++) {
 			auto vname = stale_rows.GetValue(0, row).ToString();
@@ -1892,10 +1914,11 @@ void ValidateGrantColumns(CatalogBackend &catalog, const string &vcat, const str
 			return;
 		}
 	}
-	auto match = catalog.Query("SELECT 1 FROM (SELECT lower(\"name\") AS n FROM " + catalog.Tbl("relation_columns") +
-	                           " WHERE \"vcat\" = " + Lit(vcat) + scope + " UNION ALL SELECT lower(\"name\") FROM " +
-	                           catalog.Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) + scope +
-	                           ") s WHERE n IN " + in_list + " LIMIT 1");
+	auto match =
+	    catalog.Query("SELECT 1 FROM (SELECT " + KeyFoldSql("\"name\"") + " AS n FROM " +
+	                  catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) + scope +
+	                  " UNION ALL SELECT " + KeyFoldSql("\"name\"") + " FROM " + catalog.Tbl("object_columns") +
+	                  " WHERE \"vcat\" = " + Lit(vcat) + scope + ") s WHERE n IN " + in_list + " LIMIT 1");
 	if (match->RowCount() == 0) {
 		throw BinderException(
 		    "acl admin: COLUMNS (%s) matches no column of %s - "
@@ -1957,7 +1980,7 @@ NamePred ExactName(const string &vname) {
 
 NamePred PrefixName(const string &path) {
 	return [path](const char *column) {
-		return "substr(\"" + string(column) + "\", 1, " + std::to_string(path.size() + 1) + ") = " + Lit(path + ".");
+		return KeyPrefixSql("\"" + string(column) + "\"", Lit(path));
 	};
 }
 
@@ -2317,8 +2340,7 @@ void PolicyStore::CatalogDropSchemaAlias(const string &vcat, const string &alias
 		}
 		// an expansion's records are relations of the catalog in their own right, so they go only with
 		// CASCADE - the rule DROP VIRTUAL CATALOG already follows for grants (spec 010)
-		auto prefix =
-		    " AND substr(\"vname\", 1, " + std::to_string(alias_path.size() + 1) + ") = " + Lit(alias_path + ".");
+		auto prefix = " AND " + KeyPrefixSql("\"vname\"", Lit(alias_path));
 		auto records = read("SELECT (SELECT count(*) FROM " + catalog->Tbl("relations") +
 		                    " WHERE \"vcat\" = " + Lit(vcat) + prefix + ") + (SELECT count(*) FROM " +
 		                    catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) + prefix + ")");

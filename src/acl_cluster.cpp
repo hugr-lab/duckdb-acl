@@ -615,7 +615,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 		    // while the group has none of that name, and a cluster edge never on a group's source.
 		    auto edges_result = read("SELECT \"scope\", \"name\", \"depends_on\" FROM " + catalog->Tbl("cluster_deps"));
 		    ResultRows edges(*edges_result);
-		    auto group_sources_result = read("SELECT \"scope\", lower(\"name\") FROM " + catalog->Tbl("cluster_items") +
+		    auto group_sources_result = read("SELECT \"scope\", \"name\" FROM " + catalog->Tbl("cluster_items") +
 		                                     " WHERE \"kind\" = 'source' AND \"scope\" <> ''");
 		    ResultRows group_sources(*group_sources_result);
 		    auto group_has = [&](const string &group, const string &name) {
@@ -699,7 +699,8 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 			    // a physical name as stored: bare (src.main.t) or quoted ("src".main.t)
 			    auto lower = StringUtil::Lower(source);
 			    auto through = [&](const char *column) {
-				    auto c = string("lower(\"") + column + "\")";
+				    // spec 116: folded as StringUtil::Lower folded `lower` - ASCII, never SQL's Unicode lower()
+				    auto c = KeyFoldSql(string("\"") + column + "\"");
 				    return "(" + c + " LIKE " + Lit(lower + ".%") + " OR " + c + " LIKE " + Lit("\"" + lower + "\".%") +
 				           " OR " + c + " = " + Lit(lower) + " OR " + c + " = " + Lit("\"" + lower + "\"") + ")";
 			    };

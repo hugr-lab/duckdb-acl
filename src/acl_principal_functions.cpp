@@ -322,7 +322,7 @@ string PolicyStore::PrincipalFunctionsSql(const Principal &principal) {
 	}
 	// a row outside the system catalog keeps its name and signature only: its database, schema, oids,
 	// definition and the operator's prose about it may all name physical objects
-	auto in_system = string("lower(database_name) = 'system'");
+	auto in_system = KeyFoldSql("database_name") + " = 'system'";
 	auto only_system = [&](const char *column, const char *otherwise = "NULL") {
 		return string("CASE WHEN ") + in_system + " THEN " + column + " ELSE " + otherwise + " END AS " + column;
 	};
@@ -335,9 +335,11 @@ string PolicyStore::PrincipalFunctionsSql(const Principal &principal) {
 	    only_system("examples", "[]::VARCHAR[]") +
 	    ", stability, categories FROM system.main.duckdb_functions() WHERE function_type <> 'pragma' AND " +
 	    (keys.empty() ? string("false")
-	                  : "(lower(database_name) || chr(31) || lower(schema_name) || chr(31) || lower(function_name) || "
-	                    "chr(31) || CASE WHEN function_type IN ('table', 'table_macro') THEN 'table' ELSE 'scalar' "
-	                    "END) IN (" +
+	                  : "(" + KeyFoldSql("database_name") + " || chr(31) || " + KeyFoldSql("schema_name") +
+	                        " || chr(31) || " + KeyFoldSql("function_name") +
+	                        " || "
+	                        "chr(31) || CASE WHEN function_type IN ('table', 'table_macro') THEN 'table' ELSE 'scalar' "
+	                        "END) IN (" +
 	                        StringUtil::Join(keys, ", ") + ")");
 	if (rows.empty()) {
 		return engine;

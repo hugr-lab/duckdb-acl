@@ -727,6 +727,7 @@ private:
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
 			Deny(Reason::DDL_HOME, "no schema of the catalog allows creating " + Shown(key));
 		}
+		RequireNoCaseSibling(target);
 		Note(key, "create");
 		RequireReplaceDroppable(info, key, target);
 		// the record check guards the TABLE path too: a view record occupies the name with nothing
@@ -937,6 +938,18 @@ private:
 		return parts;
 	}
 
+	//! spec 116: a principal's DDL names a NEW object, so a name that differs only by case from one the
+	//! catalog holds is refused HERE - before anything physical is created (the record write after the
+	//! CREATE would refuse too, too late: the physical object would stay, and a REFRESH would record it)
+	void RequireNoCaseSibling(const DdlTarget &target) {
+		try {
+			store.SpellName(target.vcat, target.vname, true);
+		} catch (BinderException &ex) {
+			ErrorData error(ex);
+			Deny(Reason::DDL_HOME, error.RawMessage());
+		}
+	}
+
 	//! spec 113: a client (dbt) makes sure its schema exists before it writes. A virtual schema the
 	//! principal holds already does: IF NOT EXISTS is a no-op, without it duckdb's own answer. Creating
 	//! a schema stays the operator's - one the principal does not hold is refused as before.
@@ -1066,6 +1079,7 @@ private:
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
 			Deny(Reason::DDL_HOME, "no schema of the catalog allows creating " + Shown(key));
 		}
+		RequireNoCaseSibling(target);
 		Note(key, "create");
 		// the same rules as a table's (spec 051): REPLACE priced as a drop on the schema that hosts
 		// the create, and an existing name never overwritten by omission
@@ -1177,6 +1191,7 @@ private:
 			Deny(Reason::DDL_HOME, "RENAME drops " + Shown(key) + " and creates \"" + new_key +
 			                           "\", so it needs create and drop on the schema that hosts both");
 		}
+		RequireNoCaseSibling(to);
 		Note(key, "drop");
 		Note(new_key, "create");
 		if (from.virtual_only) {

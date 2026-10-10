@@ -96,18 +96,22 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// scan of the same information_schema the columns surface already reads, never a probe (spec
 	// 065). The columns surface keeps the contract as written; the mark on the object says the read
 	// will fail anyway, and acl_check_catalog (which probes) has the rest.
-	string physcols = "physcols AS (SELECT table_catalog, table_schema, table_name, list(lower(column_name)) AS cols"
+	string physcols = "physcols AS (SELECT table_catalog, table_schema, table_name, list(" + KeyFoldSql("column_name") +
+	                  ") AS cols"
 	                  " FROM information_schema.columns GROUP BY 1, 2, 3)";
 	string declared = "declared AS (SELECT dc.\"vcat\" AS vcat, dc.\"vname\" AS vname,"
 	                  " list(dc.\"name\" ORDER BY dc.\"pos\") AS names,"
-	                  " list(lower(CASE WHEN dc.\"expr\" IS NULL OR dc.\"expr\" = '' THEN dc.\"name\""
+	                  " list(translate(CASE WHEN dc.\"expr\" IS NULL OR dc.\"expr\" = '' THEN dc.\"name\""
 	                  " WHEN dc.\"expr\" LIKE '\"%\"' THEN substr(dc.\"expr\", 2, length(dc.\"expr\") - 2)"
-	                  " ELSE dc.\"expr\" END) ORDER BY dc.\"pos\") AS reads FROM " +
+	                  " ELSE dc.\"expr\" END, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+	                  " ORDER BY dc.\"pos\") AS reads FROM " +
 	                  Tbl("relation_columns") +
 	                  " dc WHERE (dc.\"expr\" IS NULL OR dc.\"expr\" = ''"
 	                  " OR regexp_matches(dc.\"expr\", '^[A-Za-z_][A-Za-z0-9_]*$')"
 	                  " OR regexp_matches(dc.\"expr\", '^\"[^\"]+\"$'))"
-	                  " AND lower(coalesce(dc.\"expr\", '')) NOT IN ('null', 'true', 'false', 'current_catalog',"
+	                  " AND " +
+	                  KeyFoldSql("coalesce(dc.\"expr\", '')") +
+	                  " NOT IN ('null', 'true', 'false', 'current_catalog',"
 	                  " 'current_date', 'current_role', 'current_schema', 'current_time', 'current_timestamp',"
 	                  " 'current_user', 'localtime', 'localtimestamp', 'session_user', 'user')"
 	                  " GROUP BY 1, 2)";
@@ -410,8 +414,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// answer flows where nothing is declared, and a declared-key column reports NOT NULL
 	auto pk_implies = [&](const string &vcat_expr, const string &vname_expr, const string &column_expr) {
 		return "EXISTS (SELECT 1 FROM " + Tbl("keys") + " pk WHERE pk.\"vcat\" = " + vcat_expr +
-		       " AND pk.\"vname\" = " + vname_expr + " AND pk.\"kind\" = 'relation'" +
-		       " AND lower(pk.\"column\") = lower(" + column_expr + "))";
+		       " AND pk.\"vname\" = " + vname_expr + " AND pk.\"kind\" = 'relation'" + " AND " +
+		       KeyFoldSql("pk.\"column\"") + " = " + KeyFoldSql(column_expr) + ")";
 	};
 	string alias_vname = "CASE WHEN o.vschema = 'main' THEN o.vname ELSE o.vschema || '.' || o.vname END";
 	string alias_nullable = "CASE WHEN c.\"nullable\" IS NOT NULL THEN"
@@ -466,15 +470,15 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// the part before the first '.' or '['
 	auto stated = [](const string &column_expr) {
 		string item = "trim(CASE WHEN position('=' IN y) > 0 THEN regexp_extract(y, '^([^=]*)=', 1) ELSE y END)";
-		return "list_transform(str_split(" + column_expr + ", ','), lambda y: lower(CASE WHEN starts_with(" + item +
+		return "list_transform(str_split(" + column_expr + ", ','), lambda y: translate(CASE WHEN starts_with(" + item +
 		       ", '\"') THEN replace(regexp_extract(" + item +
 		       ", '^\"((?:[^\"]|\"\")*)\"', 1), '\"\"', '\"')"
 		       " ELSE regexp_replace(" +
-		       item + ", '[.\\[].*$', '') END))";
+		       item + ", '[.\\[].*$', '') END, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'))";
 	};
 	auto keeps = [&](const string &column_expr, const string &name_expr) {
 		return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = '' OR list_contains(" +
-		       stated(column_expr) + ", lower(" + name_expr + ")))";
+		       stated(column_expr) + ", " + KeyFoldSql(name_expr) + "))";
 	};
 	// Visible for at least one role: a principal may read what any of its roles may (spec 011). A
 	// row with no grant row at all is not an object of the catalog - it is a column of a live
@@ -525,7 +529,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    ") END, gp.type), o.strip_alias, o.enums_to_varchar) AS data_type"
 	    " FROM gprojection gp JOIN objects o ON o.vcat = gp.vcat AND " +
 	    path("o") + " = gp.vname LEFT JOIN lcols s ON s.table_catalog = gp.vcat AND " + source_path +
-	    " = gp.vname AND lower(s.column_name) = lower(gp.name)";
+	    " = gp.vname AND " + KeyFoldSql("s.column_name") + " = " + KeyFoldSql("gp.name");
 	if (surface == "columns") {
 		return prelude + named(effective_columns, table_names);
 	}
@@ -590,7 +594,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		                 " k2 WHERE k2.\"vcat\" = k.\"vcat\" AND k2.\"vname\" = k.\"vname\""
 		                 " AND k2.\"kind\" = 'relation'"
 		                 " AND NOT EXISTS (SELECT 1 FROM vcolumns vc WHERE vc.table_catalog = k.\"vcat\" AND " +
-		                 key_col_path + " = k2.\"vname\" AND lower(vc.column_name) = lower(k2.\"column\"))))";
+		                 key_col_path + " = k2.\"vname\" AND " + KeyFoldSql("vc.column_name") + " = " +
+		                 KeyFoldSql("k2.\"column\"") + ")))";
 		string tail = views ? column_count + ", NULL::VARCHAR AS sql, true AS is_bound"
 		                    : has_key + " AS has_primary_key, NULL::BIGINT AS estimated_size, " + column_count +
 		                          ", NULL::BIGINT AS index_count, NULL::BIGINT AS check_constraint_count, " + ddl +
@@ -654,7 +659,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		                 " AND k2.\"kind\" = k.\"kind\" AND NOT CASE WHEN k.\"kind\" = 'table' THEN " +
 		                 fcolumn_visible +
 		                 " ELSE EXISTS (SELECT 1 FROM vcolumns vc WHERE vc.table_catalog = k.\"vcat\" AND " +
-		                 kcolumn_path + " = k2.\"vname\" AND lower(vc.column_name) = lower(k2.\"column\")) END)",
+		                 kcolumn_path + " = k2.\"vname\" AND " + KeyFoldSql("vc.column_name") + " = " +
+		                 KeyFoldSql("k2.\"column\"") + ") END)",
 		             {{"vcat", Shown::CATALOG}}, "vcat, object, key_sequence");
 	}
 	// spec 022: a reference is visible when both of its ends are, and when every column it names is

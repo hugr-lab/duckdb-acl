@@ -460,7 +460,8 @@ inline string CompileWrite(const FieldNode &node, const string &written, const s
 		fields.push_back(quoted(child->name) + " := " + child_write(*child));
 	}
 	auto key = "__acl_k" + std::to_string(depth);
-	auto foreign = "len(list_filter(struct_keys(" + written + "), lambda " + key + ": lower(" + key + ") NOT IN (" +
+	auto foreign = "len(list_filter(struct_keys(" + written + "), lambda " + key + ": translate(" + key +
+	               ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN (" +
 	               StringUtil::Join(visible, ", ") + "))) > 0";
 	auto refuse = "error('" + StringUtil::Replace(refusal, "'", "''") + "')";
 	string value;

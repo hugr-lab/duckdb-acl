@@ -270,7 +270,8 @@ private:
 	//! reader sees while some predicate narrows the rows (`enum_domain_exposed`)
 	void JudgeTypes(const string &kind, const Relation &relation, const string &rls, const Value &alias_types,
 	                const Value &enum_types) {
-		auto stored = Read("SELECT lower(\"column\"), coalesce(\"as_base\", ''), coalesce(\"as_varchar\", ''),"
+		auto stored = Read("SELECT " + KeyFoldSql("\"column\"") +
+		                   ", coalesce(\"as_base\", ''), coalesce(\"as_varchar\", ''),"
 		                   " coalesce(\"as_both\", '') FROM " +
 		                   catalog.Tbl("relation_types") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                   " AND \"vname\" = " + Lit(relation.vname));
@@ -457,7 +458,7 @@ private:
 				// the target is a function of this instance: gone with its extension, or renamed
 				string parent, name;
 				NamePath::SplitLeaf(target, parent, name);
-				auto found = Read("SELECT 1 FROM duckdb_functions() WHERE lower(function_name) = " +
+				auto found = Read("SELECT 1 FROM duckdb_functions() WHERE " + KeyFoldSql("function_name") + " = " +
 				                  Lit(StringUtil::Lower(name)) + " LIMIT 1");
 				if (found->RowCount() == 0) {
 					Add("function", vname, "", "definition_broken",
@@ -737,10 +738,9 @@ private:
 			ResultRows listing_rows(*listing);
 			case_insensitive_set_t source_names;
 			vector<string> unrecorded, gone;
-			auto recorded =
-			    Read("SELECT \"vname\" FROM " + catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
-			         " AND \"origin\" = " + Lit(origin) + " AND substr(\"vname\", 1, " +
-			         std::to_string(path.size() + 1) + ") = " + Lit(path + ".") + " ORDER BY 1");
+			auto recorded = Read("SELECT \"vname\" FROM " + catalog.Tbl("relations") +
+			                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"origin\" = " + Lit(origin) + " AND " +
+			                     KeyPrefixSql("\"vname\"", Lit(path)) + " ORDER BY 1");
 			ResultRows recorded_rows(*recorded);
 			auto dropped = Read("SELECT \"name\" FROM " + catalog.Tbl("schema_dropped") +
 			                    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"path\" = " + Lit(path));
@@ -757,10 +757,21 @@ private:
 			for (idx_t i = 0; i < dropped->RowCount(); i++) {
 				dropped_names.insert(dropped_rows.GetValue(0, i).ToString());
 			}
+			auto stored = catalog.NamesUnder(vcat, NamePath::QuotePart(NamePath::FromKey(path).Head()));
 			for (idx_t i = 0; i < listing->RowCount(); i++) {
 				auto name = listing_rows.GetValue(0, i).ToString();
 				source_names.insert(name);
 				if (!recorded_names.count(name) && !dropped_names.count(name)) {
+					auto vname = NamePath::ChildKey(path, name);
+					if (CatalogBackend::CaseSibling(vname, stored)) {
+						// spec 116: REFRESH never records a second spelling of a held name - the source's
+						// object stays out until it is renamed (or the catalog's is)
+						Add("schema", path, "", "case_sibling",
+						    "the source object \"" + name +
+						        "\" differs only by case from a name the catalog holds - it is not recorded",
+						    "-- rename the source object, or drop the catalog's name of that spelling");
+						continue;
+					}
 					unrecorded.push_back(name);
 				}
 			}
