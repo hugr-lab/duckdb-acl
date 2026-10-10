@@ -437,7 +437,7 @@ private:
 		} else if (checked && !rls_checked.IsNull() && !rls_checked.GetValue<bool>()) {
 			Add(kind, relation.vname, role, "rls_unchecked",
 			    "the predicate" + who + " was accepted unchecked when it was written (spec 027) and binds now",
-			    "ANALYZE VIRTUAL CATALOG " + vcat);
+			    "ANALYZE VIRTUAL CATALOG " + NamePath::KeyToGrammar(vcat));
 		}
 	}
 
@@ -658,13 +658,14 @@ private:
 				// object's reads
 				if (!rls.empty()) {
 					JudgePredicate("grant", relation, role, rls, rls_checked,
-					               "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + role +
-					                   " SET RLS '<predicate>'");
+					               "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " +
+					                   NamePath(vector<string> {role}).ToGrammar() + " SET RLS '<predicate>'");
 				}
 				for (auto &item : items) {
 					JudgeColumns(relation, role, {item}, false,
-					             "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + role +
-					                 " SET COLUMNS " + Lit(Without(items, item.first)),
+					             "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " +
+					                 NamePath(vector<string> {role}).ToGrammar() + " SET COLUMNS " +
+					                 Lit(Without(items, item.first)),
 					             &matched);
 				}
 			}
@@ -675,7 +676,8 @@ private:
 					Add("grant", "*", role, "grant_column_missing",
 					    "the catalog-wide COLUMNS item \"" + item.first + "\" matches no column of any object of \"" +
 					        vcat + "\" - the role reads less than the grant says",
-					    "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + role + " SET COLUMNS " +
+					    "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " +
+					        NamePath(vector<string> {role}).ToGrammar() + " SET COLUMNS " +
 					        Lit(Without(items, item.first)));
 				}
 			}
@@ -745,7 +747,12 @@ private:
 			ResultRows dropped_rows(*dropped);
 			case_insensitive_set_t recorded_names, dropped_names;
 			for (idx_t i = 0; i < recorded->RowCount(); i++) {
-				recorded_names.insert(recorded_rows.GetValue(0, i).ToString().substr(path.size() + 1));
+				// spec 116: a record's leaf as the source names it (raw), compared with the source's listing
+				string parent, leaf;
+				NamePath::SplitLeaf(recorded_rows.GetValue(0, i).ToString(), parent, leaf);
+				if (parent == path) {
+					recorded_names.insert(leaf);
+				}
 			}
 			for (idx_t i = 0; i < dropped->RowCount(); i++) {
 				dropped_names.insert(dropped_rows.GetValue(0, i).ToString());

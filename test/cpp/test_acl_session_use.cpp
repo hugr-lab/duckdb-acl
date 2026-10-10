@@ -94,6 +94,14 @@ int main(int argc, char *argv[]) {
 	Exec(con, "ACL ADMIN GRANT SCHEMA mart.sales TO ROLE analyst WITH (select)");
 	Exec(con, "ACL ADMIN GRANT SCHEMA mart.exp TO ROLE analyst WITH (select, insert, create, drop)");
 
+	// spec 116: a catalog and a schema named the way SQL allows
+	Exec(con, "CREATE SCHEMA phys.\"Raw Data\"");
+	Exec(con, "CREATE TABLE phys.\"Raw Data\".\"Order Items\" AS SELECT 5 AS id");
+	Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG \"Sales Mart\"");
+	Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA \"Sales Mart\".\"Raw Data\" AS phys.\"Raw Data\"");
+	Exec(con, "ACL ADMIN GRANT CATALOG \"Sales Mart\" TO ROLE analyst WITH (select)");
+	Exec(con, "ACL ADMIN GRANT SCHEMA \"Sales Mart\".\"Raw Data\" TO ROLE analyst WITH (select)");
+
 	auto handle = OpenSession(con);
 	if (!Check(!handle.empty(), "a session opens")) {
 		return 1;
@@ -270,6 +278,25 @@ int main(int argc, char *argv[]) {
 		Check(One(con, session + "SELECT * FROM out.rows()") == "9", "a two-part name is read in mart");
 		CheckOk(*con.Query(session + "USE SCHEMA out"), "USE SCHEMA out");
 		Check(One(con, session + "SELECT * FROM rows()") == "9", "a bare name is read in mart.out");
+		CheckOk(*con.Query(session + "USE sales"), "back");
+	});
+
+	Scenario("USE takes a quoted catalog and schema, in any case (spec 116)", [&]() {
+		CheckOk(*con.Query(session + "USE \"sales mart\""), "USE \"sales mart\"");
+		Check(One(con, session + "SELECT current_database()") == "Sales Mart",
+		      "current_database() is the catalog as the policy spells it");
+		Check(One(con, session + "SELECT id FROM \"Raw Data\".\"order items\"") == "5",
+		      "a two-part name is read in \"Sales Mart\"");
+		CheckOk(*con.Query(session + "USE SCHEMA \"raw data\""), "USE SCHEMA \"raw data\"");
+		Check(One(con, session + "SELECT current_schema()") == "Raw Data", "current_schema() is the schema's name");
+		Check(One(con, session + "SELECT id FROM \"ORDER ITEMS\"") == "5", "a bare name is read in the schema");
+		Check(One(con, session + "SELECT string_agg(name, ',') FROM (SHOW TABLES)") == "Order Items",
+		      "SHOW TABLES is the schema's");
+		CheckOk(*con.Query(session + "USE \"SALES MART\".\"RAW DATA\""), "USE catalog.schema, upper case");
+		Check(One(con, session + "SELECT id FROM \"Order Items\"") == "5", "and reads there");
+		Check(Refused(One(con, session + "USE \"Sales Mart.Raw Data\""), "Sales Mart.Raw Data") ||
+		          Contains(One(con, session + "USE \"Sales Mart.Raw Data\""), "no catalog of the principal"),
+		      "one identifier with a dot is no catalog.schema");
 		CheckOk(*con.Query(session + "USE sales"), "back");
 	});
 

@@ -67,11 +67,60 @@ ACL ROLE "m" SELECT "Shout-It"('x');
 ----
 X
 
-# the whole path in one identifier is one name, not the path
+# the whole path in one identifier is one name, not the path - and the refusal names it, once quoted
 statement error
 ACL ROLE "m" SELECT * FROM "mart.Order Items";
 ----
-<REGEX>:.*no access to object.*
+<REGEX>:.*no access to object "mart.Order Items"\s*
+
+# a view, a table function, a mask: names as keys, read in any case
+statement ok
+SELECT acl_grant_view('m', '"Raw Data"."x-y"', 'SELECT 1 AS v');
+
+query I
+ACL ROLE "m" SELECT v FROM "raw data"."X-Y";
+----
+1
+
+statement ok
+SELECT acl_grant_table_function('m', 'Top Items', 'SELECT 42 AS id');
+
+query I
+ACL ROLE "m" SELECT id FROM "top items"();
+----
+42
+
+statement ok
+SELECT acl_grant_table('m', 'mart.Masked', 'phys."Raw Data"."Order Items"', 'id,Qty=0', '', 'select');
+
+query II
+ACL ROLE "m" SELECT id, "Qty" FROM mart."MASKED" ORDER BY id;
+----
+1	0
+2	0
+3	0
+
+# one name in any case is one object: a second grant under another case replaces it, never a sibling
+statement ok
+SELECT acl_grant_table('m', 'MART.masked', 'phys.main.u', '', '', 'select');
+
+query T
+ACL ROLE "m" SELECT v FROM mart.Masked;
+----
+upper
+
+query T
+ACL ROLE "m" SELECT column_name FROM (DESCRIBE mart."Order Items") ORDER BY ALL;
+----
+Qty
+id
+tenant
+
+# the memory store lists nothing: the metadata surfaces stay denied there, whatever the names
+statement error
+ACL ROLE "m" SELECT * FROM information_schema.tables;
+----
+<REGEX>:.*(not available|cannot enumerate).*
 
 statement ok
 ACL ROLE "m" INSERT INTO mart."Order Items" VALUES (4, 40, 'acme');
@@ -145,7 +194,7 @@ ACL ROLE "r" SELECT count(*) FROM "Sales Mart".main."Order Items";
 statement error
 ACL ROLE "r" SELECT * FROM "Sales Mart.Order Items";
 ----
-<REGEX>:.*no access to object ""Sales Mart.Order Items"".*
+<REGEX>:.*no access to object "Sales Mart.Order Items"\s*
 
 # DML through the writable alias
 statement ok
@@ -539,6 +588,271 @@ SELECT role FROM store.acl.roles WHERE role LIKE 'Mixed%';
 ----
 Mixed Role
 
+# --- case siblings across kinds: one spelling per name in a catalog, whatever kind holds it ---------
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCALAR "Sales Mart"."ORDER ITEMS"(s VARCHAR) AS upper(acl_arg(1));
+----
+<REGEX>:.*acl admin: name "ORDER ITEMS" differs only by case from the existing "Order Items" - names compare case-insensitively, as duckdb's catalog does \(spec 116\).*
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCHEMA "Sales Mart"."order items" AS phys.ab;
+----
+<REGEX>:.*acl admin: name "order items" differs only by case from the existing "Order Items".*
+
+# --- one fold everywhere: ASCII, as duckdb's catalog - `Öl` and `öl` are two names ----------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE "Sales Mart"."Öl" AS phys.main.u;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE "Sales Mart"."öl" AS phys.ab.t;
+
+query TT
+ACL ROLE "r" SELECT (SELECT v FROM "Öl"), (SELECT s FROM "öl");
+----
+upper	the schema a.b
+
+query T
+ACL ROLE "r" SELECT v FROM "ÖL";
+----
+upper
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c."Ä" AS phys."Raw Data"."Order Items";
+
+statement error
+ACL ADMIN GRANT TABLE c."ä" TO ROLE r WITH (select);
+----
+<REGEX>:.*object "c.ä" does not exist.*
+
+statement error
+ACL ROLE "r" SELECT * FROM c."ä";
+----
+<REGEX>:.*no access to object "c.ä".*
+
+# a mask on c."Ä" is never widened by a sibling c."ä" - two objects, two grants
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c."ä" AS phys."Raw Data"."Order Items";
+
+statement ok
+ACL ADMIN CREATE ROLE m2;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE m2 WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c."Ä" TO ROLE m2 COLUMNS (id, "Qty" = 0);
+
+query II
+ACL ROLE "m2" SELECT (SELECT sum("Qty") FROM "Ä"), (SELECT sum("Qty") FROM "ä");
+----
+0	60
+
+# a principal's DDL creating vs."ä" beside the operator's vs."Ä" makes a second object: the reads of
+# vs."Ä" keep its own predicate
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c."Raw Data"."Ä" AS phys."Raw Data"."Order Items" RLS (tenant = 'acme');
+
+statement ok
+ACL ROLE "r" CREATE TABLE c."Raw Data"."ä" AS SELECT 99 AS id, 'other' AS tenant;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM c."Raw Data"."Ä";
+----
+2
+
+query I
+ACL ROLE "r" SELECT id FROM c."Raw Data"."ä";
+----
+99
+
+statement ok
+ACL ROLE "r" DROP TABLE c."Raw Data"."ä";
+
+# --- a schema alias's tail is cut by parts, never by bytes ----------------------------------------------
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE SCHEMA phys.lake_priv;
+
+statement ok
+CREATE TABLE phys.lake.t AS SELECT 'ok' AS s;
+
+statement ok
+CREATE TABLE phys.lake_priv.secret AS SELECT 'leak' AS s;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c."STRAẞE" AS phys.lake;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.ik AS phys.lake;
+
+query T
+ACL ROLE "r" SELECT s FROM c."STRAẞE".t;
+----
+ok
+
+statement error
+ACL ROLE "r" SELECT * FROM c."straße"._priv.secret;
+----
+<REGEX>:.*no access to object.*
+
+# `iK` (a Kelvin sign, U+212A): Unicode lower() made it `ik` (one byte shorter) and the cut fell inside it
+statement error
+ACL ROLE "r" SELECT * FROM c."iK"._priv.secret;
+----
+<REGEX>:.*no access to object.*
+
+query T
+ACL ROLE "r" SELECT s FROM c.IK.t;
+----
+ok
+
+# --- RLS over a quoted column ------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE "Sales Mart"."Big Items" AS phys."Raw Data"."Order Items" RLS ("Qty" > 15);
+
+query I
+ACL ROLE "r" SELECT count(*) FROM "big items";
+----
+2
+
+# --- spec 113: RENAME in a quoted home moves the record and the physical table ----------------------
+
+statement ok
+ACL ROLE "r" CREATE TABLE c."Raw Data"."Old Name" AS SELECT 1 AS i;
+
+statement ok
+ACL ROLE "r" ALTER TABLE c."raw data"."old name" RENAME TO "New Name";
+
+query T
+SELECT vname FROM store.acl.relations WHERE vcat = 'c' AND vname LIKE '%Name';
+----
+Raw Data.New Name
+
+query I
+SELECT i FROM phys."Raw Data"."New Name";
+----
+1
+
+statement ok
+ACL ROLE "r" DROP TABLE c."Raw Data"."New Name";
+
+# --- argument filters compare as names compare ----------------------------------------------------------
+
+query I
+ACL ROLE "r" SELECT (SELECT count(*) FROM acl_function_columns('sales mart', 'MAIN')) = (SELECT count(*) FROM acl_function_columns('Sales Mart', 'main')) AND (SELECT count(*) FROM acl_function_columns('Sales Mart')) > 0;
+----
+true
+
+query T
+ACL ROLE "r" SELECT DISTINCT function_name FROM acl_function_columns('SALES MART', 'main', 'top items');
+----
+Top Items
+
+query T
+ACL ROLE "r" SELECT name FROM acl_references('order items') ORDER BY 1;
+----
+Items To Upper
+Self
+
+query TI
+ACL ROLE "r" SELECT object, key_sequence FROM acl_keys('ORDER ITEMS');
+----
+Order Items	1
+
+query T
+ACL ROLE "r" SHOW TABLES FROM "sales mart".MAIN;
+----
+Big Items
+Order Items
+Upper
+q"uote
+x-y
+Öl
+öl
+
+# --- the audit names one object one way: the policy's own name, however it was written --------------
+
+statement ok
+ACL ROLE "r" SELECT count(*) FROM "sales mart"."ORDER ITEMS";
+
+query T
+SELECT objects FROM acl_audit_events() WHERE kind = 'statement' AND verdict = 'allowed' ORDER BY seq DESC LIMIT 1;
+----
+[{'name': Sales Mart.Order Items, 'capability': select}]
+
+# --- the operator's repair statements parse and run as written ------------------------------------------
+
+statement ok
+CREATE TABLE phys."Raw Data"."a.b" AS SELECT 1 AS i;
+
+statement ok
+CREATE TABLE phys."Raw Data"."q""x" AS SELECT 1 AS i;
+
+query T
+SELECT repair FROM acl_check_catalog('c') WHERE problem = 'expansion_stale';
+----
+ALTER VIRTUAL SCHEMA c."Raw Data" REFRESH
+
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA c."Raw Data" REFRESH;
+
+query T
+SELECT vname FROM store.acl.relations WHERE vcat = 'c' AND vname IN ('Raw Data."a.b"', 'Raw Data."q""x"') ORDER BY 1;
+----
+Raw Data."a.b"
+Raw Data."q""x"
+
+# a part with a dot or a quote is its own name to the check and to PRUNE: nothing stale, nothing pruned
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE problem = 'expansion_stale';
+----
+0
+
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA c."Raw Data" REFRESH PRUNE;
+
+query I
+SELECT count(*) FROM store.acl.relations WHERE vcat = 'c' AND vname IN ('Raw Data."a.b"', 'Raw Data."q""x"');
+----
+2
+
+statement ok
+ACL ADMIN ANALYZE VIRTUAL CATALOG "Sales Mart";
+
+statement ok
+CREATE TABLE phys.main.g(id INTEGER, gone INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG "Q Cat";
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE "Q Cat".g AS phys.main.g;
+
+statement ok
+ACL ADMIN GRANT CATALOG "Q Cat" TO ROLE "Mixed Role" COLUMNS (id, gone);
+
+statement ok
+ALTER TABLE phys.main.g DROP COLUMN gone;
+
+query T
+SELECT repair FROM acl_check_catalog('q cat') WHERE problem = 'grant_column_missing';
+----
+ALTER GRANT CATALOG "Q Cat" TO ROLE "Mixed Role" SET COLUMNS 'id'
+
+statement ok
+ACL ADMIN ALTER GRANT CATALOG "Q Cat" TO ROLE "Mixed Role" SET COLUMNS 'id';
+
+query I
+SELECT count(*) FROM acl_check_catalog('q cat') WHERE problem = 'grant_column_missing';
+----
+0
+
 # --- the v20 migration: refuses while one name is spelled several ways ---------------------------------
 
 statement ok
@@ -568,6 +882,30 @@ SELECT acl_migrate_catalog('old', 'acl');
 
 statement ok
 DELETE FROM old.acl.relations WHERE vname IN ('orders', 's.b');
+
+# a catalog, a reference spelled two ways, and a stored name that is no key at all: each refuses
+statement ok
+INSERT INTO old.acl.catalogs VALUES ('Mart', NULL), ('mart', NULL);
+
+statement ok
+INSERT INTO old.acl."references"(vcat, name, from_vname, to_vname) VALUES ('c', 'Link', 'Orders', 'Orders'), ('c', 'link', 'Orders', 'Orders');
+
+statement ok
+INSERT INTO old.acl.relations(vcat, vname, form, phys) VALUES ('c', 'a"b', 'alias', 'phys.main.u'), ('c', 'x..y', 'alias', 'phys.main.u');
+
+statement error
+SELECT acl_migrate_catalog('old', 'acl');
+----
+<REGEX>:.*step v20 failed.*catalog Mart / mart.*reference c.Link / c.link.*unreadable name c / a"b.*unreadable name c / x..y.*
+
+statement ok
+DELETE FROM old.acl.catalogs WHERE vcat = 'mart';
+
+statement ok
+DELETE FROM old.acl."references" WHERE name = 'link';
+
+statement ok
+DELETE FROM old.acl.relations WHERE vname IN ('a"b', 'x..y');
 
 query T
 SELECT acl_migrate_catalog('old', 'acl');

@@ -95,7 +95,7 @@ q2
 query III
 SELECT statement, detail, objects FROM acl_audit_events() WHERE kind = 'statement' AND verdict = 'allowed' ORDER BY seq DESC LIMIT 1;
 ----
-select	pivot	[{'name': sales, 'capability': select}]
+select	pivot	[{'name': c.sales, 'capability': select}]
 
 # the statement the implicit pivot sits in can be an INSERT or a CTAS: the same enum steps run ahead
 # of it, under the same confinement, so the shape it writes is the principal's (no q9 column)
@@ -111,7 +111,7 @@ west	5	NULL
 query III
 SELECT statement, detail, objects FROM acl_audit_events() WHERE kind = 'statement' AND statement = 'insert' ORDER BY seq DESC LIMIT 1;
 ----
-insert	pivot	[{'name': sales, 'capability': select}, {'name': report, 'capability': insert}]
+insert	pivot	[{'name': c.sales, 'capability': select}, {'name': c.report, 'capability': insert}]
 
 statement ok
 ACL ROLE "analyst" CREATE TEMP TABLE pivoted AS PIVOT sales ON quarter USING sum(amount) GROUP BY region;

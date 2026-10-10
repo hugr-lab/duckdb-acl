@@ -131,6 +131,11 @@ string TakeDenyReason() {
 
 namespace {
 
+//! A key in a message, quoted once (spec 116): a key that quotes a part of its own is printed as it is
+string Shown(const string &key) {
+	return key.find('"') == string::npos ? "\"" + key + "\"" : key;
+}
+
 [[noreturn]] void Deny(Reason reason, const string &what) {
 	NoteDenyReason(reason);
 	throw BinderException("acl_rewrite: %s", what);
@@ -681,7 +686,7 @@ private:
 			return false;
 		}
 		if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
-			Deny(Reason::DDL_HOME, "\"" + key + "\" already exists");
+			Deny(Reason::DDL_HOME, "" + Shown(key) + " already exists");
 		}
 		return true;
 	}
@@ -720,7 +725,7 @@ private:
 		auto key = Key(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
-			Deny(Reason::DDL_HOME, "no schema of the catalog allows creating \"" + key + "\"");
+			Deny(Reason::DDL_HOME, "no schema of the catalog allows creating " + Shown(key));
 		}
 		Note(key, "create");
 		RequireReplaceDroppable(info, key, target);
@@ -773,7 +778,7 @@ private:
 				schema_path = NamePath::ChildKey(schema_path, parts[i]);
 			}
 			if (store.ResolveHeldSchema(principal, schema_path, vcat, path) && StringUtil::CIEquals(vcat, catalog)) {
-				Deny(Reason::NO_ACCESS, "\"" + key + "\" is ambiguous - catalog \"" + parts[0] + "\" or schema \"" +
+				Deny(Reason::NO_ACCESS, "" + Shown(key) + " is ambiguous - catalog \"" + parts[0] + "\" or schema \"" +
 				                            parts[0] + "\" of the session's catalog " + catalog +
 				                            "; write the catalog in front to mean the schema");
 			}
@@ -1059,7 +1064,7 @@ private:
 		auto key = Key(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
-			Deny(Reason::DDL_HOME, "no schema of the catalog allows creating \"" + key + "\"");
+			Deny(Reason::DDL_HOME, "no schema of the catalog allows creating " + Shown(key));
 		}
 		Note(key, "create");
 		// the same rules as a table's (spec 051): REPLACE priced as a drop on the schema that hosts
@@ -1110,7 +1115,7 @@ private:
 			if (TryTempDrop(info)) {
 				return;
 			}
-			Deny(Reason::DDL_HOME, "no schema of the catalog allows dropping \"" + key + "\"");
+			Deny(Reason::DDL_HOME, "no schema of the catalog allows dropping " + Shown(key));
 		}
 		Note(key, "drop");
 		TablePolicy existing;
@@ -1123,7 +1128,7 @@ private:
 		}
 		if (target.virtual_only) {
 			Deny(Reason::DDL_HOME,
-			     "\"" + key + "\" is granted VIRTUAL ONLY, so its physical object is not this role's to drop");
+			     "" + Shown(key) + " is granted VIRTUAL ONLY, so its physical object is not this role's to drop");
 		}
 		auto name = info.GetQualifiedName().Name();
 		info.SetQualifiedName(ParsePhysName(NamePath::ChildKey(target.phys_schema, name.GetIdentifierName())));
@@ -1165,25 +1170,25 @@ private:
 		auto new_key = NamePath::ChildKey(home, new_name.GetIdentifierName());
 		DdlTarget from, to;
 		if (!store.ResolveDdlTarget(principal, key, "drop", from)) {
-			Deny(Reason::DDL_HOME, "no schema of the catalog allows renaming \"" + key + "\"");
+			Deny(Reason::DDL_HOME, "no schema of the catalog allows renaming " + Shown(key));
 		}
 		if (!store.ResolveDdlTarget(principal, new_key, "create", to) || to.vcat != from.vcat ||
 		    to.schema_path != from.schema_path) {
-			Deny(Reason::DDL_HOME, "RENAME drops \"" + key + "\" and creates \"" + new_key +
+			Deny(Reason::DDL_HOME, "RENAME drops " + Shown(key) + " and creates \"" + new_key +
 			                           "\", so it needs create and drop on the schema that hosts both");
 		}
 		Note(key, "drop");
 		Note(new_key, "create");
 		if (from.virtual_only) {
 			Deny(Reason::DDL_HOME,
-			     "\"" + key + "\" is granted VIRTUAL ONLY, so its physical object is not this role's to rename");
+			     "" + Shown(key) + " is granted VIRTUAL ONLY, so its physical object is not this role's to rename");
 		}
 		// a live alias resolves any name under it, so "taken" is a record of the catalog; a physical
 		// object of that name makes the ALTER itself fail - judged inside the client's own transaction
 		// (dbt swaps in one), which a look from the store's connection would not see
 		auto new_phys = NamePath::ChildKey(from.phys_schema, new_name.GetIdentifierName());
 		if (store.CatalogObjectExists(to.vcat, to.vname, "relation")) {
-			Deny(Reason::DDL_HOME, "\"" + new_key + "\" already exists");
+			Deny(Reason::DDL_HOME, "" + Shown(new_key) + " already exists");
 		}
 		if (store.CatalogRelationDeclared(from.vcat, from.vname)) {
 			Deny(Reason::DDL_HOME, "\"" + key +
@@ -1191,7 +1196,7 @@ private:
 			                           "or grants by name), which are tied to its name - it is not renamed");
 		}
 		if (MetadataSurfaceOf(to.vname)) {
-			Deny(Reason::DDL_HOME, "\"" + new_key + "\" is a metadata surface's name");
+			Deny(Reason::DDL_HOME, "" + Shown(new_key) + " is a metadata surface's name");
 		}
 		TablePolicy existing;
 		bool resolved = store.ResolveTable(principal, key, existing);
@@ -1201,13 +1206,13 @@ private:
 		        NamePath::ChildKey(from.phys_schema, info.GetQualifiedName().Name().GetIdentifierName()))) {
 			// a record declared over an object elsewhere: renaming the home's object of that name would
 			// re-point the record at it (the review's finding) - the record is the operator's
-			Deny(Reason::DDL_HOME, "\"" + key + "\" is declared over " + existing.phys +
+			Deny(Reason::DDL_HOME, "" + Shown(key) + " is declared over " + existing.phys +
 			                           ", not over this schema's own object - it is not renamed");
 		}
 		if (resolved && !existing.query.empty()) {
 			// a view record: nothing physical, the record is the whole of it
 			if (!view_form) {
-				Deny(Reason::DDL_HOME, "\"" + key + "\" is a view - ALTER VIEW renames it");
+				Deny(Reason::DDL_HOME, "" + Shown(key) + " is a view - ALTER VIEW renames it");
 			}
 			drop_statement = true;
 			follow_ups.push_back(
@@ -1491,7 +1496,7 @@ private:
 					// `UPDATE SET *` / `UPDATE BY NAME` writes every column the source carries - the
 					// grant's columns, values and fields are judged per named column, so name them
 					Deny(Reason::WRITE_POLICY,
-					     "the update branch of a merge into \"" + vname + "\" must name its columns");
+					     "the update branch of a merge into " + Shown(vname) + " must name its columns");
 				}
 				if (action_set.first == MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE) {
 					// ... but "not matched" now includes every row the predicate excluded, and this
@@ -1553,7 +1558,7 @@ private:
 		if (action.default_values || action.insert_columns.empty() ||
 		    action.column_order == InsertColumnOrder::INSERT_BY_NAME) {
 			// without an explicit column list we do not know which physical columns are written
-			Deny(Reason::WRITE_POLICY, "the insert branch of a merge into \"" + vname + "\" must name its columns");
+			Deny(Reason::WRITE_POLICY, "the insert branch of a merge into " + Shown(vname) + " must name its columns");
 		}
 		for (auto &column : action.insert_columns) {
 			column = MapWrittenColumn(policy, column, vname);
@@ -1630,13 +1635,14 @@ private:
 					}
 					return;
 				}
-				Deny(Reason::NO_ACCESS, "no access to object \"" + key + "\"");
+				Deny(Reason::NO_ACCESS, "no access to object " + Shown(key));
 			}
 			// the read path needs the 'select' capability, just like DML paths need theirs (spec 003):
 			// a write-only grant (e.g. an audit/ingest table) must not leak reads through either form
-			Note(key, "select");
+			// spec 116: one object, one name in the audit - the policy's own, however it was written
+			Note(policy.canonical.empty() ? key : policy.canonical, "select");
 			if (!policy.caps.count("select")) {
-				Deny(Reason::CAPABILITY, "select on \"" + key + "\" is not allowed");
+				Deny(Reason::CAPABILITY, "select on " + Shown(key) + " is not allowed");
 			}
 			if (policy.subquery_form) {
 				ref = BuildTableSubquery(base.Table().GetIdentifierName(), policy, base);
@@ -1742,7 +1748,7 @@ private:
 			// before the template is expanded: a denied call never reaches bind.
 			Note(vname, "select");
 			if (!policy.caps.count("select")) {
-				Deny(Reason::CAPABILITY, "select on table function \"" + vname + "\" is not allowed");
+				Deny(Reason::CAPABILITY, "select on table function " + Shown(vname) + " is not allowed");
 			}
 			RewriteFunctionArgs(function); // resolve virtual names inside the call arguments first
 			Identifier alias = tf.alias.empty() ? Identifier(leaf) : tf.alias;
@@ -1760,7 +1766,7 @@ private:
 			// `FROM duckdb_tables()` - the function form of the same catalog. None of these take
 			// arguments, and quietly dropping one would answer a question nobody asked.
 			if (!function.GetArguments().empty()) {
-				Deny(Reason::STATEMENT_TYPE, "\"" + vname + "\" takes no arguments");
+				Deny(Reason::STATEMENT_TYPE, "" + Shown(vname) + " takes no arguments");
 			}
 			ref = BuildMetadataSubquery(surface, tf.alias.empty() ? Identifier(vname) : tf.alias,
 			                            std::move(tf.column_name_alias));
@@ -1833,7 +1839,7 @@ private:
 		}
 		// not a virtual table function: the gate decides by its key (spec 072), and the call is emitted
 		// qualified to the key that admitted it; then the arguments and any subquery argument
-		GateFunction(function.GetQualifiedNameMutable(), FunctionKind::TABLE, "table function \"" + vname + "\"");
+		GateFunction(function.GetQualifiedNameMutable(), FunctionKind::TABLE, "table function " + Shown(vname));
 		RewriteFunctionArgs(function);
 		if (tf.subquery && tf.subquery->node) {
 			RewriteQueryNode(*tf.subquery->node);
@@ -1915,9 +1921,10 @@ private:
 				Deny(Reason::STATEMENT_TYPE, "SHOW TABLES FROM needs a schema");
 			}
 			// (spec 116: a listing shows a schema unquoted, unless the part holds a `.`)
-			filter = " WHERE table_schema = " + SqlLiteral(NamePath::Display(NamePath::QuotePart(parts.back())));
+			filter =
+			    " WHERE " + KeyEqSql("table_schema", SqlLiteral(NamePath::Display(NamePath::QuotePart(parts.back()))));
 			if (parts.size() > 1) {
-				filter += " AND table_catalog = " + SqlLiteral(parts[parts.size() - 2]);
+				filter += " AND " + KeyEqSql("table_catalog", SqlLiteral(parts[parts.size() - 2]));
 			} else if (!use_catalog.empty() || !use_schema.empty()) {
 				filter += " AND table_catalog = " +
 				          SqlLiteral(NamePath::Unquote(UseCatalog())); // spec 114: the session's catalog
@@ -1970,7 +1977,7 @@ private:
 	unique_ptr<TableRef> BuildFunctionSubquery(const string &vname, const TablePolicy &policy,
 	                                           FunctionExpression &function, TableFunctionRef &tf) {
 		if (policy.query.empty()) {
-			Deny(Reason::POLICY_ERROR, "virtual table function \"" + vname + "\" has no template");
+			Deny(Reason::POLICY_ERROR, "virtual table function " + Shown(vname) + " has no template");
 		}
 		auto select_stmt = store.InstantiateSelect(policy.query, template_options);
 		vector<unique_ptr<ParsedExpression>> args;
@@ -2046,7 +2053,7 @@ private:
 			sql = policy.query; // a view: its SQL is the definition
 		} else {
 			if (policy.projection.empty() && policy.rls.empty()) {
-				Deny(Reason::POLICY_ERROR, "object \"" + vname + "\" exposes no readable columns");
+				Deny(Reason::POLICY_ERROR, "object " + Shown(vname) + " exposes no readable columns");
 			}
 			// no projection means the grant narrowed only the rows (spec 011): every column is read,
 			// renamed by name if the object renames any
@@ -2126,11 +2133,20 @@ private:
 			Deny(Reason::UNAVAILABLE, "references are not available: this policy source cannot enumerate them");
 		}
 		if (!object.empty()) {
-			auto quoted = "'" + StringUtil::Replace(object, "'", "''") + "'";
-			sql = "SELECT * FROM (" + sql + ") WHERE from_object = " + quoted + " OR to_object = " + quoted;
+			// spec 116: the object as a key, compared as names compare (case-insensitively)
+			auto quoted = "'" + StringUtil::Replace(ObjectKey(object), "'", "''") + "'";
+			sql = "SELECT * FROM (" + sql + ") WHERE " + KeyEqSql("from_object", quoted) + " OR " +
+			      KeyEqSql("to_object", quoted);
 		}
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+	}
+
+	//! An object named by a listing argument, as its key (`'Raw Data."a.b"'`); text that is no key, as it is
+	static string ObjectKey(const string &text) {
+		NamePath path;
+		string error;
+		return NamePath::TryFromKey(text, path, error) ? path.ToKey() : text;
 	}
 
 	//! `FROM acl_keys()` / `acl_keys('orders')`: the declared keys of the objects this principal can
@@ -2153,8 +2169,8 @@ private:
 			Deny(Reason::UNAVAILABLE, "keys are not available: this policy source cannot enumerate them");
 		}
 		if (!object.empty()) {
-			auto quoted = "'" + StringUtil::Replace(object, "'", "''") + "'";
-			sql = "SELECT * FROM (" + sql + ") WHERE object = " + quoted;
+			auto quoted = "'" + StringUtil::Replace(ObjectKey(object), "'", "''") + "'";
+			sql = "SELECT * FROM (" + sql + ") WHERE " + KeyEqSql("object", quoted);
 		}
 		auto select_stmt = store.InstantiateSelect(sql, template_options);
 		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
@@ -2178,7 +2194,8 @@ private:
 			}
 			auto value = argument.Cast<ConstantExpression>().GetLiteral().ToValue();
 			if (!value.IsNull()) {
-				filters.push_back(string(COLUMNS[i]) + " = " + SqlLiteral(value.ToString()));
+				// spec 116: a name compares case-insensitively (the shown, unquoted form)
+				filters.push_back(KeyEqSql(COLUMNS[i], SqlLiteral(value.ToString())));
 			}
 		}
 		if (!filters.empty()) {
@@ -2208,7 +2225,7 @@ private:
 		}
 		for (auto &rename : policy.renames) {
 			if (StringUtil::CIEquals(rename.second, name)) {
-				Deny(Reason::WRITE_POLICY, "\"" + vname + "\" has no column \"" + name + "\"");
+				Deny(Reason::WRITE_POLICY, "" + Shown(vname) + " has no column \"" + name + "\"");
 			}
 		}
 		return written;
@@ -2364,7 +2381,7 @@ private:
 		}
 		if (!policy.visible_columns.count(column)) {
 			Deny(Reason::WRITE_POLICY,
-			     "column \"" + VirtualColumn(policy, column) + "\" of \"" + vname + "\" is not readable");
+			     "column \"" + VirtualColumn(policy, column) + "\" of " + Shown(vname) + " is not readable");
 		}
 		if (plain) {
 			return; // read as stored
@@ -2420,7 +2437,7 @@ private:
 	void RequireValueExpression(const ParsedExpression &expr, const string &column, const string &vname) {
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			Deny(Reason::WRITE_POLICY,
-			     "column \"" + column + "\" of \"" + vname + "\" is computed from the row, so it cannot be written");
+			     "column \"" + column + "\" of " + Shown(vname) + " is computed from the row, so it cannot be written");
 		}
 		ParsedExpressionIterator::EnumerateChildren(
 		    expr, [&](const ParsedExpression &child) { RequireValueExpression(child, column, vname); });
@@ -2457,7 +2474,7 @@ private:
 		                                         "\" carries a field this role cannot write");
 		auto parsed = Parser(template_options).ParseExpressionList(text);
 		if (parsed.size() != 1) {
-			Deny(Reason::POLICY_ERROR, "the write policy of \"" + vname + "\" did not compile");
+			Deny(Reason::POLICY_ERROR, "the write policy of " + Shown(vname) + " did not compile");
 		}
 		auto value = std::move(parsed[0]);
 		BakeMarkers(value, nullptr); // a mask may read a claim
@@ -2538,7 +2555,7 @@ private:
 			return;
 		}
 		Deny(Reason::WRITE_POLICY,
-		     "column \"" + column.GetIdentifierName() + "\" of \"" + vname + "\" is not writable");
+		     "column \"" + column.GetIdentifierName() + "\" of " + Shown(vname) + " is not writable");
 	}
 
 	//! AND the policy's (already composed) predicate into a statement's WHERE, so an UPDATE/DELETE
@@ -2589,7 +2606,7 @@ private:
 				}
 			}
 			if (!written) {
-				Deny(Reason::WRITE_POLICY, "insert into \"" + vname + "\" must supply \"" + name +
+				Deny(Reason::WRITE_POLICY, "insert into " + Shown(vname) + " must supply \"" + name +
 				                               "\": the grant's predicate reads it "
 				                               "to decide whether the row may be "
 				                               "written");
@@ -2637,7 +2654,7 @@ private:
 			}
 			if (!written) {
 				Deny(Reason::WRITE_POLICY,
-				     "the insert branch of a merge into \"" + vname + "\" must supply \"" + name +
+				     "the insert branch of a merge into " + Shown(vname) + " must supply \"" + name +
 				         "\": the grant's predicate reads it to decide whether the row may be written");
 			}
 		}
@@ -2778,7 +2795,7 @@ private:
 			if (!found) {
 				// the grant assigns a column this insert does not write: nothing to replace, and
 				// appending it would shift every position after it
-				Deny(Reason::WRITE_POLICY, "insert into \"" + vname + "\" cannot assign \"" + injection.first +
+				Deny(Reason::WRITE_POLICY, "insert into " + Shown(vname) + " cannot assign \"" + injection.first +
 				                               "\", which the streamed shape does not carry");
 			}
 			replacements[Identifier("__acl_c" + to_string(position))] = InjectedValue(injection, vname);
@@ -2891,13 +2908,13 @@ private:
 		if (node.columns.empty() || node.default_values || node.column_order == InsertColumnOrder::INSERT_BY_NAME) {
 			// without an explicit column list we do not know which physical columns are written, so
 			// there is nothing to check the grant against
-			Deny(Reason::WRITE_POLICY, "insert into \"" + vname + "\" must name its columns");
+			Deny(Reason::WRITE_POLICY, "insert into " + Shown(vname) + " must name its columns");
 		}
 		if (node.on_conflict_info) {
-			Deny(Reason::WRITE_POLICY, "insert into \"" + vname + "\" cannot use ON CONFLICT under a column policy");
+			Deny(Reason::WRITE_POLICY, "insert into " + Shown(vname) + " cannot use ON CONFLICT under a column policy");
 		}
 		if (!node.select_statement) {
-			Deny(Reason::WRITE_POLICY, "insert into \"" + vname + "\" has no source to apply the grant policy to");
+			Deny(Reason::WRITE_POLICY, "insert into " + Shown(vname) + " has no source to apply the grant policy to");
 		}
 		for (auto &column : node.columns) {
 			RequireWritableColumn(policy, column, vname);
@@ -2957,7 +2974,7 @@ private:
 
 	void RequireReadableExpr(const ParsedExpression &expr, const TablePolicy &policy, const string &vname) {
 		if (expr.GetExpressionClass() == ExpressionClass::STAR) {
-			Deny(Reason::WRITE_POLICY, "RETURNING * on \"" + vname + "\" is not allowed under a column policy");
+			Deny(Reason::WRITE_POLICY, "RETURNING * on " + Shown(vname) + " is not allowed under a column policy");
 		}
 		if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 			auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
@@ -2979,7 +2996,7 @@ private:
 				}
 			}
 			if (masked || !policy.write_columns.count(name)) {
-				Deny(Reason::WRITE_POLICY, "column \"" + name + "\" of \"" + vname + "\" is not readable");
+				Deny(Reason::WRITE_POLICY, "column \"" + name + "\" of " + Shown(vname) + " is not readable");
 			}
 			return;
 		}
@@ -3099,18 +3116,18 @@ private:
 			TablePolicy called;
 			if (store.ResolveTableFunction(principal, key, called) ||
 			    store.ResolveScalarFunction(principal, key, called)) {
-				Deny(Reason::STATEMENT_TYPE, "\"" + key + "\" is a function, which is called rather than written");
+				Deny(Reason::STATEMENT_TYPE, "" + Shown(key) + " is a function, which is called rather than written");
 			}
-			Deny(Reason::NO_ACCESS, "no access to object \"" + key + "\"");
+			Deny(Reason::NO_ACCESS, "no access to object " + Shown(key));
 		}
 		// a view / masked / computed relation is read-only; a grant that only narrows a real table
 		// keeps it writable - the narrowing moves onto the written values and the WHERE (spec 011)
-		Note(key, capability);
+		Note(policy.canonical.empty() ? key : policy.canonical, capability);
 		if (!policy.writable) {
-			Deny(Reason::READ_ONLY, capability + " into read-only relation \"" + key + "\" is not allowed");
+			Deny(Reason::READ_ONLY, capability + " into read-only relation " + Shown(key) + " is not allowed");
 		}
 		if (!policy.caps.count(capability)) {
-			Deny(Reason::CAPABILITY, capability + " on \"" + key + "\" is not allowed");
+			Deny(Reason::CAPABILITY, capability + " on " + Shown(key) + " is not allowed");
 		}
 		auto phys = ParsePhysName(policy.phys);
 		NotePhysical(policy.phys);
@@ -3501,7 +3518,7 @@ private:
 	unique_ptr<ParsedExpression> BuildScalarExpr(const string &vname, const TablePolicy &policy,
 	                                             FunctionExpression &function) {
 		if (policy.query.empty()) {
-			Deny(Reason::POLICY_ERROR, "virtual scalar function \"" + vname + "\" has no template");
+			Deny(Reason::POLICY_ERROR, "virtual scalar function " + Shown(vname) + " has no template");
 		}
 		auto replacement = store.InstantiateExpr(policy.query, template_options);
 		vector<unique_ptr<ParsedExpression>> args;
