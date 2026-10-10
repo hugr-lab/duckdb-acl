@@ -220,6 +220,23 @@ reading quoted keys it does not understand. The step refuses to apply while case
     to `substr`/`left`/`right`; `test_acl_name_path.cpp` pins KeyPrefixSql / KeyLeafSql / KeyParentSql
     against the C++ side over ẞ/ß, İ, the Kelvin and Ohm signs, Å and the Angstrom sign, the final
     sigma and the ﬀ ligature.
+- **Second verification pass (2026-10-10)**, all fail-closed, each with a regression test:
+  - **a physical name is stored as the engine spells it** (`PolicyStore::SpellPhysical`): every phys /
+    phys_path / INTO argument takes, part by part, the spelling `duckdb_databases` / `duckdb_schemas` /
+    `duckdb_tables` (and views) answer under the ASCII fold - an exact match wins (a case-sensitive
+    source may hold `Orders` and `orders`); several answers and none exact, or nothing there yet (a
+    CREATE inside the client's open transaction), keep the part as written. The exact joins on the
+    engine's catalog (the listings, PhysicalObjects, PhysicalObjectExists, the INTO check, the
+    schema_missing check) then match: `c.plain AS PHYS.MAIN.U` and `c.live AS PHYS.S2` are listed, a
+    `FROM PHYS.S2` expansion and a VIRTUAL ONLY registration work, and the profile attributes a scan to
+    `pg`, never to a second `PG` (`acl_profile.test`);
+  - a RENAME's **undo** at the client's ROLLBACK runs the sibling check and skips a step whose old
+    name was taken meanwhile in another case (two connections in `acl_quoted_names.test`);
+  - EXPAND / REFRESH add each name they record to the names judged, so a case-sensitive source's second
+    spelling is skipped too (`integration/acl_quoted_names_postgres.test`: `"Pair"` and `"pair"`);
+  - the `case_sibling` finding carries a runnable repair - `DROP VIRTUAL TABLE|VIEW <held>; ALTER
+    VIRTUAL SCHEMA <path> REFRESH` - when a record holds the other spelling (a schema or a grant holding
+    it gets the REFRESH with a comment: there is no one-line repair for those).
 - **Tests added by the review**: case siblings across kinds (a scalar and a schema next to a table,
   the full message), the grant parts of the sibling rule (an object and a schema grant written in
   another case land on the stored spelling), spec 113 RENAME in a quoted home, RLS over a quoted
