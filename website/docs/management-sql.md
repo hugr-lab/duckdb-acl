@@ -148,7 +148,8 @@ a computed column or an `RLS` predicate makes it a read-only **subquery**. `RLS`
 the physical columns, AND-ed into every read and write; `acl_claim('<name>')` inside it is replaced
 by the principal's claim. `PRIMARY KEY` is declared, never enforced; it may name only columns the
 declaration has, and a masked or explicitly nullable column is refused as a key. The physical
-`<phys>` is not checked at write time: a source attached later is fine.
+`<phys>` is not checked at write time: a source attached later is fine - except for a catalog admin, whose
+`<phys>` must lie in a source granted to it (spec 118.3), which a grant requires to be attached.
 
 ```sql
 ACL ADMIN CREATE VIRTUAL TABLE sales.created AS phys.main.orders_physical
@@ -923,8 +924,11 @@ REVOKE SOURCE <database>[.<schema>] FROM ROLE <role>
 A source granted to a role - by `policy` or `passthrough` - is what a catalog admin sees of the node's
 physical sources (`platform.attached.<alias>.<schema>`, metadata only) and the only physical names it may
 build over: a table, a schema alias / expansion, a function alias, the tables a view / macro / RLS / mask
-body reads - each named in full. `policy`, `passthrough` and `cluster` build over every source. Never the
-policy store's database nor a secrets service. A revoke takes back nothing already built. Functions:
+body reads - each named in full. `policy` and `passthrough` build over every source; `cluster` sees every
+source but, holding a catalog's manage too, builds only over granted ones (it hands out no data). Never
+the policy store's database, a secrets service or a hidden database (another catalog's internals, ducklake's
+metadata). A revoke takes back nothing already built; `REVOKE ADMIN FROM ROLE r` removes its source grants
+with its other administration. Functions:
 `acl_grant_source(role, source)`, `acl_revoke_source(role, source)` (`platform.grant_source` /
 `revoke_source`).
 

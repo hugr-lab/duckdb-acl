@@ -36,8 +36,8 @@ namespace {
 vector<shared_ptr<AttachedDatabase>> SourceDatabases(ClientContext &context, PolicyStore &store) {
 	vector<shared_ptr<AttachedDatabase>> out;
 	for (auto &db : DatabaseManager::Get(context).GetDatabases(context)) {
-		if (db->IsSystem() || db->IsTemporary()) {
-			continue;
+		if (db->IsSystem() || db->IsTemporary() || db->GetVisibility() == AttachVisibility::HIDDEN) {
+			continue; // a hidden database is another catalog's internals (ducklake's metadata), never a source
 		}
 		auto name = db->GetName().GetIdentifierName();
 		if (store.catalog && StringUtil::CIEquals(name, store.catalog->db_name)) {
@@ -146,55 +146,64 @@ unique_ptr<GlobalTableFunctionState> SourcesInit(ClientContext &context, TableFu
 		if (only && !NamesDatabase(*only, alias)) {
 			continue; // no grant names this database: its catalog is not even read
 		}
-		for (auto &schema_ref : db->GetCatalog().GetSchemas(context)) {
-			auto &schema = schema_ref.get();
-			vector<string> parts {"attached", alias};
-			for (auto &part : schema.GetSchemaPath()) {
-				parts.push_back(part.GetIdentifierName());
-			}
-			if (parts.size() < 3 || !InSources(only, alias, parts[2])) {
-				continue;
-			}
-			auto path = NamePath(parts).ToKey();
-			if (!bind.columns) {
-				state->rows.push_back(
-				    {Value(path), Value(LogicalType::VARCHAR), Value(LogicalType::VARCHAR), Value("SCHEMA")});
-			}
-			schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-				auto name = Value(entry.name.GetIdentifierName());
-				auto comment = entry.comment.IsNull() ? Value(LogicalType::VARCHAR) : Value(entry.comment.ToString());
-				if (entry.type == CatalogType::TABLE_ENTRY) {
-					auto &table = entry.Cast<TableCatalogEntry>();
-					if (!bind.columns) {
-						state->rows.push_back({Value(path), name, comment, Value("BASE TABLE")});
-						return;
-					}
-					int64_t pos = 0;
-					for (auto &col : table.GetColumns().Logical()) {
-						state->rows.push_back({Value(path), name, Value::BIGINT(++pos),
-						                       Value(col.Name().GetIdentifierName()), Value(col.Type().ToString())});
-					}
-				} else if (entry.type == CatalogType::VIEW_ENTRY) {
-					auto &view = entry.Cast<ViewCatalogEntry>();
-					if (!bind.columns) {
-						state->rows.push_back({Value(path), name, comment, Value("VIEW")});
-						return;
-					}
-					try {
-						view.BindView(context);
-					} catch (std::exception &) { // NOLINT: an unbound view lists no columns
-					}
-					auto info = view.GetColumnInfo();
-					if (!info) {
-						return;
-					}
-					for (idx_t i = 0; i < info->names.size() && i < info->types.size(); i++) {
-						state->rows.push_back({Value(path), name, Value::BIGINT(NumericCast<int64_t>(i + 1)),
-						                       Value(info->names[i].GetIdentifierName()),
-						                       Value(info->types[i].ToString())});
-					}
+		// one source that cannot answer (a postgres down, a ducklake whose metadata went away) drops out of
+		// the tree - its rows are rolled back - never the whole listing every admin's console reads
+		auto mark = state->rows.size();
+		try {
+			for (auto &schema_ref : db->GetCatalog().GetSchemas(context)) {
+				auto &schema = schema_ref.get();
+				vector<string> parts {"attached", alias};
+				for (auto &part : schema.GetSchemaPath()) {
+					parts.push_back(part.GetIdentifierName());
 				}
-			});
+				if (parts.size() < 3 || !InSources(only, alias, parts[2])) {
+					continue;
+				}
+				auto path = NamePath(parts).ToKey();
+				if (!bind.columns) {
+					state->rows.push_back(
+					    {Value(path), Value(LogicalType::VARCHAR), Value(LogicalType::VARCHAR), Value("SCHEMA")});
+				}
+				schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+					auto name = Value(entry.name.GetIdentifierName());
+					auto comment =
+					    entry.comment.IsNull() ? Value(LogicalType::VARCHAR) : Value(entry.comment.ToString());
+					if (entry.type == CatalogType::TABLE_ENTRY) {
+						auto &table = entry.Cast<TableCatalogEntry>();
+						if (!bind.columns) {
+							state->rows.push_back({Value(path), name, comment, Value("BASE TABLE")});
+							return;
+						}
+						int64_t pos = 0;
+						for (auto &col : table.GetColumns().Logical()) {
+							state->rows.push_back({Value(path), name, Value::BIGINT(++pos),
+							                       Value(col.Name().GetIdentifierName()),
+							                       Value(col.Type().ToString())});
+						}
+					} else if (entry.type == CatalogType::VIEW_ENTRY) {
+						auto &view = entry.Cast<ViewCatalogEntry>();
+						if (!bind.columns) {
+							state->rows.push_back({Value(path), name, comment, Value("VIEW")});
+							return;
+						}
+						try {
+							view.BindView(context);
+						} catch (std::exception &) { // NOLINT: an unbound view lists no columns
+						}
+						auto info = view.GetColumnInfo();
+						if (!info) {
+							return;
+						}
+						for (idx_t i = 0; i < info->names.size() && i < info->types.size(); i++) {
+							state->rows.push_back({Value(path), name, Value::BIGINT(NumericCast<int64_t>(i + 1)),
+							                       Value(info->names[i].GetIdentifierName()),
+							                       Value(info->types[i].ToString())});
+						}
+					}
+				});
+			}
+		} catch (std::exception &) { // NOLINT: the source is left out, the rest of the tree stands
+			state->rows.resize(mark);
 		}
 	}
 	return std::move(state);
@@ -220,7 +229,10 @@ void SourceGrantFunc(DataChunk &args, ExpressionState &state, Vector &result, bo
 	auto &store = StoreOf(state);
 	auto &context = state.GetContext();
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto role = RequiredArg(args, 0, row, fn, "role");
+		auto role = OptionalArg(args, 0, row, "");
+		if (role.empty()) {
+			throw BinderException("%s: a source is granted to one role - never to every role ('')", fn);
+		}
 		auto source = RequiredArg(args, 1, row, fn, "source");
 		NamePath path;
 		string error;

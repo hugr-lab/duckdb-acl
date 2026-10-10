@@ -705,9 +705,10 @@ showing only. Cluster parts stay in acl_cluster.cpp (to move to hugr_node). 118.
 of platform in every listing (`pobjects` / `pcolumns` carry `path` and `type`; schema rows have a NULL vname),
 read per database by `acl_platform_attached[_columns]([sources])`; a read of it refused. `GRANT | REVOKE SOURCE
 <db>[.<schema>] TO|FROM ROLE r` → `acl_grant_source` / `acl_revoke_source` (HANDS_OUT; platform_grants kind
-`source`). `AuthorizeSources` (beside AuthorizeBodies): a catalog admin (not policy / passthrough / cluster)
-stores a physical name or a body reading a table only inside its granted sources (bound with GetTableNames - its
-answer carries the alias, cut); nothing built is taken back.
+`source`). `AuthorizeSources` (beside AuthorizeBodies): a principal that is not policy / passthrough (cluster included)
+stores a physical name or a body (incl. column expressions, REMAP, ALTER … SET PHYS) reading a table only inside its
+granted sources (GetTableNames - names as written, the alias cut); hidden databases and one failing source drop
+out of the tree; nothing built is taken back.
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant

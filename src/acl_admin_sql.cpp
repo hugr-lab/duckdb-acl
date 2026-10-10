@@ -1759,7 +1759,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 	if (StringUtil::CIEquals(keyword, "revoke")) {
 		if (s.Accept("source")) {
 			// REVOKE SOURCE <database>[.<schema>] FROM ROLE r (spec 118.3): what the role declared over it
-			// keeps working - acl_check_catalog shows it, an explicit command removes it
+			// keeps working - an explicit DROP removes it
 			auto source = s.Dotted("a source (<database>[.<schema>])");
 			s.Expect("from");
 			s.Expect("role");

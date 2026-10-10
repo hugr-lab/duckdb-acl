@@ -33,6 +33,12 @@ statement ok
 CREATE TABLE pg.main.t(x INTEGER);
 
 statement ok
+INSERT INTO pg.sales.orders VALUES (1, 10);
+
+statement ok
+INSERT INTO pg.hr.salaries VALUES (1, 999);
+
+statement ok
 SELECT acl_use_db('store', 'acl', true);
 
 statement ok
@@ -64,6 +70,15 @@ ACL ADMIN CREATE ROLE cadm;
 
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE cadm CAPS '{"select": true, "manage": true}' MAIN;
+
+statement ok
+ACL ADMIN CREATE ROLE fleet;
+
+statement ok
+ACL ADMIN GRANT ADMIN cluster TO ROLE fleet;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE fleet CAPS '{"manage": true}';
 
 # --- the tree: policy sees every source - never the policy store's database --------------------------------
 
@@ -176,6 +191,64 @@ ACL ROLE "cadm" CREATE VIRTUAL TABLE c.short AS orders;
 ----
 <REGEX>:.*outside the sources granted.*name the source in full.*
 
+# every body a definition stores: a column expression, an RLS, a macro, a REMAP; and a re-pointed alias
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.o2 AS pg.sales.orders COLUMNS (id, (SELECT max(pay) FROM pg.hr.salaries) AS amount);
+----
+<REGEX>:.*the definition's body names "pg.hr.salaries".*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.o3 AS pg.sales.orders RLS 'id IN (SELECT id FROM pg.hr.salaries)';
+----
+<REGEX>:.*the definition's body names "pg.hr.salaries".*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE FUNCTION c.f(m INTEGER) RETURNS TABLE (id INTEGER) AS 'SELECT id FROM pg.hr.salaries WHERE id >= acl_arg(1)';
+----
+<REGEX>:.*the definition's body names "pg.hr.salaries".*
+
+statement error
+ACL ROLE "cadm" REPAIR VIRTUAL TABLE c.orders REMAP (amount = (SELECT max(pay) FROM pg.hr.salaries));
+----
+<REGEX>:.*the definition's body names "pg.hr.salaries".*
+
+statement error
+ACL ROLE "cadm" ALTER VIRTUAL SCHEMA c.s SET PHYS pg.hr;
+----
+<REGEX>:.*the definition names "pg.hr", outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" SELECT platform.add_relation('c', 'o4', ?, '', '');
+----
+<REGEX>:.*must be a constant.*
+
+query II
+ACL ROLE "cadm" SELECT id, amount FROM c.orders;
+----
+1	10
+
+# the cluster bundle sees every source - and, holding a catalog's manage, builds only over granted ones
+query I
+ACL ROLE "fleet" SELECT count(DISTINCT table_schema) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema LIKE 'attached.pg.%';
+----
+3
+
+statement error
+ACL ROLE "fleet" CREATE VIRTUAL TABLE c.fleet_pay AS pg.hr.salaries;
+----
+<REGEX>:.*outside the sources granted.*
+
+statement error
+SELECT acl_grant_source('', 'pg');
+----
+<REGEX>:.*never to every role.*
+
+# the grant is a platform_grants row of kind source
+query TTTT
+SELECT role, object, kind, allowed FROM store.acl.platform_grants WHERE kind = 'source';
+----
+cadm	pg.sales	source	true
+
 # policy builds over every source
 statement ok
 ACL ROLE "pol" CREATE VIRTUAL TABLE c.pay AS pg.hr.salaries;
@@ -208,7 +281,7 @@ ACL ROLE "cadm" SELECT count(*) FROM information_schema.tables WHERE table_catal
 query I
 ACL ROLE "cadm" SELECT count(*) FROM c.orders;
 ----
-0
+1
 
 statement error
 ACL ROLE "cadm" CREATE VIRTUAL TABLE c.again AS pg.sales.orders;
@@ -220,3 +293,23 @@ query I
 SELECT count(*) FROM store.acl.platform_grants WHERE kind = 'source';
 ----
 0
+
+# --- a hidden database is another catalog's internals, never a source (review 118.3) ------------------------
+
+require ducklake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/attached_lake.ducklake' AS lake (DATA_PATH '__TEST_DIR__/attached_lake');
+
+statement ok
+CREATE TABLE lake.t(x INTEGER);
+
+query T
+ACL ROLE "pol" SELECT list(DISTINCT table_schema ORDER BY table_schema) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema LIKE 'attached.%lake%';
+----
+[attached.lake.main]
+
+statement error
+ACL ROLE "pol" GRANT SOURCE __ducklake_metadata_lake TO ROLE cadm;
+----
+<REGEX>:.*is no source of this node.*

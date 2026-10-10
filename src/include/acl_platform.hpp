@@ -181,7 +181,8 @@ void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> 
 void RegisterAclPlatformSources(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
 //! the sources granted to the principal (`<alias>` or `<alias>.<schema>` keys, kind `source`)
 vector<string> GrantedSources(const PolicyStore::AdminRights &rights);
-//! passthrough, policy and the cluster bundle see - and build over - every source
+//! passthrough, policy and the cluster bundle see every source (only passthrough and policy build over every
+//! one - the cluster bundle hands out no data)
 bool SeesAllSources(const PolicyStore::AdminRights &rights);
 //! a physical name (parts: `<db>.<schema>.<object>`, a schema path `<db>[.<schema>…]`) inside a granted source
 bool SourceGranted(const vector<string> &sources, const vector<string> &parts, bool schema_path);

@@ -1628,8 +1628,8 @@ vector<BodyArgument> BodiesOf(const string &target, FunctionExpression &call) {
 
 void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,
                       PolicyStore &store) {
-	if (SeesAllSources(rights) || !store.catalog) {
-		return; // passthrough, policy and the cluster bundle build over every source; memory mode has none
+	if (rights.Policy() || !store.catalog) {
+		return; // passthrough and policy build over every source (cluster only sees them); memory mode has none
 	}
 	auto granted = GrantedSources(rights);
 	auto refuse = [&](const string &what, const string &name) {
@@ -1672,7 +1672,8 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 		vector<std::tuple<idx_t, bool, bool>> names;
 		if (target == "acl_add_relation") {
 			names.emplace_back(2, false, false);
-		} else if (target == "acl_add_schema_alias" || target == "acl_expand_schema") {
+		} else if (target == "acl_add_schema_alias" || target == "acl_expand_schema" ||
+		           target == "acl_alter_schema_alias") {
 			names.emplace_back(2, true, false);
 		} else if (target == "acl_add_table_function_alias" || target == "acl_add_scalar_alias") {
 			names.emplace_back(2, false, true);
@@ -1703,23 +1704,46 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 		}
 		// the tables a stored body reads: bound on the node, every one inside a granted source
 		for (auto &body : BodiesOf(target, call)) {
-			if (body.shape != BodyShape::SELECT && body.shape != BodyShape::EXPRESSION) {
+			if (body.shape == BodyShape::FUNCTION_NAME) {
 				continue;
 			}
 			string text;
 			if (!text_of(call, body.index, text) || StringUtil::Replace(text, " ", "").empty()) {
 				continue;
 			}
+			// a column list (a relation's columns, a REMAP) is checked item by item, each as an expression
+			vector<std::pair<string, bool>> pieces;
+			if (body.shape == BodyShape::COLUMNS) {
+				for (auto &item : acl_detail::ParseColumnList(text)) {
+					// `name = expr`, or the grammar's `expr AS name` (kept whole as the item's name)
+					auto piece = item.second.empty() ? item.first : item.second;
+					auto as_at = StringUtil::Lower(piece).rfind(" as ");
+					if (item.second.empty() && as_at != string::npos) {
+						piece = piece.substr(0, as_at);
+					}
+					bool plain = true; // a column named as is reads no table
+					for (auto c : piece) {
+						plain = plain && (StringUtil::CharacterIsAlphaNumeric(c) || c == '_' || c == '"' || c == '.' ||
+						                  StringUtil::CharacterIsSpace(c));
+					}
+					if (!plain) {
+						pieces.emplace_back(piece, true);
+					}
+				}
+			} else {
+				pieces.emplace_back(text, body.shape == BodyShape::EXPRESSION);
+			}
 			vector<string> tables;
 			try {
-				auto expression = body.shape == BodyShape::EXPRESSION;
-				auto baked = BakeTemplateForProbe(text, ParserOptions::Builtin(), expression, {});
-				auto probe = expression ? "SELECT (" + baked + ") AS \"value\"" : baked;
-				Connection con(*store.catalog->Db());
-				for (auto &table : con.GetTableNames(probe, true)) {
-					// the binder answers a reference as written, its alias too: `pg.hr.salaries AS s`
-					auto alias_at = StringUtil::Lower(table).find(" as ");
-					tables.push_back(alias_at == string::npos ? table : table.substr(0, alias_at));
+				for (auto &piece : pieces) {
+					auto baked = BakeTemplateForProbe(piece.first, ParserOptions::Builtin(), piece.second, {});
+					auto probe = piece.second ? "SELECT (" + baked + ") AS \"value\"" : baked;
+					Connection con(*store.catalog->Db());
+					for (auto &table : con.GetTableNames(probe, true)) {
+						// the answer is the reference as written, its alias too: `pg.hr.salaries AS s`
+						auto alias_at = StringUtil::Lower(table).find(" as ");
+						tables.push_back(alias_at == string::npos ? table : table.substr(0, alias_at));
+					}
 				}
 			} catch (std::exception &ex) {
 				throw BinderException("acl admin: a catalog admin's definition must bind, so the sources it reads "
