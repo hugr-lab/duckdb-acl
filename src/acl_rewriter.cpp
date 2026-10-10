@@ -138,31 +138,18 @@ namespace {
 
 //! The lookup key for a virtual relation is its full written path (schema.subschema.table), not just
 //! the last component, so a nested virtual namespace resolves to its own physical target.
+//! Spec 116: the canonical key of the written parts (a part with a `.` or a `"` quoted), so a part is
+//! never read as two and `"a.b"` stays one schema beside the path `a.b`.
 string VirtualKey(const QualifiedName &name) {
-	vector<string> parts;
-	for (auto &part : name.Path()) {
-		if (!part.empty()) {
-			parts.push_back(part.GetIdentifierName());
-		}
-	}
-	return StringUtil::Join(parts, ".");
+	return NamePath::FromQualified(name).ToKey();
 }
 
-//! Build a QualifiedName from a dotted physical name of any depth: the last component is the name, the
-//! preceding ones are the (possibly nested) catalog/schema path. Preserves depth beyond [catalog,
-//! schema, name] for DuckDB's nested-schema support (do not collapse to three components).
+//! Build a QualifiedName from a stored physical name (a key) of any depth: the last part is the name,
+//! the preceding ones the (possibly nested) catalog/schema path - each part one identifier, so
+//! `phys."Raw Data"."Order Items"` binds as the three names it holds (spec 116). Preserves depth beyond
+//! [catalog, schema, name] for DuckDB's nested-schema support (do not collapse to three components).
 QualifiedName ParsePhysName(const string &phys) {
-	auto parts = StringUtil::Split(phys, '.');
-	if (parts.empty()) {
-		return QualifiedName(Identifier(phys));
-	}
-	vector<Identifier> path;
-	for (auto &part : parts) {
-		path.push_back(Identifier(part));
-	}
-	auto name = std::move(path.back());
-	path.pop_back();
-	return QualifiedName(std::move(path), std::move(name));
+	return NamePath::KeyToQualified(phys);
 }
 
 //! Rewrites a parsed statement tree for one principal: virtual names -> safe subqueries, claims baked.
@@ -412,13 +399,18 @@ public:
 			for (auto &part : parameter.Cast<ColumnRefExpression>().ColumnNames()) {
 				parts.push_back(part.GetIdentifierName());
 			}
-			written = StringUtil::Join(parts, ".");
+			written = NamePath(parts).ToKey();
 		}
 		if (written.empty()) {
 			Deny(Reason::STATEMENT_TYPE, "PRAGMA table_info needs a table name");
 		}
 		vector<string> quoted;
-		for (auto &part : StringUtil::Split(written, '.')) {
+		NamePath path;
+		string error;
+		if (!NamePath::TryFromKey(written, path, error)) {
+			path = NamePath({written});
+		}
+		for (auto &part : path.Parts()) {
 			quoted.push_back("\"" + StringUtil::Replace(part, "\"", "\"\"") + "\"");
 		}
 		return StringUtil::Join(quoted, ".");
@@ -556,7 +548,7 @@ private:
 		// spec 114: and in the session's catalog, where a bare name is read after a USE
 		auto in_session = use_catalog.empty() && use_schema.empty()
 		                      ? string()
-		                      : UseCatalog() + (use_schema.empty() ? string() : "." + use_schema) + "." + bare;
+		                      : NamePath::ChildKey(NamePath::JoinKeys(UseCatalog(), use_schema), bare);
 		// a live schema alias claims every name, so its "object" is no object - the temp is then reached as
 		// temp.main.<x>, which is how a door's ingest addresses it anyway
 		if (store.ResolveTable(principal, bare, shadowed) ||
@@ -725,7 +717,6 @@ private:
 			RewriteQueryNode(*table_info.query->node);
 		}
 		RewriteColumnDefinitions(table_info);
-		RequireUndottedParts(info.GetQualifiedName());
 		auto key = Key(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
@@ -741,7 +732,7 @@ private:
 			return;
 		}
 		auto name = info.GetQualifiedName().Name();
-		auto phys = target.phys_schema + "." + name.GetIdentifierName();
+		auto phys = NamePath::ChildKey(target.phys_schema, name.GetIdentifierName());
 		if (target.virtual_only) {
 			// the role registers what exists; it never materialises. The CREATE itself is dropped
 			// from the batch, so nothing physical happens.
@@ -774,17 +765,12 @@ private:
 		if (catalog.empty()) {
 			return key;
 		}
-		vector<string> parts;
-		for (auto &part : name.Path()) {
-			if (!part.empty()) {
-				parts.push_back(part.GetIdentifierName());
-			}
-		}
-		if (parts.size() >= 2 && HoldsCatalog(parts[0])) {
+		auto parts = NameParts(name);
+		if (parts.size() >= 2 && HoldsCatalog(NamePath::QuotePart(parts[0]))) {
 			// the other reading: the whole path to the object as a schema of the session's catalog
 			string vcat, path, schema_path = catalog;
 			for (idx_t i = 0; i + 1 < parts.size(); i++) {
-				schema_path += "." + parts[i];
+				schema_path = NamePath::ChildKey(schema_path, parts[i]);
 			}
 			if (store.ResolveHeldSchema(principal, schema_path, vcat, path) && StringUtil::CIEquals(vcat, catalog)) {
 				Deny(Reason::NO_ACCESS, "\"" + key + "\" is ambiguous - catalog \"" + parts[0] + "\" or schema \"" +
@@ -794,9 +780,9 @@ private:
 			return key;
 		}
 		if (parts.size() == 1 && !use_schema.empty()) {
-			return catalog + "." + use_schema + "." + key;
+			return NamePath::JoinKeys(NamePath::JoinKeys(catalog, use_schema), key);
 		}
-		return catalog + "." + key;
+		return NamePath::JoinKeys(catalog, key);
 	}
 
 	//! The role's MAIN catalog, read once per batch (not per name)
@@ -870,18 +856,19 @@ private:
 		}
 		auto parts = SplitIdentifierPath(set.value->Cast<ConstantExpression>().GetLiteral().ToValue().ToString());
 		string catalog, schema;
+		// (spec 116: each part one identifier, kept as a key - `"Sales Mart"` is one catalog)
 		if (use_schema_form) {
 			if (parts.size() != 1) {
 				Deny(Reason::SETTING_DENIED, "USE SCHEMA takes one schema name");
 			}
 			catalog = UseCatalog();
-			schema = parts[0];
+			schema = NamePath::QuotePart(parts[0]);
 		} else {
 			if (parts.empty() || parts.size() > 2) {
 				Deny(Reason::SETTING_DENIED, "USE takes <catalog> or <catalog>.<schema>");
 			}
-			catalog = parts[0];
-			schema = parts.size() == 2 ? parts[1] : string();
+			catalog = NamePath::QuotePart(parts[0]);
+			schema = parts.size() == 2 ? NamePath::QuotePart(parts[1]) : string();
 		}
 		if (catalog.empty() || !HoldsCatalog(catalog)) {
 			HoldsCatalog(string());
@@ -898,14 +885,14 @@ private:
 		}
 		if (!schema.empty()) {
 			string vcat, path;
-			if (!store.ResolveHeldSchema(principal, catalog + "." + schema, vcat, path) ||
+			if (!store.ResolveHeldSchema(principal, NamePath::JoinKeys(catalog, schema), vcat, path) ||
 			    !StringUtil::CIEquals(vcat, catalog)) {
 				Deny(Reason::SETTING_DENIED,
 				     "USE: \"" + catalog + "." + schema + "\" is no schema the principal holds");
 			}
 			schema = path;
 		}
-		Note(schema.empty() ? catalog : catalog + "." + schema, "use");
+		Note(NamePath::JoinKeys(catalog, schema), "use");
 		if (schema.empty() && StringUtil::CIEquals(catalog, PrincipalMain())) {
 			catalog.clear(); // back where the session began
 		}
@@ -945,39 +932,22 @@ private:
 		return parts;
 	}
 
-	//! spec 113: a DDL name is resolved and rebuilt as a dotted path, so a part with a dot of its own
-	//! (`"sub.t"`) would name another, nested object - one the grant never covered (the review's
-	//! finding: a RENAME to `"sub.t"` re-pointed a record at a hidden nested table). Refused.
-	void RequireUndottedParts(const QualifiedName &name) {
-		for (auto &part : name.Path()) {
-			RequireUndotted(part);
-		}
-	}
-
-	void RequireUndotted(const Identifier &part) {
-		if (part.GetIdentifierName().find('.') != string::npos) {
-			Deny(Reason::DDL_HOME, "\"" + part.GetIdentifierName() +
-			                           "\" has a dot in it - a name part of a DDL statement under the ACL is one "
-			                           "identifier, never a path");
-		}
-	}
-
 	//! spec 113: a client (dbt) makes sure its schema exists before it writes. A virtual schema the
 	//! principal holds already does: IF NOT EXISTS is a no-op, without it duckdb's own answer. Creating
 	//! a schema stays the operator's - one the principal does not hold is refused as before.
 	void RewriteCreateSchema(CreateInfo &info) {
-		RequireUndottedParts(info.GetQualifiedName());
 		auto written = VirtualKey(info.GetQualifiedName());
+		auto written_parts = NameParts(info.GetQualifiedName());
 		if (!use_catalog.empty() && !written.empty() &&
-		    (written.find('.') == string::npos || !HoldsCatalog(written.substr(0, written.find('.'))))) {
-			written = use_catalog + "." + written; // spec 114: a schema path is the session catalog's
+		    (written_parts.size() == 1 || !HoldsCatalog(NamePath::QuotePart(written_parts[0])))) {
+			written = NamePath::JoinKeys(use_catalog, written); // spec 114: a schema path is the session catalog's
 		}
 		string vcat, path;
 		if (written.empty() || !store.ResolveHeldSchema(principal, written, vcat, path)) {
 			Deny(Reason::STATEMENT_TYPE, "only tables and views can be created through the ACL - a schema is "
 			                             "the operator's to declare");
 		}
-		Note(vcat + "." + path, "schema");
+		Note(NamePath::JoinKeys(vcat, path), "schema");
 		if (info.on_conflict != OnCreateConflict::IGNORE_ON_CONFLICT) {
 			Deny(Reason::DDL_HOME, "schema \"" + written + "\" already exists");
 		}
@@ -1086,7 +1056,6 @@ private:
 		if (!info.query) {
 			Deny(Reason::STATEMENT_TYPE, "a view needs a query");
 		}
-		RequireUndottedParts(info.GetQualifiedName());
 		auto key = Key(info.GetQualifiedName());
 		DdlTarget target;
 		if (!store.ResolveDdlTarget(principal, key, "create", target)) {
@@ -1124,7 +1093,6 @@ private:
 		if (info.type != CatalogType::TABLE_ENTRY && info.type != CatalogType::VIEW_ENTRY) {
 			Deny(Reason::STATEMENT_TYPE, "only tables and views can be dropped through the ACL");
 		}
-		RequireUndottedParts(info.GetQualifiedName());
 		auto key = Key(info.GetQualifiedName());
 		DdlTarget target;
 		TablePolicy visible;
@@ -1158,7 +1126,7 @@ private:
 			     "\"" + key + "\" is granted VIRTUAL ONLY, so its physical object is not this role's to drop");
 		}
 		auto name = info.GetQualifiedName().Name();
-		info.SetQualifiedName(ParsePhysName(target.phys_schema + "." + name.GetIdentifierName()));
+		info.SetQualifiedName(ParsePhysName(NamePath::ChildKey(target.phys_schema, name.GetIdentifierName())));
 		// spec 113: the drop stays the one object the capability covers. duckdb's own CASCADE takes no
 		// other entry, but a home in another engine (postgres) would drop what depends on it there:
 		// the cascade is taken off, and an object with dependents refuses natively
@@ -1191,11 +1159,10 @@ private:
 			Deny(Reason::STATEMENT_TYPE,
 			     "statement type ALTER is not permitted under ACL - only RENAME TO inside a granted schema");
 		}
-		RequireUndottedParts(info.GetQualifiedName());
-		RequireUndotted(new_name);
 		auto key = Key(info.GetQualifiedName());
-		auto dot = key.rfind('.');
-		auto new_key = (dot == string::npos ? string() : key.substr(0, dot + 1)) + new_name.GetIdentifierName();
+		string home, leaf;
+		NamePath::SplitLeaf(key, home, leaf);
+		auto new_key = NamePath::ChildKey(home, new_name.GetIdentifierName());
 		DdlTarget from, to;
 		if (!store.ResolveDdlTarget(principal, key, "drop", from)) {
 			Deny(Reason::DDL_HOME, "no schema of the catalog allows renaming \"" + key + "\"");
@@ -1214,7 +1181,7 @@ private:
 		// a live alias resolves any name under it, so "taken" is a record of the catalog; a physical
 		// object of that name makes the ALTER itself fail - judged inside the client's own transaction
 		// (dbt swaps in one), which a look from the store's connection would not see
-		auto new_phys = from.phys_schema + "." + new_name.GetIdentifierName();
+		auto new_phys = NamePath::ChildKey(from.phys_schema, new_name.GetIdentifierName());
 		if (store.CatalogObjectExists(to.vcat, to.vname, "relation")) {
 			Deny(Reason::DDL_HOME, "\"" + new_key + "\" already exists");
 		}
@@ -1229,8 +1196,9 @@ private:
 		TablePolicy existing;
 		bool resolved = store.ResolveTable(principal, key, existing);
 		if (resolved && existing.query.empty() && !existing.phys.empty() &&
-		    !StringUtil::CIEquals(existing.phys,
-		                          from.phys_schema + "." + info.GetQualifiedName().Name().GetIdentifierName())) {
+		    !NamePath::KeyEquals(
+		        NamePath::FromKey(existing.phys).ToKey(),
+		        NamePath::ChildKey(from.phys_schema, info.GetQualifiedName().Name().GetIdentifierName()))) {
 			// a record declared over an object elsewhere: renaming the home's object of that name would
 			// re-point the record at it (the review's finding) - the record is the operator's
 			Deny(Reason::DDL_HOME, "\"" + key + "\" is declared over " + existing.phys +
@@ -1247,7 +1215,7 @@ private:
 			return;
 		}
 		auto name = info.GetQualifiedName().Name();
-		info.SetQualifiedName(ParsePhysName(from.phys_schema + "." + name.GetIdentifierName()));
+		info.SetQualifiedName(ParsePhysName(NamePath::ChildKey(from.phys_schema, name.GetIdentifierName())));
 		follow_ups.push_back(
 		    AclCall("acl_rename_relation", {Value(from.vcat), Value(from.vname), Value(to.vname), Value(new_phys)}));
 	}
@@ -1415,7 +1383,8 @@ private:
 			auto &names = expr->Cast<ColumnRefExpression>().ColumnNamesMutable();
 			if (names.size() >= 2) {
 				auto &qualifier = names[names.size() - 2];
-				auto last = SplitTopLevel(vname, '.').back();
+				string parent, last;
+				NamePath::SplitLeaf(vname, parent, last);
 				if (StringUtil::CIEquals(qualifier.GetIdentifierName(), last)) {
 					qualifier = Identifier(phys_table);
 				}
@@ -1945,16 +1914,18 @@ private:
 			if (parts.empty()) {
 				Deny(Reason::STATEMENT_TYPE, "SHOW TABLES FROM needs a schema");
 			}
-			filter = " WHERE table_schema = " + SqlLiteral(parts.back());
+			// (spec 116: a listing shows a schema unquoted, unless the part holds a `.`)
+			filter = " WHERE table_schema = " + SqlLiteral(NamePath::Display(NamePath::QuotePart(parts.back())));
 			if (parts.size() > 1) {
 				filter += " AND table_catalog = " + SqlLiteral(parts[parts.size() - 2]);
 			} else if (!use_catalog.empty() || !use_schema.empty()) {
-				filter += " AND table_catalog = " + SqlLiteral(UseCatalog()); // spec 114: the session's catalog
+				filter += " AND table_catalog = " +
+				          SqlLiteral(NamePath::Unquote(UseCatalog())); // spec 114: the session's catalog
 			}
 		} else if (!use_catalog.empty() || !use_schema.empty()) {
 			// spec 114: bare SHOW TABLES is the schema the session USEd, in its catalog
-			filter = " WHERE table_catalog = " + SqlLiteral(UseCatalog()) +
-			         " AND table_schema = " + SqlLiteral(use_schema.empty() ? string("main") : use_schema);
+			filter = " WHERE table_catalog = " + SqlLiteral(NamePath::Unquote(UseCatalog())) + " AND table_schema = " +
+			         SqlLiteral(use_schema.empty() ? string("main") : NamePath::Display(use_schema));
 		} else {
 			// bare SHOW TABLES is the current schema, which for a principal is the default one
 			filter = " WHERE table_schema = 'main'";
@@ -3491,7 +3462,8 @@ private:
 	void SubstituteSessionIdentity(unique_ptr<ParsedExpression> &expr, const string &name) {
 		auto alias = expr->GetName();
 		// spec 114: what the session USEd, else the role's MAIN catalog and its root
-		auto schema = use_schema.empty() ? string("main") : use_schema;
+		// (spec 116: the names as a listing shows them)
+		auto schema = use_schema.empty() ? string("main") : NamePath::Display(use_schema);
 		if (StringUtil::CIEquals(name, "current_schema")) {
 			expr = ConstantExpression::String(schema);
 		} else if (StringUtil::CIEquals(name, "current_schemas")) {
@@ -3499,7 +3471,7 @@ private:
 			parts.push_back(ConstantExpression::String(schema));
 			expr = make_uniq<FunctionExpression>(Identifier("list_value"), std::move(parts));
 		} else if (!use_catalog.empty() && HoldsCatalog(use_catalog)) {
-			expr = ConstantExpression::String(use_catalog); // a catalog since revoked is not claimed
+			expr = ConstantExpression::String(NamePath::Unquote(use_catalog)); // a catalog since revoked: not claimed
 		} else {
 			expr = BuildCurrentDatabaseExpr();
 		}

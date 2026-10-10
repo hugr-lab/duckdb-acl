@@ -28,6 +28,14 @@ shared_ptr<PolicyStore> SharedStoreOf(ExpressionState &state);
 //! in the refusal of a NULL; an optional argument past the last column answers its fallback.
 string RequiredArg(DataChunk &args, idx_t col, idx_t row, const char *fn, const char *what);
 string OptionalArg(DataChunk &args, idx_t col, idx_t row, const string &fallback);
+//! spec 116: a virtual or physical name argument, read with the key rules and returned as its
+//! canonical key (`'sales."Order Items"'` -> `sales.Order Items`); a malformed name is refused
+string KeyArg(DataChunk &args, idx_t col, idx_t row, const char *fn, const char *what);
+//! A name given as text, as its canonical key ('' stays '')
+string NameKey(const string &text, const char *fn, const char *what);
+//! spec 116: a catalog name argument - one identifier, as its key (`"a.b"` for a name with a dot)
+string CatalogArg(DataChunk &args, idx_t col, idx_t row, const char *fn, const char *what);
+string CatalogKey(const string &text, const char *fn, const char *what);
 string Trimmed(string value);
 
 //! A JSON string literal, quotes included: `"` and `\` escaped, every control byte below 0x20 as

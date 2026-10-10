@@ -1,4 +1,5 @@
 #include "acl_door_common.hpp"
+#include "acl_name_path.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -22,6 +23,36 @@ string RequiredArg(DataChunk &args, idx_t col, idx_t row, const char *fn, const 
 		throw InvalidInputException("%s: %s must not be NULL", fn, what);
 	}
 	return value.ToString();
+}
+
+string NameKey(const string &text, const char *fn, const char *what) {
+	if (text.empty()) {
+		return text;
+	}
+	NamePath path;
+	string error;
+	if (!NamePath::TryFromKey(text, path, error)) {
+		throw InvalidInputException("%s: the %s \"%s\" is not a name: %s", fn, what, text, error);
+	}
+	return path.ToKey();
+}
+
+string KeyArg(DataChunk &args, idx_t col, idx_t row, const char *fn, const char *what) {
+	return NameKey(RequiredArg(args, col, row, fn, what), fn, what);
+}
+
+string CatalogKey(const string &text, const char *fn, const char *what) {
+	auto key = NameKey(text, fn, what);
+	if (NamePath::KeySize(key) > 1) {
+		throw InvalidInputException("%s: a %s is one identifier - write \"%s\" in double quotes for a name with a "
+		                            "dot in it",
+		                            fn, what, text);
+	}
+	return key;
+}
+
+string CatalogArg(DataChunk &args, idx_t col, idx_t row, const char *fn, const char *what) {
+	return CatalogKey(RequiredArg(args, col, row, fn, what), fn, what);
 }
 
 string OptionalArg(DataChunk &args, idx_t col, idx_t row, const string &fallback) {

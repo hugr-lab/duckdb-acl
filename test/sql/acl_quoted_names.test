@@ -1,0 +1,580 @@
+# name: test/sql/acl_quoted_names.test
+# description: spec 116 - a virtual catalog, schema, table, view, function and the physical name it
+#   points at may be named the way SQL allows (any case, spaces, a dot or a quote inside a part), and
+#   compare case-insensitively as duckdb's catalog does. Memory mode first, then a policy catalog.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys."Raw Data";
+
+statement ok
+CREATE TABLE phys."Raw Data"."Order Items"(id INTEGER, "Qty" INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys."Raw Data"."Order Items" VALUES (1, 10, 'acme'), (2, 20, 'acme'), (3, 30, 'other');
+
+statement ok
+CREATE TABLE phys.main.u(v VARCHAR);
+
+statement ok
+INSERT INTO phys.main.u VALUES ('upper');
+
+statement ok
+CREATE SCHEMA phys.ab;
+
+statement ok
+CREATE TABLE phys.ab.t(s VARCHAR);
+
+statement ok
+INSERT INTO phys.ab.t VALUES ('the schema a.b');
+
+statement ok
+CREATE TABLE phys.main.nested(s VARCHAR);
+
+statement ok
+INSERT INTO phys.main.nested VALUES ('the path a.b');
+
+# --- memory mode: the legacy wrappers take a name as a key, the maps compare case-insensitively ------
+
+statement ok
+SELECT acl_define_role('m', '');
+
+statement ok
+SELECT acl_grant_table('m', 'mart.Order Items', 'phys."Raw Data"."Order Items"', '', '', 'select,insert');
+
+statement ok
+SELECT acl_grant_scalar('m', 'Shout-It', 'upper(acl_arg(1))');
+
+query II
+ACL ROLE "m" SELECT id, "Qty" FROM mart."Order Items" ORDER BY id;
+----
+1	10
+2	20
+3	30
+
+query I
+ACL ROLE "m" SELECT count(*) FROM MART."order items";
+----
+3
+
+query T
+ACL ROLE "m" SELECT "Shout-It"('x');
+----
+X
+
+# the whole path in one identifier is one name, not the path
+statement error
+ACL ROLE "m" SELECT * FROM "mart.Order Items";
+----
+<REGEX>:.*no access to object.*
+
+statement ok
+ACL ROLE "m" INSERT INTO mart."Order Items" VALUES (4, 40, 'acme');
+
+query I
+SELECT count(*) FROM phys."Raw Data"."Order Items";
+----
+4
+
+statement ok
+DELETE FROM phys."Raw Data"."Order Items" WHERE id = 4;
+
+# --- a policy catalog -------------------------------------------------------------------------------
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG "Sales Mart";
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG "Sales Mart" TO ROLE r MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE "Sales Mart"."Order Items" AS phys."Raw Data"."Order Items" PRIMARY KEY (id);
+
+# stored as the canonical key: a part quoted only when it holds a `.` or a `"`
+query TTT
+SELECT vcat, vname, phys FROM store.acl.relations ORDER BY vname;
+----
+Sales Mart	Order Items	phys.Raw Data.Order Items
+
+query II
+ACL ROLE "r" SELECT id, "Qty" FROM "Sales Mart"."Order Items" ORDER BY id;
+----
+1	10
+2	20
+3	30
+
+# case-insensitive, as duckdb's catalog: the catalog, the object, written any way
+query I
+ACL ROLE "r" SELECT count(*) FROM "sales mart"."ORDER ITEMS";
+----
+3
+
+query I
+ACL ROLE "r" SELECT count(*) FROM "Order Items";
+----
+3
+
+query I
+ACL ROLE "r" SELECT count(*) FROM "Sales Mart".main."Order Items";
+----
+3
+
+statement error
+ACL ROLE "r" SELECT * FROM "Sales Mart.Order Items";
+----
+<REGEX>:.*no access to object ""Sales Mart.Order Items"".*
+
+# DML through the writable alias
+statement ok
+ACL ROLE "r" INSERT INTO "Sales Mart"."Order Items" VALUES (4, 40, 'acme');
+
+statement ok
+ACL ROLE "r" UPDATE "sales mart"."order items" SET "Qty" = 41 WHERE id = 4;
+
+query I
+SELECT "Qty" FROM phys."Raw Data"."Order Items" WHERE id = 4;
+----
+41
+
+statement ok
+ACL ROLE "r" DELETE FROM "Order Items" WHERE id = 4;
+
+# --- "Upper": stored as written, read as upper / UPPER ---------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE "Sales Mart"."Upper" AS phys.main.u;
+
+query T
+ACL ROLE "r" SELECT v FROM "Sales Mart".upper;
+----
+upper
+
+query T
+ACL ROLE "r" SELECT v FROM UPPER;
+----
+upper
+
+# --- "a.b" is one schema, beside the path a.b --------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA "Sales Mart"."a.b" AS phys.ab;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE "Sales Mart".a.b AS phys.main.nested;
+
+query T
+ACL ROLE "r" SELECT s FROM "Sales Mart"."a.b".t;
+----
+the schema a.b
+
+query T
+ACL ROLE "r" SELECT s FROM "Sales Mart".a.b;
+----
+the path a.b
+
+query TT
+SELECT path, phys_path FROM store.acl.schemas ORDER BY path;
+----
+"a.b"	phys.ab
+
+# --- "x-y", "q""uote", a nested c."Raw Data".sub."T", a view ------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW "Sales Mart"."x-y" AS SELECT 1 AS v;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE "Sales Mart"."q""uote" AS phys.main.u;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c."Raw Data".sub."T" AS phys."Raw Data"."Order Items";
+
+query I
+ACL ROLE "r" SELECT v FROM "x-y";
+----
+1
+
+query T
+ACL ROLE "r" SELECT v FROM "Sales Mart"."q""uote";
+----
+upper
+
+query I
+ACL ROLE "r" SELECT count(*) FROM c."raw data".SUB.t;
+----
+3
+
+query TT
+SELECT vcat, vname FROM store.acl.relations ORDER BY vcat, vname;
+----
+Sales Mart	"q""uote"
+Sales Mart	Order Items
+Sales Mart	Upper
+Sales Mart	a.b
+Sales Mart	x-y
+c	Raw Data.sub.T
+
+# --- an expanded schema with a quoted name, and a physical name stored the old way -----------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c."Raw Data" FROM phys."Raw Data";
+
+query T
+SELECT vname FROM store.acl.relations WHERE vcat = 'c' ORDER BY vname;
+----
+Raw Data.Order Items
+Raw Data.sub.T
+
+query I
+ACL ROLE "r" SELECT count(*) FROM c."Raw Data"."Order Items";
+----
+3
+
+# a physical name written whole in single quotes (the legacy string form) is read as a key too
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.legacy AS 'phys."Raw Data"."Order Items"';
+
+query T
+SELECT phys FROM store.acl.relations WHERE vname = 'legacy';
+----
+phys.Raw Data.Order Items
+
+query I
+ACL ROLE "r" SELECT count(*) FROM c.legacy;
+----
+3
+
+# --- a table function and a scalar with quoted names -------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION "Sales Mart"."Top Items"(n INTEGER) RETURNS TABLE (id INTEGER) AS SELECT id FROM phys."Raw Data"."Order Items" ORDER BY "Qty" DESC LIMIT acl_arg(1);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR "Sales Mart"."Shout-It"(s VARCHAR) AS upper(acl_arg(1));
+
+query I
+ACL ROLE "r" SELECT id FROM "Sales Mart"."Top Items"(1);
+----
+3
+
+query I
+ACL ROLE "r" SELECT id FROM "top items"(1);
+----
+3
+
+# duckdb's transformer lowercases a function name, quoted or not: a stored "Shout-It" is still found
+query TT
+ACL ROLE "r" SELECT "Shout-It"('x'), "Sales Mart"."SHOUT-IT"('y');
+----
+X	Y
+
+# --- a reference, a key, grants with masks -------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE "Sales Mart"."Items To Upper" FROM "Order Items" TO "Upper" ON (tenant = v);
+
+query TTT
+ACL ROLE "r" SELECT vcat, from_object, to_object FROM acl_references();
+----
+Sales Mart	Order Items	Upper
+
+# a column of the pair written as a quoted identifier means the name it quotes
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE "Sales Mart"."Self" FROM "Order Items" TO "Order Items" ON ("Qty" = "Qty");
+
+query TT
+ACL ROLE "r" SELECT from_columns, to_columns FROM acl_references() WHERE name = 'Self';
+----
+Qty	Qty
+
+query TTI
+ACL ROLE "r" SELECT vcat, object, key_sequence FROM acl_keys();
+----
+Sales Mart	Order Items	1
+
+statement ok
+ACL ADMIN CREATE ROLE masked;
+
+statement ok
+ACL ADMIN GRANT CATALOG "Sales Mart" TO ROLE masked MAIN WITH (select) RLS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT TABLE "SALES MART"."order items" TO ROLE masked COLUMNS (id, "Qty" = 0);
+
+statement ok
+ACL ADMIN GRANT SCHEMA "Sales Mart"."A.B" TO ROLE masked WITH (select);
+
+query TT
+SELECT vcat, vname FROM store.acl.role_object_caps WHERE role = 'masked';
+----
+Sales Mart	Order Items
+
+query TT
+SELECT vcat, schema_path FROM store.acl.role_schemas WHERE role = 'masked';
+----
+Sales Mart	"a.b"
+
+query II
+ACL ROLE "masked" SELECT * FROM "Order Items" ORDER BY id;
+----
+1	0
+2	0
+
+# --- metadata: each name as duckdb shows it ---------------------------------------------------------
+
+query TTT
+ACL ROLE "r" SELECT table_catalog, table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'Sales Mart' ORDER BY ALL;
+----
+Sales Mart	"a.b"	t
+Sales Mart	a	b
+Sales Mart	main	Order Items
+Sales Mart	main	Upper
+Sales Mart	main	q"uote
+Sales Mart	main	x-y
+
+query TTT
+ACL ROLE "r" SELECT table_catalog, table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'c' ORDER BY ALL;
+----
+c	Raw Data	Order Items
+c	Raw Data.sub	T
+c	main	legacy
+
+query TT
+ACL ROLE "r" SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'Order Items' AND table_catalog = 'Sales Mart' ORDER BY ordinal_position;
+----
+id	INTEGER
+Qty	INTEGER
+tenant	VARCHAR
+
+query T
+ACL ROLE "r" SELECT column_name FROM (DESCRIBE "Sales Mart"."Order Items") ORDER BY ALL;
+----
+Qty
+id
+tenant
+
+query T
+ACL ROLE "r" SHOW TABLES;
+----
+Order Items
+Upper
+q"uote
+x-y
+
+query TTT
+ACL ROLE "r" SELECT database_name, schema_name, parent_schema FROM duckdb_schemas() WHERE database_name = 'c' ORDER BY ALL;
+----
+c	Raw Data	NULL
+c	main	NULL
+c	sub	Raw Data
+
+query TTT
+ACL ROLE "r" SELECT database_name, schema_name, function_name FROM duckdb_functions() WHERE database_name = 'Sales Mart' ORDER BY ALL;
+----
+Sales Mart	main	Shout-It
+Sales Mart	main	Top Items
+
+query TT
+ACL ROLE "r" SELECT current_database(), current_schema();
+----
+Sales Mart	main
+
+# the operator's check names the objects in the grammar's form
+statement ok
+DROP TABLE phys.main.nested;
+
+query TTT
+SELECT kind, object, repair FROM acl_check_catalog('sales mart') WHERE problem = 'source_missing';
+----
+table	a.b	ALTER VIRTUAL TABLE "Sales Mart".a.b SET PHYS <path>  -- or DROP VIRTUAL TABLE "Sales Mart".a.b
+
+statement ok
+CREATE TABLE phys.main.nested(s VARCHAR);
+
+# --- spec 113 DDL in a quoted home ------------------------------------------------------------------
+
+statement ok
+ACL ADMIN GRANT SCHEMA c."Raw Data" TO ROLE r WITH (select, create, drop);
+
+statement ok
+ACL ROLE "r" CREATE TABLE c."Raw Data"."New One" AS SELECT 7 AS i;
+
+query I
+SELECT i FROM phys."Raw Data"."New One";
+----
+7
+
+query I
+ACL ROLE "r" SELECT i FROM c."RAW DATA"."new one";
+----
+7
+
+query T
+SELECT vname FROM store.acl.relations WHERE vcat = 'c' AND vname LIKE '%New One';
+----
+Raw Data.New One
+
+statement ok
+ACL ROLE "r" DROP TABLE c."raw data"."New One";
+
+statement error
+SELECT * FROM phys."Raw Data"."New One";
+----
+<REGEX>:.*does not exist.*
+
+# --- negative: a name differing only by case from an existing one is refused, each kind -----------
+
+statement error
+ACL ADMIN CREATE VIRTUAL CATALOG "SALES MART";
+----
+<REGEX>:.*catalog "SALES MART" differs only by case from the existing "Sales Mart".*
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE "Sales Mart"."order items" AS phys.main.u;
+----
+<REGEX>:.*name "order items" differs only by case from the existing "Order Items".*
+
+statement error
+ACL ADMIN CREATE OR REPLACE VIRTUAL VIEW "Sales Mart"."X-Y" AS SELECT 2 AS v;
+----
+<REGEX>:.*differs only by case.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCHEMA "Sales Mart"."A.B" AS phys.ab;
+----
+<REGEX>:.*differs only by case.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCALAR "Sales Mart"."SHOUT-IT"(s VARCHAR) AS lower(acl_arg(1));
+----
+<REGEX>:.*differs only by case.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION "Sales Mart"."top items"(n INTEGER) AS SELECT 1 AS id;
+----
+<REGEX>:.*differs only by case.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL REFERENCE "Sales Mart"."items to upper" FROM "Order Items" TO "Upper" ON (tenant = v);
+----
+<REGEX>:.*reference "items to upper" differs only by case.*
+
+# IF NOT EXISTS keeps the one there, whatever case it was written in
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE IF NOT EXISTS "Sales Mart"."ORDER ITEMS" AS phys.main.u;
+
+query I
+SELECT count(*) FROM store.acl.relations WHERE lower(vname) = 'order items';
+----
+1
+
+# a parent written in another case lands under the stored one
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE C."raw data".SUB.second AS phys.main.u;
+
+query T
+SELECT vcat || ' / ' || vname FROM store.acl.relations WHERE vname LIKE '%second';
+----
+c / Raw Data.sub.second
+
+# --- negative: what is not a name -------------------------------------------------------------------
+
+statement error
+ACL ADMIN CREATE VIRTUAL CATALOG "";
+----
+<REGEX>:.*an empty quoted identifier.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL CATALOG "abc;
+----
+<REGEX>:.*unterminated quoted identifier.*
+
+statement error
+SELECT acl_add_relation('c', 'a..b', 'phys.main.u', '', '');
+----
+<REGEX>:.*is not a name: an empty part.*
+
+statement error
+SELECT acl_create_catalog('a.b');
+----
+<REGEX>:.*a catalog is one identifier.*
+
+# a catalog with a dot is written quoted, and is one name
+statement ok
+SELECT acl_create_catalog('"x.y"');
+
+query T
+SELECT vcat FROM store.acl.catalogs WHERE vcat LIKE '%x.y%';
+----
+"x.y"
+
+# roles stay values: compared exactly (a quoted role name is its text)
+statement ok
+ACL ADMIN CREATE ROLE "Mixed Role";
+
+query T
+SELECT role FROM store.acl.roles WHERE role LIKE 'Mixed%';
+----
+Mixed Role
+
+# --- the v20 migration: refuses while one name is spelled several ways ---------------------------------
+
+statement ok
+ATTACH ':memory:' AS old;
+
+statement ok
+SELECT acl_use_db('old', 'acl', true);
+
+query T
+SELECT value FROM old.acl.meta WHERE key = 'min_reader_version';
+----
+20
+
+statement ok
+INSERT INTO old.acl.relations(vcat, vname, form, phys) VALUES ('c', 'Orders', 'alias', 'phys.main.u'), ('c', 'orders', 'alias', 'phys.main.u'), ('c', 'S.a', 'alias', 'phys.main.u'), ('c', 's.b', 'alias', 'phys.main.u');
+
+statement ok
+UPDATE old.acl.meta SET "value" = '19' WHERE "key" = 'schema_version';
+
+statement ok
+UPDATE old.acl.meta SET "value" = '18' WHERE "key" = 'min_reader_version';
+
+statement error
+SELECT acl_migrate_catalog('old', 'acl');
+----
+<REGEX>:.*step v20 failed.*spelled several ways.*name c.Orders / c.orders; name c.S / c.s.*
+
+statement ok
+DELETE FROM old.acl.relations WHERE vname IN ('orders', 's.b');
+
+query T
+SELECT acl_migrate_catalog('old', 'acl');
+----
+"old"."acl" migrated from schema version 19 to 20 (readable from build 20 on)
+
+query T
+SELECT value FROM old.acl.meta WHERE key = 'min_reader_version';
+----
+20

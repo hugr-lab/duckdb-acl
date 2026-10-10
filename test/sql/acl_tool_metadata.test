@@ -157,11 +157,12 @@ ACL ROLE "r" SELECT * FROM c.main.f();
 ----
 <REGEX>:.*select on table function "c.main.f" is not allowed.*
 
-# `c.MAIN.f` reads the same way (case-insensitive), still never the root
+# `c.MAIN.f` is the same name (names compare case-insensitively, spec 116): the nested main.f, still
+# never the root
 statement error
 ACL ROLE "r" SELECT * FROM c.MAIN.f();
 ----
-<REGEX>:.*table function "f" is not allowed.*
+<REGEX>:.*select on table function "c.MAIN.f" is not allowed.*
 
 query II
 ACL ROLE "r" SELECT * FROM other.rep();

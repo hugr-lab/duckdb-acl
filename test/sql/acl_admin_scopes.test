@@ -503,20 +503,37 @@ ACL ADMIN GRANT CATALOG '' TO ROLE scoped CAPS '{"manage": true}';
 ----
 <REGEX>:.*(expected a catalog name|needs a catalog name).*
 
-# 5. catalog names are matched exactly: manage on "Sales" is not manage on "sales"
-statement ok
+# 5. catalog names compare case-insensitively, as duckdb's catalog does (spec 116): "Sales" is the
+# catalog sales - declaring it again is refused, a grant on "SALES" lands on sales, and manage on it is
+# manage on sales, never on a second catalog
+statement error
 ACL ADMIN CREATE VIRTUAL CATALOG Sales;
+----
+<REGEX>:.*catalog "Sales" differs only by case from the existing "sales".*
 
 statement ok
 ACL ADMIN CREATE ROLE caseowner;
 
 statement ok
-SELECT acl_grant_catalog('caseowner', 'Sales', '{"manage": true}', false);
+SELECT acl_grant_catalog('caseowner', 'SALES', '{"manage": true}', false);
+
+query T
+SELECT vcat FROM aclcat.acl.role_catalogs WHERE role = 'caseowner';
+----
+sales
+
+statement ok
+ACL ROLE "caseowner" ACL ADD TABLE phys.main.orders_physical AS SALES.injected;
+
+query T
+SELECT vcat || '.' || vname FROM aclcat.acl.relations WHERE vname = 'injected';
+----
+sales.injected
 
 statement error
-ACL ROLE "caseowner" ACL ADD TABLE phys.main.orders_physical AS sales.injected;
+ACL ROLE "caseowner" ACL ADD TABLE phys.main.orders_physical AS hr.injected;
 ----
-<REGEX>:.*no manage scope for catalog "sales".*
+<REGEX>:.*no manage scope for catalog "hr".*
 
 # 6. ALTER cannot silently change an object's kind (which would drop its RLS and projection)
 statement error

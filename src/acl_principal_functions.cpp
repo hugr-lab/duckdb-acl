@@ -238,10 +238,13 @@ string PolicyStore::PrincipalFunctionColumnsSql(const Principal &principal) {
 	// can call - what a JDBC driver's getFunctionColumns / getProcedureColumns read. Constants only.
 	vector<string> rows;
 	for (auto &function : CallableFunctions(*this, catalog.get(), principal)) {
-		auto dot = function.vname.rfind('.');
-		auto schema = dot == string::npos ? string("main") : function.vname.substr(0, dot);
-		auto leaf = dot == string::npos ? function.vname : function.vname.substr(dot + 1);
-		auto head = Quote(function.vcat) + ", " + Quote(schema) + ", " + Quote(leaf) + ", " + Quote(function.kind);
+		// spec 116: each name as a listing shows it - the catalog and the function unquoted, the schema
+		// unquoted unless it is a path
+		string parent, leaf;
+		NamePath::SplitLeaf(function.vname, parent, leaf);
+		auto schema = parent.empty() ? string("main") : NamePath::Display(parent);
+		auto head = Quote(NamePath::Unquote(function.vcat)) + ", " + Quote(schema) + ", " + Quote(leaf) + ", " +
+		            Quote(function.kind);
 		vector<string> names;
 		vector<string> types;
 		SplitParams(function.params, names, types);
@@ -277,15 +280,15 @@ string PolicyStore::PrincipalFunctionsSql(const Principal &principal) {
 	vector<string> rows;
 	std::set<string> shadowed; // kind \x1f name
 	for (auto &function : CallableFunctions(*this, catalog.get(), principal)) {
+		string parent, leaf;
+		NamePath::SplitLeaf(function.vname, parent, leaf);
+		auto schema = parent.empty() ? string("main") : NamePath::Display(parent);
 		if (function.bare) {
-			shadowed.insert(function.kind + "\x1f" + StringUtil::Lower(function.vname));
+			shadowed.insert(function.kind + "\x1f" + StringUtil::Lower(leaf));
 		}
 		vector<string> names;
 		vector<string> types;
 		SplitParams(function.params, names, types);
-		auto dot = function.vname.rfind('.');
-		auto schema = dot == string::npos ? string("main") : function.vname.substr(0, dot);
-		auto leaf = dot == string::npos ? function.vname : function.vname.substr(dot + 1);
 		// spec 115: a table function's declared result columns are its result type
 		Value returns = function.returns;
 		if (function.kind == "table" && !function.columns.empty()) {
@@ -296,11 +299,11 @@ string PolicyStore::PrincipalFunctionsSql(const Principal &principal) {
 			}
 			returns = Value("TABLE(" + StringUtil::Join(items, ", ") + ")");
 		}
-		rows.push_back("SELECT " + Quote(function.vcat) + "::VARCHAR, " + OidOf("database", function.vcat) +
-		               "::VARCHAR, " + Quote(schema) + "::VARCHAR, " + Quote(leaf) + "::VARCHAR, NULL::VARCHAR, " +
-		               Quote(function.kind) + "::VARCHAR, NULL::VARCHAR, " + QuoteOrNull(function.comment) +
-		               "::VARCHAR, MAP {}::MAP(VARCHAR, VARCHAR), " + QuoteOrNull(returns) + "::VARCHAR, " +
-		               ListLiteral(names) + ", " + ListLiteral(types) +
+		rows.push_back("SELECT " + Quote(NamePath::Unquote(function.vcat)) + "::VARCHAR, " +
+		               OidOf("database", function.vcat) + "::VARCHAR, " + Quote(schema) + "::VARCHAR, " + Quote(leaf) +
+		               "::VARCHAR, NULL::VARCHAR, " + Quote(function.kind) + "::VARCHAR, NULL::VARCHAR, " +
+		               QuoteOrNull(function.comment) + "::VARCHAR, MAP {}::MAP(VARCHAR, VARCHAR), " +
+		               QuoteOrNull(returns) + "::VARCHAR, " + ListLiteral(names) + ", " + ListLiteral(types) +
 		               ", NULL::VARCHAR, NULL::VARCHAR, NULL::BOOLEAN, false, NULL::VARCHAR, " +
 		               OidOf("function", function.vcat + "\x1f" + function.vname + "\x1f" + function.kind) +
 		               ", []::VARCHAR[], NULL::VARCHAR, []::VARCHAR[]");

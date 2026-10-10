@@ -135,7 +135,7 @@ struct Relation {
 	vector<string> known;               // the column names the catalog knows for it (declared, else stored)
 	bool dead = false;                  // its source does not bind: nothing below it can be judged
 	string Source() const {
-		return form == "view" ? "(" + view_sql + ")" : phys;
+		return form == "view" ? "(" + view_sql + ")" : NamePath::KeyToSql(phys);
 	}
 };
 
@@ -160,8 +160,9 @@ private:
 	         const string &repair) {
 		out.push_back(Finding {vcat, kind, object, role, problem, detail, repair});
 	}
+	//! The object's name as a repair statement writes it - each part quoted when it must be (spec 116)
 	string Named(const string &vname) const {
-		return vcat + "." + vname;
+		return NamePath::KeyToGrammar(NamePath::JoinKeys(vcat, vname));
 	}
 	unique_ptr<QueryResult> Read(const string &sql) {
 		return catalog.Query(sql);
@@ -216,7 +217,7 @@ private:
 						    "ANALYZE VIRTUAL VIEW " + Named(relation.vname));
 					}
 				}
-			} else if (!SourceBinds(catalog, relation.phys, error)) {
+			} else if (!SourceBinds(catalog, relation.Source(), error)) {
 				Add(kind, relation.vname, "", "source_missing",
 				    "the source \"" + relation.phys + "\" does not bind: " + error,
 				    "ALTER VIRTUAL TABLE " + Named(relation.vname) + " SET PHYS <path>  -- or DROP VIRTUAL TABLE " +
@@ -241,8 +242,9 @@ private:
 				}
 				if (!any_missing && stored_derived) {
 					Columns probed;
-					if (catalog.ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + relation.phys, false,
-					                        {}, probed)) {
+					if (catalog.ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " +
+					                            NamePath::KeyToSql(relation.phys),
+					                        false, {}, probed)) {
 						auto diff = SchemaDiff(stored, probed);
 						if (!diff.empty()) {
 							Add(kind, relation.vname, "", "schema_stale",
@@ -453,7 +455,8 @@ private:
 			bool scalar = kind == "scalar";
 			if (form == "alias") {
 				// the target is a function of this instance: gone with its extension, or renamed
-				auto name = target.substr(target.rfind('.') == string::npos ? 0 : target.rfind('.') + 1);
+				string parent, name;
+				NamePath::SplitLeaf(target, parent, name);
 				auto found = Read("SELECT 1 FROM duckdb_functions() WHERE lower(function_name) = " +
 				                  Lit(StringUtil::Lower(name)) + " LIMIT 1");
 				if (found->RowCount() == 0) {
@@ -655,12 +658,13 @@ private:
 				// object's reads
 				if (!rls.empty()) {
 					JudgePredicate("grant", relation, role, rls, rls_checked,
-					               "ALTER GRANT CATALOG " + vcat + " TO ROLE " + role + " SET RLS '<predicate>'");
+					               "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + role +
+					                   " SET RLS '<predicate>'");
 				}
 				for (auto &item : items) {
 					JudgeColumns(relation, role, {item}, false,
-					             "ALTER GRANT CATALOG " + vcat + " TO ROLE " + role + " SET COLUMNS " +
-					                 Lit(Without(items, item.first)),
+					             "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + role +
+					                 " SET COLUMNS " + Lit(Without(items, item.first)),
 					             &matched);
 				}
 			}
@@ -671,7 +675,7 @@ private:
 					Add("grant", "*", role, "grant_column_missing",
 					    "the catalog-wide COLUMNS item \"" + item.first + "\" matches no column of any object of \"" +
 					        vcat + "\" - the role reads less than the grant says",
-					    "ALTER GRANT CATALOG " + vcat + " TO ROLE " + role + " SET COLUMNS " +
+					    "ALTER GRANT CATALOG " + NamePath::KeyToGrammar(vcat) + " TO ROLE " + role + " SET COLUMNS " +
 					        Lit(Without(items, item.first)));
 				}
 			}
@@ -680,9 +684,15 @@ private:
 
 	//! `database.schema` of a physical schema path - the same split the schema writers make
 	static void SplitSchema(const string &phys_path, string &database, string &schema) {
-		auto dot = phys_path.find('.');
-		database = dot == string::npos ? phys_path : phys_path.substr(0, dot);
-		schema = dot == string::npos ? string() : phys_path.substr(dot + 1);
+		NamePath path;
+		string error;
+		if (!NamePath::TryFromKey(phys_path, path, error)) {
+			database = phys_path;
+			schema.clear();
+			return;
+		}
+		database = path.Head();
+		schema = path.Size() == 2 ? path.Leaf() : (path.Size() > 2 ? path.Rest().ToKey() : string());
 	}
 
 	void CheckSchemas() {
@@ -1033,7 +1043,7 @@ unique_ptr<FunctionData> CheckBind(ClientContext &, TableFunctionBindInput &inpu
 	auto bind = make_uniq<CheckBindData>();
 	bind->store = input.info->Cast<MaintenanceInfo>().store;
 	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
-		bind->vcat = input.inputs[0].ToString();
+		bind->vcat = bind->store->SpellCatalog(CatalogKey(input.inputs[0].ToString(), "acl_check_catalog", "catalog"));
 	}
 	return std::move(bind);
 }
@@ -1066,8 +1076,8 @@ void CheckScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 void RepairRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	vector<Value> counts;
 	for (idx_t row = 0; row < args.size(); row++) {
-		auto vcat = RequiredArg(args, 0, row, "acl_repair_relation", "catalog");
-		auto vname = RequiredArg(args, 1, row, "acl_repair_relation", "name");
+		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_repair_relation", "catalog"));
+		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_repair_relation", "name"));
 		auto action = RequiredArg(args, 2, row, "acl_repair_relation", "action");
 		auto spec = OptionalArg(args, 3, row, "");
 		counts.push_back(Value::BIGINT(StoreOf(state).CatalogRepairRelation(vcat, vname, action, spec)));

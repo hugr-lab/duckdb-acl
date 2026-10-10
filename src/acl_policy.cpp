@@ -214,28 +214,15 @@ string TablePolicy::CastItems(const vector<std::pair<string, string>> &casts) {
 
 string TablePolicy::ReadFrom() const {
 	auto where = rls.empty() ? string() : " WHERE " + rls;
+	// spec 116: `phys` is a stored key; the binder reads it as SQL
+	auto source = NamePath::KeyToSql(phys);
 	if (casts.empty()) {
-		return " FROM " + phys + where;
+		return " FROM " + source + where;
 	}
-	// the last part of the physical name, outside quotes: what a projection item may qualify a column by
-	string last;
-	bool in_quotes = false;
-	for (idx_t i = 0; i < phys.size(); i++) {
-		auto ch = phys[i];
-		if (ch == '"') {
-			if (in_quotes && i + 1 < phys.size() && phys[i + 1] == '"') {
-				last += '"';
-				i++;
-				continue;
-			}
-			in_quotes = !in_quotes;
-		} else if (ch == '.' && !in_quotes) {
-			last.clear();
-		} else {
-			last += ch;
-		}
-	}
-	return " FROM (SELECT " + CastItems(casts) + " FROM " + phys + where + ") AS \"" +
+	// the last part of the physical name: what a projection item may qualify a column by
+	string parent, last;
+	NamePath::SplitLeaf(phys, parent, last);
+	return " FROM (SELECT " + CastItems(casts) + " FROM " + source + where + ") AS \"" +
 	       StringUtil::Replace(last, "\"", "\"\"") + "\"";
 }
 
@@ -1475,6 +1462,23 @@ string PolicyStore::SecretService(const string &named) {
 	return services[0];
 }
 
+namespace {
+
+//! `<vcat>.main.<x>` (spec 112/115) -> `<vcat>.<x>`: the object at the catalog's root, by the name lineage
+//! and a quack client give it; `main` compared case-insensitively (spec 116)
+bool MainFallback(const string &vname, string &root) {
+	NamePath path;
+	string error;
+	if (!NamePath::TryFromKey(vname, path, error) || path.Size() != 3 ||
+	    !StringUtil::CIEquals(path.Parts()[1], "main")) {
+		return false;
+	}
+	root = NamePath({path.Parts()[0], path.Parts()[2]}).ToKey();
+	return true;
+}
+
+} // namespace
+
 bool PolicyStore::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {
 	auto resolve = [&](const string &name) {
 		return catalog ? CatalogResolveTable(principal, name, out) : Resolve(tables, principal, name, out);
@@ -1484,9 +1488,9 @@ bool PolicyStore::ResolveTable(const Principal &principal, const string &vname, 
 	}
 	// spec 112: `<vcat>.main.<object>` is the object of the catalog's default schema - the name lineage
 	// gives it (OpenLineage's three parts), so a client that copies it from a data catalog reaches it
-	auto parts = StringUtil::Split(vname, '.');
-	if (parts.size() == 3 && parts[1] == "main") { // as written (spec 115): see ResolveFunctionNamed
-		return resolve(parts[0] + "." + parts[2]);
+	string root;
+	if (MainFallback(vname, root)) {
+		return resolve(root);
 	}
 	return false;
 }
@@ -1512,12 +1516,11 @@ bool PolicyStore::ResolveFunctionNamed(const Principal &principal, const string 
 	}
 	// spec 115: `<vcat>.main.<f>` is the function at the catalog's root - only when no function is stored
 	// under that very name (`main.f`, a nested schema called main): two functions are never merged
-	auto dot = vname.find('.');
-	// (the segment as written, `main`: a stored name is matched exactly, so `c.MAIN.f` must not miss a
-	// nested `main.f` and then land on the root `f`)
-	if (dot != string::npos && StringUtil::StartsWith(vname.substr(dot + 1), "main.") &&
-	    vname.find('.', dot + 6) == string::npos) {
-		return resolve(vname.substr(0, dot) + "." + vname.substr(dot + 6));
+	// (spec 116: names compare case-insensitively, so `c.MAIN.f` finds a nested `main.f` above, before
+	// this fallback could land it on the root `f`)
+	string root;
+	if (MainFallback(vname, root)) {
+		return resolve(root);
 	}
 	return false;
 }

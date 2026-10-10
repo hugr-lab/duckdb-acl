@@ -443,8 +443,9 @@ SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'phys'
 deep	t
 other	t
 
-# --- a name part with a dot in it names another, nested object: refused in every DDL (the review's
-# finding - a RENAME to "sub.t" re-pointed a record at a hidden nested table) -----------------------------
+# --- a name part with a dot in it is ONE identifier (spec 116, lifting spec 113's refusal): "sub.t" is
+# a table named so, never the nested sub.t - the review's finding (a RENAME to "sub.t" re-pointed a
+# record at a hidden nested table) cannot happen, because the key keeps the part whole ---------------------
 
 statement ok
 CREATE SCHEMA phys.lake.sub;
@@ -455,30 +456,49 @@ CREATE TABLE phys.lake.sub.t AS SELECT 'hidden' AS s;
 statement ok
 ACL ROLE "dbt" CREATE TABLE vs.mine AS SELECT 1 AS i;
 
-statement error
+statement ok
 ACL ROLE "dbt" ALTER TABLE vs.mine RENAME TO "sub.t";
-----
-has a dot in it
-
-statement error
-ACL ROLE "dbt" CREATE TABLE vs."sub.t2" AS SELECT 1 AS i;
-----
-has a dot in it
-
-statement error
-ACL ROLE "dbt" DROP TABLE vs."sub.t";
-----
-has a dot in it
-
-statement error
-ACL ROLE "dbt" CREATE VIEW vs."sub.v" AS SELECT 1 AS i;
-----
-has a dot in it
 
 query I
-SELECT count(*) FROM phys.lake.sub.t;
+ACL ROLE "dbt" SELECT * FROM vs."sub.t";
 ----
 1
+
+query I
+SELECT i FROM phys.lake."sub.t";
+----
+1
+
+statement ok
+ACL ROLE "dbt" CREATE TABLE vs."sub.t2" AS SELECT 2 AS i;
+
+query I
+SELECT i FROM phys.lake."sub.t2";
+----
+2
+
+statement ok
+ACL ROLE "dbt" CREATE VIEW vs."sub.v" AS SELECT 3 AS i;
+
+query I
+ACL ROLE "dbt" SELECT * FROM vs."sub.v";
+----
+3
+
+statement ok
+ACL ROLE "dbt" DROP TABLE vs."sub.t";
+
+statement ok
+ACL ROLE "dbt" DROP TABLE vs."sub.t2";
+
+statement ok
+ACL ROLE "dbt" DROP VIEW vs."sub.v";
+
+# the nested table was never touched
+query T
+SELECT s FROM phys.lake.sub.t;
+----
+hidden
 
 # --- an unqualified name is a path in the MAIN catalog only ------------------------------------------------
 

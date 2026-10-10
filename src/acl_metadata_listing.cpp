@@ -23,17 +23,18 @@ vector<CatalogBackend::VisibleFunction> CatalogBackend::VisibleFunctions(const P
 	// the same visibility a call resolves with: a grant on the catalog that is not an explicit nothing.
 	// Every catalog the principal holds (spec 115): a call reaches any of them qualified; a flat name of
 	// the one MAIN catalog is also reached bare
-	auto sql =
-	    GrantsCte(principal) +
-	    " SELECT f.\"vcat\", f.\"vname\", f.\"kind\", any_value(f.\"params\"), any_value(f.\"comment\"),"
-	    " (SELECT c.\"type\" FROM " +
-	    Tbl("object_columns") +
-	    " c WHERE c.\"vcat\" = f.\"vcat\" AND c.\"vname\" = f.\"vname\" AND c.\"kind\" = 'scalar'"
-	    " ORDER BY c.\"pos\" LIMIT 1),"
-	    " bool_or(g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND position('.' IN f.\"vname\") = 0)"
-	    " FROM " +
-	    Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join + " WHERE " + FunctionVisibleExpr() +
-	    " GROUP BY 1, 2, 3 ORDER BY 1, 2, 3";
+	auto sql = GrantsCte(principal) +
+	           " SELECT f.\"vcat\", f.\"vname\", f.\"kind\", any_value(f.\"params\"), any_value(f.\"comment\"),"
+	           " (SELECT c.\"type\" FROM " +
+	           Tbl("object_columns") +
+	           " c WHERE c.\"vcat\" = f.\"vcat\" AND c.\"vname\" = f.\"vname\" AND c.\"kind\" = 'scalar'"
+	           " ORDER BY c.\"pos\" LIMIT 1),"
+	           " bool_or(g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND NOT " +
+	           KeyNestedSql("f.\"vname\"") +
+	           ")"
+	           " FROM " +
+	           Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join + " WHERE " +
+	           FunctionVisibleExpr() + " GROUP BY 1, 2, 3 ORDER BY 1, 2, 3";
 	auto result = Query(sql);
 	ResultRows rows(*result);
 	case_insensitive_map_t<idx_t> table_functions; // vcat \x1f vname -> index in out
@@ -111,15 +112,21 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                  " 'current_user', 'localtime', 'localtimestamp', 'session_user', 'user')"
 	                  " GROUP BY 1, 2)";
 	string missing =
-	    "CASE WHEN r.\"form\" IN ('alias', 'subquery') AND len(str_split(r.\"phys\", '.')) = 3"
+	    "CASE WHEN r.\"form\" IN ('alias', 'subquery') AND len(" + KeyPartsSql("r.\"phys\"") +
+	    ") = 3"
 	    " AND d.names IS NOT NULL THEN nullif(array_to_string(list_transform(list_filter("
 	    "range(1, len(d.names) + 1), lambda i: NOT list_contains(coalesce(p.cols, []::VARCHAR[]), d.reads[i])),"
 	    " lambda i: d.names[i]), ', '), '') ELSE NULL END";
 	string relations_marked = "(SELECT r.*, " + missing + " AS missing FROM " + Tbl("relations") +
 	                          " r LEFT JOIN declared d ON d.vcat = r.\"vcat\" AND d.vname = r.\"vname\""
-	                          " LEFT JOIN physcols p ON p.table_catalog = str_split(r.\"phys\", '.')[1]"
-	                          " AND p.table_schema = str_split(r.\"phys\", '.')[2]"
-	                          " AND p.table_name = str_split(r.\"phys\", '.')[3])";
+	                          " LEFT JOIN physcols p ON p.table_catalog = " +
+	                          KeyPartsSql("r.\"phys\"") +
+	                          "[1]"
+	                          " AND p.table_schema = " +
+	                          KeyPartsSql("r.\"phys\"") +
+	                          "[2]"
+	                          " AND p.table_name = " +
+	                          KeyPartsSql("r.\"phys\"") + "[3])";
 	string marked = "CASE WHEN r.missing IS NOT NULL THEN 'acl: broken - declared column(s) ' || r.missing ||"
 	                " ' no longer exist in the source' || CASE WHEN r.\"comment\" IS NULL OR r.\"comment\" = ''"
 	                " THEN '' ELSE '; ' || r.\"comment\" END ELSE r.\"comment\" END";
@@ -136,15 +143,16 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	string enums_to_varchar = "(coalesce(r.\"enum_types\" = 'varchar', " +
 	                          string(NodeEnumsToVarchar(*instance) ? "true" : "false") + ") AND " + has_facts + ")";
 	string objects = "objects AS (SELECT DISTINCT r.\"vcat\" AS vcat,"
-	                 " CASE WHEN position('.' IN r.\"vname\") > 0"
-	                 " THEN regexp_extract(r.\"vname\", '^(.*)[.][^.]*$', 1) ELSE 'main' END AS vschema,"
-	                 " regexp_extract(r.\"vname\", '([^.]*)$', 1) AS vname, r.\"vname\" AS stored_name,"
+	                 " CASE WHEN " +
+	                 KeyNestedSql("r.\"vname\"") + " THEN " + KeyParentSql("r.\"vname\"") +
+	                 " ELSE 'main' END AS vschema, " + KeyLeafSql("r.\"vname\"") +
+	                 " AS vname, r.\"vname\" AS stored_name,"
 	                 " r.\"form\" AS form, " +
 	                 strip_alias + " AS strip_alias, " + enums_to_varchar + " AS enums_to_varchar, " + marked +
 	                 " AS comment,"
-	                 " str_split(r.\"phys\", '.') AS parts FROM " +
-	                 relations_marked + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " + visible +
-	                 ")";
+	                 " " +
+	                 KeyPartsSql("r.\"phys\"") + " AS parts FROM " + relations_marked +
+	                 " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " + visible + ")";
 	// an alias schema shows the physical schema live, so its visibility is the role's capabilities
 	// on that schema (its own grant if it has one, otherwise the catalog's) - without this filter a
 	// role granted an explicit nothing would still read the names out of the source
@@ -154,30 +162,33 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	auto schema_visible =
 	    "(" + schema_caps + " IS NULL OR trim(" + schema_caps + ") = '' OR trim(" + schema_caps + ") <> '{}')";
 	string aliases = "aliases AS (SELECT DISTINCT s.\"vcat\" AS vcat, s.\"path\" AS path,"
-	                 " str_split(s.\"phys_path\", '.') AS parts FROM " +
-	                 Tbl("schemas") +
+	                 " " +
+	                 KeyPartsSql("s.\"phys_path\"") + " AS parts FROM " + Tbl("schemas") +
 	                 " s JOIN grants g ON g.\"vcat\" = s.\"vcat\""
 	                 " WHERE s.\"phys_path\" IS NOT NULL AND " +
 	                 schema_visible + ")";
 	// a schema exists for the principal when something inside it does - a relation, an alias, or a
 	// function it can see (spec 115) - and so does every schema above a nested one, so a tool can build
 	// the tree from the parents
-	string function_schemas =
-	    "fschemas AS (SELECT DISTINCT f.\"vcat\" AS vcat,"
-	    " CASE WHEN position('.' IN f.\"vname\") > 0 THEN regexp_extract(f.\"vname\", '^(.*)[.][^.]*$', 1)"
-	    " ELSE 'main' END AS path FROM " +
-	    Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" +
-	    (HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
-	                           " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
-	                           " AND oc.\"vname\" = f.\"vname\""
-	                     : string()) +
-	    " WHERE " + FunctionVisibleExpr() + ")";
+	string function_schemas = "fschemas AS (SELECT DISTINCT f.\"vcat\" AS vcat,"
+	                          " CASE WHEN " +
+	                          KeyNestedSql("f.\"vname\"") + " THEN " + KeyParentSql("f.\"vname\"") +
+	                          " ELSE 'main' END AS path FROM " + Tbl("functions") +
+	                          " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" +
+	                          (HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
+	                                                 " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
+	                                                 " AND oc.\"vname\" = f.\"vname\""
+	                                           : string()) +
+	                          " WHERE " + FunctionVisibleExpr() + ")";
 	string schemas = function_schemas +
 	                 ", leafschemas AS (SELECT vcat, path FROM aliases UNION SELECT vcat, vschema FROM objects"
 	                 " UNION SELECT vcat, path FROM fschemas),"
 	                 " vschemas AS (SELECT vcat, path FROM leafschemas UNION SELECT vcat, unnest(list_transform("
-	                 "range(1, len(str_split(path, '.'))), lambda i: array_to_string(str_split(path, '.')[1:i], '.')))"
-	                 " FROM leafschemas WHERE position('.' IN path) > 0)";
+	                 "range(1, len(" +
+	                 KeyTokensSql("path") + ")), lambda i: array_to_string(" + KeyTokensSql("path") +
+	                 "[1:i], '.')))"
+	                 " FROM leafschemas WHERE " +
+	                 KeyNestedSql("path") + ")";
 	// spec 011 narrows columns per grant level, and the listing has to narrow with it: the object
 	// row is kept per role here (unlike `objects`, which collapses them) so that "visible for at
 	// least one role" can be asked column by column.
@@ -230,6 +241,22 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// type. A value that would describe the physical object rather than the virtual one is not
 	// borrowed - an oid identifies a physical catalog entry, a path is the physical database.
 	auto empty_map = "MAP {}::MAP(VARCHAR, VARCHAR)";
+	// spec 116: the CTEs above work on stored keys (a part holding `.` or `"` quoted), which is what
+	// every join and oid reads; what a surface answers is each name as duckdb shows one - a catalog and
+	// an object unquoted (`Order Items`), a schema unquoted when it is one part (`Raw Data`) and its key
+	// when it is a path (`a."b.c"`). `order` re-states the order the body asked for.
+	enum class Shown { CATALOG, SCHEMA, NAME };
+	auto named = [](const string &body, const vector<std::pair<const char *, Shown>> &columns,
+	                const string &order = string()) {
+		vector<string> items;
+		for (auto &column : columns) {
+			auto ref = string("\"") + column.first + "\"";
+			auto shown = column.second == Shown::SCHEMA ? KeyDisplaySql(ref) : KeyUnquoteSql(ref);
+			items.push_back(shown + " AS " + ref);
+		}
+		return "SELECT * REPLACE (" + StringUtil::Join(items, ", ") + ") FROM (" + body + ") __acl_named" +
+		       (order.empty() ? string() : " ORDER BY " + order);
+	};
 	// An oid a client can key on, with nothing physical in it. Spec 035 answered every oid with
 	// NULL - a physical catalog entry's identifier is not a fact about a virtual object - and that
 	// held until quack started joining tables to schemas by oid and reading it as int64 (its
@@ -254,48 +281,53 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	};
 	if (surface == "databases") {
 		// one row per granted catalog, and no physical database name ever appears
-		return prelude + "SELECT vcat AS database_name, " + database_oid("vcat") +
-		       " AS database_oid, NULL::VARCHAR AS path,"
-		       " NULL::VARCHAR AS comment, " +
-		       empty_map +
-		       " AS tags, false AS internal, NULL::VARCHAR AS type,"
-		       " false AS readonly, false AS encrypted, NULL::VARCHAR AS cipher, " +
-		       empty_map + " AS options FROM (SELECT DISTINCT vcat FROM vschemas)";
+		return prelude + named("SELECT vcat AS database_name, " + database_oid("vcat") +
+		                           " AS database_oid, NULL::VARCHAR AS path,"
+		                           " NULL::VARCHAR AS comment, " +
+		                           empty_map +
+		                           " AS tags, false AS internal, NULL::VARCHAR AS type,"
+		                           " false AS readonly, false AS encrypted, NULL::VARCHAR AS cipher, " +
+		                           empty_map + " AS options FROM (SELECT DISTINCT vcat FROM vschemas)",
+		                       {{"database_name", Shown::CATALOG}});
 	}
 	if (surface == "schemata") {
-		return prelude + "SELECT DISTINCT vcat AS catalog_name, path AS schema_name,"
-		                 " NULL::VARCHAR AS schema_owner, NULL::VARCHAR AS default_character_set_catalog,"
-		                 " NULL::VARCHAR AS default_character_set_schema,"
-		                 " NULL::VARCHAR AS default_character_set_name, NULL::VARCHAR AS sql_path"
-		                 " FROM vschemas";
+		return prelude + named("SELECT DISTINCT vcat AS catalog_name, path AS schema_name,"
+		                       " NULL::VARCHAR AS schema_owner, NULL::VARCHAR AS default_character_set_catalog,"
+		                       " NULL::VARCHAR AS default_character_set_schema,"
+		                       " NULL::VARCHAR AS default_character_set_name, NULL::VARCHAR AS sql_path"
+		                       " FROM vschemas",
+		                       {{"catalog_name", Shown::CATALOG}, {"schema_name", Shown::SCHEMA}});
 	}
 	if (surface == "duckdb_schemas") {
 		// spec 115: duckdb's own shape for a nested schema - the leaf as schema_name, the parent's leaf as
 		// parent_schema and its oid: a client (quack) builds the tree by the oids, and a full path there
 		// doubled its levels (`raw` -> `raw.eu`). The oid stays the full path's, as every other surface's
 		// schema_oid is.
-		return prelude + "SELECT " + schema_oid("vcat", "path") + " AS oid, vcat AS database_name, " +
-		       database_oid("vcat") +
-		       " AS database_oid, regexp_extract(path, '([^.]*)$') AS schema_name, NULL::VARCHAR AS comment, " +
-		       empty_map +
-		       " AS tags, false AS internal, NULL::VARCHAR AS sql,"
-		       " regexp_extract(parent, '([^.]*)$') AS parent_schema, CASE WHEN parent IS NULL THEN NULL ELSE " +
-		       schema_oid("vcat", "parent") +
-		       " END AS parent_schema_oid FROM (SELECT DISTINCT vcat, path, CASE WHEN position('.' IN path) > 0 THEN"
-		       " regexp_extract(path, '^(.*)[.][^.]*$', 1) END AS parent FROM vschemas)";
+		// (spec 116: the leaves unquoted - a part holding a dot is one schema, never two levels)
+		return prelude +
+		       named("SELECT " + schema_oid("vcat", "path") + " AS oid, vcat AS database_name, " +
+		                 database_oid("vcat") + " AS database_oid, " + KeyUnquoteSql(KeyLeafSql("path")) +
+		                 " AS schema_name, NULL::VARCHAR AS comment, " + empty_map +
+		                 " AS tags, false AS internal, NULL::VARCHAR AS sql, " + KeyUnquoteSql(KeyLeafSql("parent")) +
+		                 " AS parent_schema, CASE WHEN parent IS NULL THEN NULL ELSE " + schema_oid("vcat", "parent") +
+		                 " END AS parent_schema_oid FROM (SELECT DISTINCT vcat, path, CASE WHEN " +
+		                 KeyNestedSql("path") + " THEN " + KeyParentSql("path") + " END AS parent FROM vschemas)",
+		             {{"database_name", Shown::CATALOG}});
 	}
 	// spec 031: the SHOW forms, each in the shape duckdb answers it with. They are the same catalog
 	// the information_schema surfaces describe - only a client asking `SHOW DATABASES` wants one
 	// column called `database_name`, not an information_schema row.
 	if (surface == "show_databases") {
-		return prelude + "SELECT DISTINCT vcat AS database_name FROM vschemas ORDER BY 1";
+		return prelude +
+		       named("SELECT DISTINCT vcat AS database_name FROM vschemas", {{"database_name", Shown::CATALOG}}, "1");
 	}
 	if (surface == "show_schemas") {
 		// `current` is the schema an unqualified name resolves in: `main` of the catalog the
 		// principal holds as MAIN, which is exactly what resolution falls back to
-		return prelude + "SELECT DISTINCT s.vcat AS database_name, s.path AS schema_name,"
-		                 " (s.path = 'main' AND EXISTS (SELECT 1 FROM grants g WHERE g.\"vcat\" = s.vcat"
-		                 " AND g.\"is_main\" = true)) AS \"current\" FROM vschemas s ORDER BY ALL";
+		return prelude + named("SELECT DISTINCT s.vcat AS database_name, s.path AS schema_name,"
+		                       " (s.path = 'main' AND EXISTS (SELECT 1 FROM grants g WHERE g.\"vcat\" = s.vcat"
+		                       " AND g.\"is_main\" = true)) AS \"current\" FROM vschemas s",
+		                       {{"database_name", Shown::CATALOG}, {"schema_name", Shown::SCHEMA}}, "ALL");
 	}
 	auto physical = "i.\"table_catalog\" = o.parts[1] AND i.\"table_schema\" = o.parts[2]"
 	                " AND i.\"table_name\" = o.parts[3]";
@@ -337,20 +369,23 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " 'VIEW' AS table_type, 'NO' AS is_insertable_into FROM objects o WHERE o.form = 'view'"
 	    " UNION ALL BY NAME"
 	    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +
-	    alias_insertable +
+	    KeyQuotePartSql("i.\"table_name\"") + " AS table_name, " + alias_insertable +
 	    ") FROM aliases a JOIN information_schema.tables i"
 	    " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
 	    " WHERE len(a.parts) = 2";
+	const vector<std::pair<const char *, Shown>> table_names = {
+	    {"table_catalog", Shown::CATALOG}, {"table_schema", Shown::SCHEMA}, {"table_name", Shown::NAME}};
 	if (surface == "tables") {
-		return prelude + tables_sql;
+		return prelude + named(tables_sql, table_names);
 	}
 	if (surface == "show_tables") {
 		// a bare `SHOW TABLES` is the schema an unqualified name resolves in - `main` of the MAIN
 		// catalog. Filtering on the schema alone listed the `main` of every granted catalog, whose
 		// tables a bare name does not reach (spec 031).
-		return prelude + "SELECT t.table_name AS name FROM (" + tables_sql +
-		       ") t WHERE t.table_schema = 'main' AND EXISTS (SELECT 1 FROM grants g"
-		       " WHERE g.\"vcat\" = t.table_catalog AND g.\"is_main\" = true) ORDER BY 1";
+		return prelude + named("SELECT t.table_name AS name FROM (" + tables_sql +
+		                           ") t WHERE t.table_schema = 'main' AND EXISTS (SELECT 1 FROM grants g"
+		                           " WHERE g.\"vcat\" = t.table_catalog AND g.\"is_main\" = true)",
+		                       {{"name", Shown::NAME}}, "1");
 	}
 	if (surface != "columns" && surface != "references" && surface != "keys" && surface != "show_tables_expanded" &&
 	    surface != "show_tables" && surface != "duckdb_tables" && surface != "duckdb_views" &&
@@ -418,7 +453,9 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " AND oc.\"vname\" = CASE WHEN o.vschema = 'main' THEN o.vname"
 	    " ELSE o.vschema || '.' || o.vname END WHERE o.form <> 'alias'"
 	    " UNION ALL BY NAME"
-	    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema)"
+	    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +
+	    KeyQuotePartSql("i.\"table_name\"") +
+	    " AS table_name)"
 	    " FROM aliases a JOIN information_schema.columns i"
 	    " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
 	    " WHERE len(a.parts) = 2";
@@ -477,9 +514,10 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " AND gp.name = l.column_name)" +
 	    " UNION ALL BY NAME"
 	    " SELECT gp.vcat AS table_catalog,"
-	    " CASE WHEN position('.' IN gp.vname) > 0 THEN regexp_extract(gp.vname, '^(.*)[.][^.]*$', 1)"
-	    " ELSE 'main' END AS table_schema,"
-	    " regexp_extract(gp.vname, '([^.]*)$', 1) AS table_name,"
+	    " CASE WHEN " +
+	    KeyNestedSql("gp.vname") + " THEN " + KeyParentSql("gp.vname") + " ELSE 'main' END AS table_schema, " +
+	    KeyLeafSql("gp.vname") +
+	    " AS table_name,"
 	    " gp.name AS column_name, gp.pos + 1 AS ordinal_position,"
 	    " acl_exposed_type(coalesce(CASE WHEN s.data_type IS NULL THEN NULL ELSE acl_listed_type(s.data_type,"
 	    " gp.name, " +
@@ -489,26 +527,30 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    path("o") + " = gp.vname LEFT JOIN lcols s ON s.table_catalog = gp.vcat AND " + source_path +
 	    " = gp.vname AND lower(s.column_name) = lower(gp.name)";
 	if (surface == "columns") {
-		return prelude + effective_columns;
+		return prelude + named(effective_columns, table_names);
 	}
 	if (surface == "duckdb_columns") {
 		// the same rows as information_schema.columns, in duckdb's own shape. `is_nullable` and
 		// `is_generated` are booleans there and strings here, and a synthesized row (a mask, a
 		// computed column) has neither - duckdb always answers, so a default is closer than a NULL.
-		return prelude + "SELECT c.table_catalog AS database_name, " + database_oid("c.table_catalog") +
-		       " AS database_oid, c.table_schema AS schema_name, " + schema_oid("c.table_catalog", "c.table_schema") +
-		       " AS schema_oid, c.table_name AS table_name, " +
-		       object_oid("table", "c.table_catalog", "c.table_schema", "c.table_name") + " AS table_oid," +
-		       " c.column_name AS column_name, c.ordinal_position::INTEGER AS column_index," +
-		       " c.\"COLUMN_COMMENT\" AS comment, false AS internal," + " c.column_default AS column_default," +
-		       " coalesce(c.is_nullable = 'YES', true) AS is_nullable," +
-		       " c.data_type AS data_type, NULL::BIGINT AS data_type_id," +
-		       " c.character_maximum_length::INTEGER AS character_maximum_length," +
-		       " c.numeric_precision::INTEGER AS numeric_precision," +
-		       " c.numeric_precision_radix::INTEGER AS numeric_precision_radix," +
-		       " c.numeric_scale::INTEGER AS numeric_scale, " + empty_map +
-		       " AS tags, coalesce(c.is_generated = 'YES', false) AS is_generated," +
-		       " c.generation_expression AS generation_expression FROM (" + effective_columns + ") c";
+		return prelude +
+		       named("SELECT c.table_catalog AS database_name, " + database_oid("c.table_catalog") +
+		                 " AS database_oid, c.table_schema AS schema_name, " +
+		                 schema_oid("c.table_catalog", "c.table_schema") +
+		                 " AS schema_oid, c.table_name AS table_name, " +
+		                 object_oid("table", "c.table_catalog", "c.table_schema", "c.table_name") + " AS table_oid," +
+		                 " c.column_name AS column_name, c.ordinal_position::INTEGER AS column_index," +
+		                 " c.\"COLUMN_COMMENT\" AS comment, false AS internal," +
+		                 " c.column_default AS column_default," +
+		                 " coalesce(c.is_nullable = 'YES', true) AS is_nullable," +
+		                 " c.data_type AS data_type, NULL::BIGINT AS data_type_id," +
+		                 " c.character_maximum_length::INTEGER AS character_maximum_length," +
+		                 " c.numeric_precision::INTEGER AS numeric_precision," +
+		                 " c.numeric_precision_radix::INTEGER AS numeric_precision_radix," +
+		                 " c.numeric_scale::INTEGER AS numeric_scale, " + empty_map +
+		                 " AS tags, coalesce(c.is_generated = 'YES', false) AS is_generated," +
+		                 " c.generation_expression AS generation_expression FROM (" + effective_columns + ") c",
+		             {{"database_name", Shown::CATALOG}, {"schema_name", Shown::SCHEMA}, {"table_name", Shown::NAME}});
 	}
 	if (surface == "duckdb_tables" || surface == "duckdb_views") {
 		bool views = surface == "duckdb_views";
@@ -522,7 +564,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		};
 		// what the role reads, spelled as DDL a client can parse and bind - never the physical
 		// `CREATE TABLE`, which names the physical object and its full set of columns
-		string ddl = "(SELECT 'CREATE TABLE ' || " + quoted("t.table_name") + " || '(' || string_agg(" +
+		string ddl = "(SELECT 'CREATE TABLE ' || " + quoted(KeyUnquoteSql("t.table_name")) + " || '(' || string_agg(" +
 		             quoted("c.column_name") + " || ' ' || c.data_type, ', ' ORDER BY c.ordinal_position)" +
 		             " || ');'" + of_this_table + ")";
 		string head = string("SELECT t.table_catalog AS database_name, ") + database_oid("t.table_catalog") +
@@ -558,18 +600,22 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		// vcolumns is the same fold every other answer here uses)
 		// the filter is the tables branch's own: only there is `sql` synthesized from the columns,
 		// and a view whose shape was never probed must stay listed (its read still answers)
-		return prelude + ", vcolumns AS (" + effective_columns + ") " + head + tail + " FROM (" + tables_sql +
-		       ") t WHERE t.table_type " + (views ? "=" : "<>") + " 'VIEW'" +
-		       (views ? string() : " AND EXISTS (SELECT 1" + of_this_table + ")");
+		return prelude + ", vcolumns AS (" + effective_columns + ") " +
+		       named(head + tail + " FROM (" + tables_sql + ") t WHERE t.table_type " + (views ? "=" : "<>") +
+		                 " 'VIEW'" + (views ? string() : " AND EXISTS (SELECT 1" + of_this_table + ")"),
+		             {{"database_name", Shown::CATALOG},
+		              {"schema_name", Shown::SCHEMA},
+		              {views ? "view_name" : "table_name", Shown::NAME}});
 	}
 	if (surface == "show_tables_expanded") {
 		// `SHOW ALL TABLES`: every table of every catalog the principal holds, with the columns it
 		// reads - the same fold duckdb does over duckdb_tables + duckdb_columns
-		return prelude + ", vcolumns AS (" + effective_columns +
-		       ") SELECT c.table_catalog AS database, c.table_schema AS schema, c.table_name AS name,"
-		       " list(c.column_name ORDER BY c.ordinal_position) AS column_names,"
-		       " list(c.data_type ORDER BY c.ordinal_position) AS column_types, false AS temporary"
-		       " FROM vcolumns c GROUP BY ALL ORDER BY ALL";
+		return prelude + ", vcolumns AS (" + effective_columns + ") " +
+		       named("SELECT c.table_catalog AS database, c.table_schema AS schema, c.table_name AS name,"
+		             " list(c.column_name ORDER BY c.ordinal_position) AS column_names,"
+		             " list(c.data_type ORDER BY c.ordinal_position) AS column_types, false AS temporary"
+		             " FROM vcolumns c GROUP BY ALL",
+		             {{"database", Shown::CATALOG}, {"schema", Shown::SCHEMA}, {"name", Shown::NAME}}, "ALL");
 	}
 	// spec 048: the declared keys a principal may see - the object visible, and every column the
 	// key names visible (a listed key over a hidden column describes what the role cannot read).
@@ -592,24 +638,24 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		                         ") OR EXISTS (SELECT 1 FROM gfcolumns gf WHERE " + fkey + " AND " +
 		                         keeps("gf.cat_columns", "k2.\"column\"") + " AND " +
 		                         keeps("gf.obj_columns", "k2.\"column\"") + "))";
-		return prelude + ", vcolumns AS (" + effective_columns + "), " + gfcolumns +
-		       " SELECT k.\"vcat\" AS vcat, k.\"vname\" AS object, k.\"kind\" AS kind,"
-		       " k.\"pos\" + 1 AS key_sequence, k.\"column\" AS \"column\" FROM " +
-		       Tbl("keys") +
-		       " k WHERE (CASE WHEN k.\"kind\" = 'table'"
-		       " THEN EXISTS (SELECT 1 FROM vfunctions vf WHERE vf.vcat = k.\"vcat\""
-		       " AND vf.vname = k.\"vname\")"
-		       " ELSE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = k.\"vcat\" AND " +
-		       path("o") +
-		       " = k.\"vname\") END)"
-		       " AND NOT EXISTS (SELECT 1 FROM " +
-		       Tbl("keys") +
-		       " k2 WHERE k2.\"vcat\" = k.\"vcat\" AND k2.\"vname\" = k.\"vname\""
-		       " AND k2.\"kind\" = k.\"kind\" AND NOT CASE WHEN k.\"kind\" = 'table' THEN " +
-		       fcolumn_visible + " ELSE EXISTS (SELECT 1 FROM vcolumns vc WHERE vc.table_catalog = k.\"vcat\" AND " +
-		       kcolumn_path +
-		       " = k2.\"vname\" AND lower(vc.column_name) = lower(k2.\"column\")) END)"
-		       " ORDER BY vcat, object, key_sequence";
+		return prelude + ", vcolumns AS (" + effective_columns + "), " + gfcolumns + " " +
+		       named("SELECT k.\"vcat\" AS vcat, k.\"vname\" AS object, k.\"kind\" AS kind,"
+		             " k.\"pos\" + 1 AS key_sequence, k.\"column\" AS \"column\" FROM " +
+		                 Tbl("keys") +
+		                 " k WHERE (CASE WHEN k.\"kind\" = 'table'"
+		                 " THEN EXISTS (SELECT 1 FROM vfunctions vf WHERE vf.vcat = k.\"vcat\""
+		                 " AND vf.vname = k.\"vname\")"
+		                 " ELSE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = k.\"vcat\" AND " +
+		                 path("o") +
+		                 " = k.\"vname\") END)"
+		                 " AND NOT EXISTS (SELECT 1 FROM " +
+		                 Tbl("keys") +
+		                 " k2 WHERE k2.\"vcat\" = k.\"vcat\" AND k2.\"vname\" = k.\"vname\""
+		                 " AND k2.\"kind\" = k.\"kind\" AND NOT CASE WHEN k.\"kind\" = 'table' THEN " +
+		                 fcolumn_visible +
+		                 " ELSE EXISTS (SELECT 1 FROM vcolumns vc WHERE vc.table_catalog = k.\"vcat\" AND " +
+		                 kcolumn_path + " = k2.\"vname\" AND lower(vc.column_name) = lower(k2.\"column\")) END)",
+		             {{"vcat", Shown::CATALOG}}, "vcat, object, key_sequence");
 	}
 	// spec 022: a reference is visible when both of its ends are, and when every column it names is
 	// a column the role can see. Anything else would describe an object - or a column - the role
@@ -617,56 +663,57 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	string column_path = "CASE WHEN vc.table_schema = 'main' THEN vc.table_name"
 	                     " ELSE vc.table_schema || '.' || vc.table_name END";
 	return prelude + ", vcolumns AS (" + effective_columns + ") " +
-	       "SELECT r.\"vcat\" AS vcat, r.\"name\" AS name, r.\"from_vname\" AS from_object,"
-	       " r.\"to_vname\" AS to_object,"
-	       // the arguments a function end is called with, and - separately - the columns of the join
-	       // condition: an argument's source column is a `from` column that also names a parameter
-	       " (SELECT string_agg(rc.\"param\" || ' => ' || rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
-	       Tbl("reference_columns") +
-	       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"param\" IS NOT NULL)"
-	       " AS arguments,"
-	       " (SELECT string_agg(rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
-	       Tbl("reference_columns") +
-	       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'from'"
-	       " AND rc.\"param\" IS NULL)"
-	       " AS from_columns,"
-	       " (SELECT string_agg(rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
-	       Tbl("reference_columns") +
-	       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'to')"
-	       " AS to_columns,"
-	       // The same two, as lists. `string_agg` reads well for a human and for an agent, but a
-	       // consumer that has to *pair* the sides by position cannot get there from a joined
-	       // string - splitting on ', ' breaks on a column name containing one. Flight SQL's
-	       // key RPCs need exactly that pairing (spec 046), so the lists are published beside the
-	       // strings rather than instead of them.
-	       " (SELECT list(rc.\"column\" ORDER BY rc.\"pos\") FROM " +
-	       Tbl("reference_columns") +
-	       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'from'"
-	       " AND rc.\"param\" IS NULL)"
-	       " AS from_column_list,"
-	       " (SELECT list(rc.\"column\" ORDER BY rc.\"pos\") FROM " +
-	       Tbl("reference_columns") +
-	       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'to')"
-	       " AS to_column_list,"
-	       " r.\"to_kind\" AS to_kind, r.\"expr\" AS expression, r.\"cardinality\" AS cardinality,"
-	       " r.\"optional\" AS optional, r.\"join_method\" AS join_method, r.\"comment\" AS comment FROM " +
-	       Tbl("references") + " r WHERE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = r.\"vcat\" AND " + path("o") +
-	       " = r.\"from_vname\")" +
-	       // the far end is an object, or - for a lateral call - a table function the role may use
-	       " AND (CASE WHEN r.\"to_kind\" = 'function'"
-	       " THEN EXISTS (SELECT 1 FROM vfunctions vf WHERE vf.vcat = r.\"vcat\""
-	       " AND vf.vname = r.\"to_vname\")"
-	       " ELSE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = r.\"vcat\" AND " +
-	       path("o") + " = r.\"to_vname\") END)" +
-	       // every column it names must be one the role sees. The `to` side of a lateral call names
-	       // parameters, not columns, so there is nothing there to hide or to check.
-	       " AND NOT EXISTS (SELECT 1 FROM " + Tbl("reference_columns") +
-	       " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\""
-	       " AND NOT (r.\"to_kind\" = 'function' AND rc.\"side\" = 'to')"
-	       " AND NOT EXISTS (SELECT 1 FROM vcolumns vc WHERE vc.table_catalog = r.\"vcat\" AND " +
-	       column_path +
-	       " = CASE WHEN rc.\"side\" = 'from' THEN r.\"from_vname\" ELSE r.\"to_vname\" END"
-	       " AND vc.column_name = rc.\"column\"))";
+	       named("SELECT r.\"vcat\" AS vcat, r.\"name\" AS name, r.\"from_vname\" AS from_object,"
+	             " r.\"to_vname\" AS to_object,"
+	             // the arguments a function end is called with, and - separately - the columns of the join
+	             // condition: an argument's source column is a `from` column that also names a parameter
+	             " (SELECT string_agg(rc.\"param\" || ' => ' || rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
+	                 Tbl("reference_columns") +
+	                 " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"param\" IS NOT NULL)"
+	                 " AS arguments,"
+	                 " (SELECT string_agg(rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
+	                 Tbl("reference_columns") +
+	                 " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'from'"
+	                 " AND rc.\"param\" IS NULL)"
+	                 " AS from_columns,"
+	                 " (SELECT string_agg(rc.\"column\", ', ' ORDER BY rc.\"pos\") FROM " +
+	                 Tbl("reference_columns") +
+	                 " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'to')"
+	                 " AS to_columns,"
+	                 // The same two, as lists. `string_agg` reads well for a human and for an agent, but a
+	                 // consumer that has to *pair* the sides by position cannot get there from a joined
+	                 // string - splitting on ', ' breaks on a column name containing one. Flight SQL's
+	                 // key RPCs need exactly that pairing (spec 046), so the lists are published beside the
+	                 // strings rather than instead of them.
+	                 " (SELECT list(rc.\"column\" ORDER BY rc.\"pos\") FROM " +
+	                 Tbl("reference_columns") +
+	                 " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'from'"
+	                 " AND rc.\"param\" IS NULL)"
+	                 " AS from_column_list,"
+	                 " (SELECT list(rc.\"column\" ORDER BY rc.\"pos\") FROM " +
+	                 Tbl("reference_columns") +
+	                 " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'to')"
+	                 " AS to_column_list,"
+	                 " r.\"to_kind\" AS to_kind, r.\"expr\" AS expression, r.\"cardinality\" AS cardinality,"
+	                 " r.\"optional\" AS optional, r.\"join_method\" AS join_method, r.\"comment\" AS comment FROM " +
+	                 Tbl("references") + " r WHERE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = r.\"vcat\" AND " +
+	                 path("o") + " = r.\"from_vname\")" +
+	                 // the far end is an object, or - for a lateral call - a table function the role may use
+	                 " AND (CASE WHEN r.\"to_kind\" = 'function'"
+	                 " THEN EXISTS (SELECT 1 FROM vfunctions vf WHERE vf.vcat = r.\"vcat\""
+	                 " AND vf.vname = r.\"to_vname\")"
+	                 " ELSE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = r.\"vcat\" AND " +
+	                 path("o") + " = r.\"to_vname\") END)" +
+	                 // every column it names must be one the role sees. The `to` side of a lateral call names
+	                 // parameters, not columns, so there is nothing there to hide or to check.
+	                 " AND NOT EXISTS (SELECT 1 FROM " + Tbl("reference_columns") +
+	                 " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\""
+	                 " AND NOT (r.\"to_kind\" = 'function' AND rc.\"side\" = 'to')"
+	                 " AND NOT EXISTS (SELECT 1 FROM vcolumns vc WHERE vc.table_catalog = r.\"vcat\" AND " +
+	                 column_path +
+	                 " = CASE WHEN rc.\"side\" = 'from' THEN r.\"from_vname\" ELSE r.\"to_vname\" END"
+	                 " AND vc.column_name = rc.\"column\"))",
+	             {{"vcat", Shown::CATALOG}});
 }
 
 } // namespace acl_detail

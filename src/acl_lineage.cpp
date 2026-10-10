@@ -255,10 +255,14 @@ bool LineageSourceNameFor(DatabaseInstance &db, const string &catalog, const str
 		prefix.pop_back();
 	}
 	prefix = StringUtil::Replace(prefix, "/", ".");
+	// spec 116: the source's own names as keys - a part holding a `.` or a `"` quoted, so the name parses
 	vector<string> parts;
-	for (auto &part : {prefix, schema, name}) {
+	if (!prefix.empty()) {
+		parts.push_back(prefix);
+	}
+	for (auto &part : {schema, name}) {
 		if (!part.empty()) {
-			parts.push_back(part);
+			parts.push_back(NamePath::QuotePart(part));
 		}
 	}
 	out_name = StringUtil::Join(parts, ".");
@@ -269,22 +273,17 @@ AuditLineageDataset LineageDatasetFor(const LineageDatasetKey &key, const Lineag
 	AuditLineageDataset dataset;
 	if (key.kind == "virtual") {
 		// spec 112: the cluster's namespace, the object as `<vcat>.<schema>.<object>` - OpenLineage's own
-		// convention for a SQL endpoint, the schema always written
-		string schema = key.schema;
-		string object = key.name;
-		if (schema.empty()) {
-			auto dot = object.find('.');
-			if (dot != string::npos) {
-				schema = object.substr(0, dot);
-				object = object.substr(dot + 1);
-			}
-		}
+		// convention for a SQL endpoint, the schema always written. Spec 116: the catalog and the name are
+		// keys, so the dataset's name is the key of its parts - unquoted unless a part holds `.` or `"`
+		auto object = key.schema.empty() ? key.name : NamePath::ChildKey(NamePath::QuotePart(key.schema), key.name);
 		dataset.ns = settings.ns;
-		dataset.name = key.catalog + "." + (schema.empty() ? string("main") : schema) + "." + object;
+		dataset.name = NamePath::JoinKeys(key.catalog,
+		                                  NamePath::KeySize(object) > 1 ? object : NamePath::JoinKeys("main", object));
 		dataset.dataset_type = "TABLE";
 	} else if (key.kind == "physical") {
 		dataset.ns = settings.ns + "/source/" + key.catalog;
-		dataset.name = key.schema.empty() ? key.name : key.schema + "." + key.name;
+		dataset.name = key.schema.empty() ? NamePath::QuotePart(key.name)
+		                                  : NamePath::ChildKey(NamePath::QuotePart(key.schema), key.name);
 		auto db = settings.db; // the settings are const; the instance they were read from is not
 		if (db) {
 			// spec 112 §9: the source's identity, when its provider or its operator gave one
