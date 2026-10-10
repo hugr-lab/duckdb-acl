@@ -736,7 +736,7 @@ private:
 			         " UNION SELECT view_name FROM duckdb_views() WHERE database_name = " + Lit(database) +
 			         " AND schema_name = " + Lit(schema) + " AND NOT internal ORDER BY 1");
 			ResultRows listing_rows(*listing);
-			case_insensitive_set_t source_names;
+			std::set<string> source_names; // exact: a case-sensitive source may hold two spellings
 			vector<string> unrecorded, gone;
 			auto recorded = Read("SELECT \"vname\" FROM " + catalog.Tbl("relations") +
 			                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"origin\" = " + Lit(origin) + " AND " +
@@ -745,7 +745,7 @@ private:
 			auto dropped = Read("SELECT \"name\" FROM " + catalog.Tbl("schema_dropped") +
 			                    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"path\" = " + Lit(path));
 			ResultRows dropped_rows(*dropped);
-			case_insensitive_set_t recorded_names, dropped_names;
+			std::set<string> recorded_names, dropped_names;
 			for (idx_t i = 0; i < recorded->RowCount(); i++) {
 				// spec 116: a record's leaf as the source names it (raw), compared with the source's listing
 				string parent, leaf;
@@ -766,10 +766,25 @@ private:
 					if (CatalogBackend::CaseSibling(vname, stored)) {
 						// spec 116: REFRESH never records a second spelling of a held name - the source's
 						// object stays out until it is renamed (or the catalog's is)
+						// the repair drops the catalog's record of the other spelling, so REFRESH records the
+						// source's object; a schema or a grant holding the name has no such one-line repair
+						auto held =
+						    Read("SELECT \"vname\", \"form\" FROM " + catalog.Tbl("relations") +
+						         " WHERE \"vcat\" = " + Lit(vcat) + " AND " + KeyEqSql("\"vname\"", Lit(vname)));
+						ResultRows held_rows(*held);
+						auto refresh = "ALTER VIRTUAL SCHEMA " + Named(path) + " REFRESH";
+						auto repair =
+						    held->RowCount() == 1
+						        ? string(held_rows.GetValue(1, 0).ToString() == "view" ? "DROP VIRTUAL VIEW "
+						                                                               : "DROP VIRTUAL TABLE ") +
+						              Named(held_rows.GetValue(0, 0).ToString()) + "; " + refresh +
+						              "  -- or rename the source object"
+						        : refresh + "  -- after the source object is renamed: a schema or a grant of the "
+						                    "catalog holds that name";
 						Add("schema", path, "", "case_sibling",
 						    "the source object \"" + name +
 						        "\" differs only by case from a name the catalog holds - it is not recorded",
-						    "-- rename the source object, or drop the catalog's name of that spelling");
+						    repair);
 						continue;
 					}
 					unrecorded.push_back(name);

@@ -484,6 +484,12 @@ struct PolicyStore {
 	//! The memory store keeps every map case-insensitive and answers the name as given.
 	string SpellCatalog(const string &vcat, bool creating = false);
 	string SpellName(const string &vcat, const string &key, bool creating = false);
+	//! spec 116: a physical name (a key) as the engine's catalog spells it - each part that the attached
+	//! database, its schema and its table answer to (folded as duckdb folds, ASCII) takes their spelling,
+	//! so the exact joins on information_schema / duckdb_tables match it. An exact match wins (a
+	//! case-sensitive source - postgres - may hold `Orders` and `orders`); several answers and none exact,
+	//! or nothing there yet (a CREATE in the client's open transaction), keep the part as written.
+	string SpellPhysical(const string &key);
 	//! The same over a catalog's references (their own namespace, spec 022)
 	string SpellReference(const string &vcat, const string &name, bool creating = false);
 

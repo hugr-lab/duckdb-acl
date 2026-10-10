@@ -231,6 +231,52 @@ string CatalogBackend::StoredReference(const string &vcat, const string &name, b
 	return Spell(name, FirstColumn(*result), creating, "reference");
 }
 
+string PolicyStore::SpellPhysical(const string &key) {
+	NamePath path;
+	string error;
+	auto db = instance.lock();
+	if (key.empty() || !db || !NamePath::TryFromKey(key, path, error)) {
+		return key;
+	}
+	Connection con(*db);
+	auto parts = path.Parts();
+	// the spelling the engine answers for one part, under the parts already spelled
+	auto adopt = [&](const string &sql, string &part) {
+		auto result = con.Query(sql);
+		if (result->HasError()) {
+			return;
+		}
+		ResultRows rows(*result);
+		vector<string> found;
+		for (idx_t row = 0; row < rows.Count(); row++) {
+			auto value = rows.GetValue(0, row).ToString();
+			if (value == part) {
+				return; // as written: exact wins
+			}
+			found.push_back(value);
+		}
+		if (found.size() == 1) {
+			part = found[0];
+		}
+	};
+	auto fold_eq = [](const char *column, const string &value) {
+		return KeyFoldSql(column) + " = " + KeyFoldSql(Lit(value));
+	};
+	adopt("SELECT database_name FROM duckdb_databases() WHERE " + fold_eq("database_name", parts[0]), parts[0]);
+	if (parts.size() >= 2) {
+		adopt("SELECT DISTINCT schema_name FROM duckdb_schemas() WHERE database_name = " + Lit(parts[0]) + " AND " +
+		          fold_eq("schema_name", parts[1]),
+		      parts[1]);
+	}
+	if (parts.size() == 3) {
+		auto where = " WHERE database_name = " + Lit(parts[0]) + " AND schema_name = " + Lit(parts[1]) + " AND ";
+		adopt("SELECT table_name FROM duckdb_tables()" + where + fold_eq("table_name", parts[2]) +
+		          " UNION SELECT view_name FROM duckdb_views()" + where + fold_eq("view_name", parts[2]),
+		      parts[2]);
+	}
+	return NamePath(std::move(parts)).ToKey();
+}
+
 string PolicyStore::SpellCatalog(const string &vcat, bool creating) {
 	return catalog ? catalog->StoredCatalog(vcat, creating) : vcat;
 }
@@ -1653,6 +1699,7 @@ void PolicyStore::CatalogExpandSchema(const string &vcat, const string &path, co
 			                        "", phys_path)) {
 				statements.push_back(statement);
 			}
+			stored.push_back(vname); // a case-sensitive source's second spelling is a sibling of this one
 		}
 		// re-expanding forgets earlier deliberate drops: the admin asked for the source as it is now
 		statements.push_back("DELETE FROM " + catalog->Tbl("schema_dropped") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -1696,6 +1743,7 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 			                                          "", "", {}, "", "", origin)) {
 				statements.push_back(statement);
 			}
+			stored.push_back(vname); // a case-sensitive source's second spelling is a sibling of this one
 			changed++;
 		}
 		if (!prune) {

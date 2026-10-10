@@ -413,3 +413,26 @@ select	[{'name': payroll, 'capability': select}]
 
 statement ok
 RESET SESSION acl_profile_level;
+
+# --- spec 116: a physical name written in another case is stored as the engine spells it, so its scans
+# are attributed to the one source (`pg`), never to a second `PG` -----------------------------------------
+
+statement ok
+SELECT acl_grant_table('analyst', 'payroll_upper', 'PG.MAIN.PAYROLL', '', '', 'select');
+
+statement ok
+SET SESSION acl_profile_level='all';
+
+statement ok
+ACL ROLE "analyst" SELECT sum(salary) FROM payroll_upper;
+
+statement ok
+SELECT acl_audit_flush();
+
+query II
+SELECT sources::VARCHAR LIKE '%"source":"pg"%', sources::VARCHAR LIKE '%"source":"PG"%' FROM acl_audit_events() WHERE kind = 'profile' AND objects::VARCHAR LIKE '%payroll_upper%' ORDER BY seq DESC LIMIT 1;
+----
+true	false
+
+statement ok
+RESET SESSION acl_profile_level;

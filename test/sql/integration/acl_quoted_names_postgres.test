@@ -99,6 +99,37 @@ ACL ADMIN CREATE VIRTUAL TABLE "Sales Mart"."ORDER ITEMS" AS pg."Raw Data"."Orde
 ----
 <REGEX>:.*differs only by case.*
 
+# a case-sensitive source holds two spellings of one name: an expansion records one, and the check says so
+statement ok
+CALL postgres_execute('pg', 'CREATE TABLE "Raw Data"."Pair" (n int)');
+
+statement ok
+CALL postgres_execute('pg', 'CREATE TABLE "Raw Data"."pair" (n int)');
+
+statement ok
+CALL pg_clear_cache();
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA "Sales Mart".exp FROM pg."Raw Data";
+
+query I
+SELECT count(*) FROM pg.acl_q.relations WHERE lower(vname) = 'exp.pair';
+----
+1
+
+query I
+SELECT count(*) FROM acl_check_catalog('Sales Mart') WHERE problem = 'case_sibling';
+----
+1
+
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA "Sales Mart".exp REFRESH;
+
+query I
+SELECT count(*) FROM pg.acl_q.relations WHERE lower(vname) = 'exp.pair';
+----
+1
+
 statement ok
 DROP SCHEMA pg.acl_q CASCADE;
 

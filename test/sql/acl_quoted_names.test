@@ -1026,6 +1026,115 @@ ACL ROLE "r" SELECT function_name FROM duckdb_functions() WHERE function_name = 
 ----
 Äx
 
+# --- second verification pass: a physical name is stored as the engine spells it ----------------------
+
+statement ok
+CREATE SCHEMA phys.s2;
+
+statement ok
+CREATE TABLE phys.s2.e AS SELECT 5 AS n;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.plain AS PHYS.MAIN.U;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.live AS PHYS.S2;
+
+query TT
+SELECT vname, phys FROM store.acl.relations WHERE vcat = 'c' AND vname = 'plain' UNION ALL SELECT path, phys_path FROM store.acl.schemas WHERE vcat = 'c' AND path = 'live';
+----
+plain	phys.main.u
+live	phys.s2
+
+# listed like any other: the exact joins on the engine's catalog match the stored spelling
+query TT
+ACL ROLE "r" SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'c' AND table_name IN ('plain', 'e') ORDER BY ALL;
+----
+live	e
+main	plain
+
+query T
+ACL ROLE "r" SELECT column_name FROM information_schema.columns WHERE table_catalog = 'c' AND table_schema = 'live';
+----
+n
+
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE problem = 'schema_missing' AND object = 'live';
+----
+0
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.exp2 FROM PHYS.S2;
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.exp2 TO ROLE r WITH (select, create) VIRTUAL ONLY;
+
+statement ok
+CREATE TABLE phys.s2.e3 AS SELECT 6 AS n;
+
+# VIRTUAL ONLY registers what exists: `E3` is the existing phys.s2.e3, recorded as the engine spells it
+statement ok
+ACL ROLE "r" CREATE TABLE c.exp2.E3 AS SELECT 1 AS n;
+
+query T
+SELECT phys FROM store.acl.relations WHERE vcat = 'c' AND vname = 'exp2.E3';
+----
+phys.s2.e3
+
+query I
+ACL ROLE "r" SELECT n FROM c.exp2.E3;
+----
+6
+
+# --- second verification pass: a RENAME's undo never makes a second spelling ----------------------------
+
+statement ok
+CREATE TABLE phys."Raw Data".mover AS SELECT 1 AS i;
+
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA c."Raw Data" REFRESH;
+
+statement ok con1
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+ACL ROLE "r" ALTER TABLE c."Raw Data".mover RENAME TO moved;
+
+# meanwhile the operator declares the old name in another case
+statement ok con2
+ACL ADMIN CREATE VIRTUAL TABLE c."Raw Data"."MOVER" AS phys.main.u;
+
+statement ok con1
+ROLLBACK;
+
+query T
+SELECT vname FROM store.acl.relations WHERE vcat = 'c' AND (lower(vname) = 'raw data.mover' OR vname = 'Raw Data.moved') ORDER BY 1;
+----
+Raw Data.MOVER
+Raw Data.moved
+
+query T
+ACL ROLE "r" SELECT v FROM c."Raw Data".mover;
+----
+upper
+
+# the source's mover stays out, reported with a repair that runs
+query T
+SELECT repair FROM acl_check_catalog('c') WHERE problem = 'case_sibling' AND detail LIKE '%"mover"%';
+----
+DROP VIRTUAL TABLE c."Raw Data".MOVER; ALTER VIRTUAL SCHEMA c."Raw Data" REFRESH  -- or rename the source object
+
+statement ok
+ACL ADMIN DROP VIRTUAL TABLE c."Raw Data".MOVER; ALTER VIRTUAL SCHEMA c."Raw Data" REFRESH;
+
+query I
+ACL ROLE "r" SELECT i FROM c."Raw Data".mover;
+----
+1
+
 # --- the v20 migration: refuses while one name is spelled several ways ---------------------------------
 
 statement ok
