@@ -207,11 +207,12 @@ struct IntrospectionRows {
 //! The built-in administration bundles (spec 117) - fixed sets of the `platform` catalog's objects,
 //! held as a SET (a role holds several): there is no order between them, so no site may compare two
 //! (the linear `NONE < OBSERVE < MANAGE < PASSTHROUGH` of spec 097 is gone). OBSERVE reads the node
-//! views (and the load report / metrics, spec 097); POLICY reads the policy views and calls every policy
-//! function but the admin grants; PASSTHROUGH is everything - `ACL NATIVE`, grants on `platform` and the
+//! views (and the load report / metrics, spec 097); OPERATE (spec 118) is observe + the node's runtime
+//! (sessions, drain / resume); POLICY reads the policy views and calls every policy function but the admin
+//! grants; PASSTHROUGH is everything - `ACL NATIVE`, grants on `platform` and the
 //! bundles. MANAGE is the name spec 009 wrote: a global row reads as POLICY + OBSERVE, a row scoped to
 //! a catalog as that catalog's administration.
-enum class AdminScope : uint8_t { OBSERVE, POLICY, MANAGE, PASSTHROUGH };
+enum class AdminScope : uint8_t { OBSERVE, OPERATE, POLICY, MANAGE, PASSTHROUGH };
 
 //! Parse/print the scope names used by the admin functions, the grammar and the policy source
 AdminScope ParseAdminScope(const string &scope);
@@ -759,6 +760,9 @@ struct PolicyStore {
 	//! `tresor`. `named` (the statement's IN / FROM, '' when none) must be one; unnamed, exactly one
 	//! must be attached. Anything else throws, with the reason noted, and says what to write.
 	string SecretService(const string &named);
+	//! spec 118: whether any secrets service is attached - without one, a standalone node keeps a
+	//! principal's secrets itself (duckdb's own storage rule)
+	bool SecretServiceAttached();
 
 	//! Verify a principal offline. A JWT-shaped token goes through real signature verification against
 	//! the issuer registry (spec 007, throws with a specific reason on failure); a non-JWT token is a
@@ -1045,6 +1049,9 @@ struct PolicyStore {
 		//! `observe` bundle, or implied by passthrough and by a global `manage` row (a catalog-scoped
 		//! manage and the `policy` bundle are not the node's)
 		bool observe = false;
+		//! spec 118: the `operate` bundle - observe + the node's runtime (kill, a session's audit level and
+		//! profile, drain / resume); implied by passthrough
+		bool operate = false;
 		//! spec 097: an `admins` row whose scope this build does not know, or one that grants nothing
 		//! here (an observe row scoped to a catalog). It grants nothing, but the role stays privileged
 		//! (spec 095) - a later scope must not open its role to IdP group names

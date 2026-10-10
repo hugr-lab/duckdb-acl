@@ -500,11 +500,34 @@ bool IsMgmtStart(const string &text) {
 		ahead.Word("keyword");
 		return StringUtil::CIEquals(ahead.PeekWord(), "virtual");
 	}
-	if (StringUtil::CIEquals(first, "profile")) {
-		// PROFILE SESSION ... (spec 074 slice 3): duckdb has no PROFILE statement
+	if (StringUtil::CIEquals(first, "profile") || StringUtil::CIEquals(first, "kill")) {
+		// PROFILE SESSION ... (spec 074 slice 3), KILL SESSION '<id>' (spec 118): duckdb has neither
 		AdminScanner ahead(text);
 		ahead.Word("keyword");
 		return StringUtil::CIEquals(ahead.PeekWord(), "session");
+	}
+	if (StringUtil::CIEquals(first, "drain") || StringUtil::CIEquals(first, "resume")) {
+		// DRAIN NODE / RESUME NODE (spec 118): duckdb has no such statements
+		AdminScanner ahead(text);
+		ahead.Word("keyword");
+		return StringUtil::CIEquals(ahead.PeekWord(), "node");
+	}
+	if (StringUtil::CIEquals(first, "migrate")) {
+		// MIGRATE POLICY CATALOG ... (spec 118)
+		AdminScanner ahead(text);
+		ahead.Word("keyword");
+		return StringUtil::CIEquals(ahead.PeekWord(), "policy");
+	}
+	if (StringUtil::CIEquals(first, "set")) {
+		// SET SESSION '<id>' AUDIT LEVEL ... (spec 118): a session named by a single-quoted id - duckdb's
+		// SET SESSION <setting> (spec 068's TimeZone) names a setting, never a string
+		AdminScanner ahead(text);
+		ahead.Word("keyword");
+		if (!ahead.Accept("session")) {
+			return false;
+		}
+		ahead.Skip();
+		return ahead.pos < ahead.text.size() && ahead.text[ahead.pos] == '\'';
 	}
 	if (StringUtil::CIEquals(first, "comment") || StringUtil::CIEquals(first, "analyze")) {
 		// duckdb owns COMMENT ON <object> and ANALYZE: ours always name a VIRTUAL target
@@ -1411,6 +1434,36 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			throw BinderException("acl admin: PROFILE SESSION expects ON, ALL, SAMPLED or OFF, not \"%s\"", word);
 		}
 		return MakeAdminCall("acl_session_profile", {Value(id), Value(level)});
+	}
+	if (StringUtil::CIEquals(keyword, "kill")) {
+		// KILL SESSION '<id>' (spec 118): the id is acl_sessions()' / platform.sessions' - never a handle
+		s.Expect("session");
+		return MakeAdminCall("acl_session_kill", {Value(s.Quoted("a session id"))});
+	}
+	if (StringUtil::CIEquals(keyword, "set")) {
+		// SET SESSION '<id>' AUDIT LEVEL off | denied | decisions | all | DEFAULT (spec 118 over spec 069)
+		s.Expect("session");
+		auto id = s.Quoted("a session id");
+		s.Expect("audit");
+		s.Expect("level");
+		auto word = StringUtil::Lower(s.Word("an audit level (OFF, DENIED, DECISIONS, ALL, DEFAULT)"));
+		return MakeAdminCall("acl_session_audit_level", {Value(id), Value(word == "default" ? string() : word)});
+	}
+	if (StringUtil::CIEquals(keyword, "drain") || StringUtil::CIEquals(keyword, "resume")) {
+		// DRAIN NODE / RESUME NODE (spec 118 over spec 066): this node
+		s.Expect("node");
+		return MakeAdminCall(StringUtil::CIEquals(keyword, "drain") ? "acl_drain" : "acl_resume", {});
+	}
+	if (StringUtil::CIEquals(keyword, "migrate")) {
+		// MIGRATE POLICY CATALOG <db>[.<schema>] (spec 118 over spec 094): passthrough's
+		s.Expect("policy");
+		s.Expect("catalog");
+		auto database = s.Ident("a database");
+		if (s.pos < s.text.size() && s.text[s.pos] == '.') {
+			s.pos++;
+			return MakeAdminCall("acl_migrate_catalog", {Value(database), Value(s.Ident("a schema"))});
+		}
+		return MakeAdminCall("acl_migrate_catalog", {Value(database)});
 	}
 	if (StringUtil::CIEquals(keyword, "deny")) {
 		// DENY FUNCTION CATEGORY c TO ROLE r | ALL ROLES; DENY FUNCTION f [TABLE] TO ROLE r | ALL ROLES

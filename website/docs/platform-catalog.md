@@ -49,13 +49,15 @@ is "stronger" than another:
 
 | Bundle | Granted with | Reads | Calls |
 | --- | --- | --- | --- |
-| `observe` | `GRANT ADMIN observe TO ROLE r` | the node views (`sessions`, `node_load`, `node_doors`, `node_streams`, `drain`, `lineage_status`); also the load report and `/metrics` (spec 097) | nothing |
-| `policy` | `GRANT ADMIN policy TO ROLE r` | every policy view, all rows - not the cluster profile's | every policy function except the admin grants, the cluster profile and a session's profile |
+| `observe` | `GRANT ADMIN observe TO ROLE r` | the node views (`sessions`, `node_load`, `node_doors`, `node_streams`, `drain`, `lineage_status`, `audit_events`); also the load report and `/metrics` (spec 097) | nothing |
+| `operate` (spec 118) | `GRANT ADMIN operate TO ROLE r` | `observe` | the node's runtime: `kill_session`, `session_audit_level`, `session_profile`, `drain`, `resume` - and their grammar (`KILL SESSION`, `SET SESSION … AUDIT LEVEL`, `PROFILE SESSION`, `DRAIN NODE`, `RESUME NODE`) |
+| `policy` | `GRANT ADMIN policy TO ROLE r` | every policy view, all rows - not the cluster profile's | every policy function except the admin grants, the cluster profile and the node's runtime (`operate`'s) |
 | `passthrough` | `GRANT ADMIN passthrough TO ROLE r` | everything | everything, plus `ACL NATIVE`, the bundles and the grants on `platform` (the break-glass) |
 | `manage` (spec 009's name) | `GRANT ADMIN manage TO ROLE r` | `policy` + `observe` | `policy` |
 | a catalog admin | `GRANT CATALOG c TO ROLE r CAPS '{"manage": true}'` | the catalog-scoped views, narrowed to its catalogs (below) | the functions that take a catalog, on its catalogs; `check_catalog` on its catalogs |
 
-`REVOKE ADMIN <bundle> FROM ROLE r` takes one bundle; `REVOKE ADMIN FROM ROLE r` takes every bundle,
+`REVOKE ADMIN <bundle> FROM ROLE r` takes one bundle (not one another carries: `observe` from a role holding
+`operate`, `manage` or `passthrough` is refused - revoke the carrier); `REVOKE ADMIN FROM ROLE r` takes every bundle,
 the `manage` capability of its catalog grants and its point grants on `platform`. Functions:
 `acl_grant_admin(role, scope)`, `acl_revoke_admin(role[, scope])`.
 
@@ -80,7 +82,7 @@ REVOKE VIEW platform.sessions FROM ROLE support;        -- the grant or the deny
   catalog.
 - **Only `passthrough` grants on `platform`** (and the bundles) - never `policy`: a grantor that can
   grant everything is everything.
-- Never to every role (`TO ALL ROLES` / role `''` is refused); never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting`, `session_profile` - the passthrough scope's own - and `console_info` (every holder's); only on an
+- Never to every role (`TO ALL ROLES` / role `''` is refused); never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting`, `migrate_catalog` - the passthrough scope's own - and `console_info` (every holder's); only on an
   object `platform` has.
 - The grants live in their own table, `platform_grants(role, object, kind, allowed)` - never in the
   catalog grants or spec 072's function grants and categories.
@@ -106,7 +108,7 @@ what to revoke.
 | --- | --- |
 | `policy`, `passthrough`, a point grant on the view | all |
 | a catalog admin | its catalogs' objects, columns, schemas, functions, references, keys, the grants **on** its catalogs, and the **names** of the roles holding them (`roles` answers `role` with a NULL `comment`); no identity, categories, resource groups, cluster or node views |
-| `observe` | the node views only |
+| `observe`, `operate` | the node views only |
 | none | the catalog is absent - not listed, `no access to object "platform.<x>"` |
 
 ### Privileged roles (spec 095, extended)
@@ -169,6 +171,7 @@ Node views (the `observe` bundle):
 | `node_streams` | budget_bytes, reserve_bytes, reserved_bytes, producing, queued, refused (BIGINT) |
 | `drain` | draining BOOLEAN, sessions BIGINT |
 | `lineage_status` | status, sending BOOLEAN, level, namespace |
+| `audit_events` | ts TIMESTAMPTZ, seq BIGINT, kind, level, door, session, subject, issuer, roles VARCHAR[], statement, objects `STRUCT(name VARCHAR, capability VARCHAR)[]`, verdict, reason_code, reason, correlation_id, traceparent, rows, duration_us (BIGINT), detail - the node's recent events, its ring (spec 069); the history is the sinks' |
 
 † the cluster profile's views are `passthrough`'s (or a point grant's) until spec 118's `cluster` bundle -
 not the `policy` bundle's: the policy admin has no cluster or node operations.
@@ -224,8 +227,8 @@ SELECT platform.alter_catalog('sales', comment := ?);
 
 Right: **CATALOG** - `policy`, or `manage` on the catalog its `catalog` argument names; **POLICY** -
 `policy`; **HANDS_OUT** - `policy` (handing out access); **ESCALATES** / **INFRASTRUCTURE** -
-`passthrough` only; **OPERATE** (a node / session operation) - `passthrough` only until spec 118's
-`operate` bundle. A point grant on the function stands in for a bundle, except for the last three.
+`passthrough` only; **OPERATE** (the node's runtime) - the `operate` bundle (spec 118). A point grant on
+the function stands in for a bundle, except for ESCALATES and INFRASTRUCTURE.
 
 | Function | Parameters (\* authorization, a constant) | Right |
 | --- | --- | --- |
@@ -275,6 +278,10 @@ Right: **CATALOG** - `policy`, or `manage` on the catalog its `catalog` argument
 | `grant_function` | role\*, function\*, allowed | POLICY |
 | `revoke_function` | role\*, function\* | POLICY |
 | `session_profile` | session\*, level | OPERATE |
+| `session_audit_level` | session\*, level (`''` inherits) | OPERATE |
+| `kill_session` | session\* | OPERATE |
+| `drain` / `resume` | - | OPERATE |
+| `migrate_catalog` | database\*, schema\* | ESCALATES |
 | `create_resource_group` | group_name\*, limits, comment, is_default | POLICY |
 | `alter_resource_group` | group_name\*, property\*, value | POLICY |
 | `drop_resource_group` | group_name\*, mode | POLICY |

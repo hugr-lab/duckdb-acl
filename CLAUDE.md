@@ -657,8 +657,8 @@ one item, no FROM/WHERE/CTE/modifiers, or `CALL f(…)`; named args; a `?` where
 statement's parameter map carried over) in the override, refused anywhere else by the rewriter; read
 functions `check_catalog([c])` / `console_info()` in FROM. **ONE authorizer**: `AuthorizeMgmt` /
 `AuthorizeAdminCall` (moved from acl_admin_sql.cpp) judge every compiled call - grammar or call - by its
-`PlatformRight` (CATALOG / POLICY / HANDS_OUT / ESCALATES / INFRASTRUCTURE / OPERATE / OPEN); until spec
-118 the session profile (OPERATE) and the cluster views (`PlatformViewClass::CLUSTER`) are passthrough's,
+`PlatformRight` (CATALOG / POLICY / HANDS_OUT / ESCALATES / INFRASTRUCTURE / OPERATE / OPEN); OPERATE is
+spec 118's `operate` bundle, and until 118.2 the cluster views (`PlatformViewClass::CLUSTER`) are passthrough's,
 and no definition may name the policy store's own tables (`RequireNotPolicyStore`), nor may a non-passthrough
 map a claim to a privileged role, repoint an issuer / client behind such a mapping or give a mapped role a
 catalog's manage (`AuthorizeRoleTargets`); every stored body (view, template, alias, RLS, mask, a grant's
@@ -678,6 +678,21 @@ quack door (`SessionDoorOf`). Flight: a management statement / call is a command
 a retained result is read from the handle. The view comment and the stored catalog / schema comments
 reach the listings. Tests: `platform_{views,calls,rights,markerless,reserved,memory}.test`,
 `test_acl_session.cpp` / `test_acl_params_passthrough.cpp`, `test/e2e/flight/admin.sh`, the door e2e.
+
+**Spec 118 — node and cluster management** (in stages; 118.1 built): the `operate` bundle
+(`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
+point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`
+(a single-quoted id - duckdb's `SET SESSION <setting>` is never captured), `PROFILE SESSION`, `DRAIN NODE`,
+`RESUME NODE`, compiled to `acl_session_kill` / `acl_session_audit_level` / `acl_session_profile` /
+`acl_drain` / `acl_resume` (`platform.kill_session`, `session_audit_level`, `drain`, `resume`);
+`MIGRATE POLICY CATALOG <db>[.<schema>]` → `acl_migrate_catalog`, ESCALATES (passthrough). `platform.audit_events`
+(observe) is the ring. **`ACL NATIVE` is the unrestricted break-glass** (owner, 2026-10-10): nothing is
+refused there - a node's divergence is shown (118.2's drift, the audit), never blocked. A standalone node
+with NO secrets service attached keeps a principal's `CREATE / DROP SECRET` (naming no storage) itself by
+duckdb's rule (`PERSISTENT` to its files, else memory; `LocalSecrets` in the rewriter). The cluster DETACH
+counts a virtual view whose `view_sql` names the source as a qualifier (`SqlNamesSource`, text: over-reading
+blocks, FORCE answers). Next: 118.2 (`acl_deployment`, `cluster`, drift), 118.3 (`platform.attached`, `GRANT
+SOURCE`).
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
@@ -738,8 +753,8 @@ the whole tree). Never the statement's text, a literal, a path or a claim value 
 `Filters`/`Projections`/`Filename(s)` are counted or ignored. Levels `acl_profile_level` = off
 (default) | sampled (the caller's `traceparent` sampled flag) | all, GLOBAL; the level in force for a
 statement (`ProfileLevelFor`) is, first answer wins: the operator's override on the session
-(`acl_session_profile(id, level)` / `PROFILE SESSION CURRENT | '<id>' ON | SAMPLED | OFF`, passthrough
-since spec 117 (118's operate), `''`/OFF clears; `acl_sessions()` shows `profile_level` + `profile_source`), the registered
+(`acl_session_profile(id, level)` / `PROFILE SESSION CURRENT | '<id>' ON | SAMPLED | OFF`, the `operate`
+bundle since spec 118, `''`/OFF clears; `acl_sessions()` shows `profile_level` + `profile_source`), the registered
 `SessionPolicy::ProfileFor` rule, the connection's own `SET SESSION acl_profile_level` (an operator's
 connection), the GLOBAL. The note that links execution to decision is the override's
 (one per decided statement, with the hash of the statement's text), taken onto the connection by the

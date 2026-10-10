@@ -1,6 +1,6 @@
 # Spec 118: node and cluster management - operate / cluster, drift, the physical tree
 
-- **Status**: accepted (by the owner 2026-10-10; aligned after the comparison with Trino, Snowflake, Databricks UC,
+- **Status**: accepted (by the owner 2026-10-10); **118.1 implemented** (see *As built*); aligned after the comparison with Trino, Snowflake, Databricks UC,
   ClickHouse, PostgreSQL, SQL Server - design/079 App. A)
 - **Date**: 2026-10-10
 - **Author**: Claude (design/079 with the owner)
@@ -99,7 +99,7 @@ reverts anything itself.
 `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL <level>` (a quoted id: spec 068's
 `SET SESSION TimeZone = …` is never captured, markerless included), `PROFILE SESSION …` (exists),
 `DRAIN NODE`, `RESUME NODE` - compiled into the existing `acl_*` calls under `operate`;
-`MIGRATE POLICY CATALOG [<db>[.<schema>]]` under **passthrough** (it moves the schema window of every
+`MIGRATE POLICY CATALOG <db>[.<schema>]` under **passthrough** (it moves the schema window of every
 node). Typed views of 117 (`sessions`, `node_load`, `drain`) show the result.
 
 ### 4a. `platform.audit_events` (observe)
@@ -132,8 +132,9 @@ prefix too).
   `GRANT SOURCE …` (or the DROP) to run; only an explicit command removes.
 
 ### 6. DETACH and views (118.1)
-The cluster DETACH check (spec 093: CASCADE / FORCE) also counts a virtual view whose body reads the
-source (its table references, parsed). Who reads what per role (`exposures`) is spec 120's, with
+The cluster DETACH check (spec 093: CASCADE / FORCE) also counts a virtual view whose body names the
+source as a qualifier (`src.` / `"src".`, read as text - never bound, which would load the source's
+catalog; over-reading blocks, FORCE is the operator's answer). Who reads what per role (`exposures`) is spec 120's, with
 `effective_rights`.
 
 ## Enforcement & security
@@ -178,3 +179,26 @@ source (its table references, parsed). Who reads what per role (`exposures`) is 
   benchmark asks for one.
 - 120: `view_as` as a session mode (a second connection "metadata as role r", minimal first), effective
   rights, `exposures`, ddl / export, the missing ALTER / REVOKE.
+
+## As built
+
+### 118.1 (2026-10-10)
+- `operate`: `AdminScope::OPERATE` / `AdminRights::operate` (an `admins` row `operate`, global only - scoped to
+  a catalog it grants nothing, like observe; passthrough implies it; it carries observe, so `REVOKE ADMIN
+  observe` from an operate holder is refused). No schema step: the scope column is text, and a build
+  before 118 reads `operate` as an unknown scope (grants nothing, the role stays privileged - spec 097).
+  `PlatformRight::OPERATE` = the bundle, or a point grant on the function (the point grant is no longer
+  refused for OPERATE).
+- Functions: `kill_session` (acl_session_kill), `session_audit_level`, `session_profile`, `drain`, `resume`
+  (OPERATE); `migrate_catalog` (ESCALATES, its own message). Grammar `KILL SESSION`, `SET SESSION '<id>'
+  AUDIT LEVEL <level>|DEFAULT`, `DRAIN NODE`, `RESUME NODE`, `MIGRATE POLICY CATALOG` - recognized markerless
+  (`IsMgmtStart`); `SET SESSION` only before a single-quoted id.
+- `platform.audit_events` (NODE class): the ring's decision columns (no profile numbers).
+- Secrets: `LocalSecrets` - no service attached and no storage named → duckdb's own handling (TEMPORARY too,
+  memory); capability and constants unchanged; GRANT / REVOKE SECRET and identity `FROM SECRET` still need a
+  service. 118.2's cluster mode will refuse the local path.
+- DETACH: `SqlNamesSource` over `relations.view_sql`.
+- Tests: `node_operate.test`, `acl_secrets.test` (the local block; type `http` - the suite loads no httpfs),
+  `acl_cluster_profile.test` (views; fails without the fix), `platform_views` / `platform_rights` /
+  `acl_observe` / `acl_profile` updated.
+

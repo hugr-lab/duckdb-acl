@@ -84,6 +84,7 @@ constexpr const char *V = "VARCHAR";
 constexpr const char *B = "BOOLEAN";
 constexpr const char *I = "BIGINT";
 constexpr const char *TS = "TIMESTAMP";
+constexpr const char *TSZ = "TIMESTAMPTZ";
 constexpr const char *LV = "VARCHAR[]";
 constexpr const char *CAPS = "CAPS";
 constexpr const char *MAPV = "MAP";
@@ -91,6 +92,8 @@ constexpr const char *MAPI = "MAPI";
 constexpr const char *CONDITIONS = "CONDITIONS";
 constexpr const char *ATTRIBUTES = "ATTRIBUTES";
 constexpr const char *GROUPS = "GROUPS";
+//! an audit event's objects (spec 069): name + the capability judged
+constexpr const char *OBJECTS = "OBJECTS";
 //! what an ACL CLUSTER call answers (spec 093), as the listings spell its type
 constexpr const char *CLUSTER_ANSWER = "STRUCT(version BIGINT, class VARCHAR, applied_here BOOLEAN, note VARCHAR)";
 
@@ -136,6 +139,13 @@ LogicalType TypeOf(const string &code) {
 	}
 	if (code == TS) {
 		return LogicalType::TIMESTAMP;
+	}
+	if (code == TSZ) {
+		return LogicalType::TIMESTAMP_TZ;
+	}
+	if (code == OBJECTS) {
+		return LogicalType::LIST(
+		    LogicalType::STRUCT({{"name", LogicalType::VARCHAR}, {"capability", LogicalType::VARCHAR}}));
 	}
 	if (code == LV) {
 		return LogicalType::LIST(LogicalType::VARCHAR);
@@ -418,6 +428,28 @@ vector<PlatformView> BuildViews() {
 	     PV::NODE,
 	     {{"status", V}, {"sending", B}, {"level", V}, {"namespace", V}},
 	     "why lineage is or is not sent (spec 112)"},
+	    {"audit_events",
+	     PV::NODE,
+	     {{"ts", TSZ},
+	      {"seq", I},
+	      {"kind", V},
+	      {"level", V},
+	      {"door", V},
+	      {"session", V},
+	      {"subject", V},
+	      {"issuer", V},
+	      {"roles", LV},
+	      {"statement", V},
+	      {"objects", OBJECTS},
+	      {"verdict", V},
+	      {"reason_code", V},
+	      {"reason", V},
+	      {"correlation_id", V},
+	      {"traceparent", V},
+	      {"rows", I},
+	      {"duration_us", I},
+	      {"detail", V}},
+	     "the node's recent audit events - its ring (spec 069; the history is the sinks')"},
 	};
 }
 
@@ -860,6 +892,35 @@ vector<PlatformFunction> BuildFunctions() {
 	     false,
 	     B,
 	     "the operator's profile level on a session (spec 074)"},
+	    {"session_audit_level",
+	     "acl_session_audit_level",
+	     {A("session"), P("level")},
+	     {2},
+	     -1,
+	     PR::OPERATE,
+	     false,
+	     B,
+	     "the operator's audit level on a session (spec 069); '' inherits"},
+	    {"kill_session",
+	     "acl_session_kill",
+	     {A("session")},
+	     {1},
+	     -1,
+	     PR::OPERATE,
+	     false,
+	     B,
+	     "end a session by its id (spec 050)"},
+	    {"drain", "acl_drain", {}, {0}, -1, PR::OPERATE, false, I, "stop seating new clients (spec 066)"},
+	    {"resume", "acl_resume", {}, {0}, -1, PR::OPERATE, false, B, "seat new clients again (spec 066)"},
+	    {"migrate_catalog",
+	     "acl_migrate_catalog",
+	     {A("database"), A("schema")},
+	     {1, 2},
+	     -1,
+	     PR::ESCALATES,
+	     false,
+	     V,
+	     "apply the schema steps to the policy catalog - every node's schema window (spec 094)"},
 	    {"create_resource_group",
 	     "acl_create_resource_group",
 	     {A("group_name"), P("limits", V, "{}"), comment, P("is_default")},
@@ -1079,7 +1140,7 @@ int PolicyStore::AdminRights::PlatformGrant(const string &kind, const string &ob
 }
 
 bool PolicyStore::AdminRights::MayAdminister() const {
-	if (passthrough || unrestricted_manage || !catalogs.empty()) {
+	if (passthrough || unrestricted_manage || operate || !catalogs.empty()) {
 		return true;
 	}
 	for (auto &grant : platform) {
@@ -1093,13 +1154,17 @@ bool PolicyStore::AdminRights::MayAdminister() const {
 }
 
 bool PolicyStore::AdminRights::Privileged() const {
-	return passthrough || unrestricted_manage || observe || unknown_scope || !catalogs.empty() || !platform.empty();
+	return passthrough || unrestricted_manage || observe || operate || unknown_scope || !catalogs.empty() ||
+	       !platform.empty();
 }
 
 vector<string> PolicyStore::AdminRights::Bundles() const {
 	vector<string> out;
 	if (observe) {
 		out.emplace_back("observe");
+	}
+	if (operate) {
+		out.emplace_back("operate");
 	}
 	if (unrestricted_manage) {
 		out.emplace_back("policy");
@@ -1163,7 +1228,6 @@ bool PlatformAccess::CallsFunction(const PlatformFunction &function) const {
 	switch (function.right) {
 	case PlatformRight::ESCALATES:
 	case PlatformRight::INFRASTRUCTURE:
-	case PlatformRight::OPERATE:
 		return false; // passthrough's alone - a point grant never reaches them
 	default:
 		break;
@@ -1177,6 +1241,8 @@ bool PlatformAccess::CallsFunction(const PlatformFunction &function) const {
 	case PlatformRight::POLICY:
 	case PlatformRight::HANDS_OUT:
 		return rights->unrestricted_manage;
+	case PlatformRight::OPERATE:
+		return rights->operate;
 	default:
 		return false;
 	}
@@ -1278,6 +1344,10 @@ void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights 
 	}
 	switch (function->right) {
 	case PlatformRight::ESCALATES:
+		if (name == "acl_migrate_catalog") {
+			throw BinderException("acl admin: MIGRATE POLICY CATALOG moves the schema window of every node and "
+			                      "requires a passthrough scope");
+		}
 		if (name == "acl_grant_platform" || name == "acl_revoke_platform") {
 			throw BinderException("acl admin: grants on the platform catalog require a passthrough scope - a "
 			                      "grantor that can grant everything is everything");
@@ -1288,8 +1358,13 @@ void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights 
 		                      "settings) and requires a passthrough scope - manage administers the ACL, not the "
 		                      "nodes");
 	case PlatformRight::OPERATE:
-		throw BinderException("acl admin: a session's profile is the node's operation and requires a passthrough "
-		                      "scope - the policy bundle administers the ACL, not the node (spec 118's operate)");
+		// spec 118: the node's runtime - the operate bundle (or a point grant), never the policy bundle
+		if (rights.operate || point == 1) {
+			return;
+		}
+		throw BinderException("acl admin: platform.%s is the node's operation and requires the operate bundle - "
+		                      "the policy bundle administers the ACL, not the node",
+		                      function->name);
 	case PlatformRight::OPEN:
 		return;
 	default:
@@ -2155,6 +2230,11 @@ string FunctionBody(const string &view) {
 	}
 	if (view == "sessions" || view == "node_load" || view == "node_doors" || view == "node_streams") {
 		return "SELECT * FROM acl_platform_" + view + "()";
+	}
+	if (view == "audit_events") {
+		return "SELECT \"ts\", \"seq\", \"kind\", \"level\", \"door\", \"session\", \"subject\", \"issuer\","
+		       " \"roles\", \"statement\", \"objects\", \"verdict\", \"reason_code\", \"reason\", \"correlation_id\","
+		       " \"traceparent\", \"rows\", \"duration_us\", \"detail\" FROM acl_audit_events()";
 	}
 	if (view == "drain") {
 		return "SELECT acl_drain_status() = 'draining' AS \"draining\", acl_session_count() AS \"sessions\"";

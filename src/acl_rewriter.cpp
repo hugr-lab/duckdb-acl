@@ -1053,7 +1053,12 @@ private:
 
 	//! A secret is the service's to keep, never the node's: the explicit `secrets` capability, and the
 	//! one service catalog (PolicyStore::SecretService) - a TEMPORARY secret would sit in this node's
-	//! own secret manager, for every principal's statements after it, so it is refused.
+	//! own secret manager, for every principal's statements after it, so it is refused. Spec 118: a
+	//! standalone node with NO service attached keeps the secret itself, by duckdb's own rule
+	//! (PERSISTENT to its files, otherwise memory) - the capability and the constants still apply.
+	bool LocalSecrets(const string &named) {
+		return named.empty() && !store.SecretServiceAttached();
+	}
 	void RequireSecrets(const char *verb) {
 		if (!store.PrincipalMainCap(principal, "secrets")) {
 			Deny(Reason::CAPABILITY, string(verb) + " a secret needs the secrets capability - granted by name on the "
@@ -1101,7 +1106,9 @@ private:
 
 	void RewriteCreateSecret(CreateSecretInfo &info) {
 		RequireSecrets("creating");
-		if (info.persist_type == SecretPersistType::TEMPORARY || info.persist_type == SecretPersistType::TRANSACTION) {
+		bool local = LocalSecrets(info.storage_type.GetIdentifierName());
+		if (!local && (info.persist_type == SecretPersistType::TEMPORARY ||
+		               info.persist_type == SecretPersistType::TRANSACTION)) {
 			Deny(Reason::STATEMENT_TYPE, "a temporary secret is kept by this node, not by its secrets service - "
 			                             "CREATE [PERSISTENT] SECRET keeps it in the service");
 		}
@@ -1112,6 +1119,10 @@ private:
 		}
 		for (auto &option : info.options) {
 			RequireSecretConstant(*option.second);
+		}
+		if (local) {
+			Note(info.GetSecretName().GetIdentifierName(), "secrets");
+			return;
 		}
 		auto service = store.SecretService(info.storage_type.GetIdentifierName());
 		info.storage_type = Identifier(service);
@@ -1126,6 +1137,10 @@ private:
 			auto &extra = info.extra_drop_info->Cast<ExtraDropSecretInfo>();
 			named = extra.secret_storage;
 			persist = extra.persist_mode;
+		}
+		if (LocalSecrets(named)) {
+			Note(info.GetQualifiedName().Name().GetIdentifierName(), "secrets");
+			return;
 		}
 		if (persist == SecretPersistType::TEMPORARY || persist == SecretPersistType::TRANSACTION) {
 			Deny(Reason::STATEMENT_TYPE, "a temporary secret is this node's, not its secrets service's - "

@@ -3157,8 +3157,8 @@ void PolicyStore::CatalogRevokeAdmin(const string &role, const string &scope) {
 	RequireCatalog(catalog, "acl_revoke_admin");
 	if (!scope.empty()) {
 		// spec 117: one bundle - the others the role holds, its catalogs' manage and its point grants stay.
-		// A bundle another row implies (manage = policy + observe, passthrough = everything) cannot be taken
-		// alone: the revoke would answer true and change nothing
+		// A bundle another row implies (manage = policy + observe, operate ⊇ observe, passthrough = everything) cannot
+		// be taken alone: the revoke would answer true and change nothing
 		auto held = catalog->Query("SELECT \"scope\" FROM " + catalog->Tbl("admins") +
 		                           " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = ''");
 		ResultRows held_rows(*held);
@@ -3169,6 +3169,7 @@ void PolicyStore::CatalogRevokeAdmin(const string &role, const string &scope) {
 		for (idx_t row = 0; row < held_rows.Count(); row++) {
 			auto holds = StringUtil::Lower(held_rows.GetValue(0, row).ToString());
 			bool implies = (holds == "manage" && (scope == "policy" || scope == "observe")) ||
+			               (holds == "operate" && scope == "observe") ||
 			               (holds == "passthrough" && scope != "passthrough");
 			if (implies) {
 				throw BinderException("acl admin: role \"%s\" holds %s, which carries %s - revoke %s (and grant what "

@@ -49,7 +49,7 @@ enum class PlatformRight : uint8_t {
 	HANDS_OUT,      //! the policy bundle: handing out access is privilege administration
 	ESCALATES,      //! passthrough only: the admin scopes and the grants on `platform`
 	INFRASTRUCTURE, //! passthrough only: the cluster profile (spec 093) - until spec 118's `cluster`
-	OPERATE,        //! passthrough only: a node / session operation (a session's profile) - until spec 118's `operate`
+	OPERATE,        //! the operate bundle (spec 118): the node's runtime - sessions, drain / resume
 	OPEN            //! every principal holding anything on `platform` (console_info)
 };
 

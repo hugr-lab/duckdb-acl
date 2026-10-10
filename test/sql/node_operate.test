@@ -1,0 +1,285 @@
+# name: test/sql/node_operate.test
+# description: spec 118.1 - the operate bundle (observe + the node's runtime), the node operations as
+#   grammar and as platform calls, platform.audit_events, MIGRATE POLICY CATALOG for passthrough alone
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('test/idp/d', '{"url": "test/idp/d", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+statement ok
+ACL ADMIN CREATE ROLE op;
+
+statement ok
+ACL ADMIN GRANT ADMIN operate TO ROLE op;
+
+statement ok
+ACL ADMIN CREATE ROLE obs;
+
+statement ok
+ACL ADMIN GRANT ADMIN observe TO ROLE obs;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+# a live session (role r) to operate on, and its ops id
+statement ok
+CREATE TABLE live AS SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9kIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.aPBrtcgDKpBFx79Ko8KlU6Y7are0gcq2Y9vgEqT2Gf5nst5QaDZGzcw_t9vyi0EmBbnB8dgagSh6VsH7P7vqm08RdVAdVYqVolxtZWMxAk2FbCCEoOdGoZ-Fa9bV45HC70xIF1gxoe2GUA4APh3ZL19gmXXHYbjtzgC86sdZ4koOfo2juuGyddJ0dbxgnNqciGuIsVozV9jh5lKky6wrXAxCjxuXAiBGiwGs153I0uA30CjTjQT576A7gXz0qmaEkVj89UOG5yhNkMkJ1_Buskxu0EBCQMrKoLp_JNZFBRvKb_U8WiGt6-XJOklkhVX4HAwUma40fep-5rhuiNhsRw') AS handle;
+
+statement ok
+SET VARIABLE sid = (SELECT unnest(regexp_extract_all(acl_sessions(), '"id":\s*"([^"]+)"', 1)));
+
+query I
+SELECT getvariable('sid') IS NOT NULL;
+----
+true
+
+# --- the bundle: observe + the node's runtime ---------------------------------------------------------
+
+query T
+ACL ROLE "op" SELECT bundles FROM platform.console_info();
+----
+[observe, operate]
+
+query I
+ACL ROLE "op" SELECT count(*) FROM platform.sessions;
+----
+1
+
+# what the console shows of `platform`: the node views and the operations, never the policy's
+query I
+ACL ROLE "op" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_name IN ('sessions', 'audit_events', 'drain');
+----
+3
+
+query I
+ACL ROLE "op" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_name = 'grants';
+----
+0
+
+statement error
+ACL ROLE "op" SELECT * FROM platform.grants;
+----
+<REGEX>:.*no access to object "platform.grants".*
+
+# --- the operations as grammar (markerless under a principal) -----------------------------------------
+
+statement ok
+SET VARIABLE mgmt = 'ACL ROLE "op" SET SESSION ''' || getvariable('sid') || ''' AUDIT LEVEL all';
+
+query I
+SELECT * FROM query(getvariable('mgmt'));
+----
+true
+
+query TT
+ACL ROLE "op" SELECT audit_level, audit_level_source FROM platform.sessions;
+----
+all	override
+
+statement ok
+SET VARIABLE mgmt = 'ACL ROLE "op" SET SESSION ''' || getvariable('sid') || ''' AUDIT LEVEL DEFAULT';
+
+query I
+SELECT * FROM query(getvariable('mgmt'));
+----
+true
+
+statement ok
+SET VARIABLE mgmt = 'ACL ROLE "op" PROFILE SESSION ''' || getvariable('sid') || ''' SAMPLED';
+
+query I
+SELECT * FROM query(getvariable('mgmt'));
+----
+true
+
+statement error
+ACL ROLE "op" SET SESSION 'x' AUDIT LEVEL loud;
+----
+<REGEX>:.*unknown level.*
+
+# duckdb's SET SESSION <setting> is not ours: no quoted id, no capture
+statement error
+ACL ROLE "op" SET SESSION threads = 2;
+----
+<REGEX>:.*acl_rewrite: SET.*
+
+query I
+ACL ROLE "op" DRAIN NODE;
+----
+1
+
+query I
+SELECT acl_drain_status();
+----
+draining
+
+query I
+ACL ROLE "op" RESUME NODE;
+----
+true
+
+# the same through the calls
+query I
+ACL ROLE "op" SELECT platform.drain();
+----
+1
+
+query I
+ACL ROLE "op" CALL platform.resume();
+----
+true
+
+query I
+ACL ROLE "op" KILL SESSION 'nosuch';
+----
+false
+
+statement ok
+SET VARIABLE mgmt = 'ACL ROLE "op" KILL SESSION ''' || getvariable('sid') || '''';
+
+query I
+SELECT * FROM query(getvariable('mgmt'));
+----
+true
+
+query I
+SELECT acl_session_count();
+----
+0
+
+# --- who may not: observe reads, policy administers the ACL, not the node ---------------------------
+
+statement error
+ACL ROLE "obs" KILL SESSION 'nosuch';
+----
+<REGEX>:.*the principal has no ACL administration scope.*
+
+statement error
+ACL ROLE "pol" KILL SESSION 'nosuch';
+----
+<REGEX>:.*platform.kill_session is the node's operation and requires the operate bundle.*
+
+statement error
+ACL ROLE "pol" DRAIN NODE;
+----
+<REGEX>:.*platform.drain is the node's operation and requires the operate bundle.*
+
+statement error
+ACL ROLE "pol" SELECT platform.resume();
+----
+<REGEX>:.*platform.resume is the node's operation and requires the operate bundle.*
+
+statement error
+ACL ROLE "r" DRAIN NODE;
+----
+<REGEX>:.*the principal has no ACL administration scope.*
+
+# a point grant on one operation stands in for the bundle (spec 117's model)
+statement ok
+ACL ADMIN GRANT FUNCTION platform.kill_session TO ROLE pol;
+
+query I
+ACL ROLE "pol" KILL SESSION 'nosuch';
+----
+false
+
+statement error
+ACL ROLE "pol" DRAIN NODE;
+----
+<REGEX>:.*platform.drain is the node's operation and requires the operate bundle.*
+
+statement ok
+ACL ADMIN REVOKE FUNCTION platform.kill_session FROM ROLE pol;
+
+# --- MIGRATE POLICY CATALOG: every node's schema window - passthrough's ------------------------------
+
+statement error
+ACL ROLE "op" MIGRATE POLICY CATALOG store.acl;
+----
+<REGEX>:.*MIGRATE POLICY CATALOG moves the schema window of every node and requires a passthrough scope.*
+
+statement error
+ACL ROLE "pol" MIGRATE POLICY CATALOG store.acl;
+----
+<REGEX>:.*MIGRATE POLICY CATALOG moves the schema window of every node and requires a passthrough scope.*
+
+statement error
+ACL ADMIN GRANT FUNCTION platform.migrate_catalog TO ROLE op;
+----
+<REGEX>:.*platform.migrate_catalog is the passthrough scope's alone.*
+
+statement ok
+ACL ROLE "root" MIGRATE POLICY CATALOG store.acl;
+
+# --- platform.audit_events: the ring, for observe -------------------------------------------------------
+
+query I
+ACL ROLE "obs" SELECT count(*) > 0 FROM platform.audit_events WHERE kind = 'admin';
+----
+true
+
+query I
+ACL ROLE "op" SELECT count(*) > 0 FROM platform.audit_events;
+----
+true
+
+statement error
+ACL ROLE "pol" SELECT * FROM platform.audit_events;
+----
+<REGEX>:.*no access to object "platform.audit_events".*
+
+# --- the bundle as a set: operate carries observe, so observe alone cannot be taken from it -------------
+
+statement error
+ACL ADMIN REVOKE ADMIN observe FROM ROLE op;
+----
+<REGEX>:.*holds operate, which carries observe.*
+
+statement ok
+ACL ADMIN REVOKE ADMIN operate FROM ROLE op;
+
+statement error
+ACL ROLE "op" DRAIN NODE;
+----
+<REGEX>:.*the principal has no ACL administration scope.*
