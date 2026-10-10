@@ -1781,6 +1781,8 @@ void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, con
 		throw BinderException("acl admin: schema \"%s.%s\" does not exist", vcat, path);
 	}
 	if (!into.empty()) {
+		// spec 117 verification: a CREATE OR REPLACE in this home would replace a policy table
+		RequireNotPolicyStore(*catalog, "the grant's INTO schema", into, true);
 		// a target checked when granted, not when a CREATE first lands on it (spec 016)
 		string database, schema;
 		SplitPhysSchema(into, database, schema);

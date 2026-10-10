@@ -254,6 +254,9 @@ before it does not know the bundles).
   - *D3*: the policy store is recognized under every reading the binder may give a name (`<db>.<t>` with
     the policy in `<db>.main`, `<schema>.<t>`, a bare `<t>` in the default path) - over-reading refuses;
     bodies by the tables they bind to, the text when they do not bind.
+    Verification round: `ALTER GRANT … SET RLS | COLUMNS` bodies are judged like GRANT's; a schema alias
+    / expansion over the policy store's database is refused; so is a schema grant's `INTO` home there
+    (a role's `CREATE OR REPLACE` would replace a policy table).
   - *D4*: `IsPlatformCatalog` ignores surrounding whitespace (`"platform "`).
   - a point grant on `check_catalog` admits the grammar too (`MayAdminister`); `SELECT * FROM
     platform.check_catalog(…)` / `CALL` compile to the call `CHECK VIRTUAL CATALOG` is - one `admin`

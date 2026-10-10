@@ -124,6 +124,26 @@ SELECT count(*) FROM store.acl.schemas WHERE path IN ('r10', 'r11', 'r12');
 ----
 0
 
+# verification round: a schema grant's INTO home in the policy store - the role's CREATE OR REPLACE
+# would replace a policy table there
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA sales.land FROM phys.main;
+
+statement error
+ACL ROLE "pol" GRANT SCHEMA sales.land TO ROLE reader WITH (select, create, drop) INTO store.acl;
+----
+<REGEX>:.*the grant's INTO schema reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" GRANT SCHEMA sales.land TO ROLE reader WITH (create) INTO "STORE"."ACL";
+----
+<REGEX>:.*the grant's INTO schema reads the policy store itself.*
+
+query I
+SELECT count(*) FROM store.acl.role_schemas WHERE schema_path = 'land';
+----
+0
+
 statement error
 ACL ROLE "cadm" CREATE VIRTUAL TABLE FUNCTION sales.q() AS SELECT * FROM query('SELECT * FROM store.' || 'acl.adm' || 'ins');
 ----
