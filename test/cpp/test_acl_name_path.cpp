@@ -129,5 +129,23 @@ int main(int argc, char *argv[]) {
 			          One(con, "SELECT " + duckdb::acl::KeyPrefixSql("'\"a.b\".c'", "'a'")) == "false",
 			      "KeyPrefixSql: a quoted part is a prefix whole, never the text before its dot");
 		});
+
+		Scenario("one fold: the SQL comparison answers what C++ (and duckdb's catalog) answers", [&] {
+			std::vector<std::pair<std::string, std::string>> pairs = {
+			    {"Order Items", "order ITEMS"},
+			    {"\xc3\x84", "\xc3\xa4"},                     // Ä / ä
+			    {"STRA\xe1\xba\x9e\x45", "stra\xc3\x9f\x65"}, // STRAẞE / straße
+			    {"i\xe2\x84\xaa", "ik"},                      // i + Kelvin sign / ik
+			    {"\xc4\xb0K", "ik"},                          // İK / ik
+			    {"a.b", "A.B"}};
+			for (auto &pair : pairs) {
+				auto sql = One(con, "SELECT " + duckdb::acl::KeyEqSql(Lit(pair.first), Lit(pair.second)));
+				auto cpp = duckdb::StringUtil::CIEquals(pair.first, pair.second) ? "true" : "false";
+				Check(sql == cpp, "KeyEqSql agrees with CIEquals: " + pair.first + " / " + pair.second + " = " + cpp);
+				Check(One(con, "SELECT strlen(" + duckdb::acl::KeyFoldSql(Lit(pair.first)) + ")") ==
+				          std::to_string(pair.first.size()),
+				      "the fold keeps the length in bytes: " + pair.first);
+			}
+		});
 	});
 }

@@ -552,6 +552,27 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 		return false;
 	}
 	auto prio = result->Collection().GetValue(11, 0).GetValue<int64_t>();
+	{
+		// spec 116: the winning reading names ONE object - two that match it equally (a driver's
+		// `Orders` and `orders`, a catalog that predates the one-spelling rule) are refused, never merged
+		auto ncols = result->ColumnCount();
+		auto object_of = [&](idx_t row) {
+			return result_rows.GetValue(ncols - 2, row).ToString() + "\x1f" +
+			       result_rows.GetValue(ncols - 1, row).ToString();
+		};
+		auto first = object_of(0);
+		for (idx_t row = 1; row < result->RowCount(); row++) {
+			if (result_rows.GetValue(11, row).GetValue<int64_t>() != prio) {
+				break;
+			}
+			if (object_of(row) != first) {
+				NoteDenyReason(Reason::NO_ACCESS);
+				throw BinderException("acl: ambiguous name \"%s\" - it matches more than one object of the policy "
+				                      "(names compare case-insensitively)",
+				                      vname);
+			}
+		}
+	}
 	auto form = result->Collection().GetValue(0, 0).ToString();
 	auto phys = result->Collection().GetValue(1, 0);
 	auto view_sql = result->Collection().GetValue(2, 0);
@@ -896,11 +917,35 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 	auto vcat = result->Collection().GetValue(0, 0).ToString();
 	auto alias_path = result->Collection().GetValue(1, 0).ToString();
 	auto &path = prio == 1 ? rest : vname;
+	// spec 116: one object or none - two aliases of the winning reading that match equally (a driver's
+	// `Raw` and `raw`) are refused, never merged
+	for (idx_t row = 1; row < result->RowCount(); row++) {
+		if (result_rows.GetValue(10, row).GetValue<int64_t>() != prio ||
+		    NamePath::KeySize(result_rows.GetValue(1, row).ToString()) != NamePath::KeySize(alias_path)) {
+			break; // ordered by prio, then by the alias's length: a shorter alias loses to the longest
+		}
+		if (result_rows.GetValue(0, row).ToString() != vcat || result_rows.GetValue(1, row).ToString() != alias_path) {
+			NoteDenyReason(Reason::NO_ACCESS);
+			throw BinderException(
+			    "acl: ambiguous name \"%s\" - it matches schema %s and schema %s of the policy", vname,
+			    NamePath::JoinKeys(vcat, alias_path),
+			    NamePath::JoinKeys(result_rows.GetValue(0, row).ToString(), result_rows.GetValue(1, row).ToString()));
+		}
+	}
+	// spec 116: the tail below the alias by PARTS - a fold that changed a length must never move the cut
+	auto written = NamePath::FromKey(path);
+	auto alias_parts = NamePath::KeySize(alias_path);
+	if (alias_parts == 0 || written.Size() <= alias_parts) {
+		return false;
+	}
+	auto tail =
+	    NamePath(vector<string>(written.Parts().begin() + NumericCast<int64_t>(alias_parts), written.Parts().end()))
+	        .ToKey();
 	out.subquery_form = false;
 	out.writable = true; // an aliased schema maps onto real tables
-	out.phys = result->Collection().GetValue(2, 0).ToString() + path.substr(alias_path.size());
+	out.phys = NamePath::JoinKeys(result->Collection().GetValue(2, 0).ToString(), tail);
 	// spec 112 §3: the object a live alias reaches is named like any other - where dbt writes
-	out.canonical = vcat + "." + path;
+	out.canonical = NamePath::JoinKeys(vcat, NamePath::JoinKeys(alias_path, tail));
 	// rows of the same winning alias differ only by role: union their caps and grant policies
 	GrantUnion grants;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
@@ -950,7 +995,7 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 	           ","
 	           " CASE WHEN " +
 	           qualified_cond +
-	           " THEN 1 ELSE 2 END AS prio"
+	           " THEN 1 ELSE 2 END AS prio, f.\"vname\" AS fvname"
 	           " FROM " +
 	           FunctionsSource(principal, names) + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join +
 	           " WHERE f.\"kind\" = '" + kind + "' AND ((" + qualified_cond +
@@ -966,6 +1011,19 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 		auto target = result->Collection().GetValue(2, 0);
 		auto template_sql = result->Collection().GetValue(3, 0);
 		auto prio = result->Collection().GetValue(11, 0).GetValue<int64_t>();
+		// spec 116: one function or none (see LookupRelation)
+		auto fvname = result_rows.GetValue(12, 0).ToString();
+		for (idx_t row = 1; row < result->RowCount(); row++) {
+			if (result_rows.GetValue(11, row).GetValue<int64_t>() != prio) {
+				break;
+			}
+			if (result_rows.GetValue(0, row).ToString() != vcat || result_rows.GetValue(12, row).ToString() != fvname) {
+				NoteDenyReason(Reason::NO_ACCESS);
+				throw BinderException("acl: ambiguous name \"%s\" - it matches more than one %s function of the "
+				                      "policy (names compare case-insensitively)",
+				                      vname, kind);
+			}
+		}
 		policy.subquery_form = form != "alias";
 		policy.phys = target.IsNull() ? string() : target.ToString();
 		policy.query = template_sql.IsNull() ? string() : template_sql.ToString();

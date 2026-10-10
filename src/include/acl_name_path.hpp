@@ -250,20 +250,14 @@ public:
 		return key.size() > path.size() + 1 && key[path.size()] == '.' &&
 		       StringUtil::CIEquals(key.substr(0, path.size()), path);
 	}
-	//! A stored key (a physical name) as SQL text the binder reads; text that is no key is kept as it is
+	//! A stored key (a physical name) as SQL text the binder reads. Text that is no key is refused, never
+	//! passed through as SQL (schema v20's migration refuses such a key in the first place)
 	static string KeyToSql(const string &key) {
-		NamePath path;
-		string error;
-		return TryFromKey(key, path, error) ? path.ToSql() : key;
+		return FromKey(key, "a stored physical name").ToSql();
 	}
 	//! A stored key as a parsed name (the binder's form of a physical name)
 	static QualifiedName KeyToQualified(const string &key) {
-		NamePath path;
-		string error;
-		if (!TryFromKey(key, path, error)) {
-			return QualifiedName(Identifier(key));
-		}
-		return path.ToQualified();
+		return FromKey(key, "a stored physical name").ToQualified();
 	}
 	//! A schema key as a listing shows it (spec 116): one part unquoted (`Raw Data`, `q"uote`) unless it
 	//! holds a `.` - then, as a path, its key (`"a.b"`, `a."b.c"`), so a part never reads as two levels
@@ -297,13 +291,19 @@ private:
 // SQL fragments over stored keys - so no ad-hoc split or regexp is written anywhere else
 //===--------------------------------------------------------------------===//
 
+//! A name folded for comparison: ASCII letters only, as duckdb's catalog (and StringUtil::Lower /
+//! CIEquals) folds - SQL's lower() folds Unicode, and two folds would make two answers to "is this the
+//! same name" (`Ä` / `ä` are two names, as in duckdb). Byte-for-byte length-preserving.
+inline string KeyFoldSql(const string &expr) {
+	return "translate(" + expr + ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
+}
 //! Two key expressions name the same thing (case-insensitively, as duckdb's catalog compares)
 inline string KeyEqSql(const string &a, const string &b) {
-	return "lower(" + a + ") = lower(" + b + ")";
+	return KeyFoldSql(a) + " = " + KeyFoldSql(b);
 }
 //! `key` lies strictly under `path` (both expressions; a part boundary is a `.` outside quotes)
 inline string KeyPrefixSql(const string &key, const string &path) {
-	return "lower(substr(" + key + ", 1, length(" + path + ") + 1)) = lower(" + path + " || '.')";
+	return KeyFoldSql("substr(" + key + ", 1, length(" + path + ") + 1)") + " = " + KeyFoldSql(path + " || '.'");
 }
 //! The last part of a key, as written in the key (quoted when it holds `.` or `"`). A quoted part has
 //! an even number of quotes and the tail of one cut at an inner `.` an odd one, so the only `.` this
