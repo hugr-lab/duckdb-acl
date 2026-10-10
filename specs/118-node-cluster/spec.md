@@ -1,6 +1,6 @@
 # Spec 118: node and cluster management - operate / cluster, drift, the physical tree
 
-- **Status**: accepted (by the owner 2026-10-10); **118.1 and 118.2 implemented** (see *As built*); aligned after the comparison with Trino, Snowflake, Databricks UC,
+- **Status**: accepted (by the owner 2026-10-10); **118.1, 118.2 and 118.3 implemented** (see *As built*); aligned after the comparison with Trino, Snowflake, Databricks UC,
   ClickHouse, PostgreSQL, SQL Server - design/079 App. A)
 - **Date**: 2026-10-10
 - **Author**: Claude (design/079 with the owner)
@@ -39,7 +39,7 @@ console works there; what makes a node differ from its profile is shown (drift, 
 2. **118.2 - the cluster**: `acl_deployment`; `cluster`; drift; the cluster parts in their own files (to
    move to hugr_node).
 3. **118.3 - the physical tree**: `platform.attached.*` (metadata, lazy); `GRANT | REVOKE SOURCE` at the
-   alias and schema level; a catalog admin builds only over granted sources (`source_not_granted`).
+   alias and schema level; a catalog admin builds only over granted sources (the `source_not_granted` finding moved to 120 - see As built).
 
 ## Design
 
@@ -115,7 +115,7 @@ happened here"; history beyond the ring is acl-otel's. One registry entry.
 
 ### 5. The physical tree: `platform.attached.<alias>.<schema>.<object>` (118.3)
 Metadata only: databases, schemas, tables, views (no view SQL, no column defaults - text that can carry
-data), columns with types, comments. Answered by a C++ `acl_platform_attached(alias[, schema])` that
+data), columns with types, comments. Answered by a C++ `acl_platform_attached([sources])` (as built: a list of granted sources, NULL = all) that
 reads ONE attached catalog's schema set (never duckdb_tables / duckdb_columns, which scan every
 database) - a tree node loads its children only (design/079 principle 5).
 - Scope: `cluster` / `policy` / `passthrough` - every attached database except the policy catalog's and
@@ -135,7 +135,7 @@ prefix too).
   target, the tables a view body reads. A reference outside the granted sources is refused at write.
 - `passthrough`, `policy`, `cluster` see every source without a grant.
 - **Existing state** (owner, 2026-10-10): objects declared before the rule keep working - nothing is
-  taken back automatically; `acl_check_catalog` reports each as `source_not_granted` with the
+  taken back automatically; (superseded - see As built 118.3: no finding until 120's created_by) `acl_check_catalog` reports each as `source_not_granted` with the
   `GRANT SOURCE …` (or the DROP) to run; only an explicit command removes.
 
 ### 6. DETACH and views (118.1)
@@ -165,7 +165,7 @@ catalog; over-reading blocks, FORCE is the operator's answer). Who reads what pe
   has no drift and refuses `ACL CLUSTER`.
 - `test/sql/platform_attached.test`: the tree per scope (a catalog admin - granted sources only), no view
   SQL / defaults, lazy per alias / schema; `GRANT SOURCE` checked at write; an older object keeps
-  working and is a `source_not_granted` finding; postgres under integration.
+  working (the finding: 120); postgres under integration (not built - the suite's in-memory sources stand in).
 - Door / Flight e2e: an `operate` token drains and resumes; a `cluster` token attaches through the
   profile and cannot `ACL NATIVE SELECT` a physical row.
 
@@ -240,4 +240,33 @@ catalog; over-reading blocks, FORCE is the operator's answer). Who reads what pe
   extension loaded; read through duckdb_settings()), one settings read, a non-file database's path never shown
   (a native attach may carry a credential). Docs: the bundles everywhere, the point-grant lists.
   Low, left: source names that are canonical keys with a dot compared as raw names; drift in group scope untested.
+
+### 118.3 (2026-10-10)
+- `src/acl_platform_sources.cpp`: `acl_platform_attached([sources])` / `acl_platform_attached_columns([sources])`
+  read each visible database through `Catalog::GetSchemas` + `Scan(TABLE_ENTRY)` (tables, views - a view's columns
+  from its binding, never its SQL); `NULL` = every source; a list = only the databases it names are read. The
+  policy store's database and tresor catalogs are never shown. `PlatformListingCtes` adds them to `pobjects` /
+  `pcolumns` (now with `path`, `type`); the listings derive the nested schemas (`attached`, `attached.<alias>`, …)
+  from the paths. A `SELECT` from `platform.attached…` is refused (no such object).
+- `GRANT | REVOKE SOURCE <db>[.<schema>] TO|FROM ROLE r` and `platform.grant_source` / `revoke_source` (HANDS_OUT:
+  policy, passthrough); written as platform_grants kind `source` (the database must be attached, the schema must
+  exist); a point grant (`acl_grant_platform`) still takes only view / function.
+- `AuthorizeSources`: for a principal that is not policy / passthrough / cluster, every stored physical name
+  (relation phys, schema alias / expansion path, a function alias' target in an attached database, ALTER … SET phys)
+  and every table a SELECT / EXPRESSION body reads (bound by `GetTableNames` on the node; a body that does not bind
+  is refused for such an author) lies in a granted source - named in full. `GetTableNames` answers a reference with
+  its alias (`pg.hr.salaries AS s`) - cut here and in spec 117's policy-store check.
+- **Not built (decided, owner's "no automatic rollback" holds without it):** the `source_not_granted` finding. Without
+  a record of who declared an object (spec 120's created_by), it would flag every object an operator or the policy
+  admin built in a catalog that also has a catalog admin. Existing objects keep working; the rule applies at write.
+- Behaviour change: a catalog admin now needs `GRANT SOURCE` to build over physical sources; the suites' catalog
+  admins got one (`acl_admin_scopes`, `acl_observe`, `platform_calls`, `platform_review`).
+- Tests: `platform_attached.test` (new).
+- Review (three passes): ALTER VIRTUAL SCHEMA … SET PHYS and the column bodies (a relation's columns in either
+  form `name = expr` / `expr AS name`, ALTER … SET COLUMNS, REPAIR REMAP) are checked too; the cluster bundle sees
+  every source but builds only over granted ones (`rights.Policy()` decides building); a hidden database (ducklake's
+  metadata) is never a source; one source whose catalog fails drops out of the tree; a source is never granted to
+  `''`. Known, 119's: a broken source still fails the listings through duckdb's own `information_schema.tables` the
+  alias branch reads (pre-existing, every principal), and an all-sources admin's listing reads every source in full
+  whatever the filter.
 

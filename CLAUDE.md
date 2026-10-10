@@ -681,7 +681,7 @@ a retained result is read from the handle. The view comment and the stored catal
 reach the listings. Tests: `platform_{views,calls,rights,markerless,reserved,memory}.test`,
 `test_acl_session.cpp` / `test_acl_params_passthrough.cpp`, `test/e2e/flight/admin.sh`, the door e2e.
 
-**Spec 118 — node and cluster management** (in stages; 118.1 and 118.2 built): the `operate` bundle
+**Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
 point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`
 (a single-quoted id - duckdb's `SET SESSION <setting>` is never captured), `PROFILE SESSION`, `DRAIN NODE`,
@@ -700,8 +700,15 @@ in its service. The `cluster` bundle (`AdminScope::CLUSTER`, `AdminRights::clust
 implies it) = INFRASTRUCTURE and the CLUSTER views, never a point grant; its settings an allowlist of resources
 and tuning (`ClusterBundleMaySet` - the rest passthrough's); the node's trust settings are HARDENING. `platform.drift` (`acl_platform_drift()`, `PolicyStore::ClusterDrift`):
 per database / loaded extension / profiled setting a state same | differs | node_only | profile_only | bootstrap;
-showing only. Cluster parts stay in acl_cluster.cpp (to move to hugr_node). Next: 118.3 (`platform.attached`,
-`GRANT SOURCE`).
+showing only. Cluster parts stay in acl_cluster.cpp (to move to hugr_node). 118.3 (`acl_platform_sources.cpp`):
+`platform.attached.<alias>.<schema>` - the sources' metadata (not the policy db, not a tresor) as nested schemas
+of platform in every listing (`pobjects` / `pcolumns` carry `path` and `type`; schema rows have a NULL vname),
+read per database by `acl_platform_attached[_columns]([sources])`; a read of it refused. `GRANT | REVOKE SOURCE
+<db>[.<schema>] TO|FROM ROLE r` → `acl_grant_source` / `acl_revoke_source` (HANDS_OUT; platform_grants kind
+`source`). `AuthorizeSources` (beside AuthorizeBodies): a principal that is not policy / passthrough (cluster included)
+stores a physical name or a body (incl. column expressions, REMAP, ALTER … SET PHYS) reading a table only inside its
+granted sources (GetTableNames - names as written, the alias cut); hidden databases and one failing source drop
+out of the tree; nothing built is taken back.
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant

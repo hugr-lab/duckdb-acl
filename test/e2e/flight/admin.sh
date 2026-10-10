@@ -104,7 +104,9 @@ echo "$got" | grep -q "no ACL administration scope" || fail "a non-admin adminis
 got="$(ask "@catalogs")"
 [ "$got" = "{'catalog_name': ['platform']}" ] || fail "GetCatalogs of the admin: $got"
 got="$(ask "@schemas")"
-echo "$got" | grep -q "'catalog_name': \['platform'\], 'db_schema_name': \['main'\]" || fail "GetDbSchemas: $got"
+# platform's own schema and (spec 118.3) the physical tree the policy bundle sees: the node's database
+echo "$got" | grep -q "'db_schema_name': \['attached', 'attached.memory', 'attached.memory.main', 'main'\]" ||
+	fail "GetDbSchemas: $got"
 got="$(ask "@tables:grants")"
 echo "$got" | grep -q "'catalog_name': \['platform'\]" || fail "GetTables does not list platform.grants: $got"
 echo "$got" | grep -q "'table_type': \['VIEW'\]" || fail "platform.grants is not a view: $got"

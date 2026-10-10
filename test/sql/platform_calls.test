@@ -415,6 +415,10 @@ ACL ROLE "pol" SELECT platform.nothing_here();
 statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE cat CAPS '{"manage": true}';
 
+# spec 118.3: a catalog admin builds over its granted sources
+statement ok
+ACL ADMIN GRANT SOURCE phys TO ROLE cat;
+
 statement ok
 ACL ROLE "cat" ACL CREATE VIRTUAL TABLE sales.g AS phys.main.orders;
 

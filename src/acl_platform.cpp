@@ -24,6 +24,8 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -918,6 +920,25 @@ vector<PlatformFunction> BuildFunctions() {
 	     "end a session by its id (spec 050)"},
 	    {"drain", "acl_drain", {}, {0}, -1, PR::OPERATE, false, I, "stop seating new clients (spec 066)"},
 	    {"resume", "acl_resume", {}, {0}, -1, PR::OPERATE, false, B, "seat new clients again (spec 066)"},
+	    {"grant_source",
+	     "acl_grant_source",
+	     {role, A("source")},
+	     {2},
+	     -1,
+	     PR::HANDS_OUT,
+	     false,
+	     B,
+	     "grant a source (<database>[.<schema>]) to a role - it sees it under platform.attached and builds over it "
+	     "(spec 118)"},
+	    {"revoke_source",
+	     "acl_revoke_source",
+	     {role, A("source")},
+	     {2},
+	     -1,
+	     PR::HANDS_OUT,
+	     false,
+	     B,
+	     "revoke a source grant (spec 118)"},
 	    {"migrate_catalog",
 	     "acl_migrate_catalog",
 	     {A("database"), A("schema")},
@@ -1604,6 +1625,139 @@ vector<BodyArgument> BodiesOf(const string &target, FunctionExpression &call) {
 }
 
 } // namespace
+
+void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,
+                      PolicyStore &store) {
+	if (rights.Policy() || !store.catalog) {
+		return; // passthrough and policy build over every source (cluster only sees them); memory mode has none
+	}
+	auto granted = GrantedSources(rights);
+	auto refuse = [&](const string &what, const string &name) {
+		NoteDenyReason(Reason::NO_ACCESS);
+		throw BinderException("acl admin: %s names %s, outside the sources granted to the principal - a catalog "
+		                      "admin builds only over its sources: GRANT SOURCE <database>[.<schema>] TO ROLE <role> "
+		                      "(policy or passthrough), and name the source in full (<database>.<schema>.<object>)",
+		                      what, name);
+	};
+	auto text_of = [&](FunctionExpression &call, idx_t index, string &out) {
+		auto &arguments = call.GetArguments();
+		if (index >= arguments.size()) {
+			return false;
+		}
+		auto &argument = arguments[index].GetExpression();
+		if (argument.GetExpressionClass() != ExpressionClass::CONSTANT) {
+			throw BinderException("acl admin: a physical name is judged against the granted sources before it is "
+			                      "stored, so it must be a constant, not a parameter");
+		}
+		auto value = argument.Cast<ConstantExpression>().GetLiteral().ToValue();
+		if (value.IsNull()) {
+			return false;
+		}
+		out = value.ToString();
+		return true;
+	};
+	auto parts_of = [](const string &key) {
+		NamePath path;
+		string error;
+		return NamePath::TryFromKey(key, path, error) ? path.Parts() : StringUtil::Split(key, '.');
+	};
+	auto attached = [&](const string &name) {
+		auto db = store.catalog->Db();
+		return db && DatabaseManager::Get(*db).GetDatabase(Identifier(name)) != nullptr;
+	};
+	for (auto &statement : statements) {
+		auto &call = CompiledCall(*statement);
+		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
+		// the physical names a call stores: (argument, a schema path?, a function?)
+		vector<std::tuple<idx_t, bool, bool>> names;
+		if (target == "acl_add_relation") {
+			names.emplace_back(2, false, false);
+		} else if (target == "acl_add_schema_alias" || target == "acl_expand_schema" ||
+		           target == "acl_alter_schema_alias") {
+			names.emplace_back(2, true, false);
+		} else if (target == "acl_add_table_function_alias" || target == "acl_add_scalar_alias") {
+			names.emplace_back(2, false, true);
+		} else if (target == "acl_alter_relation") {
+			string field;
+			if (text_of(call, 2, field) && StringUtil::CIEquals(field, "phys")) {
+				names.emplace_back(3, false, false);
+			}
+		} else if (target == "acl_alter_function") {
+			string form;
+			if (text_of(call, 3, form) && StringUtil::CIEquals(form, "alias")) {
+				names.emplace_back(4, false, true);
+			}
+		}
+		for (auto &entry : names) {
+			string name;
+			if (!text_of(call, std::get<0>(entry), name)) {
+				continue;
+			}
+			auto parts = parts_of(name);
+			if (std::get<2>(entry) && (parts.size() < 2 || !attached(parts[0]))) {
+				continue; // a builtin or the node's own function: the function gate's, not a source
+			}
+			// a schema path may be one database whole; an object is named <database>.<schema>.<object>
+			if (parts.size() < (std::get<1>(entry) ? 1u : 2u) || !SourceGranted(granted, parts, std::get<1>(entry))) {
+				refuse("the definition", "\"" + name + "\"");
+			}
+		}
+		// the tables a stored body reads: bound on the node, every one inside a granted source
+		for (auto &body : BodiesOf(target, call)) {
+			if (body.shape == BodyShape::FUNCTION_NAME) {
+				continue;
+			}
+			string text;
+			if (!text_of(call, body.index, text) || StringUtil::Replace(text, " ", "").empty()) {
+				continue;
+			}
+			// a column list (a relation's columns, a REMAP) is checked item by item, each as an expression
+			vector<std::pair<string, bool>> pieces;
+			if (body.shape == BodyShape::COLUMNS) {
+				for (auto &item : acl_detail::ParseColumnList(text)) {
+					// `name = expr`, or the grammar's `expr AS name` (kept whole as the item's name)
+					auto piece = item.second.empty() ? item.first : item.second;
+					auto as_at = StringUtil::Lower(piece).rfind(" as ");
+					if (item.second.empty() && as_at != string::npos) {
+						piece = piece.substr(0, as_at);
+					}
+					bool plain = true; // a column named as is reads no table
+					for (auto c : piece) {
+						plain = plain && (StringUtil::CharacterIsAlphaNumeric(c) || c == '_' || c == '"' || c == '.' ||
+						                  StringUtil::CharacterIsSpace(c));
+					}
+					if (!plain) {
+						pieces.emplace_back(piece, true);
+					}
+				}
+			} else {
+				pieces.emplace_back(text, body.shape == BodyShape::EXPRESSION);
+			}
+			vector<string> tables;
+			try {
+				for (auto &piece : pieces) {
+					auto baked = BakeTemplateForProbe(piece.first, ParserOptions::Builtin(), piece.second, {});
+					auto probe = piece.second ? "SELECT (" + baked + ") AS \"value\"" : baked;
+					Connection con(*store.catalog->Db());
+					for (auto &table : con.GetTableNames(probe, true)) {
+						// the answer is the reference as written, its alias too: `pg.hr.salaries AS s`
+						auto alias_at = StringUtil::Lower(table).find(" as ");
+						tables.push_back(alias_at == string::npos ? table : table.substr(0, alias_at));
+					}
+				}
+			} catch (std::exception &ex) {
+				throw BinderException("acl admin: a catalog admin's definition must bind, so the sources it reads "
+				                      "can be checked: %s",
+				                      ex.what());
+			}
+			for (auto &table : tables) {
+				if (!SourceGranted(granted, parts_of(table), false)) {
+					refuse("the definition's body", "\"" + table + "\"");
+				}
+			}
+		}
+	}
+}
 
 void AuthorizeBodies(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,
                      PolicyStore &store, const Principal &author) {
@@ -2380,6 +2534,8 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 //===--------------------------------------------------------------------===//
 
 void PlatformListingCtes(const PolicyStore::AdminRights &rights, string &objects, string &columns) {
+	// rows (path, vname, comment, type) and (path, vname, pos, name, type): the views in `main`, and (spec
+	// 118.3) the physical tree under `attached` - a schema row has a NULL vname (an empty schema is a node)
 	objects.clear();
 	columns.clear();
 	PlatformAccess access;
@@ -2393,21 +2549,40 @@ void PlatformListingCtes(const PolicyStore::AdminRights &rights, string &objects
 		if (!access.ReadsView(view, scoped)) {
 			continue;
 		}
-		object_rows.push_back("(" + Lit(view.name) + ", " + Lit(view.comment) + ")");
+		object_rows.push_back("('main', " + Lit(view.name) + ", " + Lit(view.comment) + ", 'VIEW')");
 		for (idx_t i = 0; i < view.columns.size(); i++) {
-			column_rows.push_back("(" + Lit(view.name) + ", " + std::to_string(i + 1) + ", " +
+			column_rows.push_back("('main', " + Lit(view.name) + ", " + std::to_string(i + 1) + ", " +
 			                      Lit(view.columns[i].name) + ", " + Lit(TypeText(view.columns[i].type)) + ")");
 		}
 	}
-	if (object_rows.empty()) {
-		// a principal holding only functions: the catalog is there (its schema `main` holds them)
-		objects = "SELECT NULL::VARCHAR AS vname, NULL::VARCHAR AS comment WHERE false";
-		columns = "SELECT NULL::VARCHAR AS vname, NULL::BIGINT AS pos, NULL::VARCHAR AS name, NULL::VARCHAR AS type "
-		          "WHERE false";
-		return;
+	objects = "SELECT NULL::VARCHAR AS path, NULL::VARCHAR AS vname, NULL::VARCHAR AS comment, NULL::VARCHAR AS type "
+	          "WHERE false";
+	columns = "SELECT NULL::VARCHAR AS path, NULL::VARCHAR AS vname, NULL::BIGINT AS pos, NULL::VARCHAR AS name, "
+	          "NULL::VARCHAR AS type WHERE false";
+	if (!object_rows.empty()) {
+		objects += " UNION ALL SELECT * FROM (VALUES " + StringUtil::Join(object_rows, ", ") +
+		           ") AS p(path, vname, comment, type)";
+		columns += " UNION ALL SELECT * FROM (VALUES " + StringUtil::Join(column_rows, ", ") +
+		           ") AS p(path, vname, pos, name, type)";
 	}
-	objects = "SELECT * FROM (VALUES " + StringUtil::Join(object_rows, ", ") + ") AS p(vname, comment)";
-	columns = "SELECT * FROM (VALUES " + StringUtil::Join(column_rows, ", ") + ") AS p(vname, pos, name, type)";
+	// the physical tree: every source, or only the granted ones (a catalog admin) - never read otherwise
+	string sources;
+	if (SeesAllSources(rights)) {
+		sources = "NULL";
+	} else {
+		auto granted = GrantedSources(rights);
+		if (!granted.empty()) {
+			vector<string> quoted;
+			for (auto &source : granted) {
+				quoted.push_back(Lit(source));
+			}
+			sources = "[" + StringUtil::Join(quoted, ", ") + "]::VARCHAR[]";
+		}
+	}
+	if (!sources.empty()) {
+		objects += " UNION ALL SELECT path, vname, comment, type FROM acl_platform_attached(" + sources + ")";
+		columns += " UNION ALL SELECT path, vname, pos, name, type FROM acl_platform_attached_columns(" + sources + ")";
+	}
 }
 
 vector<PlatformFunctionRow> PlatformFunctionRows(const PolicyStore::AdminRights &rights) {
@@ -2795,6 +2970,7 @@ void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> 
 	scalar("acl_platform_map", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR), MapFunc);
 	scalar("acl_platform_conditions", ConditionsType(), ConditionsFunc);
 	scalar("acl_platform_attributes", AttributesType(), AttributesFunc);
+	RegisterAclPlatformSources(loader, store);
 }
 
 } // namespace acl

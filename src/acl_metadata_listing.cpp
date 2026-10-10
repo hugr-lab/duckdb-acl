@@ -191,7 +191,9 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	string schemas = function_schemas +
 	                 ", leafschemas AS (SELECT vcat, path FROM aliases UNION SELECT vcat, vschema FROM objects"
 	                 " UNION SELECT vcat, path FROM fschemas" +
-	                 string(platform ? " UNION SELECT 'platform' AS vcat, 'main' AS path" : "") +
+	                 string(platform ? " UNION SELECT 'platform' AS vcat, 'main' AS path UNION SELECT 'platform' AS"
+	                                   " vcat, path FROM pobjects" // spec 118.3: platform.attached.<alias>.<schema>
+	                                 : "") +
 	                 "),"
 	                 " vschemas AS (SELECT vcat, path FROM leafschemas UNION SELECT vcat, unnest(list_transform("
 	                 "range(1, len(" +
@@ -246,10 +248,10 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                   " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))))"
 	                   " GROUP BY vcat, vname, name))";
 	auto prelude =
-	    GrantsCte(principal) + ", " + physcols + ", " + declared + ", " + objects + ", " + aliases + ", " + schemas +
-	    ", " + grant_columns + ", " + vfunctions + ", " + projected +
-	    (platform ? ", pobjects AS (" + platform_objects + "), pcolumns AS (" + platform_columns + ")" : string()) +
-	    " ";
+	    GrantsCte(principal) + ", " +
+	    (platform ? "pobjects AS (" + platform_objects + "), pcolumns AS (" + platform_columns + "), " : string()) +
+	    physcols + ", " + declared + ", " + objects + ", " + aliases + ", " + schemas + ", " + grant_columns + ", " +
+	    vfunctions + ", " + projected + " ";
 	// spec 035: each surface answers in its own standard shape, column for column and type for
 	// type. A value that would describe the physical object rather than the virtual one is not
 	// borrowed - an oid identifies a physical catalog entry, a path is the physical database.
@@ -398,9 +400,9 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
 	    " WHERE len(a.parts) = 2" +
 	    // spec 117: the system catalog's views the principal holds
-	    string(platform ? " UNION ALL BY NAME SELECT 'platform' AS table_catalog, 'main' AS table_schema,"
-	                      " p.vname AS table_name, 'VIEW' AS table_type, 'NO' AS is_insertable_into,"
-	                      " p.comment AS \"TABLE_COMMENT\" FROM pobjects p"
+	    string(platform ? " UNION ALL BY NAME SELECT 'platform' AS table_catalog, p.path AS table_schema,"
+	                      " p.vname AS table_name, p.type AS table_type, 'NO' AS is_insertable_into,"
+	                      " p.comment AS \"TABLE_COMMENT\" FROM pobjects p WHERE p.vname IS NOT NULL"
 	                    : "");
 	const vector<std::pair<const char *, Shown>> table_names = {
 	    {"table_catalog", Shown::CATALOG}, {"table_schema", Shown::SCHEMA}, {"table_name", Shown::NAME}};
@@ -556,7 +558,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    path("o") + " = gp.vname LEFT JOIN lcols s ON s.table_catalog = gp.vcat AND " + source_path +
 	    " = gp.vname AND " + KeyFoldSql("s.column_name") + " = " + KeyFoldSql("gp.name") +
 	    // spec 117: the columns of the system catalog's views - the types each view declares
-	    (platform ? " UNION ALL BY NAME SELECT 'platform' AS table_catalog, 'main' AS table_schema, pc.vname AS"
+	    (platform ? " UNION ALL BY NAME SELECT 'platform' AS table_catalog, pc.path AS table_schema, pc.vname AS"
 	                " table_name, pc.name AS column_name, pc.pos AS ordinal_position, pc.type AS data_type,"
 	                " 'YES' AS is_nullable FROM pcolumns pc"
 	              : string());

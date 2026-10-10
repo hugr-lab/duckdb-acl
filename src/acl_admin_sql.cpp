@@ -1654,6 +1654,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		return MakeAdminCall("acl_add_relation", {Value(vcat), Value(vname), Value(phys), Value(columns), Value(rls)});
 	}
 	if (StringUtil::CIEquals(keyword, "grant")) {
+		if (s.Accept("source")) {
+			// GRANT SOURCE <database>[.<schema>] TO ROLE r (spec 118.3): the physical tree a catalog admin
+			// sees under platform.attached, and the only sources it builds over
+			auto source = s.Dotted("a source (<database>[.<schema>])");
+			s.Expect("to");
+			s.Expect("role");
+			return MakeAdminCall("acl_grant_source", {Value(s.Ident("a role name")), Value(source)});
+		}
 		if (s.Accept("resource")) {
 			// GRANT RESOURCE GROUP g TO ROLE r (spec 085)
 			s.Expect("group");
@@ -1749,6 +1757,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		                     {Value(role), Value(vcat), Value(caps), Value::BOOLEAN(main), Value(rls), Value(columns)});
 	}
 	if (StringUtil::CIEquals(keyword, "revoke")) {
+		if (s.Accept("source")) {
+			// REVOKE SOURCE <database>[.<schema>] FROM ROLE r (spec 118.3): what the role declared over it
+			// keeps working - an explicit DROP removes it
+			auto source = s.Dotted("a source (<database>[.<schema>])");
+			s.Expect("from");
+			s.Expect("role");
+			return MakeAdminCall("acl_revoke_source", {Value(s.Ident("a role name")), Value(source)});
+		}
 		if (s.Accept("admin")) {
 			// REVOKE ADMIN FROM ROLE r - every administration of the role; REVOKE ADMIN <bundle> FROM ROLE r -
 			// that one bundle (spec 117)

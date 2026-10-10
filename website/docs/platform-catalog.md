@@ -193,6 +193,39 @@ WHERE g.role = 'analyst' AND g.catalog = 'sales';
 SELECT database, schema, name, kind FROM platform.function_status WHERE status = 'uncategorized';
 ```
 
+## The physical tree: `platform.attached`
+
+Spec 118.3. The node's sources - its attached databases, never the policy store's, a secrets service or a
+hidden database (another catalog's internals) - appear as **metadata** in `platform`: a schema `attached.<alias>.<schema>` per schema of a
+source, holding its tables (`BASE TABLE`) and views (`VIEW`) with their columns' names and types and
+the comments. Never a row, a view's SQL or a column default - `SELECT … FROM platform.attached…` is
+refused like any object the principal does not hold. The listings read one attached database at a time
+through its own schema set (`acl_platform_attached[_columns]([sources])`), and only the databases a
+principal may see: postgres loads its remote catalog on the first touch (narrow it with ATTACH's
+`SCHEMA`), mysql per schema.
+
+| Who | Sees under `attached` | May build over |
+| --- | --- | --- |
+| `passthrough`, `policy` | every source | every source |
+| `cluster` | every source | (holding a catalog's manage too) only the granted ones - it hands out no data |
+| a catalog admin | the sources granted to it | the sources granted to it |
+| `observe`, `operate`, a non-admin | nothing | - |
+
+```sql
+GRANT SOURCE <database>[.<schema>] TO ROLE <role>     -- policy or passthrough
+REVOKE SOURCE <database>[.<schema>] FROM ROLE <role>
+SELECT platform.grant_source('sales_owner', 'pg.sales');
+```
+
+A grant is a `platform_grants` row of kind `source`. It names a source of this node (the database must be
+attached, the schema must exist) and gives its subtree and the right to reference it: a catalog admin's
+`CREATE VIRTUAL TABLE` over a physical table, a schema alias or expansion, a function alias, and every
+table a view, a macro, an RLS, a column expression or a REMAP reads (as the body names it) must lie inside a granted source,
+named in full (`<database>.<schema>.<object>`) - anything else is refused at write. A database grant
+reaches all its schemas; a schema grant reaches that schema (and `<database>.<table>` when it is `main`).
+**What was built keeps working**: a REVOKE SOURCE, or objects declared before 118.3, are never taken
+back - only an explicit DROP removes them.
+
 ## The functions
 
 `platform.main.<op>(…)` - one per management operation, the `acl_*` writer under its plain name.
@@ -286,6 +319,7 @@ ESCALATES and INFRASTRUCTURE.
 | `kill_session` | session\* | OPERATE |
 | `drain` / `resume` | - | OPERATE |
 | `migrate_catalog` | database\*, schema\* | ESCALATES |
+| `grant_source` / `revoke_source` | role\*, source\* | HANDS_OUT |
 | `create_resource_group` | group_name\*, limits, comment, is_default | POLICY |
 | `alter_resource_group` | group_name\*, property\*, value | POLICY |
 | `drop_resource_group` | group_name\*, mode | POLICY |

@@ -417,7 +417,7 @@ ACL ROLE "pol" CREATE VIRTUAL TABLE FUNCTION sales.f() AS SELECT * FROM store.ac
 ----
 <REGEX>:.*the function's template reads the policy store itself.*
 
-# a catalog admin is refused the same way
+# a catalog admin is refused too - by the source gate first (spec 118.3: the policy store is never a source)
 statement ok
 ACL ADMIN CREATE ROLE pointy;
 
@@ -427,7 +427,7 @@ ACL ADMIN GRANT CATALOG sales TO ROLE pointy CAPS '{"select": true, "insert": tr
 statement error
 ACL ROLE "pointy" CREATE VIRTUAL TABLE sales.adm2 AS store.acl.admins;
 ----
-<REGEX>:.*reads the policy store itself.*
+<REGEX>:.*the definition names "store.acl.admins", outside the sources granted.*
 
 query I
 SELECT count(*) FROM store.acl.relations WHERE phys LIKE 'store.acl.%';

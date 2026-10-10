@@ -121,14 +121,14 @@ columns	VARCHAR[]
 
 # every listed column of every view is the column the view answers, type for type
 query I
-ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform';
+ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_schema = 'main';
 ----
 257
 
 foreach view catalogs relations relation_columns schemas functions function_columns references reference_columns keys roles role_claims grants schema_grants object_grants grant_columns admins platform_grants issuers clients role_mappings jwks_cache function_categories function_category_members function_grants function_status resource_groups role_resource_groups cluster_items cluster_effective drift catalog_schema sessions node_load node_doors node_streams drain lineage_status audit_events
 
 query I
-ACL ROLE "root" SELECT (SELECT list(column_name || ' ' || data_type ORDER BY ordinal_position) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_name = '{view}') = (SELECT list(column_name || ' ' || column_type) FROM (DESCRIBE platform.{view}));
+ACL ROLE "root" SELECT (SELECT list(column_name || ' ' || data_type ORDER BY ordinal_position) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_schema = 'main' AND table_name = '{view}') = (SELECT list(column_name || ' ' || column_type) FROM (DESCRIBE platform.{view}));
 ----
 true
 
@@ -262,14 +262,14 @@ ACL ROLE "obs" SELECT count(*) FROM platform.node_streams WHERE budget_bytes > 0
 
 # passthrough: everything
 query I
-ACL ROLE "root" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform';
+ACL ROLE "root" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema = 'main';
 ----
 38
 
-# policy: the policy views, all rows - never the node's, nor (until spec 118's cluster bundle) the
-# cluster profile's
+# policy: the policy views, all rows - never the node's, nor the cluster profile's (spec 118's cluster
+# bundle); the physical tree under attached is spec 118.3's (platform_attached.test)
 query I
-ACL ROLE "pol" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform';
+ACL ROLE "pol" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema = 'main';
 ----
 28
 
@@ -377,7 +377,7 @@ ACL ROLE "reader" SELECT * FROM platform.console_info();
 
 # the catalog in the tree of an admin, with its schema
 query TT
-ACL ROLE "pol" SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = 'platform';
+ACL ROLE "pol" SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = 'platform' AND schema_name NOT LIKE 'attached%';
 ----
 platform	main
 
