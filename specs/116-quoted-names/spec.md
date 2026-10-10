@@ -198,6 +198,28 @@ reading quoted keys it does not understand. The step refuses to apply while case
   - a message prints a key once (`no access to object "Sales Mart.Order Items"`, not `""…""`);
     `KeyToSql` / `KeyToQualified` refuse text that is no key instead of passing it through as SQL;
   - a reference's column pair took a quoted column as written (fixed in the first pass).
+- **Verification pass (2026-10-10)** - the same Unicode/byte class at sites the first `lower(` sweep
+  missed, each with a regression test (`acl_quoted_names.test` unless named):
+  - **a grant's projection kept a hidden column**: `COLUMNS(lambda c: lower(c) IN (...))` against
+    C++-lowered names let `"Äx"` through a grant listing `"äx"`; the listing and the keys/references
+    joins had the same compare, and a narrowed struct's hidden-field check (`struct_keys`) too - all
+    `KeyFoldSql` now;
+  - **a C++ byte count inside SQL**: `substr(col, 1, <prefix.size()>)` (SQL counts characters) left a
+    revoked schema's inherited rows under `"Größe"` and let `DROP VIRTUAL SCHEMA` without CASCADE leave
+    its records; also PRUNE, the reference/grant cleanup and the check - all `KeyPrefixSql`;
+  - **a principal could make every role's read ambiguous**: spec 113 DDL created the physical object
+    before the record write refused a case sibling, and REFRESH then recorded it beside the operator's
+    name. The DDL rewrite now runs the sibling check before the physical CREATE
+    (`RequireNoCaseSibling`), and EXPAND / REFRESH never record a second spelling of a held name - the
+    check reports it as `case_sibling`;
+  - the function gate's existence check and the engine half of `duckdb_functions()` folded the key with
+    Unicode `lower()` (a macro `"Äx"` was "not on this node"); the cluster profile's readers-of-a-source
+    check missed a relation over `"SRC_Ä"` and let its DETACH through (`acl_cluster_profile.test`);
+  - **the class cannot come back**: `scripts/ci/check_sql_fold.py` (the lint job) fails on `lower(` in
+    SQL text outside an allowlist with reasons, and on a C++ size/length concatenated into SQL text next
+    to `substr`/`left`/`right`; `test_acl_name_path.cpp` pins KeyPrefixSql / KeyLeafSql / KeyParentSql
+    against the C++ side over ẞ/ß, İ, the Kelvin and Ohm signs, Å and the Angstrom sign, the final
+    sigma and the ﬀ ligature.
 - **Tests added by the review**: case siblings across kinds (a scalar and a schema next to a table,
   the full message), the grant parts of the sibling rule (an object and a schema grant written in
   another case land on the stored spelling), spec 113 RENAME in a quoted home, RLS over a quoted
