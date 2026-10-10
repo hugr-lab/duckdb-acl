@@ -174,3 +174,12 @@ dbt does not need it (it qualifies every name), which is why it is not part of t
 - **Flight**: a prepared statement that is a no-op (`CREATE SCHEMA IF NOT EXISTS`) now prepares as the
   empty `SELECT`, so it is announced as a query, not as an update.
 - **Spike, final build**: two `dbt run`s in a row - `table`, `view`, `incremental` (`append`) - all OK.
+
+## Addendum (2026-10-10, spec 116)
+
+The refusal of a DDL name part with a dot (`… has a dot in it`) is lifted. Spec 116 stores every name
+as the canonical key of its parts (a part holding `.` or `"` quoted), so `"sub.t"` is one identifier end
+to end - the record `vs."sub.t"`, the physical `phys.lake."sub.t"` - and can no longer name the nested
+`sub.t` the grant never covered. `acl_ddl_dbt.test` now pins that the dotted part is one table and the
+nested one is untouched. DDL homes also compare case-insensitively, and a new record lands under the
+home as the policy spells it.

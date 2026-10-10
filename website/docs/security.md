@@ -195,6 +195,25 @@ mode of default-deny is a refusal, and the refusal names the function.
 - References (spec 022) are "a hint an agent reads, never enforced and granting nothing; visible
   only when both ends and every column it names are".
 
+### Names (spec 116)
+
+- A virtual catalog, schema, object and function - and the physical name it points at - may be named
+  the way SQL allows (any case, spaces, a `.` or a `"` inside a part). Every stored name is the
+  **canonical key** of its parts: joined by `.`, a part quoted only when it holds `.` or `"`, so a key
+  reads back as the same parts and a part is never read as two (`"a.b"` is one schema, beside the path
+  `a.b`). Prefix matching on keys stays sound: a quoted part delimits itself.
+- Names **compare case-insensitively**, as duckdb's catalog does - in the resolver, the DDL homes,
+  the listings and the manage-scope check. A name is never two things: every write takes the spelling
+  the policy already stores (the parent schemas, the object itself), and a NEW name that differs from
+  any stored name of its catalog only by case is refused where it is written. Joins between the
+  policy's own tables then stay exact. SQL's `lower()` folds Unicode where duckdb folds ASCII, so `"Ä"`
+  and `"ä"` are one name to the ACL - the stricter reading.
+- Roles, groups, issuers and clients are values (claims, mapping targets), not SQL identifiers: they
+  may be written quoted, and compare exactly.
+- Schema v20 declares `min_reader_version` 20: a build before spec 116 refuses such a catalog rather
+  than split a quoted part as a path; the migration refuses while one name is spelled several ways
+  and lists them (`test/sql/acl_quoted_names.test`).
+
 ### Types (spec 099)
 
 - **Only the system catalog's types can be named** under a principal: a cast, a `NULL::t`, a column

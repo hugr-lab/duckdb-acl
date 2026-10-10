@@ -601,6 +601,23 @@ not onto a record, not an object carrying the operator's declarations (`CatalogR
 a record declared over another object; the record moves back at the client's ROLLBACK
 (`RecordRenameUndo`). DROP's CASCADE is taken off. Every other ALTER stays refused.
 
+**Spec 116 — quoted names**: a virtual catalog, schema, object, function - and its physical name - may
+be named the way SQL allows (case, spaces, `.`/`"` in a part). **Every vcat / vname / path / phys string
+in C++ is a canonical key** (`NamePath`, header-only `acl_name_path.hpp`): parts joined by `.`, a part
+quoted only when it holds `.` or `"` (the inverse of `QualifiedName::ParseComponents`; an empty part is
+refused). Concatenating keys with `.` is a key; a RAW part joins with `NamePath::ChildKey`; never split a
+key on `.` (use `SplitHeadKey` / `SplitLeaf` / `KeyToQualified`, and in SQL `KeyEqSql`, `KeyPrefixSql`,
+`KeyLeafSql`, `KeyParentSql`, `KeyPartsSql`, ...). A physical key becomes SQL by `KeyToSql`; an
+operator-facing name by `ToGrammar` (`ToSql` quotes keywords). Names compare case-insensitively at read;
+every write first takes the stored spelling (`PolicyStore::SpellCatalog` / `SpellName` / `SpellReference`
+at each admin-function name argument, read by `KeyArg` / `CatalogArg`), and a NEW name differing only by
+case from any stored name of its catalog is refused - so joins between policy tables stay exact. Grammar:
+`Ident` / `Path` (a `"…"` is ONE identifier), `PathName` (`'…'` = the legacy whole path), `NameValue`
+for issuers/clients/groups/secrets. Roles/groups/issuers/clients compare exactly. Listings compute in key
+space and show names unquoted at the end (`named(...)`; a one-part schema holding a dot shows as its key
+`"a.b"`, `NamePath::Display` / `FromDisplay`). Schema v20, `min_reader` 20; the step refuses case
+collisions. Tests: `test_acl_name_path.cpp`, `acl_quoted_names.test` (both modes).
+
 **Spec 114 — the session's catalog**: `USE <vcat>[.<schema>]` / `USE SCHEMA <s>` (the override compiles
 it to `SET acl_use_schema`) on a session of the client's own (`ACL SESSION`) set its default catalog /
 schema - kept on the session record by the follow-up `acl_session_use(<ops id>, …)`, applied by

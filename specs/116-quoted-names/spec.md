@@ -1,6 +1,6 @@
 # Spec 116: quoted names
 
-- **Status**: accepted (by the owner 2026-10-09)
+- **Status**: implemented (2026-10-10; accepted by the owner 2026-10-09)
 - **Date**: 2026-10-09
 - **Author**: Claude (with the owner; issue #197)
 - **Follows**: spec 113 (DDL names, refuses a dotted part), spec 112 (lineage names), spec 094 (schema
@@ -122,3 +122,64 @@ reading quoted keys it does not understand. The step refuses to apply while case
 ## Follow-ups
 
 - `ddl` / `export_script` (spec 117) emit names with `NamePath::ToSql()`.
+
+## As built (2026-10-10)
+
+- **One representation**: every vcat / vname / schema path / phys string in C++ is a canonical key
+  (`src/include/acl_name_path.hpp`, header-only). Raw parts appear only at the boundaries -
+  QualifiedName parts, the grammar's `Ident`, listing output, the lineage scratch's SQL. A catalog is a
+  one-part key (`"x.y"` for a catalog holding a dot). Concatenating keys with `.` gives a key; a raw
+  part is joined with `ChildKey`. `NamePath::Parts()` returns by value on a temporary (a range-for over
+  `FromKey(k).Parts()` dangled and dropped a session's USE schema from a lineage job - found by
+  `test_acl_session_use`).
+- **Case: canonicalise at write, compare case-insensitively at read** (owner-accepted). Lookups from
+  input use `KeyEqSql` / `KeyPrefixSql` (`lower()`); joins between the policy's own tables stay exact,
+  which holds because every admin-function name argument first takes the stored spelling
+  (`PolicyStore::SpellCatalog` / `SpellName` / `SpellReference`, `CatalogBackend::Spell`): each part
+  adopts the spelling a stored name gives it (parent schemas, the object itself). The manage-scope
+  check of `AuthorizeMgmt` is case-insensitive for the same reason.
+- **Case siblings** (owner-accepted): a NEW name (create / replace; `IF NOT EXISTS` adopts and skips)
+  whose leaf differs only by case from ANY stored name of its catalog - relations, functions of either
+  kind, schemas, object and schema grants - is refused: one spelling per name in a catalog, stricter
+  than per kind (a relation and a function share `role_object_caps` rows by name). Catalogs against
+  every catalog column, references among references.
+- **Grammar**: `Ident` (a word or `"…"`), `Path`, `Dotted` (= the path's key), `IdentKey` (a catalog),
+  `PathName` (virtual/physical; `'…'` = the legacy whole path, read with `FromKey`), `NameValue`
+  (issuers, clients, groups, secrets, extensions, source aliases: the old reading), `DottedWords`
+  (claim paths). Roles, groups and categories are read with `Ident` and compare exactly. A reference's
+  column pair takes a quoted column (`ON ("Order Id" = id)`), which before stored the quotes.
+- **Display** (owner-accepted refinement of §6): a one-part schema holding a `.` is listed as its key
+  (`"a.b"`), so it never reads as the path `a.b`; every other one-part name unquoted, a path as its key
+  (`NamePath::Display` / `FromDisplay`, `KeyDisplaySql` / `KeyFromDisplaySql` - the Flight key RPCs
+  rebuild a stored key from the shown columns). Listings compute in key space and convert at the end
+  (`named(...)` in acl_metadata_listing.cpp); oids stay computed from keys. `SHOW TABLES FROM`,
+  `current_database()` / `current_schema()` answer the shown forms.
+- **Repair statements** (owner-accepted) print names in the grammar's form (`ToGrammar`: a plain word
+  as it is, any other part double-quoted) - `ToSql` quotes unreserved keywords (`"old"`), which is right
+  for the binder and noise for an operator.
+- **Physical names**: `ParsePhysName` = `KeyToQualified`; every `FROM <phys>` the writers, validators
+  and the maintenance check compose goes through `KeyToSql`. A stored `phys."Raw Data"."Order Items"`
+  parses as three parts; new writes store `phys.Raw Data.Order Items`.
+- **`c.MAIN.f`** now finds a nested `main.f` (case-insensitive), before the `main` fallback could land
+  it on the root `f`; the fallback compares `main` case-insensitively (`MainFallback`, acl_policy.cpp).
+- **Spec 113's refusal of a dotted part is lifted** (its addendum): `"sub.t"` is one identifier, so the
+  review's finding (a RENAME re-pointing a record at a hidden nested table) cannot recur.
+- **Lineage**: a virtual dataset key holds keys; the dataset name is `JoinKeys(vcat, [main.]object)`;
+  a physical one quotes its schema/table parts by the same rule.
+- **Schema v20** (`schema/migrations/v20.sql`, `-- min_reader: 20`): no DDL; one SELECT that `error()`s
+  with the collisions in a deterministic order - per name across the name columns of a catalog, every
+  parent level (a recursive CTE), catalogs across every catalog column, references. A v19 build is kept
+  out by `min_reader_version` 20 (spec 094's window, pinned by `acl_schema_window.test`).
+- **Not changed**: spec 072's function keys (engine functions, already lowercased); the function-driver
+  slots (spec 008) receive and return keys as stored - a driver comparing exactly misses a differently
+  cased name (documented); `acl_cluster.cpp`'s source-alias LIKE patterns already cover canonical keys.
+- **Tests**: `test/cpp/test_acl_name_path.cpp` (round trip against `ParseComponents`, the refusals it
+  does not make, every SQL fragment evaluated in duckdb over a name matrix);
+  `test/sql/acl_quoted_names.test` (memory and catalog mode, every kind, DML, DDL in a quoted home,
+  metadata, `acl_check_catalog`, the case-sibling and malformed-name negatives, the migration);
+  `test/sql/integration/acl_quoted_names_postgres.test` (a mixed-case postgres schema and table, the
+  policy catalog in postgres); Flight e2e (`GetTables` / `include_schema` / primary, imported and
+  exported keys over `"Raw Data"."Order Items"`); the quack door e2e (a quoted catalog/schema/view
+  through quack's catalog and through the door); lineage names in `acl_lineage.test`. Four existing
+  tests that pinned case-sensitive or dot-refusing behaviour were updated (`acl_admin_scopes`,
+  `acl_ddl_dbt`, `acl_tool_metadata`, `acl_schema_window`).

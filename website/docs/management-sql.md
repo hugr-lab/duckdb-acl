@@ -38,11 +38,28 @@ catalog forms refuse.
 ## Notation
 
 - `<catalog>.<name>` - a virtual name. The first component is the virtual catalog, the rest the
-  path inside it: `sales.raw.orders` is object `raw.orders` of catalog `sales`. Written bare and
-  dotted; identifier characters are `A-Z a-z 0-9 _`.
-- `<phys>` - a physical path such as `phys.main.orders`, written dotted or as a quoted string.
-- `<role>`, `<catalog>` - bare words. An issuer or a client - a bare word, or a quoted string (an
-  issuer named by its URL).
+  path inside it: `sales.raw.orders` is object `raw.orders` of catalog `sales`. Each part is an
+  identifier as SQL writes one (spec 116): a bare word (`A-Z a-z 0-9 _`) or a double-quoted
+  identifier with `""` for a quote - any case, spaces, a dot inside: `"Sales Mart"."Order Items"`,
+  `c."Raw Data".sub."T"`, `"a.b"` (one schema, never the path `a.b`). A double-quoted name is always
+  ONE identifier.
+- `<phys>` - a physical path such as `phys.main.orders` or `pg."Raw Data"."Order Items"`, written
+  like a virtual name, or as the legacy single-quoted string holding the whole path
+  (`'pg."Raw Data".orders'`).
+- Names compare **case-insensitively**, as duckdb's catalog does: `"Upper"` is read as `upper` and
+  `UPPER`, and a write naming an existing record lands on it, in the case the policy stores. A new
+  catalog, schema, object, function or reference that differs from an existing name of its catalog
+  only by case is refused (`… differs only by case from the existing …`); `IF NOT EXISTS` keeps the
+  one there.
+- `<role>`, `<catalog>` - one identifier each (a bare word or double-quoted). A role, a group, an
+  issuer or a client is a value and compares exactly; an issuer or a client may also be a
+  single-quoted string (an issuer named by its URL).
+- The `acl_*` functions take a name argument as its key: the parts joined by `.`, a part that holds
+  a `.` or a `"` in double quotes (`acl_add_relation('Sales Mart', 'Raw Data.Order Items', …)`,
+  `acl_create_catalog('"x.y"')`). Listings answer each name unquoted (`table_schema` = `Raw Data`);
+  a nested schema answers its path, and a schema part with a dot is shown quoted (`"a.b"`, `a."b.c"`)
+  so it never reads as two levels. Lineage names a dataset by the same key rules
+  (`Sales Mart.main.Order Items`, `c."a.b".Sink`).
 - Quoted values take `'…'` or `"…"`; a doubled quote is a literal one.
 - A body (after `AS` or `MACRO`) is either a quoted string or written inline to the end of the
   statement; inline text is read quote- and parenthesis-aware, so a `;` inside a literal or a
