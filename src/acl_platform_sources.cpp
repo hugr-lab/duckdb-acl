@@ -222,6 +222,81 @@ void SourcesScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 	output.SetChildCardinality(count);
 }
 
+//! acl_physical_columns(keys) (spec 119): the columns of the named physical tables / views only -
+//! `<db>.<schema>.<object>` keys, each looked up directly (never a walk of the node); a key that does not
+//! resolve, or whose source fails, answers nothing
+struct PhysicalBind : TableFunctionData {
+	vector<string> keys;
+};
+
+unique_ptr<FunctionData> PhysicalBindFn(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+                                        vector<Identifier> &names) {
+	auto bind = make_uniq<PhysicalBind>();
+	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+		for (auto &value : ListValue::GetChildren(input.inputs[0])) {
+			if (!value.IsNull()) {
+				bind->keys.push_back(value.ToString());
+			}
+		}
+	}
+	for (auto name : {"table_catalog", "table_schema", "table_name", "column_name", "data_type"}) {
+		names.push_back(Identifier(name));
+		types.push_back(LogicalType::VARCHAR);
+	}
+	names.push_back(Identifier("ordinal_position"));
+	types.push_back(LogicalType::BIGINT);
+	return std::move(bind);
+}
+
+unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<PhysicalBind>();
+	auto state = make_uniq<SourcesState>();
+	auto &manager = DatabaseManager::Get(context);
+	for (auto &key : bind.keys) {
+		NamePath path;
+		string error;
+		if (!NamePath::TryFromKey(key, path, error) || path.Parts().size() != 3) {
+			continue;
+		}
+		auto &parts = path.Parts();
+		auto mark = state->rows.size();
+		try {
+			auto db = manager.GetDatabase(context, Identifier(parts[0]));
+			if (!db || db->GetVisibility() == AttachVisibility::HIDDEN) {
+				continue;
+			}
+			auto entry = db->GetCatalog().GetEntry(context, CatalogType::TABLE_ENTRY, Identifier(parts[1]),
+			                                       Identifier(parts[2]), OnEntryNotFound::RETURN_NULL);
+			if (!entry) {
+				continue;
+			}
+			auto row = [&](const string &column, const LogicalType &type, int64_t pos) {
+				state->rows.push_back({Value(parts[0]), Value(parts[1]), Value(entry->name.GetIdentifierName()),
+				                       Value(column), Value(type.ToString()), Value::BIGINT(pos)});
+			};
+			if (entry->type == CatalogType::TABLE_ENTRY) {
+				int64_t pos = 0;
+				for (auto &col : entry->Cast<TableCatalogEntry>().GetColumns().Logical()) {
+					row(col.Name().GetIdentifierName(), col.Type(), ++pos);
+				}
+			} else if (entry->type == CatalogType::VIEW_ENTRY) {
+				auto &view = entry->Cast<ViewCatalogEntry>();
+				try {
+					view.BindView(context);
+				} catch (std::exception &) { // NOLINT: an unbound view answers no columns
+				}
+				auto info = view.GetColumnInfo();
+				for (idx_t i = 0; info && i < info->names.size() && i < info->types.size(); i++) {
+					row(info->names[i].GetIdentifierName(), info->types[i], NumericCast<int64_t>(i + 1));
+				}
+			}
+		} catch (std::exception &) { // NOLINT: a source that cannot answer answers nothing
+			state->rows.resize(mark);
+		}
+	}
+	return std::move(state);
+}
+
 //! acl_grant_source(role, source) / acl_revoke_source(role, source): a source granted to a role - a
 //! database of this node, or one schema of it; never the policy store's database nor a secrets service
 void SourceGrantFunc(DataChunk &args, ExpressionState &state, Vector &result, bool grant) {
@@ -330,6 +405,11 @@ void RegisterAclPlatformSources(ExtensionLoader &loader, const shared_ptr<Policy
 			set.AddFunction(function);
 		}
 		loader.RegisterFunction(set);
+	}
+	{
+		TableFunction physical(Identifier("acl_physical_columns"), {LogicalType::LIST(LogicalType::VARCHAR)},
+		                       SourcesScan, PhysicalBindFn, PhysicalInit);
+		loader.RegisterFunction(physical);
 	}
 	for (auto grant : {true, false}) {
 		auto name = grant ? "acl_grant_source" : "acl_revoke_source";

@@ -100,9 +100,26 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// scan of the same information_schema the columns surface already reads, never a probe (spec
 	// 065). The columns surface keeps the contract as written; the mark on the object says the read
 	// will fail anyway, and acl_check_catalog (which probes) has the rest.
-	string physcols = "physcols AS (SELECT table_catalog, table_schema, table_name, list(" + KeyFoldSql("column_name") +
-	                  ") AS cols"
-	                  " FROM information_schema.columns GROUP BY 1, 2, 3)";
+	// spec 119: the physical columns only of the relations that declare a list - read table by table
+	// (acl_physical_columns), never a walk of every attached database's information_schema; none declared,
+	// nothing read
+	vector<string> declared_phys;
+	{
+		auto rows = Query("SELECT DISTINCT r.\"phys\" FROM " + Tbl("relations") + " r JOIN " + Tbl("relation_columns") +
+		                  " dc ON dc.\"vcat\" = r.\"vcat\" AND dc.\"vname\" = r.\"vname\" WHERE r.\"form\" IN ('alias',"
+		                  " 'subquery') AND r.\"phys\" IS NOT NULL");
+		ResultRows phys_rows(*rows);
+		for (idx_t i = 0; i < phys_rows.Count(); i++) {
+			declared_phys.push_back(Lit(phys_rows.GetValue(0, i).ToString()));
+		}
+	}
+	string physcols =
+	    declared_phys.empty()
+	        ? string("physcols AS (SELECT NULL::VARCHAR AS table_catalog, NULL::VARCHAR AS table_schema, NULL::VARCHAR"
+	                 " AS table_name, NULL::VARCHAR[] AS cols WHERE false)")
+	        : "physcols AS (SELECT table_catalog, table_schema, table_name, list(" + KeyFoldSql("column_name") +
+	              ") AS cols FROM acl_physical_columns([" + StringUtil::Join(declared_phys, ", ") +
+	              "]::VARCHAR[]) GROUP BY 1, 2, 3)";
 	string declared = "declared AS (SELECT dc.\"vcat\" AS vcat, dc.\"vname\" AS vname,"
 	                  " list(dc.\"name\" ORDER BY dc.\"pos\") AS names,"
 	                  " list(translate(CASE WHEN dc.\"expr\" IS NULL OR dc.\"expr\" = '' THEN dc.\"name\""
