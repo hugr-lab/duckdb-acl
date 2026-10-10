@@ -804,12 +804,17 @@ bool NamesPolicyStore(CatalogBackend &catalog, const vector<string> &parts, bool
 	};
 	bool db_main = is(catalog.schema, "main");
 	if (schema_path) {
-		// <db>.<schema> | <db> (its main) | <schema> (in the default database)
-		if (parts.size() >= 2) {
-			return is(parts[parts.size() - 2], catalog.db_name) && is(parts.back(), catalog.schema);
+		// a schema alias / expansion reaches everything below its target: refuse a target that is the policy
+		// store's schema, anything below it, or the database that holds it (spec 117 verification - an
+		// alias to the whole database reached `<db>.<schema>.<table>` through a nested path)
+		// <db> (whatever schema the policy is in) | <db>.<schema>[.…] | <schema>[.…] (in the default db)
+		if (parts.empty()) {
+			return false;
 		}
-		return parts.size() == 1 && ((is(parts[0], catalog.db_name) && db_main) ||
-		                             (is(parts[0], catalog.schema) && is(default_db, catalog.db_name)));
+		if (is(parts[0], catalog.db_name) && (parts.size() == 1 || is(parts[1], catalog.schema))) {
+			return true;
+		}
+		return is(parts[0], catalog.schema) && is(default_db, catalog.db_name);
 	}
 	if (parts.empty() || !IsPolicyTable(parts.back())) {
 		return false;

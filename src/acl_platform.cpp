@@ -1485,6 +1485,17 @@ vector<BodyArgument> BodiesOf(const string &target, FunctionExpression &call) {
 		}
 		return {{4, kind == T ? BodyShape::SELECT : BodyShape::EXPRESSION, S}};
 	}
+	if (target == "acl_alter_grant") {
+		// spec 117 verification: ALTER GRANT … SET RLS / COLUMNS stores a body like GRANT does
+		auto field = text(2);
+		if (field == "rls") {
+			return {{3, BodyShape::EXPRESSION, S}};
+		}
+		if (field == "columns") {
+			return {{3, BodyShape::COLUMNS, S}};
+		}
+		return {};
+	}
 	if (target == "acl_grant_catalog" || target == "acl_grant_object") {
 		return {{4, BodyShape::EXPRESSION, S}, {5, BodyShape::COLUMNS, S}};
 	}

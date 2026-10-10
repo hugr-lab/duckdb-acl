@@ -86,6 +86,44 @@ ACL ROLE "cadm" CREATE VIRTUAL TABLE sales.m AS phys.main.orders COLUMNS (id, te
 ----
 <REGEX>:.*the definition calls function "acl_grant_admin".*
 
+# verification round: ALTER GRANT … SET RLS / COLUMNS stores a body like GRANT does
+statement error
+ACL ROLE "pol" SELECT platform.alter_grant('reader', 'sales', 'rls', 'acl_grant_admin(''pol'', ''passthrough'') IS NOT NULL');
+----
+<REGEX>:.*the definition calls function "acl_grant_admin".*
+
+statement error
+ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET RLS 'acl_grant_admin(''pol'', ''passthrough'') IS NOT NULL';
+----
+<REGEX>:.*the definition calls function "acl_grant_admin".*
+
+statement error
+ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET COLUMNS 'id, tenant = acl_grant_admin(''pol'', ''observe'')::VARCHAR';
+----
+<REGEX>:.*the definition calls function "acl_grant_admin".*
+
+# verification round: a schema alias / expansion over the database that holds the policy store (the
+# policy lives in store.acl) - a nested path below it would reach the store
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL SCHEMA sales.r10 AS store;
+----
+<REGEX>:.*the schema alias reads the policy store itself.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL SCHEMA sales.r11 AS "STORE";
+----
+<REGEX>:.*the schema alias reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL SCHEMA sales.r12 AS store.acl;
+----
+<REGEX>:.*the schema alias reads the policy store itself.*
+
+query I
+SELECT count(*) FROM store.acl.schemas WHERE path IN ('r10', 'r11', 'r12');
+----
+0
+
 statement error
 ACL ROLE "cadm" CREATE VIRTUAL TABLE FUNCTION sales.q() AS SELECT * FROM query('SELECT * FROM store.' || 'acl.adm' || 'ins');
 ----
