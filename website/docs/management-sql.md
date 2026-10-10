@@ -709,6 +709,10 @@ DROP [PERSISTENT] SECRET <name> [FROM <catalog>]
   node's disk**: `secret_directory`, in the clear), otherwise in memory until the node restarts. The
   `secrets` capability and the constant parameters still apply; `GRANT` / `REVOKE SECRET` are the
   service's and are refused; a storage named (`IN memory`, `IN local_file`) must still be a service.
+  The node keeps no owner per secret: there, **`secrets` is the administration of the node's own
+  secrets** - the operator's included (a `DROP`, a `CREATE OR REPLACE`, a longer `SCOPE` that the node's
+  reads then pick) - so grant it only to whoever administers the node. A secrets service is where a
+  secret has an owner and its own admin check.
 - **GRANT / REVOKE SECRET** follow the principal prefix with the `ACL` marker (`ACL TOKEN '…' ACL GRANT
   SECRET …`; unmarked after the gateway's `ACL ADMIN`) and compile to the service's own calls,
   `<catalog>.main.grant_secret('<name>', 'role:<r>', ['use'])` / `revoke_secret(…)`. A secret is granted

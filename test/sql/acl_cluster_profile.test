@@ -468,3 +468,42 @@ query I
 SELECT count(*) FROM store.acl.relations WHERE vname = 'over_v';
 ----
 1
+
+# a macro whose body reads the source blocks it too (review 118.1)
+statement ok
+ACL ADMIN DROP VIRTUAL VIEW c.over_v;
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS srcm (TYPE duckdb);
+
+statement ok
+CREATE TABLE srcm.main.t(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.f(m INTEGER) RETURNS TABLE (id INTEGER) AS 'SELECT id FROM srcm.main.t WHERE id >= acl_arg(1)';
+
+statement error
+ACL ADMIN CLUSTER DETACH srcm;
+----
+<REGEX>:.*the policy reads through srcm: c.f.*FORCE.*
+
+statement ok
+ACL ADMIN CLUSTER DETACH srcm FORCE;
+
+# a source whose name holds a quote is written with the quote doubled
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS "q""src" (TYPE duckdb);
+
+statement ok
+CREATE TABLE "q""src".main.t(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.over_q AS 'SELECT id FROM "q""src".main.t';
+
+statement error
+ACL ADMIN CLUSTER DETACH "q""src";
+----
+<REGEX>:.*the policy reads through q"src: c.over_q.*FORCE.*
+
+statement ok
+ACL ADMIN CLUSTER DETACH "q""src" FORCE;

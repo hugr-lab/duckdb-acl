@@ -264,6 +264,12 @@ ACL ROLE "op" SELECT count(*) > 0 FROM platform.audit_events;
 ----
 true
 
+# the typed columns read for real (a declared type the ring does not answer fails here)
+query IIII
+ACL ROLE "op" SELECT typeof(ts), typeof(roles), typeof(objects), count(*) > 0 FROM platform.audit_events WHERE kind = 'admin' GROUP BY ALL;
+----
+TIMESTAMP WITH TIME ZONE	VARCHAR[]	STRUCT("name" VARCHAR, capability VARCHAR)[]	true
+
 statement error
 ACL ROLE "pol" SELECT * FROM platform.audit_events;
 ----

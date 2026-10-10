@@ -81,7 +81,9 @@ console works there; what makes a node differ from its profile is shown (drift, 
 - **Standalone without a service**: under a principal holding `secrets`, duckdb's own rule - `CREATE
   PERSISTENT SECRET` goes to the node's persistent storage (files), `CREATE SECRET` without a persistence
   keyword to memory (lost at restart). `TEMPORARY` / `TRANSACTION` stay refused under a service (082).
-  The docs say plainly that a persistent local secret is a file on the node's disk.
+  The docs say plainly that a persistent local secret is a file on the node's disk, and that the node
+  keeps no owner per secret: locally `secrets` administers every secret of the node (the operator's
+  included - drop, replace, a longer scope) - grant it to the node's administrator only (review 118.1).
 - Under `ACL NATIVE`: duckdb as is (§2).
 - tresor **variables** and `corp.*` management calls are the service's (its admin check, the function
   gate); unchanged here.
@@ -201,4 +203,11 @@ catalog; over-reading blocks, FORCE is the operator's answer). Who reads what pe
 - Tests: `node_operate.test`, `acl_secrets.test` (the local block; type `http` - the suite loads no httpfs),
   `acl_cluster_profile.test` (views; fails without the fix), `platform_views` / `platform_rights` /
   `acl_observe` / `acl_profile` updated.
-
+- Review (three passes): the DETACH check also reads macro bodies (`functions.template`) and a source name
+  holding a quote (`"a""b".`) - both fail without the fix; the anonymous hatch's rights carry operate and the
+  audit detail names an operate-only admin `operate`; `audit_events` read by type in the test; Flight e2e
+  `admin.sh` - an operate token drains (a new session is then refused) and resumes, administers no policy.
+  Accepted as designed, written in the docs: locally `secrets` administers every secret of the node; an
+  operate holder may set any session's audit level (OFF too); a node drained through a door is resumed from
+  a session it already holds (the console's) or the operator's connection - drain seats no new one.
+  Low, left: a source named like a common table alias blocks views using that alias (FORCE answers).
