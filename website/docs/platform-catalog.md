@@ -80,14 +80,25 @@ REVOKE VIEW platform.sessions FROM ROLE support;        -- the grant or the deny
   catalog.
 - **Only `passthrough` grants on `platform`** (and the bundles) - never `policy`: a grantor that can
   grant everything is everything.
-- Never to every role (`TO ALL ROLES` / role `''` is refused); never on the passthrough scope's own
-  functions (`grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_*`,
-  `session_profile`) nor on
-  `console_info` (every holder's); only on an object `platform` has.
+- Never to every role (`TO ALL ROLES` / role `''` is refused); never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting`, `session_profile` - the passthrough scope's own - and `console_info` (every holder's); only on an
+  object `platform` has.
 - The grants live in their own table, `platform_grants(role, object, kind, allowed)` - never in the
   catalog grants or spec 072's function grants and categories.
 - A deny (`allowed = false`) anywhere among the principal's roles wins over a bundle; `passthrough` is
   never narrowed.
+
+### What an administrator may store
+
+A definition runs as the node when it is read, so what a non-`passthrough` administrator stores is
+judged by **its own function gate** where it is written: every function a view, a macro template, an
+alias target, an RLS, a column or mask expression (or a grant's policy) calls must be one the author
+may call itself - its roles' categories and grants by name, a deny winning, the never set (`acl_*`,
+`query*`, a scanner's `*_query`, ...) always refused; `acl_claim` / `acl_arg` are markers, not calls. A
+body is a constant (never a `?`). No definition may name the policy catalog's own tables. Changing an
+issuer or a client that carries a mapping to an administering role, mapping to such a role, and granting
+a catalog's `manage` to a role a mapping reaches are `passthrough`'s. `REVOKE ADMIN <bundle>` of a
+bundle the role does not hold - or holds only through `manage` / `passthrough` - is refused, naming
+what to revoke.
 
 ### Rows per scope
 

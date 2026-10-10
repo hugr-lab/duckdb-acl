@@ -413,7 +413,7 @@ ACL ROLE "platform" ACL NATIVE SELECT 1; CREATE ROLE mixed_b;
 statement error
 ACL ROLE "analyst" SELECT 1; ACL NATIVE DROP TABLE phys.main.orders_physical;
 ----
-<REGEX>:.*(syntax|Parser).*
+<REGEX>:.*(syntax|Parser|one ACL prefix per batch).*
 
 query I
 ACL ADMIN SELECT count(*) FROM phys.main.orders_physical;

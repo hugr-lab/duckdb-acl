@@ -447,7 +447,12 @@ unique_ptr<SQLStatement> MakeAdminCall(const string &function, const vector<Valu
 		children.push_back(ConstantExpression::FromValue(arg));
 	}
 	auto node = make_uniq<SelectNode>();
-	node->select_list.push_back(make_uniq<FunctionExpression>(Identifier(function), std::move(children)));
+	auto call = make_uniq<FunctionExpression>(Identifier(function), std::move(children));
+	// spec 117: the column is named as the platform call names it, so the two forms answer alike
+	if (auto operation = PlatformFunctionByTarget(function)) {
+		call->SetAlias(Identifier(operation->name));
+	}
+	node->select_list.push_back(std::move(call));
 	node->from_table = make_uniq<EmptyTableRef>();
 	auto statement = make_uniq<SelectStatement>();
 	statement->node = std::move(node);
@@ -506,7 +511,12 @@ bool IsMgmtStart(const string &text) {
 		AdminScanner ahead(text);
 		ahead.Word("keyword");
 		if (StringUtil::CIEquals(first, "analyze")) {
-			return StringUtil::CIEquals(ahead.PeekWord(), "virtual");
+			// `ANALYZE virtual` is duckdb's ANALYZE of a table named virtual: ours names a target after it
+			if (!StringUtil::CIEquals(ahead.PeekWord(), "virtual")) {
+				return false;
+			}
+			ahead.Word("virtual");
+			return !ahead.PeekWord().empty();
 		}
 		ahead.Accept("on");
 		return StringUtil::CIEquals(ahead.PeekWord(), "virtual");
@@ -523,7 +533,12 @@ bool IsMgmtStart(const string &text) {
 				return false;
 			}
 			ahead.Word("function");
-			return StringUtil::CIEquals(ahead.PeekWord(), "category");
+			if (!StringUtil::CIEquals(ahead.PeekWord(), "category")) {
+				return false;
+			}
+			// CREATE FUNCTION category(x) AS … is duckdb's macro named `category`: ours names one after it
+			ahead.Word("category");
+			return !ahead.PeekWord().empty() || (!ahead.Done() && ahead.text[ahead.pos] == '"');
 		};
 		if (StringUtil::CIEquals(first, "create")) {
 			if (StringUtil::CIEquals(second, "or")) {
@@ -2150,6 +2165,18 @@ vector<string> SplitBatchText(const string &text) {
 	return out;
 }
 
+void RefuseRepeatedPrefix(const string &text) {
+	auto statements = SplitBatchText(text);
+	for (idx_t i = 1; i < statements.size(); i++) {
+		idx_t pos = 0;
+		if (StringUtil::CIEquals(ReadWord(statements[i], pos), "acl")) {
+			throw BinderException("acl admin: one ACL prefix per batch - the statements after the first are written "
+			                      "without a prefix of their own (statement %llu starts with ACL)",
+			                      i + 1);
+		}
+	}
+}
+
 bool BatchHasMgmtStatement(const string &text) {
 	for (auto &statement : SplitBatchText(text)) {
 		if (IsMgmtStart(statement)) {
@@ -2170,6 +2197,7 @@ bool BatchIsAllMgmt(const string &text) {
 }
 
 vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session) {
+	RefuseRepeatedPrefix(text);
 	if (!BatchIsAllMgmt(text) && BatchHasMgmtStatement(text)) {
 		// spec 117: a batch is all management or all queries - a mix would run half of it in each world
 		throw BinderException("acl admin: a batch mixing management statements and queries is refused - send each "

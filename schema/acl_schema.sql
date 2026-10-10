@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS acl."function_category_members"("category" VARCHAR, "
 
 -- a grant to role '' is every role's; a row names either a category (key columns '') or a function
 -- (category ''); allowed = false is a deny, and a deny anywhere among a principal's roles wins
-CREATE TABLE IF NOT EXISTS acl."function_grants"("role" VARCHAR, "category" VARCHAR, "database" VARCHAR, "schema" VARCHAR, "name" VARCHAR, "kind" VARCHAR, "allowed" BOOLEAN, PRIMARY KEY ("role", "category", "database", "schema", "name", "kind"));
+CREATE TABLE IF NOT EXISTS acl."function_grants"("role" VARCHAR, "category" VARCHAR, "database" VARCHAR, "schema" VARCHAR, "name" VARCHAR, "kind" VARCHAR, "allowed" BOOLEAN NOT NULL DEFAULT true, PRIMARY KEY ("role", "category", "database", "schema", "name", "kind"));
 
 -- spec 095: an issuer is the trust anchor (its URL, or an oidc_issuer secret of the secrets service
 -- carrying it); its keys come from OIDC discovery or that secret - never from here. A client is what of
@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS acl."admins"("role" VARCHAR, "scope" VARCHAR, "vcat" 
 -- deny, which wins over every bundle but passthrough. Never in role_catalogs / role_object_caps /
 -- function_grants: a row there would spread into every listing, and a category could hand platform's
 -- keys to every role
-CREATE TABLE IF NOT EXISTS acl."platform_grants"("role" VARCHAR, "object" VARCHAR, "kind" VARCHAR, "allowed" BOOLEAN, PRIMARY KEY ("role", "object", "kind"));
+CREATE TABLE IF NOT EXISTS acl."platform_grants"("role" VARCHAR, "object" VARCHAR, "kind" VARCHAR, "allowed" BOOLEAN NOT NULL DEFAULT true, PRIMARY KEY ("role", "object", "kind"));
 
 -- spec 095: a mapping is scoped to one client or to every client of one issuer
 CREATE TABLE IF NOT EXISTS acl."role_mappings"("scope_kind" VARCHAR, "scope_name" VARCHAR, "source" VARCHAR, "external_value" VARCHAR, "role" VARCHAR, PRIMARY KEY ("scope_kind", "scope_name", "source", "external_value", "role"));

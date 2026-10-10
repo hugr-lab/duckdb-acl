@@ -238,6 +238,35 @@ before it does not know the bundles).
   function); the cluster functions were INFRASTRUCTURE already. Spec 074 had put PROFILE SESSION under an
   unrestricted manage - that narrows here. 118 moves these to operate / cluster. `observe` stays as
   specified (the node views, read-only).
+- **The second review round (2026-10-10)**, each with a regression test (`platform_review.test`,
+  `test_acl_schema_steps.cpp`, `test_acl_params_passthrough.cpp`):
+  - *D1, stored bodies ran as the node*: a view, a macro template, an alias target, an RLS, a column /
+    mask expression, a grant's policy, a remap - their function calls were never gated, so a catalog
+    admin stored `acl_grant_admin(...)` in a scalar and became passthrough at the first call.
+    `AuthorizeBodies` walks every body a compiled call stores (subqueries, CTEs, table functions, PIVOT)
+    and judges each call by the AUTHOR's gate (`ResolveFunction` on the author's principal; the never set
+    always; markers exempt; a body must be a constant). The anonymous gateway and passthrough stay
+    trusted. `acl_check_catalog` adds `body_function_denied` for a body stored before (judged by the
+    never set - the author is not recorded).
+  - *D2*: `alter_issuer` / `define_issuer` / `alter_client` / `define_client` on an issuer or client that
+    carries a mapping to an administering role are passthrough's; so is a catalog `manage` granted (or
+    altered in) to a role a mapping reaches - the map-first order.
+  - *D3*: the policy store is recognized under every reading the binder may give a name (`<db>.<t>` with
+    the policy in `<db>.main`, `<schema>.<t>`, a bare `<t>` in the default path) - over-reading refuses;
+    bodies by the tables they bind to, the text when they do not bind.
+  - *D4*: `IsPlatformCatalog` ignores surrounding whitespace (`"platform "`).
+  - a point grant on `check_catalog` admits the grammar too (`MayAdminister`); `SELECT * FROM
+    platform.check_catalog(…)` / `CALL` compile to the call `CHECK VIRTUAL CATALOG` is - one `admin`
+    event; a refused grammar statement and a call written wrongly are `admin` events of the known
+    principal (`mgmt_unauthorized`); a call keeps its column alias and the grammar answers under the
+    operation's name; `platform.<x>` that is no platform function is refused by name (never a method call);
+    a batch of several `ACL` prefixes has its own message; `REVOKE ADMIN` of a bundle not held is
+    refused; `expr AS name` in a COLUMNS list is `name = expr` (it was stored as one name that read
+    nothing); `platform_grants.allowed` is NOT NULL (a NULL reads as no grant); the step runner
+    substitutes ACL_KEY_TEXT and the generator writes it for every step's key columns (a SQL Server
+    catalog could not take step 21's re-keyed `admins`).
+  - not changed: the quack door's session lookup stays a scan per batch (cached in the rewriter; the
+    listing reads it once per surface).
 - **Known**: a virtual schema named `platform` in a MAIN catalog is no longer reached as
   `platform.<x>` (the system catalog takes the two-part name); the v21 step writes plain VARCHAR keys,
   as the earlier steps do (a SQL Server catalog needs the bounded type - the existing step pattern).

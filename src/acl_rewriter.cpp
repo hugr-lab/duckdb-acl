@@ -291,7 +291,10 @@ public:
 	//! spec 117: the platform catalog is absent on the quack door - quack loads a catalog whole, and the
 	//! console is Flight / JDBC
 	bool PlatformHidden() {
-		return !principal.session.empty() && store.SessionDoorOf(principal.session) == "quack";
+		if (platform_hidden < 0) { // the session's door, read once per batch
+			platform_hidden = !principal.session.empty() && store.SessionDoorOf(principal.session) == "quack" ? 1 : 0;
+		}
+		return platform_hidden == 1;
 	}
 
 	//! spec 117: `FROM platform.<view>` - the view's SQL for this principal, substituted before the gate
@@ -3492,6 +3495,12 @@ private:
 		if (expr->GetExpressionClass() == ExpressionClass::FUNCTION) {
 			auto &function = expr->Cast<FunctionExpression>();
 			auto name = function.FunctionName().GetIdentifierName();
+			string platform_leaf;
+			if (PlatformObjectName(NameParts(function.GetQualifiedName()), platform_leaf) &&
+			    !FindPlatformFunction(platform_leaf)) {
+				// the reserved catalog's name: `platform.<x>` is never a method call nor another catalog's
+				Deny(Reason::NO_ACCESS, "the platform catalog has no function \"" + platform_leaf + "\"");
+			}
 			if (IsPlatformFunctionName(NameParts(function.GetQualifiedName()))) {
 				// spec 117: a management call is one statement, one change, one audit event - never per row
 				// of another selection, in a subquery or a FROM: the override compiled the top-level form
@@ -3789,6 +3798,7 @@ private:
 	//! spec 117: the principal's administration, read once per batch, for the platform catalog
 	PolicyStore::AdminRights admin_rights;
 	bool rights_loaded = false;
+	int platform_hidden = -1;
 	PolicyStore &store;
 	//! the virtual name of the DML target currently being rewritten (for diagnostics and mapping)
 	string dml_target_name;

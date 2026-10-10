@@ -140,9 +140,9 @@ SELECT acl_add_relation('platform', 'orders', 'phys.main.orders', '', '');
 
 # a category or a function grant never holds platform's functions
 statement error
-ACL ADMIN GRANT FUNCTION platform.main.create_role TABLE TO ALL ROLES;
+ACL ADMIN GRANT FUNCTION platform.main.create_role TO ALL ROLES;
 ----
-<REGEX>:.*
+<REGEX>:.*names one role - never every role.*
 
 statement error
 ACL ADMIN ALTER FUNCTION CATEGORY basic ADD (platform.main.create_role);

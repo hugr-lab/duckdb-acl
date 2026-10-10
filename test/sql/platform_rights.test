@@ -385,7 +385,7 @@ ACL ROLE "pol" CREATE VIRTUAL TABLE sales.a AS store.acl."Admins";
 statement error
 ACL ROLE "pol" CREATE VIRTUAL VIEW sales.v AS SELECT * FROM query_table('store' || '.acl.issuers');
 ----
-<REGEX>:.*the relation reads the policy store itself.*
+<REGEX>:.*(the relation reads the policy store itself|query_table", which its author may not call).*
 
 statement error
 ACL ROLE "pol" CREATE VIRTUAL VIEW sales.v AS SELECT * FROM store.acl.role_catalogs;
@@ -400,12 +400,12 @@ ACL ROLE "pol" CREATE VIRTUAL SCHEMA sales.raw AS store.acl;
 statement error
 ACL ROLE "pol" CREATE VIRTUAL TABLE sales.leak AS phys.main.orders COLUMNS (id, tenant = (SELECT max(secret) FROM store.acl.issuers));
 ----
-<REGEX>:.*the relation's column list reads the policy store itself.*
+<REGEX>:.*the relation's RLS or column list reads the policy store itself.*
 
 statement error
 ACL ROLE "pol" CREATE VIRTUAL TABLE sales.leak AS phys.main.orders RLS (EXISTS (SELECT 1 FROM store.acl.admins));
 ----
-<REGEX>:.*the relation's RLS reads the policy store itself.*
+<REGEX>:.*the relation's RLS or column list reads the policy store itself.*
 
 statement error
 ACL ROLE "pol" ALTER VIRTUAL TABLE sales.orders SET PHYS store.acl.admins;

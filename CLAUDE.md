@@ -660,7 +660,10 @@ functions `check_catalog([c])` / `console_info()` in FROM. **ONE authorizer**: `
 `PlatformRight` (CATALOG / POLICY / HANDS_OUT / ESCALATES / INFRASTRUCTURE / OPERATE / OPEN); until spec
 118 the session profile (OPERATE) and the cluster views (`PlatformViewClass::CLUSTER`) are passthrough's,
 and no definition may name the policy store's own tables (`RequireNotPolicyStore`), nor may a non-passthrough
-map a claim to a privileged role (`AuthorizeRoleTargets`). Rights: `AdminRights`
+map a claim to a privileged role, repoint an issuer / client behind such a mapping or give a mapped role a
+catalog's manage (`AuthorizeRoleTargets`); every stored body (view, template, alias, RLS, mask, a grant's
+policy) is judged by its AUTHOR's function gate at write (`AuthorizeBodies`, `WalkBodyCalls`; the check's
+`body_function_denied` for older ones). Steps' key columns are ACL_KEY_TEXT (gen_schema, the runner). Rights: `AdminRights`
 is a SET (`passthrough`, `unrestricted_manage` = policy, `observe`, `catalogs`, `platform` point grants
 `<kind>:<object>` -> allowed; `MayAdminister()`, `Policy()`, `Privileged()` - spec 095's privileged roles
 include any point grant); `platform_grants(role, object, kind, allowed)` written only by passthrough

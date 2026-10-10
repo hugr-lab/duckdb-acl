@@ -35,8 +35,16 @@
 #include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "yyjson.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node.hpp"
+#include "duckdb/parser/tableref/pivotref.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "acl_identity.hpp"
 
 #include <cstdlib>
+#include <set>
 #include <unordered_map>
 
 namespace duckdb {
@@ -45,17 +53,24 @@ namespace acl {
 using acl_detail::Lit;
 
 bool IsPlatformCatalog(const string &name) {
-	if (name.empty()) {
+	auto trimmed = name;
+	StringUtil::Trim(trimmed);
+	if (trimmed.empty()) {
 		return false;
 	}
-	if (StringUtil::CIEquals(name, PLATFORM_CATALOG)) {
+	if (StringUtil::CIEquals(trimmed, PLATFORM_CATALOG)) {
 		return true;
 	}
-	// a key that quotes its one part (`"platform"`) names the same catalog
+	// a key that quotes its one part (`"platform"`, `"platform "`) names the same catalog - whitespace around
+	// the name is no other name (spec 117 review D4)
 	NamePath path;
 	string error;
-	return NamePath::TryFromKey(name, path, error) && path.Size() == 1 &&
-	       StringUtil::CIEquals(path.Parts()[0], PLATFORM_CATALOG);
+	if (!NamePath::TryFromKey(trimmed, path, error) || path.Size() != 1) {
+		return false;
+	}
+	auto part = path.Parts()[0];
+	StringUtil::Trim(part);
+	return StringUtil::CIEquals(part, PLATFORM_CATALOG);
 }
 
 namespace {
@@ -1069,9 +1084,8 @@ bool PolicyStore::AdminRights::MayAdminister() const {
 	}
 	for (auto &grant : platform) {
 		if (grant.second && StringUtil::StartsWith(grant.first, "function:")) {
-			auto function = FindPlatformFunction(grant.first.substr(9));
-			if (function && !function->table) {
-				return true;
+			if (FindPlatformFunction(grant.first.substr(9))) {
+				return true; // a read function too: CHECK VIRTUAL CATALOG is check_catalog's grammar
 			}
 		}
 	}
@@ -1189,6 +1203,16 @@ bool PlatformAccess::Any() const {
 
 namespace {
 
+//! An issuer's URL by its name ('' when none) - a short-form issuer is named by its URL
+string IssuerUrlOf(const IdentityModel &model, const string &name) {
+	for (auto &issuer : model.issuers) {
+		if (issuer.name == name) {
+			return issuer.url;
+		}
+	}
+	return string();
+}
+
 //! The call a compiled management statement makes: `SELECT acl_<fn>(…)` or `SELECT * FROM acl_<fn>(…)`
 FunctionExpression &CompiledCall(SQLStatement &statement) {
 	if (statement.type != StatementType::SELECT_STATEMENT) {
@@ -1299,14 +1323,310 @@ void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights 
 	throw BinderException("acl admin: no manage scope for catalog \"%s\"", vcat);
 }
 
+namespace {
+
+void WalkBodyNode(QueryNode &node, const std::function<void(const QualifiedName &, FunctionKind)> &callback);
+
+void WalkBodyExpr(ParsedExpression &expr, const std::set<const ParsedExpression *> &table_functions,
+                  const std::function<void(const QualifiedName &, FunctionKind)> &callback) {
+	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expr.Cast<FunctionExpression>();
+		auto name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+		bool marker = function.GetQualifiedName().Path().size() <= 1 && (name == "acl_claim" || name == "acl_arg");
+		if (!marker) {
+			callback(function.GetQualifiedName(),
+			         table_functions.count(&expr) ? FunctionKind::TABLE : FunctionKind::SCALAR);
+		}
+	} else if (expr.GetExpressionClass() == ExpressionClass::WINDOW) {
+		callback(expr.Cast<WindowExpression>().GetQualifiedName(), FunctionKind::SCALAR);
+	} else if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		auto &subquery = expr.Cast<SubqueryExpression>().SubqueryMutable();
+		if (subquery && subquery->node) {
+			WalkBodyNode(*subquery->node, callback);
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](ParsedExpression &child) { WalkBodyExpr(child, table_functions, callback); });
+}
+
+void WalkBodyNode(QueryNode &node, const std::function<void(const QualifiedName &, FunctionKind)> &callback) {
+	std::set<const ParsedExpression *> table_functions;
+	vector<QueryNode *> pivot_subqueries;
+	vector<ParsedExpression *> pivot_expressions;
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node, [](unique_ptr<ParsedExpression> &) {},
+	    [&](TableRef &ref) {
+		    if (ref.type == TableReferenceType::TABLE_FUNCTION) {
+			    table_functions.insert(ref.Cast<TableFunctionRef>().function.get());
+		    } else if (ref.type == TableReferenceType::PIVOT) {
+			    for (auto &column : ref.Cast<PivotRef>().pivots) {
+				    for (auto &pivot : column.pivot_expressions) {
+					    pivot_expressions.push_back(pivot.get());
+				    }
+				    for (auto &entry : column.entries) {
+					    if (entry.expr) {
+						    pivot_expressions.push_back(entry.expr.get());
+					    }
+				    }
+				    if (column.subquery) {
+					    pivot_subqueries.push_back(column.subquery.get());
+				    }
+			    }
+		    }
+	    });
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node, [&](unique_ptr<ParsedExpression> &child) { WalkBodyExpr(*child, table_functions, callback); });
+	for (auto expr : pivot_expressions) {
+		WalkBodyExpr(*expr, table_functions, callback);
+	}
+	for (auto subquery : pivot_subqueries) {
+		WalkBodyNode(*subquery, callback);
+	}
+}
+
+} // namespace
+
+void WalkBodyCalls(const string &text, BodyShape shape,
+                   const std::function<void(const QualifiedName &name, FunctionKind kind)> &callback) {
+	auto trimmed = text;
+	StringUtil::Trim(trimmed);
+	if (trimmed.empty()) {
+		return;
+	}
+	auto options = ParserOptions::Builtin();
+	std::set<const ParsedExpression *> none;
+	switch (shape) {
+	case BodyShape::FUNCTION_NAME:
+		callback(NamePath::KeyToQualified(NameKey(trimmed, "acl admin", "function target")), FunctionKind::SCALAR);
+		return;
+	case BodyShape::EXPRESSION:
+		for (auto &expr : Parser(options).ParseExpressionList(trimmed)) {
+			WalkBodyExpr(*expr, none, callback);
+		}
+		return;
+	case BodyShape::COLUMNS:
+		for (auto &item : acl_detail::ParseColumnList(trimmed)) {
+			if (!item.second.empty()) {
+				for (auto &expr : Parser(options).ParseExpressionList(item.second)) {
+					WalkBodyExpr(*expr, none, callback);
+				}
+			}
+		}
+		return;
+	case BodyShape::SELECT: {
+		Parser parser(options);
+		parser.ParseQuery(trimmed);
+		for (auto &statement : parser.statements) {
+			if (statement->type != StatementType::SELECT_STATEMENT) {
+				throw BinderException("acl admin: a definition body is one SELECT");
+			}
+			WalkBodyNode(*statement->Cast<SelectStatement>().node, callback);
+		}
+		return;
+	}
+	}
+}
+
+namespace {
+
+//! The bodies one compiled call stores: (argument index, shape), and for an alias target its kind
+struct BodyArgument {
+	idx_t index;
+	BodyShape shape;
+	FunctionKind kind;
+};
+
+vector<BodyArgument> BodiesOf(const string &target, FunctionExpression &call) {
+	auto text = [&](idx_t i) {
+		auto &arguments = call.GetArguments();
+		if (i >= arguments.size() || arguments[i].GetExpression().GetExpressionClass() != ExpressionClass::CONSTANT) {
+			return string();
+		}
+		auto value = arguments[i].GetExpression().Cast<ConstantExpression>().GetLiteral().ToValue();
+		return value.IsNull() ? string() : StringUtil::Lower(value.ToString());
+	};
+	auto S = FunctionKind::SCALAR;
+	auto T = FunctionKind::TABLE;
+	if (target == "acl_add_relation") {
+		return {{3, BodyShape::COLUMNS, S}, {4, BodyShape::EXPRESSION, S}};
+	}
+	if (target == "acl_add_view") {
+		return {{2, BodyShape::SELECT, S}};
+	}
+	if (target == "acl_add_table_function") {
+		return {{2, BodyShape::SELECT, S}};
+	}
+	if (target == "acl_add_table_function_alias") {
+		return {{2, BodyShape::FUNCTION_NAME, T}};
+	}
+	if (target == "acl_add_scalar") {
+		return {{2, BodyShape::EXPRESSION, S}};
+	}
+	if (target == "acl_add_scalar_alias") {
+		return {{2, BodyShape::FUNCTION_NAME, S}};
+	}
+	if (target == "acl_alter_relation") {
+		auto field = text(2);
+		if (field == "rls") {
+			return {{3, BodyShape::EXPRESSION, S}};
+		}
+		if (field == "view") {
+			return {{3, BodyShape::SELECT, S}};
+		}
+		if (field == "columns") {
+			return {{3, BodyShape::COLUMNS, S}};
+		}
+		return {};
+	}
+	if (target == "acl_alter_function") {
+		auto kind = text(2) == "table" ? T : S;
+		if (text(3) == "alias") {
+			return {{4, BodyShape::FUNCTION_NAME, kind}};
+		}
+		return {{4, kind == T ? BodyShape::SELECT : BodyShape::EXPRESSION, S}};
+	}
+	if (target == "acl_grant_catalog" || target == "acl_grant_object") {
+		return {{4, BodyShape::EXPRESSION, S}, {5, BodyShape::COLUMNS, S}};
+	}
+	if (target == "acl_repair_relation") {
+		return {{3, BodyShape::COLUMNS, S}};
+	}
+	if (target == "acl_add_reference") {
+		return {{7, BodyShape::EXPRESSION, S}};
+	}
+	return {};
+}
+
+} // namespace
+
+void AuthorizeBodies(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,
+                     PolicyStore &store, const Principal &author) {
+	if (rights.passthrough) {
+		return; // the break-glass (and the anonymous gateway) store what they write
+	}
+	for (auto &statement : statements) {
+		auto &call = CompiledCall(*statement);
+		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
+		for (auto &body : BodiesOf(target, call)) {
+			auto &arguments = call.GetArguments();
+			if (body.index >= arguments.size()) {
+				continue;
+			}
+			auto &argument = arguments[body.index].GetExpression();
+			if (argument.GetExpressionClass() != ExpressionClass::CONSTANT) {
+				throw BinderException("acl admin: a definition body is judged before it is stored, so it must be a "
+				                      "constant, not a parameter");
+			}
+			auto value = argument.Cast<ConstantExpression>().GetLiteral().ToValue();
+			if (value.IsNull()) {
+				continue;
+			}
+			auto judge = [&](const QualifiedName &name, FunctionKind kind) {
+				auto kind_here = body.shape == BodyShape::FUNCTION_NAME ? body.kind : kind;
+				auto decision = store.ResolveFunction(author, name, kind_here);
+				if (decision.verdict == FunctionVerdict::UNKNOWN_QUALIFIED && name.Path().size() >= 2 &&
+				    body.shape != BodyShape::FUNCTION_NAME) {
+					// duckdb's method-call spelling: `x.lower()` is `lower(x)`
+					decision = store.ResolveFunction(author, QualifiedName(name.Name()), kind_here);
+				}
+				if (decision.verdict != FunctionVerdict::ADMITTED) {
+					NoteDenyReason(Reason::FUNCTION_DENIED);
+					auto shown = string(kind_here == FunctionKind::TABLE ? "table function \"" : "function \"") +
+					             name.Name().GetIdentifierName() + "\"";
+					throw BinderException("acl admin: the definition calls %s, which its author may not call - a "
+					                      "stored body runs as the node, so it holds only what the author's own "
+					                      "function gate admits (%s)",
+					                      shown, decision.Why(shown));
+				}
+			};
+			try {
+				WalkBodyCalls(value.ToString(), body.shape, judge);
+			} catch (BinderException &) {
+				throw;
+			} catch (std::exception &ex) {
+				throw BinderException("acl admin: a definition body that does not parse cannot be judged: %s",
+				                      ErrorData(ex).RawMessage());
+			}
+		}
+	}
+}
+
 void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,
                           PolicyStore &store) {
 	if (rights.passthrough) {
 		return;
 	}
+	auto identity = store.Identity();
+	// the issuer / client a mapping to an administering role hangs on: what repoints that trust is privileged
+	auto privileged_behind = [&](const string &issuer, const string &client) {
+		for (auto &mapping : identity->mappings) {
+			bool scoped = false;
+			if (StringUtil::CIEquals(mapping.scope_kind, "client")) {
+				if (!client.empty() && mapping.scope_name == client) {
+					scoped = true;
+				}
+				for (auto &each : identity->clients) {
+					if (each.name == mapping.scope_name && !issuer.empty() &&
+					    (each.issuer == issuer || IssuerUrlOf(*identity, each.issuer) == issuer)) {
+						scoped = true;
+					}
+				}
+			} else if (!issuer.empty() &&
+			           (mapping.scope_name == issuer || IssuerUrlOf(*identity, mapping.scope_name) == issuer)) {
+				scoped = true;
+			}
+			if (scoped && store.RolePrivileged(mapping.role)) {
+				return mapping.role;
+			}
+		}
+		return string();
+	};
 	for (auto &statement : statements) {
 		auto &call = CompiledCall(*statement);
-		if (!StringUtil::CIEquals(call.FunctionName().GetIdentifierName(), "acl_map_role")) {
+		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
+		string issuer, client;
+		if (target == "acl_alter_issuer" || target == "acl_define_issuer") {
+			issuer = ConstantArgument(call, 0, "alter_issuer");
+		} else if (target == "acl_alter_client") {
+			client = ConstantArgument(call, 0, "alter_client");
+		} else if (target == "acl_define_client") {
+			client = ConstantArgument(call, 0, "define_client");
+			issuer = ConstantArgument(call, 1, "define_client");
+		}
+		if (!issuer.empty() || !client.empty()) {
+			auto role = privileged_behind(issuer, client);
+			if (!role.empty()) {
+				throw BinderException("acl admin: %s \"%s\" carries a mapping to \"%s\", which holds administration - "
+				                      "changing whom it trusts hands that administration out, so it requires a "
+				                      "passthrough scope",
+				                      client.empty() ? "issuer" : "client", client.empty() ? issuer : client, role);
+			}
+		}
+		// a grant that makes a mapped role administer a catalog hands it to whoever holds the claim: the
+		// order (map first, grant after) must not reach what mapping it afterwards could not
+		if (target == "acl_grant_catalog" || target == "acl_alter_grant") {
+			auto role = ConstantArgument(call, 0, "grant_catalog");
+			bool manage = false;
+			if (target == "acl_grant_catalog") {
+				auto caps = ConstantArgument(call, 2, "grant_catalog");
+				manage = !caps.empty() && acl_detail::ParseCaps(caps).count("manage");
+			} else {
+				auto field = StringUtil::Lower(ConstantArgument(call, 2, "alter_grant"));
+				auto value = ConstantArgument(call, 3, "alter_grant");
+				manage = field == "caps" && !value.empty() && acl_detail::ParseCaps(value).count("manage");
+			}
+			if (manage) {
+				for (auto &mapping : identity->mappings) {
+					if (mapping.role == role) {
+						throw BinderException("acl admin: \"%s\" is reached by a role mapping, so granting it a "
+						                      "catalog's manage hands administration to whoever holds the claim - it "
+						                      "requires a passthrough scope, as mapping to an administering role does",
+						                      role);
+					}
+				}
+			}
+		}
+		if (target != "acl_map_role") {
 			continue;
 		}
 		auto role = ConstantArgument(call, 4, "map_role");
@@ -1539,6 +1859,36 @@ vector<unique_ptr<ParsedExpression>> PlaceArguments(const PlatformFunction &func
 	return out;
 }
 
+//! `SELECT * FROM platform.<read function>(…)` and nothing else
+bool TopLevelRead(SelectStatement &statement, FunctionExpression *&call) {
+	if (!statement.node || statement.node->type != QueryNodeType::SELECT_NODE) {
+		return false;
+	}
+	auto &node = statement.node->Cast<SelectNode>();
+	if (node.select_list.size() != 1 || node.select_list[0]->GetExpressionClass() != ExpressionClass::STAR ||
+	    !node.from_table || node.from_table->type != TableReferenceType::TABLE_FUNCTION) {
+		return false;
+	}
+	auto &star = node.select_list[0]->Cast<StarExpression>();
+	if (!star.ExcludeList().empty() || !star.ReplaceList().empty() || !star.RenameList().empty() || star.IsColumns() ||
+	    star.Expression() || !star.RelationName().empty()) {
+		return false;
+	}
+	auto &ref = node.from_table->Cast<TableFunctionRef>();
+	if (!ref.function || !PlatformCallOf(*ref.function) || !ref.alias.empty() || !ref.column_name_alias.empty() ||
+	    ref.subquery || ref.sample) {
+		return false;
+	}
+	bool bare = !node.where_clause && !node.having && !node.qualify && !node.sample &&
+	            node.groups.group_expressions.empty() && node.groups.grouping_sets.empty() && node.modifiers.empty() &&
+	            node.cte_map.map.empty();
+	if (!bare) {
+		return false;
+	}
+	call = &ref.function->Cast<FunctionExpression>();
+	return true;
+}
+
 //! The bare top-level shape: one item, no FROM, nothing that would make the call per row or conditional
 bool TopLevelSelect(SelectStatement &statement, FunctionExpression *&call) {
 	if (!statement.node || statement.node->type != QueryNodeType::SELECT_NODE) {
@@ -1572,7 +1922,8 @@ unique_ptr<SQLStatement> CompiledStatement(const PlatformFunction &function, Fun
 		node->from_table = std::move(ref);
 	} else {
 		auto target = make_uniq<FunctionExpression>(Identifier(function.target), std::move(arguments));
-		target->SetAlias(Identifier(function.name));
+		// the user's alias, else the operation's name - what the grammar's form answers too
+		target->SetAlias(call.GetAlias().empty() ? Identifier(function.name) : call.GetAlias());
 		node->select_list.push_back(std::move(target));
 		node->from_table = make_uniq<EmptyTableRef>();
 	}
@@ -1585,10 +1936,15 @@ unique_ptr<SQLStatement> CompiledStatement(const PlatformFunction &function, Fun
 
 bool CompilePlatformCall(SQLStatement &statement, unique_ptr<SQLStatement> &compiled) {
 	FunctionExpression *call = nullptr;
+	bool read_form = false;
 	if (statement.type == StatementType::SELECT_STATEMENT) {
-		if (!TopLevelSelect(statement.Cast<SelectStatement>(), call)) {
+		if (!TopLevelSelect(statement.Cast<SelectStatement>(), call) &&
+		    !TopLevelRead(statement.Cast<SelectStatement>(), call)) {
 			return false;
 		}
+		read_form = call && !statement.Cast<SelectStatement>().node->Cast<SelectNode>().select_list.empty() &&
+		            statement.Cast<SelectStatement>().node->Cast<SelectNode>().select_list[0]->GetExpressionClass() ==
+		                ExpressionClass::STAR;
 	} else if (statement.type == StatementType::CALL_STATEMENT) {
 		auto &function = statement.Cast<CallStatement>().function;
 		if (!function || !PlatformCallOf(*function)) {
@@ -1601,11 +1957,17 @@ bool CompilePlatformCall(SQLStatement &statement, unique_ptr<SQLStatement> &comp
 	auto leaf = call->FunctionName().GetIdentifierName();
 	auto function = FindPlatformFunction(leaf);
 	if (function->table) {
-		if (statement.type == StatementType::SELECT_STATEMENT) {
+		if (statement.type == StatementType::SELECT_STATEMENT && !read_form) {
 			throw BinderException("acl admin: platform.%s is a table function - SELECT * FROM platform.%s(…)",
 			                      function->name, function->name);
 		}
-		return false; // CALL of a read function: the rewriter answers it like `SELECT * FROM platform.f(…)`
+		if (function->right == PlatformRight::OPEN) {
+			return false; // console_info is a read: the rewriter answers it
+		}
+		// check_catalog: `SELECT * FROM platform.check_catalog(…)` / CALL - the call CHECK VIRTUAL CATALOG
+		// is, compiled and audited as it (spec 117 review); inside a larger query the rewriter answers it
+	} else if (read_form) {
+		return false;
 	}
 	compiled = CompiledStatement(*function, *call);
 	// the user's parameters ride on: the compiled call carries exactly the ones written (the golden rule)

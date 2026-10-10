@@ -68,7 +68,32 @@ vector<std::pair<string, string>> ParseColumns(const string &csv, case_insensiti
 	vector<std::pair<string, string>> columns;
 	case_insensitive_map_t<int8_t> local;
 	auto &out = marks ? *marks : local;
-	for (auto &item : SplitCsv(csv)) {
+	for (auto &item_p : SplitCsv(csv)) {
+		auto item = item_p;
+		// `expr AS name` (SQL's spelling, outside quotes) is `name = expr` - stored as a name of its own and an
+		// expression, never as one name "expr AS name" (spec 117 review: it read nothing)
+		if (item.find('=') == string::npos && item.find('"') == string::npos && item.find('\'') == string::npos) {
+			auto lowered = StringUtil::Lower(item);
+			// the last ` as ` outside parentheses (a CAST's AS is inside its own)
+			idx_t as = string::npos;
+			idx_t depth = 0;
+			for (idx_t i = 0; i < lowered.size(); i++) {
+				if (lowered[i] == '(') {
+					depth++;
+				} else if (lowered[i] == ')' && depth > 0) {
+					depth--;
+				} else if (depth == 0 && lowered.compare(i, 4, " as ") == 0) {
+					as = i;
+				}
+			}
+			if (as != string::npos && as > 0) {
+				auto expr = Trimmed(item.substr(0, as));
+				auto name = Trimmed(item.substr(as + 4));
+				if (!expr.empty() && !name.empty()) {
+					item = name + " = " + expr;
+				}
+			}
+		}
 		auto pos = item.find('='); // the first '=' separates the name; the rest is the expression
 		if (pos == string::npos) {
 			columns.emplace_back(StripNullableSuffix(item, out), string());

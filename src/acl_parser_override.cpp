@@ -323,6 +323,8 @@ struct StatementAudit {
 	AuditTrail trail;
 	//! What the override was doing when an exception nobody noted escaped: it names the code
 	Reason phase = Reason::PARSE;
+	//! spec 117: the class a refusal names when it came before any statement was compiled (`manage`)
+	string refused_statement;
 
 	//! The batch runs under a session: its door, its ops id and its own level name the events
 	void OnSession(PolicyStore &store, const string &handle) {
@@ -387,7 +389,9 @@ struct StatementAudit {
 			code = ReasonCode(phase);
 		}
 		AuditTrail::Statement last;
-		if (!trail.statements.empty()) {
+		if (trail.statements.empty()) {
+			last.statement = refused_statement;
+		} else {
 			last = trail.statements.back();
 			if (proto.kind == "admin") {
 				// a management batch is authorized as a whole: the refusal names every call in it
@@ -660,6 +664,15 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		// interpret it" and must never be re-routed here.
 		mode = AclPrefix::Mode::MANAGE;
 	}
+	if (mode == AclPrefix::Mode::MANAGE || (principal_prefix && mode == AclPrefix::Mode::QUERY)) {
+		RefuseRepeatedPrefix(prefix.rest);
+	}
+	if (mode != AclPrefix::Mode::QUERY) {
+		// management, or native SQL outside the virtual catalog - an event of its own kind from the first
+		// refusal on, whoever is refused (spec 117: the grammar and the call are audited alike)
+		audit.proto.kind = "admin";
+		audit.refused_statement = mode == AclPrefix::Mode::MANAGE ? "manage" : "native";
+	}
 	if (principal_prefix && mode == AclPrefix::Mode::QUERY && BatchHasMgmtStatement(prefix.rest)) {
 		// spec 117: the first statement is a query and a later one management - refused, never split
 		NoteDenyReason(Reason::STATEMENT_TYPE);
@@ -708,10 +721,6 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 			throw BinderException("acl admin: the principal has no ACL administration scope");
 		}
 	}
-	if (mode != AclPrefix::Mode::QUERY) {
-		audit.proto.kind = "admin"; // management, or native SQL outside the virtual catalog
-	}
-
 	if (secrets) {
 		// compiled to the service catalog's own calls, which the service authorizes once more: it
 		// manages only for a principal it knows as an administrator (tresor spec 009)
@@ -737,6 +746,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		audit.phase = Reason::MGMT_UNAUTHORIZED;
 		AuthorizeMgmt(statements, rights);
 		AuthorizeRoleTargets(statements, rights, store);
+		AuthorizeBodies(statements, rights, store, principal);
 		return ParserOverrideResult(std::move(statements));
 	}
 	if (mode == AclPrefix::Mode::NATIVE) {
@@ -782,10 +792,24 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		// rewriter refuses it; a batch of calls and queries is refused here.
 		vector<unique_ptr<SQLStatement>> compiled(statements.size());
 		idx_t calls = 0;
-		for (idx_t i = 0; i < statements.size(); i++) {
-			if (CompilePlatformCall(*statements[i], compiled[i])) {
-				calls++;
+		try {
+			for (idx_t i = 0; i < statements.size(); i++) {
+				if (CompilePlatformCall(*statements[i], compiled[i])) {
+					calls++;
+				}
 			}
+		} catch (std::exception &) {
+			// a call written wrongly (a parameter where authorization is carried, an argument it does not take)
+			// is a management refusal of a known principal - audited as the grammar's would be
+			audit.proto.kind = "admin";
+			audit.refused_statement = "manage";
+			try {
+				ResolvePrincipal(store, prefix, principal);
+				audit.proto.principal = principal;
+			} catch (std::exception &) { // NOLINT: the principal's own refusal is not this one's
+			}
+			NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
+			throw;
 		}
 		if (calls > 0) {
 			if (calls != statements.size()) {
@@ -794,6 +818,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 				                      "send each kind in a batch of its own");
 			}
 			audit.proto.kind = "admin";
+			audit.refused_statement = "manage";
 			audit.phase = Reason::PRINCIPAL;
 			ResolvePrincipal(store, prefix, principal);
 			audit.proto.principal = principal;
@@ -813,6 +838,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 			audit.phase = Reason::MGMT_UNAUTHORIZED;
 			AuthorizeMgmt(compiled, rights);
 			AuthorizeRoleTargets(compiled, rights, store);
+			AuthorizeBodies(compiled, rights, store, principal);
 			return ParserOverrideResult(std::move(compiled));
 		}
 	}

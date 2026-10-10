@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS <function_category_members>("category" ACL_KEY_TEXT, 
 
 -- a grant to role '' is every role's; a row names either a category (key columns '') or a function
 -- (category ''); allowed = false is a deny, and a deny anywhere among a principal's roles wins
-CREATE TABLE IF NOT EXISTS <function_grants>("role" ACL_KEY_TEXT, "category" ACL_KEY_TEXT, "database" ACL_KEY_TEXT, "schema" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "allowed" BOOLEAN, PRIMARY KEY ("role", "category", "database", "schema", "name", "kind"));
+CREATE TABLE IF NOT EXISTS <function_grants>("role" ACL_KEY_TEXT, "category" ACL_KEY_TEXT, "database" ACL_KEY_TEXT, "schema" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "allowed" BOOLEAN NOT NULL DEFAULT true, PRIMARY KEY ("role", "category", "database", "schema", "name", "kind"));
 
 -- spec 095: an issuer is the trust anchor (its URL, or an oidc_issuer secret of the secrets service
 -- carrying it); its keys come from OIDC discovery or that secret - never from here. A client is what of
@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS <admins>("role" ACL_KEY_TEXT, "scope" ACL_KEY_TEXT, "
 -- deny, which wins over every bundle but passthrough. Never in role_catalogs / role_object_caps /
 -- function_grants: a row there would spread into every listing, and a category could hand platform's
 -- keys to every role
-CREATE TABLE IF NOT EXISTS <platform_grants>("role" ACL_KEY_TEXT, "object" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "allowed" BOOLEAN, PRIMARY KEY ("role", "object", "kind"));
+CREATE TABLE IF NOT EXISTS <platform_grants>("role" ACL_KEY_TEXT, "object" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "allowed" BOOLEAN NOT NULL DEFAULT true, PRIMARY KEY ("role", "object", "kind"));
 
 -- spec 095: a mapping is scoped to one client or to every client of one issuer
 CREATE TABLE IF NOT EXISTS <role_mappings>("scope_kind" ACL_KEY_TEXT, "scope_name" ACL_KEY_TEXT, "source" ACL_KEY_TEXT, "external_value" ACL_KEY_TEXT, "role" ACL_KEY_TEXT, PRIMARY KEY ("scope_kind", "scope_name", "source", "external_value", "role"));

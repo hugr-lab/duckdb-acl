@@ -895,8 +895,7 @@ ROLE r` takes every one, the `manage` capability of the role's catalog grants an
 
 A **point grant** gives one view (read whole) or one function (callable for any catalog) of `platform`;
 `DENY` writes a deny, which wins over every bundle but `passthrough`; `REVOKE` takes the grant or the
-deny. Never to `ALL ROLES`, never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`,
-the `cluster_*` functions or `console_info`.
+deny. Never to `ALL ROLES`, and never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting`, `session_profile` - the passthrough scope's own - and `console_info` (every holder's).
 
 Granting or revoking a bundle or a point grant needs `passthrough` - `policy` never hands them out, and
 no scope is self-granted.
@@ -1008,6 +1007,7 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | `types_stale` | the source's column types differ from the type facts stored with the object (spec 099) - a retyped column, or a source that did not exist when the object was written | `ANALYZE VIRTUAL TABLE …` / `… VIEW …` |
 | `enum_domain_exposed` | an object with an ENUM column whose labels are exposed (`enums = keep`) while a predicate - the object's or a grant's - narrows its rows (a view's own `WHERE` is not seen) | `ALTER VIRTUAL TABLE … SET TYPES (enums = varchar)` |
 | `types_incompatible` | a declared entry or a grant's mask that binds over the source but not over the exposed type (`enum_code(tier)` once ENUMs are VARCHAR) - every read refuses | `… SET TYPES (enums = keep)`, or rewrite the expression |
+| `body_function_denied` | a stored body (view, template, alias, RLS, column or mask, a grant's policy) calls a function no principal may call - written before spec 117 judged bodies by their author's gate | redefine it without the call, or drop it |
 | `types_mismatch` | a declared entry that makes a type of its own (`CAST(x AS ENUM(…))`) - described as the exposed type, read as its own | `REPAIR VIRTUAL TABLE … REMAP (n = CAST(… AS <type>))` |
 
 A bare alias (no declared list) has no contract beyond "binds", so only `source_missing` can be

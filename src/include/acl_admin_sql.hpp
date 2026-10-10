@@ -37,6 +37,9 @@ vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicySto
 //! spec 117: split a batch's text into its statements (quote-, comment- and paren-aware) - what the
 //! mixed-batch rule reads: a batch is all management statements or none
 vector<string> SplitBatchText(const string &text);
+//! spec 117: a statement after the first that starts with its own `ACL` prefix - refused with a message of its
+//! own (a second prefix inside a batch is text, never a prefix)
+void RefuseRepeatedPrefix(const string &text);
 //! spec 117: whether any statement of the batch opens with a management form
 bool BatchHasMgmtStatement(const string &text);
 //! spec 117: whether every statement of the batch opens with a management form

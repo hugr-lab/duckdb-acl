@@ -775,26 +775,68 @@ bool IsPolicyTable(const string &name) {
 	return false;
 }
 
-//! A physical name (parts) that IS the policy store: its schema (`<db>.<schema>`, a schema alias's target)
-//! or one of its tables (`[<db>.]<schema>.<table>`)
-bool NamesPolicyStore(const CatalogBackend &catalog, const vector<string> &parts, bool schema_path) {
-	if (schema_path) {
-		return (parts.size() == 2 && StringUtil::CIEquals(parts[0], catalog.db_name) &&
-		        StringUtil::CIEquals(parts[1], catalog.schema)) ||
-		       (parts.size() == 1 && StringUtil::CIEquals(parts[0], catalog.schema));
+//! The node's default database and schema, where a short name lands
+void DefaultPath(CatalogBackend &catalog, string &database, string &schema) {
+	database = "memory";
+	schema = "main";
+	try {
+		auto instance = catalog.Db();
+		Connection con(*instance);
+		auto result = con.Query("SELECT current_database(), current_schema()");
+		if (!result->HasError() && result->RowCount() == 1) {
+			database = result->Collection().GetValue(0, 0).ToString();
+			schema = result->Collection().GetValue(1, 0).ToString();
+		}
+	} catch (std::exception &) { // NOLINT: the defaults stand
 	}
-	if (parts.size() < 2 || !IsPolicyTable(parts.back()) ||
-	    !StringUtil::CIEquals(parts[parts.size() - 2], catalog.schema)) {
+}
+
+//! A physical name (parts) that IS the policy store - its schema (a schema alias's target) or one of its
+//! tables - under ANY reading the binder may give it (spec 117 review D3: `store.admins` is the policy's
+//! admins when the policy lives in `store.main`): `<db>.<schema>.<t>`, `<db>.<t>` (the database's default
+//! schema `main`), `<schema>.<t>` (in the default database), `<t>` (in the default database and schema).
+//! Over-reading refuses a definition, never admits one.
+bool NamesPolicyStore(CatalogBackend &catalog, const vector<string> &parts, bool schema_path) {
+	string default_db, default_schema;
+	DefaultPath(catalog, default_db, default_schema);
+	auto is = [](const string &a, const string &b) {
+		return StringUtil::CIEquals(a, b);
+	};
+	bool db_main = is(catalog.schema, "main");
+	if (schema_path) {
+		// <db>.<schema> | <db> (its main) | <schema> (in the default database)
+		if (parts.size() >= 2) {
+			return is(parts[parts.size() - 2], catalog.db_name) && is(parts.back(), catalog.schema);
+		}
+		return parts.size() == 1 && ((is(parts[0], catalog.db_name) && db_main) ||
+		                             (is(parts[0], catalog.schema) && is(default_db, catalog.db_name)));
+	}
+	if (parts.empty() || !IsPolicyTable(parts.back())) {
 		return false;
 	}
-	return parts.size() == 2 || StringUtil::CIEquals(parts[parts.size() - 3], catalog.db_name);
+	if (parts.size() >= 3) {
+		return is(parts[parts.size() - 3], catalog.db_name) && is(parts[parts.size() - 2], catalog.schema);
+	}
+	if (parts.size() == 2) {
+		return (is(parts[0], catalog.db_name) && db_main) ||
+		       (is(parts[0], catalog.schema) && is(default_db, catalog.db_name));
+	}
+	return is(default_db, catalog.db_name) && is(default_schema, catalog.schema);
 }
 
 //! The text names a table of the policy store: `<schema>.<table>` with a policy table, any quoting, any
 //! spacing - the fallback where a body cannot be bound, and the check of an expression (a mask, an RLS)
+bool TextNamesPolicyStore(const CatalogBackend &catalog, const string &text, const string &qualifier);
+
 bool TextNamesPolicyStore(const CatalogBackend &catalog, const string &text) {
+	// `<schema>.<table>`, and `<db>.<table>` where the policy lives in the database's main schema
+	return TextNamesPolicyStore(catalog, text, catalog.schema) ||
+	       (StringUtil::CIEquals(catalog.schema, "main") && TextNamesPolicyStore(catalog, text, catalog.db_name));
+}
+
+bool TextNamesPolicyStore(const CatalogBackend &catalog, const string &text, const string &qualifier) {
 	auto folded = StringUtil::Lower(text);
-	auto schema = StringUtil::Lower(catalog.schema);
+	auto schema = StringUtil::Lower(qualifier);
 	for (idx_t at = folded.find(schema); at != string::npos; at = folded.find(schema, at + 1)) {
 		if (at > 0 && (IsWordChar(folded[at - 1]))) {
 			continue;
@@ -873,6 +915,19 @@ void RequireNotPolicyStore(CatalogBackend &catalog, const char *what, const stri
 	}
 }
 
+//! An RLS predicate and a column list (masks, computed columns) of a definition or a grant
+void RequirePolicyFreeExpressions(CatalogBackend &catalog, const char *what, const string &rls,
+                                  const vector<std::pair<string, string>> &columns) {
+	if (!rls.empty()) {
+		RequireNotPolicyStore(catalog, what, string(), false, rls, true);
+	}
+	for (auto &column : columns) {
+		if (!column.second.empty()) {
+			RequireNotPolicyStore(catalog, what, string(), false, column.second, true);
+		}
+	}
+}
+
 } // namespace
 
 void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form_p, const string &phys,
@@ -882,14 +937,7 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
 	RequireCatalog(catalog, "acl_add_relation");
 	RequireNotReserved(vname);
 	RequireNotPolicyStore(*catalog, "the relation", phys, false, view_sql);
-	if (!rls.empty() && TextNamesPolicyStore(*catalog, rls)) {
-		RefusePolicyStore("the relation's RLS");
-	}
-	for (auto &column : columns_p) {
-		if (TextNamesPolicyStore(*catalog, column.second)) {
-			RefusePolicyStore("the relation's column list");
-		}
-	}
+	RequirePolicyFreeExpressions(*catalog, "the relation's RLS or column list", rls, columns_p);
 	auto columns = columns_p;
 	auto form = form_p;
 	if (CompileDeclaredPaths(*catalog, phys, vname, columns)) {
@@ -2142,6 +2190,7 @@ void ValidateGrantColumns(CatalogBackend &catalog, const string &vcat, const str
 void PolicyStore::CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
                                const string &rls, const string &columns, bool judge_columns) {
 	RequireCatalog(catalog, "acl_grant_catalog");
+	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls, acl_detail::ParseColumnList(columns));
 	if (vcat.empty()) {
 		throw BinderException("acl admin: a grant needs a catalog name");
 	}
@@ -2870,14 +2919,9 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
 		RequireNotPolicyStore(*catalog, "the relation", value, false);
 	} else if (field == "view") {
 		RequireNotPolicyStore(*catalog, "the view", string(), false, value);
-	} else if (field == "rls" && TextNamesPolicyStore(*catalog, value)) {
-		RefusePolicyStore("the relation's RLS");
 	}
-	for (auto &column : columns) {
-		if (TextNamesPolicyStore(*catalog, column.second)) {
-			RefusePolicyStore("the relation's column list");
-		}
-	}
+	RequirePolicyFreeExpressions(*catalog, "the relation's RLS or column list", field == "rls" ? value : string(),
+	                             columns);
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto current = read("SELECT \"form\", \"phys\", \"view_sql\", \"rls\" FROM " + catalog->Tbl("relations") +
 		                    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
@@ -3111,6 +3155,10 @@ void PolicyStore::CatalogRevokeAdmin(const string &role, const string &scope) {
 		auto held = catalog->Query("SELECT \"scope\" FROM " + catalog->Tbl("admins") +
 		                           " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = ''");
 		ResultRows held_rows(*held);
+		bool holds_it = false;
+		for (idx_t row = 0; row < held_rows.Count(); row++) {
+			holds_it = holds_it || StringUtil::CIEquals(held_rows.GetValue(0, row).ToString(), scope);
+		}
 		for (idx_t row = 0; row < held_rows.Count(); row++) {
 			auto holds = StringUtil::Lower(held_rows.GetValue(0, row).ToString());
 			bool implies = (holds == "manage" && (scope == "policy" || scope == "observe")) ||
@@ -3120,6 +3168,9 @@ void PolicyStore::CatalogRevokeAdmin(const string &role, const string &scope) {
 				                      "should stay)",
 				                      role, holds, scope, holds);
 			}
+		}
+		if (!holds_it) {
+			throw BinderException("acl admin: role \"%s\" does not hold %s - nothing to revoke", role, scope);
 		}
 		catalog->Write({"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role) +
 		                " AND \"scope\" = " + Lit(scope) + " AND \"vcat\" = ''"});
@@ -3270,6 +3321,7 @@ void PolicyStore::CatalogEditIdentity(const std::function<void(IdentityModel &)>
 void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,
                                        const string &caps_json, const string &rls, const string &columns) {
 	RequireCatalog(catalog, "acl catalog");
+	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls, acl_detail::ParseColumnList(columns));
 	ValidateGrantColumns(*catalog, vcat, columns, vname);
 	// spec 032: a capability that cannot apply to what it names is a misunderstanding, not a no-op, and
 	// the refusal belongs here rather than in the pre-check - the legacy wrappers write a grant without

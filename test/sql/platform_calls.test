@@ -368,7 +368,7 @@ ACL ROLE "pol" SELECT platform.create_role('x') UNION ALL SELECT true;
 statement error
 ACL ROLE "pol" INSERT INTO platform.roles VALUES ('x', NULL);
 ----
-<REGEX>:.*
+<REGEX>:.*no access to object "platform.roles".*
 
 statement error
 ACL ROLE "pol" SELECT platform.create_role('x'); SELECT 1;
@@ -404,7 +404,7 @@ ACL ROLE "pol" SELECT platform.check_catalog('sales');
 statement error
 ACL ROLE "pol" SELECT platform.nothing_here();
 ----
-<REGEX>:.*
+<REGEX>:.*the platform catalog has no function "nothing_here".*
 
 # --- the grammar and the call: the same result, the same refusal ----------------------------------------
 
@@ -472,6 +472,42 @@ ACL ROLE "pol" SELECT platform.grant_admin('pol', 'passthrough');
 
 statement error
 ACL ROLE "pol" SELECT platform.cluster_setting('set', '', 'threads', '2');
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+# every cluster operation is passthrough's (until spec 118's cluster bundle) - the call and the grammar
+statement error
+ACL ROLE "pol" SELECT platform.cluster_attach('', 'src', ':memory:', 'duckdb', '', '{}', '', '');
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "pol" CLUSTER ATTACH ':memory:' AS src;
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "pol" SELECT platform.cluster_detach('', 'src', 'false', 'false');
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "pol" CLUSTER DETACH src;
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "pol" SELECT platform.cluster_extension('install', '', 'spatial', '', 'core', '');
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "pol" CLUSTER INSTALL EXTENSION spatial;
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "cat" SELECT platform.cluster_setting('set', '', 'threads', '2');
 ----
 <REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
 

@@ -343,8 +343,15 @@ combined with a certificate. Both doors require cert **and** key together.
   one view or function (`platform_grants`, its own table - never a catalog grant, a function grant or a
   category, which could spread it into every listing or hand it to every role). **Only `passthrough`
   grants on `platform` and grants the bundles** - a grantor that can grant everything is everything;
-  never to every role, never the passthrough scope's own functions (`grant_admin`, `revoke_admin`,
-  `grant_platform`, `revoke_platform`, `cluster_*`). A deny wins over every bundle but `passthrough`.
+  never to every role, never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting`, `session_profile` - the passthrough scope's own - and `console_info` (every holder's). A deny wins over every bundle but `passthrough`.
+- **A stored body holds only what its author may call** (the review of spec 117): a view, a macro
+  template, an alias target, an RLS, a column or mask expression, a grant's policy runs as the node when
+  read, so an author who is not `passthrough` may store only calls its own function gate admits (its
+  roles' categories and grants by name; the never set always refused) - judged where it is written.
+  `acl_check_catalog` names a body stored before (`body_function_denied`). No definition names the
+  policy catalog's own tables, under any reading of the name. A change to an issuer or a client behind
+  a mapping to an administering role, a mapping to such a role, and a catalog's `manage` for a role a
+  mapping reaches are `passthrough`'s.
 - **One authorizer.** The grammar and a direct `platform.<op>(…)` compile to the same `acl_*` call and
   are judged by the same table of rights per operation (CATALOG / POLICY / HANDS_OUT / ESCALATES /
   INFRASTRUCTURE), before anything runs; an operation the table does not know is refused.

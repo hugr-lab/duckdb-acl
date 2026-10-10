@@ -1535,7 +1535,8 @@ void CatalogBackend::PlatformGrants(const Principal &principal, vector<std::pair
 		auto allowed = rows.GetValue(2, row);
 		out.emplace_back(StringUtil::Lower(rows.GetValue(0, row).ToString()) + ":" +
 		                     StringUtil::Lower(rows.GetValue(1, row).ToString()),
-		                 allowed.IsNull() || BooleanValue::Get(allowed.DefaultCastAs(LogicalType::BOOLEAN)));
+		                 // a NULL is no grant (fail closed) - the column is NOT NULL, a driver-made row may not be
+		                 !allowed.IsNull() && BooleanValue::Get(allowed.DefaultCastAs(LogicalType::BOOLEAN)));
 	}
 }
 
@@ -1739,7 +1740,10 @@ string CatalogBackend::Migrate() {
 				                      at, at + 1);
 			}
 			for (int i = 0; i < step.count; i++) {
-				auto result = con.Query(ResolveSchemaNames(step.statements[i]));
+				// a key column takes the type this catalog's kind indexes (spec 033), as the schema's own do
+				auto statement =
+				    StringUtil::Replace(ResolveSchemaNames(step.statements[i]), "ACL_KEY_TEXT", KeyColumnType());
+				auto result = con.Query(statement);
 				if (result->HasError()) {
 					throw BinderException("acl_migrate_catalog: step v%d failed: %s", step.version, result->GetError());
 				}

@@ -134,7 +134,9 @@ void PlatformCallParameters() {
 	          authz->GetError().find("carries authorization and must be a constant") != std::string::npos,
 	      "a parameter for the role is refused: " + (authz->HasError() ? authz->GetError() : "it prepared"));
 	auto catalog = con.Prepare("ACL ROLE \"pol\" SELECT platform.alter_catalog($1, 'x')");
-	Check(catalog->HasError(), "...and for the catalog");
+	Check(catalog->HasError() &&
+	          catalog->GetError().find("carries authorization and must be a constant") != std::string::npos,
+	      "...and for the catalog: " + (catalog->HasError() ? catalog->GetError() : "it prepared"));
 
 	auto payload = con.Prepare("ACL ROLE \"pol\" SELECT platform.alter_catalog('sales', comment := ?)");
 	if (!CheckOk(*payload, "a parameter for the comment prepares")) {
@@ -152,6 +154,15 @@ void PlatformCallParameters() {
 	Check(!stored->HasError() && stored->Collection().GetValue(0, 0).ToString() == "the second",
 	      "each execution is its own change");
 
+	// the call keeps the column alias it was written with; the grammar answers under the call's name
+	auto aliased = con.Query("ACL ROLE \"pol\" SELECT platform.create_role('aliased_role') AS made");
+	Check(!aliased->HasError() && aliased->ColumnName(0).GetIdentifierName() == "made",
+	      "a call keeps its alias: " +
+	          (aliased->HasError() ? aliased->GetError() : aliased->ColumnName(0).GetIdentifierName()));
+	auto named = con.Query("ACL ROLE \"pol\" CREATE ROLE named_role");
+	Check(!named->HasError() && named->ColumnName(0).GetIdentifierName() == "create_role",
+	      "the grammar answers as the call is named: " +
+	          (named->HasError() ? named->GetError() : named->ColumnName(0).GetIdentifierName()));
 	// the grammar's compiled call prepares the same way (and carries no parameter of its own)
 	auto grammar = con.Prepare("ACL ROLE \"pol\" CREATE ROLE prepared_role");
 	if (CheckOk(*grammar, "a management statement prepares")) {

@@ -136,7 +136,7 @@ echo "$got" | grep -q "requires a passthrough scope" || fail "the policy bundle 
 got="$(ask "GRANT ADMIN passthrough TO ROLE boss")"
 echo "$got" | grep -q "requires a passthrough scope" || fail "the policy bundle escalated: $got"
 got="$(ask "SELECT * FROM platform.sessions")"
-echo "$got" | grep -q 'platform.sessions' || fail "the policy bundle read a node view: $got"
+echo "$got" | grep -q 'no access to object' || fail "the policy bundle read a node view: $got"
 got="$(ask "SELECT platform.create_role(r) FROM (VALUES ('per_row')) t(r)")"
 echo "$got" | grep -q "call it at the top level" || fail "a per-row call was not refused: $got"
 

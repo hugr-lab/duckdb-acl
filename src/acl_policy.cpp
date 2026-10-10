@@ -1305,7 +1305,10 @@ void PolicyStore::RevokeAdmin(const string &role, const string &scope) {
 		return;
 	}
 	auto entry = admin_scopes.find(role);
-	if (entry != admin_scopes.end()) {
+	if (entry == admin_scopes.end()) {
+		throw BinderException("acl admin: role \"%s\" does not hold %s - nothing to revoke", role, scope);
+	}
+	{
 		auto name = string(AdminScopeName(ParseAdminScope(scope)));
 		for (auto &holds : entry->second) {
 			bool implies = (holds == "manage" && (name == "policy" || name == "observe")) ||
@@ -1315,6 +1318,9 @@ void PolicyStore::RevokeAdmin(const string &role, const string &scope) {
 				                      "should stay)",
 				                      role, holds, name, holds);
 			}
+		}
+		if (!entry->second.count(name)) {
+			throw BinderException("acl admin: role \"%s\" does not hold %s - nothing to revoke", role, name);
 		}
 		entry->second.erase(name);
 		if (entry->second.empty()) {

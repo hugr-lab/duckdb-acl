@@ -1,0 +1,416 @@
+# name: test/sql/platform_review.test
+# description: the review of spec 117 - negative tests for the paths a non-passthrough administrator had
+#   to the node's own rights. D1: a stored body (view, macro template, alias target, RLS, column / mask
+#   expression, a grant's policy) is judged by its AUTHOR's function gate where it is written - the never
+#   set always refused - and acl_check_catalog names a body stored before (body_function_denied). D2: a
+#   change to an issuer / client behind a mapping to an administering role is passthrough's. D3: the
+#   policy store is recognized under every reading of a name (a policy in `<db>.main`). D4: the reserved
+#   name with whitespace. And: a point grant on check_catalog reaches the grammar too; the grammar and the
+#   call are audited alike; the call keeps a column alias and the grammar answers under the same name;
+#   a revoke of a bundle not held; a mapped role made to administer; `expr AS name` in a column list; a
+#   batch of prefixes.
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme'), (2, 'globex');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE cadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE cadm CAPS '{"select": true, "insert": true, "manage": true}' MAIN;
+
+statement ok
+ACL ADMIN CREATE ROLE reader;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE reader MAIN;
+
+# --- D1: a stored body holds only what its author's own function gate admits ------------------------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL SCALAR sales.esc(x VARCHAR) RETURNS BOOLEAN AS acl_grant_admin('cadm', 'passthrough');
+----
+<REGEX>:.*the definition calls function "acl_grant_admin", which its author may not call.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW sales.ev AS SELECT acl_grant_admin('cadm', 'manage') AS x;
+----
+<REGEX>:.*the definition calls function "acl_grant_admin", which its author may not call.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE sales.r AS phys.main.orders RLS (acl_grant_admin('nobody', 'passthrough'));
+----
+<REGEX>:.*the definition calls function "acl_grant_admin".*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE sales.m AS phys.main.orders COLUMNS (id, tenant = acl_grant_admin('cadm', 'observe')::VARCHAR);
+----
+<REGEX>:.*the definition calls function "acl_grant_admin".*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE FUNCTION sales.q() AS SELECT * FROM query('SELECT * FROM store.' || 'acl.adm' || 'ins');
+----
+<REGEX>:.*the definition calls table function "query", which its author may not call.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW sales.hosts AS SELECT * FROM read_text('/etc/hosts');
+----
+<REGEX>:.*the definition calls table function "read_text", which its author may not call.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW sales.tabs AS SELECT * FROM duckdb_tables();
+----
+<REGEX>:.*the definition calls table function "duckdb_tables", which its author may not call.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW sales.iss AS SELECT * FROM acl_issuers();
+----
+<REGEX>:.*the definition calls table function "acl_issuers", which its author may not call.*
+
+# an alias target is a call too
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL SCALAR sales.g(r VARCHAR, s VARCHAR) ALIAS OF acl_grant_admin;
+----
+<REGEX>:.*the definition calls function "acl_grant_admin".*
+
+# inside a subquery, a CTE, a lambda: still the author's gate
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW sales.deep AS WITH t AS (SELECT (SELECT acl_session_count()) AS n) SELECT n FROM t;
+----
+<REGEX>:.*the definition calls function "acl_session_count".*
+
+statement error
+ACL ROLE "pol" GRANT CATALOG sales TO ROLE reader RLS (getvariable('x') IS NULL);
+----
+<REGEX>:.*the definition calls function "getvariable".*
+
+# the platform call is judged the same way, and a body is a constant (never a parameter)
+statement error
+ACL ROLE "pol" SELECT platform.add_view('sales', 'ev', 'SELECT acl_grant_admin(''pol'', ''passthrough'') AS x');
+----
+<REGEX>:.*the definition calls function "acl_grant_admin".*
+
+query I
+SELECT count(*) FROM store.acl.admins WHERE "role" IN ('cadm', 'nobody', 'pol') AND "scope" IN ('passthrough', 'manage', 'observe');
+----
+0
+
+# what the author's gate admits works as before - markers included
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL VIEW sales.ok_view AS SELECT upper(tenant) AS t, acl_claim('tenant') AS c FROM phys.main.orders;
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL SCALAR sales.twice(x INTEGER) RETURNS INTEGER AS acl_arg(1) * 2;
+
+query I
+ACL ROLE "reader" SELECT count(*) FROM ok_view;
+----
+2
+
+query I
+ACL ROLE "reader" SELECT twice(21);
+----
+42
+
+statement error
+ACL ROLE "cadm" ALTER VIRTUAL VIEW sales.ok_view SET AS 'SELECT acl_drain() AS n';
+----
+<REGEX>:.*the definition calls function "acl_drain".*
+
+# a grant by name in the author's gate admits it in a body
+statement ok
+ACL ADMIN GRANT FUNCTION read_text TABLE TO ROLE cadm;
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL VIEW sales.hosts AS SELECT * FROM read_text('/etc/hosts');
+
+# the operator and passthrough store what they write (the trusted side, as before)
+statement ok
+ACL ROLE "root" CREATE VIRTUAL VIEW sales.trusted AS SELECT acl_session_count() AS n;
+
+# a body stored before the gate judged it: named by the check
+query TTT
+SELECT kind, object, problem FROM acl_check_catalog('sales') WHERE problem = 'body_function_denied';
+----
+view	trusted	body_function_denied
+
+# --- D2: a trust anchor behind a privileged mapping is repointed by passthrough only ------------------------
+
+statement ok
+ACL ADMIN CREATE ISSUER kc URL 'test/idp/two';
+
+statement ok
+ACL ADMIN CREATE CLIENT catchall ISSUER kc AUDIENCES ('api://acl-test') ROLES FROM ('groups');
+
+statement ok
+ACL ADMIN MAP GROUP 'g-root' FROM CLIENT catchall TO ROLE root;
+
+statement error
+ACL ROLE "pol" ALTER ISSUER kc SET URL 'test/idp/a';
+----
+<REGEX>:.*issuer "kc" carries a mapping to "root", which holds administration.*
+
+statement error
+ACL ROLE "pol" SELECT platform.alter_issuer('kc', '{"url": "test/idp/a"}');
+----
+<REGEX>:.*issuer "kc" carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" ALTER CLIENT catchall SET AUDIENCES ('api://other');
+----
+<REGEX>:.*client "catchall" carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" SELECT platform.alter_client('catchall', '{"audiences": ["api://other"]}');
+----
+<REGEX>:.*client "catchall" carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" CREATE CLIENT sneaky ISSUER kc AUDIENCES ('api://acl-test') AZP ('x') ROLES FROM ('groups');
+----
+<REGEX>:.*carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" SELECT platform.define_client('sneaky', 'kc', '{"audiences": ["api://acl-test"]}');
+----
+<REGEX>:.*carries a mapping to "root".*
+
+# without a privileged mapping behind it, policy changes it
+statement ok
+ACL ADMIN CREATE ISSUER plain URL 'test/idp/b';
+
+statement ok
+ACL ADMIN CREATE CLIENT pc ISSUER plain AUDIENCES ('api://acl-test') ROLES FROM ('groups');
+
+statement ok
+ACL ADMIN MAP GROUP 'g-read' FROM CLIENT pc TO ROLE reader;
+
+statement ok
+ACL ROLE "pol" ALTER ISSUER plain SET URL 'test/idp/c';
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_client('pc', '{"audiences": ["api://other"]}');
+
+statement ok
+ACL ROLE "pol" CREATE CLIENT pc2 ISSUER plain AUDIENCES ('api://x') AZP ('x') ROLES FROM ('groups');
+
+# and passthrough repoints it
+statement ok
+ACL ROLE "root" ALTER ISSUER kc SET URL 'test/idp/two';
+
+# a mapped role is not made to administer by a policy holder (the order map-then-grant)
+statement error
+ACL ROLE "pol" GRANT CATALOG sales TO ROLE reader CAPS '{"select": true, "manage": true}';
+----
+<REGEX>:.*"reader" is reached by a role mapping, so granting it a catalog's manage.*
+
+statement error
+ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET CAPS '{"manage": true}';
+----
+<REGEX>:.*"reader" is reached by a role mapping.*
+
+# --- D3: the policy store under every reading of its name ---------------------------------------------------
+
+statement ok
+ATTACH ':memory:' AS mstore;
+
+statement ok
+SELECT acl_use_db('mstore', 'main', true);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE sales.a AS mstore.admins;
+----
+<REGEX>:.*the relation reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE sales.a AS mstore.main.admins;
+----
+<REGEX>:.*the relation reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL VIEW sales.v AS SELECT * FROM mstore.platform_grants;
+----
+<REGEX>:.*reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL SCHEMA sales.raw AS mstore.main;
+----
+<REGEX>:.*the schema alias reads the policy store itself.*
+
+query I
+SELECT count(*) FROM mstore.main.relations;
+----
+0
+
+statement ok
+SELECT acl_use_db('store', 'acl', false);
+
+# --- D4: the reserved name with whitespace ------------------------------------------------------------------
+
+statement error
+ACL ADMIN CREATE VIRTUAL CATALOG "platform ";
+----
+<REGEX>:.*reserved system catalog of administration.*
+
+statement error
+ACL ADMIN CREATE VIRTUAL CATALOG " Platform";
+----
+<REGEX>:.*reserved system catalog of administration.*
+
+# --- a point grant on check_catalog: the call and the grammar alike ----------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE checker;
+
+statement ok
+ACL ADMIN GRANT FUNCTION platform.check_catalog TO ROLE checker;
+
+query I
+ACL ROLE "checker" SELECT count(*) >= 0 FROM platform.check_catalog('sales');
+----
+true
+
+statement ok
+ACL ROLE "checker" CHECK VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN DENY FUNCTION platform.check_catalog TO ROLE checker;
+
+statement error
+ACL ROLE "checker" CHECK VIRTUAL CATALOG sales;
+----
+<REGEX>:.*the principal has no ACL administration scope.*
+
+# (the result column - the call keeps its alias, the grammar answers as the call is named: in
+# test/cpp/test_acl_params_passthrough.cpp, which reads the names)
+
+# --- revokes and the column list ---------------------------------------------------------------------------
+
+statement error
+ACL ADMIN REVOKE ADMIN observe FROM ROLE pol;
+----
+<REGEX>:.*role "pol" does not hold observe - nothing to revoke.*
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.renamed AS phys.main.orders COLUMNS (id, tenant AS t2);
+
+query TT
+SELECT name, expr FROM store.acl.relation_columns WHERE vname = 'renamed' ORDER BY pos;
+----
+id	(empty)
+t2	tenant
+
+query I
+ACL ROLE "reader" SELECT count(t2) FROM renamed;
+----
+2
+
+query TT
+ACL ROLE "root" SELECT name, expr FROM platform.relation_columns WHERE relation = 'renamed' ORDER BY pos;
+----
+id	(empty)
+t2	tenant
+
+# --- a batch of prefixes: its own message ------------------------------------------------------------------
+
+statement error
+ACL ADMIN CREATE ROLE b1; ACL ADMIN CREATE ROLE b2;
+----
+<REGEX>:.*one ACL prefix per batch.*
+
+statement error
+ACL ROLE "pol" CREATE ROLE b1; ACL ROLE "pol" CREATE ROLE b2;
+----
+<REGEX>:.*one ACL prefix per batch.*
+
+# --- the grammar and the call, audited alike ----------------------------------------------------------------
+
+statement ok
+SET GLOBAL acl_audit_level='decisions';
+
+statement ok
+SELECT acl_audit_flush();
+
+statement ok
+SET VARIABLE seq0 = (SELECT coalesce(max(seq), 0) FROM acl_audit_events());
+
+statement error
+ACL ROLE "reader" CREATE ROLE no_scope;
+----
+<REGEX>:.*no ACL administration scope.*
+
+statement error
+ACL ROLE "reader" SELECT platform.create_role('no_scope');
+----
+<REGEX>:.*no ACL administration scope.*
+
+statement error
+ACL ROLE "pol" SELECT platform.create_role('x', nope := 'y');
+----
+<REGEX>:.*takes no argument "nope".*
+
+statement ok
+ACL ROLE "pol" SELECT * FROM platform.check_catalog('sales');
+
+statement ok
+ACL ROLE "pol" CHECK VIRTUAL CATALOG sales;
+
+statement ok
+SELECT acl_audit_flush();
+
+query IIIII
+SELECT kind, statement, verdict, reason_code, roles FROM acl_audit_events() WHERE seq > getvariable('seq0') AND kind IN ('statement', 'admin') ORDER BY seq;
+----
+admin	manage	denied	mgmt_unauthorized	[reader]
+admin	manage	denied	mgmt_unauthorized	[reader]
+admin	manage	denied	mgmt_unauthorized	[pol]
+admin	manage	allowed	NULL	[pol]
+admin	manage	allowed	NULL	[pol]

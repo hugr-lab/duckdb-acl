@@ -16,6 +16,9 @@
 #pragma once
 
 #include "acl_policy.hpp"
+#include "acl_function_categories.hpp"
+
+#include <functional>
 
 namespace duckdb {
 class SQLStatement;
@@ -118,6 +121,22 @@ void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights 
 //! own - so mapping to a privileged role is the passthrough scope's alone, as granting the bundle is
 void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,
                           PolicyStore &store);
+
+//! The shape a stored definition body is written in
+enum class BodyShape : uint8_t { SELECT, EXPRESSION, COLUMNS, FUNCTION_NAME };
+//! Every function a stored body calls, as written (a table function's kind TABLE) - the markers acl_claim /
+//! acl_arg left out. Throws when the body does not parse (a body nobody can judge is refused).
+void WalkBodyCalls(const string &text, BodyShape shape,
+                   const std::function<void(const QualifiedName &name, FunctionKind kind)> &callback);
+//! spec 117 review D1: the bodies a compiled management call stores (a view, a macro template, an alias
+//! target, an RLS, a column / mask expression, a remap) run as the node when read - so a principal who is
+//! not passthrough may store only what its OWN function gate admits (spec 072: its roles' categories and
+//! grants by name, a deny wins, the never set always refused). The anonymous gateway and the operator's
+//! connection stay trusted.
+void AuthorizeBodies(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,
+                     PolicyStore &store, const Principal &author);
+//! spec 117 review D2: a change to an issuer or a client that carries a mapping to a role holding
+//! administration repoints the trust anchor behind it - passthrough's alone. Inside AuthorizeRoleTargets.
 
 //! A top-level `SELECT platform.f(<args>)` (one item, no FROM / WHERE / CTE / modifiers) or
 //! `CALL platform.f(<args>)` of a management function, compiled to the acl_* call it is (named

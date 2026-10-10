@@ -14,7 +14,7 @@ DROP TABLE acl."admins";
 CREATE TABLE acl."admins"("role" VARCHAR, "scope" VARCHAR, "vcat" VARCHAR, PRIMARY KEY ("role", "scope", "vcat"));
 INSERT INTO acl."admins" SELECT DISTINCT "role", "scope", "vcat" FROM acl."admins_previous";
 DROP TABLE acl."admins_previous";
-CREATE TABLE IF NOT EXISTS acl."platform_grants"("role" VARCHAR, "object" VARCHAR, "kind" VARCHAR, "allowed" BOOLEAN, PRIMARY KEY ("role", "object", "kind"));
+CREATE TABLE IF NOT EXISTS acl."platform_grants"("role" VARCHAR, "object" VARCHAR, "kind" VARCHAR, "allowed" BOOLEAN NOT NULL DEFAULT true, PRIMARY KEY ("role", "object", "kind"));
 DELETE FROM acl."meta" WHERE "key" = 'min_reader_version';
 INSERT INTO acl."meta" VALUES ('min_reader_version', '21');
 UPDATE acl."meta" SET "value" = '21' WHERE "key" = 'schema_version';
