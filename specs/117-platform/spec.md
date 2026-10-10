@@ -280,6 +280,9 @@ before it does not know the bundles).
 
 ## Follow-ups
 
-- 118: `operate` / `cluster` bundles, node and cluster operations, `platform.attached.*`, `exposures`.
-- 119: metadata limits, timeouts, batching, pushdown + benchmark.
-- 120: `view_as`, `effective_rights`, `ddl` / `export_script`, missing ALTER / REVOKE.
+- 118: `operate` / `cluster` bundles, node operations as grammar, drift, `platform.attached.*` +
+  `GRANT SOURCE`; `ACL NATIVE` stays the unrestricted break-glass (owner, 2026-10-10).
+- 119: the metadata row limit (one GLOBAL, a session may lower it), batching, pushdown + benchmark; a
+  timeout only if the benchmark asks.
+- 120: `view_as` as a session mode, `effective_rights`, `exposures`, `ddl` / `export_script`, missing
+  ALTER / REVOKE.
