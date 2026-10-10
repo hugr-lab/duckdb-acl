@@ -35,7 +35,8 @@ enum class PlatformViewClass : uint8_t {
 	NODE,    //! the node's state - the observe bundle
 	POLICY,  //! the policy - the policy bundle, all rows
 	CATALOG, //! the policy - the policy bundle (all rows), or a catalog admin (its catalogs' rows)
-	ROLES    //! role names - the policy bundle (every role), or a catalog admin (the roles holding its catalogs)
+	ROLES,   //! role names - the policy bundle (every role), or a catalog admin (the roles holding its catalogs)
+	CLUSTER  //! the cluster profile - passthrough alone until spec 118's `cluster` bundle
 };
 
 //! The right a management operation requires (what spec 009's provenance table said, as a class)
@@ -45,6 +46,7 @@ enum class PlatformRight : uint8_t {
 	HANDS_OUT,      //! the policy bundle: handing out access is privilege administration
 	ESCALATES,      //! passthrough only: the admin scopes and the grants on `platform`
 	INFRASTRUCTURE, //! passthrough only: the cluster profile (spec 093) - until spec 118's `cluster`
+	OPERATE,        //! passthrough only: a node / session operation (a session's profile) - until spec 118's `operate`
 	OPEN            //! every principal holding anything on `platform` (console_info)
 };
 
@@ -111,6 +113,11 @@ struct PlatformAccess {
 //! it does not know is refused, never waved through.
 void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights);
 void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights &rights);
+//! What the static table cannot see (spec 117 review): a role mapping whose target role administers hands
+//! that administration to whoever holds the claim - spec 095 admits it because the mapping is the client's
+//! own - so mapping to a privileged role is the passthrough scope's alone, as granting the bundle is
+void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,
+                          PolicyStore &store);
 
 //! A top-level `SELECT platform.f(<args>)` (one item, no FROM / WHERE / CTE / modifiers) or
 //! `CALL platform.f(<args>)` of a management function, compiled to the acl_* call it is (named

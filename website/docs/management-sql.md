@@ -925,8 +925,8 @@ policy's rule and the node's `acl_profile_level` decide again. `CURRENT` is the 
 statement runs under (an `ACL SESSION` prefix - a client connected through a door); off a session
 it is a refusal. Another session is named by its ops id from `acl_sessions()`, which also shows the
 level in force and who decided it (`profile_level`, `profile_source` = `instance` / `policy` /
-`override`). A session is the node's, not a catalog's: the statement needs an unrestricted `manage`
-scope. An operator's own connection (no session) uses `SET SESSION acl_profile_level = ...`
+`override`). A session is the node's, not a catalog's: the statement needs a `passthrough` scope
+(spec 117 - the policy bundle administers the ACL, not the node; spec 118's `operate` bundle takes it). An operator's own connection (no session) uses `SET SESSION acl_profile_level = ...`
 instead, which outranks the node's `SET GLOBAL` on that connection alone.
 
 ```sql
@@ -1136,7 +1136,7 @@ takes those of its expanded records too.
   | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
   | anonymous `ACL ADMIN` (where allowed)                               | everything, native SQL included                                                                                                                                 |
   | `passthrough` (`GRANT ADMIN passthrough`)                           | everything, native SQL included                                                                                                                                 |
-  | `policy` (`GRANT ADMIN policy`; spec 009's global `manage` = `policy` + `observe`) | every management statement except `GRANT ADMIN` / `REVOKE ADMIN`, the grants on `platform` and `CLUSTER …`; no `ACL NATIVE`                    |
+  | `policy` (`GRANT ADMIN policy`; spec 009's global `manage` = `policy` + `observe`) | every management statement except `GRANT ADMIN` / `REVOKE ADMIN`, the grants on `platform`, `CLUSTER …` and `PROFILE SESSION` (the node's, spec 118); no `ACL NATIVE`                    |
   | `observe` (`GRANT ADMIN observe`)                                   | no management statement and no `ACL NATIVE` - it reads the node views, the load report and `/metrics` (spec 097)                                               |
   | a point grant on `platform.<f>` (`GRANT FUNCTION platform.f`)      | that one operation (the grammar form and the call alike), for any catalog                                                                                      |
   | catalog-scoped `manage` (`GRANT CATALOG c … CAPS '{"manage": true}'`) | statements whose target names one of its catalogs; **not** `GRANT`/`REVOKE CATALOG`, `GRANT`/`REVOKE SCHEMA`, `GRANT TABLE`/`VIEW`/`OBJECT`, `ALTER GRANT`, `DROP VIRTUAL CATALOG` (handing out or taking away access is privilege administration), and not the statements that belong to no catalog (roles, issuers, mappings, `CREATE VIRTUAL CATALOG`) |

@@ -366,6 +366,99 @@ ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiO
 ----
 <REGEX>:.*no recognized roles.*
 
+# --- the review of spec 117: no definition reaches the policy store; no policy holder maps to an admin ------
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE pol WITH (select, insert, manage) MAIN;
+
+# a virtual table over the store's own admins would let its writer insert itself a passthrough row
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE sales.a AS store.acl.admins;
+----
+<REGEX>:.*the relation reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE sales.a AS store.acl."Admins";
+----
+<REGEX>:.*reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL VIEW sales.v AS SELECT * FROM query_table('store' || '.acl.issuers');
+----
+<REGEX>:.*the relation reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL VIEW sales.v AS SELECT * FROM store.acl.role_catalogs;
+----
+<REGEX>:.*reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL SCHEMA sales.raw AS store.acl;
+----
+<REGEX>:.*the schema alias reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE sales.leak AS phys.main.orders COLUMNS (id, tenant = (SELECT max(secret) FROM store.acl.issuers));
+----
+<REGEX>:.*the relation's column list reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE sales.leak AS phys.main.orders RLS (EXISTS (SELECT 1 FROM store.acl.admins));
+----
+<REGEX>:.*the relation's RLS reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" ALTER VIRTUAL TABLE sales.orders SET PHYS store.acl.admins;
+----
+<REGEX>:.*reads the policy store itself.*
+
+statement error
+ACL ROLE "pol" CREATE VIRTUAL TABLE FUNCTION sales.f() AS SELECT * FROM store.acl.admins;
+----
+<REGEX>:.*the function's template reads the policy store itself.*
+
+# a catalog admin is refused the same way
+statement ok
+ACL ADMIN CREATE ROLE pointy;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE pointy CAPS '{"select": true, "insert": true, "manage": true}';
+
+statement error
+ACL ROLE "pointy" CREATE VIRTUAL TABLE sales.adm2 AS store.acl.admins;
+----
+<REGEX>:.*reads the policy store itself.*
+
+query I
+SELECT count(*) FROM store.acl.relations WHERE phys LIKE 'store.acl.%';
+----
+0
+
+# mapping a claim to a role that administers hands the administration out: passthrough's alone
+statement error
+ACL ROLE "pol" MAP CLAIM 'x' FROM CLIENT catchall TO ROLE root;
+----
+<REGEX>:.*"root" holds administration, so mapping a claim to it hands that administration out.*
+
+statement error
+ACL ROLE "pol" SELECT platform.map_role('client', 'catchall', 'claim-value', 'x', 'support');
+----
+<REGEX>:.*"support" holds administration.*
+
+statement ok
+ACL ROLE "root" MAP CLAIM 'x' FROM CLIENT catchall TO ROLE support;
+
+# a bundle another row carries is not revoked alone - it would answer true and change nothing
+statement error
+ACL ADMIN REVOKE ADMIN policy FROM ROLE legacy;
+----
+<REGEX>:.*role "legacy" holds manage, which carries policy - revoke manage.*
+
+statement error
+ACL ADMIN REVOKE ADMIN observe FROM ROLE root;
+----
+<REGEX>:.*role "root" holds passthrough, which carries observe.*
+
 # --- the old admins rows read as bundles after v21 ---------------------------------------------------------
 
 # a v20 catalog: admins keyed by the role alone, no platform_grants - spec 009's rows

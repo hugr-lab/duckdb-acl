@@ -262,11 +262,38 @@ ACL ROLE "root" SELECT count(*) FROM information_schema.tables WHERE table_catal
 ----
 36
 
-# policy: the policy views, all rows - never the node's
+# policy: the policy views, all rows - never the node's, nor (until spec 118's cluster bundle) the
+# cluster profile's
 query I
 ACL ROLE "pol" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform';
 ----
-30
+28
+
+statement error
+ACL ROLE "pol" SELECT * FROM platform.cluster_items;
+----
+<REGEX>:.*no access to object "platform.cluster_items".*
+
+statement error
+ACL ROLE "pol" SELECT * FROM platform.cluster_effective;
+----
+<REGEX>:.*no access to object "platform.cluster_effective".*
+
+# nor a session's profile (spec 118's operate bundle)
+statement error
+ACL ROLE "pol" PROFILE SESSION 'any' ON;
+----
+<REGEX>:.*a session's profile is the node's operation and requires a passthrough scope.*
+
+statement error
+ACL ROLE "pol" SELECT platform.session_profile('any', 'all');
+----
+<REGEX>:.*a session's profile is the node's operation and requires a passthrough scope.*
+
+statement error
+ACL ADMIN GRANT FUNCTION platform.session_profile TO ROLE pol;
+----
+<REGEX>:.*platform.session_profile is the passthrough scope's alone.*
 
 query T
 ACL ROLE "pol" SELECT list(catalog ORDER BY catalog) FROM platform.catalogs;

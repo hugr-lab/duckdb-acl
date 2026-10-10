@@ -328,7 +328,7 @@ vector<PlatformView> BuildViews() {
 	     "the resource groups (spec 085)"},
 	    {"role_resource_groups", PV::POLICY, {{"role", V}, {"group", V}}, "which role is in which resource group"},
 	    {"cluster_items",
-	     PV::POLICY,
+	     PV::CLUSTER,
 	     {{"scope", V},
 	      {"kind", V},
 	      {"name", V},
@@ -339,7 +339,7 @@ vector<PlatformView> BuildViews() {
 	      {"comment", V}},
 	     "the cluster profile as written (spec 093)"},
 	    {"cluster_effective",
-	     PV::POLICY,
+	     PV::CLUSTER,
 	     {{"scope", V},
 	      {"kind", V},
 	      {"name", V},
@@ -841,7 +841,7 @@ vector<PlatformFunction> BuildFunctions() {
 	     {A("session"), P("level")},
 	     {2},
 	     -1,
-	     PR::POLICY,
+	     PR::OPERATE,
 	     false,
 	     B,
 	     "the operator's profile level on a session (spec 074)"},
@@ -1116,6 +1116,8 @@ bool PlatformAccess::ReadsView(const PlatformView &view, bool &rows_scoped) cons
 		return rights->observe;
 	case PlatformViewClass::POLICY:
 		return rights->unrestricted_manage;
+	case PlatformViewClass::CLUSTER:
+		return false; // passthrough's (above) until spec 118's cluster bundle - or a point grant
 	case PlatformViewClass::CATALOG:
 	case PlatformViewClass::ROLES:
 		if (rights->unrestricted_manage) {
@@ -1147,6 +1149,7 @@ bool PlatformAccess::CallsFunction(const PlatformFunction &function) const {
 	switch (function.right) {
 	case PlatformRight::ESCALATES:
 	case PlatformRight::INFRASTRUCTURE:
+	case PlatformRight::OPERATE:
 		return false; // passthrough's alone - a point grant never reaches them
 	default:
 		break;
@@ -1260,6 +1263,9 @@ void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights 
 		throw BinderException("acl admin: ACL CLUSTER changes the cluster's infrastructure (extensions, sources, "
 		                      "settings) and requires a passthrough scope - manage administers the ACL, not the "
 		                      "nodes");
+	case PlatformRight::OPERATE:
+		throw BinderException("acl admin: a session's profile is the node's operation and requires a passthrough "
+		                      "scope - the policy bundle administers the ACL, not the node (spec 118's operate)");
 	case PlatformRight::OPEN:
 		return;
 	default:
@@ -1291,6 +1297,25 @@ void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights 
 		}
 	}
 	throw BinderException("acl admin: no manage scope for catalog \"%s\"", vcat);
+}
+
+void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,
+                          PolicyStore &store) {
+	if (rights.passthrough) {
+		return;
+	}
+	for (auto &statement : statements) {
+		auto &call = CompiledCall(*statement);
+		if (!StringUtil::CIEquals(call.FunctionName().GetIdentifierName(), "acl_map_role")) {
+			continue;
+		}
+		auto role = ConstantArgument(call, 4, "map_role");
+		if (!role.empty() && store.RolePrivileged(role)) {
+			throw BinderException("acl admin: \"%s\" holds administration, so mapping a claim to it hands that "
+			                      "administration out - it requires a passthrough scope, as granting the bundle does",
+			                      role);
+		}
+	}
 }
 
 void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights) {

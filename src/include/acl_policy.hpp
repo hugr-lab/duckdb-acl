@@ -1072,6 +1072,9 @@ struct PolicyStore {
 	};
 	//! The principal's effective rights: the strongest over its roles and its catalog grants
 	AdminRights AdminRightsOf(const Principal &principal);
+	//! spec 095 / 117: the role holds any administration (a bundle, a catalog's manage, a point grant on
+	//! platform) - reached only through a client's own mapping, mapped only by passthrough
+	bool RolePrivileged(const string &role);
 	//! Whether an anonymous `ACL ADMIN` (no principal) is still permitted: always in the in-memory
 	//! dev mode, and with a policy source only when acl_allow_anonymous_admin is on (spec 009).
 	bool AnonymousAdminAllowed();
@@ -1144,9 +1147,8 @@ private:
 	bool ReadDocumentText(const string &uri, string &out, string &error);
 	//! A `connection_changed` policy event when an object's resolved connection differs from the last
 	void NoteConnection(const string &kind, const string &name, const string &connection);
-	//! Whether a role exists (UNMAPPED AS ROLE) / holds an administration scope (spec 009)
+	//! Whether a role exists (UNMAPPED AS ROLE); RolePrivileged above says whether it administers
 	bool RoleKnown(const string &role);
-	bool RolePrivileged(const string &role);
 	//! acl_jwt_clock_skew setting (seconds); the memory mode uses the 60s default (no db handle)
 	int64_t JwtClockSkew();
 	int64_t JwksRefreshInterval();

@@ -360,6 +360,10 @@ combined with a certificate. Both doors require cert **and** key together.
   nothing of identity, categories, resource groups, the cluster or the node. No view carries a secret or
   a handle (an issuer / client shows the secret's name). A missing grant fails closed: the object is not
   listed and is `no access`.
+- **No definition reads the policy store itself**: a virtual table, schema alias, expansion, view or
+  macro body, RLS or column expression naming the policy catalog's tables is refused where it is written
+  - otherwise whoever may write the object could write their own `admins` row. And mapping a claim to a
+  role that administers is `passthrough`'s alone, as granting the bundle is.
 - **The name is reserved** and synthesized: no virtual catalog takes it, no management call names it,
   a function-driver source answering it is refused on every read, `USE platform` is refused, and the
   v21 migration refuses while a catalog carries it.

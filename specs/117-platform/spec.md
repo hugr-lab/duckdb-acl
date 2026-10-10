@@ -216,6 +216,31 @@ before it does not know the bundles).
   `acl_function_columns()` - and never on the quack door (`PolicyStore::SessionDoorOf`). The view comment
   fix and the stored catalog / schema comments in `duckdb_databases` / `duckdb_schemas` (NULL for an empty
   one) are §7.
+- **The review (2026-10-10) closed three paths to passthrough** the "no self-escalation" rule forbids
+  (two of them older than this spec, reachable since spec 009, easy now):
+  - *a definition over the policy store itself* - `CREATE VIRTUAL TABLE c.a AS <polcat>.acl.admins`
+    plus a grant and an INSERT made a `policy` holder (or a catalog's `manage` with `insert`)
+    passthrough. Every writer now refuses a physical target, a schema alias / expansion, a view or
+    macro body (the tables it binds to, `query_table` included, else its text), an RLS or a column
+    expression that names the policy catalog's tables (`RequireNotPolicyStore`,
+    `acl_catalog_admin.cpp`). A secrets service catalog is not covered by this rule (its own
+    authorization refuses a principal it does not know as an administrator).
+  - *a role mapping to an administering role* - spec 095 admits a privileged role through the client's
+    own mapping, so `MAP … TO ROLE <passthrough role>` by a `policy` holder handed the bundle out; it is
+    passthrough's now (`AuthorizeRoleTargets`).
+  - *a revoke of an implied bundle* (`REVOKE ADMIN policy` from a `manage` row, `observe` from
+    passthrough) answered true and changed nothing; it is refused, naming the row to revoke.
+  - and the platform functions are refused on the quack door like its views (the grammar stays).
+- **The policy admin has no cluster or node operations** (owner's correction, design/079 §3.5): until
+  spec 118 adds the `operate` / `cluster` bundles, `session_profile` (PROFILE SESSION) is
+  `PlatformRight::OPERATE` and the views `cluster_items` / `cluster_effective` are
+  `PlatformViewClass::CLUSTER` - passthrough's alone (a point grant may still give a view; never the
+  function); the cluster functions were INFRASTRUCTURE already. Spec 074 had put PROFILE SESSION under an
+  unrestricted manage - that narrows here. 118 moves these to operate / cluster. `observe` stays as
+  specified (the node views, read-only).
+- **Known**: a virtual schema named `platform` in a MAIN catalog is no longer reached as
+  `platform.<x>` (the system catalog takes the two-part name); the v21 step writes plain VARCHAR keys,
+  as the earlier steps do (a SQL Server catalog needs the bounded type - the existing step pattern).
 - **Not here** (as the spec says): the metadata row limit, the timeout and batching of design/079 §3.2в
   (spec 119), `view_as` / effective rights / ddl (120), `operate` / `cluster` and the node operations
   (118).

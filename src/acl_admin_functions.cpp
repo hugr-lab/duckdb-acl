@@ -1459,7 +1459,7 @@ void PlatformGrantTarget(DataChunk &args, idx_t row, const char *fn, string &rol
 		throw BinderException("%s: the platform catalog has no function \"%s\"", fn, object);
 	}
 	if (function->right == PlatformRight::ESCALATES || function->right == PlatformRight::INFRASTRUCTURE ||
-	    function->right == PlatformRight::OPEN) {
+	    function->right == PlatformRight::OPERATE || function->right == PlatformRight::OPEN) {
 		throw BinderException("%s: platform.%s is %s - it is never granted by name", fn, object,
 		                      function->right == PlatformRight::OPEN ? "every holder's"
 		                                                             : "the passthrough scope's alone");

@@ -736,6 +736,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		NoteManagement(statements, audit);
 		audit.phase = Reason::MGMT_UNAUTHORIZED;
 		AuthorizeMgmt(statements, rights);
+		AuthorizeRoleTargets(statements, rights, store);
 		return ParserOverrideResult(std::move(statements));
 	}
 	if (mode == AclPrefix::Mode::NATIVE) {
@@ -796,6 +797,12 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 			audit.phase = Reason::PRINCIPAL;
 			ResolvePrincipal(store, prefix, principal);
 			audit.proto.principal = principal;
+			if (!principal.session.empty() && store.SessionDoorOf(principal.session) == "quack") {
+				// the platform catalog is absent on the quack door - its functions too; the grammar stays
+				NoteDenyReason(Reason::NO_ACCESS);
+				throw BinderException("acl_rewrite: the platform catalog is not served on the quack door - write the "
+				                      "management statement itself (GRANT ..., CREATE ROLE ...)");
+			}
 			rights = store.AdminRightsOf(principal);
 			audit.proto.detail = RightsDetail(rights);
 			if (!rights.MayAdminister()) {
@@ -805,6 +812,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 			NoteManagement(compiled, audit);
 			audit.phase = Reason::MGMT_UNAUTHORIZED;
 			AuthorizeMgmt(compiled, rights);
+			AuthorizeRoleTargets(compiled, rights, store);
 			return ParserOverrideResult(std::move(compiled));
 		}
 	}

@@ -6,6 +6,7 @@
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_platform.hpp"
+#include "acl_scan_util.hpp"
 #include "acl_lineage.hpp"
 #include "acl_rewriter.hpp"
 
@@ -733,6 +734,145 @@ void RequireNotReserved(const string &vname) {
 	}
 }
 
+//! The policy catalog's own tables - what no definition may read or write (spec 117 review)
+const char *const POLICY_TABLES[] = {"meta",
+                                     "catalogs",
+                                     "relations",
+                                     "relation_columns",
+                                     "relation_types",
+                                     "functions",
+                                     "roles",
+                                     "role_claims",
+                                     "role_catalogs",
+                                     "role_object_caps",
+                                     "function_categories",
+                                     "function_category_members",
+                                     "function_grants",
+                                     "issuers",
+                                     "clients",
+                                     "admins",
+                                     "platform_grants",
+                                     "role_mappings",
+                                     "object_columns",
+                                     "schemas",
+                                     "role_schemas",
+                                     "schema_dropped",
+                                     "references",
+                                     "reference_columns",
+                                     "keys",
+                                     "grant_columns",
+                                     "resource_groups",
+                                     "role_resource_groups",
+                                     "cluster_items",
+                                     "cluster_deps"};
+
+bool IsPolicyTable(const string &name) {
+	for (auto table : POLICY_TABLES) {
+		if (StringUtil::CIEquals(name, table)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! A physical name (parts) that IS the policy store: its schema (`<db>.<schema>`, a schema alias's target)
+//! or one of its tables (`[<db>.]<schema>.<table>`)
+bool NamesPolicyStore(const CatalogBackend &catalog, const vector<string> &parts, bool schema_path) {
+	if (schema_path) {
+		return (parts.size() == 2 && StringUtil::CIEquals(parts[0], catalog.db_name) &&
+		        StringUtil::CIEquals(parts[1], catalog.schema)) ||
+		       (parts.size() == 1 && StringUtil::CIEquals(parts[0], catalog.schema));
+	}
+	if (parts.size() < 2 || !IsPolicyTable(parts.back()) ||
+	    !StringUtil::CIEquals(parts[parts.size() - 2], catalog.schema)) {
+		return false;
+	}
+	return parts.size() == 2 || StringUtil::CIEquals(parts[parts.size() - 3], catalog.db_name);
+}
+
+//! The text names a table of the policy store: `<schema>.<table>` with a policy table, any quoting, any
+//! spacing - the fallback where a body cannot be bound, and the check of an expression (a mask, an RLS)
+bool TextNamesPolicyStore(const CatalogBackend &catalog, const string &text) {
+	auto folded = StringUtil::Lower(text);
+	auto schema = StringUtil::Lower(catalog.schema);
+	for (idx_t at = folded.find(schema); at != string::npos; at = folded.find(schema, at + 1)) {
+		if (at > 0 && (IsWordChar(folded[at - 1]))) {
+			continue;
+		}
+		idx_t pos = at + schema.size();
+		if (pos < folded.size() && folded[pos] == '"') {
+			pos++;
+		}
+		while (pos < folded.size() && StringUtil::CharacterIsSpace(folded[pos])) {
+			pos++;
+		}
+		if (pos >= folded.size() || folded[pos] != '.') {
+			continue;
+		}
+		pos++;
+		while (pos < folded.size() && (StringUtil::CharacterIsSpace(folded[pos]) || folded[pos] == '"')) {
+			pos++;
+		}
+		auto start = pos;
+		while (pos < folded.size() && IsWordChar(folded[pos])) {
+			pos++;
+		}
+		if (IsPolicyTable(folded.substr(start, pos - start))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+[[noreturn]] void RefusePolicyStore(const char *what) {
+	throw BinderException("acl admin: %s reads the policy store itself - a definition never names the policy "
+	                      "catalog's own tables (its administration would be anyone's who reads or writes the "
+	                      "object)",
+	                      what);
+}
+
+//! spec 117 review: no definition reads or writes the policy store - a virtual table over `admins` let a
+//! policy (or a catalog's manage) holder insert itself a passthrough row. A physical name is judged by its
+//! parts; a SQL body by the tables it binds to (query_table included), or by its text where it does not bind.
+void RequireNotPolicyStore(CatalogBackend &catalog, const char *what, const string &phys_key, bool schema_path,
+                           const string &body = string(), bool expression = false,
+                           const vector<string> &param_types = {}) {
+	if (!phys_key.empty()) {
+		NamePath path;
+		string error;
+		auto parts = NamePath::TryFromKey(phys_key, path, error) ? path.Parts() : vector<string> {phys_key};
+		if (NamesPolicyStore(catalog, parts, schema_path)) {
+			RefusePolicyStore(what);
+		}
+	}
+	if (body.empty()) {
+		return;
+	}
+	if (TextNamesPolicyStore(catalog, body)) {
+		RefusePolicyStore(what);
+	}
+	try {
+		auto options = ParserOptions::Builtin();
+		auto baked = BakeTemplateForProbe(body, options, expression, param_types);
+		auto probe = expression ? "SELECT (" + baked + ") AS \"value\"" : baked;
+		auto instance = catalog.Db();
+		Connection con(*instance);
+		for (auto &name : con.GetTableNames(probe, true)) {
+			NamePath path;
+			string error;
+			auto parts = NamePath::TryFromKey(name, path, error) ? path.Parts() : StringUtil::Split(name, '.');
+			if (NamesPolicyStore(catalog, parts, false)) {
+				RefusePolicyStore(what);
+			}
+		}
+	} catch (BinderException &ex) {
+		if (StringUtil::Contains(ex.what(), "reads the policy store itself")) {
+			throw;
+		}
+	} catch (std::exception &) { // NOLINT: a body that does not bind is judged by its text (above)
+	}
+}
+
 } // namespace
 
 void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, const string &form_p, const string &phys,
@@ -741,6 +881,15 @@ void PolicyStore::CatalogAddRelation(const string &vcat, const string &vname, co
                                      const string &pk, const case_insensitive_map_t<int8_t> &nullable_marks) {
 	RequireCatalog(catalog, "acl_add_relation");
 	RequireNotReserved(vname);
+	RequireNotPolicyStore(*catalog, "the relation", phys, false, view_sql);
+	if (!rls.empty() && TextNamesPolicyStore(*catalog, rls)) {
+		RefusePolicyStore("the relation's RLS");
+	}
+	for (auto &column : columns_p) {
+		if (TextNamesPolicyStore(*catalog, column.second)) {
+			RefusePolicyStore("the relation's column list");
+		}
+	}
 	auto columns = columns_p;
 	auto form = form_p;
 	if (CompileDeclaredPaths(*catalog, phys, vname, columns)) {
@@ -1405,6 +1554,7 @@ void PolicyStore::CatalogDropReference(const string &vcat, const string &name) {
 void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_path, const string &phys_path,
                                         const string &origin) {
 	RequireCatalog(catalog, "acl_add_schema_alias");
+	RequireNotPolicyStore(*catalog, "the schema alias", phys_path, true);
 	// a schema is one row either way (spec 014): with a physical path it is a live alias, without one
 	// it is a schema whose content is the catalog's own records. The comment survives a redefinition.
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
@@ -1682,6 +1832,7 @@ void PolicyStore::CatalogRematerializeSchemaCaps(const string &vcat, const strin
 
 void PolicyStore::CatalogExpandSchema(const string &vcat, const string &path, const string &phys_path) {
 	RequireCatalog(catalog, "acl_expand_schema");
+	RequireNotPolicyStore(*catalog, "the expansion", phys_path, true);
 	auto names = PhysicalObjects(*catalog, phys_path);
 	// the schema itself carries no physical path: what is visible inside it are the records below,
 	// each of which can then be altered, dropped or granted on its own
@@ -1875,6 +2026,10 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
                                      const case_insensitive_map_t<int8_t> &nullable_marks, bool pk_carried) {
 	RequireCatalog(catalog, "acl_add_function");
 	RequireNotReserved(vname);
+	if (form == "macro") {
+		RequireNotPolicyStore(*catalog, "the function's template", string(), false, template_sql, kind == "scalar",
+		                      CatalogBackend::DeclaredTypes(params));
+	}
 	vector<string> statements = {"DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                                 " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind),
 	                             "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -2711,6 +2866,18 @@ void PolicyStore::CatalogAlterRelation(const string &vcat, const string &vname, 
                                        const string &value, const vector<std::pair<string, string>> &columns,
                                        const case_insensitive_map_t<int8_t> &nullable_marks) {
 	RequireCatalog(catalog, "acl_alter_relation");
+	if (field == "phys") {
+		RequireNotPolicyStore(*catalog, "the relation", value, false);
+	} else if (field == "view") {
+		RequireNotPolicyStore(*catalog, "the view", string(), false, value);
+	} else if (field == "rls" && TextNamesPolicyStore(*catalog, value)) {
+		RefusePolicyStore("the relation's RLS");
+	}
+	for (auto &column : columns) {
+		if (TextNamesPolicyStore(*catalog, column.second)) {
+			RefusePolicyStore("the relation's column list");
+		}
+	}
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto current = read("SELECT \"form\", \"phys\", \"view_sql\", \"rls\" FROM " + catalog->Tbl("relations") +
 		                    " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
@@ -2938,7 +3105,22 @@ void PolicyStore::CatalogWritePlatformGrant(const string &role, const string &ki
 void PolicyStore::CatalogRevokeAdmin(const string &role, const string &scope) {
 	RequireCatalog(catalog, "acl_revoke_admin");
 	if (!scope.empty()) {
-		// spec 117: one bundle - the others the role holds, its catalogs' manage and its point grants stay
+		// spec 117: one bundle - the others the role holds, its catalogs' manage and its point grants stay.
+		// A bundle another row implies (manage = policy + observe, passthrough = everything) cannot be taken
+		// alone: the revoke would answer true and change nothing
+		auto held = catalog->Query("SELECT \"scope\" FROM " + catalog->Tbl("admins") +
+		                           " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = ''");
+		ResultRows held_rows(*held);
+		for (idx_t row = 0; row < held_rows.Count(); row++) {
+			auto holds = StringUtil::Lower(held_rows.GetValue(0, row).ToString());
+			bool implies = (holds == "manage" && (scope == "policy" || scope == "observe")) ||
+			               (holds == "passthrough" && scope != "passthrough");
+			if (implies) {
+				throw BinderException("acl admin: role \"%s\" holds %s, which carries %s - revoke %s (and grant what "
+				                      "should stay)",
+				                      role, holds, scope, holds);
+			}
+		}
 		catalog->Write({"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role) +
 		                " AND \"scope\" = " + Lit(scope) + " AND \"vcat\" = ''"});
 		return;

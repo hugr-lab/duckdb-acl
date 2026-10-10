@@ -657,7 +657,10 @@ one item, no FROM/WHERE/CTE/modifiers, or `CALL f(…)`; named args; a `?` where
 statement's parameter map carried over) in the override, refused anywhere else by the rewriter; read
 functions `check_catalog([c])` / `console_info()` in FROM. **ONE authorizer**: `AuthorizeMgmt` /
 `AuthorizeAdminCall` (moved from acl_admin_sql.cpp) judge every compiled call - grammar or call - by its
-`PlatformRight` (CATALOG / POLICY / HANDS_OUT / ESCALATES / INFRASTRUCTURE / OPEN). Rights: `AdminRights`
+`PlatformRight` (CATALOG / POLICY / HANDS_OUT / ESCALATES / INFRASTRUCTURE / OPERATE / OPEN); until spec
+118 the session profile (OPERATE) and the cluster views (`PlatformViewClass::CLUSTER`) are passthrough's,
+and no definition may name the policy store's own tables (`RequireNotPolicyStore`), nor may a non-passthrough
+map a claim to a privileged role (`AuthorizeRoleTargets`). Rights: `AdminRights`
 is a SET (`passthrough`, `unrestricted_manage` = policy, `observe`, `catalogs`, `platform` point grants
 `<kind>:<object>` -> allowed; `MayAdminister()`, `Policy()`, `Privileged()` - spec 095's privileged roles
 include any point grant); `platform_grants(role, object, kind, allowed)` written only by passthrough
@@ -732,8 +735,8 @@ the whole tree). Never the statement's text, a literal, a path or a claim value 
 `Filters`/`Projections`/`Filename(s)` are counted or ignored. Levels `acl_profile_level` = off
 (default) | sampled (the caller's `traceparent` sampled flag) | all, GLOBAL; the level in force for a
 statement (`ProfileLevelFor`) is, first answer wins: the operator's override on the session
-(`acl_session_profile(id, level)` / `PROFILE SESSION CURRENT | '<id>' ON | SAMPLED | OFF`, unrestricted
-manage, `''`/OFF clears; `acl_sessions()` shows `profile_level` + `profile_source`), the registered
+(`acl_session_profile(id, level)` / `PROFILE SESSION CURRENT | '<id>' ON | SAMPLED | OFF`, passthrough
+since spec 117 (118's operate), `''`/OFF clears; `acl_sessions()` shows `profile_level` + `profile_source`), the registered
 `SessionPolicy::ProfileFor` rule, the connection's own `SET SESSION acl_profile_level` (an operator's
 connection), the GLOBAL. The note that links execution to decision is the override's
 (one per decided statement, with the hash of the statement's text), taken onto the connection by the

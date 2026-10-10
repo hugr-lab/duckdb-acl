@@ -313,6 +313,15 @@ run_leg() {
 		fi
 		grep -q 'no access to object .*platform.sessions' "$TMP/$name.platform.out" ||
 			{ cat "$TMP/$name.platform.out" >&2; fail "$name: the platform view was not refused over quack"; }
+		# nor its functions: the grammar is how a quack client administers
+		{
+			echo "$L"
+			echo "ATTACH 'quack:localhost:$port' AS remote (TYPE quack, TOKEN '$TOKEN_ACME');"
+			echo "SELECT 'platform_call' AS label, * FROM quack_query_by_name('remote', 'SELECT platform.create_role(''over_quack'')');"
+		} >"$TMP/$name.platform_call.sql"
+		"$DUCKDB" -unsigned -csv <"$TMP/$name.platform_call.sql" >"$TMP/$name.platform_call.out" 2>&1 || true
+		grep -q 'not served on the quack door' "$TMP/$name.platform_call.out" ||
+			{ cat "$TMP/$name.platform_call.out" >&2; fail "$name: a platform call was not refused over quack"; }
 		# the bootstrap seeds two acme rows and one globex row, so each client's own total differs
 		case "$who" in acme) seeded=2 ;; globex) seeded=1 ;; esac
 		before="$(grep "^seen_before," "$TMP/$name.$who.out" | cut -d, -f2)"

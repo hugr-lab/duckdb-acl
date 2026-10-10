@@ -84,7 +84,7 @@ wins:
 
 1. **The operator's switch on the session** - `acl_session_profile(<ops id>, 'off' | 'sampled' |
    'all')` (`''` clears), or the management form `PROFILE SESSION CURRENT | '<ops id>' ON | ALL |
-   SAMPLED | OFF` under an unrestricted `manage` scope. `CURRENT` is the session the statement runs
+   SAMPLED | OFF` under a `passthrough` scope (spec 117; spec 118's `operate` bundle takes it). `CURRENT` is the session the statement runs
    under, so an administrator connected through a door switches their own session; another session
    is named by its ops id from `acl_sessions()`. In force from the session's next statement.
 2. **A registered policy's rule** - `SessionPolicy::ProfileFor` (acl_otel answers it from its

@@ -50,7 +50,7 @@ is "stronger" than another:
 | Bundle | Granted with | Reads | Calls |
 | --- | --- | --- | --- |
 | `observe` | `GRANT ADMIN observe TO ROLE r` | the node views (`sessions`, `node_load`, `node_doors`, `node_streams`, `drain`, `lineage_status`); also the load report and `/metrics` (spec 097) | nothing |
-| `policy` | `GRANT ADMIN policy TO ROLE r` | every policy view, all rows | every policy function except the admin grants and the cluster profile |
+| `policy` | `GRANT ADMIN policy TO ROLE r` | every policy view, all rows - not the cluster profile's | every policy function except the admin grants, the cluster profile and a session's profile |
 | `passthrough` | `GRANT ADMIN passthrough TO ROLE r` | everything | everything, plus `ACL NATIVE`, the bundles and the grants on `platform` (the break-glass) |
 | `manage` (spec 009's name) | `GRANT ADMIN manage TO ROLE r` | `policy` + `observe` | `policy` |
 | a catalog admin | `GRANT CATALOG c TO ROLE r CAPS '{"manage": true}'` | the catalog-scoped views, narrowed to its catalogs (below) | the functions that take a catalog, on its catalogs; `check_catalog` on its catalogs |
@@ -81,7 +81,8 @@ REVOKE VIEW platform.sessions FROM ROLE support;        -- the grant or the deny
 - **Only `passthrough` grants on `platform`** (and the bundles) - never `policy`: a grantor that can
   grant everything is everything.
 - Never to every role (`TO ALL ROLES` / role `''` is refused); never on the passthrough scope's own
-  functions (`grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_*`) nor on
+  functions (`grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `cluster_*`,
+  `session_profile`) nor on
   `console_info` (every holder's); only on an object `platform` has.
 - The grants live in their own table, `platform_grants(role, object, kind, allowed)` - never in the
   catalog grants or spec 072's function grants and categories.
@@ -143,8 +144,8 @@ Policy views (the `policy` bundle; marked *c* - also a catalog admin, narrowed):
 | `function_status` | database, schema, name, kind, function_type, categories VARCHAR[], status, present BOOLEAN |
 | `resource_groups` | group, window_start, window_max, batch_bytes, max_result_rows, queue_priority, max_sessions (BIGINT), comment, is_default BOOLEAN |
 | `role_resource_groups` | role, group |
-| `cluster_items` | scope, kind, name, spec `MAP(VARCHAR, VARCHAR)`, class, version BIGINT, depends_on VARCHAR[], comment |
-| `cluster_effective` | the same, what applies to this node (spec 096) |
+| `cluster_items` † | scope, kind, name, spec `MAP(VARCHAR, VARCHAR)`, class, version BIGINT, depends_on VARCHAR[], comment |
+| `cluster_effective` † | the same, what applies to this node (spec 096) |
 | `catalog_schema` | build, build_min_reader, catalog, min_reader (BIGINT), mode |
 
 Node views (the `observe` bundle):
@@ -157,6 +158,9 @@ Node views (the `observe` bundle):
 | `node_streams` | budget_bytes, reserve_bytes, reserved_bytes, producing, queued, refused (BIGINT) |
 | `drain` | draining BOOLEAN, sessions BIGINT |
 | `lineage_status` | status, sending BOOLEAN, level, namespace |
+
+† the cluster profile's views are `passthrough`'s (or a point grant's) until spec 118's `cluster` bundle -
+not the `policy` bundle's: the policy admin has no cluster or node operations.
 
 Unmarked columns are VARCHAR. The views that read the policy catalog's tables need a catalog policy
 source (`acl_use_db`); in memory mode and behind a function driver they refuse with a clear error, while
@@ -209,7 +213,8 @@ SELECT platform.alter_catalog('sales', comment := ?);
 
 Right: **CATALOG** - `policy`, or `manage` on the catalog its `catalog` argument names; **POLICY** -
 `policy`; **HANDS_OUT** - `policy` (handing out access); **ESCALATES** / **INFRASTRUCTURE** -
-`passthrough` only. A point grant on the function stands in for a bundle, except for the last two.
+`passthrough` only; **OPERATE** (a node / session operation) - `passthrough` only until spec 118's
+`operate` bundle. A point grant on the function stands in for a bundle, except for the last three.
 
 | Function | Parameters (\* authorization, a constant) | Right |
 | --- | --- | --- |
@@ -258,7 +263,7 @@ Right: **CATALOG** - `policy`, or `manage` on the catalog its `catalog` argument
 | `revoke_function_category` | role\*, category\* | POLICY |
 | `grant_function` | role\*, function\*, allowed | POLICY |
 | `revoke_function` | role\*, function\* | POLICY |
-| `session_profile` | session\*, level | POLICY |
+| `session_profile` | session\*, level | OPERATE |
 | `create_resource_group` | group_name\*, limits, comment, is_default | POLICY |
 | `alter_resource_group` | group_name\*, property\*, value | POLICY |
 | `drop_resource_group` | group_name\*, mode | POLICY |
