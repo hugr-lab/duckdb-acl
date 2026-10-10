@@ -15,6 +15,7 @@
 
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_platform.hpp"
 #include "acl_types.hpp"
 #include "acl_placement.hpp"
 #include "acl_rewriter.hpp"
@@ -284,6 +285,13 @@ vector<CatalogBackend::GrantRow> CatalogBackend::Grants(const vector<string> &ro
 			GrantRow grant;
 			grant.role = result_rows.GetValue(0, row).ToString();
 			grant.vcat = result_rows.GetValue(1, row).ToString();
+			if (IsPlatformCatalog(grant.vcat)) {
+				// spec 117: the name is the system catalog's - a source that answers it is refused, never
+				// read as a virtual catalog (nor as a grant on platform, which only platform_grants holds)
+				throw BinderException("acl catalog: the policy source's role_catalogs answers a catalog named "
+				                      "\"%s\" - the reserved system catalog of administration; rename it there",
+				                      grant.vcat);
+			}
 			auto is_main = result_rows.GetValue(2, row);
 			grant.is_main = !is_main.IsNull() && is_main.GetValue<bool>();
 			auto caps = result_rows.GetValue(3, row);
@@ -1489,8 +1497,7 @@ shared_ptr<const IdentityModel> CatalogBackend::Identity() {
 	return model;
 }
 
-void CatalogBackend::LoadRights(const Principal &principal, std::set<string> &catalogs,
-                                vector<std::pair<string, string>> &scopes) {
+void CatalogBackend::LoadRights(const Principal &principal, RightsRows &out) {
 	if (principal.roles.empty()) {
 		return;
 	}
@@ -1500,16 +1507,32 @@ void CatalogBackend::LoadRights(const Principal &principal, std::set<string> &ca
 		lock_guard<mutex> guard(lock);
 		auto entry = rights_cache.find(key);
 		if (entry != rights_cache.end()) {
-			catalogs = entry->second.first;
-			scopes = entry->second.second;
+			out = entry->second;
 			return;
 		}
 	}
-	ManageCatalogs(principal, catalogs);
-	AdminScopes(principal, scopes);
+	ManageCatalogs(principal, out.catalogs);
+	AdminScopes(principal, out.scopes);
+	PlatformGrants(principal, out.platform);
 	lock_guard<mutex> guard(lock);
 	ClearIfOversized(rights_cache);
-	rights_cache[key] = {catalogs, scopes};
+	rights_cache[key] = out;
+}
+
+void CatalogBackend::PlatformGrants(const Principal &principal, vector<std::pair<string, bool>> &out) {
+	if (principal.roles.empty() || function_mode) {
+		return; // the driver contract carries no grants on `platform`: its admin_scopes slot is the bundles
+	}
+	EnsureFresh();
+	auto result = Query("SELECT \"kind\", \"object\", \"allowed\" FROM " + Tbl("platform_grants") +
+	                    " WHERE \"role\" IN (" + LitList(principal.roles) + ")");
+	ResultRows rows(*result);
+	for (idx_t row = 0; row < rows.Count(); row++) {
+		auto allowed = rows.GetValue(2, row);
+		out.emplace_back(StringUtil::Lower(rows.GetValue(0, row).ToString()) + ":" +
+		                     StringUtil::Lower(rows.GetValue(1, row).ToString()),
+		                 allowed.IsNull() || BooleanValue::Get(allowed.DefaultCastAs(LogicalType::BOOLEAN)));
+	}
 }
 
 void CatalogBackend::ManageCatalogs(const Principal &principal, std::set<string> &out) {
@@ -1532,7 +1555,8 @@ void CatalogBackend::ManageCatalogs(const Principal &principal, std::set<string>
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		auto caps = result_rows.GetValue(1, row);
 		auto vcat = result_rows.GetValue(0, row).ToString();
-		if (!vcat.empty() && ParseCaps(caps.IsNull() ? string() : caps.ToString()).count("manage")) {
+		if (!vcat.empty() && !IsPlatformCatalog(vcat) &&
+		    ParseCaps(caps.IsNull() ? string() : caps.ToString()).count("manage")) {
 			out.insert(vcat);
 		}
 	}

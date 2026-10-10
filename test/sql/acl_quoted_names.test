@@ -1146,7 +1146,7 @@ SELECT acl_use_db('old', 'acl', true);
 query T
 SELECT value FROM old.acl.meta WHERE key = 'min_reader_version';
 ----
-20
+21
 
 statement ok
 INSERT INTO old.acl.relations(vcat, vname, form, phys) VALUES ('c', 'Orders', 'alias', 'phys.main.u'), ('c', 'orders', 'alias', 'phys.main.u'), ('c', 'S.a', 'alias', 'phys.main.u'), ('c', 's.b', 'alias', 'phys.main.u');
@@ -1192,9 +1192,9 @@ DELETE FROM old.acl.relations WHERE vname IN ('a"b', 'x..y');
 query T
 SELECT acl_migrate_catalog('old', 'acl');
 ----
-"old"."acl" migrated from schema version 19 to 20 (readable from build 20 on)
+"old"."acl" migrated from schema version 19 to 21 (readable from build 21 on)
 
 query T
 SELECT value FROM old.acl.meta WHERE key = 'min_reader_version';
 ----
-20
+21

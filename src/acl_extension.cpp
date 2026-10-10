@@ -24,6 +24,7 @@
 #include "acl_policy.hpp"
 #include "acl_profile.hpp"
 #include "acl_node_load.hpp"
+#include "acl_platform.hpp"
 #include "duckdb/common/helper.hpp"
 
 #include <chrono>
@@ -410,6 +411,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	acl::RegisterAclLineage(loader, store, pipeline); // spec 107: acl_lineage_events()
 	acl::RegisterAclProfile(loader, store);           // spec 074: the execution profile, on every connection
 	acl::RegisterAclNodeLoad(loader, store);          // spec 079: acl_node_load(), the orchestrator's report
+	acl::RegisterAclPlatform(loader, store);          // spec 117: the platform catalog's node views, conversions
 	// the node's own gauges (spec 069): how long it has been up, and which build it is
 	{
 		string version;

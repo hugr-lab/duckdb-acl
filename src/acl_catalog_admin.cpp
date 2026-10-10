@@ -5,6 +5,7 @@
 
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_platform.hpp"
 #include "acl_lineage.hpp"
 #include "acl_rewriter.hpp"
 
@@ -291,6 +292,12 @@ string PolicyStore::SpellReference(const string &vcat, const string &name, bool 
 
 void PolicyStore::CatalogCreate(const string &vcat, const string &comment) {
 	RequireCatalog(catalog, "acl_create_catalog");
+	if (IsPlatformCatalog(vcat)) {
+		// spec 117: the system catalog is synthesized, never stored - its name is no virtual catalog's
+		throw BinderException("acl_create_catalog: \"%s\" is the reserved system catalog of administration - pick "
+		                      "another name",
+		                      vcat);
+	}
 	catalog->Write({"DELETE FROM " + catalog->Tbl("catalogs") + " WHERE \"vcat\" = " + Lit(vcat),
 	                "INSERT INTO " + catalog->Tbl("catalogs") + " VALUES (" + Lit(vcat) + ", " + Lit(comment) + ")"});
 }
@@ -2909,18 +2916,40 @@ void PolicyStore::CatalogAlterGrant(const string &role, const string &vcat, cons
 
 void PolicyStore::CatalogGrantAdmin(const string &role, const string &scope) {
 	RequireCatalog(catalog, "acl_grant_admin");
-	catalog->Write({"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role),
+	// spec 117: a role holds several bundles - the row is (role, scope, vcat), so a grant adds its bundle
+	// and keeps the others
+	catalog->Write({"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role) +
+	                    " AND \"scope\" = " + Lit(scope) + " AND \"vcat\" = ''",
 	                "INSERT INTO " + catalog->Tbl("admins") + " VALUES (" + Lit(role) + ", " + Lit(scope) + ", '')"});
 }
 
-void PolicyStore::CatalogRevokeAdmin(const string &role) {
+void PolicyStore::CatalogWritePlatformGrant(const string &role, const string &kind, const string &object, bool allowed,
+                                            bool remove) {
+	RequireCatalog(catalog, remove ? "acl_revoke_platform" : "acl_grant_platform");
+	vector<string> statements = {"DELETE FROM " + catalog->Tbl("platform_grants") + " WHERE \"role\" = " + Lit(role) +
+	                             " AND \"object\" = " + Lit(object) + " AND \"kind\" = " + Lit(kind)};
+	if (!remove) {
+		statements.push_back("INSERT INTO " + catalog->Tbl("platform_grants") + " VALUES (" + Lit(role) + ", " +
+		                     Lit(object) + ", " + Lit(kind) + ", " + (allowed ? "true" : "false") + ")");
+	}
+	catalog->Write(statements);
+}
+
+void PolicyStore::CatalogRevokeAdmin(const string &role, const string &scope) {
 	RequireCatalog(catalog, "acl_revoke_admin");
-	// de-privileging a role must remove ALL of its administration: the global scope and the
-	// per-catalog manage capabilities, which live in the catalog grants
+	if (!scope.empty()) {
+		// spec 117: one bundle - the others the role holds, its catalogs' manage and its point grants stay
+		catalog->Write({"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role) +
+		                " AND \"scope\" = " + Lit(scope) + " AND \"vcat\" = ''"});
+		return;
+	}
+	// de-privileging a role must remove ALL of its administration: the global bundles, the per-catalog
+	// manage capabilities, which live in the catalog grants, and (spec 117) its point grants on platform
 	auto grants = catalog->Query("SELECT \"vcat\", \"caps\" FROM " + catalog->Tbl("role_catalogs") +
 	                             " WHERE \"role\" = " + Lit(role));
 	ResultRows grants_rows(*grants);
-	vector<string> statements = {"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role)};
+	vector<string> statements = {"DELETE FROM " + catalog->Tbl("admins") + " WHERE \"role\" = " + Lit(role),
+	                             "DELETE FROM " + catalog->Tbl("platform_grants") + " WHERE \"role\" = " + Lit(role)};
 	for (idx_t row = 0; row < grants->RowCount(); row++) {
 		auto caps_value = grants_rows.GetValue(1, row);
 		auto caps = acl_detail::ParseCaps(caps_value.IsNull() ? string() : caps_value.ToString());
@@ -2939,8 +2968,13 @@ void PolicyStore::CatalogRevokeAdmin(const string &role) {
 }
 
 void PolicyStore::CatalogAdminRights(const Principal &principal, std::set<string> &catalogs,
-                                     vector<std::pair<string, string>> &scopes) {
-	catalog->LoadRights(principal, catalogs, scopes);
+                                     vector<std::pair<string, string>> &scopes,
+                                     vector<std::pair<string, bool>> &platform) {
+	acl_detail::CatalogBackend::RightsRows rows;
+	catalog->LoadRights(principal, rows);
+	catalogs = std::move(rows.catalogs);
+	scopes = std::move(rows.scopes);
+	platform = std::move(rows.platform);
 }
 
 bool PolicyStore::CatalogAnonymousAdminAllowed() {

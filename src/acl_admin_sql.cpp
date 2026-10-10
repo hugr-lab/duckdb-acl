@@ -4,6 +4,7 @@
 // The grammar compiles text into acl_* admin-function calls; the parser override is its only caller.
 
 #include "acl_admin_sql.hpp"
+#include "acl_platform.hpp"
 
 #include "acl_door_common.hpp"
 #include "acl_name_path.hpp"
@@ -483,10 +484,10 @@ bool IsMgmtStart(const string &text) {
 		return true;
 	}
 	if (StringUtil::CIEquals(first, "deny")) {
-		// DENY FUNCTION [CATEGORY] … (spec 072): duckdb has no DENY at all
+		// DENY FUNCTION [CATEGORY] … (spec 072), DENY VIEW platform.<v> (spec 117): duckdb has no DENY at all
 		AdminScanner ahead(text);
 		ahead.Word("keyword");
-		return StringUtil::CIEquals(ahead.PeekWord(), "function");
+		return StringUtil::CIEquals(ahead.PeekWord(), "function") || StringUtil::CIEquals(ahead.PeekWord(), "view");
 	}
 	if (StringUtil::CIEquals(first, "check") || StringUtil::CIEquals(first, "repair")) {
 		// CHECK VIRTUAL CATALOG / REPAIR VIRTUAL TABLE (spec 039): ours always name a VIRTUAL target
@@ -796,6 +797,44 @@ string RoleOrAllRoles(AdminScanner &s, const char *preposition) {
 	}
 	s.Expect("role");
 	return s.Ident("a role name");
+}
+
+//! spec 117: `platform.<object>` / `platform.main.<object>` next - a view or a function of the system
+//! catalog, whose grants are its own (platform_grants), never a catalog's or spec 072's. Consumed only
+//! when it is one; `object` is the leaf.
+bool PlatformTarget(AdminScanner &s, string &object) {
+	auto saved = s.pos;
+	s.Skip();
+	if (s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"')) {
+		// a quoted function spec (an operator) is never platform's
+		if (s.text[s.pos] == '\'') {
+			s.pos = saved;
+			return false;
+		}
+	}
+	NamePath path;
+	try {
+		path = s.Path("a name");
+	} catch (std::exception &) {
+		s.pos = saved;
+		return false;
+	}
+	if (!PlatformObjectName(path.Parts(), object)) {
+		s.pos = saved;
+		return false;
+	}
+	return true;
+}
+
+//! GRANT | DENY | REVOKE VIEW|FUNCTION platform.<x> TO|FROM ROLE r (spec 117)
+unique_ptr<SQLStatement> PlatformGrant(AdminScanner &s, const char *kind, const string &object, const char *verb) {
+	auto grant = string(verb) != "revoke";
+	auto role = RoleOrAllRoles(s, grant ? "to" : "from");
+	if (grant) {
+		return MakeAdminCall("acl_grant_platform", {Value(role), Value(kind), Value(object),
+		                                            Value(string(verb) == "deny" ? "false" : "true")});
+	}
+	return MakeAdminCall("acl_revoke_platform", {Value(role), Value(kind), Value(object)});
 }
 
 //! `ACL CLUSTER …` (spec 093): the cluster profile. Compiled to acl_cluster_* calls; the authorization
@@ -1361,7 +1400,17 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 	if (StringUtil::CIEquals(keyword, "deny")) {
 		// DENY FUNCTION CATEGORY c TO ROLE r | ALL ROLES; DENY FUNCTION f [TABLE] TO ROLE r | ALL ROLES
 		// (spec 072): a grant row with allowed = false, which wins over every grant
+		string object;
+		if (s.Accept("view")) { // spec 117: DENY VIEW platform.<v> TO ROLE r
+			if (!PlatformTarget(s, object)) {
+				throw BinderException("acl admin: DENY VIEW names a view of the platform catalog (platform.<view>)");
+			}
+			return PlatformGrant(s, "view", object, "deny");
+		}
 		s.Expect("function");
+		if (PlatformTarget(s, object)) {
+			return PlatformGrant(s, "function", object, "deny");
+		}
 		if (s.Accept("category")) {
 			auto category = s.Ident("a category name");
 			auto role = RoleOrAllRoles(s, "to");
@@ -1557,6 +1606,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		if (s.Accept("function")) {
 			// GRANT FUNCTION CATEGORY c TO ROLE r | ALL ROLES; GRANT FUNCTION f [TABLE] TO ROLE r | ALL
 			// ROLES (spec 072) - a grant by name admits the key whatever its categories
+			string object;
+			if (PlatformTarget(s, object)) { // spec 117: a function of the platform catalog
+				return PlatformGrant(s, "function", object, "grant");
+			}
 			if (s.Accept("category")) {
 				auto category = s.Ident("a category name");
 				auto role = RoleOrAllRoles(s, "to");
@@ -1594,6 +1647,15 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		}
 		// GRANT TABLE|VIEW|OBJECT v.n TO ROLE r [CAPS '…'] [RLS '…'] [COLUMNS '…'] - the grant's own
 		// policy (spec 011): it narrows the object for this role, it never widens it
+		{
+			// spec 117: GRANT VIEW platform.<v> TO ROLE r - a view of the system catalog
+			auto saved = s.pos;
+			string object;
+			if (s.Accept("view") && PlatformTarget(s, object)) {
+				return PlatformGrant(s, "view", object, "grant");
+			}
+			s.pos = saved;
+		}
 		if (s.Accept("table") || s.Accept("view") || s.Accept("object")) {
 			string vcat, vname;
 			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
@@ -1619,11 +1681,33 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		                     {Value(role), Value(vcat), Value(caps), Value::BOOLEAN(main), Value(rls), Value(columns)});
 	}
 	if (StringUtil::CIEquals(keyword, "revoke")) {
-		if (s.Accept("admin")) { // REVOKE ADMIN FROM ROLE r
+		if (s.Accept("admin")) {
+			// REVOKE ADMIN FROM ROLE r - every administration of the role; REVOKE ADMIN <bundle> FROM ROLE r -
+			// that one bundle (spec 117)
+			string scope;
+			if (!StringUtil::CIEquals(s.PeekWord(), "from")) {
+				scope = s.Word("an admin scope");
+			}
 			s.Expect("from");
 			s.Expect("role");
 			auto role = s.Ident("a role name");
-			return MakeAdminCall("acl_revoke_admin", {Value(role)});
+			if (scope.empty()) {
+				return MakeAdminCall("acl_revoke_admin", {Value(role)});
+			}
+			return MakeAdminCall("acl_revoke_admin", {Value(role), Value(scope)});
+		}
+		{
+			// spec 117: REVOKE VIEW|FUNCTION platform.<x> FROM ROLE r
+			auto saved = s.pos;
+			string object;
+			if (s.Accept("view") && PlatformTarget(s, object)) {
+				return PlatformGrant(s, "view", object, "revoke");
+			}
+			s.pos = saved;
+			if (s.Accept("function") && PlatformTarget(s, object)) {
+				return PlatformGrant(s, "function", object, "revoke");
+			}
+			s.pos = saved;
 		}
 		if (s.Accept("resource")) {
 			// REVOKE RESOURCE GROUP g FROM ROLE r (spec 085)
@@ -1973,126 +2057,124 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 	throw BinderException("acl admin: unknown management statement \"%s\"", keyword);
 }
 
-//! What authorizing a compiled management call needs (spec 009), read off the call itself: which
-//! constant argument names the catalog it touches, and whether it escalates privilege.
-struct MgmtProvenance {
-	string vcat;            // "" = not catalog-specific (roles, issuers, mappings, admin grants)
-	bool escalates = false; // admin scopes: only a passthrough scope may hand them out
-	//! catalog grants: handing out access is privilege administration, so a catalog-scoped manage
-	//! may not grant read on the catalog it manages (to itself or to anyone else)
-	bool hands_out = false;
-	//! spec 093: the cluster profile - the node's infrastructure, a passthrough scope's alone
-	bool infrastructure = false;
-};
-
-MgmtProvenance ProvenanceOf(SQLStatement &statement) {
-	// name -> index of the constant argument holding the catalog; -1 = none
-	static const std::unordered_map<string, int> CATALOG_ARG = {
-	    {"acl_create_catalog", 0},
-	    {"acl_add_relation", 0},
-	    {"acl_add_view", 0},
-	    {"acl_add_schema_alias", 0},
-	    {"acl_add_table_function", 0},
-	    {"acl_add_table_function_alias", 0},
-	    {"acl_add_scalar", 0},
-	    {"acl_add_scalar_alias", 0},
-	    {"acl_drop_relation", 0},
-	    {"acl_grant_catalog", 1},
-	    {"acl_revoke_catalog", 1},
-	    {"acl_grant_object", 1},
-	    {"acl_define_role", -1},
-	    {"acl_define_issuer", -1},
-	    {"acl_define_client", -1},
-	    {"acl_alter_client", -1},
-	    {"acl_drop_client", -1},
-	    {"acl_map_role", -1},
-	    {"acl_alter_relation", 0},
-	    {"acl_alter_schema_alias", 0},
-	    {"acl_alter_function", 0},
-	    {"acl_alter_catalog", 0},
-	    {"acl_alter_grant", 1},
-	    {"acl_alter_role", -1},
-	    {"acl_alter_issuer", -1},
-	    {"acl_drop_schema_alias", 0},
-	    {"acl_drop_function", 0},
-	    {"acl_drop_role", -1},
-	    {"acl_drop_issuer", -1},
-	    {"acl_drop_role_mapping", -1},
-	    {"acl_comment", 0},
-	    {"acl_refresh_schema", 0},
-	    {"acl_check_catalog", 0},
-	    {"acl_repair_relation", 0},
-	    {"acl_expand_schema", 0},
-	    {"acl_refresh_schema_objects", 0},
-	    {"acl_grant_schema", 1},
-	    {"acl_revoke_schema", 1},
-	    {"acl_rematerialize_schema_caps", 0},
-	    // spec 072: a category acts in every catalog a role holds, so none of these is catalog-specific -
-	    // an unrestricted manage scope, never a catalog-scoped one
-	    {"acl_create_function_category", -1},
-	    {"acl_drop_function_category", -1},
-	    {"acl_function_category_add", -1},
-	    {"acl_function_category_remove", -1},
-	    {"acl_grant_function_category", -1},
-	    {"acl_revoke_function_category", -1},
-	    {"acl_grant_function", -1},
-	    {"acl_revoke_function", -1},
-	    // spec 074 slice 3: a session is the node's, not a catalog's - an unrestricted manage scope
-	    {"acl_session_profile", -1},
-	    // spec 085: a resource group limits a role's sessions on the whole node - unrestricted manage
-	    {"acl_create_resource_group", -1},
-	    {"acl_alter_resource_group", -1},
-	    {"acl_drop_resource_group", -1},
-	    {"acl_grant_resource_group", -1},
-	    {"acl_revoke_resource_group", -1},
-	};
-	MgmtProvenance provenance;
-	auto &select = statement.Cast<SelectStatement>().node->Cast<SelectNode>();
-	// the one compiled form that is a table function in FROM (CHECK VIRTUAL CATALOG, spec 039) is
-	// judged exactly like a scalar call: by its name and the catalog its first argument names
-	auto call_of = [&]() -> FunctionExpression & {
-		if (select.from_table && select.from_table->type == TableReferenceType::TABLE_FUNCTION) {
-			return select.from_table->Cast<TableFunctionRef>().function->Cast<FunctionExpression>();
-		}
-		return select.select_list[0]->Cast<FunctionExpression>();
-	};
-	auto &call = call_of();
-	auto name = StringUtil::Lower(call.FunctionName().GetIdentifierName());
-	if (name == "acl_grant_admin" || name == "acl_revoke_admin") {
-		provenance.escalates = true;
-		return provenance;
-	}
-	if (StringUtil::StartsWith(name, "acl_cluster_")) {
-		provenance.infrastructure = true;
-		return provenance;
-	}
-	if (name == "acl_grant_catalog" || name == "acl_revoke_catalog" || name == "acl_grant_object" ||
-	    name == "acl_grant_schema" || name == "acl_revoke_schema" || name == "acl_alter_grant" ||
-	    name == "acl_drop_catalog") {
-		// dropping a catalog takes it away from everyone who holds it, so it is privilege
-		// administration too - a scope over the catalog's content does not include destroying it
-		provenance.hands_out = true;
-		return provenance;
-	}
-	auto entry = CATALOG_ARG.find(name);
-	if (entry == CATALOG_ARG.end()) {
-		// a management call this table does not know: refuse rather than treat it as unscoped
-		throw BinderException("acl admin: cannot authorize the management call \"%s\"", name);
-	}
-	if (entry->second >= 0 && NumericCast<idx_t>(entry->second) < call.GetArguments().size()) {
-		// a call without the catalog argument (acl_check_catalog() over every catalog) stays
-		// unscoped, which the caller reads as "needs an unrestricted manage scope"
-		auto &argument = call.GetArguments()[NumericCast<idx_t>(entry->second)].GetExpression();
-		provenance.vcat = argument.Cast<ConstantExpression>().GetLiteral().ToValue().ToString();
-	}
-	return provenance;
-}
-
 //! The whole batch is management statements (the first one decided that); mixing is refused
 
 } // namespace
 
+vector<string> SplitBatchText(const string &text) {
+	vector<string> out;
+	string current;
+	idx_t depth = 0;
+	auto flush = [&]() {
+		// the statement without what opens it but says nothing: whitespace and comments
+		idx_t i = 0;
+		while (i < current.size()) {
+			if (StringUtil::CharacterIsSpace(current[i])) {
+				i++;
+			} else if (current.compare(i, 2, "--") == 0) {
+				auto end = current.find('\n', i);
+				i = end == string::npos ? current.size() : end + 1;
+			} else if (current.compare(i, 2, "/*") == 0) {
+				auto end = current.find("*/", i + 2);
+				i = end == string::npos ? current.size() : end + 2;
+			} else {
+				break;
+			}
+		}
+		auto statement = current.substr(i);
+		StringUtil::Trim(statement);
+		if (!statement.empty()) {
+			out.push_back(statement);
+		}
+		current.clear();
+	};
+	for (idx_t i = 0; i < text.size(); i++) {
+		auto c = text[i];
+		if (c == '\'' || c == '"') {
+			// a literal or a quoted identifier, the doubled quote its own escape
+			current += c;
+			for (i++; i < text.size(); i++) {
+				current += text[i];
+				if (text[i] == c) {
+					if (i + 1 < text.size() && text[i + 1] == c) {
+						current += text[++i];
+						continue;
+					}
+					break;
+				}
+			}
+			continue;
+		}
+		if (c == '$') {
+			// a dollar-quoted string: $tag$ ... $tag$
+			auto close = text.find('$', i + 1);
+			if (close != string::npos) {
+				auto tag = text.substr(i, close - i + 1);
+				bool word = true;
+				for (idx_t k = 1; k + 1 < tag.size(); k++) {
+					word = word && IsWordChar(tag[k]);
+				}
+				auto end = word ? text.find(tag, close + 1) : string::npos;
+				if (end != string::npos) {
+					current += text.substr(i, end + tag.size() - i);
+					i = end + tag.size() - 1;
+					continue;
+				}
+			}
+		}
+		if (c == '-' && i + 1 < text.size() && text[i + 1] == '-') {
+			auto end = text.find('\n', i);
+			end = end == string::npos ? text.size() : end;
+			current += text.substr(i, end - i);
+			i = end - 1;
+			continue;
+		}
+		if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
+			auto end = text.find("*/", i + 2);
+			end = end == string::npos ? text.size() : end + 2;
+			current += text.substr(i, end - i);
+			i = end - 1;
+			continue;
+		}
+		if (c == '(') {
+			depth++;
+		} else if (c == ')' && depth > 0) {
+			depth--;
+		} else if (c == ';' && depth == 0) {
+			flush();
+			continue;
+		}
+		current += c;
+	}
+	flush();
+	return out;
+}
+
+bool BatchHasMgmtStatement(const string &text) {
+	for (auto &statement : SplitBatchText(text)) {
+		if (IsMgmtStart(statement)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool BatchIsAllMgmt(const string &text) {
+	auto statements = SplitBatchText(text);
+	for (auto &statement : statements) {
+		if (!IsMgmtStart(statement)) {
+			return false;
+		}
+	}
+	return !statements.empty();
+}
+
 vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session) {
+	if (!BatchIsAllMgmt(text) && BatchHasMgmtStatement(text)) {
+		// spec 117: a batch is all management or all queries - a mix would run half of it in each world
+		throw BinderException("acl admin: a batch mixing management statements and queries is refused - send each "
+		                      "kind in a batch of its own");
+	}
 	vector<unique_ptr<SQLStatement>> statements;
 	AdminScanner scanner(text);
 	while (!scanner.Done()) {
@@ -2225,47 +2307,6 @@ vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicySto
 		throw BinderException("acl admin: empty management batch");
 	}
 	return statements;
-}
-
-//! Authorize a management batch against the principal's rights (spec 009). A catalog-scoped MANAGE
-//! edits the content of its own catalogs; handing out access or admin scopes is privilege
-//! administration and needs an unrestricted manage / passthrough. PASSTHROUGH may do anything.
-
-void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights) {
-	if (rights.scope == AdminScope::PASSTHROUGH) {
-		return;
-	}
-	for (auto &statement : statements) {
-		auto provenance = ProvenanceOf(*statement);
-		if (provenance.escalates) {
-			throw BinderException("acl admin: granting admin scopes requires a passthrough scope");
-		}
-		if (provenance.infrastructure) {
-			throw BinderException("acl admin: ACL CLUSTER changes the cluster's infrastructure (extensions, sources, "
-			                      "settings) and requires a passthrough scope - manage administers the ACL, not the "
-			                      "nodes");
-		}
-		if (provenance.hands_out && !rights.unrestricted_manage) {
-			throw BinderException("acl admin: granting access to a catalog requires an unrestricted manage "
-			                      "scope - managing a catalog does not include handing it out");
-		}
-		if (rights.unrestricted_manage) {
-			continue;
-		}
-		if (provenance.vcat.empty()) {
-			throw BinderException(
-			    "acl admin: this statement is not catalog-specific and needs an unrestricted manage scope");
-		}
-		// case-insensitive (spec 116): a write lands on the catalog as the policy spells it
-		// (PolicyStore::SpellCatalog), and the policy holds one spelling per catalog name
-		bool managed = false;
-		for (auto &catalog : rights.catalogs) {
-			managed = managed || NamePath::KeyEquals(catalog, provenance.vcat);
-		}
-		if (!managed) {
-			throw BinderException("acl admin: no manage scope for catalog \"%s\"", provenance.vcat);
-		}
-	}
 }
 
 } // namespace acl

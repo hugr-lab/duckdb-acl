@@ -4,6 +4,7 @@
 
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_platform.hpp"
 #include "acl_types.hpp"
 
 namespace duckdb {
@@ -77,7 +78,10 @@ vector<CatalogBackend::VisibleFunction> CatalogBackend::VisibleFunctions(const P
 	return out;
 }
 
-string CatalogBackend::MetadataListingSql(const Principal &principal, const string &surface) {
+string CatalogBackend::MetadataListingSql(const Principal &principal, const string &surface,
+                                          const string &platform_objects, const string &platform_columns) {
+	// spec 117: the system catalog's views this principal holds - constants, one `platform.main` schema
+	bool platform = !platform_objects.empty();
 	if (function_mode) {
 		throw BinderException("acl: this policy source does not expose enumeration, so %s cannot be listed "
 		                      "for a principal",
@@ -186,7 +190,9 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                          " WHERE " + FunctionVisibleExpr() + ")";
 	string schemas = function_schemas +
 	                 ", leafschemas AS (SELECT vcat, path FROM aliases UNION SELECT vcat, vschema FROM objects"
-	                 " UNION SELECT vcat, path FROM fschemas),"
+	                 " UNION SELECT vcat, path FROM fschemas" +
+	                 string(platform ? " UNION SELECT 'platform' AS vcat, 'main' AS path" : "") +
+	                 "),"
 	                 " vschemas AS (SELECT vcat, path FROM leafschemas UNION SELECT vcat, unnest(list_transform("
 	                 "range(1, len(" +
 	                 KeyTokensSql("path") + ")), lambda i: array_to_string(" + KeyTokensSql("path") +
@@ -239,8 +245,11 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                   " AND (gc.cat_columns IS NULL OR trim(gc.cat_columns) = '')"
 	                   " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))))"
 	                   " GROUP BY vcat, vname, name))";
-	auto prelude = GrantsCte(principal) + ", " + physcols + ", " + declared + ", " + objects + ", " + aliases + ", " +
-	               schemas + ", " + grant_columns + ", " + vfunctions + ", " + projected + " ";
+	auto prelude =
+	    GrantsCte(principal) + ", " + physcols + ", " + declared + ", " + objects + ", " + aliases + ", " + schemas +
+	    ", " + grant_columns + ", " + vfunctions + ", " + projected +
+	    (platform ? ", pobjects AS (" + platform_objects + "), pcolumns AS (" + platform_columns + ")" : string()) +
+	    " ";
 	// spec 035: each surface answers in its own standard shape, column for column and type for
 	// type. A value that would describe the physical object rather than the virtual one is not
 	// borrowed - an oid identifies a physical catalog entry, a path is the physical database.
@@ -285,13 +294,18 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	};
 	if (surface == "databases") {
 		// one row per granted catalog, and no physical database name ever appears
+		// the catalog's own comment (spec 117 §7) - the system catalog's says what it is
+		string catalog_comment =
+		    "CASE WHEN d.vcat = 'platform' AND " + string(platform ? "true" : "false") +
+		    " THEN 'the system catalog of administration (spec 117)' ELSE (SELECT nullif(max(c.\"comment\"), '') "
+		    "FROM " +
+		    Tbl("catalogs") + " c WHERE " + KeyFoldSql("c.\"vcat\"") + " = " + KeyFoldSql("d.vcat") + ") END";
 		return prelude + named("SELECT vcat AS database_name, " + database_oid("vcat") +
-		                           " AS database_oid, NULL::VARCHAR AS path,"
-		                           " NULL::VARCHAR AS comment, " +
-		                           empty_map +
+		                           " AS database_oid, NULL::VARCHAR AS path, " + catalog_comment +
+		                           "::VARCHAR AS comment, " + empty_map +
 		                           " AS tags, false AS internal, NULL::VARCHAR AS type,"
 		                           " false AS readonly, false AS encrypted, NULL::VARCHAR AS cipher, " +
-		                           empty_map + " AS options FROM (SELECT DISTINCT vcat FROM vschemas)",
+		                           empty_map + " AS options FROM (SELECT DISTINCT vcat FROM vschemas) d",
 		                       {{"database_name", Shown::CATALOG}});
 	}
 	if (surface == "schemata") {
@@ -308,14 +322,18 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		// doubled its levels (`raw` -> `raw.eu`). The oid stays the full path's, as every other surface's
 		// schema_oid is.
 		// (spec 116: the leaves unquoted - a part holding a dot is one schema, never two levels)
+		// a schema's stored comment (an alias or an expansion carries one; spec 117 §7)
+		string schema_comment = "(SELECT nullif(max(sc.\"comment\"), '') FROM " + Tbl("schemas") + " sc WHERE " +
+		                        KeyFoldSql("sc.\"vcat\"") + " = " + KeyFoldSql("d.vcat") + " AND " +
+		                        KeyFoldSql("sc.\"path\"") + " = " + KeyFoldSql("d.path") + ")";
 		return prelude +
 		       named("SELECT " + schema_oid("vcat", "path") + " AS oid, vcat AS database_name, " +
 		                 database_oid("vcat") + " AS database_oid, " + KeyUnquoteSql(KeyLeafSql("path")) +
-		                 " AS schema_name, NULL::VARCHAR AS comment, " + empty_map +
+		                 " AS schema_name, " + schema_comment + "::VARCHAR AS comment, " + empty_map +
 		                 " AS tags, false AS internal, NULL::VARCHAR AS sql, " + KeyUnquoteSql(KeyLeafSql("parent")) +
 		                 " AS parent_schema, CASE WHEN parent IS NULL THEN NULL ELSE " + schema_oid("vcat", "parent") +
 		                 " END AS parent_schema_oid FROM (SELECT DISTINCT vcat, path, CASE WHEN " +
-		                 KeyNestedSql("path") + " THEN " + KeyParentSql("path") + " END AS parent FROM vschemas)",
+		                 KeyNestedSql("path") + " THEN " + KeyParentSql("path") + " END AS parent FROM vschemas) d",
 		             {{"database_name", Shown::CATALOG}});
 	}
 	// spec 031: the SHOW forms, each in the shape duckdb answers it with. They are the same catalog
@@ -369,14 +387,21 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    object_insertable + ") FROM objects o JOIN information_schema.tables i ON " + physical +
 	    " WHERE len(o.parts) = 3"
 	    " UNION ALL BY NAME"
+	    // a view's own comment (spec 117 §7: it never reached duckdb_views / information_schema.tables)
 	    " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
-	    " 'VIEW' AS table_type, 'NO' AS is_insertable_into FROM objects o WHERE o.form = 'view'"
+	    " 'VIEW' AS table_type, 'NO' AS is_insertable_into, o.comment AS \"TABLE_COMMENT\" FROM objects o"
+	    " WHERE o.form = 'view'"
 	    " UNION ALL BY NAME"
 	    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +
 	    KeyQuotePartSql("i.\"table_name\"") + " AS table_name, " + alias_insertable +
 	    ") FROM aliases a JOIN information_schema.tables i"
 	    " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
-	    " WHERE len(a.parts) = 2";
+	    " WHERE len(a.parts) = 2" +
+	    // spec 117: the system catalog's views the principal holds
+	    string(platform ? " UNION ALL BY NAME SELECT 'platform' AS table_catalog, 'main' AS table_schema,"
+	                      " p.vname AS table_name, 'VIEW' AS table_type, 'NO' AS is_insertable_into,"
+	                      " p.comment AS \"TABLE_COMMENT\" FROM pobjects p"
+	                    : "");
 	const vector<std::pair<const char *, Shown>> table_names = {
 	    {"table_catalog", Shown::CATALOG}, {"table_schema", Shown::SCHEMA}, {"table_name", Shown::NAME}};
 	if (surface == "tables") {
@@ -529,7 +554,12 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    ") END, gp.type), o.strip_alias, o.enums_to_varchar) AS data_type"
 	    " FROM gprojection gp JOIN objects o ON o.vcat = gp.vcat AND " +
 	    path("o") + " = gp.vname LEFT JOIN lcols s ON s.table_catalog = gp.vcat AND " + source_path +
-	    " = gp.vname AND " + KeyFoldSql("s.column_name") + " = " + KeyFoldSql("gp.name");
+	    " = gp.vname AND " + KeyFoldSql("s.column_name") + " = " + KeyFoldSql("gp.name") +
+	    // spec 117: the columns of the system catalog's views - the types each view declares
+	    (platform ? " UNION ALL BY NAME SELECT 'platform' AS table_catalog, 'main' AS table_schema, pc.vname AS"
+	                " table_name, pc.name AS column_name, pc.pos AS ordinal_position, pc.type AS data_type,"
+	                " 'YES' AS is_nullable FROM pcolumns pc"
+	              : string());
 	if (surface == "columns") {
 		return prelude + named(effective_columns, table_names);
 	}
@@ -908,7 +938,13 @@ bool PolicyStore::MetadataListing(const Principal &principal, const string &surf
 	if (!catalog) {
 		return false; // the memory store has no catalog to list; the surface stays denied
 	}
-	sql = catalog->MetadataListingSql(principal, surface);
+	// spec 117: the platform catalog's share - absent on the quack door (quack loads a catalog whole and
+	// the console is Flight / JDBC), and for a principal holding nothing on it
+	string platform_objects, platform_columns;
+	if (principal.session.empty() || SessionDoorOf(principal.session) != "quack") {
+		PlatformListingCtes(AdminRightsOf(principal), platform_objects, platform_columns);
+	}
+	sql = catalog->MetadataListingSql(principal, surface, platform_objects, platform_columns);
 	return true;
 }
 

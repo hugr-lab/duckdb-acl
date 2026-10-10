@@ -346,8 +346,14 @@ struct CatalogBackend {
 	//! spec 095: the identity model of this policy version (issuers, clients, role mappings), read
 	//! whole on first use and dropped on a version bump; nullptr until then
 	shared_ptr<const IdentityModel> identity_model;
-	//! rolesig -> (manage catalogs, acl.admins rows); administration statements hit this per batch
-	std::unordered_map<string, std::pair<std::set<string>, vector<std::pair<string, string>>>> rights_cache;
+	//! rolesig -> (manage catalogs, acl.admins rows, platform grants); administration statements hit
+	//! this per batch
+	struct RightsRows {
+		std::set<string> catalogs;
+		vector<std::pair<string, string>> scopes;
+		vector<std::pair<string, bool>> platform; // `<kind>:<object>` -> allowed (spec 117)
+	};
+	std::unordered_map<string, RightsRows> rights_cache;
 	case_insensitive_map_t<vector<GrantRow>> fn_grants; // function mode: role -> rows
 	case_insensitive_set_t fn_grants_loaded;
 
@@ -517,7 +523,10 @@ struct CatalogBackend {
 	//! identity columns are REPLACEd with the virtual ones, so every other column (types, nullability,
 	//! whatever duckdb adds next) stays correct for free. Objects without a physical row (a view, a
 	//! query-defined function) are added through UNION ALL BY NAME, which fills the rest with NULL.
-	string MetadataListingSql(const Principal &principal, const string &surface);
+	//! spec 117: `platform_objects` / `platform_columns` are the system catalog's share (constant CTE bodies,
+	//! PlatformListingCtes) - empty when the principal holds nothing on it
+	string MetadataListingSql(const Principal &principal, const string &surface,
+	                          const string &platform_objects = string(), const string &platform_columns = string());
 
 	//! Targeted gate lookup: only the rows for this name and these roles leave the database ('' as
 	//! role means a global row - NULL cannot be part of the primary key). Role-specific rows beat
@@ -540,8 +549,8 @@ struct CatalogBackend {
 	//! The model from rows already read (the write path reads them inside its own transaction)
 	static IdentityModel IdentityFromRows(QueryResult *issuers, QueryResult *clients, QueryResult *mappings);
 
-	//! Load (and cache) both administration sources for the principal in one go
-	void LoadRights(const Principal &principal, std::set<string> &catalogs, vector<std::pair<string, string>> &scopes);
+	//! Load (and cache) every administration source for the principal in one go
+	void LoadRights(const Principal &principal, RightsRows &out);
 
 	//! The catalogs the principal may MANAGE: a capability of the catalog grant itself, so a role can
 	//! manage many catalogs (and manage one without being able to read it)
@@ -549,6 +558,8 @@ struct CatalogBackend {
 
 	//! The admin scopes of the principal's roles; the function-driver may serve them through a slot
 	void AdminScopes(const Principal &principal, vector<std::pair<string, string>> &out);
+	//! spec 117: the point grants on `platform` of the principal's roles (none through a function driver)
+	void PlatformGrants(const Principal &principal, vector<std::pair<string, bool>> &out);
 
 	//! spec 095: which of these values exist as roles (UNMAPPED AS ROLE keeps only those)
 	void KnownRoles(const vector<string> &values, case_insensitive_set_t &known_roles);

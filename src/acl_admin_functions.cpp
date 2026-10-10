@@ -1,4 +1,5 @@
 #include "acl_admin_functions.hpp"
+#include "acl_platform.hpp"
 #include "acl_door_common.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -817,6 +818,13 @@ FunctionSpec ParseFunctionSpec(const string &spec_p, const char *fn) {
 	key.name = StringUtil::Lower(key.name);
 	key.database = StringUtil::Lower(key.database);
 	key.schema = StringUtil::Lower(key.schema);
+	if (IsPlatformCatalog(key.database) || (key.database == "system" && IsPlatformCatalog(key.schema))) {
+		// spec 117: the platform catalog's functions are granted on platform (GRANT FUNCTION platform.<f>),
+		// never through a category or a function grant - a category could hand them to every role
+		throw BinderException("%s: \"%s\" names the platform catalog, whose functions are granted on platform "
+		                      "itself (acl_grant_platform / GRANT FUNCTION platform.<f> TO ROLE r)",
+		                      fn, spec_p);
+	}
 	if (FunctionNeverCallable(key.name, key.database)) {
 		throw BinderException("%s: \"%s\" is never callable under a principal - it runs SQL past the rewriter or "
 		                      "reads memory by pointer - and only ACL NATIVE may run it; no category or grant "
@@ -1400,11 +1408,12 @@ void AclDropRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_grant_admin(role, scope): a GLOBAL administration scope (spec 009) - 'observe' (reading the load
-//! report and /metrics, spec 097), 'manage' (the management grammar over every catalog, plus the
-//! statements that belong to no catalog) or 'passthrough' (anything, including native SQL - god mode).
-//! A role holds one: the grant replaces what it held. Managing ONE catalog is not granted here: it is a
-//! capability of the catalog grant, `acl_grant_catalog(role, vcat, '{"manage": true}')`.
+//! acl_grant_admin(role, scope): a GLOBAL administration bundle (spec 009 / 117) - 'observe' (the node
+//! views, the load report and /metrics, spec 097), 'policy' (the policy views and every policy function
+//! but the admin grants), 'manage' (spec 009's name: policy + observe) or 'passthrough' (anything,
+//! including native SQL - the break-glass). A role holds several: a grant adds its bundle. Managing ONE
+//! catalog is not granted here: it is a capability of the catalog grant, `acl_grant_catalog(role, vcat,
+//! '{"manage": true}')`.
 void AclGrantAdminFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_grant_admin", "role");
@@ -1414,10 +1423,70 @@ void AclGrantAdminFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
-//! acl_revoke_admin(role): drop the role's ACL-administration scope
+//! acl_revoke_admin(role[, scope]): one bundle, or (no scope) every administration of the role - its
+//! bundles, its catalogs' manage and its point grants on platform
 void AclRevokeAdminFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
-		StoreOf(state).RevokeAdmin(RequiredArg(args, 0, row, "acl_revoke_admin", "role"));
+		auto scope = OptionalArg(args, 1, row, "");
+		if (!scope.empty()) {
+			ParseAdminScope(scope); // a bundle this build does not know is refused by name
+		}
+		StoreOf(state).RevokeAdmin(RequiredArg(args, 0, row, "acl_revoke_admin", "role"), StringUtil::Lower(scope));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! The kind and the object of a point grant on platform (spec 117), checked: a view or a function the
+//! system catalog has, never one passthrough keeps for itself (the admin grants, the cluster profile)
+void PlatformGrantTarget(DataChunk &args, idx_t row, const char *fn, string &role, string &kind, string &object) {
+	role = OptionalArg(args, 0, row, "");
+	if (role.empty()) {
+		throw BinderException("%s: a grant on the platform catalog names one role - never every role ('')", fn);
+	}
+	kind = StringUtil::Lower(RequiredArg(args, 1, row, fn, "kind"));
+	object = StringUtil::Lower(RequiredArg(args, 2, row, fn, "object"));
+	if (kind == "view") {
+		if (!FindPlatformView(object)) {
+			throw BinderException("%s: the platform catalog has no view \"%s\"", fn, object);
+		}
+		return;
+	}
+	if (kind != "function") {
+		throw BinderException("%s: the kind is view or function, got \"%s\"", fn, kind);
+	}
+	auto function = FindPlatformFunction(object);
+	if (!function) {
+		throw BinderException("%s: the platform catalog has no function \"%s\"", fn, object);
+	}
+	if (function->right == PlatformRight::ESCALATES || function->right == PlatformRight::INFRASTRUCTURE ||
+	    function->right == PlatformRight::OPEN) {
+		throw BinderException("%s: platform.%s is %s - it is never granted by name", fn, object,
+		                      function->right == PlatformRight::OPEN ? "every holder's"
+		                                                             : "the passthrough scope's alone");
+	}
+}
+
+//! acl_grant_platform(role, kind, object[, allowed]): a point grant (or, allowed 'false', a deny) on one
+//! view or function of the platform catalog (spec 117)
+void AclGrantPlatformFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		string role, kind, object;
+		PlatformGrantTarget(args, row, "acl_grant_platform", role, kind, object);
+		auto allowed = StringUtil::Lower(OptionalArg(args, 3, row, "true"));
+		if (allowed != "true" && allowed != "false") {
+			throw BinderException("acl_grant_platform: allowed is true or false, got \"%s\"", allowed);
+		}
+		StoreOf(state).GrantPlatform(role, kind, object, allowed == "true");
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_revoke_platform(role, kind, object): the point grant or deny goes
+void AclRevokePlatformFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		string role, kind, object;
+		PlatformGrantTarget(args, row, "acl_revoke_platform", role, kind, object);
+		StoreOf(state).RevokePlatform(role, kind, object);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -2177,7 +2246,10 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin("acl_alter_issuer", {v, v}, AclAlterIssuerFunc);
 	// ACL administration scopes (spec 009)
 	register_admin("acl_grant_admin", {v, v}, AclGrantAdminFunc);
-	register_admin("acl_revoke_admin", {v}, AclRevokeAdminFunc);
+	register_admin_set("acl_revoke_admin", {{v}, {v, v}}, AclRevokeAdminFunc);
+	// spec 117: the point grants on the platform catalog
+	register_admin_set("acl_grant_platform", {{v, v, v}, {v, v, v, v}}, AclGrantPlatformFunc);
+	register_admin("acl_revoke_platform", {v, v, v}, AclRevokePlatformFunc);
 }
 
 } // namespace acl

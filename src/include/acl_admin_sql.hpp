@@ -3,8 +3,8 @@
 //
 // `ACL ADMIN CREATE VIRTUAL CATALOG ...`, `GRANT CATALOG ... TO ROLE ...`, `ALTER ...`, `DROP ...`
 // and the rest compile, with no parse-time side effects, into calls of the acl_* admin functions;
-// AuthorizeMgmt then judges every compiled call against the principal's administration scope
-// (spec 009) before anything runs. The parser override (acl_parser_override.cpp) is the only caller:
+// AuthorizeMgmt (acl_platform.hpp) then judges every compiled call against the principal's rights
+// (spec 009 / 117) before anything runs. The parser override (acl_parser_override.cpp) is the only caller:
 // it recognises the `ACL <management>` marker after a principal and hands the text here.
 //===----------------------------------------------------------------------===//
 #pragma once
@@ -34,10 +34,16 @@ bool IsSecretsStart(const string &text);
 //! (PolicyStore::SecretService).
 vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicyStore &store);
 
-//! The authorization gate of spec 009: every compiled call is judged against `rights` - the
-//! catalog it acts on, whether it hands out access or scopes - and a refusal anywhere in the batch
-//! throws before any statement runs. A call the gate does not know is refused, never waved through.
-void AuthorizeMgmt(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights);
+//! spec 117: split a batch's text into its statements (quote-, comment- and paren-aware) - what the
+//! mixed-batch rule reads: a batch is all management statements or none
+vector<string> SplitBatchText(const string &text);
+//! spec 117: whether any statement of the batch opens with a management form
+bool BatchHasMgmtStatement(const string &text);
+//! spec 117: whether every statement of the batch opens with a management form
+bool BatchIsAllMgmt(const string &text);
+
+// The authorization gate (spec 009) moved to acl_platform.hpp (spec 117): AuthorizeMgmt is the one
+// authorizer of the grammar and of a direct platform.<op>(…) call alike.
 
 } // namespace acl
 } // namespace duckdb

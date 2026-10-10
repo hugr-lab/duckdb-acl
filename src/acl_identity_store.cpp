@@ -560,10 +560,10 @@ bool PolicyStore::RolePrivileged(const string &role) {
 	Principal probe;
 	probe.roles = {role};
 	auto rights = AdminRightsOf(probe);
-	// any scope, observe included (spec 097): a role that reads the node's load report is privileged
-	// too - reached only through a client's own mapping (spec 095), never by an IdP group's name
-	return rights.scope != AdminScope::NONE || rights.unrestricted_manage || !rights.catalogs.empty() ||
-	       rights.unknown_scope;
+	// any bundle, observe included (spec 097), a catalog's manage, and (spec 117) any point grant on the
+	// platform catalog - deny or grant: a role that holds anything of administration is privileged,
+	// reached only through a client's own mapping (spec 095), never by an IdP group's name
+	return rights.Privileged();
 }
 
 void PolicyStore::VerifyJwtPrincipal(const string &token, const string &iss, Principal &out, bool ignore_exp,

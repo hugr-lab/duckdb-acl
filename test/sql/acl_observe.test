@@ -34,7 +34,7 @@ SELECT acl_grant_admin('watcher', 'observe');
 statement error
 SELECT acl_grant_admin('watcher', 'superpowers');
 ----
-<REGEX>:.*unknown admin scope "superpowers" \(expected observe, manage or passthrough\).*
+<REGEX>:.*unknown admin scope "superpowers" \(expected observe, policy, manage or passthrough\).*
 
 # --- catalog mode -----------------------------------------------------------------------------------
 

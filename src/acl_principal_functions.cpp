@@ -15,6 +15,7 @@
 
 #include "acl_policy.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_platform.hpp"
 #include "duckdb/main/connection.hpp"
 
 #include <set>
@@ -231,6 +232,14 @@ CallableFunctions(PolicyStore &store, acl_detail::CatalogBackend *catalog, const
 	return out;
 }
 
+//! spec 117: the platform functions a principal may call, none on the quack door
+vector<PlatformFunctionRow> PlatformRowsFor(PolicyStore &store, const Principal &principal) {
+	if (!principal.session.empty() && store.SessionDoorOf(principal.session) == "quack") {
+		return {};
+	}
+	return PlatformFunctionRows(store.AdminRightsOf(principal));
+}
+
 } // namespace
 
 string PolicyStore::PrincipalFunctionColumnsSql(const Principal &principal) {
@@ -261,6 +270,17 @@ string PolicyStore::PrincipalFunctionColumnsSql(const Principal &principal) {
 		}
 		if (function.kind == "scalar" && !function.returns.IsNull()) {
 			rows.push_back("(" + head + ", 'return', 0, NULL, " + Quote(function.returns.ToString()) + ", NULL, NULL)");
+		}
+	}
+	// spec 117: and the platform catalog's functions' parameters
+	for (auto &function : PlatformRowsFor(*this, principal)) {
+		auto head = string("'platform', 'main', ") + Quote(function.name) + ", " + Quote(function.kind);
+		for (idx_t i = 0; i < function.parameters.size(); i++) {
+			rows.push_back("(" + head + ", 'param', " + std::to_string(i + 1) + ", " + Quote(function.parameters[i]) +
+			               ", " + Quote(function.parameter_types[i]) + ", NULL, NULL)");
+		}
+		if (function.kind == "scalar") {
+			rows.push_back("(" + head + ", 'return', 0, NULL, " + Quote(function.returns) + ", NULL, NULL)");
 		}
 	}
 	string shape = "SELECT NULL::VARCHAR AS database_name, NULL::VARCHAR AS schema_name, NULL::VARCHAR AS "
@@ -306,6 +326,18 @@ string PolicyStore::PrincipalFunctionsSql(const Principal &principal) {
 		               QuoteOrNull(returns) + "::VARCHAR, " + ListLiteral(names) + ", " + ListLiteral(types) +
 		               ", NULL::VARCHAR, NULL::VARCHAR, NULL::BOOLEAN, false, NULL::VARCHAR, " +
 		               OidOf("function", function.vcat + "\x1f" + function.vname + "\x1f" + function.kind) +
+		               ", []::VARCHAR[], NULL::VARCHAR, []::VARCHAR[]");
+	}
+
+	// spec 117: the platform catalog's functions this principal may call - absent on the quack door
+	for (auto &function : PlatformRowsFor(*this, principal)) {
+		rows.push_back("SELECT 'platform'::VARCHAR, " + OidOf("database", "platform") + "::VARCHAR, 'main'::VARCHAR, " +
+		               Quote(function.name) + "::VARCHAR, NULL::VARCHAR, " + Quote(function.kind) +
+		               "::VARCHAR, NULL::VARCHAR, " + Quote(function.comment) +
+		               "::VARCHAR, MAP {}::MAP(VARCHAR, VARCHAR), " + Quote(function.returns) + "::VARCHAR, " +
+		               ListLiteral(function.parameters) + ", " + ListLiteral(function.parameter_types) +
+		               ", NULL::VARCHAR, NULL::VARCHAR, " + (function.kind == "table" ? "false" : "true") +
+		               ", false, NULL::VARCHAR, " + OidOf("function", "platform\x1fmain\x1f" + function.name) +
 		               ", []::VARCHAR[], NULL::VARCHAR, []::VARCHAR[]");
 	}
 

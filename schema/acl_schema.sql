@@ -59,8 +59,15 @@ CREATE TABLE IF NOT EXISTS acl."issuers"("name" VARCHAR PRIMARY KEY, "url" VARCH
 
 CREATE TABLE IF NOT EXISTS acl."clients"("name" VARCHAR PRIMARY KEY, "issuer" VARCHAR, "audiences" VARCHAR, "azp" VARCHAR, "requires" VARCHAR, "roles_from" VARCHAR, "roles_constant" VARCHAR, "unmapped" VARCHAR, "attributes" VARCHAR, "subject" VARCHAR, "token_type" VARCHAR, "client_id" VARCHAR, "flows" VARCHAR, "secret_service" VARCHAR, "secret" VARCHAR, "implicit" BOOLEAN);
 
--- '' as vcat means "every catalog": NULL cannot be part of the primary key
-CREATE TABLE IF NOT EXISTS acl."admins"("role" VARCHAR PRIMARY KEY, "scope" VARCHAR, "vcat" VARCHAR);
+-- '' as vcat means "every catalog": NULL cannot be part of the primary key. Spec 117: a role holds
+-- several bundles (observe, policy, passthrough; manage is spec 009's policy + observe), so the key is the row
+CREATE TABLE IF NOT EXISTS acl."admins"("role" VARCHAR, "scope" VARCHAR, "vcat" VARCHAR, PRIMARY KEY ("role", "scope", "vcat"));
+
+-- spec 117: point grants on the platform catalog's objects (kind view | function); allowed = false is a
+-- deny, which wins over every bundle but passthrough. Never in role_catalogs / role_object_caps /
+-- function_grants: a row there would spread into every listing, and a category could hand platform's
+-- keys to every role
+CREATE TABLE IF NOT EXISTS acl."platform_grants"("role" VARCHAR, "object" VARCHAR, "kind" VARCHAR, "allowed" BOOLEAN, PRIMARY KEY ("role", "object", "kind"));
 
 -- spec 095: a mapping is scoped to one client or to every client of one issuer
 CREATE TABLE IF NOT EXISTS acl."role_mappings"("scope_kind" VARCHAR, "scope_name" VARCHAR, "source" VARCHAR, "external_value" VARCHAR, "role" VARCHAR, PRIMARY KEY ("scope_kind", "scope_name", "source", "external_value", "role"));
@@ -140,7 +147,7 @@ INSERT INTO acl."function_grants" SELECT * FROM (VALUES ('', 'base', '', '', '',
 
 INSERT INTO acl."meta" SELECT 'function_seed', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'function_seed');
 
-INSERT INTO acl."meta" SELECT 'schema_version', '20' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
+INSERT INTO acl."meta" SELECT 'schema_version', '21' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
 
 INSERT INTO acl."meta" SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'policy_version');
 
@@ -148,4 +155,4 @@ INSERT INTO acl."meta" SELECT 'config_version', '0' WHERE NOT EXISTS (SELECT 1 F
 
 -- spec 094: the oldest build that may read this catalog (it then serves, and never writes). Equal to the
 -- min_reader the latest step in schema/migrations/ declares; gen_schema checks the two agree.
-INSERT INTO acl."meta" SELECT 'min_reader_version', '20' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'min_reader_version');
+INSERT INTO acl."meta" SELECT 'min_reader_version', '21' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'min_reader_version');
