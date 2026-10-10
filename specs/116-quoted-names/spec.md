@@ -51,11 +51,13 @@ a LIST path - the policy catalog lives in any attached engine (spec 006), and My
 no arrays.
 
 ### 3. Case
-Names are stored as written and compared case-insensitively (`lower(a) = lower(b)` in SQL,
-`StringUtil::CIEquals` / `Lower` in C++), for catalogs, schema paths, relations, functions, references
-and keys - as duckdb's catalog compares. A name that differs from an existing sibling only by case is
-refused where it is written (each kind). SQL `lower()` folds Unicode while duckdb folds ASCII: `"Ä"`
-and `"ä"` are one name to us - stricter, documented.
+Names are stored as written and compared case-insensitively with ONE fold everywhere - ASCII only, as
+duckdb's catalog does (`KeyFoldSql` = `translate(x, 'A..Z', 'a..z')` in SQL, `StringUtil::CIEquals` /
+`Lower` in C++, the memory store's maps and every cache key) - for catalogs, schema paths, relations,
+functions, references and keys. `Ä` and `ä` are two names, as in duckdb. (Review 2026-10-10: SQL's
+`lower()` folds Unicode, and two folds gave two answers to "the same name" - a cut by bytes after a
+fold that changed a length, and a merge of two objects; see As built.) A name that differs from an
+existing sibling only by case is refused where it is written.
 Roles, groups, issuers, clients are **values** (claims, mapping targets), not SQL identifiers: the
 grammar accepts them quoted, comparison stays exact (as today) - owner, 2026-10-09.
 
@@ -170,12 +172,45 @@ reading quoted keys it does not understand. The step refuses to apply while case
   with the collisions in a deterministic order - per name across the name columns of a catalog, every
   parent level (a recursive CTE), catalogs across every catalog column, references. A v19 build is kept
   out by `min_reader_version` 20 (spec 094's window, pinned by `acl_schema_window.test`).
+- **Review fixes (2026-10-10)**, each with a regression test:
+  - **one fold** (ASCII, `KeyFoldSql`) in every name comparison, the v20 collision check included -
+    `lower()` folded Unicode while C++ and duckdb fold ASCII (`acl_quoted_names.test`: `Öl` / `öl` two
+    objects; a grant on `c."ä"` over a stored `c."Ä"` refused as missing, its read refused alike);
+  - **a schema alias's tail by parts**: `phys_path + path.substr(alias_path.size())` cut by bytes, and a
+    Unicode fold could change a length - `c."straße"._priv.secret` over an alias `c."STRAẞE"` read
+    `phys.lake_priv.secret`; the tail is now the written path's parts after the alias's;
+  - **fail closed on ambiguity**: LookupRelation, ResolveFunction and LookupSchemaAlias refuse
+    (`ambiguous name`) when the winning reading names more than one object - never a union of their
+    capabilities and predicates (`acl_quoted_names_driver.test`: a driver answering `Orders` and
+    `orders`); a principal's `vs."ä"` beside the operator's `vs."Ä"` and a mask on `c."Ä"` beside
+    `c."ä"` stay two objects;
+  - `acl_check_catalog`'s `expansion_stale` compares a record's raw leaf with the source's listing
+    (tables `"a.b"`, `"q""x"` reported stale before; PRUNE spared them already);
+  - repair statements quote a catalog (`ANALYZE VIRTUAL CATALOG "Sales Mart"`) and a role (`TO ROLE
+    "Mixed Role"`) in the grammar's form - each pinned by running the emitted text;
+  - argument filters (`acl_function_columns`, `acl_references(object)`, `acl_keys(object)`) and
+    `SHOW TABLES FROM` compare as names compare;
+  - **the audit names one object one way**: a read and a DML target are noted by the policy's
+    canonical name (`Sales Mart.Order Items`), however written - which also turns the earlier
+    as-written `sales` into `c.sales` (acl_pivot.test updated);
+  - the v20 step also refuses a stored name that is no key (`a"b`, `x..y`), and catalog and reference
+    collisions are pinned;
+  - a message prints a key once (`no access to object "Sales Mart.Order Items"`, not `""…""`);
+    `KeyToSql` / `KeyToQualified` refuse text that is no key instead of passing it through as SQL;
+  - a reference's column pair took a quoted column as written (fixed in the first pass).
+- **Tests added by the review**: case siblings across kinds (a scalar and a schema next to a table,
+  the full message), the grant parts of the sibling rule (an object and a schema grant written in
+  another case land on the stored spelling), spec 113 RENAME in a quoted home, RLS over a quoted
+  column, spec 114 USE `"sales mart"` / USE SCHEMA `"raw data"` (`test_acl_session_use.cpp`), spec 115
+  filters, the migration's catalog / reference / unreadable refusals, and a memory-mode section (view,
+  table function, mask, one object per name in any case, DESCRIBE; its metadata surfaces stay denied
+  - the memory store lists nothing, so "both modes" covers resolution, not listings).
 - **Not changed**: spec 072's function keys (engine functions, already lowercased); the function-driver
   slots (spec 008) receive and return keys as stored - a driver comparing exactly misses a differently
   cased name (documented); `acl_cluster.cpp`'s source-alias LIKE patterns already cover canonical keys.
 - **Tests**: `test/cpp/test_acl_name_path.cpp` (round trip against `ParseComponents`, the refusals it
   does not make, every SQL fragment evaluated in duckdb over a name matrix);
-  `test/sql/acl_quoted_names.test` (memory and catalog mode, every kind, DML, DDL in a quoted home,
+  `test/sql/acl_quoted_names.test` (memory mode: resolution; catalog mode: every kind, DML, DDL in a quoted home,
   metadata, `acl_check_catalog`, the case-sibling and malformed-name negatives, the migration);
   `test/sql/integration/acl_quoted_names_postgres.test` (a mixed-case postgres schema and table, the
   policy catalog in postgres); Flight e2e (`GetTables` / `include_schema` / primary, imported and

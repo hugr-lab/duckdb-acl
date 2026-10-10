@@ -206,8 +206,11 @@ mode of default-deny is a refusal, and the refusal names the function.
   the listings and the manage-scope check. A name is never two things: every write takes the spelling
   the policy already stores (the parent schemas, the object itself), and a NEW name that differs from
   any stored name of its catalog only by case is refused where it is written. Joins between the
-  policy's own tables then stay exact. SQL's `lower()` folds Unicode where duckdb folds ASCII, so `"Ä"`
-  and `"ä"` are one name to the ACL - the stricter reading.
+  policy's own tables then stay exact. The fold is ASCII only, as duckdb's catalog folds - one fold in
+  SQL and in C++ - so `"Ä"` and `"ä"` are two names, as in duckdb. When a name nonetheless matches
+  more than one object (a function-driver source answering `Orders` and `orders`), the read is
+  refused as ambiguous, never served from the union of their grants; a schema alias's tail is taken
+  by parts, never by bytes.
 - Roles, groups, issuers and clients are values (claims, mapping targets), not SQL identifiers: they
   may be written quoted, and compare exactly.
 - Schema v20 declares `min_reader_version` 20: a build before spec 116 refuses such a catalog rather
