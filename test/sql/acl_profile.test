@@ -345,14 +345,14 @@ ACL ADMIN PROFILE SESSION 'x' LOUD;
 ----
 <REGEX>:.*PROFILE SESSION expects.*
 
-# spec 117: a session's profile is the node's operation - passthrough's until spec 118's operate bundle
+# spec 117 / 118: a session's profile is the node's operation - the operate bundle's, never the policy's
 statement ok
 SELECT acl_grant_admin('analyst', 'manage');
 
 statement error
 SELECT * FROM query(acl_session_sql(getvariable('h'), 'ACL PROFILE SESSION CURRENT ON'));
 ----
-<REGEX>:.*a session's profile is the node's operation and requires a passthrough scope.*
+<REGEX>:.*platform.session_profile is the node's operation and requires the operate bundle.*
 
 statement ok
 SELECT acl_revoke_admin('analyst');

@@ -1434,10 +1434,10 @@ void AclDropRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 }
 
 //! acl_grant_admin(role, scope): a GLOBAL administration bundle (spec 009 / 117) - 'observe' (the node
-//! views, the load report and /metrics, spec 097), 'policy' (the policy views and every policy function
-//! but the admin grants), 'manage' (spec 009's name: policy + observe) or 'passthrough' (anything,
-//! including native SQL - the break-glass). A role holds several: a grant adds its bundle. Managing ONE
-//! catalog is not granted here: it is a capability of the catalog grant, `acl_grant_catalog(role, vcat,
+//! views, the load report and /metrics, spec 097), 'operate' (observe + the node's runtime, spec 118), 'policy' (the
+//! policy views and every policy function but the admin grants), 'manage' (spec 009's name: policy + observe) or
+//! 'passthrough' (anything, including native SQL - the break-glass). A role holds several: a grant adds its bundle.
+//! Managing ONE catalog is not granted here: it is a capability of the catalog grant, `acl_grant_catalog(role, vcat,
 //! '{"manage": true}')`.
 void AclGrantAdminFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -1484,7 +1484,7 @@ void PlatformGrantTarget(DataChunk &args, idx_t row, const char *fn, string &rol
 		throw BinderException("%s: the platform catalog has no function \"%s\"", fn, object);
 	}
 	if (function->right == PlatformRight::ESCALATES || function->right == PlatformRight::INFRASTRUCTURE ||
-	    function->right == PlatformRight::OPERATE || function->right == PlatformRight::OPEN) {
+	    function->right == PlatformRight::OPEN) {
 		throw BinderException("%s: platform.%s is %s - it is never granted by name", fn, object,
 		                      function->right == PlatformRight::OPEN ? "every holder's"
 		                                                             : "the passthrough scope's alone");

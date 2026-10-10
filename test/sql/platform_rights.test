@@ -554,7 +554,7 @@ ACL ROLE "was_observe" SELECT bundles FROM platform.console_info();
 query T
 ACL ROLE "was_passthrough" SELECT bundles FROM platform.console_info();
 ----
-[observe, passthrough]
+[observe, operate, passthrough]
 
 # and the key is the row now: a second bundle beside the first
 statement ok

@@ -411,3 +411,99 @@ ACL ADMIN DROP VIRTUAL TABLE c.umlaut;
 
 statement ok
 ACL ADMIN CLUSTER DETACH "SRC_Ä";
+
+# --- spec 118: a virtual view whose body reads the source blocks its DETACH too ------------------------
+# (the check read relations / schemas / functions only: a view over the source let the DETACH through)
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS src_v (TYPE duckdb);
+
+statement ok
+CREATE TABLE src_v.main.t(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.over_v AS 'SELECT id FROM src_v.main.t';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.over_v_quoted AS 'SELECT id FROM "SRC_V" . main.t';
+
+statement error
+ACL ADMIN CLUSTER DETACH src_v;
+----
+<REGEX>:.*the policy reads through src_v: c.over_v, c.over_v_quoted.*FORCE.*
+
+# a longer name that only ends in the alias is not it
+statement ok
+ACL ADMIN DROP VIRTUAL VIEW c.over_v;
+
+statement ok
+ACL ADMIN DROP VIRTUAL VIEW c.over_v_quoted;
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS my_src_v (TYPE duckdb);
+
+statement ok
+CREATE TABLE my_src_v.main.t(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.over_other AS 'SELECT id FROM my_src_v.main.t';
+
+statement ok
+ACL ADMIN CLUSTER DETACH src_v;
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS src_v (TYPE duckdb);
+
+statement ok
+CREATE TABLE src_v.main.t(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.over_v AS 'SELECT id FROM src_v.main.t';
+
+# FORCE is the operator's answer: the view stays, acl_check_catalog reports it
+statement ok
+ACL ADMIN CLUSTER DETACH src_v FORCE;
+
+query I
+SELECT count(*) FROM store.acl.relations WHERE vname = 'over_v';
+----
+1
+
+# a macro whose body reads the source blocks it too (review 118.1)
+statement ok
+ACL ADMIN DROP VIRTUAL VIEW c.over_v;
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS srcm (TYPE duckdb);
+
+statement ok
+CREATE TABLE srcm.main.t(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.f(m INTEGER) RETURNS TABLE (id INTEGER) AS 'SELECT id FROM srcm.main.t WHERE id >= acl_arg(1)';
+
+statement error
+ACL ADMIN CLUSTER DETACH srcm;
+----
+<REGEX>:.*the policy reads through srcm: c.f.*FORCE.*
+
+statement ok
+ACL ADMIN CLUSTER DETACH srcm FORCE;
+
+# a source whose name holds a quote is written with the quote doubled
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS "q""src" (TYPE duckdb);
+
+statement ok
+CREATE TABLE "q""src".main.t(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.over_q AS 'SELECT id FROM "q""src".main.t';
+
+statement error
+ACL ADMIN CLUSTER DETACH "q""src";
+----
+<REGEX>:.*the policy reads through q"src: c.over_q.*FORCE.*
+
+statement ok
+ACL ADMIN CLUSTER DETACH "q""src" FORCE;

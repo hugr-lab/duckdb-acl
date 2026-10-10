@@ -628,6 +628,9 @@ const char *RightsDetail(const PolicyStore::AdminRights &rights) {
 	if (rights.passthrough) {
 		return "passthrough";
 	}
+	if (rights.operate && !rights.Policy() && rights.catalogs.empty()) {
+		return "operate"; // spec 118: the node's runtime, not the ACL's administration
+	}
 	if (rights.MayAdminister()) {
 		return "manage";
 	}
@@ -688,6 +691,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	PolicyStore::AdminRights rights;
 	rights.passthrough = true; // the anonymous hatch is god mode by definition
 	rights.unrestricted_manage = true;
+	rights.operate = true;
 	rights.observe = true;
 	if (anonymous) {
 		audit.proto.door = "admin";

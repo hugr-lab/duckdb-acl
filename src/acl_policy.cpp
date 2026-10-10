@@ -1248,6 +1248,8 @@ bool TryParseAdminScope(const string &scope, AdminScope &out) {
 		out = AdminScope::POLICY;
 	} else if (StringUtil::CIEquals(scope, "observe")) {
 		out = AdminScope::OBSERVE;
+	} else if (StringUtil::CIEquals(scope, "operate")) {
+		out = AdminScope::OPERATE;
 	} else {
 		return false;
 	}
@@ -1257,8 +1259,8 @@ bool TryParseAdminScope(const string &scope, AdminScope &out) {
 AdminScope ParseAdminScope(const string &scope) {
 	AdminScope out;
 	if (!TryParseAdminScope(scope, out)) {
-		throw BinderException("acl admin: unknown admin scope \"%s\" (expected observe, policy, manage or passthrough)",
-		                      scope);
+		throw BinderException(
+		    "acl admin: unknown admin scope \"%s\" (expected observe, operate, policy, manage or passthrough)", scope);
 	}
 	return out;
 }
@@ -1273,6 +1275,8 @@ const char *AdminScopeName(AdminScope scope) {
 		return "policy";
 	case AdminScope::OBSERVE:
 		return "observe";
+	case AdminScope::OPERATE:
+		return "operate";
 	}
 	throw BinderException("acl admin: an administration grant needs a scope");
 }
@@ -1312,6 +1316,7 @@ void PolicyStore::RevokeAdmin(const string &role, const string &scope) {
 		auto name = string(AdminScopeName(ParseAdminScope(scope)));
 		for (auto &holds : entry->second) {
 			bool implies = (holds == "manage" && (name == "policy" || name == "observe")) ||
+			               (holds == "operate" && name == "observe") ||
 			               (holds == "passthrough" && name != "passthrough");
 			if (implies) {
 				throw BinderException("acl admin: role \"%s\" holds %s, which carries %s - revoke %s (and grant what "
@@ -1381,6 +1386,15 @@ void ApplyAdminRow(PolicyStore::AdminRights &rights, const string &scope_text, c
 			rights.unknown_scope = true;
 		}
 		return;
+	case AdminScope::OPERATE:
+		// the node's, as observe (spec 118): scoped to a catalog it grants nothing
+		if (vcat.empty()) {
+			rights.operate = true;
+			rights.observe = true;
+		} else {
+			rights.unknown_scope = true;
+		}
+		return;
 	case AdminScope::MANAGE:
 	case AdminScope::POLICY:
 		if (!vcat.empty()) {
@@ -1394,6 +1408,7 @@ void ApplyAdminRow(PolicyStore::AdminRights &rights, const string &scope_text, c
 		return;
 	case AdminScope::PASSTHROUGH:
 		rights.passthrough = true;
+		rights.operate = true;
 		rights.observe = true;
 		return;
 	}
@@ -1528,7 +1543,9 @@ bool PolicyStore::PrincipalMainCap(const Principal &principal, const string &cap
 	return false;
 }
 
-string PolicyStore::SecretService(const string &named) {
+namespace {
+
+vector<string> AttachedSecretServices(const weak_ptr<DatabaseInstance> &instance) {
 	vector<string> services;
 	auto db = instance.lock();
 	if (db) {
@@ -1540,6 +1557,17 @@ string PolicyStore::SecretService(const string &named) {
 		}
 	}
 	std::sort(services.begin(), services.end());
+	return services;
+}
+
+} // namespace
+
+bool PolicyStore::SecretServiceAttached() {
+	return !AttachedSecretServices(instance).empty();
+}
+
+string PolicyStore::SecretService(const string &named) {
+	auto services = AttachedSecretServices(instance);
 	if (!named.empty()) {
 		for (auto &service : services) {
 			if (StringUtil::CIEquals(service, named)) {

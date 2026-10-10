@@ -119,9 +119,9 @@ columns	VARCHAR[]
 query I
 ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform';
 ----
-232
+251
 
-foreach view catalogs relations relation_columns schemas functions function_columns references reference_columns keys roles role_claims grants schema_grants object_grants grant_columns admins platform_grants issuers clients role_mappings jwks_cache function_categories function_category_members function_grants function_status resource_groups role_resource_groups cluster_items cluster_effective catalog_schema sessions node_load node_doors node_streams drain lineage_status
+foreach view catalogs relations relation_columns schemas functions function_columns references reference_columns keys roles role_claims grants schema_grants object_grants grant_columns admins platform_grants issuers clients role_mappings jwks_cache function_categories function_category_members function_grants function_status resource_groups role_resource_groups cluster_items cluster_effective catalog_schema sessions node_load node_doors node_streams drain lineage_status audit_events
 
 query I
 ACL ROLE "root" SELECT (SELECT list(column_name || ' ' || data_type ORDER BY ordinal_position) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_name = '{view}') = (SELECT list(column_name || ' ' || column_type) FROM (DESCRIBE platform.{view}));
@@ -260,7 +260,7 @@ ACL ROLE "obs" SELECT count(*) FROM platform.node_streams WHERE budget_bytes > 0
 query I
 ACL ROLE "root" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform';
 ----
-36
+37
 
 # policy: the policy views, all rows - never the node's, nor (until spec 118's cluster bundle) the
 # cluster profile's
@@ -279,21 +279,16 @@ ACL ROLE "pol" SELECT * FROM platform.cluster_effective;
 ----
 <REGEX>:.*no access to object "platform.cluster_effective".*
 
-# nor a session's profile (spec 118's operate bundle)
+# nor a session's profile (spec 118: the operate bundle's)
 statement error
 ACL ROLE "pol" PROFILE SESSION 'any' ON;
 ----
-<REGEX>:.*a session's profile is the node's operation and requires a passthrough scope.*
+<REGEX>:.*platform.session_profile is the node's operation and requires the operate bundle.*
 
 statement error
 ACL ROLE "pol" SELECT platform.session_profile('any', 'all');
 ----
-<REGEX>:.*a session's profile is the node's operation and requires a passthrough scope.*
-
-statement error
-ACL ADMIN GRANT FUNCTION platform.session_profile TO ROLE pol;
-----
-<REGEX>:.*platform.session_profile is the passthrough scope's alone.*
+<REGEX>:.*platform.session_profile is the node's operation and requires the operate bundle.*
 
 query T
 ACL ROLE "pol" SELECT list(catalog ORDER BY catalog) FROM platform.catalogs;
@@ -348,7 +343,7 @@ ACL ROLE "cat" SELECT * FROM platform.admins;
 query T
 ACL ROLE "obs" SELECT list(table_name ORDER BY table_name) FROM information_schema.tables WHERE table_catalog = 'platform';
 ----
-[drain, lineage_status, node_doors, node_load, node_streams, sessions]
+[audit_events, drain, lineage_status, node_doors, node_load, node_streams, sessions]
 
 statement error
 ACL ROLE "obs" SELECT * FROM platform.catalogs;
@@ -392,7 +387,7 @@ platform	the system catalog of administration (spec 117)
 query TTTTTT
 ACL ROLE "cat" SELECT audit_contract, connection_contract, schema_catalog, bundles, admin_catalogs, len(views) FROM platform.console_info();
 ----
-3	2	21	[]	[sales]	36
+3	2	21	[]	[sales]	37
 
 query T
 ACL ROLE "cat" SELECT list_contains(my_views, 'grants') AND NOT list_contains(my_views, 'issuers') AND list_contains(my_functions, 'add_relation') AND NOT list_contains(my_functions, 'grant_catalog') FROM platform.console_info();

@@ -702,13 +702,22 @@ CREATE [PERSISTENT] SECRET [<name>] [IN <catalog>] (TYPE …, …)
 DROP [PERSISTENT] SECRET <name> [FROM <catalog>]
 ```
 
-- **The catalog** is the one written, which must be a secrets service; otherwise the one attached. None,
-  or several unnamed, is refused with what to write.
+- **The catalog** is the one written, which must be a secrets service; otherwise the one attached.
+  Several unnamed is refused with what to write.
+- **No service attached** (a standalone node, spec 118): `CREATE` / `DROP SECRET` that name no storage
+  keep the secret on the node by duckdb's own rule - `PERSISTENT` in its secret files (**a file on the
+  node's disk**: `secret_directory`, in the clear), otherwise in memory until the node restarts. The
+  `secrets` capability and the constant parameters still apply; `GRANT` / `REVOKE SECRET` are the
+  service's and are refused; a storage named (`IN memory`, `IN local_file`) must still be a service.
+  The node keeps no owner per secret: there, **`secrets` is the administration of the node's own
+  secrets** - the operator's included (a `DROP`, a `CREATE OR REPLACE`, a longer `SCOPE` that the node's
+  reads then pick) - so grant it only to whoever administers the node. A secrets service is where a
+  secret has an owner and its own admin check.
 - **GRANT / REVOKE SECRET** follow the principal prefix with the `ACL` marker (`ACL TOKEN '…' ACL GRANT
   SECRET …`; unmarked after the gateway's `ACL ADMIN`) and compile to the service's own calls,
   `<catalog>.main.grant_secret('<name>', 'role:<r>', ['use'])` / `revoke_secret(…)`. A secret is granted
   to a role or a group, never to one user, and only its use. A batch holds nothing else.
-- **CREATE / DROP SECRET** keep the secret in the service. `TEMPORARY` is refused (a temporary secret
+- **CREATE / DROP SECRET** keep the secret in the service. With a service attached, `TEMPORARY` is refused (a temporary secret
   would serve every statement on the node after it), and so is any storage that is not a service.
   A secret's parameters are constants - literals and lists of them: duckdb evaluates them on the node,
   so a call there (`SECRET getenv('…')`) would store what the node knows.
@@ -924,8 +933,8 @@ policy's rule and the node's `acl_profile_level` decide again. `CURRENT` is the 
 statement runs under (an `ACL SESSION` prefix - a client connected through a door); off a session
 it is a refusal. Another session is named by its ops id from `acl_sessions()`, which also shows the
 level in force and who decided it (`profile_level`, `profile_source` = `instance` / `policy` /
-`override`). A session is the node's, not a catalog's: the statement needs a `passthrough` scope
-(spec 117 - the policy bundle administers the ACL, not the node; spec 118's `operate` bundle takes it). An operator's own connection (no session) uses `SET SESSION acl_profile_level = ...`
+`override`). A session is the node's, not a catalog's: the statement needs the `operate` bundle (spec
+118; `passthrough` carries it - the policy bundle administers the ACL, not the node). An operator's own connection (no session) uses `SET SESSION acl_profile_level = ...`
 instead, which outranks the node's `SET GLOBAL` on that connection alone.
 
 ```sql
@@ -935,6 +944,37 @@ ACL ADMIN PROFILE SESSION '62F31C2A7615' OFF;
 ```
 
 Function: `acl_session_profile(id, level)` (`''` clears).
+
+## Operating the node
+
+```
+KILL SESSION '<ops id>'
+SET SESSION '<ops id>' AUDIT LEVEL OFF | DENIED | DECISIONS | ALL | DEFAULT
+DRAIN NODE
+RESUME NODE
+MIGRATE POLICY CATALOG <database>[.<schema>]
+```
+
+The node's runtime (spec 118), the `operate` bundle's (`passthrough` carries it; a point grant on the
+one function stands in): `KILL SESSION` ends a live session by its ops id from `acl_sessions()` /
+`platform.sessions` (true when one was found); `SET SESSION … AUDIT LEVEL` is the operator's audit level
+on that session, `DEFAULT` clears it back to the policy's and the node's (spec 069); `DRAIN NODE` stops
+seating new clients and answers how many sessions remain, `RESUME NODE` seats them again (spec 066) -
+this node, never the fleet. The session is a single-quoted id: duckdb's own `SET SESSION <setting> = …`
+(spec 068's `TimeZone`) is never taken for it. `MIGRATE POLICY CATALOG` applies the schema steps to a
+policy catalog (spec 094) - it moves the schema window of every node that reads it, so it is
+`passthrough`'s alone.
+
+```sql
+ACL ROLE "ops" KILL SESSION '62F31C2A7615';
+ACL ROLE "ops" SET SESSION '62F31C2A7615' AUDIT LEVEL all;
+ACL ROLE "ops" DRAIN NODE;
+ACL ROLE "root" MIGRATE POLICY CATALOG store.acl;
+```
+
+Functions: `acl_session_kill(id)`, `acl_session_audit_level(id, level)`, `acl_drain()`, `acl_resume()`,
+`acl_migrate_catalog(database[, schema])` - or `platform.kill_session`, `session_audit_level`, `drain`,
+`resume`, `migrate_catalog`.
 
 ## Comments
 
@@ -1136,7 +1176,8 @@ takes those of its expanded records too.
   | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
   | anonymous `ACL ADMIN` (where allowed)                               | everything, native SQL included                                                                                                                                 |
   | `passthrough` (`GRANT ADMIN passthrough`)                           | everything, native SQL included                                                                                                                                 |
-  | `policy` (`GRANT ADMIN policy`; spec 009's global `manage` = `policy` + `observe`) | every management statement except `GRANT ADMIN` / `REVOKE ADMIN`, the grants on `platform`, `CLUSTER …` and `PROFILE SESSION` (the node's, spec 118); no `ACL NATIVE`                    |
+  | `policy` (`GRANT ADMIN policy`; spec 009's global `manage` = `policy` + `observe`) | every management statement except `GRANT ADMIN` / `REVOKE ADMIN`, the grants on `platform`, `CLUSTER …` and the node's operations (`operate`'s); no `ACL NATIVE`                    |
+  | `operate` (`GRANT ADMIN operate`, spec 118)                         | `KILL SESSION`, `SET SESSION … AUDIT LEVEL`, `PROFILE SESSION`, `DRAIN NODE`, `RESUME NODE`; reads what `observe` reads; no `ACL NATIVE`                     |
   | `observe` (`GRANT ADMIN observe`)                                   | no management statement and no `ACL NATIVE` - it reads the node views, the load report and `/metrics` (spec 097)                                               |
   | a point grant on `platform.<f>` (`GRANT FUNCTION platform.f`)      | that one operation (the grammar form and the call alike), for any catalog                                                                                      |
   | catalog-scoped `manage` (`GRANT CATALOG c … CAPS '{"manage": true}'`) | statements whose target names one of its catalogs; **not** `GRANT`/`REVOKE CATALOG`, `GRANT`/`REVOKE SCHEMA`, `GRANT TABLE`/`VIEW`/`OBJECT`, `ALTER GRANT`, `DROP VIRTUAL CATALOG` (handing out or taking away access is privilege administration), and not the statements that belong to no catalog (roles, issuers, mappings, `CREATE VIRTUAL CATALOG`) |

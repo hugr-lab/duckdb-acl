@@ -17,10 +17,12 @@ ACL_EXT="${ACL_EXT:-$BUILD/extension/acl/acl.duckdb_extension}"
 PORT="${ACL_FLIGHT_ADMIN_PORT:-32716}"
 URI="grpc://localhost:$PORT"
 
-# RS256 tokens of the seeded issuer (test/idp/s): role analyst (data only), role boss (the policy bundle)
+# RS256 tokens of the seeded issuer (test/idp/s): role analyst (data only), role boss (the policy bundle),
+# role ops (spec 118's operate bundle)
 ANALYST='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtYWNtZSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.UV5-WWUpQLp-Em8K2yLLkz-NEJgOyTAn9i9B1zpBWF3hNQVgorAVPVK48bxnrMiMm7NabgM3g945lDY31DFwxNeUKnVEe0QdRy1d1KbFh8td3Ak_mepOZ35CjPektGaOjVEpjUFxZUOj_uxYnse_y660xC0stlY8zxDrpSjNCOZRGv-vaxITv7ggOIDYAN07rmPntKe9oOYsb5g0ZkFcIEsKuHuXsL8z1crko6vIZzT9ido-xrph_WEejO5lKaPIxVe1QrB1-C5DUp8D8fnLWMJ3g426VNKWJwUyeSgh_nq1XzLyR8WcLchBQwaFAzkGivmLFmDdrDS7VUy49I8uLw'
 BOSS='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtYm9zcyIsInJvbGVzIjpbImJvc3MiXSwidGlkIjoiYWNtZSJ9.WWyV4WmSaXLuLcpW0kszQA0-kcT_Ox_0x73RRyzm3_OUQ5YQ6siegTRjWXHrwS7oSgURdvTpw1J4HZGuZfy7NZAS5ueIw6PVzjIujiHpLHMrGF6qbzuV8TOjcZavxM50LB_g6NVMx6CWkraMH43pQ7KQtimGvUIqrIqodSmRKeTsNjeJVuCZqXJBwOJqXybOnrhm9yz6Pm6Lg92pWUgyW7tNongP8rCZ8Ht6TG_5A3gPAD1Kksh850_TXabo9TzlEHhS-ZNKBnCdPYwRFOt9soSkrfOj_BiIcD1Txis8SXMVN6lfqz_uWm7Gsy6ir8LvgSADSFGygMzdcquskiRz0w'
 
+OPS='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtb3BzIiwicm9sZXMiOlsib3BzIl0sInRpZCI6ImFjbWUifQ.Dk7wYl2-hxF5uWroG2LVnifnphObyhP1afFluVVO52D8IrsI6Xa5r970KsJIGMntcoSO7OeLLchpEn_BoqpV9ZB48Ib1FmoAHTf1JkcxhF2qlUIJDzoiv7TAYsJ-ZtxqnS6In9zTgBexVuU_qPB2APwVW5EAE4ZK3CD76KPCLRcpdGjTwl15oYI8fR0cOIgbxzRfWGrew6RW6nwdi8iag9GlZBCMbg51Dj-vjYq1ObAEhyCSc6MOqhbAVgLSFaJEltAPgVFouRqjM8zShgt7P3wCLG6sxTvAcnkzE3_5FIBtTa4j19z1yzeOOScTzTjYCecXGxxW2AZh653_KJI_Aw'
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 [ -x "$DUCKDB" ] || { echo "SKIP: no duckdb CLI at $DUCKDB"; exit 0; }
@@ -67,6 +69,9 @@ ACL ADMIN CREATE ROLE boss;
 ACL ADMIN GRANT ADMIN policy TO ROLE boss;
 -- a privileged role is reached only through the client's own mapping (spec 095)
 ACL ADMIN MAP CLAIM 'boss' FROM CLIENT 'test/idp/s' TO ROLE boss;
+ACL ADMIN CREATE ROLE ops;
+ACL ADMIN GRANT ADMIN operate TO ROLE ops;
+ACL ADMIN MAP CLAIM 'ops' FROM CLIENT 'test/idp/s' TO ROLE ops;
 SET GLOBAL acl_allow_anonymous_admin=false;
 SELECT acl_flight_serve('$URI');
 SELECT 1;
@@ -140,5 +145,24 @@ echo "$got" | grep -q 'no access to object' || fail "the policy bundle read a no
 got="$(ask "SELECT platform.create_role(r) FROM (VALUES ('per_row')) t(r)")"
 echo "$got" | grep -q "call it at the top level" || fail "a per-row call was not refused: $got"
 
+# --- spec 118: the operate bundle drains and resumes the node, and administers no policy ---------------
+got="$(ask "DRAIN NODE" "$OPS")"
+echo "$got" | grep -q "\[[0-9]*\]" || fail "DRAIN NODE under operate: $got"
+# draining seats no new session - the client's next connection is one (a console keeps its own and
+# RESUMEs from it; here the operator's connection resumes)
+got="$(ask "SELECT 1" "$OPS")"
+echo "$got" | grep -q "node is draining" || fail "a new session was seated while draining: $got"
+echo "SELECT acl_resume();" >&3
+for _ in $(seq 1 20); do
+	got="$(ask "RESUME NODE" "$OPS")"
+	echo "$got" | grep -q "draining" || break
+	sleep 0.3
+done
+echo "$got" | grep -q "False" || fail "RESUME NODE under operate on a serving node: $got"
+got="$(ask "CREATE ROLE by_ops" "$OPS")"
+echo "$got" | grep -q "unrestricted manage\|requires" || fail "the operate bundle administered the policy: $got"
+got="$(ask "DRAIN NODE")"
+echo "$got" | grep -q "requires the operate bundle" || fail "the policy bundle drained the node: $got"
+
 echo "SELECT acl_flight_stop('$URI');" >&3
-echo "PASS: an administrator read the platform catalog through the Flight door and changed the policy with a call and with the bare grammar, ad hoc and prepared, fetched or not; a non-admin saw no platform"
+echo "PASS: an administrator read the platform catalog through the Flight door and changed the policy with a call and with the bare grammar, ad hoc and prepared, fetched or not; a non-admin saw no platform; an operate token drained and resumed the node"
