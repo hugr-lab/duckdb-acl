@@ -195,7 +195,9 @@ def catalog_command(spec: str) -> bytes:
     if name in ("pk", "imported", "exported"):
         message = {"pk": "CommandGetPrimaryKeys", "imported": "CommandGetImportedKeys",
                    "exported": "CommandGetExportedKeys"}[name]
-        return command(message, text(3, argument))
+        # `schema/table` names the schema too (spec 116: a quoted one, `Raw Data/Order Items`)
+        schema, _, table = argument.rpartition("/")
+        return command(message, (text(2, schema) if schema else b"") + text(3, table))
     if name == "cross":
         pk_table, fk_table = argument.split(",")
         # pk_catalog = 1, pk_db_schema = 2, pk_table = 3, fk_catalog = 4, fk_db_schema = 5, fk_table = 6

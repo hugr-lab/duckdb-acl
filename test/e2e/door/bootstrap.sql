@@ -42,6 +42,10 @@ ACL ADMIN CREATE VIRTUAL VIEW m.hello AS 'SELECT 7 AS v';
 -- spec 115: a nested schema, as quack loads it (through the parent oids)
 ACL ADMIN CREATE VIRTUAL VIEW m.raw.eu.deep AS 'SELECT 8 AS v';
 ACL ADMIN GRANT CATALOG m TO ROLE analyst WITH (select);
+-- spec 116: a catalog, a schema and a view named the way SQL allows, as quack loads them
+ACL ADMIN CREATE VIRTUAL CATALOG "Sales Mart";
+ACL ADMIN CREATE VIRTUAL VIEW "Sales Mart"."Raw Data"."Order Items" AS 'SELECT 9 AS v';
+ACL ADMIN GRANT CATALOG "Sales Mart" TO ROLE analyst WITH (select);
 
 -- A leg may publish a second object over another source (the cross-source join under load): run.sh
 -- renders the statements here, or nothing.

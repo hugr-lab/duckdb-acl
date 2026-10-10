@@ -40,4 +40,7 @@ SELECT 'use' AS label, * FROM quack_query_by_name('remote', 'SELECT current_data
 FROM quack_query_by_name('remote', 'USE c');
 -- spec 115: another catalog's nested schema, read through quack's own catalog (remote.<vcat>.<a>.<b>.<t>)
 SELECT 'nested' AS label, v FROM remote.m.raw.eu.deep;
+-- spec 116: a quoted catalog, schema and view through quack's catalog, and the same name through the door
+SELECT 'quoted' AS label, v FROM remote."Sales Mart"."Raw Data"."Order Items";
+SELECT 'quoted_door' AS label, * FROM quack_query_by_name('remote', 'SELECT v FROM "sales mart"."raw data"."ORDER ITEMS"');
 SELECT 'use_back' AS label, * FROM quack_query_by_name('remote', 'SELECT current_database()');
