@@ -162,6 +162,37 @@ def prepared_dataset_fields(client, options, sql: str) -> int:
     return len(pa.ipc.read_schema(pa.py_buffer(schema))) if schema else 0
 
 
+def prepared_execute(client, options, sql: str, fetch: bool = True):
+    """spec 117: a statement prepared (CreatePreparedStatement), executed (GetFlightInfo on
+    CommandPreparedStatementQuery) and - unless `fetch` is false - fetched (DoGet), then closed: what
+    JDBC's prepareStatement / execute does. `fetch=False` is a client that never reads the result."""
+    request = command("ActionCreatePreparedStatementRequest", text(1, sql))
+    results = list(client.do_action(flight.Action("CreatePreparedStatement", request), options))
+    any_bytes = results[0].body.to_pybytes()
+    def fields_of(payload):
+        out, at = {}, 0
+        while at < len(payload):
+            key, at = read_varint(payload, at)
+            number, wire = key >> 3, key & 7
+            if wire == 2:
+                length, at = read_varint(payload, at)
+                out[number] = payload[at:at + length]
+                at += length
+            else:
+                _, at = read_varint(payload, at)
+        return out
+    handle = fields_of(fields_of(any_bytes)[2]).get(1, b"")
+    try:
+        descriptor = flight.FlightDescriptor.for_command(command("CommandPreparedStatementQuery", field(1, handle)))
+        info = client.get_flight_info(descriptor, options)
+        if not fetch:
+            return {"endpoints": len(info.endpoints)}
+        return client.do_get(info.endpoints[0].ticket, options).read_all().to_pydict()
+    finally:
+        close = command("ActionClosePreparedStatementRequest", field(1, handle))
+        list(client.do_action(flight.Action("ClosePreparedStatement", close), options))
+
+
 def type_names(schema):
     """spec 115: `name:TYPE_NAME[/precision/scale]` from each field's Flight SQL column metadata"""
     out = []
@@ -272,6 +303,12 @@ if ask.startswith("@ingest:"):
     raise SystemExit(0)
 if ask.startswith("@prepared_fields:"):  # spec 111: the dataset schema CreatePreparedStatement announces
     print({"fields": prepared_dataset_fields(client, options, ask[len("@prepared_fields:"):])})
+    raise SystemExit(0)
+if ask.startswith("@prepared:"):  # spec 117: prepare, execute, fetch, close
+    print(prepared_execute(client, options, ask[len("@prepared:"):]))
+    raise SystemExit(0)
+if ask.startswith("@prepared_nofetch:"):  # spec 117: prepared and executed, never fetched
+    print(prepared_execute(client, options, ask[len("@prepared_nofetch:"):], fetch=False))
     raise SystemExit(0)
 if ask.startswith("@nofetch:"):  # spec 111: a query whose result is never fetched - GetFlightInfo only
     info = client.get_flight_info(flight.FlightDescriptor.for_command(statement_query(ask[len("@nofetch:"):])), options)

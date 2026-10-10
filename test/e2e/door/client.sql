@@ -44,3 +44,8 @@ SELECT 'nested' AS label, v FROM remote.m.raw.eu.deep;
 SELECT 'quoted' AS label, v FROM remote."Sales Mart"."Raw Data"."Order Items";
 SELECT 'quoted_door' AS label, * FROM quack_query_by_name('remote', 'SELECT v FROM "sales mart"."raw data"."ORDER ITEMS"');
 SELECT 'use_back' AS label, * FROM quack_query_by_name('remote', 'SELECT current_database()');
+-- spec 117: the platform catalog is absent on the quack door - not in the catalog quack loaded, not among
+-- the schemas the node lists (its view is no object there either: a refusal, run.sh's own client)
+SELECT 'platform_tree' AS label, count(*) AS n FROM duckdb_schemas()
+WHERE database_name = 'remote' AND (schema_name = 'platform' OR schema_name LIKE 'platform.%');
+SELECT 'platform_listed' AS label, * FROM quack_query_by_name('remote', 'SELECT count(*) FROM information_schema.schemata WHERE catalog_name = ''platform''');

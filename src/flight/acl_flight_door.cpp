@@ -41,6 +41,8 @@
 #include "oidc_core.hpp"
 #include "acl_profile.hpp"
 #include "acl_parser_override.hpp"
+#include "acl_admin_sql.hpp"
+#include "acl_platform.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/enums/result_eagerness.hpp"
@@ -140,8 +142,10 @@ struct FlightDoorState {
 			return stream || handle;
 		}
 		//! Takes the result a statement just produced: a stream where duckdb can drain it, else the handle
-		void Take(unique_ptr<QueryResult> result) {
-			if (result->GetStatementProperties().result_eagerness != ResultEagerness::FORCED &&
+		//! `retained`: a result PreparedStatement::Execute answered (spec 111's statement run at GetFlightInfo,
+		//! spec 117's management call among them) - read from the handle, never opened as a stream
+		void Take(unique_ptr<QueryResult> result, bool retained = false) {
+			if (!retained && result->GetStatementProperties().result_eagerness != ResultEagerness::FORCED &&
 			    result->HasBufferedData()) {
 				stream = make_uniq<QueryResultStream<>>(std::move(result));
 			} else {
@@ -1977,11 +1981,36 @@ public:
 	//! nothing - as duckdb knows it once bound, parameters or not (the result eagerness of a prepared
 	//! statement is not settled until it runs). `INSERT ... RETURNING` returns rows: not one of these.
 	static bool ClientStatementIsCommand(const string &query) {
+		// spec 117: a management statement - the grammar, bare or after the `ACL` marker - is a change, not
+		// a query, whatever call it compiles to: run where Flight SQL says a statement runs
+		{
+			idx_t pos = 0;
+			while (pos < query.size() && StringUtil::CharacterIsSpace(query[pos])) {
+				pos++;
+			}
+			auto rest = query.substr(pos);
+			if (rest.size() > 4 && StringUtil::CIEquals(rest.substr(0, 3), "acl") &&
+			    StringUtil::CharacterIsSpace(rest[3])) {
+				rest = rest.substr(4);
+			}
+			if (acl::IsMgmtStart(rest) || acl::IsSecretsStart(rest)) {
+				return true;
+			}
+		}
 		try {
 			Parser parser(ParserOptions::Builtin());
 			parser.ParseQuery(UseSchemaAsSet(query)); // `USE SCHEMA s` is the SET it compiles to
 			if (parser.statements.size() != 1) {
 				return false;
+			}
+			// spec 117: a top-level platform.<op>(…) call is one change too
+			unique_ptr<SQLStatement> compiled;
+			try {
+				if (acl::CompilePlatformCall(*parser.statements[0], compiled)) {
+					return true;
+				}
+			} catch (std::exception &) {
+				return false; // a call written wrongly: refused where it is decided, not here
 			}
 			switch (parser.statements[0]->type) {
 			case StatementType::SET_STATEMENT:
@@ -2080,8 +2109,10 @@ public:
 		// completion here; anything else is submitted, and the reader drains it chunk by chunk
 		auto &stmt = *reservation->stmt;
 		unique_ptr<QueryResult> result;
+		bool retained = false;
 		if (reservation->executed) {
 			result = std::move(reservation->executed); // spec 111: it ran at GetFlightInfo
+			retained = true;
 		} else {
 			ArmProfile(handle, *reservation->conn, reservation.get(), string());
 			result = stmt.GetStatementProperties().result_eagerness == ResultEagerness::FORCED ? stmt.Execute(values)
@@ -2098,7 +2129,7 @@ public:
 		std::shared_ptr<arrow::Schema> schema;
 		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result->GetTypes(), result->GetNames(), properties));
 		auto slot = make_shared_ptr<FlightDoorState::ResultStream>();
-		slot->Take(std::move(result));
+		slot->Take(std::move(result), retained);
 		{
 			auto &conn = *reservation->conn;
 			std::lock_guard<std::mutex> stream(conn.stream_lock);

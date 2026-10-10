@@ -27,6 +27,11 @@ ACL ADMIN CREATE VIRTUAL CATALOG c;
 ACL ADMIN CREATE VIRTUAL TABLE c.orders AS ${ACL_E2E_TABLE};
 ACL ADMIN CREATE ROLE analyst;
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN;
+-- spec 117: the role also holds a view of the platform catalog - which quack must never show it (quack
+-- loads a catalog whole; the console is Flight / JDBC). A role holding anything of platform is reached
+-- only through its client's own mapping (spec 095), so the token's role value is mapped explicitly.
+ACL ADMIN GRANT VIEW platform.sessions TO ROLE analyst;
+ACL ADMIN MAP CLAIM 'analyst' FROM CLIENT 'test/idp/s' TO ROLE analyst;
 
 -- One role, many tenants: the slice comes from the token's claim, not from the role name. The grant
 -- both confines reads (RLS) and assigns the tenant on write, so a client cannot place a row outside
