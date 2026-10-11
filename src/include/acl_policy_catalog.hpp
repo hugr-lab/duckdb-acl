@@ -445,6 +445,20 @@ struct CatalogBackend {
 	//! object, then schema, then catalog - and a level that says nothing (NULL, empty or blank) is
 	//! "unspecified", which is not "none" (spec 012).
 	string CapsExpr(const string &name_expr = "r.\"vname\"", const string &vcat_expr = "r.\"vcat\"");
+	//! Spec 120.2: what decides one role's caps on one object, read with the resolver's own expressions
+	//! (CapsExpr's terms, the grants CTE, the object-grant join by key) - never a second reading of the tables
+	struct GrantDecisionRow {
+		bool granted = false; // the role holds a grant on the catalog
+		string level;         // object | schema <path> | catalog
+		string schema_path;   // the role_schemas row that decided, when level is a schema
+		bool schema_inherited = false;
+		case_insensitive_set_t caps; // the effective caps (EffectiveCaps of the coalesce)
+		bool main = false;           // MAIN and the role's only MAIN catalog (bare names resolve)
+		string catalog_rls, object_rls;
+		string catalog_columns, object_columns; // the grants' column lists as stated
+	};
+	//! one per name of `vnames`, in that order - one query for all of them
+	vector<GrantDecisionRow> GrantDecisions(const string &role, const string &vcat, const vector<string> &vnames);
 	//! The same visibility test as an object's, written against a `functions f` row instead of a
 	//! `relations r` one - a function is granted like any other object of the catalog.
 	string FunctionVisibleExpr();

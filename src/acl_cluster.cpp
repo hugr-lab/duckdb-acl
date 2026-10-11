@@ -412,6 +412,10 @@ string JsonField(const string &json, const char *field) {
 
 } // namespace
 
+bool SqlNamesSourceOf(const string &sql, const string &source) {
+	return SqlNamesSource(sql, source);
+}
+
 bool ClusterBundleMaySet(const string &name) {
 	// an allowlist (review 118.2: a denylist of data paths left the ACL's own trust settings open) - the
 	// node's resources and tuning; everything else is passthrough's

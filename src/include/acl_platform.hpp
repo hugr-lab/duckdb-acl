@@ -182,6 +182,8 @@ void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> 
 //! spec 118.3 (acl_platform_sources.cpp): the physical tree `platform.attached.<alias>.<schema>` - its
 //! table functions acl_platform_attached[_columns]([sources]) and acl_grant_source / acl_revoke_source
 void RegisterAclPlatformSources(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
+//! spec 120.2 (acl_platform_rights.cpp): acl_effective_rights(role, catalog[, object]), acl_exposures(source[, …])
+void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
 //! the sources granted to the principal (`<alias>` or `<alias>.<schema>` keys, kind `source`)
 vector<string> GrantedSources(const PolicyStore::AdminRights &rights);
 //! passthrough, policy and the cluster bundle see every source (only passthrough and policy build over every

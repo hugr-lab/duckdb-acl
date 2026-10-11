@@ -350,10 +350,30 @@ The parameters mean what the matching `acl_*` function's do - see the
   `schema_build_min_reader`, `schema_catalog`, `schema_min_reader`, `schema_mode`), `views` /
   `functions` (what this node has), `my_views` / `my_functions` (what the caller may use), `bundles`
   and `admin_catalogs`. Every principal holding anything on `platform` may call it.
+- `platform.effective_rights(role, catalog[, object])` (spec 120) - what `role` gets of each table, view
+  and live schema alias of `catalog`, and of each object under an alias the role holds a grant on:
+  `decided_by` (`object`, `schema <path>` - the longest prefix the role holds, `(inherited)` when that row
+  was inherited - or `catalog`; `none` without a grant on the catalog), `caps` (an unstated grant = the
+  five data capabilities; a view lists `select` at most; `manage` is shown by `platform.admins`), `main`
+  (the catalog is the role's only MAIN one - bare names resolve there), and for a table or a view what a
+  read as the role gets: `rls`, `columns` (the role's own columns listing - what its `DESCRIBE` answers; `[]` = it reads none),
+  `masks` (the masks its grants state on those columns), `writable`, or `refused` (the resolver's refusal
+  - every read of the object fails with it). Answered by the resolver itself; `policy` for any catalog, a
+  catalog admin on its catalogs.
+- `platform.exposures(source[, schema[, object]])` (spec 120) - who reads a physical database, schema or
+  table through the policy: a relation over it, a live schema alias of it (asked inside the alias, the
+  object there), a view, a function, a computed column, a relation's RLS, and a grant's RLS or mask
+  (`kind = 'grant'`, for that role only) whose body names it - and per role holding a grant on the
+  object's catalog its `decided_by` and `caps`. A body is parsed, never bound (no source is reached):
+  `t` is the node's default database's, `x.t` the default schema of database `x`. Direct names only -
+  what a physical view or macro reads in turn is not followed, and `ACL NATIVE` (passthrough) reaches
+  every source outside the policy. An empty `schema` is any schema. `policy` only (it spans catalogs).
 
 ```sql
 SELECT bundles, admin_catalogs, my_views FROM platform.console_info();
 SELECT problem, object, repair FROM platform.check_catalog('sales');
+SELECT object, decided_by, caps, rls, columns FROM platform.effective_rights('analyst', 'sales');
+SELECT catalog, object, kind, role, caps FROM platform.exposures('pg', 'public', 'orders');
 ```
 
 ## The grammar without the marker
