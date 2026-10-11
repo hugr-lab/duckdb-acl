@@ -67,44 +67,6 @@ server_says() { # <sql> -> the csv lines of that answer
 	cat "$TMP/server.log" >&2
 	fail "the serving process did not answer check $mark"
 }
-# --- spec 121: the door plans its own statement once - a listing ran on its prepare's plan, a prepared
-# statement's re-execution rebinds (and sees what changed) -------------------------------------------------
-echo ".mode csv" >&3
-kept() { server_says "SELECT value FROM acl_metrics() WHERE name = 'acl.door.plans_kept'" | tail -1; }
-before="$(kept)"
-"$PYBIN" - "$URI" "$TOKEN" <<'PY' || fail "plan-once client failed"
-import sys
-import adbc_driver_flightsql.dbapi as dbapi
-from adbc_driver_flightsql import DatabaseOptions
-conn = dbapi.connect(sys.argv[1], db_kwargs={DatabaseOptions.AUTHORIZATION_HEADER.value: "Bearer " + sys.argv[2],
-                                              DatabaseOptions.WITH_COOKIE_MIDDLEWARE.value: "true"})
-conn.adbc_connection.set_autocommit(True)
-cur = conn.cursor()
-cur.execute("SELECT table_name FROM information_schema.tables WHERE table_catalog = 'c'")
-print(cur.fetchall())
-PY
-after="$(kept)"
-[ "$after" -eq "$((before + 1))" ] || fail "a listing did not run on its prepare's plan: $before -> $after"
-echo "  ok:   a listing through the door runs on its prepare's plan (one plan, acl.door.plans_kept $before -> $after)"
-before="$(kept)"
-"$PYBIN" - "$URI" "$TOKEN" <<'PY' || fail "plan-once prepared client failed"
-import sys
-import adbc_driver_flightsql.dbapi as dbapi
-from adbc_driver_flightsql import DatabaseOptions
-conn = dbapi.connect(sys.argv[1], db_kwargs={DatabaseOptions.AUTHORIZATION_HEADER.value: "Bearer " + sys.argv[2],
-                                              DatabaseOptions.WITH_COOKIE_MIDDLEWARE.value: "true"})
-conn.adbc_connection.set_autocommit(True)
-cur = conn.cursor()
-query = "SELECT table_name FROM information_schema.tables WHERE table_catalog = 'c' AND table_name = 'orders'"
-cur.adbc_prepare(query)
-cur.execute(query)
-first = cur.fetchall()
-cur.execute(query)  # the same prepared statement again: a re-execution rebinds, as duckdb wants
-assert cur.fetchall() == first, "a re-execution answered differently"
-PY
-after="$(kept)"
-[ "$after" -eq "$((before + 1))" ] || fail "a prepared statement's two executions: kept $before -> $after (want +1)"
-echo "  ok:   a prepared statement runs its prepare's plan once, its re-execution rebinds ($before -> $after)"
 PARENT_RUN="01929e3a-0000-7000-8000-0000000001a2"
 { echo ".mode csv"; echo "SET GLOBAL acl_lineage_level = 'on';"; echo "SET GLOBAL acl_lineage_namespace = 'acl://e2e';"; } >&3
 "$PYBIN" "$HERE/lineage_client.py" "$URI" "$TOKEN" "airflow/daily.load/$PARENT_RUN" || fail "lineage assertions failed"

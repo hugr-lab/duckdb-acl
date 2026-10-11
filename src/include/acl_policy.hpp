@@ -720,8 +720,6 @@ struct PolicyStore {
 	};
 	vector<DriftRow> ClusterDrift();
 	std::atomic<int64_t> cluster_applied {-1};
-	//! spec 121: the Flight door's statements that ran on their prepare's plan (gauge acl.door.plans_kept)
-	std::atomic<int64_t> door_plans_kept {0};
 	ClusterAnswer ClusterExtension(const string &verb, const string &scope, const string &name, const string &version,
 	                               const string &repository, const string &comment);
 	ClusterAnswer ClusterAttach(const string &scope, const string &alias, const string &path, const string &type,

@@ -1,7 +1,7 @@
 # Spec 121: a tool's tree within budget
 
-- **Status**: implemented - steps 1-3 (2026-10-11); steps 4-5 and the plugin's References folder after the DBeaver
-  plugin is finished (owner, 2026-10-11)
+- **Status**: implemented - steps 1-2 (2026-10-11); step 3 built and reverted (a correctness bug - see As built);
+  steps 3-5 and the plugin's References folder after the DBeaver plugin is finished (owner, 2026-10-11)
 - **Date**: 2026-10-11
 - **Author**: duckdb-acl
 - **Builds on**: spec 119 (metadata at scale - the narrowing, the per-source reader), 115 (metadata for tools);
@@ -100,22 +100,24 @@ narrows nothing (slower, never wider). The driver's listing change reads a surfa
 
 ## As built
 
-### Step 3 - one plan for the door's own statement (2026-10-11)
-- duckdb drops a prepared plan it must rebind (`CreatePlan(LogicalPrepare)` keeps none while the flag is up), so the
-  flag cannot simply come off at execution (tried: the execution found no physical plan - an internal error). It
-  comes off while the door's prepare is optimized: `DoorPrepareScope` (a trivial thread_local pointer, spec 088)
-  marks the door's own Prepare (the ticket at GetFlightInfo, CreatePreparedStatement, the catalog RPCs), and the
-  door's optimizer extension (`DoorPlanPreOptimize`, registered with the door) clears `always_require_rebind` on the
-  `LogicalPrepare` - only when it still has its plan (the data-source rule's flag; a flag the binder raised leaves
-  none), the statement is read-only and its parameters are bound. The plan is then kept; `DoorPlanOnce` runs it for
-  the reservation's first execution within 10 s and puts the flag back after; a later first execution, or any
-  re-execution, gets the flag back first and rebinds as duckdb wants.
-- Measured (the dev node through ADBC, first text / repeated, ms): a schema's tables 1421/699 → 713/672, a table's
-  columns 458/224 → 246/215, keys 458/227 → 226/217, references ~1500/~750 → ~735/~720 - the first text costs what a
-  repeat did.
-- Gauge `acl.door.plans_kept` (on the store, per instance). Tests: `test/e2e/flight/adbc.sh` - a listing through ADBC
-  runs on its prepare's plan (+1), a prepared statement executed twice runs it once (+1) and its re-execution
-  answers the same after rebinding.
+### Step 3 - built, reviewed, reverted (2026-10-11)
+- Built as the owner asked - the flag off only for the door's own statement: an optimizer extension cleared
+  `always_require_rebind` while the door's Prepare was optimized (duckdb keeps no plan while the flag is up - clearing
+  it at execution found none, an internal error) and the first execution within 10 s ran that plan. Measured through
+  ADBC: a new text cost what a repeat did (a schema's tables 1.42 s → 0.71 s on the dev node).
+- **Reverted - the review's finding, a correctness bug**: the door prepares in GetFlightInfo's transaction and executes
+  in DoGet's, so the kept plan carried the first transaction's state into the second - exactly duckdb's own guarded
+  case (`test/sql/prepared/prepared_stale_statistics.test`, the rule's commit): statistics-based pruning answers from
+  the old data (a prepared `count(*) WHERE id = 200`, an insert of 200 committed between, the first execution 0
+  instead of 1; a deny-list RLS body pruned from old statistics would miss a block committed between), and a DuckLake
+  scan holds the ended transaction (`Scanning a DuckLake table after the transaction has ended`, or a stale snapshot).
+  Paths outside the guarded execution (a count at GetFlightInfo, the update path, the schema probe) also left the
+  flag off for good.
+- What would be correct (the owner's call, after the plugin): plan and execute in ONE transaction - the door executes
+  a parameterless query at GetFlightInfo (Flight SQL's "GetFlightInfo: execute the query", spec 111 does it for counts
+  already) and DoGet streams the submitted handle; a prepared statement (Arrow's JDBC prepares even `executeQuery`)
+  keeps two plans unless the driver asks differently. Until then each expansion through Flight costs its listing
+  twice - within budget for what step 2 left (≤0.39 s per listing on the node), the References folder above it.
 
 ### Step 2 - keys and references read what they are asked about (2026-10-11)
 - `ScopeOf` knows the keys / references surfaces (`vcat`; `object`, `from_object` / `to_object` - keys, in the new
@@ -131,9 +133,7 @@ narrows nothing (slower, never wider). The driver's listing change reads a surfa
   0.046 / 0.050 / 0.048 / 0.055 (were 0.77-0.86), columns 0.234 / 0.237 / 0.239 / 0.248, keys 0.254 / 0.261 / 0.257 /
   0.275 (were 0.51-0.58), references 0.338 / 0.355 / 0.350 / 0.392 (were 0.84-1.37), schemas ≤0.043, functions
   ≤0.038. A scanner's first touch is unchanged (postgres +0.7 s, SQL Server +5 s - the `first` column).
-- In DBeaver (the plugin's LiveExpansionTest, dev node, ms; before → after): a schema's tables 1461 → 59, columns 482
-  → 245, keys 482 → 250, foreign keys 1417 → 321, the References folder 3569 → 990 (three listings: Generic's model
-  reads the referencing table's columns and its own foreign keys - the plugin's to change).
+- In DBeaver (the plugin's LiveExpansionTest, dev node, ms): measured with step 3 on - re-measured without it below.
 - Tests: `test/sql/acl_tree_budget.test` (keys and references narrowed - by `=`, by the far end, through a nested
   schema, by the argument - answer what the unnarrowed form answers; `to_has_key` true / false for a key whose column
   the role does not see).
