@@ -116,6 +116,13 @@ def generate(args):
     sql += "SET GLOBAL acl_allow_anonymous_admin=true;\nACL ADMIN CREATE VIRTUAL CATALOG c;\n"
     source = (lambda i: f"src{i:03d}.main") if args.sources_in == "duckdb" else (lambda i: f"ext.aclb_s{i:03d}")
     sql += "".join(f"ACL ADMIN CREATE VIRTUAL SCHEMA c.v{i:03d} AS {source(i)};\n" for i in range(args.sources))
+    # spec 121: declared keys and references to measure - relations over the middle source's tables, each with a key,
+    # each referencing the next (the keys / references listings over empty sets would measure nothing)
+    mid = args.sources // 2
+    phys = (lambda t: f"src{mid:03d}.main.t{t:03d}") if args.sources_in == "duckdb" else (lambda t: f"ext.aclb_s{mid:03d}.t{t:03d}")
+    sql += "".join(f"ACL ADMIN CREATE VIRTUAL TABLE c.k{t:03d} AS {phys(t)} PRIMARY KEY (c0);\n" for t in range(args.tables))
+    sql += "".join(f"ACL ADMIN CREATE VIRTUAL REFERENCE c.r{t:03d} FROM c.k{t:03d} TO c.k{t + 1:03d} ON (c1 = c0);\n"
+                   for t in range(args.tables - 1))
     sql += "ACL ADMIN CREATE ROLE r;\nACL ADMIN GRANT CATALOG c TO ROLE r MAIN;\n"
     out = run_sql(sql)
     if out.returncode:
@@ -162,8 +169,9 @@ def main():
         "jdbc getTables (schema)": f"SELECT table_catalog, table_schema, table_name, table_type, \"TABLE_COMMENT\" AS comment FROM information_schema.tables WHERE table_catalog = 'c' AND table_schema LIKE '{mid}' ESCAPE '\\' AND table_name LIKE '%' ESCAPE '\\' ORDER BY table_type, table_catalog, table_schema, table_name",
         "jdbc getTables, before spec 121": f"SELECT database_name, schema_name, table_name AS object_name, comment, temporary, false AS is_view FROM duckdb_tables() WHERE database_name = 'c' AND schema_name LIKE '{mid}' ESCAPE '\\' AND table_name LIKE '%' ESCAPE '\\' UNION ALL SELECT database_name, schema_name, view_name AS object_name, comment, temporary, true AS is_view FROM duckdb_views() WHERE database_name = 'c' AND schema_name LIKE '{mid}' ESCAPE '\\' AND view_name LIKE '%' ESCAPE '\\' ORDER BY is_view, temporary, database_name, schema_name, object_name",
         "jdbc getColumns (table)": f"SELECT database_name, schema_name, table_name, column_name, column_index, comment, column_default, is_nullable, data_type, is_generated FROM duckdb_columns() WHERE database_name = 'c' AND schema_name LIKE '{mid}' ESCAPE '\\' AND table_name LIKE 't010' ESCAPE '\\' AND column_name LIKE '%' ESCAPE '\\' ORDER BY database_name, schema_name, table_name, column_index",
-        "jdbc getPrimaryKeys (table)": f"SELECT vcat, object, key_sequence, \"column\" FROM acl_keys() WHERE kind = 'relation' AND vcat = 'c' AND object = '{mid}.t010' ORDER BY vcat, object, \"column\"",
-        "jdbc getImportedKeys (table)": f"SELECT r.vcat, r.name, r.from_object, r.to_object, r.from_column_list, r.to_column_list, r.to_has_key FROM acl_references() r WHERE r.to_kind = 'relation' AND r.expression IS NULL AND r.vcat = 'c' AND r.from_object = '{mid}.t010' ORDER BY r.vcat, r.name",
+        "jdbc getPrimaryKeys (table)": f"SELECT vcat, object, key_sequence, \"column\" FROM acl_keys() WHERE kind = 'relation' AND vcat = 'c' AND object = 'k010' ORDER BY vcat, object, \"column\"",
+        "jdbc getImportedKeys (table)": f"SELECT r.vcat, r.name, r.from_object, r.to_object, r.from_column_list, r.to_column_list, r.to_has_key FROM acl_references() r WHERE r.to_kind = 'relation' AND r.expression IS NULL AND r.vcat = 'c' AND r.from_object = 'k010' ORDER BY r.vcat, r.name",
+        "jdbc getExportedKeys (table)": f"SELECT r.vcat, r.name, r.from_object, r.to_object, r.from_column_list, r.to_column_list, r.to_has_key FROM acl_references() r WHERE r.to_kind = 'relation' AND r.expression IS NULL AND r.vcat = 'c' AND r.to_object = 'k010' ORDER BY r.vcat, r.name",
         "jdbc getFunctions (schema)": f"SELECT database_name, schema_name, function_name, function_type, comment, description, parameter_types FROM duckdb_functions() WHERE database_name = 'c' AND schema_name LIKE '{mid}' ESCAPE '\\' AND function_name LIKE '%' ESCAPE '\\' ORDER BY database_name, schema_name, function_name",
     }
     attach, use = policy_attach(args, policy_path(args))

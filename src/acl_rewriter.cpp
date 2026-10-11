@@ -2364,9 +2364,9 @@ private:
 			if (name_column && StringUtil::CIEquals(column, name_column)) {
 				return &scope.tables;
 			}
-			if (keyed && (StringUtil::CIEquals(column, "object") ||
-			              (kind == "references" && (StringUtil::CIEquals(column, "from_object") ||
-			                                        StringUtil::CIEquals(column, "to_object"))))) {
+			if ((kind == "keys" && StringUtil::CIEquals(column, "object")) ||
+			    (kind == "references" &&
+			     (StringUtil::CIEquals(column, "from_object") || StringUtil::CIEquals(column, "to_object")))) {
 				return &scope.objects;
 			}
 			return nullptr;

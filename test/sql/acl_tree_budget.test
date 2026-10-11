@@ -46,6 +46,9 @@ statement ok
 ACL ADMIN CREATE VIRTUAL SCHEMA c.raw.eu FROM phys.eu;
 
 statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.raw.eu.events_keyed AS phys.eu.events PRIMARY KEY (id);
+
+statement ok
 ACL ADMIN CREATE VIRTUAL TABLE c.vault AS phys.main.vault PRIMARY KEY (code);
 
 statement ok
@@ -94,10 +97,15 @@ ACL ROLE "r" SELECT count(*) FROM acl_keys() WHERE vcat = 'c' AND object = 'vaul
 0
 
 # a key object of a nested schema, by its path
-query I
-ACL ROLE "r" SELECT count(*) FROM acl_keys() WHERE vcat = 'c' AND object = 'raw.eu.events';
+query IIII
+ACL ROLE "r" SELECT vcat, object, key_sequence, "column" FROM acl_keys() WHERE vcat = 'c' AND object = 'raw.eu.events_keyed';
 ----
-0
+c	raw.eu.events_keyed	1	id
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_keys() WHERE object || '' = 'raw.eu.events_keyed';
+----
+1
 
 # --- references: by its near end and by its far end - the far end's columns are read too ------------------
 
@@ -140,3 +148,11 @@ ACL ROLE "full" SELECT name, to_object, to_has_key FROM acl_references() WHERE v
 ----
 order_vault	vault	true
 orders_customer	customers	true
+
+# `object` is a keys column: written unqualified beside acl_references() it narrows the keys, never the references
+# (review 121) - every reference r sees, each paired with customers' key row
+query I
+ACL ROLE "r" SELECT DISTINCT name FROM acl_references(), acl_keys() WHERE object = 'customers' ORDER BY ALL;
+----
+event_order
+orders_customer
