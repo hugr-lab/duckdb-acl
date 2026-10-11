@@ -100,26 +100,90 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// scan of the same information_schema the columns surface already reads, never a probe (spec
 	// 065). The columns surface keeps the contract as written; the mark on the object says the read
 	// will fail anyway, and acl_check_catalog (which probes) has the rest.
-	// spec 119: the physical columns only of the relations that declare a list - read table by table
-	// (acl_physical_columns), never a walk of every attached database's information_schema; none declared,
-	// nothing read
-	vector<string> declared_phys;
+	// spec 119: the physical facts are read per source - the schemas the policy's objects and aliases name,
+	// each read directly (acl_physical_tables / _columns) - never duckdb's information_schema, which walks
+	// every attached database; the broken-list mark only over the relations that declare a list
+	vector<string> source_keys, declared_phys;
 	{
-		auto rows = Query("SELECT DISTINCT r.\"phys\" FROM " + Tbl("relations") + " r JOIN " + Tbl("relation_columns") +
-		                  " dc ON dc.\"vcat\" = r.\"vcat\" AND dc.\"vname\" = r.\"vname\" WHERE r.\"form\" IN ('alias',"
-		                  " 'subquery') AND r.\"phys\" IS NOT NULL");
+		auto add_schema = [&](const string &key) {
+			NamePath path;
+			string error;
+			if (!NamePath::TryFromKey(key, path, error) || path.Parts().empty()) {
+				return;
+			}
+			auto &parts = path.Parts();
+			auto schema = parts.size() >= 3   ? vector<string> {parts[0], parts[1]}
+			              : parts.size() == 2 ? vector<string> {parts[0], parts[1]}
+			                                  : vector<string> {};
+			if (!schema.empty()) {
+				source_keys.push_back(Lit(NamePath(schema).ToKey()));
+			}
+		};
+		auto rows = Query("SELECT DISTINCT \"phys\" FROM " + Tbl("relations") + " WHERE \"phys\" IS NOT NULL");
 		ResultRows phys_rows(*rows);
 		for (idx_t i = 0; i < phys_rows.Count(); i++) {
-			declared_phys.push_back(Lit(phys_rows.GetValue(0, i).ToString()));
+			auto phys = phys_rows.GetValue(0, i).ToString();
+			NamePath path;
+			string error;
+			if (NamePath::TryFromKey(phys, path, error) && path.Parts().size() == 2) {
+				add_schema(NamePath({path.Parts()[0], "main"}).ToKey()); // <db>.<table>: the database's main
+			} else {
+				add_schema(phys);
+			}
+		}
+		auto aliases_rows = Query("SELECT DISTINCT \"phys_path\" FROM " + Tbl("schemas") +
+		                          " WHERE \"phys_path\" IS NOT NULL AND \"phys_path\" <> ''");
+		ResultRows alias_rows(*aliases_rows);
+		for (idx_t i = 0; i < alias_rows.Count(); i++) {
+			add_schema(alias_rows.GetValue(0, i).ToString());
+		}
+		auto declared_rows =
+		    Query("SELECT DISTINCT r.\"phys\" FROM " + Tbl("relations") + " r JOIN " + Tbl("relation_columns") +
+		          " dc ON dc.\"vcat\" = r.\"vcat\" AND dc.\"vname\" = r.\"vname\" WHERE r.\"form\" IN ('alias',"
+		          " 'subquery') AND r.\"phys\" IS NOT NULL");
+		ResultRows declared_phys_rows(*declared_rows);
+		for (idx_t i = 0; i < declared_phys_rows.Count(); i++) {
+			declared_phys.push_back(Lit(declared_phys_rows.GetValue(0, i).ToString()));
 		}
 	}
+	auto keys_list = [](const vector<string> &keys) {
+		return "[" + StringUtil::Join(keys, ", ") + "]::VARCHAR[]";
+	};
 	string physcols =
 	    declared_phys.empty()
 	        ? string("physcols AS (SELECT NULL::VARCHAR AS table_catalog, NULL::VARCHAR AS table_schema, NULL::VARCHAR"
 	                 " AS table_name, NULL::VARCHAR[] AS cols WHERE false)")
-	        : "physcols AS (SELECT table_catalog, table_schema, table_name, list(" + KeyFoldSql("column_name") +
-	              ") AS cols FROM acl_physical_columns([" + StringUtil::Join(declared_phys, ", ") +
-	              "]::VARCHAR[]) GROUP BY 1, 2, 3)";
+	        : "physcols AS (SELECT database_name AS table_catalog, schema_name AS table_schema, table_name, list(" +
+	              KeyFoldSql("column_name") + ") AS cols FROM acl_physical_columns(" + keys_list(declared_phys) +
+	              ") GROUP BY 1, 2, 3)";
+	// duckdb's own information_schema.tables / .columns views, over the per-source reader
+	auto sources = keys_list(source_keys);
+	// inlined where they are joined, as duckdb's own views are - a CTE referenced from correlated
+	// subqueries is materialized, and decorrelating over it blew the planner up (measured: minutes)
+	string itables =
+	    "(SELECT database_name table_catalog, schema_name table_schema, table_name, CASE WHEN is_view THEN"
+	    " 'VIEW' WHEN temporary THEN 'LOCAL TEMPORARY' ELSE 'BASE TABLE' END table_type, NULL::VARCHAR"
+	    " self_referencing_column_name, NULL::VARCHAR reference_generation, NULL::VARCHAR user_defined_type_catalog,"
+	    " NULL::VARCHAR user_defined_type_schema, NULL::VARCHAR user_defined_type_name, CASE WHEN is_view THEN 'NO'"
+	    " ELSE 'YES' END is_insertable_into, 'NO' is_typed, CASE WHEN temporary AND NOT is_view THEN 'PRESERVE' ELSE"
+	    " NULL END commit_action, comment AS TABLE_COMMENT FROM acl_physical_tables(" +
+	    sources + "))";
+	string icolumns =
+	    "(SELECT database_name table_catalog, schema_name table_schema, table_name, column_name,"
+	    " column_index ordinal_position, column_default, CASE WHEN is_nullable THEN 'YES' ELSE 'NO' END is_nullable,"
+	    " data_type, character_maximum_length, NULL::INT character_octet_length, numeric_precision,"
+	    " numeric_precision_radix, numeric_scale, NULL::INT datetime_precision, NULL::VARCHAR interval_type, NULL::INT"
+	    " interval_precision, NULL::VARCHAR character_set_catalog, NULL::VARCHAR character_set_schema, NULL::VARCHAR"
+	    " character_set_name, NULL::VARCHAR collation_catalog, NULL::VARCHAR collation_schema, NULL::VARCHAR"
+	    " collation_name, NULL::VARCHAR domain_catalog, NULL::VARCHAR domain_schema, NULL::VARCHAR domain_name,"
+	    " NULL::VARCHAR udt_catalog, NULL::VARCHAR udt_schema, NULL::VARCHAR udt_name, NULL::VARCHAR scope_catalog,"
+	    " NULL::VARCHAR scope_schema, NULL::VARCHAR scope_name, NULL::BIGINT maximum_cardinality, NULL::VARCHAR"
+	    " dtd_identifier, NULL::BOOL is_self_referencing, NULL::BOOL is_identity, NULL::VARCHAR identity_generation,"
+	    " NULL::VARCHAR identity_start, NULL::VARCHAR identity_increment, NULL::VARCHAR identity_maximum, NULL::VARCHAR"
+	    " identity_minimum, NULL::BOOL identity_cycle, CASE WHEN is_generated THEN 'ALWAYS' ELSE 'NEVER' END"
+	    " is_generated, generation_expression, NULL::BOOL is_updatable, comment AS COLUMN_COMMENT FROM"
+	    " acl_physical_columns(" +
+	    sources + "))";
 	string declared = "declared AS (SELECT dc.\"vcat\" AS vcat, dc.\"vname\" AS vname,"
 	                  " list(dc.\"name\" ORDER BY dc.\"pos\") AS names,"
 	                  " list(translate(CASE WHEN dc.\"expr\" IS NULL OR dc.\"expr\" = '' THEN dc.\"name\""
@@ -403,7 +467,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	string tables_sql =
 	    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
 	           " o.comment AS \"TABLE_COMMENT\", ") +
-	    object_insertable + ") FROM objects o JOIN information_schema.tables i ON " + physical +
+	    object_insertable + ") FROM objects o JOIN " + itables + " i ON " + physical +
 	    " WHERE len(o.parts) = 3"
 	    " UNION ALL BY NAME"
 	    // a view's own comment (spec 117 §7: it never reached duckdb_views / information_schema.tables)
@@ -412,9 +476,9 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " WHERE o.form = 'view'"
 	    " UNION ALL BY NAME"
 	    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +
-	    KeyQuotePartSql("i.\"table_name\"") + " AS table_name, " + alias_insertable +
-	    ") FROM aliases a JOIN information_schema.tables i"
-	    " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
+	    KeyQuotePartSql("i.\"table_name\"") + " AS table_name, " + alias_insertable + ") FROM aliases a JOIN " +
+	    itables +
+	    " i ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
 	    " WHERE len(a.parts) = 2" +
 	    // spec 117: the system catalog's views the principal holds
 	    string(platform ? " UNION ALL BY NAME SELECT 'platform' AS table_catalog, p.path AS table_schema,"
@@ -470,10 +534,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
 	           " coalesce(c.\"name\", i.\"column_name\") AS column_name,"
 	           " acl_exposed_type(i.\"data_type\", o.strip_alias, o.enums_to_varchar) AS data_type, ") +
-	    alias_nullable +
-	    string(" AS is_nullable)"
-	           " FROM objects o JOIN information_schema.columns i ON ") +
-	    physical + projection +
+	    alias_nullable + " AS is_nullable) FROM objects o JOIN " + icolumns + " i ON " + physical + projection +
 	    " AND c.\"expr\" = i.\"column_name\""
 	    " WHERE len(o.parts) = 3 AND (o.form = 'alias' OR (o.form = 'subquery' AND NOT EXISTS"
 	    " (SELECT 1 FROM " +
@@ -504,8 +565,9 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +
 	    KeyQuotePartSql("i.\"table_name\"") +
 	    " AS table_name)"
-	    " FROM aliases a JOIN information_schema.columns i"
-	    " ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
+	    " FROM aliases a JOIN " +
+	    icolumns +
+	    " i ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
 	    " WHERE len(a.parts) = 2";
 	// The names a grant states: split the list and take the part before '=' of a masked item. A
 	// mask's expression may itself contain a comma, which splits into a fragment that matches no

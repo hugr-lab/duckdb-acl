@@ -19,6 +19,8 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -222,16 +224,26 @@ void SourcesScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 	output.SetChildCardinality(count);
 }
 
-//! acl_physical_columns(keys) (spec 119): the columns of the named physical tables / views only -
-//! `<db>.<schema>.<object>` keys, each looked up directly (never a walk of the node); a key that does not
-//! resolve, or whose source fails, answers nothing
+//! acl_physical_tables(keys) / acl_physical_columns(keys) (spec 119): duckdb_tables / duckdb_views /
+//! duckdb_columns' rows - only of the named physical schemas (`<db>.<schema>`) and objects
+//! (`<db>.<schema>.<object>`), each read directly: a listing reads the sources it answers about, never a
+//! walk of every attached database. A key that does not resolve answers nothing; a source that fails is
+//! left out, never the listing failed.
 struct PhysicalBind : TableFunctionData {
 	vector<string> keys;
+	bool columns = false;
+};
+
+struct PhysicalInfo : TableFunctionInfo {
+	explicit PhysicalInfo(bool columns_p) : columns(columns_p) {
+	}
+	bool columns;
 };
 
 unique_ptr<FunctionData> PhysicalBindFn(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
                                         vector<Identifier> &names) {
 	auto bind = make_uniq<PhysicalBind>();
+	bind->columns = input.info->Cast<PhysicalInfo>().columns;
 	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
 		for (auto &value : ListValue::GetChildren(input.inputs[0])) {
 			if (!value.IsNull()) {
@@ -239,23 +251,144 @@ unique_ptr<FunctionData> PhysicalBindFn(ClientContext &, TableFunctionBindInput 
 			}
 		}
 	}
-	for (auto name : {"table_catalog", "table_schema", "table_name", "column_name", "data_type"}) {
+	auto column = [&](const char *name, const LogicalType &type) {
 		names.push_back(Identifier(name));
-		types.push_back(LogicalType::VARCHAR);
+		types.push_back(type);
+	};
+	column("database_name", LogicalType::VARCHAR);
+	column("schema_name", LogicalType::VARCHAR);
+	column("table_name", LogicalType::VARCHAR);
+	if (bind->columns) {
+		column("column_name", LogicalType::VARCHAR);
+		column("column_index", LogicalType::INTEGER);
+		column("column_default", LogicalType::VARCHAR);
+		column("is_nullable", LogicalType::BOOLEAN);
+		column("data_type", LogicalType::VARCHAR);
+		column("character_maximum_length", LogicalType::INTEGER);
+		column("numeric_precision", LogicalType::INTEGER);
+		column("numeric_precision_radix", LogicalType::INTEGER);
+		column("numeric_scale", LogicalType::INTEGER);
+		column("is_generated", LogicalType::BOOLEAN);
+		column("generation_expression", LogicalType::VARCHAR);
+		column("comment", LogicalType::VARCHAR);
+	} else {
+		column("is_view", LogicalType::BOOLEAN);
+		column("temporary", LogicalType::BOOLEAN);
+		column("comment", LogicalType::VARCHAR);
 	}
-	names.push_back(Identifier("ordinal_position"));
-	types.push_back(LogicalType::BIGINT);
 	return std::move(bind);
+}
+
+//! duckdb_columns' numeric facts of a type
+void NumericFacts(const LogicalType &type, Value &precision, Value &radix, Value &scale) {
+	int32_t bits = 0;
+	switch (type.id()) {
+	case LogicalTypeId::DECIMAL:
+		precision = Value::INTEGER(DecimalType::GetWidth(type));
+		scale = Value::INTEGER(DecimalType::GetScale(type));
+		radix = Value::INTEGER(10);
+		return;
+	case LogicalTypeId::HUGEINT:
+		bits = 128;
+		break;
+	case LogicalTypeId::BIGINT:
+		bits = 64;
+		break;
+	case LogicalTypeId::INTEGER:
+		bits = 32;
+		break;
+	case LogicalTypeId::SMALLINT:
+		bits = 16;
+		break;
+	case LogicalTypeId::TINYINT:
+		bits = 8;
+		break;
+	case LogicalTypeId::FLOAT:
+		bits = 24;
+		break;
+	case LogicalTypeId::DOUBLE:
+		bits = 53;
+		break;
+	default:
+		precision = Value(LogicalType::INTEGER);
+		scale = Value(LogicalType::INTEGER);
+		radix = Value(LogicalType::INTEGER);
+		return;
+	}
+	precision = Value::INTEGER(bits);
+	scale = Value::INTEGER(0);
+	radix = Value::INTEGER(2);
+}
+
+void PhysicalRows(ClientContext &context, const PhysicalBind &bind, SourcesState &state, const string &db_name,
+                  const string &schema_name, CatalogEntry &entry) {
+	auto text = [](const Value &value) {
+		return value.IsNull() ? Value(LogicalType::VARCHAR) : Value(value.ToString());
+	};
+	auto comment = text(entry.comment);
+	auto table = Value(entry.name.GetIdentifierName());
+	bool is_view = entry.type == CatalogType::VIEW_ENTRY;
+	if (!bind.columns) {
+		state.rows.push_back({Value(db_name), Value(schema_name), table, Value::BOOLEAN(is_view),
+		                      Value::BOOLEAN(entry.temporary), comment});
+		return;
+	}
+	auto push = [&](const string &column, int32_t index, const Value &column_default, bool nullable,
+	                const LogicalType &type, bool generated, const Value &generation, const Value &column_comment) {
+		Value precision, radix, scale;
+		NumericFacts(type, precision, radix, scale);
+		state.rows.push_back(
+		    {Value(db_name), Value(schema_name), table, Value(column), Value::INTEGER(index), column_default,
+		     Value::BOOLEAN(nullable),
+		     type.id() == LogicalTypeId::INVALID ? Value(LogicalType::VARCHAR) : Value(type.ToString()),
+		     Value(LogicalType::INTEGER), precision, radix, scale, Value::BOOLEAN(generated), generation,
+		     text(column_comment)});
+	};
+	if (!is_view) {
+		auto &table_entry = entry.Cast<TableCatalogEntry>();
+		std::set<idx_t> not_null;
+		for (auto &constraint : table_entry.GetConstraints()) {
+			if (constraint->type == ConstraintType::NOT_NULL) {
+				not_null.insert(constraint->Cast<NotNullConstraint>().index.index);
+			}
+		}
+		auto &columns = table_entry.GetColumns();
+		for (idx_t i = 0; i < columns.LogicalColumnCount(); i++) {
+			auto &col = columns.GetColumn(LogicalIndex(i));
+			Value column_default(LogicalType::VARCHAR), generation(LogicalType::VARCHAR);
+			if (col.Generated()) {
+				column_default = Value(col.GeneratedExpression().ToString());
+				generation = column_default;
+			} else if (col.HasDefaultValue()) {
+				column_default = Value(col.DefaultValue().ToString());
+			}
+			push(col.Name().GetIdentifierName(), NumericCast<int32_t>(i + 1), column_default, !not_null.count(i),
+			     col.Type(), col.Generated(), generation, col.Comment());
+		}
+		return;
+	}
+	auto &view = entry.Cast<ViewCatalogEntry>();
+	try {
+		view.BindView(context);
+	} catch (std::exception &) { // NOLINT: an unbound view answers no columns
+	}
+	auto info = view.GetColumnInfo();
+	for (idx_t i = 0; info && i < info->names.size() && i < info->types.size(); i++) {
+		push(info->names[i].GetIdentifierName(), NumericCast<int32_t>(i + 1), Value(LogicalType::VARCHAR), true,
+		     info->types[i], false, Value(LogicalType::VARCHAR), view.GetColumnComment(i));
+	}
 }
 
 unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<PhysicalBind>();
 	auto state = make_uniq<SourcesState>();
 	auto &manager = DatabaseManager::Get(context);
+	std::set<string> seen;
 	for (auto &key : bind.keys) {
 		NamePath path;
 		string error;
-		if (!NamePath::TryFromKey(key, path, error) || path.Parts().size() != 3) {
+		if (!NamePath::TryFromKey(key, path, error) || path.Parts().size() < 2 || path.Parts().size() > 3 ||
+		    !seen.insert(StringUtil::Lower(path.ToKey())).second) {
 			continue;
 		}
 		auto &parts = path.Parts();
@@ -265,32 +398,26 @@ unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableF
 			if (!db || db->GetVisibility() == AttachVisibility::HIDDEN) {
 				continue;
 			}
-			auto entry = db->GetCatalog().GetEntry(context, CatalogType::TABLE_ENTRY, Identifier(parts[1]),
-			                                       Identifier(parts[2]), OnEntryNotFound::RETURN_NULL);
-			if (!entry) {
+			auto db_name = db->GetName().GetIdentifierName();
+			auto &catalog = db->GetCatalog();
+			if (parts.size() == 3) {
+				auto entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, Identifier(parts[1]),
+				                              Identifier(parts[2]), OnEntryNotFound::RETURN_NULL);
+				if (entry) {
+					PhysicalRows(context, bind, *state, db_name, parts[1], *entry);
+				}
 				continue;
 			}
-			auto row = [&](const string &column, const LogicalType &type, int64_t pos) {
-				state->rows.push_back({Value(parts[0]), Value(parts[1]), Value(entry->name.GetIdentifierName()),
-				                       Value(column), Value(type.ToString()), Value::BIGINT(pos)});
-			};
-			if (entry->type == CatalogType::TABLE_ENTRY) {
-				int64_t pos = 0;
-				for (auto &col : entry->Cast<TableCatalogEntry>().GetColumns().Logical()) {
-					row(col.Name().GetIdentifierName(), col.Type(), ++pos);
-				}
-			} else if (entry->type == CatalogType::VIEW_ENTRY) {
-				auto &view = entry->Cast<ViewCatalogEntry>();
-				try {
-					view.BindView(context);
-				} catch (std::exception &) { // NOLINT: an unbound view answers no columns
-				}
-				auto info = view.GetColumnInfo();
-				for (idx_t i = 0; info && i < info->names.size() && i < info->types.size(); i++) {
-					row(info->names[i].GetIdentifierName(), info->types[i], NumericCast<int64_t>(i + 1));
-				}
+			EntryLookupInfo schema_lookup(CatalogType::SCHEMA_ENTRY, QualifiedName(Identifier(parts[1])));
+			auto schema = catalog.GetSchema(context, schema_lookup, OnEntryNotFound::RETURN_NULL);
+			if (!schema) {
+				continue;
 			}
-		} catch (std::exception &) { // NOLINT: a source that cannot answer answers nothing
+			auto schema_name = schema->name.GetIdentifierName();
+			schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+				PhysicalRows(context, bind, *state, db_name, schema_name, entry);
+			});
+		} catch (std::exception &) { // NOLINT: a source that cannot answer is left out
 			state->rows.resize(mark);
 		}
 	}
@@ -406,9 +533,11 @@ void RegisterAclPlatformSources(ExtensionLoader &loader, const shared_ptr<Policy
 		}
 		loader.RegisterFunction(set);
 	}
-	{
-		TableFunction physical(Identifier("acl_physical_columns"), {LogicalType::LIST(LogicalType::VARCHAR)},
-		                       SourcesScan, PhysicalBindFn, PhysicalInit);
+	for (auto columns : {false, true}) {
+		auto name = columns ? "acl_physical_columns" : "acl_physical_tables";
+		TableFunction physical(Identifier(name), {LogicalType::LIST(LogicalType::VARCHAR)}, SourcesScan, PhysicalBindFn,
+		                       PhysicalInit);
+		physical.function_info = make_shared_ptr<PhysicalInfo>(columns);
 		loader.RegisterFunction(physical);
 	}
 	for (auto grant : {true, false}) {
