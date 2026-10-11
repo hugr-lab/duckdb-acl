@@ -1,6 +1,6 @@
 # Spec 119: metadata at scale - a listing reads the sources it answers about, not the node
 
-- **Status**: accepted (by the owner 2026-10-11, after the measurements below)
+- **Status**: implemented (accepted by the owner 2026-10-11 after the measurements; built the same day - see *As built*)
 - **Date**: 2026-10-11
 - **Author**: Claude (design/079 with the owner)
 - **Follows**: spec 010/025/035 (the metadata surfaces), 039 (the broken-list mark), 046 (the Flight catalog
@@ -97,3 +97,38 @@ platform scopes) is untouched; the bound refuses, never shortens.
 - **Truncate at N** - a tool takes a short answer as complete (spec 070).
 - **A metadata cache now** - the real answer for an unfiltered listing over many sources, but a cluster's
   coherence is unsettled; after the release.
+
+## As built (2026-10-11)
+
+Warm medians after each step (the bench119 scenarios, principal):
+
+| scenario / query | before | step 1 (mark) | step 2 (per source + narrowing) |
+| --- | --- | --- | --- |
+| 100 aliases: tables of one schema | 0.343 | 0.074 | **0.035** |
+| 100 aliases: columns of one table | 0.515 | 0.301 | **0.144** |
+| 100 aliases: duckdb_schemas | 0.321 | 0.023 | 0.029 |
+| + unrelated 20k-table source: tables of one schema | 0.674 | 0.127 | **0.034** |
+| + unrelated source: columns of one table | 0.838 | 0.422 | **0.142** |
+| admin, the tree: columns of one table (s4b) | ~0.29 | - | **0.15** (step 3) |
+
+`test/bench/metadata_scale.py`, **200 sources x 150 tables x 10 columns under one virtual catalog**: tables of one
+schema 0.043 s, columns of one table 0.216 s, columns of one schema 0.217 s, schemas of the catalog 0.036 s, Flight
+GetTables for one schema 0.046 s, every table (30,000 rows, bound off) 0.060 s.
+
+- Step 1: `physcols` reads `acl_physical_columns(declared relations' phys)`; none declared - nothing read.
+- Step 2: `acl_physical_tables / _columns(keys)` (`acl_platform_sources.cpp`) - duckdb_tables / duckdb_views /
+  duckdb_columns' facts (numeric precision / radix / scale, nullability by the NOT NULL constraints, defaults,
+  generated columns) of the named schemas / objects; inlined as subqueries where the listing joined
+  `information_schema.tables / .columns` (a CTE referenced from correlated subqueries is materialized and the
+  planner's decorrelation took minutes - found by the suite). Keys from the policy: relations' `phys` (their schema;
+  the object itself when narrowed) and aliases' `phys_path` (+ the named tables when narrowed). `ListingScope` from
+  `AclRewriter::ScopeOf`. The Flight catalog RPCs bind their filters as quoted literals.
+- Step 3: `PlatformListingCtes(…, scope)` - another catalog asked about reads none of the tree; `attached.<alias>
+  [.<schema>]` reads only that source.
+- Step 4: `acl_metadata_max_rows`; the wrapper `SELECT * EXCLUDE (__acl_rows) FROM (SELECT *, count(*) OVER () …
+  LIMIT <node + 1>) WHERE CASE WHEN __acl_rows > least(session, node) THEN error(…)`. A RESET writes the default on
+  the session (duckdb), so the bound in force is the lower of the two; the validator refuses an explicit raise. A
+  `LIMIT (SELECT …)` crashed duckdb (SIGSEGV in PhysicalLimit::GetDelimiter) - the node's bound is a constant.
+- The suite's ~1000 s stalls during the work were the laptop's sleep cycles (pmset: 919-1062 s), not the code.
+- Tests: `test/sql/acl_metadata_scale.test`; every listing test unchanged.
+
