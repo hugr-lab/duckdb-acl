@@ -1060,7 +1060,7 @@ bool PolicyStore::MetadataListing(const Principal &principal, const string &surf
 	// the console is Flight / JDBC), and for a principal holding nothing on it
 	string platform_objects, platform_columns;
 	if (principal.session.empty() || SessionDoorOf(principal.session) != "quack") {
-		PlatformListingCtes(AdminRightsOf(principal), platform_objects, platform_columns);
+		PlatformListingCtes(AdminRightsOf(principal), platform_objects, platform_columns, scope);
 	}
 	sql = catalog->MetadataListingSql(principal, surface, platform_objects, platform_columns, scope);
 	return true;
