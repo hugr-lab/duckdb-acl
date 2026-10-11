@@ -1073,6 +1073,11 @@ ACL SESSION 'h…' SELECT table_schema, table_name FROM information_schema.table
 ACL SESSION 'h…' RESET SESSION VIEW AS;
 ```
 
+A console that checks how a role sees the catalog (a DBeaver data source, for one) sets the mode on every
+connection it opens - DBeaver reads metadata over a connection of its own by default, so the statement goes into
+the connection's bootstrap queries - and keeps the door's session (the Flight cookie). A data preview is refused
+in the mode.
+
 Function: `acl_session_view_as(role)` (`''` leaves) - or `platform.view_as(role)`.
 
 ## Comments
