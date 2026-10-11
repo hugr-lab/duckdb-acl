@@ -1,6 +1,7 @@
 # Spec 121: a tool's tree within budget
 
-- **Status**: accepted (owner, 2026-10-11 - the plan below; numbers to be met, measured before and after)
+- **Status**: implemented - steps 1-3 (2026-10-11); steps 4-5 and the plugin's References folder after the DBeaver
+  plugin is finished (owner, 2026-10-11)
 - **Date**: 2026-10-11
 - **Author**: duckdb-acl
 - **Builds on**: spec 119 (metadata at scale - the narrowing, the per-source reader), 115 (metadata for tools);
@@ -136,3 +137,10 @@ narrows nothing (slower, never wider). The driver's listing change reads a surfa
 - Tests: `test/sql/acl_tree_budget.test` (keys and references narrowed - by `=`, by the far end, through a nested
   schema, by the argument - answer what the unnarrowed form answers; `to_has_key` true / false for a key whose column
   the role does not see).
+
+### Deferred (owner, 2026-10-11: after the plugin is finished)
+- Step 4 - the columns surface's plan cost (~0.23 s whatever the size: the listing's SQL is ~23 KB, 54 SELECTs; the
+  planner spends ~0.1 s on its correlated subqueries, binding 8 ms, execution 12 ms).
+- Step 5 - `duckdb_tables()` / `duckdb_views()` as cheap as `information_schema.tables` (still ~0.78 s at 200 x 150)
+  for tools that ask that way.
+- The plugin's References folder (990 ms: Generic's model asks three listings).
