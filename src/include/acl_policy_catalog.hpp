@@ -526,7 +526,8 @@ struct CatalogBackend {
 	//! spec 117: `platform_objects` / `platform_columns` are the system catalog's share (constant CTE bodies,
 	//! PlatformListingCtes) - empty when the principal holds nothing on it
 	string MetadataListingSql(const Principal &principal, const string &surface,
-	                          const string &platform_objects = string(), const string &platform_columns = string());
+	                          const string &platform_objects = string(), const string &platform_columns = string(),
+	                          const ListingScope &scope = ListingScope());
 
 	//! Targeted gate lookup: only the rows for this name and these roles leave the database ('' as
 	//! role means a global row - NULL cannot be part of the primary key). Role-specific rows beat

@@ -273,8 +273,20 @@ struct TemplateCache {
 };
 
 namespace acl_detail {
+//! spec 119: what a metadata query asks about - the constant conjuncts of the WHERE above a substituted
+//! surface on its catalog / schema / name columns (`=`, `IN`, a LIKE with no wildcard). Each list holds the
+//! names as shown, folded; empty = not narrowed. A narrowing only selects which physical sources are read -
+//! the WHERE stays as written, so it never changes an answer
+struct ListingScope {
+	vector<string> catalogs, schemas, tables;
+	bool Empty() const {
+		return catalogs.empty() && schemas.empty() && tables.empty();
+	}
+};
+
 struct CatalogBackend; // catalog-DB policy backend (spec 006), declared in acl_policy_catalog.hpp
 } // namespace acl_detail
+using acl_detail::ListingScope;
 
 //! Per-database policy store: the seam the rewriter and the admin functions talk to. Two backends:
 //! the in-memory maps below (default; dev/tests) and, once acl_use_db() ran, the catalog backend
@@ -540,7 +552,8 @@ struct PolicyStore {
 	//! The SQL behind a metadata surface for this principal (spec 010 part 3): duckdb's own shape,
 	//! filtered to what the roles hold, with virtual names in place of physical ones. False when the
 	//! active source cannot enumerate (memory mode); the driver mode throws with the reason.
-	bool MetadataListing(const Principal &principal, const string &surface, string &sql);
+	bool MetadataListing(const Principal &principal, const string &surface, string &sql,
+	                     const ListingScope &scope = ListingScope());
 	//! spec 098: the principal's own `duckdb_functions()` - the engine's functions the gate admits for
 	//! its roles (no definition, database or schema outside the system catalog) and the virtual
 	//! functions of its catalogs, in duckdb's shape. Works in every mode; the catalog adds (b).
@@ -676,6 +689,8 @@ struct PolicyStore {
 	string NodeGroup();
 	//! spec 118: acl_deployment = 'cluster' - the deployment's, never the policy's
 	bool ClusterNode();
+	//! spec 119: the node's acl_metadata_max_rows (0 = unlimited)
+	int64_t MetadataMaxRows();
 	bool NodeGroupKnown();
 	vector<ClusterItem> ClusterEffective();
 	//! spec 118: what this cluster node carries that its effective profile lacks and the other way round -

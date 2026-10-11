@@ -107,6 +107,11 @@ got="$(ask "@schemas")"
 # platform's own schema and (spec 118.3) the physical tree the policy bundle sees: the node's database
 echo "$got" | grep -q "'db_schema_name': \['attached', 'attached.memory', 'attached.memory.main', 'main'\]" ||
 	fail "GetDbSchemas: $got"
+# spec 119: the RPC's filter is written as a literal the listing narrows by - and answers the same rows
+got="$(ask "@schemas:attached.memory%")"
+echo "$got" | grep -q "'db_schema_name': \['attached.memory', 'attached.memory.main'\]" || fail "GetDbSchemas filtered: $got"
+got="$(ask "@schemas:it's")"
+echo "$got" | grep -q "'db_schema_name': \[\]" || fail "a filter with a quote: $got"
 got="$(ask "@tables:grants")"
 echo "$got" | grep -q "'catalog_name': \['platform'\]" || fail "GetTables does not list platform.grants: $got"
 echo "$got" | grep -q "'table_type': \['VIEW'\]" || fail "platform.grants is not a view: $got"

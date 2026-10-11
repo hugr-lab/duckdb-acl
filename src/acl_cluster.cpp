@@ -937,6 +937,15 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 	return answer;
 }
 
+int64_t PolicyStore::MetadataMaxRows() {
+	auto db = instance.lock();
+	Value value;
+	if (db && db->TryGetCurrentSetting("acl_metadata_max_rows", value) && !value.IsNull()) {
+		return value.GetValue<int64_t>();
+	}
+	return 0;
+}
+
 bool PolicyStore::ClusterNode() {
 	auto db = instance.lock();
 	Value value;

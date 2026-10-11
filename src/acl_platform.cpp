@@ -2533,7 +2533,8 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 // The listings' share
 //===--------------------------------------------------------------------===//
 
-void PlatformListingCtes(const PolicyStore::AdminRights &rights, string &objects, string &columns) {
+void PlatformListingCtes(const PolicyStore::AdminRights &rights, string &objects, string &columns,
+                         const ListingScope &scope) {
 	// rows (path, vname, comment, type) and (path, vname, pos, name, type): the views in `main`, and (spec
 	// 118.3) the physical tree under `attached` - a schema row has a NULL vname (an empty schema is a node)
 	objects.clear();
@@ -2565,18 +2566,65 @@ void PlatformListingCtes(const PolicyStore::AdminRights &rights, string &objects
 		columns += " UNION ALL SELECT * FROM (VALUES " + StringUtil::Join(column_rows, ", ") +
 		           ") AS p(path, vname, pos, name, type)";
 	}
-	// the physical tree: every source, or only the granted ones (a catalog admin) - never read otherwise
+	// the physical tree: every source, or only the granted ones (a catalog admin) - never read otherwise;
+	// spec 119: and only what the query asks about - another catalog reads none of it, a schema under
+	// `attached` only its source
+	bool asks_platform = scope.catalogs.empty();
+	for (auto &catalog : scope.catalogs) {
+		asks_platform = asks_platform || IsPlatformCatalog(catalog);
+	}
+	vector<string> asked; // `<alias>[.<schema>]` keys named by an `attached.…` schema filter; empty = every one
+	bool asks_tree = asks_platform;
+	if (asks_platform && !scope.schemas.empty()) {
+		asks_tree = false;
+		for (auto &shown : scope.schemas) {
+			NamePath path;
+			string error;
+			if (!NamePath::TryFromKey(NamePath::FromDisplay(shown), path, error) || path.Parts().empty() ||
+			    !StringUtil::CIEquals(path.Parts()[0], "attached")) {
+				continue;
+			}
+			asks_tree = true;
+			auto parts = path.Parts();
+			if (parts.size() == 1) {
+				asked.clear(); // the `attached` schema itself: its children are every source
+				break;
+			}
+			asked.push_back(
+			    NamePath(vector<string>(parts.begin() + 1, parts.begin() + std::min<idx_t>(parts.size(), 3))).ToKey());
+		}
+	}
 	string sources;
-	if (SeesAllSources(rights)) {
-		sources = "NULL";
+	auto literal_list = [](const vector<string> &keys) {
+		vector<string> quoted;
+		for (auto &key : keys) {
+			quoted.push_back(Lit(key));
+		}
+		return "[" + StringUtil::Join(quoted, ", ") + "]::VARCHAR[]";
+	};
+	if (!asks_tree) {
+		// nothing of the tree is asked about
+	} else if (SeesAllSources(rights)) {
+		sources = asked.empty() ? string("NULL") : literal_list(asked);
 	} else {
 		auto granted = GrantedSources(rights);
-		if (!granted.empty()) {
-			vector<string> quoted;
-			for (auto &source : granted) {
-				quoted.push_back(Lit(source));
+		vector<string> keep;
+		for (auto &source : granted) {
+			NamePath granted_path;
+			string error;
+			bool wanted = asked.empty();
+			for (auto &want : asked) {
+				NamePath want_path;
+				wanted = wanted || (NamePath::TryFromKey(source, granted_path, error) &&
+				                    NamePath::TryFromKey(want, want_path, error) &&
+				                    StringUtil::CIEquals(granted_path.Parts()[0], want_path.Parts()[0]));
 			}
-			sources = "[" + StringUtil::Join(quoted, ", ") + "]::VARCHAR[]";
+			if (wanted) {
+				keep.push_back(source);
+			}
+		}
+		if (!keep.empty()) {
+			sources = literal_list(keep);
 		}
 	}
 	if (!sources.empty()) {

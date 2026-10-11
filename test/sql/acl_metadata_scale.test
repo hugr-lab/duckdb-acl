@@ -1,0 +1,269 @@
+# name: test/sql/acl_metadata_scale.test
+# description: spec 119 - a listing reads the sources it answers about (narrowed by the WHERE's constant
+#   conjuncts, the same answer either way), a source that fails drops out instead of failing the listing, and
+#   acl_metadata_max_rows refuses - never cuts - an answer above it (a session may only lower it)
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.a;
+
+statement ok
+CREATE SCHEMA phys.b;
+
+statement ok
+CREATE TABLE phys.a.t1(id INTEGER, x VARCHAR);
+
+statement ok
+CREATE TABLE phys.a.t2(id INTEGER);
+
+statement ok
+CREATE TABLE phys.b.t3(id INTEGER, y DOUBLE, z DECIMAL(10, 2));
+
+statement ok
+CREATE TABLE phys.main.lone(id INTEGER NOT NULL);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.sa AS phys.a;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.sb AS phys.b;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.lone AS phys.main.lone;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.narrow AS phys.a.t1 COLUMNS (id, x);
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- the narrowing changes no answer: each form, against the unfiltered listing filtered after ----------------
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables;
+----
+5
+
+query TTT
+ACL ROLE "r" SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_catalog = 'c' AND table_schema = 'sa' ORDER BY ALL;
+----
+sa	t1	BASE TABLE
+sa	t2	BASE TABLE
+
+query TT
+ACL ROLE "r" SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema IN ('sb', 'main') ORDER BY ALL;
+----
+main	lone
+main	narrow
+sb	t3
+
+query TT
+ACL ROLE "r" SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema LIKE 's\b' ESCAPE '\' AND table_name LIKE 't3' ORDER BY ALL;
+----
+sb	t3
+
+# the narrowed answer IS the unnarrowed one: compared both ways against a form that cannot narrow (upper())
+query I
+ACL ROLE "r" SELECT (SELECT count(*) FROM ((SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'c') EXCEPT ALL (SELECT table_schema, table_name FROM information_schema.tables WHERE upper(table_catalog) = 'C'))) + (SELECT count(*) FROM ((SELECT table_schema, table_name FROM information_schema.tables WHERE upper(table_catalog) = 'C') EXCEPT ALL (SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'c')));
+----
+0
+
+query I
+ACL ROLE "r" SELECT (SELECT count(*) FROM ((SELECT table_name, column_name FROM information_schema.columns WHERE table_catalog = 'c') EXCEPT ALL (SELECT table_name, column_name FROM information_schema.columns WHERE upper(table_catalog) = 'C'))) + (SELECT count(*) FROM ((SELECT table_name, column_name FROM information_schema.columns WHERE upper(table_catalog) = 'C') EXCEPT ALL (SELECT table_name, column_name FROM information_schema.columns WHERE table_catalog = 'c')));
+----
+0
+
+# review 119: a relation's table inside an aliased schema is one row, narrowed by the catalog alone too
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'c';
+----
+5
+
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_tables() WHERE database_name = 'c';
+----
+5
+
+# a column the surface does not have narrows nothing (another FROM item's, a select alias), nor a renamed one
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables t, (SELECT 'zzz' AS catalog_name) x WHERE catalog_name = 'zzz';
+----
+5
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables AS t(table_schema, table_catalog) WHERE table_schema = 'c';
+----
+5
+
+# a wildcard, an OR, a function of a column narrow nothing - the same rows
+query TT
+ACL ROLE "r" SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema LIKE 's%' OR table_name = 'lone' ORDER BY ALL;
+----
+main	lone
+sa	t1
+sa	t2
+sb	t3
+
+query TT
+ACL ROLE "r" SELECT table_schema, table_name FROM information_schema.tables t WHERE upper(t.table_schema) = 'SB' ORDER BY ALL;
+----
+sb	t3
+
+# the columns of one table, through an alias and a relation - types, nullability, numeric facts as duckdb's own
+query TTTIII
+ACL ROLE "r" SELECT column_name, data_type, is_nullable, numeric_precision, numeric_precision_radix, numeric_scale FROM information_schema.columns WHERE table_catalog = 'c' AND table_schema = 'sb' AND table_name = 't3' ORDER BY ordinal_position;
+----
+id	INTEGER	YES	32	2	0
+y	DOUBLE	YES	53	2	0
+z	DECIMAL(10,2)	YES	10	10	2
+
+query TT
+ACL ROLE "r" SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name = 'lone';
+----
+id	NO
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.columns WHERE table_schema = 'sa';
+----
+3
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.columns;
+----
+9
+
+# the broken-list mark still marks a declared column the source lost (spec 039)
+statement ok
+ALTER TABLE phys.a.t1 DROP COLUMN x;
+
+query T
+ACL ROLE "r" SELECT "TABLE_COMMENT" FROM information_schema.tables WHERE table_name = 'narrow';
+----
+acl: broken - declared column(s) x no longer exist in the source
+
+statement ok
+ALTER TABLE phys.a.t1 ADD COLUMN x VARCHAR;
+
+# --- the bound: N answered, N + 1 refused, never cut ------------------------------------------------------------
+
+statement ok
+SET GLOBAL acl_metadata_max_rows = 5;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables;
+----
+5
+
+statement error
+ACL ROLE "r" SELECT * FROM information_schema.columns;
+----
+<REGEX>:.*acl: more than 5 rows of columns - narrow by catalog, schema or name \(acl_metadata_max_rows\).*
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.columns WHERE table_schema = 'sb';
+----
+3
+
+# a session may lower it, never raise it; 0 is unlimited for the node only
+statement error
+SET acl_metadata_max_rows = 6;
+----
+<REGEX>:.*a session may only lower the node's 5.*
+
+statement error
+SET acl_metadata_max_rows = 0;
+----
+<REGEX>:.*a session may only lower the node's 5.*
+
+statement ok
+SET acl_metadata_max_rows = 2;
+
+statement error
+ACL ROLE "r" SELECT * FROM information_schema.tables WHERE table_schema = 'sb' OR table_schema = 'sa';
+----
+<REGEX>:.*acl: more than 2 rows of tables.*
+
+statement ok
+RESET acl_metadata_max_rows;
+
+# a RESET writes the default back on the session: the node's lower bound still holds - refused, never cut
+statement error
+ACL ROLE "r" SELECT * FROM information_schema.columns;
+----
+<REGEX>:.*acl: more than 5 rows of columns.*
+
+statement ok
+SET GLOBAL acl_metadata_max_rows = 0;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.columns;
+----
+9
+
+statement ok
+RESET GLOBAL acl_metadata_max_rows;
+
+query I
+SELECT current_setting('acl_metadata_max_rows');
+----
+1000000
+
+# --- a source that fails drops out of the listing; the others answer -----------------------------------------
+
+require ducklake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/scale_lake.ducklake' AS lake (DATA_PATH '__TEST_DIR__/scale_lake');
+
+statement ok
+CREATE TABLE lake.lt(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.lk AS lake.main;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables WHERE table_schema = 'lk';
+----
+1
+
+statement ok
+DETACH __ducklake_metadata_lake;
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables WHERE table_schema = 'sb';
+----
+1
+
+# the failed source asked about answers nothing - no error
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables WHERE table_schema = 'lk';
+----
+0
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables;
+----
+5

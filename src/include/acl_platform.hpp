@@ -159,7 +159,10 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 //! The listings' share (spec 117 §1): CTE bodies of the objects and the columns of `platform` this
 //! principal holds, as constant VALUES - `pobjects(vname, kind, comment)` and
 //! `pcolumns(vname, pos, name, type)` - or empty strings when it holds nothing (the catalog is absent)
-void PlatformListingCtes(const PolicyStore::AdminRights &rights, string &objects, string &columns);
+//! spec 119: `scope` (what the query asks about) narrows the physical tree's read - another catalog asked about
+//! reads none of it, `attached.<alias>[.<schema>]` reads only that
+void PlatformListingCtes(const PolicyStore::AdminRights &rights, string &objects, string &columns,
+                         const ListingScope &scope = ListingScope());
 //! The functions of `platform` this principal may call, for duckdb_functions()
 struct PlatformFunctionRow {
 	string name;

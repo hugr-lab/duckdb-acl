@@ -237,6 +237,17 @@ door's metadata, all of it answered for the connected principal:
   (`information_schema.schemata`, SHOW SCHEMAS, Flight GetDbSchemas) takes those nodes too. A table
   function's result columns are the ones the call returns to the role (a grant's hidden column is
   not listed).
+- **Cost at scale** (spec 119) - a listing reads the physical facts only of the sources it answers
+  about: the constant `=` / `IN` / wildcard-free `LIKE` conditions on the catalog, schema and name
+  columns of the WHERE above a metadata surface (what the Flight catalog RPCs and DBeaver write) choose
+  which sources are read - the answer is the same with or without them. Expanding one schema or one
+  table costs what it holds, whatever else is attached (measured: 200 sources x 150 tables - one
+  schema's tables 0.04 s, one table's columns 0.2 s). A source whose catalog fails is left out of the
+  listing instead of failing it. An answer above `acl_metadata_max_rows` (1,000,000 - a safety bound: a quack client loads a catalog whole) is **refused**, never
+  cut: `acl: more than N rows of <surface> - narrow by catalog, schema or name` - a quack catalog load
+  falls under it too. A session may lower the bound (`SET acl_metadata_max_rows = 100`); a value above the
+  node's is refused, and the node's lower bound always holds (a `RESET` or the default written back changes
+  nothing).
 
 ### Administering through the door (spec 117)
 
@@ -520,6 +531,7 @@ report success and change nothing):
 | `acl_session_token_binding` | `connect` | `connect` judges `exp` at establishment only; `every_use` re-judges it on every use. GLOBAL-only (`acl_session_token_binding is global - use SET GLOBAL`); other values refused (`acl_session_token_binding accepts 'connect' or 'every_use', not '<v>'`); entering `connect` with idle at 0 is refused (`acl_session_token_binding='connect' needs a live idle reaper: set acl_session_idle_timeout > 0 first (it is currently 0/disabled)`). Memory mode (no policy catalog) stays at `every_use` |
 | `acl_max_sessions` | 1000 | sessions that may live at once; at the cap a new one is refused; `0` = unlimited |
 | `acl_max_ingest_rows` | 0 | rows one Flight ingest may stream; `0` = unlimited |
+| `acl_metadata_max_rows` | 1000000 | rows a metadata surface (information_schema, duckdb_*, SHOW, the Flight catalog RPCs, quack's catalog load) answers a principal; above it the statement is refused, never cut; `0` = unlimited; a session may lower it for itself, never raise it (spec 119) |
 | `acl_max_result_rows` | 0 | rows one Flight statement may hand out: exactly that many go out, then the stream ends in a refusal; `0` = unlimited (spec 070) |
 | `acl_flight_stream_idle` | 30 | seconds a Flight result stream may sit unpulled (since its last pull returned) before the session's next statement ends it and runs; a stream being pulled is never ended - the statement waits; `0` = never - the statement waits for the stream's own end (spec 070) |
 | `acl_jwt_clock_skew` | 60 | seconds of skew allowed on JWT `exp`/`nbf` (GLOBAL since the 2026-09-03 review) |
@@ -586,7 +598,8 @@ state, not configuration: a restarted node serves; a node that must come up drai
 ## Client-local settings (spec 068)
 
 `SET` is refused under a principal except for the two ICU rendering settings, `TimeZone` and
-`Calendar` - a `TIMESTAMPTZ` rendered in the server's zone is a wrong answer, not a cosmetic one - and
+`Calendar` - a `TIMESTAMPTZ` rendered in the server's zone is a wrong answer, not a cosmetic one - the
+trace and lineage context settings, and `acl_metadata_max_rows` (spec 119: lowered only) - and
 only where the principal owns its connection. The gate checks four things, and the refusal says which
 failed:
 

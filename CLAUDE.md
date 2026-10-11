@@ -710,6 +710,21 @@ stores a physical name or a body (incl. column expressions, REMAP, ALTER … SET
 granted sources (GetTableNames - names as written, the alias cut); hidden databases and one failing source drop
 out of the tree; nothing built is taken back.
 
+**Spec 119 — metadata at scale** (measured first: specs/119's tables): a listing reads the physical facts
+only of the sources it answers about - `acl_physical_tables / _columns(keys)` (acl_platform_sources.cpp:
+duckdb_tables / _views / _columns' rows of the named `<db>.<schema>[.<object>]`, each read directly, a failing
+source left out) inlined where `MetadataListingSql` used to join duckdb's node-wide `information_schema` (as
+subqueries, never CTEs - a CTE under correlated subqueries is materialized and the planner blew up); the keys
+come from the policy (relations' phys, aliases' phys_path), narrowed by `ListingScope` - the constant `=` / `IN` /
+wildcard-free `LIKE` conjuncts on catalog / schema / name of the WHERE above the surface (`AclRewriter::ScopeOf`,
+`listing_where` set in RewriteSelectNode before the FROM is rewritten; the WHERE stays as written); the
+broken-list mark (`physcols`) only over relations that declare a list; the admin's `platform.attached` read
+narrowed the same way; the Flight catalog RPCs write their filters as quoted literals (`acl_catalog_rpc.cpp`
+Bind). `acl_metadata_max_rows` (1,000,000 - a quack client loads a catalog whole; 0 = unlimited; SESSION-default scope, the validator refuses a session
+raise, a RESET's default passes) wraps each substituted surface: a constant `LIMIT node+1`, then
+`least(session, node)` judged where it runs, above it `error()` - refused, never cut (duckdb segfaulted on a
+LIMIT with a subquery). A narrowed listing is parsed outside the template cache. Bench: `test/bench/metadata_scale.py`.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,
