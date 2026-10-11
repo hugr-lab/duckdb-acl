@@ -245,7 +245,9 @@ door's metadata, all of it answered for the connected principal:
   schema's tables 0.04 s, one table's columns 0.2 s). A source whose catalog fails is left out of the
   listing instead of failing it. An answer above `acl_metadata_max_rows` (10000) is **refused**, never
   cut: `acl: more than N rows of <surface> - narrow by catalog, schema or name` - a quack catalog load
-  falls under it too.
+  falls under it too. A session may lower the bound (`SET acl_metadata_max_rows = 100`); a value above the
+  node's is refused, and the node's lower bound always holds (a `RESET` or the default written back changes
+  nothing).
 
 ### Administering through the door (spec 117)
 

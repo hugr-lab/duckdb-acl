@@ -85,6 +85,39 @@ ACL ROLE "r" SELECT table_schema, table_name FROM information_schema.tables WHER
 ----
 sb	t3
 
+# the narrowed answer IS the unnarrowed one: compared both ways against a form that cannot narrow (upper())
+query I
+ACL ROLE "r" SELECT (SELECT count(*) FROM ((SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'c') EXCEPT ALL (SELECT table_schema, table_name FROM information_schema.tables WHERE upper(table_catalog) = 'C'))) + (SELECT count(*) FROM ((SELECT table_schema, table_name FROM information_schema.tables WHERE upper(table_catalog) = 'C') EXCEPT ALL (SELECT table_schema, table_name FROM information_schema.tables WHERE table_catalog = 'c')));
+----
+0
+
+query I
+ACL ROLE "r" SELECT (SELECT count(*) FROM ((SELECT table_name, column_name FROM information_schema.columns WHERE table_catalog = 'c') EXCEPT ALL (SELECT table_name, column_name FROM information_schema.columns WHERE upper(table_catalog) = 'C'))) + (SELECT count(*) FROM ((SELECT table_name, column_name FROM information_schema.columns WHERE upper(table_catalog) = 'C') EXCEPT ALL (SELECT table_name, column_name FROM information_schema.columns WHERE table_catalog = 'c')));
+----
+0
+
+# review 119: a relation's table inside an aliased schema is one row, narrowed by the catalog alone too
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'c';
+----
+5
+
+query I
+ACL ROLE "r" SELECT count(*) FROM duckdb_tables() WHERE database_name = 'c';
+----
+5
+
+# a column the surface does not have narrows nothing (another FROM item's, a select alias), nor a renamed one
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables t, (SELECT 'zzz' AS catalog_name) x WHERE catalog_name = 'zzz';
+----
+5
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables AS t(table_schema, table_catalog) WHERE table_schema = 'c';
+----
+5
+
 # a wildcard, an OR, a function of a column narrow nothing - the same rows
 query TT
 ACL ROLE "r" SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema LIKE 's%' OR table_name = 'lone' ORDER BY ALL;
@@ -218,6 +251,12 @@ query I
 ACL ROLE "r" SELECT count(*) FROM information_schema.tables WHERE table_schema = 'sb';
 ----
 1
+
+# the failed source asked about answers nothing - no error
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables WHERE table_schema = 'lk';
+----
+0
 
 query I
 ACL ROLE "r" SELECT count(*) FROM information_schema.tables;

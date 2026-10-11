@@ -344,6 +344,9 @@ combined with a certificate. Both doors require cert **and** key together.
   category, which could spread it into every listing or hand it to every role). **Only `passthrough`
   grants on `platform` and grants the bundles** - a grantor that can grant everything is everything;
   never to every role, never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `migrate_catalog` (the passthrough scope's own), `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` (the cluster bundle's alone) and `console_info` (every holder's). A deny wins over every bundle but `passthrough`.
+- **A metadata answer is bounded, never cut** (spec 119): above `acl_metadata_max_rows` the statement is
+  refused; the narrowing a listing takes from its WHERE only chooses which physical sources are read - it never
+  changes the answer (the WHERE stays as written) and reads only sources behind objects the principal sees.
 - **A catalog admin builds only over its granted sources** (spec 118.3): every physical name it stores and
   every table a body of its reads (as the body names it) lies inside a `GRANT SOURCE` of its role - handed
   out by `policy` or `passthrough`; the physical tree it sees under `platform.attached` is the same set.

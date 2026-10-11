@@ -2268,11 +2268,27 @@ private:
 	//! The constant conjuncts of `listing_where` on a surface's catalog / schema / name columns - unqualified
 	//! or qualified by the surface's alias - as a ListingScope. Only `=`, `IN (…)` and a LIKE whose pattern
 	//! has no wildcard count; anything else narrows nothing (an OR, a function of a column, a parameter).
-	ListingScope ScopeOf(const Identifier &alias) {
+	ListingScope ScopeOf(const char *surface, const Identifier &alias, const vector<Identifier> &column_alias) {
 		ListingScope scope;
-		if (!listing_where) {
+		// review 119: written column aliases rename the surface's columns - the WHERE's names are not its own
+		if (!listing_where || !column_alias.empty()) {
 			return scope;
 		}
+		// only the surface's OWN columns narrow (an unqualified name the surface lacks belongs to another FROM
+		// item or a select alias): per surface, its catalog / schema / name columns
+		string kind = surface;
+		bool info = kind == "tables" || kind == "columns";
+		bool duck = kind == "duckdb_tables" || kind == "duckdb_columns" || kind == "duckdb_views";
+		const char *catalog_column = info                                                      ? "table_catalog"
+		                             : kind == "schemata"                                      ? "catalog_name"
+		                             : duck || kind == "duckdb_schemas" || kind == "databases" ? "database_name"
+		                                                                                       : nullptr;
+		const char *schema_column = info                                                     ? "table_schema"
+		                            : kind == "schemata" || duck || kind == "duckdb_schemas" ? "schema_name"
+		                                                                                     : nullptr;
+		const char *name_column = info || kind == "duckdb_tables" || kind == "duckdb_columns" ? "table_name"
+		                          : kind == "duckdb_views"                                    ? "view_name"
+		                                                                                      : nullptr;
 		auto column_of = [&](const ParsedExpression &expr) -> vector<string> * {
 			if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
 				return nullptr;
@@ -2282,14 +2298,14 @@ private:
 			    (names.size() == 2 && !StringUtil::CIEquals(names[0].GetIdentifierName(), alias.GetIdentifierName()))) {
 				return nullptr;
 			}
-			auto column = StringUtil::Lower(names.back().GetIdentifierName());
-			if (column == "table_catalog" || column == "catalog_name" || column == "database_name") {
+			auto column = names.back().GetIdentifierName();
+			if (catalog_column && StringUtil::CIEquals(column, catalog_column)) {
 				return &scope.catalogs;
 			}
-			if (column == "table_schema" || column == "schema_name") {
+			if (schema_column && StringUtil::CIEquals(column, schema_column)) {
 				return &scope.schemas;
 			}
-			if (column == "table_name" || column == "view_name") {
+			if (name_column && StringUtil::CIEquals(column, name_column)) {
 				return &scope.tables;
 			}
 			return nullptr;
@@ -2383,7 +2399,7 @@ private:
 	unique_ptr<TableRef> BuildMetadataSubquery(const char *surface, const Identifier &alias,
 	                                           vector<Identifier> column_alias = {}) {
 		string sql;
-		auto scope = ScopeOf(alias);
+		auto scope = ScopeOf(surface, alias, column_alias);
 		if (!store.MetadataListing(principal, surface, sql, scope)) {
 			Deny(Reason::UNAVAILABLE,
 			     string("metadata is not available: this policy source cannot enumerate ") + surface);

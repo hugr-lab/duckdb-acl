@@ -2,6 +2,7 @@
 
 #include "acl_name_path.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/exception.hpp"
 
 namespace duckdb {
 namespace acl {
@@ -12,7 +13,11 @@ namespace {
 //! A filter value as a quoted literal (spec 119): the door composes this SQL itself, and the rewriter's
 //! listing narrowing reads constants - a `$n` it cannot see, so a filtered RPC read every source
 string Bind(CatalogQuery &, Value value) {
-	return "'" + StringUtil::Replace(value.ToString(), "'", "''") + "'";
+	auto text = value.ToString();
+	if (text.find('\0') != string::npos) {
+		throw InvalidInputException("acl: a catalog filter holds a NUL byte");
+	}
+	return "'" + StringUtil::Replace(text, "'", "''") + "'";
 }
 
 //! The virtual path of an object as the store keys it: bare in `main`, `schema.name` elsewhere.

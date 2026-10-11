@@ -384,6 +384,13 @@ unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableF
 	auto state = make_uniq<SourcesState>();
 	auto &manager = DatabaseManager::Get(context);
 	std::set<string> seen;
+	// review 119: an object reached by two keys (a relation's table inside an aliased schema) is one row
+	std::set<string> emitted;
+	auto once = [&](const string &db_name, const string &schema_name, CatalogEntry &entry) {
+		return emitted
+		    .insert(StringUtil::Lower(NamePath({db_name, schema_name, entry.name.GetIdentifierName()}).ToKey()))
+		    .second;
+	};
 	for (auto &key : bind.keys) {
 		NamePath path;
 		string error;
@@ -404,7 +411,10 @@ unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableF
 				auto entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, Identifier(parts[1]),
 				                              Identifier(parts[2]), OnEntryNotFound::RETURN_NULL);
 				if (entry) {
-					PhysicalRows(context, bind, *state, db_name, parts[1], *entry);
+					auto schema_name = entry->ParentSchema().name.GetIdentifierName(); // as the catalog spells it
+					if (once(db_name, schema_name, *entry)) {
+						PhysicalRows(context, bind, *state, db_name, schema_name, *entry);
+					}
 				}
 				continue;
 			}
@@ -415,7 +425,9 @@ unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableF
 			}
 			auto schema_name = schema->name.GetIdentifierName();
 			schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-				PhysicalRows(context, bind, *state, db_name, schema_name, entry);
+				if (once(db_name, schema_name, entry)) {
+					PhysicalRows(context, bind, *state, db_name, schema_name, entry);
+				}
 			});
 		} catch (std::exception &) { // NOLINT: a source that cannot answer is left out
 			state->rows.resize(mark);

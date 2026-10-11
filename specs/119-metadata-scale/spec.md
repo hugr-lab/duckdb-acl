@@ -64,7 +64,9 @@ unfiltered listing still reads every source it lists (that is the cache's, later
 ### 4. A row bound - a safety knob, not speed
 `acl_metadata_max_rows` (GLOBAL, default 10000, `0` = unlimited; a session may only lower it - spec 068's
 allowlist) bounds each substituted surface after the narrowing: above it the statement is **refused** with
-`more than N rows of <surface> - narrow by catalog, schema or name` (reason `at_capacity`), never cut. The
+`more than N rows of <surface> - narrow by catalog, schema or name`, never cut (as built: an `error()` where the
+statement runs - its outcome is a failure in the profile event; the rewrite, which counts no rows, records no
+reason code). The
 Flight RPCs and quack's catalog load (its `duckdb_schemas()` / `duckdb_tables()` / `duckdb_views()` arrive through
 the door) fall under it.
 
@@ -131,4 +133,12 @@ GetTables for one schema 0.046 s, every table (30,000 rows, bound off) 0.060 s.
   `LIMIT (SELECT …)` crashed duckdb (SIGSEGV in PhysicalLimit::GetDelimiter) - the node's bound is a constant.
 - The suite's ~1000 s stalls during the work were the laptop's sleep cycles (pmset: 919-1062 s), not the code.
 - Tests: `test/sql/acl_metadata_scale.test`; every listing test unchanged.
+- Review (three passes): a relation's table inside an aliased schema was read under two keys when narrowed by the
+  catalog alone (duplicate rows on the Flight / DBeaver path) - the reader emits each object once; only the
+  surface's OWN catalog / schema / name columns narrow (another FROM item's column or a select alias of that name
+  narrowed before), and a written column-alias list narrows nothing; a NUL byte in a Flight filter is refused.
+  Tests compare the narrowed answer with a form that cannot narrow (EXCEPT ALL both ways) - they fail without the
+  fixes; Flight e2e `admin.sh` checks a filtered GetDbSchemas and a filter holding a quote. An explicit
+  `SET acl_metadata_max_rows = 10000` (the default) is accepted and changes nothing - the bound in force is the
+  lower of the session's and the node's.
 

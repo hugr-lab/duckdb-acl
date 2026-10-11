@@ -41,7 +41,9 @@ def generate(args):
         if not os.path.exists(path):
             cols = ", ".join(f"c{j} INTEGER" for j in range(args.columns))
             body = "".join(f"CREATE TABLE u.main.t{t:04d}({cols});\n" for t in range(1000))
-            run_sql(f"ATTACH '{path}' AS u;\n{body}")
+            out = run_sql(f"ATTACH '{path}' AS u;\n{body}")
+            if out.returncode:
+                sys.exit(out.stderr)
     policy = os.path.join(args.dir, "policy.duckdb")
     if os.path.exists(policy) and not args.rebuild:
         return
@@ -83,7 +85,7 @@ def main():
         "columns of one table": f"SELECT * FROM information_schema.columns WHERE table_catalog = 'c' AND table_schema = '{mid}' AND table_name = 't010'",
         "columns of one schema": f"SELECT * FROM information_schema.columns WHERE table_catalog = 'c' AND table_schema = '{mid}'",
         "schemas of the catalog": "SELECT * FROM duckdb_schemas() WHERE database_name = 'c'",
-        "Flight GetTables (one schema)": f"SELECT table_catalog AS catalog_name, table_schema AS db_schema_name, table_name, table_type FROM information_schema.tables WHERE table_catalog = 'c' AND table_schema LIKE '{mid}' ESCAPE '\\' ORDER BY 1, 2, 3",
+        "GetTables, as the RPC writes it": f"SELECT table_catalog AS catalog_name, table_schema AS db_schema_name, table_name, table_type FROM information_schema.tables WHERE table_catalog = 'c' AND table_schema LIKE '{mid}' ESCAPE '\\' ORDER BY 1, 2, 3",
         "every table, unbounded": "SELECT * FROM information_schema.tables",
     }
     head = attaches(args) + f"ATTACH '{os.path.join(args.dir, 'policy.duckdb')}' AS store (READ_ONLY);\n"
