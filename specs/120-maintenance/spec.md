@@ -27,9 +27,9 @@ finding 118.3 deferred. In stages, a PR each; nothing changes what already works
 ### 1. The missing forms (120.1)
 | Form | Over |
 | --- | --- |
-| `ALTER FUNCTION CATEGORY c SET COMMENT '…'` | `acl_create_function_category(c, comment)` (re-create updates only the comment) |
+| `ALTER FUNCTION CATEGORY c SET COMMENT '…'` | new `acl_comment_function_category(c, comment)` - the category must exist |
 | `ALTER RESOURCE GROUP g SET (limits …)` | `acl_alter_resource_group(g, 'limits', json)` - a new field; the comment kept |
-| `ALTER ROLE r SET COMMENT '…'` | `acl_alter_role` gains `comment` (the `roles.comment` column exists, written '' today) |
+| `ALTER ROLE r SET COMMENT '…'` | new `acl_comment_role(role, comment)` (the `roles.comment` column exists, written '' today) |
 | `REVOKE TABLE | VIEW | OBJECT c.n FROM ROLE r` | new `acl_revoke_object(role, vcat, vname)` - deletes `role_object_caps` + its `grant_columns`, like `CatalogRevoke` |
 | `ALTER VIRTUAL REFERENCE c.n SET COMMENT | CARDINALITY | OPTIONAL …` + `COMMENT ON VIRTUAL REFERENCE` | read-merge-write over `CatalogAddReference` |
 Each with its `platform.*` function and right (spec 117), docs, tests.
@@ -98,11 +98,17 @@ the role's own, every data path refused; export round trip; created_by written a
   + `grant_columns` of that object; HANDS_OUT); `ALTER VIRTUAL REFERENCE c.n SET COMMENT|CARDINALITY|OPTIONAL` and
   `COMMENT ON VIRTUAL REFERENCE` → `acl_alter_reference` (CATALOG; validated as the create does); `ALTER RESOURCE GROUP
   g SET (limits) | SET COMMENT` → `acl_alter_resource_group` fields `limits` (only the named ones) / `comment`
-  (`ResourceLimitsJson` shared with CREATE); `ALTER FUNCTION CATEGORY c SET COMMENT` → `acl_create_function_category`.
+  (`ResourceLimitsJson` shared with CREATE); `ALTER FUNCTION CATEGORY c SET COMMENT` → `acl_comment_function_category`.
   Platform functions `comment_role`, `revoke_object`, `alter_reference`.
 - **No ALTER MAP** (decided while building): a mapping is only its key, so the change is `DROP MAP` + `MAP` - two
   existing statements; one call would have needed its own privileged-target check (spec 095).
 - Found: `CatalogBackend::WriteWithReads` committed without the `written` policy event `Write` emits - fixed (a
   resource group's create, a role's re-define … were not audited as writes).
 - Tests: `test/sql/acl_maintenance_forms.test`; `acl_node_group.test`'s unknown-property message.
+- Review (three passes): `ALTER FUNCTION CATEGORY … SET COMMENT` compiled to the create and made a missing category -
+  now `acl_comment_function_category`, which requires it; `ALTER RESOURCE GROUP … SET (…)` judged only the named limits -
+  the merged window_start / window_max is now judged as CREATE does, read and written in one transaction; every new
+  writer checks its target inside its write transaction (a concurrent DROP refuses, never a silent no-op); `WriteWithReads`
+  refuses the function-driver source by name, as `Write` does. Low, left: one limit cannot be unset back to the node's
+  through ALTER (re-create the group); a no-op `DROP … IF EXISTS` bumps the version and is now a `written` event.
 

@@ -320,11 +320,12 @@ ESCALATES and INFRASTRUCTURE.
 | `drain` / `resume` | - | OPERATE |
 | `migrate_catalog` | database\*, schema\* | ESCALATES |
 | `comment_role` | role\*, comment | POLICY |
+| `comment_function_category` | category\*, comment | POLICY |
 | `revoke_object` | role\*, catalog\*, name\* | HANDS_OUT |
 | `alter_reference` | catalog\*, name\*, property\* (comment / cardinality / optional), value | CATALOG |
 | `grant_source` / `revoke_source` | role\*, source\* | HANDS_OUT |
 | `create_resource_group` | group_name\*, limits, comment, is_default | POLICY |
-| `alter_resource_group` | group_name\*, property\*, value | POLICY |
+| `alter_resource_group` | group_name\*, property\* (default / limits / comment), value | POLICY |
 | `drop_resource_group` | group_name\*, mode | POLICY |
 | `grant_resource_group` / `revoke_resource_group` | role\*, group_name\* | POLICY |
 | `grant_admin` | role\*, scope\* | ESCALATES |

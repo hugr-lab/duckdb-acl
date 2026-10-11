@@ -729,7 +729,7 @@ LIMIT with a subquery). A narrowed listing is parsed outside the template cache.
 a re-define keeps the comment), `REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r` (`acl_revoke_object`, HANDS_OUT),
 `ALTER VIRTUAL REFERENCE c.n SET COMMENT|CARDINALITY|OPTIONAL` + `COMMENT ON VIRTUAL REFERENCE` (`acl_alter_reference`),
 `ALTER RESOURCE GROUP g SET (limits) | SET COMMENT` (`acl_alter_resource_group` fields `limits` / `comment`, only the
-named limits change), `ALTER FUNCTION CATEGORY c SET COMMENT` (over the create, members kept); no ALTER MAP (a mapping
+named limits change), `ALTER FUNCTION CATEGORY c SET COMMENT` (`acl_comment_function_category`, it must exist); no ALTER MAP (a mapping
 is its key). `CatalogBackend::WriteWithReads` now emits the `written` policy event like `Write`. Next: 120.2 effective
 rights + exposures, 120.3 view-as, 120.5 created_by (export after the release).
 

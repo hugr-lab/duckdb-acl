@@ -57,6 +57,9 @@ void CatalogBackend::WriteWithReads(
 int64_t CatalogBackend::WriteWithReads(
     const std::function<void(const std::function<unique_ptr<QueryResult>(const string &)> &, vector<string> &)> &body,
     const char *version_key, const std::function<void(int64_t)> &before_commit) {
+	if (function_mode) {
+		throw BinderException("acl catalog: the function-driver policy source is read-only");
+	}
 	auto instance = Db();
 	Connection con(*instance);
 	auto begin = con.Query("BEGIN");

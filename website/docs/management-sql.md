@@ -324,7 +324,8 @@ either may stand alone. `CARDINALITY` and `JOIN` accept only the values listed. 
 far side may be absent. The trailing clauses come in any order.
 
 Its hints change in place (spec 120) - `ALTER VIRTUAL REFERENCE c.n SET COMMENT '…' | SET CARDINALITY <c> |
-SET OPTIONAL true | false`, `COMMENT ON VIRTUAL REFERENCE c.n IS '…'`; its ends and condition only by a re-create.
+SET OPTIONAL true | false`, `COMMENT ON VIRTUAL REFERENCE c.n IS '…'` (`acl_alter_reference(catalog, name, property,
+value)`); its ends and condition only by a re-create.
 A mapping (`MAP …`) has no ALTER: it is only its key, so `DROP MAP` + `MAP` is the change.
 
 ```sql
@@ -353,7 +354,7 @@ DROP ROLE [IF EXISTS] <role>
 A role is an internal name that grants attach to. Its claims are defaults: they are what
 `acl_claim('<name>')` answers under the bare `ACL ROLE "r"` form, and under a token they fill in only
 what the token's claim map did not supply (explicit token claims win). `SET COMMENT` (spec 120) is what a
-console shows of the role; a later `SET CLAIMS` keeps it. `ALTER … SET CLAIMS` replaces the whole
+console shows of the role (`acl_comment_role(role, comment)`); a later `SET CLAIMS` keeps it. `ALTER … SET CLAIMS` replaces the whole
 list. Dropping a role takes its grants, object capabilities, admin scope and mappings with it.
 
 ```sql
@@ -469,10 +470,9 @@ REVOKE CATALOG <catalog> FROM ROLE <role>
 REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM ROLE <role>
 ```
 
-`REVOKE TABLE | VIEW | OBJECT` (spec 120) takes one object's own grant (`GRANT TABLE … CAPS …`) - its caps, policy
-and columns; the catalog's or a schema's grant then decides that object again. Policy-level, like every grant.
-
-The grant that makes a catalog resolve for a role. Clauses after the role come in any order.
+The grant that makes a catalog resolve for a role. `REVOKE TABLE | VIEW | OBJECT` (spec 120) takes one object's own
+grant (`GRANT TABLE … CAPS …`) - its caps, policy and columns; the catalog's or a schema's grant then decides that
+object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like every grant. Clauses after the role come in any order.
 
 - **Capabilities.** `WITH (…)` is the list form of `CAPS '{"select": true, …}'`. A grant that states
   nothing holds every data capability - `select`, `insert`, `update`, `delete`, `merge` - and never
@@ -663,7 +663,7 @@ schema[, function]]])` lists their parameters, result columns and a scalar's ret
 ```sql
 CREATE FUNCTION CATEGORY <name> [COMMENT '<text>']
 ALTER FUNCTION CATEGORY <name> ADD (<function> [, …]) | DROP (<function> [, …])
-ALTER FUNCTION CATEGORY <name> SET COMMENT '<text>'      -- the members stay (spec 120)
+ALTER FUNCTION CATEGORY <name> SET COMMENT '<text>'      -- it must exist; the members stay (spec 120)
 DROP FUNCTION CATEGORY [IF EXISTS] <name>
 
 GRANT  FUNCTION CATEGORY <name> TO ROLE <role> | TO ALL ROLES
@@ -786,7 +786,8 @@ session opens, and a limit it does not name is the node's setting.
   `charged_group`.
 - **Functions.** The admin functions behind the statements are `acl_create_resource_group(group,
   limits_json[, comment[, is_default]])`, `acl_alter_resource_group(group, 'default', 'true' |
-  'false')`, `acl_drop_resource_group(group[, 'skip'])`, `acl_grant_resource_group(role, group)` and
+  'false')` / `(group, 'limits', limits_json)` (only the named limits change; the result is judged as CREATE judges
+  it) / `(group, 'comment', text)` (spec 120), `acl_drop_resource_group(group[, 'skip'])`, `acl_grant_resource_group(role, group)` and
   `acl_revoke_resource_group(role, group)`.
 
 **A group is also a set of nodes** (spec 096). A node belongs to the group its deployment names with

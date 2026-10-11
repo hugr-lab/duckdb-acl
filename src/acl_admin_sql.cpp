@@ -1850,10 +1850,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			// the list goes to the admin function as written, which parses each spec
 			s.Expect("category");
 			auto category = s.Ident("a category name");
-			if (s.Accept(
-			        "set")) { // spec 120: ALTER FUNCTION CATEGORY c SET COMMENT '…' - a re-create keeps the members
+			if (s.Accept("set")) { // spec 120: ALTER FUNCTION CATEGORY c SET COMMENT '…' - the category must exist; its
+				                   // members stay
 				s.Expect("comment");
-				return MakeAdminCall("acl_create_function_category", {Value(category), Value(s.Quoted("comment"))});
+				return MakeAdminCall("acl_comment_function_category", {Value(category), Value(s.Quoted("comment"))});
 			}
 			bool add = s.Accept("add");
 			if (!add) {

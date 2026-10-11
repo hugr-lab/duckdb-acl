@@ -99,10 +99,16 @@ ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{}';
 statement error
 ACL ROLE "analyst" SELECT * FROM c.orders;
 ----
-<REGEX>:.*(no access|capability|select).*
+<REGEX>:.*select on "c.orders" is not allowed.*
 
+query I
+SELECT count(*) FROM store.acl.role_object_caps WHERE role = 'analyst';
+----
+1
+
+# names compare as names do (spec 116): the grant c.orders is revoked as C.ORDERS
 statement ok
-ACL ROLE "pol" REVOKE TABLE c.orders FROM ROLE analyst;
+ACL ROLE "pol" REVOKE TABLE C.ORDERS FROM ROLE analyst;
 
 query I
 ACL ROLE "analyst" SELECT count(*) FROM c.orders;
@@ -128,8 +134,25 @@ ACL ROLE "cadm" REVOKE OBJECT c.customers FROM ROLE analyst;
 ----
 <REGEX>:.*unrestricted manage.*
 
+# a grant with a column list: its columns go with it
+statement ok
+ACL ADMIN GRANT OBJECT c.orders TO ROLE analyst CAPS '{"select": true}' COLUMNS (id, amount = 0);
+
+query I
+SELECT count(*) > 0 FROM store.acl.grant_columns WHERE role = 'analyst';
+----
+true
+
 statement ok
 ACL ROLE "pol" SELECT platform.revoke_object('analyst', 'c', 'customers');
+
+statement ok
+ACL ROLE "pol" REVOKE OBJECT c.orders FROM ROLE analyst;
+
+query I
+SELECT count(*) FROM store.acl.grant_columns WHERE role = 'analyst';
+----
+0
 
 # --- ALTER VIRTUAL REFERENCE c.n SET …, COMMENT ON VIRTUAL REFERENCE -------------------------------------------------
 
@@ -156,6 +179,21 @@ statement error
 ACL ROLE "cadm" ALTER VIRTUAL REFERENCE c.nosuch SET OPTIONAL false;
 ----
 <REGEX>:.*reference "c.nosuch".*
+
+# another catalog's admin may not touch c's references
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG d;
+
+statement ok
+ACL ADMIN CREATE ROLE dadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG d TO ROLE dadm CAPS '{"manage": true}';
+
+statement error
+ACL ROLE "dadm" ALTER VIRTUAL REFERENCE c.orders_customer SET OPTIONAL true;
+----
+<REGEX>:.*no manage scope for catalog "c".*
 
 statement ok
 ACL ROLE "cadm" SELECT platform.alter_reference('c', 'orders_customer', 'optional', 'false');
@@ -186,6 +224,28 @@ ACL ROLE "pol" SELECT window_max, max_sessions, comment FROM platform.resource_g
 ----
 64	20	the night batch
 
+# the limits after the change are judged as CREATE judges them
+statement error
+ACL ROLE "pol" ALTER RESOURCE GROUP g SET (window_start 128);
+----
+<REGEX>:.*window_start \(128\) is above window_max \(64\).*
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_resource_group('g', 'limits', '{"window_start": 8}');
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_resource_group('g', 'comment', 'set through the call');
+
+query IT
+ACL ROLE "pol" SELECT window_start, comment FROM platform.resource_groups WHERE "group" = 'g';
+----
+8	set through the call
+
+statement error
+ACL ROLE "cadm" ALTER RESOURCE GROUP g SET (max_sessions 1);
+----
+<REGEX>:.*unrestricted manage.*
+
 statement error
 ACL ROLE "pol" ALTER RESOURCE GROUP g SET (no_such_limit 1);
 ----
@@ -212,6 +272,25 @@ ACL ROLE "pol" SELECT comment FROM platform.function_categories WHERE category =
 ----
 the text functions
 
+# an ALTER of a category that does not exist is an error - never a new category
+statement error
+ACL ROLE "pol" ALTER FUNCTION CATEGORY never_existed SET COMMENT 'oops';
+----
+<REGEX>:.*function category "never_existed" does not exist.*
+
+query I
+SELECT count(*) FROM store.acl.function_categories WHERE category = 'never_existed';
+----
+0
+
+statement error
+ACL ROLE "cadm" ALTER FUNCTION CATEGORY text_fns SET COMMENT 'x';
+----
+<REGEX>:.*unrestricted manage.*
+
+statement ok
+ACL ROLE "pol" SELECT platform.comment_function_category('text_fns', 'through the call');
+
 query I
 ACL ROLE "pol" SELECT count(*) FROM platform.function_category_members WHERE category = 'text_fns';
 ----
@@ -228,6 +307,7 @@ SELECT acl_audit_flush();
 statement ok
 SET VARIABLE before_writes = (SELECT count(*) FROM acl_audit_events() WHERE kind = 'policy' AND detail = 'written');
 
+# each through WriteWithReads (silent before): a group's limits, a role's define, a group's create
 statement ok
 ACL ROLE "pol" ALTER RESOURCE GROUP g SET (window_max 32);
 
@@ -235,9 +315,12 @@ statement ok
 ACL ROLE "pol" CREATE ROLE later;
 
 statement ok
+ACL ROLE "pol" CREATE RESOURCE GROUP g2 (window_max 8);
+
+statement ok
 SELECT acl_audit_flush();
 
 query I
 SELECT count(*) - getvariable('before_writes') FROM acl_audit_events() WHERE kind = 'policy' AND detail = 'written';
 ----
-2
+3

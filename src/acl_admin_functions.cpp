@@ -1351,6 +1351,15 @@ void AclCommentRoleFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
 
+//! acl_comment_function_category(category, comment) (spec 120): its comment - the category must exist
+void AclCommentFunctionCategoryFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		StoreOf(state).CatalogCommentFunctionCategory(
+		    RequiredArg(args, 0, row, "acl_comment_function_category", "category"), OptionalArg(args, 1, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
 //! acl_revoke_object(role, vcat, vname) (spec 120): one object's own grant - its caps, policy and columns; the
 //! catalog's (or a schema's) grant stays and decides again
 void AclRevokeObjectFunc(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -2300,9 +2309,10 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		loader.RegisterFunction(kill);
 	}
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);
-	register_admin("acl_comment_role", {v, v}, AclCommentRoleFunc);             // spec 120
-	register_admin("acl_revoke_object", {v, v, v}, AclRevokeObjectFunc);        // spec 120
-	register_admin("acl_alter_reference", {v, v, v, v}, AclAlterReferenceFunc); // spec 120
+	register_admin("acl_comment_role", {v, v}, AclCommentRoleFunc);                          // spec 120
+	register_admin("acl_comment_function_category", {v, v}, AclCommentFunctionCategoryFunc); // spec 120
+	register_admin("acl_revoke_object", {v, v, v}, AclRevokeObjectFunc);                     // spec 120
+	register_admin("acl_alter_reference", {v, v, v, v}, AclAlterReferenceFunc);              // spec 120
 	register_admin_set("acl_define_role", {{v, v}, {v, v, v}}, AclDefineRoleFunc);
 	// offline JWT verification (spec 007)
 	// issuers, clients and scoped role mappings (spec 095)
