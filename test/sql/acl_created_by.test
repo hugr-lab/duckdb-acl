@@ -1,0 +1,352 @@
+# name: test/sql/acl_created_by.test
+# description: spec 120.5 - who defined an object (created_by: the author's subject or role, kept across a
+#   redefinition, NULL for the operator and the anonymous gateway) and acl_check_catalog's source_not_granted: an
+#   object an administrator below policy built over a source its roles no longer hold - shown, never taken back
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+CREATE TABLE phys.main.t AS SELECT 1 AS id, 'acme' AS tenant;
+
+statement ok
+CREATE TABLE phys.main.u AS SELECT 2 AS id;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('test/idp/s', '{"url": "test/idp/s", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+# --- the operator's own SQL and the anonymous gateway record no author -----------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.by_anon AS phys.main.t;
+
+statement ok
+SELECT acl_add_relation('c', 'by_operator', 'phys.main.t', '', '');
+
+# --- a catalog admin (a role through the gateway) is the author; the source gate bound it, so its roles are kept --
+
+statement ok
+ACL ADMIN CREATE ROLE cadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cadm CAPS '{"manage": true}';
+
+statement ok
+ACL ADMIN GRANT SOURCE phys.main TO ROLE cadm;
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.by_cadm AS phys.main.t;
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.v AS 'SELECT id FROM phys.main.u';
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL SCHEMA c.s AS phys.main;
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL TABLE FUNCTION c.f AS 'SELECT id FROM phys.main.t';
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL REFERENCE c.r FROM c.by_cadm TO c.v ON (id = id);
+
+query TTT
+SELECT vname, created_by, created_roles FROM store.acl.relations ORDER BY 1;
+----
+by_anon	NULL	NULL
+by_cadm	cadm	cadm
+by_operator	NULL	NULL
+v	cadm	cadm
+
+query TT
+SELECT (SELECT created_by FROM store.acl.schemas WHERE path = 's'), (SELECT created_by FROM store.acl.functions WHERE vname = 'f');
+----
+cadm	cadm
+
+query T
+SELECT created_by FROM store.acl."references" WHERE name = 'r';
+----
+cadm
+
+# a redefinition keeps who made it first - and the current definition is no longer the catalog admin's to answer
+# for: another writer made it (its roles go, so no finding names cadm for a source cadm never chose)
+statement ok
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE c.by_cadm AS phys.main.u;
+
+query TT
+SELECT created_by, created_roles FROM store.acl.relations WHERE vname = 'by_cadm';
+----
+cadm	NULL
+
+# --- the policy bundle is an author the source gate never bound: no roles kept ------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ROLE "pol" CREATE VIRTUAL TABLE c.by_pol AS phys.main.u;
+
+query TT
+SELECT created_by, created_roles FROM store.acl.relations WHERE vname = 'by_pol';
+----
+pol	NULL
+
+# --- a token's author is its issuer and subject: a principal's own CREATE in a granted schema -------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.lake FROM phys.lake;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst CAPS '{}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.lake TO ROLE analyst WITH (select, insert, create, drop);
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUtYWNtZSIsInJvbGVzIjpbImFuYWx5c3QiXSwidGlkIjoiYWNtZSJ9.UV5-WWUpQLp-Em8K2yLLkz-NEJgOyTAn9i9B1zpBWF3hNQVgorAVPVK48bxnrMiMm7NabgM3g945lDY31DFwxNeUKnVEe0QdRy1d1KbFh8td3Ak_mepOZ35CjPektGaOjVEpjUFxZUOj_uxYnse_y660xC0stlY8zxDrpSjNCOZRGv-vaxITv7ggOIDYAN07rmPntKe9oOYsb5g0ZkFcIEsKuHuXsL8z1crko6vIZzT9ido-xrph_WEejO5lKaPIxVe1QrB1-C5DUp8D8fnLWMJ3g426VNKWJwUyeSgh_nq1XzLyR8WcLchBQwaFAzkGivmLFmDdrDS7VUy49I8uLw' CREATE TABLE lake.landing(id INTEGER);
+
+query TT
+SELECT created_by LIKE '%|u-acme', created_roles FROM store.acl.relations WHERE vname = 'lake.landing';
+----
+true	NULL
+
+# --- the platform shows it --------------------------------------------------------------------------------------
+
+query TT
+ACL ROLE "pol" SELECT name, created_by FROM platform.relations WHERE name IN ('by_cadm', 'by_anon') ORDER BY 1;
+----
+by_anon	NULL
+by_cadm	cadm
+
+# --- source_not_granted: the source taken from the catalog admin; its objects keep working --------------------
+
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE problem = 'source_not_granted';
+----
+0
+
+statement ok
+ACL ADMIN REVOKE SOURCE phys.main FROM ROLE cadm;
+
+query TTTT
+SELECT kind, object, role, repair FROM acl_check_catalog('c') WHERE problem = 'source_not_granted' ORDER BY kind, object;
+----
+function	f	cadm	GRANT SOURCE phys.main TO ROLE cadm
+schema	s	cadm	GRANT SOURCE phys.main TO ROLE cadm
+view	v	cadm	GRANT SOURCE phys.main TO ROLE cadm
+
+statement ok
+ACL ADMIN CREATE ROLE reader;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE reader MAIN;
+
+query I
+ACL ROLE "reader" SELECT id FROM c.v;
+----
+2
+
+# granted again: the finding is gone
+statement ok
+ACL ADMIN GRANT SOURCE phys TO ROLE cadm;
+
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE problem = 'source_not_granted';
+----
+0
+
+# --- the review's cases ----------------------------------------------------------------------------------------
+
+statement ok
+ATTACH ':memory:' AS other;
+
+statement ok
+CREATE TABLE other.main.allow AS SELECT 1 AS id;
+
+statement ok
+ACL ADMIN GRANT SOURCE other.main TO ROLE cadm;
+
+# bodies beyond a view's: a relation's RLS, a computed column, a reference's ON EXPRESSION
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.rlst AS phys.main.t RLS (id IN (SELECT id FROM other.main.allow));
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.colt AS phys.main.t COLUMNS (id, (SELECT max(id) FROM other.main.allow) AS x);
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL REFERENCE c.rf FROM c.rlst TO c.colt ON EXPRESSION 'rlst.id IN (SELECT id FROM other.main.allow)';
+
+# an alias of a builtin names no source - never a finding (its repair could not run)
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL SCALAR c.l2 ALIAS OF main.lower;
+
+statement ok
+ACL ADMIN REVOKE SOURCE other.main FROM ROLE cadm;
+
+query TT
+SELECT kind, object FROM acl_check_catalog('c') WHERE problem = 'source_not_granted' AND detail LIKE '%other.main%' ORDER BY 1, 2;
+----
+reference	rf
+table	colt
+table	rlst
+
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE problem = 'source_not_granted' AND object = 'l2';
+----
+0
+
+# a refresh of an expansion over a source no longer granted is refused where it is written (spec 118.3's gate)
+statement ok
+CREATE SCHEMA other.ex;
+
+statement ok
+CREATE TABLE other.ex.one(id INTEGER);
+
+statement ok
+ACL ADMIN GRANT SOURCE other.ex TO ROLE cadm;
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL SCHEMA c.ex FROM other.ex;
+
+statement ok
+ACL ADMIN REVOKE SOURCE other.ex FROM ROLE cadm;
+
+statement ok
+CREATE TABLE other.ex.two(id INTEGER);
+
+statement error
+ACL ROLE "cadm" ALTER VIRTUAL SCHEMA c.ex REFRESH;
+----
+<REGEX>:.*outside the sources granted.*
+
+# the cluster bundle is source-gated too: its definitions carry its roles
+statement ok
+ACL ADMIN CREATE ROLE clu;
+
+statement ok
+ACL ADMIN GRANT ADMIN cluster TO ROLE clu;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE clu CAPS '{"manage": true}';
+
+statement ok
+ACL ADMIN GRANT SOURCE phys.main TO ROLE clu;
+
+statement ok
+ACL ROLE "clu" CREATE VIRTUAL TABLE c.by_clu AS phys.main.t;
+
+query T
+SELECT created_roles FROM store.acl.relations WHERE vname = 'by_clu';
+----
+clu
+
+# a role named with a comma is one role
+statement ok
+ACL ADMIN CREATE ROLE "a,b";
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE "a,b" CAPS '{"manage": true}';
+
+statement ok
+ACL ADMIN GRANT SOURCE phys.main TO ROLE "a,b";
+
+statement ok
+ACL ROLE "a,b" CREATE VIRTUAL TABLE c.cm AS phys.main.t;
+
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE problem = 'source_not_granted' AND object = 'cm';
+----
+0
+
+# the roles gone: no grant to a name somebody may take next - redefine or drop
+statement ok
+ACL ADMIN REVOKE SOURCE phys.main FROM ROLE "a,b";
+
+statement ok
+ACL ADMIN DROP ROLE "a,b";
+
+query T
+SELECT repair FROM acl_check_catalog('c') WHERE problem = 'source_not_granted' AND object = 'cm';
+----
+redefine or drop the object
+
+# an ALTER is a definition written: re-pointing an object records its writer, so a later revoke still finds it
+statement ok
+CREATE SCHEMA other.lk;
+
+statement ok
+CREATE TABLE other.lk.x(id INTEGER);
+
+statement ok
+ACL ADMIN GRANT SOURCE other.lk TO ROLE cadm;
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.p AS phys.main.t;
+
+statement ok
+ACL ROLE "cadm" ALTER VIRTUAL TABLE c.p SET PHYS other.lk.x;
+
+query TT
+SELECT created_by, created_roles FROM store.acl.relations WHERE vname = 'p';
+----
+cadm	cadm
+
+statement ok
+ACL ADMIN REVOKE SOURCE other.lk FROM ROLE cadm;
+
+query T
+SELECT repair FROM acl_check_catalog('c') WHERE problem = 'source_not_granted' AND object = 'p';
+----
+GRANT SOURCE other.lk TO ROLE cadm
+
+# --- the decision's note reaches the execution of a definition whose body the source gate probed ----------------
+# (a parse nested in the decision left a boundary in front of the batch's notes: the statement ran noteless)
+
+statement ok
+SET GLOBAL acl_audit_level = 'all';
+
+statement ok
+SET GLOBAL acl_profile_level = 'all';
+
+statement ok
+SELECT acl_audit_flush();
+
+statement ok
+SET VARIABLE profiles = (SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile');
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.v2 AS 'SELECT id FROM phys.main.u';
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) - getvariable('profiles') FROM acl_audit_events() WHERE kind = 'profile';
+----
+1

@@ -197,7 +197,8 @@ vector<PlatformView> BuildViews() {
 	      {"origin", V},
 	      {"comment", V},
 	      {"alias_types", V},
-	      {"enum_types", V}},
+	      {"enum_types", V},
+	      {"created_by", V}},
 	     "the virtual tables and views of each catalog"},
 	    {"relation_columns",
 	     PV::CATALOG,
@@ -205,7 +206,7 @@ vector<PlatformView> BuildViews() {
 	     "the declared column lists of the relations"},
 	    {"schemas",
 	     PV::CATALOG,
-	     {{"catalog", V}, {"path", V}, {"phys_path", V}, {"origin", V}, {"comment", V}},
+	     {{"catalog", V}, {"path", V}, {"phys_path", V}, {"origin", V}, {"comment", V}, {"created_by", V}},
 	     "the virtual schemas (aliases and expansions)"},
 	    {"functions",
 	     PV::CATALOG,
@@ -216,7 +217,8 @@ vector<PlatformView> BuildViews() {
 	      {"target", V},
 	      {"template", V},
 	      {"params", LV},
-	      {"comment", V}},
+	      {"comment", V},
+	      {"created_by", V}},
 	     "the virtual table and scalar functions"},
 	    {"function_columns",
 	     PV::CATALOG,
@@ -240,7 +242,8 @@ vector<PlatformView> BuildViews() {
 	      {"cardinality", V},
 	      {"optional", B},
 	      {"join_method", V},
-	      {"comment", V}},
+	      {"comment", V},
+	      {"created_by", V}},
 	     "the declared join paths (spec 022)"},
 	    {"reference_columns",
 	     PV::CATALOG,
@@ -1751,6 +1754,22 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 				names.emplace_back(4, false, true);
 			}
 		}
+		if (target == "acl_refresh_schema_objects") {
+			// spec 120.5 review: a refresh adds the records of whatever the expansion's source holds now - the source
+			// is the expansion's stored origin, judged like the schema path it was created over
+			string vcat, path;
+			if (text_of(call, 0, vcat) && text_of(call, 1, path)) {
+				auto origin = store.catalog->Query("SELECT \"origin\" FROM " + store.catalog->Tbl("schemas") +
+				                                   " WHERE " + KeyEqSql("\"vcat\"", acl_detail::Lit(vcat)) + " AND " +
+				                                   KeyEqSql("\"path\"", acl_detail::Lit(path)));
+				if (origin->RowCount() > 0 && !origin->Collection().GetValue(0, 0).IsNull()) {
+					auto source = origin->Collection().GetValue(0, 0).ToString();
+					if (!SourceGranted(granted, parts_of(source), true)) {
+						refuse("the refresh", "\"" + source + "\"");
+					}
+				}
+			}
+		}
 		for (auto &entry : names) {
 			string name;
 			if (!text_of(call, std::get<0>(entry), name)) {
@@ -2361,7 +2380,7 @@ string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool s
 	}
 	if (view == "relations") {
 		return "SELECT \"vcat\" AS \"catalog\", \"vname\" AS \"name\", \"form\", \"phys\", \"view_sql\", \"rls\","
-		       " \"rls_checked\", \"origin\", \"comment\", \"alias_types\", \"enum_types\" FROM " +
+		       " \"rls_checked\", \"origin\", \"comment\", \"alias_types\", \"enum_types\", \"created_by\" FROM " +
 		       table("relations") + where("\"vcat\"");
 	}
 	if (view == "relation_columns") {
@@ -2370,12 +2389,13 @@ string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool s
 		       table("relation_columns") + where("\"vcat\"");
 	}
 	if (view == "schemas") {
-		return "SELECT \"vcat\" AS \"catalog\", \"path\", \"phys_path\", \"origin\", \"comment\" FROM " +
+		return "SELECT \"vcat\" AS \"catalog\", \"path\", \"phys_path\", \"origin\", \"comment\", \"created_by\" "
+		       "FROM " +
 		       table("schemas") + where("\"vcat\"");
 	}
 	if (view == "functions") {
 		return "SELECT \"vcat\" AS \"catalog\", \"vname\" AS \"name\", \"kind\", \"form\", \"target\", \"template\","
-		       " acl_platform_list(\"params\") AS \"params\", \"comment\" FROM " +
+		       " acl_platform_list(\"params\") AS \"params\", \"comment\", \"created_by\" FROM " +
 		       table("functions") + where("\"vcat\"");
 	}
 	if (view == "function_columns") {
@@ -2387,7 +2407,7 @@ string TableBody(acl_detail::CatalogBackend &catalog, const string &view, bool s
 	if (view == "references") {
 		return "SELECT \"vcat\" AS \"catalog\", \"name\", \"from_vname\" AS \"from_object\", \"to_vname\" AS "
 		       "\"to_object\", \"to_kind\", \"expr\" AS \"expression\", \"cardinality\", \"optional\", "
-		       "\"join_method\", \"comment\" FROM " +
+		       "\"join_method\", \"comment\", \"created_by\" FROM " +
 		       table("references") + where("\"vcat\"");
 	}
 	if (view == "reference_columns") {

@@ -22,6 +22,25 @@ namespace acl {
 //! the call - the quack door's live discovery document (specs 062/063). Once three copies: the admin
 //! functions, the Flight door and the quack door each had their own.
 PolicyStore &StoreOf(ExpressionState &state);
+
+//! spec 120.5: for the duration of an admin function that creates objects, the statement's author (StatementAuthor) is
+//! what the policy writers record as `created_by` - read on the thread that runs the function, cleared on the way out
+class AuthorScope {
+public:
+	explicit AuthorScope(ExpressionState &state);
+	//! a principal's own CREATE (spec 016/018): the rewriter's follow-up names its author - the follow-up carries no
+	//! decision of its own; such a write is never source-gated, so no roles are kept
+	explicit AuthorScope(const string &author);
+	~AuthorScope();
+	AuthorScope(const AuthorScope &) = delete;
+	AuthorScope &operator=(const AuthorScope &) = delete;
+
+private:
+	string author;
+	string roles; // the author's roles, when the source gate bound it (spec 118.3) - else empty
+	const string *previous_author = nullptr;
+	const string *previous_roles = nullptr;
+};
 shared_ptr<PolicyStore> SharedStoreOf(ExpressionState &state);
 
 //! The argument readers every acl_* scalar uses. `fn` and `what` name the function and the argument

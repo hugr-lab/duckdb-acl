@@ -123,7 +123,7 @@ columns	VARCHAR[]
 query I
 ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_schema = 'main';
 ----
-257
+261
 
 foreach view catalogs relations relation_columns schemas functions function_columns references reference_columns keys roles role_claims grants schema_grants object_grants grant_columns admins platform_grants issuers clients role_mappings jwks_cache function_categories function_category_members function_grants function_status resource_groups role_resource_groups cluster_items cluster_effective drift catalog_schema sessions node_load node_doors node_streams drain lineage_status audit_events
 
@@ -204,7 +204,7 @@ categorized	true
 query TTTTT
 ACL ROLE "root" SELECT build, build_min_reader, catalog, min_reader, mode FROM platform.catalog_schema;
 ----
-21	21	21	21	current
+22	21	22	21	current
 
 statement ok
 ACL ADMIN CLUSTER SET threads = 2;
@@ -391,7 +391,7 @@ platform	the system catalog of administration (spec 117)
 query TTTTTT
 ACL ROLE "cat" SELECT audit_contract, connection_contract, schema_catalog, bundles, admin_catalogs, len(views) FROM platform.console_info();
 ----
-3	2	21	[]	[sales]	38
+3	2	22	[]	[sales]	38
 
 query T
 ACL ROLE "cat" SELECT list_contains(my_views, 'grants') AND NOT list_contains(my_views, 'issuers') AND list_contains(my_functions, 'add_relation') AND NOT list_contains(my_functions, 'grant_catalog') FROM platform.console_info();

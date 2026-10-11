@@ -653,6 +653,8 @@ struct PolicyStore {
 	//! spec 039: probe every stored fact of a catalog (every catalog when `only` is empty) against
 	//! the source, off the query path, and answer what no longer holds; writes nothing
 	vector<CatalogFinding> CatalogCheck(const string &only);
+	//! spec 120.5: source_not_granted - appended to a catalog's findings
+	void SourcesNotGranted(const string &vcat, vector<CatalogFinding> &out);
 	//! spec 039: mend a declared COLUMNS list on purpose - `remap` (spec: "name = expression, ..."),
 	//! `drop_missing`, `drop_missing_and_masks`; returns the entries changed
 	int64_t CatalogRepairRelation(const string &vcat, const string &vname, const string &action, const string &spec);
@@ -1259,6 +1261,20 @@ struct AclScalarInfo : ScalarFunctionInfo {
 //! statement is planned and may run again when it executes, and the second call sees the world the
 //! first one changed (`acl_quack_stop(uri) LIKE '%closed%'` stopped the door, then reported that
 //! nobody served it).
+//! spec 120.5: who a principal is as an object's `created_by` records it - `<issuer>|<subject>` for a token, the role
+//! (roles, comma-joined) for a gateway's ACL ROLE
+inline string AuthorOf(const Principal &principal) {
+	if (!principal.subject.empty()) {
+		return principal.issuer + "|" + principal.subject;
+	}
+	return StringUtil::Join(principal.roles, ",");
+}
+
+//! spec 120.5: the author an admin function writes as `created_by` (AuthorScope sets it around the call; empty outside)
+string AuthorInScope();
+//! spec 120.5: the writer's roles (joined by \x1f) when the source gate bound it - an administrator below policy
+string AuthorRolesInScope();
+
 inline void MarkAclScalar(ScalarFunction &function, const shared_ptr<PolicyStore> &store) {
 	function.SetExtraFunctionInfo(make_shared_ptr<AclScalarInfo>(store));
 	function.SetFallible();

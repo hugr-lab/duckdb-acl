@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS acl."meta"("key" VARCHAR PRIMARY KEY, "value" VARCHAR
 
 CREATE TABLE IF NOT EXISTS acl."catalogs"("vcat" VARCHAR PRIMARY KEY, "comment" VARCHAR);
 
-CREATE TABLE IF NOT EXISTS acl."relations"("vcat" VARCHAR, "vname" VARCHAR, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, "alias_types" VARCHAR, "enum_types" VARCHAR, PRIMARY KEY ("vcat", "vname"));
+CREATE TABLE IF NOT EXISTS acl."relations"("vcat" VARCHAR, "vname" VARCHAR, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, "alias_types" VARCHAR, "enum_types" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "vname"));
 
 CREATE TABLE IF NOT EXISTS acl."relation_columns"("vcat" VARCHAR, "vname" VARCHAR, "pos" INTEGER, "name" VARCHAR, "expr" VARCHAR, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "pos"));
 
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS acl."relation_columns"("vcat" VARCHAR, "vname" VARCHA
 -- as_base (aliases -> base type), as_varchar (ENUMs -> VARCHAR), as_both; NULL where it changes nothing.
 CREATE TABLE IF NOT EXISTS acl."relation_types"("vcat" VARCHAR, "vname" VARCHAR, "column" VARCHAR, "as_base" VARCHAR, "as_varchar" VARCHAR, "as_both" VARCHAR, PRIMARY KEY ("vcat", "vname", "column"));
 
-CREATE TABLE IF NOT EXISTS acl."functions"("vcat" VARCHAR, "vname" VARCHAR, "kind" VARCHAR, "form" VARCHAR, "target" VARCHAR, "template" VARCHAR, "comment" VARCHAR, "params" VARCHAR, PRIMARY KEY ("vcat", "vname", "kind"));
+CREATE TABLE IF NOT EXISTS acl."functions"("vcat" VARCHAR, "vname" VARCHAR, "kind" VARCHAR, "form" VARCHAR, "target" VARCHAR, "template" VARCHAR, "comment" VARCHAR, "params" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "vname", "kind"));
 
 CREATE TABLE IF NOT EXISTS acl."roles"("role" VARCHAR PRIMARY KEY, "comment" VARCHAR);
 
@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS acl."role_mappings"("scope_kind" VARCHAR, "scope_name
 -- physical row to read names and types from). Runs after every CREATE TABLE above.
 CREATE TABLE IF NOT EXISTS acl."object_columns"("vcat" VARCHAR, "vname" VARCHAR, "kind" VARCHAR, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, "comment" VARCHAR, "derived" BOOLEAN, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "kind", "pos"));
 
-CREATE TABLE IF NOT EXISTS acl."schemas"("vcat" VARCHAR, "path" VARCHAR, "phys_path" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, PRIMARY KEY ("vcat", "path"));
+CREATE TABLE IF NOT EXISTS acl."schemas"("vcat" VARCHAR, "path" VARCHAR, "phys_path" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "path"));
 
 CREATE TABLE IF NOT EXISTS acl."role_schemas"("role" VARCHAR, "vcat" VARCHAR, "schema_path" VARCHAR, "caps" VARCHAR, "inherited" BOOLEAN, "comment" VARCHAR, "into" VARCHAR, "virtual_only" BOOLEAN, PRIMARY KEY ("role", "vcat", "schema_path"));
 
@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS acl."schema_dropped"("vcat" VARCHAR, "path" VARCHAR, 
 
 -- and the record is a hint an agent reads. The columns live in their own table so that
 -- visibility is an anti-join rather than the parsing of a packed string.
-CREATE TABLE IF NOT EXISTS acl."references"("vcat" VARCHAR, "name" VARCHAR, "from_vname" VARCHAR, "to_vname" VARCHAR, "to_kind" VARCHAR, "expr" VARCHAR, "cardinality" VARCHAR, "optional" BOOLEAN, "join_method" VARCHAR, "comment" VARCHAR, PRIMARY KEY ("vcat", "name"));
+CREATE TABLE IF NOT EXISTS acl."references"("vcat" VARCHAR, "name" VARCHAR, "from_vname" VARCHAR, "to_vname" VARCHAR, "to_kind" VARCHAR, "expr" VARCHAR, "cardinality" VARCHAR, "optional" BOOLEAN, "join_method" VARCHAR, "comment" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "name"));
 
 CREATE TABLE IF NOT EXISTS acl."reference_columns"("vcat" VARCHAR, "name" VARCHAR, "pos" INTEGER, "side" VARCHAR, "column" VARCHAR, "param" VARCHAR, PRIMARY KEY ("vcat", "name", "pos", "side"));
 
@@ -147,7 +147,7 @@ INSERT INTO acl."function_grants" SELECT * FROM (VALUES ('', 'base', '', '', '',
 
 INSERT INTO acl."meta" SELECT 'function_seed', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'function_seed');
 
-INSERT INTO acl."meta" SELECT 'schema_version', '21' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
+INSERT INTO acl."meta" SELECT 'schema_version', '22' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
 
 INSERT INTO acl."meta" SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'policy_version');
 

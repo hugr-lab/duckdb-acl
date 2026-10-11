@@ -97,6 +97,27 @@ using acl_detail::Lit;
 
 namespace {
 
+//! spec 120.5: the `created_by, created_roles` a (re)written row carries. created_by is who defined the object first:
+//! the stored one when it exists (a row from before v22 stays unknown), else the statement's author. created_roles is
+//! the CURRENT definition's: the roles of the writer the source gate bound, or NULL - a definition another writer made
+//! (the operator, policy) is no longer the first author's to answer for (the review: its repair widened that role)
+string CreatedByLit(CatalogBackend &catalog, const char *table, const string &where) {
+	if (catalog.FunctionMode()) {
+		return "NULL, NULL"; // a driver's tables are no store of ours - its write is refused as read-only first
+	}
+	auto rows = catalog.Query("SELECT \"created_by\" FROM " + catalog.Tbl(table) + where);
+	string created_by;
+	if (rows->RowCount() > 0) {
+		auto stored = rows->Collection().GetValue(0, 0);
+		created_by = stored.IsNull() ? string("NULL") : Lit(stored.ToString());
+	} else {
+		auto author = AuthorInScope();
+		created_by = author.empty() ? string("NULL") : Lit(author);
+	}
+	auto roles = AuthorRolesInScope();
+	return created_by + ", " + (roles.empty() ? string("NULL") : Lit(roles));
+}
+
 void RequireCatalog(const unique_ptr<CatalogBackend> &catalog, const char *what) {
 	if (!catalog) {
 		throw BinderException("%s requires a policy catalog - run acl_use_db() first", what);
@@ -317,6 +338,8 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
                                   const case_insensitive_map_t<int8_t> &nullable_marks = {}, bool pk_carried = false,
                                   const string &alias_types = string(), const string &enum_types = string()) {
 	vector<string> statements;
+	auto created_by =
+	    CreatedByLit(catalog, "relations", " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
 	statements.push_back("DELETE FROM " + catalog.Tbl("relations") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                     " AND \"vname\" = " + Lit(vname));
 	statements.push_back("DELETE FROM " + catalog.Tbl("relation_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
@@ -335,14 +358,14 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 	// change is not a reason to lose an operator's documentation
 	statements.push_back("INSERT INTO " + catalog.Tbl("relations") +
 	                     "(\"vcat\", \"vname\", \"form\", \"phys\", \"view_sql\", \"rls\", \"comment\", \"origin\","
-	                     " \"rls_checked\", \"alias_types\", \"enum_types\")"
+	                     " \"rls_checked\", \"alias_types\", \"enum_types\", \"created_by\", \"created_roles\")"
 	                     " VALUES (" +
 	                     Lit(vcat) + ", " + Lit(vname) + ", " + Lit(form) + ", " + Lit(phys) + ", " + Lit(view_sql) +
 	                     ", " + Lit(rls) + ", " + (comment.empty() ? string("NULL") : Lit(comment)) + ", " +
 	                     (origin.empty() ? string("NULL") : Lit(origin)) + ", " +
 	                     (rls.empty() ? "NULL" : (checked ? "true" : "false")) + ", " +
 	                     (alias_types.empty() ? string("NULL") : Lit(alias_types)) + ", " +
-	                     (enum_types.empty() ? string("NULL") : Lit(enum_types)) + ")");
+	                     (enum_types.empty() ? string("NULL") : Lit(enum_types)) + ", " + created_by + ")");
 	// spec 099: the source's types, probed here so the read can cast them without looking
 	for (auto &statement : catalog.TypeFactStatements(vcat, vname, form, phys, view_sql)) {
 		statements.push_back(statement);
@@ -1581,6 +1604,8 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 		}
 		statements.push_back("DELETE FROM " + catalog->Tbl("reference_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"name\" = " + Lit(name));
+		auto created_by =
+		    CreatedByLit(*catalog, "references", " WHERE \"vcat\" = " + Lit(vcat) + " AND \"name\" = " + Lit(name));
 		statements.push_back("DELETE FROM " + catalog->Tbl("references") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"name\" = " + Lit(name));
 		statements.push_back(
@@ -1589,7 +1614,7 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 		    (expr.empty() ? string("NULL") : Lit(expr)) + ", " +
 		    (cardinality.empty() ? string("NULL") : Lit(cardinality)) + ", " + (optional ? "true" : "false") + ", " +
 		    (join_method.empty() ? string("NULL") : Lit(join_method)) + ", " +
-		    (comment.empty() ? string("NULL") : Lit(comment)) + ")");
+		    (comment.empty() ? string("NULL") : Lit(comment)) + ", " + created_by + ")");
 		for (auto &column : columns) {
 			statements.push_back("INSERT INTO " + catalog->Tbl("reference_columns") + " VALUES (" + Lit(vcat) + ", " +
 			                     Lit(name) + ", " + std::to_string(std::get<0>(column)) + ", " +
@@ -1620,11 +1645,13 @@ void PolicyStore::CatalogAddSchemaAlias(const string &vcat, const string &alias_
 		if (current->RowCount() > 0 && !current->Collection().GetValue(0, 0).IsNull()) {
 			comment = Lit(current->Collection().GetValue(0, 0).ToString());
 		}
+		auto created_by = CreatedByLit(*catalog, "schemas", where);
 		statements.push_back("DELETE FROM " + catalog->Tbl("schemas") + where);
-		statements.push_back("INSERT INTO " + catalog->Tbl("schemas") +
-		                     "(\"vcat\", \"path\", \"phys_path\", \"comment\", \"origin\") VALUES (" + Lit(vcat) +
-		                     ", " + Lit(alias_path) + ", " + (phys_path.empty() ? "NULL" : Lit(phys_path)) + ", " +
-		                     comment + ", " + (origin.empty() ? "NULL" : Lit(origin)) + ")");
+		statements.push_back(
+		    "INSERT INTO " + catalog->Tbl("schemas") +
+		    "(\"vcat\", \"path\", \"phys_path\", \"comment\", \"origin\", \"created_by\", \"created_roles\") VALUES (" +
+		    Lit(vcat) + ", " + Lit(alias_path) + ", " + (phys_path.empty() ? "NULL" : Lit(phys_path)) + ", " + comment +
+		    ", " + (origin.empty() ? "NULL" : Lit(origin)) + ", " + created_by + ")");
 	});
 	// a schema created under a granted parent inherits its capabilities at creation (spec 015)
 	CatalogRematerializeSchemaCaps(vcat, alias_path);
@@ -2088,13 +2115,16 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 		RequireNotPolicyStore(*catalog, "the function's template", string(), false, template_sql, kind == "scalar",
 		                      CatalogBackend::DeclaredTypes(params));
 	}
+	auto created_by = CreatedByLit(*catalog, "functions",
+	                               " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+	                                   " AND \"kind\" = " + Lit(kind));
 	vector<string> statements = {"DELETE FROM " + catalog->Tbl("functions") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                                 " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind),
 	                             "DELETE FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                                 " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind),
 	                             "INSERT INTO " + catalog->Tbl("functions") + " VALUES (" + Lit(vcat) + ", " +
 	                                 Lit(vname) + ", " + Lit(kind) + ", " + Lit(form) + ", " + Lit(target) + ", " +
-	                                 Lit(template_sql) + ", NULL, " + Lit(params) + ")"};
+	                                 Lit(template_sql) + ", NULL, " + Lit(params) + ", " + created_by + ")"};
 	// A declared result is the truth and needs no probe: an argument-dependent template cannot be
 	// typed from NULLs anyway, and binding admin SQL at write time touches the sources.
 	vector<std::pair<string, string>> schema;

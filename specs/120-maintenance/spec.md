@@ -1,6 +1,6 @@
 # Spec 120: maintenance - the missing forms, effective rights, exposures, view-as, export, created_by
 
-- **Status**: accepted, **120.1, 120.2, 120.3 implemented** (see *As built*) (by the owner 2026-10-11: the order 120.1 → 120.5; export after the release; view-as for
+- **Status**: accepted, **120.1, 120.2, 120.3, 120.5 implemented** (see *As built*; 120.4 after the release) (by the owner 2026-10-11: the order 120.1 → 120.5; export after the release; view-as for
   policy / passthrough first; created_by as written)
 - **Date**: 2026-10-11
 - **Author**: Claude (design/079 with the owner)
@@ -73,6 +73,9 @@ the script on an empty policy reproduces it (tested by round trip). Not the clus
 
 ## Not here
 - A per-node metadata cache (after the release); the DBeaver plugin itself (acl-clients 007).
+- Follow-up (owner, 2026-10-11): the `admin` audit event names the object a management call defines (`<vcat>.<vname>`,
+  its kind, its source - as cluster items carry `<kind>:<name>`), so authorship reaches acl_otel whatever the
+  statement's note did (`created_by` is NULL when a client parses between a batch's parse and its execution).
 
 ## Enforcement & security
 - Effective rights, exposures and view-as answer metadata only; view-as refuses every data path; its listings are
@@ -192,3 +195,48 @@ the role's own, every data path refused; export round trip; created_by written a
   RESET / platform.view_as, who may, a privileged role, a point grant, a revocation mid-view),
   `test/e2e/flight/admin.sh` + `view_as_client.py` (GetCatalogs / GetTables as the role, a read refused, a statement
   prepared before the mode refused inside it).
+
+### 120.5 (2026-10-11)
+- Schema v22 (min_reader 21 - nullable columns at the end; a v21 build reads by name and never writes a newer
+  catalog): `created_by` and `created_roles` on relations, schemas, functions, references. `created_roles` was not in
+  the design: the finding judges "the sources granted to the author's roles NOW", and a token's roles are nowhere
+  else - the roles are kept only when the source gate (spec 118.3) bound the author (it administers, below policy),
+  so a policy author, the operator and a principal's own CREATE never raise the finding.
+- The author: not an appended argument to every compiled call (the design's) but the decision itself - the note the
+  override leaves for the statement (spec 074) carries the principal; `AuthorScope` around the creating admin
+  functions reads it (`StatementAuthor`, `AuthorOf`: `<issuer>|<subject>`, or the role for `ACL ROLE`); none for the
+  anonymous gateway or the operator's own SQL. A principal's own CREATE / CREATE VIEW is a follow-up of the rewrite
+  (no note of its own): the rewriter names the author as `acl_register_*`'s last argument (acl_* is the never set - a
+  principal cannot write it). A redefinition keeps the stored pair (`CreatedByLit`); a rename is an UPDATE.
+- `acl_check_catalog` adds `source_not_granted` (`PolicyStore::SourcesNotGranted`): per object with `created_roles`,
+  its physical names (phys, an alias' phys_path, a function alias' attached database) and the tables its bodies name
+  (view / template / RLS / computed columns / a reference's expression - `StoredBodyTables`, parsed) outside
+  `GrantedSources` of those roles now - with `GRANT SOURCE <db>.<schema> TO ROLE <r>`; nothing is taken back.
+- `platform.relations / schemas / functions / references` show `created_by`.
+- Found while building: a parse nested in a batch's own decision (the source gate's `GetTableNames` probe of a view
+  or function body, spec 118.3) pushed a profile boundary in front of the batch's notes - the definition then ran with
+  no note (no profile event, no AclConnection session, no author). `PushProfileNote` drops a trailing boundary.
+- Review (three passes): `created_roles` is the CURRENT definition's writer, not the first author's - a definition
+  the operator or policy rewrote kept the catalog admin's roles, and the finding's repair then widened that role for a
+  source it never chose; the source-gated set is everyone below policy (`!Policy()`, the cluster bundle too - it was
+  `SeesAllSources`, the listing predicate); the finding reads a relation's RLS, its computed columns and a reference's
+  expression too (grants are policy's - never gated); a function alias names a source only when its first part is an
+  attached database (a builtin's alias raised a finding no repair could clear); roles are joined by `\x1f` (a role
+  name may hold a comma); roles that are gone or administer nothing get "redefine or drop the object", never a grant
+  to a name the next role may take; the repair names a role that still administers. Spec 118.3's gate now judges
+  `acl_refresh_schema_objects` (by the expansion's origin) - a refresh added records over a revoked source. The
+  driver mode's read-only refusal is no longer preceded by a failing lookup.
+- Review (author): the ALTER writers (relation, schema alias, function, reference) and REPAIR record their writer -
+  without it a re-point cleared `created_roles` and laundered the object out of the finding; `AuthorScope` restores the
+  scope it found.
+- Left (owner's call): the author is read from the decision's note at execution, so a client that parses another
+  statement between a batch's parse and its execution (the duckdb CLI's agent mode plans every statement first) loses
+  it - `created_by` / `created_roles` are then NULL ("unknown"), never another principal's, and the finding does not
+  rise for that object. The robust form is the design's (the author appended to every compiled call), at the price of
+  every creating function's signature. The same loss, before this spec, takes such a statement's profile and its
+  AclConnection session.
+- Left: the stored author is read on the store's own connection, outside the write's transaction (a concurrent
+  definer may record the other's author - a fact, never a right); the legacy grant wrappers write no author; an
+  expansion's own schema row is not judged (its records are, one finding each).
+- Tests: `test/sql/acl_created_by.test` (each author, a redefinition, the platform view, the finding raised and gone,
+  each review case, the note regression).

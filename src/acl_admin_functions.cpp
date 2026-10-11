@@ -224,6 +224,7 @@ bool AllowWrite(PolicyStore &store, const string &vcat, const string &vname, con
 //! argument substitution of a function end ("param => column, …") and `pairs`/`expr` the join
 //! condition, which for a function end names columns of its result.
 void AclAddReferenceFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AuthorScope author(state); // spec 120.5: created_by
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_add_reference", "catalog"));
 		auto name = StoreOf(state).SpellReference(vcat, KeyArg(args, 1, row, "acl_add_reference", "name"),
@@ -296,6 +297,7 @@ void SetInlineComment(PolicyStore &store, const string &vcat, const string &vnam
 //! acl_add_relation(vcat, vname, phys, cols_csv, rls[, comment, mode]): define a relation inside a
 //! virtual catalog; no columns and no RLS -> a writable alias (RENAME), otherwise a read-only subquery
 void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AuthorScope author(state); // spec 120.5: created_by
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_add_relation", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_add_relation", "name"),
@@ -319,6 +321,7 @@ void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result)
 
 //! acl_add_view(vcat, vname, select_sql): a virtual view (full SQL definition, read-only)
 void AclAddViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AuthorScope author(state); // spec 120.5: created_by
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_add_view", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_add_view", "name"),
@@ -340,6 +343,7 @@ void AclAddViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 //! acl_add_schema_alias(vcat, alias_path, phys_path): expose a whole physical schema under a virtual
 //! prefix; any name below it RENAMEs in place, existence is the binder's business
 void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AuthorScope author(state); // spec 120.5: created_by
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_add_schema_alias", "catalog"));
 		auto alias = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_add_schema_alias", "alias path"),
@@ -361,6 +365,7 @@ void AclAddSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &resu
 //! query, where every acl_* name is denied (spec 009).
 void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
+		AuthorScope author(OptionalArg(args, 4, row, "")); // spec 120.5: the rewriter names the author
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_created", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_created", "name"), true);
 		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_register_created", "phys"));
@@ -373,6 +378,7 @@ void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &res
 //! the body as written, in virtual names, and nothing else to choose
 void AclRegisterViewFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
+		AuthorScope author(OptionalArg(args, 3, row, "")); // spec 120.5: the rewriter names the author
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_view", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_view", "name"), true);
 		auto body = RequiredArg(args, 2, row, "acl_register_view", "body");
@@ -440,6 +446,7 @@ void AclRenameRelationFunc(DataChunk &args, ExpressionState &state, Vector &resu
 //! an object that must already exist physically, and refuses if it does not (spec 016)
 void AclRegisterExistingFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
+		AuthorScope author(OptionalArg(args, 4, row, "")); // spec 120.5: the rewriter names the author
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_existing", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_existing", "name"), true);
 		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_register_existing", "phys"));
@@ -499,6 +506,7 @@ void AclRematerializeSchemaCapsFunc(DataChunk &args, ExpressionState &state, Vec
 //! acl_expand_schema(vcat, path, phys_path[, comment, mode]): register one virtual record per object
 //! the physical schema holds right now (spec 014)
 void AclExpandSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AuthorScope author(state); // spec 120.5: created_by
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_expand_schema", "catalog"));
 		auto path = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_expand_schema", "schema path"),
@@ -517,6 +525,7 @@ void AclExpandSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result
 //! acl_refresh_schema_objects(vcat, path[, prune]): re-read an expansion's source; returns how many
 //! records were added (and, with prune, removed)
 void AclRefreshSchemaObjectsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AuthorScope author(state); // spec 120.5: created_by
 	vector<Value> counts;
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_refresh_schema_objects", "catalog"));
@@ -535,6 +544,7 @@ void AclRefreshSchemaObjectsFunc(DataChunk &args, ExpressionState &state, Vector
 
 void AddFunction(DataChunk &args, ExpressionState &state, Vector &result, const char *what, const char *kind,
                  const char *form) {
+	AuthorScope author(state); // spec 120.5: created_by
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, what, "catalog"));
 		auto vname =
@@ -1284,6 +1294,7 @@ void AclAllowFunctionFunc(DataChunk &args, ExpressionState &state, Vector &resul
 
 //! acl_alter_relation(vcat, vname, field, value): field is phys | columns | rls | view
 void AclAlterRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AuthorScope author(state); // spec 120.5: the definition's writer
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_alter_relation", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_alter_relation", "name"));
@@ -1301,6 +1312,7 @@ void AclAlterRelationFunc(DataChunk &args, ExpressionState &state, Vector &resul
 
 //! acl_alter_schema_alias(vcat, alias_path, phys_path): retarget an existing schema alias
 void AclAlterSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AuthorScope author(state); // spec 120.5: the definition's writer
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_alter_schema_alias", "catalog"));
 		auto alias = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_alter_schema_alias", "alias path"));
@@ -1312,6 +1324,7 @@ void AclAlterSchemaAliasFunc(DataChunk &args, ExpressionState &state, Vector &re
 
 //! acl_alter_function(vcat, vname, kind, form, definition): redefine an existing virtual function
 void AclAlterFunctionFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AuthorScope author(state); // spec 120.5: the definition's writer
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_alter_function", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_alter_function", "name"));
@@ -1377,6 +1390,7 @@ void AclRevokeObjectFunc(DataChunk &args, ExpressionState &state, Vector &result
 //! acl_alter_reference(vcat, name, field, value) (spec 120): a reference's comment, cardinality or optional - the
 //! hints an agent reads; its ends and condition change only by a re-create
 void AclAlterReferenceFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AuthorScope author(state); // spec 120.5: the definition's writer
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto &store = StoreOf(state);
 		auto vcat = store.SpellCatalog(CatalogArg(args, 0, row, "acl_alter_reference", "catalog"));
@@ -2193,10 +2207,10 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_admin_set("acl_add_schema_alias", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclAddSchemaAliasFunc);
 	register_admin_set("acl_expand_schema", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclExpandSchemaFunc);
 	register_admin_set("acl_grant_schema", {{v, v, v, v}, {v, v, v, v, v}, {v, v, v, v, v, v, b}}, AclGrantSchemaFunc);
-	register_admin_set("acl_register_created", {{v, v, v}, {v, v, v, v}}, AclRegisterCreatedFunc);
-	register_admin_set("acl_register_existing", {{v, v, v}, {v, v, v, v}}, AclRegisterExistingFunc);
+	register_admin_set("acl_register_created", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclRegisterCreatedFunc);
+	register_admin_set("acl_register_existing", {{v, v, v}, {v, v, v, v}, {v, v, v, v, v}}, AclRegisterExistingFunc);
 	register_admin_set("acl_rename_relation", {{v, v, v}, {v, v, v, v}}, AclRenameRelationFunc);
-	register_admin("acl_register_view", {v, v, v}, AclRegisterViewFunc);
+	register_admin_set("acl_register_view", {{v, v, v}, {v, v, v, v}}, AclRegisterViewFunc);
 	register_admin("acl_revoke_schema", {v, v, v}, AclRevokeSchemaFunc);
 	register_admin_set("acl_rematerialize_schema_caps", {{v}, {v, v}}, AclRematerializeSchemaCapsFunc);
 	register_admin_set(

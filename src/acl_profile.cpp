@@ -599,6 +599,23 @@ bool StatementDecidedVirtual(ClientContext &context, Principal &principal, strin
 	return false;
 }
 
+bool StatementPrincipal(ClientContext &context, Principal &out) {
+	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
+	if (!state || !state->has_note || state->note.proto.detail == "anonymous") {
+		return false;
+	}
+	out = state->note.proto.principal;
+	return !out.roles.empty() || !out.subject.empty();
+}
+
+string StatementAuthor(ClientContext &context) {
+	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
+	if (!state || !state->has_note || state->note.proto.detail == "anonymous") {
+		return string();
+	}
+	return AuthorOf(state->note.proto.principal);
+}
+
 void SetPhysicalLineage(ClientContext &context, shared_ptr<PhysicalLineage> lineage) {
 	auto state = context.registered_state->Get<AclProfileState>(STATE_KEY);
 	if (state) {
@@ -646,7 +663,14 @@ void MarkPreparing(ClientContext &context) {
 }
 
 void PushProfileNote(ProfileNote note) {
-	PendingNotes().push_back(std::move(note));
+	auto &notes = PendingNotes();
+	// a boundary here was pushed by a parse nested in this batch's own decision (a body probed on another
+	// connection of the thread, spec 118.3) - the batch's StatementAudit cleared the queue when the decision began,
+	// so it ends nothing of ours; left in front, it made the batch's first statement miss its note (spec 120.5)
+	while (!notes.empty() && notes.back().text_hash == 0) {
+		notes.pop_back();
+	}
+	notes.push_back(std::move(note));
 }
 
 void ClearProfileNotes() {

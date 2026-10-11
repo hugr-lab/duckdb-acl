@@ -656,6 +656,10 @@ void RightsScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 
 } // namespace
 
+void StoredBodyTables(const string &body, bool expression, vector<vector<string>> &tables) {
+	BodyTables(body, expression, tables);
+}
+
 void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {
 	const LogicalType &v = LogicalType::VARCHAR;
 	for (auto exposures : {false, true}) {
