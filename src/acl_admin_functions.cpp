@@ -2118,6 +2118,10 @@ void AclSessionViewAsFunc(DataChunk &args, ExpressionState &state, Vector &resul
 		                            "session of the client's own (a door's ACL SESSION)");
 	}
 	auto &store = StoreOf(state);
+	if (store.SessionDeclaredViewAs(current.session_id)) {
+		throw InvalidInputException("acl_session_view_as: this connection declares its view-as mode on every call "
+		                            "(x-acl-view-as) - open another connection to change it");
+	}
 	if (store.SessionPerCall(current.session_id)) {
 		// 120.3 addendum: the mode would end with this call and the next one would be the viewer's own
 		throw InvalidInputException("acl_session_view_as: this call's session ends with it - send the door's session "

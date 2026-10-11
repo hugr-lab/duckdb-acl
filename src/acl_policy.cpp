@@ -428,6 +428,34 @@ void PolicyStore::AuditSessionRefused(const string &door, const char *reason_cod
 	SessionEvent(audit.get(), Principal(), door, "", -1, "refused", reason_code, reason, -1);
 }
 
+void PolicyStore::AuditSessionRefused(const string &door, const string &handle, const char *reason_code,
+                                      const string &reason) {
+	Principal principal;
+	string why;
+	PolicyStore::SessionRef ref;
+	auto known = SessionPrincipal(handle, principal, why) && SessionRefOf(handle, ref);
+	SessionEvent(audit.get(), known ? principal : Principal(), door, known ? ref.id : string(), -1, "refused",
+	             reason_code, reason, -1);
+}
+
+void PolicyStore::SessionMarkDeclaredViewAs(const string &handle) {
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry != sessions.end()) {
+		entry->second.declared_view_as = true;
+	}
+}
+
+bool PolicyStore::SessionDeclaredViewAs(const string &id) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			return entry.second.declared_view_as;
+		}
+	}
+	return false;
+}
+
 //! The close event of a session being removed (spec 069): how it ended, and for how long it lived.
 //! Caller holds the lock; the event itself takes nothing of the store's.
 void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now) {
@@ -1197,6 +1225,9 @@ string PolicyStore::ViewAsRefusal(const AdminRights &rights, const string &role)
 	}
 	if (role.empty()) {
 		return string();
+	}
+	if (!rights.passthrough && rights.PlatformGrant("function", "view_as") == 0) {
+		return "platform.view_as is denied to this principal"; // a DENY wins over the policy bundle (spec 117)
 	}
 	if (!RoleDefined(role)) {
 		return StringUtil::Format("role \"%s\" does not exist", role);

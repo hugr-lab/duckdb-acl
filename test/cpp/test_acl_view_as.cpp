@@ -183,8 +183,20 @@ int main(int argc, char *argv[]) {
 		// and a REVOKE still work
 		Check(Contains(Rows(con, "ACL ADMIN GRANT FUNCTION platform.view_as TO ROLE cadm"), "never granted by name"),
 		      "a point grant on platform.view_as is refused at write");
+		// a DENY wins over the policy bundle: the SET refused, and a session already in the mode refused on its next
+		// batch (never pol2's own view); REVOKE takes it away
+		auto pol3 = OpenSession(con, "pol2tok");
+		CheckOk(*con.Query("ACL SESSION '" + pol3 + "' SET SESSION VIEW AS ROLE 'r'"), "pol2 in the mode");
 		CheckOk(*con.Query("ACL ADMIN DENY FUNCTION platform.view_as TO ROLE pol2"), "a DENY on it is written");
+		Check(Contains(Rows(con, "ACL SESSION '" + pol3 + "' SELECT table_name FROM information_schema.tables"),
+		               "can no longer be kept"),
+		      "...the session in the mode is refused");
+		auto pol4 = OpenSession(con, "pol2tok");
+		Check(Contains(Rows(con, "ACL SESSION '" + pol4 + "' SET SESSION VIEW AS ROLE 'r'"), "ERROR"),
+		      "...a SET is refused");
 		CheckOk(*con.Query("ACL ADMIN REVOKE FUNCTION platform.view_as FROM ROLE pol2"), "...and revoked");
+		Exec(con, "SELECT acl_session_close('" + pol3 + "')");
+		Exec(con, "SELECT acl_session_close('" + pol4 + "')");
 		// one written before (a v21 node took it): neither offered by console_info nor obeyed - beside a sibling
 		// point grant written the same way, which is offered (the control: the rows are read)
 		Exec(con, "INSERT INTO store.acl.platform_grants (\"role\", \"object\", \"kind\", \"allowed\") "

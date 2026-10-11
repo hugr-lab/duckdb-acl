@@ -216,8 +216,19 @@ session ended with the call.
   dropped - it used to leave the mode and run as the viewer.
 - **`view_as` is the policy bundle's alone**: `console_info` no longer offers it through a point grant (the authorizer
   refused that grant); `acl_grant_platform` refuses a GRANT on it (a DENY and a REVOKE still work - a row written
-  before stays removable, nothing is removed automatically).
-- Audit: each door refusal is a `session refused` event with reason code `view_as`.
+  before stays removable, nothing is removed automatically). A DENY on it wins over the policy bundle in
+  `ViewAsRefusal` too - for the header and for a session already in the mode, not only the SET.
+- **A statement prepared in the mode** is judged again at every redemption (`OwnerOf`): once the right is lost it is
+  refused, never run from its old rewrite (a SET-only client; a declaring one is refused per call anyway).
+- **One reading of the header** (`DeclaredRole`: the last non-empty value) for the guard and the mode; a session whose
+  calls declare the mode refuses a SET / RESET (it would race the next call's declaration - another connection
+  changes it).
+- Audit: each door refusal is a `session refused` event with reason code `view_as`, naming the session's principal
+  and ops id when the door resolved one; the reason is a fixed sentence (never the client's header value).
+- Tests (also): admin.sh - a DENY refuses a declared mode; a percent-encoded role decoded (`no%20such`); the kill of the
+  declared session confirmed before its re-seat is judged; a RESET on a declared connection refused;
+  `view_as_lost_client.py` - a statement prepared in the mode answers, then (a DENY) is refused (fails without the
+  `OwnerOf` judgment); test_acl_view_as.cpp - a DENY refuses the SET and a session already in the mode.
 - Tests: `test/e2e/flight/admin.sh` (a killed SET-only session's cookie refused - fails without the fix: the cookie
   came back as the viewer -, a new connection works; a swap refused, the viewer's session kept; a SET on a per-call
   session refused; a declared connection in the mode from its first call, re-seated after a kill in the mode again,

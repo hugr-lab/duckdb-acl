@@ -374,6 +374,9 @@ struct PolicyStore {
 		//! A door's per-call session (a Flight call without the cookie, spec 050): it ends with the call, so a mode
 		//! set on it would end there too - `SET SESSION VIEW AS` is refused on one (120.3 addendum)
 		bool per_call = false;
+		//! The door's calls declare the mode (x-acl-view-as): a SET / RESET on the session would race the
+		//! declaration of the next call, so it is refused (120.3 addendum)
+		bool declared_view_as = false;
 		//! The stream the session's last rewritten statement drained (spec 042, judged on the AST), for
 		//! the door's completion hook to tell a load's outcome from any other statement's (spec 069);
 		//! taken once
@@ -997,6 +1000,10 @@ struct PolicyStore {
 	//! A door refused a client before any session (spec 079: the node's seats): the `session refused`
 	//! event, with nobody's principal, so the counters and the audit see it like any other refusal.
 	void AuditSessionRefused(const string &door, const char *reason_code, const string &reason);
+	//! The same, for a session the door already resolved: the event names its principal and ops id
+	void AuditSessionRefused(const string &door, const string &handle, const char *reason_code, const string &reason);
+	void SessionMarkDeclaredViewAs(const string &handle);
+	bool SessionDeclaredViewAs(const string &id);
 	//! A door's connection is gone (spec 079: quack's DISCONNECT, or its heartbeat lease ran out): the
 	//! session bound to it (SessionBind) ends now with `how`, instead of waiting out the idle timeout.
 	void SessionEndBound(const string &external_id, const char *how);
