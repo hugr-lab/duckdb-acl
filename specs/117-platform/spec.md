@@ -289,3 +289,11 @@ before it does not know the bundles).
   timeout only if the benchmark asks.
 - 120: `view_as` as a session mode, `effective_rights`, `exposures`, `ddl` / `export_script`, missing
   ALTER / REVOKE.
+
+## Addendum 2026-10-11: a read function prepared answers rows (found by acl-clients spec 007.3)
+`SELECT * FROM platform.check_catalog(…)` / `effective_rights(…)` / `exposures(…)` compile to a management call
+(audited as one), so the Flight door's `ClientStatementIsCommand` took them for a command and a prepared statement
+announced an empty dataset schema - Arrow's JDBC driver, which prepares even `executeQuery`, ran it as an update and
+handed the client no result set (the ticket path kept the command's result, so ADBC never saw it). A read function in
+FROM is now a query to the door. Test: `test/e2e/flight/admin.sh` - both prepared, each announces its columns (fails
+without the fix).
