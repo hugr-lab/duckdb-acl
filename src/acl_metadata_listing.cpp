@@ -79,7 +79,8 @@ vector<CatalogBackend::VisibleFunction> CatalogBackend::VisibleFunctions(const P
 }
 
 string CatalogBackend::MetadataListingSql(const Principal &principal, const string &surface,
-                                          const string &platform_objects, const string &platform_columns) {
+                                          const string &platform_objects, const string &platform_columns,
+                                          const ListingScope &scope) {
 	// spec 117: the system catalog's views this principal holds - constants, one `platform.main` schema
 	bool platform = !platform_objects.empty();
 	if (function_mode) {
@@ -105,42 +106,77 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// every attached database; the broken-list mark only over the relations that declare a list
 	vector<string> source_keys, declared_phys;
 	{
-		auto add_schema = [&](const string &key) {
-			NamePath path;
-			string error;
-			if (!NamePath::TryFromKey(key, path, error) || path.Parts().empty()) {
-				return;
+		// spec 119 §2: what the query asks about narrows which physical sources are read - the keys of the
+		// shown names (a catalog / a table is one part; a schema as shown, a key when it is a path)
+		auto in_list = [&](const vector<string> &values, const string &expr, bool schema) {
+			vector<string> keys;
+			for (auto &value : values) {
+				keys.push_back(
+				    Lit(StringUtil::Lower(schema ? NamePath::FromDisplay(value) : NamePath::QuotePart(value))));
 			}
-			auto &parts = path.Parts();
-			auto schema = parts.size() >= 3   ? vector<string> {parts[0], parts[1]}
-			              : parts.size() == 2 ? vector<string> {parts[0], parts[1]}
-			                                  : vector<string> {};
-			if (!schema.empty()) {
-				source_keys.push_back(Lit(NamePath(schema).ToKey()));
+			return " AND " + KeyFoldSql(expr) + " IN (" + StringUtil::Join(keys, ", ") + ")";
+		};
+		string relation_scope, alias_scope;
+		if (!scope.catalogs.empty()) {
+			relation_scope += in_list(scope.catalogs, "\"vcat\"", false);
+			alias_scope += in_list(scope.catalogs, "\"vcat\"", false);
+		}
+		if (!scope.schemas.empty()) {
+			relation_scope +=
+			    in_list(scope.schemas, "coalesce(nullif(" + KeyParentSql("\"vname\"") + ", ''), 'main')", true);
+			alias_scope += in_list(scope.schemas, "\"path\"", true);
+		}
+		if (!scope.tables.empty()) {
+			relation_scope += in_list(scope.tables, KeyLeafSql("\"vname\""), false);
+		}
+		bool narrowed = !scope.Empty();
+		std::set<string> seen;
+		auto add_key = [&](const vector<string> &parts) {
+			auto key = NamePath(parts).ToKey();
+			if (seen.insert(StringUtil::Lower(key)).second) {
+				source_keys.push_back(Lit(key));
 			}
 		};
-		auto rows = Query("SELECT DISTINCT \"phys\" FROM " + Tbl("relations") + " WHERE \"phys\" IS NOT NULL");
+		// a relation: its physical object when the query narrows (a handful of rows), else its schema
+		auto rows =
+		    Query("SELECT DISTINCT \"phys\" FROM " + Tbl("relations") + " WHERE \"phys\" IS NOT NULL" + relation_scope);
 		ResultRows phys_rows(*rows);
 		for (idx_t i = 0; i < phys_rows.Count(); i++) {
-			auto phys = phys_rows.GetValue(0, i).ToString();
 			NamePath path;
 			string error;
-			if (NamePath::TryFromKey(phys, path, error) && path.Parts().size() == 2) {
-				add_schema(NamePath({path.Parts()[0], "main"}).ToKey()); // <db>.<table>: the database's main
-			} else {
-				add_schema(phys);
+			if (!NamePath::TryFromKey(phys_rows.GetValue(0, i).ToString(), path, error) || path.Parts().size() < 2) {
+				continue;
 			}
+			auto parts = path.Parts();
+			if (parts.size() == 2) {
+				parts.insert(parts.begin() + 1, "main"); // <db>.<table>: the database's main
+			}
+			add_key(narrowed ? parts : vector<string> {parts[0], parts[1]});
 		}
+		// a schema alias: its physical schema - or, when the query names tables, those tables of it
 		auto aliases_rows = Query("SELECT DISTINCT \"phys_path\" FROM " + Tbl("schemas") +
-		                          " WHERE \"phys_path\" IS NOT NULL AND \"phys_path\" <> ''");
+		                          " WHERE \"phys_path\" IS NOT NULL AND \"phys_path\" <> ''" + alias_scope);
 		ResultRows alias_rows(*aliases_rows);
 		for (idx_t i = 0; i < alias_rows.Count(); i++) {
-			add_schema(alias_rows.GetValue(0, i).ToString());
+			NamePath path;
+			string error;
+			if (!NamePath::TryFromKey(alias_rows.GetValue(0, i).ToString(), path, error) || path.Parts().size() != 2) {
+				continue;
+			}
+			if (scope.tables.empty()) {
+				add_key(path.Parts());
+				continue;
+			}
+			for (auto &table : scope.tables) {
+				add_key({path.Parts()[0], path.Parts()[1], table});
+			}
 		}
 		auto declared_rows =
 		    Query("SELECT DISTINCT r.\"phys\" FROM " + Tbl("relations") + " r JOIN " + Tbl("relation_columns") +
 		          " dc ON dc.\"vcat\" = r.\"vcat\" AND dc.\"vname\" = r.\"vname\" WHERE r.\"form\" IN ('alias',"
-		          " 'subquery') AND r.\"phys\" IS NOT NULL");
+		          " 'subquery') AND r.\"phys\" IS NOT NULL" +
+		          StringUtil::Replace(StringUtil::Replace(relation_scope, "\"vcat\"", "r.\"vcat\""), "\"vname\"",
+		                              "r.\"vname\""));
 		ResultRows declared_phys_rows(*declared_rows);
 		for (idx_t i = 0; i < declared_phys_rows.Count(); i++) {
 			declared_phys.push_back(Lit(declared_phys_rows.GetValue(0, i).ToString()));
@@ -1005,7 +1041,8 @@ IntrospectionRows PolicyStore::Introspect(const string &listing) {
 	return out;
 }
 
-bool PolicyStore::MetadataListing(const Principal &principal, const string &surface, string &sql) {
+bool PolicyStore::MetadataListing(const Principal &principal, const string &surface, string &sql,
+                                  const ListingScope &scope) {
 	if (surface == "duckdb_functions") {
 		sql = PrincipalFunctionsSql(principal); // spec 098: every mode answers the engine's half
 		return true;
@@ -1025,7 +1062,7 @@ bool PolicyStore::MetadataListing(const Principal &principal, const string &surf
 	if (principal.session.empty() || SessionDoorOf(principal.session) != "quack") {
 		PlatformListingCtes(AdminRightsOf(principal), platform_objects, platform_columns);
 	}
-	sql = catalog->MetadataListingSql(principal, surface, platform_objects, platform_columns);
+	sql = catalog->MetadataListingSql(principal, surface, platform_objects, platform_columns, scope);
 	return true;
 }
 

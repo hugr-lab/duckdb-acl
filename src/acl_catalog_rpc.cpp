@@ -9,9 +9,10 @@ namespace acl {
 namespace {
 
 //! `$1`, `$2`, ... - the door's own placeholders, numbered as they are appended.
-string Bind(CatalogQuery &query, Value value) {
-	query.parameters.push_back(std::move(value));
-	return "$" + std::to_string(query.parameters.size());
+//! A filter value as a quoted literal (spec 119): the door composes this SQL itself, and the rewriter's
+//! listing narrowing reads constants - a `$n` it cannot see, so a filtered RPC read every source
+string Bind(CatalogQuery &, Value value) {
+	return "'" + StringUtil::Replace(value.ToString(), "'", "''") + "'";
 }
 
 //! The virtual path of an object as the store keys it: bare in `main`, `schema.name` elsewhere.

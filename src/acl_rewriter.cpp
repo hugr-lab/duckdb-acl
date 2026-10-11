@@ -14,6 +14,8 @@
 #include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
+#include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
@@ -1420,7 +1422,12 @@ private:
 
 	void RewriteSelectNode(SelectNode &node) {
 		KeepItemNames(node.select_list);
+		// spec 119: a metadata surface in this FROM reads its narrowing from this WHERE (as written - the
+		// FROM is rewritten before it)
+		auto outer_where = listing_where;
+		listing_where = node.where_clause.get();
 		RewriteTableRef(node.from_table);
+		listing_where = outer_where;
 		for (auto &item : node.select_list) {
 			RewriteExpr(item);
 		}
@@ -2255,18 +2262,139 @@ private:
 	}
 
 	//! Replace a metadata surface with the principal's own catalog in the same shape
+	//! spec 119: the WHERE of the SELECT whose FROM is being rewritten (nullptr outside one)
+	optional_ptr<ParsedExpression> listing_where;
+
+	//! The constant conjuncts of `listing_where` on a surface's catalog / schema / name columns - unqualified
+	//! or qualified by the surface's alias - as a ListingScope. Only `=`, `IN (…)` and a LIKE whose pattern
+	//! has no wildcard count; anything else narrows nothing (an OR, a function of a column, a parameter).
+	ListingScope ScopeOf(const Identifier &alias) {
+		ListingScope scope;
+		if (!listing_where) {
+			return scope;
+		}
+		auto column_of = [&](const ParsedExpression &expr) -> vector<string> * {
+			if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+				return nullptr;
+			}
+			auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+			if (names.size() > 2 ||
+			    (names.size() == 2 && !StringUtil::CIEquals(names[0].GetIdentifierName(), alias.GetIdentifierName()))) {
+				return nullptr;
+			}
+			auto column = StringUtil::Lower(names.back().GetIdentifierName());
+			if (column == "table_catalog" || column == "catalog_name" || column == "database_name") {
+				return &scope.catalogs;
+			}
+			if (column == "table_schema" || column == "schema_name") {
+				return &scope.schemas;
+			}
+			if (column == "table_name" || column == "view_name") {
+				return &scope.tables;
+			}
+			return nullptr;
+		};
+		auto constant = [](const ParsedExpression &expr, string &out) {
+			if (expr.GetExpressionClass() != ExpressionClass::CONSTANT) {
+				return false;
+			}
+			auto value = expr.Cast<ConstantExpression>().GetLiteral().ToValue();
+			if (value.IsNull()) {
+				return false;
+			}
+			out = value.ToString();
+			return true;
+		};
+		// a LIKE pattern that matches one name only: no unescaped wildcard; the escapes taken off
+		auto exact = [](const string &pattern, char escape, string &out) {
+			out.clear();
+			for (idx_t i = 0; i < pattern.size(); i++) {
+				auto c = pattern[i];
+				if (escape && c == escape && i + 1 < pattern.size()) {
+					out += pattern[++i];
+				} else if (c == '%' || c == '_') {
+					return false;
+				} else {
+					out += c;
+				}
+			}
+			return true;
+		};
+		std::function<void(const ParsedExpression &)> visit = [&](const ParsedExpression &expr) {
+			if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+				for (auto &child : expr.Cast<ConjunctionExpression>().GetChildren()) {
+					visit(*child);
+				}
+				return;
+			}
+			auto take = [&](vector<string> *target, vector<string> values) {
+				if (target && target->empty() && !values.empty()) {
+					for (auto &value : values) {
+						target->push_back(StringUtil::Lower(value)); // the first constraint narrows; WHERE has the rest
+					}
+				}
+			};
+			if (expr.GetExpressionType() == ExpressionType::COMPARE_EQUAL) {
+				auto &comparison = expr.Cast<ComparisonExpression>();
+				string value;
+				if (constant(comparison.Right(), value)) {
+					take(column_of(comparison.Left()), {value});
+				} else if (constant(comparison.Left(), value)) {
+					take(column_of(comparison.Right()), {value});
+				}
+				return;
+			}
+			if (expr.GetExpressionType() == ExpressionType::COMPARE_IN) {
+				auto &children = expr.Cast<OperatorExpression>().GetChildren();
+				vector<string> values;
+				for (idx_t i = 1; i < children.size(); i++) {
+					string value;
+					if (!constant(*children[i], value)) {
+						return; // one non-constant item: the list says nothing for sure
+					}
+					values.push_back(value);
+				}
+				if (!children.empty()) {
+					take(column_of(*children[0]), values);
+				}
+				return;
+			}
+			if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+				auto &function = expr.Cast<FunctionExpression>();
+				auto name = function.FunctionName().GetIdentifierName();
+				auto &arguments = function.GetArguments();
+				string pattern, escape, value;
+				if ((name == "~~" && arguments.size() == 2) || (name == "like_escape" && arguments.size() == 3)) {
+					if (!constant(arguments[1].GetExpression(), pattern) ||
+					    (arguments.size() == 3 &&
+					     (!constant(arguments[2].GetExpression(), escape) || escape.size() != 1))) {
+						return;
+					}
+					if (exact(pattern, escape.empty() ? '\0' : escape[0], value)) {
+						take(column_of(arguments[0].GetExpression()), {value});
+					}
+				}
+			}
+		};
+		visit(*listing_where);
+		return scope;
+	}
+
 	unique_ptr<TableRef> BuildMetadataSubquery(const char *surface, const Identifier &alias,
 	                                           vector<Identifier> column_alias = {}) {
 		string sql;
-		if (!store.MetadataListing(principal, surface, sql)) {
+		auto scope = ScopeOf(alias);
+		if (!store.MetadataListing(principal, surface, sql, scope)) {
 			Deny(Reason::UNAVAILABLE,
 			     string("metadata is not available: this policy source cannot enumerate ") + surface);
 		}
 		AppendTempListing(surface, sql);
 		// spec 098: the functions listing carries the principal's admitted keys as constants - tens of
 		// KB that differ per role set; parsed outside the template cache, never filling it
-		auto select_stmt = string(surface) == "duckdb_functions" ? store.InstantiateSelect(sql, template_options, false)
-		                                                         : store.InstantiateSelect(sql, template_options);
+		// a narrowed listing differs per value asked about: parsed outside the template cache too (spec 119)
+		auto select_stmt = string(surface) == "duckdb_functions" || !scope.Empty()
+		                       ? store.InstantiateSelect(sql, template_options, false)
+		                       : store.InstantiateSelect(sql, template_options);
 		auto sub = make_uniq<SubqueryRef>(std::move(select_stmt), alias);
 		// `FROM duckdb_tables() AS t(a, b)`: the written column aliases name the listing's columns
 		sub->column_name_alias = std::move(column_alias);
