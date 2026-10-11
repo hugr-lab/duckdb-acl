@@ -314,7 +314,11 @@ DROP [VIRTUAL] REFERENCE [IF EXISTS] <catalog>.<name>
 
 A reference is a declared join path between two objects of one virtual catalog - a hint an agent
 reads through `acl_references([object])`. It is never enforced and grants nothing; a principal sees
-it only when both ends and every column it names are visible. Ends are virtual names, written with or
+it only when both ends and every column it names are visible. Its `to_has_key` column says whether the
+far end declares a key whose every column the principal sees (what a tool's foreign-key listing names).
+`acl_references()` / `acl_keys()` asked about an object - their argument, or `WHERE vcat = … AND
+object | from_object | to_object = …` - read only the sources behind it (and, for a reference, its other
+end), not every source of the node (spec 121). Ends are virtual names, written with or
 without the reference's own catalog in front (`FROM orders` and `FROM c.orders` are the same in
 `c.…`). `ON (…)` lists column pairs; `ON EXPRESSION '…'` is arbitrary SQL in which every column must
 be qualified by its end. Exactly one of the two is written for a relation end. For a `TO FUNCTION`

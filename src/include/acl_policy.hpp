@@ -279,8 +279,11 @@ namespace acl_detail {
 //! the WHERE stays as written, so it never changes an answer
 struct ListingScope {
 	vector<string> catalogs, schemas, tables;
+	//! spec 121: the keys / references surfaces name objects by key (`raw.eu.events`, `customers`) - the backend
+	//! adds a reference's other ends and reads their schemas and tables
+	vector<string> objects;
 	bool Empty() const {
-		return catalogs.empty() && schemas.empty() && tables.empty();
+		return catalogs.empty() && schemas.empty() && tables.empty() && objects.empty();
 	}
 };
 

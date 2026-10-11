@@ -2340,6 +2340,11 @@ private:
 		const char *name_column = info || kind == "duckdb_tables" || kind == "duckdb_columns" ? "table_name"
 		                          : kind == "duckdb_views"                                    ? "view_name"
 		                                                                                      : nullptr;
+		// spec 121: acl_keys() / acl_references() name a catalog and objects by key
+		bool keyed = kind == "keys" || kind == "references";
+		if (keyed) {
+			catalog_column = "vcat";
+		}
 		auto column_of = [&](const ParsedExpression &expr) -> vector<string> * {
 			if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
 				return nullptr;
@@ -2358,6 +2363,11 @@ private:
 			}
 			if (name_column && StringUtil::CIEquals(column, name_column)) {
 				return &scope.tables;
+			}
+			if ((kind == "keys" && StringUtil::CIEquals(column, "object")) ||
+			    (kind == "references" &&
+			     (StringUtil::CIEquals(column, "from_object") || StringUtil::CIEquals(column, "to_object")))) {
+				return &scope.objects;
 			}
 			return nullptr;
 		};
@@ -2501,7 +2511,11 @@ private:
 			object = argument.Cast<ConstantExpression>().GetLiteral().ToValue().ToString();
 		}
 		string sql;
-		if (!store.MetadataListing(principal, "references", sql)) {
+		auto scope = ScopeOf("references", alias, {});
+		if (!object.empty() && scope.objects.empty()) {
+			scope.objects.push_back(StringUtil::Lower(ObjectKey(object)));
+		}
+		if (!store.MetadataListing(principal, "references", sql, scope)) {
 			Deny(Reason::UNAVAILABLE, "references are not available: this policy source cannot enumerate them");
 		}
 		if (!object.empty()) {
@@ -2510,7 +2524,9 @@ private:
 			sql = "SELECT * FROM (" + sql + ") WHERE " + KeyEqSql("from_object", quoted) + " OR " +
 			      KeyEqSql("to_object", quoted);
 		}
-		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		// spec 121: a narrowed listing differs per object asked about - parsed outside the template cache
+		auto select_stmt = scope.Empty() ? store.InstantiateSelect(sql, template_options)
+		                                 : store.InstantiateSelect(sql, template_options, false);
 		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
 	}
 
@@ -2537,14 +2553,20 @@ private:
 			object = argument.Cast<ConstantExpression>().GetLiteral().ToValue().ToString();
 		}
 		string sql;
-		if (!store.MetadataListing(principal, "keys", sql)) {
+		auto scope = ScopeOf("keys", alias, {});
+		if (!object.empty() && scope.objects.empty()) {
+			scope.objects.push_back(StringUtil::Lower(ObjectKey(object)));
+		}
+		if (!store.MetadataListing(principal, "keys", sql, scope)) {
 			Deny(Reason::UNAVAILABLE, "keys are not available: this policy source cannot enumerate them");
 		}
 		if (!object.empty()) {
 			auto quoted = "'" + StringUtil::Replace(ObjectKey(object), "'", "''") + "'";
 			sql = "SELECT * FROM (" + sql + ") WHERE " + KeyEqSql("object", quoted);
 		}
-		auto select_stmt = store.InstantiateSelect(sql, template_options);
+		// spec 121: a narrowed listing differs per object asked about - parsed outside the template cache
+		auto select_stmt = scope.Empty() ? store.InstantiateSelect(sql, template_options)
+		                                 : store.InstantiateSelect(sql, template_options, false);
 		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
 	}
 

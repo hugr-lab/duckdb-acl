@@ -1,0 +1,158 @@
+# name: test/sql/acl_tree_budget.test
+# description: spec 121 - acl_keys() / acl_references() narrowed by what they are asked about answer exactly what
+#   the unnarrowed listing answers (a narrowing only chooses which sources are read), and a reference says whether
+#   its far end has a key the role sees (to_has_key)
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.eu;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, customer_id INT, amount INT);
+
+statement ok
+CREATE TABLE phys.main.customers(id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE phys.eu.events(id INT, order_id INT, kind VARCHAR);
+
+statement ok
+CREATE TABLE phys.main.vault(code INT, secret VARCHAR);
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders PRIMARY KEY (id);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.customers AS phys.main.customers PRIMARY KEY (id);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.raw.eu FROM phys.eu;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.raw.eu.events_keyed AS phys.eu.events PRIMARY KEY (id);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.vault AS phys.main.vault PRIMARY KEY (code);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM c.orders TO c.customers ON (customer_id = id);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.event_order FROM c.raw.eu.events TO c.orders ON (order_id = id);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.order_vault FROM c.orders TO c.vault ON (amount = code);
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select) MAIN;
+
+# the vault's key column is hidden from r: its key does not show, nor does a reference's key to it
+statement ok
+ACL ADMIN GRANT TABLE c.vault TO ROLE r WITH (select) COLUMNS (secret);
+
+statement ok
+ACL ADMIN CREATE ROLE full;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE full WITH (select) MAIN;
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+# --- keys: narrowed (=) and unnarrowed (a function of the column narrows nothing) - the same rows ----------
+
+query IIII
+ACL ROLE "r" SELECT vcat, object, key_sequence, "column" FROM acl_keys() WHERE vcat = 'c' AND object = 'orders';
+----
+c	orders	1	id
+
+query IIII
+ACL ROLE "r" SELECT vcat, object, key_sequence, "column" FROM acl_keys() WHERE vcat || '' = 'c' AND object || '' = 'orders';
+----
+c	orders	1	id
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_keys() WHERE vcat = 'c' AND object = 'vault';
+----
+0
+
+# a key object of a nested schema, by its path
+query IIII
+ACL ROLE "r" SELECT vcat, object, key_sequence, "column" FROM acl_keys() WHERE vcat = 'c' AND object = 'raw.eu.events_keyed';
+----
+c	raw.eu.events_keyed	1	id
+
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_keys() WHERE object || '' = 'raw.eu.events_keyed';
+----
+1
+
+# --- references: by its near end and by its far end - the far end's columns are read too ------------------
+
+query IIIT
+ACL ROLE "r" SELECT name, from_object, to_object, to_has_key FROM acl_references() WHERE vcat = 'c' AND from_object = 'orders' ORDER BY name;
+----
+orders_customer	orders	customers	true
+
+query IIIT
+ACL ROLE "r" SELECT name, from_object, to_object, to_has_key FROM acl_references() WHERE vcat || '' = 'c' AND from_object || '' = 'orders' ORDER BY name;
+----
+orders_customer	orders	customers	true
+
+# by the far end: the near end is in another (nested) schema, read because the reference names it
+query IIIT
+ACL ROLE "r" SELECT name, from_object, to_object, to_has_key FROM acl_references() WHERE vcat = 'c' AND to_object = 'orders';
+----
+event_order	raw.eu.events	orders	true
+
+query IIIT
+ACL ROLE "r" SELECT name, from_object, to_object, to_has_key FROM acl_references() WHERE to_object || '' = 'orders';
+----
+event_order	raw.eu.events	orders	true
+
+# the argument form narrows the same way
+query II
+ACL ROLE "r" SELECT name, to_has_key FROM acl_references('raw.eu.events');
+----
+event_order	true
+
+# order_vault names vault.code, hidden from r: the reference does not show (spec 022), narrowed or not
+query I
+ACL ROLE "r" SELECT count(*) FROM acl_references() WHERE vcat = 'c' AND to_object = 'vault';
+----
+0
+
+# a role that sees vault's key column sees the reference to it - with its key
+query IIT
+ACL ROLE "full" SELECT name, to_object, to_has_key FROM acl_references() WHERE vcat = 'c' AND from_object = 'orders' ORDER BY name;
+----
+order_vault	vault	true
+orders_customer	customers	true
+
+# `object` is a keys column: written unqualified beside acl_references() it narrows the keys, never the references
+# (review 121) - every reference r sees, each paired with customers' key row
+query I
+ACL ROLE "r" SELECT DISTINCT name FROM acl_references(), acl_keys() WHERE object = 'customers' ORDER BY ALL;
+----
+event_order
+orders_customer
