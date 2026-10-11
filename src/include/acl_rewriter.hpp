@@ -76,8 +76,10 @@ struct AuditTrail {
 };
 
 //! Rewrite every statement of one ACL batch in place, under one verified principal
+//! `metadata_only` (spec 120.3, the override's one decision for a view-as session): listings answer, nothing reads rows
 void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Principal &principal,
-                       const ParserOptions &options, PolicyStore &store, AuditTrail *trail = nullptr);
+                       const ParserOptions &options, PolicyStore &store, AuditTrail *trail = nullptr,
+                       bool metadata_only = false);
 
 //! Rewrite a policy template into a bindable form by baking every marker to NULL: used at write time
 //! to derive the column names and types of a query-defined object (spec 010). `expression` picks the

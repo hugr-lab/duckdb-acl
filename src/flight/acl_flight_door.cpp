@@ -345,11 +345,27 @@ struct FlightDoorState {
 		return id;
 	}
 
+	//! The owner is the principal's fingerprint and, after `\x1c`, the session's view-as mode (spec 120.3). The
+	//! principal must be the same; the mode too, for a statement still to run - one prepared with the session's own
+	//! rights never runs inside the metadata-only view, nor one prepared in the view outside it - while a result
+	//! already kept (spec 111: the SET of the mode itself ran at GetFlightInfo) is answered whatever the mode now is
+	static bool Owns(const Reservation &reservation, const string &owner, bool to_run) {
+		auto split = [](const string &text, string &who, string &mode) {
+			auto at = text.rfind('\x1c');
+			who = at == string::npos ? text : text.substr(0, at);
+			mode = at == string::npos ? string() : text.substr(at + 1);
+		};
+		string held_who, held_mode, who, mode;
+		split(reservation.owner, held_who, held_mode);
+		split(owner, who, mode);
+		return held_who == who && (!to_run || reservation.executed || held_mode == mode);
+	}
+
 	//! Owner-checked: not yours reads exactly like not there - no oracle.
 	shared_ptr<Reservation> FindReservation(const string &id, const string &owner) {
 		std::lock_guard<std::mutex> guard(lock);
 		auto entry = reservations.find(id);
-		if (entry == reservations.end() || entry->second->owner != owner) {
+		if (entry == reservations.end() || !Owns(*entry->second, owner, true)) {
 			return nullptr;
 		}
 		entry->second->last_used = NowSeconds();
@@ -361,7 +377,7 @@ struct FlightDoorState {
 	shared_ptr<Reservation> TakeReservation(const string &id, const string &owner) {
 		std::lock_guard<std::mutex> guard(lock);
 		auto entry = reservations.find(id);
-		if (entry == reservations.end() || entry->second->owner != owner) {
+		if (entry == reservations.end() || !Owns(*entry->second, owner, true)) {
 			return nullptr;
 		}
 		auto out = std::move(entry->second);
@@ -373,7 +389,7 @@ struct FlightDoorState {
 	void CloseReservation(const string &id, const string &owner) {
 		std::lock_guard<std::mutex> guard(lock);
 		auto entry = reservations.find(id);
-		if (entry != reservations.end() && entry->second->owner == owner) {
+		if (entry != reservations.end() && Owns(*entry->second, owner, false)) {
 			reservations.erase(entry);
 		}
 	}
@@ -1864,7 +1880,10 @@ public:
 		if (!state->store->SessionPrincipal(session_handle, principal, reason)) {
 			return arrow::Status::UnknownError("acl: authentication failed");
 		}
-		return PrincipalFingerprint(principal);
+		// spec 120.3: the session's view-as mode rides on the owner - see FlightDoorState::Owns
+		PolicyStore::SessionRef ref;
+		auto mode = state->store->SessionRefOf(session_handle, ref) ? state->store->SessionViewAsOf(ref.id) : string();
+		return PrincipalFingerprint(principal) + "\x1c" + mode;
 	}
 
 	//! Prepare under the caller and hand back both schemas the protocol wants: the result's, and the

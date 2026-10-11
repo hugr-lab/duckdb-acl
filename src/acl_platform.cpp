@@ -936,6 +936,15 @@ vector<PlatformFunction> BuildFunctions() {
 	     false,
 	     B,
 	     "the operator's profile level on a session (spec 074)"},
+	    {"view_as",
+	     "acl_session_view_as",
+	     {A("role")},
+	     {1},
+	     -1,
+	     PR::POLICY,
+	     false,
+	     B,
+	     "this session as role r, metadata only (spec 120.3); '' leaves the mode"},
 	    {"session_audit_level",
 	     "acl_session_audit_level",
 	     {A("session"), P("level")},
@@ -1898,6 +1907,23 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
 	for (auto &statement : statements) {
 		auto &call = CompiledCall(*statement);
 		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
+		if (target == "acl_session_view_as") {
+			// spec 120.3: the policy bundle's (a point grant on platform.view_as does not reach it), and a view never
+			// shows more than the viewer may read: a role holding administration is viewed by passthrough only
+			if (!rights.Policy()) {
+				throw BinderException("acl admin: SET SESSION VIEW AS is the policy bundle's - a point grant does not "
+				                      "reach it");
+			}
+			auto role = ConstantArgument(call, 0, "view_as");
+			Principal viewed;
+			viewed.roles = {role};
+			if (!role.empty() && store.AdminRightsOf(viewed).Privileged()) {
+				throw BinderException("acl admin: \"%s\" holds administration - viewing it would show more than the "
+				                      "policy bundle reads (the platform's node and cluster views), so it requires a "
+				                      "passthrough scope",
+				                      role);
+			}
+		}
 		string issuer, client;
 		if (target == "acl_alter_issuer" || target == "acl_define_issuer") {
 			issuer = ConstantArgument(call, 0, "alter_issuer");

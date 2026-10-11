@@ -2387,5 +2387,15 @@ Value PolicyStore::CatalogSchemaState() {
 	return Value::STRUCT(std::move(children));
 }
 
+bool PolicyStore::RoleDefined(const string &role) {
+	if (!catalog || catalog->FunctionMode()) {
+		return true; // memory mode keeps no list of roles; a driver answers per call
+	}
+	auto rows = catalog->Query("SELECT 1 FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + acl_detail::Lit(role) +
+	                           " UNION ALL SELECT 1 FROM " + catalog->Tbl("role_catalogs") +
+	                           " WHERE \"role\" = " + acl_detail::Lit(role) + " LIMIT 1");
+	return rows->RowCount() > 0;
+}
+
 } // namespace acl
 } // namespace duckdb

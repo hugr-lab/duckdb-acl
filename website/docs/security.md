@@ -359,6 +359,15 @@ combined with a certificate. Both doors require cert **and** key together.
   policy catalog's own tables, under any reading of the name. A change to an issuer or a client behind
   a mapping to an administering role, a mapping to such a role, and a catalog's `manage` for a role a
   mapping reaches are `passthrough`'s.
+- **A view as another role sees no more than that role, and reads no rows** (spec 120): `SET SESSION VIEW AS
+  ROLE` is `policy`'s or `passthrough`'s, acts only on the session the statement runs under (the call takes no
+  session argument, so no session can be put into another role's view by someone else), rewrites the
+  session's statements as that role, and refuses every path that returns rows or changes anything - a read of
+  an object, a table function, a virtual scalar, `SUMMARIZE`, DML, DDL, management, `ACL NATIVE`, secrets.
+  `DESCRIBE` binds what it describes and runs nothing. A role holding administration is viewed by passthrough only,
+  the viewer's right is judged on every statement, a function of an attached catalog (whose body may read) is
+  refused, and a statement the session prepared outside the mode does not run inside it. The administrator is what
+  the audit records.
 - **One authorizer.** The grammar and a direct `platform.<op>(…)` compile to the same `acl_*` call and
   are judged by the same table of rights per operation (CATALOG / POLICY / HANDS_OUT / ESCALATES /
   INFRASTRUCTURE), before anything runs; an operation the table does not know is refused.
