@@ -317,6 +317,7 @@ ESCALATES and INFRASTRUCTURE.
 | `session_profile` | session\*, level | OPERATE |
 | `session_audit_level` | session\*, level (`''` inherits) | OPERATE |
 | `kill_session` | session\* | OPERATE |
+| `view_as` | role (`''` leaves) - this session only, metadata only (spec 120) | POLICY |
 | `drain` / `resume` | - | OPERATE |
 | `migrate_catalog` | database\*, schema\* | ESCALATES |
 | `comment_role` | role\*, comment | POLICY |

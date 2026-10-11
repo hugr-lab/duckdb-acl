@@ -670,6 +670,27 @@ void PolicyStore::SessionUseOf(const string &id, string &vcat, string &schema) {
 	}
 }
 
+bool PolicyStore::SessionViewAs(const string &id, const string &role) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			entry.second.view_as = role;
+			return true;
+		}
+	}
+	return false;
+}
+
+string PolicyStore::SessionViewAsOf(const string &id) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			return entry.second.view_as;
+		}
+	}
+	return string();
+}
+
 string PolicyStore::SessionDoorOf(const string &id) {
 	lock_guard<mutex> guard(lock);
 	for (auto &entry : sessions) {

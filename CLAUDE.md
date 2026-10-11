@@ -725,7 +725,7 @@ raise, a RESET's default passes) wraps each substituted surface: a constant `LIM
 `least(session, node)` judged where it runs, above it `error()` - refused, never cut (duckdb segfaulted on a
 LIMIT with a subquery). A narrowed listing is parsed outside the template cache. Bench: `test/bench/metadata_scale.py`.
 
-**Spec 120 — maintenance** (in stages; 120.1, 120.2 built): the missing forms - `ALTER ROLE r SET COMMENT` (`acl_comment_role`;
+**Spec 120 — maintenance** (in stages; 120.1, 120.2, 120.3 built): the missing forms - `ALTER ROLE r SET COMMENT` (`acl_comment_role`;
 a re-define keeps the comment), `REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r` (`acl_revoke_object`, HANDS_OUT),
 `ALTER VIRTUAL REFERENCE c.n SET COMMENT|CARDINALITY|OPTIONAL` + `COMMENT ON VIRTUAL REFERENCE` (`acl_alter_reference`),
 `ALTER RESOURCE GROUP g SET (limits) | SET COMMENT` (`acl_alter_resource_group` fields `limits` / `comment`, only the
@@ -738,7 +738,18 @@ caps, MAIN (= unique_main), RLS / writable / refusal from `ResolveTable(Principa
 role's own `columns` listing, masks as its grants state them; `platform.exposures(source[, schema[, object]])`
 (POLICY) - relations, live aliases, and every stored body that NAMES it (view, template, computed column, a
 relation's or a grant's RLS / mask - parsed, never bound, `BodyTables`; `t` / `x.t` completed by the default
-database / schema), per role of the catalog. Next: 120.3 view-as, 120.5 created_by (export after the release).
+database / schema), per role of the catalog. **120.3** - view-as: `SET SESSION VIEW AS ROLE 'r'` / `RESET SESSION VIEW AS` (or `platform.view_as(r)`, POLICY)
+compile to `acl_session_view_as(role)`, which acts on the session the statement runs under (its AclConnection -
+no session argument, so never another's) and keeps the role on the session record (`Session::view_as`, never the
+Principal contract); the override (`ViewAsOf`) then rewrites the session's queries as `ACL ROLE "r"` would
+(`VerifyPrincipal`), refuses management (but the view-as calls), secrets and NATIVE, and audits the real principal
+(`detail = view_as`); the rewriter's `metadata_only` refuses every statement but SELECT / PRAGMA / SET /
+transaction / CALL and, outside a DESCRIBE, every object read, table function (but the metadata surfaces) and
+virtual scalar, plus SUMMARIZE; a function outside `system` (GateFunction), USE, temps. Below passthrough a role holding
+administration may not be viewed (AuthorizeRoleTargets), and `ViewAsOf` re-judges every batch (a lost right ends
+the mode); the decision is passed to `RewriteStatements(…, metadata_only)`. Flight reservations carry the mode
+(owner suffix, `FlightDoorState::Owns`). Tests `test/cpp/test_acl_view_as.cpp`, `test/e2e/flight/admin.sh`. Next: 120.5
+created_by (export after the release).
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant

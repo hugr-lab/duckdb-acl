@@ -527,7 +527,17 @@ bool IsMgmtStart(const string &text) {
 			return false;
 		}
 		ahead.Skip();
-		return ahead.pos < ahead.text.size() && ahead.text[ahead.pos] == '\'';
+		if (ahead.pos < ahead.text.size() && ahead.text[ahead.pos] == '\'') {
+			return true;
+		}
+		// SET SESSION VIEW AS ROLE ... (spec 120.3): no setting is written `view as`
+		return ahead.Accept("view") && ahead.Accept("as");
+	}
+	if (StringUtil::CIEquals(first, "reset")) {
+		// RESET SESSION VIEW AS (spec 120.3) - duckdb's RESET SESSION <setting> names one word
+		AdminScanner ahead(text);
+		ahead.Word("keyword");
+		return ahead.Accept("session") && ahead.Accept("view") && ahead.Accept("as");
 	}
 	if (StringUtil::CIEquals(first, "comment") || StringUtil::CIEquals(first, "analyze")) {
 		// duckdb owns COMMENT ON <object> and ANALYZE: ours always name a VIRTUAL target
@@ -1469,11 +1479,24 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 	if (StringUtil::CIEquals(keyword, "set")) {
 		// SET SESSION '<id>' AUDIT LEVEL off | denied | decisions | all | DEFAULT (spec 118 over spec 069)
 		s.Expect("session");
+		if (s.Accept("view")) {
+			// SET SESSION VIEW AS ROLE '<r>' (spec 120.3): this session, as role r, metadata only
+			s.Expect("as");
+			s.Expect("role");
+			return MakeAdminCall("acl_session_view_as", {Value(s.NameValue("a role"))});
+		}
 		auto id = s.Quoted("a session id");
 		s.Expect("audit");
 		s.Expect("level");
 		auto word = StringUtil::Lower(s.Word("an audit level (OFF, DENIED, DECISIONS, ALL, DEFAULT)"));
 		return MakeAdminCall("acl_session_audit_level", {Value(id), Value(word == "default" ? string() : word)});
+	}
+	if (StringUtil::CIEquals(keyword, "reset")) {
+		// RESET SESSION VIEW AS (spec 120.3): back to the session's own principal
+		s.Expect("session");
+		s.Expect("view");
+		s.Expect("as");
+		return MakeAdminCall("acl_session_view_as", {Value(string())});
 	}
 	if (StringUtil::CIEquals(keyword, "drain") || StringUtil::CIEquals(keyword, "resume")) {
 		// DRAIN NODE / RESUME NODE (spec 118 over spec 066): this node

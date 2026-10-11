@@ -1,6 +1,6 @@
 # Spec 120: maintenance - the missing forms, effective rights, exposures, view-as, export, created_by
 
-- **Status**: accepted, **120.1, 120.2 implemented** (see *As built*) (by the owner 2026-10-11: the order 120.1 → 120.5; export after the release; view-as for
+- **Status**: accepted, **120.1, 120.2, 120.3 implemented** (see *As built*) (by the owner 2026-10-11: the order 120.1 → 120.5; export after the release; view-as for
   policy / passthrough first; created_by as written)
 - **Date**: 2026-10-11
 - **Author**: Claude (design/079 with the owner)
@@ -150,3 +150,45 @@ the role's own, every data path refused; export round trip; created_by written a
   0.22 s at this scale). No cache: a parse cache would need the policy version for its invalidation, for 0.2 s on
   an operator's call; the listing's own cost is the per-node metadata cache after the release.
 - Tests: `test/sql/platform_effective_rights.test`; bench `test/bench/rights_scale.py`.
+
+### 120.3 (2026-10-11)
+- Grammar `SET SESSION VIEW AS ROLE '<r>'` / `RESET SESSION VIEW AS` (and `platform.view_as(role)`, POLICY) compile to
+  `acl_session_view_as(role)` (`''` leaves). The call takes NO session argument: it acts on the session its statement
+  runs under (the AclConnection the override publishes, spec 078) - a session id argument would let a policy holder
+  put somebody else's session into a stronger role's view. Under a per-statement prefix there is none, refused.
+- The role is kept on the session record (`Session::view_as`), not on the Principal contract. The override reads it
+  (`ViewAsOf`): management other than the view-as calls, secrets and `ACL NATIVE` are refused (`a view-as session
+  reads metadata only`); a query batch is rewritten for `VerifyPrincipal(role)` - what `ACL ROLE "r"` gets, claims
+  included - with the session kept, and the audit keeps the session's principal (`detail = view_as`). RESET is
+  judged as the session's own principal, so the mode is always left the way it was entered.
+- The rewriter's `metadata_only` (from the same record): statements other than SELECT / PRAGMA / SET / transaction /
+  CALL refused; outside a DESCRIBE (`describing`) every object read, every table function but the metadata surfaces
+  (`duckdb_*`, `acl_keys`, `acl_function_columns`, `acl_references`) and every virtual scalar call refused, and
+  SUMMARIZE. The metadata surfaces, the platform views and the Flight catalog RPCs answer as the role.
+- A view never shows more than the viewer may read: below passthrough, a role holding administration
+  (`AdminRights::Privileged()` - a bundle, a catalog's manage, a point grant) is refused at SET (`AuthorizeRoleTargets`) -
+  else a policy holder would read the node / cluster views through an operate or passthrough role's view; a point
+  grant on `platform.view_as` does not reach the mode (the policy bundle's only). Judged again on EVERY batch
+  (`ViewAsOf`): a viewer that lost the policy bundle, or a viewed role that came to hold administration, ends the
+  mode, so a revocation never leaves a session reading as the role.
+- The one decision is the override's and is handed to the rewriter (`RewriteStatements(…, metadata_only)`), never
+  read a second time. In the mode: the viewer's USE does not apply and `USE` is refused (the record is the viewer's);
+  the session's temp tables are the viewer's and are not listed nor resolved; a function of an attached catalog
+  (a physical macro, a service's function - the gate's key outside `system`) is refused, a system function runs;
+  the INGEST prefix and the quack drain are refused. Flight: a reservation carries the mode it was made in (the
+  owner's `\x1c` suffix, `FlightDoorState::Owns`) - a statement prepared with the session's own rights does not run
+  inside the view, nor one prepared in the view after RESET; a result kept at GetFlightInfo (the SET itself) is
+  answered whatever the mode is now.
+- Review (three passes) found: a policy holder read `platform.sessions` / `audit_events` / the cluster views by
+  viewing a passthrough role; a point grant reached the mode; a revoked viewer stayed in it; a virtual table function
+  named `acl_references` / `acl_keys` returned rows (the exemption was by the written name - now a virtual hit is
+  refused whatever its name); a physical scalar macro granted to the role read rows; the viewer's USE and temps
+  carried into the view; a Flight statement prepared before the mode ran inside it. Each is a test.
+- Not here (minimal first, owner): a catalog admin's view; the mode in `acl_sessions()` / `platform.sessions`; the
+  viewed role in the audit event (its detail is `view_as`); a token's claims (the view is the role's, as
+  `ACL ROLE` - one role, its default claims). An open stream started before the SET keeps streaming; quack's
+  client-side prepared statements were not probed.
+- Tests: `test/cpp/test_acl_view_as.cpp` (listings as the role, each refused path, another session untouched,
+  RESET / platform.view_as, who may, a privileged role, a point grant, a revocation mid-view),
+  `test/e2e/flight/admin.sh` + `view_as_client.py` (GetCatalogs / GetTables as the role, a read refused, a statement
+  prepared before the mode refused inside it).

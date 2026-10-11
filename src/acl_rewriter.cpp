@@ -164,8 +164,8 @@ QualifiedName ParsePhysName(const string &phys) {
 //! Rewrites a parsed statement tree for one principal: virtual names -> safe subqueries, claims baked.
 class AclRewriter {
 public:
-	AclRewriter(const Principal &principal, const ParserOptions &options, PolicyStore &store)
-	    : principal(principal), store(store) {
+	AclRewriter(const Principal &principal, const ParserOptions &options, PolicyStore &store, bool metadata_only_p)
+	    : principal(principal), store(store), metadata_only(metadata_only_p) {
 		// re-parse rewrite templates with the native parser, never re-entering this override
 		template_options = options;
 		template_options.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
@@ -173,7 +173,10 @@ public:
 		// runs under the session too (only setting a USE needs the client's own connection)
 		if (!principal.session.empty()) {
 			session_id = principal.session; // the ops id
-			store.SessionUseOf(session_id, use_catalog, use_schema);
+			if (!metadata_only) {
+				// spec 120.3: the viewer's USE is not the viewed role's - a view starts at the role's MAIN catalog
+				store.SessionUseOf(session_id, use_catalog, use_schema);
+			}
 		}
 	}
 
@@ -186,6 +189,18 @@ public:
 	}
 
 	void RewriteStatement(SQLStatement &stmt) {
+		if (metadata_only) {
+			switch (stmt.type) {
+			case StatementType::SELECT_STATEMENT: // a listing, a DESCRIBE, SHOW - the reads are judged per ref
+			case StatementType::PRAGMA_STATEMENT: // SHOW TABLES' PRAGMA forms: answered by the listings
+			case StatementType::SET_STATEMENT:    // USE, and the render settings (spec 068)
+			case StatementType::TRANSACTION_STATEMENT:
+			case StatementType::CALL_STATEMENT: // platform read functions only
+				break;
+			default:
+				MetadataOnly("the statement " + StatementTypeToString(stmt.type));
+			}
+		}
 		switch (stmt.type) {
 		case StatementType::SELECT_STATEMENT:
 			RewriteQueryNode(*stmt.Cast<SelectStatement>().node);
@@ -508,6 +523,9 @@ private:
 	//! The `temp` capability: explicit on the principal's MAIN catalog grant, never inherited from
 	//! unstated caps (spec 012's rule holds by construction - the default set does not carry it).
 	bool TempAllowed() {
+		if (metadata_only) {
+			return false; // spec 120.3: the session's temps are the viewer's, never the viewed role's
+		}
 		if (temp_cap_state < 0) {
 			temp_cap_state = store.PrincipalMainCap(principal, "temp") ? 1 : 0;
 		}
@@ -912,6 +930,9 @@ private:
 	//! of the client's own, only what the principal holds; it grants nothing. Recorded by the follow-up
 	//! `acl_session_use(<ops id>, ...)` - at execution, never at parse - by the session's non-secret id.
 	void RewriteUse(SetStatement &stmt) {
+		if (metadata_only) {
+			MetadataOnly("USE"); // the session's USE is the viewer's own record
+		}
 		auto use_schema_form = StringUtil::CIEquals(stmt.name.GetIdentifierName(), "acl_use_schema");
 		if (!use_schema_form && stmt.set_type == SetType::SET) {
 			auto &written = stmt.Cast<SetVariableStatement>();
@@ -1743,6 +1764,9 @@ private:
 				ref = BuildMetadataSubquery(surface, alias, std::move(base.column_name_alias));
 				return;
 			}
+			if (metadata_only && describing == 0) {
+				MetadataOnly("a read of " + Shown(key)); // DESCRIBE describes it; a read reads its rows
+			}
 			TablePolicy policy;
 			if (!store.ResolveTable(principal, key, policy)) {
 				// not virtual - the session's own temp table still answers (spec 050). Virtual wins
@@ -1875,6 +1899,10 @@ private:
 		TablePolicy policy;
 		string resolved_name;
 		if (ResolveVirtualFunction(function.GetQualifiedName(), true, policy, resolved_name)) {
+			if (metadata_only && describing == 0) {
+				MetadataOnly("the table function " + resolved_name); // a virtual function returns rows, whatever
+				                                                     // it is named
+			}
 			vname = resolved_name; // the name the call resolved by: the audit's and the messages'; the alias
 			                       // stays the written leaf
 			// a call returns rows, so it is a read like any relation (spec 012). The check comes
@@ -1922,6 +1950,9 @@ private:
 			// the function gate, exactly as the metadata surfaces are - so it needs no hole in the gate.
 			ref = BuildReferencesSubquery(function, tf.alias.empty() ? Identifier(vname) : tf.alias);
 			return;
+		}
+		if (metadata_only && describing == 0) {
+			MetadataOnly("the table function " + vname); // past the metadata surfaces, a function returns rows
 		}
 		// A principal may drain the stream its own connection is filling, and no other (spec 042). The
 		// function stays denied by the gate - this is not a hole in it but a statement the server
@@ -2020,6 +2051,19 @@ private:
 	//! sends anything else, so refusing them left every ordinary tool talking to a wall.
 	void RewriteShowRef(unique_ptr<TableRef> &ref) {
 		auto &show = ref->Cast<ShowRef>();
+		if (metadata_only && show.show_type == ShowType::SUMMARY) {
+			MetadataOnly("SUMMARIZE"); // it reads every row
+		}
+		// spec 120.3: what DESCRIBE binds is described, never read - the one place a view-as session names an object
+		struct Describing {
+			idx_t &depth;
+			explicit Describing(idx_t &depth_p) : depth(depth_p) {
+				depth++;
+			}
+			~Describing() {
+				depth--;
+			}
+		} describing_scope(describing);
 		if (show.query) {
 			// DESCRIBE (SELECT …) - the query is the principal's, and it is rewritten like any other
 			RewriteQueryNode(*show.query);
@@ -3688,6 +3732,9 @@ private:
 			TablePolicy spolicy;
 			string resolved_name;
 			if (ResolveVirtualFunction(function.GetQualifiedName(), false, spolicy, resolved_name)) {
+				if (metadata_only && describing == 0) {
+					MetadataOnly("a call of " + resolved_name); // its template may read a table
+				}
 				// its template is admin-authored SQL that may read a physical table, so calling it is
 				// a read too: the same capability gates it (spec 012)
 				Note(resolved_name, "select");
@@ -3760,6 +3807,10 @@ private:
 		}
 		if (decision.verdict != FunctionVerdict::ADMITTED) {
 			Deny(Reason::FUNCTION_DENIED, decision.Why(shown));
+		}
+		if (metadata_only && describing == 0 && !StringUtil::CIEquals(decision.key.database, "system")) {
+			// spec 120.3: a function of an attached catalog is a macro or a service's - its body may read rows
+			MetadataOnly("the " + shown);
 		}
 		qualified = QualifiedName(Identifier(decision.key.database), Identifier(decision.key.schema),
 		                          Identifier(decision.key.name));
@@ -3963,6 +4014,16 @@ private:
 	const Principal &principal;
 	//! spec 114: the session's USE (empty = the role's MAIN catalog / the catalog's root), its ops id
 	string use_catalog;
+
+	//! spec 120.3: the session is viewed as a role - listings answer, any read of rows / write / DDL is refused
+	bool metadata_only = false;
+	//! inside a DESCRIBE: the query is bound and described, never run
+	idx_t describing = 0;
+
+	[[noreturn]] void MetadataOnly(const string &what) {
+		Deny(Reason::STATEMENT_TYPE,
+		     "a view-as session reads metadata only - " + what + " is refused (RESET SESSION VIEW AS leaves it)");
+	}
 	string use_schema;
 	string session_id;
 	vector<string> held_catalogs;
@@ -4144,8 +4205,8 @@ string BakeTemplateForProbe(const string &sql, const ParserOptions &options, boo
 }
 
 void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Principal &principal,
-                       const ParserOptions &options, PolicyStore &store, AuditTrail *trail) {
-	AclRewriter rewriter(principal, options, store);
+                       const ParserOptions &options, PolicyStore &store, AuditTrail *trail, bool metadata_only) {
+	AclRewriter rewriter(principal, options, store, metadata_only);
 	vector<unique_ptr<SQLStatement>> rewritten;
 	for (auto &stmt : statements) {
 		rewriter.follow_ups.clear();

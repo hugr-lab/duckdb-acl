@@ -1042,6 +1042,44 @@ Functions: `acl_session_kill(id)`, `acl_session_audit_level(id, level)`, `acl_dr
 `acl_migrate_catalog(database[, schema])` - or `platform.kill_session`, `session_audit_level`, `drain`,
 `resume`, `migrate_catalog`.
 
+## Viewing the catalog as a role
+
+```
+SET SESSION VIEW AS ROLE '<role>'
+RESET SESSION VIEW AS
+```
+
+On a session of its own (a door's `ACL SESSION` - the Flight or quack connection a console keeps), an
+administrator holding `policy` (or `passthrough`) sees the catalog as `<role>` sees it (spec 120): from then on
+every statement of that session is rewritten as `ACL ROLE "<role>"` would be - `information_schema`, the
+`duckdb_*` listings, `SHOW TABLES`, `DESCRIBE`, the Flight catalog RPCs and the `platform` listings answer what
+the role sees - and **metadata only**: a read of an object's rows, a table function, a virtual scalar (its
+template may read), `SUMMARIZE`, a write, DDL, management, `ACL NATIVE` and the secrets statements are refused
+(`a view-as session reads metadata only`). `RESET SESSION VIEW AS` (judged as the session's own principal)
+leaves the mode. A view never shows more than the viewer may read: a role that holds administration (a bundle,
+a catalog's `manage`, a point grant) is viewed by `passthrough` only, and the right is judged again on every
+statement - a viewer that loses `policy` is out of the mode at once. Inside it, `USE` is refused (and the
+viewer's own `USE` and temp tables do not apply), functions of attached catalogs are refused (system functions
+run), and a Flight statement prepared before the mode does not run inside it. The mode is the session's:
+another session of the same administrator is untouched, a
+per-statement prefix (`ACL ROLE …`, a gateway's shared connection) has no session to set it on, and the call
+acts on the session the statement runs under - never one named by an argument. A catalog admin may not take
+a view (the role's tree spans catalogs it does not administer). The audit keeps who looked (the session's
+principal), with the detail `view_as`.
+
+```sql
+ACL SESSION 'h…' SET SESSION VIEW AS ROLE 'analyst';
+ACL SESSION 'h…' SELECT table_schema, table_name FROM information_schema.tables;
+ACL SESSION 'h…' RESET SESSION VIEW AS;
+```
+
+A console that checks how a role sees the catalog (a DBeaver data source, for one) sets the mode on every
+connection it opens - DBeaver reads metadata over a connection of its own by default, so the statement goes into
+the connection's bootstrap queries - and keeps the door's session (the Flight cookie). A data preview is refused
+in the mode.
+
+Function: `acl_session_view_as(role)` (`''` leaves) - or `platform.view_as(role)`.
+
 ## Comments
 
 ```

@@ -1,0 +1,37 @@
+duckdb agent mode on: AI_AGENT is set and stdout is not a terminal; -no-agent turns it off, .help agent explains the output
+| acl_use_db('store', 'acl', true):BOOLEAN |
+|---|
+| true |
+| acl_define_issuer('test/idp/s', '{"url": "test/idp/s", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}'):BOOLEAN |
+|---|
+| true |
+| create_catalog:BOOLEAN |
+|---|
+| true |
+| add_relation:BOOLEAN |
+|---|
+| true |
+| create_role:BOOLEAN |
+|---|
+| true |
+| grant_catalog:BOOLEAN |
+|---|
+| true |
+| create_role:BOOLEAN |
+|---|
+| true |
+| grant_admin:BOOLEAN |
+|---|
+| true |
+| grant_catalog:BOOLEAN |
+|---|
+| true |
+| map_role:BOOLEAN |
+|---|
+| true |
+| acl_flight_serve('grpc://localhost:32791'):VARCHAR |
+|---|
+| grpc://localhost:32791 |
+| acl_flight_stop('grpc://localhost:32791'):VARCHAR |
+|---|
+| grpc://localhost:32791 (0 session(s) closed) |

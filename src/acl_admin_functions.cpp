@@ -1,6 +1,7 @@
 #include "acl_admin_functions.hpp"
 #include "acl_platform.hpp"
 #include "acl_door_common.hpp"
+#include "acl_connection.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -2085,6 +2086,30 @@ void AclSessionUseFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	}
 }
 
+//! acl_session_view_as(role) (spec 120.3): the session the statement runs under (its AclConnection - the caller's
+//! own, never one named by an argument) is from now on rewritten as `role`, metadata only; '' leaves the mode.
+//! Compiled from `SET SESSION VIEW AS ROLE` / `RESET SESSION VIEW AS`, judged by the authorizer (POLICY)
+void AclSessionViewAsFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AclSessionView current;
+	string why;
+	auto connection = AclConnection::Reach(state.GetContext(), why);
+	if (!connection || !connection->Current(current) || current.session_id.empty()) {
+		throw InvalidInputException("acl_session_view_as: a view-as mode is a session's - run it under the "
+		                            "session of the client's own (a door's ACL SESSION)");
+	}
+	auto &store = StoreOf(state);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto role = OptionalArg(args, 0, row, "");
+		if (!role.empty() && !store.RoleDefined(role)) {
+			throw InvalidInputException("acl_session_view_as: role \"%s\" does not exist", role);
+		}
+		if (!store.SessionViewAs(current.session_id, role)) {
+			throw InvalidInputException("acl_session_view_as: the session is gone");
+		}
+		result.SetValue(row, Value::BOOLEAN(true));
+	}
+}
+
 //! acl_session_close(handle): end it. Idempotent, so a door may retry a disconnect.
 void AclSessionCloseFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -2298,6 +2323,11 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 	register_session_bigint("acl_drain", AclDrainFunc);
 	register_admin("acl_resume", {}, AclResumeFunc);
 	register_session_text("acl_drain_status", {}, AclDrainStatusFunc);
+	{
+		ScalarFunction view_as(Identifier("acl_session_view_as"), {v}, LogicalType::BOOLEAN, AclSessionViewAsFunc);
+		MarkAclScalar(view_as, store);
+		loader.RegisterFunction(view_as);
+	}
 	{
 		ScalarFunction use(Identifier("acl_session_use"), {v, v, v}, LogicalType::BOOLEAN, AclSessionUseFunc);
 		MarkAclScalar(use, store);

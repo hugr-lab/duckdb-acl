@@ -152,6 +152,26 @@ echo "$got" | grep -q 'no access to object' || fail "the policy bundle read a no
 got="$(ask "SELECT platform.create_role(r) FROM (VALUES ('per_row')) t(r)")"
 echo "$got" | grep -q "call it at the top level" || fail "a per-row call was not refused: $got"
 
+# --- spec 120.3: view-as on the door's own session - the catalog RPCs and listings as analyst, no rows ---
+export ACL_COOKIE_JAR="$TMP/view_as.jar"
+ask "SELECT 1" >/dev/null # the first call sets the session's cookie; the jar returns it from then on
+got="$(ask "SET SESSION VIEW AS ROLE 'analyst'")"
+echo "$got" | grep -qi "error" && fail "SET SESSION VIEW AS ROLE over Flight: $got"
+got="$(ask "@catalogs")"
+[ "$got" = "{'catalog_name': ['c']}" ] || fail "GetCatalogs in view-as is not analyst's: $got"
+got="$(ask "@tables:orders")"
+echo "$got" | grep -q "'catalog_name': \['c'\]" || fail "GetTables in view-as: $got"
+got="$(ask "SELECT id FROM c.orders")"
+echo "$got" | grep -q "a view-as session reads metadata only" || fail "a read in view-as: $got"
+got="$(ask "RESET SESSION VIEW AS")"
+echo "$got" | grep -qi "error" && fail "RESET SESSION VIEW AS over Flight: $got"
+got="$(ask "@catalogs")"
+[ "$got" = "{'catalog_name': ['platform']}" ] || fail "GetCatalogs after RESET SESSION VIEW AS: $got"
+unset ACL_COOKIE_JAR
+# a statement prepared before the mode is the session's own rights - it does not run inside it
+got="$(python3 "$HERE/view_as_client.py" "$URI" "$BOSS" "SELECT count(*) AS n FROM platform.roles" 2>&1 || true)"
+[ "$got" = "refused" ] || fail "a statement prepared before view-as ran inside it: $got"
+
 # --- spec 118: the operate bundle drains and resumes the node, and administers no policy ---------------
 got="$(ask "DRAIN NODE" "$OPS")"
 echo "$got" | grep -q "\[[0-9]*\]" || fail "DRAIN NODE under operate: $got"
@@ -172,4 +192,4 @@ got="$(ask "DRAIN NODE")"
 echo "$got" | grep -q "requires the operate bundle" || fail "the policy bundle drained the node: $got"
 
 echo "SELECT acl_flight_stop('$URI');" >&3
-echo "PASS: an administrator read the platform catalog through the Flight door and changed the policy with a call and with the bare grammar, ad hoc and prepared, fetched or not; a non-admin saw no platform; an operate token drained and resumed the node"
+echo "PASS: an administrator read the platform catalog through the Flight door and changed the policy with a call and with the bare grammar, ad hoc and prepared, fetched or not; a non-admin saw no platform; view-as showed analyst's tree and no rows; an operate token drained and resumed the node"

@@ -276,6 +276,12 @@ bool ParseAttachLineage(const string &text, ParserOptions &options, vector<uniqu
 	return true;
 }
 
+//! spec 120.3: the one refusal of a view-as session outside the rewriter
+[[noreturn]] void RefuseInViewAs() {
+	NoteDenyReason(Reason::STATEMENT_TYPE);
+	throw BinderException("acl: a view-as session reads metadata only - RESET SESSION VIEW AS leaves it");
+}
+
 //! The principal a prefix stands for. A role is itself, a token is verified here, and a session is a
 //! handle a door already exchanged a token for (spec 040) - so this is the one place that turns any
 //! of the three into a principal, and the one place that refuses.
@@ -603,6 +609,9 @@ ParserOverrideResult DrainStreamUnderPrincipal(PolicyStore &store, const string 
 		throw BinderException("%s (its session is %s)", REFUSED, reason.empty() ? "not usable" : reason.c_str());
 	}
 	principal.session = audit.proto.session;
+	if (!store.SessionViewAsOf(principal.session).empty()) {
+		RefuseInViewAs(); // spec 120.3: a drain is a write
+	}
 	// the one exemption this path carries, and it is bound to this exact stream: the principal may
 	// read the source the server is filling for it, and no other
 	principal.ingest_stream = stream_id;
@@ -652,6 +661,50 @@ void NoteManagement(vector<unique_ptr<SQLStatement>> &statements, StatementAudit
 	}
 }
 
+//! spec 120.3: the role the session is viewed as (empty: not in view-as mode, or not a session of the client's own).
+//! Judged again on every batch: a viewer that no longer holds the policy bundle - or a viewed role that came to
+//! hold administration, for a viewer below passthrough - ends the mode, never keeps it
+string ViewAsOf(PolicyStore &store, const AclPrefix &prefix) {
+	if (prefix.kind != AclPrefix::Kind::SESSION && prefix.kind != AclPrefix::Kind::INGEST) {
+		return string();
+	}
+	PolicyStore::SessionRef ref;
+	if (!store.SessionRefOf(prefix.value, ref)) {
+		return string();
+	}
+	auto role = store.SessionViewAsOf(ref.id);
+	if (role.empty()) {
+		return role;
+	}
+	Principal viewer;
+	string reason;
+	if (!store.SessionPrincipal(prefix.value, viewer, reason)) {
+		return string(); // the session's own refusal follows where the principal is resolved
+	}
+	auto rights = store.AdminRightsOf(viewer);
+	bool keeps = rights.Policy();
+	if (keeps && !rights.passthrough) {
+		Principal viewed;
+		viewed.roles = {role};
+		keeps = !store.AdminRightsOf(viewed).Privileged();
+	}
+	if (!keeps) {
+		store.SessionViewAs(ref.id, string());
+		return string();
+	}
+	return role;
+}
+
+//! Every statement is the view-as mode's own (SET / RESET SESSION VIEW AS, platform.view_as)
+bool OnlyViewAsCalls(vector<unique_ptr<SQLStatement>> &statements) {
+	for (auto &statement : statements) {
+		if (!statement || MgmtCallName(*statement) != "acl_session_view_as") {
+			return false;
+		}
+	}
+	return !statements.empty();
+}
+
 //! One prefixed batch, decided. Every refusal throws; the caller turns the outcome into the audit's
 //! events, so this only has to say what it is doing (`audit.phase`) and whom it is doing it for.
 ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, ParserOptions &options,
@@ -686,6 +739,12 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	// spec 082: GRANT / REVOKE SECRET manage the node's secrets service, not the ACL - judged by the
 	// explicit `secrets` capability below, never by an administration scope
 	bool secrets = mode == AclPrefix::Mode::MANAGE && IsSecretsStart(prefix.rest);
+	// spec 120.3: a session viewed as a role reads that role's metadata; management (but leaving the mode),
+	// secrets and native SQL are refused - judged on the session's own principal, never the viewed role
+	auto viewing = ViewAsOf(store, prefix);
+	if (!viewing.empty() && (secrets || mode == AclPrefix::Mode::NATIVE || prefix.kind == AclPrefix::Kind::INGEST)) {
+		RefuseInViewAs();
+	}
 
 	Principal principal;
 	PolicyStore::AdminRights rights;
@@ -747,6 +806,9 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		// the management grammar (spec 008): compiled to admin-function calls, no native parse
 		audit.phase = Reason::PARSE;
 		auto statements = ParseMgmtBatch(prefix.rest, audit.proto.session); // CURRENT is this session
+		if (!viewing.empty() && !OnlyViewAsCalls(statements)) {
+			RefuseInViewAs();
+		}
 		NoteManagement(statements, audit);
 		audit.phase = Reason::MGMT_UNAUTHORIZED;
 		AuthorizeMgmt(statements, rights);
@@ -823,6 +885,11 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 				throw BinderException("acl admin: a batch mixing management statements and queries is refused - "
 				                      "send each kind in a batch of its own");
 			}
+			if (!viewing.empty() && !OnlyViewAsCalls(compiled)) {
+				audit.proto.kind = "admin";
+				audit.refused_statement = "manage";
+				RefuseInViewAs();
+			}
 			audit.proto.kind = "admin";
 			audit.refused_statement = "manage";
 			audit.phase = Reason::PRINCIPAL;
@@ -867,6 +934,18 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	audit.phase = Reason::PRINCIPAL;
 	ResolvePrincipal(store, prefix, principal);
 	audit.proto.principal = principal;
+	if (!viewing.empty()) {
+		// the statements are rewritten as the viewed role would have them - as `ACL ROLE "<r>"` - on this
+		// session's connection; the audit keeps who looked (the session's principal) and says as whom
+		Principal viewed;
+		if (!store.VerifyPrincipal(false, viewing, viewed)) {
+			RefuseInViewAs();
+		}
+		viewed.session = principal.session;
+		viewed.session_connection = principal.session_connection;
+		principal = std::move(viewed);
+		audit.proto.detail = "view_as";
+	}
 
 	if (prefix.kind == AclPrefix::Kind::SESSION && DrainsQuackClientStream(prefix.rest)) {
 		// Since quack f4328c5 the drain of a client's streamed insert is a statement the CLIENT
@@ -907,7 +986,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		lineage_jobs.push_back(CaptureLineageJob(store, *statement, principal, audit.proto.door, prefix.lineage));
 	}
 	audit.phase = Reason::POLICY_ERROR; // an unnoted failure under the rewrite is the policy's
-	RewriteStatements(statements, principal, options, store, &audit.trail);
+	RewriteStatements(statements, principal, options, store, &audit.trail, !viewing.empty());
 	for (idx_t i = 0; i < audit.trail.statements.size() && i < lineage_jobs.size(); i++) {
 		audit.trail.statements[i].lineage = lineage_jobs[i];
 		if (lineage_jobs[i]) {
