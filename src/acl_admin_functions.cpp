@@ -1201,10 +1201,21 @@ void AclAlterResourceGroupFunc(DataChunk &args, ExpressionState &state, Vector &
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto name = RequiredArg(args, 0, row, "acl_alter_resource_group", "group");
 		auto field = StringUtil::Lower(RequiredArg(args, 1, row, "acl_alter_resource_group", "property"));
-		auto value = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_resource_group", "value"));
+		auto written = OptionalArg(args, 2, row, "");
+		if (field == "limits") { // spec 120: only the limits named change
+			StoreOf(state).CatalogAlterResourceGroup(name, ParseResourceLimits(written, "acl_alter_resource_group"));
+			continue;
+		}
+		if (field == "comment") {
+			StoreOf(state).CatalogCommentResourceGroup(name, written);
+			continue;
+		}
+		auto value = StringUtil::Lower(written);
 		if (field != "default" || (value != "true" && value != "false")) {
-			throw BinderException("acl_alter_resource_group: the property is 'default', true or false - got %s = %s",
-			                      field, value);
+			throw BinderException(
+			    "acl_alter_resource_group: the property is default (true | false), limits or comment - "
+			    "got %s = %s",
+			    field, value);
 		}
 		StoreOf(state).CatalogSetDefaultResourceGroup(name, value == "true");
 	}
@@ -1327,6 +1338,41 @@ void AclAlterRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_alter_role", "role");
 		StoreOf(state).CatalogAlterRole(role, ParseClaims(OptionalArg(args, 1, row, "")));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_comment_role(role, comment) (spec 120): a role's comment - what the console shows of it
+void AclCommentRoleFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		StoreOf(state).CatalogCommentRole(RequiredArg(args, 0, row, "acl_comment_role", "role"),
+		                                  OptionalArg(args, 1, row, ""));
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_revoke_object(role, vcat, vname) (spec 120): one object's own grant - its caps, policy and columns; the
+//! catalog's (or a schema's) grant stays and decides again
+void AclRevokeObjectFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto &store = StoreOf(state);
+		auto role = RequiredArg(args, 0, row, "acl_revoke_object", "role");
+		auto vcat = store.SpellCatalog(CatalogArg(args, 1, row, "acl_revoke_object", "catalog"));
+		auto vname = store.SpellName(vcat, KeyArg(args, 2, row, "acl_revoke_object", "name"));
+		store.CatalogRevokeObject(role, vcat, vname);
+	}
+	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
+}
+
+//! acl_alter_reference(vcat, name, field, value) (spec 120): a reference's comment, cardinality or optional - the
+//! hints an agent reads; its ends and condition change only by a re-create
+void AclAlterReferenceFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto &store = StoreOf(state);
+		auto vcat = store.SpellCatalog(CatalogArg(args, 0, row, "acl_alter_reference", "catalog"));
+		auto name = store.SpellReference(vcat, KeyArg(args, 1, row, "acl_alter_reference", "name"));
+		store.CatalogAlterReference(vcat, name, RequiredArg(args, 2, row, "acl_alter_reference", "property"),
+		                            OptionalArg(args, 3, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -2254,6 +2300,9 @@ void RegisterAclAdminFunctions(ExtensionLoader &loader, shared_ptr<PolicyStore> 
 		loader.RegisterFunction(kill);
 	}
 	register_admin("acl_define_token", {v, v, v}, AclDefineTokenFunc);
+	register_admin("acl_comment_role", {v, v}, AclCommentRoleFunc);             // spec 120
+	register_admin("acl_revoke_object", {v, v, v}, AclRevokeObjectFunc);        // spec 120
+	register_admin("acl_alter_reference", {v, v, v, v}, AclAlterReferenceFunc); // spec 120
 	register_admin_set("acl_define_role", {{v, v}, {v, v, v}}, AclDefineRoleFunc);
 	// offline JWT verification (spec 007)
 	// issuers, clients and scoped role mappings (spec 095)

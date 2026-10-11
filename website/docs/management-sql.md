@@ -323,6 +323,10 @@ parameter, checked against the declared signature - and `ON` names columns of th
 either may stand alone. `CARDINALITY` and `JOIN` accept only the values listed. `OPTIONAL` says the
 far side may be absent. The trailing clauses come in any order.
 
+Its hints change in place (spec 120) - `ALTER VIRTUAL REFERENCE c.n SET COMMENT '…' | SET CARDINALITY <c> |
+SET OPTIONAL true | false`, `COMMENT ON VIRTUAL REFERENCE c.n IS '…'`; its ends and condition only by a re-create.
+A mapping (`MAP …`) has no ALTER: it is only its key, so `DROP MAP` + `MAP` is the change.
+
 ```sql
 ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM c.orders TO c.customers
     ON (customer_id = id) CARDINALITY many_to_one COMMENT 'the ordering customer';
@@ -342,12 +346,14 @@ with `to_kind` `relation` (default) or `function`, `args` the substitution text 
 ```
 CREATE [OR REPLACE] ROLE [IF NOT EXISTS] <role> [CLAIMS (<name> = '<value>', …) | CLAIMS '<name>=<value>,…']
 ALTER ROLE <role> SET CLAIMS (<name> = '<value>', …) | '<name>=<value>,…'
+ALTER ROLE <role> SET COMMENT '<text>'
 DROP ROLE [IF EXISTS] <role>
 ```
 
 A role is an internal name that grants attach to. Its claims are defaults: they are what
 `acl_claim('<name>')` answers under the bare `ACL ROLE "r"` form, and under a token they fill in only
-what the token's claim map did not supply (explicit token claims win). `ALTER` replaces the whole
+what the token's claim map did not supply (explicit token claims win). `SET COMMENT` (spec 120) is what a
+console shows of the role; a later `SET CLAIMS` keeps it. `ALTER … SET CLAIMS` replaces the whole
 list. Dropping a role takes its grants, object capabilities, admin scope and mappings with it.
 
 ```sql
@@ -460,7 +466,11 @@ GRANT CATALOG <catalog> TO ROLE <role>
 ALTER GRANT CATALOG <catalog> TO ROLE <role>
     SET CAPS '<json>' | SET RLS '<predicate>' | SET COLUMNS '<list>' | SET MAIN true | false
 REVOKE CATALOG <catalog> FROM ROLE <role>
+REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM ROLE <role>
 ```
+
+`REVOKE TABLE | VIEW | OBJECT` (spec 120) takes one object's own grant (`GRANT TABLE … CAPS …`) - its caps, policy
+and columns; the catalog's or a schema's grant then decides that object again. Policy-level, like every grant.
 
 The grant that makes a catalog resolve for a role. Clauses after the role come in any order.
 
@@ -653,6 +663,7 @@ schema[, function]]])` lists their parameters, result columns and a scalar's ret
 ```sql
 CREATE FUNCTION CATEGORY <name> [COMMENT '<text>']
 ALTER FUNCTION CATEGORY <name> ADD (<function> [, …]) | DROP (<function> [, …])
+ALTER FUNCTION CATEGORY <name> SET COMMENT '<text>'      -- the members stay (spec 120)
 DROP FUNCTION CATEGORY [IF EXISTS] <name>
 
 GRANT  FUNCTION CATEGORY <name> TO ROLE <role> | TO ALL ROLES
@@ -740,6 +751,8 @@ DROP [PERSISTENT] SECRET <name> [FROM <catalog>]
 ```sql
 CREATE [OR REPLACE] RESOURCE GROUP <group> [WITH] (<limit> <value>, …) [DEFAULT] [COMMENT '<text>']
 ALTER RESOURCE GROUP <group> SET DEFAULT | DROP DEFAULT
+ALTER RESOURCE GROUP <group> SET (<limit> <value>, …)   -- only the limits named change (spec 120)
+ALTER RESOURCE GROUP <group> SET COMMENT '<text>'
 DROP RESOURCE GROUP [IF EXISTS] <group>
 GRANT  RESOURCE GROUP <group> TO   ROLE <role>
 REVOKE RESOURCE GROUP <group> FROM ROLE <role>

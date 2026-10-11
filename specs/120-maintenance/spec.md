@@ -1,6 +1,6 @@
 # Spec 120: maintenance - the missing forms, effective rights, exposures, view-as, export, created_by
 
-- **Status**: accepted (by the owner 2026-10-11: the order 120.1 → 120.5; export after the release; view-as for
+- **Status**: accepted, **120.1 implemented** (see *As built*) (by the owner 2026-10-11: the order 120.1 → 120.5; export after the release; view-as for
   policy / passthrough first; created_by as written)
 - **Date**: 2026-10-11
 - **Author**: Claude (design/079 with the owner)
@@ -28,7 +28,6 @@ finding 118.3 deferred. In stages, a PR each; nothing changes what already works
 | Form | Over |
 | --- | --- |
 | `ALTER FUNCTION CATEGORY c SET COMMENT '…'` | `acl_create_function_category(c, comment)` (re-create updates only the comment) |
-| `ALTER MAP CLAIM …` | `acl_drop_role_mapping` + `acl_map_role` (a mapping is only its key) - one batch, one transaction |
 | `ALTER RESOURCE GROUP g SET (limits …)` | `acl_alter_resource_group(g, 'limits', json)` - a new field; the comment kept |
 | `ALTER ROLE r SET COMMENT '…'` | `acl_alter_role` gains `comment` (the `roles.comment` column exists, written '' today) |
 | `REVOKE TABLE | VIEW | OBJECT c.n FROM ROLE r` | new `acl_revoke_object(role, vcat, vname)` - deletes `role_object_caps` + its `grant_columns`, like `CatalogRevoke` |
@@ -90,3 +89,20 @@ the role's own, every data path refused; export round trip; created_by written a
 - view-as as navigation functions (`view_as(role, path)`) - a second tree beside the real one (owner chose the
   session mode).
 - Ownership instead of created_by - rejected (design/079: no owner, no self-grant path).
+
+## As built
+
+### 120.1 (2026-10-11)
+- Grammar + writers: `ALTER ROLE r SET COMMENT` → `acl_comment_role` (`CatalogCommentRole`; `CatalogDefineRole` keeps a
+  role's comment on a re-define); `REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r` → `acl_revoke_object` (`role_object_caps`
+  + `grant_columns` of that object; HANDS_OUT); `ALTER VIRTUAL REFERENCE c.n SET COMMENT|CARDINALITY|OPTIONAL` and
+  `COMMENT ON VIRTUAL REFERENCE` → `acl_alter_reference` (CATALOG; validated as the create does); `ALTER RESOURCE GROUP
+  g SET (limits) | SET COMMENT` → `acl_alter_resource_group` fields `limits` (only the named ones) / `comment`
+  (`ResourceLimitsJson` shared with CREATE); `ALTER FUNCTION CATEGORY c SET COMMENT` → `acl_create_function_category`.
+  Platform functions `comment_role`, `revoke_object`, `alter_reference`.
+- **No ALTER MAP** (decided while building): a mapping is only its key, so the change is `DROP MAP` + `MAP` - two
+  existing statements; one call would have needed its own privileged-target check (spec 095).
+- Found: `CatalogBackend::WriteWithReads` committed without the `written` policy event `Write` emits - fixed (a
+  resource group's create, a role's re-define … were not audited as writes).
+- Tests: `test/sql/acl_maintenance_forms.test`; `acl_node_group.test`'s unknown-property message.
+

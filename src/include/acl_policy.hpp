@@ -736,6 +736,13 @@ struct PolicyStore {
 	                          const string &definition);
 	void CatalogAlterCatalog(const string &vcat, const string &comment);
 	void CatalogAlterRole(const string &role, const case_insensitive_map_t<string> &claims);
+	//! spec 120: the missing maintenance forms - a role's comment, one object's grant revoked, a reference's
+	//! metadata (comment / cardinality / optional), a resource group's limits (only those named) or comment
+	void CatalogCommentRole(const string &role, const string &comment);
+	void CatalogRevokeObject(const string &role, const string &vcat, const string &vname);
+	void CatalogAlterReference(const string &vcat, const string &name, const string &field, const string &value);
+	void CatalogAlterResourceGroup(const string &name, const case_insensitive_map_t<int64_t> &limits);
+	void CatalogCommentResourceGroup(const string &name, const string &comment);
 	void CatalogAlterGrant(const string &role, const string &vcat, const string &field, const string &value);
 	void CatalogGrantAdmin(const string &role, const string &scope);
 	void CatalogRevokeAdmin(const string &role, const string &scope);

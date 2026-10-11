@@ -1402,6 +1402,32 @@ unique_ptr<SQLStatement> ParseMapping(AdminScanner &s, const char *function) {
 	    function, {Value(kind), Value(scope), Value(is_group ? "group" : "claim-value"), Value(external), Value(role)});
 }
 
+//! `(window_max 64, batch_bytes '32MiB', …)` - a resource group's limits as the JSON the admin functions take
+//! (spec 085; ALTER RESOURCE GROUP … SET (…), spec 120)
+string ResourceLimitsJson(const string &inside) {
+	vector<string> entries;
+	for (auto &item : SplitTopLevel(inside, ',')) {
+		auto text = item;
+		StringUtil::Trim(text);
+		if (text.empty()) {
+			continue;
+		}
+		auto space = text.find_first_of(" \t=");
+		if (space == string::npos) {
+			throw BinderException("acl admin: a limit is written as name value, got \"%s\"", text);
+		}
+		auto name = text.substr(0, space);
+		auto value = text.substr(space + 1);
+		StringUtil::Trim(value);
+		if (!value.empty() && value[0] == '=') {
+			value = value.substr(1);
+		}
+		value = Unquoted(value);
+		entries.push_back(JsonQuote(StringUtil::Lower(name)) + ": " + JsonQuote(value));
+	}
+	return "{" + StringUtil::Join(entries, ", ") + "}";
+}
+
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &current_session) {
 	auto keyword = s.Word("a management keyword");
 	if (StringUtil::CIEquals(keyword, "cluster")) {
@@ -1522,27 +1548,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			s.Accept("with");
 			string limits = "{}";
 			if (s.AtParen()) {
-				vector<string> entries;
-				for (auto &item : SplitTopLevel(s.Parens(), ',')) {
-					auto text = item;
-					StringUtil::Trim(text);
-					if (text.empty()) {
-						continue;
-					}
-					auto space = text.find_first_of(" \t=");
-					if (space == string::npos) {
-						throw BinderException("acl admin: a limit is written as name value, got \"%s\"", text);
-					}
-					auto name = text.substr(0, space);
-					auto value = text.substr(space + 1);
-					StringUtil::Trim(value);
-					if (!value.empty() && value[0] == '=') {
-						value = value.substr(1);
-					}
-					value = Unquoted(value);
-					entries.push_back(JsonQuote(StringUtil::Lower(name)) + ": " + JsonQuote(value));
-				}
-				limits = "{" + StringUtil::Join(entries, ", ") + "}";
+				limits = ResourceLimitsJson(s.Parens());
 			}
 			// DEFAULT (spec 096): principals bound to no group are its members; before or after COMMENT
 			string comment, is_default;
@@ -1793,6 +1799,14 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			}
 			s.pos = saved;
 		}
+		if (s.Accept("table") || s.Accept("view") || s.Accept("object")) {
+			// REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r (spec 120): the object's own grant - the catalog's stays
+			string vcat, vname;
+			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
+			s.Expect("from");
+			s.Expect("role");
+			return MakeAdminCall("acl_revoke_object", {Value(s.Ident("a role name")), Value(vcat), Value(vname)});
+		}
 		if (s.Accept("resource")) {
 			// REVOKE RESOURCE GROUP g FROM ROLE r (spec 085)
 			s.Expect("group");
@@ -1836,6 +1850,11 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			// the list goes to the admin function as written, which parses each spec
 			s.Expect("category");
 			auto category = s.Ident("a category name");
+			if (s.Accept(
+			        "set")) { // spec 120: ALTER FUNCTION CATEGORY c SET COMMENT '…' - a re-create keeps the members
+				s.Expect("comment");
+				return MakeAdminCall("acl_create_function_category", {Value(category), Value(s.Quoted("comment"))});
+			}
 			bool add = s.Accept("add");
 			if (!add) {
 				s.Expect("drop");
@@ -1848,10 +1867,19 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			return MakeAdminCall(add ? "acl_function_category_add" : "acl_function_category_remove",
 			                     {Value(category), Value(members)});
 		}
-		if (s.Accept("resource")) { // spec 096: ALTER RESOURCE GROUP g SET DEFAULT | DROP DEFAULT
+		if (s.Accept(
+		        "resource")) { // spec 096 / 120: ALTER RESOURCE GROUP g SET (limits) | SET COMMENT | SET|DROP DEFAULT
 			s.Expect("group");
 			auto group = s.Ident("a group name");
 			bool set = s.Accept("set");
+			if (set && s.AtParen()) {
+				return MakeAdminCall("acl_alter_resource_group",
+				                     {Value(group), Value("limits"), Value(ResourceLimitsJson(s.Parens()))});
+			}
+			if (set && s.Accept("comment")) {
+				return MakeAdminCall("acl_alter_resource_group",
+				                     {Value(group), Value("comment"), Value(s.Quoted("comment"))});
+			}
 			if (!set) {
 				s.Expect("drop");
 			}
@@ -1859,9 +1887,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			return MakeAdminCall("acl_alter_resource_group",
 			                     {Value(group), Value("default"), Value(set ? "true" : "false")});
 		}
-		if (s.Accept("role")) { // ALTER ROLE r SET CLAIMS (...) | '...'
+		if (s.Accept("role")) { // ALTER ROLE r SET CLAIMS (...) | '...' | SET COMMENT '…' (spec 120)
 			auto role = s.Ident("a role name");
 			s.Expect("set");
+			if (s.Accept("comment")) {
+				return MakeAdminCall("acl_comment_role", {Value(role), Value(s.Quoted("comment"))});
+			}
 			s.Expect("claims");
 			auto claims = s.AtParen() ? ClaimsListToCsv(s.Parens()) : s.Quoted("claims list");
 			return MakeAdminCall("acl_alter_role", {Value(role), Value(claims)});
@@ -1898,6 +1929,23 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		}
 		// the object forms carry the VIRTUAL marker, so they never shadow duckdb's own ALTER
 		s.Expect("virtual");
+		if (s.Accept(
+		        "reference")) { // spec 120: ALTER VIRTUAL REFERENCE c.n SET COMMENT '…' | CARDINALITY x | OPTIONAL t|f
+			string vcat, name;
+			SplitVirtual(s.Dotted("a reference name"), vcat, name);
+			s.Expect("set");
+			if (s.Accept("comment")) {
+				return MakeAdminCall("acl_alter_reference",
+				                     {Value(vcat), Value(name), Value("comment"), Value(s.Quoted("comment"))});
+			}
+			if (s.Accept("cardinality")) {
+				return MakeAdminCall("acl_alter_reference",
+				                     {Value(vcat), Value(name), Value("cardinality"), Value(s.Word("a cardinality"))});
+			}
+			s.Expect("optional");
+			return MakeAdminCall("acl_alter_reference",
+			                     {Value(vcat), Value(name), Value("optional"), Value(s.Word("true or false"))});
+		}
 		if (s.Accept("catalog")) { // ALTER VIRTUAL CATALOG c SET COMMENT '...'
 			auto vcat = s.IdentKey("a catalog name");
 			s.Expect("set");
@@ -1992,6 +2040,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		// COMMENT ON VIRTUAL TABLE|VIEW|SCHEMA|TABLE FUNCTION|SCALAR v.n [COLUMN c] IS '...'
 		s.Expect("on");
 		s.Expect("virtual");
+		if (s.Accept("reference")) { // spec 120
+			string vcat, name;
+			SplitVirtual(s.Dotted("a reference name"), vcat, name);
+			s.Expect("is");
+			return MakeAdminCall("acl_alter_reference",
+			                     {Value(vcat), Value(name), Value("comment"), Value(s.Quoted("comment"))});
+		}
 		bool schema = s.Accept("schema");
 		bool scalar = !schema && s.Accept("scalar");
 		bool table_function = false;

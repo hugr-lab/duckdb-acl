@@ -116,6 +116,10 @@ int64_t CatalogBackend::WriteWithReads(
 	if (commit->HasError()) {
 		throw BinderException("acl catalog: %s", commit->GetError());
 	}
+	// a policy write is audited whichever writer committed it (it was Write's alone - spec 120 found the gap)
+	if (on_policy && string(version_key) == "policy_version") {
+		on_policy("written", string());
+	}
 	lock_guard<mutex> guard(lock);
 	checked_once = false;
 	local_writes++;

@@ -405,9 +405,9 @@ ACL ADMIN CREATE RESOURCE GROUP twice (max_sessions 1) DEFAULT DEFAULT;
 <REGEX>:.*acl admin: unexpected trailing text.*
 
 statement error
-SELECT acl_alter_resource_group('general', 'limits', 'true');
+SELECT acl_alter_resource_group('general', 'colour', 'true');
 ----
-<REGEX>:.*the property is 'default', true or false - got limits = true.*
+<REGEX>:.*the property is default \(true \| false\), limits or comment - got colour = true.*
 
 statement error
 SELECT acl_create_resource_group('maybe', '{}', '', 'perhaps');
