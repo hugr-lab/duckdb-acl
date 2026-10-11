@@ -1,0 +1,326 @@
+# name: test/sql/acl_maintenance_forms.test
+# description: spec 120.1 - the management forms a console needs to maintain a policy: a role's comment,
+#   one object's grant revoked, a reference's hints, a resource group's limits and comment, a function
+#   category's comment - each as grammar and as its platform call, each keeping what it does not name
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, customer_id INTEGER, amount INTEGER);
+
+statement ok
+CREATE TABLE phys.main.customers(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 1, 10);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.customers AS phys.main.customers;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM c.orders TO c.customers ON (customer_id = id) CARDINALITY many_to_one COMMENT 'the customer';
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE cadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cadm CAPS '{"select": true, "manage": true}' MAIN;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst MAIN;
+
+# --- ALTER ROLE r SET COMMENT, and a later SET CLAIMS keeps it ---------------------------------------------------
+
+statement ok
+ACL ROLE "pol" ALTER ROLE analyst SET COMMENT 'the analysts of acme';
+
+statement ok
+ACL ROLE "pol" ALTER ROLE analyst SET CLAIMS (tenant = 'globex');
+
+query TT
+ACL ROLE "pol" SELECT role, comment FROM platform.roles WHERE role = 'analyst';
+----
+analyst	the analysts of acme
+
+statement ok
+ACL ROLE "pol" SELECT platform.comment_role('analyst', 'renamed through the call');
+
+query T
+SELECT comment FROM store.acl.roles WHERE role = 'analyst';
+----
+renamed through the call
+
+statement error
+ACL ROLE "pol" ALTER ROLE nosuch SET COMMENT 'x';
+----
+<REGEX>:.*role "nosuch".*
+
+statement error
+ACL ROLE "cadm" ALTER ROLE analyst SET COMMENT 'x';
+----
+<REGEX>:.*unrestricted manage.*
+
+# --- REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r: the object's own grant goes, the catalog's decides again -----------
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{}';
+
+statement error
+ACL ROLE "analyst" SELECT * FROM c.orders;
+----
+<REGEX>:.*select on "c.orders" is not allowed.*
+
+query I
+SELECT count(*) FROM store.acl.role_object_caps WHERE role = 'analyst';
+----
+1
+
+# names compare as names do (spec 116): the grant c.orders is revoked as C.ORDERS
+statement ok
+ACL ROLE "pol" REVOKE TABLE C.ORDERS FROM ROLE analyst;
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM c.orders;
+----
+1
+
+query I
+SELECT count(*) FROM store.acl.role_object_caps WHERE role = 'analyst';
+----
+0
+
+statement error
+ACL ROLE "pol" REVOKE TABLE c.orders FROM ROLE analyst;
+----
+<REGEX>:.*grant of "c.orders" to role "analyst".*
+
+# handing out (and taking back) access is not a catalog admin's
+statement ok
+ACL ADMIN GRANT OBJECT c.customers TO ROLE analyst CAPS '{"select": true}';
+
+statement error
+ACL ROLE "cadm" REVOKE OBJECT c.customers FROM ROLE analyst;
+----
+<REGEX>:.*unrestricted manage.*
+
+# a grant with a column list: its columns go with it
+statement ok
+ACL ADMIN GRANT OBJECT c.orders TO ROLE analyst CAPS '{"select": true}' COLUMNS (id, amount = 0);
+
+query I
+SELECT count(*) > 0 FROM store.acl.grant_columns WHERE role = 'analyst';
+----
+true
+
+statement ok
+ACL ROLE "pol" SELECT platform.revoke_object('analyst', 'c', 'customers');
+
+statement ok
+ACL ROLE "pol" REVOKE OBJECT c.orders FROM ROLE analyst;
+
+query I
+SELECT count(*) FROM store.acl.grant_columns WHERE role = 'analyst';
+----
+0
+
+# --- ALTER VIRTUAL REFERENCE c.n SET …, COMMENT ON VIRTUAL REFERENCE -------------------------------------------------
+
+statement ok
+ACL ROLE "cadm" ALTER VIRTUAL REFERENCE c.orders_customer SET CARDINALITY one_to_one;
+
+statement ok
+ACL ROLE "cadm" ALTER VIRTUAL REFERENCE c.orders_customer SET OPTIONAL true;
+
+statement ok
+ACL ROLE "cadm" COMMENT ON VIRTUAL REFERENCE c.orders_customer IS 'one customer per order';
+
+query TTTTT
+ACL ROLE "cadm" SELECT name, from_object, cardinality, optional, comment FROM platform.references;
+----
+orders_customer	orders	one_to_one	true	one customer per order
+
+statement error
+ACL ROLE "cadm" ALTER VIRTUAL REFERENCE c.orders_customer SET CARDINALITY sideways;
+----
+<REGEX>:.*unknown cardinality "sideways".*
+
+statement error
+ACL ROLE "cadm" ALTER VIRTUAL REFERENCE c.nosuch SET OPTIONAL false;
+----
+<REGEX>:.*reference "c.nosuch".*
+
+# another catalog's admin may not touch c's references
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG d;
+
+statement ok
+ACL ADMIN CREATE ROLE dadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG d TO ROLE dadm CAPS '{"manage": true}';
+
+statement error
+ACL ROLE "dadm" ALTER VIRTUAL REFERENCE c.orders_customer SET OPTIONAL true;
+----
+<REGEX>:.*no manage scope for catalog "c".*
+
+statement ok
+ACL ROLE "cadm" SELECT platform.alter_reference('c', 'orders_customer', 'optional', 'false');
+
+query T
+SELECT optional FROM store.acl.references WHERE name = 'orders_customer';
+----
+false
+
+# --- ALTER RESOURCE GROUP g SET (limits) | SET COMMENT: only what is named changes --------------------------------
+
+statement ok
+ACL ROLE "pol" CREATE RESOURCE GROUP g (window_max 64, max_sessions 10) COMMENT 'the batch group';
+
+statement ok
+ACL ROLE "pol" ALTER RESOURCE GROUP g SET (max_sessions 20);
+
+query IIT
+ACL ROLE "pol" SELECT window_max, max_sessions, comment FROM platform.resource_groups WHERE "group" = 'g';
+----
+64	20	the batch group
+
+statement ok
+ACL ROLE "pol" ALTER RESOURCE GROUP g SET COMMENT 'the night batch';
+
+query IIT
+ACL ROLE "pol" SELECT window_max, max_sessions, comment FROM platform.resource_groups WHERE "group" = 'g';
+----
+64	20	the night batch
+
+# the limits after the change are judged as CREATE judges them
+statement error
+ACL ROLE "pol" ALTER RESOURCE GROUP g SET (window_start 128);
+----
+<REGEX>:.*window_start \(128\) is above window_max \(64\).*
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_resource_group('g', 'limits', '{"window_start": 8}');
+
+statement ok
+ACL ROLE "pol" SELECT platform.alter_resource_group('g', 'comment', 'set through the call');
+
+query IT
+ACL ROLE "pol" SELECT window_start, comment FROM platform.resource_groups WHERE "group" = 'g';
+----
+8	set through the call
+
+statement error
+ACL ROLE "cadm" ALTER RESOURCE GROUP g SET (max_sessions 1);
+----
+<REGEX>:.*unrestricted manage.*
+
+statement error
+ACL ROLE "pol" ALTER RESOURCE GROUP g SET (no_such_limit 1);
+----
+<REGEX>:.*no_such_limit.*
+
+statement error
+ACL ROLE "pol" ALTER RESOURCE GROUP nosuch SET (max_sessions 1);
+----
+<REGEX>:.*resource group "nosuch".*
+
+# --- ALTER FUNCTION CATEGORY c SET COMMENT: the members stay -------------------------------------------------------
+
+statement ok
+ACL ROLE "pol" CREATE FUNCTION CATEGORY text_fns COMMENT 'text';
+
+statement ok
+ACL ROLE "pol" ALTER FUNCTION CATEGORY text_fns ADD (lower, upper);
+
+statement ok
+ACL ROLE "pol" ALTER FUNCTION CATEGORY text_fns SET COMMENT 'the text functions';
+
+query T
+ACL ROLE "pol" SELECT comment FROM platform.function_categories WHERE category = 'text_fns';
+----
+the text functions
+
+# an ALTER of a category that does not exist is an error - never a new category
+statement error
+ACL ROLE "pol" ALTER FUNCTION CATEGORY never_existed SET COMMENT 'oops';
+----
+<REGEX>:.*function category "never_existed" does not exist.*
+
+query I
+SELECT count(*) FROM store.acl.function_categories WHERE category = 'never_existed';
+----
+0
+
+statement error
+ACL ROLE "cadm" ALTER FUNCTION CATEGORY text_fns SET COMMENT 'x';
+----
+<REGEX>:.*unrestricted manage.*
+
+statement ok
+ACL ROLE "pol" SELECT platform.comment_function_category('text_fns', 'through the call');
+
+query I
+ACL ROLE "pol" SELECT count(*) FROM platform.function_category_members WHERE category = 'text_fns';
+----
+2
+
+# --- a write through any writer is audited (spec 120 found WriteWithReads silent: a resource group, a role) ------
+
+statement ok
+SET GLOBAL acl_audit_level = 'all';
+
+statement ok
+SELECT acl_audit_flush();
+
+statement ok
+SET VARIABLE before_writes = (SELECT count(*) FROM acl_audit_events() WHERE kind = 'policy' AND detail = 'written');
+
+# each through WriteWithReads (silent before): a group's limits, a role's define, a group's create
+statement ok
+ACL ROLE "pol" ALTER RESOURCE GROUP g SET (window_max 32);
+
+statement ok
+ACL ROLE "pol" CREATE ROLE later;
+
+statement ok
+ACL ROLE "pol" CREATE RESOURCE GROUP g2 (window_max 8);
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) - getvariable('before_writes') FROM acl_audit_events() WHERE kind = 'policy' AND detail = 'written';
+----
+3

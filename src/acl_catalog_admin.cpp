@@ -2685,15 +2685,22 @@ void PolicyStore::CatalogDropRole(const string &role) {
 
 void PolicyStore::CatalogDefineRole(const string &role, const case_insensitive_map_t<string> &claims) {
 	RequireCatalog(catalog, "acl_define_role");
-	vector<string> statements;
-	statements.push_back("DELETE FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
-	statements.push_back("INSERT INTO " + catalog->Tbl("roles") + " VALUES (" + Lit(role) + ", '')");
-	statements.push_back("DELETE FROM " + catalog->Tbl("role_claims") + " WHERE \"role\" = " + Lit(role));
-	for (auto &claim : claims) {
-		statements.push_back("INSERT INTO " + catalog->Tbl("role_claims") + " VALUES (" + Lit(role) + ", " +
-		                     Lit(claim.first) + ", " + Lit(claim.second) + ")");
-	}
-	catalog->Write(statements);
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		// spec 120: a re-define (ALTER ROLE … SET CLAIMS) keeps the role's comment
+		auto was = read("SELECT \"comment\" FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
+		string comment;
+		if (was->RowCount() > 0 && !was->Collection().GetValue(0, 0).IsNull()) {
+			comment = was->Collection().GetValue(0, 0).ToString();
+		}
+		statements.push_back("DELETE FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role));
+		statements.push_back("INSERT INTO " + catalog->Tbl("roles") + " VALUES (" + Lit(role) + ", " + Lit(comment) +
+		                     ")");
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_claims") + " WHERE \"role\" = " + Lit(role));
+		for (auto &claim : claims) {
+			statements.push_back("INSERT INTO " + catalog->Tbl("role_claims") + " VALUES (" + Lit(role) + ", " +
+			                     Lit(claim.first) + ", " + Lit(claim.second) + ")");
+		}
+	});
 }
 
 // spec 072: the function categories' writers. A key is stored lowercased throughout - function,
@@ -3100,6 +3107,133 @@ void PolicyStore::CatalogAlterRole(const string &role, const case_insensitive_ma
 	RequireRow(*catalog, "SELECT 1 FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role),
 	           "role \"" + role + "\"");
 	CatalogDefineRole(role, claims);
+}
+
+namespace {
+
+//! spec 120: the target's existence is checked inside the write's own transaction - a concurrent DROP is a
+//! refusal, never a silent no-op
+void RequireExisting(const ReadFn &read, const string &sql, const string &what) {
+	if (read(sql)->RowCount() == 0) {
+		throw BinderException("acl admin: %s does not exist", what);
+	}
+}
+
+} // namespace
+
+void PolicyStore::CatalogCommentRole(const string &role, const string &comment) {
+	RequireCatalog(catalog, "acl_comment_role");
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		RequireExisting(read, "SELECT 1 FROM " + catalog->Tbl("roles") + " WHERE \"role\" = " + Lit(role),
+		                "role \"" + role + "\"");
+		statements.push_back("UPDATE " + catalog->Tbl("roles") + " SET \"comment\" = " + Lit(comment) +
+		                     " WHERE \"role\" = " + Lit(role));
+	});
+}
+
+void PolicyStore::CatalogCommentFunctionCategory(const string &category, const string &comment) {
+	RequireCatalog(catalog, "acl_comment_function_category");
+	auto where = " WHERE \"category\" = " + Lit(StringUtil::Lower(category));
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		RequireExisting(read, "SELECT 1 FROM " + catalog->Tbl("function_categories") + where,
+		                "function category \"" + category + "\"");
+		statements.push_back("UPDATE " + catalog->Tbl("function_categories") + " SET \"comment\" = " + Lit(comment) +
+		                     where);
+	});
+}
+
+void PolicyStore::CatalogRevokeObject(const string &role, const string &vcat, const string &vname) {
+	RequireCatalog(catalog, "acl_revoke_object");
+	auto where = " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname);
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		RequireExisting(read, "SELECT 1 FROM " + catalog->Tbl("role_object_caps") + where,
+		                "grant of \"" + vcat + "." + vname + "\" to role \"" + role + "\"");
+		// the object's own grant and its columns - the catalog's (or a schema's) grant stays and decides again
+		statements.push_back("DELETE FROM " + catalog->Tbl("role_object_caps") + where);
+		statements.push_back("DELETE FROM " + catalog->Tbl("grant_columns") + where);
+	});
+	NoteGrantLineage(vcat); // spec 107
+}
+
+void PolicyStore::CatalogAlterReference(const string &vcat, const string &name, const string &field,
+                                        const string &value) {
+	RequireCatalog(catalog, "acl_alter_reference");
+	auto where = " WHERE \"vcat\" = " + Lit(vcat) + " AND \"name\" = " + Lit(name);
+	string assignment;
+	auto f = StringUtil::Lower(field);
+	if (f == "comment") {
+		assignment = "\"comment\" = " + Lit(value);
+	} else if (f == "cardinality") {
+		static const case_insensitive_set_t CARDINALITIES = {"many_to_one", "one_to_many", "one_to_one",
+		                                                     "many_to_many"};
+		if (!value.empty() && !CARDINALITIES.count(value)) {
+			throw InvalidInputException("acl: reference \"%s\": unknown cardinality \"%s\" (expected many_to_one, "
+			                            "one_to_many, one_to_one or many_to_many)",
+			                            name, value);
+		}
+		assignment = "\"cardinality\" = " + (value.empty() ? string("NULL") : Lit(StringUtil::Lower(value)));
+	} else if (f == "optional") {
+		auto v = StringUtil::Lower(value);
+		if (v != "true" && v != "false") {
+			throw InvalidInputException("acl: reference \"%s\": OPTIONAL is true or false, not \"%s\"", name, value);
+		}
+		assignment = "\"optional\" = " + v;
+	} else {
+		throw InvalidInputException(
+		    "acl_alter_reference: the property is comment, cardinality or optional - got \"%s\"", field);
+	}
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		RequireExisting(read, "SELECT 1 FROM " + catalog->Tbl("references") + where,
+		                "reference \"" + vcat + "." + name + "\"");
+		statements.push_back("UPDATE " + catalog->Tbl("references") + " SET " + assignment + where);
+	});
+}
+
+void PolicyStore::CatalogAlterResourceGroup(const string &name, const case_insensitive_map_t<int64_t> &limits) {
+	RequireCatalog(catalog, "acl_alter_resource_group");
+	if (limits.empty()) {
+		throw InvalidInputException("acl_alter_resource_group: name at least one limit");
+	}
+	auto where = " WHERE \"group\" = " + Lit(name);
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		auto current = read("SELECT \"window_start\", \"window_max\" FROM " + catalog->Tbl("resource_groups") + where);
+		if (current->RowCount() == 0) {
+			throw BinderException("acl admin: resource group \"%s\" does not exist", name);
+		}
+		// review 120: the limits after the change are judged as CREATE judges them - window_start <= window_max
+		auto merged = [&](const char *limit, idx_t column) -> int64_t {
+			auto named = limits.find(limit);
+			if (named != limits.end()) {
+				return named->second;
+			}
+			auto stored = current->Collection().GetValue(column, 0);
+			return stored.IsNull() ? -1 : stored.GetValue<int64_t>();
+		};
+		auto start = merged("window_start", 0);
+		auto max = merged("window_max", 1);
+		if (start >= 0 && max > 0 && start > max) {
+			throw BinderException("acl_alter_resource_group: window_start (%lld) is above window_max (%lld)",
+			                      static_cast<long long>(start), static_cast<long long>(max));
+		}
+		// only the limits named change; the others, the comment, the default and the bound roles stay
+		vector<string> sets;
+		for (auto &limit : limits) {
+			sets.push_back("\"" + StringUtil::Lower(limit.first) + "\" = " + std::to_string(limit.second));
+		}
+		statements.push_back("UPDATE " + catalog->Tbl("resource_groups") + " SET " + StringUtil::Join(sets, ", ") +
+		                     where);
+	});
+}
+
+void PolicyStore::CatalogCommentResourceGroup(const string &name, const string &comment) {
+	RequireCatalog(catalog, "acl_alter_resource_group");
+	auto where = " WHERE \"group\" = " + Lit(name);
+	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		RequireExisting(read, "SELECT 1 FROM " + catalog->Tbl("resource_groups") + where,
+		                "resource group \"" + name + "\"");
+		statements.push_back("UPDATE " + catalog->Tbl("resource_groups") + " SET \"comment\" = " + Lit(comment) +
+		                     where);
+	});
 }
 
 void PolicyStore::CatalogAlterGrant(const string &role, const string &vcat, const string &field, const string &value) {
