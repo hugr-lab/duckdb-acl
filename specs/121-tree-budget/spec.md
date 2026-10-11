@@ -96,3 +96,22 @@ narrows nothing (slower, never wider). The driver's listing change reads a surfa
 ## Follow-ups
 
 - Warming the scanners' catalogs at the node's start (SQL Server's first touch is seconds).
+
+## As built
+
+### Step 3 - one plan for the door's own statement (2026-10-11)
+- duckdb drops a prepared plan it must rebind (`CreatePlan(LogicalPrepare)` keeps none while the flag is up), so the
+  flag cannot simply come off at execution (tried: the execution found no physical plan - an internal error). It
+  comes off while the door's prepare is optimized: `DoorPrepareScope` (a trivial thread_local pointer, spec 088)
+  marks the door's own Prepare (the ticket at GetFlightInfo, CreatePreparedStatement, the catalog RPCs), and the
+  door's optimizer extension (`DoorPlanPreOptimize`, registered with the door) clears `always_require_rebind` on the
+  `LogicalPrepare` - only when it still has its plan (the data-source rule's flag; a flag the binder raised leaves
+  none), the statement is read-only and its parameters are bound. The plan is then kept; `DoorPlanOnce` runs it for
+  the reservation's first execution within 10 s and puts the flag back after; a later first execution, or any
+  re-execution, gets the flag back first and rebinds as duckdb wants.
+- Measured (the dev node through ADBC, first text / repeated, ms): a schema's tables 1421/699 → 713/672, a table's
+  columns 458/224 → 246/215, keys 458/227 → 226/217, references ~1500/~750 → ~735/~720 - the first text costs what a
+  repeat did.
+- Gauge `acl.door.plans_kept` (on the store, per instance). Tests: `test/e2e/flight/adbc.sh` - a listing through ADBC
+  runs on its prepare's plan (+1), a prepared statement executed twice runs it once (+1) and its re-execution
+  answers the same after rebinding.

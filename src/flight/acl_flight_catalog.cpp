@@ -17,6 +17,7 @@
 #include "acl_flight_catalog.hpp"
 
 #include "acl_catalog_rpc.hpp"
+#include "acl_flight_plan_once.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -135,14 +136,26 @@ arrow::Result<unique_ptr<QueryResult>> RunCatalogQuery(PolicyStore &store, Conne
 	if (prefixed.empty()) {
 		return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 	}
-	auto prepared = con.Prepare(prefixed);
+	unique_ptr<PreparedStatement> prepared;
+	bool kept;
+	{
+		DoorPrepareScope plan_once(*con.context);
+		prepared = con.Prepare(prefixed);
+		kept = plan_once.Kept();
+	}
 	if (prepared->HasError()) {
 		return arrow::Status::Invalid("acl: " + prepared->GetError());
 	}
 	vector<Value> parameters = query.parameters;
 	// Execute runs the statement to completion and retains its rows: a catalog answer is small and is
 	// read twice on the include_schema path (the rows, then the per-table schemas)
-	auto result = prepared->Execute(parameters);
+	unique_ptr<QueryResult> result;
+	{
+		// spec 121: prepared and executed here, at once - one plan
+		DoorPlanOnce plan_once(*con.context, *prepared, kept, true, std::chrono::steady_clock::now(),
+		                       store.door_plans_kept);
+		result = prepared->Execute(parameters);
+	}
 	if (result->HasError()) {
 		return arrow::Status::Invalid("acl: " + result->GetError());
 	}

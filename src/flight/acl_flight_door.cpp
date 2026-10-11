@@ -47,6 +47,9 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/enums/result_eagerness.hpp"
 #include "duckdb/main/query_result_stream.hpp"
+#include "acl_flight_plan_once.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/operator/logical_prepare.hpp"
 #include <thread>
 
 #include <arrow/c/bridge.h>
@@ -291,6 +294,11 @@ struct FlightDoorState {
 		//! the client's statement as it sent it - what spec 111 reads when duckdb could not settle the
 		//! statement's properties at Prepare (a parameter it could not type)
 		string query;
+		//! spec 121: when it was prepared, and how many times it ran - its first execution, soon after, keeps the
+		//! prepare's plan (DoorPlanOnce)
+		std::chrono::steady_clock::time_point prepared_at = std::chrono::steady_clock::now();
+		idx_t executions = 0;
+		bool plan_kept = false;
 	};
 	std::unordered_map<string, shared_ptr<Reservation>> reservations;
 	//! Refuse a new reservation rather than evict somebody's old one: an evicted one is a mid-flight
@@ -1248,7 +1256,9 @@ public:
 				TempScanScope temp_scan(reservation->conn->con->context.get());
 				{
 					LineagePrepareScope preparing(*reservation->conn->con->context);
+					DoorPrepareScope plan_once(*reservation->conn->con->context);
 					reservation->stmt = reservation->conn->con->Prepare(prefixed);
+					reservation->plan_kept = plan_once.Kept();
 				}
 				ProfileOfPrepare(*reservation);
 			}
@@ -1693,7 +1703,11 @@ public:
 				    ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, request.transaction_id));
 				    TempScanScope temp_scan(reservation->conn->con->context.get());
 				    LineagePrepareScope preparing(*reservation->conn->con->context);
-				    reservation->stmt = reservation->conn->con->Prepare(prefixed);
+				    {
+					    DoorPrepareScope plan_once(*reservation->conn->con->context);
+					    reservation->stmt = reservation->conn->con->Prepare(prefixed);
+					    reservation->plan_kept = plan_once.Kept();
+				    }
 				    ProfileOfPrepare(*reservation);
 			    }
 			    if (reservation->stmt->HasError()) {
@@ -2142,6 +2156,10 @@ public:
 			retained = true;
 		} else {
 			ArmProfile(handle, *reservation->conn, reservation.get(), string());
+			DoorPlanOnce plan_once(*reservation->conn->con->context, stmt, reservation->plan_kept,
+			                       reservation->executions == 0, reservation->prepared_at,
+			                       state->store->door_plans_kept);
+			reservation->executions++;
 			result = stmt.GetStatementProperties().result_eagerness == ResultEagerness::FORCED ? stmt.Execute(values)
 			                                                                                   : stmt.Submit(values);
 		}
@@ -2902,7 +2920,46 @@ void AclFlightStopFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 
 } // namespace
 
+//! spec 121: the door's prepare in flight on this thread, and whether its plan was kept (a pointer and a flag:
+//! trivial thread_locals, spec 088)
+static thread_local ClientContext *door_preparing = nullptr;
+static thread_local bool door_plan_kept = false;
+
+DoorPrepareScope::DoorPrepareScope(ClientContext &context) : previous(door_preparing), previous_kept(door_plan_kept) {
+	door_preparing = &context;
+	door_plan_kept = false;
+}
+
+DoorPrepareScope::~DoorPrepareScope() {
+	door_preparing = previous;
+	door_plan_kept = previous_kept;
+}
+
+bool DoorPrepareScope::Kept() const {
+	return door_plan_kept;
+}
+
+static void DoorPlanPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	if (!plan || door_preparing != &input.context || plan->type != LogicalOperatorType::LOGICAL_PREPARE ||
+	    plan->children.empty()) {
+		return;
+	}
+	auto &prepared = *plan->Cast<LogicalPrepare>().prepared;
+	if (prepared.properties.always_require_rebind && prepared.properties.modified_databases.empty() &&
+	    prepared.properties.bound_all_parameters) {
+		prepared.properties.always_require_rebind = false; // DoorPlanOnce puts it back after the first execution
+		door_plan_kept = true;
+	}
+}
+
+void RegisterDoorPlanOnce(DatabaseInstance &db) {
+	OptimizerExtension extension;
+	extension.pre_optimize_function = DoorPlanPreOptimize;
+	OptimizerExtension::Register(DBConfig::GetConfig(db), extension);
+}
+
 void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> store) {
+	RegisterDoorPlanOnce(loader.GetDatabaseInstance());
 	// the door's state gauge (spec 069): doors of this instance serving right now. Through the
 	// registry in the object cache, which exists before the pipeline is attached.
 	{
@@ -2927,6 +2984,13 @@ void RegisterAclFlightDoor(ExtensionLoader &loader, shared_ptr<PolicyStore> stor
 		                         });
 		// spec 070: result streams open right now, across this instance's doors - a fleet of
 		// forgotten cursors shows here before it shows as a session that will not run its next statement
+		// spec 121: statements the door ran on their prepare's plan - one plan where duckdb would make two
+		weak_ptr<PolicyStore> weak_store = store;
+		hooks->Gauges().Register("acl.door.plans_kept", {{"door", "flight"}}, "{statement}",
+		                         "door statements run on their prepare's plan", [weak_store]() -> int64_t {
+			                         auto locked = weak_store.lock();
+			                         return locked ? locked->door_plans_kept.load() : 0;
+		                         });
 		hooks->Gauges().Register("acl.door.streams_open", {{"door", "flight"}}, "{stream}",
 		                         "result streams being pulled right now", [weak_db]() -> int64_t {
 			                         auto locked = weak_db.lock();
