@@ -1059,7 +1059,9 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 } // namespace
 
 //! spec 114: `USE SCHEMA <name>[;]` as the one statement of the text -> `SET acl_use_schema = '<name>'`,
-//! which the rewriter reads as USE of that schema in the session's catalog. Any other text unchanged.
+//! which the rewriter reads as USE of that schema in the session's catalog; `<name>` may be a nested schema's
+//! path (`raw.eu`, spec 116: each part an identifier). `USE <catalog>.<schema path>` of three parts or more - beyond
+//! duckdb's grammar - becomes `SET schema = '...'`, read the same way. Any other text unchanged.
 string UseSchemaAsSet(const string &text) {
 	idx_t i = 0;
 	auto skip_space = [&]() { // whitespace and comments, as the parser skips them
@@ -1097,32 +1099,51 @@ string UseSchemaAsSet(const string &text) {
 		return text;
 	}
 	skip_space();
-	if (!word("schema")) {
-		return text;
-	}
+	// `USE SCHEMA <path>`, or `USE <catalog>.<schema path>` of three parts or more (duckdb's grammar stops at
+	// two): both become the SET the rewriter reads
+	bool schema_form = word("schema");
 	skip_space();
+	// a schema name, or a nested schema's path: identifiers (quoted or bare) joined by `.` (spec 116 / 114)
 	string name;
-	if (i < text.size() && text[i] == '"') {
-		for (i++; i < text.size(); i++) {
-			if (text[i] == '"' && i + 1 < text.size() && text[i + 1] == '"') {
-				name += '"';
-				i++;
-			} else if (text[i] == '"') {
-				break;
-			} else {
-				name += text[i];
+	idx_t parts = 0;
+	for (;;) {
+		string part;
+		if (i < text.size() && text[i] == '"') {
+			for (i++; i < text.size(); i++) {
+				if (text[i] == '"' && i + 1 < text.size() && text[i + 1] == '"') {
+					part += '"';
+					i++;
+				} else if (text[i] == '"') {
+					break;
+				} else {
+					part += text[i];
+				}
+			}
+			if (i >= text.size()) {
+				return text;
+			}
+			i++;
+			part = "\"" + StringUtil::Replace(part, "\"", "\"\"") + "\"";
+		} else {
+			while (i < text.size() && (StringUtil::CharacterIsAlphaNumeric(text[i]) || text[i] == '_' ||
+			                           static_cast<unsigned char>(text[i]) >= 0x80)) {
+				part += text[i++];
 			}
 		}
-		if (i >= text.size()) {
+		if (part.empty()) {
 			return text;
 		}
-		i++;
-		name = "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
-	} else {
-		while (i < text.size() && (StringUtil::CharacterIsAlphaNumeric(text[i]) || text[i] == '_' ||
-		                           static_cast<unsigned char>(text[i]) >= 0x80)) {
-			name += text[i++];
+		name += (name.empty() ? "" : ".") + part;
+		parts++;
+		auto at = i;
+		skip_space(); // `a . b`, as duckdb's grammar reads it
+		if (i < text.size() && text[i] == '.') {
+			i++;
+			skip_space();
+			continue;
 		}
+		i = at;
+		break;
 	}
 	skip_space();
 	if (i < text.size() && text[i] == ';') {
@@ -1131,6 +1152,9 @@ string UseSchemaAsSet(const string &text) {
 	skip_space();
 	if (name.empty() || i != text.size()) {
 		return text;
+	}
+	if (!schema_form) {
+		return parts >= 3 ? "SET schema = '" + StringUtil::Replace(name, "'", "''") + "'" : text;
 	}
 	return "SET acl_use_schema = '" + StringUtil::Replace(name, "'", "''") + "'";
 }

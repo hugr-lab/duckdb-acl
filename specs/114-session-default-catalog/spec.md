@@ -128,3 +128,14 @@ name refuse, as a written one would). Never on a shared connection.
 - **Tests**: `test/cpp/test_acl_session_use.cpp` (the positive path - a handle is minted at runtime),
   `test/sql/acl_session_use.test` (refusals on a per-statement prefix, the function is no principal's),
   the Flight e2e (ADBC `USE SCHEMA` / `USE`), the door e2e (quack through `quack_query_by_name`).
+
+## Addendum 2026-10-11: a nested schema by its parts
+Since spec 116 a quoted part is ONE identifier, so `USE SCHEMA "raw.eu"` names a one-part schema `raw.eu`, never the
+nested `raw.eu` - and `USE SCHEMA` took one name only, `USE c.s` two: a nested schema could not be USEd at all (found
+by acl-clients spec 006's live e2e, whose driver sent the quoted form). Now `USE SCHEMA <path>` takes the parts
+(`raw.eu`, `"raw"."eu"`), and `USE <catalog>.<schema path>` of three parts or more (beyond duckdb's grammar) is
+turned into the same SET by the override (`UseSchemaAsSet`) - so, like `USE SCHEMA`, it must be a request of its own
+(a 2-part `USE c.s` still stands in a batch); `current_schema()` answers the path; spaces around a dot are read;
+an empty part is refused. Not here: lineage under a nested USE - the worker's scratch database cannot USE (nor
+create) a nested schema, so a run read under one has no inputs (an explicit nested name had none before either);
+a follow-up. Tests: `test_acl_session_use.cpp` ("a nested schema is USEd by its parts").

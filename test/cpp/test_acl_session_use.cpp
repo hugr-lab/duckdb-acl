@@ -93,6 +93,11 @@ int main(int argc, char *argv[]) {
 	Exec(con, "ACL ADMIN GRANT SCHEMA mart.home TO ROLE analyst WITH (select, insert, create, drop)");
 	Exec(con, "ACL ADMIN GRANT SCHEMA mart.sales TO ROLE analyst WITH (select)");
 	Exec(con, "ACL ADMIN GRANT SCHEMA mart.exp TO ROLE analyst WITH (select, insert, create, drop)");
+	// a nested schema (spec 113 paths): USE names it by its parts
+	Exec(con, "CREATE SCHEMA phys.deep");
+	Exec(con, "CREATE TABLE phys.deep.d AS SELECT 7 AS id");
+	Exec(con, "ACL ADMIN CREATE VIRTUAL SCHEMA mart.out.deep AS phys.deep");
+	Exec(con, "ACL ADMIN GRANT SCHEMA mart.out.deep TO ROLE analyst WITH (select)");
 
 	// spec 116: a catalog and a schema named the way SQL allows
 	Exec(con, "CREATE SCHEMA phys.\"Raw Data\"");
@@ -159,8 +164,8 @@ int main(int argc, char *argv[]) {
 	Scenario("refusals", [&]() {
 		Check(Contains(One(con, session + "USE secret"), "no catalog of the principal"), "a catalog not held");
 		Check(Contains(One(con, session + "USE mart.nope"), "no schema the principal holds"), "a schema not held");
-		Check(Contains(One(con, session + "USE a.b.c"), "Expected \"USE database\" or \"USE database.schema\""),
-		      "three parts are no USE");
+		Check(Contains(One(con, session + "USE a.b.c"), "no catalog of the principal"),
+		      "three parts are a catalog and a schema path (a nested schema)");
 		Check(One(con, session + "SELECT current_database()") == "mart", "a refused USE changed nothing");
 	});
 
@@ -297,6 +302,23 @@ int main(int argc, char *argv[]) {
 		Check(Refused(One(con, session + "USE \"Sales Mart.Raw Data\""), "Sales Mart.Raw Data") ||
 		          Contains(One(con, session + "USE \"Sales Mart.Raw Data\""), "no catalog of the principal"),
 		      "one identifier with a dot is no catalog.schema");
+		CheckOk(*con.Query(session + "USE sales"), "back");
+	});
+
+	Scenario("a nested schema is USEd by its parts, never as one quoted name", [&]() {
+		CheckOk(*con.Query(session + "USE mart"), "USE mart");
+		CheckOk(*con.Query(session + "USE SCHEMA out.deep"), "USE SCHEMA out.deep");
+		Check(One(con, session + "SELECT id FROM d") == "7", "a bare name is read in mart.out.deep");
+		Check(One(con, session + "SELECT current_schema()") == "out.deep", "current_schema() is the path");
+		CheckOk(*con.Query(session + "USE SCHEMA \"out\".\"deep\""), "the parts quoted are the same schema");
+		Check(One(con, session + "SELECT id FROM d") == "7", "...read there");
+		CheckOk(*con.Query(session + "USE mart.out.deep"), "USE <catalog>.<schema path>");
+		Check(One(con, session + "SELECT id FROM d") == "7", "...read there too");
+		Check(Contains(One(con, session + "USE SCHEMA \"out.deep\""), "no schema the principal holds"),
+		      "one quoted part with a dot is another schema (spec 116)");
+		CheckOk(*con.Query(session + "USE SCHEMA out . deep"), "spaces around the dot, as duckdb reads them");
+		Check(One(con, session + "SELECT id FROM d") == "7", "...the same schema");
+		Check(Contains(One(con, session + "USE SCHEMA \"\""), "no empty part"), "an empty name is refused");
 		CheckOk(*con.Query(session + "USE sales"), "back");
 	});
 

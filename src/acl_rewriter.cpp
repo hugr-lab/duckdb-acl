@@ -959,24 +959,30 @@ private:
 			Deny(Reason::SETTING_DENIED, "USE takes a name");
 		}
 		auto parts = SplitIdentifierPath(set.value->Cast<ConstantExpression>().GetLiteral().ToValue().ToString());
+		for (auto &part : parts) {
+			if (part.empty()) {
+				Deny(Reason::SETTING_DENIED, "USE: a name has no empty part"); // spec 116 refuses one
+			}
+		}
 		string catalog, schema;
-		// (spec 116: each part one identifier, kept as a key - `"Sales Mart"` is one catalog)
+		// (spec 116: each part one identifier, kept as a key - `"Sales Mart"` is one catalog, `"a.b"` one schema; a
+		// nested schema is its parts: `USE SCHEMA raw.eu`, `USE sales.raw.eu`)
 		if (use_schema_form) {
-			if (parts.size() != 1) {
-				Deny(Reason::SETTING_DENIED, "USE SCHEMA takes one schema name");
+			if (parts.empty()) {
+				Deny(Reason::SETTING_DENIED, "USE SCHEMA takes a schema name");
 			}
 			catalog = UseCatalog();
-			schema = NamePath::QuotePart(parts[0]);
+			schema = NamePath(parts).ToKey();
 		} else {
-			if (parts.empty() || parts.size() > 2) {
-				Deny(Reason::SETTING_DENIED, "USE takes <catalog> or <catalog>.<schema>");
+			if (parts.empty()) {
+				Deny(Reason::SETTING_DENIED, "USE takes <catalog> or <catalog>.<schema path>");
 			}
 			catalog = NamePath::QuotePart(parts[0]);
-			schema = parts.size() == 2 ? NamePath::QuotePart(parts[1]) : string();
+			schema = parts.size() >= 2 ? NamePath(vector<string>(parts.begin() + 1, parts.end())).ToKey() : string();
 		}
 		if (catalog.empty() || !HoldsCatalog(catalog)) {
 			HoldsCatalog(string());
-			Deny(Reason::SETTING_DENIED, "USE: \"" + catalog + "\" is no catalog of the principal - it holds: " +
+			Deny(Reason::SETTING_DENIED, "USE: " + Shown(catalog) + " is no catalog of the principal - it holds: " +
 			                                 StringUtil::Join(held_catalogs, ", "));
 		}
 		for (auto &held : held_catalogs) {
@@ -992,7 +998,7 @@ private:
 			if (!store.ResolveHeldSchema(principal, NamePath::JoinKeys(catalog, schema), vcat, path) ||
 			    !StringUtil::CIEquals(vcat, catalog)) {
 				Deny(Reason::SETTING_DENIED,
-				     "USE: \"" + catalog + "." + schema + "\" is no schema the principal holds");
+				     "USE: " + Shown(NamePath::JoinKeys(catalog, schema)) + " is no schema the principal holds");
 			}
 			schema = path;
 		}

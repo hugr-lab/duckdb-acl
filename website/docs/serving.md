@@ -635,6 +635,8 @@ its session with plain SQL:
 USE mart;              -- the default catalog: `facts` is mart.facts, `out.t` is mart.out.t
 USE SCHEMA out;        -- the default schema in it: a bare `t` is mart.out.t, the root is main.<x>
 USE mart.out;          -- both at once (duckdb's own form)
+USE SCHEMA out.deep;   -- a nested schema by its parts (`USE mart.out.deep` too); "out.deep" quoted whole is
+                       -- another, one-part schema whose name holds a dot
 USE SCHEMA main;       -- back to the catalog's root
 USE sales;             -- the role's MAIN catalog: back where the session began
 ```
@@ -649,7 +651,8 @@ USE sales;             -- the role's MAIN catalog: back where the session began
   client's own catalog - send it to the node with `FROM quack_query_by_name('<alias>', 'USE mart')`.
 - `current_database()` / `current_schema()` answer the session's catalog and schema; a bare `SHOW
   TABLES` lists the session's schema. `information_schema.*` still lists every catalog you hold.
-- A `USE` in a batch applies to the statements after it; `USE SCHEMA s` must be a request of its own.
+- A `USE` in a batch applies to the statements after it; `USE SCHEMA s` (and a `USE` of three parts or more - a
+  nested schema) must be a request of its own.
   A `USE` is not undone by `ROLLBACK`.
 - A schema is `USE`d only when you hold a grant on it (`GRANT SCHEMA`); function names still resolve in
   the MAIN catalog. Under `USE <catalog>.<schema alias>` a session temp table is `temp.main.<name>` -
