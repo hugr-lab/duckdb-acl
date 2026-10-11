@@ -59,39 +59,45 @@ string Joined(const vector<string> &rows) {
 	return out;
 }
 
-//! A filter pattern is bound, never concatenated - so there is nothing to escape and nothing to get
-//! wrong. The pattern below would be a syntax error if it reached the parser as text.
-void PatternsAreParameters() {
+//! spec 119: a filter value is a quoted literal (the listing narrows by constants - a `$n` it cannot see), its
+//! quote doubled - the pattern below would be a syntax error, or worse, if it reached the parser unescaped - and
+//! a NUL byte is refused
+void PatternsAreQuotedLiterals() {
 	CatalogFilter filter;
 	filter.has_table_pattern = true;
 	filter.table_pattern = "o'rd%";
 	auto query = BuildCatalogListing(CatalogListing::TABLES, filter);
-	Check(query.sql.find("o'rd%") == string::npos, "the pattern is not in the statement text");
-	Check(query.sql.find("table_name LIKE $1") != string::npos, "the pattern is a placeholder");
-	Check(query.parameters.size() == 1 && query.parameters[0].ToString() == "o'rd%", "and it is the bound value");
+	Check(query.sql.find("table_name LIKE 'o''rd%' ESCAPE") != string::npos, "the pattern is a quoted literal");
+	Check(query.parameters.empty(), "and nothing is bound");
+	CatalogFilter nul;
+	nul.has_table_pattern = true;
+	nul.table_pattern = string("a\0b", 3);
+	bool refused = false;
+	try {
+		BuildCatalogListing(CatalogListing::TABLES, nul);
+	} catch (std::exception &) {
+		refused = true;
+	}
+	Check(refused, "a NUL byte in a filter is refused");
 }
 
 //! Flight distinguishes an absent catalog (no filter) from an empty one ("objects with no catalog").
 void AbsentCatalogIsNotAnEmptyOne() {
 	CatalogFilter absent;
 	auto no_filter = BuildCatalogListing(CatalogListing::TABLES, absent);
-	Check(no_filter.parameters.empty(), "an absent catalog binds nothing");
-	Check(no_filter.sql.find("WHERE") == string::npos, "and adds no condition");
+	Check(no_filter.sql.find("WHERE") == string::npos, "an absent catalog adds no condition");
 
 	CatalogFilter empty;
 	empty.has_catalog = true;
 	auto filtered = BuildCatalogListing(CatalogListing::TABLES, empty);
-	Check(filtered.parameters.size() == 1 && filtered.parameters[0].ToString() == "",
-	      "an empty catalog binds the empty string");
-	Check(filtered.sql.find("table_catalog = $1") != string::npos, "as an ordinary equality");
+	Check(filtered.sql.find("table_catalog = ''") != string::npos, "an empty catalog is an equality with ''");
 }
 
 void TableTypesBecomeAnInList() {
 	CatalogFilter filter;
 	filter.table_types = {"BASE TABLE", "VIEW"};
 	auto query = BuildCatalogListing(CatalogListing::TABLES, filter);
-	Check(query.sql.find("table_type IN ($1, $2)") != string::npos, "the type list is an IN list");
-	Check(query.parameters.size() == 2, "with one parameter each");
+	Check(query.sql.find("table_type IN ('BASE TABLE', 'VIEW')") != string::npos, "the type list is an IN list");
 }
 
 void ListingsAnswerUnderARole(Connection &con) {
@@ -260,7 +266,7 @@ int main() {
 	};
 
 	return acl_test::RunMain("acl Flight SQL catalog statements (spec 046)", [&]() {
-		Scenario("patterns-are-parameters", PatternsAreParameters);
+		Scenario("patterns-are-quoted-literals", PatternsAreQuotedLiterals);
 		Scenario("absent-catalog-is-not-empty", AbsentCatalogIsNotAnEmptyOne);
 		Scenario("table-types-in-list", TableTypesBecomeAnInList);
 		Scenario("listings-under-a-role", [&]() { ListingsAnswerUnderARole(con); });

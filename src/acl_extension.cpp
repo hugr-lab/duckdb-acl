@@ -246,7 +246,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	    "acl: the most rows a metadata surface (information_schema, duckdb_*, SHOW, the Flight catalog RPCs, "
 	    "quack's catalog load) answers a principal - above it the statement is refused, never cut; 0 = unlimited. "
 	    "A session may only lower it",
-	    LogicalType::BIGINT, Value::BIGINT(10000),
+	    LogicalType::BIGINT, Value::BIGINT(1000000),
 	    [](ClientContext &context, SetScope scope, Value &value) {
 		    auto wanted = value.IsNull() ? int64_t(-1) : value.GetValue<int64_t>();
 		    if (wanted < 0) {
@@ -261,7 +261,7 @@ void LoadInternal(ExtensionLoader &loader) {
 			    limit = node.GetValue<int64_t>();
 		    }
 		    // a RESET passes the default: harmless - the listing judges the lower of the two
-		    if (limit > 0 && wanted != 10000 && (wanted == 0 || wanted > limit)) {
+		    if (limit > 0 && wanted != 1000000 && (wanted == 0 || wanted > limit)) {
 			    throw InvalidInputException("acl_metadata_max_rows: a session may only lower the node's %lld",
 			                                static_cast<long long>(limit));
 		    }

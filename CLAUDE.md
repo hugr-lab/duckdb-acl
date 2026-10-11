@@ -720,7 +720,7 @@ wildcard-free `LIKE` conjuncts on catalog / schema / name of the WHERE above the
 `listing_where` set in RewriteSelectNode before the FROM is rewritten; the WHERE stays as written); the
 broken-list mark (`physcols`) only over relations that declare a list; the admin's `platform.attached` read
 narrowed the same way; the Flight catalog RPCs write their filters as quoted literals (`acl_catalog_rpc.cpp`
-Bind). `acl_metadata_max_rows` (10000, 0 = unlimited; SESSION-default scope, the validator refuses a session
+Bind). `acl_metadata_max_rows` (1,000,000 - a quack client loads a catalog whole; 0 = unlimited; SESSION-default scope, the validator refuses a session
 raise, a RESET's default passes) wraps each substituted surface: a constant `LIMIT node+1`, then
 `least(session, node)` judged where it runs, above it `error()` - refused, never cut (duckdb segfaulted on a
 LIMIT with a subquery). A narrowed listing is parsed outside the template cache. Bench: `test/bench/metadata_scale.py`.

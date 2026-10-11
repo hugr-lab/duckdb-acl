@@ -224,7 +224,12 @@ ACL ROLE "r" SELECT count(*) FROM information_schema.columns;
 9
 
 statement ok
-SET GLOBAL acl_metadata_max_rows = 10000;
+RESET GLOBAL acl_metadata_max_rows;
+
+query I
+SELECT current_setting('acl_metadata_max_rows');
+----
+1000000
 
 # --- a source that fails drops out of the listing; the others answer -----------------------------------------
 

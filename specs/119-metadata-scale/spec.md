@@ -62,7 +62,8 @@ unfiltered listing still reads every source it lists (that is the cache's, later
 `platform.attached` (118.3) reads only the sources the narrowed rows name.
 
 ### 4. A row bound - a safety knob, not speed
-`acl_metadata_max_rows` (GLOBAL, default 10000, `0` = unlimited; a session may only lower it - spec 068's
+`acl_metadata_max_rows` (GLOBAL, default 1,000,000 - owner, 2026-10-11: 10,000 refused every quack ATTACH at the
+target scale, 200 x 150 = 30,000 tables in one catalog load - `0` = unlimited; a session may only lower it - spec 068's
 allowlist) bounds each substituted surface after the narrowing: above it the statement is **refused** with
 `more than N rows of <surface> - narrow by catalog, schema or name`, never cut (as built: an `error()` where the
 statement runs - its outcome is a failure in the profile event; the rewrite, which counts no rows, records no
@@ -139,6 +140,11 @@ GetTables for one schema 0.046 s, every table (30,000 rows, bound off) 0.060 s.
   narrowed before), and a written column-alias list narrows nothing; a NUL byte in a Flight filter is refused.
   Tests compare the narrowed answer with a form that cannot narrow (EXCEPT ALL both ways) - they fail without the
   fixes; Flight e2e `admin.sh` checks a filtered GetDbSchemas and a filter holding a quote. An explicit
-  `SET acl_metadata_max_rows = 10000` (the default) is accepted and changes nothing - the bound in force is the
+  `SET acl_metadata_max_rows = 1000000` (the default) is accepted and changes nothing - the bound in force is the
   lower of the session's and the node's.
+- Supersedes spec 046's "a filter is a bound parameter, never in the statement text": the catalog RPCs' filters are
+  quoted literals (`'` doubled, a NUL refused - `test_acl_catalog_rpc.cpp`) so the listing can narrow by them; the
+  rewriter still adds no parameter of its own (the golden rule).
+- Default `acl_metadata_max_rows` = 1,000,000 (owner, 2026-10-11): 10,000 refused every quack ATTACH at the target
+  scale - quack loads a catalog whole, 200 x 150 = 30,000 tables in one load.
 
