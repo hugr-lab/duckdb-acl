@@ -179,11 +179,22 @@ int main(int argc, char *argv[]) {
 		Check(Contains(Rows(con, "ACL SESSION '" + pt + "' SELECT count(*) FROM platform.sessions"), "ERROR"),
 		      "...but not what pol does not read");
 		Exec(con, "SELECT acl_session_close('" + pt + "')");
-		Exec(con, "ACL ADMIN GRANT FUNCTION platform.view_as TO ROLE cadm");
-		Check(Contains(Rows(con, "ACL SESSION '" + catalog_admin + "' SET SESSION VIEW AS ROLE 'r'"),
-		               "a point grant does not reach it"),
-		      "a point grant on platform.view_as does not reach the mode");
-		Exec(con, "ACL ADMIN REVOKE FUNCTION platform.view_as FROM ROLE cadm");
+		// addendum: a point grant on platform.view_as is refused where it is written (it would grant nothing), and
+		// one written before is not offered by console_info either - a console shows only what works
+		Check(Contains(Rows(con, "ACL ADMIN GRANT FUNCTION platform.view_as TO ROLE cadm"),
+		               "the policy bundle's - it is never granted by name"),
+		      "a point grant on platform.view_as is refused at write");
+		Exec(con, "INSERT INTO store.acl.platform_grants (\"role\", \"object\", \"kind\", \"allowed\") "
+		          "VALUES ('cadm', 'view_as', 'function', true)");
+		Check(!Contains(Rows(con, "ACL SESSION '" + catalog_admin +
+		                              "' SELECT list_contains(my_functions, 'view_as') FROM platform.console_info()"),
+		                "true"),
+		      "console_info does not offer view_as through a point grant");
+		auto refused = Rows(con, "ACL SESSION '" + catalog_admin + "' SET SESSION VIEW AS ROLE 'r'");
+		Check(Contains(refused, "ERROR"), "...and the mode refuses it: " + refused);
+		Check(!MetadataOnly(Rows(con, "ACL SESSION '" + catalog_admin + "' SELECT id FROM c.orders")),
+		      "...and the session is not in it");
+		Exec(con, "DELETE FROM store.acl.platform_grants WHERE \"role\" = 'cadm'");
 	});
 
 	Scenario("a viewer that loses the policy bundle leaves the mode at once", [&]() {

@@ -432,6 +432,20 @@ void PolicyStore::AuditSessionRefused(const string &door, const char *reason_cod
 //! Caller holds the lock; the event itself takes nothing of the store's.
 void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now) {
 	session_notices.QueueClose(session.id, how); // spec 078: delivered once the lock is released
+	if (!session.view_as.empty()) {
+		// every removal passes here, before its binding goes: the ids it was bound to are never seated again
+		for (auto &entry : sessions) {
+			if (&entry.second != &session) {
+				continue;
+			}
+			for (auto &binding : session_bindings) {
+				if (binding.second == entry.first) {
+					view_as_ended[binding.first] = now;
+				}
+			}
+			break;
+		}
+	}
 	auto lived = session.opened_at > 0 ? (now - session.opened_at) * 1000000 : -1;
 	SessionEvent(audit.get(), session.principal, session.door, session.id, session.audit_level, how, "", "", lived);
 }
@@ -555,6 +569,10 @@ idx_t PolicyStore::SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp
 	// row here forever - the same unbounded growth this spec is about, one map to the left.
 	for (auto binding = session_bindings.begin(); binding != session_bindings.end();) {
 		binding = sessions.count(binding->second) == 0 ? session_bindings.erase(binding) : std::next(binding);
+	}
+	// a day is longer than any client keeps retrying a connection whose session is gone
+	for (auto ended = view_as_ended.begin(); ended != view_as_ended.end();) {
+		ended = ended->second + 86400 < now ? view_as_ended.erase(ended) : std::next(ended);
 	}
 	last_sweep = now;
 	return removed;
@@ -1166,6 +1184,17 @@ idx_t PolicyStore::SessionCloseAll() {
 	sessions.clear();
 	session_bindings.clear();
 	return closed;
+}
+
+bool PolicyStore::SessionViewAsEnded(const string &external_id) {
+	lock_guard<mutex> guard(lock);
+	return view_as_ended.count(external_id) > 0;
+}
+
+bool PolicyStore::SessionInViewAs(const string &handle) {
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	return entry != sessions.end() && !entry->second.view_as.empty();
 }
 
 bool PolicyStore::SessionHandleFor(const string &external_id, string &handle) {

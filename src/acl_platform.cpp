@@ -1321,6 +1321,9 @@ bool PlatformAccess::CallsFunction(const PlatformFunction &function) const {
 	if (point == 0) {
 		return false;
 	}
+	if (string(function.target) == "acl_session_view_as") {
+		return rights->Policy(); // the authorizer's rule (spec 120.3): a point grant does not reach it
+	}
 	switch (function.right) {
 	case PlatformRight::ESCALATES:
 		return false; // passthrough's alone - a point grant never reaches them

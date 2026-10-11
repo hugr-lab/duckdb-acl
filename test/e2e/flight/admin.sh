@@ -167,6 +167,33 @@ got="$(ask "RESET SESSION VIEW AS")"
 echo "$got" | grep -qi "error" && fail "RESET SESSION VIEW AS over Flight: $got"
 got="$(ask "@catalogs")"
 [ "$got" = "{'catalog_name': ['platform']}" ] || fail "GetCatalogs after RESET SESSION VIEW AS: $got"
+# addendum: a connection whose session ended IN the mode is never re-seated by a fresh session (it would run on as
+# the viewer under the client's view-as label) - the client's next call is refused, a new connection works
+export ACL_COOKIE_JAR="$TMP/view_as_killed.jar"
+ask "SELECT 1" >/dev/null
+got="$(ask "SET SESSION VIEW AS ROLE 'analyst'")"
+echo "$got" | grep -qi "error" && fail "SET SESSION VIEW AS ROLE (second connection): $got"
+echo "SELECT count(*) FROM (SELECT acl_session_kill(id) AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\\s*\"([^\"]+)\"', 1)) AS id)) WHERE k;" >&3
+for _ in $(seq 1 30); do
+	got="$(ask "@catalogs")"
+	echo "$got" | grep -q "is gone" && break
+	sleep 0.2
+done
+echo "$got" | grep -q "viewed the catalog as a role and is gone" || fail "a killed view-as session was re-seated: $got"
+got="$(ask "SELECT count(*) FROM platform.roles")"
+echo "$got" | grep -q "is gone" || fail "a re-seated view-as connection ran a statement: $got"
+# ...nor is a swap: another principal on a connection in the mode gets no session there
+export ACL_COOKIE_JAR="$TMP/view_as_swap.jar"
+ask "SELECT 1" >/dev/null
+got="$(ask "SET SESSION VIEW AS ROLE 'analyst'")"
+echo "$got" | grep -qi "error" && fail "SET SESSION VIEW AS ROLE (third connection): $got"
+got="$(ask "@catalogs" "$OPS")"
+echo "$got" | grep -q "viewed the catalog as a role and is gone" || fail "a swap carried a view-as connection on: $got"
+got="$(ask "@catalogs")"
+[ "$got" = "{'catalog_name': ['c']}" ] || fail "the refused swap ended the viewer's own session: $got"
+export ACL_COOKIE_JAR="$TMP/view_as_new.jar"
+got="$(ask "@catalogs")"
+[ "$got" = "{'catalog_name': ['platform']}" ] || fail "a new connection after the refusal: $got"
 unset ACL_COOKIE_JAR
 # a statement prepared before the mode is the session's own rights - it does not run inside it
 got="$(python3 "$HERE/view_as_client.py" "$URI" "$BOSS" "SELECT count(*) AS n FROM platform.roles" 2>&1 || true)"

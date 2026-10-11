@@ -433,6 +433,11 @@ struct PolicyStore {
 	//! is what turns "which connection is this" into "which principal is this" without the door ever
 	//! holding one.
 	unordered_map<string, string> session_bindings;
+	//! spec 120.3 addendum: the door ids (a Flight cookie) whose session ended while it viewed the catalog as a
+	//! role, and when. Such an id is never seated again (SessionViewAsEnded): a door re-seats a known cookie
+	//! with a fresh session, which would carry the client's connection on as the viewer under a
+	//! view-as label. Swept a day after.
+	unordered_map<string, int64_t> view_as_ended;
 	//! Whether a door of ours is serving on this instance (spec 043); see SetDoorOpen. Atomic, not
 	//! under `lock`: the parser override reads it on every unprefixed statement of the process.
 	std::atomic<bool> door_open {false};
@@ -922,6 +927,10 @@ struct PolicyStore {
 	//! replaces it: a door that reconnects under the same id gets the session it just authenticated.
 	void SessionBind(const string &external_id, const string &handle);
 	bool SessionHandleFor(const string &external_id, string &handle);
+	//! spec 120.3 addendum: whether the session bound to `external_id` ended in a view-as mode (a door then
+	//! refuses to seat that id again), and whether the session `handle` is in one now
+	bool SessionViewAsEnded(const string &external_id);
+	bool SessionInViewAs(const string &handle);
 	//! Drop every session and binding, and say how many there were. What a door does when it closes:
 	//! the connections it served will never come back, and nothing else can tell that they are gone.
 	idx_t SessionCloseAll();

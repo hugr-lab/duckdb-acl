@@ -196,6 +196,23 @@ the role's own, every data path refused; export round trip; created_by written a
   `test/e2e/flight/admin.sh` + `view_as_client.py` (GetCatalogs / GetTables as the role, a read refused, a statement
   prepared before the mode refused inside it).
 
+#### 120.3 addendum (2026-10-11): the mode fails closed (found by acl-clients spec 007.2's review)
+- **A connection that ended in the mode is never re-seated.** The Flight door re-seats a known cookie whose session
+  died (idle, `KILL SESSION`) with a fresh session - which has no `view_as`, so a console's view-as connection went on
+  as the viewer under the role's label. Now every removal (`SessionClosed`, the one seam) of a session in the
+  mode records the door ids bound to it (`view_as_ended`, swept a day later), and `SessionFor` refuses such a cookie
+  - and a swap away from a session in the mode (another principal's token on that cookie) - with `acl: this
+  connection's session viewed the catalog as a role and is gone - connect again`; a new connection sets the mode
+  again. quack binds a session per connection and re-seats nothing.
+- **`console_info` offers `view_as` only to the policy bundle**: `PlatformAccess::CallsFunction` said yes to a point
+  grant on `platform.view_as` that the authorizer then refused; a point grant on it is now refused where it is
+  written (`acl_grant_platform`: "the policy bundle's - it is never granted by name"), and one written before is
+  neither offered nor obeyed (nothing is removed).
+- Docs: a console treats a refused SET as a failed connect (DBeaver's bootstrap queries only log it).
+- Tests: `test/e2e/flight/admin.sh` (a killed view-as session's cookie refused, then a new connection works; a swap
+  refused and the viewer's own session kept - fails without the fix: the cookie came back as the viewer, `platform`),
+  `test_acl_view_as.cpp` (the point grant refused at write; a legacy row neither offered by console_info nor obeyed).
+
 ### 120.5 (2026-10-11)
 - Schema v22 (min_reader 21 - nullable columns at the end; a v21 build reads by name and never writes a newer
   catalog): `created_by` and `created_roles` on relations, schemas, functions, references. `created_roles` was not in

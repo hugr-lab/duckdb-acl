@@ -1074,9 +1074,12 @@ ACL SESSION 'h…' RESET SESSION VIEW AS;
 ```
 
 A console that checks how a role sees the catalog (a DBeaver data source, for one) sets the mode on every
-connection it opens - DBeaver reads metadata over a connection of its own by default, so the statement goes into
-the connection's bootstrap queries - and keeps the door's session (the Flight cookie). A data preview is refused
-in the mode.
+connection it opens - DBeaver reads metadata over a connection of its own by default - keeps the door's session
+(the Flight cookie), and treats a refused `SET SESSION VIEW AS` as a failed connect: a client that only logs it
+(DBeaver's bootstrap queries do) goes on as the viewer under the role's label. A data preview is refused in the
+mode. A Flight connection whose session ends while in the mode - idle, killed, or another principal's token on
+it - is never carried on by a fresh session: its next call is refused (`… viewed the catalog as a role and is
+gone - connect again`), and a new connection sets the mode again.
 
 Function: `acl_session_view_as(role)` (`''` leaves) - or `platform.view_as(role)`.
 

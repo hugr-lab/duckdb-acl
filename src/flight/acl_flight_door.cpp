@@ -2481,6 +2481,15 @@ private:
 				}
 			}
 		}
+		// spec 120.3 addendum: a connection that viewed the catalog as a role is never carried on by a fresh
+		// session - one that died in the mode (idle, killed) or a swap away from it would run the client's
+		// next statement as the viewer under the client's view-as label. A new connection sets the
+		// mode again.
+		if (!transient && (state->store->SessionViewAsEnded(cookie) ||
+		                   (!replacing.empty() && state->store->SessionInViewAs(replacing)))) {
+			return arrow::Status::Invalid("acl: this connection's session viewed the catalog as a role and is gone - "
+			                              "connect again");
+		}
 		// Whoever reaches this point is new: no live session of their own resolved above. A draining
 		// node seats nobody new (spec 066), and says WHY - a load balancer and a driver both treat
 		// UNAVAILABLE as "go elsewhere", where a generic auth failure would read as bad credentials.

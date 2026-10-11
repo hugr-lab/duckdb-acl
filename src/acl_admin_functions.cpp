@@ -1553,6 +1553,10 @@ void PlatformGrantTarget(DataChunk &args, idx_t row, const char *fn, string &rol
 	if (!function) {
 		throw BinderException("%s: the platform catalog has no function \"%s\"", fn, object);
 	}
+	if (string(function->target) == "acl_session_view_as") {
+		// spec 120.3: the policy bundle's - a point grant on it would grant nothing
+		throw BinderException("%s: platform.%s is the policy bundle's - it is never granted by name", fn, object);
+	}
 	if (function->right == PlatformRight::ESCALATES || function->right == PlatformRight::INFRASTRUCTURE ||
 	    function->right == PlatformRight::OPEN) {
 		throw BinderException("%s: platform.%s is %s - it is never granted by name", fn, object,

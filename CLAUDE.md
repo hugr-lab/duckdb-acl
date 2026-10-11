@@ -748,7 +748,9 @@ transaction / CALL and, outside a DESCRIBE, every object read, table function (b
 virtual scalar, plus SUMMARIZE; a function outside `system` (GateFunction), USE, temps. Below passthrough a role holding
 administration may not be viewed (AuthorizeRoleTargets), and `ViewAsOf` re-judges every batch (a lost right ends
 the mode); the decision is passed to `RewriteStatements(…, metadata_only)`. Flight reservations carry the mode
-(owner suffix, `FlightDoorState::Owns`). Tests `test/cpp/test_acl_view_as.cpp`, `test/e2e/flight/admin.sh`.
+(owner suffix, `FlightDoorState::Owns`). Fails closed (addendum): a Flight cookie whose session ended in the mode
+(`view_as_ended`, recorded in `SessionClosed`) or a swap away from one is refused, never re-seated; `view_as` is the
+policy bundle's alone (no point grant). Tests `test/cpp/test_acl_view_as.cpp`, `test/e2e/flight/admin.sh`.
 **120.5** - schema v22 (min_reader 21): `created_by` + `created_roles` on relations / schemas / functions /
 references; `AuthorScope` (acl_door_common) around the creating admin functions takes the author from the decision's
 note (`StatementAuthor` / `AuthorOf`: `<iss>|<sub>` or the role; NULL operator / anonymous) - a principal's own CREATE
