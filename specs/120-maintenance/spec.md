@@ -73,6 +73,9 @@ the script on an empty policy reproduces it (tested by round trip). Not the clus
 
 ## Not here
 - A per-node metadata cache (after the release); the DBeaver plugin itself (acl-clients 007).
+- Follow-up (owner, 2026-10-11): the `admin` audit event names the object a management call defines (`<vcat>.<vname>`,
+  its kind, its source - as cluster items carry `<kind>:<name>`), so authorship reaches acl_otel whatever the
+  statement's note did (`created_by` is NULL when a client parses between a batch's parse and its execution).
 
 ## Enforcement & security
 - Effective rights, exposures and view-as answer metadata only; view-as refuses every data path; its listings are
