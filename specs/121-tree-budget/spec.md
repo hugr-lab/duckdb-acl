@@ -115,3 +115,24 @@ narrows nothing (slower, never wider). The driver's listing change reads a surfa
 - Gauge `acl.door.plans_kept` (on the store, per instance). Tests: `test/e2e/flight/adbc.sh` - a listing through ADBC
   runs on its prepare's plan (+1), a prepared statement executed twice runs it once (+1) and its re-execution
   answers the same after rebinding.
+
+### Step 2 - keys and references read what they are asked about (2026-10-11)
+- `ScopeOf` knows the keys / references surfaces (`vcat`; `object`, `from_object` / `to_object` - keys, in the new
+  `ListingScope::objects`); the argument forms (`acl_keys('x')`, `acl_references('x')`) narrow the same way. The
+  backend adds, for references, every object at a reference's other end (one read of the policy's `references`) and
+  turns the keys into the schemas and tables spec 119's per-source reader reads - the policy CTEs stay as they were
+  (the WHERE as written); a narrowed listing is parsed outside the template cache.
+- `acl_references()` has a new column `to_has_key`: the far end declares a key whose every column the role sees -
+  what a tool's foreign-key listing names; acl-clients' driver joined every key of the node for it (0.53 s).
+- acl-clients' driver (spec 006 addendum, its branch 121-tree-budget): a schema's tables through
+  `information_schema.tables` (TABLE_TYPE is JDBC's), references without the keys join (`to_has_key`).
+- Measured, 200 x 150, warm, s (duckdb / postgres / SQL Server sources / policy in postgres): tables of a schema
+  0.046 / 0.050 / 0.048 / 0.055 (were 0.77-0.86), columns 0.234 / 0.237 / 0.239 / 0.248, keys 0.254 / 0.261 / 0.257 /
+  0.275 (were 0.51-0.58), references 0.338 / 0.355 / 0.350 / 0.392 (were 0.84-1.37), schemas ≤0.043, functions
+  ≤0.038. A scanner's first touch is unchanged (postgres +0.7 s, SQL Server +5 s - the `first` column).
+- In DBeaver (the plugin's LiveExpansionTest, dev node, ms; before → after): a schema's tables 1461 → 59, columns 482
+  → 245, keys 482 → 250, foreign keys 1417 → 321, the References folder 3569 → 990 (three listings: Generic's model
+  reads the referencing table's columns and its own foreign keys - the plugin's to change).
+- Tests: `test/sql/acl_tree_budget.test` (keys and references narrowed - by `=`, by the far end, through a nested
+  schema, by the argument - answer what the unnarrowed form answers; `to_has_key` true / false for a key whose column
+  the role does not see).

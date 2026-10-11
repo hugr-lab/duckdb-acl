@@ -80,7 +80,47 @@ vector<CatalogBackend::VisibleFunction> CatalogBackend::VisibleFunctions(const P
 
 string CatalogBackend::MetadataListingSql(const Principal &principal, const string &surface,
                                           const string &platform_objects, const string &platform_columns,
-                                          const ListingScope &scope) {
+                                          const ListingScope &asked) {
+	// spec 121: objects named by key (the keys / references surfaces) become the schemas and tables to read - with,
+	// for references, every object at a reference's other end (its columns decide whether the reference shows)
+	ListingScope scope = asked;
+	if (!asked.objects.empty() && asked.schemas.empty() && asked.tables.empty()) {
+		vector<string> objects = asked.objects;
+		if (surface == "references" && !function_mode) {
+			vector<string> keys;
+			for (auto &object : asked.objects) {
+				keys.push_back(Lit(StringUtil::Lower(object)));
+			}
+			auto in_objects = " IN (" + StringUtil::Join(keys, ", ") + ")";
+			auto ends =
+			    Query("SELECT DISTINCT \"from_vname\", \"to_vname\" FROM " + Tbl("references") + " WHERE " +
+			          KeyFoldSql("\"from_vname\"") + in_objects + " OR " + KeyFoldSql("\"to_vname\"") + in_objects);
+			ResultRows end_rows(*ends);
+			for (idx_t i = 0; i < end_rows.Count(); i++) {
+				for (idx_t c = 0; c < 2; c++) {
+					auto value = end_rows.GetValue(c, i);
+					if (!value.IsNull()) {
+						objects.push_back(StringUtil::Lower(value.ToString()));
+					}
+				}
+			}
+		}
+		std::set<string> schemas, tables;
+		for (auto &object : objects) {
+			string parent, leaf;
+			if (!NamePath::SplitLeaf(object, parent, leaf)) {
+				scope = ListingScope(); // a name that is no key narrows nothing
+				scope.catalogs = asked.catalogs;
+				schemas.clear();
+				tables.clear();
+				break;
+			}
+			schemas.insert(parent.empty() ? string("main") : NamePath::Display(parent));
+			tables.insert(leaf);
+		}
+		scope.schemas.assign(schemas.begin(), schemas.end());
+		scope.tables.assign(tables.begin(), tables.end());
+	}
 	// spec 117: the system catalog's views this principal holds - constants, one `platform.main` schema
 	bool platform = !platform_objects.empty();
 	if (function_mode) {
@@ -847,6 +887,18 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                 Tbl("reference_columns") +
 	                 " rc WHERE rc.\"vcat\" = r.\"vcat\" AND rc.\"name\" = r.\"name\" AND rc.\"side\" = 'to')"
 	                 " AS to_column_list,"
+	                 // spec 121: whether the far end declares a key the role sees (all its columns visible) - what a
+	                 // tool's foreign-key listing names, without a second listing of every key
+	                 " (r.\"to_kind\" = 'relation' AND EXISTS (SELECT 1 FROM " +
+	                 Tbl("keys") +
+	                 " k WHERE k.\"vcat\" = r.\"vcat\" AND k.\"vname\" = r.\"to_vname\" AND k.\"kind\" = 'relation')"
+	                 " AND NOT EXISTS (SELECT 1 FROM " +
+	                 Tbl("keys") +
+	                 " k2 WHERE k2.\"vcat\" = r.\"vcat\" AND k2.\"vname\" = r.\"to_vname\" AND k2.\"kind\" = 'relation'"
+	                 " AND NOT EXISTS (SELECT 1 FROM vcolumns vc WHERE vc.table_catalog = r.\"vcat\" AND " +
+	                 column_path + " = r.\"to_vname\" AND " + KeyFoldSql("vc.column_name") + " = " +
+	                 KeyFoldSql("k2.\"column\"") +
+	                 "))) AS to_has_key,"
 	                 " r.\"to_kind\" AS to_kind, r.\"expr\" AS expression, r.\"cardinality\" AS cardinality,"
 	                 " r.\"optional\" AS optional, r.\"join_method\" AS join_method, r.\"comment\" AS comment FROM " +
 	                 Tbl("references") + " r WHERE EXISTS (SELECT 1 FROM objects o WHERE o.vcat = r.\"vcat\" AND " +
