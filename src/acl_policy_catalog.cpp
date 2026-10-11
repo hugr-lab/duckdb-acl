@@ -453,6 +453,74 @@ string CatalogBackend::CapsExpr(const string &name_expr, const string &vcat_expr
 	return "coalesce(" + StringUtil::Join(terms, ", ") + ")";
 }
 
+vector<CatalogBackend::GrantDecisionRow> CatalogBackend::GrantDecisions(const string &role, const string &vcat,
+                                                                        const vector<string> &vnames) {
+	vector<GrantDecisionRow> out(vnames.size());
+	if (vnames.empty()) {
+		return out;
+	}
+	Principal principal;
+	principal.roles = {role};
+	auto cat = Lit(vcat);
+	// the names asked, numbered - one query for all of them (a row per name was the whole cost, spec 120.2's bench)
+	string values;
+	for (idx_t i = 0; i < vnames.size(); i++) {
+		values += (i ? ", (" : "(") + std::to_string(i) + ", " + Lit(vnames[i]) + ")";
+	}
+	auto name = string("q.\"vname\"");
+	string oc_join = HasObjectCaps() ? " LEFT JOIN " + ObjectCapsSource(principal, vnames) +
+	                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = g.\"vcat\" AND " +
+	                                       KeyEqSql("oc.\"vname\"", name)
+	                                 : string();
+	auto object_term = HasObjectCaps() ? string("nullif(trim(oc.\"caps\"), '')") : string("NULL");
+	auto schema_term = SchemaCapsExpr(name, cat);
+	// the row SchemaCapsExpr picks (the same WHERE and ORDER), to name it
+	auto schema_row = function_mode
+	                      ? string("NULL")
+	                      : "(SELECT sc.\"schema_path\" || chr(31) || CASE WHEN sc.\"inherited\" THEN 'i' "
+	                        "ELSE '' END FROM " +
+	                            Tbl("role_schemas") + " sc WHERE sc.\"role\" = g.\"role\" AND sc.\"vcat\" = " + cat +
+	                            " AND " + KeyPrefixSql(name, "sc.\"schema_path\"") +
+	                            " ORDER BY length(sc.\"schema_path\") DESC LIMIT 1)";
+	auto sql = GrantsCte(principal) + "SELECT q.\"i\", " + CapsExpr(name, cat) + ", " + object_term + ", " +
+	           (schema_term.empty() ? string("NULL") : schema_term) + ", " + schema_row +
+	           ", g.\"is_main\" AND (SELECT unique_main FROM main_ok), " +
+	           (function_mode ? string("NULL, NULL, NULL, NULL")
+	                          : string("g.\"rls\", ") + (HasObjectCaps() ? "oc.\"rls\"" : "NULL") +
+	                                ", g.\"columns\", " + (HasObjectCaps() ? "oc.\"columns\"" : "NULL")) +
+	           " FROM (VALUES " + values + ") q(\"i\", \"vname\") JOIN grants g ON " + KeyEqSql("g.\"vcat\"", cat) +
+	           oc_join;
+	auto result = Query(sql);
+	ResultRows rows(*result);
+	for (idx_t r = 0; r < rows.Count(); r++) {
+		auto text = [&](idx_t column) {
+			auto value = rows.GetValue(column, r);
+			return value.IsNull() ? string() : value.ToString();
+		};
+		auto &row = out[rows.GetValue(0, r).GetValue<int64_t>()];
+		row.granted = true;
+		row.caps = EffectiveCaps(rows.GetValue(1, r));
+		if (!text(2).empty()) {
+			row.level = "object";
+		} else if (!text(3).empty()) {
+			auto picked = text(4);
+			auto split = picked.find('\x1f');
+			row.schema_path = picked.substr(0, split);
+			row.schema_inherited = split != string::npos && picked.substr(split + 1) == "i";
+			row.level = "schema";
+		} else {
+			row.level = "catalog";
+		}
+		auto main = rows.GetValue(5, r);
+		row.main = !main.IsNull() && main.GetValue<bool>();
+		row.catalog_rls = text(6);
+		row.object_rls = text(7);
+		row.catalog_columns = text(8);
+		row.object_columns = text(9);
+	}
+	return out;
+}
+
 string CatalogBackend::FunctionVisibleExpr() {
 	auto caps = CapsExpr("f.\"vname\"", "f.\"vcat\"");
 	return "(" + caps + " IS NULL OR trim(" + caps + ") = '' OR trim(" + caps + ") <> '{}')";

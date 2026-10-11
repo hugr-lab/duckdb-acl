@@ -725,13 +725,20 @@ raise, a RESET's default passes) wraps each substituted surface: a constant `LIM
 `least(session, node)` judged where it runs, above it `error()` - refused, never cut (duckdb segfaulted on a
 LIMIT with a subquery). A narrowed listing is parsed outside the template cache. Bench: `test/bench/metadata_scale.py`.
 
-**Spec 120 — maintenance** (in stages; 120.1 built): the missing forms - `ALTER ROLE r SET COMMENT` (`acl_comment_role`;
+**Spec 120 — maintenance** (in stages; 120.1, 120.2 built): the missing forms - `ALTER ROLE r SET COMMENT` (`acl_comment_role`;
 a re-define keeps the comment), `REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r` (`acl_revoke_object`, HANDS_OUT),
 `ALTER VIRTUAL REFERENCE c.n SET COMMENT|CARDINALITY|OPTIONAL` + `COMMENT ON VIRTUAL REFERENCE` (`acl_alter_reference`),
 `ALTER RESOURCE GROUP g SET (limits) | SET COMMENT` (`acl_alter_resource_group` fields `limits` / `comment`, only the
 named limits change), `ALTER FUNCTION CATEGORY c SET COMMENT` (`acl_comment_function_category`, it must exist); no ALTER MAP (a mapping
-is its key). `CatalogBackend::WriteWithReads` now emits the `written` policy event like `Write`. Next: 120.2 effective
-rights + exposures, 120.3 view-as, 120.5 created_by (export after the release).
+is its key). `CatalogBackend::WriteWithReads` now emits the `written` policy event like `Write`. **120.2**
+(`acl_platform_rights.cpp`): `platform.effective_rights(role, catalog[, object])` (CATALOG; the catalog argument a
+KEY - `CatalogKey`, as the authorizer reads it) - per table / view / live alias / granted object under an alias:
+the deciding level from `CatalogBackend::GrantDecision` (the resolver's own CapsExpr terms, never a re-read),
+caps, MAIN (= unique_main), RLS / writable / refusal from `ResolveTable(Principal{roles: {r}})`, columns from the
+role's own `columns` listing, masks as its grants state them; `platform.exposures(source[, schema[, object]])`
+(POLICY) - relations, live aliases, and every stored body that NAMES it (view, template, computed column, a
+relation's or a grant's RLS / mask - parsed, never bound, `BodyTables`; `t` / `x.t` completed by the default
+database / schema), per role of the catalog. Next: 120.3 view-as, 120.5 created_by (export after the release).
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant

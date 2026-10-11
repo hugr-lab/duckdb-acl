@@ -1,0 +1,435 @@
+# name: test/sql/platform_effective_rights.test
+# description: spec 120.2 - platform.effective_rights: what a role gets of a catalog's objects and which grant
+#   decides it (object / schema by the longest prefix / catalog, the resolver's own order); platform.exposures:
+#   the virtual objects reading a physical source and what each role gets of them
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE SCHEMA phys.raw;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR, amount INTEGER);
+
+statement ok
+CREATE SCHEMA phys.s2;
+
+statement ok
+CREATE TABLE phys.s2.items(sku VARCHAR);
+
+statement ok
+CREATE TABLE phys.raw.events(id INTEGER);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 5), (2, 'globex', 7);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.sales FROM phys.s2;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.big AS 'SELECT id FROM phys.main.orders WHERE amount > 6';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.small AS 'SELECT id FROM phys.orders WHERE amount < 6';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.lake AS phys.raw;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.skus AS 'SELECT sku FROM phys.s2.items';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR c.top_order() RETURNS INTEGER AS (SELECT max(id) FROM phys.main.orders);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG d;
+
+statement ok
+ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.sales TO ROLE r WITH (select);
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE r CAPS '{"select": true, "insert": true}' COLUMNS (id, amount = 0);
+
+statement ok
+ACL ADMIN GRANT VIEW c.small TO ROLE r CAPS '{}';
+
+statement ok
+ACL ADMIN CREATE ROLE other;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE other CAPS '{"select": true}';
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE cadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cadm CAPS '{"manage": true}';
+
+statement ok
+ACL ADMIN CREATE ROLE dadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG d TO ROLE dadm CAPS '{"manage": true}';
+
+# --- the deciding level, the caps, MAIN, per object -------------------------------------------------------------
+
+query TTTTT
+ACL ROLE "pol" SELECT object, kind, decided_by, caps, main FROM platform.effective_rights('r', 'c') ORDER BY object;
+----
+big	view	catalog	[select]	true
+lake	schema_alias	catalog	[delete, insert, merge, select, update]	true
+orders	relation	object	[insert, select]	true
+sales.items	relation	schema sales	[select]	true
+small	view	object	[]	true
+
+# the RLS and the columns are what a read as the role gets - compared with the read itself
+query TTTTT
+ACL ROLE "pol" SELECT rls, columns, masks, writable, refused FROM platform.effective_rights('r', 'c', 'orders');
+----
+tenant = acl_claim('tenant')	[id, amount]	['amount = 0']	true	NULL
+
+query II
+ACL ROLE "r" SELECT id, amount FROM c.orders;
+----
+1	0
+
+# a role whose catalog grant states its caps; a role with no grant on the catalog
+query TT
+ACL ROLE "pol" SELECT decided_by, caps FROM platform.effective_rights('other', 'c', 'orders');
+----
+catalog	[select]
+
+query T
+ACL ROLE "pol" SELECT decided_by FROM platform.effective_rights('other', 'd');
+----
+
+query T
+ACL ROLE "pol" SELECT decided_by FROM platform.effective_rights('nobody', 'c', 'orders');
+----
+none
+
+# --- who may ask: policy for any catalog; a catalog admin for its own -------------------------------------------
+
+query I
+ACL ROLE "cadm" SELECT count(*) FROM platform.effective_rights('r', 'c');
+----
+5
+
+statement error
+ACL ROLE "dadm" SELECT * FROM platform.effective_rights('r', 'c');
+----
+<REGEX>:.*no manage scope for catalog "c".*
+
+statement error
+ACL ROLE "r" SELECT * FROM platform.effective_rights('r', 'c');
+----
+<REGEX>:.*no ACL administration scope.*
+
+# --- exposures: who reads a physical source, and what each role gets ---------------------------------------------
+# a view's or a function's body is parsed, never bound: skus reads phys.s2.items, not phys.main.orders; small
+#   names phys.orders - the database's main schema
+
+query TTTTTT
+ACL ROLE "pol" SELECT source, catalog, object, kind, role, decided_by FROM platform.exposures('phys', 'main', 'orders') ORDER BY object, role;
+----
+phys.main.orders	c	big	view	cadm	catalog
+phys.main.orders	c	big	view	other	catalog
+phys.main.orders	c	big	view	r	catalog
+phys.main.orders	c	orders	relation	cadm	catalog
+phys.main.orders	c	orders	relation	other	catalog
+phys.main.orders	c	orders	relation	r	object
+phys.main.orders	c	small	view	cadm	catalog
+phys.main.orders	c	small	view	other	catalog
+phys.main.orders	c	small	view	r	object
+phys.main.orders	c	top_order	function	cadm	catalog
+phys.main.orders	c	top_order	function	other	catalog
+phys.main.orders	c	top_order	function	r	catalog
+
+query TTT
+ACL ROLE "pol" SELECT DISTINCT object, kind, source FROM platform.exposures('phys') ORDER BY object;
+----
+big	view	phys.main.orders
+lake	schema_alias	phys.raw
+orders	relation	phys.main.orders
+sales.items	relation	phys.s2.items
+skus	function	phys.s2.items
+small	view	phys.main.orders
+top_order	function	phys.main.orders
+
+query I
+ACL ROLE "pol" SELECT count(*) FROM platform.exposures('nosuch');
+----
+0
+
+# the exposures span catalogs: the policy's alone
+statement error
+ACL ROLE "cadm" SELECT * FROM platform.exposures('phys');
+----
+<REGEX>:.*unrestricted manage.*
+
+# === review findings (spec 120.2): each a regression test ========================================================
+
+# --- the catalog argument is a KEY, as the authorizer judged it: '"a.b"' is catalog a.b, never """a.b""" ------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG "a.b";
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG """a.b""";
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE """a.b""".secret AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE abadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG "a.b" TO ROLE abadm CAPS '{"manage": true}';
+
+statement ok
+ACL ADMIN GRANT CATALOG """a.b""" TO ROLE r RLS (tenant = 'zzz');
+
+query I
+ACL ROLE "abadm" SELECT count(*) FROM platform.effective_rights('r', '"a.b"');
+----
+0
+
+statement error
+ACL ROLE "abadm" SELECT * FROM platform.effective_rights('r', '"""a.b"""');
+----
+<REGEX>:.*no manage scope.*
+
+# --- the deciding schema row is the resolver's: a longer prefix stating nothing falls to the catalog --------------
+
+statement ok
+CREATE SCHEMA phys.deep;
+
+statement ok
+CREATE TABLE phys.deep.ev(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG e;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA e.a FROM phys.s2;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA e.a.b FROM phys.deep;
+
+statement ok
+ACL ADMIN CREATE ROLE s;
+
+statement ok
+ACL ADMIN GRANT CATALOG e TO ROLE s MAIN CAPS '{"select": true}';
+
+statement ok
+ACL ADMIN GRANT SCHEMA e.a TO ROLE s WITH (select, insert, update);
+
+statement ok
+ACL ADMIN GRANT SCHEMA e.a.b TO ROLE s VIRTUAL ONLY;
+
+query TTT
+ACL ROLE "pol" SELECT object, decided_by, caps FROM platform.effective_rights('s', 'e') ORDER BY object;
+----
+a.b.ev	catalog	[select]
+a.items	schema a	[insert, select, update]
+
+statement error
+ACL ROLE "s" INSERT INTO e.a.b.ev VALUES (1);
+----
+<REGEX>:.*insert on.*is not allowed.*
+
+# --- MAIN as the resolver judges it: two MAIN catalogs resolve no bare name -----------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE twomain;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE twomain MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG e TO ROLE twomain MAIN;
+
+query T
+ACL ROLE "pol" SELECT DISTINCT main FROM platform.effective_rights('twomain', 'c');
+----
+false
+
+# --- a view's RLS is the grants' predicates (folded into its query); the columns are what the role reads ----------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.v AS 'SELECT id, tenant, amount FROM phys.main.orders';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.o2 AS phys.main.orders COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN CREATE ROLE w CLAIMS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE w MAIN CAPS '{"select": true}' RLS (tenant = acl_claim('tenant')) COLUMNS (amount, tenant, id);
+
+statement ok
+ACL ADMIN GRANT VIEW c.v TO ROLE w RLS (amount > 1);
+
+query TT
+ACL ROLE "pol" SELECT rls, columns FROM platform.effective_rights('w', 'c', 'v');
+----
+(tenant = acl_claim('tenant')) AND (amount > 1)	[id, tenant, amount]
+
+# o2 declares (id, amount): tenant of the grant's list grants nothing there - the read and the report agree
+query TT
+ACL ROLE "pol" SELECT columns, writable FROM platform.effective_rights('w', 'c', 'o2');
+----
+[id, amount]	false
+
+query II
+ACL ROLE "w" SELECT * FROM c.o2;
+----
+1	5
+
+# --- an object grant under a live alias is the one the resolver applies -------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE u;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE u MAIN CAPS '{"select": false}';
+
+statement ok
+ACL ADMIN GRANT TABLE c.lake.events TO ROLE u CAPS '{"select": true}';
+
+query TTTT
+ACL ROLE "pol" SELECT object, kind, decided_by, caps FROM platform.effective_rights('u', 'c') WHERE object LIKE 'lake%' ORDER BY object;
+----
+lake	schema_alias	catalog	[]
+lake.events	relation	object	[select]
+
+query I
+ACL ROLE "u" SELECT count(*) FROM c.lake.events;
+----
+0
+
+query TTTT
+ACL ROLE "pol" SELECT source, object, decided_by, caps FROM platform.exposures('phys', 'raw', 'events') WHERE role = 'u';
+----
+phys.raw.events	lake.events	object	[select]
+
+# --- exposures: bodies beyond a view's - a computed column, a relation's RLS, a grant's mask and RLS ---------------
+
+statement ok
+CREATE TABLE phys.main.secret(x INTEGER);
+
+statement ok
+CREATE TABLE phys.main.tenants(t VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.o3 AS phys.main.orders COLUMNS (id, (SELECT max(x) FROM phys.main.secret) AS amount);
+
+statement ok
+SELECT acl_add_relation('c', 'o4', 'phys.orders', '', 'tenant IN (SELECT t FROM phys.main.tenants)');
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE w COLUMNS (id, amount = (SELECT max(x) FROM phys.main.secret));
+
+query TTTT
+ACL ROLE "pol" SELECT DISTINCT catalog, object, kind, coalesce(role, '') FROM platform.exposures('phys', 'main', 'secret') WHERE kind <> 'grant' OR role = 'w' ORDER BY object, 4;
+----
+c	o3	relation	cadm
+c	o3	relation	other
+c	o3	relation	r
+c	o3	relation	twomain
+c	o3	relation	u
+c	o3	relation	w
+c	orders	grant	w
+
+query TT
+ACL ROLE "pol" SELECT DISTINCT object, kind FROM platform.exposures('phys', 'main', 'tenants');
+----
+o4	relation
+
+# a phys stored in two parts is the database's default schema; an empty schema is any schema
+query T
+ACL ROLE "pol" SELECT DISTINCT object FROM platform.exposures('phys', NULL, 'orders') ORDER BY 1;
+----
+big
+o2
+o3
+o4
+orders
+secret
+small
+top_order
+v
+
+# a view's caps in exposures are a view's: select at most
+query T
+ACL ROLE "pol" SELECT DISTINCT caps FROM platform.exposures('phys', 'main', 'orders') WHERE object = 'big' AND role = 'r';
+----
+[select]
+
+# an unqualified name in a body is the node's default database's
+statement ok
+CREATE TABLE loc(x INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.vloc AS 'SELECT x FROM loc';
+
+query TT
+ACL ROLE "pol" SELECT DISTINCT source, object FROM platform.exposures('memory');
+----
+memory.main.loc	vloc
+
+# a name with a dot in a part (spec 116): its columns are found under its own name
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c."T.x" AS phys.s2.items;
+
+query TT
+ACL ROLE "pol" SELECT object, columns FROM platform.effective_rights('r', 'c', '"T.x"');
+----
+"T.x"	[sku]
+
+query TT
+ACL ROLE "pol" SELECT object, columns FROM platform.effective_rights('r', 'c') WHERE object = '"T.x"';
+----
+"T.x"	[sku]
+
+# a role whose grant lists none of the object's columns reads nothing of it: an empty list, never NULL
+query TT
+ACL ROLE "pol" SELECT columns, masks FROM platform.effective_rights('w', 'c', '"T.x"');
+----
+[]	[]

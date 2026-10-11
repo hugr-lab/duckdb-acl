@@ -1,6 +1,6 @@
 # Spec 120: maintenance - the missing forms, effective rights, exposures, view-as, export, created_by
 
-- **Status**: accepted, **120.1 implemented** (see *As built*) (by the owner 2026-10-11: the order 120.1 → 120.5; export after the release; view-as for
+- **Status**: accepted, **120.1, 120.2 implemented** (see *As built*) (by the owner 2026-10-11: the order 120.1 → 120.5; export after the release; view-as for
   policy / passthrough first; created_by as written)
 - **Date**: 2026-10-11
 - **Author**: Claude (design/079 with the owner)
@@ -112,3 +112,41 @@ the role's own, every data path refused; export round trip; created_by written a
   refuses the function-driver source by name, as `Write` does. Low, left: one limit cannot be unset back to the node's
   through ALTER (re-create the group); a no-op `DROP … IF EXISTS` bumps the version and is now a `written` event.
 
+
+### 120.2 (2026-10-11)
+- `src/acl_platform_rights.cpp`: `acl_effective_rights(role, vcat[, vname])` and `acl_exposures(source[, schema[,
+  object]])`, table functions; platform `effective_rights` (CATALOG, its catalog argument judged - read as a KEY,
+  `CatalogKey`, as the authorizer reads it) and `exposures` (POLICY - the design's "cluster, passthrough; a catalog
+  admin over its granted sources" is left for later: passthrough holds it already, the rest needs a narrowing by
+  granted sources). `PlatformReadFunctionSql` checks a read function's declared arities (it allowed at most one).
+- The deciding level: `CatalogBackend::GrantDecision` - the resolver's own CapsExpr / SchemaCapsExpr, grants CTE
+  and object-grant join by key, plus the row SchemaCapsExpr picks (to name it, `(inherited)` when materialized);
+  `main` = the flag AND `main_ok.unique_main`. RLS and `writable` are `ResolveTable`'s for a principal holding only
+  that role (a view's: its grants' predicates, which ApplyGrantPolicy folds into its query); `columns` the role's own
+  `columns` listing (`MetadataListingSql`, one per call, scoped to the catalog); `masks` the masks its grants state
+  on those columns; `refused` the resolver's refusal. Objects under a live alias that the role holds a grant on are
+  rows of their own.
+- Exposures: a relation's `phys`, a live alias' `phys_path` (asked inside it, decided on the alias path + the rest),
+  a function's target, and the tables named by a view's SQL, a function's template, a computed column
+  (`relation_columns.expr`), a relation's RLS and a grant's RLS / mask expressions (`kind = 'grant'`, that role only) -
+  PARSED, never bound (a scanner's bind would reach the source): FROM, joins, subqueries, a PIVOT's `IN (SELECT …)`;
+  `t` / `x.t` completed by the node's default database / a database's default schema. A body that does not parse
+  falls back to the DETACH check's text match. Not followed: what a physical view / macro reads in turn; a
+  passthrough role reaches every source outside the policy. An empty schema is any schema (an alias then is not
+  reported - whether its schema holds the object is the source's).
+- Review (three passes) found and fixed: the catalog argument read as a raw part named another catalog than the one
+  the authorizer judged (`'"a.b"'` vs `"""a.b"""` - a catalog admin read the other's rights); a first `Decide` that
+  re-read the grant tables diverged from the resolver (an empty longer schema prefix, MAIN with two MAIN catalogs,
+  the columns, a view's RLS, object grants under an alias); exposures missed computed columns, RLS and grant masks,
+  two-part physical names, unqualified body names, and shifted a NULL middle argument; a view's caps differed
+  between the two functions.
+- Measured (`test/bench/rights_scale.py`: 20 sources x 150 tables as expansions = 3000 declared relations, 500
+  views with a join and a subquery, 10 roles x 50 object grants with a mask, laptop): the first build asked the
+  deciding level one query per row - a whole source's exposures 5.6 s (2000 rows), a catalog's effective rights
+  10.0 s (3500 rows). `GrantDecisions(role, vcat, names)` asks it once per (catalog, role) for every name - the same
+  expressions over a VALUES list: one table's exposures 0.21 s, a whole source's 0.23 s, one object's effective
+  rights 0.19 s, the whole catalog's 0.27 s. What is left is a floor, not per row: exposures parses every stored body
+  (~1000 here) per call, effective_rights reads the role's columns listing (spec 119's cost: one table's columns
+  0.22 s at this scale). No cache: a parse cache would need the policy version for its invalidation, for 0.2 s on
+  an operator's call; the listing's own cost is the per-node metadata cache after the release.
+- Tests: `test/sql/platform_effective_rights.test`; bench `test/bench/rights_scale.py`.

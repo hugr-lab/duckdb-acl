@@ -1114,6 +1114,24 @@ vector<PlatformFunction> BuildFunctions() {
 	     true,
 	     "TABLE",
 	     "probe a catalog's stored facts against the source (spec 039)"},
+	    {"effective_rights",
+	     "acl_effective_rights",
+	     {role, catalog, P("object")},
+	     {2, 3},
+	     1,
+	     PR::CATALOG,
+	     true,
+	     "TABLE",
+	     "what a role gets of a catalog's objects: caps, the deciding grant, MAIN, RLS, columns (spec 120)"},
+	    {"exposures",
+	     "acl_exposures",
+	     {A("source"), P("schema"), P("object")},
+	     {1, 2, 3},
+	     -1,
+	     PR::POLICY,
+	     true,
+	     "TABLE",
+	     "the virtual objects reading a physical source and what each role gets of them (spec 120)"},
 	    {"console_info",
 	     "",
 	     {},
@@ -2545,9 +2563,11 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 		      list(catalogs) + " AS \"admin_catalogs\" FROM (SELECT acl_catalog_schema() AS s)";
 		return true;
 	}
-	// check_catalog([vcat]): the authorizer judges it like the grammar's CHECK VIRTUAL CATALOG
-	if (arguments.size() > 1) {
-		throw BinderException("acl_rewrite: platform.%s takes at most one argument: the catalog", function->name);
+	// check_catalog([vcat]), effective_rights(role, catalog[, object]), exposures(source[, …]): the authorizer
+	// judges each like its grammar / its right (spec 117, 120)
+	if (std::find(function->arities.begin(), function->arities.end(), arguments.size()) == function->arities.end()) {
+		throw BinderException("acl_rewrite: platform.%s does not take %llu arguments", function->name,
+		                      static_cast<unsigned long long>(arguments.size()));
 	}
 	vector<unique_ptr<ParsedExpression>> children;
 	for (auto &argument : arguments) {
@@ -3055,6 +3075,7 @@ void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> 
 	scalar("acl_platform_conditions", ConditionsType(), ConditionsFunc);
 	scalar("acl_platform_attributes", AttributesType(), AttributesFunc);
 	RegisterAclPlatformSources(loader, store);
+	RegisterAclPlatformRights(loader, store);
 }
 
 } // namespace acl
