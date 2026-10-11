@@ -689,6 +689,8 @@ struct PolicyStore {
 	string NodeGroup();
 	//! spec 118: acl_deployment = 'cluster' - the deployment's, never the policy's
 	bool ClusterNode();
+	//! spec 119: the node's acl_metadata_max_rows (0 = unlimited)
+	int64_t MetadataMaxRows();
 	bool NodeGroupKnown();
 	vector<ClusterItem> ClusterEffective();
 	//! spec 118: what this cluster node carries that its effective profile lacks and the other way round -

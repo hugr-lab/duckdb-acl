@@ -239,6 +239,34 @@ void LoadInternal(ExtensionLoader &loader) {
 		    }
 	    },
 	    SetScope::GLOBAL);
+	// spec 119: the most rows a metadata surface answers a principal - above it the statement is refused,
+	// never cut. A session may LOWER it for itself (spec 068's allowlist); never raise it above the node's
+	config.AddExtensionOption(
+	    "acl_metadata_max_rows",
+	    "acl: the most rows a metadata surface (information_schema, duckdb_*, SHOW, the Flight catalog RPCs, "
+	    "quack's catalog load) answers a principal - above it the statement is refused, never cut; 0 = unlimited. "
+	    "A session may only lower it",
+	    LogicalType::BIGINT, Value::BIGINT(10000),
+	    [](ClientContext &context, SetScope scope, Value &value) {
+		    auto wanted = value.IsNull() ? int64_t(-1) : value.GetValue<int64_t>();
+		    if (wanted < 0) {
+			    throw InvalidInputException("acl_metadata_max_rows is a row count (0 = unlimited)");
+		    }
+		    if (scope == SetScope::GLOBAL) {
+			    return;
+		    }
+		    Value node;
+		    int64_t limit = 0;
+		    if (context.db->TryGetCurrentSetting("acl_metadata_max_rows", node) && !node.IsNull()) {
+			    limit = node.GetValue<int64_t>();
+		    }
+		    // a RESET passes the default: harmless - the listing judges the lower of the two
+		    if (limit > 0 && wanted != 10000 && (wanted == 0 || wanted > limit)) {
+			    throw InvalidInputException("acl_metadata_max_rows: a session may only lower the node's %lld",
+			                                static_cast<long long>(limit));
+		    }
+	    },
+	    SetScope::SESSION);
 	// spec 118: what this node is - a standalone node (its bootstrap SQL and its admin's ACL NATIVE configure
 	// it; no cluster profile) or a cluster node (the profile configures the fleet, tresor keeps its secrets).
 	// A security mode never follows from the policy's contents: the deployment sets it

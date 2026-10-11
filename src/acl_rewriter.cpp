@@ -2391,6 +2391,20 @@ private:
 		AppendTempListing(surface, sql);
 		// spec 098: the functions listing carries the principal's admitted keys as constants - tens of
 		// KB that differ per role set; parsed outside the template cache, never filling it
+		// spec 119 §4: at most acl_metadata_max_rows rows - the node's bound stops the listing (a constant
+		// LIMIT: one more row is produced), and the session's own lower value is judged where the statement
+		// runs; above it the statement is refused, never answered short. A tool narrows by catalog, schema or name
+		auto node_bound = store.MetadataMaxRows();
+		// the bound in force: the session's value never above the node's (a RESET writes the default back)
+		auto session = string("nullif(current_setting('acl_metadata_max_rows')::BIGINT, 0)");
+		auto SESSION_BOUND = node_bound > 0 ? "least(coalesce(" + session + ", " + std::to_string(node_bound) + "), " +
+		                                          std::to_string(node_bound) + ")"
+		                                    : session;
+		sql = "SELECT * EXCLUDE (__acl_rows) FROM (SELECT *, count(*) OVER () AS __acl_rows FROM (SELECT * FROM (" +
+		      sql + ") __acl_listing" + (node_bound > 0 ? " LIMIT " + std::to_string(node_bound + 1) : string()) +
+		      ")) __acl_bounded WHERE CASE WHEN __acl_rows > " + SESSION_BOUND + " THEN error('acl: more than ' || " +
+		      SESSION_BOUND + " || ' rows of " + surface +
+		      " - narrow by catalog, schema or name (acl_metadata_max_rows)') ELSE true END";
 		// a narrowed listing differs per value asked about: parsed outside the template cache too (spec 119)
 		auto select_stmt = string(surface) == "duckdb_functions" || !scope.Empty()
 		                       ? store.InstantiateSelect(sql, template_options, false)

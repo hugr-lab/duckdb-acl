@@ -1088,9 +1088,10 @@ bool ClientSettingAllowed(const string &name) {
 	// about what a statement reads or costs.
 	// spec 107 adds the client's lineage context (the job and the external run a statement is a step
 	// of): metadata of the lineage event, nothing a statement reads or costs
+	// spec 119: a session may lower the metadata row bound for itself (the setting refuses a raise)
 	return StringUtil::CIEquals(name, "TimeZone") || StringUtil::CIEquals(name, "Calendar") ||
-	       StringUtil::CIEquals(name, "acl_correlation_id") || StringUtil::CIEquals(name, "acl_traceparent") ||
-	       LineageClientSetting(name);
+	       StringUtil::CIEquals(name, "acl_metadata_max_rows") || StringUtil::CIEquals(name, "acl_correlation_id") ||
+	       StringUtil::CIEquals(name, "acl_traceparent") || LineageClientSetting(name);
 }
 
 bool PolicyStore::SetDraining(bool value) {
