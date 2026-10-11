@@ -84,7 +84,7 @@ REVOKE VIEW platform.sessions FROM ROLE support;        -- the grant or the deny
   catalog.
 - **Only `passthrough` grants on `platform`** (and the bundles) - never `policy`: a grantor that can
   grant everything is everything.
-- Never to every role (`TO ALL ROLES` / role `''` is refused); never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `migrate_catalog` (the passthrough scope's own), `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` (the cluster bundle's alone) and `console_info` (every holder's); only on an
+- Never to every role (`TO ALL ROLES` / role `''` is refused); never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `migrate_catalog` (the passthrough scope's own), `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` (the cluster bundle's alone), `view_as` (the policy bundle's - granted by name it would grant nothing; a DENY on it still works) and `console_info` (every holder's); only on an
   object `platform` has.
 - The grants live in their own table, `platform_grants(role, object, kind, allowed)` - never in the
   catalog grants or spec 072's function grants and categories.

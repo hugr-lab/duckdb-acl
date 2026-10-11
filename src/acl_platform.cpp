@@ -1321,6 +1321,9 @@ bool PlatformAccess::CallsFunction(const PlatformFunction &function) const {
 	if (point == 0) {
 		return false;
 	}
+	if (string(function.target) == "acl_session_view_as") {
+		return rights->Policy(); // the authorizer's rule (spec 120.3): a point grant does not reach it
+	}
 	switch (function.right) {
 	case PlatformRight::ESCALATES:
 		return false; // passthrough's alone - a point grant never reaches them
@@ -1929,18 +1932,9 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
 		if (target == "acl_session_view_as") {
 			// spec 120.3: the policy bundle's (a point grant on platform.view_as does not reach it), and a view never
 			// shows more than the viewer may read: a role holding administration is viewed by passthrough only
-			if (!rights.Policy()) {
-				throw BinderException("acl admin: SET SESSION VIEW AS is the policy bundle's - a point grant does not "
-				                      "reach it");
-			}
-			auto role = ConstantArgument(call, 0, "view_as");
-			Principal viewed;
-			viewed.roles = {role};
-			if (!role.empty() && store.AdminRightsOf(viewed).Privileged()) {
-				throw BinderException("acl admin: \"%s\" holds administration - viewing it would show more than the "
-				                      "policy bundle reads (the platform's node and cluster views), so it requires a "
-				                      "passthrough scope",
-				                      role);
+			auto why = store.ViewAsRefusal(rights, ConstantArgument(call, 0, "view_as"));
+			if (!why.empty()) {
+				throw BinderException("acl admin: %s", why);
 			}
 		}
 		string issuer, client;

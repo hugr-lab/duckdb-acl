@@ -167,6 +167,90 @@ got="$(ask "RESET SESSION VIEW AS")"
 echo "$got" | grep -qi "error" && fail "RESET SESSION VIEW AS over Flight: $got"
 got="$(ask "@catalogs")"
 [ "$got" = "{'catalog_name': ['platform']}" ] || fail "GetCatalogs after RESET SESSION VIEW AS: $got"
+# addendum: a connection whose session ended IN the mode is never re-seated by a fresh session (it would run on as
+# the viewer under the client's view-as label) - the client's next call is refused, a new connection works
+export ACL_COOKIE_JAR="$TMP/view_as_killed.jar"
+ask "SELECT 1" >/dev/null
+got="$(ask "SET SESSION VIEW AS ROLE 'analyst'")"
+echo "$got" | grep -qi "error" && fail "SET SESSION VIEW AS ROLE (second connection): $got"
+echo "SELECT count(*) FROM (SELECT acl_session_kill(id) AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\\s*\"([^\"]+)\"', 1)) AS id)) WHERE k;" >&3
+for _ in $(seq 1 30); do
+	got="$(ask "@catalogs")"
+	echo "$got" | grep -q "is gone" && break
+	sleep 0.2
+done
+echo "$got" | grep -q "viewed the catalog as a role and is gone" || fail "a killed view-as session was re-seated: $got"
+got="$(ask "SELECT count(*) FROM platform.roles")"
+echo "$got" | grep -q "is gone" || fail "a re-seated view-as connection ran a statement: $got"
+# ...nor is a swap: another principal on a connection in the mode gets no session there
+export ACL_COOKIE_JAR="$TMP/view_as_swap.jar"
+ask "SELECT 1" >/dev/null
+got="$(ask "SET SESSION VIEW AS ROLE 'analyst'")"
+echo "$got" | grep -qi "error" && fail "SET SESSION VIEW AS ROLE (third connection): $got"
+got="$(ask "@catalogs" "$OPS")"
+echo "$got" | grep -q "needs a connection of its own" || fail "a swap carried a view-as connection on: $got"
+got="$(ask "@catalogs")"
+[ "$got" = "{'catalog_name': ['c']}" ] || fail "the refused swap ended the viewer's own session: $got"
+# a SET on a per-call session (no cookie) would end with the call - refused, never lost silently
+unset ACL_COOKIE_JAR
+got="$(ask "SET SESSION VIEW AS ROLE 'analyst'")"
+echo "$got" | grep -q "this call's session ends with it" || fail "a view-as SET on a per-call session: $got"
+# a connection that DECLARES the mode on every call (x-acl-view-as - what the JDBC driver's acl.viewAs sends) is in
+# it from its first call, and a session seated afresh for it (killed here) is put in it again - never the viewer's
+export ACL_COOKIE_JAR="$TMP/view_as_declared.jar"
+export ACL_EXTRA_HEADERS="x-acl-view-as=analyst"
+got="$(ask "@catalogs")"
+[ "$got" = "{'catalog_name': ['c']}" ] || fail "a declared view-as is not analyst's: $got"
+got="$(ask "SELECT id FROM c.orders")"
+echo "$got" | grep -q "a view-as session reads metadata only" || fail "a read under a declared view-as: $got"
+echo "SELECT 'killed_declared' AS m, count(*) AS n FROM (SELECT acl_session_kill(id) AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\\s*\"([^\"]+)\"', 1)) AS id)) WHERE k;" >&3
+for _ in $(seq 1 50); do
+	grep -Eq "killed_declared *[|│] *[1-9]" "$TMP/server.log" && break
+	sleep 0.1
+done
+grep -Eq "killed_declared *[|│] *[1-9]" "$TMP/server.log" || fail "the kill of the declared session did not run"
+got="$(ask "@catalogs")" # a fresh session for the cookie - in the mode again
+[ "$got" = "{'catalog_name': ['c']}" ] || fail "a re-seated declared view-as left the mode: $got"
+got="$(ask "RESET SESSION VIEW AS")"
+echo "$got" | grep -q "declares its view-as mode on every call" || fail "a RESET on a declared connection: $got"
+export ACL_EXTRA_HEADERS="x-acl-view-as=no%20such"
+got="$(ask "@catalogs")"
+echo "$got" | grep -q 'role "no such" does not exist' || fail "a declared view-as of no role (percent-decoded): $got"
+# a DENY on platform.view_as wins over the policy bundle - for the header as for the SET
+echo "SELECT acl_grant_platform('boss', 'function', 'view_as', 'false');" >&3
+export ACL_COOKIE_JAR="$TMP/view_as_denied.jar"
+export ACL_EXTRA_HEADERS="x-acl-view-as=analyst"
+for _ in $(seq 1 30); do
+	got="$(ask "@catalogs")"
+	echo "$got" | grep -q "denied" && break
+	sleep 0.1
+done
+echo "$got" | grep -q "platform.view_as is denied" || fail "a declared view-as under a DENY: $got"
+echo "SELECT acl_revoke_platform('boss', 'function', 'view_as');" >&3
+unset ACL_EXTRA_HEADERS
+# a statement prepared IN the mode (a SET-only client) is not run once the right is lost
+unset ACL_COOKIE_JAR
+rm -f "$TMP/lost.ready" "$TMP/lost.go"
+python3 "$HERE/view_as_lost_client.py" "$URI" "$BOSS" "SELECT table_name FROM information_schema.tables" \
+	"$TMP/lost.ready" "$TMP/lost.go" > "$TMP/lost.out" 2>&1 &
+lost_pid=$!
+for _ in $(seq 1 100); do [ -f "$TMP/lost.ready" ] && break; sleep 0.1; done
+echo "SELECT acl_grant_platform('boss', 'function', 'view_as', 'false');" >&3
+sleep 1
+touch "$TMP/lost.go"
+wait $lost_pid || true
+echo "SELECT acl_revoke_platform('boss', 'function', 'view_as');" >&3
+grep -q "^first ok" "$TMP/lost.out" || fail "a statement prepared in the mode: $(cat "$TMP/lost.out")"
+tail -1 "$TMP/lost.out" | grep -q "^refused" || fail "a prepared statement ran after the right was lost: $(cat "$TMP/lost.out")"
+sleep 1
+export ACL_COOKIE_JAR="$TMP/view_as_declared_analyst.jar"
+export ACL_EXTRA_HEADERS="x-acl-view-as=analyst"
+got="$(ask "@catalogs" "$ANALYST")"
+echo "$got" | grep -q "the policy bundle's" || fail "a declared view-as without the policy bundle: $got"
+unset ACL_EXTRA_HEADERS
+export ACL_COOKIE_JAR="$TMP/view_as_new.jar"
+got="$(ask "@catalogs")"
+[ "$got" = "{'catalog_name': ['platform']}" ] || fail "a new connection after the refusal: $got"
 unset ACL_COOKIE_JAR
 # a statement prepared before the mode is the session's own rights - it does not run inside it
 got="$(python3 "$HERE/view_as_client.py" "$URI" "$BOSS" "SELECT count(*) AS n FROM platform.roles" 2>&1 || true)"

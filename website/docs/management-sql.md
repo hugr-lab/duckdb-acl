@@ -1073,10 +1073,19 @@ ACL SESSION 'h…' SELECT table_schema, table_name FROM information_schema.table
 ACL SESSION 'h…' RESET SESSION VIEW AS;
 ```
 
-A console that checks how a role sees the catalog (a DBeaver data source, for one) sets the mode on every
-connection it opens - DBeaver reads metadata over a connection of its own by default, so the statement goes into
-the connection's bootstrap queries - and keeps the door's session (the Flight cookie). A data preview is refused
-in the mode.
+A console that checks how a role sees the catalog (a DBeaver data source, for one) **declares the mode on every
+call** instead: on the Flight door the header `x-acl-view-as: <role>` (percent-encoded) puts the call's session in
+the mode - judged like the statement, or the call is refused - so a session the door seats afresh (the old one went
+idle, was killed, the node restarted, another node took the connection) is in the mode again, never the viewer's
+own. The JDBC driver's `acl.viewAs` sends it. On such a connection a `SET` / `RESET SESSION VIEW AS` is refused (open
+another connection to change the role); a `DENY FUNCTION platform.view_as` refuses the mode however it is asked for. A client that only SETs the mode is guarded on this node for a day:
+its connection is refused once its session ended in the mode (`… viewed the catalog as a role and is gone - connect
+again`); a SET on a per-call session (a Flight call without the session cookie) is refused - the mode would end
+with the call. Another principal's token on a connection in the mode is refused (`… needs a connection of its
+own`); the viewer's session is kept. When the viewer loses the right, or the role comes to hold administration or
+is dropped, the session's statements - and its statements prepared in the mode - are refused (`the view-as mode can
+no longer be kept … - connect again`), never run as the viewer; a RESET is the policy bundle's too, so the way out is
+a new connection. A data preview is refused in the mode.
 
 Function: `acl_session_view_as(role)` (`''` leaves) - or `platform.view_as(role)`.
 

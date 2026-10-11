@@ -428,10 +428,52 @@ void PolicyStore::AuditSessionRefused(const string &door, const char *reason_cod
 	SessionEvent(audit.get(), Principal(), door, "", -1, "refused", reason_code, reason, -1);
 }
 
+void PolicyStore::AuditSessionRefused(const string &door, const string &handle, const char *reason_code,
+                                      const string &reason) {
+	Principal principal;
+	string why;
+	PolicyStore::SessionRef ref;
+	auto known = SessionPrincipal(handle, principal, why) && SessionRefOf(handle, ref);
+	SessionEvent(audit.get(), known ? principal : Principal(), door, known ? ref.id : string(), -1, "refused",
+	             reason_code, reason, -1);
+}
+
+void PolicyStore::SessionMarkDeclaredViewAs(const string &handle) {
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry != sessions.end()) {
+		entry->second.declared_view_as = true;
+	}
+}
+
+bool PolicyStore::SessionDeclaredViewAs(const string &id) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			return entry.second.declared_view_as;
+		}
+	}
+	return false;
+}
+
 //! The close event of a session being removed (spec 069): how it ended, and for how long it lived.
 //! Caller holds the lock; the event itself takes nothing of the store's.
 void PolicyStore::SessionClosed(const Session &session, const char *how, int64_t now) {
 	session_notices.QueueClose(session.id, how); // spec 078: delivered once the lock is released
+	if (!session.view_as.empty()) {
+		// every removal passes here, before its binding goes: the ids it was bound to are never seated again
+		for (auto &entry : sessions) {
+			if (&entry.second != &session) {
+				continue;
+			}
+			for (auto &binding : session_bindings) {
+				if (binding.second == entry.first) {
+					view_as_ended[binding.first] = now;
+				}
+			}
+			break;
+		}
+	}
 	auto lived = session.opened_at > 0 ? (now - session.opened_at) * 1000000 : -1;
 	SessionEvent(audit.get(), session.principal, session.door, session.id, session.audit_level, how, "", "", lived);
 }
@@ -555,6 +597,10 @@ idx_t PolicyStore::SweepLocked(int64_t now, int64_t skew, int64_t idle, bool exp
 	// row here forever - the same unbounded growth this spec is about, one map to the left.
 	for (auto binding = session_bindings.begin(); binding != session_bindings.end();) {
 		binding = sessions.count(binding->second) == 0 ? session_bindings.erase(binding) : std::next(binding);
+	}
+	// a day is longer than any client keeps retrying a connection whose session is gone
+	for (auto ended = view_as_ended.begin(); ended != view_as_ended.end();) {
+		ended = ended->second + 86400 < now ? view_as_ended.erase(ended) : std::next(ended);
 	}
 	last_sweep = now;
 	return removed;
@@ -1166,6 +1212,62 @@ idx_t PolicyStore::SessionCloseAll() {
 	sessions.clear();
 	session_bindings.clear();
 	return closed;
+}
+
+bool PolicyStore::SessionViewAsEnded(const string &external_id) {
+	lock_guard<mutex> guard(lock);
+	return view_as_ended.count(external_id) > 0;
+}
+
+string PolicyStore::ViewAsRefusal(const AdminRights &rights, const string &role) {
+	if (!rights.Policy()) {
+		return "SET SESSION VIEW AS is the policy bundle's - a point grant does not reach it";
+	}
+	if (role.empty()) {
+		return string();
+	}
+	if (!rights.passthrough && rights.PlatformGrant("function", "view_as") == 0) {
+		return "platform.view_as is denied to this principal"; // a DENY wins over the policy bundle (spec 117)
+	}
+	if (!RoleDefined(role)) {
+		return StringUtil::Format("role \"%s\" does not exist", role);
+	}
+	if (!rights.passthrough) {
+		// a view never shows more than the viewer may read: a role holding administration is passthrough's to view
+		Principal viewed;
+		viewed.roles = {role};
+		if (AdminRightsOf(viewed).Privileged()) {
+			return StringUtil::Format("\"%s\" holds administration - viewing it would show more than the policy "
+			                          "bundle reads (the platform's node and cluster views), so it requires a "
+			                          "passthrough scope",
+			                          role);
+		}
+	}
+	return string();
+}
+
+void PolicyStore::SessionMarkPerCall(const string &handle) {
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry != sessions.end()) {
+		entry->second.per_call = true;
+	}
+}
+
+bool PolicyStore::SessionPerCall(const string &id) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			return entry.second.per_call;
+		}
+	}
+	return false;
+}
+
+bool PolicyStore::SessionInViewAs(const string &handle) {
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	return entry != sessions.end() && !entry->second.view_as.empty();
 }
 
 bool PolicyStore::SessionHandleFor(const string &external_id, string &handle) {

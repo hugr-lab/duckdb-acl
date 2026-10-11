@@ -1572,6 +1572,12 @@ void AclGrantPlatformFunc(DataChunk &args, ExpressionState &state, Vector &resul
 		if (allowed != "true" && allowed != "false") {
 			throw BinderException("acl_grant_platform: allowed is true or false, got \"%s\"", allowed);
 		}
+		if (allowed == "true" && kind == "function" && object == "view_as") {
+			// spec 120.3: the policy bundle's - a grant by name would grant nothing (a DENY still works, a REVOKE
+			// still removes a row written before)
+			throw BinderException("acl_grant_platform: platform.view_as is the policy bundle's - it is never granted "
+			                      "by name (a DENY still is)");
+		}
 		StoreOf(state).GrantPlatform(role, kind, object, allowed == "true");
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -2112,6 +2118,16 @@ void AclSessionViewAsFunc(DataChunk &args, ExpressionState &state, Vector &resul
 		                            "session of the client's own (a door's ACL SESSION)");
 	}
 	auto &store = StoreOf(state);
+	if (store.SessionDeclaredViewAs(current.session_id)) {
+		throw InvalidInputException("acl_session_view_as: this connection declares its view-as mode on every call "
+		                            "(x-acl-view-as) - open another connection to change it");
+	}
+	if (store.SessionPerCall(current.session_id)) {
+		// 120.3 addendum: the mode would end with this call and the next one would be the viewer's own
+		throw InvalidInputException("acl_session_view_as: this call's session ends with it - send the door's session "
+		                            "cookie (a client has one from its second call on), or declare the mode on every "
+		                            "call (x-acl-view-as)");
+	}
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = OptionalArg(args, 0, row, "");
 		if (!role.empty() && !store.RoleDefined(role)) {

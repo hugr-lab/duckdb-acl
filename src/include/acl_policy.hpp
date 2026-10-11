@@ -371,6 +371,12 @@ struct PolicyStore {
 		//! spec 120.3: the role an administrator views the catalog as (empty = none) - the session's statements
 		//! are rewritten as that role and read metadata only; set by `SET SESSION VIEW AS ROLE`, never by a role
 		string view_as;
+		//! A door's per-call session (a Flight call without the cookie, spec 050): it ends with the call, so a mode
+		//! set on it would end there too - `SET SESSION VIEW AS` is refused on one (120.3 addendum)
+		bool per_call = false;
+		//! The door's calls declare the mode (x-acl-view-as): a SET / RESET on the session would race the
+		//! declaration of the next call, so it is refused (120.3 addendum)
+		bool declared_view_as = false;
 		//! The stream the session's last rewritten statement drained (spec 042, judged on the AST), for
 		//! the door's completion hook to tell a load's outcome from any other statement's (spec 069);
 		//! taken once
@@ -433,6 +439,11 @@ struct PolicyStore {
 	//! is what turns "which connection is this" into "which principal is this" without the door ever
 	//! holding one.
 	unordered_map<string, string> session_bindings;
+	//! spec 120.3 addendum: the door ids (a Flight cookie) whose session ended while it viewed the catalog as a
+	//! role, and when. Such an id is never seated again (SessionViewAsEnded): a door re-seats a known cookie
+	//! with a fresh session, which would carry the client's connection on as the viewer under a
+	//! view-as label. Swept a day after.
+	unordered_map<string, int64_t> view_as_ended;
 	//! Whether a door of ours is serving on this instance (spec 043); see SetDoorOpen. Atomic, not
 	//! under `lock`: the parser override reads it on every unprefixed statement of the process.
 	std::atomic<bool> door_open {false};
@@ -922,6 +933,12 @@ struct PolicyStore {
 	//! replaces it: a door that reconnects under the same id gets the session it just authenticated.
 	void SessionBind(const string &external_id, const string &handle);
 	bool SessionHandleFor(const string &external_id, string &handle);
+	//! spec 120.3 addendum: whether the session bound to `external_id` ended in a view-as mode (a door then
+	//! refuses to seat that id again), and whether the session `handle` is in one now
+	bool SessionViewAsEnded(const string &external_id);
+	bool SessionInViewAs(const string &handle);
+	void SessionMarkPerCall(const string &handle);
+	bool SessionPerCall(const string &id);
 	//! Drop every session and binding, and say how many there were. What a door does when it closes:
 	//! the connections it served will never come back, and nothing else can tell that they are gone.
 	idx_t SessionCloseAll();
@@ -983,6 +1000,10 @@ struct PolicyStore {
 	//! A door refused a client before any session (spec 079: the node's seats): the `session refused`
 	//! event, with nobody's principal, so the counters and the audit see it like any other refusal.
 	void AuditSessionRefused(const string &door, const char *reason_code, const string &reason);
+	//! The same, for a session the door already resolved: the event names its principal and ops id
+	void AuditSessionRefused(const string &door, const string &handle, const char *reason_code, const string &reason);
+	void SessionMarkDeclaredViewAs(const string &handle);
+	bool SessionDeclaredViewAs(const string &id);
 	//! A door's connection is gone (spec 079: quack's DISCONNECT, or its heartbeat lease ran out): the
 	//! session bound to it (SessionBind) ends now with `how`, instead of waiting out the idle timeout.
 	void SessionEndBound(const string &external_id, const char *how);
@@ -1124,6 +1145,9 @@ struct PolicyStore {
 	};
 	//! The principal's effective rights: the strongest over its roles and its catalog grants
 	AdminRights AdminRightsOf(const Principal &principal);
+	//! spec 120.3: why `rights` may not view the catalog as `role` (empty: it may) - the one judgment the authorizer
+	//! (SET SESSION VIEW AS), every batch of a session in the mode and the Flight door's x-acl-view-as share
+	string ViewAsRefusal(const AdminRights &rights, const string &role);
 	//! spec 095 / 117: the role holds any administration (a bundle, a catalog's manage, a point grant on
 	//! platform) - reached only through a client's own mapping, mapped only by passthrough
 	bool RolePrivileged(const string &role);
