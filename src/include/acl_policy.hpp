@@ -371,6 +371,9 @@ struct PolicyStore {
 		//! spec 120.3: the role an administrator views the catalog as (empty = none) - the session's statements
 		//! are rewritten as that role and read metadata only; set by `SET SESSION VIEW AS ROLE`, never by a role
 		string view_as;
+		//! A door's per-call session (a Flight call without the cookie, spec 050): it ends with the call, so a mode
+		//! set on it would end there too - `SET SESSION VIEW AS` is refused on one (120.3 addendum)
+		bool per_call = false;
 		//! The stream the session's last rewritten statement drained (spec 042, judged on the AST), for
 		//! the door's completion hook to tell a load's outcome from any other statement's (spec 069);
 		//! taken once
@@ -931,6 +934,8 @@ struct PolicyStore {
 	//! refuses to seat that id again), and whether the session `handle` is in one now
 	bool SessionViewAsEnded(const string &external_id);
 	bool SessionInViewAs(const string &handle);
+	void SessionMarkPerCall(const string &handle);
+	bool SessionPerCall(const string &id);
 	//! Drop every session and binding, and say how many there were. What a door does when it closes:
 	//! the connections it served will never come back, and nothing else can tell that they are gone.
 	idx_t SessionCloseAll();
@@ -1133,6 +1138,9 @@ struct PolicyStore {
 	};
 	//! The principal's effective rights: the strongest over its roles and its catalog grants
 	AdminRights AdminRightsOf(const Principal &principal);
+	//! spec 120.3: why `rights` may not view the catalog as `role` (empty: it may) - the one judgment the authorizer
+	//! (SET SESSION VIEW AS), every batch of a session in the mode and the Flight door's x-acl-view-as share
+	string ViewAsRefusal(const AdminRights &rights, const string &role);
 	//! spec 095 / 117: the role holds any administration (a bundle, a catalog's manage, a point grant on
 	//! platform) - reached only through a client's own mapping, mapped only by passthrough
 	bool RolePrivileged(const string &role);

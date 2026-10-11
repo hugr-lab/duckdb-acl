@@ -196,22 +196,36 @@ the role's own, every data path refused; export round trip; created_by written a
   `test/e2e/flight/admin.sh` + `view_as_client.py` (GetCatalogs / GetTables as the role, a read refused, a statement
   prepared before the mode refused inside it).
 
-#### 120.3 addendum (2026-10-11): the mode fails closed (found by acl-clients spec 007.2's review)
-- **A connection that ended in the mode is never re-seated.** The Flight door re-seats a known cookie whose session
-  died (idle, `KILL SESSION`) with a fresh session - which has no `view_as`, so a console's view-as connection went on
-  as the viewer under the role's label. Now every removal (`SessionClosed`, the one seam) of a session in the
-  mode records the door ids bound to it (`view_as_ended`, swept a day later), and `SessionFor` refuses such a cookie
-  - and a swap away from a session in the mode (another principal's token on that cookie) - with `acl: this
-  connection's session viewed the catalog as a role and is gone - connect again`; a new connection sets the mode
-  again. quack binds a session per connection and re-seats nothing.
-- **`console_info` offers `view_as` only to the policy bundle**: `PlatformAccess::CallsFunction` said yes to a point
-  grant on `platform.view_as` that the authorizer then refused; a point grant on it is now refused where it is
-  written (`acl_grant_platform`: "the policy bundle's - it is never granted by name"), and one written before is
-  neither offered nor obeyed (nothing is removed).
-- Docs: a console treats a refused SET as a failed connect (DBeaver's bootstrap queries only log it).
-- Tests: `test/e2e/flight/admin.sh` (a killed view-as session's cookie refused, then a new connection works; a swap
-  refused and the viewer's own session kept - fails without the fix: the cookie came back as the viewer, `platform`),
-  `test_acl_view_as.cpp` (the point grant refused at write; a legacy row neither offered by console_info nor obeyed).
+#### 120.3 addendum (2026-10-11): the mode fails closed (found by acl-clients spec 007.2's reviews)
+The mode lived on the session record only, so every path that replaced or emptied the record went on as the viewer
+under a client's view-as label: the Flight door re-seats a known cookie whose session died (idle, `KILL SESSION`, a
+restart, another node behind a front) with a fresh session; a lost right left the mode silently; a SET on a per-call
+session ended with the call.
+- **Declared per call** (the robust form): `x-acl-view-as: <role>` (percent-encoded) on a Flight call puts the call's
+  session in the mode before the call runs (`DeclaredViewAs` in `UnderSession`), judged by `ViewAsRefusal` - the one
+  judgment `SET SESSION VIEW AS`, every batch in the mode and the header share (the policy bundle; the role exists;
+  a role holding administration is passthrough's) - or refuses the call. A re-seated session is in the mode again.
+  The JDBC driver's `acl.viewAs` sends it (acl-clients spec 006's addendum).
+- **A SET alone** is guarded on this node: every removal (`SessionClosed`) of a session in the mode records the door
+  ids bound to it (`view_as_ended`, swept a day later), and the door refuses such a cookie when the call does not
+  declare the mode; a node restart or another node forgets it (the header is the answer). A swap to another
+  principal on a connection in the mode is refused (the viewer's session kept). A SET on a per-call session
+  (`Session::per_call`, marked by the door) is refused.
+- **A lost right refuses**: `ViewAsOf` keeps the mode and the batch is refused (`the view-as mode can no longer be
+  kept (…) - connect again`) when the viewer lost the policy bundle or the role came to hold administration or was
+  dropped - it used to leave the mode and run as the viewer.
+- **`view_as` is the policy bundle's alone**: `console_info` no longer offers it through a point grant (the authorizer
+  refused that grant); `acl_grant_platform` refuses a GRANT on it (a DENY and a REVOKE still work - a row written
+  before stays removable, nothing is removed automatically).
+- Audit: each door refusal is a `session refused` event with reason code `view_as`.
+- Tests: `test/e2e/flight/admin.sh` (a killed SET-only session's cookie refused - fails without the fix: the cookie
+  came back as the viewer -, a new connection works; a swap refused, the viewer's session kept; a SET on a per-call
+  session refused; a declared connection in the mode from its first call, re-seated after a kill in the mode again,
+  a declared unknown role and a declaration without the policy bundle refused), `test_acl_view_as.cpp` (the GRANT
+  refused, DENY / REVOKE written; a row written before neither offered nor obeyed beside an offered sibling, after a
+  version bump; a viewer that loses the bundle refused, never its own view).
+- Not here: a concurrent SET and swap on one cookie (two RPCs of one client racing) - the header closes it for a
+  declaring client.
 
 ### 120.5 (2026-10-11)
 - Schema v22 (min_reader 21 - nullable columns at the end; a v21 build reads by name and never writes a newer

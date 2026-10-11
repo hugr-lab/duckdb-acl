@@ -663,8 +663,9 @@ void NoteManagement(vector<unique_ptr<SQLStatement>> &statements, StatementAudit
 
 //! spec 120.3: the role the session is viewed as (empty: not in view-as mode, or not a session of the client's own).
 //! Judged again on every batch: a viewer that no longer holds the policy bundle - or a viewed role that came to
-//! hold administration, for a viewer below passthrough - ends the mode, never keeps it
-string ViewAsOf(PolicyStore &store, const AclPrefix &prefix) {
+//! hold administration, or was dropped - KEEPS the mode, and `lost` says why: the batch is refused (addendum - it
+//! used to leave the mode and run as the viewer, under the client's view-as label)
+string ViewAsOf(PolicyStore &store, const AclPrefix &prefix, string &lost) {
 	if (prefix.kind != AclPrefix::Kind::SESSION && prefix.kind != AclPrefix::Kind::INGEST) {
 		return string();
 	}
@@ -681,17 +682,7 @@ string ViewAsOf(PolicyStore &store, const AclPrefix &prefix) {
 	if (!store.SessionPrincipal(prefix.value, viewer, reason)) {
 		return string(); // the session's own refusal follows where the principal is resolved
 	}
-	auto rights = store.AdminRightsOf(viewer);
-	bool keeps = rights.Policy();
-	if (keeps && !rights.passthrough) {
-		Principal viewed;
-		viewed.roles = {role};
-		keeps = !store.AdminRightsOf(viewed).Privileged();
-	}
-	if (!keeps) {
-		store.SessionViewAs(ref.id, string());
-		return string();
-	}
+	lost = store.ViewAsRefusal(store.AdminRightsOf(viewer), role);
 	return role;
 }
 
@@ -741,7 +732,8 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	bool secrets = mode == AclPrefix::Mode::MANAGE && IsSecretsStart(prefix.rest);
 	// spec 120.3: a session viewed as a role reads that role's metadata; management (but leaving the mode),
 	// secrets and native SQL are refused - judged on the session's own principal, never the viewed role
-	auto viewing = ViewAsOf(store, prefix);
+	string lost;
+	auto viewing = ViewAsOf(store, prefix, lost);
 	if (!viewing.empty() && (secrets || mode == AclPrefix::Mode::NATIVE || prefix.kind == AclPrefix::Kind::INGEST)) {
 		RefuseInViewAs();
 	}
@@ -934,6 +926,10 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	audit.phase = Reason::PRINCIPAL;
 	ResolvePrincipal(store, prefix, principal);
 	audit.proto.principal = principal;
+	if (!lost.empty()) {
+		NoteDenyReason(Reason::MGMT_UNAUTHORIZED);
+		throw BinderException("acl: the view-as mode can no longer be kept (%s) - connect again", lost);
+	}
 	if (!viewing.empty()) {
 		// the statements are rewritten as the viewed role would have them - as `ACL ROLE "<r>"` - on this
 		// session's connection; the audit keeps who looked (the session's principal) and says as whom

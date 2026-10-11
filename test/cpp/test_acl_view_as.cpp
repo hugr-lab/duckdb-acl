@@ -179,32 +179,39 @@ int main(int argc, char *argv[]) {
 		Check(Contains(Rows(con, "ACL SESSION '" + pt + "' SELECT count(*) FROM platform.sessions"), "ERROR"),
 		      "...but not what pol does not read");
 		Exec(con, "SELECT acl_session_close('" + pt + "')");
-		// addendum: a point grant on platform.view_as is refused where it is written (it would grant nothing), and
-		// one written before is not offered by console_info either - a console shows only what works
-		Check(Contains(Rows(con, "ACL ADMIN GRANT FUNCTION platform.view_as TO ROLE cadm"),
-		               "the policy bundle's - it is never granted by name"),
+		// addendum: a point grant on platform.view_as is refused where it is written (it would grant nothing); a DENY
+		// and a REVOKE still work
+		Check(Contains(Rows(con, "ACL ADMIN GRANT FUNCTION platform.view_as TO ROLE cadm"), "never granted by name"),
 		      "a point grant on platform.view_as is refused at write");
+		CheckOk(*con.Query("ACL ADMIN DENY FUNCTION platform.view_as TO ROLE pol2"), "a DENY on it is written");
+		CheckOk(*con.Query("ACL ADMIN REVOKE FUNCTION platform.view_as FROM ROLE pol2"), "...and revoked");
+		// one written before (a v21 node took it): neither offered by console_info nor obeyed - beside a sibling
+		// point grant written the same way, which is offered (the control: the rows are read)
 		Exec(con, "INSERT INTO store.acl.platform_grants (\"role\", \"object\", \"kind\", \"allowed\") "
-		          "VALUES ('cadm', 'view_as', 'function', true)");
-		Check(!Contains(Rows(con, "ACL SESSION '" + catalog_admin +
-		                              "' SELECT list_contains(my_functions, 'view_as') FROM platform.console_info()"),
-		                "true"),
-		      "console_info does not offer view_as through a point grant");
+		          "VALUES ('cadm', 'view_as', 'function', true), ('cadm', 'create_role', 'function', true)");
+		Exec(con, "ACL ADMIN CREATE ROLE bump_policy_version");
+		auto offered = Rows(con, "ACL SESSION '" + catalog_admin +
+		                             "' SELECT list_contains(my_functions, 'view_as') || ',' || "
+		                             "list_contains(my_functions, 'create_role') FROM platform.console_info()");
+		Check(offered == "false,true", "console_info offers the sibling and not view_as: " + offered);
 		auto refused = Rows(con, "ACL SESSION '" + catalog_admin + "' SET SESSION VIEW AS ROLE 'r'");
-		Check(Contains(refused, "ERROR"), "...and the mode refuses it: " + refused);
-		Check(!MetadataOnly(Rows(con, "ACL SESSION '" + catalog_admin + "' SELECT id FROM c.orders")),
-		      "...and the session is not in it");
+		Check(Contains(refused, "a point grant does not reach it"), "...and the mode refuses it: " + refused);
+		CheckOk(*con.Query("ACL ADMIN REVOKE FUNCTION platform.view_as FROM ROLE cadm"),
+		        "...and a REVOKE removes the row written before");
 		Exec(con, "DELETE FROM store.acl.platform_grants WHERE \"role\" = 'cadm'");
 	});
 
-	Scenario("a viewer that loses the policy bundle leaves the mode at once", [&]() {
+	Scenario("a viewer that loses the policy bundle is refused at once, never its own view", [&]() {
 		auto pol2 = OpenSession(con, "pol2tok");
 		auto in = "ACL SESSION '" + pol2 + "' ";
 		CheckOk(*con.Query(in + "SET SESSION VIEW AS ROLE 'r'"), "pol2 views as r");
 		Check(Rows(con, in + "SELECT table_name FROM information_schema.tables") == "orders", "...r's tree");
 		Exec(con, "ACL ADMIN REVOKE ADMIN FROM ROLE pol2");
+		// addendum: refused - never pol2's own tree under the client's view-as label
 		auto after = Rows(con, in + "SELECT table_name FROM information_schema.tables");
-		Check(after != "orders" && !MetadataOnly(after), "the next statement is pol2's own again: " + after);
+		Check(Contains(after, "the view-as mode can no longer be kept") && Contains(after, "policy bundle's"),
+		      "the next statement is refused: " + after);
+		Check(Contains(Rows(con, in + "SELECT id FROM c.orders"), "can no longer be kept"), "...a read too");
 		Exec(con, "SELECT acl_session_close('" + pol2 + "')");
 	});
 

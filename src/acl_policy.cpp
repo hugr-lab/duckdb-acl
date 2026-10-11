@@ -1191,6 +1191,48 @@ bool PolicyStore::SessionViewAsEnded(const string &external_id) {
 	return view_as_ended.count(external_id) > 0;
 }
 
+string PolicyStore::ViewAsRefusal(const AdminRights &rights, const string &role) {
+	if (!rights.Policy()) {
+		return "SET SESSION VIEW AS is the policy bundle's - a point grant does not reach it";
+	}
+	if (role.empty()) {
+		return string();
+	}
+	if (!RoleDefined(role)) {
+		return StringUtil::Format("role \"%s\" does not exist", role);
+	}
+	if (!rights.passthrough) {
+		// a view never shows more than the viewer may read: a role holding administration is passthrough's to view
+		Principal viewed;
+		viewed.roles = {role};
+		if (AdminRightsOf(viewed).Privileged()) {
+			return StringUtil::Format("\"%s\" holds administration - viewing it would show more than the policy "
+			                          "bundle reads (the platform's node and cluster views), so it requires a "
+			                          "passthrough scope",
+			                          role);
+		}
+	}
+	return string();
+}
+
+void PolicyStore::SessionMarkPerCall(const string &handle) {
+	lock_guard<mutex> guard(lock);
+	auto entry = sessions.find(handle);
+	if (entry != sessions.end()) {
+		entry->second.per_call = true;
+	}
+}
+
+bool PolicyStore::SessionPerCall(const string &id) {
+	lock_guard<mutex> guard(lock);
+	for (auto &entry : sessions) {
+		if (entry.second.id == id) {
+			return entry.second.per_call;
+		}
+	}
+	return false;
+}
+
 bool PolicyStore::SessionInViewAs(const string &handle) {
 	lock_guard<mutex> guard(lock);
 	auto entry = sessions.find(handle);

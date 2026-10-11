@@ -188,9 +188,37 @@ ask "SELECT 1" >/dev/null
 got="$(ask "SET SESSION VIEW AS ROLE 'analyst'")"
 echo "$got" | grep -qi "error" && fail "SET SESSION VIEW AS ROLE (third connection): $got"
 got="$(ask "@catalogs" "$OPS")"
-echo "$got" | grep -q "viewed the catalog as a role and is gone" || fail "a swap carried a view-as connection on: $got"
+echo "$got" | grep -q "needs a connection of its own" || fail "a swap carried a view-as connection on: $got"
 got="$(ask "@catalogs")"
 [ "$got" = "{'catalog_name': ['c']}" ] || fail "the refused swap ended the viewer's own session: $got"
+# a SET on a per-call session (no cookie) would end with the call - refused, never lost silently
+unset ACL_COOKIE_JAR
+got="$(ask "SET SESSION VIEW AS ROLE 'analyst'")"
+echo "$got" | grep -q "this call's session ends with it" || fail "a view-as SET on a per-call session: $got"
+# a connection that DECLARES the mode on every call (x-acl-view-as - what the JDBC driver's acl.viewAs sends) is in
+# it from its first call, and a session seated afresh for it (killed here) is put in it again - never the viewer's
+export ACL_COOKIE_JAR="$TMP/view_as_declared.jar"
+export ACL_EXTRA_HEADERS="x-acl-view-as=analyst"
+got="$(ask "@catalogs")"
+[ "$got" = "{'catalog_name': ['c']}" ] || fail "a declared view-as is not analyst's: $got"
+got="$(ask "SELECT id FROM c.orders")"
+echo "$got" | grep -q "a view-as session reads metadata only" || fail "a read under a declared view-as: $got"
+echo "SELECT count(*) FROM (SELECT acl_session_kill(id) AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\\s*\"([^\"]+)\"', 1)) AS id)) WHERE k;" >&3
+for _ in $(seq 1 30); do
+	n="$(ask "SELECT 1")" # each call lands on a fresh session once the kill ran - in the mode again
+	got="$(ask "@catalogs")"
+	[ "$got" = "{'catalog_name': ['c']}" ] || break
+	sleep 0.1
+done
+[ "$got" = "{'catalog_name': ['c']}" ] || fail "a re-seated declared view-as left the mode: $got"
+export ACL_EXTRA_HEADERS="x-acl-view-as=nosuch"
+got="$(ask "@catalogs")"
+echo "$got" | grep -q 'role "nosuch" does not exist' || fail "a declared view-as of no role: $got"
+export ACL_COOKIE_JAR="$TMP/view_as_declared_analyst.jar"
+export ACL_EXTRA_HEADERS="x-acl-view-as=analyst"
+got="$(ask "@catalogs" "$ANALYST")"
+echo "$got" | grep -q "the policy bundle's" || fail "a declared view-as without the policy bundle: $got"
+unset ACL_EXTRA_HEADERS
 export ACL_COOKIE_JAR="$TMP/view_as_new.jar"
 got="$(ask "@catalogs")"
 [ "$got" = "{'catalog_name': ['platform']}" ] || fail "a new connection after the refusal: $got"

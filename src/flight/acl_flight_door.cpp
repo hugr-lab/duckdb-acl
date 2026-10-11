@@ -2407,9 +2407,12 @@ private:
 			if (!transient) {
 				// a connection-long session (spec 050): the sweeper, exp, CloseSession or the door's
 				// stop end it - an RPC boundary does not
+				ARROW_RETURN_NOT_OK(DeclaredViewAs(context, handle));
 				return body(handle);
 			}
 			SessionScope scope(*state, handle);
+			state->store->SessionMarkPerCall(handle);
+			ARROW_RETURN_NOT_OK(DeclaredViewAs(context, handle));
 			return body(handle);
 		} catch (std::exception &ex) {
 			// duckdb's what() is a JSON envelope; ErrorData gives the message a person wrote
@@ -2440,6 +2443,46 @@ private:
 		} catch (std::exception &) {
 			return false;
 		}
+	}
+
+	static bool DeclaresViewAs(const flight::ServerCallContext &context) {
+		for (const auto &header : context.incoming_headers()) {
+			if (StringUtil::CIEquals(string(header.first), "x-acl-view-as") && !header.second.empty()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! spec 120.3 addendum: a connection that views the catalog as a role says so on every call (`x-acl-view-as:
+	//! <role>`, percent-encoded), and the call runs in that mode - judged as `SET SESSION VIEW AS` is - or not at
+	//! all. The mode is the connection's, not only the session's: a session the door seats afresh (an idle death, a
+	//! node restart, another node behind a front) is put in it again, never left as the viewer's own.
+	arrow::Status DeclaredViewAs(const flight::ServerCallContext &context, const string &handle) {
+		string role;
+		for (const auto &header : context.incoming_headers()) {
+			if (StringUtil::CIEquals(string(header.first), "x-acl-view-as")) {
+				role = StringUtil::URLDecode(string(header.second));
+			}
+		}
+		if (role.empty()) {
+			return arrow::Status::OK();
+		}
+		Principal viewer;
+		string reason;
+		PolicyStore::SessionRef ref;
+		if (!state->store->SessionPrincipal(handle, viewer, reason) || !state->store->SessionRefOf(handle, ref)) {
+			return arrow::Status::UnknownError("acl: authentication failed");
+		}
+		auto why = state->store->ViewAsRefusal(state->store->AdminRightsOf(viewer), role);
+		if (!why.empty()) {
+			state->store->AuditSessionRefused("flight", "view_as", why);
+			return arrow::Status::Invalid("acl: x-acl-view-as: " + why);
+		}
+		if (state->store->SessionViewAsOf(ref.id) != role) {
+			state->store->SessionViewAs(ref.id, role);
+		}
+		return arrow::Status::OK();
 	}
 
 	//! The caller's session (spec 050): the client's connection, identified by the cookie our
@@ -2485,8 +2528,15 @@ private:
 		// session - one that died in the mode (idle, killed) or a swap away from it would run the client's
 		// next statement as the viewer under the client's view-as label. A new connection sets the
 		// mode again.
-		if (!transient && (state->store->SessionViewAsEnded(cookie) ||
-		                   (!replacing.empty() && state->store->SessionInViewAs(replacing)))) {
+		// (A client that declares the mode on every call - x-acl-view-as, below - is put in it again instead; this
+		// guards one that only SET it, and only while this node remembers: its memory, for a day.)
+		if (!transient && !replacing.empty() && state->store->SessionInViewAs(replacing)) {
+			state->store->AuditSessionRefused("flight", "view_as", "a swap on a view-as connection");
+			return arrow::Status::Invalid("acl: this connection views the catalog as a role - another principal's "
+			                              "token needs a connection of its own");
+		}
+		if (!transient && !DeclaresViewAs(context) && state->store->SessionViewAsEnded(cookie)) {
+			state->store->AuditSessionRefused("flight", "view_as", "a view-as connection's session is gone");
 			return arrow::Status::Invalid("acl: this connection's session viewed the catalog as a role and is gone - "
 			                              "connect again");
 		}

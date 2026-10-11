@@ -1553,10 +1553,6 @@ void PlatformGrantTarget(DataChunk &args, idx_t row, const char *fn, string &rol
 	if (!function) {
 		throw BinderException("%s: the platform catalog has no function \"%s\"", fn, object);
 	}
-	if (string(function->target) == "acl_session_view_as") {
-		// spec 120.3: the policy bundle's - a point grant on it would grant nothing
-		throw BinderException("%s: platform.%s is the policy bundle's - it is never granted by name", fn, object);
-	}
 	if (function->right == PlatformRight::ESCALATES || function->right == PlatformRight::INFRASTRUCTURE ||
 	    function->right == PlatformRight::OPEN) {
 		throw BinderException("%s: platform.%s is %s - it is never granted by name", fn, object,
@@ -1575,6 +1571,12 @@ void AclGrantPlatformFunc(DataChunk &args, ExpressionState &state, Vector &resul
 		auto allowed = StringUtil::Lower(OptionalArg(args, 3, row, "true"));
 		if (allowed != "true" && allowed != "false") {
 			throw BinderException("acl_grant_platform: allowed is true or false, got \"%s\"", allowed);
+		}
+		if (allowed == "true" && kind == "function" && object == "view_as") {
+			// spec 120.3: the policy bundle's - a grant by name would grant nothing (a DENY still works, a REVOKE
+			// still removes a row written before)
+			throw BinderException("acl_grant_platform: platform.view_as is the policy bundle's - it is never granted "
+			                      "by name (a DENY still is)");
 		}
 		StoreOf(state).GrantPlatform(role, kind, object, allowed == "true");
 	}
@@ -2116,6 +2118,12 @@ void AclSessionViewAsFunc(DataChunk &args, ExpressionState &state, Vector &resul
 		                            "session of the client's own (a door's ACL SESSION)");
 	}
 	auto &store = StoreOf(state);
+	if (store.SessionPerCall(current.session_id)) {
+		// 120.3 addendum: the mode would end with this call and the next one would be the viewer's own
+		throw InvalidInputException("acl_session_view_as: this call's session ends with it - send the door's session "
+		                            "cookie (a client has one from its second call on), or declare the mode on every "
+		                            "call (x-acl-view-as)");
+	}
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = OptionalArg(args, 0, row, "");
 		if (!role.empty() && !store.RoleDefined(role)) {

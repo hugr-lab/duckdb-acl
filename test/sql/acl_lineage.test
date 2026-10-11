@@ -322,6 +322,10 @@ SELECT payload->>'roles', payload->>'subject' FROM acl_lineage_events() WHERE se
 
 # --- a plain SELECT is not a lineage event -----------------------------------------------------------------
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -340,6 +344,10 @@ SELECT count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
 0
 
 # --- spec 112 §6: a write in a client's transaction is a run when the transaction ends ---------------------
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
 
 statement ok
 DELETE FROM before;
@@ -376,6 +384,10 @@ SELECT event_type, count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FR
 ----
 RUN_ABORT	2
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -400,6 +412,10 @@ SELECT event_type, count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FR
 RUN_COMPLETE	1
 
 # a failed statement is final at once; what the transaction did before it is aborted with it
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -429,6 +445,10 @@ RUN_ABORT	1
 RUN_FAIL	1
 
 # a write inside a CTE is a write, not a read: its run has the target
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -454,6 +474,10 @@ ACL ROLE "w" DELETE FROM c.main.sink WHERE a >= 100;
 statement ok
 SELECT acl_lineage_flush();
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -470,6 +494,10 @@ ACL ADMIN CREATE VIRTUAL SCHEMA c.home AS phys.home;
 
 statement ok
 ACL ADMIN GRANT SCHEMA c.home TO ROLE w WITH (select, insert, create, drop);
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
 
 statement ok
 DELETE FROM before;
@@ -506,6 +534,10 @@ FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
 id:INTEGER total:DOUBLE
 
 # an INSERT into the object the CTAS made, through the alias
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -535,6 +567,10 @@ ACL ROLE "w" DROP TABLE home.model;
 statement ok
 SELECT acl_lineage_flush();
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -555,6 +591,10 @@ ACL ADMIN GRANT SCHEMA c.exp TO ROLE w WITH (select, insert, create, drop);
 statement ok
 ACL ROLE "w" CREATE TABLE exp.model__tmp AS SELECT id, total FROM src;
 
+statement ok
+SELECT acl_lineage_flush();
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
 statement ok
 SELECT acl_lineage_flush();
 
@@ -593,6 +633,10 @@ ACL ROLE "w" CREATE TABLE home.alias__tmp AS SELECT id FROM src;
 statement ok
 SELECT acl_lineage_flush();
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -611,6 +655,10 @@ FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) ORDER BY 1;
 ----
 DATASET	NULL	c.home.alias__tmp
 RUN_COMPLETE	c.home.alias__tmp	c.home.alias_model
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
 
 statement ok
 DELETE FROM before;
@@ -646,6 +694,10 @@ SELECT count(*) FROM acl_lineage_events() WHERE payload->>'sql' IS NOT NULL;
 statement ok
 SET GLOBAL acl_lineage_sql = 'normalized';
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -668,6 +720,10 @@ statement ok
 SET GLOBAL acl_lineage_sql = 'off';
 
 # === physical statements: the operator's own SQL, named physically (there is no rewrite to undo) ==========
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
 
 statement ok
 DELETE FROM before;
@@ -748,6 +804,10 @@ STRUCT	city:VARCHAR zip:VARCHAR
 statement ok
 ACL ADMIN CREATE ROLE clerk;
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -816,6 +876,10 @@ CREATE TABLE dwh.main.facts(id INTEGER, v DOUBLE);
 
 statement ok
 SELECT acl_lineage_source('dwh', 'postgres://db.corp:5432/analytics');
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
 
 statement ok
 DELETE FROM before;
@@ -887,6 +951,10 @@ ATTACH ':memory:' AS dwh;
 statement ok
 CREATE TABLE dwh.main.facts(id INTEGER, v DOUBLE);
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -921,6 +989,10 @@ ATTACH ':memory:' AS dwh;
 
 statement ok
 CREATE TABLE dwh.main.facts(id INTEGER, v DOUBLE);
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
 
 statement ok
 DELETE FROM before;
@@ -968,6 +1040,10 @@ DETACH dwh;
 
 # --- ATTACH … LINEAGE '<identity>': the same, written where the source is attached ---------------------
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -1011,6 +1087,10 @@ ATTACH ':memory:' AS lost;
 
 statement ok
 CREATE TABLE lost.main.t(i INTEGER);
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
 
 statement ok
 DELETE FROM before;
@@ -1089,6 +1169,10 @@ acl_lineage_status
 
 # === the client's context: a step of an external job (OPENLINEAGE_PARENT_ID's format) ====================
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -1113,6 +1197,10 @@ SELECT payload->'root_parent'->>'run_id' FROM acl_lineage_events() WHERE seq > (
 01929e3a-0000-7000-8000-0000000000ff
 
 # a read is emitted only as a declared step: its inputs, no target, no edges
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -1133,6 +1221,10 @@ FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
 RUN_COMPLETE	c.main.src	0	0
 
 # spec 112 §5: what reads nothing is no step - a catalog refresh, a description, a probe of no rows
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -1266,6 +1358,10 @@ ACL LINEAGE PARENT requires a quoted value
 
 # === the static picture again, for a transport that starts on an empty catalog ==========================
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -1289,6 +1385,10 @@ true
 
 # --- VALUES read nothing: the run is exact, not approximate -------------------------------------------------
 
+statement ok
+SELECT acl_lineage_flush();
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
 statement ok
 SELECT acl_lineage_flush();
 
@@ -1321,6 +1421,10 @@ ACL ADMIN GRANT CATALOG c TO ROLE sinker WITH (insert) MAIN;
 statement ok
 SELECT acl_lineage_flush();
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -1343,6 +1447,10 @@ c.main.sink	[a, b]	false
 
 # --- a name written with its catalog binds in the scratch mirror as it did on the node ----------------------
 
+statement ok
+SELECT acl_lineage_flush();
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
 statement ok
 SELECT acl_lineage_flush();
 
@@ -1379,6 +1487,10 @@ ACL ADMIN GRANT CATALOG c TO ROLE merger WITH (select, insert, update, delete, m
 statement ok
 SELECT acl_lineage_flush();
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -1405,6 +1517,10 @@ b	c.main.src.ssn	DIRECT
 
 # --- DELETE: the target, its filter ----------------------------------------------------------------------
 
+statement ok
+SELECT acl_lineage_flush();
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
 statement ok
 SELECT acl_lineage_flush();
 
@@ -1444,6 +1560,10 @@ ACL ADMIN CREATE VIRTUAL TABLE c.prices AS phys.main.prices;
 statement ok
 SELECT acl_lineage_flush();
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -1467,6 +1587,10 @@ sku	items[].sku
 
 # a struct built in the statement has no path of its own: struct_pack(x := id).x is id
 
+statement ok
+SELECT acl_lineage_flush();
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
 statement ok
 SELECT acl_lineage_flush();
 
@@ -1496,6 +1620,10 @@ b	ssn
 statement ok
 SELECT acl_lineage_flush();
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -1515,6 +1643,10 @@ false
 
 # --- a PREPARE is no run; each execution of a prepared physical write is one ------------------------------
 
+statement ok
+SELECT acl_lineage_flush();
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
 statement ok
 SELECT acl_lineage_flush();
 
@@ -1546,6 +1678,10 @@ RUN_COMPLETE	2
 statement ok
 SET GLOBAL acl_lineage_sql = 'normalized';
 
+statement ok
+SELECT acl_lineage_flush();
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
 statement ok
 SELECT acl_lineage_flush();
 
@@ -1618,6 +1754,10 @@ ACL ROLE "w" SELECT acl_lineage_resend();
 statement ok
 SELECT acl_lineage_flush();
 
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
+
 statement ok
 DELETE FROM before;
 
@@ -1668,6 +1808,10 @@ FROM acl_lineage_events() WHERE event_type = 'DATASET' ORDER BY seq DESC LIMIT 2
 ----
 c."a.b".Sink	Raw Data.Order Items	acl://test/source/phys
 c.main.Order Items	Raw Data.Order Items	acl://test/source/phys
+
+# the mark after the worker has drained what the steps before queued (a late event would land past it)
+statement ok
+SELECT acl_lineage_flush();
 
 statement ok
 DELETE FROM before;

@@ -343,7 +343,7 @@ combined with a certificate. Both doors require cert **and** key together.
   one view or function (`platform_grants`, its own table - never a catalog grant, a function grant or a
   category, which could spread it into every listing or hand it to every role). **Only `passthrough`
   grants on `platform` and grants the bundles** - a grantor that can grant everything is everything;
-  never to every role, never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `migrate_catalog` (the passthrough scope's own), `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` (the cluster bundle's alone) and `console_info` (every holder's). A deny wins over every bundle but `passthrough`.
+  never to every role, never on `grant_admin`, `revoke_admin`, `grant_platform`, `revoke_platform`, `migrate_catalog` (the passthrough scope's own), `cluster_extension`, `cluster_attach`, `cluster_detach`, `cluster_setting` (the cluster bundle's alone), `view_as` (the policy bundle's - granted by name it would grant nothing; a DENY on it still works) and `console_info` (every holder's). A deny wins over every bundle but `passthrough`.
 - **A metadata answer is bounded, never cut** (spec 119): above `acl_metadata_max_rows` the statement is
   refused; the narrowing a listing takes from its WHERE only chooses which physical sources are read - it never
   changes the answer (the WHERE stays as written) and reads only sources behind objects the principal sees.
