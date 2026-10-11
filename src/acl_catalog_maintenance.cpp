@@ -972,8 +972,190 @@ vector<PolicyStore::CatalogFinding> PolicyStore::CatalogCheck(const string &only
 	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
 		CatalogChecker checker(*catalog, catalogs_rows.GetValue(0, row).ToString(), out);
 		checker.Run();
+		SourcesNotGranted(catalogs_rows.GetValue(0, row).ToString(), out);
 	}
 	return out;
+}
+
+//! spec 120.5: an object an administrator below policy defined (created_roles: the roles the source gate bound when it
+//! was written) that reads a physical source its roles are no longer granted - the GRANT SOURCE to run. Showing only:
+//! nothing built is taken back (spec 118.3); the object goes on working.
+void PolicyStore::SourcesNotGranted(const string &vcat, vector<CatalogFinding> &out) {
+	struct Defined {
+		string kind, name, roles, created_by;
+		vector<std::pair<vector<string>, bool>> reads; // a physical name's parts; true = a schema path
+	};
+	vector<Defined> defined;
+	auto split_key = [](const string &key, vector<string> &parts) {
+		NamePath path;
+		string error;
+		if (!NamePath::TryFromKey(key, path, error)) {
+			return false;
+		}
+		parts = path.Parts();
+		return true;
+	};
+	auto body_reads = [](const string &body, bool expression, Defined &into) {
+		vector<vector<string>> tables;
+		try {
+			StoredBodyTables(body, expression, tables);
+		} catch (std::exception &) {
+			return; // a body that does not parse is definition_broken's - judged there
+		}
+		for (auto &table : tables) {
+			if (table.size() >= 2) { // `t` alone is the node's default database - no source of an administrator's
+				into.reads.emplace_back(table, false);
+			}
+		}
+	};
+	auto where = " WHERE \"vcat\" = " + Lit(vcat) + " AND \"created_roles\" IS NOT NULL";
+	// an alias of a function names a source only when its first part is an attached database (AuthorizeSources' rule)
+	case_insensitive_set_t databases;
+	{
+		auto attached = catalog->Query("SELECT database_name FROM duckdb_databases()");
+		ResultRows attached_rows(*attached);
+		for (idx_t i = 0; i < attached_rows.Count(); i++) {
+			databases.insert(attached_rows.GetValue(0, i).ToString());
+		}
+	}
+	auto relations =
+	    catalog->Query("SELECT \"vname\", \"form\", \"phys\", \"view_sql\", \"created_roles\", "
+	                   "\"created_by\", \"rls\", (SELECT list(c.\"expr\") FROM " +
+	                   catalog->Tbl("relation_columns") +
+	                   " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\" AND c.\"expr\" IS NOT NULL"
+	                   " AND trim(c.\"expr\") <> '') FROM " +
+	                   catalog->Tbl("relations") + " r" + where + " ORDER BY 1");
+	ResultRows relation_rows(*relations);
+	for (idx_t i = 0; i < relation_rows.Count(); i++) {
+		Defined entry {Text(relation_rows.GetValue(1, i)) == "view" ? "view" : "table",
+		               relation_rows.GetValue(0, i).ToString(),
+		               Text(relation_rows.GetValue(4, i)),
+		               Text(relation_rows.GetValue(5, i)),
+		               {}};
+		vector<string> parts;
+		if (!Text(relation_rows.GetValue(2, i)).empty() && split_key(Text(relation_rows.GetValue(2, i)), parts)) {
+			entry.reads.emplace_back(parts, false);
+		}
+		if (!Text(relation_rows.GetValue(3, i)).empty()) {
+			body_reads(Text(relation_rows.GetValue(3, i)), false, entry);
+		}
+		if (!Text(relation_rows.GetValue(6, i)).empty()) {
+			body_reads(Text(relation_rows.GetValue(6, i)), true, entry); // the relation's own RLS
+		}
+		auto expressions = relation_rows.GetValue(7, i);
+		if (!expressions.IsNull()) {
+			for (auto &expression : ListValue::GetChildren(expressions)) {
+				body_reads(expression.ToString(), true, entry); // a computed or remapped column
+			}
+		}
+		defined.push_back(std::move(entry));
+	}
+	auto schemas = catalog->Query("SELECT \"path\", \"phys_path\", \"created_roles\", \"created_by\" FROM " +
+	                              catalog->Tbl("schemas") + where + " ORDER BY 1");
+	ResultRows schema_rows(*schemas);
+	for (idx_t i = 0; i < schema_rows.Count(); i++) {
+		Defined entry {"schema",
+		               schema_rows.GetValue(0, i).ToString(),
+		               Text(schema_rows.GetValue(2, i)),
+		               Text(schema_rows.GetValue(3, i)),
+		               {}};
+		vector<string> parts;
+		if (!Text(schema_rows.GetValue(1, i)).empty() && split_key(Text(schema_rows.GetValue(1, i)), parts)) {
+			entry.reads.emplace_back(parts, true);
+		}
+		defined.push_back(std::move(entry));
+	}
+	auto functions = catalog->Query("SELECT \"vname\", \"kind\", \"target\", \"template\", \"created_roles\", "
+	                                "\"created_by\" FROM " +
+	                                catalog->Tbl("functions") + where + " ORDER BY 1");
+	ResultRows function_rows(*functions);
+	for (idx_t i = 0; i < function_rows.Count(); i++) {
+		Defined entry {"function",
+		               function_rows.GetValue(0, i).ToString(),
+		               Text(function_rows.GetValue(4, i)),
+		               Text(function_rows.GetValue(5, i)),
+		               {}};
+		vector<string> parts;
+		if (!Text(function_rows.GetValue(2, i)).empty() && split_key(Text(function_rows.GetValue(2, i)), parts) &&
+		    parts.size() >= 2 && databases.count(parts[0])) {
+			entry.reads.emplace_back(parts, false);
+		}
+		if (!Text(function_rows.GetValue(3, i)).empty()) {
+			body_reads(Text(function_rows.GetValue(3, i)), Text(function_rows.GetValue(1, i)) == "scalar", entry);
+		}
+		defined.push_back(std::move(entry));
+	}
+	auto references = catalog->Query("SELECT \"name\", \"expr\", \"created_roles\", \"created_by\" FROM " +
+	                                 catalog->Tbl("references") + where + " AND \"expr\" IS NOT NULL ORDER BY 1");
+	ResultRows reference_rows(*references);
+	for (idx_t i = 0; i < reference_rows.Count(); i++) {
+		Defined entry {"reference",
+		               reference_rows.GetValue(0, i).ToString(),
+		               Text(reference_rows.GetValue(2, i)),
+		               Text(reference_rows.GetValue(3, i)),
+		               {}};
+		body_reads(Text(reference_rows.GetValue(1, i)), true, entry); // ON EXPRESSION
+		defined.push_back(std::move(entry));
+	}
+	for (auto &entry : defined) {
+		Principal author;
+		author.roles = StringUtil::Split(entry.roles, "\x1f");
+		auto rights = AdminRightsOf(author);
+		if (rights.Policy()) {
+			continue; // its roles build over every source now
+		}
+		// the role the repair names: one that still administers (a token's roles may hold a broad data role too)
+		string grantee;
+		bool any_role = false;
+		for (auto &role : author.roles) {
+			any_role = any_role || RoleDefined(role);
+			Principal one;
+			one.roles = {role};
+			if (grantee.empty() && AdminRightsOf(one).MayAdminister()) {
+				grantee = role;
+			}
+		}
+		auto granted = GrantedSources(rights);
+		vector<string> missing;
+		for (auto &read : entry.reads) {
+			if (SourceGranted(granted, read.first, read.second)) {
+				continue;
+			}
+			// what to grant: the database and the schema it reads in (`db.t` reads main)
+			auto source = NamePath::QuotePart(read.first[0]);
+			if (read.first.size() >= (read.second ? 2 : 3)) {
+				source = NamePath::JoinKeys(source, NamePath::QuotePart(read.first[1]));
+			} else if (!read.second) {
+				source = NamePath::JoinKeys(source, "main");
+			}
+			if (std::find(missing.begin(), missing.end(), source) == missing.end()) {
+				missing.push_back(source);
+			}
+		}
+		auto shown_roles = StringUtil::Join(author.roles, ", ");
+		for (auto &source : missing) {
+			if (!any_role || grantee.empty()) {
+				// the roles are gone (or administer nothing now): granting them a source would hand it to whoever
+				// takes the name next - the object is the operator's to redefine or drop
+				out.push_back(CatalogFinding {
+				    vcat, entry.kind, entry.name, author.roles.empty() ? string() : author.roles[0],
+				    "source_not_granted",
+				    "defined by " + (entry.created_by.empty() ? string("(unknown)") : entry.created_by) + " as " +
+				        shown_roles + ", it reads " + NamePath::Display(source) + " - and " +
+				        (any_role ? "those roles administer nothing now" : "those roles no longer exist"),
+				    "redefine or drop the object"});
+				continue;
+			}
+			out.push_back(CatalogFinding {
+			    vcat, entry.kind, entry.name, grantee, "source_not_granted",
+			    "defined by " + (entry.created_by.empty() ? string("(unknown)") : entry.created_by) + " as " +
+			        shown_roles + ", it reads " + NamePath::Display(source) +
+			        ", outside the sources granted to those roles now - it goes on working; grant the source, or "
+			        "redefine the object",
+			    "GRANT SOURCE " + NamePath::KeyToGrammar(source) + " TO ROLE " +
+			        NamePath::KeyToGrammar(NamePath::QuotePart(grantee))});
+		}
+	}
 }
 
 int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vname, const string &action_p,
@@ -1187,6 +1369,7 @@ void CheckScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 
 //! acl_repair_relation(vcat, vname, action[, spec]) -> entries changed
 void RepairRelationFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	AuthorScope author(state); // spec 120.5: the definition's writer
 	vector<Value> counts;
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_repair_relation", "catalog"));

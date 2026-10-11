@@ -826,16 +826,16 @@ private:
 			// the role registers what exists; it never materialises. The CREATE itself is dropped
 			// from the batch, so nothing physical happens.
 			drop_statement = true;
-			follow_ups.push_back(AclCall("acl_register_existing",
-			                             {Value(target.vcat), Value(target.vname), Value(phys), Value(target.origin)}));
+			follow_ups.push_back(AclCall("acl_register_existing", {Value(target.vcat), Value(target.vname), Value(phys),
+			                                                       Value(target.origin), Value(AuthorOf(principal))}));
 			return;
 		}
 		info.SetQualifiedName(ParsePhysName(phys));
 		if (target.needs_record) {
 			// an expansion shows only its own records, so the new object needs one - written after
 			// the CREATE, so a failure leaves nothing behind
-			follow_ups.push_back(AclCall("acl_register_created",
-			                             {Value(target.vcat), Value(target.vname), Value(phys), Value(target.origin)}));
+			follow_ups.push_back(AclCall("acl_register_created", {Value(target.vcat), Value(target.vname), Value(phys),
+			                                                      Value(target.origin), Value(AuthorOf(principal))}));
 		}
 	}
 
@@ -1211,7 +1211,8 @@ private:
 		keep_claim_markers = false;
 		auto body = info.query->ToString();
 		drop_statement = true;
-		follow_ups.push_back(AclCall("acl_register_view", {Value(target.vcat), Value(target.vname), Value(body)}));
+		follow_ups.push_back(AclCall(
+		    "acl_register_view", {Value(target.vcat), Value(target.vname), Value(body), Value(AuthorOf(principal))}));
 	}
 
 	void RewriteDropStatement(DropStatement &stmt) {

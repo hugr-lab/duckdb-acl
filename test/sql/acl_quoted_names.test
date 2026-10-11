@@ -1192,7 +1192,7 @@ DELETE FROM old.acl.relations WHERE vname IN ('a"b', 'x..y');
 query T
 SELECT acl_migrate_catalog('old', 'acl');
 ----
-"old"."acl" migrated from schema version 19 to 21 (readable from build 21 on)
+"old"."acl" migrated from schema version 19 to 22 (readable from build 21 on)
 
 query T
 SELECT value FROM old.acl.meta WHERE key = 'min_reader_version';

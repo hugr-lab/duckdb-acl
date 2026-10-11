@@ -53,6 +53,12 @@ struct ProfileNote {
 //! virtual catalog (then its lineage is the worker's). For `ACL NATIVE` it also answers its principal
 //! and door; for a statement nobody decided, both stay empty.
 bool StatementDecidedVirtual(ClientContext &context, Principal &principal, string &door);
+//! spec 120.5: who the running statement was decided for, as an object's `created_by` records it - `<issuer>|<subject>`
+//! for a token, the role for a gateway's ACL ROLE; empty for the anonymous gateway and for a statement nobody decided
+//! (the operator's own SQL)
+string StatementAuthor(ClientContext &context);
+//! spec 120.5: the principal the running statement was decided for (false: none - the operator, the anonymous gateway)
+bool StatementPrincipal(ClientContext &context, Principal &out);
 //! spec 107: the running statement's physical lineage, emitted by QueryEnd with its outcome.
 void SetPhysicalLineage(ClientContext &context, shared_ptr<PhysicalLineage> lineage);
 //! spec 107: the running statement is a PREPARE - no execution, so no run at its QueryEnd.

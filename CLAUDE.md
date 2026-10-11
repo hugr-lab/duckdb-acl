@@ -725,7 +725,7 @@ raise, a RESET's default passes) wraps each substituted surface: a constant `LIM
 `least(session, node)` judged where it runs, above it `error()` - refused, never cut (duckdb segfaulted on a
 LIMIT with a subquery). A narrowed listing is parsed outside the template cache. Bench: `test/bench/metadata_scale.py`.
 
-**Spec 120 — maintenance** (in stages; 120.1, 120.2, 120.3 built): the missing forms - `ALTER ROLE r SET COMMENT` (`acl_comment_role`;
+**Spec 120 — maintenance** (in stages; 120.1, 120.2, 120.3, 120.5 built): the missing forms - `ALTER ROLE r SET COMMENT` (`acl_comment_role`;
 a re-define keeps the comment), `REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r` (`acl_revoke_object`, HANDS_OUT),
 `ALTER VIRTUAL REFERENCE c.n SET COMMENT|CARDINALITY|OPTIONAL` + `COMMENT ON VIRTUAL REFERENCE` (`acl_alter_reference`),
 `ALTER RESOURCE GROUP g SET (limits) | SET COMMENT` (`acl_alter_resource_group` fields `limits` / `comment`, only the
@@ -748,8 +748,16 @@ transaction / CALL and, outside a DESCRIBE, every object read, table function (b
 virtual scalar, plus SUMMARIZE; a function outside `system` (GateFunction), USE, temps. Below passthrough a role holding
 administration may not be viewed (AuthorizeRoleTargets), and `ViewAsOf` re-judges every batch (a lost right ends
 the mode); the decision is passed to `RewriteStatements(…, metadata_only)`. Flight reservations carry the mode
-(owner suffix, `FlightDoorState::Owns`). Tests `test/cpp/test_acl_view_as.cpp`, `test/e2e/flight/admin.sh`. Next: 120.5
-created_by (export after the release).
+(owner suffix, `FlightDoorState::Owns`). Tests `test/cpp/test_acl_view_as.cpp`, `test/e2e/flight/admin.sh`.
+**120.5** - schema v22 (min_reader 21): `created_by` + `created_roles` on relations / schemas / functions /
+references; `AuthorScope` (acl_door_common) around the creating admin functions takes the author from the decision's
+note (`StatementAuthor` / `AuthorOf`: `<iss>|<sub>` or the role; NULL operator / anonymous) - a principal's own CREATE
+names it in the rewriter's follow-up (`acl_register_*`'s last argument); a redefinition keeps `created_by`, while
+`created_roles` is the CURRENT definition's writer when the source gate bound it (administers, below policy - `\x1f`
+joined), NULL otherwise (`CreatedByLit`). The gate also judges `acl_refresh_schema_objects` (by the expansion's origin). `acl_check_catalog` adds
+`source_not_granted` (`PolicyStore::SourcesNotGranted`, bodies via `StoredBodyTables`). Found: a parse nested in a
+decision (the source gate's probe) left a boundary in front of the batch's notes - the definition ran noteless (no
+profile, no AclConnection); `PushProfileNote` drops it. Export (120.4) after the release.
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant

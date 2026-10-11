@@ -1,6 +1,7 @@
 #include "acl_door_common.hpp"
 #include "acl_platform.hpp"
 #include "acl_name_path.hpp"
+#include "acl_profile.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -12,6 +13,50 @@ namespace acl {
 
 shared_ptr<PolicyStore> SharedStoreOf(ExpressionState &state) {
 	return state.expr.Cast<BoundFunctionExpression>().Function().GetExtraFunctionInfo().Cast<AclScalarInfo>().store;
+}
+
+namespace {
+//! A pointer, never a string (spec 088): a thread_local with a non-trivial destructor is not safe on MinGW
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+thread_local const string *author_in_scope = nullptr;
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+thread_local const string *author_roles_in_scope = nullptr;
+} // namespace
+
+AuthorScope::AuthorScope(ExpressionState &state) : author(StatementAuthor(state.GetContext())) {
+	Principal principal;
+	if (StatementPrincipal(state.GetContext(), principal)) {
+		auto rights = StoreOf(state).AdminRightsOf(principal);
+		if (rights.MayAdminister() && !rights.Policy()) {
+			// the source gate bound this writer (spec 118.3: everyone below policy, the cluster bundle too); a unit
+			// separator between the roles - a role name may hold a comma
+			roles = StringUtil::Join(principal.roles, "\x1f");
+		}
+	}
+	previous_author = author_in_scope;
+	previous_roles = author_roles_in_scope;
+	author_in_scope = &author;
+	author_roles_in_scope = &roles;
+}
+
+AuthorScope::AuthorScope(const string &author_p) : author(author_p) {
+	previous_author = author_in_scope;
+	previous_roles = author_roles_in_scope;
+	author_in_scope = &author;
+	author_roles_in_scope = &roles;
+}
+
+AuthorScope::~AuthorScope() {
+	author_in_scope = previous_author;
+	author_roles_in_scope = previous_roles;
+}
+
+string AuthorInScope() {
+	return author_in_scope ? *author_in_scope : string();
+}
+
+string AuthorRolesInScope() {
+	return author_roles_in_scope ? *author_roles_in_scope : string();
 }
 
 PolicyStore &StoreOf(ExpressionState &state) {

@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS <meta>("key" ACL_KEY_TEXT PRIMARY KEY, "value" VARCHA
 
 CREATE TABLE IF NOT EXISTS <catalogs>("vcat" ACL_KEY_TEXT PRIMARY KEY, "comment" VARCHAR);
 
-CREATE TABLE IF NOT EXISTS <relations>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, "alias_types" VARCHAR, "enum_types" VARCHAR, PRIMARY KEY ("vcat", "vname"));
+CREATE TABLE IF NOT EXISTS <relations>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "form" VARCHAR, "phys" VARCHAR, "view_sql" VARCHAR, "rls" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "rls_checked" BOOLEAN, "alias_types" VARCHAR, "enum_types" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "vname"));
 
 CREATE TABLE IF NOT EXISTS <relation_columns>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "pos" INTEGER, "name" VARCHAR, "expr" VARCHAR, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "pos"));
 
@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS <relation_columns>("vcat" ACL_KEY_TEXT, "vname" ACL_K
 -- as_base (aliases -> base type), as_varchar (ENUMs -> VARCHAR), as_both; NULL where it changes nothing.
 CREATE TABLE IF NOT EXISTS <relation_types>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "column" ACL_KEY_TEXT, "as_base" VARCHAR, "as_varchar" VARCHAR, "as_both" VARCHAR, PRIMARY KEY ("vcat", "vname", "column"));
 
-CREATE TABLE IF NOT EXISTS <functions>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "form" VARCHAR, "target" VARCHAR, "template" VARCHAR, "comment" VARCHAR, "params" VARCHAR, PRIMARY KEY ("vcat", "vname", "kind"));
+CREATE TABLE IF NOT EXISTS <functions>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "form" VARCHAR, "target" VARCHAR, "template" VARCHAR, "comment" VARCHAR, "params" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "vname", "kind"));
 
 CREATE TABLE IF NOT EXISTS <roles>("role" ACL_KEY_TEXT PRIMARY KEY, "comment" VARCHAR);
 
@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS <role_mappings>("scope_kind" ACL_KEY_TEXT, "scope_nam
 -- physical row to read names and types from). Runs after every CREATE TABLE above.
 CREATE TABLE IF NOT EXISTS <object_columns>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, "comment" VARCHAR, "derived" BOOLEAN, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "kind", "pos"));
 
-CREATE TABLE IF NOT EXISTS <schemas>("vcat" ACL_KEY_TEXT, "path" ACL_KEY_TEXT, "phys_path" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, PRIMARY KEY ("vcat", "path"));
+CREATE TABLE IF NOT EXISTS <schemas>("vcat" ACL_KEY_TEXT, "path" ACL_KEY_TEXT, "phys_path" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "path"));
 
 CREATE TABLE IF NOT EXISTS <role_schemas>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, "schema_path" ACL_KEY_TEXT, "caps" VARCHAR, "inherited" BOOLEAN, "comment" VARCHAR, "into" VARCHAR, "virtual_only" BOOLEAN, PRIMARY KEY ("role", "vcat", "schema_path"));
 
@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS <schema_dropped>("vcat" ACL_KEY_TEXT, "path" ACL_KEY_
 
 -- and the record is a hint an agent reads. The columns live in their own table so that
 -- visibility is an anti-join rather than the parsing of a packed string.
-CREATE TABLE IF NOT EXISTS <references>("vcat" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "from_vname" VARCHAR, "to_vname" VARCHAR, "to_kind" VARCHAR, "expr" VARCHAR, "cardinality" VARCHAR, "optional" BOOLEAN, "join_method" VARCHAR, "comment" VARCHAR, PRIMARY KEY ("vcat", "name"));
+CREATE TABLE IF NOT EXISTS <references>("vcat" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "from_vname" VARCHAR, "to_vname" VARCHAR, "to_kind" VARCHAR, "expr" VARCHAR, "cardinality" VARCHAR, "optional" BOOLEAN, "join_method" VARCHAR, "comment" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "name"));
 
 CREATE TABLE IF NOT EXISTS <reference_columns>("vcat" ACL_KEY_TEXT, "name" ACL_KEY_TEXT, "pos" INTEGER, "side" ACL_KEY_TEXT, "column" VARCHAR, "param" VARCHAR, PRIMARY KEY ("vcat", "name", "pos", "side"));
 
@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS <cluster_deps>("scope" ACL_KEY_TEXT, "name" ACL_KEY_T
 -- @seed function_categories
 
 -- @section schema
-INSERT INTO <meta> SELECT 'schema_version', '21' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '22' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');

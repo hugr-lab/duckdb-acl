@@ -184,6 +184,8 @@ void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> 
 void RegisterAclPlatformSources(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
 //! spec 120.2 (acl_platform_rights.cpp): acl_effective_rights(role, catalog[, object]), acl_exposures(source[, …])
 void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
+//! spec 120.2: the tables a stored body names, as written - parsed, never bound (a view's SELECT, a macro's expression)
+void StoredBodyTables(const string &body, bool expression, vector<vector<string>> &tables);
 //! the sources granted to the principal (`<alias>` or `<alias>.<schema>` keys, kind `source`)
 vector<string> GrantedSources(const PolicyStore::AdminRights &rights);
 //! passthrough, policy and the cluster bundle see every source (only passthrough and policy build over every

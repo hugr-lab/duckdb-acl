@@ -133,12 +133,12 @@ Policy views (the `policy` bundle; marked *c* - also a catalog admin, narrowed):
 | View | Columns |
 | --- | --- |
 | `catalogs` *c* | catalog, comment |
-| `relations` *c* | catalog, name, form, phys, view_sql, rls, rls_checked BOOLEAN, origin, comment, alias_types, enum_types |
+| `relations` *c* | catalog, name, form, phys, view_sql, rls, rls_checked BOOLEAN, origin, comment, alias_types, enum_types, created_by |
 | `relation_columns` *c* | catalog, relation, pos BIGINT, name, expr, nullable BOOLEAN |
-| `schemas` *c* | catalog, path, phys_path, origin, comment |
-| `functions` *c* | catalog, name, kind, form, target, template, params VARCHAR[], comment |
+| `schemas` *c* | catalog, path, phys_path, origin, comment, created_by |
+| `functions` *c* | catalog, name, kind, form, target, template, params VARCHAR[], comment, created_by |
 | `function_columns` *c* | catalog, function, kind, pos BIGINT, name, type, comment, nullable BOOLEAN |
-| `references` *c* | catalog, name, from_object, to_object, to_kind, expression, cardinality, optional BOOLEAN, join_method, comment |
+| `references` *c* | catalog, name, from_object, to_object, to_kind, expression, cardinality, optional BOOLEAN, join_method, comment, created_by |
 | `reference_columns` *c* | catalog, reference, pos BIGINT, side, column, param |
 | `keys` *c* | catalog, object, kind, pos BIGINT, column |
 | `roles` *c* | role, comment |
@@ -162,6 +162,12 @@ Policy views (the `policy` bundle; marked *c* - also a catalog admin, narrowed):
 | `cluster_items` † | scope, kind, name, spec `MAP(VARCHAR, VARCHAR)`, class, version BIGINT, depends_on VARCHAR[], comment |
 | `cluster_effective` † | the same, what applies to this node (spec 096) |
 | `catalog_schema` | build, build_min_reader, catalog, min_reader (BIGINT), mode |
+
+`created_by` (spec 120): who defined the object first - `<issuer>|<subject>` for a token, the role for a gateway's
+`ACL ROLE`, NULL for the operator's own SQL, the anonymous gateway and anything defined before schema v22; a
+redefinition and a rename keep it. It is a fact, never a right. What the check (`source_not_granted`) judges is the
+current definition's writer: the roles the source gate bound when it was written (an administrator below `policy`),
+dropped when another writer redefines the object.
 
 Node views (the `observe` bundle):
 
@@ -401,3 +407,7 @@ several bundles) and `platform_grants` is new. An older catalog is migrated with
 nothing is rewritten. The step refuses while a virtual catalog (or a grant on one) is named `platform`:
 rename or drop it, then migrate. `min_reader_version` is 21 - a build before it does not know the
 bundles and does not serve a v21 catalog.
+
+Schema v22 (spec 120) adds `created_by` and `created_roles` at the end of `relations`, `schemas`, `functions` and
+`references` - nullable, so its `min_reader_version` stays 21: a v21 build serves a v22 catalog and, inside the
+window, never writes it. `acl_migrate_catalog` applies it like any step; objects defined before stay NULL.

@@ -98,8 +98,8 @@ object of booleans (`{"select": true, "manage": true}`), extensible without a mi
 
 ## Schema versions and migration (specs 034, 094)
 
-The catalog says which shape it is: `meta.schema_version`, currently **19**. It also says the oldest
-build that may still read it: `meta.min_reader_version`, currently **18**. A build judges the pair
+The catalog says which shape it is: `meta.schema_version`, currently **22**. It also says the oldest
+build that may still read it: `meta.min_reader_version`, currently **21**. A build judges the pair
 where the catalog is chosen (`acl_use_db`) and again at every freshness check (below), so a catalog
 migrated under a running node is noticed without a restart.
 
@@ -157,6 +157,9 @@ another engine. The shipped steps are:
 | `v17` | 095 | rebuilds `issuers` (name, URL, secret), adds `clients`, scopes `role_mappings`; each issuer becomes the short form (an issuer named by its URL and its implicit client); keys, algs, `jwks_uri` and `client_secret` are **dropped** - an issuer that relied on them needs an `oidc_issuer` / `oidc_client` secret or reads its keys by discovery; an audience `*` no longer means "any" |
 | `v18` | 096 | adds `is_default` to `resource_groups` (the default group); keeps `min_reader_version` 17 |
 | `v19` | 099 | adds `alias_types` / `enum_types` to `relations` and the `relation_types` facts (empty until an object is written or `ANALYZE`d - `acl_check_catalog` reports `types_stale` until then); keeps `min_reader_version` 18 |
+| `v20` | 116 | names may hold a quoted part and compare case-insensitively; refuses case collisions; stamps `min_reader_version` 20 |
+| `v21` | 117 | rebuilds `admins` keyed `(role, scope, vcat)`, adds `platform_grants`; refuses a catalog named `platform`; stamps `min_reader_version` 21 |
+| `v22` | 120 | adds `created_by` / `created_roles` to `relations`, `schemas`, `functions`, `references` (who defined an object first; the roles the source gate bound for its current definition); keeps `min_reader_version` 21 |
 
 The contract behind this is in `schema/migrations/README.md`:
 - `acl_schema.sql` always creates the current version complete, and a migrated catalog must be
