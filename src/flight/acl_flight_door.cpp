@@ -2044,10 +2044,21 @@ public:
 			if (parser.statements.size() != 1) {
 				return false;
 			}
-			// spec 117: a top-level platform.<op>(…) call is one change too
+			// spec 117: a top-level platform.<op>(…) call is one change too - but a read function in FROM
+			// (`SELECT * FROM platform.check_catalog(…)`, effective_rights, exposures) answers rows: a query, whose
+			// prepared form must announce its rows' schema (found by acl-clients 007.3: JDBC read an empty schema as
+			// an update and got no result set)
 			unique_ptr<SQLStatement> compiled;
 			try {
 				if (acl::CompilePlatformCall(*parser.statements[0], compiled)) {
+					auto &statement = *parser.statements[0];
+					if (statement.type == StatementType::SELECT_STATEMENT) {
+						auto &node = *statement.Cast<SelectStatement>().node;
+						if (node.type == QueryNodeType::SELECT_NODE && node.Cast<SelectNode>().from_table &&
+						    node.Cast<SelectNode>().from_table->type == TableReferenceType::TABLE_FUNCTION) {
+							return false;
+						}
+					}
 					return true;
 				}
 			} catch (std::exception &) {

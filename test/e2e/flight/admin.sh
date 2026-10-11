@@ -256,6 +256,27 @@ unset ACL_COOKIE_JAR
 got="$(python3 "$HERE/view_as_client.py" "$URI" "$BOSS" "SELECT count(*) AS n FROM platform.roles" 2>&1 || true)"
 [ "$got" = "refused" ] || fail "a statement prepared before view-as ran inside it: $got"
 
+# --- spec 117 addendum (found by acl-clients 007.3): a platform read function, prepared, announces its rows -------
+# the prepared path (Arrow's JDBC driver runs even executeQuery that way) read an empty schema as an update
+got="$(python3 - "$URI" "$BOSS" "$HERE" <<'PY' 2>&1
+import os, sys
+HERE = sys.argv[3]
+__file__ = os.path.join(HERE, "view_as_client.py")
+exec(open(__file__).read().split("uri, token, query = sys.argv")[0])
+uri, token = sys.argv[1], sys.argv[2]
+client = flight.FlightClient(uri, middleware=[MemoryJarFactory()])
+options = flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {token}".encode())])
+for query in ("SELECT * FROM platform.effective_rights('analyst', 'c')", "SELECT * FROM platform.check_catalog('c')"):
+    request = command("ActionCreatePreparedStatementRequest", text(1, query))
+    result = list(client.do_action(flight.Action("CreatePreparedStatement", request), options))
+    fields = fields_of(fields_of(result[0].body.to_pybytes())[2])
+    import pyarrow as pa
+    schema = pa.ipc.read_schema(pa.py_buffer(fields.get(2, b""))) if fields.get(2) else None
+    print(schema is not None and len(schema) > 0)
+PY
+)"
+[ "$(echo "$got" | tr -d '\n')" = "TrueTrue" ] || fail "a prepared platform read function announced no columns: $got"
+
 # --- spec 118: the operate bundle drains and resumes the node, and administers no policy ---------------
 got="$(ask "DRAIN NODE" "$OPS")"
 echo "$got" | grep -q "\[[0-9]*\]" || fail "DRAIN NODE under operate: $got"
