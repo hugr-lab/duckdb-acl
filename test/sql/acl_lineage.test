@@ -1255,10 +1255,12 @@ ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-
 statement ok
 SELECT acl_lineage_flush();
 
-query I
-SELECT count(*) FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before);
+# no RUN - what the statements above would be; the run's type and job are named, so a failure says what came (the
+# linux distribution build saw an approximate run with no dataset: now no step at all)
+query II
+SELECT event_type, payload->'job'->>'name' FROM acl_lineage_events()
+WHERE seq > (SELECT seq FROM before) AND event_type LIKE 'RUN_%';
 ----
-0
 
 statement ok
 ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-000000000002' SELECT * FROM main.duckdb_tables();
