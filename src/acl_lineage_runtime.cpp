@@ -959,6 +959,11 @@ void LineageWorker::Process(LineageJob &job, LineageOutcome outcome) {
 		walk.has_target = false;
 		walk.outputs.clear();
 		walk.whole_target.clear();
+		if (walk.datasets.empty()) {
+			// spec 112 §5: a read that names no dataset is no step - nothing known to have been read (a scratch bind
+			// that failed left the probe's empty plan unjudged: the linux distribution build emitted such a run)
+			return;
+		}
 	}
 	auto lineage = LineageFromWalk(walk, settings);
 	lineage->event_type = LineageRunEventType(outcome);

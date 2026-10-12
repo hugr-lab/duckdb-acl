@@ -277,3 +277,10 @@ end with the connection.
   - the batch scope and the probe's note are restored on every way out (`LineageBatchScope`).
 - **Not done here:** a runtime call of a *virtual table function* still does not bind in the scratch
   (approximate); a CTE write with a parameter in its result binds nowhere in the scratch (approximate, no target); a declared-before-ATTACH identity binds lazily (at the first lineage lookup); quack's `executemany` is not batched (one statement per row on that protocol).
+
+## Addendum 2026-10-12: a declared read that names no dataset is no run
+The linux distribution build emitted an approximate `RUN_COMPLETE` with no dataset for one of §5's probes under a
+declared parent (a scratch bind that failed there left the empty plan unjudged - `reads_nothing` never set). A read
+under a declared parent whose walk names no dataset now emits nothing: there is nothing it is known to have read,
+which is §5's rule. A write still emits its (approximate) run. Test: `acl_lineage.test`'s no-run steps now list any
+`RUN_*` with its job, so a failure says what came.

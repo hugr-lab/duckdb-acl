@@ -1255,10 +1255,10 @@ ACL ROLE "w" LINEAGE PARENT 'airflow/daily_load.extract/01929e3a-0000-7000-8000-
 statement ok
 SELECT acl_lineage_flush();
 
-# no RUN - what the statements above would be (a dataset event of the steps before may still land: it is no run);
-# the run's type and job are named, so a failure says what came (the linux distribution build saw one once)
+# no RUN - what the statements above would be; the run's type and job are named, so a failure says what came (the
+# linux distribution build saw an approximate run with no dataset: now no step at all)
 query II
-SELECT event_type, left(payload::VARCHAR, 700) FROM acl_lineage_events()
+SELECT event_type, payload->'job'->>'name' FROM acl_lineage_events()
 WHERE seq > (SELECT seq FROM before) AND event_type LIKE 'RUN_%';
 ----
 
