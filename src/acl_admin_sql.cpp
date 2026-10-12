@@ -291,7 +291,8 @@ string Unquoted(string value) {
 	return value;
 }
 
-//! `(tenant = 'acme', unit = 'eu')` -> the stored csv `tenant=acme,unit=eu`
+//! `(tenant = 'acme', unit = 'eu')` -> the csv `tenant='acme',unit='eu'`: each value stays one quoted literal, so
+//! a `,` or a `'` inside it is part of the value (ParseClaims takes the quotes off)
 string ClaimsListToCsv(const string &list) {
 	vector<string> entries;
 	for (auto &item : SplitTopLevel(list, ',')) {
@@ -304,7 +305,8 @@ string ClaimsListToCsv(const string &list) {
 		}
 		auto name = item.substr(0, split);
 		StringUtil::Trim(name);
-		entries.push_back(name + "=" + Unquoted(item.substr(split + 1)));
+		auto value = Unquoted(item.substr(split + 1));
+		entries.push_back(name + "='" + StringUtil::Replace(value, "'", "''") + "'");
 	}
 	return StringUtil::Join(entries, ",");
 }

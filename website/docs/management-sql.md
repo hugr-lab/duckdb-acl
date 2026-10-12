@@ -355,6 +355,9 @@ ALTER ROLE <role> SET COMMENT '<text>'
 DROP ROLE [IF EXISTS] <role>
 ```
 
+A value in the list form is one quoted literal and may hold `,`, `=` or `'` (doubled); in the quoted csv form a
+value with a comma is written in quotes of its own: `CLAIMS 'tenant=''a,b'''`.
+
 A role is an internal name that grants attach to. Its claims are defaults: they are what
 `acl_claim('<name>')` answers under the bare `ACL ROLE "r"` form, and under a token they fill in only
 what the token's claim map did not supply (explicit token claims win). `SET COMMENT` (spec 120) is what a
@@ -589,7 +592,8 @@ A `COLUMNS` item with a value on a writable table is an assignment as well as a 
 `tenant = acl_claim('tenant')` is added to an `INSERT` when absent, overrides a supplied value, and
 is applied to an `UPDATE`'s `SET`.
 
-There is no `REVOKE` for an object grant; write it again with `CAPS '{}'`, or revoke the catalog.
+Writing the grant again replaces it whole (caps, `RLS`, `COLUMNS`); `REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM
+ROLE <role>` takes it away (spec 120), and the catalog's or a schema's grant decides the object again.
 
 ### Fields of a structured column (spec 102)
 

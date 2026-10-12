@@ -1,0 +1,128 @@
+# name: test/sql/acl_role_claims_values.test
+# description: a role's CLAIMS (name = 'value', …) keep each value whole - a `,` or a `'` inside a value is part of
+#   it (spec 008 addendum): the list used to compile to an unquoted csv the store split again, so 'a,b' was cut to
+#   'a' and a quote swallowed the pairs after it. In the policy catalog and in the memory store alike.
+# group: [sql]
+
+require acl
+
+statement ok
+CREATE TABLE orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO orders VALUES (1, 'a,b'), (2, 'a''b'), (3, 'a'), (4, 'b'), (5, 'x=y');
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+# --- the memory store --------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE comma CLAIMS (tenant = 'a,b', unit = 'eu');
+
+statement ok
+SELECT acl_grant_table('comma', 'orders', 'memory.main.orders', 'id', 'tenant = acl_claim(''tenant'')', 'select');
+
+query I
+ACL ROLE "comma" SELECT id FROM orders ORDER BY id;
+----
+1
+
+statement ok
+ACL ADMIN CREATE ROLE quote CLAIMS (tenant = 'a''b', unit = 'eu');
+
+statement ok
+SELECT acl_grant_table('quote', 'orders', 'memory.main.orders', 'id', 'tenant = acl_claim(''tenant'')', 'select');
+
+query I
+ACL ROLE "quote" SELECT id FROM orders ORDER BY id;
+----
+2
+
+# --- the policy catalog ------------------------------------------------------------------------------
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+ACL ADMIN CREATE ROLE boss;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE boss;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS memory.main.orders RLS (tenant = acl_claim('tenant'));
+
+statement ok
+ACL ADMIN CREATE ROLE r CLAIMS (tenant = 'a,b', unit = 'eu');
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE r WITH (select) MAIN;
+
+query TT
+ACL ROLE "boss" SELECT claim, value FROM platform.role_claims WHERE role = 'r' ORDER BY claim;
+----
+tenant	a,b
+unit	eu
+
+query I
+ACL ROLE "r" SELECT id FROM orders ORDER BY id;
+----
+1
+
+statement ok
+ACL ADMIN ALTER ROLE r SET CLAIMS (tenant = 'a''b', unit = 'eu');
+
+query TT
+ACL ROLE "boss" SELECT claim, value FROM platform.role_claims WHERE role = 'r' ORDER BY claim;
+----
+tenant	a'b
+unit	eu
+
+query I
+ACL ROLE "r" SELECT id FROM orders ORDER BY id;
+----
+2
+
+# a value with `=` in it, and the platform function form a console composes markerless
+statement ok
+ACL ROLE "boss" ALTER ROLE r SET CLAIMS (tenant = 'x=y');
+
+query TT
+ACL ROLE "boss" SELECT claim, value FROM platform.role_claims WHERE role = 'r' ORDER BY claim;
+----
+tenant	x=y
+
+# the quoted csv form (legacy) is unchanged: pairs split at commas, a value wholly in '...' is its text
+statement ok
+ACL ADMIN ALTER ROLE r SET CLAIMS 'tenant=b,unit=us';
+
+query TT
+ACL ROLE "boss" SELECT claim, value FROM platform.role_claims WHERE role = 'r' ORDER BY claim;
+----
+tenant	b
+unit	us
+
+statement ok
+ACL ADMIN ALTER ROLE r SET CLAIMS 'tenant=''a,b''';
+
+query TT
+ACL ROLE "boss" SELECT claim, value FROM platform.role_claims WHERE role = 'r' ORDER BY claim;
+----
+tenant	a,b
+
+# a parenthesis inside a value is text too, and the pair after it survives
+statement ok
+ACL ADMIN ALTER ROLE r SET CLAIMS (tenant = 'a(b', unit = 'eu');
+
+query TT
+ACL ROLE "boss" SELECT claim, value FROM platform.role_claims WHERE role = 'r' ORDER BY claim;
+----
+tenant	a(b
+unit	eu

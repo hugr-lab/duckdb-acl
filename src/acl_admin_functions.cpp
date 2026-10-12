@@ -41,7 +41,12 @@ case_insensitive_map_t<string> ParseClaims(const string &csv) {
 		if (pos == string::npos) {
 			continue;
 		}
-		claims[Trimmed(item.substr(0, pos))] = Trimmed(item.substr(pos + 1));
+		// a value written as one '...' literal is its text, quotes doubled inside (the list form compiles to that)
+		auto value = Trimmed(item.substr(pos + 1));
+		if (value.size() >= 2 && value.front() == '\'' && value.back() == '\'') {
+			value = StringUtil::Replace(value.substr(1, value.size() - 2), "''", "'");
+		}
+		claims[Trimmed(item.substr(0, pos))] = value;
 	}
 	return claims;
 }
