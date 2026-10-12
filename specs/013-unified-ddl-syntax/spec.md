@@ -142,3 +142,9 @@ legacy syntax and must stay green.
 Parts 2–4 of design 004 extend this grammar: `CREATE VIRTUAL SCHEMA … FROM …` / `REFRESH` (schemas as
 objects), `GRANT SCHEMA … WITH (…)` (schema-level caps and their materialised inheritance), and
 `INTO` / `VIRTUAL ONLY` (DDL through ACL).
+
+## Addendum 2026-10-12 - the refusal names what exists
+
+"already exists" named a role `".analyst"` and a catalog `"hr.hr"` (the message joined catalog and name for every
+kind). It now says `role "analyst"`, `virtual catalog "hr"`, and `"c.name"` for an object of a catalog. Found by the
+DBeaver plugin's editors (acl-clients 008), whose error dialog shows the node's text. Test: `acl_ddl_syntax.test`.

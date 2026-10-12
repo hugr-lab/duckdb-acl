@@ -218,9 +218,13 @@ bool AllowWrite(PolicyStore &store, const string &vcat, const string &vname, con
 	if (mode == "skip") {
 		return false;
 	}
-	throw BinderException("acl admin: \"%s.%s\" already exists - use CREATE OR REPLACE to overwrite it, or "
+	// what is named: a catalog and a role by themselves, anything else inside its catalog
+	auto named = kind == "catalog" ? "virtual catalog \"" + vname + "\""
+	             : kind == "role"  ? "role \"" + vname + "\""
+	                               : "\"" + vcat + "." + vname + "\"";
+	throw BinderException("acl admin: %s already exists - use CREATE OR REPLACE to overwrite it, or "
 	                      "CREATE ... IF NOT EXISTS to keep the existing one",
-	                      vcat, vname);
+	                      named);
 }
 
 //! acl_add_reference(vcat, name, from, to [, to_kind, args, pairs, expr, cardinality, optional,
