@@ -26,8 +26,8 @@ acl-otel and tresor pin the same duckdb and follow the same day.
 
 ## Testing
 
-The whole gate at the new pin: `test/sql/*`, test-cpp, harness, test-integration (postgres, mysql, sqlserver,
-ducklake), test-e2e (with the mssql legs, now built), schema-check, clang-format, the fold and thread_local lints.
+The whole gate at the new pin: `test/sql/*`, test-cpp, harness, test-integration (postgres, mysql,
+ducklake), test-e2e, schema-check, clang-format, the fold and thread_local lints.
 The distribution build is dispatched on the PR.
 
 ## As built
