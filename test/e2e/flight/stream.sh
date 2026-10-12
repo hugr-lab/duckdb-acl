@@ -161,8 +161,10 @@ echo "  pass an idle stream is superseded after ${waited}ms, the next statement 
 # shape, not by count
 unprofiled="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile' AND seq > $seq_before AND objects::VARCHAR = '[]'")"
 [ "$unprofiled" = "0" ] || fail "the switched-off session's statement was profiled ($unprofiled event(s))"
-streams="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile' AND seq > $seq_before AND objects::VARCHAR LIKE '%big%'")"
-[ "$streams" -ge 1 ] || fail "the superseded stream left no profile"
+# since duckdb 664aafa (spec 123) a result closed before anything ended it is ABORTED - rolled back, its
+# profiler reset before any hook - so its profile says `aborted` and carries no tree
+streams="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile' AND seq > $seq_before AND objects::VARCHAR LIKE '%big%' AND detail = 'aborted'")"
+[ "$streams" -ge 1 ] || fail "the superseded stream left no (aborted) profile"
 echo "  pass the operator's switch on a live session holds at the door (the stream's profile, none for the switched-off statement)"
 
 # --- a session the operator kills takes its stream with it at the next pull ----------------------

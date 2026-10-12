@@ -838,7 +838,9 @@ has no profile, and an unprefixed parse ends what was kept. The profiler is swit
 by whoever runs the statement (`ProfileConnectionFor`: the Flight door before each execution, quack's
 driver before it submits, `QueryBegin` on the gateway path) and never over a client's own setting.
 Contract `AuditHooks::CONTRACT_VERSION` = 2. duckdb resets the profiler at an autocommit rollback
-before any hook: a failed statement's profile has its outcome, class and wall time, not the tree.
+before any hook: a failed statement's profile has its outcome, class and wall time, not the tree; since the
+664aafa pin (spec 123) a result closed before anything ended it (a superseded or cancelled stream) is ABORTED -
+rolled back in autocommit - and its profile is the same, `detail = 'aborted'`.
 
 **Spec 078 — the acl_connection contract** (duckdb-ext-common spec 005, `contracts/acl_connection.hpp`,
 magic `ACLC` v2 since spec 081 / tag v0.6.0; consumer tresor's delegation): `AclConnection` (a ClientContextState,

@@ -264,6 +264,10 @@ public:
 	int64_t began_us = 0;
 	//! spec 078: this state put a session on the connection's AclConnection for the running statement
 	bool published_session = false;
+	//! spec 123: the running statement's autocommit transaction rolled back with no error - a result
+	//! closed before anything ended it (duckdb aborts it since 664aafa), and duckdb resets the profiler
+	//! at that rollback before any hook: its profile has its outcome and wall time, not the tree
+	bool aborted = false;
 	//! spec 107: a physical statement's lineage, captured by the pre-optimize hook, emitted at QueryEnd
 	shared_ptr<PhysicalLineage> physical_lineage;
 	//! spec 107: the running statement is a PREPARE (the hook saw LOGICAL_PREPARE): not an execution
@@ -282,6 +286,7 @@ public:
 	vector<shared_ptr<PhysicalLineage>> held_physical;
 
 	void QueryBegin(ClientContext &context) override {
+		aborted = false;
 		if (pending_notes && !pending_notes->empty()) {
 			// a new parse on this thread, and this statement is its first: what an earlier batch
 			// left, and the note kept for re-executions, are over
@@ -451,7 +456,10 @@ public:
 		ReleaseHeld(context, LineageOutcome::COMPLETE);
 	}
 
-	void TransactionRollback(MetaTransaction &, ClientContext &context, optional_ptr<ErrorData>) override {
+	void TransactionRollback(MetaTransaction &, ClientContext &context, optional_ptr<ErrorData> error) override {
+		if (!error && context.transaction.IsAutoCommit()) {
+			aborted = true; // a statement's own transaction, ended undecided (a client's ROLLBACK is not autocommit)
+		}
 		ReleaseHeld(context, LineageOutcome::ABORT);
 	}
 
@@ -492,7 +500,7 @@ private:
 		auto &profiler = QueryProfiler::Get(context);
 		bool failed = error != nullptr;
 		bool measured = profiler.IsEnabled() && profiler.HasRoot();
-		if (!failed && !measured) {
+		if (!failed && !measured && !aborted) {
 			return; // nobody profiles this connection, or nothing ran yet: the note waits
 		}
 		RootCollector collector;
@@ -536,7 +544,9 @@ private:
 		event.rewrite_us = -1;
 		// a failure's class, never its text (spec 069): a bind error names a column, an execution
 		// error a value
-		event.detail = failed ? Exception::ExceptionTypeToString(error->Type()) : string();
+		event.detail = failed                 ? Exception::ExceptionTypeToString(error->Type())
+		               : !measured && aborted ? "aborted"
+		                                      : string();
 		event.exec_us = NowMicros() - began_us;
 		if (measured) {
 			auto &query = profiler.GetQueryMetrics();
