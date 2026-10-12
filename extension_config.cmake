@@ -65,9 +65,9 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
     # catalog is recreated (`DROP DATABASE ducklake_catalog; CREATE DATABASE ducklake_catalog;`).
     include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/ducklake.cmake)
     duckdb_extension_statically_link(ducklake)
-    # mysql_scanner is currently disabled at the submodule pin ("patches do not apply"); flip its
-    # gate here the moment the submodule re-enables it.
-    set(MYSQL_SCANNER_ENABLED OFF)
+    # mysql_scanner: the submodule's own pin and patches. It was disabled at the submodule's pin until
+    # 2026-10-12 ("patches do not apply"); the 664aafa pin (spec 123) builds it again, so the mysql
+    # scenarios run (ACL_MYSQL_DSN).
     include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/mysql_scanner.cmake)
 endif()
 
