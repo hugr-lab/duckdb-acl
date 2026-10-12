@@ -1329,6 +1329,7 @@ void EmitPhysicalLineage(const PhysicalLineage &captured, AuditPipeline &pipelin
 		lineage->event_type = "NAMESPACE";
 		AuditLineageDataset source;
 		source.ns = settings.ns + "/source/" + captured.object.catalog;
+		source.name = captured.object.catalog; // the alias - a transport's name for it, whatever the namespace
 		string identity_ns, identity_name;
 		if (!captured.resolved_ns.empty()) {
 			source.ns = captured.resolved_ns;

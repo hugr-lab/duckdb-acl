@@ -22,7 +22,7 @@ and a namespace (`acl_lineage_namespace`, below): without one nothing is sent, w
 | `DATASET` | a virtual table, view or table function is created, altered, repaired or dropped | the object's fields and their edges to the physical columns, its lifecycle, the per-role tags |
 | `DATASET` (no lifecycle) | a catalog or object grant changes | the affected objects again, with the new per-role tags |
 | `DATASET` | the operator's own SQL (or `ACL NATIVE`) creates, alters or drops a physical table or view | a physical view's body lineage; a table's schema |
-| `NAMESPACE` | `ATTACH` / `DETACH` of a source - the operator's, or a cluster item's | the source's namespace (below) and its type |
+| `NAMESPACE` | `ATTACH` / `DETACH` of a source - the operator's, or a cluster item's | the source's namespace (below), its alias as the name, and its type |
 | `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | a write - INSERT / UPDATE / DELETE / MERGE / CREATE TABLE AS, and a SELECT whose CTE writes (`WITH w AS (INSERT … RETURNING …) SELECT …`); one per execution (a `PREPARE` is none) | the target's fields, typed, and where each came from |
 | `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | a client's `ALTER TABLE|VIEW … RENAME TO` (spec 113) | the old name in, the new name out, each field `DIRECT/IDENTITY` - with a `DATASET` `DROP` of the old name and, where a record exists, a `CREATE` of the new one (how dbt's `__dbt_tmp` swap holds together) |
 | `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | a Flight `executemany` (one DoPut of N parameter rows) | ONE run for the batch - `RUN_FAIL` if any row failed |

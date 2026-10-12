@@ -294,4 +294,7 @@ exact check and binding, the marker's grammar, the session settings, the `cluste
 expansion's records, a table function's per-role tags) or only approximate. The page said a quack client's streamed
 load (`SEND_DATA`) was not emitted: since quack f4328c5 the client composes the drain and sends it under its session,
 so it is a write run like any other - the target only, `approximate`. Test: `acl_lineage_quack.test`'s streamed
-load. The `acl_lineage_namespace` setting's description still named the removed default (`acl://<group>`); fixed.
+load. The `acl_lineage_namespace` setting's description still named the removed default (`acl://<group>`); fixed. A `NAMESPACE` event's dataset now carries the source's
+alias as its `name`: with an identity the namespace is the source's address (`mysql://mart.corp:3306`), and acl-otel
+took the name from the address's tail (`mart.corp:3306`) instead of the alias spec 018 promises - it prefers the name
+now (acl-otel's own addendum). Test: `acl_lineage.test`'s NAMESPACE rows.
