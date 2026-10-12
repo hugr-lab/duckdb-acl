@@ -143,8 +143,7 @@ void AddLineageOptions(DBConfig &config) {
 	                          LogicalType::BIGINT, Value::BIGINT(1000), CheckBuffer, SetScope::GLOBAL);
 	config.AddExtensionOption(
 	    "acl_lineage_namespace",
-	    "acl: the OpenLineage namespace prefix of this node's datasets ('' = acl://<acl_node_group "
-	    "or default>)",
+	    "acl: the cluster's OpenLineage namespace, e.g. acl://prod (no default: '' = no lineage is sent)",
 	    LogicalType::VARCHAR, Value(""), CheckNamespace, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_lineage_identity",
 	                          "acl: who a lineage run names - none, client (the client, issuer, roles, door, node "

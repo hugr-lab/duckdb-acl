@@ -134,6 +134,25 @@ FROM acl_lineage_events() WHERE event_type = 'RUN_COMPLETE' ORDER BY seq DESC LI
 ----
 01929e3a-0000-7000-8000-00000000000c
 
+# a streamed load (SEND_DATA): the client composes the drain - INSERT ... FROM
+# scan_data_from_quack_client(...) - and sends it under the session, so it is a run like any write: the
+# target only, approximate (the rows came from the client, which names no dataset of ours)
+statement ok
+CREATE TABLE payload AS SELECT i::INTEGER AS a, 'p' || i AS b FROM range(3) t(i);
+
+statement ok
+INSERT INTO r2.main.sink SELECT * FROM payload;
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTTTT
+SELECT payload->'job'->>'namespace', payload->'datasets'->0->>'name', json_array_length(payload->'inputs'),
+    payload->'parent'->>'run_id', approximate
+FROM acl_lineage_events() WHERE event_type = 'RUN_COMPLETE' ORDER BY seq DESC LIMIT 1;
+----
+acl://it/client/quack	c.main.sink	0	01929e3a-0000-7000-8000-00000000000c	true
+
 statement ok
 DETACH r2;
 

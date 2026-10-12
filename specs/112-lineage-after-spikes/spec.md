@@ -284,3 +284,14 @@ declared parent (a scratch bind that failed there left the empty plan unjudged -
 under a declared parent whose walk names no dataset now emits nothing: there is nothing it is known to have read,
 which is §5's rule. A write still emits its (approximate) run. Test: `acl_lineage.test`'s no-run steps now list any
 `RUN_*` with its job, so a failure says what came.
+
+## Addendum 2026-10-12: the docs caught up, and a quack streamed load is a run
+An audit of `website/docs/lineage.md` against what specs 107 / 109 / 112-116 built: the page now states the RENAME
+run (spec 113), the CTE write, the third no-run rule (above), the job and door names (`gateway` / `session` / `flight` /
+`quack`, `physical:<operation>` in `…/client/operator`), quoted names and the accepted three-part name, the identity's
+exact check and binding, the marker's grammar, the session settings, the `cluster` bundle's lineage settings, the
+`platform.lineage_status` view, the ring's columns and every counter, and what is not yet emitted (a schema
+expansion's records, a table function's per-role tags) or only approximate. The page said a quack client's streamed
+load (`SEND_DATA`) was not emitted: since quack f4328c5 the client composes the drain and sends it under its session,
+so it is a write run like any other - the target only, `approximate`. Test: `acl_lineage_quack.test`'s streamed
+load. The `acl_lineage_namespace` setting's description still named the removed default (`acl://<group>`); fixed.
