@@ -1,4 +1,4 @@
-# Spec 123: re-pin duckdb to 664aafa and its scanners
+# Spec 123: re-pin duckdb to bba7360 and its scanners
 
 - **Status**: implemented (mssql-extension: see below)
 - **Date**: 2026-10-12
@@ -13,7 +13,8 @@ scanner is pinned to an mssql-extension commit 208 commits behind its main.
 
 ## Design
 
-- **duckdb 4fbae43 → 664aafa** (the head of `v2.0-cyanoptera` on 2026-10-12; no `v2.0.0` tag yet). The extensions
+- **duckdb 4fbae43 → 664aafa → bba7360** (the head of `v2.0-cyanoptera` on 2026-10-12, morning and afternoon; no
+  `v2.0.0` tag yet). The extensions
   come with it from the submodule's own `.github/config/extensions/` and patches:
   - ducklake e8924cf → 80e6155;
   - mysql_scanner accd6a7 - built again (it was disabled at the old pin, "patches do not apply"), so our
@@ -35,6 +36,17 @@ The distribution build is dispatched on the PR.
 - **One drift in our sources**: `DBConfig::ParseMemoryLimit` answers an `optional_idx` (none = unlimited); the
   resource group's `batch_bytes` takes it through an overload of `MemoryLimitBytes` that also takes the old
   `idx_t`, an unlimited answer refused (a batch is a size).
+- **The pin moved again while the PR ran**: the branch head grew 63 commits by the afternoon (the distribution
+  build compiles the head) and duckdb #26880 "Remove planner eagerness" deleted `ResultEagerness` - the Flight
+  door's test of "a count, never a stream" (specs 070 / 111). The pin is bba7360 (the head then; extension pins
+  unchanged since 664aafa). Now `Submit` decides nothing and leaves every result to its consumer, and a result
+  abandoned before its end is rolled back. The door's rule is `StreamsAtDoor` = duckdb's
+  `StreamsByDefault(written type, properties, reads_to_the_end = false)`: only a read-only SELECT that returns rows
+  streams; anything else runs to completion (`Execute`) and is read from its handle - a Flight client may stop
+  reading at any batch (cancel, a superseded stream), and a write must never depend on being read to its end.
+  `stream.sh` checks both writes a client cancels after one batch - an `INSERT … RETURNING` and a SELECT whose CTE
+  writes (the one write duckdb's own rule streams to a reader that reads to the end: with `reads_to_the_end = true`
+  the e2e fails, "kept 0 of 300000 rows").
 - **A closed result is aborted** (duckdb ef5b57f, "Roll back queries on close"; the owner: the new autocommit
   behaviour): `QueryResult::Close()` on a query nothing ended now rolls it back where it used to commit, and the
   autocommit rollback resets the profiler before any hook. Spec 074's profile of such a statement - a Flight stream
@@ -49,6 +61,6 @@ The distribution build is dispatched on the PR.
   the change duckdb patches into every scanner it carries (`0003-table-function-get-table-entry.patch`). Its
   `table_scan.cpp` needs the same; the pin stays at 1d74ae2 (which fails the same way at this duckdb - the mssql
   leg is opt-in, `ACL_INTEGRATION_MSSQL`, never in CI) until mssql-extension moves to this duckdb.
-- **Gate** (macOS, 664aafa): `test/sql/*` (106 files), test-cpp, harness, test-flight, test-integration (postgres, mysql,
+- **Gate** (macOS, bba7360): `test/sql/*` (106 files), test-cpp, harness, test-flight, test-integration (postgres, mysql,
   ducklake; mssql skipped), test-e2e (mssql legs skipped), schema-check,
   clang-format, the fold and thread_local lints.

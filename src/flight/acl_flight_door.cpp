@@ -45,7 +45,6 @@
 #include "acl_platform.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
-#include "duckdb/common/enums/result_eagerness.hpp"
 #include "duckdb/main/query_result_stream.hpp"
 #include <thread>
 
@@ -67,6 +66,15 @@ namespace {
 
 namespace flight = arrow::flight;
 namespace flightsql = arrow::flight::sql;
+
+//! spec 070 / 123: whether the door streams a statement's rows or runs it to completion first. duckdb's own
+//! rule (only a SELECT that returns rows streams), with a reader that may stop before the end - a Flight
+//! client cancels, a forgotten stream is superseded - so a statement that writes runs to completion
+//! instead: a stream abandoned before its end is rolled back, and a write must not depend on being read.
+//! `written` is the statement as the client wrote it (an execution reports EXECUTE).
+bool StreamsAtDoor(StatementType written, const StatementProperties &properties) {
+	return StreamsByDefault(written, properties, false);
+}
 
 //! The header a client's JWT arrives in. `authorization: Bearer <jwt>` is what every Flight SQL driver
 //! sends when it is given a token, so this is the driver's setting rather than our invention.
@@ -130,9 +138,10 @@ struct FlightDoorState {
 	//! spec 070: one result stream - the slot its reader and the connection share (see SessionConn).
 	//! A submitted statement is a handle (duckdb's unified QueryResult): a QueryResultStream opened
 	//! on it drains chunks through a bounded buffer as the reader takes them, so nothing beyond the
-	//! chunk in flight is held. A statement that completes before it answers - a count,
-	//! ResultEagerness::FORCED - refuses a stream and is read from the handle instead, complete by
-	//! then and one row long.
+	//! chunk in flight is held. Anything else - a count, a write's RETURNING - is read from the handle,
+	//! complete by then (spec 123: duckdb streams only a SELECT that returns rows, and a client may stop
+	//! reading - a stream abandoned before its end is rolled back, so a statement that writes never
+	//! streams here; StreamsAtDoor).
 	struct ResultStream {
 		unique_ptr<QueryResultStream<>> stream;
 		unique_ptr<QueryResult> handle;
@@ -144,9 +153,8 @@ struct FlightDoorState {
 		//! Takes the result a statement just produced: a stream where duckdb can drain it, else the handle
 		//! `retained`: a result PreparedStatement::Execute answered (spec 111's statement run at GetFlightInfo,
 		//! spec 117's management call among them) - read from the handle, never opened as a stream
-		void Take(unique_ptr<QueryResult> result, bool retained = false) {
-			if (!retained && result->GetStatementProperties().result_eagerness != ResultEagerness::FORCED &&
-			    result->HasBufferedData()) {
+		void Take(unique_ptr<QueryResult> result, StatementType written, bool retained = false) {
+			if (!retained && StreamsAtDoor(written, result->GetStatementProperties()) && result->HasBufferedData()) {
 				stream = make_uniq<QueryResultStream<>>(std::move(result));
 			} else {
 				handle = std::move(result);
@@ -284,7 +292,7 @@ struct FlightDoorState {
 		//! given back to the connection for each execution
 		bool has_profile = false;
 		acl::ProfileNote profile;
-		//! spec 111: a statement that answers only a count (ResultEagerness::FORCED: DML, DDL) runs at
+		//! spec 111: a statement that answers only a count (DML, DDL) runs at
 		//! GetFlightInfo - Flight SQL's "GetFlightInfo: execute the query" - and its result waits here
 		//! for the DoGet, which answers it without running again
 		unique_ptr<QueryResult> executed;
@@ -1919,11 +1927,10 @@ public:
 		bool writes = !properties.IsReadOnly() || kind == StatementType::INSERT_STATEMENT ||
 		              kind == StatementType::UPDATE_STATEMENT || kind == StatementType::DELETE_STATEMENT ||
 		              kind == StatementType::MERGE_INTO_STATEMENT;
-		if (unresolved && bound_row && !writes &&
-		    stmt.GetStatementProperties().result_eagerness != ResultEagerness::FORCED) {
+		if (unresolved && bound_row && !writes && StreamsAtDoor(kind, properties)) {
 			// a submitted handle carries the types the binder resolved with the row, and is closed
-			// unread; a statement that completes before it answers (FORCED) is never submitted for
-			// its schema - its types never ride on a parameter anyway. The probe is no execution: the
+			// unread; a statement the door does not stream is never submitted for its schema - its
+			// types never ride on a parameter anyway. The probe is no execution: the
 			// connection's note (spec 074 / 107) is kept off it and given back for the real one.
 			ProfileNote note;
 			bool noted = TakeConnectionProfileNote(context, note);
@@ -2115,7 +2122,7 @@ public:
 		}
 	}
 
-	//! spec 111: run a statement whose whole answer is a count (ResultEagerness::FORCED) right away,
+	//! spec 111: run a statement whose whole answer is a count right away,
 	//! under the caller's statement lock, and keep the result for the DoGet; a statement that streams
 	//! rows is left for DoGet to submit. A failure is the caller's answer now.
 	arrow::Status ExecuteCountNow(const string &handle, FlightDoorState::Reservation &reservation,
@@ -2143,8 +2150,8 @@ public:
 	                vector<Value> &values, const string &handle) {
 		// under the caller's `exec`: the statement executes here; its result goes onto the connection,
 		// where the reader pulls it and the session's next statement can end it (spec 070)
-		// a statement that completes before it answers (a count - ResultEagerness::FORCED) runs to
-		// completion here; anything else is submitted, and the reader drains it chunk by chunk
+		// a statement the door does not stream (a count, a write - StreamsAtDoor) runs to completion
+		// here; a read is submitted, and the reader drains it chunk by chunk
 		auto &stmt = *reservation->stmt;
 		unique_ptr<QueryResult> result;
 		bool retained = false;
@@ -2153,8 +2160,8 @@ public:
 			retained = true;
 		} else {
 			ArmProfile(handle, *reservation->conn, reservation.get(), string());
-			result = stmt.GetStatementProperties().result_eagerness == ResultEagerness::FORCED ? stmt.Execute(values)
-			                                                                                   : stmt.Submit(values);
+			result = StreamsAtDoor(stmt.GetStatementType(), stmt.GetStatementProperties()) ? stmt.Submit(values)
+			                                                                               : stmt.Execute(values);
 		}
 		if (result->HasError()) {
 			return StatusFromDuck("acl", result->GetError());
@@ -2167,7 +2174,7 @@ public:
 		std::shared_ptr<arrow::Schema> schema;
 		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result->GetTypes(), result->GetNames(), properties));
 		auto slot = make_shared_ptr<FlightDoorState::ResultStream>();
-		slot->Take(std::move(result), retained);
+		slot->Take(std::move(result), stmt.GetStatementType(), retained);
 		{
 			auto &conn = *reservation->conn;
 			std::lock_guard<std::mutex> stream(conn.stream_lock);
