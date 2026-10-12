@@ -47,7 +47,8 @@ The event carries:
 - `truncated` - the plan was cut at the base's limits (256 nodes, depth 32); the rollup is always
   over the whole tree.
 - `error` - the execution failed; `detail` carries the error's **class** (`Conversion`, `Binder`,
-  `IO`, ...), never its text.
+  `IO`, ...), never its text. A result closed before it ended (a stream superseded or cancelled) is
+  no error: `detail` = `aborted`.
 
 How a scan is attributed to a source: duckdb's scanners write a table name into the profile, never
 the attached database. The rewriter knows the database, because it resolved every virtual name to a
@@ -72,6 +73,10 @@ before any hook runs, so the tree is gone; inside a transaction the client owns 
 back there and the tree of the failed execution is in the event. A failure at bind - an allowed
 statement duckdb then refused - has no tree either way, and is the one place the audit records that
 the allowed statement did not run.
+
+A result closed before anything ended it - a client that stops reading, a stream the session's next
+statement supersedes - is aborted by duckdb: in autocommit it is rolled back, so its profile is like
+a failure's (outcome, wall time, no tree) with `detail` = `aborted`.
 
 ## Switching it on
 
