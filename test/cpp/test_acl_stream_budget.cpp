@@ -133,14 +133,16 @@ int main(int argc, char *argv[]) {
 			std::mutex order_lock;
 			auto waiter = [&](const char *name, int64_t priority) {
 				bool interrupted = false;
-				// 5 each: after the first is admitted the second no longer fits, so the order is the queue's
-				if (budget.Acquire(5, 10, ms(3000), nullptr, interrupted, priority)) {
+				// 6 each: after the first is admitted the second no longer fits until it releases, so the recorded
+				// order is the queue's (with 5 each the second was admitted at once and the two threads raced to
+				// record)
+				if (budget.Acquire(6, 10, ms(3000), nullptr, interrupted, priority)) {
 					{
 						std::lock_guard<std::mutex> guard(order_lock);
 						order.emplace_back(name);
 					}
 					std::this_thread::sleep_for(ms(50));
-					budget.Release(5);
+					budget.Release(6);
 				}
 			};
 			std::thread low([&] { waiter("low", 0); });
@@ -159,15 +161,18 @@ int main(int argc, char *argv[]) {
 			Take(budget, 8, 10, ms(0));
 			std::vector<std::string> order;
 			std::mutex order_lock;
+			// 6 each in a budget of 10: once the room frees only one of them fits until it releases, so the recorded
+			// order is the queue's (with 5 each both were admitted at once and the threads raced to record - seen on
+			// macOS CI)
 			auto waiter = [&](const char *name, int64_t priority) {
 				bool interrupted = false;
-				if (budget.Acquire(5, 10, ms(5000), nullptr, interrupted, priority)) {
+				if (budget.Acquire(6, 10, ms(5000), nullptr, interrupted, priority)) {
 					{
 						std::lock_guard<std::mutex> guard(order_lock);
 						order.emplace_back(name);
 					}
 					std::this_thread::sleep_for(ms(50));
-					budget.Release(5);
+					budget.Release(6);
 				}
 			};
 			std::thread old_low([&] { waiter("old", 0); });
