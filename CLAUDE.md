@@ -24,7 +24,9 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   `PendingQueryResult` are gone - `Connection::Query` and `PreparedStatement::Execute` answer a
   retained result (`RowCount`, `GetValue`, `Fetch` read it), `Submit` answers a handle that runs on
   the workers but decides nothing, and a `QueryResultStream` opened on a handle is the one streaming
-  form (it refuses a `ResultEagerness::FORCED` statement - a count - which is read from the handle).
+  form. Since the bba7360 pin (spec 123, duckdb #26880) the planner decides nothing: `Submit` leaves every result
+  to its consumer, a write waits at its count until something settles it, and a result closed before its end is
+  rolled back; `StreamsByDefault(written type, properties, reads_to_the_end)` is duckdb's rule of who streams.
   **A result has a format** (since the 2026-09-30 pin, spec 090): `QueryResult` has no `GetValue`;
   `Collection().GetValue(c, r)` rebuilds every row per call, so a loop over rows reads a `ResultRows`
   (`acl_result_rows.hpp`) built once; the stream is `QueryResultStream<>` (the chunk format), and a
@@ -838,7 +840,9 @@ has no profile, and an unprefixed parse ends what was kept. The profiler is swit
 by whoever runs the statement (`ProfileConnectionFor`: the Flight door before each execution, quack's
 driver before it submits, `QueryBegin` on the gateway path) and never over a client's own setting.
 Contract `AuditHooks::CONTRACT_VERSION` = 2. duckdb resets the profiler at an autocommit rollback
-before any hook: a failed statement's profile has its outcome, class and wall time, not the tree.
+before any hook: a failed statement's profile has its outcome, class and wall time, not the tree; since the
+664aafa pin (spec 123) a result closed before anything ended it (a superseded or cancelled stream) is ABORTED -
+rolled back in autocommit - and its profile is the same, `detail = 'aborted'`.
 
 **Spec 078 — the acl_connection contract** (duckdb-ext-common spec 005, `contracts/acl_connection.hpp`,
 magic `ACLC` v2 since spec 081 / tag v0.6.0; consumer tresor's delegation): `AclConnection` (a ClientContextState,
@@ -865,7 +869,9 @@ DBAPI `execute` never fetched (ADBC cancels the DoGet) used to lose the write si
 one is announced with an empty dataset schema (JDBC then takes DoPut); Flight SQL's `is_update` when
 the Arrow pin carries it. Rows still stream lazily at DoGet.
 **Spec 070 — the Flight door streams**: `DoGet` submits the statement (`PreparedStatement::Submit`,
-a handle; a `ResultEagerness::FORCED` statement - a count - runs to completion instead) and hands
+a handle; a statement the door does not stream - `StreamsAtDoor`, duckdb's rule for a reader that may stop:
+anything but a read-only SELECT, so a write is never undone by a client that stops reading - runs to completion
+instead) and hands
 gRPC a `RecordBatchStream` over `AclResultReader`, which pulls ONE duckdb chunk per Arrow batch
 through the `QueryResultStream` opened on the handle — nothing beyond the chunk in flight is held,
 whatever the result's size. The stream lives in a

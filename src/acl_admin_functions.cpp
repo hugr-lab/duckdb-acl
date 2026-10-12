@@ -1114,6 +1114,19 @@ void AclRevokeFunctionFunc(DataChunk &args, ExpressionState &state, Vector &resu
 //! `{"window_max": 64, "batch_bytes": "32MiB", ...}` -> the limits a group states. Every name must be
 //! one a group carries - unlike a capability, a limit written wrong would silently limit nothing - and
 //! every value a non-negative integer (a priority may be negative); `batch_bytes` also takes a size.
+//! A memory size in bytes. duckdb's `DBConfig::ParseMemoryLimit` answers an idx_t at our pin and an
+//! optional_idx (none = unlimited) on the 2.0 branch's head; a limit is a size either way
+int64_t MemoryLimitBytes(idx_t bytes) {
+	return NumericCast<int64_t>(bytes);
+}
+
+int64_t MemoryLimitBytes(optional_idx bytes) {
+	if (!bytes.IsValid()) {
+		throw InvalidInputException("a size, not unlimited");
+	}
+	return NumericCast<int64_t>(bytes.GetIndex());
+}
+
 case_insensitive_map_t<int64_t> ParseResourceLimits(const string &json, const char *fn) {
 	using namespace duckdb_yyjson; // NOLINT
 	case_insensitive_map_t<int64_t> limits;
@@ -1156,7 +1169,7 @@ case_insensitive_map_t<int64_t> ParseResourceLimits(const string &json, const ch
 				if (digits) {
 					value = std::stoll(text);
 				} else if (name == "batch_bytes") {
-					value = NumericCast<int64_t>(DBConfig::ParseMemoryLimit(text));
+					value = MemoryLimitBytes(DBConfig::ParseMemoryLimit(text));
 				} else {
 					throw BinderException("%s: %s is a number, got \"%s\"", fn, name, text);
 				}

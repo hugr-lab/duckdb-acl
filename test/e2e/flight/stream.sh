@@ -44,6 +44,8 @@ trap cleanup EXIT INT TERM
 	echo "SET GLOBAL acl_allow_anonymous_admin=true;"
 	echo "ACL ADMIN CREATE VIRTUAL VIEW c.big AS SELECT i, i::VARCHAR AS s FROM range(200000000) t(i);"
 	echo "SET GLOBAL acl_allow_anonymous_admin=false;"
+	# spec 123: a write's RETURNING the client stops reading (the stage schema is the analyst's home)
+	echo "CREATE TABLE memory.staging.returned(i BIGINT);"
 	echo "SET GLOBAL acl_audit_level='all';"
 	echo "SET GLOBAL acl_profile_level='all';"
 	echo "SET GLOBAL acl_flight_stream_idle=2;"
@@ -161,9 +163,28 @@ echo "  pass an idle stream is superseded after ${waited}ms, the next statement 
 # shape, not by count
 unprofiled="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile' AND seq > $seq_before AND objects::VARCHAR = '[]'")"
 [ "$unprofiled" = "0" ] || fail "the switched-off session's statement was profiled ($unprofiled event(s))"
-streams="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile' AND seq > $seq_before AND objects::VARCHAR LIKE '%big%'")"
-[ "$streams" -ge 1 ] || fail "the superseded stream left no profile"
+# since duckdb 664aafa (spec 123) a result closed before anything ended it is ABORTED - rolled back, its
+# profiler reset before any hook - so its profile says `aborted` and carries no tree
+streams="$(server_says "SELECT count(*) FROM acl_audit_events() WHERE kind = 'profile' AND seq > $seq_before AND objects::VARCHAR LIKE '%big%' AND detail = 'aborted'")"
+[ "$streams" -ge 1 ] || fail "the superseded stream left no (aborted) profile"
 echo "  pass the operator's switch on a live session holds at the door (the stream's profile, none for the switched-off statement)"
+
+# --- a write is never a stream: a client that stops reading its RETURNING does not undo it ---------
+# spec 123: since duckdb 664aafa a result abandoned before its end is rolled back, so the door runs a
+# statement that writes to completion first (StreamsAtDoor) - the client reads one batch, cancels,
+# and every row is there
+got="$(python3 "$HERE/stream_client.py" "$URI" first "INSERT INTO stage.returned SELECT i FROM range(300000) t(i) RETURNING i" 2>&1)"
+echo "$got" | grep -q "'rows': [1-9]" || fail "the RETURNING answered no batch: $got"
+landed="$(server_says "SELECT count(*) FROM memory.staging.returned")"
+[ "$landed" = "300000" ] || fail "a write whose RETURNING the client stopped reading kept $landed of 300000 rows"
+echo "  pass a write whose RETURNING the client cancels after one batch kept all 300000 rows"
+# ... and a SELECT whose CTE writes - the one write duckdb's own rule would stream to a reader that
+# reads to the end
+got="$(python3 "$HERE/stream_client.py" "$URI" first "WITH w AS (INSERT INTO stage.returned SELECT i FROM range(300000) t(i) RETURNING i) SELECT * FROM w" 2>&1)"
+echo "$got" | grep -q "'rows': [1-9]" || fail "the CTE write answered no batch: $got"
+landed="$(server_says "SELECT count(*) FROM memory.staging.returned")"
+[ "$landed" = "600000" ] || fail "a CTE write whose rows the client stopped reading kept $((landed - 300000)) of 300000 rows"
+echo "  pass a SELECT whose CTE writes, cancelled after one batch, kept all 300000 rows"
 
 # --- a session the operator kills takes its stream with it at the next pull ----------------------
 ACL_STREAM_PAUSE=3 python3 "$HERE/stream_client.py" "$URI" killed "SELECT * FROM big" >"$TMP/killed.out" 2>&1 &
