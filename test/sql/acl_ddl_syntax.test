@@ -276,7 +276,7 @@ alias	(empty)
 statement error
 ACL ADMIN CREATE VIRTUAL CATALOG hr;
 ----
-<REGEX>:.*already exists.*
+<REGEX>:.*virtual catalog "hr" already exists.*
 
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG IF NOT EXISTS hr;
@@ -284,7 +284,7 @@ ACL ADMIN CREATE VIRTUAL CATALOG IF NOT EXISTS hr;
 statement error
 ACL ADMIN CREATE ROLE analyst;
 ----
-<REGEX>:.*already exists.*
+<REGEX>:.*role "analyst" already exists.*
 
 statement ok
 ACL ADMIN CREATE ROLE IF NOT EXISTS analyst;
