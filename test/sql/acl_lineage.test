@@ -859,12 +859,13 @@ DETACH warehouse;
 statement ok
 SELECT acl_lineage_flush();
 
-query TTT
-SELECT payload->'datasets'->0->>'namespace', payload->'datasets'->0->>'type', payload->'datasets'->0->>'lifecycle'
+query TTTT
+SELECT payload->'datasets'->0->>'namespace', payload->'datasets'->0->>'name', payload->'datasets'->0->>'type',
+    payload->'datasets'->0->>'lifecycle'
 FROM acl_lineage_events() WHERE event_type = 'NAMESPACE' ORDER BY seq DESC LIMIT 2;
 ----
-acl://test/source/warehouse	DUCKDB	DROP
-acl://test/source/warehouse	DUCKDB	CREATE
+acl://test/source/warehouse	warehouse	DUCKDB	DROP
+acl://test/source/warehouse	warehouse	DUCKDB	CREATE
 
 # === spec 112 §9: a source's identity - the name everyone else knows it by ==============================
 
@@ -1056,12 +1057,13 @@ ATTACH ':memory:' AS mart (READ_ONLY false) LINEAGE 'mysql://mart.corp:3306/sale
 statement ok
 SELECT acl_lineage_flush();
 
-# the NAMESPACE event of the ATTACH already names the source as itself
-query TT
-SELECT payload->'datasets'->0->>'namespace', payload->'datasets'->0->>'lifecycle'
+# the NAMESPACE event of the ATTACH already names the source as itself - and carries its alias, the
+# name a transport gives it (the identity's address says nothing of it)
+query TTT
+SELECT payload->'datasets'->0->>'namespace', payload->'datasets'->0->>'name', payload->'datasets'->0->>'lifecycle'
 FROM acl_lineage_events() WHERE seq > (SELECT seq FROM before) AND event_type = 'NAMESPACE';
 ----
-mysql://mart.corp:3306	CREATE
+mysql://mart.corp:3306	mart	CREATE
 
 statement ok
 DETACH mart;

@@ -561,7 +561,8 @@ ACL ADMIN REVOKE SCHEMA sales.raw.eu FROM ROLE analyst;
 - **`ALTER TABLE|VIEW … RENAME TO`** in the same home, priced at `create` + `drop` on it: the new name
   must not be a record of the catalog, an object carrying the operator's declarations (a predicate,
   columns, keys, references, a grant by name) keeps its name, an expansion's record follows the
-  object, and a rename is a lineage `DROP` + `CREATE`. Every other `ALTER` is refused.
+  object, and a rename is a lineage run (old name in, new name out) with a `DROP` of the old
+  name and, where a record exists, a `CREATE` of the new one. Every other `ALTER` is refused.
 - dbt through quack: the `table`, `view` and `incremental` (`append`) materializations run as they
   are. `delete+insert` / `merge` incremental strategies fail in the quack client itself (`DELETE`
   through an attached quack catalog is not planned there), before the node sees them.

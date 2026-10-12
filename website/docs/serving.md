@@ -702,6 +702,8 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
   `acl.audit.events/dropped/sink_errors/queue_fill/ring_fill`, `acl.node.draining/uptime/info`.
   Attribute values come from bounded sets only - never a role, a subject or an object name.
   `acl.door.observe{door,surface,result}` (reads of the load report and the metrics, spec 097).
+  `acl.lineage.events{event_type}`, `acl.lineage.approximate`, `acl.lineage.dropped`,
+  `acl.lineage.errors`, `acl.lineage.parent_invalid{door}` (see [Lineage](lineage.md)).
   `SET GLOBAL acl_metrics_endpoint = true` adds `GET /metrics` (Prometheus text) to the quack door's
   listener, for a bearer token holding `observe` (spec 097; see the load report above); 404 while off.
   A node running `acl_otel` exports the same counters and gauges over OTLP and needs neither.

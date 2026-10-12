@@ -22,21 +22,46 @@ and a namespace (`acl_lineage_namespace`, below): without one nothing is sent, w
 | `DATASET` | a virtual table, view or table function is created, altered, repaired or dropped | the object's fields and their edges to the physical columns, its lifecycle, the per-role tags |
 | `DATASET` (no lifecycle) | a catalog or object grant changes | the affected objects again, with the new per-role tags |
 | `DATASET` | the operator's own SQL (or `ACL NATIVE`) creates, alters or drops a physical table or view | a physical view's body lineage; a table's schema |
-| `NAMESPACE` | `ATTACH` / `DETACH` of a source - the operator's, or a cluster item's | the source's namespace (below) and its type |
-| `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | a write - INSERT / UPDATE / DELETE / MERGE / CREATE TABLE AS, one per execution (a `PREPARE` is none) | the target's fields, typed, and where each came from |
+| `NAMESPACE` | `ATTACH` / `DETACH` of a source - the operator's, or a cluster item's | the source's namespace (below), its alias as the name, and its type |
+| `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | a write - INSERT / UPDATE / DELETE / MERGE / CREATE TABLE AS, and a SELECT whose CTE writes (`WITH w AS (INSERT … RETURNING …) SELECT …`); one per execution (a `PREPARE` is none) | the target's fields, typed, and where each came from |
+| `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | a client's `ALTER TABLE|VIEW … RENAME TO` (spec 113) | the old name in, the new name out, each field `DIRECT/IDENTITY` - with a `DATASET` `DROP` of the old name and, where a record exists, a `CREATE` of the new one (how dbt's `__dbt_tmp` swap holds together) |
 | `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | a Flight `executemany` (one DoPut of N parameter rows) | ONE run for the batch - `RUN_FAIL` if any row failed |
 | `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | Flight ingest (`adbc_ingest`), with the call's lineage headers | the target and the fields written - their source is the client's stream (`approximate`) |
-| `RUN_COMPLETE` / `RUN_FAIL` (inputs only) | a SELECT that declared itself a step of an external job | the datasets it read |
+| `RUN_COMPLETE` / `RUN_FAIL` / `RUN_ABORT` | a quack client's streamed load (`SEND_DATA`: the client sends `INSERT … FROM scan_data_from_quack_client(…)` under its session) | the target only (`approximate`): the rows came from the client |
+| `RUN_COMPLETE` / `RUN_FAIL` (inputs only) | a SELECT under a declared **parent** (a `JOB` or `ROOT` alone does not make it a run) | the datasets it read |
+
+Over quack an `executemany` is one run per row: the protocol sends it as one statement per row.
 
 **Transactions.** A write inside a client's explicit transaction is sent when the transaction ends:
 `COMMIT` sends its runs as they are, `ROLLBACK` sends them as `RUN_ABORT` (OpenLineage's `ABORT`). A
 statement that fails is `RUN_FAIL` at once. In autocommit the statement is its transaction.
 
 A plain SELECT, DESCRIBE, SHOW, EXPLAIN, a listing and `COPY TO` are never emitted. Under a declared
-parent, a read that reads nothing is not a run either: one of only the metadata surfaces
-(`duckdb_tables()`, `information_schema`, a DESCRIBE - a client's catalog refresh), and one whose plan
-cannot return a row (`WHERE 1=0`, `LIMIT 0` - a client's schema probe). Not yet emitted: writes through
-the quack door's streamed ingest (`SEND_DATA`), and a `GRANT SCHEMA` does not re-send the tags.
+parent, a read that reads nothing is not a run either:
+
+- one of only the metadata surfaces (`duckdb_tables()`, `information_schema`, a DESCRIBE - a client's
+  catalog refresh);
+- one whose plan cannot return a row (`WHERE 1=0`, `LIMIT 0` - a client's schema probe);
+- one that names no dataset (`SELECT 1`, or a read the worker could not bind).
+
+A write always emits its run, approximate when its sources could not be derived.
+
+A physical definition the operator rolls back with its transaction sends nothing.
+
+Not yet emitted:
+
+- a `GRANT SCHEMA` does not re-send the tags;
+- a schema expansion (`CREATE VIRTUAL SCHEMA … FROM`, `acl_refresh_schema_objects`) sends no
+  `DATASET` for the records it writes, and a live alias (`AS`) has no records - `acl_lineage_resend()`
+  sends the expanded objects;
+- a virtual table function's `DATASET` carries no per-role tags.
+
+Approximate for now:
+
+- a runtime call of a virtual table function;
+- a CTE write with a parameter in its result (no target either);
+- a statement read under a nested `USE` (spec 114: the worker cannot `USE` a nested schema, so the run
+  has no inputs).
 
 ## Names
 
@@ -45,7 +70,10 @@ the quack door's streamed ingest (`SEND_DATA`), and a `GRANT SCHEMA` does not re
   its `DATASET` event.
 - **Datasets** (namespace + name), OpenLineage's convention for a SQL endpoint:
   - virtual: `<ns>` + `<vcat>.<schema>.<object>`, the schema always written - `acl://prod` +
-    `sales.main.orders`; a virtual table function the same, of type `TABLE_FUNCTION`;
+    `sales.main.orders`; a virtual table function the same, of type `TABLE_FUNCTION`. The node
+    accepts the name back: a query of `sales.main.orders` reads the root object `sales.orders`;
+  - a name part holding `.` or `"` is quoted, as the node keys it (spec 116): `sales."a.b".Sink`;
+  - a statement read under a `USE` (spec 114) is named in full, as the `USE` qualified it;
   - physical: `<ns>/source/<alias>` + `<schema>.<table>`, or the source's own name when it has an
     identity (below).
 - **The namespace is the cluster's.** `<ns>` is `acl_lineage_namespace`. It has no default: with none
@@ -54,7 +82,12 @@ the quack door's streamed ingest (`SEND_DATA`), and a `GRANT SCHEMA` does not re
   cluster node (spec 118's `acl_deployment`) - or in a standalone node's bootstrap with `SET GLOBAL`. Clearing it is the cluster-wide off switch (a setting item: each node takes it as the node agent rolls the profile out), and it keeps
   two clusters from merging their virtual catalogs in one backend by accident. The node group is in
   the run's facet, not in the name.
-- **Job namespaces** are `<ns>/client/<door>`.
+- **Job namespaces** are `<ns>/client/<door>`, where `<door>` is `flight`, `quack`, `session`
+  (a session the gateway opened with `acl_session_open()`) or `gateway` (a per-statement prefix). A run's job is
+  `acl_lineage_job` (the marker, the header or the SET), or `sql:<hash of the normalized statement>`.
+  A parent only adds the parent facet; it does not change the job.
+- **Physical runs** (`ACL NATIVE`, the operator's own DML / CTAS) are the job `physical:<operation>`
+  in `<ns>/client/<door>` (`<ns>/client/operator` without a door), with no parent and no client.
 - **Renamed?** Re-send the static picture under the new names with `acl_lineage_resend()`. The old
   names stay in the backend as orphans; delete them in the backend's own way.
 
@@ -72,12 +105,15 @@ SELECT acl_lineage_source('pg', 'postgres://pg.prod:5432/sales');
 ```
 
 Then `pg.public.orders` is `postgres://pg.prod:5432` + `sales.public.orders`, in every edge, run and
-`NAMESPACE` event. The identity is `<scheme>://<host:port>[/<database>]`; it is a name and never a
-credential - userinfo, a query string or a fragment (`user:password@`, `?password=`, `#…`) is refused. The node never derives it from a DSN or a secret: a host
+`NAMESPACE` event. The identity is exactly `<scheme>://<host[:port]>[/<path>]` - a path's `/` become `.` in the
+dataset name's prefix. It is a name and never a credential: `@`, `?`, `#`, `%`, `\` and control
+characters are refused anywhere (`user:password@`, `?password=`, `#…`), and the scheme is letters,
+digits, `+`, `-`, `.`. The node never derives it from a DSN or a secret: a host
 behind a proxy is not the host others see.
 
 - It lives in the node's memory, like the ATTACH it describes: the bootstrap declares it at every
-  start. `acl_lineage_source(alias, NULL)` clears it, and a `DETACH` ends it.
+  start. `acl_lineage_source(alias, NULL)` clears it; a `DETACH`, or a new ATTACH of the alias, ends it.
+  Declared before its ATTACH, it binds to the first attachment of that alias.
 - In a cluster profile: `ACL CLUSTER ATTACH '…' AS pg (TYPE postgres, SECRET s) LINEAGE '…'`.
 - A platform extension may name sources itself through the `acl_lineage_sources` registry
   (duckdb-ext-common); its answer comes first, then the declared identity, then the alias form.
@@ -123,9 +159,9 @@ pipeline's run as their **parent**. The parent is OpenLineage's `OPENLINEAGE_PAR
 | channel | how |
 | --- | --- |
 | a session setting | `SET acl_lineage_parent = '…'`, `acl_lineage_root_parent`, `acl_lineage_job` - on a session of the client's own |
-| a Flight call | headers `x-openlineage-parent`, `x-openlineage-root-parent`, `x-openlineage-job` |
+| a Flight call | headers `x-openlineage-parent`, `x-openlineage-root-parent`, `x-openlineage-job`; or `SetSessionOptions` with the three settings |
 | a quack request | the same headers, from an http secret: `CREATE SECRET (TYPE http, SCOPE 'https://<door>', EXTRA_HTTP_HEADERS MAP {'x-openlineage-root-parent': '…', 'x-openlineage-job': '…'})` |
-| the gateway | `ACL … LINEAGE PARENT '…' [ROOT '…'] [JOB '…'] <statement>` |
+| the gateway | `ACL … LINEAGE PARENT '…' ROOT '…' JOB '…' <statement>` - `LINEAGE` once, then any of the three, each at most once, in any order |
 
 A request's headers take precedence over the session's settings.
 
@@ -134,7 +170,8 @@ with a UUID as the runId: OpenLineage's parent facet requires one, and a backend
 that carries anything else.
 
 - **The marker and `SET`.** A malformed value refuses the statement or the SET, with a message that
-  repeats nothing of the value.
+  repeats nothing of the value. A marker value over 512 bytes is refused whole (a cut would lose its
+  runId).
 - **A Flight header.** A malformed value fails the call with `InvalidArgument`.
 - **A quack header.** quack cannot return a message here, so a malformed value is ignored: the
   statement runs with no parent. A `door` event `lineage_parent_invalid` is written once per
@@ -175,8 +212,9 @@ A pipeline's own events and the node's join in the backend only when both name a
   the node's in the catalog.
 - **A Python job** (or anything that emits for itself) uses the node's names directly.
 
-Without a parent, a run belongs to the job `acl_lineage_job`, or `sql:<hash of the normalized
-statement>`, in the namespace `<ns>/client/<door>` (`acl://dev/client/flight` for the namespace `acl://dev`).
+A run belongs to the job `acl_lineage_job`, or `sql:<hash of the normalized statement>`, in the
+namespace `<ns>/client/<door>` (`acl://dev/client/flight` for the namespace `acl://dev`), with or
+without a parent.
 
 ## Settings
 
@@ -190,18 +228,32 @@ statement>`, in the namespace `<ns>/client/<door>` (`acl://dev/client/flight` fo
 | `acl_lineage_max_edges` | `4096` | edges per event before it is `truncated` |
 | `acl_lineage_buffer` | `1000` | events `acl_lineage_events()` holds |
 
-All are GLOBAL and can be cluster-profile items.
+All are GLOBAL and can be cluster-profile items (restart class): `acl_lineage_namespace`, `_level`,
+`_max_edges` and `_buffer` are on the `cluster` bundle's list; `_identity`, `_sql` and `_physical`
+are `passthrough`'s.
+
+A client's own context is three session settings, set only on a session of the client's own
+(spec 068's allowlist):
+
+| setting | |
+| --- | --- |
+| `acl_lineage_parent` | the parent run, `<namespace>/<job>/<UUID>` |
+| `acl_lineage_root_parent` | the root run, the same form |
+| `acl_lineage_job` | the job name, free text |
 
 ## For the operator
 
-- `acl_lineage_status()` - `on`, `off`, or why nothing is sent.
+- `acl_lineage_status()` - `on`, `off`, or why nothing is sent; an `observe` admin reads the same
+  as the view `platform.lineage_status` (status, sending, level, namespace).
 - `acl_lineage_source(alias, identity)` - a source's identity (above).
-- `acl_lineage_events()` - the ring: one row per event, the payload as JSON.
+- `acl_lineage_events()` - the ring: one row per event - `ts, seq, node, event_type, job_namespace,
+  job_name, run_id, parent, approximate, truncated, payload` (the payload as JSON).
 - `acl_lineage_flush()` - waits for the worker (runs and static events) and the audit queue.
 - `acl_lineage_resend([vcat])` - sends every object's `DATASET` event again (tables, views, table
   functions), for a transport that starts on an empty catalog.
-- The counters `acl.lineage.events`, `acl.lineage.approximate` and `acl.lineage.dropped` (the
-  worker's queue holds 1000 items; past that an item is dropped and counted).
+- The counters `acl.lineage.events{event_type}`, `acl.lineage.approximate`, `acl.lineage.dropped`
+  (the worker's queue holds 1000 items; past that an item is dropped and counted),
+  `acl.lineage.errors` (a worker job that failed) and `acl.lineage.parent_invalid{door}`.
 
 None of these is a principal's.
 
