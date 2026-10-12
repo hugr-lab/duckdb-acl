@@ -352,6 +352,26 @@ The parameters mean what the matching `acl_*` function's do - see the
 - `platform.check_catalog([catalog])` - the catalog check of spec 039 (one row per finding with its
   repair statement), judged like `CHECK VIRTUAL CATALOG`: a catalog admin on its catalogs, `policy`
   without an argument. `CALL platform.check_catalog('sales')` is the same.
+- `platform.check_grant(role, catalog, object, rls, columns[, caps])` (spec 122) - what writing that grant would
+  say, written nowhere: one row per finding, `(item, name, type, status, message)`. `object` empty = a catalog
+  grant. In the write's order - the object (it exists; no RLS or columns on a scalar), the column list against the
+  object, the caps (when given: `manage` is per catalog, a write verb on a function is never consulted), the RLS bound
+  against the object's source, then the list in its stored form (`item = 'columns'`) and each column the role would
+  read (`item = 'column'`: its name, its exposed type, and its mask or expression as `message`; with no list, every
+  column the object exposes - what a grant that lists none lets the role read). The first refusal
+  ends the answer with the write's own message (`status = 'refused'`); a catalog grant's columns are `unchecked`
+  (the write does not probe them either). A body calling a function its author may not call refuses the call itself,
+  as the write would. Who may grant may check: `policy`, or a point grant on `platform.check_grant`.
+
+  ```sql
+  SELECT * FROM platform.check_grant('analyst', 'sales', 'orders', 'tenant = acl_claim(''tenant'')',
+      'id, amount, ssn = 42, address.city');
+  -- rls      tenant = acl_claim('tenant')                ok
+  -- columns  id, amount, ssn = 42, address.city          ok
+  -- column   id       INTEGER                            ok
+  -- column   ssn      INTEGER                            ok   42
+  -- column   address  STRUCT(city VARCHAR)               ok
+  ```
 - `platform.console_info()` - what a console reads to show only what works: `build`,
   `audit_contract`, `connection_contract`, the catalog schema and window (`schema_build`,
   `schema_build_min_reader`, `schema_catalog`, `schema_min_reader`, `schema_mode`), `views` /

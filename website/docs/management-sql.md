@@ -1354,6 +1354,7 @@ section.
 | `acl_check_catalog([vcat])` (table function)                                                          | what no longer holds against the source, one row per finding (spec 039) |
 | `acl_repair_relation(vcat, vname, action[, spec])` -> BIGINT                                          | mend a declared list: `remap`, `drop_missing`, `drop_missing_and_masks` |
 | `acl_effective_rights(role, vcat[, vname])` (table function)                                          | what a role gets of each object and which grant decides it (spec 120)   |
+| `acl_check_grant(role, vcat, vname, rls, columns[, caps])` (table function)                           | what writing that grant would say, written nowhere (spec 122)           |
 | `acl_exposures(source[, schema[, object]])` (table function)                                          | the virtual objects reading a physical source, per role (spec 120)      |
 | `acl_add_reference(vcat, name, from, to[, to_kind, args, pairs, expr, cardinality, optional, join_method, comment, mode])` | declare a join path                                |
 | `acl_drop_reference(vcat, name[, mode])`                                                              | drop it                                                                 |

@@ -1,6 +1,6 @@
 # Spec 122: check a grant before writing it
 
-- **Status**: draft (for the owner, 2026-10-12)
+- **Status**: implemented (accepted by the owner 2026-10-12)
 - **Date**: 2026-10-12
 - **Author**: the agent, at the owner's ask (the DBeaver plugin's grant editor, acl-clients spec 008)
 
@@ -76,3 +76,28 @@ the author edits, saves, reads the refusal, edits again. Nothing on the node ans
 - **A dry-run flag on GRANT** (`GRANT … CHECK ONLY`): grammar for a tool's question, and a statement that looks like
   a write; a read function says what it is.
 - **Let the editor write and read the refusal**: what happens today - a refused write is the only answer.
+
+## As built (2026-10-12)
+
+- **One plan**: `PolicyStore::CatalogCheckObjectCaps` (the spec 032 caps judgment, moved out of the write) and
+  `PlanObjectGrant` (acl_catalog_admin.cpp: the predicate bound against the object, `NormaliseGrantColumns`, the
+  projection probed - `GrantProjectionStatements` now hands out what it probed) are what `CatalogSetObjectCaps`
+  writes from and what `CatalogCheckGrant` answers from; the write is otherwise unchanged (same statements, same
+  order). The check runs `CatalogRequireGrantTarget` first, as `acl_grant_object` does.
+- **The function**: `acl_check_grant(role, vcat, vname, rls, columns[, caps])` (acl_platform_rights.cpp, a table
+  function; names spelled as the write spells them - spec 116), `platform.check_grant` in `PlatformFunctions()`
+  (`HANDS_OUT`, catalog argument 1). Its RLS and columns are bodies (`BodiesOf`), and a read function in FROM now
+  passes `AuthorizeBodies` after `AuthorizeAdminCall` (`PlatformReadFunctionSql`) - before, the read path judged
+  only the right, and no read function carried a body.
+- **The answer**: `item` = `object` | `rls` | `columns` | `caps` | `column`; a refusal is the write's message
+  (`ErrorData::RawMessage`), and ends the answer; the plan's refusal is `rls` when it is the predicate's, else
+  `columns`. A grant without a column list answers every column the object exposes (`ExposedColumnList` - its
+  declared list, else its source's - probed as a list of them all): what the role reads, and what a tool shows to
+  narrow from (the plugin's Columns tab - the grantor needs no grant on the catalog to see them).
+- **Tests**: `test/sql/platform_check_grant.test` - the right grant (types, a mask changing the type, a field path's
+  narrowed STRUCT, the stored order), nothing written, the write then storing exactly the probed projection; the
+  refusals each checked then written (RLS that does not bind, an unknown column, `manage` on an object, RLS on a
+  scalar, a missing object - the write refused with the same words); a body calling a denied function refused for
+  both; a catalog grant (`unchecked` columns); a catalog admin and an ordinary role refused, a point grant admitted;
+  `acl_check_grant` itself in the never set.
+- **For**: acl-clients spec 008's grant editor (its Row filter and Columns tabs' Check).

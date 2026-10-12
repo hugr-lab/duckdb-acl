@@ -1135,6 +1135,16 @@ vector<PlatformFunction> BuildFunctions() {
 	     true,
 	     "TABLE",
 	     "what a role gets of a catalog's objects: caps, the deciding grant, MAIN, RLS, columns (spec 120)"},
+	    {"check_grant",
+	     "acl_check_grant",
+	     {role, catalog, P("object"), P("rls"), P("columns"), P("caps")},
+	     {5, 6},
+	     1,
+	     PR::HANDS_OUT,
+	     true,
+	     "TABLE",
+	     "what writing a grant would say - its predicate, the columns the role would read with their types - written "
+	     "nowhere (spec 122)"},
 	    {"exposures",
 	     "acl_exposures",
 	     {A("source"), P("schema"), P("object")},
@@ -1683,6 +1693,10 @@ vector<BodyArgument> BodiesOf(const string &target, FunctionExpression &call) {
 	}
 	if (target == "acl_grant_catalog" || target == "acl_grant_object") {
 		return {{4, BodyShape::EXPRESSION, S}, {5, BodyShape::COLUMNS, S}};
+	}
+	if (target == "acl_check_grant") {
+		// spec 122: a check is judged like the write it stands for
+		return {{3, BodyShape::EXPRESSION, S}, {4, BodyShape::COLUMNS, S}};
 	}
 	if (target == "acl_repair_relation") {
 		return {{3, BodyShape::COLUMNS, S}};
@@ -2618,10 +2632,15 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 	auto ref = make_uniq<TableFunctionRef>();
 	ref->function = make_uniq<FunctionExpression>(Identifier(function->target), std::move(children));
 	node->from_table = std::move(ref);
-	SelectStatement statement;
-	statement.node = std::move(node);
-	AuthorizeAdminCall(statement, rights);
-	sql = statement.ToString();
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(node);
+	AuthorizeAdminCall(*statement, rights);
+	vector<unique_ptr<SQLStatement>> judged;
+	judged.push_back(std::move(statement));
+	// spec 122: a read function carrying a body (check_grant's RLS and columns) is judged by its author's function
+	// gate as the write it stands for would be
+	AuthorizeBodies(judged, rights, store, principal);
+	sql = judged[0]->ToString();
 	return true;
 }
 

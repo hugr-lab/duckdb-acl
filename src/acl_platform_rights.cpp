@@ -654,6 +654,62 @@ void RightsScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 	output.SetChildCardinality(count);
 }
 
+//===--------------------------------------------------------------------===//
+// spec 122: acl_check_grant(role, vcat, object, rls, columns[, caps]) - what writing the grant would say
+//===--------------------------------------------------------------------===//
+
+struct CheckGrantInfo : TableFunctionInfo {
+	explicit CheckGrantInfo(shared_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
+	}
+	shared_ptr<PolicyStore> store;
+};
+
+struct CheckGrantBind : TableFunctionData {
+	shared_ptr<PolicyStore> store;
+	vector<Value> arguments;
+};
+
+unique_ptr<FunctionData> CheckGrantBindFn(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+                                          vector<Identifier> &names) {
+	auto bind = make_uniq<CheckGrantBind>();
+	bind->store = input.info->Cast<CheckGrantInfo>().store;
+	bind->arguments = input.inputs;
+	for (auto name : {"item", "name", "type", "status", "message"}) {
+		names.push_back(Identifier(name));
+		types.push_back(LogicalType::VARCHAR);
+	}
+	return std::move(bind);
+}
+
+unique_ptr<GlobalTableFunctionState> CheckGrantInit(ClientContext &, TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<CheckGrantBind>();
+	auto state = make_uniq<RightsState>();
+	auto &store = *bind.store;
+	if (!store.catalog || store.catalog->FunctionMode()) {
+		throw BinderException("acl: acl_check_grant needs a policy catalog (acl_use_db)");
+	}
+	auto text = [&](idx_t index) {
+		return index < bind.arguments.size() && !bind.arguments[index].IsNull() ? bind.arguments[index].ToString()
+		                                                                        : string();
+	};
+	auto role = text(0);
+	if (role.empty()) {
+		throw BinderException("acl_check_grant: a grant is to a role");
+	}
+	// names as the write takes them: the stored spelling (spec 116)
+	auto vcat = store.SpellCatalog(text(1));
+	auto vname = text(2).empty() ? string() : store.SpellName(vcat, text(2));
+	auto has_caps = bind.arguments.size() > 5 && !bind.arguments[5].IsNull();
+	auto value = [](const string &text) {
+		return text.empty() ? Value(LogicalType::VARCHAR) : Value(text);
+	};
+	for (auto &row : store.CatalogCheckGrant(role, vcat, vname, text(3), text(4), text(5), has_caps)) {
+		state->rows.push_back(
+		    {Value(row.item), value(row.name), value(row.type), Value(row.status), value(row.message)});
+	}
+	return std::move(state);
+}
+
 } // namespace
 
 void StoredBodyTables(const string &body, bool expression, vector<vector<string>> &tables) {
@@ -674,6 +730,14 @@ void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyS
 		}
 		loader.RegisterFunction(set);
 	}
+	TableFunctionSet check((Identifier("acl_check_grant")));
+	for (idx_t arity : {5, 6}) {
+		TableFunction function(Identifier("acl_check_grant"), vector<LogicalType>(arity, v), RightsScan,
+		                       CheckGrantBindFn, CheckGrantInit);
+		function.function_info = make_shared_ptr<CheckGrantInfo>(store);
+		check.AddFunction(function);
+	}
+	loader.RegisterFunction(check);
 }
 
 } // namespace acl

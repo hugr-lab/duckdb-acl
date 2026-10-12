@@ -783,6 +783,22 @@ struct PolicyStore {
 	//! per-object grant: its capabilities and (spec 011) the policy it imposes on the object
 	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json,
 	                          const string &rls = "", const string &columns = "");
+	//! spec 032 / 122: what an object grant's capabilities name (`manage` per object, a write verb on a function)
+	void CatalogCheckObjectCaps(const string &vcat, const string &vname, const string &caps_json);
+	//! spec 122: one finding of platform.check_grant - item rls | columns | column | caps | object, status ok |
+	//! refused | unchecked
+	struct GrantCheckRow {
+		string item;
+		string name;
+		string type;
+		string status;
+		string message;
+	};
+	//! spec 122: what writing the grant would say, written nowhere - the write's own steps (vname empty = a catalog
+	//! grant)
+	vector<GrantCheckRow> CatalogCheckGrant(const string &role, const string &vcat, const string &vname,
+	                                        const string &rls, const string &columns, const string &caps_json,
+	                                        bool has_caps);
 	//! Whether an object of that kind already exists - what CREATE / CREATE OR REPLACE /
 	//! CREATE IF NOT EXISTS decide on (spec 013). kind: catalog|role|issuer|schema|relation|table|scalar
 	bool CatalogObjectExists(const string &vcat, const string &vname, const string &kind);
