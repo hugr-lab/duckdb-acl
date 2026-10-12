@@ -1,0 +1,195 @@
+# name: test/sql/platform_check_grant.test
+# description: spec 122 - platform.check_grant answers what writing a grant would say, writes nothing, and agrees
+#   with the write: every case is checked, then written - refused exactly when the check refused, and the projection
+#   the write stores (grant_columns) is what the check answered
+# group: [sql]
+
+require acl
+
+statement ok
+CREATE TABLE orders(id INTEGER, amount INTEGER, tenant VARCHAR, ssn VARCHAR, address STRUCT(city VARCHAR, zip VARCHAR));
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE ROLE boss;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE boss;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS memory.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR sales.shout(text VARCHAR) RETURNS VARCHAR AS upper(acl_arg(1));
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN;
+
+# --- a grant that is right: each column the role would read, with its type; a mask that changes the type; a path ---
+
+query TTTTT
+ACL ROLE "boss" SELECT * FROM platform.check_grant('analyst', 'sales', 'orders', 'tenant = acl_claim(''tenant'')',
+    'id, amount, ssn = 42, address.city');
+----
+rls	tenant = acl_claim('tenant')	NULL	ok	NULL
+columns	id, amount, ssn = 42, address.city	NULL	ok	NULL
+column	id	INTEGER	ok	NULL
+column	amount	INTEGER	ok	NULL
+column	ssn	INTEGER	ok	42
+column	address	STRUCT(city VARCHAR)	ok	NULL
+
+# ... and it wrote nothing
+query I
+ACL ROLE "boss" SELECT count(*) FROM platform.object_grants WHERE role = 'analyst';
+----
+0
+
+# the write agrees: it succeeds, and stores the projection the check answered
+statement ok
+ACL ROLE "boss" GRANT OBJECT sales.orders TO ROLE analyst WITH (select) RLS (tenant = acl_claim('tenant'))
+    COLUMNS (id, amount, ssn = 42, address.city);
+
+query TT
+ACL ROLE "boss" SELECT name, type FROM platform.grant_columns WHERE role = 'analyst' ORDER BY pos;
+----
+id	INTEGER
+amount	INTEGER
+ssn	INTEGER
+address	STRUCT(city VARCHAR)
+
+# no list: every column the object exposes, with its type - what the role reads (a tool shows them)
+query TTTT
+ACL ROLE "boss" SELECT item, name, type, status FROM platform.check_grant('analyst', 'sales', 'orders', '', '');
+----
+column	id	INTEGER	ok
+column	amount	INTEGER	ok
+column	tenant	VARCHAR	ok
+column	ssn	VARCHAR	ok
+column	address	STRUCT(city VARCHAR, zip VARCHAR)	ok
+
+# the column list in its stored form (the object's order, spec 037)
+query TT
+ACL ROLE "boss" SELECT item, name FROM platform.check_grant('analyst', 'sales', 'orders', '', 'amount, id')
+    WHERE item = 'columns';
+----
+columns	id, amount
+
+# --- refusals: the write's own message, and the write is refused too ---------------------------------------------
+
+query TTT
+ACL ROLE "boss" SELECT item, status, message LIKE 'acl: the predicate of the grant on "orders" does not bind against it:%'
+    FROM platform.check_grant('analyst', 'sales', 'orders', 'nope > 1', '');
+----
+rls	refused	true
+
+statement error
+ACL ROLE "boss" GRANT OBJECT sales.orders TO ROLE analyst WITH (select) RLS (nope > 1);
+----
+does not bind against it
+
+query TTT
+ACL ROLE "boss" SELECT item, status, message LIKE '%lists "nothere", which the object does not have%'
+    FROM platform.check_grant('analyst', 'sales', 'orders', '', 'id, nothere');
+----
+columns	refused	true
+
+statement error
+ACL ROLE "boss" GRANT OBJECT sales.orders TO ROLE analyst WITH (select) COLUMNS (id, nothere);
+----
+which the object does not have
+
+query TTT
+ACL ROLE "boss" SELECT item, status, message FROM platform.check_grant('analyst', 'sales', 'orders', '', '',
+    '{"manage": true}');
+----
+caps	refused	acl admin: `manage` is granted per catalog, not per object - administering the ACL is catalog-scoped (spec 009)
+
+statement error
+ACL ROLE "boss" GRANT OBJECT sales.orders TO ROLE analyst CAPS '{"manage": true}';
+----
+is granted per catalog, not per object
+
+query TTT
+ACL ROLE "boss" SELECT item, status, message FROM platform.check_grant('analyst', 'sales', 'shout', 'true', '');
+----
+object	refused	acl admin: scalar function "sales.shout" has no rows or columns to narrow
+
+statement error
+ACL ROLE "boss" GRANT OBJECT sales.shout TO ROLE analyst RLS (true);
+----
+has no rows or columns to narrow
+
+query TTT
+ACL ROLE "boss" SELECT item, status, message FROM platform.check_grant('analyst', 'sales', 'zzz', '', '');
+----
+object	refused	acl admin: object "sales.zzz" does not exist
+
+# a body calling a function its author may not call: the call itself is refused, as the write is
+statement error
+ACL ROLE "boss" SELECT * FROM platform.check_grant('analyst', 'sales', 'orders', 'acl_session_count() > 0', '');
+----
+which its author may not call
+
+statement error
+ACL ROLE "boss" GRANT OBJECT sales.orders TO ROLE analyst RLS (acl_session_count() > 0);
+----
+which its author may not call
+
+# --- a catalog grant: its predicate judged as the write judges it, its columns not probed ------------------------
+
+query TTTT
+ACL ROLE "boss" SELECT item, name, status, message FROM platform.check_grant('analyst', 'sales', '', 'amount > 0', 'id');
+----
+rls	amount > 0	ok	NULL
+columns	id	unchecked	a catalog grant's columns are not probed
+
+# --- who may check: who may grant (HANDS_OUT) ---------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE curator;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE curator CAPS '{"manage": true}';
+
+statement error
+ACL ROLE "curator" SELECT * FROM platform.check_grant('analyst', 'sales', 'orders', '', '');
+----
+acl admin
+
+statement error
+ACL ROLE "analyst" SELECT * FROM platform.check_grant('analyst', 'sales', 'orders', '', '');
+----
+no ACL administration scope
+
+# a point grant on the function stands in for the bundle
+statement ok
+ACL ADMIN CREATE ROLE checker;
+
+statement ok
+ACL ADMIN GRANT FUNCTION platform.check_grant TO ROLE checker;
+
+query TT
+ACL ROLE "checker" SELECT item, status FROM platform.check_grant('analyst', 'sales', 'orders', 'amount > 0', '')
+    WHERE item = 'rls';
+----
+rls	ok
+
+# the acl_* function itself is never a principal's
+statement error
+ACL ROLE "boss" SELECT * FROM acl_check_grant('analyst', 'sales', 'orders', '', '');
+----
+not allowed

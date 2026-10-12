@@ -762,6 +762,12 @@ joined), NULL otherwise (`CreatedByLit`). The gate also judges `acl_refresh_sche
 decision (the source gate's probe) left a boundary in front of the batch's notes - the definition ran noteless (no
 profile, no AclConnection); `PushProfileNote` drops it. Export (120.4) after the release.
 
+**Spec 122 — check a grant before writing it**: `platform.check_grant(role, catalog, object, rls, columns[, caps])`
+(`acl_check_grant`, HANDS_OUT) answers what the write would say - `(item, name, type, status, message)`: the object,
+the RLS bound, the caps, the list's stored form, each column the role would read with its exposed type and mask -
+and writes nothing. One plan with the write (`PlanObjectGrant`, `CatalogCheckObjectCaps`); its bodies pass
+`AuthorizeBodies`, which the read-function path now runs. For acl-clients 008's grant editor.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,
