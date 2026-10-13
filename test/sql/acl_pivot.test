@@ -91,6 +91,10 @@ region
 q1
 q2
 
+# the event is written by the audit thread: flush before reading the ring (an unflushed read raced it)
+statement ok
+SELECT acl_audit_flush();
+
 # the audit keeps the statement's own class, and says in the detail that the parser shaped it as a pivot
 query III
 SELECT statement, detail, objects FROM acl_audit_events() WHERE kind = 'statement' AND verdict = 'allowed' ORDER BY seq DESC LIMIT 1;
@@ -107,6 +111,9 @@ ACL ROLE "analyst" SELECT * FROM report ORDER BY region;
 ----
 east	10	20
 west	5	NULL
+
+statement ok
+SELECT acl_audit_flush();
 
 query III
 SELECT statement, detail, objects FROM acl_audit_events() WHERE kind = 'statement' AND statement = 'insert' ORDER BY seq DESC LIMIT 1;

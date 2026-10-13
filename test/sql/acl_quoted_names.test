@@ -781,6 +781,10 @@ x-y
 statement ok
 ACL ROLE "r" SELECT count(*) FROM "sales mart"."ORDER ITEMS";
 
+# the event is written by the audit thread: flush before reading the ring (an unflushed read raced it)
+statement ok
+SELECT acl_audit_flush();
+
 query T
 SELECT objects FROM acl_audit_events() WHERE kind = 'statement' AND verdict = 'allowed' ORDER BY seq DESC LIMIT 1;
 ----
