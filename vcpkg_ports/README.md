@@ -39,5 +39,7 @@ headers do not; everything else is the registry's port (3.3.2). Upstream still h
 
 `x64-mingw-static`: the registry's community triplet plus `-Wa,-mbig-obj` - grpc 1.76 (the same
 baseline) no longer fits a COFF object on MinGW without it - and `VCPKG_BUILD_TYPE release`, since
-the extension links release alone. Listed first in `vcpkg.json`'s `overlay-triplets`; the same file
-lives in acl-otel, whose graph carries grpc too.
+the extension links release alone. Listed first in `vcpkg.json`'s `overlay-triplets`. The same file, byte for
+byte, lives in acl-otel (whose graph carries grpc too) and tresor, and hugr-node reads this one: vcpkg
+hashes the triplet file into every package's ABI, so one file is what lets the repositories share one
+binary cache (`docs/vcpkg-cache-r2.md`) - change it in all of them at once.
