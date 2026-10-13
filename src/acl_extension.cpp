@@ -1,4 +1,6 @@
+#ifndef ACL_EMBEDDED // spec 127: an extension that builds acl in is the one main
 #define DUCKDB_EXTENSION_MAIN
+#endif
 
 #include "acl_extension.hpp"
 #include "acl_lineage.hpp"
