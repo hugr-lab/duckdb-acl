@@ -2595,14 +2595,17 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 		}
 		auto bundles = rights.Bundles();
 		vector<string> readable, callable;
+		// spec 125: a standalone node refuses the profile's writes and its drift (spec 118.2), so it does not offer
+		// them - the profile's reads stay, they read on any node
+		bool cluster_node = store.ClusterNode();
 		for (auto &view : Views()) {
 			bool scoped;
-			if (access.ReadsView(view, scoped)) {
+			if (access.ReadsView(view, scoped) && (cluster_node || view.name != "drift")) {
 				readable.emplace_back(view.name);
 			}
 		}
 		for (auto &each : Functions()) {
-			if (access.CallsFunction(each)) {
+			if (access.CallsFunction(each) && (cluster_node || each.right != PlatformRight::INFRASTRUCTURE)) {
 				callable.emplace_back(each.name);
 			}
 		}
@@ -2614,7 +2617,9 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 		      "s.mode AS \"schema_mode\", " +
 		      list(views) + " AS \"views\", " + list(functions) + " AS \"functions\", " + list(readable) +
 		      " AS \"my_views\", " + list(callable) + " AS \"my_functions\", " + list(bundles) + " AS \"bundles\", " +
-		      list(catalogs) + " AS \"admin_catalogs\" FROM (SELECT acl_catalog_schema() AS s)";
+		      list(catalogs) + " AS \"admin_catalogs\", " + Lit(cluster_node ? "cluster" : "standalone") +
+		      " AS \"deployment\", " + list(GrantableAdminScopes()) +
+		      " AS \"scopes\" FROM (SELECT acl_catalog_schema() AS s)";
 		return true;
 	}
 	// check_catalog([vcat]), effective_rights(role, catalog[, object]), exposures(source[, …]): the authorizer

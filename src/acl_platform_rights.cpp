@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "acl_platform.hpp"
-#include "acl_cluster.hpp"
+#include "acl_sql_text.hpp"
 #include "acl_door_common.hpp"
 #include "acl_name_path.hpp"
 #include "acl_policy_catalog.hpp"
@@ -431,7 +431,7 @@ void Exposures(PolicyStore &store, const vector<string> &arguments, RightsState 
 		try {
 			BodyTables(body, expression, tables);
 		} catch (std::exception &) {
-			if (SqlNamesSourceOf(body, asked[0])) {
+			if (SqlNamesSource(body, asked[0])) {
 				sources.push_back(prefix);
 			}
 			return sources;

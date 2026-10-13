@@ -375,8 +375,11 @@ The parameters mean what the matching `acl_*` function's do - see the
 - `platform.console_info()` - what a console reads to show only what works: `build`,
   `audit_contract`, `connection_contract`, the catalog schema and window (`schema_build`,
   `schema_build_min_reader`, `schema_catalog`, `schema_min_reader`, `schema_mode`), `views` /
-  `functions` (what this node has), `my_views` / `my_functions` (what the caller may use), `bundles`
-  and `admin_catalogs`. Every principal holding anything on `platform` may call it.
+  `functions` (what this node has), `my_views` / `my_functions` (what the caller may use), `bundles`,
+  `admin_catalogs`, `deployment` (`standalone` | `cluster`) and `scopes` (the admin scopes this node grants, in
+  the order a picker shows them). A standalone node leaves out of `my_views` / `my_functions` what it refuses
+  there: `drift` and the cluster profile's writes (`cluster_*`); the profile's reads stay. Every principal
+  holding anything on `platform` may call it.
 - `platform.effective_rights(role, catalog[, object])` (spec 120) - what `role` gets of each table, view
   and live schema alias of `catalog`, and of each object under an alias the role holds a grant on:
   `decided_by` (`object`, `schema <path>` - the longest prefix the role holds, `(inherited)` when that row
