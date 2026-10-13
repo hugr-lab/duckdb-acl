@@ -71,15 +71,6 @@ ACL ADMIN CREATE ROLE cadm;
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE cadm CAPS '{"select": true, "manage": true}' MAIN;
 
-statement ok
-ACL ADMIN CREATE ROLE fleet;
-
-statement ok
-ACL ADMIN GRANT ADMIN cluster TO ROLE fleet;
-
-statement ok
-ACL ADMIN GRANT CATALOG c TO ROLE fleet CAPS '{"manage": true}';
-
 # --- the tree: policy sees every source - never the policy store's database --------------------------------
 
 query TTT
@@ -226,17 +217,6 @@ query II
 ACL ROLE "cadm" SELECT id, amount FROM c.orders;
 ----
 1	10
-
-# the cluster bundle sees every source - and, holding a catalog's manage, builds only over granted ones
-query I
-ACL ROLE "fleet" SELECT count(DISTINCT table_schema) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema LIKE 'attached.pg.%';
-----
-3
-
-statement error
-ACL ROLE "fleet" CREATE VIRTUAL TABLE c.fleet_pay AS pg.hr.salaries;
-----
-<REGEX>:.*outside the sources granted.*
 
 statement error
 SELECT acl_grant_source('', 'pg');

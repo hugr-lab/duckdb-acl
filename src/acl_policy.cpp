@@ -1165,6 +1165,14 @@ bool PolicyStore::SetDraining(bool value) {
 	return draining.exchange(value);
 }
 
+bool PolicyStore::ClusterNode() {
+	return node_traits.cluster_node && node_traits.cluster_node();
+}
+
+string PolicyStore::NodeGroup() {
+	return node_traits.node_group ? node_traits.node_group() : string();
+}
+
 int64_t PolicyStore::MetadataMaxRows() {
 	auto db = instance.lock();
 	Value value;
@@ -1372,6 +1380,22 @@ void PolicyStore::MergeMemoryRoleDefaults(Principal &out) {
 	}
 }
 
+namespace {
+
+//! spec 126: the scopes a linked module brings (the platform part's `cluster`); the others are acl's own
+std::atomic<bool> &ClusterScopeRegistered() {
+	static std::atomic<bool> registered {false};
+	return registered;
+}
+
+} // namespace
+
+void RegisterAdminScope(AdminScope scope) {
+	if (scope == AdminScope::CLUSTER) {
+		ClusterScopeRegistered().store(true);
+	}
+}
+
 bool TryParseAdminScope(const string &scope, AdminScope &out) {
 	if (StringUtil::CIEquals(scope, "passthrough")) {
 		out = AdminScope::PASSTHROUGH;
@@ -1383,7 +1407,8 @@ bool TryParseAdminScope(const string &scope, AdminScope &out) {
 		out = AdminScope::OBSERVE;
 	} else if (StringUtil::CIEquals(scope, "operate")) {
 		out = AdminScope::OPERATE;
-	} else if (StringUtil::CIEquals(scope, "cluster")) {
+	} else if (StringUtil::CIEquals(scope, "cluster") && ClusterScopeRegistered().load()) {
+		// spec 126: only where the platform part is linked - elsewhere an old row is an unknown scope (spec 097)
 		out = AdminScope::CLUSTER;
 	} else {
 		return false;
@@ -1394,9 +1419,8 @@ bool TryParseAdminScope(const string &scope, AdminScope &out) {
 AdminScope ParseAdminScope(const string &scope) {
 	AdminScope out;
 	if (!TryParseAdminScope(scope, out)) {
-		throw BinderException(
-		    "acl admin: unknown admin scope \"%s\" (expected observe, operate, cluster, policy, manage or passthrough)",
-		    scope);
+		throw BinderException("acl admin: unknown admin scope \"%s\" (expected %s)", scope,
+		                      StringUtil::Join(GrantableAdminScopes(), ", "));
 	}
 	return out;
 }
@@ -1423,7 +1447,9 @@ vector<string> GrantableAdminScopes() {
 	vector<string> out;
 	for (auto scope : {AdminScope::OBSERVE, AdminScope::OPERATE, AdminScope::CLUSTER, AdminScope::POLICY,
 	                   AdminScope::MANAGE, AdminScope::PASSTHROUGH}) {
-		out.emplace_back(AdminScopeName(scope));
+		if (scope != AdminScope::CLUSTER || ClusterScopeRegistered().load()) {
+			out.emplace_back(AdminScopeName(scope));
+		}
 	}
 	return out;
 }
@@ -1566,7 +1592,7 @@ void ApplyAdminRow(PolicyStore::AdminRights &rights, const string &scope_text, c
 		return;
 	case AdminScope::PASSTHROUGH:
 		rights.passthrough = true;
-		rights.cluster = true;
+		rights.cluster = ClusterScopeRegistered().load(); // spec 126: only where the platform part is linked
 		rights.operate = true;
 		rights.observe = true;
 		return;

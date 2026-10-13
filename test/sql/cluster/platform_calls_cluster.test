@@ -1,0 +1,93 @@
+# name: test/sql/cluster/platform_calls_cluster.test
+# description: spec 117 / 118 for the platform part: the cluster profile's platform calls - passthrough's (and the
+#   cluster bundle's), refused to the policy bundle and a catalog admin, as a call and as grammar (moved from
+#   platform_calls.test, which runs on an open node too)
+# group: [cluster]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_deployment = 'cluster';
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN CREATE ROLE cat;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE cat CAPS '{"manage": true}';
+
+statement ok
+ACL ROLE "root" SELECT platform.cluster_setting('set', '', 'threads', '2');
+
+query TT
+SELECT kind, name FROM store.acl.cluster_items;
+----
+setting	threads
+
+statement ok
+ACL ROLE "root" SELECT platform.cluster_setting('reset', '', 'threads', '');
+
+statement error
+ACL ROLE "pol" SELECT platform.cluster_setting('set', '', 'threads', '2');
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+# every cluster operation is passthrough's (until spec 118's cluster bundle) - the call and the grammar
+statement error
+ACL ROLE "pol" SELECT platform.cluster_attach('', 'src', ':memory:', 'duckdb', '', '{}', '', '');
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "pol" CLUSTER ATTACH ':memory:' AS src;
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "pol" SELECT platform.cluster_detach('', 'src', 'false', 'false');
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "pol" CLUSTER DETACH src;
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "pol" SELECT platform.cluster_extension('install', '', 'spatial', '', 'core', '');
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "pol" CLUSTER INSTALL EXTENSION spatial;
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+
+statement error
+ACL ROLE "cat" SELECT platform.cluster_setting('set', '', 'threads', '2');
+----
+<REGEX>:.*ACL CLUSTER changes the cluster's infrastructure.*
+

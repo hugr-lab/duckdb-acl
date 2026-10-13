@@ -1,4 +1,4 @@
-# name: test/sql/acl_cluster_profile.test
+# name: test/sql/cluster/acl_cluster_profile.test
 # description: the cluster profile (spec 093) - ACL CLUSTER writes the shared part of the node bootstrap
 #   into the policy catalog (desired state, config_version), applies a hot change on this node before
 #   the commit, never holds a credential, never touches the node's hardening, orders sources by
@@ -204,6 +204,12 @@ statement error
 ACL ADMIN CLUSTER SET lock_configuration = true;
 ----
 <REGEX>:.*node's hardening.*
+
+# spec 097's opt-out is the node's own (moved from acl_observe.test)
+statement error
+ACL ADMIN CLUSTER SET acl_observe_unauthenticated = true;
+----
+<REGEX>:.*"acl_observe_unauthenticated" is the node's hardening.*
 
 statement error
 ACL ADMIN CLUSTER SET no_such_setting = 1;

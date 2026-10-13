@@ -4,6 +4,7 @@
 // The grammar compiles text into acl_* admin-function calls; the parser override is its only caller.
 
 #include "acl_admin_sql.hpp"
+#include "acl_admin_scanner.hpp"
 #include "acl_platform.hpp"
 
 #include "acl_door_common.hpp"
@@ -27,237 +28,6 @@ namespace duckdb {
 namespace acl {
 namespace {
 
-struct AdminScanner {
-	const string &text;
-	idx_t pos = 0;
-
-	explicit AdminScanner(const string &text_p) : text(text_p) {
-	}
-	void Skip() {
-		SkipWhitespace(text, pos);
-	}
-	bool Done() {
-		Skip();
-		return pos >= text.size();
-	}
-	bool AtSemicolon() {
-		Skip();
-		return pos < text.size() && text[pos] == ';';
-	}
-	string PeekWord() {
-		Skip();
-		auto saved = pos;
-		auto word = ReadWord(text, pos);
-		pos = saved;
-		return word;
-	}
-	string Word(const char *what) {
-		Skip();
-		auto word = ReadWord(text, pos);
-		if (word.empty()) {
-			throw BinderException("acl admin: expected %s at position %llu", what, pos);
-		}
-		return word;
-	}
-	void Expect(const char *keyword) {
-		auto word = Word(keyword);
-		if (!StringUtil::CIEquals(word, keyword)) {
-			throw BinderException("acl admin: expected %s, got \"%s\"", keyword, word);
-		}
-	}
-	bool Accept(const char *keyword) {
-		Skip();
-		auto saved = pos;
-		auto word = ReadWord(text, pos);
-		if (StringUtil::CIEquals(word, keyword)) {
-			return true;
-		}
-		pos = saved;
-		return false;
-	}
-	bool AtParen() {
-		Skip();
-		return pos < text.size() && text[pos] == '(';
-	}
-	string Quoted(const char *what) {
-		Skip();
-		if (pos >= text.size() || (text[pos] != '\'' && text[pos] != '"')) {
-			throw BinderException("acl admin: expected a quoted %s at position %llu", what, pos);
-		}
-		return ReadQuoted(text, pos);
-	}
-	//! The text inside a parenthesised list, e.g. `(id INT, amount INT)` -> "id INT, amount INT".
-	//! Returns empty when the next token is not '('.
-	string Parens() {
-		Skip();
-		if (pos >= text.size() || text[pos] != '(') {
-			return string();
-		}
-		auto start = ++pos;
-		idx_t depth = 1;
-		while (pos < text.size() && depth > 0) {
-			auto c = text[pos];
-			if (c == '\'' || c == '"') {
-				ReadQuoted(text, pos);
-				continue;
-			}
-			if (c == '(') {
-				depth++;
-			} else if (c == ')') {
-				depth--;
-				if (depth == 0) {
-					break;
-				}
-			}
-			pos++;
-		}
-		if (depth != 0) {
-			throw BinderException("acl admin: unbalanced parentheses at position %llu", start);
-		}
-		auto body = text.substr(start, pos - start);
-		pos++; // the closing paren
-		StringUtil::Trim(body);
-		return body;
-	}
-
-	//! Everything up to the end of this statement, taken verbatim - quote- and paren-aware, so a
-	//! body may contain ';' inside a literal or a parenthesised list. This is what makes an inline
-	//! body possible: `AS SELECT … WHERE tenant = acl_claim('tenant')` instead of the same text in a
-	//! quoted string with every quote doubled.
-	string Rest(const char *what) {
-		Skip();
-		auto start = pos;
-		idx_t depth = 0;
-		while (pos < text.size()) {
-			auto c = text[pos];
-			if (c == '\'' || c == '"') {
-				ReadQuoted(text, pos);
-				continue;
-			}
-			if (c == '(') {
-				depth++;
-			} else if (c == ')' && depth > 0) {
-				depth--;
-			} else if (c == ';' && depth == 0) {
-				break;
-			}
-			pos++;
-		}
-		auto body = text.substr(start, pos - start);
-		StringUtil::Trim(body);
-		if (body.empty()) {
-			throw BinderException("acl admin: expected %s at position %llu", what, start);
-		}
-		return body;
-	}
-
-	//! A body written either way: a quoted string (what a gateway generates) or inline to the end of
-	//! the statement (what a human writes). Both forms are accepted everywhere a body is taken.
-	string Body(const char *what) {
-		Skip();
-		if (pos < text.size() && (text[pos] == '\'' || text[pos] == '"')) {
-			return Quoted(what);
-		}
-		return Rest(what);
-	}
-
-	//! A name that is a VALUE, not an SQL identifier (an issuer, a client, a resource group, a secret, an
-	//! extension, a source's alias - spec 116 §3): bare (`range`, `a.b`) or quoted either way, as written
-	string NameValue(const char *what) {
-		Skip();
-		if (pos < text.size() && (text[pos] == '\'' || text[pos] == '"')) {
-			return Quoted(what);
-		}
-		return DottedWords(what);
-	}
-
-	//! A virtual or physical name, as its canonical key (spec 116): written as SQL writes one
-	//! (`pg."Raw Data".orders`, each part a word or a double-quoted identifier), or as the legacy
-	//! single-quoted string holding a whole path (`'pg.public.orders'`), read with the key rules
-	string PathName(const char *what) {
-		Skip();
-		if (pos < text.size() && text[pos] == '\'') {
-			auto written = Quoted(what);
-			return NamePath::FromKey(written, what).ToKey();
-		}
-		return Dotted(what);
-	}
-
-	//! A list written either way: `(a, b = c)` or the legacy quoted csv/JSON string
-	string List(const char *what) {
-		Skip();
-		if (pos < text.size() && text[pos] == '(') {
-			return Parens();
-		}
-		return Quoted(what);
-	}
-
-	//! words joined by `.`, as written - a claim path, a value; never a SQL name (that is Path)
-	string DottedWords(const char *what) {
-		auto path = Word(what);
-		while (pos < text.size() && text[pos] == '.') {
-			pos++;
-			path += "." + Word(what);
-		}
-		return path;
-	}
-
-	//! One SQL identifier (spec 116): a word, or a double-quoted identifier with `""` for a quote - any
-	//! case, spaces, a dot inside. The raw name, unquoted.
-	string Ident(const char *what) {
-		Skip();
-		if (pos < text.size() && text[pos] == '"') {
-			auto start = pos;
-			pos++;
-			string name;
-			bool closed = false;
-			while (pos < text.size()) {
-				if (text[pos] == '"') {
-					if (pos + 1 < text.size() && text[pos + 1] == '"') {
-						name += '"';
-						pos += 2;
-						continue;
-					}
-					pos++;
-					closed = true;
-					break;
-				}
-				name += text[pos++];
-			}
-			if (!closed) {
-				throw BinderException("acl admin: an unterminated quoted identifier at position %llu", start);
-			}
-			if (name.empty()) {
-				throw BinderException("acl admin: an empty quoted identifier at position %llu - %s cannot be empty",
-				                      start, what);
-			}
-			return name;
-		}
-		return Word(what);
-	}
-
-	//! Identifiers joined by `.` (spec 116): `c."Raw Data".sub."T"` - each part one identifier
-	NamePath Path(const char *what) {
-		vector<string> parts;
-		parts.push_back(Ident(what));
-		while (pos < text.size() && text[pos] == '.') {
-			pos++;
-			parts.push_back(Ident(what));
-		}
-		return NamePath(std::move(parts));
-	}
-
-	//! A path as its canonical key
-	string Dotted(const char *what) {
-		return Path(what).ToKey();
-	}
-
-	//! One identifier as the key of a one-part name (a catalog: `"Sales Mart"`, `"a.b"`)
-	string IdentKey(const char *what) {
-		return NamePath::QuotePart(Ident(what));
-	}
-};
-
 //! vcat.vname (a key): the first part is the catalog, the rest the in-catalog path - both as keys
 void SplitVirtual(const string &path, string &vcat, string &vname) {
 	if (!NamePath::SplitHeadKey(path, vcat, vname)) {
@@ -280,6 +50,8 @@ string CapsListToJson(const string &list) {
 	return "{" + StringUtil::Join(entries, ", ") + "}";
 }
 
+} // namespace
+
 //! Strip one layer of quotes from a list element written as a literal
 string Unquoted(string value) {
 	StringUtil::Trim(value);
@@ -290,6 +62,8 @@ string Unquoted(string value) {
 	}
 	return value;
 }
+
+namespace {
 
 //! `(tenant = 'acme', unit = 'eu')` -> the csv `tenant='acme',unit='eu'`: each value stays one quoted literal, so
 //! a `,` or a `'` inside it is part of the value (ParseClaims takes the quotes off)
@@ -443,6 +217,8 @@ void GrantPolicyClauses(AdminScanner &s, string &caps, string &rls, string &colu
 	}
 }
 
+} // namespace
+
 unique_ptr<SQLStatement> MakeAdminCall(const string &function, const vector<Value> &args) {
 	vector<unique_ptr<ParsedExpression>> children;
 	for (auto &arg : args) {
@@ -460,6 +236,8 @@ unique_ptr<SQLStatement> MakeAdminCall(const string &function, const vector<Valu
 	statement->node = std::move(node);
 	return std::move(statement);
 }
+
+namespace {
 
 //! `SELECT * FROM acl_<fn>(...)`: the compiled form of a management statement that answers rows
 //! (CHECK VIRTUAL CATALOG, spec 039); authorized by the same name-and-catalog rule as a scalar call
@@ -482,13 +260,54 @@ unique_ptr<SQLStatement> MakeAdminTableCall(const string &function, const vector
 
 } // namespace
 
+namespace {
+
+struct MgmtGrammarEntry {
+	string keyword;
+	MgmtGrammar parse;
+};
+
+vector<MgmtGrammarEntry> &MgmtGrammars() {
+	static vector<MgmtGrammarEntry> grammars;
+	return grammars;
+}
+
+mutex &MgmtGrammarLock() {
+	static mutex lock;
+	return lock;
+}
+
+MgmtGrammar FindMgmtGrammar(const string &keyword) {
+	lock_guard<mutex> guard(MgmtGrammarLock());
+	for (auto &entry : MgmtGrammars()) {
+		if (StringUtil::CIEquals(entry.keyword, keyword)) {
+			return entry.parse;
+		}
+	}
+	return nullptr;
+}
+
+} // namespace
+
+void RegisterMgmtGrammar(const char *keyword, MgmtGrammar parse) {
+	lock_guard<mutex> guard(MgmtGrammarLock());
+	for (auto &entry : MgmtGrammars()) {
+		if (StringUtil::CIEquals(entry.keyword, keyword)) {
+			return;
+		}
+	}
+	MgmtGrammars().push_back({keyword, parse});
+}
+
 bool IsMgmtStart(const string &text) {
 	AdminScanner scanner(text);
 	auto first = scanner.PeekWord();
 	if (StringUtil::CIEquals(first, "add") || StringUtil::CIEquals(first, "grant") ||
-	    StringUtil::CIEquals(first, "revoke") || StringUtil::CIEquals(first, "map") ||
-	    StringUtil::CIEquals(first, "cluster")) { // CLUSTER (spec 093): duckdb has no CLUSTER statement
+	    StringUtil::CIEquals(first, "revoke") || StringUtil::CIEquals(first, "map")) {
 		return true;
+	}
+	if (FindMgmtGrammar(first)) {
+		return true; // a linked module's form (spec 126: CLUSTER - duckdb has no CLUSTER statement)
 	}
 	if (StringUtil::CIEquals(first, "deny")) {
 		// DENY FUNCTION [CATEGORY] … (spec 072), DENY VIEW platform.<v> (spec 117): duckdb has no DENY at all
@@ -885,132 +704,6 @@ unique_ptr<SQLStatement> PlatformGrant(AdminScanner &s, const char *kind, const 
 		                                            Value(string(verb) == "deny" ? "false" : "true")});
 	}
 	return MakeAdminCall("acl_revoke_platform", {Value(role), Value(kind), Value(object)});
-}
-
-//! `ACL CLUSTER …` (spec 093): the cluster profile. Compiled to acl_cluster_* calls; the authorization
-//! (a passthrough scope - it changes the cluster's infrastructure) is AuthorizeMgmt's.
-unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
-	auto group = [&]() -> string {
-		if (s.Accept("in")) {
-			s.Expect("group");
-			return s.NameValue("a resource group name");
-		}
-		return string();
-	};
-	auto comment = [&]() -> string {
-		return s.Accept("comment") ? s.Quoted("comment") : string();
-	};
-	auto verb = StringUtil::Lower(s.Word("INSTALL, UPDATE, REMOVE, ATTACH, DETACH, SET or RESET"));
-	if (verb == "install" || verb == "update" || verb == "remove") {
-		s.Expect("extension");
-		auto name = s.NameValue("an extension name");
-		string version, repository;
-		for (;;) {
-			if (verb != "remove" && s.Accept("version")) {
-				version = s.Quoted("version");
-			} else if (verb == "install" && s.Accept("from")) {
-				repository = s.NameValue("a repository name");
-			} else if (verb != "remove" && s.Accept("sha256")) {
-				// spec 103: refused, never ignored - a script that still pins a hash must not believe it does
-				throw BinderException("acl admin: SHA256 is no longer part of the cluster profile (spec 103) - "
-				                      "DuckDB verifies the repository's signature at every INSTALL and LOAD; name "
-				                      "the VERSION and the repository");
-			} else {
-				break;
-			}
-		}
-		auto scope = group();
-		auto note = comment();
-		return MakeAdminCall("acl_cluster_extension",
-		                     {Value(verb), Value(scope), Value(name), Value(version), Value(repository), Value(note)});
-	}
-	if (verb == "attach") {
-		auto path = s.Quoted("the source's path");
-		s.Expect("as");
-		auto alias = s.NameValue("the source's alias");
-		string type, secret;
-		vector<std::pair<string, string>> options;
-		if (s.AtParen()) {
-			for (auto &item : SplitTopLevel(s.Parens(), ',')) {
-				auto text = item;
-				StringUtil::Trim(text);
-				if (text.empty()) {
-					continue;
-				}
-				auto space = text.find_first_of(" \t");
-				auto key = space == string::npos ? text : text.substr(0, space);
-				auto value = space == string::npos ? string("true") : Unquoted(text.substr(space + 1));
-				if (StringUtil::CIEquals(key, "type")) {
-					type = StringUtil::Lower(value);
-				} else if (StringUtil::CIEquals(key, "secret")) {
-					secret = value;
-				} else {
-					options.emplace_back(StringUtil::Upper(key), value);
-				}
-			}
-		}
-		string lineage; // spec 112 §9: the name the source is known by, declared where it is attached
-		if (s.Accept("lineage")) {
-			lineage = s.Quoted("the source's lineage identity");
-		}
-		string deps;
-		if (s.Accept("depends")) {
-			s.Expect("on");
-			vector<string> names;
-			for (auto &item : SplitTopLevel(s.Parens(), ',')) {
-				auto name = Unquoted(item);
-				if (!name.empty()) {
-					names.push_back(name);
-				}
-			}
-			deps = StringUtil::Join(names, ",");
-		}
-		auto scope = group();
-		auto note = comment();
-		vector<string> json;
-		for (auto &option : options) {
-			json.push_back(JsonQuote(option.first) + ": " + JsonQuote(option.second));
-		}
-		return MakeAdminCall("acl_cluster_attach", {Value(scope), Value(alias), Value(path), Value(type), Value(secret),
-		                                            Value("{" + StringUtil::Join(json, ", ") + "}"), Value(deps),
-		                                            Value(note), Value(lineage)});
-	}
-	if (verb == "detach") {
-		auto alias = s.NameValue("the source's alias");
-		bool cascade = false, force = false;
-		for (;;) {
-			if (s.Accept("cascade")) {
-				cascade = true;
-			} else if (s.Accept("force")) {
-				force = true;
-			} else {
-				break;
-			}
-		}
-		auto scope = group();
-		return MakeAdminCall("acl_cluster_detach", {Value(scope), Value(alias), Value(cascade ? "true" : "false"),
-		                                            Value(force ? "true" : "false")});
-	}
-	if (verb == "set" || verb == "reset") {
-		auto name = s.Word("a setting name");
-		string value;
-		if (verb == "set") {
-			s.Skip();
-			if (s.pos < s.text.size() && s.text[s.pos] == '=') {
-				s.pos++;
-			} else {
-				s.Expect("to");
-			}
-			s.Skip();
-			value = s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"') ? s.Quoted("a value")
-			                                                                                 : s.Word("a value");
-		}
-		auto scope = group();
-		return MakeAdminCall("acl_cluster_setting", {Value(verb), Value(scope), Value(name), Value(value)});
-	}
-	throw BinderException("acl admin: ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET "
-	                      "or RESET, not \"%s\"",
-	                      verb);
 }
 
 // --- spec 095: issuers, clients, mappings --------------------------------------------------------
@@ -1442,8 +1135,8 @@ string ResourceLimitsJson(const string &inside) {
 
 unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &current_session) {
 	auto keyword = s.Word("a management keyword");
-	if (StringUtil::CIEquals(keyword, "cluster")) {
-		return ParseCluster(s);
+	if (auto parse = FindMgmtGrammar(keyword)) {
+		return parse(s); // spec 126: a linked module's form
 	}
 	if (StringUtil::CIEquals(keyword, "profile")) {
 		// PROFILE SESSION CURRENT | '<id>' ON | ALL | SAMPLED | OFF (spec 074 slice 3): the operator's

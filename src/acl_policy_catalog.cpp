@@ -2143,15 +2143,12 @@ ResourceLimits CatalogBackend::ResourceLimitsOf(const Principal &principal, cons
 	return out;
 }
 
+uint64_t PolicyStore::CatalogLocalWrites() {
+	return catalog ? catalog->local_writes.load() : 0;
+}
+
 ResourceLimits PolicyStore::ResolveResourceLimits(const Principal &principal) {
-	string node_group;
-	{
-		Value value;
-		auto db = instance.lock();
-		if (db && db->TryGetCurrentSetting("acl_node_group", value) && !value.IsNull()) {
-			node_group = value.ToString();
-		}
-	}
+	auto node_group = NodeGroup(); // spec 126: the platform's part names it; an open node has none
 	if (!catalog) {
 		ResourceLimits out; // memory mode has no groups
 		if (!node_group.empty()) {

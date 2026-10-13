@@ -227,18 +227,6 @@ void LoadInternal(ExtensionLoader &loader) {
 		    }
 	    },
 	    SetScope::GLOBAL);
-	config.AddExtensionOption(
-	    "acl_node_group",
-	    "acl: the resource group this node belongs to (spec 096) - it serves the sessions of principals "
-	    "that hold the group (or are in none and it is the default); '' serves everyone. Set by the "
-	    "deployment, never by the policy",
-	    LogicalType::VARCHAR, Value(""),
-	    [](ClientContext &, SetScope scope, Value &) {
-		    if (scope != SetScope::GLOBAL) {
-			    throw InvalidInputException("acl_node_group is global - use SET GLOBAL");
-		    }
-	    },
-	    SetScope::GLOBAL);
 	// spec 119: the most rows a metadata surface answers a principal - above it the statement is refused,
 	// never cut. A session may LOWER it for itself (spec 068's allowlist); never raise it above the node's
 	config.AddExtensionOption(
@@ -267,26 +255,6 @@ void LoadInternal(ExtensionLoader &loader) {
 		    }
 	    },
 	    SetScope::SESSION);
-	// spec 118: what this node is - a standalone node (its bootstrap SQL and its admin's ACL NATIVE configure
-	// it; no cluster profile) or a cluster node (the profile configures the fleet, tresor keeps its secrets).
-	// A security mode never follows from the policy's contents: the deployment sets it
-	config.AddExtensionOption(
-	    "acl_deployment",
-	    "acl: 'standalone' (the default - configured by its bootstrap, no cluster profile) or 'cluster' (the "
-	    "cluster profile, drift, secrets only in the secrets service). Set by the deployment, never by the policy",
-	    LogicalType::VARCHAR, Value("standalone"),
-	    [](ClientContext &, SetScope scope, Value &value) {
-		    if (scope != SetScope::GLOBAL) {
-			    throw InvalidInputException("acl_deployment is global - use SET GLOBAL");
-		    }
-		    auto text = StringUtil::Lower(value.ToString());
-		    if (text != "standalone" && text != "cluster") {
-			    throw InvalidInputException("acl_deployment is 'standalone' or 'cluster', not \"%s\"",
-			                                value.ToString());
-		    }
-		    value = Value(text);
-	    },
-	    SetScope::GLOBAL);
 	// spec 099: how a type the clients may not know is exposed - in the description and the data alike.
 	// A virtual table's own value (ALTER VIRTUAL TABLE ... SET TYPES) overrides these.
 	config.AddExtensionOption(
@@ -355,8 +323,10 @@ void LoadInternal(ExtensionLoader &loader) {
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
 	acl::RegisterAclMaintenance(loader, store); // spec 039: acl_check_catalog / acl_repair_relation
-	acl::RegisterAclCluster(loader, store);     // spec 093: the cluster profile
-	acl::RegisterAclTypes(loader, store);       // spec 099: acl_exposed_type, the listings' type rule
+#ifndef ACL_NO_CLUSTER
+	acl::RegisterAclCluster(loader, store); // spec 093: the cluster profile - the platform part (spec 126)
+#endif
+	acl::RegisterAclTypes(loader, store); // spec 099: acl_exposed_type, the listings' type rule
 	// The audit and observability hooks (spec 069): one registry per instance, reached through the
 	// object cache so an extension loaded before or after us finds the same one - unless the one
 	// there was stamped with another contract version (an extension built from another revision of

@@ -8,7 +8,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "acl_platform.hpp"
-#include "acl_cluster.hpp"
 
 #include "acl_connection.hpp"
 #include "acl_door_common.hpp"
@@ -97,8 +96,6 @@ constexpr const char *ATTRIBUTES = "ATTRIBUTES";
 constexpr const char *GROUPS = "GROUPS";
 //! an audit event's objects (spec 069): name + the capability judged
 constexpr const char *OBJECTS = "OBJECTS";
-//! what an ACL CLUSTER call answers (spec 093), as the listings spell its type
-constexpr const char *CLUSTER_ANSWER = "STRUCT(version BIGINT, class VARCHAR, applied_here BOOLEAN, note VARCHAR)";
 
 const char *const CAPABILITIES[] = {"select", "insert", "update",  "delete",  "merge", "create",
                                     "drop",   "temp",   "explain", "secrets", "manage"};
@@ -358,33 +355,6 @@ vector<PlatformView> BuildViews() {
 	      {"is_default", B}},
 	     "the resource groups (spec 085)"},
 	    {"role_resource_groups", PV::POLICY, {{"role", V}, {"group", V}}, "which role is in which resource group"},
-	    {"cluster_items",
-	     PV::CLUSTER,
-	     {{"scope", V},
-	      {"kind", V},
-	      {"name", V},
-	      {"spec", MAPV},
-	      {"class", V},
-	      {"version", I},
-	      {"depends_on", LV},
-	      {"comment", V}},
-	     "the cluster profile as written (spec 093)"},
-	    {"cluster_effective",
-	     PV::CLUSTER,
-	     {{"scope", V},
-	      {"kind", V},
-	      {"name", V},
-	      {"spec", MAPV},
-	      {"class", V},
-	      {"version", I},
-	      {"depends_on", LV},
-	      {"comment", V}},
-	     "what of the cluster profile applies to this node (spec 096)"},
-	    {"drift",
-	     PV::CLUSTER,
-	     {{"kind", V}, {"name", V}, {"state", V}, {"node_value", V}, {"profile_value", V}, {"scope", V}},
-	     "what this cluster node carries against its profile: same, differs, node_only, profile_only, bootstrap "
-	     "(spec 118)"},
 	    {"catalog_schema",
 	     PV::POLICY,
 	     {{"build", I}, {"build_min_reader", I}, {"catalog", I}, {"min_reader", I}, {"mode", V}},
@@ -1078,44 +1048,6 @@ vector<PlatformFunction> BuildFunctions() {
 	     false,
 	     B,
 	     "revoke a point grant on platform"},
-	    // the cluster profile (spec 093): the node's infrastructure - the cluster bundle's (spec 118)
-	    {"cluster_extension",
-	     "acl_cluster_extension",
-	     {A("verb"), A("scope"), A("name"), P("version"), A("repository"), comment},
-	     {6},
-	     -1,
-	     PR::INFRASTRUCTURE,
-	     false,
-	     CLUSTER_ANSWER,
-	     "install / update / remove an extension of the profile"},
-	    {"cluster_attach",
-	     "acl_cluster_attach",
-	     {A("scope"), A("alias"), A("path"), A("type"), A("secret"), P("options"), A("depends_on"), comment,
-	      P("lineage")},
-	     {8, 9},
-	     -1,
-	     PR::INFRASTRUCTURE,
-	     false,
-	     CLUSTER_ANSWER,
-	     "attach a source in the profile"},
-	    {"cluster_detach",
-	     "acl_cluster_detach",
-	     {A("scope"), A("alias"), P("cascade"), P("force")},
-	     {4},
-	     -1,
-	     PR::INFRASTRUCTURE,
-	     false,
-	     CLUSTER_ANSWER,
-	     "detach a source of the profile"},
-	    {"cluster_setting",
-	     "acl_cluster_setting",
-	     {A("verb"), A("scope"), A("name"), P("value")},
-	     {4},
-	     -1,
-	     PR::INFRASTRUCTURE,
-	     false,
-	     CLUSTER_ANSWER,
-	     "set / reset a setting of the profile"},
 	    // read: table functions in FROM
 	    {"check_catalog",
 	     "acl_check_catalog",
@@ -1166,20 +1098,56 @@ vector<PlatformFunction> BuildFunctions() {
 	};
 }
 
-const vector<PlatformView> &Views() {
-	static const vector<PlatformView> views = BuildViews();
+// spec 126: acl's entries, then what a linked module registers at load (before the first statement)
+vector<PlatformView> &ViewRegistry() {
+	static vector<PlatformView> views = BuildViews();
 	return views;
 }
 
-const vector<PlatformFunction> &Functions() {
-	static const vector<PlatformFunction> functions = BuildFunctions();
+vector<PlatformFunction> &FunctionRegistry() {
+	static vector<PlatformFunction> functions = BuildFunctions();
 	return functions;
+}
+
+mutex &RegistryLock() {
+	static mutex lock;
+	return lock;
+}
+
+const vector<PlatformView> &Views() {
+	return ViewRegistry();
+}
+
+const vector<PlatformFunction> &Functions() {
+	return FunctionRegistry();
 }
 
 } // namespace
 
 const vector<PlatformView> &PlatformViews() {
 	return Views();
+}
+
+void RegisterPlatformView(PlatformView view) {
+	lock_guard<mutex> guard(RegistryLock());
+	auto &views = ViewRegistry();
+	for (auto &existing : views) {
+		if (StringUtil::CIEquals(existing.name, view.name)) {
+			return;
+		}
+	}
+	views.push_back(std::move(view));
+}
+
+void RegisterPlatformFunction(PlatformFunction function) {
+	lock_guard<mutex> guard(RegistryLock());
+	auto &functions = FunctionRegistry();
+	for (auto &existing : functions) {
+		if (StringUtil::CIEquals(existing.name, function.name)) {
+			return;
+		}
+	}
+	functions.push_back(std::move(function));
 }
 
 const vector<PlatformFunction> &PlatformFunctions() {
@@ -1466,11 +1434,14 @@ void AuthorizeAdminCall(SQLStatement &statement, const PolicyStore::AdminRights 
 	case PlatformRight::INFRASTRUCTURE:
 		// spec 118: the cluster bundle - never a point grant, and only the settings of the node's resources
 		if (rights.cluster) {
-			if (name == "acl_cluster_setting" && !ClusterBundleMaySet(ConstantArgument(call, 2, function->name))) {
-				throw BinderException("acl admin: \"%s\" is not among the settings the cluster bundle sets (the "
-				                      "node's resources and tuning) - a data path, a trust or audit setting is a "
-				                      "passthrough scope's",
-				                      ConstantArgument(call, 2, function->name));
+			// spec 126: the function's own rule on an argument (the cluster bundle's settings allowlist)
+			if (function->rule && function->rule_arg >= 0) {
+				auto value = ConstantArgument(call, NumericCast<idx_t>(function->rule_arg), function->name);
+				if (!function->rule(value)) {
+					throw BinderException(function->rule_refusal ? function->rule_refusal
+					                                             : "acl admin: \"%s\" is refused by the bundle's rule",
+					                      value);
+				}
 			}
 			return;
 		}
@@ -2501,14 +2472,6 @@ string FunctionBody(const string &view) {
 		return "SELECT \"database\", \"schema\", \"name\", \"kind\", \"function_type\", \"categories\", \"status\","
 		       " \"present\" FROM acl_function_status()";
 	}
-	if (view == "drift") {
-		return "SELECT * FROM acl_platform_drift()";
-	}
-	if (view == "cluster_items" || view == "cluster_effective") {
-		return "SELECT \"scope\", \"kind\", \"name\", acl_platform_map(\"spec\") AS \"spec\", \"class\", \"version\","
-		       " \"depends_on\", \"comment\" FROM acl_" +
-		       view + "()";
-	}
 	if (view == "catalog_schema") {
 		return "SELECT s.build AS \"build\", s.build_min_reader AS \"build_min_reader\", s.catalog AS \"catalog\","
 		       " s.min_reader AS \"min_reader\", s.mode AS \"mode\" FROM (SELECT acl_catalog_schema() AS s)";
@@ -2545,7 +2508,7 @@ bool PlatformViewSql(PolicyStore &store, const PolicyStore::AdminRights &rights,
 	if (!access.ReadsView(*view, scoped)) {
 		return false;
 	}
-	auto body = FunctionBody(view->name);
+	auto body = view->body ? string(view->body) : FunctionBody(view->name);
 	if (body.empty()) {
 		if (!store.catalog || store.catalog->FunctionMode()) {
 			NoteDenyReason(Reason::UNAVAILABLE);
@@ -2600,7 +2563,7 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 		bool cluster_node = store.ClusterNode();
 		for (auto &view : Views()) {
 			bool scoped;
-			if (access.ReadsView(view, scoped) && (cluster_node || view.name != "drift")) {
+			if (access.ReadsView(view, scoped) && (cluster_node || !StringUtil::CIEquals(view.name, "drift"))) {
 				readable.emplace_back(view.name);
 			}
 		}

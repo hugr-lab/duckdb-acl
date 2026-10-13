@@ -6,12 +6,16 @@
 
 #include "acl_cluster.hpp"
 
+#include "acl_admin_scanner.hpp"
+
 #include "acl_door_common.hpp"
+#include "acl_platform.hpp"
 #include "acl_lineage.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_result_rows.hpp"
 #include "acl_sql_text.hpp"
 
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_helper.hpp"
@@ -888,13 +892,6 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 	return answer;
 }
 
-bool PolicyStore::ClusterNode() {
-	auto db = instance.lock();
-	Value value;
-	return db && db->TryGetCurrentSetting("acl_deployment", value) && !value.IsNull() &&
-	       StringUtil::CIEquals(value.ToString(), "cluster");
-}
-
 vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 	RequireClusterCatalog(catalog, "acl_platform_drift");
 	if (!ClusterNode()) {
@@ -1023,19 +1020,6 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 		out.push_back({"setting", name, "bootstrap", value.IsNull() ? string() : value.ToString(), "", ""});
 	}
 	return out;
-}
-
-string PolicyStore::NodeGroup() {
-	auto db = instance.lock();
-	Value value;
-	if (db && db->TryGetCurrentSetting("acl_node_group", value) && !value.IsNull()) {
-		return value.ToString();
-	}
-	return string();
-}
-
-uint64_t PolicyStore::CatalogLocalWrites() {
-	return catalog ? catalog->local_writes.load() : 0;
 }
 
 bool PolicyStore::NodeGroupKnown() {
@@ -1345,6 +1329,216 @@ void ClusterAppliedFunc(DataChunk &args, ExpressionState &state, Vector &result)
 
 } // namespace
 
+namespace {
+
+//! `ACL CLUSTER …` (spec 093): the cluster profile. Compiled to acl_cluster_* calls; the authorization
+//! (a passthrough scope - it changes the cluster's infrastructure) is AuthorizeMgmt's.
+unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
+	auto group = [&]() -> string {
+		if (s.Accept("in")) {
+			s.Expect("group");
+			return s.NameValue("a resource group name");
+		}
+		return string();
+	};
+	auto comment = [&]() -> string {
+		return s.Accept("comment") ? s.Quoted("comment") : string();
+	};
+	auto verb = StringUtil::Lower(s.Word("INSTALL, UPDATE, REMOVE, ATTACH, DETACH, SET or RESET"));
+	if (verb == "install" || verb == "update" || verb == "remove") {
+		s.Expect("extension");
+		auto name = s.NameValue("an extension name");
+		string version, repository;
+		for (;;) {
+			if (verb != "remove" && s.Accept("version")) {
+				version = s.Quoted("version");
+			} else if (verb == "install" && s.Accept("from")) {
+				repository = s.NameValue("a repository name");
+			} else if (verb != "remove" && s.Accept("sha256")) {
+				// spec 103: refused, never ignored - a script that still pins a hash must not believe it does
+				throw BinderException("acl admin: SHA256 is no longer part of the cluster profile (spec 103) - "
+				                      "DuckDB verifies the repository's signature at every INSTALL and LOAD; name "
+				                      "the VERSION and the repository");
+			} else {
+				break;
+			}
+		}
+		auto scope = group();
+		auto note = comment();
+		return MakeAdminCall("acl_cluster_extension",
+		                     {Value(verb), Value(scope), Value(name), Value(version), Value(repository), Value(note)});
+	}
+	if (verb == "attach") {
+		auto path = s.Quoted("the source's path");
+		s.Expect("as");
+		auto alias = s.NameValue("the source's alias");
+		string type, secret;
+		vector<std::pair<string, string>> options;
+		if (s.AtParen()) {
+			for (auto &item : SplitTopLevel(s.Parens(), ',')) {
+				auto text = item;
+				StringUtil::Trim(text);
+				if (text.empty()) {
+					continue;
+				}
+				auto space = text.find_first_of(" \t");
+				auto key = space == string::npos ? text : text.substr(0, space);
+				auto value = space == string::npos ? string("true") : Unquoted(text.substr(space + 1));
+				if (StringUtil::CIEquals(key, "type")) {
+					type = StringUtil::Lower(value);
+				} else if (StringUtil::CIEquals(key, "secret")) {
+					secret = value;
+				} else {
+					options.emplace_back(StringUtil::Upper(key), value);
+				}
+			}
+		}
+		string lineage; // spec 112 §9: the name the source is known by, declared where it is attached
+		if (s.Accept("lineage")) {
+			lineage = s.Quoted("the source's lineage identity");
+		}
+		string deps;
+		if (s.Accept("depends")) {
+			s.Expect("on");
+			vector<string> names;
+			for (auto &item : SplitTopLevel(s.Parens(), ',')) {
+				auto name = Unquoted(item);
+				if (!name.empty()) {
+					names.push_back(name);
+				}
+			}
+			deps = StringUtil::Join(names, ",");
+		}
+		auto scope = group();
+		auto note = comment();
+		vector<string> json;
+		for (auto &option : options) {
+			json.push_back(JsonQuote(option.first) + ": " + JsonQuote(option.second));
+		}
+		return MakeAdminCall("acl_cluster_attach", {Value(scope), Value(alias), Value(path), Value(type), Value(secret),
+		                                            Value("{" + StringUtil::Join(json, ", ") + "}"), Value(deps),
+		                                            Value(note), Value(lineage)});
+	}
+	if (verb == "detach") {
+		auto alias = s.NameValue("the source's alias");
+		bool cascade = false, force = false;
+		for (;;) {
+			if (s.Accept("cascade")) {
+				cascade = true;
+			} else if (s.Accept("force")) {
+				force = true;
+			} else {
+				break;
+			}
+		}
+		auto scope = group();
+		return MakeAdminCall("acl_cluster_detach", {Value(scope), Value(alias), Value(cascade ? "true" : "false"),
+		                                            Value(force ? "true" : "false")});
+	}
+	if (verb == "set" || verb == "reset") {
+		auto name = s.Word("a setting name");
+		string value;
+		if (verb == "set") {
+			s.Skip();
+			if (s.pos < s.text.size() && s.text[s.pos] == '=') {
+				s.pos++;
+			} else {
+				s.Expect("to");
+			}
+			s.Skip();
+			value = s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"') ? s.Quoted("a value")
+			                                                                                 : s.Word("a value");
+		}
+		auto scope = group();
+		return MakeAdminCall("acl_cluster_setting", {Value(verb), Value(scope), Value(name), Value(value)});
+	}
+	throw BinderException("acl admin: ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET "
+	                      "or RESET, not \"%s\"",
+	                      verb);
+}
+
+//! spec 126: the cluster's part of the `platform` catalog - its views and functions, registered at load; the ONE
+//! authorizer judges them by their class (CLUSTER views, INFRASTRUCTURE functions: the cluster bundle's)
+void RegisterClusterPlatform() {
+	constexpr const char *V = "VARCHAR";
+	constexpr const char *I = "BIGINT";
+	constexpr const char *LV = "VARCHAR[]";
+	constexpr const char *MAPV = "MAP";
+	constexpr const char *ANSWER = "STRUCT(version BIGINT, class VARCHAR, applied_here BOOLEAN, note VARCHAR)";
+	const vector<PlatformColumn> item_columns = {{"scope", V}, {"kind", V},    {"name", V},        {"spec", MAPV},
+	                                             {"class", V}, {"version", I}, {"depends_on", LV}, {"comment", V}};
+	PlatformView items {"cluster_items", PlatformViewClass::CLUSTER, item_columns,
+	                    "the cluster profile as written (spec 093)"};
+	items.body =
+	    "SELECT \"scope\", \"kind\", \"name\", acl_platform_map(\"spec\") AS \"spec\", \"class\", \"version\", "
+	    "\"depends_on\", \"comment\" FROM acl_cluster_items()";
+	RegisterPlatformView(std::move(items));
+	PlatformView effective {"cluster_effective", PlatformViewClass::CLUSTER, item_columns,
+	                        "what of the cluster profile applies to this node (spec 096)"};
+	effective.body = "SELECT \"scope\", \"kind\", \"name\", acl_platform_map(\"spec\") AS \"spec\", \"class\", "
+	                 "\"version\", \"depends_on\", \"comment\" FROM acl_cluster_effective()";
+	RegisterPlatformView(std::move(effective));
+	PlatformView drift {"drift",
+	                    PlatformViewClass::CLUSTER,
+	                    {{"kind", V}, {"name", V}, {"state", V}, {"node_value", V}, {"profile_value", V}, {"scope", V}},
+	                    "what this cluster node carries against its profile: same, differs, node_only, profile_only, "
+	                    "bootstrap (spec 118)"};
+	drift.body = "SELECT * FROM acl_platform_drift()";
+	RegisterPlatformView(std::move(drift));
+
+	auto A = [](const char *name) {
+		return PlatformParam {name, true, "VARCHAR", ""};
+	};
+	auto P = [](const char *name) {
+		return PlatformParam {name, false, "VARCHAR", ""};
+	};
+	RegisterPlatformFunction({"cluster_extension",
+	                          "acl_cluster_extension",
+	                          {A("verb"), A("scope"), A("name"), P("version"), A("repository"), P("comment")},
+	                          {6},
+	                          -1,
+	                          PlatformRight::INFRASTRUCTURE,
+	                          false,
+	                          ANSWER,
+	                          "install / update / remove an extension of the profile"});
+	RegisterPlatformFunction({"cluster_attach",
+	                          "acl_cluster_attach",
+	                          {A("scope"), A("alias"), A("path"), A("type"), A("secret"), P("options"), A("depends_on"),
+	                           P("comment"), P("lineage")},
+	                          {8, 9},
+	                          -1,
+	                          PlatformRight::INFRASTRUCTURE,
+	                          false,
+	                          ANSWER,
+	                          "attach a source in the profile"});
+	RegisterPlatformFunction({"cluster_detach",
+	                          "acl_cluster_detach",
+	                          {A("scope"), A("alias"), P("cascade"), P("force")},
+	                          {4},
+	                          -1,
+	                          PlatformRight::INFRASTRUCTURE,
+	                          false,
+	                          ANSWER,
+	                          "detach a source of the profile"});
+	PlatformFunction setting {"cluster_setting",
+	                          "acl_cluster_setting",
+	                          {A("verb"), A("scope"), A("name"), P("value")},
+	                          {4},
+	                          -1,
+	                          PlatformRight::INFRASTRUCTURE,
+	                          false,
+	                          ANSWER,
+	                          "set / reset a setting of the profile"};
+	// spec 118: the cluster bundle sets only the node's resources and tuning; the rest is passthrough's
+	setting.rule_arg = 2;
+	setting.rule = ClusterBundleMaySet;
+	setting.rule_refusal = "acl admin: \"%s\" is not among the settings the cluster bundle sets (the node's resources "
+	                       "and tuning) - a data path, a trust or audit setting is a passthrough scope's";
+	RegisterPlatformFunction(std::move(setting));
+}
+
+} // namespace
+
 void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {
 	const LogicalType &v = LogicalType::VARCHAR;
 	auto scalar = [&](const char *name, vector<LogicalType> arguments, const scalar_function_t &fn,
@@ -1376,6 +1570,65 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	TableFunction drift(Identifier("acl_platform_drift"), {}, DriftScan, DriftBindFn, DriftInit);
 	drift.function_info = info;
 	loader.RegisterFunction(drift);
+	RegisterClusterPlatform();
+	RegisterMgmtGrammar("cluster", ParseCluster);
+	RegisterAdminScope(AdminScope::CLUSTER);
+
+	// spec 126: the node's deployment and group are the platform part's settings and traits
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	// spec 118: what this node is - a standalone node (its bootstrap SQL and its admin's ACL NATIVE configure
+	// it; no cluster profile) or a cluster node (the profile configures the fleet, tresor keeps its secrets).
+	// A security mode never follows from the policy's contents: the deployment sets it
+	config.AddExtensionOption(
+	    "acl_deployment",
+	    "acl: 'standalone' (the default - configured by its bootstrap, no cluster profile) or 'cluster' (the "
+	    "cluster profile, drift, secrets only in the secrets service). Set by the deployment, never by the policy",
+	    LogicalType::VARCHAR, Value("standalone"),
+	    [](ClientContext &, SetScope scope, Value &value) {
+		    if (scope != SetScope::GLOBAL) {
+			    throw InvalidInputException("acl_deployment is global - use SET GLOBAL");
+		    }
+		    auto text = StringUtil::Lower(value.ToString());
+		    if (text != "standalone" && text != "cluster") {
+			    throw InvalidInputException("acl_deployment is 'standalone' or 'cluster', not \"%s\"",
+			                                value.ToString());
+		    }
+		    value = Value(text);
+	    },
+	    SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "acl_node_group",
+	    "acl: the resource group this node belongs to (spec 096) - it serves the sessions of principals "
+	    "that hold the group (or are in none and it is the default); '' serves everyone. Set by the "
+	    "deployment, never by the policy",
+	    LogicalType::VARCHAR, Value(""),
+	    [](ClientContext &, SetScope scope, Value &) {
+		    if (scope != SetScope::GLOBAL) {
+			    throw InvalidInputException("acl_node_group is global - use SET GLOBAL");
+		    }
+	    },
+	    SetScope::GLOBAL);
+	auto *node = store.get(); // the traits live in the store: no reference back to it is kept
+	node->node_traits.cluster_node = [node]() {
+		auto db = node->instance.lock();
+		Value value;
+		return db && db->TryGetCurrentSetting("acl_deployment", value) && !value.IsNull() &&
+		       StringUtil::CIEquals(value.ToString(), "cluster");
+	};
+	node->node_traits.node_group = [node]() {
+		auto db = node->instance.lock();
+		Value value;
+		if (db && db->TryGetCurrentSetting("acl_node_group", value) && !value.IsNull()) {
+			return value.ToString();
+		}
+		return string();
+	};
+	node->node_traits.node_group_known = [node]() {
+		return node->NodeGroupKnown();
+	};
+	node->node_traits.config_target = [node]() {
+		return node->ClusterVersion();
+	};
 }
 
 } // namespace acl

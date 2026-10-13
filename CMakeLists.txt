@@ -61,6 +61,14 @@ set(EXTENSION_SOURCES
     src/acl_identity_store.cpp
     third_party/p256-m/p256-m.c)
 
+# spec 126: the platform part (the cluster profile, node groups, drift, the deployment, the cluster bundle) is in
+# acl_cluster.cpp and plugs into the core through its registration points. ACL_NO_CLUSTER=1 builds the open node
+# without it - the proof the core does not need it (design/080: it moves to hugr_node).
+if(DEFINED ENV{ACL_NO_CLUSTER})
+    list(REMOVE_ITEM EXTENSION_SOURCES src/acl_cluster.cpp)
+    add_definitions(-DACL_NO_CLUSTER)
+endif()
+
 # The Arrow Flight SQL door (specs/045): built by default, because it is what a client with an ADBC or
 # JDBC driver connects to - a feature of the extension rather than an option for people who build it
 # themselves. Static targets, as the airport extension does: a loadable extension is dlopen'd

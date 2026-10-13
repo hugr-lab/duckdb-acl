@@ -63,6 +63,8 @@ struct PlatformView {
 	PlatformViewClass view_class;
 	vector<PlatformColumn> columns;
 	const char *comment;
+	//! spec 126: a view read through a table function - its SELECT (a registered view carries its own)
+	const char *body = nullptr;
 };
 
 struct PlatformParam {
@@ -87,7 +89,18 @@ struct PlatformFunction {
 	bool table;          //! a table function, called in FROM (read-only)
 	const char *returns; //! the result type, for the listings
 	const char *comment;
+	//! spec 126: a rule on one constant argument the INFRASTRUCTURE right applies for a bundle holder (not for
+	//! passthrough) - e.g. the settings the cluster bundle may put in the profile; `rule_refusal` has one %s
+	int rule_arg = -1;
+	bool (*rule)(const string &value) = nullptr;
+	const char *rule_refusal = nullptr;
 };
+
+//! spec 126: a module linked into the extension adds its views and functions to the `platform` registry at load,
+//! before the first statement; the ONE authorizer judges them by their class like acl's own. Idempotent by name
+//! (a second instance loading in the same process registers nothing new).
+void RegisterPlatformView(PlatformView view);
+void RegisterPlatformFunction(PlatformFunction function);
 
 const vector<PlatformView> &PlatformViews();
 const vector<PlatformFunction> &PlatformFunctions();

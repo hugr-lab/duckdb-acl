@@ -1,4 +1,4 @@
-# name: test/sql/acl_node_group.test
+# name: test/sql/cluster/acl_node_group.test
 # description: a node's resource group (spec 096) - membership by acl_node_group, placement of sessions
 #   (a node of g serves principals that hold g, with g's limits only), the default group for principals
 #   bound to none, an unknown group failing closed, the group's part of the cluster profile (written,
