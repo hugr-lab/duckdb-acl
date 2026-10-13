@@ -67,7 +67,7 @@
 namespace duckdb {
 namespace {
 
-void LoadInternal(ExtensionLoader &loader) {
+shared_ptr<acl::PolicyStore> LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 
@@ -323,8 +323,10 @@ void LoadInternal(ExtensionLoader &loader) {
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
 	acl::RegisterAclMaintenance(loader, store); // spec 039: acl_check_catalog / acl_repair_relation
-#ifndef ACL_NO_CLUSTER
-	acl::RegisterAclCluster(loader, store); // spec 093: the cluster profile - the platform part (spec 126)
+#if !defined(ACL_NO_CLUSTER) && !defined(ACL_EMBEDDED)
+	// spec 093: the cluster profile - the platform part (spec 126); an extension that builds acl in (spec 127,
+	// hugr_node) registers it itself after LoadAclCore
+	acl::RegisterAclCluster(loader, store);
 #endif
 	acl::RegisterAclTypes(loader, store); // spec 099: acl_exposed_type, the listings' type rule
 	// The audit and observability hooks (spec 069): one registry per instance, reached through the
@@ -456,11 +458,17 @@ void LoadInternal(ExtensionLoader &loader) {
 	// the store's own handle in the cache (weak): what PolicyStore::Of(db) answers to code that holds a
 	// connection and nothing else - the embedded quack server's drain thread (spec 069)
 	db.GetObjectCache().GetOrCreate<acl::PolicyStoreHandle>(acl::PolicyStoreHandle::ObjectType())->store = store;
-	acl::RegisterAclAdminFunctions(loader, std::move(store));
+	acl::RegisterAclAdminFunctions(loader, store);
+	return store;
 }
 
 } // namespace
 
+shared_ptr<acl::PolicyStore> LoadAclCore(ExtensionLoader &loader) {
+	return LoadInternal(loader);
+}
+
+#ifndef ACL_EMBEDDED
 void AclExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
@@ -474,11 +482,14 @@ std::string AclExtension::Version() const {
 	return "";
 #endif
 }
+#endif
 
 } // namespace duckdb
 
+#ifndef ACL_EMBEDDED
 extern "C" {
 DUCKDB_CPP_EXTENSION_ENTRY(acl, loader) {
 	duckdb::LoadInternal(loader);
 }
 }
+#endif
