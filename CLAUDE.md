@@ -770,6 +770,11 @@ the RLS bound, the caps, the list's stored form, each column the role would read
 and writes nothing. One plan with the write (`PlanObjectGrant`, `CatalogCheckObjectCaps`); its bodies pass
 `AuthorizeBodies`, which the read-function path now runs. For acl-clients 008's grant editor.
 
+**Spec 125 — before the split** (design/080, the open node vs the platform's `hugr_node`): `MetadataMaxRows()` and
+`SqlNamesSource` (acl_sql_text) left `acl_cluster.cpp`, which now holds the platform part only; `console_info`
+says `deployment` and `scopes` (`GrantableAdminScopes()`), and a standalone node does not offer `drift` or the
+profile's writes. The plugin reads both instead of guessing.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

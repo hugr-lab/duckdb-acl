@@ -44,6 +44,7 @@ set(EXTENSION_SOURCES
     src/acl_catalog_admin.cpp
     src/acl_catalog_maintenance.cpp
     src/acl_cluster.cpp
+    src/acl_sql_text.cpp
     src/acl_types.cpp
     src/acl_lineage_walker.cpp
     src/acl_lineage.cpp

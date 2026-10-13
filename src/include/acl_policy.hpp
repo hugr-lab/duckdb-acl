@@ -220,6 +220,8 @@ AdminScope ParseAdminScope(const string &scope);
 //! a scope a later build writes cannot break an older one inside the schema window (spec 094)
 bool TryParseAdminScope(const string &scope, AdminScope &out);
 const char *AdminScopeName(AdminScope scope);
+//! spec 125: the scopes `GRANT ADMIN` takes on this node, in the order a picker shows them (console_info)
+vector<string> GrantableAdminScopes();
 
 //! duckdb answers "what is in this catalog?" three ways - a table function, a view of the same name
 //! and `information_schema` - and under a principal all three are replaced by a listing of the

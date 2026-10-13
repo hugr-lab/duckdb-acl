@@ -79,6 +79,19 @@ SELECT acl_cluster_version();
 ----
 0
 
+# spec 125: the node says what it is - and a standalone node does not offer what it refuses (the profile's
+# writes, drift); the profile's reads stay
+query TTTT
+ACL ROLE "fleet" SELECT deployment, scopes, list_contains(my_views, 'drift'), list_contains(my_views, 'cluster_items')
+FROM platform.console_info();
+----
+standalone	[observe, operate, cluster, policy, manage, passthrough]	false	true
+
+query I
+ACL ROLE "fleet" SELECT len(list_filter(my_functions, lambda f: f LIKE 'cluster_%')) FROM platform.console_info();
+----
+0
+
 # a standalone node keeps a principal's secret itself (spec 118.1)
 statement ok
 ACL ROLE "keeper" CREATE SECRET s (TYPE http, BEARER_TOKEN 'v');
@@ -95,6 +108,13 @@ query I
 SELECT current_setting('acl_deployment');
 ----
 cluster
+
+# spec 125: on a cluster node the same holder is offered all of it
+query TTI
+ACL ROLE "fleet" SELECT deployment, list_contains(my_views, 'drift'), len(list_filter(my_functions, lambda f: f LIKE 'cluster_%'))
+FROM platform.console_info();
+----
+cluster	true	4
 
 statement error
 ACL ADMIN CLUSTER SET acl_deployment = 'standalone';

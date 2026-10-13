@@ -1165,6 +1165,15 @@ bool PolicyStore::SetDraining(bool value) {
 	return draining.exchange(value);
 }
 
+int64_t PolicyStore::MetadataMaxRows() {
+	auto db = instance.lock();
+	Value value;
+	if (db && db->TryGetCurrentSetting("acl_metadata_max_rows", value) && !value.IsNull()) {
+		return value.GetValue<int64_t>();
+	}
+	return 0;
+}
+
 bool PolicyStore::Draining() const {
 	return draining.load(std::memory_order_relaxed);
 }
@@ -1408,6 +1417,15 @@ const char *AdminScopeName(AdminScope scope) {
 		return "cluster";
 	}
 	throw BinderException("acl admin: an administration grant needs a scope");
+}
+
+vector<string> GrantableAdminScopes() {
+	vector<string> out;
+	for (auto scope : {AdminScope::OBSERVE, AdminScope::OPERATE, AdminScope::CLUSTER, AdminScope::POLICY,
+	                   AdminScope::MANAGE, AdminScope::PASSTHROUGH}) {
+		out.emplace_back(AdminScopeName(scope));
+	}
+	return out;
 }
 
 void PolicyStore::GrantAdmin(const string &role, AdminScope scope) {
