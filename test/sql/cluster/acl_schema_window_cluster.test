@@ -1,0 +1,42 @@
+# name: test/sql/cluster/acl_schema_window_cluster.test
+# description: spec 094 for the platform part: a catalog newer than the build inside its window is never
+#   written - the cluster profile's writes included (moved from acl_schema_window.test, which runs on an open
+#   node too)
+# group: [cluster]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_deployment = 'cluster';
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET GLOBAL acl_version_check_interval=0;
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 2;
+
+statement ok
+UPDATE store.acl.meta SET "value" = '23' WHERE "key" = 'schema_version';
+
+statement ok
+UPDATE store.acl.meta SET "value" = '22' WHERE "key" = 'min_reader_version';
+
+statement error
+ACL ADMIN CLUSTER SET threads = 3;
+----
+<REGEX>:.*this node's build writes 22.*
+
+# the profile reads still serve
+query I
+SELECT count(*) FROM acl_cluster_items() WHERE name = 'threads';
+----
+1

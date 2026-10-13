@@ -23,10 +23,6 @@ CREATE TABLE phys.main.staff(id INTEGER, name VARCHAR);
 statement ok
 SELECT acl_use_db('store', 'acl', true);
 
-# a cluster node (spec 118): the profile is a cluster node's
-statement ok
-SET GLOBAL acl_deployment = 'cluster';
-
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
@@ -120,12 +116,13 @@ rls_checked	BOOLEAN
 columns	VARCHAR[]
 
 # every listed column of every view is the column the view answers, type for type
+# (the platform part's views, where it is linked: test/sql/cluster/platform_views_cluster.test)
 query I
-ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_schema = 'main';
+ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_schema = 'main' AND table_name NOT IN ('cluster_items', 'cluster_effective', 'drift');
 ----
-261
+239
 
-foreach view catalogs relations relation_columns schemas functions function_columns references reference_columns keys roles role_claims grants schema_grants object_grants grant_columns admins platform_grants issuers clients role_mappings jwks_cache function_categories function_category_members function_grants function_status resource_groups role_resource_groups cluster_items cluster_effective drift catalog_schema sessions node_load node_doors node_streams drain lineage_status audit_events
+foreach view catalogs relations relation_columns schemas functions function_columns references reference_columns keys roles role_claims grants schema_grants object_grants grant_columns admins platform_grants issuers clients role_mappings jwks_cache function_categories function_category_members function_grants function_status resource_groups role_resource_groups catalog_schema sessions node_load node_doors node_streams drain lineage_status audit_events
 
 query I
 ACL ROLE "root" SELECT (SELECT list(column_name || ' ' || data_type ORDER BY ordinal_position) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_schema = 'main' AND table_name = '{view}') = (SELECT list(column_name || ' ' || column_type) FROM (DESCRIBE platform.{view}));
@@ -206,22 +203,6 @@ ACL ROLE "root" SELECT build, build_min_reader, catalog, min_reader, mode FROM p
 ----
 22	21	22	21	current
 
-statement ok
-ACL ADMIN CLUSTER SET threads = 2;
-
-query TTTT
-ACL ROLE "root" SELECT kind, name, spec['value'], typeof(spec) FROM platform.cluster_items;
-----
-setting	threads	2	MAP(VARCHAR, VARCHAR)
-
-query TTT
-ACL ROLE "root" SELECT kind, name, spec['value'] FROM platform.cluster_effective;
-----
-setting	threads	2
-
-statement ok
-ACL ADMIN CLUSTER RESET threads;
-
 # --- the node views (observe) -------------------------------------------------------------------------
 
 query TTTT
@@ -262,9 +243,9 @@ ACL ROLE "obs" SELECT count(*) FROM platform.node_streams WHERE budget_bytes > 0
 
 # passthrough: everything
 query I
-ACL ROLE "root" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema = 'main';
+ACL ROLE "root" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema = 'main' AND table_name NOT IN ('cluster_items', 'cluster_effective', 'drift');
 ----
-38
+35
 
 # policy: the policy views, all rows - never the node's, nor the cluster profile's (spec 118's cluster
 # bundle); the physical tree under attached is spec 118.3's (platform_attached.test)
@@ -272,16 +253,6 @@ query I
 ACL ROLE "pol" SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema = 'main';
 ----
 28
-
-statement error
-ACL ROLE "pol" SELECT * FROM platform.cluster_items;
-----
-<REGEX>:.*no access to object "platform.cluster_items".*
-
-statement error
-ACL ROLE "pol" SELECT * FROM platform.cluster_effective;
-----
-<REGEX>:.*no access to object "platform.cluster_effective".*
 
 # nor a session's profile (spec 118: the operate bundle's)
 statement error
@@ -389,9 +360,9 @@ platform	the system catalog of administration (spec 117)
 # --- console_info --------------------------------------------------------------------------------------
 
 query TTTTTT
-ACL ROLE "cat" SELECT audit_contract, connection_contract, schema_catalog, bundles, admin_catalogs, len(views) FROM platform.console_info();
+ACL ROLE "cat" SELECT audit_contract, connection_contract, schema_catalog, bundles, admin_catalogs, len(list_filter(views, lambda v: v NOT IN ('cluster_items', 'cluster_effective', 'drift'))) FROM platform.console_info();
 ----
-3	2	22	[]	[sales]	38
+3	2	22	[]	[sales]	35
 
 query T
 ACL ROLE "cat" SELECT list_contains(my_views, 'grants') AND NOT list_contains(my_views, 'issuers') AND list_contains(my_functions, 'add_relation') AND NOT list_contains(my_functions, 'grant_catalog') FROM platform.console_info();

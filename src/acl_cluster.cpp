@@ -1572,6 +1572,7 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	loader.RegisterFunction(drift);
 	RegisterClusterPlatform();
 	RegisterMgmtGrammar("cluster", ParseCluster);
+	RegisterAdminScope(AdminScope::CLUSTER);
 
 	// spec 126: the node's deployment and group are the platform part's settings and traits
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());

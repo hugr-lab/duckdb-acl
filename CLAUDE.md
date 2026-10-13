@@ -774,6 +774,11 @@ and writes nothing. One plan with the write (`PlanObjectGrant`, `CatalogCheckObj
 `SqlNamesSource` (acl_sql_text) left `acl_cluster.cpp`, which now holds the platform part only; `console_info`
 says `deployment` and `scopes` (`GrantableAdminScopes()`), and a standalone node does not offer `drift` or the
 profile's writes. The plugin reads both instead of guessing.
+**Spec 126 — the split's seams**: the platform part (`acl_cluster.cpp`) plugs in through registration points -
+`RegisterPlatformView/Function` (a view's `body`, a function's argument `rule`), `RegisterMgmtGrammar` (the scanner
+is `acl_admin_scanner.hpp`), `RegisterAdminScope(CLUSTER)`, and `PolicyStore::NodeTraits` (deployment, node group,
+group known, profile version). `ACL_NO_CLUSTER=1` builds the open node without it; group A's tests live in
+`test/sql/cluster/` and run only where it is linked.
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant

@@ -222,6 +222,8 @@ bool TryParseAdminScope(const string &scope, AdminScope &out);
 const char *AdminScopeName(AdminScope scope);
 //! spec 125: the scopes `GRANT ADMIN` takes on this node, in the order a picker shows them (console_info)
 vector<string> GrantableAdminScopes();
+//! spec 126: a scope a linked module brings (the platform part's `cluster`), registered at load
+void RegisterAdminScope(AdminScope scope);
 
 //! duckdb answers "what is in this catalog?" three ways - a table function, a view of the same name
 //! and `information_schema` - and under a principal all three are replaced by a listing of the

@@ -323,8 +323,10 @@ void LoadInternal(ExtensionLoader &loader) {
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
 	acl::RegisterAclMaintenance(loader, store); // spec 039: acl_check_catalog / acl_repair_relation
-	acl::RegisterAclCluster(loader, store);     // spec 093: the cluster profile
-	acl::RegisterAclTypes(loader, store);       // spec 099: acl_exposed_type, the listings' type rule
+#ifndef ACL_NO_CLUSTER
+	acl::RegisterAclCluster(loader, store); // spec 093: the cluster profile - the platform part (spec 126)
+#endif
+	acl::RegisterAclTypes(loader, store); // spec 099: acl_exposed_type, the listings' type rule
 	// The audit and observability hooks (spec 069): one registry per instance, reached through the
 	// object cache so an extension loaded before or after us finds the same one - unless the one
 	// there was stamped with another contract version (an extension built from another revision of

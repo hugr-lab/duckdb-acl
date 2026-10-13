@@ -22,10 +22,6 @@ INSERT INTO phys.main.orders VALUES (1), (2);
 statement ok
 SELECT acl_use_db('store', 'acl', true);
 
-# a cluster node (spec 118): the profile is a cluster node's
-statement ok
-SET GLOBAL acl_deployment = 'cluster';
-
 statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
@@ -71,11 +67,6 @@ statement error
 ACL ADMIN CREATE ROLE other;
 ----
 <REGEX>:.*schema version 23 and this node's build writes 22 - policy is written from a node of the catalog's build.*
-
-statement error
-ACL ADMIN CLUSTER SET threads = 2;
-----
-<REGEX>:.*this node's build writes 22.*
 
 # the refused write wrote nothing
 query I
@@ -232,9 +223,6 @@ ACL ADMIN MAP CLAIM 'more' FROM ISSUER 'test/idp/rs' TO ROLE r;
 
 statement ok
 ACL ADMIN ALTER ISSUER 'test/idp/a' SET AUDIENCES ('api://acl-test');
-
-statement ok
-ACL ADMIN CLUSTER SET threads = 2;
 
 # --- not an acl catalog -----------------------------------------------------------------------------
 

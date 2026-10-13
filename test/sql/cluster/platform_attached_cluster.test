@@ -1,0 +1,57 @@
+# name: test/sql/cluster/platform_attached_cluster.test
+# description: spec 118.3 for the platform part's bundle: the cluster bundle sees every source of
+#   platform.attached, and holding a catalog's manage it builds only over granted sources (moved from
+#   platform_attached.test, which runs on an open node too)
+# group: [cluster]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS pg;
+
+statement ok
+CREATE SCHEMA pg.sales;
+
+statement ok
+CREATE SCHEMA pg.hr;
+
+statement ok
+CREATE TABLE pg.sales.orders(id INTEGER, amount INTEGER);
+
+statement ok
+CREATE TABLE pg.hr.salaries(id INTEGER, pay INTEGER);
+
+statement ok
+CREATE TABLE pg.main.t(x INTEGER);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE fleet;
+
+statement ok
+ACL ADMIN GRANT ADMIN cluster TO ROLE fleet;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE fleet CAPS '{"manage": true}';
+
+# the cluster bundle sees every source - and, holding a catalog's manage, builds only over granted ones
+query I
+ACL ROLE "fleet" SELECT count(DISTINCT table_schema) FROM information_schema.tables WHERE table_catalog = 'platform' AND table_schema LIKE 'attached.pg.%';
+----
+3
+
+statement error
+ACL ROLE "fleet" CREATE VIRTUAL TABLE c.fleet_pay AS pg.hr.salaries;
+----
+<REGEX>:.*outside the sources granted.*

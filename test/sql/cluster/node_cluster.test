@@ -1,4 +1,4 @@
-# name: test/sql/node_cluster.test
+# name: test/sql/cluster/node_cluster.test
 # description: spec 118.2 - two deployments (acl_deployment): a standalone node has no cluster profile, a
 #   cluster node's profile is what the fleet runs and platform.drift shows what this node carries against
 #   it - ACL NATIVE stays unrestricted, its effect is shown, never refused
