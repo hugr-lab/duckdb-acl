@@ -109,8 +109,8 @@ string LineageStatus(DatabaseInstance &db) {
 		return "off";
 	}
 	if (InstanceSetting(db, "acl_lineage_namespace", "").empty()) {
-		return "no namespace: set acl_lineage_namespace (the cluster's, e.g. ACL CLUSTER SET acl_lineage_namespace = "
-		       "'acl://prod')";
+		return "no namespace: set acl_lineage_namespace (SET GLOBAL acl_lineage_namespace = 'acl://prod' in the node's "
+		       "bootstrap - on a platform node the cluster profile's)";
 	}
 	return "on";
 }

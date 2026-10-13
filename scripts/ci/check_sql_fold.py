@@ -18,10 +18,6 @@ import sys
 
 # (file, a fragment of the line) -> why `lower(` is right there
 ALLOWED = {
-    ("src/acl_cluster.cpp", 'lower(\\"name\\") = lower('): "cluster items (extensions, sources): both sides in SQL",
-    ("src/acl_cluster.cpp", 'lower(\\"name\\"), lower(\\"depends_on\\")'): "cluster deps: both read back folded in SQL",
-    ("src/acl_cluster.cpp", 'lower(d.\\"name\\") = lower(i.\\"name\\")'): "cluster deps: both sides in SQL",
-    ("src/acl_cluster.cpp", "lower(name) = lower("): "duckdb_settings names: both sides folded in SQL",
 }
 
 LOWER = re.compile(r"(?<![A-Za-z_.:])lower\(")

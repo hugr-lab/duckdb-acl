@@ -192,4 +192,4 @@ ACL ROLE "observer" SET GLOBAL acl_observe_unauthenticated = true;
 <REGEX>:.*not permitted under ACL.*
 
 # the opt-out is the node's own: never a cluster profile item (spec 093's hardening list) -
-# test/sql/cluster/acl_cluster_profile.test checks it with the platform part
+# hugr-node's test/sql/cluster/acl_cluster_profile.test checks it with the platform part

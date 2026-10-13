@@ -459,7 +459,8 @@ attached; none/several refused with what to write) from the instance the store k
 direct `corp.whoami()` is the function gate's (a category the operator grants); `whoami` is never only
 as the system catalog's (quack's), and the resolver reads `x.f` as `x.main.f` when x is no schema.
 
-**Spec 093 — the cluster profile**: the shared part of every node's bootstrap, in the policy catalog as
+**Spec 093 — the cluster profile** (since spec 127 the code is hugr-node's - `hugr-lab/hugr-node`, BUSL, which builds
+this acl into the platform node's `hugr_node`; what follows describes it there, and the tables stay in acl's schema): the shared part of every node's bootstrap, in the policy catalog as
 desired state (`cluster_items` + `cluster_deps`, schema v16, its own `config_version`; no history -
 who changed what is the audit's, the previous state the orchestrator's). `ACL CLUSTER INSTALL|UPDATE|
 REMOVE EXTENSION / ATTACH / DETACH / SET / RESET … [IN GROUP g]` (the `cluster` bundle, spec 118; a cluster
@@ -483,7 +484,8 @@ newer outside it, or older, is refused (fail closed; older says `acl_migrate_cat
 embedded (`ACL_SCHEMA_STEPS`) and `acl_migrate_catalog(db[, schema])` applies them in one transaction -
 never automatically. `acl_catalog_schema()` reports build/catalog/window/mode.
 
-**Spec 096 — a node's resource group**: a 085 resource group is also a set of NODES. A node belongs to
+**Spec 096 — a node's resource group** (the node's group and its settings are hugr-node's since spec 127; placement
+and the limits stay acl's, judged against the group `NodeTraits` names): a 085 resource group is also a set of NODES. A node belongs to
 the group its deployment names (`SET GLOBAL acl_node_group`, GLOBAL-only, never the policy's); it
 serves only principals that hold the group (bound, or - bound to none - members of the DEFAULT group,
 `CREATE RESOURCE GROUP g … DEFAULT` / `ALTER RESOURCE GROUP g SET|DROP DEFAULT`, at most one, schema
@@ -777,8 +779,9 @@ profile's writes. The plugin reads both instead of guessing.
 **Spec 126 — the split's seams**: the platform part (`acl_cluster.cpp`) plugs in through registration points -
 `RegisterPlatformView/Function` (a view's `body`, a function's argument `rule`), `RegisterMgmtGrammar` (the scanner
 is `acl_admin_scanner.hpp`), `RegisterAdminScope(CLUSTER)`, and `PolicyStore::NodeTraits` (deployment, node group,
-group known, profile version). `ACL_NO_CLUSTER=1` builds the open node without it; group A's tests live in
-`test/sql/cluster/` and run only where it is linked.
+group known, profile version). **Spec 127** moved it, with its history and tests, to `hugr-lab/hugr-node`: that
+repository builds this acl in (`acl_sources.cmake`, `LoadAclCore`, `ACL_EMBEDDED`) as one extension, `hugr_node`, and
+registers its part; this repository is the open node (tag `pre-platform-split` = the last state with the part in).
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant

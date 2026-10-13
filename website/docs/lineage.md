@@ -78,8 +78,8 @@ Approximate for now:
     identity (below).
 - **The namespace is the cluster's.** `<ns>` is `acl_lineage_namespace`. It has no default: with none
   the node sends **no lineage**, and `acl_lineage_status()` says so (`on`, `off`, or `no namespace:
-  …`). Set it once for the cluster - `ACL CLUSTER SET acl_lineage_namespace = 'acl://prod'` on a
-  cluster node (spec 118's `acl_deployment`) - or in a standalone node's bootstrap with `SET GLOBAL`. Clearing it is the cluster-wide off switch (a setting item: each node takes it as the node agent rolls the profile out), and it keeps
+  …`). Set it in the node's bootstrap with `SET GLOBAL acl_lineage_namespace = 'acl://prod'` - on a
+  platform node ([hugr-node](https://github.com/hugr-lab/hugr-node)) the cluster profile sets it once for the cluster. Clearing it is the cluster-wide off switch (a setting item: each node takes it as the node agent rolls the profile out), and it keeps
   two clusters from merging their virtual catalogs in one backend by accident. The node group is in
   the run's facet, not in the name.
 - **Job namespaces** are `<ns>/client/<door>`, where `<door>` is `flight`, `quack`, `session`
@@ -114,7 +114,7 @@ behind a proxy is not the host others see.
 - It lives in the node's memory, like the ATTACH it describes: the bootstrap declares it at every
   start. `acl_lineage_source(alias, NULL)` clears it; a `DETACH`, or a new ATTACH of the alias, ends it.
   Declared before its ATTACH, it binds to the first attachment of that alias.
-- In a cluster profile: `ACL CLUSTER ATTACH '…' AS pg (TYPE postgres, SECRET s) LINEAGE '…'`.
+- On a platform node, the cluster profile's `ACL CLUSTER ATTACH … LINEAGE '…'` (hugr-node) declares it.
 - A platform extension may name sources itself through the `acl_lineage_sources` registry
   (duckdb-ext-common); its answer comes first, then the declared identity, then the alias form.
 

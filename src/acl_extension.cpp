@@ -20,7 +20,6 @@
 #include "acl_audit_pipeline.hpp"
 #include "acl_introspection.hpp"
 #include "acl_maintenance.hpp"
-#include "acl_cluster.hpp"
 #include "acl_types.hpp"
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
@@ -325,11 +324,8 @@ shared_ptr<acl::PolicyStore> LoadInternal(ExtensionLoader &loader) {
 	acl::RegisterAclParser(config, store);
 	acl::RegisterAclIntrospection(loader, store);
 	acl::RegisterAclMaintenance(loader, store); // spec 039: acl_check_catalog / acl_repair_relation
-#if !defined(ACL_NO_CLUSTER) && !defined(ACL_EMBEDDED)
-	// spec 093: the cluster profile - the platform part (spec 126); an extension that builds acl in (spec 127,
-	// hugr_node) registers it itself after LoadAclCore
-	acl::RegisterAclCluster(loader, store);
-#endif
+	// the platform part (the cluster profile, node groups, drift, the deployment, the cluster bundle - specs 093 /
+	// 096 / 118) is hugr-node's: it builds acl in and registers its part after LoadAclCore (specs 126 / 127)
 	acl::RegisterAclTypes(loader, store); // spec 099: acl_exposed_type, the listings' type rule
 	// The audit and observability hooks (spec 069): one registry per instance, reached through the
 	// object cache so an extension loaded before or after us finds the same one - unless the one
