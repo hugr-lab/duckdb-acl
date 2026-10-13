@@ -1,6 +1,6 @@
 # Spec 127: the split's move - the platform part leaves duckdb-acl for hugr-node
 
-- **Status**: accepted (owner, 2026-10-13: the name hugr_node)
+- **Status**: implemented (accepted by the owner 2026-10-13: the name hugr_node)
 - **Date**: 2026-10-13
 - **Author**: the agent, at the owner's ask (design/080 variant 2, step 3; specs 125 / 126 prepared it)
 
@@ -99,3 +99,20 @@ node (hugr_node) behaves as today's acl with the cluster part. A node never load
 - Gate (macOS): both builds (with the cluster part 112 files, `ACL_NO_CLUSTER=1` 103), test-cpp, integration,
   test-flight, lints; test-e2e green but for an intermittent mssql-leg partial-load reading under RCSI (2 of 4 runs
   today) - the mssql scanner's, raised with mssql-extension; the leg is opt-in and not in CI.
+
+## As built - the move and PR B (2026-10-13)
+
+- **hugr-node #1**: the moved files with their history (14 commits from spec 093; `git log --follow
+  src/acl_cluster.cpp` reaches it), merged with a merge commit; the build (`hugr_node` = acl built in + the platform
+  part), the moved tests (`require hugr_node`), a smoke, CI. Its docs carry this repository's cluster section
+  (`docs/cluster.md`), and the Flight e2e's node-group block is kept there verbatim (`test/e2e/`) until it has an e2e.
+- **PR B**: `src/acl_cluster.cpp`, `src/include/acl_cluster.hpp`, `test/sql/cluster/`,
+  `test/cpp/test_acl_cluster_install.cpp` removed; `ACL_NO_CLUSTER` gone (the only build is the open node);
+  `RegisterAclCluster` no longer called; the fold lint's cluster entries dropped; the Flight e2e's node-group block
+  moved; the docs point to hugr-node (management-sql's node groups and cluster profile, lineage, the platform catalog,
+  security, serving); `acl_lineage_status()`'s hint says `SET GLOBAL`.
+- **Left in the core, inert on an open node**: the audit object of an `acl_cluster_*` call (parser override), the
+  resource-group drop guard over `cluster_items`, the INFRASTRUCTURE right's refusal - each reached only where the
+  platform part registers those calls.
+- Gate (macOS, the open node): `test/sql/*` (103 files), test-cpp, integration, test-flight, test-e2e, harness,
+  lints, schema-check.

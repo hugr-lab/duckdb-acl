@@ -464,7 +464,8 @@ capacity - the stream memory budget stayed full ...`. The load report's `streams
 - **Everywhere.** `max_sessions` refuses a new session of the group at open, with `at_capacity`.
 - **In the load report.** `sessions.by_group` counts the group's live sessions against its max. That
   names the groups to whoever may read the report, so do not name a group after anything secret.
-- **Placement** (spec 096). A node set to a group with `acl_node_group` serves only principals that
+- **Placement** (spec 096 - a platform node's: the node's group is set by [hugr-node](https://github.com/hugr-lab/hugr-node);
+  an open node has none and serves everyone). A node set to a group with `acl_node_group` serves only principals that
   hold the group (or, bound to none, the default group's members), with that group's limits only.
   Anyone else gets a refusal a front acts on: Flight answers `UNAVAILABLE` with `acl: this node serves
   resource group "g" - your roles are served by "h"`, quack refuses the connect (its client shows the

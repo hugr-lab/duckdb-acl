@@ -437,7 +437,7 @@ private address. They publish counts and states, never a principal, a handle or 
 | bundle `passthrough` | `acl.admins` via `acl_grant_admin` | - | everything, including `ACL NATIVE`; the only scope that grants bundles and grants on `platform` |
 | bundle `observe` | `acl.admins` via `acl_grant_admin` | - | the node views, the load report and `/metrics` (spec 097); administers nothing - implied by `passthrough` and a global `manage` |
 | bundle `operate` (spec 118) | `acl.admins` via `acl_grant_admin` | - | the node's runtime: kill a session, set a session's audit level (`OFF` included - its own too) and profile, drain / resume; reads what `observe` reads; administers no policy - implied by `passthrough` |
-| bundle `cluster` (spec 118) | `acl.admins` via `acl_grant_admin` | - | `operate` + `ACL CLUSTER …` (settings: resources and tuning only), the cluster views and `drift`; never a source's data nor `ACL NATIVE`; a cluster node's - implied by `passthrough` |
+| bundle `cluster` (spec 118; a platform node's - [hugr-node](https://github.com/hugr-lab/hugr-node), absent on an open node) | `acl.admins` via `acl_grant_admin` | - | `operate` + `ACL CLUSTER …` (settings: resources and tuning only), the cluster views and `drift`; never a source's data nor `ACL NATIVE`; a cluster node's - implied by `passthrough` |
 | point grant on `platform.<view|function>` | `platform_grants` via `GRANT VIEW|FUNCTION platform.x` (passthrough) | - | one view (whole) or one function; a deny wins over bundles, not over `passthrough` (spec 117) |
 
 The rules behind the table (spec 012): a grant "written without `CAPS` - or a driver row with
