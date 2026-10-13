@@ -462,7 +462,10 @@ if wanted mssql; then
 	elif ! why="$(probe "LOAD '$MS_EXT'; ATTACH '$ACL_MSSQL_DSN' AS ms (TYPE mssql); SELECT 1;")"; then
 		skip_leg mssql "$why"
 	else
-		run_leg mssql "LOAD '$MS_EXT';" \
+		# one BCP writer per INSERT: mssql-extension commits its parallel writers one by one, so a reader on row
+		# versioning (the test database's RCSI, spec 124) could count a load half committed - an ingest is one
+		# statement, seen whole or not at all (mssql_copy_parallel_writers: 0 = up to 8 writers, each its COMMIT)
+		run_leg mssql "LOAD '$MS_EXT'; SET GLOBAL mssql_copy_parallel_writers = 1;" \
 			"ATTACH '$ACL_MSSQL_DSN' AS ms (TYPE mssql);" "ms.dbo.e2e_orders" "$((BASE_PORT + 1))"
 	fi
 fi
