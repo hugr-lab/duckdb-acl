@@ -1,6 +1,6 @@
 # Spec 124: re-pin mssql-extension to its bba7360 build
 
-- **Status**: in progress (waiting for mssql-extension #459 on its main)
+- **Status**: implemented
 - **Date**: 2026-10-13
 
 ## Problem
@@ -12,8 +12,8 @@ held for the whole load - the owner keeps that default.
 
 ## Design
 
-- **The pin**: mssql-extension's main once #459 lands there (meanwhile its branch commit 3502283 is what was
-  tested).
+- **The pin**: mssql-extension 3645903 (its main, #459 merged; one commit past the tested 3502283, comments and
+  spec only).
 - **The test database reads on row versioning**: `docker/init/sqlserver.sql` turns `READ_COMMITTED_SNAPSHOT` on for
   `acltest`. The door e2e's reader (a count through quack, 30 s timeout) waited behind the writers' BU lock under
   locking READ COMMITTED and timed out; with RCSI it reads the last committed state and never waits. A load stays
@@ -26,3 +26,8 @@ held for the whole load - the owner keeps that default.
 The mssql legs, now built: test-integration (both SQL Server scenarios), test-e2e (the door's mssql leg twice, the
 types leg). A local database created before this spec needs the init re-run (`docker compose up sqlserver-init`),
 and one holding an old policy catalog (`acl`, schema v10) a fresh `acltest`.
+
+## As built (2026-10-13)
+
+At 3645903 with duckdb bba7360: test-integration green (538 assertions, 17 files, both SQL Server scenarios);
+test-e2e green with all four door legs (postgres, mssql, ducklake, pair) and the types leg with mssql.
