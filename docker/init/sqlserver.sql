@@ -13,6 +13,17 @@ BEGIN
 END
 GO
 
+-- Readers on row versioning (spec 124): mssql-extension loads an INSERT atomically through BCP, with TABLOCK on a
+-- heap (its specs 057 / 062) - a BU lock for the whole client-driven load, which a locking READ COMMITTED reader
+-- waits behind (the door e2e's reader: quack's 30 s timeout). With RCSI a reader sees the last committed state and
+-- never waits for a writer, whatever the load does; the load stays atomic (seen whole, after its COMMIT).
+IF (SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name = 'acltest') = 0
+BEGIN
+    ALTER DATABASE acltest SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;
+    PRINT 'acltest: READ_COMMITTED_SNAPSHOT on';
+END
+GO
+
 USE acltest;
 GO
 
