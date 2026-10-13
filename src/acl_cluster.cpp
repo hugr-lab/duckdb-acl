@@ -6,6 +6,8 @@
 
 #include "acl_cluster.hpp"
 
+#include "acl_admin_scanner.hpp"
+
 #include "acl_door_common.hpp"
 #include "acl_platform.hpp"
 #include "acl_lineage.hpp"
@@ -1348,6 +1350,132 @@ void ClusterAppliedFunc(DataChunk &args, ExpressionState &state, Vector &result)
 
 namespace {
 
+//! `ACL CLUSTER …` (spec 093): the cluster profile. Compiled to acl_cluster_* calls; the authorization
+//! (a passthrough scope - it changes the cluster's infrastructure) is AuthorizeMgmt's.
+unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
+	auto group = [&]() -> string {
+		if (s.Accept("in")) {
+			s.Expect("group");
+			return s.NameValue("a resource group name");
+		}
+		return string();
+	};
+	auto comment = [&]() -> string {
+		return s.Accept("comment") ? s.Quoted("comment") : string();
+	};
+	auto verb = StringUtil::Lower(s.Word("INSTALL, UPDATE, REMOVE, ATTACH, DETACH, SET or RESET"));
+	if (verb == "install" || verb == "update" || verb == "remove") {
+		s.Expect("extension");
+		auto name = s.NameValue("an extension name");
+		string version, repository;
+		for (;;) {
+			if (verb != "remove" && s.Accept("version")) {
+				version = s.Quoted("version");
+			} else if (verb == "install" && s.Accept("from")) {
+				repository = s.NameValue("a repository name");
+			} else if (verb != "remove" && s.Accept("sha256")) {
+				// spec 103: refused, never ignored - a script that still pins a hash must not believe it does
+				throw BinderException("acl admin: SHA256 is no longer part of the cluster profile (spec 103) - "
+				                      "DuckDB verifies the repository's signature at every INSTALL and LOAD; name "
+				                      "the VERSION and the repository");
+			} else {
+				break;
+			}
+		}
+		auto scope = group();
+		auto note = comment();
+		return MakeAdminCall("acl_cluster_extension",
+		                     {Value(verb), Value(scope), Value(name), Value(version), Value(repository), Value(note)});
+	}
+	if (verb == "attach") {
+		auto path = s.Quoted("the source's path");
+		s.Expect("as");
+		auto alias = s.NameValue("the source's alias");
+		string type, secret;
+		vector<std::pair<string, string>> options;
+		if (s.AtParen()) {
+			for (auto &item : SplitTopLevel(s.Parens(), ',')) {
+				auto text = item;
+				StringUtil::Trim(text);
+				if (text.empty()) {
+					continue;
+				}
+				auto space = text.find_first_of(" \t");
+				auto key = space == string::npos ? text : text.substr(0, space);
+				auto value = space == string::npos ? string("true") : Unquoted(text.substr(space + 1));
+				if (StringUtil::CIEquals(key, "type")) {
+					type = StringUtil::Lower(value);
+				} else if (StringUtil::CIEquals(key, "secret")) {
+					secret = value;
+				} else {
+					options.emplace_back(StringUtil::Upper(key), value);
+				}
+			}
+		}
+		string lineage; // spec 112 §9: the name the source is known by, declared where it is attached
+		if (s.Accept("lineage")) {
+			lineage = s.Quoted("the source's lineage identity");
+		}
+		string deps;
+		if (s.Accept("depends")) {
+			s.Expect("on");
+			vector<string> names;
+			for (auto &item : SplitTopLevel(s.Parens(), ',')) {
+				auto name = Unquoted(item);
+				if (!name.empty()) {
+					names.push_back(name);
+				}
+			}
+			deps = StringUtil::Join(names, ",");
+		}
+		auto scope = group();
+		auto note = comment();
+		vector<string> json;
+		for (auto &option : options) {
+			json.push_back(JsonQuote(option.first) + ": " + JsonQuote(option.second));
+		}
+		return MakeAdminCall("acl_cluster_attach", {Value(scope), Value(alias), Value(path), Value(type), Value(secret),
+		                                            Value("{" + StringUtil::Join(json, ", ") + "}"), Value(deps),
+		                                            Value(note), Value(lineage)});
+	}
+	if (verb == "detach") {
+		auto alias = s.NameValue("the source's alias");
+		bool cascade = false, force = false;
+		for (;;) {
+			if (s.Accept("cascade")) {
+				cascade = true;
+			} else if (s.Accept("force")) {
+				force = true;
+			} else {
+				break;
+			}
+		}
+		auto scope = group();
+		return MakeAdminCall("acl_cluster_detach", {Value(scope), Value(alias), Value(cascade ? "true" : "false"),
+		                                            Value(force ? "true" : "false")});
+	}
+	if (verb == "set" || verb == "reset") {
+		auto name = s.Word("a setting name");
+		string value;
+		if (verb == "set") {
+			s.Skip();
+			if (s.pos < s.text.size() && s.text[s.pos] == '=') {
+				s.pos++;
+			} else {
+				s.Expect("to");
+			}
+			s.Skip();
+			value = s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"') ? s.Quoted("a value")
+			                                                                                 : s.Word("a value");
+		}
+		auto scope = group();
+		return MakeAdminCall("acl_cluster_setting", {Value(verb), Value(scope), Value(name), Value(value)});
+	}
+	throw BinderException("acl admin: ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET "
+	                      "or RESET, not \"%s\"",
+	                      verb);
+}
+
 //! spec 126: the cluster's part of the `platform` catalog - its views and functions, registered at load; the ONE
 //! authorizer judges them by their class (CLUSTER views, INFRASTRUCTURE functions: the cluster bundle's)
 void RegisterClusterPlatform() {
@@ -1462,6 +1590,7 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	drift.function_info = info;
 	loader.RegisterFunction(drift);
 	RegisterClusterPlatform();
+	RegisterMgmtGrammar("cluster", ParseCluster);
 }
 
 } // namespace acl
