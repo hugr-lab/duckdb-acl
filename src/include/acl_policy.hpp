@@ -722,6 +722,15 @@ struct PolicyStore {
 	};
 	vector<DriftRow> ClusterDrift();
 	std::atomic<int64_t> cluster_applied {-1};
+	//! spec 126: what the platform's part says about this node, set at load by the module that knows it. An open
+	//! node has none of it: standalone, no group (serves everyone), no profile to target
+	struct NodeTraits {
+		std::function<bool()> cluster_node;     //! acl_deployment = cluster: secrets only in the service
+		std::function<string()> node_group;     //! acl_node_group, '' = none
+		std::function<bool()> node_group_known; //! the policy has the node's group (throws: a catalog not readable)
+		std::function<int64_t()> config_target; //! the profile's version (throws: no profile)
+	};
+	NodeTraits node_traits;
 	ClusterAnswer ClusterExtension(const string &verb, const string &scope, const string &name, const string &version,
 	                               const string &repository, const string &comment);
 	ClusterAnswer ClusterAttach(const string &scope, const string &alias, const string &path, const string &type,

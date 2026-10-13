@@ -164,12 +164,14 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 	if (!cached) {
 		// a catalog this build may not read (spec 094) admits nobody: neither known nor targeted
 		try {
-			group_known = store.NodeGroupKnown();
+			group_known = store.node_traits.node_group_known ? store.node_traits.node_group_known() : true;
 		} catch (std::exception &) {
 			group_known = false;
 		}
 		try {
-			target = std::to_string(store.ClusterVersion());
+			if (store.node_traits.config_target) { // spec 126: an open node has no profile to target
+				target = std::to_string(store.node_traits.config_target());
+			}
 		} catch (std::exception &) {
 		}
 		lock_guard<mutex> guard(store.lock);

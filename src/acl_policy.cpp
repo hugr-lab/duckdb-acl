@@ -1165,6 +1165,14 @@ bool PolicyStore::SetDraining(bool value) {
 	return draining.exchange(value);
 }
 
+bool PolicyStore::ClusterNode() {
+	return node_traits.cluster_node && node_traits.cluster_node();
+}
+
+string PolicyStore::NodeGroup() {
+	return node_traits.node_group ? node_traits.node_group() : string();
+}
+
 int64_t PolicyStore::MetadataMaxRows() {
 	auto db = instance.lock();
 	Value value;

@@ -15,6 +15,7 @@
 #include "acl_result_rows.hpp"
 #include "acl_sql_text.hpp"
 
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_helper.hpp"
@@ -891,13 +892,6 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 	return answer;
 }
 
-bool PolicyStore::ClusterNode() {
-	auto db = instance.lock();
-	Value value;
-	return db && db->TryGetCurrentSetting("acl_deployment", value) && !value.IsNull() &&
-	       StringUtil::CIEquals(value.ToString(), "cluster");
-}
-
 vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 	RequireClusterCatalog(catalog, "acl_platform_drift");
 	if (!ClusterNode()) {
@@ -1026,19 +1020,6 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 		out.push_back({"setting", name, "bootstrap", value.IsNull() ? string() : value.ToString(), "", ""});
 	}
 	return out;
-}
-
-string PolicyStore::NodeGroup() {
-	auto db = instance.lock();
-	Value value;
-	if (db && db->TryGetCurrentSetting("acl_node_group", value) && !value.IsNull()) {
-		return value.ToString();
-	}
-	return string();
-}
-
-uint64_t PolicyStore::CatalogLocalWrites() {
-	return catalog ? catalog->local_writes.load() : 0;
 }
 
 bool PolicyStore::NodeGroupKnown() {
@@ -1591,6 +1572,62 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	loader.RegisterFunction(drift);
 	RegisterClusterPlatform();
 	RegisterMgmtGrammar("cluster", ParseCluster);
+
+	// spec 126: the node's deployment and group are the platform part's settings and traits
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	// spec 118: what this node is - a standalone node (its bootstrap SQL and its admin's ACL NATIVE configure
+	// it; no cluster profile) or a cluster node (the profile configures the fleet, tresor keeps its secrets).
+	// A security mode never follows from the policy's contents: the deployment sets it
+	config.AddExtensionOption(
+	    "acl_deployment",
+	    "acl: 'standalone' (the default - configured by its bootstrap, no cluster profile) or 'cluster' (the "
+	    "cluster profile, drift, secrets only in the secrets service). Set by the deployment, never by the policy",
+	    LogicalType::VARCHAR, Value("standalone"),
+	    [](ClientContext &, SetScope scope, Value &value) {
+		    if (scope != SetScope::GLOBAL) {
+			    throw InvalidInputException("acl_deployment is global - use SET GLOBAL");
+		    }
+		    auto text = StringUtil::Lower(value.ToString());
+		    if (text != "standalone" && text != "cluster") {
+			    throw InvalidInputException("acl_deployment is 'standalone' or 'cluster', not \"%s\"",
+			                                value.ToString());
+		    }
+		    value = Value(text);
+	    },
+	    SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "acl_node_group",
+	    "acl: the resource group this node belongs to (spec 096) - it serves the sessions of principals "
+	    "that hold the group (or are in none and it is the default); '' serves everyone. Set by the "
+	    "deployment, never by the policy",
+	    LogicalType::VARCHAR, Value(""),
+	    [](ClientContext &, SetScope scope, Value &) {
+		    if (scope != SetScope::GLOBAL) {
+			    throw InvalidInputException("acl_node_group is global - use SET GLOBAL");
+		    }
+	    },
+	    SetScope::GLOBAL);
+	auto *node = store.get(); // the traits live in the store: no reference back to it is kept
+	node->node_traits.cluster_node = [node]() {
+		auto db = node->instance.lock();
+		Value value;
+		return db && db->TryGetCurrentSetting("acl_deployment", value) && !value.IsNull() &&
+		       StringUtil::CIEquals(value.ToString(), "cluster");
+	};
+	node->node_traits.node_group = [node]() {
+		auto db = node->instance.lock();
+		Value value;
+		if (db && db->TryGetCurrentSetting("acl_node_group", value) && !value.IsNull()) {
+			return value.ToString();
+		}
+		return string();
+	};
+	node->node_traits.node_group_known = [node]() {
+		return node->NodeGroupKnown();
+	};
+	node->node_traits.config_target = [node]() {
+		return node->ClusterVersion();
+	};
 }
 
 } // namespace acl
