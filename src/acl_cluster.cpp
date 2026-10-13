@@ -7,6 +7,7 @@
 #include "acl_cluster.hpp"
 
 #include "acl_door_common.hpp"
+#include "acl_platform.hpp"
 #include "acl_lineage.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_result_rows.hpp"
@@ -1345,6 +1346,90 @@ void ClusterAppliedFunc(DataChunk &args, ExpressionState &state, Vector &result)
 
 } // namespace
 
+namespace {
+
+//! spec 126: the cluster's part of the `platform` catalog - its views and functions, registered at load; the ONE
+//! authorizer judges them by their class (CLUSTER views, INFRASTRUCTURE functions: the cluster bundle's)
+void RegisterClusterPlatform() {
+	constexpr const char *V = "VARCHAR";
+	constexpr const char *I = "BIGINT";
+	constexpr const char *LV = "VARCHAR[]";
+	constexpr const char *MAPV = "MAP";
+	constexpr const char *ANSWER = "STRUCT(version BIGINT, class VARCHAR, applied_here BOOLEAN, note VARCHAR)";
+	const vector<PlatformColumn> item_columns = {{"scope", V}, {"kind", V},    {"name", V},        {"spec", MAPV},
+	                                             {"class", V}, {"version", I}, {"depends_on", LV}, {"comment", V}};
+	PlatformView items {"cluster_items", PlatformViewClass::CLUSTER, item_columns,
+	                    "the cluster profile as written (spec 093)"};
+	items.body =
+	    "SELECT \"scope\", \"kind\", \"name\", acl_platform_map(\"spec\") AS \"spec\", \"class\", \"version\", "
+	    "\"depends_on\", \"comment\" FROM acl_cluster_items()";
+	RegisterPlatformView(std::move(items));
+	PlatformView effective {"cluster_effective", PlatformViewClass::CLUSTER, item_columns,
+	                        "what of the cluster profile applies to this node (spec 096)"};
+	effective.body = "SELECT \"scope\", \"kind\", \"name\", acl_platform_map(\"spec\") AS \"spec\", \"class\", "
+	                 "\"version\", \"depends_on\", \"comment\" FROM acl_cluster_effective()";
+	RegisterPlatformView(std::move(effective));
+	PlatformView drift {"drift",
+	                    PlatformViewClass::CLUSTER,
+	                    {{"kind", V}, {"name", V}, {"state", V}, {"node_value", V}, {"profile_value", V}, {"scope", V}},
+	                    "what this cluster node carries against its profile: same, differs, node_only, profile_only, "
+	                    "bootstrap (spec 118)"};
+	drift.body = "SELECT * FROM acl_platform_drift()";
+	RegisterPlatformView(std::move(drift));
+
+	auto A = [](const char *name) {
+		return PlatformParam {name, true, "VARCHAR", ""};
+	};
+	auto P = [](const char *name) {
+		return PlatformParam {name, false, "VARCHAR", ""};
+	};
+	RegisterPlatformFunction({"cluster_extension",
+	                          "acl_cluster_extension",
+	                          {A("verb"), A("scope"), A("name"), P("version"), A("repository"), P("comment")},
+	                          {6},
+	                          -1,
+	                          PlatformRight::INFRASTRUCTURE,
+	                          false,
+	                          ANSWER,
+	                          "install / update / remove an extension of the profile"});
+	RegisterPlatformFunction({"cluster_attach",
+	                          "acl_cluster_attach",
+	                          {A("scope"), A("alias"), A("path"), A("type"), A("secret"), P("options"), A("depends_on"),
+	                           P("comment"), P("lineage")},
+	                          {8, 9},
+	                          -1,
+	                          PlatformRight::INFRASTRUCTURE,
+	                          false,
+	                          ANSWER,
+	                          "attach a source in the profile"});
+	RegisterPlatformFunction({"cluster_detach",
+	                          "acl_cluster_detach",
+	                          {A("scope"), A("alias"), P("cascade"), P("force")},
+	                          {4},
+	                          -1,
+	                          PlatformRight::INFRASTRUCTURE,
+	                          false,
+	                          ANSWER,
+	                          "detach a source of the profile"});
+	PlatformFunction setting {"cluster_setting",
+	                          "acl_cluster_setting",
+	                          {A("verb"), A("scope"), A("name"), P("value")},
+	                          {4},
+	                          -1,
+	                          PlatformRight::INFRASTRUCTURE,
+	                          false,
+	                          ANSWER,
+	                          "set / reset a setting of the profile"};
+	// spec 118: the cluster bundle sets only the node's resources and tuning; the rest is passthrough's
+	setting.rule_arg = 2;
+	setting.rule = ClusterBundleMaySet;
+	setting.rule_refusal = "acl admin: \"%s\" is not among the settings the cluster bundle sets (the node's resources "
+	                       "and tuning) - a data path, a trust or audit setting is a passthrough scope's";
+	RegisterPlatformFunction(std::move(setting));
+}
+
+} // namespace
+
 void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {
 	const LogicalType &v = LogicalType::VARCHAR;
 	auto scalar = [&](const char *name, vector<LogicalType> arguments, const scalar_function_t &fn,
@@ -1376,6 +1461,7 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	TableFunction drift(Identifier("acl_platform_drift"), {}, DriftScan, DriftBindFn, DriftInit);
 	drift.function_info = info;
 	loader.RegisterFunction(drift);
+	RegisterClusterPlatform();
 }
 
 } // namespace acl
