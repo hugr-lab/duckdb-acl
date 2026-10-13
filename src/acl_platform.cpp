@@ -2563,7 +2563,7 @@ bool PlatformReadFunctionSql(PolicyStore &store, const Principal &principal, con
 		bool cluster_node = store.ClusterNode();
 		for (auto &view : Views()) {
 			bool scoped;
-			if (access.ReadsView(view, scoped) && (cluster_node || view.name != "drift")) {
+			if (access.ReadsView(view, scoped) && (cluster_node || !StringUtil::CIEquals(view.name, "drift"))) {
 				readable.emplace_back(view.name);
 			}
 		}
