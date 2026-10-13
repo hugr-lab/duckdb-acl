@@ -31,3 +31,11 @@ and one holding an old policy catalog (`acl`, schema v10) a fresh `acltest`.
 
 At 3645903 with duckdb bba7360: test-integration green (538 assertions, 17 files, both SQL Server scenarios);
 test-e2e green with all four door legs (postgres, mssql, ducklake, pair) and the types leg with mssql.
+
+## Addendum 2026-10-13: one BCP writer in the door e2e
+
+The door's mssql leg read a half-committed load now and then under RCSI (2 of 4 runs): mssql-extension's INSERT
+through BCP may use several parallel writers on a heap (`mssql_copy_parallel_writers`, 0 = up to 8), each its own
+server transaction committed one after another - atomic against a failure, not for a concurrent snapshot reader.
+The leg's node sets `mssql_copy_parallel_writers = 1` (one writer, one COMMIT; parallelism pays only on far larger
+loads); 4 of 4 runs green.
