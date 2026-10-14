@@ -1,12 +1,12 @@
-# The MinGW leg of the distribution build: the registry's community `x64-mingw-static` as it stands
-# at the baseline (2026.06.24), plus what that baseline needs (see vcpkg_ports/README.md):
-#   - `-Wa,-mbig-obj`: grpc 1.76's http2 transport no longer fits a COFF object without it
-#     ("can't write ... to section .text ... file too big"), and neither grpc nor its port passes
-#     the flag for MinGW;
-#   - a release-only build: the extension links release alone, and the debug variant of arrow and
-#     grpc is an hour of runner time spent on nothing (the debug build is also where the object
-#     overflows first).
-# Retire it when the registry's grpc port carries the flag for MinGW itself.
+# The MinGW leg of the distribution build. The SAME file, byte for byte, in duckdb-acl, acl-otel and tresor (hugr-node
+# reads duckdb-acl's): vcpkg hashes the triplet file into every package's ABI, so one file is what lets the four
+# repositories share one binary cache - change it in all of them at once.
+# The registry's community `x64-mingw-static` at the baseline (2026.06.24), plus:
+#   - `-Wa,-mbig-obj`: grpc 1.76's http2 transport no longer fits a COFF object without it ("can't write ... to
+#     section .text ... file too big"), and neither grpc nor its port passes the flag for MinGW;
+#   - a release-only build: the extensions link release alone; the debug variants (arrow, grpc, the OpenTelemetry
+#     SDK) are runner time spent on nothing, and the debug build is where the object overflows first.
+# Retire the flag when the registry's grpc port carries it for MinGW itself.
 set(VCPKG_TARGET_ARCHITECTURE x64)
 set(VCPKG_CRT_LINKAGE dynamic)
 set(VCPKG_LIBRARY_LINKAGE static)

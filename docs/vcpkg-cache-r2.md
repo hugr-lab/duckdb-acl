@@ -62,6 +62,22 @@ right failure mode: a fork's build is slower, not broken, and it cannot write to
 The cache starts empty, so the first run of each platform pays full price and fills it. Merge to the
 default branch first if you want the cache warm before anyone's pull request needs it.
 
+## One cache for the family
+
+duckdb-acl, acl-otel, tresor and hugr-node use the same bucket under the same prefix, each with the
+variable and the four secrets above. vcpkg keys every package by its ABI hash - the port's files, the
+triplet, the toolchain, the compiler - so the repositories never collide, and a port two of them need
+(openssl, abseil, protobuf, grpc, ...) is built once for all. Two things keep the hashes equal:
+
+- the same extension-ci-tools (its vcpkg commit, overlay ports and toolchains): every repository's
+  distribution build calls it at `main`;
+- the same triplet **file**: the MinGW overlay triplet (`vcpkg_triplets/x64-mingw-static.cmake`) is
+  byte-identical in duckdb-acl, acl-otel and tresor - even a comment changes the hash of every MinGW
+  package. hugr-node reads duckdb-acl's.
+
+This repository's own overlay ports (thrift, mimalloc - `vcpkg_ports/README.md`) arrive with Arrow;
+they change only the packages of a graph that holds them.
+
 ## Where it is used
 
 `.github/workflows/distribution.yml` — the build community-extensions will run, run here first. It
