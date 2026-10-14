@@ -1086,7 +1086,8 @@ private:
 	//! standalone node with NO service attached keeps the secret itself, by duckdb's own rule
 	//! (PERSISTENT to its files, otherwise memory) - the capability and the constants still apply.
 	bool LocalSecrets(const string &named) {
-		// a cluster node (spec 118, acl_deployment) keeps secrets only in its service
+		// a cluster node (spec 118; NodeTraits::cluster_node - hugr-node's hugr_node always is) keeps secrets only in
+		// its service
 		return named.empty() && !store.ClusterNode() && !store.SecretServiceAttached();
 	}
 	void RequireSecrets(const char *verb) {

@@ -697,10 +697,10 @@ refused there - a node's divergence is shown (118.2's drift, the audit), never b
 with NO secrets service attached keeps a principal's `CREATE / DROP SECRET` (naming no storage) itself by
 duckdb's rule (`PERSISTENT` to its files, else memory; `LocalSecrets` in the rewriter). The cluster DETACH
 counts a virtual view whose `view_sql` names the source as a qualifier (`SqlNamesSource`, text: over-reading
-blocks, FORCE answers; macro bodies too). 118.2: `acl_deployment` = standalone (default) | cluster
-(GLOBAL-only, never a profile item; `PolicyStore::ClusterNode()`): a standalone node refuses every `ACL CLUSTER`
-write (`RequireClusterDeployment`; the listings read) and keeps local secrets; a cluster node keeps secrets only
-in its service. The `cluster` bundle (`AdminScope::CLUSTER`, `AdminRights::cluster` ⊇ operate ⊇ observe; passthrough
+blocks, FORCE answers; macro bodies too). 118.2: `PolicyStore::ClusterNode()` (`NodeTraits::cluster_node`, the
+platform part's): an open node (this build) is standalone - no profile, local secrets; hugr-node's `hugr_node` is a
+cluster node by construction (its spec 002 removed `acl_deployment`: a cluster may be one node) - secrets only in
+its service. The `cluster` bundle (`AdminScope::CLUSTER`, `AdminRights::cluster` ⊇ operate ⊇ observe; passthrough
 implies it) = INFRASTRUCTURE and the CLUSTER views, never a point grant; its settings an allowlist of resources
 and tuning (`ClusterBundleMaySet` - the rest passthrough's); the node's trust settings are HARDENING. `platform.drift` (`acl_platform_drift()`, `PolicyStore::ClusterDrift`):
 per database / loaded extension / profiled setting a state same | differs | node_only | profile_only | bootstrap;
