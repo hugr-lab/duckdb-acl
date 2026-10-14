@@ -2582,7 +2582,9 @@ private:
 		for (auto &vcat : catalogs) {
 			literals.push_back("'" + StringUtil::Replace(vcat, "'", "''") + "'");
 		}
-		auto sql = "SELECT d.* FROM acl_lineage_definitions([" + StringUtil::Join(literals, ", ") +
+		// qualified to the system catalog (spec 072's rule for an emitted call): a macro of that name in the
+		// connection's default catalog never takes it
+		auto sql = "SELECT d.* FROM system.main.acl_lineage_definitions([" + StringUtil::Join(literals, ", ") +
 		           "]::VARCHAR[]) d WHERE (d.\"catalog\", d.\"schema\", d.\"object\") IN (SELECT table_catalog, "
 		           "table_schema, table_name FROM (" +
 		           tables +
