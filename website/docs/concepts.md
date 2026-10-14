@@ -53,6 +53,7 @@ capabilities.
   - `create` / `drop` on a schema;
   - `temp` (session temp tables), `explain`, and `secrets` (the node's secrets service) on the main
     catalog grant;
+  - `lineage` (the catalog's definition lineage, `acl_lineage_definitions`) on a catalog grant;
   - `manage` (administer this catalog).
 - **Predicates.** A grant's **RLS** predicate is AND-ed into every read and write. It is also
   checked against the row being written, so an `INSERT` or `UPDATE` cannot leave a row outside the

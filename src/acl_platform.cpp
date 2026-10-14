@@ -97,8 +97,8 @@ constexpr const char *GROUPS = "GROUPS";
 //! an audit event's objects (spec 069): name + the capability judged
 constexpr const char *OBJECTS = "OBJECTS";
 
-const char *const CAPABILITIES[] = {"select", "insert", "update",  "delete",  "merge", "create",
-                                    "drop",   "temp",   "explain", "secrets", "manage"};
+const char *const CAPABILITIES[] = {"select", "insert", "update",  "delete",  "merge",   "create",
+                                    "drop",   "temp",   "explain", "secrets", "lineage", "manage"};
 
 LogicalType CapsType() {
 	child_list_t<LogicalType> children;

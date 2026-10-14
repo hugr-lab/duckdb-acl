@@ -124,8 +124,8 @@ mapped issuer-wide before its grant stops counting at the next token.
 
 Every column is typed - no packed JSON or csv. A capability set is `caps STRUCT("select" BOOLEAN,
 "insert" BOOLEAN, "update" BOOLEAN, "delete" BOOLEAN, "merge" BOOLEAN, "create" BOOLEAN, "drop"
-BOOLEAN, "temp" BOOLEAN, "explain" BOOLEAN, secrets BOOLEAN, manage BOOLEAN)` (NULL = unstated: on a
-catalog grant every data capability, on an object grant inherited); a list is `VARCHAR[]`. The listing
+BOOLEAN, "temp" BOOLEAN, "explain" BOOLEAN, secrets BOOLEAN, lineage BOOLEAN, manage BOOLEAN)` (NULL = unstated:
+on a catalog grant every data capability, on an object grant inherited); a list is `VARCHAR[]`. The listing
 of a view and `DESCRIBE platform.<view>` agree column for column.
 
 Policy views (the `policy` bundle; marked *c* - also a catalog admin, narrowed):

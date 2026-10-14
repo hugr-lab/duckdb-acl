@@ -1953,6 +1953,12 @@ private:
 			ref = BuildFunctionColumnsSubquery(function, tf.alias.empty() ? Identifier(vname) : tf.alias);
 			return;
 		}
+		if (StringUtil::CIEquals(vname, "acl_lineage_definitions")) {
+			// spec 129: the definition lineage of what the principal reads, where it holds `lineage` - substituted
+			// before the gate like acl_references, so no hole in it either
+			ref = BuildLineageDefinitionsSubquery(function, tf.alias.empty() ? Identifier(vname) : tf.alias);
+			return;
+		}
 		if (StringUtil::CIEquals(vname, "acl_references")) {
 			// spec 022: the principal's own view of the declared join paths. Substituted here, before
 			// the function gate, exactly as the metadata surfaces are - so it needs no hole in the gate.
@@ -2529,6 +2535,64 @@ private:
 		auto select_stmt = scope.Empty() ? store.InstantiateSelect(sql, template_options)
 		                                 : store.InstantiateSelect(sql, template_options, false);
 		return make_uniq<SubqueryRef>(std::move(select_stmt), alias);
+	}
+
+	//! spec 129: `FROM acl_lineage_definitions()` / `acl_lineage_definitions('c')`: the operator's function over the
+	//! catalogs on whose grant the principal holds the explicit `lineage` capability (a definition's edges name the
+	//! physical objects it is made of, as a plan does - spec 052), filtered by the principal's own tables and columns
+	//! listings: an object it cannot select, or a column it does not see, has no row.
+	unique_ptr<TableRef> BuildLineageDefinitionsSubquery(FunctionExpression &function, const Identifier &alias) {
+		auto &arguments = function.GetArguments();
+		if (arguments.size() > 1) {
+			Deny(Reason::STATEMENT_TYPE, "acl_lineage_definitions takes at most one argument: the catalog");
+		}
+		string asked;
+		if (arguments.size() == 1) {
+			auto &argument = arguments[0].GetExpression();
+			if (argument.GetExpressionClass() != ExpressionClass::CONSTANT) {
+				Deny(Reason::STATEMENT_TYPE, "acl_lineage_definitions needs a constant catalog name");
+			}
+			auto value = argument.Cast<ConstantExpression>().GetLiteral().ToValue();
+			if (value.IsNull() || value.type().id() != LogicalTypeId::VARCHAR) {
+				Deny(Reason::STATEMENT_TYPE, "acl_lineage_definitions takes one catalog's name");
+			}
+			asked = value.ToString();
+		}
+		vector<string> catalogs;
+		for (auto &vcat : store.PrincipalCatalogsWithCap(principal, "lineage")) {
+			if (asked.empty() || StringUtil::CIEquals(vcat, asked) ||
+			    StringUtil::CIEquals(NamePath::Unquote(vcat), asked)) {
+				catalogs.push_back(vcat);
+			}
+		}
+		if (catalogs.empty()) {
+			Deny(Reason::CAPABILITY,
+			     asked.empty()
+			         ? string("acl_lineage_definitions needs the lineage capability on a catalog grant: a "
+			                  "definition's lineage names the physical objects it is made of")
+			         : "acl_lineage_definitions: the lineage capability on catalog \"" + asked + "\" is not granted");
+		}
+		string tables, columns;
+		if (!store.MetadataListing(principal, "tables", tables) ||
+		    !store.MetadataListing(principal, "columns", columns)) {
+			Deny(Reason::UNAVAILABLE,
+			     "lineage definitions are not available: this policy source cannot enumerate them");
+		}
+		vector<string> literals;
+		for (auto &vcat : catalogs) {
+			literals.push_back("'" + StringUtil::Replace(vcat, "'", "''") + "'");
+		}
+		// qualified to the system catalog (spec 072's rule for an emitted call): a macro of that name in the
+		// connection's default catalog never takes it
+		auto sql = "SELECT d.* FROM system.main.acl_lineage_definitions([" + StringUtil::Join(literals, ", ") +
+		           "]::VARCHAR[]) d WHERE (d.\"catalog\", d.\"schema\", d.\"object\") IN (SELECT table_catalog, "
+		           "table_schema, table_name FROM (" +
+		           tables +
+		           ")) AND (d.\"field\" IS NULL OR d.\"field\" = '' OR (d.\"catalog\", d.\"schema\", d.\"object\", "
+		           "d.\"field\") IN (SELECT table_catalog, table_schema, table_name, column_name FROM (" +
+		           columns + ")))";
+		// the catalogs differ per principal: parsed outside the template cache
+		return make_uniq<SubqueryRef>(store.InstantiateSelect(sql, template_options, false), alias);
 	}
 
 	//! An object named by a listing argument, as its key (`'Raw Data."a.b"'`); text that is no key, as it is

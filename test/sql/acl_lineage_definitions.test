@@ -1,0 +1,159 @@
+# name: test/sql/acl_lineage_definitions.test
+# description: spec 129 - a catalog's definition lineage on demand (acl_lineage_definitions): the operator's over every
+#   catalog; a principal's substituted - only where it holds the explicit `lineage` capability, only what it sees
+# group: [sql]
+
+require acl
+
+# memory mode has no catalog to walk
+statement error
+SELECT * FROM acl_lineage_definitions();
+----
+<REGEX>:.*acl_lineage_definitions needs a policy catalog.*
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INT, tenant VARCHAR, amount INT, ssn VARCHAR, address STRUCT(city VARCHAR, zip VARCHAR));
+
+statement ok
+CREATE TABLE phys.main.staff(id INT, name VARCHAR, salary INT);
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG hr;
+
+# a declared list: a column, a mask over the source's own column, a constant, a nested field
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS phys.main.orders COLUMNS (id, amount, ssn = left(ssn, 1), note = 'n/a', city = address.city);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW sales.totals AS SELECT tenant, sum(amount) AS total FROM phys.main.orders GROUP BY tenant;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE hr.staff AS phys.main.staff;
+
+# --- no namespace, no names (spec 112) ------------------------------------------------------------------------------
+
+statement error
+SELECT * FROM acl_lineage_definitions();
+----
+<REGEX>:.*no lineage namespace \(acl_lineage_namespace\).*
+
+statement ok
+SET GLOBAL acl_lineage_namespace = 'acl://test';
+
+# --- the operator: every catalog, every edge ------------------------------------------------------------------------
+
+query TTTTTTTTTTT
+SELECT catalog, schema, object, object_type, namespace, field, source_namespace, source_name, source_field, type,
+    subtype FROM acl_lineage_definitions() ORDER BY catalog, object, field, source_field;
+----
+hr	main	staff	TABLE	acl://test	id	acl://test/source/phys	main.staff	id	DIRECT	IDENTITY
+hr	main	staff	TABLE	acl://test	name	acl://test/source/phys	main.staff	name	DIRECT	IDENTITY
+hr	main	staff	TABLE	acl://test	salary	acl://test/source/phys	main.staff	salary	DIRECT	IDENTITY
+sales	main	orders	TABLE	acl://test	amount	acl://test/source/phys	main.orders	amount	DIRECT	IDENTITY
+sales	main	orders	TABLE	acl://test	city	acl://test/source/phys	main.orders	address.city	DIRECT	IDENTITY
+sales	main	orders	TABLE	acl://test	id	acl://test/source/phys	main.orders	id	DIRECT	IDENTITY
+sales	main	orders	TABLE	acl://test	ssn	acl://test/source/phys	main.orders	ssn	DIRECT	TRANSFORMATION
+sales	main	totals	VIEW	acl://test	(empty)	acl://test/source/phys	main.orders	tenant	INDIRECT	GROUP_BY
+sales	main	totals	VIEW	acl://test	tenant	acl://test/source/phys	main.orders	tenant	DIRECT	IDENTITY
+sales	main	totals	VIEW	acl://test	total	acl://test/source/phys	main.orders	amount	DIRECT	AGGREGATION
+
+# the mask over the source's own column is flagged; the constant has no edge
+query TT
+SELECT field, masking FROM acl_lineage_definitions('sales') WHERE object = 'orders' ORDER BY field;
+----
+amount	false
+city	false
+id	false
+ssn	true
+
+# a source whose identity the operator declared is named by it - OpenLineage's naming (spec 112 §9): the address is
+# the namespace, the database leads the name
+statement ok
+SELECT acl_lineage_source('phys', 'postgres://db.example:5432/shop');
+
+query TT
+SELECT DISTINCT source_namespace, source_name FROM acl_lineage_definitions('hr');
+----
+postgres://db.example:5432	shop.main.staff
+
+statement ok
+SELECT acl_lineage_source('phys', NULL);
+
+# --- a principal: only with the `lineage` capability, which no default carries ---------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE reader;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE reader MAIN;
+
+statement error
+ACL ROLE "reader" SELECT * FROM acl_lineage_definitions();
+----
+<REGEX>:.*acl_lineage_definitions needs the lineage capability on a catalog grant.*
+
+statement ok
+ACL ADMIN CREATE ROLE connector;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE connector WITH (select, lineage) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG hr TO ROLE connector WITH (select);
+
+# the catalog where it holds lineage - and not the one where it only reads
+query TTT
+ACL ROLE "connector" SELECT object, field, source_field FROM acl_lineage_definitions() ORDER BY object, field;
+----
+orders	amount	amount
+orders	city	address.city
+orders	id	id
+orders	ssn	ssn
+totals	(empty)	tenant
+totals	tenant	tenant
+totals	total	amount
+
+statement error
+ACL ROLE "connector" SELECT * FROM acl_lineage_definitions('hr');
+----
+<REGEX>:.*the lineage capability on catalog "hr" is not granted.*
+
+# the operator's list form is the rewriter's: a principal's call of it is substituted all the same, and refused
+statement error
+ACL ROLE "connector" SELECT * FROM acl_lineage_definitions(['hr']);
+----
+<REGEX>:.*acl_lineage_definitions needs a constant catalog name.*
+
+# a column the role does not see has no row; an object it cannot select has none
+statement ok
+ACL ADMIN CREATE ROLE narrow;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE narrow WITH (select, lineage) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.orders TO ROLE narrow COLUMNS (id, city);
+
+statement ok
+ACL ADMIN GRANT VIEW sales.totals TO ROLE narrow WITH ();
+
+query TT
+ACL ROLE "narrow" SELECT object, field FROM acl_lineage_definitions() ORDER BY object, field;
+----
+orders	city
+orders	id

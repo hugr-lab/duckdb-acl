@@ -146,7 +146,8 @@ enforcement off — the `acl_*` functions still configure policy, but no `ACL �
   explicit `'{}'` means none. An *object* grant that states nothing inherits the catalog grant's caps,
   so a refinement never widens by omission. The capabilities *outside* that default are explicit-only
   and never inherited: `create`/`drop` on a schema (spec 016/051), `temp` (spec 050), `explain`
-  (spec 052) and `secrets` (spec 082) on the MAIN catalog grant — each granted by name or not held.
+  (spec 052) and `secrets` (spec 082) on the MAIN catalog grant, `lineage` (spec 129) on any catalog grant — each
+  granted by name or not held.
 - **A grant's predicate confines writes too** (spec 024): it is AND-ed into the read/write `WHERE` and
   also checked against the row being written — an `INSERT`/`UPDATE`/`MERGE` that would leave a row
   outside the principal's slice is refused where the value is written (`error()` inside a `CASE`). An
@@ -602,6 +603,15 @@ transaction (`AclProfileState` TransactionCommit/Rollback → `RUN_ABORT`, `Line
 `Connection::Prepare` is no run (`LineagePrepareScope`), a write is never Submitted for its schema,
 Flight ingest carries `LINEAGE` markers (the note survives its BEGIN), a declared read of only metadata
 or of no rows is no run, fields carry types (`LineageFieldOf`). acl-otel spec 020 renders `ABORT`.
+
+**Spec 129 — a catalog's definition lineage on demand** (the node side of acl-clients spec 005, OpenMetadata takes no
+`DatasetEvent`): `acl_lineage_definitions([catalog])` (acl_lineage.cpp) - one row per definition edge of every virtual
+table and view (`PolicyStore::RelationDefinitionWalk`, the walk the `DATASET` event makes, shared with
+`EmitDefinitionLineageNow`), spec 112's names, computed at the call. The operator's as written; under a principal
+the rewriter substitutes it (`BuildLineageDefinitionsSubquery`, before the gate, like acl_references): the
+operator's form over the catalogs where the principal holds the explicit `lineage` capability
+(`PrincipalCatalogsWithCap`; never in the default, on any catalog grant), filtered by its own tables / columns
+listings. Needs a lineage namespace, not `acl_lineage_level`.
 
 **Spec 113 — dbt's own statements**: DDL names are `[<vcat>.]<schema path>.<object>` -
 `CatalogBackend::DdlTarget` reads the first part as a catalog the principal holds a grant on, else the

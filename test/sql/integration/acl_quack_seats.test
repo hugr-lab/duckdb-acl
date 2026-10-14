@@ -88,7 +88,11 @@ ATTACH 'quack:localhost:31493' AS r3 (TYPE quack, TOKEN 'eyJhbGciOiJSUzI1NiIsInR
 ----
 <REGEX>:.*acl: node at capacity - 2 of 2 quack clients seated.*acl_quack_client_depth 512.*try another node.*
 
-# counted like every refusal, under its code
+# counted like every refusal, under its code - counters are derived on the audit's thread: flushed first (the
+# gate saw the count read before the refusal's event was processed)
+statement ok
+SELECT acl_audit_flush();
+
 query I
 SELECT value FROM acl_metrics() WHERE name = 'acl.sessions.refused' AND attributes LIKE '%at_capacity%';
 ----

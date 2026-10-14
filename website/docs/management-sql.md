@@ -487,7 +487,9 @@ object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like ever
   implied: `manage` (administer this catalog, see below), `create`/`drop` (reserved - a principal never creates
   a schema, spec 113),
   `temp` (session temp tables on the Flight door), `explain` (EXPLAIN) and `secrets` (the node's
-  secrets service, see below), each held only when named.
+  secrets service, see below) on the main catalog grant, and `lineage` (the catalog's definition lineage,
+  `acl_lineage_definitions` - [lineage](lineage.md#a-catalogs-definitions-on-demand)) on any catalog grant,
+  each held only when named.
   An unknown name is stored as written and enforces nothing.
 - **`MAIN`** marks the catalog whose objects the role addresses unqualified. A principal with more than
   one main catalog across its roles resolves only qualified names.

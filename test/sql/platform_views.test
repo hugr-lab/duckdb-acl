@@ -98,7 +98,7 @@ ACL ROLE "root" SELECT column_name, data_type, ordinal_position FROM information
 role	VARCHAR	1
 catalog	VARCHAR	2
 is_main	BOOLEAN	3
-caps	STRUCT("select" BOOLEAN, "insert" BOOLEAN, "update" BOOLEAN, "delete" BOOLEAN, "merge" BOOLEAN, "create" BOOLEAN, "drop" BOOLEAN, "temp" BOOLEAN, "explain" BOOLEAN, secrets BOOLEAN, manage BOOLEAN)	4
+caps	STRUCT("select" BOOLEAN, "insert" BOOLEAN, "update" BOOLEAN, "delete" BOOLEAN, "merge" BOOLEAN, "create" BOOLEAN, "drop" BOOLEAN, "temp" BOOLEAN, "explain" BOOLEAN, secrets BOOLEAN, lineage BOOLEAN, manage BOOLEAN)	4
 rls	VARCHAR	5
 rls_checked	BOOLEAN	6
 columns	VARCHAR[]	7
@@ -110,7 +110,7 @@ ACL ROLE "root" SELECT column_name, column_type FROM (DESCRIBE platform.grants);
 role	VARCHAR
 catalog	VARCHAR
 is_main	BOOLEAN
-caps	STRUCT("select" BOOLEAN, "insert" BOOLEAN, "update" BOOLEAN, "delete" BOOLEAN, "merge" BOOLEAN, "create" BOOLEAN, "drop" BOOLEAN, "temp" BOOLEAN, "explain" BOOLEAN, secrets BOOLEAN, manage BOOLEAN)
+caps	STRUCT("select" BOOLEAN, "insert" BOOLEAN, "update" BOOLEAN, "delete" BOOLEAN, "merge" BOOLEAN, "create" BOOLEAN, "drop" BOOLEAN, "temp" BOOLEAN, "explain" BOOLEAN, secrets BOOLEAN, lineage BOOLEAN, manage BOOLEAN)
 rls	VARCHAR
 rls_checked	BOOLEAN
 columns	VARCHAR[]
