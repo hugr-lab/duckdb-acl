@@ -218,6 +218,12 @@ ACL ROLE "r" EXPLAIN ANALYZE SELECT * FROM orders;
 ----
 <REGEX>:.*EXPLAIN needs the explain capability.*
 
+# spec 128 (duckdb #26958): EXPLAIN (SQL) reconstructs a WRITE's SQL from its plan - the same gate
+statement error
+ACL ROLE "r" EXPLAIN (SQL) INSERT INTO lake.events VALUES (2, 'k');
+----
+<REGEX>:.*EXPLAIN needs the explain capability.*
+
 # grant it, and the plan (physical names and all) is the principal's to see
 statement ok
 ACL ADMIN GRANT CATALOG sales TO ROLE r WITH (select, insert, update, delete, merge, explain) MAIN;
@@ -228,6 +234,18 @@ query II
 ACL ROLE "r" EXPLAIN SELECT id FROM orders;
 ----
 physical_plan	<REGEX>:.*phys.main.orders.*
+
+# spec 128: with the capability, the write's reconstructed SQL is the REWRITTEN write - its physical target - and
+# EXPLAIN (SQL) runs nothing
+query II
+ACL ROLE "r" EXPLAIN (SQL) INSERT INTO lake.events VALUES (2, 'k');
+----
+sql	<REGEX>:.*INSERT INTO phys.lake.events.*
+
+query I
+SELECT count(*) FROM phys.lake.events;
+----
+0
 
 # --- an enclosing EXPLAIN keeps its place -----------------------------------------------------------------
 # the PRAGMA is answered by a different statement, so the replacement has to happen inside the EXPLAIN

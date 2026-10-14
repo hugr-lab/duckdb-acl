@@ -26,7 +26,11 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   the workers but decides nothing, and a `QueryResultStream` opened on a handle is the one streaming
   form. Since the bba7360 pin (spec 123, duckdb #26880) the planner decides nothing: `Submit` leaves every result
   to its consumer, a write waits at its count until something settles it, and a result closed before its end is
-  rolled back; `StreamsByDefault(written type, properties, reads_to_the_end)` is duckdb's rule of who streams.
+  rolled back; `StreamsByDefault(written type, result, reads_to_the_end)` is duckdb's rule of who streams.
+  **A statement may expand into several** (since the f702a1f pin, spec 128, duckdb #27108): a dynamic PIVOT, an
+  `ALTER … ADD COLUMN` with a volatile default, `IMPORT DATABASE` run as ONE query, and `Prepare` accepts them with
+  their metadata deferred - `MetadataAvailable()` false, the types a placeholder, the properties the defaults (they
+  look read-only whatever the statement does: never judge such a statement by them).
   **A result has a format** (since the 2026-09-30 pin, spec 090): `QueryResult` has no `GetValue`;
   `Collection().GetValue(c, r)` rebuilds every row per call, so a loop over rows reads a `ResultRows`
   (`acl_result_rows.hpp`) built once; the stream is `QueryResultStream<>` (the chunk format), and a
@@ -39,8 +43,9 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   `DONT_LINK` is gone (a FATAL_ERROR). We link acl, icu, ducklake and quack's json/autocomplete/httpfs;
   postgres/mysql/quack/mssql stay loadables by not being named.
   Re-pin to the `v2.0.0` tag when it is cut; the scanners come from the submodule's own
-  extension pins (`.github/config/extensions/`), patches included - ducklake's too, since 2026-09-17
-  (the three patches we carried in `patches/ducklake/` are upstream). quack is the submodule's own pin
+  extension pins (`.github/config/extensions/`), patches included - ducklake's too, with one patch of
+  ours on top since the f702a1f pin (spec 128: `patches/ducklake/` renames its `pg_clear_cache` call - duckdb-postgres
+  renamed the function - applied together with duckdb's by our own declare in `extension_config.cmake`). quack is the submodule's own pin
   (974927a since the 2026-09-30 pin, spec 090), with the patches duckdb
   carries for it applied to the loadable (`APPLY_PATCHES`) and, by `sync.py`, to the embedded
   server's copies alike (a patch that touches only quack's tests is skipped there, and says so).

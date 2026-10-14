@@ -98,14 +98,16 @@ got="$(ask "EXPLAIN SELECT * FROM orders")"
 echo "$got" | grep -q "explain capability" || fail "EXPLAIN was not gated by the capability: $got"
 
 # --- PIVOT through the door (spec 075): the explicit form prepares like any SELECT and answers the
-# principal's slice - five acme rows, and nothing for the tenant it cannot see; the implicit form is
-# a multi-statement duckdb itself cannot prepare, so the door answers duckdb's own refusal
+# principal's slice - five acme rows, and nothing for the tenant it cannot see; the implicit form expands into
+# several statements, which duckdb prepares with its result unknown (spec 128, duckdb #27108) - the door runs it at
+# GetFlightInfo, and its columns are the enum domain the principal reads: acme, never globex
 got="$(ask "SELECT * FROM (SELECT tenant FROM orders) PIVOT (count(*) FOR tenant IN ('acme', 'globex'))")"
 echo "$got" | grep -q "'acme': \[5\]" || fail "the explicit PIVOT did not answer the tenant's slice: $got"
 echo "$got" | grep -q "'globex': \[5\]" && fail "the explicit PIVOT counted another tenant's rows: $got"
 
-got="$(ask "PIVOT orders ON tenant USING count(*)")"
-echo "$got" | grep -qi "prepare multiple statements" || fail "the implicit PIVOT was not refused as unpreparable: $got"
+got="$(ask "PIVOT (SELECT tenant FROM orders) ON tenant USING count(*)")"
+echo "$got" | grep -q "'acme': \[5\]" || fail "the implicit PIVOT did not answer the tenant's slice: $got"
+echo "$got" | grep -q "globex" && fail "the implicit PIVOT's columns named another tenant: $got"
 
 # --- spec 109: a lineage parent in a header is checked where it enters - a malformed one is the call's
 # error (InvalidArgument, no part of the value echoed); a well-formed one is taken
