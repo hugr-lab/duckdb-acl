@@ -213,6 +213,13 @@ test-integration:
 check-flight-deps:
 	./scripts/check_flight_deps.sh
 
+# The e2e scripts read the CLI's own output. In an agent's shell the CLI switches to its agent output mode (duckdb's
+# shell.cpp lists the markers: AI_AGENT, AGENT, CLAUDECODE, CODEX_*, CURSOR_AGENT, GEMINI_CLI, COPILOT_*), whose layout
+# none of them parses - at the f702a1f pin (spec 128) the Flight door's last check and the door e2e's probes stopped
+# matching. None of them is passed on to a recipe here
+unexport AI_AGENT AGENT CLAUDECODE CODEX_CI CODEX_SANDBOX CODEX_THREAD_ID CURSOR_AGENT GEMINI_CLI COPILOT_AGENT \
+	COPILOT_CLI COPILOT_AGENT_SESSION_ID
+
 # The Flight SQL door end to end (specs/045): one duckdb serves, a third-party pyarrow client reads its
 # own slice through it. Needs a build with the door in (GEN=ninja make, without ACL_NO_FLIGHT=1) and
 # pyarrow; skips itself, saying why, when either is missing.

@@ -43,6 +43,13 @@ with connect(acme_token) as conn:
     check("parameterized ? answers the slice", cur.fetchall() == [(3,)])
     cur.execute("SELECT count(*) FROM orders WHERE amount >= $1", (40,))
     check("parameterized $1 answers the slice", cur.fetchall() == [(3,)])
+    # spec 128: a parameter whose type the prepare could not resolve leaves duckdb's MetadataAvailable() false - it is
+    # no statement that expands into several: its schema is probed with the bound row (spec 112), never announced as
+    # the placeholder's text, and it streams
+    import pyarrow as pa
+    _, announced = cur.adbc_execute_partitions("SELECT ? AS v", (7,))
+    check("an unresolved parameter's column is probed with the row", pa.types.is_integer(announced.field("v").type),
+          announced)
     # the same cursor keeps working - the poisoned-cursor sequence from the survey, now clean
     cur.execute("SELECT count(*) FROM orders")
     check("the cursor survives (no poison)", cur.fetchall() == [(5,)])

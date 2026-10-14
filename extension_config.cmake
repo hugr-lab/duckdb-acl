@@ -63,6 +63,36 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
     # (min_is_exact/max_is_exact, no version bump), so a lake a previous pin wrote can be unreadable
     # ("Referenced column ... not found"); CI starts its postgres empty, a developer's persistent
     # catalog is recreated (`DROP DATABASE ducklake_catalog; CREATE DATABASE ducklake_catalog;`).
+    #
+    # spec 128 (f702a1f): one patch of ours again, on top of the submodule's pin and patches. duckdb-postgres
+    # renamed `pg_clear_cache` to `postgres_clear_cache` (98ee7fc, in the branch's pin 57f857e) while ducklake - its
+    # pin and its main alike - still calls `CALL pg_clear_cache()` in the postgres metadata manager, so DuckLake on
+    # a PostgreSQL catalog fails at the head of the 2.0 branch. patches/ducklake/ renames the call. The declare
+    # below wins over the one register_external_extension makes for the same content name (CMake keeps the first),
+    # so its PATCH_COMMAND is the one that runs: duckdb's own ducklake patches and ours, copied into one directory
+    # (duckdb's script applies one directory and refuses a tree it already changed; ours sort last, 9xxx). The pin is
+    # read from the submodule's config, so it follows the submodule. Only the test build carries ducklake - nothing
+    # of it reaches acl's artifact. Drop it (back to the plain include) once ducklake calls the new name.
+    file(READ ${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/ducklake.cmake ACL_DUCKLAKE_CONFIG)
+    string(REGEX MATCH "GIT_TAG ([0-9a-f]+)" _ ${ACL_DUCKLAKE_CONFIG})
+    set(ACL_DUCKLAKE_PIN ${CMAKE_MATCH_1})
+    set(ACL_DUCKLAKE_PATCHES ${CMAKE_BINARY_DIR}/acl_patches/ducklake/)
+    file(REMOVE_RECURSE ${ACL_DUCKLAKE_PATCHES})
+    file(GLOB ACL_DUCKLAKE_PATCH_FILES ${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/patches/extensions/ducklake/*.patch
+         ${CMAKE_CURRENT_LIST_DIR}/patches/ducklake/*.patch)
+    file(COPY ${ACL_DUCKLAKE_PATCH_FILES} DESTINATION ${ACL_DUCKLAKE_PATCHES})
+    include(FetchContent)
+    if(NOT Python3_EXECUTABLE)
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    endif()
+    FetchContent_Declare(
+        ducklake_extension_fc
+        GIT_REPOSITORY https://github.com/duckdb/ducklake
+        GIT_TAG ${ACL_DUCKLAKE_PIN}
+        PATCH_COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/duckdb/scripts/apply_extension_patches.py
+                      ${ACL_DUCKLAKE_PATCHES}
+        SOURCE_SUBDIR __duckdb_no_add_subdirectory__
+    )
     include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/ducklake.cmake)
     duckdb_extension_statically_link(ducklake)
     # mysql_scanner: the submodule's own pin and patches. It was disabled at the submodule's pin until

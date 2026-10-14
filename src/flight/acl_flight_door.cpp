@@ -72,8 +72,25 @@ namespace flightsql = arrow::flight::sql;
 //! client cancels, a forgotten stream is superseded - so a statement that writes runs to completion
 //! instead: a stream abandoned before its end is rolled back, and a write must not depend on being read.
 //! `written` is the statement as the client wrote it (an execution reports EXECUTE).
-bool StreamsAtDoor(StatementType written, const StatementProperties &properties) {
-	return StreamsByDefault(written, properties, false);
+bool StreamsAtDoor(StatementType written, const QueryResult &result) {
+	return StreamsByDefault(written, result, false);
+}
+//! spec 128 (duckdb #27108): a statement that expands into several - a dynamic PIVOT, an ALTER that adds a column
+//! with a volatile default, IMPORT DATABASE - is prepared with its result unknown until it runs: its types are a
+//! placeholder and its properties describe nothing (they look read-only, whatever it does). duckdb's
+//! MetadataAvailable() is false for it with every parameter bound - and false too for an ordinary statement whose
+//! parameter type is not resolved yet (spec 112), which this is not
+bool ExpandsIntoSeveral(PreparedStatement &stmt) {
+	return !stmt.MetadataAvailable() && stmt.GetStatementProperties().bound_all_parameters;
+}
+//! ... and the same rule judged on the prepared statement, before it runs (Submit or Execute): `written` first - a
+//! statement that expands into several is no SELECT as written - and such a statement never streams
+bool StreamsAtDoor(StatementType written, PreparedStatement &stmt) {
+	if (written != StatementType::SELECT_STATEMENT || ExpandsIntoSeveral(stmt)) {
+		return false;
+	}
+	auto &properties = stmt.GetStatementProperties();
+	return properties.return_type == StatementReturnType::QUERY_RESULT && properties.IsReadOnly();
 }
 
 //! The header a client's JWT arrives in. `authorization: Bearer <jwt>` is what every Flight SQL driver
@@ -154,7 +171,7 @@ struct FlightDoorState {
 		//! `retained`: a result PreparedStatement::Execute answered (spec 111's statement run at GetFlightInfo,
 		//! spec 117's management call among them) - read from the handle, never opened as a stream
 		void Take(unique_ptr<QueryResult> result, StatementType written, bool retained = false) {
-			if (!retained && StreamsAtDoor(written, result->GetStatementProperties()) && result->HasBufferedData()) {
+			if (!retained && StreamsAtDoor(written, *result) && result->HasBufferedData()) {
 				stream = make_uniq<QueryResultStream<>>(std::move(result));
 			} else {
 				handle = std::move(result);
@@ -1281,6 +1298,10 @@ public:
 					state->CloseReservation(ticket_id, owner);
 					return ran;
 				}
+				if (held->executed && Expands(*held->stmt)) {
+					// spec 128: run now, its schema is known now
+					ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(held->executed->GetTypes(), held->executed->GetNames()));
+				}
 			}
 			state->store->AuditDoor("flight", "ticket_issued", true, string(), string(), handle);
 			ARROW_ASSIGN_OR_RAISE(auto ticket, flightsql::CreateStatementQueryTicket(ticket_id));
@@ -1776,6 +1797,12 @@ public:
 				// the declared parameters are bound: then it answers the schema, as before, and DoGet runs)
 				if (reservation->parameter_rows.size() <= 1 && (bound || reservation->stmt->GetParameterCount() == 0)) {
 					ARROW_RETURN_NOT_OK(ExecuteCountNow(handle, *reservation, bound));
+					if (reservation->executed && Expands(*reservation->stmt)) {
+						// spec 128: its schema is its result's - announced at CreatePreparedStatement as duckdb's
+						// placeholder, the one thing known before it runs
+						ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaFor(reservation->executed->GetTypes(),
+						                                                reservation->executed->GetNames()));
+					}
 				}
 			}
 			// the ticket is the protocol's own command, which carries the handle - nothing is
@@ -1927,7 +1954,7 @@ public:
 		bool writes = !properties.IsReadOnly() || kind == StatementType::INSERT_STATEMENT ||
 		              kind == StatementType::UPDATE_STATEMENT || kind == StatementType::DELETE_STATEMENT ||
 		              kind == StatementType::MERGE_INTO_STATEMENT;
-		if (unresolved && bound_row && !writes && StreamsAtDoor(kind, properties)) {
+		if (unresolved && bound_row && !writes && StreamsAtDoor(kind, stmt)) {
 			// a submitted handle carries the types the binder resolved with the row, and is closed
 			// unread; a statement the door does not stream is never submitted for its schema - its
 			// types never ride on a parameter anyway. The probe is no execution: the
@@ -2074,6 +2101,12 @@ public:
 		}
 	}
 
+	//! spec 128: a statement that expands into several (ExpandsIntoSeveral) runs at GetFlightInfo, as a count does
+	//! (spec 111), and its schema is its result's
+	static bool Expands(PreparedStatement &stmt) {
+		return ExpandsIntoSeveral(stmt);
+	}
+
 	static bool AnswersOnlyCount(const FlightDoorState::Reservation &reservation) {
 		auto &stmt = *reservation.stmt;
 		// a client's USE / SET / CREATE / DROP / ALTER answers no rows, whatever the rewrite made of it: a
@@ -2128,7 +2161,7 @@ public:
 	arrow::Status ExecuteCountNow(const string &handle, FlightDoorState::Reservation &reservation,
 	                              const vector<Value> *bound) {
 		auto &stmt = *reservation.stmt;
-		if (!AnswersOnlyCount(reservation)) {
+		if (!AnswersOnlyCount(reservation) && !Expands(stmt)) {
 			return arrow::Status::OK();
 		}
 		ArmProfile(handle, *reservation.conn, &reservation, string());
@@ -2160,8 +2193,7 @@ public:
 			retained = true;
 		} else {
 			ArmProfile(handle, *reservation->conn, reservation.get(), string());
-			result = StreamsAtDoor(stmt.GetStatementType(), stmt.GetStatementProperties()) ? stmt.Submit(values)
-			                                                                               : stmt.Execute(values);
+			result = StreamsAtDoor(stmt.GetStatementType(), stmt) ? stmt.Submit(values) : stmt.Execute(values);
 		}
 		if (result->HasError()) {
 			return StatusFromDuck("acl", result->GetError());
