@@ -255,12 +255,43 @@ A client's own context is three session settings, set only on a session of the c
   (the worker's queue holds 1000 items; past that an item is dropped and counted),
   `acl.lineage.errors` (a worker job that failed) and `acl.lineage.parent_invalid{door}`.
 
-None of these is a principal's.
+None of these is a principal's - but the one below.
+
+## A catalog's definitions, on demand
+
+A backend that takes no `DATASET` event - OpenMetadata, as of 2.0.5 - can still learn what each virtual
+object is made of: `acl_lineage_definitions([catalog])` answers it as rows, walked when it is called (the
+same walk as the `DATASET` event, never the ring), one row per edge:
+
+```sql
+SELECT catalog, schema, object, field, source_namespace, source_name, source_field, type, subtype, masking
+FROM acl_lineage_definitions('sales');
+-- sales  main  orders  city   acl://prod/source/pg  main.orders  address.city  DIRECT    IDENTITY     false
+-- sales  main  totals  total  acl://prod/source/pg  main.orders  amount        DIRECT    AGGREGATION  false
+-- sales  main  totals         acl://prod/source/pg  main.orders  tenant        INDIRECT  GROUP_BY     false
+```
+
+The columns: `catalog, schema, object, object_type` (TABLE / VIEW), `namespace` (`acl_lineage_namespace`),
+`field` (empty: an edge to the whole object - a filter, join or group key), `source_namespace`, `source_name`,
+`source_field` - the names of [Names](#names) and [a source's identity](#a-sources-identity), a source without one
+as `<namespace>/source/<alias>` - `type`, `subtype`, `masking` (the object's own mask over that column), and
+`approximate` (the definition did not bind exactly). An object with no edge (constants only) has one row with no
+source. Tables and views; a table function's lineage is its `DATASET` event's.
+
+- **The operator** reads every catalog (no argument) or one.
+- **A principal** reads it only where its catalog grant names the explicit capability **`lineage`** - never in the
+  unstated default, never implied (`GRANT CATALOG sales TO ROLE om_connector WITH (select, lineage)`): an edge
+  names the physical objects a definition is made of, as a plan does. And only what the role sees: an object it
+  cannot select, or a column it does not see, has no row. The call is answered by the node from the principal's
+  own listings - the role needs no administration and no `ACL NATIVE`.
+- It needs a policy catalog and a lineage namespace; `acl_lineage_level` may be off (nothing is sent, the
+  definitions still answer).
 
 ## How it is safe
 
-- **No principal ever reads lineage.** It goes to the sinks that ask for it, never to the audit file
-  or `acl_audit_events()`.
+- **No principal reads lineage events.** They go to the sinks that ask for them, never to the audit file
+  or `acl_audit_events()`. A principal reads a catalog's definitions only under the explicit `lineage`
+  capability, and only what it sees (above).
 - **Never in a payload:** a value, a literal, a claim, a token, a session handle, a mask's or a
   predicate's text, and the statement's text unless `acl_lineage_sql = 'normalized'`.
 - **A runtime run is computed off the statement's path.** The worker mirrors what the principal

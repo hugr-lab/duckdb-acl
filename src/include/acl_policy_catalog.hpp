@@ -525,6 +525,8 @@ struct CatalogBackend {
 	//! EffectiveCaps carries spec 012's rule for free: an unstated caps column defaults to the data
 	//! capabilities, which never include `temp` - so anything beyond them is here only if granted.
 	bool PrincipalMainCap(const Principal &principal, const string &capability);
+	//! spec 129: the catalogs on whose grant (any of the principal's roles) `capability` is written explicitly
+	vector<string> PrincipalCatalogsWithCap(const Principal &principal, const string &capability);
 
 	//! Where a `CREATE`/`DROP` of `vname` lands for this principal (spec 016). One query: the longest
 	//! virtual schema prefix of the name that the principal's roles hold, with the grant that states

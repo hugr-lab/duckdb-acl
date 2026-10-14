@@ -41,6 +41,7 @@ namespace acl {
 
 class AuditPipeline; // the audit's own side (spec 069), acl_audit_pipeline.hpp
 class LineageWorker; // spec 107, acl_lineage.hpp
+struct LineageWalk;  // spec 107, acl_lineage_walker.hpp
 class AuditHooks;    // its registry, acl_audit.hpp
 
 // `Principal` is the audit contract's (duckdb-ext-common/contracts/acl_principal.hpp, spec 076): a
@@ -650,6 +651,11 @@ struct PolicyStore {
 	void NoteGrantLineage(const string &vcat, const string &vname = string());
 	//! The worker's side of the two above: the events made now, on the calling thread. Never throws.
 	void EmitDefinitionLineageNow(const string &vcat, const string &vname, const string &lifecycle);
+	//! spec 107 / 129: what a virtual table or view of `vcat` is made of - its definition read back and walked
+	//! (`walked` false: it did not bind - approximate). False when it cannot be read (`dataset_type` empty: no
+	//! such object); `source_columns` the physical source's columns, for the role tags
+	bool RelationDefinitionWalk(const string &vcat, const string &vname, idx_t max_edges, LineageWalk &walk,
+	                            string &dataset_type, bool &walked, case_insensitive_set_t *source_columns = nullptr);
 	void EmitGrantLineageNow(const string &vcat, const string &vname);
 	//! spec 107: a virtual TABLE function's static event - a macro's body bound and walked, an alias's
 	//! declared result (what it reads is the physical function's) - queued like NoteDefinitionLineage
@@ -836,6 +842,9 @@ struct PolicyStore {
 	//! catalog, like the rest of the served story.
 	bool PrincipalMainCap(const Principal &principal, const string &capability);
 	bool CatalogPrincipalMainCap(const Principal &principal, const string &capability);
+	//! spec 129: the catalogs on whose grant `capability` is written explicitly for the principal (memory mode:
+	//! none - it has no catalog grants)
+	vector<string> PrincipalCatalogsWithCap(const Principal &principal, const string &capability);
 
 	//! spec 082: the node's secrets service a statement acts on - an attached catalog of type
 	//! `tresor`. `named` (the statement's IN / FROM, '' when none) must be one; unnamed, exactly one

@@ -5,6 +5,7 @@
 #include "acl_door_common.hpp"
 #include "acl_policy.hpp"
 #include "acl_policy_catalog.hpp"
+#include "acl_result_rows.hpp"
 #include "acl_lineage_sources.hpp"
 
 #include "duckdb/common/types/uuid.hpp"
@@ -798,6 +799,168 @@ void LineageSourceFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	}
 }
 
+namespace {
+
+//! spec 129: acl_lineage_definitions([catalog | catalogs]) - every definition edge of the virtual tables and views of
+//! the catalogs (all without an argument): what each is made of, walked on demand as spec 107's DatasetEvent walks
+//! it, the names spec 112's. The operator's as written; a principal's call is substituted by the rewriter (the
+//! catalogs on which it holds the explicit `lineage` capability, filtered by its own tables / columns listings).
+struct LineageDefinitionsInfo : TableFunctionInfo {
+	explicit LineageDefinitionsInfo(weak_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
+	}
+	weak_ptr<PolicyStore> store;
+};
+
+struct LineageDefinitionsBindData : TableFunctionData {
+	weak_ptr<PolicyStore> store;
+	bool all = true;
+	vector<string> catalogs;
+};
+
+struct LineageDefinitionsState : GlobalTableFunctionState {
+	vector<vector<Value>> rows;
+	idx_t emitted = 0;
+};
+
+unique_ptr<FunctionData> LineageDefinitionsBind(ClientContext &, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
+	auto column = [&](const char *name, const LogicalType &type) {
+		names.push_back(Identifier(name));
+		return_types.push_back(type);
+	};
+	for (auto name : {"catalog", "schema", "object", "object_type", "namespace", "field", "source_namespace",
+	                  "source_name", "source_field", "type", "subtype"}) {
+		column(name, LogicalType::VARCHAR);
+	}
+	column("masking", LogicalType::BOOLEAN);
+	column("approximate", LogicalType::BOOLEAN);
+	auto data = make_uniq<LineageDefinitionsBindData>();
+	data->store = input.info->Cast<LineageDefinitionsInfo>().store;
+	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+		data->all = false;
+		auto &value = input.inputs[0];
+		if (value.type().id() == LogicalTypeId::LIST) {
+			for (auto &child : ListValue::GetChildren(value)) {
+				if (!child.IsNull()) {
+					data->catalogs.push_back(child.ToString());
+				}
+			}
+		} else {
+			data->catalogs.push_back(value.ToString());
+		}
+	}
+	return std::move(data);
+}
+
+unique_ptr<GlobalTableFunctionState> LineageDefinitionsInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<LineageDefinitionsBindData>();
+	auto state = make_uniq<LineageDefinitionsState>();
+	auto store = bind.store.lock();
+	if (!store || !store->catalog) {
+		throw InvalidInputException("acl_lineage_definitions needs a policy catalog (acl_use_db)");
+	}
+	auto settings = LineageSettings::Read(*context.db);
+	if (settings.ns.empty()) {
+		// spec 112: a name is `<acl_lineage_namespace>` :: `<vcat>.<schema>.<object>` - without the namespace nothing
+		// here would meet what the node's events say (and OpenMetadata's service mapping)
+		throw InvalidInputException("acl_lineage_definitions: no lineage namespace (acl_lineage_namespace) - %s",
+		                            LineageStatus(*context.db));
+	}
+	if (!bind.all && bind.catalogs.empty()) {
+		return std::move(state); // a principal holding `lineage` on no catalog it asked about
+	}
+	string filter;
+	if (!bind.all) {
+		vector<string> keys;
+		for (auto &name : bind.catalogs) {
+			keys.push_back(KeyFoldSql(acl_detail::Lit(name)));
+		}
+		filter = " WHERE " + KeyFoldSql("\"vcat\"") + " IN (" + StringUtil::Join(keys, ", ") + ")";
+	}
+	auto objects = store->catalog->Query("SELECT \"vcat\", \"vname\" FROM " + store->catalog->Tbl("relations") +
+	                                     filter + " ORDER BY 1, 2");
+	ResultRows object_rows(*objects);
+	auto text = [](const string &value) {
+		return value.empty() ? Value(LogicalType::VARCHAR) : Value(value);
+	};
+	for (idx_t i = 0; i < objects->RowCount(); i++) {
+		auto vcat = object_rows.GetValue(0, i).ToString();
+		auto vname = object_rows.GetValue(1, i).ToString();
+		LineageWalk walk;
+		string dataset_type;
+		bool walked = false;
+		if (!store->RelationDefinitionWalk(vcat, vname, settings.max_edges, walk, dataset_type, walked) &&
+		    dataset_type.empty()) {
+			continue; // dropped meanwhile
+		}
+		string parent, leaf;
+		NamePath::SplitLeaf(vname, parent, leaf);
+		auto catalog_shown = NamePath::Unquote(vcat);
+		auto schema_shown = parent.empty() ? string("main") : NamePath::Display(parent);
+		LineageWalk defined = walked ? walk : LineageWalk();
+		defined.approximate = defined.approximate || !walked;
+		defined.has_target = true;
+		defined.target.kind = "virtual";
+		defined.target.catalog = vcat;
+		defined.target.name = vname;
+		auto lineage = LineageFromWalk(defined, settings);
+		auto object_row = [&](const AuditLineageEdge *edge) {
+			vector<Value> row;
+			row.push_back(Value(catalog_shown));
+			row.push_back(Value(schema_shown));
+			row.push_back(Value(leaf));
+			row.push_back(Value(dataset_type));
+			row.push_back(Value(settings.ns));
+			if (edge) {
+				auto &source = lineage->datasets[edge->source];
+				row.push_back(Value(edge->target_field));
+				row.push_back(Value(source.ns));
+				row.push_back(Value(source.name));
+				row.push_back(Value(edge->source_field));
+				row.push_back(text(edge->type));
+				row.push_back(text(edge->subtype));
+				row.push_back(Value::BOOLEAN(edge->masking));
+			} else {
+				// an object with no edge (constants only, or a definition that did not bind): one row says it is
+				// there, and whether that is all that could be said
+				for (idx_t c = 0; c < 6; c++) {
+					row.push_back(Value(LogicalType::VARCHAR));
+				}
+				row.push_back(Value(LogicalType::BOOLEAN));
+			}
+			row.push_back(Value::BOOLEAN(lineage->approximate || lineage->truncated));
+			state->rows.push_back(std::move(row));
+		};
+		idx_t edges = 0;
+		for (auto &edge : lineage->edges) {
+			if (edge.source < 0 || idx_t(edge.source) >= lineage->datasets.size()) {
+				continue;
+			}
+			object_row(&edge);
+			edges++;
+		}
+		if (edges == 0) {
+			object_row(nullptr);
+		}
+	}
+	return std::move(state);
+}
+
+void LineageDefinitionsScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<LineageDefinitionsState>();
+	idx_t count = 0;
+	while (state.emitted < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows[state.emitted++];
+		for (idx_t c = 0; c < row.size(); c++) {
+			output.SetValue(c, count, row[c]);
+		}
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+} // namespace
+
 void RegisterAclLineage(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store,
                         const shared_ptr<AuditPipeline> &pipeline) {
 	{
@@ -832,6 +995,17 @@ void RegisterAclLineage(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 		flush.SetFallible();
 		flush.SetVolatile();
 		loader.RegisterFunction(flush);
+	}
+	for (auto argument : {LogicalType(LogicalTypeId::INVALID), LogicalType(LogicalType::VARCHAR),
+	                      LogicalType::LIST(LogicalType::VARCHAR)}) {
+		vector<LogicalType> arguments;
+		if (argument.id() != LogicalTypeId::INVALID) {
+			arguments.push_back(argument);
+		}
+		TableFunction definitions(Identifier("acl_lineage_definitions"), arguments, LineageDefinitionsScan,
+		                          LineageDefinitionsBind, LineageDefinitionsInit);
+		definitions.function_info = make_shared_ptr<LineageDefinitionsInfo>(store);
+		loader.RegisterFunction(definitions);
 	}
 	TableFunction events(Identifier("acl_lineage_events"), {}, LineageEventsScan, LineageEventsBind, LineageEventsInit);
 	events.function_info = make_shared_ptr<LineageFunctionInfo>(pipeline);

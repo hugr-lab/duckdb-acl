@@ -1197,6 +1197,24 @@ bool CatalogBackend::PrincipalMainCap(const Principal &principal, const string &
 	return false;
 }
 
+vector<string> CatalogBackend::PrincipalCatalogsWithCap(const Principal &principal, const string &capability) {
+	vector<string> out;
+	if (principal.roles.empty()) {
+		return out;
+	}
+	EnsureFresh();
+	auto result = Query(GrantsCte(principal) + "SELECT \"vcat\", \"caps\" FROM grants ORDER BY 1");
+	ResultRows rows(*result);
+	case_insensitive_set_t seen;
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		auto vcat = rows.GetValue(0, row).ToString();
+		if (EffectiveCaps(rows.GetValue(1, row)).count(capability) && seen.insert(vcat).second) {
+			out.push_back(vcat);
+		}
+	}
+	return out;
+}
+
 bool CatalogBackend::DdlTarget(const Principal &principal, const string &vname, const string &capability,
                                acl::DdlTarget &out) {
 	if (principal.roles.empty() || function_mode) {
@@ -2019,6 +2037,10 @@ bool PolicyStore::CatalogResolveFunction(const Principal &principal, const strin
 
 shared_ptr<const FunctionCategoryModel> PolicyStore::CatalogFunctionModel() {
 	return catalog->FunctionModel();
+}
+
+vector<string> PolicyStore::PrincipalCatalogsWithCap(const Principal &principal, const string &capability) {
+	return catalog ? catalog->PrincipalCatalogsWithCap(principal, capability) : vector<string>();
 }
 
 bool PolicyStore::CatalogPrincipalMainCap(const Principal &principal, const string &capability) {

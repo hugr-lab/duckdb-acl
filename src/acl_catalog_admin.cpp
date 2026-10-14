@@ -1154,6 +1154,39 @@ void PolicyStore::EmitDefinitionLineageNow(const string &vcat, const string &vna
 	}
 	// the definition as it now stands - read back after the commit, so every writer (add, alter,
 	// repair) reports the same thing: what a read of the object is made of
+	LineageWalk walk;
+	string dataset_type;
+	case_insensitive_set_t source_columns;
+	bool walked = false;
+	if (!RelationDefinitionWalk(vcat, vname, settings.max_edges, walk, dataset_type, walked, &source_columns)) {
+		if (dataset_type.empty()) {
+			return; // no such object (any more)
+		}
+		EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE", lifecycle, nullptr);
+		return;
+	}
+	vector<string> fields;
+	for (auto &output : walk.outputs) {
+		fields.push_back(output.name);
+	}
+	vector<AuditLineageTag> tags;
+	try {
+		tags = RoleTags(*this, *catalog, vcat, vname, fields, source_columns);
+	} catch (std::exception &) {
+		tags.clear(); // the tags could not be made: the definition still goes out
+	}
+	EmitDefinitionLineage(*audit, *db, vcat, vname, dataset_type, lifecycle, walked ? &walk : nullptr, tags);
+}
+
+bool PolicyStore::RelationDefinitionWalk(const string &vcat, const string &vname, idx_t max_edges, LineageWalk &walk,
+                                         string &dataset_type, bool &walked,
+                                         case_insensitive_set_t *source_columns_out) {
+	dataset_type.clear();
+	walked = false;
+	auto db = instance.lock();
+	if (!db || !catalog) {
+		return false;
+	}
 	string form, phys, view_sql, rls;
 	vector<string> items;
 	case_insensitive_set_t masks; // `c = expr` over a column the source has: a mask, not a computed column
@@ -1163,7 +1196,7 @@ void PolicyStore::EmitDefinitionLineageNow(const string &vcat, const string &vna
 		    catalog->Query("SELECT \"form\", \"phys\", \"view_sql\", \"rls\" FROM " + catalog->Tbl("relations") +
 		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
 		if (relation->RowCount() == 0) {
-			return;
+			return false;
 		}
 		ResultRows row(*relation);
 		auto text = [&](idx_t col) {
@@ -1173,6 +1206,7 @@ void PolicyStore::EmitDefinitionLineageNow(const string &vcat, const string &vna
 		phys = text(1);
 		view_sql = text(2);
 		rls = text(3);
+		dataset_type = form == "view" ? "VIEW" : "TABLE";
 		auto columns =
 		    catalog->Query("SELECT \"name\", \"expr\" FROM " + catalog->Tbl("relation_columns") +
 		                   " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) + " ORDER BY \"pos\"");
@@ -1194,8 +1228,10 @@ void PolicyStore::EmitDefinitionLineageNow(const string &vcat, const string &vna
 			}
 		}
 	} catch (std::exception &) {
-		EmitDefinitionLineage(*audit, *db, vcat, vname, "TABLE", lifecycle, nullptr);
-		return;
+		if (dataset_type.empty()) {
+			dataset_type = "TABLE"; // it may exist: the caller says what it could not read (approximate)
+		}
+		return false;
 	}
 	string sql;
 	if (form == "view") {
@@ -1204,13 +1240,11 @@ void PolicyStore::EmitDefinitionLineageNow(const string &vcat, const string &vna
 		sql = "SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " +
 		      NamePath::KeyToSql(phys) + (rls.empty() ? string() : " WHERE " + rls);
 	}
-	LineageWalk walk;
-	bool walked = false;
 	if (!sql.empty()) {
 		try {
 			// markers (acl_claim, acl_arg) baked the way a probe bakes them: the plan's shape, no value
-			walked = WalkDefinition(*db, BakeTemplateForProbe(sql, ParserOptions::Builtin(), false, {}),
-			                        settings.max_edges, walk);
+			walked =
+			    WalkDefinition(*db, BakeTemplateForProbe(sql, ParserOptions::Builtin(), false, {}), max_edges, walk);
 		} catch (std::exception &) {
 			walked = false;
 		}
@@ -1224,18 +1258,10 @@ void PolicyStore::EmitDefinitionLineageNow(const string &vcat, const string &vna
 			}
 		}
 	}
-	vector<string> fields;
-	for (auto &output : walk.outputs) {
-		fields.push_back(output.name);
+	if (source_columns_out) {
+		*source_columns_out = std::move(source_columns);
 	}
-	vector<AuditLineageTag> tags;
-	try {
-		tags = RoleTags(*this, *catalog, vcat, vname, fields, source_columns);
-	} catch (std::exception &) {
-		tags.clear(); // the tags could not be made: the definition still goes out
-	}
-	EmitDefinitionLineage(*audit, *db, vcat, vname, form == "view" ? "VIEW" : "TABLE", lifecycle,
-	                      walked ? &walk : nullptr, tags);
+	return true;
 }
 
 void PolicyStore::NoteFunctionLineage(const string &vcat, const string &vname, const string &lifecycle) {
