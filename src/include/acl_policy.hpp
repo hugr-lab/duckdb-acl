@@ -710,7 +710,8 @@ struct PolicyStore {
 	//! items that apply to this node (the cluster's, its group's over them), and the profile version the
 	//! node agent last reported applied (-1 = never)
 	string NodeGroup();
-	//! spec 118: acl_deployment = 'cluster' - the deployment's, never the policy's
+	//! spec 118: a cluster node (NodeTraits::cluster_node, the platform part's - hugr-node's hugr_node is one by
+	//! construction, its spec 002); never the policy's. An open node is standalone
 	bool ClusterNode();
 	//! spec 119: the node's acl_metadata_max_rows (0 = unlimited)
 	int64_t MetadataMaxRows();
@@ -727,7 +728,7 @@ struct PolicyStore {
 	//! spec 126: what the platform's part says about this node, set at load by the module that knows it. An open
 	//! node has none of it: standalone, no group (serves everyone), no profile to target
 	struct NodeTraits {
-		std::function<bool()> cluster_node;     //! acl_deployment = cluster: secrets only in the service
+		std::function<bool()> cluster_node;     //! a cluster node: secrets only in the service
 		std::function<string()> node_group;     //! acl_node_group, '' = none
 		std::function<bool()> node_group_known; //! the policy has the node's group (throws: a catalog not readable)
 		std::function<int64_t()> config_target; //! the profile's version (throws: no profile)

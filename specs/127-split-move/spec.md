@@ -116,3 +116,21 @@ node (hugr_node) behaves as today's acl with the cluster part. A node never load
   platform part registers those calls.
 - Gate (macOS, the open node): `test/sql/*` (103 files), test-cpp, integration, test-flight, test-e2e, harness,
   lints, schema-check.
+
+## Addendum - beside tresor in hugr_node (2026-10-14)
+
+hugr-node spec 002 builds tresor into `hugr_node` beside acl (tresor spec 024) and removes `acl_deployment` (a
+hugr_node node is a cluster node by construction). This repository's side:
+
+- **acl's OIDC definitions are properties of its own sources**, not of the target (tresor spec 024's follow-up):
+  `DUCKDB_EXT_COMMON_OIDC_NAMESPACE=acl` and, in the flight build, `DUCKDB_EXT_COMMON_OIDC_TLS=1` are set by
+  `acl_sources.cmake` on `EXTENSION_SOURCES` (exactly acl's there); `acl_configure_targets` keeps `ACL_FLIGHT_ENABLED`
+  and the libraries. In hugr_node the one target also compiles tresor's copy of the core (`duckdb::tresor::oidc`,
+  source-level `=tresor`), which a target-wide `=acl` reached as a redefinition on every tresor TU. Checked on the
+  release build's compile commands: all of acl's TUs (its sources, the quack embed, p256-m, the OIDC core) carry exactly
+  the two definitions, no duckdb TU carries either; only duckdb's generated `acl_describe.c` lost them (it never read
+  them).
+- The comments and docs that named `acl_deployment` name the trait (`NodeTraits::cluster_node`) and hugr_node.
+- **A test of the open node's identity** (`platform_views.test`): `console_info` says `standalone`, the `cluster`
+  bundle is not grantable, no `drift` view and no `cluster_*` call is offered - the case that left with the cluster
+  tests (spec 127 PR B) and was removed there by hugr-node spec 002.

@@ -179,17 +179,22 @@ endif()
 
 list(APPEND EXTENSION_SOURCES ${DUCKDB_EXT_COMMON_OIDC_SOURCES})
 
+# the OIDC core's namespace is the consumer's (duckdb-ext-common charter R13): ours is `acl`, so the module's names
+# are `duckdb::acl::oidc::...` in this image and nobody else's. A property of acl's own sources (EXTENSION_SOURCES is
+# exactly those here), not of a target: an embedder's one target may compile another consumer's copy of the core
+# too - hugr_node builds tresor in, whose copy is `duckdb::tresor::oidc` (tresor spec 024) - and a target-wide
+# definition would reach its sources. TLS, the flight build's (its OpenSSL), the same way
+set(ACL_OIDC_DEFINITIONS DUCKDB_EXT_COMMON_OIDC_NAMESPACE=acl)
+if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_FLIGHT})
+    list(APPEND ACL_OIDC_DEFINITIONS DUCKDB_EXT_COMMON_OIDC_TLS=1)
+endif()
+set_property(SOURCE ${EXTENSION_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS ${ACL_OIDC_DEFINITIONS})
+
 # acl's compile definitions and link libraries, on the targets the including build made
 function(acl_configure_targets)
-    # the OIDC core's namespace is the consumer's (duckdb-ext-common charter R13): ours is `acl`, so the
-    # module's names are `duckdb::acl::oidc::...` in this image and nobody else's
-    foreach(target ${ARGN})
-        target_compile_definitions(${target} PRIVATE DUCKDB_EXT_COMMON_OIDC_NAMESPACE=acl)
-    endforeach()
-
     if(NOT ${WASM_ENABLED} AND NOT DEFINED ENV{ACL_NO_FLIGHT})
         foreach(target ${ARGN})
-            target_compile_definitions(${target} PRIVATE ACL_FLIGHT_ENABLED=1 DUCKDB_EXT_COMMON_OIDC_TLS=1)
+            target_compile_definitions(${target} PRIVATE ACL_FLIGHT_ENABLED=1)
             target_link_libraries(${target}
                 ArrowFlightSql::arrow_flight_sql_static
                 ArrowFlight::arrow_flight_static

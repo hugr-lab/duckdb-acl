@@ -280,7 +280,7 @@ mode of default-deny is a refusal, and the refusal names the function.
 | --- | --- |
 | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE INTO` | rewritten (sections above) |
 | `EXPLAIN [ANALYZE]` | needs the explicit `explain` capability on the MAIN grant, then the inner statement is rewritten (spec 052) |
-| `CREATE`, `DROP` | tables and views under `create`/`drop`/`temp` (above); `SECRET` under the explicit `secrets` capability, constant parameters only - kept in the attached secrets service, never `TEMPORARY` there (spec 082); with no service attached (a standalone node, spec 118) kept by the node itself, `PERSISTENT` in its secret files on disk - there `secrets` administers every secret of the node, the operator's included; on a cluster node (`acl_deployment = 'cluster'`) only in the service |
+| `CREATE`, `DROP` | tables and views under `create`/`drop`/`temp` (above); `SECRET` under the explicit `secrets` capability, constant parameters only - kept in the attached secrets service, never `TEMPORARY` there (spec 082); with no service attached (a standalone node, spec 118) kept by the node itself, `PERSISTENT` in its secret files on disk - there `secrets` administers every secret of the node, the operator's included; on a platform node (hugr-node's `hugr_node`, a cluster node by construction) only in the service |
 | `PRAGMA` | `table_info`, `show_tables` answered; the rest denied by name (spec 031) |
 | `SET` / `RESET` | `TimeZone`, `Calendar` only, session scope, constant value, only on an `ACL SESSION` connection (spec 068) |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | pass through: "they are session control, not access" |

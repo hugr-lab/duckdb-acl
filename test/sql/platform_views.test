@@ -374,6 +374,15 @@ ACL ROLE "obs" SELECT bundles FROM platform.console_info();
 ----
 [observe]
 
+# the open node says what it is (spec 125; the platform part is hugr-node's since spec 127): standalone - the
+# cluster bundle is not grantable here, and nothing of a profile is offered: no drift, no cluster_* call
+query TTTI
+ACL ROLE "root" SELECT deployment, list_contains(scopes, 'cluster'), list_contains(my_views, 'drift'),
+    len(list_filter(my_functions, lambda f: f LIKE 'cluster_%'))
+FROM platform.console_info();
+----
+standalone	false	false	0
+
 # --- the view comment (spec 117 §7) and the stored catalog / schema comments ---------------------------
 
 query TT
