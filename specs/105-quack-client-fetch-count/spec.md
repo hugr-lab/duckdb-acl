@@ -82,3 +82,14 @@ without the fix.
 
 Under the same overload (24 copies), most reads end in `Timeout was reached error for HTTP POST` to
 the local door instead. That is a separate symptom, not investigated in this spec.
+
+## Addendum (2026-10-15): fixed upstream
+
+- duckdb/duckdb-quack#299 is closed by PR #305, merged into quack's main as e49149621f on 2026-10-15. It makes the
+  same reorder: the request is counted in flight before its index is claimed. It also calls `NoteError` on the
+  FETCH error path, so the attachment of a server that died mid-scan fails fast.
+- duckdb's `v2.0-cyanoptera` still pins quack 974927a (`.github/config/extensions/quack.cmake`; the last bump is
+  6c43df2d78, 2026-09-24). quack's main is 82 commits ahead, so the patch stays. We do not run quack ahead of
+  duckdb's pin for one fix.
+- The patch goes at the duckdb re-pin whose quack pin includes e49149621f. It no longer applies there, and the build
+  says so.
