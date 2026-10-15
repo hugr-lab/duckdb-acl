@@ -1083,6 +1083,8 @@ public:
 					refusal =
 					    "acl: the token endpoint of " + candidate.url + " is not a location this node reads: " + why;
 				} else {
+					// spec 130: the grant trusts ca_cert_file beside the system's roots, as the discovery did
+					oidc::CaBundleScope trust(state->store->CaBundle());
 					auto tokens = oidc::PasswordGrant(ep, candidate.client.client_id, candidate.client.client_secret,
 					                                  user, password);
 					if (!tokens.Ok()) {

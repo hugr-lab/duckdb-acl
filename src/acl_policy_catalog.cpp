@@ -2323,6 +2323,11 @@ string PolicyStore::JwksLocations() {
 	return catalog->SettingString("acl_jwks_locations", "https://");
 }
 
+string PolicyStore::CaBundle() {
+	Value value;
+	return InstanceSetting(instance, "ca_cert_file", value) ? value.ToString() : string();
+}
+
 //! spec 071: a location is allowed when it starts with one of the operator's prefixes, compared as
 //! written - no URL normalisation, so no normalisation bugs; the list is the operator's to shape
 bool PolicyStore::JwksLocationAllowed(const string &uri, string &why) {

@@ -19,6 +19,7 @@ from urllib.parse import parse_qs
 
 BASE = sys.argv[1]          # the issuer URL the door was configured with, e.g. http://localhost:32795
 PORT = int(sys.argv[2])
+# argv[3], argv[4] (optional): a certificate and its key - the IdP then serves https (spec 130)
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 KEY = os.path.join(ROOT, "test", "scripts", "fixtures", "rs256_key.pem")
 JWKS = json.load(open(os.path.join(ROOT, "test", "idp", "rs", "jwks.json")))
@@ -99,4 +100,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "invalid_grant"})
 
 
-HTTPServer(("localhost", PORT), Handler).serve_forever()
+server = HTTPServer(("localhost", PORT), Handler)
+if len(sys.argv) > 4:
+    # spec 130: https with a certificate a test CA signed, the CA known only to whoever is told of it
+    import ssl
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(sys.argv[3], sys.argv[4])
+    server.socket = tls.wrap_socket(server.socket, server_side=True)
+server.serve_forever()

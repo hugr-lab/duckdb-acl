@@ -1100,6 +1100,9 @@ struct PolicyStore {
 	//! judgement of one location against them - `why` says which list refused it
 	string JwksLocations();
 	bool JwksLocationAllowed(const string &uri, string &why);
+	//! spec 130: the CA bundle the OIDC core's own client trusts beside the system's roots on the doors' requests -
+	//! the instance's GLOBAL `ca_cert_file` (httpfs's setting; "" without httpfs or when unset), never the policy's
+	string CaBundle();
 	//! spec 071: what the node trusts right now - one row per issuer that reads its keys
 	struct JwksCacheRow {
 		string issuer, location, error;

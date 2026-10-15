@@ -235,6 +235,10 @@ fatal at once).
 **Spec 101**: a remote document is read WHOLE (`ReadDocumentText` sets `force_download` on its own
 connection): Entra ID's HEAD answers another page (HTML) than its GET, and httpfs's ranged read refused
 the size mismatch.
+**Spec 130**: the OIDC core's own client (a door's discovery, the Flight password grant, the quack provider
+secret's flows) trusts `ca_cert_file` BESIDE the system's roots - ext-common v0.13.0's `oidc::CaBundleScope`
+around each call, the door reading the instance's global value (`PolicyStore::CaBundle()`), the secret its
+context's; the discovery cache is keyed by issuer + bundle. httpfs (the key documents) trusts it INSTEAD of them.
 **Spec 071**: `acl_jwks_locations` (GLOBAL only, default `https://`) lists the prefixes every location
 the node reads keys from may start with (discovery, JWKS, a secret's `KEYS_FROM`); `..` is refused
 anywhere; a location outside it is refused where read (the node's setting binds, whatever a shared

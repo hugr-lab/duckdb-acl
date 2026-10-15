@@ -228,6 +228,7 @@ test-flight:
 	test/e2e/flight/adbc.sh
 	test/e2e/flight/tls.sh
 	test/e2e/flight/auth.sh
+	test/e2e/flight/ca_bundle.sh
 	test/e2e/flight/drain.sh
 	test/e2e/flight/stream.sh
 	test/e2e/flight/admin.sh

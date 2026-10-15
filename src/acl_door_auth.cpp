@@ -18,7 +18,8 @@ namespace {
 
 // process-wide on purpose: a discovery document is the issuer's public metadata, the same for every
 // database instance in the process, and fetching it once per instance would only multiply the round
-// trips - nothing per-principal or per-instance lives here
+// trips - nothing per-principal or per-instance lives here. Keyed by the issuer AND the CA bundle it was
+// read under (spec 130): an endpoint learned under one trust is never served under another
 std::mutex discovery_cache_lock; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::unordered_map<string, std::pair<oidc::Endpoints, std::chrono::steady_clock::time_point>>
     discovery_cache; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -39,10 +40,12 @@ oidc::Endpoints DiscoverEndpointsCached(PolicyStore &store, const string &issuer
 		refused.error = "the issuer's discovery is not read from here: " + why;
 		return refused;
 	}
+	auto bundle = store.CaBundle();
+	auto key = issuer + '\n' + bundle;
 	auto now = std::chrono::steady_clock::now();
 	{
 		std::lock_guard<std::mutex> guard(discovery_cache_lock);
-		auto entry = discovery_cache.find(issuer);
+		auto entry = discovery_cache.find(key);
 		if (entry != discovery_cache.end()) {
 			auto ttl = std::chrono::seconds(entry->second.first.Ok() ? 300 : 30);
 			if (now - entry->second.second < ttl) {
@@ -50,9 +53,11 @@ oidc::Endpoints DiscoverEndpointsCached(PolicyStore &store, const string &issuer
 			}
 		}
 	}
+	// spec 130: the OIDC core's own client trusts ca_cert_file beside the system's roots, for this call only
+	oidc::CaBundleScope trust(bundle);
 	auto ep = oidc::Discover(issuer);
 	std::lock_guard<std::mutex> guard(discovery_cache_lock);
-	discovery_cache[issuer] = {ep, now};
+	discovery_cache[key] = {ep, now};
 	return ep;
 }
 
