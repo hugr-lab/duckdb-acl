@@ -59,10 +59,22 @@ int64_t NowSeconds() {
 	    .count();
 }
 
+//! spec 130: the CA bundle the OIDC core's client trusts beside the system's roots - this context's
+//! `ca_cert_file` (httpfs's setting, read the way httpfs reads it), "" without httpfs or when unset
+string CaBundleOf(ClientContext &context) {
+	Value value;
+	if (!context.TryGetCurrentSetting(Identifier("ca_cert_file"), value) || value.IsNull()) {
+		return string();
+	}
+	return value.ToString();
+}
+
 //! Run the configured flow and return the token set; every refusal is the
 //! protocol's own, surfaced verbatim — never a silent fallback to another flow.
 oidc::TokenSet Acquire(ClientContext &context, const CreateSecretInput &input, const string &flow,
                        string &resolved_issuer) {
+	// every request below runs on this thread: the door's and the issuer's discovery, each grant, the device poll
+	oidc::CaBundleScope trust(CaBundleOf(context));
 	if (flow == "token") {
 		oidc::TokenSet out;
 		out.access_token = Require(input, "token", "token");

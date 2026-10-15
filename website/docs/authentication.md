@@ -397,6 +397,21 @@ The Handshake RPC answers two pre-auth questions unauthenticated:
 A payload-less, header-less handshake still succeeds and gates nothing (spec 058): the per-call
 Bearer header remains the real gate.
 
+## An IdP behind a private CA (spec 130)
+
+Point `ca_cert_file` at a PEM bundle that holds the CA (`SET GLOBAL ca_cert_file = '/etc/acl/ca.pem'`; it is
+httpfs's setting). The node reaches an IdP in two ways, and both trust that bundle:
+
+- **The key documents** (the discovery document and the JWKS) are read through httpfs. There the bundle
+  **replaces** the system's roots.
+- **The requests the node makes itself** go through the OIDC core's own client. These are a door's discovery
+  (Flight `discover-auth`, quack's `/.well-known/quack-auth`), the Flight password grant, and the flows of the
+  quack provider secret. There the bundle is trusted **beside** the system's roots.
+
+So a node that also reads a public IdP's keys needs the public roots in the bundle too. Verification is never
+turned off, and a bundle that cannot be read fails the request. A door reads the global value. The provider
+secret reads the value of the session that creates it.
+
 ## Settings
 
 All GLOBAL (`SET GLOBAL ...`); the store reads them through the instance, so a session-scoped `SET`
@@ -436,6 +451,7 @@ settings too (spec 095); the session settings need a policy catalog.
 | `token rejected: groups overage - the groups claim was replaced by a Graph link; resolve groups at the gateway and use the ROLE form` | Entra put too many groups to inline | use app roles, or resolve groups upstream |
 | `token rejected: no recognized roles` | no role value was mapped (or kept by `UNMAPPED AS ROLE`), no constant, or only a privileged role reached other than through the client's own mapping | `MAP … FROM CLIENT`, or create/grant the role the token names |
 | `token rejected: issuer "X" could not read "location": ...` | nothing cached and the read failed | the reason is duckdb's own (httpfs missing, 404, ...) |
+| `OIDC discovery against X failed: https request failed: SSL server verification failed` (also `discovery against "X" failed` from the provider secret) | the IdP's certificate is signed by a CA the node does not trust | set `ca_cert_file` to a bundle that holds the CA (spec 130) |
 | `token rejected: issuer "X" last read "location" N seconds ago and it is still unreadable (...); acl_jwks_max_stale is M` | the cached document is older than allowed | fix the location; raise `acl_jwks_max_stale` only knowingly |
 | `token rejected: issuer "X" reads "location", which this node does not: … is outside acl_jwks_locations (…)` | the location is not on this node's list (spec 071) | list its prefix in `acl_jwks_locations` |
 | `token rejected: the secret of issuer|client "X" (service.name) cannot be read` | the secrets service is down, detached, or the node may not `use` the secret | the service's own audit says why |
