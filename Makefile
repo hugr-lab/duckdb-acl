@@ -78,10 +78,12 @@ endif
 TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,$(TEST_CPP_DIR)/%,$(TEST_CPP_SOURCES))
 # `src/include` so a test can reach a seam the extension exposes to itself - spec 046's catalog
 # statement composition is a free function, and checking the text it produces needs its header.
+# utf8proc for the PEG parser's headers (spec 132's grammar extension: its transform sees a ParseResult).
 TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include \
 	-I src/quack_embed/include \
 	-I duckdb-ext-common/contracts -I duckdb-ext-common/oidc/include \
-	-I duckdb/third_party/httplib -I duckdb/third_party/yyjson/include
+	-I duckdb/third_party/httplib -I duckdb/third_party/yyjson/include \
+	-I duckdb/third_party/utf8proc/include
 
 # Link against the shared libduckdb, exactly like duckdb's own unittest: it already carries the
 # statically linked extensions (acl, core_functions, ... and the scanners of an integration build)

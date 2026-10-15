@@ -134,3 +134,19 @@ Existing pins that complete the picture: nested prefix (acl_admin_scopes.test), 
   produces *custom* nodes still needs enumeration to pass the gate.
 - `DialectExtension` appeared in the same registration surface upstream — watch what it becomes
   (QUESTION.md already asks; an opt-in dialect that can bypass rewriting would concern us).
+
+## Addendum (2026-10-15): the grammar API exists - spec 132
+
+The reopen condition above was met on 2026-09-04: duckdb #24919 (`79469d161a6`) added `GrammarExtension::Register`,
+and it reached our pins at eb0d9df. Our pin checks looked only at `GetMatcher` and missed it until the 7304f7b bump
+(spec 131).
+
+The contract gains a fourth row, pinned in `test/cpp/test_acl_foreign_parser.cpp`. The inner parse copies the
+caller's `ParserOptions`, so the remainder after the prefix parses with the connection's active grammar.
+
+- **A grammar extension's ordinary AST** is walked under the prefix like any statement: confined, not refused.
+- **A grammar statement that yields an `ExtensionStatement`** is refused, as a peeler's is.
+- **Choosing the grammar** is the connection owner's alone: `SET active_grammar_extensions` and
+  `SET current_dialect` are refused under every prefix. That answers the `DialectExtension` concern in the follow-ups.
+
+The prefix as a grammar rule (the port above) waits for v2.0.0; spec 132 has the reasons.
