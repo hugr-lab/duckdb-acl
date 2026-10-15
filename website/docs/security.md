@@ -597,6 +597,16 @@ are name leaks bounded to an already-granted principal.
   statement is an opaque `ExtensionStatement`: "an AST we cannot enumerate is an AST we cannot
   confine". It works only under `ACL NATIVE` (passthrough). An **unprefixed** foreign query "runs
   without the ACL - the same property every unprefixed query has" (spec 017).
+- **A grammar extension's syntax is confined, not refused (spec 132).** duckdb's grammar extensions
+  are opted into per connection (`SET active_grammar_extensions = [...]`, LOCAL only). The text after
+  the prefix parses with that connection's grammar. A statement the extension builds from ordinary AST
+  is therefore walked like any other: virtual names resolved, the grant's RLS and projection applied,
+  a physical name refused. One that yields an `ExtensionStatement` is refused as above.
+  - **The grammar is the connection owner's choice** (gateway, door, operator), never the principal's:
+    `SET active_grammar_extensions` and `SET current_dialect` are refused under every prefix, a
+    session's own included.
+  - **An active extension can change what ordinary SQL means**, since a transform may replace a core
+    rule's. Activate only extensions the node trusts, on the connections that need them.
 - **The function gate is default-deny by category** (spec 072): a newly loaded extension's functions
   are refused until the operator puts them in a category; quack's functions and `arrow_scan` are in
   the never set, which no grant re-opens.

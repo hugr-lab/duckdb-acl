@@ -12,15 +12,25 @@
 //                      foreign extension's syntax is no more privileged there than the SQL it
 //                      already allows (design/005 path 1).
 //
-// A grammar-extension API (rules + transforms producing ordinary AST) is not landed upstream yet;
-// when it lands, statements built from extended grammar arrive as AST the rewriter walks node by
-// node - ordinary nodes rewritten, unknown ones denied - and this file gains the parallel case.
+// Spec 132: duckdb's grammar extensions (rules + transforms, opted into per connection by
+// active_grammar_extensions) are the fourth row. Our inner parse uses the connection's grammar, so a
+// statement an extension builds from ordinary AST is walked under the prefix like any other - virtual
+// names resolved, the grant's RLS applied, a hidden name refused - while one that yields an
+// ExtensionStatement is denied as a peeler's is. The grammar is the connection owner's to choose: a
+// principal's SET of active_grammar_extensions is refused under every prefix.
 
 #include "acl_test_util.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/grammar_extension.hpp"
 #include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/parser/peg/parsed_grammar.hpp"
+#include "duckdb/parser/peg/transformer/peg_transformer.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/extension_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 
 using namespace duckdb;
 using namespace acl_test;
@@ -126,6 +136,68 @@ public:
 	}
 };
 
+//! Spec 132, ordinary AST: `FROM t |> WHERE p` is `SELECT * FROM t WHERE p` - the first stage of duckdb's pipe
+//! syntax demo, built from the core transforms of FromClause and WhereClause
+arena_ptr<TransformResultValue> FinalizePipeWhere(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<StarExpression>());
+	select_node->from_table = transformer.Transform<duckdb::unique_ptr<TableRef>>(list.GetChild(0));
+	select_node->where_clause = transformer.Transform<duckdb::unique_ptr<ParsedExpression>>(list.GetChild(2));
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(select_node);
+	return transformer.MakeResult<duckdb::unique_ptr<SelectStatement>>(std::move(statement));
+}
+
+arena_ptr<TransformProcess> StartPipeWhere(PEGTransformer &transformer, ParseResult &parse_result) {
+	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, FinalizePipeWhere);
+}
+
+class PipeWhereGrammar final : public GrammarExtension {
+public:
+	PipeWhereGrammar() : GrammarExtension("acl_test_pipe_where", "FROM t |> WHERE p (spec 132's test)") {
+	}
+	vector<GrammarChange> GetChanges() const override {
+		return {GrammarChange::AddRule("PipeWhereAtom <- FromClause '|>' WhereClause", StartPipeWhere),
+		        GrammarChange::PrependChoice("SelectAtom", "PipeWhereAtom")};
+	}
+};
+
+//! Spec 132, opaque: the statement `HONKING` is the toy peeler's ExtensionStatement, reached through the grammar
+arena_ptr<TransformResultValue> FinalizeHonking(PEGTransformer &transformer, ParseResult &) {
+	duckdb::unique_ptr<SQLStatement> statement =
+	    make_uniq<ExtensionStatement>(HonkExtension(), make_uniq<HonkParseData>(1));
+	return transformer.MakeResult<duckdb::unique_ptr<SQLStatement>>(std::move(statement));
+}
+
+arena_ptr<TransformProcess> StartHonking(PEGTransformer &transformer, ParseResult &parse_result) {
+	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, FinalizeHonking);
+}
+
+class HonkingGrammar final : public GrammarExtension {
+public:
+	HonkingGrammar() : GrammarExtension("acl_test_honking", "HONKING as an ExtensionStatement (spec 132's test)") {
+	}
+	vector<GrammarChange> GetChanges() const override {
+		return {GrammarChange::AddRule("HonkingStatement <- 'HONKING'", StartHonking),
+		        GrammarChange::AddChoice("Statement", "HonkingStatement")};
+	}
+};
+
+std::string OpenSession(Connection &con) {
+	auto result = con.Query("SELECT acl_session_open('tok')");
+	if (result->HasError() || result->RowCount() == 0) {
+		return std::string();
+	}
+	auto value = result->Collection().GetValue(0, 0);
+	return value.IsNull() ? std::string() : value.ToString();
+}
+
+bool Refused(QueryResult &result, const std::string &needle, const std::string &what) {
+	return Check(result.HasError() && result.GetError().find(needle) != string::npos,
+	             what + ": " + (result.HasError() ? result.GetError() : "it passed"));
+}
+
 void Run() {
 	DBConfig config;
 	// the toy is registered the way any co-loaded extension would register itself
@@ -161,6 +233,77 @@ void Run() {
 		          (refused->HasError() ? refused->GetError() : "it passed"));
 	});
 
+	// spec 132: the grammar extensions, registered as a co-loaded extension's Load would, and opted into by this
+	// connection - its owner's choice
+	GrammarExtension::Register(*db.instance, make_shared_ptr<PipeWhereGrammar>());
+	GrammarExtension::Register(*db.instance, make_shared_ptr<HonkingGrammar>());
+	Exec(con, "INSERT INTO phys.main.orders_physical VALUES (1, 'acme'), (2, 'globex'), (3, 'acme')");
+	Exec(con, "SELECT acl_grant_table('analyst','orders_rls','phys.main.orders_physical','id, tenant',"
+	          "'tenant = acl_claim(''tenant'')','select')");
+	Exec(con, "SET active_grammar_extensions = ['acl_test_pipe_where', 'acl_test_honking']");
+
+	Scenario("spec 132: the extended grammar parses bare", [&] {
+		auto rows = con.Query("FROM phys.main.orders_physical |> WHERE id > 1");
+		if (CheckOk(*rows, "the pipe statement answers")) {
+			Check(rows->RowCount() == 2, "...two rows past id 1: " + std::to_string(rows->RowCount()));
+		}
+		auto honks = con.Query("HONKING");
+		if (CheckOk(*honks, "the grammar's ExtensionStatement answers bare")) {
+			Check(honks->RowCount() == 1, "...one honk: " + std::to_string(honks->RowCount()));
+		}
+	});
+
+	Scenario("spec 132: under the prefix the extended grammar's AST is walked like any SELECT", [&] {
+		auto rows = con.Query("ACL TOKEN 'tok' FROM orders_rls |> WHERE id > 1");
+		if (CheckOk(*rows, "the pipe statement answers under the prefix")) {
+			// globex's row 2 is outside the slice: the grant's RLS applied to what the grammar built
+			Check(rows->RowCount() == 1 && rows->Collection().GetValue(0, 0).ToString() == "3",
+			      "...only acme's row past id 1: " + std::to_string(rows->RowCount()));
+		}
+		auto projected = con.Query("ACL TOKEN 'tok' FROM orders |> WHERE id > 0");
+		if (CheckOk(*projected, "the virtual name resolves in the grammar's FROM")) {
+			Check(projected->ColumnCount() == 1,
+			      "...and the grant's projection holds: " + std::to_string(projected->ColumnCount()) + " columns");
+		}
+		auto hidden_column = con.Query("ACL TOKEN 'tok' FROM orders |> WHERE tenant = 'acme'");
+		Refused(*hidden_column, "\"tenant\"", "a column the grant hides is not there for the grammar's WHERE either");
+		auto physical = con.Query("ACL TOKEN 'tok' FROM phys.main.orders_physical |> WHERE id > 0");
+		Refused(*physical, "phys", "a physical name stays unreachable through the grammar");
+	});
+
+	Scenario("spec 132: a grammar that yields an ExtensionStatement is denied like a peeler", [&] {
+		auto refused = con.Query("ACL TOKEN 'tok' HONKING");
+		Refused(*refused, "not permitted under ACL", "an opaque statement from the grammar");
+	});
+
+	Scenario("spec 132: the grammar is the connection owner's - a principal cannot change it", [&] {
+		auto by_token = con.Query("ACL TOKEN 'tok' SET active_grammar_extensions = []");
+		Refused(*by_token, "SET \"active_grammar_extensions\" is not permitted under ACL", "SET under ACL TOKEN");
+		auto by_role = con.Query("ACL ROLE \"analyst\" SET active_grammar_extensions = []");
+		Refused(*by_role, "SET \"active_grammar_extensions\" is not permitted under ACL", "SET under ACL ROLE");
+		// a dialect (DialectExtension) is chosen the same way, per connection - refused alike (spec 067's concern)
+		auto dialect = con.Query("ACL TOKEN 'tok' SET current_dialect = 'duckdb'");
+		Refused(*dialect, "SET \"current_dialect\" is not permitted under ACL", "SET current_dialect under ACL TOKEN");
+		auto handle = OpenSession(con);
+		if (Check(!handle.empty(), "a session opens for the token")) {
+			// a session of the client's own may set TimeZone (spec 068) - and nothing else
+			auto by_session = con.Query("ACL SESSION '" + handle + "' SET active_grammar_extensions = []");
+			Refused(*by_session, "SET \"active_grammar_extensions\" is not permitted under ACL",
+			        "SET under ACL SESSION");
+			auto session_dialect = con.Query("ACL SESSION '" + handle + "' SET current_dialect = 'duckdb'");
+			Refused(*session_dialect, "SET \"current_dialect\" is not permitted under ACL",
+			        "SET current_dialect under ACL SESSION");
+			auto local = con.Query("ACL SESSION '" + handle + "' SET TimeZone = 'UTC'");
+			Check(!local->HasError(),
+			      "...while the spec 068 allowlist still holds: " + (local->HasError() ? local->GetError() : string()));
+			Exec(con, "SELECT acl_session_close('" + handle + "')");
+		}
+		auto active = con.Query("SELECT current_setting('active_grammar_extensions')::VARCHAR");
+		Check(!active->HasError() &&
+		          active->Collection().GetValue(0, 0).ToString().find("acl_test_pipe_where") != string::npos,
+		      "the connection's grammar is unchanged");
+	});
+
 	Scenario("ACL NATIVE without passthrough stays refused - foreign syntax changes nothing", [&] {
 		auto refused = con.Query("ACL TOKEN 'tok' ACL NATIVE honk honk honk");
 		// the refusal fires even earlier than the passthrough gate: leaving the virtual catalog at
@@ -179,6 +322,13 @@ void Run() {
 		// and the virtual context still refuses the same principal - NATIVE is the only door
 		auto still = con.Query("ACL TOKEN 'tok' honk honk honk");
 		Check(still->HasError(), "the virtual context still refuses it for the same principal");
+		// spec 132: break-glass keeps the connection's grammar - both of its statements run there
+		auto piped = con.Query("ACL TOKEN 'tok' ACL NATIVE FROM phys.main.orders_physical |> WHERE id > 1");
+		if (CheckOk(*piped, "the pipe statement runs through NATIVE")) {
+			Check(piped->RowCount() == 2, "...on the physical table, unconfined: " + std::to_string(piped->RowCount()));
+		}
+		auto honking = con.Query("ACL TOKEN 'tok' ACL NATIVE HONKING");
+		CheckOk(*honking, "the grammar's ExtensionStatement runs through NATIVE");
 	});
 }
 

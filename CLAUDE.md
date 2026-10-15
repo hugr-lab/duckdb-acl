@@ -455,9 +455,12 @@ intact and load-bearing upstream. Foreign syntax under the prefix is a three-way
 `test/cpp/test_acl_foreign_parser.cpp`: bare — a co-loaded extension's token peeler works (loading
 acl costs nobody anything); in the virtual context — its opaque `ExtensionStatement` is
 default-denied (unenumerable ⇒ unconfinable); under `ACL NATIVE` — works, gated on the passthrough
-scope, never the syntax. Grammar-extension registration is not exposed upstream yet; when it lands,
-extended-grammar AST flows through the same inner parse (walked or denied per node) and the prefix
-itself becomes a grammar rule (design/014 spike; the upstream question is design/011/QUESTION.md).
+scope, never the syntax. **Spec 132**: duckdb's grammar extensions (#24919, `GrammarExtension::Register`,
+opted into per connection by the LOCAL `active_grammar_extensions`) are the fourth row - the inner parse
+copies the caller's `ParserOptions`, so a grammar extension's ordinary AST is walked under the prefix
+(confined, not refused) and one yielding an `ExtensionStatement` is denied; the grammar is the
+connection owner's (`SET active_grammar_extensions` / `current_dialect` refused under every prefix). CLI
+completion of `ACL …` and the prefix/management grammar as PEG rules wait (the latter for v2.0.0).
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
 attached catalog of type `tresor`, never its own secret manager. Under the explicit `secrets`

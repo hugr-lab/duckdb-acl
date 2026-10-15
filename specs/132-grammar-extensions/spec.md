@@ -1,6 +1,6 @@
 # Spec 132: grammar extensions under the ACL - what the API gives us
 
-- **Status**: draft
+- **Status**: implemented (uses 1 and 2, accepted by the owner 2026-10-15; 3 and 4 are follow-ups)
 - **Date**: 2026-10-15
 - **Author**: the agent, at the owner's ask ("давай откроем и посмотрим что полезного мы получим от грамматики")
 
@@ -84,10 +84,26 @@ whose transform builds a `SELECT * FROM <table>`, and a second rule that yields 
   - a table the role cannot see is refused;
   - the `ExtensionStatement` rule is denied.
 - **The setting**: `SET active_grammar_extensions = [...]` is refused under `ACL ROLE`, `ACL TOKEN` and
-  `ACL SESSION`.
+  `ACL SESSION`, and so is `SET current_dialect` (a `DialectExtension` is chosen the same way).
 - **Under `ACL NATIVE`** with passthrough: both rules work.
 
 Spec 067 gets an addendum: the API exists, and its contract gains the fourth row.
+
+## As built
+
+- **Code**: no change; uses 1 and 2 were already true, and the tests pin them.
+- **`test/cpp/test_acl_foreign_parser.cpp`** registers two grammar extensions, `acl_test_pipe_where` and
+  `acl_test_honking`, and activates them on the connection.
+  - `ACL TOKEN 'tok' FROM orders_rls |> WHERE id > 1` answers acme's row 3 only: the grant's RLS applied to what the
+    grammar built.
+  - `FROM orders |> …` keeps the grant's one column. A hidden column (`Referenced column "tenant" not found`) and the
+    physical name (`no access to object`) are refused.
+  - `HONKING` is denied as `statement type EXTENSION`.
+  - Both `SET`s are refused under TOKEN, ROLE and SESSION, while the session's `SET TimeZone` still passes.
+  - Under `ACL NATIVE` with passthrough, both statements run.
+- **Build**: the Makefile adds `third_party/utf8proc/include` to the C++ tests' include path, because the PEG headers
+  need it.
+- **Docs**: `security.md` describes grammar extensions under the prefix, and spec 067 has an addendum.
 
 ## Alternatives considered
 
