@@ -39,61 +39,31 @@ duckdb_extension_statically_link(icu)
 # from the duckdb submodule's own extension config, so they are the versions tested against the
 # exact duckdb commit we track.
 if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
-    # postgres_scanner: the submodule's own pin and patches. Until 2026-09-08 this was a pin of ours
-    # plus a patch restoring postgres_execute (PR #78): duckdb-postgres #552 had made it an alias of
-    # postgres_query, which prepares the SQL, and PostgreSQL refuses a multi-command string in a
-    # prepared statement - exactly what DuckLake's postgres metadata manager flushes per commit.
-    # Upstream fixed it from both sides (duckdb-postgres fffcb35, "Allow non-preparable queries in
-    # postgres_query"; ducklake 7f2f82c, the batches split), and the duckdb 2.0 release branch we
-    # track pins fffcb35 - so the submodule's include is the whole story again. (A pin change trips
-    # FetchContent's git-update on a stale _deps clone: wipe build/*/_deps/postgres_scanner_* and
-    # rebuild - CI is always fresh.)
-    include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/postgres_scanner.cmake)
-    # ducklake: the submodule's own pin and patches again, since 2026-09-17. From 2026-09-10 to then
-    # this was a pin of ours (c0a2060, ducklake's main of 2026-09-10) plus three patches in
-    # patches/ducklake/ (the TableCatalogEntry columns virtual, the merge-into action pipelines, the
-    # Literal API), because the branch's own pin (eb7b95d) flushed its postgres metadata as ONE
-    # multi-command string - refused by a prepared statement since duckdb-postgres #552 - and
-    # ducklake took the split only in 7f2f82c. The 2.0 branch now pins e8924cf (106 commits past
-    # 7f2f82c) and carries the equivalents of all three upstream, with its own patch for the unified
-    # QueryResult (#25477) on top - so the include is the whole story, as for postgres_scanner.
-    # (A pin change trips FetchContent's git-update on a stale _deps clone: wipe
-    # build/*/_deps/ducklake_extension_fc-* and rebuild - CI is always fresh.)
+    # postgres_scanner: duckdb-postgres's main (spec 131, ed73241 - the default application_name in a URI
+    # connection string), five commits past the 2.0 branch's pin 9671d2c on the same duckdb submodule; duckdb carries
+    # no patch for it. Until 2026-09-08 this was a pin of ours plus a patch restoring postgres_execute (PR #78);
+    # from then to spec 131 the submodule's own include. (A pin change trips FetchContent's git-update on a stale
+    # _deps clone: wipe build/*/_deps/postgres_scanner_* and rebuild - CI is always fresh.)
+    duckdb_extension_load(postgres_scanner
+        GIT_URL https://github.com/duckdb/duckdb-postgres
+        GIT_TAG ed7324179e993538b4bf907d403ce091fdc69f3c
+        SUBMODULES database-connector
+    )
+    # ducklake: ducklake's main (spec 131, 4e923e2), which builds against duckdb bde1b27 itself and already carries
+    # what the 2.0 branch patches its older pin (80e6155) with - so no patch, ours included: it calls
+    # `postgres_clear_cache` (spec 128's patches/ducklake/9001 is gone). From 2026-09-17 to spec 131 the submodule's
+    # own pin and patches; before that a pin of ours with three patches. Only the test build carries ducklake -
+    # nothing of it reaches acl's artifact. (A pin change trips FetchContent's git-update on a stale _deps clone:
+    # wipe build/*/_deps/ducklake_extension_fc-* and rebuild - CI is always fresh.)
     # Local caveat: ducklake has changed the layout of metadata version `1.1-dev1` in place before
     # (min_is_exact/max_is_exact, no version bump), so a lake a previous pin wrote can be unreadable
     # ("Referenced column ... not found"); CI starts its postgres empty, a developer's persistent
     # catalog is recreated (`DROP DATABASE ducklake_catalog; CREATE DATABASE ducklake_catalog;`).
-    #
-    # spec 128 (f702a1f): one patch of ours again, on top of the submodule's pin and patches. duckdb-postgres
-    # renamed `pg_clear_cache` to `postgres_clear_cache` (98ee7fc, in the branch's pin 57f857e) while ducklake - its
-    # pin and its main alike - still calls `CALL pg_clear_cache()` in the postgres metadata manager, so DuckLake on
-    # a PostgreSQL catalog fails at the head of the 2.0 branch. patches/ducklake/ renames the call. The declare
-    # below wins over the one register_external_extension makes for the same content name (CMake keeps the first),
-    # so its PATCH_COMMAND is the one that runs: duckdb's own ducklake patches and ours, copied into one directory
-    # (duckdb's script applies one directory and refuses a tree it already changed; ours sort last, 9xxx). The pin is
-    # read from the submodule's config, so it follows the submodule. Only the test build carries ducklake - nothing
-    # of it reaches acl's artifact. Drop it (back to the plain include) once ducklake calls the new name.
-    file(READ ${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/ducklake.cmake ACL_DUCKLAKE_CONFIG)
-    string(REGEX MATCH "GIT_TAG ([0-9a-f]+)" _ ${ACL_DUCKLAKE_CONFIG})
-    set(ACL_DUCKLAKE_PIN ${CMAKE_MATCH_1})
-    set(ACL_DUCKLAKE_PATCHES ${CMAKE_BINARY_DIR}/acl_patches/ducklake/)
-    file(REMOVE_RECURSE ${ACL_DUCKLAKE_PATCHES})
-    file(GLOB ACL_DUCKLAKE_PATCH_FILES ${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/patches/extensions/ducklake/*.patch
-         ${CMAKE_CURRENT_LIST_DIR}/patches/ducklake/*.patch)
-    file(COPY ${ACL_DUCKLAKE_PATCH_FILES} DESTINATION ${ACL_DUCKLAKE_PATCHES})
-    include(FetchContent)
-    if(NOT Python3_EXECUTABLE)
-        find_package(Python3 COMPONENTS Interpreter REQUIRED)
-    endif()
-    FetchContent_Declare(
-        ducklake_extension_fc
-        GIT_REPOSITORY https://github.com/duckdb/ducklake
-        GIT_TAG ${ACL_DUCKLAKE_PIN}
-        PATCH_COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/duckdb/scripts/apply_extension_patches.py
-                      ${ACL_DUCKLAKE_PATCHES}
-        SOURCE_SUBDIR __duckdb_no_add_subdirectory__
+    duckdb_extension_load(ducklake
+        LOAD_TESTS
+        GIT_URL https://github.com/duckdb/ducklake
+        GIT_TAG 4e923e26c34c9058daca2e7247177f49de0ab430
     )
-    include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/ducklake.cmake)
     duckdb_extension_statically_link(ducklake)
     # mysql_scanner: the submodule's own pin and patches. It was disabled at the submodule's pin until
     # 2026-10-12 ("patches do not apply"); the 664aafa pin (spec 123) builds it again, so the mysql
@@ -108,7 +78,7 @@ endif()
 if(DEFINED ENV{ACL_INTEGRATION_MSSQL} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(mssql
         GIT_URL https://github.com/hugr-lab/mssql-extension
-        GIT_TAG 3645903d2e43a1367aa13d66cd91a5a66e0180f6
+        GIT_TAG 7c75db25b647e7dd20b3d179571521ad5473273a
     )
 endif()
 
