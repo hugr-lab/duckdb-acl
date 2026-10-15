@@ -42,10 +42,11 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   duckdb only when `extension_config.cmake` names it with `duckdb_extension_statically_link` -
   `DONT_LINK` is gone (a FATAL_ERROR). We link acl, icu, ducklake and quack's json/autocomplete/httpfs;
   postgres/mysql/quack/mssql stay loadables by not being named.
-  Re-pin to the `v2.0.0` tag when it is cut; the scanners come from the submodule's own
-  extension pins (`.github/config/extensions/`), patches included - ducklake's too, with one patch of
-  ours on top since the f702a1f pin (spec 128: `patches/ducklake/` renames its `pg_clear_cache` call - duckdb-postgres
-  renamed the function - applied together with duckdb's by our own declare in `extension_config.cmake`). quack is the submodule's own pin
+  Re-pin to the `v2.0.0` tag when it is cut; httpfs and mysql_scanner come from the submodule's own
+  extension pins (`.github/config/extensions/`), patches included. Since the 7304f7b pin (spec 131) ducklake,
+  postgres_scanner and mssql are pins of ours at their own mains, which build against the 2.0 branch themselves
+  (ducklake main needs none of duckdb's patches for its older pin, and calls `postgres_clear_cache` - spec 128's
+  patch is gone). quack is the submodule's own pin
   (974927a since the 2026-09-30 pin, spec 090), with the patches duckdb
   carries for it applied to the loadable (`APPLY_PATCHES`) and, by `sync.py`, to the embedded
   server's copies alike (a patch that touches only quack's tests is skipped there, and says so).
