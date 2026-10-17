@@ -29,7 +29,7 @@ spec 105 patched in, and they also change the server our quack door embeds.
 - **The scanners at their mains** (spec 131's rule):
   - ducklake 4e923e2 → ca86db0, DuckLake v1.1: a catalog at 1.1-dev1 must be migrated;
   - duckdb-postgres ed73241 → c0f5a3c, which is also duckdb's own pin now;
-  - mssql-extension 7c75db2 → 404a9fd.
+  - mssql-extension 7c75db2 → 75e0fb6, its main re-pinned to f8f3f4d by its own session (no code change).
 
 acl-otel, tresor and hugr-node follow the same day.
 
@@ -54,6 +54,14 @@ The whole gate at the new pin:
   reads like duckdb's own quack block (spec 105 addendum).
 - **DuckLake v1.1** refuses a 1.1-dev1 catalog ("To automatically migrate, set AUTOMATIC_MIGRATION to TRUE"). CI
   starts empty. A developer's persistent catalog is recreated once, as the comment in `extension_config.cmake` says.
+- **Found by CI**:
+  - **The embed without TLS.** quack's headers now name `duckdb_httplib_openssl` themselves: the server's member and
+    the pinned client's. The linux job builds acl without OpenSSL, where only `duckdb_httplib` exists. The
+    namespace shim (`acl_quack_httplib_ns.hpp`) now aliases that way too. All ten embed TUs compile without TLS.
+  - **The distribution build took a prebuilt duckdb.** extension-ci-tools a90d6d4 (2026-10-15) hands the build a
+    prebuilt static duckdb (`DUCKDB_PREBUILT_LIBRARY`), which leaves no libduckdb for test-cpp. That build is the
+    only place test-cpp runs on Windows and macOS. acl's Makefile overrides the two variables and builds duckdb
+    from the pin as before; ci-tools stays unpinned.
 - **The gate**, all green:
   - `test/sql/*`: 9563 assertions in 104 test cases;
   - test-cpp: 26;
