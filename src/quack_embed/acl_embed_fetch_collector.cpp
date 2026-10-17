@@ -16,6 +16,7 @@
 
 #include "quack_message.hpp"
 #include "quack_rebalancer_sink.hpp"
+#include "quack_settings.hpp"
 
 namespace duckdb {
 

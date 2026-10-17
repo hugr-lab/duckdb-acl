@@ -13,6 +13,7 @@
 #include "duckdb/storage/buffer_manager.hpp"
 #include "quack_fetch_collector.hpp"
 #include "quack_rebalancer_sink.hpp"
+#include "quack_settings.hpp"
 #include "acl_lineage.hpp"
 #include "acl_quack_fetch_window.hpp"
 #include "acl_node_load.hpp"
@@ -342,7 +343,7 @@ idx_t AclQuackStreamReserve(DatabaseInstance &db, const ResourceLimits *limits) 
 	// what the server lets one stream hold: its producer buffer (as the server caps it: at most a
 	// quarter of the operator memory limit), and the batches in flight - the window's cap, or the
 	// client's whole read-ahead when the window grows without one
-	auto producer = SettingOr(db, "acl_quack_fetch_producer_buffer_bytes", QUACK_FETCH_PRODUCER_BUFFER_BYTES_DEFAULT);
+	auto producer = SettingOr(db, "acl_quack_fetch_producer_buffer_bytes", QUACK_SERVER_STREAM_BUFFER_BYTES_DEFAULT);
 	auto memory_cap = BufferManager::GetBufferManager(db).GetOperatorMemoryLimit() / 4;
 	if (producer > 0 && memory_cap > 0) {
 		producer = MinValue<idx_t>(producer, memory_cap);

@@ -18,6 +18,7 @@
 #include "quack_fetch_collector.hpp"
 #include "quack_message.hpp"
 #include "quack_rebalancer_sink.hpp"
+#include "quack_settings.hpp"
 
 #include <chrono>
 

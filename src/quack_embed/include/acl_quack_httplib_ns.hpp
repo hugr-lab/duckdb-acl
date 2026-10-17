@@ -8,8 +8,9 @@
 // terminate TLS itself; this force-included shim aliases the name quack expects
 // back onto the OpenSSL namespace, so quack's sources compile UNCHANGED and the
 // listener can reach `duckdb_httplib::SSLServer`. In a non-TLS build the macro is
-// undefined, no alias is made, and quack uses the real `duckdb_httplib` — so this
-// header is a no-op there. Force-included via -include on the embed graph only.
+// undefined and the alias runs the other way: quack's headers name
+// `duckdb_httplib_openssl` since e7a9be3, which then means the core's httplib (spec 133).
+// Force-included via -include on the embed graph only.
 //===----------------------------------------------------------------------===//
 #pragma once
 
@@ -27,4 +28,8 @@
 // The embedded quack TUs never pull the core's non-TLS httplib, so `duckdb_httplib`
 // is a free name here and this alias cannot clash with a real namespace of that name.
 namespace duckdb_httplib = duckdb_httplib_openssl;
+#else
+// Since quack e7a9be3 (spec 133) its headers name `duckdb_httplib_openssl` themselves (the server's member,
+// the pinned client's): in a build without TLS that name is free, and it means the core's httplib.
+namespace duckdb_httplib_openssl = duckdb_httplib;
 #endif

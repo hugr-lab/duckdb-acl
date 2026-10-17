@@ -46,6 +46,11 @@ endif
 endif
 
 # Include the Makefile from extension-ci-tools
+# Spec 133: extension-ci-tools a90d6d4 (2026-10-15) hands the distribution build a prebuilt static duckdb
+# (DUCKDB_PREBUILT_LIBRARY / _EXTENSIONS). That leaves no libduckdb to link test-cpp against, and the distribution
+# build is the only place it runs on Windows and macOS. acl builds duckdb from the pinned source as before.
+override DUCKDB_PREBUILT_LIBRARY :=
+override DUCKDB_PREBUILT_EXTENSIONS :=
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # --- Standalone C++ invariant tests (specs/002-cpp-invariant-tests) ---------
