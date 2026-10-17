@@ -69,3 +69,14 @@ The whole gate at the new pin:
   - test-e2e: postgres, mssql, ducklake and the pair, plus types;
   - test-integration: 539 assertions;
   - harness, schema-check, the thread_local and fold lints, clang-format.
+
+## Addendum (2026-10-17): mssql-extension 986fd19
+
+mssql-extension's main moved to 986fd19, at the same duckdb f8f3f4d (its PR #490). It fixes #489: a value past SQL
+Server's 2^31-1-byte MAX limit is now refused by name on every write path. On the columnar BCP path (COPY, CTAS,
+INSERT through BCP), such a value used to be silently truncated (ASCII) or to overflow the client's chunk buffer
+(non-ASCII). The pin follows, by spec 131's rule. hugr-node ships mssql from these pins, so the fix reaches it at its
+next acl re-pin.
+
+The door e2e (postgres, mssql, ducklake and the pair, plus types) and test-integration (539 assertions) pass at
+986fd19.
