@@ -78,7 +78,7 @@ endif()
 if(DEFINED ENV{ACL_INTEGRATION_MSSQL} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(mssql
         GIT_URL https://github.com/hugr-lab/mssql-extension
-        GIT_TAG 75e0fb6d39dcbb244d08271b9922931623257cc6
+        GIT_TAG 986fd19128e0694a54b3ce2165648a00ba16ace3
     )
 endif()
 
