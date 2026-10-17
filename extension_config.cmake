@@ -46,7 +46,7 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
     # _deps clone: wipe build/*/_deps/postgres_scanner_* and rebuild - CI is always fresh.)
     duckdb_extension_load(postgres_scanner
         GIT_URL https://github.com/duckdb/duckdb-postgres
-        GIT_TAG ed7324179e993538b4bf907d403ce091fdc69f3c
+        GIT_TAG c0f5a3c0c4b68b02afbf669d36d7f0e503985c88
         SUBMODULES database-connector
     )
     # ducklake: ducklake's main (spec 131, 4e923e2), which builds against duckdb bde1b27 itself and already carries
@@ -62,7 +62,7 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(ducklake
         LOAD_TESTS
         GIT_URL https://github.com/duckdb/ducklake
-        GIT_TAG 4e923e26c34c9058daca2e7247177f49de0ab430
+        GIT_TAG ca86db02880fa8116fc1083869e54e47d138899d
     )
     duckdb_extension_statically_link(ducklake)
     # mysql_scanner: the submodule's own pin and patches. It was disabled at the submodule's pin until
@@ -78,7 +78,7 @@ endif()
 if(DEFINED ENV{ACL_INTEGRATION_MSSQL} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(mssql
         GIT_URL https://github.com/hugr-lab/mssql-extension
-        GIT_TAG 7c75db25b647e7dd20b3d179571521ad5473273a
+        GIT_TAG 404a9fd9f9ec18734310f3da40e8ebd6999e1f7d
     )
 endif()
 
@@ -89,65 +89,23 @@ endif()
 # quack needs json + autocomplete (core) and httpfs, which it pins itself; we take duckdb's own pin
 # so everything builds against the commit we track.
 #
-# quack's pin is the duckdb submodule's own (`.github/config/extensions/quack.cmake`): 974927a, quack
-# #278 of 2026-09-29 (CONNECT out of the transaction mechanism, the self-CONNECT guard, duckdb's
-# v2.0-cyanoptera patches applied) - taken with the 2026-09-30 duckdb pin (spec 090). It builds with
-# the patches duckdb carries for that pin (APPLY_PATCHES: the function-signature options; 0001
-# touches a test only) - and
-# the embedded server (third_party/quack) is the same commit, its copies patched the same way by
-# sync.py. The block is ours rather than an include of duckdb's file for two reasons: quack is never
-# named in duckdb_extension_statically_link (the client must stay a loadable, or its symbols and the
-# embed's - both define duckdb::QuackServer & co. - meet in one static link, spec 063 strategy B; it
-# was DONT_LINK before duckdb #26189), and no LOAD_TESTS (quack's own sqllogic suite is duckdb's CI's
-# business, not ours).
+# quack's pin is the duckdb submodule's own (`.github/config/extensions/quack.cmake`): e7a9be3 since the f8f3f4d pin
+# (spec 133; 974927a from spec 090 to then). It builds with the patches duckdb carries for that pin (APPLY_PATCHES),
+# and the embedded server (third_party/quack) is the same commit, its copies patched the same way by sync.py. Spec
+# 105's own patch to the client (duckdb-quack#299) left with this pin: e7a9be3 carries the fix (#305). The block is
+# ours rather than an include of duckdb's file for two reasons: quack is never named in
+# duckdb_extension_statically_link (the client must stay a loadable, or its symbols and the embed's - both define
+# duckdb::QuackServer & co. - meet in one static link, spec 063 strategy B; it was DONT_LINK before duckdb #26189), and
+# no LOAD_TESTS (quack's own sqllogic suite is duckdb's CI's business, not ours).
 if(DEFINED ENV{ACL_QUACK} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(json)
     duckdb_extension_load(autocomplete)
     include(${CMAKE_CURRENT_LIST_DIR}/duckdb/.github/config/extensions/httpfs.cmake)
     duckdb_extension_statically_link(json autocomplete httpfs)
-    # Spec 105: our own patches to the quack CLIENT, on top of duckdb's (APPLY_PATCHES reads only duckdb's
-    # directory). Each is upstream-bound and leaves when quack takes it (0001: duckdb/duckdb-quack#299).
-    #   0001: count a FETCH in flight before claiming its index - the client could end a stream one batch
-    #         short ("N-1 of N batches received"): CI's acl_quack_fetch_window.test, 2026-10-07.
-    # duckdb's patch step refuses a clone with changes beyond its own patches ("Detected local changes"),
-    # and it re-runs whenever FetchContent re-populates - so ours come OFF before duckdb_extension_load
-    # and go back ON after it. A local checkout (DUCKDB_QUACK_DIRECTORY, DUCKDB_NEW_EXTENSION_BUILD) is
-    # the developer's own tree and is left alone.
-    file(GLOB ACL_QUACK_CLIENT_PATCHES ${CMAKE_CURRENT_LIST_DIR}/patches/quack/*.patch)
-    list(SORT ACL_QUACK_CLIENT_PATCHES)
-    set(ACL_QUACK_CLIENT_REVERSED ${ACL_QUACK_CLIENT_PATCHES})
-    list(REVERSE ACL_QUACK_CLIENT_REVERSED)
-    if(DEFINED FETCHCONTENT_BASE_DIR)
-        set(ACL_QUACK_CLIENT_SRC ${FETCHCONTENT_BASE_DIR}/quack_extension_fc-src)
-    else()
-        set(ACL_QUACK_CLIENT_SRC ${CMAKE_BINARY_DIR}/_deps/quack_extension_fc-src)
-    endif()
-    if(EXISTS ${ACL_QUACK_CLIENT_SRC}/.git)
-        foreach(ACL_PATCH IN LISTS ACL_QUACK_CLIENT_REVERSED)
-            execute_process(COMMAND git apply --reverse --check ${ACL_PATCH} WORKING_DIRECTORY ${ACL_QUACK_CLIENT_SRC}
-                            RESULT_VARIABLE ACL_PATCH_APPLIED OUTPUT_QUIET ERROR_QUIET)
-            if(ACL_PATCH_APPLIED EQUAL 0)
-                execute_process(COMMAND git apply --reverse ${ACL_PATCH} WORKING_DIRECTORY ${ACL_QUACK_CLIENT_SRC})
-            endif()
-        endforeach()
-    endif()
     duckdb_extension_load(quack
         GIT_URL https://github.com/duckdb/duckdb-quack
-        GIT_TAG 974927a394b188755284682b73398ed50e86316c
+        GIT_TAG e7a9be3f8c1c3be5946e534c96f15b56b81dc026
         SUBMODULES extension-ci-tools
         APPLY_PATCHES
     )
-    FetchContent_GetProperties(quack_extension_fc SOURCE_DIR ACL_QUACK_FETCHED)
-    if("${ACL_QUACK_FETCHED}" STREQUAL "")
-        message(WARNING "spec 105: the quack client is not a fetched clone - patches/quack/ is NOT applied")
-        set(ACL_QUACK_CLIENT_PATCHES "")
-    endif()
-    foreach(ACL_PATCH IN LISTS ACL_QUACK_CLIENT_PATCHES)
-        execute_process(COMMAND git apply ${ACL_PATCH} WORKING_DIRECTORY ${ACL_QUACK_FETCHED}
-                        RESULT_VARIABLE ACL_PATCH_RESULT)
-        if(NOT ACL_PATCH_RESULT EQUAL 0)
-            message(FATAL_ERROR "spec 105: ${ACL_PATCH} does not apply to the quack client at ${ACL_QUACK_FETCHED}")
-        endif()
-        message(STATUS "spec 105: quack client patched with ${ACL_PATCH}")
-    endforeach()
 endif()

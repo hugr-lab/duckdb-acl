@@ -47,7 +47,7 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   postgres_scanner and mssql are pins of ours at their own mains, which build against the 2.0 branch themselves
   (ducklake main needs none of duckdb's patches for its older pin, and calls `postgres_clear_cache` - spec 128's
   patch is gone). quack is the submodule's own pin
-  (974927a since the 2026-09-30 pin, spec 090), with the patches duckdb
+  (e7a9be3 since the f8f3f4d pin, spec 133; 974927a from spec 090), with the patches duckdb
   carries for it applied to the loadable (`APPLY_PATCHES`) and, by `sync.py`, to the embedded
   server's copies alike (a patch that touches only quack's tests is skipped there, and says so).
 - **Dependencies**: none (no vcpkg/OpenSSL). The **shared repository** `duckdb-ext-common` is a

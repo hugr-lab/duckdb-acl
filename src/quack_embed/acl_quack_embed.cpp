@@ -18,6 +18,7 @@
 
 #include "quack_scan_from_client.hpp"
 #include "quack_rebalancer_sink.hpp"
+#include "quack_settings.hpp"
 
 namespace duckdb {
 
@@ -67,7 +68,7 @@ void RegisterAclQuackEmbed(ExtensionLoader &loader) {
 	                          LogicalType::UBIGINT, Value::UBIGINT(QUACK_REBALANCE_BUFFER_BYTES_DEFAULT));
 	config.AddExtensionOption("acl_quack_fetch_producer_buffer_bytes",
 	                          "acl embedded door: server-side cap on bytes the fetch collector buffers ahead",
-	                          LogicalType::UBIGINT, Value::UBIGINT(QUACK_FETCH_PRODUCER_BUFFER_BYTES_DEFAULT));
+	                          LogicalType::UBIGINT, Value::UBIGINT(QUACK_SERVER_STREAM_BUFFER_BYTES_DEFAULT));
 	// spec 077: what the server does about #277 itself - past the window's batches with rows above the
 	// client's ack, a FETCH is answered at once with an empty batch, so an early stop costs the window;
 	// the window doubles while the client keeps reading, up to the max

@@ -47,7 +47,8 @@ RENAMES = {
     '"quack_debug_emit_delay_ms"': '"acl_quack_debug_emit_delay_ms"',
     '"quack_target_batch_bytes"': '"acl_quack_target_batch_bytes"',
     '"quack_rebalance_buffer_bytes"': '"acl_quack_rebalance_buffer_bytes"',
-    '"quack_fetch_producer_buffer_bytes"': '"acl_quack_fetch_producer_buffer_bytes"',
+    # quack 536effa renamed its quack_fetch_producer_buffer_bytes; acl's setting keeps its name (spec 133)
+    '"quack_server_stream_buffer_bytes"': '"acl_quack_fetch_producer_buffer_bytes"',
     '"quack_enable_reconnects"': '"acl_quack_enable_reconnects"',
     '"quack_cache_max_rows"': '"acl_quack_cache_max_rows"',
     '"quack_result_ttl"': '"acl_quack_result_ttl"',
@@ -90,7 +91,7 @@ PATCHES = {
             "\t\tconfig.get_result_collector = nullptr;\n"
             "\t\tif (result->HasError()) {\n",
             "\t\t// acl (spec 074): whether this statement is profiled is decided before it runs\n"
-            "\t\tacl::AclQuackStatementStarting(*connection.duckdb_connection, connection.session_id);\n"
+            "\t\tacl::AclQuackStatementStarting(*connection.duckdb_connection, connection.connection_id);\n"
             "\t\tunique_ptr<QueryResult> result;\n"
             "\t\ttry {\n"
             "\t\t\t// acl (spec 080): a place in the node's stream budget while the statement produces - it\n"
@@ -104,7 +105,7 @@ PATCHES = {
             "\t\t}\n"
             "\t\tconfig.get_result_collector = nullptr;\n"
             "\t\t// acl (spec 069): the outcome of every statement the server drives\n"
-            "\t\tacl::AclQuackStatementCompleted(*connection.duckdb_connection, connection.session_id, sql, *result);\n"
+            "\t\tacl::AclQuackStatementCompleted(*connection.duckdb_connection, connection.connection_id, sql, *result);\n"
             "\t\tif (result->HasError()) {\n",
         ),
         # spec 077, the fetch window: a quack client keeps 64 FETCHes in flight and waits for all of
@@ -113,8 +114,8 @@ PATCHES = {
         # handler asks the plan which produced batch an index gets - the retry path (`served`), the
         # pop, the header and the retain stay quack's - and the terminal total counts the empties.
         (
-            "\t\tauto dense_ack = fetch_request_message.ack_index + stream->prepare_batches;\n",
-            "\t\tauto dense_ack = fetch_request_message.ack_index + stream->prepare_batches;\n"
+            "\t\tauto dense_ack = fetch_request_message.AckIndex() + stream->prepare_batches;\n",
+            "\t\tauto dense_ack = fetch_request_message.AckIndex() + stream->prepare_batches;\n"
             "\t\t// acl (spec 077): past the client's window an index is answered by an empty batch\n"
             "\t\tauto window = acl::AclQuackFetchWindowFor(*connection.duckdb_connection->context, stream, db);\n",
         ),
@@ -142,7 +143,7 @@ PATCHES = {
             "\t\t\t\t\t} else if (answer.kind == acl::AclFetchWindowPlan::Kind::EMPTY) {\n"
             "\t\t\t\t\t\thold = acl::AclQuackEmptyHold(*window, *stream, dense_index);\n"
             "\t\t\t\t\t\tif (hold == acl::AclFetchWindowPlan::Hold::NONE) {\n"
-            "\t\t\t\t\t\t\tserved_batch = acl::AclQuackEmptyBatch(*window, *stream, fetch_request_message.batch_index,\n"
+            "\t\t\t\t\t\t\tserved_batch = acl::AclQuackEmptyBatch(*window, *stream, fetch_request_message.BatchIndex(),\n"
             "\t\t\t\t\t\t\t                                      served_start);\n"
             "\t\t\t\t\t\t\tstream->served.emplace(dense_index,\n"
             "\t\t\t\t\t\t\t                       QuackResultStream::RetainedPayload {served_batch, served_start, 0});\n"
@@ -195,7 +196,7 @@ PATCHES = {
         # connections whose heartbeat lease ran out are swept first (quack only notices them when
         # they send again), so a client that vanished frees its seat.
         (
-            "\t\tstring session_id = GenerateSessionId();\n"
+            "\t\tstring connection_id = GenerateConnectionId();\n"
             "\t\tauto auth = EvaluateAuthQuery(\n",
             "\t\t// acl (spec 079): the node's seats, decided before a session is opened\n"
             "\t\tidx_t acl_seated = 0;\n"
@@ -221,7 +222,7 @@ PATCHES = {
             "\t\t\t}\n"
             "\t\t\tfor (auto &connection : lapsed) {\n"
             "\t\t\t\tCleanupExpiredConnection(*connection);\n"
-            "\t\t\t\tacl::AclQuackConnectionGone(db, connection->session_id, \"idle\");\n"
+            "\t\t\t\tacl::AclQuackConnectionGone(db, connection->connection_id, \"idle\");\n"
             "\t\t\t}\n"
             "\t\t}\n"
             "\t\t// held until this handler returns: the connection below is created or refused by then\n"
@@ -230,21 +231,21 @@ PATCHES = {
             "\t\tif (!acl_seat.Granted()) {\n"
             "\t\t\treturn make_uniq<ErrorResponse>(acl_refusal);\n"
             "\t\t}\n"
-            "\t\tstring session_id = GenerateSessionId();\n"
+            "\t\tstring connection_id = GenerateConnectionId();\n"
             "\t\tauto auth = EvaluateAuthQuery(\n",
         ),
         # spec 079: a connection the server drops ends its acl session at once - quack's own DISCONNECT
         # and a heartbeat lease noticed expired - instead of the session waiting out
         # acl_session_idle_timeout (15 min) with no client behind it
         (
-            "\t\tif (!DisconnectConnection(connection.session_id)) {\n"
+            "\t\tif (!DisconnectConnection(connection.connection_id)) {\n"
             "\t\t\treturn make_uniq<ErrorResponse>(\"Connection does not exist / already disconnected\");\n"
             "\t\t}\n",
-            "\t\tif (!DisconnectConnection(connection.session_id)) {\n"
+            "\t\tif (!DisconnectConnection(connection.connection_id)) {\n"
             "\t\t\treturn make_uniq<ErrorResponse>(\"Connection does not exist / already disconnected\");\n"
             "\t\t}\n"
             "\t\t// acl (spec 079): the session bound to the connection ends with it\n"
-            "\t\tacl::AclQuackConnectionGone(db, connection.session_id, \"client\");\n",
+            "\t\tacl::AclQuackConnectionGone(db, connection.connection_id, \"client\");\n",
         ),
         (
             "\tCleanupExpiredConnection(*expired_connection);\n"
@@ -275,9 +276,10 @@ PRISTINE_GUARDS = {
 FILES = {
     "quack_server.cpp": [
         '"quack_authentication_function"', '"quack_authorization_function"',
-        '"quack_prepare_inline_rows"', '"quack_fetch_producer_buffer_bytes"',
-        'scan_data_from_quack_client',
+        '"quack_prepare_inline_rows"', 'scan_data_from_quack_client',
     ],
+    # quack ef9231a/536effa: the stream buffer's getter moved here
+    "quack_settings.cpp": ['"quack_server_stream_buffer_bytes"'],
     "quack_result_cache.cpp": [
         '"quack_enable_reconnects"', '"quack_cache_max_rows"', '"quack_result_ttl"',
     ],

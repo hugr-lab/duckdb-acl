@@ -93,3 +93,8 @@ the local door instead. That is a separate symptom, not investigated in this spe
   duckdb's pin for one fix.
 - The patch goes at the duckdb re-pin whose quack pin includes e49149621f. It no longer applies there, and the build
   says so.
+
+## Addendum (2026-10-17): the patch is gone
+
+duckdb f8f3f4d (spec 133) pins quack e7a9be3, which carries e49149621f. `patches/quack/` and the cmake that applied it
+are removed, and the quack client builds as duckdb's config says.
