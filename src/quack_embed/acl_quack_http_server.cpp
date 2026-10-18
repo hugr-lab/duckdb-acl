@@ -399,6 +399,18 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 	server->Post("/quack", [&](const duckdb_httplib::Request &req, duckdb_httplib::Response &res,
 	                           const duckdb_httplib::ContentReader &content_reader) {
 		res.set_header("Access-Control-Allow-Origin", "*");
+		// spec 134: the node's label, for a front that keeps the connection on this node by cookie - set
+		// before the message is handled, so every answer carries it, a refusal included
+		if (auto owner = db_ptr.lock()) {
+			vector<string> cookies;
+			for (auto range = req.headers.equal_range("Cookie"); range.first != range.second; ++range.first) {
+				cookies.push_back(range.first->second);
+			}
+			auto cookie = acl::AclQuackNodeLabelCookie(*owner, cookies);
+			if (!cookie.empty()) {
+				res.set_header("Set-Cookie", cookie);
+			}
+		}
 		MemoryStream stream;
 		content_reader([&](const char *data, size_t data_length) {
 			stream.WriteData((data_ptr_t)data, data_length);

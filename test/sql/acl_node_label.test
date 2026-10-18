@@ -1,0 +1,83 @@
+# name: test/sql/acl_node_label.test
+# description: the node's label in its sessions' names (spec 134) - the setting and the load report. The
+#   doors' cookie and the quack connection id are test/cpp/test_acl_quack_embed.cpp's (quack) and
+#   test/e2e/flight/run.sh's (Flight); the rules themselves test/cpp/test_acl_node_label.cpp's.
+# group: [acl]
+
+require acl
+
+# --- unset by default: no name carries a label, and the report says so -----------------------------------
+
+query I
+SELECT current_setting('acl_node_label');
+----
+(empty)
+
+query I
+SELECT acl_node_load() LIKE '%"label":null%';
+----
+true
+
+# --- a DNS label is the node's, and the report names it ---------------------------------------------------
+
+statement ok
+SET GLOBAL acl_node_label = 'node-1';
+
+query I
+SELECT current_setting('acl_node_label');
+----
+node-1
+
+query I
+SELECT acl_node_load() LIKE '%"label":"node-1"%';
+----
+true
+
+# --- anything else is refused, and the label stays what it was --------------------------------------------
+
+statement error
+SET GLOBAL acl_node_label = 'Node_1';
+----
+<REGEX>:.*acl_node_label: "Node_1" is not a DNS label.*
+
+statement error
+SET GLOBAL acl_node_label = 'a.b';
+----
+<REGEX>:.*is not a DNS label.*
+
+statement error
+SET GLOBAL acl_node_label = '-node';
+----
+<REGEX>:.*is not a DNS label.*
+
+statement error
+SET GLOBAL acl_node_label = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+----
+<REGEX>:.*is not a DNS label.*
+
+statement ok
+SET GLOBAL acl_node_label = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+statement ok
+SET GLOBAL acl_node_label = 'node-1';
+
+# the doors read the global: a session-scoped value would be shown and ignored
+statement error
+SET acl_node_label = 'node-2';
+----
+<REGEX>:.*acl_node_label is global - use SET GLOBAL.*
+
+query I
+SELECT current_setting('acl_node_label');
+----
+node-1
+
+# --- '' is no label again ------------------------------------------------------------------------------------
+
+statement ok
+SET GLOBAL acl_node_label = '';
+
+query I
+SELECT acl_node_load() LIKE '%"label":null%';
+----
+true

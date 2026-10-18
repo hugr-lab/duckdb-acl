@@ -37,6 +37,7 @@
 #include "duckdb/common/types/blob.hpp"
 #include "acl_door_auth.hpp"
 #include "acl_door_common.hpp"
+#include "acl_node_label.hpp"
 #include "acl_node_load.hpp"
 #include "oidc_core.hpp"
 #include "acl_profile.hpp"
@@ -798,66 +799,83 @@ string MintCookieId() {
 	return MintRandomHex(16); // bearer-grade bytes from the one guarded minter (spec 040)
 }
 
+//! Every Cookie header a request carries (HTTP/2 may split one into several).
+vector<string> CookieHeadersOf(const flight::ServerCallContext &context) {
+	vector<string> cookies;
+	for (const auto &header : context.incoming_headers()) {
+		if (StringUtil::CIEquals(string(header.first), "cookie")) {
+			cookies.emplace_back(header.second);
+		}
+	}
+	return cookies;
+}
+
 //! The session cookie a request carries, parsed by NAME from the Cookie header (F1: never a substring
 //! of the value). Empty when the client sent none.
-string CookieFromHeaders(const flight::ServerCallContext &context) {
-	for (const auto &header : context.incoming_headers()) {
-		if (!StringUtil::CIEquals(string(header.first), "cookie")) {
-			continue;
-		}
-		string cookies(header.second);
-		idx_t pos = 0;
-		while (pos < cookies.size()) {
-			auto semi = cookies.find(';', pos);
-			auto piece = cookies.substr(pos, semi == string::npos ? string::npos : semi - pos);
-			auto eq = piece.find('=');
-			if (eq != string::npos) {
-				string name = piece.substr(0, eq);
-				StringUtil::Trim(name);
-				if (name == SESSION_COOKIE) {
-					string value = piece.substr(eq + 1);
-					StringUtil::Trim(value);
-					return value;
-				}
-			}
-			if (semi == string::npos) {
-				break;
-			}
-			pos = semi + 1;
+string CookieFromHeaders(const vector<string> &cookies) {
+	for (auto &header : cookies) {
+		string value;
+		if (CookieNamed(header, SESSION_COOKIE, value)) {
+			return value;
 		}
 	}
 	return string();
 }
 
-//! Carries the connection's cookie id for one call and, when it was minted this call, emits it.
+//! Carries the connection's cookie id for one call and, when it was minted this call, emits it - and
+//! (spec 134) the node's label cookie when the request did not carry it already.
 class CookieMiddleware : public flight::ServerMiddleware {
 public:
-	CookieMiddleware(string id_p, bool fresh_p) : id(std::move(id_p)), fresh(fresh_p) {
+	CookieMiddleware(string id_p, bool fresh_p, string node_cookie_p)
+	    : id(std::move(id_p)), fresh(fresh_p), node_cookie(std::move(node_cookie_p)) {
 	}
 	string name() const override {
 		return COOKIE_MIDDLEWARE_KEY;
 	}
 	void SendingHeaders(flight::AddCallHeaders *outgoing) override {
-		if (fresh && outgoing) {
+		if (!outgoing) {
+			return;
+		}
+		if (fresh) {
 			outgoing->AddHeader("set-cookie",
 			                    string(SESSION_COOKIE) + "=" + id + "; HttpOnly; Path=/; SameSite=Strict");
+		}
+		if (!node_cookie.empty()) {
+			outgoing->AddHeader("set-cookie", node_cookie);
 		}
 	}
 	void CallCompleted(const arrow::Status &) override {
 	}
 	string id;
-	bool fresh; // minted this call (client sent none) -> set-cookie, and this call is transient
+	bool fresh;         // minted this call (client sent none) -> set-cookie, and this call is transient
+	string node_cookie; // spec 134: the label's Set-Cookie value, '' when there is none to send
 };
 
 class CookieMiddlewareFactory : public flight::ServerMiddlewareFactory {
 public:
+	explicit CookieMiddlewareFactory(DatabaseInstance &db_p) : db(db_p) {
+	}
 	arrow::Status StartCall(const flight::CallInfo &, const flight::ServerCallContext &context,
 	                        std::shared_ptr<flight::ServerMiddleware> *middleware) override {
-		auto incoming = CookieFromHeaders(context);
+		auto cookies = CookieHeadersOf(context);
+		auto incoming = CookieFromHeaders(cookies);
 		bool fresh = incoming.empty();
-		*middleware = std::make_shared<CookieMiddleware>(fresh ? MintCookieId() : incoming, fresh);
+		*middleware = std::make_shared<CookieMiddleware>(fresh ? MintCookieId() : incoming, fresh, NodeCookie(cookies));
 		return arrow::Status::OK();
 	}
+
+	//! spec 134: the label is read per call - a change applies to the next response that names it. Never
+	//! throws into gRPC: a call without the label cookie still works.
+	string NodeCookie(const vector<string> &cookies) {
+		try {
+			return NodeLabelSetCookie(NodeLabel(db), cookies);
+		} catch (...) { // NOLINT: never into the gRPC handler
+			return string();
+		}
+	}
+
+private:
+	DatabaseInstance &db; // the door's instance: FlightDoorState holds it the same way
 };
 
 //! --- spec 064: auth discovery + the password handshake --------------------------------------------
@@ -2897,7 +2915,8 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 			options.tls_certificates.push_back(flight::CertKeyPair {std::move(cert), std::move(key)});
 		}
 		// spec 050: the cookie identifies a client connection, which is what lets a session persist
-		std::shared_ptr<flight::ServerMiddlewareFactory> cookie_factory = std::make_shared<CookieMiddlewareFactory>();
+		std::shared_ptr<flight::ServerMiddlewareFactory> cookie_factory =
+		    std::make_shared<CookieMiddlewareFactory>(door.state->db);
 		options.middleware.emplace_back(string(COOKIE_MIDDLEWARE_KEY), std::move(cookie_factory));
 		// spec 064: a BasicAuth Handshake becomes the IdP-gated password grant; TLS-only by refusal
 		options.middleware.emplace_back(string("acl-password-handshake"),

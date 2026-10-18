@@ -86,5 +86,10 @@ vector<AclQuackDoorLoad> AclQuackDoorLoads(const DatabaseInstance &db);
 void AclQuackNoteRequestLineage(DatabaseInstance &db, const string &connection_id, const string &parent,
                                 const string &root_parent, const string &job);
 
+//! spec 134: the Set-Cookie value the node's label asks for on a `/quack` response - `acl_node=<label>;
+//! ...` when the label is set and none of the request's Cookie headers carries it already, '' otherwise.
+//! Never throws.
+string AclQuackNodeLabelCookie(DatabaseInstance &db, const vector<string> &cookie_headers);
+
 } // namespace acl
 } // namespace duckdb

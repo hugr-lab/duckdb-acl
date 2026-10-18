@@ -384,6 +384,33 @@ done
 [ -n "$counted" ] || fail "the server did not answer the cookie session count"
 grep -q "cookielive=1" "$TMP/server.log" || fail "a cookie connection did not reuse ONE session: $(grep cookielive= "$TMP/server.log")"
 
+# --- the node's label rides a cookie of its own (spec 134) ---------------------------------------
+# Unset by default: the door sends its session cookie and nothing else. Set, every response to a call
+# that does not carry acl_node=<label> sets it - a front routes the client back to this node by it - and
+# the session cookie is untouched; a call carrying another node's label gets this node's.
+got="$(ACL_PRINT_SET_COOKIE=1 ask "SELECT 1 AS one")"
+echo "$got" | grep -q "set-cookie: acl_flight_session_id=" || fail "no session cookie came: $got"
+echo "$got" | grep -q "set-cookie: acl_node=" && fail "an acl_node cookie came without a label: $got"
+echo "SET GLOBAL acl_node_label='e2e-node-1'; SELECT 'labelflip' AS s;" >&3
+flipped=""
+for _ in $(seq 1 40); do grep -q "labelflip" "$TMP/server.log" && { flipped=1; break; }; sleep 0.25; done
+[ -n "$flipped" ] || fail "the server did not set the label"
+got="$(ACL_PRINT_SET_COOKIE=1 ask "SELECT 1 AS one")"
+echo "$got" | grep -q "set-cookie: acl_node=e2e-node-1; HttpOnly; Path=/; SameSite=Strict" ||
+	fail "the label cookie did not come: $got"
+echo "$got" | grep -q "set-cookie: acl_flight_session_id=" || fail "the session cookie went missing: $got"
+echo "$got" | grep -q "'one': \[1\]" || fail "the call itself did not answer: $got"
+got="$(ACL_PRINT_SET_COOKIE=1 ACL_EXTRA_HEADERS="cookie=acl_node=e2e-node-1" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "set-cookie: acl_node=" && fail "a call carrying the label got it again: $got"
+got="$(ACL_PRINT_SET_COOKIE=1 ACL_EXTRA_HEADERS="cookie=acl_node=other-node" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "set-cookie: acl_node=e2e-node-1;" || fail "another node's label was not replaced: $got"
+echo "SET GLOBAL acl_node_label=''; SELECT 'labelunflip' AS s;" >&3
+flipped=""
+for _ in $(seq 1 40); do grep -q "labelunflip" "$TMP/server.log" && { flipped=1; break; }; sleep 0.25; done
+[ -n "$flipped" ] || fail "the server did not clear the label"
+got="$(ACL_PRINT_SET_COOKIE=1 ask "SELECT 1 AS one")"
+echo "$got" | grep -q "set-cookie: acl_node=" && fail "the label cookie outlived the label: $got"
+
 # --- a session outlives its token's exp under the default binding (spec 059) ----------------------
 # The cookie session below is established while the token is fresh; then the server's clock skew goes
 # hugely negative, which makes the same bearer look long-expired to every later re-verification. Under

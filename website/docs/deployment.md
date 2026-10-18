@@ -33,10 +33,23 @@ authentication) is a separate product; nodes are identical either way, which is 
 
 - **A session stays on one node.** Its connection, its transaction, its temp tables and its Flight
   tickets live on the node that opened it.
-  - `GetFlightInfo` and its `DoGet` must reach the **same node**: the front routes by the session
-    cookie, `arrow_flight_session_id`. A front that spreads one session over nodes breaks the ticket
-    (`acl: unknown or already fetched ticket`).
-  - quack keeps its own connection id, so a quack client is sticky by construction.
+  - `GetFlightInfo` and its `DoGet` must reach the **same node**. A front that spreads one session
+    over nodes breaks the ticket (`acl: unknown or already fetched ticket`).
+  - A quack client opens several HTTP connections per logical connection, one per FETCH in flight,
+    and all of them must reach the same node.
+- **The node names its sessions** when `acl_node_label` is set. A front then routes by the name alone
+  and keeps no table of sessions.
+  - Both doors send the cookie `acl_node=<label>` to a client that does not carry it yet. A front
+    routes every call carrying it to that node. The Flight session cookie, `acl_flight_session_id`,
+    is unchanged.
+  - The quack connection id the node mints starts with `<label>.`. Every request carries it in the
+    message header at the start of its body. A quack client that keeps cookies per connection
+    (duckdb/duckdb-quack#297) also sends the `acl_node` cookie and `X-Quack-Connection-Id`.
+  - A Flight client that sends no cookies (ADBC's default) is kept on one node by its connection.
+  - The label is a DNS label (`[a-z0-9-]`, at most 63 characters), GLOBAL only, set in the bootstrap
+    before the doors serve, for example the pod's name. The load report shows it as `"label"`.
+  - It is a routing hint and never an authority. A client that rewrites it only reaches another node,
+    which verifies its token like any other and refuses a principal of another resource group.
 - **DML is safest over `DoPut`.** It is one RPC, so there is no window between two calls. `JDBC
   executeUpdate`, prepared DML (announced as an update), `executemany` and `adbc_ingest` all take it.
 - **A retried write may double** (spec 111). DML sent through the query path runs at `GetFlightInfo`.

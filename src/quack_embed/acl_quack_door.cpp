@@ -16,6 +16,7 @@
 #include "quack_settings.hpp"
 #include "acl_lineage.hpp"
 #include "acl_quack_fetch_window.hpp"
+#include "acl_node_label.hpp"
 #include "acl_node_load.hpp"
 
 #include "acl_audit_pipeline.hpp"
@@ -519,6 +520,22 @@ void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, c
 		}
 	} catch (...) {
 		// the idle timeout still ends it
+	}
+}
+
+string AclQuackConnectionIdPrefix(DatabaseInstance &db) {
+	try {
+		return NodeLabelIdPrefix(NodeLabel(db));
+	} catch (...) { // NOLINT: never into the server's CONNECT handler - an id without a label still works
+		return string();
+	}
+}
+
+string AclQuackNodeLabelCookie(DatabaseInstance &db, const vector<string> &cookie_headers) {
+	try {
+		return NodeLabelSetCookie(NodeLabel(db), cookie_headers);
+	} catch (...) { // NOLINT: never into the HTTP handler - a response without the cookie still works
+		return string();
 	}
 }
 
