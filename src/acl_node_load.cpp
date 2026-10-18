@@ -5,6 +5,7 @@
 #include "acl_node_load.hpp"
 
 #include "acl_door_common.hpp"
+#include "acl_node_label.hpp"
 #include "acl_rewriter.hpp"
 
 #include "duckdb/main/config.hpp"
@@ -40,6 +41,15 @@ bool NodeLoadServed(DatabaseInstance &db) {
 	Value on;
 	return DBConfig::GetConfig(db).TryGetCurrentSetting("acl_metrics_endpoint", on) && !on.IsNull() &&
 	       on.GetValue<bool>();
+}
+
+string NodeLabel(DatabaseInstance &db) {
+	Value label;
+	if (!DBConfig::GetConfig(db).TryGetCurrentSetting("acl_node_label", label) || label.IsNull()) {
+		return string();
+	}
+	auto text = label.ToString();
+	return ValidNodeLabel(text) ? text : string(); // the setting's validator holds it; a name never carries less
 }
 
 namespace {
@@ -147,6 +157,7 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 	// does not answer reads as "unknown", never as its own text
 	auto group = store.NodeGroup();
 	bool group_known = group.empty();
+	auto label = NodeLabel(db); // spec 134: the name the node's sessions carry, for a front to match
 	string target = "null";
 	auto now = std::chrono::steady_clock::now();
 	uint64_t writes = store.CatalogLocalWrites();
@@ -224,7 +235,8 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 	return "{\"draining\":" + string(draining ? "true" : "false") +
 	       ",\"observe\":" + (ObserveOpen(db) ? "\"open\"" : "\"token\"") +
 	       ",\"group\":" + (group.empty() ? string("null") : JsonQuote(group)) +
-	       ",\"group_known\":" + (group_known ? "true" : "false") + ",\"config\":{\"target\":" + target +
+	       ",\"group_known\":" + (group_known ? "true" : "false") +
+	       ",\"label\":" + (label.empty() ? string("null") : JsonQuote(label)) + ",\"config\":{\"target\":" + target +
 	       ",\"applied\":" + (applied < 0 ? string("null") : std::to_string(applied)) + "}" +
 	       ",\"sessions\":{\"live\":" + std::to_string(live) + ",\"max\":" + std::to_string(max_sessions) +
 	       ",\"by_door\":{" + by_door + "},\"by_group\":{" + groups + "}},\"quack\":" + quack +

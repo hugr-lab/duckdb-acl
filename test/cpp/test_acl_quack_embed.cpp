@@ -375,6 +375,73 @@ int main(int argc, char *argv[]) {
 			Exec(con, "DETACH before");
 		});
 
+		Scenario("the node's label names the connection and rides a cookie (spec 134)", [&] {
+			// the Set-Cookie a bare POST /quack answers with ("" = none); the handler sets it before the
+			// message is read, so even a refusal of an empty body carries it
+			auto set_cookie = [](const std::string &cookie) {
+				duckdb_httplib::Client client("localhost", 31975);
+				duckdb_httplib::Headers headers;
+				if (!cookie.empty()) {
+					headers.emplace("Cookie", cookie);
+				}
+				auto response = client.Post("/quack", headers, std::string(), "application/vnd.duckdb");
+				return response ? response->get_header_value("Set-Cookie") : std::string("<no response>");
+			};
+			Check(set_cookie("").empty(), "without a label, no cookie: '" + set_cookie("") + "'");
+			Exec(con, "SET GLOBAL acl_node_label = 'node-134'");
+			auto expected = std::string("acl_node=node-134; HttpOnly; Path=/; SameSite=Strict");
+			Check(set_cookie("") == expected, "a request without the cookie gets it: '" + set_cookie("") + "'");
+			Check(set_cookie("acl_node=node-134").empty(), "...one carrying it gets none");
+			Check(set_cookie("a=1; acl_node=other-node") == expected, "...another node's is replaced");
+
+			// the id quack mints is <label>.<random>: every message of the connection carries it (quack's
+			// own debug log names the id each request rode)
+			Exec(con, "CALL enable_logging('Quack', level = 'debug')");
+			Exec(con, "ATTACH 'quack:localhost:31975' AS labelled (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
+			auto rows = con.Query("SELECT count(*)::BIGINT FROM labelled.main.orders");
+			if (CheckOk(*rows, "a labelled connection reads")) {
+				Check(rows->Collection().GetValue(0, 0).GetValue<int64_t>() == 2, "...its own slice");
+			}
+			auto named = con.Query("SELECT count(*) FILTER (WHERE regexp_matches(message, "
+			                       "'quack_connection_id'': node-134\\.[0-9A-F]{32}[,}]')), count(*) FILTER "
+			                       "(WHERE message LIKE '%PREPARE_REQUEST%') FROM duckdb_logs WHERE type = 'Quack'");
+			if (CheckOk(*named, "quack's log is readable")) {
+				Check(named->Collection().GetValue(0, 0).GetValue<int64_t>() > 0 &&
+				          named->Collection().GetValue(0, 0).GetValue<int64_t>() >=
+				              named->Collection().GetValue(1, 0).GetValue<int64_t>(),
+				      "every statement rode an id that starts with the label: " +
+				          named->Collection().GetValue(0, 0).ToString() + " labelled of " +
+				          named->Collection().GetValue(1, 0).ToString() + " prepares");
+			}
+			Exec(con, "CALL disable_logging()");
+
+			// the longest label still fits quack's SEND_DATA header: a streamed write goes through
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
+			Exec(con, "ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{\"select\": true, \"insert\": true}' "
+			          "RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,tenant'");
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
+			Exec(con, "SET GLOBAL acl_node_label = '" + std::string(63, 'a') + "'");
+			Exec(con, "ATTACH 'quack:localhost:31975' AS longest (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
+			Exec(con, "CREATE TABLE label_rows AS SELECT 10 AS id, 'acme' AS tenant");
+			auto wrote = con.Query("INSERT INTO longest.main.orders SELECT * FROM label_rows");
+			CheckOk(*wrote, "a streamed write under a 63-character label");
+			auto landed = con.Query("SELECT count(*)::BIGINT FROM memory.main.orders WHERE id = 10");
+			if (CheckOk(*landed, "the row is readable")) {
+				Check(landed->Collection().GetValue(0, 0).GetValue<int64_t>() == 1, "...and it landed");
+			}
+
+			Exec(con, "DETACH labelled");
+			Exec(con, "DETACH longest");
+			Exec(con, "DELETE FROM memory.main.orders WHERE id = 10");
+			Exec(con, "DROP TABLE label_rows");
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
+			Exec(con, "ACL ADMIN GRANT TABLE c.orders TO ROLE analyst CAPS '{\"select\": true}' "
+			          "RLS 'tenant = acl_claim(''tenant'')' COLUMNS 'id,tenant'");
+			Exec(con, "SET GLOBAL acl_allow_anonymous_admin=false");
+			Exec(con, "SET GLOBAL acl_node_label = ''");
+			Check(set_cookie("").empty(), "the label unset again: no cookie");
+		});
+
 		Scenario("two advertised issuers make an ISSUER-less secret ask for one", [&] {
 			auto ambiguous = con.Query("CREATE SECRET amb (TYPE quack, PROVIDER oidc, SCOPE "
 			                           "'quack:localhost:31975', CLIENT_ID 'cli', FLOW 'password', "

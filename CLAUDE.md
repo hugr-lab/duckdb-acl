@@ -820,6 +820,15 @@ watch loop (it sweeps, then answers what remains - the auto-sweep rode `SessionO
 turns off), stragglers go to `acl_session_kill`, then the doors stop and the process exits. `acl_resume()` / `acl_drain_status()` complete the surface; all three are denied to a
 principal. The node never waits or times out by itself — the deadline belongs to the orchestrator.
 
+**Spec 134 — the node's label in its sessions' names**: behind a front that keeps no table of sessions,
+`acl_node_label` (GLOBAL only, default '' = today's behaviour; a DNS label, `[a-z0-9-]` ≤ 63 - header-only
+`acl_node_label.hpp`) makes both doors send the cookie `acl_node=<label>; HttpOnly; Path=/; SameSite=Strict` to a
+request that does not carry it (Flight: the cookie middleware beside the unchanged `acl_flight_session_id`; quack:
+our own HTTP server on every `/quack` response) and the quack connection ids the embedded server mints start with
+`<label>.` (one `sync.py` hunk in `GenerateConnectionId` → `AclQuackConnectionIdPrefix`; the random part is the
+connection's secret, unchanged). The load report adds `"label"`. A routing hint, never an authority: an incoming
+value is only compared with the node's own. hugr-node sets it from the pod at bootstrap.
+
 **Spec 069 — audit and metrics, layered**: every decision is an event (`AuditEvent`, header-only
 contract in `acl_audit.hpp` - since spec 076 in `duckdb-ext-common/contracts/`, with `Principal` beside
 it in `acl_principal.hpp`): statement/admin (emitted by the parser override after the decision, with

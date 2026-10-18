@@ -234,6 +234,25 @@ PATCHES = {
             "\t\tstring connection_id = GenerateConnectionId();\n"
             "\t\tauto auth = EvaluateAuthQuery(\n",
         ),
+        # spec 134: the node's label in front of every connection id it mints - the id stays opaque to
+        # quack and to the client, the random part after the label is unchanged (the connection's secret)
+        (
+            "string QuackServer::GenerateConnectionId() {\n"
+            "\tauto db = db_ptr.lock();\n"
+            "\tif (!db) {\n"
+            "\t\tthrow InternalException(\"Database was closed\");\n"
+            "\t}\n"
+            "\treturn QuackRandomToken(*db);\n"
+            "}\n",
+            "string QuackServer::GenerateConnectionId() {\n"
+            "\tauto db = db_ptr.lock();\n"
+            "\tif (!db) {\n"
+            "\t\tthrow InternalException(\"Database was closed\");\n"
+            "\t}\n"
+            "\t// acl (spec 134): the node's label first, so a front routes the connection by its name\n"
+            "\treturn acl::AclQuackConnectionIdPrefix(*db) + QuackRandomToken(*db);\n"
+            "}\n",
+        ),
         # spec 079: a connection the server drops ends its acl session at once - quack's own DISCONNECT
         # and a heartbeat lease noticed expired - instead of the session waiting out
         # acl_session_idle_timeout (15 min) with no client behind it

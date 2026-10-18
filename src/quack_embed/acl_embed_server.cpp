@@ -492,7 +492,8 @@ string QuackServer::GenerateConnectionId() {
 	if (!db) {
 		throw InternalException("Database was closed");
 	}
-	return QuackRandomToken(*db);
+	// acl (spec 134): the node's label first, so a front routes the connection by its name
+	return acl::AclQuackConnectionIdPrefix(*db) + QuackRandomToken(*db);
 }
 
 static string ExtractQuery(QuackMessage &msg) {

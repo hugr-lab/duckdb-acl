@@ -26,6 +26,10 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store);
 //! Whether the pull surfaces exist at all (`acl_metrics_endpoint`).
 bool NodeLoadServed(DatabaseInstance &db);
 
+//! spec 134: the node's label (`acl_node_label`), '' when unset - the name its sessions carry for a
+//! front. Read when a name is minted, so a change applies to names minted after it.
+string NodeLabel(DatabaseInstance &db);
+
 //! spec 097: the answer to one read of the load report or the metrics.
 enum class ObserveVerdict : uint8_t {
 	ALLOWED,         //! serve it

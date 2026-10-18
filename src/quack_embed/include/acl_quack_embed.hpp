@@ -125,6 +125,9 @@ private:
 //! The server dropped a client connection (spec 079): its DISCONNECT (`how` = client) or a heartbeat
 //! lease that ran out (`idle`). The acl session bound to it ends now. Never throws.
 void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how);
+//! spec 134: what a connection id the server mints starts with - `<acl_node_label>.`, or nothing
+//! without a label - so a front routes the connection by its name alone. Never throws.
+string AclQuackConnectionIdPrefix(DatabaseInstance &db);
 
 } // namespace acl
 } // namespace duckdb

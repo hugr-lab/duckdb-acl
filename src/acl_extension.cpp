@@ -24,6 +24,7 @@
 #include "acl_parser_override.hpp"
 #include "acl_policy.hpp"
 #include "acl_profile.hpp"
+#include "acl_node_label.hpp"
 #include "acl_node_load.hpp"
 #include "acl_platform.hpp"
 #include "duckdb/common/helper.hpp"
@@ -145,6 +146,26 @@ shared_ptr<acl::PolicyStore> LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("acl_node_id",
 	                          "acl: the node's name on every audit event and metric ('' = <hostname>:<pid>)",
 	                          LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);
+	// spec 134: the node's label in its sessions' names - the acl_node cookie both doors set and the
+	// prefix of the quack door's connection ids, for a front that routes by the name alone
+	config.AddExtensionOption(
+	    "acl_node_label",
+	    "acl: the node's label in its sessions' names ('' = none): both doors set the cookie acl_node=<label> "
+	    "and quack connection ids start with <label>. - a DNS label, [a-z0-9-], at most 63 (spec 134)",
+	    LogicalType::VARCHAR, Value(""),
+	    [](ClientContext &, SetScope scope, Value &value) {
+		    if (scope != SetScope::GLOBAL) {
+			    // the doors read the global: a session-scoped value would show and be ignored
+			    throw InvalidInputException("acl_node_label is global - use SET GLOBAL");
+		    }
+		    auto text = value.IsNull() ? string() : value.ToString();
+		    if (!text.empty() && !acl::ValidNodeLabel(text)) {
+			    throw InvalidInputException("acl_node_label: \"%s\" is not a DNS label - 1 to 63 of a-z, 0-9 and "
+			                                "'-', a letter or a digit at both ends",
+			                                text);
+		    }
+	    },
+	    SetScope::GLOBAL);
 	config.AddExtensionOption("acl_metrics_endpoint",
 	                          "acl: serve GET /metrics (Prometheus text) on the embedded quack listener",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);

@@ -717,7 +717,8 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
   carries both.
 - **Node identity** - `acl_node_id` (default `<hostname>:<pid>`) is on every event and metric row, so
   a fleet's streams merge without ambiguity. Nodes never share audit state; a central view is the
-  collector's job (spec 069, "In a fleet").
+  collector's job (spec 069, "In a fleet"). The routing name a front reads, `acl_node_label`, is a
+  separate setting (spec 134; see [deployment.md](deployment.md)).
 - **What a refusal's text may carry** - our own message, which names virtual objects and nothing
   else, with three exceptions the audit closes itself: a `parse` refusal is a fixed sentence (the
   parser would echo the statement's text, and a literal in it could be a secret); a `principal`
