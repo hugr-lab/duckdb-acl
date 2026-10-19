@@ -1,6 +1,6 @@
 # Spec 135: a session moves between nodes - its context in the cookie, an error only for what cannot move
 
-- **Status**: draft
+- **Status**: accepted (the owner, 2026-10-19: «По спекам ок»)
 - **Date**: 2026-10-19
 - **Author**: Claude (with the owner)
 
