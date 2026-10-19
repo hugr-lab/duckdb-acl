@@ -71,11 +71,14 @@ authentication) is a separate product; nodes are identical either way, which is 
     node and lost its temp tables; the statement did not run, the connection works on`. The next call
     works on the new session, with whatever context did carry.
   - A lost transaction stays aborted on the new node until the client's `ROLLBACK` (or `EndTransaction`).
-    Every statement in between is refused, and a `COMMIT` commits nothing. No part of it runs in
-    autocommit.
+    Every statement in between is refused (`… ROLLBACK to go on`), the catalog RPCs that run SQL on the
+    connection fail too, and a `COMMIT` is answered `… nothing of it was committed`. No part of it runs in
+    autocommit. A cookie the node cannot read is treated the same way.
   - A session that was in the view-as mode is not seated afresh, unless the call declares the mode
     (`x-acl-view-as`).
-  - Another principal's token with the cookie carries nothing of it.
+  - Another principal's token with the cookie carries nothing of it (a pin it states still refuses once).
+  - A session that carries a full lineage context and a USE can pass the cookie's 1 KiB; its moves then
+    refuse once, honestly.
   - The move verifies the token again, as any new session does: a connection that has lived for months
     must present a valid token.
   - A front needs nothing for this. It routes by the label, and a label that is gone goes to any node of

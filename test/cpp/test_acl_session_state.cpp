@@ -102,20 +102,22 @@ void Malformed() {
 	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"set\":{\"TimeZone\":\"UTC\",\"timezone\":\"UTC\"}}"),
 	           "a setting twice (a restore runs one statement per item: bounded by the list)");
 	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"set\":{\"TimeZone\":\"UTC\\u0000x\"}}"), "a NUL inside a value");
+	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"p\":\"u\"}"), "a key twice");
+	unreadable(B64Url("{\"v\":1,\"p\\u0000x\":\"t\"}"), "a NUL inside a key");
 	unreadable("not*base64", "a character outside base64url");
 	unreadable("eyJ2Ijox=", "padding");
 	unreadable("A", "a length base64 cannot end on");
 	unreadable(B64Url("[1,2]"), "JSON that is no object");
 	unreadable(B64Url("{\"v\":1"), "truncated JSON");
-	unreadable(B64Url("{\"use\":{\"catalog\":\"c\"}}"), "no version");
-	unreadable(B64Url("{\"v\":2}"), "a version this build does not know");
-	unreadable(B64Url("{\"v\":\"1\"}"), "a version of the wrong type");
-	unreadable(B64Url("{\"v\":1,\"use\":\"c.s\"}"), "use not an object");
-	unreadable(B64Url("{\"v\":1,\"use\":{\"catalog\":1}}"), "a use part not a string");
-	unreadable(B64Url("{\"v\":1,\"use\":{\"database\":\"c\"}}"), "a use part this build does not write");
-	unreadable(B64Url("{\"v\":1,\"set\":{\"TimeZone\":3}}"), "a setting's value not a string");
-	unreadable(B64Url("{\"v\":1,\"pinned\":\"transaction\"}"), "pinned not an array");
-	unreadable(B64Url("{\"v\":1,\"pinned\":[1]}"), "a pin not a string");
+	unreadable(B64Url("{\"p\":\"t\",\"use\":{\"catalog\":\"c\"}}"), "no version");
+	unreadable(B64Url("{\"v\":2,\"p\":\"t\"}"), "a version this build does not know");
+	unreadable(B64Url("{\"v\":\"1\",\"p\":\"t\"}"), "a version of the wrong type");
+	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"use\":\"c.s\"}"), "use not an object");
+	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"use\":{\"catalog\":1}}"), "a use part not a string");
+	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"use\":{\"database\":\"c\"}}"), "a use part this build does not write");
+	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"set\":{\"TimeZone\":3}}"), "a setting's value not a string");
+	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"pinned\":\"transaction\"}"), "pinned not an array");
+	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"pinned\":[1]}"), "a pin not a string");
 	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"handle\":\"x\"}"), "a key this build does not write");
 
 	Check(Read(B64Url("{\"v\":1,\"p\":\"t\",\"pinned\":[\"lock\"]}"), read) == SessionStateRead::OK &&

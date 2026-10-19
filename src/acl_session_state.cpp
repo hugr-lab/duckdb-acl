@@ -220,10 +220,21 @@ SessionStateRead DecodeSessionState(const std::string &value, SessionState &out)
 	SessionState read;
 	bool versioned = false;
 	bool owned = false;
+	std::vector<std::string> keys;
 	duckdb_yyjson::yyjson_obj_iter iter;
 	duckdb_yyjson::yyjson_obj_iter_init(root, &iter);
 	while (auto *key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
-		std::string name = duckdb_yyjson::yyjson_get_str(key);
+		std::string name;
+		if (!Text(key, name)) {
+			return SessionStateRead::UNREADABLE;
+		}
+		// each key once: this build never writes one twice, and a second `p` or `use` would be read over the first
+		for (auto &seen : keys) {
+			if (seen == name) {
+				return SessionStateRead::UNREADABLE;
+			}
+		}
+		keys.push_back(name);
 		auto *val = duckdb_yyjson::yyjson_obj_iter_get_val(key);
 		if (name == "v") {
 			if (!duckdb_yyjson::yyjson_is_int(val) || duckdb_yyjson::yyjson_get_int(val) != 1) {

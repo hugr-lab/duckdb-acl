@@ -62,8 +62,10 @@ acl_session_state=<base64url of a JSON object>; HttpOnly; Path=/; SameSite=Stric
 - **`set`**: what the client SET on its session from spec 068's allowlist. That list is one list,
   `PORTABLE_SETTINGS` in `acl_session_state.hpp`, and `ClientSettingAllowed` reads it too: `TimeZone`, `Calendar`,
   `acl_metadata_max_rows`, `acl_correlation_id`, `acl_traceparent` and the three lineage settings of spec 107.
-  - A value is carried only when the connection holds it at scope `LOCAL` and it differs from the option's default:
-    duckdb's `RESET` writes the default as a LOCAL value, and a node's default is never carried.
+  - A value is carried only when the connection holds it at scope `LOCAL` and it differs from what a fresh session
+    of the node reads (its GLOBAL, else the option's default). duckdb's `RESET` writes the default as a LOCAL value,
+    and the node's own values are never carried. A client that SETs exactly the node's value is not carried, and
+    reads the new node's: in one cluster the nodes share their GLOBALs by the profile.
 - **`pinned`**: why the session cannot move.
   - `transaction`: an explicit transaction is open on the session's connection. That is duckdb's own word
     (`!IsAutoCommit()`), whoever began the transaction: `BeginTransaction`, SQL `BEGIN`, or a moved one.
@@ -82,10 +84,12 @@ acl_session_state=<base64url of a JSON object>; HttpOnly; Path=/; SameSite=Stric
       own response carries the change.
 - **Bound:** at most 1 KiB encoded, because a request's metadata (a bearer of several KB, and the cookies) shares
   gRPC's 8 KiB limit. A larger state keeps its principal and its pins and adds `context`; it is never written
-  partly.
+  partly. 1 KiB of base64 is about 760 bytes of JSON: a session that carries a full lineage context (parent, root,
+  job, correlation id, traceparent) and a USE can pass it, and its moves then refuse once, honestly.
 - **The decoder** reads at most 4 KiB. It answers UNREADABLE, and never reads partly, on any of: a malformed input,
-  an unknown `v`, a wrong type, a missing or empty `p`, a setting not on the list or a setting twice, a NUL inside a
-  string, or a key this build does not write. So a restore runs at most one `USE` and eight `SET`s.
+  an unknown `v`, a wrong type, a missing or empty `p`, a setting not on the list or a setting twice, a key twice, a
+  NUL inside a key or a string, or a key this build does not write. So a restore runs at most one `USE` and eight
+  `SET`s.
 - **Not here:**
   - prepared statements and reservations (spec 047), and open streams (spec 070): on another node they fail with
     their own "unknown" errors, which are honest;
@@ -98,23 +102,41 @@ cookie's `acl_node` label says: another node's, this node's (the session died id
 (another principal on a live session) is not this case: nothing of the old principal's context is carried, and the
 response overwrites the cookie.
 
-1. **No state, or another principal's.** If `p` is not the caller's tag (verified from the token), it is a stolen
-   or shared jar: the caller gets a new session, as it would without the cookie.
-2. **The view-as mode, not declared by the call.** The connection is not seated afresh. The 120.3 addendum's
-   record (`view_as_ended`) is written for the cookie and the call is refused: `… viewed the catalog as a role and
-   is gone - connect again`. This is the same rule on every node. A call that declares `x-acl-view-as` is put in
-   the mode again (DeclaredViewAs) and goes on.
-3. **Otherwise** the session is opened and bound to the cookie (drain, the session cap and placement refuse a move
-   as they refuse any new session). Then, after the call's own mode is in place, `TakeOverState` runs:
+1. **No state.** A new session, as before.
+2. **Another principal's state.** `p` is not the caller's tag, verified from the token; a token that does not verify
+   is refused as `authentication failed`. That is a stolen or shared jar, or the same subject whose roles changed.
+   Nothing of the state carries. A pin it states still refuses the call once, and a transaction it states is
+   aborted: the caller cannot be the one to finish it.
+3. **The view-as mode, not declared by the call.** The connection is not seated afresh: the call is refused with
+   `… viewed the catalog as a role and is gone - connect again`, the same rule as the 120.3 addendum's on every
+   node. No record is kept: the pin in the client's own jar refuses each call, so a state the client writes never
+   grows the node's memory. A client that drops the pin, its own choice, is seated as itself. A call that declares
+   `x-acl-view-as` is put in the mode again (DeclaredViewAs) and goes on.
+4. **Otherwise** the session is opened (drain, the session cap and placement refuse a move as they refuse any new
+   session). Its connection's lock is taken **before** the session is bound to the cookie and held until the
+   takeover is done, so a concurrent call on the cookie waits instead of running on a session not yet restored.
+   A takeover that does not finish (the call's own view-as declaration refused, a BEGIN that fails, an exception)
+   ends the new session, and the next call reads the state again. After the call's own mode is in place,
+   `TakeOverState` runs:
    - **The portable part is restored through the client's own paths, pinned or not.** `USE` becomes
      `SET schema = '<catalog.schema>'` (or `SET acl_use_schema`) and each setting a `SET`, under the session's
      prefix, so `RewriteUse` and spec 068's gate judge each item as the client's own statement now.
      - A `USE` that records nothing (`acl_session_use` answering false) counts as not restored.
      - In a declared view-as mode no `USE` is restored: the mode is metadata only.
-   - **A lost transaction** is begun on the new connection and aborted (`ValidChecker::Invalidate`). duckdb then
-     refuses every statement until a `ROLLBACK` ("Current transaction is aborted (please ROLLBACK)"), and a
-     `COMMIT` commits nothing. `EndTransaction` ends it whatever transaction id it names, since the id was the
-     other node's; a commit is told that nothing was committed. `BeginTransaction` asks for the rollback first.
+   - **A lost transaction** is begun on the new connection and aborted (`ValidChecker::Invalidate`), and the door
+     answers its statements itself (`MovedTxnGuardLocked`, on every path a client's SQL runs: the query path, the
+     update path, ingest, prepare and the prepared executions). duckdb's abort alone would let a `COMMIT` turn into
+     a silent rollback, and a node may run with `disable_database_invalidation`.
+     - A `ROLLBACK` passes.
+     - A `COMMIT` rolls back and is told `… lost its open transaction - nothing of it was committed`.
+     - Anything else is refused: `… lost its open transaction - ROLLBACK to go on`.
+     - `EndTransaction` ends it whatever transaction id it names, since the id was the other node's, and a commit is
+       told that nothing was committed. `BeginTransaction` asks for the rollback first.
+     - The catalog RPCs that run SQL on the session's connection fail as duckdb's abort makes them, until the
+       ROLLBACK.
+   - **An unreadable state** is treated as if a transaction were in it (fail closed): refused once, then aborted
+     until the client's ROLLBACK. A rolling upgrade whose newer build writes what an older one cannot read is the
+     case this protects.
    - **Anything not carried refuses this call, once, naming all of it.** That covers a pin, an item that did not
      restore, and an unreadable state. The message is `acl: the session moved to another node and lost its open
      transaction (ROLLBACK to go on: nothing of it was committed); the statement did not run, the connection works
@@ -179,10 +201,14 @@ is a hugr-node spec. With duckdb/duckdb-quack#297, the state cookie could ride `
     of the principal", and the next call works.
   - A forged setting outside the list, and a garbled cookie: "lost its session context", once.
   - `acl_metadata_max_rows` above a lowered node bound: "could not restore its acl_metadata_max_rows".
-  - `BEGIN`, a write, kill. The next write is refused once, the pin stays in the cookie, and the write after is
-    refused as aborted. ROLLBACK goes through, no write of the transaction is committed, and the pin goes.
+  - `BEGIN`, a write, kill. The next write is refused once, the pin stays in the cookie (decoded), and the write
+    after is refused by the door. ROLLBACK goes through, no write of the transaction is committed, and the pin goes.
+  - `BEGIN`, a write, kill, a ping that spends the refusal, then `COMMIT`: the COMMIT is told nothing was committed,
+    and nothing is.
+  - A forged setting and a garbled cookie are held aborted until ROLLBACK, then the connection works.
   - A temp table: refused once, then the connection works.
-  - A view-as pin without the header: refused, and refused again (never seated).
+  - A view-as pin without the header: refused, and refused again; with the state cookie dropped, seated as itself
+    (no node record).
   - A drain refuses the move as any new session; the state survives and is restored after the resume.
   - A session that died idle here takes the same path, through the binding that still names it.
   - The counters count each kind.
@@ -194,8 +220,10 @@ is a hugr-node spec. With duckdb/duckdb-quack#297, the state cookie could ride `
 - **A loud refusal of any unknown session** (design/082 F1 as first written). That breaks every long-lived read-only
   connection on each roll.
 - **Refusing a lost transaction once and moving on** (this spec's first build). A driver can spend the one refusal
-  on a close or a metadata call and run the rest of the transaction in autocommit. duckdb's own aborted state
-  cannot be missed.
+  on a close or a metadata call and run the rest of the transaction in autocommit. So the transaction is aborted,
+  and the door answers its statements: duckdb's abort alone makes a COMMIT a silent rollback.
+- **Remembering a moved view-as connection on the node** (`view_as_ended`, as 120.3 does for a session that ended
+  here). A client writes that state: any principal could grow the node's memory with ids of its choosing.
 - **Pinning only the sessions with state, and letting the front re-place the rest.** The front has no session table
   and should not get one.
 - **A signed cookie.** Signing needs a key shared by the nodes, and the cookie grants nothing. Re-judging every item

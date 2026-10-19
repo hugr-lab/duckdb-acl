@@ -961,9 +961,9 @@ call** instead: on the Flight door the header `x-acl-view-as: <role>` (percent-e
 the mode - judged like the statement, or the call is refused - so a session the door seats afresh (the old one went
 idle, was killed, the node restarted, another node took the connection) is in the mode again, never the viewer's
 own. The JDBC driver's `acl.viewAs` sends it. On such a connection a `SET` / `RESET SESSION VIEW AS` is refused (open
-another connection to change the role); a `DENY FUNCTION platform.view_as` refuses the mode however it is asked for. A client that only SETs the mode is guarded for a day - on this node, and on any
-node its connection moves to (the session-state cookie says the session was in the mode, spec 135): its connection
-is refused once its session ended in the mode (`… viewed the catalog as a role and is gone - connect
+another connection to change the role); a `DENY FUNCTION platform.view_as` refuses the mode however it is asked for. A client that only SETs the mode is guarded on this node for a day, and on any
+node its connection moves to for as long as its session-state cookie says the session was in the mode (spec 135):
+its connection is refused once its session ended in the mode (`… viewed the catalog as a role and is gone - connect
 again`); a SET on a per-call session (a Flight call without the session cookie) is refused - the mode would end
 with the call. Another principal's token on a connection in the mode is refused (`… needs a connection of its
 own`); the viewer's session is kept. When the viewer loses the right, or the role comes to hold administration or

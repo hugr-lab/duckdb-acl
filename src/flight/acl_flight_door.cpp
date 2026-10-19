@@ -21,6 +21,7 @@
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/statement/transaction_statement.hpp"
 #include "duckdb/common/error_data.hpp"
 
 #include <algorithm>
@@ -1237,6 +1238,40 @@ public:
 		return arrow::Status::OK();
 	}
 
+	//! spec 135: while the transaction a session lost when it moved is still open (begun here and aborted), the door
+	//! answers a client statement itself - duckdb's abort alone turns a COMMIT into a silent rollback, and a node may
+	//! run with disable_database_invalidation. ROLLBACK passes; COMMIT rolls back and says nothing was committed;
+	//! anything else is refused. Once the transaction ended (autocommit again) the mark goes. Caller holds `exec`.
+	static arrow::Status MovedTxnGuardLocked(FlightDoorState::SessionConn &conn, const string &query) {
+		if (!conn.moved_txn) {
+			return arrow::Status::OK();
+		}
+		if (conn.con->context->transaction.IsAutoCommit()) {
+			conn.moved_txn = false;
+			return arrow::Status::OK();
+		}
+		auto verb = TransactionType::INVALID;
+		try {
+			Parser parser(ParserOptions::Builtin());
+			parser.ParseQuery(query);
+			if (parser.statements.size() == 1 && parser.statements[0]->type == StatementType::TRANSACTION_STATEMENT) {
+				verb = parser.statements[0]->Cast<TransactionStatement>().info->type;
+			}
+		} catch (std::exception &) { // NOLINT: what does not parse is no ROLLBACK
+		}
+		if (verb == TransactionType::ROLLBACK) {
+			return arrow::Status::OK();
+		}
+		if (verb == TransactionType::COMMIT) {
+			conn.con->Query("ROLLBACK");
+			conn.moved_txn = false;
+			return arrow::Status::Invalid("acl: the session moved to another node and lost its open transaction - "
+			                              "nothing of it was committed (it is rolled back now)");
+		}
+		return arrow::Status::Invalid("acl: the session moved to another node and lost its open transaction - ROLLBACK "
+		                              "to go on (nothing of it was committed)");
+	}
+
 	//! Begin a transaction on the session's own connection (spec 055): it spans the session's RPCs
 	//! because the connection does, and it is rolled back natively if the session ends first. Needs a
 	//! connection-long (cookie) session - a per-call one has nowhere to hold it.
@@ -1335,6 +1370,7 @@ public:
 			reservation->query = command.query; // spec 111
 			{
 				auto execution = state->LockForStatement(*reservation->conn);
+				ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, command.query));
 				ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, command.transaction_id));
 				TempScanScope temp_scan(reservation->conn->con->context.get());
 				{
@@ -1359,6 +1395,7 @@ public:
 			// full ticket map refuses above, before anything is written); a failure takes the ticket back
 			{
 				auto execution = state->LockForStatement(*held->conn);
+				ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*held->conn, held->query));
 				auto ran = ExecuteCountNow(handle, *held, nullptr);
 				if (!ran.ok()) {
 					state->CloseReservation(ticket_id, owner);
@@ -1398,6 +1435,7 @@ public:
 			                    }
 			                    state->store->AuditDoor("flight", "ticket_redeemed", true, string(), string(), caller);
 			                    auto execution = state->LockForStatement(*reservation->conn);
+			                    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
 			                    vector<Value> values;
 			                    return StreamStatement(context, std::move(reservation), values, caller);
 		                    });
@@ -1419,6 +1457,7 @@ public:
 				return arrow::Status::Invalid("acl: this session is no longer usable - reconnect");
 			}
 			auto execution = state->LockForStatement(*conn);
+			ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*conn, command.query));
 			ARROW_RETURN_NOT_OK(ValidateTxnLocked(*conn, command.transaction_id));
 			TempScanScope temp_scan(conn->con->context.get());
 			ArmProfile(handle, *conn, nullptr, traceparent); // the Prepare's note serves the Execute
@@ -1667,6 +1706,7 @@ public:
 			auto prefixed = "ACL INGEST '" + StringUtil::Replace(handle, "'", "''") + "' " +
 			                LineageMarkers(lineage_parent, lineage_root, lineage_job) + sql;
 			auto execution = state->LockForStatement(*conn);
+			ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*conn, string())); // a load is no ROLLBACK
 			TempScanScope temp_scan(conn->con->context.get());
 			auto &con = *conn->con;
 			unique_ptr<PreparedStatement> stmt;
@@ -1785,6 +1825,7 @@ public:
 			    reservation->query = request.query; // spec 111
 			    {
 				    auto execution = state->LockForStatement(*reservation->conn);
+				    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, request.query));
 				    ARROW_RETURN_NOT_OK(ValidateTxnLocked(*reservation->conn, request.transaction_id));
 				    TempScanScope temp_scan(reservation->conn->con->context.get());
 				    LineagePrepareScope preparing(*reservation->conn->con->context);
@@ -1856,6 +1897,7 @@ public:
 			std::shared_ptr<arrow::Schema> parameter_schema;
 			{
 				auto execution = state->LockForStatement(*reservation->conn);
+				ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
 				auto bound = reservation->parameter_rows.empty() ? nullptr : &reservation->parameter_rows.front();
 				ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->conn->con->context, *reservation->stmt, bound,
 				                                         dataset_schema, parameter_schema));
@@ -1892,6 +1934,7 @@ public:
 				    return arrow::Status::KeyError("acl: unknown prepared statement");
 			    }
 			    auto execution = state->LockForStatement(*reservation->conn);
+			    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
 			    if (reservation->parameter_rows.size() > 1) {
 				    // answering from the first row alone is a silently wrong result; batches are
 				    // the update path's business
@@ -1917,6 +1960,7 @@ public:
 			}
 			ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader, FlightDoorState::MAX_PARAM_ROWS));
 			auto execution = state->LockForStatement(*reservation->conn);
+			ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
 			reservation->executed.reset(); // spec 111: this call executes; a count an earlier GetFlightInfo kept goes
 			// executemany semantics, DBAPI's: once per parameter row. Zero rows with declared
 			// parameters is zero executions - not one; only a parameterless statement runs once.
@@ -2526,23 +2570,29 @@ private:
 	auto UnderSession(const flight::ServerCallContext &context, Body body) -> decltype(body(string())) {
 		string handle;
 		bool durable = false;
+		Takeover moving;
 		try {
 			bool transient = false;
-			Takeover moving;
 			ARROW_ASSIGN_OR_RAISE(handle, SessionFor(context, transient, moving));
 			if (!transient) {
 				// a connection-long session (spec 050): the sweeper, exp, CloseSession or the door's
 				// stop end it - an RPC boundary does not
 				durable = true;
-				ARROW_RETURN_NOT_OK(DeclaredViewAs(context, handle));
+				auto declared = DeclaredViewAs(context, handle);
 				if (moving.read != SessionStateRead::ABSENT) {
 					// spec 135: a session this node did not know - its context restored, or the call refused once
-					auto taken = TakeOverState(context, handle, moving);
+					auto taken = declared.ok() ? TakeOverState(context, handle, moving) : declared;
+					if (!moving.done) {
+						AbandonTakeover(handle, moving);
+						return taken;
+					}
+					moving.hold.unlock();
 					if (!taken.ok()) {
 						SendState(context, handle);
 						return taken;
 					}
 				}
+				ARROW_RETURN_NOT_OK(declared);
 				auto answer = body(handle);
 				// spec 135: what the call left the session holding goes out with this very response
 				SendState(context, handle);
@@ -2553,7 +2603,9 @@ private:
 			ARROW_RETURN_NOT_OK(DeclaredViewAs(context, handle));
 			return body(handle);
 		} catch (std::exception &ex) {
-			if (durable) {
+			if (moving.conn && !moving.done) {
+				AbandonTakeover(handle, moving);
+			} else if (durable) {
 				SendState(context, handle); // what the call changed before it threw still goes out
 			}
 			// duckdb's what() is a JSON envelope; ErrorData gives the message a person wrote
@@ -2600,16 +2652,16 @@ private:
 			return false;
 		}
 		auto &client = *conn->con->context;
-		auto &config = DBConfig::GetConfig(client);
 		for (auto name : PORTABLE_SETTINGS) {
 			Value value;
 			auto found = client.TryGetCurrentSetting(Identifier(name), value);
 			if (!found || found.GetScope() != SettingScope::LOCAL || value.IsNull()) {
 				continue;
 			}
-			// a RESET writes the option's default as the session's LOCAL value: that is the node's, never carried
-			ExtensionOption option;
-			if (config.TryGetExtensionOption(Identifier(name), option) && option.default_value == value) {
+			// only what differs from what a fresh session of this node reads (its GLOBAL, else the option's default): a
+			// RESET writes the default as a LOCAL value, and the node's own values are never carried
+			Value fresh;
+			if (DatabaseInstance::GetDatabase(client).TryGetCurrentSetting(Identifier(name), fresh) && fresh == value) {
 				continue;
 			}
 			out.settings.emplace_back(name, value.ToString());
@@ -2650,6 +2702,16 @@ private:
 	struct Takeover {
 		SessionStateRead read = SessionStateRead::ABSENT;
 		SessionState carried;
+		//! another principal's state (a stolen or shared jar, or the same subject's roles changed): nothing of it
+		//! carries, but a pin it states still refuses once - and a transaction it states is aborted
+		bool foreign = false;
+		//! the new session's connection, held from before its binding to the cookie until the takeover is done: a
+		//! concurrent call on the cookie waits for it, never runs on a session not yet restored
+		shared_ptr<FlightDoorState::SessionConn> conn;
+		std::unique_lock<std::mutex> hold;
+		//! the takeover finished (restored, refused or both); a session bound but not finished is ended, so the next
+		//! call reads the state again
+		bool done = false;
 	};
 
 	//! spec 135: a session this node did not know, opened for a client whose state cookie is its principal's. The
@@ -2659,44 +2721,45 @@ private:
 	//! so no part of it runs in autocommit. Anything not carried - a pin, an item that did not restore, an unreadable
 	//! state - refuses this call, once, naming all of it; the connection works on.
 	arrow::Status TakeOverState(const flight::ServerCallContext &context, const string &handle, Takeover &moving) {
+		auto &conn = *moving.conn; // held (moving.hold) since before the session was bound to the cookie
 		auto refuse = [&](const char *code, const string &what) {
 			state->store->AuditSessionMove("flight", handle, true, code, what);
 			return arrow::Status::Invalid("acl: the session moved to another node and " + what +
 			                              "; the statement did not run, the connection works on");
 		};
-		if (moving.read == SessionStateRead::UNREADABLE) {
-			return refuse("session_unreadable", "lost its session context");
-		}
 		auto &carried = moving.carried;
 		bool declared = !DeclaredRole(context).empty();
+		bool unreadable = moving.read == SessionStateRead::UNREADABLE;
 		vector<string> lost;
+		if (unreadable) {
+			// what it held is unknown - a transaction among it, perhaps: aborted as one would be (fail closed)
+			lost = {"context", "transaction"};
+		}
 		for (auto &pin : carried.pinned) {
-			// a call that declares the view-as mode was put in it again (DeclaredViewAs): that pin is answered
-			if (!(pin == "view_as" && declared)) {
+			// a call that declares the view-as mode was put in it again (DeclaredViewAs): that pin is answered; another
+			// principal's is no mode of the caller's
+			if (!(pin == "view_as" && (declared || moving.foreign))) {
 				lost.push_back(pin);
 			}
 		}
 		bool transaction = std::find(lost.begin(), lost.end(), "transaction") != lost.end();
 		vector<string> restored, failed;
-		{
-			auto conn = state->ConnFor(handle);
-			auto execution = state->LockForStatement(*conn);
-			TempScanScope temp_scan(conn->con->context.get());
-			auto restore = [&](const string &what, const string &sql) {
-				auto prefixed = state->store->SessionSql(handle, sql, string(), string(), string(), string(), string());
-				bool done = !prefixed.empty();
-				if (done) {
-					auto result = conn->con->Query(prefixed);
-					done = !result->HasError();
-					// acl_session_use answers false when it recorded nothing
-					for (idx_t row = 0; done && row < result->RowCount(); row++) {
-						auto value = result->Collection().GetValue(0, row);
-						done = !(value.type().id() == LogicalTypeId::BOOLEAN && !value.IsNull() &&
-						         !value.GetValue<bool>());
-					}
+		TempScanScope temp_scan(conn.con->context.get());
+		auto restore = [&](const string &what, const string &sql) {
+			auto prefixed = state->store->SessionSql(handle, sql, string(), string(), string(), string(), string());
+			bool ok = !prefixed.empty();
+			if (ok) {
+				auto result = conn.con->Query(prefixed);
+				ok = !result->HasError();
+				// acl_session_use answers false when it recorded nothing
+				for (idx_t row = 0; ok && row < result->RowCount(); row++) {
+					auto value = result->Collection().GetValue(0, row);
+					ok = !(value.type().id() == LogicalTypeId::BOOLEAN && !value.IsNull() && !value.GetValue<bool>());
 				}
-				(done ? restored : failed).push_back(what);
-			};
+			}
+			(ok ? restored : failed).push_back(what);
+		};
+		if (!unreadable && !moving.foreign) {
 			// in the view-as mode a USE is not the client's to make (metadata only): the declared mode is the context
 			if (!declared && !carried.use_catalog.empty()) {
 				auto path = carried.use_schema.empty() ? carried.use_catalog
@@ -2710,33 +2773,55 @@ private:
 				restore(setting.first,
 				        "SET \"" + setting.first + "\" = '" + StringUtil::Replace(setting.second, "'", "''") + "'");
 			}
-			if (transaction) {
-				auto begun = conn->con->Query("BEGIN TRANSACTION");
-				if (!begun->HasError()) {
-					ValidChecker::Invalidate(conn->con->context->ActiveTransaction(),
-					                         "the session moved to another node and lost its open transaction");
-					conn->moved_txn = true;
-				}
-			}
 		}
+		if (transaction) {
+			// begun here and aborted: duckdb refuses its statements until ROLLBACK, and the door's own guard
+			// (MovedTxnGuardLocked) answers a COMMIT - no part of it runs in autocommit
+			auto begun = conn.con->Query("BEGIN TRANSACTION");
+			if (begun->HasError()) {
+				return refuse("session_pinned", "lost its open transaction"); // not done: the session ends
+			}
+			ValidChecker::Invalidate(conn.con->context->ActiveTransaction(),
+			                         "the session moved to another node and lost its open transaction");
+			conn.moved_txn = true;
+		}
+		moving.done = true;
 		if (!lost.empty() || !failed.empty()) {
 			string what;
-			if (!lost.empty()) {
-				what = "lost " + SessionStateLost(lost);
+			if (unreadable) {
+				what = "lost its session context (ROLLBACK to go on: if a transaction was open, nothing of it was "
+				       "committed)";
+			} else {
+				if (!lost.empty()) {
+					what = "lost " + SessionStateLost(lost);
+				}
+				if (!failed.empty()) {
+					what += (what.empty() ? "" : " and ") + string("could not restore its ") +
+					        StringUtil::Join(failed, ", ");
+				}
+				if (transaction) {
+					what += " (ROLLBACK to go on: nothing of it was committed)";
+				}
 			}
-			if (!failed.empty()) {
-				what +=
-				    (what.empty() ? "" : " and ") + string("could not restore its ") + StringUtil::Join(failed, ", ");
-			}
-			if (transaction) {
-				what += " (ROLLBACK to go on: nothing of it was committed)";
-			}
-			return refuse(lost.empty() ? "session_unrestorable" : "session_pinned", what);
+			return refuse(unreadable     ? "session_unreadable"
+			              : lost.empty() ? "session_unrestorable"
+			                             : "session_pinned",
+			              what);
 		}
 		if (!restored.empty()) {
 			state->store->AuditSessionMove("flight", handle, false, "", StringUtil::Join(restored, ", "));
 		}
 		return arrow::Status::OK();
+	}
+
+	//! spec 135: a takeover that did not finish leaves no session behind: the next call on the cookie reads the state
+	//! again, rather than running on a session bound but never restored
+	void AbandonTakeover(const string &handle, Takeover &moving) {
+		if (moving.hold.owns_lock()) {
+			moving.hold.unlock();
+		}
+		state->store->SessionClose(handle);
+		state->DropConn(handle);
 	}
 
 	//! The connection's cookie id, from our own middleware (empty if unavailable).
@@ -2866,12 +2951,24 @@ private:
 			moving.read = DecodeSessionState(StateCookieFromHeaders(CookieHeadersOf(context)), moving.carried);
 			if (moving.read == SessionStateRead::OK) {
 				Principal caller;
-				if (!VerifyQuietly(token, caller) || moving.carried.principal != PrincipalTag(caller)) {
-					moving.read = SessionStateRead::ABSENT;
+				if (!VerifyQuietly(token, caller)) {
+					return arrow::Status::UnknownError("acl: authentication failed");
+				}
+				auto &pins = moving.carried.pinned;
+				if (moving.carried.principal != PrincipalTag(caller)) {
+					// another principal's state: nothing of it carries (only its pins, which still refuse once)
+					moving.foreign = true;
+					moving.carried.use_catalog.clear();
+					moving.carried.use_schema.clear();
+					moving.carried.settings.clear();
+					pins.erase(std::remove(pins.begin(), pins.end(), "view_as"), pins.end());
+					if (pins.empty()) {
+						moving.read = SessionStateRead::ABSENT;
+					}
 				} else if (DeclaredRole(context).empty() &&
-				           std::find(moving.carried.pinned.begin(), moving.carried.pinned.end(), "view_as") !=
-				               moving.carried.pinned.end()) {
-					state->store->SessionMarkViewAsEnded(cookie);
+				           std::find(pins.begin(), pins.end(), "view_as") != pins.end()) {
+					// not seated afresh: the pin in the client's own jar refuses each call until it connects anew. No
+					// record is kept of it - a state the client writes never grows the node's memory
 					state->store->AuditSessionRefused("flight", "view_as", "a moved view-as connection");
 					return arrow::Status::Invalid("acl: this connection's session viewed the catalog as a role and is "
 					                              "gone - connect again");
@@ -2895,6 +2992,12 @@ private:
 			}
 			// what refuses a token in the prefix refuses it here, and says no more (spec 040)
 			return arrow::Status::UnknownError("acl: authentication failed");
+		}
+		if (!transient && moving.read != SessionStateRead::ABSENT) {
+			// spec 135: held before it is bound - a concurrent call on the cookie finds the session and waits for its
+			// connection until the takeover is done
+			moving.conn = state->ConnFor(handle);
+			moving.hold = std::unique_lock<std::mutex>(moving.conn->exec);
 		}
 		if (!transient) {
 			state->store->SessionBind(cookie, handle); // ends the session it replaces, if any

@@ -1243,11 +1243,6 @@ idx_t PolicyStore::SessionCloseAll() {
 	return closed;
 }
 
-void PolicyStore::SessionMarkViewAsEnded(const string &external_id) {
-	lock_guard<mutex> guard(lock);
-	view_as_ended[external_id] = NowSeconds();
-}
-
 bool PolicyStore::SessionViewAsEnded(const string &external_id) {
 	lock_guard<mutex> guard(lock);
 	return view_as_ended.count(external_id) > 0;
