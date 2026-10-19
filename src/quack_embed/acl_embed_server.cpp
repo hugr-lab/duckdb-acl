@@ -588,7 +588,7 @@ unique_ptr<QuackMessage> QuackServer::DispatchMessage(MemoryStream &read_stream)
 	if (MessageRequiresConnection(header.type)) {
 		connection = GetConnection(header.connection_id);
 		if (!connection) {
-			return make_uniq<ErrorResponse>("Invalid connection id");
+			return make_uniq<ErrorResponse>("acl: this connection is not known on this node - connect again");
 		}
 	}
 
@@ -599,7 +599,7 @@ unique_ptr<QuackMessage> QuackServer::DispatchMessage(MemoryStream &read_stream)
 	if (connection) {
 		// Only supported, structurally valid messages for an existing session renew its lease.
 		if (!RenewConnectionLease(header.connection_id, connection)) {
-			return make_uniq<ErrorResponse>("Connection heartbeat lease expired");
+			return make_uniq<ErrorResponse>("acl: this connection's lease ran out on this node - connect again");
 		}
 	}
 

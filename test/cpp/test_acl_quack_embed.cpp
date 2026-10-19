@@ -442,6 +442,28 @@ int main(int argc, char *argv[]) {
 			Check(set_cookie("").empty(), "the label unset again: no cookie");
 		});
 
+		// spec 135: quack authenticates only at CONNECT, so a node that does not know a connection id cannot seat it -
+		// the door says so in words a client can act on (connect again), where quack said "Invalid connection id".
+		// A door that restarts forgets every connection, which is the case of a client re-placed on another node.
+		Scenario("spec 135: an unknown connection is told to connect again", [&] {
+			Exec(con, "ATTACH 'quack:localhost:31975' AS moving (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
+			auto before = con.Query("SELECT count(*)::BIGINT FROM moving.main.orders");
+			CheckOk(*before, "the connection reads while the node knows it");
+			Exec(con, "SELECT acl_quack_stop('quack:localhost:31975')");
+			Exec(con, "SELECT acl_quack_serve('quack:localhost:31975', 'server-token')");
+			auto after = con.Query("SELECT count(*)::BIGINT FROM moving.main.orders");
+			Check(after->HasError() &&
+			          after->GetError().find("acl: this connection is not known on this node - connect again") !=
+			              std::string::npos,
+			      "a connection the node no longer knows is told to connect again: " +
+			          (after->HasError() ? after->GetError() : std::string("it read")));
+			con.Query("DETACH moving"); // its DISCONNECT names an id the node does not know: answered, whatever it says
+			Exec(con, "ATTACH 'quack:localhost:31975' AS moved (TYPE quack, TOKEN '" + std::string(TOKEN) + "')");
+			auto again = con.Query("SELECT count(*)::BIGINT FROM moved.main.orders");
+			CheckOk(*again, "connecting again reads");
+			Exec(con, "DETACH moved");
+		});
+
 		Scenario("two advertised issuers make an ISSUER-less secret ask for one", [&] {
 			auto ambiguous = con.Query("CREATE SECRET amb (TYPE quack, PROVIDER oidc, SCOPE "
 			                           "'quack:localhost:31975', CLIENT_ID 'cli', FLOW 'password', "

@@ -1,4 +1,5 @@
 #include "acl_policy.hpp"
+#include "acl_session_state.hpp"
 #include "acl_lineage.hpp"
 
 #include "acl_audit_pipeline.hpp"
@@ -436,6 +437,17 @@ void PolicyStore::AuditSessionRefused(const string &door, const string &handle, 
 	auto known = SessionPrincipal(handle, principal, why) && SessionRefOf(handle, ref);
 	SessionEvent(audit.get(), known ? principal : Principal(), door, known ? ref.id : string(), -1, "refused",
 	             reason_code, reason, -1);
+}
+
+void PolicyStore::AuditSessionMove(const string &door, const string &handle, bool refused, const char *reason_code,
+                                   const string &what) {
+	Principal principal;
+	string why;
+	PolicyStore::SessionRef ref;
+	auto known = SessionPrincipal(handle, principal, why) && SessionRefOf(handle, ref);
+	SessionEvent(audit.get(), known ? principal : Principal(), door, known ? ref.id : string(),
+	             known ? ref.audit_level : static_cast<int8_t>(-1), refused ? "move_refused" : "moved",
+	             refused ? reason_code : "", what, -1);
 }
 
 void PolicyStore::SessionMarkDeclaredViewAs(const string &handle) {
@@ -1156,9 +1168,9 @@ bool ClientSettingAllowed(const string &name) {
 	// spec 107 adds the client's lineage context (the job and the external run a statement is a step
 	// of): metadata of the lineage event, nothing a statement reads or costs
 	// spec 119: a session may lower the metadata row bound for itself (the setting refuses a raise)
-	return StringUtil::CIEquals(name, "TimeZone") || StringUtil::CIEquals(name, "Calendar") ||
-	       StringUtil::CIEquals(name, "acl_metadata_max_rows") || StringUtil::CIEquals(name, "acl_correlation_id") ||
-	       StringUtil::CIEquals(name, "acl_traceparent") || LineageClientSetting(name);
+	// spec 135: the list is the session state's own (PORTABLE_SETTINGS): what a client may SET is what a moved
+	// session carries, one list for both
+	return PortableSetting(name) != nullptr;
 }
 
 bool PolicyStore::SetDraining(bool value) {

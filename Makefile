@@ -110,6 +110,10 @@ $(TEST_CPP_DIR)/test_acl_catalog_rpc: TEST_CPP_EXTRA := src/acl_catalog_rpc.cpp
 $(TEST_CPP_DIR)/test_acl_identity_routing: src/acl_identity.cpp src/include/acl_identity.hpp
 $(TEST_CPP_DIR)/test_acl_identity_routing: TEST_CPP_EXTRA := src/acl_identity.cpp duckdb/third_party/yyjson/yyjson.cpp
 
+# spec 135: the session-state cookie's codec is its own translation unit, with the bundled yyjson
+$(TEST_CPP_DIR)/test_acl_session_state: src/acl_session_state.cpp src/include/acl_session_state.hpp
+$(TEST_CPP_DIR)/test_acl_session_state: TEST_CPP_EXTRA := src/acl_session_state.cpp duckdb/third_party/yyjson/yyjson.cpp
+
 # spec 107: the lineage walker is its own translation unit, run over plans bound from SQL
 $(TEST_CPP_DIR)/test_acl_lineage_walker: src/acl_lineage_walker.cpp src/include/acl_lineage_walker.hpp
 $(TEST_CPP_DIR)/test_acl_lineage_walker: TEST_CPP_EXTRA := src/acl_lineage_walker.cpp

@@ -806,6 +806,27 @@ group known, profile version). **Spec 127** moved it, with its history and tests
 repository builds this acl in (`acl_sources.cmake`, `LoadAclCore`, `ACL_EMBEDDED`) as one extension, `hugr_node`, and
 registers its part; this repository is the open node (tag `pre-platform-split` = the last state with the part in).
 
+**Spec 135 — a session moves between nodes**: the Flight door sets `acl_session_state` (base64url JSON, codec
+`acl_session_state.{hpp,cpp}`, ≤ 1 KiB written - past it the principal + pins + `context` - ≤ 4 KiB read, keys once,
+no NUL): a principal tag (`p`, sha-256 of `PrincipalFingerprint`, required), the session's USE (spec 114), the
+client's own spec 068 SETs (LOCAL and not what a fresh session of the node reads - `PORTABLE_SETTINGS` is THE list,
+`ClientSettingAllowed` reads it) and `pinned` (`!IsAutoCommit()`, a temp table, view-as) - from `UnderSession`'s end
+(and after a throw) by `ServerCallContext::AddHeader` (a middleware's headers go out BEFORE the handler runs); nothing
+is sent when the session vanished mid-call, ran nothing here, or `exec` is busy (`try_lock`). A cookie this node does
+not know (`SessionFor`, not a swap): a token that does not verify = `authentication failed`; another principal's tag
+= nothing carried, its pins refuse once (a transaction aborted); an undeclared view-as pin = never seated (no node
+record - the pin in the jar refuses); otherwise the new session's `exec` is taken BEFORE `SessionBind` and held
+through `TakeOverState` (after `DeclaredViewAs`; an unfinished takeover ends the session - `AbandonTakeover`), which
+restores the portable part through the client's own paths (`SET schema` / `SET acl_use_schema`, each `SET`, under the
+session's prefix), begins + `ValidChecker::Invalidate`s a lost transaction (an unreadable state counts as one - fail
+closed) and refuses the call once naming everything not carried. While `SessionConn::moved_txn`, `MovedTxnGuardLocked`
+(every client-SQL path) passes ROLLBACK, answers COMMIT "nothing of it was committed", refuses the rest; EndTransaction
+ends it whatever id. Events `session` `moved` (only when carried, names never values) / `move_refused`
+(`session_pinned|unrestorable|unreadable`), counters `acl.sessions.moved{door}` / `.move_refused{door,reason_code}`.
+quack (CONNECT authenticates): an unknown id / a lapsed lease answer `… - connect again` (two `sync.py` hunks).
+Tests: `test/cpp/test_acl_session_state.cpp`, `test/e2e/flight/run.sh` (kill + a real cookie jar + `reforge`),
+`test_acl_quack_embed.cpp`.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,
