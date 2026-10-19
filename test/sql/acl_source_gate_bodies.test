@@ -164,6 +164,49 @@ ACL ROLE "cadm" CREATE VIRTUAL TABLE c.m1 AS src.main.t COLUMNS (id, k = (SELECT
 ----
 <REGEX>:.*names "sec\.main\.vconst", outside the sources granted.*
 
+# --- a nested schema keeps its whole path: a grant on another schema's leaf name admits nothing (review 138) -------
+
+statement ok
+ATTACH ':memory:' AS nd;
+
+statement ok
+CREATE SCHEMA nd.a;
+
+statement ok
+CREATE SCHEMA nd.a.b;
+
+statement ok
+CREATE SCHEMA nd.b;
+
+statement ok
+CREATE TABLE nd.a.b.hidden(s VARCHAR);
+
+statement ok
+ACL ADMIN CREATE ROLE onb;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE onb CAPS '{"select": true, "manage": true}';
+
+statement ok
+ACL ADMIN GRANT SOURCE nd.b TO ROLE onb;
+
+statement ok
+ACL ADMIN CREATE ROLE ona;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE ona CAPS '{"select": true, "manage": true}';
+
+statement ok
+ACL ADMIN GRANT SOURCE nd.a TO ROLE ona;
+
+statement error
+ACL ROLE "onb" CREATE VIRTUAL VIEW c.nb AS 'SELECT * FROM nd.a.b.hidden';
+----
+<REGEX>:.*names "nd\.a\.b\.hidden", outside the sources granted.*
+
+statement ok
+ACL ROLE "ona" CREATE VIRTUAL VIEW c.na AS 'SELECT * FROM nd.a.b.hidden';
+
 # --- admitted: the granted source's own objects, whatever its views read (the owner's rule), and a CTE -----------
 
 statement ok

@@ -97,11 +97,32 @@ reaches by any path.
   - refused: a replacement-scan file; a CTE's name used outside its scope;
   - admitted: `src.main.inner_v` (its inner `main.t` stays in `src`), `src.main.over_v` (it reads `sec` - the
     owner's rule), a body with a CTE;
-  - `acl_check_catalog` reports `source_not_granted` for a body stored over `sec.main.vconst`.
+  - refused: `SUMMARIZE` / `DESCRIBE` of `sec` objects; a CTE naming itself or a later sibling, and a recursive
+    CTE's left side, where those names read the default database's `g`; a NEAREST ranking subquery over `sec`;
+    a computed column's subquery over a view of `sec`;
+  - a nested schema: a grant on `nd.b` is refused `nd.a.b.hidden`, and one on `nd.a` admits it;
+  - admitted: a recursive CTE that reads itself on its right side;
+  - `acl_check_catalog` reports `source_not_granted` for a body stored as `SELECT * FROM g`.
 - **Integration** (`test/sql/integration/acl_source_gate_policy_postgres.test`): a policy store in a Postgres
   schema that is its database's default; `<db>.admins` in a policy admin's body is refused.
 - The existing source-gate tests stay green: `platform_attached`, `platform_review`, `acl_two_part_phys`,
   `platform_effective_rights` and `acl_catalog_maintenance`.
+
+## What the review found
+
+One adversarial review, three passes: bypass hunting, regressions, tests. Its findings were fixed before the PR:
+
+- **SUMMARIZE / DESCRIBE** in a body were skipped. A `SHOW` reference is now walked: its query, or the object it
+  names.
+- **The CTE scope was wider than duckdb's.** A CTE's definition now sees only the CTEs written before it and those
+  around it, never itself nor a later sibling. Only a recursive CTE's right side sees its own name.
+- **NEAREST's ranking expression** was skipped, the field spec 139 found. The core rewriter and the function gate
+  had the same gap; spec 139 closed those.
+- **A nested schema lost its path.** The entry is now the whole path `<db>.<schema path>.<object>`, so a grant on
+  another schema's leaf name admits nothing, and a grant on the parent admits it. Spec 137's reading of a two-part
+  name had the same bug and is fixed with it.
+- **Weak tests** were made to fail without the fix. The check's probe now stores a one-part name, which the old
+  check skipped.
 
 ## Decisions
 
