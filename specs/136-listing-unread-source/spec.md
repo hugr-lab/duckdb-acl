@@ -198,4 +198,7 @@ grant's projection - still lists them, so the clause would be false for it.)
   older than it.
 
 - The console (hugr-platform 003) can show the unread sources from the counter and the events.
-- The Flight catalog RPCs could carry the mark if Flight SQL's `GetTables` grows a remarks column.
+- The comments of an object and of its columns reach a Flight client in the Arrow schema the door describes (schema
+  and field metadata) - the owner, 2026-10-19: a separate task; the descriptions must be there and visible in Arrow.
+  The mark rides with it. DuckDB's side is discussion duckdb#25917 (COMMENT / TAGS that follow a column through
+  queries; rustyconover's `column-metadata-stack` branch on `v2.0-cyanoptera` carries Arrow and Parquet too).
