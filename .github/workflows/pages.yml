@@ -77,6 +77,9 @@ jobs:
 
       - name: Build the docs site
         working-directory: website
+        env:
+          # with the hugr-lab.com copy on, this copy names it as canonical and has no sitemap
+          DOCS_CANONICAL: ${{ vars.DOCS_IONOS == 'true' && 'https://hugr-lab.com/docs/duckdb-acl/' || '' }}
         run: npx docusaurus build
 
       # The same docs for hugr-lab.com/docs/duckdb-acl/ (IONOS): off until the organization sets DOCS_IONOS=true

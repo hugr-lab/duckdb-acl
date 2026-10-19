@@ -11,6 +11,10 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 // The same docs are built twice: for GitHub Pages (default) and for hugr-lab.com on IONOS (DOCS_TARGET=ionos).
 const ionos = process.env.DOCS_TARGET === 'ionos';
+// While the hugr-lab.com copy exists (DOCS_IONOS on), pages.yml sets DOCS_CANONICAL for
+// the GitHub Pages build: its pages then name the hugr-lab.com copy as canonical
+// (src/theme/SiteMetadata) and it has no sitemap of its own.
+const canonicalBase = ionos ? '' : process.env.DOCS_CANONICAL ?? '';
 const site = ionos
   ? {url: 'https://hugr-lab.com', baseUrl: '/docs/duckdb-acl/', home: 'https://hugr-lab.com/', impressum: 'https://hugr-lab.com/impressum/', datenschutz: 'https://hugr-lab.com/datenschutz/'}
   : {url: 'https://hugr-lab.github.io', baseUrl: '/duckdb-acl/', home: 'https://hugr-lab.github.io/', impressum: 'https://hugr-lab.github.io/impressum/', datenschutz: 'https://hugr-lab.github.io/datenschutz/'};
@@ -24,7 +28,7 @@ const config: Config = {
   baseUrl: site.baseUrl,
   baseUrlIssueBanner: false,
   trailingSlash: true,
-  customFields: {docsTarget: ionos ? 'ionos' : 'github'},
+  customFields: {docsTarget: ionos ? 'ionos' : 'github', canonicalBase},
 
   organizationName: 'hugr-lab',
   projectName: 'duckdb-acl',
@@ -54,6 +58,7 @@ const config: Config = {
           showLastUpdateTime: true,
         },
         blog: false,
+        sitemap: canonicalBase ? false : undefined,
         theme: {
           customCss: './src/css/custom.css',
         },
