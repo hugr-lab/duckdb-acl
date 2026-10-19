@@ -1,0 +1,141 @@
+# Spec 138: the source gate judges what a body names, by catalog entry
+
+- **Status**: accepted (the owner, 2026-10-19: «138 да»; Q1 extended to views; first moved after the release, then
+  «давай уже разберемся до конца и если уже почти все сделали то давай» - done before it, kept proportionate: in the
+  main scenario one policy admin builds every catalog, and the source gate judges only catalog admins)
+- **Date**: 2026-10-19
+- **Author**: Claude (with the owner)
+
+## Summary
+
+A catalog admin builds only over the sources granted to it (spec 118.3). For a stored body - a view's SQL, an RLS
+predicate, a mask, a computed column - the gate judges the table names that duckdb's name extraction reports. Review
+137 found that this is not what the body names, in three ways. From now on the gate judges the **catalog entries**
+the body names - each reference as duckdb resolves it, by its exact `<database>.<schema>.<object>` - and, by the
+owner's rule, never what a granted view or function reads inside.
+
+## Problem
+
+`AuthorizeSources` (`src/acl_platform.cpp`) takes a body's names from `Connection::GetTableNames(probe, true)` and
+judges each with `SourceGranted`. In the name-extraction mode, duckdb's binder records a reference **as written**
+and expands a physical view into its body. Review 137 found three gaps:
+
+1. **A physical view's own name is never judged.**
+   - Extraction does not record a view, only the references inside it, as written in the view.
+   - Those names bind in the view's own catalog: `main.secret` in a view of `sec` is `sec.main.secret`.
+   - So a body reading a view of an ungranted source passes whenever the view's inner names look granted. In the
+     probe, a view over `vconst`, a constant, passed; so did one over `read_csv('<file>')`, which read the file's
+     rows.
+2. **A one-part name is matched against a database granted whole.**
+   - `SELECT * FROM g` reads the table `g` of the node's default database.
+   - The gate treats the name `g` as the database `g`.
+3. **The policy store's two-part branch assumes `main`.**
+   - `NamesPolicyStore` refuses `<db>.<table>` only when the policy lives in `<db>.main`.
+   - A policy catalog in Postgres (`public`) is not covered for a body's `pol.admins`.
+
+Spec 137 closed the case of a two-part name (`pg.t` under a `pg.main` grant). These three are older.
+
+## Design
+
+### One judgment, by catalog entry: what the body names, never what a granted object reads inside
+
+The owner, 2026-10-19 (Q1): a table function the principal holds a right on is allowed, whatever its own query
+reads inside. The same holds for a physical view of a granted source: the right on the source is the right on its
+objects. The gate judges **what the body names**, each reference resolved to its exact entry, and never looks into
+a granted view's or function's definition.
+
+For each body a catalog admin (neither policy nor passthrough) writes, on the fresh connection the gate already
+probes with:
+
+1. **Every reference as written resolves to an entry**, and the entry's source must be granted.
+   - The references come from the body's own parse: `BodyTables`, the walk spec 120.2's exposures and the check
+     already use.
+   - Each is resolved the way the binder resolves it: catalog-or-schema, the search path, the default database and
+     its default schema. That gives the exact entry: a table, a view or a missing name.
+   - This judges a physical view by **its own** catalog and schema, and a one-part name by the default database it
+     reads.
+   - A name that resolves to nothing, or to two entries (ambiguous), is refused. The body must bind anyway.
+2. **The body must bind** (as today): it is bound normally on the probe connection, and a body that does not
+   bind is refused - nothing judged by name is then left unread.
+3. **What a granted view or function reads inside is not judged.**
+   - A view of a granted source that reads another source is admitted. Today its inner text was judged, and
+     wrongly (`main.x` read in the default database).
+   - A table function the author may call is admitted whatever it scans: the function gate (spec 072, judged per
+     body by `AuthorizeBodies`) decides the call, the source gate does not look inside.
+
+The gate's `SourceGranted` takes three-part entries only; the plain two-part `main` reading goes away for bodies.
+`acl_check_catalog`'s `source_not_granted` judges stored bodies the same way, so the gate and the check agree.
+
+### The policy store, by entry
+
+`RequireNotPolicyStore` for a body adds the same entries: a reference resolving into the policy store's database and
+schema is refused, whatever the policy's schema. Its text check (`TextNamesPolicyStore`) and its name-extraction
+check stay as they are. Those also judge what a view reads inside: the policy store is the one thing no definition
+reaches by any path.
+
+## Enforcement & security
+
+- **Fail closed:** a reference that does not resolve, resolves ambiguously, or whose lookup throws is refused.
+- **What changes for a catalog admin:**
+  - A body naming a physical view of an ungranted source is refused, even when the view's inner names look
+    granted (the gap).
+  - `SELECT * FROM g` is judged as the default database's table `g` (the gap).
+  - A view of a granted source is admitted whatever it reads inside - the owner's rule (Q1). Today its inner text
+    was judged; this is the one place the gate admits more than before, and it is the operator's own view in a
+    source the operator granted.
+- **Policy and passthrough** are not judged by the source gate, as today.
+- **Nothing stored is taken back.** Bodies stored before this spec are reported by `acl_check_catalog`
+  (`source_not_granted`) when they fail the new judgment, and never rewritten. This is the owner's rule.
+
+## Testing
+
+- **sqllogictest** (`test/sql/acl_source_gate_bodies.test`), gate coverage probes for a catalog admin granted
+  `src` and `g`:
+  - refused: a view of the ungranted `sec` over a constant (`sec.main.vconst`), and one over
+    `read_csv('<file>')`; the same view in an RLS body;
+  - refused: `SELECT * FROM g` (the default database's table `g`, not the granted database `g`);
+  - refused: a replacement-scan file; a CTE's name used outside its scope;
+  - admitted: `src.main.inner_v` (its inner `main.t` stays in `src`), `src.main.over_v` (it reads `sec` - the
+    owner's rule), a body with a CTE;
+  - refused: `SUMMARIZE` / `DESCRIBE` of `sec` objects; a CTE naming itself or a later sibling, and a recursive
+    CTE's left side, where those names read the default database's `g`; a NEAREST ranking subquery over `sec`;
+    a computed column's subquery over a view of `sec`;
+  - a nested schema: a grant on `nd.b` is refused `nd.a.b.hidden`, and one on `nd.a` admits it;
+  - admitted: a recursive CTE that reads itself on its right side;
+  - `acl_check_catalog` reports `source_not_granted` for a body stored as `SELECT * FROM g`.
+- **Integration** (`test/sql/integration/acl_source_gate_policy_postgres.test`): a policy store in a Postgres
+  schema that is its database's default; `<db>.admins` in a policy admin's body is refused.
+- The existing source-gate tests stay green: `platform_attached`, `platform_review`, `acl_two_part_phys`,
+  `platform_effective_rights` and `acl_catalog_maintenance`.
+
+## What the review found
+
+One adversarial review, three passes: bypass hunting, regressions, tests. Its findings were fixed before the PR:
+
+- **SUMMARIZE / DESCRIBE** in a body were skipped. A `SHOW` reference is now walked: its query, or the object it
+  names.
+- **The CTE scope was wider than duckdb's.** A CTE's definition now sees only the CTEs written before it and those
+  around it, never itself nor a later sibling. Only a recursive CTE's right side sees its own name.
+- **NEAREST's ranking expression** was skipped, the field spec 139 found. The core rewriter and the function gate
+  had the same gap; spec 139 closed those.
+- **A nested schema lost its path.** The entry is now the whole path `<db>.<schema path>.<object>`, so a grant on
+  another schema's leaf name admits nothing, and a grant on the parent admits it. Spec 137's reading of a two-part
+  name had the same bug and is fixed with it.
+- **Weak tests** were made to fail without the fix. The check's probe now stores a one-part name, which the old
+  check skipped.
+
+## Decisions
+
+- **Q1 (the owner, 2026-10-19):** «если дали права на табличную функцию то ее разрешаем независимо от того что
+  разрешено внутри ее запроса» - a right on the object is enough; what its definition reads is not judged. And for a
+  physical view of a granted source the same (the owner: «да, и на вьюху распространяется»).
+
+## Alternatives considered
+
+- **Keep name extraction and add the view names.** Extraction does not record views, and it gives inner names
+  without their catalog. Fixing that means resolving in each view's own context, which is what binding already
+  does.
+- **Refuse every physical view in a catalog admin's body.** Simple and closed, but it takes away a use that works:
+  a view inside a granted source.
+- **Also judge every table the bound body scans** (through views). Stricter, but against the owner's rule (Q1):
+  the right on a view or a function is the right to what it reads.

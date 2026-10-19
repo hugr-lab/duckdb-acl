@@ -1,0 +1,230 @@
+# name: test/sql/acl_source_gate_bodies.test
+# description: spec 138 - the source gate judges what a catalog admin's body NAMES, each reference resolved to the
+#   catalog entry duckdb binds it to: a physical view by its own catalog, a one-part name in the default database, a
+#   CTE of its scope left out, a name of no object refused; what a granted view or function reads inside is not
+#   judged (the owner: the virtual catalog is a facade). Gate coverage probes, one per gap.
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS src;
+
+statement ok
+CREATE TABLE src.main.t(id INTEGER);
+
+statement ok
+ATTACH ':memory:' AS sec;
+
+statement ok
+CREATE TABLE sec.main.secret(s VARCHAR);
+
+statement ok
+INSERT INTO sec.main.secret VALUES ('top-secret');
+
+statement ok
+CREATE VIEW sec.main.vconst AS SELECT 42 AS x;
+
+statement ok
+COPY (SELECT 'file-row' AS r) TO '{TEST_DIR}/gate138.csv' (HEADER);
+
+statement ok
+CREATE VIEW sec.main.vcsv AS SELECT * FROM read_csv('{TEST_DIR}/gate138.csv');
+
+# views of the granted source: one whose inner name stays inside it, one that reads the ungranted source
+statement ok
+CREATE VIEW src.main.inner_v AS SELECT * FROM main.t;
+
+statement ok
+CREATE VIEW src.main.over_v AS SELECT * FROM sec.main.secret;
+
+# a table of the node's default database named like a granted database
+statement ok
+CREATE TABLE g(s VARCHAR);
+
+statement ok
+INSERT INTO g VALUES ('default-db-secret');
+
+statement ok
+ATTACH ':memory:' AS g;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE cadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cadm CAPS '{"select": true, "manage": true}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SOURCE src TO ROLE cadm;
+
+statement ok
+ACL ADMIN GRANT SOURCE g TO ROLE cadm;
+
+# --- a physical view of an ungranted source is judged by its own catalog, whatever it reads inside ----------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.l1 AS 'SELECT * FROM sec.main.vconst';
+----
+<REGEX>:.*the definition's body names "sec\.main\.vconst", outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.l2 AS 'SELECT * FROM sec.main.vcsv';
+----
+<REGEX>:.*the definition's body names "sec\.main\.vcsv", outside the sources granted.*
+
+# in an RLS body too
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.r1 AS src.main.t RLS (id IN (SELECT x FROM sec.main.vconst));
+----
+<REGEX>:.*names "sec\.main\.vconst", outside the sources granted.*
+
+# --- a one-part name is the default database's table, never the database it is spelled like ----------------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.l3 AS 'SELECT * FROM g';
+----
+<REGEX>:.*the definition's body names "g", outside the sources granted.*
+
+# --- a name of no object (a file read by a replacement scan) reads no source ---------------------------------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.l4 AS 'SELECT * FROM ''{TEST_DIR}/gate138.csv''';
+----
+<REGEX>:.*outside the sources granted.*
+
+# a CTE is left out only in its own scope: the same name outside it names nothing
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.l5 AS 'SELECT * FROM (WITH q AS (SELECT 1 AS a) SELECT * FROM q) s CROSS JOIN q';
+----
+<REGEX>:.*the definition's body names "q", outside the sources granted.*
+
+# --- SUMMARIZE / DESCRIBE name what they read (review 138) ----------------------------------------------------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.s1 AS 'SELECT * FROM (SUMMARIZE sec.main.secret)';
+----
+<REGEX>:.*names "sec\.main\.secret", outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.s2 AS 'SELECT * FROM (SUMMARIZE SELECT s FROM sec.main.secret)';
+----
+<REGEX>:.*names "sec\.main\.secret", outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.s3 AS 'SELECT * FROM (DESCRIBE sec.main.secret)';
+----
+<REGEX>:.*names "sec\.main\.secret", outside the sources granted.*
+
+# --- a CTE's scope is duckdb's: never itself, never a later sibling, only a recursive CTE's right side --------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c1 AS 'WITH g AS (SELECT * FROM g) SELECT * FROM g';
+----
+<REGEX>:.*names "g", outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c2 AS 'WITH a1 AS (SELECT * FROM g), g AS (SELECT 1 AS s) SELECT * FROM a1';
+----
+<REGEX>:.*names "g", outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c3 AS 'WITH RECURSIVE g AS (SELECT * FROM g UNION ALL SELECT * FROM g WHERE false) SELECT * FROM g';
+----
+<REGEX>:.*names "g", outside the sources granted.*
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c4 AS 'WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT * FROM r';
+
+# --- NEAREST's ranking expression (spec 139's field) ---------------------------------------------------------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.n1 AS 'SELECT x.id FROM src.main.t x INNER JOIN src.main.t y EXACT NEAREST 1 BY DISTANCE x.id - y.id + (SELECT count(*) FROM sec.main.secret)';
+----
+<REGEX>:.*names "sec\.main\.secret", outside the sources granted.*
+
+# --- a computed column's body ----------------------------------------------------------------------------------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.m1 AS src.main.t COLUMNS (id, k = (SELECT x FROM sec.main.vconst));
+----
+<REGEX>:.*names "sec\.main\.vconst", outside the sources granted.*
+
+# --- a nested schema keeps its whole path: a grant on another schema's leaf name admits nothing (review 138) -------
+
+statement ok
+ATTACH ':memory:' AS nd;
+
+statement ok
+CREATE SCHEMA nd.a;
+
+statement ok
+CREATE SCHEMA nd.a.b;
+
+statement ok
+CREATE SCHEMA nd.b;
+
+statement ok
+CREATE TABLE nd.a.b.hidden(s VARCHAR);
+
+statement ok
+ACL ADMIN CREATE ROLE onb;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE onb CAPS '{"select": true, "manage": true}';
+
+statement ok
+ACL ADMIN GRANT SOURCE nd.b TO ROLE onb;
+
+statement ok
+ACL ADMIN CREATE ROLE ona;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE ona CAPS '{"select": true, "manage": true}';
+
+statement ok
+ACL ADMIN GRANT SOURCE nd.a TO ROLE ona;
+
+statement error
+ACL ROLE "onb" CREATE VIRTUAL VIEW c.nb AS 'SELECT * FROM nd.a.b.hidden';
+----
+<REGEX>:.*names "nd\.a\.b\.hidden", outside the sources granted.*
+
+statement ok
+ACL ROLE "ona" CREATE VIRTUAL VIEW c.na AS 'SELECT * FROM nd.a.b.hidden';
+
+# --- admitted: the granted source's own objects, whatever its views read (the owner's rule), and a CTE -----------
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.ok1 AS 'SELECT * FROM src.main.inner_v';
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.ok2 AS 'SELECT * FROM src.main.over_v';
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.ok3 AS 'WITH x AS (SELECT * FROM src.main.t) SELECT * FROM x';
+
+# --- the check judges a stored body the same way -----------------------------------------------------------------
+
+# (a one-part name the old check skipped as "the default database's")
+statement ok
+UPDATE store.acl.relations SET view_sql = 'SELECT * FROM g' WHERE vname = 'ok3';
+
+query TT
+SELECT object, problem FROM acl_check_catalog('c') WHERE problem = 'source_not_granted' ORDER BY ALL;
+----
+ok3	source_not_granted

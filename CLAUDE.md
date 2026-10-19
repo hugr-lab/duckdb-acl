@@ -791,6 +791,16 @@ ran `acl_create_catalog` through them. The rewriter's JOIN case rewrites the ran
 planner-only `duplicate_eliminated_columns`), its BASE_TABLE case the AT expression first (before the CTE check);
 `WalkBodyNode` collects both. A pin bump re-runs the spec's sweep of expression-bearing fields.
 
+**Spec 138 — the source gate judges what a body names, by catalog entry** (catalog admins only; the owner: the
+virtual catalog is a facade - a right on a view / table function is enough, what it reads inside is the
+constructor's): `BodyReferences` (acl_platform_rights.cpp - a CTE-scoped walk of the body's parse: a one-part name
+that is a CTE of ITS scope is left out) + `ResolvedReference` (acl_platform_sources.cpp - `Binder::BindTableName` +
+`Catalog::GetEntry`, the binder's own reading) replace `GetTableNames` in AuthorizeSources' body loop (which kept
+the "must bind" probe): a physical view is judged by its own database (name extraction never recorded a view), `t`
+alone by the default database, a name of no object (a replacement-scan file) is refused. `acl_check_catalog`'s
+`source_not_granted` reads bodies the same way; `RequireNotPolicyStore` adds the entry check beside its text and
+GetTableNames ones (a policy store in a non-`main` default schema).
+
 **Spec 120 — maintenance** (in stages; 120.1, 120.2, 120.3, 120.5 built): the missing forms - `ALTER ROLE r SET COMMENT` (`acl_comment_role`;
 a re-define keeps the comment), `REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r` (`acl_revoke_object`, HANDS_OUT),
 `ALTER VIRTUAL REFERENCE c.n SET COMMENT|CARDINALITY|OPTIONAL` + `COMMENT ON VIRTUAL REFERENCE` (`acl_alter_reference`),

@@ -288,8 +288,12 @@ vector<vector<string>> PhysicalObjectReadings(DatabaseInstance &db, const vector
 				                       QualifiedName(catalog_name, Identifier(), Identifier(parts[1])));
 				auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 				if (entry) {
-					as_database = {entry->ParentCatalog().GetName().GetIdentifierName(),
-					               entry->ParentSchema().name.GetIdentifierName(), entry->name.GetIdentifierName()};
+					// the whole schema path (a search path may name a nested schema - review 138)
+					as_database.push_back(entry->ParentCatalog().GetName().GetIdentifierName());
+					for (auto &part : entry->ParentSchema().GetSchemaPath()) {
+						as_database.push_back(part.GetIdentifierName());
+					}
+					as_database.push_back(entry->name.GetIdentifierName());
 				} else {
 					auto &catalog = attached->GetCatalog();
 					auto default_schema = catalog.GetDefaultSchema();
@@ -1045,6 +1049,25 @@ void RequireNotPolicyStore(CatalogBackend &catalog, const char *what, const stri
 			throw;
 		}
 	} catch (std::exception &) { // NOLINT: a body that does not bind is judged by its text (above)
+	}
+	// spec 138: each name the body writes, by the entry it resolves to - whatever the policy's schema (the two-part
+	// branch above reads `main` only: a policy catalog in Postgres' `public` is reached by `<db>.admins`)
+	vector<vector<string>> references;
+	try {
+		BodyReferences(body, expression, references);
+	} catch (std::exception &) { // NOLINT: a body that does not parse is judged by its text (above)
+	}
+	for (auto &reference : references) {
+		vector<string> entry;
+		try {
+			entry = ResolvedReference(*catalog.Db(), reference);
+		} catch (std::exception &) { // NOLINT: an ambiguous name binds to nothing - the read fails
+			continue;
+		}
+		if (entry.size() == 3 && StringUtil::CIEquals(entry[0], catalog.db_name) &&
+		    StringUtil::CIEquals(entry[1], catalog.schema)) {
+			RefusePolicyStore(what);
+		}
 	}
 }
 

@@ -24,6 +24,9 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/main/client_context_state.hpp"
+#include "duckdb/catalog/catalog_entry_retriever.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -673,8 +676,7 @@ vector<string> GrantedSources(const PolicyStore::AdminRights &rights) {
 	return out;
 }
 
-bool SourceGranted(DatabaseInstance &db, const vector<string> &sources, const vector<string> &parts, bool schema_path,
-                   bool as_written) {
+bool SourceGranted(DatabaseInstance &db, const vector<string> &sources, const vector<string> &parts, bool schema_path) {
 	if (schema_path || parts.size() != 2) {
 		return SourceGranted(sources, parts, schema_path);
 	}
@@ -686,13 +688,38 @@ bool SourceGranted(DatabaseInstance &db, const vector<string> &sources, const ve
 	if (readings.size() > 1) {
 		ThrowAmbiguousPhysical(NamePath(parts).ToKey()); // duckdb refuses it at read; neither reading is named
 	}
-	if (as_written) {
-		// a body's name: the plain reading (it is how a name inside a physical view is judged - bound in the view's
-		// own catalog, never the default database) AND, for an attached database, what duckdb finds there
-		return SourceGranted(sources, parts, false) && (readings.empty() || SourceGranted(sources, readings[0], false));
-	}
 	// a definition's name: as the write stores it (spec 137)
 	return readings.empty() ? SourceGranted(sources, parts, false) : SourceGranted(sources, readings[0], false);
+}
+
+vector<string> ResolvedReference(DatabaseInstance &db, const vector<string> &parts) {
+	vector<string> out;
+	if (parts.empty()) {
+		return out;
+	}
+	vector<Identifier> path;
+	for (auto &part : parts) {
+		path.emplace_back(part);
+	}
+	Connection con(db);
+	auto &context = *con.context;
+	context.RunFunctionInTransaction([&]() {
+		CatalogEntryRetriever retriever(context);
+		// the binder's own reading of a table reference: catalog-or-schema (its ambiguity refusal too), then the lookup
+		// through the search path for whatever the name leaves out
+		auto bound = Binder::BindTableName(retriever, QualifiedName::FromPath(std::move(path)));
+		auto entry = Catalog::GetEntry(retriever, EntryLookupInfo(CatalogType::TABLE_ENTRY, bound),
+		                               OnEntryNotFound::RETURN_NULL);
+		if (entry) {
+			// the whole schema path: a nested schema's leaf alone matched a grant on another schema (review 138)
+			out.push_back(entry->ParentCatalog().GetName().GetIdentifierName());
+			for (auto &part : entry->ParentSchema().GetSchemaPath()) {
+				out.push_back(part.GetIdentifierName());
+			}
+			out.push_back(entry->name.GetIdentifierName());
+		}
+	});
+	return out;
 }
 
 string UnreadSourceMark(const string &database, const string &error_class) {
