@@ -1,9 +1,8 @@
 # Spec 138: the source gate judges what a body names, by catalog entry
 
-- **Status**: accepted, **deferred to after the release** (the owner, 2026-10-19: «138 да»; Q1 extended to views;
-  then «нужна строгость к админам каталога, но увлекаться можно не сильно - можно сделать после релиза; в основном
-  сценарии один админ на все каталоги» - a policy admin, whom the source gate does not judge). The branch holds the
-  work in progress (the scoped walker and the resolution), unbuilt.
+- **Status**: accepted (the owner, 2026-10-19: «138 да»; Q1 extended to views; first moved after the release, then
+  «давай уже разберемся до конца и если уже почти все сделали то давай» - done before it, kept proportionate: in the
+  main scenario one policy admin builds every catalog, and the source gate judges only catalog admins)
 - **Date**: 2026-10-19
 - **Author**: Claude (with the owner)
 
@@ -69,9 +68,10 @@ The gate's `SourceGranted` takes three-part entries only; the plain two-part `ma
 
 ### The policy store, by entry
 
-`RequireNotPolicyStore` for a body checks the same entries. A reference resolving into the policy store's database
-and schema is refused, whatever the policy's schema. The text check (`TextNamesPolicyStore`) stays in front: it is cheap,
-and it covers a body that does not bind.
+`RequireNotPolicyStore` for a body adds the same entries: a reference resolving into the policy store's database and
+schema is refused, whatever the policy's schema. Its text check (`TextNamesPolicyStore`) and its name-extraction
+check stay as they are. Those also judge what a view reads inside: the policy store is the one thing no definition
+reaches by any path.
 
 ## Enforcement & security
 
@@ -89,15 +89,19 @@ and it covers a body that does not bind.
 
 ## Testing
 
-- **sqllogictest gate coverage probes** for a catalog admin granted one source:
-  - a view of an ungranted source over a constant: refused;
-  - a view of an ungranted source over `read_csv`: refused;
-  - a one-part name of the default database while a database of that name is granted: refused;
-  - a view of the granted source whose inner `main.x` stays inside it: admitted;
-  - a view of the granted source reading an ungranted one: admitted (Q1 - the right on the object).
-- **The policy store:** a policy catalog in a schema other than `main` (Postgres integration) refuses a body over
-  `pol.admins`.
-- **The check:** a body stored before this spec, through `UPDATE`, is reported by `acl_check_catalog`.
+- **sqllogictest** (`test/sql/acl_source_gate_bodies.test`), gate coverage probes for a catalog admin granted
+  `src` and `g`:
+  - refused: a view of the ungranted `sec` over a constant (`sec.main.vconst`), and one over
+    `read_csv('<file>')`; the same view in an RLS body;
+  - refused: `SELECT * FROM g` (the default database's table `g`, not the granted database `g`);
+  - refused: a replacement-scan file; a CTE's name used outside its scope;
+  - admitted: `src.main.inner_v` (its inner `main.t` stays in `src`), `src.main.over_v` (it reads `sec` - the
+    owner's rule), a body with a CTE;
+  - `acl_check_catalog` reports `source_not_granted` for a body stored over `sec.main.vconst`.
+- **Integration** (`test/sql/integration/acl_source_gate_policy_postgres.test`): a policy store in a Postgres
+  schema that is its database's default; `<db>.admins` in a policy admin's body is refused.
+- The existing source-gate tests stay green: `platform_attached`, `platform_review`, `acl_two_part_phys`,
+  `platform_effective_rights` and `acl_catalog_maintenance`.
 
 ## Decisions
 

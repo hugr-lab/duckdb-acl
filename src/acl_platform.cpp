@@ -1833,9 +1833,9 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 				                      "can be checked: %s",
 				                      ex.what());
 			}
-			// spec 138: each name the body WRITES, resolved to the entry duckdb binds it to - a physical view by its own
-			// catalog, a one-part name in the default database, a two-part one as the binder reads it. What a granted
-			// view or function reads inside is the constructor's (the owner: the virtual catalog is a facade)
+			// spec 138: each name the body WRITES, resolved to the entry duckdb binds it to - a physical view by its
+			// own catalog, a one-part name in the default database, a two-part one as the binder reads it. What a
+			// granted view or function reads inside is the constructor's (the owner: the virtual catalog is a facade)
 			for (auto &reference : references) {
 				auto shown = "\"" + NamePath(reference).ToKey() + "\"";
 				vector<string> entry;

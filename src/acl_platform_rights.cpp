@@ -845,10 +845,6 @@ unique_ptr<GlobalTableFunctionState> CheckGrantInit(ClientContext &, TableFuncti
 
 } // namespace
 
-void StoredBodyTables(const string &body, bool expression, vector<vector<string>> &tables) {
-	BodyTables(body, expression, tables);
-}
-
 void BodyReferences(const string &body, bool expression, vector<vector<string>> &references) {
 	auto baked = BakeTemplateForProbe(body, ParserOptions::Builtin(), expression, {});
 	Parser parser(ParserOptions::Builtin());
@@ -864,7 +860,8 @@ void BodyReferences(const string &body, bool expression, vector<vector<string>> 
 		if (statement->type == StatementType::SELECT_STATEMENT) {
 			walk.Node(*statement->Cast<SelectStatement>().node, case_insensitive_set_t());
 		} else {
-			throw BinderException("acl admin: a stored body is a SELECT, not a %s", StatementTypeToString(statement->type));
+			throw BinderException("acl admin: a stored body is a SELECT, not a %s",
+			                      StatementTypeToString(statement->type));
 		}
 	}
 }

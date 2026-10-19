@@ -197,8 +197,6 @@ void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> 
 void RegisterAclPlatformSources(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
 //! spec 120.2 (acl_platform_rights.cpp): acl_effective_rights(role, catalog[, object]), acl_exposures(source[, …])
 void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
-//! spec 120.2: the tables a stored body names, as written - parsed, never bound (a view's SELECT, a macro's expression)
-void StoredBodyTables(const string &body, bool expression, vector<vector<string>> &tables);
 //! spec 138: the table / view names a stored body writes, as written - a one-part name that is a CTE of its scope
 //! left out. Throws when the body does not parse (or is no SELECT / expression).
 void BodyReferences(const string &body, bool expression, vector<vector<string>> &references);

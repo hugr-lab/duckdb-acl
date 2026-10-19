@@ -1,0 +1,59 @@
+# name: test/sql/integration/acl_source_gate_policy_postgres.test
+# description: spec 138 over a live PostgreSQL - the policy store held in a Postgres schema that is its database's
+#   default (here through ATTACH's SCHEMA, as `public` would be): a body naming `<db>.admins` reaches it, and the
+#   guard judges the entry it resolves to, never an assumed `main`
+# group: [integration]
+
+require acl
+
+require postgres_scanner
+
+require-env ACL_PG_DSN
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH '{ACL_PG_DSN}' AS pgadm (TYPE postgres);
+
+statement ok
+CALL postgres_execute('pgadm', 'DROP SCHEMA IF EXISTS acl138 CASCADE');
+
+statement ok
+CALL postgres_execute('pgadm', 'CREATE SCHEMA acl138');
+
+# the policy database's default schema is the policy's own schema
+statement ok
+ATTACH '{ACL_PG_DSN}' AS pol (TYPE postgres, SCHEMA 'acl138');
+
+statement ok
+SELECT acl_use_db('pol', 'acl138', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE p;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE p;
+
+# gate coverage probe: `pol.admins` binds pol.acl138.admins - the policy store
+statement error
+ACL ROLE "p" CREATE VIRTUAL VIEW c.v AS 'SELECT * FROM pol.admins';
+----
+<REGEX>:.*reads the policy store itself.*
+
+statement error
+ACL ROLE "p" CREATE VIRTUAL VIEW c.v AS 'SELECT * FROM pol.acl138.admins';
+----
+<REGEX>:.*reads the policy store itself.*
+
+statement ok
+DETACH pol;
+
+statement ok
+CALL postgres_execute('pgadm', 'DROP SCHEMA acl138 CASCADE');

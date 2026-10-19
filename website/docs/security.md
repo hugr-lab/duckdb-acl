@@ -348,9 +348,12 @@ combined with a certificate. Both doors require cert **and** key together.
   refused; the narrowing a listing takes from its WHERE only chooses which physical sources are read - it never
   changes the answer (the WHERE stays as written) and reads only sources behind objects the principal sees.
 - **A catalog admin builds only over its granted sources** (spec 118.3): every physical name it stores and
-  every table a body of its reads (as the body names it) lies inside a `GRANT SOURCE` of its role - handed
-  out by `policy` or `passthrough`; the physical tree it sees under `platform.attached` is the same set.
-  Delegating a catalog no longer delegates every attached database.
+  every table or view a body of its names lies inside a `GRANT SOURCE` of its role - handed out by `policy`
+  or `passthrough`; the physical tree it sees under `platform.attached` is the same set. Delegating a catalog
+  no longer delegates every attached database. A body's names are judged by the object each one resolves to,
+  as duckdb binds it (spec 138): a physical view by its own database, a one-part name in the node's default
+  database, a name of no object (a file) refused. What a granted view or function reads inside is the
+  constructor's - the virtual catalog is a facade.
 - **A stored body holds only what its author may call** (the review of spec 117): a view, a macro
   template, an alias target, an RLS, a column or mask expression, a grant's policy runs as the node when
   read, so an author who is not `passthrough` may store only calls its own function gate admits (its

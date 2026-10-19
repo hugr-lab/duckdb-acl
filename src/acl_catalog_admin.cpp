@@ -1046,6 +1046,25 @@ void RequireNotPolicyStore(CatalogBackend &catalog, const char *what, const stri
 		}
 	} catch (std::exception &) { // NOLINT: a body that does not bind is judged by its text (above)
 	}
+	// spec 138: each name the body writes, by the entry it resolves to - whatever the policy's schema (the two-part
+	// branch above reads `main` only: a policy catalog in Postgres' `public` is reached by `<db>.admins`)
+	vector<vector<string>> references;
+	try {
+		BodyReferences(body, expression, references);
+	} catch (std::exception &) { // NOLINT: a body that does not parse is judged by its text (above)
+	}
+	for (auto &reference : references) {
+		vector<string> entry;
+		try {
+			entry = ResolvedReference(*catalog.Db(), reference);
+		} catch (std::exception &) { // NOLINT: an ambiguous name binds to nothing - the read fails
+			continue;
+		}
+		if (entry.size() == 3 && StringUtil::CIEquals(entry[0], catalog.db_name) &&
+		    StringUtil::CIEquals(entry[1], catalog.schema)) {
+			RefusePolicyStore(what);
+		}
+	}
 }
 
 //! An RLS predicate and a column list (masks, computed columns) of a definition or a grant

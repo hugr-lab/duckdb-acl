@@ -1019,16 +1019,25 @@ void PolicyStore::SourcesNotGranted(const string &vcat, vector<CatalogFinding> &
 		parts = path.Parts();
 		return true;
 	};
-	auto body_reads = [](const string &body, bool expression, Defined &into) {
-		vector<vector<string>> tables;
+	// spec 138: each name a body writes, by the entry duckdb binds it to - the gate's own judgment; what a view or a
+	// function it names reads inside is not judged (the owner: the virtual catalog is a facade)
+	auto instance = catalog->Db();
+	auto body_reads = [&](const string &body, bool expression, Defined &into) {
+		vector<vector<string>> references;
 		try {
-			StoredBodyTables(body, expression, tables);
+			BodyReferences(body, expression, references);
 		} catch (std::exception &) {
 			return; // a body that does not parse is definition_broken's - judged there
 		}
-		for (auto &table : tables) {
-			if (table.size() >= 2) { // `t` alone is the node's default database - no source of an administrator's
-				into.reads.emplace_back(table, false);
+		for (auto &reference : references) {
+			vector<string> entry;
+			try {
+				entry = ResolvedReference(*instance, reference);
+			} catch (std::exception &) { // NOLINT: ambiguous - the read fails, definition_broken's
+				continue;
+			}
+			if (!entry.empty()) {
+				into.reads.emplace_back(entry, false);
 			}
 		}
 	};

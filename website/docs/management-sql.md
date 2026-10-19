@@ -824,8 +824,10 @@ REVOKE SOURCE <database>[.<schema>] FROM ROLE <role>
 
 A source granted to a role - by `policy` or `passthrough` - is what a catalog admin sees of the node's
 physical sources (`platform.attached.<alias>.<schema>`, metadata only) and the only physical names it may
-build over: a table, a schema alias / expansion, a function alias, the tables a view / macro / RLS / mask
-body reads - each named in full. `policy` and `passthrough` build over every source; `cluster` sees every
+build over: a table, a schema alias / expansion, a function alias, the tables and views a view / macro / RLS /
+mask body names - each judged by the object it resolves to (spec 138: a physical view by its own database, `t`
+alone in the node's default database, a name of no object refused; what a granted view or function reads inside
+is not judged). `policy` and `passthrough` build over every source; `cluster` sees every
 source but, holding a catalog's manage too, builds only over granted ones (it hands out no data). Never
 the policy store's database, a secrets service or a hidden database (another catalog's internals, ducklake's
 metadata). A revoke takes back nothing already built; `REVOKE ADMIN FROM ROLE r` removes its source grants
@@ -1049,7 +1051,7 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | `types_stale` | the source's column types differ from the type facts stored with the object (spec 099) - a retyped column, or a source that did not exist when the object was written | `ANALYZE VIRTUAL TABLE …` / `… VIEW …` |
 | `enum_domain_exposed` | an object with an ENUM column whose labels are exposed (`enums = keep`) while a predicate - the object's or a grant's - narrows its rows (a view's own `WHERE` is not seen) | `ALTER VIRTUAL TABLE … SET TYPES (enums = varchar)` |
 | `types_incompatible` | a declared entry or a grant's mask that binds over the source but not over the exposed type (`enum_code(tier)` once ENUMs are VARCHAR) - every read refuses | `… SET TYPES (enums = keep)`, or rewrite the expression |
-| `source_not_granted` | an object whose current definition an administrator below `policy` wrote (spec 120) reads a physical source its roles are no longer granted (`REVOKE SOURCE`) - its physical name, an alias' schema, a function alias' database, the tables its view / template / RLS / computed columns / reference expression name; it goes on working | `GRANT SOURCE <db>.<schema> TO ROLE <r>` (a role that still administers), or - when those roles are gone - redefine or drop the object |
+| `source_not_granted` | an object whose current definition an administrator below `policy` wrote (spec 120) reads a physical source its roles are no longer granted (`REVOKE SOURCE`) - its physical name, an alias' schema, a function alias' database, the objects its view / template / RLS / computed columns / reference expression name (each as it resolves, spec 138); it goes on working | `GRANT SOURCE <db>.<schema> TO ROLE <r>` (a role that still administers), or - when those roles are gone - redefine or drop the object |
 | `body_function_denied` | a stored body (view, template, alias, RLS, column or mask, a grant's policy) calls a function no principal may call - written before spec 117 judged bodies by their author's gate | redefine it without the call, or drop it |
 | `types_mismatch` | a declared entry that makes a type of its own (`CAST(x AS ENUM(…))`) - described as the exposed type, read as its own | `REPAIR VIRTUAL TABLE … REMAP (n = CAST(… AS <type>))` |
 
