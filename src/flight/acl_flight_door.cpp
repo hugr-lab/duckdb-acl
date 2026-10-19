@@ -369,7 +369,10 @@ struct FlightDoorState {
 	}
 
 	string PutReservation(shared_ptr<Reservation> reservation, int64_t idle_seconds) {
-		auto id = MintId();
+		// spec 134 addendum: a ticket and a prepared statement's handle start with the node's label, as a quack
+		// connection id does - a front routes a client that keeps no cookie by it. The random part is unchanged, and
+		// the id is redeemed whole: the label is a routing hint, never an authority
+		auto id = NodeLabelIdPrefix(NodeLabel(db)) + MintId();
 		std::lock_guard<std::mutex> guard(lock);
 		if (reservations.size() >= MAX_RESERVATIONS) {
 			SweepReservationsLocked(idle_seconds);

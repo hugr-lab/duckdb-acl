@@ -118,9 +118,33 @@ them on one node. Two such names exist:
 ## Follow-ups
 
 - **After the release** (the phase-1 doc, the row «фронт»):
-  - labels inside tickets and prepared handles;
+  - ~~labels inside tickets and prepared handles~~ - the addendum below (2026-10-19);
   - pinning a session only by its state;
   - releasing free sessions at drain;
   - a loud refusal of a foreign node's label (design/082 F1);
   - a Location directly to the node for in-cluster services.
 - **hugr-node**: set `acl_node_label` from the pod (the Downward API) at bootstrap.
+
+## Addendum (2026-10-19): the label in a ticket and a prepared handle
+
+hugr-platform spec 002's front routes a Flight call by the `acl_node` cookie. A client that keeps no cookies - ADBC
+with its default (`with_cookie_middleware` off), a plain pyarrow or arrow-go client - is seated afresh on every call,
+so its `DoGet` reached a node that did not hold the ticket (`acl: unknown or already fetched ticket`) in (N-1)/N of
+the calls on N nodes. The owner chose (2026-10-19) to name the node inside the ids the door hands out, as the quack
+connection id already does, over hashing the token (one principal's connections on one node, and the tickets in
+flight lost at every change of the fleet).
+
+- **Every reservation id** - a statement's ticket (`TicketStatementQuery.statement_handle`) and a prepared
+  statement's handle (`prepared_statement_handle`), both minted by `PutReservation` - is `<label>.<32 hex>` (upper case, as before) while the
+  label is set, the 32 hex as before. Unset, it is the 32 hex alone, as before.
+- The id is redeemed whole, under the same owner rule (the principal's fingerprint, spec 047): the label is a
+  routing hint, never an authority, exactly as the cookie. A changed label applies to ids minted after it; ids already
+  out are found by their whole value.
+- What the front reads (hugr-platform, not here): a `DoGet`'s `Ticket` -> `Any` -> `TicketStatementQuery`, a
+  `GetFlightInfo` / `DoPut`'s `FlightDescriptor.cmd` -> `CommandPreparedStatementQuery` / `Update`, a
+  `ClosePreparedStatement` action's body - only when the call carries no `acl_node` cookie.
+- Not labelled: a transaction id (spec 055) and everything else that lives in a session - a session needs the
+  cookie anyway (spec 050); a catalog RPC's ticket is the command itself, which any node answers alike.
+
+Tests: `test/e2e/flight/run.sh`, the label section - with `acl_node_label` set both ids are `<label>.<32 hex>`, and
+after it is cleared both are the 32 hex alone (`client.py @handles:`).

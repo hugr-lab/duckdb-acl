@@ -335,6 +335,31 @@ if ask.startswith("@ingest:"):
 if ask.startswith("@prepared_fields:"):  # spec 111: the dataset schema CreatePreparedStatement announces
     print({"fields": prepared_dataset_fields(client, options, ask[len("@prepared_fields:"):])})
     raise SystemExit(0)
+if ask.startswith("@handles:"):  # spec 134 addendum: the ids the door hands out - a ticket's and a prepared one's
+    def proto_fields(payload):
+        out, at = {}, 0
+        while at < len(payload):
+            key, at = read_varint(payload, at)
+            if key & 7 == 2:
+                length, at = read_varint(payload, at)
+                out[key >> 3] = payload[at:at + length]
+                at += length
+            else:
+                _, at = read_varint(payload, at)
+        return out
+    _sql = ask[len("@handles:"):]
+    info = client.get_flight_info(flight.FlightDescriptor.for_command(statement_query(_sql)), options)
+    ticket = info.endpoints[0].ticket
+    # Ticket.ticket = Any{type_url = 1, value = 2}, value = TicketStatementQuery{statement_handle = 1}
+    statement = proto_fields(proto_fields(ticket.ticket)[2]).get(1, b"").decode()
+    client.do_get(ticket, options).read_all()
+    request = command("ActionCreatePreparedStatementRequest", text(1, _sql))
+    result = list(client.do_action(flight.Action("CreatePreparedStatement", request), options))[0].body.to_pybytes()
+    prepared = proto_fields(proto_fields(result)[2]).get(1, b"")
+    list(client.do_action(flight.Action("ClosePreparedStatement",
+                                        command("ActionClosePreparedStatementRequest", field(1, prepared))), options))
+    print({"statement": statement, "prepared": prepared.decode()})
+    raise SystemExit(0)
 if ask.startswith("@prepared:"):  # spec 117: prepare, execute, fetch, close
     print(prepared_execute(client, options, ask[len("@prepared:"):]))
     raise SystemExit(0)

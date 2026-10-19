@@ -404,12 +404,18 @@ got="$(ACL_PRINT_SET_COOKIE=1 ACL_EXTRA_HEADERS="cookie=acl_node=e2e-node-1" ask
 echo "$got" | grep -q "set-cookie: acl_node=" && fail "a call carrying the label got it again: $got"
 got="$(ACL_PRINT_SET_COOKIE=1 ACL_EXTRA_HEADERS="cookie=acl_node=other-node" ask "SELECT 1 AS one")"
 echo "$got" | grep -q "set-cookie: acl_node=e2e-node-1;" || fail "another node's label was not replaced: $got"
+# the addendum: a ticket and a prepared handle start with the label too, for a client that keeps no cookie
+got="$(ask "@handles:SELECT 1 AS one")"
+echo "$got" | grep -Eq "'statement': 'e2e-node-1\.[0-9A-F]{32}'" || fail "a ticket without the label: $got"
+echo "$got" | grep -Eq "'prepared': 'e2e-node-1\.[0-9A-F]{32}'" || fail "a prepared handle without the label: $got"
 echo "SET GLOBAL acl_node_label=''; SELECT 'labelunflip' AS s;" >&3
 flipped=""
 for _ in $(seq 1 40); do grep -q "labelunflip" "$TMP/server.log" && { flipped=1; break; }; sleep 0.25; done
 [ -n "$flipped" ] || fail "the server did not clear the label"
 got="$(ACL_PRINT_SET_COOKIE=1 ask "SELECT 1 AS one")"
 echo "$got" | grep -q "set-cookie: acl_node=" && fail "the label cookie outlived the label: $got"
+got="$(ask "@handles:SELECT 1 AS one")"
+echo "$got" | grep -Eq "'statement': '[0-9A-F]{32}', 'prepared': '[0-9A-F]{32}'" || fail "an id with a label that is gone: $got"
 
 # --- a session outlives its token's exp under the default binding (spec 059) ----------------------
 # The cookie session below is established while the token is fresh; then the server's clock skew goes
