@@ -233,6 +233,10 @@ bool AuditPipeline::AdmitDenial(const AuditEvent &event, int64_t per_second) {
 			// spec 097: a tokenless GET /metrics is the cheapest refusal there is - its own bucket, so a
 			// flood of them never keeps the door's refused logins out of the record
 			source += ":observe";
+		} else if (event.kind == "policy" && event.detail == "source_unreadable") {
+			// spec 136: floored per source already; its own bucket, so a burst of policy or keys failures in the same
+			// second never drops the one record a minute a listing's failing source gets
+			source += ":listing";
 		}
 	}
 	auto second = NowMicros() / 1000000;

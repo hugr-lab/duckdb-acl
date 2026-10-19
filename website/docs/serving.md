@@ -243,7 +243,16 @@ door's metadata, all of it answered for the connected principal:
   which sources are read - the answer is the same with or without them. Expanding one schema or one
   table costs what it holds, whatever else is attached (measured: 200 sources x 150 tables - one
   schema's tables 0.04 s, one table's columns 0.2 s). A source whose catalog fails is left out of the
-  listing instead of failing it. An answer above `acl_metadata_max_rows` (1,000,000 - a safety bound: a quack client loads a catalog whole) is **refused**, never
+  listing instead of failing it - and **says so** (spec 136): an object over it stays listed in
+  `information_schema.tables` (and so in Flight GetTables, without the comment) as a `BASE TABLE` whose
+  comment begins `acl: source <database> could not be read (<class>)` - the exception's class (`IO`,
+  `Binder`, `not attached`, ...), never its text; the database is named only to a principal that may read
+  the object - with no physical columns; `duckdb_tables()` leaves a column-less object out (spec 065); an
+  alias schema over it and an admin's `platform.attached.<alias>` carry the same mark in
+  `duckdb_schemas()`. Only those surfaces read for the mark, and one statement reads a failing database
+  once, however many schemas and subqueries. The node records `policy` / `source_unreadable` (once per
+  source and class a minute) and counts `acl.listing.sources_unreadable{class}` - a database that is not
+  attached is marked, never counted. An answer above `acl_metadata_max_rows` (1,000,000 - a safety bound: a quack client loads a catalog whole) is **refused**, never
   cut: `acl: more than N rows of <surface> - narrow by catalog, schema or name` - a quack catalog load
   falls under it too. A session may lower the bound (`SET acl_metadata_max_rows = 100`); a value above the
   node's is refused, and the node's lower bound always holds (a `RESET` or the default written back changes
@@ -667,7 +676,8 @@ opened / closed / refused / moved / refused a move (spec 135: the items it carri
 reason codes `session_pinned`, `session_unrestorable`, `session_unreadable`), an ingest completed with its row count, a Flight ticket issued / redeemed /
 expired / presented by somebody else, a Flight result stream ended (consumed, cancelled, superseded,
 capped, failed - with the rows that went out) or an ingest its client cancelled, the password
-handshake, a policy reload or source error, a keys refresh. An event carries who (subject, roles - never a claim value), where (`door`, the session's ops
+handshake, a policy reload or source error, a source a listing could not read (`source_unreadable`, spec 136), a
+keys refresh. An event carries who (subject, roles - never a claim value), where (`door`, the session's ops
 id - never the handle), what (the statement class - never the text), the verdict, and on a refusal
 one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only`, `function_denied`,
 `statement_type`, `unchecked_predicate`, `setting_denied`, `parse`, `principal`,
@@ -701,7 +711,8 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
   plus `ingest_cancelled` - the stream in the other direction) and the gauge
   `acl.door.streams_open{door}` (result streams pulling right now) - spec 070,
   `acl.ingest.statements`, `acl.admin.statements{scope}`,
-  `acl.policy.version/staleness/reloads/writes/source_errors`, `acl.jwks.refreshes/age`,
+  `acl.policy.version/staleness/reloads/writes/source_errors`, `acl.listing.sources_unreadable{class}` (a
+  source schema a listing could not read, by the exception's class - spec 136), `acl.jwks.refreshes/age`,
   `acl.audit.events/dropped/sink_errors/queue_fill/ring_fill`, `acl.node.draining/uptime/info`.
   Attribute values come from bounded sets only - never a role, a subject or an object name.
   `acl.door.observe{door,surface,result}` (reads of the load report and the metrics, spec 097).

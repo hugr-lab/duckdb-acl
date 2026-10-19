@@ -21,12 +21,18 @@
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+
+#include <map>
+#include <mutex>
+#include <set>
 
 namespace duckdb {
 namespace acl {
@@ -87,6 +93,61 @@ bool NamesDatabase(const vector<string> &sources, const string &alias) {
 	return false;
 }
 
+//! spec 136: the class of a source that is not attached at all (an object over a detached source, or over one attached
+//! on another group's nodes only)
+constexpr const char *NOT_ATTACHED = "not attached";
+
+//! spec 136: what the physical readers of ONE statement learned of each source, so a source is read once - by
+//! whichever reader runs first (acl_physical_tables / _columns / _unread, acl_platform_attached[_columns]) - and a
+//! source that is down costs its timeout once, not once per inlined subquery. A failure is kept as its exception's
+//! class, never its text. Cleared at each query's start and end: nothing learned outlives the statement.
+struct PhysicalReadCache : ClientContextState {
+	static constexpr const char *KEY = "acl_physical_read_cache";
+	struct Failure {
+		string database; // as the node spells it, else as the key does (a database not attached)
+		string schema;
+		string error_class;
+	};
+	//! held across a reader's whole init: duckdb initializes a plan's sources in parallel
+	std::mutex lock;
+	std::map<string, Failure> failed; // `<db>.<schema>` lowered
+	//! a database whose first read failed before it answered anything in the statement: a server down, a login
+	//! refused, a detached source fail every schema alike - its other schemas are not tried (review 136)
+	std::map<string, Failure> failed_database; // `<db>` lowered
+	std::set<string> answered;                 // `<db>` lowered: answered a read in the statement
+	std::set<string> read;                     // the keys read whole, lowered
+	void Clear() {
+		std::lock_guard<std::mutex> guard(lock);
+		failed.clear();
+		failed_database.clear();
+		answered.clear();
+		read.clear();
+	}
+	void QueryBegin(ClientContext &) override {
+		Clear();
+	}
+	void QueryEnd(ClientContext &) override {
+		Clear();
+	}
+};
+
+//! A source's failure as a reader keeps it: the exception's class, never its message (a source's text can name a
+//! host, a login, a path). False = not a source's failure, the caller rethrows: the statement's own end (an
+//! interrupt) or what duckdb ends the instance on (FATAL and the like, INTERNAL)
+bool SourceFailureClass(ClientContext &context, const std::exception &ex, string &error_class) {
+	auto type = ExceptionType::INVALID;
+	try {
+		type = ErrorData(ex).Type();
+	} catch (std::exception &) { // NOLINT: a message that only looks like serialized error data is no known class
+	}
+	if (type == ExceptionType::INTERRUPT || type == ExceptionType::INTERNAL || Exception::InvalidatesDatabase(type) ||
+	    context.IsInterrupted()) {
+		return false;
+	}
+	error_class = Exception::ExceptionTypeToString(type);
+	return true;
+}
+
 struct SourcesInfo : TableFunctionInfo {
 	explicit SourcesInfo(shared_ptr<PolicyStore> store_p, bool columns_p)
 	    : store(std::move(store_p)), columns(columns_p) {
@@ -143,10 +204,28 @@ unique_ptr<GlobalTableFunctionState> SourcesInit(ClientContext &context, TableFu
 	auto &bind = input.bind_data->Cast<SourcesBind>();
 	auto state = make_uniq<SourcesState>();
 	auto *only = bind.all ? nullptr : &bind.sources;
+	auto cache = context.registered_state->GetOrCreate<PhysicalReadCache>(PhysicalReadCache::KEY);
+	std::lock_guard<std::mutex> guard(cache->lock);
+	// spec 136: the source stays a node of the tree, and says why it is empty - the class only
+	auto unread_node = [&](const string &alias, const string &error_class) {
+		if (!bind.columns) {
+			state->rows.push_back({Value(NamePath({"attached", alias}).ToKey()), Value(LogicalType::VARCHAR),
+			                       Value(UnreadSourceMark(alias, error_class)), Value("SCHEMA")});
+		}
+	};
 	for (auto &db : SourceDatabases(context, *bind.store)) {
 		auto alias = db->GetName().GetIdentifierName();
 		if (only && !NamesDatabase(*only, alias)) {
 			continue; // no grant names this database: its catalog is not even read
+		}
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+		auto db_key = StringUtil::Lower(alias);
+		auto known = cache->failed_database.find(db_key);
+		if (known != cache->failed_database.end()) {
+			unread_node(alias, known->second.error_class); // this statement met its failure already
+			continue;
 		}
 		// one source that cannot answer (a postgres down, a ducklake whose metadata went away) drops out of
 		// the tree - its rows are rolled back - never the whole listing every admin's console reads
@@ -204,8 +283,18 @@ unique_ptr<GlobalTableFunctionState> SourcesInit(ClientContext &context, TableFu
 					}
 				});
 			}
-		} catch (std::exception &) { // NOLINT: the source is left out, the rest of the tree stands
+			cache->answered.insert(db_key);
+		} catch (std::exception &ex) { // NOLINT: the source is left out, the rest of the tree stands
+			string error_class;
+			if (!SourceFailureClass(context, ex, error_class)) {
+				throw;
+			}
 			state->rows.resize(mark);
+			if (!cache->answered.count(db_key)) {
+				cache->failed_database[db_key] = PhysicalReadCache::Failure {alias, string(), error_class};
+			}
+			bind.store->AuditSourceUnreadable(alias, error_class);
+			unread_node(alias, error_class);
 		}
 	}
 	return std::move(state);
@@ -228,22 +317,30 @@ void SourcesScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 //! duckdb_columns' rows - only of the named physical schemas (`<db>.<schema>`) and objects
 //! (`<db>.<schema>.<object>`), each read directly: a listing reads the sources it answers about, never a
 //! walk of every attached database. A key that does not resolve answers nothing; a source that fails is
-//! left out, never the listing failed.
+//! left out, never the listing failed - and (spec 136) acl_physical_unread(keys) says which failed.
+enum class PhysicalKind : uint8_t { TABLES, COLUMNS, UNREAD };
+
 struct PhysicalBind : TableFunctionData {
+	shared_ptr<PolicyStore> store;
 	vector<string> keys;
 	bool columns = false;
+	bool unread = false;
 };
 
 struct PhysicalInfo : TableFunctionInfo {
-	explicit PhysicalInfo(bool columns_p) : columns(columns_p) {
+	PhysicalInfo(shared_ptr<PolicyStore> store_p, PhysicalKind kind_p) : store(std::move(store_p)), kind(kind_p) {
 	}
-	bool columns;
+	shared_ptr<PolicyStore> store;
+	PhysicalKind kind;
 };
 
 unique_ptr<FunctionData> PhysicalBindFn(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
                                         vector<Identifier> &names) {
 	auto bind = make_uniq<PhysicalBind>();
-	bind->columns = input.info->Cast<PhysicalInfo>().columns;
+	auto &info = input.info->Cast<PhysicalInfo>();
+	bind->store = info.store;
+	bind->columns = info.kind == PhysicalKind::COLUMNS;
+	bind->unread = info.kind == PhysicalKind::UNREAD;
 	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
 		for (auto &value : ListValue::GetChildren(input.inputs[0])) {
 			if (!value.IsNull()) {
@@ -257,6 +354,10 @@ unique_ptr<FunctionData> PhysicalBindFn(ClientContext &, TableFunctionBindInput 
 	};
 	column("database_name", LogicalType::VARCHAR);
 	column("schema_name", LogicalType::VARCHAR);
+	if (bind->unread) {
+		column("error_class", LogicalType::VARCHAR);
+		return std::move(bind);
+	}
 	column("table_name", LogicalType::VARCHAR);
 	if (bind->columns) {
 		column("column_name", LogicalType::VARCHAR);
@@ -382,7 +483,12 @@ void PhysicalRows(ClientContext &context, const PhysicalBind &bind, SourcesState
 unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<PhysicalBind>();
 	auto state = make_uniq<SourcesState>();
+	// acl_physical_unread probes what no sibling read yet, as the tables reader would, and keeps no row of it
+	SourcesState scratch;
+	auto &rows = bind.unread ? scratch : *state;
 	auto &manager = DatabaseManager::Get(context);
+	auto cache = context.registered_state->GetOrCreate<PhysicalReadCache>(PhysicalReadCache::KEY);
+	std::lock_guard<std::mutex> guard(cache->lock);
 	std::set<string> seen;
 	// review 119: an object reached by two keys (a relation's table inside an aliased schema) is one row
 	std::set<string> emitted;
@@ -398,39 +504,99 @@ unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableF
 		    !seen.insert(StringUtil::Lower(path.ToKey())).second) {
 			continue;
 		}
+		if (context.IsInterrupted()) {
+			throw InterruptException(); // a sibling's cancelled read cached nothing: never read on for it
+		}
 		auto &parts = path.Parts();
-		auto mark = state->rows.size();
+		auto group = StringUtil::Lower(NamePath({parts[0], parts[1]}).ToKey());
+		if (cache->failed.count(group)) {
+			continue; // this statement met the schema's failure already: never read twice
+		}
+		auto db_key = StringUtil::Lower(parts[0]);
+		auto known = cache->failed_database.find(db_key);
+		if (known != cache->failed_database.end()) {
+			// its database failed before it answered anything: this schema is not tried either
+			cache->failed[group] =
+			    PhysicalReadCache::Failure {known->second.database, parts[1], known->second.error_class};
+			continue;
+		}
+		auto lowered = StringUtil::Lower(path.ToKey());
+		if (bind.unread && cache->read.count(lowered)) {
+			continue;
+		}
+		string db_name = parts[0];
+		auto fail = [&](const string &error_class) {
+			cache->failed[group] = PhysicalReadCache::Failure {db_name, parts[1], error_class};
+			if (!cache->answered.count(db_key)) {
+				cache->failed_database[db_key] = PhysicalReadCache::Failure {db_name, string(), error_class};
+			}
+			// a database that is not attached is absence, not a failure: a source attached on another group's
+			// nodes only, a detach the operator made (acl_check_catalog says source_missing) - marked, not counted
+			if (bind.store && error_class != NOT_ATTACHED) {
+				bind.store->AuditSourceUnreadable(db_name, error_class);
+			}
+		};
+		auto mark = rows.rows.size();
 		try {
 			auto db = manager.GetDatabase(context, Identifier(parts[0]));
-			if (!db || db->GetVisibility() == AttachVisibility::HIDDEN) {
+			if (!db) {
+				fail(NOT_ATTACHED); // an object over a detached source is the same case to a reader
 				continue;
 			}
-			auto db_name = db->GetName().GetIdentifierName();
+			if (db->GetVisibility() == AttachVisibility::HIDDEN) {
+				continue;
+			}
+			db_name = db->GetName().GetIdentifierName();
 			auto &catalog = db->GetCatalog();
 			if (parts.size() == 3) {
 				auto entry = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, Identifier(parts[1]),
 				                              Identifier(parts[2]), OnEntryNotFound::RETURN_NULL);
 				if (entry) {
 					auto schema_name = entry->ParentSchema().name.GetIdentifierName(); // as the catalog spells it
-					if (once(db_name, schema_name, *entry)) {
-						PhysicalRows(context, bind, *state, db_name, schema_name, *entry);
+					if (once(db_name, schema_name, *entry) && !bind.unread) {
+						PhysicalRows(context, bind, rows, db_name, schema_name, *entry);
 					}
 				}
+				cache->answered.insert(db_key);
+				cache->read.insert(lowered);
 				continue;
 			}
 			EntryLookupInfo schema_lookup(CatalogType::SCHEMA_ENTRY, QualifiedName(Identifier(parts[1])));
 			auto schema = catalog.GetSchema(context, schema_lookup, OnEntryNotFound::RETURN_NULL);
-			if (!schema) {
+			if (schema) {
+				auto schema_name = schema->name.GetIdentifierName();
+				// (acl_physical_unread only probes: the scan is what makes a catalog load its tables)
+				schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+					if (once(db_name, schema_name, entry) && !bind.unread) {
+						PhysicalRows(context, bind, rows, db_name, schema_name, entry);
+					}
+				});
+			}
+			cache->answered.insert(db_key);
+			cache->read.insert(lowered);
+		} catch (std::exception &ex) { // NOLINT: a source that cannot answer is left out, and said (spec 136)
+			string error_class;
+			if (!SourceFailureClass(context, ex, error_class)) {
+				throw;
+			}
+			rows.rows.resize(mark);
+			fail(error_class);
+		}
+	}
+	if (bind.unread) {
+		std::set<string> answered;
+		for (auto &key : bind.keys) {
+			NamePath path;
+			string error;
+			if (!NamePath::TryFromKey(key, path, error) || path.Parts().size() < 2 || path.Parts().size() > 3) {
 				continue;
 			}
-			auto schema_name = schema->name.GetIdentifierName();
-			schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-				if (once(db_name, schema_name, entry)) {
-					PhysicalRows(context, bind, *state, db_name, schema_name, entry);
-				}
-			});
-		} catch (std::exception &) { // NOLINT: a source that cannot answer is left out
-			state->rows.resize(mark);
+			auto group = StringUtil::Lower(NamePath({path.Parts()[0], path.Parts()[1]}).ToKey());
+			auto failure = cache->failed.find(group);
+			if (failure != cache->failed.end() && answered.insert(group).second) {
+				state->rows.push_back({Value(failure->second.database), Value(failure->second.schema),
+				                       Value(failure->second.error_class)});
+			}
 		}
 	}
 	return std::move(state);
@@ -507,6 +673,15 @@ vector<string> GrantedSources(const PolicyStore::AdminRights &rights) {
 	return out;
 }
 
+string UnreadSourceMark(const string &database, const string &error_class) {
+	return "acl: source " + (database.empty() ? string() : database + " ") + "could not be read (" + error_class + ")";
+}
+
+string UnreadSourceMarkSql(const string &database_expr, const string &class_expr) {
+	return "('acl: source ' || coalesce(" + database_expr + " || ' ', '') || 'could not be read (' || " + class_expr +
+	       " || ')')";
+}
+
 bool SeesAllSources(const PolicyStore::AdminRights &rights) {
 	return rights.passthrough || rights.unrestricted_manage || rights.cluster;
 }
@@ -545,11 +720,13 @@ void RegisterAclPlatformSources(ExtensionLoader &loader, const shared_ptr<Policy
 		}
 		loader.RegisterFunction(set);
 	}
-	for (auto columns : {false, true}) {
-		auto name = columns ? "acl_physical_columns" : "acl_physical_tables";
+	for (auto kind : {PhysicalKind::TABLES, PhysicalKind::COLUMNS, PhysicalKind::UNREAD}) {
+		auto name = kind == PhysicalKind::COLUMNS  ? "acl_physical_columns"
+		            : kind == PhysicalKind::UNREAD ? "acl_physical_unread"
+		                                           : "acl_physical_tables";
 		TableFunction physical(Identifier(name), {LogicalType::LIST(LogicalType::VARCHAR)}, SourcesScan, PhysicalBindFn,
 		                       PhysicalInit);
-		physical.function_info = make_shared_ptr<PhysicalInfo>(columns);
+		physical.function_info = make_shared_ptr<PhysicalInfo>(store, kind);
 		loader.RegisterFunction(physical);
 	}
 	for (auto grant : {true, false}) {

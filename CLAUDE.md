@@ -752,6 +752,25 @@ raise, a RESET's default passes) wraps each substituted surface: a constant `LIM
 `least(session, node)` judged where it runs, above it `error()` - refused, never cut (duckdb segfaulted on a
 LIMIT with a subquery). A narrowed listing is parsed outside the template cache. Bench: `test/bench/metadata_scale.py`.
 
+**Spec 136 — a listing says which source it could not read**: the readers share a per-statement
+`PhysicalReadCache` (a `ClientContextState`, cleared at QueryBegin/End, its lock held across a reader's init -
+duckdb inits sources in parallel; `acl_platform_attached[_columns]` too): a `<db>.<schema>` that threw is read by no
+other reader of the statement, and a database that failed before it answered anything is not tried for its other
+schemas (a down source's timeout once). `acl_physical_unread(keys)` (probes only) answers `(database_name,
+schema_name, error_class)` - the exception's type (`SourceFailureClass`), never its text; `not attached` for a
+missing database (marked, never counted nor audited - absence, e.g. a group's source); an interrupt, FATAL-like and
+INTERNAL are rethrown. Only the mark's surfaces (tables, SHOW TABLES, duckdb_tables/_views; duckdb_schemas over
+alias keys) get a non-empty `unread` CTE, joined into `relations_marked`: the comment becomes `acl: source <db> could
+not be read (<class>)[; comment]` (`UnreadSourceMark[Sql]`, acl_platform.hpp - before spec 039's broken mark; the
+`<db>` only when a role's caps admit `select`, spec 035), and the
+tables surface's join to `itables` is a LEFT JOIN kept for an unread object (`BASE TABLE`; it used to VANISH, so
+Flight GetTables lists it again); `duckdb_tables` keeps spec 065's no-columns rule; an alias schema over it and the
+admin's `platform.attached.<alias>` node (SourcesInit's row) carry the mark in `duckdb_schemas`. Audit
+`policy`/`source_unreadable` (`PolicyStore::AuditSourceUnreadable`: once per source + class a minute on a steady
+clock, its own rate bucket `:listing`), counter
+`acl.listing.sources_unreadable{class}` at every failed read. A DuckLake scan in sqllogictest needs `require parquet`
+(its `GetScanFunctionById` calls a null bind otherwise - DuckLake's SIGSEGV).
+
 **Spec 120 — maintenance** (in stages; 120.1, 120.2, 120.3, 120.5 built): the missing forms - `ALTER ROLE r SET COMMENT` (`acl_comment_role`;
 a re-define keeps the comment), `REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r` (`acl_revoke_object`, HANDS_OUT),
 `ALTER VIRTUAL REFERENCE c.n SET COMMENT|CARDINALITY|OPTIONAL` + `COMMENT ON VIRTUAL REFERENCE` (`acl_alter_reference`),

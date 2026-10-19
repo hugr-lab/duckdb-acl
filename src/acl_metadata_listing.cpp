@@ -11,6 +11,17 @@ namespace duckdb {
 namespace acl {
 namespace acl_detail {
 
+namespace {
+
+//! Whether a caps chain admits `capability` the way the resolver's default reads it (spec 012: unstated = the data
+//! capabilities, an explicit '{}' = none). A caps JSON is admin-written, so the true-flag test is textual.
+string CapsAllowSql(const string &caps_expr, const char *capability) {
+	return "(" + caps_expr + " IS NULL OR trim(" + caps_expr + ") = '' OR regexp_matches(" + caps_expr + ", '(?i)\"" +
+	       capability + "\"\\s*:\\s*true'))";
+}
+
+} // namespace
+
 vector<CatalogBackend::VisibleFunction> CatalogBackend::VisibleFunctions(const Principal &principal) {
 	vector<VisibleFunction> out;
 	if (function_mode || principal.roles.empty()) {
@@ -144,7 +155,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// spec 119: the physical facts are read per source - the schemas the policy's objects and aliases name,
 	// each read directly (acl_physical_tables / _columns) - never duckdb's information_schema, which walks
 	// every attached database; the broken-list mark only over the relations that declare a list
-	vector<string> source_keys, declared_phys;
+	vector<string> source_keys, declared_phys, alias_keys;
 	{
 		// spec 119 §2: what the query asks about narrows which physical sources are read - the keys of the
 		// shown names (a catalog / a table is one part; a schema as shown, a key when it is a path)
@@ -171,10 +182,14 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		}
 		bool narrowed = !scope.Empty();
 		std::set<string> seen;
-		auto add_key = [&](const vector<string> &parts) {
+		std::set<string> alias_seen;
+		auto add_key = [&](const vector<string> &parts, bool alias) {
 			auto key = NamePath(parts).ToKey();
 			if (seen.insert(StringUtil::Lower(key)).second) {
 				source_keys.push_back(Lit(key));
+			}
+			if (alias && alias_seen.insert(StringUtil::Lower(key)).second) {
+				alias_keys.push_back(Lit(key));
 			}
 		};
 		// a relation: its physical object when the query narrows (a handful of rows), else its schema
@@ -191,7 +206,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 			if (parts.size() == 2) {
 				parts.insert(parts.begin() + 1, "main"); // <db>.<table>: the database's main
 			}
-			add_key(narrowed ? parts : vector<string> {parts[0], parts[1]});
+			add_key(narrowed ? parts : vector<string> {parts[0], parts[1]}, false);
 		}
 		// a schema alias: its physical schema - or, when the query names tables, those tables of it
 		auto aliases_rows = Query("SELECT DISTINCT \"phys_path\" FROM " + Tbl("schemas") +
@@ -204,11 +219,11 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 				continue;
 			}
 			if (scope.tables.empty()) {
-				add_key(path.Parts());
+				add_key(path.Parts(), true);
 				continue;
 			}
 			for (auto &table : scope.tables) {
-				add_key({path.Parts()[0], path.Parts()[1], table});
+				add_key({path.Parts()[0], path.Parts()[1], table}, true);
 			}
 		}
 		auto declared_rows =
@@ -234,6 +249,20 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	              ") GROUP BY 1, 2, 3)";
 	// duckdb's own information_schema.tables / .columns views, over the per-source reader
 	auto sources = keys_list(source_keys);
+	// spec 136: the source schemas the readers could not read in this statement - each read once, whichever
+	// reader came first (their per-statement cache) - and the exception's class, never its text. Only the
+	// surfaces that show the mark ask: the tables surfaces over every source they read, duckdb_schemas over the
+	// alias schemas it marks; any other (databases, schemata, columns, keys) reads no source it did not before
+	bool tables_mark =
+	    surface == "tables" || surface == "show_tables" || surface == "duckdb_tables" || surface == "duckdb_views";
+	auto unread_keys = tables_mark ? source_keys : (surface == "duckdb_schemas" ? alias_keys : vector<string>());
+	string unread = unread_keys.empty()
+	                    ? string("unread AS (SELECT NULL::VARCHAR AS db, NULL::VARCHAR AS fdb, NULL::VARCHAR AS fsch,"
+	                             " NULL::VARCHAR AS cls WHERE false)")
+	                    : "unread AS (SELECT min(database_name) AS db, " + KeyFoldSql("database_name") + " AS fdb, " +
+	                          KeyFoldSql("schema_name") +
+	                          " AS fsch, min(error_class) AS cls FROM acl_physical_unread(" + keys_list(unread_keys) +
+	                          ") GROUP BY 2, 3)";
 	// inlined where they are joined, as duckdb's own views are - a CTE referenced from correlated
 	// subqueries is materialized, and decorrelating over it blew the planner up (measured: minutes)
 	string itables =
@@ -282,7 +311,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " AND d.names IS NOT NULL THEN nullif(array_to_string(list_transform(list_filter("
 	    "range(1, len(d.names) + 1), lambda i: NOT list_contains(coalesce(p.cols, []::VARCHAR[]), d.reads[i])),"
 	    " lambda i: d.names[i]), ', '), '') ELSE NULL END";
-	string relations_marked = "(SELECT r.*, " + missing + " AS missing FROM " + Tbl("relations") +
+	string relations_marked = "(SELECT r.*, " + missing + " AS missing, u.db AS unread_db, u.cls AS unread_cls FROM " +
+	                          Tbl("relations") +
 	                          " r LEFT JOIN declared d ON d.vcat = r.\"vcat\" AND d.vname = r.\"vname\""
 	                          " LEFT JOIN physcols p ON p.table_catalog = " +
 	                          KeyPartsSql("r.\"phys\"") +
@@ -291,10 +321,22 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                          KeyPartsSql("r.\"phys\"") +
 	                          "[2]"
 	                          " AND p.table_name = " +
-	                          KeyPartsSql("r.\"phys\"") + "[3])";
-	string marked = "CASE WHEN r.missing IS NOT NULL THEN 'acl: broken - declared column(s) ' || r.missing ||"
-	                " ' no longer exist in the source' || CASE WHEN r.\"comment\" IS NULL OR r.\"comment\" = ''"
-	                " THEN '' ELSE '; ' || r.\"comment\" END ELSE r.\"comment\" END";
+	                          KeyPartsSql("r.\"phys\"") +
+	                          "[3] LEFT JOIN unread u ON u.fdb = " + KeyFoldSql(KeyPartsSql("r.\"phys\"") + "[1]") +
+	                          " AND u.fsch = " + KeyFoldSql(KeyPartsSql("r.\"phys\"") + "[2]") + ")";
+	// spec 136: a source that could not be read is said first - the broken mark needs its columns, so the
+	// two never meet, and nothing is known of the declared list then
+	string own_comment = "CASE WHEN r.\"comment\" IS NULL OR r.\"comment\" = '' THEN '' ELSE '; ' || r.\"comment\" END";
+	// review 136: the physical database is named only to a principal that may read the object - its failed read
+	// would say as much; one that only sees it (a grant without `select`) learns the class alone (spec 035)
+	string may_read = "EXISTS (SELECT 1 FROM grants g" + oc_join + " WHERE g.\"vcat\" = r.\"vcat\" AND " +
+	                  CapsAllowSql(CapsExpr(), "select") + ")";
+	string marked = "CASE WHEN r.unread_cls IS NOT NULL THEN " +
+	                UnreadSourceMarkSql("CASE WHEN " + may_read + " THEN r.unread_db END", "r.unread_cls") + " || " +
+	                own_comment +
+	                " WHEN r.missing IS NOT NULL THEN 'acl: broken - declared column(s) ' || r.missing ||"
+	                " ' no longer exist in the source' || " +
+	                own_comment + " ELSE r.\"comment\" END";
 	// the written path splits into a virtual schema and a name; a bare name sits in `main`
 	// spec 099: the type policy in force for the object - its own, else the node's - so every column
 	// row below describes what the read casts it to. The read casts only what the object's type facts
@@ -314,7 +356,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                 " AS vname, r.\"vname\" AS stored_name,"
 	                 " r.\"form\" AS form, " +
 	                 strip_alias + " AS strip_alias, " + enums_to_varchar + " AS enums_to_varchar, " + marked +
-	                 " AS comment,"
+	                 " AS comment, r.unread_cls IS NOT NULL AS unread,"
 	                 " " +
 	                 KeyPartsSql("r.\"phys\"") + " AS parts FROM " + relations_marked +
 	                 " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " + visible + ")";
@@ -407,8 +449,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	auto prelude =
 	    GrantsCte(principal) + ", " +
 	    (platform ? "pobjects AS (" + platform_objects + "), pcolumns AS (" + platform_columns + "), " : string()) +
-	    physcols + ", " + declared + ", " + objects + ", " + aliases + ", " + schemas + ", " + grant_columns + ", " +
-	    vfunctions + ", " + projected + " ";
+	    physcols + ", " + unread + ", " + declared + ", " + objects + ", " + aliases + ", " + schemas + ", " +
+	    grant_columns + ", " + vfunctions + ", " + projected + " ";
 	// spec 035: each surface answers in its own standard shape, column for column and type for
 	// type. A value that would describe the physical object rather than the virtual one is not
 	// borrowed - an oid identifies a physical catalog entry, a path is the physical database.
@@ -485,14 +527,35 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		string schema_comment = "(SELECT nullif(max(sc.\"comment\"), '') FROM " + Tbl("schemas") + " sc WHERE " +
 		                        KeyFoldSql("sc.\"vcat\"") + " = " + KeyFoldSql("d.vcat") + " AND " +
 		                        KeyFoldSql("sc.\"path\"") + " = " + KeyFoldSql("d.path") + ")";
+		// spec 136: an alias schema over a source that could not be read lists nothing - it says why; so
+		// does an admin's `platform.attached.<alias>` whose source failed (its reader's own row)
+		// (the database named only where the schema's caps admit `select`, as on an object)
+		string alias_caps =
+		    "coalesce((SELECT nullif(trim(sc.\"caps\"), '') FROM " + Tbl("role_schemas") +
+		    " sc WHERE sc.\"role\" = g.\"role\" AND sc.\"vcat\" = a.vcat AND sc.\"schema_path\" = a.path),"
+		    " g.\"caps\")";
+		string alias_may_read =
+		    "EXISTS (SELECT 1 FROM grants g WHERE g.\"vcat\" = a.vcat AND " + CapsAllowSql(alias_caps, "select") + ")";
+		string schema_marks =
+		    "(SELECT mvcat, mpath, min(mark) AS mark FROM (SELECT a.vcat AS mvcat, a.path AS mpath, " +
+		    UnreadSourceMarkSql("CASE WHEN " + alias_may_read + " THEN u.db END", "u.cls") +
+		    " AS mark FROM aliases a JOIN unread u ON u.fdb = " + KeyFoldSql("a.parts[1]") +
+		    " AND u.fsch = " + KeyFoldSql("a.parts[2]") + " WHERE len(a.parts) = 2" +
+		    (platform ? string(" UNION ALL SELECT 'platform', path, comment FROM pobjects WHERE vname IS NULL AND"
+		                       " comment IS NOT NULL")
+		              : string()) +
+		    ") GROUP BY ALL)";
+		string comment = "CASE WHEN m.mark IS NULL THEN " + schema_comment + " ELSE m.mark || coalesce('; ' || " +
+		                 schema_comment + ", '') END";
 		return prelude +
 		       named("SELECT " + schema_oid("vcat", "path") + " AS oid, vcat AS database_name, " +
 		                 database_oid("vcat") + " AS database_oid, " + KeyUnquoteSql(KeyLeafSql("path")) +
-		                 " AS schema_name, " + schema_comment + "::VARCHAR AS comment, " + empty_map +
+		                 " AS schema_name, (" + comment + ")::VARCHAR AS comment, " + empty_map +
 		                 " AS tags, false AS internal, NULL::VARCHAR AS sql, " + KeyUnquoteSql(KeyLeafSql("parent")) +
 		                 " AS parent_schema, CASE WHEN parent IS NULL THEN NULL ELSE " + schema_oid("vcat", "parent") +
 		                 " END AS parent_schema_oid FROM (SELECT DISTINCT vcat, path, CASE WHEN " +
-		                 KeyNestedSql("path") + " THEN " + KeyParentSql("path") + " END AS parent FROM vschemas) d",
+		                 KeyNestedSql("path") + " THEN " + KeyParentSql("path") + " END AS parent FROM vschemas) d" +
+		                 " LEFT JOIN " + schema_marks + " m ON m.mvcat = d.vcat AND m.mpath = d.path",
 		             {{"database_name", Shown::CATALOG}});
 	}
 	// spec 031: the SHOW forms, each in the shape duckdb answers it with. They are the same catalog
@@ -519,8 +582,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// like the rest of this file's caps SQL. The listing is a hint - the write path stays the
 	// authority - so a YES the write path would still refuse errs on the side it must.
 	auto caps_allow_insert = [&](const string &caps_expr) {
-		return "(" + caps_expr + " IS NULL OR trim(" + caps_expr + ") = '' OR regexp_matches(" + caps_expr +
-		       ", '(?i)\"insert\"\\s*:\\s*true'))";
+		return CapsAllowSql(caps_expr, "insert");
 	};
 	string o_oc_join = HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
 	                                         " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = o.vcat"
@@ -540,11 +602,13 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                          caps_allow_insert(alias_schema_caps) + ") THEN 'YES' ELSE 'NO' END AS is_insertable_into";
 	// the comment is the virtual object's own: a physical comment describes the physical table, and
 	// may say things about it the role is not reading (spec 035)
+	// spec 136: an object over a source that could not be read stays listed - with no physical row, as a
+	// table, its comment saying why - instead of vanishing
 	string tables_sql =
 	    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
-	           " o.comment AS \"TABLE_COMMENT\", ") +
-	    object_insertable + ") FROM objects o JOIN " + itables + " i ON " + physical +
-	    " WHERE len(o.parts) = 3"
+	           " coalesce(i.table_type, 'BASE TABLE') AS table_type, o.comment AS \"TABLE_COMMENT\", ") +
+	    object_insertable + ") FROM objects o LEFT JOIN " + itables + " i ON " + physical +
+	    " WHERE len(o.parts) = 3 AND (i.table_name IS NOT NULL OR o.unread)"
 	    " UNION ALL BY NAME"
 	    // a view's own comment (spec 117 §7: it never reached duckdb_views / information_schema.tables)
 	    " SELECT o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"

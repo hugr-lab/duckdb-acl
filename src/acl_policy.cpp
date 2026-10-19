@@ -1,6 +1,7 @@
 #include "acl_policy.hpp"
 #include "acl_session_state.hpp"
 #include "acl_lineage.hpp"
+#include "acl_platform.hpp"
 
 #include "acl_audit_pipeline.hpp"
 #include "acl_rewriter.hpp"
@@ -944,6 +945,39 @@ void PolicyStore::AuditKeys(const string &issuer, bool ok, const string &error, 
 		event.reason = error;
 	}
 	event.level = ok ? AuditLevel::ALL : AuditLevel::DENIED;
+	event.recorded = audit->Records(event.level, -1);
+	audit->Emit(std::move(event));
+}
+
+void PolicyStore::AuditSourceUnreadable(const string &database, const string &error_class) {
+	if (!audit) {
+		return;
+	}
+	audit->Hooks().Counters().Add("acl.listing.sources_unreadable", {{"class", error_class}});
+	{
+		// a steady clock: a wall clock set back would silence the source until it caught up again
+		auto now = int64_t(
+		    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch())
+		        .count());
+		lock_guard<mutex> guard(unreadable_floor_lock);
+		if (unreadable_floor.size() > 4096) {
+			unreadable_floor.clear(); // bounded: a flood of sources is a flood too, and a reset is cheap
+		}
+		auto &last = unreadable_floor[StringUtil::Lower(database) + '\x1f' + error_class];
+		if (last != 0 && now - last < 60) {
+			return; // counted above, recorded once a minute
+		}
+		last = now;
+	}
+	// a database the node attached is the operator's name; no principal's data rides on the event
+	AuditEvent event;
+	event.kind = "policy";
+	event.detail = "source_unreadable";
+	event.objects.push_back(AuditObject {database, "source"});
+	event.allowed = false;
+	event.reason_code = "source_error";
+	event.reason = UnreadSourceMark(database, error_class);
+	event.level = AuditLevel::DENIED;
 	event.recorded = audit->Records(event.level, -1);
 	audit->Emit(std::move(event));
 }
