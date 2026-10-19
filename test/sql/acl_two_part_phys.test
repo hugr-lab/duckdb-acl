@@ -1,0 +1,216 @@
+# name: test/sql/acl_two_part_phys.test
+# description: spec 137 - a relation's physical name is stored whole: a two-part name over an attached database is
+#   expanded at write to what duckdb finds there, so the listings join the object to its source; a name read in the
+#   node's default database stays as written (that node's own); one that reads both ways is refused; one stored in
+#   two parts before is found by acl_check_catalog with its repair, never rewritten by itself; the source gate
+#   judges a definition's two-part name the way the write stores it, and a body's names as written
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS src;
+
+statement ok
+CREATE TABLE src.main.t(id INTEGER, x VARCHAR);
+
+statement ok
+CREATE TABLE src.main.t2(id INTEGER);
+
+statement ok
+CREATE TABLE src.main.t3(id INTEGER);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# --- at write: the name as duckdb finds it in the attached database ------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.two AS src.t;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.dec AS src.t COLUMNS (id);
+
+query TT
+SELECT vname, phys FROM store.acl.relations ORDER BY 1;
+----
+dec	src.main.t
+two	src.main.t
+
+# listed like any other object - in the tables, the columns and duckdb's own surfaces
+query TT
+ACL ROLE "r" SELECT table_name, table_type FROM information_schema.tables ORDER BY ALL;
+----
+dec	BASE TABLE
+two	BASE TABLE
+
+query TT
+ACL ROLE "r" SELECT table_name, column_name FROM information_schema.columns ORDER BY ALL;
+----
+dec	id
+two	id
+two	x
+
+query T
+ACL ROLE "r" SELECT table_name FROM duckdb_tables() ORDER BY ALL;
+----
+dec
+two
+
+# and read as before
+query II
+ACL ROLE "r" SELECT count(*), count(x) FROM two;
+----
+0	0
+
+# SET PHYS too
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.two SET PHYS src.t2;
+
+query T
+SELECT phys FROM store.acl.relations WHERE vname = 'two';
+----
+src.main.t2
+
+# a name read in the node's default database stays as written: the database is that node's own, and a policy
+# catalog other nodes share must not carry it
+statement ok
+CREATE SCHEMA loc;
+
+statement ok
+CREATE TABLE loc.lt(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.loc AS loc.lt;
+
+query T
+SELECT phys FROM store.acl.relations WHERE vname = 'loc';
+----
+loc.lt
+
+# --- stored in two parts before: found, with its repair; never rewritten by itself --------------------------------
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.old AS src.main.t3;
+
+statement ok
+UPDATE store.acl.relations SET phys = 'src.t3' WHERE vname = 'old';
+
+query T
+ACL ROLE "r" SELECT count(*) FROM information_schema.tables WHERE table_name = 'old';
+----
+0
+
+# (the default database's `loc.lt` is not found: its whole name would be one node's)
+query TTTT
+SELECT object, problem, detail, repair FROM acl_check_catalog('c') WHERE problem = 'phys_incomplete';
+----
+old	phys_incomplete	the physical name "src.t3" has two parts: it is read, but the listings join an object to its source by three, so it is not listed - it binds to "src.main.t3"	ALTER VIRTUAL TABLE c.old SET PHYS src.main.t3
+
+# the check rewrote nothing
+query T
+SELECT phys FROM store.acl.relations WHERE vname = 'old';
+----
+src.t3
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.old SET PHYS src.main.t3;
+
+query T
+ACL ROLE "r" SELECT table_name FROM information_schema.tables WHERE table_name = 'old';
+----
+old
+
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE problem = 'phys_incomplete';
+----
+0
+
+# --- the source gate: a definition's two-part name is judged as the write stores it -------------------------------
+
+statement ok
+CREATE SCHEMA src.other;
+
+statement ok
+CREATE TABLE src.other.o(id INTEGER);
+
+statement ok
+ATTACH ':memory:' AS sec;
+
+statement ok
+CREATE TABLE sec.main.secret(s VARCHAR);
+
+statement ok
+INSERT INTO sec.main.secret VALUES ('top-secret');
+
+statement ok
+CREATE VIEW sec.main.v AS SELECT * FROM main.secret;
+
+statement ok
+ACL ADMIN CREATE ROLE cadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cadm CAPS '{"select": true, "manage": true}';
+
+statement ok
+ACL ADMIN GRANT SOURCE src.other TO ROLE cadm;
+
+# src.t is src.main.t - outside the granted schema
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.out AS src.t;
+----
+<REGEX>:.*outside the sources granted.*
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.inside AS src.other.o;
+
+# gate coverage probe: a body's names are judged as written - a name inside a physical view (`main.secret`, bound
+# in the view's own catalog) is never read against the node's default database
+statement ok
+ACL ADMIN GRANT SOURCE memory.main TO ROLE cadm;
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.leak AS 'SELECT * FROM sec.main.v';
+----
+<REGEX>:.*the definition's body names .*outside the sources granted.*
+
+# --- a name that reads two ways is refused: duckdb refuses it at read too; the refusal names neither reading -----
+
+statement ok
+CREATE SCHEMA src;
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE c.amb AS src.t;
+----
+<REGEX>:.*the physical name "src\.t" names two objects - a database and a schema of the node's default database; write it whole, as <database>\.<schema>\.<object>.*
+
+# IF NOT EXISTS over an existing object does not read its name
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE IF NOT EXISTS c.two AS src.t;
+
+# written whole, the name is taken as written
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.amb AS src.main.t;
+
+query T
+SELECT phys FROM store.acl.relations WHERE vname = 'amb';
+----
+src.main.t

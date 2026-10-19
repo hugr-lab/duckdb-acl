@@ -206,6 +206,21 @@ vector<string> GrantedSources(const PolicyStore::AdminRights &rights);
 bool SeesAllSources(const PolicyStore::AdminRights &rights);
 //! a physical name (parts: `<db>.<schema>.<object>`, a schema path `<db>[.<schema>…]`) inside a granted source
 bool SourceGranted(const vector<string> &sources, const vector<string> &parts, bool schema_path);
+//! spec 137: the same with a two-part object name read the way duckdb binds it - the database's own default
+//! schema (Postgres `public`), never an assumed `main`
+//! `as_written`: a body's name - the plain reading must pass too (a name inside a physical view binds in the view's
+//! own catalog), so the attached database's reading only ever narrows it. Throws for a name that reads two ways.
+bool SourceGranted(DatabaseInstance &db, const vector<string> &sources, const vector<string> &parts, bool schema_path,
+                   bool as_written = false);
+//! spec 137: what a two-part object name `a.b` is stored as - one reading `a.<schema>.b` when `a` is an attached
+//! database (the entry duckdb's own lookup finds there, else its default schema's real name); two when `a` is also a
+//! schema of the node's default database (duckdb refuses the name as ambiguous - the second only for that); none
+//! otherwise. `unknown` (optional) is set when the source could not say (it threw): a gate must then refuse.
+vector<vector<string>> PhysicalObjectReadings(DatabaseInstance &db, const vector<string> &parts,
+                                              bool *unknown = nullptr);
+//! The refusal of a name that reads two ways - naming neither reading (a principal may not learn the node's default
+//! database or what it holds)
+[[noreturn]] void ThrowAmbiguousPhysical(const string &name);
 //! spec 136: the comment mark of what a listing could not read - `acl: source <db> could not be read (<class>)` -
 //! as a value, and as SQL over two VARCHAR expressions (one text, written once here); an empty / NULL database leaves
 //! the name out (a principal that may not read the object, review 136)

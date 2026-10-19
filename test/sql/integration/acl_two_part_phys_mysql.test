@@ -1,0 +1,52 @@
+# name: test/sql/integration/acl_two_part_phys_mysql.test
+# description: spec 137 over a live MySQL - a two-part physical name is stored whole with the schema MySQL's catalog
+#   really gives (its database, `acltest` - never the `main` it answers to), so the object is listed and read
+# group: [integration]
+
+require acl
+
+require mysql_scanner
+
+require-env ACL_MYSQL_DSN
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH '{ACL_MYSQL_DSN}' AS my (TYPE mysql);
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.o AS my.orders;
+
+query T
+SELECT phys FROM store.acl.relations WHERE vname = 'o';
+----
+my.acltest.orders
+
+query TT
+ACL ROLE "r" SELECT table_name, table_type FROM information_schema.tables WHERE table_name = 'o';
+----
+o	BASE TABLE
+
+query I
+ACL ROLE "r" SELECT count(*) > 0 FROM o;
+----
+true

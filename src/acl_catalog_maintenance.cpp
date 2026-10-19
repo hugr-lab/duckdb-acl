@@ -256,6 +256,9 @@ private:
 					}
 				}
 			}
+			if (!relation.dead && !is_view) {
+				JudgeWholeName(kind, relation);
+			}
 			if (!relation.dead) {
 				JudgeTypes(kind, relation, rls, rows_rows.GetValue(7, row), rows_rows.GetValue(6, row));
 			}
@@ -266,6 +269,27 @@ private:
 			}
 			relations[relation.vname] = std::move(relation);
 		}
+	}
+
+	//! spec 137: a physical name stored in two parts (before the write expanded it) is read, but no listing joins it
+	//! to its source - the repair writes it whole, as duckdb binds it; never rewritten by itself
+	void JudgeWholeName(const string &kind, const Relation &relation) {
+		NamePath path;
+		string error;
+		if (!NamePath::TryFromKey(relation.phys, path, error) || path.Parts().size() != 2) {
+			return;
+		}
+		auto readings = PhysicalObjectReadings(*catalog.Db(), path.Parts());
+		if (readings.size() != 1) {
+			return; // it binds to nothing, or reads two ways - a source that does not bind has its own finding
+		}
+		auto whole = NamePath(readings[0]).ToKey();
+		Add(kind, relation.vname, "", "phys_incomplete",
+		    "the physical name \"" + relation.phys +
+		        "\" has two parts: it is read, but the listings join an object to "
+		        "its source by three, so it is not listed - it binds to \"" +
+		        whole + "\"",
+		    "ALTER VIRTUAL TABLE " + Named(relation.vname) + " SET PHYS " + NamePath::KeyToGrammar(whole));
 	}
 
 	//! spec 099: the type facts against the source now (`types_stale`), and an ENUM whose labels every

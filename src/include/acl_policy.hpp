@@ -540,6 +540,9 @@ struct PolicyStore {
 	//! case-sensitive source - postgres - may hold `Orders` and `orders`); several answers and none exact,
 	//! or nothing there yet (a CREATE in the client's open transaction), keep the part as written.
 	string SpellPhysical(const string &key);
+	//! spec 137: a relation's physical name, stored whole - `<database>.<schema>.<object>`. A two-part name is
+	//! expanded the way duckdb binds it (PhysicalObjectReadings); one that reads two ways is refused
+	string SpellRelationPhysical(const string &key);
 	//! The same over a catalog's references (their own namespace, spec 022)
 	string SpellReference(const string &vcat, const string &name, bool creating = false);
 

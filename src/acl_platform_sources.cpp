@@ -673,6 +673,28 @@ vector<string> GrantedSources(const PolicyStore::AdminRights &rights) {
 	return out;
 }
 
+bool SourceGranted(DatabaseInstance &db, const vector<string> &sources, const vector<string> &parts, bool schema_path,
+                   bool as_written) {
+	if (schema_path || parts.size() != 2) {
+		return SourceGranted(sources, parts, schema_path);
+	}
+	bool unknown = false;
+	auto readings = PhysicalObjectReadings(db, parts, &unknown);
+	if (unknown) {
+		return false; // the source could not say what the name is: never the `main` guess (review 137)
+	}
+	if (readings.size() > 1) {
+		ThrowAmbiguousPhysical(NamePath(parts).ToKey()); // duckdb refuses it at read; neither reading is named
+	}
+	if (as_written) {
+		// a body's name: the plain reading (it is how a name inside a physical view is judged - bound in the view's
+		// own catalog, never the default database) AND, for an attached database, what duckdb finds there
+		return SourceGranted(sources, parts, false) && (readings.empty() || SourceGranted(sources, readings[0], false));
+	}
+	// a definition's name: as the write stores it (spec 137)
+	return readings.empty() ? SourceGranted(sources, parts, false) : SourceGranted(sources, readings[0], false);
+}
+
 string UnreadSourceMark(const string &database, const string &error_class) {
 	return "acl: source " + (database.empty() ? string() : database + " ") + "could not be read (" + error_class + ")";
 }

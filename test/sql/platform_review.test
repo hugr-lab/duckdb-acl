@@ -343,6 +343,12 @@ ACL ROLE "pol" CREATE VIRTUAL TABLE sales.a AS mstore.main.admins;
 ----
 <REGEX>:.*the relation reads the policy store itself.*
 
+# (spec 137 stores a relation's name whole; a body keeps the two-part reading of the policy store's tables)
+statement error
+ACL ROLE "pol" CREATE VIRTUAL VIEW sales.av AS 'SELECT * FROM mstore.admins';
+----
+<REGEX>:.*policy store.*
+
 statement error
 ACL ROLE "pol" CREATE VIRTUAL VIEW sales.v AS SELECT * FROM mstore.platform_grants;
 ----

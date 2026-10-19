@@ -771,6 +771,19 @@ clock, its own rate bucket `:listing`), counter
 `acl.listing.sources_unreadable{class}` at every failed read. A DuckLake scan in sqllogictest needs `require parquet`
 (its `GetScanFunctionById` calls a null bind otherwise - DuckLake's SIGSEGV).
 
+**Spec 137 — a relation's physical name is stored whole**: the listings join an object to its source by three
+parts, so a two-part `phys` (`pg.orders`) was read but never listed. `PolicyStore::SpellRelationPhysical` (the
+relation writers: add / register / grant_table / alter `phys`, after an IF NOT EXISTS skip; a schema alias's
+`<db>.<schema>` keeps SpellPhysical; the memory store keeps names as written) expands it by
+`PhysicalObjectReadings` (acl_platform.hpp, a fresh connection): `a` an attached database (not system/temp) - the
+entry duckdb's own `Catalog::GetEntry(catalog, no schema)` finds, by its catalog/schema/name (MySQL `acltest`, not
+`main`), else the default schema's real name; `a` also a schema of the default database = refused as ambiguous;
+`a` only such a schema = KEPT AS WRITTEN (the default database is one node's; a shared policy must not carry it).
+The source gate: a definition's two-part name via `SourceGranted(db, …)` as stored; a BODY's name with `as_written`
+= the plain check (names inside a physical view bind in the view's catalog - review 137's hole) AND the attached
+database's reading; ambiguous = `ThrowAmbiguousPhysical` (names neither reading), a lookup that threw = refused.
+Stored rows are never rewritten: `acl_check_catalog`'s `phys_incomplete` gives the `SET PHYS` repair.
+
 **Spec 120 — maintenance** (in stages; 120.1, 120.2, 120.3, 120.5 built): the missing forms - `ALTER ROLE r SET COMMENT` (`acl_comment_role`;
 a re-define keeps the comment), `REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r` (`acl_revoke_object`, HANDS_OUT),
 `ALTER VIRTUAL REFERENCE c.n SET COMMENT|CARDINALITY|OPTIONAL` + `COMMENT ON VIRTUAL REFERENCE` (`acl_alter_reference`),
