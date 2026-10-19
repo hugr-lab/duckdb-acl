@@ -208,7 +208,9 @@ the comments. Never a row, a view's SQL or a column default - `SELECT … FROM p
 refused like any object the principal does not hold. The listings read one attached database at a time
 through its own schema set (`acl_platform_attached[_columns]([sources])`), and only the databases a
 principal may see: postgres loads its remote catalog on the first touch (narrow it with ATTACH's
-`SCHEMA`), mysql per schema.
+`SCHEMA`), mysql per schema. A source whose catalog cannot be read stays in the tree as `attached.<alias>` with no
+schemas, its `duckdb_schemas()` comment saying why - `acl: source <alias> could not be read (<class>)`,
+the exception's class and never its text (spec 136).
 
 | Who | Sees under `attached` | May build over |
 | --- | --- | --- |

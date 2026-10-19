@@ -966,6 +966,12 @@ struct PolicyStore {
 	//! spec 071's location_refused / policy_error is the one other shape
 	void AuditKeys(const string &issuer, bool ok, const string &error, const char *detail = nullptr,
 	               const char *reason_code = nullptr);
+	//! spec 136: a listing could not read a source (`policy` / `source_unreadable`, the database and the
+	//! exception's class - never its text). Recorded once per source and class a minute, counted each time
+	//! (`acl.listing.sources_unreadable{class}`).
+	void AuditSourceUnreadable(const string &database, const string &error_class);
+	mutex unreadable_floor_lock;
+	unordered_map<string, int64_t> unreadable_floor; // `<db lowered>\x1f<class>` -> last recorded, s
 	//! The store of an instance, for code that holds a connection and nothing else (the embedded
 	//! quack server's drain thread): registered in the object cache at load. Null before load.
 	static shared_ptr<PolicyStore> Of(DatabaseInstance &db);

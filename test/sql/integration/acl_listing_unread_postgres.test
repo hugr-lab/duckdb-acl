@@ -1,0 +1,93 @@
+# name: test/sql/integration/acl_listing_unread_postgres.test
+# description: spec 136 over a live PostgreSQL - a source whose server stops answering (its login is taken away,
+#   its connections ended, the scanner's catalog cache cleared) marks the objects over it with the exception's
+#   class; the scanner's own text (the host, the login) is nowhere in the listing
+# group: [integration]
+
+require acl
+
+require postgres_scanner
+
+require-env ACL_PG_DSN
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH '{ACL_PG_DSN}' AS pgadm (TYPE postgres);
+
+statement ok
+CALL postgres_execute('pgadm', 'DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ''acl136_reader'') THEN DROP OWNED BY acl136_reader; DROP ROLE acl136_reader; END IF; END $$');
+
+statement ok
+CALL postgres_execute('pgadm', 'CREATE ROLE acl136_reader LOGIN PASSWORD ''acl136pw''');
+
+statement ok
+CALL postgres_execute('pgadm', 'GRANT USAGE ON SCHEMA public TO acl136_reader');
+
+statement ok
+CALL postgres_execute('pgadm', 'GRANT SELECT ON public.orders TO acl136_reader');
+
+# the same server under the reader's login (a repeated keyword: the last one counts)
+statement ok
+ATTACH '{ACL_PG_DSN} user=acl136_reader password=acl136pw' AS pgr (TYPE postgres);
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.o AS pgr.public.orders COMMENT 'orders';
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+query TT
+ACL ROLE "r" SELECT table_name, TABLE_COMMENT FROM information_schema.tables ORDER BY ALL;
+----
+o	orders
+
+# the server stops answering this source: no login, no open connection, nothing cached
+statement ok
+CALL postgres_execute('pgadm', 'ALTER ROLE acl136_reader NOLOGIN');
+
+statement ok
+CALL postgres_execute('pgadm', 'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = ''acl136_reader''');
+
+statement ok
+CALL postgres_clear_cache();
+
+query T
+ACL ROLE "r" SELECT TABLE_COMMENT LIKE 'acl: source pgr could not be read (%); orders' FROM information_schema.tables WHERE table_name = 'o';
+----
+true
+
+# the class only: the scanner's message names the login and the server
+query T
+ACL ROLE "r" SELECT TABLE_COMMENT FROM information_schema.tables WHERE table_name = 'o' AND (TABLE_COMMENT LIKE '%acl136%' OR TABLE_COMMENT LIKE '%host%' OR TABLE_COMMENT LIKE '%login%' OR TABLE_COMMENT LIKE '%FATAL%');
+----
+
+query I
+ACL ROLE "r" SELECT count(*) FROM information_schema.columns WHERE table_name = 'o';
+----
+0
+
+statement ok
+DETACH pgr;
+
+statement ok
+CALL postgres_execute('pgadm', 'DROP OWNED BY acl136_reader');
+
+statement ok
+CALL postgres_execute('pgadm', 'DROP ROLE acl136_reader');

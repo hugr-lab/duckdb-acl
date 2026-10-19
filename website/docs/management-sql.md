@@ -1081,6 +1081,11 @@ computed column written as an expression, a constant or one of SQL's bare-word f
 (`current_user`, `current_date`, …) is not judged; write anything else that is not a column with
 parentheses or a cast so it cannot be mistaken for one.
 
+A source the listing could not read at all (spec 136) is said before anything else: the object's
+comment begins `acl: source <database> could not be read (<class>)` - the class of the exception
+(`IO`, `Binder`, `not attached`, ...), never its text, and the database only to a principal that may
+read the object - and the object stays listed with no physical columns. Nothing about its declared list is known then, so the broken mark waits for the source.
+
 ```sql
 ACL ADMIN CHECK VIRTUAL CATALOG sales;
 ACL ADMIN REPAIR VIRTUAL TABLE sales.customers REMAP (ssn = ssn_v2);

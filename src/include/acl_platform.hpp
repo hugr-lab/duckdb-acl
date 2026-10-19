@@ -206,6 +206,11 @@ vector<string> GrantedSources(const PolicyStore::AdminRights &rights);
 bool SeesAllSources(const PolicyStore::AdminRights &rights);
 //! a physical name (parts: `<db>.<schema>.<object>`, a schema path `<db>[.<schema>…]`) inside a granted source
 bool SourceGranted(const vector<string> &sources, const vector<string> &parts, bool schema_path);
+//! spec 136: the comment mark of what a listing could not read - `acl: source <db> could not be read (<class>)` -
+//! as a value, and as SQL over two VARCHAR expressions (one text, written once here); an empty / NULL database leaves
+//! the name out (a principal that may not read the object, review 136)
+string UnreadSourceMark(const string &database, const string &error_class);
+string UnreadSourceMarkSql(const string &database_expr, const string &class_expr);
 //! spec 118.3: a catalog admin (neither policy, passthrough nor cluster) builds only over its granted
 //! sources - every physical name and every table a stored body reads; anything else is refused at write
 void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const PolicyStore::AdminRights &rights,

@@ -1,0 +1,236 @@
+# name: test/sql/acl_listing_unread_source.test
+# description: spec 136 - a listing says which source it could not read: an object over it stays listed with a
+#   mark in its comment (the source - to a principal that may read the object - and the exception's class, never its
+#   text), an alias schema over it says so in duckdb_schemas, only the surfaces that show the mark read for it, a
+#   failing database is read once per statement, and the node records it (one event per source and class a minute)
+#   and counts it - a database that is not attached is marked, never counted
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH '{TEST_DIR}/unread_src.duckdb' AS src;
+
+statement ok
+CREATE SCHEMA src.s2;
+
+statement ok
+CREATE TABLE src.main.t(id INTEGER, x VARCHAR);
+
+statement ok
+CREATE TABLE src.s2.u(id INTEGER);
+
+statement ok
+ATTACH ':memory:' AS keep;
+
+statement ok
+CREATE TABLE keep.main.k(id INTEGER);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS src.main.t COMMENT 'the t table';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.k AS keep.main.k;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.al AS src.s2;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+# a role that sees the catalog's objects but may read none of them
+statement ok
+ACL ADMIN CREATE ROLE seer;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE seer CAPS '{"select": false}' MAIN;
+
+# --- a source that answers: no mark ------------------------------------------------------------------------------
+
+query TTTT
+ACL ROLE "r" SELECT table_schema, table_name, table_type, TABLE_COMMENT FROM information_schema.tables ORDER BY ALL;
+----
+al	u	BASE TABLE	NULL
+main	k	BASE TABLE	NULL
+main	t	BASE TABLE	the t table
+
+query TT
+ACL ROLE "r" SELECT schema_name, comment FROM duckdb_schemas() ORDER BY ALL;
+----
+al	NULL
+main	NULL
+
+# --- the source detached: the object stays listed and says why; the rest is unchanged ----------------------------
+
+statement ok
+DETACH src;
+
+statement ok
+SET VARIABLE counted = (SELECT coalesce(sum(value), 0) FROM acl_metrics() WHERE name = 'acl.listing.sources_unreadable');
+
+query TTTT
+ACL ROLE "r" SELECT table_schema, table_name, table_type, TABLE_COMMENT FROM information_schema.tables ORDER BY ALL;
+----
+main	k	BASE TABLE	NULL
+main	t	BASE TABLE	acl: source src could not be read (not attached); the t table
+
+# no column is listed for it; the readable source's are
+query TT
+ACL ROLE "r" SELECT table_name, column_name FROM information_schema.columns ORDER BY ALL;
+----
+k	id
+
+# the alias schema's tables are the source's - unknown now; the schema says why
+query TT
+ACL ROLE "r" SELECT schema_name, comment FROM duckdb_schemas() ORDER BY ALL;
+----
+al	acl: source src could not be read (not attached)
+main	NULL
+
+# duckdb_tables keeps spec 065's rule: an object with no column to describe is not listed there
+query T
+ACL ROLE "r" SELECT table_name FROM duckdb_tables() ORDER BY ALL;
+----
+k
+
+# a narrowed listing: only what it reads is judged
+query TT
+ACL ROLE "r" SELECT table_name, TABLE_COMMENT FROM information_schema.tables WHERE table_name = 't';
+----
+t	acl: source src could not be read (not attached); the t table
+
+# a principal that may not read the object learns the class, never the physical database (spec 035)
+query TT
+ACL ROLE "seer" SELECT table_name, TABLE_COMMENT FROM information_schema.tables WHERE table_name = 't';
+----
+t	acl: source could not be read (not attached); the t table
+
+query TT
+ACL ROLE "seer" SELECT schema_name, comment FROM duckdb_schemas() WHERE schema_name = 'al';
+----
+al	acl: source could not be read (not attached)
+
+# a database that is not attached is absence, not a failure: marked, never counted nor recorded
+query I
+SELECT coalesce(sum(value), 0) - getvariable('counted') FROM acl_metrics() WHERE name = 'acl.listing.sources_unreadable';
+----
+0
+
+# the reader is the listing's: a principal never names it
+statement error
+ACL ROLE "r" SELECT * FROM acl_physical_unread(['src.main']);
+----
+<REGEX>:.*acl_physical_unread.*not allowed.*
+
+query TTT
+SELECT * FROM acl_physical_unread(['src.main', 'keep.main', 'src.s2.u']) ORDER BY ALL;
+----
+src	main	not attached
+src	s2	not attached
+
+# --- a source whose catalog read throws: the mark names the exception's class, never its text -------------------
+
+require parquet
+
+require ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/unread_lake.ducklake' AS lake (DATA_PATH '{TEST_DIR}/unread_lake');
+
+statement ok
+CREATE TABLE lake.lt(id INTEGER);
+
+statement ok
+CREATE SCHEMA lake.s2;
+
+statement ok
+CREATE TABLE lake.s2.lt2(id INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.lt AS lake.main.lt;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.lt2 AS lake.s2.lt2;
+
+statement ok
+ACL ADMIN CREATE ROLE pol;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE pol;
+
+query T
+ACL ROLE "r" SELECT TABLE_COMMENT FROM information_schema.tables WHERE table_name = 'lt';
+----
+NULL
+
+statement ok
+DETACH __ducklake_metadata_lake;
+
+statement ok
+SET VARIABLE counted = (SELECT coalesce(sum(value), 0) FROM acl_metrics() WHERE name = 'acl.listing.sources_unreadable');
+
+query TT
+ACL ROLE "r" SELECT table_name, TABLE_COMMENT FROM information_schema.tables WHERE table_name LIKE 'lt%' ORDER BY ALL;
+----
+lt	acl: source lake could not be read (Binder)
+lt2	acl: source lake could not be read (Binder)
+
+# one read for the whole failing database in a statement, whatever the readers and its schemas
+query I
+SELECT coalesce(sum(value), 0) - getvariable('counted') FROM acl_metrics() WHERE name = 'acl.listing.sources_unreadable' AND attributes = '{"class":"Binder"}';
+----
+1
+
+# a surface that shows no mark reads no source for it (spec 119: only what it answers about)
+statement ok
+SET VARIABLE counted = (SELECT coalesce(sum(value), 0) FROM acl_metrics() WHERE name = 'acl.listing.sources_unreadable');
+
+statement ok
+ACL ROLE "r" SELECT * FROM duckdb_databases();
+
+statement ok
+ACL ROLE "r" SHOW DATABASES;
+
+statement ok
+ACL ROLE "r" SELECT * FROM information_schema.schemata;
+
+statement ok
+ACL ROLE "r" SHOW SCHEMAS;
+
+query I
+SELECT coalesce(sum(value), 0) - getvariable('counted') FROM acl_metrics() WHERE name = 'acl.listing.sources_unreadable';
+----
+0
+
+# the admin's tree keeps the source as a node, and says why it is empty
+query TT
+ACL ROLE "pol" SELECT schema_name, comment FROM duckdb_schemas() WHERE database_name = 'platform' AND comment LIKE 'acl: source %' ORDER BY ALL;
+----
+lake	acl: source lake could not be read (Binder)
+
+# the node records it once a minute, however many listings met it - and nothing for the source not attached
+statement ok
+SELECT acl_audit_flush();
+
+query TTTTT
+SELECT detail, verdict, reason_code, reason, objects::VARCHAR FROM acl_audit_events() WHERE detail = 'source_unreadable';
+----
+source_unreadable	denied	source_error	acl: source lake could not be read (Binder)	[{'name': lake, 'capability': source}]
