@@ -113,6 +113,57 @@ ACL ROLE "cadm" CREATE VIRTUAL VIEW c.l5 AS 'SELECT * FROM (WITH q AS (SELECT 1 
 ----
 <REGEX>:.*the definition's body names "q", outside the sources granted.*
 
+# --- SUMMARIZE / DESCRIBE name what they read (review 138) ----------------------------------------------------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.s1 AS 'SELECT * FROM (SUMMARIZE sec.main.secret)';
+----
+<REGEX>:.*names "sec\.main\.secret", outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.s2 AS 'SELECT * FROM (SUMMARIZE SELECT s FROM sec.main.secret)';
+----
+<REGEX>:.*names "sec\.main\.secret", outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.s3 AS 'SELECT * FROM (DESCRIBE sec.main.secret)';
+----
+<REGEX>:.*names "sec\.main\.secret", outside the sources granted.*
+
+# --- a CTE's scope is duckdb's: never itself, never a later sibling, only a recursive CTE's right side --------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c1 AS 'WITH g AS (SELECT * FROM g) SELECT * FROM g';
+----
+<REGEX>:.*names "g", outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c2 AS 'WITH a1 AS (SELECT * FROM g), g AS (SELECT 1 AS s) SELECT * FROM a1';
+----
+<REGEX>:.*names "g", outside the sources granted.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c3 AS 'WITH RECURSIVE g AS (SELECT * FROM g UNION ALL SELECT * FROM g WHERE false) SELECT * FROM g';
+----
+<REGEX>:.*names "g", outside the sources granted.*
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.c4 AS 'WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT * FROM r';
+
+# --- NEAREST's ranking expression (spec 139's field) ---------------------------------------------------------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.n1 AS 'SELECT x.id FROM src.main.t x INNER JOIN src.main.t y EXACT NEAREST 1 BY DISTANCE x.id - y.id + (SELECT count(*) FROM sec.main.secret)';
+----
+<REGEX>:.*names "sec\.main\.secret", outside the sources granted.*
+
+# --- a computed column's body ----------------------------------------------------------------------------------------
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.m1 AS src.main.t COLUMNS (id, k = (SELECT x FROM sec.main.vconst));
+----
+<REGEX>:.*names "sec\.main\.vconst", outside the sources granted.*
+
 # --- admitted: the granted source's own objects, whatever its views read (the owner's rule), and a CTE -----------
 
 statement ok
@@ -126,8 +177,9 @@ ACL ROLE "cadm" CREATE VIRTUAL VIEW c.ok3 AS 'WITH x AS (SELECT * FROM src.main.
 
 # --- the check judges a stored body the same way -----------------------------------------------------------------
 
+# (a one-part name the old check skipped as "the default database's")
 statement ok
-UPDATE store.acl.relations SET view_sql = 'SELECT * FROM sec.main.vconst' WHERE vname = 'ok3';
+UPDATE store.acl.relations SET view_sql = 'SELECT * FROM g' WHERE vname = 'ok3';
 
 query TT
 SELECT object, problem FROM acl_check_catalog('c') WHERE problem = 'source_not_granted' ORDER BY ALL;

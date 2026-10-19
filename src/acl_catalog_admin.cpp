@@ -288,8 +288,12 @@ vector<vector<string>> PhysicalObjectReadings(DatabaseInstance &db, const vector
 				                       QualifiedName(catalog_name, Identifier(), Identifier(parts[1])));
 				auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 				if (entry) {
-					as_database = {entry->ParentCatalog().GetName().GetIdentifierName(),
-					               entry->ParentSchema().name.GetIdentifierName(), entry->name.GetIdentifierName()};
+					// the whole schema path (a search path may name a nested schema - review 138)
+					as_database.push_back(entry->ParentCatalog().GetName().GetIdentifierName());
+					for (auto &part : entry->ParentSchema().GetSchemaPath()) {
+						as_database.push_back(part.GetIdentifierName());
+					}
+					as_database.push_back(entry->name.GetIdentifierName());
 				} else {
 					auto &catalog = attached->GetCatalog();
 					auto default_schema = catalog.GetDefaultSchema();

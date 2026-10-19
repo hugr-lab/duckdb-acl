@@ -35,6 +35,7 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/showref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
@@ -140,18 +141,17 @@ void BodyTables(const string &body, bool expression, vector<vector<string>> &tab
 }
 
 //! spec 138: a body's references as written, each a table / view name - except a one-part name that is a CTE of
-//! the scope it is written in (duckdb binds a CTE before the catalog). The scope is per query node: its own CTEs and
-//! those of the nodes around it, never a sibling's.
+//! the scope it is written in (duckdb binds a CTE before the catalog). The scope is duckdb's own (review 138): a CTE's
+//! definition sees the CTEs written before it and those around it - never itself nor a later sibling - and only a
+//! recursive CTE's right side sees its own name; the body after the WITH sees them all.
 struct ScopedReferences {
 	vector<vector<string>> &out;
 	void Node(QueryNode &node, case_insensitive_set_t scope) {
 		for (auto &kv : node.cte_map.map) {
-			scope.insert(kv.first.GetIdentifierName());
-		}
-		for (auto &kv : node.cte_map.map) {
 			if (kv.second->query_node) {
-				Node(*kv.second->query_node, scope); // a CTE sees itself (recursive) and its siblings
+				Node(*kv.second->query_node, scope);
 			}
+			scope.insert(kv.first.GetIdentifierName());
 		}
 		switch (node.type) {
 		case QueryNodeType::SELECT_NODE: {
@@ -180,7 +180,9 @@ struct ScopedReferences {
 		case QueryNodeType::RECURSIVE_CTE_NODE: {
 			auto &recursive = node.Cast<RecursiveCTENode>();
 			Node(*recursive.left, scope);
-			Node(*recursive.right, scope);
+			auto with_self = scope;
+			with_self.insert(recursive.ctename.GetIdentifierName());
+			Node(*recursive.right, with_self);
 			break;
 		}
 		default:
@@ -200,7 +202,10 @@ struct ScopedReferences {
 		}
 	}
 	void Base(BaseTableRef &ref, const case_insensitive_set_t &scope) {
-		auto &path = ref.GetQualifiedName().Path();
+		Name(ref.GetQualifiedName(), scope);
+	}
+	void Name(const QualifiedName &name, const case_insensitive_set_t &scope) {
+		auto &path = name.Path();
 		if (path.size() == 1 && scope.count(path[0].GetIdentifierName())) {
 			return; // the CTE of its scope
 		}
@@ -221,6 +226,9 @@ struct ScopedReferences {
 			Ref(*join.right, scope);
 			if (join.condition) {
 				Expr(*join.condition, scope);
+			}
+			if (join.ranking_expression) {
+				Expr(*join.ranking_expression, scope); // NEAREST's (spec 139: duckdb's iterator skips it)
 			}
 			break;
 		}
@@ -250,8 +258,18 @@ struct ScopedReferences {
 				}
 			}
 			break;
+		case TableReferenceType::SHOW_REF: {
+			// SUMMARIZE / DESCRIBE: the query it describes, or the object it names (review 138)
+			auto &show = ref.Cast<ShowRef>();
+			if (show.query) {
+				Node(*show.query, scope);
+			} else if (!show.qualified_name.Path().empty()) {
+				Name(show.qualified_name, scope);
+			}
+			break;
+		}
 		default:
-			break; // nothing to read: an empty FROM, column data, a SHOW
+			break; // nothing to read: an empty FROM, column data
 		}
 	}
 	void Expr(ParsedExpression &expr, const case_insensitive_set_t &scope) {

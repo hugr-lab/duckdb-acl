@@ -711,8 +711,12 @@ vector<string> ResolvedReference(DatabaseInstance &db, const vector<string> &par
 		auto entry = Catalog::GetEntry(retriever, EntryLookupInfo(CatalogType::TABLE_ENTRY, bound),
 		                               OnEntryNotFound::RETURN_NULL);
 		if (entry) {
-			out = {entry->ParentCatalog().GetName().GetIdentifierName(), entry->ParentSchema().name.GetIdentifierName(),
-			       entry->name.GetIdentifierName()};
+			// the whole schema path: a nested schema's leaf alone matched a grant on another schema (review 138)
+			out.push_back(entry->ParentCatalog().GetName().GetIdentifierName());
+			for (auto &part : entry->ParentSchema().GetSchemaPath()) {
+				out.push_back(part.GetIdentifierName());
+			}
+			out.push_back(entry->name.GetIdentifierName());
 		}
 	});
 	return out;
