@@ -335,6 +335,88 @@ if ask.startswith("@ingest:"):
 if ask.startswith("@prepared_fields:"):  # spec 111: the dataset schema CreatePreparedStatement announces
     print({"fields": prepared_dataset_fields(client, options, ask[len("@prepared_fields:"):])})
     raise SystemExit(0)
+if ask.startswith("@handles:"):  # spec 134 addendum: the ids the door hands out - a ticket's and a prepared one's
+    def proto_fields(payload):
+        out, at = {}, 0
+        while at < len(payload):
+            key, at = read_varint(payload, at)
+            if key & 7 == 2:
+                length, at = read_varint(payload, at)
+                out[key >> 3] = payload[at:at + length]
+                at += length
+            else:
+                _, at = read_varint(payload, at)
+        return out
+    _sql = ask[len("@handles:"):]
+    info = client.get_flight_info(flight.FlightDescriptor.for_command(statement_query(_sql)), options)
+    ticket = info.endpoints[0].ticket
+    # Ticket.ticket = Any{type_url = 1, value = 2}, value = TicketStatementQuery{statement_handle = 1}
+    statement = proto_fields(proto_fields(ticket.ticket)[2]).get(1, b"").decode()
+    client.do_get(ticket, options).read_all()
+    request = command("ActionCreatePreparedStatementRequest", text(1, _sql))
+    result = list(client.do_action(flight.Action("CreatePreparedStatement", request), options))[0].body.to_pybytes()
+    prepared = proto_fields(proto_fields(result)[2]).get(1, b"")
+    list(client.do_action(flight.Action("ClosePreparedStatement",
+                                        command("ActionClosePreparedStatementRequest", field(1, prepared))), options))
+    print({"statement": statement, "prepared": prepared.decode()})
+    raise SystemExit(0)
+def _pb_fields(payload):
+    out, at = {}, 0
+    while at < len(payload):
+        key, at = read_varint(payload, at)
+        if key & 7 == 2:
+            length, at = read_varint(payload, at)
+            out[key >> 3] = payload[at:at + length]
+            at += length
+        else:
+            _, at = read_varint(payload, at)
+    return out
+
+
+def _statement_ticket(handle: bytes):
+    return flight.Ticket(command("TicketStatementQuery", field(1, handle)))
+
+
+def _refused(fetch):
+    try:
+        fetch()
+        return "redeemed"
+    except Exception as e:  # pyarrow raises a NOT_FOUND as ArrowKeyError, not a FlightError
+        return "refused" if "unknown or already fetched ticket" in str(e) else str(e)
+
+
+if ask.startswith("@tamper:"):  # spec 134 addendum: the label is a routing hint, the id is redeemed whole
+    info = client.get_flight_info(flight.FlightDescriptor.for_command(statement_query(ask[len("@tamper:"):])), options)
+    handle = _pb_fields(_pb_fields(info.endpoints[0].ticket.ticket)[2]).get(1, b"")
+    label, _, random = handle.partition(b".")
+    out = {"swapped": _refused(lambda: client.do_get(_statement_ticket(b"other-node." + random), options).read_all()),
+           "stripped": _refused(lambda: client.do_get(_statement_ticket(random), options).read_all())}
+    other = flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {os.environ['ACL_OTHER_TOKEN']}".encode())])
+    out["other"] = _refused(lambda: client.do_get(info.endpoints[0].ticket, other).read_all())
+    out["own"] = client.do_get(info.endpoints[0].ticket, options).read_all().to_pydict()
+    print(out)
+    raise SystemExit(0)
+if ask.startswith("@ticket_out:"):  # a statement's ticket handed out, not fetched (redeemed later, @redeem:)
+    info = client.get_flight_info(flight.FlightDescriptor.for_command(statement_query(ask[len("@ticket_out:"):])), options)
+    print({"ticket": info.endpoints[0].ticket.ticket.hex()})
+    raise SystemExit(0)
+if ask.startswith("@redeem:"):
+    print(client.do_get(flight.Ticket(bytes.fromhex(ask[len("@redeem:"):])), options).read_all().to_pydict())
+    raise SystemExit(0)
+if ask.startswith("@prepare_out:"):  # a prepared statement's handle handed out (run later, @prepared_run:)
+    _result = list(client.do_action(flight.Action("CreatePreparedStatement", command(
+        "ActionCreatePreparedStatementRequest", text(1, ask[len("@prepare_out:"):]))), options))[0].body.to_pybytes()
+    print({"prepared": _pb_fields(_pb_fields(_result)[2]).get(1, b"").hex()})
+    raise SystemExit(0)
+if ask.startswith("@prepared_run:"):  # execute a held prepared statement, fetch, close
+    _handle = bytes.fromhex(ask[len("@prepared_run:"):])
+    _desc = flight.FlightDescriptor.for_command(command("CommandPreparedStatementQuery", field(1, _handle)))
+    _info = client.get_flight_info(_desc, options)
+    _rows = client.do_get(_info.endpoints[0].ticket, options).read_all().to_pydict()
+    list(client.do_action(flight.Action("ClosePreparedStatement",
+                                        command("ActionClosePreparedStatementRequest", field(1, _handle))), options))
+    print(_rows)
+    raise SystemExit(0)
 if ask.startswith("@prepared:"):  # spec 117: prepare, execute, fetch, close
     print(prepared_execute(client, options, ask[len("@prepared:"):]))
     raise SystemExit(0)

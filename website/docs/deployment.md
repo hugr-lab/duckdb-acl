@@ -46,7 +46,9 @@ authentication) is a separate product; nodes are identical either way, which is 
   - The quack connection id the node mints starts with `<label>.`. Every request carries it in the
     message header at the start of its body. A quack client that keeps cookies per connection
     (duckdb/duckdb-quack#297) also sends the `acl_node` cookie and `X-Quack-Connection-Id`.
-  - A Flight client that sends no cookies (ADBC's default) is kept on one node by its connection.
+  - A Flight ticket and a prepared statement's handle start with `<label>.` too, so a front routes a
+    client that keeps no cookies (ADBC's default) by them. Behind an L4 balancer such a client is kept on
+    one node by its connection.
   - The label is a DNS label (`[a-z0-9-]`, at most 63 characters), GLOBAL only, set in the bootstrap
     before the doors serve, for example the pod's name. The load report shows it as `"label"`.
   - It is a routing hint and never an authority. A client that rewrites it only reaches another node,

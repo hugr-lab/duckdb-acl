@@ -65,7 +65,23 @@ ACL_COOKIE_JAR="$JAR" "$PYBIN" "$HERE/client.py" "$URI" "SELECT count(*) FROM or
 	|| fail "the pre-drain client could not reuse its session"
 [ -s "$JAR" ] || fail "the door set no session cookie"
 
+# spec 134's addendum: a client that keeps no cookie holds what it was handed - a statement's ticket, a prepared
+# statement - and redeems it on a draining node, as a connection-long session keeps working
+held="$("$PYBIN" "$HERE/client.py" "$URI" "@ticket_out:SELECT count(*) AS n FROM orders" "$TOKEN")" ||
+	fail "a cookie-less client could not take a ticket: $held"
+ticket="$(echo "$held" | sed -n "s/.*'ticket': '\([0-9a-f]*\)'.*/\1/p")"
+held="$("$PYBIN" "$HERE/client.py" "$URI" "@prepare_out:SELECT count(*) AS n FROM orders" "$TOKEN")" ||
+	fail "a cookie-less client could not prepare: $held"
+prepared="$(echo "$held" | sed -n "s/.*'prepared': '\([0-9a-f]*\)'.*/\1/p")"
+[ -n "$ticket" ] && [ -n "$prepared" ] || fail "no ticket or prepared handle to hold"
+
 operator DRAIN_ENTERED "acl_drain()"
+
+got="$("$PYBIN" "$HERE/client.py" "$URI" "@redeem:$ticket" "$TOKEN" 2>&1)" || fail "a held ticket was refused during the drain: $got"
+echo "$got" | grep -q "'n': \[5\]" || fail "the held ticket's rows: $got"
+got="$("$PYBIN" "$HERE/client.py" "$URI" "@prepared_run:$prepared" "$TOKEN" 2>&1)" ||
+	fail "a held prepared statement was refused during the drain: $got"
+echo "$got" | grep -q "'n': \[5\]" || fail "the held prepared statement's rows: $got"
 
 # the established session keeps working: the cookie resolves before the drain check is ever reached
 ACL_COOKIE_JAR="$JAR" "$PYBIN" "$HERE/client.py" "$URI" "SELECT count(*) FROM orders" "$TOKEN" >/dev/null \
@@ -94,4 +110,4 @@ operator RESUME_DONE "acl_resume()::VARCHAR"
 	|| fail "a new client is still refused after acl_resume"
 
 echo "SELECT acl_flight_stop('$URI');" >&3
-echo "PASS: the draining door kept its seated session, refused the new client with the reason, and resumed"
+echo "PASS: the draining door kept its seated session and a cookie-less client's held ticket and prepared statement, refused the new client with the reason, and resumed"

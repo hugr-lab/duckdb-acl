@@ -900,7 +900,9 @@ request that does not carry it (Flight: the cookie middleware beside the unchang
 our own HTTP server on every `/quack` response) and the quack connection ids the embedded server mints start with
 `<label>.` (one `sync.py` hunk in `GenerateConnectionId` → `AclQuackConnectionIdPrefix`; the random part is the
 connection's secret, unchanged). The load report adds `"label"`. A routing hint, never an authority: an incoming
-value is only compared with the node's own. hugr-node sets it from the pod at bootstrap.
+value is only compared with the node's own. hugr-node sets it from the pod at bootstrap. Addendum (2026-10-19): a
+Flight ticket and a prepared handle (`PutReservation`) are `<label>.<32 hex>` too, for a client that keeps no cookie;
+the six calls that redeem one open their per-call session on a draining node too (`UnderSession(…, redeems)`).
 
 **Spec 069 — audit and metrics, layered**: every decision is an event (`AuditEvent`, header-only
 contract in `acl_audit.hpp` - since spec 076 in `duckdb-ext-common/contracts/`, with `Principal` beside

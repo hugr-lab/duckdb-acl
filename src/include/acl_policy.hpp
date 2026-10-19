@@ -882,8 +882,12 @@ struct PolicyStore {
 	//! the principal's resource group - the one refusal a client should act on (go elsewhere) - and
 	//! `placement_groups` the groups that serve the principal, for a front (the addendum's
 	//! x-acl-resource-groups).
+	//! `despite_drain` (spec 134's addendum): a per-call session of a call that redeems a reservation its principal
+	//! holds - a cookie-less client's ticket or prepared statement - opens on a draining node, as a connection-long
+	//! session keeps working there (spec 066: the node seats nobody NEW).
 	string SessionOpen(const string &token, const string &door = "session", const string &replacing = string(),
-	                   string *placement = nullptr, vector<string> *placement_groups = nullptr);
+	                   string *placement = nullptr, vector<string> *placement_groups = nullptr,
+	                   bool despite_drain = false);
 	//! The operator's per-session audit level (spec 069), by the ops id; -1 inherits. False = no such session.
 	bool SetSessionAuditLevel(const string &id, int8_t level);
 	//! A session's own level by handle, -1 when it inherits or the handle is unknown.
@@ -1249,7 +1253,8 @@ private:
 	//! got, so a refusal event can still name who was trying. PRIVATE on purpose: calling it
 	//! directly is how the guard above would be bypassed, and a door must never be able to.
 	string SessionOpenBody(const string &token, const string &door, Principal &principal, SessionOpenInfo &opened,
-	                       const string &replacing, string *placement, vector<string> *placement_groups);
+	                       const string &replacing, string *placement, vector<string> *placement_groups,
+	                       bool despite_drain);
 
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);

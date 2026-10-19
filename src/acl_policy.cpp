@@ -272,12 +272,13 @@ string MintRandomHex(idx_t bytes) {
 //! `source_error` to a door: a door must not learn the difference between a catalog that is down and
 //! a bug of ours, and the audit keeps the text either way.
 string PolicyStore::SessionOpen(const string &token, const string &door, const string &replacing, string *placement,
-                                vector<string> *placement_groups) {
+                                vector<string> *placement_groups, bool despite_drain) {
 	DeliverSessionNotices deliver(session_notices); // a sweep inside may have ended sessions
 	Principal principal; // as far as verification got, so a refusal can still name who was trying
 	try {
 		SessionOpenInfo opened;
-		auto handle = SessionOpenBody(token, door, principal, opened, replacing, placement, placement_groups);
+		auto handle =
+		    SessionOpenBody(token, door, principal, opened, replacing, placement, placement_groups, despite_drain);
 		if (!handle.empty()) {
 			// spec 078: the observers, before the handle is anyone's - outside the store's lock, the
 			// verified token by reference for the call only
@@ -295,7 +296,7 @@ string PolicyStore::SessionOpen(const string &token, const string &door, const s
 
 string PolicyStore::SessionOpenBody(const string &token, const string &door, Principal &principal,
                                     SessionOpenInfo &opened, const string &replacing, string *placement,
-                                    vector<string> *placement_groups) {
+                                    vector<string> *placement_groups, bool despite_drain) {
 	// a refusal is a session event too (spec 069): the reason a client never learns is what the
 	// operator's record carries
 	auto refused = [&](const Principal &who, const char *code, const string &reason) {
@@ -305,7 +306,7 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 	// Spec 066: a draining node seats nobody new. Refused before verifying anything - there is
 	// nothing to decide with the result, and the drain path stays free of JWKS reads. Established
 	// sessions never come back through here, so they keep working.
-	if (draining.load(std::memory_order_relaxed)) {
+	if (!despite_drain && draining.load(std::memory_order_relaxed)) {
 		return refused(Principal(), "draining", "acl: node is draining - not accepting new sessions");
 	}
 	int64_t expires_at = 0;
