@@ -1,4 +1,4 @@
-# Spec 138: the source gate judges what a body really reads
+# Spec 138: the source gate judges what a body names, by catalog entry
 
 - **Status**: draft (the owner, 2026-10-19: «138 да» - the gaps close before the release)
 - **Date**: 2026-10-19
@@ -8,9 +8,9 @@
 
 A catalog admin builds only over the sources granted to it (spec 118.3). For a stored body - a view's SQL, an RLS
 predicate, a mask, a computed column - the gate judges the table names that duckdb's name extraction reports. Review
-137 found that this is not what the body reads, in three ways. From now on the gate judges the **catalog entries**:
-each reference as duckdb resolves it, and each table the bound body really scans, by its exact
-`<database>.<schema>.<object>`.
+137 found that this is not what the body names, in three ways. From now on the gate judges the **catalog entries**
+the body names - each reference as duckdb resolves it, by its exact `<database>.<schema>.<object>` - and, by the
+owner's rule, never what a granted view or function reads inside.
 
 ## Problem
 
@@ -66,8 +66,8 @@ The gate's `SourceGranted` takes three-part entries only; the plain two-part `ma
 
 ### The policy store, by entry
 
-`RequireNotPolicyStore` for a body checks the same entries. A reference or a scan in the policy store's database and
-schema is refused, whatever the policy's schema. The text check (`TextNamesPolicyStore`) stays in front: it is cheap,
+`RequireNotPolicyStore` for a body checks the same entries. A reference resolving into the policy store's database
+and schema is refused, whatever the policy's schema. The text check (`TextNamesPolicyStore`) stays in front: it is cheap,
 and it covers a body that does not bind.
 
 ## Enforcement & security
