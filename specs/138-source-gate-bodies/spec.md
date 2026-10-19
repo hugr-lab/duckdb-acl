@@ -35,7 +35,12 @@ Spec 137 closed the case of a two-part name (`pg.t` under a `pg.main` grant). Th
 
 ## Design
 
-### Two judgments, both by catalog entry
+### One judgment, by catalog entry: what the body names, never what a granted object reads inside
+
+The owner, 2026-10-19 (Q1): a table function the principal holds a right on is allowed, whatever its own query
+reads inside. The same holds for a physical view of a granted source: the right on the source is the right on its
+objects. The gate judges **what the body names**, each reference resolved to its exact entry, and never looks into
+a granted view's or function's definition.
 
 For each body a catalog admin (neither policy nor passthrough) writes, on the fresh connection the gate already
 probes with:
@@ -48,12 +53,13 @@ probes with:
    - This judges a physical view by **its own** catalog and schema, and a one-part name by the default database it
      reads.
    - A name that resolves to nothing, or to two entries (ambiguous), is refused. The body must bind anyway.
-2. **Every table the bound body scans**, after views are expanded, must be in a granted source.
-   - The body is bound normally, not in name-extraction mode. The plan is walked for its `LogicalGet`s, and each
-     scan's `TableCatalogEntry` gives the exact catalog and schema (the walk lineage's binding already does).
-   - So a view of a granted source that reads an ungranted one is refused, as today, but by the exact entry and
-     no longer by its inner text.
-   - **Pending Q1:** a table function scanned only inside a physical view (`read_csv`, a scanner call).
+2. **The body must bind** (as today): it is bound normally on the probe connection, and a body that does not
+   bind is refused - nothing judged by name is then left unread.
+3. **What a granted view or function reads inside is not judged.**
+   - A view of a granted source that reads another source is admitted. Today its inner text was judged, and
+     wrongly (`main.x` read in the default database).
+   - A table function the author may call is admitted whatever it scans: the function gate (spec 072, judged per
+     body by `AuthorizeBodies`) decides the call, the source gate does not look inside.
 
 The gate's `SourceGranted` takes three-part entries only; the plain two-part `main` reading goes away for bodies.
 `acl_check_catalog`'s `source_not_granted` judges stored bodies the same way, so the gate and the check agree.
@@ -69,10 +75,11 @@ and it covers a body that does not bind.
 - **Fail closed:** a reference that does not resolve, resolves ambiguously, or whose lookup throws is refused.
 - **What changes for a catalog admin:**
   - A body naming a physical view of an ungranted source is refused, even when the view's inner names look
-    granted.
-  - `SELECT * FROM g` is judged as the default database's table `g`.
-  - A view of a granted source whose inner `main.x` binds in that same source, which today is refused by its text,
-    is admitted.
+    granted (the gap).
+  - `SELECT * FROM g` is judged as the default database's table `g` (the gap).
+  - A view of a granted source is admitted whatever it reads inside - the owner's rule (Q1). Today its inner text
+    was judged; this is the one place the gate admits more than before, and it is the operator's own view in a
+    source the operator granted.
 - **Policy and passthrough** are not judged by the source gate, as today.
 - **Nothing stored is taken back.** Bodies stored before this spec are reported by `acl_check_catalog`
   (`source_not_granted`) when they fail the new judgment, and never rewritten. This is the owner's rule.
@@ -84,17 +91,16 @@ and it covers a body that does not bind.
   - a view of an ungranted source over `read_csv`: refused;
   - a one-part name of the default database while a database of that name is granted: refused;
   - a view of the granted source whose inner `main.x` stays inside it: admitted;
-  - a view of the granted source reading an ungranted one: refused.
+  - a view of the granted source reading an ungranted one: admitted (Q1 - the right on the object).
 - **The policy store:** a policy catalog in a schema other than `main` (Postgres integration) refuses a body over
   `pol.admins`.
 - **The check:** a body stored before this spec, through `UPDATE`, is reported by `acl_check_catalog`.
 
-## Open questions
+## Decisions
 
-- **Q1. A table function reached only through a physical view.** A view of a granted source may call `read_csv` or a
-  scanner function. *Recommendation:* refuse it unless the function gate admits that function to the body's author
-  (spec 117's `AuthorizeBodies`). A function the author could not call directly should not be reachable through a
-  view the gate otherwise admits.
+- **Q1 (the owner, 2026-10-19):** «если дали права на табличную функцию то ее разрешаем независимо от того что
+  разрешено внутри ее запроса» - a right on the object is enough; what its definition reads is not judged. Applied
+  to a physical view of a granted source the same way (to be confirmed with the owner with the spec's acceptance).
 
 ## Alternatives considered
 
@@ -103,3 +109,5 @@ and it covers a body that does not bind.
   does.
 - **Refuse every physical view in a catalog admin's body.** Simple and closed, but it takes away a use that works:
   a view inside a granted source.
+- **Also judge every table the bound body scans** (through views). Stricter, but against the owner's rule (Q1):
+  the right on a view or a function is the right to what it reads.
