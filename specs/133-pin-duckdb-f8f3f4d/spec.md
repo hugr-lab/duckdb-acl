@@ -80,3 +80,12 @@ next acl re-pin.
 
 The door e2e (postgres, mssql, ducklake and the pair, plus types) and test-integration (539 assertions) pass at
 986fd19.
+
+## Addendum (2026-10-19): mssql-extension 7e1bb1c
+
+mssql-extension's main moved to 7e1bb1c (its PR #495, documentation only), at the same duckdb f8f3f4d. The pin
+follows its main, by spec 131's rule; nothing in the scanner changed. The SQL Server scenarios of test-integration
+(`acl_sqlserver`, `acl_catalog_sqlserver`: 24 and 22 assertions - run, not skipped), the whole of test-integration
+(616 assertions) and the door e2e (postgres, mssql, ducklake and the pair, plus types - an mssql alias type read as
+VARCHAR by a client without mssql) pass at 7e1bb1c. Release plan item 5.4b (the mssql pin before the release) is closed:
+the pin builds with our duckdb, and the mssql legs are in the local gate again (CI has no SQL Server service).
