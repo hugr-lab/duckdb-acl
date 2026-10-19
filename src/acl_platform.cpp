@@ -41,6 +41,9 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node.hpp"
+#include "duckdb/parser/tableref/at_clause.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "acl_identity.hpp"
@@ -1524,6 +1527,18 @@ void WalkBodyNode(QueryNode &node, const std::function<void(const QualifiedName 
 	    [&](TableRef &ref) {
 		    if (ref.type == TableReferenceType::TABLE_FUNCTION) {
 			    table_functions.insert(ref.Cast<TableFunctionRef>().function.get());
+		    } else if (ref.type == TableReferenceType::JOIN) {
+			    // spec 139: NEAREST's ranking expression - duckdb's iterator does not walk it
+			    auto &join = ref.Cast<JoinRef>();
+			    if (join.ranking_expression) {
+				    pivot_expressions.push_back(join.ranking_expression.get());
+			    }
+		    } else if (ref.type == TableReferenceType::BASE_TABLE) {
+			    // spec 139: an AT clause's expression, evaluated while the reference binds
+			    auto &base = ref.Cast<BaseTableRef>();
+			    if (base.at_clause && base.at_clause->ExpressionMutable()) {
+				    pivot_expressions.push_back(base.at_clause->ExpressionMutable().get());
+			    }
 		    } else if (ref.type == TableReferenceType::PIVOT) {
 			    for (auto &column : ref.Cast<PivotRef>().pivots) {
 				    for (auto &pivot : column.pivot_expressions) {

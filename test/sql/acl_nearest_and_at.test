@@ -1,0 +1,103 @@
+# name: test/sql/acl_nearest_and_at.test
+# description: spec 139 - the expressions duckdb 2.0's grammar puts in a table reference are walked like any other:
+#   NEAREST's ranking expression (a subquery there read an ungranted source, a call there skipped the function gate)
+#   and an AT clause's expression (evaluated while the reference binds - an admin function there ran as the
+#   principal). Negative tests, under a principal and in a stored body; a NEAREST join over granted objects works.
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.a(id INTEGER, v DOUBLE);
+
+statement ok
+INSERT INTO phys.main.a VALUES (1, 1.0), (2, 2.0);
+
+statement ok
+ATTACH ':memory:' AS sec;
+
+statement ok
+CREATE TABLE sec.main.secret(s VARCHAR, n DOUBLE);
+
+statement ok
+INSERT INTO sec.main.secret VALUES ('top-secret', 1.5);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.a AS phys.main.a;
+
+statement ok
+ACL ADMIN CREATE ROLE rd;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE rd CAPS '{"select": true}' MAIN;
+
+# --- NEAREST: the ranking expression is the principal's expression like any other -------------------------------
+
+statement error
+ACL ROLE "rd" SELECT x.id FROM a x INNER JOIN a y EXACT NEAREST 1 BY DISTANCE abs(x.v - y.v) + (SELECT n FROM sec.main.secret);
+----
+<REGEX>:.*no access to object "sec\.main\.secret".*
+
+statement error
+ACL ROLE "rd" SELECT x.id FROM a x INNER JOIN a y EXACT NEAREST 1 BY DISTANCE x.v - y.v + acl_create_catalog('cat_nearest')::INT;
+----
+<REGEX>:.*function "acl_create_catalog" is not allowed.*
+
+# a NEAREST join over granted objects works
+query II
+ACL ROLE "rd" SELECT x.id, y.id FROM a x INNER JOIN a y EXACT NEAREST 1 BY DISTANCE x.v - y.v ORDER BY 1;
+----
+1	2
+2	2
+
+# --- AT: evaluated while the reference binds, before the catalog says it takes no time travel --------------------
+
+statement error
+ACL ROLE "rd" SELECT * FROM a AT (VERSION => acl_create_catalog('cat_at')::INT);
+----
+<REGEX>:.*function "acl_create_catalog" is not allowed.*
+
+# --- a stored body: the author's function gate sees both -----------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE cadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cadm CAPS '{"select": true, "manage": true}';
+
+statement ok
+ACL ADMIN GRANT SOURCE phys TO ROLE cadm;
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.nv AS 'SELECT x.id FROM phys.main.a x INNER JOIN phys.main.a y EXACT NEAREST 1 BY DISTANCE x.v - y.v + acl_create_catalog(''cat_body'')::INT';
+----
+<REGEX>:.*the definition calls function "acl_create_catalog", which its author may not call.*
+
+statement error
+ACL ROLE "cadm" CREATE VIRTUAL VIEW c.av AS 'SELECT * FROM phys.main.a AT (VERSION => acl_create_catalog(''cat_body_at'')::INT)';
+----
+<REGEX>:.*the definition calls function "acl_create_catalog", which its author may not call.*
+
+# no catalog was made by any of them
+query T
+SELECT vcat FROM store.acl.catalogs ORDER BY 1;
+----
+c

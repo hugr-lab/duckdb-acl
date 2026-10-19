@@ -55,6 +55,7 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/set_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/tableref/at_clause.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
@@ -1750,6 +1751,12 @@ private:
 		switch (ref->type) {
 		case TableReferenceType::BASE_TABLE: {
 			auto &base = ref->Cast<BaseTableRef>();
+			// spec 139: an AT (time travel) clause is an expression duckdb evaluates while it binds the reference -
+			// before it learns the catalog takes no time travel - so it is gated like any other: an admin function
+			// there ran as the principal
+			if (base.at_clause && base.at_clause->ExpressionMutable()) {
+				RewriteExpr(base.at_clause->ExpressionMutable());
+			}
 			if (IsCteName(base)) {
 				return; // a CTE reference, not a catalog object
 			}
@@ -1831,6 +1838,13 @@ private:
 			RewriteTableRef(join.left);
 			RewriteTableRef(join.right);
 			RewriteExpr(join.condition);
+			// spec 139: NEAREST's ranking expression (the 2.0 grammar; duckdb's own iterator does not walk it either) -
+			// a subquery there read an ungranted source and a call there skipped the function gate
+			RewriteExpr(join.ranking_expression);
+			if (!join.duplicate_eliminated_columns.empty()) {
+				// the planner's own field: the parser never writes it, so a statement carrying it is no client's
+				Deny(Reason::STATEMENT_TYPE, "table reference form is not permitted under ACL");
+			}
 			break;
 		}
 		case TableReferenceType::TABLE_FUNCTION:

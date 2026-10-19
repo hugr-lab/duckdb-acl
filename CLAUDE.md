@@ -784,6 +784,13 @@ The source gate: a definition's two-part name via `SourceGranted(db, …)` as st
 database's reading; ambiguous = `ThrowAmbiguousPhysical` (names neither reading), a lookup that threw = refused.
 Stored rows are never rewritten: `acl_check_catalog`'s `phys_incomplete` gives the `SET PHYS` repair.
 
+**Spec 139 — NEAREST and AT expressions are walked**: duckdb 2.0's `JoinRef::ranking_expression` (`NEAREST … BY
+DISTANCE <expr>`) and `BaseTableRef::at_clause` (`AT (VERSION => <expr>)`, evaluated WHILE the reference binds) were
+walked by neither the rewriter nor duckdb's own `ParsedExpressionIterator` - a principal read an ungranted source /
+ran `acl_create_catalog` through them. The rewriter's JOIN case rewrites the ranking expression (and refuses the
+planner-only `duplicate_eliminated_columns`), its BASE_TABLE case the AT expression first (before the CTE check);
+`WalkBodyNode` collects both. A pin bump re-runs the spec's sweep of expression-bearing fields.
+
 **Spec 120 — maintenance** (in stages; 120.1, 120.2, 120.3, 120.5 built): the missing forms - `ALTER ROLE r SET COMMENT` (`acl_comment_role`;
 a re-define keeps the comment), `REVOKE TABLE|VIEW|OBJECT c.n FROM ROLE r` (`acl_revoke_object`, HANDS_OUT),
 `ALTER VIRTUAL REFERENCE c.n SET COMMENT|CARDINALITY|OPTIONAL` + `COMMENT ON VIRTUAL REFERENCE` (`acl_alter_reference`),
