@@ -84,8 +84,10 @@ nothing that works today stops working.
   three-part name binds exactly what the two-part one did at write time, because the expansion is duckdb's own
   reading.
 - **The ambiguous case is refused at write**, instead of binding whichever object duckdb finds at read.
-- **Source grants (spec 118.3)** judge the three-part name. The expansion happens before `AuthorizeSources`, so a
-  catalog admin granted `pg.public` may write `pg.orders`. Its expansion `pg.public.orders` is inside the grant.
+- **Source grants (spec 118.3)**: `AuthorizeSources` judges the statement as written, before the admin function
+  expands the name. Its two-part branch (`SourceGranted`) assumes `main` today, so a catalog admin granted
+  `pg.public` is refused `pg.orders`. It takes the same reading as the write: the database's default schema. The
+  grant and the stored name then always agree.
 
 ## Testing
 
