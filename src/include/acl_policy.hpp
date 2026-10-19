@@ -413,6 +413,11 @@ struct PolicyStore {
 	//! authorization callback, which may run on any of the instance's threads. Ended with the connection.
 	mutex quack_lineage_lock;
 	unordered_map<string, std::array<string, 3>> quack_lineage; // parent, root_parent, job
+	//! spec 096 addendum: the groups that serve a principal a quack CONNECT was refused for by placement, by the
+	//! connection id it was refused under - noted by the authentication callback (any thread), taken at once by
+	//! the CONNECT handler for its answer (x-acl-resource-groups)
+	mutex quack_placement_lock;
+	unordered_map<string, string> quack_placements;
 	//! spec 112 §9: the lineage identity the operator declared per attached source (alias ->
 	//! `<scheme>://<host:port>[/<prefix>]`): acl_lineage_source / ATTACH … LINEAGE. Tied to the
 	//! attachment it was declared for (one declared before the ATTACH, to the first it meets): after a
@@ -725,6 +730,9 @@ struct PolicyStore {
 	//! spec 119: the node's acl_metadata_max_rows (0 = unlimited)
 	int64_t MetadataMaxRows();
 	bool NodeGroupKnown();
+	//! spec 096 addendum: the node's group is the policy's default (false: no group, no catalog; throws: a catalog
+	//! not readable) - what a front seats an ungrouped principal by
+	bool NodeGroupDefault();
 	vector<ClusterItem> ClusterEffective();
 	//! spec 118: what this cluster node carries that its effective profile lacks and the other way round -
 	//! kind (database | extension | setting), name, state (same | differs | node_only | profile_only | bootstrap),
@@ -871,9 +879,11 @@ struct PolicyStore {
 	//! reads. `acl_session_open()` (door `session`) is the operator's own call and still throws: the
 	//! gateway is the trusted side by the deployment invariant, and it is the one that has to know.
 	//! `placement` (spec 096) receives the sentence a door tells the client when the node does not serve
-	//! the principal's resource group - the one refusal a client should act on (go elsewhere).
+	//! the principal's resource group - the one refusal a client should act on (go elsewhere) - and
+	//! `placement_groups` the groups that serve the principal, for a front (the addendum's
+	//! x-acl-resource-groups).
 	string SessionOpen(const string &token, const string &door = "session", const string &replacing = string(),
-	                   string *placement = nullptr);
+	                   string *placement = nullptr, vector<string> *placement_groups = nullptr);
 	//! The operator's per-session audit level (spec 069), by the ops id; -1 inherits. False = no such session.
 	bool SetSessionAuditLevel(const string &id, int8_t level);
 	//! A session's own level by handle, -1 when it inherits or the handle is unknown.
@@ -1027,6 +1037,7 @@ struct PolicyStore {
 		std::chrono::steady_clock::time_point at;
 		string group;
 		bool group_known = false;
+		bool group_default = false;
 		string target = "null";
 		uint64_t writes = 0; // the catalog's local_writes when read: a write here invalidates it at once
 		bool valid = false;
@@ -1238,7 +1249,7 @@ private:
 	//! got, so a refusal event can still name who was trying. PRIVATE on purpose: calling it
 	//! directly is how the guard above would be bypassed, and a door must never be able to.
 	string SessionOpenBody(const string &token, const string &door, Principal &principal, SessionOpenInfo &opened,
-	                       const string &replacing, string *placement);
+	                       const string &replacing, string *placement, vector<string> *placement_groups);
 
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);

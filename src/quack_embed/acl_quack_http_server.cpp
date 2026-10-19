@@ -28,6 +28,8 @@
 #include "quack_uri.hpp"
 
 #include "acl_quack_server.hpp"
+#include "acl_quack_embed.hpp"
+#include "acl_placement.hpp"
 
 #include "httplib.hpp"
 
@@ -434,6 +436,14 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 			}
 		}
 		auto response = HandleMessage(stream);
+		if (response->Type() == MessageType::ERROR_RESPONSE) {
+			// spec 096 addendum: a CONNECT refused by placement names the groups that serve the principal
+			auto &extra = response->Cast<ErrorResponse>().Error().ExtraInfo();
+			auto groups = extra.find(acl::QUACK_PLACEMENT_INFO);
+			if (groups != extra.end()) {
+				res.set_header(acl::RESOURCE_GROUPS_HEADER, groups->second);
+			}
+		}
 		auto raw = response->RawPayload();
 		if (raw) {
 			// already serialized: httplib sends the bytes with no copy (quack f4328c5: the wire header

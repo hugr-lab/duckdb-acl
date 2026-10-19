@@ -2169,6 +2169,21 @@ uint64_t PolicyStore::CatalogLocalWrites() {
 	return catalog ? catalog->local_writes.load() : 0;
 }
 
+bool CatalogBackend::GroupIsDefault(const string &group) {
+	if (function_mode) {
+		return false;
+	}
+	EnsureFresh();
+	auto result = Query("SELECT 1 FROM " + Tbl("resource_groups") + " WHERE \"group\" = " + Lit(group) +
+	                    " AND \"is_default\" = true");
+	return result->RowCount() > 0;
+}
+
+bool PolicyStore::NodeGroupDefault() {
+	auto node_group = NodeGroup();
+	return catalog && !node_group.empty() && catalog->GroupIsDefault(node_group);
+}
+
 ResourceLimits PolicyStore::ResolveResourceLimits(const Principal &principal) {
 	auto node_group = NodeGroup(); // spec 126: the platform's part names it; an open node has none
 	if (!catalog) {

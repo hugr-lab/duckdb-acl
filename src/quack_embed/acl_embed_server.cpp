@@ -682,6 +682,11 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		    db, StringUtil::Format("SELECT %s(?, ?, ?)", GetSettingString(db, "acl_quack_authentication_function")),
 		    Value(connection_id), Value(connection_request_message.AuthString()), Value(Token()));
 		if (auth.Denied()) {
+			auto acl_groups = acl::AclQuackTakePlacement(db, connection_id);
+			if (!acl_groups.empty()) {
+				return make_uniq<ErrorResponse>(ErrorData(InvalidInputException(
+				    {{acl::QUACK_PLACEMENT_INFO, acl_groups}}, "Authentication callback failed: " + auth.error)));
+			}
 			return auth.Failure("Authentication");
 		}
 		string client_id_hash;

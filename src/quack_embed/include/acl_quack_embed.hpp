@@ -125,6 +125,12 @@ private:
 //! The server dropped a client connection (spec 079): its DISCONNECT (`how` = client) or a heartbeat
 //! lease that ran out (`idle`). The acl session bound to it ends now. Never throws.
 void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, const char *how);
+//! spec 096 addendum: the extra info of a CONNECT refused by placement that names the groups serving the
+//! principal (x-acl-resource-groups' value), for the HTTP layer to answer as that header
+constexpr const char *QUACK_PLACEMENT_INFO = "acl_resource_groups";
+//! The groups noted for a CONNECT the authentication callback refused by placement, under its connection id - taken
+//! (the note is gone after), '' when none. Never throws.
+string AclQuackTakePlacement(DatabaseInstance &db, const string &connection_id);
 //! spec 134: what a connection id the server mints starts with - `<acl_node_label>.`, or nothing
 //! without a label - so a front routes the connection by its name alone. Never throws.
 string AclQuackConnectionIdPrefix(DatabaseInstance &db);

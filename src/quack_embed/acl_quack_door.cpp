@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "acl_quack_embed.hpp"
+#include "acl_placement.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "quack_fetch_collector.hpp"
 #include "quack_rebalancer_sink.hpp"
@@ -238,7 +239,16 @@ void AclQuackAuthenticateFunc(DataChunk &args, ExpressionState &state, Vector &r
 			// max_sessions does not refuse the connection its own token refresh
 			string replacing;
 			store.SessionHandleFor(session_id, replacing);
-			auto handle = store.SessionOpen(token, "quack", replacing, &placement);
+			vector<string> groups;
+			auto handle = store.SessionOpen(token, "quack", replacing, &placement, &groups);
+			if (!placement.empty() && !groups.empty()) {
+				// spec 096 addendum: for the CONNECT handler's answer, under this connection's id
+				lock_guard<mutex> guard(store.quack_placement_lock);
+				if (store.quack_placements.size() >= 1024) {
+					store.quack_placements.clear(); // each note is taken at once; a stray one never accumulates
+				}
+				store.quack_placements[session_id] = ResourceGroupsHeader(groups);
+			}
 			if (handle.empty() && placement.empty()) {
 				result.SetValue(row, Value::BOOLEAN(false));
 				continue;
@@ -521,6 +531,22 @@ void AclQuackConnectionGone(DatabaseInstance &db, const string &connection_id, c
 	} catch (...) {
 		// the idle timeout still ends it
 	}
+}
+
+string AclQuackTakePlacement(DatabaseInstance &db, const string &connection_id) {
+	try {
+		if (auto store = PolicyStore::Of(db)) {
+			lock_guard<mutex> guard(store->quack_placement_lock);
+			auto found = store->quack_placements.find(connection_id);
+			if (found != store->quack_placements.end()) {
+				auto groups = std::move(found->second);
+				store->quack_placements.erase(found);
+				return groups;
+			}
+		}
+	} catch (...) { // NOLINT: never into the server's CONNECT handler - the refusal's sentence still says it
+	}
+	return string();
 }
 
 string AclQuackConnectionIdPrefix(DatabaseInstance &db) {

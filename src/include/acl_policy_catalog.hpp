@@ -553,6 +553,8 @@ struct CatalogBackend {
 
 	//! spec 085: the merged limits of the principal's resource groups (none in the driver contract)
 	ResourceLimits ResourceLimitsOf(const Principal &principal, const string &node_group);
+	//! spec 096 addendum: whether `group` is the policy's default group (false in the driver contract)
+	bool GroupIsDefault(const string &group);
 	void LoadRoleClaims(Principal &principal);
 
 	bool SettingBool(const char *name, bool fallback);

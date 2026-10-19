@@ -55,5 +55,32 @@ inline PlacementDecision Place(const std::string &node_group, bool node_group_kn
 	return out;
 }
 
+//! The groups that serve a principal, for a front (spec 096 addendum): Flight's trailer and quack's CONNECT header
+//! `x-acl-resource-groups`. Each name percent-encoded (everything but RFC 3986's unreserved characters), joined by
+//! commas - ASCII whatever a group is called, and a comma never inside a name. It tells nobody more than the refusal's
+//! sentence does.
+constexpr const char *RESOURCE_GROUPS_HEADER = "x-acl-resource-groups";
+
+inline std::string ResourceGroupsHeader(const std::vector<std::string> &groups) {
+	static const char *HEX = "0123456789ABCDEF";
+	std::string out;
+	for (auto &group : groups) {
+		if (!out.empty()) {
+			out += ',';
+		}
+		for (unsigned char c : group) {
+			if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' ||
+			    c == '_' || c == '~') {
+				out += static_cast<char>(c);
+			} else {
+				out += '%';
+				out += HEX[c >> 4];
+				out += HEX[c & 15];
+			}
+		}
+	}
+	return out;
+}
+
 } // namespace acl
 } // namespace duckdb

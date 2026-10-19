@@ -9,6 +9,7 @@
 #include "acl_placement.hpp"
 
 using duckdb::acl::Place;
+using duckdb::acl::ResourceGroupsHeader;
 using namespace acl_test;
 
 int main(int argc, char *argv[]) {
@@ -34,6 +35,16 @@ int main(int argc, char *argv[]) {
 			Check(!none.admitted && none.refusal.find("no resource group serves your roles") != std::string::npos,
 			      "a principal no group serves (and no default): " + none.refusal);
 			Check(!Place("g", true, {"G"}).admitted, "group names compare as written, as the catalog does");
+		});
+		Scenario("the groups a refusal names, as x-acl-resource-groups (the addendum)", [&] {
+			Check(ResourceGroupsHeader({"h", "k"}) == "h,k", "names joined by commas");
+			Check(ResourceGroupsHeader({"etl-2.a_b~c"}) == "etl-2.a_b~c",
+			      "RFC 3986's unreserved characters as written");
+			Check(ResourceGroupsHeader({"a,b", "c d", "x%y"}) == "a%2Cb,c%20d,x%25y",
+			      "a comma, a space and a percent inside a name encoded: " +
+			          ResourceGroupsHeader({"a,b", "c d", "x%y"}));
+			Check(ResourceGroupsHeader({"\xc3\xa4"}) == "%C3%A4", "a non-ASCII name byte by byte, upper-case hex");
+			Check(ResourceGroupsHeader({}).empty(), "no group, no value (the header is not sent)");
 		});
 		Scenario("a node whose group the policy does not have serves nobody new", [&] {
 			auto unknown = Place("g", false, {"g"});

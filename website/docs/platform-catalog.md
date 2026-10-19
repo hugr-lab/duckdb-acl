@@ -174,7 +174,7 @@ Node views (the `observe` bundle):
 | View | Columns |
 | --- | --- |
 | `sessions` | id, subject, roles VARCHAR[], door, idle_seconds BIGINT, expires_at TIMESTAMP, audit_level, audit_level_source, profile_level, profile_source, groups VARCHAR[], charged_group - never a handle |
-| `node_load` | draining BOOLEAN, observe, group, group_known BOOLEAN, config_target, config_applied, sessions_live, sessions_max (BIGINT), sessions_by_door `MAP(VARCHAR, BIGINT)`, sessions_by_group `MAP(VARCHAR, STRUCT(live BIGINT, max BIGINT))`, admit_new_session, admit_new_quack_client, admit_new_stream (BOOLEAN) - one row |
+| `node_load` | draining BOOLEAN, observe, group, group_known BOOLEAN, group_default BOOLEAN, config_target, config_applied, sessions_live, sessions_max (BIGINT), sessions_by_door `MAP(VARCHAR, BIGINT)`, sessions_by_group `MAP(VARCHAR, STRUCT(live BIGINT, max BIGINT))`, admit_new_session, admit_new_quack_client, admit_new_stream (BOOLEAN) - one row |
 | `node_doors` | door, uri, seats, seated, seats_left (BIGINT) - one row per quack door |
 | `node_streams` | budget_bytes, reserve_bytes, reserved_bytes, producing, queued, refused (BIGINT) |
 | `drain` | draining BOOLEAN, sessions BIGINT |
