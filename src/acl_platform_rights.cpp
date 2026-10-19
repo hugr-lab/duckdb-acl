@@ -30,6 +30,13 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/pivotref.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include <algorithm>
 
@@ -131,6 +138,132 @@ void BodyTables(const string &body, bool expression, vector<vector<string>> &tab
 		}
 	}
 }
+
+//! spec 138: a body's references as written, each a table / view name - except a one-part name that is a CTE of
+//! the scope it is written in (duckdb binds a CTE before the catalog). The scope is per query node: its own CTEs and
+//! those of the nodes around it, never a sibling's.
+struct ScopedReferences {
+	vector<vector<string>> &out;
+	void Node(QueryNode &node, case_insensitive_set_t scope) {
+		for (auto &kv : node.cte_map.map) {
+			scope.insert(kv.first.GetIdentifierName());
+		}
+		for (auto &kv : node.cte_map.map) {
+			if (kv.second->query_node) {
+				Node(*kv.second->query_node, scope); // a CTE sees itself (recursive) and its siblings
+			}
+		}
+		switch (node.type) {
+		case QueryNodeType::SELECT_NODE: {
+			auto &select = node.Cast<SelectNode>();
+			if (select.from_table) {
+				Ref(*select.from_table, scope);
+			}
+			for (auto &expr : select.select_list) {
+				Expr(*expr, scope);
+			}
+			for (auto &expr : select.groups.group_expressions) {
+				Expr(*expr, scope);
+			}
+			for (auto *expr : {select.where_clause.get(), select.having.get(), select.qualify.get()}) {
+				if (expr) {
+					Expr(*expr, scope);
+				}
+			}
+			break;
+		}
+		case QueryNodeType::SET_OPERATION_NODE:
+			for (auto &child : node.Cast<SetOperationNode>().children) {
+				Node(*child, scope);
+			}
+			break;
+		case QueryNodeType::RECURSIVE_CTE_NODE: {
+			auto &recursive = node.Cast<RecursiveCTENode>();
+			Node(*recursive.left, scope);
+			Node(*recursive.right, scope);
+			break;
+		}
+		default:
+			// a stored body is a SELECT or an expression; anything else is judged by every name it writes
+			ParsedExpressionIterator::EnumerateQueryNodeChildren(
+			    node, [&](unique_ptr<ParsedExpression> &child) { Expr(*child, scope); },
+			    [&](TableRef &ref) {
+				    if (ref.type == TableReferenceType::BASE_TABLE) {
+					    Base(ref.Cast<BaseTableRef>(), case_insensitive_set_t());
+				    }
+			    });
+			return;
+		}
+		if (!node.modifiers.empty()) {
+			ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+			    node, [&](unique_ptr<ParsedExpression> &child) { Expr(*child, scope); });
+		}
+	}
+	void Base(BaseTableRef &ref, const case_insensitive_set_t &scope) {
+		auto &path = ref.GetQualifiedName().Path();
+		if (path.size() == 1 && scope.count(path[0].GetIdentifierName())) {
+			return; // the CTE of its scope
+		}
+		vector<string> parts;
+		for (auto &part : path) {
+			parts.push_back(part.GetIdentifierName());
+		}
+		out.push_back(std::move(parts));
+	}
+	void Ref(TableRef &ref, const case_insensitive_set_t &scope) {
+		switch (ref.type) {
+		case TableReferenceType::BASE_TABLE:
+			Base(ref.Cast<BaseTableRef>(), scope);
+			break;
+		case TableReferenceType::JOIN: {
+			auto &join = ref.Cast<JoinRef>();
+			Ref(*join.left, scope);
+			Ref(*join.right, scope);
+			if (join.condition) {
+				Expr(*join.condition, scope);
+			}
+			break;
+		}
+		case TableReferenceType::SUBQUERY:
+			Node(*ref.Cast<SubqueryRef>().subquery->node, scope);
+			break;
+		case TableReferenceType::TABLE_FUNCTION:
+			Expr(*ref.Cast<TableFunctionRef>().function, scope);
+			break;
+		case TableReferenceType::PIVOT: {
+			auto &pivot = ref.Cast<PivotRef>();
+			Ref(*pivot.source, scope);
+			for (auto &aggregate : pivot.aggregates) {
+				Expr(*aggregate, scope);
+			}
+			for (auto &column : pivot.pivots) {
+				if (column.subquery) {
+					Node(*column.subquery, scope);
+				}
+			}
+			break;
+		}
+		case TableReferenceType::EXPRESSION_LIST:
+			for (auto &row : ref.Cast<ExpressionListRef>().values) {
+				for (auto &value : row) {
+					Expr(*value, scope);
+				}
+			}
+			break;
+		default:
+			break; // nothing to read: an empty FROM, column data, a SHOW
+		}
+	}
+	void Expr(ParsedExpression &expr, const case_insensitive_set_t &scope) {
+		if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			auto &subquery = expr.Cast<SubqueryExpression>().SubqueryMutable();
+			if (subquery && subquery->node) {
+				Node(*subquery->node, scope);
+			}
+		}
+		ParsedExpressionIterator::EnumerateChildren(expr, [&](ParsedExpression &child) { Expr(child, scope); });
+	}
+};
 
 Value TextList(const vector<string> &items) {
 	vector<Value> values;
@@ -714,6 +847,26 @@ unique_ptr<GlobalTableFunctionState> CheckGrantInit(ClientContext &, TableFuncti
 
 void StoredBodyTables(const string &body, bool expression, vector<vector<string>> &tables) {
 	BodyTables(body, expression, tables);
+}
+
+void BodyReferences(const string &body, bool expression, vector<vector<string>> &references) {
+	auto baked = BakeTemplateForProbe(body, ParserOptions::Builtin(), expression, {});
+	Parser parser(ParserOptions::Builtin());
+	ScopedReferences walk {references};
+	if (expression) {
+		for (auto &expr : parser.ParseExpressionList(baked)) {
+			walk.Expr(*expr, case_insensitive_set_t());
+		}
+		return;
+	}
+	parser.ParseQuery(baked);
+	for (auto &statement : parser.statements) {
+		if (statement->type == StatementType::SELECT_STATEMENT) {
+			walk.Node(*statement->Cast<SelectStatement>().node, case_insensitive_set_t());
+		} else {
+			throw BinderException("acl admin: a stored body is a SELECT, not a %s", StatementTypeToString(statement->type));
+		}
+	}
 }
 
 void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {

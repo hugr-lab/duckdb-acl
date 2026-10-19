@@ -1819,29 +1819,33 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 			} else {
 				pieces.emplace_back(text, body.shape == BodyShape::EXPRESSION);
 			}
-			vector<string> tables;
+			vector<vector<string>> references;
 			try {
 				for (auto &piece : pieces) {
 					auto baked = BakeTemplateForProbe(piece.first, ParserOptions::Builtin(), piece.second, {});
 					auto probe = piece.second ? "SELECT (" + baked + ") AS \"value\"" : baked;
 					Connection con(*store.catalog->Db());
-					for (auto &table : con.GetTableNames(probe, true)) {
-						// the answer is the reference as written, its alias too: `pg.hr.salaries AS s`
-						auto alias_at = StringUtil::Lower(table).find(" as ");
-						tables.push_back(alias_at == string::npos ? table : table.substr(0, alias_at));
-					}
+					con.GetTableNames(probe, true); // the body must bind
+					BodyReferences(piece.first, piece.second, references);
 				}
 			} catch (std::exception &ex) {
 				throw BinderException("acl admin: a catalog admin's definition must bind, so the sources it reads "
 				                      "can be checked: %s",
 				                      ex.what());
 			}
-			for (auto &table : tables) {
-				// as written: a body's names include those inside a physical view, which duckdb binds in the view's own
-				// catalog - the plain reading judges them; a two-part name over an attached database must ALSO be
-				// granted as duckdb finds it there (a `pg.main` grant never admits `pg.t`, which reads pg.public.t)
-				if (!SourceGranted(*store.catalog->Db(), granted, parts_of(table), false, true)) {
-					refuse("the definition's body", "\"" + table + "\"");
+			// spec 138: each name the body WRITES, resolved to the entry duckdb binds it to - a physical view by its own
+			// catalog, a one-part name in the default database, a two-part one as the binder reads it. What a granted
+			// view or function reads inside is the constructor's (the owner: the virtual catalog is a facade)
+			for (auto &reference : references) {
+				auto shown = "\"" + NamePath(reference).ToKey() + "\"";
+				vector<string> entry;
+				try {
+					entry = ResolvedReference(*store.catalog->Db(), reference);
+				} catch (std::exception &) {
+					refuse("the definition's body", shown); // ambiguous, or the source could not say: never a guess
+				}
+				if (entry.empty() || !SourceGranted(granted, entry, false)) {
+					refuse("the definition's body", shown); // a name of no object (a file, a typo) reads no source
 				}
 			}
 		}

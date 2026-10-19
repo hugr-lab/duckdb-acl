@@ -1,6 +1,9 @@
 # Spec 138: the source gate judges what a body names, by catalog entry
 
-- **Status**: accepted (the owner, 2026-10-19: «138 да» - the gaps close before the release; Q1 extended to views: «да, и на вьюху распространяется»)
+- **Status**: accepted, **deferred to after the release** (the owner, 2026-10-19: «138 да»; Q1 extended to views;
+  then «нужна строгость к админам каталога, но увлекаться можно не сильно - можно сделать после релиза; в основном
+  сценарии один админ на все каталоги» - a policy admin, whom the source gate does not judge). The branch holds the
+  work in progress (the scoped walker and the resolution), unbuilt.
 - **Date**: 2026-10-19
 - **Author**: Claude (with the owner)
 

@@ -199,6 +199,13 @@ void RegisterAclPlatformSources(ExtensionLoader &loader, const shared_ptr<Policy
 void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
 //! spec 120.2: the tables a stored body names, as written - parsed, never bound (a view's SELECT, a macro's expression)
 void StoredBodyTables(const string &body, bool expression, vector<vector<string>> &tables);
+//! spec 138: the table / view names a stored body writes, as written - a one-part name that is a CTE of its scope
+//! left out. Throws when the body does not parse (or is no SELECT / expression).
+void BodyReferences(const string &body, bool expression, vector<vector<string>> &references);
+//! spec 138: the catalog entry a reference names, as duckdb's binder resolves it (catalog-or-schema, the search path,
+//! the defaults): `<db>.<schema>.<object>`, empty when it names no entry. Throws duckdb's own refusal of an ambiguous
+//! name, and whatever the lookup throws (a gate refuses then).
+vector<string> ResolvedReference(DatabaseInstance &db, const vector<string> &parts);
 //! the sources granted to the principal (`<alias>` or `<alias>.<schema>` keys, kind `source`)
 vector<string> GrantedSources(const PolicyStore::AdminRights &rights);
 //! passthrough, policy and the cluster bundle see every source (only passthrough and policy build over every
@@ -208,10 +215,8 @@ bool SeesAllSources(const PolicyStore::AdminRights &rights);
 bool SourceGranted(const vector<string> &sources, const vector<string> &parts, bool schema_path);
 //! spec 137: the same with a two-part object name read the way duckdb binds it - the database's own default
 //! schema (Postgres `public`), never an assumed `main`
-//! `as_written`: a body's name - the plain reading must pass too (a name inside a physical view binds in the view's
-//! own catalog), so the attached database's reading only ever narrows it. Throws for a name that reads two ways.
-bool SourceGranted(DatabaseInstance &db, const vector<string> &sources, const vector<string> &parts, bool schema_path,
-                   bool as_written = false);
+//! Throws for a name that reads two ways. (A body's names are judged by their entries - ResolvedReference, spec 138.)
+bool SourceGranted(DatabaseInstance &db, const vector<string> &sources, const vector<string> &parts, bool schema_path);
 //! spec 137: what a two-part object name `a.b` is stored as - one reading `a.<schema>.b` when `a` is an attached
 //! database (the entry duckdb's own lookup finds there, else its default schema's real name); two when `a` is also a
 //! schema of the node's default database (duckdb refuses the name as ambiguous - the second only for that); none
