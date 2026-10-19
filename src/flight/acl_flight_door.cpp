@@ -1426,23 +1426,25 @@ public:
 		// The ticket is an id; the statement behind it is already parsed, rewritten and bound under
 		// its owner. What DoGet does is verify the caller IS that owner - a stolen ticket earns
 		// nothing, spec 047's rule - and execute. No second parse, no second resolution.
-		return UnderSession(context,
-		                    [&](const string &caller) -> arrow::Result<std::unique_ptr<flight::FlightDataStream>> {
-			                    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(caller));
-			                    auto reservation = state->TakeReservation(string(command.statement_handle), owner);
-			                    if (!reservation) {
-				                    // a ticket of somebody else's reads exactly like none (no oracle) - and is
-				                    // the one event here worth a denial: a stolen ticket presented (spec 047)
-				                    state->store->AuditDoor("flight", "ticket_foreign", false, "principal",
-				                                            "acl: unknown or already fetched ticket", caller);
-				                    return arrow::Status::KeyError("acl: unknown or already fetched ticket");
-			                    }
-			                    state->store->AuditDoor("flight", "ticket_redeemed", true, string(), string(), caller);
-			                    auto execution = state->LockForStatement(*reservation->conn);
-			                    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
-			                    vector<Value> values;
-			                    return StreamStatement(context, std::move(reservation), values, caller);
-		                    });
+		return UnderSession(
+		    context,
+		    [&](const string &caller) -> arrow::Result<std::unique_ptr<flight::FlightDataStream>> {
+			    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(caller));
+			    auto reservation = state->TakeReservation(string(command.statement_handle), owner);
+			    if (!reservation) {
+				    // a ticket of somebody else's reads exactly like none (no oracle) - and is
+				    // the one event here worth a denial: a stolen ticket presented (spec 047)
+				    state->store->AuditDoor("flight", "ticket_foreign", false, "principal",
+				                            "acl: unknown or already fetched ticket", caller);
+				    return arrow::Status::KeyError("acl: unknown or already fetched ticket");
+			    }
+			    state->store->AuditDoor("flight", "ticket_redeemed", true, string(), string(), caller);
+			    auto execution = state->LockForStatement(*reservation->conn);
+			    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
+			    vector<Value> values;
+			    return StreamStatement(context, std::move(reservation), values, caller);
+		    },
+		    true);
 	}
 
 	//! Text DML via DoPut - the path JDBC's executeUpdate speaks (spec 048). The statement path's
@@ -1860,11 +1862,14 @@ public:
 
 	arrow::Status ClosePreparedStatement(const flight::ServerCallContext &context,
 	                                     const flightsql::ActionClosePreparedStatementRequest &request) override {
-		auto closed = UnderSession(context, [&](const string &handle) -> arrow::Result<bool> {
-			ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(handle));
-			state->CloseReservation(request.prepared_statement_handle, owner);
-			return true;
-		});
+		auto closed = UnderSession(
+		    context,
+		    [&](const string &handle) -> arrow::Result<bool> {
+			    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(handle));
+			    state->CloseReservation(request.prepared_statement_handle, owner);
+			    return true;
+		    },
+		    true);
 		return closed.status();
 	}
 
@@ -1872,18 +1877,21 @@ public:
 	                                          const flightsql::PreparedStatementQuery &command,
 	                                          flight::FlightMessageReader *reader,
 	                                          flight::FlightMetadataWriter *writer) override {
-		auto bound = UnderSession(context, [&](const string &handle) -> arrow::Result<bool> {
-			ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(handle));
-			ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader, FlightDoorState::MAX_PARAM_ROWS));
-			auto reservation = state->FindReservation(command.prepared_statement_handle, owner);
-			if (!reservation) {
-				return arrow::Status::KeyError("acl: unknown prepared statement");
-			}
-			auto execution = state->LockForStatement(*reservation->conn);
-			reservation->parameter_rows = std::move(rows);
-			reservation->executed.reset(); // spec 111: a count kept for the old parameters is not this one's
-			return true;
-		});
+		auto bound = UnderSession(
+		    context,
+		    [&](const string &handle) -> arrow::Result<bool> {
+			    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(handle));
+			    ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader, FlightDoorState::MAX_PARAM_ROWS));
+			    auto reservation = state->FindReservation(command.prepared_statement_handle, owner);
+			    if (!reservation) {
+				    return arrow::Status::KeyError("acl: unknown prepared statement");
+			    }
+			    auto execution = state->LockForStatement(*reservation->conn);
+			    reservation->parameter_rows = std::move(rows);
+			    reservation->executed.reset(); // spec 111: a count kept for the old parameters is not this one's
+			    return true;
+		    },
+		    true);
 		return bound.status();
 	}
 
@@ -1891,47 +1899,52 @@ public:
 	GetFlightInfoPreparedStatement(const flight::ServerCallContext &context,
 	                               const flightsql::PreparedStatementQuery &command,
 	                               const flight::FlightDescriptor &descriptor) override {
-		return UnderSession(context, [&](const string &handle) -> arrow::Result<std::unique_ptr<flight::FlightInfo>> {
-			ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(handle));
-			auto reservation = state->FindReservation(command.prepared_statement_handle, owner);
-			if (!reservation) {
-				return arrow::Status::KeyError("acl: unknown prepared statement");
-			}
-			std::shared_ptr<arrow::Schema> dataset_schema;
-			std::shared_ptr<arrow::Schema> parameter_schema;
-			{
-				auto execution = state->LockForStatement(*reservation->conn);
-				ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
-				auto bound = reservation->parameter_rows.empty() ? nullptr : &reservation->parameter_rows.front();
-				ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->conn->con->context, *reservation->stmt, bound,
-				                                         dataset_schema, parameter_schema));
-				// spec 111: GetFlightInfo IS the execution of a count; the next DoGet answers it (not before
-				// the declared parameters are bound: then it answers the schema, as before, and DoGet runs)
-				if (reservation->parameter_rows.size() <= 1 && (bound || reservation->stmt->GetParameterCount() == 0)) {
-					ARROW_RETURN_NOT_OK(ExecuteCountNow(handle, *reservation, bound));
-					if (reservation->executed && Expands(*reservation->stmt)) {
-						// spec 128: its schema is its result's - announced at CreatePreparedStatement as duckdb's
-						// placeholder, the one thing known before it runs
-						ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaFor(reservation->executed->GetTypes(),
-						                                                reservation->executed->GetNames()));
-					}
-				}
-			}
-			// the ticket is the protocol's own command, which carries the handle - nothing is
-			// remembered between the two calls that is not already in the reservation
-			std::vector<flight::FlightEndpoint> endpoints {
-			    flight::FlightEndpoint {flight::Ticket {descriptor.cmd}, {}, std::nullopt, {}}};
-			ARROW_ASSIGN_OR_RAISE(auto info,
-			                      flight::FlightInfo::Make(*dataset_schema, descriptor, endpoints, -1, -1, false));
-			return std::make_unique<flight::FlightInfo>(std::move(info));
-		});
+		return UnderSession(
+		    context,
+		    [&](const string &handle) -> arrow::Result<std::unique_ptr<flight::FlightInfo>> {
+			    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(handle));
+			    auto reservation = state->FindReservation(command.prepared_statement_handle, owner);
+			    if (!reservation) {
+				    return arrow::Status::KeyError("acl: unknown prepared statement");
+			    }
+			    std::shared_ptr<arrow::Schema> dataset_schema;
+			    std::shared_ptr<arrow::Schema> parameter_schema;
+			    {
+				    auto execution = state->LockForStatement(*reservation->conn);
+				    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
+				    auto bound = reservation->parameter_rows.empty() ? nullptr : &reservation->parameter_rows.front();
+				    ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->conn->con->context, *reservation->stmt,
+				                                             bound, dataset_schema, parameter_schema));
+				    // spec 111: GetFlightInfo IS the execution of a count; the next DoGet answers it (not before
+				    // the declared parameters are bound: then it answers the schema, as before, and DoGet runs)
+				    if (reservation->parameter_rows.size() <= 1 &&
+				        (bound || reservation->stmt->GetParameterCount() == 0)) {
+					    ARROW_RETURN_NOT_OK(ExecuteCountNow(handle, *reservation, bound));
+					    if (reservation->executed && Expands(*reservation->stmt)) {
+						    // spec 128: its schema is its result's - announced at CreatePreparedStatement as duckdb's
+						    // placeholder, the one thing known before it runs
+						    ARROW_ASSIGN_OR_RAISE(dataset_schema, SchemaFor(reservation->executed->GetTypes(),
+						                                                    reservation->executed->GetNames()));
+					    }
+				    }
+			    }
+			    // the ticket is the protocol's own command, which carries the handle - nothing is
+			    // remembered between the two calls that is not already in the reservation
+			    std::vector<flight::FlightEndpoint> endpoints {
+			        flight::FlightEndpoint {flight::Ticket {descriptor.cmd}, {}, std::nullopt, {}}};
+			    ARROW_ASSIGN_OR_RAISE(auto info,
+			                          flight::FlightInfo::Make(*dataset_schema, descriptor, endpoints, -1, -1, false));
+			    return std::make_unique<flight::FlightInfo>(std::move(info));
+		    },
+		    true);
 	}
 
 	arrow::Result<std::unique_ptr<flight::FlightDataStream>>
 	DoGetPreparedStatement(const flight::ServerCallContext &context,
 	                       const flightsql::PreparedStatementQuery &command) override {
 		return UnderSession(
-		    context, [&](const string &caller) -> arrow::Result<std::unique_ptr<flight::FlightDataStream>> {
+		    context,
+		    [&](const string &caller) -> arrow::Result<std::unique_ptr<flight::FlightDataStream>> {
 			    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(caller));
 			    auto reservation = state->FindReservation(command.prepared_statement_handle, owner);
 			    if (!reservation) {
@@ -1950,76 +1963,81 @@ public:
 				    values = reservation->parameter_rows.front();
 			    }
 			    return StreamStatement(context, std::move(reservation), values, caller);
-		    });
+		    },
+		    true);
 	}
 
 	arrow::Result<int64_t> DoPutPreparedStatementUpdate(const flight::ServerCallContext &context,
 	                                                    const flightsql::PreparedStatementUpdate &command,
 	                                                    flight::FlightMessageReader *reader) override {
-		return UnderSession(context, [&](const string &caller) -> arrow::Result<int64_t> {
-			ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(caller));
-			auto reservation = state->FindReservation(command.prepared_statement_handle, owner);
-			if (!reservation) {
-				return arrow::Status::KeyError("acl: unknown prepared statement");
-			}
-			ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader, FlightDoorState::MAX_PARAM_ROWS));
-			auto execution = state->LockForStatement(*reservation->conn);
-			ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
-			reservation->executed.reset(); // spec 111: this call executes; a count an earlier GetFlightInfo kept goes
-			// executemany semantics, DBAPI's: once per parameter row. Zero rows with declared
-			// parameters is zero executions - not one; only a parameterless statement runs once.
-			if (rows.empty()) {
-				if (reservation->stmt->GetParameterCount() > 0) {
-					return int64_t(0);
-				}
-				rows.push_back({});
-			}
-			// One batch, one outcome (the review's lesson): a mid-batch refusal rolls the whole
-			// batch back, so a retry cannot duplicate rows. When the client already holds an explicit
-			// transaction (spec 055), the batch joins it rather than nesting a second BEGIN - the
-			// client owns the commit then, and a mid-batch failure surfaces without us rolling back
-			// work that is now the client's to keep or discard.
-			auto &con = *reservation->conn->con;
-			bool owns_txn = !con.HasActiveTransaction();
-			if (owns_txn) {
-				auto begun = con.Query("BEGIN TRANSACTION");
-				if (begun->HasError()) {
-					return StatusFromDuck("acl", begun->GetError());
-				}
-			}
-			ArmProfile(caller, *reservation->conn, reservation.get(), string()); // one note, every row's execution
-			// spec 112 §2: the rows are one run - ended before the transaction is, so a commit hands
-			// it on and a rollback aborts it
-			auto &context = *con.context;
-			LineageBatchScope batch(context); // ends on every way out - an exception too
-			int64_t total = 0;
-			for (auto &row : rows) {
-				auto result = reservation->stmt->Execute(row);
-				if (result->HasError()) {
-					batch.End();
-					if (owns_txn) {
-						con.Query("ROLLBACK");
-					}
-					return StatusFromDuck("acl", result->GetError());
-				}
-				auto chunk = result->Fetch();
-				if (chunk && chunk->size() > 0 && chunk->ColumnCount() == 1) {
-					auto count = chunk->GetValue(0, 0);
-					// only a DML's count column is a count; anything else must not be force-cast
-					if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
-						total += count.GetValue<int64_t>();
-					}
-				}
-			}
-			batch.End();
-			if (owns_txn) {
-				auto committed = con.Query("COMMIT");
-				if (committed->HasError()) {
-					return StatusFromDuck("acl", committed->GetError());
-				}
-			}
-			return total;
-		});
+		return UnderSession(
+		    context,
+		    [&](const string &caller) -> arrow::Result<int64_t> {
+			    ARROW_ASSIGN_OR_RAISE(auto owner, OwnerOf(caller));
+			    auto reservation = state->FindReservation(command.prepared_statement_handle, owner);
+			    if (!reservation) {
+				    return arrow::Status::KeyError("acl: unknown prepared statement");
+			    }
+			    ARROW_ASSIGN_OR_RAISE(auto rows, ParamRowsFrom(state->db, *reader, FlightDoorState::MAX_PARAM_ROWS));
+			    auto execution = state->LockForStatement(*reservation->conn);
+			    ARROW_RETURN_NOT_OK(MovedTxnGuardLocked(*reservation->conn, reservation->query));
+			    reservation->executed
+			        .reset(); // spec 111: this call executes; a count an earlier GetFlightInfo kept goes
+			    // executemany semantics, DBAPI's: once per parameter row. Zero rows with declared
+			    // parameters is zero executions - not one; only a parameterless statement runs once.
+			    if (rows.empty()) {
+				    if (reservation->stmt->GetParameterCount() > 0) {
+					    return int64_t(0);
+				    }
+				    rows.push_back({});
+			    }
+			    // One batch, one outcome (the review's lesson): a mid-batch refusal rolls the whole
+			    // batch back, so a retry cannot duplicate rows. When the client already holds an explicit
+			    // transaction (spec 055), the batch joins it rather than nesting a second BEGIN - the
+			    // client owns the commit then, and a mid-batch failure surfaces without us rolling back
+			    // work that is now the client's to keep or discard.
+			    auto &con = *reservation->conn->con;
+			    bool owns_txn = !con.HasActiveTransaction();
+			    if (owns_txn) {
+				    auto begun = con.Query("BEGIN TRANSACTION");
+				    if (begun->HasError()) {
+					    return StatusFromDuck("acl", begun->GetError());
+				    }
+			    }
+			    ArmProfile(caller, *reservation->conn, reservation.get(), string()); // one note, every row's execution
+			    // spec 112 §2: the rows are one run - ended before the transaction is, so a commit hands
+			    // it on and a rollback aborts it
+			    auto &context = *con.context;
+			    LineageBatchScope batch(context); // ends on every way out - an exception too
+			    int64_t total = 0;
+			    for (auto &row : rows) {
+				    auto result = reservation->stmt->Execute(row);
+				    if (result->HasError()) {
+					    batch.End();
+					    if (owns_txn) {
+						    con.Query("ROLLBACK");
+					    }
+					    return StatusFromDuck("acl", result->GetError());
+				    }
+				    auto chunk = result->Fetch();
+				    if (chunk && chunk->size() > 0 && chunk->ColumnCount() == 1) {
+					    auto count = chunk->GetValue(0, 0);
+					    // only a DML's count column is a count; anything else must not be force-cast
+					    if (!count.IsNull() && count.type().id() == LogicalTypeId::BIGINT) {
+						    total += count.GetValue<int64_t>();
+					    }
+				    }
+			    }
+			    batch.End();
+			    if (owns_txn) {
+				    auto committed = con.Query("COMMIT");
+				    if (committed->HasError()) {
+					    return StatusFromDuck("acl", committed->GetError());
+				    }
+			    }
+			    return total;
+		    },
+		    true);
 	}
 
 	//! The caller's fingerprint, from the live session this call already opened.
@@ -2570,14 +2588,18 @@ private:
 	//! Every RPC now runs inside one try, so what escapes is a Status that names itself, and
 	//! the session is closed by the scope's destructor either way. This is the same boundary the
 	//! statement RPCs of spec 045 needed and did not have.
+	//!
+	//! `redeems`: the call redeems a reservation (a ticket, a prepared statement) - a cookie-less client's per-call
+	//! session for it opens on a draining node too (spec 134's addendum), the reservation's owner rule judging it.
 	template <class Body>
-	auto UnderSession(const flight::ServerCallContext &context, Body body) -> decltype(body(string())) {
+	auto UnderSession(const flight::ServerCallContext &context, Body body, bool redeems = false)
+	    -> decltype(body(string())) {
 		string handle;
 		bool durable = false;
 		Takeover moving;
 		try {
 			bool transient = false;
-			ARROW_ASSIGN_OR_RAISE(handle, SessionFor(context, transient, moving));
+			ARROW_ASSIGN_OR_RAISE(handle, SessionFor(context, transient, moving, redeems));
 			if (!transient) {
 				// a connection-long session (spec 050): the sweeper, exp, CloseSession or the door's
 				// stop end it - an RPC boundary does not
@@ -2900,7 +2922,8 @@ private:
 	//! single-call RPCs still work, a session resource honestly refuses on the next call). The token
 	//! is the authority of every call, verified BEFORE the session's idle clock is touched (F9); an
 	//! unverifiable token falls through to the honest refusal it always earned, cookie or not.
-	arrow::Result<string> SessionFor(const flight::ServerCallContext &context, bool &transient, Takeover &moving) {
+	arrow::Result<string> SessionFor(const flight::ServerCallContext &context, bool &transient, Takeover &moving,
+	                                 bool redeems = false) {
 		auto token = TokenFromHeaders(context);
 		if (token.empty()) {
 			return arrow::Status::UnknownError("acl: authentication failed");
@@ -2982,13 +3005,17 @@ private:
 		// Whoever reaches this point is new: no live session of their own resolved above. A draining
 		// node seats nobody new (spec 066), and says WHY - a load balancer and a driver both treat
 		// UNAVAILABLE as "go elsewhere", where a generic auth failure would read as bad credentials.
-		if (state->store->Draining()) {
+		// A cookie-less call redeeming what it holds is no NEW client (spec 134's addendum): its ticket or prepared
+		// statement was minted here before the drain, and a connection-long session would keep working too
+		auto despite_drain = transient && redeems;
+		if (state->store->Draining() && !despite_drain) {
 			return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
 			                               "acl: node is draining - not accepting new sessions");
 		}
 		string placement;
 		vector<string> placement_groups;
-		auto handle = state->store->SessionOpen(token, "flight", replacing, &placement, &placement_groups);
+		auto handle =
+		    state->store->SessionOpen(token, "flight", replacing, &placement, &placement_groups, despite_drain);
 		if (handle.empty()) {
 			if (!placement.empty()) {
 				// spec 096: this node serves another resource group - UNAVAILABLE, like a drain, so a

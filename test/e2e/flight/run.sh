@@ -408,6 +408,12 @@ echo "$got" | grep -q "set-cookie: acl_node=e2e-node-1;" || fail "another node's
 got="$(ask "@handles:SELECT 1 AS one")"
 echo "$got" | grep -Eq "'statement': 'e2e-node-1\.[0-9A-F]{32}'" || fail "a ticket without the label: $got"
 echo "$got" | grep -Eq "'prepared': 'e2e-node-1\.[0-9A-F]{32}'" || fail "a prepared handle without the label: $got"
+# ...and the label is a hint, never an authority: the id is redeemed whole, by its owner only
+OTHER="$(python3 "$ROOT/test/scripts/idp_fixtures.py" mint \
+	'{"iss": "test/idp/s", "aud": "api://acl-test", "exp": 4102444800, "sub": "u-other", "roles": ["analyst"], "tid": "acme"}')"
+got="$(ACL_OTHER_TOKEN="$OTHER" ask "@tamper:SELECT 1 AS one")"
+echo "$got" | grep -q "'swapped': 'refused', 'stripped': 'refused', 'other': 'refused', 'own': {'one': \[1\]}" ||
+	fail "a ticket was redeemed with another label, without one, or by another principal: $got"
 echo "SET GLOBAL acl_node_label=''; SELECT 'labelunflip' AS s;" >&3
 flipped=""
 for _ in $(seq 1 40); do grep -q "labelunflip" "$TMP/server.log" && { flipped=1; break; }; sleep 0.25; done

@@ -146,5 +146,15 @@ flight lost at every change of the fleet).
 - Not labelled: a transaction id (spec 055) and everything else that lives in a session - a session needs the
   cookie anyway (spec 050); a catalog RPC's ticket is the command itself, which any node answers alike.
 
+- **A draining node redeems what a cookie-less client holds** (review, 2026-10-19). Such a client gets a per-call
+  session for every call, and a draining node seated nobody new - so a ticket or a prepared statement minted just
+  before a drain could not be redeemed on its node, during a rolling restart, front or no front. The six calls that
+  redeem a reservation (DoGet of a statement and of a prepared statement, GetFlightInfo of a prepared statement, its
+  two DoPuts, ClosePreparedStatement) open their per-call session despite the drain (`UnderSession(…, redeems)` ->
+  `SessionOpen(…, despite_drain)`); the token, the placement and the reservation's owner rule judge them as before. A
+  connection-long session keeps working through a drain already (spec 066); anything else stays refused.
+
 Tests: `test/e2e/flight/run.sh`, the label section - with `acl_node_label` set both ids are `<label>.<32 hex>`, and
-after it is cleared both are the 32 hex alone (`client.py @handles:`).
+after it is cleared both are the 32 hex alone (`client.py @handles:`); a ticket with another node's label or none is
+not redeemed, nor by another principal, and its owner's is (`@tamper:`). `test/e2e/flight/drain.sh`: a ticket and a
+prepared statement taken before the drain without a cookie are redeemed during it, a new client is still refused.
