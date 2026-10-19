@@ -1,6 +1,6 @@
 # Spec 136: a listing says which source it could not read
 
-- **Status**: draft
+- **Status**: accepted (the owner, 2026-10-19: «По спекам ок» - the mark names the source, as written)
 - **Date**: 2026-10-19
 - **Author**: Claude (with the owner)
 
@@ -95,8 +95,7 @@ acl: source <database> could not be read (<class>) - its columns are not listed;
     object would tell it: a read fails with the source's error itself.
   - The source's database name in the mark is the physical key the object resolves to. It is the same thing a
     principal's `DESCRIBE` or a failed read would disclose.
-  - **Open (for the owner):** if the physical name is to stay hidden, the mark says "its source could not be read"
-    without the name.
+  - The owner accepted the mark as written, naming the source (2026-10-19).
 - **No new parameters** (the golden rule). `acl_physical_unread` takes the same constant key list its siblings take.
 - **Fail-safe direction:** a failure still never fails the listing, which is spec 119's rule. Only the silence goes.
 
