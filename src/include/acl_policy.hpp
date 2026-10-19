@@ -978,6 +978,9 @@ struct PolicyStore {
 	//! spec 120.3 addendum: whether the session bound to `external_id` ended in a view-as mode (a door then
 	//! refuses to seat that id again), and whether the session `handle` is in one now
 	bool SessionViewAsEnded(const string &external_id);
+	//! spec 135: a cookie whose moved session was in the view-as mode, never seated again - the same record a removal
+	//! in the mode leaves (SessionViewAsEnded)
+	void SessionMarkViewAsEnded(const string &external_id);
 	bool SessionInViewAs(const string &handle);
 	void SessionMarkPerCall(const string &handle);
 	bool SessionPerCall(const string &id);

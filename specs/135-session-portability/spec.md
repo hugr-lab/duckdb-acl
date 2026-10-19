@@ -17,8 +17,9 @@ F1): a session moves silently when nothing of it is lost, and errors once when s
 - **The portable context travels in a cookie the node sets: the session's `USE` and its client-local settings.** A
   node that does not know the session restores the context. Each item is judged again, as if the client had sent it.
 - **What cannot move sets a pinned flag in that cookie: an open transaction, a temp table, the view-as mode.** A node
-  that does not know a pinned session refuses the first call once, saying what was lost. It then serves the client on
-  a new session.
+  that does not know a pinned session still restores what is portable, refuses the first call once, saying what was
+  lost, and serves the client on a new session. A lost transaction stays aborted until the client's ROLLBACK, so no
+  part of it runs in autocommit. A session in the view-as mode is not seated afresh unless the call declares the mode.
 
 ## Problem
 
@@ -49,31 +50,42 @@ acl_session_state=<base64url of a JSON object>; HttpOnly; Path=/; SameSite=Stric
 ```
 
 ```json
-{"v": 1,
+{"v": 1, "p": "<16 hex digits>",
  "use": {"catalog": "<key>", "schema": "<key>"},
  "set": {"TimeZone": "Europe/Berlin", "acl_correlation_id": "..."},
  "pinned": ["transaction", "temp", "view_as"]}
 ```
 
+- **`p`**: whose state it is. It is a tag of the principal's fingerprint (the first 16 hex digits of the SHA-256 of
+  `PrincipalFingerprint`), never the fingerprint itself. It is required.
 - **`use`**: the session's `USE` (spec 114, `Session::use_catalog` / `use_schema`), in canonical keys (spec 116).
-- **`set`**: what the client SET on its session from spec 068's allowlist (`ClientSettingAllowed`): `TimeZone`,
-  `Calendar`, `acl_metadata_max_rows`, `acl_correlation_id`, `acl_traceparent`, and the lineage context of spec 107.
-  Only values the client set itself are listed, never a node's defaults.
+- **`set`**: what the client SET on its session from spec 068's allowlist. That list is one list,
+  `PORTABLE_SETTINGS` in `acl_session_state.hpp`, and `ClientSettingAllowed` reads it too: `TimeZone`, `Calendar`,
+  `acl_metadata_max_rows`, `acl_correlation_id`, `acl_traceparent` and the three lineage settings of spec 107.
+  - A value is carried only when the connection holds it at scope `LOCAL` and it differs from the option's default:
+    duckdb's `RESET` writes the default as a LOCAL value, and a node's default is never carried.
 - **`pinned`**: why the session cannot move.
-  - `transaction`: an explicit transaction is open on the session's connection, whether begun by `BeginTransaction`
-    or by SQL `BEGIN` (spec 055).
+  - `transaction`: an explicit transaction is open on the session's connection. That is duckdb's own word
+    (`!IsAutoCommit()`), whoever began the transaction: `BeginTransaction`, SQL `BEGIN`, or a moved one.
   - `temp`: a session temp table exists (spec 050; an ingest's `temporary = true` included).
   - `view_as`: the session views the catalog as a role (spec 120.3).
 - **When it is sent:** on the response of the call that changed the state, whenever the state differs from what the
-  request's own cookie said. An empty state clears the cookie (`Max-Age=0`).
-  - The door reads the state at the end of `UnderSession`, after the call's work, and sends it with
-    `ServerCallContext::AddHeader`. A middleware cannot do this: Arrow sends a middleware's headers right after
-    `StartCall`, before the handler runs, so they would describe the state before the call.
-  - `USE` and view-as come from the session record. The settings come from the connection's own `SET`s: a value
-    is read only when its scope is `LOCAL`, never a default. The transaction and the temp tables are read from
-    the connection, under its lock.
-- **Bound:** at most 3 KiB encoded. A larger state is never written partly: the cookie carries `pinned:
-  ["context"]` instead, and a move errors honestly.
+  request's own cookie said, with an error response included. An empty state clears the cookie (`Max-Age=0`).
+  - The door reads the state at the end of `UnderSession`, after the call's work, and also after a body that
+    throws. It sends the state with `ServerCallContext::AddHeader`. A middleware cannot do this: Arrow sends a
+    middleware's headers right after `StartCall`, before the handler runs, so they would describe the state before
+    the call.
+  - It says nothing on a call where it cannot see the state, so a pin it cannot see is never dropped:
+    - the session went away during the call (a kill, a sweep, a swap);
+    - the session never ran anything on this node;
+    - a statement or a stream's pull holds the connection: the state is read with `try_lock`, and that other call's
+      own response carries the change.
+- **Bound:** at most 1 KiB encoded, because a request's metadata (a bearer of several KB, and the cookies) shares
+  gRPC's 8 KiB limit. A larger state keeps its principal and its pins and adds `context`; it is never written
+  partly.
+- **The decoder** reads at most 4 KiB. It answers UNREADABLE, and never reads partly, on any of: a malformed input,
+  an unknown `v`, a wrong type, a missing or empty `p`, a setting not on the list or a setting twice, a NUL inside a
+  string, or a key this build does not write. So a restore runs at most one `USE` and eight `SET`s.
 - **Not here:**
   - prepared statements and reservations (spec 047), and open streams (spec 070): on another node they fail with
     their own "unknown" errors, which are honest;
@@ -81,96 +93,109 @@ acl_session_state=<base64url of a JSON object>; HttpOnly; Path=/; SameSite=Stric
 
 ### A call whose session this node does not know
 
-Before `SessionOpen`, `SessionFor` reads `acl_session_state`. That holds whatever the cookie's `acl_node` label says:
-another node's, this node's (the session died idle or was killed), or none.
+`SessionFor` reads `acl_session_state` when the session cookie names no live session here. That holds whatever the
+cookie's `acl_node` label says: another node's, this node's (the session died idle or was killed), or none. A swap
+(another principal on a live session) is not this case: nothing of the old principal's context is carried, and the
+response overwrites the cookie.
 
-1. **No state cookie:** a new session, as today.
-2. **A state that is pinned** (or unreadable: malformed, a `v` this build does not know): the new session is opened
-   and bound to the cookie as today, but this call is refused with `Invalid`.
-   - The message: `acl: the session moved to another node and lost its open transaction, its temp tables; the
-     statement did not run, the connection works on`. It names what the state listed.
-   - The response clears the state cookie.
-   - The client's next call finds the new session live, and goes on.
-   - `Invalid` is what spec 120.3's guards answer: a driver neither retries it nor reads it as bad credentials.
-3. **A state that is not pinned:** the new session is opened, and the context is restored before the call runs,
-   through the same paths a client's own statement takes.
-   - `USE` goes through `acl_session_use`, which judges the catalog and schema against the principal (spec 114).
-   - Each setting is a `SET` on the session's connection (spec 068's path, with its validators: spec 109's run-ref
-     check, spec 119's refused raise).
-   - If any item does not restore (the catalog is no longer held, a value is refused), the call is refused as in 2.
-     The message is `… and could not restore its USE` (or the setting's name). Silently dropping a `USE` is exactly
-     the bug this spec closes.
+1. **No state, or another principal's.** If `p` is not the caller's tag (verified from the token), it is a stolen
+   or shared jar: the caller gets a new session, as it would without the cookie.
+2. **The view-as mode, not declared by the call.** The connection is not seated afresh. The 120.3 addendum's
+   record (`view_as_ended`) is written for the cookie and the call is refused: `… viewed the catalog as a role and
+   is gone - connect again`. This is the same rule on every node. A call that declares `x-acl-view-as` is put in
+   the mode again (DeclaredViewAs) and goes on.
+3. **Otherwise** the session is opened and bound to the cookie (drain, the session cap and placement refuse a move
+   as they refuse any new session). Then, after the call's own mode is in place, `TakeOverState` runs:
+   - **The portable part is restored through the client's own paths, pinned or not.** `USE` becomes
+     `SET schema = '<catalog.schema>'` (or `SET acl_use_schema`) and each setting a `SET`, under the session's
+     prefix, so `RewriteUse` and spec 068's gate judge each item as the client's own statement now.
+     - A `USE` that records nothing (`acl_session_use` answering false) counts as not restored.
+     - In a declared view-as mode no `USE` is restored: the mode is metadata only.
+   - **A lost transaction** is begun on the new connection and aborted (`ValidChecker::Invalidate`). duckdb then
+     refuses every statement until a `ROLLBACK` ("Current transaction is aborted (please ROLLBACK)"), and a
+     `COMMIT` commits nothing. `EndTransaction` ends it whatever transaction id it names, since the id was the
+     other node's; a commit is told that nothing was committed. `BeginTransaction` asks for the rollback first.
+   - **Anything not carried refuses this call, once, naming all of it.** That covers a pin, an item that did not
+     restore, and an unreadable state. The message is `acl: the session moved to another node and lost its open
+     transaction (ROLLBACK to go on: nothing of it was committed); the statement did not run, the connection works
+     on`, or `… could not restore its USE, acl_metadata_max_rows`, or `… lost its session context`. The client's
+     next call works on the new session.
 
 The token is the authority, as on every call. `SessionOpen` verifies it like any new session (spec 059: `exp` is
-judged at establishment), so a long-lived connection moves only with a token that is valid now. A client refreshes
-it. Drain (spec 066), the session cap (spec 044) and placement (spec 096) refuse a move as they refuse any new session.
+judged at establishment), so a long-lived connection moves only with a token that is valid now.
 
 ### quack
 
-A quack connection authenticates once, at its CONNECT. Later requests carry the connection id but no token. So a
-node that does not know a connection id cannot open a session for it, and a move is always the client's reconnect.
-
-- The door answers an unknown connection id with a reason a client can recognise: `acl: this connection is not known
-  on this node - connect again`. This takes one `sync.py` hunk around quack's own lookup; the text is the door's.
-- A client that knows it holds no pinned state reconnects by itself. hugr_node's federation client knows that, since
-  it issued its own `USE` / `BEGIN` / `CREATE TEMP`. It replays its portable context on the new connection. That is a
-  hugr-node spec; nothing here changes the quack client.
-- With duckdb/duckdb-quack#297 the client keeps cookies per logical connection. The door may then set
-  `acl_session_state` on `/quack` responses too, and a generic client could act on it. That is a follow-up, once #297
-  is in.
+A quack connection authenticates once, at its CONNECT, so a connection id this node does not know cannot be seated.
+The door says so: `acl: this connection is not known on this node - connect again`, and for a lease that ran out
+but was not swept yet, `acl: this connection's lease ran out on this node - connect again` (two `sync.py` hunks).
+hugr_node's federation client reconnects by itself when it holds nothing pinned, and replays its own context; that
+is a hugr-node spec. With duckdb/duckdb-quack#297, the state cookie could ride `/quack` responses too (a follow-up).
 
 ### The audit
 
 - `session` events:
-  - `moved` (door, `restored` = the items carried) when a new session took a context over;
-  - `move_refused` (door, `lost` = what the state listed or the item that did not restore).
-- Never the values themselves: a setting's name, not its value; a `USE` as the catalog's key, which the audit
-  already notes for resolved objects (spec 116).
-- Counters `acl.sessions.moved` and `acl.sessions.move_refused`.
+  - `moved`, emitted only when something was carried; its reason lists the items' names (`USE, TimeZone`);
+  - `move_refused`, with reason codes `session_pinned`, `session_unrestorable` or `session_unreadable`; its reason
+    names what was lost.
+- Never a value. A setting's name comes from the list, never the client's text.
+- Counters `acl.sessions.moved{door}` and `acl.sessions.move_refused{door,reason_code}`.
 
 ## Enforcement & security
 
-- **The cookie is the client's own context, not a credential.** It is not signed: nodes share no key (keys come by
-  discovery, nothing is baked in), and nothing in it grants anything.
-  - Every item is judged again as if the client had sent it now. A forged `USE` of a catalog the principal does not
-    hold is refused (case 3), and a forged setting goes through the same allowlist and validators as a `SET`.
+- **The cookie is the client's own context, not a credential.** It is not signed: nodes share no key, and nothing
+  in it grants anything.
+  - Every item is judged again as the client's own statement. A forged `USE` of a catalog the principal does not
+    hold is refused (and the audit shows the rewriter's own refusal); a setting outside the list is unreadable.
+  - Another principal's state carries nothing (the tag), so a stolen jar gives the thief none of the victim's
+    context, and the victim's pins do not refuse the thief.
   - A client that drops `pinned` loses only its own transaction or temp tables, its own choice.
   - A client that drops `view_as` runs as its own principal, the administrator itself: view-as is a self-restriction,
-    never a grant. A call that declares the mode (`x-acl-view-as`) is put in it again, as today.
-- **The session id stays the bearer secret:** `acl_flight_session_id` is unchanged. The state cookie carries no
-  handle and no token.
-- **Nothing is silently changed:** a context that cannot be carried whole is an error, once (case 2 or 3).
+    never a grant.
+- **The session id stays the bearer secret.** `acl_flight_session_id` is unchanged; the state cookie carries no
+  handle and no token, and its tag is one-way.
+- **Nothing is silently changed.** A context that is not carried whole is named in a refusal, once, and a lost
+  transaction cannot be half committed.
+- **Bounded.** A restore is at most nine statements; the cookie is at most 1 KiB written and 4 KiB read.
 - **The parameter golden rule is untouched.** Restoring runs the door's own statements on the session's connection,
   as spec 068's `SetSessionOptions` does.
-- **The cookie's size is bounded**, and so is its decode. Malformed input is refused once, never parsed partly.
 
 ## Testing
 
 - **C++ (`test/cpp/test_acl_session_state.cpp`):**
-  - the cookie codec round-trips;
-  - the bound gives `pinned: ["context"]`;
-  - malformed input (bad base64, bad JSON, an unknown `v`, wrong types) reads as unreadable.
-- **Flight (`test/e2e/flight/run.sh`, its client's cookie jar now a real one).** A "move" is simulated on one node
-  by `acl_session_kill`: this node no longer knows the session, and the client keeps its cookies. Then:
-  - `USE c.stage`, kill, then a short name: it resolves in `c.stage`;
-  - `SET TimeZone`, kill: a `TIMESTAMPTZ` comes back in that zone (its Arrow type's `tz`);
-  - `BEGIN`, kill: the next call is refused once, naming the transaction; the one after succeeds on a new session;
-  - a temp table, kill: refused once, naming the temp tables;
-  - a state whose `USE` names a catalog the principal does not hold: refused, naming it (a negative test of the
-    forged cookie);
-  - a malformed cookie: refused once;
-  - the counters `acl.sessions.moved` / `move_refused` count them.
-  - Not covered by a test of its own: view-as and drain take the paths of the transaction pin and of any new
-    session.
+  - the codec round-trips, escapes included;
+  - past the bound, the principal and the pins are kept and `context` is added;
+  - a valid state past 4 KiB is not read;
+  - every malformed shape reads as unreadable: no principal, a setting off the list or twice, a NUL, a wrong type,
+    an unknown key or version;
+  - the one settings list.
+- **Flight (`test/e2e/flight/run.sh`, its client's cookie jar now a real one).** A "move" is simulated on one node by
+  `acl_session_kill` (asserted to kill at least one session): this node no longer knows the session, and the client
+  keeps its cookies. Each case:
+  - `USE c.stage` and `SET TimeZone`, kill: a short name resolves in `c.stage`, and a `TIMESTAMPTZ` comes back in
+    the zone. The `moved` event names `USE, TimeZone`, and no event carries a value.
+  - Another principal's token with the jar: nothing carried.
+  - A forged `USE` of an unheld catalog: refused naming the USE. The audit holds the rewriter's own "is no catalog
+    of the principal", and the next call works.
+  - A forged setting outside the list, and a garbled cookie: "lost its session context", once.
+  - `acl_metadata_max_rows` above a lowered node bound: "could not restore its acl_metadata_max_rows".
+  - `BEGIN`, a write, kill. The next write is refused once, the pin stays in the cookie, and the write after is
+    refused as aborted. ROLLBACK goes through, no write of the transaction is committed, and the pin goes.
+  - A temp table: refused once, then the connection works.
+  - A view-as pin without the header: refused, and refused again (never seated).
+  - A drain refuses the move as any new session; the state survives and is restored after the resume.
+  - A session that died idle here takes the same path, through the binding that still names it.
+  - The counters count each kind.
 - **quack (`test/cpp/test_acl_quack_embed.cpp`):** a connection attached before the door restarts gets the door's
   sentence, and attaching again reads.
-- **hugr-platform's demo** gains a check once the front (hugr-platform 002) is in: a read-only session survives its
-  node's roll, and a session in a transaction is told once.
 
 ## Alternatives considered
 
 - **A loud refusal of any unknown session** (design/082 F1 as first written). That breaks every long-lived read-only
   connection on each roll.
+- **Refusing a lost transaction once and moving on** (this spec's first build). A driver can spend the one refusal
+  on a close or a metadata call and run the rest of the transaction in autocommit. duckdb's own aborted state
+  cannot be missed.
 - **Pinning only the sessions with state, and letting the front re-place the rest.** The front has no session table
   and should not get one.
 - **A signed cookie.** Signing needs a key shared by the nodes, and the cookie grants nothing. Re-judging every item
@@ -182,5 +207,11 @@ node that does not know a connection id cannot open a session for it, and a move
 
 - hugr-node: the federation client's reconnect, with its portable context replayed.
 - quack: the state cookie on `/quack` responses once duckdb/duckdb-quack#297 is in.
+- A ticket the old node issued reads, on the new one, as an unknown ticket, and its audit records it as a foreign
+  ticket. It could say "after a move".
+- A swap (another principal's token on a live session) still ends the old principal's transaction and temp tables
+  without a word to anyone, as before this spec.
+- Concurrent calls of one session: the cookie is last-writer-wins, so a response that read an older state can land
+  after a newer one. The next call heals it.
 - hugr-platform 002 (the front): no change is needed (label → node, gone → any node of the group); its check of a
   move joins the demo.

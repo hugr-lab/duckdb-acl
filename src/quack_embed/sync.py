@@ -265,6 +265,16 @@ PATCHES = {
             "again\");\n"
             "\t\t}\n",
         ),
+        # spec 135: a lease that ran out but was not swept yet is the same case to a client: connect again
+        (
+            "\t\tif (!RenewConnectionLease(header.connection_id, connection)) {\n"
+            "\t\t\treturn make_uniq<ErrorResponse>(\"Connection heartbeat lease expired\");\n"
+            "\t\t}\n",
+            "\t\tif (!RenewConnectionLease(header.connection_id, connection)) {\n"
+            "\t\t\treturn make_uniq<ErrorResponse>(\"acl: this connection's lease ran out on this node - connect "
+            "again\");\n"
+            "\t\t}\n",
+        ),
         # spec 079: a connection the server drops ends its acl session at once - quack's own DISCONNECT
         # and a heartbeat lease noticed expired - instead of the session waiting out
         # acl_session_idle_timeout (15 min) with no client behind it

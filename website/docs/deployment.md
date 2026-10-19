@@ -61,15 +61,21 @@ authentication) is a separate product; nodes are identical either way, which is 
     transaction (`BeginTransaction`), which the node rolls back with the session.
 - **A session can move to another node** (spec 135) when its node goes away (a roll, a drain, a
   scale-down) or its session died there. The Flight door sets a third cookie, `acl_session_state`,
-  holding the session's `USE` and the client-local settings the client `SET` (`TimeZone`, `Calendar`, the
-  trace and lineage context). It also records whether something cannot move: an open transaction, a temp
-  table, the view-as mode.
-  - On a node that does not know the session, a context with nothing pinned is restored before the call
-    runs. Each item is judged again as if the client sent it now, so a `USE` of a catalog the principal
-    no longer holds is refused. A long-lived read-only connection simply carries on.
-  - A pinned session gets one refusal, naming what was lost:
-    `acl: the session moved to another node and lost its open transaction; the statement did not run,
-    the connection works on`. The next call works on the new session.
+  holding the session's `USE` and the client-local settings the client `SET` (`TimeZone`, `Calendar`,
+  `acl_metadata_max_rows`, the trace and lineage context), a tag of its principal, and whether something
+  cannot move: an open transaction, a temp table, the view-as mode.
+  - On a node that does not know the session, its context is restored before the call runs. Each item
+    is judged again as if the client sent it now, so a `USE` of a catalog the principal no longer holds is
+    refused. A long-lived read-only connection simply carries on.
+  - Anything not carried refuses the call once and names all of it: `acl: the session moved to another
+    node and lost its temp tables; the statement did not run, the connection works on`. The next call
+    works on the new session, with whatever context did carry.
+  - A lost transaction stays aborted on the new node until the client's `ROLLBACK` (or `EndTransaction`).
+    Every statement in between is refused, and a `COMMIT` commits nothing. No part of it runs in
+    autocommit.
+  - A session that was in the view-as mode is not seated afresh, unless the call declares the mode
+    (`x-acl-view-as`).
+  - Another principal's token with the cookie carries nothing of it.
   - The move verifies the token again, as any new session does: a connection that has lived for months
     must present a valid token.
   - A front needs nothing for this. It routes by the label, and a label that is gone goes to any node of

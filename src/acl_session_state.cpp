@@ -5,6 +5,7 @@
 
 #include "yyjson.hpp"
 
+#include <cctype>
 #include <cstdio>
 
 namespace duckdb {
@@ -116,7 +117,7 @@ std::string Quote(const std::string &value) {
 }
 
 std::string Json(const SessionState &state) {
-	std::string out = "{\"v\":1";
+	std::string out = "{\"v\":1,\"p\":" + Quote(state.principal);
 	if (!state.use_catalog.empty() || !state.use_schema.empty()) {
 		out += ",\"use\":{\"catalog\":" + Quote(state.use_catalog) + ",\"schema\":" + Quote(state.use_schema) + "}";
 	}
@@ -156,7 +157,35 @@ bool IsKnownPin(const std::string &pin) {
 	return pin == "transaction" || pin == "temp" || pin == "view_as" || pin == "context";
 }
 
+//! a JSON string whole: its length, not its first NUL - a NUL anywhere is a value this build never writes
+bool Text(yyjson_val *val, std::string &out) {
+	if (!duckdb_yyjson::yyjson_is_str(val)) {
+		return false;
+	}
+	out.assign(duckdb_yyjson::yyjson_get_str(val), duckdb_yyjson::yyjson_get_len(val));
+	return out.find('\0') == std::string::npos;
+}
+
+bool CaseEquals(const std::string &a, const char *b) {
+	std::size_t i = 0;
+	for (; i < a.size() && b[i]; i++) {
+		if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) {
+			return false;
+		}
+	}
+	return i == a.size() && !b[i];
+}
+
 } // namespace
+
+const char *PortableSetting(const std::string &name) {
+	for (auto setting : PORTABLE_SETTINGS) {
+		if (CaseEquals(name, setting)) {
+			return setting;
+		}
+	}
+	return nullptr;
+}
 
 std::string EncodeSessionState(const SessionState &state) {
 	if (state.Empty()) {
@@ -164,8 +193,11 @@ std::string EncodeSessionState(const SessionState &state) {
 	}
 	auto encoded = Base64UrlEncode(Json(state));
 	if (encoded.size() > SESSION_STATE_MAX_BYTES) {
+		// the pins are what a move must not lose silently: they stay, and the context they cannot carry is one more
 		SessionState bounded;
-		bounded.pinned = {"context"};
+		bounded.principal = state.principal;
+		bounded.pinned = state.pinned;
+		bounded.pinned.emplace_back("context");
 		return Base64UrlEncode(Json(bounded));
 	}
 	return encoded;
@@ -187,6 +219,7 @@ SessionStateRead DecodeSessionState(const std::string &value, SessionState &out)
 	}
 	SessionState read;
 	bool versioned = false;
+	bool owned = false;
 	duckdb_yyjson::yyjson_obj_iter iter;
 	duckdb_yyjson::yyjson_obj_iter_init(root, &iter);
 	while (auto *key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
@@ -197,6 +230,11 @@ SessionStateRead DecodeSessionState(const std::string &value, SessionState &out)
 				return SessionStateRead::UNREADABLE;
 			}
 			versioned = true;
+		} else if (name == "p") {
+			if (!Text(val, read.principal) || read.principal.empty()) {
+				return SessionStateRead::UNREADABLE;
+			}
+			owned = true;
 		} else if (name == "use") {
 			if (!duckdb_yyjson::yyjson_is_obj(val)) {
 				return SessionStateRead::UNREADABLE;
@@ -204,12 +242,10 @@ SessionStateRead DecodeSessionState(const std::string &value, SessionState &out)
 			duckdb_yyjson::yyjson_obj_iter use;
 			duckdb_yyjson::yyjson_obj_iter_init(val, &use);
 			while (auto *part = duckdb_yyjson::yyjson_obj_iter_next(&use)) {
-				std::string part_name = duckdb_yyjson::yyjson_get_str(part);
-				auto *part_val = duckdb_yyjson::yyjson_obj_iter_get_val(part);
-				if (!duckdb_yyjson::yyjson_is_str(part_val)) {
+				std::string part_name, text_val;
+				if (!Text(part, part_name) || !Text(duckdb_yyjson::yyjson_obj_iter_get_val(part), text_val)) {
 					return SessionStateRead::UNREADABLE;
 				}
-				std::string text_val = duckdb_yyjson::yyjson_get_str(part_val);
 				if (part_name == "catalog") {
 					read.use_catalog = text_val;
 				} else if (part_name == "schema") {
@@ -225,12 +261,22 @@ SessionStateRead DecodeSessionState(const std::string &value, SessionState &out)
 			duckdb_yyjson::yyjson_obj_iter set;
 			duckdb_yyjson::yyjson_obj_iter_init(val, &set);
 			while (auto *setting = duckdb_yyjson::yyjson_obj_iter_next(&set)) {
-				auto *setting_val = duckdb_yyjson::yyjson_obj_iter_get_val(setting);
-				if (!duckdb_yyjson::yyjson_is_str(setting_val)) {
+				std::string setting_name, setting_val;
+				if (!Text(setting, setting_name) ||
+				    !Text(duckdb_yyjson::yyjson_obj_iter_get_val(setting), setting_val)) {
 					return SessionStateRead::UNREADABLE;
 				}
-				read.settings.emplace_back(duckdb_yyjson::yyjson_get_str(setting),
-				                           duckdb_yyjson::yyjson_get_str(setting_val));
+				// only the list's settings, each once: a restore runs a statement per item, so the items are bounded
+				auto known = PortableSetting(setting_name);
+				if (!known) {
+					return SessionStateRead::UNREADABLE;
+				}
+				for (auto &seen : read.settings) {
+					if (seen.first == known) {
+						return SessionStateRead::UNREADABLE;
+					}
+				}
+				read.settings.emplace_back(known, setting_val);
 			}
 		} else if (name == "pinned") {
 			if (!duckdb_yyjson::yyjson_is_arr(val)) {
@@ -239,10 +285,10 @@ SessionStateRead DecodeSessionState(const std::string &value, SessionState &out)
 			duckdb_yyjson::yyjson_arr_iter pins;
 			duckdb_yyjson::yyjson_arr_iter_init(val, &pins);
 			while (auto *pin = duckdb_yyjson::yyjson_arr_iter_next(&pins)) {
-				if (!duckdb_yyjson::yyjson_is_str(pin)) {
+				std::string pin_name;
+				if (!Text(pin, pin_name)) {
 					return SessionStateRead::UNREADABLE;
 				}
-				std::string pin_name = duckdb_yyjson::yyjson_get_str(pin);
 				// a reason this build does not know still pins: the session held something it cannot carry
 				read.pinned.push_back(IsKnownPin(pin_name) ? pin_name : "context");
 			}
@@ -250,7 +296,7 @@ SessionStateRead DecodeSessionState(const std::string &value, SessionState &out)
 			return SessionStateRead::UNREADABLE;
 		}
 	}
-	if (!versioned) {
+	if (!versioned || !owned) {
 		return SessionStateRead::UNREADABLE;
 	}
 	out = std::move(read);

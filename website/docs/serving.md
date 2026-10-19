@@ -663,7 +663,8 @@ USE sales;             -- the role's MAIN catalog: back where the session began
 
 Every decision the node makes about a principal is one **event**: a statement admitted or refused
 (with the objects it touched and the capability judged for each), a management statement, a session
-opened / closed / refused, an ingest completed with its row count, a Flight ticket issued / redeemed /
+opened / closed / refused / moved / refused a move (spec 135: the items it carried or lost, by name - never a value,
+reason codes `session_pinned`, `session_unrestorable`, `session_unreadable`), an ingest completed with its row count, a Flight ticket issued / redeemed /
 expired / presented by somebody else, a Flight result stream ended (consumed, cancelled, superseded,
 capped, failed - with the rows that went out) or an ingest its client cancelled, the password
 handshake, a policy reload or source error, a keys refresh. An event carries who (subject, roles - never a claim value), where (`door`, the session's ops
@@ -694,7 +695,8 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
   never slowed by its own audit.
 - **Metrics** - `acl_metrics()` answers every counter and gauge with its attributes as JSON:
   `acl.decisions{verdict,kind,door,statement}`, `acl.denials{reason_code,door}`,
-  `acl.sessions.opened/refused/closed`, `acl.sessions.live`, `acl.door.handshakes`,
+  `acl.sessions.opened/refused/closed`, `acl.sessions.moved/move_refused` (spec 135), `acl.sessions.live`,
+  `acl.door.handshakes`,
   `acl.door.tickets{outcome}`, `acl.door.streams{door,outcome}` (result streams ended, by outcome,
   plus `ingest_cancelled` - the stream in the other direction) and the gauge
   `acl.door.streams_open{door}` (result streams pulling right now) - spec 070,
@@ -798,7 +800,8 @@ denied to a principal.
 | client: `acl: a transaction needs a connection-long session ...` / `acl: a session option needs a connection-long session ...` | the client does not echo the session cookie (ADBC: enable the cookie middleware) |
 | client: `no access to object ...` | a physical name, a name outside the grant, or another session's temp table |
 | client: `acl: the session moved to another node and lost its ...` / `... could not restore its ...` | the client's node went away (or its session died there) while the session held a transaction, temp tables or the view-as mode, or its `USE` / a setting no longer passes; the statement did not run, the next one works on a new session (spec 135) |
-| quack client: `acl: this connection is not known on this node - connect again` | the connection's node restarted or another node got the request; ATTACH again (hugr_node's federation client reconnects by itself) |
+| quack client: `acl: this connection is not known on this node - connect again` / `acl: this connection's lease ran out on this node - connect again` | the connection's node restarted, another node got the request, or its heartbeat lease ran out; ATTACH again (hugr_node's federation client reconnects by itself) |
+| client: `acl: this connection's session viewed the catalog as a role and is gone - connect again` | a session in the view-as mode ended (here, or on the node it moved from) and the client only SET the mode; declare it with `x-acl-view-as`, or open a new connection |
 | client: `EXPLAIN needs the explain capability` | grant `explain` on the MAIN catalog grant, by name |
 | client: `... is not permitted under ACL: only the client-local rendering settings ...` | `SET` of anything but `TimeZone`/`Calendar` |
 | client: `SET "<name>" needs a session of the client's own ...` | a `SET` through a gateway prefix; give the client a session |

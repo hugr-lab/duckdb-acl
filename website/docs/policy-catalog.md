@@ -297,7 +297,8 @@ Nodes are identical and share nothing but the catalog:
   `acl_version_check_interval`.
 - Sessions are per node: a client's session exists only on the node that opened it, so a front that
   routes must keep a client on one node (the Flight door's session cookie, quack's per-connection
-  binding). There is no shared session backend, by decision.
+  binding). There is no shared session backend, by decision. A Flight session whose node goes away moves:
+  its `USE` and settings ride a cookie, and what cannot move errors once (spec 135, see deployment).
 - Issuer keys are re-read per node (`acl_jwks_refresh_interval`), so an IdP rotation reaches each
   node independently; a `kid` a node has not seen triggers its own re-read. A secret's change reaches
   each node at its next read through the service's cache, with no policy write.

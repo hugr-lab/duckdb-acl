@@ -499,13 +499,36 @@ echo "$got" | grep -q "no access to object" || fail "the dropped temp still reso
 # --- a session moves between nodes (spec 135) -----------------------------------------------------
 # One node plays both: killing every session here, while each client keeps its cookies, leaves a cookie this node
 # does not know - a client re-placed on another node (or one whose session died here). The session-state cookie
-# carries what the session held: a context that is not pinned is restored, each item judged again as if the client
-# sent it; a pinned one (a transaction, temp tables) is refused once, and the connection works on.
-kill_sessions() {
-	echo "SELECT '$1=' || count(*) AS k FROM (SELECT acl_session_kill(id) AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\\s*\"([^\"]+)\"', 1)) AS id)) WHERE k;" >&3
-	for _ in $(seq 1 40); do grep -q "$1=" "$TMP/server.log" && return 0; sleep 0.25; done
-	fail "the server did not kill the sessions ($1)"
+# carries what the session held, for its own principal only: a context that is not pinned is restored, each item
+# judged again as if the client sent it; what cannot move (a transaction, temp tables) refuses the call once, and a
+# lost transaction stays aborted until ROLLBACK - nothing of it runs in autocommit.
+server_says() { # <tag> <sql>: the server's answer to one statement, read back from its log
+	echo "SELECT '$1=' || ($2) AS said;" >&3
+	for _ in $(seq 1 40); do grep -q "$1=" "$TMP/server.log" && break; sleep 0.25; done
+	sed -n "s/.*$1=\([^│|]*\).*/\1/p" "$TMP/server.log" | tail -1 | tr -d ' '
 }
+kill_sessions() {
+	local killed
+	killed="$(server_says "$1" "SELECT count(*) FROM (SELECT acl_session_kill(id) AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\\s*\"([^\"]+)\"', 1)) AS id)) WHERE k")"
+	[ "${killed:-0}" -ge 1 ] || fail "no session was killed ($1): $killed"
+}
+# reforge <jar> <python>: rewrite the jar's state cookie (a dict `s`) - what another node, or a tampering client,
+# would send
+reforge() {
+	python3 - "$1" "$2" <<'PY'
+import base64, json, sys
+path, change = sys.argv[1], sys.argv[2]
+jar = dict(p.split("=", 1) for p in open(path).read().split("; ") if "=" in p)
+raw = jar["acl_session_state"]
+s = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+exec(change)
+jar["acl_session_state"] = base64.urlsafe_b64encode(json.dumps(s, separators=(",", ":")).encode()).decode().rstrip("=")
+open(path, "w").write("; ".join(f"{k}={v}" for k, v in jar.items()))
+PY
+}
+# the moves' events are recorded at level all (a refusal at any level)
+echo "SET GLOBAL acl_audit_level = 'all';" >&3
+
 MJ="$TMP/movejar"
 ACL_COOKIE_JAR="$MJ" ask "SELECT 1" >/dev/null
 got="$(ACL_COOKIE_JAR="$MJ" ask "@update:CREATE TABLE stage.moved_t AS SELECT 42 AS x")"
@@ -523,17 +546,41 @@ echo "$got" | grep -q "'x': \[42\]" || fail "a moved session did not keep its US
 # the zone a TIMESTAMPTZ is rendered in rides its Arrow type (current_setting is the door's, never a principal's)
 got="$(ACL_SHOW_SCHEMA=1 ACL_COOKIE_JAR="$MJ" ask "SELECT TIMESTAMPTZ '2026-01-01 00:00:00+00' AS t")"
 echo "$got" | grep -q "tz=Asia/Tokyo" || fail "a moved session did not keep its TimeZone: $got"
-# a forged state - a USE of a catalog the principal does not hold - is judged like the client's own USE: refused once
+# the move is audited by the items' names, never their values
+said="$(server_says movednamed "SELECT count(*) FROM acl_audit_events() WHERE kind = 'session' AND detail = 'moved' AND reason = 'USE, TimeZone'")"
+[ "${said:-0}" -ge 1 ] || fail "the moved event does not name what it carried: $said"
+said="$(server_says movedvalues "SELECT count(*) FROM acl_audit_events() WHERE kind = 'session' AND detail IN ('moved', 'move_refused') AND (reason ILIKE '%tokyo%' OR reason ILIKE '%stage%' OR reason ILIKE '%secret_cat%')")"
+[ "${said:-1}" = 0 ] || fail "a move's event carries a value: $said"
+
+# another principal's token with this jar (a stolen or shared jar): nothing of the state carries, as on a swap
+kill_sessions moved2
+got="$(ACL_COOKIE_JAR="$MJ" ask 'SELECT x FROM moved_t' "$GLOBEX")"
+echo "$got" | grep -q "no access to object" || fail "another principal's call inherited the jar's USE: $got"
+
+# a forged USE - a catalog the principal does not hold - is judged like the client's own USE: refused, once
 FJ="$TMP/forgedjar"
 ACL_COOKIE_JAR="$FJ" ask "SELECT 1" >/dev/null
-forged="$(python3 -c 'import base64, json; print(base64.urlsafe_b64encode(json.dumps({"v": 1, "use": {"catalog": "secret_cat", "schema": ""}}).encode()).decode().rstrip("="))')"
-printf '; acl_session_state=%s' "$forged" >>"$FJ"
+ACL_COOKIE_JAR="$FJ" ask 'USE c.stage' >/dev/null
+reforge "$FJ" 's["use"] = {"catalog": "secret_cat", "schema": ""}'
 kill_sessions forged1
 got="$(ACL_COOKIE_JAR="$FJ" ask "SELECT 1 AS one")"
 echo "$got" | grep -q "the session moved to another node and could not restore its USE" ||
 	fail "a forged USE was not refused at the move: $got"
+said="$(server_says forgedwhy "SELECT count(*) FROM acl_audit_events() WHERE kind = 'statement' AND reason LIKE '%secret_cat%is no catalog of the principal%'")"
+[ "${said:-0}" -ge 1 ] || fail "the forged USE was not judged as the principal's own USE: $said"
 got="$(ACL_COOKIE_JAR="$FJ" ask "SELECT 1 AS one")"
 echo "$got" | grep -q "'one': \[1\]" || fail "the connection did not work on after the refused move: $got"
+# a forged setting outside the client-local list reads as unreadable: refused once, never restored
+SJ="$TMP/setjar"
+ACL_COOKIE_JAR="$SJ" ask "SELECT 1" >/dev/null
+ACL_COOKIE_JAR="$SJ" ask "SET TimeZone = 'UTC'" >/dev/null
+reforge "$SJ" 's["set"] = {"search_path": "memory.main"}'
+kill_sessions forged2
+got="$(ACL_COOKIE_JAR="$SJ" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "the session moved to another node and lost its session context" ||
+	fail "a setting outside the list was not refused: $got"
+got="$(ACL_COOKIE_JAR="$SJ" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "'one': \[1\]" || fail "the connection did not work on after the unreadable state: $got"
 # a garbled state reads as unreadable: refused once, never read partly
 GJ="$TMP/garbledjar"
 ACL_COOKIE_JAR="$GJ" ask "SELECT 1" >/dev/null
@@ -542,19 +589,42 @@ kill_sessions garbled1
 got="$(ACL_COOKIE_JAR="$GJ" ask "SELECT 1 AS one")"
 echo "$got" | grep -q "the session moved to another node and lost its session context" ||
 	fail "an unreadable state was not refused: $got"
-# an open transaction pins: the next call is refused once, naming it - never run in autocommit
+got="$(ACL_COOKIE_JAR="$GJ" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "'one': \[1\]" || fail "the connection did not work on after the garbled state: $got"
+# a carried setting the new node no longer admits (a session's raise above the node's bound): refused once
+RJ="$TMP/rowsjar"
+ACL_COOKIE_JAR="$RJ" ask "SELECT 1" >/dev/null
+got="$(ACL_COOKIE_JAR="$RJ" ask "SET acl_metadata_max_rows = 500")"
+echo "$got" | grep -qi "error\|denied" && fail "lowering acl_metadata_max_rows on the session failed: $got"
+echo "SET GLOBAL acl_metadata_max_rows = 100;" >&3
+kill_sessions rows1
+got="$(ACL_COOKIE_JAR="$RJ" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "the session moved to another node and could not restore its acl_metadata_max_rows" ||
+	fail "a setting the node no longer admits was not refused at the move: $got"
+echo "SET GLOBAL acl_metadata_max_rows = 1000000;" >&3
+
+# an open transaction pins: refused once, then aborted until ROLLBACK - never run in autocommit
 PJ="$TMP/pinjar"
 ACL_COOKIE_JAR="$PJ" ask "SELECT 1" >/dev/null
+ACL_COOKIE_JAR="$PJ" ask 'USE c.stage' >/dev/null
 got="$(ACL_COOKIE_JAR="$PJ" ask "@update:BEGIN TRANSACTION")"
 echo "$got" | grep -q "'count':" || fail "BEGIN for the pin check failed: $got"
+got="$(ACL_COOKIE_JAR="$PJ" ask "@update:INSERT INTO moved_t VALUES (1)")"
+echo "$got" | grep -q "'count':" || fail "the first write of the transaction failed: $got"
 kill_sessions pinned1
-got="$(ACL_COOKIE_JAR="$PJ" ask "SELECT 1 AS one")"
-echo "$got" | grep -q "the session moved to another node and lost its open transaction; the statement did not run" ||
+got="$(ACL_COOKIE_JAR="$PJ" ask "@update:INSERT INTO moved_t VALUES (2)")"
+echo "$got" | grep -q "the session moved to another node and lost its open transaction (ROLLBACK to go on" ||
 	fail "a moved session in a transaction was not refused once: $got"
-got="$(ACL_COOKIE_JAR="$PJ" ask "SELECT 1 AS one")"
-echo "$got" | grep -q "'one': \[1\]" || fail "the connection did not work on after the pinned move: $got"
-grep -q "acl_session_state=" "$PJ" && fail "the refused move left the state cookie in place: $(cat "$PJ")"
-# a temp table pins too
+grep -q "acl_session_state=" "$PJ" || fail "the refused move dropped the pin from the cookie: $(cat "$PJ")"
+got="$(ACL_COOKIE_JAR="$PJ" ask "@update:INSERT INTO moved_t VALUES (3)")"
+echo "$got" | grep -q "transaction is aborted" || fail "a write after the lost transaction ran in autocommit: $got"
+got="$(ACL_COOKIE_JAR="$PJ" ask "@update:ROLLBACK")"
+echo "$got" | grep -q "'count':" || fail "ROLLBACK of the lost transaction failed: $got"
+got="$(ACL_COOKIE_JAR="$PJ" ask 'SELECT count(*) AS n FROM moved_t WHERE x IN (1, 2, 3)')"
+echo "$got" | grep -q "'n': \[0\]" || fail "a write of the lost transaction was committed: $got"
+grep -q "acl_session_state=" "$PJ" && grep -q "transaction" <<<"$(python3 -c 'import base64,sys; v=dict(p.split("=",1) for p in open(sys.argv[1]).read().split("; ") if "=" in p).get("acl_session_state",""); print(base64.urlsafe_b64decode(v+"="*(-len(v)%4)).decode() if v else "")' "$PJ")" &&
+	fail "the pin outlived the ROLLBACK: $(cat "$PJ")"
+# a temp table pins too: refused once, then the connection works on
 TPJ="$TMP/temppinjar"
 ACL_COOKIE_JAR="$TPJ" ask "SELECT 1" >/dev/null
 got="$(ACL_COOKIE_JAR="$TPJ" ask "@update:CREATE TEMP TABLE pinned_tmp(id INTEGER)")"
@@ -563,13 +633,44 @@ kill_sessions pinned2
 got="$(ACL_COOKIE_JAR="$TPJ" ask "SELECT 1 AS one")"
 echo "$got" | grep -q "the session moved to another node and lost its temp tables" ||
 	fail "a moved session with a temp table was not refused once: $got"
-# and the audit counted each kind
-echo "SELECT 'movecount=' || (SELECT coalesce(sum(value), 0) FROM acl_metrics() WHERE name = 'acl.sessions.moved') ||
-	'/' || (SELECT coalesce(sum(value), 0) FROM acl_metrics() WHERE name = 'acl.sessions.move_refused') AS m;" >&3
-for _ in $(seq 1 40); do grep -q "movecount=" "$TMP/server.log" && break; sleep 0.25; done
-counts="$(sed -n 's/.*movecount=\([0-9]*\)\/\([0-9]*\).*/\1 \2/p' "$TMP/server.log" | tail -1)"
-[ "${counts%% *}" -ge 1 ] && [ "${counts##* }" -ge 4 ] ||
+got="$(ACL_COOKIE_JAR="$TPJ" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "'one': \[1\]" || fail "the connection did not work on after the temp pin: $got"
+# a view-as pin without the call declaring the mode is never seated afresh (the 120.3 addendum's rule)
+VJ="$TMP/viewasjar"
+ACL_COOKIE_JAR="$VJ" ask "SELECT 1" >/dev/null
+ACL_COOKIE_JAR="$VJ" ask "SET TimeZone = 'UTC'" >/dev/null
+reforge "$VJ" 's["pinned"] = ["view_as"]'
+kill_sessions viewas1
+for attempt in 1 2; do
+	got="$(ACL_COOKIE_JAR="$VJ" ask "SELECT 1 AS one")"
+	echo "$got" | grep -q "viewed the catalog as a role and is gone - connect again" ||
+		fail "a moved view-as session was seated (attempt $attempt): $got"
+done
+# a drain refuses the move like any new session - and the state survives it, restored after the resume
+DRJ="$TMP/drainjar"
+ACL_COOKIE_JAR="$DRJ" ask "SELECT 1" >/dev/null
+ACL_COOKIE_JAR="$DRJ" ask 'USE c.stage' >/dev/null
+kill_sessions drain1
+server_says drained "SELECT count(*) FROM (SELECT 1) WHERE (acl_drain()) IS NOT NULL" >/dev/null
+got="$(ACL_COOKIE_JAR="$DRJ" ask 'SELECT x FROM moved_t')"
+echo "$got" | grep -q "draining" || fail "a move into a draining node was not refused as any new session: $got"
+server_says resumed "SELECT count(*) FROM (SELECT 1) WHERE (acl_resume()::VARCHAR) IS NOT NULL" >/dev/null
+got="$(ACL_COOKIE_JAR="$DRJ" ask 'SELECT x FROM moved_t')"
+echo "$got" | grep -q "'x': \[42\]" || fail "the state did not survive the drain's refusal: $got"
+# a session that died idle here takes the same path (the cookie's binding still names it)
+IDJ="$TMP/idlejar"
+ACL_COOKIE_JAR="$IDJ" ask "SELECT 1" >/dev/null
+ACL_COOKIE_JAR="$IDJ" ask 'USE c.stage' >/dev/null
+echo "SET GLOBAL acl_session_idle_timeout = 1;" >&3
+sleep 3
+got="$(ACL_COOKIE_JAR="$IDJ" ask 'SELECT x FROM moved_t')"
+echo "SET GLOBAL acl_session_idle_timeout = 900;" >&3
+echo "$got" | grep -q "'x': \[42\]" || fail "a session that died idle did not keep its USE: $got"
+# and the counters count each kind
+counts="$(server_says movecount "SELECT coalesce(sum(value) FILTER (WHERE name = 'acl.sessions.moved'), 0) || '/' || coalesce(sum(value) FILTER (WHERE name = 'acl.sessions.move_refused'), 0) FROM acl_metrics()")"
+[ "${counts%%/*}" -ge 3 ] && [ "${counts##*/}" -ge 6 ] ||
 	fail "the moves were not counted (moved / move_refused): $counts"
+echo "SET GLOBAL acl_audit_level = 'decisions';" >&3
 
 # (spec 096's node-group refusal at the door - UNAVAILABLE, the swap kept - is the platform part's: it moved to
 # hugr-node with the code, duckdb-acl spec 127)

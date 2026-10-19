@@ -807,17 +807,22 @@ repository builds this acl in (`acl_sources.cmake`, `LoadAclCore`, `ACL_EMBEDDED
 registers its part; this repository is the open node (tag `pre-platform-split` = the last state with the part in).
 
 **Spec 135 — a session moves between nodes**: the Flight door sets `acl_session_state` (base64url JSON, codec
-`acl_session_state.{hpp,cpp}`, ≤ 3 KiB, else pinned `context`) - the session's USE (spec 114) and the client's own
-spec 068 SETs (scope LOCAL only), plus `pinned` (open transaction, temp table, view-as) - from `UnderSession`'s end by
-`ServerCallContext::AddHeader` (a middleware's headers go out BEFORE the handler runs). A cookie this node does not
-know (`SessionFor`, not a swap): no state = a new session as before; pinned / unreadable = the new session bound, the
-call refused once (`Invalid`, "the session moved to another node and lost its ..."), the state cleared; otherwise the
-context restored through the client's own paths (`SET schema = '<cat.schema>'` / `SET acl_use_schema`, each `SET`,
-under the session's prefix) - an item that does not restore refuses once ("could not restore its USE"). A declared
-`x-acl-view-as` answers the view-as pin. Events `session` `moved` / `move_refused`, counters
-`acl.sessions.moved{door}` / `.move_refused{door,reason_code}`. quack (CONNECT authenticates; no move by itself):
-an unknown connection id answers `acl: this connection is not known on this node - connect again` (a `sync.py`
-hunk). Tests: `test/cpp/test_acl_session_state.cpp`, `test/e2e/flight/run.sh` (kill + cookie jar),
+`acl_session_state.{hpp,cpp}`, ≤ 1 KiB written - past it the principal + pins + `context` - ≤ 4 KiB read): a tag of
+the principal's fingerprint (`p`, sha-256, required), the session's USE (spec 114), the client's own spec 068 SETs
+(LOCAL scope, not the option's default - `PORTABLE_SETTINGS` is THE list, `ClientSettingAllowed` reads it) and
+`pinned` (`!IsAutoCommit()`, a temp table, view-as) - from `UnderSession`'s end (and after a body that throws) by
+`ServerCallContext::AddHeader` (a middleware's headers go out BEFORE the handler runs); nothing is sent when the
+session vanished mid-call, ran nothing here, or its `exec` is busy (`try_lock`). A cookie this node does not know
+(`SessionFor`, not a swap): another principal's tag = nothing carried; an undeclared view-as pin = never seated
+(`SessionMarkViewAsEnded`, the 120.3 rule on every node); otherwise seated, and after `DeclaredViewAs`
+`TakeOverState` restores the portable part through the client's own paths (`SET schema` / `SET acl_use_schema`, each
+`SET`, under the session's prefix - pinned or not), begins + `ValidChecker::Invalidate`s a lost transaction (aborted
+until ROLLBACK, COMMIT commits nothing; `SessionConn::moved_txn` lets `EndTransaction` end it whatever id), and
+refuses the call once naming everything not carried ("the session moved to another node and lost its … / could not
+restore its …"). Events `session` `moved` (only when carried, names never values) / `move_refused`
+(`session_pinned|unrestorable|unreadable`), counters `acl.sessions.moved{door}` / `.move_refused{door,reason_code}`.
+quack (CONNECT authenticates): an unknown id / a lapsed lease answer `… - connect again` (two `sync.py` hunks).
+Tests: `test/cpp/test_acl_session_state.cpp`, `test/e2e/flight/run.sh` (kill + a real cookie jar + `reforge`),
 `test_acl_quack_embed.cpp`.
 
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two

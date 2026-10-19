@@ -506,6 +506,18 @@ useless outside this instance".
 under a per-session lock; temp tables are "per-connection by construction, so no principal can
 reach another session's temp through any surface"; duckdb reclaims everything when the session ends.
 A cookie-less call gets a per-call session closed on the way out.
+- Flight (spec 135): the **session-state cookie** `acl_session_state` is the client's own context, not a
+  credential. It carries the session's `USE`, the client-local settings it SET, why the session cannot move (an
+  open transaction, a temp table, the view-as mode) and a tag of its principal. It is unsigned on purpose: it
+  grants nothing.
+  - On a node that does not know the session, every item is judged again as if the client sent it now: a `USE` of
+    a catalog the principal does not hold is refused, and a setting goes through the same allowlist and validators
+    as a `SET`.
+  - The decoder admits only spec 068's eight settings, each once, within 4 KiB: anything else is refused, never
+    read partly.
+  - A state of another principal (a stolen or shared jar) carries nothing.
+  - Dropping a pin loses only the client's own transaction or temp tables. A session that was in the view-as mode
+    is not seated afresh, unless the call declares the mode.
 
 **Bounds** (spec 044): a session dies at idle (`acl_session_idle_timeout`, default 900 s) or - under
 `every_use` - at `exp`; `acl_max_sessions` (default 1000) is a cap at which "a new session is

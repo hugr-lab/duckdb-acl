@@ -1,4 +1,5 @@
 #include "acl_policy.hpp"
+#include "acl_session_state.hpp"
 #include "acl_lineage.hpp"
 
 #include "acl_audit_pipeline.hpp"
@@ -1167,9 +1168,9 @@ bool ClientSettingAllowed(const string &name) {
 	// spec 107 adds the client's lineage context (the job and the external run a statement is a step
 	// of): metadata of the lineage event, nothing a statement reads or costs
 	// spec 119: a session may lower the metadata row bound for itself (the setting refuses a raise)
-	return StringUtil::CIEquals(name, "TimeZone") || StringUtil::CIEquals(name, "Calendar") ||
-	       StringUtil::CIEquals(name, "acl_metadata_max_rows") || StringUtil::CIEquals(name, "acl_correlation_id") ||
-	       StringUtil::CIEquals(name, "acl_traceparent") || LineageClientSetting(name);
+	// spec 135: the list is the session state's own (PORTABLE_SETTINGS): what a client may SET is what a moved
+	// session carries, one list for both
+	return PortableSetting(name) != nullptr;
 }
 
 bool PolicyStore::SetDraining(bool value) {
@@ -1240,6 +1241,11 @@ idx_t PolicyStore::SessionCloseAll() {
 	sessions.clear();
 	session_bindings.clear();
 	return closed;
+}
+
+void PolicyStore::SessionMarkViewAsEnded(const string &external_id) {
+	lock_guard<mutex> guard(lock);
+	view_as_ended[external_id] = NowSeconds();
 }
 
 bool PolicyStore::SessionViewAsEnded(const string &external_id) {

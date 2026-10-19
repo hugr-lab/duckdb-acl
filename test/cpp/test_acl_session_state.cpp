@@ -9,6 +9,8 @@
 using namespace acl_test;
 using duckdb::acl::DecodeSessionState;
 using duckdb::acl::EncodeSessionState;
+using duckdb::acl::PORTABLE_SETTINGS;
+using duckdb::acl::PortableSetting;
 using duckdb::acl::SESSION_STATE_MAX_BYTES;
 using duckdb::acl::SessionState;
 using duckdb::acl::SessionStateLost;
@@ -48,6 +50,7 @@ void RoundTrip() {
 	Check(Read("", read) == SessionStateRead::ABSENT, "no value reads as absent");
 
 	SessionState state;
+	state.principal = "0123456789abcdef";
 	state.use_catalog = "sales";
 	state.use_schema = "\"eu.west\"";
 	state.settings = {{"TimeZone", "Europe/Berlin"}, {"acl_correlation_id", "req \"1\"\n\\x"}};
@@ -65,14 +68,25 @@ void RoundTrip() {
 
 void Bound() {
 	SessionState big;
+	big.principal = "0123456789abcdef";
 	big.settings = {{"acl_traceparent", std::string(SESSION_STATE_MAX_BYTES, 'x')}};
+	big.pinned = {"transaction", "view_as"};
 	auto value = EncodeSessionState(big);
 	SessionState read;
 	Check(value.size() <= SESSION_STATE_MAX_BYTES, "a state past the bound is never written whole");
-	Check(Read(value, read) == SessionStateRead::OK && read.pinned == std::vector<std::string> {"context"} &&
-	          read.settings.empty(),
-	      "past the bound the state is pinned 'context', with nothing of it carried partly");
-	Check(Read(std::string(5000, 'A'), read) == SessionStateRead::UNREADABLE, "an oversized input is not read");
+	Check(Read(value, read) == SessionStateRead::OK &&
+	          read.pinned == std::vector<std::string> {"transaction", "view_as", "context"} && read.settings.empty() &&
+	          read.principal == big.principal,
+	      "past the bound the state keeps its principal and its pins, adds 'context', and carries nothing partly");
+	// one setting short of the bound is carried whole
+	SessionState fits;
+	fits.principal = big.principal;
+	fits.settings = {{"acl_traceparent", std::string(600, 'y')}};
+	Check(Read(EncodeSessionState(fits), read) == SessionStateRead::OK && read == fits,
+	      "a state within the bound whole");
+	// a VALID state past the input bound is not read: the bound is checked before anything else
+	std::string huge = "{\"v\":1,\"p\":\"x\",\"set\":{\"TimeZone\":\"" + std::string(4000, 'z') + "\"}}";
+	Check(Read(B64Url(huge), read) == SessionStateRead::UNREADABLE, "a valid state past 4096 bytes is not read");
 }
 
 void Malformed() {
@@ -81,6 +95,13 @@ void Malformed() {
 		bool refused = Read(value, read) == SessionStateRead::UNREADABLE && read.Empty();
 		Check(refused, what + " reads as unreadable, with nothing taken from it");
 	};
+	unreadable(B64Url("{\"v\":1}"), "no principal");
+	unreadable(B64Url("{\"v\":1,\"p\":\"\"}"), "an empty principal");
+	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"set\":{\"search_path\":\"x\"}}"),
+	           "a setting outside the client-local list (search_path)");
+	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"set\":{\"TimeZone\":\"UTC\",\"timezone\":\"UTC\"}}"),
+	           "a setting twice (a restore runs one statement per item: bounded by the list)");
+	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"set\":{\"TimeZone\":\"UTC\\u0000x\"}}"), "a NUL inside a value");
 	unreadable("not*base64", "a character outside base64url");
 	unreadable("eyJ2Ijox=", "padding");
 	unreadable("A", "a length base64 cannot end on");
@@ -95,12 +116,28 @@ void Malformed() {
 	unreadable(B64Url("{\"v\":1,\"set\":{\"TimeZone\":3}}"), "a setting's value not a string");
 	unreadable(B64Url("{\"v\":1,\"pinned\":\"transaction\"}"), "pinned not an array");
 	unreadable(B64Url("{\"v\":1,\"pinned\":[1]}"), "a pin not a string");
-	unreadable(B64Url("{\"v\":1,\"handle\":\"x\"}"), "a key this build does not write");
+	unreadable(B64Url("{\"v\":1,\"p\":\"t\",\"handle\":\"x\"}"), "a key this build does not write");
 
-	Check(Read(B64Url("{\"v\":1,\"pinned\":[\"lock\"]}"), read) == SessionStateRead::OK &&
+	Check(Read(B64Url("{\"v\":1,\"p\":\"t\",\"pinned\":[\"lock\"]}"), read) == SessionStateRead::OK &&
 	          read.pinned == std::vector<std::string> {"context"},
 	      "a pin this build does not know still pins, as 'context'");
-	Check(Read(B64Url("{\"v\":1}"), read) == SessionStateRead::OK && read.Empty(), "a bare version is an empty state");
+	Check(Read(B64Url("{\"v\":1,\"p\":\"t\"}"), read) == SessionStateRead::OK && read.Empty(),
+	      "a principal alone is an empty state");
+	Check(Read(B64Url("{\"v\":1,\"p\":\"t\",\"set\":{\"timezone\":\"UTC\"}}"), read) == SessionStateRead::OK &&
+	          read.settings.size() == 1 && read.settings[0].first == "TimeZone",
+	      "a listed setting in any case reads in the list's spelling");
+}
+
+void OneList() {
+	// what a moved session carries is exactly what a client may SET: ClientSettingAllowed reads this list
+	Check(sizeof(PORTABLE_SETTINGS) / sizeof(PORTABLE_SETTINGS[0]) == 8, "eight client-local settings");
+	for (auto name : {"TimeZone", "calendar", "ACL_METADATA_MAX_ROWS", "acl_correlation_id", "acl_traceparent",
+	                  "acl_lineage_parent", "acl_lineage_root_parent", "acl_lineage_job"}) {
+		Check(PortableSetting(name) != nullptr, std::string(name) + " is on the list");
+	}
+	for (auto name : {"search_path", "schema", "acl_use_schema", "threads", "memory_limit", "TimeZoneX", ""}) {
+		Check(PortableSetting(name) == nullptr, "'" + std::string(name) + "' is not");
+	}
 }
 
 void Cookie() {
@@ -117,6 +154,7 @@ int main() {
 		Scenario("round trip", RoundTrip);
 		Scenario("bound", Bound);
 		Scenario("malformed", Malformed);
+		Scenario("one list", OneList);
 		Scenario("cookie", Cookie);
 	});
 }
