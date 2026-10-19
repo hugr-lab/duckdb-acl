@@ -227,3 +227,13 @@ query II
 SELECT max_sessions, batch_bytes FROM acl_resource_groups() WHERE "group" = 'plain';
 ----
 5	1048576
+
+# spec 096 addendum: the load report says whether the node's group is the policy's default - an open node has no
+# group, so a default group of the policy is never its own
+statement ok
+ACL ADMIN ALTER RESOURCE GROUP plain SET DEFAULT;
+
+query I
+SELECT acl_node_load() LIKE '%"group":null,"group_known":true,"group_default":false,%';
+----
+true

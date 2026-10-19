@@ -120,7 +120,7 @@ columns	VARCHAR[]
 query I
 ACL ROLE "root" SELECT count(*) FROM information_schema.columns WHERE table_catalog = 'platform' AND table_schema = 'main' AND table_name NOT IN ('cluster_items', 'cluster_effective', 'drift');
 ----
-239
+240
 
 foreach view catalogs relations relation_columns schemas functions function_columns references reference_columns keys roles role_claims grants schema_grants object_grants grant_columns admins platform_grants issuers clients role_mappings jwks_cache function_categories function_category_members function_grants function_status resource_groups role_resource_groups catalog_schema sessions node_load node_doors node_streams drain lineage_status audit_events
 
@@ -205,10 +205,10 @@ ACL ROLE "root" SELECT build, build_min_reader, catalog, min_reader, mode FROM p
 
 # --- the node views (observe) -------------------------------------------------------------------------
 
-query TTTT
-ACL ROLE "obs" SELECT draining, sessions_live, sessions_max, typeof(sessions_by_door) FROM platform.node_load;
+query TTTTTT
+ACL ROLE "obs" SELECT draining, group_known, group_default, sessions_live, sessions_max, typeof(sessions_by_door) FROM platform.node_load;
 ----
-false	0	1000	MAP(VARCHAR, BIGINT)
+false	true	false	0	1000	MAP(VARCHAR, BIGINT)
 
 query TT
 ACL ROLE "obs" SELECT draining, sessions FROM platform.drain;

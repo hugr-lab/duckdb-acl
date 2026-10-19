@@ -157,6 +157,7 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 	// does not answer reads as "unknown", never as its own text
 	auto group = store.NodeGroup();
 	bool group_known = group.empty();
+	bool group_default = false;
 	auto label = NodeLabel(db); // spec 134: the name the node's sessions carry, for a front to match
 	string target = "null";
 	auto now = std::chrono::steady_clock::now();
@@ -168,6 +169,7 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 		if (policy.valid && policy.group == group && policy.writes == writes &&
 		    now - policy.at < std::chrono::seconds(2)) {
 			group_known = policy.group_known;
+			group_default = policy.group_default;
 			target = policy.target;
 			cached = true;
 		}
@@ -180,13 +182,17 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 			group_known = false;
 		}
 		try {
+			group_default = group_known && store.NodeGroupDefault();
+		} catch (std::exception &) {
+		}
+		try {
 			if (store.node_traits.config_target) { // spec 126: an open node has no profile to target
 				target = std::to_string(store.node_traits.config_target());
 			}
 		} catch (std::exception &) {
 		}
 		lock_guard<mutex> guard(store.lock);
-		store.node_load_policy = {now, group, group_known, target, writes, true};
+		store.node_load_policy = {now, group, group_known, group_default, target, writes, true};
 	}
 	auto applied = store.cluster_applied.load();
 	bool session_room = !draining && group_known && (max_sessions == 0 || live < max_sessions);
@@ -236,6 +242,7 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store) {
 	       ",\"observe\":" + (ObserveOpen(db) ? "\"open\"" : "\"token\"") +
 	       ",\"group\":" + (group.empty() ? string("null") : JsonQuote(group)) +
 	       ",\"group_known\":" + (group_known ? "true" : "false") +
+	       ",\"group_default\":" + (group_default ? "true" : "false") +
 	       ",\"label\":" + (label.empty() ? string("null") : JsonQuote(label)) + ",\"config\":{\"target\":" + target +
 	       ",\"applied\":" + (applied < 0 ? string("null") : std::to_string(applied)) + "}" +
 	       ",\"sessions\":{\"live\":" + std::to_string(live) + ",\"max\":" + std::to_string(max_sessions) +

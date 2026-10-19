@@ -479,8 +479,11 @@ capacity - the stream memory budget stayed full ...`. The load report's `streams
   Anyone else gets a refusal a front acts on: Flight answers `UNAVAILABLE` with `acl: this node serves
   resource group "g" - your roles are served by "h"`, quack refuses the connect (its client shows the
   same sentence inside its authentication error),
-  and the session event's `reason_code` is `wrong_resource_group`. The load report says `group`,
-  `group_known` (a group the policy does not have admits nobody: `admit.new_session` is false) and
+  and the session event's `reason_code` is `wrong_resource_group`. For a front, the refusal also names the
+  groups that serve the principal in `x-acl-resource-groups` (percent-encoded names joined by commas) - a trailer
+  of the refused Flight call, a header of quack's answer to the connect. The load report says `group`,
+  `group_known` (a group the policy does not have admits nobody: `admit.new_session` is false),
+  `group_default` (the node's group is the policy's default: where a principal bound to no group is served) and
   `config` - the profile version the node targets and the one its agent reported applied. A node
   without a group serves everyone, exactly as before.
 

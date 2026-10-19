@@ -273,3 +273,29 @@ node's cap is admitted, a new connection refused).
   trusted by the deployment invariant.
 - **Refusing ungrouped principals on every grouped node.** Rejected (owner): an installation that
   adds groups for some teams must not have to bind every other role; the default group serves them.
+
+## Addendum (2026-10-19): what a front reads, machine-readable
+
+hugr-platform spec 002 (the platform's front, accepted 2026-10-19) seats a client on a node of the principal's group.
+It reads two things the node already knows. Neither changes a decision of the node (§2's refusal stays the backstop),
+and neither tells anyone more than they are told today.
+
+- **`x-acl-resource-groups`**: on a `wrong_resource_group` refusal, the groups that serve the principal (the ones the
+  sentence names) - percent-encoded names (everything but RFC 3986's unreserved characters), joined by commas
+  (`ResourceGroupsHeader`, acl_placement.hpp). Flight: a trailer of the refused call (`UNAVAILABLE`, as before).
+  quack: a header of the HTTP answer to the CONNECT. The authentication callback notes the groups under the
+  connection's id (`PolicyStore::quack_placements`, taken at once - capped at 1024 notes); the CONNECT handler (one
+  `sync.py` hunk) answers the same sentence as an `InvalidInputException` carrying them as extra info
+  `acl_resource_groups`; our HTTP layer sets the header from it. Not sent when no group serves the principal, nor for
+  a node whose own group the policy lacks - nothing to seat by.
+- **`group_default`** in the load report (`acl_node_load()`, `/.well-known/acl-node`, Flight `node-load`, a column of
+  `platform.node_load`): whether the node's group is the policy's default group (`PolicyStore::NodeGroupDefault`, one
+  read, cached with `group_known`). False for a node without a group, or one whose group the policy lacks. A front
+  seats a principal whose group it does not know yet on the default group's nodes; a wrong guess costs one refusal.
+
+The SessionOpen seam gives the groups to the doors (`SessionOpen(…, &placement, &placement_groups)`, from
+`ResourceLimits::groups`).
+
+Tests: `test_acl_placement.cpp` (the encoding), `acl_resource_groups.test` (an open node: `group_default` false whatever
+the policy's default). A node of a group is hugr-node's (the trait that names the group), so the true case, the
+trailer and the header are tested there (`acl_node_group.test`, its Flight e2e) at its re-pin.

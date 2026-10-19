@@ -505,7 +505,10 @@ serves only principals that hold the group (bound, or - bound to none - members 
 `CREATE RESOURCE GROUP g … DEFAULT` / `ALTER RESOURCE GROUP g SET|DROP DEFAULT`, at most one, schema
 v18 `is_default`) with THAT group's limits only, and refuses others in `SessionOpenBody` (every door)
 with `wrong_resource_group` naming the groups that serve them (Flight `UNAVAILABLE`, quack connect
-error; `SessionOpen(…, &placement)`); a group the policy lacks fails closed. Decision is header-only
+error; `SessionOpen(…, &placement, &placement_groups)`); a group the policy lacks fails closed. For a front (the
+2026-10-19 addendum, hugr-platform spec 002): the refusal also carries `x-acl-resource-groups` (percent-encoded names,
+commas - `ResourceGroupsHeader`; a Flight trailer, quack's CONNECT header through the error's extra info
+`acl_resource_groups`), and the load report says `group_default`. Decision is header-only
 `acl_placement.hpp` (`Place`). No group = serves everyone (a single node needs nothing). The gateway
 prefix path is not placed; admins are placed like anyone. Cluster items `IN GROUP g` apply live only
 on g's nodes (`NotThisNodesScope`; a group item overrides the cluster's of that kind+name, so the

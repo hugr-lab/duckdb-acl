@@ -40,6 +40,7 @@
 #include "acl_door_common.hpp"
 #include "acl_node_label.hpp"
 #include "acl_node_load.hpp"
+#include "acl_placement.hpp"
 #include "acl_session_state.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/setting_info.hpp"
@@ -2983,11 +2984,16 @@ private:
 			                               "acl: node is draining - not accepting new sessions");
 		}
 		string placement;
-		auto handle = state->store->SessionOpen(token, "flight", replacing, &placement);
+		vector<string> placement_groups;
+		auto handle = state->store->SessionOpen(token, "flight", replacing, &placement, &placement_groups);
 		if (handle.empty()) {
 			if (!placement.empty()) {
 				// spec 096: this node serves another resource group - UNAVAILABLE, like a drain, so a
-				// front or a driver goes elsewhere; the sentence names groups and nothing else
+				// front or a driver goes elsewhere; the sentence names groups and nothing else, and the
+				// addendum's trailer names them for a front to seat the call there
+				if (!placement_groups.empty()) {
+					context.AddTrailer(RESOURCE_GROUPS_HEADER, ResourceGroupsHeader(placement_groups));
+				}
 				return flight::MakeFlightError(flight::FlightStatusCode::Unavailable, placement);
 			}
 			// what refuses a token in the prefix refuses it here, and says no more (spec 040)

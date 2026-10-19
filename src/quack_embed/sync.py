@@ -234,6 +234,22 @@ PATCHES = {
             "\t\tstring connection_id = GenerateConnectionId();\n"
             "\t\tauto auth = EvaluateAuthQuery(\n",
         ),
+        # spec 096 addendum: a CONNECT refused by placement names the groups that serve the principal, for a front
+        # to seat the client on one of them - in the answer's extra info, which the HTTP layer (ours) answers as the
+        # x-acl-resource-groups header; the sentence is the same
+        (
+            "\t\tif (auth.Denied()) {\n"
+            "\t\t\treturn auth.Failure(\"Authentication\");\n"
+            "\t\t}\n",
+            "\t\tif (auth.Denied()) {\n"
+            "\t\t\tauto acl_groups = acl::AclQuackTakePlacement(db, connection_id);\n"
+            "\t\t\tif (!acl_groups.empty()) {\n"
+            "\t\t\t\treturn make_uniq<ErrorResponse>(ErrorData(InvalidInputException(\n"
+            "\t\t\t\t    {{acl::QUACK_PLACEMENT_INFO, acl_groups}}, \"Authentication callback failed: \" + auth.error)));\n"
+            "\t\t\t}\n"
+            "\t\t\treturn auth.Failure(\"Authentication\");\n"
+            "\t\t}\n",
+        ),
         # spec 134: the node's label in front of every connection id it mints - the id stays opaque to
         # quack and to the client, the random part after the label is unchanged (the connection's secret)
         (
