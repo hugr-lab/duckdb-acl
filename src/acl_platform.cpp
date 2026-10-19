@@ -1822,10 +1822,10 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 				                      ex.what());
 			}
 			for (auto &table : tables) {
-				// as written, never through spec 137's reading: a body's names include those inside a physical view,
-				// which duckdb binds in the view's own catalog (review 137); the plain reading of two parts (`main`)
-				// refuses more than it must - it fails closed
-				if (!SourceGranted(granted, parts_of(table), false)) {
+				// as written: a body's names include those inside a physical view, which duckdb binds in the view's own
+				// catalog - the plain reading judges them; a two-part name over an attached database must ALSO be
+				// granted as duckdb finds it there (a `pg.main` grant never admits `pg.t`, which reads pg.public.t)
+				if (!SourceGranted(*store.catalog->Db(), granted, parts_of(table), false, true)) {
 					refuse("the definition's body", "\"" + table + "\"");
 				}
 			}

@@ -55,8 +55,8 @@ which lists nothing, keeps every name as written.
   - It is stored by the names the catalog gives the entry: `pg.public.orders`, MySQL's `my.acltest.orders` (MySQL
     answers to `main` with its own database), SQL Server's `default_schema` option or `dbo`.
   - An object not there yet takes the default schema's real name. The name is spelled once, after the reading.
-- **`a` also a schema of the node's default database**: refused as ambiguous, naming both whole names. duckdb
-  refuses that name at read.
+- **`a` also a schema of the node's default database**: refused as ambiguous, naming neither reading (a principal
+  may not learn the node's default database). duckdb refuses that name at read.
 - **`a` only a schema of the node's default database**: kept as written. That database is the node's own (a
   file-backed default is named after its file), and a policy catalog other nodes share must not carry one node's
   name.
@@ -93,11 +93,14 @@ nothing that works today stops working.
   - A definition's two-part name is judged by the same reading the write stores: `SourceGranted(db, …)`. A catalog
     admin granted `pg.public` may write `pg.orders`, and one granted `src.other` is refused `src.t`
     (`src.main.t`).
-  - A name that reads two ways is refused by the gate without naming either reading.
-  - **A body's names are judged as written**, with the plain reading (two parts in `main`), as before. A body's
-    names include those inside a physical view, which duckdb binds in the view's own catalog. Reading them against
-    the node's default database let a catalog admin build over a view of an ungranted source; review 137 found
-    it, and the test keeps it closed. The plain reading refuses more than it must, so it fails closed.
+  - A name that reads two ways is refused by the gate, naming neither reading; a name whose source could not say
+    (the lookup threw) is refused too, never guessed as `main`.
+  - **A body's names are judged as written, and narrowed by the reading.** A body's names include those inside a
+    physical view, which duckdb binds in the view's own catalog. Reading them against the node's default database
+    let a catalog admin build over a view of an ungranted source; review 137 found it. So the plain reading (two
+    parts in `main`) must pass, AND for an attached database what duckdb finds there must be granted too: a grant
+    on a schema literally named `main` never admits `pg.orders`, which reads `pg.public.orders` - a gap older than
+    this spec, closed with it.
 - **TOCTOU.** The gate reads the name when the statement is parsed, and the write reads it again when it runs. An
   operator's ATTACH, DETACH or CREATE SCHEMA in between can make the two differ. Only operator actions can do that,
   and the gate had the same gap before.
@@ -116,7 +119,10 @@ merge:
   physical view.
 - **The ambiguity refusal fired before `IF NOT EXISTS`.**
 - **Smaller fixes:** the memory store expanded names; spelling ran before reading; the ambiguity message showed
-  the default database's name to a catalog admin; a hidden database was not counted.
+  the default database's name (to a catalog admin, and through a principal's own CREATE to any role); a hidden
+  database was not counted; the gate guessed `main` when the lookup threw.
+- **The re-verification pass** confirmed every item above closed, and found the body-name gap below the gate's
+  `main` guess (closed here, see Enforcement).
 
 Accepted as they are:
 
@@ -132,7 +138,8 @@ Accepted as they are:
   - A schema of the default database (`loc.lt`) is kept as written and not reported.
   - A row stored in two parts gives `phys_incomplete` with its repair, the check changes nothing, and the repair
     makes the object listed.
-  - Source gate: a catalog admin granted `src.other` is refused `src.t`.
+  - Source gate: a catalog admin granted `src.other` is refused `src.t`; the ambiguous name's refusal names
+    neither reading.
   - Gate coverage probe: a view over `sec.main.v` (a physical view over `main.secret`) is refused to a catalog admin
     granted the default database's `main`.
   - A name that reads two ways is refused; `IF NOT EXISTS` over an existing object skips; the whole name is taken
@@ -141,7 +148,7 @@ Accepted as they are:
   and a body form (`platform_review`).
 - **Integration:**
   - Postgres: `pg.orders` stores `pg.public.orders`, is listed and read, and a catalog admin granted `pg.public`
-    writes it.
+    writes it; gate coverage probe: one granted a Postgres schema named `main` is refused a body over `pg.orders`.
   - MySQL: `my.orders` stores `my.acltest.orders`, is listed and read.
 
 ## Alternatives considered

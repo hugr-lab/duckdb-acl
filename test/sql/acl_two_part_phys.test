@@ -192,7 +192,7 @@ ACL ROLE "cadm" CREATE VIRTUAL VIEW c.leak AS 'SELECT * FROM sec.main.v';
 ----
 <REGEX>:.*the definition's body names .*outside the sources granted.*
 
-# --- a name that reads two ways is refused: duckdb refuses it at read too -----------------------------------------
+# --- a name that reads two ways is refused: duckdb refuses it at read too; the refusal names neither reading -----
 
 statement ok
 CREATE SCHEMA src;
@@ -200,7 +200,7 @@ CREATE SCHEMA src;
 statement error
 ACL ADMIN CREATE VIRTUAL TABLE c.amb AS src.t;
 ----
-<REGEX>:.*names a database and a schema of the node's default database alike - write it whole: src\.main\.t or [a-z_]+\.src\.t.*
+<REGEX>:.*the physical name "src\.t" names two objects - a database and a schema of the node's default database; write it whole, as <database>\.<schema>\.<object>.*
 
 # IF NOT EXISTS over an existing object does not read its name
 statement ok

@@ -74,3 +74,28 @@ query T
 SELECT phys FROM store.acl.relations WHERE vname = 'o2';
 ----
 pg.public.orders
+
+# gate coverage probe: a body's two-part name is judged as written AND as duckdb finds it - a grant on a schema
+# literally named `main` never admits `pg.orders`, which reads pg.public.orders
+statement ok
+CALL postgres_execute('pg', 'CREATE SCHEMA IF NOT EXISTS main');
+
+statement ok
+CALL postgres_clear_cache();
+
+statement ok
+ACL ADMIN CREATE ROLE cmain;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cmain CAPS '{"select": true, "manage": true}';
+
+statement ok
+ACL ADMIN GRANT SOURCE pg.main TO ROLE cmain;
+
+statement error
+ACL ROLE "cmain" CREATE VIRTUAL VIEW c.v AS 'SELECT * FROM pg.orders';
+----
+<REGEX>:.*outside the sources granted.*
+
+statement ok
+CALL postgres_execute('pg', 'DROP SCHEMA main');

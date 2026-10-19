@@ -260,7 +260,13 @@ string CatalogBackend::StoredReference(const string &vcat, const string &name, b
 	return Spell(name, FirstColumn(*result), creating, "reference");
 }
 
-vector<vector<string>> PhysicalObjectReadings(DatabaseInstance &db, const vector<string> &parts) {
+void ThrowAmbiguousPhysical(const string &name) {
+	throw BinderException("acl: the physical name \"%s\" names two objects - a database and a schema of the node's "
+	                      "default database; write it whole, as <database>.<schema>.<object>",
+	                      name);
+}
+
+vector<vector<string>> PhysicalObjectReadings(DatabaseInstance &db, const vector<string> &parts, bool *unknown) {
 	vector<vector<string>> readings;
 	if (parts.size() != 2) {
 		return readings;
@@ -314,6 +320,9 @@ vector<vector<string>> PhysicalObjectReadings(DatabaseInstance &db, const vector
 			}
 		});
 	} catch (std::exception &) { // NOLINT: a source that cannot say answers nothing - the name stays as written
+		if (unknown) {
+			*unknown = true; // ...and a gate refuses it
+		}
 		return readings;
 	}
 	if (!as_database.empty()) {
@@ -336,9 +345,7 @@ string PolicyStore::SpellRelationPhysical(const string &key) {
 	// read from the parts as written, then spelled once: spelling `a.b` first reads `b` as a schema
 	auto readings = PhysicalObjectReadings(*db, path.Parts());
 	if (readings.size() > 1) {
-		throw BinderException("acl: the physical name \"%s\" names a database and a schema of the node's default "
-		                      "database alike - write it whole: %s or %s",
-		                      key, NamePath(readings[0]).ToKey(), NamePath(readings[1]).ToKey());
+		ThrowAmbiguousPhysical(key);
 	}
 	// one reading: stored whole; none (`a` no database here - yet, or a schema of the default database, which is
 	// that node's own): as written
