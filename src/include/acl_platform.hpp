@@ -206,6 +206,13 @@ vector<string> GrantedSources(const PolicyStore::AdminRights &rights);
 bool SeesAllSources(const PolicyStore::AdminRights &rights);
 //! a physical name (parts: `<db>.<schema>.<object>`, a schema path `<db>[.<schema>…]`) inside a granted source
 bool SourceGranted(const vector<string> &sources, const vector<string> &parts, bool schema_path);
+//! spec 137: the same with a two-part object name read the way duckdb binds it - the database's own default
+//! schema (Postgres `public`), never an assumed `main`
+bool SourceGranted(DatabaseInstance &db, const vector<string> &sources, const vector<string> &parts, bool schema_path);
+//! spec 137: what a two-part object name `a.b` binds to - `a.<a's default schema>.b` when `a` is an attached
+//! database, `<default database>.a.b` when it is a schema of the node's default database. Both = duckdb refuses
+//! the name as ambiguous; none = it binds to nothing. Another number of parts answers nothing.
+vector<vector<string>> PhysicalObjectReadings(DatabaseInstance &db, const vector<string> &parts);
 //! spec 136: the comment mark of what a listing could not read - `acl: source <db> could not be read (<class>)` -
 //! as a value, and as SQL over two VARCHAR expressions (one text, written once here); an empty / NULL database leaves
 //! the name out (a principal that may not read the object, review 136)

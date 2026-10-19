@@ -673,6 +673,19 @@ vector<string> GrantedSources(const PolicyStore::AdminRights &rights) {
 	return out;
 }
 
+bool SourceGranted(DatabaseInstance &db, const vector<string> &sources, const vector<string> &parts, bool schema_path) {
+	if (!schema_path && parts.size() == 2) {
+		auto readings = PhysicalObjectReadings(db, parts);
+		if (readings.size() == 1) {
+			return SourceGranted(sources, readings[0], false); // spec 137: the name as the write stores it
+		}
+		if (readings.size() > 1) {
+			return false; // reads two ways: duckdb refuses it at read, and the gate says nothing of either reading
+		}
+	}
+	return SourceGranted(sources, parts, schema_path);
+}
+
 string UnreadSourceMark(const string &database, const string &error_class) {
 	return "acl: source " + (database.empty() ? string() : database + " ") + "could not be read (" + error_class + ")";
 }

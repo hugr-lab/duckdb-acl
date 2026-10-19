@@ -10,6 +10,12 @@
 #include "acl_lineage.hpp"
 #include "acl_rewriter.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
+
 namespace duckdb {
 namespace acl {
 namespace acl_detail {
@@ -252,6 +258,91 @@ string CatalogBackend::StoredReference(const string &vcat, const string &name, b
 	auto result = Query("SELECT DISTINCT \"name\" FROM " + Tbl("references") + " WHERE \"vcat\" = " + Lit(vcat) +
 	                    " AND " + KeyEqSql("\"name\"", Lit(name)));
 	return Spell(name, FirstColumn(*result), creating, "reference");
+}
+
+vector<vector<string>> PhysicalObjectReadings(DatabaseInstance &db, const vector<string> &parts) {
+	vector<vector<string>> readings;
+	if (parts.size() != 2) {
+		return readings;
+	}
+	Connection con(db);
+	auto &context = *con.context;
+	vector<string> as_database, as_schema;
+	try {
+		context.RunFunctionInTransaction([&]() {
+			auto &manager = DatabaseManager::Get(context);
+			// `a` an attached database (a hidden one too - duckdb's binder finds it): the object as duckdb finds it in
+			// that catalog - the search path's schema for it, else its default - by the names the catalog gives
+			// (MySQL answers `main` with its own database). An object not there yet: the default schema's real name.
+			// The system and temp catalogs are read through the search path, never stored by their default
+			auto attached = manager.GetDatabase(context, Identifier(parts[0]));
+			if (attached && !attached->IsSystem() && !attached->IsTemporary()) {
+				auto catalog_name = attached->GetName();
+				EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
+				                       QualifiedName(catalog_name, Identifier(), Identifier(parts[1])));
+				auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
+				if (entry) {
+					as_database = {entry->ParentCatalog().GetName().GetIdentifierName(),
+					               entry->ParentSchema().name.GetIdentifierName(), entry->name.GetIdentifierName()};
+				} else {
+					auto &catalog = attached->GetCatalog();
+					auto default_schema = catalog.GetDefaultSchema();
+					if (default_schema) {
+						EntryLookupInfo schema_lookup(CatalogType::SCHEMA_ENTRY, QualifiedName(*default_schema));
+						auto schema = catalog.GetSchema(context, schema_lookup, OnEntryNotFound::RETURN_NULL);
+						if (schema) {
+							as_database = {catalog_name.GetIdentifierName(), schema->name.GetIdentifierName(),
+							               parts[1]};
+						}
+					}
+				}
+			}
+			// `a` a schema of the node's default database: only for the refusal - duckdb refuses `a.b` as ambiguous
+			// when `a` is a database too. A name read in the default database is that node's own, never stored for a
+			// policy other nodes share (review 137)
+			auto default_name = DatabaseManager::TryGetDefaultDatabase(context);
+			optional_ptr<AttachedDatabase> home;
+			if (!default_name.empty()) {
+				home = manager.GetDatabase(context, default_name);
+			}
+			if (home) {
+				EntryLookupInfo lookup(CatalogType::SCHEMA_ENTRY, QualifiedName(Identifier(parts[0])));
+				auto schema = home->GetCatalog().GetSchema(context, lookup, OnEntryNotFound::RETURN_NULL);
+				if (schema) {
+					as_schema = {home->GetName().GetIdentifierName(), schema->name.GetIdentifierName(), parts[1]};
+				}
+			}
+		});
+	} catch (std::exception &) { // NOLINT: a source that cannot say answers nothing - the name stays as written
+		return readings;
+	}
+	if (!as_database.empty()) {
+		readings.push_back(std::move(as_database));
+		if (!as_schema.empty()) {
+			readings.push_back(std::move(as_schema));
+		}
+	}
+	return readings;
+}
+
+string PolicyStore::SpellRelationPhysical(const string &key) {
+	NamePath path;
+	string error;
+	auto db = instance.lock();
+	// the memory store lists nothing, and keeps a name as written (review 137)
+	if (!catalog || !db || !NamePath::TryFromKey(key, path, error) || path.Parts().size() != 2) {
+		return SpellPhysical(key);
+	}
+	// read from the parts as written, then spelled once: spelling `a.b` first reads `b` as a schema
+	auto readings = PhysicalObjectReadings(*db, path.Parts());
+	if (readings.size() > 1) {
+		throw BinderException("acl: the physical name \"%s\" names a database and a schema of the node's default "
+		                      "database alike - write it whole: %s or %s",
+		                      key, NamePath(readings[0]).ToKey(), NamePath(readings[1]).ToKey());
+	}
+	// one reading: stored whole; none (`a` no database here - yet, or a schema of the default database, which is
+	// that node's own): as written
+	return SpellPhysical(readings.empty() ? key : NamePath(readings[0]).ToKey());
 }
 
 string PolicyStore::SpellPhysical(const string &key) {

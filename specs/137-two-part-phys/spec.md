@@ -1,6 +1,7 @@
 # Spec 137: a relation's physical name is stored whole
 
-- **Status**: draft
+- **Status**: implemented (accepted by the owner 2026-10-19: «Принимаем 137»; the design was narrowed by review
+  137, see "What the review found")
 - **Date**: 2026-10-19
 - **Author**: Claude (with the owner)
 
@@ -8,9 +9,9 @@
 
 A virtual table over a two-part physical name (`CREATE VIRTUAL TABLE c.t AS pg.orders`) is read correctly but is
 missing from every listing: the listings join an object to its physical row by three parts. From now on a relation's
-physical name is stored whole, as `<database>.<schema>.<object>`, resolved at write the way duckdb binds the
-two-part name. A name already stored in two parts is found by `acl_check_catalog`, which gives the statement that
-repairs it. Nothing is rewritten by itself.
+physical name over an attached database is stored whole, as `<database>.<schema>.<object>`, by what duckdb finds
+in that database at write. A name already stored in two parts is found by `acl_check_catalog`, which gives the
+statement that repairs it. Nothing is rewritten by itself.
 
 ## Problem
 
@@ -32,46 +33,50 @@ ACL ADMIN CREATE VIRTUAL TABLE c.three AS src.main.t;  -- stored phys: src.main.
   - the source grants (`SourceGranted`), `platform.effective_rights` and lineage each have their own two-part
     branch.
   - The guess is wrong for a Postgres source, whose default schema is `public`.
-- The read itself is fragile: `src.t` binds to the database `src`, unless the node's default database holds a
-  schema named `src`. duckdb then refuses the read (`Ambiguous reference to catalog or schema`).
 
 ## Design
 
-### At write: the name as duckdb binds it
+### At write: the object as duckdb finds it in the attached database
 
-`PolicyStore::SpellPhysical` gets a relation form (`SpellRelationPhysical`) for the writers of a relation's
-physical name:
+`PolicyStore::SpellRelationPhysical` is used by the writers of a relation's physical name:
 
-- `acl_add_relation`, `acl_register_created` / `_existing` (a principal's own CREATE, spec 113);
-- `acl_grant_table` (legacy, catalog mode), and `acl_alter_relation`'s `phys` (`SET PHYS`).
+- `acl_add_relation` (and the grammar over it), `acl_register_created` / `_existing` (spec 113);
+- `acl_grant_table` (legacy), and `acl_alter_relation`'s `phys` (`SET PHYS`).
 
-A schema alias's path (`<db>.<schema>`) keeps the two-part form; it is a schema, not a relation.
+A schema alias's path (`<db>.<schema>`) keeps `SpellPhysical`: it is a schema, not a relation. The memory store,
+which lists nothing, keeps every name as written.
 
-A two-part name `a.b` becomes three parts by duckdb's own reading:
+`PhysicalObjectReadings` reads a two-part name `a.b` on a fresh connection, from the parts as written:
 
-- `a` is an attached database: `a.<its default schema>.b` (`Catalog::GetDefaultSchema()`: `main` for duckdb and
-  DuckLake; `public` for Postgres, or the first schema its ATTACH names; for SQL Server the login's default schema,
-  usually `dbo`).
-- `a` is a schema of the node's default database: `<default database>.a.b`.
-- Both: refused as ambiguous, naming the two three-part names to write instead. duckdb refuses that name at read
-  too.
-- Neither: written as given. The source probe that every CREATE runs already fails on a name that binds to
-  nothing.
+- **`a` an attached database** (a hidden one too; not `system`, not `temp`, which duckdb reads through its search
+  path).
+  - The object is looked up as duckdb looks it up: `Catalog::GetEntry` with the catalog and no schema, that is the
+    search path's schema for that catalog, else its default.
+  - It is stored by the names the catalog gives the entry: `pg.public.orders`, MySQL's `my.acltest.orders` (MySQL
+    answers to `main` with its own database), SQL Server's `default_schema` option or `dbo`.
+  - An object not there yet takes the default schema's real name. The name is spelled once, after the reading.
+- **`a` also a schema of the node's default database**: refused as ambiguous, naming both whole names. duckdb
+  refuses that name at read.
+- **`a` only a schema of the node's default database**: kept as written. That database is the node's own (a
+  file-backed default is named after its file), and a policy catalog other nodes share must not carry one node's
+  name.
+- **Neither, or a source that cannot say** (it throws): kept as written. A write does not require its source to bind
+  yet; once it binds, `acl_check_catalog` finds the two parts (below).
 
-A three-part name is unchanged; its parts are still spelled as today. A one-part name is unchanged: it means the
-node's default database, and this spec does not touch it.
+`CREATE … IF NOT EXISTS` over an existing object skips before the name is read.
 
 ### Already stored: found, never rewritten
 
-`acl_check_catalog` adds the finding `phys_incomplete` for a relation whose stored physical name has two parts. It
-says what the name binds to now, and gives the repair statement:
+`acl_check_catalog` adds the finding `phys_incomplete` for a relation whose stored physical name has two parts and
+reads as an attached database's object, as above. It names what the name binds to now, and gives the repair:
 
 ```sql
 ACL ADMIN ALTER VIRTUAL TABLE c.two SET PHYS src.main.t;
 ```
 
 The owner's rule holds: nothing is rewritten by itself, and an explicit command does the repair. Until it is
-repaired, the object stays missing from the listings, as it is today. A read keeps working.
+repaired, the object stays missing from the listings, as it is today. A read keeps working. A name read in the
+node's default database is not reported: its whole name would be one node's.
 
 ### The readers
 
@@ -81,35 +86,78 @@ nothing that works today stops working.
 ## Enforcement & security
 
 - **No change to what a principal may read.** The rewrite of a read emits the stored name, as before. A stored
-  three-part name binds exactly what the two-part one did at write time, because the expansion is duckdb's own
-  reading.
-- **The ambiguous case is refused at write**, instead of binding whichever object duckdb finds at read.
-- **Source grants (spec 118.3)**: `AuthorizeSources` judges the statement as written, before the admin function
-  expands the name. Its two-part branch (`SourceGranted`) assumes `main` today, so a catalog admin granted
-  `pg.public` is refused `pg.orders`. It takes the same reading as the write: the database's default schema. The
-  grant and the stored name then always agree.
+  whole name is the entry duckdb found for the two-part one at write.
+- **The ambiguous case is refused at write**, instead of being left for duckdb to refuse at every read.
+- **Source grants (spec 118.3).** `AuthorizeSources` judges the statement as written, before the admin function
+  expands the name.
+  - A definition's two-part name is judged by the same reading the write stores: `SourceGranted(db, …)`. A catalog
+    admin granted `pg.public` may write `pg.orders`, and one granted `src.other` is refused `src.t`
+    (`src.main.t`).
+  - A name that reads two ways is refused by the gate without naming either reading.
+  - **A body's names are judged as written**, with the plain reading (two parts in `main`), as before. A body's
+    names include those inside a physical view, which duckdb binds in the view's own catalog. Reading them against
+    the node's default database let a catalog admin build over a view of an ungranted source; review 137 found
+    it, and the test keeps it closed. The plain reading refuses more than it must, so it fails closed.
+- **TOCTOU.** The gate reads the name when the statement is parsed, and the write reads it again when it runs. An
+  operator's ATTACH, DETACH or CREATE SCHEMA in between can make the two differ. Only operator actions can do that,
+  and the gate had the same gap before.
+
+## What the review found
+
+Three passes covered binding semantics, security and compatibility. All of the following were fixed before the
+merge:
+
+- **First version stored the default database's reading.** `s.t` became `<default db>.s.t`. That broke a shared
+  policy catalog on every other node, and broke the system catalog's names (`main.duckdb_tables`,
+  `system.pg_class`).
+- **It took `GetDefaultSchema()` instead of the entry it finds.** On MySQL that stored `my.main.orders`, a name
+  MySQL refuses.
+- **The gate read body names against the default database.** That was a new hole: the case of a name inside a
+  physical view.
+- **The ambiguity refusal fired before `IF NOT EXISTS`.**
+- **Smaller fixes:** the memory store expanded names; spelling ran before reading; the ambiguity message showed
+  the default database's name to a catalog admin; a hidden database was not counted.
+
+Accepted as they are:
+
+- The TOCTOU above.
+- The legacy `acl_grant_table` rows in its implicit catalog `default` are not checked. That is spec 039's existing
+  limit: the check walks the stored catalogs.
 
 ## Testing
 
-- **sqllogictest:**
-  - `CREATE VIRTUAL TABLE c.two AS src.t` stores `src.main.t`, and the object is listed in
-    `information_schema.tables`, `columns` and `duckdb_tables()`.
-  - A second attached database with a schema named like the first database: the two-part name is refused as
-    ambiguous, naming both three-part names.
-  - `ALTER … SET PHYS src.t` stores three parts.
-  - A two-part name stored the old way (written straight into the policy table) gives the `phys_incomplete`
-    finding with its repair; the repair makes the object listed.
-- **Integration (Postgres):** `CREATE VIRTUAL TABLE c.o AS pg.orders` stores `pg.public.orders`, which is listed
-  and read.
+- **sqllogictest** (`test/sql/acl_two_part_phys.test`):
+  - `src.t` stores `src.main.t`, and the object is listed in `information_schema.tables`, `columns` and
+    `duckdb_tables()`; `SET PHYS src.t2` stores three parts.
+  - A schema of the default database (`loc.lt`) is kept as written and not reported.
+  - A row stored in two parts gives `phys_incomplete` with its repair, the check changes nothing, and the repair
+    makes the object listed.
+  - Source gate: a catalog admin granted `src.other` is refused `src.t`.
+  - Gate coverage probe: a view over `sec.main.v` (a physical view over `main.secret`) is refused to a catalog admin
+    granted the default database's `main`.
+  - A name that reads two ways is refused; `IF NOT EXISTS` over an existing object skips; the whole name is taken
+    as written.
+- **Existing tests keep the two-part branches covered** by a row written in two parts (`platform_effective_rights`)
+  and a body form (`platform_review`).
+- **Integration:**
+  - Postgres: `pg.orders` stores `pg.public.orders`, is listed and read, and a catalog admin granted `pg.public`
+    writes it.
+  - MySQL: `my.orders` stores `my.acltest.orders`, is listed and read.
 
 ## Alternatives considered
 
 - **Read-side normalisation in the listing:** a CTE that maps each stored two-part name to its three parts, using
   each database's default schema at listing time. It fixes the listing for old rows too, but every other reader
-  keeps its own guess, and the read stays fragile.
+  keeps its own guess.
 - **A migration step that rewrites stored names.** It goes against the owner's rule: nothing changes by itself.
 - **Refusing two-part names at write.** That needlessly breaks a form that works and that people write.
+- **Copying the binder's rule by hand** (the first version). It differed from duckdb in the cases above. The
+  catalog's own lookup is the rule.
 
 ## Follow-ups
 
+- **The source gate's other gaps, found by review 137 and older than it** (a spec of their own, before the release):
+  - a physical view's own name in a body is never judged, since name extraction does not record a view;
+  - a one-part name in a body is matched against a database granted whole;
+  - `NamesPolicyStore`'s two-part branch assumes `main` for the policy database.
 - A schema alias written with one part (`CREATE VIRTUAL SCHEMA c.s AS pg`) needs the same check.

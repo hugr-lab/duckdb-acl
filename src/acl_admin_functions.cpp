@@ -311,7 +311,7 @@ void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_add_relation", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_add_relation", "name"),
 		                                      OptionalArg(args, 6, row, "") != "skip");
-		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_add_relation", "phys"));
+		auto phys_key = KeyArg(args, 2, row, "acl_add_relation", "phys");
 		case_insensitive_map_t<int8_t> marks;
 		auto columns = ParseColumns(OptionalArg(args, 3, row, ""), &marks);
 		auto rls = OptionalArg(args, 4, row, "");
@@ -320,8 +320,9 @@ void AclAddRelationFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		auto form = rls.empty() && (columns.empty() || RenameOnlyColumns(columns)) ? "alias" : "subquery";
 		auto &store = StoreOf(state);
 		if (!AllowWrite(store, vcat, vname, "relation", OptionalArg(args, 6, row, ""))) {
-			continue;
+			continue; // IF NOT EXISTS over an existing object: its name is not even read (review 137)
 		}
+		auto phys = store.SpellRelationPhysical(phys_key);
 		store.CatalogAddRelation(vcat, vname, form, phys, "", rls, columns, "", pk, marks);
 		SetInlineComment(store, vcat, vname, "relation", OptionalArg(args, 5, row, ""));
 	}
@@ -377,7 +378,7 @@ void AclRegisterCreatedFunc(DataChunk &args, ExpressionState &state, Vector &res
 		AuthorScope author(OptionalArg(args, 4, row, "")); // spec 120.5: the rewriter names the author
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_created", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_created", "name"), true);
-		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_register_created", "phys"));
+		auto phys = StoreOf(state).SpellRelationPhysical(KeyArg(args, 2, row, "acl_register_created", "phys"));
 		StoreOf(state).CatalogRegisterCreated(vcat, vname, phys, OptionalArg(args, 3, row, ""));
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
@@ -458,7 +459,7 @@ void AclRegisterExistingFunc(DataChunk &args, ExpressionState &state, Vector &re
 		AuthorScope author(OptionalArg(args, 4, row, "")); // spec 120.5: the rewriter names the author
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 0, row, "acl_register_existing", "catalog"));
 		auto vname = StoreOf(state).SpellName(vcat, KeyArg(args, 1, row, "acl_register_existing", "name"), true);
-		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_register_existing", "phys"));
+		auto phys = StoreOf(state).SpellRelationPhysical(KeyArg(args, 2, row, "acl_register_existing", "phys"));
 		auto &store = StoreOf(state);
 		if (!store.PhysicalObjectExists(phys)) {
 			throw BinderException("acl: \"%s\" does not exist - this role may register objects, not create them "
@@ -676,7 +677,7 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto role = RequiredArg(args, 0, row, "acl_grant_table", "role");
 		auto vname = StoreOf(state).SpellName("default", KeyArg(args, 1, row, "acl_grant_table", "name"));
-		auto phys = StoreOf(state).SpellPhysical(KeyArg(args, 2, row, "acl_grant_table", "phys"));
+		auto phys = StoreOf(state).SpellRelationPhysical(KeyArg(args, 2, row, "acl_grant_table", "phys"));
 		auto columns = ParseColumns(OptionalArg(args, 3, row, ""));
 		auto rls = OptionalArg(args, 4, row, "");
 		auto cap_list = SplitCsv(OptionalArg(args, 5, row, "select"));
@@ -1323,7 +1324,7 @@ void AclAlterRelationFunc(DataChunk &args, ExpressionState &state, Vector &resul
 		auto field = StringUtil::Lower(RequiredArg(args, 2, row, "acl_alter_relation", "property"));
 		auto value = OptionalArg(args, 3, row, "");
 		if (field == "phys") {
-			value = StoreOf(state).SpellPhysical(NameKey(value, "acl_alter_relation", "phys"));
+			value = StoreOf(state).SpellRelationPhysical(NameKey(value, "acl_alter_relation", "phys"));
 		}
 		case_insensitive_map_t<int8_t> marks;
 		auto columns = field == "columns" ? ParseColumns(value, &marks) : vector<std::pair<string, string>>();

@@ -1768,7 +1768,8 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 				continue; // a builtin or the node's own function: the function gate's, not a source
 			}
 			// a schema path may be one database whole; an object is named <database>.<schema>.<object>
-			if (parts.size() < (std::get<1>(entry) ? 1u : 2u) || !SourceGranted(granted, parts, std::get<1>(entry))) {
+			if (parts.size() < (std::get<1>(entry) ? 1u : 2u) ||
+			    !SourceGranted(*store.catalog->Db(), granted, parts, std::get<1>(entry))) {
 				refuse("the definition", "\"" + name + "\"");
 			}
 		}
@@ -1821,6 +1822,9 @@ void AuthorizeSources(vector<unique_ptr<SQLStatement>> &statements, const Policy
 				                      ex.what());
 			}
 			for (auto &table : tables) {
+				// as written, never through spec 137's reading: a body's names include those inside a physical view,
+				// which duckdb binds in the view's own catalog (review 137); the plain reading of two parts (`main`)
+				// refuses more than it must - it fails closed
 				if (!SourceGranted(granted, parts_of(table), false)) {
 					refuse("the definition's body", "\"" + table + "\"");
 				}

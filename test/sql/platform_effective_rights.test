@@ -363,6 +363,10 @@ ACL ADMIN CREATE VIRTUAL TABLE c.o3 AS phys.main.orders COLUMNS (id, (SELECT max
 statement ok
 SELECT acl_add_relation('c', 'o4', 'phys.orders', '', 'tenant IN (SELECT t FROM phys.main.tenants)');
 
+# spec 137 stores that name whole; a row stored in two parts before it keeps its reading - covered here
+statement ok
+UPDATE store.acl.relations SET phys = 'phys.orders' WHERE vname = 'o4';
+
 statement ok
 ACL ADMIN GRANT TABLE c.orders TO ROLE w COLUMNS (id, amount = (SELECT max(x) FROM phys.main.secret));
 

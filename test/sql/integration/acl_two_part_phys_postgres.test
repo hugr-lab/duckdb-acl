@@ -1,0 +1,76 @@
+# name: test/sql/integration/acl_two_part_phys_postgres.test
+# description: spec 137 over a live PostgreSQL - a two-part physical name is stored whole with the source's own
+#   default schema (`public`, never an assumed `main`), so the object is listed and read; and a catalog admin
+#   granted that schema may write the two-part name (its source grant reads it the same way)
+# group: [integration]
+
+require acl
+
+require postgres_scanner
+
+require-env ACL_PG_DSN
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH '{ACL_PG_DSN}' AS pg (TYPE postgres);
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.o AS pg.orders;
+
+query T
+SELECT phys FROM store.acl.relations WHERE vname = 'o';
+----
+pg.public.orders
+
+query TT
+ACL ROLE "r" SELECT table_name, table_type FROM information_schema.tables WHERE table_name = 'o';
+----
+o	BASE TABLE
+
+query I
+ACL ROLE "r" SELECT count(*) > 0 FROM information_schema.columns WHERE table_name = 'o';
+----
+true
+
+query I
+ACL ROLE "r" SELECT count(*) > 0 FROM o;
+----
+true
+
+# a catalog admin granted pg.public writes the two-part name: the grant reads it as the write does
+statement ok
+ACL ADMIN CREATE ROLE cadm;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE cadm CAPS '{"select": true, "manage": true}' MAIN;
+
+statement ok
+ACL ADMIN GRANT SOURCE pg.public TO ROLE cadm;
+
+statement ok
+ACL ROLE "cadm" CREATE VIRTUAL TABLE c.o2 AS pg.orders;
+
+query T
+SELECT phys FROM store.acl.relations WHERE vname = 'o2';
+----
+pg.public.orders

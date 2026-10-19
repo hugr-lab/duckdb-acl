@@ -150,6 +150,10 @@ by the principal's claim. `PRIMARY KEY` is declared, never enforced; it may name
 declaration has, and a masked or explicitly nullable column is refused as a key. The physical
 `<phys>` is not checked at write time: a source attached later is fine - except for a catalog admin, whose
 `<phys>` must lie in a source granted to it (spec 118.3), which a grant requires to be attached.
+A two-part `<phys>` over an attached database (`pg.orders`) is stored whole, as duckdb finds the object there:
+`pg.public.orders` (MySQL: its database; SQL Server: the ATTACH's `default_schema`, else `dbo`). One that also names
+a schema of the node's default database is refused as ambiguous - write it whole; one that names only such a schema
+is kept as written, since the default database is that node's own (spec 137).
 
 ```sql
 ACL ADMIN CREATE VIRTUAL TABLE sales.created AS phys.main.orders_physical
@@ -1032,6 +1036,7 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | problem | what no longer holds | the repair it names |
 | --- | --- | --- |
 | `source_missing` | the relation's physical source does not bind (dropped, renamed) | `ALTER VIRTUAL TABLE … SET PHYS` / `DROP VIRTUAL TABLE` |
+| `phys_incomplete` | the physical name is stored in two parts over an attached database (written before spec 137, or before its source was attached): it is read, but not listed | `ALTER VIRTUAL TABLE … SET PHYS <db>.<schema>.<object>` (the finding names it) |
 | `column_missing` | a declared `COLUMNS` entry whose expression no longer binds against the source | `REPAIR VIRTUAL TABLE … REMAP (…)` or `… DROP MISSING COLUMNS` |
 | `definition_broken` | a view's SQL, a macro's template (with its declared parameter types), or an alias's target function does not bind / exist | `CREATE OR REPLACE VIRTUAL VIEW … AS` / `acl_alter_function` |
 | `schema_stale` | a query-defined object's stored (derived) schema - a view's, a macro's, or a declared-list table's projection - differs from what its definition binds to now | `ANALYZE VIRTUAL …` (re-derives a table's projection too since spec 039, keeping its marks and column comments) |
@@ -1048,8 +1053,8 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | `body_function_denied` | a stored body (view, template, alias, RLS, column or mask, a grant's policy) calls a function no principal may call - written before spec 117 judged bodies by their author's gate | redefine it without the call, or drop it |
 | `types_mismatch` | a declared entry that makes a type of its own (`CAST(x AS ENUM(…))`) - described as the exposed type, read as its own | `REPAIR VIRTUAL TABLE … REMAP (n = CAST(… AS <type>))` |
 
-A bare alias (no declared list) has no contract beyond "binds", so only `source_missing` can be
-found on it - declaring `COLUMNS` is the opt-in to `column_missing`, as it is to spec 065's clean
+A bare alias (no declared list) has no contract beyond "binds", so only `source_missing` (and spec 137's
+`phys_incomplete`) can be found on it - declaring `COLUMNS` is the opt-in to `column_missing`, as it is to spec 065's clean
 refusals. A column *added* to the source is not a finding: it appears live under a whole-table grant
 by design (docs/security.md, "a grant on the source's future").
 
