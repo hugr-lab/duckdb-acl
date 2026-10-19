@@ -5,16 +5,26 @@ import type * as Preset from '@docusaurus/preset-classic';
 // Docs for duckdb-acl - role/token-scoped access control for DuckDB. Mirrors the
 // tresor, mssql-extension and mssql-ducklake sites and the org site
 // (hugr-lab.github.io) so they share look and feel; published by this repo's
-// Pages workflow to https://hugr-lab.github.io/duckdb-acl/.
+// Pages workflow to https://hugr-lab.github.io/duckdb-acl/ and, as a second build,
+// to https://hugr-lab.com/docs/duckdb-acl/ (IONOS) - that copy loads nothing from
+// another host (the site's CSP and its Datenschutz say so).
+
+// The same docs are built twice: for GitHub Pages (default) and for hugr-lab.com on IONOS (DOCS_TARGET=ionos).
+const ionos = process.env.DOCS_TARGET === 'ionos';
+const site = ionos
+  ? {url: 'https://hugr-lab.com', baseUrl: '/docs/duckdb-acl/', home: 'https://hugr-lab.com/', impressum: 'https://hugr-lab.com/impressum/', datenschutz: 'https://hugr-lab.com/datenschutz/'}
+  : {url: 'https://hugr-lab.github.io', baseUrl: '/duckdb-acl/', home: 'https://hugr-lab.github.io/', impressum: 'https://hugr-lab.github.io/impressum/', datenschutz: 'https://hugr-lab.github.io/datenschutz/'};
 
 const config: Config = {
   title: 'duckdb-acl',
   tagline: 'Role- and token-scoped access control for DuckDB - virtual catalogs, row-level security, column masking, served over Flight SQL and quack.',
   favicon: 'img/favicon.ico',
 
-  url: 'https://hugr-lab.github.io',
-  baseUrl: '/duckdb-acl/',
+  url: site.url,
+  baseUrl: site.baseUrl,
+  baseUrlIssueBanner: false,
   trailingSlash: true,
+  customFields: {docsTarget: ionos ? 'ionos' : 'github'},
 
   organizationName: 'hugr-lab',
   projectName: 'duckdb-acl',
@@ -57,6 +67,12 @@ const config: Config = {
     // the pages are plain Markdown full of `<role>` and `{"caps": ...}`: .md is CommonMark, never MDX
     format: 'detect',
     mermaid: true,
+    // the hugr-lab.com copy requests no other server: an external image (a badge) is dropped from every page and
+    // every version snapshotted from a tag - those are never edited, so this happens at build time
+    preprocessor: ({fileContent}) =>
+      ionos
+        ? fileContent.replace(/\[!\[[^\]]*\]\(https?:\/\/[^)]*\)\]\([^)]*\)|!\[[^\]]*\]\(https?:\/\/[^)]*\)/g, '')
+        : fileContent,
     hooks: {
       onBrokenMarkdownLinks: 'throw',
     },
@@ -87,7 +103,7 @@ const config: Config = {
           position: 'left',
         },
         {
-          href: 'https://hugr-lab.github.io/',
+          href: site.home,
           label: 'Hugr Lab',
           position: 'right',
         },
@@ -126,9 +142,16 @@ const config: Config = {
         {
           title: 'Hugr Lab',
           items: [
-            {label: 'Main site', href: 'https://hugr-lab.github.io/'},
+            {label: 'Main site', href: site.home},
             {label: 'tresor', href: 'https://hugr-lab.github.io/tresor/'},
             {label: 'DuckDB MSSQL Extension', href: 'https://hugr-lab.github.io/mssql-extension/'},
+          ],
+        },
+        {
+          title: 'Legal',
+          items: [
+            {label: 'Impressum', href: site.impressum},
+            {label: 'Datenschutz', href: site.datenschutz},
           ],
         },
       ],
