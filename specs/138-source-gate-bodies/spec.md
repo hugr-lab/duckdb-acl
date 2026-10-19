@@ -1,6 +1,6 @@
 # Spec 138: the source gate judges what a body names, by catalog entry
 
-- **Status**: draft (the owner, 2026-10-19: «138 да» - the gaps close before the release)
+- **Status**: accepted (the owner, 2026-10-19: «138 да» - the gaps close before the release; Q1 extended to views: «да, и на вьюху распространяется»)
 - **Date**: 2026-10-19
 - **Author**: Claude (with the owner)
 
@@ -99,8 +99,8 @@ and it covers a body that does not bind.
 ## Decisions
 
 - **Q1 (the owner, 2026-10-19):** «если дали права на табличную функцию то ее разрешаем независимо от того что
-  разрешено внутри ее запроса» - a right on the object is enough; what its definition reads is not judged. Applied
-  to a physical view of a granted source the same way (to be confirmed with the owner with the spec's acceptance).
+  разрешено внутри ее запроса» - a right on the object is enough; what its definition reads is not judged. And for a
+  physical view of a granted source the same (the owner: «да, и на вьюху распространяется»).
 
 ## Alternatives considered
 
