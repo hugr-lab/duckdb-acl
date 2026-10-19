@@ -253,6 +253,18 @@ PATCHES = {
             "\treturn acl::AclQuackConnectionIdPrefix(*db) + QuackRandomToken(*db);\n"
             "}\n",
         ),
+        # spec 135: a connection id this node does not know is answered so a client can tell it - a node it left
+        # (a roll, a drain) or a lease that ran out: quack authenticates only at CONNECT, so the move is the
+        # client's reconnect (hugr_node's federation client does it by itself when it holds nothing pinned)
+        (
+            "\t\tif (!connection) {\n"
+            "\t\t\treturn make_uniq<ErrorResponse>(\"Invalid connection id\");\n"
+            "\t\t}\n",
+            "\t\tif (!connection) {\n"
+            "\t\t\treturn make_uniq<ErrorResponse>(\"acl: this connection is not known on this node - connect "
+            "again\");\n"
+            "\t\t}\n",
+        ),
         # spec 079: a connection the server drops ends its acl session at once - quack's own DISCONNECT
         # and a heartbeat lease noticed expired - instead of the session waiting out
         # acl_session_idle_timeout (15 min) with no client behind it

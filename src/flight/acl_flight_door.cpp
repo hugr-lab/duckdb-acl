@@ -39,6 +39,8 @@
 #include "acl_door_common.hpp"
 #include "acl_node_label.hpp"
 #include "acl_node_load.hpp"
+#include "acl_session_state.hpp"
+#include "duckdb/main/setting_info.hpp"
 #include "oidc_core.hpp"
 #include "acl_profile.hpp"
 #include "acl_parser_override.hpp"
@@ -456,6 +458,14 @@ struct FlightDoorState {
 		return entry;
 	}
 
+	//! spec 135: the session's connection if it has one - never made here: what a session holds is read
+	//! from the connection it ran on, and a session that ran nothing holds nothing there
+	shared_ptr<SessionConn> ConnIfAny(const string &handle) {
+		std::lock_guard<std::mutex> guard(lock);
+		auto found = session_conns.find(handle);
+		return found == session_conns.end() ? nullptr : found->second;
+	}
+
 	//! Drop a session's connection entry. A reservation still holding the shared_ptr keeps the
 	//! connection alive for its own pending redemption; nobody new can reach it.
 	void DropConn(const string &handle) {
@@ -821,6 +831,23 @@ string CookieFromHeaders(const vector<string> &cookies) {
 	}
 	return string();
 }
+
+//! spec 135: the session-state cookie a request carries (empty when none), by name like the session cookie
+string StateCookieFromHeaders(const vector<string> &cookies) {
+	for (auto &header : cookies) {
+		string value;
+		if (CookieNamed(header, SESSION_STATE_COOKIE, value)) {
+			return value;
+		}
+	}
+	return string();
+}
+
+//! spec 135: the client-local settings a session's state cookie may carry - spec 068's allowlist
+//! (ClientSettingAllowed), by name, each read only when the client SET it on its own connection
+constexpr const char *PORTABLE_SETTINGS[] = {
+    "TimeZone",        "Calendar",           "acl_metadata_max_rows",   "acl_correlation_id",
+    "acl_traceparent", "acl_lineage_parent", "acl_lineage_root_parent", "acl_lineage_job"};
 
 //! Carries the connection's cookie id for one call and, when it was minted this call, emits it - and
 //! (spec 134) the node's label cookie when the request did not carry it already.
@@ -2486,7 +2513,10 @@ private:
 				// a connection-long session (spec 050): the sweeper, exp, CloseSession or the door's
 				// stop end it - an RPC boundary does not
 				ARROW_RETURN_NOT_OK(DeclaredViewAs(context, handle));
-				return body(handle);
+				auto answer = body(handle);
+				// spec 135: what the call left the session holding goes out with this very response
+				SendState(context, handle);
+				return answer;
 			}
 			SessionScope scope(*state, handle);
 			state->store->SessionMarkPerCall(handle);
@@ -2496,6 +2526,113 @@ private:
 			// duckdb's what() is a JSON envelope; ErrorData gives the message a person wrote
 			return StatusFromDuck("acl", ErrorData(ex).Message());
 		}
+	}
+
+	//! spec 135: what the session holds now - its USE and view-as from the record, the settings its client SET,
+	//! an open transaction and temp tables from its connection, read under the connection's own lock
+	SessionState CurrentState(const string &handle) {
+		SessionState out;
+		PolicyStore::SessionRef ref;
+		if (!state->store->SessionRefOf(handle, ref)) {
+			return out;
+		}
+		state->store->SessionUseOf(ref.id, out.use_catalog, out.use_schema);
+		bool view_as = !state->store->SessionViewAsOf(ref.id).empty();
+		if (auto conn = state->ConnIfAny(handle)) {
+			std::lock_guard<std::mutex> guard(conn->exec);
+			auto &client = *conn->con->context;
+			for (auto name : PORTABLE_SETTINGS) {
+				Value value;
+				auto found = client.TryGetCurrentSetting(Identifier(name), value);
+				if (found && found.GetScope() == SettingScope::LOCAL && !value.IsNull()) {
+					out.settings.emplace_back(name, value.ToString());
+				}
+			}
+			if (!conn->txn_id.empty() || !client.transaction.IsAutoCommit()) {
+				out.pinned.emplace_back("transaction");
+			}
+			if (!TempCatalogNames(client).empty()) {
+				out.pinned.emplace_back("temp");
+			}
+		}
+		if (view_as) {
+			out.pinned.emplace_back("view_as");
+		}
+		return out;
+	}
+
+	//! spec 135: the session-state cookie of the response, when the state differs from what the request carried.
+	//! Called after the call's work, before its response goes out (ServerCallContext::AddHeader: a middleware's
+	//! headers are sent before the handler runs). Never fails the call: a state it cannot read is not sent.
+	void SendState(const flight::ServerCallContext &context, const string &handle) {
+		try {
+			auto now = EncodeSessionState(CurrentState(handle));
+			if (now != StateCookieFromHeaders(CookieHeadersOf(context))) {
+				context.AddHeader("set-cookie", SessionStateSetCookie(now));
+			}
+		} catch (std::exception &) { // NOLINT: the cookie is a convenience of the client's, never the call's outcome
+		}
+	}
+
+	//! spec 135: a session this node did not know, opened for a client that sent a session-state cookie. Not
+	//! pinned: its context is restored through the client's own paths - USE as `SET schema`, each setting as a
+	//! SET, all under the session's prefix, so each is judged as if the client sent it now - and the call runs.
+	//! Pinned, unreadable, or an item that does not restore: the call is refused, once - the new session stays
+	//! bound to the cookie, so the client's next call works on it.
+	arrow::Status TakeOverState(const flight::ServerCallContext &context, const string &handle) {
+		SessionState carried;
+		auto read = DecodeSessionState(StateCookieFromHeaders(CookieHeadersOf(context)), carried);
+		if (read == SessionStateRead::ABSENT) {
+			return arrow::Status::OK();
+		}
+		auto pinned = read == SessionStateRead::UNREADABLE ? vector<string> {"context"} : carried.pinned;
+		if (!DeclaredRole(context).empty()) {
+			// a call that declares the view-as mode is put in it again (DeclaredViewAs): that pin is answered
+			pinned.erase(std::remove(pinned.begin(), pinned.end(), "view_as"), pinned.end());
+		}
+		auto refuse = [&](const char *code, const string &what) {
+			context.AddHeader("set-cookie", SessionStateSetCookie(string()));
+			state->store->AuditSessionMove("flight", handle, true, code, what);
+			return arrow::Status::Invalid("acl: the session moved to another node and " + what +
+			                              "; the statement did not run, the connection works on");
+		};
+		if (!pinned.empty()) {
+			return refuse("session_pinned", "lost " + SessionStateLost(pinned));
+		}
+		vector<string> restored;
+		string failed;
+		{
+			auto conn = state->ConnFor(handle);
+			auto execution = state->LockForStatement(*conn);
+			TempScanScope temp_scan(conn->con->context.get());
+			auto restore = [&](const string &what, const string &sql) {
+				if (!failed.empty()) {
+					return;
+				}
+				auto prefixed = state->store->SessionSql(handle, sql, string(), string(), string(), string(), string());
+				if (prefixed.empty() || conn->con->Query(prefixed)->HasError()) {
+					failed = what;
+					return;
+				}
+				restored.push_back(what);
+			};
+			if (!carried.use_catalog.empty()) {
+				auto path = carried.use_schema.empty() ? carried.use_catalog
+				                                       : NamePath::JoinKeys(carried.use_catalog, carried.use_schema);
+				restore("USE", "SET schema = '" + StringUtil::Replace(path, "'", "''") + "'");
+			} else if (!carried.use_schema.empty()) {
+				restore("USE", "SET acl_use_schema = '" + StringUtil::Replace(carried.use_schema, "'", "''") + "'");
+			}
+			for (auto &setting : carried.settings) {
+				restore(setting.first, "SET \"" + StringUtil::Replace(setting.first, "\"", "\"\"") + "\" = '" +
+				                           StringUtil::Replace(setting.second, "'", "''") + "'");
+			}
+		}
+		if (!failed.empty()) {
+			return refuse("session_unrestorable", "could not restore its " + failed);
+		}
+		state->store->AuditSessionMove("flight", handle, false, "", StringUtil::Join(restored, ", "));
+		return arrow::Status::OK();
 	}
 
 	//! The connection's cookie id, from our own middleware (empty if unavailable).
@@ -2641,6 +2778,12 @@ private:
 		}
 		if (!replacing.empty()) {
 			state->DropConn(replacing); // and the old principal's connection with it
+		}
+		// spec 135: a cookie this node does not know (another node held it, or it died here) carries the
+		// session's state - restored, or refused once. A swap is another principal: nothing of the old one's
+		// context is carried, and the response clears it (SendState)
+		if (!transient && replacing.empty()) {
+			ARROW_RETURN_NOT_OK(TakeOverState(context, handle));
 		}
 		return handle;
 	}

@@ -806,6 +806,20 @@ group known, profile version). **Spec 127** moved it, with its history and tests
 repository builds this acl in (`acl_sources.cmake`, `LoadAclCore`, `ACL_EMBEDDED`) as one extension, `hugr_node`, and
 registers its part; this repository is the open node (tag `pre-platform-split` = the last state with the part in).
 
+**Spec 135 — a session moves between nodes**: the Flight door sets `acl_session_state` (base64url JSON, codec
+`acl_session_state.{hpp,cpp}`, ≤ 3 KiB, else pinned `context`) - the session's USE (spec 114) and the client's own
+spec 068 SETs (scope LOCAL only), plus `pinned` (open transaction, temp table, view-as) - from `UnderSession`'s end by
+`ServerCallContext::AddHeader` (a middleware's headers go out BEFORE the handler runs). A cookie this node does not
+know (`SessionFor`, not a swap): no state = a new session as before; pinned / unreadable = the new session bound, the
+call refused once (`Invalid`, "the session moved to another node and lost its ..."), the state cleared; otherwise the
+context restored through the client's own paths (`SET schema = '<cat.schema>'` / `SET acl_use_schema`, each `SET`,
+under the session's prefix) - an item that does not restore refuses once ("could not restore its USE"). A declared
+`x-acl-view-as` answers the view-as pin. Events `session` `moved` / `move_refused`, counters
+`acl.sessions.moved{door}` / `.move_refused{door,reason_code}`. quack (CONNECT authenticates; no move by itself):
+an unknown connection id answers `acl: this connection is not known on this node - connect again` (a `sync.py`
+hunk). Tests: `test/cpp/test_acl_session_state.cpp`, `test/e2e/flight/run.sh` (kill + cookie jar),
+`test_acl_quack_embed.cpp`.
+
 **Spec 068 — client-local settings**: `SET` stays refused under a principal except the two
 render-only settings (`TimeZone`, `Calendar` — one allowlist, `ClientSettingAllowed`), a constant
 value, a session scope, and only on a session of the client's own (`Principal::session_connection`,

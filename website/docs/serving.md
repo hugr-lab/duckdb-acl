@@ -797,6 +797,8 @@ denied to a principal.
 | client: `acl: unknown transaction ...` | a stale or foreign `transaction_id`; begin one, or omit it |
 | client: `acl: a transaction needs a connection-long session ...` / `acl: a session option needs a connection-long session ...` | the client does not echo the session cookie (ADBC: enable the cookie middleware) |
 | client: `no access to object ...` | a physical name, a name outside the grant, or another session's temp table |
+| client: `acl: the session moved to another node and lost its ...` / `... could not restore its ...` | the client's node went away (or its session died there) while the session held a transaction, temp tables or the view-as mode, or its `USE` / a setting no longer passes; the statement did not run, the next one works on a new session (spec 135) |
+| quack client: `acl: this connection is not known on this node - connect again` | the connection's node restarted or another node got the request; ATTACH again (hugr_node's federation client reconnects by itself) |
 | client: `EXPLAIN needs the explain capability` | grant `explain` on the MAIN catalog grant, by name |
 | client: `... is not permitted under ACL: only the client-local rendering settings ...` | `SET` of anything but `TimeZone`/`Calendar` |
 | client: `SET "<name>" needs a session of the client's own ...` | a `SET` through a gateway prefix; give the client a session |

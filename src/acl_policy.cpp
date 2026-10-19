@@ -438,6 +438,17 @@ void PolicyStore::AuditSessionRefused(const string &door, const string &handle, 
 	             reason_code, reason, -1);
 }
 
+void PolicyStore::AuditSessionMove(const string &door, const string &handle, bool refused, const char *reason_code,
+                                   const string &what) {
+	Principal principal;
+	string why;
+	PolicyStore::SessionRef ref;
+	auto known = SessionPrincipal(handle, principal, why) && SessionRefOf(handle, ref);
+	SessionEvent(audit.get(), known ? principal : Principal(), door, known ? ref.id : string(),
+	             known ? ref.audit_level : static_cast<int8_t>(-1), refused ? "move_refused" : "moved",
+	             refused ? reason_code : "", what, -1);
+}
+
 void PolicyStore::SessionMarkDeclaredViewAs(const string &handle) {
 	lock_guard<mutex> guard(lock);
 	auto entry = sessions.find(handle);

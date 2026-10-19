@@ -312,6 +312,10 @@ void AuditPipeline::Count(const AuditEvent &event) {
 			counters.Add("acl.sessions.opened", {{"door", event.door}});
 		} else if (event.detail == "refused") {
 			counters.Add("acl.sessions.refused", {{"door", event.door}, {"reason_code", event.reason_code}});
+		} else if (event.detail == "moved") {
+			counters.Add("acl.sessions.moved", {{"door", event.door}}); // spec 135
+		} else if (event.detail == "move_refused") {
+			counters.Add("acl.sessions.move_refused", {{"door", event.door}, {"reason_code", event.reason_code}});
 		} else {
 			counters.Add("acl.sessions.closed", {{"door", event.door}, {"how", event.detail}});
 		}

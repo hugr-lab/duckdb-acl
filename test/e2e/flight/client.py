@@ -247,23 +247,34 @@ import os
 
 
 class CookieJar(flight.ClientMiddleware):
-    """Persist the door's session cookie across processes (spec 050): each `ask` is a fresh process,
-    and only a client that RETURNS the cookie keeps its connection-long session - which is what the
-    reuse check exercises."""
+    """Persist the door's cookies across processes (spec 050): each `ask` is a fresh process, and only a
+    client that RETURNS the cookie keeps its connection-long session - which is what the reuse check
+    exercises. A jar, as a driver's cookie middleware keeps one: every cookie by name, the newest value, a
+    Max-Age=0 removing it (spec 135's session-state cookie rides beside the session cookie)."""
     def __init__(self, path):
         self.path = path
-    def sending_headers(self):
+    def _read(self):
         try:
-            cookie = open(self.path).read().strip()
+            pairs = [line.split("=", 1) for line in open(self.path).read().split("; ") if "=" in line]
+            return {name.strip(): value.strip() for name, value in pairs}
         except OSError:
-            cookie = ""
+            return {}
+    def sending_headers(self):
+        jar = self._read()
+        cookie = "; ".join(f"{name}={value}" for name, value in jar.items())
         return {"cookie": cookie} if cookie else {}
     def received_headers(self, headers):
+        jar = self._read()
         for key, values in headers.items():
             if key.lower() == "set-cookie":
                 for item in (values if isinstance(values, list) else [values]):
-                    if "acl_flight_session_id" in item:
-                        open(self.path, "w").write(item.split(";")[0].strip())
+                    first, *attributes = [part.strip() for part in item.split(";")]
+                    name, _, value = first.partition("=")
+                    if any(a.lower() == "max-age=0" for a in attributes):
+                        jar.pop(name, None)
+                    else:
+                        jar[name] = value
+        open(self.path, "w").write("; ".join(f"{name}={value}" for name, value in jar.items()))
     def call_completed(self, exception):
         pass
 

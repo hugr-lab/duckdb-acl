@@ -31,8 +31,9 @@ authentication) is a separate product; nodes are identical either way, which is 
 
 **Several nodes behind a front.** What a front must keep:
 
-- **A session stays on one node.** Its connection, its transaction, its temp tables and its Flight
-  tickets live on the node that opened it.
+- **A session stays on one node while that node serves it.** Its connection, its transaction, its temp
+  tables and its Flight tickets live on the node that opened it. When the node goes away, the session
+  moves (below).
   - `GetFlightInfo` and its `DoGet` must reach the **same node**. A front that spreads one session
     over nodes breaks the ticket (`acl: unknown or already fetched ticket`).
   - A quack client opens several HTTP connections per logical connection, one per FETCH in flight,
@@ -58,5 +59,22 @@ authentication) is a separate product; nodes are identical either way, which is 
   - Any DML RPC whose answer is lost after the commit is in the same position, `DoPut` included.
   - Writes a client may retry must be idempotent (MERGE, a key) or held in the client's own
     transaction (`BeginTransaction`), which the node rolls back with the session.
+- **A session can move to another node** (spec 135) when its node goes away (a roll, a drain, a
+  scale-down) or its session died there. The Flight door sets a third cookie, `acl_session_state`,
+  holding the session's `USE` and the client-local settings the client `SET` (`TimeZone`, `Calendar`, the
+  trace and lineage context). It also records whether something cannot move: an open transaction, a temp
+  table, the view-as mode.
+  - On a node that does not know the session, a context with nothing pinned is restored before the call
+    runs. Each item is judged again as if the client sent it now, so a `USE` of a catalog the principal
+    no longer holds is refused. A long-lived read-only connection simply carries on.
+  - A pinned session gets one refusal, naming what was lost:
+    `acl: the session moved to another node and lost its open transaction; the statement did not run,
+    the connection works on`. The next call works on the new session.
+  - The move verifies the token again, as any new session does: a connection that has lived for months
+    must present a valid token.
+  - A front needs nothing for this. It routes by the label, and a label that is gone goes to any node of
+    the group.
+  - quack authenticates only at CONNECT, so a connection never moves by itself. A node that does not
+    know a connection id answers `acl: this connection is not known on this node - connect again`.
 - **Draining** (`acl_drain()`) keeps established sessions, unfetched tickets included, until they end
   or their idle timeout passes. The orchestrator owns the deadline.

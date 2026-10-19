@@ -496,6 +496,81 @@ echo "$got" | grep -q "'count':" || fail "DROP of the session's temp failed: $go
 got="$(ACL_COOKIE_JAR="$DJ" ask "SELECT * FROM gone")"
 echo "$got" | grep -q "no access to object" || fail "the dropped temp still resolves: $got"
 
+# --- a session moves between nodes (spec 135) -----------------------------------------------------
+# One node plays both: killing every session here, while each client keeps its cookies, leaves a cookie this node
+# does not know - a client re-placed on another node (or one whose session died here). The session-state cookie
+# carries what the session held: a context that is not pinned is restored, each item judged again as if the client
+# sent it; a pinned one (a transaction, temp tables) is refused once, and the connection works on.
+kill_sessions() {
+	echo "SELECT '$1=' || count(*) AS k FROM (SELECT acl_session_kill(id) AS k FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\\s*\"([^\"]+)\"', 1)) AS id)) WHERE k;" >&3
+	for _ in $(seq 1 40); do grep -q "$1=" "$TMP/server.log" && return 0; sleep 0.25; done
+	fail "the server did not kill the sessions ($1)"
+}
+MJ="$TMP/movejar"
+ACL_COOKIE_JAR="$MJ" ask "SELECT 1" >/dev/null
+got="$(ACL_COOKIE_JAR="$MJ" ask "@update:CREATE TABLE stage.moved_t AS SELECT 42 AS x")"
+echo "$got" | grep -q "'count':" || fail "the table for the move check was not created: $got"
+got="$(ACL_COOKIE_JAR="$MJ" ask 'USE c.stage')"
+echo "$got" | grep -qi "error\|denied\|refused" && fail "USE on the session failed: $got"
+got="$(ACL_COOKIE_JAR="$MJ" ask "SET TimeZone = 'Asia/Tokyo'")"
+echo "$got" | grep -qi "error\|denied\|refused" && fail "SET TimeZone on the session failed: $got"
+grep -q "acl_session_state=" "$MJ" || fail "the door set no session-state cookie after USE and SET: $(cat "$MJ")"
+got="$(ACL_COOKIE_JAR="$MJ" ask 'SELECT x FROM moved_t')"
+echo "$got" | grep -q "'x': \[42\]" || fail "the short name did not resolve under USE: $got"
+kill_sessions moved1
+got="$(ACL_COOKIE_JAR="$MJ" ask 'SELECT x FROM moved_t')"
+echo "$got" | grep -q "'x': \[42\]" || fail "a moved session did not keep its USE - a short name resolved elsewhere: $got"
+# the zone a TIMESTAMPTZ is rendered in rides its Arrow type (current_setting is the door's, never a principal's)
+got="$(ACL_SHOW_SCHEMA=1 ACL_COOKIE_JAR="$MJ" ask "SELECT TIMESTAMPTZ '2026-01-01 00:00:00+00' AS t")"
+echo "$got" | grep -q "tz=Asia/Tokyo" || fail "a moved session did not keep its TimeZone: $got"
+# a forged state - a USE of a catalog the principal does not hold - is judged like the client's own USE: refused once
+FJ="$TMP/forgedjar"
+ACL_COOKIE_JAR="$FJ" ask "SELECT 1" >/dev/null
+forged="$(python3 -c 'import base64, json; print(base64.urlsafe_b64encode(json.dumps({"v": 1, "use": {"catalog": "secret_cat", "schema": ""}}).encode()).decode().rstrip("="))')"
+printf '; acl_session_state=%s' "$forged" >>"$FJ"
+kill_sessions forged1
+got="$(ACL_COOKIE_JAR="$FJ" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "the session moved to another node and could not restore its USE" ||
+	fail "a forged USE was not refused at the move: $got"
+got="$(ACL_COOKIE_JAR="$FJ" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "'one': \[1\]" || fail "the connection did not work on after the refused move: $got"
+# a garbled state reads as unreadable: refused once, never read partly
+GJ="$TMP/garbledjar"
+ACL_COOKIE_JAR="$GJ" ask "SELECT 1" >/dev/null
+printf '; acl_session_state=not*base64' >>"$GJ"
+kill_sessions garbled1
+got="$(ACL_COOKIE_JAR="$GJ" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "the session moved to another node and lost its session context" ||
+	fail "an unreadable state was not refused: $got"
+# an open transaction pins: the next call is refused once, naming it - never run in autocommit
+PJ="$TMP/pinjar"
+ACL_COOKIE_JAR="$PJ" ask "SELECT 1" >/dev/null
+got="$(ACL_COOKIE_JAR="$PJ" ask "@update:BEGIN TRANSACTION")"
+echo "$got" | grep -q "'count':" || fail "BEGIN for the pin check failed: $got"
+kill_sessions pinned1
+got="$(ACL_COOKIE_JAR="$PJ" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "the session moved to another node and lost its open transaction; the statement did not run" ||
+	fail "a moved session in a transaction was not refused once: $got"
+got="$(ACL_COOKIE_JAR="$PJ" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "'one': \[1\]" || fail "the connection did not work on after the pinned move: $got"
+grep -q "acl_session_state=" "$PJ" && fail "the refused move left the state cookie in place: $(cat "$PJ")"
+# a temp table pins too
+TPJ="$TMP/temppinjar"
+ACL_COOKIE_JAR="$TPJ" ask "SELECT 1" >/dev/null
+got="$(ACL_COOKIE_JAR="$TPJ" ask "@update:CREATE TEMP TABLE pinned_tmp(id INTEGER)")"
+echo "$got" | grep -q "'count':" || fail "CREATE TEMP for the pin check failed: $got"
+kill_sessions pinned2
+got="$(ACL_COOKIE_JAR="$TPJ" ask "SELECT 1 AS one")"
+echo "$got" | grep -q "the session moved to another node and lost its temp tables" ||
+	fail "a moved session with a temp table was not refused once: $got"
+# and the audit counted each kind
+echo "SELECT 'movecount=' || (SELECT coalesce(sum(value), 0) FROM acl_metrics() WHERE name = 'acl.sessions.moved') ||
+	'/' || (SELECT coalesce(sum(value), 0) FROM acl_metrics() WHERE name = 'acl.sessions.move_refused') AS m;" >&3
+for _ in $(seq 1 40); do grep -q "movecount=" "$TMP/server.log" && break; sleep 0.25; done
+counts="$(sed -n 's/.*movecount=\([0-9]*\)\/\([0-9]*\).*/\1 \2/p' "$TMP/server.log" | tail -1)"
+[ "${counts%% *}" -ge 1 ] && [ "${counts##* }" -ge 4 ] ||
+	fail "the moves were not counted (moved / move_refused): $counts"
+
 # (spec 096's node-group refusal at the door - UNAVAILABLE, the swap kept - is the platform part's: it moved to
 # hugr-node with the code, duckdb-acl spec 127)
 
@@ -511,4 +586,4 @@ done
 [ -n "$stopped" ] || fail "the door was still answering after acl_flight_stop"
 grep -q "session(s) closed" "$TMP/server.log" || fail "acl_flight_stop did not report what it closed"
 
-echo "PASS: a third-party Flight SQL client read its own slice, a cookie connection reused one session, session temp tables stayed the session's own, and the door closed"
+echo "PASS: a third-party Flight SQL client read its own slice, a cookie connection reused one session, session temp tables stayed the session's own, a session moved with its context or was told once what it lost, and the door closed"

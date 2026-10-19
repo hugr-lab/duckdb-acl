@@ -1044,6 +1044,10 @@ struct PolicyStore {
 	void AuditSessionRefused(const string &door, const char *reason_code, const string &reason);
 	//! The same, for a session the door already resolved: the event names its principal and ops id
 	void AuditSessionRefused(const string &door, const string &handle, const char *reason_code, const string &reason);
+	//! spec 135: a session a door seated for a client whose session this node did not know - `moved` (its context
+	//! restored: `what` names the items, never their values) or `move_refused` (`what` is what was lost)
+	void AuditSessionMove(const string &door, const string &handle, bool refused, const char *reason_code,
+	                      const string &what);
 	void SessionMarkDeclaredViewAs(const string &handle);
 	bool SessionDeclaredViewAs(const string &id);
 	//! A door's connection is gone (spec 079: quack's DISCONNECT, or its heartbeat lease ran out): the
