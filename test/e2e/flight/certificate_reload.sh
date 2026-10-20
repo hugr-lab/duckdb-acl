@@ -10,7 +10,9 @@
 #      key_mismatch, and the audit has the door's certificate_refresh_failed;
 #   4. a good pair again (A) is taken, and the refusal is over;
 #   5. a door served from inline PEM, and one served while the refresh is 0, are not watched: they keep their
-#      pair through a swap.
+#      pair through a swap;
+#   6. a door that cannot make its anchor (no writable TMPDIR) serves as before, and the load report says
+#      anchor_unavailable.
 #
 # Skips (exit 0, saying why) without an ACL_FLIGHT build, without pyarrow, or without openssl.
 set -euo pipefail
@@ -260,4 +262,22 @@ recovered() {
 }
 eventually 15 "the load report clears the refusal" recovered
 
-echo "PASS: both doors took a renewed certificate for new connections, kept serving through a broken one and said so, and left an inline or unwatched door alone"
+# --- 6. a door that cannot watch still serves: no private directory for its anchor (TMPDIR unwritable) ----------
+fallback="$(TMPDIR=/nonexistent/acl-anchor "$DUCKDB" -unsigned -no-agent -list 2>&1 <<SQL || true
+LOAD '$ACL_EXT';
+ATTACH ':memory:' AS store;
+SELECT acl_use_db('store','acl',true);
+SET allow_parser_override_extension='strict';
+SET GLOBAL acl_door_certificate_refresh = 1;
+SELECT acl_flight_serve('grpc+tls://localhost:$((PORT + 4))', '$LIVE/tls.crt', '$LIVE/tls.key') AS bound;
+SELECT acl_node_load() AS r;
+SELECT acl_flight_stop('grpc+tls://localhost:$((PORT + 4))') AS stopped;
+SQL
+)"
+case "$fallback" in
+	*Error*) fail "a door without a writable TMPDIR did not serve: $fallback" ;;
+esac
+certificate "$(echo "$fallback" | grep '"certificates"' | tail -1)" flight 'not c["watched"] and c["error"] == "anchor_unavailable"' ||
+	fail "the load report does not say why the door reads its pair once: $fallback"
+
+echo "PASS: both doors took a renewed certificate for new connections, kept serving through a broken one and said so, left an inline or unwatched door alone, and a door that could not watch served as before"

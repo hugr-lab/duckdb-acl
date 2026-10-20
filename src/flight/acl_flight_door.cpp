@@ -3396,14 +3396,25 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		bool watch = has_tls && refresh > 0 && IsLocalCertificatePath(cert_arg) && IsLocalCertificatePath(key_arg);
 		string anchor;
 		auto public_location = *location;
+		// a door never fails to serve for being watched: no private directory (a read-only root and no writable
+		// TMPDIR), no unix socket, gRPC refusing the credentials or the anchor's Init - each serves as before spec
+		// 140, the pair read once, and the load report says why (anchor_unavailable)
+		bool anchor_unavailable = false;
 		if (watch) {
-			anchor = MakeAnchorDirectory();
-			auto unix_location = flight::Location::ForGrpcUnix(anchor + "/flight.sock");
-			if (!unix_location.ok()) {
-				RemoveAnchor(anchor);
-				throw IOException("acl_flight_serve: %s", unix_location.status().ToString());
+			try {
+				anchor = MakeAnchorDirectory();
+				auto unix_location = flight::Location::ForGrpcUnix(anchor + "/flight.sock");
+				if (unix_location.ok()) {
+					location = unix_location;
+				} else {
+					RemoveAnchor(anchor);
+					anchor.clear();
+					anchor_unavailable = true;
+				}
+			} catch (std::exception &) {
+				anchor_unavailable = true;
 			}
-			location = unix_location;
+			watch = !anchor_unavailable;
 		}
 
 		auto &doors = ServedDoors::Get();
@@ -3470,14 +3481,20 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 			door.feed = make_shared_ptr<FlightCertificateFeed>();
 			door.feed->Set(cert_pem, key_pem);
 			auto credentials = FeedCredentials(*door.feed);
-			if (!credentials) {
+			if (credentials) {
+				auto public_address = host + ":" + std::to_string(port);
+				options.builder_hook = [credentials, public_address](void *raw) {
+					static_cast<grpc::ServerBuilder *>(raw)->AddListeningPort(public_address, credentials);
+				};
+			} else {
 				RemoveAnchor(anchor);
-				throw IOException("acl_flight_serve: gRPC refused the TLS credentials");
+				anchor.clear();
+				door.feed.reset();
+				watch = false;
+				anchor_unavailable = true;
+				options.location = public_location;
+				options.tls_certificates.push_back(flight::CertKeyPair {cert_pem, key_pem});
 			}
-			auto public_address = host + ":" + std::to_string(port);
-			options.builder_hook = [credentials, public_address](void *raw) {
-				static_cast<grpc::ServerBuilder *>(raw)->AddListeningPort(public_address, credentials);
-			};
 		} else if (has_tls) {
 			options.tls_certificates.push_back(flight::CertKeyPair {cert_pem, key_pem});
 		}
@@ -3503,6 +3520,7 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 			door.server = std::make_unique<AclFlightSqlServer>(door.state);
 			init = door.server->Init(fallback);
 			watch = false;
+			anchor_unavailable = true;
 			door.feed.reset();
 		}
 		if (!init.ok()) {
@@ -3544,6 +3562,9 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 				                          .count();
 				string error_class;
 				CheckCertificatePair(cert_pem, key_pem, status.not_after, error_class);
+				if (anchor_unavailable) {
+					status.error = "anchor_unavailable"; // watched it would be, but it reads its pair once
+				}
 				report(status, false);
 			}
 		}

@@ -34,7 +34,8 @@ struct DoorCertificateStatus {
 	//! when the served pair was taken, unix seconds
 	int64_t refreshed_at = 0;
 	//! the class of the last refused renewal ("" when the files hold the served pair): unreadable,
-	//! certificate_unparsable, key_unparsable, key_mismatch, refused_by_door
+	//! certificate_unparsable, key_unparsable, key_mismatch, refused_by_door; on an unwatched door served from
+	//! local files, anchor_unavailable: the Flight door could not watch them (spec 140) and read its pair once
 	string error;
 };
 
