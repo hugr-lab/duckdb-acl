@@ -2167,6 +2167,16 @@ public:
 			if (known) {
 				// the note was written at Prepare: the execution is judged by the switch as it is now
 				reservation->profile.session_profile_override = ref.profile_override;
+				// ...and it runs under the session of the call that executes it (spec 066's addendum): a
+				// cookie-less client's GetFlightInfo session ended with that call, and the statement its
+				// DoGet runs - on the workers, the handle submitted - names the DoGet's own session, the live
+				// one, to its AclConnection (the call's own session left out of acl_drain() / node_load /
+				// platform.sessions; a secrets service acting for the session, spec 078)
+				if (!reservation->profile.proto.session.empty()) {
+					reservation->profile.proto.session = ref.id;
+					reservation->profile.session_opened_at = ref.opened_at;
+					reservation->profile.session_expires_at = ref.expires_at;
+				}
 			}
 			acl::SetConnectionProfileNote(context, reservation->profile);
 			if (trace.empty()) {
