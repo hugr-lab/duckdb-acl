@@ -125,6 +125,34 @@ void AclQuackServeFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		cfg.cert_pem = cert_arg.empty() ? string() : ReadPemArg(context, cert_arg, "certificate", "acl_quack_serve");
 		cfg.key_pem = key_arg.empty() ? string() : ReadPemArg(context, key_arg, "private key", "acl_quack_serve");
 		auto shared_store = SharedStoreOf(state);
+		if (!cert_arg.empty()) {
+			// spec 140: a pair given as local files is re-read and a renewed one swapped in; every TLS door
+			// says what its certificate is (the load report's `certificates`), its stop withdraws it
+			auto refresh = DoorCertificateRefresh(*context.db);
+			if (refresh > 0 && IsLocalCertificatePath(cert_arg) && IsLocalCertificatePath(key_arg)) {
+				cfg.cert_path = LocalCertificatePath(cert_arg);
+				cfg.key_path = LocalCertificatePath(key_arg);
+				cfg.certificate_refresh = refresh;
+			}
+			weak_ptr<PolicyStore> weak_store = shared_store;
+			auto key = "quack " + uri;
+			cfg.certificate_report = [weak_store, key](const DoorCertificateStatus &status, bool failed) {
+				auto store_now = weak_store.lock();
+				if (!store_now) {
+					return;
+				}
+				store_now->NoteDoorCertificate(key, status);
+				if (failed) {
+					store_now->AuditDoor("quack", "certificate_refresh_failed", false, "unavailable",
+					                     "acl: the door's renewed certificate was not taken (" + status.error + ")");
+				}
+			};
+			cfg.certificate_forget = [weak_store, key]() {
+				if (auto store_now = weak_store.lock()) {
+					store_now->ForgetDoorCertificate(key);
+				}
+			};
+		}
 		// per request, so the discovery document tracks an issuer added or dropped after the serve;
 		// the document is spec 064's - the same one the Flight door answers to `discover-auth`
 		cfg.wellknown = [shared_store] {

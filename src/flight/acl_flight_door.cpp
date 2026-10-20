@@ -27,6 +27,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <random>
+#include <grpc/grpc.h>
+#include <grpc/grpc_security.h>
+#include <grpcpp/security/server_credentials.h>
+#include <grpcpp/server_builder.h>
 #include <arrow/table.h> // arrow::Schema is complete here, not in the flight headers alone
 #include <arrow/util/config.h>
 
@@ -37,6 +43,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/blob.hpp"
 #include "acl_door_auth.hpp"
+#include "acl_door_certificate.hpp"
 #include "acl_door_common.hpp"
 #include "acl_node_label.hpp"
 #include "acl_node_load.hpp"
@@ -3197,8 +3204,64 @@ private:
 	shared_ptr<FlightDoorState> state;
 };
 
+//! spec 140: the pair a watched Flight door serves. gRPC asks its certificate-config fetcher at the server's
+//! start and for new handshakes, and takes a new config only when this hands one out (RELOAD_NEW); the
+//! watcher sets a renewed pair only once it checked, so gRPC never sees a broken one and keeps the last it
+//! took. The pair stays in memory - no copy of the key on disk.
+struct FlightCertificateFeed {
+	std::mutex lock;
+	string cert_pem;
+	string key_pem;
+	uint64_t generation = 0; // pairs set
+	uint64_t taken = 0;      // the generation gRPC holds
+
+	void Set(const string &cert, const string &key) {
+		std::lock_guard<std::mutex> guard(lock);
+		cert_pem = cert;
+		key_pem = key;
+		generation++;
+	}
+
+	static grpc_ssl_certificate_config_reload_status Fetch(void *self, grpc_ssl_server_certificate_config **config) {
+		auto *feed = static_cast<FlightCertificateFeed *>(self);
+		std::lock_guard<std::mutex> guard(feed->lock);
+		if (feed->taken == feed->generation) {
+			return GRPC_SSL_CERTIFICATE_CONFIG_RELOAD_UNCHANGED;
+		}
+		grpc_ssl_pem_key_cert_pair pair {feed->key_pem.c_str(), feed->cert_pem.c_str()};
+		*config = grpc_ssl_server_certificate_config_create(nullptr, &pair, 1);
+		if (!*config) {
+			return GRPC_SSL_CERTIFICATE_CONFIG_RELOAD_FAIL; // gRPC keeps the config it holds
+		}
+		feed->taken = feed->generation;
+		return GRPC_SSL_CERTIFICATE_CONFIG_RELOAD_NEW;
+	}
+};
+
+//! gRPC's C++ credentials wrap C ones only through a protected constructor; the fetcher's are C ones
+class FetchedServerCredentials final : public grpc::ServerCredentials {
+public:
+	explicit FetchedServerCredentials(grpc_server_credentials *credentials) : grpc::ServerCredentials(credentials) {
+	}
+};
+
+std::shared_ptr<grpc::ServerCredentials> FeedCredentials(FlightCertificateFeed &feed) {
+	grpc_init(); // the C calls below before any C++ object holds the library; balanced at the end
+	auto *options = grpc_ssl_server_credentials_create_options_using_config_fetcher(
+	    GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE, &FlightCertificateFeed::Fetch, &feed);
+	auto *credentials = options ? grpc_ssl_server_credentials_create_with_options(options) : nullptr;
+	std::shared_ptr<grpc::ServerCredentials> wrapped;
+	if (credentials) {
+		wrapped = std::make_shared<FetchedServerCredentials>(credentials);
+	}
+	grpc_shutdown();
+	return wrapped;
+}
+
 //! A door that is listening: the server, the thread serving it, and the state its calls share.
 struct ServedDoor {
+	//! spec 140: first, so it outlives the server whose fetcher reads it
+	shared_ptr<FlightCertificateFeed> feed;
 	std::unique_ptr<AclFlightSqlServer> server;
 	std::thread thread;
 	shared_ptr<FlightDoorState> state;
@@ -3207,7 +3270,41 @@ struct ServedDoor {
 	//! privilege (the 2026-09-03 review); and an instance that closed without acl_flight_stop left
 	//! a door nobody could reclaim. The quack door has held the same since spec 063.
 	weak_ptr<DatabaseInstance> owner;
+	//! spec 140: the watcher of a door served from local files - it judges each renewal, sets a good one
+	//! on the feed and reports it (the load report, a refusal's event). Declared last: it is stopped first
+	//! when the door goes.
+	unique_ptr<DoorCertificateWatcher> certificate;
 };
+
+//! spec 140: a directory only this process's user may enter, for the unix socket Arrow's own location
+//! needs while the public port is ours (the builder hook's); removed with the socket right after Init
+string MakeAnchorDirectory() {
+	std::random_device random;
+	auto base = std::filesystem::temp_directory_path();
+	for (int attempt = 0; attempt < 8; attempt++) {
+		auto name = "acl-flight-" + std::to_string(random()) + std::to_string(random());
+		auto path = base / name;
+		std::error_code error;
+		if (std::filesystem::create_directory(path, error)) {
+			std::filesystem::permissions(path, std::filesystem::perms::owner_all,
+			                             std::filesystem::perm_options::replace, error);
+			if (error) {
+				std::filesystem::remove(path, error);
+				break;
+			}
+			return path.string();
+		}
+	}
+	throw IOException("acl_flight_serve: could not make a private directory for the door's internal socket");
+}
+
+void RemoveAnchor(const string &directory) {
+	if (directory.empty()) {
+		return;
+	}
+	std::error_code error;
+	std::filesystem::remove_all(directory, error);
+}
 
 //! One server per listen uri, per process. Kept here rather than in the store: the store is policy,
 //! and a listening socket is not.
@@ -3287,6 +3384,27 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 			}
 			location = tls_location;
 		}
+		// spec 140: a pair given as local files is watched - Arrow builds its credentials from PEM once, so
+		// the public port is added by the builder hook with credentials gRPC refetches (the feed below), and
+		// Arrow's location becomes a unix socket nothing can reach (its path is unlinked after Init)
+		string cert_arg, key_arg;
+		if (has_tls) {
+			cert_arg = FlatVector::GetData<string_t>(args.data[1])[row].GetString();
+			key_arg = FlatVector::GetData<string_t>(args.data[2])[row].GetString();
+		}
+		auto refresh = DoorCertificateRefresh(*context.db);
+		bool watch = has_tls && refresh > 0 && IsLocalCertificatePath(cert_arg) && IsLocalCertificatePath(key_arg);
+		string anchor;
+		auto public_location = *location;
+		if (watch) {
+			anchor = MakeAnchorDirectory();
+			auto unix_location = flight::Location::ForGrpcUnix(anchor + "/flight.sock");
+			if (!unix_location.ok()) {
+				RemoveAnchor(anchor);
+				throw IOException("acl_flight_serve: %s", unix_location.status().ToString());
+			}
+			location = unix_location;
+		}
 
 		auto &doors = ServedDoors::Get();
 		// Reclaim a door left behind by an instance that closed without acl_flight_stop, BEFORE
@@ -3332,12 +3450,36 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		// adds the two pre-auth answers: the `discover-auth` payload reads the discovery document,
 		// and a BasicAuth handshake runs the IdP-gated password grant (the middleware below).
 		options.auth_handler = std::make_shared<AclDoorAuthHandler>(door.state);
+		string cert_pem, key_pem;
 		if (has_tls) {
-			auto cert = ReadPemArg(context, FlatVector::GetData<string_t>(args.data[1])[row].GetString(), "certificate",
-			                       "acl_flight_serve");
-			auto key = ReadPemArg(context, FlatVector::GetData<string_t>(args.data[2])[row].GetString(), "key",
-			                      "acl_flight_serve");
-			options.tls_certificates.push_back(flight::CertKeyPair {std::move(cert), std::move(key)});
+			try {
+				cert_pem = ReadPemArg(context, cert_arg, "certificate", "acl_flight_serve");
+				key_pem = ReadPemArg(context, key_arg, "key", "acl_flight_serve");
+			} catch (...) {
+				RemoveAnchor(anchor);
+				throw;
+			}
+		}
+		if (watch) {
+			// the pair is judged here, as Arrow's Init judged it: gRPC takes the feed's first pair as it is
+			string not_after, error_class;
+			if (!CheckCertificatePair(cert_pem, key_pem, not_after, error_class)) {
+				RemoveAnchor(anchor);
+				throw IOException("acl_flight_serve: the certificate and key are not a pair (%s)", error_class);
+			}
+			door.feed = make_shared_ptr<FlightCertificateFeed>();
+			door.feed->Set(cert_pem, key_pem);
+			auto credentials = FeedCredentials(*door.feed);
+			if (!credentials) {
+				RemoveAnchor(anchor);
+				throw IOException("acl_flight_serve: gRPC refused the TLS credentials");
+			}
+			auto public_address = host + ":" + std::to_string(port);
+			options.builder_hook = [credentials, public_address](void *raw) {
+				static_cast<grpc::ServerBuilder *>(raw)->AddListeningPort(public_address, credentials);
+			};
+		} else if (has_tls) {
+			options.tls_certificates.push_back(flight::CertKeyPair {cert_pem, key_pem});
 		}
 		// spec 050: the cookie identifies a client connection, which is what lets a session persist
 		std::shared_ptr<flight::ServerMiddlewareFactory> cookie_factory =
@@ -3347,11 +3489,63 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		options.middleware.emplace_back(string("acl-password-handshake"),
 		                                std::make_shared<PasswordHandshakeFactory>(door.state, has_tls));
 		auto init = door.server->Init(options);
+		// spec 140: the anchor's path goes either way - after Init its listener holds the socket, and no
+		// path is left to connect to
+		RemoveAnchor(anchor);
+		if (!init.ok() && watch) {
+			// a platform whose gRPC binds no unix socket, or the public port refused: once more as before
+			// spec 140 - Arrow's own TLS on the public address, the pair read once - so a door never fails to
+			// serve for being watched. A port in use fails this second Init too, and says so.
+			auto fallback = options;
+			fallback.location = public_location;
+			fallback.builder_hook = nullptr;
+			fallback.tls_certificates = {flight::CertKeyPair {cert_pem, key_pem}};
+			door.server = std::make_unique<AclFlightSqlServer>(door.state);
+			init = door.server->Init(fallback);
+			watch = false;
+			door.feed.reset();
+		}
 		if (!init.ok()) {
 			// Init binds the listen address (and loads the TLS material): what fails here is the
 			// environment - a port in use, an address that is not ours - not the policy, so it is an
 			// IO error (the error contract, website/docs/security.md section 8)
 			throw IOException("acl_flight_serve: %s", init.ToString());
+		}
+		if (has_tls) {
+			// spec 140: what the load report says of the door's certificate; a watched door's watcher keeps
+			// saying it (it judges each renewal, sets a good one on the feed gRPC fetches, reports a refusal)
+			weak_ptr<PolicyStore> weak_store = door.state->store;
+			auto key = "flight " + uri;
+			auto report = [weak_store, key](const DoorCertificateStatus &status, bool failed) {
+				auto store_now = weak_store.lock();
+				if (!store_now) {
+					return;
+				}
+				store_now->NoteDoorCertificate(key, status);
+				if (failed) {
+					store_now->AuditDoor("flight", "certificate_refresh_failed", false, "unavailable",
+					                     "acl: the door's renewed certificate was not taken (" + status.error + ")");
+				}
+			};
+			if (watch) {
+				auto feed = door.feed;
+				door.certificate = make_uniq<DoorCertificateWatcher>(
+				    "flight", LocalCertificatePath(cert_arg), LocalCertificatePath(key_arg), refresh, cert_pem, key_pem,
+				    [feed](const string &cert, const string &key) {
+					    feed->Set(cert, key); // gRPC takes it at its next fetch, a new handshake
+					    return true;
+				    },
+				    report);
+			} else {
+				DoorCertificateStatus status;
+				status.door = "flight";
+				status.refreshed_at = std::chrono::duration_cast<std::chrono::seconds>(
+				                          std::chrono::system_clock::now().time_since_epoch())
+				                          .count();
+				string error_class;
+				CheckCertificatePair(cert_pem, key_pem, status.not_after, error_class);
+				report(status, false);
+			}
 		}
 		// Serve() blocks for the life of the door, so it gets a thread of its own; Shutdown() is what
 		// ends it, and acl_flight_stop is the only thing that calls that.
@@ -3385,6 +3579,8 @@ void AclFlightStopFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			door = std::move(entry->second);
 			doors.doors.erase(entry);
 		}
+		door.certificate.reset(); // spec 140: its watcher first, then what it reported
+		StoreOf(state).ForgetDoorCertificate("flight " + uri);
 		auto shutdown = door.server->Shutdown();
 		if (door.thread.joinable()) {
 			door.thread.join();

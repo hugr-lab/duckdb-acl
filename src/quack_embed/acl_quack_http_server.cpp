@@ -39,6 +39,7 @@
 #include <type_traits>
 #endif
 
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -269,7 +270,7 @@ class AclQuackServer : public QuackServer {
 public:
 	AclQuackServer(ClientContext &context, const QuackUri &uri_p, const string &token_p, const string &cert_pem,
 	               const string &key_pem, std::function<string()> wellknown, std::function<bool()> draining,
-	               ObservedRoute metrics, ObservedRoute node_load, bool discovery);
+	               ObservedRoute metrics, ObservedRoute node_load, bool discovery, const AclQuackServeConfig &cfg);
 	~AclQuackServer() override;
 
 	void StopAccepting() override;
@@ -291,8 +292,16 @@ public:
 
 private:
 	static void ListenThread(AclQuackServer *self);
+	//! spec 140: hand the TLS context a renewed pair (already judged whole by the watcher)
+	bool UpdateCertificate(const string &cert_pem, const string &key_pem);
 
 	std::unique_ptr<duckdb_httplib::Server> server;
+	//! spec 140: the watcher of a door served from local files, stopped before the listener (the flight
+	//! build's, with its OpenSSL); and the door's withdrawal of what it said of its certificate
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+	unique_ptr<DoorCertificateWatcher> certificate;
+#endif
+	std::function<void()> certificate_forget;
 	std::mutex state_lock;
 	AclServerState server_state = AclServerState::WAITING_TO_START;
 	std::function<string()> wellknown;
@@ -308,9 +317,10 @@ private:
 AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, const string &token_p,
                                const string &cert_pem, const string &key_pem, std::function<string()> wellknown_p,
                                std::function<bool()> draining_p, ObservedRoute metrics_p, ObservedRoute node_load_p,
-                               bool discovery)
-    : QuackServer(context, uri_p, token_p), wellknown(std::move(wellknown_p)), draining(std::move(draining_p)),
-      metrics(std::move(metrics_p)), node_load(std::move(node_load_p)) {
+                               bool discovery, const AclQuackServeConfig &cfg)
+    : QuackServer(context, uri_p, token_p), certificate_forget(cfg.certificate_forget),
+      wellknown(std::move(wellknown_p)), draining(std::move(draining_p)), metrics(std::move(metrics_p)),
+      node_load(std::move(node_load_p)) {
 	if (!cert_pem.empty() || !key_pem.empty()) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 		if (cert_pem.empty() || key_pem.empty()) {
@@ -324,6 +334,23 @@ AclQuackServer::AclQuackServer(ClientContext &context, const QuackUri &uri_p, co
 			throw IOException("acl_quack_serve: the TLS context refused the certificate/key pair");
 		}
 		server = std::move(tls);
+		// spec 140: what the load report says of the door's certificate - a watched door's watcher keeps
+		// saying it, and swaps a renewed pair into the TLS context for the new handshakes
+		if (!cfg.cert_path.empty() && cfg.certificate_refresh > 0) {
+			certificate = make_uniq<DoorCertificateWatcher>(
+			    "quack", cfg.cert_path, cfg.key_path, cfg.certificate_refresh, cert_pem, key_pem,
+			    [this](const string &cert, const string &key) { return UpdateCertificate(cert, key); },
+			    cfg.certificate_report);
+		} else if (cfg.certificate_report) {
+			DoorCertificateStatus status;
+			status.door = "quack";
+			status.refreshed_at =
+			    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+			        .count();
+			string error_class;
+			CheckCertificatePair(cert_pem, key_pem, status.not_after, error_class);
+			cfg.certificate_report(status, false);
+		}
 #else
 		throw IOException("acl_quack_serve: TLS needs a build that carries OpenSSL (the flight build) - "
 		                  "this build serves cleartext only");
@@ -503,7 +530,29 @@ void AclQuackServer::ListenThread(AclQuackServer *self) {
 	}
 }
 
+bool AclQuackServer::UpdateCertificate(const string &cert_pem, const string &key_pem) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+	if constexpr (HasPemMemoryCtor<duckdb_httplib::SSLServer>::value) {
+		// under the server's own context lock: a handshake that starts after this takes the new pair
+		auto *tls = static_cast<duckdb_httplib::SSLServer *>(server.get());
+		return tls->update_certs_pem(cert_pem.c_str(), key_pem.c_str());
+	}
+#endif
+	return false; // an httplib without the in-place update: the pair stays as served (refused_by_door)
+}
+
 void AclQuackServer::StopAccepting() {
+	// spec 140: the watcher first - nothing swaps into a context being torn down - then what it said
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+	if (certificate) {
+		certificate->Stop();
+	}
+#endif
+	if (certificate_forget) {
+		auto forget = std::move(certificate_forget);
+		certificate_forget = nullptr;
+		forget();
+	}
 	std::lock_guard<std::mutex> guard(state_lock);
 	if (server_state == AclServerState::RUNNING) {
 		server->wait_until_ready();
@@ -609,8 +658,9 @@ string StartAclQuackServer(ClientContext &context, const AclQuackServeConfig &cf
 			}
 		}
 
-		auto server = make_uniq<AclQuackServer>(context, listen_uri, cfg.token, cfg.cert_pem, cfg.key_pem,
-		                                        cfg.wellknown, cfg.draining, cfg.metrics, cfg.node_load, cfg.discovery);
+		auto server =
+		    make_uniq<AclQuackServer>(context, listen_uri, cfg.token, cfg.cert_pem, cfg.key_pem, cfg.wellknown,
+		                              cfg.draining, cfg.metrics, cfg.node_load, cfg.discovery, cfg);
 		auto key = server->ListenUri().CanonicalUri();
 		actual_uri_out = server->ListenUri().Uri();
 		RegisterExitStop();

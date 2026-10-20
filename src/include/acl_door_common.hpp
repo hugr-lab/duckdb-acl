@@ -68,6 +68,9 @@ string JsonQuote(const string &value);
 //! a refusal; `what` is "certificate" or "private key". A non-PEM document is refused here rather
 //! than reaching the TLS stack as a cryptic init error.
 string ReadPemArg(ClientContext &context, const string &arg, const char *what, const char *fn);
+//! spec 140: seconds between a door's re-reads of its certificate when it was served from local files
+//! (acl_door_certificate_refresh, GLOBAL; 0 = read once, at serve)
+idx_t DoorCertificateRefresh(DatabaseInstance &db);
 
 //! The host part of a listen uri as either door writes it: `quack:host:port`, `grpc://host:port`,
 //! `grpc+tls://host:port` or a bare `host:port`; a bracketed IPv6 literal keeps its brackets.

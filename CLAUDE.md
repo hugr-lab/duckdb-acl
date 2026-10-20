@@ -896,6 +896,15 @@ watch loop (it sweeps, then answers what remains - the auto-sweep rode `SessionO
 turns off), stragglers go to `acl_session_kill`, then the doors stop and the process exits. `acl_resume()` / `acl_drain_status()` complete the surface; all three are denied to a
 principal. The node never waits or times out by itself — the deadline belongs to the orchestrator.
 
+**Spec 140 — a door picks up a renewed certificate**: a pair given as LOCAL files (`IsLocalCertificatePath`; the
+csi-driver's, hugr-platform spec 005) is re-read every `acl_door_certificate_refresh` s (GLOBAL, 60; 0 = once) by a
+`DoorCertificateWatcher` (`src/flight/acl_door_certificate.cpp`, OpenSSL: `CheckCertificatePair` judges the pair whole,
+a refusal gets a second look a check later). Flight: Arrow's location is an unlinked unix socket in a `0700` dir, the
+public port is added by `builder_hook` with gRPC's certificate-config FETCHER (`FlightCertificateFeed`: a new config
+only for a checked pair, UNCHANGED otherwise - gRPC's FileWatcherCertificateProvider took a mismatched pair and every
+handshake failed); quack: `SSLServer::update_certs_pem`. Status per door in `acl_node_load()`'s `certificates`, a
+refusal is a `door` event `certificate_refresh_failed`. e2e `test/e2e/flight/certificate_reload.sh`.
+
 **Spec 134 — the node's label in its sessions' names**: behind a front that keeps no table of sessions,
 `acl_node_label` (GLOBAL only, default '' = today's behaviour; a DNS label, `[a-z0-9-]` ≤ 63 - header-only
 `acl_node_label.hpp`) makes both doors send the cookie `acl_node=<label>; HttpOnly; Path=/; SameSite=Strict` to a

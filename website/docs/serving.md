@@ -95,6 +95,13 @@ SELECT acl_flight_stop('grpc://localhost:32700');
   instance opened in the same process (`acl_flight_stop: the door on <uri> belongs to another
   database instance`).
 - mTLS is not offered; the token is the client's identity, the certificate is the wire's.
+- **A renewed certificate is picked up** (spec 140). When `cert` and `key` are local file paths, which is how
+  cert-manager's csi-driver hands them to a pod, both doors re-read the files every
+  `acl_door_certificate_refresh` seconds (default 60). A renewed pair whose key matches its certificate serves the
+  new connections; open connections carry on. A pair that does not parse or does not match is not taken: the door
+  keeps serving the last good one, records a `door` event `certificate_refresh_failed` (its class only), and
+  `acl_node_load()` shows it under `certificates` (`not_after`, `refreshed_at`, `error`). Inline PEM and remote
+  locations are read once, as is everything while the setting is `0`.
 
 What the door serves, every RPC authenticated per call from the `authorization: Bearer <jwt>` header:
 
@@ -546,6 +553,7 @@ report success and change nothing):
 | `acl_max_ingest_rows` | 0 | rows one Flight ingest may stream; `0` = unlimited |
 | `acl_metadata_max_rows` | 1000000 | rows a metadata surface (information_schema, duckdb_*, SHOW, the Flight catalog RPCs, quack's catalog load) answers a principal; above it the statement is refused, never cut; `0` = unlimited; a session may lower it for itself, never raise it (spec 119) |
 | `acl_max_result_rows` | 0 | rows one Flight statement may hand out: exactly that many go out, then the stream ends in a refusal; `0` = unlimited (spec 070) |
+| `acl_door_certificate_refresh` | 60 | seconds between a door's re-reads of its certificate and key when they were given as local files; a renewed pair that checks serves the new connections; `0` = read once, at serve. GLOBAL (spec 140) |
 | `acl_flight_stream_idle` | 30 | seconds a Flight result stream may sit unpulled (since its last pull returned) before the session's next statement ends it and runs; a stream being pulled is never ended - the statement waits; `0` = never - the statement waits for the stream's own end (spec 070) |
 | `acl_jwt_clock_skew` | 60 | seconds of skew allowed on JWT `exp`/`nbf` (GLOBAL since the 2026-09-03 review) |
 | `acl_version_check_interval` | 1000 | milliseconds between `policy_version` re-reads of the policy catalog (`0` = every batch) |

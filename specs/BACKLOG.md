@@ -47,6 +47,12 @@ the cluster profile (093) and the schema window (094). The rest lives in new rep
 
 ## Open
 
+- **A Flight door left serving aborts the process at exit** (found 2026-10-20 by spec 140's `tls.sh` fix): the
+  CLI that served a door and exits without `acl_flight_stop` ends in `libc++abi: terminating`. `ServedDoors` is a
+  function-static, destroyed with a serving thread still joinable in it. quack's registry has been leaked, with an
+  `atexit` stop, since spec 084; the Flight door wants the same. hugr-node stops its doors on SIGTERM, so a node
+  never meets it.
+
 - **Lineage follow-ups (spec 107):**
   - the quack drain's writes (`DrainStreamUnderPrincipal`);
   - schema grants re-sending tags;

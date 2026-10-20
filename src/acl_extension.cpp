@@ -139,6 +139,19 @@ shared_ptr<acl::PolicyStore> LoadInternal(ExtensionLoader &loader) {
 	                          "acl: seconds an open Flight result stream may sit unpulled before the session's "
 	                          "next statement ends it and runs (0 = never: the statement waits for the stream)",
 	                          LogicalType::BIGINT, Value::BIGINT(30), nullptr, SetScope::GLOBAL);
+	// spec 140: a door served from local files re-reads its certificate and key - the csi-driver renews
+	// them in place - and the renewed pair serves the new connections
+	config.AddExtensionOption(
+	    "acl_door_certificate_refresh",
+	    "acl: seconds between a door's re-reads of its certificate and key when it was served from local files; "
+	    "a renewed pair that checks serves the new connections (0 = read once, at serve)",
+	    LogicalType::BIGINT, Value::BIGINT(60),
+	    [](ClientContext &, SetScope, Value &value) {
+		    if (!value.IsNull() && value.GetValue<int64_t>() < 0) {
+			    throw InvalidInputException("acl_door_certificate_refresh: seconds, 0 or more");
+		    }
+	    },
+	    SetScope::GLOBAL);
 	config.AddExtensionOption("acl_audit_denials_per_second",
 	                          "acl: refusals RECORDED per second per source (a session, a principal, a door); "
 	                          "the rest are counted only, as dropped where=rate_limit (0 = unlimited)",

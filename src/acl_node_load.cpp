@@ -261,6 +261,17 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besi
 		          ",\"refused\":" + std::to_string(now.refused) + "}";
 	}
 #endif
+	// spec 140: the served doors' certificates - when each expires, when its pair was taken, and the class
+	// of a renewal it refused (a door that re-reads its files says watched)
+	string certificates;
+	for (auto &certificate : store.DoorCertificates()) {
+		certificates +=
+		    string(certificates.empty() ? "" : ",") + "{\"door\":" + JsonQuote(certificate.door) +
+		    ",\"watched\":" + (certificate.watched ? "true" : "false") +
+		    ",\"not_after\":" + (certificate.not_after.empty() ? string("null") : JsonQuote(certificate.not_after)) +
+		    ",\"refreshed_at\":" + std::to_string(certificate.refreshed_at) +
+		    ",\"error\":" + (certificate.error.empty() ? string("null") : JsonQuote(certificate.error)) + "}";
+	}
 	return "{\"draining\":" + string(draining ? "true" : "false") +
 	       ",\"observe\":" + (ObserveOpen(db) ? "\"open\"" : "\"token\"") +
 	       ",\"group\":" + (group.empty() ? string("null") : JsonQuote(group)) +
@@ -270,7 +281,8 @@ string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besi
 	       ",\"applied\":" + (applied < 0 ? string("null") : std::to_string(applied)) + "}" +
 	       ",\"sessions\":{\"live\":" + std::to_string(live) + ",\"max\":" + std::to_string(max_sessions) +
 	       ",\"by_door\":{" + by_door + "},\"by_group\":{" + groups + "}},\"quack\":" + quack +
-	       ",\"streams\":" + streams + ",\"admit\":{\"new_session\":" + (session_room ? "true" : "false") +
+	       ",\"streams\":" + streams + ",\"certificates\":[" + certificates + "]" +
+	       ",\"admit\":{\"new_session\":" + (session_room ? "true" : "false") +
 	       ",\"new_quack_client\":" + (session_room && quack_room ? "true" : "false") +
 	       ",\"new_stream\":" + (stream_room ? "true" : "false") + "}}";
 }

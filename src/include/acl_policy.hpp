@@ -6,6 +6,7 @@
 #pragma once
 
 #include "acl_name_path.hpp"
+#include "acl_door_certificate.hpp"
 #include "acl_function_categories.hpp"
 #include "acl_identity.hpp"
 #include "acl_principal.hpp"
@@ -464,6 +465,10 @@ struct PolicyStore {
 	//! Atomic rather than under `lock`: the doors read it on paths that must not contend with the
 	//! session map, and a flag flip needs no invariant with anything else.
 	std::atomic<bool> draining {false};
+	//! spec 140: the served doors' certificates, as their watchers last saw them, by door uri - the load
+	//! report's `certificates`. Its own lock: a watcher's thread writes it, never with `lock` held.
+	mutable std::mutex door_certificates_lock;
+	std::map<string, DoorCertificateStatus> door_certificates;
 	//! When sessions were last swept (spec 044), so the automatic sweep inside SessionOpen runs at most
 	//! once a minute rather than on every arrival.
 	int64_t last_sweep = 0;
@@ -1164,6 +1169,11 @@ struct PolicyStore {
 	//! node serves. SetDraining returns the previous value (acl_resume tells whether it did anything).
 	bool SetDraining(bool value);
 	bool Draining() const;
+	//! spec 140: a served door's certificate - its watcher's report, or the pair read once at serve - and
+	//! its stop forgetting it; DoorCertificates lists them, by door uri, for the load report.
+	void NoteDoorCertificate(const string &uri, const DoorCertificateStatus &status);
+	void ForgetDoorCertificate(const string &uri);
+	vector<DoorCertificateStatus> DoorCertificates() const;
 
 	//! Grant/revoke a GLOBAL ACL-administration bundle for a role (spec 009 / 117). Managing one catalog
 	//! is not granted here - it is a capability of the catalog grant itself ({"manage": true}). A role
