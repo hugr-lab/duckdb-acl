@@ -49,6 +49,12 @@ its new connections: no restart, and no connection cut.
     - The pair stays in memory: no copy of the key on disk.
     - No client certificate is requested, as with Arrow's credentials before.
   - **One server**: the auth handler, the middleware and the sessions stay as they are, unchanged.
+  - **A door never fails to serve for being watched.** Any of these makes it serve as before this spec, its pair
+    read once, and its load report entry says `anchor_unavailable`:
+    - no private directory (a read-only root and no writable `TMPDIR`, a hardened pod);
+    - no unix socket;
+    - gRPC refusing the fetcher's credentials;
+    - the anchor's `Init` failing.
   - **Not gRPC's `FileWatcherCertificateProvider`**, which the draft proposed. The e2e found that it takes a
     renewal whose key does not match its certificate, after which every new handshake fails. Only a pair that has
     been judged whole reaches gRPC now.
@@ -60,7 +66,8 @@ its new connections: no restart, and no connection cut.
     content;
   - the load report (`acl_node_load()`) gains `certificates`: per served TLS door, `door` (`flight` or `quack`),
     `watched`, `not_after`, `refreshed_at` (unix seconds), and `error` (a class: `unreadable`,
-    `certificate_unparsable`, `key_unparsable`, `key_mismatch`, `refused_by_door`).
+    `certificate_unparsable`, `key_unparsable`, `key_mismatch`, `refused_by_door`; and `anchor_unavailable` on a Flight
+    door that could not watch its files).
 
 ## Enforcement & security
 
@@ -84,7 +91,8 @@ its new connections: no restart, and no connection cut.
   3. a broken pair (B's certificate, another key) is not taken: both keep B, the load report says `key_mismatch`, the
      audit has both doors' `certificate_refresh_failed`, and no PEM reaches the output;
   4. A again is taken, and the refusal clears;
-  5. a door served from inline PEM, and one served while the refresh was 0, keep A through the swap.
+  5. a door served from inline PEM, and one served while the refresh was 0, keep A through the swap;
+  6. a door whose process has no writable `TMPDIR` serves, reading its pair once, and says `anchor_unavailable`.
 - **Found on the way**: `tls.sh` called `read_text` as a scalar, which fails to bind, and its check matched the uri
   inside that error. It now reads the PEM through a subquery and refuses an error.
 

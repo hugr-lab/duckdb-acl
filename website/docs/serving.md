@@ -101,7 +101,9 @@ SELECT acl_flight_stop('grpc://localhost:32700');
   new connections; open connections carry on. A pair that does not parse or does not match is not taken: the door
   keeps serving the last good one, records a `door` event `certificate_refresh_failed` (its class only), and
   `acl_node_load()` shows it under `certificates` (`not_after`, `refreshed_at`, `error`). Inline PEM and remote
-  locations are read once, as is everything while the setting is `0`.
+  locations are read once, as is everything while the setting is `0`. A Flight door that cannot watch its files (no
+  writable `TMPDIR` for its private socket, as in a pod with a read-only root) serves as before, reading its pair once,
+  and its `certificates` entry says `anchor_unavailable`.
 
 What the door serves, every RPC authenticated per call from the `authorization: Bearer <jwt>` header:
 
