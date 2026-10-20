@@ -42,6 +42,42 @@ ACL ADMIN CREATE ROLE r;
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
 
+# spec 066's addendum: who may resume a draining node is seated on it - the operate bundle, a point grant on
+# platform.resume; a deny on it wins over the bundle
+statement ok
+ACL ADMIN CREATE ROLE op;
+
+statement ok
+ACL ADMIN GRANT ADMIN operate TO ROLE op;
+
+statement ok
+ACL ADMIN CREATE ROLE pointer;
+
+statement ok
+ACL ADMIN GRANT FUNCTION platform.resume TO ROLE pointer;
+
+statement ok
+ACL ADMIN CREATE ROLE denied;
+
+statement ok
+ACL ADMIN GRANT ADMIN operate TO ROLE denied;
+
+statement ok
+ACL ADMIN DENY FUNCTION platform.resume TO ROLE denied;
+
+# a role holding administration is reached only through the client's own mapping (spec 095)
+statement ok
+ACL ADMIN MAP CLAIM 'op' FROM CLIENT 'test/idp/d' TO ROLE op;
+
+statement ok
+ACL ADMIN MAP CLAIM 'pointer' FROM CLIENT 'test/idp/d' TO ROLE pointer;
+
+statement ok
+ACL ADMIN MAP CLAIM 'denied' FROM CLIENT 'test/idp/d' TO ROLE denied;
+
+statement ok
+SET GLOBAL acl_audit_level = 'all';
+
 # --- serving is the starting state -------------------------------------------------------------------
 
 query I
@@ -83,6 +119,27 @@ query I
 SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9kIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJyIl0sInRpZCI6ImFjbWUifQ.aPBrtcgDKpBFx79Ko8KlU6Y7are0gcq2Y9vgEqT2Gf5nst5QaDZGzcw_t9vyi0EmBbnB8dgagSh6VsH7P7vqm08RdVAdVYqVolxtZWMxAk2FbCCEoOdGoZ-Fa9bV45HC70xIF1gxoe2GUA4APh3ZL19gmXXHYbjtzgC86sdZ4koOfo2juuGyddJ0dbxgnNqciGuIsVozV9jh5lKky6wrXAxCjxuXAiBGiwGs153I0uA30CjTjQT576A7gXz0qmaEkVj89UOG5yhNkMkJ1_Buskxu0EBCQMrKoLp_JNZFBRvKb_U8WiGt6-XJOklkhVX4HAwUma40fep-5rhuiNhsRw') IS NULL;
 ----
 true
+
+# --- a connection-long session is refused whoever asks (the addendum seats one call alone) ----------------
+
+# the drain's own right is seated for ONE call, a cookie-less Flight call (test/e2e/flight/drain.sh); the contract's
+# session - like a driver's, quack's - lives on, so even an operator, a point grant on resume, is refused it
+query IIII
+SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9kIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6Im9wLXVzZXIiLCJyb2xlcyI6WyJvcCJdLCJ0aWQiOiJhY21lIn0.YiVCu4Ut1p1jW68meI1HeX6ixQEwJDCftZx0J7pdZkvly-PJjk7ggk3uu9GahJcqd4XmxlarnUhywl9q4vXBdELFcuPq9bTWxi-g_xVI2wx62IeroKtJQiCeiR1rmungIcOhtMtS3LlO5poFhrR6g3T7p_ULiteNsx9so7lwbLZGABfd4ef90yMA5XSvjxN-PnL_N6vSKmQOpjNP2rVWJ_z15kqhcNO0ADggOWpl9xqsrb8wTZBdxqrQsht-woj62yUbbZ9SPVZAF_NeOQX9FKw0bNsRCnK-4bBQI2MQXJfoykAfKB4ric_u5wz-21TGZMt332tETZXG-U4bOjVPrw') IS NULL,
+    acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9kIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InBvaW50ZXItdXNlciIsInJvbGVzIjpbInBvaW50ZXIiXSwidGlkIjoiYWNtZSJ9.ZIoQsf38PKFKmXSh1leyNhrQBJzPJtoScAJHTvwmUwCUUsuH4stpohGXP6_6EHwLTA0kzUrYkNjuwLRbfxrjJqtDFZgUT4QANkYvcf-36wnK2MyJU32v8t-vtpw_UX8P9aGNxjIdxPyrRV2czGu3Em4fyeGdPoQkRciD0R8FvnqIcIIJ6MZ3vsjtW_QajuG24kR93lUf41xkMtZmIGa3rrqgIu1UmJV2VZphaFCVUZTanF2oWBN1agD6GzeuADBVQDi_Zl5VXNMAab0piovF1EOGfS2phr3Ay1w1WlkwJPQNuJNA0xPlKrfwZsHqDjLejoUEBDx5quTYHMmWncnEZA') IS NULL,
+    acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9kIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImRlbmllZC11c2VyIiwicm9sZXMiOlsiZGVuaWVkIl0sInRpZCI6ImFjbWUifQ.Vuchbu0D94CWEj3zhIBqnNyhqBbbjoSf7JkxIhmvk1IXaNBLeGouZNB1Fh2PdMvKaGUz_DMN_zevGfOtbVQmwCSB8jnyU43M2S-OAReTaoKGv7NO7-ytw9Owoq9K4VXU7cVDkSGc7ucLpwIxPr-VJ2rvLEwTtFdOW8Oyn2Txk4FRw4M-vXKCGQ90dQUy38oSwVq505uHjrCYTemMUNgc-OTDGfn_q_o71A4yVTE-5JVB4KBN8k3IEQdoVYeRwvhHn-RFTvqbS5gpQ4NKreiGsWcvUlVI3sjb366_vFRfQWpfcY9MptCDYJPBJgih7IulXC3c0-iNsg_YxyGsJFavNg') IS NULL,
+    acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9kIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6Im9wLXVzZXIiLCJyb2xlcyI6WyJvcCJdLCJ0aWQiOiJhY21lIn0.YiVCu4Ut1p1jW68meI1HeX6ixQEwJDCftZx0J7pdZkvly-PJjk7ggk3uu9GahJcqd4XmxlarnUhywl9q4vXBdELFcuPq9bTWxi-g_xVI2wx62IeroKtJQiCeiR1rmungIcOhtMtS3LlO5poFhrR6g3T7p_ULiteNsx9so7lwbLZGABfd4ef90yMA5XSvjxN-PnL_N6vSKmQOpjNP2rVWJ_z15kqhcNO0ADggOWpl9xqsrb8wTZBdxqrQsht-woj62yUbbZ9SPVZAF_NeOQX9FKw0bNsRCnK-4bBQI2MQXJfoykAfKB4ric_u5wz-21TGZMt332tETZXG-U4bAAAAAA') IS NULL;
+----
+true	true	true	true
+
+statement ok
+SELECT acl_audit_flush();
+
+# refused before verifying anything, so with the drain's code - the five of them: the analyst above and these four
+query I
+SELECT count(*) FROM acl_audit_events() WHERE kind = 'session' AND detail = 'refused' AND reason_code = 'draining';
+----
+5
 
 # the established session still composes: in-flight clients finish their work
 query I

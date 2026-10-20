@@ -859,8 +859,8 @@ string StateCookieFromHeaders(const vector<string> &cookies) {
 //! (spec 134) the node's label cookie when the request did not carry it already.
 class CookieMiddleware : public flight::ServerMiddleware {
 public:
-	CookieMiddleware(string id_p, bool fresh_p, string node_cookie_p)
-	    : id(std::move(id_p)), fresh(fresh_p), node_cookie(std::move(node_cookie_p)) {
+	CookieMiddleware(string id_p, bool fresh_p, bool emit_p, string node_cookie_p)
+	    : id(std::move(id_p)), fresh(fresh_p), emit(emit_p), node_cookie(std::move(node_cookie_p)) {
 	}
 	string name() const override {
 		return COOKIE_MIDDLEWARE_KEY;
@@ -869,7 +869,7 @@ public:
 		if (!outgoing) {
 			return;
 		}
-		if (fresh) {
+		if (fresh && emit) {
 			outgoing->AddHeader("set-cookie",
 			                    string(SESSION_COOKIE) + "=" + id + "; HttpOnly; Path=/; SameSite=Strict");
 		}
@@ -881,19 +881,27 @@ public:
 	}
 	string id;
 	bool fresh;         // minted this call (client sent none) -> set-cookie, and this call is transient
+	bool emit;          // the minted id is handed to the client (not while the node drains, spec 066's addendum)
 	string node_cookie; // spec 134: the label's Set-Cookie value, '' when there is none to send
 };
 
 class CookieMiddlewareFactory : public flight::ServerMiddlewareFactory {
 public:
-	explicit CookieMiddlewareFactory(DatabaseInstance &db_p) : db(db_p) {
+	CookieMiddlewareFactory(DatabaseInstance &db_p, shared_ptr<PolicyStore> store_p)
+	    : db(db_p), store(std::move(store_p)) {
 	}
 	arrow::Status StartCall(const flight::CallInfo &, const flight::ServerCallContext &context,
 	                        std::shared_ptr<flight::ServerMiddleware> *middleware) override {
 		auto cookies = CookieHeadersOf(context);
 		auto incoming = CookieFromHeaders(cookies);
 		bool fresh = incoming.empty();
-		*middleware = std::make_shared<CookieMiddleware>(fresh ? MintCookieId() : incoming, fresh, NodeCookie(cookies));
+		// spec 066's addendum: a draining node seats a cookie-less call of the node's own rights, and hands out no
+		// session cookie - with one, a cookie-keeping client's DoGet would be a connection-long session refused after
+		// its GetFlightInfo already ran (a write, a management statement: told "draining", retried elsewhere, done
+		// twice)
+		bool emit = !store || !store->Draining();
+		*middleware =
+		    std::make_shared<CookieMiddleware>(fresh ? MintCookieId() : incoming, fresh, emit, NodeCookie(cookies));
 		return arrow::Status::OK();
 	}
 
@@ -908,7 +916,8 @@ public:
 	}
 
 private:
-	DatabaseInstance &db; // the door's instance: FlightDoorState holds it the same way
+	DatabaseInstance &db;          // the door's instance: FlightDoorState holds it the same way
+	shared_ptr<PolicyStore> store; // whether it drains (the session cookie is not handed out then)
 };
 
 //! --- spec 064: auth discovery + the password handshake --------------------------------------------
@@ -3003,20 +3012,25 @@ private:
 			}
 		}
 		// Whoever reaches this point is new: no live session of their own resolved above. A draining
-		// node seats nobody new (spec 066), and says WHY - a load balancer and a driver both treat
-		// UNAVAILABLE as "go elsewhere", where a generic auth failure would read as bad credentials.
+		// node seats nobody new (spec 066) - but a call without a cookie of a principal who holds the node's rights
+		// (the addendum: SessionOpen decides, `per_call`) - and says WHY to everyone it refuses: a load balancer and a
+		// driver both treat UNAVAILABLE as "go elsewhere", where a generic auth failure would read as bad credentials.
 		// A cookie-less call redeeming what it holds is no NEW client (spec 134's addendum): its ticket or prepared
 		// statement was minted here before the drain, and a connection-long session would keep working too
 		auto despite_drain = transient && redeems;
-		if (state->store->Draining() && !despite_drain) {
-			return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
-			                               "acl: node is draining - not accepting new sessions");
-		}
 		string placement;
 		vector<string> placement_groups;
-		auto handle =
-		    state->store->SessionOpen(token, "flight", replacing, &placement, &placement_groups, despite_drain);
+		auto handle = state->store->SessionOpen(token, "flight", replacing, &placement, &placement_groups,
+		                                        despite_drain, transient);
 		if (handle.empty()) {
+			if (placement.empty() && state->store->Draining() && !despite_drain) {
+				// what a draining node refuses answers as the drain: a connection-long session, a cookie-less call of a
+				// principal who may not resume the node or whose token did not verify, and an operator's call refused
+				// for the node's cap or its policy source. A node of another resource group says so below, to an
+				// operator too.
+				return flight::MakeFlightError(flight::FlightStatusCode::Unavailable,
+				                               "acl: node is draining - not accepting new sessions");
+			}
 			if (!placement.empty()) {
 				// spec 096: this node serves another resource group - UNAVAILABLE, like a drain, so a
 				// front or a driver goes elsewhere; the sentence names groups and nothing else, and the
@@ -3317,7 +3331,7 @@ void AclFlightServeFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		}
 		// spec 050: the cookie identifies a client connection, which is what lets a session persist
 		std::shared_ptr<flight::ServerMiddlewareFactory> cookie_factory =
-		    std::make_shared<CookieMiddlewareFactory>(door.state->db);
+		    std::make_shared<CookieMiddlewareFactory>(door.state->db, door.state->store);
 		options.middleware.emplace_back(string(COOKIE_MIDDLEWARE_KEY), std::move(cookie_factory));
 		// spec 064: a BasicAuth Handshake becomes the IdP-gated password grant; TLS-only by refusal
 		options.middleware.emplace_back(string("acl-password-handshake"),

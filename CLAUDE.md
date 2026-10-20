@@ -887,7 +887,10 @@ setting would leak to the next principal. The Flight door's `SetSessionOptions`/
 apply the same list on the session's connection. The build carries `icu` for the tests.
 
 **Spec 066 — node drain**: `acl_drain()` stops seating new clients at the one seam they all cross
-(`SessionOpen` refuses; the doors say why — Flight answers UNAVAILABLE "draining", quack's discovery
+(`SessionOpen` refuses all but each cookie-less Flight call of a principal who holds the node's own rights - its
+2026-10-20 addendum, `per_call` + `MayOperateNode` (a NODE view or an OPERATE function), the token verified for such a
+call alone, no session cookie handed out while draining, the calling call's own session left out of `acl_drain()`
+and the node's listings; the doors say why — Flight answers UNAVAILABLE "draining", quack's discovery
 answers 503 `draining`) while established sessions keep working; repeating `acl_drain()` is the
 watch loop (it sweeps, then answers what remains - the auto-sweep rode `SessionOpen`, which drain
 turns off), stragglers go to `acl_session_kill`, then the doors stop and the process exits. `acl_resume()` / `acl_drain_status()` complete the surface; all three are denied to a

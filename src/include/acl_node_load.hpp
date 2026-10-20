@@ -21,7 +21,9 @@ class ExtensionLoader;
 namespace acl {
 
 //! The document, now.
-string NodeLoadJson(DatabaseInstance &db, PolicyStore &store);
+//! `besides`: the ops id of a session left out of the counts - the calling call's own, when it is a session of that
+//! one call (spec 066's addendum: a console reads the node with such calls, and is no load of the node's)
+string NodeLoadJson(DatabaseInstance &db, PolicyStore &store, const string &besides = string());
 
 //! Whether the pull surfaces exist at all (`acl_metrics_endpoint`).
 bool NodeLoadServed(DatabaseInstance &db);

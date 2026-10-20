@@ -885,9 +885,11 @@ struct PolicyStore {
 	//! `despite_drain` (spec 134's addendum): a per-call session of a call that redeems a reservation its principal
 	//! holds - a cookie-less client's ticket or prepared statement - opens on a draining node, as a connection-long
 	//! session keeps working there (spec 066: the node seats nobody NEW).
+	//! `per_call` (spec 066's addendum): the session lives for one call and closes on its way out (a cookie-less
+	//! Flight call, spec 050) - the one kind a draining node seats for a principal who may resume it.
 	string SessionOpen(const string &token, const string &door = "session", const string &replacing = string(),
 	                   string *placement = nullptr, vector<string> *placement_groups = nullptr,
-	                   bool despite_drain = false);
+	                   bool despite_drain = false, bool per_call = false);
 	//! The operator's per-session audit level (spec 069), by the ops id; -1 inherits. False = no such session.
 	bool SetSessionAuditLevel(const string &id, int8_t level);
 	//! A session's own level by handle, -1 when it inherits or the handle is unknown.
@@ -1218,6 +1220,10 @@ struct PolicyStore {
 	};
 	//! The principal's effective rights: the strongest over its roles and its catalog grants
 	AdminRights AdminRightsOf(const Principal &principal);
+	//! whether the principal holds this node's own rights - reads a view of the node's or calls one of its operations
+	//! (`platform.node_load`, `sessions`, `KILL SESSION`, `RESUME NODE`, ...): the call a draining node seats (spec
+	//! 066's addendum), so the person who watches a drain, ends its stragglers or resumes the node reaches it
+	bool MayOperateNode(const Principal &principal);
 	//! spec 120.3: why `rights` may not view the catalog as `role` (empty: it may) - the one judgment the authorizer
 	//! (SET SESSION VIEW AS), every batch of a session in the mode and the Flight door's x-acl-view-as share
 	string ViewAsRefusal(const AdminRights &rights, const string &role);
@@ -1254,7 +1260,7 @@ private:
 	//! directly is how the guard above would be bypassed, and a door must never be able to.
 	string SessionOpenBody(const string &token, const string &door, Principal &principal, SessionOpenInfo &opened,
 	                       const string &replacing, string *placement, vector<string> *placement_groups,
-	                       bool despite_drain);
+	                       bool despite_drain, bool per_call);
 
 	bool Resolve(const case_insensitive_map_t<case_insensitive_map_t<TablePolicy>> &space, const Principal &principal,
 	             const string &vname, TablePolicy &out);

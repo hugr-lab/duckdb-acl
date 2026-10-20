@@ -172,14 +172,15 @@ string MintHandle() {
 //! store's lock: emitting takes the audit queue's lock and reads two settings, nothing of the store's.
 void SessionEvent(AuditPipeline *hooks, const Principal &principal, const string &door, const string &id,
                   int8_t session_level, const string &detail, const string &reason_code, const string &reason,
-                  int64_t duration_us) {
+                  int64_t duration_us, bool decision = false) {
 	if (!hooks) {
 		return;
 	}
 	// always emitted - the counters are a state of the node whatever the level - and recorded only
-	// where the level says so: an opened/closed session is `all`, a refused one is a denial
+	// where the level says so: an opened/closed session is `all`, a refused one is a denial, and an exception to a
+	// rule (a seat on a draining node, spec 066's addendum) a decision
 	AuditEvent event;
-	event.level = reason_code.empty() ? AuditLevel::ALL : AuditLevel::DENIED;
+	event.level = !reason_code.empty() ? AuditLevel::DENIED : decision ? AuditLevel::DECISIONS : AuditLevel::ALL;
 	event.recorded = hooks->Records(event.level, session_level);
 	event.kind = "session";
 	event.door = door;
@@ -272,13 +273,13 @@ string MintRandomHex(idx_t bytes) {
 //! `source_error` to a door: a door must not learn the difference between a catalog that is down and
 //! a bug of ours, and the audit keeps the text either way.
 string PolicyStore::SessionOpen(const string &token, const string &door, const string &replacing, string *placement,
-                                vector<string> *placement_groups, bool despite_drain) {
+                                vector<string> *placement_groups, bool despite_drain, bool per_call) {
 	DeliverSessionNotices deliver(session_notices); // a sweep inside may have ended sessions
 	Principal principal; // as far as verification got, so a refusal can still name who was trying
 	try {
 		SessionOpenInfo opened;
-		auto handle =
-		    SessionOpenBody(token, door, principal, opened, replacing, placement, placement_groups, despite_drain);
+		auto handle = SessionOpenBody(token, door, principal, opened, replacing, placement, placement_groups,
+		                              despite_drain, per_call);
 		if (!handle.empty()) {
 			// spec 078: the observers, before the handle is anyone's - outside the store's lock, the
 			// verified token by reference for the call only
@@ -296,18 +297,24 @@ string PolicyStore::SessionOpen(const string &token, const string &door, const s
 
 string PolicyStore::SessionOpenBody(const string &token, const string &door, Principal &principal,
                                     SessionOpenInfo &opened, const string &replacing, string *placement,
-                                    vector<string> *placement_groups, bool despite_drain) {
+                                    vector<string> *placement_groups, bool despite_drain, bool per_call) {
 	// a refusal is a session event too (spec 069): the reason a client never learns is what the
 	// operator's record carries
 	auto refused = [&](const Principal &who, const char *code, const string &reason) {
 		SessionEvent(audit.get(), who, door, "", -1, "refused", code, reason, -1);
 		return string();
 	};
-	// Spec 066: a draining node seats nobody new. Refused before verifying anything - there is
-	// nothing to decide with the result, and the drain path stays free of JWKS reads. Established
-	// sessions never come back through here, so they keep working.
-	if (!despite_drain && draining.load(std::memory_order_relaxed)) {
-		return refused(Principal(), "draining", "acl: node is draining - not accepting new sessions");
+	// Spec 066: a draining node seats nobody new. A connection-long session is refused before verifying anything -
+	// there is nothing to decide with the result, and the drain path stays free of JWKS reads - so a driver, a
+	// front's client, quack and the gateway contract go elsewhere. The one exception (its 2026-10-20 addendum) is a
+	// session of ONE call for a principal who holds the node's own rights: an operator without a session there ends the
+	// drain, and nothing new holds it. Established sessions never come back through here.
+	auto draining_now = !despite_drain && draining.load(std::memory_order_relaxed);
+	auto drain_refusal = [&](const Principal &who) {
+		return refused(who, "draining", "acl: node is draining - not accepting new sessions");
+	};
+	if (draining_now && !per_call) {
+		return drain_refusal(Principal());
 	}
 	int64_t expires_at = 0;
 	string issuer;
@@ -338,6 +345,9 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 		}
 	} else if (!VerifyPrincipal(true, token, principal)) {
 		return refused(Principal(), "principal", "acl_rewrite: token verification failed"); // the dev stub
+	}
+	if (draining_now && !MayOperateNode(principal)) {
+		return drain_refusal(principal);
 	}
 	// The session's own audit level (spec 069): the door's policy - the extended extension's rule
 	// per role, user and door - answers once, here; no opinion means the instance's level applies.
@@ -398,7 +408,10 @@ string PolicyStore::SessionOpenBody(const string &token, const string &door, Pri
 			                   std::to_string(limits.charged_max) + ") - a new session is refused");
 		}
 	}
-	SessionEvent(audit.get(), principal, door, id, session_level, "opened", "", "", -1);
+	// a seat on a draining node is the drain's own right's: a decision of the audit's, on record at the default level
+	SessionEvent(audit.get(), principal, door, id, session_level, "opened", "",
+	             draining_now ? "seated while draining for one call: the principal holds the node's own rights" : "",
+	             -1, draining_now);
 	// spec 078: from here a close of this session waits for its open to reach the observers
 	session_notices.BeginOpen(id);
 	opened.session_id = id;
@@ -1652,6 +1665,27 @@ void ApplyAdminRow(PolicyStore::AdminRights &rights, const string &scope_text, c
 }
 
 } // namespace
+
+bool PolicyStore::MayOperateNode(const Principal &principal) {
+	// the node's own rights, as the authorizer judges them (specs 117, 118): a view of the node's (the observe bundle,
+	// a point grant on one) or one of its operations (the operate bundle, a point grant on one; a deny winning) - the
+	// person who watches a drain, ends its stragglers or resumes the node
+	auto rights = AdminRightsOf(principal);
+	PlatformAccess access;
+	access.rights = &rights;
+	for (auto &view : PlatformViews()) {
+		bool scoped = false;
+		if (view.view_class == PlatformViewClass::NODE && access.ReadsView(view, scoped)) {
+			return true;
+		}
+	}
+	for (auto &function : PlatformFunctions()) {
+		if (function.right == PlatformRight::OPERATE && access.CallsFunction(function)) {
+			return true;
+		}
+	}
+	return false;
+}
 
 PolicyStore::AdminRights PolicyStore::AdminRightsOf(const Principal &principal) {
 	AdminRights rights;

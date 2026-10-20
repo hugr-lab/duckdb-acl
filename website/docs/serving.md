@@ -582,6 +582,18 @@ flag, so a door that forgot to check still could not seat anyone:
   already watches.
 - The contract: `acl_session_open` returns NULL.
 
+One call is seated anyway: a **cookie-less Flight call of a principal who holds the node's own rights** - a view of
+the node's (the `observe` bundle, a point grant) or one of its operations (the `operate` bundle, a point grant; a deny
+wins). Its session closes on its way out, so a person holding no session on a draining node (a console acts with such
+calls) watches the drain, ends its stragglers or runs `RESUME NODE` as their rights allow, and nothing new holds the
+drain. A connection-long session - a driver that keeps the door's cookie, a
+quack connection, `acl_session_open` - is refused to an operator too, before anything is verified. For the cookie-less
+call the node verifies the token; whoever else makes one gets the same draining answer, and the seated call's
+`session` event (a decision, on record at the default level) says it was seated while draining. `acl_drain()` counts
+what remains to be drained - not the session of the call that asks - and `platform.sessions` and the load report
+leave that session out too. A draining node hands out no session cookie, so a driver that keeps cookies stays
+cookie-less there and is answered call by call; a cookie it brings is refused.
+
 What keeps working, deliberately: statements, `BEGIN`, ingest, reservations and stream drains on
 established sessions; `ACL TOKEN`/`ACL ROLE` prefixed statements (in the gateway deployment the
 gateway is what drains; refusing its statements mid-flight would turn a graceful stop into an outage);
@@ -688,8 +700,8 @@ one `reason_code` from a bounded taxonomy (`no_access`, `capability`, `read_only
 `unavailable`, `write_policy`, `policy_error`) plus the refusal text.
 
 - **Levels** - `SET GLOBAL acl_audit_level = 'off' | 'denied' | 'decisions' | 'all'` (default
-  `decisions`): refusals only; every statement/admin/ingest decision; plus the session, door, policy
-  and keys lifecycle. `acl_session_audit_level(<ops id>, <level>)` overrides it for one live session
+  `decisions`): refusals only; every statement/admin/ingest decision (and a session seated on a draining
+  node, spec 066's exception); plus the session, door, policy and keys lifecycle. `acl_session_audit_level(<ops id>, <level>)` overrides it for one live session
   (the operator's call, never the principal's). Whatever the level, the **counters count**: metrics
   are a state of the node, audit is a record of it.
 - **Profiles** (spec 074) - `SET GLOBAL acl_profile_level = 'off' | 'sampled' | 'all'` (default

@@ -527,10 +527,17 @@ A cookie-less call gets a per-call session closed on the way out.
 **refused**, never an old one evicted"; `SessionOpen` sweeps by itself. Arrow's own session store is
 closed alongside ours so it "cannot grow without bound".
 
-**Drain** (spec 066): `acl_drain()` sets one flag on the store and `SessionOpen` refuses "before
-verifying anything"; it "never ends a session"; established sessions keep working; `ACL TOKEN` /
-`ACL ROLE` statements keep working; the three drain functions are denied to a principal; quack's
-discovery document answers 503 `draining`. Ending a straggler is `acl_session_kill`, an operator's act.
+**Drain** (spec 066): `acl_drain()` sets one flag on the store and `SessionOpen` refuses every new session but one:
+a cookie-less Flight call - a session of that one call - of a principal who holds the node's own rights (the
+authorizer's judgement: a view of the node's or one of its operations - `observe`, `operate`, a point grant, a deny
+winning), so the node's operators are never locked out of the node they drain and nothing new holds it (the
+2026-10-20 addendum). A
+connection-long session is refused "before verifying anything", an operator's too (but on spec 135's state-cookie
+path, which matches a verified token first); for the cookie-less call the token is verified and its refusal answers
+draining - but a node of another resource group, which tells an operator so (spec 096). A draining node hands out
+no session cookie, and leaves the calling call's own session out of `acl_drain()`'s count and its listings. It "never ends a session"; established sessions keep
+working; `ACL TOKEN` / `ACL ROLE` statements keep working; the three drain functions are denied to a principal;
+quack's discovery document answers 503 `draining`. Ending a straggler is `acl_session_kill`, an operator's act.
 
 **The unprefixed drain fence** (spec 042; `src/acl_parser_override.cpp`). quack generates its bulk
 `INSERT … SELECT * FROM <scan>(…)` **unprefixed** on the client's connection. While a door of this
