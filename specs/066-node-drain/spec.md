@@ -242,6 +242,22 @@ at `decisions`; `DRAIN NODE` does not count itself; an operator's `RESUME NODE` 
 `test/e2e/flight/admin.sh`: the operate bundle drains the node, the analyst is refused, the operator's call resumes
 it, a second finds it serving.
 
+**Found 2026-10-20 (spec 140's CI): the call's own session was named after its GetFlightInfo.** A cookie-less
+client's read is two calls, each with its own session:
+
+- **The statement** is prepared at GetFlightInfo, and the reservation keeps the override's note. That note names the
+  GetFlightInfo's session, which ended with that call.
+- **Its DoGet** submits the statement, which runs on the workers, and the note put back on the connection named that
+  ended session to the statement's `AclConnection`. `CallOwnSession` found no live per-call session by that id, so
+  nothing was left out.
+- **The test passed by timing.** It passed only when the DoGet's own session closed (the handler returned) before a
+  worker computed the report; otherwise the report counted 2 where 1 was right. drain.sh failed about one run in
+  eight.
+
+Now the execution is named after the call that runs it: the DoGet's own session, live (`ArmProfile` puts the
+caller's session on the reservation's note). The count is right in either order, and drain.sh ran 20 of 20. The
+same naming serves a secrets service that acts for the session (spec 078), which used to see an ended one there.
+
 **Left open.** A drain waits for every live session up to its orchestrator's deadline, an idle client's too; whether it
 should not wait for an idle session with nothing pinned (spec 135 moves it to another node) is its own spec.
 
