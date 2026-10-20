@@ -238,6 +238,7 @@ test-flight:
 	test/e2e/flight/run.sh
 	test/e2e/flight/adbc.sh
 	test/e2e/flight/tls.sh
+	test/e2e/flight/certificate_reload.sh
 	test/e2e/flight/auth.sh
 	test/e2e/flight/ca_bundle.sh
 	test/e2e/flight/drain.sh

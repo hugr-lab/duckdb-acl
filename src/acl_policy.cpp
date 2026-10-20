@@ -1251,6 +1251,25 @@ bool PolicyStore::Draining() const {
 	return draining.load(std::memory_order_relaxed);
 }
 
+void PolicyStore::NoteDoorCertificate(const string &uri, const DoorCertificateStatus &status) {
+	std::lock_guard<std::mutex> guard(door_certificates_lock);
+	door_certificates[uri] = status;
+}
+
+void PolicyStore::ForgetDoorCertificate(const string &uri) {
+	std::lock_guard<std::mutex> guard(door_certificates_lock);
+	door_certificates.erase(uri);
+}
+
+vector<DoorCertificateStatus> PolicyStore::DoorCertificates() const {
+	std::lock_guard<std::mutex> guard(door_certificates_lock);
+	vector<DoorCertificateStatus> out;
+	for (auto &entry : door_certificates) {
+		out.push_back(entry.second);
+	}
+	return out;
+}
+
 void PolicyStore::SessionClose(const string &handle) {
 	DeliverSessionNotices deliver(session_notices); // spec 078: after the lock below is released
 	auto now = NowSeconds();

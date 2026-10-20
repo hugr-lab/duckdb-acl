@@ -12,6 +12,7 @@
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/vector.hpp"
+#include "acl_door_certificate.hpp"
 
 #include <functional>
 
@@ -55,6 +56,15 @@ struct AclQuackServeConfig {
 	//! `mode := 'plain'` sets false - a bare quack server (no discovery route), for a stock client or
 	//! when TLS is terminated by a reverse proxy upstream. Still acl-gated; still cleartext-only here.
 	bool discovery = true;
+	//! spec 140: the pair's local files when the door watches them ("" = read once), and how often; a renewed
+	//! pair that checks serves the new connections
+	string cert_path;
+	string key_path;
+	idx_t certificate_refresh = 0;
+	//! what the door says of its certificate (the load report's `certificates`, a refusal's event), and
+	//! its stop withdrawing that. Unset for a cleartext door.
+	std::function<void(const DoorCertificateStatus &status, bool failed)> certificate_report;
+	std::function<void()> certificate_forget;
 };
 
 //! Start the embedded server on `cfg.uri`. Returns "" on success (with `actual_uri_out` set to the

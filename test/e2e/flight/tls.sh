@@ -93,9 +93,14 @@ esac
 
 # --- inline PEM (the -----BEGIN branch) initializes a TLS door too ---------------------------------
 # a one-shot serve returns the uri on a successful bind, then the CLI exits; we assert it came up
-inline_out="$(oneshot "SELECT acl_flight_serve('grpc://localhost:$((PORT+1))', read_text('$TMP/cert.pem'), read_text('$TMP/key.pem'));")"
+# (read_text is a table function: a scalar call of it failed to bind, and its error line names the uri this
+# check looked for - so it matched an error until spec 140's e2e found it. The answer is the bound uri, alone.)
+# The door is stopped before the CLI exits: a Flight door left serving at exit aborts the process (its registry is a
+# static destroyed with a serving thread in it) - the operator's rule is to stop the doors first (spec 084).
+inline_out="$(oneshot "SELECT acl_flight_serve('grpc://localhost:$((PORT+1))', (SELECT content FROM read_text('$TMP/cert.pem')), (SELECT content FROM read_text('$TMP/key.pem'))) AS bound; SELECT acl_flight_stop('grpc://localhost:$((PORT+1))') AS stopped;")"
 case "$inline_out" in
-	*"grpc://localhost:$((PORT+1))"*) ;;
+	*Error*|*terminat*) fail "an inline-PEM TLS door did not initialize: $inline_out";;
+	*"grpc://localhost:$((PORT+1)) (0 session(s) closed)"*) ;;
 	*) fail "an inline-PEM TLS door did not initialize: $inline_out";;
 esac
 

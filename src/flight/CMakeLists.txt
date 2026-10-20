@@ -6,4 +6,5 @@
 set(ACL_FLIGHT_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/acl_flight_catalog.cpp
     ${CMAKE_CURRENT_LIST_DIR}/acl_flight_door.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/acl_door_certificate.cpp
     PARENT_SCOPE)

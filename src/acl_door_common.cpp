@@ -1,10 +1,14 @@
 #include "acl_door_common.hpp"
+#include "acl_door_certificate.hpp"
 #include "acl_platform.hpp"
 #include "acl_name_path.hpp"
 #include "acl_profile.hpp"
 
 #include "duckdb/common/string_util.hpp"
+
+#include <cstring>
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
@@ -134,6 +138,38 @@ string JsonQuote(const string &value) {
 	}
 	out += "\"";
 	return out;
+}
+
+bool IsLocalCertificatePath(const string &arg) {
+	static constexpr const char *FILE_SCHEME = "file://";
+	auto trimmed = arg;
+	StringUtil::Trim(trimmed);
+	if (trimmed.empty() || StringUtil::StartsWith(trimmed, "-----BEGIN")) {
+		return false;
+	}
+	if (StringUtil::Contains(trimmed, "://")) {
+		return StringUtil::StartsWith(StringUtil::Lower(trimmed), FILE_SCHEME) && trimmed.size() > strlen(FILE_SCHEME);
+	}
+	return true;
+}
+
+string LocalCertificatePath(const string &arg) {
+	static constexpr const char *FILE_SCHEME = "file://";
+	auto trimmed = arg;
+	StringUtil::Trim(trimmed);
+	if (StringUtil::StartsWith(StringUtil::Lower(trimmed), FILE_SCHEME)) {
+		return trimmed.substr(strlen(FILE_SCHEME));
+	}
+	return trimmed;
+}
+
+idx_t DoorCertificateRefresh(DatabaseInstance &db) {
+	Value value;
+	if (!DBConfig::GetConfig(db).TryGetCurrentSetting("acl_door_certificate_refresh", value) || value.IsNull()) {
+		return 60;
+	}
+	auto seconds = value.GetValue<int64_t>();
+	return seconds <= 0 ? 0 : NumericCast<idx_t>(seconds);
 }
 
 string ReadPemArg(ClientContext &context, const string &arg, const char *what, const char *fn) {
