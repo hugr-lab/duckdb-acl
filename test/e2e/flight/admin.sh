@@ -280,16 +280,13 @@ PY
 # --- spec 118: the operate bundle drains and resumes the node, and administers no policy ---------------
 got="$(ask "DRAIN NODE" "$OPS")"
 echo "$got" | grep -q "\[[0-9]*\]" || fail "DRAIN NODE under operate: $got"
-# draining seats no new session - the client's next connection is one (a console keeps its own and
-# RESUMEs from it; here the operator's connection resumes)
-got="$(ask "SELECT 1" "$OPS")"
+# draining seats no new session but the drain's own right's one call (spec 066's addendum): the analyst is refused,
+# the operator's call without a cookie is seated - it resumes the node - and a second RESUME finds it serving
+got="$(ask "SELECT 1" "$ANALYST")"
 echo "$got" | grep -q "node is draining" || fail "a new session was seated while draining: $got"
-echo "SELECT acl_resume();" >&3
-for _ in $(seq 1 20); do
-	got="$(ask "RESUME NODE" "$OPS")"
-	echo "$got" | grep -q "draining" || break
-	sleep 0.3
-done
+got="$(ask "RESUME NODE" "$OPS")"
+echo "$got" | grep -q "True" || fail "RESUME NODE under operate on the draining node: $got"
+got="$(ask "RESUME NODE" "$OPS")"
 echo "$got" | grep -q "False" || fail "RESUME NODE under operate on a serving node: $got"
 got="$(ask "CREATE ROLE by_ops" "$OPS")"
 echo "$got" | grep -q "unrestricted manage\|requires" || fail "the operate bundle administered the policy: $got"

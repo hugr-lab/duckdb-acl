@@ -2860,10 +2860,28 @@ struct JsonDocument {
 	duckdb_yyjson::yyjson_doc *doc = nullptr;
 };
 
+//! The calling call's own session, when it is a session of that one call (a cookie-less Flight call): the node's
+//! listings and counts leave it out - a console reads a node with such calls (spec 066's addendum), and its read is
+//! nobody connected to the node
+string CallOwnSession(ClientContext &context, PolicyStore &store) {
+	AclSessionView current;
+	string why;
+	auto connection = AclConnection::Reach(context, why);
+	if (!connection || !connection->Current(current) || current.session_id.empty() ||
+	    !store.SessionPerCall(current.session_id)) {
+		return string();
+	}
+	return current.session_id;
+}
+
 vector<vector<Value>> NodeRows(ClientContext &context, PolicyStore &store, const string &view) {
 	vector<vector<Value>> rows;
 	if (view == "sessions") {
+		auto own = CallOwnSession(context, store);
 		for (auto &session : store.SessionList()) {
+			if (!own.empty() && session.id == own) {
+				continue;
+			}
 			vector<Value> roles, groups;
 			for (auto &role : session.roles) {
 				roles.emplace_back(role);
@@ -2885,7 +2903,7 @@ vector<vector<Value>> NodeRows(ClientContext &context, PolicyStore &store, const
 		return rows;
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
-	JsonDocument doc(NodeLoadJson(db, store));
+	JsonDocument doc(NodeLoadJson(db, store, CallOwnSession(context, store)));
 	auto root = doc.Root();
 	if (!root) {
 		throw BinderException("acl: the load report is not a document");

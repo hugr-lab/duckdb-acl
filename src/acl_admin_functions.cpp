@@ -2052,8 +2052,17 @@ void AclDrainFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &store = StoreOf(state);
 	store.SetDraining(true);
 	store.SessionSweep();
-	auto live = Value::BIGINT(NumericCast<int64_t>(store.SessionCount()));
-	result.Reference(live, count_t(args.size()));
+	auto live = NumericCast<int64_t>(store.SessionCount());
+	// what remains to be drained: a session of this one call (a console's DRAIN NODE, spec 066's addendum) ends with
+	// it, so it is not among them - the watch loop reaches 0 from a console too
+	AclSessionView current;
+	string why;
+	auto connection = AclConnection::Reach(state.GetContext(), why);
+	if (live > 0 && connection && connection->Current(current) && !current.session_id.empty() &&
+	    store.SessionPerCall(current.session_id)) {
+		live--;
+	}
+	result.Reference(Value::BIGINT(live), count_t(args.size()));
 }
 
 //! acl_resume(): leave drain; true when the node was draining, false when it already served.
