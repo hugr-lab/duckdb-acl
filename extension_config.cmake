@@ -49,8 +49,8 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
         GIT_TAG c0f5a3c0c4b68b02afbf669d36d7f0e503985c88
         SUBMODULES database-connector
     )
-    # ducklake: ducklake's main (spec 131, 4e923e2), which builds against duckdb bde1b27 itself and already carries
-    # what the 2.0 branch patches its older pin (80e6155) with - so no patch, ours included: it calls
+    # ducklake: duckdb v2.0.0's own pin, 417a911 (spec 141; ducklake's main from spec 131, ca86db0 from spec 133, 49
+    # commits before it), with no patch, ours included: it calls
     # `postgres_clear_cache` (spec 128's patches/ducklake/9001 is gone). From 2026-09-17 to spec 131 the submodule's
     # own pin and patches; before that a pin of ours with three patches. Only the test build carries ducklake -
     # nothing of it reaches acl's artifact. (A pin change trips FetchContent's git-update on a stale _deps clone:
@@ -62,7 +62,7 @@ if(DEFINED ENV{ACL_INTEGRATION} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(ducklake
         LOAD_TESTS
         GIT_URL https://github.com/duckdb/ducklake
-        GIT_TAG ca86db02880fa8116fc1083869e54e47d138899d
+        GIT_TAG 417a9117f590e8141742ac0579d02f6a90162e37
     )
     duckdb_extension_statically_link(ducklake)
     # mysql_scanner: the submodule's own pin and patches. It was disabled at the submodule's pin until
@@ -89,10 +89,10 @@ endif()
 # quack needs json + autocomplete (core) and httpfs, which it pins itself; we take duckdb's own pin
 # so everything builds against the commit we track.
 #
-# quack's pin is the duckdb submodule's own (`.github/config/extensions/quack.cmake`): e7a9be3 since the f8f3f4d pin
-# (spec 133; 974927a from spec 090 to then). It builds with the patches duckdb carries for that pin (APPLY_PATCHES),
-# and the embedded server (third_party/quack) is the same commit, its copies patched the same way by sync.py. Spec
-# 105's own patch to the client (duckdb-quack#299) left with this pin: e7a9be3 carries the fix (#305). The block is
+# quack's pin is the duckdb submodule's own (`.github/config/extensions/quack.cmake`): f96420e since the v2.0.0 pin
+# (spec 141; e7a9be3 from spec 133, 974927a from spec 090). duckdb builds it without patches since v2.0.0 (its two
+# went into quack itself), and so does the embedded server (third_party/quack, the same commit; sync.py copies it as
+# it is when duckdb's quack.cmake applies none). Spec 105's own client patch left with e7a9be3 (#305). The block is
 # ours rather than an include of duckdb's file for two reasons: quack is never named in
 # duckdb_extension_statically_link (the client must stay a loadable, or its symbols and the embed's - both define
 # duckdb::QuackServer & co. - meet in one static link, spec 063 strategy B; it was DONT_LINK before duckdb #26189), and
@@ -104,8 +104,7 @@ if(DEFINED ENV{ACL_QUACK} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_statically_link(json autocomplete httpfs)
     duckdb_extension_load(quack
         GIT_URL https://github.com/duckdb/duckdb-quack
-        GIT_TAG e7a9be3f8c1c3be5946e534c96f15b56b81dc026
+        GIT_TAG f96420ed46aee9c42064bdb99ddfd1230d6c0086
         SUBMODULES extension-ci-tools
-        APPLY_PATCHES
     )
 endif()

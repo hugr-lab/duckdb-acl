@@ -12,9 +12,8 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
 ## Technology
 
 - **Language**: C++17 (DuckDB extension standard).
-- **DuckDB**: tracks the **2.0 release branch `v2.0-cyanoptera`** (submodule pinned in
-  `.gitmodules`; until 2026-09-08 it tracked `main`, which is now `v2.1.0-dev` and already diverges in
-  the MERGE INTO API the extension ecosystem builds against). Depends on parser/AST APIs
+- **DuckDB**: pinned to the **`v2.0.0` tag** (d54cbbe, spec 141; the 2.0 release branch `v2.0-cyanoptera`,
+  which patch releases come from, until the tag; `main` until 2026-09-08). Depends on parser/AST APIs
   (`Identifier`, multi-level `QualifiedName`, `MergeQueryNode`, unified DML query nodes, and since
   2026-09-14 `Literal`) that land with 2.0. **A constant is a `Literal`, not a `Value`**: the
   literal is the text as written and the binder turns it into a value, so build one with
@@ -42,14 +41,12 @@ for the core model. Deeper research/thinking lives in a local `design/` folder (
   duckdb only when `extension_config.cmake` names it with `duckdb_extension_statically_link` -
   `DONT_LINK` is gone (a FATAL_ERROR). We link acl, icu, ducklake and quack's json/autocomplete/httpfs;
   postgres/mysql/quack/mssql stay loadables by not being named.
-  Re-pin to the `v2.0.0` tag when it is cut; httpfs and mysql_scanner come from the submodule's own
-  extension pins (`.github/config/extensions/`), patches included. Since the 7304f7b pin (spec 131) ducklake,
-  postgres_scanner and mssql are pins of ours at their own mains, which build against the 2.0 branch themselves
-  (ducklake main needs none of duckdb's patches for its older pin, and calls `postgres_clear_cache` - spec 128's
-  patch is gone). quack is the submodule's own pin
-  (e7a9be3 since the f8f3f4d pin, spec 133; 974927a from spec 090), with the patches duckdb
-  carries for it applied to the loadable (`APPLY_PATCHES`) and, by `sync.py`, to the embedded
-  server's copies alike (a patch that touches only quack's tests is skipped there, and says so).
+  httpfs and mysql_scanner come from the submodule's own extension pins (`.github/config/extensions/`), patches
+  included (none at v2.0.0). ducklake, postgres_scanner and mssql are pins of ours (spec 131): since v2.0.0 ducklake
+  and postgres_scanner are the release's own (417a911, c0f5a3c), mssql its main re-pinned to the tag. quack is the
+  submodule's own pin (f96420e since v2.0.0, spec 141; e7a9be3 from spec 133), with whatever patches duckdb carries
+  for it applied to the loadable (`APPLY_PATCHES`) and, by `sync.py`, to the embedded server's copies alike - v2.0.0
+  carries none, and `sync.py` copies the pin as it is then.
 - **Dependencies**: none (no vcpkg/OpenSSL). The **shared repository** `duckdb-ext-common` is a
   submodule (spec 076): the audit contract (`contracts/acl_audit.hpp` + `acl_principal.hpp`, the same
   header acl-otel compiles - moved as is, contract version unchanged) and the OIDC client core
