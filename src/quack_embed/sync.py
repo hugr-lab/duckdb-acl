@@ -12,10 +12,11 @@ Run after bumping the `third_party/quack` submodule:  python3 src/quack_embed/sy
 It overwrites src/quack_embed/<file> and fails loudly if an expected literal is gone
 (upstream moved it — re-audit the read sites before trusting the rename).
 
-duckdb carries patches for quack (`.github/patches/extensions/quack/`), applied to the loadable
-client through APPLY_PATCHES; the embedded server is the same commit and must build against the
-same duckdb, so the copies are taken from a scratch copy of the submodule's `src` with those
-patches applied first — the two never diverge, and a patch that stops applying fails the sync.
+When duckdb carries patches for quack (`.github/patches/extensions/quack/`, applied to the loadable
+client through APPLY_PATCHES in its quack.cmake), the embedded server - the same commit, built against
+the same duckdb - takes them too: the copies come from a scratch copy of the submodule's `src` with
+those patches applied first, the two never diverge, and a patch that stops applying fails the sync.
+A pin duckdb builds without patches (v2.0.0's) is copied as it is.
 PATCHES below are the embed's own: two calls around quack's statement driver - spec 074's profile
 arming before the statement, spec 069's audit hook after it - and spec 077's fetch window in the
 FETCH handler. (From 2026-09-17 to 2026-09-22 the driver itself was ours, while duckdb ended a
@@ -36,6 +37,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 SUB = ROOT / "third_party" / "quack" / "src"
 OUT = ROOT / "src" / "quack_embed"
 DUCKDB_PATCHES = ROOT / "duckdb" / ".github" / "patches" / "extensions" / "quack"
+DUCKDB_QUACK_CONFIG = ROOT / "duckdb" / ".github" / "config" / "extensions" / "quack.cmake"
 
 # Exact literal renames applied to every generated file. Setting names and the drain
 # function name only — never a blanket quack_ -> acl_quack_ (that would corrupt error
@@ -355,14 +357,27 @@ BANNER = (
 )
 
 
+def duckdb_patches_quack() -> bool:
+    """Whether duckdb's own pin of quack carries patches (APPLY_PATCHES in its quack.cmake): v2.0.0's carries none."""
+    if not DUCKDB_QUACK_CONFIG.exists():
+        sys.exit(f"SYNC FAILED: no {DUCKDB_QUACK_CONFIG} - is the duckdb submodule checked out?")
+    return "APPLY_PATCHES" in DUCKDB_QUACK_CONFIG.read_text()
+
+
 def patched_source() -> pathlib.Path:
     """A scratch copy of the submodule's `src` with duckdb's quack patches applied (the caller removes it)."""
-    patches = sorted(DUCKDB_PATCHES.glob("*.patch"))
-    if not patches:
-        # a copy made without them would compile against the wrong duckdb and pass the sync
-        sys.exit(f"SYNC FAILED: no quack patches under {DUCKDB_PATCHES} - is the duckdb submodule checked out?")
     scratch = pathlib.Path(tempfile.mkdtemp(prefix="acl-quack-sync-"))
     shutil.copytree(SUB, scratch / "src")
+    patches = sorted(DUCKDB_PATCHES.glob("*.patch"))
+    if not duckdb_patches_quack():
+        # duckdb builds this quack as it is: so does the embed, and a patch left in duckdb's tree is not applied there
+        if patches:
+            sys.exit(f"SYNC FAILED: duckdb's quack.cmake applies no patches, yet {DUCKDB_PATCHES} holds some")
+        print("duckdb carries no patches for this quack: the copies are its src as it is")
+        return scratch / "src"
+    if not patches:
+        # a copy made without them would compile against the wrong duckdb and pass the sync
+        sys.exit(f"SYNC FAILED: duckdb's quack.cmake applies patches, and none are under {DUCKDB_PATCHES}")
     applied = 0
     for patch in patches:
         # the scratch holds quack's `src` only: a patch that touches nothing under it (a test of
