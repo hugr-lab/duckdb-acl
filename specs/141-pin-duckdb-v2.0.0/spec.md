@@ -25,7 +25,10 @@ The distribution build checks duckdb out at the branch name, so it would build a
   - httpfs 77392a7 and mysql_scanner f7fc0d4: the submodule's own includes, unpatched now.
   - ducklake ca86db0 → 417a911, duckdb v2.0.0's own pin, 49 commits forward on ducklake's main.
   - duckdb-postgres c0f5a3c, which already is duckdb v2.0.0's pin.
-  - mssql-extension: its main, once its own re-pin to v2.0.0 (#511) merges.
+  - mssql-extension 7e1bb1c → 6df11bc (addendum, 2026-10-22): its main re-pinned onto v2.0.0 (its #511; #512 labels
+    a build on a release pin as that release). Its code is v0.3.0's, which since 7e1bb1c adds one fix (a PLP value
+    that encodes to no payload, #496/#497). test-integration with the mssql leg built
+    (`ACL_INTEGRATION_MSSQL=1`): 616 assertions in 21 files, the SQL Server scenarios included.
 - **What the 77 commits change for us**:
   - `OperatorExpression` gets a custom serializer for array-slice bounds (storage before v2.0). It adds no field, so
     spec 139's sweep of expression-bearing fields finds nothing new.
@@ -62,5 +65,4 @@ Run on macOS, all green:
 
 ## Follow-ups
 
-- mssql at its re-pinned main, when #511 merges.
 - The extensions' submission to community-extensions, now that 2.0.0 is out (specs/045).
