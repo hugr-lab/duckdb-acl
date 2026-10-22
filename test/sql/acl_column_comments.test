@@ -91,6 +91,81 @@ note	PHYS note
 statement ok
 ACL ADMIN REVOKE TABLE c.orders FROM ROLE narrowed;
 
+# review 143 (a negative test): a column the catalog grant's list hides is no column of the read, whatever an object
+# grant states for it - not listed, so neither its comment nor its tags
+statement ok
+ACL ADMIN CREATE ROLE both_levels;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE both_levels WITH (select) MAIN COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE both_levels WITH (select) COLUMNS (id, note = '***');
+
+query I
+ACL ROLE 'both_levels' SELECT * FROM orders;
+----
+
+query II
+ACL ROLE 'both_levels' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'orders' ORDER BY ordinal_position;
+----
+id	NULL
+
+query I
+ACL ROLE 'both_levels' SELECT count(*) FROM duckdb_columns() WHERE table_name = 'orders' AND column_name = 'note';
+----
+0
+
+# a relation that only filters its rows (RLS, no column list) reads its source's columns too: it takes a comment
+# of its own the same way
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.positive AS phys.main.orders RLS (amount > 0);
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.positive COLUMN amount IS 'a positive amount';
+
+query II
+ACL ROLE 'analyst' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'positive' ORDER BY ordinal_position;
+----
+id	NULL
+amount	a positive amount
+note	PHYS note
+
+# a relation that declares its columns keeps their comments, and takes none for a source column its list does not
+# read (no comment for, and no probe of, what the object hides)
+statement error
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.narrow COLUMN note IS 'x';
+----
+has no column "note"
+
+# an alias that comes to declare its columns: the comment it kept for a source column is no longer shown - the check
+# says so, and the repair clears it
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.positive COLUMN note IS 'kept';
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE c.positive SET COLUMNS (id, amount);
+
+query T
+SELECT repair FROM acl_check_catalog('c') WHERE problem = 'comment_column_missing' AND object = 'positive' ORDER BY 1;
+----
+COMMENT ON VIRTUAL TABLE c.positive COLUMN "amount" IS ''
+COMMENT ON VIRTUAL TABLE c.positive COLUMN "note" IS ''
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.positive COLUMN "note" IS '';
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.positive COLUMN "amount" IS '';
+
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE problem = 'comment_column_missing';
+----
+0
+
+statement ok
+ACL ADMIN DROP RELATION c.positive;
+
 # the column must be the source's
 statement error
 ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders COLUMN missing IS 'x';

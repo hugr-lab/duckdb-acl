@@ -997,11 +997,12 @@ ACL ADMIN COMMENT ON VIRTUAL VIEW sales.stats COLUMN top IS 'the largest order';
 ACL ADMIN COMMENT ON VIRTUAL SCHEMA sales.raw IS 'raw zone';
 ```
 
-A column of a table declared without a column list (`CREATE VIRTUAL TABLE c.orders AS phys.main.orders`) takes a
-comment of its own too (spec 143): the column must be the source's, and the listings show the virtual comment over
-the source's, which shows where there is none. `IS ''` removes a comment - for such a column even once the source
-dropped it (`CHECK VIRTUAL CATALOG` reports `comment_column_missing` with that repair). A grant that names a
-column, masked or not, keeps its comment. A Flight client reads the comments in the Arrow schema
+A column of a table declared without a column list (`CREATE VIRTUAL TABLE c.orders AS phys.main.orders`, or one
+with only an `RLS`) takes a comment of its own too (spec 143): the column must be the source's, and the listings
+show the virtual comment over the source's, which shows where there is none. A table that declares its columns
+keeps theirs, and takes none for a source column its list does not read. `IS ''` removes a comment - a kept one even
+once the source dropped its column or the table came to declare its columns (`CHECK VIRTUAL CATALOG` reports
+`comment_column_missing` with that repair). A grant that names a column, masked or not, keeps its comment. A Flight client reads the comments in the Arrow schema
 ([serving](serving.md#descriptions-and-tags-in-the-arrow-schema-spec-143)).
 
 Function: `acl_comment(vcat, vname, kind, column, comment)` with `kind` = `relation` (table or view)
@@ -1060,7 +1061,7 @@ against the source and answers **one row per finding** - `vcat`, `kind` (`table`
 | `types_incompatible` | a declared entry or a grant's mask that binds over the source but not over the exposed type (`enum_code(tier)` once ENUMs are VARCHAR) - every read refuses | `… SET TYPES (enums = keep)`, or rewrite the expression |
 | `source_not_granted` | an object whose current definition an administrator below `policy` wrote (spec 120) reads a physical source its roles are no longer granted (`REVOKE SOURCE`) - its physical name, an alias' schema, a function alias' database, the objects its view / template / RLS / computed columns / reference expression name (each as it resolves, spec 138); it goes on working | `GRANT SOURCE <db>.<schema> TO ROLE <r>` (a role that still administers), or - when those roles are gone - redefine or drop the object |
 | `body_function_denied` | a stored body (view, template, alias, RLS, column or mask, a grant's policy) calls a function no principal may call - written before spec 117 judged bodies by their author's gate | redefine it without the call, or drop it |
-| `comment_column_missing` | a column comment of a table without a column list (spec 143) names a column its source no longer has | `COMMENT ON VIRTUAL TABLE … COLUMN "<c>" IS ''` |
+| `comment_column_missing` | a column comment kept for a table without a column list (spec 143) that no listing shows: its source no longer has the column, or the table now declares its columns | `COMMENT ON VIRTUAL TABLE … COLUMN "<c>" IS ''` |
 | `types_mismatch` | a declared entry that makes a type of its own (`CAST(x AS ENUM(…))`) - described as the exposed type, read as its own | `REPAIR VIRTUAL TABLE … REMAP (n = CAST(… AS <type>))` |
 
 A bare alias (no declared list) has no contract beyond "binds", so only `source_missing` (and spec 137's

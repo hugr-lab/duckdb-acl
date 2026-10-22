@@ -156,9 +156,9 @@ string VirtualKey(const QualifiedName &name) {
 
 //! The bare names duckdb reads as a value, never a column (`current_date`, `user`, ...)
 bool IsValueKeyword(const string &name) {
-	static const case_insensitive_set_t KEYWORDS = {"current_date", "current_time",   "current_timestamp",
-	                                                "localtime",    "localtimestamp", "current_user",
-	                                                "user",         "session_user",   "current_role"};
+	static const case_insensitive_set_t KEYWORDS = {
+	    "current_date", "current_time", "current_timestamp", "localtime",       "localtimestamp", "current_user",
+	    "user",         "session_user", "current_role",      "current_catalog", "current_schema"};
 	return KEYWORDS.count(name) > 0;
 }
 
@@ -189,12 +189,12 @@ public:
 		}
 	}
 
-	//! spec 143: the origin of each result column of a top-level SELECT, read off the statement as written - before
-	//! the rewrite, which replaces the relations. A column is a virtual object's when the item is a reference to it:
-	//! qualified by the relation's alias (or name), or bare when the FROM has one relation; a star over one relation
-	//! is a span of its columns. Anything else - an expression, a subquery's column, a CTE's, a set operation's - has
-	//! none. Empty when the column count cannot be read off the text (a second star, COLUMNS(), a star with
-	//! modifiers) or nothing has an origin; the door drops a list that does not fit the result.
+	//! spec 143: the origin of each result column of a top-level SELECT, read off a copy of the statement as written
+	//! (the rewrite replaces the relations) once the rewrite has decided it. A column is a virtual object's when the
+	//! item is a reference to it: qualified by the relation's alias (or name), or bare when the FROM has one relation;
+	//! a star over one relation is a span of its columns. Anything else - an expression, a subquery's column, a CTE's,
+	//! a set operation's - has none. Empty when the column count cannot be read off the text (a second star, COLUMNS(),
+	//! a star with modifiers) or nothing has an origin; the door drops a list that does not fit the result.
 	vector<ResultOrigin> ResultOrigins(SelectStatement &stmt) {
 		vector<ResultOrigin> out;
 		if (!stmt.node || stmt.node->type != QueryNodeType::SELECT_NODE) {
@@ -262,8 +262,13 @@ public:
 		bool star = false;
 		for (auto &item : node.select_list) {
 			ResultOrigin origin;
+			// the name the result gives the item, where the text says it: its alias, a reference's last part
+			auto name = item->GetAlias().GetIdentifierName();
 			if (item->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 				auto &names = item->Cast<ColumnRefExpression>().ColumnNames();
+				if (name.empty()) {
+					name = names.back().GetIdentifierName();
+				}
 				// `x` or `t.x`; a longer path is a qualified name or a struct field - no origin read off it, nor off a
 				// bare name duckdb reads as a value
 				auto relation = names.size() == 1 && IsValueKeyword(names[0].GetIdentifierName()) ? nullptr
@@ -286,7 +291,9 @@ public:
 					origin = relation->origin;
 				}
 				origin.kind = ResultOrigin::Kind::STAR;
+				name.clear(); // a span: its fields are named as the result names them
 			}
+			origin.name = std::move(name);
 			any = any || !origin.table.empty();
 			out.push_back(std::move(origin));
 		}
@@ -4435,14 +4442,11 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 			rewriter.trail = &trail->statements.back();
 			rewriter.NoteUseInForce(trail->statements.back());
 		}
-		// spec 143: a Flight session's result columns - before the rewrite replaces the relations they name; a
-		// statement the rewrite refuses is refused there, never here
+		// spec 143: a Flight session's result columns are read off the statement as written - a copy, since the
+		// rewrite replaces the relations they name - once the rewrite has decided it
+		unique_ptr<SQLStatement> as_written;
 		if (trail && trail->origins && stmt->type == StatementType::SELECT_STATEMENT) {
-			try {
-				trail->statements.back().origins = rewriter.ResultOrigins(stmt->Cast<SelectStatement>());
-			} catch (std::exception &) { // NOLINT: no origin is the answer; the rewrite judges the statement
-				TakeDenyReason();
-			}
+			as_written = stmt->Copy();
 		}
 		auto started = std::chrono::steady_clock::now();
 		auto record_cost = [&]() {
@@ -4459,6 +4463,16 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 			throw;
 		}
 		record_cost();
+		if (as_written) {
+			try {
+				trail->statements.back().origins = rewriter.ResultOrigins(as_written->Cast<SelectStatement>());
+			} catch (std::exception &) { // NOLINT: no origin is the answer - but a policy source that failed refuses
+				if (TakeDenyReason() == ReasonCode(Reason::SOURCE_ERROR)) {
+					NoteDenyReason(Reason::SOURCE_ERROR);
+					throw;
+				}
+			}
+		}
 		if (trail) {
 			// spec 074: the execution profile matches its note by the text the statement carries
 			auto &entry = trail->statements.back();

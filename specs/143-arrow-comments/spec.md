@@ -38,8 +38,10 @@ relation gets a virtual comment of its own.
   `ARROW:FLIGHT:SQL:REMARKS` when the column has one (beside `WithTypeNames`' metadata).
 - `include_schema`'s tables listing (`DESCRIBED_TABLES`) adds `TABLE_COMMENT` after the protocol's columns (not
   sent: `BatchFrom`'s `trailing`); the serialized schema's own metadata carries it as `duckdb:comment` (Flight SQL
-  has no table-level key; the name is upstream's proposal) - spec 136's unread mark rides with it. The object's
-  tags come from a third listing (`TABLE_TAGS`, `duckdb_tables()` + `duckdb_views()` under the same filters).
+  has no table-level key; the name is upstream's proposal) - spec 136's unread mark rides with it. The objects'
+  tags are read for the listed objects alone (`PolicyStore::ObjectTags`: the session principal's own tables
+  listing with its hidden tags kept, narrowed to them) - not through `duckdb_tables()`, whose shape costs a planner
+  pass per call (spec 121's measurement; the review's: 2.85 s a call against 0.83 s before the branch, now 1.05 s).
 - What the listings show is what goes: the principal's own `information_schema.columns` / `tables` (spec 035's
   visibility, spec 119's narrowing).
 
@@ -52,29 +54,37 @@ relation gets a virtual comment of its own.
   - or a star (`*`, `t.*`) over one virtual relation - its columns as the principal's listing orders them.
   Anything else - an expression, an aggregate, a subquery, a CTE's column, a set operation's - has no origin. A masked
   column is still the column (the client wrote the column; the mask is the role's view of it).
-- The origins are noted for a Flight session's batch only (the override's door; `AuditTrail::origins`), before the
-  rewrite replaces the relations, and ride the decision's profile note (spec 074: per statement, by its text's
+- The origins are noted for a Flight session's batch only (the override's door; `AuditTrail::origins`), off a copy
+  of the statement taken before the rewrite replaces the relations and read once the rewrite has decided it (a
+  policy source that fails there still refuses), and ride the decision's profile note (spec 074: per statement, by its text's
   hash); the door takes it with the note after `Prepare` (on the reservation). A star is a span: its length is the
-  result's to say, so a second star, `COLUMNS(…)` or a star with modifiers leaves the statement without origins, and
-  the door drops a list that does not fit the result's columns.
+  result's to say, so a second star, `COLUMNS(…)` or a star with modifiers leaves the statement without origins.
+- The door says nothing rather than the wrong thing (the review's misattributions): a list that does not fit the
+  fields is dropped - a star of no column (a placeholder schema), an item whose name the text gives (its alias, a
+  reference's last part) landing on a field of another name (an item beside it made several columns), a star over
+  an object whose span is not that object's columns; and a column is labelled only when the object's description
+  lists it (not a struct column's field `t.x` duckdb read off another relation, a lateral alias, `current_schema`).
 - **What a field carries** (`SchemaFor`, beside `WithTypeNames`): for a column with an origin,
   `ARROW:FLIGHT:SQL:CATALOG_NAME` / `SCHEMA_NAME` / `TABLE_NAME` - the virtual names - and `duckdb:comment` when the
   column has a comment. Never `REMARKS` on a result: arrow-java makes it the column's label (spec 115).
 - **The schema's metadata**: when every column comes from one relation, that object's comment as `duckdb:comment`.
-- The comments are the principal's own listing's (`PolicyStore::DescribeObject`: `duckdb_tables` / `duckdb_views`
-  / `duckdb_columns` narrowed to the object, on the store's connection), read once per role set and object and kept
-  until the policy's version moves or a minute passes (a source's own comment or tags change without it); the door
-  reads them at Prepare onto the reservation, so GetFlightInfo's schema, CreatePreparedStatement's and DoGet's say
-  the same.
+- The comments are the principal's own listing's (`PolicyStore::DescribeObject`: the tables and columns listings
+  with their hidden tags kept, narrowed to the object, on the store's connection), read once per role set and object
+  and kept until the policy's version moves or ten minutes pass (a source's own comment or tags change without it) -
+  an object no listing shows kept as none; the door reads them at Prepare onto the reservation, so GetFlightInfo's
+  schema, CreatePreparedStatement's and DoGet's say the same. Measured through the door: the first statement over an
+  object pays ~0.3 s once (the columns listing's own cost), the next nothing.
 
 ### A virtual comment for an alias relation's column
 
 - `COMMENT ON VIRTUAL TABLE c.t COLUMN x IS '…'` (and `acl_comment`) works for any relation: a relation with a stored
-  column list keeps it there as today (`object_columns.comment`); an alias relation stores it in a new table
+  column list keeps it there as today (`object_columns.comment`) and takes none for a source column its list does not
+  read; one with no list over a source - an alias, or one that only filters its rows (RLS) - stores it in a new table
   `column_comments (vcat, vname, column_name, comment)` (schema step v23), its column checked against the source at the
-  write. `IS ''` removes it, as for any comment.
+  write. `IS ''` removes it, as for any comment - a kept one first, whatever the relation is now.
 - The listings show the virtual comment, else the physical one - nothing shown today is taken away.
-- `acl_check_catalog` reports `comment_column_missing` when a commented column left the source.
+- `acl_check_catalog` reports `comment_column_missing` when a kept comment is shown by no listing: its column left the
+  source, or the relation came to declare its columns (each then has its own comment) - with the `IS ''` repair.
 
 ### Tags
 
@@ -109,7 +119,11 @@ They go wherever the comments go:
 ## Enforcement & security
 
 - No new visibility: every comment and name comes from the principal's own listings, which already hide what spec 035
-  hides (a hidden column has no field; a physical table comment never shows).
+  hides (a hidden column has no field; a virtual object never shows its source's table comment - a live alias
+  schema's tables are the source's own, comment included).
+- Found by the review (a negative test in `acl_column_comments.test`): a grant's projection (spec 026) listed a column
+  an object grant names but the catalog grant's list hides - the read has no such column - and this spec would have
+  carried its comment and tags; the leg now lists only a name every level of a role's grants keeps (spec 035).
 - Tags are the physical catalog's, as the owner decided for now: they may name what the source's operator wrote. A
   hidden column's tags never show (no row); the policy's own tags will replace them when the virtual catalog has them.
 - Names in a result's metadata are virtual, never the physical ones the rewrite resolved to.
@@ -148,6 +162,9 @@ They go wherever the comments go:
   `duckdb_columns`; a quack client reads none at ATTACH, and its protocol has no per-column metadata - an upstream
   duckdb-quack change (and hugr-node's `hugr` type, its copy).
 - ADBC Go's GetObjects leaves column remarks NULL (an upstream ADBC gap).
-- Found while testing the tags (not this spec's): a live schema alias's columns are listed whole under a catalog
-  grant whose `COLUMNS` narrows what the read returns - the listing shows a column name the read hides (spec 035's
-  rule). Its own spec.
+- Found while testing and reviewing (not this spec's, each its own spec):
+  - a live schema alias's columns are listed whole under a catalog grant whose `COLUMNS` narrows what the read
+    returns - the listing shows a column name (and now its tags) the read hides (spec 035's rule);
+  - a catalog grant's struct path (`COLUMNS (id, addr.city)`) lists `addr` with its hidden fields in its type (an
+    object grant's lists `STRUCT(city …)`, spec 102);
+  - `SELECT * LIKE '%t%' FROM t` under a principal names its columns `(* ~~ '%t%')` (spec 072's `KeepItemNames`).

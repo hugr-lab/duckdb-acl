@@ -259,7 +259,7 @@ private:
 			if (!relation.dead && !is_view) {
 				JudgeWholeName(kind, relation);
 			}
-			if (!relation.dead && relation.form == "alias") {
+			if (!relation.dead && !is_view) {
 				JudgeColumnComments(relation);
 			}
 			if (!relation.dead) {
@@ -295,13 +295,25 @@ private:
 		    "ALTER VIRTUAL TABLE " + Named(relation.vname) + " SET PHYS " + NamePath::KeyToGrammar(whole));
 	}
 
-	//! spec 143: an alias relation's column comment whose column its source no longer has - kept, never dropped by
-	//! itself; the repair clears it
+	//! spec 143: a column comment kept beside a relation (it declared no column list) that no listing shows - its
+	//! column left the source, or the relation declares its columns now - kept, never dropped by itself; the repair
+	//! clears it
 	void JudgeColumnComments(const Relation &relation) {
-		auto commented = Read("SELECT \"column_name\" FROM " + catalog.Tbl("column_comments") + " WHERE \"vcat\" = " +
-		                      Lit(vcat) + " AND \"vname\" = " + Lit(relation.vname) + " ORDER BY 1");
+		auto commented =
+		    Read("SELECT \"column_name\" FROM " + catalog.Tbl("column_comments") + " WHERE \"vcat\" = " + Lit(vcat) +
+		         " AND \"vname\" = " + Lit(relation.vname) + " ORDER BY 1");
 		ResultRows rows(*commented);
 		if (rows.Count() == 0) {
+			return;
+		}
+		if (!relation.declared.empty()) {
+			for (idx_t i = 0; i < rows.Count(); i++) {
+				auto column = rows.GetValue(0, i).ToString();
+				Add("table", relation.vname, "", "comment_column_missing",
+				    "a comment is kept for its source's column \"" + column +
+				        "\", which no listing shows: the object declares its columns, each with its own comment",
+				    "COMMENT ON VIRTUAL TABLE " + Named(relation.vname) + " COLUMN " + Ident(column) + " IS ''");
+			}
 			return;
 		}
 		Columns probed;
@@ -317,8 +329,7 @@ private:
 			if (!present) {
 				Add("table", relation.vname, "", "comment_column_missing",
 				    "a comment is kept for column \"" + column + "\", which \"" + relation.phys + "\" no longer has",
-				    "COMMENT ON VIRTUAL TABLE " + Named(relation.vname) + " COLUMN " + Ident(column) +
-				        " IS ''");
+				    "COMMENT ON VIRTUAL TABLE " + Named(relation.vname) + " COLUMN " + Ident(column) + " IS ''");
 			}
 		}
 	}

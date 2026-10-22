@@ -28,10 +28,10 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> BatchFrom(const std::shared_p
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> EmptyBatch(const std::shared_ptr<arrow::Schema> &schema);
 
 //! include_schema's serialized schema per object (spec 046): `tables` the DESCRIBED_TABLES listing, `columns` the
-//! COLUMNS one, `tags` TABLE_TAGS - a column's comment rides as REMARKS, the object's as `duckdb:comment` on the
-//! schema, tags as `duckdb:tag:<key>` on both (spec 143)
+//! COLUMNS one, `tags` the objects' (PolicyStore::ObjectTags) - a column's comment rides as REMARKS, the object's as
+//! `duckdb:comment` on the schema, tags as `duckdb:tag:<key>` on both (spec 143)
 arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &tables, QueryResult &columns,
-                                         QueryResult &tags);
+                                         const std::map<std::tuple<string, string, string>, Value> &tags);
 
 //! spec 143: a comment (under `comment_key`) and tags (`duckdb:tag:<key>` each) as Arrow metadata; empty when
 //! there is neither

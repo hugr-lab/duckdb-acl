@@ -124,27 +124,6 @@ CatalogQuery BuildCatalogListing(CatalogListing listing, const CatalogFilter &fi
 		            " FROM information_schema.tables" + Where(conditions) + " ORDER BY 1, 2, 3";
 		return query;
 
-	case CatalogListing::TABLE_TAGS: {
-		// spec 143: an object's tags, for `include_schema`'s schema metadata - duckdb_tables / duckdb_views carry
-		// them, information_schema has none. Matched back to the tables listing by (catalog, schema, name), like
-		// COLUMNS; each half filtered alike, so the listing narrows (spec 119)
-		auto half = [&](const string &surface, const string &name_column) {
-			vector<string> where;
-			AppendCatalogFilter(query, where, filter, "database_name");
-			if (filter.has_db_schema_pattern) {
-				where.push_back("schema_name LIKE " + Bind(query, Value(filter.db_schema_pattern)) + " ESCAPE '\\'");
-			}
-			if (filter.has_table_pattern) {
-				where.push_back(name_column + " LIKE " + Bind(query, Value(filter.table_pattern)) + " ESCAPE '\\'");
-			}
-			return "SELECT database_name, schema_name, " + name_column + " AS table_name, tags FROM " + surface + "()" +
-			       Where(where);
-		};
-		query.sql = half("duckdb_tables", "table_name") + " UNION ALL " + half("duckdb_views", "view_name") +
-		            " ORDER BY 1, 2, 3";
-		return query;
-	}
-
 	case CatalogListing::COLUMNS:
 		// What `include_schema` is built from: every column of every table the same filters select, in
 		// one statement. The `table_types` filter is deliberately *not* applied - this listing has no

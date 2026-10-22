@@ -14,6 +14,7 @@
 #include "acl_audit.hpp"
 #include "acl_lineage.hpp"
 #include "acl_flight_catalog.hpp"
+#include "acl_result_rows.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/query_node/list.hpp"
@@ -2494,11 +2495,25 @@ public:
 			    ARROW_ASSIGN_OR_RAISE(auto columns,
 			                          RunCatalogQuery(*state->store, *conn->con, handle,
 			                                          BuildCatalogListing(CatalogListing::COLUMNS, filter)));
-			    ARROW_ASSIGN_OR_RAISE(auto tags,
-			                          RunCatalogQuery(*state->store, *conn->con, handle,
-			                                          BuildCatalogListing(CatalogListing::TABLE_TAGS, filter)));
+			    // spec 143: the objects' tags, read for the listed objects alone by the principal's own listing
+			    // (information_schema keeps duckdb's shape; duckdb_tables' costs a planner pass per call)
+			    std::map<std::tuple<string, string, string>, Value> tags;
+			    Principal principal;
+			    string reason;
+			    if (state->store->SessionPrincipal(handle, principal, reason)) {
+				    ResultRows rows(*tables);
+				    vector<std::tuple<string, string, string>> objects;
+				    for (idx_t row = 0; row < rows.Count(); row++) {
+					    objects.emplace_back(rows.GetValue(0, row).ToString(), rows.GetValue(1, row).ToString(),
+					                         rows.GetValue(2, row).ToString());
+				    }
+				    try {
+					    tags = state->store->ObjectTags(principal, objects);
+				    } catch (std::exception &) { // NOLINT: tags are a description; the listing is not refused for them
+				    }
+			    }
 			    Connection con(state->db);
-			    ARROW_ASSIGN_OR_RAISE(auto serialized, SchemasFor(*con.context, *tables, *columns, *tags));
+			    ARROW_ASSIGN_OR_RAISE(auto serialized, SchemasFor(*con.context, *tables, *columns, tags));
 			    return BatchFrom(schema, *tables, &serialized, 1);
 		    });
 	}

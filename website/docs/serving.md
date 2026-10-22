@@ -281,8 +281,10 @@ physical name never appears):
   one relation) or comes from a star over one object carries `ARROW:FLIGHT:SQL:CATALOG_NAME` / `SCHEMA_NAME` /
   `TABLE_NAME` - the virtual names - and its comment as `duckdb:comment` (never `REMARKS`: arrow-java makes it the
   column's label). When every column is one object's, the schema carries that object's comment. An expression, an
-  aggregate, a subquery's, a CTE's or a set operation's column has none. What an object says is read once per
-  role set and object, kept until the policy changes (at most a minute).
+  aggregate, a subquery's, a CTE's or a set operation's column has none, and when the columns cannot be matched to
+  the statement's items for certain (an item that makes several columns beside a star) none is labelled. What an
+  object says is read once per role set and object (the first statement over it pays the column listing, ~0.3 s)
+  and kept until the policy changes, at most ten minutes.
 - **Tags** - one key per tag, `duckdb:tag:<key>`, wherever the comment goes (a field's, the schema's). The virtual
   catalog has no tags of its own yet: they are the source's (a DuckLake table's, say), where a virtual object has
   one physical counterpart - an alias relation's table and columns, a declared list's columns by the source column

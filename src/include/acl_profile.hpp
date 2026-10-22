@@ -37,6 +37,10 @@ struct ResultOrigin {
 	//! something that is no virtual object (a span that takes its columns and gives them no origin)
 	string catalog, schema, table;
 	string column; // COLUMN: as written
+	//! the name the result gives the column when it can be read off the text (an alias, a reference's last part);
+	//! empty when it cannot (an expression with no alias) or for a star. The door checks it against the field, so a
+	//! shift (an item that makes several columns) is caught
+	string name;
 };
 
 //! What the override knows at decision time and the profile needs at execution time: the seq of

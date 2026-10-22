@@ -149,15 +149,13 @@ void ColumnsAreOneStatementForEveryTable(Connection &con) {
 	Check(Joined(columns).find("secret") == string::npos, "and a column the role cannot read is not in it");
 }
 
-//! spec 143: include_schema's object comment (after the protocol's columns) and tags, under the same filters
+//! spec 143: include_schema's object comment, after the protocol's columns, under the same filters
 void TablesAreDescribed(Connection &con) {
 	CatalogFilter filter;
 	filter.has_table_pattern = true;
 	filter.table_pattern = "cust%";
 	auto tables = RunAsRole(con, "analyst", BuildCatalogListing(CatalogListing::DESCRIBED_TABLES, filter));
 	Check(Joined(tables) == "c|main|customers|BASE TABLE|who buys", "the object's comment follows: " + Joined(tables));
-	auto tags = RunAsRole(con, "analyst", BuildCatalogListing(CatalogListing::TABLE_TAGS, filter));
-	Check(Joined(tags) == "c|main|customers|{}", "and its tags, one row per object: " + Joined(tags));
 }
 
 void ReferencesAreTheForeignKeys(Connection &con) {

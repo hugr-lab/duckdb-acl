@@ -645,6 +645,10 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	if (surface == "tables") {
 		return prelude + named("SELECT * EXCLUDE (acl_tags) FROM (" + tables_sql + ")", table_names);
 	}
+	if (surface == "tables_tagged") {
+		// spec 143: information_schema.tables with the hidden acl_tags kept - DescribeObject's and ObjectTags'
+		return prelude + named(tables_sql, table_names);
+	}
 	if (surface == "show_tables") {
 		// a bare `SHOW TABLES` is the schema an unqualified name resolves in - `main` of the MAIN
 		// catalog. Filtering on the schema alone listed the `main` of every granted catalog, whose
@@ -654,9 +658,9 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		                           " WHERE g.\"vcat\" = t.table_catalog AND g.\"is_main\" = true)",
 		                       {{"name", Shown::NAME}}, "1");
 	}
-	if (surface != "columns" && surface != "references" && surface != "keys" && surface != "show_tables_expanded" &&
-	    surface != "show_tables" && surface != "duckdb_tables" && surface != "duckdb_views" &&
-	    surface != "duckdb_columns") {
+	if (surface != "columns" && surface != "columns_tagged" && surface != "references" && surface != "keys" &&
+	    surface != "show_tables_expanded" && surface != "show_tables" && surface != "duckdb_tables" &&
+	    surface != "duckdb_views" && surface != "duckdb_columns") {
 		throw BinderException("acl: unknown metadata surface \"%s\"", surface);
 	}
 	// the columns a role actually sees: an object's own projection when it has one (its rows in
@@ -693,7 +697,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    alias_nullable + " AS is_nullable, coalesce(cc.\"comment\", i.\"COLUMN_COMMENT\") AS \"COLUMN_COMMENT\")" +
 	    " FROM objects o JOIN " + icolumns + " i ON " + physical + projection +
 	    " AND c.\"expr\" = i.\"column_name\" LEFT JOIN " + Tbl("column_comments") +
-	    " cc ON o.form = 'alias' AND cc.\"vcat\" = o.vcat AND cc.\"vname\" = " + alias_vname +
+	    " cc ON c.\"name\" IS NULL AND cc.\"vcat\" = o.vcat AND cc.\"vname\" = " + alias_vname +
 	    " AND cc.\"column_name\" = i.\"column_name\""
 	    " WHERE len(o.parts) = 3 AND (o.form = 'alias' OR (o.form = 'subquery' AND NOT EXISTS"
 	    " (SELECT 1 FROM " +
@@ -806,6 +810,9 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " FROM gprojection gp JOIN objects o ON o.vcat = gp.vcat AND " +
 	    path("o") + " = gp.vname LEFT JOIN lcols s ON s.table_catalog = gp.vcat AND " + source_path +
 	    " = gp.vname AND " + KeyFoldSql("s.column_name") + " = " + KeyFoldSql("gp.name") +
+	    // review 143: an object grant's list names what that level keeps - the catalog grant's may hide it, and then
+	    // the read has no such column (nor may its name, comment or tags be listed)
+	    " WHERE " + column_visible("gp.vcat", "gp.vname", "gp.name") +
 	    // spec 117: the columns of the system catalog's views - the types each view declares
 	    (platform ? " UNION ALL BY NAME SELECT 'platform' AS table_catalog, pc.path AS table_schema, pc.vname AS"
 	                " table_name, pc.name AS column_name, pc.pos AS ordinal_position, pc.type AS data_type,"
@@ -813,6 +820,9 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	              : string());
 	if (surface == "columns") {
 		return prelude + named("SELECT * EXCLUDE (acl_tags) FROM (" + effective_columns + ")", table_names);
+	}
+	if (surface == "columns_tagged") {
+		return prelude + named(effective_columns, table_names); // spec 143: DescribeObject's
 	}
 	if (surface == "duckdb_columns") {
 		// the same rows as information_schema.columns, in duckdb's own shape. `is_nullable` and
@@ -1212,6 +1222,25 @@ bool PolicyStore::MetadataListing(const Principal &principal, const string &surf
 	return true;
 }
 
+namespace {
+
+//! What a listing shows depends on the roles alone (the claims narrow rows, never columns)
+string RoleSetKey(const Principal &principal) {
+	auto roles = principal.roles;
+	std::sort(roles.begin(), roles.end());
+	return StringUtil::Join(roles, "\x1f");
+}
+
+//! The principal without its session: a session's temps and the platform's share are no virtual object's, so a
+//! description kept per role set holds for every session of it
+Principal Listed(const Principal &principal) {
+	Principal listed = principal;
+	listed.session.clear();
+	return listed;
+}
+
+} // namespace
+
 shared_ptr<const PolicyStore::ObjectDescription> PolicyStore::DescribeObject(const Principal &principal,
                                                                              const string &catalog_name,
                                                                              const string &schema,
@@ -1219,56 +1248,82 @@ shared_ptr<const PolicyStore::ObjectDescription> PolicyStore::DescribeObject(con
 	if (!catalog) {
 		return nullptr; // the memory store lists nothing
 	}
-	// what a listing shows depends on the roles alone (the claims narrow rows, never columns)
-	auto roles = principal.roles;
-	std::sort(roles.begin(), roles.end());
-	string key = StringUtil::Join(roles, "\x1f") + "\x1e" + StringUtil::Lower(catalog_name) + "\x1e" +
-	             StringUtil::Lower(schema) + "\x1e" + StringUtil::Lower(table);
+	string key = RoleSetKey(principal) + "\x1e" + StringUtil::Lower(catalog_name) + "\x1e" + StringUtil::Lower(schema) +
+	             "\x1e" + StringUtil::Lower(table);
 	auto version = PolicyVersion();
 	auto now = std::chrono::steady_clock::now();
 	{
 		std::lock_guard<std::mutex> guard(descriptions_lock);
 		auto found = descriptions.find(key);
 		if (found != descriptions.end() && found->second.version == version &&
-		    now - found->second.read < std::chrono::seconds(60)) {
+		    now - found->second.read < std::chrono::minutes(10)) {
 			return found->second.description;
 		}
 	}
+	// information_schema's two surfaces with their tags kept - the listing's cheap bodies (duckdb_tables'
+	// shape costs a planner pass over its per-table subqueries), narrowed to the object
 	ListingScope scope;
 	scope.catalogs = {catalog_name};
 	scope.schemas = {schema};
 	scope.tables = {table};
-	string columns_sql, tables_sql, views_sql;
-	Principal listed = principal;
-	listed.session.clear(); // a session's temps and the platform's share are no virtual object's
-	MetadataListing(listed, "duckdb_columns", columns_sql, scope);
-	MetadataListing(listed, "duckdb_tables", tables_sql, scope);
-	MetadataListing(listed, "duckdb_views", views_sql, scope);
-	auto where = [&](const char *name_column) {
-		return string(" WHERE database_name = ") + Lit(catalog_name) + " AND schema_name = " + Lit(schema) + " AND " +
-		       name_column + " = " + Lit(table);
-	};
-	auto description = make_shared_ptr<ObjectDescription>();
-	auto objects = catalog->Query("SELECT comment, tags FROM (" + tables_sql + ")" + where("table_name") +
-	                              " UNION ALL SELECT comment, tags FROM (" + views_sql + ")" + where("view_name"));
+	string tables_sql, columns_sql;
+	auto listed = Listed(principal);
+	MetadataListing(listed, "tables_tagged", tables_sql, scope);
+	MetadataListing(listed, "columns_tagged", columns_sql, scope);
+	auto where = string(" WHERE table_catalog = ") + Lit(catalog_name) + " AND table_schema = " + Lit(schema) +
+	             " AND table_name = " + Lit(table);
+	shared_ptr<ObjectDescription> description;
+	auto objects = catalog->Query("SELECT \"TABLE_COMMENT\", acl_tags FROM (" + tables_sql + ")" + where);
 	ResultRows object_rows(*objects);
-	if (object_rows.Count() == 0) {
-		return nullptr; // not an object this principal sees
+	if (object_rows.Count() > 0) {
+		description = make_shared_ptr<ObjectDescription>();
+		description->comment = object_rows.GetValue(0, 0);
+		description->tags = object_rows.GetValue(1, 0);
+		auto columns =
+		    catalog->Query("SELECT column_name, \"COLUMN_COMMENT\", acl_tags FROM (" + columns_sql + ")" + where);
+		ResultRows column_rows(*columns);
+		for (idx_t i = 0; i < column_rows.Count(); i++) {
+			description->columns.emplace(column_rows.GetValue(0, i).ToString(),
+			                             std::make_pair(column_rows.GetValue(1, i), column_rows.GetValue(2, i)));
+		}
 	}
-	description->comment = object_rows.GetValue(0, 0);
-	description->tags = object_rows.GetValue(1, 0);
-	auto columns = catalog->Query("SELECT column_name, comment, tags FROM (" + columns_sql + ")" + where("table_name"));
-	ResultRows column_rows(*columns);
-	for (idx_t i = 0; i < column_rows.Count(); i++) {
-		description->columns.emplace(column_rows.GetValue(0, i).ToString(),
-		                             std::make_pair(column_rows.GetValue(1, i), column_rows.GetValue(2, i)));
-	}
+	// kept whatever it says - none (an object the listings do not show) included, so a statement over one does not
+	// pay for the listing again
 	std::lock_guard<std::mutex> guard(descriptions_lock);
 	if (descriptions.size() >= 4096) {
 		descriptions.clear(); // a cache, not a record: past its bound it starts over
 	}
 	descriptions[key] = CachedDescription {version, now, description};
 	return description;
+}
+
+std::map<std::tuple<string, string, string>, Value>
+PolicyStore::ObjectTags(const Principal &principal, const vector<std::tuple<string, string, string>> &objects) {
+	std::map<std::tuple<string, string, string>, Value> out;
+	if (!catalog || objects.empty()) {
+		return out;
+	}
+	ListingScope scope;
+	std::set<string> catalogs, schemas, tables;
+	for (auto &object : objects) {
+		catalogs.insert(std::get<0>(object));
+		schemas.insert(std::get<1>(object));
+		tables.insert(std::get<2>(object));
+	}
+	scope.catalogs.assign(catalogs.begin(), catalogs.end());
+	scope.schemas.assign(schemas.begin(), schemas.end());
+	scope.tables.assign(tables.begin(), tables.end());
+	string sql;
+	MetadataListing(Listed(principal), "tables_tagged", sql, scope);
+	auto rows = catalog->Query("SELECT table_catalog, table_schema, table_name, acl_tags FROM (" + sql +
+	                           ") WHERE acl_tags IS NOT NULL AND cardinality(acl_tags) > 0");
+	ResultRows tagged(*rows);
+	for (idx_t i = 0; i < tagged.Count(); i++) {
+		out.emplace(std::make_tuple(tagged.GetValue(0, i).ToString(), tagged.GetValue(1, i).ToString(),
+		                            tagged.GetValue(2, i).ToString()),
+		            tagged.GetValue(3, i));
+	}
+	return out;
 }
 
 } // namespace acl

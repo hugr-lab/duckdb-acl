@@ -194,10 +194,15 @@ got="$(ACL_SHOW_DESCRIBED=1 ask "SELECT o.amount, k.name FROM orders o JOIN cust
 echo "$got" | grep -q "'amount|c.main.orders|comment:what was paid|', 'name|c.main.customers|comment:PHYS name|'" ||
 	fail "a join's origins: $got"
 # nothing read off an aggregate, a CTE's column or a set operation - nor off a bare value keyword, nor off a star
-# beside an expression that makes several columns (its span shifts)
+# beside an expression that makes several columns (its span shifts), nor off a name that is no column of the object
+# (a lateral alias, a struct column's field), nor off a placeholder schema (a parameter in a star's relation)
 for sql in "SELECT count(*) AS n FROM orders" "WITH x AS (SELECT amount FROM orders) SELECT amount FROM x" \
 	"SELECT id FROM orders UNION ALL SELECT id FROM customers" "SELECT current_date AS d FROM orders" \
-	"SELECT *, unnest({'a': 1, 'b': 2}) FROM orders"; do
+	"SELECT *, unnest({'a': 1, 'b': 2}) FROM orders" \
+	"SELECT current_schema FROM orders" "SELECT amount + 1 AS z, z FROM orders" \
+	"SELECT o.x FROM orders o, (SELECT {'x': 1} AS o) s" \
+	"SELECT unnest({'a': 1, 'b': 2}), o.amount, x.* FROM orders o, (SELECT 1 AS q) x" \
+	"@prepared_fields:SELECT orders.amount, x.* FROM orders, (SELECT ? AS p) x"; do
 	got="$(ACL_SHOW_DESCRIBED=1 ask "$sql")"
 	echo "$got" | grep -q "c.main" && fail "an origin was read off \"$sql\": $got"
 done

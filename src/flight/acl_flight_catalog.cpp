@@ -352,64 +352,78 @@ WithOrigins(const std::shared_ptr<arrow::Schema> &schema, const vector<ResultOri
 	for (auto &origin : origins) {
 		stars += origin.kind == ResultOrigin::Kind::STAR ? 1 : 0;
 	}
+	// a star is at least one column (duckdb refuses an empty one): a span of none is a placeholder schema
 	if (origins.empty() || stars > 1 || (stars == 0 && origins.size() != fields) ||
-	    (stars == 1 && origins.size() - 1 > fields)) {
+	    (stars == 1 && origins.size() > fields)) {
 		return schema; // the list does not describe these columns
 	}
 	// one origin per field: a star's span takes the columns the others leave, each named as the result names it
+	auto span = fields - (origins.size() - 1);
 	vector<std::pair<const ResultOrigin *, string>> per_field;
 	for (auto &origin : origins) {
+		auto at = per_field.size();
 		if (origin.kind != ResultOrigin::Kind::STAR) {
+			// an item whose name the text gives lands on a field of that name, or the list is off (an item that
+			// made several columns shifted it) - then nothing is said rather than the wrong thing
+			if (!origin.name.empty() &&
+			    !StringUtil::CIEquals(origin.name, schema->field(NumericCast<int>(at))->name())) {
+				return schema;
+			}
 			per_field.emplace_back(&origin, origin.column);
 			continue;
 		}
-		for (idx_t span = fields - (origins.size() - 1); span > 0; span--) {
-			per_field.emplace_back(&origin, schema->field(NumericCast<int>(per_field.size()))->name());
+		for (idx_t i = 0; i < span; i++) {
+			per_field.emplace_back(&origin, schema->field(NumericCast<int>(at + i))->name());
 		}
 	}
-	// a star's span is the object's columns: an expression beside it that makes several (an unnest of a struct)
-	// shifts it - then nothing is said rather than the wrong thing
-	for (idx_t i = 0; i < fields; i++) {
-		auto &origin = *per_field[i].first;
-		if (origin.kind != ResultOrigin::Kind::STAR || origin.table.empty()) {
-			continue;
-		}
-		auto described = describe(origin);
-		if (described && (described->columns.size() != fields - (origins.size() - 1) ||
-		                  !described->columns.count(per_field[i].second))) {
-			return schema;
-		}
-	}
-	auto out = schema;
-	shared_ptr<const PolicyStore::ObjectDescription> only;
-	bool one_object = fields > 0;
+	// what each field is said to be: the object's column as the principal's listing describes it - a column the
+	// description does not list is no column of that object (a struct field, a lateral alias, a value keyword)
+	vector<shared_ptr<const PolicyStore::ObjectDescription>> described(fields);
+	vector<const std::pair<Value, Value> *> column_of(fields, nullptr);
 	for (idx_t i = 0; i < fields; i++) {
 		auto &origin = *per_field[i].first;
 		if (origin.table.empty()) {
-			one_object = false;
 			continue;
 		}
-		auto &first = *per_field[0].first;
-		one_object = one_object && StringUtil::CIEquals(origin.catalog, first.catalog) &&
-		             StringUtil::CIEquals(origin.schema, first.schema) &&
-		             StringUtil::CIEquals(origin.table, first.table);
-		auto builder = flight::sql::ColumnMetadata::Builder();
-		builder.CatalogName(origin.catalog).SchemaName(origin.schema).TableName(origin.table);
-		auto metadata = builder.Build().metadata_map();
-		auto described = describe(origin);
-		if (described) {
-			only = described;
-			auto column = described->columns.find(per_field[i].second);
-			if (column != described->columns.end()) {
-				metadata =
-				    metadata->Merge(*DescribedMetadata("duckdb:comment", column->second.first, column->second.second));
+		described[i] = describe(origin);
+		if (described[i]) {
+			auto found = described[i]->columns.find(per_field[i].second);
+			if (found != described[i]->columns.end()) {
+				column_of[i] = &found->second;
 			}
 		}
+		if (!column_of[i] && origin.kind == ResultOrigin::Kind::STAR) {
+			return schema; // a star's span is the object's columns, or the list is off
+		}
+	}
+	for (auto &origin : origins) {
+		if (origin.kind == ResultOrigin::Kind::STAR && !origin.table.empty()) {
+			auto object = describe(origin);
+			if (!object || object->columns.size() != span) {
+				return schema;
+			}
+		}
+	}
+	auto out = schema;
+	bool one_object = fields > 0;
+	for (idx_t i = 0; i < fields; i++) {
+		auto &origin = *per_field[i].first;
+		auto &first = *per_field[0].first;
+		one_object = one_object && column_of[i] && StringUtil::CIEquals(origin.catalog, first.catalog) &&
+		             StringUtil::CIEquals(origin.schema, first.schema) &&
+		             StringUtil::CIEquals(origin.table, first.table);
+		if (!column_of[i]) {
+			continue;
+		}
+		auto builder = flight::sql::ColumnMetadata::Builder();
+		builder.CatalogName(origin.catalog).SchemaName(origin.schema).TableName(origin.table);
+		auto metadata = builder.Build().metadata_map()->Merge(
+		    *DescribedMetadata("duckdb:comment", column_of[i]->first, column_of[i]->second));
 		auto field = NumericCast<int>(i);
 		ARROW_ASSIGN_OR_RAISE(out, out->SetField(field, out->field(field)->WithMergedMetadata(metadata)));
 	}
-	if (one_object && only) {
-		auto object = DescribedMetadata("duckdb:comment", only->comment, only->tags);
+	if (one_object) {
+		auto object = DescribedMetadata("duckdb:comment", described[0]->comment, described[0]->tags);
 		if (object->size() > 0) {
 			out = out->WithMetadata(out->metadata() ? out->metadata()->Merge(*object) : object);
 		}
@@ -418,10 +432,9 @@ WithOrigins(const std::shared_ptr<arrow::Schema> &schema, const vector<ResultOri
 }
 
 arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &tables, QueryResult &columns,
-                                         QueryResult &tags) {
+                                         const std::map<std::tuple<string, string, string>, Value> &tags_of) {
 	ResultRows table_rows(tables);
 	ResultRows column_rows(columns);
-	ResultRows tag_rows(tags);
 	using ObjectKey = std::tuple<string, string, string>;
 	auto key_of = [](ResultRows &rows, idx_t row) {
 		return std::make_tuple(rows.GetValue(0, row).ToString(), rows.GetValue(1, row).ToString(),
@@ -431,11 +444,6 @@ arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &ta
 	std::map<ObjectKey, vector<idx_t>> by_object;
 	for (idx_t row = 0; row < columns.RowCount(); row++) {
 		by_object[key_of(column_rows, row)].push_back(row);
-	}
-	// spec 143: each object's tags (duckdb_tables / duckdb_views), for the schema's own metadata
-	std::map<ObjectKey, Value> tags_of;
-	for (idx_t row = 0; row < tags.RowCount(); row++) {
-		tags_of.emplace(key_of(tag_rows, row), tag_rows.GetValue(3, row));
 	}
 
 	// Two passes, and the split is deliberate. Parsing a type name resolves it against the catalog -

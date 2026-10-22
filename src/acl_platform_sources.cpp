@@ -590,6 +590,10 @@ unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableF
 					}
 				});
 			}
+			if (bind.schemas) {
+				continue; // the schema looked up, its tables never loaded: no reader of this statement may count it
+				          // read
+			}
 			cache->answered.insert(db_key);
 			cache->read.insert(lowered);
 		} catch (std::exception &ex) { // NOLINT: a source that cannot answer is left out, and said (spec 136)

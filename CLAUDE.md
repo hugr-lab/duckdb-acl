@@ -895,15 +895,19 @@ principal. The node never waits or times out by itself — the deadline belongs 
 
 **Spec 143 — comments and tags in the Arrow schema** (Flight; quack later): GetTables `include_schema` reads
 `duckdb_columns()` (comment + tags), a `DESCRIBED_TABLES` listing (the object's comment after the protocol's columns,
-`BatchFrom`'s `trailing`) and `TABLE_TAGS`; a field's comment is `ARROW:FLIGHT:SQL:REMARKS`, the object's
-`duckdb:comment` on the schema, a tag `duckdb:tag:<key>`. A result's columns: the rewriter notes `ResultOrigin`s off
-the statement as written (`ResultOrigins`, a Flight batch only - `AuditTrail::origins`; a column reference to one
-virtual relation, a star = a span, never an expression / CTE / union / a second star) onto the profile note; the door
-reads `PolicyStore::DescribeObject` (the principal's duckdb_tables / _views / _columns narrowed to the object, cached
-per role set + object, policy version, ≤ 60 s) at Prepare onto the reservation, and `WithOrigins` writes CATALOG_NAME
-/ SCHEMA_NAME / TABLE_NAME + `duckdb:comment` (never REMARKS on a result) + tags (a star's span checked against the
-object's columns). An alias relation's column takes a virtual comment (`column_comments`, schema v23; `IS ''`
-clears; check `comment_column_missing`). Tags are the PHYSICAL catalog's for now (`tags` on `acl_physical_tables` /
+`BatchFrom`'s `trailing`) and `PolicyStore::ObjectTags` (the listed objects' tags, C++); a field's comment is
+`ARROW:FLIGHT:SQL:REMARKS`, the object's `duckdb:comment` on the schema, a tag `duckdb:tag:<key>`. Never
+`duckdb_tables()` on these paths: its shape costs a planner pass per call. The internal surfaces `tables_tagged` /
+`columns_tagged` (MetadataListingSql, no SQL name maps to them) keep the hidden tags. A result's columns: the rewriter
+notes `ResultOrigin`s (with each item's name) off a copy of the statement as written, after the rewrite decided it
+(`ResultOrigins`, a Flight batch only - `AuditTrail::origins`; a column reference to one virtual relation, a star = a
+span, never an expression / CTE / union / a second star) onto the profile note; the door reads
+`PolicyStore::DescribeObject` (those surfaces narrowed to the object, cached per role set + object, policy version,
+≤ 10 min, none kept too) at Prepare onto the reservation, and `WithOrigins` writes CATALOG_NAME / SCHEMA_NAME /
+TABLE_NAME + `duckdb:comment` (never REMARKS on a result) + tags - only when every item lands on its named field, a
+star's span is its object's columns, and the description lists the column. A relation with no column list (alias,
+RLS-only) takes a virtual column comment (`column_comments`, schema v23; `IS ''` clears a kept one first; check
+`comment_column_missing`). Tags are the PHYSICAL catalog's for now (`tags` on `acl_physical_tables` /
 `_columns`, `acl_physical_schemas(keys)` for a live alias schema; a declared column by the spec 039 read-by-name
 rule; none for views / functions / computed columns), in the duckdb_* surfaces, never information_schema (hidden
 `acl_tags`, EXCLUDEd). A grant's projection keeps the column's comment and tags. No SQL sets a tag: tests make them
