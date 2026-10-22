@@ -156,6 +156,8 @@ def prepared_dataset_fields(client, options, sql: str) -> int:
         close = command("ActionClosePreparedStatementRequest", field(1, handle))
         list(client.do_action(flight.Action("ClosePreparedStatement", close), options))
     schema = inner.get(2, b"")
+    if os.environ.get("ACL_SHOW_DESCRIBED"):  # spec 143: what the announced dataset schema says of its columns
+        return described(pa.ipc.read_schema(pa.py_buffer(schema))) if schema else []
     if os.environ.get("ACL_SHOW_PARAM_TYPE_NAMES"):  # spec 115: parameter_schema = 3
         params = inner.get(3, b"")
         return type_names(pa.ipc.read_schema(pa.py_buffer(params))) if params else []
@@ -202,6 +204,32 @@ def type_names(schema):
         if b"ARROW:FLIGHT:SQL:PRECISION" in md:
             text_ += f"/{md[b'ARROW:FLIGHT:SQL:PRECISION'].decode()}/{md.get(b'ARROW:FLIGHT:SQL:SCALE', b'-').decode()}"
         out.append(text_)
+    return out
+
+
+def described(schema):
+    """spec 143: what a schema says of where its columns come from - `name|catalog.schema.table|comment|tags` per
+    field (`comment:` = duckdb:comment, `remarks:` = Flight SQL's REMARKS), then `<object>|comment|tags` - the
+    schema's own metadata"""
+    def tags(md):
+        return ",".join(f"{k.decode()[len('duckdb:tag:'):]}={v.decode()}"
+                        for k, v in sorted(md.items()) if k.startswith(b"duckdb:tag:"))
+
+    def comment(md):
+        if b"duckdb:comment" in md:
+            return "comment:" + md[b"duckdb:comment"].decode()
+        if b"ARROW:FLIGHT:SQL:REMARKS" in md:
+            return "remarks:" + md[b"ARROW:FLIGHT:SQL:REMARKS"].decode()
+        return ""
+    out = []
+    for f in schema:
+        md = f.metadata or {}
+        where = ".".join(md.get(k, b"").decode() for k in (b"ARROW:FLIGHT:SQL:CATALOG_NAME",
+                                                           b"ARROW:FLIGHT:SQL:SCHEMA_NAME",
+                                                           b"ARROW:FLIGHT:SQL:TABLE_NAME"))
+        out.append(f"{f.name}|{where if where != '..' else ''}|{comment(md)}|{tags(md)}")
+    md = schema.metadata or {}
+    out.append(f"<object>|{comment(md)}|{tags(md)}")
     return out
 
 
@@ -439,6 +467,10 @@ data = table.to_pydict()
 # spec 099: what the stream itself carries, column by column - a dictionary or a plain string
 if os.environ.get("ACL_SHOW_SCHEMA"):
     data["__schema"] = [f"{f.name}:{f.type}" for f in table.schema]
+# spec 143: where each column comes from, as the stream's schema says it - and whether GetFlightInfo promised the same
+if os.environ.get("ACL_SHOW_DESCRIBED") and "table_schema" not in data:
+    data["__described"] = described(table.schema)
+    data["__promised_same"] = described(info.schema) == data["__described"]
 # spec 115: the type a tool shows - Flight SQL's ARROW:FLIGHT:SQL:TYPE_NAME on each field
 if os.environ.get("ACL_SHOW_TYPE_NAMES"):
     data["__type_names"] = type_names(table.schema)
@@ -451,6 +483,9 @@ if "table_schema" in data:
         schema = pa.ipc.read_schema(pa.BufferReader(blob))
         if os.environ.get("ACL_SHOW_TYPE_NAMES"):
             unpacked.append(type_names(schema))
+            continue
+        if os.environ.get("ACL_SHOW_DESCRIBED"):
+            unpacked.append(described(schema))
             continue
         unpacked.append([f"{f.name}:{f.type}" + ("" if f.nullable else " NOT NULL") for f in schema])
     data["table_schema"] = unpacked

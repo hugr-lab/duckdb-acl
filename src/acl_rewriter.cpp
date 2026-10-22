@@ -154,6 +154,14 @@ string VirtualKey(const QualifiedName &name) {
 	return NamePath::FromQualified(name).ToKey();
 }
 
+//! The bare names duckdb reads as a value, never a column (`current_date`, `user`, ...)
+bool IsValueKeyword(const string &name) {
+	static const case_insensitive_set_t KEYWORDS = {"current_date", "current_time",   "current_timestamp",
+	                                                "localtime",    "localtimestamp", "current_user",
+	                                                "user",         "session_user",   "current_role"};
+	return KEYWORDS.count(name) > 0;
+}
+
 //! Build a QualifiedName from a stored physical name (a key) of any depth: the last part is the name,
 //! the preceding ones the (possibly nested) catalog/schema path - each part one identifier, so
 //! `phys."Raw Data"."Order Items"` binds as the three names it holds (spec 116). Preserves depth beyond
@@ -179,6 +187,110 @@ public:
 				store.SessionUseOf(session_id, use_catalog, use_schema);
 			}
 		}
+	}
+
+	//! spec 143: the origin of each result column of a top-level SELECT, read off the statement as written - before
+	//! the rewrite, which replaces the relations. A column is a virtual object's when the item is a reference to it:
+	//! qualified by the relation's alias (or name), or bare when the FROM has one relation; a star over one relation
+	//! is a span of its columns. Anything else - an expression, a subquery's column, a CTE's, a set operation's - has
+	//! none. Empty when the column count cannot be read off the text (a second star, COLUMNS(), a star with
+	//! modifiers) or nothing has an origin; the door drops a list that does not fit the result.
+	vector<ResultOrigin> ResultOrigins(SelectStatement &stmt) {
+		vector<ResultOrigin> out;
+		if (!stmt.node || stmt.node->type != QueryNodeType::SELECT_NODE) {
+			return out;
+		}
+		auto &node = stmt.node->Cast<SelectNode>();
+		struct Relation {
+			string qualifier;
+			ResultOrigin origin; // kind NONE: no virtual object
+		};
+		vector<Relation> relations;
+		std::function<void(TableRef &)> collect = [&](TableRef &ref) {
+			if (ref.type == TableReferenceType::JOIN) {
+				auto &join = ref.Cast<JoinRef>();
+				collect(*join.left);
+				collect(*join.right);
+				return;
+			}
+			Relation relation;
+			relation.qualifier = ref.alias.GetIdentifierName();
+			if (ref.type != TableReferenceType::BASE_TABLE) {
+				relations.push_back(relation); // a subquery, a function: columns of its own
+				return;
+			}
+			auto &base = ref.Cast<BaseTableRef>();
+			auto &name = base.GetQualifiedName();
+			if (relation.qualifier.empty()) {
+				relation.qualifier = base.Table().GetIdentifierName();
+			}
+			bool cte = name.Catalog().empty() && name.Schema().empty() &&
+			           node.cte_map.map.find(base.Table()) != node.cte_map.map.end();
+			string leaf;
+			auto key = cte || !base.column_name_alias.empty() || PlatformObjectName(NameParts(name), leaf) ? string()
+			                                                                                               : Key(name);
+			TablePolicy policy;
+			string head, rest, parent;
+			if (!key.empty() && !MetadataSurfaceOf(key) && store.ResolveTable(principal, key, policy) &&
+			    NamePath::SplitHeadKey(policy.canonical, head, rest) && NamePath::SplitLeaf(rest, parent, leaf)) {
+				relation.origin.kind = ResultOrigin::Kind::COLUMN;
+				relation.origin.catalog = NamePath::Unquote(head);
+				relation.origin.schema = parent.empty() ? string("main") : NamePath::Display(parent);
+				relation.origin.table = leaf;
+			}
+			relations.push_back(relation);
+		};
+		if (node.from_table) {
+			collect(*node.from_table);
+		}
+		auto relation_of = [&](const string &qualifier) -> optional_ptr<Relation> {
+			if (qualifier.empty()) {
+				return relations.size() == 1 ? &relations[0] : nullptr;
+			}
+			optional_ptr<Relation> found;
+			for (auto &relation : relations) {
+				if (StringUtil::CIEquals(relation.qualifier, qualifier)) {
+					if (found) {
+						return nullptr; // two relations answer to the name: the binder's to refuse
+					}
+					found = &relation;
+				}
+			}
+			return found;
+		};
+		bool any = false;
+		bool star = false;
+		for (auto &item : node.select_list) {
+			ResultOrigin origin;
+			if (item->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+				auto &names = item->Cast<ColumnRefExpression>().ColumnNames();
+				// `x` or `t.x`; a longer path is a qualified name or a struct field - no origin read off it, nor off a
+				// bare name duckdb reads as a value
+				auto relation = names.size() == 1 && IsValueKeyword(names[0].GetIdentifierName()) ? nullptr
+				                : names.size() == 1 ? relation_of(string())
+				                : names.size() == 2 ? relation_of(names[0].GetIdentifierName())
+				                                    : nullptr;
+				if (relation && relation->origin.kind != ResultOrigin::Kind::NONE) {
+					origin = relation->origin;
+					origin.column = names.back().GetIdentifierName();
+				}
+			} else if (item->GetExpressionClass() == ExpressionClass::STAR) {
+				auto &expr = item->Cast<StarExpression>();
+				if (star || expr.IsColumns() || expr.Expression() || !expr.ExcludeList().empty() ||
+				    !expr.ReplaceList().empty() || !expr.RenameList().empty()) {
+					return {}; // how many columns it is cannot be read off the text
+				}
+				star = true;
+				auto relation = relation_of(expr.RelationName().GetIdentifierName());
+				if (relation) {
+					origin = relation->origin;
+				}
+				origin.kind = ResultOrigin::Kind::STAR;
+			}
+			any = any || !origin.table.empty();
+			out.push_back(std::move(origin));
+		}
+		return any ? out : vector<ResultOrigin>();
 	}
 
 	//! spec 114: the USE a statement is read under, for its lineage job (the worker runs later)
@@ -2822,10 +2934,7 @@ private:
 		if (!qualified && names.size() >= 2 && (scope.others.count(head) || scope.inner.count(head))) {
 			return; // `other.x`: qualified by another relation in scope - not the target's
 		}
-		static const case_insensitive_set_t KEYWORDS = {"current_date", "current_time",   "current_timestamp",
-		                                                "localtime",    "localtimestamp", "current_user",
-		                                                "user",         "session_user",   "current_role"};
-		if (!qualified && names.size() == 1 && KEYWORDS.count(head)) {
+		if (!qualified && names.size() == 1 && IsValueKeyword(head)) {
 			return;
 		}
 		idx_t at = qualified ? 1 : 0;
@@ -4325,6 +4434,15 @@ void RewriteStatements(vector<unique_ptr<SQLStatement>> &statements, const Princ
 			trail->statements.back().statement = StringUtil::Lower(StatementTypeToString(stmt->type));
 			rewriter.trail = &trail->statements.back();
 			rewriter.NoteUseInForce(trail->statements.back());
+		}
+		// spec 143: a Flight session's result columns - before the rewrite replaces the relations they name; a
+		// statement the rewrite refuses is refused there, never here
+		if (trail && trail->origins && stmt->type == StatementType::SELECT_STATEMENT) {
+			try {
+				trail->statements.back().origins = rewriter.ResultOrigins(stmt->Cast<SelectStatement>());
+			} catch (std::exception &) { // NOLINT: no origin is the answer; the rewrite judges the statement
+				TakeDenyReason();
+			}
 		}
 		auto started = std::chrono::steady_clock::now();
 		auto record_cost = [&]() {

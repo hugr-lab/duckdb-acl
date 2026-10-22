@@ -5,9 +5,11 @@
 
 #include "acl_catalog_rpc.hpp"
 #include "acl_policy.hpp"
+#include "acl_profile.hpp"
 #include "duckdb/main/database.hpp"
 
 #include <arrow/flight/sql/server.h>
+#include <functional>
 
 namespace duckdb {
 class ClientContext;
@@ -20,11 +22,30 @@ arrow::Result<unique_ptr<QueryResult>> RunCatalogQuery(PolicyStore &store, Conne
                                                        const CatalogQuery &query);
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> BatchFrom(const std::shared_ptr<arrow::Schema> &schema,
-                                                             QueryResult &result, const vector<string> *extra);
+                                                             QueryResult &result, const vector<string> *extra,
+                                                             idx_t trailing = 0);
 
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> EmptyBatch(const std::shared_ptr<arrow::Schema> &schema);
 
-arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &tables, QueryResult &columns);
+//! include_schema's serialized schema per object (spec 046): `tables` the DESCRIBED_TABLES listing, `columns` the
+//! COLUMNS one, `tags` TABLE_TAGS - a column's comment rides as REMARKS, the object's as `duckdb:comment` on the
+//! schema, tags as `duckdb:tag:<key>` on both (spec 143)
+arrow::Result<vector<string>> SchemasFor(ClientContext &context, QueryResult &tables, QueryResult &columns,
+                                         QueryResult &tags);
+
+//! spec 143: a comment (under `comment_key`) and tags (`duckdb:tag:<key>` each) as Arrow metadata; empty when
+//! there is neither
+std::shared_ptr<const arrow::KeyValueMetadata> DescribedMetadata(const string &comment_key, const Value &comment,
+                                                                 const Value &tags);
+
+//! spec 143: a result schema with its columns' origins (the rewriter's, read off the statement): Flight SQL's
+//! CATALOG_NAME / SCHEMA_NAME / TABLE_NAME - the virtual names - and the column's comment as `duckdb:comment`
+//! (never REMARKS on a result: arrow-java makes it the column's label) and its tags; the object's comment and tags
+//! on the schema when every column is one object's. `describe` answers an origin's object as the principal's
+//! listing describes it (null: names only). Origins that do not fit the fields leave the schema as it is.
+arrow::Result<std::shared_ptr<arrow::Schema>>
+WithOrigins(const std::shared_ptr<arrow::Schema> &schema, const vector<ResultOrigin> &origins,
+            const std::function<shared_ptr<const PolicyStore::ObjectDescription>(const ResultOrigin &)> &describe);
 
 //! spec 115: each field carries duckdb's type text as Flight SQL's `ARROW:FLIGHT:SQL:TYPE_NAME` (and a
 //! DECIMAL its precision and scale) - what a JDBC driver's getColumns / a tool's tree shows instead of

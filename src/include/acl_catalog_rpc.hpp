@@ -33,8 +33,18 @@ struct CatalogQuery {
 };
 
 //! Which listing a command needs. COLUMNS is not an RPC of its own - it is what `GetTables` asks for
-//! when `include_schema` is set, in one statement rather than one per table.
-enum class CatalogListing : uint8_t { CATALOGS, DB_SCHEMAS, TABLES, TABLE_TYPES, COLUMNS };
+//! when `include_schema` is set, in one statement rather than one per table; DESCRIBED_TABLES is TABLES with
+//! each object's comment after the protocol's columns, TABLE_TAGS each object's tags (spec 143) - both for the
+//! same schemas.
+enum class CatalogListing : uint8_t {
+	CATALOGS,
+	DB_SCHEMAS,
+	TABLES,
+	TABLE_TYPES,
+	COLUMNS,
+	DESCRIBED_TABLES,
+	TABLE_TAGS
+};
 
 //! The filters a Flight SQL catalog command may carry. Flight's semantics are followed as written,
 //! including the corner: an *absent* catalog means no filter, while an empty string means "objects

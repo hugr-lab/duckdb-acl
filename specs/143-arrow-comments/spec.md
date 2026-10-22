@@ -1,6 +1,6 @@
 # Spec 143: comments and tags reach Flight clients in the Arrow schema
 
-- **Status**: accepted
+- **Status**: implemented
 - **Date**: 2026-10-22
 - **Author**: hugr lab (the owner, 2026-10-19 and 2026-10-22: "описания колонок и объекта должны быть и должны быть видны
   в Arrow"; result schemas with their names; a virtual column comment, else the physical one; quack later; and tags -
@@ -33,10 +33,13 @@ relation gets a virtual comment of its own.
 
 ### GetTables `include_schema`
 
-- The COLUMNS listing the door runs (`acl_catalog_rpc.cpp`) adds `COLUMN_COMMENT`; `SchemasFor` gives each field
-  `ARROW:FLIGHT:SQL:REMARKS` when the column has one (the field metadata `WithTypeNames` builds).
-- The TABLES listing adds `TABLE_COMMENT`; the serialized schema's own metadata carries it as `duckdb:comment`
-  (Flight SQL has no table-level key; the name is upstream's proposal) - spec 136's unread mark rides with it.
+- The COLUMNS listing the door runs (`acl_catalog_rpc.cpp`) reads `duckdb_columns()` - the same rows as
+  `information_schema.columns`, with `comment` and `tags`; `SchemasFor` gives each field
+  `ARROW:FLIGHT:SQL:REMARKS` when the column has one (beside `WithTypeNames`' metadata).
+- `include_schema`'s tables listing (`DESCRIBED_TABLES`) adds `TABLE_COMMENT` after the protocol's columns (not
+  sent: `BatchFrom`'s `trailing`); the serialized schema's own metadata carries it as `duckdb:comment` (Flight SQL
+  has no table-level key; the name is upstream's proposal) - spec 136's unread mark rides with it. The object's
+  tags come from a third listing (`TABLE_TAGS`, `duckdb_tables()` + `duckdb_views()` under the same filters).
 - What the listings show is what goes: the principal's own `information_schema.columns` / `tables` (spec 035's
   visibility, spec 119's narrowing).
 
@@ -49,14 +52,20 @@ relation gets a virtual comment of its own.
   - or a star (`*`, `t.*`) over one virtual relation - its columns as the principal's listing orders them.
   Anything else - an expression, an aggregate, a subquery, a CTE's column, a set operation's - has no origin. A masked
   column is still the column (the client wrote the column; the mask is the role's view of it).
-- The note rides the decision's profile note (spec 074: per statement, by its text's hash); the door takes it with the
-  note after `Prepare` and keeps it on the reservation, so GetFlightInfo's schema and DoGet's are the same.
+- The origins are noted for a Flight session's batch only (the override's door; `AuditTrail::origins`), before the
+  rewrite replaces the relations, and ride the decision's profile note (spec 074: per statement, by its text's
+  hash); the door takes it with the note after `Prepare` (on the reservation). A star is a span: its length is the
+  result's to say, so a second star, `COLUMNS(…)` or a star with modifiers leaves the statement without origins, and
+  the door drops a list that does not fit the result's columns.
 - **What a field carries** (`SchemaFor`, beside `WithTypeNames`): for a column with an origin,
   `ARROW:FLIGHT:SQL:CATALOG_NAME` / `SCHEMA_NAME` / `TABLE_NAME` - the virtual names - and `duckdb:comment` when the
   column has a comment. Never `REMARKS` on a result: arrow-java makes it the column's label (spec 115).
 - **The schema's metadata**: when every column comes from one relation, that object's comment as `duckdb:comment`.
-- The comments are the principal's own listing's, read once per object and principal and kept until the policy's
-  version moves (the store's caches' rule).
+- The comments are the principal's own listing's (`PolicyStore::DescribeObject`: `duckdb_tables` / `duckdb_views`
+  / `duckdb_columns` narrowed to the object, on the store's connection), read once per role set and object and kept
+  until the policy's version moves or a minute passes (a source's own comment or tags change without it); the door
+  reads them at Prepare onto the reservation, so GetFlightInfo's schema, CreatePreparedStatement's and DoGet's say
+  the same.
 
 ### A virtual comment for an alias relation's column
 
@@ -77,8 +86,11 @@ empty map today. Now they answer the physical catalog's where a virtual object h
 - an alias relation: its table's tags, its columns' tags;
 - a declared list or a projection over one physical table: each column's tags by the source column it reads (a
   computed column has none); the object's tags are its table's;
-- a masked column keeps its column's tags (the column is the same; the role sees its values masked);
-- a live schema alias: its schema's, tables' and columns' tags;
+- a masked column keeps its column's tags (the column is the same; the role sees its values masked) - and its
+  comment: a grant that names a column (spec 026's projection) used to drop the column's comment from the listing,
+  found by the e2e;
+- a live schema alias: its schema's (`duckdb_schemas`; the schema looked up by `acl_physical_schemas(keys)`, its
+  tables never scanned), tables' and columns' tags;
 - a virtual view, a table function, a computed column, a catalog: none - and nothing is derived from the query that
   defines a view or a function (the owner, 2026-10-22): such an object and its columns carry only the comments given
   to them in the virtual catalog (`COMMENT ON VIRTUAL VIEW|TABLE FUNCTION … [COLUMN …]`).
@@ -86,7 +98,10 @@ empty map today. Now they answer the physical catalog's where a virtual object h
 They go wherever the comments go:
 
 - the listings' `tags` (`duckdb_tables`, `duckdb_views`, `duckdb_columns`, `duckdb_schemas`; the physical readers -
-  `acl_physical_tables` / `_columns`, spec 119 - carry them);
+  `acl_physical_tables` / `_columns`, spec 119 - carry them, and the information_schema surfaces drop the column:
+  their shape is duckdb's);
+- a declared column reads its source column's tags by the rule spec 039's broken mark reads it by: no expression, or
+  a bare or quoted identifier that is no special value (`NULL`, `current_date`, ...);
 - Arrow, one key per tag: a field's `duckdb:tag:<key>` = value (GetTables' schema, a result column with an origin), a
   table's in its schema's metadata (GetTables' table, a result from one relation). A schema's tags reach the listings
   only: Flight SQL's GetDbSchemas has no metadata to carry them.
@@ -103,17 +118,22 @@ They go wherever the comments go:
 ## Tests
 
 - **sqllogictest**: an alias relation's column comment written, listed (virtual over physical), removed; refused for a
-  column the source lacks; the check's finding. Tags: a source with tags (a DuckLake catalog's, where the build has it,
-  else a test table function setting them) - an alias relation's and a declared list's in `duckdb_tables` /
-  `duckdb_columns`, a hidden column's absent, a view's empty.
-- **C++** (`test/cpp`): the origins the rewriter notes - plain, renamed, qualified by an alias, a star, a join with
-  qualified references; none for an expression, an aggregate, a subquery, a CTE, a union, an unqualified reference in
-  a join.
-- **Flight e2e** (`test/e2e/flight`, pyarrow):
-  - GetTables' schema: `REMARKS` per column, `duckdb:comment` for the table;
-  - a SELECT's schema at GetFlightInfo and at DoGet: `TABLE_NAME` and `duckdb:comment` per column, the object's comment
-    when one relation; none for an expression; a hidden column absent; the physical names nowhere;
-  - tags as `duckdb:tag:<key>` on the table and its fields, where the source has them.
+  column the source lacks; the check's finding (`acl_column_comments.test`). A DuckLake table's tags on an alias
+  relation, a view's empty (`acl_physical_tags_ducklake.test`; DuckLake applies a column's tag only as its comment).
+- **C++** `test_acl_physical_tags.cpp`: no SQL statement of the release sets a tag, so the tagged schema and table are
+  made through the catalog API - an alias relation's table and columns, a declared list's columns by the source column
+  (a computed one none), a live schema alias's schema, tables and columns, a masked column's kept, a hidden one's
+  absent, a view's none, information_schema's shape unchanged.
+- The origins the rewriter notes are checked where they are written, the Flight e2e below: the extension's internals
+  are not exported from libduckdb, and a C++ test cannot open a Flight-door session to reach them.
+- `test_acl_catalog_rpc.cpp`: the described tables and tags listings and the columns listing's comment, under a role.
+- **Flight e2e** (`test/e2e/flight/run.sh`, pyarrow; `client.py`'s `ACL_SHOW_DESCRIBED`):
+  - GetTables' schema: `REMARKS` per column (a virtual comment on an alias relation's column, a source's where there
+    is none), `duckdb:comment` for the table, a hidden column absent;
+  - a SELECT's schema at DoGet, equal to GetFlightInfo's: catalog / schema / table and `duckdb:comment` per column
+    (plain, renamed, a star, a join by aliases), the object's comment for one object; none for an expression, an
+    aggregate, a CTE's column, a union; the physical names nowhere; a prepared statement's announced schema;
+  - tags as `duckdb:tag:<key>` on a GetTables schema and a result's, from a DuckLake table (where the build has it).
 
 ## Alternatives considered
 
@@ -128,3 +148,6 @@ They go wherever the comments go:
   `duckdb_columns`; a quack client reads none at ATTACH, and its protocol has no per-column metadata - an upstream
   duckdb-quack change (and hugr-node's `hugr` type, its copy).
 - ADBC Go's GetObjects leaves column remarks NULL (an upstream ADBC gap).
+- Found while testing the tags (not this spec's): a live schema alias's columns are listed whole under a catalog
+  grant whose `COLUMNS` narrows what the read returns - the listing shows a column name the read hides (spec 035's
+  rule). Its own spec.

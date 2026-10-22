@@ -589,6 +589,24 @@ struct PolicyStore {
 	//! active source cannot enumerate (memory mode); the driver mode throws with the reason.
 	bool MetadataListing(const Principal &principal, const string &surface, string &sql,
 	                     const ListingScope &scope = ListingScope());
+	//! spec 143: what a principal's listings say about one object - its comment and tags, each column's - for a
+	//! Flight result's Arrow schema. Null when nothing is listed (memory mode, an object it does not see).
+	//! Kept per role set and object until the policy's version moves, at most a minute (a source's own comment
+	//! or tags change without it)
+	struct ObjectDescription {
+		Value comment, tags;
+		case_insensitive_map_t<std::pair<Value, Value>> columns; // name -> (comment, tags)
+	};
+	shared_ptr<const ObjectDescription> DescribeObject(const Principal &principal, const string &catalog_name,
+	                                                   const string &schema, const string &table);
+	//! spec 143: DescribeObject's answers, by role set and object
+	struct CachedDescription {
+		int64_t version = -1;
+		std::chrono::steady_clock::time_point read;
+		shared_ptr<const ObjectDescription> description;
+	};
+	std::mutex descriptions_lock;
+	std::unordered_map<string, CachedDescription> descriptions;
 	//! spec 098: the principal's own `duckdb_functions()` - the engine's functions the gate admits for
 	//! its roles (no definition, database or schema outside the system catalog) and the virtual
 	//! functions of its catalogs, in duckdb's shape. Works in every mode; the catalog adds (b).

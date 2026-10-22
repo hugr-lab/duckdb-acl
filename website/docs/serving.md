@@ -267,6 +267,33 @@ door's metadata, all of it answered for the connected principal:
   node's is refused, and the node's lower bound always holds (a `RESET` or the default written back changes
   nothing).
 
+### Descriptions and tags in the Arrow schema (spec 143)
+
+Flight SQL has no remarks column: a description travels as Arrow metadata, and the door writes the virtual
+catalog's into every schema it describes - always the principal's own listings' (a hidden column is no field, a
+physical name never appears):
+
+- **GetTables `include_schema`** - each field carries its column's comment as Flight SQL's
+  `ARROW:FLIGHT:SQL:REMARKS` (what JDBC's `getColumns` shows); the schema's own metadata carries the object's
+  comment as `duckdb:comment` (spec 136's unread mark rides in it).
+- **A statement's result** (at GetFlightInfo, CreatePreparedStatement and DoGet alike) - a column that is a plain
+  reference to a virtual object's column (`id`, `o.amount`, `amount AS paid`; a bare name only when the FROM has
+  one relation) or comes from a star over one object carries `ARROW:FLIGHT:SQL:CATALOG_NAME` / `SCHEMA_NAME` /
+  `TABLE_NAME` - the virtual names - and its comment as `duckdb:comment` (never `REMARKS`: arrow-java makes it the
+  column's label). When every column is one object's, the schema carries that object's comment. An expression, an
+  aggregate, a subquery's, a CTE's or a set operation's column has none. What an object says is read once per
+  role set and object, kept until the policy changes (at most a minute).
+- **Tags** - one key per tag, `duckdb:tag:<key>`, wherever the comment goes (a field's, the schema's). The virtual
+  catalog has no tags of its own yet: they are the source's (a DuckLake table's, say), where a virtual object has
+  one physical counterpart - an alias relation's table and columns, a declared list's columns by the source column
+  each reads (a computed one has none), a live alias schema's schema, tables and columns, a masked column's. A
+  virtual view, a table function, a computed column and a catalog carry none, and nothing is read off the query
+  that defines them - they carry only what `COMMENT ON VIRTUAL …` gives them. The same tags are in the listings'
+  `tags` (`duckdb_tables`, `duckdb_views`, `duckdb_columns`, `duckdb_schemas`); `information_schema` keeps
+  duckdb's shape and has none.
+
+A quack client reads none of this yet: its protocol has no per-column metadata.
+
 ### Administering through the door (spec 117)
 
 An administrator connects like any client and manages the node without `ACL NATIVE`. The

@@ -1,6 +1,7 @@
 # name: test/sql/acl_column_comments.test
 # description: spec 143 - an alias relation's column gets a virtual comment of its own, shown over its source's;
-#   a declared list keeps its own; written for a column the source has, removed by IS NULL, gone with the relation
+#   a declared list keeps its own; a grant naming the column keeps it; written for a column the source has, removed
+#   by IS '', gone with the relation
 # group: [sql]
 
 require acl
@@ -69,6 +70,26 @@ ACL ROLE 'analyst' SELECT column_name, comment FROM duckdb_columns() WHERE table
 id	NULL
 amount	what the customer paid
 note	PHYS note
+
+# a grant that names the columns (one masked) reads the same columns: their comments with them
+statement ok
+ACL ADMIN CREATE ROLE narrowed;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE narrowed WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.orders TO ROLE narrowed WITH (select) COLUMNS (id, amount = 0, note);
+
+query II
+ACL ROLE 'narrowed' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'orders' ORDER BY ordinal_position;
+----
+id	NULL
+amount	what the customer paid
+note	PHYS note
+
+statement ok
+ACL ADMIN REVOKE TABLE c.orders FROM ROLE narrowed;
 
 # the column must be the source's
 statement error

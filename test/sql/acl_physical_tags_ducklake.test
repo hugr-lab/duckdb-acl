@@ -1,0 +1,81 @@
+# name: test/sql/acl_physical_tags_ducklake.test
+# description: spec 143 - a source's own tags reach a principal's listings: a DuckLake table's tags (DuckLake keeps
+#   them in its metadata; it applies a table's, a column's only as a comment) on an alias relation; a virtual view
+#   carries none. test/cpp/test_acl_physical_tags.cpp covers the columns.
+# group: [sql]
+
+require acl
+
+require parquet
+
+require ducklake
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/tags_lake.ducklake' AS lake (DATA_PATH '{TEST_DIR}/tags_lake');
+
+statement ok
+CREATE TABLE lake.orders(id INTEGER, amount INTEGER);
+
+statement ok
+COMMENT ON TABLE lake.orders IS 'PHYS orders';
+
+# no SQL statement of the release writes a tag: the row DuckLake would keep, written into its metadata, read at the
+# next ATTACH
+statement ok
+INSERT INTO __ducklake_metadata_lake.ducklake_tag
+SELECT t.table_id, (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot), NULL, 'owner', 'sales'
+FROM __ducklake_metadata_lake.ducklake_table t WHERE t.table_name = 'orders';
+
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/tags_lake.ducklake' AS lake (DATA_PATH '{TEST_DIR}/tags_lake');
+
+query I
+SELECT tags FROM duckdb_tables() WHERE database_name = 'lake' AND table_name = 'orders';
+----
+{owner=sales}
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS lake.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.recent AS SELECT id FROM lake.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+query TT
+ACL ROLE 'analyst' SELECT table_name, tags FROM duckdb_tables() ORDER BY table_name;
+----
+orders	{owner=sales}
+
+query TT
+ACL ROLE 'analyst' SELECT view_name, tags FROM duckdb_views() ORDER BY view_name;
+----
+recent	{}
+
+# the physical comment never shows on the virtual object (spec 035), the tags do (the owner's decision for now)
+query T
+ACL ROLE 'analyst' SELECT comment FROM duckdb_tables() WHERE table_name = 'orders';
+----
+NULL
