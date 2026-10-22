@@ -73,12 +73,12 @@ endif()
 
 # SQL Server scanner (hugr-lab/mssql-extension) for the integration scenarios. A separate opt-in;
 # its openssl/simdutf dependencies arrive through the merged vcpkg manifest. The pin is a commit on
-# that repo's main, which now tracks duckdb main as we do (spec 033) - re-pin when it moves and the
+# that repo's main built on the same duckdb (v2.0.0 since spec 141) - re-pin when it moves and the
 # scenarios need something newer.
 if(DEFINED ENV{ACL_INTEGRATION_MSSQL} AND NOT MINGW AND NOT ${WASM_ENABLED})
     duckdb_extension_load(mssql
         GIT_URL https://github.com/hugr-lab/mssql-extension
-        GIT_TAG 7e1bb1c5f3e00f5ce0a85a7082534c51bb077fe5
+        GIT_TAG 6df11bceb032624cbafb4be044a7f3bf5252739a
     )
 endif()
 
