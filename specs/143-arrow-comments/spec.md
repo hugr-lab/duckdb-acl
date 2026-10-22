@@ -79,7 +79,9 @@ empty map today. Now they answer the physical catalog's where a virtual object h
   computed column has none); the object's tags are its table's;
 - a masked column keeps its column's tags (the column is the same; the role sees its values masked);
 - a live schema alias: its schema's, tables' and columns' tags;
-- a virtual view, a computed column, a virtual function, a catalog: none.
+- a virtual view, a table function, a computed column, a catalog: none - and nothing is derived from the query that
+  defines a view or a function (the owner, 2026-10-22): such an object and its columns carry only the comments given
+  to them in the virtual catalog (`COMMENT ON VIRTUAL VIEW|TABLE FUNCTION … [COLUMN …]`).
 
 They go wherever the comments go:
 
