@@ -170,7 +170,8 @@ oidc::TokenSet Acquire(ClientContext &context, const CreateSecretInput &input, c
 		if (!begun.verification_uri_complete.empty()) {
 			std::cerr << "  (or open " << begun.verification_uri_complete << " directly)\n";
 		}
-		return oidc::DevicePoll(endpoints, client_id, begun.device_code, begun.interval,
+		// ext-common spec 017: the PKCE verifier of the authorization's challenge, for an issuer that took it
+		return oidc::DevicePoll(endpoints, client_id, begun.device_code, begun.code_verifier, begun.interval,
 		                        NowSeconds() + begun.expires_in, [&context] { return context.IsInterrupted(); });
 	}
 	throw InvalidInputException(
