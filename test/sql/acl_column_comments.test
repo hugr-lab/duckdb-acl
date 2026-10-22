@@ -1,0 +1,139 @@
+# name: test/sql/acl_column_comments.test
+# description: spec 143 - an alias relation's column gets a virtual comment of its own, shown over its source's;
+#   a declared list keeps its own; written for a column the source has, removed by IS NULL, gone with the relation
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, amount INTEGER, note VARCHAR);
+
+statement ok
+COMMENT ON COLUMN phys.main.orders.amount IS 'PHYS amount';
+
+statement ok
+COMMENT ON COLUMN phys.main.orders.note IS 'PHYS note';
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.narrow AS phys.main.orders COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+# before: the alias relation's columns show the source's comments
+query II
+ACL ROLE 'analyst' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'orders' ORDER BY ordinal_position;
+----
+id	NULL
+amount	PHYS amount
+note	PHYS note
+
+# a virtual comment on an alias relation's column: written, shown over the source's (any spelling of the column)
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders COLUMN AMOUNT IS 'what the customer paid';
+
+query II
+ACL ROLE 'analyst' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'orders' ORDER BY ordinal_position;
+----
+id	NULL
+amount	what the customer paid
+note	PHYS note
+
+query II
+ACL ROLE 'analyst' SELECT column_name, comment FROM duckdb_columns() WHERE table_name = 'orders' ORDER BY column_index;
+----
+id	NULL
+amount	what the customer paid
+note	PHYS note
+
+# the column must be the source's
+statement error
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders COLUMN missing IS 'x';
+----
+has none of that name
+
+# replaced, then removed: the source's shows again
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders COLUMN amount IS 'the amount';
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders COLUMN amount IS '';
+
+query II
+ACL ROLE 'analyst' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'orders' AND column_name = 'amount';
+----
+amount	PHYS amount
+
+# a declared list keeps its own comments (object_columns), never the source's
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.narrow COLUMN id IS 'the order';
+
+query II
+ACL ROLE 'analyst' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'narrow' ORDER BY ordinal_position;
+----
+id	the order
+amount	NULL
+
+# a commented column the source drops: the comment is kept and the check says so, with the repair
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders COLUMN amount IS 'the amount';
+
+statement ok
+ALTER TABLE phys.main.orders DROP COLUMN amount;
+
+query III
+SELECT object, problem, repair FROM acl_check_catalog('c') WHERE problem = 'comment_column_missing';
+----
+orders	comment_column_missing	COMMENT ON VIRTUAL TABLE c.orders COLUMN "amount" IS ''
+
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders COLUMN "amount" IS '';
+
+query I
+SELECT count(*) FROM acl_check_catalog('c') WHERE problem = 'comment_column_missing';
+----
+0
+
+# a renamed relation keeps its column comment; a dropped one takes it
+statement ok
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders COLUMN note IS 'a note';
+
+statement ok
+SELECT acl_rename_relation('c', 'orders', 'sales');
+
+query II
+ACL ROLE 'analyst' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_name = 'sales' AND column_name = 'note';
+----
+note	a note
+
+statement ok
+ACL ADMIN DROP RELATION c.sales;
+
+query I
+SELECT count(*) FROM store.acl.column_comments;
+----
+0

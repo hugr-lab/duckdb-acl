@@ -499,7 +499,7 @@ UPDATE old.acl.meta SET "value" = '20' WHERE "key" IN ('schema_version', 'min_re
 statement error
 SELECT acl_use_db('old', 'acl', false);
 ----
-<REGEX>:.*schema version 20 and this build reads 22 - migrate it first.*
+<REGEX>:.*schema version 20 and this build reads 23 - migrate it first.*
 
 # the reserved name: the step refuses while a catalog carries it
 statement ok
@@ -516,7 +516,7 @@ DELETE FROM old.acl.catalogs WHERE vcat = 'Platform';
 query T
 SELECT acl_migrate_catalog('old', 'acl');
 ----
-"old"."acl" migrated from schema version 20 to 22 (readable from build 21 on)
+"old"."acl" migrated from schema version 20 to 23 (readable from build 21 on)
 
 statement ok
 SELECT acl_use_db('old', 'acl', false);

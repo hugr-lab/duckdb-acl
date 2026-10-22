@@ -670,12 +670,16 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                        " CASE WHEN c.\"nullable\" THEN 'YES' ELSE 'NO' END WHEN " +
 	                        pk_implies("o.vcat", alias_vname, "coalesce(c.\"name\", i.\"column_name\")") +
 	                        " THEN 'NO' ELSE i.\"is_nullable\" END";
+	// spec 143: an alias relation's column shows its virtual comment over its source's
 	string columns_sql =
 	    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
 	           " coalesce(c.\"name\", i.\"column_name\") AS column_name,"
 	           " acl_exposed_type(i.\"data_type\", o.strip_alias, o.enums_to_varchar) AS data_type, ") +
-	    alias_nullable + " AS is_nullable) FROM objects o JOIN " + icolumns + " i ON " + physical + projection +
-	    " AND c.\"expr\" = i.\"column_name\""
+	    alias_nullable + " AS is_nullable, coalesce(cc.\"comment\", i.\"COLUMN_COMMENT\") AS \"COLUMN_COMMENT\")" +
+	    " FROM objects o JOIN " + icolumns + " i ON " + physical + projection +
+	    " AND c.\"expr\" = i.\"column_name\" LEFT JOIN " + Tbl("column_comments") +
+	    " cc ON o.form = 'alias' AND cc.\"vcat\" = o.vcat AND cc.\"vname\" = " + alias_vname +
+	    " AND cc.\"column_name\" = i.\"column_name\""
 	    " WHERE len(o.parts) = 3 AND (o.form = 'alias' OR (o.form = 'subquery' AND NOT EXISTS"
 	    " (SELECT 1 FROM " +
 	    Tbl("relation_columns") +

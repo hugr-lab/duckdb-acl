@@ -43,15 +43,15 @@ ACL ADMIN GRANT CATALOG c TO ROLE r MAIN;
 query T
 SELECT acl_catalog_schema();
 ----
-{'build': 22, 'build_min_reader': 21, 'catalog': 22, 'min_reader': 21, 'mode': current}
+{'build': 23, 'build_min_reader': 21, 'catalog': 23, 'min_reader': 21, 'mode': current}
 
 # --- a newer catalog inside its window, migrated under the running node: served, never written ---
 
 statement ok
-UPDATE store.acl.meta SET "value" = '23' WHERE "key" = 'schema_version';
+UPDATE store.acl.meta SET "value" = '24' WHERE "key" = 'schema_version';
 
 statement ok
-UPDATE store.acl.meta SET "value" = '22' WHERE "key" = 'min_reader_version';
+UPDATE store.acl.meta SET "value" = '23' WHERE "key" = 'min_reader_version';
 
 query I
 ACL ROLE "r" SELECT count(*) FROM orders;
@@ -66,7 +66,7 @@ read_only
 statement error
 ACL ADMIN CREATE ROLE other;
 ----
-<REGEX>:.*schema version 23 and this node's build writes 22 - policy is written from a node of the catalog's build.*
+<REGEX>:.*schema version 24 and this node's build writes 23 - policy is written from a node of the catalog's build.*
 
 # the refused write wrote nothing
 query I
@@ -77,12 +77,12 @@ SELECT count(*) FROM store.acl.roles WHERE "role" = 'other';
 # --- outside the window: the running node stops serving (fail closed) -----------------------------
 
 statement ok
-UPDATE store.acl.meta SET "value" = '23' WHERE "key" = 'min_reader_version';
+UPDATE store.acl.meta SET "value" = '24' WHERE "key" = 'min_reader_version';
 
 statement error
 ACL ROLE "r" SELECT count(*) FROM orders;
 ----
-<REGEX>:.*schema version 23, readable from build 23 on, and this build is 22 - upgrade the node.*
+<REGEX>:.*schema version 24, readable from build 24 on, and this build is 23 - upgrade the node.*
 
 statement error
 SELECT acl_use_db('store', 'acl', false);
@@ -98,7 +98,7 @@ SELECT acl_migrate_catalog('store', 'acl');
 # --- an older catalog: refused with what to do, then migrated by the embedded steps ------------------
 
 statement ok
-UPDATE store.acl.meta SET "value" = '22' WHERE "key" = 'schema_version';
+UPDATE store.acl.meta SET "value" = '23' WHERE "key" = 'schema_version';
 
 statement ok
 UPDATE store.acl.meta SET "value" = '21' WHERE "key" = 'min_reader_version';
@@ -120,6 +120,10 @@ ALTER TABLE store.acl.relations DROP COLUMN enum_types;
 
 statement ok
 DROP TABLE store.acl.relation_types;
+
+# (nor v23's: an alias relation's column comments)
+statement ok
+DROP TABLE store.acl.column_comments;
 
 statement ok
 DROP TABLE store.acl.clients;
@@ -155,7 +159,7 @@ UPDATE store.acl.meta SET "value" = '15' WHERE "key" = 'min_reader_version';
 statement error
 SELECT acl_use_db('store', 'acl', false);
 ----
-<REGEX>:.*schema version 16 and this build reads 22 - migrate it first: SELECT acl_migrate_catalog\('store', 'acl'\).*
+<REGEX>:.*schema version 16 and this build reads 23 - migrate it first: SELECT acl_migrate_catalog\('store', 'acl'\).*
 
 statement error
 SELECT acl_use_db('store', 'acl', true);
@@ -165,12 +169,12 @@ SELECT acl_use_db('store', 'acl', true);
 query T
 SELECT acl_migrate_catalog('store', 'acl');
 ----
-"store"."acl" migrated from schema version 16 to 22 (readable from build 21 on)
+"store"."acl" migrated from schema version 16 to 23 (readable from build 21 on)
 
 query T
 SELECT acl_migrate_catalog('store');
 ----
-"store"."acl" is already schema version 22
+"store"."acl" is already schema version 23
 
 statement ok
 SELECT acl_use_db('store', 'acl', false);
@@ -178,7 +182,7 @@ SELECT acl_use_db('store', 'acl', false);
 query T
 SELECT acl_catalog_schema();
 ----
-{'build': 22, 'build_min_reader': 21, 'catalog': 22, 'min_reader': 21, 'mode': current}
+{'build': 23, 'build_min_reader': 21, 'catalog': 23, 'min_reader': 21, 'mode': current}
 
 # spec 095: the issuer became the short form - its keys, algorithms and client secret are gone, the
 # rest is its implicit client, and its mapping is scoped to that client (its only one)

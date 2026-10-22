@@ -63,7 +63,7 @@ relation gets a virtual comment of its own.
 - `COMMENT ON VIRTUAL TABLE c.t COLUMN x IS '…'` (and `acl_comment`) works for any relation: a relation with a stored
   column list keeps it there as today (`object_columns.comment`); an alias relation stores it in a new table
   `column_comments (vcat, vname, column_name, comment)` (schema step v23), its column checked against the source at the
-  write. `IS NULL` removes it.
+  write. `IS ''` removes it, as for any comment.
 - The listings show the virtual comment, else the physical one - nothing shown today is taken away.
 - `acl_check_catalog` reports `comment_column_missing` when a commented column left the source.
 

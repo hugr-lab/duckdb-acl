@@ -201,7 +201,7 @@ categorized	true
 query TTTTT
 ACL ROLE "root" SELECT build, build_min_reader, catalog, min_reader, mode FROM platform.catalog_schema;
 ----
-22	21	22	21	current
+23	21	23	21	current
 
 # --- the node views (observe) -------------------------------------------------------------------------
 
@@ -362,7 +362,7 @@ platform	the system catalog of administration (spec 117)
 query TTTTTT
 ACL ROLE "cat" SELECT audit_contract, connection_contract, schema_catalog, bundles, admin_catalogs, len(list_filter(views, lambda v: v NOT IN ('cluster_items', 'cluster_effective', 'drift'))) FROM platform.console_info();
 ----
-3	2	22	[]	[sales]	35
+3	2	23	[]	[sales]	35
 
 query T
 ACL ROLE "cat" SELECT list_contains(my_views, 'grants') AND NOT list_contains(my_views, 'issuers') AND list_contains(my_functions, 'add_relation') AND NOT list_contains(my_functions, 'grant_catalog') FROM platform.console_info();
