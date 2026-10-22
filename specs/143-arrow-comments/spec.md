@@ -1,9 +1,10 @@
-# Spec 143: comments reach Flight clients in the Arrow schema
+# Spec 143: comments and tags reach Flight clients in the Arrow schema
 
-- **Status**: draft
+- **Status**: accepted
 - **Date**: 2026-10-22
 - **Author**: hugr lab (the owner, 2026-10-19 and 2026-10-22: "описания колонок и объекта должны быть и должны быть видны
-  в Arrow"; result schemas with their names; a virtual column comment, else the physical one; quack later)
+  в Arrow"; result schemas with their names; a virtual column comment, else the physical one; quack later; and tags -
+  the physical catalog's until the virtual catalog has its own)
 
 ## Summary
 
@@ -66,24 +67,51 @@ relation gets a virtual comment of its own.
 - The listings show the virtual comment, else the physical one - nothing shown today is taken away.
 - `acl_check_catalog` reports `comment_column_missing` when a commented column left the source.
 
+### Tags
+
+DuckDB v2.0.0 keeps tags (`MAP(VARCHAR, VARCHAR)`) on every catalog entry - databases, schemas, tables, views, columns,
+functions - and lists them (`duckdb_*().tags`); no SQL statement sets them in the release, a source's extension does
+(DuckLake's tags, say). The virtual catalog has none of its own yet (a later spec), so a principal's listings answer an
+empty map today. Now they answer the physical catalog's where a virtual object has one physical counterpart:
+
+- an alias relation: its table's tags, its columns' tags;
+- a declared list or a projection over one physical table: each column's tags by the source column it reads (a
+  computed column has none); the object's tags are its table's;
+- a masked column keeps its column's tags (the column is the same; the role sees its values masked);
+- a live schema alias: its schema's, tables' and columns' tags;
+- a virtual view, a computed column, a virtual function, a catalog: none.
+
+They go wherever the comments go:
+
+- the listings' `tags` (`duckdb_tables`, `duckdb_views`, `duckdb_columns`, `duckdb_schemas`; the physical readers -
+  `acl_physical_tables` / `_columns`, spec 119 - carry them);
+- Arrow, one key per tag: a field's `duckdb:tag:<key>` = value (GetTables' schema, a result column with an origin), a
+  table's in its schema's metadata (GetTables' table, a result from one relation). A schema's tags reach the listings
+  only: Flight SQL's GetDbSchemas has no metadata to carry them.
+
 ## Enforcement & security
 
 - No new visibility: every comment and name comes from the principal's own listings, which already hide what spec 035
   hides (a hidden column has no field; a physical table comment never shows).
+- Tags are the physical catalog's, as the owner decided for now: they may name what the source's operator wrote. A
+  hidden column's tags never show (no row); the policy's own tags will replace them when the virtual catalog has them.
 - Names in a result's metadata are virtual, never the physical ones the rewrite resolved to.
 - The note holds names only, per decided statement, and dies with it.
 
 ## Tests
 
 - **sqllogictest**: an alias relation's column comment written, listed (virtual over physical), removed; refused for a
-  column the source lacks; the check's finding.
+  column the source lacks; the check's finding. Tags: a source with tags (a DuckLake catalog's, where the build has it,
+  else a test table function setting them) - an alias relation's and a declared list's in `duckdb_tables` /
+  `duckdb_columns`, a hidden column's absent, a view's empty.
 - **C++** (`test/cpp`): the origins the rewriter notes - plain, renamed, qualified by an alias, a star, a join with
   qualified references; none for an expression, an aggregate, a subquery, a CTE, a union, an unqualified reference in
   a join.
 - **Flight e2e** (`test/e2e/flight`, pyarrow):
   - GetTables' schema: `REMARKS` per column, `duckdb:comment` for the table;
   - a SELECT's schema at GetFlightInfo and at DoGet: `TABLE_NAME` and `duckdb:comment` per column, the object's comment
-    when one relation; none for an expression; a hidden column absent; the physical names nowhere.
+    when one relation; none for an expression; a hidden column absent; the physical names nowhere;
+  - tags as `duckdb:tag:<key>` on the table and its fields, where the source has them.
 
 ## Alternatives considered
 
