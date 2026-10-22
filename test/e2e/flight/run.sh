@@ -202,6 +202,7 @@ for sql in "SELECT count(*) AS n FROM orders" "WITH x AS (SELECT amount FROM ord
 	"SELECT current_schema FROM orders" "SELECT amount + 1 AS z, z FROM orders" \
 	"SELECT o.x FROM orders o, (SELECT {'x': 1} AS o) s" \
 	"SELECT unnest({'a': 1, 'b': 2}), o.amount, x.* FROM orders o, (SELECT 1 AS q) x" \
+	"SELECT unnest({'q': 5, 'amount': 1}), o.amount, s.* FROM orders o, (SELECT 1 AS z) s" \
 	"@prepared_fields:SELECT orders.amount, x.* FROM orders, (SELECT ? AS p) x"; do
 	got="$(ACL_SHOW_DESCRIBED=1 ask "$sql")"
 	echo "$got" | grep -q "c.main" && fail "an origin was read off \"$sql\": $got"
@@ -769,6 +770,16 @@ echo "SET GLOBAL acl_audit_level = 'decisions';" >&3
 
 # (spec 096's node-group refusal at the door - UNAVAILABLE, the swap kept - is the platform part's: it moved to
 # hugr-node with the code, duckdb-acl spec 127)
+
+# --- spec 143: a live alias schema's object written in another case than its own is the same object - described,
+# and labelled as the listing names it
+echo "CREATE TABLE staging.events(kind VARCHAR); COMMENT ON COLUMN staging.events.kind IS 'what happened';" >&3
+server_says made "SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'staging' AND table_name = 'events'" >/dev/null
+for sql in "SELECT KIND FROM stage.EVENTS" "SELECT kind FROM stage.events"; do
+	got="$(ACL_SHOW_DESCRIBED=1 ask "$sql")"
+	echo "$got" | grep -q "|c.stage.events|comment:what happened|'" || fail "a live alias object's origin (\"$sql\"): $got"
+done
+echo "DROP TABLE staging.events;" >&3
 
 # --- spec 143: a source's tags as duckdb:tag:<key> - a DuckLake table's (DuckLake keeps a table's tags; no SQL
 # statement of the release writes one, so its metadata row is written here), where the build carries DuckLake

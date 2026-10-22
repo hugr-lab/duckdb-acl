@@ -415,8 +415,9 @@ WithOrigins(const std::shared_ptr<arrow::Schema> &schema, const vector<ResultOri
 		if (!column_of[i]) {
 			continue;
 		}
+		// named as the listing names the object, whatever case the statement wrote it in
 		auto builder = flight::sql::ColumnMetadata::Builder();
-		builder.CatalogName(origin.catalog).SchemaName(origin.schema).TableName(origin.table);
+		builder.CatalogName(described[i]->catalog).SchemaName(described[i]->schema).TableName(described[i]->table);
 		auto metadata = builder.Build().metadata_map()->Merge(
 		    *DescribedMetadata("duckdb:comment", column_of[i]->first, column_of[i]->second));
 		auto field = NumericCast<int>(i);

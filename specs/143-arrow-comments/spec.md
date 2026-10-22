@@ -62,8 +62,11 @@ relation gets a virtual comment of its own.
 - The door says nothing rather than the wrong thing (the review's misattributions): a list that does not fit the
   fields is dropped - a star of no column (a placeholder schema), an item whose name the text gives (its alias, a
   reference's last part) landing on a field of another name (an item beside it made several columns), a star over
-  an object whose span is not that object's columns; and a column is labelled only when the object's description
-  lists it (not a struct column's field `t.x` duckdb read off another relation, a lateral alias, `current_schema`).
+  an object whose span is not that object's columns, a star over no virtual object (unverifiable) beside an item that
+  is not a plain reference (an unnest of a struct may name its fields like anything); and a column is labelled only
+  when the object's description lists it (not a struct column's field `t.x` duckdb read off another relation, a
+  lateral alias, `current_schema`) - with the listing's spelling of the names (a live alias schema's object written
+  in another case is the same object).
 - **What a field carries** (`SchemaFor`, beside `WithTypeNames`): for a column with an origin,
   `ARROW:FLIGHT:SQL:CATALOG_NAME` / `SCHEMA_NAME` / `TABLE_NAME` - the virtual names - and `duckdb:comment` when the
   column has a comment. Never `REMARKS` on a result: arrow-java makes it the column's label (spec 115).
@@ -121,9 +124,15 @@ They go wherever the comments go:
 - No new visibility: every comment and name comes from the principal's own listings, which already hide what spec 035
   hides (a hidden column has no field; a virtual object never shows its source's table comment - a live alias
   schema's tables are the source's own, comment included).
-- Found by the review (a negative test in `acl_column_comments.test`): a grant's projection (spec 026) listed a column
-  an object grant names but the catalog grant's list hides - the read has no such column - and this spec would have
-  carried its comment and tags; the leg now lists only a name every level of a role's grants keeps (spec 035).
+- Found by the reviews (negative tests in `acl_column_comments.test`), older than this spec but now carrying comments
+  and tags into Arrow, so fixed here (spec 035's rule - the listing is what the read returns):
+  - a grant's projection (spec 026) listed a column an object grant names but the catalog grant's list hides - it
+    now lists only a name every level of a role's grants keeps, numbered after that filter (positions close up as
+    the read's, spec 036);
+  - a grant's column list was split in SQL on every comma, so a column named inside a mask (`note = concat(id,
+    amount)`) counted as kept - it is now split where the read splits it (`ParseColumnList`, C++), written into the
+    listing as a constant per stored list;
+  - a renaming list's own column comments (in `object_columns`) were never listed - shown now, over the source's.
 - Tags are the physical catalog's, as the owner decided for now: they may name what the source's operator wrote. A
   hidden column's tags never show (no row); the policy's own tags will replace them when the virtual catalog has them.
 - Names in a result's metadata are virtual, never the physical ones the rewrite resolved to.

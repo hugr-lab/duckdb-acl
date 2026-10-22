@@ -905,7 +905,9 @@ span, never an expression / CTE / union / a second star) onto the profile note; 
 `PolicyStore::DescribeObject` (those surfaces narrowed to the object, cached per role set + object, policy version,
 ≤ 10 min, none kept too) at Prepare onto the reservation, and `WithOrigins` writes CATALOG_NAME / SCHEMA_NAME /
 TABLE_NAME + `duckdb:comment` (never REMARKS on a result) + tags - only when every item lands on its named field, a
-star's span is its object's columns, and the description lists the column. A relation with no column list (alias,
+star's span is its object's columns (a star over no virtual object only beside plain references), and the description
+lists the column (labelled with its spelling). A grant's column list is split as the read splits it
+(`ParseColumnList`, constants per stored list in the listing SQL - never a SQL split on commas). A relation with no column list (alias,
 RLS-only) takes a virtual column comment (`column_comments`, schema v23; `IS ''` clears a kept one first; check
 `comment_column_missing`). Tags are the PHYSICAL catalog's for now (`tags` on `acl_physical_tables` /
 `_columns`, `acl_physical_schemas(keys)` for a live alias schema; a declared column by the spec 039 read-by-name

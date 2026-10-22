@@ -420,6 +420,75 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                       string(HasObjectCaps() ? "oc.\"columns\"" : "NULL") + " AS obj_columns FROM " +
 	                       Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " +
 	                       visible + ")";
+	// The names a grant states, split where the read path splits them (ParseColumnList: at top level, so a mask's
+	// own commas - `note = concat(id, amount)` - never make a name of its arguments; review 143: a SQL split on every
+	// comma listed `amount` as kept) and each item's column - a masked item's left of '=', spec 102's path its head
+	// (a quoted head unquoted, else the part before the first '.' or '['), folded. Read here, from the grants of the
+	// principal's roles, and written as a constant CASE over the stored text: no subquery for the planner to
+	// decorrelate under the listing's own
+	std::map<string, vector<string>> stated_lists;
+	if (!function_mode) {
+		auto lists_sql = "SELECT DISTINCT \"columns\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
+		                 LitList(principal.roles) + ") AND coalesce(trim(\"columns\"), '') <> ''";
+		if (HasObjectCaps()) {
+			lists_sql += " UNION SELECT DISTINCT \"columns\" FROM " + Tbl("role_object_caps") + " WHERE \"role\" IN (" +
+			             LitList(principal.roles) + ") AND coalesce(trim(\"columns\"), '') <> ''";
+		}
+		auto lists = Query(lists_sql);
+		ResultRows list_rows(*lists);
+		for (idx_t i = 0; i < list_rows.Count(); i++) {
+			auto text = list_rows.GetValue(0, i).ToString();
+			vector<string> names;
+			for (auto &item : ParseColumnList(text)) {
+				auto name = item.first;
+				StringUtil::Trim(name);
+				string head;
+				if (!name.empty() && name[0] == '"') {
+					for (idx_t at = 1; at < name.size(); at++) {
+						if (name[at] == '"') {
+							if (at + 1 < name.size() && name[at + 1] == '"') {
+								head += '"';
+								at++;
+								continue;
+							}
+							break;
+						}
+						head += name[at];
+					}
+				} else {
+					head = name.substr(0, name.find_first_of(".["));
+				}
+				names.push_back(StringUtil::Lower(head));
+			}
+			stated_lists[text] = std::move(names);
+		}
+	}
+	auto stated = [&](const string &column_expr) {
+		string cases;
+		for (auto &list : stated_lists) {
+			vector<string> names;
+			for (auto &name : list.second) {
+				names.push_back(Lit(name));
+			}
+			cases += " WHEN " + Lit(list.first) + " THEN [" + StringUtil::Join(names, ", ") + "]::VARCHAR[]";
+		}
+		// a list read after this text was composed matches nothing: nothing it names is kept (fail closed)
+		return cases.empty() ? string("[]::VARCHAR[]") : "CASE " + column_expr + cases + " ELSE []::VARCHAR[] END";
+	};
+	auto keeps = [&](const string &column_expr, const string &name_expr) {
+		return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = '' OR list_contains(" +
+		       stated(column_expr) + ", " + KeyFoldSql(name_expr) + "))";
+	};
+	// Visible for at least one role: a principal may read what any of its roles may (spec 011). A
+	// row with no grant row at all is not an object of the catalog - it is a column of a live
+	// schema alias, whose visibility is the schema's, decided in `aliases` - so it is left alone.
+	auto column_visible = [&](const string &vcat_expr, const string &vname_expr, const string &name_expr) {
+		string key = "gc.vcat = " + vcat_expr + " AND gc.vname = " + vname_expr;
+		return "(NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE " + key + ")" +
+		       " OR EXISTS (SELECT 1 FROM gcolumns gc"
+		       " WHERE " +
+		       key + " AND " + keeps("gc.cat_columns", name_expr) + " AND " + keeps("gc.obj_columns", name_expr) + "))";
+	};
 	// spec 026: what a grant's own projection produces - a mask that changes a column's type, or a
 	// computed column the object never had. Probed when the grant is written, so a listing can
 	// describe what the role reads rather than what the physical table holds.
@@ -449,7 +518,13 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                   " WHERE NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE gc.vcat = pc.\"vcat\""
 	                   " AND gc.vname = pc.\"vname\""
 	                   " AND (gc.cat_columns IS NULL OR trim(gc.cat_columns) = '')"
-	                   " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))))"
+	                   " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))"
+	                   // review 143: an object grant's list names what that level keeps - the catalog grant's may
+	                   // hide it, and then the read has no such column (nor its name, comment or tags a row);
+	                   // filtered before the positions are numbered, so they close up as the read's do (spec 036)
+	                   " AND " +
+	                   column_visible("pc.\"vcat\"", "pc.\"vname\"", "pc.\"name\"") +
+	                   "))"
 	                   " GROUP BY vcat, vname, name))";
 	auto prelude =
 	    GrantsCte(principal) + ", " +
@@ -694,9 +769,13 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
 	           " coalesce(c.\"name\", i.\"column_name\") AS column_name,"
 	           " acl_exposed_type(i.\"data_type\", o.strip_alias, o.enums_to_varchar) AS data_type, ") +
-	    alias_nullable + " AS is_nullable, coalesce(cc.\"comment\", i.\"COLUMN_COMMENT\") AS \"COLUMN_COMMENT\")" +
+	    alias_nullable +
+	    " AS is_nullable, coalesce(ocv.\"comment\", cc.\"comment\", i.\"COLUMN_COMMENT\") AS \"COLUMN_COMMENT\")" +
 	    " FROM objects o JOIN " + icolumns + " i ON " + physical + projection +
-	    " AND c.\"expr\" = i.\"column_name\" LEFT JOIN " + Tbl("column_comments") +
+	    // a renaming list keeps its columns' comments in object_columns (the writer's), under the virtual name
+	    " AND c.\"expr\" = i.\"column_name\" LEFT JOIN " + Tbl("object_columns") +
+	    " ocv ON c.\"name\" IS NOT NULL AND ocv.\"vcat\" = o.vcat AND ocv.\"kind\" = 'relation' AND ocv.\"vname\" = " +
+	    alias_vname + " AND ocv.\"name\" = c.\"name\" LEFT JOIN " + Tbl("column_comments") +
 	    " cc ON c.\"name\" IS NULL AND cc.\"vcat\" = o.vcat AND cc.\"vname\" = " + alias_vname +
 	    " AND cc.\"column_name\" = i.\"column_name\""
 	    " WHERE len(o.parts) = 3 AND (o.form = 'alias' OR (o.form = 'subquery' AND NOT EXISTS"
@@ -741,33 +820,6 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    icolumns +
 	    " i ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
 	    " WHERE len(a.parts) = 2";
-	// The names a grant states: split the list and take the part before '=' of a masked item. A
-	// mask's expression may itself contain a comma, which splits into a fragment that matches no
-	// column - harmless, since only the names on the left of '=' can ever match one.
-	// spec 102: a path names its column - a quoted head unquoted (`"odd.col"`, `"my col".city`), else
-	// the part before the first '.' or '['
-	auto stated = [](const string &column_expr) {
-		string item = "trim(CASE WHEN position('=' IN y) > 0 THEN regexp_extract(y, '^([^=]*)=', 1) ELSE y END)";
-		return "list_transform(str_split(" + column_expr + ", ','), lambda y: translate(CASE WHEN starts_with(" + item +
-		       ", '\"') THEN replace(regexp_extract(" + item +
-		       ", '^\"((?:[^\"]|\"\")*)\"', 1), '\"\"', '\"')"
-		       " ELSE regexp_replace(" +
-		       item + ", '[.\\[].*$', '') END, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'))";
-	};
-	auto keeps = [&](const string &column_expr, const string &name_expr) {
-		return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = '' OR list_contains(" +
-		       stated(column_expr) + ", " + KeyFoldSql(name_expr) + "))";
-	};
-	// Visible for at least one role: a principal may read what any of its roles may (spec 011). A
-	// row with no grant row at all is not an object of the catalog - it is a column of a live
-	// schema alias, whose visibility is the schema's, decided in `aliases` - so it is left alone.
-	auto column_visible = [&](const string &vcat_expr, const string &vname_expr, const string &name_expr) {
-		string key = "gc.vcat = " + vcat_expr + " AND gc.vname = " + vname_expr;
-		return "(NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE " + key + ")" +
-		       " OR EXISTS (SELECT 1 FROM gcolumns gc"
-		       " WHERE " +
-		       key + " AND " + keeps("gc.cat_columns", name_expr) + " AND " + keeps("gc.obj_columns", name_expr) + "))";
-	};
 	auto path = [](const string &alias) {
 		return "CASE WHEN " + alias + ".vschema = 'main' THEN " + alias + ".vname ELSE " + alias +
 		       ".vschema || '.' || " + alias + ".vname END";
@@ -810,9 +862,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " FROM gprojection gp JOIN objects o ON o.vcat = gp.vcat AND " +
 	    path("o") + " = gp.vname LEFT JOIN lcols s ON s.table_catalog = gp.vcat AND " + source_path +
 	    " = gp.vname AND " + KeyFoldSql("s.column_name") + " = " + KeyFoldSql("gp.name") +
-	    // review 143: an object grant's list names what that level keeps - the catalog grant's may hide it, and then
-	    // the read has no such column (nor may its name, comment or tags be listed)
-	    " WHERE " + column_visible("gp.vcat", "gp.vname", "gp.name") +
+
 	    // spec 117: the columns of the system catalog's views - the types each view declares
 	    (platform ? " UNION ALL BY NAME SELECT 'platform' AS table_catalog, pc.path AS table_schema, pc.vname AS"
 	                " table_name, pc.name AS column_name, pc.pos AS ordinal_position, pc.type AS data_type,"
@@ -1270,15 +1320,22 @@ shared_ptr<const PolicyStore::ObjectDescription> PolicyStore::DescribeObject(con
 	auto listed = Listed(principal);
 	MetadataListing(listed, "tables_tagged", tables_sql, scope);
 	MetadataListing(listed, "columns_tagged", columns_sql, scope);
-	auto where = string(" WHERE table_catalog = ") + Lit(catalog_name) + " AND table_schema = " + Lit(schema) +
-	             " AND table_name = " + Lit(table);
+	// names compare as the catalog compares them (one ASCII fold, spec 116): a name written in another case than the
+	// object's - a live alias schema's object keeps the spelling it was read under - is the same object
+	auto where = " WHERE " + KeyFoldSql("table_catalog") + " = " + KeyFoldSql(Lit(catalog_name)) + " AND " +
+	             KeyFoldSql("table_schema") + " = " + KeyFoldSql(Lit(schema)) + " AND " + KeyFoldSql("table_name") +
+	             " = " + KeyFoldSql(Lit(table));
 	shared_ptr<ObjectDescription> description;
-	auto objects = catalog->Query("SELECT \"TABLE_COMMENT\", acl_tags FROM (" + tables_sql + ")" + where);
+	auto objects = catalog->Query("SELECT \"TABLE_COMMENT\", acl_tags, table_catalog, table_schema, table_name FROM (" +
+	                              tables_sql + ")" + where);
 	ResultRows object_rows(*objects);
-	if (object_rows.Count() > 0) {
+	if (object_rows.Count() == 1) {
 		description = make_shared_ptr<ObjectDescription>();
 		description->comment = object_rows.GetValue(0, 0);
 		description->tags = object_rows.GetValue(1, 0);
+		description->catalog = object_rows.GetValue(2, 0).ToString();
+		description->schema = object_rows.GetValue(3, 0).ToString();
+		description->table = object_rows.GetValue(4, 0).ToString();
 		auto columns =
 		    catalog->Query("SELECT column_name, \"COLUMN_COMMENT\", acl_tags FROM (" + columns_sql + ")" + where);
 		ResultRows column_rows(*columns);

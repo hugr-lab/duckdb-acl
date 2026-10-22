@@ -595,6 +595,7 @@ struct PolicyStore {
 	//! Kept per role set and object until the policy's version moves, at most ten minutes (a source's own comment
 	//! or tags change without it); an object nothing describes is kept as null
 	struct ObjectDescription {
+		string catalog, schema, table; // as the listing names the object (the spelling a result is labelled with)
 		Value comment, tags;
 		case_insensitive_map_t<std::pair<Value, Value>> columns; // name -> (comment, tags)
 	};

@@ -2533,9 +2533,11 @@ void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, con
 					}
 				}
 			}
-			auto exists = read("SELECT 1 FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-			                   " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind) +
-			                   " AND \"name\" = " + Lit(column));
+			// a column as the catalog compares names (one ASCII fold), kept in its stored spelling
+			auto exists =
+			    read("SELECT \"name\" FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+			         " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind) + " AND " +
+			         KeyFoldSql("\"name\"") + " = " + KeyFoldSql(Lit(column)));
 			if (exists->RowCount() == 0 && kind == "relation") {
 				// spec 143: a relation over a source that declares no column list (an alias, an RLS-only one) reads
 				// its source's columns live; a column's virtual comment is kept beside it, the column as the source
@@ -2574,14 +2576,15 @@ void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, con
 					return;
 				}
 			}
-			if (exists->RowCount() == 0) {
+			if (exists->RowCount() != 1) {
 				throw BinderException("acl admin: \"%s.%s\" has no column \"%s\" (its schema may be unknown - "
 				                      "run acl_refresh_schema)",
 				                      vcat, vname, column);
 			}
+			auto stored = ResultRows(*exists).GetValue(0, 0).ToString();
 			statements.push_back("UPDATE " + catalog->Tbl("object_columns") + " SET \"comment\" = " + value +
 			                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
-			                     " AND \"kind\" = " + Lit(kind) + " AND \"name\" = " + Lit(column));
+			                     " AND \"kind\" = " + Lit(kind) + " AND \"name\" = " + Lit(stored));
 			return;
 		}
 		if (kind == "schema") {

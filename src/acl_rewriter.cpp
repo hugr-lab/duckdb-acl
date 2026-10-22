@@ -297,7 +297,17 @@ public:
 			any = any || !origin.table.empty();
 			out.push_back(std::move(origin));
 		}
-		return any ? out : vector<ResultOrigin>();
+		// a star over no virtual object takes whatever columns the others leave, unverified: beside an item that may
+		// make several (an unnest of a struct, whose fields may be named like anything) the list cannot be trusted
+		bool open_star = false, all_references = true;
+		for (idx_t i = 0; i < out.size(); i++) {
+			open_star = open_star || (out[i].kind == ResultOrigin::Kind::STAR && out[i].table.empty());
+			if (out[i].kind != ResultOrigin::Kind::STAR &&
+			    node.select_list[i]->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+				all_references = false;
+			}
+		}
+		return any && (!open_star || all_references) ? out : vector<ResultOrigin>();
 	}
 
 	//! spec 114: the USE a statement is read under, for its lineage job (the worker runs later)
