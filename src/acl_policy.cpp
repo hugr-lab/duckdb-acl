@@ -1900,9 +1900,11 @@ bool MainFallback(const string &vname, string &root) {
 
 } // namespace
 
-bool PolicyStore::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {
+bool PolicyStore::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out,
+                               const string &capability) {
+	// the memory store (dev mode) takes the first role that holds the name - no union, nothing lifted
 	auto resolve = [&](const string &name) {
-		return catalog ? CatalogResolveTable(principal, name, out) : Resolve(tables, principal, name, out);
+		return catalog ? CatalogResolveTable(principal, name, out, capability) : Resolve(tables, principal, name, out);
 	};
 	if (resolve(vname)) {
 		return true;

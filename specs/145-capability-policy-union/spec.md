@@ -1,8 +1,8 @@
 # Spec 145: a capability's policy is the union of the grants that hold it
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-10-23
-- **Author**: hugr lab (found by spec 144's review)
+- **Author**: hugr lab (found by spec 144's review; accepted by the owner 2026-10-23)
 
 ## Summary
 
@@ -40,11 +40,13 @@ ACL TOKEN '<roles: analyst, auditor>' SELECT * FROM t;   -- every row, every col
 - `PolicyStore::ResolveTable(principal, name, out, capability = "select")`; the cache key carries the capability;
   `ResolveDmlTarget` passes its verb (`insert`, `update`, `delete`, `merge`), every read keeps the default. A
   capability no row holds leaves the union empty - and the caps check refuses before the policy is used.
-- **RETURNING is a read**: a DML target's `RETURNING` is checked against the `select` policy as well as the verb's -
-  and when the two differ in their predicate or columns (a principal whose update role is wider than its read
-  role), a statement with `RETURNING` is refused, rather than returning rows or columns its reads cannot see.
-- **Listings** (spec 035, what the read returns): the grant rows that narrow a listing's columns (`gcolumns`, spec
-  144's alias levels) are those holding `select`.
+- **RETURNING is a read**: a DML target's `RETURNING` needs `select` on the object, and the `select` policy the same
+  as the verb's (predicate, projection, visible columns, masks, field writes) - a principal whose update role is
+  wider than its read role, or that holds no read at all, is refused with `RETURNING: …`, rather than returned rows
+  or columns its reads cannot see (`TablePolicy::returning_refused`, set where the DML target is resolved).
+- **Listings** (spec 035, what the read returns): the grant rows that narrow a listing's columns (`gcolumns`) are
+  those holding `select`, and a role's probed projection (`grant_columns`) is listed only where that role reads the
+  object; spec 144's alias levels follow when it lands.
 - The memory store (dev mode) resolves a name to the first role holding it - no union, nothing lifted; unchanged.
 
 ## Enforcement & security

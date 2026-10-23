@@ -500,8 +500,12 @@ object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like ever
 - **`RLS`** is the grant's own predicate, AND-ed onto every object of the catalog for this role (and
   onto the object's own). **`COLUMNS`** is the grant's own column list, intersected with the object's;
   a name the object hides cannot be re-exposed here. A grant narrows, it never widens. Across roles the
-  effective policy is the union, so a role without a narrowing grant lifts it for a principal holding
-  both. A catalog-level column list is not probed for its types.
+  effective policy is the union of the roles that hold the capability exercised (spec 145): a role that
+  may read without a narrowing grant lifts it for a principal holding both, while a role that may not
+  read - one with `insert` only, an object grant `CAPS '{}'` - lifts no read role's filter or columns;
+  likewise for each write verb. `RETURNING` reads: it is refused where the principal may not read the
+  object, or reads it under another policy than the verb's. A catalog-level column list is not probed
+  for its types.
 - `CAPS '{"manage": true}'` is the catalog-scoped administration scope: the role may run the
   management grammar over this catalog's content (and only that - see *Batches and authorization*).
   Managing a catalog does not imply reading it.

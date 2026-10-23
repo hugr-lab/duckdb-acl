@@ -3563,6 +3563,9 @@ private:
 	//! which expands to every physical column - never is.
 	void RequireReadableReturning(const vector<unique_ptr<ParsedExpression>> &returning, const TablePolicy &policy,
 	                              const string &vname) {
+		if (!returning.empty() && !policy.returning_refused.empty()) {
+			Deny(Reason::CAPABILITY, "RETURNING: " + policy.returning_refused); // spec 145: RETURNING is a read
+		}
 		if (policy.write_columns.empty()) {
 			return; // no column policy: the relation is the table, and RETURNING reads the table
 		}
@@ -3703,7 +3706,8 @@ private:
 			key = Key(target_name);
 		}
 		TablePolicy policy;
-		if (!store.ResolveTable(principal, key, policy)) {
+		// spec 145: the verb's policy - the union of the grant rows that hold it
+		if (!store.ResolveTable(principal, key, policy, capability)) {
 			// the session's own temp table is written natively, with nothing to enforce: no grant
 			// narrows an object only this connection can see (spec 050). Virtual wins - this is
 			// reached only when no grant claims the name.
@@ -3727,6 +3731,18 @@ private:
 		}
 		if (!policy.caps.count(capability)) {
 			Deny(Reason::CAPABILITY, capability + " on " + Shown(key) + " is not allowed");
+		}
+		// spec 145: RETURNING reads - only what the principal reads, under the policy it reads by
+		TablePolicy read;
+		if (!policy.caps.count("select") || !store.ResolveTable(principal, key, read)) {
+			policy.returning_refused = "select on " + Shown(key) + " is not allowed";
+		} else if (read.rls != policy.rls || read.projection != policy.projection || read.query != policy.query ||
+		           read.visible_columns != policy.visible_columns || read.injections != policy.injections ||
+		           read.field_writes != policy.field_writes) {
+			policy.returning_refused = "the principal reads " + Shown(key) + " under another policy than its " +
+			                           capability +
+			                           " - RETURNING "
+			                           "would return what its reads do not";
 		}
 		auto phys = ParsePhysName(policy.phys);
 		NotePhysical(policy.phys);

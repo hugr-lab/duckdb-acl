@@ -449,7 +449,10 @@ means none"; "an *object* grant that states nothing inherits the catalog grant's
 refinement never widens by omission"; the capabilities outside the default "are explicit-only and
 never inherited". A schema grant "carries **capabilities only** - no RLS, no column list" (spec 015).
 Capabilities and predicates union across a principal's roles; column lists union in the object's
-order (specs 026/038).
+order (specs 026/038). A capability's policy is the union of the roles that hold it (spec 145): a
+role that may not read the object contributes nothing to what is read, nor a role that may not update
+it to what an update may touch; `RETURNING` reads, so it needs `select` and the same policy as the
+verb.
 
 ## 4. Identity
 

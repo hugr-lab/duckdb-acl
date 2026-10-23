@@ -141,6 +141,9 @@ struct TablePolicy {
 	bool writable = false;
 	//! Found through a live schema alias (which claims every name under it), not a stored object
 	bool from_schema_alias = false;
+	//! spec 145: a DML target's RETURNING reads - refused when the principal may not read the object or reads it
+	//! under another policy than the verb's (its write role wider than its read role); empty = it may
+	string returning_refused;
 	//! Columns a grant assigns on writes: physical column name -> value template (claims/constants
 	//! only). On INSERT the value is added when absent and overridden when supplied; on UPDATE a SET
 	//! of the column is overridden - so a row cannot be written outside the grant's slice.
@@ -1268,7 +1271,10 @@ struct PolicyStore {
 	//! dev mode, and with a policy source only when acl_allow_anonymous_admin is on (spec 009).
 	bool AnonymousAdminAllowed();
 
-	bool ResolveTable(const Principal &principal, const string &vname, TablePolicy &out);
+	//! spec 145: the policy of `capability` (a read's `select` by default, a DML target's verb) - the union of the
+	//! principal's grant rows that hold it
+	bool ResolveTable(const Principal &principal, const string &vname, TablePolicy &out,
+	                  const string &capability = "select");
 	bool ResolveTableFunction(const Principal &principal, const string &vname, TablePolicy &out);
 	bool ResolveScalarFunction(const Principal &principal, const string &vname, TablePolicy &out);
 
@@ -1344,7 +1350,8 @@ private:
 	int64_t JwksRefreshInterval();
 	int64_t JwksMaxStale();
 	// catalog-backend bridges, defined in acl_policy_catalog.cpp (the backend type stays private there)
-	bool CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out);
+	bool CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out,
+	                         const string &capability);
 	bool CatalogResolveFunction(const Principal &principal, const string &vname, bool table_kind, TablePolicy &out);
 	//! spec 072: the backend's model of the function categories; nullptr when the source has none (a
 	//! function-driver source without the slots), which reads as the seed

@@ -418,8 +418,10 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	string grant_columns = "gcolumns AS (SELECT r.\"vcat\" AS vcat, r.\"vname\" AS vname, g.\"role\" AS role,"
 	                       " g.\"columns\" AS cat_columns, " +
 	                       string(HasObjectCaps() ? "oc.\"columns\"" : "NULL") + " AS obj_columns FROM " +
-	                       Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " +
-	                       visible + ")";
+	                       Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
+	                       // spec 145: what a role reads narrows a listing only where the role may read - the read
+	                       // unites the policies of the rows that hold `select`, and so does the listing
+	                       " WHERE " + CapsAllowSql(CapsExpr(), "select") + ")";
 	// The names a grant states, split where the read path splits them (ParseColumnList: at top level, so a mask's
 	// own commas - `note = concat(id, amount)` - never make a name of its arguments; review 143: a SQL split on every
 	// comma listed `amount` as kept) and each item's column - a masked item's left of '=', spec 102's path its head
@@ -501,31 +503,34 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// list in its own order - so a column belongs where the first role that states it put it.
 	// Ranking by `(role, pos)` and taking each name's first occurrence reproduces exactly that,
 	// and the outer row_number closes the gaps a merged name leaves behind.
-	string projected = "gprojection AS (SELECT vcat, vname, name, type,"
-	                   " row_number() OVER (PARTITION BY vcat, vname ORDER BY rk) - 1 AS pos FROM"
-	                   " (SELECT vcat, vname, name, min_by(type, rk) AS type, min(rk) AS rk FROM"
-	                   " (SELECT vcat, vname, name, type,"
-	                   " row_number() OVER (PARTITION BY vcat, vname ORDER BY \"role\", \"pos\") AS rk FROM"
-	                   " (SELECT DISTINCT pc.\"vcat\" AS vcat, pc.\"vname\" AS vname, pc.\"name\" AS name,"
-	                   " pc.\"type\" AS type, pc.\"role\" AS \"role\", pc.\"pos\" AS \"pos\" FROM " +
-	                   Tbl("grant_columns") +
-	                   " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\""
-	                   // One role whose chain states no column list lifts the restriction for the
-	                   // whole principal (spec 011: `Restricts()` is `any && !unrestricted`), and
-	                   // then the object's own columns are what it reads - so another role's
-	                   // projection must not be listed either, or the listing would advertise a
-	                   // column `SELECT *` never returns.
-	                   " WHERE NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE gc.vcat = pc.\"vcat\""
-	                   " AND gc.vname = pc.\"vname\""
-	                   " AND (gc.cat_columns IS NULL OR trim(gc.cat_columns) = '')"
-	                   " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))"
-	                   // review 143: an object grant's list names what that level keeps - the catalog grant's may
-	                   // hide it, and then the read has no such column (nor its name, comment or tags a row);
-	                   // filtered before the positions are numbered, so they close up as the read's do (spec 036)
-	                   " AND " +
-	                   column_visible("pc.\"vcat\"", "pc.\"vname\"", "pc.\"name\"") +
-	                   "))"
-	                   " GROUP BY vcat, vname, name))";
+	string projected =
+	    "gprojection AS (SELECT vcat, vname, name, type,"
+	    " row_number() OVER (PARTITION BY vcat, vname ORDER BY rk) - 1 AS pos FROM"
+	    " (SELECT vcat, vname, name, min_by(type, rk) AS type, min(rk) AS rk FROM"
+	    " (SELECT vcat, vname, name, type,"
+	    " row_number() OVER (PARTITION BY vcat, vname ORDER BY \"role\", \"pos\") AS rk FROM"
+	    " (SELECT DISTINCT pc.\"vcat\" AS vcat, pc.\"vname\" AS vname, pc.\"name\" AS name,"
+	    " pc.\"type\" AS type, pc.\"role\" AS \"role\", pc.\"pos\" AS \"pos\" FROM " +
+	    Tbl("grant_columns") +
+	    " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\""
+	    // spec 145: a role's projection is listed only where the role reads the object
+	    " JOIN gcolumns gr ON gr.vcat = pc.\"vcat\" AND gr.vname = pc.\"vname\" AND gr.role = pc.\"role\""
+	    // One role whose chain states no column list lifts the restriction for the
+	    // whole principal (spec 011: `Restricts()` is `any && !unrestricted`), and
+	    // then the object's own columns are what it reads - so another role's
+	    // projection must not be listed either, or the listing would advertise a
+	    // column `SELECT *` never returns.
+	    " WHERE NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE gc.vcat = pc.\"vcat\""
+	    " AND gc.vname = pc.\"vname\""
+	    " AND (gc.cat_columns IS NULL OR trim(gc.cat_columns) = '')"
+	    " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))"
+	    // review 143: an object grant's list names what that level keeps - the catalog grant's may
+	    // hide it, and then the read has no such column (nor its name, comment or tags a row);
+	    // filtered before the positions are numbered, so they close up as the read's do (spec 036)
+	    " AND " +
+	    column_visible("pc.\"vcat\"", "pc.\"vname\"", "pc.\"name\"") +
+	    "))"
+	    " GROUP BY vcat, vname, name))";
 	auto prelude =
 	    GrantsCte(principal) + ", " +
 	    (platform ? "pobjects AS (" + platform_objects + "), pcolumns AS (" + platform_columns + "), " : string()) +

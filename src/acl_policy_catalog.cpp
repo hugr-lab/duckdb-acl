@@ -553,7 +553,8 @@ void CatalogBackend::SplitName(const string &vname, string &head, string &rest) 
 	NamePath::SplitHeadKey(vname, head, rest);
 }
 
-bool CatalogBackend::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {
+bool CatalogBackend::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out,
+                                  const string &capability) {
 	if (principal.roles.empty()) {
 		return false;
 	}
@@ -561,7 +562,8 @@ bool CatalogBackend::ResolveTable(const Principal &principal, const string &vnam
 	// spec 099: the node's type settings shape the read, so a SET GLOBAL never serves a stale one
 	auto instance = Db();
 	auto key = RoleSig(principal) + "\x1f" + StringUtil::Lower(vname) + "\x1f" +
-	           (NodeStripsAliases(*instance) ? "b" : "k") + (NodeEnumsToVarchar(*instance) ? "v" : "k");
+	           (NodeStripsAliases(*instance) ? "b" : "k") + (NodeEnumsToVarchar(*instance) ? "v" : "k") + "\x1f" +
+	           capability;
 	{
 		lock_guard<mutex> guard(lock);
 		auto entry = objects.find(key);
@@ -571,8 +573,8 @@ bool CatalogBackend::ResolveTable(const Principal &principal, const string &vnam
 		}
 	}
 	TablePolicy policy;
-	bool found = LookupRelation(principal, vname, policy);
-	if (!found && LookupSchemaAlias(principal, vname, policy)) {
+	bool found = LookupRelation(principal, vname, policy, capability);
+	if (!found && LookupSchemaAlias(principal, vname, policy, capability)) {
 		found = true;
 		policy.from_schema_alias = true;
 	}
@@ -585,7 +587,8 @@ bool CatalogBackend::ResolveTable(const Principal &principal, const string &vnam
 	return found;
 }
 
-bool CatalogBackend::LookupRelation(const Principal &principal, const string &vname, TablePolicy &out) {
+bool CatalogBackend::LookupRelation(const Principal &principal, const string &vname, TablePolicy &out,
+                                    const string &capability) {
 	string head, rest;
 	SplitName(vname, head, rest);
 	string qualified_cond = head.empty()
@@ -706,17 +709,20 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 		}
 	}
 	// remaining rows of the winning interpretation differ only by role: union their caps, and the
-	// policies of their grant chains (spec 011)
+	// policies of their grant chains (spec 011) - spec 145: of the rows that hold the capability exercised, so a role
+	// that may not do it (an ingest role's `insert` only, an object grant's '{}') lifts no other role's policy
 	GrantUnion grants;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		if (result_rows.GetValue(11, row).GetValue<int64_t>() != prio) {
 			break; // ordered by prio; the losing interpretation starts here
 		}
-		auto caps = result_rows.GetValue(4, row);
-		for (auto &cap : EffectiveCaps(caps)) {
+		auto caps = EffectiveCaps(result_rows.GetValue(4, row));
+		for (auto &cap : caps) {
 			out.caps.insert(cap);
 		}
-		grants.Add(RowPolicy(result_rows, row, 5));
+		if (caps.count(capability)) {
+			grants.Add(RowPolicy(result_rows, row, 5));
+		}
 	}
 	ApplyGrantPolicy(vname, grants, object_columns, out);
 	return true;
@@ -968,7 +974,8 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 	out.subquery_form = true; // a narrowed read is a projection, so it needs the subquery shape
 }
 
-bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string &vname, TablePolicy &out) {
+bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string &vname, TablePolicy &out,
+                                       const string &capability) {
 	string head, rest;
 	SplitName(vname, head, rest);
 	auto prefix_match = [](const string &path, const string &alias_expr) {
@@ -1040,11 +1047,13 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 		    result_rows.GetValue(0, row).ToString() != vcat || result_rows.GetValue(1, row).ToString() != alias_path) {
 			continue;
 		}
-		auto caps = result_rows.GetValue(3, row);
-		for (auto &cap : EffectiveCaps(caps)) {
+		auto caps = EffectiveCaps(result_rows.GetValue(3, row));
+		for (auto &cap : caps) {
 			out.caps.insert(cap);
 		}
-		grants.Add(RowPolicy(result_rows, row, 4));
+		if (caps.count(capability)) { // spec 145: see LookupRelation
+			grants.Add(RowPolicy(result_rows, row, 4));
+		}
 	}
 	vector<std::pair<string, string>> no_columns;
 	ApplyGrantPolicy(vname, grants, no_columns, out);
@@ -2026,8 +2035,9 @@ void PolicyStore::EnableFunctions(DatabaseInstance &db, const string &slots_json
 	node_load_policy.valid = false; // spec 096: the report's reads were the old source's
 }
 
-bool PolicyStore::CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out) {
-	return catalog->ResolveTable(principal, vname, out);
+bool PolicyStore::CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out,
+                                      const string &capability) {
+	return catalog->ResolveTable(principal, vname, out, capability);
 }
 
 bool PolicyStore::CatalogResolveFunction(const Principal &principal, const string &vname, bool table_kind,
