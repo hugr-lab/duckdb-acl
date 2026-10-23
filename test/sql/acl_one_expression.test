@@ -8,6 +8,12 @@
 
 require acl
 
+# the memory store judges the same text (it pastes it at read too)
+statement error
+SELECT acl_grant_table('m', 't', 'phys.main.t', 'id, note = 1 FROM range(1)', '', 'select');
+----
+spec 148
+
 statement ok
 ATTACH ':memory:' AS store;
 
@@ -103,6 +109,32 @@ ACL ROLE "r" SELECT * FROM t ORDER BY id;
 1	a/*
 2	b/*
 
+# review: a star's EXCLUDE / REPLACE / RENAME inside the text is one expression too (compared as trees)
+statement ok
+CREATE TABLE phys.main.w(id INTEGER, note VARCHAR, s INTEGER, l INTEGER, j INTEGER);
+
+statement ok
+INSERT INTO phys.main.w VALUES (1, 'a', 0, 0, 0), (2, 'b', 0, 0, 0);
+
+statement ok
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id IN (SELECT id FROM (SELECT * EXCLUDE (s, l, j) FROM phys.main.w)) AND id IN (SELECT i FROM (SELECT * RENAME (id AS i, note AS n, s AS ss) FROM phys.main.w))', 'id, note');
+
+query I
+ACL ROLE "r" SELECT count(*) FROM t;
+----
+2
+
+# the golden rule: a policy text never asks for a value
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id = ?', '');
+----
+parameter
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = $1');
+----
+parameter
+
 # an object grant's mask and row filter
 statement error
 SELECT acl_grant_object('r', 'c', 'u', '{"select": true}', '', 'id, note = j AS m FROM range(3) j');
@@ -151,3 +183,33 @@ query I
 SELECT count(*) > 0 FROM acl_check_catalog('c') WHERE detail LIKE '%spec 148%';
 ----
 true
+
+# ... and refuses the read it would have shaped - it is never pasted into the statement
+statement error
+ACL ROLE "r" SELECT * FROM t;
+----
+spec 148
+
+# review: a column's name is read as a name, quoted - a declared column named with a space reads under a grant
+statement ok
+CREATE TABLE phys.main.o("odd name" INTEGER, id INTEGER);
+
+statement ok
+INSERT INTO phys.main.o VALUES (7, 1);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.o AS phys.main.o COLUMNS (id, "odd name");
+
+statement ok
+ACL ADMIN CREATE ROLE q;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE q WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.o TO ROLE q COLUMNS ("odd name");
+
+query I
+ACL ROLE "q" SELECT * FROM o;
+----
+7

@@ -142,9 +142,10 @@ The four clauses after `AS <phys>` come in any order. A `COLUMNS` item is one of
 | `name NOT NULL` / `name NULL` | expose and declare nullability (spec 048); `name = <expr> NOT NULL` is the promise that lets a masked column be a key |
 | `"odd name"`               | a quoted identifier means the name it quotes (spec 065); a quoted name containing `,` or `=` is refused |
 
-A mask, a computed column and an `RLS` predicate are each **one SQL expression**: text with a comment, an alias or
-a clause after it (`FROM`, `WHERE`, a second statement) is refused where it is written (spec 148), on a relation, a
-catalog grant, an object grant, a `REMAP` and a scalar function's template alike.
+A mask, a computed column and an `RLS` predicate are each **one SQL expression**: text with a comment left open, an
+alias, a parameter or a clause after it (`FROM`, `WHERE`, a second statement) is refused where it is written (spec
+148), on a relation, a catalog grant, an object grant, a `REMAP` and a scalar function's template alike; a stored one
+refuses the reads it would have shaped, and `acl_check_catalog` names it.
 
 Any column not listed is hidden. With no `COLUMNS` and no `RLS` the relation is an **alias**
 (RENAME in place, writable); a list made only of bare names and renames keeps the alias form; a mask,

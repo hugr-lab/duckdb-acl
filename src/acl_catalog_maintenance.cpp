@@ -682,7 +682,8 @@ private:
 				auto own = relation.own.find(path.head);
 				auto value = own != relation.own.end() && !own->second.empty() ? own->second : Ident(path.head);
 				vector<std::pair<string, LogicalType>> types;
-				if (catalog.ProbeTypes("SELECT " + value + " AS c FROM " + relation.Source(), types) &&
+				if (acl_detail::StoredExpressionsOk({value}) && // spec 148
+				    catalog.ProbeTypes("SELECT " + value + " AS c FROM " + relation.Source(), types) &&
 				    !types.empty()) {
 					string steps;
 					for (auto &step : path.steps) {

@@ -36,14 +36,29 @@ accepted by every check: the mask's select list is `j AS m`, the FROM is never s
   What the text does to the text around it shows as a tail that is no longer the one written: a comment left open,
   an unbalanced parenthesis, a clause or a second statement. Text that does not parse is refused too. A comment
   closed inside the text hides nothing and is allowed.
+
+  The two parses are compared as trees, in place (`Equals`). A copy of a star's EXCLUDE / REPLACE / RENAME sets
+  prints them in another order (review). A parameter (`?`, `$1`) is refused too, by the golden rule.
 - **Refused where it is written** (`RequireOneExpression`): `RequirePolicyFreeExpressions` (every writer of an RLS and
   a column list: relations, catalog and object grants, ALTER ... SET), a scalar function's template, and a
   reference's join expression. A REMAP item is refused by `ItemBinds`.
-- **Never spliced by a probe**: `ItemBinds`, `ProjectionSchema` (spec 026) and `PredicateError` (spec 027) judge the
-  text first. A row stored before this spec, or past it by the operator's own SQL into the policy tables, is
-  `acl_check_catalog`'s `mask_broken` / `rls_broken` / `definition_broken` with the reason. It is never run and never
-  rewritten (nothing rolls back by itself).
-- The read is unchanged. Such a text never parsed there.
+- **Never pasted by a probe.** `ItemBinds`, `ProjectionSchema` (spec 026) and `PredicateError` (spec 027) judge the
+  text first. So do the probes that re-read stored text (`StoredExpressionsOk`, verdicts kept per text):
+  - an ALTER of another field (`RelationStatements`);
+  - `ExposedTypes`;
+  - ANALYZE's re-derivation;
+  - the check's path test;
+  - the lineage definition walk.
+
+  A row stored before this spec, or past it by the operator's own SQL into the policy tables, is
+  `acl_check_catalog`'s `mask_broken` / `rls_broken` with the reason. It is never run and never rewritten (nothing
+  rolls back by itself).
+- **The read refuses such a policy** (`RequireStoredExpressions` in `LookupRelation`, `LookupSchemaAlias` and
+  `FunctionPolicyFrom`, reason `policy_error`). The review found two shapes where the read did not reliably fail: a
+  declared list's projection, and an RLS at the end of a statement.
+- **A column's name is emitted as a name.** The read quoted it only when it renamed: a declared column named `odd
+  name` read under a grant was pasted bare (review).
+- The memory store's writers (`acl_grant_table`, a scalar template) judge the same text.
 
 ## Enforcement & security
 
@@ -67,7 +82,12 @@ accepted by every check: the mask's select list is `j AS m`, the FROM is never s
   - a scalar template.
 - Allowed and read: a comment closed inside the text, a string holding comment marks, CASE, a subquery in the RLS,
   and a lambda.
-- A row written straight into the policy tables is reported by `acl_check_catalog` with spec 148's reason.
+- A row written straight into the policy tables is reported by `acl_check_catalog` with spec 148's reason, and
+  refuses the read.
+- A star's EXCLUDE / RENAME inside a subquery of the RLS passes and reads.
+- A parameter in an RLS or a mask is refused.
+- A declared column named with a space reads under a grant.
+- The memory store refuses a tail.
 
 `acl_catalog_scale.test` (spec 147): its injected mask is now refused at write.
 
@@ -77,3 +97,13 @@ accepted by every check: the mask's select list is `j AS m`, the FROM is never s
   and drop the tail instead of saying so.
 - **Judge the text in each read's shape only**: there are several shapes (REPLACE, select item, WHERE, the probes'),
   and one rule at write covers them all.
+
+## Follow-ups
+
+- The next spec moves our whole grammar onto the PEG parser (the owner, 2026-10-23: "вообще не будем разбирать текст
+  запроса вручную"):
+  - the prefix, the markers and the management statements become grammar-extension rules over the standard parser;
+  - an expression position is the engine's `Expression` rule;
+  - this spec's text check becomes "the text parses as the rule".
+- Older, noted by the review: `ParseColumnList` splits a list or struct literal at its commas (`[a, b]`,
+  `{'a': x}`). A comment before an item becomes part of its name.

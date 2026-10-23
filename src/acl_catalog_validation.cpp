@@ -8,6 +8,8 @@
 #include "acl_rewriter.hpp"
 #include "acl_types.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/expression/parameter_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
@@ -73,15 +75,64 @@ bool OneExpression(const string &text, string &problem) {
 	            placed->select_list[1]->GetAlias().GetIdentifierName() == "__acl_b" &&
 	            placed->select_list[1]->GetExpressionClass() == ExpressionClass::CONSTANT;
 	if (kept) {
-		auto first = placed->select_list[0]->Copy();
-		first->ClearAlias();
-		kept = first->ToString() == alone->select_list[0]->ToString();
+		// compared as trees, in place: a copy of a star's EXCLUDE / REPLACE / RENAME sets prints them in another order
+		placed->select_list[0]->ClearAlias();
+		kept = placed->select_list[0]->Equals(*alone->select_list[0]);
 	}
 	if (!kept) {
 		problem = "text that does not stay one expression where it is placed (a comment left open, a parenthesis)";
 		return false;
 	}
+	// the golden rule: a statement's parameters are its client's - a policy text that holds one would make every read
+	// under it ask for a value
+	bool parameter = false;
+	ParsedExpressionIterator::VisitExpression<ParameterExpression>(
+	    *alone->select_list[0], [&](const ParameterExpression &) { parameter = true; });
+	if (parameter) {
+		problem = "a parameter ($1, ?) - a policy carries values, never asks for them";
+		return false;
+	}
 	return true;
+}
+
+bool StoredExpressionsOk(const vector<string> &texts) {
+	// a verdict depends on the text alone: kept, so a read of many rows of the same policy parses it once
+	static mutex verdicts_lock;
+	static unordered_map<string, bool> verdicts;
+	for (auto &text : texts) {
+		if (text.empty()) {
+			continue;
+		}
+		{
+			lock_guard<mutex> guard(verdicts_lock);
+			auto entry = verdicts.find(text);
+			if (entry != verdicts.end()) {
+				if (!entry->second) {
+					return false;
+				}
+				continue;
+			}
+		}
+		string problem;
+		auto ok = OneExpression(text, problem);
+		lock_guard<mutex> guard(verdicts_lock);
+		if (verdicts.size() > 8192) {
+			verdicts.clear();
+		}
+		verdicts[text] = ok;
+		if (!ok) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void RequireOneExpression(const char *what, const string &text) {
+	string problem;
+	if (!text.empty() && !OneExpression(text, problem)) {
+		throw BinderException("acl admin: %s holds \"%s\", which is %s - write a single expression (spec 148)", what,
+		                      text, problem);
+	}
 }
 
 bool CatalogBackend::ProbeSchema(const string &sql, bool expression, const vector<string> &param_types,
