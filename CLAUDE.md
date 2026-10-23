@@ -947,6 +947,17 @@ probe); positions close up per object where a list narrowed; a separators-only l
 leaves an item with an expanding star (`* LIKE`, `COLUMNS()` inside an expression; not `count(t.*)`) to duckdb.
 Test `acl_listing_read_parity.test`.
 
+**Spec 147 — a big virtual catalog** (bench `test/bench/catalog_scale.py`: 10,000 tables / views / table functions,
+1,000 roles; build its catalog grants BEFORE the objects - each RLS grant probes every relation). PR 1, the read side:
+`KnownRoles` cached per policy version (`known_roles_cache`; a gateway statement asked per claimed role); the functions
+listing - `ResolveFunctions` (256 stored keys a query, `FunctionPolicyFrom` = ResolveFunction's per-row step, never
+written to the per-name cache), rows from `acl_principal_function_rows(roles, quack_door, columns)` (never set,
+2,048 a chunk, oids by `Hash<string_t>` as `OidOf` writes them), `NarrowedColumns` from `TablePolicy::granted_items`
+(no DESCRIBE but for a mask that reads a column, once per shape), `callable_cache` per role set + version,
+`VisibleFunctions` grouped before its per-function reads; the relation listings - `objects` by a semi-join, `greaders`
+/ `glists` instead of per-role self-joins, `PrincipalCapsLevels` leaves out a caps-chain level the roles hold no row
+of. Test `acl_catalog_scale.test`.
+
 **Spec 140 — a door picks up a renewed certificate**: a pair given as LOCAL files (`IsLocalCertificatePath`; the
 csi-driver's, hugr-platform spec 005) is re-read every `acl_door_certificate_refresh` s (GLOBAL, 60; 0 = once) by a
 `DoorCertificateWatcher` (`src/flight/acl_door_certificate.cpp`, OpenSSL: `CheckCertificatePair` judges the pair whole,

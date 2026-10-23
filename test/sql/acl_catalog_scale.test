@@ -1039,3 +1039,83 @@ query I
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMyIsInJvbGVzIjpbImdob3N0Il19.TFgWcdU1pXezWEaCtah6s0XdL8SFQXm5xN56eUTN9DB8hL-dpo13foY9A4iNu9mxoP6j3uKzTEW5wVxuDxgc2vBkGHZKJtcKJZ6tBIQXaboPJd6dBBNsIetROc9q2rDafFPQ6imemfpT3Md_HCIToTtOBOo5Lice3JhBYLYtDF1zcnfv5dFtsfgXa0URYknXDxkr-seemHDuFvIexzwbJjaOMe6_WuSPLPXnTXbY2BRTvQ-oRKeLmEWszEFWruD-WEo-mwIuf7YxBUeR9R4tPvr8Oo3H1fIviDlafZL-aEuLLG_kL1F4xa4c_iJ-V1de6pZGaGMBeqnzUm2CfmUdBw' SELECT count(*) FROM t;
 ----
 2
+
+# review: a cast mask is listed with the type the read binds (not as written), a masked item is named as the grant
+# writes it, and a mask is bound as ONE expression - a FROM after it runs nothing while the listing binds
+statement ok
+CREATE TABLE phys.main.w(c0 INTEGER, c1 INTEGER, c2 VARCHAR, d DECIMAL(18, 3));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG m;
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION m.fw MACRO 'SELECT * FROM phys.main.w';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION m.fx MACRO 'SELECT * FROM phys.main.w';
+
+statement ok
+ACL ADMIN CREATE ROLE masker;
+
+statement ok
+ACL ADMIN GRANT CATALOG m TO ROLE masker WITH (select) MAIN COLUMNS (C0 = c0::INT8, c1 = c1::TEXT, c2, d = d::DECIMAL);
+
+statement ok
+SELECT acl_grant_object('masker', 'm', 'fx', '{"select": true}', '', 'c0 = j AS m FROM range(3) j --, c2');
+
+query TT
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT column_name, data_type FROM acl_function_columns() WHERE function_name = 'fw' AND column_kind = 'column' ORDER BY position;
+----
+C0	BIGINT
+c1	VARCHAR
+c2	VARCHAR
+d	DECIMAL(18,3)
+
+query TT
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM fw());
+----
+C0	BIGINT
+c1	VARCHAR
+c2	VARCHAR
+d	DECIMAL(18,3)
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT count(*) FROM acl_function_columns() WHERE function_name = 'fx' AND column_kind = 'column';
+----
+0
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT * FROM fx();
+----
+
+# review: a role named `a,b` and the role set {a, b} are two keys of the caches - one never answers with the other's
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG k;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE k.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE ROLE ra;
+
+statement ok
+ACL ADMIN CREATE ROLE rb;
+
+statement ok
+ACL ADMIN CREATE ROLE "ra,rb";
+
+statement ok
+ACL ADMIN GRANT CATALOG k TO ROLE ra WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG k TO ROLE "ra,rb" WITH (insert) MAIN;
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNSIsInJvbGVzIjpbInJhIiwicmIiXX0.gimMvO0PTXqKZbE50IqXkZbftug2GjU26WgTiRrIo3GtG4jMvqzWU_jYiBiWCqfOQPY83cH-LYjpGWiLrcXMRdD1sYJ7rIDoSeU5z0G6aVwwKsZVp5HL9KpC2BPVME0vOlcS2SCmuJvgUjSjM7NI9ABdRb_4n4JCsNCM9ELaSEFlFi8VVKmAsab3ZyvFU7gazGyD5I9HHboI4iZr3-ZfKsAJhvWI7sxWqG_MM6BNgbjsyBvs5mFJ8ulBK9wiDuyJUeRm29Q76uMLaA7-WPJ2DpiAv73EdxxAVAoCHZcB5S9m-wrqJ2kcgNwILYETBTPbb4zDyIWxLOxG4azms_jcyQ' SELECT count(*) FROM t;
+----
+2
+
+statement error
+ACL ROLE "ra,rb" SELECT count(*) FROM t;
+----
+not allowed

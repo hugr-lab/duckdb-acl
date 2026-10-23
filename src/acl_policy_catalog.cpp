@@ -246,7 +246,13 @@ void CatalogBackend::EnsureFresh() {
 string CatalogBackend::RoleSig(const Principal &principal) {
 	auto roles = principal.roles;
 	std::sort(roles.begin(), roles.end());
-	return StringUtil::Join(roles, ",");
+	// spec 147 review: each role length-prefixed - joined by a separator, the role `a,b` and the role set {a, b}
+	// were one key, and the caches keyed by it answered one principal with the other's policy
+	string sig;
+	for (auto &role : roles) {
+		sig += std::to_string(role.size()) + ":" + role + ";";
+	}
+	return sig;
 }
 
 bool CatalogBackend::HasSlot(const char *slot) {
@@ -1266,8 +1272,11 @@ void CatalogBackend::ResolveFunctions(const Principal &principal, const vector<V
 			}
 		}
 	}
-	bool object_level, schema_level;
-	PrincipalCapsLevels(principal, object_level, schema_level); // the schema level is a correlated read per row
+	bool object_level = true, schema_level = true;
+	if (!missing.empty()) {
+		PrincipalCapsLevels(principal, object_level, schema_level); // the schema level is a correlated read per row
+	}
+	(void)object_level; // the rows read an object grant's columns whatever its caps: its join stays
 	static constexpr idx_t CHUNK = 256;
 	for (idx_t start = 0; start < missing.size(); start += CHUNK) {
 		auto stop = MinValue<idx_t>(start + CHUNK, missing.size());
@@ -1889,11 +1898,13 @@ void CatalogBackend::KnownRoles(const vector<string> &values, case_insensitive_s
 	if (missing.empty()) {
 		return;
 	}
-	std::set<string> found; // exact: roles compare exactly
+	auto read_at = version;                 // spec 147 review: an answer computed across a version change is not kept
+	std::set<string> found;                 // exact: roles compare exactly
+	case_insensitive_set_t found_by_driver; // a driver answers in its own spelling (spec 008)
 	if (function_mode) {
 		// a raw value is a known role iff the role_catalogs callback grants it anything
 		for (auto &grant : Grants(missing)) {
-			found.insert(grant.role);
+			found_by_driver.insert(grant.role);
 		}
 	} else {
 		auto known = Query("SELECT \"role\" FROM " + Tbl("roles") + " WHERE \"role\" IN (" + LitList(missing) +
@@ -1905,10 +1916,15 @@ void CatalogBackend::KnownRoles(const vector<string> &values, case_insensitive_s
 		}
 	}
 	lock_guard<mutex> guard(lock);
-	ClearIfOversized(known_roles_cache);
+	bool keep = version == read_at;
+	if (keep) {
+		ClearIfOversized(known_roles_cache);
+	}
 	for (auto &value : missing) {
-		bool known = found.count(value) > 0;
-		known_roles_cache[value] = known;
+		bool known = function_mode ? found_by_driver.count(value) > 0 : found.count(value) > 0;
+		if (keep) {
+			known_roles_cache[value] = known;
+		}
 		if (known) {
 			known_roles.insert(value);
 		}

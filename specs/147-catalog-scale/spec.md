@@ -120,6 +120,16 @@ projection. Spec 144's follow-up named the struct-path form of it; this is the p
    cycle the per-name cache (4,096) on every call. `VisibleFunctions` groups the (function, role) pairs before it reads
    each function once.
    PR 2 moves the probe of an object grant's mask on a function to the grant's write, as spec 026 does for relations.
+   Review of PR 1:
+   - A mask is bound as ONE parsed expression, from its printed form. Its text spliced into the DESCRIBE ran a FROM
+     written after it - a table function, as the node.
+   - A cast is bound too: its written type (`INT8`, `TEXT`, `DECIMAL`) is not the bound one.
+   - A masked column is named as the grant spells it, because REPLACE renames it.
+   - `RoleSig` length-prefixes each role. It used to join them with `,`, so the role `a,b` and the role set {a, b}
+     shared every cache keyed by it - the objects', the functions', the rights' and this listing's. That was older
+     than this spec, and the review reproduced a read through it.
+   - The new caches keep nothing computed across a version change.
+   - In function mode, known roles compare as the driver spells them.
 2. **The catalog grant's probe in one bind per chunk**: the predicate is judged against up to 200 relations at once
    (`SELECT 1 FROM (<source> WHERE false) WHERE <rls> UNION ALL …`); a chunk that binds is judged; one that does not is
    probed one by one as now (a source that does not bind judges nothing; the predicate failing on one is `false`).
@@ -179,4 +189,12 @@ listings' (a test joins them). Tests pin each verdict as written today.
 
 ## Follow-ups
 
-- Spec 148: the view read under a catalog-wide column list (above).
+- Spec 148 (security, next): a grant's mask, computed column or RLS text must parse as exactly one expression with nothing
+  after it. The write-time check (`ParseExpressionList`, the author's gate, the source gate) drops a `FROM ...` written
+  after a mask, and spec 026's probe splices the text into a statement it runs. The read refuses it (the statement
+  does not parse); the probes at write do not.
+- Spec 149: the view read under a catalog-wide column list (above).
+- spec 119's wrap: a cheap filter outside it is evaluated before its `error()`, so a listing cut by `LIMIT node+1`
+  answers short instead of refusing (older, reproduced by the review).
+- A listing prepared at the protocol level keeps the caps-chain levels decided at its rewrite, as every prepared read
+  keeps its rewrite's policy.

@@ -178,11 +178,15 @@ NarrowedColumns(DatabaseInstance *db, const TablePolicy &policy,
 	// columns, in their order, whose name the united list names; a mask's type from its text where it says it (a
 	// constant, a cast), else bound once per mask and shape. A mask naming no declared column refuses the read
 	// (REPLACE), and nothing is listed then. The row filter is not judged here, as a relation's listing does not.
-	case_insensitive_map_t<string> kept; // name -> mask ('' = as it is)
+	struct Kept {
+		string spelled; // the item's own name: a masked column is named by it (REPLACE ... AS <item>)
+		string mask;    // '' = as it is
+	};
+	case_insensitive_map_t<Kept> kept;
 	for (auto &item : policy.granted_items) {
 		auto name = item.first;
 		StringUtil::Trim(name);
-		kept[name] = item.second;
+		kept[name] = Kept {Unquoted(name), item.second};
 	}
 	string inner;
 	for (auto &column : declared) {
@@ -193,7 +197,7 @@ NarrowedColumns(DatabaseInstance *db, const TablePolicy &policy,
 		         QuoteIdentifier(Unquoted(column.name));
 	}
 	for (auto &item : kept) {
-		if (item.second.empty()) {
+		if (item.second.mask.empty()) {
 			continue;
 		}
 		bool returned = false;
@@ -205,27 +209,33 @@ NarrowedColumns(DatabaseInstance *db, const TablePolicy &policy,
 		}
 	}
 	auto mask_type = [&](const string &mask, string &type) {
+		// spec 147 review: the mask as ONE parsed expression, bound from its printed form - never its text spliced
+		// into a statement (a mask with a FROM after it ran a table function while binding), and only a constant is
+		// typed without binding (a cast's written type is not its bound one: INT8, TEXT, DECIMAL)
+		unique_ptr<ParsedExpression> expression;
 		try {
 			auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(mask);
-			if (parsed.size() == 1 && parsed[0]->GetExpressionClass() == ExpressionClass::CONSTANT) {
-				type = LogicalType::NormalizeType(parsed[0]->Cast<ConstantExpression>().GetLiteral().ToValue().type())
-				           .ToString();
-				return true;
+			if (parsed.size() != 1) {
+				return false;
 			}
-			if (parsed.size() == 1 && parsed[0]->GetExpressionClass() == ExpressionClass::CAST) {
-				type = parsed[0]->Cast<CastExpression>().TargetType().ToString();
-				return true;
-			}
+			expression = std::move(parsed[0]);
 		} catch (std::exception &) {
 			return false;
 		}
-		auto key = mask + "\x1f" + inner;
+		if (expression->GetExpressionClass() == ExpressionClass::CONSTANT) {
+			type = LogicalType::NormalizeType(expression->Cast<ConstantExpression>().GetLiteral().ToValue().type())
+			           .ToString();
+			return true;
+		}
+		auto printed = expression->ToString();
+		auto key = printed + "\x1f" + inner;
 		auto entry = mask_types.find(key);
 		if (entry == mask_types.end()) {
 			string bound;
 			try {
 				Connection con(*db);
-				auto described = con.Query("DESCRIBE SELECT " + mask + " AS m FROM (SELECT " + inner + " WHERE false)");
+				auto described =
+				    con.Query("DESCRIBE SELECT " + printed + " AS m FROM (SELECT " + inner + " WHERE false)");
 				if (!described->HasError() && described->RowCount() == 1) {
 					bound = described->Collection().GetValue(1, 0).ToString();
 				}
@@ -245,10 +255,10 @@ NarrowedColumns(DatabaseInstance *db, const TablePolicy &policy,
 			continue;
 		}
 		Column column;
-		column.name = name;
+		column.name = entry->second.mask.empty() ? name : entry->second.spelled;
 		column.type = candidate.type;
 		column.comment = candidate.comment;
-		if (!entry->second.empty() && !mask_type(entry->second, column.type)) {
+		if (!entry->second.mask.empty() && !mask_type(entry->second.mask, column.type)) {
 			return vector<Column>(); // a mask that does not bind refuses the read
 		}
 		out.push_back(std::move(column));
@@ -268,12 +278,18 @@ CallableFunctions(PolicyStore &store, acl_detail::CatalogBackend *catalog, const
 	// spec 147: kept whole per role set and policy version (a listing computes it twice, a tool lists again)
 	catalog->EnsureFresh();
 	auto cache_key = catalog->RoleSig(principal);
+	shared_ptr<const vector<acl_detail::CatalogBackend::VisibleFunction>> cached;
+	int64_t read_at;
 	{
 		lock_guard<mutex> guard(catalog->lock);
+		read_at = catalog->version;
 		auto entry = catalog->callable_cache.find(cache_key);
 		if (entry != catalog->callable_cache.end()) {
-			return *entry->second;
+			cached = entry->second;
 		}
+	}
+	if (cached) {
+		return *cached; // copied outside the lock every resolution takes
 	}
 	auto db = store.instance.lock();
 	auto visible = catalog->VisibleFunctions(principal);
@@ -296,8 +312,11 @@ CallableFunctions(PolicyStore &store, acl_detail::CatalogBackend *catalog, const
 		out.push_back(std::move(function));
 	}
 	lock_guard<mutex> guard(catalog->lock);
-	if (catalog->callable_cache.size() >= 64) {
-		catalog->callable_cache.clear(); // bounded: a role set's listing, not every role set's
+	if (catalog->version != read_at) {
+		return out; // computed across a policy change: answered, not kept
+	}
+	if (catalog->callable_cache.size() >= 16) {
+		catalog->callable_cache.clear(); // bounded: a few role sets' listings (each can be large)
 	}
 	catalog->callable_cache[cache_key] =
 	    make_shared_ptr<const vector<acl_detail::CatalogBackend::VisibleFunction>>(out);
