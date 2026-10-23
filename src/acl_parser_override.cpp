@@ -17,6 +17,8 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
+#include "duckdb/parser/grammar_extension.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -1181,6 +1183,7 @@ void RegisterAclParser(DBConfig &config, shared_ptr<PolicyStore> store) {
 	extension.parser_override = AclParserOverride;
 	auto parser_info = make_shared_ptr<AclParserInfo>(std::move(store));
 	parser_info->grammar = make_shared_ptr<AclGrammarCache>();
+	config.GetCallbackManager().Register(parser_info->grammar->Extension());
 	extension.parser_info = std::move(parser_info);
 	ParserExtension::Register(config, extension);
 }

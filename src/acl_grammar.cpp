@@ -157,16 +157,16 @@ arena_ptr<TransformProcess> StartPrefixed(PEGTransformer &transformer, ParseResu
 
 class AclPrefixGrammar final : public GrammarExtension {
 public:
-	AclPrefixGrammar() : GrammarExtension("acl_prefix", "acl: the ACL prefix (spec 150, stage 1)") {
+	AclPrefixGrammar() : GrammarExtension("acl", "acl: the ACL prefix (spec 150, stage 1)") {
 	}
 
 	vector<GrammarChange> GetChanges() const override {
 		vector<GrammarChange> changes;
 		changes.push_back(GrammarChange::AddRule(
-		    "AclPrefixedStatement <- 'ACL' 'ROLE' AclPrincipalValue AclTraceMarker* Statement", StartPrefixed, true));
+		    "AclPrefixedStatement <- 'ACL' 'ROLE' AclPrincipalValue AclTraceMarker* Statement", StartPrefixed));
 		changes.push_back(GrammarChange::AddRule("AclPrincipalValue <- StringLiteral / Identifier", nullptr, true));
 		changes.push_back(GrammarChange::AddRule("AclTraceMarker <- AclTraceWord StringLiteral", nullptr, true));
-		changes.push_back(GrammarChange::AddRule("AclTraceWord <- 'TRACE' / 'PARENT'", nullptr, true));
+		changes.push_back(GrammarChange::AddRule("AclTraceWord <- 'TRACE' / 'PARENT'"));
 		changes.push_back(GrammarChange::PrependChoice("Statement", "AclPrefixedStatement"));
 		return changes;
 	}
@@ -175,7 +175,7 @@ public:
 } // namespace
 
 struct AclGrammarCache::Impl {
-	AclPrefixGrammar grammar;
+	shared_ptr<AclPrefixGrammar> grammar = make_shared_ptr<AclPrefixGrammar>();
 	std::mutex lock;
 	//! the caller's grammar extensions, in order -> the grammar compiled with ours behind them
 	vector<pair<vector<string>, shared_ptr<CompiledGrammar>>> compiled;
@@ -189,13 +189,14 @@ struct AclGrammarCache::Impl {
 			auto &callbacks = ExtensionCallbackManager::Get(*context);
 			for (auto &name : config.active_grammar_extensions) {
 				auto extension = callbacks.FindGrammarExtension(name);
-				if (extension) {
+				// the connection switched ours on itself (CLI completion): it goes behind the others, once
+				if (extension && extension->Name() != grammar->Name()) {
 					names.push_back(extension->Name());
 					extensions.emplace_back(*extension);
 				}
 			}
 		}
-		extensions.emplace_back(grammar);
+		extensions.emplace_back(*grammar);
 		std::lock_guard<std::mutex> guard(lock);
 		for (auto &entry : compiled) {
 			if (entry.first == names) {
@@ -215,6 +216,10 @@ AclGrammarCache::AclGrammarCache() : impl(make_uniq<Impl>()) {
 }
 
 AclGrammarCache::~AclGrammarCache() {
+}
+
+shared_ptr<GrammarExtension> AclGrammarCache::Extension() const {
+	return impl->grammar;
 }
 
 bool AclGrammarCache::ParsePrefixed(const string &query, const ParserOptions &options, PegPrefix &out) {

@@ -44,9 +44,19 @@ before any statement runs. The override parses with a grammar compiled by us: th
 extensions plus ours (`CompiledGrammar::Create(vector<reference<GrammarExtension>>)`; `ParserOptions` carries the
 `context` and the `compiled_grammar`).
 
-The grammar is not registered with duckdb. So no connection can `SET active_grammar_extensions` it on, and a bare
-statement parses exactly as before (spec 067's first row). Spec 132's grammar extensions keep working under the prefix:
-the inner statements are parsed by the same compiled grammar, which includes them.
+The grammar is also registered with duckdb as `acl` (the owner, 2026-10-23: so a CLI session completes `ACL …`), and
+the override never depends on it: it adds the rules itself when the connection has not switched them on, and uses
+the connection's grammar as is when it has. Not switched on, nothing changes for a bare statement (spec 067's first
+row). Switched on, `sql_auto_complete` offers `ACL`, then `ROLE`, then the statements; a prefixed text that reaches
+duckdb's own parser - the override set to `DEFAULT` - parses to our statement and is refused at bind (acl's parser
+extension plans nothing). Spec 132's grammar extensions keep working under the prefix: the inner statements are parsed
+by the same compiled grammar, which includes them.
+
+**A connection with a grammar of its own choosing.** `CONNECT` binds a connection to a remote catalog and forwards its
+statements there; it is the connection owner's native mode (the owner, 2026-10-23), refused under every prefix
+(`statement type CONNECT is not permitted under ACL`, also `DISCONNECT`). A prefix on a CONNECT-ed connection, or under
+a dialect (`current_dialect`, refused under a prefix since spec 132), is refused from stage 2 on: nothing of ours can
+be added to their grammars, and nothing there runs as a principal. Stage 1 leaves both to the scanner.
 
 **What the rules yield.** A rule's transform (`std::function<arena_ptr<TransformProcess>(PEGTransformer &,
 ParseResult &)>`) returns typed results. duckdb parses a text one top-level statement at a time, so the prefix rule
@@ -88,8 +98,8 @@ stay the scanner's in this stage; the scanner's text checks still run first).
   rules - `StringLiteral`, `Identifier`); a token rule (`QuotedIdentifier`) cannot be named from a rule (it is a
   regex), so "quoted only" is judged on the token in stage 2; the inner statement's text, a CREATE's `sql` and the
   named parameters are set by the rule's caller, not by duckdb, for a statement inside a rule.
-- A connection that parses with a grammar of its own choosing (CONNECT-ed, a dialect) keeps the scanner in this
-  stage; stage 2 decides it (refuse, or compile ours over that grammar).
+- Completion: with `SET active_grammar_extensions = ['acl']`, `sql_auto_complete('AC')` offers `ACL`, `'ACL '` offers
+  `role`, and after the prefix the statements; a rule's keywords are suggested unless the rule suppresses them.
 
 **Open questions**
 

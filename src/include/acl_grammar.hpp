@@ -14,6 +14,8 @@
 #include "duckdb/parser/sql_statement.hpp"
 
 namespace duckdb {
+class GrammarExtension;
+
 namespace acl {
 
 //! What the prefix rule read off one batch
@@ -35,6 +37,10 @@ public:
 	//! own choosing (CONNECT-ed, a dialect) - the prototype leaves those to the scanner. Throws a
 	//! ParserException for a text the rule does not read.
 	bool ParsePrefixed(const string &query, const ParserOptions &options, PegPrefix &out);
+
+	//! The rules as a grammar extension, registered so a connection may switch them on for completion
+	//! (`SET active_grammar_extensions = ['acl']`); the override never depends on it being on
+	shared_ptr<GrammarExtension> Extension() const;
 
 private:
 	struct Impl;
