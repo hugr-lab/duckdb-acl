@@ -229,7 +229,9 @@ DROP VIRTUAL SCHEMA [IF EXISTS] <catalog>.<path> [CASCADE]
 ```
 
 - `AS <phys>` records a **live alias**: any name under the prefix resolves through it in place, a
-  table added physically is visible at once, and nothing under it can be excluded.
+  table added physically is visible at once, and nothing under it can be excluded. Its objects' columns are
+  narrowed like any object's - the catalog grant's `COLUMNS` and an object grant on `c.raw.orders` - and the
+  listings show what the read returns (spec 144).
 - `FROM <phys>` records an **expansion**: the physical schema is read once, at write time, and one
   alias-form relation record is written per object it holds. A table created physically later is
   invisible until `REFRESH`. Records may then be edited or dropped individually; a record an admin
@@ -633,7 +635,8 @@ ACL ADMIN GRANT TABLE c.customers TO ROLE audit  COLUMNS (id, address, address.t
 - **Levels and roles.** Levels narrow: an object grant never re-exposes a field the catalog grant
   dropped. A principal's roles unite: `{city}` and `{zip}` read `{city, zip}`, a visible field beats a
   masked one, and two different masks on one field are refused. Every listing, `DESCRIBE`, the DDL a
-  quack client binds, and the Arrow schema describe what is read.
+  quack client binds, and the Arrow schema describe what is read - a catalog grant's paths included, on a table
+  and on a live alias's objects alike (spec 144; a field a catalog grant masks is listed with the field's type).
 - **Writes.** A column a grant narrows stays writable, and a write touches only what the role sees:
   - an `UPDATE`/`MERGE` keeps the stored values of the hidden fields;
   - an `INSERT` leaves them NULL;

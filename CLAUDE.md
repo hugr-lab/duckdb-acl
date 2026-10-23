@@ -936,6 +936,17 @@ predicates as written then as the parser prints them; an alias reports as the al
 object + capability + roles in `union_floor`, stamped only when recorded - spec 136's floor too) and
 `acl.policy.role_union_widens{capability}`. Documented in security.md. Test `acl_role_union_audit.test`.
 
+**Spec 144 — a listing says what the read returns**: a live alias's columns follow the read's two levels (the catalog
+grant's list, the role's object grant on `alias.table` as a joined `aoc` column - `alias_visible`, only when the
+principal holds such lists, read in C++: `catalog_lists` / `alias_object_lists`; spec 145: of the roles whose caps
+chain admits `select`, else - write-only - of every role), and an object a relation names under
+the alias path is the relation's; a column some list narrows by a path or masks (`path_heads`) is listed through
+`acl_listed_type` - a mask nothing probed typed from its text (a constant's type, a cast's target, else a scalar
+source type or NULL, never a nested one) - and drops when the levels leave nothing of it (no fallback to one role's
+probe); positions close up per object where a list narrowed; a separators-only list narrows nothing; `KeepItemNames`
+leaves an item with an expanding star (`* LIKE`, `COLUMNS()` inside an expression; not `count(t.*)`) to duckdb.
+Test `acl_listing_read_parity.test`.
+
 **Spec 140 — a door picks up a renewed certificate**: a pair given as LOCAL files (`IsLocalCertificatePath`; the
 csi-driver's, hugr-platform spec 005) is re-read every `acl_door_certificate_refresh` s (GLOBAL, 60; 0 = once) by a
 `DoorCertificateWatcher` (`src/flight/acl_door_certificate.cpp`, OpenSSL: `CheckCertificatePair` judges the pair whole,

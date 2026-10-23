@@ -7,6 +7,8 @@
 #include "acl_platform.hpp"
 #include "acl_types.hpp"
 
+#include <map>
+
 namespace duckdb {
 namespace acl {
 namespace acl_detail {
@@ -433,6 +435,17 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// principal's roles, and written as a constant CASE over the stored text: no subquery for the planner to
 	// decorrelate under the listing's own
 	std::map<string, vector<string>> stated_lists;
+	// spec 144: the columns some list narrows by a path (spec 102) or masks - their type is the read's projection,
+	// which nothing probed for a catalog grant (spec 026 probes an object grant's), folded
+	std::set<string> path_heads;
+	// spec 144: does any of the principal's roles hold a catalog grant's list, or an object grant's list on an object
+	// no relation names (an object under a live alias)? Only then the alias leg narrows - and only then by that level
+	bool catalog_lists = false, alias_object_lists = false;
+	// spec 145 on the alias leg: the grant rows that read (`select`). Where only the catalog grants' caps decide it,
+	// the rows are a constant (`alias_readers`, empty = every row reads); where an object or schema grant of the
+	// principal's states caps, the caps chain is judged per alias object (`alias_caps_vary`)
+	bool alias_caps_vary = false;
+	string alias_readers;
 	if (!function_mode) {
 		auto lists_sql = "SELECT DISTINCT \"columns\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
 		                 LitList(principal.roles) + ") AND coalesce(trim(\"columns\"), '') <> ''";
@@ -449,6 +462,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 				auto name = item.first;
 				StringUtil::Trim(name);
 				string head;
+				bool path = false;
 				if (!name.empty() && name[0] == '"') {
 					for (idx_t at = 1; at < name.size(); at++) {
 						if (name[at] == '"') {
@@ -457,16 +471,90 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 								at++;
 								continue;
 							}
+							path = at + 1 < name.size();
 							break;
 						}
 						head += name[at];
 					}
 				} else {
-					head = name.substr(0, name.find_first_of(".["));
+					auto cut = name.find_first_of(".[");
+					head = name.substr(0, cut);
+					path = cut != string::npos;
 				}
 				names.push_back(StringUtil::Lower(head));
+				if (path || !item.second.empty()) {
+					path_heads.insert(StringUtil::Lower(head));
+				}
 			}
 			stated_lists[text] = std::move(names);
+		}
+		auto has = [&](const string &sql) {
+			return Query(sql)->RowCount() > 0;
+		};
+		catalog_lists = has("SELECT 1 FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
+		                    LitList(principal.roles) + ") AND coalesce(trim(\"columns\"), '') <> '' LIMIT 1");
+		alias_object_lists =
+		    HasObjectCaps() &&
+		    has("SELECT 1 FROM " + Tbl("role_object_caps") + " oc WHERE oc.\"role\" IN (" + LitList(principal.roles) +
+		        ") AND coalesce(trim(oc.\"columns\"), '') <> '' AND NOT EXISTS (SELECT 1 FROM " + Tbl("relations") +
+		        " r WHERE r.\"vcat\" = oc.\"vcat\" AND " + KeyFoldSql("r.\"vname\"") + " = " +
+		        KeyFoldSql("oc.\"vname\"") + ") LIMIT 1");
+		if (catalog_lists || alias_object_lists) {
+			// a schema grant on a live alias or above one, or an object grant under one, that states caps
+			string alias_schemas = "SELECT 1 FROM " + Tbl("schemas") + " s WHERE s.\"phys_path\" IS NOT NULL AND ";
+			alias_caps_vary =
+			    has("SELECT 1 FROM " + Tbl("role_schemas") + " sc WHERE sc.\"role\" IN (" + LitList(principal.roles) +
+			        ") AND coalesce(trim(sc.\"caps\"), '') <> '' AND EXISTS (" + alias_schemas +
+			        "s.\"vcat\" = sc.\"vcat\" AND (" + KeyFoldSql("s.\"path\"") + " = " +
+			        KeyFoldSql("sc.\"schema_path\"") + " OR " + KeyPrefixSql("s.\"path\"", "sc.\"schema_path\"") +
+			        ")) LIMIT 1") ||
+			    (HasObjectCaps() &&
+			     has("SELECT 1 FROM " + Tbl("role_object_caps") + " oc WHERE oc.\"role\" IN (" +
+			         LitList(principal.roles) + ") AND coalesce(trim(oc.\"caps\"), '') <> '' AND EXISTS (" +
+			         alias_schemas + "s.\"vcat\" = oc.\"vcat\" AND " + KeyPrefixSql("oc.\"vname\"", "s.\"path\"") +
+			         ") AND NOT EXISTS (SELECT 1 FROM " + Tbl("relations") + " r WHERE r.\"vcat\" = oc.\"vcat\" AND " +
+			         KeyFoldSql("r.\"vname\"") + " = " + KeyFoldSql("oc.\"vname\"") + ") LIMIT 1"));
+		}
+		if ((catalog_lists || alias_object_lists) && !alias_caps_vary) {
+			auto grant_rows = Query(GrantsCte(principal) + "SELECT \"vcat\", \"role\", \"caps\" FROM grants");
+			ResultRows rows(*grant_rows);
+			struct GrantRow {
+				string role;
+				bool reads;
+				bool holds; // any capability: an explicit '{}' lifts nothing, not even a write-only principal's list
+			};
+			std::map<string, vector<GrantRow>> by_catalog;
+			for (idx_t i = 0; i < rows.Count(); i++) {
+				auto caps = EffectiveCaps(rows.GetValue(2, i));
+				by_catalog[rows.GetValue(0, i).ToString()].push_back(
+				    GrantRow {rows.GetValue(1, i).ToString(), caps.count("select") > 0, !caps.empty()});
+			}
+			vector<string> narrowed, admitted;
+			for (auto &catalog : by_catalog) {
+				bool any_reads = false;
+				for (auto &row : catalog.second) {
+					any_reads = any_reads || row.reads;
+				}
+				// the rows that read, or - none does, a write-only principal - every row that holds anything
+				vector<string> roles;
+				for (auto &row : catalog.second) {
+					if (any_reads ? row.reads : row.holds) {
+						roles.push_back(Lit(row.role));
+					}
+				}
+				if (roles.size() == catalog.second.size()) {
+					continue; // every row counts: nothing to narrow
+				}
+				narrowed.push_back(Lit(catalog.first));
+				if (!roles.empty()) {
+					admitted.push_back("(g.\"vcat\" = " + Lit(catalog.first) + " AND g.\"role\" IN (" +
+					                   StringUtil::Join(roles, ", ") + "))");
+				}
+			}
+			if (!narrowed.empty()) {
+				alias_readers = " AND (g.\"vcat\" NOT IN (" + StringUtil::Join(narrowed, ", ") + ")" +
+				                (admitted.empty() ? string() : " OR " + StringUtil::Join(admitted, " OR ")) + ")";
+			}
 		}
 	}
 	auto stated = [&](const string &column_expr) {
@@ -476,14 +564,16 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 			for (auto &name : list.second) {
 				names.push_back(Lit(name));
 			}
-			cases += " WHEN " + Lit(list.first) + " THEN [" + StringUtil::Join(names, ", ") + "]::VARCHAR[]";
+			// a list of nothing but separators names no item: it narrows nothing, as the read reads it
+			cases += " WHEN " + Lit(list.first) + " THEN " +
+			         (names.empty() ? string("NULL") : "[" + StringUtil::Join(names, ", ") + "]") + "::VARCHAR[]";
 		}
 		// a list read after this text was composed matches nothing: nothing it names is kept (fail closed)
 		return cases.empty() ? string("[]::VARCHAR[]") : "CASE " + column_expr + cases + " ELSE []::VARCHAR[] END";
 	};
 	auto keeps = [&](const string &column_expr, const string &name_expr) {
-		return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = '' OR list_contains(" +
-		       stated(column_expr) + ", " + KeyFoldSql(name_expr) + "))";
+		return "(" + column_expr + " IS NULL OR trim(" + column_expr + ") = '' OR coalesce(list_contains(" +
+		       stated(column_expr) + ", " + KeyFoldSql(name_expr) + "), true))";
 	};
 	// Visible for at least one role: a principal may read what any of its roles may (spec 011). A
 	// row with no grant row at all is not an object of the catalog - it is a column of a live
@@ -494,6 +584,21 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		       " OR EXISTS (SELECT 1 FROM gcolumns gc"
 		       " WHERE " +
 		       key + " AND " + keeps("gc.cat_columns", name_expr) + " AND " + keeps("gc.obj_columns", name_expr) + "))";
+	};
+	// spec 144: a column some list narrows by a path is listed as the read projects it - the roles' lists folded over
+	// its type (spec 102's acl_listed_type, which the grant projection's rows already pass through); any other keeps
+	// its listed type (a whole-column mask's is spec 026's probe or the source's)
+	auto listed_type = [&](const string &type_expr, const string &name_expr, const string &roles_expr) {
+		if (path_heads.empty()) {
+			return type_expr;
+		}
+		vector<string> heads;
+		for (auto &head : path_heads) {
+			heads.push_back(Lit(head));
+		}
+		return "CASE WHEN " + KeyFoldSql(name_expr) + " IN (" + StringUtil::Join(heads, ", ") +
+		       ") THEN acl_listed_type(" + type_expr + ", " + name_expr + ", " + roles_expr + ") ELSE " + type_expr +
+		       " END";
 	};
 	// spec 026: what a grant's own projection produces - a mask that changes a column's type, or a
 	// computed column the object never had. Probed when the grant is written, so a listing can
@@ -718,7 +823,11 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    KeyQuotePartSql("i.\"table_name\"") + " AS table_name, " + alias_insertable + ") FROM aliases a JOIN " +
 	    itables +
 	    " i ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
-	    " WHERE len(a.parts) = 2" +
+	    " WHERE len(a.parts) = 2"
+	    // review 144: an object a relation of the catalog names is that relation's - the relation wins the read
+	    " AND NOT EXISTS (SELECT 1 FROM " +
+	    Tbl("relations") + " ar WHERE ar.\"vcat\" = a.vcat AND " + KeyFoldSql("ar.\"vname\"") + " = " +
+	    KeyFoldSql("a.path || '.' || " + KeyQuotePartSql("i.\"table_name\"")) + ")" +
 	    // spec 117: the system catalog's views the principal holds
 	    string(platform ? " UNION ALL BY NAME SELECT 'platform' AS table_catalog, p.path AS table_schema,"
 	                      " p.vname AS table_name, p.type AS table_type, 'NO' AS is_insertable_into,"
@@ -773,6 +882,48 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                        " CASE WHEN c.\"nullable\" THEN 'YES' ELSE 'NO' END WHEN " +
 	                        pk_implies("o.vcat", alias_vname, "coalesce(c.\"name\", i.\"column_name\")") +
 	                        " THEN 'NO' ELSE i.\"is_nullable\" END";
+	// spec 144: a live alias's object is read under the grants of its catalog, each role's two levels (RowPolicy): the
+	// catalog grant's list and the role's object grant on the object, under the alias - a column the read does not
+	// return is not listed. No list of the principal's names anything: nothing to narrow (the common case is free)
+	string alias_object = "a.path || '.' || " + KeyQuotePartSql("i.\"table_name\"");
+	string alias_object_join = alias_caps_vary || alias_object_lists
+	                               ? " LEFT JOIN " + Tbl("role_object_caps") +
+	                                     " aoc ON aoc.\"role\" = g.\"role\" AND aoc.\"vcat\" = g.\"vcat\" AND " +
+	                                     KeyFoldSql("aoc.\"vname\"") + " = " + KeyFoldSql(alias_object)
+	                               : string();
+	string alias_object_columns = alias_object_lists ? string("aoc.\"columns\"") : string("NULL::VARCHAR");
+	// spec 145: the levels of the roles that read the object, or - a write-only principal - of every role, as the
+	// columns surface reads them (gcolumns): a constant where the catalog grants decide (alias_readers), else the
+	// object's caps chain (object, schema, catalog) judged per row
+	string alias_grants;
+	if (alias_caps_vary) {
+		string alias_caps = "coalesce(" + string(HasObjectCaps() ? "nullif(trim(aoc.\"caps\"), ''), " : "") +
+		                    SchemaCapsExpr(alias_object, "a.vcat") + ", g.\"caps\")";
+		string alias_reads = CapsAllowSql(alias_caps, "select");
+		// an explicit '{}' holds nothing: it lifts no list, not even a write-only principal's
+		string alias_holds = "(" + alias_caps + " IS NULL OR trim(" + alias_caps + ") = '' OR regexp_matches(" +
+		                     alias_caps + ", ':\\s*true'))";
+		alias_grants = "(SELECT g.\"role\" AS role, g.\"columns\" AS cat, " + alias_object_columns + " AS obj, " +
+		               alias_reads + " AS reads, " + alias_holds + " AS holds, bool_or(" + alias_reads +
+		               ") OVER () AS any_reads FROM grants g" + alias_object_join +
+		               " WHERE g.\"vcat\" = a.vcat) ag WHERE (ag.reads OR (NOT ag.any_reads AND ag.holds))";
+	} else {
+		alias_grants = "(SELECT g.\"role\" AS role, g.\"columns\" AS cat, " + alias_object_columns +
+		               " AS obj FROM grants g" + alias_object_join + " WHERE g.\"vcat\" = a.vcat" + alias_readers +
+		               ") ag WHERE true";
+	}
+	string alias_roles = "(SELECT list(struct_pack(cat := ag.cat, obj := ag.obj, probed := NULL::VARCHAR) ORDER BY "
+	                     "ag.role) FROM " +
+	                     alias_grants + ")";
+	string alias_visible =
+	    !catalog_lists && !alias_object_lists
+	        ? string()
+	        : " AND EXISTS (SELECT 1 FROM " + alias_grants + " AND " + keeps("ag.cat", "i.\"column_name\"") +
+	              (alias_object_lists ? " AND " + keeps("ag.obj", "i.\"column_name\"") : string()) + ")";
+	// review 144: an object a relation of the catalog names is that relation's, read through it (LookupRelation wins
+	// over an alias) - the alias leg leaves it alone
+	alias_visible += " AND NOT EXISTS (SELECT 1 FROM " + Tbl("relations") + " ar WHERE ar.\"vcat\" = a.vcat AND " +
+	                 KeyFoldSql("ar.\"vname\"") + " = " + KeyFoldSql(alias_object) + ")";
 	// spec 143: an alias relation's column shows its virtual comment over its source's
 	string columns_sql =
 	    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
@@ -822,13 +973,17 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    KeyFoldSql("ip.\"column_name\"") + " = " + KeyFoldSql(read_name("rc")) +
 	    " WHERE o.form <> 'alias'"
 	    " UNION ALL BY NAME"
-	    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +
-	    KeyQuotePartSql("i.\"table_name\"") +
-	    " AS table_name)"
+	    // a column whose levels' paths leave nothing of it (`addr.city` at one, `addr.secret` at the other) is no
+	    // column of the read - acl_listed_type answers NULL for it
+	    " SELECT * FROM (SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +
+	    KeyQuotePartSql("i.\"table_name\"") + " AS table_name, " +
+	    listed_type("i.\"data_type\"", "i.\"column_name\"", alias_roles) +
+	    " AS data_type)"
 	    " FROM aliases a JOIN " +
 	    icolumns +
 	    " i ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
-	    " WHERE len(a.parts) = 2";
+	    " WHERE len(a.parts) = 2" +
+	    alias_visible + ") __acl_alias_columns WHERE data_type IS NOT NULL";
 	auto path = [](const string &alias) {
 		return "CASE WHEN " + alias + ".vschema = 'main' THEN " + alias + ".vname ELSE " + alias +
 		       ".vschema || '.' || " + alias + ".vname END";
@@ -851,8 +1006,15 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                  " pc WHERE pc.\"role\" = gc.\"role\" AND pc.\"vcat\" = gc.vcat AND pc.\"vname\" = gc.vname"
 	                  " AND pc.\"name\" = gp.name)) ORDER BY gc.\"role\") FROM gcolumns gc"
 	                  " WHERE gc.vcat = gp.vcat AND gc.vname = gp.vname)";
-	string effective_columns =
-	    "SELECT * FROM lcols l WHERE " + column_visible("l.table_catalog", listed_path, "l.column_name") +
+	string relation_roles = "(SELECT list(struct_pack(cat := gc.cat_columns, obj := gc.obj_columns, probed := "
+	                        "NULL::VARCHAR) ORDER BY gc.\"role\") FROM gcolumns gc WHERE gc.vcat = l.table_catalog AND"
+	                        " gc.vname = " +
+	                        listed_path + ")";
+	string effective_columns_body =
+	    (path_heads.empty() ? string("SELECT * FROM lcols l WHERE ")
+	                        : "SELECT * REPLACE (" + listed_type("l.data_type", "l.column_name", relation_roles) +
+	                              " AS data_type) FROM lcols l WHERE ") +
+	    column_visible("l.table_catalog", listed_path, "l.column_name") +
 	    " AND NOT EXISTS (SELECT 1 FROM gprojection gp WHERE gp.vcat = l.table_catalog AND gp.vname = " + listed_path +
 	    " AND gp.name = l.column_name)" +
 	    " UNION ALL BY NAME"
@@ -862,10 +1024,12 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    KeyLeafSql("gp.vname") +
 	    " AS table_name,"
 	    " gp.name AS column_name, gp.pos + 1 AS ordinal_position,"
-	    " acl_exposed_type(coalesce(CASE WHEN s.data_type IS NULL THEN NULL ELSE acl_listed_type(s.data_type,"
+	    // a column the source has is typed by the roles' union over it - NULL (dropped below) when the union leaves
+	    // nothing of it, never one role's own probe, which may name a field another level hides (review 144)
+	    " acl_exposed_type(CASE WHEN s.data_type IS NULL THEN gp.type ELSE acl_listed_type(s.data_type,"
 	    " gp.name, " +
 	    roles_of +
-	    ") END, gp.type), o.strip_alias, o.enums_to_varchar) AS data_type,"
+	    ") END, o.strip_alias, o.enums_to_varchar) AS data_type,"
 	    // spec 143: a column the grant names (masked or not) is the object's column - its comment and tags with it
 	    " s.\"COLUMN_COMMENT\" AS \"COLUMN_COMMENT\", s.acl_tags AS acl_tags"
 	    " FROM gprojection gp JOIN objects o ON o.vcat = gp.vcat AND " +
@@ -877,6 +1041,14 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                " table_name, pc.name AS column_name, pc.pos AS ordinal_position, pc.type AS data_type,"
 	                " 'YES' AS is_nullable FROM pcolumns pc"
 	              : string());
+	// spec 144: a column the levels' union leaves nothing of drops out, and - where a list narrowed anything - the
+	// positions close up per object, as the read's (spec 036: a consumer counts them)
+	string effective_columns =
+	    stated_lists.empty()
+	        ? effective_columns_body
+	        : "SELECT * REPLACE (CAST(row_number() OVER (PARTITION BY table_catalog, table_schema, table_name ORDER BY"
+	          " ordinal_position, column_name) AS INTEGER) AS ordinal_position) FROM (" +
+	              effective_columns_body + ") __acl_kept WHERE data_type IS NOT NULL";
 	if (surface == "columns") {
 		return prelude + named("SELECT * EXCLUDE (acl_tags) FROM (" + effective_columns + ")", table_names);
 	}

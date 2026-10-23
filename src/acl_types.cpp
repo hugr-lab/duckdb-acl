@@ -2,6 +2,9 @@
 // listings' spelling of it (acl_exposed_type).
 
 #include "acl_types.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/parser.hpp"
 
 #include "acl_policy_catalog.hpp"
 
@@ -155,6 +158,30 @@ void ListedTypeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 							return probed;
 						}
 					}
+				}
+				// spec 144: no probe (a catalog grant's mask, an object grant's on a live alias's object - nothing is
+				// probed for either) - the type the mask's own text says: a constant's, a cast's target. A mask that
+				// reads columns cannot be typed without binding it: the source's type where that names no field (a
+				// scalar), else NULL - never a nested source type, whose field names the grant may hide
+				for (auto &entry : own) {
+					auto at = entry.first ? NodeAt(*entry.first, path) : nullptr;
+					if (!at || !at->masked) {
+						continue;
+					}
+					auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(at->mask);
+					if (parsed.size() == 1 && parsed[0]->GetExpressionClass() == ExpressionClass::CONSTANT) {
+						return LogicalType::NormalizeType(
+						    parsed[0]->Cast<ConstantExpression>().GetLiteral().ToValue().type());
+					}
+					if (parsed.size() == 1 && parsed[0]->GetExpressionClass() == ExpressionClass::CAST) {
+						return TransformStringToLogicalType(parsed[0]->Cast<CastExpression>().TargetType().ToString(),
+						                                    context);
+					}
+					LogicalType own_type;
+					if (acl_detail::TypeAtPath(source, path, own_type) && !own_type.IsNested()) {
+						return own_type;
+					}
+					break;
 				}
 				return LogicalType::SQLNULL;
 			};
