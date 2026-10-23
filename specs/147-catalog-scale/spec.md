@@ -1,0 +1,145 @@
+# Spec 147: a big virtual catalog - what it costs, and what that showed
+
+- **Status**: draft
+- **Date**: 2026-10-23
+- **Author**: hugr lab (the owner, 2026-10-23: "10к таблиц/функций представлений, причем замер как по памяти так и по
+  времени ddl/dml и при запросах данных и при большом количестве ролей")
+
+## Summary
+
+`test/bench/catalog_scale.py` builds ONE virtual catalog - 10,000 tables, 10,000 views and 10,000 table functions over
+100 schemas, on 10,000 physical tables of 11 columns - and a policy of 1,000 roles: each a catalog grant with a row
+filter and a column list, ten object grants each (10,000 rows). It measures, as principals holding 1, 10 and 100 of
+the roles: the policy's writes as the catalog grows, the node's memory, reads and DML cold and warm, the listings, and
+what a policy write costs the next read. Most of it scales; seven places do not. This spec records the numbers and
+fixes those seven.
+
+## Method
+
+Every measured step is its own CLI process (`/usr/bin/time` for its maximum RSS, `duckdb_memory()` at its end); a
+process that only opens the sources and the policy is measured the same way and subtracted. The policy is written in
+chunks of 1,000 statements, a process each, so a write's cost is seen as the catalog grows. A gateway principal
+(`ACL TOKEN`, RS256, the issuer by discovery). macOS arm64, release build, main at 3260795.
+
+## Results
+
+**Writes** (per statement, the catalog growing from empty):
+
+| what | count | ms each (first chunk → last) |
+|---|---|---|
+| role | 1,000 | 1.7 |
+| catalog grant (RLS + list), before any object | 1,000 | 3.2 |
+| virtual table | 10,000 | 54 → 70 |
+| virtual view | 10,000 | 30 → 46 |
+| table function | 10,000 | 45 → 51 |
+| object grant (list) | 10,000 | 52 |
+| catalog grant with RLS, at full size | 5 | **8,757** |
+
+The policy catalog file: 21 MiB. The node with the sources and the policy open: 0.25 s, 314 MiB.
+
+**Reads and DML** (first = the object's first resolution, warm = cached; a gateway statement, `ACL TOKEN`):
+
+| statement | 1 role | 10 roles | 100 roles |
+|---|---|---|---|
+| a table, first / warm | 44 / 1 ms | 53 / 5 ms | 138 / 44 ms |
+| a view | 27 / 1 ms | 34 / 6 ms | 69 / 45 ms |
+| a table function | 14 / 1 ms | 19 / 5 ms | 62 / 45 ms |
+| a join of two tables | 55 / 1 ms | 69 / 5 ms | 107 / 46 ms |
+| INSERT under the row filter | 57 / 1 ms | 69 / 5 ms | 154 / 45 ms |
+| UPDATE / DELETE | 39 / 1, 27 / 1 ms | 44 / 4, 31 / 5 ms | 89 / 55, 73 / 43 ms |
+| 2,000 distinct tables, one statement each | 28 ms each | 33 ms | 75 ms |
+| a policy write, then the next statement | 54 → 42 ms | 75 → 56 ms | 58 → 132 ms |
+
+(The same 2,000 reads written natively: 0.1 ms each.)
+
+**Memory**: what the ACL holds beyond the same reads written natively (`SELECT count(*) FROM (SELECT c0, c1, tenant
+FROM t WHERE tenant = 0)`), by the number of distinct objects read: 1,000 → +78 MiB, 4,000 → +107 MiB, 8,000 → +118
+MiB - bounded (the resolver's caches hold 4,096 entries, the templates 256). The rest of a node's RSS is duckdb's
+buffer pool holding what was read (2 GiB of `BASE_TABLE` after 8,000 tables) - under its memory limit.
+
+**Listings** (30,000 objects; warm time, the process's maximum RSS):
+
+| listing | rows | 1 role | 10 roles | 100 roles |
+|---|---|---|---|---|
+| `information_schema.tables` | 20,000 | 0.13 s, 0.5 GiB | 0.19 s, 0.9 GiB | 0.86 s, **5.0 GiB** |
+| `information_schema.columns` of one table | 4 | 0.75 s, 0.6 GiB | 0.86 s, 1.4 GiB | 3.1 s, **8.9 GiB** |
+| `information_schema.columns` of one schema | 800 | 0.74 s, 0.6 GiB | 0.94 s, 1.4 GiB | 2.8 s, **9.3 GiB** |
+| `information_schema.columns` | 80,000 | 0.86 s, 1.5 GiB | 1.15 s, 2.3 GiB | 4.0 s, **9.9 GiB** |
+| `duckdb_tables()` | 10,000 | 1.0 s, 1.2 GiB | 1.3 s, 2.1 GiB | 4.2 s, **10.8 GiB** |
+| `SHOW ALL TABLES` | 20,000 | 0.62 s, 1.0 GiB | 0.80 s, 1.7 GiB | 3.4 s, **9.4 GiB** |
+| `duckdb_functions()` | - | **over 120 s** | over 120 s | over 120 s |
+
+## Findings
+
+1. **`duckdb_functions()` / `acl_function_columns()` resolve every visible function on its own**
+   (`CallableFunctions`, spec 098/115): one policy query per function on a cold cache - minutes at 10,000 functions,
+   2 s at 300.
+2. **A catalog grant with a row filter probes the predicate against every relation** (`CatalogPredicateChecked`,
+   spec 027: two probe queries each) - 0.3 ms a relation, 8.8 s a grant at 20,000 relations.
+3. **A relation's write scans the source's whole catalog**: `SpellPhysical` (spec 116) and `PhysicalObjectExists`
+   filter `duckdb_tables()` / `duckdb_views()`, which enumerate every table of every attached database first - a
+   table's write 14 ms over 1,000 physical tables, 54-70 ms over 10,000.
+4. **A gateway statement asks the policy, per claimed role, whether the role exists** (`RolesFor` → `RoleKnown` →
+   `CatalogBackend::KnownRoles`, uncached; the rights beside it are cached): a warm statement 1 ms with one role, 5 ms
+   with ten, 44 ms with a hundred. A session pays it once, at open.
+5. **An object's first resolution grows with the catalog** (10 ms at 900 objects, 28 ms at 30,000; 75 ms with 100
+   roles): the resolver's query folds every name it compares (`KeyFoldSql`, spec 116) over the whole `relations` /
+   grants tables. Paid once per object, role set and policy version - and again for every object after any policy
+   write.
+6. **A write spells its name against every stored name of its catalog** (`NamesUnder`, five folded scans) - the slow
+   growth of every write (a view 30 → 46 ms over 10,000).
+7. **A listing's memory grows with objects × roles**: `gcolumns_all` (spec 145) joins every relation with every grant
+   row of the principal's roles - 20,000 x 100 = 2 million rows, each with its caps chain (`SchemaCapsExpr`, a
+   correlated subquery a row) and both lists, then a self-`NOT EXISTS` and a per-column `EXISTS` over them: 9-11 GiB
+   and 3-4 s a listing with 100 roles, though the hundred grants carry ONE column list between them.
+
+Found on the way, a correctness defect of its own: a view read under a catalog-wide column list naming a column the
+view does not have fails (`Referenced column "c1" not found`) - the grant's items become the view's explicit
+projection. Spec 144's follow-up named the struct-path form of it; this is the plain one. Its own spec (148).
+
+## Design (the fixes)
+
+1. **Functions listed in one resolution**: `CatalogBackend::ResolveFunctions(principal, keys)` - the resolver's query
+   once for every visible function, grouped per function in C++ through the same per-row step `ResolveFunction`
+   uses (caps, the select rows' `GrantUnion`, `ApplyFunctionGrantPolicy`), the results put in its cache.
+   `CallableFunctions` calls it instead of one `Resolve*Function` each. Same verdict per function by construction.
+2. **The catalog grant's probe in one bind per chunk**: the predicate is judged against up to 200 relations at once
+   (`SELECT 1 FROM (<source> WHERE false) WHERE <rls> UNION ALL …`); a chunk that binds is judged; one that does not is
+   probed one by one as now (a source that does not bind judges nothing; the predicate failing on one is `false`).
+3. **A physical name looked up, not listed**: `SpellPhysical` and `PhysicalObjectExists` ask the catalog
+   (`Catalog::GetEntry` on the database and schema, case-insensitively, as `PhysicalObjectReadings` does since spec
+   137) instead of filtering `duckdb_tables()` / `duckdb_views()`.
+4. **Known roles cached per policy version**: `KnownRoles` answers from a map beside `rights_cache`, cleared with it.
+5. **The resolver's comparisons through a folded key column**: a generated column (or an index) with the folded key on
+   `relations`, `functions`, `role_object_caps`, `schemas`, kept by the writers - the comparisons read it instead of
+   folding every row. (Measured before deciding: if (5) is a schema step, it is the v24 step with `min_reader` 23.)
+6. **`NamesUnder` reads the same folded column.**
+7. **A listing joins grant shapes, not roles**: the catalog grants of the principal's roles are folded by what decides
+   a column's visibility - catalog, caps' `select`, the list - before they meet the relations (one row per distinct
+   shape, not per role); the role stays only where an object grant or a schema grant is the role's own (those rows are
+   joined by role, as few as there are such grants). `gcolumns` keeps its meaning: "visible for at least one reading
+   row". (The projection leg keeps its per-role rows - spec 026's `grant_columns` are per role.)
+
+## Enforcement & security
+
+Every fix keeps the verdict: (1) runs the same per-row step over the same rows; (2) asks the same question of each
+relation and falls back to the one-by-one probe whenever a chunk does not bind; (3) finds the same entry duckdb's own
+bind would; (4) caches what the policy says until its version changes, as every other resolver cache; (5)/(6) compare
+the same folded keys; (7) unites the same lists - the union of a set of rows is the union of its distinct rows. Tests pin each verdict as written today.
+
+## Testing
+
+- The bench: `test/bench/catalog_scale.py` (defaults = the numbers above), its results in this spec after the fixes.
+- sqllogictest: the functions listing of a principal over many functions and grants (narrowed, `{}`, denied) equals
+  what one-by-one resolution answered; a catalog grant's `rls_checked` over relations where some do not bind, one where
+  the predicate fails, a chunk boundary; a physical name spelled in another case adopted; a role unknown then created
+  is known after the write.
+
+## Alternatives considered
+
+- **Bigger caches** for (5): the first touch stays the cost; a write still empties them.
+- **Skipping spec 027's probe for catalog grants**: drops a check the model relies on.
+
+## Follow-ups
+
+- Spec 148: the view read under a catalog-wide column list (above).
