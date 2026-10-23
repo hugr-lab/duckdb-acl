@@ -71,6 +71,11 @@ string EntryItem(const std::pair<string, string> &entry) {
 }
 
 bool ItemBinds(CatalogBackend &catalog, const string &source, const string &item, string &error) {
+	string problem;
+	if (!acl_detail::OneExpression(item, problem)) { // spec 148: never spliced into the probe
+		error = "the expression is " + problem + " (spec 148: one expression)";
+		return false;
+	}
 	return Binds(catalog, "SELECT " + item + " AS __acl_probe FROM " + source + " WHERE false", error);
 }
 

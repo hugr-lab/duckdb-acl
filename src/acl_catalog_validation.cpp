@@ -7,10 +7,59 @@
 #include "acl_policy_catalog.hpp"
 #include "acl_rewriter.hpp"
 #include "acl_types.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/simplified_token.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 
 namespace duckdb {
 namespace acl {
 namespace acl_detail {
+
+bool OneExpression(const string &text, string &problem) {
+	for (auto &token : Parser::Tokenize(text)) {
+		if (token.type == SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT) {
+			problem = "a comment - it hides what follows it where the text is placed";
+			return false;
+		}
+	}
+	vector<unique_ptr<SQLStatement>> statements;
+	try {
+		Parser parser(ParserOptions::Builtin());
+		parser.ParseQuery("SELECT " + text);
+		statements = std::move(parser.statements);
+	} catch (std::exception &) {
+		// what does not parse alone may parse where it is spliced (an unbalanced parenthesis closes the
+		// statement around it): refused as well
+		problem = "text that does not parse as one expression";
+		return false;
+	}
+	if (statements.size() != 1 || statements[0]->type != StatementType::SELECT_STATEMENT) {
+		problem = "more than one statement";
+		return false;
+	}
+	auto &node = *statements[0]->Cast<SelectStatement>().node;
+	if (node.type != QueryNodeType::SELECT_NODE || !node.modifiers.empty() || !node.cte_map.map.empty()) {
+		problem = "a query, not an expression";
+		return false;
+	}
+	auto &select = node.Cast<SelectNode>();
+	if (select.select_list.size() != 1) {
+		problem = "more than one expression";
+		return false;
+	}
+	if (select.select_list[0]->HasAlias()) {
+		problem = "an alias";
+		return false;
+	}
+	if ((select.from_table && select.from_table->type != TableReferenceType::EMPTY_FROM) || select.where_clause ||
+	    !select.groups.group_expressions.empty() || !select.groups.grouping_sets.empty() || select.having ||
+	    select.qualify || select.sample) {
+		problem = "a clause after it (FROM, WHERE, GROUP BY, ...)";
+		return false;
+	}
+	return true;
+}
 
 bool CatalogBackend::ProbeSchema(const string &sql, bool expression, const vector<string> &param_types,
                                  vector<std::pair<string, string>> &out) {
@@ -124,6 +173,13 @@ string CatalogBackend::PredicateError(const string &source, const string &rls, b
 	if (rls.empty() || source.empty()) {
 		return string();
 	}
+	string problem;
+	if (!OneExpression(rls, problem)) {
+		if (checked) {
+			*checked = true; // judged: never spliced into a probe
+		}
+		return "the predicate is " + problem + " (spec 148: one expression)";
+	}
 	auto instance = Db();
 	Connection con(*instance);
 	auto base = con.Query("SELECT * FROM " + source + " WHERE false");
@@ -198,6 +254,25 @@ string CatalogBackend::ProjectionSchema(const string &source, const string &colu
                                         vector<std::pair<string, string>> &out, bool *checked) {
 	if (checked) {
 		*checked = false;
+	}
+	// spec 148: nothing is spliced into the probe that is not one expression - a FROM written after a mask bound its
+	// table function here, as the node, before the shape was refused
+	string problem;
+	for (auto &item : ParseColumnList(column_csv)) {
+		if (!item.second.empty() && !OneExpression(item.second, problem)) {
+			if (checked) {
+				*checked = true;
+			}
+			return "\"" + item.first + "\" is " + problem + " (spec 148: one expression)";
+		}
+	}
+	for (auto &item : own) {
+		if (!item.second.empty() && !OneExpression(item.second, problem)) {
+			if (checked) {
+				*checked = true;
+			}
+			return "the object's \"" + item.first + "\" is " + problem + " (spec 148: one expression)";
+		}
 	}
 	vector<string> items;
 	// spec 102: items are grouped by column first, so a path into one compiles to what the role reads

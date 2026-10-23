@@ -100,6 +100,7 @@ vector<string> CatalogBackend::ColumnSchemaStatements(const string &vcat, const 
 
 using acl_detail::CatalogBackend;
 using acl_detail::Lit;
+using acl_detail::OneExpression;
 
 namespace {
 
@@ -1071,9 +1072,22 @@ void RequireNotPolicyStore(CatalogBackend &catalog, const char *what, const stri
 	}
 }
 
+//! spec 148: a policy expression is one expression - refused where it is written, with what is wrong
+void RequireOneExpression(const char *what, const string &text) {
+	string problem;
+	if (!text.empty() && !OneExpression(text, problem)) {
+		throw BinderException("acl admin: %s holds \"%s\", which is %s - write a single expression (spec 148)", what,
+		                      text, problem);
+	}
+}
+
 //! An RLS predicate and a column list (masks, computed columns) of a definition or a grant
 void RequirePolicyFreeExpressions(CatalogBackend &catalog, const char *what, const string &rls,
                                   const vector<std::pair<string, string>> &columns) {
+	RequireOneExpression(what, rls);
+	for (auto &column : columns) {
+		RequireOneExpression(what, column.second);
+	}
 	if (!rls.empty()) {
 		RequireNotPolicyStore(catalog, what, string(), false, rls, true);
 	}
@@ -1575,6 +1589,7 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 		                            "both",
 		                            name);
 	}
+	RequireOneExpression("the reference's join expression", expr); // spec 148
 	bool to_function = StringUtil::CIEquals(to_kind, "function");
 	if (pairs.empty() && expr.empty() && args.empty()) {
 		// a condition may be left out only when the arguments are the whole relationship: the function
@@ -2267,6 +2282,9 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 	RequireCatalog(catalog, "acl_add_function");
 	RequireNotReserved(vname);
 	if (form == "macro") {
+		if (kind == "scalar") {
+			RequireOneExpression("the scalar function's template", template_sql); // spec 148
+		}
 		RequireNotPolicyStore(*catalog, "the function's template", string(), false, template_sql, kind == "scalar",
 		                      CatalogBackend::DeclaredTypes(params));
 	}
