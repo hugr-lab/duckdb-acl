@@ -1,6 +1,6 @@
 # Spec 144: a listing says what the read returns - live aliases, struct paths, star filters
 
-- **Status**: accepted
+- **Status**: implemented
 - **Date**: 2026-10-23
 - **Author**: hugr lab (found by spec 143's reviews; accepted by the owner 2026-10-23)
 
@@ -41,8 +41,9 @@ the right columns and names every one of them after the pattern. This spec makes
 - **Struct paths in a listed type**: a column some stored list narrows by a path (`addr.city`, `items[].price`) is
   listed through `acl_listed_type` with the roles' lists (`roles_of`, as the projection leg already does) - on the
   relation legs and the alias leg alike; a column no path narrows keeps its listed type (a whole-column mask's type
-  stays what spec 026's probe or the source says - `acl_listed_type` has no probe for a catalog mask). Which columns
-  a path narrows is read with the lists, in C++.
+  stays what spec 026's probe or the source says). Which columns a path narrows is read with the lists, in C++. A
+  field a catalog grant masks (`addr.secret = '***'`) has no probe: `acl_listed_type` lists it with the field's own
+  type (it answered SQL NULL).
 - **Star filters keep duckdb's names**: `KeepItemNames` leaves alone an item whose root (under one `NOT`) is a
   function with a star as its first argument - duckdb's `TryTransformStarLike` shape, which expands to the columns.
 - Not here: a catalog grant's mask that changes a live alias column's type is still listed with the source's type
@@ -57,12 +58,12 @@ the right columns and names every one of them after the pattern. This spec makes
 
 ## Testing
 
-- sqllogictest `acl_listing_read_parity.test` (new): for each - a live alias under a catalog grant's list, under an
-  object grant's on one alias object, under both, under two roles (one unrestricted); a catalog grant's struct path
-  on a relation and on an alias object, an object grant's (unchanged), a path under a mask; `SELECT * LIKE`, `ILIKE`,
-  `NOT LIKE`, `SIMILAR TO` under `ACL ROLE` - the listing (information_schema.columns, duckdb_columns, DESCRIBE)
-  compared with the read's columns and types.
-- Flight e2e: GetTables' promised schema for an alias object under a narrowing grant has the read's columns.
+- sqllogictest `acl_listing_read_parity.test` (new): a live alias under a catalog grant's list, under an object
+  grant's on one alias object, under both, under two roles (a token naming both; one unrestricted); a catalog grant's
+  struct path on a relation and on an alias object, a masked field, an object grant's path (unchanged); `SELECT *
+  LIKE`, `NOT LIKE`, `ILIKE`, `SIMILAR TO` under `ACL ROLE` - each listing compared with what the read returns.
+- Flight e2e (`run.sh`): GetTables' promised schema for a live alias object under an object grant has the read's
+  columns.
 
 ## Alternatives considered
 

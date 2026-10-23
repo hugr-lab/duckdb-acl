@@ -156,6 +156,12 @@ void ListedTypeFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 						}
 					}
 				}
+				// spec 144: no probe (a catalog grant's mask is never probed per object) - the field's own type, the
+				// nearest the listing can say without binding the mask
+				LogicalType own_type;
+				if (acl_detail::TypeAtPath(source, path, own_type)) {
+					return own_type;
+				}
 				return LogicalType::SQLNULL;
 			};
 			auto type = acl_detail::ProjectedType(*node, source, string(), mask_type);

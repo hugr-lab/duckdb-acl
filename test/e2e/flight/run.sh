@@ -773,12 +773,19 @@ echo "SET GLOBAL acl_audit_level = 'decisions';" >&3
 
 # --- spec 143: a live alias schema's object written in another case than its own is the same object - described,
 # and labelled as the listing names it
-echo "CREATE TABLE staging.events(kind VARCHAR); COMMENT ON COLUMN staging.events.kind IS 'what happened';" >&3
+echo "CREATE TABLE staging.events(kind VARCHAR, secret VARCHAR); COMMENT ON COLUMN staging.events.kind IS 'what happened';" >&3
 server_says made "SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'staging' AND table_name = 'events'" >/dev/null
 for sql in "SELECT KIND FROM stage.EVENTS" "SELECT kind FROM stage.events"; do
 	got="$(ACL_SHOW_DESCRIBED=1 ask "$sql")"
 	echo "$got" | grep -q "|c.stage.events|comment:what happened|'" || fail "a live alias object's origin (\"$sql\"): $got"
 done
+# spec 144: an object grant on the alias object narrows it - GetTables' promised schema has the read's columns only
+server_says narrowed "SELECT acl_grant_object('analyst', 'c', 'stage.events', '{\"select\": true}', '', 'kind')::VARCHAR" >/dev/null
+got="$(ask "@tables_schema:events")"
+echo "$got" | grep -q "\['kind:string'\]" || fail "a live alias object's promised schema under an object grant: $got"
+got="$(ask "SELECT * FROM stage.events")"
+echo "$got" | grep -q "secret" && fail "the read returned a column the grant hides: $got"
+server_says unnarrowed "SELECT acl_revoke_object('analyst', 'c', 'stage.events')::VARCHAR" >/dev/null
 echo "DROP TABLE staging.events;" >&3
 
 # --- spec 143: a source's tags as duckdb:tag:<key> - a DuckLake table's (DuckLake keeps a table's tags; no SQL

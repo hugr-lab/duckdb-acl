@@ -433,6 +433,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// principal's roles, and written as a constant CASE over the stored text: no subquery for the planner to
 	// decorrelate under the listing's own
 	std::map<string, vector<string>> stated_lists;
+	std::set<string> path_heads; // spec 144: the columns some list narrows by a path (spec 102), folded
 	if (!function_mode) {
 		auto lists_sql = "SELECT DISTINCT \"columns\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
 		                 LitList(principal.roles) + ") AND coalesce(trim(\"columns\"), '') <> ''";
@@ -449,6 +450,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 				auto name = item.first;
 				StringUtil::Trim(name);
 				string head;
+				bool path = false;
 				if (!name.empty() && name[0] == '"') {
 					for (idx_t at = 1; at < name.size(); at++) {
 						if (name[at] == '"') {
@@ -457,14 +459,20 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 								at++;
 								continue;
 							}
+							path = at + 1 < name.size();
 							break;
 						}
 						head += name[at];
 					}
 				} else {
-					head = name.substr(0, name.find_first_of(".["));
+					auto cut = name.find_first_of(".[");
+					head = name.substr(0, cut);
+					path = cut != string::npos;
 				}
 				names.push_back(StringUtil::Lower(head));
+				if (path) {
+					path_heads.insert(StringUtil::Lower(head));
+				}
 			}
 			stated_lists[text] = std::move(names);
 		}
@@ -494,6 +502,21 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		       " OR EXISTS (SELECT 1 FROM gcolumns gc"
 		       " WHERE " +
 		       key + " AND " + keeps("gc.cat_columns", name_expr) + " AND " + keeps("gc.obj_columns", name_expr) + "))";
+	};
+	// spec 144: a column some list narrows by a path is listed as the read projects it - the roles' lists folded over
+	// its type (spec 102's acl_listed_type, which the grant projection's rows already pass through); any other keeps
+	// its listed type (a whole-column mask's is spec 026's probe or the source's)
+	auto listed_type = [&](const string &type_expr, const string &name_expr, const string &roles_expr) {
+		if (path_heads.empty()) {
+			return type_expr;
+		}
+		vector<string> heads;
+		for (auto &head : path_heads) {
+			heads.push_back(Lit(head));
+		}
+		return "CASE WHEN " + KeyFoldSql(name_expr) + " IN (" + StringUtil::Join(heads, ", ") +
+		       ") THEN acl_listed_type(" + type_expr + ", " + name_expr + ", " + roles_expr + ") ELSE " + type_expr +
+		       " END";
 	};
 	// spec 026: what a grant's own projection produces - a mask that changes a column's type, or a
 	// computed column the object never had. Probed when the grant is written, so a listing can
@@ -773,6 +796,21 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                        " CASE WHEN c.\"nullable\" THEN 'YES' ELSE 'NO' END WHEN " +
 	                        pk_implies("o.vcat", alias_vname, "coalesce(c.\"name\", i.\"column_name\")") +
 	                        " THEN 'NO' ELSE i.\"is_nullable\" END";
+	// spec 144: a live alias's object is read under the grants of its catalog, each role's two levels (RowPolicy): the
+	// catalog grant's list and the role's object grant on the object, under the alias - a column the read does not
+	// return is not listed. No list of the principal's names anything: nothing to narrow (the common case is free)
+	string alias_object = "a.path || '.' || " + KeyQuotePartSql("i.\"table_name\"");
+	string alias_object_columns = HasObjectCaps()
+	                                  ? "(SELECT max(aoc.\"columns\") FROM " + Tbl("role_object_caps") +
+	                                        " aoc WHERE aoc.\"role\" = g.\"role\" AND aoc.\"vcat\" = g.\"vcat\" AND " +
+	                                        KeyFoldSql("aoc.\"vname\"") + " = " + KeyFoldSql(alias_object) + ")"
+	                                  : string("NULL::VARCHAR");
+	string alias_roles = "(SELECT list(struct_pack(cat := g.\"columns\", obj := " + alias_object_columns +
+	                     ", probed := NULL::VARCHAR) ORDER BY g.\"role\") FROM grants g WHERE g.\"vcat\" = a.vcat)";
+	string alias_visible = stated_lists.empty() ? string()
+	                                            : " AND EXISTS (SELECT 1 FROM grants g WHERE g.\"vcat\" = a.vcat AND " +
+	                                                  keeps("g.\"columns\"", "i.\"column_name\"") + " AND " +
+	                                                  keeps(alias_object_columns, "i.\"column_name\"") + ")";
 	// spec 143: an alias relation's column shows its virtual comment over its source's
 	string columns_sql =
 	    string("SELECT i.* REPLACE (o.vcat AS table_catalog, o.vschema AS table_schema, o.vname AS table_name,"
@@ -823,12 +861,14 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	    " WHERE o.form <> 'alias'"
 	    " UNION ALL BY NAME"
 	    " SELECT i.* REPLACE (a.vcat AS table_catalog, a.path AS table_schema, " +
-	    KeyQuotePartSql("i.\"table_name\"") +
-	    " AS table_name)"
+	    KeyQuotePartSql("i.\"table_name\"") + " AS table_name, " +
+	    listed_type("i.\"data_type\"", "i.\"column_name\"", alias_roles) +
+	    " AS data_type)"
 	    " FROM aliases a JOIN " +
 	    icolumns +
 	    " i ON i.\"table_catalog\" = a.parts[1] AND i.\"table_schema\" = a.parts[2]"
-	    " WHERE len(a.parts) = 2";
+	    " WHERE len(a.parts) = 2" +
+	    alias_visible;
 	auto path = [](const string &alias) {
 		return "CASE WHEN " + alias + ".vschema = 'main' THEN " + alias + ".vname ELSE " + alias +
 		       ".vschema || '.' || " + alias + ".vname END";
@@ -851,8 +891,15 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                  " pc WHERE pc.\"role\" = gc.\"role\" AND pc.\"vcat\" = gc.vcat AND pc.\"vname\" = gc.vname"
 	                  " AND pc.\"name\" = gp.name)) ORDER BY gc.\"role\") FROM gcolumns gc"
 	                  " WHERE gc.vcat = gp.vcat AND gc.vname = gp.vname)";
+	string relation_roles = "(SELECT list(struct_pack(cat := gc.cat_columns, obj := gc.obj_columns, probed := "
+	                        "NULL::VARCHAR) ORDER BY gc.\"role\") FROM gcolumns gc WHERE gc.vcat = l.table_catalog AND"
+	                        " gc.vname = " +
+	                        listed_path + ")";
 	string effective_columns =
-	    "SELECT * FROM lcols l WHERE " + column_visible("l.table_catalog", listed_path, "l.column_name") +
+	    (path_heads.empty() ? string("SELECT * FROM lcols l WHERE ")
+	                        : "SELECT * REPLACE (" + listed_type("l.data_type", "l.column_name", relation_roles) +
+	                              " AS data_type) FROM lcols l WHERE ") +
+	    column_visible("l.table_catalog", listed_path, "l.column_name") +
 	    " AND NOT EXISTS (SELECT 1 FROM gprojection gp WHERE gp.vcat = l.table_catalog AND gp.vname = " + listed_path +
 	    " AND gp.name = l.column_name)" +
 	    " UNION ALL BY NAME"

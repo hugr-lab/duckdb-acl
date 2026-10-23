@@ -1,0 +1,215 @@
+# name: test/sql/acl_listing_read_parity.test
+# description: spec 144 - a listing says what the read returns: a live schema alias's columns under a narrowing grant
+#   (the catalog grant's list, an object grant's on the alias object, both, two roles), a catalog grant's struct path
+#   in the listed type (a relation, an alias object, a masked field), and a star filter's column names
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, amount INTEGER, note VARCHAR, addr STRUCT(city VARCHAR, secret VARCHAR));
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 10, 'n', {'city': 'A', 'secret': 'S'});
+
+statement ok
+COMMENT ON COLUMN phys.main.orders.note IS 'PHYS note';
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.raw AS phys.main;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.orders;
+
+# --- a live alias under the catalog grant's list: the read returns id, amount (masked) - and so does the listing ----
+statement ok
+ACL ADMIN CREATE ROLE r_cat;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_cat WITH (select) MAIN COLUMNS (id, amount = 0);
+
+query II
+ACL ROLE 'r_cat' SELECT * FROM raw.orders;
+----
+1	0
+
+query T
+ACL ROLE 'r_cat' SELECT column_name FROM information_schema.columns WHERE table_schema = 'raw' ORDER BY ordinal_position;
+----
+id
+amount
+
+query I
+ACL ROLE 'r_cat' SELECT count(*) FROM duckdb_columns() WHERE schema_name = 'raw' AND column_name IN ('note', 'addr');
+----
+0
+
+# --- an object grant on the alias object narrows it further, like the read ------------------------------------------
+statement ok
+ACL ADMIN CREATE ROLE r_obj;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_obj WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_obj WITH (select) COLUMNS (id, note);
+
+query II
+ACL ROLE 'r_obj' SELECT * FROM raw.orders;
+----
+1	n
+
+query II
+ACL ROLE 'r_obj' SELECT column_name, COLUMN_COMMENT FROM information_schema.columns WHERE table_schema = 'raw' ORDER BY ordinal_position;
+----
+id	NULL
+note	PHYS note
+
+# --- both levels: what both keep -----------------------------------------------------------------------------------
+statement ok
+ACL ADMIN CREATE ROLE r_both;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_both WITH (select) MAIN COLUMNS (id, note);
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_both WITH (select) COLUMNS (id, amount);
+
+query I
+ACL ROLE 'r_both' SELECT * FROM raw.orders;
+----
+1
+
+query T
+ACL ROLE 'r_both' SELECT column_name FROM information_schema.columns WHERE table_schema = 'raw' ORDER BY ordinal_position;
+----
+id
+
+# --- two roles, one of them unrestricted: the union is everything (a token naming analyst and auditor) -------------
+statement ok
+SELECT acl_define_issuer('test/idp/rs', '{"url": "test/idp/rs", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"]}}');
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN COLUMNS (id, amount = 0);
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN;
+
+query T
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT column_name FROM information_schema.columns WHERE table_schema = 'raw' ORDER BY ordinal_position;
+----
+id
+amount
+note
+addr
+
+statement ok
+ACL ADMIN CREATE ROLE r_all;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_all WITH (select) MAIN;
+
+# --- a catalog grant's struct path: the listed type is the read's ----------------------------------------------------
+statement ok
+ACL ADMIN CREATE ROLE r_path;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_path WITH (select) MAIN COLUMNS (id, addr.city);
+
+query T
+ACL ROLE 'r_path' SELECT typeof(addr) FROM t;
+----
+STRUCT(city VARCHAR)
+
+query TT
+ACL ROLE 'r_path' SELECT table_schema, data_type FROM information_schema.columns WHERE column_name = 'addr' ORDER BY 1;
+----
+main	STRUCT(city VARCHAR)
+raw	STRUCT(city VARCHAR)
+
+query T
+ACL ROLE 'r_path' SELECT data_type FROM duckdb_columns() WHERE schema_name = 'raw' AND column_name = 'addr';
+----
+STRUCT(city VARCHAR)
+
+# a masked field keeps its place, typed as the field (no probe for a catalog grant's mask)
+statement ok
+ACL ADMIN CREATE ROLE r_field_mask;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_field_mask WITH (select) MAIN COLUMNS (id, addr.city, addr.secret = '***');
+
+query T
+ACL ROLE 'r_field_mask' SELECT typeof(addr) FROM t;
+----
+STRUCT(city VARCHAR, "secret" VARCHAR)
+
+query T
+ACL ROLE 'r_field_mask' SELECT data_type FROM information_schema.columns WHERE table_name = 't' AND column_name = 'addr';
+----
+STRUCT(city VARCHAR, "secret" VARCHAR)
+
+# an object grant's path was right before (its projection is probed, spec 026) and stays so
+statement ok
+ACL ADMIN CREATE ROLE r_obj_path;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_obj_path WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r_obj_path WITH (select) COLUMNS (id, addr.city);
+
+query T
+ACL ROLE 'r_obj_path' SELECT data_type FROM information_schema.columns WHERE table_name = 't' AND column_name = 'addr';
+----
+STRUCT(city VARCHAR)
+
+# --- a star filter: the columns it reads are named as duckdb names them (the virtual names) ------------------------
+query T
+ACL ROLE 'r_all' SELECT column_name FROM (DESCRIBE SELECT * LIKE 'a%' FROM t);
+----
+amount
+addr
+
+query T
+ACL ROLE 'r_all' SELECT column_name FROM (DESCRIBE SELECT * NOT LIKE 'a%' FROM t);
+----
+id
+note
+
+query T
+ACL ROLE 'r_all' SELECT column_name FROM (DESCRIBE SELECT * ILIKE 'A%' FROM t);
+----
+amount
+addr
+
+# (duckdb's own reading of a star's SIMILAR TO - a match anywhere in the name)
+query T
+ACL ROLE 'r_all' SELECT column_name FROM (DESCRIBE SELECT * SIMILAR TO 'n.*' FROM t);
+----
+amount
+note

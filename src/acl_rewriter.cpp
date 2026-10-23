@@ -1557,6 +1557,24 @@ private:
 		cte_scope = saved_scope;
 	}
 
+	//! spec 144: `* LIKE '…'` (ILIKE, SIMILAR TO, a NOT around them) - a function whose first argument is a star, which
+	//! duckdb turns into the columns it filters (TryTransformStarLike), each keeping its own name - and an alias it
+	//! carries over onto every one of them
+	static bool IsStarFilterCall(const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() != ExpressionClass::FUNCTION) {
+			return false;
+		}
+		auto &arguments = expr.Cast<FunctionExpression>().GetArguments();
+		return !arguments.empty() && arguments[0].GetExpression().GetExpressionClass() == ExpressionClass::STAR;
+	}
+	static bool IsStarFilter(const ParsedExpression &item) {
+		if (item.GetExpressionType() == ExpressionType::OPERATOR_NOT) {
+			auto &children = item.Cast<OperatorExpression>().GetChildren();
+			return children.size() == 1 && children[0] && IsStarFilterCall(*children[0]);
+		}
+		return IsStarFilterCall(item);
+	}
+
 	//! A result column keeps the name duckdb would give it as written. The gate qualifies every
 	//! admitted call (spec 072), and a header of `"system".main.lower(x)` where the principal wrote
 	//! `lower(x)` is a wrong answer to a client that reads column names - so an item without an alias
@@ -1569,7 +1587,7 @@ private:
 			}
 			auto expression_class = item->GetExpressionClass();
 			if (expression_class == ExpressionClass::STAR || expression_class == ExpressionClass::COLUMN_REF ||
-			    expression_class == ExpressionClass::CONSTANT) {
+			    expression_class == ExpressionClass::CONSTANT || IsStarFilter(*item)) {
 				// a star expands, a column or a constant is its own name - and a bare column reference
 				// aliased to itself is a self-reference to the binder when it is a keyword it resolves
 				// late (`SELECT current_date`)
