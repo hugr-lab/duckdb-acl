@@ -1,0 +1,1147 @@
+# name: test/sql/acl_catalog_scale.test
+# description: spec 147 - what the big-catalog bench changed, pinned: the gateway's known roles cached per policy
+#   version (a write is seen), the functions listing resolved in chunks and answered by a table function, a grant's
+#   column list narrowing a function's declared columns without binding the read (masks by their text, a mask that
+#   reads columns bound once), the oids the rows carry equal to the listings', and relations visible by a semi-join.
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t(c0 INTEGER, c1 INTEGER, c2 VARCHAR, tenant INTEGER);
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, 10, 'a', 0), (2, 20, 'b', 1);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+SELECT acl_define_issuer('test/idp/rs', '{"url": "test/idp/rs", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"]}}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.t;
+
+# more functions than one resolution chunk (256)
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f000 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f001 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f002 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f003 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f004 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f005 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f006 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f007 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f008 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f009 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f010 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f011 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f012 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f013 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f014 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f015 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f016 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f017 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f018 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f019 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f020 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f021 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f022 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f023 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f024 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f025 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f026 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f027 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f028 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f029 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f030 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f031 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f032 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f033 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f034 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f035 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f036 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f037 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f038 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f039 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f040 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f041 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f042 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f043 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f044 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f045 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f046 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f047 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f048 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f049 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f050 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f051 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f052 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f053 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f054 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f055 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f056 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f057 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f058 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f059 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f060 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f061 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f062 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f063 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f064 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f065 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f066 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f067 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f068 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f069 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f070 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f071 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f072 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f073 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f074 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f075 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f076 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f077 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f078 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f079 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f080 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f081 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f082 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f083 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f084 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f085 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f086 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f087 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f088 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f089 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f090 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f091 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f092 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f093 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f094 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f095 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f096 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f097 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f098 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f099 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f100 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f101 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f102 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f103 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f104 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f105 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f106 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f107 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f108 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f109 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f110 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f111 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f112 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f113 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f114 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f115 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f116 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f117 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f118 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f119 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f120 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f121 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f122 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f123 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f124 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f125 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f126 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f127 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f128 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f129 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f130 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f131 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f132 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f133 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f134 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f135 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f136 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f137 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f138 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f139 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f140 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f141 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f142 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f143 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f144 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f145 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f146 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f147 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f148 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f149 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f150 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f151 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f152 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f153 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f154 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f155 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f156 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f157 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f158 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f159 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f160 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f161 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f162 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f163 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f164 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f165 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f166 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f167 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f168 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f169 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f170 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f171 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f172 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f173 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f174 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f175 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f176 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f177 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f178 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f179 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f180 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f181 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f182 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f183 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f184 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f185 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f186 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f187 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f188 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f189 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f190 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f191 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f192 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f193 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f194 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f195 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f196 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f197 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f198 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f199 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f200 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f201 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f202 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f203 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f204 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f205 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f206 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f207 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f208 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f209 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f210 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f211 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f212 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f213 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f214 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f215 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f216 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f217 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f218 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f219 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f220 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f221 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f222 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f223 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f224 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f225 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f226 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f227 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f228 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f229 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f230 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f231 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f232 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f233 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f234 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f235 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f236 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f237 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f238 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f239 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f240 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f241 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f242 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f243 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f244 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f245 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f246 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f247 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f248 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f249 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f250 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f251 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f252 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f253 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f254 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f255 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f256 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f257 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f258 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f259 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f260 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f261 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f262 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f263 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f264 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f265 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f266 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f267 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f268 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f269 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f270 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f271 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f272 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f273 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f274 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f275 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f276 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f277 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f278 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f279 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f280 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f281 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f282 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f283 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f284 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f285 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f286 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f287 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f288 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f289 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f290 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f291 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f292 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f293 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f294 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f295 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f296 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f297 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f298 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f299 MACRO 'SELECT * FROM phys.main.t WHERE c0 >= acl_arg(1)';
+
+statement ok
+ACL ADMIN ADD SCALAR c.sc MACRO 'acl_arg(1) + 1';
+
+statement ok
+ACL ADMIN CREATE ROLE lister;
+
+# a plain column, a constant mask, a cast mask and a mask that reads a column
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE lister WITH (select) MAIN COLUMNS (c0, c1 = 0, c2 = NULL::BIGINT, tenant = tenant * 2);
+
+statement ok
+ACL ADMIN GRANT TABLE c.f001 TO ROLE lister WITH ();
+
+# the listing: every table function the role may call - not the '{}' one, not the scalar
+# (a scalar under a grant that carries a column list refuses its call)
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT count(*), count(*) FILTER (WHERE function_name IN ('f001', 'sc')) FROM duckdb_functions() WHERE database_name = 'c';
+----
+299	0
+
+# a function's columns as the read returns them, without the read bound: the listing and DESCRIBE agree
+query TT
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT column_name, data_type FROM acl_function_columns() WHERE function_name = 'f000' AND column_kind = 'column' ORDER BY position;
+----
+c0	INTEGER
+c1	INTEGER
+c2	BIGINT
+tenant	INTEGER
+
+query TT
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM f000(0));
+----
+c0	INTEGER
+c1	INTEGER
+c2	BIGINT
+tenant	INTEGER
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT count(DISTINCT function_name) FROM acl_function_columns() WHERE database_name = 'c';
+----
+299
+
+# the rows' oids are the listings' (computed in C++ the way the SQL writes them)
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT count(*) FROM duckdb_functions() f JOIN duckdb_databases() d ON d.database_name = f.database_name AND d.database_oid::VARCHAR = f.database_oid WHERE f.database_name = 'c';
+----
+299
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT count(DISTINCT function_oid) FROM duckdb_functions() WHERE database_name = 'c';
+----
+299
+
+# a policy write is seen by the next listing (the listing's cache is per policy version)
+statement ok
+ACL ADMIN ADD TABLE FUNCTION c.f300 MACRO 'SELECT * FROM phys.main.t';
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMSIsInJvbGVzIjpbImxpc3RlciJdfQ.gvm1JU9L_lOEPJlcgTqtqbTegcA1PPpEekySXjrwFvM2m7brLFXhpCMNmeK2uOUGjMon94tKKsO9qKUQaZmsucBkqK-w_gwSOxrm6-Tgjl4CNPLHKmIRgsJGPRkU-1CBXZyI9hCgq7StXmcUaDRRCtt_LjCODjrF3D-k1gQ-5tCUqakQSGfrpsewGrwnptWQlxVU18cuN1rTr2HWBuEcgl6XYnE8iwxSppY5M-hIAev_tEH1aLZuh3SUjubTOrnvm58aRkwq7wTPbIpiYnT9EQMIwbm06QpY3HPcvhASR_hPt5FYAz6Wf1tGDNB4uz3UlncGd0Xvgyf0sD1XKFUAUw' SELECT count(*) FROM duckdb_functions() WHERE database_name = 'c';
+----
+300
+
+# a relation one role reads and another holds '{}' on: listed once, by the role that sees it
+statement ok
+ACL ADMIN CREATE ROLE hider;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE hider WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE hider WITH ();
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMiIsInJvbGVzIjpbImxpc3RlciIsImhpZGVyIl19.BO250Ujc8ohI8H5Y38dGiRoL5Gfry6-GEeq6hMKPDXSxqg4BNpU7EnQF8kphuq62IchwBSX-qxXxivezizo309AXTrEFvxkvdlkb3j-VJID0SJ9igKvwIs8RpQkFnTGkz1GSUh3I2B71oIz1OMEu1rDyCxhAMH2Zd8CRtovnXly60sEQzVga1s1vFTobA75zuScGZByTmxkqG6erPOVOio_DJBvxqXa4kfji9l1GGgPiVZvYe7sWV3t-pinv_Yka1fHH_wtjv2S4EGUjfPM2n9HtMMOM5ysqr2g2cLYhV6lgG45akwecL-y5kOD2zYBmCrI6ZXi0NPZHVUr_7PSMYw' SELECT count(*), list(table_name) FROM information_schema.tables WHERE table_catalog = 'c';
+----
+1	[t]
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE lister;
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMiIsInJvbGVzIjpbImxpc3RlciIsImhpZGVyIl19.BO250Ujc8ohI8H5Y38dGiRoL5Gfry6-GEeq6hMKPDXSxqg4BNpU7EnQF8kphuq62IchwBSX-qxXxivezizo309AXTrEFvxkvdlkb3j-VJID0SJ9igKvwIs8RpQkFnTGkz1GSUh3I2B71oIz1OMEu1rDyCxhAMH2Zd8CRtovnXly60sEQzVga1s1vFTobA75zuScGZByTmxkqG6erPOVOio_DJBvxqXa4kfji9l1GGgPiVZvYe7sWV3t-pinv_Yka1fHH_wtjv2S4EGUjfPM2n9HtMMOM5ysqr2g2cLYhV6lgG45akwecL-y5kOD2zYBmCrI6ZXi0NPZHVUr_7PSMYw' SELECT count(*) FROM information_schema.tables WHERE table_catalog = 'c';
+----
+0
+
+# known roles per policy version: a claimed role the policy does not know is no role - until a write makes it one
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMyIsInJvbGVzIjpbImdob3N0Il19.TFgWcdU1pXezWEaCtah6s0XdL8SFQXm5xN56eUTN9DB8hL-dpo13foY9A4iNu9mxoP6j3uKzTEW5wVxuDxgc2vBkGHZKJtcKJZ6tBIQXaboPJd6dBBNsIetROc9q2rDafFPQ6imemfpT3Md_HCIToTtOBOo5Lice3JhBYLYtDF1zcnfv5dFtsfgXa0URYknXDxkr-seemHDuFvIexzwbJjaOMe6_WuSPLPXnTXbY2BRTvQ-oRKeLmEWszEFWruD-WEo-mwIuf7YxBUeR9R4tPvr8Oo3H1fIviDlafZL-aEuLLG_kL1F4xa4c_iJ-V1de6pZGaGMBeqnzUm2CfmUdBw' SELECT 1;
+----
+no recognized roles
+
+statement ok
+ACL ADMIN CREATE ROLE ghost;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE ghost WITH (select) MAIN;
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzMyIsInJvbGVzIjpbImdob3N0Il19.TFgWcdU1pXezWEaCtah6s0XdL8SFQXm5xN56eUTN9DB8hL-dpo13foY9A4iNu9mxoP6j3uKzTEW5wVxuDxgc2vBkGHZKJtcKJZ6tBIQXaboPJd6dBBNsIetROc9q2rDafFPQ6imemfpT3Md_HCIToTtOBOo5Lice3JhBYLYtDF1zcnfv5dFtsfgXa0URYknXDxkr-seemHDuFvIexzwbJjaOMe6_WuSPLPXnTXbY2BRTvQ-oRKeLmEWszEFWruD-WEo-mwIuf7YxBUeR9R4tPvr8Oo3H1fIviDlafZL-aEuLLG_kL1F4xa4c_iJ-V1de6pZGaGMBeqnzUm2CfmUdBw' SELECT count(*) FROM t;
+----
+2
+
+# review: a cast mask is listed with the type the read binds (not as written), a masked item is named as the grant
+# writes it, and a mask is bound as ONE expression - a FROM after it runs nothing while the listing binds
+statement ok
+CREATE TABLE phys.main.w(c0 INTEGER, c1 INTEGER, c2 VARCHAR, d DECIMAL(18, 3));
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG m;
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION m.fw MACRO 'SELECT * FROM phys.main.w';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION m.fx MACRO 'SELECT * FROM phys.main.w';
+
+statement ok
+ACL ADMIN CREATE ROLE masker;
+
+statement ok
+ACL ADMIN GRANT CATALOG m TO ROLE masker WITH (select) MAIN COLUMNS (C0 = c0::INT8, c1 = c1::TEXT, c2, d = d::DECIMAL);
+
+statement ok
+SELECT acl_grant_object('masker', 'm', 'fx', '{"select": true}', '', 'c0 = j AS m FROM range(3) j --, c2');
+
+query TT
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT column_name, data_type FROM acl_function_columns() WHERE function_name = 'fw' AND column_kind = 'column' ORDER BY position;
+----
+C0	BIGINT
+c1	VARCHAR
+c2	VARCHAR
+d	DECIMAL(18,3)
+
+query TT
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM fw());
+----
+C0	BIGINT
+c1	VARCHAR
+c2	VARCHAR
+d	DECIMAL(18,3)
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT count(*) FROM acl_function_columns() WHERE function_name = 'fx' AND column_kind = 'column';
+----
+0
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT * FROM fx();
+----
+
+# re-review: a mask the read refuses - an aggregate, an alias in its text - lists no columns either
+statement ok
+ACL ADMIN ADD TABLE FUNCTION m.fy MACRO 'SELECT * FROM phys.main.w';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION m.fz MACRO 'SELECT * FROM phys.main.w';
+
+statement ok
+SELECT acl_grant_object('masker', 'm', 'fy', '{"select": true}', '', 'c0 = count(*), c2');
+
+statement ok
+SELECT acl_grant_object('masker', 'm', 'fz', '{"select": true}', '', 'c0 = c1 AS m, c2');
+
+query T
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT list(DISTINCT function_name ORDER BY function_name) FROM acl_function_columns() WHERE function_name IN ('fy', 'fz') AND column_kind = 'column';
+----
+NULL
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT * FROM fy();
+----
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT * FROM fz();
+----
+
+# review: a role named `a,b` and the role set {a, b} are two keys of the caches - one never answers with the other's
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG k;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE k.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE ROLE ra;
+
+statement ok
+ACL ADMIN CREATE ROLE rb;
+
+statement ok
+ACL ADMIN CREATE ROLE "ra,rb";
+
+statement ok
+ACL ADMIN GRANT CATALOG k TO ROLE ra WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG k TO ROLE "ra,rb" WITH (insert) MAIN;
+
+query I
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNSIsInJvbGVzIjpbInJhIiwicmIiXX0.gimMvO0PTXqKZbE50IqXkZbftug2GjU26WgTiRrIo3GtG4jMvqzWU_jYiBiWCqfOQPY83cH-LYjpGWiLrcXMRdD1sYJ7rIDoSeU5z0G6aVwwKsZVp5HL9KpC2BPVME0vOlcS2SCmuJvgUjSjM7NI9ABdRb_4n4JCsNCM9ELaSEFlFi8VVKmAsab3ZyvFU7gazGyD5I9HHboI4iZr3-ZfKsAJhvWI7sxWqG_MM6BNgbjsyBvs5mFJ8ulBK9wiDuyJUeRm29Q76uMLaA7-WPJ2DpiAv73EdxxAVAoCHZcB5S9m-wrqJ2kcgNwILYETBTPbb4zDyIWxLOxG4azms_jcyQ' SELECT count(*) FROM t;
+----
+2
+
+statement error
+ACL ROLE "ra,rb" SELECT count(*) FROM t;
+----
+not allowed

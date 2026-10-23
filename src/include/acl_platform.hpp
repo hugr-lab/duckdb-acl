@@ -195,6 +195,9 @@ void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> 
 //! spec 118.3 (acl_platform_sources.cpp): the physical tree `platform.attached.<alias>.<schema>` - its
 //! table functions acl_platform_attached[_columns]([sources]) and acl_grant_source / acl_revoke_source
 void RegisterAclPlatformSources(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
+//! spec 147: acl_principal_function_rows - a principal's virtual and platform functions (and their columns) as rows,
+//! for duckdb_functions() / acl_function_columns() under a principal (acl_principal_functions.cpp)
+void RegisterAclPrincipalFunctionRows(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
 //! spec 120.2 (acl_platform_rights.cpp): acl_effective_rights(role, catalog[, object]), acl_exposures(source[, …])
 void RegisterAclPlatformRights(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store);
 //! spec 138: the table / view names a stored body writes, as written - a one-part name that is a CTE of its scope

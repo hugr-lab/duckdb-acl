@@ -14,11 +14,19 @@
 //===----------------------------------------------------------------------===//
 
 #include "acl_policy.hpp"
+#include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_platform.hpp"
+#include "duckdb/common/types/hash.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 
 #include <set>
+#include <unordered_map>
 
 namespace duckdb {
 namespace acl {
@@ -157,46 +165,115 @@ string QuoteIdentifier(const string &name) {
 //! node lacks) withholds the list: nothing rather than more than the call returns.
 vector<acl_detail::CatalogBackend::VisibleFunction::Column>
 NarrowedColumns(DatabaseInstance *db, const TablePolicy &policy,
-                const vector<acl_detail::CatalogBackend::VisibleFunction::Column> &declared) {
+                const vector<acl_detail::CatalogBackend::VisibleFunction::Column> &declared,
+                std::unordered_map<string, string> &mask_types) {
 	using Column = acl_detail::CatalogBackend::VisibleFunction::Column;
 	if (policy.wrap_sql.empty() && policy.projection.empty()) {
 		return declared;
 	}
-	if (!db || declared.empty()) {
+	if (!db || declared.empty() || policy.granted_items.empty()) {
 		return vector<Column>();
 	}
-	vector<string> items;
+	// spec 147: what the read's wrap keeps (ApplyFunctionGrantPolicy), decided from the stored facts - the declared
+	// columns, in their order, whose name the united list names; a mask's type from its text where it says it (a
+	// constant, a cast), else bound once per mask and shape. A mask naming no declared column refuses the read
+	// (REPLACE), and nothing is listed then. The row filter is not judged here, as a relation's listing does not.
+	struct Kept {
+		string spelled; // the item's own name: a masked column is named by it (REPLACE ... AS <item>)
+		string mask;    // '' = as it is
+	};
+	case_insensitive_map_t<Kept> kept;
+	for (auto &item : policy.granted_items) {
+		auto name = item.first;
+		StringUtil::Trim(name);
+		kept[name] = Kept {Unquoted(name), item.second};
+	}
+	string inner;
 	for (auto &column : declared) {
 		if (column.type.empty()) {
 			return vector<Column>();
 		}
-		items.push_back("NULL::" + column.type + " AS " + QuoteIdentifier(Unquoted(column.name)));
+		inner += (inner.empty() ? "" : ", ") + string("NULL::") + column.type + " AS " +
+		         QuoteIdentifier(Unquoted(column.name));
 	}
-	auto inner = "(SELECT " + StringUtil::Join(items, ", ") + " WHERE false)";
-	auto sql = !policy.wrap_sql.empty()
-	               ? policy.wrap_sql
-	               : "SELECT " + StringUtil::Join(policy.projection, ", ") + " FROM \"__acl_inner\"";
-	sql = StringUtil::Replace(sql, "\"__acl_inner\"", inner);
-	vector<Column> out;
-	try {
-		Connection con(*db);
-		auto described = con.Query("DESCRIBE " + sql);
-		if (described->HasError()) {
+	for (auto &item : kept) {
+		if (item.second.mask.empty()) {
+			continue;
+		}
+		bool returned = false;
+		for (auto &column : declared) {
+			returned = returned || StringUtil::CIEquals(Unquoted(column.name), item.first);
+		}
+		if (!returned) {
 			return vector<Column>();
 		}
-		for (idx_t row = 0; row < described->RowCount(); row++) {
-			Column column;
-			column.name = described->Collection().GetValue(0, row).ToString();
-			column.type = described->Collection().GetValue(1, row).ToString();
-			for (auto &candidate : declared) {
-				if (StringUtil::CIEquals(Unquoted(candidate.name), column.name)) {
-					column.comment = candidate.comment;
-				}
+	}
+	auto mask_type = [&](const string &mask, const string &column, string &type) {
+		// spec 147 review: judged in the read's own shape - the wrap splices the mask's text into `REPLACE (<mask> AS
+		// <column>)`, so a text that does not parse there (an alias, a comment, a `;`, a FROM after it) refuses the
+		// read and lists nothing - then bound from its printed form in that shape (an aggregate, COLUMNS(), refuse
+		// there too); never the text spliced into a statement run here. Only a constant is typed without binding.
+		auto target = QuoteIdentifier(column);
+		unique_ptr<ParsedExpression> expression;
+		try {
+			Parser shape(ParserOptions::Builtin());
+			shape.ParseQuery("SELECT * REPLACE (" + mask + " AS " + target + ") FROM t");
+			if (shape.statements.size() != 1) {
+				return false;
 			}
-			out.push_back(std::move(column));
+			auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(mask);
+			if (parsed.size() != 1 || parsed[0]->HasAlias()) {
+				return false;
+			}
+			expression = std::move(parsed[0]);
+		} catch (std::exception &) {
+			return false;
 		}
-	} catch (std::exception &) {
-		return vector<Column>();
+		if (expression->GetExpressionClass() == ExpressionClass::CONSTANT) {
+			type = LogicalType::NormalizeType(expression->Cast<ConstantExpression>().GetLiteral().ToValue().type())
+			           .ToString();
+			return true;
+		}
+		auto printed = expression->ToString();
+		auto key = printed + "\x1f" + column + "\x1f" + inner;
+		auto entry = mask_types.find(key);
+		if (entry == mask_types.end()) {
+			string bound;
+			try {
+				Connection con(*db);
+				auto described = con.Query("DESCRIBE SELECT * REPLACE (" + printed + " AS " + target +
+				                           ") FROM (SELECT " + inner + " WHERE false)");
+				if (!described->HasError()) {
+					ResultRows rows(*described);
+					for (idx_t row = 0; row < rows.Count(); row++) {
+						if (StringUtil::CIEquals(rows.GetValue(0, row).ToString(), column)) {
+							bound = rows.GetValue(1, row).ToString();
+						}
+					}
+				}
+			} catch (std::exception &) {
+				bound.clear();
+			}
+			entry = mask_types.emplace(key, bound).first;
+		}
+		type = entry->second;
+		return !type.empty();
+	};
+	vector<Column> out;
+	for (auto &candidate : declared) {
+		auto name = Unquoted(candidate.name);
+		auto entry = kept.find(name);
+		if (entry == kept.end()) {
+			continue;
+		}
+		Column column;
+		column.name = entry->second.mask.empty() ? name : entry->second.spelled;
+		column.type = candidate.type;
+		column.comment = candidate.comment;
+		if (!entry->second.mask.empty() && !mask_type(entry->second.mask, name, column.type)) {
+			return vector<Column>(); // a mask that does not bind refuses the read
+		}
+		out.push_back(std::move(column));
 	}
 	return out;
 }
@@ -210,102 +287,100 @@ CallableFunctions(PolicyStore &store, acl_detail::CatalogBackend *catalog, const
 	if (!catalog) {
 		return out;
 	}
-	auto db = store.instance.lock();
-	for (auto &function : catalog->VisibleFunctions(principal)) {
-		TablePolicy policy;
-		bool resolved = false;
-		auto qualified = function.vcat + "." + function.vname;
-		try {
-			resolved = function.kind == "table" ? store.ResolveTableFunction(principal, qualified, policy)
-			                                    : store.ResolveScalarFunction(principal, qualified, policy);
-		} catch (BinderException &) {
-			// what refuses the call (a scalar under a grant that carries a policy) keeps it out of
-			// the listing - never the whole listing out with it
-			continue;
+	// spec 147: kept whole per role set and policy version (a listing computes it twice, a tool lists again)
+	catalog->EnsureFresh();
+	auto cache_key = catalog->RoleSig(principal);
+	shared_ptr<const vector<acl_detail::CatalogBackend::VisibleFunction>> cached;
+	int64_t read_at;
+	{
+		lock_guard<mutex> guard(catalog->lock);
+		read_at = catalog->version;
+		auto entry = catalog->callable_cache.find(cache_key);
+		if (entry != catalog->callable_cache.end()) {
+			cached = entry->second;
 		}
-		if (!resolved || !policy.caps.count("select")) {
+	}
+	if (cached) {
+		return *cached; // copied outside the lock every resolution takes
+	}
+	auto db = store.instance.lock();
+	auto visible = catalog->VisibleFunctions(principal);
+	// spec 147: resolved together - one query a chunk, not one per function (minutes over 10,000 functions)
+	vector<acl_detail::CatalogBackend::VirtualFunctionKey> keys;
+	for (auto &function : visible) {
+		keys.push_back({function.vcat, function.vname, function.kind == "table"});
+	}
+	vector<acl_detail::CatalogBackend::ResolvedVirtualFunction> resolved;
+	catalog->ResolveFunctions(principal, keys, resolved);
+	std::unordered_map<string, string> mask_types; // spec 147: a mask that reads columns, bound once per shape
+	for (idx_t i = 0; i < visible.size(); i++) {
+		// what refuses the call (a scalar under a grant that carries a policy) keeps it out of the listing - never
+		// the whole listing out with it
+		if (resolved[i].refused || !resolved[i].found || !resolved[i].policy.caps.count("select")) {
 			continue; // a call needs select (spec 012)
 		}
-		function.columns = NarrowedColumns(db.get(), policy, function.columns);
+		auto function = std::move(visible[i]);
+		function.columns = NarrowedColumns(db.get(), resolved[i].policy, function.columns, mask_types);
 		out.push_back(std::move(function));
 	}
+	lock_guard<mutex> guard(catalog->lock);
+	if (catalog->version != read_at) {
+		return out; // computed across a policy change: answered, not kept
+	}
+	if (catalog->callable_cache.size() >= 16) {
+		catalog->callable_cache.clear(); // bounded: a few role sets' listings (each can be large)
+	}
+	catalog->callable_cache[cache_key] =
+	    make_shared_ptr<const vector<acl_detail::CatalogBackend::VisibleFunction>>(out);
 	return out;
 }
 
 //! spec 117: the platform functions a principal may call, none on the quack door
-vector<PlatformFunctionRow> PlatformRowsFor(PolicyStore &store, const Principal &principal) {
-	if (!principal.session.empty() && store.SessionDoorOf(principal.session) == "quack") {
+vector<PlatformFunctionRow> PlatformRowsFor(PolicyStore &store, const Principal &principal, bool quack_door) {
+	if (quack_door) {
 		return {};
 	}
 	return PlatformFunctionRows(store.AdminRightsOf(principal));
 }
 
-} // namespace
-
-string PolicyStore::PrincipalFunctionColumnsSql(const Principal &principal) {
-	// spec 115: one row per parameter and per declared result column of every function the principal
-	// can call - what a JDBC driver's getFunctionColumns / getProcedureColumns read. Constants only.
-	vector<string> rows;
-	for (auto &function : CallableFunctions(*this, catalog.get(), principal)) {
-		// spec 116: each name as a listing shows it - the catalog and the function unquoted, the schema
-		// unquoted unless it is a path
-		string parent, leaf;
-		NamePath::SplitLeaf(function.vname, parent, leaf);
-		auto schema = parent.empty() ? string("main") : NamePath::Display(parent);
-		auto head = Quote(NamePath::Unquote(function.vcat)) + ", " + Quote(schema) + ", " + Quote(leaf) + ", " +
-		            Quote(function.kind);
-		vector<string> names;
-		vector<string> types;
-		SplitParams(function.params, names, types);
-		for (idx_t i = 0; i < names.size(); i++) {
-			rows.push_back("(" + head + ", 'param', " + std::to_string(i + 1) + ", " + Quote(names[i]) + ", " +
-			               (types[i].empty() ? string("NULL") : Quote(types[i])) + ", NULL, NULL)");
-		}
-		for (idx_t i = 0; i < function.columns.size(); i++) {
-			auto &column = function.columns[i];
-			rows.push_back("(" + head + ", 'column', " + std::to_string(i + 1) + ", " + Quote(Unquoted(column.name)) +
-			               ", " + (column.type.empty() ? string("NULL") : Quote(column.type)) + ", " +
-			               (column.nullable.IsNull() ? string("NULL") : column.nullable.ToString()) + ", " +
-			               QuoteOrNull(column.comment) + ")");
-		}
-		if (function.kind == "scalar" && !function.returns.IsNull()) {
-			rows.push_back("(" + head + ", 'return', 0, NULL, " + Quote(function.returns.ToString()) + ", NULL, NULL)");
-		}
-	}
-	// spec 117: and the platform catalog's functions' parameters
-	for (auto &function : PlatformRowsFor(*this, principal)) {
-		auto head = string("'platform', 'main', ") + Quote(function.name) + ", " + Quote(function.kind);
-		for (idx_t i = 0; i < function.parameters.size(); i++) {
-			rows.push_back("(" + head + ", 'param', " + std::to_string(i + 1) + ", " + Quote(function.parameters[i]) +
-			               ", " + Quote(function.parameter_types[i]) + ", NULL, NULL)");
-		}
-		if (function.kind == "scalar") {
-			rows.push_back("(" + head + ", 'return', 0, NULL, " + Quote(function.returns) + ", NULL, NULL)");
-		}
-	}
-	string shape = "SELECT NULL::VARCHAR AS database_name, NULL::VARCHAR AS schema_name, NULL::VARCHAR AS "
-	               "function_name, NULL::VARCHAR AS function_type, NULL::VARCHAR AS column_kind, NULL::INTEGER AS "
-	               "position, NULL::VARCHAR AS column_name, NULL::VARCHAR AS data_type, NULL::BOOLEAN AS is_nullable, "
-	               "NULL::VARCHAR AS comment WHERE false";
-	if (rows.empty()) {
-		return shape;
-	}
-	return shape + " UNION ALL SELECT * FROM (VALUES " + StringUtil::Join(rows, ", ") + ")";
+//! the door a principal's session came through, as the rows below need it
+bool QuackDoor(PolicyStore &store, const Principal &principal) {
+	return !principal.session.empty() && store.SessionDoorOf(principal.session) == "quack";
 }
 
-string PolicyStore::PrincipalFunctionsSql(const Principal &principal) {
-	// (b) first: the virtual functions a call of this principal reaches, each resolved the way a call
-	// is. A virtual function also takes the bare call of every engine function of its name and kind
-	// (the rewriter resolves virtual functions first, by bare name), so those leave (a).
-	vector<string> rows;
-	std::set<string> shadowed; // kind \x1f name
-	for (auto &function : CallableFunctions(*this, catalog.get(), principal)) {
+//! spec 147: the oid OidOf writes as SQL (`(hash(kind || chr(31) || name) >> 1)::BIGINT`), computed here - duckdb's
+//! own string hash, so a surface that writes the SQL and one that answers rows agree
+int64_t OidValue(const string &kind, const string &name) {
+	auto text = kind + '\x1f' + name;
+	return int64_t(Hash<string_t>(string_t(text.c_str(), UnsafeNumericCast<uint32_t>(text.size()))) >> 1);
+}
+
+Value TextOrNull(const Value &value) {
+	return value.IsNull() ? Value(LogicalType::VARCHAR) : Value(value.ToString());
+}
+
+//! a VARCHAR[] value; an empty item is NULL (a parameter declared without a type), as ListLiteral writes it
+Value ListOf(const vector<string> &items) {
+	vector<Value> values;
+	for (auto &item : items) {
+		values.push_back(item.empty() ? Value(LogicalType::VARCHAR) : Value(item));
+	}
+	return Value::LIST(LogicalType::VARCHAR, std::move(values));
+}
+
+//! spec 147: the rows of (b) - the virtual functions a call reaches and the platform's - as values: answered by a
+//! table function a chunk at a time, never written into the listing's SQL (ten thousand UNION branches planned for
+//! minutes, one VALUES of ten thousand rows took 8 s and 3 GiB to parse and bind)
+vector<vector<Value>> FunctionRows(PolicyStore &store, acl_detail::CatalogBackend *catalog, const Principal &principal,
+                                   bool quack_door) {
+	vector<vector<Value>> rows;
+	auto empty_map = Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, vector<Value>(), vector<Value>());
+	auto no_items = Value::LIST(LogicalType::VARCHAR, vector<Value>());
+	auto null_text = Value(LogicalType::VARCHAR);
+	for (auto &function : CallableFunctions(store, catalog, principal)) {
 		string parent, leaf;
 		NamePath::SplitLeaf(function.vname, parent, leaf);
 		auto schema = parent.empty() ? string("main") : NamePath::Display(parent);
-		if (function.bare) {
-			shadowed.insert(function.kind + "\x1f" + StringUtil::Lower(leaf));
-		}
 		vector<string> names;
 		vector<string> types;
 		SplitParams(function.params, names, types);
@@ -319,26 +394,239 @@ string PolicyStore::PrincipalFunctionsSql(const Principal &principal) {
 			}
 			returns = Value("TABLE(" + StringUtil::Join(items, ", ") + ")");
 		}
-		rows.push_back("SELECT " + Quote(NamePath::Unquote(function.vcat)) + "::VARCHAR, " +
-		               OidOf("database", function.vcat) + "::VARCHAR, " + Quote(schema) + "::VARCHAR, " + Quote(leaf) +
-		               "::VARCHAR, NULL::VARCHAR, " + Quote(function.kind) + "::VARCHAR, NULL::VARCHAR, " +
-		               QuoteOrNull(function.comment) + "::VARCHAR, MAP {}::MAP(VARCHAR, VARCHAR), " +
-		               QuoteOrNull(returns) + "::VARCHAR, " + ListLiteral(names) + ", " + ListLiteral(types) +
-		               ", NULL::VARCHAR, NULL::VARCHAR, NULL::BOOLEAN, false, NULL::VARCHAR, " +
-		               OidOf("function", function.vcat + "\x1f" + function.vname + "\x1f" + function.kind) +
-		               ", []::VARCHAR[], NULL::VARCHAR, []::VARCHAR[]");
+		rows.push_back(
+		    {Value(NamePath::Unquote(function.vcat)),
+		     Value(std::to_string(OidValue("database", function.vcat))),
+		     Value(schema),
+		     Value(leaf),
+		     null_text,
+		     Value(function.kind),
+		     null_text,
+		     TextOrNull(function.comment),
+		     empty_map,
+		     TextOrNull(returns),
+		     ListOf(names),
+		     ListOf(types),
+		     null_text,
+		     null_text,
+		     Value(LogicalType::BOOLEAN),
+		     Value::BOOLEAN(false),
+		     null_text,
+		     Value::BIGINT(OidValue("function", function.vcat + "\x1f" + function.vname + "\x1f" + function.kind)),
+		     no_items,
+		     null_text,
+		     no_items});
 	}
-
 	// spec 117: the platform catalog's functions this principal may call - absent on the quack door
-	for (auto &function : PlatformRowsFor(*this, principal)) {
-		rows.push_back("SELECT 'platform'::VARCHAR, " + OidOf("database", "platform") + "::VARCHAR, 'main'::VARCHAR, " +
-		               Quote(function.name) + "::VARCHAR, NULL::VARCHAR, " + Quote(function.kind) +
-		               "::VARCHAR, NULL::VARCHAR, " + Quote(function.comment) +
-		               "::VARCHAR, MAP {}::MAP(VARCHAR, VARCHAR), " + Quote(function.returns) + "::VARCHAR, " +
-		               ListLiteral(function.parameters) + ", " + ListLiteral(function.parameter_types) +
-		               ", NULL::VARCHAR, NULL::VARCHAR, " + (function.kind == "table" ? "false" : "true") +
-		               ", false, NULL::VARCHAR, " + OidOf("function", "platform\x1fmain\x1f" + function.name) +
-		               ", []::VARCHAR[], NULL::VARCHAR, []::VARCHAR[]");
+	for (auto &function : PlatformRowsFor(store, principal, quack_door)) {
+		rows.push_back({Value("platform"),
+		                Value(std::to_string(OidValue("database", "platform"))),
+		                Value("main"),
+		                Value(function.name),
+		                null_text,
+		                Value(function.kind),
+		                null_text,
+		                Value(function.comment),
+		                empty_map,
+		                Value(function.returns),
+		                ListOf(function.parameters),
+		                ListOf(function.parameter_types),
+		                null_text,
+		                null_text,
+		                Value::BOOLEAN(function.kind != "table"),
+		                Value::BOOLEAN(false),
+		                null_text,
+		                Value::BIGINT(OidValue("function", "platform\x1fmain\x1f" + function.name)),
+		                no_items,
+		                null_text,
+		                no_items});
+	}
+	return rows;
+}
+
+//! spec 115's rows of acl_function_columns: one per parameter and per declared result column of every function the
+//! principal can call, and each scalar's return
+vector<vector<Value>> FunctionColumnRows(PolicyStore &store, acl_detail::CatalogBackend *catalog,
+                                         const Principal &principal, bool quack_door) {
+	vector<vector<Value>> rows;
+	auto null_text = Value(LogicalType::VARCHAR);
+	auto null_bool = Value(LogicalType::BOOLEAN);
+	for (auto &function : CallableFunctions(store, catalog, principal)) {
+		// spec 116: each name as a listing shows it - the catalog and the function unquoted, the schema
+		// unquoted unless it is a path
+		string parent, leaf;
+		NamePath::SplitLeaf(function.vname, parent, leaf);
+		auto schema = parent.empty() ? string("main") : NamePath::Display(parent);
+		vector<Value> head = {Value(NamePath::Unquote(function.vcat)), Value(schema), Value(leaf),
+		                      Value(function.kind)};
+		auto row = [&](const char *kind, int32_t position, Value name, Value type, Value nullable, Value comment) {
+			auto values = head;
+			values.insert(values.end(), {Value(kind), Value::INTEGER(position), std::move(name), std::move(type),
+			                             std::move(nullable), std::move(comment)});
+			rows.push_back(std::move(values));
+		};
+		vector<string> names;
+		vector<string> types;
+		SplitParams(function.params, names, types);
+		for (idx_t i = 0; i < names.size(); i++) {
+			row("param", int32_t(i + 1), Value(names[i]), types[i].empty() ? null_text : Value(types[i]), null_bool,
+			    null_text);
+		}
+		for (idx_t i = 0; i < function.columns.size(); i++) {
+			auto &column = function.columns[i];
+			row("column", int32_t(i + 1), Value(Unquoted(column.name)),
+			    column.type.empty() ? null_text : Value(column.type),
+			    column.nullable.IsNull() ? null_bool : column.nullable.DefaultCastAs(LogicalType::BOOLEAN),
+			    TextOrNull(column.comment));
+		}
+		if (function.kind == "scalar" && !function.returns.IsNull()) {
+			row("return", 0, null_text, Value(function.returns.ToString()), null_bool, null_text);
+		}
+	}
+	// spec 117: and the platform catalog's functions' parameters
+	for (auto &function : PlatformRowsFor(store, principal, quack_door)) {
+		vector<Value> head = {Value("platform"), Value("main"), Value(function.name), Value(function.kind)};
+		for (idx_t i = 0; i < function.parameters.size(); i++) {
+			auto values = head;
+			values.insert(values.end(), {Value("param"), Value::INTEGER(int32_t(i + 1)), Value(function.parameters[i]),
+			                             Value(function.parameter_types[i]), null_bool, null_text});
+			rows.push_back(std::move(values));
+		}
+		if (function.kind == "scalar") {
+			auto values = head;
+			values.insert(values.end(), {Value("return"), Value::INTEGER(0), null_text, Value(function.returns),
+			                             null_bool, null_text});
+			rows.push_back(std::move(values));
+		}
+	}
+	return rows;
+}
+
+//! acl_principal_function_rows(roles, quack_door, columns): (b)'s rows for the roles named - in the never set (an
+//! acl_* name), reached only by the listing's substitution, which writes the principal's own roles
+struct FunctionRowsInfo : TableFunctionInfo {
+	explicit FunctionRowsInfo(shared_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
+	}
+	shared_ptr<PolicyStore> store;
+};
+
+struct FunctionRowsBind : TableFunctionData {
+	vector<vector<Value>> rows;
+};
+
+struct FunctionRowsState : GlobalTableFunctionState {
+	idx_t offset = 0;
+};
+
+unique_ptr<FunctionData> FunctionRowsBindFn(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+                                            vector<Identifier> &names) {
+	auto bind = make_uniq<FunctionRowsBind>();
+	auto &store = *input.info->Cast<FunctionRowsInfo>().store;
+	Principal principal;
+	if (!input.inputs[0].IsNull()) {
+		for (auto &role : ListValue::GetChildren(input.inputs[0])) {
+			if (!role.IsNull()) {
+				principal.roles.push_back(role.ToString());
+			}
+		}
+	}
+	auto quack_door = !input.inputs[1].IsNull() && input.inputs[1].GetValue<bool>();
+	auto columns = !input.inputs[2].IsNull() && input.inputs[2].GetValue<bool>();
+	auto column = [&](const char *name, const LogicalType &type) {
+		names.push_back(Identifier(name));
+		types.push_back(type);
+	};
+	auto text = LogicalType::VARCHAR;
+	auto list = LogicalType::LIST(LogicalType::VARCHAR);
+	if (columns) {
+		for (auto name : {"database_name", "schema_name", "function_name", "function_type", "column_kind"}) {
+			column(name, text);
+		}
+		column("position", LogicalType::INTEGER);
+		column("column_name", text);
+		column("data_type", text);
+		column("is_nullable", LogicalType::BOOLEAN);
+		column("comment", text);
+		bind->rows = FunctionColumnRows(store, store.catalog.get(), principal, quack_door);
+		return std::move(bind);
+	}
+	for (auto name : {"database_name", "database_oid", "schema_name", "function_name", "alias_of", "function_type",
+	                  "description", "comment"}) {
+		column(name, text);
+	}
+	column("tags", LogicalType::MAP(text, text));
+	column("return_type", text);
+	column("parameters", list);
+	column("parameter_types", list);
+	column("varargs", text);
+	column("macro_definition", text);
+	column("has_side_effects", LogicalType::BOOLEAN);
+	column("internal", LogicalType::BOOLEAN);
+	column("extension_name", text);
+	column("function_oid", LogicalType::BIGINT);
+	column("examples", list);
+	column("stability", text);
+	column("categories", list);
+	bind->rows = FunctionRows(store, store.catalog.get(), principal, quack_door);
+	return std::move(bind);
+}
+
+unique_ptr<GlobalTableFunctionState> FunctionRowsInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<FunctionRowsState>();
+}
+
+void FunctionRowsScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &bind = input.bind_data->Cast<FunctionRowsBind>();
+	auto &state = input.global_state->Cast<FunctionRowsState>();
+	idx_t count = 0;
+	for (; state.offset < bind.rows.size() && count < STANDARD_VECTOR_SIZE; state.offset++, count++) {
+		auto &row = bind.rows[state.offset];
+		for (idx_t c = 0; c < row.size(); c++) {
+			output.SetValue(c, count, row[c]);
+		}
+	}
+	output.SetCardinality(count);
+}
+
+//! the roles and door as constants of the listing's SQL (the golden rule: no parameter added)
+string FunctionRowsCall(PolicyStore &store, const Principal &principal, bool columns) {
+	vector<string> roles;
+	for (auto &role : principal.roles) {
+		roles.push_back(Quote(role));
+	}
+	return "acl_principal_function_rows([" + StringUtil::Join(roles, ", ") + "]::VARCHAR[], " +
+	       (QuackDoor(store, principal) ? "true" : "false") + ", " + (columns ? "true" : "false") + ")";
+}
+
+} // namespace
+
+string PolicyStore::PrincipalFunctionColumnsSql(const Principal &principal) {
+	// spec 115: one row per parameter and per declared result column of every function the principal
+	// can call - what a JDBC driver's getFunctionColumns / getProcedureColumns read; spec 147: answered by
+	// acl_principal_function_rows a chunk at a time
+	if (!catalog && PlatformRowsFor(*this, principal, QuackDoor(*this, principal)).empty()) {
+		return "SELECT NULL::VARCHAR AS database_name, NULL::VARCHAR AS schema_name, NULL::VARCHAR AS function_name, "
+		       "NULL::VARCHAR AS function_type, NULL::VARCHAR AS column_kind, NULL::INTEGER AS position, NULL::VARCHAR "
+		       "AS column_name, NULL::VARCHAR AS data_type, NULL::BOOLEAN AS is_nullable, NULL::VARCHAR AS comment "
+		       "WHERE false";
+	}
+	return "SELECT * FROM " + FunctionRowsCall(*this, principal, true);
+}
+
+string PolicyStore::PrincipalFunctionsSql(const Principal &principal) {
+	// (b) first: the virtual functions a call of this principal reaches, each resolved the way a call
+	// is. A virtual function also takes the bare call of every engine function of its name and kind
+	// (the rewriter resolves virtual functions first, by bare name), so those leave (a). Its rows come from
+	// acl_principal_function_rows (spec 147); the resolutions here are the ones it reads back from the cache.
+	std::set<string> shadowed; // kind \x1f name
+	bool any = !PlatformRowsFor(*this, principal, QuackDoor(*this, principal)).empty();
+	for (auto &function : CallableFunctions(*this, catalog.get(), principal)) {
+		any = true;
+		string parent, leaf;
+		NamePath::SplitLeaf(function.vname, parent, leaf);
+		if (function.bare) {
+			shadowed.insert(function.kind + "\x1f" + StringUtil::Lower(leaf));
+		}
 	}
 
 	// (a) the engine's functions the gate admits and a bare call reaches - one string key each,
@@ -373,10 +661,18 @@ string PolicyStore::PrincipalFunctionsSql(const Principal &principal) {
 	                        "chr(31) || CASE WHEN function_type IN ('table', 'table_macro') THEN 'table' ELSE 'scalar' "
 	                        "END) IN (" +
 	                        StringUtil::Join(keys, ", ") + ")");
-	if (rows.empty()) {
+	if (!any) {
 		return engine;
 	}
-	return "SELECT * FROM (" + engine + ") UNION ALL (" + StringUtil::Join(rows, " UNION ALL ") + ")";
+	return "SELECT * FROM (" + engine + ") UNION ALL SELECT * FROM " + FunctionRowsCall(*this, principal, false);
+}
+
+void RegisterAclPrincipalFunctionRows(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {
+	TableFunction rows(Identifier("acl_principal_function_rows"),
+	                   {LogicalType::LIST(LogicalType::VARCHAR), LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+	                   FunctionRowsScan, FunctionRowsBindFn, FunctionRowsInit);
+	rows.function_info = make_shared_ptr<FunctionRowsInfo>(store);
+	loader.RegisterFunction(rows);
 }
 
 } // namespace acl
