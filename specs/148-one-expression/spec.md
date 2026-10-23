@@ -1,6 +1,6 @@
 # Spec 148: a policy expression is one expression
 
-- **Status**: accepted (the owner, 2026-10-23: "да давай")
+- **Status**: implemented (accepted by the owner, 2026-10-23: "да давай")
 - **Date**: 2026-10-23
 - **Author**: hugr lab (found by spec 147's review)
 
