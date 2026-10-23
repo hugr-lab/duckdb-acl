@@ -208,14 +208,21 @@ NarrowedColumns(DatabaseInstance *db, const TablePolicy &policy,
 			return vector<Column>();
 		}
 	}
-	auto mask_type = [&](const string &mask, string &type) {
-		// spec 147 review: the mask as ONE parsed expression, bound from its printed form - never its text spliced
-		// into a statement (a mask with a FROM after it ran a table function while binding), and only a constant is
-		// typed without binding (a cast's written type is not its bound one: INT8, TEXT, DECIMAL)
+	auto mask_type = [&](const string &mask, const string &column, string &type) {
+		// spec 147 review: judged in the read's own shape - the wrap splices the mask's text into `REPLACE (<mask> AS
+		// <column>)`, so a text that does not parse there (an alias, a comment, a `;`, a FROM after it) refuses the
+		// read and lists nothing - then bound from its printed form in that shape (an aggregate, COLUMNS(), refuse
+		// there too); never the text spliced into a statement run here. Only a constant is typed without binding.
+		auto target = QuoteIdentifier(column);
 		unique_ptr<ParsedExpression> expression;
 		try {
+			Parser shape(ParserOptions::Builtin());
+			shape.ParseQuery("SELECT * REPLACE (" + mask + " AS " + target + ") FROM t");
+			if (shape.statements.size() != 1) {
+				return false;
+			}
 			auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(mask);
-			if (parsed.size() != 1) {
+			if (parsed.size() != 1 || parsed[0]->HasAlias()) {
 				return false;
 			}
 			expression = std::move(parsed[0]);
@@ -228,16 +235,21 @@ NarrowedColumns(DatabaseInstance *db, const TablePolicy &policy,
 			return true;
 		}
 		auto printed = expression->ToString();
-		auto key = printed + "\x1f" + inner;
+		auto key = printed + "\x1f" + column + "\x1f" + inner;
 		auto entry = mask_types.find(key);
 		if (entry == mask_types.end()) {
 			string bound;
 			try {
 				Connection con(*db);
-				auto described =
-				    con.Query("DESCRIBE SELECT " + printed + " AS m FROM (SELECT " + inner + " WHERE false)");
-				if (!described->HasError() && described->RowCount() == 1) {
-					bound = described->Collection().GetValue(1, 0).ToString();
+				auto described = con.Query("DESCRIBE SELECT * REPLACE (" + printed + " AS " + target +
+				                           ") FROM (SELECT " + inner + " WHERE false)");
+				if (!described->HasError()) {
+					ResultRows rows(*described);
+					for (idx_t row = 0; row < rows.Count(); row++) {
+						if (StringUtil::CIEquals(rows.GetValue(0, row).ToString(), column)) {
+							bound = rows.GetValue(1, row).ToString();
+						}
+					}
 				}
 			} catch (std::exception &) {
 				bound.clear();
@@ -258,7 +270,7 @@ NarrowedColumns(DatabaseInstance *db, const TablePolicy &policy,
 		column.name = entry->second.mask.empty() ? name : entry->second.spelled;
 		column.type = candidate.type;
 		column.comment = candidate.comment;
-		if (!entry->second.mask.empty() && !mask_type(entry->second.mask, column.type)) {
+		if (!entry->second.mask.empty() && !mask_type(entry->second.mask, name, column.type)) {
 			return vector<Column>(); // a mask that does not bind refuses the read
 		}
 		out.push_back(std::move(column));

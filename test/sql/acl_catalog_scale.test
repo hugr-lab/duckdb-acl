@@ -1088,6 +1088,32 @@ statement error
 ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT * FROM fx();
 ----
 
+# re-review: a mask the read refuses - an aggregate, an alias in its text - lists no columns either
+statement ok
+ACL ADMIN ADD TABLE FUNCTION m.fy MACRO 'SELECT * FROM phys.main.w';
+
+statement ok
+ACL ADMIN ADD TABLE FUNCTION m.fz MACRO 'SELECT * FROM phys.main.w';
+
+statement ok
+SELECT acl_grant_object('masker', 'm', 'fy', '{"select": true}', '', 'c0 = count(*), c2');
+
+statement ok
+SELECT acl_grant_object('masker', 'm', 'fz', '{"select": true}', '', 'c0 = c1 AS m, c2');
+
+query T
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT list(DISTINCT function_name ORDER BY function_name) FROM acl_function_columns() WHERE function_name IN ('fy', 'fz') AND column_kind = 'column';
+----
+NULL
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT * FROM fy();
+----
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJzNCIsInJvbGVzIjpbIm1hc2tlciJdfQ.bVtv7l53TuheU76sMxwB0raiWlHbfjJEU8gL0oh9cLXXJcG4w3E06wRYffs5xriC02tZZRsS66BOoaMQjUSfQzQuBa0hoBDfTUQu1U8uddb9WbDKbHemxqjs2IQtXhS34twGJfbpk4dsi2x6mxyvs21BiNmnXHnT8HLWXahH30D687bWGm0xldPmvPElG10F9Rk8cBbD7SWxj0OV5VXdNp8ez08aNQeg8OEr70Ma9eg8PVThtnmr1Dg0kUhd-pMKfFAeFsd6lSquX7fIsvnjgBD1Jf0Xl9urSYqhM0oKit1M5u0Eyg0Z7v3lZZSSK01LJoY7LUATwtO-4ZolQiHKxg' SELECT * FROM fz();
+----
+
 # review: a role named `a,b` and the role set {a, b} are two keys of the caches - one never answers with the other's
 statement ok
 ACL ADMIN CREATE VIRTUAL CATALOG k;

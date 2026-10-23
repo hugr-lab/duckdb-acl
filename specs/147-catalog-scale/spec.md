@@ -69,6 +69,22 @@ buffer pool holding what was read (2 GiB of `BASE_TABLE` after 8,000 tables) - u
 | `SHOW ALL TABLES` | 20,000 | 0.62 s, 1.0 GiB | 0.80 s, 1.7 GiB | 3.4 s, **9.4 GiB** |
 | `duckdb_functions()` | - | **over 120 s** | over 120 s | over 120 s |
 
+**After PR 1** (the same catalog, warm unless said; before → after):
+
+| what | 1 role | 10 roles | 100 roles |
+|---|---|---|---|
+| a warm statement (gateway) | 1 → 0-1 ms | 5 → 0-1 ms | 44 → 2 ms |
+| 2,000 distinct tables, each | 28 → 28 ms | 33 → 28 ms | 75 → 31 ms |
+| `information_schema.tables` | 0.13 s → 0.07 s | 0.19 → 0.09 s | 0.86 s, 5.0 GiB → 0.26 s, 0.66 GiB |
+| columns of one table | 0.75 → 0.54 s | 0.86 → 0.60 s | 3.1 s, 8.9 GiB → 1.5 s, 1.3 GiB |
+| `information_schema.columns` (80,000) | 0.86 → 0.68 s | 1.15 → 0.69 s | 4.0 s, 9.9 GiB → 1.8 s, 2.2 GiB |
+| `duckdb_tables()` | 1.0 → 0.76 s | 1.3 → 0.79 s | 4.2 s, 10.8 GiB → 1.9 s, 1.9 GiB |
+| `SHOW ALL TABLES` | 0.62 → 0.52 s | 0.80 → 0.54 s | 3.4 s, 9.4 GiB → 1.6 s, 1.6 GiB |
+| `duckdb_functions()` first / again | > 120 s → 0.44 / 0.04 s | > 120 s → 0.80 / 0.04 s | > 120 s → 3.7 / 0.04 s, 0.5 GiB |
+
+The first functions listing of a role set still resolves functions x roles pairs (1 million with 100 roles). Writes are
+PR 2's.
+
 ## Findings
 
 1. **`duckdb_functions()` / `acl_function_columns()` resolve every visible function on its own**

@@ -574,8 +574,10 @@ bool CatalogBackend::ResolveTable(const Principal &principal, const string &vnam
 	auto key = RoleSig(principal) + "\x1f" + StringUtil::Lower(vname) + "\x1f" +
 	           (NodeStripsAliases(*instance) ? "b" : "k") + (NodeEnumsToVarchar(*instance) ? "v" : "k") + "\x1f" +
 	           capability;
+	int64_t read_at; // spec 147 review: what is computed across a version change is answered, not kept
 	{
 		lock_guard<mutex> guard(lock);
+		read_at = version;
 		auto entry = objects.find(key);
 		if (entry != objects.end()) {
 			out = entry->second.second;
@@ -589,8 +591,10 @@ bool CatalogBackend::ResolveTable(const Principal &principal, const string &vnam
 		policy.from_schema_alias = true;
 	}
 	lock_guard<mutex> guard(lock);
-	ClearIfOversized(objects);
-	objects[key] = {found, policy};
+	if (version == read_at) {
+		ClearIfOversized(objects);
+		objects[key] = {found, policy};
+	}
 	if (found) {
 		out = policy;
 	}
@@ -1135,8 +1139,10 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 	EnsureFresh();
 	auto kind = table_kind ? "table" : "scalar";
 	auto key = RoleSig(principal) + "\x1f" + kind + "\x1f" + StringUtil::Lower(vname);
+	int64_t read_at; // spec 147 review: what is computed across a version change is answered, not kept
 	{
 		lock_guard<mutex> guard(lock);
+		read_at = version;
 		auto entry = functions.find(key);
 		if (entry != functions.end()) {
 			out = entry->second.second;
@@ -1186,8 +1192,10 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 		FunctionPolicyFrom(result_rows, 0, end, vname, table_kind, policy);
 	}
 	lock_guard<mutex> guard(lock);
-	ClearIfOversized(functions);
-	functions[key] = {found, policy};
+	if (version == read_at) {
+		ClearIfOversized(functions);
+		functions[key] = {found, policy};
+	}
 	if (found) {
 		out = policy;
 	}
@@ -1794,8 +1802,10 @@ void CatalogBackend::LoadRights(const Principal &principal, RightsRows &out) {
 	}
 	EnsureFresh();
 	auto key = RoleSig(principal);
+	int64_t read_at; // spec 147 review: what is computed across a version change is answered, not kept
 	{
 		lock_guard<mutex> guard(lock);
+		read_at = version;
 		auto entry = rights_cache.find(key);
 		if (entry != rights_cache.end()) {
 			out = entry->second;
@@ -1806,8 +1816,10 @@ void CatalogBackend::LoadRights(const Principal &principal, RightsRows &out) {
 	AdminScopes(principal, out.scopes);
 	PlatformGrants(principal, out.platform);
 	lock_guard<mutex> guard(lock);
-	ClearIfOversized(rights_cache);
-	rights_cache[key] = out;
+	if (version == read_at) {
+		ClearIfOversized(rights_cache);
+		rights_cache[key] = out;
+	}
 }
 
 void CatalogBackend::PlatformGrants(const Principal &principal, vector<std::pair<string, bool>> &out) {
@@ -1884,8 +1896,10 @@ void CatalogBackend::KnownRoles(const vector<string> &values, case_insensitive_s
 	EnsureFresh();
 	// spec 147: answered per policy version - a gateway statement asks for every role its token claims
 	vector<string> missing;
+	int64_t read_at; // an answer computed across a version change is not kept
 	{
 		lock_guard<mutex> guard(lock);
+		read_at = version;
 		for (auto &value : values) {
 			auto entry = known_roles_cache.find(value);
 			if (entry == known_roles_cache.end()) {
@@ -1898,7 +1912,6 @@ void CatalogBackend::KnownRoles(const vector<string> &values, case_insensitive_s
 	if (missing.empty()) {
 		return;
 	}
-	auto read_at = version;                 // spec 147 review: an answer computed across a version change is not kept
 	std::set<string> found;                 // exact: roles compare exactly
 	case_insensitive_set_t found_by_driver; // a driver answers in its own spelling (spec 008)
 	if (function_mode) {
