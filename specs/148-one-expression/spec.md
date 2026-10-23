@@ -38,7 +38,9 @@ accepted by every check: the mask's select list is `j AS m`, the FROM is never s
   closed inside the text hides nothing and is allowed.
 
   The two parses are compared as trees, in place (`Equals`). A copy of a star's EXCLUDE / REPLACE / RENAME sets
-  prints them in another order (review). A parameter (`?`, `$1`) is refused too, by the golden rule.
+  prints them in another order (review). A parameter (`?`, `$1`) is refused too, by the golden rule. It is read
+  from the statement's own map, so it is found at any depth - the re-review reproduced a prepared read binding the
+  client's `$1` into a policy through a subquery.
 - **Refused where it is written** (`RequireOneExpression`): `RequirePolicyFreeExpressions` (every writer of an RLS and
   a column list: relations, catalog and object grants, ALTER ... SET), a scalar function's template, and a
   reference's join expression. A REMAP item is refused by `ItemBinds`.
@@ -58,7 +60,8 @@ accepted by every check: the mask's select list is `j AS m`, the FROM is never s
   declared list's projection, and an RLS at the end of a statement.
 - **A column's name is emitted as a name.** The read quoted it only when it renamed: a declared column named `odd
   name` read under a grant was pasted bare (review).
-- The memory store's writers (`acl_grant_table`, a scalar template) judge the same text.
+- The memory store's writers (`acl_grant_table`, a scalar template) judge the same text, and a name it pastes as written
+  must be one column reference (`RequireColumnName`).
 
 ## Enforcement & security
 
@@ -106,4 +109,5 @@ accepted by every check: the mask's select list is `j AS m`, the FROM is never s
   - an expression position is the engine's `Expression` rule;
   - this spec's text check becomes "the text parses as the rule".
 - Older, noted by the review: `ParseColumnList` splits a list or struct literal at its commas (`[a, b]`,
-  `{'a': x}`). A comment before an item becomes part of its name.
+  `{'a': x}`). A comment before an item becomes part of its name. A `""` inside a quoted name swallows the next items
+  (`"we""ird", s` is one column). The PEG spec removes the hand splitter.

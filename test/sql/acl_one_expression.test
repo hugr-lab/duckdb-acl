@@ -14,6 +14,12 @@ SELECT acl_grant_table('m', 't', 'phys.main.t', 'id, note = 1 FROM range(1)', ''
 ----
 spec 148
 
+# ... and a name it pastes as written
+statement error
+SELECT acl_grant_table('m', 't', 'phys.main.t', 'id FROM range(1)', '', 'select');
+----
+not a column name
+
 statement ok
 ATTACH ':memory:' AS store;
 
@@ -132,6 +138,16 @@ parameter
 
 statement error
 SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = $1');
+----
+parameter
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id IN (SELECT id FROM phys.main.t WHERE id = ?)', '');
+----
+parameter
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = (SELECT max(note) FROM phys.main.t WHERE id = $1)');
 ----
 parameter
 

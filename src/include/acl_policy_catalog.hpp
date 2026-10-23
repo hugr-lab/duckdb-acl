@@ -378,6 +378,8 @@ bool OneExpression(const string &text, string &problem);
 bool StoredExpressionsOk(const vector<string> &texts);
 //! spec 148: refuse, where it is written, a policy expression that is not one expression
 void RequireOneExpression(const char *what, const string &text);
+//! spec 148: a name the memory store pastes as it is written must be one column reference
+void RequireColumnName(const char *what, const string &name);
 
 //! Parse a caps JSON object ({"select": true, "insert": false, ...}) into the set of enabled
 //! capability names, with duckdb's bundled yyjson. Anything but a flat object of booleans is refused.

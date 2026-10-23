@@ -696,6 +696,7 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		// spec 148: the memory store pastes this text at read too
 		acl_detail::RequireOneExpression("the grant's RLS", rls);
 		for (auto &column : columns) {
+			acl_detail::RequireColumnName("the grant's column list", column.first);
 			acl_detail::RequireOneExpression("the grant's column list", column.second);
 		}
 		TablePolicy policy;

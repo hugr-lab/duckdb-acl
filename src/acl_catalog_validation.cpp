@@ -8,8 +8,6 @@
 #include "acl_rewriter.hpp"
 #include "acl_types.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/parsed_expression_iterator.hpp"
-#include "duckdb/parser/expression/parameter_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
@@ -83,12 +81,9 @@ bool OneExpression(const string &text, string &problem) {
 		problem = "text that does not stay one expression where it is placed (a comment left open, a parenthesis)";
 		return false;
 	}
-	// the golden rule: a statement's parameters are its client's - a policy text that holds one would make every read
-	// under it ask for a value
-	bool parameter = false;
-	ParsedExpressionIterator::VisitExpression<ParameterExpression>(
-	    *alone->select_list[0], [&](const ParameterExpression &) { parameter = true; });
-	if (parameter) {
+	// the golden rule: a statement's parameters are its client's - a policy text that holds one (at any depth, inside a
+	// subquery too: the parser maps every one) would take the client's value into the policy
+	if (!alone_statement->named_param_map.empty()) {
 		problem = "a parameter ($1, ?) - a policy carries values, never asks for them";
 		return false;
 	}
@@ -125,6 +120,19 @@ bool StoredExpressionsOk(const vector<string> &texts) {
 		}
 	}
 	return true;
+}
+
+void RequireColumnName(const char *what, const string &name) {
+	// a name as one column reference (quoted or not) - nothing else may stand where a name is pasted
+	string problem;
+	bool ok = OneExpression(name, problem);
+	if (ok) {
+		auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(name);
+		ok = parsed.size() == 1 && parsed[0]->GetExpressionClass() == ExpressionClass::COLUMN_REF;
+	}
+	if (!ok) {
+		throw BinderException("acl admin: %s names \"%s\", which is not a column name (spec 148)", what, name);
+	}
 }
 
 void RequireOneExpression(const char *what, const string &text) {
