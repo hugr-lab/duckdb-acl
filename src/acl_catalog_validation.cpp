@@ -9,53 +9,76 @@
 #include "acl_types.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/parser/simplified_token.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 
 namespace duckdb {
 namespace acl {
 namespace acl_detail {
 
-bool OneExpression(const string &text, string &problem) {
-	for (auto &token : Parser::Tokenize(text)) {
-		if (token.type == SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT) {
-			problem = "a comment - it hides what follows it where the text is placed";
-			return false;
-		}
-	}
+namespace {
+
+//! `SELECT <sql>` parsed to its one SelectNode, or null (not one SELECT, a set operation, modifiers, a CTE)
+unique_ptr<SQLStatement> ParseOneSelect(const string &sql, optional_ptr<SelectNode> &select) {
+	select = nullptr;
 	vector<unique_ptr<SQLStatement>> statements;
 	try {
 		Parser parser(ParserOptions::Builtin());
-		parser.ParseQuery("SELECT " + text);
+		parser.ParseQuery(sql);
 		statements = std::move(parser.statements);
 	} catch (std::exception &) {
-		// what does not parse alone may parse where it is spliced (an unbalanced parenthesis closes the
-		// statement around it): refused as well
-		problem = "text that does not parse as one expression";
-		return false;
+		return nullptr;
 	}
 	if (statements.size() != 1 || statements[0]->type != StatementType::SELECT_STATEMENT) {
-		problem = "more than one statement";
-		return false;
+		return nullptr;
 	}
 	auto &node = *statements[0]->Cast<SelectStatement>().node;
 	if (node.type != QueryNodeType::SELECT_NODE || !node.modifiers.empty() || !node.cte_map.map.empty()) {
-		problem = "a query, not an expression";
+		return nullptr;
+	}
+	select = &node.Cast<SelectNode>();
+	if (!select->groups.group_expressions.empty() || !select->groups.grouping_sets.empty() || select->having ||
+	    select->qualify || select->sample) {
+		select = nullptr;
+		return nullptr;
+	}
+	return std::move(statements[0]);
+}
+
+} // namespace
+
+bool OneExpression(const string &text, string &problem) {
+	// judged by the parser that reads the text where it is spliced - alone, and with a known tail right after it:
+	// what the text does to the text around it (a comment left open, a parenthesis, a clause, a second statement)
+	// shows as a tail that is no longer the one written
+	optional_ptr<SelectNode> alone;
+	auto alone_statement = ParseOneSelect("SELECT " + text, alone);
+	if (!alone || alone->select_list.size() != 1 ||
+	    (alone->from_table && alone->from_table->type != TableReferenceType::EMPTY_FROM) || alone->where_clause) {
+		problem = "not one expression (a clause, a second statement or text that does not parse)";
 		return false;
 	}
-	auto &select = node.Cast<SelectNode>();
-	if (select.select_list.size() != 1) {
-		problem = "more than one expression";
-		return false;
-	}
-	if (select.select_list[0]->HasAlias()) {
+	if (alone->select_list[0]->HasAlias()) {
 		problem = "an alias";
 		return false;
 	}
-	if ((select.from_table && select.from_table->type != TableReferenceType::EMPTY_FROM) || select.where_clause ||
-	    !select.groups.group_expressions.empty() || !select.groups.grouping_sets.empty() || select.having ||
-	    select.qualify || select.sample) {
-		problem = "a clause after it (FROM, WHERE, GROUP BY, ...)";
+	optional_ptr<SelectNode> placed;
+	auto placed_statement =
+	    ParseOneSelect("SELECT " + text + " AS __acl_a, 1 AS __acl_b FROM __acl_t WHERE true", placed);
+	bool kept = placed && placed->select_list.size() == 2 && placed->where_clause &&
+	            placed->where_clause->GetExpressionClass() == ExpressionClass::CONSTANT && placed->from_table &&
+	            placed->from_table->type == TableReferenceType::BASE_TABLE &&
+	            placed->from_table->Cast<BaseTableRef>().Table().GetIdentifierName() == "__acl_t" &&
+	            placed->select_list[0]->GetAlias().GetIdentifierName() == "__acl_a" &&
+	            placed->select_list[1]->GetAlias().GetIdentifierName() == "__acl_b" &&
+	            placed->select_list[1]->GetExpressionClass() == ExpressionClass::CONSTANT;
+	if (kept) {
+		auto first = placed->select_list[0]->Copy();
+		first->ClearAlias();
+		kept = first->ToString() == alone->select_list[0]->ToString();
+	}
+	if (!kept) {
+		problem = "text that does not stay one expression where it is placed (a comment left open, a parenthesis)";
 		return false;
 	}
 	return true;

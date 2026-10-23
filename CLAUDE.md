@@ -959,9 +959,10 @@ written to the per-name cache), rows from `acl_principal_function_rows(roles, qu
 of. Test `acl_catalog_scale.test`.
 
 **Spec 148 — a policy expression is one expression**: an RLS, a mask, a computed column, a REMAP item, a scalar
-template and a reference's join expression must be exactly one expression - `OneExpression` (acl_catalog_validation.cpp:
-no comment token, `SELECT <text>` = one statement, one select item, no alias, no FROM / WHERE / ... ; unparseable
-refused too). Refused where written (`RequireOneExpression` in `RequirePolicyFreeExpressions` and the template /
+template and a reference's join expression must be exactly one expression - `OneExpression` (acl_catalog_validation.cpp,
+the real parser only: `SELECT <text>` = one item, no alias, no clause; and `SELECT <text> AS __acl_a, 1 AS __acl_b
+FROM __acl_t WHERE true` keeps that structure with the same first item - an open comment, a parenthesis, a tail break
+it; unparseable refused). Refused where written (`RequireOneExpression` in `RequirePolicyFreeExpressions` and the template /
 reference writers), and never spliced by a probe (`ItemBinds`, `ProjectionSchema`, `PredicateError` judge first - a
 stored row is the check's `mask_broken` / `rls_broken` with the reason). The gates judged `ParseExpressionList`'s
 select list, which drops a FROM written after a mask. Test `acl_one_expression.test`.

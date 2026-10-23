@@ -1,7 +1,7 @@
 # name: test/sql/acl_one_expression.test
 # description: spec 148 - a policy expression (an RLS, a mask, a computed column, a REMAP item, a scalar template, a
-#   reference's join expression) is exactly one expression, refused where it is written otherwise: a comment, an
-#   alias, a FROM / WHERE written after it, a second statement, an unbalanced parenthesis. The node splices this text
+#   reference's join expression) is exactly one expression, refused where it is written otherwise: a comment left
+#   open, an alias, a FROM / WHERE written after it, a second statement, an unbalanced parenthesis. The node splices this text
 #   into statements; the gates judge only its select list. A row stored past the check is reported by
 #   acl_check_catalog and never run by its probes.
 # group: [sql]
@@ -42,17 +42,21 @@ ACL ADMIN CREATE ROLE r;
 statement error
 SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1 FROM range(3)');
 ----
-a clause after it
+spec 148
 
 statement error
 SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) -- hidden');
 ----
-a comment
+does not stay one expression
 
 statement error
-SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) /* hidden */');
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) /* hidden');
 ----
-a comment
+spec 148
+
+# a comment closed inside the text hides nothing around it
+statement ok
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) /* kept */');
 
 statement error
 SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1; SELECT 2');
@@ -73,7 +77,7 @@ spec 148
 statement error
 SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id > 0 FROM range(1)', '');
 ----
-a clause after it
+spec 148
 
 statement error
 ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select) MAIN RLS (id > 0 -- x
@@ -119,7 +123,7 @@ spec 148
 statement error
 SELECT acl_add_relation('c', 'v', 'phys.main.t', '', 'id > 0 -- x');
 ----
-a comment
+spec 148
 
 # a REMAP item
 statement ok

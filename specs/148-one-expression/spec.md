@@ -27,14 +27,15 @@ accepted by every check: the mask's select list is `j AS m`, the FROM is never s
 
 ## Design
 
-- `OneExpression(text, problem)` (acl_catalog_validation.cpp, declared in acl_policy_catalog.hpp):
-  1. no comment token (`Parser::Tokenize`, `SIMPLIFIED_TOKEN_COMMENT`), since a comment hides what follows it wherever
-     the text is placed;
-  2. `SELECT <text>` parses to exactly one statement: a SelectNode with one select item, no alias, an empty FROM, no
-     WHERE / GROUP BY / HAVING / QUALIFY / SAMPLE / modifiers / CTE.
+- `OneExpression(text, problem)` (acl_catalog_validation.cpp, declared in acl_policy_catalog.hpp) judges the text with
+  the same parser that reads it where it is spliced, never a second lexer:
+  1. **Alone.** `SELECT <text>` is one SelectNode with one select item, no alias, no FROM, and no other clause.
+  2. **With a known tail right after it.** `SELECT <text> AS __acl_a, 1 AS __acl_b FROM __acl_t WHERE true` keeps
+     exactly that structure, and its first item prints as the text alone does.
 
-  Text that does not parse alone is refused too: an unbalanced parenthesis could close the statement it is spliced
-  into.
+  What the text does to the text around it shows as a tail that is no longer the one written: a comment left open,
+  an unbalanced parenthesis, a clause or a second statement. Text that does not parse is refused too. A comment
+  closed inside the text hides nothing and is allowed.
 - **Refused where it is written** (`RequireOneExpression`): `RequirePolicyFreeExpressions` (every writer of an RLS and
   a column list: relations, catalog and object grants, ALTER ... SET), a scalar function's template, and a
   reference's join expression. A REMAP item is refused by `ItemBinds`.
@@ -57,14 +58,15 @@ accepted by every check: the mask's select list is `j AS m`, the FROM is never s
 
 `acl_one_expression.test`:
 - Refused at write:
-  - a catalog grant's mask with a FROM after it, a `--` or `/* */` comment, a second statement, an alias, or an
-    unbalanced parenthesis;
+  - a catalog grant's mask with a FROM after it, a `--` comment, an open `/*` comment, a second statement, an alias, or
+    an unbalanced parenthesis;
   - its RLS with a FROM after it;
   - an object grant's mask and RLS;
   - a relation's computed column and RLS;
   - a REMAP item;
   - a scalar template.
-- Allowed and read: a string holding comment marks, CASE, a subquery in the RLS, a lambda.
+- Allowed and read: a comment closed inside the text, a string holding comment marks, CASE, a subquery in the RLS,
+  and a lambda.
 - A row written straight into the policy tables is reported by `acl_check_catalog` with spec 148's reason.
 
 `acl_catalog_scale.test` (spec 147): its injected mask is now refused at write.
