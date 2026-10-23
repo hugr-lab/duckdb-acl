@@ -377,3 +377,60 @@ query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name = 'phys' AND schema_name = 'lake';
 ----
 0
+
+# --- re-review 145 (negative tests): a condition reads under the read policy only where every role the verb unites
+# reads - else a condition would read a column on rows only the verb reaches (the change count tells its value)
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN RLS (id = 2);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update) MAIN COLUMNS (id, amount);
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = amount WHERE secret = 'S1';
+----
+secret
+
+# an upsert's SET and WHERE are never mapped column by column: under a column policy - the update's, or the one it
+# reads under - refused, as an insert's is (a hidden column read, a hidden field written)
+statement ok
+CREATE TABLE phys.main.p(id INTEGER PRIMARY KEY, amount INTEGER, addr STRUCT(city VARCHAR, ssn VARCHAR));
+
+statement ok
+INSERT INTO phys.main.p VALUES (1, 0, {'city': 'Berlin', 'ssn': 'REAL'});
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.p AS phys.main.p;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN COLUMNS (id, amount, addr.city);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert) MAIN;
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' INSERT INTO p VALUES (1, 0, {'city': 'Rome', 'ssn': 'x'}) ON CONFLICT (id) DO UPDATE SET amount = length(p.addr.ssn);
+----
+ON CONFLICT DO UPDATE under a column policy
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' INSERT INTO p VALUES (1, 0, {'city': 'Rome', 'ssn': 'HACKED'}) ON CONFLICT (id) DO UPDATE SET addr = excluded.addr;
+----
+ON CONFLICT DO UPDATE under a column policy
+
+query T
+SELECT addr.ssn FROM phys.main.p;
+----
+REAL

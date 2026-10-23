@@ -1659,6 +1659,23 @@ private:
 			                               " is not allowed under a row or column policy - write ON CONFLICT (…) DO "
 			                               "UPDATE SET …, which the policy confines");
 		}
+		// what its SET and WHERE read and write of the row already there is never mapped column by column (an UPDATE's
+		// is: MapReadable, field writes) - under a column policy, the update's or the one it reads under, refused as
+		// ApplyInsertPolicy refuses an insert's (the re-review: hidden columns read, a hidden field written)
+		auto column_policy = [](const TablePolicy &p) {
+			return !p.visible_columns.empty() || !p.injections.empty() || !p.field_writes.empty() ||
+			       !p.write_columns.empty() || !p.narrowed_reads.empty();
+		};
+		bool restricted = column_policy(update);
+		if (!restricted && update.caps.count("select") && update.capability_rows_read) {
+			TablePolicy read;
+			restricted = store.ResolveTable(principal, key, read) && column_policy(read);
+		}
+		if (node.on_conflict_info->action_type == OnConflictAction::UPDATE && restricted) {
+			Deny(Reason::WRITE_POLICY, "insert into " + Shown(key) +
+			                               " cannot use ON CONFLICT DO UPDATE under a column policy - write an "
+			                               "UPDATE, which the policy confines column by column");
+		}
 		// RETURNING returns the row already there: a read, as an UPDATE's (ResolveDmlTarget)
 		if (!update.caps.count("select")) {
 			update.returning_refused = "select on " + Shown(key) + " is not allowed";
@@ -3794,7 +3811,9 @@ private:
 		} else {
 			try {
 				TablePolicy read;
-				if (store.ResolveTable(principal, key, read)) {
+				// only where every role the verb unites reads: the verb's slice then lies inside the read's - else a
+				// condition would read the read's columns on rows only the verb reaches (the re-review's oracle)
+				if (store.ResolveTable(principal, key, read) && policy.capability_rows_read) {
 					dml_read_policy = read;
 				}
 			} catch (std::exception &ex) {

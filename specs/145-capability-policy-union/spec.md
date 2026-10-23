@@ -44,10 +44,15 @@ ACL TOKEN '<roles: analyst, auditor>' SELECT * FROM t;   -- every row, every col
   REPLACE` change the row already there - they need `update` and run their SET under the update's policy
   (`ConflictUpdatePolicy`); an insert-only role updated through them, and an insert role beside an update role
   lifted its confinement. `OR REPLACE` has no SET to confine (duckdb writes every inserted column): refused under a
-  row or column policy, with `ON CONFLICT … DO UPDATE SET …` named as what the policy confines.
+  row or column policy, with `ON CONFLICT … DO UPDATE SET …` named as what the policy confines. `ON CONFLICT DO UPDATE`
+  under a column policy - the update's, or the read policy it reads under - is refused as an insert's already was
+  (`ApplyInsertPolicy`): its SET and WHERE are never mapped column by column, so the re-review read a hidden column and
+  wrote a hidden struct field through it.
 - **A statement's own conditions read**: what UPDATE / DELETE / MERGE's SET, WHERE, ON and WHEN read of the target is
-  judged under the read policy where the principal reads the object (the verb's predicate stays AND-ed in: which
-  rows it may touch), under the verb's where it only writes.
+  judged under the read policy where every role the verb unites reads (the verb's slice then lies inside the read's;
+  the verb's predicate stays AND-ed in), under the verb's otherwise - as a write-only role's always were (the
+  re-review: under the read policy beside a non-reading verb role, a condition read a column on rows only the verb
+  reaches, and the change count told its value).
 - **RETURNING is a read** - where it returns a row already there (UPDATE, DELETE, MERGE, an upsert): it needs
   `select`, and every grant row the verb's policy unites must hold `select` too (`capability_rows_read`: the verb's
   policy is then no wider than the read's - fewer predicates OR-ed, fewer lists united), else it is refused with
