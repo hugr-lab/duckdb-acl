@@ -434,3 +434,67 @@ query T
 SELECT addr.ssn FROM phys.main.p;
 ----
 REAL
+
+# --- focused review 145 (negative tests): beside a verb role that may not read, a condition reads only the columns
+# every verb role reads as stored - never one role's columns on another role's rows
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN RLS (id = 2) COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update) MAIN RLS (id = 1);
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = length(secret) WHERE id = 2;
+----
+secret
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update, delete) MAIN RLS (id = 2);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update, delete) MAIN RLS (id = 1) COLUMNS (id, amount);
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = amount WHERE id = 1 AND secret = 'S1';
+----
+secret
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' DELETE FROM t WHERE id = 1 AND secret = 'S1';
+----
+secret
+
+# an upsert beside an update role that may not read: any update role's column policy refuses it
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, update) MAIN COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert, update) MAIN RLS (amount = -1);
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' INSERT INTO p (id, amount) VALUES (1, -1) ON CONFLICT (id) DO UPDATE SET amount = length(p.addr.ssn);
+----
+ON CONFLICT DO UPDATE under a column policy
+
+query T
+SELECT addr.ssn FROM phys.main.p;
+----
+REAL

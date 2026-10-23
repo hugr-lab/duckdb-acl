@@ -1632,6 +1632,50 @@ private:
 		RequireReadableReturning(node.returning_list, policy, vname);
 	}
 
+	//! spec 145: what a DML statement's own conditions may read of its target where a role the verb unites may not read
+	//! it: only the columns EVERY role holding the verb reads as stored (none masks or narrows them) - the verb's union
+	//! would let one role's columns be read on another role's rows (the focused review's oracle). `restricted`: some
+	//! such role narrows the columns at all
+	TablePolicy VerbReadScope(const string &key, const string &verb, const TablePolicy &verb_policy, bool &restricted) {
+		restricted = false;
+		case_insensitive_set_t allowed;
+		for (auto &role : principal.roles) {
+			auto one = principal;
+			one.roles = {role};
+			TablePolicy own;
+			if (!store.ResolveTable(one, key, own, verb) || !own.caps.count(verb) || own.visible_columns.empty()) {
+				continue; // no grant here, no such verb, or every column as stored
+			}
+			case_insensitive_set_t mine = own.visible_columns;
+			for (auto &mask : own.injections) {
+				mine.erase(mask.first);
+			}
+			for (auto &tree : own.narrowed_reads) {
+				mine.erase(tree.first);
+			}
+			if (!restricted) {
+				allowed = std::move(mine);
+				restricted = true;
+				continue;
+			}
+			case_insensitive_set_t both;
+			for (auto &name : allowed) {
+				if (mine.count(name)) {
+					both.insert(name);
+				}
+			}
+			allowed = std::move(both);
+		}
+		auto scope = verb_policy;
+		if (restricted) {
+			// a name no column has: an empty set would read as "every column"
+			scope.visible_columns = allowed.empty() ? case_insensitive_set_t {"\x01"} : allowed;
+			scope.injections.clear();
+			scope.narrowed_reads.clear();
+		}
+		return scope;
+	}
+
 	//! spec 145: `ON CONFLICT … DO UPDATE` and `INSERT OR REPLACE` update a row that is already there - the `update`
 	//! capability, under ITS policy (the union of the grant rows that hold it), never the insert's: an insert-only
 	//! role updated through them, and an insert role beside an update role lifted the update's confinement.
@@ -1670,6 +1714,9 @@ private:
 		if (!restricted && update.caps.count("select") && update.capability_rows_read) {
 			TablePolicy read;
 			restricted = store.ResolveTable(principal, key, read) && column_policy(read);
+		} else if (!restricted) {
+			// a role the update unites may not read: any update role's own column policy confines it (VerbReadScope)
+			VerbReadScope(key, "update", update, restricted);
 		}
 		if (node.on_conflict_info->action_type == OnConflictAction::UPDATE && restricted) {
 			Deny(Reason::WRITE_POLICY, "insert into " + Shown(key) +
@@ -3825,6 +3872,10 @@ private:
 				policy.returning_refused = "a role that may " + capability + " " + Shown(key) +
 				                           " but not read it would widen what RETURNING returns";
 			}
+		}
+		if (!policy.capability_rows_read) {
+			bool restricted = false;
+			dml_read_policy = VerbReadScope(key, capability, policy, restricted);
 		}
 		auto phys = ParsePhysName(policy.phys);
 		NotePhysical(policy.phys);

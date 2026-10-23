@@ -52,7 +52,9 @@ ACL TOKEN '<roles: analyst, auditor>' SELECT * FROM t;   -- every row, every col
   judged under the read policy where every role the verb unites reads (the verb's slice then lies inside the read's;
   the verb's predicate stays AND-ed in), under the verb's otherwise - as a write-only role's always were (the
   re-review: under the read policy beside a non-reading verb role, a condition read a column on rows only the verb
-  reaches, and the change count told its value).
+  reaches, and the change count told its value) - and there only the columns EVERY role holding the verb reads as
+  stored (`VerbReadScope`: none masks or narrows them), never the verb's union, which let one role's columns be read
+  on another role's rows; an upsert there is refused when any update role narrows the columns.
 - **RETURNING is a read** - where it returns a row already there (UPDATE, DELETE, MERGE, an upsert): it needs
   `select`, and every grant row the verb's policy unites must hold `select` too (`capability_rows_read`: the verb's
   policy is then no wider than the read's - fewer predicates OR-ed, fewer lists united), else it is refused with
@@ -103,6 +105,10 @@ ACL TOKEN '<roles: analyst, auditor>' SELECT * FROM t;   -- every row, every col
 - **Intersecting instead of uniting**: spec 011 is a union - a principal may do what any of its roles may.
 
 ## Follow-ups
+
+- **The union itself (spec 011) is per object, not per row** - found by this spec's reviews, on main: a principal
+  whose role A reads row 2 without `secret` and role B reads row 1 whole reads row 2's `secret`, which neither role
+  may (rows OR-ed, column lists united independently); writes alike. Its own spec (146), the owner's decision.
 
 - An unqualified name reads under the MAIN grants' roles only, a qualified one under every role holding the catalog
   (spec 144's review): a principal reads less through `t` than through `c.t` - narrower, not a leak.
