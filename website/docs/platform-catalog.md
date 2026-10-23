@@ -388,7 +388,7 @@ The parameters mean what the matching `acl_*` function's do - see the
   was inherited - or `catalog`; `none` without a grant on the catalog), `caps` (an unstated grant = the
   five data capabilities; a view lists `select` at most; `manage` is shown by `platform.admins`), `main`
   (the catalog is the role's only MAIN one - bare names resolve there), and for a table or a view what a
-  read as the role gets: `rls`, `columns` (the role's own columns listing - what its `DESCRIBE` answers; `[]` = it reads none),
+  read as the role gets - for a role that may not read, the policy its writes are confined by (spec 145): `rls`, `columns` (the role's own columns listing - what its `DESCRIBE` answers; `[]` = it reads none),
   `masks` (the masks its grants state on those columns), `writable`, or `refused` (the resolver's refusal
   - every read of the object fails with it). Answered by the resolver itself; `policy` for any catalog, a
   catalog admin on its catalogs.

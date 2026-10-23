@@ -1,0 +1,500 @@
+# name: test/sql/acl_capability_union.test
+# description: spec 145 - a capability's policy is the union of the grant rows that hold it: a role that may not read
+#   (insert only, CAPS '{}') lifts no read role's row filter or columns, a role that may only insert lifts no update
+#   role's confinement, RETURNING reads under the read policy, and the listings narrow as the read does. The token
+#   names two roles: analyst and auditor (test/idp/rs).
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, amount INTEGER, secret VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 10, 'S1'), (2, 20, 'S2');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('test/idp/rs', '{"url": "test/idp/rs", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"]}}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.raw AS phys.main;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+# --- a read role with a row filter and a column list, beside a role that may only insert -------------------------
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN RLS (id = 2) COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert) MAIN;
+
+query II
+ACL ROLE 'analyst' SELECT * FROM t;
+----
+2	20
+
+# the insert-only role lifts nothing: the two roles read what the analyst reads (main: every row, every column)
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t;
+----
+2	20
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM raw.orders;
+----
+2	20
+
+query T
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT column_name FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position;
+----
+id
+amount
+
+# ... and inserts as the auditor may - anywhere, unconfined by the analyst's filter
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' INSERT INTO t (id, amount, secret) VALUES (3, 30, 'S3');
+
+# a plain INSERT's RETURNING returns what the principal wrote (and the defaults): allowed whatever it reads
+query T
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' INSERT INTO t (id, amount, secret) VALUES (4, 40, 'S4') RETURNING secret;
+----
+S4
+
+# --- an object grant CAPS '{}' on one role lifts nothing either --------------------------------------------------
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE auditor CAPS '{}';
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t ORDER BY id;
+----
+2	20
+
+# --- an update role confined by a predicate, beside a role that may only insert --------------------------------------
+statement ok
+ACL ADMIN REVOKE TABLE c.t FROM ROLE auditor;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN RLS (id = 2);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert) MAIN;
+
+# the update stays the analyst's: row 1 is outside its slice, untouched (main: the insert role lifted the predicate)
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = 0;
+
+query II
+SELECT id, amount FROM phys.main.orders ORDER BY id;
+----
+1	10
+2	0
+3	30
+4	40
+
+# one role holding both: its read and update policies agree - RETURNING reads what it updated
+query I
+ACL ROLE 'analyst' UPDATE t SET amount = 5 RETURNING amount;
+----
+5
+
+# an update's RETURNING is a read: refused where a role the update unites may not read (the update would return
+# what the reads do not) ...
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN RLS (id = 2);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update) MAIN;
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = 6 RETURNING secret;
+----
+RETURNING
+
+# ... allowed where every role the update unites reads (its policy is no wider than the read's)
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN RLS (id = 2) COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN;
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = 7 WHERE id = 2 RETURNING id, amount;
+----
+2	7
+
+# the update's own condition reads under the read policy (the auditor reads secret), its rows the update's slice
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = 8 WHERE secret IS NOT NULL;
+
+query II
+SELECT id, amount FROM phys.main.orders ORDER BY id;
+----
+1	10
+2	8
+3	30
+4	40
+
+# --- review 145: an upsert updates the row already there - the `update` capability, under its own policy -----------
+statement ok
+CREATE TABLE phys.main.keyed(id INTEGER PRIMARY KEY, tenant VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO phys.main.keyed VALUES (1, 'globex', 10), (2, 'acme', 20);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.k AS phys.main.keyed;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN RLS (tenant = 'acme');
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert) MAIN;
+
+# the conflict's update stays the analyst's: globex's row 1 is outside its slice (main: updated by the insert role)
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' INSERT INTO k VALUES (1, 'globex', 0) ON CONFLICT (id) DO UPDATE SET amount = 666;
+
+query III
+SELECT * FROM phys.main.keyed ORDER BY id;
+----
+1	globex	10
+2	acme	20
+
+# an insert-only role updates nothing through ON CONFLICT DO UPDATE or INSERT OR REPLACE (main: both updated)
+statement error
+ACL ROLE 'auditor' INSERT INTO k VALUES (1, 'globex', 0) ON CONFLICT (id) DO UPDATE SET amount = 222;
+----
+update on
+
+statement error
+ACL ROLE 'auditor' INSERT OR REPLACE INTO k VALUES (1, 'globex', 555);
+----
+update on
+
+# INSERT OR REPLACE has no SET to confine: refused under a row policy (main: it overwrote globex's row into acme's)
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, update) MAIN RLS (tenant = 'acme');
+
+statement error
+ACL ROLE 'analyst' INSERT OR REPLACE INTO k (id, tenant, amount) VALUES (1, 'acme', 333);
+----
+INSERT OR REPLACE
+
+query III
+SELECT * FROM phys.main.keyed ORDER BY id;
+----
+1	globex	10
+2	acme	20
+
+# ... and allowed where the update is unconfined
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, update) MAIN;
+
+statement ok
+ACL ROLE 'analyst' INSERT OR REPLACE INTO k VALUES (1, 'globex', 11);
+
+query III
+SELECT * FROM phys.main.keyed ORDER BY id;
+----
+1	globex	11
+2	acme	20
+
+# --- review 145: a role that may not read still sees only the columns its own lists keep -----------------------------
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert, update) MAIN RLS (id = 2) COLUMNS (id, amount);
+
+query T
+ACL ROLE 'auditor' SELECT column_name FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position;
+----
+id
+amount
+
+# the operator's screen describes the role's own policy, not a read it may not make
+query TT
+SELECT rls, columns FROM acl_effective_rights('auditor', 'c', 't');
+----
+id = 2	[id, amount]
+
+# --- review 145: a table function's call is a read - a role that may not call it lifts nothing ----------------------
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION c.f AS SELECT id, amount, secret FROM phys.main.orders;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.f TO ROLE analyst RLS (id = 2) COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert) MAIN;
+
+query II
+ACL ROLE 'analyst' SELECT * FROM f() ORDER BY id;
+----
+2	8
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM f() ORDER BY id;
+----
+2	8
+
+# --- review 145: a view, a DELETE and a MERGE follow the same rule -----------------------------------------------------
+statement ok
+CREATE TABLE phys.main.d(id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO phys.main.d VALUES (1, 10), (2, 20);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.d AS phys.main.d;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.v AS SELECT id, amount, secret FROM phys.main.orders;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, delete, merge) MAIN RLS (id = 2) COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert) MAIN;
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM v;
+----
+2	8
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' MERGE INTO d USING (SELECT 1 AS id UNION ALL SELECT 2) s ON d.id = s.id WHEN MATCHED THEN UPDATE SET amount = 0;
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' DELETE FROM d WHERE amount = 0 OR amount = 10;
+
+query II
+SELECT * FROM phys.main.d ORDER BY id;
+----
+1	10
+
+# --- review 145: a table a grant narrows by columns is a table - DROP drops it, RENAME renames it -------------------
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.vs FROM phys.lake;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert) MAIN COLUMNS (id);
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.vs TO ROLE analyst WITH (select, insert, create, drop);
+
+statement ok
+ACL ROLE 'analyst' CREATE TABLE vs.k(id INTEGER, y INTEGER);
+
+statement ok
+ACL ROLE 'analyst' ALTER TABLE vs.k RENAME TO k2;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'phys' AND schema_name = 'lake' AND table_name = 'k2';
+----
+1
+
+statement ok
+ACL ROLE 'analyst' DROP TABLE vs.k2;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'phys' AND schema_name = 'lake';
+----
+0
+
+# --- re-review 145 (negative tests): a condition reads under the read policy only where every role the verb unites
+# reads - else a condition would read a column on rows only the verb reaches (the change count tells its value)
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN RLS (id = 2);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update) MAIN COLUMNS (id, amount);
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = amount WHERE secret = 'S1';
+----
+secret
+
+# an upsert's SET and WHERE are never mapped column by column: under a column policy - the update's, or the one it
+# reads under - refused, as an insert's is (a hidden column read, a hidden field written)
+statement ok
+CREATE TABLE phys.main.p(id INTEGER PRIMARY KEY, amount INTEGER, addr STRUCT(city VARCHAR, ssn VARCHAR));
+
+statement ok
+INSERT INTO phys.main.p VALUES (1, 0, {'city': 'Berlin', 'ssn': 'REAL'});
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.p AS phys.main.p;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN COLUMNS (id, amount, addr.city);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert) MAIN;
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' INSERT INTO p VALUES (1, 0, {'city': 'Rome', 'ssn': 'x'}) ON CONFLICT (id) DO UPDATE SET amount = length(p.addr.ssn);
+----
+ON CONFLICT DO UPDATE under a column policy
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' INSERT INTO p VALUES (1, 0, {'city': 'Rome', 'ssn': 'HACKED'}) ON CONFLICT (id) DO UPDATE SET addr = excluded.addr;
+----
+ON CONFLICT DO UPDATE under a column policy
+
+query T
+SELECT addr.ssn FROM phys.main.p;
+----
+REAL
+
+# --- focused review 145 (negative tests): beside a verb role that may not read, a condition reads only the columns
+# every verb role reads as stored - never one role's columns on another role's rows
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update) MAIN RLS (id = 2) COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update) MAIN RLS (id = 1);
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = length(secret) WHERE id = 2;
+----
+secret
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, update, delete) MAIN RLS (id = 2);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (update, delete) MAIN RLS (id = 1) COLUMNS (id, amount);
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' UPDATE t SET amount = amount WHERE id = 1 AND secret = 'S1';
+----
+secret
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' DELETE FROM t WHERE id = 1 AND secret = 'S1';
+----
+secret
+
+# an upsert beside an update role that may not read: any update role's column policy refuses it
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE analyst;
+
+statement ok
+ACL ADMIN REVOKE CATALOG c FROM ROLE auditor;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, update) MAIN COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (insert, update) MAIN RLS (amount = -1);
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' INSERT INTO p (id, amount) VALUES (1, -1) ON CONFLICT (id) DO UPDATE SET amount = length(p.addr.ssn);
+----
+ON CONFLICT DO UPDATE under a column policy
+
+query T
+SELECT addr.ssn FROM phys.main.p;
+----
+REAL

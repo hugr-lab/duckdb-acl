@@ -495,12 +495,15 @@ struct CatalogBackend {
 	//! Split a written name into its qualified interpretation; empty head = no qualified branch
 	static void SplitName(const string &vname, string &head, string &rest);
 
-	bool ResolveTable(const Principal &principal, const string &vname, TablePolicy &out);
+	//! spec 145: `capability` - the one a statement exercises on the object (`select` for a read, the verb for a DML
+	//! target); the policy is the union of the grant rows that hold it, the caps the union of every row
+	bool ResolveTable(const Principal &principal, const string &vname, TablePolicy &out,
+	                  const string &capability = "select");
 
 	//! One JOIN resolves the object: both name interpretations, the unique-main guard, the per-role
 	//! effective caps (object override beats the catalog default) and the projected columns (as a
 	//! list() aggregate) come back in a single result - the engine does the selection.
-	bool LookupRelation(const Principal &principal, const string &vname, TablePolicy &out);
+	bool LookupRelation(const Principal &principal, const string &vname, TablePolicy &out, const string &capability);
 
 	//! Compose the grant chain onto the object's own definition (spec 011). A grant only narrows: its
 	//! predicate is AND-ed onto the object's, its column list intersects the object's, and on the
@@ -510,7 +513,7 @@ struct CatalogBackend {
 
 	//! The longest granted schema-alias prefix, picked by the query (ORDER BY prefix length);
 	//! the matched prefix RENAMEs into the physical schema, the binder validates existence.
-	bool LookupSchemaAlias(const Principal &principal, const string &vname, TablePolicy &out);
+	bool LookupSchemaAlias(const Principal &principal, const string &vname, TablePolicy &out, const string &capability);
 
 	bool ResolveFunction(const Principal &principal, const string &vname, bool table_kind, TablePolicy &out);
 

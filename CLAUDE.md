@@ -915,6 +915,16 @@ rule; none for views / functions / computed columns), in the duckdb_* surfaces, 
 `acl_tags`, EXCLUDEd). A grant's projection keeps the column's comment and tags. No SQL sets a tag: tests make them
 through the catalog API (`test_acl_physical_tags.cpp`) or DuckLake's metadata.
 
+**Spec 145 — a capability's policy is the union of the grants that hold it**: `ResolveTable(…, capability =
+"select")` (the cache key carries it) unites the `RowPolicy` of only the rows whose `EffectiveCaps` hold the
+capability (`LookupRelation` / `LookupSchemaAlias`; `ResolveFunction`: a call is a read), the caps over every row, and
+notes `capability_rows_read`; `ResolveDmlTarget` passes its verb and sets `dml_read_policy` (the read policy where
+the principal reads - what SET / WHERE / ON / WHEN read, via MapReadable; the verb's RLS AND-ed in). Upserts need
+`update` (`ConflictUpdatePolicy`; `OR REPLACE` refused under a row or column policy). RETURNING of an existing row
+needs `select` and `capability_rows_read` (`returning_refused`); a plain INSERT's returns what was written. Listings:
+`gcolumns` / `gfcolumns` the rows holding `select`, else (a write-only principal) every visible row's. Operator
+screens: `ResolveTableOwnPolicy`. Test `acl_capability_union.test`.
+
 **Spec 140 — a door picks up a renewed certificate**: a pair given as LOCAL files (`IsLocalCertificatePath`; the
 csi-driver's, hugr-platform spec 005) is re-read every `acl_door_certificate_refresh` s (GLOBAL, 60; 0 = once) by a
 `DoorCertificateWatcher` (`src/flight/acl_door_certificate.cpp`, OpenSSL: `CheckCertificatePair` judges the pair whole,

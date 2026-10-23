@@ -121,6 +121,9 @@ struct TablePolicy {
 	//! subquery whose free names could resolve against the source instead of the target (spec 020).
 	bool rls_unchecked = false;
 	string query; // full SELECT template for a view (SUBQUERY; replaces phys/projection/rls)
+	//! The object is a virtual view (its SQL is its definition). Never read off `query`, which a grant's column list
+	//! sets on a table with no declared columns too (review 145: DROP left the physical table, RENAME refused it)
+	bool is_view = false;
 	//! How a grant narrows a *table function's* result (spec 038). The function's returns cannot be
 	//! known without calling it, so the narrowing is expressed as SQL the engine resolves while it
 	//! binds: masks in an inner `REPLACE` (which errors when the column is not there) and the listed
@@ -141,6 +144,12 @@ struct TablePolicy {
 	bool writable = false;
 	//! Found through a live schema alias (which claims every name under it), not a stored object
 	bool from_schema_alias = false;
+	//! spec 145: a DML target's RETURNING reads - refused when the principal may not read the object, or a role whose
+	//! policy the verb unites may not read it (then the verb's policy may be wider than the read's); empty = it may
+	string returning_refused;
+	//! spec 145: every grant row the capability's policy unites also holds `select` - the policy is no wider than
+	//! the read's (fewer predicates OR-ed, fewer lists united)
+	bool capability_rows_read = true;
 	//! Columns a grant assigns on writes: physical column name -> value template (claims/constants
 	//! only). On INSERT the value is added when absent and overridden when supplied; on UPDATE a SET
 	//! of the column is overridden - so a row cannot be written outside the grant's slice.
@@ -1268,7 +1277,14 @@ struct PolicyStore {
 	//! dev mode, and with a policy source only when acl_allow_anonymous_admin is on (spec 009).
 	bool AnonymousAdminAllowed();
 
-	bool ResolveTable(const Principal &principal, const string &vname, TablePolicy &out);
+	//! spec 145: the policy of `capability` (a read's `select` by default, a DML target's verb) - the union of the
+	//! principal's grant rows that hold it
+	bool ResolveTable(const Principal &principal, const string &vname, TablePolicy &out,
+	                  const string &capability = "select");
+	//! spec 145: one role's own policy on an object, for the operator's screens - under `select` when it holds it, else
+	//! under the first verb it holds (a role's policy is the same under each capability it holds; under one it lacks,
+	//! none of it applies)
+	bool ResolveTableOwnPolicy(const Principal &principal, const string &vname, TablePolicy &out);
 	bool ResolveTableFunction(const Principal &principal, const string &vname, TablePolicy &out);
 	bool ResolveScalarFunction(const Principal &principal, const string &vname, TablePolicy &out);
 
@@ -1344,7 +1360,8 @@ private:
 	int64_t JwksRefreshInterval();
 	int64_t JwksMaxStale();
 	// catalog-backend bridges, defined in acl_policy_catalog.cpp (the backend type stays private there)
-	bool CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out);
+	bool CatalogResolveTable(const Principal &principal, const string &vname, TablePolicy &out,
+	                         const string &capability);
 	bool CatalogResolveFunction(const Principal &principal, const string &vname, bool table_kind, TablePolicy &out);
 	//! spec 072: the backend's model of the function categories; nullptr when the source has none (a
 	//! function-driver source without the slots), which reads as the seed

@@ -439,7 +439,8 @@ bool ResolveTarget(PolicyStore &store, DatabaseInstance &db, const Principal &pr
                    Mirror &out) {
 	try {
 		TablePolicy policy;
-		if (!store.ResolveTable(principal, NamePath(relation.parts).ToKey(), policy) || policy.phys.empty()) {
+		// spec 145: the policy it writes under - a read it may not make would describe the source whole
+		if (!store.ResolveTableOwnPolicy(principal, NamePath(relation.parts).ToKey(), policy) || policy.phys.empty()) {
 			return false;
 		}
 		if (!policy.caps.count("insert") && !policy.caps.count("update") && !policy.caps.count("delete") &&

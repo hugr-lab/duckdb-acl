@@ -443,7 +443,8 @@ void EffectiveRights(PolicyStore &store, const vector<string> &arguments, Rights
 			TablePolicy policy;
 			bool resolved = false;
 			try {
-				resolved = store.ResolveTable(principal, vcat + "." + vname, policy);
+				// spec 145: the role's own policy - under a capability it holds, never a read it may not make
+				resolved = store.ResolveTableOwnPolicy(principal, vcat + "." + vname, policy);
 			} catch (std::exception &ex) {
 				refused = Value(ErrorData(ex).RawMessage()); // every read of it refuses with this
 			}

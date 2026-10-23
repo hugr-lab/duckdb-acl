@@ -415,11 +415,17 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                                           " AND oc.\"vname\" = f.\"vname\""
 	                                     : string()) +
 	                    " WHERE f.\"kind\" = 'table' AND " + FunctionVisibleExpr() + ")";
-	string grant_columns = "gcolumns AS (SELECT r.\"vcat\" AS vcat, r.\"vname\" AS vname, g.\"role\" AS role,"
+	// spec 145: what narrows a listing is what narrows the read - the rows that hold `select` (the read unites their
+	// policies alone); an object no row of the principal's may read (it only writes) keeps every visible row's lists,
+	// as before - a role without `select` must not see the columns its own lists hide (the review's regression)
+	string grant_columns = "gcolumns_all AS (SELECT r.\"vcat\" AS vcat, r.\"vname\" AS vname, g.\"role\" AS role,"
 	                       " g.\"columns\" AS cat_columns, " +
-	                       string(HasObjectCaps() ? "oc.\"columns\"" : "NULL") + " AS obj_columns FROM " +
-	                       Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " +
-	                       visible + ")";
+	                       string(HasObjectCaps() ? "oc.\"columns\"" : "NULL") + " AS obj_columns, " +
+	                       CapsAllowSql(CapsExpr(), "select") + " AS reads FROM " + Tbl("relations") +
+	                       " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " + visible +
+	                       "), gcolumns AS (SELECT vcat, vname, role, cat_columns, obj_columns FROM gcolumns_all x"
+	                       " WHERE x.reads OR NOT EXISTS (SELECT 1 FROM gcolumns_all y WHERE y.vcat = x.vcat AND"
+	                       " y.vname = x.vname AND y.reads))";
 	// The names a grant states, split where the read path splits them (ParseColumnList: at top level, so a mask's
 	// own commas - `note = concat(id, amount)` - never make a name of its arguments; review 143: a SQL split on every
 	// comma listed `amount` as kept) and each item's column - a masked item's left of '=', spec 102's path its head
@@ -501,31 +507,34 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// list in its own order - so a column belongs where the first role that states it put it.
 	// Ranking by `(role, pos)` and taking each name's first occurrence reproduces exactly that,
 	// and the outer row_number closes the gaps a merged name leaves behind.
-	string projected = "gprojection AS (SELECT vcat, vname, name, type,"
-	                   " row_number() OVER (PARTITION BY vcat, vname ORDER BY rk) - 1 AS pos FROM"
-	                   " (SELECT vcat, vname, name, min_by(type, rk) AS type, min(rk) AS rk FROM"
-	                   " (SELECT vcat, vname, name, type,"
-	                   " row_number() OVER (PARTITION BY vcat, vname ORDER BY \"role\", \"pos\") AS rk FROM"
-	                   " (SELECT DISTINCT pc.\"vcat\" AS vcat, pc.\"vname\" AS vname, pc.\"name\" AS name,"
-	                   " pc.\"type\" AS type, pc.\"role\" AS \"role\", pc.\"pos\" AS \"pos\" FROM " +
-	                   Tbl("grant_columns") +
-	                   " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\""
-	                   // One role whose chain states no column list lifts the restriction for the
-	                   // whole principal (spec 011: `Restricts()` is `any && !unrestricted`), and
-	                   // then the object's own columns are what it reads - so another role's
-	                   // projection must not be listed either, or the listing would advertise a
-	                   // column `SELECT *` never returns.
-	                   " WHERE NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE gc.vcat = pc.\"vcat\""
-	                   " AND gc.vname = pc.\"vname\""
-	                   " AND (gc.cat_columns IS NULL OR trim(gc.cat_columns) = '')"
-	                   " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))"
-	                   // review 143: an object grant's list names what that level keeps - the catalog grant's may
-	                   // hide it, and then the read has no such column (nor its name, comment or tags a row);
-	                   // filtered before the positions are numbered, so they close up as the read's do (spec 036)
-	                   " AND " +
-	                   column_visible("pc.\"vcat\"", "pc.\"vname\"", "pc.\"name\"") +
-	                   "))"
-	                   " GROUP BY vcat, vname, name))";
+	string projected =
+	    "gprojection AS (SELECT vcat, vname, name, type,"
+	    " row_number() OVER (PARTITION BY vcat, vname ORDER BY rk) - 1 AS pos FROM"
+	    " (SELECT vcat, vname, name, min_by(type, rk) AS type, min(rk) AS rk FROM"
+	    " (SELECT vcat, vname, name, type,"
+	    " row_number() OVER (PARTITION BY vcat, vname ORDER BY \"role\", \"pos\") AS rk FROM"
+	    " (SELECT DISTINCT pc.\"vcat\" AS vcat, pc.\"vname\" AS vname, pc.\"name\" AS name,"
+	    " pc.\"type\" AS type, pc.\"role\" AS \"role\", pc.\"pos\" AS \"pos\" FROM " +
+	    Tbl("grant_columns") +
+	    " pc JOIN grants g ON g.\"role\" = pc.\"role\" AND g.\"vcat\" = pc.\"vcat\""
+	    // spec 145: a role's projection is listed only where the role reads the object
+	    " JOIN gcolumns gr ON gr.vcat = pc.\"vcat\" AND gr.vname = pc.\"vname\" AND gr.role = pc.\"role\""
+	    // One role whose chain states no column list lifts the restriction for the
+	    // whole principal (spec 011: `Restricts()` is `any && !unrestricted`), and
+	    // then the object's own columns are what it reads - so another role's
+	    // projection must not be listed either, or the listing would advertise a
+	    // column `SELECT *` never returns.
+	    " WHERE NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE gc.vcat = pc.\"vcat\""
+	    " AND gc.vname = pc.\"vname\""
+	    " AND (gc.cat_columns IS NULL OR trim(gc.cat_columns) = '')"
+	    " AND (gc.obj_columns IS NULL OR trim(gc.obj_columns) = ''))"
+	    // review 143: an object grant's list names what that level keeps - the catalog grant's may
+	    // hide it, and then the read has no such column (nor its name, comment or tags a row);
+	    // filtered before the positions are numbered, so they close up as the read's do (spec 036)
+	    " AND " +
+	    column_visible("pc.\"vcat\"", "pc.\"vname\"", "pc.\"name\"") +
+	    "))"
+	    " GROUP BY vcat, vname, name))";
 	auto prelude =
 	    GrantsCte(principal) + ", " +
 	    (platform ? "pobjects AS (" + platform_objects + "), pcolumns AS (" + platform_columns + "), " : string()) +
@@ -970,15 +979,20 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	if (surface == "keys") {
 		string kcolumn_path = "CASE WHEN vc.table_schema = 'main' THEN vc.table_name"
 		                      " ELSE vc.table_schema || '.' || vc.table_name END";
-		string gfcolumns = "gfcolumns AS (SELECT DISTINCT f.\"vcat\" AS vcat, f.\"vname\" AS vname,"
+		// spec 145: as gcolumns - the rows that may call it (a call is a read), else every visible row's
+		string gfcolumns = "gfcolumns_all AS (SELECT DISTINCT f.\"vcat\" AS vcat, f.\"vname\" AS vname,"
 		                   " g.\"columns\" AS cat_columns, " +
-		                   string(HasObjectCaps() ? "oc.\"columns\"" : "NULL") + " AS obj_columns FROM " +
+		                   string(HasObjectCaps() ? "oc.\"columns\"" : "NULL") + " AS obj_columns, " +
+		                   CapsAllowSql(CapsExpr("f.\"vname\"", "f.\"vcat\""), "select") + " AS reads FROM " +
 		                   Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" +
 		                   (HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
 		                                          " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
 		                                          " AND oc.\"vname\" = f.\"vname\""
 		                                    : string()) +
-		                   " WHERE f.\"kind\" = 'table' AND " + FunctionVisibleExpr() + ")";
+		                   " WHERE f.\"kind\" = 'table' AND " + FunctionVisibleExpr() +
+		                   "), gfcolumns AS (SELECT vcat, vname, cat_columns, obj_columns FROM gfcolumns_all x WHERE"
+		                   " x.reads OR NOT EXISTS (SELECT 1 FROM gfcolumns_all y WHERE y.vcat = x.vcat AND"
+		                   " y.vname = x.vname AND y.reads))";
 		string fkey = "gf.vcat = k.\"vcat\" AND gf.vname = k.\"vname\"";
 		string fcolumn_visible = "(NOT EXISTS (SELECT 1 FROM gfcolumns gf WHERE " + fkey +
 		                         ") OR EXISTS (SELECT 1 FROM gfcolumns gf WHERE " + fkey + " AND " +

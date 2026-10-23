@@ -1385,7 +1385,7 @@ private:
 		}
 		Note(key, "drop");
 		TablePolicy existing;
-		if (store.ResolveTable(principal, key, existing) && !existing.query.empty()) {
+		if (store.ResolveTable(principal, key, existing) && existing.is_view) {
 			// a view has no physical object behind it: the record is the whole of it
 			drop_statement = true;
 			follow_ups.push_back(
@@ -1467,7 +1467,7 @@ private:
 		}
 		TablePolicy existing;
 		bool resolved = store.ResolveTable(principal, key, existing);
-		if (resolved && existing.query.empty() && !existing.phys.empty() &&
+		if (resolved && !existing.is_view && !existing.phys.empty() &&
 		    !NamePath::KeyEquals(
 		        NamePath::FromKey(existing.phys).ToKey(),
 		        NamePath::ChildKey(from.phys_schema, info.GetQualifiedName().Name().GetIdentifierName()))) {
@@ -1476,7 +1476,7 @@ private:
 			Deny(Reason::DDL_HOME, "" + Shown(key) + " is declared over " + existing.phys +
 			                           ", not over this schema's own object - it is not renamed");
 		}
-		if (resolved && !existing.query.empty()) {
+		if (resolved && existing.is_view) {
 			// a view record: nothing physical, the record is the whole of it
 			if (!view_form) {
 				Deny(Reason::DDL_HOME, "" + Shown(key) + " is a view - ALTER VIEW renames it");
@@ -1610,7 +1610,18 @@ private:
 		}
 		ApplyInsertPolicy(node, policy, vname);
 		ApplyInsertCheck(node, policy, vname);
-		ApplyConflictPolicy(node, policy, vname);
+		auto conflict_update = ConflictUpdatePolicy(node, policy, vname);
+		ApplyConflictPolicy(node, policy, conflict_update, vname);
+		bool updates_existing =
+		    node.on_conflict_info && (node.on_conflict_info->action_type == OnConflictAction::UPDATE ||
+		                              node.on_conflict_info->action_type == OnConflictAction::REPLACE);
+		if (!updates_existing) {
+			// spec 145: a plain INSERT's RETURNING returns what the principal wrote and the defaults (a generated key)
+			// - nothing it did not have; an upsert's returns the row already there: a read
+			policy.returning_refused.clear();
+		} else if (!conflict_update.returning_refused.empty()) {
+			policy.returning_refused = conflict_update.returning_refused;
+		}
 		for (auto &item : node.returning_list) {
 			RewriteExpr(item);
 			MapColumnRefs(item, policy, vname); // RETURNING names the target's own columns
@@ -1621,16 +1632,119 @@ private:
 		RequireReadableReturning(node.returning_list, policy, vname);
 	}
 
+	//! spec 145: what a DML statement's own conditions may read of its target where a role the verb unites may not read
+	//! it: only the columns EVERY role holding the verb reads as stored (none masks or narrows them) - the verb's union
+	//! would let one role's columns be read on another role's rows (the focused review's oracle). `restricted`: some
+	//! such role narrows the columns at all
+	TablePolicy VerbReadScope(const string &key, const string &verb, const TablePolicy &verb_policy, bool &restricted) {
+		restricted = false;
+		case_insensitive_set_t allowed;
+		for (auto &role : principal.roles) {
+			auto one = principal;
+			one.roles = {role};
+			TablePolicy own;
+			if (!store.ResolveTable(one, key, own, verb) || !own.caps.count(verb) || own.visible_columns.empty()) {
+				continue; // no grant here, no such verb, or every column as stored
+			}
+			case_insensitive_set_t mine = own.visible_columns;
+			for (auto &mask : own.injections) {
+				mine.erase(mask.first);
+			}
+			for (auto &tree : own.narrowed_reads) {
+				mine.erase(tree.first);
+			}
+			if (!restricted) {
+				allowed = std::move(mine);
+				restricted = true;
+				continue;
+			}
+			case_insensitive_set_t both;
+			for (auto &name : allowed) {
+				if (mine.count(name)) {
+					both.insert(name);
+				}
+			}
+			allowed = std::move(both);
+		}
+		auto scope = verb_policy;
+		if (restricted) {
+			// a name no column has: an empty set would read as "every column"
+			scope.visible_columns = allowed.empty() ? case_insensitive_set_t {"\x01"} : allowed;
+			scope.injections.clear();
+			scope.narrowed_reads.clear();
+		}
+		return scope;
+	}
+
+	//! spec 145: `ON CONFLICT … DO UPDATE` and `INSERT OR REPLACE` update a row that is already there - the `update`
+	//! capability, under ITS policy (the union of the grant rows that hold it), never the insert's: an insert-only
+	//! role updated through them, and an insert role beside an update role lifted the update's confinement.
+	//! `OR REPLACE` has no SET to confine (duckdb writes every inserted column): refused under a row or column policy
+	TablePolicy ConflictUpdatePolicy(InsertQueryNode &node, const TablePolicy &insert, const string &key) {
+		if (!node.on_conflict_info || (node.on_conflict_info->action_type != OnConflictAction::UPDATE &&
+		                               node.on_conflict_info->action_type != OnConflictAction::REPLACE)) {
+			return insert;
+		}
+		TablePolicy update;
+		if (!store.ResolveTable(principal, key, update, "update")) {
+			Deny(Reason::NO_ACCESS, "no access to object " + Shown(key));
+		}
+		Note(update.canonical.empty() ? key : update.canonical, "update");
+		if (!update.caps.count("update")) {
+			Deny(Reason::CAPABILITY,
+			     "update on " + Shown(key) +
+			         " is not allowed - an ON CONFLICT DO UPDATE / INSERT OR REPLACE updates the row "
+			         "already there");
+		}
+		if (node.on_conflict_info->action_type == OnConflictAction::REPLACE &&
+		    (!update.rls.empty() || !update.injections.empty() || !update.write_columns.empty() ||
+		     !update.field_writes.empty() || !update.visible_columns.empty())) {
+			Deny(Reason::WRITE_POLICY, "INSERT OR REPLACE into " + Shown(key) +
+			                               " is not allowed under a row or column policy - write ON CONFLICT (…) DO "
+			                               "UPDATE SET …, which the policy confines");
+		}
+		// what its SET and WHERE read and write of the row already there is never mapped column by column (an UPDATE's
+		// is: MapReadable, field writes) - under a column policy, the update's or the one it reads under, refused as
+		// ApplyInsertPolicy refuses an insert's (the re-review: hidden columns read, a hidden field written)
+		auto column_policy = [](const TablePolicy &p) {
+			return !p.visible_columns.empty() || !p.injections.empty() || !p.field_writes.empty() ||
+			       !p.write_columns.empty() || !p.narrowed_reads.empty();
+		};
+		bool restricted = column_policy(update);
+		if (!restricted && update.caps.count("select") && update.capability_rows_read) {
+			TablePolicy read;
+			restricted = store.ResolveTable(principal, key, read) && column_policy(read);
+		} else if (!restricted) {
+			// a role the update unites may not read: any update role's own column policy confines it (VerbReadScope)
+			VerbReadScope(key, "update", update, restricted);
+		}
+		if (node.on_conflict_info->action_type == OnConflictAction::UPDATE && restricted) {
+			Deny(Reason::WRITE_POLICY, "insert into " + Shown(key) +
+			                               " cannot use ON CONFLICT DO UPDATE under a column policy - write an "
+			                               "UPDATE, which the policy confines column by column");
+		}
+		// RETURNING returns the row already there: a read, as an UPDATE's (ResolveDmlTarget)
+		if (!update.caps.count("select")) {
+			update.returning_refused = "select on " + Shown(key) + " is not allowed";
+		} else if (!update.capability_rows_read) {
+			update.returning_refused =
+			    "a role that may update " + Shown(key) + " but not read it would widen what RETURNING returns";
+		}
+		return update;
+	}
+
 	//! `ON CONFLICT … DO UPDATE` is an update wearing an insert's clothes, and it was going through
 	//! untouched: its SET list decides what an existing row becomes, and the row it lands on may belong
-	//! to someone else entirely. It carries the same policy as any other update (specs 011, 024).
-	void ApplyConflictPolicy(InsertQueryNode &node, const TablePolicy &policy, const string &vname) {
+	//! to someone else entirely. It carries the same policy as any other update (specs 011, 024) - spec 145: the
+	//! update's own (`update`), the conflict target's condition the insert's
+	void ApplyConflictPolicy(InsertQueryNode &node, const TablePolicy &insert, const TablePolicy &policy,
+	                         const string &vname) {
 		if (!node.on_conflict_info) {
 			return;
 		}
 		auto &conflict = *node.on_conflict_info;
 		RewriteExpr(conflict.condition);
-		MapColumnRefs(conflict.condition, policy, vname);
+		MapColumnRefs(conflict.condition, insert, vname);
 		if (!conflict.set_info) {
 			return;
 		}
@@ -1675,6 +1789,7 @@ private:
 	void RewriteUpdateNode(UpdateQueryNode &node) {
 		auto policy = ResolveDmlTarget(node.table, "update");
 		auto vname = dml_target_name;
+		auto reads = dml_read_policy; // spec 145: the conditions read under the read policy
 		RewriteTableRef(node.from_table);
 		if (node.set_info) {
 			for (auto &column : node.set_info->columns) {
@@ -1688,7 +1803,7 @@ private:
 			for (auto &expr : node.set_info->expressions) {
 				RewriteExpr(expr);
 				MapColumnRefs(expr, policy, vname);
-				MapReadable(expr, policy, vname, target, single, others);
+				MapReadable(expr, reads, vname, target, single, others);
 			}
 			// a grant's value column is assigned, not suggested: overriding the SET keeps the row
 			// inside the principal's slice, and the predicate keeps the statement there too
@@ -1705,7 +1820,7 @@ private:
 			RewriteExpr(node.set_info->condition);
 			MapColumnRefs(node.set_info->condition, policy, vname,
 			              node.from_table ? TargetAliasOf(node.table) : Identifier());
-			MapReadable(node.set_info->condition, policy, vname, target, single, others);
+			MapReadable(node.set_info->condition, reads, vname, target, single, others);
 			if (node.from_table) {
 				AndInto(node.set_info->condition, TargetPredicate(policy, TargetAliasOf(node.table), vname));
 			} else {
@@ -1722,6 +1837,7 @@ private:
 	void RewriteDeleteNode(DeleteQueryNode &node) {
 		auto policy = ResolveDmlTarget(node.table, "delete");
 		auto vname = dml_target_name;
+		auto reads = dml_read_policy; // spec 145: the conditions read under the read policy
 		for (auto &using_ref : node.using_clauses) {
 			RewriteTableRef(using_ref);
 		}
@@ -1732,7 +1848,7 @@ private:
 		for (auto &using_ref : node.using_clauses) {
 			CollectRefNames(using_ref.get(), others);
 		}
-		MapReadable(node.condition, policy, vname, TargetAliasOf(node.table), node.using_clauses.empty(), others);
+		MapReadable(node.condition, reads, vname, TargetAliasOf(node.table), node.using_clauses.empty(), others);
 		if (!node.using_clauses.empty()) {
 			AndInto(node.condition, TargetPredicate(policy, TargetAliasOf(node.table), vname));
 		} else {
@@ -1748,13 +1864,14 @@ private:
 	void RewriteMergeNode(MergeQueryNode &node) {
 		auto policy = ResolveDmlTarget(node.target, "merge");
 		auto vname = dml_target_name;
+		auto reads = dml_read_policy; // spec 145: the conditions read under the read policy
 		auto alias = TargetAliasOf(node.target);
 		RewriteTableRef(node.source);
 		RewriteExpr(node.join_condition);
 		MapColumnRefs(node.join_condition, policy, vname, alias);
 		case_insensitive_set_t others;
 		CollectRefNames(node.source.get(), others);
-		MapReadable(node.join_condition, policy, vname, alias, false, others);
+		MapReadable(node.join_condition, reads, vname, alias, false, others);
 		// The predicate joins the target rather than filters the result: a row outside the grant is
 		// never matched, so no WHEN MATCHED branch can reach it.
 		AndInto(node.join_condition, TargetPredicate(policy, alias, vname));
@@ -1762,7 +1879,7 @@ private:
 			for (auto &action : action_set.second) {
 				RewriteExpr(action->condition);
 				MapColumnRefs(action->condition, policy, vname, alias);
-				MapReadable(action->condition, policy, vname, alias, false, others);
+				MapReadable(action->condition, reads, vname, alias, false, others);
 				if (action->action_type == MergeActionType::MERGE_UPDATE && HasWritePolicy(policy) &&
 				    (!action->update_info || action->update_info->columns.empty())) {
 					// `UPDATE SET *` / `UPDATE BY NAME` writes every column the source carries - the
@@ -1783,14 +1900,14 @@ private:
 					for (auto &expr : action->update_info->expressions) {
 						RewriteExpr(expr);
 						MapColumnRefs(expr, policy, vname, alias);
-						MapReadable(expr, policy, vname, alias, false, others);
+						MapReadable(expr, reads, vname, alias, false, others);
 					}
 					ApplySetInjections(*action->update_info, policy, vname);
 					ApplyFieldWrites(*action->update_info, policy, vname, alias);
 					ApplyUpdateCheck(*action->update_info, policy, vname, alias);
 					RewriteExpr(action->update_info->condition);
 					MapColumnRefs(action->update_info->condition, policy, vname, alias);
-					MapReadable(action->update_info->condition, policy, vname, alias, false, others);
+					MapReadable(action->update_info->condition, reads, vname, alias, false, others);
 				}
 				for (auto &expr : action->expressions) {
 					RewriteExpr(expr);
@@ -3563,6 +3680,9 @@ private:
 	//! which expands to every physical column - never is.
 	void RequireReadableReturning(const vector<unique_ptr<ParsedExpression>> &returning, const TablePolicy &policy,
 	                              const string &vname) {
+		if (!returning.empty() && !policy.returning_refused.empty()) {
+			Deny(Reason::CAPABILITY, "RETURNING: " + policy.returning_refused); // spec 145: RETURNING is a read
+		}
 		if (policy.write_columns.empty()) {
 			return; // no column policy: the relation is the table, and RETURNING reads the table
 		}
@@ -3703,7 +3823,8 @@ private:
 			key = Key(target_name);
 		}
 		TablePolicy policy;
-		if (!store.ResolveTable(principal, key, policy)) {
+		// spec 145: the verb's policy - the union of the grant rows that hold it
+		if (!store.ResolveTable(principal, key, policy, capability)) {
 			// the session's own temp table is written natively, with nothing to enforce: no grant
 			// narrows an object only this connection can see (spec 050). Virtual wins - this is
 			// reached only when no grant claims the name.
@@ -3727,6 +3848,34 @@ private:
 		}
 		if (!policy.caps.count(capability)) {
 			Deny(Reason::CAPABILITY, capability + " on " + Shown(key) + " is not allowed");
+		}
+		// spec 145: what the statement's own conditions read of the target, and what its RETURNING returns, is a read -
+		// under the read policy where the principal reads the object (the verb's RLS stays AND-ed in), the verb's
+		// where it only writes; a read that does not resolve refuses RETURNING alone, never the write
+		dml_read_policy = policy;
+		if (!policy.caps.count("select")) {
+			policy.returning_refused = "select on " + Shown(key) + " is not allowed";
+		} else {
+			try {
+				TablePolicy read;
+				// only where every role the verb unites reads: the verb's slice then lies inside the read's - else a
+				// condition would read the read's columns on rows only the verb reaches (the re-review's oracle)
+				if (store.ResolveTable(principal, key, read) && policy.capability_rows_read) {
+					dml_read_policy = read;
+				}
+			} catch (std::exception &ex) {
+				TakeDenyReason();
+				policy.returning_refused = ErrorData(ex).RawMessage();
+			}
+			if (policy.returning_refused.empty() && !policy.capability_rows_read) {
+				// a role the verb's policy unites may not read: that policy may be wider than the read's
+				policy.returning_refused = "a role that may " + capability + " " + Shown(key) +
+				                           " but not read it would widen what RETURNING returns";
+			}
+		}
+		if (!policy.capability_rows_read) {
+			bool restricted = false;
+			dml_read_policy = VerbReadScope(key, capability, policy, restricted);
 		}
 		auto phys = ParsePhysName(policy.phys);
 		NotePhysical(policy.phys);
@@ -4271,6 +4420,9 @@ private:
 	PolicyStore &store;
 	//! the virtual name of the DML target currently being rewritten (for diagnostics and mapping)
 	string dml_target_name;
+	//! spec 145: what the DML target's own conditions read it under (ResolveDmlTarget) - copied by each node at once,
+	//! before a nested statement resolves its own
+	TablePolicy dml_read_policy;
 	//! While rewriting a body that will be *stored* (a role's CREATE VIEW, spec 018): names and policy
 	//! resolve now, with the creator's rights, but `acl_claim` stays a marker so every later reader is
 	//! filtered by their own claims. `acl_arg` is still substituted - it belongs to a call that is
