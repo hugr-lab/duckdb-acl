@@ -45,9 +45,9 @@ extensions plus ours (`CompiledGrammar::Create(vector<reference<GrammarExtension
 `context` and the `compiled_grammar`).
 
 The grammar is also registered with duckdb as `acl` (the owner, 2026-10-23: so a CLI session completes `ACL …`), and
-the override never depends on it: it adds the rules itself when the connection has not switched them on, and uses
-the connection's grammar as is when it has. Not switched on, nothing changes for a bare statement (spec 067's first
-row). Switched on, `sql_auto_complete` offers `ACL`, then `ROLE`, then the statements; a prefixed text that reaches
+the override never depends on it: it compiles the connection's grammar extensions with ours behind them, once per set
+(a connection that switched `acl` on gets the same grammar). Not switched on, nothing changes for a bare statement
+(spec 067's first row). Switched on, `sql_auto_complete` offers `ACL`, then `ROLE`, then the statements; a prefixed text that reaches
 duckdb's own parser - the override set to `DEFAULT` - parses to our statement and is refused at bind (acl's parser
 extension plans nothing). Spec 132's grammar extensions keep working under the prefix: the inner statements are parsed
 by the same compiled grammar, which includes them.
@@ -84,7 +84,7 @@ quack does (the same collector), and Flight refuses a batch at Prepare. Owner, 2
 4. Policy texts become rules and stored rows are emitted from trees; `ParseColumnList` / `SplitTopLevel` go.
 
 **Stage 1, measured (2026-10-23)** - `acl_grammar.{hpp,cpp}`, behind `acl_peg_prefix` (GLOBAL, off):
-`AclPrefixedStatement <- 'ACL' 'ROLE' AclPrincipalValue AclTraceMarker* Statement`, prepended to `Statement`, taken
+`AclPrefixedStatement <- 'ACL' 'ROLE' AclQuotedValue AclTraceMarker* Statement?`, prepended to `Statement`, taken
 by the override for a role prefix in query mode (LINEAGE, the `ACL [NATIVE]` markers, `USE SCHEMA` and management
 stay the scanner's in this stage; the scanner's text checks still run first).
 
@@ -98,6 +98,17 @@ stay the scanner's in this stage; the scanner's text checks still run first).
   rules - `StringLiteral`, `Identifier`); a token rule (`QuotedIdentifier`) cannot be named from a rule (it is a
   regex), so "quoted only" is judged on the token in stage 2; the inner statement's text, a CREATE's `sql` and the
   named parameters are set by the rule's caller, not by duckdb, for a statement inside a rule.
+- The two readers must agree on the role, the markers and where the statement starts; between where the scanner
+  stopped and the rule's statement only comments may lie (and separators for a prefix with no statement of its own),
+  judged by duckdb's tokenizer. A comment inside the prefix or a string the tokenizer joins across a line break makes
+  them read two prefixes - refused as a parse ("reads two ways"), never an internal error (the reviews found the
+  internal error reachable by a principal, with its stack trace sent to the client).
+- Where they still differ, found by the reviews, for stage 2 to decide: `ACL ROLE ""` (the rule refuses a zero-length
+  quoted identifier, the scanner reads an empty role; `''` reads the same either way); a syntax error names the whole
+  text, the scanner's the remainder; a binder error's caret in the first statement lands the prefix's length to the
+  right (its expressions count from the whole text, its text is cut) - the rule's statement must carry positions of
+  its own; foreign syntax after the prefix (a co-loaded extension's peeler) is refused as `parse`, the scanner's path
+  as `statement_type` (spec 067) - stage 2 hands the remainder to the peeler for `ACL NATIVE`.
 - Completion: with `SET active_grammar_extensions = ['acl']`, `sql_auto_complete('AC')` offers `ACL`, `'ACL '` offers
   `role`, and after the prefix the statements; a rule's keywords are suggested unless the rule suppresses them.
 
@@ -113,10 +124,10 @@ stay the scanner's in this stage; the scanner's text checks still run first).
   statements are the parse tree's, so there is no second reading to disagree with.
 - **Fail closed.**
   - The override still claims every text (`STRICT`), and a parse that fails is a refusal, as now.
-  - The grammar is active only inside the override. With the override off (`DEFAULT`), an `ACL …` text is a parse
-    error, as today.
-  - Our statement never leaves the override unrewritten. If one ever reached the binder, it would fail there: acl's
-    parser extension plans nothing.
+  - With the override off (`DEFAULT`), an `ACL …` text is a parse error on a connection that has not switched `acl`
+    on, as today, and on one that has it parses to our statement, which is refused at bind: acl's parser extension
+    plans nothing.
+  - Our statement never leaves the override unrewritten.
   - A rule never yields a statement the rewriter has not seen.
 - **Nothing widens.** Every refusal the scanner makes is kept: a second prefix, a mixed batch, `USE` without a
   session, foreign syntax under the prefix (spec 067's three rows and spec 132's fourth). The tests pin them before the
@@ -129,15 +140,17 @@ stay the scanner's in this stage; the scanner's text checks still run first).
 - Before stage 2, tests pin the batch behaviour: the gateway answers the first row-returning result, the quack door
   answers as native quack, and Flight refuses a batch.
 - Negative tests cover what the hand parser accepted and the rules refuse.
-- The prototype is compared statement by statement with the scanner over the suite's prefixed statements.
+- The prototype ran the whole suite with the rule on by default; on every statement it takes, the role and the
+  markers it read are compared with the scanner's (an internal error when they differ), and a syntax error names the
+  whole text - which the scanner's parse of the remainder cannot - so a test sees which path ran.
 
 ## Alternatives considered
 
 - **Keep the scanner and harden it.** The disagreement class stays, and every new form needs both readers kept in
   step.
-- **Register the grammar and switch it on per connection** (`active_grammar_extensions`). A connection owner could
-  switch it off, and every door and gateway connection would have to set it. Compiling it inside the override needs
-  neither.
+- **Depend on the registered grammar** (switched on per connection by `active_grammar_extensions`). A connection owner
+  could switch it off, and every door and gateway connection would have to set it. The override compiles ours in, and
+  the registration is for completion only.
 
 ## Follow-ups
 

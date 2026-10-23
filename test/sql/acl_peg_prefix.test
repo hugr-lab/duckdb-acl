@@ -1,7 +1,7 @@
 # name: test/sql/acl_peg_prefix.test
 # description: spec 150, stage 1 - the role prefix parsed by duckdb's parser with our rule
 #   (`acl_peg_prefix`): the same principal, markers, batch and refusals as the scanner, and a bare
-#   statement parses as before (the grammar is never registered)
+#   statement parses as before
 # group: [sql]
 
 require acl
@@ -14,6 +14,9 @@ CREATE TABLE phys.main.sales(region VARCHAR, quarter VARCHAR, amount INT);
 
 statement ok
 INSERT INTO phys.main.sales VALUES ('east', 'q1', 10), ('east', 'q2', 20), ('west', 'q1', 5), ('hidden', 'q9', 99);
+
+statement ok
+CREATE SCHEMA phys.lake;
 
 statement ok
 ATTACH ':memory:' AS aclcat;
@@ -43,6 +46,12 @@ statement ok
 ACL ADMIN GRANT TABLE c.sales TO ROLE analyst WITH (select) RLS (region <> 'hidden');
 
 statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.lake FROM phys.lake;
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.lake TO ROLE analyst WITH (select, insert, create);
+
+statement ok
 SET GLOBAL acl_peg_prefix = true;
 
 # --- a bare statement parses as before: `acl` stays a name ---------------------------------------
@@ -54,6 +63,14 @@ query I
 SELECT acl FROM acl;
 ----
 1
+
+# --- the rule read it: a syntax error names the whole text - the scanner's parse of the remainder
+#     names the remainder only ---------------------------------------------------------------------
+
+statement error
+ACL ROLE "analyst" SELEC count(*) FROM sales;
+----
+<REGEX>:.*LINE 1: ACL ROLE "analyst" SELEC.*
 
 # --- the prefix, its value either quoted way, the markers ----------------------------------------
 
@@ -85,6 +102,56 @@ statement error
 ACL ROLE "analyst" TRACE 'a' TRACE 'b' SELECT 1;
 ----
 may be written once
+
+# a comment between the prefix and the statement is a tool's, and reads the same either way
+query I
+ACL ROLE "analyst" /* a tool's note */ SELECT count(*) FROM sales;
+----
+3
+
+query I
+ACL ROLE "analyst" TRACE 'peg-trace-3' -- a line comment
+SELECT count(*) FROM sales;
+----
+3
+
+# a comment inside the prefix makes the two readers read two prefixes: refused as a parse, never an internal error
+statement error
+ACL ROLE "analyst" /* c */ TRACE 'x' SELECT count(*) FROM sales;
+----
+reads two ways
+
+statement error
+ACL ROLE "analyst" /**/ TRACE '' SELECT count(*) FROM sales;
+----
+reads two ways
+
+statement error
+ACL ROLE "analyst" TRACE 'a' /* c */ PARENT 'p' SELECT count(*) FROM sales;
+----
+reads two ways
+
+# a string the tokenizer joins across a line break: the rule reads `analystx`, the scanner `analyst` - refused
+statement error
+ACL ROLE 'analyst'
+'x' SELECT 1;
+----
+reads two ways
+
+# a prefix with no statement of its own, and a separator right after it, read as the scanner reads them
+statement ok
+ACL ROLE "analyst";
+
+query I
+ACL ROLE "analyst" ; SELECT count(*) FROM sales;
+----
+3
+
+# a marker's value quoted either way, as the scanner reads it
+query I
+ACL ROLE "analyst" TRACE "peg-trace-2" SELECT count(*) FROM sales;
+----
+3
 
 # --- the batch: every statement under the one prefix, every one decided before any runs ---------
 
@@ -121,6 +188,29 @@ ACL ROLE "analyst" PIVOT sales ON quarter USING sum(amount) GROUP BY region ORDE
 ----
 east	10	20
 west	5	NULL
+
+# --- a DDL statement keeps its own text, never the prefix -----------------------------------------
+
+statement ok
+ACL ROLE "analyst" CREATE TABLE lake.landing(id INTEGER);
+
+query I
+SELECT sql NOT ILIKE '%ACL%' FROM duckdb_tables() WHERE table_name = 'landing';
+----
+true
+
+# --- a connection that switched the rules on itself gets the same grammar, ours once ------------
+
+statement ok
+SET active_grammar_extensions = ['acl'];
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM sales;
+----
+3
+
+statement ok
+RESET active_grammar_extensions;
 
 # --- what the statement records is its own text, as the scanner's parse gave it -----------------
 

@@ -3,8 +3,9 @@
 //
 // Spec 150: our grammar as rules of duckdb's PEG parser. Stage 1, the prototype: the prefix
 // `ACL ROLE <value> [TRACE '<id>'] [PARENT '<tp>'] <statement>` as a rule, parsed with a grammar
-// compiled inside the override (the connection's grammar extensions plus ours) - never registered,
-// so no connection can switch it on and a bare statement parses as before.
+// the override compiles itself (the connection's grammar extensions, ours behind them). The rules
+// are also registered as the grammar extension `acl` - for completion only: the override never
+// depends on a connection switching them on, and a connection that does not parses as before.
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -23,6 +24,10 @@ struct PegPrefix {
 	string role;
 	string correlation_id;
 	string traceparent;
+	//! where the prefixed statement starts in the text, past the principal and the markers - or, for a prefix
+	//! with no statement of its own, where the prefix's part of the text ends
+	bool has_statement = false;
+	idx_t statement_start = 0;
 	//! the batch's statements, the first one the prefixed statement itself
 	vector<unique_ptr<SQLStatement>> statements;
 };

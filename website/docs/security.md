@@ -22,6 +22,14 @@ stripped (spec 001) and the inner parse runs with the override disabled, so `ACL
 ACL ADMIN CREATE VIRTUAL CATALOG x` reaches duckdb's own parser as `ACL ADMIN CREATE …` and fails
 there - no re-entry, no mode laundering" (spec 009).
 
+**The prefix as a grammar rule (spec 150, being built).** The prefix is moving from a hand scanner to a rule of
+DuckDB's own PEG parser, so the text is read once, by one reader. Stage 1 reads `ACL ROLE` batches with the rule when
+`SET GLOBAL acl_peg_prefix = true` (off by default). The scanner still runs as well; where the two would read
+different prefixes (a comment or a split string inside the prefix), the statement is refused as a parse. The rules are
+also registered as the grammar extension `acl`, for completion only: `SET active_grammar_extensions = ['acl']` makes
+the CLI offer `ACL`, `ROLE` and the statements after it. A prefixed text that reaches DuckDB's own parser with that
+grammar on - the override turned off - is refused at bind, never run.
+
 **The rewrite happens before bind.** The extension is a `parser_override`: it rewrites the parsed
 AST and "returns real `SQLStatement`s to the normal execution path" (spec 001). Enforcement is
 structural, not a filter: "a denied column is absent from the safe subquery, so the binder rejects
