@@ -104,11 +104,14 @@ stay the scanner's in this stage; the scanner's text checks still run first).
   them read two prefixes - refused as a parse ("reads two ways"), never an internal error (the reviews found the
   internal error reachable by a principal, with its stack trace sent to the client).
 - Where they still differ, found by the reviews, for stage 2 to decide: `ACL ROLE ""` (the rule refuses a zero-length
-  quoted identifier, the scanner reads an empty role; `''` reads the same either way); a syntax error names the whole
-  text, the scanner's the remainder; a binder error's caret in the first statement lands the prefix's length to the
-  right (its expressions count from the whole text, its text is cut) - the rule's statement must carry positions of
-  its own; foreign syntax after the prefix (a co-loaded extension's peeler) is refused as `parse`, the scanner's path
+  quoted identifier, the scanner reads an empty role; `''` reads the same either way); a syntax error's caret in the
+  first statement, and a binder error's, in the first statement lands the prefix's length to the
+  right on one path or the other (the rule's expressions count from the whole text, its text is cut) - the rule's
+  statement must carry positions of its own; foreign syntax after the prefix (a co-loaded extension's peeler) is refused as `parse`, the scanner's path
   as `statement_type` (spec 067) - stage 2 hands the remainder to the peeler for `ACL NATIVE`.
+- A prefix in a position where duckdb's grammar takes a `Statement` - `PREPARE p AS ACL ROLE …`, a CTE body, a CTAS -
+  parses to our statement and is refused by duckdb's own transforms ("not a preparable statement" and the like);
+  were one ever to pass, the plan function refuses it.
 - Completion: with `SET active_grammar_extensions = ['acl']`, `sql_auto_complete('AC')` offers `ACL`, `'ACL '` offers
   `role`, and after the prefix the statements; a rule's keywords are suggested unless the rule suppresses them.
 
@@ -140,9 +143,9 @@ stay the scanner's in this stage; the scanner's text checks still run first).
 - Before stage 2, tests pin the batch behaviour: the gateway answers the first row-returning result, the quack door
   answers as native quack, and Flight refuses a batch.
 - Negative tests cover what the hand parser accepted and the rules refuse.
-- The prototype ran the whole suite with the rule on by default; on every statement it takes, the role and the
-  markers it read are compared with the scanner's (an internal error when they differ), and a syntax error names the
-  whole text - which the scanner's parse of the remainder cannot - so a test sees which path ran.
+- The prototype ran the whole suite with the rule on by default; on every statement it takes, the role, the markers
+  and the statement's start are compared with the scanner's (a parse refusal when they differ), and the tests that
+  make them differ (a comment or a split string inside the prefix) are what shows the rule's path ran.
 
 ## Alternatives considered
 

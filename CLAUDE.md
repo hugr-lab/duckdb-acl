@@ -467,7 +467,7 @@ compiles the connection's grammar extensions with ours behind them (`CompiledGra
 registered as the grammar extension `acl` for CLI completion only (`SET active_grammar_extensions = ['acl']`). In
 `Prefixed` a role prefix in query mode (no LINEAGE / `ACL [NATIVE]` / `USE SCHEMA`; not CONNECT-ed, no dialect) takes
 the rule's statements; the readers must agree on role, markers and where the statement starts (only comments between,
-judged by `Parser::Tokenize`), else `parse` "reads two ways". The whole suite passed with it on by default; no cost
+and `;` for a prefix with no statement, judged by `Parser::Tokenize`), else `parse` "reads two ways". The whole suite passed with it on by default; no cost
 past noise. Stage 2 moves every prefix and marker and drops the scanner; CONNECT-ed / dialect connections refuse a
 prefix. Tests `acl_peg_prefix.test`, `acl_peg_completion.test`.
 

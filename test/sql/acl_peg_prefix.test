@@ -52,6 +52,9 @@ statement ok
 ACL ADMIN GRANT SCHEMA c.lake TO ROLE analyst WITH (select, insert, create);
 
 statement ok
+ACL ADMIN GRANT FUNCTION current_query TO ROLE analyst;
+
+statement ok
 SET GLOBAL acl_peg_prefix = true;
 
 # --- a bare statement parses as before: `acl` stays a name ---------------------------------------
@@ -63,14 +66,6 @@ query I
 SELECT acl FROM acl;
 ----
 1
-
-# --- the rule read it: a syntax error names the whole text - the scanner's parse of the remainder
-#     names the remainder only ---------------------------------------------------------------------
-
-statement error
-ACL ROLE "analyst" SELEC count(*) FROM sales;
-----
-<REGEX>:.*LINE 1: ACL ROLE "analyst" SELEC.*
 
 # --- the prefix, its value either quoted way, the markers ----------------------------------------
 
@@ -189,15 +184,31 @@ ACL ROLE "analyst" PIVOT sales ON quarter USING sum(amount) GROUP BY region ORDE
 east	10	20
 west	5	NULL
 
-# --- a DDL statement keeps its own text, never the prefix -----------------------------------------
+# --- a statement's text is its own, never the prefix: what it runs as, and what a DDL creates -----
+
+query I
+ACL ROLE "analyst" /* a tool's note */ SELECT current_query();
+----
+SELECT current_query();
+
+query I
+ACL ROLE "analyst" TRACE 'peg-trace-4' SELECT 1; SELECT current_query();
+----
+1
 
 statement ok
 ACL ROLE "analyst" CREATE TABLE lake.landing(id INTEGER);
 
 query I
-SELECT sql NOT ILIKE '%ACL%' FROM duckdb_tables() WHERE table_name = 'landing';
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'landing';
 ----
-true
+1
+
+# a LINEAGE marker - even an empty one - leaves the batch to the scanner in this stage
+query I
+ACL ROLE "analyst" LINEAGE JOB '' SELECT count(*) FROM sales;
+----
+3
 
 # --- a connection that switched the rules on itself gets the same grammar, ours once ------------
 

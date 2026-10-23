@@ -54,6 +54,7 @@ struct AclPrefix {
 	string traceparent;
 	//! spec 107: the client's lineage context - `LINEAGE PARENT '<ns/job/run>' [ROOT '<...>'] [JOB '<name>']`
 	LineageContext lineage;
+	bool lineage_written = false; // spec 150: written, whatever its values (an empty JOB '' is still written)
 };
 
 AclPrefix ParseAclPrefix(const string &query) {
@@ -101,6 +102,7 @@ AclPrefix ParseAclPrefix(const string &query) {
 					throw ParserException("acl_rewrite: ACL LINEAGE may be written once in a prefix");
 				}
 				seen_lineage = true;
+				prefix.lineage_written = true;
 				bool any = false;
 				for (;;) {
 					SkipWhitespace(query, scan);
@@ -844,8 +846,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const string &query, const Acl
 	// spec 150, stage 1: the role prefix and its statements as ONE parse of duckdb's parser with our rule
 	bool peg = false;
 	if (grammar && PegPrefixEnabled(options) && prefix.kind == AclPrefix::Kind::ROLE &&
-	    mode == AclPrefix::Mode::QUERY && !prefix.marked && prefix.lineage.parent.empty() &&
-	    prefix.lineage.root_parent.empty() && prefix.lineage.job.empty() &&
+	    mode == AclPrefix::Mode::QUERY && !prefix.marked && !prefix.lineage_written &&
 	    UseSchemaAsSet(prefix.rest) == prefix.rest) {
 		AclParseGuard guard;
 		PegPrefix parsed;

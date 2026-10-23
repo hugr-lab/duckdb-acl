@@ -1396,7 +1396,6 @@ void RegisterIdentitySecretTypes(ExtensionLoader &loader);
 class AclGrammarCache;
 
 //! Carried on the parser extension (parser_info); the override reads the store from it.
-
 struct AclParserInfo : ParserExtensionInfo {
 	explicit AclParserInfo(shared_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
 	}
