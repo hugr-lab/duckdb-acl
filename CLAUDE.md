@@ -958,6 +958,15 @@ written to the per-name cache), rows from `acl_principal_function_rows(roles, qu
 / `glists` instead of per-role self-joins, `PrincipalCapsLevels` leaves out a caps-chain level the roles hold no row
 of. Test `acl_catalog_scale.test`.
 
+**Spec 148 — a policy expression is one expression**: an RLS, a mask, a computed column, a REMAP item, a scalar
+template and a reference's join expression must be exactly one expression - `OneExpression` (acl_catalog_validation.cpp,
+the real parser only: `SELECT <text>` = one item, no alias, no clause; and `SELECT <text> AS __acl_a, 1 AS __acl_b
+FROM __acl_t WHERE true` keeps that structure with the same first item - an open comment, a parenthesis, a tail break
+it; unparseable refused). Refused where written (`RequireOneExpression` in `RequirePolicyFreeExpressions` and the template /
+reference writers), and never spliced by a probe (`ItemBinds`, `ProjectionSchema`, `PredicateError` judge first - a
+stored row is the check's `mask_broken` / `rls_broken` with the reason). The gates judged `ParseExpressionList`'s
+select list, which drops a FROM written after a mask. Test `acl_one_expression.test`.
+
 **Spec 140 — a door picks up a renewed certificate**: a pair given as LOCAL files (`IsLocalCertificatePath`; the
 csi-driver's, hugr-platform spec 005) is re-read every `acl_door_certificate_refresh` s (GLOBAL, 60; 0 = once) by a
 `DoorCertificateWatcher` (`src/flight/acl_door_certificate.cpp`, OpenSSL: `CheckCertificatePair` judges the pair whole,

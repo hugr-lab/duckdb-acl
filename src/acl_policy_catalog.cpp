@@ -601,6 +601,35 @@ bool CatalogBackend::ResolveTable(const Principal &principal, const string &vnam
 	return found;
 }
 
+namespace {
+
+//! spec 148: a stored policy text that is not one expression (written before the rule, or past it by the operator's
+//! own SQL into the policy tables) refuses the read - it is never pasted into the statement
+void RequireStoredExpressions(const string &object, const string &own_rls,
+                              const vector<std::pair<string, string>> &own_columns,
+                              const vector<std::pair<string, GrantPolicy>> &united) {
+	vector<string> texts = {own_rls};
+	for (auto &column : own_columns) {
+		texts.push_back(column.second);
+	}
+	for (auto &role : united) {
+		for (auto &predicate : role.second.predicates) {
+			texts.push_back(predicate);
+		}
+		for (auto &column : role.second.columns) {
+			texts.push_back(column.second);
+		}
+	}
+	if (!StoredExpressionsOk(texts)) {
+		NoteDenyReason(Reason::POLICY_ERROR);
+		throw BinderException("acl: the policy of \"%s\" holds a stored expression that is not one expression (spec "
+		                      "148) - acl_check_catalog names it",
+		                      object);
+	}
+}
+
+} // namespace
+
 bool CatalogBackend::LookupRelation(const Principal &principal, const string &vname, TablePolicy &out,
                                     const string &capability) {
 	string head, rest;
@@ -746,6 +775,7 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 			out.capability_rows_read = out.capability_rows_read && caps.count("select");
 		}
 	}
+	RequireStoredExpressions(vname, out.rls, object_columns, united);
 	// spec 146: the object's columns where it declares them (type facts are only the columns exposed differently)
 	vector<string> known;
 	for (auto &column : object_columns) {
@@ -965,15 +995,18 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 	}
 	for (auto &column : listed) {
 		string source = column.name; // what to read the value from, in physical terms
+		bool source_is_name = true;  // spec 148 review: a name is emitted quoted, never as text
 		for (auto &defined : object_columns) {
 			if (StringUtil::CIEquals(defined.first, column.name)) {
 				source = defined.second.empty() ? defined.first : defined.second;
+				source_is_name = defined.second.empty();
 				break;
 			}
 		}
 		for (auto &rename : out.renames) {
 			if (StringUtil::CIEquals(rename.first, column.name)) {
 				source = rename.second;
+				source_is_name = false;
 				break;
 			}
 			if (StringUtil::CIEquals(rename.second, column.name)) {
@@ -981,8 +1014,8 @@ void CatalogBackend::ApplyGrantPolicy(const string &vname, const GrantUnion &gra
 				                      column.name);
 			}
 		}
-		auto expr = column.Read(source);
-		out.projection.push_back(expr == column.name ? expr : expr + " AS " + Ident(column.name));
+		auto expr = column.Read(source_is_name ? Ident(source) : source);
+		out.projection.push_back(expr == Ident(column.name) ? expr : expr + " AS " + Ident(column.name));
 		out.visible_columns.insert(source);
 		if (column.tree) {
 			out.narrowed_reads.emplace_back(source, column.TreeItems(source));
@@ -1088,6 +1121,7 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 		}
 	}
 	vector<std::pair<string, string>> no_columns;
+	RequireStoredExpressions(vname, string(), no_columns, united);
 	ApplyGrantPolicy(vname, grants, no_columns, out);
 	// the alias is the object: a tail is the client's text, and the alias's policy is one for every tail
 	NoteUnionWidens(NamePath::JoinKeys(vcat, alias_path), capability, united, {});
@@ -1249,6 +1283,7 @@ void CatalogBackend::FunctionPolicyFrom(ResultRows &rows, idx_t begin, idx_t end
 			united.emplace_back(rows.GetValue(13, row).ToString(), std::move(row_policy));
 		}
 	}
+	RequireStoredExpressions(vname, string(), {}, united);
 	ApplyFunctionGrantPolicy(vname, table_kind, grants, policy);
 	NoteUnionWidens(NamePath::JoinKeys(vcat, fvname), "select", united, {});
 }

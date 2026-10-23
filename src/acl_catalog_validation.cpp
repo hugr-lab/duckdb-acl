@@ -7,10 +7,141 @@
 #include "acl_policy_catalog.hpp"
 #include "acl_rewriter.hpp"
 #include "acl_types.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 
 namespace duckdb {
 namespace acl {
 namespace acl_detail {
+
+namespace {
+
+//! `SELECT <sql>` parsed to its one SelectNode, or null (not one SELECT, a set operation, modifiers, a CTE)
+unique_ptr<SQLStatement> ParseOneSelect(const string &sql, optional_ptr<SelectNode> &select) {
+	select = nullptr;
+	vector<unique_ptr<SQLStatement>> statements;
+	try {
+		Parser parser(ParserOptions::Builtin());
+		parser.ParseQuery(sql);
+		statements = std::move(parser.statements);
+	} catch (std::exception &) {
+		return nullptr;
+	}
+	if (statements.size() != 1 || statements[0]->type != StatementType::SELECT_STATEMENT) {
+		return nullptr;
+	}
+	auto &node = *statements[0]->Cast<SelectStatement>().node;
+	if (node.type != QueryNodeType::SELECT_NODE || !node.modifiers.empty() || !node.cte_map.map.empty()) {
+		return nullptr;
+	}
+	select = &node.Cast<SelectNode>();
+	if (!select->groups.group_expressions.empty() || !select->groups.grouping_sets.empty() || select->having ||
+	    select->qualify || select->sample) {
+		select = nullptr;
+		return nullptr;
+	}
+	return std::move(statements[0]);
+}
+
+} // namespace
+
+bool OneExpression(const string &text, string &problem) {
+	// judged by the parser that reads the text where it is spliced - alone, and with a known tail right after it:
+	// what the text does to the text around it (a comment left open, a parenthesis, a clause, a second statement)
+	// shows as a tail that is no longer the one written
+	optional_ptr<SelectNode> alone;
+	auto alone_statement = ParseOneSelect("SELECT " + text, alone);
+	if (!alone || alone->select_list.size() != 1 ||
+	    (alone->from_table && alone->from_table->type != TableReferenceType::EMPTY_FROM) || alone->where_clause) {
+		problem = "not one expression (a clause, a second statement or text that does not parse)";
+		return false;
+	}
+	if (alone->select_list[0]->HasAlias()) {
+		problem = "an alias";
+		return false;
+	}
+	optional_ptr<SelectNode> placed;
+	auto placed_statement =
+	    ParseOneSelect("SELECT " + text + " AS __acl_a, 1 AS __acl_b FROM __acl_t WHERE true", placed);
+	bool kept = placed && placed->select_list.size() == 2 && placed->where_clause &&
+	            placed->where_clause->GetExpressionClass() == ExpressionClass::CONSTANT && placed->from_table &&
+	            placed->from_table->type == TableReferenceType::BASE_TABLE &&
+	            placed->from_table->Cast<BaseTableRef>().Table().GetIdentifierName() == "__acl_t" &&
+	            placed->select_list[0]->GetAlias().GetIdentifierName() == "__acl_a" &&
+	            placed->select_list[1]->GetAlias().GetIdentifierName() == "__acl_b" &&
+	            placed->select_list[1]->GetExpressionClass() == ExpressionClass::CONSTANT;
+	if (kept) {
+		// compared as trees, in place: a copy of a star's EXCLUDE / REPLACE / RENAME sets prints them in another order
+		placed->select_list[0]->ClearAlias();
+		kept = placed->select_list[0]->Equals(*alone->select_list[0]);
+	}
+	if (!kept) {
+		problem = "text that does not stay one expression where it is placed (a comment left open, a parenthesis)";
+		return false;
+	}
+	// the golden rule: a statement's parameters are its client's - a policy text that holds one (at any depth, inside a
+	// subquery too: the parser maps every one) would take the client's value into the policy
+	if (!alone_statement->named_param_map.empty()) {
+		problem = "a parameter ($1, ?) - a policy carries values, never asks for them";
+		return false;
+	}
+	return true;
+}
+
+bool StoredExpressionsOk(const vector<string> &texts) {
+	// a verdict depends on the text alone: kept, so a read of many rows of the same policy parses it once
+	static mutex verdicts_lock;
+	static unordered_map<string, bool> verdicts;
+	for (auto &text : texts) {
+		if (text.empty()) {
+			continue;
+		}
+		{
+			lock_guard<mutex> guard(verdicts_lock);
+			auto entry = verdicts.find(text);
+			if (entry != verdicts.end()) {
+				if (!entry->second) {
+					return false;
+				}
+				continue;
+			}
+		}
+		string problem;
+		auto ok = OneExpression(text, problem);
+		lock_guard<mutex> guard(verdicts_lock);
+		if (verdicts.size() > 8192) {
+			verdicts.clear();
+		}
+		verdicts[text] = ok;
+		if (!ok) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void RequireColumnName(const char *what, const string &name) {
+	// a name as one column reference (quoted or not) - nothing else may stand where a name is pasted
+	string problem;
+	bool ok = OneExpression(name, problem);
+	if (ok) {
+		auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(name);
+		ok = parsed.size() == 1 && parsed[0]->GetExpressionClass() == ExpressionClass::COLUMN_REF;
+	}
+	if (!ok) {
+		throw BinderException("acl admin: %s names \"%s\", which is not a column name (spec 148)", what, name);
+	}
+}
+
+void RequireOneExpression(const char *what, const string &text) {
+	string problem;
+	if (!text.empty() && !OneExpression(text, problem)) {
+		throw BinderException("acl admin: %s holds \"%s\", which is %s - write a single expression (spec 148)", what,
+		                      text, problem);
+	}
+}
 
 bool CatalogBackend::ProbeSchema(const string &sql, bool expression, const vector<string> &param_types,
                                  vector<std::pair<string, string>> &out) {
@@ -124,6 +255,13 @@ string CatalogBackend::PredicateError(const string &source, const string &rls, b
 	if (rls.empty() || source.empty()) {
 		return string();
 	}
+	string problem;
+	if (!OneExpression(rls, problem)) {
+		if (checked) {
+			*checked = true; // judged: never spliced into a probe
+		}
+		return "the predicate is " + problem + " (spec 148: one expression)";
+	}
 	auto instance = Db();
 	Connection con(*instance);
 	auto base = con.Query("SELECT * FROM " + source + " WHERE false");
@@ -198,6 +336,25 @@ string CatalogBackend::ProjectionSchema(const string &source, const string &colu
                                         vector<std::pair<string, string>> &out, bool *checked) {
 	if (checked) {
 		*checked = false;
+	}
+	// spec 148: nothing is spliced into the probe that is not one expression - a FROM written after a mask bound its
+	// table function here, as the node, before the shape was refused
+	string problem;
+	for (auto &item : ParseColumnList(column_csv)) {
+		if (!item.second.empty() && !OneExpression(item.second, problem)) {
+			if (checked) {
+				*checked = true;
+			}
+			return "\"" + item.first + "\" is " + problem + " (spec 148: one expression)";
+		}
+	}
+	for (auto &item : own) {
+		if (!item.second.empty() && !OneExpression(item.second, problem)) {
+			if (checked) {
+				*checked = true;
+			}
+			return "the object's \"" + item.first + "\" is " + problem + " (spec 148: one expression)";
+		}
 	}
 	vector<string> items;
 	// spec 102: items are grouped by column first, so a path into one compiles to what the role reads

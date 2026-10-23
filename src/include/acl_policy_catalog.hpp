@@ -368,6 +368,19 @@ inline vector<UnionWidening> RoleUnionWidens(const vector<std::pair<string, Gran
 	return out;
 }
 
+//! spec 148: whether a policy expression's text (an RLS, a mask, a computed column) is exactly one expression - no
+//! comment, no alias, nothing written after it (FROM, WHERE, a second statement). The node splices this text into
+//! statements (the read, the probes), while a parse of its select list alone (ParseExpressionList, the gates' walk)
+//! drops what follows it. `problem` says what is wrong.
+bool OneExpression(const string &text, string &problem);
+//! spec 148: every non-empty text of a stored policy is one expression (verdicts kept per text) - a probe pastes
+//! stored text only then, and a read refuses a policy that holds one that is not
+bool StoredExpressionsOk(const vector<string> &texts);
+//! spec 148: refuse, where it is written, a policy expression that is not one expression
+void RequireOneExpression(const char *what, const string &text);
+//! spec 148: a name the memory store pastes as it is written must be one column reference
+void RequireColumnName(const char *what, const string &name);
+
 //! Parse a caps JSON object ({"select": true, "insert": false, ...}) into the set of enabled
 //! capability names, with duckdb's bundled yyjson. Anything but a flat object of booleans is refused.
 inline case_insensitive_set_t ParseCaps(const string &json) {

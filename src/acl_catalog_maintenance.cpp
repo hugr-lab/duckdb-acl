@@ -71,6 +71,11 @@ string EntryItem(const std::pair<string, string> &entry) {
 }
 
 bool ItemBinds(CatalogBackend &catalog, const string &source, const string &item, string &error) {
+	string problem;
+	if (!acl_detail::OneExpression(item, problem)) { // spec 148: never spliced into the probe
+		error = "the expression is " + problem + " (spec 148: one expression)";
+		return false;
+	}
 	return Binds(catalog, "SELECT " + item + " AS __acl_probe FROM " + source + " WHERE false", error);
 }
 
@@ -677,7 +682,8 @@ private:
 				auto own = relation.own.find(path.head);
 				auto value = own != relation.own.end() && !own->second.empty() ? own->second : Ident(path.head);
 				vector<std::pair<string, LogicalType>> types;
-				if (catalog.ProbeTypes("SELECT " + value + " AS c FROM " + relation.Source(), types) &&
+				if (acl_detail::StoredExpressionsOk({value}) && // spec 148
+				    catalog.ProbeTypes("SELECT " + value + " AS c FROM " + relation.Source(), types) &&
 				    !types.empty()) {
 					string steps;
 					for (auto &step : path.steps) {

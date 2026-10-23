@@ -1,0 +1,231 @@
+# name: test/sql/acl_one_expression.test
+# description: spec 148 - a policy expression (an RLS, a mask, a computed column, a REMAP item, a scalar template, a
+#   reference's join expression) is exactly one expression, refused where it is written otherwise: a comment left
+#   open, an alias, a FROM / WHERE written after it, a second statement, an unbalanced parenthesis. The node splices this text
+#   into statements; the gates judge only its select list. A row stored past the check is reported by
+#   acl_check_catalog and never run by its probes.
+# group: [sql]
+
+require acl
+
+# the memory store judges the same text (it pastes it at read too)
+statement error
+SELECT acl_grant_table('m', 't', 'phys.main.t', 'id, note = 1 FROM range(1)', '', 'select');
+----
+spec 148
+
+# ... and a name it pastes as written
+statement error
+SELECT acl_grant_table('m', 't', 'phys.main.t', 'id FROM range(1)', '', 'select');
+----
+not a column name
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t(id INTEGER, note VARCHAR);
+
+statement ok
+INSERT INTO phys.main.t VALUES (1, 'a'), (2, 'b');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.u AS phys.main.t;
+
+statement ok
+ACL ADMIN CREATE ROLE r;
+
+# a catalog grant's mask: a FROM after it, a comment, a second statement, an alias, an unbalanced parenthesis
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1 FROM range(3)');
+----
+spec 148
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) -- hidden');
+----
+does not stay one expression
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) /* hidden');
+----
+spec 148
+
+# a comment closed inside the text hides nothing around it
+statement ok
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = upper(note) /* kept */');
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1; SELECT 2');
+----
+spec 148
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1 AS x');
+----
+an alias
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = 1) UNION SELECT 1 (');
+----
+spec 148
+
+# ... and its row filter
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id > 0 FROM range(1)', '');
+----
+spec 148
+
+statement error
+ACL ADMIN GRANT CATALOG c TO ROLE r WITH (select) MAIN RLS (id > 0 -- x
+);
+----
+
+# what is one expression stays allowed: a string holding the comment marks, a subquery, CASE, a lambda, a cast
+statement ok
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'note <> ''x--y''', 'id, note = CASE WHEN id > 1 THEN ''--'' ELSE upper(note) END');
+
+query II
+ACL ROLE "r" SELECT * FROM t ORDER BY id;
+----
+1	A
+2	--
+
+statement ok
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id IN (SELECT id FROM phys.main.t)', 'id, note = list_transform([note], lambda x: x || ''/*'')[1]::VARCHAR');
+
+query II
+ACL ROLE "r" SELECT * FROM t ORDER BY id;
+----
+1	a/*
+2	b/*
+
+# review: a star's EXCLUDE / REPLACE / RENAME inside the text is one expression too (compared as trees)
+statement ok
+CREATE TABLE phys.main.w(id INTEGER, note VARCHAR, s INTEGER, l INTEGER, j INTEGER);
+
+statement ok
+INSERT INTO phys.main.w VALUES (1, 'a', 0, 0, 0), (2, 'b', 0, 0, 0);
+
+statement ok
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id IN (SELECT id FROM (SELECT * EXCLUDE (s, l, j) FROM phys.main.w)) AND id IN (SELECT i FROM (SELECT * RENAME (id AS i, note AS n, s AS ss) FROM phys.main.w))', 'id, note');
+
+query I
+ACL ROLE "r" SELECT count(*) FROM t;
+----
+2
+
+# the golden rule: a policy text never asks for a value
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id = ?', '');
+----
+parameter
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = $1');
+----
+parameter
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, 'id IN (SELECT id FROM phys.main.t WHERE id = ?)', '');
+----
+parameter
+
+statement error
+SELECT acl_grant_catalog('r', 'c', '{"select": true}', true, '', 'id, note = (SELECT max(note) FROM phys.main.t WHERE id = $1)');
+----
+parameter
+
+# an object grant's mask and row filter
+statement error
+SELECT acl_grant_object('r', 'c', 'u', '{"select": true}', '', 'id, note = j AS m FROM range(3) j');
+----
+spec 148
+
+statement error
+SELECT acl_grant_object('r', 'c', 'u', '{"select": true}', 'id > 0 WHERE true', '');
+----
+spec 148
+
+# a relation's computed column and row filter
+statement error
+SELECT acl_add_relation('c', 'v', 'phys.main.t', 'id, n = note FROM range(1)', '');
+----
+spec 148
+
+statement error
+SELECT acl_add_relation('c', 'v', 'phys.main.t', '', 'id > 0 -- x');
+----
+spec 148
+
+# a REMAP item
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.d AS phys.main.t COLUMNS (id, n = note);
+
+statement error
+SELECT acl_repair_relation('c', 'd', 'remap', 'n = note FROM range(1)');
+----
+spec 148
+
+# a scalar function's template
+statement error
+ACL ADMIN ADD SCALAR c.s MACRO 'acl_arg(1) FROM range(1)';
+----
+spec 148
+
+statement ok
+ACL ADMIN ADD SCALAR c.s2 MACRO 'upper(acl_arg(1))';
+
+# a row stored past the check (the operator's own SQL into the policy tables) is reported, never run by the probes
+statement ok
+UPDATE store.acl.role_catalogs SET "columns" = 'id, note = j AS m FROM range(3) j' WHERE "role" = 'r';
+
+query I
+SELECT count(*) > 0 FROM acl_check_catalog('c') WHERE detail LIKE '%spec 148%';
+----
+true
+
+# ... and refuses the read it would have shaped - it is never pasted into the statement
+statement error
+ACL ROLE "r" SELECT * FROM t;
+----
+spec 148
+
+# review: a column's name is read as a name, quoted - a declared column named with a space reads under a grant
+statement ok
+CREATE TABLE phys.main.o("odd name" INTEGER, id INTEGER);
+
+statement ok
+INSERT INTO phys.main.o VALUES (7, 1);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.o AS phys.main.o COLUMNS (id, "odd name");
+
+statement ok
+ACL ADMIN CREATE ROLE q;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE q WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.o TO ROLE q COLUMNS ("odd name");
+
+query I
+ACL ROLE "q" SELECT * FROM o;
+----
+7

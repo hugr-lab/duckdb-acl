@@ -100,6 +100,9 @@ vector<string> CatalogBackend::ColumnSchemaStatements(const string &vcat, const 
 
 using acl_detail::CatalogBackend;
 using acl_detail::Lit;
+using acl_detail::OneExpression;
+using acl_detail::RequireOneExpression;
+using acl_detail::StoredExpressionsOk;
 
 namespace {
 
@@ -495,11 +498,15 @@ vector<string> RelationStatements(CatalogBackend &catalog, const string &vcat, c
 		// on the write path, exactly as a view's SQL is bound (spec 010). Without this the column is
 		// readable but typeless, and metadata cannot describe it (spec 010 part 3).
 		vector<string> items;
+		vector<string> expressions;
 		for (auto &column : columns) {
 			items.push_back(column.second.empty() ? acl_detail::Ident(column.first)
 			                                      : column.second + " AS " + acl_detail::Ident(column.first));
+			expressions.push_back(column.second);
 		}
-		derived = catalog.ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + NamePath::KeyToSql(phys),
+		// spec 148: a stored list (re-read by an ALTER of another field) is pasted only when each is one expression
+		derived = StoredExpressionsOk(expressions) &&
+		          catalog.ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + NamePath::KeyToSql(phys),
 		                              false, {}, schema);
 		if (!derived) {
 			schema.clear();
@@ -562,6 +569,14 @@ vector<std::pair<string, LogicalType>> ExposedTypes(CatalogBackend &catalog, con
 		                                                         : expr.ToString() + " AS " + acl_detail::Ident(name));
 	}
 	vector<std::pair<string, LogicalType>> types;
+	vector<string> expressions;
+	for (idx_t i = 0; i < rows->RowCount(); i++) {
+		auto expr = rows_rows.GetValue(1, i);
+		expressions.push_back(expr.IsNull() ? string() : expr.ToString());
+	}
+	if (!StoredExpressionsOk(expressions)) {
+		return types; // spec 148: not pasted - unknown here, the read refuses it
+	}
 	catalog.ProbeTypes("SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " + source,
 	                   types);
 	return types;
@@ -1074,6 +1089,10 @@ void RequireNotPolicyStore(CatalogBackend &catalog, const char *what, const stri
 //! An RLS predicate and a column list (masks, computed columns) of a definition or a grant
 void RequirePolicyFreeExpressions(CatalogBackend &catalog, const char *what, const string &rls,
                                   const vector<std::pair<string, string>> &columns) {
+	RequireOneExpression(what, rls);
+	for (auto &column : columns) {
+		RequireOneExpression(what, column.second);
+	}
 	if (!rls.empty()) {
 		RequireNotPolicyStore(catalog, what, string(), false, rls, true);
 	}
@@ -1313,7 +1332,8 @@ bool PolicyStore::RelationDefinitionWalk(const string &vcat, const string &vname
 	}
 	string form, phys, view_sql, rls;
 	vector<string> items;
-	case_insensitive_set_t masks; // `c = expr` over a column the source has: a mask, not a computed column
+	vector<string> stored_expressions; // spec 148: planned only when each is one expression
+	case_insensitive_set_t masks;      // `c = expr` over a column the source has: a mask, not a computed column
 	case_insensitive_set_t source_columns;
 	try {
 		auto relation =
@@ -1347,6 +1367,7 @@ bool PolicyStore::RelationDefinitionWalk(const string &vcat, const string &vname
 			auto name = column_rows.GetValue(0, i).ToString();
 			auto expr = column_rows.GetValue(1, i).IsNull() ? string() : column_rows.GetValue(1, i).ToString();
 			items.push_back(expr.empty() ? acl_detail::Ident(name) : expr + " AS " + acl_detail::Ident(name));
+			stored_expressions.push_back(expr);
 			if (!expr.empty() && source_columns.count(name)) {
 				masks.insert(name);
 			}
@@ -1358,7 +1379,10 @@ bool PolicyStore::RelationDefinitionWalk(const string &vcat, const string &vname
 		return false;
 	}
 	string sql;
-	if (form == "view") {
+	stored_expressions.push_back(rls);
+	if (!StoredExpressionsOk(stored_expressions)) {
+		// spec 148: a stored text that is not one expression is never planned - the dataset without its edges
+	} else if (form == "view") {
 		sql = view_sql;
 	} else if (!phys.empty()) {
 		sql = "SELECT " + (items.empty() ? string("*") : StringUtil::Join(items, ", ")) + " FROM " +
@@ -1575,6 +1599,7 @@ void PolicyStore::CatalogAddReference(const string &vcat, const string &name, co
 		                            "both",
 		                            name);
 	}
+	RequireOneExpression("the reference's join expression", expr); // spec 148
 	bool to_function = StringUtil::CIEquals(to_kind, "function");
 	if (pairs.empty() && expr.empty() && args.empty()) {
 		// a condition may be left out only when the arguments are the whole relationship: the function
@@ -2267,6 +2292,9 @@ void PolicyStore::CatalogAddFunction(const string &vcat, const string &vname, co
 	RequireCatalog(catalog, "acl_add_function");
 	RequireNotReserved(vname);
 	if (form == "macro") {
+		if (kind == "scalar") {
+			RequireOneExpression("the scalar function's template", template_sql); // spec 148
+		}
 		RequireNotPolicyStore(*catalog, "the function's template", string(), false, template_sql, kind == "scalar",
 		                      CatalogBackend::DeclaredTypes(params));
 	}
@@ -2707,8 +2735,15 @@ idx_t PolicyStore::CatalogRefreshSchema(const string &vcat, const string &vname)
 				}
 			}
 			vector<std::pair<string, string>> schema;
-			bool derived = catalog->ProbeSchema(
-			    "SELECT " + StringUtil::Join(items, ", ") + " FROM " + NamePath::KeyToSql(phys), false, {}, schema);
+			vector<string> expressions;
+			for (idx_t i = 0; i < columns->RowCount(); i++) {
+				auto expr = columns_rows.GetValue(1, i);
+				expressions.push_back(expr.IsNull() ? string() : expr.ToString());
+			}
+			bool derived =
+			    StoredExpressionsOk(expressions) && // spec 148
+			    catalog->ProbeSchema("SELECT " + StringUtil::Join(items, ", ") + " FROM " + NamePath::KeyToSql(phys),
+			                         false, {}, schema);
 			rederive(object, "relation", derived ? schema : names_only, derived, marks);
 		}
 		auto macros = read("SELECT \"vname\", \"kind\", \"template\", \"params\" FROM " + catalog->Tbl("functions") +

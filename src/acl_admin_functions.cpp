@@ -1,6 +1,7 @@
 #include "acl_admin_functions.hpp"
 #include "acl_platform.hpp"
 #include "acl_door_common.hpp"
+#include "acl_policy_catalog.hpp"
 #include "acl_connection.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -692,6 +693,12 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 			store.CatalogSetObjectCaps(role, "default", vname, CapsCsvToJson(cap_list));
 			continue;
 		}
+		// spec 148: the memory store pastes this text at read too
+		acl_detail::RequireOneExpression("the grant's RLS", rls);
+		for (auto &column : columns) {
+			acl_detail::RequireColumnName("the grant's column list", column.first);
+			acl_detail::RequireOneExpression("the grant's column list", column.second);
+		}
 		TablePolicy policy;
 		policy.phys = phys;
 		for (auto &column : columns) {
@@ -749,6 +756,9 @@ void GrantFunctionWrapper(DataChunk &args, ExpressionState &state, Vector &resul
 			store.CatalogAddFunction("default", vname, kind, is_alias ? "alias" : "macro", is_alias ? definition : "",
 			                         is_alias ? "" : definition);
 			continue;
+		}
+		if (!is_alias && string(kind) == "scalar") {
+			acl_detail::RequireOneExpression("the scalar function's template", definition); // spec 148
 		}
 		TablePolicy policy;
 		policy.subquery_form = !is_alias;
