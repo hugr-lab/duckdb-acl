@@ -1,16 +1,16 @@
 # Spec 144: a listing says what the read returns - live aliases, struct paths, star filters
 
-- **Status**: draft
+- **Status**: accepted
 - **Date**: 2026-10-23
-- **Author**: hugr lab (found by spec 143's reviews; the owner, 2026-10-23: "давай начнём 144")
+- **Author**: hugr lab (found by spec 143's reviews; accepted by the owner 2026-10-23)
 
 ## Summary
 
 Spec 035's rule is that a principal's listings describe exactly what its reads return. Spec 143's reviews found
-three places where they do not: a live schema alias's columns ignore a narrowing grant, a catalog grant's struct
-path leaves the hidden fields in the listed type, and `SELECT * LIKE '…'` under a principal names every column
-after the pattern. The first two list names the read hides - and, since spec 143, their comments, tags and the
-Flight `REMARKS`. This spec makes the listings follow the read in all three.
+two places where they do not - a live schema alias's columns ignore a narrowing grant, a catalog grant's struct path
+leaves the hidden fields in the listed type - both listing names the read hides (and, since spec 143, their comments,
+tags and the Flight `REMARKS`). A third, of the same family but no leak: `SELECT * LIKE '…'` under a principal reads
+the right columns and names every one of them after the pattern. This spec makes all three follow the read.
 
 ## Problem
 
@@ -24,9 +24,12 @@ Flight `REMARKS`. This spec makes the listings follow the read in all three.
    name in the listing and in Flight's promised schema. The same path on an object grant is listed right: its
    projection is probed into `grant_columns` (spec 026), a catalog grant's is not, and only the projection's rows
    pass through `acl_listed_type` (spec 102).
-3. **`SELECT * LIKE '%t%' FROM t`** answers `tenant, amount, …` in duckdb and three columns all named
-   `(* ~~ '%t%')` under a principal. `KeepItemNames` (spec 072) gives an item without an alias its current name; duckdb
-   turns `* LIKE` / `ILIKE` / `SIMILAR TO` (and their `NOT`) into `COLUMNS(list_filter(*, …))` carrying that alias.
+3. **`SELECT * LIKE '%t%' FROM t`** under a principal reads the right columns - duckdb expands the star over the
+   rewritten FROM, so the pattern matches the virtual names of the visible columns (`* LIKE 'p%'` over `COLUMNS (id,
+   paid = amount)` reads `paid`, never the source's `amount`) - but every column is named `(* ~~ '%t%')`, where
+   duckdb names them `tenant, amount, …`. `KeepItemNames` (spec 072) gives an item without an alias its current name;
+   duckdb turns `* LIKE` / `ILIKE` / `SIMILAR TO` (and their `NOT`) into `COLUMNS(list_filter(*, …))` carrying that
+   alias. Names only - nothing the read hides is reached.
 
 ## Design
 
