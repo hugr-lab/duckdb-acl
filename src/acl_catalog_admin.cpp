@@ -1182,7 +1182,7 @@ vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, co
 		principal.roles = {role};
 		TablePolicy policy;
 		try {
-			if (!store.ResolveTable(principal, vcat + "." + vname, policy) || policy.caps.empty()) {
+			if (!store.ResolveTableOwnPolicy(principal, vcat + "." + vname, policy) || policy.caps.empty()) {
 				continue;
 			}
 		} catch (std::exception &) {
@@ -1214,6 +1214,9 @@ vector<AuditLineageTag> RoleTags(PolicyStore &store, CatalogBackend &catalog, co
 				tags.push_back(AuditLineageTag {key, eq == string::npos ? "visible" : "masked", path});
 			}
 		};
+		if (!policy.caps.count("select")) {
+			continue; // spec 145: a role that may not read reads no field - no visible or masked tag
+		}
 		if (policy.projection.empty()) {
 			// a writable object a grant narrows keeps its shape: what the role reads is the grant's
 			// visible columns (all of them when it names none), a masked one carried as an injection

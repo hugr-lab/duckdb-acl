@@ -503,9 +503,12 @@ object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like ever
   effective policy is the union of the roles that hold the capability exercised (spec 145): a role that
   may read without a narrowing grant lifts it for a principal holding both, while a role that may not
   read - one with `insert` only, an object grant `CAPS '{}'` - lifts no read role's filter or columns;
-  likewise for each write verb. `RETURNING` reads: it is refused where the principal may not read the
-  object, or reads it under another policy than the verb's. A catalog-level column list is not probed
-  for its types.
+  likewise for each write verb, and for a function call (a read). An upsert (`ON CONFLICT DO UPDATE`,
+  `INSERT OR REPLACE`) updates the row already there: it needs `update`, under the update's policy;
+  `OR REPLACE` is refused under a row or column policy. `RETURNING` of a row already there (UPDATE,
+  DELETE, MERGE, an upsert) reads: it needs `select`, and is refused where a role whose policy the verb
+  unites may not read; a plain INSERT's returns what was written. A catalog-level column list is not
+  probed for its types.
 - `CAPS '{"manage": true}'` is the catalog-scoped administration scope: the role may run the
   management grammar over this catalog's content (and only that - see *Batches and authorization*).
   Managing a catalog does not imply reading it.

@@ -839,6 +839,31 @@ acl.role.clerk	id	visible
 acl.role.clerk	name	visible
 acl.role.clerk	ssn	masked
 
+# spec 145: a role that may not read reads no field - its caps and its row filter, never a visible or masked tag
+statement ok
+ACL ADMIN CREATE ROLE ingester;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE ingester WITH (insert);
+
+statement ok
+ACL ADMIN GRANT TABLE c.people TO ROLE ingester WITH (insert) RLS (id > 0) COLUMNS (id, name);
+
+statement ok
+SELECT acl_lineage_flush();
+
+query TTT
+SELECT t->>'key', coalesce(t->>'field', '-'), t->>'value'
+FROM (SELECT unnest(from_json(payload->'datasets'->(payload->'outputs'->>0)::INT->'tags', '["JSON"]')) AS t
+      FROM acl_lineage_events()
+      WHERE seq = (SELECT max(seq) FROM acl_lineage_events()
+                   WHERE (payload->'datasets'->(payload->'outputs'->>0)::INT->>'name') = 'c.main.people'))
+WHERE (t->>'key') LIKE 'acl.role.ingester%'
+ORDER BY 1, 2;
+----
+acl.role.ingester	-	insert
+acl.role.ingester.rls	-	true
+
 # a grant change is no lifecycle change
 query T
 SELECT coalesce(payload->'datasets'->(payload->'outputs'->>0)::INT->>'lifecycle', '-')

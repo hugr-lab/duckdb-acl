@@ -669,6 +669,7 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	auto rls = result->Collection().GetValue(3, 0);
 	out.phys = phys.IsNull() ? string() : phys.ToString();
 	out.query = view_sql.IsNull() ? string() : view_sql.ToString();
+	out.is_view = form == "view";
 	out.rls = rls.IsNull() ? string() : rls.ToString();
 	auto rchk = result->Collection().GetValue(13, 0);
 	out.rls_unchecked = !out.rls.empty() && (rchk.IsNull() || !rchk.GetValue<bool>());
@@ -722,6 +723,7 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 		}
 		if (caps.count(capability)) {
 			grants.Add(RowPolicy(result_rows, row, 5));
+			out.capability_rows_read = out.capability_rows_read && caps.count("select");
 		}
 	}
 	ApplyGrantPolicy(vname, grants, object_columns, out);
@@ -1053,6 +1055,7 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 		}
 		if (caps.count(capability)) { // spec 145: see LookupRelation
 			grants.Add(RowPolicy(result_rows, row, 4));
+			out.capability_rows_read = out.capability_rows_read && caps.count("select");
 		}
 	}
 	vector<std::pair<string, string>> no_columns;
@@ -1131,11 +1134,14 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 			    result_rows.GetValue(0, row).ToString() != vcat) {
 				continue;
 			}
-			auto caps = result_rows.GetValue(4, row);
-			for (auto &cap : EffectiveCaps(caps)) {
+			auto caps = EffectiveCaps(result_rows.GetValue(4, row));
+			for (auto &cap : caps) {
 				policy.caps.insert(cap);
 			}
-			grants.Add(RowPolicy(result_rows, row, 5));
+			// spec 145: a call is a read - only a role that may call it narrows or widens what it returns
+			if (caps.count("select")) {
+				grants.Add(RowPolicy(result_rows, row, 5));
+			}
 		}
 		ApplyFunctionGrantPolicy(vname, table_kind, grants, policy);
 	}

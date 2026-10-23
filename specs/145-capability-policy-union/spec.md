@@ -40,29 +40,55 @@ ACL TOKEN '<roles: analyst, auditor>' SELECT * FROM t;   -- every row, every col
 - `PolicyStore::ResolveTable(principal, name, out, capability = "select")`; the cache key carries the capability;
   `ResolveDmlTarget` passes its verb (`insert`, `update`, `delete`, `merge`), every read keeps the default. A
   capability no row holds leaves the union empty - and the caps check refuses before the policy is used.
-- **RETURNING is a read**: a DML target's `RETURNING` needs `select` on the object, and the `select` policy the same
-  as the verb's (predicate, projection, visible columns, masks, field writes) - a principal whose update role is
-  wider than its read role, or that holds no read at all, is refused with `RETURNING: …`, rather than returned rows
-  or columns its reads cannot see (`TablePolicy::returning_refused`, set where the DML target is resolved).
-- **Listings** (spec 035, what the read returns): the grant rows that narrow a listing's columns (`gcolumns`) are
-  those holding `select`, and a role's probed projection (`grant_columns`) is listed only where that role reads the
-  object; spec 144's alias levels follow when it lands.
+- **Upserts update** (found by the review, on main for one role too): `INSERT … ON CONFLICT DO UPDATE` and `INSERT OR
+  REPLACE` change the row already there - they need `update` and run their SET under the update's policy
+  (`ConflictUpdatePolicy`); an insert-only role updated through them, and an insert role beside an update role
+  lifted its confinement. `OR REPLACE` has no SET to confine (duckdb writes every inserted column): refused under a
+  row or column policy, with `ON CONFLICT … DO UPDATE SET …` named as what the policy confines.
+- **A statement's own conditions read**: what UPDATE / DELETE / MERGE's SET, WHERE, ON and WHEN read of the target is
+  judged under the read policy where the principal reads the object (the verb's predicate stays AND-ed in: which
+  rows it may touch), under the verb's where it only writes.
+- **RETURNING is a read** - where it returns a row already there (UPDATE, DELETE, MERGE, an upsert): it needs
+  `select`, and every grant row the verb's policy unites must hold `select` too (`capability_rows_read`: the verb's
+  policy is then no wider than the read's - fewer predicates OR-ed, fewer lists united), else it is refused with
+  `RETURNING: …` (`TablePolicy::returning_refused`). A plain INSERT's RETURNING returns what the principal wrote and
+  the defaults (a generated key): allowed as before, whatever it reads. A read that does not resolve refuses
+  RETURNING alone, never the write.
+- **Table and scalar functions**: a call is a read - `ResolveFunction` unites the rows holding `select` (the review:
+  an insert-only role lifted a function grant's filter and columns).
+- **Listings** (spec 035, what the read returns): the grant rows that narrow a listing's columns (`gcolumns`, the
+  function keys' `gfcolumns`) are those holding `select` - for an object no row of the principal's may read (it only
+  writes), every visible row's, as before (the review: a write-only role saw every column) - and a role's probed
+  projection (`grant_columns`) is listed only where those rows include it; spec 144's alias levels follow when it
+  lands.
+- **The operator's screens** describe a role's own policy (`ResolveTableOwnPolicy`: under `select` when it holds it,
+  else under the first verb it holds): `platform.effective_rights`, the lineage role tags (no `visible` / `masked`
+  tag for a role that may not read), the runtime lineage of a write's target.
+- **A view is a view by its form** (`TablePolicy::is_view`), never by a `query` - a grant's column list sets one on a
+  table with no declared columns: DROP left the physical table behind and RENAME refused it (one role holding a
+  column list and `drop`; with this spec, a multi-role principal whose wider role no longer lifts the list too).
 - The memory store (dev mode) resolves a name to the first role holding it - no union, nothing lifted; unchanged.
 
 ## Enforcement & security
 
-- Only narrows: a role contributes to a capability's policy only when it holds that capability, so no principal
-  reads or writes more than before; a principal whose wider role lacked the capability reads less - what its grants
-  say.
-- RETURNING fails closed where the read and the write policy differ.
+- A role contributes to a capability's policy only when it holds that capability: no principal reads, writes or
+  upserts more than its grants for that capability say - a principal whose wider role lacked the capability now
+  reads (writes) less. What a statement's conditions read is a read.
+- RETURNING of a row already there fails closed where the verb's policy may be wider than the read's - a new refusal
+  for a principal whose write role does not read (a plain INSERT's RETURNING is unchanged: it returns what was
+  written, a generated key included). An upsert needs `update`, and `INSERT OR REPLACE` under a row or column policy
+  is refused - both new refusals of what used to bypass the policy.
 
 ## Testing
 
 - sqllogictest `acl_capability_union.test` (new, negative tests that fail on main): a read role with RLS and columns
   plus an `insert`-only role (catalog grant), plus a `CAPS '{}'` object grant, plus a live alias object - the read is
   the read role's; an `update` role with a predicate plus an `insert`-only role - the update stays confined, the
-  insert is the insert role's; `UPDATE … RETURNING` refused where the policies differ, allowed where they agree; the
-  listings agree with the reads.
+  insert is the insert role's; upserts (`ON CONFLICT DO UPDATE` confined by the update role, refused for an
+  insert-only role, `INSERT OR REPLACE` refused under a row policy and allowed without one); `RETURNING` - a plain
+  INSERT's allowed, an UPDATE's refused where a role the update unites may not read and allowed where all do; an
+  update's condition read under the read policy; a write-only role's listing narrowed by its own lists; the
+  operator's `effective_rights`; a table function under an insert-only second role.
 - The existing multi-role tests (spec 011, 102's unions) unchanged.
 
 ## Alternatives considered
@@ -75,3 +101,7 @@ ACL TOKEN '<roles: analyst, auditor>' SELECT * FROM t;   -- every row, every col
 
 - An unqualified name reads under the MAIN grants' roles only, a qualified one under every role holding the catalog
   (spec 144's review): a principal reads less through `t` than through `c.t` - narrower, not a leak.
+- A catalog grant's row filter or column list makes every virtual scalar of the catalog refuse ("carries a policy"),
+  for one role as before - with this spec a write-only second role no longer hides that.
+- `ResolveTableOwnPolicy` describes a write-only role under the first verb it holds (insert, update, delete, merge):
+  a role whose verbs carry different object grants is described by the first.

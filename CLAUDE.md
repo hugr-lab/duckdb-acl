@@ -917,10 +917,13 @@ through the catalog API (`test_acl_physical_tags.cpp`) or DuckLake's metadata.
 
 **Spec 145 — a capability's policy is the union of the grants that hold it**: `ResolveTable(…, capability =
 "select")` (the cache key carries it) unites the `RowPolicy` of only the rows whose `EffectiveCaps` hold the
-capability (`LookupRelation` / `LookupSchemaAlias`), the caps over every row; `ResolveDmlTarget` passes its verb. A
-role that may not read (insert only, `CAPS '{}'`) lifted another role's RLS and columns before. RETURNING is a read:
-`TablePolicy::returning_refused` (no `select`, or a `select` policy unlike the verb's). Listings: `gcolumns` only
-rows holding `select`, a role's `grant_columns` only where it reads. Test `acl_capability_union.test`.
+capability (`LookupRelation` / `LookupSchemaAlias`; `ResolveFunction`: a call is a read), the caps over every row, and
+notes `capability_rows_read`; `ResolveDmlTarget` passes its verb and sets `dml_read_policy` (the read policy where
+the principal reads - what SET / WHERE / ON / WHEN read, via MapReadable; the verb's RLS AND-ed in). Upserts need
+`update` (`ConflictUpdatePolicy`; `OR REPLACE` refused under a row or column policy). RETURNING of an existing row
+needs `select` and `capability_rows_read` (`returning_refused`); a plain INSERT's returns what was written. Listings:
+`gcolumns` / `gfcolumns` the rows holding `select`, else (a write-only principal) every visible row's. Operator
+screens: `ResolveTableOwnPolicy`. Test `acl_capability_union.test`.
 
 **Spec 140 — a door picks up a renewed certificate**: a pair given as LOCAL files (`IsLocalCertificatePath`; the
 csi-driver's, hugr-platform spec 005) is re-read every `acl_door_certificate_refresh` s (GLOBAL, 60; 0 = once) by a

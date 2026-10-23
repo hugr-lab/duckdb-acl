@@ -1900,6 +1900,21 @@ bool MainFallback(const string &vname, string &root) {
 
 } // namespace
 
+bool PolicyStore::ResolveTableOwnPolicy(const Principal &principal, const string &vname, TablePolicy &out) {
+	if (!ResolveTable(principal, vname, out)) {
+		return false;
+	}
+	if (out.caps.count("select")) {
+		return true;
+	}
+	for (auto verb : {"insert", "update", "delete", "merge"}) {
+		if (out.caps.count(verb)) {
+			return ResolveTable(principal, vname, out, verb);
+		}
+	}
+	return true; // no capability at all: the caps say so, the policy is no one's
+}
+
 bool PolicyStore::ResolveTable(const Principal &principal, const string &vname, TablePolicy &out,
                                const string &capability) {
 	// the memory store (dev mode) takes the first role that holds the name - no union, nothing lifted

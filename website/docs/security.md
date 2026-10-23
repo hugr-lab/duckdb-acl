@@ -450,9 +450,9 @@ refinement never widens by omission"; the capabilities outside the default "are 
 never inherited". A schema grant "carries **capabilities only** - no RLS, no column list" (spec 015).
 Capabilities and predicates union across a principal's roles; column lists union in the object's
 order (specs 026/038). A capability's policy is the union of the roles that hold it (spec 145): a
-role that may not read the object contributes nothing to what is read, nor a role that may not update
-it to what an update may touch; `RETURNING` reads, so it needs `select` and the same policy as the
-verb.
+role that may not read the object contributes nothing to what is read (a function call included), nor
+a role that may not update it to what an update - or an upsert - may touch; a statement's own
+conditions and the `RETURNING` of a row already there read under the read policy.
 
 ## 4. Identity
 
