@@ -521,6 +521,9 @@ struct CatalogBackend {
 		vector<std::pair<string, bool>> platform; // `<kind>:<object>` -> allowed (spec 117)
 	};
 	std::unordered_map<string, RightsRows> rights_cache;
+	//! spec 147: role (exact, as roles compare) -> whether the policy knows it; a gateway statement asks per claimed
+	//! role
+	std::unordered_map<string, bool> known_roles_cache;
 	case_insensitive_map_t<vector<GrantRow>> fn_grants; // function mode: role -> rows
 	case_insensitive_set_t fn_grants_loaded;
 
@@ -611,7 +614,10 @@ struct CatalogBackend {
 	//! The effective capabilities of one grant row: the most specific level that states them wins -
 	//! object, then schema, then catalog - and a level that says nothing (NULL, empty or blank) is
 	//! "unspecified", which is not "none" (spec 012).
-	string CapsExpr(const string &name_expr = "r.\"vname\"", const string &vcat_expr = "r.\"vcat\"");
+	//! spec 147: `object_level` / `schema_level` false leave out a level no row of the principal's roles holds (a
+	//! listing asks once) - the same chain, without a term that is NULL for every row
+	string CapsExpr(const string &name_expr = "r.\"vname\"", const string &vcat_expr = "r.\"vcat\"",
+	                bool object_level = true, bool schema_level = true);
 	//! Spec 120.2: what decides one role's caps on one object, read with the resolver's own expressions
 	//! (CapsExpr's terms, the grants CTE, the object-grant join by key) - never a second reading of the tables
 	struct GrantDecisionRow {
@@ -628,7 +634,7 @@ struct CatalogBackend {
 	vector<GrantDecisionRow> GrantDecisions(const string &role, const string &vcat, const vector<string> &vnames);
 	//! The same visibility test as an object's, written against a `functions f` row instead of a
 	//! `relations r` one - a function is granted like any other object of the catalog.
-	string FunctionVisibleExpr();
+	string FunctionVisibleExpr(bool object_level = true, bool schema_level = true);
 	//! spec 098: a virtual function a principal can see - what its `duckdb_functions()` row is built of
 	struct VisibleFunction {
 		string vcat;
@@ -650,6 +656,9 @@ struct CatalogBackend {
 		vector<Column> columns;
 	};
 	vector<VisibleFunction> VisibleFunctions(const Principal &principal);
+	//! spec 147: role set -> the functions its listings show (CallableFunctions), whole - a listing of ten thousand
+	//! functions would cycle the per-name cache past its capacity on every call; cleared with the other caches
+	std::unordered_map<string, shared_ptr<const vector<VisibleFunction>>> callable_cache;
 
 	//! The grant chain's policy columns (spec 011): the catalog grant's and the object grant's own RLS
 	//! and column list. The function-driver's slots do not carry them, so it composes to no narrowing.
@@ -687,6 +696,26 @@ struct CatalogBackend {
 	                     const vector<std::pair<string, GrantPolicy>> &united, const vector<string> &known);
 
 	bool ResolveFunction(const Principal &principal, const string &vname, bool table_kind, TablePolicy &out);
+	//! spec 147: many functions by their stored keys at once - ResolveFunction's verdict for each, one query a chunk
+	struct VirtualFunctionKey {
+		string vcat;
+		string vname;
+		bool table_kind = true;
+	};
+	struct ResolvedVirtualFunction {
+		bool found = false;
+		bool refused = false; // resolving it throws (ResolveFunction's BinderException)
+		TablePolicy policy;
+	};
+	void ResolveFunctions(const Principal &principal, const vector<VirtualFunctionKey> &keys,
+	                      vector<ResolvedVirtualFunction> &out);
+	//! the resolver's select list for a function's rows (prio as given), and the policy from one function's rows
+	string FunctionRowColumns(const string &prio_expr, bool schema_level = true);
+	//! spec 147: whether the principal's roles hold any object grant / any schema grant with caps - a level none
+	//! holds is left out of a caps chain built for many rows (its term is NULL for every one of them)
+	void PrincipalCapsLevels(const Principal &principal, bool &object_level, bool &schema_level);
+	void FunctionPolicyFrom(ResultRows &rows, idx_t begin, idx_t end, const string &vname, bool table_kind,
+	                        TablePolicy &policy);
 
 	//! A grant narrows a table function the same way it narrows a relation, only the result is not a
 	//! table but the function's output: the rewriter wraps the expanded/retargeted call in

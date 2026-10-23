@@ -130,6 +130,9 @@ struct TablePolicy {
 	//! names in an outer `COLUMNS(lambda …)` (which keeps what matches and ignores what does not).
 	//! Wraps the call, which appears in it as the placeholder `"__acl_inner"`. Empty = no projection.
 	string wrap_sql;
+	//! spec 147: a table function grant's united column list (name, mask), the one wrap_sql is written from - what a
+	//! listing narrows the function's declared columns by, without binding wrap_sql
+	vector<std::pair<string, string>> granted_items;
 	case_insensitive_set_t caps; // {"select","insert","update","delete","merge"}
 	//! Column renames of a writable (alias-form) relation: virtual name -> physical name. Renaming is
 	//! not a restriction, so it does not force the read-only subquery form: reads go through

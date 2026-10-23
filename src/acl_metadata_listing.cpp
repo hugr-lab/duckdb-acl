@@ -37,18 +37,26 @@ vector<CatalogBackend::VisibleFunction> CatalogBackend::VisibleFunctions(const P
 	// the same visibility a call resolves with: a grant on the catalog that is not an explicit nothing.
 	// Every catalog the principal holds (spec 115): a call reaches any of them qualified; a flat name of
 	// the one MAIN catalog is also reached bare
+	// spec 147: which functions a row shows is decided per (function, role) pair - with only the levels the roles hold
+	// (PrincipalCapsLevels) - and what is read of each function once, after: the pairs are functions x roles
+	bool object_level, schema_level;
+	PrincipalCapsLevels(principal, object_level, schema_level);
+	string visible_oc_join = object_level ? oc_join : string();
 	auto sql = GrantsCte(principal) +
-	           " SELECT f.\"vcat\", f.\"vname\", f.\"kind\", any_value(f.\"params\"), any_value(f.\"comment\"),"
+	           ", vis AS (SELECT f.\"vcat\" AS vcat, f.\"vname\" AS vname, f.\"kind\" AS kind,"
+	           " bool_or(g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND NOT " +
+	           KeyNestedSql("f.\"vname\"") + ") AS bare FROM " + Tbl("functions") +
+	           " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + visible_oc_join + " WHERE " +
+	           FunctionVisibleExpr(object_level, schema_level) +
+	           " GROUP BY 1, 2, 3)"
+	           " SELECT v.vcat, v.vname, v.kind, any_value(f.\"params\"), any_value(f.\"comment\"),"
 	           " (SELECT c.\"type\" FROM " +
 	           Tbl("object_columns") +
-	           " c WHERE c.\"vcat\" = f.\"vcat\" AND c.\"vname\" = f.\"vname\" AND c.\"kind\" = 'scalar'"
-	           " ORDER BY c.\"pos\" LIMIT 1),"
-	           " bool_or(g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND NOT " +
-	           KeyNestedSql("f.\"vname\"") +
-	           ")"
-	           " FROM " +
-	           Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join + " WHERE " +
-	           FunctionVisibleExpr() + " GROUP BY 1, 2, 3 ORDER BY 1, 2, 3";
+	           " c WHERE c.\"vcat\" = v.vcat AND c.\"vname\" = v.vname AND c.\"kind\" = 'scalar'"
+	           " ORDER BY c.\"pos\" LIMIT 1), any_value(v.bare) FROM vis v JOIN " +
+	           Tbl("functions") +
+	           " f ON f.\"vcat\" = v.vcat AND f.\"vname\" = v.vname AND f.\"kind\" = v.kind GROUP BY 1, 2, 3 ORDER BY"
+	           " 1, 2, 3";
 	auto result = Query(sql);
 	ResultRows rows(*result);
 	case_insensitive_map_t<idx_t> table_functions; // vcat \x1f vname -> index in out
@@ -141,12 +149,21 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		                      "for a principal",
 		                      surface);
 	}
+	// spec 147: a level of the caps chain no row of the principal's roles holds is no term - its join and its
+	// correlated read per (object, role) pair were the listing's cost with many roles
+	bool object_level, schema_level;
+	PrincipalCapsLevels(principal, object_level, schema_level);
+	auto caps_chain = [&](const string &name_expr, const string &vcat_expr) {
+		return CapsExpr(name_expr, vcat_expr, object_level, schema_level);
+	};
 	// an object appears when the role holds something on it; '{}' is an explicit nothing (spec 012)
-	auto visible = "(" + CapsExpr() + " IS NULL OR trim(" + CapsExpr() + ") = '' OR trim(" + CapsExpr() + ") <> '{}')";
-	string oc_join = HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
-	                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = r.\"vcat\""
-	                                       " AND oc.\"vname\" = r.\"vname\""
-	                                 : string();
+	auto relation_caps = caps_chain("r.\"vname\"", "r.\"vcat\"");
+	auto visible =
+	    "(" + relation_caps + " IS NULL OR trim(" + relation_caps + ") = '' OR trim(" + relation_caps + ") <> '{}')";
+	string oc_join = object_level ? " LEFT JOIN " + Tbl("role_object_caps") +
+	                                    " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = r.\"vcat\""
+	                                    " AND oc.\"vname\" = r.\"vname\""
+	                              : string();
 	// spec 039: a declared-list object whose source lost a column is MARKED, not narrowed. The
 	// declared entries that read a bare source column (a name, or a quoted one - an expression is
 	// not judged, and neither is a constant or one of SQL's bare-word functions) with no column of
@@ -337,7 +354,7 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// review 136: the physical database is named only to a principal that may read the object - its failed read
 	// would say as much; one that only sees it (a grant without `select`) learns the class alone (spec 035)
 	string may_read = "EXISTS (SELECT 1 FROM grants g" + oc_join + " WHERE g.\"vcat\" = r.\"vcat\" AND " +
-	                  CapsAllowSql(CapsExpr(), "select") + ")";
+	                  CapsAllowSql(relation_caps, "select") + ")";
 	string marked = "CASE WHEN r.unread_cls IS NOT NULL THEN " +
 	                UnreadSourceMarkSql("CASE WHEN " + may_read + " THEN r.unread_db END", "r.unread_cls") + " || " +
 	                own_comment +
@@ -366,7 +383,10 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                 " AS comment, r.unread_cls IS NOT NULL AS unread,"
 	                 " " +
 	                 KeyPartsSql("r.\"phys\"") + " AS parts FROM " + relations_marked +
-	                 " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " + visible + ")";
+	                 // spec 147: visible for some role - a semi-join, so what is computed per object is computed once,
+	                 // not per (object, role) pair before the DISTINCT
+	                 " r WHERE EXISTS (SELECT 1 FROM grants g" + oc_join + " WHERE g.\"vcat\" = r.\"vcat\" AND " +
+	                 visible + "))";
 	// an alias schema shows the physical schema live, so its visibility is the role's capabilities
 	// on that schema (its own grant if it has one, otherwise the catalog's) - without this filter a
 	// role granted an explicit nothing would still read the names out of the source
@@ -389,11 +409,11 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	                          KeyNestedSql("f.\"vname\"") + " THEN " + KeyParentSql("f.\"vname\"") +
 	                          " ELSE 'main' END AS path FROM " + Tbl("functions") +
 	                          " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" +
-	                          (HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
-	                                                 " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
-	                                                 " AND oc.\"vname\" = f.\"vname\""
-	                                           : string()) +
-	                          " WHERE " + FunctionVisibleExpr() + ")";
+	                          (object_level ? " LEFT JOIN " + Tbl("role_object_caps") +
+	                                              " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
+	                                              " AND oc.\"vname\" = f.\"vname\""
+	                                        : string()) +
+	                          " WHERE " + FunctionVisibleExpr(object_level, schema_level) + ")";
 	string schemas = function_schemas +
 	                 ", leafschemas AS (SELECT vcat, path FROM aliases UNION SELECT vcat, vschema FROM objects"
 	                 " UNION SELECT vcat, path FROM fschemas" +
@@ -412,22 +432,26 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// least one role" can be asked column by column.
 	string vfunctions = "vfunctions AS (SELECT DISTINCT f.\"vcat\" AS vcat, f.\"vname\" AS vname FROM " +
 	                    Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" +
-	                    (HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
-	                                           " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
-	                                           " AND oc.\"vname\" = f.\"vname\""
-	                                     : string()) +
-	                    " WHERE f.\"kind\" = 'table' AND " + FunctionVisibleExpr() + ")";
+	                    (object_level ? " LEFT JOIN " + Tbl("role_object_caps") +
+	                                        " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
+	                                        " AND oc.\"vname\" = f.\"vname\""
+	                                  : string()) +
+	                    " WHERE f.\"kind\" = 'table' AND " + FunctionVisibleExpr(object_level, schema_level) + ")";
 	// spec 145: what narrows a listing is what narrows the read - the rows that hold `select` (the read unites their
 	// policies alone); an object no row of the principal's may read (it only writes) keeps every visible row's lists,
 	// as before - a role without `select` must not see the columns its own lists hide (the review's regression)
-	string grant_columns = "gcolumns_all AS (SELECT r.\"vcat\" AS vcat, r.\"vname\" AS vname, g.\"role\" AS role,"
-	                       " g.\"columns\" AS cat_columns, " +
-	                       string(HasObjectCaps() ? "oc.\"columns\"" : "NULL") + " AS obj_columns, " +
-	                       CapsAllowSql(CapsExpr(), "select") + " AS reads FROM " + Tbl("relations") +
-	                       " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " + visible +
-	                       "), gcolumns AS (SELECT vcat, vname, role, cat_columns, obj_columns FROM gcolumns_all x"
-	                       " WHERE x.reads OR NOT EXISTS (SELECT 1 FROM gcolumns_all y WHERE y.vcat = x.vcat AND"
-	                       " y.vname = x.vname AND y.reads))";
+	string grant_columns =
+	    "gcolumns_all AS (SELECT r.\"vcat\" AS vcat, r.\"vname\" AS vname, g.\"role\" AS role,"
+	    " g.\"columns\" AS cat_columns, " +
+	    string(object_level ? "oc.\"columns\"" : "NULL") + " AS obj_columns, " + CapsAllowSql(relation_caps, "select") +
+	    " AS reads FROM " + Tbl("relations") + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join + " WHERE " +
+	    visible +
+	    // spec 147: the objects some row reads, once each - not a self-join of the pairs
+	    "), greaders AS (SELECT DISTINCT vcat, vname FROM gcolumns_all WHERE reads)"
+	    ", gcolumns AS (SELECT x.vcat, x.vname, x.role, x.cat_columns, x.obj_columns FROM gcolumns_all x"
+	    " LEFT JOIN greaders y ON y.vcat = x.vcat AND y.vname = x.vname WHERE x.reads OR y.vcat IS NULL)"
+	    // what a column's visibility reads: the distinct lists, not one row per role that holds them
+	    ", glists AS (SELECT DISTINCT vcat, vname, cat_columns, obj_columns FROM gcolumns)";
 	// The names a grant states, split where the read path splits them (ParseColumnList: at top level, so a mask's
 	// own commas - `note = concat(id, amount)` - never make a name of its arguments; review 143: a SQL split on every
 	// comma listed `amount` as kept) and each item's column - a masked item's left of '=', spec 102's path its head
@@ -580,8 +604,8 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// schema alias, whose visibility is the schema's, decided in `aliases` - so it is left alone.
 	auto column_visible = [&](const string &vcat_expr, const string &vname_expr, const string &name_expr) {
 		string key = "gc.vcat = " + vcat_expr + " AND gc.vname = " + vname_expr;
-		return "(NOT EXISTS (SELECT 1 FROM gcolumns gc WHERE " + key + ")" +
-		       " OR EXISTS (SELECT 1 FROM gcolumns gc"
+		return "(NOT EXISTS (SELECT 1 FROM glists gc WHERE " + key + ")" +
+		       " OR EXISTS (SELECT 1 FROM glists gc"
 		       " WHERE " +
 		       key + " AND " + keeps("gc.cat_columns", name_expr) + " AND " + keeps("gc.obj_columns", name_expr) + "))";
 	};
@@ -788,16 +812,16 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	auto caps_allow_insert = [&](const string &caps_expr) {
 		return CapsAllowSql(caps_expr, "insert");
 	};
-	string o_oc_join = HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
-	                                         " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = o.vcat"
-	                                         " AND oc.\"vname\" = o.stored_name"
-	                                   : string();
+	string o_oc_join = object_level ? " LEFT JOIN " + Tbl("role_object_caps") +
+	                                      " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = o.vcat"
+	                                      " AND oc.\"vname\" = o.stored_name"
+	                                : string();
 	// writability is the stored authority's verdict, not re-derived: the relation's form was
 	// decided where it was written (RenameOnlyColumns) - only the plain alias form takes writes,
 	// a mask or an RLS'd relation is the read-only SUBQUERY form
 	string object_insertable = "CASE WHEN o.form = 'alias' AND EXISTS (SELECT 1 FROM grants g" + o_oc_join +
 	                           " WHERE g.\"vcat\" = o.vcat AND " +
-	                           caps_allow_insert(CapsExpr("o.stored_name", "o.vcat")) +
+	                           caps_allow_insert(caps_chain("o.stored_name", "o.vcat")) +
 	                           ") THEN 'YES' ELSE 'NO' END AS is_insertable_into";
 	string alias_schema_caps = "coalesce((SELECT nullif(trim(sc.\"caps\"), '') FROM " + Tbl("role_schemas") +
 	                           " sc WHERE sc.\"role\" = g.\"role\" AND sc.\"vcat\" = a.vcat"
@@ -1154,14 +1178,14 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		// spec 145: as gcolumns - the rows that may call it (a call is a read), else every visible row's
 		string gfcolumns = "gfcolumns_all AS (SELECT DISTINCT f.\"vcat\" AS vcat, f.\"vname\" AS vname,"
 		                   " g.\"columns\" AS cat_columns, " +
-		                   string(HasObjectCaps() ? "oc.\"columns\"" : "NULL") + " AS obj_columns, " +
-		                   CapsAllowSql(CapsExpr("f.\"vname\"", "f.\"vcat\""), "select") + " AS reads FROM " +
+		                   string(object_level ? "oc.\"columns\"" : "NULL") + " AS obj_columns, " +
+		                   CapsAllowSql(caps_chain("f.\"vname\"", "f.\"vcat\""), "select") + " AS reads FROM " +
 		                   Tbl("functions") + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" +
-		                   (HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
-		                                          " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
-		                                          " AND oc.\"vname\" = f.\"vname\""
-		                                    : string()) +
-		                   " WHERE f.\"kind\" = 'table' AND " + FunctionVisibleExpr() +
+		                   (object_level ? " LEFT JOIN " + Tbl("role_object_caps") +
+		                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
+		                                       " AND oc.\"vname\" = f.\"vname\""
+		                                 : string()) +
+		                   " WHERE f.\"kind\" = 'table' AND " + FunctionVisibleExpr(object_level, schema_level) +
 		                   "), gfcolumns AS (SELECT vcat, vname, cat_columns, obj_columns FROM gfcolumns_all x WHERE"
 		                   " x.reads OR NOT EXISTS (SELECT 1 FROM gfcolumns_all y WHERE y.vcat = x.vcat AND"
 		                   " y.vname = x.vname AND y.reads))";

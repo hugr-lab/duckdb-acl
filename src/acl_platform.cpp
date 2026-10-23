@@ -3145,6 +3145,7 @@ void RegisterAclPlatform(ExtensionLoader &loader, const shared_ptr<PolicyStore> 
 	scalar("acl_platform_conditions", ConditionsType(), ConditionsFunc);
 	scalar("acl_platform_attributes", AttributesType(), AttributesFunc);
 	RegisterAclPlatformSources(loader, store);
+	RegisterAclPrincipalFunctionRows(loader, store);
 	RegisterAclPlatformRights(loader, store);
 }
 

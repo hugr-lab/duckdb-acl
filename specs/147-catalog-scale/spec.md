@@ -1,6 +1,6 @@
 # Spec 147: a big virtual catalog - what it costs, and what that showed
 
-- **Status**: draft
+- **Status**: accepted (the owner, 2026-10-23: "да целиком можно двумя pr" - PR 1: fixes 1, 4, 7; PR 2: 2, 3, 5, 6)
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "10к таблиц/функций представлений, причем замер как по памяти так и по
   времени ddl/dml и при запросах данных и при большом количестве ролей")
@@ -99,41 +99,78 @@ projection. Spec 144's follow-up named the struct-path form of it; this is the p
 
 ## Design (the fixes)
 
-1. **Functions listed in one resolution**: `CatalogBackend::ResolveFunctions(principal, keys)` - the resolver's query
-   once for every visible function, grouped per function in C++ through the same per-row step `ResolveFunction`
-   uses (caps, the select rows' `GrantUnion`, `ApplyFunctionGrantPolicy`), the results put in its cache.
-   `CallableFunctions` calls it instead of one `Resolve*Function` each. Same verdict per function by construction.
+1. **Functions listed in one resolution, as rows of a table function** (PR 1). The cost was three things, found in
+   turn:
+   - **One resolution each.** `CatalogBackend::ResolveFunctions(principal, keys)` runs the resolver's query 256 stored
+     keys at a time (rows = functions x roles, so a chunk bounds what one read holds). The rows of one function go
+     through the same per-row step `ResolveFunction` uses (`FunctionPolicyFrom`: caps, the select rows'
+     `GrantUnion`, `ApplyFunctionGrantPolicy`, spec 146's note).
+   - **SQL text.** The listing wrote each function as its own `SELECT ... UNION ALL` branch: the planner's
+     decorrelation over 10,000 of them ran for minutes, and one `VALUES` of 10,000 rows took 8 s and 3 GiB to parse.
+     So the rows come from `acl_principal_function_rows(roles, quack_door, columns)`: a table function in the never set,
+     reached by the substitution with the principal's own roles as constants, answering 2,048 rows a chunk. Its oids
+     are computed as the SQL writes them (duckdb's `Hash<string_t>`).
+   - **A `DESCRIBE` per function.** `NarrowedColumns` bound the grant's wrap over every narrowed function to learn
+     what is left of its declared columns. Now, as the owner asked, it reads the stored facts instead: the declared
+     columns, in order, whose name the united list (`TablePolicy::granted_items`) names. A mask is typed by its text (a
+     constant, a cast); one that reads a column is bound once per mask and shape. A mask naming no declared column lists
+     nothing, as the read refuses. The row filter is not judged, as for a relation.
+
+   The callable list is kept whole per role set and policy version (`callable_cache`), because 10,000 functions would
+   cycle the per-name cache (4,096) on every call. `VisibleFunctions` groups the (function, role) pairs before it reads
+   each function once.
+   PR 2 moves the probe of an object grant's mask on a function to the grant's write, as spec 026 does for relations.
 2. **The catalog grant's probe in one bind per chunk**: the predicate is judged against up to 200 relations at once
    (`SELECT 1 FROM (<source> WHERE false) WHERE <rls> UNION ALL …`); a chunk that binds is judged; one that does not is
    probed one by one as now (a source that does not bind judges nothing; the predicate failing on one is `false`).
 3. **A physical name looked up, not listed**: `SpellPhysical` and `PhysicalObjectExists` ask the catalog
    (`Catalog::GetEntry` on the database and schema, case-insensitively, as `PhysicalObjectReadings` does since spec
    137) instead of filtering `duckdb_tables()` / `duckdb_views()`.
-4. **Known roles cached per policy version**: `KnownRoles` answers from a map beside `rights_cache`, cleared with it.
+4. **Known roles cached per policy version** (PR 1): `KnownRoles` answers from a map beside `rights_cache` (roles exact,
+   as they compare), cleared with it.
 5. **The resolver's comparisons through a folded key column**: a generated column (or an index) with the folded key on
    `relations`, `functions`, `role_object_caps`, `schemas`, kept by the writers - the comparisons read it instead of
    folding every row. (Measured before deciding: if (5) is a schema step, it is the v24 step with `min_reader` 23.)
 6. **`NamesUnder` reads the same folded column.**
-7. **A listing joins grant shapes, not roles**: the catalog grants of the principal's roles are folded by what decides
-   a column's visibility - catalog, caps' `select`, the list - before they meet the relations (one row per distinct
-   shape, not per role); the role stays only where an object grant or a schema grant is the role's own (those rows are
-   joined by role, as few as there are such grants). `gcolumns` keeps its meaning: "visible for at least one reading
-   row". (The projection leg keeps its per-role rows - spec 026's `grant_columns` are per role.)
+7. **A listing computes per object what is per object** (PR 1, measured: the profile of a tables listing with 100
+   roles had 127 million intermediate rows, 16 GB). Three changes:
+   - `objects` is a semi-join (`EXISTS` over the roles' grants), so the comment marks, name parts and type facts are
+     computed once per relation, not per (relation, role) pair before a `DISTINCT`.
+   - The write-only fallback of `gcolumns` joins the distinct readers (`greaders`) instead of a self-join of the pairs,
+     and a column's visibility reads the distinct lists (`glists`), not one row per role.
+   - A level of the caps chain no row of the principal's roles holds is left out (`PrincipalCapsLevels`: any object
+     grant, any schema grant with caps). Its term is NULL for every row, and the schema level is a correlated read per
+     pair.
+
+   The pairs remain, as narrow rows. Folding roles by grant shape is not needed after this. A listing as a chunked
+   table function with filter pushdown (the owner's direction: 2,048-row chunks, the WHERE's constants and a join's
+   dynamic filters - min/max ranges, bloom - deciding which objects are computed at all) is the next step if a
+   catalog outgrows this.
 
 ## Enforcement & security
 
 Every fix keeps the verdict: (1) runs the same per-row step over the same rows; (2) asks the same question of each
 relation and falls back to the one-by-one probe whenever a chunk does not bind; (3) finds the same entry duckdb's own
 bind would; (4) caches what the policy says until its version changes, as every other resolver cache; (5)/(6) compare
-the same folded keys; (7) unites the same lists - the union of a set of rows is the union of its distinct rows. Tests pin each verdict as written today.
+the same folded keys; (7) unites the same lists - the union of a set of rows is the union of its distinct rows, and a
+level no row holds contributes NULL to every chain it is left out of. The function rows' table function is an `acl_*`
+name (the never set): a principal cannot call it with other roles; the substitution writes its own. Its oids equal the
+listings' (a test joins them). Tests pin each verdict as written today.
 
 ## Testing
 
 - The bench: `test/bench/catalog_scale.py` (defaults = the numbers above), its results in this spec after the fixes.
-- sqllogictest: the functions listing of a principal over many functions and grants (narrowed, `{}`, denied) equals
-  what one-by-one resolution answered; a catalog grant's `rls_checked` over relations where some do not bind, one where
-  the predicate fails, a chunk boundary; a physical name spelled in another case adopted; a role unknown then created
-  is known after the write.
+- `acl_catalog_scale.test` (PR 1):
+  - 300 table functions, past a resolution chunk, with a `{}` object grant and a scalar under a list. The listing
+    leaves out exactly those.
+  - A function's listed columns equal `DESCRIBE` of its read under a plain item, a constant mask, a cast mask and a
+    mask that reads a column.
+  - The rows' oids join `duckdb_databases()`'s, and every function oid is distinct.
+  - A policy write is seen by the next listing.
+  - A relation one role reads and another holds `{}` on is listed once, then not at all once the reader goes.
+  - A claimed role the policy does not know is no role until a write makes it one.
+- PR 2: a catalog grant's `rls_checked` over relations where some do not bind, one where the predicate fails, a chunk
+  boundary; a physical name spelled in another case adopted; an object grant's mask on a function probed at write.
 
 ## Alternatives considered
 

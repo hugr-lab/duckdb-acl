@@ -236,6 +236,8 @@ void CatalogBackend::EnsureFresh() {
 		claims_loaded.clear();
 		identity_model.reset();
 		rights_cache.clear();
+		known_roles_cache.clear();
+		callable_cache.clear();
 		fn_grants.clear();
 		fn_grants_loaded.clear();
 	}
@@ -437,9 +439,10 @@ string CatalogBackend::SchemaCapsExpr(const string &name_expr, const string &vca
 	       KeyPrefixSql(name_expr, "sc.\"schema_path\"") + " ORDER BY length(sc.\"schema_path\") DESC LIMIT 1)";
 }
 
-string CatalogBackend::CapsExpr(const string &name_expr, const string &vcat_expr) {
-	string caps = HasObjectCaps() ? "nullif(trim(oc.\"caps\"), '')" : string();
-	auto schema_caps = SchemaCapsExpr(name_expr, vcat_expr);
+string CatalogBackend::CapsExpr(const string &name_expr, const string &vcat_expr, bool object_level,
+                                bool schema_level) {
+	string caps = HasObjectCaps() && object_level ? "nullif(trim(oc.\"caps\"), '')" : string();
+	auto schema_caps = schema_level ? SchemaCapsExpr(name_expr, vcat_expr) : string();
 	if (caps.empty() && schema_caps.empty()) {
 		return "g.\"caps\"";
 	}
@@ -522,8 +525,8 @@ vector<CatalogBackend::GrantDecisionRow> CatalogBackend::GrantDecisions(const st
 	return out;
 }
 
-string CatalogBackend::FunctionVisibleExpr() {
-	auto caps = CapsExpr("f.\"vname\"", "f.\"vcat\"");
+string CatalogBackend::FunctionVisibleExpr(bool object_level, bool schema_level) {
+	auto caps = CapsExpr("f.\"vname\"", "f.\"vcat\"", object_level, schema_level);
 	return "(" + caps + " IS NULL OR trim(" + caps + ") = '' OR trim(" + caps + ") <> '{}')";
 }
 
@@ -1144,13 +1147,8 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 	                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
 	                                       " AND oc.\"vname\" = f.\"vname\""
 	                                 : string();
-	auto sql = GrantsCte(principal) + "SELECT f.\"vcat\", f.\"form\", f.\"target\", f.\"template\", " +
-	           CapsExpr("f.\"vname\"", "f.\"vcat\"") + " AS caps, " + GrantPolicyExprs() +
-	           ","
-	           " CASE WHEN " +
-	           qualified_cond +
-	           " THEN 1 ELSE 2 END AS prio, f.\"vname\" AS fvname, g.\"role\" AS grole" // spec 146: whose row it is
-	           " FROM " +
+	auto sql = GrantsCte(principal) + "SELECT " +
+	           FunctionRowColumns("CASE WHEN " + qualified_cond + " THEN 1 ELSE 2 END") + " FROM " +
 	           FunctionsSource(principal, names) + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join +
 	           " WHERE f.\"kind\" = '" + kind + "' AND ((" + qualified_cond +
 	           ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND " +
@@ -1160,11 +1158,8 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 	TablePolicy policy;
 	bool found = result->RowCount() > 0;
 	if (found) {
-		auto vcat = result->Collection().GetValue(0, 0).ToString();
-		auto form = result->Collection().GetValue(1, 0).ToString();
-		auto target = result->Collection().GetValue(2, 0);
-		auto template_sql = result->Collection().GetValue(3, 0);
-		auto prio = result->Collection().GetValue(11, 0).GetValue<int64_t>();
+		auto vcat = result_rows.GetValue(0, 0).ToString();
+		auto prio = result_rows.GetValue(11, 0).GetValue<int64_t>();
 		// spec 116: one function or none (see LookupRelation)
 		auto fvname = result_rows.GetValue(12, 0).ToString();
 		for (idx_t row = 1; row < result->RowCount(); row++) {
@@ -1178,31 +1173,11 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 				                      vname, kind);
 			}
 		}
-		policy.subquery_form = form != "alias";
-		policy.phys = target.IsNull() ? string() : target.ToString();
-		policy.query = template_sql.IsNull() ? string() : template_sql.ToString();
-		// rows of the same winning function differ only by role: union their caps (spec 012 - a
-		// call is a read, so it needs one) and their grant policies
-		GrantUnion grants;
-		vector<std::pair<string, GrantPolicy>> united; // spec 146: each role's own, for RoleUnionWidens
-		for (idx_t row = 0; row < result->RowCount(); row++) {
-			if (result_rows.GetValue(11, row).GetValue<int64_t>() != prio ||
-			    result_rows.GetValue(0, row).ToString() != vcat) {
-				continue;
-			}
-			auto caps = EffectiveCaps(result_rows.GetValue(4, row));
-			for (auto &cap : caps) {
-				policy.caps.insert(cap);
-			}
-			// spec 145: a call is a read - only a role that may call it narrows or widens what it returns
-			if (caps.count("select")) {
-				auto row_policy = RowPolicy(result_rows, row, 5);
-				grants.Add(row_policy);
-				united.emplace_back(result_rows.GetValue(13, row).ToString(), std::move(row_policy));
-			}
+		idx_t end = 1;
+		while (end < result->RowCount() && result_rows.GetValue(11, end).GetValue<int64_t>() == prio) {
+			end++;
 		}
-		ApplyFunctionGrantPolicy(vname, table_kind, grants, policy);
-		NoteUnionWidens(NamePath::JoinKeys(vcat, fvname), "select", united, {});
+		FunctionPolicyFrom(result_rows, 0, end, vname, table_kind, policy);
 	}
 	lock_guard<mutex> guard(lock);
 	ClearIfOversized(functions);
@@ -1211,6 +1186,141 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 		out = policy;
 	}
 	return found;
+}
+
+void CatalogBackend::PrincipalCapsLevels(const Principal &principal, bool &object_level, bool &schema_level) {
+	object_level = HasObjectCaps() && !principal.roles.empty() &&
+	               Query("SELECT 1 FROM " + Tbl("role_object_caps") + " WHERE \"role\" IN (" +
+	                     LitList(principal.roles) + ") LIMIT 1")
+	                       ->RowCount() > 0;
+	schema_level = !function_mode && !principal.roles.empty() &&
+	               Query("SELECT 1 FROM " + Tbl("role_schemas") + " WHERE \"role\" IN (" + LitList(principal.roles) +
+	                     ") AND coalesce(trim(\"caps\"), '') <> '' LIMIT 1")
+	                       ->RowCount() > 0;
+}
+
+string CatalogBackend::FunctionRowColumns(const string &prio_expr, bool schema_level) {
+	// 0-3 the function, 4 caps, 5.. the grant policy (RowPolicy), 11 prio, 12 its name, 13 whose row (spec 146)
+	return "f.\"vcat\", f.\"form\", f.\"target\", f.\"template\", " +
+	       CapsExpr("f.\"vname\"", "f.\"vcat\"", true, schema_level) + " AS caps, " + GrantPolicyExprs() + ", " +
+	       prio_expr + " AS prio, f.\"vname\" AS fvname, g.\"role\" AS grole";
+}
+
+void CatalogBackend::FunctionPolicyFrom(ResultRows &rows, idx_t begin, idx_t end, const string &vname, bool table_kind,
+                                        TablePolicy &policy) {
+	auto vcat = rows.GetValue(0, begin).ToString();
+	auto form = rows.GetValue(1, begin).ToString();
+	auto target = rows.GetValue(2, begin);
+	auto template_sql = rows.GetValue(3, begin);
+	auto fvname = rows.GetValue(12, begin).ToString();
+	policy.subquery_form = form != "alias";
+	policy.phys = target.IsNull() ? string() : target.ToString();
+	policy.query = template_sql.IsNull() ? string() : template_sql.ToString();
+	// rows of the same winning function differ only by role: union their caps (spec 012 - a
+	// call is a read, so it needs one) and their grant policies
+	GrantUnion grants;
+	vector<std::pair<string, GrantPolicy>> united; // spec 146: each role's own, for RoleUnionWidens
+	for (idx_t row = begin; row < end; row++) {
+		if (rows.GetValue(0, row).ToString() != vcat) {
+			continue;
+		}
+		auto caps = EffectiveCaps(rows.GetValue(4, row));
+		for (auto &cap : caps) {
+			policy.caps.insert(cap);
+		}
+		// spec 145: a call is a read - only a role that may call it narrows or widens what it returns
+		if (caps.count("select")) {
+			auto row_policy = RowPolicy(rows, row, 5);
+			grants.Add(row_policy);
+			united.emplace_back(rows.GetValue(13, row).ToString(), std::move(row_policy));
+		}
+	}
+	ApplyFunctionGrantPolicy(vname, table_kind, grants, policy);
+	NoteUnionWidens(NamePath::JoinKeys(vcat, fvname), "select", united, {});
+}
+
+void CatalogBackend::ResolveFunctions(const Principal &principal, const vector<VirtualFunctionKey> &keys,
+                                      vector<ResolvedVirtualFunction> &out) {
+	out.assign(keys.size(), ResolvedVirtualFunction());
+	if (principal.roles.empty() || keys.empty() || function_mode) {
+		return; // a function driver enumerates no functions (spec 008), so lists none to resolve
+	}
+	EnsureFresh();
+	auto sig = RoleSig(principal);
+	auto cache_key = [&](const VirtualFunctionKey &key) {
+		return sig + "\x1f" + (key.table_kind ? "table" : "scalar") + "\x1f" +
+		       StringUtil::Lower(key.vcat + "." + key.vname);
+	};
+	// what the cache answers already, then the rest a chunk at a time: one query for up to CHUNK functions (rows =
+	// functions x the principal's roles, so a chunk bounds what one read holds)
+	vector<idx_t> missing;
+	{
+		lock_guard<mutex> guard(lock);
+		for (idx_t i = 0; i < keys.size(); i++) {
+			auto entry = functions.find(cache_key(keys[i]));
+			if (entry != functions.end()) {
+				out[i].found = entry->second.first;
+				out[i].policy = entry->second.second;
+			} else {
+				missing.push_back(i);
+			}
+		}
+	}
+	bool object_level, schema_level;
+	PrincipalCapsLevels(principal, object_level, schema_level); // the schema level is a correlated read per row
+	static constexpr idx_t CHUNK = 256;
+	for (idx_t start = 0; start < missing.size(); start += CHUNK) {
+		auto stop = MinValue<idx_t>(start + CHUNK, missing.size());
+		string values;
+		std::map<std::tuple<string, string, string>, idx_t> index; // (vcat, vname, kind) -> key
+		for (idx_t n = start; n < stop; n++) {
+			auto &key = keys[missing[n]];
+			auto kind = key.table_kind ? "table" : "scalar";
+			values += (values.empty() ? "(" : ", (") + Lit(key.vcat) + ", " + Lit(key.vname) + ", " + Lit(kind) + ")";
+			index[std::make_tuple(key.vcat, key.vname, string(kind))] = missing[n];
+		}
+		// the keys are the stored ones (VisibleFunctions), so the qualified reading is the one that wins
+		// (ResolveFunction's prio 1) and an exact match is that reading
+		string oc_join = HasObjectCaps() ? " LEFT JOIN " + Tbl("role_object_caps") +
+		                                       " oc ON oc.\"role\" = g.\"role\" AND oc.\"vcat\" = f.\"vcat\""
+		                                       " AND oc.\"vname\" = f.\"vname\""
+		                                 : string();
+		auto sql = GrantsCte(principal) + "SELECT " + FunctionRowColumns("1", schema_level) +
+		           ", f.\"kind\" AS fkind FROM " + Tbl("functions") + " f JOIN (VALUES " + values +
+		           ") k(kvcat, kvname, kkind) ON f.\"vcat\" = k.kvcat AND f.\"vname\" = k.kvname AND f.\"kind\" = "
+		           "k.kkind JOIN grants g ON g.\"vcat\" = f.\"vcat\"" +
+		           oc_join + " ORDER BY f.\"vcat\", f.\"vname\", f.\"kind\", g.\"role\"";
+		auto result = Query(sql);
+		ResultRows rows(*result);
+		idx_t begin = 0;
+		while (begin < rows.Count()) {
+			auto group = std::make_tuple(rows.GetValue(0, begin).ToString(), rows.GetValue(12, begin).ToString(),
+			                             rows.GetValue(14, begin).ToString());
+			idx_t end = begin + 1;
+			while (end < rows.Count() &&
+			       std::make_tuple(rows.GetValue(0, end).ToString(), rows.GetValue(12, end).ToString(),
+			                       rows.GetValue(14, end).ToString()) == group) {
+				end++;
+			}
+			auto entry = index.find(group);
+			if (entry != index.end()) {
+				auto &key = keys[entry->second];
+				auto &answer = out[entry->second];
+				try {
+					// not put in the per-name cache: a listing of more functions than it holds would empty it of the
+					// ones calls use (the listing keeps its own, callable_cache)
+					FunctionPolicyFrom(rows, begin, end, key.vcat + "." + key.vname, key.table_kind, answer.policy);
+					answer.found = true;
+				} catch (BinderException &) {
+					// what refuses the call (a scalar under a grant that carries a policy) - as ResolveFunction throws
+					// it
+					answer.refused = true;
+					answer.policy = TablePolicy();
+				}
+			}
+			begin = end;
+		}
+	}
 }
 
 void CatalogBackend::ApplyFunctionGrantPolicy(const string &vname, bool table_kind, const GrantUnion &grants,
@@ -1252,6 +1362,7 @@ void CatalogBackend::ApplyFunctionGrantPolicy(const string &vname, bool table_ki
 	}
 	out.wrap_sql = "SELECT COLUMNS(lambda __acl_col: " + KeyFoldSql("__acl_col") + " IN (" +
 	               StringUtil::Join(names, ", ") + ")) FROM (" + inner + ")";
+	out.granted_items = grants.columns;
 }
 
 bool CatalogBackend::PrincipalMainCap(const Principal &principal, const string &capability) {
@@ -1762,19 +1873,45 @@ void CatalogBackend::KnownRoles(const vector<string> &values, case_insensitive_s
 		return;
 	}
 	EnsureFresh();
-	if (function_mode) {
-		// a raw value is a known role iff the role_catalogs callback grants it anything
-		for (auto &grant : Grants(values)) {
-			known_roles.insert(grant.role);
+	// spec 147: answered per policy version - a gateway statement asks for every role its token claims
+	vector<string> missing;
+	{
+		lock_guard<mutex> guard(lock);
+		for (auto &value : values) {
+			auto entry = known_roles_cache.find(value);
+			if (entry == known_roles_cache.end()) {
+				missing.push_back(value);
+			} else if (entry->second) {
+				known_roles.insert(value);
+			}
 		}
+	}
+	if (missing.empty()) {
 		return;
 	}
-	auto known = Query("SELECT \"role\" FROM " + Tbl("roles") + " WHERE \"role\" IN (" + LitList(values) +
-	                   ") UNION SELECT DISTINCT \"role\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
-	                   LitList(values) + ")");
-	ResultRows known_rows(*known);
-	for (idx_t row = 0; row < known->RowCount(); row++) {
-		known_roles.insert(known_rows.GetValue(0, row).ToString());
+	std::set<string> found; // exact: roles compare exactly
+	if (function_mode) {
+		// a raw value is a known role iff the role_catalogs callback grants it anything
+		for (auto &grant : Grants(missing)) {
+			found.insert(grant.role);
+		}
+	} else {
+		auto known = Query("SELECT \"role\" FROM " + Tbl("roles") + " WHERE \"role\" IN (" + LitList(missing) +
+		                   ") UNION SELECT DISTINCT \"role\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
+		                   LitList(missing) + ")");
+		ResultRows known_rows(*known);
+		for (idx_t row = 0; row < known->RowCount(); row++) {
+			found.insert(known_rows.GetValue(0, row).ToString());
+		}
+	}
+	lock_guard<mutex> guard(lock);
+	ClearIfOversized(known_roles_cache);
+	for (auto &value : missing) {
+		bool known = found.count(value) > 0;
+		known_roles_cache[value] = known;
+		if (known) {
+			known_roles.insert(value);
+		}
 	}
 }
 
