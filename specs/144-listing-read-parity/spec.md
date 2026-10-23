@@ -38,16 +38,34 @@ the right columns and names every one of them after the pattern. This spec makes
   key under the alias) both keep it - `RowPolicy`'s two levels, read the way spec 143's re-review made the listing
   read every list (`ParseColumnList`, a constant per stored list). No list of the principal's names anything: the
   leg stays as it is (the common case costs nothing).
-- **Struct paths in a listed type**: a column some stored list narrows by a path (`addr.city`, `items[].price`) is
-  listed through `acl_listed_type` with the roles' lists (`roles_of`, as the projection leg already does) - on the
-  relation legs and the alias leg alike; a column no path narrows keeps its listed type (a whole-column mask's type
-  stays what spec 026's probe or the source says). Which columns a path narrows is read with the lists, in C++. A
-  field a catalog grant masks (`addr.secret = '***'`) has no probe: `acl_listed_type` lists it with the field's own
-  type (it answered SQL NULL).
-- **Star filters keep duckdb's names**: `KeepItemNames` leaves alone an item whose root (under one `NOT`) is a
-  function with a star as its first argument - duckdb's `TryTransformStarLike` shape, which expands to the columns.
-- Not here: a catalog grant's mask that changes a live alias column's type is still listed with the source's type
-  (nothing is probed for an alias object, which the policy never names) - a description, not a leak; the follow-up.
+- **Struct paths and masks in a listed type**: a column some stored list narrows by a path (`addr.city`,
+  `items[].price`) or masks is listed through `acl_listed_type` with the roles' lists (`roles_of`, as the projection
+  leg already does) - on the relation legs and the alias leg alike; any other column keeps its listed type. Which
+  columns are so is read with the lists, in C++. A mask nothing probed (a catalog grant's; an object grant's on a live
+  alias's object) is typed as its text says - a constant's type, a cast's target - else, for a mask that reads
+  columns, the source's type where that is no nested type, else NULL: never a nested source type, whose field names
+  the grant may hide (the review's finding: a field fallback listed them).
+- **A column the levels leave nothing of** (`addr.city` at one level, `addr.secret` at the other) is no column of the
+  read: `acl_listed_type` answers NULL and the row drops - on the projection leg too, which used to fall back to one
+  role's probe and so named the other level's hidden field.
+- **Positions close up** where a list narrowed anything: `ordinal_position` / `column_index` are renumbered per object
+  in the listing's order (spec 036; a catalog grant's list left holes on relations already).
+- **A list of nothing but separators** (`COLUMNS (,)` stores `' , '`) narrows nothing, as the read reads it - the
+  listing used to keep nothing.
+- **An object a relation names under an alias path** (`CREATE VIRTUAL TABLE c.raw.orders AS …` where `raw` is a live
+  alias) is that relation's - the read resolves the relation first - and the alias legs leave it out (it was listed
+  twice, with the shadowed table's columns).
+- **Expanding items keep duckdb's names**: `KeepItemNames` leaves alone an item with a star anywhere in it - `* LIKE
+  '…'` (duckdb's `TryTransformStarLike` turns it into `COLUMNS()`), `1 + COLUMNS('a|b')`, `min(COLUMNS(*))` - but the
+  argument of `COUNT(tbl.*)`, which duckdb rewrites into one count (its `FindStarExpression` walk): duckdb names each
+  expanded column, and carries an alias onto every one of them.
+- **Cost**: the alias leg narrows only when the principal holds a catalog grant's list or an object grant's list on
+  an object no relation names, read in C++; the object level is a joined column, never a subquery as a `CASE`
+  operand (the first cut's planner cost grew with the number of distinct lists: 40 lists 26 s, 500 never finished).
+  Measured, 40 relations each under its own object grant list, one table's columns: 0.54 s (main 0.48 s; the
+  renumbering is ~0.08 s).
+- **Which grant rows narrow**: spec 145 (a capability's policy is the union of the grants that hold it) - the
+  listings take its rule for reads, the rows holding `select`, when it lands.
 
 ## Enforcement & security
 
@@ -60,8 +78,11 @@ the right columns and names every one of them after the pattern. This spec makes
 
 - sqllogictest `acl_listing_read_parity.test` (new): a live alias under a catalog grant's list, under an object
   grant's on one alias object, under both, under two roles (a token naming both; one unrestricted); a catalog grant's
-  struct path on a relation and on an alias object, a masked field, an object grant's path (unchanged); `SELECT *
-  LIKE`, `NOT LIKE`, `ILIKE`, `SIMILAR TO` under `ACL ROLE` - each listing compared with what the read returns.
+  struct path on a relation and on an alias object, a masked field, an object grant's path (unchanged); levels whose
+  paths leave nothing of a column; masks typed from their text (`= NULL`, `= 0`, a whole struct masked); positions
+  closing up; a separators-only list; a relation declared under an alias path; `SELECT * LIKE`, `NOT LIKE`, `ILIKE`,
+  `SIMILAR TO`, `count(t.*)`, `1 + COLUMNS('a|b')` under `ACL ROLE` - each listing compared with what the read
+  returns.
 - Flight e2e (`run.sh`): GetTables' promised schema for a live alias object under an object grant has the read's
   columns.
 
@@ -74,4 +95,11 @@ the right columns and names every one of them after the pattern. This spec makes
 
 ## Follow-ups
 
-- A catalog grant's type-changing mask on a live alias object's column (listed with the source's type).
+- Spec 145: a role that may not read (only `insert`, `CAPS '{}'`) lifts another role's read policy - the read path,
+  found by this spec's review; then the listings' rows narrow by `select` too, and a live alias object under an
+  object grant `CAPS '{}'` (still listed) or a `CAPS '{}'` schema grant over a readable object (hidden) follow it.
+- The read path (found by the review, its own spec): a catalog grant's struct path fails the read of an object that
+  lacks the column (`Column "addr" in REPLACE list not found`) - and such an object stays listed.
+- The grammar loses the quotes of a dotted column head in a path (`"we.ird"."a.b"` stored as `we.ird."a.b"`); the
+  function form keeps them.
+- A mask that reads columns, nothing probed for it, is listed with its source's scalar type or NULL - not its own.

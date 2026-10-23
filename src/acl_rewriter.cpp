@@ -1557,22 +1557,32 @@ private:
 		cte_scope = saved_scope;
 	}
 
-	//! spec 144: `* LIKE '…'` (ILIKE, SIMILAR TO, a NOT around them) - a function whose first argument is a star, which
-	//! duckdb turns into the columns it filters (TryTransformStarLike), each keeping its own name - and an alias it
-	//! carries over onto every one of them
-	static bool IsStarFilterCall(const ParsedExpression &expr) {
-		if (expr.GetExpressionClass() != ExpressionClass::FUNCTION) {
-			return false;
+	//! spec 144: an item duckdb expands into several columns - one with a star anywhere in it (`* LIKE '…'`, which it
+	//! turns into COLUMNS(), `1 + COLUMNS('a|b')`, `min(COLUMNS(*))`) but the argument of COUNT(tbl.*), which it
+	//! rewrites into one count (FindStarExpression's own walk). duckdb names each column - and an alias it carries
+	//! over onto every one of them
+	static bool ExpandsStar(const ParsedExpression &expr) {
+		if (expr.GetExpressionClass() == ExpressionClass::STAR) {
+			return true;
 		}
-		auto &arguments = expr.Cast<FunctionExpression>().GetArguments();
-		return !arguments.empty() && arguments[0].GetExpression().GetExpressionClass() == ExpressionClass::STAR;
-	}
-	static bool IsStarFilter(const ParsedExpression &item) {
-		if (item.GetExpressionType() == ExpressionType::OPERATOR_NOT) {
-			auto &children = item.Cast<OperatorExpression>().GetChildren();
-			return children.size() == 1 && children[0] && IsStarFilterCall(*children[0]);
+		// COUNT(tbl.*) [OVER ...]: its star is one count, not columns
+		bool count_star = false;
+		if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+			auto &function = expr.Cast<FunctionExpression>();
+			count_star = StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), "count") &&
+			             function.GetArguments().size() == 1;
+		} else if (expr.GetExpressionClass() == ExpressionClass::WINDOW) {
+			count_star =
+			    StringUtil::CIEquals(expr.Cast<WindowExpression>().FunctionName().GetIdentifierName(), "count");
 		}
-		return IsStarFilterCall(item);
+		bool found = false;
+		ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+			if (found || (count_star && child.GetExpressionClass() == ExpressionClass::STAR)) {
+				return;
+			}
+			found = ExpandsStar(child);
+		});
+		return found;
 	}
 
 	//! A result column keeps the name duckdb would give it as written. The gate qualifies every
@@ -1587,7 +1597,7 @@ private:
 			}
 			auto expression_class = item->GetExpressionClass();
 			if (expression_class == ExpressionClass::STAR || expression_class == ExpressionClass::COLUMN_REF ||
-			    expression_class == ExpressionClass::CONSTANT || IsStarFilter(*item)) {
+			    expression_class == ExpressionClass::CONSTANT || ExpandsStar(*item)) {
 				// a star expands, a column or a constant is its own name - and a bare column reference
 				// aliased to itself is a self-reference to the binder when it is a keyword it resolves
 				// late (`SELECT current_date`)

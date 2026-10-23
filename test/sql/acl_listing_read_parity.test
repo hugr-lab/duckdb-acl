@@ -213,3 +213,131 @@ ACL ROLE 'r_all' SELECT column_name FROM (DESCRIBE SELECT * SIMILAR TO 'n.*' FRO
 ----
 amount
 note
+
+# --- the reviews' cases ---------------------------------------------------------------------------------------------
+# levels whose paths leave nothing of a column: the read has no such column, nor does the listing (no field name of
+# one level's own probe either)
+statement ok
+ACL ADMIN CREATE ROLE r_disjoint;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_disjoint WITH (select) MAIN COLUMNS (id, addr.city);
+
+statement ok
+ACL ADMIN GRANT TABLE c.t TO ROLE r_disjoint WITH (select) COLUMNS (id, addr.secret);
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_disjoint WITH (select) COLUMNS (id, addr.secret);
+
+query I
+ACL ROLE 'r_disjoint' SELECT * FROM t;
+----
+1
+
+query I
+ACL ROLE 'r_disjoint' SELECT * FROM raw.orders;
+----
+1
+
+query TT
+ACL ROLE 'r_disjoint' SELECT table_schema, column_name FROM information_schema.columns ORDER BY 1, ordinal_position;
+----
+main	id
+raw	id
+
+# a mask is typed as its own text says - a constant's type, never a nested source type naming the fields
+statement ok
+ACL ADMIN CREATE ROLE r_mask_types;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_mask_types WITH (select) MAIN COLUMNS (id, amount = NULL, addr.city, addr.secret = 0);
+
+query TT
+ACL ROLE 'r_mask_types' SELECT typeof(amount), typeof(addr) FROM t;
+----
+"NULL"	STRUCT(city VARCHAR, "secret" INTEGER)
+
+query TT
+ACL ROLE 'r_mask_types' SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position;
+----
+id	INTEGER
+amount	"NULL"
+addr	STRUCT(city VARCHAR, "secret" INTEGER)
+
+statement ok
+ACL ADMIN CREATE ROLE r_whole_mask;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_whole_mask WITH (select) MAIN COLUMNS (id, addr = NULL);
+
+query TT
+ACL ROLE 'r_whole_mask' SELECT table_schema, data_type FROM information_schema.columns WHERE column_name = 'addr' ORDER BY 1;
+----
+main	"NULL"
+raw	"NULL"
+
+# the positions of what a list keeps close up, as the read's (spec 036)
+statement ok
+ACL ADMIN CREATE ROLE r_positions;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_positions WITH (select) MAIN COLUMNS (id, note, addr);
+
+query TTI
+ACL ROLE 'r_positions' SELECT table_schema, column_name, ordinal_position FROM information_schema.columns ORDER BY 1, 3;
+----
+main	id	1
+main	note	2
+main	addr	3
+raw	id	1
+raw	note	2
+raw	addr	3
+
+# a list of nothing but separators narrows nothing - as the read reads it
+statement ok
+ACL ADMIN CREATE ROLE r_separators;
+
+statement ok
+SELECT acl_grant_catalog('r_separators', 'c', '{"select": true}', true, '', ' , ');
+
+query I
+ACL ROLE 'r_separators' SELECT count(*) FROM information_schema.columns WHERE table_name = 't';
+----
+4
+
+# an object a relation of the catalog names under an alias path is that relation's: listed once, as the relation
+statement ok
+CREATE TABLE phys.main.other(k INTEGER, v VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.raw.orders AS phys.main.other;
+
+query II
+ACL ROLE 'r_all' SELECT * FROM raw.orders;
+----
+
+query TI
+ACL ROLE 'r_all' SELECT column_name, ordinal_position FROM information_schema.columns WHERE table_schema = 'raw' AND table_name = 'orders' ORDER BY 2;
+----
+k	1
+v	2
+
+query I
+ACL ROLE 'r_all' SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'raw' AND table_name = 'orders';
+----
+1
+
+statement ok
+ACL ADMIN DROP RELATION c.raw.orders;
+
+# star names: a qualified count star is one count, headed as duckdb heads it; a COLUMNS() inside an expression expands
+query T
+ACL ROLE 'r_all' SELECT column_name FROM (DESCRIBE SELECT count(t.*) FROM t);
+----
+count(t.*)
+
+query T
+ACL ROLE 'r_all' SELECT column_name FROM (DESCRIBE SELECT 1 + COLUMNS('amount|id') FROM t);
+----
+id
+amount
