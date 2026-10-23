@@ -925,6 +925,17 @@ needs `select` and `capability_rows_read` (`returning_refused`); a plain INSERT'
 `gcolumns` / `gfcolumns` the rows holding `select`, else (a write-only principal) every visible row's. Operator
 screens: `ResolveTableOwnPolicy`. Test `acl_capability_union.test`.
 
+**Spec 146 — the role union is per object, documented and audited** (the owner's decision): rows OR-ed and column
+lists united independently (spec 011), so roles narrowing one object differently unite into cells neither reads.
+`RoleUnionWidens` (acl_policy_catalog.hpp; `UnionWidening` in acl_policy.hpp) judges each union `LookupRelation` /
+`LookupSchemaAlias` / `ResolveFunction` compute, after the policy applied (`grole` is each resolver select's last
+column - `cvcat` / `cvname` are `ncols - 3/2`): one pair per filter and B (≤16 named), A's rows read whole by the
+roles with A's filter or none, items by path and mask, columns known only from a declared list (never type facts),
+predicates as written then as the parser prints them; an alias reports as the alias. `on_union_widens` →
+`PolicyStore::AuditRoleUnionWidens`: a `policy` event `role_union_widens` (level DENIED, allowed; floored a minute per
+object + capability + roles in `union_floor`, stamped only when recorded - spec 136's floor too) and
+`acl.policy.role_union_widens{capability}`. Documented in security.md. Test `acl_role_union_audit.test`.
+
 **Spec 140 — a door picks up a renewed certificate**: a pair given as LOCAL files (`IsLocalCertificatePath`; the
 csi-driver's, hugr-platform spec 005) is re-read every `acl_door_certificate_refresh` s (GLOBAL, 60; 0 = once) by a
 `DoorCertificateWatcher` (`src/flight/acl_door_certificate.cpp`, OpenSSL: `CheckCertificatePair` judges the pair whole,

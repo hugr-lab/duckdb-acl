@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include <map>
+#include <set>
 #include <random>
 #include "duckdb/parser/parser.hpp"
 
@@ -932,6 +933,57 @@ void PolicyStore::AuditPolicy(const string &detail, const string &reason) {
 	audit->Emit(std::move(event));
 }
 
+void PolicyStore::AuditRoleUnionWidens(const string &object, const string &capability,
+                                       const vector<UnionWidening> &pairs) {
+	if (!audit || pairs.empty()) {
+		return;
+	}
+	audit->Hooks().Counters().Add("acl.policy.role_union_widens", {{"capability", capability}});
+	std::set<string> roles;
+	for (auto &pair : pairs) {
+		roles.insert(pair.role_a);
+		roles.insert(pair.role_b);
+	}
+	auto role_list = StringUtil::Join(vector<string>(roles.begin(), roles.end()), ", ");
+	bool recorded = audit->Records(AuditLevel::DENIED, -1); // the floor is stamped only by a recorded event
+	if (recorded) {
+		auto now = int64_t(
+		    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch())
+		        .count());
+		lock_guard<mutex> guard(union_floor_lock);
+		if (union_floor.size() > 4096) {
+			union_floor.clear();
+		}
+		auto &last = union_floor[StringUtil::Lower(object) + '\x1f' + capability + '\x1f' + role_list];
+		if (last != 0 && now - last < 60) {
+			return; // counted above, recorded once a minute
+		}
+		last = now;
+	}
+	// the policy's own names - an object, roles, the items they list - never a value nor a predicate's text
+	vector<string> parts;
+	for (idx_t i = 0; i < pairs.size() && i < UnionWidening::REPORTED; i++) {
+		auto &pair = pairs[i];
+		parts.push_back(pair.role_b + "'s " +
+		                (pair.columns.size() == 1 && pair.columns[0] == "*"
+		                     ? string("columns outside the lists read")
+		                     : "columns " + StringUtil::Join(pair.columns, ", ")) +
+		                " on " + pair.role_a + "'s rows");
+	}
+	AuditEvent event;
+	event.kind = "policy";
+	event.detail = "role_union_widens";
+	event.objects.push_back(AuditObject {object, capability});
+	event.allowed = true;
+	event.reason = "the union of roles " + role_list +
+	               " may show cells none of them reads: " + StringUtil::Join(parts, "; ") +
+	               (pairs.size() > UnionWidening::REPORTED ? "; and more" : ""); // cut at 512 bytes by Emit
+	// a warning the operator must see whenever anything is recorded, though it refuses nothing (serving.md's levels)
+	event.level = AuditLevel::DENIED;
+	event.recorded = recorded;
+	audit->Emit(std::move(event));
+}
+
 void PolicyStore::AuditConnection(const string &kind, const string &name, const string &fingerprint) {
 	if (!audit) {
 		return;
@@ -973,7 +1025,9 @@ void PolicyStore::AuditSourceUnreadable(const string &database, const string &er
 		return;
 	}
 	audit->Hooks().Counters().Add("acl.listing.sources_unreadable", {{"class", error_class}});
-	{
+	// the floor is stamped only by a recorded event: one dropped at `off` must not silence the next minute
+	bool recorded = audit->Records(AuditLevel::DENIED, -1);
+	if (recorded) {
 		// a steady clock: a wall clock set back would silence the source until it caught up again
 		auto now = int64_t(
 		    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -997,7 +1051,7 @@ void PolicyStore::AuditSourceUnreadable(const string &database, const string &er
 	event.reason_code = "source_error";
 	event.reason = UnreadSourceMark(database, error_class);
 	event.level = AuditLevel::DENIED;
-	event.recorded = audit->Records(event.level, -1);
+	event.recorded = recorded;
 	audit->Emit(std::move(event));
 }
 

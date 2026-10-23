@@ -1,0 +1,416 @@
+# name: test/sql/acl_role_union_audit.test
+# description: spec 146 - the union of a principal's roles is per object (rows OR-ed, column lists united
+#   independently, spec 011): two roles that narrow one object differently unite into cells neither reads. Documented
+#   and audited - one `policy` event `role_union_widens` names the object, every widening pair and its items, counted
+#   at every resolution that computes it; nothing for roles that do not widen. The token names analyst and auditor
+#   (test/idp/rs); the second one analyst, auditor and reader.
+# group: [sql]
+
+require acl
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+SET GLOBAL acl_audit_level = 'decisions';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, amount INTEGER, secret VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 10, 'S1'), (2, 20, 'S2');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('test/idp/rs', '{"url": "test/idp/rs", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"]}}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE ROLE auditor;
+
+# the same row filter for both: the same rows, no cell beyond either role - no event
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN RLS (id > 0) COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN RLS (id > 0);
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t;
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE detail = 'role_union_widens';
+----
+0
+
+# different rows, different columns: the analyst's row 2 with the auditor's `secret` - read, and audited
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN RLS (id = 2) COLUMNS (id, amount);
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN RLS (id = 1);
+
+query III
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t ORDER BY id;
+----
+1	10	S1
+2	20	S2
+
+statement ok
+SELECT acl_audit_flush();
+
+query TTT
+SELECT verdict, reason, objects::VARCHAR FROM acl_audit_events() WHERE detail = 'role_union_widens';
+----
+allowed	the union of roles analyst, auditor may show cells none of them reads: auditor's columns outside the lists read on analyst's rows	[{'name': c.t, 'capability': select}]
+
+query I
+SELECT sum(value)::INTEGER FROM acl_metrics() WHERE name = 'acl.policy.role_union_widens';
+----
+1
+
+# a role without a row filter sees its columns on every row: nothing beyond it - no new event
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN COLUMNS (id, amount, secret);
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t;
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE detail = 'role_union_widens';
+----
+1
+
+# two narrowed lists: each pair's items are named (another object: one event per object and roles a minute)
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t2 AS phys.main.orders;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE auditor WITH (select) MAIN RLS (id = 1) COLUMNS (id, secret);
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM t2;
+
+statement ok
+SELECT acl_audit_flush();
+
+query TT
+SELECT reason, objects::VARCHAR FROM acl_audit_events() WHERE detail = 'role_union_widens' ORDER BY seq DESC LIMIT 1;
+----
+the union of roles analyst, auditor may show cells none of them reads: auditor's columns secret on analyst's rows; analyst's columns amount on auditor's rows	[{'name': c.t2, 'capability': select}]
+
+# fields (spec 102) and masks: another catalog, read qualified
+statement ok
+CREATE TABLE phys.main.people(id INTEGER, address STRUCT(city VARCHAR, zip VARCHAR), secret VARCHAR);
+
+statement ok
+INSERT INTO phys.main.people VALUES (1, {'city': 'A', 'zip': '1'}, 'S1'), (2, {'city': 'B', 'zip': '2'}, 'S2');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG d;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE d.p AS phys.main.people;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE d.q AS phys.main.people;
+
+# the analyst reads every row: its whole `address` covers the auditor's `address.zip`, the same mask on both sides
+# covers itself - no event (with a row filter of its own, the analyst's `address.city` on the auditor's rows would
+# widen the other way)
+statement ok
+ACL ADMIN GRANT CATALOG d TO ROLE analyst WITH (select) COLUMNS (id, address, secret = 'x');
+
+statement ok
+ACL ADMIN GRANT CATALOG d TO ROLE auditor WITH (select) RLS (id = 1) COLUMNS (id, address.zip, secret = 'x');
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM d.p;
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name = 'd.p';
+----
+0
+
+# a field the analyst does not list, and a column the analyst only reads masked
+statement ok
+ACL ADMIN GRANT CATALOG d TO ROLE analyst WITH (select) RLS (id = 2) COLUMNS (id, address.city, secret = 'x');
+
+statement ok
+ACL ADMIN GRANT CATALOG d TO ROLE auditor WITH (select) RLS (id = 1) COLUMNS (id, address.zip, secret);
+
+query III
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT id, address.zip, secret FROM d.q ORDER BY id;
+----
+1	1	S1
+2	2	S2
+
+statement ok
+SELECT acl_audit_flush();
+
+query T
+SELECT reason FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name = 'd.q';
+----
+the union of roles analyst, auditor may show cells none of them reads: auditor's columns address.zip, secret on analyst's rows; analyst's columns address.city on auditor's rows
+
+# a field masked under a column the other role reads whole is not read by the first in clear
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE d.s AS phys.main.people;
+
+statement ok
+ACL ADMIN GRANT CATALOG d TO ROLE analyst WITH (select) RLS (id = 2) COLUMNS (id, address, address.zip = 'x');
+
+statement ok
+ACL ADMIN GRANT CATALOG d TO ROLE auditor WITH (select) RLS (id = 1) COLUMNS (id, address);
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM d.s;
+
+statement ok
+SELECT acl_audit_flush();
+
+query T
+SELECT reason FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name = 'd.s';
+----
+the union of roles analyst, auditor may show cells none of them reads: auditor's columns address on analyst's rows
+
+# one filter written two ways is one set of rows; a column an object that declares its columns does not have (a
+# catalog-wide list) is no cell - of an object that declares none, the node knows no columns and names it
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG e;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE e.t AS phys.main.orders COLUMNS (id, amount, secret);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE e.u AS phys.main.orders;
+
+statement ok
+ACL ADMIN GRANT CATALOG e TO ROLE analyst WITH (select) RLS (id = 2) COLUMNS (id, amount, secret);
+
+statement ok
+ACL ADMIN GRANT CATALOG e TO ROLE auditor WITH (select) RLS (id=2) COLUMNS (id, amount);
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM e.t;
+
+statement ok
+ACL ADMIN GRANT CATALOG e TO ROLE auditor WITH (select) RLS (id = 1) COLUMNS (id, amount, secret, salary);
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM e.t;
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM e.u;
+
+statement ok
+SELECT acl_audit_flush();
+
+query TT
+SELECT objects[1].name, reason FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name LIKE 'e.%';
+----
+e.u	the union of roles analyst, auditor may show cells none of them reads: auditor's columns salary on analyst's rows
+
+# a third role reading the rows of both whole: every cell is read - no event; without it, the event
+statement ok
+ACL ADMIN CREATE ROLE reader;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG f;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE f.t AS phys.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE f.u AS phys.main.orders;
+
+statement ok
+ACL ADMIN GRANT CATALOG f TO ROLE analyst WITH (select) RLS (id = 2) COLUMNS (id);
+
+statement ok
+ACL ADMIN GRANT CATALOG f TO ROLE auditor WITH (select) RLS (id = 1) COLUMNS (id, secret);
+
+statement ok
+ACL ADMIN GRANT CATALOG f TO ROLE reader WITH (select);
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MyIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIiwicmVhZGVyIl19.Ou1yvy8CmMpZoIFkHPjRFEqD2PG70q7OgD9MsmQT9tJwduq-PYd75RR_CgYUrfU3DcjFbyK7gJmyQZ67O36PIREIqOZf0WxwMF9by1Ep2Dg9EmUjGK-_8XdSC9VPbMTet3CewcfFjJgXXM0dpv3Kj9KQxjuozuuEJcSr1Y1bHOhYvQ0v-jESW4R3vpYbkpmvIbGFY4U7Sh405rPtYcCq3QF55Oj9zEIdO4omWdVaD2rIv28bFb4i_pXAm4ZEMzm3fBDWGYzslIZup5RF8C7Q44LLqkcfmgPxSlMZnf6O5SawZtvvblpRstA5s2mRCwrItW1RZuL1x-SKRnkHu4pARg' SELECT * FROM f.t;
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name = 'f.t';
+----
+0
+
+statement ok
+ACL ADMIN GRANT CATALOG f TO ROLE reader WITH (select) RLS (id = 3) COLUMNS (id, amount);
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MyIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIiwicmVhZGVyIl19.Ou1yvy8CmMpZoIFkHPjRFEqD2PG70q7OgD9MsmQT9tJwduq-PYd75RR_CgYUrfU3DcjFbyK7gJmyQZ67O36PIREIqOZf0WxwMF9by1Ep2Dg9EmUjGK-_8XdSC9VPbMTet3CewcfFjJgXXM0dpv3Kj9KQxjuozuuEJcSr1Y1bHOhYvQ0v-jESW4R3vpYbkpmvIbGFY4U7Sh405rPtYcCq3QF55Oj9zEIdO4omWdVaD2rIv28bFb4i_pXAm4ZEMzm3fBDWGYzslIZup5RF8C7Q44LLqkcfmgPxSlMZnf6O5SawZtvvblpRstA5s2mRCwrItW1RZuL1x-SKRnkHu4pARg' SELECT * FROM f.u;
+
+statement ok
+SELECT acl_audit_flush();
+
+query T
+SELECT reason FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name = 'f.u';
+----
+the union of roles analyst, auditor, reader may show cells none of them reads: auditor's columns secret on analyst's rows; reader's columns amount on analyst's rows; reader's columns amount on auditor's rows; auditor's columns secret on reader's rows
+
+# a table function's grants unite the same way
+statement ok
+ACL ADMIN ADD TABLE FUNCTION f.report MACRO 'SELECT * FROM phys.main.orders';
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM f.report() ORDER BY id;
+----
+1	S1
+2	S2
+
+statement ok
+SELECT acl_audit_flush();
+
+query T
+SELECT reason FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name = 'f.report';
+----
+the union of roles analyst, auditor may show cells none of them reads: auditor's columns secret on analyst's rows
+
+# a live schema alias is one object for every tail a client writes: one event, named by the alias
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA f.raw AS phys.main;
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM f.raw.orders;
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM f.raw.nope1;
+----
+
+statement error
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM f.raw.nope2;
+----
+
+statement ok
+SELECT acl_audit_flush();
+
+query T
+SELECT list(DISTINCT objects[1].name) FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name LIKE 'f.raw%';
+----
+[f.raw]
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name LIKE 'f.raw%';
+----
+1
+
+# a role without a filter but with a list reads every row of those columns only: the other role's columns on the rows
+# it does not filter in are read by neither
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG g;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE g.t AS phys.main.orders COLUMNS (id, amount, secret);
+
+statement ok
+ACL ADMIN GRANT CATALOG g TO ROLE analyst WITH (select) COLUMNS (id);
+
+statement ok
+ACL ADMIN GRANT CATALOG g TO ROLE auditor WITH (select) RLS (id = 1) COLUMNS (id, secret);
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT id, secret FROM g.t ORDER BY id;
+----
+1	S1
+2	S2
+
+statement ok
+SELECT acl_audit_flush();
+
+query T
+SELECT reason FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name = 'g.t';
+----
+the union of roles analyst, auditor may show cells none of them reads: auditor's columns secret on analyst's rows
+
+# a column the source exposes differently (a type fact, spec 099) is not the object's column list: the others widen
+statement ok
+CREATE TYPE phys.main.st AS ENUM ('x', 'y');
+
+statement ok
+CREATE TABLE phys.main.typed(id INTEGER, st phys.main.st, secret VARCHAR);
+
+statement ok
+INSERT INTO phys.main.typed VALUES (1, 'x', 'S1'), (2, 'y', 'S2');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE g.typed AS phys.main.typed;
+
+statement ok
+ACL ADMIN GRANT CATALOG g TO ROLE analyst WITH (select) RLS (id = 2) COLUMNS (id);
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM g.typed;
+
+statement ok
+SELECT acl_audit_flush();
+
+query T
+SELECT reason FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name = 'g.typed';
+----
+the union of roles analyst, auditor may show cells none of them reads: auditor's columns secret on analyst's rows
+
+# turned on after a resolution at `off`: the next one within the minute (a policy write empties the resolver's cache)
+# is recorded - the floor counts recorded events only
+statement ok
+SET GLOBAL acl_audit_level = 'off';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE g.late AS phys.main.orders;
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM g.late;
+
+statement ok
+SET GLOBAL acl_audit_level = 'decisions';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE g.other AS phys.main.orders;
+
+statement ok
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1MiIsInJvbGVzIjpbImFuYWx5c3QiLCJhdWRpdG9yIl0sInRpZCI6ImFjbWUifQ.SPf0FiV3Her6HFT4awngyv27bHcGkGga5ptlaaDVdjmX6Y2PgaXLHbpnXXdPO0XO52kqA5BnoomOItvUxZtwFL1sQamV95sd4XTbhjXlrwtpzXzwKE-xaQYNHYprOsRZtET3o2x_L9nGzqU0ziCnDDiMsMjF_PZ4FB84C89dKJJVkDUdGMIM6OFQo-6GYrOAvVR0c7zbYjKgfO6XMRx1X_i9uSebASQvX8tv6ryTJyaCb5h9H4ETBCiyJO0EnYd8n2r-t0wQUQNIL8dP96C7agt6xkEqfEHNubCBQjWt4Ay7IdtkIJPdMEVwDc_8mZOf6OrnFb3gibgpPqxzgNBiFA' SELECT * FROM g.late;
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT count(*) FROM acl_audit_events() WHERE detail = 'role_union_widens' AND objects[1].name = 'g.late';
+----
+1
