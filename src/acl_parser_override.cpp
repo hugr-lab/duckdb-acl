@@ -375,6 +375,7 @@ struct StatementAudit {
 			note.statement = stmt.statement;
 			note.objects = stmt.objects;
 			note.physical = stmt.physical;
+			note.origins = stmt.origins;
 			if (stmt.lineage) {
 				stmt.lineage->decision_seq = seq; // spec 107: the run names its decision
 				note.lineage = stmt.lineage;
@@ -981,7 +982,8 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	for (auto &statement : statements) {
 		lineage_jobs.push_back(CaptureLineageJob(store, *statement, principal, audit.proto.door, prefix.lineage));
 	}
-	audit.phase = Reason::POLICY_ERROR; // an unnoted failure under the rewrite is the policy's
+	audit.phase = Reason::POLICY_ERROR;                 // an unnoted failure under the rewrite is the policy's
+	audit.trail.origins = audit.proto.door == "flight"; // spec 143
 	RewriteStatements(statements, principal, options, store, &audit.trail, !viewing.empty());
 	for (idx_t i = 0; i < audit.trail.statements.size() && i < lineage_jobs.size(); i++) {
 		audit.trail.statements[i].lineage = lineage_jobs[i];

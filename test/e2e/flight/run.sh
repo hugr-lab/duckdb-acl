@@ -168,6 +168,49 @@ got="$(ask "@tables_schema")"
 echo "$got" | grep -q "\['id:int64', 'name:string'\]" || fail "the promised schema is wrong: $got"
 case "$got" in *ssn*) fail "a column the role cannot read was in the promised schema: $got";; esac
 
+# --- spec 143: descriptions in the Arrow schema ---------------------------------------------------------------
+# include_schema: each column's comment as Flight SQL's REMARKS - an alias relation's virtual comment over its
+# source's, the source's where it has none - and the object's own comment on the schema
+got="$(ACL_SHOW_DESCRIBED=1 ask "@tables_schema:orders")"
+echo "$got" | grep -q "'amount||remarks:what was paid|'" || fail "include_schema: the column's REMARKS: $got"
+echo "$got" | grep -q "'<object>|comment:the orders|'" || fail "include_schema: the object's comment: $got"
+got="$(ACL_SHOW_DESCRIBED=1 ask "@tables_schema:customers")"
+echo "$got" | grep -q "'name||remarks:PHYS name|'" || fail "include_schema: the source's column comment: $got"
+case "$got" in *ssn*) fail "a hidden column was described: $got";; esac
+
+# a result: the virtual object each column reads (Flight SQL's CATALOG_NAME / SCHEMA_NAME / TABLE_NAME) and its
+# comment as duckdb:comment - a renamed reference too; an expression has none; GetFlightInfo promised the same
+got="$(ACL_SHOW_DESCRIBED=1 ask "SELECT id, amount AS paid, amount + 1 AS more FROM orders")"
+echo "$got" | grep -q "'id|c.main.orders||', 'paid|c.main.orders|comment:what was paid|', 'more|||', '<object>||'" ||
+	fail "a result's origins: $got"
+echo "$got" | grep -q "'__promised_same': True" || fail "GetFlightInfo's schema and DoGet's differ: $got"
+case "$got" in *memory*) fail "a physical name reached the result's schema: $got";; esac
+# a star over one object: its columns, and the object's comment on the schema
+got="$(ACL_SHOW_DESCRIBED=1 ask "SELECT * FROM orders")"
+echo "$got" | grep -q "'amount|c.main.orders|comment:what was paid|'" || fail "a star's origins: $got"
+echo "$got" | grep -q "'<object>|comment:the orders|'" || fail "one object's comment on the schema: $got"
+# a join, each side by its alias; a hidden column is no field, so it has no description
+got="$(ACL_SHOW_DESCRIBED=1 ask "SELECT o.amount, k.name FROM orders o JOIN customers k ON o.customer_id = k.id")"
+echo "$got" | grep -q "'amount|c.main.orders|comment:what was paid|', 'name|c.main.customers|comment:PHYS name|'" ||
+	fail "a join's origins: $got"
+# nothing read off an aggregate, a CTE's column or a set operation - nor off a bare value keyword, nor off a star
+# beside an expression that makes several columns (its span shifts), nor off a name that is no column of the object
+# (a lateral alias, a struct column's field), nor off a placeholder schema (a parameter in a star's relation)
+for sql in "SELECT count(*) AS n FROM orders" "WITH x AS (SELECT amount FROM orders) SELECT amount FROM x" \
+	"SELECT id FROM orders UNION ALL SELECT id FROM customers" "SELECT current_date AS d FROM orders" \
+	"SELECT *, unnest({'a': 1, 'b': 2}) FROM orders" \
+	"SELECT current_schema FROM orders" "SELECT amount + 1 AS z, z FROM orders" \
+	"SELECT o.x FROM orders o, (SELECT {'x': 1} AS o) s" \
+	"SELECT unnest({'a': 1, 'b': 2}), o.amount, x.* FROM orders o, (SELECT 1 AS q) x" \
+	"SELECT unnest({'q': 5, 'amount': 1}), o.amount, s.* FROM orders o, (SELECT 1 AS z) s" \
+	"@prepared_fields:SELECT orders.amount, x.* FROM orders, (SELECT ? AS p) x"; do
+	got="$(ACL_SHOW_DESCRIBED=1 ask "$sql")"
+	echo "$got" | grep -q "c.main" && fail "an origin was read off \"$sql\": $got"
+done
+# a prepared statement announces the same schema
+got="$(ACL_SHOW_DESCRIBED=1 ask "@prepared_fields:SELECT amount FROM orders")"
+echo "$got" | grep -q "'amount|c.main.orders|comment:what was paid|'" || fail "a prepared statement's origins: $got"
+
 # --- spec 099: an ENUM goes out as an Arrow dictionary, or as utf8 where the table reads it as VARCHAR -----
 # the promised schema and the stream agree either way: a client never decodes what it was not told
 got="$(ACL_SHOW_SCHEMA=1 ask "SELECT tier, s FROM typed")"
@@ -727,6 +770,32 @@ echo "SET GLOBAL acl_audit_level = 'decisions';" >&3
 
 # (spec 096's node-group refusal at the door - UNAVAILABLE, the swap kept - is the platform part's: it moved to
 # hugr-node with the code, duckdb-acl spec 127)
+
+# --- spec 143: a live alias schema's object written in another case than its own is the same object - described,
+# and labelled as the listing names it
+echo "CREATE TABLE staging.events(kind VARCHAR); COMMENT ON COLUMN staging.events.kind IS 'what happened';" >&3
+server_says made "SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'staging' AND table_name = 'events'" >/dev/null
+for sql in "SELECT KIND FROM stage.EVENTS" "SELECT kind FROM stage.events"; do
+	got="$(ACL_SHOW_DESCRIBED=1 ask "$sql")"
+	echo "$got" | grep -q "|c.stage.events|comment:what happened|'" || fail "a live alias object's origin (\"$sql\"): $got"
+done
+echo "DROP TABLE staging.events;" >&3
+
+# --- spec 143: a source's tags as duckdb:tag:<key> - a DuckLake table's (DuckLake keeps a table's tags; no SQL
+# statement of the release writes one, so its metadata row is written here), where the build carries DuckLake
+if [ "$(server_says haslake "SELECT count(*) FROM duckdb_extensions() WHERE extension_name = 'ducklake' AND loaded")" = "1" ]; then
+	LAKE="ATTACH 'ducklake:$TMP/tags.ducklake' AS lake (DATA_PATH '$TMP/tags_lake')"
+	echo "$LAKE; CREATE TABLE lake.tagged(id INTEGER); INSERT INTO __ducklake_metadata_lake.ducklake_tag SELECT table_id, (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot), NULL, 'owner', 'sales' FROM __ducklake_metadata_lake.ducklake_table WHERE table_name = 'tagged'; DETACH lake; $LAKE;" >&3
+	added="$(server_says tagged "SELECT acl_add_relation('c', 'tagged', 'lake.main.tagged', '', '')::VARCHAR")"; [ "$added" = "true" ] ||
+		{ tail -20 "$TMP/server.log" >&2; fail "the tagged relation was not added: $added"; }
+	got="$(ACL_SHOW_DESCRIBED=1 ask "@tables_schema:tagged")"
+	echo "$got" | grep -q "'<object>||owner=sales'" || fail "include_schema: the source's table tags: $got"
+	got="$(ACL_SHOW_DESCRIBED=1 ask "SELECT * FROM tagged")"
+	echo "$got" | grep -q "'id|c.main.tagged||', '<object>||owner=sales'" || fail "a result's object tags: $got"
+	server_says untagged "SELECT acl_drop_relation('c', 'tagged')::VARCHAR" >/dev/null
+else
+	echo "note: no DuckLake in this build - the tags leg is skipped"
+fi
 
 # --- and the door closes ------------------------------------------------------------------------------
 echo "SELECT acl_flight_stop('$URI');" >&3

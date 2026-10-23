@@ -321,13 +321,16 @@ void SourcesScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 //! (`<db>.<schema>.<object>`), each read directly: a listing reads the sources it answers about, never a
 //! walk of every attached database. A key that does not resolve answers nothing; a source that fails is
 //! left out, never the listing failed - and (spec 136) acl_physical_unread(keys) says which failed.
-enum class PhysicalKind : uint8_t { TABLES, COLUMNS, UNREAD };
+//! acl_physical_schemas(keys) (spec 143): the named schemas' tags - the schema looked up, its tables never
+//! scanned.
+enum class PhysicalKind : uint8_t { TABLES, COLUMNS, UNREAD, SCHEMAS };
 
 struct PhysicalBind : TableFunctionData {
 	shared_ptr<PolicyStore> store;
 	vector<string> keys;
 	bool columns = false;
 	bool unread = false;
+	bool schemas = false;
 };
 
 struct PhysicalInfo : TableFunctionInfo {
@@ -344,6 +347,7 @@ unique_ptr<FunctionData> PhysicalBindFn(ClientContext &, TableFunctionBindInput 
 	bind->store = info.store;
 	bind->columns = info.kind == PhysicalKind::COLUMNS;
 	bind->unread = info.kind == PhysicalKind::UNREAD;
+	bind->schemas = info.kind == PhysicalKind::SCHEMAS;
 	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
 		for (auto &value : ListValue::GetChildren(input.inputs[0])) {
 			if (!value.IsNull()) {
@@ -359,6 +363,10 @@ unique_ptr<FunctionData> PhysicalBindFn(ClientContext &, TableFunctionBindInput 
 	column("schema_name", LogicalType::VARCHAR);
 	if (bind->unread) {
 		column("error_class", LogicalType::VARCHAR);
+		return std::move(bind);
+	}
+	if (bind->schemas) {
+		column("tags", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
 		return std::move(bind);
 	}
 	column("table_name", LogicalType::VARCHAR);
@@ -380,6 +388,8 @@ unique_ptr<FunctionData> PhysicalBindFn(ClientContext &, TableFunctionBindInput 
 		column("temporary", LogicalType::BOOLEAN);
 		column("comment", LogicalType::VARCHAR);
 	}
+	// spec 143: the source's tags (a source's extension sets them; duckdb_tables / duckdb_columns list them)
+	column("tags", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
 	return std::move(bind);
 }
 
@@ -434,11 +444,12 @@ void PhysicalRows(ClientContext &context, const PhysicalBind &bind, SourcesState
 	bool is_view = entry.type == CatalogType::VIEW_ENTRY;
 	if (!bind.columns) {
 		state.rows.push_back({Value(db_name), Value(schema_name), table, Value::BOOLEAN(is_view),
-		                      Value::BOOLEAN(entry.temporary), comment});
+		                      Value::BOOLEAN(entry.temporary), comment, Value::MAP(entry.tags)});
 		return;
 	}
 	auto push = [&](const string &column, int32_t index, const Value &column_default, bool nullable,
-	                const LogicalType &type, bool generated, const Value &generation, const Value &column_comment) {
+	                const LogicalType &type, bool generated, const Value &generation, const Value &column_comment,
+	                const InsertionOrderPreservingMap<string> &tags) {
 		Value precision, radix, scale;
 		NumericFacts(type, precision, radix, scale);
 		state.rows.push_back(
@@ -446,7 +457,7 @@ void PhysicalRows(ClientContext &context, const PhysicalBind &bind, SourcesState
 		     Value::BOOLEAN(nullable),
 		     type.id() == LogicalTypeId::INVALID ? Value(LogicalType::VARCHAR) : Value(type.ToString()),
 		     Value(LogicalType::INTEGER), precision, radix, scale, Value::BOOLEAN(generated), generation,
-		     text(column_comment)});
+		     text(column_comment), Value::MAP(tags)});
 	};
 	if (!is_view) {
 		auto &table_entry = entry.Cast<TableCatalogEntry>();
@@ -467,7 +478,7 @@ void PhysicalRows(ClientContext &context, const PhysicalBind &bind, SourcesState
 				column_default = Value(col.DefaultValue().ToString());
 			}
 			push(col.Name().GetIdentifierName(), NumericCast<int32_t>(i + 1), column_default, !not_null.count(i),
-			     col.Type(), col.Generated(), generation, col.Comment());
+			     col.Type(), col.Generated(), generation, col.Comment(), col.Tags());
 		}
 		return;
 	}
@@ -479,7 +490,8 @@ void PhysicalRows(ClientContext &context, const PhysicalBind &bind, SourcesState
 	auto info = view.GetColumnInfo();
 	for (idx_t i = 0; info && i < info->names.size() && i < info->types.size(); i++) {
 		push(info->names[i].GetIdentifierName(), NumericCast<int32_t>(i + 1), Value(LogicalType::VARCHAR), true,
-		     info->types[i], false, Value(LogicalType::VARCHAR), view.GetColumnComment(i));
+		     info->types[i], false, Value(LogicalType::VARCHAR), view.GetColumnComment(i),
+		     InsertionOrderPreservingMap<string>());
 	}
 }
 
@@ -504,7 +516,7 @@ unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableF
 		NamePath path;
 		string error;
 		if (!NamePath::TryFromKey(key, path, error) || path.Parts().size() < 2 || path.Parts().size() > 3 ||
-		    !seen.insert(StringUtil::Lower(path.ToKey())).second) {
+		    (bind.schemas && path.Parts().size() != 2) || !seen.insert(StringUtil::Lower(path.ToKey())).second) {
 			continue;
 		}
 		if (context.IsInterrupted()) {
@@ -566,7 +578,10 @@ unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableF
 			}
 			EntryLookupInfo schema_lookup(CatalogType::SCHEMA_ENTRY, QualifiedName(Identifier(parts[1])));
 			auto schema = catalog.GetSchema(context, schema_lookup, OnEntryNotFound::RETURN_NULL);
-			if (schema) {
+			if (schema && bind.schemas) {
+				state->rows.push_back(
+				    {Value(db_name), Value(schema->name.GetIdentifierName()), Value::MAP(schema->tags)});
+			} else if (schema) {
 				auto schema_name = schema->name.GetIdentifierName();
 				// (acl_physical_unread only probes: the scan is what makes a catalog load its tables)
 				schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
@@ -574,6 +589,10 @@ unique_ptr<GlobalTableFunctionState> PhysicalInit(ClientContext &context, TableF
 						PhysicalRows(context, bind, rows, db_name, schema_name, entry);
 					}
 				});
+			}
+			if (bind.schemas) {
+				continue; // the schema looked up, its tables never loaded: no reader of this statement may count it
+				          // read
 			}
 			cache->answered.insert(db_key);
 			cache->read.insert(lowered);
@@ -769,10 +788,11 @@ void RegisterAclPlatformSources(ExtensionLoader &loader, const shared_ptr<Policy
 		}
 		loader.RegisterFunction(set);
 	}
-	for (auto kind : {PhysicalKind::TABLES, PhysicalKind::COLUMNS, PhysicalKind::UNREAD}) {
-		auto name = kind == PhysicalKind::COLUMNS  ? "acl_physical_columns"
-		            : kind == PhysicalKind::UNREAD ? "acl_physical_unread"
-		                                           : "acl_physical_tables";
+	for (auto kind : {PhysicalKind::TABLES, PhysicalKind::COLUMNS, PhysicalKind::UNREAD, PhysicalKind::SCHEMAS}) {
+		auto name = kind == PhysicalKind::COLUMNS   ? "acl_physical_columns"
+		            : kind == PhysicalKind::UNREAD  ? "acl_physical_unread"
+		            : kind == PhysicalKind::SCHEMAS ? "acl_physical_schemas"
+		                                            : "acl_physical_tables";
 		TableFunction physical(Identifier(name), {LogicalType::LIST(LogicalType::VARCHAR)}, SourcesScan, PhysicalBindFn,
 		                       PhysicalInit);
 		physical.function_info = make_shared_ptr<PhysicalInfo>(store, kind);

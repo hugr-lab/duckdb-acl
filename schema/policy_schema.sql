@@ -90,6 +90,10 @@ CREATE TABLE IF NOT EXISTS <role_mappings>("scope_kind" ACL_KEY_TEXT, "scope_nam
 -- physical row to read names and types from). Runs after every CREATE TABLE above.
 CREATE TABLE IF NOT EXISTS <object_columns>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "kind" ACL_KEY_TEXT, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, "comment" VARCHAR, "derived" BOOLEAN, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "kind", "pos"));
 
+-- spec 143 (schema v23): a column's virtual comment where the object stores no column list - an alias relation, whose
+-- columns are its source's, read live. The listings show it over the source's own comment.
+CREATE TABLE IF NOT EXISTS <column_comments>("vcat" ACL_KEY_TEXT, "vname" ACL_KEY_TEXT, "column_name" ACL_KEY_TEXT, "comment" VARCHAR, PRIMARY KEY ("vcat", "vname", "column_name"));
+
 CREATE TABLE IF NOT EXISTS <schemas>("vcat" ACL_KEY_TEXT, "path" ACL_KEY_TEXT, "phys_path" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "path"));
 
 CREATE TABLE IF NOT EXISTS <role_schemas>("role" ACL_KEY_TEXT, "vcat" ACL_KEY_TEXT, "schema_path" ACL_KEY_TEXT, "caps" VARCHAR, "inherited" BOOLEAN, "comment" VARCHAR, "into" VARCHAR, "virtual_only" BOOLEAN, PRIMARY KEY ("role", "vcat", "schema_path"));
@@ -138,7 +142,7 @@ CREATE TABLE IF NOT EXISTS <cluster_deps>("scope" ACL_KEY_TEXT, "name" ACL_KEY_T
 -- @seed function_categories
 
 -- @section schema
-INSERT INTO <meta> SELECT 'schema_version', '22' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
+INSERT INTO <meta> SELECT 'schema_version', '23' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'schema_version');
 
 
 INSERT INTO <meta> SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM <meta> WHERE "key" = 'policy_version');

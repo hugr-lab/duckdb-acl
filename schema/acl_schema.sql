@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS acl."role_mappings"("scope_kind" VARCHAR, "scope_name
 -- physical row to read names and types from). Runs after every CREATE TABLE above.
 CREATE TABLE IF NOT EXISTS acl."object_columns"("vcat" VARCHAR, "vname" VARCHAR, "kind" VARCHAR, "pos" INTEGER, "name" VARCHAR, "type" VARCHAR, "comment" VARCHAR, "derived" BOOLEAN, "nullable" BOOLEAN, PRIMARY KEY ("vcat", "vname", "kind", "pos"));
 
+-- spec 143 (schema v23): a column's virtual comment where the object stores no column list - an alias relation, whose
+-- columns are its source's, read live. The listings show it over the source's own comment.
+CREATE TABLE IF NOT EXISTS acl."column_comments"("vcat" VARCHAR, "vname" VARCHAR, "column_name" VARCHAR, "comment" VARCHAR, PRIMARY KEY ("vcat", "vname", "column_name"));
+
 CREATE TABLE IF NOT EXISTS acl."schemas"("vcat" VARCHAR, "path" VARCHAR, "phys_path" VARCHAR, "comment" VARCHAR, "origin" VARCHAR, "created_by" VARCHAR, "created_roles" VARCHAR, PRIMARY KEY ("vcat", "path"));
 
 CREATE TABLE IF NOT EXISTS acl."role_schemas"("role" VARCHAR, "vcat" VARCHAR, "schema_path" VARCHAR, "caps" VARCHAR, "inherited" BOOLEAN, "comment" VARCHAR, "into" VARCHAR, "virtual_only" BOOLEAN, PRIMARY KEY ("role", "vcat", "schema_path"));
@@ -147,7 +151,7 @@ INSERT INTO acl."function_grants" SELECT * FROM (VALUES ('', 'base', '', '', '',
 
 INSERT INTO acl."meta" SELECT 'function_seed', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'function_seed');
 
-INSERT INTO acl."meta" SELECT 'schema_version', '22' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
+INSERT INTO acl."meta" SELECT 'schema_version', '23' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'schema_version');
 
 INSERT INTO acl."meta" SELECT 'policy_version', '1' WHERE NOT EXISTS (SELECT 1 FROM acl."meta" WHERE "key" = 'policy_version');
 

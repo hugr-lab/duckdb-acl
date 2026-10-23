@@ -14,6 +14,7 @@
 #include "acl_audit.hpp"
 #include "acl_lineage.hpp"
 #include "acl_flight_catalog.hpp"
+#include "acl_result_rows.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/query_node/list.hpp"
@@ -335,6 +336,9 @@ struct FlightDoorState {
 		//! the client's statement as it sent it - what spec 111 reads when duckdb could not settle the
 		//! statement's properties at Prepare (a parameter it could not type)
 		string query;
+		//! spec 143: each object its result columns come from, as the principal's listing describes it - read once
+		//! at Prepare, so GetFlightInfo's schema and DoGet's say the same (the origins ride on `profile`)
+		std::map<std::tuple<string, string, string>, shared_ptr<const PolicyStore::ObjectDescription>> described;
 	};
 	std::unordered_map<string, shared_ptr<Reservation>> reservations;
 	//! Refuse a new reservation rather than evict somebody's old one: an evicted one is a mid-flight
@@ -1402,8 +1406,10 @@ public:
 			if (reservation->stmt->HasError()) {
 				return StatusFromDuck("acl", reservation->stmt->GetError());
 			}
+			DescribeResult(handle, *reservation);
 			std::shared_ptr<arrow::Schema> schema;
 			ARROW_ASSIGN_OR_RAISE(schema, SchemaOf(*reservation->stmt));
+			ARROW_ASSIGN_OR_RAISE(schema, Described(schema, *reservation));
 			reservation->owner = owner;
 			reservation->single_use = true;
 			auto held = reservation;
@@ -1424,6 +1430,7 @@ public:
 				if (held->executed && Expands(*held->stmt)) {
 					// spec 128: run now, its schema is known now
 					ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(held->executed->GetTypes(), held->executed->GetNames()));
+					ARROW_ASSIGN_OR_RAISE(schema, Described(schema, *held));
 				}
 			}
 			state->store->AuditDoor("flight", "ticket_issued", true, string(), string(), handle);
@@ -1857,9 +1864,11 @@ public:
 			    if (reservation->stmt->HasError()) {
 				    return StatusFromDuck("acl", reservation->stmt->GetError());
 			    }
+			    DescribeResult(handle, *reservation);
 			    flightsql::ActionCreatePreparedStatementResult result;
 			    ARROW_RETURN_NOT_OK(SchemasFromStatement(*reservation->conn->con->context, *reservation->stmt, nullptr,
 			                                             result.dataset_schema, result.parameter_schema));
+			    ARROW_ASSIGN_OR_RAISE(result.dataset_schema, Described(result.dataset_schema, *reservation));
 			    if (AnswersOnlyCount(*reservation)) {
 				    // spec 111: a statement that answers only a count is announced as an update - JDBC reads
 				    // an empty dataset schema as one and executes it through DoPut, in one call (the field
@@ -1944,6 +1953,7 @@ public:
 					    }
 				    }
 			    }
+			    ARROW_ASSIGN_OR_RAISE(dataset_schema, Described(dataset_schema, *reservation));
 			    // the ticket is the protocol's own command, which carries the handle - nothing is
 			    // remembered between the two calls that is not already in the reservation
 			    std::vector<flight::FlightEndpoint> endpoints {
@@ -2161,6 +2171,44 @@ public:
 		reservation.has_profile = acl::TakeConnectionProfileNote(*reservation.conn->con->context, reservation.profile);
 	}
 
+	//! spec 143: the objects a prepared statement's result columns come from (the origins the rewriter noted on its
+	//! profile note), each described by the session principal's listing. Outside the session's `exec`: a listing
+	//! runs on the store's own connection. A description that cannot be read leaves the names only.
+	void DescribeResult(const string &handle, FlightDoorState::Reservation &reservation) {
+		if (!reservation.has_profile || reservation.profile.origins.empty() || reservation.stmt->HasError()) {
+			return;
+		}
+		Principal principal;
+		string reason;
+		if (!state->store->SessionPrincipal(handle, principal, reason)) {
+			return;
+		}
+		for (auto &origin : reservation.profile.origins) {
+			auto key = std::make_tuple(origin.catalog, origin.schema, origin.table);
+			if (origin.table.empty() || reservation.described.count(key)) {
+				continue;
+			}
+			shared_ptr<const PolicyStore::ObjectDescription> described;
+			try {
+				described = state->store->DescribeObject(principal, origin.catalog, origin.schema, origin.table);
+			} catch (std::exception &) { // NOLINT: a description is a hint; the result is not refused for it
+			}
+			reservation.described[key] = described;
+		}
+	}
+
+	//! spec 143: a result schema with what its columns' origins say (WithOrigins)
+	arrow::Result<std::shared_ptr<arrow::Schema>> Described(const std::shared_ptr<arrow::Schema> &schema,
+	                                                        const FlightDoorState::Reservation &reservation) {
+		if (!reservation.has_profile || reservation.profile.origins.empty()) {
+			return schema;
+		}
+		return WithOrigins(schema, reservation.profile.origins, [&](const ResultOrigin &origin) {
+			auto found = reservation.described.find(std::make_tuple(origin.catalog, origin.schema, origin.table));
+			return found == reservation.described.end() ? nullptr : found->second;
+		});
+	}
+
 	//! spec 074: before an execution on the session's connection - the reservation's note back on
 	//! the connection (the execution takes it: its text is the prepared one) and the profiler set
 	//! for the session's principal by the level and the trace the note carries.
@@ -2363,6 +2411,7 @@ public:
 		auto properties = reservation->conn->con->context->GetClientProperties();
 		std::shared_ptr<arrow::Schema> schema;
 		ARROW_ASSIGN_OR_RAISE(schema, SchemaFor(result->GetTypes(), result->GetNames(), properties));
+		ARROW_ASSIGN_OR_RAISE(schema, Described(schema, *reservation));
 		auto slot = make_shared_ptr<FlightDoorState::ResultStream>();
 		slot->Take(std::move(result), stmt.GetStatementType(), retained);
 		{
@@ -2442,13 +2491,30 @@ public:
 			    TempScanScope temp_scan(conn->con->context.get());
 			    ARROW_ASSIGN_OR_RAISE(auto tables,
 			                          RunCatalogQuery(*state->store, *conn->con, handle,
-			                                          BuildCatalogListing(CatalogListing::TABLES, filter)));
+			                                          BuildCatalogListing(CatalogListing::DESCRIBED_TABLES, filter)));
 			    ARROW_ASSIGN_OR_RAISE(auto columns,
 			                          RunCatalogQuery(*state->store, *conn->con, handle,
 			                                          BuildCatalogListing(CatalogListing::COLUMNS, filter)));
+			    // spec 143: the objects' tags, read for the listed objects alone by the principal's own listing
+			    // (information_schema keeps duckdb's shape; duckdb_tables' costs a planner pass per call)
+			    std::map<std::tuple<string, string, string>, Value> tags;
+			    Principal principal;
+			    string reason;
+			    if (state->store->SessionPrincipal(handle, principal, reason)) {
+				    ResultRows rows(*tables);
+				    vector<std::tuple<string, string, string>> objects;
+				    for (idx_t row = 0; row < rows.Count(); row++) {
+					    objects.emplace_back(rows.GetValue(0, row).ToString(), rows.GetValue(1, row).ToString(),
+					                         rows.GetValue(2, row).ToString());
+				    }
+				    try {
+					    tags = state->store->ObjectTags(principal, objects);
+				    } catch (std::exception &) { // NOLINT: tags are a description; the listing is not refused for them
+				    }
+			    }
 			    Connection con(state->db);
-			    ARROW_ASSIGN_OR_RAISE(auto serialized, SchemasFor(*con.context, *tables, *columns));
-			    return BatchFrom(schema, *tables, &serialized);
+			    ARROW_ASSIGN_OR_RAISE(auto serialized, SchemasFor(*con.context, *tables, *columns, tags));
+			    return BatchFrom(schema, *tables, &serialized, 1);
 		    });
 	}
 

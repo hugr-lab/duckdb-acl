@@ -58,6 +58,11 @@ ACL ADMIN CREATE VIRTUAL TABLE c."Raw Data"."Order Items" AS memory."Raw Data"."
 ACL ADMIN CREATE VIRTUAL TABLE c."Raw Data"."Line Items" AS memory."Raw Data"."Line Items";
 ACL ADMIN CREATE VIRTUAL REFERENCE c."Line To Order" FROM "Raw Data"."Line Items" TO "Raw Data"."Order Items"
     ON ("Order Id" = id);
+-- spec 143: descriptions a Flight client reads in the Arrow schema - the object's own, a virtual comment on an alias
+-- relation's column, and a source's column comment shown where the virtual catalog has none
+COMMENT ON COLUMN customers.name IS 'PHYS name';
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders IS 'the orders';
+ACL ADMIN COMMENT ON VIRTUAL TABLE c.orders COLUMN amount IS 'what was paid';
 ACL ADMIN CREATE ROLE analyst;
 -- temp is explicit (spec 050): session temp tables ride on it, and nothing else grants them
 ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select, insert, temp) MAIN;

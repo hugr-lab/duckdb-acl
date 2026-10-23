@@ -26,6 +26,23 @@ struct PolicyStore;
 struct LineageJob;
 struct PhysicalLineage;
 
+//! spec 143: where a result column comes from, read off the statement as the client wrote it - a column of one
+//! virtual object, the columns a star expands to (one span, its length the result's to say), or nothing. Names
+//! only; the Flight door writes them into the result's Arrow schema with the comments and tags the principal's
+//! listing says.
+struct ResultOrigin {
+	enum class Kind : uint8_t { NONE, COLUMN, STAR };
+	Kind kind = Kind::NONE;
+	//! the object as a listing names it (table_catalog, table_schema, table_name); empty for a star over
+	//! something that is no virtual object (a span that takes its columns and gives them no origin)
+	string catalog, schema, table;
+	string column; // COLUMN: as written
+	//! the name the result gives the column when it can be read off the text (an alias, a reference's last part);
+	//! empty when it cannot (an expression with no alias) or for a star. The door checks it against the field, so a
+	//! shift (an item that makes several columns) is caught
+	string name;
+};
+
 //! What the override knows at decision time and the profile needs at execution time: the seq of
 //! the statement event, the batch's shared identity (door, session, principal, trace ids), the
 //! statement's class and objects, and the physical names its relations resolved to.
@@ -47,6 +64,8 @@ struct ProfileNote {
 	vector<string> physical;
 	//! spec 107: the statement's lineage job; each execution of it is a run (QueryEnd)
 	shared_ptr<LineageJob> lineage;
+	//! spec 143: the origin of each result column (a Flight session's top-level SELECT only; empty otherwise)
+	vector<ResultOrigin> origins;
 };
 
 //! spec 107, the pre-optimize hook: whether the running statement was decided under a principal's

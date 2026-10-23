@@ -259,6 +259,9 @@ private:
 			if (!relation.dead && !is_view) {
 				JudgeWholeName(kind, relation);
 			}
+			if (!relation.dead && !is_view) {
+				JudgeColumnComments(relation);
+			}
 			if (!relation.dead) {
 				JudgeTypes(kind, relation, rls, rows_rows.GetValue(7, row), rows_rows.GetValue(6, row));
 			}
@@ -290,6 +293,45 @@ private:
 		        "its source by three, so it is not listed - it binds to \"" +
 		        whole + "\"",
 		    "ALTER VIRTUAL TABLE " + Named(relation.vname) + " SET PHYS " + NamePath::KeyToGrammar(whole));
+	}
+
+	//! spec 143: a column comment kept beside a relation (it declared no column list) that no listing shows - its
+	//! column left the source, or the relation declares its columns now - kept, never dropped by itself; the repair
+	//! clears it
+	void JudgeColumnComments(const Relation &relation) {
+		auto commented =
+		    Read("SELECT \"column_name\" FROM " + catalog.Tbl("column_comments") + " WHERE \"vcat\" = " + Lit(vcat) +
+		         " AND \"vname\" = " + Lit(relation.vname) + " ORDER BY 1");
+		ResultRows rows(*commented);
+		if (rows.Count() == 0) {
+			return;
+		}
+		if (!relation.declared.empty()) {
+			for (idx_t i = 0; i < rows.Count(); i++) {
+				auto column = rows.GetValue(0, i).ToString();
+				Add("table", relation.vname, "", "comment_column_missing",
+				    "a comment is kept for its source's column \"" + column +
+				        "\", which no listing shows: the object declares its columns, each with its own comment",
+				    "COMMENT ON VIRTUAL TABLE " + Named(relation.vname) + " COLUMN " + Ident(column) + " IS ''");
+			}
+			return;
+		}
+		Columns probed;
+		if (!catalog.ProbeSchema("SELECT * FROM " + NamePath::KeyToSql(relation.phys), false, {}, probed)) {
+			return; // a source that does not bind has its own finding
+		}
+		for (idx_t i = 0; i < rows.Count(); i++) {
+			auto column = rows.GetValue(0, i).ToString();
+			bool present = false;
+			for (auto &c : probed) {
+				present = present || StringUtil::CIEquals(c.first, column);
+			}
+			if (!present) {
+				Add("table", relation.vname, "", "comment_column_missing",
+				    "a comment is kept for column \"" + column + "\", which \"" + relation.phys + "\" no longer has",
+				    "COMMENT ON VIRTUAL TABLE " + Named(relation.vname) + " COLUMN " + Ident(column) + " IS ''");
+			}
+		}
 	}
 
 	//! spec 099: the type facts against the source now (`types_stale`), and an ENUM whose labels every

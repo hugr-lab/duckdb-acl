@@ -137,14 +137,25 @@ void FiltersNarrowTheListing(Connection &con) {
 void ColumnsAreOneStatementForEveryTable(Connection &con) {
 	CatalogFilter none;
 	auto columns = RunAsRole(con, "analyst", BuildCatalogListing(CatalogListing::COLUMNS, none));
-	// the sixth column is spec 048's nullability - and orders.id answers NO from its declared key
-	Check(Joined(columns) == "c|main|customers|id|INTEGER|YES ; c|main|customers|name|VARCHAR|YES ; "
-	                         "c|main|orders|id|INTEGER|NO ; c|main|orders|customer_id|INTEGER|YES ; "
-	                         "c|main|shipments|id|INTEGER|YES ; c|main|shipments|customer_id|INTEGER|YES",
+	// the sixth column is spec 048's nullability - and orders.id answers false from its declared key; then the
+	// comment and the tags (spec 143)
+	Check(Joined(columns) ==
+	          "c|main|customers|id|INTEGER|true|NULL|{} ; c|main|customers|name|VARCHAR|true|the name|{} ; "
+	          "c|main|orders|id|INTEGER|false|NULL|{} ; c|main|orders|customer_id|INTEGER|true|NULL|{} ; "
+	          "c|main|shipments|id|INTEGER|true|NULL|{} ; c|main|shipments|customer_id|INTEGER|true|NULL|{}",
 	      "every column of every table, in order, in one statement: " + Joined(columns));
 	// `secret` is not granted to this role, so it is absent here - which is the whole point: what the
 	// client is told it will receive is what it will receive (spec 026)
 	Check(Joined(columns).find("secret") == string::npos, "and a column the role cannot read is not in it");
+}
+
+//! spec 143: include_schema's object comment, after the protocol's columns, under the same filters
+void TablesAreDescribed(Connection &con) {
+	CatalogFilter filter;
+	filter.has_table_pattern = true;
+	filter.table_pattern = "cust%";
+	auto tables = RunAsRole(con, "analyst", BuildCatalogListing(CatalogListing::DESCRIBED_TABLES, filter));
+	Check(Joined(tables) == "c|main|customers|BASE TABLE|who buys", "the object's comment follows: " + Joined(tables));
 }
 
 void ReferencesAreTheForeignKeys(Connection &con) {
@@ -223,7 +234,8 @@ int main() {
 	Exec(con, "SET GLOBAL acl_allow_anonymous_admin=true");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL CATALOG c");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders PRIMARY KEY (id)");
-	Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.customers AS phys.main.customers");
+	Exec(con, "ACL ADMIN CREATE VIRTUAL TABLE c.customers AS phys.main.customers COMMENT 'who buys'");
+	Exec(con, "COMMENT ON COLUMN phys.main.customers.name IS 'the name'");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL REFERENCE c.orders_customer FROM orders TO customers"
 	          " ON (customer_id = id) CARDINALITY many_to_one");
 	Exec(con, "ACL ADMIN CREATE VIRTUAL REFERENCE c.by_expression FROM orders TO customers"
@@ -272,6 +284,7 @@ int main() {
 		Scenario("listings-under-a-role", [&]() { ListingsAnswerUnderARole(con); });
 		Scenario("filters-narrow", [&]() { FiltersNarrowTheListing(con); });
 		Scenario("columns-in-one-statement", [&]() { ColumnsAreOneStatementForEveryTable(con); });
+		Scenario("tables-described", [&]() { TablesAreDescribed(con); });
 		Scenario("references-are-keys", [&]() { ReferencesAreTheForeignKeys(con); });
 		Scenario("catalog-qualified-and-export-order", [&]() { CatalogQualifiedRefsAndExportOrder(con); });
 		Scenario("not-every-reference-is-a-key", [&]() { WhatCannotBeAKeyIsNotOne(con); });

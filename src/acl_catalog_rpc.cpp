@@ -101,6 +101,7 @@ CatalogQuery BuildCatalogListing(CatalogListing listing, const CatalogFilter &fi
 		return query;
 
 	case CatalogListing::TABLES:
+	case CatalogListing::DESCRIBED_TABLES:
 		AppendCatalogFilter(query, conditions, filter, "table_catalog");
 		if (filter.has_db_schema_pattern) {
 			conditions.push_back("table_schema LIKE " + Bind(query, Value(filter.db_schema_pattern)) + " ESCAPE '\\'");
@@ -115,9 +116,12 @@ CatalogQuery BuildCatalogListing(CatalogListing listing, const CatalogFilter &fi
 			}
 			conditions.push_back("table_type IN (" + StringUtil::Join(placeholders, ", ") + ")");
 		}
-		query.sql = "SELECT table_catalog AS catalog_name, table_schema AS db_schema_name, table_name, table_type"
-		            " FROM information_schema.tables" +
-		            Where(conditions) + " ORDER BY 1, 2, 3";
+		// spec 143: `include_schema`'s rows carry the object's comment after the protocol's columns, for the
+		// schema's metadata (spec 136's unread mark rides in it)
+		query.sql = string("SELECT table_catalog AS catalog_name, table_schema AS db_schema_name, table_name,"
+		                   " table_type") +
+		            (listing == CatalogListing::DESCRIBED_TABLES ? ", \"TABLE_COMMENT\" AS table_comment" : "") +
+		            " FROM information_schema.tables" + Where(conditions) + " ORDER BY 1, 2, 3";
 		return query;
 
 	case CatalogListing::COLUMNS:
@@ -125,18 +129,20 @@ CatalogQuery BuildCatalogListing(CatalogListing listing, const CatalogFilter &fi
 		// one statement. The `table_types` filter is deliberately *not* applied - this listing has no
 		// `table_type`, and a superset is harmless because the rows are matched back to the tables
 		// listing by (catalog, schema, name).
-		AppendCatalogFilter(query, conditions, filter, "table_catalog");
+		AppendCatalogFilter(query, conditions, filter, "database_name");
 		if (filter.has_db_schema_pattern) {
-			conditions.push_back("table_schema LIKE " + Bind(query, Value(filter.db_schema_pattern)) + " ESCAPE '\\'");
+			conditions.push_back("schema_name LIKE " + Bind(query, Value(filter.db_schema_pattern)) + " ESCAPE '\\'");
 		}
 		if (filter.has_table_pattern) {
 			conditions.push_back("table_name LIKE " + Bind(query, Value(filter.table_pattern)) + " ESCAPE '\\'");
 		}
 		// is_nullable rides along for the promised Arrow schema (spec 048): duckdb's converter
-		// cannot say non-nullable, so the door clears the flag itself from this very column
-		query.sql = "SELECT table_catalog, table_schema, table_name, column_name, data_type, is_nullable"
-		            " FROM information_schema.columns" +
-		            Where(conditions) + " ORDER BY 1, 2, 3, ordinal_position";
+		// cannot say non-nullable, so the door clears the flag itself from this very column. Since spec 143 the
+		// columns are duckdb_columns' - the same rows as information_schema.columns, with the comment a field's
+		// REMARKS carries and the tags (information_schema has none)
+		query.sql = "SELECT database_name, schema_name, table_name, column_name, data_type, is_nullable, comment, tags"
+		            " FROM duckdb_columns()" +
+		            Where(conditions) + " ORDER BY 1, 2, 3, column_index";
 		return query;
 	}
 	throw InternalException("acl: unknown catalog listing");

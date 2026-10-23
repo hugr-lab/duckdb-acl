@@ -1929,7 +1929,7 @@ bool PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname,
 		}
 		statements.push_back("UPDATE " + catalog->Tbl("relations") + " SET \"vname\" = " + Lit(new_vname) +
 		                     (new_phys.empty() ? string() : ", \"phys\" = " + Lit(new_phys)) + where(vname));
-		for (auto table : {"relation_types", "object_columns"}) {
+		for (auto table : {"relation_types", "object_columns", "column_comments"}) {
 			statements.push_back("UPDATE " + string(catalog->Tbl(table)) + " SET \"vname\" = " + Lit(new_vname) +
 			                     where(vname));
 		}
@@ -2154,7 +2154,8 @@ int64_t PolicyStore::CatalogRefreshSchemaObjects(const string &vcat, const strin
 			if (parent != path || std::find(names.begin(), names.end(), name) != names.end()) {
 				continue;
 			}
-			for (auto table : {"relations", "relation_columns", "relation_types", "role_object_caps"}) {
+			for (auto table :
+			     {"relations", "relation_columns", "relation_types", "column_comments", "role_object_caps"}) {
 				statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat) +
 				                     " AND \"vname\" = " + Lit(vname));
 			}
@@ -2480,6 +2481,8 @@ void PolicyStore::CatalogDropRelation(const string &vcat, const string &vname) {
 		                     " AND \"vname\" = " + Lit(vname));
 		statements.push_back("DELETE FROM " + catalog->Tbl("relation_types") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname));
+		statements.push_back("DELETE FROM " + catalog->Tbl("column_comments") + " WHERE \"vcat\" = " + Lit(vcat) +
+		                     " AND \"vname\" = " + Lit(vname));
 		statements.push_back("DELETE FROM " + catalog->Tbl("keys") + " WHERE \"vcat\" = " + Lit(vcat) +
 		                     " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = 'relation'");
 		// a function of the same name keeps the grant, because the grant row cannot tell them apart
@@ -2513,17 +2516,75 @@ void PolicyStore::CatalogSetComment(const string &vcat, const string &vname, con
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
 		auto value = comment.empty() ? string("NULL") : Lit(comment);
 		if (!column.empty()) {
-			auto exists = read("SELECT 1 FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
-			                   " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind) +
-			                   " AND \"name\" = " + Lit(column));
-			if (exists->RowCount() == 0) {
+			// spec 143: clearing a comment kept beside a relation needs no source - one whose column the source
+			// dropped, or one a relation stopped showing when it declared its columns (the check's
+			// comment_column_missing) - so it comes first, whatever the relation is now
+			if (comment.empty() && kind == "relation") {
+				auto kept = read("SELECT \"column_name\" FROM " + catalog->Tbl("column_comments") +
+				                 " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
+				ResultRows kept_rows(*kept);
+				for (idx_t i = 0; i < kept_rows.Count(); i++) {
+					auto name = kept_rows.GetValue(0, i).ToString();
+					if (StringUtil::CIEquals(name, column)) {
+						statements.push_back("DELETE FROM " + catalog->Tbl("column_comments") +
+						                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+						                     " AND \"column_name\" = " + Lit(name));
+						return;
+					}
+				}
+			}
+			// a column as the catalog compares names (one ASCII fold), kept in its stored spelling
+			auto exists =
+			    read("SELECT \"name\" FROM " + catalog->Tbl("object_columns") + " WHERE \"vcat\" = " + Lit(vcat) +
+			         " AND \"vname\" = " + Lit(vname) + " AND \"kind\" = " + Lit(kind) + " AND " +
+			         KeyFoldSql("\"name\"") + " = " + KeyFoldSql(Lit(column)));
+			if (exists->RowCount() == 0 && kind == "relation") {
+				// spec 143: a relation over a source that declares no column list (an alias, an RLS-only one) reads
+				// its source's columns live; a column's virtual comment is kept beside it, the column as the source
+				// spells it. A relation that declares its columns keeps theirs in object_columns - and never takes a
+				// comment for a source column its list does not read
+				auto alias = read("SELECT r.\"phys\" FROM " + catalog->Tbl("relations") +
+				                  " r WHERE r.\"vcat\" = " + Lit(vcat) + " AND r.\"vname\" = " + Lit(vname) +
+				                  " AND r.\"form\" IN ('alias', 'subquery') AND coalesce(r.\"phys\", '') <> ''"
+				                  " AND NOT EXISTS (SELECT 1 FROM " +
+				                  catalog->Tbl("relation_columns") +
+				                  " c WHERE c.\"vcat\" = r.\"vcat\" AND c.\"vname\" = r.\"vname\")");
+				if (alias->RowCount() == 1) {
+					auto phys = ResultRows(*alias).GetValue(0, 0).ToString();
+					vector<std::pair<string, string>> probed;
+					string spelled;
+					if (catalog->ProbeSchema("SELECT * FROM " + NamePath::KeyToSql(phys), false, {}, probed)) {
+						for (auto &c : probed) {
+							if (StringUtil::CIEquals(c.first, column)) {
+								spelled = c.first;
+							}
+						}
+					}
+					if (spelled.empty()) {
+						throw BinderException("acl admin: \"%s.%s\" has no column \"%s\" - its source \"%s\" has none "
+						                      "of that name",
+						                      vcat, vname, column, phys);
+					}
+					auto where = " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
+					             " AND \"column_name\" = " + Lit(spelled);
+					statements.push_back("DELETE FROM " + catalog->Tbl("column_comments") + where);
+					if (!comment.empty()) {
+						statements.push_back("INSERT INTO " + catalog->Tbl("column_comments") + " VALUES (" +
+						                     Lit(vcat) + ", " + Lit(vname) + ", " + Lit(spelled) + ", " + Lit(comment) +
+						                     ")");
+					}
+					return;
+				}
+			}
+			if (exists->RowCount() != 1) {
 				throw BinderException("acl admin: \"%s.%s\" has no column \"%s\" (its schema may be unknown - "
 				                      "run acl_refresh_schema)",
 				                      vcat, vname, column);
 			}
+			auto stored = ResultRows(*exists).GetValue(0, 0).ToString();
 			statements.push_back("UPDATE " + catalog->Tbl("object_columns") + " SET \"comment\" = " + value +
 			                     " WHERE \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname) +
-			                     " AND \"kind\" = " + Lit(kind) + " AND \"name\" = " + Lit(column));
+			                     " AND \"kind\" = " + Lit(kind) + " AND \"name\" = " + Lit(stored));
 			return;
 		}
 		if (kind == "schema") {
@@ -2768,7 +2829,7 @@ void PolicyStore::CatalogDropCatalog(const string &vcat, bool cascade) {
 			                      vcat, StringUtil::Join(roles, ", "));
 		}
 		for (auto table : {"relations", "relation_columns", "relation_types", "schemas", "functions", "object_columns",
-		                   "references", "reference_columns", "schema_dropped", "keys"}) {
+		                   "column_comments", "references", "reference_columns", "schema_dropped", "keys"}) {
 			statements.push_back("DELETE FROM " + catalog->Tbl(table) + " WHERE \"vcat\" = " + Lit(vcat));
 		}
 		if (cascade) {

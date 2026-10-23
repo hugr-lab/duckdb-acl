@@ -7,6 +7,7 @@
 
 #include "acl_audit.hpp"
 #include "acl_policy.hpp"
+#include "acl_profile.hpp"
 
 namespace duckdb {
 class SQLStatement;
@@ -71,8 +72,12 @@ struct AuditTrail {
 		//! batch included); empty = none in force
 		string use_catalog;
 		string use_schema;
+		//! spec 143: the origin of each result column, noted before the rewrite (see ResultOrigin)
+		vector<ResultOrigin> origins;
 	};
 	vector<Statement> statements;
+	//! spec 143: note each statement's result origins - a Flight session's batch, the one door that writes them
+	bool origins = false;
 };
 
 //! Rewrite every statement of one ACL batch in place, under one verified principal
