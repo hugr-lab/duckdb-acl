@@ -938,7 +938,8 @@ object + capability + roles in `union_floor`, stamped only when recorded - spec 
 
 **Spec 144 — a listing says what the read returns**: a live alias's columns follow the read's two levels (the catalog
 grant's list, the role's object grant on `alias.table` as a joined `aoc` column - `alias_visible`, only when the
-principal holds such lists, read in C++: `catalog_lists` / `alias_object_lists`), and an object a relation names under
+principal holds such lists, read in C++: `catalog_lists` / `alias_object_lists`; spec 145: of the roles whose caps
+chain admits `select`, else - write-only - of every role), and an object a relation names under
 the alias path is the relation's; a column some list narrows by a path or masks (`path_heads`) is listed through
 `acl_listed_type` - a mask nothing probed typed from its text (a constant's type, a cast's target, else a scalar
 source type or NULL, never a nested one) - and drops when the levels leave nothing of it (no fallback to one role's

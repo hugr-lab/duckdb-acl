@@ -37,7 +37,15 @@ the right columns and names every one of them after the pattern. This spec makes
   catalog, the catalog grant's list and the role's object grant on that object (`role_object_caps`, the object's
   key under the alias) both keep it - `RowPolicy`'s two levels, read the way spec 143's re-review made the listing
   read every list (`ParseColumnList`, a constant per stored list). No list of the principal's names anything: the
-  leg stays as it is (the common case costs nothing).
+  leg stays as it is (the common case costs nothing). Spec 145's rule on this leg: only the roles whose caps chain for
+  the object (object, schema, catalog) admits `select` count - a write-only principal, every role (the columns
+  surface's `gcolumns` fallback; a row whose caps are an explicit `{}` lifts nothing, not even then) - so an
+  insert-only role without a list lifts no reading role's list. Where only the catalog grants' caps decide it (no
+  schema grant on or above a live alias, and no object grant under one, of the principal's states caps), the rows are
+  a constant read in C++ (`alias_readers`, per catalog: `vcat = … AND role IN (…)`); otherwise the object's caps chain
+  is judged per row (`alias_caps_vary`, a window over the catalog's rows - +0.2-0.5 s on the bench below, so only
+  there). Bench (200 sources, a live alias): one table's columns 0.634 s for a role with a
+  catalog list (0.613 s before), the catalog's 1.08 s (1.07 s).
 - **Struct paths and masks in a listed type**: a column some stored list narrows by a path (`addr.city`,
   `items[].price`) or masks is listed through `acl_listed_type` with the roles' lists (`roles_of`, as the projection
   leg already does) - on the relation legs and the alias leg alike; any other column keeps its listed type. Which
@@ -95,9 +103,10 @@ the right columns and names every one of them after the pattern. This spec makes
 
 ## Follow-ups
 
-- Spec 145: a role that may not read (only `insert`, `CAPS '{}'`) lifts another role's read policy - the read path,
-  found by this spec's review; then the listings' rows narrow by `select` too, and a live alias object under an
-  object grant `CAPS '{}'` (still listed) or a `CAPS '{}'` schema grant over a readable object (hidden) follow it.
+- Spec 145 (done): a role that may not read no longer lifts another role's read policy, and the listings - this leg
+  included - narrow by `select`. Left: an object under a live alias whose only grant for the principal is an explicit
+  `{}` is refused on read but still listed (the live alias's documented "nothing under it can be excluded"), and a
+  `CAPS '{}'` schema grant over a readable object hides it - per-object listing exclusion is its own change.
 - The read path (found by the review, its own spec): a catalog grant's struct path fails the read of an object that
   lacks the column (`Column "addr" in REPLACE list not found`) - and such an object stays listed.
 - The grammar loses the quotes of a dotted column head in a path (`"we.ird"."a.b"` stored as `we.ird."a.b"`); the

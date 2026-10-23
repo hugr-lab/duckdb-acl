@@ -7,6 +7,8 @@
 #include "acl_platform.hpp"
 #include "acl_types.hpp"
 
+#include <map>
+
 namespace duckdb {
 namespace acl {
 namespace acl_detail {
@@ -439,6 +441,11 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// spec 144: does any of the principal's roles hold a catalog grant's list, or an object grant's list on an object
 	// no relation names (an object under a live alias)? Only then the alias leg narrows - and only then by that level
 	bool catalog_lists = false, alias_object_lists = false;
+	// spec 145 on the alias leg: the grant rows that read (`select`). Where only the catalog grants' caps decide it,
+	// the rows are a constant (`alias_readers`, empty = every row reads); where an object or schema grant of the
+	// principal's states caps, the caps chain is judged per alias object (`alias_caps_vary`)
+	bool alias_caps_vary = false;
+	string alias_readers;
 	if (!function_mode) {
 		auto lists_sql = "SELECT DISTINCT \"columns\" FROM " + Tbl("role_catalogs") + " WHERE \"role\" IN (" +
 		                 LitList(principal.roles) + ") AND coalesce(trim(\"columns\"), '') <> ''";
@@ -492,6 +499,63 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 		        ") AND coalesce(trim(oc.\"columns\"), '') <> '' AND NOT EXISTS (SELECT 1 FROM " + Tbl("relations") +
 		        " r WHERE r.\"vcat\" = oc.\"vcat\" AND " + KeyFoldSql("r.\"vname\"") + " = " +
 		        KeyFoldSql("oc.\"vname\"") + ") LIMIT 1");
+		if (catalog_lists || alias_object_lists) {
+			// a schema grant on a live alias or above one, or an object grant under one, that states caps
+			string alias_schemas = "SELECT 1 FROM " + Tbl("schemas") + " s WHERE s.\"phys_path\" IS NOT NULL AND ";
+			alias_caps_vary =
+			    has("SELECT 1 FROM " + Tbl("role_schemas") + " sc WHERE sc.\"role\" IN (" + LitList(principal.roles) +
+			        ") AND coalesce(trim(sc.\"caps\"), '') <> '' AND EXISTS (" + alias_schemas +
+			        "s.\"vcat\" = sc.\"vcat\" AND (" + KeyFoldSql("s.\"path\"") + " = " +
+			        KeyFoldSql("sc.\"schema_path\"") + " OR " + KeyPrefixSql("s.\"path\"", "sc.\"schema_path\"") +
+			        ")) LIMIT 1") ||
+			    (HasObjectCaps() &&
+			     has("SELECT 1 FROM " + Tbl("role_object_caps") + " oc WHERE oc.\"role\" IN (" +
+			         LitList(principal.roles) + ") AND coalesce(trim(oc.\"caps\"), '') <> '' AND EXISTS (" +
+			         alias_schemas + "s.\"vcat\" = oc.\"vcat\" AND " + KeyPrefixSql("oc.\"vname\"", "s.\"path\"") +
+			         ") AND NOT EXISTS (SELECT 1 FROM " + Tbl("relations") + " r WHERE r.\"vcat\" = oc.\"vcat\" AND " +
+			         KeyFoldSql("r.\"vname\"") + " = " + KeyFoldSql("oc.\"vname\"") + ") LIMIT 1"));
+		}
+		if ((catalog_lists || alias_object_lists) && !alias_caps_vary) {
+			auto grant_rows = Query(GrantsCte(principal) + "SELECT \"vcat\", \"role\", \"caps\" FROM grants");
+			ResultRows rows(*grant_rows);
+			struct GrantRow {
+				string role;
+				bool reads;
+				bool holds; // any capability: an explicit '{}' lifts nothing, not even a write-only principal's list
+			};
+			std::map<string, vector<GrantRow>> by_catalog;
+			for (idx_t i = 0; i < rows.Count(); i++) {
+				auto caps = EffectiveCaps(rows.GetValue(2, i));
+				by_catalog[rows.GetValue(0, i).ToString()].push_back(
+				    GrantRow {rows.GetValue(1, i).ToString(), caps.count("select") > 0, !caps.empty()});
+			}
+			vector<string> narrowed, admitted;
+			for (auto &catalog : by_catalog) {
+				bool any_reads = false;
+				for (auto &row : catalog.second) {
+					any_reads = any_reads || row.reads;
+				}
+				// the rows that read, or - none does, a write-only principal - every row that holds anything
+				vector<string> roles;
+				for (auto &row : catalog.second) {
+					if (any_reads ? row.reads : row.holds) {
+						roles.push_back(Lit(row.role));
+					}
+				}
+				if (roles.size() == catalog.second.size()) {
+					continue; // every row counts: nothing to narrow
+				}
+				narrowed.push_back(Lit(catalog.first));
+				if (!roles.empty()) {
+					admitted.push_back("(g.\"vcat\" = " + Lit(catalog.first) + " AND g.\"role\" IN (" +
+					                   StringUtil::Join(roles, ", ") + "))");
+				}
+			}
+			if (!narrowed.empty()) {
+				alias_readers = " AND (g.\"vcat\" NOT IN (" + StringUtil::Join(narrowed, ", ") + ")" +
+				                (admitted.empty() ? string() : " OR " + StringUtil::Join(admitted, " OR ")) + ")";
+			}
+		}
 	}
 	auto stated = [&](const string &column_expr) {
 		string cases;
@@ -822,21 +886,40 @@ string CatalogBackend::MetadataListingSql(const Principal &principal, const stri
 	// catalog grant's list and the role's object grant on the object, under the alias - a column the read does not
 	// return is not listed. No list of the principal's names anything: nothing to narrow (the common case is free)
 	string alias_object = "a.path || '.' || " + KeyQuotePartSql("i.\"table_name\"");
-	string alias_object_join = alias_object_lists
+	string alias_object_join = alias_caps_vary || alias_object_lists
 	                               ? " LEFT JOIN " + Tbl("role_object_caps") +
 	                                     " aoc ON aoc.\"role\" = g.\"role\" AND aoc.\"vcat\" = g.\"vcat\" AND " +
 	                                     KeyFoldSql("aoc.\"vname\"") + " = " + KeyFoldSql(alias_object)
 	                               : string();
 	string alias_object_columns = alias_object_lists ? string("aoc.\"columns\"") : string("NULL::VARCHAR");
-	string alias_roles = "(SELECT list(struct_pack(cat := g.\"columns\", obj := " + alias_object_columns +
-	                     ", probed := NULL::VARCHAR) ORDER BY g.\"role\") FROM grants g" + alias_object_join +
-	                     " WHERE g.\"vcat\" = a.vcat)";
+	// spec 145: the levels of the roles that read the object, or - a write-only principal - of every role, as the
+	// columns surface reads them (gcolumns): a constant where the catalog grants decide (alias_readers), else the
+	// object's caps chain (object, schema, catalog) judged per row
+	string alias_grants;
+	if (alias_caps_vary) {
+		string alias_caps = "coalesce(" + string(HasObjectCaps() ? "nullif(trim(aoc.\"caps\"), ''), " : "") +
+		                    SchemaCapsExpr(alias_object, "a.vcat") + ", g.\"caps\")";
+		string alias_reads = CapsAllowSql(alias_caps, "select");
+		// an explicit '{}' holds nothing: it lifts no list, not even a write-only principal's
+		string alias_holds = "(" + alias_caps + " IS NULL OR trim(" + alias_caps + ") = '' OR regexp_matches(" +
+		                     alias_caps + ", ':\\s*true'))";
+		alias_grants = "(SELECT g.\"role\" AS role, g.\"columns\" AS cat, " + alias_object_columns + " AS obj, " +
+		               alias_reads + " AS reads, " + alias_holds + " AS holds, bool_or(" + alias_reads +
+		               ") OVER () AS any_reads FROM grants g" + alias_object_join +
+		               " WHERE g.\"vcat\" = a.vcat) ag WHERE (ag.reads OR (NOT ag.any_reads AND ag.holds))";
+	} else {
+		alias_grants = "(SELECT g.\"role\" AS role, g.\"columns\" AS cat, " + alias_object_columns +
+		               " AS obj FROM grants g" + alias_object_join + " WHERE g.\"vcat\" = a.vcat" + alias_readers +
+		               ") ag WHERE true";
+	}
+	string alias_roles = "(SELECT list(struct_pack(cat := ag.cat, obj := ag.obj, probed := NULL::VARCHAR) ORDER BY "
+	                     "ag.role) FROM " +
+	                     alias_grants + ")";
 	string alias_visible =
 	    !catalog_lists && !alias_object_lists
 	        ? string()
-	        : " AND EXISTS (SELECT 1 FROM grants g" + alias_object_join + " WHERE g.\"vcat\" = a.vcat AND " +
-	              keeps("g.\"columns\"", "i.\"column_name\"") +
-	              (alias_object_lists ? " AND " + keeps(alias_object_columns, "i.\"column_name\"") : string()) + ")";
+	        : " AND EXISTS (SELECT 1 FROM " + alias_grants + " AND " + keeps("ag.cat", "i.\"column_name\"") +
+	              (alias_object_lists ? " AND " + keeps("ag.obj", "i.\"column_name\"") : string()) + ")";
 	// review 144: an object a relation of the catalog names is that relation's, read through it (LookupRelation wins
 	// over an alias) - the alias leg leaves it alone
 	alias_visible += " AND NOT EXISTS (SELECT 1 FROM " + Tbl("relations") + " ar WHERE ar.\"vcat\" = a.vcat AND " +

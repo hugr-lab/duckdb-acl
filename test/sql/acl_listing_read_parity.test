@@ -341,3 +341,106 @@ ACL ROLE 'r_all' SELECT column_name FROM (DESCRIBE SELECT 1 + COLUMNS('amount|id
 ----
 id
 amount
+
+# spec 145 on the alias leg: a role that may not read the object (insert only, no list) lifts no list of a role that
+# reads it - the listing says what the read returns (id, the masked amount), not every column
+statement ok
+ACL ADMIN CREATE ROLE r_writer;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_writer WITH (insert) MAIN;
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1NCIsInJvbGVzIjpbInJfY2F0Iiwicl93cml0ZXIiXX0.CB5P6hikcIWw-jJz8wRfYATpZkNCF8KHllQ16PwvDvookXcZz9XFg4Fel8N9eEidE8zHoMvDm3_1vkoACbg-P-dfyrD_rudu_m0VBQpXZokzxj2GUDfqMDNbzis9O5i20heCKfKhKunH_iuXT8L2-fFUiyeDK3q4UkiBlG9SMsTKFnnO4IOUCVwD2uaSi6I5ae5rcVNPlGDqTXvmJ8JAXU3bY5T0NudSPDrWSTqocVs7gGSrcrf0JE7Ot1M3yVTdlVj1dMzWVKmBH_z1lWklBfIIoMaTelAq91r2l4tFsQgt67uocCTm9w-OiSlh72GVmkteVQOj-xCW-jIdf7UfxQ' SELECT * FROM raw.orders ORDER BY id LIMIT 1;
+----
+1	0
+
+query T
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1NCIsInJvbGVzIjpbInJfY2F0Iiwicl93cml0ZXIiXX0.CB5P6hikcIWw-jJz8wRfYATpZkNCF8KHllQ16PwvDvookXcZz9XFg4Fel8N9eEidE8zHoMvDm3_1vkoACbg-P-dfyrD_rudu_m0VBQpXZokzxj2GUDfqMDNbzis9O5i20heCKfKhKunH_iuXT8L2-fFUiyeDK3q4UkiBlG9SMsTKFnnO4IOUCVwD2uaSi6I5ae5rcVNPlGDqTXvmJ8JAXU3bY5T0NudSPDrWSTqocVs7gGSrcrf0JE7Ot1M3yVTdlVj1dMzWVKmBH_z1lWklBfIIoMaTelAq91r2l4tFsQgt67uocCTm9w-OiSlh72GVmkteVQOj-xCW-jIdf7UfxQ' SELECT list(column_name ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'raw' AND table_name = 'orders';
+----
+[id, amount]
+
+# a write-only principal sees the columns it may write: every role's levels, as the columns surface reads them
+query T
+ACL ROLE 'r_writer' SELECT list(column_name ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'raw' AND table_name = 'orders';
+----
+[id, amount, note, addr]
+
+# ... and where an object grant states the caps (insert only on the alias's object, the catalog grant reading
+# everything), the object's caps chain decides: the role does not read that object - r_cat's list is what is listed
+statement ok
+ACL ADMIN CREATE ROLE r_objw;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_objw WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.raw.orders TO ROLE r_objw WITH (insert);
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1NSIsInJvbGVzIjpbInJfY2F0Iiwicl9vYmp3Il19.HKLvRhMUwtnMT2uu7X8ZMdxbfBMM_Bx22sWZdyTy71fsTEv4RU6xpqJ_PG3ko1SO1CMZpdWZ_HORTRlY97_fs-gt-ZEzZ4vCvzX-Z4uf4gIqkhYXgthdk4gNMvzO79opLrTDOy-Ge-ozB9Mi6_C8AeONILu66pFVzob3TRRKrW6-3YcCPAHD1NG1VYzI1qFmTKGGOdopYT4ij0SPkBFuix2HqH3icLJeI7yq5LLEusw3t9SGZxe_-s5BFc_4jaFpfmZ2qGcQvV4XIRl2s5PL-FNoYwWrjGVmvnQd-JMU9a1teX2X04RrFieQjPLezcedwB-0xCeNXFhfjq4GREm1yA' SELECT * FROM raw.orders ORDER BY id LIMIT 1;
+----
+1	0
+
+query T
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1NSIsInJvbGVzIjpbInJfY2F0Iiwicl9vYmp3Il19.HKLvRhMUwtnMT2uu7X8ZMdxbfBMM_Bx22sWZdyTy71fsTEv4RU6xpqJ_PG3ko1SO1CMZpdWZ_HORTRlY97_fs-gt-ZEzZ4vCvzX-Z4uf4gIqkhYXgthdk4gNMvzO79opLrTDOy-Ge-ozB9Mi6_C8AeONILu66pFVzob3TRRKrW6-3YcCPAHD1NG1VYzI1qFmTKGGOdopYT4ij0SPkBFuix2HqH3icLJeI7yq5LLEusw3t9SGZxe_-s5BFc_4jaFpfmZ2qGcQvV4XIRl2s5PL-FNoYwWrjGVmvnQd-JMU9a1teX2X04RrFieQjPLezcedwB-0xCeNXFhfjq4GREm1yA' SELECT list(column_name ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'raw' AND table_name = 'orders';
+----
+[id, amount]
+
+# a write-only principal's list: an explicit '{}' beside it lifts nothing - as on a relation
+statement ok
+ACL ADMIN CREATE ROLE r_insl;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_insl WITH (insert) MAIN COLUMNS (id);
+
+statement ok
+ACL ADMIN CREATE ROLE r_none;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_none WITH () MAIN;
+
+query T
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1NiIsInJvbGVzIjpbInJfaW5zbCIsInJfbm9uZSJdfQ.RKXwSnOt7KAAgru9YInIZO6yq6YgaIukuhNzyiiVYUDWgbxV9eUWrevgCnLCPuJJK0ZYY2KZpvdWB_7P1pdKFwY_O1YtVfP59GW4cTQVEG7nOT2p61Jv7DeQAc8N5jM3JyiJMGAkWG_M5-eNNp2jFFldX8rPckD3X5DcPSH8FhXpi4-4II3u0_EgugLC-Ed-SJ4cgPf9JFpAtYR6EGXtGikq0aLe-9unUOPdRApicpg2l5O5UzmLlN7XrtRtrjbgTZG97ljBoUT6GYpacDSm4ISlJ427bPalGtACrvNhGn1P_2VmiA1Sz5NDKvVgZWi5zvrkXrgkez7javJSe_LHPw' SELECT list(column_name ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'raw' AND table_name = 'orders';
+----
+[id]
+
+# a schema grant on the live alias that may only insert: the role does not read the alias's objects (the caps chain
+# judged per object)
+statement ok
+ACL ADMIN CREATE ROLE r_schw;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE r_schw WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.raw TO ROLE r_schw WITH (insert);
+
+query II
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1NyIsInJvbGVzIjpbInJfY2F0Iiwicl9zY2h3Il19.W8wC_6WSmpxCFKEHUdA_meCaigy1_DisNSKP5Es3JZ9kdvJI-L336Rrmj6QYhmJhUAIJ7_H9YWIh5m69tanEuz2gaeX3oMkBlWJ7Ygr6IO2sVHdp503XRBo2N2TT2dtni0zTO3dNLFM-_HLpD1Evc98THoyZASC6t8qI0J8fuv7-UjErzMcnWL0YielZon1QHHpmg4CUDIFHUxxGYc--XHjYwDMBHjtTz8rOXeIihNjwGjZb-7KE456kyG2eq-626dl2XVfyaFXPs7fChOU952nSDfRPK9n4iFm9bD1Lt_osVTxKZmuJqKq5w14R74vrFmNZeBzg4XjA43e3x1CJOw' SELECT * FROM raw.orders ORDER BY id LIMIT 1;
+----
+1	0
+
+query T
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1NyIsInJvbGVzIjpbInJfY2F0Iiwicl9zY2h3Il19.W8wC_6WSmpxCFKEHUdA_meCaigy1_DisNSKP5Es3JZ9kdvJI-L336Rrmj6QYhmJhUAIJ7_H9YWIh5m69tanEuz2gaeX3oMkBlWJ7Ygr6IO2sVHdp503XRBo2N2TT2dtni0zTO3dNLFM-_HLpD1Evc98THoyZASC6t8qI0J8fuv7-UjErzMcnWL0YielZon1QHHpmg4CUDIFHUxxGYc--XHjYwDMBHjtTz8rOXeIihNjwGjZb-7KE456kyG2eq-626dl2XVfyaFXPs7fChOU952nSDfRPK9n4iFm9bD1Lt_osVTxKZmuJqKq5w14R74vrFmNZeBzg4XjA43e3x1CJOw' SELECT list(column_name ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'raw' AND table_name = 'orders';
+----
+[id, amount]
+
+# two catalogs: the one where a role reads and another may only write is narrowed, the other is left as it is
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG d;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA d.raw AS phys.main;
+
+statement ok
+ACL ADMIN CREATE ROLE r_d;
+
+statement ok
+ACL ADMIN GRANT CATALOG d TO ROLE r_d WITH (select) COLUMNS (id, note);
+
+query TT
+ACL TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9ycyIsImF1ZCI6ImFwaTovL2FjbC10ZXN0IiwiZXhwIjo0MTAyNDQ0ODAwLCJzdWIiOiJ1OCIsInJvbGVzIjpbInJfY2F0Iiwicl93cml0ZXIiLCJyX2QiXX0.A-YeoKBQAiKaEi43SXOmHxHIcggwQWk34yNkgKcENcXnQtlkYSzlFlnweeinJYpeG07lNFmoco0ug9IIQBrLGQyeB4TyrHPydj5WWIBtBiPhxHGFR6Z3E9dWNr7dFSFtK-O3nFHDAriCa6daedJcvWTZRmj3ynEX132f8QNtwfvI9Naf6NWbex7_LjTsbQPX9nhFdQiT_oNa_QoYVUBiWFdVxgGVZY8MocjXy-3j49QcFibWwjaD6ksRYt8O2AU-i65k698d6VbogHHQZiZ0Cvyx4EPxQokYiq6aJo1UT_mMN9xRMpqZHkaTLWV-_tJXvso5msED8FO5hXj_9Erjcg' SELECT table_catalog, list(column_name ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'raw' AND table_name = 'orders' GROUP BY 1 ORDER BY 1;
+----
+c	[id, amount]
+d	[id, note]
