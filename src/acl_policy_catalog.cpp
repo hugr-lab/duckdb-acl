@@ -22,6 +22,7 @@
 #include "acl_schema_sql.hpp"
 #include "acl_token.hpp"
 #include "duckdb/common/error_data.hpp"
+#include "duckdb/parser/parser.hpp"
 
 namespace duckdb {
 namespace acl {
@@ -629,6 +630,8 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	                      Tbl("relation_types") + " t WHERE t.\"vcat\" = r.\"vcat\" AND t.\"vname\" = r.\"vname\")") +
 	           // spec 107: where the name resolved - the object's canonical virtual name, last so no index moves
 	           ", r.\"vcat\" AS cvcat, r.\"vname\" AS cvname"
+	           // spec 146: whose row it is - after them, so no index moves
+	           ", g.\"role\" AS grole"
 	           " FROM " +
 	           RelationsSource(principal, names) + " r JOIN grants g ON g.\"vcat\" = r.\"vcat\"" + oc_join +
 	           " WHERE (" + qualified_cond + ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND " +
@@ -645,10 +648,10 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	{
 		// spec 116: the winning reading names ONE object - two that match it equally (a driver's
 		// `Orders` and `orders`, a catalog that predates the one-spelling rule) are refused, never merged
-		auto ncols = result->ColumnCount();
+		auto ncols = result->ColumnCount(); // cvcat, cvname, then spec 146's grole
 		auto object_of = [&](idx_t row) {
-			return result_rows.GetValue(ncols - 2, row).ToString() + "\x1f" +
-			       result_rows.GetValue(ncols - 1, row).ToString();
+			return result_rows.GetValue(ncols - 3, row).ToString() + "\x1f" +
+			       result_rows.GetValue(ncols - 2, row).ToString();
 		};
 		auto first = object_of(0);
 		for (idx_t row = 1; row < result->RowCount(); row++) {
@@ -676,9 +679,9 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	out.subquery_form = form != "alias";
 	out.writable = form == "alias"; // a real table stays writable, however a grant narrows it
 	{
-		auto ncols = result->ColumnCount();
-		auto cvcat = result->Collection().GetValue(ncols - 2, 0);
-		auto cvname = result->Collection().GetValue(ncols - 1, 0);
+		auto ncols = result->ColumnCount(); // cvcat, cvname, then spec 146's grole
+		auto cvcat = result->Collection().GetValue(ncols - 3, 0);
+		auto cvname = result->Collection().GetValue(ncols - 2, 0);
 		if (!cvcat.IsNull() && !cvname.IsNull()) {
 			out.canonical = cvcat.ToString() + "." + cvname.ToString();
 		}
@@ -713,6 +716,8 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 	// policies of their grant chains (spec 011) - spec 145: of the rows that hold the capability exercised, so a role
 	// that may not do it (an ingest role's `insert` only, an object grant's '{}') lifts no other role's policy
 	GrantUnion grants;
+	vector<std::pair<string, GrantPolicy>> united; // spec 146: each role's own, for RoleUnionWidens
+	auto role_column = result->ColumnCount() - 1;
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		if (result_rows.GetValue(11, row).GetValue<int64_t>() != prio) {
 			break; // ordered by prio; the losing interpretation starts here
@@ -722,11 +727,19 @@ bool CatalogBackend::LookupRelation(const Principal &principal, const string &vn
 			out.caps.insert(cap);
 		}
 		if (caps.count(capability)) {
-			grants.Add(RowPolicy(result_rows, row, 5));
+			auto row_policy = RowPolicy(result_rows, row, 5);
+			grants.Add(row_policy);
+			united.emplace_back(result_rows.GetValue(role_column, row).ToString(), std::move(row_policy));
 			out.capability_rows_read = out.capability_rows_read && caps.count("select");
 		}
 	}
+	// spec 146: the object's columns where it declares them (type facts are only the columns exposed differently)
+	vector<string> known;
+	for (auto &column : object_columns) {
+		known.push_back(column.first);
+	}
 	ApplyGrantPolicy(vname, grants, object_columns, out);
+	NoteUnionWidens(out.canonical.empty() ? vname : out.canonical, capability, united, known);
 	return true;
 }
 
@@ -998,7 +1011,7 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 	           ","
 	           " CASE WHEN " +
 	           qualified_cond +
-	           " THEN 1 ELSE 2 END AS prio"
+	           " THEN 1 ELSE 2 END AS prio, g.\"role\" AS grole" // spec 146: whose row it is
 	           " FROM " +
 	           AliasesSource(principal) + " sa JOIN grants g ON g.\"vcat\" = sa.\"vcat\"" + oc_join + " WHERE (" +
 	           qualified_cond + ") OR (g.\"is_main\" = true AND (SELECT unique_main FROM main_ok) AND " +
@@ -1044,6 +1057,7 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 	out.canonical = NamePath::JoinKeys(vcat, NamePath::JoinKeys(alias_path, tail));
 	// rows of the same winning alias differ only by role: union their caps and grant policies
 	GrantUnion grants;
+	vector<std::pair<string, GrantPolicy>> united; // spec 146: each role's own, for RoleUnionWidens
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		if (result_rows.GetValue(10, row).GetValue<int64_t>() != prio ||
 		    result_rows.GetValue(0, row).ToString() != vcat || result_rows.GetValue(1, row).ToString() != alias_path) {
@@ -1054,13 +1068,54 @@ bool CatalogBackend::LookupSchemaAlias(const Principal &principal, const string 
 			out.caps.insert(cap);
 		}
 		if (caps.count(capability)) { // spec 145: see LookupRelation
-			grants.Add(RowPolicy(result_rows, row, 4));
+			auto row_policy = RowPolicy(result_rows, row, 4);
+			grants.Add(row_policy);
+			united.emplace_back(result_rows.GetValue(11, row).ToString(), std::move(row_policy));
 			out.capability_rows_read = out.capability_rows_read && caps.count("select");
 		}
 	}
 	vector<std::pair<string, string>> no_columns;
 	ApplyGrantPolicy(vname, grants, no_columns, out);
+	// the alias is the object: a tail is the client's text, and the alias's policy is one for every tail
+	NoteUnionWidens(NamePath::JoinKeys(vcat, alias_path), capability, united, {});
 	return true;
+}
+
+void CatalogBackend::NoteUnionWidens(const string &object, const string &capability,
+                                     const vector<std::pair<string, GrantPolicy>> &united,
+                                     const vector<string> &known) {
+	if (!on_union_widens || united.size() < 2) {
+		return;
+	}
+	auto roles = united; // by name: the pairs reported do not depend on the rows' order
+	std::sort(roles.begin(), roles.end(),
+	          [](const std::pair<string, GrantPolicy> &a, const std::pair<string, GrantPolicy> &b) {
+		          return a.first < b.first;
+	          });
+	auto pairs = RoleUnionWidens(roles, known, UnionWidening::REPORTED);
+	if (pairs.empty()) {
+		return; // as written: telling two spellings of one filter apart finds no fewer pairs, never more
+	}
+	for (auto &role : roles) {
+		// one filter written two ways (`id=2`, `id = 2`) is one set of rows: compared as the parser prints it
+		auto predicate = role.second.Predicate();
+		if (predicate.empty()) {
+			continue;
+		}
+		try {
+			auto parsed = Parser(ParserOptions::Builtin()).ParseExpressionList(predicate);
+			if (parsed.size() == 1) {
+				predicate = parsed[0]->ToString();
+			}
+		} catch (std::exception &) {
+			// compared as written
+		}
+		role.second.predicates = {predicate};
+	}
+	pairs = RoleUnionWidens(roles, known, UnionWidening::REPORTED);
+	if (!pairs.empty()) {
+		on_union_widens(object, capability, pairs);
+	}
 }
 
 bool CatalogBackend::ResolveFunction(const Principal &principal, const string &vname, bool table_kind,
@@ -1094,7 +1149,7 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 	           ","
 	           " CASE WHEN " +
 	           qualified_cond +
-	           " THEN 1 ELSE 2 END AS prio, f.\"vname\" AS fvname"
+	           " THEN 1 ELSE 2 END AS prio, f.\"vname\" AS fvname, g.\"role\" AS grole" // spec 146: whose row it is
 	           " FROM " +
 	           FunctionsSource(principal, names) + " f JOIN grants g ON g.\"vcat\" = f.\"vcat\"" + oc_join +
 	           " WHERE f.\"kind\" = '" + kind + "' AND ((" + qualified_cond +
@@ -1129,6 +1184,7 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 		// rows of the same winning function differ only by role: union their caps (spec 012 - a
 		// call is a read, so it needs one) and their grant policies
 		GrantUnion grants;
+		vector<std::pair<string, GrantPolicy>> united; // spec 146: each role's own, for RoleUnionWidens
 		for (idx_t row = 0; row < result->RowCount(); row++) {
 			if (result_rows.GetValue(11, row).GetValue<int64_t>() != prio ||
 			    result_rows.GetValue(0, row).ToString() != vcat) {
@@ -1140,10 +1196,13 @@ bool CatalogBackend::ResolveFunction(const Principal &principal, const string &v
 			}
 			// spec 145: a call is a read - only a role that may call it narrows or widens what it returns
 			if (caps.count("select")) {
-				grants.Add(RowPolicy(result_rows, row, 5));
+				auto row_policy = RowPolicy(result_rows, row, 5);
+				grants.Add(row_policy);
+				united.emplace_back(result_rows.GetValue(13, row).ToString(), std::move(row_policy));
 			}
 		}
 		ApplyFunctionGrantPolicy(vname, table_kind, grants, policy);
+		NoteUnionWidens(NamePath::JoinKeys(vcat, fvname), "select", united, {});
 	}
 	lock_guard<mutex> guard(lock);
 	ClearIfOversized(functions);
@@ -1990,6 +2049,10 @@ void PolicyStore::EnableCatalog(DatabaseInstance &db, const string &db_name, con
 	backend->on_policy = [this](const string &detail, const string &reason) {
 		AuditPolicy(detail, reason);
 	};
+	backend->on_union_widens = [this](const string &object, const string &capability,
+	                                  const vector<UnionWidening> &pairs) {
+		AuditRoleUnionWidens(object, capability, pairs);
+	};
 	if (init) {
 		backend->InitSchema();
 	}
@@ -2005,6 +2068,10 @@ void PolicyStore::EnableFunctions(DatabaseInstance &db, const string &slots_json
 	auto backend = make_uniq<CatalogBackend>(db, slots);
 	backend->on_policy = [this](const string &detail, const string &reason) {
 		AuditPolicy(detail, reason);
+	};
+	backend->on_union_widens = [this](const string &object, const string &capability,
+	                                  const vector<UnionWidening> &pairs) {
+		AuditRoleUnionWidens(object, capability, pairs);
 	};
 	// explicit slot map, fail closed at enable (design decision): the core slots are required and
 	// every named function must actually be registered

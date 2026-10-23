@@ -449,7 +449,18 @@ means none"; "an *object* grant that states nothing inherits the catalog grant's
 refinement never widens by omission"; the capabilities outside the default "are explicit-only and
 never inherited". A schema grant "carries **capabilities only** - no RLS, no column list" (spec 015).
 Capabilities and predicates union across a principal's roles; column lists union in the object's
-order (specs 026/038). A capability's policy is the union of the roles that hold it (spec 145): a
+order (specs 026/038). **The union is per object, not per row** (spec 146): rows are OR-ed and the column lists united
+independently, so two roles that narrow one object differently unite into cells neither reads. A role reading the
+`acme` rows without `salary` and a role reading the `globex` rows with it give a principal holding both the `acme`
+salaries. Give the roles one person may hold the same column list on an object (or narrow its rows alike). When the
+node resolves such a union - a table, a view, a live schema alias, a table function - it records a `policy` event
+`role_union_widens`: the object, and each pair of roles with the items one lists on the other's rows (up to 16
+pairs; never a value or a predicate), counted as `acl.policy.role_union_widens`. It judges what the policy states: a third role that reads
+those rows whole, or the same filter written twice, is no widening. A filter that contains another (a manager's rows
+holding an employee's) still reports, hence "may". So does an item that a catalog-wide list names but an object
+without a declared column list lacks, since the node does not look at the source on a query's path. A union is judged
+when it is resolved - once per role set, name as written and capability until the policy changes; one resolved while
+auditing is `off` is counted, not recorded. A capability's policy is the union of the roles that hold it (spec 145): a
 role that may not read the object contributes nothing to what is read (a function call included), nor
 a role that may not update it to what an update - or an upsert - may touch; a statement's own
 conditions and the `RETURNING` of a row already there read under the read policy.

@@ -16,6 +16,7 @@
 #include "duckdb/main/database.hpp"
 #include "yyjson.hpp"
 
+#include <algorithm>
 #include <set>
 
 #include <atomic>
@@ -205,6 +206,168 @@ struct GrantUnion {
 	}
 };
 
+//! spec 146: the union is per object - rows OR-ed, column lists united independently (spec 011) - so two roles that
+//! narrow one object differently unite into cells neither reads: B's columns on A's rows. Every such pair, with the
+//! items it adds - names as the policy lists them, never a value or a predicate. A's rows are read whole by A and by
+//! every role whose filter is A's or none; an item of B is theirs when one lists it or a column / path above it
+//! (spec 102) plainly with nothing masked at or under it, or masks that very item too (two masks of one item are
+//! refused). B without a filter, or with A's, adds nothing B does not read itself. `known` = the object's columns
+//! (empty: unknown) - an item naming none of them is no cell. Predicates compare as given: the caller normalizes.
+//! One pair per set of rows (a filter, named by its first role) and B; at most `max_pairs` + 1 (more = there are more).
+inline vector<UnionWidening> RoleUnionWidens(const vector<std::pair<string, GrantPolicy>> &roles,
+                                             const vector<string> &known, idx_t max_pairs) {
+	struct Seen {
+		bool all = false;                      // no list: every column
+		vector<std::pair<string, bool>> items; // the list, trimmed: name, masked
+		case_insensitive_set_t plain;          // listed as they are
+		case_insensitive_set_t masked;         // listed masked
+		case_insensitive_set_t above_masked;   // a strict prefix of a masked item
+	};
+	auto trimmed = [](const string &text) {
+		auto name = text;
+		StringUtil::Trim(name);
+		return name;
+	};
+	auto prefixes = [](const string &name) {
+		vector<string> out;
+		for (idx_t i = 1; i < name.size(); i++) {
+			if (name[i] == '.' || name[i] == '[') {
+				out.push_back(name.substr(0, i));
+			}
+		}
+		return out;
+	};
+	case_insensitive_set_t known_set(known.begin(), known.end());
+	auto head_known = [&](const string &name) {
+		auto cut = name.find_first_of(".[");
+		return known_set.empty() || known_set.count(cut == string::npos ? name : name.substr(0, cut)) > 0;
+	};
+	vector<Seen> seen(roles.size());
+	vector<string> predicates;
+	for (idx_t i = 0; i < roles.size(); i++) {
+		auto &policy = roles[i].second;
+		predicates.push_back(policy.Predicate());
+		seen[i].all = !policy.restricts;
+		for (auto &item : policy.columns) {
+			auto name = trimmed(item.first);
+			seen[i].items.emplace_back(name, !item.second.empty());
+			if (item.second.empty()) {
+				seen[i].plain.insert(name);
+				continue;
+			}
+			seen[i].masked.insert(name);
+			for (auto &prefix : prefixes(name)) {
+				seen[i].above_masked.insert(prefix);
+			}
+		}
+	}
+	auto covers = [&](const Seen &c, const string &name, bool masked_item) {
+		if (c.all) {
+			return true;
+		}
+		bool plain = false;
+		for (auto &prefix : prefixes(name)) {
+			if (c.masked.count(prefix)) {
+				return false; // masked above: what the union shows of it is not what c reads
+			}
+			plain = plain || c.plain.count(prefix) > 0;
+		}
+		if (c.masked.count(name)) {
+			return masked_item;
+		}
+		return (plain || c.plain.count(name) > 0) && !c.above_masked.count(name);
+	};
+	// A's rows are read whole by the roles without a filter (the same for every A: their answer per item is kept) and
+	// by those with A's filter
+	vector<idx_t> open_readers;
+	for (idx_t c = 0; c < roles.size(); c++) {
+		if (predicates[c].empty()) {
+			if (seen[c].all) {
+				return {}; // one role reads every cell of the object
+			}
+			open_readers.push_back(c);
+		}
+	}
+	case_insensitive_map_t<bool> open_covered[2]; // item -> some open reader covers it, by mask kind
+	auto covered_open = [&](const string &name, bool masked_item) {
+		auto &memo = open_covered[masked_item ? 1 : 0];
+		auto entry = memo.find(name);
+		if (entry != memo.end()) {
+			return entry->second;
+		}
+		bool answer = false;
+		for (auto c : open_readers) {
+			if (covers(seen[c], name, masked_item)) {
+				answer = true;
+				break;
+			}
+		}
+		memo[name] = answer;
+		return answer;
+	};
+	// a set of rows per filter: the first role holding it (by the caller's order) names it, the open readers' rows
+	// are every row
+	vector<UnionWidening> out;
+	vector<string> classes;
+	for (idx_t a = 0; a < roles.size(); a++) {
+		if (std::find(classes.begin(), classes.end(), predicates[a]) != classes.end()) {
+			continue;
+		}
+		classes.push_back(predicates[a]);
+		vector<idx_t> readers; // the roles with A's filter (with none: the open readers again)
+		bool all = false;
+		for (idx_t c = 0; c < roles.size(); c++) {
+			if (predicates[c] == predicates[a]) {
+				readers.push_back(c);
+				all = all || seen[c].all;
+			}
+		}
+		if (all) {
+			continue; // every column of A's rows is read
+		}
+		auto covered = [&](const string &name, bool masked_item) {
+			if (covered_open(name, masked_item)) {
+				return true;
+			}
+			for (auto c : readers) {
+				if (covers(seen[c], name, masked_item)) {
+					return true;
+				}
+			}
+			return false;
+		};
+		for (idx_t b = 0; b < roles.size(); b++) {
+			if (predicates[b].empty() || predicates[b] == predicates[a]) {
+				continue;
+			}
+			vector<string> extra;
+			if (seen[b].all) {
+				for (auto &name : known) {
+					if (!covered(name, false)) {
+						extra.push_back(name);
+					}
+				}
+				if (known.empty()) {
+					extra.push_back("*");
+				}
+			} else {
+				for (auto &item : seen[b].items) {
+					if (head_known(item.first) && !covered(item.first, item.second)) {
+						extra.push_back(item.first);
+					}
+				}
+			}
+			if (!extra.empty()) {
+				out.push_back(UnionWidening {roles[a].first, roles[b].first, std::move(extra)});
+				if (out.size() > max_pairs) {
+					return out; // enough to name: the caller says there are more
+				}
+			}
+		}
+	}
+	return out;
+}
+
 //! Parse a caps JSON object ({"select": true, "insert": false, ...}) into the set of enabled
 //! capability names, with duckdb's bundled yyjson. Anything but a flat object of booleans is refused.
 inline case_insensitive_set_t ParseCaps(const string &json) {
@@ -333,6 +496,10 @@ struct CatalogBackend {
 	//! when a write commits, `source_error` (with the reason) when the source did not answer. Set by
 	//! the store that owns the backend; unset = nobody listens.
 	std::function<void(const string &detail, const string &reason)> on_policy;
+	//! spec 146: the principal's roles united into cells none of them reads (RoleUnionWidens) - the object, the
+	//! capability and the pairs, as an audit event the operator watches
+	std::function<void(const string &object, const string &capability, const vector<UnionWidening> &pairs)>
+	    on_union_widens;
 	// result caches, invalidated on a version bump; maps are size-capped by ClearIfOversized().
 	// keys carry the principal's sorted role set: the effective policy depends on it.
 	static constexpr idx_t CACHE_CAPACITY = 4096;
@@ -514,6 +681,10 @@ struct CatalogBackend {
 	//! The longest granted schema-alias prefix, picked by the query (ORDER BY prefix length);
 	//! the matched prefix RENAMEs into the physical schema, the binder validates existence.
 	bool LookupSchemaAlias(const Principal &principal, const string &vname, TablePolicy &out, const string &capability);
+	//! spec 146: report a union of roles that widens (RoleUnionWidens) through `on_union_widens` - the roles by name,
+	//! their predicates normalized (parsed and printed); `known` = the object's columns, empty when unknown
+	void NoteUnionWidens(const string &object, const string &capability,
+	                     const vector<std::pair<string, GrantPolicy>> &united, const vector<string> &known);
 
 	bool ResolveFunction(const Principal &principal, const string &vname, bool table_kind, TablePolicy &out);
 

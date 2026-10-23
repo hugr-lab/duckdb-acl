@@ -335,6 +335,15 @@ struct ResourceLimits {
 static constexpr const char *RESOURCE_LIMIT_NAMES[] = {"window_start",    "window_max",     "batch_bytes",
                                                        "max_result_rows", "queue_priority", "max_sessions"};
 
+//! spec 146: one pair of a principal's roles whose union shows cells neither reads - B's columns on A's rows
+struct UnionWidening {
+	string role_a;          // whose rows (the first role holding that filter)
+	string role_b;          // whose columns
+	vector<string> columns; // items of B as listed; `*` = beyond the lists read on A's rows
+	//! how many pairs an event names; past it, "and more" (the reason is cut at 512 bytes anyway)
+	static constexpr idx_t REPORTED = 16;
+};
+
 struct PolicyStore {
 	mutex lock;
 	// role -> virtual name -> policy (tables and views share one namespace)
@@ -938,6 +947,10 @@ struct PolicyStore {
 	//! catalog), seconds since the last successful version check (-1 = never), and per issuer the
 	//! seconds since its keys were last read successfully.
 	int64_t PolicyVersion();
+	//! spec 146: a principal's roles united into cells none of them reads - one `policy` event `role_union_widens`
+	//! per object, capability and set of roles a minute (the object, the pairs, their items; never a value or a
+	//! predicate), counted `acl.policy.role_union_widens{capability}` at every resolution that computes it
+	void AuditRoleUnionWidens(const string &object, const string &capability, const vector<UnionWidening> &pairs);
 	int64_t PolicyStalenessSeconds();
 	vector<std::pair<string, int64_t>> JwksAges();
 	//! The principal behind a handle, or false with `reason` saying which of "unknown" / "expired" it
@@ -1029,6 +1042,8 @@ struct PolicyStore {
 	void AuditSourceUnreadable(const string &database, const string &error_class);
 	mutex unreadable_floor_lock;
 	unordered_map<string, int64_t> unreadable_floor; // `<db lowered>\x1f<class>` -> last recorded, s
+	mutex union_floor_lock;
+	unordered_map<string, int64_t> union_floor; // spec 146: `<object lowered>\x1f<capability>\x1f<roles>` -> s
 	//! The store of an instance, for code that holds a connection and nothing else (the embedded
 	//! quack server's drain thread): registered in the object cache at load. Null before load.
 	static shared_ptr<PolicyStore> Of(DatabaseInstance &db);
