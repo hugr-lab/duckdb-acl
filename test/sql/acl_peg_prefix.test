@@ -1,0 +1,245 @@
+# name: test/sql/acl_peg_prefix.test
+# description: spec 150, stage 1 - the role prefix parsed by duckdb's parser with our rule
+#   (`acl_peg_prefix`): the same principal, markers, batch and refusals as the scanner, and a bare
+#   statement parses as before
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.sales(region VARCHAR, quarter VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.sales VALUES ('east', 'q1', 10), ('east', 'q2', 20), ('west', 'q1', 5), ('hidden', 'q9', 99);
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET GLOBAL acl_audit_level='decisions';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.sales AS phys.main.sales;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.sales TO ROLE analyst WITH (select) RLS (region <> 'hidden');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.lake FROM phys.lake;
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.lake TO ROLE analyst WITH (select, insert, create);
+
+statement ok
+ACL ADMIN GRANT FUNCTION current_query TO ROLE analyst;
+
+statement ok
+SET GLOBAL acl_peg_prefix = true;
+
+# --- a bare statement parses as before: `acl` stays a name ---------------------------------------
+
+statement ok
+CREATE TABLE acl AS SELECT 1 AS acl;
+
+query I
+SELECT acl FROM acl;
+----
+1
+
+# --- the prefix, its value either quoted way, the markers ----------------------------------------
+
+query II
+ACL ROLE "analyst" SELECT region, sum(amount) FROM sales GROUP BY region ORDER BY region;
+----
+east	30
+west	5
+
+query I
+ACL ROLE 'analyst' SELECT count(*) FROM sales;
+----
+3
+
+query I
+ACL ROLE "analyst" TRACE 'peg-trace-1' PARENT '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01' SELECT count(*) FROM sales;
+----
+3
+
+statement ok
+SELECT acl_audit_flush();
+
+query II
+SELECT correlation_id, traceparent FROM acl_audit_events() WHERE kind = 'statement' AND verdict = 'allowed' ORDER BY seq DESC LIMIT 1;
+----
+peg-trace-1	00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
+
+statement error
+ACL ROLE "analyst" TRACE 'a' TRACE 'b' SELECT 1;
+----
+may be written once
+
+# a comment between the prefix and the statement is a tool's, and reads the same either way
+query I
+ACL ROLE "analyst" /* a tool's note */ SELECT count(*) FROM sales;
+----
+3
+
+query I
+ACL ROLE "analyst" TRACE 'peg-trace-3' -- a line comment
+SELECT count(*) FROM sales;
+----
+3
+
+# a comment inside the prefix makes the two readers read two prefixes: refused as a parse, never an internal error
+statement error
+ACL ROLE "analyst" /* c */ TRACE 'x' SELECT count(*) FROM sales;
+----
+reads two ways
+
+statement error
+ACL ROLE "analyst" /**/ TRACE '' SELECT count(*) FROM sales;
+----
+reads two ways
+
+statement error
+ACL ROLE "analyst" TRACE 'a' /* c */ PARENT 'p' SELECT count(*) FROM sales;
+----
+reads two ways
+
+# a string the tokenizer joins across a line break: the rule reads `analystx`, the scanner `analyst` - refused
+statement error
+ACL ROLE 'analyst'
+'x' SELECT 1;
+----
+reads two ways
+
+# a prefix with no statement of its own, and a separator right after it, read as the scanner reads them
+statement ok
+ACL ROLE "analyst";
+
+query I
+ACL ROLE "analyst" ; SELECT count(*) FROM sales;
+----
+3
+
+# a marker's value quoted either way, as the scanner reads it
+query I
+ACL ROLE "analyst" TRACE "peg-trace-2" SELECT count(*) FROM sales;
+----
+3
+
+# --- the batch: every statement under the one prefix, every one decided before any runs ---------
+
+query I
+ACL ROLE "analyst" SELECT 1; SELECT count(*) FROM sales;
+----
+1
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM sales; SELECT * FROM phys.main.sales;
+----
+no access to object
+
+statement error
+ACL ROLE "analyst" SELECT 1; ACL ROLE "analyst" SELECT 2;
+----
+one ACL prefix per batch
+
+statement error
+ACL ROLE "analyst" SELECT * FROM phys.main.sales;
+----
+no access to object
+
+# a role prefix is the gateway's word: an unknown role is a principal with no grant, reading nothing
+statement error
+ACL ROLE "nobody" SELECT count(*) FROM sales;
+----
+no access to object
+
+# --- the statement's own parts stay inside the prefix: an implicit PIVOT's enum step is confined --
+
+query III
+ACL ROLE "analyst" PIVOT sales ON quarter USING sum(amount) GROUP BY region ORDER BY region;
+----
+east	10	20
+west	5	NULL
+
+# --- a statement's text is its own, never the prefix: what it runs as, and what a DDL creates -----
+
+query I
+ACL ROLE "analyst" /* a tool's note */ SELECT current_query();
+----
+SELECT current_query();
+
+query I
+ACL ROLE "analyst" TRACE 'peg-trace-4' SELECT 1; SELECT current_query();
+----
+1
+
+statement ok
+ACL ROLE "analyst" CREATE TABLE lake.landing(id INTEGER);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'landing';
+----
+1
+
+# a LINEAGE marker - even an empty one - leaves the batch to the scanner in this stage
+query I
+ACL ROLE "analyst" LINEAGE JOB '' SELECT count(*) FROM sales;
+----
+3
+
+# --- a connection that switched the rules on itself gets the same grammar, ours once ------------
+
+statement ok
+SET active_grammar_extensions = ['acl'];
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM sales;
+----
+3
+
+statement ok
+RESET active_grammar_extensions;
+
+# --- what the statement records is its own text, as the scanner's parse gave it -----------------
+
+statement ok
+SELECT acl_audit_flush();
+
+query I
+SELECT statement FROM acl_audit_events() WHERE kind = 'statement' AND verdict = 'allowed' ORDER BY seq DESC LIMIT 1;
+----
+select
+
+# --- off again: the scanner reads the same batch the same way ------------------------------------
+
+statement ok
+SET GLOBAL acl_peg_prefix = false;
+
+query III
+ACL ROLE "analyst" PIVOT sales ON quarter USING sum(amount) GROUP BY region ORDER BY region;
+----
+east	10	20
+west	5	NULL

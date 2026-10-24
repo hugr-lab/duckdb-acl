@@ -456,8 +456,20 @@ scope, never the syntax. **Spec 132**: duckdb's grammar extensions (#24919, `Gra
 opted into per connection by the LOCAL `active_grammar_extensions`) are the fourth row - the inner parse
 copies the caller's `ParserOptions`, so a grammar extension's ordinary AST is walked under the prefix
 (confined, not refused) and one yielding an `ExtensionStatement` is denied; the grammar is the
-connection owner's (`SET active_grammar_extensions` / `current_dialect` refused under every prefix). CLI
-completion of `ACL …` and the prefix/management grammar as PEG rules wait (the latter for v2.0.0).
+connection owner's (`SET active_grammar_extensions` / `current_dialect` refused under every prefix). The
+prefix/management grammar as PEG rules is spec 150's.
+**Spec 150 — our grammar on the PEG parser** (in stages; stage 1 built): no statement text parsed by hand. Stage 1
+(`acl_grammar.{hpp,cpp}`, behind `acl_peg_prefix`, GLOBAL, off): `AclPrefixedStatement <- 'ACL' 'ROLE' AclQuotedValue
+AclTraceMarker* Statement?`, prepended to `Statement`; its transform yields an `ExtensionStatement` whose plan function
+refuses (`IsPrefixStatement`), carrying the role, the markers and the statement (its PIVOT entries taken and cleared,
+its named parameters, its text cut from the rule's offsets). `AclGrammarCache` (on `AclParserInfo`, per instance)
+compiles the connection's grammar extensions with ours behind them (`CompiledGrammar::Create`); the rules are also
+registered as the grammar extension `acl` for CLI completion only (`SET active_grammar_extensions = ['acl']`). In
+`Prefixed` a role prefix in query mode (no LINEAGE / `ACL [NATIVE]` / `USE SCHEMA`; not CONNECT-ed, no dialect) takes
+the rule's statements; the readers must agree on role, markers and where the statement starts (only comments between,
+and `;` for a prefix with no statement, judged by `Parser::Tokenize`), else `parse` "reads two ways". The whole suite passed with it on by default; no cost
+past noise. Stage 2 moves every prefix and marker and drops the scanner; CONNECT-ed / dialect connections refuse a
+prefix. Tests `acl_peg_prefix.test`, `acl_peg_completion.test`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
 attached catalog of type `tresor`, never its own secret manager. Under the explicit `secrets`

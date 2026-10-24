@@ -1393,11 +1393,15 @@ private:
 //! is kept in (acl_identity_store.cpp)
 void RegisterIdentitySecretTypes(ExtensionLoader &loader);
 
+class AclGrammarCache;
+
 //! Carried on the parser extension (parser_info); the override reads the store from it.
 struct AclParserInfo : ParserExtensionInfo {
 	explicit AclParserInfo(shared_ptr<PolicyStore> store_p) : store(std::move(store_p)) {
 	}
 	shared_ptr<PolicyStore> store;
+	//! spec 150: the grammars the override compiles (its rules plus the caller's grammar extensions)
+	shared_ptr<AclGrammarCache> grammar;
 };
 
 //! The store's entry in the instance's object cache (spec 069): what `PolicyStore::Of(db)` reads.

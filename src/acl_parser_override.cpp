@@ -4,6 +4,7 @@
 #include "acl_platform.hpp"
 #include "acl_attach_lineage.hpp"
 #include "acl_audit_pipeline.hpp"
+#include "acl_grammar.hpp"
 #include "acl_profile.hpp"
 #include "acl_lineage.hpp"
 #include "acl_rewriter.hpp"
@@ -16,6 +17,8 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
+#include "duckdb/parser/grammar_extension.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -51,6 +54,7 @@ struct AclPrefix {
 	string traceparent;
 	//! spec 107: the client's lineage context - `LINEAGE PARENT '<ns/job/run>' [ROOT '<...>'] [JOB '<name>']`
 	LineageContext lineage;
+	bool lineage_written = false; // spec 150: written, whatever its values (an empty JOB '' is still written)
 };
 
 AclPrefix ParseAclPrefix(const string &query) {
@@ -98,6 +102,7 @@ AclPrefix ParseAclPrefix(const string &query) {
 					throw ParserException("acl_rewrite: ACL LINEAGE may be written once in a prefix");
 				}
 				seen_lineage = true;
+				prefix.lineage_written = true;
 				bool any = false;
 				for (;;) {
 					SkipWhitespace(query, scan);
@@ -699,8 +704,8 @@ bool OnlyViewAsCalls(vector<unique_ptr<SQLStatement>> &statements) {
 
 //! One prefixed batch, decided. Every refusal throws; the caller turns the outcome into the audit's
 //! events, so this only has to say what it is doing (`audit.phase`) and whom it is doing it for.
-ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, ParserOptions &options,
-                              StatementAudit &audit) {
+ParserOverrideResult Prefixed(PolicyStore &store, const string &query, const AclPrefix &prefix, ParserOptions &options,
+                              StatementAudit &audit, optional_ptr<AclGrammarCache> grammar) {
 	auto mode = prefix.mode;
 	bool anonymous = prefix.kind == AclPrefix::Kind::ADMIN;
 	bool principal_prefix = prefix.kind == AclPrefix::Kind::ROLE || prefix.kind == AclPrefix::Kind::TOKEN ||
@@ -838,7 +843,41 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
 	}
 	vector<unique_ptr<SQLStatement>> statements;
-	if (mode != AclPrefix::Mode::NATIVE || !ParseAttachLineage(prefix.rest, inner, statements)) {
+	// spec 150, stage 1: the role prefix and its statements as ONE parse of duckdb's parser with our rule
+	bool peg = false;
+	if (grammar && PegPrefixEnabled(options) && prefix.kind == AclPrefix::Kind::ROLE &&
+	    mode == AclPrefix::Mode::QUERY && !prefix.marked && !prefix.lineage_written &&
+	    UseSchemaAsSet(prefix.rest) == prefix.rest) {
+		AclParseGuard guard;
+		PegPrefix parsed;
+		if (grammar->ParsePrefixed(query, options, parsed)) {
+			// the two readers must agree on the principal, the markers and where the statement starts. The scanner
+			// reads no comment: what lies between where it stopped and where the rule's statement starts may be
+			// comments only (a tool's `/* … */` before its SQL), and separators when the prefix has no statement of
+			// its own - a marker there is the two reading two prefixes
+			auto rest_start = query.size() - prefix.rest.size();
+			bool agree = parsed.role == prefix.value && parsed.correlation_id == prefix.correlation_id &&
+			             parsed.traceparent == prefix.traceparent && parsed.statement_start >= rest_start;
+			if (agree) {
+				auto gap = query.substr(rest_start, parsed.statement_start - rest_start);
+				for (auto &token : Parser::Tokenize(gap)) {
+					bool separator = !parsed.has_statement &&
+					                 token.type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR &&
+					                 gap[token.start] == ';';
+					agree = agree && (token.type == SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT || separator);
+				}
+			}
+			if (!agree) {
+				NoteDenyReason(Reason::PARSE);
+				throw ParserException(
+				    "acl_rewrite: the ACL prefix reads two ways - write the principal and its markers "
+				    "plainly, with no comment or split string among them (spec 150)");
+			}
+			statements = std::move(parsed.statements);
+			peg = true;
+		}
+	}
+	if (!peg && (mode != AclPrefix::Mode::NATIVE || !ParseAttachLineage(prefix.rest, inner, statements))) {
 		AclParseGuard guard;
 		Parser parser(inner);
 		// spec 114: `USE SCHEMA s` - a form duckdb's grammar lacks - is the session's default schema
@@ -1045,7 +1084,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		audit.OnSession(store, prefix.value); // known before anything is judged: a parse error names it too
 	}
 	try {
-		auto result = Prefixed(store, prefix, options, audit);
+		auto result = Prefixed(store, query, prefix, options, audit, info->Cast<AclParserInfo>().grammar.get());
 		audit.Allowed();
 		return result;
 	} catch (std::exception &ex) {
@@ -1160,7 +1199,10 @@ string UseSchemaAsSet(const string &text) {
 void RegisterAclParser(DBConfig &config, shared_ptr<PolicyStore> store) {
 	ParserExtension extension;
 	extension.parser_override = AclParserOverride;
-	extension.parser_info = make_shared_ptr<AclParserInfo>(std::move(store));
+	auto parser_info = make_shared_ptr<AclParserInfo>(std::move(store));
+	parser_info->grammar = make_shared_ptr<AclGrammarCache>();
+	config.GetCallbackManager().Register(parser_info->grammar->Extension());
+	extension.parser_info = std::move(parser_info);
 	ParserExtension::Register(config, extension);
 }
 

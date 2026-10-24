@@ -1,0 +1,65 @@
+# name: test/sql/acl_peg_completion.test
+# description: spec 150 - the prefix rules registered as the grammar extension `acl`: a connection that switches
+#   them on parses as before and completes `ACL …`; and a prefixed text that reaches duckdb's own parser (the
+#   override off) is refused at bind, never run
+# group: [sql]
+
+require acl
+
+query I
+SELECT name FROM duckdb_grammar_extensions() WHERE name = 'acl';
+----
+acl
+
+statement ok
+SET active_grammar_extensions = ['acl'];
+
+# `acl` stays a name with the rules on
+statement ok
+CREATE TABLE acl AS SELECT 1 AS acl;
+
+query I
+SELECT acl FROM acl;
+----
+1
+
+statement ok
+SET GLOBAL allow_parser_override_extension = 'DEFAULT';
+
+statement error
+ACL ROLE "r" SELECT 1;
+----
+planned only through the acl override
+
+statement ok
+RESET active_grammar_extensions;
+
+statement error
+ACL ROLE "r" SELECT 1;
+----
+syntax error
+
+statement ok
+SET GLOBAL allow_parser_override_extension = 'STRICT';
+
+# --- completion (the autocomplete extension) ------------------------------------------------------
+
+require autocomplete
+
+query I
+SELECT count(*) FROM sql_auto_complete('AC') WHERE suggestion ILIKE 'acl%';
+----
+0
+
+statement ok
+SET active_grammar_extensions = ['acl'];
+
+query I
+SELECT count(*) FROM sql_auto_complete('AC') WHERE suggestion ILIKE 'acl%';
+----
+1
+
+query I
+SELECT count(*) FROM sql_auto_complete('ACL ') WHERE suggestion ILIKE 'role%';
+----
+1
