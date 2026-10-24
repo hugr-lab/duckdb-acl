@@ -1602,6 +1602,11 @@ idx_t CommentEnd(const string &text, idx_t start) {
 } // namespace
 
 vector<string> SplitBatchText(const string &text) {
+	bool inner_semicolon = false;
+	return SplitBatchText(text, inner_semicolon);
+}
+
+vector<string> SplitBatchText(const string &text, bool &inner_semicolon) {
 	vector<string> out;
 	string current;
 	idx_t depth = 0;
@@ -1671,6 +1676,8 @@ vector<string> SplitBatchText(const string &text) {
 		} else if (c == ';' && depth == 0) {
 			flush();
 			continue;
+		} else if (c == ';') {
+			inner_semicolon = true;
 		}
 		current += c;
 	}
@@ -1751,6 +1758,17 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 					pieces.push_back(Piece {std::move(parsed), nullptr});
 				}
 			} catch (ParserException &refusal) {
+				// a `;` the split kept inside parentheses ends a statement for duckdb's tokenizer: a piece holding one
+				// is never compiled from its text (a body would take the statement after it - `SET AS SELECT (1 AS "";
+				// DROP ROLE r)`), the tokenizer's words refuse it
+				bool inner_semicolon = false;
+				SplitBatchText(piece, inner_semicolon);
+				if (inner_semicolon) {
+					auto info = ErrorData(refusal).ExtraInfo();
+					info.erase("position");
+					info.erase("location");
+					throw ParserException(info, ErrorData(refusal).RawMessage());
+				}
 				MgmtParsed parsed;
 				parsed.legacy = true;
 				parsed.text = piece;

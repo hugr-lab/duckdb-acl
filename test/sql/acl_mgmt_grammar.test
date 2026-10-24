@@ -806,3 +806,30 @@ a list is written with '...' literals
 
 statement ok
 ACL ADMIN CREATE VIRTUAL TABLE objects.dollar_rls AS phys.main.t RLS (tenant <> $$x, y$$);
+
+# ... a line comment elsewhere is a space: a declared column's name and type stay apart
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW objects.nt (a -- the only column
+INTEGER) AS SELECT 1 AS a;
+
+query II
+SELECT name, type FROM aclcat.acl.object_columns WHERE vcat = 'objects' AND vname = 'nt';
+----
+a	INTEGER
+
+# an E'...' string without a backslash splits as written: a mask may be one
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE objects.masked AS phys.main.t COLUMNS (a, tenant = E'***');
+
+# a statement the tokenizer refuses (`""`) is compiled from its text only when the split kept no `;` inside its
+# parentheses - there duckdb's tokenizer ends a statement, and a body would take the next one into it
+statement error
+ACL ADMIN ALTER VIRTUAL VIEW objects.v SET AS SELECT (1 AS ""; DROP ROLE grammar_one);
+----
+zero-length delimited identifier
+
+query II
+SELECT (SELECT count(*) FROM aclcat.acl.roles WHERE role = 'grammar_one'),
+       (SELECT view_sql FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'v');
+----
+1	SELECT a /* kept */ FROM phys.main.t

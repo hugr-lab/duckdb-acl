@@ -195,13 +195,17 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   was never one statement), while a `$$…$$` string in a body is one token (the scanner did not know it); a name the
   scanner took as a keyword is a name (`CREATE VIRTUAL CATALOG if`, `CREATE VIRTUAL TABLE function.t`). A body
   written quoted is still the whole body: `AS 'SELECT 1' COMMENT 'x'` is refused, never stored as the view's SQL.
-  A list our readers split (columns, keys, pairs, parameters, a result's columns - `SplitTopLevel` knows `'…'` and
-  `"…"` only) takes `'…'` literals only, as 3b's claims list: `COLUMNS (a, $$x, b, y$$)` was three columns to the
-  reader where the tokenizer reads one literal; an RLS predicate (SQL, duckdb's parser reads it) takes any. A line
-  comment in a list is a line break, not a space - it ends a line as one does, and two quoted strings a line apart
-  are one. A batch holding a dollar-quoted string nobody closed is refused whole: duckdb's tokenizer keeps it as one
-  literal to the end of the text (`MatcherToken::unterminated`), so `AS SELECT $x$ AS a; DROP ROLE r` stored the DROP
-  as the view's SQL - and never ran it - while the batch answered success (found in review).
+  A list our readers split (columns, keys, pairs, parameters, a result's columns - `SplitTopLevel` knows `'…'` with
+  `''` and `"…"` only) refuses a literal it would split otherwise than the tokenizer reads it - a `$$…$$` string, an
+  `E'…'` one with a backslash, a backtick name: `COLUMNS (a, $$x, b, y$$)` was three columns to the reader where the
+  tokenizer reads one literal; an RLS predicate (SQL, duckdb's parser reads it) takes any, and there a comment
+  between two `'…'` strings a line apart is a line break where duckdb joins them (`'a' -- c⏎'b'` is `'ab'`: the
+  token's `preceded_by_newline` without `preceded_by_block_comment`), a space elsewhere. A batch holding a
+  dollar-quoted string nobody closed is refused whole: duckdb's tokenizer keeps it as one literal to the end of the
+  text (`MatcherToken::unterminated`), so `AS SELECT $x$ AS a; DROP ROLE r` stored the DROP as the view's SQL - and
+  never ran it - while the batch answered success; and a statement the tokenizer refuses (a `""`) is compiled from
+  its text only when the split kept no `;` inside its parentheses (`ALTER VIRTUAL VIEW … SET AS SELECT (1 AS "";
+  DROP ROLE r)` did the same through the compiler's `Rest`) - both found in review.
   Part 2: `ALTER | DROP VIRTUAL …`, `DROP RELATION | REFERENCE`, `COMMENT ON VIRTUAL`, `CHECK`,
   `REPAIR`, `ANALYZE VIRTUAL`.
 - 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).

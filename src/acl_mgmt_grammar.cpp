@@ -867,8 +867,9 @@ arena_ptr<TransformResultValue> FinalizeCreateFunction(PEGTransformer &transform
 	auto &definition = Strip(list.GetChild(10)).Cast<ListParseResult>();
 	auto mode = CreateMode(list, 1, 4);
 	if (KeywordOf(definition.GetChild(0)) == "alias") {
-		// AclAliasOf <- 'ALIAS' 'OF' AclPathName AclComment? - an alias keeps no parameters, result or key, but they
-		// are judged as the body form judges them
+		// AclAliasOf <- 'ALIAS' 'OF' AclPathName AclComment? - an alias keeps no parameters, result or key: its
+		// result's shape and a quoted key are judged as the body form judges them, a parenthesised list only with the
+		// batch's tokens
 		ReturnsInto(list, 7, scalar, optional_idx(), *data);
 		if (pk.HasResult()) {
 			ListInto(transformer, Strip(pk.GetResult()).Cast<ListParseResult>().GetChild(2), optional_idx(),
@@ -1209,17 +1210,23 @@ public:
 
 const char *const TILING_REFUSAL = "acl admin: a list or a body does not read as written - its tokens do not tile it";
 
+//! Whether a token is a plain `'…'` string literal
+bool IsSingleQuoted(const MatcherToken &token) {
+	return token.type == TokenType::STRING_LITERAL && !token.text.empty() && token.text[0] == '\'';
+}
+
 //! The text of the tokens in [start, end) - a list between its parentheses or a body - refused unless the tokens
 //! tile it as written (only whitespace and comments between them: after a lone `$` duckdb's tokenizer places the next
-//! token at the `$`). A gap that holds a comment is, when `comments_as_space`, a space - a line break for a line
-//! comment, which ends a line as the break does (two quoted strings a line apart are one) - else as written
+//! token at the `$`). A gap that holds a comment is, when `comments_as_space`, a space - in SQL (`sql`) a line break
+//! where duckdb's tokenizer would join the strings on its two sides (`'a' -- c⏎'b'` is `'ab'`) - else as written
 string TokensText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool comments_as_space,
-                  const string &refusal, const std::function<void(const MatcherToken &)> &judge) {
+                  bool sql, const string &refusal, const std::function<void(const MatcherToken &)> &judge) {
 	auto refuse = [&refusal]() {
 		throw BinderException(refusal);
 	};
 	string inside;
 	optional_idx previous_end;
+	optional_ptr<const MatcherToken> previous;
 	for (idx_t index = grammar::FirstTokenFrom(tokens, start); index < tokens.Size(); index++) {
 		auto &token = tokens.GetToken(index);
 		if (token.offset >= end || token.type == TokenType::END_OF_INPUT) {
@@ -1240,7 +1247,9 @@ string TokensText(const string &text, const TokenIterator &tokens, idx_t start, 
 				}
 				inside += gap;
 			} else if (StringUtil::StartsWith(blank, "--") || StringUtil::StartsWith(blank, "/*")) {
-				inside += StringUtil::Contains(gap, "/*") ? " " : "\n";
+				bool joins = sql && previous && IsSingleQuoted(*previous) && IsSingleQuoted(token) &&
+				             token.preceded_by_newline && !token.preceded_by_block_comment;
+				inside += joins ? "\n" : " ";
 			} else {
 				refuse();
 			}
@@ -1250,6 +1259,7 @@ string TokensText(const string &text, const TokenIterator &tokens, idx_t start, 
 		}
 		inside += text.substr(token.offset, token.length);
 		previous_end = token.offset + token.length;
+		previous = &token;
 	}
 	return inside;
 }
@@ -1262,20 +1272,23 @@ bool BetweenParentheses(const string &text, idx_t start, idx_t end) {
 
 //! A parenthesised list's text between its parentheses, as written with each comment a space (a comment would
 //! otherwise be read as part of the list: `(a = 1 -- note⏎)` left an open comment in an RLS predicate). A list our
-//! readers split (`SplitTopLevel` knows `'…'` and `"…"` only) takes `'…'` literals only - `E'…'`, `$$…$$` or a
-//! backtick name would split into other items than written; one duckdb's parser reads (`sql`) any
+//! readers split (`SplitTopLevel` knows `'…'` with `''` and `"…"` only) refuses a literal it would split into other
+//! items than written - a `$$…$$` string, an `E'…'` one with a backslash, a backtick name; one duckdb's parser reads
+//! (`sql`) takes any
 string ListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool sql) {
 	if (!BetweenParentheses(text, start, end)) {
 		throw BinderException(TILING_REFUSAL);
 	}
-	return TokensText(text, tokens, start, end, true, TILING_REFUSAL, [sql](const MatcherToken &token) {
-		if (sql) {
+	return TokensText(text, tokens, start, end, true, sql, TILING_REFUSAL, [sql](const MatcherToken &token) {
+		if (sql || token.text.empty()) {
 			return;
 		}
-		if ((token.type == TokenType::STRING_LITERAL && (token.text.empty() || token.text[0] != '\'')) ||
-		    (!token.text.empty() && token.text[0] == '`')) {
-			throw BinderException("acl admin: a list is written with '...' literals - E'...', $$...$$ and a backtick "
-			                      "name are not read as one item here yet");
+		bool dollar = token.type == TokenType::STRING_LITERAL && token.text[0] == '$';
+		bool escapes = token.type == TokenType::STRING_LITERAL && (token.text[0] == 'E' || token.text[0] == 'e') &&
+		               StringUtil::Contains(token.text, "\\");
+		if (dollar || escapes || token.text[0] == '`') {
+			throw BinderException("acl admin: a list is written with '...' literals - a $$...$$ string, an E'...' one "
+			                      "with a backslash and a backtick name are not read as one item here yet");
 		}
 	});
 }
@@ -1291,7 +1304,8 @@ string ClaimsListText(const string &text, const TokenIterator &tokens, idx_t sta
 		refuse("its text does not read as written");
 	}
 	return TokensText(
-	    text, tokens, start, end, true, prefix + "its text does not read as written", [&](const MatcherToken &token) {
+	    text, tokens, start, end, true, false, prefix + "its text does not read as written",
+	    [&](const MatcherToken &token) {
 		    if (token.type == TokenType::STRING_LITERAL && (token.text.empty() || token.text[0] != '\'')) {
 			    refuse("a value is in single quotes (E'...' and $$...$$ are not read as one value here yet)");
 		    }
@@ -1325,7 +1339,7 @@ string BodyText(const string &text, const TokenIterator &tokens, idx_t start, id
 			return value;
 		}
 	}
-	return TokensText(text, tokens, start, end, false, TILING_REFUSAL, [](const MatcherToken &) {});
+	return TokensText(text, tokens, start, end, false, true, TILING_REFUSAL, [](const MatcherToken &) {});
 }
 
 } // namespace

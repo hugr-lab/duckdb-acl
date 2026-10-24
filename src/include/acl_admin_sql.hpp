@@ -44,6 +44,8 @@ vector<unique_ptr<SQLStatement>> ParseSecretsBatch(const string &text, PolicySto
 //! spec 117: split a batch's text into its statements (quote-, comment- and paren-aware) - what the
 //! mixed-batch rule reads: a batch is all management statements or none
 vector<string> SplitBatchText(const string &text);
+//! ... and whether it kept a `;` inside parentheses (a piece duckdb's tokenizer ends there)
+vector<string> SplitBatchText(const string &text, bool &inner_semicolon);
 //! spec 117: a statement after the first that starts with its own `ACL` prefix - refused with a message of its
 //! own (a second prefix inside a batch is text, never a prefix)
 void RefuseRepeatedPrefix(const string &text);
