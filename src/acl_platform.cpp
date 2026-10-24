@@ -2074,7 +2074,7 @@ string CapsJson(const Value &value) {
 		}
 		auto capability = StringUtil::Lower(item.ToString());
 		StringUtil::Trim(capability);
-		if (named.insert(capability).second) { // each once: the same capability twice is one
+		if (!capability.empty() && named.insert(capability).second) { // each once, an empty item none
 			entries.push_back(JsonQuote(capability) + ": true");
 		}
 	}

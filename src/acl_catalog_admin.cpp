@@ -1981,7 +1981,7 @@ bool PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname,
 
 void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, const string &path,
                                      const string &caps_json, const string &comment, const string &into,
-                                     bool virtual_only) {
+                                     bool virtual_only, bool ensure_grant) {
 	RequireCatalog(catalog, "acl_grant_schema");
 	if (acl_detail::ParseCaps(caps_json, true).count("manage")) {
 		throw BinderException("acl admin: `manage` is granted per catalog, not per schema - administering the ACL is "
@@ -2007,14 +2007,19 @@ void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, con
 		throw BinderException("acl admin: INTO and VIRTUAL ONLY are opposites - one names where the role creates, "
 		                      "the other says it never does");
 	}
-	catalog->Write({"DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"role\" = " + Lit(role) +
-	                    " AND \"vcat\" = " + Lit(vcat) + " AND \"schema_path\" = " + Lit(path),
-	                "INSERT INTO " + catalog->Tbl("role_schemas") +
-	                    "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\", \"comment\", \"into\","
-	                    " \"virtual_only\") VALUES (" +
-	                    Lit(role) + ", " + Lit(vcat) + ", " + Lit(path) + ", " + Lit(caps_json) + ", false, " +
-	                    (comment.empty() ? "NULL" : Lit(comment)) + ", " + (into.empty() ? "NULL" : Lit(into)) + ", " +
-	                    (virtual_only ? "true" : "false") + ")"});
+	vector<string> statements;
+	if (ensure_grant) {
+		statements.push_back(EnsureGrantSql(role, vcat, false));
+	}
+	statements.push_back("DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"role\" = " + Lit(role) +
+	                     " AND \"vcat\" = " + Lit(vcat) + " AND \"schema_path\" = " + Lit(path));
+	statements.push_back("INSERT INTO " + catalog->Tbl("role_schemas") +
+	                     "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\", \"comment\", \"into\","
+	                     " \"virtual_only\") VALUES (" +
+	                     Lit(role) + ", " + Lit(vcat) + ", " + Lit(path) + ", " + Lit(caps_json) + ", false, " +
+	                     (comment.empty() ? "NULL" : Lit(comment)) + ", " + (into.empty() ? "NULL" : Lit(into)) + ", " +
+	                     (virtual_only ? "true" : "false") + ")");
+	catalog->Write(statements);
 	CatalogRematerializeSchemaCaps(vcat, path);
 }
 
@@ -3861,12 +3866,15 @@ string ExposedColumnList(CatalogBackend &catalog, const ReadFn &read, const stri
 
 void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,
                                        const string &caps_json, const string &rls, const string &columns,
-                                       bool judge_caps) {
+                                       bool judge_caps, bool ensure_grant) {
 	RequireCatalog(catalog, "acl catalog");
 	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls, acl_detail::ParseColumnList(columns));
 	ValidateGrantColumns(*catalog, vcat, columns, vname);
 	CatalogCheckObjectCaps(vcat, vname, caps_json, judge_caps);
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		if (ensure_grant) {
+			statements.push_back(EnsureGrantSql(role, vcat, false));
+		}
 		auto plan = PlanObjectGrant(*catalog, read, role, vcat, vname, rls, columns, statements);
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
 		                     " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
@@ -4056,13 +4064,16 @@ void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vn
 	}
 }
 
-void PolicyStore::CatalogEnsureGrant(const string &role, const string &vcat, bool is_main) {
+string PolicyStore::EnsureGrantSql(const string &role, const string &vcat, bool is_main) {
 	RequireCatalog(catalog, "acl catalog");
-	catalog->Write({"INSERT INTO " + catalog->Tbl("role_catalogs") +
-	                "(\"role\", \"vcat\", \"is_main\", \"caps\") SELECT " + Lit(role) + ", " + Lit(vcat) + ", " +
-	                (is_main ? "true" : "false") + ", '{}' WHERE NOT EXISTS (SELECT 1 FROM " +
-	                catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat) +
-	                ")"});
+	return "INSERT INTO " + catalog->Tbl("role_catalogs") + "(\"role\", \"vcat\", \"is_main\", \"caps\") SELECT " +
+	       Lit(role) + ", " + Lit(vcat) + ", " + (is_main ? "true" : "false") +
+	       ", '{}' WHERE NOT EXISTS (SELECT 1 FROM " + catalog->Tbl("role_catalogs") +
+	       " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat) + ")";
+}
+
+void PolicyStore::CatalogEnsureGrant(const string &role, const string &vcat, bool is_main) {
+	catalog->Write({EnsureGrantSql(role, vcat, is_main)});
 }
 
 } // namespace acl

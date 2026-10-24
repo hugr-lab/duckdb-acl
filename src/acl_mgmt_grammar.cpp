@@ -70,6 +70,8 @@ struct MgmtParseData : ParserExtensionParseData {
 		string what;
 		//! a body that is an expression (a scalar's template), not a statement
 		bool expression = false;
+		//! a quoted list a reader of ours splits: judged as the compiler's text is (no comment, no `$$`, ...)
+		bool judge = false;
 	};
 	vector<Span> spans;
 
@@ -444,13 +446,13 @@ void ListInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg
 	if (!arg.IsValid()) {
 		return;
 	}
-	if (kind == MgmtParsed::TextKind::CLAIMS) {
-		data.args[arg.GetIndex()] = Value(entry.value);
-		return;
-	}
 	MgmtParseData::Span span;
 	span.arg = arg.GetIndex();
-	span.kind = kind;
+	// a quoted claims list is the stored csv as it stands; a columns list goes to its reader - both split by readers
+	// of ours, judged as the compiler's text is
+	span.kind = kind == MgmtParsed::TextKind::CLAIMS ? MgmtParsed::TextKind::TEXT : kind;
+	span.judge = kind != MgmtParsed::TextKind::TEXT;
+	span.what = kind == MgmtParsed::TextKind::CLAIMS ? "claims list" : "columns list";
 	span.resolved = true;
 	span.text = entry.value;
 	data.spans.push_back(std::move(span));
@@ -723,7 +725,10 @@ vector<reference<ParseResult>> Clauses(ListParseResult &list, idx_t index) {
 //! the first while the last took effect - refused
 void ClauseOnce(case_insensitive_set_t &seen, const string &kind) {
 	if (!seen.insert(kind).second) {
-		throw BinderException("acl admin: %s is written twice - write each clause once", StringUtil::Upper(kind));
+		auto shown = kind == "primary" ? string("PRIMARY KEY")
+		             : kind == "caps"  ? "CAPS / WITH"
+		                               : StringUtil::Upper(kind);
+		throw BinderException("acl admin: %s is written twice - write each clause once", shown);
 	}
 }
 
@@ -1314,7 +1319,7 @@ arena_ptr<TransformResultValue> FinalizeDropObject(PEGTransformer &transformer, 
 
 // --- grants (specs 011, 012, 015, 120) ------------------------------------------------------------------------------
 
-//! A grant's policy clauses, in any order, the last of a kind winning: `WITH (select, insert)` (the list form of
+//! A grant's policy clauses, in any order, each once: `WITH (select, insert)` (the list form of
 //! CAPS), `CAPS '<json>'`, `RLS <list>`, `COLUMNS <list>`, and - a catalog grant's - `MAIN`
 struct GrantClauses {
 	optional_idx caps;
@@ -2165,6 +2170,11 @@ string JudgeLegacyText(shared_ptr<CompiledGrammar> compiled, const string &text)
 	SplitTokenizerBehavior behavior(text, owned);
 	compiled->GetTokenizer().TokenizeInput(behavior);
 	TokenIterator tokens(owned);
+	for (auto &token : owned) {
+		if (token.type == TokenType::TERMINATOR) {
+			return "a `;`"; // the judgment would stop there, the reader not
+		}
+	}
 	auto why = LegacyUnreadable(text, tokens, 0, text.size());
 	if (!why.empty()) {
 		return why;
@@ -2267,13 +2277,13 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 				string value;
 				if (span.resolved) {
 					value = span.text;
-					if (span.kind == MgmtParsed::TextKind::COLUMNS) {
-						// a quoted columns list is split by the compiler's reader, which knows no comment
+					if (span.judge) {
+						// a quoted list is split by a reader of ours, which knows no comment
 						auto why = JudgeLegacyText(compiled, value);
 						if (!why.empty()) {
-							throw BinderException("acl admin: %s in a quoted columns list - its reader would read it "
-							                      "otherwise than written; write the list in parentheses",
-							                      why);
+							throw BinderException("acl admin: %s in a quoted %s - its reader would read it otherwise "
+							                      "than written; write the list in parentheses",
+							                      why, span.what);
 						}
 					}
 				} else if (span.body) {

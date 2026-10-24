@@ -1272,7 +1272,7 @@ RLS is written twice
 statement error
 ACL ADMIN GRANT CATALOG granted TO ROLE grantee CAPS '{"manage": true}' WITH (select);
 ----
-CAPS is written twice
+CAPS / WITH is written twice
 
 statement ok
 ACL ADMIN GRANT CATALOG granted TO ROLE grantee MAIN COLUMNS (a, "b") WITH (select) RLS (a > 0);
@@ -1340,9 +1340,42 @@ ACL ADMIN GRANT CATALOG granted TO ROLE grantee COLUMNS 'a /*, tenant, */';
 ----
 a comment in a quoted columns list
 
-# a schema grant's capabilities are judged before anything is written: a refused one leaves no catalog grant behind
+# a refused grant leaves no catalog grant behind: the role's grant on the catalog is written in the grant's own write
+# (an empty one moved a role's short names to another catalog, or gave it a second main one)
 statement ok
 ACL ADMIN CREATE ROLE schema_only;
+
+statement error
+ACL ADMIN GRANT SCHEMA granted.nosuch TO ROLE schema_only WITH (select);
+----
+does not exist
+
+statement error
+ACL ADMIN GRANT TABLE granted.t TO ROLE schema_only WITH (select) COLUMNS (nosuch);
+----
+nosuch
+
+query I
+SELECT count(*) FROM aclcat.acl.role_catalogs WHERE role = 'schema_only';
+----
+0
+
+# CAPS JSON holds no escape: a name is a word and needs none (an escaped word read as one here, as text in listings)
+statement error
+ACL ADMIN GRANT CATALOG granted TO ROLE schema_only CAPS '{"select": true, "\u0069nsert": true}';
+----
+caps JSON holds no escape
+
+# a quoted claims list is judged as a quoted columns list is
+statement error
+ACL ADMIN CREATE ROLE commented_csv CLAIMS 'tenant=''a'', /* unit=''b'', */ region=''c''';
+----
+a comment in a quoted claims list
+
+statement error
+ACL ADMIN GRANT CATALOG granted TO ROLE schema_only COLUMNS 'a; /*, tenant, */ b';
+----
+in a quoted columns list
 
 statement error
 ACL ADMIN GRANT SCHEMA granted.s TO ROLE schema_only CAPS '{"create": true, "CREATE": true}';

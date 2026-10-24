@@ -394,6 +394,11 @@ inline case_insensitive_set_t ParseCaps(const string &json, bool strict = false)
 	if (trimmed.empty()) {
 		return caps; // empty/NULL caps -> no capabilities
 	}
+	if (strict && trimmed.find('\\') != string::npos) {
+		// a name is a word, so it needs no escape - an escaped one (`\u0069nsert`) reads as a word to this reader and
+		// as text to the listings' match
+		throw BinderException("acl catalog: caps JSON holds no escape - a capability's name is a word: %s", json);
+	}
 	auto doc = duckdb_yyjson::yyjson_read(trimmed.c_str(), trimmed.size(), 0);
 	if (!doc) {
 		throw BinderException("acl catalog: malformed caps JSON: %s", json);
