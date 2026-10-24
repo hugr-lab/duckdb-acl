@@ -135,17 +135,23 @@ families' rules and, last, `AclMgmtLegacy <- AclTailToken+`: a statement of a fa
 through as tokens and goes, as its own text, to the management compiler (`CompileMgmtText`). A rule yields the acl_*
 call it always compiled to (`MgmtParsed` -> `MakeAdminCall`), so the authorizer and the admin functions do not change.
 A moved family's text form stays only as a refusal in the form's own words ("write KILL SESSION '<id>'"): what does
-not read as its rule falls to it, and only the rule accepts - never two readers. duckdb's grammar splits the batch (a
-`;` inside parentheses now ends a statement - none of ours holds one); a text its tokenizer refuses (an empty quoted
-name) is read by the compiler piece by piece, as before, until every family is a rule. hugr-node's registered forms
+not read as its rule falls to it, and only the rule accepts - never two readers. A form a rule began with more after
+it before its `;` (PEG keeps the rule that matched, so the statement fails there) goes the same way: its tokens up to
+the `;`, as text, to the compiler - the batch's other statements are not blamed. duckdb's grammar splits the batch (a
+`;` inside parentheses now ends a statement - none of ours holds one; `SplitBatchText` reads comments as the
+tokenizer does, a line comment ending at either line break, block comments nested); a text the tokenizer refuses is
+read piece by piece - the pieces it reads by their rules, the refused one by the compiler in its own words (a moved
+form refused there says the tokenizer's: an unterminated string). Values a rule reads are checked against their
+tokens - one plain quoted literal (an empty one passes, as it did: the function judges it), a level a bare word. hugr-node's registered forms
 (`RegisterMgmtGrammar`, spec 126) take the legacy path unchanged. The text checks that tell a management batch from
 native SQL (`IsMgmtStart`, `StartsWithMgmt`, `BatchHasMgmtStatement`, `SplitBatchText`, `RefuseRepeatedPrefix`) stay
 until the last PR of the stage, which judges the batch by its parse and drops `AdminScanner`.
 
 - 3a (built): the grammar, the legacy path, and the operations of a node - `KILL SESSION '<id>'`,
   `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`, `PROFILE SESSION CURRENT|'<id>' ON|ALL|SAMPLED|OFF`, `DRAIN NODE`,
-  `RESUME NODE`, `MIGRATE POLICY CATALOG <db>[.<schema>]`. Quoted values are checked against their tokens as in the
-  head (one plain literal).
+  `RESUME NODE`, `MIGRATE POLICY CATALOG <db>[.<schema>]`. Newly accepted: comments inside these forms; a quoted
+  level stays refused, as it was; a SQL keyword as a database name must be quoted now (the refusal says so); an inline body's trailing comment is no longer part of a legacy statement's text. A rule's checks run over
+  the batch before the compiler's statements, so a later statement's error may be the one reported.
 - 3b: roles, admin scopes, role mappings, view-as (names as values, spec 116's `NameValue`).
 - 3c: the virtual catalog's objects (`CREATE | ALTER | DROP VIRTUAL …`, `ADD …`, `CHECK`, `REPAIR`, comments) -
   spec 116's paths and the bodies (still their text until stage 4).

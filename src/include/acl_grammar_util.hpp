@@ -3,7 +3,8 @@
 //
 // Spec 150: what the rules of our grammar share - reading a parse result of a helper rule (ours have no
 // transform: the base rule under it is transformed), the keyword a part matched, a quoted value and the
-// token it was written as. Private to acl_grammar.cpp and acl_mgmt_grammar.cpp.
+// token it was written as - and the seam to the management statements' grammar. Private to acl_grammar.cpp
+// and acl_mgmt_grammar.cpp.
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -85,18 +86,30 @@ inline string ValueOf(PEGTransformer &transformer, ParseResult &result, optional
 	return transformer.Transform<string>(base);
 }
 
-//! The token starting at `offset` (the tokens come in text order), or none
+//! The token starting at `offset`, or none - the tokens come in text order, so it is a binary search (a batch of
+//! many statements asks once per quoted value)
 inline optional_idx TokenIndexAt(const TokenIterator &tokens, idx_t offset) {
-	for (idx_t i = 0; i < tokens.Size(); i++) {
-		auto &token = tokens.GetToken(i);
-		if (token.offset > offset) {
-			break;
-		}
-		if (token.offset == offset && token.type != TokenType::END_OF_INPUT) {
-			return i;
+	idx_t low = 0;
+	idx_t high = tokens.Size();
+	while (low < high) {
+		auto middle = low + (high - low) / 2;
+		if (tokens.GetToken(middle).offset < offset) {
+			low = middle + 1;
+		} else {
+			high = middle;
 		}
 	}
+	if (low < tokens.Size() && tokens.GetToken(low).offset == offset &&
+	    tokens.GetToken(low).type != TokenType::END_OF_INPUT) {
+		return low;
+	}
 	return optional_idx();
+}
+
+//! A rule's transform process: its parse result finalized by FINALIZE
+template <arena_ptr<TransformResultValue> (*FINALIZE)(PEGTransformer &, ParseResult &)>
+arena_ptr<TransformProcess> Start(PEGTransformer &transformer, ParseResult &parse_result) {
+	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, FINALIZE);
 }
 
 //! The text a value's token must be: the value in its quotes, written plainly - so a string the tokenizer
@@ -120,7 +133,7 @@ inline bool WrittenPlainly(const string &query, const MatcherToken &token, const
 //! spec 150, stage 3 (acl_mgmt_grammar.cpp): the management statements' rules, compiled by AclGrammarCache, and a
 //! batch read with them
 shared_ptr<GrammarExtension> MakeMgmtGrammar();
-vector<MgmtParsed> ReadMgmtStatements(CompiledGrammar &compiled, shared_ptr<CompiledGrammar> owner, const string &text,
+vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, const string &text,
                                       const ParserOptions &options);
 
 } // namespace acl

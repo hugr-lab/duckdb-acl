@@ -142,6 +142,59 @@ ACL ADMIN MIGRATE POLICY aclcat;
 ----
 write MIGRATE POLICY CATALOG
 
+statement error
+ACL ADMIN MIGRATE POLICY CATALOG order;
+----
+a name that is an SQL keyword in double quotes
+
+statement error
+ACL ADMIN KILL SESSION E'x';
+----
+expected a session id, quoted
+
+statement error
+ACL ADMIN KILL SESSION $$x$$;
+----
+expected a session id, quoted
+
+statement error
+ACL ADMIN PROFILE SESSION 'x' "on";
+----
+expected a profile level written as a word
+
+# a form with more after it is that statement's refusal - the correct one before it is not blamed, and nothing runs
+statement error
+ACL ADMIN DRAIN NODE; KILL SESSION 'a' extra;
+----
+write KILL SESSION '<id>'
+
+query I
+SELECT acl_drain_status();
+----
+serving
+
+# every statement is decided before any runs: a refused one leaves the first undone
+statement error
+ACL ADMIN CREATE ROLE never_made; KILL SESSION nobody;
+----
+expected a session id, quoted
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role = 'never_made';
+----
+0
+
+# a statement the tokenizer refuses is the compiler's to judge, in its own words; the rest of the batch is read by its
+# rules as before
+statement ok
+ACL ADMIN ALTER ROLE grammar_one SET COMMENT ""; RESUME NODE;
+
+# a moved form the tokenizer refuses says the tokenizer's words
+statement error
+ACL ADMIN KILL SESSION 'unterminated;
+----
+unterminated
+
 # the grammar never runs outside a management batch: duckdb has no DRAIN statement
 statement error
 DRAIN NODE;

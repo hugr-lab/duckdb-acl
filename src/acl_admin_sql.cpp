@@ -430,6 +430,18 @@ bool IsMgmtStart(const string &text) {
 
 namespace {
 
+//! spec 150, stage 3: a moved family's form written so its rule did not read it - the form's own words. Its own type,
+//! so a batch whose tokenizer refused that very statement says the tokenizer's words instead (an unterminated string)
+class MovedFormRefusal : public BinderException {
+public:
+	explicit MovedFormRefusal(const string &usage) : BinderException("acl admin: " + usage) {
+	}
+};
+
+[[noreturn]] void RefuseMovedForm(const string &usage) {
+	throw MovedFormRefusal(usage);
+}
+
 unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 	//! `IF NOT EXISTS` after the kind keyword: keep what is there instead of refusing
 	auto if_not_exists = [&mode](AdminScanner &scanner) {
@@ -1134,7 +1146,7 @@ string ResourceLimitsJson(const string &inside) {
 	return "{" + StringUtil::Join(entries, ", ") + "}";
 }
 
-unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &current_session) {
+unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	auto keyword = s.Word("a management keyword");
 	if (auto parse = FindMgmtGrammar(keyword)) {
 		return parse(s); // spec 126: a linked module's form
@@ -1142,13 +1154,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 	// spec 150, stage 3: the operations of a node are rules (acl_mgmt_grammar.cpp); one that reaches here did not
 	// read as its rule - said in the form's own words
 	if (StringUtil::CIEquals(keyword, "profile")) {
-		throw BinderException("acl admin: write PROFILE SESSION CURRENT | '<id>' ON | ALL | SAMPLED | OFF");
+		RefuseMovedForm("write PROFILE SESSION CURRENT | '<id>' ON | ALL | SAMPLED | OFF");
 	}
 	if (StringUtil::CIEquals(keyword, "kill")) {
-		throw BinderException("acl admin: write KILL SESSION '<id>'");
+		RefuseMovedForm("write KILL SESSION '<id>'");
 	}
 	if (StringUtil::CIEquals(keyword, "set")) {
-		// SET SESSION '<id>' AUDIT LEVEL off | denied | decisions | all | DEFAULT (spec 118 over spec 069)
+		// SET SESSION VIEW AS ROLE here; SET SESSION '<id>' AUDIT LEVEL is a rule
 		s.Expect("session");
 		if (s.Accept("view")) {
 			// SET SESSION VIEW AS ROLE '<r>' (spec 120.3): this session, as role r, metadata only
@@ -1156,8 +1168,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			s.Expect("role");
 			return MakeAdminCall("acl_session_view_as", {Value(s.NameValue("a role"))});
 		}
-		throw BinderException(
-		    "acl admin: write SET SESSION '<id>' AUDIT LEVEL OFF | DENIED | DECISIONS | ALL | DEFAULT");
+		RefuseMovedForm("write SET SESSION '<id>' AUDIT LEVEL OFF | DENIED | DECISIONS | ALL | DEFAULT");
 	}
 	if (StringUtil::CIEquals(keyword, "reset")) {
 		// RESET SESSION VIEW AS (spec 120.3): back to the session's own principal
@@ -1167,10 +1178,11 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		return MakeAdminCall("acl_session_view_as", {Value(string())});
 	}
 	if (StringUtil::CIEquals(keyword, "drain") || StringUtil::CIEquals(keyword, "resume")) {
-		throw BinderException("acl admin: write DRAIN NODE / RESUME NODE");
+		RefuseMovedForm("write DRAIN NODE / RESUME NODE");
 	}
 	if (StringUtil::CIEquals(keyword, "migrate")) {
-		throw BinderException("acl admin: write MIGRATE POLICY CATALOG <database>[.<schema>]");
+		RefuseMovedForm("write MIGRATE POLICY CATALOG <database>[.<schema>] - a name that is an SQL keyword in double "
+		                "quotes");
 	}
 	if (StringUtil::CIEquals(keyword, "deny")) {
 		// DENY FUNCTION CATEGORY c TO ROLE r | ALL ROLES; DENY FUNCTION f [TABLE] TO ROLE r | ALL ROLES
@@ -1881,6 +1893,32 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 
 } // namespace
 
+namespace {
+
+//! Where a comment that opens at `start` ends, as duckdb's tokenizer reads it (spec 150: the batch's split and the
+//! grammar's agree) - a line comment at a line break of either kind, a block comment at the `*/` of its own depth
+idx_t CommentEnd(const string &text, idx_t start) {
+	if (text.compare(start, 2, "--") == 0) {
+		auto end = text.find_first_of("\n\r", start);
+		return end == string::npos ? text.size() : end;
+	}
+	idx_t depth = 0;
+	for (idx_t i = start; i + 1 < text.size(); i++) {
+		if (text[i] == '/' && text[i + 1] == '*') {
+			depth++;
+			i++;
+		} else if (text[i] == '*' && text[i + 1] == '/') {
+			if (--depth == 0) {
+				return i + 2;
+			}
+			i++;
+		}
+	}
+	return text.size();
+}
+
+} // namespace
+
 vector<string> SplitBatchText(const string &text) {
 	vector<string> out;
 	string current;
@@ -1891,12 +1929,8 @@ vector<string> SplitBatchText(const string &text) {
 		while (i < current.size()) {
 			if (StringUtil::CharacterIsSpace(current[i])) {
 				i++;
-			} else if (current.compare(i, 2, "--") == 0) {
-				auto end = current.find('\n', i);
-				i = end == string::npos ? current.size() : end + 1;
-			} else if (current.compare(i, 2, "/*") == 0) {
-				auto end = current.find("*/", i + 2);
-				i = end == string::npos ? current.size() : end + 2;
+			} else if (current.compare(i, 2, "--") == 0 || current.compare(i, 2, "/*") == 0) {
+				i = CommentEnd(current, i);
 			} else {
 				break;
 			}
@@ -1942,16 +1976,8 @@ vector<string> SplitBatchText(const string &text) {
 				}
 			}
 		}
-		if (c == '-' && i + 1 < text.size() && text[i + 1] == '-') {
-			auto end = text.find('\n', i);
-			end = end == string::npos ? text.size() : end;
-			current += text.substr(i, end - i);
-			i = end - 1;
-			continue;
-		}
-		if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
-			auto end = text.find("*/", i + 2);
-			end = end == string::npos ? text.size() : end + 2;
+		if ((c == '-' || c == '/') && i + 1 < text.size() && text[i + 1] == (c == '-' ? '-' : '*')) {
+			auto end = CommentEnd(text, i);
 			current += text.substr(i, end - i);
 			i = end - 1;
 			continue;
@@ -2002,9 +2028,9 @@ bool BatchIsAllMgmt(const string &text) {
 }
 
 //! One management statement written as text, compiled by the management compiler (a family no rule reads yet)
-unique_ptr<SQLStatement> CompileMgmtText(const string &text, const string &current_session) {
+unique_ptr<SQLStatement> CompileMgmtText(const string &text) {
 	AdminScanner scanner(text);
-	auto statement = ParseMgmtStatement(scanner, current_session);
+	auto statement = ParseMgmtStatement(scanner);
 	if (!scanner.Done()) {
 		throw BinderException("acl admin: unexpected trailing text at position %llu", scanner.pos);
 	}
@@ -2021,24 +2047,46 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 	}
 	// spec 150, stage 3: statement by statement as duckdb's grammar splits the batch - each by its rule, or as its own
 	// text by the management compiler
-	vector<MgmtParsed> parsed;
+	struct Piece {
+		MgmtParsed parsed;
+		//! the tokenizer refused this statement: a moved form says the tokenizer's words
+		shared_ptr<ErrorData> refused;
+	};
+	vector<Piece> pieces;
 	try {
-		parsed = grammar.ReadManagement(text, options);
+		for (auto &parsed : grammar.ReadManagement(text, options)) {
+			pieces.push_back(Piece {std::move(parsed), nullptr});
+		}
 	} catch (ParserException &) {
-		// a text duckdb's tokenizer refuses (an empty quoted name, an unterminated string): the management compiler
-		// reads it piece by piece and says what is wrong in its own words, as it did
-		parsed.clear();
+		// a text duckdb's tokenizer refuses (an empty quoted name, an unterminated string): piece by piece as the batch
+		// splits - each piece the grammar reads is its rules', and the one it refuses goes to the compiler, which says
+		// what is wrong in its own words, as it did
+		pieces.clear();
 		for (auto &piece : SplitBatchText(text)) {
-			MgmtParsed entry;
-			entry.legacy = true;
-			entry.text = piece;
-			parsed.push_back(std::move(entry));
+			try {
+				for (auto &parsed : grammar.ReadManagement(piece, options)) {
+					pieces.push_back(Piece {std::move(parsed), nullptr});
+				}
+			} catch (ParserException &refusal) {
+				MgmtParsed parsed;
+				parsed.legacy = true;
+				parsed.text = piece;
+				pieces.push_back(Piece {std::move(parsed), make_shared_ptr<ErrorData>(refusal)});
+			}
 		}
 	}
 	vector<unique_ptr<SQLStatement>> statements;
-	for (auto &entry : parsed) {
+	for (auto &piece : pieces) {
+		auto &entry = piece.parsed;
 		if (entry.legacy) {
-			statements.push_back(CompileMgmtText(entry.text, current_session));
+			try {
+				statements.push_back(CompileMgmtText(entry.text));
+			} catch (MovedFormRefusal &) {
+				if (piece.refused) {
+					piece.refused->Throw();
+				}
+				throw;
+			}
 			continue;
 		}
 		if (entry.current_session) {

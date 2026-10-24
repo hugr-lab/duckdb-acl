@@ -22,6 +22,7 @@ namespace acl {
 namespace {
 
 using grammar::KeywordOf;
+using grammar::Start;
 using grammar::Strip;
 using grammar::TokenIndexAt;
 using grammar::ValueOf;
@@ -43,6 +44,8 @@ struct MgmtParseData : ParserExtensionParseData {
 	vector<Value> args;
 	bool current_session = false;
 	vector<QuotedValue> quoted;
+	//! words that must be written bare (a level is a word, never a quoted name)
+	vector<QuotedValue> bare;
 
 	unique_ptr<ParserExtensionParseData> Copy() const override {
 		return make_uniq<MgmtParseData>(*this);
@@ -78,16 +81,18 @@ string Quoted(PEGTransformer &transformer, ListParseResult &list, idx_t index, c
 	return entry.value;
 }
 
-//! `AclLevelWord <- 'ON' / 'ALL' / 'OFF' / 'DEFAULT' / Identifier`, lower-cased
-string LevelWord(PEGTransformer &transformer, ParseResult &result) {
+//! `AclLevelWord <- 'ON' / 'ALL' / 'OFF' / 'DEFAULT' / Identifier`, lower-cased - written bare
+string LevelWord(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
 	auto &base = Strip(result);
 	auto keyword = KeywordOf(base);
-	return keyword.empty() ? StringUtil::Lower(transformer.Transform<string>(base)) : keyword;
-}
-
-template <arena_ptr<TransformResultValue> (*FINALIZE)(PEGTransformer &, ParseResult &)>
-arena_ptr<TransformProcess> Start(PEGTransformer &transformer, ParseResult &parse_result) {
-	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, FINALIZE);
+	if (!keyword.empty()) {
+		return keyword;
+	}
+	QuotedValue entry;
+	entry.offset = base.offset;
+	entry.what = what;
+	data.bare.push_back(entry);
+	return StringUtil::Lower(transformer.Transform<string>(base));
 }
 
 // --- the operations of a node (spec 118) ----------------------------------------------------------------------------
@@ -105,7 +110,7 @@ arena_ptr<TransformResultValue> FinalizeAuditLevel(PEGTransformer &transformer, 
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = Call("acl_session_audit_level");
 	data->args.emplace_back(Quoted(transformer, list, 2, "a session id", *data));
-	auto level = LevelWord(transformer, list.GetChild(5));
+	auto level = LevelWord(transformer, list.GetChild(5), "an audit level", *data);
 	data->args.emplace_back(level == "default" ? string() : level);
 	return MgmtResult(transformer, std::move(data));
 }
@@ -122,7 +127,7 @@ arena_ptr<TransformResultValue> FinalizeProfile(PEGTransformer &transformer, Par
 	} else {
 		data->args.emplace_back(Quoted(transformer, list, 2, "a session id", *data));
 	}
-	auto word = LevelWord(transformer, list.GetChild(3));
+	auto word = LevelWord(transformer, list.GetChild(3), "a profile level", *data);
 	string level;
 	if (word == "on" || word == "all") {
 		level = "all";
@@ -241,20 +246,45 @@ shared_ptr<GrammarExtension> MakeMgmtGrammar() {
 	return make_shared_ptr<AclMgmtGrammar>();
 }
 
-vector<MgmtParsed> ReadMgmtStatements(CompiledGrammar &compiled, shared_ptr<CompiledGrammar> owner, const string &text,
+vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, const string &text,
                                       const ParserOptions &options) {
 	ParserOptions inner = options;
-	inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
-	inner.compiled_grammar = std::move(owner);
+	inner.compiled_grammar = compiled;
 	auto owned = make_uniq<vector<MatcherToken>>();
 	ParserTokenizerBehavior behavior(text, *owned);
-	compiled.GetTokenizer().TokenizeInput(behavior);
+	compiled->GetTokenizer().TokenizeInput(behavior);
 	TokenIterator tokens(std::move(owned));
 	TokenIterator cursor(tokens);
 	Parser parser(inner);
 	vector<MgmtParsed> result;
 	while (cursor.Current()) {
-		auto statement = parser.ParseTopLevelStatement(cursor);
+		auto start = cursor.Position();
+		unique_ptr<SQLStatement> statement;
+		try {
+			statement = parser.ParseTopLevelStatement(cursor);
+		} catch (ParserException &) {
+			// a form a rule began but more follows it before its `;` (PEG keeps the rule that matched): the statement's
+			// tokens up to its `;` go to the compiler as its own text, as a statement no rule reads does
+			auto end = start;
+			while (end < tokens.Size() && tokens.GetToken(end).type != TokenType::TERMINATOR &&
+			       tokens.GetToken(end).type != TokenType::END_OF_INPUT) {
+				end++;
+			}
+			if (end == start) {
+				throw;
+			}
+			auto &last = tokens.GetToken(end - 1);
+			MgmtParsed parsed;
+			parsed.legacy = true;
+			parsed.text =
+			    text.substr(tokens.GetToken(start).offset, last.offset + last.length - tokens.GetToken(start).offset);
+			result.push_back(std::move(parsed));
+			cursor.SetPosition(end);
+			while (cursor.Current() && cursor.Current()->type == TokenType::TERMINATOR) {
+				cursor.Advance();
+			}
+			continue;
+		}
 		if (!statement) {
 			continue; // a separator
 		}
@@ -264,6 +294,13 @@ vector<MgmtParsed> ReadMgmtStatements(CompiledGrammar &compiled, shared_ptr<Comp
 			if (!index.IsValid() || !WrittenPlainly(text, tokens.GetToken(index.GetIndex()), quoted.value)) {
 				throw BinderException("acl admin: expected %s, quoted ('...' or \"...\") as one plain literal",
 				                      quoted.what);
+			}
+		}
+		for (auto &bare : data.bare) {
+			auto index = bare.offset.IsValid() ? TokenIndexAt(tokens, bare.offset.GetIndex()) : optional_idx();
+			if (!index.IsValid() || tokens.GetToken(index.GetIndex()).text.empty() ||
+			    tokens.GetToken(index.GetIndex()).text[0] == '"') {
+				throw BinderException("acl admin: expected %s written as a word, not a quoted name", bare.what);
 			}
 		}
 		MgmtParsed parsed;

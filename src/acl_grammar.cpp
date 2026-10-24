@@ -131,10 +131,6 @@ arena_ptr<TransformResultValue> FinalizePrefix(PEGTransformer &transformer, Pars
 	return transformer.MakeResult<unique_ptr<SQLStatement>>(std::move(result));
 }
 
-arena_ptr<TransformProcess> StartPrefix(PEGTransformer &transformer, ParseResult &parse_result) {
-	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, FinalizePrefix);
-}
-
 //! The rules. The override's variant passes the rest through as tokens - it is parsed as its own text
 //! afterwards, by whatever reads that mode - and the registered one (completion only) offers a statement
 class AclPrefixGrammar final : public GrammarExtension {
@@ -146,7 +142,7 @@ public:
 	vector<GrammarChange> GetChanges() const override {
 		vector<GrammarChange> changes;
 		changes.push_back(GrammarChange::AddRule(
-		    "AclPrefixedStatement <- 'ACL' AclPrincipal AclMarker* AclMode? AclTail?", StartPrefix));
+		    "AclPrefixedStatement <- 'ACL' AclPrincipal AclMarker* AclMode? AclTail?", grammar::Start<FinalizePrefix>));
 		changes.push_back(GrammarChange::AddRule("AclPrincipal <- AclPrincipalWord AclQuotedValue / 'ADMIN'"));
 		changes.push_back(GrammarChange::AddRule("AclPrincipalWord <- 'ROLE' / 'TOKEN' / 'SESSION' / 'INGEST'"));
 		// a value is quoted text, '…' or "…" (the reader refuses anything but one literal written plainly); the
@@ -287,7 +283,7 @@ vector<MgmtParsed> AclGrammarCache::ReadManagement(const string &text, const Par
 		}
 		compiled = impl->management_compiled;
 	}
-	return ReadMgmtStatements(*compiled, compiled, text, options);
+	return ReadMgmtStatements(std::move(compiled), text, options);
 }
 
 bool AclGrammarCache::ReadPrefix(const string &query, const ParserOptions &options, GrammarPrefix &out) {

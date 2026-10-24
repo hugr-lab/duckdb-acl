@@ -11,6 +11,8 @@
 
 #include "acl_policy.hpp"
 
+#include "duckdb/parser/parser_options.hpp"
+
 namespace duckdb {
 class SQLStatement;
 
@@ -22,7 +24,8 @@ class AclGrammarCache;
 bool IsMgmtStart(const string &text);
 
 //! Compile a management batch (statements separated by `;`) into admin-function calls. Parse-time
-//! only: nothing is written until the statements execute. A syntax error throws a ParserException.
+//! only: nothing is written until the statements execute. A statement that does not read is refused (a
+//! ParserException from the tokenizer, a BinderException from a form).
 //! `current_session` is the ops id of the session the batch runs under ('' off a session): what
 //! `PROFILE SESSION CURRENT` names (spec 074 slice 3).
 //! spec 150, stage 3: the batch is read by `grammar`'s management rules, a family no rule reads yet by the compiler.
