@@ -67,8 +67,6 @@ ACL ADMIN CREATE ISSUER 'https://kc/realms/x'
 - `CLAIM MAP` - JWT path `=>` the name `acl_claim` reads.
 - `CLIENT ID` - optional: what drivers log in as.
 
-A comment inside this statement is refused for now - put notes before or after it.
-
 A quoted URL in place of a name is the short form. It creates the issuer, named by its URL, and its
 **implicit client** of the same name: the audiences, the role claim, the claim map, the client id -
 and, because a single own IdP usually names its roles like the ACL does, an unmapped role value that

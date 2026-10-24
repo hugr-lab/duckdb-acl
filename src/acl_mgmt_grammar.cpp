@@ -72,6 +72,8 @@ struct MgmtParseData : ParserExtensionParseData {
 		bool expression = false;
 		//! a quoted list a reader of ours splits: judged as the compiler's text is (no comment, no `$$`, ...)
 		bool judge = false;
+		//! where the list's reading goes inside the argument (a JSON spec), '' = the whole argument
+		string splice;
 	};
 	vector<Span> spans;
 
@@ -723,12 +725,13 @@ vector<reference<ParseResult>> Clauses(ListParseResult &list, idx_t index) {
 
 //! A clause kind written once: a repeated one (`RLS (tenant = 'x') … RLS ()`) would leave a reader of the statement
 //! the first while the last took effect - refused
-void ClauseOnce(case_insensitive_set_t &seen, const string &kind) {
+void ClauseOnce(case_insensitive_set_t &seen, const string &kind, const string &shown = string()) {
 	if (!seen.insert(kind).second) {
-		auto shown = kind == "primary" ? string("PRIMARY KEY")
-		             : kind == "caps"  ? "CAPS / WITH"
-		                               : StringUtil::Upper(kind);
-		throw BinderException("acl admin: %s is written twice - write each clause once", shown);
+		auto words = !shown.empty()      ? shown
+		             : kind == "primary" ? string("PRIMARY KEY")
+		             : kind == "caps"    ? string("CAPS / WITH")
+		                                 : StringUtil::Upper(kind);
+		throw BinderException("acl admin: %s is written twice - write each clause once", words);
 	}
 }
 
@@ -1561,6 +1564,275 @@ arena_ptr<TransformResultValue> FinalizeAlterGrant(PEGTransformer &transformer, 
 	return MgmtResult(transformer, std::move(data));
 }
 
+// --- issuers and clients (spec 095) --------------------------------------------------------------------------------
+
+//! A parenthesised list inside a JSON spec: its marker in the spec, which the reading of its text replaces once the
+//! batch's tokens are known (a control character never stands raw in JSON, so no value can forge it)
+string SpecListMarker(ParseResult &paren_list, MgmtParsed::TextKind kind, idx_t arg, MgmtParseData &data) {
+	auto index = data.spans.size();
+	auto marker = string("\x01") + std::to_string(index) + "\x01";
+	ParensInto(paren_list, arg, kind, false, data);
+	if (data.spans.size() != index + 1) {
+		throw ParserException("acl admin: a list inside a spec left no span");
+	}
+	data.spans[index].splice = marker;
+	return marker;
+}
+
+//! A JSON list of a legacy csv's items (`'a,b'`): split at the commas, each trimmed, the empty ones left out
+string CsvItemsJson(const string &csv) {
+	vector<string> items;
+	for (auto &item : StringUtil::Split(csv, ',')) {
+		StringUtil::Trim(item);
+		if (!item.empty()) {
+			items.push_back(JsonQuote(item));
+		}
+	}
+	return "[" + StringUtil::Join(items, ",") + "]";
+}
+
+//! `AclList <- AclParenList / AclQuotedValue` inside a JSON spec: a list of values as written, or the legacy csv
+string ItemsJson(PEGTransformer &transformer, ParseResult &result, const char *what, idx_t arg, MgmtParseData &data) {
+	auto &node = Strip(result);
+	if (node.Name() == "AclParenList") {
+		return SpecListMarker(node, MgmtParsed::TextKind::ITEMS, arg, data);
+	}
+	QuotedValue entry;
+	entry.value = ValueOf(transformer, node, entry.offset);
+	entry.what = what;
+	data.quoted.push_back(entry);
+	return CsvItemsJson(entry.value);
+}
+
+//! `FROM SECRET <name> [IN <service>]`'s entries: the secret's name at `name`, AclSecretIn? after it
+void SecretEntries(PEGTransformer &transformer, ListParseResult &clause, idx_t name, vector<string> &entries,
+                   MgmtParseData &data) {
+	entries.push_back("\"secret\":" +
+	                  JsonQuote(NameValueOf(transformer, clause.GetChild(name), "a secret name", data)));
+	auto &in = clause.Child<OptionalParseResult>(name + 1);
+	if (in.HasResult()) {
+		// AclSecretIn <- 'IN' AclName
+		entries.push_back("\"service\":" +
+		                  JsonQuote(NameOf(ClauseList(in.GetResult()).GetChild(1), "a secrets service")));
+	}
+}
+
+//! One clause of a client (spec 095 §2) into its spec entries: each clause once. `issuer` collects what is the
+//! issuer's in the short form (URL, its own FROM SECRET); null when the clause belongs to a client alone
+void ClientClauseInto(PEGTransformer &transformer, ParseResult &result, idx_t arg, vector<string> &entries,
+                      optional_ptr<vector<string>> issuer, case_insensitive_set_t &seen, MgmtParseData &data) {
+	auto &clause = Strip(result);
+	if (clause.Name() == "AclKeysClause") {
+		// AclKeysClause <- AclKeysWord AclList? (AclKeysWord <- 'KEYS' / 'ALGS')
+		throw BinderException(
+		    "acl admin: an issuer's keys and algorithms are never written into the policy - the "
+		    "issuer's OIDC discovery supplies them, or KEYS / KEYS_FROM / ALGS in an oidc_issuer secret "
+		    "named with FROM SECRET");
+	}
+	auto name = clause.Name();
+	auto &parts = clause.Cast<ListParseResult>();
+	// each clause once, by what it writes (a repeated one wrote its key twice into the spec, the last taking effect):
+	// ROLE CLAIM and ROLES FROM both name the role sources, ATTRIBUTES and CLAIM MAP both the attributes
+	if (name == "AclRoleClaim" || name == "AclRolesFrom") {
+		ClauseOnce(seen, "roles_from", "ROLE CLAIM / ROLES FROM");
+	} else if (name == "AclAttributes" || name == "AclClaimMap") {
+		ClauseOnce(seen, "attributes", "ATTRIBUTES / CLAIM MAP");
+	} else {
+		vector<string> words; // shown as its leading words
+		for (auto &child : parts.GetChildren()) {
+			if (child.get().type != ParseResultType::KEYWORD) {
+				break;
+			}
+			words.push_back(KeywordOf(child.get()));
+		}
+		ClauseOnce(seen, name, StringUtil::Upper(StringUtil::Join(words, " ")));
+	}
+	if (name == "AclUrlClause") {
+		// AclUrlClause <- 'URL' AclQuotedValue - empty = none (ALTER ISSUER … SET URL '')
+		auto url = Quoted(transformer, parts, 1, "URL", data);
+		issuer->push_back("\"url\":" + (url.empty() ? string("null") : JsonQuote(url)));
+	} else if (name == "AclFromSecret") {
+		// AclFromSecret <- 'FROM' 'SECRET' AclNameValue AclSecretIn? - an issuer's clause names the issuer's keys, a
+		// client's its own
+		SecretEntries(transformer, parts, 2, issuer ? *issuer : entries, data);
+	} else if (name == "AclClientSecret") {
+		// AclClientSecret <- 'CLIENT' 'FROM' 'SECRET' AclNameValue AclSecretIn? - the short form's client
+		SecretEntries(transformer, parts, 3, entries, data);
+	} else if (name == "AclAudiences" || name == "AclAzp" || name == "AclFlows" || name == "AclRolesFrom" ||
+	           name == "AclRolesConstant") {
+		auto key = name == "AclAudiences"   ? "audiences"
+		           : name == "AclAzp"       ? "azp"
+		           : name == "AclFlows"     ? "flows"
+		           : name == "AclRolesFrom" ? "roles_from"
+		                                    : "roles_constant";
+		auto what = name == "AclRolesFrom" ? "claim paths" : name == "AclRolesConstant" ? "roles" : key;
+		entries.push_back(string("\"") + key + "\":" +
+		                  ItemsJson(transformer, parts.GetChild(parts.GetChildren().size() - 1), what, arg, data));
+	} else if (name == "AclRequire" || name == "AclAttributes") {
+		// AclRequire <- 'REQUIRE' AclList / AclAttributes <- 'ATTRIBUTES' AclList - a list in parentheses only
+		bool require = name == "AclRequire";
+		auto &list = Strip(parts.GetChild(1));
+		if (list.Name() != "AclParenList") {
+			throw BinderException(require ? "acl admin: REQUIRE takes its conditions in parentheses"
+			                              : "acl admin: ATTRIBUTES takes its list in parentheses");
+		}
+		entries.push_back(string(require ? "\"require\":" : "\"attributes\":") +
+		                  SpecListMarker(list,
+		                                 require ? MgmtParsed::TextKind::REQUIRE : MgmtParsed::TextKind::ATTRIBUTES,
+		                                 arg, data));
+	} else if (name == "AclClaimMap") {
+		// AclClaimMap <- 'CLAIM' 'MAP' AclList - the map kept as a JSON string, which the spec parses
+		auto &map = Strip(parts.GetChild(2));
+		entries.push_back("\"claim_map\":" + (map.Name() == "AclParenList"
+		                                          ? SpecListMarker(map, MgmtParsed::TextKind::CLAIM_MAP, arg, data)
+		                                          : JsonQuote(Quoted(transformer, parts, 2, "claim map", data))));
+	} else if (name == "AclRoleClaim") {
+		// AclRoleClaim <- 'ROLE' 'CLAIM' AclQuotedValue - the short form's one source
+		entries.push_back("\"roles_from\":[" + JsonQuote(Quoted(transformer, parts, 2, "role claim path", data)) + "]");
+	} else if (name == "AclUnmapped") {
+		// AclUnmapped <- 'UNMAPPED' AclUnmappedAs
+		entries.push_back(string("\"unmapped\":") +
+		                  (KeywordOf(parts.GetChild(1)) == "ignore" ? "\"ignore\"" : "\"as_role\""));
+	} else if (name == "AclSubject") {
+		// AclSubject <- 'SUBJECT' AclList - paths in parentheses, or one quoted path
+		auto &paths = Strip(parts.GetChild(1));
+		entries.push_back("\"subject\":" +
+		                  (paths.Name() == "AclParenList"
+		                       ? SpecListMarker(paths, MgmtParsed::TextKind::ITEMS, arg, data)
+		                       : "[" + JsonQuote(Quoted(transformer, parts, 1, "subject path", data)) + "]"));
+	} else if (name == "AclTokenType") {
+		// AclTokenType <- 'TOKEN' 'TYPE' AclQuotedValue
+		entries.push_back("\"token_type\":" + JsonQuote(Quoted(transformer, parts, 2, "token type", data)));
+	} else if (name == "AclClientId") {
+		// AclClientId <- 'CLIENT' 'ID' AclQuotedValue
+		entries.push_back("\"client_id\":" + JsonQuote(Quoted(transformer, parts, 2, "client id", data)));
+	} else if (name == "AclClientSecretValue") {
+		throw BinderException("acl admin: a client secret is never written into the policy - keep it as "
+		                      "CLIENT_SECRET in an oidc_client secret of the secrets service and name that secret (%s)",
+		                      issuer ? "CLIENT FROM SECRET s" : "FROM SECRET s");
+	} else {
+		throw ParserException("acl admin: a client clause no rule names");
+	}
+}
+
+string SpecObject(const vector<string> &entries) {
+	return "{" + StringUtil::Join(entries, ",") + "}";
+}
+
+// AclCreateIssuer <- 'CREATE' AclOrReplace? 'ISSUER' AclIfNotExists? AclIssuerName AclIssuerClause* - any client
+// clause makes it the short form, with an implicit client; a quoted name is the short form's URL unless URL says one
+arena_ptr<TransformResultValue> FinalizeCreateIssuer(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_define_issuer");
+	// AclIssuerName <- StringLiteral / AclNameToken: '…' or "…" is a quoted name (the compiler's Quoted), else a word
+	auto &name_node = Strip(list.GetChild(4));
+	string name;
+	bool quoted = name_node.Name() != "AclNameToken" || TokenOf(name_node).text[0] == '"';
+	if (name_node.Name() == "AclNameToken") {
+		name = NameOf(name_node, "an issuer name");
+	} else {
+		name = Quoted(transformer, list, 4, "issuer", *data);
+	}
+	data->args = {Value(name), Value(string()), Value(CreateMode(list, 1, 3))};
+	vector<string> issuer_entries, client_entries;
+	case_insensitive_set_t seen;
+	for (auto &clause : Clauses(list, 5)) {
+		ClientClauseInto(transformer, clause, 1, client_entries, &issuer_entries, seen, *data);
+	}
+	bool has_url = seen.count("AclUrlClause");
+	if (!has_url && quoted) {
+		issuer_entries.push_back("\"url\":" + JsonQuote(name)); // the short form's name IS its URL
+	} else if (!has_url && !seen.count("AclFromSecret")) {
+		throw BinderException("acl admin: issuer \"%s\" needs its URL - URL '<url>', or the URL as its quoted name, "
+		                      "or an oidc_issuer secret carrying it (FROM SECRET s)",
+		                      name);
+	}
+	if (!client_entries.empty()) {
+		issuer_entries.push_back("\"client\":" + SpecObject(client_entries));
+	}
+	data->args[1] = Value(SpecObject(issuer_entries));
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclCreateClient <- 'CREATE' AclOrReplace? 'CLIENT' AclIfNotExists? AclNameValue 'ISSUER' AclNameValue
+//     AclClientClause*
+arena_ptr<TransformResultValue> FinalizeCreateClient(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_define_client");
+	data->args = {Value(NameValueOf(transformer, list.GetChild(4), "a client name", *data)),
+	              Value(NameValueOf(transformer, list.GetChild(6), "an issuer name", *data)), Value(string()),
+	              Value(CreateMode(list, 1, 3))};
+	vector<string> entries;
+	case_insensitive_set_t seen;
+	for (auto &clause : Clauses(list, 7)) {
+		ClientClauseInto(transformer, clause, 2, entries, nullptr, seen, *data);
+	}
+	data->args[2] = Value(SpecObject(entries));
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclAlterIssuer <- 'ALTER' 'ISSUER' AclNameValue AclIssuerChange - SET (URL | [CLIENT] FROM SECRET | a client clause)
+// … | DROP [CLIENT] FROM SECRET (AclIssuerChange <- AclIssuerDropSecret / AclIssuerSet)
+arena_ptr<TransformResultValue> FinalizeAlterIssuer(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_alter_issuer");
+	auto name = NameValueOf(transformer, list.GetChild(2), "an issuer name", *data);
+	data->args = {Value(name), Value(string())};
+	vector<string> issuer_entries, client_entries;
+	auto &change = Strip(list.GetChild(3)).Cast<ListParseResult>();
+	if (change.Name() == "AclIssuerDropSecret") {
+		// AclIssuerDropSecret <- 'DROP' 'CLIENT'? 'FROM' 'SECRET'
+		(change.Child<OptionalParseResult>(1).HasResult() ? client_entries : issuer_entries)
+		    .push_back("\"secret\":null");
+	} else {
+		// AclIssuerSet <- 'SET' AclIssuerClause+
+		case_insensitive_set_t seen;
+		vector<reference<ParseResult>> clauses;
+		grammar::Collect(change.GetChild(1), clauses);
+		for (auto &clause : clauses) {
+			ClientClauseInto(transformer, clause, 1, client_entries, &issuer_entries, seen, *data);
+		}
+	}
+	if (!client_entries.empty()) {
+		issuer_entries.push_back("\"client\":" + SpecObject(client_entries));
+	}
+	data->args[1] = Value(SpecObject(issuer_entries));
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclAlterClient <- 'ALTER' 'CLIENT' AclNameValue AclClientChange - SET (FROM SECRET | a client clause) … |
+// DROP FROM SECRET
+arena_ptr<TransformResultValue> FinalizeAlterClient(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_alter_client");
+	data->args = {Value(NameValueOf(transformer, list.GetChild(2), "a client name", *data)), Value(string())};
+	vector<string> entries;
+	auto &change = Strip(list.GetChild(3)).Cast<ListParseResult>();
+	if (change.Name() == "AclClientDropSecret") {
+		entries.push_back("\"secret\":null"); // AclClientDropSecret <- 'DROP' 'FROM' 'SECRET'
+	} else {
+		// AclClientSet <- 'SET' AclClientClause+
+		case_insensitive_set_t seen;
+		vector<reference<ParseResult>> clauses;
+		grammar::Collect(change.GetChild(1), clauses);
+		for (auto &clause : clauses) {
+			ClientClauseInto(transformer, clause, 1, entries, nullptr, seen, *data);
+		}
+	}
+	data->args[1] = Value(SpecObject(entries));
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclDropIdentity <- 'DROP' AclIdentityKind AclIfExists? AclNameValue (AclIdentityKind <- 'ISSUER' / 'CLIENT')
+arena_ptr<TransformResultValue> FinalizeDropIdentity(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	bool issuer = KeywordOf(list.GetChild(1)) == "issuer";
+	auto data = Call(issuer ? "acl_drop_issuer" : "acl_drop_client");
+	data->args = {Value(NameValueOf(transformer, list.GetChild(3), issuer ? "an issuer name" : "a client name", *data)),
+	              Value(DropMode(list, 2))};
+	return MgmtResult(transformer, std::move(data));
+}
+
 // --- a statement no rule reads yet ------------------------------------------------------------------------------
 
 // AclMgmtLegacy <- AclTailToken+ : its span, for the management compiler
@@ -1865,6 +2137,60 @@ public:
 		changes.push_back(GrammarChange::AddRule(
 		    "AclAlterGrant <- 'ALTER' 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName 'SET' AclGrantSet",
 		    Start<FinalizeAlterGrant>));
+		// issuers and clients (spec 095)
+		changes.push_back(GrammarChange::AddRule("AclSecretIn <- 'IN' AclName"));
+		changes.push_back(GrammarChange::AddRule("AclUrlClause <- 'URL' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclFromSecret <- 'FROM' 'SECRET' AclNameValue AclSecretIn?"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclClientSecret <- 'CLIENT' 'FROM' 'SECRET' AclNameValue AclSecretIn?"));
+		changes.push_back(GrammarChange::AddRule("AclAudiences <- 'AUDIENCES' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclAzp <- 'AZP' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclRequire <- 'REQUIRE' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclRolesFrom <- 'ROLES' 'FROM' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclRolesConstant <- 'ROLES' 'CONSTANT' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclRoleClaim <- 'ROLE' 'CLAIM' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclUnmappedAs <- 'IGNORE' / AclAsRole"));
+		changes.push_back(GrammarChange::AddRule("AclAsRole <- 'AS' 'ROLE'"));
+		changes.push_back(GrammarChange::AddRule("AclUnmapped <- 'UNMAPPED' AclUnmappedAs"));
+		changes.push_back(GrammarChange::AddRule("AclAttributes <- 'ATTRIBUTES' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclClaimMap <- 'CLAIM' 'MAP' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclSubject <- 'SUBJECT' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclTokenType <- 'TOKEN' 'TYPE' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclFlows <- 'FLOWS' AclList"));
+		changes.push_back(GrammarChange::AddRule("AclClientId <- 'CLIENT' 'ID' AclQuotedValue"));
+		// what is never written into the policy - read with its value, so the refusal says where it goes
+		changes.push_back(GrammarChange::AddRule("AclClientSecretValue <- 'CLIENT' 'SECRET' AclList?"));
+		changes.push_back(GrammarChange::AddRule("AclKeysWord <- 'KEYS' / 'ALGS'"));
+		changes.push_back(GrammarChange::AddRule("AclKeysClause <- AclKeysWord AclList?"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclClientCommon <- AclAudiences / AclAzp / AclRequire / AclRolesFrom / AclRolesConstant / AclRoleClaim / "
+		    "AclUnmapped / AclAttributes / AclClaimMap / AclSubject / AclTokenType / AclFlows / AclClientId / "
+		    "AclClientSecretValue / AclKeysClause"));
+		// the short form's clauses: the issuer's URL and secret, the implicit client's CLIENT FROM SECRET
+		changes.push_back(GrammarChange::AddRule(
+		    "AclIssuerClause <- AclUrlClause / AclFromSecret / AclClientSecret / AclClientCommon"));
+		// a client's own: its FROM SECRET
+		changes.push_back(GrammarChange::AddRule("AclClientClause <- AclFromSecret / AclClientCommon"));
+		changes.push_back(GrammarChange::AddRule("AclIssuerName <- StringLiteral / AclNameToken"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclCreateIssuer <- 'CREATE' AclOrReplace? 'ISSUER' AclIfNotExists? AclIssuerName AclIssuerClause*",
+		    Start<FinalizeCreateIssuer>));
+		changes.push_back(GrammarChange::AddRule("AclCreateClient <- 'CREATE' AclOrReplace? 'CLIENT' AclIfNotExists? "
+		                                         "AclNameValue 'ISSUER' AclNameValue AclClientClause*",
+		                                         Start<FinalizeCreateClient>));
+		changes.push_back(GrammarChange::AddRule("AclIssuerDropSecret <- 'DROP' 'CLIENT'? 'FROM' 'SECRET'"));
+		changes.push_back(GrammarChange::AddRule("AclIssuerSet <- 'SET' AclIssuerClause+"));
+		changes.push_back(GrammarChange::AddRule("AclIssuerChange <- AclIssuerDropSecret / AclIssuerSet"));
+		changes.push_back(GrammarChange::AddRule("AclAlterIssuer <- 'ALTER' 'ISSUER' AclNameValue AclIssuerChange",
+		                                         Start<FinalizeAlterIssuer>));
+		changes.push_back(GrammarChange::AddRule("AclClientDropSecret <- 'DROP' 'FROM' 'SECRET'"));
+		changes.push_back(GrammarChange::AddRule("AclClientSet <- 'SET' AclClientClause+"));
+		changes.push_back(GrammarChange::AddRule("AclClientChange <- AclClientDropSecret / AclClientSet"));
+		changes.push_back(GrammarChange::AddRule("AclAlterClient <- 'ALTER' 'CLIENT' AclNameValue AclClientChange",
+		                                         Start<FinalizeAlterClient>));
+		changes.push_back(GrammarChange::AddRule("AclIdentityKind <- 'ISSUER' / 'CLIENT'"));
+		changes.push_back(GrammarChange::AddRule("AclDropIdentity <- 'DROP' AclIdentityKind AclIfExists? AclNameValue",
+		                                         Start<FinalizeDropIdentity>));
 		// a statement no rule reads yet: its tokens, to the management compiler
 		changes.push_back(GrammarChange::AddRule("AclTailToken <- Identifier"));
 		changes.push_back(
@@ -1883,7 +2209,8 @@ public:
 		    "AclAnalyzeCatalog / "
 		    "AclAnalyzeObject / AclDropRelation / AclDropReference / AclDropCatalog / AclDropSchema / "
 		    "AclDropFunction / AclDropObject / AclGrantCatalog / AclGrantSchema / AclGrantObject / AclRevokeCatalog / "
-		    "AclRevokeSchema / AclRevokeObject / AclAlterGrant / AclMgmtLegacy"));
+		    "AclRevokeSchema / AclRevokeObject / AclAlterGrant / AclCreateIssuer / AclCreateClient / AclAlterIssuer / "
+		    "AclAlterClient / AclDropIdentity / AclMgmtLegacy"));
 		// the batch holds management statements only: duckdb's own are not ours to read here
 		changes.push_back(GrammarChange::ReplaceRule("Statement <- AclMgmtStatement", Start<FinalizeStatement>));
 		return changes;
@@ -1911,8 +2238,8 @@ bool JoinsStrings(const MatcherToken &previous, const MatcherToken &next) {
 //! The text of the tokens in [start, end) - a list between its parentheses or a body - refused unless the tokens
 //! tile it as written (only whitespace and comments between them: after a lone `$` duckdb's tokenizer places the next
 //! token at the `$`). A gap that holds a comment is, when `comments_as_space`, a space - a line break where duckdb
-//! would join the strings on its two sides (`'a' -- c⏎'b'` is `'ab'`) and the list's reader does too (`joins`) - else
-//! as written
+//! would join the strings on its two sides (`'a' -- c⏎'b'` is `'ab'`), when the text's reader joins them as duckdb
+//! does (`joins`) - else as written
 string TokensText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool comments_as_space,
                   bool joins, const string &refusal, const std::function<void(const MatcherToken &)> &judge) {
 	auto refuse = [&refusal]() {
@@ -1965,14 +2292,25 @@ bool BetweenParentheses(const string &text, idx_t start, idx_t end) {
 //! A parenthesised list's text between its parentheses, as written with each comment a space (a comment would
 //! otherwise be read as part of the list: `(a = 1 -- note⏎)` left an open comment in an RLS predicate). A list our
 //! readers split (`SplitTopLevel` knows `'…'` with `''` and `"…"` only) refuses a literal it would split into other
-//! items than written - a `$$…$$` string, an `E'…'` one with a backslash, a backtick name; one duckdb's parser reads
+//! items than written - a `$$…$$` string, an `E'…'` one with a backslash, a backtick name - and one whose items its
+//! reader takes as literals (`literal_items`: spec 095's lists) a string continued on the next line, which duckdb
+//! joins (an item that is SQL - a mask, a REMAP expression - is read by duckdb, joined); one duckdb's parser reads
 //! (`sql`) takes any
-string ListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool sql) {
+string ListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool sql, bool literal_items) {
 	if (!BetweenParentheses(text, start, end)) {
 		throw BinderException(TILING_REFUSAL);
 	}
-	return TokensText(text, tokens, start, end, true, true, TILING_REFUSAL, [sql](const MatcherToken &token) {
-		if (sql || token.text.empty()) {
+	optional_ptr<const MatcherToken> previous;
+	return TokensText(text, tokens, start, end, true, true, TILING_REFUSAL, [&](const MatcherToken &token) {
+		if (sql) {
+			return;
+		}
+		if (literal_items && previous && JoinsStrings(*previous, token)) {
+			throw BinderException("acl admin: a list item is one literal - a string continued on the next line (which "
+			                      "duckdb joins) is not read as one item here yet");
+		}
+		previous = &token;
+		if (token.text.empty()) {
 			return;
 		}
 		bool dollar = token.type == TokenType::STRING_LITERAL && token.text[0] == '$';
@@ -1995,9 +2333,15 @@ string ClaimsListText(const string &text, const TokenIterator &tokens, idx_t sta
 	if (!BetweenParentheses(text, start, end)) {
 		refuse("its text does not read as written");
 	}
+	optional_ptr<const MatcherToken> previous;
 	return TokensText(
 	    text, tokens, start, end, true, false, prefix + "its text does not read as written",
 	    [&](const MatcherToken &token) {
+		    if (previous && JoinsStrings(*previous, token)) {
+			    refuse(
+			        "a value is one literal (a string continued on the next line is not read as one value here yet)");
+		    }
+		    previous = &token;
 		    if (token.type == TokenType::STRING_LITERAL && (token.text.empty() || token.text[0] != '\'')) {
 			    refuse("a value is in single quotes (E'...' and $$...$$ are not read as one value here yet)");
 		    }
@@ -2292,9 +2636,13 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 				} else if (span.kind == MgmtParsed::TextKind::CLAIMS) {
 					value = ClaimsListText(text, tokens, span.start, span.end);
 				} else {
-					value = ListText(text, tokens, span.start, span.end, span.sql);
+					auto kind = span.kind;
+					value = ListText(text, tokens, span.start, span.end, span.sql,
+					                 kind == MgmtParsed::TextKind::ITEMS || kind == MgmtParsed::TextKind::REQUIRE ||
+					                     kind == MgmtParsed::TextKind::ATTRIBUTES ||
+					                     kind == MgmtParsed::TextKind::CLAIM_MAP);
 				}
-				parsed.texts.push_back(MgmtParsed::TextArg {span.arg, std::move(value), span.kind});
+				parsed.texts.push_back(MgmtParsed::TextArg {span.arg, std::move(value), span.kind, span.splice});
 			}
 		}
 		result.push_back(std::move(parsed));

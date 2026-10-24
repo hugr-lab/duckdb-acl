@@ -1319,6 +1319,19 @@ SELECT string_agg(vname, ',') FROM aclcat.acl.role_object_caps WHERE role = 'gra
 ----
 t
 
+# a mask is SQL: a string continued on the next line is duckdb's to join, kept as written
+statement ok
+ACL ADMIN GRANT TABLE granted.t TO ROLE grantee WITH (select) RLS (a > 1) COLUMNS (a = 1 + length('X'
+'Y'));
+
+query I
+SELECT replace("columns", chr(10), '|') FROM aclcat.acl.role_object_caps WHERE role = 'grantee' AND vname = 't';
+----
+a = 1 + length('X'|'Y')
+
+statement ok
+ACL ADMIN GRANT TABLE granted.t TO ROLE grantee WITH (select) RLS (a > 1) COLUMNS (a);
+
 # a WITH item that is no name, MAIN on an object, a quoted columns list with a comment in it
 statement error
 ACL ADMIN GRANT CATALOG granted TO ROLE grantee WITH ('insert');
@@ -1468,3 +1481,180 @@ statement error
 ACL ADMIN REVOKE CATALOG granted TO ROLE grantee;
 ----
 write REVOKE CATALOG
+
+# --- issuers and clients (stage 3e): CREATE / ALTER / DROP ISSUER | CLIENT - rules, the same calls ------------------
+
+# the short form, a comment inside it; CLAIM MAP's sides are quoted as JSON, split at an `=>` outside quotes (they
+# were pasted into the JSON, so a quoted side holding `", "` stored a second mapping)
+statement ok
+ACL ADMIN CREATE ISSUER 'test/idp/a' AUDIENCES ('api://a' /* the app */) ROLE CLAIM 'roles'
+CLAIM MAP ('x' => 'a", "groups": "tenant', 'p=>q' => 'r') CLIENT ID 'acl-desktop';
+
+query IIII
+SELECT audiences, roles_from, attributes, client_id FROM acl_clients() WHERE name = 'test/idp/a';
+----
+["api://a"]	["roles"]	[{"name":"a\", \"groups\": \"tenant","paths":["x"]},{"name":"r","paths":["p=>q"]}]	acl-desktop
+
+# a client and its clauses in any order, each once
+statement ok
+ACL ADMIN CREATE CLIENT svc ISSUER 'test/idp/a' AUDIENCES ('api://svc') AZP ('door') CLIENT ID 'svc'
+REQUIRE (sub LIKE 'svc-%', level IN (1, 2)) ROLES FROM ('roles', 'groups')
+ATTRIBUTES (tenant = 'tid', mail = ('upn', 'email'), org = CONSTANT 'acme') SUBJECT ('email', 'sub')
+TOKEN TYPE 'at+jwt' FLOWS (password) UNMAPPED IGNORE;
+
+query IIIIII
+SELECT audiences, azp, roles_from, subject, token_type, flows FROM acl_clients() WHERE name = 'svc';
+----
+["api://svc"]	["door"]	["roles","groups"]	["email","sub"]	at+jwt	["password"]
+
+query II
+SELECT requires, attributes FROM acl_clients() WHERE name = 'svc';
+----
+[{"path":"sub","op":"like","values":["svc-%"]},{"path":"level","op":"in","values":["1","2"]}]	[{"name":"tenant","paths":["tid"]},{"name":"mail","paths":["upn","email"]},{"name":"org","constant":"acme"}]
+
+statement ok
+ACL ADMIN ALTER CLIENT svc SET AUDIENCES 'api://svc2,api://svc3' FLOWS ();
+
+query II
+SELECT audiences, flows FROM acl_clients() WHERE name = 'svc';
+----
+["api://svc2","api://svc3"]	NULL
+
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET CLIENT ID 'acl-desktop-2';
+
+query I
+SELECT client_id FROM acl_clients() WHERE name = 'test/idp/a';
+----
+acl-desktop-2
+
+# what is never written into the policy says where it goes; a clause twice; a form that does not read as its rule
+statement error
+ACL ADMIN CREATE ISSUER 'test/idp/b' KEYS '{}';
+----
+keys and algorithms are never written into the policy
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') CLIENT SECRET 's';
+----
+a client secret is never written into the policy
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') AUDIENCES ('y');
+----
+AUDIENCES is written twice
+
+statement error
+ACL ADMIN CREATE CLIENT never 'test/idp/a';
+----
+write CREATE [OR REPLACE] CLIENT
+
+# each clause once by what it writes: ROLE CLAIM / ROLES FROM both name the role sources, ATTRIBUTES / CLAIM MAP
+# both the attributes - the last took effect (CLAIM MAP read `tenant` from the token where ATTRIBUTES pinned it)
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ROLE CLAIM 'admins' ROLES FROM ('groups');
+----
+ROLE CLAIM / ROLES FROM is written twice
+
+statement error
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET CLAIM MAP (tid => tenant) ATTRIBUTES (tenant = CONSTANT 'acme');
+----
+ATTRIBUTES / CLAIM MAP is written twice
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ROLES FROM ('a') ROLES FROM ('b');
+----
+ROLE CLAIM / ROLES FROM is written twice
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ROLES CONSTANT ('a') ROLES CONSTANT ('b');
+----
+ROLES CONSTANT is written twice
+
+# a comment inside a clause is a space
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET ROLE /* the claim */ CLAIM 'groups' CLAIM -- the map
+MAP (tid => tenant);
+
+query II
+SELECT roles_from, attributes FROM acl_clients() WHERE name = 'test/idp/a';
+----
+["groups"]	[{"name":"tenant","paths":["tid"]}]
+
+# IF NOT EXISTS keeps the client there
+statement ok
+ACL ADMIN CREATE CLIENT IF NOT EXISTS svc ISSUER 'test/idp/a' AUDIENCES ('api://other');
+
+query I
+SELECT audiences FROM acl_clients() WHERE name = 'svc';
+----
+["api://svc2","api://svc3"]
+
+# REQUIRE and ATTRIBUTES take parentheses; a list's items are plain literals - a bare word, `""`, a $$…$$ string and
+# a string continued on the next line (duckdb joins `'api://'⏎'x'`, the list's reader stored the line break) refused
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') REQUIRE 'sub = x';
+----
+REQUIRE takes its conditions in parentheses
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ATTRIBUTES 'tenant = tid';
+----
+ATTRIBUTES takes its list in parentheses
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES api;
+----
+expected audiences, quoted
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') CLIENT ID "";
+----
+zero-length delimited identifier
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ($$x$$);
+----
+a list is written with '...' literals
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') REQUIRE (sub = $$x$$);
+----
+a list is written with '...' literals
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('api://'
+'x');
+----
+a string continued on the next line
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ROLES FROM ('rol' -- a note
+'es');
+----
+a string continued on the next line
+
+statement error
+ACL ADMIN CREATE ROLE never CLAIMS (tenant = 'ac'
+'me');
+----
+a string continued on the next line
+
+# ALGS is a key's, a client secret is never written - in a client's ALTER it names FROM SECRET
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ALGS ('RS256');
+----
+keys and algorithms are never written into the policy
+
+statement error
+ACL ADMIN ALTER CLIENT svc SET CLIENT SECRET 's';
+----
+name that secret (FROM SECRET s)
+
+statement ok
+ACL ADMIN DROP CLIENT IF EXISTS nobody; DROP CLIENT svc; DROP ISSUER IF EXISTS 'nobody';
+
+query I
+SELECT count(*) FROM acl_clients() WHERE name IN ('svc', 'never');
+----
+0
