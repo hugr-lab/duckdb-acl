@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c part 1 built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -204,12 +204,38 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   line break, a space elsewhere (a declared column's name and type stay apart); a claims list's is always a space. A batch holding a
   dollar-quoted string nobody closed is refused whole: duckdb's tokenizer keeps it as one literal to the end of the
   text (`MatcherToken::unterminated`), so `AS SELECT $x$ AS a; DROP ROLE r` stored the DROP as the view's SQL - and
-  never ran it - while the batch answered success; and a statement the tokenizer refuses (a `""`) is compiled from
-  its text only when it holds no `;` - the batch's split and duckdb's tokenizer may disagree on where a statement
-  ends (`ALTER VIRTUAL VIEW … SET AS SELECT (1 AS ""; DROP ROLE r)`, or `$1$; …; $1$`, which the split took for a
-  quote, did the same through the compiler's `Rest`) - both found in review.
-  Part 2: `ALTER | DROP VIRTUAL …`, `DROP RELATION | REFERENCE`, `COMMENT ON VIRTUAL`, `CHECK`,
-  `REPAIR`, `ANALYZE VIRTUAL`.
+  never ran it - while the batch answered success; and the statement-by-statement reading of a batch the tokenizer
+  refuses (a `""`) did the same through the compiler's `Rest` (`ALTER VIRTUAL VIEW … SET AS SELECT (1 AS ""; DROP
+  ROLE r)`, `$1$; …; $1$`) - both found in review; part 2 reads such a batch by duckdb's own statement ends.
+  Part 2 (built): `ALTER VIRTUAL CATALOG | REFERENCE | VIEW | TABLE | SCALAR | TABLE FUNCTION | SCHEMA …`,
+  `COMMENT ON VIRTUAL …`, `CHECK VIRTUAL CATALOG` (a table call, `MgmtParsed::table_call`), `REPAIR VIRTUAL TABLE`,
+  `ANALYZE VIRTUAL …`, `DROP RELATION | [VIRTUAL] REFERENCE`, `DROP VIRTUAL CATALOG | SCHEMA | TABLE | VIEW | SCALAR |
+  TABLE FUNCTION` - one `ObjectChangeInto` for every SET / DROP change of a view, a table and a function, part 1's
+  paths, lists and bodies. Changed as in part 1 (comments, `""`, the lists' literal rule - REMAP's list too, as a
+  columns list); a scalar's PRIMARY KEY is refused in its own words (the scanner said `expected alias` / `expected
+  set`); a physical path may be the legacy single-quoted string in `ALTER VIRTUAL SCHEMA … SET PHYS`, `ADD SCHEMA`
+  and `ADD TABLE` too, as the notation always said; a table function's COMMENT ON / ANALYZE form is a rule of its own
+  and a kind is read only before a path, so `TABLE function.x` and `ANALYZE VIRTUAL table.t` name catalogs
+  `function` / `table` (the scanner refused them; `CHECK` writes such repairs). A batch duckdb's tokenizer refuses
+  whole (a `""` in one statement) is read statement by statement as THAT tokenizer ends them - `SplitMgmtStatements`,
+  its tokenizer run with a behavior that throws nothing (`SplitTokenizerBehavior`), the text ending inside a comment,
+  a string or a quoted name refused - never by `SplitBatchText`, whose own reading of quotes and comments (`$1$`, a
+  backtick name, `E'\''`) hid an open comment and let the statements it hides run (found in review, four times, on
+  that path: a `;` inside parentheses, `$1$`, an open comment, an opener inside what it took for a quote); part 1's
+  "no `;` in a refused piece" guard is gone with it. A statement no rule reads yet goes to the compiler as its text,
+  whose scanner knows `'…'`, `"…"` and whitespace only: once it compiles, a comment inside it, a `$$…$$` string, an
+  `E'…'` one with a backslash or a backtick name refuses it (`MgmtParsed::unreadable`, `LegacyUnreadable`) -
+  `GRANT CATALOG c TO ROLE r WITH (select, /*, manage, */ insert)` stored `manage` (found in review; a statement
+  that does not compile keeps its own refusal; comments before, between and after statements are untouched). A body
+  is read as what it is before anything of the batch runs (`JudgeBody`: a view's SQL and a table function's template
+  one statement, a scalar's template an expression list, duckdb's parser): a body a `;` cut (`AS SELECT [1; …`,
+  `CASE … ; … END`) does not parse and is refused, and an unparseable body is never stored (it used to be, under an
+  operator, and failed at its first read).
+  Found in the same review and left to the family that moves the form (each a fix with its test there): 3d - the WITH
+  list's JSON is built without escaping (`\u006danage` stores manage), `ParseCaps` reads a key up to a NUL and counts
+  a duplicate key true if any is; 3e - `CLAIM MAP`'s JSON without escaping and split on `=>` inside quotes; 3b's
+  `ClaimsListToCsv` splits at an `=` inside a quoted name (stage 4's rule); 3g - `UseSchemaAsSet`'s own comment
+  reader (`--` ends at `\n` only, `/* */` not nested).
 - 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).
 - 3e: issuers and clients (spec 095).
 - 3f: function categories and grants, platform grants, sources, resource groups.

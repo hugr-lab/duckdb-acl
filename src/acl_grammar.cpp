@@ -273,17 +273,25 @@ shared_ptr<GrammarExtension> AclGrammarCache::Extension() const {
 	return impl->registered;
 }
 
-vector<MgmtParsed> AclGrammarCache::ReadManagement(const string &text, const ParserOptions &options) {
-	shared_ptr<CompiledGrammar> compiled;
-	{
-		std::lock_guard<std::mutex> guard(impl->lock);
-		if (!impl->management_compiled) {
-			vector<reference<GrammarExtension>> extensions {*impl->management};
-			impl->management_compiled = CompiledGrammar::Create(extensions);
-		}
-		compiled = impl->management_compiled;
+shared_ptr<CompiledGrammar> AclGrammarCache::ManagementGrammar() {
+	std::lock_guard<std::mutex> guard(impl->lock);
+	if (!impl->management_compiled) {
+		vector<reference<GrammarExtension>> extensions {*impl->management};
+		impl->management_compiled = CompiledGrammar::Create(extensions);
 	}
-	return ReadMgmtStatements(std::move(compiled), text, options);
+	return impl->management_compiled;
+}
+
+vector<MgmtParsed> AclGrammarCache::ReadManagement(const string &text, const ParserOptions &options) {
+	return ReadMgmtStatements(ManagementGrammar(), text, options);
+}
+
+vector<string> AclGrammarCache::SplitManagement(const string &text) {
+	return SplitMgmtStatements(ManagementGrammar(), text);
+}
+
+string AclGrammarCache::JudgeLegacy(const string &text) {
+	return JudgeLegacyText(ManagementGrammar(), text);
 }
 
 bool AclGrammarCache::ReadPrefix(const string &query, const ParserOptions &options, GrammarPrefix &out) {

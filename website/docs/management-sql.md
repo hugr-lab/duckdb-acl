@@ -68,14 +68,19 @@ catalog forms refuse.
   a nested schema answers its path, and a schema part with a dot is shown quoted (`"a.b"`, `a."b.c"`)
   so it never reads as two levels. Lineage names a dataset by the same key rules
   (`Sales Mart.main.Order Items`, `c."a.b".Sink`).
-- Quoted values take `'…'` or `"…"`; a doubled quote is a literal one.
+- Quoted values take `'…'` or `"…"`; a doubled quote is a literal one. The empty text is `''` - in
+  the forms read by duckdb's tokenizer (roles, mappings, view-as, the virtual catalog's objects) `""`
+  is an empty identifier, which it refuses.
 - A body (after `AS` or `MACRO`) is either one quoted string - the whole body, nothing after it - or
   written inline to the end of the statement: a `;` inside a literal does not end it, one outside
-  does. In `CREATE VIRTUAL …` and `ADD …` a `$$…$$` string is a literal too, and an inline body keeps
-  the comments inside it, not one before its first token or after its last.
+  does. In the forms of the virtual catalog's objects (`CREATE | ALTER VIRTUAL …`, `ADD …`) a `$$…$$`
+  string is a literal too, and an inline body keeps the comments inside it, not one before its first
+  token or after its last.
 - A list is written `( … )` or as the legacy quoted csv/JSON string; both are accepted wherever a
   list is taken. `WITH (select, insert)` and `CAPS '{"select": true, "insert": true}'` store the same.
-  In `CREATE VIRTUAL …` and `ADD …` a comment inside a parenthesised list reads as a space.
+  In the forms of the virtual catalog's objects a comment inside a parenthesised list reads as a space,
+  and a list split into items (columns, keys, pairs, parameters, REMAP, TYPES) refuses a `$$…$$` string,
+  an `E'…'` string with a backslash and a backtick name - an RLS predicate takes any literal.
 - Keywords are case-insensitive. Statements of a batch are separated by `;`.
 - Write modes on `CREATE`: `CREATE` refuses an existing object, `CREATE OR REPLACE` overwrites,
   `CREATE … IF NOT EXISTS` keeps what is there. The legacy `ADD` forms always upsert. Where a

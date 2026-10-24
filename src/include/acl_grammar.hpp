@@ -16,6 +16,7 @@
 #include "duckdb/parser/parser_options.hpp"
 
 namespace duckdb {
+class CompiledGrammar;
 class GrammarExtension;
 
 namespace acl {
@@ -50,11 +51,17 @@ struct MgmtParsed {
 	bool legacy = false;
 	//! legacy: the statement as written, its first token to its last
 	string text;
+	//! legacy: why the compiler cannot read it as written ('' when it can) - a comment, a `$$…$$` string, an `E'…'`
+	//! string with a backslash or a backtick name, which its scanner does not know: judged once it compiled, so a form
+	//! that does not compile keeps its own refusal
+	string unreadable;
 	//! a rule's: the acl_* function and its arguments
 	string function;
 	vector<Value> args;
 	//! the first argument is the session the batch runs under (`PROFILE SESSION CURRENT`)
 	bool current_session = false;
+	//! the call is a table function, read in FROM (`CHECK VIRTUAL CATALOG`)
+	bool table_call = false;
 	//! arguments written as a list or a body, as text the compiler's readers take as they always did (a list becomes a
 	//! rule in stage 4): a parenthesised claims list for ClaimsListToCsv, a columns list for UnquoteColumnsList, the
 	//! rest as is
@@ -83,12 +90,20 @@ public:
 	//! spec 150, stage 3: a management batch's statements, each by its rule or as text. Throws a ParserException for a
 	//! text the grammar refuses.
 	vector<MgmtParsed> ReadManagement(const string &text, const ParserOptions &options);
+	//! A management batch's statements as duckdb's tokenizer ends them, for a batch it refuses to read whole (a `""`
+	//! in one statement): each statement's text, first token to last. Throws a ParserException when the text ends
+	//! inside a comment, a string or a quoted name - what it hides is never run without it
+	vector<string> SplitManagement(const string &text);
+	//! Why the management compiler cannot read `text` (one statement) as written, '' when it can
+	//! (MgmtParsed::unreadable)
+	string JudgeLegacy(const string &text);
 
 	//! The rules as a grammar extension, registered so a connection may switch them on for completion
 	//! (`SET active_grammar_extensions = ['acl']`); the override never depends on it being on
 	shared_ptr<GrammarExtension> Extension() const;
 
 private:
+	shared_ptr<CompiledGrammar> ManagementGrammar();
 	struct Impl;
 	unique_ptr<Impl> impl;
 };
