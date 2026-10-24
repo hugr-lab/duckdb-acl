@@ -1,0 +1,149 @@
+# name: test/sql/acl_mgmt_grammar.test
+# description: spec 150, stage 3 - the management statements read by rules of duckdb's parser: a family that moved
+#   compiles to the acl_* call it always compiled to, a statement of a family that has not moved yet goes as its own
+#   text to the management compiler, and a batch may hold both. First family: the operations of a node.
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+# --- a family not moved yet: as its own text, as before ------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE grammar_one;
+
+statement ok
+ACL ADMIN CREATE ROLE grammar_two; CREATE ROLE grammar_three;
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role LIKE 'grammar_%';
+----
+3
+
+# --- the operations of a node: rules, the same calls ---------------------------------------------------------------
+
+query I
+ACL ADMIN DRAIN NODE;
+----
+0
+
+query I
+SELECT acl_drain_status();
+----
+draining
+
+query I
+ACL ADMIN RESUME NODE;
+----
+true
+
+query I
+ACL ADMIN KILL SESSION 'no-such-session';
+----
+false
+
+query I
+ACL ADMIN KILL SESSION "no-such-session";
+----
+false
+
+query I
+ACL ADMIN SET SESSION 'no-such-session' AUDIT LEVEL decisions;
+----
+false
+
+query I
+ACL ADMIN SET SESSION 'no-such-session' AUDIT LEVEL DEFAULT;
+----
+false
+
+query I
+ACL ADMIN PROFILE SESSION 'no-such-session' SAMPLED;
+----
+false
+
+# the catalog is at the build's version already: the call answers so
+statement ok
+ACL ADMIN MIGRATE POLICY CATALOG aclcat.acl;
+
+statement ok
+ACL ADMIN MIGRATE POLICY CATALOG "aclcat"."acl";
+
+# keywords in any case, a comment before the statement, the batch split by duckdb's grammar (a comment INSIDE the
+# first statement still hides it from the text check that tells management from native SQL - the last PR of stage 3
+# makes that a rule too)
+query I
+ACL ADMIN /* the operator's note */ drain node;
+----
+0
+
+query I
+ACL ADMIN RESUME NODE ;;
+----
+true
+
+# a batch of a rule's statement and a compiler's
+statement ok
+ACL ADMIN CREATE ROLE grammar_four; DRAIN NODE; RESUME NODE;
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role = 'grammar_four';
+----
+1
+
+# --- a form that does not read as its rule says how it is written --------------------------------------------------
+
+statement error
+ACL ADMIN KILL SESSION;
+----
+write KILL SESSION '<id>'
+
+statement error
+ACL ADMIN KILL SESSION 'a' 'b';
+----
+write KILL SESSION '<id>'
+
+statement error
+ACL ADMIN KILL SESSION nobody;
+----
+expected a session id, quoted
+
+statement error
+ACL ADMIN KILL SESSION 'ab'
+'cd';
+----
+expected a session id, quoted
+
+statement error
+ACL ADMIN SET SESSION 'x' AUDIT;
+----
+write SET SESSION '<id>' AUDIT LEVEL
+
+statement error
+ACL ADMIN PROFILE SESSION CURRENT LOUD;
+----
+PROFILE SESSION expects ON, ALL, SAMPLED or OFF, not "loud"
+
+statement error
+ACL ADMIN PROFILE SESSION CURRENT ON;
+----
+PROFILE SESSION CURRENT needs a session
+
+statement error
+ACL ADMIN MIGRATE POLICY aclcat;
+----
+write MIGRATE POLICY CATALOG
+
+# the grammar never runs outside a management batch: duckdb has no DRAIN statement
+statement error
+DRAIN NODE;
+----
+syntax error

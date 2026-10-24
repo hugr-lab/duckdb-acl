@@ -44,6 +44,19 @@ struct GrammarPrefix {
 	idx_t rest_start = 0;
 };
 
+//! spec 150, stage 3: a management statement as the grammar read it - a call of an acl_* function a rule compiled,
+//! or (a family not moved to rules yet) the statement's own text for the management compiler
+struct MgmtParsed {
+	bool legacy = false;
+	//! legacy: the statement as written, its first token to its last
+	string text;
+	//! a rule's: the acl_* function and its arguments
+	string function;
+	vector<Value> args;
+	//! the first argument is the session the batch runs under (`PROFILE SESSION CURRENT`)
+	bool current_session = false;
+};
+
 //! A marker's words as a client writes them: `TRACE`, `LINEAGE JOB`, ...
 const char *MarkerWords(GrammarPrefix::MarkerKind kind);
 
@@ -56,6 +69,10 @@ public:
 	//! Reads `query`'s ACL prefix head. False when the text has none of ours (it does not start with
 	//! `ACL <kind>`) - the override leaves it. Throws a ParserException for a head the rule refuses.
 	bool ReadPrefix(const string &query, const ParserOptions &options, GrammarPrefix &out);
+
+	//! spec 150, stage 3: a management batch's statements, each by its rule or as text. Throws a ParserException for a
+	//! text the grammar refuses.
+	vector<MgmtParsed> ReadManagement(const string &text, const ParserOptions &options);
 
 	//! The rules as a grammar extension, registered so a connection may switch them on for completion
 	//! (`SET active_grammar_extensions = ['acl']`); the override never depends on it being on

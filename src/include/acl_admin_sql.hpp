@@ -15,6 +15,7 @@ namespace duckdb {
 class SQLStatement;
 
 namespace acl {
+class AclGrammarCache;
 
 //! Whether text opens with a management statement (CREATE VIRTUAL ..., GRANT ..., ALTER ..., ...):
 //! how the anonymous `ACL ADMIN` form tells a management batch from native SQL it may also carry.
@@ -24,7 +25,9 @@ bool IsMgmtStart(const string &text);
 //! only: nothing is written until the statements execute. A syntax error throws a ParserException.
 //! `current_session` is the ops id of the session the batch runs under ('' off a session): what
 //! `PROFILE SESSION CURRENT` names (spec 074 slice 3).
-vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session = string());
+//! spec 150, stage 3: the batch is read by `grammar`'s management rules, a family no rule reads yet by the compiler.
+vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session,
+                                                AclGrammarCache &grammar, const ParserOptions &options);
 
 //! spec 082: whether text opens with `GRANT SECRET` / `REVOKE SECRET` - the node's secrets service,
 //! not the ACL: judged by the `secrets` capability, never by an administration scope.

@@ -72,6 +72,7 @@ src/
   acl_identity_store.cpp     #   ... the store's side: secrets, discovery documents, VerifyJwtPrincipal, doors
   acl_parser_override.cpp    # the ACL prefix + parser_override; exposes RegisterAclParser(...)
   acl_grammar.cpp            # spec 150: the prefix's head as a PEG rule (acl_grammar.hpp: AclGrammarCache)
+  acl_mgmt_grammar.cpp       #   ... and the management statements' rules (stage 3; acl_grammar_util.hpp shared)
   acl_admin_functions.cpp    # acl_* admin stubs; exposes RegisterAclAdminFunctions(...)
   acl_platform.cpp           # spec 117: the platform catalog - views, functions, the ONE authorizer (acl_platform.hpp)
   acl_door_common.cpp        # what every acl_* scalar and both doors share: StoreOf/RequiredArg, PEM, JSON
@@ -472,8 +473,13 @@ scanner's rules (markers once, LINEAGE parent a run ref, INGEST no mode marker, 
 rest is parsed as its own text per mode, as before (positions, peelers, NATIVE). The registered variant (`acl`, tail
 `Statement`) is for CLI completion only. `AclGrammarCache` (on `AclParserInfo`, per instance) compiles the connection's
 grammar extensions with ours behind them; a CONNECT-ed / dialect connection refuses a prefix. A text not starting with
-the word ACL is never tokenized. Stage 3 moves the management statements, stage 4 the policy texts. Tests
-`acl_prefix_grammar.test`, `acl_prefix_completion.test`.
+the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a built): the batch is
+read by acl_mgmt_grammar.cpp's grammar (`Statement <- AclMgmtStatement`, compiled once, never registered) - a moved
+family's rule yields the acl_* call (`MgmtParsed` -> `MakeAdminCall`), anything else passes through as tokens
+(`AclMgmtLegacy`) to the compiler as its own text (`CompileMgmtText`); a moved family's text form stays only as a
+refusal in its own words. 3a: KILL SESSION, SET SESSION … AUDIT LEVEL, PROFILE SESSION, DRAIN / RESUME NODE, MIGRATE
+POLICY CATALOG. Stage 4 the policy texts. Tests `acl_prefix_grammar.test`, `acl_prefix_completion.test`,
+`acl_mgmt_grammar.test`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
 attached catalog of type `tresor`, never its own secret manager. Under the explicit `secrets`

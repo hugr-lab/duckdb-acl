@@ -1,4 +1,5 @@
 #include "acl_grammar.hpp"
+#include "acl_grammar_util.hpp"
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
@@ -22,6 +23,13 @@
 namespace duckdb {
 namespace acl {
 namespace {
+
+using grammar::Collect;
+using grammar::KeywordOf;
+using grammar::Strip;
+using grammar::TokenIndexAt;
+using grammar::ValueOf;
+using grammar::WrittenPlainly;
 
 //! What the prefix rule yields: an ExtensionStatement of ours carrying what the head says. It never
 //! leaves the override - and one that reached the binder (the registered rules switched on, the
@@ -64,68 +72,6 @@ ParserExtension PrefixExtension() {
 bool IsPrefixStatement(const SQLStatement &statement) {
 	return statement.type == StatementType::EXTENSION_STATEMENT &&
 	       statement.Cast<ExtensionStatement>().extension.plan_function == RefusePrefixPlan;
-}
-
-//! The results a rule part holds: an optional one's result if any, a repetition's children, else itself
-void Collect(ParseResult &result, vector<reference<ParseResult>> &out) {
-	if (result.type == ParseResultType::OPTIONAL) {
-		auto &optional = result.Cast<OptionalParseResult>();
-		if (optional.HasResult()) {
-			Collect(optional.GetResult(), out);
-		}
-		return;
-	}
-	if (result.type == ParseResultType::REPEAT) {
-		for (auto &child : result.Cast<RepeatParseResult>().GetChildren()) {
-			out.push_back(child);
-		}
-		return;
-	}
-	out.push_back(result);
-}
-
-//! Under one of our helper rules: the choice taken, a list of one part - ours have no transform
-ParseResult &Strip(ParseResult &result) {
-	if (result.type == ParseResultType::CHOICE) {
-		return Strip(result.Cast<ChoiceParseResult>().GetResult());
-	}
-	if (result.type == ParseResultType::OPTIONAL && result.Cast<OptionalParseResult>().HasResult()) {
-		return Strip(result.Cast<OptionalParseResult>().GetResult());
-	}
-	if (result.type == ParseResultType::LIST && StringUtil::StartsWith(result.Name(), "Acl")) {
-		auto &list = result.Cast<ListParseResult>();
-		if (list.GetChildren().size() == 1) {
-			return Strip(list.GetChild(0));
-		}
-	}
-	return result;
-}
-
-//! The keyword a rule part matched, lower-cased ('' when it holds none)
-string KeywordOf(ParseResult &result) {
-	switch (result.type) {
-	case ParseResultType::KEYWORD:
-		return StringUtil::Lower(result.Cast<KeywordParseResult>().keyword);
-	case ParseResultType::CHOICE:
-		return KeywordOf(result.Cast<ChoiceParseResult>().GetResult());
-	case ParseResultType::LIST:
-		for (auto &child : result.Cast<ListParseResult>().GetChildren()) {
-			auto keyword = KeywordOf(child.get());
-			if (!keyword.empty()) {
-				return keyword;
-			}
-		}
-		return string();
-	default:
-		return string();
-	}
-}
-
-//! A quoted value (`AclQuotedValue <- StringLiteral / Identifier`): its text and where its token starts
-string ValueOf(PEGTransformer &transformer, ParseResult &result, optional_idx &offset) {
-	auto &base = Strip(result);
-	offset = base.offset;
-	return transformer.Transform<string>(base);
 }
 
 // AclPrefixedStatement <- 'ACL' AclPrincipal AclMarker* AclMode? AclTail?
@@ -233,36 +179,6 @@ private:
 	bool passthrough_tail;
 };
 
-//! The text a value's token must be: the value in its quotes, written plainly - so a string the tokenizer
-//! joins across a line break, an escape string or an unquoted name never stands for the value
-bool WrittenPlainly(const string &query, const MatcherToken &token, const string &value) {
-	if (token.offset + token.length > query.size() || query.compare(token.offset, token.length, token.text) != 0) {
-		return false;
-	}
-	if (token.text.empty() || (token.text[0] != '\'' && token.text[0] != '"')) {
-		return false;
-	}
-	auto quote = token.text[0];
-	string written(1, quote);
-	written += StringUtil::Replace(value, string(1, quote), string(2, quote));
-	written += quote;
-	return token.text == written;
-}
-
-//! The token starting at `offset` (the tokens come in text order), or none
-optional_idx TokenIndexAt(const TokenIterator &tokens, idx_t offset) {
-	for (idx_t i = 0; i < tokens.Size(); i++) {
-		auto &token = tokens.GetToken(i);
-		if (token.offset > offset) {
-			break;
-		}
-		if (token.offset == offset && token.type != TokenType::END_OF_INPUT) {
-			return i;
-		}
-	}
-	return optional_idx();
-}
-
 //! The kinds, as the rule's `AclPrincipalWord` and `'ADMIN'` spell them
 bool TryKindOf(const string &word, GrammarPrefix::Kind &kind) {
 	static constexpr struct {
@@ -311,6 +227,10 @@ struct AclGrammarCache::Impl {
 	//! what the override parses with, never registered; and what a connection may switch on
 	shared_ptr<AclPrefixGrammar> grammar = make_shared_ptr<AclPrefixGrammar>("acl_prefix_head", true);
 	shared_ptr<AclPrefixGrammar> registered = make_shared_ptr<AclPrefixGrammar>("acl", false);
+	//! spec 150, stage 3: the management statements' grammar - duckdb's own rules for what a statement holds,
+	//! ours for the statements, compiled once
+	shared_ptr<GrammarExtension> management = MakeMgmtGrammar();
+	shared_ptr<CompiledGrammar> management_compiled;
 	std::mutex lock;
 	//! the caller's grammar extensions, in order -> the grammar compiled with ours behind them
 	vector<pair<vector<string>, shared_ptr<CompiledGrammar>>> compiled;
@@ -355,6 +275,19 @@ AclGrammarCache::~AclGrammarCache() {
 
 shared_ptr<GrammarExtension> AclGrammarCache::Extension() const {
 	return impl->registered;
+}
+
+vector<MgmtParsed> AclGrammarCache::ReadManagement(const string &text, const ParserOptions &options) {
+	shared_ptr<CompiledGrammar> compiled;
+	{
+		std::lock_guard<std::mutex> guard(impl->lock);
+		if (!impl->management_compiled) {
+			vector<reference<GrammarExtension>> extensions {*impl->management};
+			impl->management_compiled = CompiledGrammar::Create(extensions);
+		}
+		compiled = impl->management_compiled;
+	}
+	return ReadMgmtStatements(*compiled, compiled, text, options);
 }
 
 bool AclGrammarCache::ReadPrefix(const string &query, const ParserOptions &options, GrammarPrefix &out) {

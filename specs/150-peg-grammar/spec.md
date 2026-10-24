@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, 3 and 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -127,6 +127,33 @@ stage 1 path and `acl_peg_prefix` are gone. The registered `acl` grammar (comple
 `AclTail <- Statement`, so the CLI offers the statements after the prefix. A prefix in a position where duckdb's
 grammar takes a `Statement` - `PREPARE p AS ACL ROLE …`, a CTE body, a CTAS - parses to our statement (on a connection
 with `acl` on) and is refused by duckdb's own transforms or by the plan function.
+
+**Stage 3 - the management statements, one family per PR.** The batch after `ACL <prefix> ACL` (or `ACL ADMIN`) is
+read by a grammar of its own (acl_mgmt_grammar.cpp, compiled once by `AclGrammarCache`, never registered): duckdb's
+rules for what a statement holds, ours for the statements - `Statement <- AclMgmtStatement`, its alternatives the
+families' rules and, last, `AclMgmtLegacy <- AclTailToken+`: a statement of a family that has not moved yet passes
+through as tokens and goes, as its own text, to the management compiler (`CompileMgmtText`). A rule yields the acl_*
+call it always compiled to (`MgmtParsed` -> `MakeAdminCall`), so the authorizer and the admin functions do not change.
+A moved family's text form stays only as a refusal in the form's own words ("write KILL SESSION '<id>'"): what does
+not read as its rule falls to it, and only the rule accepts - never two readers. duckdb's grammar splits the batch (a
+`;` inside parentheses now ends a statement - none of ours holds one); a text its tokenizer refuses (an empty quoted
+name) is read by the compiler piece by piece, as before, until every family is a rule. hugr-node's registered forms
+(`RegisterMgmtGrammar`, spec 126) take the legacy path unchanged. The text checks that tell a management batch from
+native SQL (`IsMgmtStart`, `StartsWithMgmt`, `BatchHasMgmtStatement`, `SplitBatchText`, `RefuseRepeatedPrefix`) stay
+until the last PR of the stage, which judges the batch by its parse and drops `AdminScanner`.
+
+- 3a (built): the grammar, the legacy path, and the operations of a node - `KILL SESSION '<id>'`,
+  `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`, `PROFILE SESSION CURRENT|'<id>' ON|ALL|SAMPLED|OFF`, `DRAIN NODE`,
+  `RESUME NODE`, `MIGRATE POLICY CATALOG <db>[.<schema>]`. Quoted values are checked against their tokens as in the
+  head (one plain literal).
+- 3b: roles, admin scopes, role mappings, view-as (names as values, spec 116's `NameValue`).
+- 3c: the virtual catalog's objects (`CREATE | ALTER | DROP VIRTUAL …`, `ADD …`, `CHECK`, `REPAIR`, comments) -
+  spec 116's paths and the bodies (still their text until stage 4).
+- 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).
+- 3e: issuers and clients (spec 095).
+- 3f: function categories and grants, platform grants, sources, resource groups, references.
+- 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;
+  `AdminScanner` and `SplitBatchText` go; `RegisterMgmtGrammar` becomes rules (hugr-node re-pins).
 
 **Open questions**
 

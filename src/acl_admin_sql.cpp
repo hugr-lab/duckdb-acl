@@ -4,6 +4,7 @@
 // The grammar compiles text into acl_* admin-function calls; the parser override is its only caller.
 
 #include "acl_admin_sql.hpp"
+#include "acl_grammar.hpp"
 #include "acl_admin_scanner.hpp"
 #include "acl_platform.hpp"
 
@@ -1138,38 +1139,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 	if (auto parse = FindMgmtGrammar(keyword)) {
 		return parse(s); // spec 126: a linked module's form
 	}
+	// spec 150, stage 3: the operations of a node are rules (acl_mgmt_grammar.cpp); one that reaches here did not
+	// read as its rule - said in the form's own words
 	if (StringUtil::CIEquals(keyword, "profile")) {
-		// PROFILE SESSION CURRENT | '<id>' ON | ALL | SAMPLED | OFF (spec 074 slice 3): the operator's
-		// profile level on a session - the caller's own (the session the prefix names) or another
-		// open one by its ops id from acl_sessions(); OFF clears it back to the policy and the node
-		s.Expect("session");
-		string id;
-		if (s.Accept("current")) {
-			if (current_session.empty()) {
-				throw BinderException("acl admin: PROFILE SESSION CURRENT needs a session - the statement runs "
-				                      "under no ACL SESSION prefix");
-			}
-			id = current_session;
-		} else {
-			id = s.Quoted("a session id");
-		}
-		auto word = StringUtil::Lower(s.Word("a profile level (ON, ALL, SAMPLED, OFF)"));
-		string level;
-		if (word == "on" || word == "all") {
-			level = "all";
-		} else if (word == "sampled") {
-			level = "sampled";
-		} else if (word == "off") {
-			level = "";
-		} else {
-			throw BinderException("acl admin: PROFILE SESSION expects ON, ALL, SAMPLED or OFF, not \"%s\"", word);
-		}
-		return MakeAdminCall("acl_session_profile", {Value(id), Value(level)});
+		throw BinderException("acl admin: write PROFILE SESSION CURRENT | '<id>' ON | ALL | SAMPLED | OFF");
 	}
 	if (StringUtil::CIEquals(keyword, "kill")) {
-		// KILL SESSION '<id>' (spec 118): the id is acl_sessions()' / platform.sessions' - never a handle
-		s.Expect("session");
-		return MakeAdminCall("acl_session_kill", {Value(s.Quoted("a session id"))});
+		throw BinderException("acl admin: write KILL SESSION '<id>'");
 	}
 	if (StringUtil::CIEquals(keyword, "set")) {
 		// SET SESSION '<id>' AUDIT LEVEL off | denied | decisions | all | DEFAULT (spec 118 over spec 069)
@@ -1180,11 +1156,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			s.Expect("role");
 			return MakeAdminCall("acl_session_view_as", {Value(s.NameValue("a role"))});
 		}
-		auto id = s.Quoted("a session id");
-		s.Expect("audit");
-		s.Expect("level");
-		auto word = StringUtil::Lower(s.Word("an audit level (OFF, DENIED, DECISIONS, ALL, DEFAULT)"));
-		return MakeAdminCall("acl_session_audit_level", {Value(id), Value(word == "default" ? string() : word)});
+		throw BinderException(
+		    "acl admin: write SET SESSION '<id>' AUDIT LEVEL OFF | DENIED | DECISIONS | ALL | DEFAULT");
 	}
 	if (StringUtil::CIEquals(keyword, "reset")) {
 		// RESET SESSION VIEW AS (spec 120.3): back to the session's own principal
@@ -1194,20 +1167,10 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		return MakeAdminCall("acl_session_view_as", {Value(string())});
 	}
 	if (StringUtil::CIEquals(keyword, "drain") || StringUtil::CIEquals(keyword, "resume")) {
-		// DRAIN NODE / RESUME NODE (spec 118 over spec 066): this node
-		s.Expect("node");
-		return MakeAdminCall(StringUtil::CIEquals(keyword, "drain") ? "acl_drain" : "acl_resume", {});
+		throw BinderException("acl admin: write DRAIN NODE / RESUME NODE");
 	}
 	if (StringUtil::CIEquals(keyword, "migrate")) {
-		// MIGRATE POLICY CATALOG <db>[.<schema>] (spec 118 over spec 094): passthrough's
-		s.Expect("policy");
-		s.Expect("catalog");
-		auto database = s.Ident("a database");
-		if (s.pos < s.text.size() && s.text[s.pos] == '.') {
-			s.pos++;
-			return MakeAdminCall("acl_migrate_catalog", {Value(database), Value(s.Ident("a schema"))});
-		}
-		return MakeAdminCall("acl_migrate_catalog", {Value(database)});
+		throw BinderException("acl admin: write MIGRATE POLICY CATALOG <database>[.<schema>]");
 	}
 	if (StringUtil::CIEquals(keyword, "deny")) {
 		// DENY FUNCTION CATEGORY c TO ROLE r | ALL ROLES; DENY FUNCTION f [TABLE] TO ROLE r | ALL ROLES
@@ -2038,22 +2001,55 @@ bool BatchIsAllMgmt(const string &text) {
 	return !statements.empty();
 }
 
-vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session) {
+//! One management statement written as text, compiled by the management compiler (a family no rule reads yet)
+unique_ptr<SQLStatement> CompileMgmtText(const string &text, const string &current_session) {
+	AdminScanner scanner(text);
+	auto statement = ParseMgmtStatement(scanner, current_session);
+	if (!scanner.Done()) {
+		throw BinderException("acl admin: unexpected trailing text at position %llu", scanner.pos);
+	}
+	return statement;
+}
+
+vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session,
+                                                AclGrammarCache &grammar, const ParserOptions &options) {
 	RefuseRepeatedPrefix(text);
 	if (!BatchIsAllMgmt(text) && BatchHasMgmtStatement(text)) {
 		// spec 117: a batch is all management or all queries - a mix would run half of it in each world
 		throw BinderException("acl admin: a batch mixing management statements and queries is refused - send each "
 		                      "kind in a batch of its own");
 	}
-	vector<unique_ptr<SQLStatement>> statements;
-	// statement by statement, as the batch splits (quotes, comments and parentheses respected): a comment
-	// in front of a statement says nothing, and a `;` inside a body's literal ends nothing
-	for (auto &piece : SplitBatchText(text)) {
-		AdminScanner scanner(piece);
-		statements.push_back(ParseMgmtStatement(scanner, current_session));
-		if (!scanner.Done()) {
-			throw BinderException("acl admin: unexpected trailing text at position %llu", scanner.pos);
+	// spec 150, stage 3: statement by statement as duckdb's grammar splits the batch - each by its rule, or as its own
+	// text by the management compiler
+	vector<MgmtParsed> parsed;
+	try {
+		parsed = grammar.ReadManagement(text, options);
+	} catch (ParserException &) {
+		// a text duckdb's tokenizer refuses (an empty quoted name, an unterminated string): the management compiler
+		// reads it piece by piece and says what is wrong in its own words, as it did
+		parsed.clear();
+		for (auto &piece : SplitBatchText(text)) {
+			MgmtParsed entry;
+			entry.legacy = true;
+			entry.text = piece;
+			parsed.push_back(std::move(entry));
 		}
+	}
+	vector<unique_ptr<SQLStatement>> statements;
+	for (auto &entry : parsed) {
+		if (entry.legacy) {
+			statements.push_back(CompileMgmtText(entry.text, current_session));
+			continue;
+		}
+		if (entry.current_session) {
+			if (current_session.empty()) {
+				throw BinderException(
+				    "acl admin: PROFILE SESSION CURRENT needs a session - the statement runs under no "
+				    "ACL SESSION prefix");
+			}
+			entry.args[0] = Value(current_session);
+		}
+		statements.push_back(MakeAdminCall(entry.function, entry.args));
 	}
 	if (statements.empty()) {
 		throw BinderException("acl admin: empty management batch");
