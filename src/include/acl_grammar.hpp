@@ -55,9 +55,16 @@ struct MgmtParsed {
 	vector<Value> args;
 	//! the first argument is the session the batch runs under (`PROFILE SESSION CURRENT`)
 	bool current_session = false;
-	//! arguments written as a parenthesised claims list - the text inside, which the compiler's ClaimsListToCsv reads
-	//! as it always did (a list becomes a rule in stage 4)
-	vector<pair<idx_t, string>> claims_lists;
+	//! arguments written as a list or a body, as text the compiler's readers take as they always did (a list becomes a
+	//! rule in stage 4): a parenthesised claims list for ClaimsListToCsv, a columns list for UnquoteColumnsList, the
+	//! rest as is
+	enum class ListKind : uint8_t { CLAIMS, COLUMNS, TEXT };
+	struct ListArg {
+		idx_t arg;
+		string text;
+		ListKind kind;
+	};
+	vector<ListArg> lists;
 };
 
 //! A marker's words as a client writes them: `TRACE`, `LINEAGE JOB`, ...

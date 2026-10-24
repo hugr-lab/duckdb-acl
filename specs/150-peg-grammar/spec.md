@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c part 1 built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -176,8 +176,24 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   `(region = $$a, tenant = 'globex', b = $$)` into three claims where the tokenizer reads one value (the scanner's
   `Parens` accepted that too) - and a text the tokens do not tile (after a lone `$` duckdb's tokenizer places the next
   token at the `$`).
-- 3c: the virtual catalog's objects (`CREATE | ALTER | DROP VIRTUAL …`, `ADD …`, `CHECK`, `REPAIR`, comments) -
-  spec 116's paths and the bodies (still their text until stage 4).
+- 3c: the virtual catalog's objects, in two PRs. Part 1 (built): `CREATE [OR REPLACE] VIRTUAL CATALOG | REFERENCE |
+  SCHEMA | VIEW | SCALAR | TABLE FUNCTION | TABLE …` and the spec-008 `ADD VIEW | SCHEMA | SCALAR | TABLE FUNCTION |
+  TABLE` forms. The compiler's `Path` is our matcher's `AclPathToken` (`Kind::PATH`): the dotted name's run of tokens
+  with a double-quoted name a part of its own, judged whole into spec 116's canonical key (an empty part, `a"b"`,
+  `"a"b` refused); `PathName` is `AclPathName <- StringLiteral / AclPathToken` (the single-quoted legacy whole path
+  read with the key rules); `List` is `AclList <- AclParenList / AclQuotedValue`, a parenthesised one as written with
+  each comment a space (`TokensText`, refused unless the tokens tile it - the lone `$` of 3b); a body is `AclBody <-
+  AclTailToken+`: one plain quoted token is its value, anything else the text from its first token to its last as
+  written (its comments kept, one after its last token not). A columns list goes to `UnquoteColumnsList` and a
+  claims list to `ClaimsListToCsv` as before (`MgmtParsed::lists`). Changed: comments are accepted inside these
+  forms, and a list's comment is a space - `RLS (a > 0 -- note⏎)` left an open comment in the stored predicate, which
+  spec 148 refused; an inline body's trailing comment is not stored; a body that starts with a quoted string and goes
+  on (`AS 'tag:' || acl_arg(1)`) is inline (the scanner refused the rest); spaces or a comment around a path's dot are
+  accepted, a leading-digit part is one word (`objects.9t`), `CREATE VIRTUAL CATALOG ""` is the tokenizer's
+  zero-length identifier; a `;` ends a body wherever it stands outside a literal (the scanner kept one inside
+  parentheses: such a body was never one statement), while a `$$…$$` string in a body is one token (the scanner did
+  not know it). Part 2: `ALTER | DROP VIRTUAL …`, `DROP RELATION | REFERENCE`, `COMMENT ON VIRTUAL`, `CHECK`,
+  `REPAIR`, `ANALYZE VIRTUAL`.
 - 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).
 - 3e: issuers and clients (spec 095).
 - 3f: function categories and grants, platform grants, sources, resource groups, references.

@@ -499,3 +499,115 @@ statement error
 ACL ADMIN MAP GROUP admins FROM ISSUER corp TO ROLE tenant_reader;
 ----
 expected external value, quoted
+
+# --- the virtual catalog's objects (stage 3c): CREATE VIRTUAL and the ADD forms, rules, the same calls ---------------
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.t (a INTEGER, b INTEGER, tenant VARCHAR);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG objects COMMENT 'the objects of stage 3c';
+
+# a comment anywhere inside a form; a list's comment is a space - an RLS predicate's line comment before its closing
+# parenthesis no longer leaves an open comment in the stored predicate
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE /* the table */ objects.t AS phys.main.t COLUMNS (a, b -- not tenant
+) RLS (a > 0 -- positive only
+) COMMENT 'commented';
+
+query III
+SELECT phys, rls, comment FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 't';
+----
+phys.main.t	a > 0	commented
+
+query I
+SELECT string_agg(name, ',' ORDER BY pos) FROM aclcat.acl.relation_columns WHERE vcat = 'objects' AND vname = 't';
+----
+a,b
+
+# a body inline runs to the end of the statement: its own comments are its own, one after its last token is not
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW objects.v AS SELECT a /* kept */ FROM phys.main.t -- not kept
+;
+
+query I
+SELECT view_sql FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'v';
+----
+SELECT a /* kept */ FROM phys.main.t
+
+# ... or one quoted string, its value; a body that starts with a quoted string and goes on is inline
+statement ok
+ACL ADMIN ADD VIEW objects.q AS 'SELECT ''x'' AS s';
+
+query I
+SELECT view_sql FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'q';
+----
+SELECT 'x' AS s
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCALAR objects.tag(x VARCHAR) AS 'tag:' || acl_arg(1);
+
+query I
+SELECT template FROM aclcat.acl.functions WHERE vcat = 'objects' AND vname = 'tag';
+----
+'tag:' || acl_arg(1)
+
+# a name with a leading digit, a part the tokenizer reads as a number, spaces around a dot
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE objects.9t AS phys . main . t; ADD TABLE phys.main.t AS objects.v1.2;
+
+query II
+SELECT vname, phys FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname IN ('9t', 'v1.2') ORDER BY vname;
+----
+9t	phys.main.t
+v1.2	phys.main.t
+
+# a reference, a function's argument substitution, the clauses in any order
+statement ok
+ACL ADMIN CREATE VIRTUAL REFERENCE objects.r FROM objects.t TO v ON (a = a) OPTIONAL CARDINALITY one_to_one COMMENT 'r';
+
+query IIIII
+SELECT from_vname, to_vname, to_kind, cardinality, comment FROM aclcat.acl.references WHERE vcat = 'objects';
+----
+t	v	relation	one_to_one	r
+
+# --- an object form that does not read as its rule says how it is written ------------------------------------------
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE objects.nothing;
+----
+write CREATE [OR REPLACE] VIRTUAL TABLE
+
+statement error
+ACL ADMIN ADD SCALAR objects.s RETURNS INTEGER;
+----
+write ADD SCALAR | TABLE FUNCTION
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION objects.f() RETURNS TABLE () AS SELECT 1;
+----
+RETURNS TABLE needs a column list
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCALAR objects.s() PRIMARY KEY (x) AS 1;
+----
+a scalar has no PRIMARY KEY
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE t AS phys.main.t;
+----
+must be written as <catalog>.<name>
+
+# a list the tokens do not tile (after a lone `$` the tokenizer places the next token at the `$`) is refused
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE objects.dollar AS phys.main.t RLS (a = $, b > 0);
+----
+does not read as written
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname IN ('nothing', 'dollar');
+----
+0
