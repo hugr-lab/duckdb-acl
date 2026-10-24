@@ -319,8 +319,16 @@ schema-check:
 	./scripts/check_schema.sh
 
 # Bootstrap a local vcpkg checkout for integration builds (the standard duckdb-extension dependency
-# manager; dependencies themselves come from the merged manifests of the loaded extensions)
+# manager; dependencies themselves come from the merged manifests of the loaded extensions). The
+# checkout is the commit duckdb's merged manifest names as its builtin-baseline - the one
+# extension-ci-tools checks out too: an overlay port that includes the checkout's own port must find
+# the version it was written for (postgres_scanner's vcpkg-tool-meson 1.9.0 took the head's 1.12.1
+# portfile and downloaded 1.9.0 against 1.12.1's hash, 2026-10-23)
+VCPKG_COMMIT ?= $(shell sed -n 's/.*"builtin-baseline": "\([0-9a-f]*\)".*/\1/p' duckdb/scripts/merge_vcpkg_deps.py)
 .PHONY: vcpkg-setup
 vcpkg-setup:
+	@test -n "$(VCPKG_COMMIT)" || (echo "vcpkg-setup: no builtin-baseline in duckdb/scripts/merge_vcpkg_deps.py" && exit 1)
 	@test -d vcpkg || git clone https://github.com/microsoft/vcpkg.git vcpkg
+	@git -C vcpkg cat-file -e $(VCPKG_COMMIT)^{commit} 2>/dev/null || git -C vcpkg fetch origin
+	git -C vcpkg checkout -q --detach $(VCPKG_COMMIT)
 	./vcpkg/bootstrap-vcpkg.sh -disableMetrics
