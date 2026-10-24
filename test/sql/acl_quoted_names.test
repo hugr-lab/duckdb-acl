@@ -550,10 +550,11 @@ c / Raw Data.sub.second
 
 # --- negative: what is not a name -------------------------------------------------------------------
 
+# spec 150, stage 3c: the form is a rule on duckdb's tokens, whose tokenizer refuses `""` itself
 statement error
 ACL ADMIN CREATE VIRTUAL CATALOG "";
 ----
-<REGEX>:.*an empty quoted identifier.*
+zero-length delimited identifier
 
 statement error
 ACL ADMIN CREATE VIRTUAL CATALOG "abc;

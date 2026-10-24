@@ -2,7 +2,8 @@
 // acl_admin_sql.hpp — the ACL management grammar (spec 008) and its authorization gate
 //
 // `ACL ADMIN CREATE VIRTUAL CATALOG ...`, `GRANT CATALOG ... TO ROLE ...`, `ALTER ...`, `DROP ...`
-// and the rest compile, with no parse-time side effects, into calls of the acl_* admin functions;
+// and the rest compile, with no parse-time side effects, into calls of the acl_* admin functions - the
+// families spec 150 moved by the grammar's rules (acl_mgmt_grammar.cpp), the rest here from their text;
 // AuthorizeMgmt (acl_platform.hpp) then judges every compiled call against the principal's rights
 // (spec 009 / 117) before anything runs. The parser override (acl_parser_override.cpp) is the only caller:
 // it recognises the `ACL <management>` marker after a principal and hands the text here.

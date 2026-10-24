@@ -473,16 +473,18 @@ scanner's rules (markers once, LINEAGE parent a run ref, INGEST no mode marker, 
 rest is parsed as its own text per mode, as before (positions, peelers, NATIVE). The registered variant (`acl`, tail
 `Statement`) is for CLI completion only. `AclGrammarCache` (on `AclParserInfo`, per instance) compiles the connection's
 grammar extensions with ours behind them; a CONNECT-ed / dialect connection refuses a prefix. A text not starting with
-the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a, 3b built): the batch
-is read by acl_mgmt_grammar.cpp's grammar (`Statement <- AclMgmtStatement`, compiled once, never registered) - a moved
-family's rule yields the acl_* call (`MgmtParsed` -> `MakeAdminCall`), anything else passes through as tokens
+the word ACL is never tokenized. Stage 3 moves the management statements one family per PR (3a, 3b, 3c part 1 built):
+the batch is read by acl_mgmt_grammar.cpp's grammar (`Statement <- AclMgmtStatement`, compiled once, never registered) -
+a moved family's rule yields the acl_* call (`MgmtParsed` -> `MakeAdminCall`), anything else passes through as tokens
 (`AclMgmtLegacy`) to the compiler as its own text (`CompileMgmtText`); a moved family's text form stays only as a
 refusal in its own words. 3a: KILL SESSION, SET SESSION … AUDIT LEVEL, PROFILE SESSION, DRAIN / RESUME NODE, MIGRATE
 POLICY CATALOG. 3b: CREATE / ALTER / DROP ROLE, GRANT / REVOKE ADMIN, [DROP] MAP, SET / RESET SESSION VIEW AS - the
-compiler's values on duckdb's tokens (`AclTokenMatcher`: a word - the run of tokens the tokenizer split at a
-leading digit -, a quoted name, a dotted name judged whole, a list item; `AclName`, `AclNameValue`, a claims list
-for `ClaimsListToCsv` as written with each comment a space). Stage 4 the policy texts. Tests `acl_prefix_grammar.test`,
-`acl_prefix_completion.test`, `acl_mgmt_grammar.test`.
+compiler's values on duckdb's tokens (`AclTokenMatcher`: a word - the run of tokens the tokenizer split at a leading
+digit -, a quoted name, a dotted name judged whole, a list item; `AclName`, `AclNameValue`, a claims list for
+`ClaimsListToCsv` as written with each comment a space). 3c part 1: CREATE VIRTUAL … and the ADD forms - `AclPathToken`
+(a path judged whole into its canonical key), `AclPathName`, `AclList` (a list as written, each comment a space),
+`AclBody` (one plain quoted token its value, else its tokens' text as written). Stage 4 the policy texts. Tests
+`acl_prefix_grammar.test`, `acl_prefix_completion.test`, `acl_mgmt_grammar.test`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
 attached catalog of type `tresor`, never its own secret manager. Under the explicit `secrets`

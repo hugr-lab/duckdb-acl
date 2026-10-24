@@ -86,17 +86,6 @@ string ClaimsListToCsv(const string &list) {
 	return StringUtil::Join(entries, ",");
 }
 
-//! `('api://hugr', 'api://other')` or `(RS256, ES256)` -> the stored csv
-string ValueListToCsv(const string &list) {
-	vector<string> entries;
-	for (auto &item : SplitTopLevel(list, ',')) {
-		if (!item.empty()) {
-			entries.push_back(Unquoted(item));
-		}
-	}
-	return StringUtil::Join(entries, ",");
-}
-
 //! `(tid => tenant, oid => user_id)` -> the stored JSON `{"tid": "tenant", "oid": "user_id"}`
 string ClaimMapToJson(const string &list) {
 	vector<string> entries;
@@ -424,10 +413,6 @@ bool IsMgmtStart(const string &text) {
 	return false;
 }
 
-//! `CREATE VIRTUAL <kind> <name> …` - the SQL-shaped spelling of the ADD forms, with the virtual
-//! name first (like `CREATE TABLE`) and `AS` naming the physical target or the body. The ADD forms
-//! stay accepted: a gateway generates them, and every existing script uses them.
-
 namespace {
 
 //! spec 150, stage 3: a moved family's form written so its rule did not read it - the form's own words. Its own type,
@@ -442,212 +427,56 @@ public:
 	throw MovedFormRefusal(usage);
 }
 
-unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
-	//! `IF NOT EXISTS` after the kind keyword: keep what is there instead of refusing
-	auto if_not_exists = [&mode](AdminScanner &scanner) {
-		if (!scanner.Accept("if")) {
-			return;
+//! spec 150, stage 3c: CREATE VIRTUAL … and the ADD forms are rules (acl_mgmt_grammar.cpp) - one that reaches here did
+//! not read as its rule, said in the form's own words
+[[noreturn]] void RefuseObjectForm(AdminScanner &s, bool add) {
+	auto kind = StringUtil::Lower(s.PeekWord());
+	s.Accept(kind.c_str());
+	bool function = kind == "scalar" || (kind == "table" && s.Accept("function"));
+	if (add) {
+		if (kind == "view") {
+			RefuseMovedForm("write ADD VIEW <catalog>.<name> [(<columns>)] AS <sql>");
 		}
-		scanner.Expect("not");
-		scanner.Expect("exists");
-		if (mode == "create") {
-			mode = "skip";
+		if (kind == "schema") {
+			RefuseMovedForm("write ADD SCHEMA <physical schema> AS <catalog>.<alias>");
 		}
-	};
-	//! `COMMENT '…'` may precede the body (a body runs to the end of the statement, so it cannot
-	//! follow one); for the forms whose tail is a list it may come last as well
-	auto comment_clause = [](AdminScanner &scanner, string &comment) {
-		if (scanner.Accept("comment")) {
-			comment = scanner.Quoted("comment");
+		if (function) {
+			RefuseMovedForm("write ADD SCALAR | TABLE FUNCTION <catalog>.<name>[(<parameters>)] [RETURNS <type> | "
+			                "RETURNS TABLE (<columns>)] MACRO <body> | ALIAS [OF] <function>");
 		}
-	};
-	if (s.Accept("catalog")) {
-		if_not_exists(s);
-		auto vcat = s.IdentKey("a catalog name");
-		string comment;
-		comment_clause(s, comment);
-		return MakeAdminCall("acl_create_catalog", {Value(vcat), Value(comment), Value(mode)});
+		if (kind == "table") {
+			RefuseMovedForm("write ADD TABLE <physical table> AS <catalog>.<name> [COLUMNS (...)] [RLS (...)]");
+		}
+		RefuseMovedForm("write ADD VIEW | SCHEMA | SCALAR | TABLE FUNCTION | TABLE ...");
 	}
-	if (s.Accept("reference")) {
-		// CREATE VIRTUAL REFERENCE v.name FROM <object> TO <object>
-		//     ON (from_col = to_col, …) | ON EXPRESSION '<sql>'
-		//     [CARDINALITY <kind>] [OPTIONAL] [JOIN <method>] [COMMENT '…']
-		if_not_exists(s);
-		string vcat, name;
-		SplitVirtual(s.Dotted("a virtual name"), vcat, name);
-		//! an endpoint may be written with or without the reference's own catalog in front of it
-		auto endpoint = [&s, &vcat]() {
-			auto written = s.Dotted("an object name");
-			if (NamePath::KeyUnder(written, vcat)) {
-				return written.substr(vcat.size() + 1);
-			}
-			return written;
-		};
-		s.Expect("from");
-		auto from_vname = endpoint();
-		s.Expect("to");
-		// TO FUNCTION f(param => col, …): the parenthesis is the argument substitution - which column
-		// of the source row feeds which parameter - and ON, when present, is the join condition on the
-		// function's result. Pure substitution needs no condition at all.
-		bool to_function = s.Accept("function");
-		auto to_vname = endpoint();
-		string call_args;
-		if (to_function) {
-			call_args = s.Parens();
-		}
-		string pairs, expr;
-		if (s.Accept("on")) {
-			// a bare list is a list of column pairs; SQL is spelled out, so neither can be mistaken
-			// for the other and a qualified name never reads as a column name
-			if (s.Accept("expression")) {
-				expr = s.Quoted("a join expression");
-			} else {
-				pairs = s.List("column pairs");
-			}
-		} else if (!to_function) {
-			throw BinderException("acl admin: a reference between objects needs an ON condition");
-		}
-		string cardinality, join_method, comment;
-		bool optional = false;
-		for (bool more = true; more;) {
-			more = false;
-			if (s.Accept("cardinality")) {
-				cardinality = s.Word("a cardinality");
-				more = true;
-			}
-			if (s.Accept("optional")) {
-				optional = true;
-				more = true;
-			}
-			if (s.Accept("join")) {
-				join_method = s.Word("a join method");
-				more = true;
-			}
-			if (s.Accept("comment")) {
-				comment = s.Quoted("comment");
-				more = true;
-			}
-		}
-		return MakeAdminCall("acl_add_reference",
-		                     {Value(vcat), Value(name), Value(from_vname), Value(to_vname),
-		                      Value(to_function ? "function" : "relation"), Value(call_args), Value(pairs), Value(expr),
-		                      Value(cardinality), Value(optional ? "true" : "false"), Value(join_method),
-		                      Value(comment), Value(mode)});
+	if (kind == "catalog") {
+		RefuseMovedForm("write CREATE [OR REPLACE] VIRTUAL CATALOG [IF NOT EXISTS] <catalog> [COMMENT '<text>']");
 	}
-	if (s.Accept("schema")) {
-		// CREATE VIRTUAL SCHEMA v.path AS <phys> - the live alias, resolves through
-		//                              FROM <phys> - the expansion, one record per object right now
-		if_not_exists(s);
-		string vcat, path;
-		SplitVirtual(s.Dotted("a virtual schema path"), vcat, path);
-		bool expand = s.Accept("from");
-		if (!expand) {
-			s.Expect("as");
-		}
-		auto phys = s.PathName("a physical schema path");
-		string comment;
-		comment_clause(s, comment);
-		return MakeAdminCall(expand ? "acl_expand_schema" : "acl_add_schema_alias",
-		                     {Value(vcat), Value(path), Value(phys), Value(comment), Value(mode)});
+	if (kind == "reference") {
+		RefuseMovedForm(
+		    "write CREATE [OR REPLACE] VIRTUAL REFERENCE [IF NOT EXISTS] <catalog>.<name> FROM <object> TO "
+		    "<object> ON (<pairs>) | ON EXPRESSION '<sql>' - or TO FUNCTION <function>[(<param> => "
+		    "<column>, ...)] [ON ...] - [CARDINALITY <kind>] [OPTIONAL] [JOIN <method>] [COMMENT '<text>']");
 	}
-	if (s.Accept("view")) { // CREATE VIRTUAL VIEW v.n [(col TYPE, …)] [COMMENT '…'] AS <sql>
-		if_not_exists(s);
-		string vcat, vname;
-		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-		auto returns = s.Parens();
-		string comment, pk;
-		for (bool more = true; more;) {
-			more = false;
-			if (s.Accept("primary")) {
-				s.Expect("key");
-				pk = s.List("key columns");
-				more = true;
-			}
-			if (s.Accept("comment")) {
-				comment = s.Quoted("comment");
-				more = true;
-			}
-		}
-		s.Expect("as");
-		auto sql = s.Body("view SQL");
-		return MakeAdminCall("acl_add_view", {Value(vcat), Value(vname), Value(sql), Value(returns), Value(comment),
-		                                      Value(mode), Value(pk)});
+	if (kind == "schema") {
+		RefuseMovedForm("write CREATE [OR REPLACE] VIRTUAL SCHEMA [IF NOT EXISTS] <catalog>.<path> AS | FROM <physical "
+		                "schema> [COMMENT '<text>']");
 	}
-	bool scalar = s.Accept("scalar");
-	bool table_function = false;
-	if (!scalar) {
-		s.Expect("table");
-		table_function = s.Accept("function");
+	if (kind == "view") {
+		RefuseMovedForm("write CREATE [OR REPLACE] VIRTUAL VIEW [IF NOT EXISTS] <catalog>.<name> [(<columns>)] "
+		                "[PRIMARY KEY (<columns>)] [COMMENT '<text>'] AS <sql>");
 	}
-	if_not_exists(s);
-	string vcat, vname;
-	SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-	if (scalar || table_function) {
-		// CREATE VIRTUAL SCALAR|TABLE FUNCTION v.n[(args)] [RETURNS …] [COMMENT '…'] AS <body>
-		//                                                                             | ALIAS OF <fn>
-		auto params = s.Parens();
-		string returns;
-		if (s.Accept("returns")) {
-			if (scalar) {
-				returns = s.Word("a result type");
-			} else {
-				s.Accept("table");
-				returns = s.Parens();
-				if (returns.empty()) {
-					throw BinderException("acl admin: RETURNS TABLE needs a column list");
-				}
-			}
-		}
-		string pk;
-		if (!scalar && s.Accept("primary")) { // after RETURNS: a key describes the result (spec 048)
-			s.Expect("key");
-			pk = s.List("key columns");
-		}
-		string comment;
-		comment_clause(s, comment);
-		if (s.Accept("alias")) {
-			s.Expect("of");
-			auto target = s.PathName("a target function");
-			comment_clause(s, comment); // an alias has no body, so the comment may also come last
-			return MakeAdminCall(
-			    scalar ? "acl_add_scalar_alias" : "acl_add_table_function_alias",
-			    {Value(vcat), Value(vname), Value(target), Value(""), Value(""), Value(comment), Value(mode)});
-		}
-		s.Expect("as");
-		auto definition = s.Body(scalar ? "expression template" : "SQL template");
-		vector<Value> call_args = {Value(vcat),    Value(vname),   Value(definition), Value(params),
-		                           Value(returns), Value(comment), Value(mode)};
-		if (!scalar) {
-			call_args.push_back(Value(pk)); // a scalar result has no key to declare
-		}
-		return MakeAdminCall(scalar ? "acl_add_scalar" : "acl_add_table_function", call_args);
+	if (function) {
+		RefuseMovedForm("write CREATE [OR REPLACE] VIRTUAL SCALAR | TABLE FUNCTION [IF NOT EXISTS] "
+		                "<catalog>.<name>[(<parameters>)] [RETURNS <type> | RETURNS TABLE (<columns>)] [PRIMARY KEY "
+		                "(<columns>)] [COMMENT '<text>'] AS <body> | ALIAS OF <function> [COMMENT '<text>']");
 	}
-	// CREATE VIRTUAL TABLE v.n AS <phys> [COLUMNS (…)] [RLS (…)] [COMMENT '…']
-	s.Expect("as");
-	auto phys = s.PathName("a physical table path");
-	string columns, rls, comment, pk;
-	for (bool more = true; more;) {
-		more = false;
-		if (s.Accept("columns")) {
-			columns = UnquoteColumnsList(s.List("columns list"));
-			more = true;
-		}
-		if (s.Accept("rls")) {
-			rls = s.List("RLS predicate");
-			more = true;
-		}
-		if (s.Accept("primary")) { // PRIMARY KEY (col, ...) - declared, never enforced (spec 048)
-			s.Expect("key");
-			pk = s.List("key columns");
-			more = true;
-		}
-		if (s.Accept("comment")) {
-			comment = s.Quoted("comment");
-			more = true;
-		}
+	if (kind == "table") {
+		RefuseMovedForm("write CREATE [OR REPLACE] VIRTUAL TABLE [IF NOT EXISTS] <catalog>.<name> AS <physical table> "
+		                "[COLUMNS (...)] [RLS (...)] [PRIMARY KEY (...)] [COMMENT '<text>']");
 	}
-	return MakeAdminCall("acl_add_relation", {Value(vcat), Value(vname), Value(phys), Value(columns), Value(rls),
-	                                          Value(comment), Value(mode), Value(pk)});
+	RefuseMovedForm("write CREATE [OR REPLACE] VIRTUAL CATALOG | REFERENCE | SCHEMA | VIEW | SCALAR | TABLE FUNCTION | "
+	                "TABLE ...");
 }
 
 //! spec 072: a function as a grant or a member names it - `read_parquet`, `lake.main.peek`, a
@@ -1182,7 +1011,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			mode = "replace";
 		}
 		if (s.Accept("virtual")) {
-			return ParseCreateVirtual(s, mode);
+			RefuseObjectForm(s, false);
 		}
 		if (s.Accept("role")) {
 			RefuseMovedForm("write CREATE [OR REPLACE] ROLE [IF NOT EXISTS] <role> [CLAIMS (name = 'value', ...)]");
@@ -1229,82 +1058,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		return ParseCreateIssuer(s, mode);
 	}
 	if (StringUtil::CIEquals(keyword, "add")) {
-		if (s.Accept("view")) {
-			// ADD VIEW v.n [(col TYPE, …)] AS '<sql>' - the CREATE VIEW shape; a declared column list
-			// is the truth and spares the write-time probe
-			string vcat, vname;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			auto returns = s.Parens();
-			s.Expect("as");
-			auto sql = s.Body("view SQL");
-			return MakeAdminCall("acl_add_view", {Value(vcat), Value(vname), Value(sql), Value(returns)});
-		}
-		if (s.Accept("schema")) {
-			auto phys = s.Dotted("a physical schema path");
-			s.Expect("as");
-			string vcat, alias;
-			SplitVirtual(s.Dotted("a virtual alias"), vcat, alias);
-			return MakeAdminCall("acl_add_schema_alias", {Value(vcat), Value(alias), Value(phys)});
-		}
-		if (s.Accept("scalar")) {
-			// ADD SCALAR v.n[(arg TYPE, …)] [RETURNS <type>] MACRO '<expr>' | ALIAS '<fn>'
-			string vcat, vname;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			auto params = s.Parens();
-			string returns;
-			if (s.Accept("returns")) {
-				returns = s.Word("a result type");
-			}
-			bool is_macro = s.Accept("macro");
-			if (!is_macro) {
-				s.Expect("alias");
-				s.Accept("of"); // ALIAS OF <fn> and the older ALIAS <fn> are the same thing
-			}
-			auto definition = is_macro ? s.Body("expression template") : s.PathName("a target function");
-			if (!is_macro) {
-				return MakeAdminCall("acl_add_scalar_alias", {Value(vcat), Value(vname), Value(definition)});
-			}
-			return MakeAdminCall("acl_add_scalar",
-			                     {Value(vcat), Value(vname), Value(definition), Value(params), Value(returns)});
-		}
-		s.Expect("table");
-		if (s.Accept("function")) {
-			// ADD TABLE FUNCTION v.n[(arg TYPE, …)] [RETURNS TABLE (col TYPE, …)] MACRO '<sql>' | ALIAS '<fn>'
-			string vcat, vname;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			auto params = s.Parens();
-			string returns;
-			if (s.Accept("returns")) {
-				s.Accept("table");
-				returns = s.Parens();
-				if (returns.empty()) {
-					throw BinderException("acl admin: RETURNS TABLE needs a column list");
-				}
-			}
-			bool is_macro = s.Accept("macro");
-			if (!is_macro) {
-				s.Expect("alias");
-				s.Accept("of"); // ALIAS OF <fn> and the older ALIAS <fn> are the same thing
-			}
-			auto definition = is_macro ? s.Body("SQL template") : s.PathName("a target function");
-			if (!is_macro) {
-				return MakeAdminCall("acl_add_table_function_alias", {Value(vcat), Value(vname), Value(definition)});
-			}
-			return MakeAdminCall("acl_add_table_function",
-			                     {Value(vcat), Value(vname), Value(definition), Value(params), Value(returns)});
-		}
-		auto phys = s.Dotted("a physical table path");
-		s.Expect("as");
-		string vcat, vname;
-		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-		string columns, rls;
-		if (s.Accept("columns")) {
-			columns = UnquoteColumnsList(s.List("columns list"));
-		}
-		if (s.Accept("rls")) {
-			rls = s.List("RLS predicate");
-		}
-		return MakeAdminCall("acl_add_relation", {Value(vcat), Value(vname), Value(phys), Value(columns), Value(rls)});
+		RefuseObjectForm(s, true);
 	}
 	if (StringUtil::CIEquals(keyword, "grant")) {
 		if (s.Accept("source")) {
@@ -1997,6 +1751,16 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 					pieces.push_back(Piece {std::move(parsed), nullptr});
 				}
 			} catch (ParserException &refusal) {
+				// a piece holding a `;` is never compiled from its text: the split and duckdb's tokenizer may disagree
+				// on where a statement ends (a `;` inside parentheses, a `$1$` the split took for a quote), and a body
+				// would take the statement after it (`SET AS SELECT (1 AS ""; DROP ROLE r)`) - the tokenizer's words
+				// refuse it
+				if (piece.find(';') != string::npos) {
+					auto info = ErrorData(refusal).ExtraInfo();
+					info.erase("position");
+					info.erase("location");
+					throw ParserException(info, ErrorData(refusal).RawMessage());
+				}
 				MgmtParsed parsed;
 				parsed.legacy = true;
 				parsed.text = piece;
@@ -2034,8 +1798,18 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 			}
 			continue;
 		}
-		for (auto &list : entry.claims_lists) {
-			entry.args[list.first] = Value(ClaimsListToCsv(list.second));
+		for (auto &list : entry.texts) {
+			switch (list.kind) {
+			case MgmtParsed::TextKind::CLAIMS:
+				entry.args[list.arg] = Value(ClaimsListToCsv(list.text));
+				break;
+			case MgmtParsed::TextKind::COLUMNS:
+				entry.args[list.arg] = Value(UnquoteColumnsList(list.text));
+				break;
+			case MgmtParsed::TextKind::TEXT:
+				entry.args[list.arg] = Value(list.text);
+				break;
+			}
 		}
 		if (entry.current_session) {
 			if (current_session.empty()) {
