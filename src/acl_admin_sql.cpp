@@ -1097,7 +1097,6 @@ unique_ptr<SQLStatement> ParseAlterClient(AdminScanner &s) {
 	return MakeAdminCall("acl_alter_client", {Value(name), Value(SpecJson(entries))});
 }
 
-//! [DROP] MAP GROUP|CLAIM '<v>' FROM CLIENT|ISSUER <name> TO ROLE r
 //! `(window_max 64, batch_bytes '32MiB', …)` - a resource group's limits as the JSON the admin functions take
 //! (spec 085; ALTER RESOURCE GROUP … SET (…), spec 120)
 string ResourceLimitsJson(const string &inside) {

@@ -105,11 +105,15 @@ string LevelWord(PEGTransformer &transformer, ParseResult &result, const char *w
 
 // --- the values a management statement holds ---------------------------------------------------------------------
 
-//! One token of a kind the management compiler's scanner read: a word (letters, digits, `_` - a keyword too), a
-//! double-quoted name, either - or, inside a parenthesised list, any token but a parenthesis
+//! One token of a kind the management compiler's scanner read: a word (ASCII letters, digits, `_` - a keyword too),
+//! a double-quoted name, either, words joined by `.` - or, inside a parenthesised list, any token but a parenthesis.
+//! The scanner read a word whole where duckdb's tokenizer splits it at a leading digit (`9abc` is `9` `abc`, `0x1F` is
+//! `0` `x1F`): a word is the run of word tokens with nothing between them. The tokenizer also reads a number through
+//! its dots (`v2.0.1` is `v2` `.0.1`, `9.x` is `9.` `x`): a dotted name is the run of tokens of word characters and
+//! dots that touch or meet at a dot (`a . b`, `a /* c */ .b` too), then judged whole - every part a word
 class AclTokenMatcher final : public AtomicMatcher {
 public:
-	enum class Kind : uint8_t { WORD, QUOTED_NAME, NAME, LIST_ITEM };
+	enum class Kind : uint8_t { WORD, NAME, DOTTED, LIST_ITEM };
 
 	explicit AclTokenMatcher(Kind kind_p) : AtomicMatcher(MatcherType::CUSTOM), kind(kind_p) {
 	}
@@ -119,11 +123,26 @@ public:
 		if (!current || !Accepts(*current)) {
 			return MatcherResult::Failure();
 		}
+		if (kind == Kind::DOTTED) {
+			return MatchDotted(state);
+		}
 		auto text = current->text;
 		auto offset = current->offset;
 		auto length = current->length;
+		bool joins = kind != Kind::LIST_ITEM && current->type != TokenType::STRING_LITERAL && text[0] != '"';
 		state.token_iterator.Advance();
 		state.UpdateMaxTokenIndex();
+		while (joins) {
+			auto next = state.token_iterator.Current();
+			if (!next || next->offset != offset + length || next->type == TokenType::STRING_LITERAL ||
+			    !IsWord(next->text)) {
+				break;
+			}
+			text += next->text;
+			length += next->length;
+			state.token_iterator.Advance();
+			state.UpdateMaxTokenIndex();
+		}
 		return state.AllocateParseResult<TokenParseResult>(std::move(text), offset, length);
 	}
 
@@ -136,6 +155,50 @@ public:
 	}
 
 private:
+	static bool IsDottedText(const MatcherToken &token) {
+		if (token.type == TokenType::STRING_LITERAL || token.text.empty()) {
+			return false;
+		}
+		for (auto c : token.text) {
+			if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '_' && c != '.') {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	MatcherResult MatchDotted(MatchState &state) const {
+		auto &tokens = state.token_iterator;
+		auto first = tokens.Position();
+		auto &head = tokens.GetToken(first);
+		string text = head.text;
+		auto end = head.offset + head.length;
+		idx_t count = 1;
+		while (first + count < tokens.Size()) {
+			auto &next = tokens.GetToken(first + count);
+			bool touches = next.offset == end;
+			if (!IsDottedText(next) || (!touches && text.back() != '.' && next.text[0] != '.')) {
+				break;
+			}
+			text += next.text;
+			end = next.offset + next.length;
+			count++;
+		}
+		// every part a word: no dot first, last or twice
+		idx_t part_start = 0;
+		for (idx_t i = 0; i <= text.size(); i++) {
+			if (i == text.size() || text[i] == '.') {
+				if (!IsWord(text.substr(part_start, i - part_start))) {
+					return MatcherResult::Failure();
+				}
+				part_start = i + 1;
+			}
+		}
+		tokens.Advance(count);
+		state.UpdateMaxTokenIndex();
+		return state.AllocateParseResult<TokenParseResult>(std::move(text), head.offset, end - head.offset);
+	}
+
 	static bool IsWord(const string &text) {
 		if (text.empty()) {
 			return false;
@@ -157,10 +220,10 @@ private:
 		switch (kind) {
 		case Kind::WORD:
 			return token.type != TokenType::STRING_LITERAL && IsWord(token.text);
-		case Kind::QUOTED_NAME:
-			return quoted_name;
 		case Kind::NAME:
 			return quoted_name || (token.type != TokenType::STRING_LITERAL && IsWord(token.text));
+		case Kind::DOTTED:
+			return IsDottedText(token);
 		case Kind::LIST_ITEM:
 			return token.text != "(" && token.text != ")";
 		}
@@ -180,7 +243,7 @@ const TokenParseResult &TokenOf(ParseResult &result) {
 		           node.get().Cast<ListParseResult>().GetChildren().size() == 1) {
 			node = node.get().Cast<ListParseResult>().GetChild(0);
 		} else {
-			throw InternalException("acl admin: a name's token is not where its rule says");
+			throw ParserException("acl admin: a name's token is not where its rule says");
 		}
 	}
 	return node.get().Cast<TokenParseResult>();
@@ -205,20 +268,13 @@ string NameOf(ParseResult &result, const char *what) {
 	return name;
 }
 
-//! `AclNameValue <- AclQuotedValue / AclDottedWords`: a name that is a value (spec 116 §3) as `NameValue` read it -
-//! quoted either way, as written, or words joined by `.`
+//! `AclNameValue <- StringLiteral / AclDottedToken / Identifier`: a name that is a value (spec 116 §3) as `NameValue`
+//! read it - quoted either way, as written, or words joined by `.`
 string NameValueOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
 	auto &node = Strip(result);
-	if (node.Name() == "AclDottedWords") {
-		auto &list = node.Cast<ListParseResult>();
-		string value = TokenOf(list.GetChild(0)).text;
-		vector<reference<ParseResult>> parts;
-		grammar::Collect(list.GetChild(1), parts);
-		for (auto &part : parts) {
-			// AclDottedPart <- '.' AclWordToken
-			value += "." + TokenOf(part.get().Cast<ListParseResult>().GetChild(1)).text;
-		}
-		return value;
+	if (node.Name() == "AclDottedToken") {
+		// the matcher joined the name's tokens, its dots kept
+		return TokenOf(node).text;
 	}
 	QuotedValue entry;
 	entry.value = ValueOf(transformer, node, entry.offset);
@@ -513,15 +569,18 @@ public:
 		    GrammarChange::AddTerminalRuleOverride("AclNameToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
 			    return make_uniq<AclTokenMatcher>(AclTokenMatcher::Kind::NAME);
 		    }));
+		changes.push_back(GrammarChange::AddRule("AclDottedToken <- Identifier"));
+		changes.push_back(GrammarChange::AddTerminalRuleOverride(
+		    "AclDottedToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
+			    return make_uniq<AclTokenMatcher>(AclTokenMatcher::Kind::DOTTED);
+		    }));
 		changes.push_back(GrammarChange::AddRule("AclListToken <- Identifier"));
 		changes.push_back(
 		    GrammarChange::AddTerminalRuleOverride("AclListToken", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
 			    return make_uniq<AclTokenMatcher>(AclTokenMatcher::Kind::LIST_ITEM);
 		    }));
 		changes.push_back(GrammarChange::AddRule("AclName <- AclNameToken"));
-		changes.push_back(GrammarChange::AddRule("AclDottedPart <- '.' AclWordToken"));
-		changes.push_back(GrammarChange::AddRule("AclDottedWords <- AclWordToken AclDottedPart*"));
-		changes.push_back(GrammarChange::AddRule("AclNameValue <- StringLiteral / AclDottedWords / Identifier"));
+		changes.push_back(GrammarChange::AddRule("AclNameValue <- StringLiteral / AclDottedToken / Identifier"));
 		changes.push_back(GrammarChange::AddRule("AclListItem <- AclParenList / AclListToken"));
 		changes.push_back(GrammarChange::AddRule("AclParenList <- '(' AclListItem* ')'"));
 		changes.push_back(GrammarChange::AddRule("AclClaims <- AclParenList / AclQuotedValue"));
@@ -574,6 +633,54 @@ public:
 		return changes;
 	}
 };
+
+//! A claims list's text between its parentheses for the compiler's `ClaimsListToCsv`: as written with each comment a
+//! space - that reader keeps a name and an unquoted value as written (`custom:tenant`, `-1`), and a comment would be
+//! read as part of the list (`(region = 'eu' -- , tenant = 'x'` set tenant). That reader knows `'…'` and `"…"` only:
+//! a literal the tokenizer reads otherwise (`E'…'`, `$$…$$`, a backtick name) would split into other claims than
+//! written, so it is refused until the list is a rule (stage 4), as is a text the tokens do not tile
+string ClaimsListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end) {
+	auto refuse = [](const char *why) {
+		throw BinderException("acl admin: a claims list is written as name = 'value' items - %s", why);
+	};
+	if (start == 0 || text[start - 1] != '(' || end >= text.size() || text[end] != ')') {
+		refuse("its text does not read as written"); // a parenthesis placed at another token's offset
+	}
+	auto first = grammar::TokenIndexAt(tokens, start - 1); // the list's `(`
+	string inside;
+	optional_idx previous_end;
+	for (idx_t index = first.IsValid() ? first.GetIndex() : 0; index < tokens.Size(); index++) {
+		auto &token = tokens.GetToken(index);
+		if (token.offset < start) {
+			continue;
+		}
+		if (token.offset >= end || token.type == TokenType::END_OF_INPUT) {
+			break;
+		}
+		if (token.type == TokenType::STRING_LITERAL && (token.text.empty() || token.text[0] != '\'')) {
+			refuse("a value is in single quotes (E'...' and $$...$$ are not read as one value here yet)");
+		}
+		if (!token.text.empty() && token.text[0] == '`') {
+			refuse("a backtick name is not read as one name here");
+		}
+		if (previous_end.IsValid()) {
+			auto gap_start = previous_end.GetIndex();
+			if (token.offset < gap_start) {
+				refuse("its text does not read as written");
+			}
+			auto gap = text.substr(gap_start, token.offset - gap_start);
+			auto blank = gap;
+			StringUtil::Trim(blank);
+			if (!blank.empty() && !StringUtil::StartsWith(blank, "--") && !StringUtil::StartsWith(blank, "/*")) {
+				refuse("its text does not read as written");
+			}
+			inside += blank.empty() ? gap : " ";
+		}
+		inside += text.substr(token.offset, token.length);
+		previous_end = token.offset + token.length;
+	}
+	return inside;
+}
 
 } // namespace
 
@@ -647,9 +754,7 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 			parsed.args = data.args;
 			parsed.current_session = data.current_session;
 			for (auto &span : data.claims_lists) {
-				auto inside = text.substr(span.start, span.end - span.start);
-				StringUtil::Trim(inside);
-				parsed.claims_lists.emplace_back(span.arg, std::move(inside));
+				parsed.claims_lists.emplace_back(span.arg, ClaimsListText(text, tokens, span.start, span.end));
 			}
 		}
 		result.push_back(std::move(parsed));
