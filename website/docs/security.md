@@ -376,7 +376,8 @@ combined with a certificate. Both doors require cert **and** key together.
   `acl_check_catalog` names a body stored before (`body_function_denied`). No definition names the
   policy catalog's own tables, under any reading of the name. A change to an issuer or a client behind
   a mapping to an administering role, a mapping to such a role, and a catalog's `manage` for a role a
-  mapping reaches are `passthrough`'s.
+  mapping reaches are `passthrough`'s - the names read as the store resolves them (any case), a batch with
+  what it maps and grants itself, in either order (spec 152).
 - **A view as another role sees no more than that role, and reads no rows** (spec 120): `SET SESSION VIEW AS
   ROLE` is `policy`'s or `passthrough`'s, acts only on the session the statement runs under (the call takes no
   session argument, so no session can be put into another role's view by someone else), rewrites the

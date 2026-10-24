@@ -740,6 +740,11 @@ a retained result is read from the handle. The view comment and the stored catal
 reach the listings. Tests: `platform_{views,calls,rights,markerless,reserved,memory}.test`,
 `test_acl_session.cpp` / `test_acl_params_passthrough.cpp`, `test/e2e/flight/admin.sh`, the door e2e.
 
+**Spec 152 — the role-target authorizer reads as the store does**: `AuthorizeRoleTargets` compares issuer / client
+names case-insensitively (`ALTER ISSUER KC` is kc - it compared exactly, so a `policy` admin repointed an issuer behind
+a passthrough mapping and became passthrough), and judges a batch with its own `acl_map_role` targets and catalog
+`manage` grants, in either order (`MAP … TO ROLE r; GRANT … manage TO r` passed together). Test `platform_review.test`.
+
 **Spec 118 — node and cluster management** (all three stages built): the `operate` bundle
 (`AdminScope::OPERATE`, `AdminRights::operate`; observe + the node's runtime, implied by passthrough, a
 point grant on one operation stands in) - `KILL SESSION '<id>'`, `SET SESSION '<id>' AUDIT LEVEL …|DEFAULT`

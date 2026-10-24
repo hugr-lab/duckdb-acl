@@ -316,6 +316,72 @@ ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET CAPS '{"manage": tru
 ----
 <REGEX>:.*"reader" is reached by a role mapping.*
 
+# spec 152: a name in another case is the same issuer / client to the store, and to the authorizer
+statement error
+ACL ROLE "pol" ALTER ISSUER KC SET URL 'test/idp/a';
+----
+<REGEX>:.*issuer "KC" carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" SELECT platform.alter_issuer('Kc', '{"url": "test/idp/a"}');
+----
+<REGEX>:.*issuer "Kc" carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" ALTER CLIENT CATCHALL SET AUDIENCES ('api://other');
+----
+<REGEX>:.*client "CATCHALL" carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" CREATE OR REPLACE CLIENT Catchall ISSUER KC AUDIENCES ('api://acl-test') ROLES FROM ('groups');
+----
+<REGEX>:.*carries a mapping to "root".*
+
+statement error
+ACL ROLE "pol" CREATE CLIENT sneaky2 ISSUER kC AUDIENCES ('api://acl-test') AZP ('y') ROLES FROM ('groups');
+----
+<REGEX>:.*carries a mapping to "root".*
+
+# ... and a short form, named by its URL
+statement ok
+ACL ADMIN CREATE ISSUER 'test/idp/d' AUDIENCES ('api://d') ROLE CLAIM 'roles';
+
+statement ok
+ACL ADMIN MAP CLAIM 'd-root' FROM CLIENT 'test/idp/d' TO ROLE root;
+
+statement error
+ACL ROLE "pol" ALTER ISSUER 'TEST/IDP/D' SET AUDIENCES ('api://any');
+----
+<REGEX>:.*carries a mapping to "root".*
+
+# spec 152: a batch is judged with what it maps and grants itself - map then grant, grant then map
+statement ok
+ACL ADMIN CREATE ROLE r_both; CREATE ROLE r_rev; CREATE ROLE r_map; CREATE ROLE r_grant;
+
+statement error
+ACL ROLE "pol" MAP CLAIM 'x' FROM CLIENT pc TO ROLE r_both; GRANT CATALOG sales TO ROLE r_both WITH (select, manage);
+----
+<REGEX>:.*"r_both" holds administration \(this batch grants it a catalog's manage\).*
+
+statement error
+ACL ROLE "pol" GRANT CATALOG sales TO ROLE r_rev WITH (select, manage); MAP CLAIM 'y' FROM CLIENT pc TO ROLE r_rev;
+----
+<REGEX>:.*"r_rev" is reached by a role mapping.*
+
+statement error
+ACL ROLE "pol" ALTER GRANT CATALOG sales TO ROLE reader SET CAPS '{"select": true}'; MAP CLAIM 'z' FROM CLIENT pc TO ROLE r_rev; ALTER GRANT CATALOG sales TO ROLE r_rev SET CAPS '{"manage": true}';
+----
+<REGEX>:.*"r_rev" holds administration \(this batch grants it a catalog's manage\).*
+
+query I
+SELECT count(*) FROM acl_role_mappings() WHERE role IN ('r_both', 'r_rev');
+----
+0
+
+# a mapping and a manage grant to different roles stay one batch
+statement ok
+ACL ROLE "pol" MAP CLAIM 'm' FROM CLIENT pc TO ROLE r_map; GRANT CATALOG sales TO ROLE r_grant WITH (select, manage);
+
 # --- D3: the policy store under every reading of its name ---------------------------------------------------
 
 statement ok

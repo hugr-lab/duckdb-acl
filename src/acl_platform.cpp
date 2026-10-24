@@ -1354,7 +1354,7 @@ namespace {
 //! An issuer's URL by its name ('' when none) - a short-form issuer is named by its URL
 string IssuerUrlOf(const IdentityModel &model, const string &name) {
 	for (auto &issuer : model.issuers) {
-		if (issuer.name == name) {
+		if (StringUtil::CIEquals(issuer.name, name)) {
 			return issuer.url;
 		}
 	}
@@ -1911,22 +1911,27 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
 		return;
 	}
 	auto identity = store.Identity();
-	// the issuer / client a mapping to an administering role hangs on: what repoints that trust is privileged
+	// the issuer / client a mapping to an administering role hangs on: what repoints that trust is privileged. Names
+	// compare as the store resolves them (spec 152: `ALTER ISSUER KC` is issuer kc) - an over-reading refuses, never
+	// a miss
+	auto same = [](const string &a, const string &b) {
+		return StringUtil::CIEquals(a, b);
+	};
 	auto privileged_behind = [&](const string &issuer, const string &client) {
 		for (auto &mapping : identity->mappings) {
 			bool scoped = false;
 			if (StringUtil::CIEquals(mapping.scope_kind, "client")) {
-				if (!client.empty() && mapping.scope_name == client) {
+				if (!client.empty() && same(mapping.scope_name, client)) {
 					scoped = true;
 				}
 				for (auto &each : identity->clients) {
-					if (each.name == mapping.scope_name && !issuer.empty() &&
-					    (each.issuer == issuer || IssuerUrlOf(*identity, each.issuer) == issuer)) {
+					if (same(each.name, mapping.scope_name) && !issuer.empty() &&
+					    (same(each.issuer, issuer) || same(IssuerUrlOf(*identity, each.issuer), issuer))) {
 						scoped = true;
 					}
 				}
 			} else if (!issuer.empty() &&
-			           (mapping.scope_name == issuer || IssuerUrlOf(*identity, mapping.scope_name) == issuer)) {
+			           (same(mapping.scope_name, issuer) || same(IssuerUrlOf(*identity, mapping.scope_name), issuer))) {
 				scoped = true;
 			}
 			if (scoped && store.RolePrivileged(mapping.role)) {
@@ -1935,6 +1940,33 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
 		}
 		return string();
 	};
+	// a grant of a catalog's manage: the role it goes to, '' for any other call
+	auto manage_granted = [](FunctionExpression &call, const string &target) {
+		bool manage = false;
+		if (target == "acl_grant_catalog") {
+			auto caps = ConstantArgument(call, 2, "grant_catalog");
+			manage = !caps.empty() && acl_detail::ParseCaps(caps).count("manage");
+		} else if (target == "acl_alter_grant") {
+			auto field = StringUtil::Lower(ConstantArgument(call, 2, "alter_grant"));
+			auto value = ConstantArgument(call, 3, "alter_grant");
+			manage = field == "caps" && !value.empty() && acl_detail::ParseCaps(value).count("manage");
+		}
+		return manage ? ConstantArgument(call, 0, "grant_catalog") : string();
+	};
+	// the batch judged with its own effects, whatever their order (spec 152): the roles it maps and the roles it
+	// gives a catalog's manage - each statement alone was refused, the two together were not
+	unordered_set<string> mapped_here, managed_here;
+	for (auto &statement : statements) {
+		auto &call = CompiledCall(*statement);
+		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
+		if (target == "acl_map_role") {
+			mapped_here.insert(ConstantArgument(call, 4, "map_role"));
+		}
+		auto managed = manage_granted(call, target);
+		if (!managed.empty()) {
+			managed_here.insert(managed);
+		}
+	}
 	for (auto &statement : statements) {
 		auto &call = CompiledCall(*statement);
 		auto target = StringUtil::Lower(call.FunctionName().GetIdentifierName());
@@ -1966,36 +1998,27 @@ void AuthorizeRoleTargets(vector<unique_ptr<SQLStatement>> &statements, const Po
 		}
 		// a grant that makes a mapped role administer a catalog hands it to whoever holds the claim: the
 		// order (map first, grant after) must not reach what mapping it afterwards could not
-		if (target == "acl_grant_catalog" || target == "acl_alter_grant") {
-			auto role = ConstantArgument(call, 0, "grant_catalog");
-			bool manage = false;
-			if (target == "acl_grant_catalog") {
-				auto caps = ConstantArgument(call, 2, "grant_catalog");
-				manage = !caps.empty() && acl_detail::ParseCaps(caps).count("manage");
-			} else {
-				auto field = StringUtil::Lower(ConstantArgument(call, 2, "alter_grant"));
-				auto value = ConstantArgument(call, 3, "alter_grant");
-				manage = field == "caps" && !value.empty() && acl_detail::ParseCaps(value).count("manage");
+		auto managed = manage_granted(call, target);
+		if (!managed.empty()) {
+			bool mapped = mapped_here.count(managed) > 0;
+			for (auto &mapping : identity->mappings) {
+				mapped = mapped || mapping.role == managed;
 			}
-			if (manage) {
-				for (auto &mapping : identity->mappings) {
-					if (mapping.role == role) {
-						throw BinderException("acl admin: \"%s\" is reached by a role mapping, so granting it a "
-						                      "catalog's manage hands administration to whoever holds the claim - it "
-						                      "requires a passthrough scope, as mapping to an administering role does",
-						                      role);
-					}
-				}
+			if (mapped) {
+				throw BinderException("acl admin: \"%s\" is reached by a role mapping, so granting it a "
+				                      "catalog's manage hands administration to whoever holds the claim - it "
+				                      "requires a passthrough scope, as mapping to an administering role does",
+				                      managed);
 			}
 		}
 		if (target != "acl_map_role") {
 			continue;
 		}
 		auto role = ConstantArgument(call, 4, "map_role");
-		if (!role.empty() && store.RolePrivileged(role)) {
-			throw BinderException("acl admin: \"%s\" holds administration, so mapping a claim to it hands that "
+		if (!role.empty() && (store.RolePrivileged(role) || managed_here.count(role))) {
+			throw BinderException("acl admin: \"%s\" holds administration%s, so mapping a claim to it hands that "
 			                      "administration out - it requires a passthrough scope, as granting the bundle does",
-			                      role);
+			                      role, managed_here.count(role) ? " (this batch grants it a catalog's manage)" : "");
 		}
 	}
 }
