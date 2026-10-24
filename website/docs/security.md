@@ -24,7 +24,8 @@ there - no re-entry, no mode laundering" (spec 009).
 
 **The prefix is read by a grammar rule (spec 150).** The prefix's head - the principal, the markers (`TRACE`, `PARENT`,
 `LINEAGE …`) and the client's `ACL` / `ACL NATIVE` - is read by a rule of DuckDB's own PEG parser, with DuckDB's
-tokenizer: no hand scanner reads the text, so there is no second reading of where the prefix ends. The rest of the
+tokenizer: no hand scanner reads the prefix, so there is no second reading of where it ends (the management
+statements and the batch's checks are still read by hand until they become rules too). The rest of the
 statement is then parsed as its own text the way its mode parses it - a query by DuckDB's parser with the connection's
 grammar extensions, `ACL NATIVE` as DuckDB's own SQL, management by the management compiler. Each value in the head is
 one quoted literal written plainly (`'…'` or `"…"`, never empty): a string the tokenizer would join across a line break
@@ -32,7 +33,8 @@ one quoted literal written plainly (`'…'` or `"…"`, never empty): a string t
 principal's name. Comments among the markers are comments. The rules are also registered as the grammar extension
 `acl`, for completion only: `SET active_grammar_extensions = ['acl']` makes the CLI offer `ACL`, the kinds and the
 statements after them; a prefixed text that reaches DuckDB's own parser with that grammar on - the override turned off -
-is refused at bind, never run. A prefix on a `CONNECT`-ed connection or under a dialect is refused.
+is refused at bind, never run. A prefix on a `CONNECT`-ed connection or under a dialect is refused. An error in the
+statement is drawn against the statement, never under the prefix - a token or a session handle is not echoed back.
 
 **The rewrite happens before bind.** The extension is a `parser_override`: it rewrites the parsed
 AST and "returns real `SQLStatement`s to the normal execution path" (spec 001). Enforcement is
@@ -747,7 +749,7 @@ marks:
 
 | prefix | raised by | what it marks |
 | --- | --- | --- |
-| `acl_rewrite:` | the prefix scanner (`ParserException`), principal resolution (`… token rejected: …`, `… role verification failed`, `… session unknown|expired|idle`), every `Deny()` of the rewriter (`BinderException`), the per-row write check (`InvalidInputException` via `error()`: `the row does not satisfy the grant on "<name>", so it cannot be written`), template errors | **a principal's statement was refused** - the class a client sees most |
+| `acl_rewrite:` | the prefix's reader (`ParserException`), principal resolution (`… token rejected: …`, `… role verification failed`, `… session unknown|expired|idle`), every `Deny()` of the rewriter (`BinderException`), the per-row write check (`InvalidInputException` via `error()`: `the row does not satisfy the grant on "<name>", so it cannot be written`), template errors | **a principal's statement was refused** - the class a client sees most |
 | `acl admin:` | the management grammar and its authorization in `acl_parser_override.cpp`, the admin functions, the catalog writers | a management statement or admin function was malformed or not authorized (`a bare ACL ADMIN is disabled - …`) |
 | `acl catalog:` | `acl_policy_catalog.cpp` | the policy-catalog backend: malformed caps/claim JSON, a failed catalog read/write/transaction, the read-only function driver |
 | `acl:` | the drain fence (`a streamed insert carries no principal, so it would be written outside the policy (…)`), door runtime refusals returned as `arrow::Status` (`node is draining - not accepting new sessions`, transaction and ticket errors, the password handshake), the multi-relation predicate check, join-expression checks, internal errors (`this build's std::random_device is deterministic, …`) | the door or the store refused something that is not one statement's rewrite; **also** the description text of every `acl_*` setting, which the grep counts |

@@ -70,7 +70,8 @@ src/
   acl_rewriter.cpp           # the AST walker; exposes RewriteStatements(...)
   acl_identity.cpp           # spec 095: issuers/clients/mappings - the pure model + routing (acl_identity.hpp)
   acl_identity_store.cpp     #   ... the store's side: secrets, discovery documents, VerifyJwtPrincipal, doors
-  acl_parser_override.cpp    # ACL prefix scanner + parser_override; exposes RegisterAclParser(...)
+  acl_parser_override.cpp    # the ACL prefix + parser_override; exposes RegisterAclParser(...)
+  acl_grammar.cpp            # spec 150: the prefix's head as a PEG rule (acl_grammar.hpp: AclGrammarCache)
   acl_admin_functions.cpp    # acl_* admin stubs; exposes RegisterAclAdminFunctions(...)
   acl_platform.cpp           # spec 117: the platform catalog - views, functions, the ONE authorizer (acl_platform.hpp)
   acl_door_common.cpp        # what every acl_* scalar and both doors share: StoreOf/RequiredArg, PEM, JSON

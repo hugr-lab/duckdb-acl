@@ -318,10 +318,7 @@ int main(int argc, char *argv[]) {
 		      "one quoted part with a dot is another schema (spec 116)");
 		CheckOk(*con.Query(session + "USE SCHEMA out . deep"), "spaces around the dot, as duckdb reads them");
 		Check(One(con, session + "SELECT id FROM d") == "7", "...the same schema");
-		// spec 150: duckdb's tokenizer reads the whole text with the prefix now, and refuses an empty quoted name first
-		auto empty = One(con, session + "USE SCHEMA \"\"");
-		Check(Contains(empty, "no empty part") || Contains(empty, "zero-length delimited identifier"),
-		      "an empty name is refused");
+		Check(Contains(One(con, session + "USE SCHEMA \"\""), "no empty part"), "an empty name is refused");
 		CheckOk(*con.Query(session + "USE sales"), "back");
 	});
 

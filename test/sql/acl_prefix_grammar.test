@@ -136,6 +136,54 @@ ACL ROLE "analyst" TRACE 'a' TRACE 'b' SELECT 1;
 ----
 may be written once
 
+# written once whatever its value: an empty one first (a door's id of control characters only) does not make room
+statement error
+ACL ROLE "analyst" TRACE '' TRACE 'forged' SELECT 1;
+----
+may be written once
+
+statement error
+ACL ROLE "analyst" LINEAGE JOB '' JOB 'forged' SELECT 1;
+----
+may be written once
+
+query I
+ACL /* the gateway's note */ ROLE "analyst" SELECT count(*) FROM sales;
+----
+3
+
+# a marker's value is held to the same rule as the principal's
+statement error
+ACL ROLE "analyst" TRACE abc SELECT 1;
+----
+TRACE requires a quoted value
+
+statement error
+ACL ROLE "analyst" TRACE E'x' SELECT 1;
+----
+TRACE requires a quoted value
+
+# a marker word whose value does not read is said in the client's words, not as the rest's syntax error
+statement error
+ACL ROLE "analyst" TRACE SELECT 1;
+----
+ACL TRACE requires a quoted value
+
+statement error
+ACL ROLE "analyst" LINEAGE SELECT 1;
+----
+ACL LINEAGE needs PARENT, ROOT or JOB
+
+statement error
+ACL ROLE "analyst" LINEAGE JOB SELECT 1;
+----
+ACL LINEAGE JOB requires a quoted value
+
+statement error
+ACL ROLE "analyst" LINEAGE JOB 'j' ROOT SELECT 1;
+----
+ACL LINEAGE ROOT requires a quoted value
+
 statement error
 ACL ROLE "analyst" TRACE 'a'
 'b' SELECT 1;
@@ -159,6 +207,23 @@ LINEAGE PARENT
 
 # --- the rest: where the scanner left it, parsed as its own text ----------------------------------
 
+# a rest duckdb's tokenizer refuses is the rest's to report, drawn against the rest - a door's session handle is
+# never echoed back
+statement error
+ACL SESSION 'no-such-handle' SELECT 'unterminated;
+----
+<REGEX>:.*LINE 1: SELECT 'unterminated.*
+
+statement error
+ACL SESSION 'no-such-handle' SELECT 'unterminated;
+----
+<!REGEX>:.*no-such-handle.*
+
+statement error
+ACL ROLE "analyst" SELECT 'unterminated;
+----
+unterminated string literal
+
 # a statement's text is its own, never the prefix
 query I
 ACL ROLE "analyst" /* a tool's note */ SELECT current_query();
@@ -170,6 +235,18 @@ statement error
 ACL ROLE "analyst" SELECT nope FROM sales;
 ----
 <REGEX>:.*LINE 1: SELECT nope FROM sales.*
+
+# a syntax error too, drawn against the statement: duckdb drew it under the whole text with the statement's offset -
+# the caret in the prefix, and the prefix (a token, a door's session handle) echoed back (the 2026-10-24 review)
+statement error
+ACL ROLE "analyst" SELECT , FROM sales;
+----
+<REGEX>:.*LINE 1: SELECT , FROM sales.*
+
+statement error
+ACL ROLE "analyst" SELECT , FROM sales;
+----
+<!REGEX>:.*ACL ROLE.*
 
 # a prefix with no statement of its own, a separator right after it, the batch under one prefix
 statement ok
@@ -194,6 +271,17 @@ statement error
 ACL ROLE "analyst" SELECT 1; ACL ROLE "analyst" SELECT 2;
 ----
 one ACL prefix per batch
+
+# every statement of a batch is decided before any runs: a refused one leaves the first, a DDL, undone
+statement error
+ACL ROLE "analyst" CREATE TABLE lake.never_made(id INTEGER); SELECT * FROM phys.main.sales;
+----
+no access to object
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'never_made';
+----
+0
 
 # an implicit PIVOT's enum step stays inside the prefix
 query III

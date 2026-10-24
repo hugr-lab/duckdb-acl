@@ -1,5 +1,7 @@
 #include "acl_grammar.hpp"
 
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -29,7 +31,7 @@ struct PrefixParseData : ParserExtensionParseData {
 	string value;
 	optional_idx value_offset;
 	struct Marker {
-		string word;
+		GrammarPrefix::MarkerKind kind;
 		string value;
 		optional_idx offset;
 	};
@@ -44,7 +46,7 @@ struct PrefixParseData : ParserExtensionParseData {
 		return make_uniq<PrefixParseData>(*this);
 	}
 	string ToString() const override {
-		return "ACL " + StringUtil::Upper(kind) + (value_offset.IsValid() ? " " + SQLString::ToString(value) : "");
+		return "ACL " + StringUtil::Upper(kind); // never the value: a token or a session handle
 	}
 };
 
@@ -148,7 +150,10 @@ arena_ptr<TransformResultValue> FinalizePrefix(PEGTransformer &transformer, Pars
 			for (auto &part_result : parts) {
 				auto &part = Strip(part_result.get()).Cast<ListParseResult>();
 				PrefixParseData::Marker entry;
-				entry.word = "lineage." + KeywordOf(part.GetChild(0));
+				auto word = KeywordOf(part.GetChild(0));
+				entry.kind = word == "parent" ? GrammarPrefix::MarkerKind::LINEAGE_PARENT
+				             : word == "root" ? GrammarPrefix::MarkerKind::LINEAGE_ROOT
+				                              : GrammarPrefix::MarkerKind::LINEAGE_JOB;
 				entry.value = ValueOf(transformer, part.GetChild(1), entry.offset);
 				data->markers.push_back(std::move(entry));
 			}
@@ -156,7 +161,8 @@ arena_ptr<TransformResultValue> FinalizePrefix(PEGTransformer &transformer, Pars
 		}
 		// AclTraceMarker <- AclTraceWord AclQuotedValue
 		PrefixParseData::Marker entry;
-		entry.word = KeywordOf(marker.GetChild(0));
+		entry.kind = KeywordOf(marker.GetChild(0)) == "trace" ? GrammarPrefix::MarkerKind::TRACE
+		                                                      : GrammarPrefix::MarkerKind::PARENT;
 		entry.value = ValueOf(transformer, marker.GetChild(1), entry.offset);
 		data->markers.push_back(std::move(entry));
 	}
@@ -187,8 +193,8 @@ arena_ptr<TransformProcess> StartPrefix(PEGTransformer &transformer, ParseResult
 //! afterwards, by whatever reads that mode - and the registered one (completion only) offers a statement
 class AclPrefixGrammar final : public GrammarExtension {
 public:
-	AclPrefixGrammar(string name, bool passthrough_tail)
-	    : GrammarExtension(std::move(name), "acl: the ACL prefix (spec 150)"), passthrough_tail(passthrough_tail) {
+	AclPrefixGrammar(string name, bool passthrough_tail_p)
+	    : GrammarExtension(std::move(name), "acl: the ACL prefix (spec 150)"), passthrough_tail(passthrough_tail_p) {
 	}
 
 	vector<GrammarChange> GetChanges() const override {
@@ -243,31 +249,63 @@ bool WrittenPlainly(const string &query, const MatcherToken &token, const string
 	return token.text == written;
 }
 
-optional_ptr<const MatcherToken> TokenAt(const TokenIterator &tokens, idx_t offset) {
+//! The token starting at `offset` (the tokens come in text order), or none
+optional_idx TokenIndexAt(const TokenIterator &tokens, idx_t offset) {
 	for (idx_t i = 0; i < tokens.Size(); i++) {
 		auto &token = tokens.GetToken(i);
+		if (token.offset > offset) {
+			break;
+		}
 		if (token.offset == offset && token.type != TokenType::END_OF_INPUT) {
-			return &token;
+			return i;
 		}
 	}
-	return nullptr;
+	return optional_idx();
 }
 
-//! `ACL <kind>`: the text's first two tokens - anything else is not a prefix of ours
-bool StartsWithPrefix(const TokenIterator &tokens) {
-	if (tokens.Size() < 2 || !StringUtil::CIEquals(tokens.GetToken(0).text, "acl")) {
-		return false;
-	}
-	auto &kind = tokens.GetToken(1).text;
-	for (auto word : {"role", "token", "session", "ingest", "admin"}) {
-		if (StringUtil::CIEquals(kind, word)) {
+//! The kinds, as the rule's `AclPrincipalWord` and `'ADMIN'` spell them
+bool TryKindOf(const string &word, GrammarPrefix::Kind &kind) {
+	static constexpr struct {
+		const char *word;
+		GrammarPrefix::Kind kind;
+	} KINDS[] = {{"role", GrammarPrefix::Kind::ROLE},
+	             {"token", GrammarPrefix::Kind::TOKEN},
+	             {"session", GrammarPrefix::Kind::SESSION},
+	             {"ingest", GrammarPrefix::Kind::INGEST},
+	             {"admin", GrammarPrefix::Kind::ADMIN}};
+	for (auto &entry : KINDS) {
+		if (StringUtil::CIEquals(word, entry.word)) {
+			kind = entry.kind;
 			return true;
 		}
 	}
 	return false;
 }
 
+//! `ACL <kind>`: the text's first two tokens - anything else is not a prefix of ours
+bool StartsWithPrefix(const TokenIterator &tokens) {
+	GrammarPrefix::Kind kind;
+	return tokens.Size() >= 2 && StringUtil::CIEquals(tokens.GetToken(0).text, "acl") &&
+	       TryKindOf(tokens.GetToken(1).text, kind);
+}
+
 } // namespace
+
+const char *MarkerWords(GrammarPrefix::MarkerKind kind) {
+	switch (kind) {
+	case GrammarPrefix::MarkerKind::TRACE:
+		return "TRACE";
+	case GrammarPrefix::MarkerKind::PARENT:
+		return "PARENT";
+	case GrammarPrefix::MarkerKind::LINEAGE_PARENT:
+		return "LINEAGE PARENT";
+	case GrammarPrefix::MarkerKind::LINEAGE_ROOT:
+		return "LINEAGE ROOT";
+	case GrammarPrefix::MarkerKind::LINEAGE_JOB:
+		return "LINEAGE JOB";
+	}
+	return "";
+}
 
 struct AclGrammarCache::Impl {
 	//! what the override parses with, never registered; and what a connection may switch on
@@ -324,9 +362,28 @@ bool AclGrammarCache::ReadPrefix(const string &query, const ParserOptions &optio
 	ParserOptions inner = options;
 	inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
 	inner.compiled_grammar = impl->For(context);
-	auto owned = make_uniq<vector<MatcherToken>>();
-	ParserTokenizerBehavior behavior(query, *owned);
-	inner.compiled_grammar->GetTokenizer().TokenizeInput(behavior);
+	auto tokenize = [&](const string &text) {
+		auto owned = make_uniq<vector<MatcherToken>>();
+		ParserTokenizerBehavior behavior(text, *owned);
+		inner.compiled_grammar->GetTokenizer().TokenizeInput(behavior);
+		return owned;
+	};
+	unique_ptr<vector<MatcherToken>> owned;
+	try {
+		owned = tokenize(query);
+	} catch (ParserException &ex) {
+		// a text duckdb's tokenizer refuses past the head is the rest's to report, where its mode reads it - after
+		// the principal is judged, and under ACL NATIVE by whichever parser it reaches (spec 067): the head is read
+		// from the text before the refusal. One inside the head leaves a head that does not read.
+		ErrorData error(ex);
+		auto entry = error.ExtraInfo().find("position");
+		idx_t at = 0;
+		if (entry == error.ExtraInfo().end() || !TryCast::Operation(string_t(entry->second), at, false) || at == 0 ||
+		    at > query.size()) {
+			throw;
+		}
+		owned = tokenize(query.substr(0, at));
+	}
 	TokenIterator tokens(std::move(owned));
 	if (!StartsWithPrefix(tokens)) {
 		return false;
@@ -340,10 +397,11 @@ bool AclGrammarCache::ReadPrefix(const string &query, const ParserOptions &optio
 			                      "dialect - DISCONNECT, or RESET current_dialect");
 		}
 	}
-	// a principal's value must follow its kind as a quoted token - said here, in the scanner's words, rather than as
-	// the rule's syntax error at whatever came instead
+	// a principal's value must follow its kind as a quoted token - said here, in the words a client knows, rather than
+	// as the rule's syntax error at whatever came instead
+	TryKindOf(tokens.GetToken(1).text, out.kind);
 	auto kind_word = StringUtil::Lower(tokens.GetToken(1).text);
-	if (kind_word != "admin") {
+	if (out.kind != GrammarPrefix::Kind::ADMIN) {
 		auto value_quoted = tokens.Size() > 2 && !tokens.GetToken(2).text.empty() &&
 		                    (tokens.GetToken(2).text[0] == '\'' || tokens.GetToken(2).text[0] == '"');
 		if (!value_quoted) {
@@ -356,44 +414,61 @@ bool AclGrammarCache::ReadPrefix(const string &query, const ParserOptions &optio
 	// the head and the rest of its statement, passed through; the statements after it are the rest's
 	TokenIterator cursor(tokens);
 	Parser parser(inner);
-	auto statement = parser.ParseTopLevelStatement(cursor);
+	unique_ptr<SQLStatement> statement;
+	try {
+		statement = parser.ParseTopLevelStatement(cursor);
+	} catch (ParserException &) {
+		// never the parser's own message: it draws the text - a token, a session handle - under its caret
+		throw ParserException("acl_rewrite: the ACL prefix does not parse");
+	}
 	if (!statement || !IsPrefixStatement(*statement)) {
 		throw ParserException("acl_rewrite: the ACL prefix does not parse");
 	}
 	auto &data = statement->Cast<ExtensionStatement>().parse_data->Cast<PrefixParseData>();
-	auto written_plainly = [&](const optional_idx &offset, const string &value, const string &what) {
-		auto token = offset.IsValid() ? TokenAt(tokens, offset.GetIndex()) : nullptr;
-		if (!token || !WrittenPlainly(query, *token, value)) {
+	auto require_plain = [&](const optional_idx &offset, const string &value, const string &what) {
+		auto index = offset.IsValid() ? TokenIndexAt(tokens, offset.GetIndex()) : optional_idx();
+		if (!index.IsValid() || !WrittenPlainly(query, tokens.GetToken(index.GetIndex()), value)) {
 			throw ParserException("acl_rewrite: ACL %s requires a quoted value, written as one plain literal", what);
 		}
 	};
-	if (data.kind == "role") {
-		out.kind = GrammarPrefix::Kind::ROLE;
-	} else if (data.kind == "token") {
-		out.kind = GrammarPrefix::Kind::TOKEN;
-	} else if (data.kind == "session") {
-		out.kind = GrammarPrefix::Kind::SESSION;
-	} else if (data.kind == "ingest") {
-		out.kind = GrammarPrefix::Kind::INGEST;
-	} else {
-		out.kind = GrammarPrefix::Kind::ADMIN;
-	}
 	if (out.kind != GrammarPrefix::Kind::ADMIN) {
-		written_plainly(data.value_offset, data.value, StringUtil::Upper(data.kind));
+		require_plain(data.value_offset, data.value, StringUtil::Upper(data.kind));
 		if (data.value.empty()) {
 			throw ParserException("acl_rewrite: ACL %s requires a value", StringUtil::Upper(data.kind));
 		}
 		out.value = data.value;
 	}
 	for (auto &marker : data.markers) {
-		auto word = StringUtil::Upper(StringUtil::Replace(marker.word, "lineage.", "LINEAGE "));
-		written_plainly(marker.offset, marker.value, word);
-		out.markers.push_back(GrammarPrefix::Marker {marker.word, marker.value});
+		require_plain(marker.offset, marker.value, MarkerWords(marker.kind));
+		out.markers.push_back(GrammarPrefix::Marker {marker.kind, marker.value});
+	}
+	// a marker word whose value did not read is where the rule stopped: said in the words a client knows, rather than
+	// as the rest's syntax error (the mode marker ends the markers - after it such a word is the rest's)
+	if (!data.mode_written && data.tail_offset.IsValid()) {
+		auto first = TokenIndexAt(tokens, data.tail_offset.GetIndex());
+		auto word = first.IsValid() ? StringUtil::Lower(tokens.GetToken(first.GetIndex()).text) : string();
+		bool after_lineage = !data.markers.empty() && data.markers.back().kind != GrammarPrefix::MarkerKind::TRACE &&
+		                     data.markers.back().kind != GrammarPrefix::MarkerKind::PARENT;
+		if (word == "trace" || word == "parent") {
+			throw ParserException("acl_rewrite: ACL %s requires a quoted value", StringUtil::Upper(word));
+		}
+		if (word == "lineage") {
+			auto next = first.GetIndex() + 1 < tokens.Size()
+			                ? StringUtil::Lower(tokens.GetToken(first.GetIndex() + 1).text)
+			                : string();
+			if (next == "parent" || next == "root" || next == "job") {
+				throw ParserException("acl_rewrite: ACL LINEAGE %s requires a quoted value", StringUtil::Upper(next));
+			}
+			throw ParserException("acl_rewrite: ACL LINEAGE needs PARENT, ROOT or JOB");
+		}
+		if (after_lineage && (word == "root" || word == "job")) {
+			throw ParserException("acl_rewrite: ACL LINEAGE %s requires a quoted value", StringUtil::Upper(word));
+		}
 	}
 	out.lineage_written = data.lineage_written;
 	out.mode_written = data.mode_written;
 	out.native = data.native;
-	// the rest starts past the head's last token and the whitespace after it - as the scanner left it
+	// the rest starts past the head's last token and the whitespace after it
 	idx_t head_end = 0;
 	auto head_tokens = cursor.Position();
 	for (idx_t i = 0; i < head_tokens && i < tokens.Size(); i++) {

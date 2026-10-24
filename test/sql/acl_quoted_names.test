@@ -553,7 +553,7 @@ c / Raw Data.sub.second
 statement error
 ACL ADMIN CREATE VIRTUAL CATALOG "";
 ----
-<REGEX>:.*(an empty quoted identifier|zero-length delimited identifier).*
+<REGEX>:.*an empty quoted identifier.*
 
 statement error
 ACL ADMIN CREATE VIRTUAL CATALOG "abc;

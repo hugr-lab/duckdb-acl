@@ -23,9 +23,10 @@ namespace acl {
 //! What the prefix rule read off a text's head
 struct GrammarPrefix {
 	enum class Kind : uint8_t { ROLE, TOKEN, SESSION, INGEST, ADMIN };
+	enum class MarkerKind : uint8_t { TRACE, PARENT, LINEAGE_PARENT, LINEAGE_ROOT, LINEAGE_JOB };
+	//! a marker, in the order written
 	struct Marker {
-		//! trace, parent, or lineage.parent / lineage.root / lineage.job - in the order written
-		string word;
+		MarkerKind kind;
 		string value;
 	};
 	Kind kind = Kind::ROLE;
@@ -40,6 +41,9 @@ struct GrammarPrefix {
 	//! where the rest starts: past the head and the whitespace after it
 	idx_t rest_start = 0;
 };
+
+//! A marker's words as a client writes them: `TRACE`, `LINEAGE JOB`, ...
+const char *MarkerWords(GrammarPrefix::MarkerKind kind);
 
 //! The grammars the override compiles, one per set of the caller's grammar extensions
 class AclGrammarCache {

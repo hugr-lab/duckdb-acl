@@ -75,7 +75,7 @@ today, so the authorizer and the admin functions do not change.
 **Each value is one plain literal.** duckdb's tokenizer joins string literals across a line break (`'ana'` then
 `'lyst'` on the next line is `'analyst'`) - a client writing after a gateway's `ACL ROLE 'ana'` would finish its role's
 name. Every value in the head must be its own token, written as the value in its quotes (`WrittenPlainly`): no joined
-string, no `E'…'`, no bare name, never empty. Comments among the markers are comments now (the scanner read none).
+string, no `E'…'`, no bare name, never empty. Comments anywhere in the head are comments now (the scanner read none).
 
 **Batches.** A prefix covers a statement list, as today:
 
@@ -108,7 +108,18 @@ rule.
 (acl_grammar.cpp): a text not starting with the word ACL is never tokenized; `ACL <unknown>` is left to duckdb's
 parser, as before; the scanner's rules are kept (each marker once, a lineage parent a run reference, INGEST with no
 mode marker, ADMIN native unless marked) and the rest starts where the scanner left it, past the head and its
-whitespace. The scanner, the stage 1 path and `acl_peg_prefix` are gone. The registered `acl` grammar (completion) has
+whitespace. A text duckdb's tokenizer refuses past the head (an unterminated string, `""`) is read up to the refusal:
+the head reads, and the rest reports its own error where its mode parses it, as before (under `ACL NATIVE` other
+extensions' parsers still get it; the audit still names the session). An error of the rest's parse is drawn against
+the rest - duckdb drew it under the whole text with the rest's offset, the caret in the prefix and the prefix, a token
+or a door's session handle, echoed back (pre-existing, found by the review, fixed); a compiler's own segment error
+loses its position instead; the head's own syntax error never quotes the text. A marker word whose value does not read
+(`TRACE SELECT`, `LINEAGE JOB SELECT`) gets the client's words, not the rest's syntax error. Cost: 5,000 prefixed
+statements 1.04-1.06 s (the scanner's 1.02-1.12 s): the text is tokenized for the head and again for the rest. The
+management statements and the batch's checks (`SplitBatchText`, `StartsWithMgmt`, `RefuseRepeatedPrefix`) stay read by
+hand until stage 3; `ACL ROLE "r" ; ACL ROLE "x" …` ends as a syntax error, not as "one ACL prefix per batch".
+A client's `ROOT` / `PARENT` right after a door's `LINEAGE JOB` joins that LINEAGE marker, as it did. The scanner, the
+stage 1 path and `acl_peg_prefix` are gone. The registered `acl` grammar (completion) has
 `AclTail <- Statement`, so the CLI offers the statements after the prefix. A prefix in a position where duckdb's
 grammar takes a `Statement` - `PREPARE p AS ACL ROLE …`, a CTE body, a CTAS - parses to our statement (on a connection
 with `acl` on) and is refused by duckdb's own transforms or by the plan function.
@@ -132,8 +143,9 @@ with `acl` on) and is refused by duckdb's own transforms or by the plan function
   - A rule never yields a statement the rewriter has not seen.
 - **Nothing widens.** Every refusal the scanner made is kept: a second prefix, a mixed batch, `USE` without a
   session, foreign syntax under the prefix (spec 067's three rows and spec 132's fourth), each marker once. Newly
-  refused: an empty value, a value that is not one plain literal, a prefix on a CONNECT-ed connection or under a
-  dialect, a mode marker after INGEST.
+  refused: an empty value, a value that is not one plain literal, a marker written twice whatever its first value (the
+  review found `TRACE '' TRACE 'x'` accepted mid-stage), a prefix on a CONNECT-ed connection or under a dialect; a mode
+  marker after INGEST is refused in its own words now, where it was the rest's parse error.
 - **The golden rule holds.** A rule adds no parameters; a client's `$1` / `?` stays the only parameter.
 
 ## Testing

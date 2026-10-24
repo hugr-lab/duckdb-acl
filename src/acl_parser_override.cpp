@@ -56,7 +56,7 @@ struct AclPrefix {
 	LineageContext lineage;
 };
 
-//! spec 150: the prefix's head as the rule read it, held to the rules the scanner kept - each marker once, a
+//! spec 150: the prefix's head as the rule read it, held to the prefix's rules - each marker once, a
 //! lineage parent a run reference, an INGEST with no mode marker, an ADMIN native unless marked - and its rest.
 //! A text that does not start with the word ACL is nobody's prefix and costs no tokenizing.
 AclPrefix ReadAclPrefix(AclGrammarCache &grammar, const string &query, ParserOptions &options) {
@@ -95,29 +95,30 @@ AclPrefix ReadAclPrefix(AclGrammarCache &grammar, const string &query, ParserOpt
 	if (head.lineage_written > 1) {
 		throw ParserException("acl_rewrite: ACL LINEAGE may be written once in a prefix");
 	}
+	using MarkerKind = GrammarPrefix::MarkerKind;
+	// a marker is written once whatever its value - an empty one included
+	bool written[static_cast<uint8_t>(MarkerKind::LINEAGE_JOB) + 1] = {};
 	for (auto &marker : head.markers) {
-		if (marker.word == "trace" || marker.word == "parent") {
-			auto &target = marker.word == "trace" ? prefix.correlation_id : prefix.traceparent;
-			if (!target.empty()) {
-				throw ParserException("acl_rewrite: ACL %s may be written once in a prefix",
-				                      StringUtil::Upper(marker.word));
-			}
-			target = marker.value;
+		auto &seen = written[static_cast<uint8_t>(marker.kind)];
+		if (seen) {
+			throw ParserException("acl_rewrite: ACL %s may be written once%s", MarkerWords(marker.kind),
+			                      marker.kind == MarkerKind::TRACE || marker.kind == MarkerKind::PARENT ? " in a prefix"
+			                                                                                            : "");
+		}
+		seen = true;
+		if (marker.kind == MarkerKind::TRACE || marker.kind == MarkerKind::PARENT) {
+			(marker.kind == MarkerKind::TRACE ? prefix.correlation_id : prefix.traceparent) = marker.value;
 			continue;
 		}
 		// spec 107: `LINEAGE [PARENT '<ns/job/run>'] [ROOT '<ns/job/run>'] [JOB '<name>']`
-		auto part = marker.word.substr(strlen("lineage."));
-		string *target = part == "parent" ? &prefix.lineage.parent
-		                 : part == "root" ? &prefix.lineage.root_parent
-		                                  : &prefix.lineage.job;
-		if (!target->empty()) {
-			throw ParserException("acl_rewrite: ACL LINEAGE %s may be written once", StringUtil::Upper(part));
-		}
+		string *target = marker.kind == MarkerKind::LINEAGE_PARENT ? &prefix.lineage.parent
+		                 : marker.kind == MarkerKind::LINEAGE_ROOT ? &prefix.lineage.root_parent
+		                                                           : &prefix.lineage.job;
 		// spec 109: a parent the transport would have to drop is refused here, where the client can still hear
 		// it - judged before the bound, which would cut its runId
 		string malformed;
-		if (target != &prefix.lineage.job && !LineageRunRefCheck(marker.value, malformed)) {
-			throw ParserException("acl_rewrite: ACL LINEAGE %s: %s", StringUtil::Upper(part), malformed);
+		if (marker.kind != MarkerKind::LINEAGE_JOB && !LineageRunRefCheck(marker.value, malformed)) {
+			throw ParserException("acl_rewrite: ACL %s: %s", MarkerWords(marker.kind), malformed);
 		}
 		*target = BoundLineage(marker.value);
 	}
@@ -216,6 +217,29 @@ bool ParseAttachLineage(const string &text, ParserOptions &options, vector<uniqu
 		}
 	}
 	return true;
+}
+
+//! A parse error of the rest carries the offset of what was parsed, and duckdb draws it under the whole text - the
+//! prefix, a token or a session handle included, the caret in the wrong place (the 2026-10-24 review). Drawn here
+//! against the text that was parsed, or - a compiler's own segment - not drawn at all.
+template <class FUNC>
+void ParseOfRest(const string *parsed, FUNC &&parse) {
+	try {
+		parse();
+	} catch (ParserException &ex) {
+		ErrorData error(ex);
+		if (error.ExtraInfo().find("position") == error.ExtraInfo().end()) {
+			throw;
+		}
+		if (parsed) {
+			error.AddErrorLocation(*parsed);
+			throw ParserException(error.ExtraInfo(), error.RawMessage());
+		}
+		auto info = error.ExtraInfo();
+		info.erase("position");
+		info.erase("location");
+		throw ParserException(info, error.RawMessage());
+	}
 }
 
 //! spec 120.3: the one refusal of a view-as session outside the rewriter
@@ -724,7 +748,8 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		// compiled to the service catalog's own calls, which the service authorizes once more: it
 		// manages only for a principal it knows as an administrator (tresor spec 009)
 		audit.phase = Reason::PARSE;
-		auto statements = ParseSecretsBatch(prefix.rest, store);
+		vector<unique_ptr<SQLStatement>> statements;
+		ParseOfRest(nullptr, [&]() { statements = ParseSecretsBatch(prefix.rest, store); });
 		for (auto &stmt : statements) {
 			// the execution must find its decision (spec 074's note, matched by the text the statement
 			// carries): that note is what puts the session on the connection while the service's call
@@ -740,7 +765,8 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 	if (mode == AclPrefix::Mode::MANAGE) {
 		// the management grammar (spec 008): compiled to admin-function calls, no native parse
 		audit.phase = Reason::PARSE;
-		auto statements = ParseMgmtBatch(prefix.rest, audit.proto.session); // CURRENT is this session
+		vector<unique_ptr<SQLStatement>> statements;
+		ParseOfRest(nullptr, [&]() { statements = ParseMgmtBatch(prefix.rest, audit.proto.session); }); // CURRENT: ours
 		if (!viewing.empty() && !OnlyViewAsCalls(statements)) {
 			RefuseInViewAs();
 		}
@@ -780,12 +806,16 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
 	}
 	vector<unique_ptr<SQLStatement>> statements;
-	if (mode != AclPrefix::Mode::NATIVE || !ParseAttachLineage(prefix.rest, inner, statements)) {
+	bool attach_lineage = false;
+	if (mode == AclPrefix::Mode::NATIVE) {
+		ParseOfRest(nullptr, [&]() { attach_lineage = ParseAttachLineage(prefix.rest, inner, statements); });
+	}
+	if (!attach_lineage) {
 		AclParseGuard guard;
 		Parser parser(inner);
 		// spec 114: `USE SCHEMA s` - a form duckdb's grammar lacks - is the session's default schema
 		auto rest = mode == AclPrefix::Mode::QUERY ? UseSchemaAsSet(prefix.rest) : prefix.rest;
-		parser.ParseQuery(rest);
+		ParseOfRest(&rest, [&]() { parser.ParseQuery(rest); });
 		statements = std::move(parser.statements);
 	}
 
@@ -946,7 +976,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 	try {
 		prefix = ReadAclPrefix(*info->Cast<AclParserInfo>().grammar, query, options);
 	} catch (std::exception &ex) {
-		// a prefix that does not scan (an unterminated quote, a bare ACL TOKEN) is a refusal too, and
+		// a prefix that does not read (an unterminated quote, a bare ACL TOKEN) is a refusal too, and
 		// counted as one: nobody is known yet, so it is the gateway's, and a parse
 		StatementAudit audit(store.audit.get());
 		audit.Denied(ex);
