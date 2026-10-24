@@ -1468,3 +1468,78 @@ statement error
 ACL ADMIN REVOKE CATALOG granted TO ROLE grantee;
 ----
 write REVOKE CATALOG
+
+# --- issuers and clients (stage 3e): CREATE / ALTER / DROP ISSUER | CLIENT - rules, the same calls ------------------
+
+# the short form, a comment inside it; CLAIM MAP's sides are quoted as JSON, split at an `=>` outside quotes (they
+# were pasted into the JSON, so a quoted side holding `", "` stored a second mapping)
+statement ok
+ACL ADMIN CREATE ISSUER 'test/idp/a' AUDIENCES ('api://a' /* the app */) ROLE CLAIM 'roles'
+CLAIM MAP ('x' => 'a", "groups": "tenant', 'p=>q' => 'r') CLIENT ID 'acl-desktop';
+
+query IIII
+SELECT audiences, roles_from, attributes, client_id FROM acl_clients() WHERE name = 'test/idp/a';
+----
+["api://a"]	["roles"]	[{"name":"a\", \"groups\": \"tenant","paths":["x"]},{"name":"r","paths":["p=>q"]}]	acl-desktop
+
+# a client and its clauses in any order, each once
+statement ok
+ACL ADMIN CREATE CLIENT svc ISSUER 'test/idp/a' AUDIENCES ('api://svc') AZP ('door') CLIENT ID 'svc'
+REQUIRE (sub LIKE 'svc-%', level IN (1, 2)) ROLES FROM ('roles', 'groups')
+ATTRIBUTES (tenant = 'tid', mail = ('upn', 'email'), org = CONSTANT 'acme') SUBJECT ('email', 'sub')
+TOKEN TYPE 'at+jwt' FLOWS (password) UNMAPPED IGNORE;
+
+query IIIIII
+SELECT audiences, azp, roles_from, subject, token_type, flows FROM acl_clients() WHERE name = 'svc';
+----
+["api://svc"]	["door"]	["roles","groups"]	["email","sub"]	at+jwt	["password"]
+
+query II
+SELECT requires, attributes FROM acl_clients() WHERE name = 'svc';
+----
+[{"path":"sub","op":"like","values":["svc-%"]},{"path":"level","op":"in","values":["1","2"]}]	[{"name":"tenant","paths":["tid"]},{"name":"mail","paths":["upn","email"]},{"name":"org","constant":"acme"}]
+
+statement ok
+ACL ADMIN ALTER CLIENT svc SET AUDIENCES 'api://svc2,api://svc3' FLOWS ();
+
+query II
+SELECT audiences, flows FROM acl_clients() WHERE name = 'svc';
+----
+["api://svc2","api://svc3"]	NULL
+
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET CLIENT ID 'acl-desktop-2';
+
+query I
+SELECT client_id FROM acl_clients() WHERE name = 'test/idp/a';
+----
+acl-desktop-2
+
+# what is never written into the policy says where it goes; a clause twice; a form that does not read as its rule
+statement error
+ACL ADMIN CREATE ISSUER 'test/idp/b' KEYS '{}';
+----
+keys and algorithms are never written into the policy
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') CLIENT SECRET 's';
+----
+a client secret is never written into the policy
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') AUDIENCES ('y');
+----
+AUDIENCES is written twice
+
+statement error
+ACL ADMIN CREATE CLIENT never 'test/idp/a';
+----
+write CREATE [OR REPLACE] CLIENT
+
+statement ok
+ACL ADMIN DROP CLIENT IF EXISTS nobody; DROP CLIENT svc; DROP ISSUER IF EXISTS 'nobody';
+
+query I
+SELECT count(*) FROM acl_clients() WHERE name IN ('svc', 'never');
+----
+0

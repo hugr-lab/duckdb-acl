@@ -60,20 +60,33 @@ string ClaimsListToCsv(const string &list) {
 	return StringUtil::Join(entries, ",");
 }
 
-//! `(tid => tenant, oid => user_id)` -> the stored JSON `{"tid": "tenant", "oid": "user_id"}`
+//! `(tid => tenant, oid => user_id)` -> the stored JSON `{"tid": "tenant", "oid": "user_id"}` - each side quoted as
+//! JSON, split at the first `=>` outside quotes (spec 150 stage 3e: the sides were pasted into the JSON, so a quoted
+//! side holding `", "` stored a second mapping, and an `=>` inside quotes split the item there)
 string ClaimMapToJson(const string &list) {
 	vector<string> entries;
 	for (auto &item : SplitTopLevel(list, ',')) {
 		if (item.empty()) {
 			continue;
 		}
-		auto arrow = item.find("=>");
+		idx_t arrow = string::npos;
+		char quote = 0;
+		for (idx_t i = 0; i + 1 < item.size(); i++) {
+			auto c = item[i];
+			if (quote) {
+				quote = c == quote ? 0 : quote;
+			} else if (c == '\'' || c == '"') {
+				quote = c;
+			} else if (c == '=' && item[i + 1] == '>') {
+				arrow = i;
+				break;
+			}
+		}
 		if (arrow == string::npos) {
 			throw BinderException("acl admin: a claim mapping is written as <jwt path> => <claim>, got \"%s\"", item);
 		}
-		auto from = item.substr(0, arrow);
-		StringUtil::Trim(from);
-		entries.push_back("\"" + Unquoted(from) + "\": \"" + Unquoted(item.substr(arrow + 2)) + "\"");
+		entries.push_back(JsonQuote(Unquoted(item.substr(0, arrow))) + ": " +
+		                  JsonQuote(Unquoted(item.substr(arrow + 2))));
 	}
 	return "{" + StringUtil::Join(entries, ", ") + "}";
 }
@@ -590,26 +603,17 @@ string JsonList(const vector<string> &values) {
 	return "[" + StringUtil::Join(quoted, ",") + "]";
 }
 
-//! A list written `(a, 'b', …)` or as the legacy quoted csv `'a,b'`; items unquoted
-vector<string> ListItems(AdminScanner &s, const char *what) {
+//! A list written `(a, 'b', …)` - the text between its parentheses - as a JSON list, items unquoted
+string ListItemsJson(const string &inside) {
 	vector<string> out;
-	if (s.AtParen()) {
-		for (auto &item : SplitTopLevel(s.Parens(), ',')) {
-			auto value = Unquoted(item);
-			StringUtil::Trim(value);
-			if (!value.empty()) {
-				out.push_back(value);
-			}
-		}
-		return out;
-	}
-	for (auto &item : StringUtil::Split(s.Quoted(what), ',')) {
-		StringUtil::Trim(item);
-		if (!item.empty()) {
-			out.push_back(item);
+	for (auto &item : SplitTopLevel(inside, ',')) {
+		auto value = Unquoted(item);
+		StringUtil::Trim(value);
+		if (!value.empty()) {
+			out.push_back(value);
 		}
 	}
-	return out;
+	return JsonList(out);
 }
 
 //! A claim path: a quoted string (a claim with characters a word cannot hold) or word(.word)*
@@ -727,235 +731,6 @@ string AttributesJson(const string &list) {
 		}
 	}
 	return "[" + StringUtil::Join(attributes, ",") + "]";
-}
-
-//! `FROM SECRET s [IN c]` after its FROM SECRET: the spec entries naming it
-void SecretRef(AdminScanner &s, vector<string> &entries) {
-	auto secret = s.NameValue("a secret name");
-	entries.push_back("\"secret\":" + JsonQuote(secret));
-	if (s.Accept("in")) {
-		entries.push_back("\"service\":" + JsonQuote(s.Ident("a secrets service")));
-	}
-}
-
-//! One clause of a client (spec 095 §2), as a client-spec JSON entry. False when the next words are
-//! not a client clause. `secret_clause` is how its secret is written: FROM SECRET (a client) or
-//! CLIENT FROM SECRET (the short form, where FROM SECRET is the issuer's).
-bool ClientClause(AdminScanner &s, vector<string> &entries, bool short_form) {
-	auto saved = s.pos;
-	if (s.Accept("audiences")) {
-		entries.push_back("\"audiences\":" + JsonList(ListItems(s, "audiences")));
-	} else if (s.Accept("azp")) {
-		entries.push_back("\"azp\":" + JsonList(ListItems(s, "azp")));
-	} else if (s.Accept("require")) {
-		if (!s.AtParen()) {
-			throw BinderException("acl admin: REQUIRE takes its conditions in parentheses");
-		}
-		entries.push_back("\"require\":" + RequireJson(s.Parens()));
-	} else if (s.Accept("roles")) {
-		if (s.Accept("from")) {
-			entries.push_back("\"roles_from\":" + JsonList(ListItems(s, "claim paths")));
-		} else {
-			s.Expect("constant");
-			entries.push_back("\"roles_constant\":" + JsonList(ListItems(s, "roles")));
-		}
-	} else if (s.Accept("role")) {
-		s.Expect("claim"); // the short form's ROLE CLAIM 'path' - one source
-		entries.push_back("\"roles_from\":" + JsonList({s.Quoted("role claim path")}));
-	} else if (s.Accept("unmapped")) {
-		if (s.Accept("ignore")) {
-			entries.push_back("\"unmapped\":\"ignore\"");
-		} else {
-			s.Expect("as");
-			s.Expect("role");
-			entries.push_back("\"unmapped\":\"as_role\"");
-		}
-	} else if (s.Accept("attributes")) {
-		if (!s.AtParen()) {
-			throw BinderException("acl admin: ATTRIBUTES takes its list in parentheses");
-		}
-		entries.push_back("\"attributes\":" + AttributesJson(s.Parens()));
-	} else if (s.Accept("claim")) {
-		s.Expect("map"); // the short form's CLAIM MAP: {"<jwt path>": "<name>"}
-		auto map = s.AtParen() ? ClaimMapToJson(s.Parens()) : s.Quoted("claim map");
-		entries.push_back("\"claim_map\":" + JsonQuote(map)); // text: parsed by the spec, never spliced
-	} else if (s.Accept("subject")) {
-		vector<string> paths;
-		if (s.AtParen()) {
-			paths = ListItems(s, "subject paths");
-		} else {
-			paths.push_back(s.Quoted("subject path"));
-		}
-		entries.push_back("\"subject\":" + JsonList(paths));
-	} else if (s.Accept("token")) {
-		s.Expect("type");
-		entries.push_back("\"token_type\":" + JsonQuote(s.Quoted("token type")));
-	} else if (s.Accept("flows")) {
-		entries.push_back("\"flows\":" + JsonList(ListItems(s, "flows")));
-	} else if (s.Accept("client")) {
-		if (s.Accept("id")) {
-			entries.push_back("\"client_id\":" + JsonQuote(s.Quoted("client id")));
-		} else if (short_form && s.Accept("from")) {
-			s.Expect("secret");
-			SecretRef(s, entries);
-		} else if (s.Accept("secret")) {
-			throw BinderException("acl admin: a client secret is never written into the policy - keep it as "
-			                      "CLIENT_SECRET in an oidc_client secret of the secrets service and name that "
-			                      "secret (%s)",
-			                      short_form ? "CLIENT FROM SECRET s" : "FROM SECRET s");
-		} else {
-			s.pos = saved;
-			return false;
-		}
-	} else if (!short_form && s.Accept("from")) {
-		s.Expect("secret");
-		SecretRef(s, entries);
-	} else if (s.Accept("keys") || s.Accept("algs")) {
-		throw BinderException("acl admin: an issuer's keys and algorithms are never written into the policy - "
-		                      "the issuer's OIDC discovery supplies them, or KEYS / KEYS_FROM / ALGS in an "
-		                      "oidc_issuer secret named with FROM SECRET");
-	} else {
-		return false;
-	}
-	return true;
-}
-
-string SpecJson(const vector<string> &entries) {
-	return "{" + StringUtil::Join(entries, ",") + "}";
-}
-
-//! CREATE [OR REPLACE] ISSUER [IF NOT EXISTS] <name | '<url>'> [URL '<url>'] [FROM SECRET s [IN c]]
-//! [client clauses] - any client clause makes it the short form, with an implicit client
-unique_ptr<SQLStatement> ParseCreateIssuer(AdminScanner &s, string mode) {
-	if (s.Accept("if")) {
-		s.Expect("not");
-		s.Expect("exists");
-		if (mode == "create") {
-			mode = "skip";
-		}
-	}
-	s.Skip();
-	bool quoted = s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"');
-	auto name = quoted ? s.Quoted("issuer") : s.Ident("an issuer name");
-	vector<string> issuer_entries, client_entries;
-	bool has_url = false, has_secret = false;
-	while (!s.Done() && !s.AtSemicolon()) {
-		if (s.Accept("url")) {
-			issuer_entries.push_back("\"url\":" + JsonQuote(s.Quoted("URL")));
-			has_url = true;
-			continue;
-		}
-		auto saved = s.pos;
-		if (s.Accept("from")) {
-			s.Expect("secret");
-			SecretRef(s, issuer_entries);
-			has_secret = true;
-			continue;
-		}
-		s.pos = saved;
-		if (!ClientClause(s, client_entries, true)) {
-			throw BinderException("acl admin: unexpected \"%s\" in CREATE ISSUER", s.PeekWord());
-		}
-	}
-	if (!has_url && quoted) {
-		// the short form's name IS its URL
-		issuer_entries.push_back("\"url\":" + JsonQuote(name));
-	} else if (!has_url && !has_secret) {
-		throw BinderException("acl admin: issuer \"%s\" needs its URL - URL '<url>', or the URL as its quoted name, "
-		                      "or an oidc_issuer secret carrying it (FROM SECRET s)",
-		                      name);
-	}
-	if (!client_entries.empty()) {
-		issuer_entries.push_back("\"client\":" + SpecJson(client_entries));
-	}
-	return MakeAdminCall("acl_define_issuer", {Value(name), Value(SpecJson(issuer_entries)), Value(mode)});
-}
-
-//! CREATE [OR REPLACE] CLIENT [IF NOT EXISTS] c ISSUER i <client clauses>
-unique_ptr<SQLStatement> ParseCreateClient(AdminScanner &s, string mode) {
-	if (s.Accept("if")) {
-		s.Expect("not");
-		s.Expect("exists");
-		if (mode == "create") {
-			mode = "skip";
-		}
-	}
-	auto name = s.NameValue("a client name");
-	s.Expect("issuer");
-	auto issuer = s.NameValue("an issuer name");
-	vector<string> entries;
-	while (!s.Done() && !s.AtSemicolon()) {
-		if (!ClientClause(s, entries, false)) {
-			throw BinderException("acl admin: unexpected \"%s\" in CREATE CLIENT", s.PeekWord());
-		}
-	}
-	return MakeAdminCall("acl_define_client", {Value(name), Value(issuer), Value(SpecJson(entries)), Value(mode)});
-}
-
-//! ALTER ISSUER i SET URL '…' | SET FROM SECRET s [IN c] | DROP FROM SECRET | SET <client clause> …
-//! | DROP CLIENT FROM SECRET
-unique_ptr<SQLStatement> ParseAlterIssuer(AdminScanner &s) {
-	auto name = s.NameValue("an issuer name");
-	vector<string> issuer_entries, client_entries;
-	if (s.Accept("drop")) {
-		if (s.Accept("client")) {
-			s.Expect("from");
-			s.Expect("secret");
-			client_entries.push_back("\"secret\":null");
-		} else {
-			s.Expect("from");
-			s.Expect("secret");
-			issuer_entries.push_back("\"secret\":null");
-		}
-	} else {
-		s.Expect("set");
-		while (!s.Done() && !s.AtSemicolon()) {
-			if (s.Accept("url")) {
-				auto url = s.Quoted("URL");
-				issuer_entries.push_back("\"url\":" + (url.empty() ? string("null") : JsonQuote(url)));
-				continue;
-			}
-			auto saved = s.pos;
-			if (s.Accept("from")) {
-				s.Expect("secret");
-				SecretRef(s, issuer_entries);
-				continue;
-			}
-			s.pos = saved;
-			if (!ClientClause(s, client_entries, true)) {
-				throw BinderException("acl admin: unexpected \"%s\" in ALTER ISSUER", s.PeekWord());
-			}
-		}
-	}
-	if (!client_entries.empty()) {
-		issuer_entries.push_back("\"client\":" + SpecJson(client_entries));
-	}
-	if (issuer_entries.empty()) {
-		throw BinderException("acl admin: ALTER ISSUER %s changes nothing", name);
-	}
-	return MakeAdminCall("acl_alter_issuer", {Value(name), Value(SpecJson(issuer_entries))});
-}
-
-//! ALTER CLIENT c SET <client clause> … | DROP FROM SECRET
-unique_ptr<SQLStatement> ParseAlterClient(AdminScanner &s) {
-	auto name = s.NameValue("a client name");
-	vector<string> entries;
-	if (s.Accept("drop")) {
-		s.Expect("from");
-		s.Expect("secret");
-		entries.push_back("\"secret\":null");
-	} else {
-		s.Expect("set");
-		while (!s.Done() && !s.AtSemicolon()) {
-			if (!ClientClause(s, entries, false)) {
-				throw BinderException("acl admin: unexpected \"%s\" in ALTER CLIENT", s.PeekWord());
-			}
-		}
-	}
-	if (entries.empty()) {
-		throw BinderException("acl admin: ALTER CLIENT %s changes nothing", name);
-	}
-	return MakeAdminCall("acl_alter_client", {Value(name), Value(SpecJson(entries))});
 }
 
 //! `(window_max 64, batch_bytes '32MiB', …)` - a resource group's limits as the JSON the admin functions take
@@ -1083,11 +858,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			}
 			return MakeAdminCall("acl_create_function_category", {Value(category), Value(comment)});
 		}
+		// spec 150, stage 3e: CREATE ISSUER | CLIENT are rules - one that reaches here did not read as its rule
 		if (s.Accept("client")) {
-			return ParseCreateClient(s, mode);
+			RefuseMovedForm("write CREATE [OR REPLACE] CLIENT [IF NOT EXISTS] <client> ISSUER <issuer> [<client "
+			                "clause> ...]");
 		}
-		s.Expect("issuer");
-		return ParseCreateIssuer(s, mode);
+		RefuseMovedForm("write CREATE [OR REPLACE] ISSUER [IF NOT EXISTS] <issuer> | '<url>' [URL '<url>'] [FROM "
+		                "SECRET <secret> [IN <service>]] [<client clause> ...]");
 	}
 	if (StringUtil::CIEquals(keyword, "add")) {
 		RefuseObjectForm(s, true);
@@ -1237,11 +1014,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		if (s.Accept("role")) {
 			RefuseMovedForm("write ALTER ROLE <role> SET COMMENT '<text>' | SET CLAIMS (name = 'value', ...)");
 		}
-		if (s.Accept("issuer")) { // spec 095: ALTER ISSUER i SET … | DROP [CLIENT] FROM SECRET
-			return ParseAlterIssuer(s);
+		if (s.Accept("issuer")) {
+			RefuseMovedForm(
+			    "write ALTER ISSUER <issuer> SET <URL '<url>' | FROM SECRET <secret> | client clause> ... | "
+			    "DROP [CLIENT] FROM SECRET");
 		}
-		if (s.Accept("client")) { // spec 095: ALTER CLIENT c SET … | DROP FROM SECRET
-			return ParseAlterClient(s);
+		if (s.Accept("client")) {
+			RefuseMovedForm("write ALTER CLIENT <client> SET <client clause> ... | DROP FROM SECRET");
 		}
 		if (s.Accept("grant")) {
 			RefuseMovedForm("write ALTER GRANT CATALOG <catalog> TO ROLE <role> SET CAPS '<json>' | SET RLS "
@@ -1288,13 +1067,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		if (s.Accept("role")) {
 			RefuseMovedForm("write DROP ROLE [IF EXISTS] <role>");
 		}
-		if (s.Accept("issuer")) {
-			if_exists(s);
-			return MakeAdminCall("acl_drop_issuer", {Value(s.NameValue("an issuer name")), Value(mode)});
-		}
-		if (s.Accept("client")) {
-			if_exists(s);
-			return MakeAdminCall("acl_drop_client", {Value(s.NameValue("a client name")), Value(mode)});
+		if (s.Accept("issuer") || s.Accept("client")) {
+			RefuseMovedForm("write DROP ISSUER | CLIENT [IF EXISTS] <name>");
 		}
 		if (s.Accept("map")) {
 			RefuseMovedForm("write DROP MAP GROUP | CLAIM '<value>' FROM CLIENT | ISSUER <name> TO ROLE <role>");
@@ -1531,16 +1305,35 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 			continue;
 		}
 		for (auto &list : entry.texts) {
+			string read;
 			switch (list.kind) {
 			case MgmtParsed::TextKind::CLAIMS:
-				entry.args[list.arg] = Value(ClaimsListToCsv(list.text));
+				read = ClaimsListToCsv(list.text);
 				break;
 			case MgmtParsed::TextKind::COLUMNS:
-				entry.args[list.arg] = Value(UnquoteColumnsList(list.text));
+				read = UnquoteColumnsList(list.text);
 				break;
 			case MgmtParsed::TextKind::TEXT:
-				entry.args[list.arg] = Value(list.text);
+				read = list.text;
 				break;
+			case MgmtParsed::TextKind::ITEMS:
+				read = ListItemsJson(list.text);
+				break;
+			case MgmtParsed::TextKind::REQUIRE:
+				read = RequireJson(list.text);
+				break;
+			case MgmtParsed::TextKind::ATTRIBUTES:
+				read = AttributesJson(list.text);
+				break;
+			case MgmtParsed::TextKind::CLAIM_MAP:
+				read = JsonQuote(ClaimMapToJson(list.text)); // text: parsed by the spec, never spliced
+				break;
+			}
+			if (list.splice.empty()) {
+				entry.args[list.arg] = Value(read);
+			} else {
+				// a list inside a JSON spec: its reading where the rule left its marker
+				entry.args[list.arg] = Value(StringUtil::Replace(entry.args[list.arg].ToString(), list.splice, read));
 			}
 		}
 		if (entry.current_session) {

@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c, 3d built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c, 3d, 3e built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -234,7 +234,7 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   Found in the same review and left to the family that moves the form (each a fix with its test there): 3d - the WITH
   list's JSON is built without escaping (`\u006danage` stores manage), `ParseCaps` reads a key up to a NUL and counts
   a duplicate key true if any is (both fixed in 3d); 3e - `CLAIM MAP`'s JSON without escaping and split on `=>` inside
-  quotes; 3b's
+  quotes (fixed in 3e); 3b's
   `ClaimsListToCsv` splits at an `=` inside a quoted name (stage 4's rule); 3g - `UseSchemaAsSet`'s own comment
   reader (`--` ends at `\n` only, `/* */` not nested).
 - 3d (built): grants - `GRANT CATALOG c TO ROLE r` / `GRANT SCHEMA c.p …` / `GRANT TABLE | VIEW | OBJECT c.n …` with
@@ -263,7 +263,22 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   refused the open comment), a clause written twice is refused (the last won, so `RLS (tenant = 'x') … RLS ()` read
   as a filter and granted every row), a `WITH` item that is no word (`'insert'`, `select insert`) is refused, the
   catalog / schema / object refusals are the form's usage, `""` is the tokenizer's (`''` the empty text).
-- 3e: issuers and clients (spec 095).
+- 3e (built): issuers and clients (spec 095) - `CREATE [OR REPLACE] ISSUER [IF NOT EXISTS] <name | '<url>'>` with
+  `URL`, its `FROM SECRET s [IN c]` and the implicit client's clauses (the short form), `CREATE [OR REPLACE] CLIENT
+  [IF NOT EXISTS] c ISSUER i` with a client's (`AUDIENCES`, `AZP`, `REQUIRE (…)`, `ROLES FROM | CONSTANT`, `ROLE
+  CLAIM`, `UNMAPPED IGNORE | AS ROLE`, `ATTRIBUTES (…)`, `CLAIM MAP`, `SUBJECT`, `TOKEN TYPE`, `FLOWS`, `CLIENT ID`,
+  its own `FROM SECRET`, the short form's `CLIENT FROM SECRET`), `ALTER ISSUER i SET … | DROP [CLIENT] FROM SECRET`,
+  `ALTER CLIENT c SET … | DROP FROM SECRET`, `DROP ISSUER | CLIENT [IF EXISTS] n`; `KEYS` / `ALGS` / `CLIENT SECRET`
+  are read with their values and refused in their own words (never written into the policy). The spec JSON is built
+  in the transform; a parenthesised list inside it (`AUDIENCES (…)` and the other value lists, `REQUIRE`,
+  `ATTRIBUTES`, `CLAIM MAP`) is a marker the list's reading replaces once the tokens are known
+  (`MgmtParsed::TextArg::splice`, a control character no JSON value holds raw) - the compiler's readers
+  (`ListItemsJson`, `RequireJson`, `AttributesJson`, `ClaimMapToJson`) on the list as written, each comment a space,
+  the lists' literal rule. Fixed with the move (3c's review): `ClaimMapToJson` quotes each side as JSON and splits at
+  an `=>` outside quotes - it pasted the sides, so `('x' => 'a", "groups": "tenant')` stored a second, hidden
+  attribute (`tenant` from `groups`, what RLS reads through `acl_claim`), and `('a=>b' => 'c')` split inside the
+  quotes. Changed: each clause once (a repeated one wrote its key twice into the spec JSON), comments inside these
+  forms, `""` the tokenizer's.
 - 3f: function categories and grants, platform grants, sources, resource groups.
 - 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;
   `AdminScanner` and `SplitBatchText` go; `RegisterMgmtGrammar` becomes rules (hugr-node re-pins).
