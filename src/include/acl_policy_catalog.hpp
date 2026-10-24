@@ -382,13 +382,22 @@ void RequireOneExpression(const char *what, const string &text);
 void RequireColumnName(const char *what, const string &name);
 
 //! Parse a caps JSON object ({"select": true, "insert": false, ...}) into the set of enabled
-//! capability names, with duckdb's bundled yyjson. Anything but a flat object of booleans is refused.
-inline case_insensitive_set_t ParseCaps(const string &json) {
+//! capability names, with duckdb's bundled yyjson. Anything but a flat object of booleans is refused. `strict` (where
+//! caps are written, spec 150 stage 3d) also refuses what another reader would read otherwise than this one does: a
+//! name that is not a word (ASCII letters, digits, `_` - a NUL this one reads up to, a `"` a rewrite pastes, a
+//! character the listings' regex folds) and a name written twice (names compare case-insensitively; this one counts
+//! any true, a JSON reader takes the last). A stored row keeps its reading - nothing is taken back by itself.
+inline case_insensitive_set_t ParseCaps(const string &json, bool strict = false) {
 	case_insensitive_set_t caps;
 	auto trimmed = json;
 	StringUtil::Trim(trimmed);
 	if (trimmed.empty()) {
 		return caps; // empty/NULL caps -> no capabilities
+	}
+	if (strict && trimmed.find('\\') != string::npos) {
+		// a name is a word, so it needs no escape - an escaped one (`\u0069nsert`) reads as a word to this reader and
+		// as text to the listings' match
+		throw BinderException("acl catalog: caps JSON holds no escape - a capability's name is a word: %s", json);
 	}
 	auto doc = duckdb_yyjson::yyjson_read(trimmed.c_str(), trimmed.size(), 0);
 	if (!doc) {
@@ -402,11 +411,27 @@ inline case_insensitive_set_t ParseCaps(const string &json) {
 		duckdb_yyjson::yyjson_obj_iter iter;
 		duckdb_yyjson::yyjson_obj_iter_init(root, &iter);
 		duckdb_yyjson::yyjson_val *key;
+		case_insensitive_set_t named;
 		while ((key = duckdb_yyjson::yyjson_obj_iter_next(&iter))) {
 			auto value = duckdb_yyjson::yyjson_obj_iter_get_val(key);
 			if (!duckdb_yyjson::yyjson_is_bool(value)) {
 				error = "caps values must be true/false";
 				break;
+			}
+			if (strict) {
+				string name(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key));
+				bool word = !name.empty() && !StringUtil::CharacterIsDigit(name[0]);
+				for (auto c : name) {
+					word = word && (StringUtil::CharacterIsAlpha(c) || StringUtil::CharacterIsDigit(c) || c == '_');
+				}
+				if (!word) {
+					error = "a capability's name is a word (letters, digits, _)";
+					break;
+				}
+				if (!named.insert(name).second) {
+					error = "caps name \"" + name + "\" twice";
+					break;
+				}
 			}
 			if (duckdb_yyjson::yyjson_get_bool(value)) {
 				caps.insert(duckdb_yyjson::yyjson_get_str(key));

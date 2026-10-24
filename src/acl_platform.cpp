@@ -2067,13 +2067,16 @@ bool FoldConstant(const ParsedExpression &expr, Value &out) {
 //! A capability list (`['select', 'insert']`) as the caps JSON the target takes
 string CapsJson(const Value &value) {
 	vector<string> entries;
+	case_insensitive_set_t named;
 	for (auto &item : ListValue::GetChildren(value)) {
 		if (item.IsNull()) {
 			continue;
 		}
 		auto capability = StringUtil::Lower(item.ToString());
 		StringUtil::Trim(capability);
-		entries.push_back(JsonQuote(capability) + ": true");
+		if (!capability.empty() && named.insert(capability).second) { // each once, an empty item none
+			entries.push_back(JsonQuote(capability) + ": true");
+		}
 	}
 	return "{" + StringUtil::Join(entries, ", ") + "}";
 }

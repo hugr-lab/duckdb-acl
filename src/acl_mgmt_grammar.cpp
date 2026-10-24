@@ -4,9 +4,11 @@
 // to the management compiler (acl_admin_sql.cpp) - one family moves per PR. Never registered: a connection cannot
 // switch it on.
 
+#include "acl_door_common.hpp"
 #include "acl_grammar.hpp"
 #include "acl_grammar_util.hpp"
 #include "acl_name_path.hpp"
+#include "acl_platform.hpp"
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -68,6 +70,8 @@ struct MgmtParseData : ParserExtensionParseData {
 		string what;
 		//! a body that is an expression (a scalar's template), not a statement
 		bool expression = false;
+		//! a quoted list a reader of ours splits: judged as the compiler's text is (no comment, no `$$`, ...)
+		bool judge = false;
 	};
 	vector<Span> spans;
 
@@ -442,13 +446,13 @@ void ListInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg
 	if (!arg.IsValid()) {
 		return;
 	}
-	if (kind == MgmtParsed::TextKind::CLAIMS) {
-		data.args[arg.GetIndex()] = Value(entry.value);
-		return;
-	}
 	MgmtParseData::Span span;
 	span.arg = arg.GetIndex();
-	span.kind = kind;
+	// a quoted claims list is the stored csv as it stands; a columns list goes to its reader - both split by readers
+	// of ours, judged as the compiler's text is
+	span.kind = kind == MgmtParsed::TextKind::CLAIMS ? MgmtParsed::TextKind::TEXT : kind;
+	span.judge = kind != MgmtParsed::TextKind::TEXT;
+	span.what = kind == MgmtParsed::TextKind::CLAIMS ? "claims list" : "columns list";
 	span.resolved = true;
 	span.text = entry.value;
 	data.spans.push_back(std::move(span));
@@ -717,6 +721,17 @@ vector<reference<ParseResult>> Clauses(ListParseResult &list, idx_t index) {
 	return clauses;
 }
 
+//! A clause kind written once: a repeated one (`RLS (tenant = 'x') … RLS ()`) would leave a reader of the statement
+//! the first while the last took effect - refused
+void ClauseOnce(case_insensitive_set_t &seen, const string &kind) {
+	if (!seen.insert(kind).second) {
+		auto shown = kind == "primary" ? string("PRIMARY KEY")
+		             : kind == "caps"  ? "CAPS / WITH"
+		                               : StringUtil::Upper(kind);
+		throw BinderException("acl admin: %s is written twice - write each clause once", shown);
+	}
+}
+
 //! A clause `'<KEYWORD>' … <value>`'s list (its value the last part)
 ListParseResult &ClauseList(ParseResult &clause) {
 	return Strip(clause).Cast<ListParseResult>();
@@ -776,8 +791,10 @@ arena_ptr<TransformResultValue> FinalizeCreateReference(PEGTransformer &transfor
 	}
 	string cardinality, join_method, comment;
 	bool optional = false;
+	case_insensitive_set_t seen;
 	for (auto &clause : Clauses(list, 11)) {
 		auto keyword = KeywordOf(clause);
+		ClauseOnce(seen, keyword);
 		if (keyword == "optional") {
 			optional = true;
 		} else if (keyword == "comment") {
@@ -825,7 +842,9 @@ arena_ptr<TransformResultValue> FinalizeCreateView(PEGTransformer &transformer, 
 	auto comment = AddArg(*data);
 	data->args.emplace_back(CreateMode(list, 1, 4));
 	auto pk = AddArg(*data);
+	case_insensitive_set_t seen;
 	for (auto &clause : Clauses(list, 7)) {
+		ClauseOnce(seen, KeywordOf(clause));
 		if (KeywordOf(clause) == "comment") {
 			data->args[comment] = Value(Quoted(transformer, ClauseList(clause), 1, "comment", *data));
 		} else {
@@ -933,8 +952,10 @@ arena_ptr<TransformResultValue> FinalizeCreateTable(PEGTransformer &transformer,
 	auto comment = AddArg(*data);
 	data->args.emplace_back(CreateMode(list, 1, 4));
 	auto pk = AddArg(*data);
+	case_insensitive_set_t seen;
 	for (auto &clause : Clauses(list, 8)) {
 		auto keyword = KeywordOf(clause);
+		ClauseOnce(seen, keyword);
 		auto &value = ClauseList(clause);
 		if (keyword == "columns") {
 			ListInto(transformer, value.GetChild(1), columns, MgmtParsed::TextKind::COLUMNS, false, "columns list",
@@ -1296,6 +1317,250 @@ arena_ptr<TransformResultValue> FinalizeDropObject(PEGTransformer &transformer, 
 	return MgmtResult(transformer, std::move(data));
 }
 
+// --- grants (specs 011, 012, 015, 120) ------------------------------------------------------------------------------
+
+//! A grant's policy clauses, in any order, each once: `WITH (select, insert)` (the list form of
+//! CAPS), `CAPS '<json>'`, `RLS <list>`, `COLUMNS <list>`, and - a catalog grant's - `MAIN`
+struct GrantClauses {
+	optional_idx caps;
+	optional_idx rls;
+	optional_idx columns;
+	bool main = false;
+	//! a clause that is present and not empty (a schema grant carries capabilities only)
+	bool rls_written = false;
+	bool columns_written = false;
+};
+
+//! Whether a list clause's value (`AclList`) is empty as written - `()` or `''`
+bool ListIsEmpty(PEGTransformer &transformer, ParseResult &result) {
+	auto &node = Strip(result);
+	if (node.Name() == "AclParenList") {
+		// separators only read as no item (the compiler's reader drops empty items)
+		vector<reference<ParseResult>> items;
+		grammar::Collect(node.Cast<ListParseResult>().GetChild(1), items);
+		for (auto &item : items) {
+			auto &token = Strip(item.get());
+			if (token.type != ParseResultType::TOKEN || token.Cast<TokenParseResult>().text != ",") {
+				return false;
+			}
+		}
+		return true;
+	}
+	optional_idx offset;
+	auto value = ValueOf(transformer, node, offset);
+	for (auto c : value) {
+		if (c != ',' && !StringUtil::CharacterIsSpace(c)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! `AclCapsList <- '(' AclCapsEntry AclCapsMore* ')'` (AclCapsEntry <- AclName?): the capabilities named, as the
+//! stored JSON - the list form is what a person writes, JSON the storage format and the admin functions' input. Each
+//! a word or a double-quoted name, lower-cased, quoted as JSON (the compiler pasted the text between the commas into
+//! the JSON, so `\u006danage` stored manage). An unknown capability is kept as written rather than refused - the
+//! vocabulary grows, and a grant authored against a newer version must not fail - but enforces nothing until some
+//! spec reads it (design 004)
+string CapsListJson(ParseResult &result) {
+	vector<reference<ParseResult>> names;
+	auto &list = Strip(result).Cast<ListParseResult>();
+	auto collect = [&names](ParseResult &entry) {
+		auto &part = Strip(entry);
+		if (part.type != ParseResultType::OPTIONAL) {
+			names.push_back(part);
+		}
+	};
+	collect(list.GetChild(1));
+	vector<reference<ParseResult>> more;
+	grammar::Collect(list.GetChild(2), more);
+	for (auto &next : more) {
+		collect(next.get().Cast<ListParseResult>().GetChild(1));
+	}
+	vector<string> entries;
+	case_insensitive_set_t named;
+	for (auto &name : names) {
+		auto capability = StringUtil::Lower(NameOf(name, "a capability"));
+		if (named.insert(capability).second) { // the same capability twice is one
+			entries.push_back(JsonQuote(capability) + ": true");
+		}
+	}
+	return "{" + StringUtil::Join(entries, ", ") + "}";
+}
+
+//! The clauses of a repetition at part `index` into the call's arguments `clauses` names
+void GrantClausesInto(PEGTransformer &transformer, ListParseResult &list, idx_t index, GrantClauses &clauses,
+                      MgmtParseData &data) {
+	case_insensitive_set_t seen;
+	for (auto &clause : Clauses(list, index)) {
+		auto keyword = KeywordOf(clause);
+		ClauseOnce(seen, keyword == "with" ? "caps" : keyword); // WITH is the list form of CAPS
+		if (keyword == "main") {
+			clauses.main = true;
+			continue;
+		}
+		auto &parts = ClauseList(clause);
+		if (keyword == "with") {
+			data.args[clauses.caps.GetIndex()] = Value(CapsListJson(parts.GetChild(1)));
+		} else if (keyword == "caps") {
+			data.args[clauses.caps.GetIndex()] = Value(Quoted(transformer, parts, 1, "caps JSON", data));
+		} else if (keyword == "rls") {
+			clauses.rls_written = !ListIsEmpty(transformer, parts.GetChild(1));
+			ListInto(transformer, parts.GetChild(1), clauses.rls, MgmtParsed::TextKind::TEXT, true, "an RLS predicate",
+			         data);
+		} else {
+			clauses.columns_written = !ListIsEmpty(transformer, parts.GetChild(1));
+			ListInto(transformer, parts.GetChild(1), clauses.columns, MgmtParsed::TextKind::COLUMNS, false,
+			         "a column list", data);
+		}
+	}
+}
+
+//! A grant on a view of the platform catalog (`GRANT | REVOKE VIEW platform.x`): a point grant on the system catalog
+//! (spec 117), the compiler's for now - the statement goes to it as its text (legacy data, its span). Any other name
+//! of platform's stays an object grant, which refuses the reserved catalog in its own words
+unique_ptr<MgmtParseData> PlatformViewGrant(ParseResult &parse_result, idx_t kind, const string &path_key) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	string leaf;
+	if (KeywordOf(list.GetChild(kind)) != "view" || !PlatformObjectName(NamePath::FromKey(path_key).Parts(), leaf)) {
+		return nullptr;
+	}
+	if (!parse_result.offset.IsValid() || !parse_result.length.IsValid()) {
+		throw ParserException("acl admin: a grant has no position");
+	}
+	auto data = make_uniq<MgmtParseData>();
+	data->legacy = true;
+	data->start = parse_result.offset.GetIndex();
+	data->end = data->start + parse_result.length.GetIndex();
+	return data;
+}
+
+// AclGrantCatalog <- 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName AclGrantClause* - the catalog level (spec 011):
+// no capability clause = unspecified, which resolves to every data capability; `WITH ()` / `CAPS '{}'` none
+arena_ptr<TransformResultValue> FinalizeGrantCatalog(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_grant_catalog");
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(CatalogKeyOf(list.GetChild(2)))};
+	GrantClauses clauses;
+	clauses.caps = AddArg(*data);
+	auto main = AddArg(*data);
+	clauses.rls = AddArg(*data);
+	clauses.columns = AddArg(*data);
+	GrantClausesInto(transformer, list, 6, clauses, *data);
+	data->args[main] = Value::BOOLEAN(clauses.main);
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclGrantSchema <- 'GRANT' 'SCHEMA' AclPath 'TO' 'ROLE' AclName AclObjectClause* AclSchemaHome? AclComment? - the
+// middle level (spec 015): capabilities only; INTO <phys> is where this role creates, VIRTUAL ONLY nowhere
+arena_ptr<TransformResultValue> FinalizeGrantSchema(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_grant_schema");
+	string vcat, path;
+	SplitVirtualName(PathOf(list.GetChild(2)), vcat, path);
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(path)};
+	// RLS and COLUMNS are judged, not kept: present and not empty, they are refused
+	GrantClauses clauses;
+	clauses.caps = AddArg(*data);
+	auto comment = AddArg(*data);
+	auto into = AddArg(*data);
+	auto virtual_only = AddArg(*data, Value::BOOLEAN(false));
+	GrantClausesInto(transformer, list, 6, clauses, *data);
+	if (clauses.rls_written || clauses.columns_written) {
+		throw BinderException("acl admin: a schema grant carries capabilities only - RLS and COLUMNS belong to the "
+		                      "catalog or to the object (spec 015)");
+	}
+	auto &home = list.Child<OptionalParseResult>(7);
+	if (home.HasResult()) {
+		auto &where = Strip(home.GetResult()).Cast<ListParseResult>();
+		if (KeywordOf(where) == "into") {
+			// AclInto <- 'INTO' AclPathName
+			data->args[into] = Value(PathNameOf(transformer, where.GetChild(1), "a physical schema path", *data));
+		} else {
+			data->args[virtual_only] = Value::BOOLEAN(true); // AclVirtualOnly <- 'VIRTUAL' 'ONLY'
+		}
+	}
+	data->args[comment] = Value(OptionalComment(transformer, list, 8, *data));
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclGrantObject <- 'GRANT' AclObjectKind AclPath 'TO' 'ROLE' AclName AclObjectClause* - the object's own grant (spec
+// 011): it narrows the object for this role, it never widens it
+arena_ptr<TransformResultValue> FinalizeGrantObject(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	if (auto platform = PlatformViewGrant(parse_result, 1, PathOf(list.GetChild(2)))) {
+		return MgmtResult(transformer, std::move(platform));
+	}
+	auto data = Call("acl_grant_object");
+	string vcat, vname;
+	SplitVirtualName(PathOf(list.GetChild(2)), vcat, vname);
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(vname)};
+	GrantClauses clauses;
+	clauses.caps = AddArg(*data);
+	clauses.rls = AddArg(*data);
+	clauses.columns = AddArg(*data);
+	GrantClausesInto(transformer, list, 6, clauses, *data);
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclRevokeCatalog <- 'REVOKE' 'CATALOG' AclName 'FROM' 'ROLE' AclName
+arena_ptr<TransformResultValue> FinalizeRevokeCatalog(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_revoke_catalog");
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(CatalogKeyOf(list.GetChild(2)))};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclRevokeSchema <- 'REVOKE' 'SCHEMA' AclPath 'FROM' 'ROLE' AclName
+arena_ptr<TransformResultValue> FinalizeRevokeSchema(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_revoke_schema");
+	string vcat, path;
+	SplitVirtualName(PathOf(list.GetChild(2)), vcat, path);
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(path)};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclRevokeObject <- 'REVOKE' AclObjectKind AclPath 'FROM' 'ROLE' AclName (spec 120): the object's own grant - the
+// catalog's stays
+arena_ptr<TransformResultValue> FinalizeRevokeObject(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	if (auto platform = PlatformViewGrant(parse_result, 1, PathOf(list.GetChild(2)))) {
+		return MgmtResult(transformer, std::move(platform));
+	}
+	auto data = Call("acl_revoke_object");
+	string vcat, vname;
+	SplitVirtualName(PathOf(list.GetChild(2)), vcat, vname);
+	data->args = {Value(NameOf(list.GetChild(5), "a role name")), Value(vcat), Value(vname)};
+	return MgmtResult(transformer, std::move(data));
+}
+
+// AclAlterGrant <- 'ALTER' 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName 'SET' AclGrantSet - one property of a
+// catalog grant, the rest kept; its values are quoted strings (AclGrantSet <- AclCapsClause / AclSetRlsValue /
+// AclSetColumnsValue / AclSetMainValue)
+arena_ptr<TransformResultValue> FinalizeAlterGrant(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto data = Call("acl_alter_grant");
+	data->args = {Value(NameOf(list.GetChild(6), "a role name")), Value(CatalogKeyOf(list.GetChild(3)))};
+	auto &change = ClauseList(list.GetChild(8));
+	auto field = KeywordOf(change);
+	data->args.emplace_back(field);
+	if (field == "main") {
+		data->args.emplace_back(TokenOf(change.GetChild(1)).text);
+	} else if (field == "columns") {
+		MgmtParseData::Span span;
+		span.arg = AddArg(*data);
+		span.kind = MgmtParsed::TextKind::COLUMNS;
+		span.resolved = true;
+		span.text = Quoted(transformer, change, 1, "a column list", *data);
+		data->spans.push_back(std::move(span));
+	} else {
+		data->args.emplace_back(
+		    Quoted(transformer, change, 1, field == "caps" ? "caps JSON" : "an RLS predicate", *data));
+	}
+	return MgmtResult(transformer, std::move(data));
+}
+
 // --- a statement no rule reads yet ------------------------------------------------------------------------------
 
 // AclMgmtLegacy <- AclTailToken+ : its span, for the management compiler
@@ -1563,6 +1828,43 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclDropObjectKind <- 'TABLE' / 'VIEW'"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclDropObject <- 'DROP' 'VIRTUAL' AclDropObjectKind AclIfExists? AclPath", Start<FinalizeDropObject>));
+		// grants
+		changes.push_back(GrammarChange::AddRule("AclCapsEntry <- AclName?"));
+		changes.push_back(GrammarChange::AddRule("AclCapsMore <- ',' AclCapsEntry"));
+		changes.push_back(GrammarChange::AddRule("AclCapsList <- '(' AclCapsEntry AclCapsMore* ')'"));
+		changes.push_back(GrammarChange::AddRule("AclWithCaps <- 'WITH' AclCapsList"));
+		changes.push_back(GrammarChange::AddRule("AclCapsClause <- 'CAPS' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclMainClause <- 'MAIN'"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclObjectClause <- AclWithCaps / AclCapsClause / AclRlsClause / AclColumnsClause"));
+		changes.push_back(GrammarChange::AddRule("AclGrantClause <- AclObjectClause / AclMainClause"));
+		changes.push_back(
+		    GrammarChange::AddRule("AclGrantCatalog <- 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName AclGrantClause*",
+		                           Start<FinalizeGrantCatalog>));
+		changes.push_back(GrammarChange::AddRule("AclInto <- 'INTO' AclPathName"));
+		changes.push_back(GrammarChange::AddRule("AclVirtualOnly <- 'VIRTUAL' 'ONLY'"));
+		changes.push_back(GrammarChange::AddRule("AclSchemaHome <- AclInto / AclVirtualOnly"));
+		changes.push_back(GrammarChange::AddRule("AclGrantSchema <- 'GRANT' 'SCHEMA' AclPath 'TO' 'ROLE' AclName "
+		                                         "AclObjectClause* AclSchemaHome? AclComment?",
+		                                         Start<FinalizeGrantSchema>));
+		changes.push_back(GrammarChange::AddRule("AclObjectKind <- 'TABLE' / 'VIEW' / 'OBJECT'"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclGrantObject <- 'GRANT' AclObjectKind AclPath 'TO' 'ROLE' AclName AclObjectClause*",
+		    Start<FinalizeGrantObject>));
+		changes.push_back(GrammarChange::AddRule("AclRevokeCatalog <- 'REVOKE' 'CATALOG' AclName 'FROM' 'ROLE' AclName",
+		                                         Start<FinalizeRevokeCatalog>));
+		changes.push_back(GrammarChange::AddRule("AclRevokeSchema <- 'REVOKE' 'SCHEMA' AclPath 'FROM' 'ROLE' AclName",
+		                                         Start<FinalizeRevokeSchema>));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclRevokeObject <- 'REVOKE' AclObjectKind AclPath 'FROM' 'ROLE' AclName", Start<FinalizeRevokeObject>));
+		changes.push_back(GrammarChange::AddRule("AclSetRlsValue <- 'RLS' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclSetColumnsValue <- 'COLUMNS' AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclSetMainValue <- 'MAIN' AclWordToken"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclGrantSet <- AclCapsClause / AclSetRlsValue / AclSetColumnsValue / AclSetMainValue"));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclAlterGrant <- 'ALTER' 'GRANT' 'CATALOG' AclName 'TO' 'ROLE' AclName 'SET' AclGrantSet",
+		    Start<FinalizeAlterGrant>));
 		// a statement no rule reads yet: its tokens, to the management compiler
 		changes.push_back(GrammarChange::AddRule("AclTailToken <- Identifier"));
 		changes.push_back(
@@ -1580,7 +1882,8 @@ public:
 		    "AclCommentReference / AclCommentFunction / AclCommentObject / AclCheckCatalog / AclRepairTable / "
 		    "AclAnalyzeCatalog / "
 		    "AclAnalyzeObject / AclDropRelation / AclDropReference / AclDropCatalog / AclDropSchema / "
-		    "AclDropFunction / AclDropObject / AclMgmtLegacy"));
+		    "AclDropFunction / AclDropObject / AclGrantCatalog / AclGrantSchema / AclGrantObject / AclRevokeCatalog / "
+		    "AclRevokeSchema / AclRevokeObject / AclAlterGrant / AclMgmtLegacy"));
 		// the batch holds management statements only: duckdb's own are not ours to read here
 		changes.push_back(GrammarChange::ReplaceRule("Statement <- AclMgmtStatement", Start<FinalizeStatement>));
 		return changes;
@@ -1867,7 +2170,27 @@ string JudgeLegacyText(shared_ptr<CompiledGrammar> compiled, const string &text)
 	SplitTokenizerBehavior behavior(text, owned);
 	compiled->GetTokenizer().TokenizeInput(behavior);
 	TokenIterator tokens(owned);
-	return LegacyUnreadable(text, tokens, 0, text.size());
+	for (auto &token : owned) {
+		if (token.type == TokenType::TERMINATOR) {
+			return "a `;`"; // the judgment would stop there, the reader not
+		}
+	}
+	auto why = LegacyUnreadable(text, tokens, 0, text.size());
+	if (!why.empty()) {
+		return why;
+	}
+	// the whole text: what stands before its first token or after its last is a comment too
+	idx_t first = text.size();
+	idx_t last = 0;
+	for (auto &token : owned) {
+		if (token.type != TokenType::END_OF_INPUT && token.type != TokenType::TERMINATOR) {
+			first = MinValue(first, token.offset);
+			last = MaxValue(last, token.offset + token.length);
+		}
+	}
+	auto outside = first <= last ? text.substr(0, first) + text.substr(last) : text;
+	StringUtil::Trim(outside);
+	return outside.empty() ? string() : "a comment";
 }
 
 shared_ptr<GrammarExtension> MakeMgmtGrammar() {
@@ -1954,6 +2277,15 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 				string value;
 				if (span.resolved) {
 					value = span.text;
+					if (span.judge) {
+						// a quoted list is split by a reader of ours, which knows no comment
+						auto why = JudgeLegacyText(compiled, value);
+						if (!why.empty()) {
+							throw BinderException("acl admin: %s in a quoted %s - its reader would read it otherwise "
+							                      "than written; write the list in parentheses",
+							                      why, span.what);
+						}
+					}
 				} else if (span.body) {
 					value = BodyText(text, tokens, span.start, span.end, span.what);
 					JudgeBody(value, span.what, span.expression, options);

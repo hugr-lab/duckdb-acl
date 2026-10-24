@@ -662,8 +662,11 @@ struct PolicyStore {
 	bool ResolveHeldSchema(const Principal &principal, const string &written, string &vcat, string &path);
 	//! Grant/revoke one schema to a role (spec 015): capabilities only, `manage` refused. Both
 	//! rematerialise the subtree, so the stored rows always show what a role effectively has.
+	//! `ensure_grant`: the role's catalog grant (an empty one when it has none) is written in the same transaction,
+	//! so a refused grant leaves none behind
 	void CatalogGrantSchema(const string &role, const string &vcat, const string &path, const string &caps_json,
-	                        const string &comment = string(), const string &into = string(), bool virtual_only = false);
+	                        const string &comment = string(), const string &into = string(), bool virtual_only = false,
+	                        bool ensure_grant = false);
 	void CatalogRevokeSchema(const string &role, const string &vcat, const string &path);
 	//! "Rebuild this subtree from the nearest ancestor that states capabilities" - idempotent, so
 	//! grants, schema DDL and drift repair are all the same call (spec 015)
@@ -694,8 +697,10 @@ struct PolicyStore {
 	                         const string &cardinality, bool optional, const string &join_method,
 	                         const string &comment);
 	void CatalogDropReference(const string &vcat, const string &name);
+	//! `judge_columns` / `judge_caps`: only where that part itself is being written - never re-judging a stored one
 	void CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
-	                  const string &rls = "", const string &columns = "", bool judge_columns = true);
+	                  const string &rls = "", const string &columns = "", bool judge_columns = true,
+	                  bool judge_caps = true);
 	void CatalogRevoke(const string &role, const string &vcat);
 	void CatalogDropRelation(const string &vcat, const string &vname);
 	//! spec 107: after a virtual object's definition was written (or dropped), the static lineage event
@@ -863,9 +868,11 @@ struct PolicyStore {
 	void CatalogEditIdentity(const std::function<void(IdentityModel &)> &apply);
 	//! per-object grant: its capabilities and (spec 011) the policy it imposes on the object
 	void CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname, const string &caps_json,
-	                          const string &rls = "", const string &columns = "");
-	//! spec 032 / 122: what an object grant's capabilities name (`manage` per object, a write verb on a function)
-	void CatalogCheckObjectCaps(const string &vcat, const string &vname, const string &caps_json);
+	                          const string &rls = "", const string &columns = "", bool judge_caps = true,
+	                          bool ensure_grant = false);
+	//! spec 032 / 122: what an object grant's capabilities name (`manage` per object, a write verb on a function);
+	//! `strict` where they are written (spec 150 stage 3d: a name twice, a NUL in a name)
+	void CatalogCheckObjectCaps(const string &vcat, const string &vname, const string &caps_json, bool strict = true);
 	//! spec 122: one finding of platform.check_grant - item rls | columns | column | caps | object, status ok |
 	//! refused | unchecked
 	struct GrantCheckRow {
@@ -888,6 +895,8 @@ struct PolicyStore {
 	void CatalogRequireGrantTarget(const string &vcat, const string &vname, bool with_policy, const string &caps_json);
 	//! ensure a role->catalog grant row exists without clobbering an existing one
 	void CatalogEnsureGrant(const string &role, const string &vcat, bool is_main);
+	//! ... as the statement a grant's own write carries
+	string EnsureGrantSql(const string &role, const string &vcat, bool is_main);
 
 	//! Instantiate a SELECT template: a fresh SelectStatement whose node is a copy of the cached
 	//! prototype (parsed once). The caller bakes markers into the copy.

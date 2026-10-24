@@ -164,7 +164,7 @@ ACL ADMIN SELECT x FROM phys.main.scratch;
 statement error
 ACL ADMIN GRANT CATLOG sales TO ROLE analyst;
 ----
-<REGEX>:.*expected catalog.*
+<REGEX>:.*write GRANT CATALOG \| SCHEMA.*
 
 statement error
 ACL ADMIN ADD TABLE phys.main.orders_physical AS plainname;

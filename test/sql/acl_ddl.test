@@ -200,7 +200,7 @@ alias	phys.lake.by_hand
 statement error
 ACL ADMIN GRANT SCHEMA sales.vs TO ROLE curator WITH (create) INTO phys.staging VIRTUAL ONLY;
 ----
-<REGEX>:.*(INTO and VIRTUAL ONLY are opposites|unexpected trailing text).*
+<REGEX>:.*write GRANT SCHEMA.*
 
 # --- dropping: the user-facing drop takes both, the administrative one takes the record --------------
 

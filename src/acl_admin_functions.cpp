@@ -148,11 +148,14 @@ string StripDeclarationNullability(const string &declaration, case_insensitive_m
 	return StringUtil::Join(cleaned, ", ");
 }
 
-//! The old grant functions carry caps as a csv list; the catalog stores a JSON object
+//! The old grant functions carry caps as a csv list; the catalog stores a JSON object - each name once, as JSON
 string CapsCsvToJson(const vector<string> &caps) {
 	vector<string> items;
+	case_insensitive_set_t named;
 	for (auto &cap : caps) {
-		items.push_back("\"" + StringUtil::Lower(cap) + "\": true");
+		if (named.insert(cap).second) {
+			items.push_back(JsonQuote(StringUtil::Lower(cap)) + ": true");
+		}
 	}
 	return "{" + StringUtil::Join(items, ", ") + "}";
 }
@@ -480,15 +483,16 @@ void AclGrantSchemaFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		auto vcat = StoreOf(state).SpellCatalog(CatalogArg(args, 1, row, "acl_grant_schema", "catalog"));
 		auto path = StoreOf(state).SpellName(vcat, KeyArg(args, 2, row, "acl_grant_schema", "schema path"));
 		auto &store = StoreOf(state);
-		store.CatalogEnsureGrant(role, vcat, false);
 		bool virtual_only = false;
 		if (args.ColumnCount() > 6) {
 			auto value = args.GetValue(6, row);
 			virtual_only = !value.IsNull() && value.GetValue<bool>();
 		}
+		// the role's catalog grant is ensured in the schema grant's own write: a refused grant leaves none behind
 		store.CatalogGrantSchema(
 		    role, vcat, path, OptionalArg(args, 3, row, ""), OptionalArg(args, 4, row, ""),
-		    store.SpellPhysical(NameKey(OptionalArg(args, 5, row, ""), "acl_grant_schema", "into")), virtual_only);
+		    store.SpellPhysical(NameKey(OptionalArg(args, 5, row, ""), "acl_grant_schema", "into")), virtual_only,
+		    true);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -639,8 +643,8 @@ void AclGrantObjectFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		auto &store = StoreOf(state);
 		// a grant on an object nobody defined is a policy that never applies: refuse it now
 		store.CatalogRequireGrantTarget(vcat, vname, !rls.empty() || !columns.empty(), caps);
-		store.CatalogEnsureGrant(role, vcat, false);
-		store.CatalogSetObjectCaps(role, vcat, vname, caps, rls, columns);
+		// the role's catalog grant is ensured in the object grant's own write: a refused grant leaves none behind
+		store.CatalogSetObjectCaps(role, vcat, vname, caps, rls, columns, true, true);
 	}
 	result.Reference(Value::BOOLEAN(true), count_t(args.size()));
 }
@@ -688,6 +692,7 @@ void AclGrantTableFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		auto &store = StoreOf(state);
 		if (store.CatalogEnabled()) {
 			auto form = columns.empty() && rls.empty() ? "alias" : "subquery";
+			acl_detail::ParseCaps(CapsCsvToJson(cap_list), true); // judged before anything is written
 			store.CatalogEnsureGrant(role, "default", true);
 			store.CatalogAddRelation("default", vname, form, phys, "", rls, columns);
 			store.CatalogSetObjectCaps(role, "default", vname, CapsCsvToJson(cap_list));

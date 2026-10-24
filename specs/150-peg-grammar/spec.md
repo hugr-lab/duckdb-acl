@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c, 3d built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -233,10 +233,36 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   operator, and failed at its first read).
   Found in the same review and left to the family that moves the form (each a fix with its test there): 3d - the WITH
   list's JSON is built without escaping (`\u006danage` stores manage), `ParseCaps` reads a key up to a NUL and counts
-  a duplicate key true if any is; 3e - `CLAIM MAP`'s JSON without escaping and split on `=>` inside quotes; 3b's
+  a duplicate key true if any is (both fixed in 3d); 3e - `CLAIM MAP`'s JSON without escaping and split on `=>` inside
+  quotes; 3b's
   `ClaimsListToCsv` splits at an `=` inside a quoted name (stage 4's rule); 3g - `UseSchemaAsSet`'s own comment
   reader (`--` ends at `\n` only, `/* */` not nested).
-- 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).
+- 3d (built): grants - `GRANT CATALOG c TO ROLE r` / `GRANT SCHEMA c.p …` / `GRANT TABLE | VIEW | OBJECT c.n …` with
+  their clauses in any order, each once (`WITH (…)` / `CAPS '<json>'` one kind, `RLS`, `COLUMNS`, a catalog's `MAIN`;
+  a schema's `INTO <phys>` | `VIRTUAL ONLY` and `COMMENT` after them, its `RLS` / `COLUMNS` refused unless empty -
+  separators only are empty), `REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT … FROM ROLE r`, `ALTER GRANT CATALOG c
+  TO ROLE r SET CAPS | RLS | COLUMNS '<text>' | MAIN <word>`. A grant on a view of the platform catalog (`GRANT |
+  REVOKE VIEW platform.x`, spec 117, `PlatformObjectName`) is a point grant the compiler still reads: its transform
+  answers legacy data with the statement's span (`PlatformViewGrant`); another name of platform's stays an object
+  grant, refused as the reserved catalog. Fixed with the move (3c's review, 3d's): `WITH (…)` is a list of names
+  (`AclCapsList`: a word or a double-quoted name, lower-cased, the same twice one, `JsonQuote`d - `CapsListToJson`
+  pasted the text between the commas, so `\u006danage` stored manage); `ParseCaps(json, strict)` where caps are WRITTEN
+  (a grant, `ALTER GRANT SET CAPS`, `check_grant`, the function forms) refuses an escape in the JSON (a name is a word
+  and needs none - an escaped one read as a word here and as text to the listings' match) and a name that is not a word (ASCII letters, digits, `_`: a NUL it read up
+  to, a `"` a rewrite pasted, a character the listings' regex folded) and a name written twice (names compare
+  case-insensitively; it counts any true, a JSON reader takes the last); `REVOKE ADMIN` rebuilds the caps as JSON
+  (`JsonQuote` - it pasted each name, so a stored `\u006danage` came back as manage and the role stayed an administrator;
+  found in 3d's review) and so does the legacy csv wrapper (`CapsCsvToJson`, each name once, as `CapsJson` the
+  platform call's list); a quoted COLUMNS list holding a comment, a `$$…$$` string, an `E'…'` one with a backslash or
+  a backtick name or a `;` is refused (its reader would split it otherwise than written: `'a /*, tenant, */'` read
+  only `tenant`), and so is a quoted claims list. A refused grant leaves no catalog grant behind: the role's grant on
+  the catalog (an empty one when it has none) is written in the schema / object grant's own transaction
+  (`EnsureGrantSql`) - the separate ensure before it was left by any later refusal, and an empty grant moved a role's
+  short names to that catalog or gave it a second main one (found in 3d's re-review). A stored row keeps its reading and its rewrites stay unjudged (`ALTER GRANT SET RLS`, `REPAIR … AND
+  MASKS`): nothing is taken back by itself. Changed: a comment in an RLS / COLUMNS list reads as a space (spec 148
+  refused the open comment), a clause written twice is refused (the last won, so `RLS (tenant = 'x') … RLS ()` read
+  as a filter and granted every row), a `WITH` item that is no word (`'insert'`, `select insert`) is refused, the
+  catalog / schema / object refusals are the form's usage, `""` is the tokenizer's (`''` the empty text).
 - 3e: issuers and clients (spec 095).
 - 3f: function categories and grants, platform grants, sources, resource groups.
 - 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;

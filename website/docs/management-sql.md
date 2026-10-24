@@ -139,7 +139,7 @@ CREATE [OR REPLACE] VIRTUAL TABLE [IF NOT EXISTS] <catalog>.<name> AS <phys>
 ADD TABLE <phys> AS <catalog>.<name> [COLUMNS (<item>, …)] [RLS (<predicate>)]        -- legacy, upsert
 ```
 
-The four clauses after `AS <phys>` come in any order. A `COLUMNS` item is one of:
+The four clauses after `AS <phys>` come in any order, each once. A `COLUMNS` item is one of:
 
 | Item                       | Meaning                                                                                      |
 | -------------------------- | -------------------------------------------------------------------------------------------- |
@@ -343,7 +343,7 @@ be qualified by its end. Exactly one of the two is written for a relation end. F
 end the parenthesis is the argument substitution - which column of the source row feeds which
 parameter, checked against the declared signature - and `ON` names columns of the function's result;
 either may stand alone. `CARDINALITY` and `JOIN` accept only the values listed. `OPTIONAL` says the
-far side may be absent. The trailing clauses come in any order.
+far side may be absent. The trailing clauses come in any order, each once.
 
 Its hints change in place (spec 120) - `ALTER VIRTUAL REFERENCE c.n SET COMMENT '…' | SET CARDINALITY <c> |
 SET OPTIONAL true | false`, `COMMENT ON VIRTUAL REFERENCE c.n IS '…'` (`acl_alter_reference(catalog, name, property,
@@ -498,7 +498,7 @@ REVOKE TABLE | VIEW | OBJECT <catalog>.<name> FROM ROLE <role>
 
 The grant that makes a catalog resolve for a role. `REVOKE TABLE | VIEW | OBJECT` (spec 120) takes one object's own
 grant (`GRANT TABLE … CAPS …`) - its caps, policy and columns; the catalog's or a schema's grant then decides that
-object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like every grant. Clauses after the role come in any order.
+object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like every grant. Clauses after the role come in any order, each once.
 
 - **Capabilities.** `WITH (…)` is the list form of `CAPS '{"select": true, …}'`. A grant that states
   nothing holds every data capability - `select`, `insert`, `update`, `delete`, `merge` - and never
@@ -509,7 +509,10 @@ object again (`acl_revoke_object(role, catalog, name)`). Policy-level, like ever
   secrets service, see below) on the main catalog grant, and `lineage` (the catalog's definition lineage,
   `acl_lineage_definitions` - [lineage](lineage.md#a-catalogs-definitions-on-demand)) on any catalog grant,
   each held only when named.
-  An unknown name is stored as written and enforces nothing.
+  An unknown name is stored as written and enforces nothing. A capability's name is a word (ASCII
+  letters, digits, `_`): each item of `WITH (…)` is one - bare or double-quoted, lower-cased, the same
+  one twice counting once - and `CAPS` JSON naming anything else, or a capability twice (names compare
+  case-insensitively), is refused where it is written. Each clause of a grant is written once.
 - **`MAIN`** marks the catalog whose objects the role addresses unqualified. A principal with more than
   one main catalog across its roles resolves only qualified names.
 - **`RLS`** is the grant's own predicate, AND-ed onto every object of the catalog for this role (and
@@ -552,8 +555,8 @@ REVOKE SCHEMA <catalog>.<path> FROM ROLE <role>
 ```
 
 The middle level of the grant chain: capabilities for everything under a schema path, including
-objects that appear in it later. It carries capabilities only - `RLS` and `COLUMNS` parse but are
-refused, and `manage` is refused at this level. Capabilities resolve by the longest granted prefix of
+objects that appear in it later. It carries capabilities only - `RLS` and `COLUMNS` are refused
+unless empty, and `manage` is refused at this level. Capabilities resolve by the longest granted prefix of
 a name (`object -> schema -> catalog`); a level that states none inherits from the nearest ancestor
 that does, and the inheritance is materialised when a grant or a schema changes. `REVOKE` re-points
 the subtree at the next ancestor. A schema grant does not make names resolve - the role still needs

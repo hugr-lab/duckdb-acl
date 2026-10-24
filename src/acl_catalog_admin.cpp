@@ -3,6 +3,7 @@
 // write is validated where it is written (acl_catalog_validation.cpp) and lands in one
 // transaction. Split from acl_policy_catalog.cpp (plan 4.2).
 
+#include "acl_door_common.hpp"
 #include "acl_result_rows.hpp"
 #include "acl_policy_catalog.hpp"
 #include "acl_platform.hpp"
@@ -1980,9 +1981,9 @@ bool PolicyStore::CatalogRenameRelation(const string &vcat, const string &vname,
 
 void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, const string &path,
                                      const string &caps_json, const string &comment, const string &into,
-                                     bool virtual_only) {
+                                     bool virtual_only, bool ensure_grant) {
 	RequireCatalog(catalog, "acl_grant_schema");
-	if (acl_detail::ParseCaps(caps_json).count("manage")) {
+	if (acl_detail::ParseCaps(caps_json, true).count("manage")) {
 		throw BinderException("acl admin: `manage` is granted per catalog, not per schema - administering the ACL is "
 		                      "catalog-scoped (spec 009)");
 	}
@@ -2006,14 +2007,19 @@ void PolicyStore::CatalogGrantSchema(const string &role, const string &vcat, con
 		throw BinderException("acl admin: INTO and VIRTUAL ONLY are opposites - one names where the role creates, "
 		                      "the other says it never does");
 	}
-	catalog->Write({"DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"role\" = " + Lit(role) +
-	                    " AND \"vcat\" = " + Lit(vcat) + " AND \"schema_path\" = " + Lit(path),
-	                "INSERT INTO " + catalog->Tbl("role_schemas") +
-	                    "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\", \"comment\", \"into\","
-	                    " \"virtual_only\") VALUES (" +
-	                    Lit(role) + ", " + Lit(vcat) + ", " + Lit(path) + ", " + Lit(caps_json) + ", false, " +
-	                    (comment.empty() ? "NULL" : Lit(comment)) + ", " + (into.empty() ? "NULL" : Lit(into)) + ", " +
-	                    (virtual_only ? "true" : "false") + ")"});
+	vector<string> statements;
+	if (ensure_grant) {
+		statements.push_back(EnsureGrantSql(role, vcat, false));
+	}
+	statements.push_back("DELETE FROM " + catalog->Tbl("role_schemas") + " WHERE \"role\" = " + Lit(role) +
+	                     " AND \"vcat\" = " + Lit(vcat) + " AND \"schema_path\" = " + Lit(path));
+	statements.push_back("INSERT INTO " + catalog->Tbl("role_schemas") +
+	                     "(\"role\", \"vcat\", \"schema_path\", \"caps\", \"inherited\", \"comment\", \"into\","
+	                     " \"virtual_only\") VALUES (" +
+	                     Lit(role) + ", " + Lit(vcat) + ", " + Lit(path) + ", " + Lit(caps_json) + ", false, " +
+	                     (comment.empty() ? "NULL" : Lit(comment)) + ", " + (into.empty() ? "NULL" : Lit(into)) + ", " +
+	                     (virtual_only ? "true" : "false") + ")");
+	catalog->Write(statements);
 	CatalogRematerializeSchemaCaps(vcat, path);
 }
 
@@ -2411,14 +2417,14 @@ void ValidateGrantColumns(CatalogBackend &catalog, const string &vcat, const str
 } // namespace
 
 void PolicyStore::CatalogGrant(const string &role, const string &vcat, const string &caps_json, bool is_main,
-                               const string &rls, const string &columns, bool judge_columns) {
+                               const string &rls, const string &columns, bool judge_columns, bool judge_caps) {
 	RequireCatalog(catalog, "acl_grant_catalog");
 	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls, acl_detail::ParseColumnList(columns));
 	if (vcat.empty()) {
 		throw BinderException("acl admin: a grant needs a catalog name");
 	}
-	acl_detail::ParseCaps(caps_json); // validate before persisting
-	if (judge_columns) {              // only where the list itself is being written - never re-judging a stored one
+	acl_detail::ParseCaps(caps_json, judge_caps); // validate before persisting
+	if (judge_columns) { // only where the list itself is being written - never re-judging a stored one
 		ValidateGrantColumns(*catalog, vcat, columns, "");
 	}
 	// the verdict is read on the connection that writes it (spec 027), so what it judges the predicate
@@ -3546,7 +3552,7 @@ void PolicyStore::CatalogAlterGrant(const string &role, const string &vcat, cons
 	} else {
 		throw BinderException("acl admin: unknown grant property \"%s\"", field);
 	}
-	CatalogGrant(role, vcat, caps, is_main, rls, columns, field == "columns");
+	CatalogGrant(role, vcat, caps, is_main, rls, columns, field == "columns", field == "caps");
 }
 
 void PolicyStore::CatalogGrantAdmin(const string &role, const string &scope) {
@@ -3617,7 +3623,7 @@ void PolicyStore::CatalogRevokeAdmin(const string &role, const string &scope) {
 		}
 		vector<string> kept;
 		for (auto &cap : caps) {
-			kept.push_back("\"" + cap + "\": true");
+			kept.push_back(JsonQuote(cap) + ": true"); // the name as JSON - pasted, `\u006danage` read as manage
 		}
 		statements.push_back("UPDATE " + catalog->Tbl("role_catalogs") + " SET \"caps\" = " +
 		                     Lit("{" + StringUtil::Join(kept, ", ") + "}") + " WHERE \"role\" = " + Lit(role) +
@@ -3747,11 +3753,12 @@ void PolicyStore::CatalogEditIdentity(const std::function<void(IdentityModel &)>
 //! What a written object grant is, before it is written (spec 122): the steps the write runs, in its order, shared
 //! by the write and by platform.check_grant so the two cannot disagree. The caps half judges what the capabilities
 //! name; the plan half runs on the write's own reads (a check: on the store's connection, nothing written).
-void PolicyStore::CatalogCheckObjectCaps(const string &vcat, const string &vname, const string &caps_json) {
+void PolicyStore::CatalogCheckObjectCaps(const string &vcat, const string &vname, const string &caps_json,
+                                         bool strict) {
 	// spec 032: a capability that cannot apply to what it names is a misunderstanding, not a no-op, and
 	// the refusal belongs here rather than in the pre-check - the legacy wrappers write a grant without
 	// passing through that one.
-	auto caps = acl_detail::ParseCaps(caps_json);
+	auto caps = acl_detail::ParseCaps(caps_json, strict);
 	if (caps.count("manage")) {
 		throw BinderException("acl admin: `manage` is granted per catalog, not per object - administering the ACL is "
 		                      "catalog-scoped (spec 009)");
@@ -3858,12 +3865,16 @@ string ExposedColumnList(CatalogBackend &catalog, const ReadFn &read, const stri
 } // namespace
 
 void PolicyStore::CatalogSetObjectCaps(const string &role, const string &vcat, const string &vname,
-                                       const string &caps_json, const string &rls, const string &columns) {
+                                       const string &caps_json, const string &rls, const string &columns,
+                                       bool judge_caps, bool ensure_grant) {
 	RequireCatalog(catalog, "acl catalog");
 	RequirePolicyFreeExpressions(*catalog, "the grant's RLS or column list", rls, acl_detail::ParseColumnList(columns));
 	ValidateGrantColumns(*catalog, vcat, columns, vname);
-	CatalogCheckObjectCaps(vcat, vname, caps_json);
+	CatalogCheckObjectCaps(vcat, vname, caps_json, judge_caps);
 	catalog->WriteWithReads([&](const ReadFn &read, vector<string> &statements) {
+		if (ensure_grant) {
+			statements.push_back(EnsureGrantSql(role, vcat, false));
+		}
 		auto plan = PlanObjectGrant(*catalog, read, role, vcat, vname, rls, columns, statements);
 		statements.push_back("DELETE FROM " + catalog->Tbl("role_object_caps") + " WHERE \"role\" = " + Lit(role) +
 		                     " AND \"vcat\" = " + Lit(vcat) + " AND \"vname\" = " + Lit(vname));
@@ -3915,7 +3926,7 @@ vector<PolicyStore::GrantCheckRow> PolicyStore::CatalogCheckGrant(const string &
 		    if (object) {
 			    CatalogCheckObjectCaps(vcat, vname, caps_json);
 		    } else {
-			    acl_detail::ParseCaps(caps_json);
+			    acl_detail::ParseCaps(caps_json, true);
 		    }
 	    })) {
 		return out;
@@ -4053,13 +4064,16 @@ void PolicyStore::CatalogRequireGrantTarget(const string &vcat, const string &vn
 	}
 }
 
-void PolicyStore::CatalogEnsureGrant(const string &role, const string &vcat, bool is_main) {
+string PolicyStore::EnsureGrantSql(const string &role, const string &vcat, bool is_main) {
 	RequireCatalog(catalog, "acl catalog");
-	catalog->Write({"INSERT INTO " + catalog->Tbl("role_catalogs") +
-	                "(\"role\", \"vcat\", \"is_main\", \"caps\") SELECT " + Lit(role) + ", " + Lit(vcat) + ", " +
-	                (is_main ? "true" : "false") + ", '{}' WHERE NOT EXISTS (SELECT 1 FROM " +
-	                catalog->Tbl("role_catalogs") + " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat) +
-	                ")"});
+	return "INSERT INTO " + catalog->Tbl("role_catalogs") + "(\"role\", \"vcat\", \"is_main\", \"caps\") SELECT " +
+	       Lit(role) + ", " + Lit(vcat) + ", " + (is_main ? "true" : "false") +
+	       ", '{}' WHERE NOT EXISTS (SELECT 1 FROM " + catalog->Tbl("role_catalogs") +
+	       " WHERE \"role\" = " + Lit(role) + " AND \"vcat\" = " + Lit(vcat) + ")";
+}
+
+void PolicyStore::CatalogEnsureGrant(const string &role, const string &vcat, bool is_main) {
+	catalog->Write({EnsureGrantSql(role, vcat, is_main)});
 }
 
 } // namespace acl

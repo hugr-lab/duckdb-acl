@@ -1360,7 +1360,7 @@ int64_t PolicyStore::CatalogRepairRelation(const string &vcat, const string &vna
 				}
 				items.push_back(item.second.empty() ? item.first : item.first + " = " + item.second);
 			}
-			CatalogSetObjectCaps(grant.role, vcat, vname, grant.caps, grant.rls, StringUtil::Join(items, ", "));
+			CatalogSetObjectCaps(grant.role, vcat, vname, grant.caps, grant.rls, StringUtil::Join(items, ", "), false);
 		}
 		Columns kept;
 		for (auto &column : columns) {
