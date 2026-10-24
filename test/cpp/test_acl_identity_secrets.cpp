@@ -279,6 +279,15 @@ int main(int argc, char *argv[]) {
 			Check(One(con, "SELECT secret IS NULL AND client_id IS NULL FROM acl_clients() WHERE name = 'extra'") ==
 			          "true",
 			      "a client's own secret dropped: " + One(con, "SELECT * FROM acl_clients() WHERE name = 'extra'"));
+			// … and SET … FROM SECRET: a client's own, the implicit client's beside the issuer's
+			Exec(con, "ACL ADMIN ALTER CLIENT extra SET FROM SECRET extra_conn");
+			Check(One(con, "SELECT secret FROM acl_clients() WHERE name = 'extra'") == "extra_conn",
+			      "a client's own secret set: " + One(con, "SELECT * FROM acl_clients() WHERE name = 'extra'"));
+			Exec(con, "ACL ADMIN ALTER ISSUER short SET CLIENT FROM SECRET extra_conn");
+			Check(One(con, "SELECT c.secret || ' ' || i.secret FROM acl_clients() c, acl_issuers() i WHERE c.name = "
+			               "'short' AND i.name = 'short'") == "extra_conn short_conn",
+			      "the implicit client's secret set, the issuer's kept");
+			Exec(con, "ACL ADMIN ALTER ISSUER short SET CLIENT FROM SECRET short_client");
 			Exec(con, "ACL ADMIN DROP CLIENT extra");
 		});
 

@@ -2292,9 +2292,11 @@ bool BetweenParentheses(const string &text, idx_t start, idx_t end) {
 //! A parenthesised list's text between its parentheses, as written with each comment a space (a comment would
 //! otherwise be read as part of the list: `(a = 1 -- note⏎)` left an open comment in an RLS predicate). A list our
 //! readers split (`SplitTopLevel` knows `'…'` with `''` and `"…"` only) refuses a literal it would split into other
-//! items than written - a `$$…$$` string, an `E'…'` one with a backslash, a backtick name, a string continued on the
-//! next line; one duckdb's parser reads (`sql`) takes any
-string ListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool sql) {
+//! items than written - a `$$…$$` string, an `E'…'` one with a backslash, a backtick name - and one whose items its
+//! reader takes as literals (`literal_items`: spec 095's lists) a string continued on the next line, which duckdb
+//! joins (an item that is SQL - a mask, a REMAP expression - is read by duckdb, joined); one duckdb's parser reads
+//! (`sql`) takes any
+string ListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool sql, bool literal_items) {
 	if (!BetweenParentheses(text, start, end)) {
 		throw BinderException(TILING_REFUSAL);
 	}
@@ -2303,7 +2305,7 @@ string ListText(const string &text, const TokenIterator &tokens, idx_t start, id
 		if (sql) {
 			return;
 		}
-		if (previous && JoinsStrings(*previous, token)) {
+		if (literal_items && previous && JoinsStrings(*previous, token)) {
 			throw BinderException("acl admin: a list item is one literal - a string continued on the next line (which "
 			                      "duckdb joins) is not read as one item here yet");
 		}
@@ -2634,7 +2636,11 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 				} else if (span.kind == MgmtParsed::TextKind::CLAIMS) {
 					value = ClaimsListText(text, tokens, span.start, span.end);
 				} else {
-					value = ListText(text, tokens, span.start, span.end, span.sql);
+					auto kind = span.kind;
+					value = ListText(text, tokens, span.start, span.end, span.sql,
+					                 kind == MgmtParsed::TextKind::ITEMS || kind == MgmtParsed::TextKind::REQUIRE ||
+					                     kind == MgmtParsed::TextKind::ATTRIBUTES ||
+					                     kind == MgmtParsed::TextKind::CLAIM_MAP);
 				}
 				parsed.texts.push_back(MgmtParsed::TextArg {span.arg, std::move(value), span.kind, span.splice});
 			}

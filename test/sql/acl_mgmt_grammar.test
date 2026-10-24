@@ -1319,6 +1319,19 @@ SELECT string_agg(vname, ',') FROM aclcat.acl.role_object_caps WHERE role = 'gra
 ----
 t
 
+# a mask is SQL: a string continued on the next line is duckdb's to join, kept as written
+statement ok
+ACL ADMIN GRANT TABLE granted.t TO ROLE grantee WITH (select) RLS (a > 1) COLUMNS (a = 1 + length('X'
+'Y'));
+
+query I
+SELECT replace("columns", chr(10), '|') FROM aclcat.acl.role_object_caps WHERE role = 'grantee' AND vname = 't';
+----
+a = 1 + length('X'|'Y')
+
+statement ok
+ACL ADMIN GRANT TABLE granted.t TO ROLE grantee WITH (select) RLS (a > 1) COLUMNS (a);
+
 # a WITH item that is no name, MAIN on an object, a quoted columns list with a comment in it
 statement error
 ACL ADMIN GRANT CATALOG granted TO ROLE grantee WITH ('insert');

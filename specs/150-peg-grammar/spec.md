@@ -281,8 +281,12 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   `ATTRIBUTES` / `CLAIM MAP` (both the attributes) are one clause each (a repeated one wrote its key twice into the
   spec JSON and the last took effect: `ATTRIBUTES (tenant = CONSTANT 'acme') CLAIM MAP (tid => tenant)` read
   `tenant` from the token); comments inside these forms after their first words (one after `CREATE` / `ALTER` /
-  `DROP` is 3g's classification); `""` the tokenizer's; a list item continued on the next line refused (duckdb joins
-  `'rol'⏎'es'`, the list's reader stored `rol'⏎'es`) - in the claims lists of 3b too. 3e's review also found two
+  `DROP` is 3g's classification); `""` the tokenizer's; an item continued on the next line refused where the
+  list's reader takes its items as literals - these lists and 3b's claims lists (duckdb joins `'rol'⏎'es'`, the
+  reader stored `rol'⏎'es`); a mask or a REMAP item is SQL, read by duckdb, joined. Two literals with no separator
+  (`('a' 'b')`, a claims list's missing comma) are still read as one item, wrongly and closed - the lists as rules
+  (stage 4); the function forms take a spec JSON as written (a key twice, `attributes` with `claim_map` - the last
+  wins), never read by an authorizer. 3e's review also found two
   holes of spec 117's authorizer (a name written in another case, a batch mapping and granting manage together) -
   spec 152's.
 - 3f: function categories and grants, platform grants, sources, resource groups.

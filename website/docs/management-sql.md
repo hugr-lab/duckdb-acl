@@ -78,11 +78,12 @@ catalog forms refuse.
   token or after its last.
 - A list is written `( … )` or as the legacy quoted csv/JSON string; both are accepted wherever a
   list is taken. `WITH (select, insert)` and `CAPS '{"select": true, "insert": true}'` store the same.
-  In the forms of the virtual catalog's objects, grants, issuers and clients a comment inside a
-  parenthesised list reads as a space, and a list split into items (columns, keys, pairs, parameters,
-  REMAP, TYPES, an issuer's or a client's lists) refuses a `$$…$$` string, an `E'…'` string with a
-  backslash, a backtick name and a string continued on the next line - an RLS predicate takes any
-  literal.
+  In the forms of roles, the virtual catalog's objects, grants, issuers and clients a comment inside a
+  parenthesised list reads as a space, and a list split into items (claims, columns, keys, pairs,
+  parameters, REMAP, TYPES, an issuer's or a client's lists) refuses a `$$…$$` string, an `E'…'`
+  string with a backslash and a backtick name - an RLS predicate takes any literal. Where an item is a
+  value (a role's claims, an issuer's or a client's lists) a string continued on the next line is
+  refused too; a mask or a REMAP item is SQL and duckdb joins it.
 - Keywords are case-insensitive. Statements of a batch are separated by `;`.
 - Write modes on `CREATE`: `CREATE` refuses an existing object, `CREATE OR REPLACE` overwrites,
   `CREATE … IF NOT EXISTS` keeps what is there. The legacy `ADD` forms always upsert. Where a
@@ -406,7 +407,7 @@ ALTER ISSUER <name> DROP FROM SECRET | DROP CLIENT FROM SECRET
 DROP ISSUER [IF EXISTS] <name>
 
 CREATE [OR REPLACE] CLIENT [IF NOT EXISTS] <name> ISSUER <issuer> <client clause> … [FROM SECRET <s> [IN <service>]]
-ALTER CLIENT <name> SET [FROM SECRET <s> [IN <service>]] <client clause> … | DROP FROM SECRET
+ALTER CLIENT <name> SET [FROM SECRET <s> [IN <service>]] [<client clause> …] | DROP FROM SECRET
 DROP CLIENT [IF EXISTS] <name>
 
 <client clause> := AUDIENCES ('<aud>', …) | AZP ('<azp>', …)
