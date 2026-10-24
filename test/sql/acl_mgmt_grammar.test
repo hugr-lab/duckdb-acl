@@ -21,18 +21,18 @@ SET GLOBAL acl_jwks_locations = 'test/idp/';
 # --- a family not moved yet: as its own text, as before ------------------------------------------------------------
 
 statement ok
-ACL ADMIN CREATE VIRTUAL CATALOG grammar_one;
+ACL ADMIN CREATE RESOURCE GROUP grammar_one (window_max 8);
 
 statement ok
-ACL ADMIN CREATE VIRTUAL CATALOG grammar_two; CREATE VIRTUAL CATALOG grammar_three;
+ACL ADMIN CREATE RESOURCE GROUP grammar_two (window_max 8); CREATE RESOURCE GROUP grammar_three (window_max 8);
 
 query I
-SELECT count(*) FROM aclcat.acl.catalogs WHERE vcat LIKE 'grammar_%';
+SELECT count(*) FROM aclcat.acl.resource_groups WHERE "group" LIKE 'grammar_%';
 ----
 3
 
 statement ok
-ACL ADMIN CREATE ROLE grammar_one;
+ACL ADMIN CREATE VIRTUAL CATALOG grammar_one; CREATE ROLE grammar_one;
 
 # --- the operations of a node: rules, the same calls ---------------------------------------------------------------
 
@@ -98,12 +98,14 @@ true
 
 # a batch of a rule's statement and a compiler's
 statement ok
-ACL ADMIN CREATE VIRTUAL CATALOG grammar_four; DRAIN NODE; RESUME NODE;
+ACL ADMIN CREATE VIRTUAL CATALOG grammar_four; CREATE RESOURCE GROUP grammar_four (window_max 8); DRAIN NODE;
+RESUME NODE;
 
-query I
-SELECT count(*) FROM aclcat.acl.catalogs WHERE vcat = 'grammar_four';
+query II
+SELECT (SELECT count(*) FROM aclcat.acl.catalogs WHERE vcat = 'grammar_four'),
+       (SELECT count(*) FROM aclcat.acl.resource_groups WHERE "group" = 'grammar_four');
 ----
-1
+1	1
 
 # --- a form that does not read as its rule says how it is written --------------------------------------------------
 
@@ -538,7 +540,7 @@ SELECT view_sql FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'v'
 ----
 SELECT a /* kept */ FROM phys.main.t
 
-# ... or one quoted string, its value; a body that starts with a quoted string and goes on is inline
+# ... or one quoted string, its value - the whole body: a clause written after it is refused, never stored as the SQL
 statement ok
 ACL ADMIN ADD VIEW objects.q AS 'SELECT ''x'' AS s';
 
@@ -547,13 +549,23 @@ SELECT view_sql FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'q'
 ----
 SELECT 'x' AS s
 
+statement error
+ACL ADMIN CREATE VIRTUAL VIEW objects.late AS 'SELECT 1 AS a' COMMENT 'x';
+----
+is the whole body
+
+statement error
+ACL ADMIN ADD SCALAR objects.tag(x VARCHAR) MACRO 'acl_arg(1)' || 'x';
+----
+is the whole body
+
 statement ok
-ACL ADMIN CREATE VIRTUAL SCALAR objects.tag(x VARCHAR) AS 'tag:' || acl_arg(1);
+ACL ADMIN CREATE VIRTUAL SCALAR objects.tag(x VARCHAR) AS concat('tag:', acl_arg(1));
 
 query I
 SELECT template FROM aclcat.acl.functions WHERE vcat = 'objects' AND vname = 'tag';
 ----
-'tag:' || acl_arg(1)
+concat('tag:', acl_arg(1))
 
 # a name with a leading digit, a part the tokenizer reads as a number, spaces around a dot
 statement ok
@@ -565,7 +577,7 @@ SELECT vname, phys FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname IN
 9t	phys.main.t
 v1.2	phys.main.t
 
-# a reference, a function's argument substitution, the clauses in any order
+# a reference between objects, the clauses in any order
 statement ok
 ACL ADMIN CREATE VIRTUAL REFERENCE objects.r FROM objects.t TO v ON (a = a) OPTIONAL CARDINALITY one_to_one COMMENT 'r';
 
@@ -574,7 +586,146 @@ SELECT from_vname, to_vname, to_kind, cardinality, comment FROM aclcat.acl.refer
 ----
 t	v	relation	one_to_one	r
 
+# a table function and a reference that substitutes its argument; ON EXPRESSION; an endpoint with its catalog
+statement ok
+ACL ADMIN ADD TABLE FUNCTION objects.tf(x INTEGER) RETURNS TABLE (a INTEGER) MACRO SELECT a FROM phys.main.t WHERE a = acl_arg(1);
+CREATE VIRTUAL REFERENCE objects.rf FROM objects.t TO FUNCTION objects.tf(x => a) JOIN asof;
+CREATE VIRTUAL REFERENCE objects.re FROM t TO objects.v ON EXPRESSION 't.a = v.a';
+
+query IIIII
+SELECT name, from_vname, to_vname, to_kind, coalesce(expr, '') FROM aclcat.acl.references WHERE vcat = 'objects'
+    AND name IN ('rf', 're') ORDER BY name;
+----
+re	t	v	relation	t.a = v.a
+rf	t	tf	function	(empty)
+
+query II
+SELECT "column", param FROM aclcat.acl.reference_columns WHERE vcat = 'objects' AND name = 'rf';
+----
+a	x
+
+# schemas: the live alias (AS), the expansion (FROM, the legacy quoted path), the ADD form
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA objects.live AS phys.main COMMENT 'l'; CREATE VIRTUAL SCHEMA objects.copy FROM 'phys.main';
+ADD SCHEMA phys.main AS objects.old;
+
+query III
+SELECT path, coalesce(phys_path, '-'), coalesce(comment, '') FROM aclcat.acl.schemas WHERE vcat = 'objects' ORDER BY path;
+----
+copy	-	(empty)
+live	phys.main	l
+old	phys.main	(empty)
+
+# aliases: ALIAS, ALIAS OF, a comment before and after it (the last one written wins)
+statement ok
+ACL ADMIN ADD SCALAR objects.lo ALIAS lower; ADD TABLE FUNCTION objects.rng ALIAS OF range;
+CREATE VIRTUAL SCALAR objects.up COMMENT 'a' ALIAS OF upper COMMENT 'b';
+
+query IIII
+SELECT vname, form, target, coalesce(comment, '') FROM aclcat.acl.functions WHERE vcat = 'objects'
+    AND vname IN ('lo', 'rng', 'up') ORDER BY vname;
+----
+lo	alias	lower	(empty)
+rng	alias	range	(empty)
+up	alias	upper	b
+
+# the legacy quoted forms: a whole path, a columns list, an RLS predicate, a key
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE objects.lg AS 'phys.main.t' COLUMNS 'a, "b"' RLS 'a > 0' PRIMARY KEY 'a';
+
+query II
+SELECT phys, rls FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'lg';
+----
+phys.main.t	a > 0
+
+query II
+SELECT (SELECT string_agg(name, ',' ORDER BY pos) FROM aclcat.acl.relation_columns WHERE vcat = 'objects' AND vname = 'lg'),
+       (SELECT string_agg("column", ',' ORDER BY pos) FROM aclcat.acl.keys WHERE vcat = 'objects' AND vname = 'lg');
+----
+a,b	a
+
+# a view's declared columns, its key and comment in either order
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW objects.vk (a INTEGER) COMMENT 'c' PRIMARY KEY (a) AS SELECT a FROM phys.main.t;
+
+query III
+SELECT (SELECT string_agg(name || ' ' || type, ',') FROM aclcat.acl.object_columns WHERE vcat = 'objects' AND vname = 'vk'),
+       (SELECT string_agg("column", ',') FROM aclcat.acl.keys WHERE vcat = 'objects' AND vname = 'vk'),
+       (SELECT comment FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'vk');
+----
+a INTEGER	a	c
+
+# the modes: IF NOT EXISTS keeps what is there, OR REPLACE overwrites, a plain CREATE refuses an existing one
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE IF NOT EXISTS objects.lg AS phys.main.t RLS (a > 5);
+
+query I
+SELECT rls FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'lg';
+----
+a > 0
+
+statement ok
+ACL ADMIN CREATE OR REPLACE VIRTUAL TABLE objects.lg AS phys.main.t RLS (a > 5);
+
+query I
+SELECT rls FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'lg';
+----
+a > 5
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE objects.lg AS phys.main.t;
+----
+already exists
+
+# a `$$…$$` string in a body is one literal, whatever it holds
+statement ok
+ACL ADMIN ADD VIEW objects.d AS SELECT $$a;b$$ AS x;
+
+query I
+SELECT view_sql FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'd';
+----
+SELECT $$a;b$$ AS x
+
+# a quoted part keeps its case; a path written otherwise is no path
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE objects."Mixed Case" AS phys.main.t;
+
+query I
+SELECT vname FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'Mixed Case';
+----
+Mixed Case
+
 # --- an object form that does not read as its rule says how it is written ------------------------------------------
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE objects."a"b AS phys.main.t;
+----
+write CREATE [OR REPLACE] VIRTUAL TABLE
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE objects..t AS phys.main.t;
+----
+write CREATE [OR REPLACE] VIRTUAL TABLE
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCALAR objects.s RETURNS TABLE (x INTEGER) AS 1;
+----
+a scalar RETURNS one type
+
+statement error
+ACL ADMIN CREATE VIRTUAL SCALAR objects.s RETURNS TABLE (x INTEGER) ALIAS OF upper;
+----
+a scalar RETURNS one type
+
+statement error
+ACL ADMIN CREATE VIRTUAL CATALOG c2 COMMENT 'x' extra;
+----
+write CREATE [OR REPLACE] VIRTUAL CATALOG
+
+statement error
+ACL ADMIN CREATE VIRTUAL GADGET objects.g;
+----
+write CREATE [OR REPLACE] VIRTUAL CATALOG | REFERENCE
 
 statement error
 ACL ADMIN CREATE VIRTUAL TABLE objects.nothing;
@@ -608,6 +759,50 @@ ACL ADMIN CREATE VIRTUAL TABLE objects.dollar AS phys.main.t RLS (a = $, b > 0);
 does not read as written
 
 query I
-SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname IN ('nothing', 'dollar');
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname IN ('nothing', 'dollar', 'late');
 ----
 0
+
+# an alias form still judges what it does not store: a table function's RETURNS, a key written as a plain literal
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION objects.fa RETURNS INTEGER ALIAS OF range;
+----
+RETURNS TABLE needs a column list
+
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE FUNCTION objects.fa RETURNS TABLE (a INTEGER) PRIMARY KEY E'a' ALIAS OF range;
+----
+key columns
+
+# a dollar-quoted string nobody closed is one literal to the end of the text to duckdb's tokenizer: it would take the
+# statements after it into the body (`AS SELECT $x$ AS a; DROP ROLE …` stored the DROP as the view's SQL) - refused
+statement error
+ACL ADMIN CREATE VIRTUAL VIEW objects.dz AS SELECT $x$ AS a; DROP ROLE grammar_one;
+----
+an unterminated quoted string
+
+query II
+SELECT (SELECT count(*) FROM aclcat.acl.roles WHERE role = 'grammar_one'),
+       (SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'dz');
+----
+1	0
+
+# a line comment between two quoted strings ends the line as a line break does - they stay one string
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE objects.joined AS phys.main.t RLS (tenant = 'a' -- the first half
+'b');
+
+query I
+SELECT rls = 'tenant = ''a''' || chr(10) || '''b''' FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'joined';
+----
+true
+
+# a list our readers split takes '...' literals only: `$$x, b, y$$` is one literal to the tokenizer, three columns to
+# the reader (an RLS predicate is SQL, read by duckdb's parser: any literal)
+statement error
+ACL ADMIN CREATE VIRTUAL TABLE objects.split AS phys.main.t COLUMNS (a, $$x, b, y$$);
+----
+a list is written with '...' literals
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE objects.dollar_rls AS phys.main.t RLS (tenant <> $$x, y$$);

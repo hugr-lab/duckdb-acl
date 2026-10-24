@@ -86,9 +86,9 @@ inline string ValueOf(PEGTransformer &transformer, ParseResult &result, optional
 	return transformer.Transform<string>(base);
 }
 
-//! The token starting at `offset`, or none - the tokens come in text order, so it is a binary search (a batch of
-//! many statements asks once per quoted value)
-inline optional_idx TokenIndexAt(const TokenIterator &tokens, idx_t offset) {
+//! The first token starting at or after `offset` (Size() when none) - the tokens come in text order, so it is a binary
+//! search (a batch of many statements asks once per quoted value)
+inline idx_t FirstTokenFrom(const TokenIterator &tokens, idx_t offset) {
 	idx_t low = 0;
 	idx_t high = tokens.Size();
 	while (low < high) {
@@ -99,6 +99,12 @@ inline optional_idx TokenIndexAt(const TokenIterator &tokens, idx_t offset) {
 			high = middle;
 		}
 	}
+	return low;
+}
+
+//! The token starting at `offset`, or none
+inline optional_idx TokenIndexAt(const TokenIterator &tokens, idx_t offset) {
+	auto low = FirstTokenFrom(tokens, offset);
 	if (low < tokens.Size() && tokens.GetToken(low).offset == offset &&
 	    tokens.GetToken(low).type != TokenType::END_OF_INPUT) {
 		return low;

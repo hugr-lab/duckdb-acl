@@ -69,13 +69,13 @@ catalog forms refuse.
   so it never reads as two levels. Lineage names a dataset by the same key rules
   (`Sales Mart.main.Order Items`, `c."a.b".Sink`).
 - Quoted values take `'…'` or `"…"`; a doubled quote is a literal one.
-- A body (after `AS` or `MACRO`) is either one quoted string or written inline to the end of the
-  statement: a `;` inside a literal (a `$$…$$` string too) does not end it, one outside does. An
-  inline body keeps its own comments, not one after its last token; a body that starts with a quoted
-  string and goes on is inline (`AS 'tag:' || acl_arg(1)`).
+- A body (after `AS` or `MACRO`) is either one quoted string - the whole body, nothing after it - or
+  written inline to the end of the statement: a `;` inside a literal does not end it, one outside
+  does. In `CREATE VIRTUAL …` and `ADD …` a `$$…$$` string is a literal too, and an inline body keeps
+  the comments inside it, not one before its first token or after its last.
 - A list is written `( … )` or as the legacy quoted csv/JSON string; both are accepted wherever a
   list is taken. `WITH (select, insert)` and `CAPS '{"select": true, "insert": true}'` store the same.
-  A comment inside a parenthesised list reads as a space.
+  In `CREATE VIRTUAL …` and `ADD …` a comment inside a parenthesised list reads as a space.
 - Keywords are case-insensitive. Statements of a batch are separated by `;`.
 - Write modes on `CREATE`: `CREATE` refuses an existing object, `CREATE OR REPLACE` overwrites,
   `CREATE … IF NOT EXISTS` keeps what is there. The legacy `ADD` forms always upsert. Where a

@@ -50,11 +50,13 @@ struct MgmtParseData : ParserExtensionParseData {
 	vector<QuotedValue> bare;
 	//! arguments written as a list or a body: read as text once the batch's tokens are known (a parenthesised list
 	//! inside its parentheses, a body its first token to its last) - or, written as a quoted string, its value
-	enum class SpanKind : uint8_t { CLAIMS, LIST, BODY };
 	struct Span {
 		idx_t arg;
-		SpanKind span_kind;
-		MgmtParsed::ListKind list_kind;
+		MgmtParsed::TextKind kind;
+		bool body = false;
+		//! SQL read by duckdb's parser (an RLS predicate, a body) - any literal; a list our readers split takes
+		//! `'…'` literals only
+		bool sql = false;
 		idx_t start = 0;
 		idx_t end = 0;
 		bool resolved = false;
@@ -113,8 +115,14 @@ string LevelWord(PEGTransformer &transformer, ParseResult &result, const char *w
 
 // --- the values a management statement holds ---------------------------------------------------------------------
 
+//! A double-quoted name's text, `""` a quote - what the compiler's scanner took
+string UnquoteName(const string &text) {
+	return StringUtil::Replace(text.substr(1, text.size() - 2), "\"\"", "\"");
+}
+
 //! One token of a kind the management compiler's scanner read: a word (ASCII letters, digits, `_` - a keyword too),
-//! a double-quoted name, either, words joined by `.` - or, inside a parenthesised list, any token but a parenthesis.
+//! a double-quoted name, either, words joined by `.`, a path (identifiers joined by `.`) - or, inside a parenthesised
+//! list, any token but a parenthesis.
 //! The scanner read a word whole where duckdb's tokenizer splits it at a leading digit (`9abc` is `9` `abc`, `0x1F` is
 //! `0` `x1F`): a word is the run of word tokens with nothing between them. The tokenizer also reads a number through
 //! its dots (`v2.0.1` is `v2` `.0.1`, `9.x` is `9.` `x`): a dotted name is the run of tokens of word characters and
@@ -235,9 +243,9 @@ private:
 				break; // neither touching nor meeting at a dot: the path ended
 			}
 			if (IsQuotedName(token)) {
-				auto name = StringUtil::Replace(token.text.substr(1, token.text.size() - 2), "\"\"", "\"");
+				auto name = UnquoteName(token.text);
 				if (in_word || after_quoted || name.empty()) {
-					return MatcherResult::Failure(); // `a"b"`, `"a""b"` written apart, an empty part
+					return MatcherResult::Failure(); // `a"b"` (a word touching a quoted part)
 				}
 				parts.push_back(std::move(name));
 				after_quoted = true;
@@ -330,11 +338,6 @@ const TokenParseResult &TokenOf(ParseResult &result) {
 	return node.get().Cast<TokenParseResult>();
 }
 
-//! A double-quoted name's text, `""` a quote - what the compiler's scanner took
-string UnquoteName(const string &text) {
-	return StringUtil::Replace(text.substr(1, text.size() - 2), "\"\"", "\"");
-}
-
 //! `AclName <- AclNameToken`: one SQL identifier as the compiler's `Ident` read it - a word, or a double-quoted
 //! name with `""` for a quote; never empty
 string NameOf(ParseResult &result, const char *what) {
@@ -364,6 +367,18 @@ string NameValueOf(PEGTransformer &transformer, ParseResult &result, const char 
 	return entry.value;
 }
 
+//! Where a repetition of tokens (`AclTailToken+`) stands: its first token's start, its last token's end
+void RepeatSpan(ParseResult &result, idx_t &start, idx_t &end, const char *what) {
+	vector<reference<ParseResult>> parts;
+	grammar::Collect(Strip(result), parts);
+	if (parts.empty() || !parts.front().get().offset.IsValid() || !parts.back().get().offset.IsValid() ||
+	    !parts.back().get().length.IsValid()) {
+		throw ParserException("acl admin: %s has no position", what);
+	}
+	start = parts.front().get().offset.GetIndex();
+	end = parts.back().get().offset.GetIndex() + parts.back().get().length.GetIndex();
+}
+
 //! A new argument of the call, its index
 idx_t AddArg(MgmtParseData &data, Value value = Value(string())) {
 	data.args.push_back(std::move(value));
@@ -371,19 +386,21 @@ idx_t AddArg(MgmtParseData &data, Value value = Value(string())) {
 }
 
 //! `AclParenList <- '(' AclListItem* ')'` into argument `arg`: its text between the parentheses, read once the
-//! batch's tokens are known
-void ParensInto(ParseResult &result, idx_t arg, MgmtParseData::SpanKind span_kind, MgmtParsed::ListKind list_kind,
-                MgmtParseData &data) {
+//! batch's tokens are known (no argument: judged, not stored - what an alias form does not keep)
+void ParensInto(ParseResult &result, optional_idx arg, MgmtParsed::TextKind kind, bool sql, MgmtParseData &data) {
 	auto &list = Strip(result).Cast<ListParseResult>();
 	auto &open = list.GetChild(0);
 	auto &close = list.GetChild(list.GetChildren().size() - 1);
 	if (!open.offset.IsValid() || !close.offset.IsValid()) {
 		throw ParserException("acl admin: a list has no position");
 	}
+	if (!arg.IsValid()) {
+		return; // its tokens are judged with the batch's
+	}
 	MgmtParseData::Span span;
-	span.arg = arg;
-	span.span_kind = span_kind;
-	span.list_kind = list_kind;
+	span.arg = arg.GetIndex();
+	span.kind = kind;
+	span.sql = sql;
 	span.start = open.offset.GetIndex() + 1;
 	span.end = close.offset.GetIndex();
 	data.spans.push_back(std::move(span));
@@ -393,34 +410,34 @@ void ParensInto(ParseResult &result, idx_t arg, MgmtParseData::SpanKind span_kin
 void OptionalParensInto(ListParseResult &list, idx_t index, idx_t arg, MgmtParseData &data) {
 	auto &part = list.Child<OptionalParseResult>(index);
 	if (part.HasResult()) {
-		ParensInto(part.GetResult(), arg, MgmtParseData::SpanKind::LIST, MgmtParsed::ListKind::TEXT, data);
+		ParensInto(part.GetResult(), arg, MgmtParsed::TextKind::TEXT, false, data);
 	}
 }
 
 //! `AclList <- AclParenList / AclQuotedValue` into argument `arg`: a list as written, or the legacy quoted string -
-//! both to the compiler's reader of that kind (a quoted claims list is the stored csv as it stands)
-void ListInto(PEGTransformer &transformer, ParseResult &result, idx_t arg, MgmtParsed::ListKind kind, const char *what,
-              MgmtParseData &data) {
+//! both to the compiler's reader of that kind (a quoted claims list is the stored csv as it stands); `sql` for a
+//! list duckdb's parser reads (an RLS predicate), which may hold any literal
+void ListInto(PEGTransformer &transformer, ParseResult &result, optional_idx arg, MgmtParsed::TextKind kind, bool sql,
+              const char *what, MgmtParseData &data) {
 	auto &node = Strip(result);
 	if (node.Name() == "AclParenList") {
-		ParensInto(node, arg,
-		           kind == MgmtParsed::ListKind::CLAIMS ? MgmtParseData::SpanKind::CLAIMS
-		                                                : MgmtParseData::SpanKind::LIST,
-		           kind, data);
+		ParensInto(node, arg, kind, sql, data);
 		return;
 	}
 	QuotedValue entry;
 	entry.value = ValueOf(transformer, node, entry.offset);
 	entry.what = what;
 	data.quoted.push_back(entry);
-	if (kind == MgmtParsed::ListKind::CLAIMS) {
-		data.args[arg] = Value(entry.value);
+	if (!arg.IsValid()) {
+		return;
+	}
+	if (kind == MgmtParsed::TextKind::CLAIMS) {
+		data.args[arg.GetIndex()] = Value(entry.value);
 		return;
 	}
 	MgmtParseData::Span span;
-	span.arg = arg;
-	span.span_kind = MgmtParseData::SpanKind::LIST;
-	span.list_kind = kind;
+	span.arg = arg.GetIndex();
+	span.kind = kind;
 	span.resolved = true;
 	span.text = entry.value;
 	data.spans.push_back(std::move(span));
@@ -428,24 +445,18 @@ void ListInto(PEGTransformer &transformer, ParseResult &result, idx_t arg, MgmtP
 
 //! `AclClaims <- AclParenList / AclQuotedValue` into argument `arg`
 void ClaimsInto(PEGTransformer &transformer, ParseResult &result, idx_t arg, MgmtParseData &data) {
-	ListInto(transformer, result, arg, MgmtParsed::ListKind::CLAIMS, "claims list", data);
+	ListInto(transformer, result, arg, MgmtParsed::TextKind::CLAIMS, false, "claims list", data);
 }
 
 //! `AclBody <- AclTailToken+` into argument `arg`: a body written either way - inline to the end of the statement
 //! (what a human writes) or as one quoted string (what a gateway generates), read once the tokens are known
 void BodyInto(ParseResult &result, idx_t arg, const char *what, MgmtParseData &data) {
-	vector<reference<ParseResult>> parts;
-	grammar::Collect(Strip(result), parts);
-	if (parts.empty() || !parts.front().get().offset.IsValid() || !parts.back().get().offset.IsValid() ||
-	    !parts.back().get().length.IsValid()) {
-		throw ParserException("acl admin: a body has no position");
-	}
 	MgmtParseData::Span span;
 	span.arg = arg;
-	span.span_kind = MgmtParseData::SpanKind::BODY;
-	span.list_kind = MgmtParsed::ListKind::TEXT;
-	span.start = parts.front().get().offset.GetIndex();
-	span.end = parts.back().get().offset.GetIndex() + parts.back().get().length.GetIndex();
+	span.kind = MgmtParsed::TextKind::TEXT;
+	span.body = true;
+	span.sql = true;
+	RepeatSpan(result, span.start, span.end, "a body");
 	span.what = what;
 	data.spans.push_back(std::move(span));
 }
@@ -558,14 +569,21 @@ string OptionalKeyword(ListParseResult &list, idx_t index) {
 	return part.HasResult() ? KeywordOf(part.GetResult()) : string();
 }
 
+//! `'CREATE' AclOrReplace? … AclIfNotExists?`: what the statement promises about an existing object (spec 013) -
+//! CREATE refuses to overwrite one, OR REPLACE overwrites, IF NOT EXISTS keeps it
+string CreateMode(ListParseResult &list, idx_t or_replace, idx_t if_not_exists) {
+	string mode = OptionalKeyword(list, or_replace) == "or" ? "replace" : "create";
+	if (OptionalKeyword(list, if_not_exists) == "if" && mode == "create") {
+		mode = "skip";
+	}
+	return mode;
+}
+
 // AclCreateRole <- 'CREATE' AclOrReplace? 'ROLE' AclIfNotExists? AclName AclRoleClaims?
 arena_ptr<TransformResultValue> FinalizeCreateRole(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = Call("acl_define_role");
-	string mode = OptionalKeyword(list, 1) == "or" ? "replace" : "create";
-	if (OptionalKeyword(list, 3) == "if" && mode == "create") {
-		mode = "skip";
-	}
+	auto mode = CreateMode(list, 1, 3);
 	data->args.emplace_back(NameOf(list.GetChild(4), "a role name"));
 	data->args.emplace_back(string());
 	auto &claims = list.Child<OptionalParseResult>(5);
@@ -675,16 +693,6 @@ arena_ptr<TransformResultValue> FinalizeResetViewAs(PEGTransformer &transformer,
 
 // --- the virtual catalog's objects (specs 008, 010, 013, 022, 048) -------------------------------------------------
 
-//! `'CREATE' AclOrReplace? … AclIfNotExists?`: what the statement promises about an existing object (spec 013) -
-//! CREATE refuses to overwrite one, OR REPLACE overwrites, IF NOT EXISTS keeps it
-string CreateMode(ListParseResult &list, idx_t or_replace, idx_t if_not_exists) {
-	string mode = OptionalKeyword(list, or_replace) == "or" ? "replace" : "create";
-	if (OptionalKeyword(list, if_not_exists) == "if" && mode == "create") {
-		mode = "skip";
-	}
-	return mode;
-}
-
 //! The clauses of a repetition at part `index`, each the clause's own result (its keyword says which)
 vector<reference<ParseResult>> Clauses(ListParseResult &list, idx_t index) {
 	vector<reference<ParseResult>> clauses;
@@ -744,7 +752,7 @@ arena_ptr<TransformResultValue> FinalizeCreateReference(PEGTransformer &transfor
 			data->args[expr] =
 			    Value(Quoted(transformer, condition.Cast<ListParseResult>(), 1, "a join expression", *data));
 		} else {
-			ListInto(transformer, condition, pairs, MgmtParsed::ListKind::TEXT, "column pairs", *data);
+			ListInto(transformer, condition, pairs, MgmtParsed::TextKind::TEXT, false, "column pairs", *data);
 		}
 	} else if (!to_function) {
 		throw BinderException("acl admin: a reference between objects needs an ON condition");
@@ -805,15 +813,17 @@ arena_ptr<TransformResultValue> FinalizeCreateView(PEGTransformer &transformer, 
 			data->args[comment] = Value(Quoted(transformer, ClauseList(clause), 1, "comment", *data));
 		} else {
 			// AclPrimaryKey <- 'PRIMARY' 'KEY' AclList
-			ListInto(transformer, ClauseList(clause).GetChild(2), pk, MgmtParsed::ListKind::TEXT, "key columns", *data);
+			ListInto(transformer, ClauseList(clause).GetChild(2), pk, MgmtParsed::TextKind::TEXT, false, "key columns",
+			         *data);
 		}
 	}
 	return MgmtResult(transformer, std::move(data));
 }
 
 //! `AclReturns <- 'RETURNS' AclReturnType` (AclReturnType <- AclReturnsTable / AclWordToken) into argument `arg`: a
-//! scalar's one type word, a table function's column list (TABLE before it optional)
-void ReturnsInto(ListParseResult &list, idx_t index, bool scalar, idx_t arg, MgmtParseData &data) {
+//! scalar's one type word, a table function's column list (TABLE before it optional) - judged also where it is not
+//! kept (no argument: an alias)
+void ReturnsInto(ListParseResult &list, idx_t index, bool scalar, optional_idx arg, MgmtParseData &data) {
 	auto &part = list.Child<OptionalParseResult>(index);
 	if (!part.HasResult()) {
 		return;
@@ -824,7 +834,9 @@ void ReturnsInto(ListParseResult &list, idx_t index, bool scalar, idx_t arg, Mgm
 		if (table) {
 			throw BinderException("acl admin: a scalar RETURNS one type");
 		}
-		data.args[arg] = Value(TokenOf(type).text);
+		if (arg.IsValid()) {
+			data.args[arg.GetIndex()] = Value(TokenOf(type).text);
+		}
 		return;
 	}
 	// AclReturnsTable <- 'TABLE'? AclParenList
@@ -835,8 +847,7 @@ void ReturnsInto(ListParseResult &list, idx_t index, bool scalar, idx_t arg, Mgm
 	if (items.empty()) {
 		throw BinderException("acl admin: RETURNS TABLE needs a column list");
 	}
-	ParensInto(type.Cast<ListParseResult>().GetChild(1), arg, MgmtParseData::SpanKind::LIST, MgmtParsed::ListKind::TEXT,
-	           data);
+	ParensInto(type.Cast<ListParseResult>().GetChild(1), arg, MgmtParsed::TextKind::TEXT, false, data);
 }
 
 // AclCreateFunction <- 'CREATE' AclOrReplace? 'VIRTUAL' AclFunctionKind AclIfNotExists? AclPath AclParenList?
@@ -856,7 +867,13 @@ arena_ptr<TransformResultValue> FinalizeCreateFunction(PEGTransformer &transform
 	auto &definition = Strip(list.GetChild(10)).Cast<ListParseResult>();
 	auto mode = CreateMode(list, 1, 4);
 	if (KeywordOf(definition.GetChild(0)) == "alias") {
-		// AclAliasOf <- 'ALIAS' 'OF' AclPathName AclComment?
+		// AclAliasOf <- 'ALIAS' 'OF' AclPathName AclComment? - an alias keeps no parameters, result or key, but they
+		// are judged as the body form judges them
+		ReturnsInto(list, 7, scalar, optional_idx(), *data);
+		if (pk.HasResult()) {
+			ListInto(transformer, Strip(pk.GetResult()).Cast<ListParseResult>().GetChild(2), optional_idx(),
+			         MgmtParsed::TextKind::TEXT, false, "key columns", *data);
+		}
 		data->function = scalar ? "acl_add_scalar_alias" : "acl_add_table_function_alias";
 		auto target = PathNameOf(transformer, definition.GetChild(2), "a target function", *data);
 		if (definition.Child<OptionalParseResult>(3).HasResult()) {
@@ -878,7 +895,7 @@ arena_ptr<TransformResultValue> FinalizeCreateFunction(PEGTransformer &transform
 		auto key = AddArg(*data);
 		if (pk.HasResult()) {
 			ListInto(transformer, Strip(pk.GetResult()).Cast<ListParseResult>().GetChild(2), key,
-			         MgmtParsed::ListKind::TEXT, "key columns", *data);
+			         MgmtParsed::TextKind::TEXT, false, "key columns", *data);
 		}
 	}
 	return MgmtResult(transformer, std::move(data));
@@ -902,11 +919,12 @@ arena_ptr<TransformResultValue> FinalizeCreateTable(PEGTransformer &transformer,
 		auto keyword = KeywordOf(clause);
 		auto &value = ClauseList(clause);
 		if (keyword == "columns") {
-			ListInto(transformer, value.GetChild(1), columns, MgmtParsed::ListKind::COLUMNS, "columns list", *data);
+			ListInto(transformer, value.GetChild(1), columns, MgmtParsed::TextKind::COLUMNS, false, "columns list",
+			         *data);
 		} else if (keyword == "rls") {
-			ListInto(transformer, value.GetChild(1), rls, MgmtParsed::ListKind::TEXT, "RLS predicate", *data);
+			ListInto(transformer, value.GetChild(1), rls, MgmtParsed::TextKind::TEXT, true, "RLS predicate", *data);
 		} else if (keyword == "primary") {
-			ListInto(transformer, value.GetChild(2), pk, MgmtParsed::ListKind::TEXT, "key columns", *data);
+			ListInto(transformer, value.GetChild(2), pk, MgmtParsed::TextKind::TEXT, false, "key columns", *data);
 		} else {
 			data->args[comment] = Value(Quoted(transformer, value, 1, "comment", *data));
 		}
@@ -948,7 +966,8 @@ arena_ptr<TransformResultValue> FinalizeAddFunction(PEGTransformer &transformer,
 	data->args = {Value(vcat), Value(vname)};
 	auto &definition = Strip(list.GetChild(5)).Cast<ListParseResult>();
 	if (KeywordOf(definition.GetChild(0)) == "alias") {
-		// AclAddAlias <- 'ALIAS' 'OF'? AclPathName
+		// AclAddAlias <- 'ALIAS' 'OF'? AclPathName - the result is judged, not kept
+		ReturnsInto(list, 4, scalar, optional_idx(), *data);
 		data->function = scalar ? "acl_add_scalar_alias" : "acl_add_table_function_alias";
 		data->args.emplace_back(PathNameOf(transformer, definition.GetChild(2), "a target function", *data));
 		return MgmtResult(transformer, std::move(data));
@@ -972,12 +991,12 @@ arena_ptr<TransformResultValue> FinalizeAddTable(PEGTransformer &transformer, Pa
 	auto rls = AddArg(*data);
 	auto &columns_part = list.Child<OptionalParseResult>(5);
 	if (columns_part.HasResult()) {
-		ListInto(transformer, ClauseList(columns_part.GetResult()).GetChild(1), columns, MgmtParsed::ListKind::COLUMNS,
-		         "columns list", *data);
+		ListInto(transformer, ClauseList(columns_part.GetResult()).GetChild(1), columns, MgmtParsed::TextKind::COLUMNS,
+		         false, "columns list", *data);
 	}
 	auto &rls_part = list.Child<OptionalParseResult>(6);
 	if (rls_part.HasResult()) {
-		ListInto(transformer, ClauseList(rls_part.GetResult()).GetChild(1), rls, MgmtParsed::ListKind::TEXT,
+		ListInto(transformer, ClauseList(rls_part.GetResult()).GetChild(1), rls, MgmtParsed::TextKind::TEXT, true,
 		         "RLS predicate", *data);
 	}
 	return MgmtResult(transformer, std::move(data));
@@ -989,15 +1008,7 @@ arena_ptr<TransformResultValue> FinalizeAddTable(PEGTransformer &transformer, Pa
 arena_ptr<TransformResultValue> FinalizeLegacy(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto data = make_uniq<MgmtParseData>();
 	data->legacy = true;
-	vector<reference<ParseResult>> parts;
-	auto &list = parse_result.Cast<ListParseResult>();
-	grammar::Collect(list.GetChild(0), parts);
-	if (parts.empty() || !parts.front().get().offset.IsValid() || !parts.back().get().offset.IsValid() ||
-	    !parts.back().get().length.IsValid()) {
-		throw ParserException("acl admin: a management statement has no position");
-	}
-	data->start = parts.front().get().offset.GetIndex();
-	data->end = parts.back().get().offset.GetIndex() + parts.back().get().length.GetIndex();
+	RepeatSpan(parse_result.Cast<ListParseResult>().GetChild(0), data->start, data->end, "a management statement");
 	return MgmtResult(transformer, std::move(data));
 }
 
@@ -1196,30 +1207,20 @@ public:
 	}
 };
 
+const char *const TILING_REFUSAL = "acl admin: a list or a body does not read as written - its tokens do not tile it";
+
 //! The text of the tokens in [start, end) - a list between its parentheses or a body - refused unless the tokens
 //! tile it as written (only whitespace and comments between them: after a lone `$` duckdb's tokenizer places the next
-//! token at the `$`). A gap that holds a comment is a space when `comments_as_space`, else as written
+//! token at the `$`). A gap that holds a comment is, when `comments_as_space`, a space - a line break for a line
+//! comment, which ends a line as the break does (two quoted strings a line apart are one) - else as written
 string TokensText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool comments_as_space,
                   const string &refusal, const std::function<void(const MatcherToken &)> &judge) {
 	auto refuse = [&refusal]() {
 		throw BinderException(refusal);
 	};
-	idx_t first = 0;
-	{
-		// the first token at or after start (the tokens come in text order)
-		idx_t high = tokens.Size();
-		while (first < high) {
-			auto middle = first + (high - first) / 2;
-			if (tokens.GetToken(middle).offset < start) {
-				first = middle + 1;
-			} else {
-				high = middle;
-			}
-		}
-	}
 	string inside;
 	optional_idx previous_end;
-	for (idx_t index = first; index < tokens.Size(); index++) {
+	for (idx_t index = grammar::FirstTokenFrom(tokens, start); index < tokens.Size(); index++) {
 		auto &token = tokens.GetToken(index);
 		if (token.offset >= end || token.type == TokenType::END_OF_INPUT) {
 			break;
@@ -1233,10 +1234,16 @@ string TokensText(const string &text, const TokenIterator &tokens, idx_t start, 
 			auto gap = text.substr(gap_start, token.offset - gap_start);
 			auto blank = gap;
 			StringUtil::Trim(blank);
-			if (!blank.empty() && !StringUtil::StartsWith(blank, "--") && !StringUtil::StartsWith(blank, "/*")) {
+			if (blank.empty() || !comments_as_space) {
+				if (!blank.empty() && !StringUtil::StartsWith(blank, "--") && !StringUtil::StartsWith(blank, "/*")) {
+					refuse();
+				}
+				inside += gap;
+			} else if (StringUtil::StartsWith(blank, "--") || StringUtil::StartsWith(blank, "/*")) {
+				inside += StringUtil::Contains(gap, "/*") ? " " : "\n";
+			} else {
 				refuse();
 			}
-			inside += blank.empty() || !comments_as_space ? gap : " ";
 		}
 		if (token.offset + token.length > end) {
 			refuse();
@@ -1247,28 +1254,41 @@ string TokensText(const string &text, const TokenIterator &tokens, idx_t start, 
 	return inside;
 }
 
-//! A parenthesised list's text between its parentheses, as written with each comment a space (a comment would
-//! otherwise be read as part of the list: `(a = 1 -- note⏎)` left an open comment in an RLS predicate)
-const char *const TILING_REFUSAL = "acl admin: a list or a body does not read as written - its tokens do not tile it";
-
-string ListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end) {
-	if (start == 0 || text[start - 1] != '(' || end >= text.size() || text[end] != ')') {
-		throw BinderException(TILING_REFUSAL); // a parenthesis placed at another token's offset
-	}
-	return TokensText(text, tokens, start, end, true, TILING_REFUSAL, [](const MatcherToken &) {});
+//! Whether [start, end) is a list's inside: a parenthesis right before it and after it (one placed at another token's
+//! offset is not)
+bool BetweenParentheses(const string &text, idx_t start, idx_t end) {
+	return start > 0 && text[start - 1] == '(' && end < text.size() && text[end] == ')';
 }
 
-//! A claims list's text for the compiler's `ClaimsListToCsv`: a list's (that reader keeps a name and an unquoted value
-//! as written - `custom:tenant`, `-1`). That reader knows `'…'` and `"…"` only: a literal the tokenizer reads
-//! otherwise (`E'…'`, `$$…$$`, a backtick name) would split into other claims than written, so it is refused until
-//! the list is a rule (stage 4)
+//! A parenthesised list's text between its parentheses, as written with each comment a space (a comment would
+//! otherwise be read as part of the list: `(a = 1 -- note⏎)` left an open comment in an RLS predicate). A list our
+//! readers split (`SplitTopLevel` knows `'…'` and `"…"` only) takes `'…'` literals only - `E'…'`, `$$…$$` or a
+//! backtick name would split into other items than written; one duckdb's parser reads (`sql`) any
+string ListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool sql) {
+	if (!BetweenParentheses(text, start, end)) {
+		throw BinderException(TILING_REFUSAL);
+	}
+	return TokensText(text, tokens, start, end, true, TILING_REFUSAL, [sql](const MatcherToken &token) {
+		if (sql) {
+			return;
+		}
+		if ((token.type == TokenType::STRING_LITERAL && (token.text.empty() || token.text[0] != '\'')) ||
+		    (!token.text.empty() && token.text[0] == '`')) {
+			throw BinderException("acl admin: a list is written with '...' literals - E'...', $$...$$ and a backtick "
+			                      "name are not read as one item here yet");
+		}
+	});
+}
+
+//! A claims list's text for the compiler's `ClaimsListToCsv`: a list's, in the words of a claims list (that reader
+//! keeps a name and an unquoted value as written - `custom:tenant`, `-1`)
 string ClaimsListText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end) {
 	const string prefix = "acl admin: a claims list is written as name = 'value' items - ";
 	auto refuse = [&prefix](const char *why) {
 		throw BinderException(prefix + why);
 	};
-	if (start == 0 || text[start - 1] != '(' || end >= text.size() || text[end] != ')') {
-		refuse("its text does not read as written"); // a parenthesis placed at another token's offset
+	if (!BetweenParentheses(text, start, end)) {
+		refuse("its text does not read as written");
 	}
 	return TokensText(
 	    text, tokens, start, end, true, prefix + "its text does not read as written", [&](const MatcherToken &token) {
@@ -1281,14 +1301,21 @@ string ClaimsListText(const string &text, const TokenIterator &tokens, idx_t sta
 	    });
 }
 
-//! A body's text, its first token to its last as written (the comments inside it are the body's own; one after its
-//! last token is not part of it) - or, written as one quoted string, that string's value
+//! A body's text, its first token to its last as written (the comments inside it are the body's own; one before its
+//! first token or after its last is not part of it) - or, written as a quoted string, that string's value: the whole
+//! body, as the compiler's `Body` read it (a clause written after it - `AS 'SELECT 1' COMMENT 'x'` - is refused, never
+//! stored as the body)
 string BodyText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, const string &what) {
 	auto first = TokenIndexAt(tokens, start);
 	if (first.IsValid()) {
 		auto &token = tokens.GetToken(first.GetIndex());
-		bool alone = token.offset + token.length == end;
-		if (alone && !token.text.empty() && (token.text[0] == '\'' || token.text[0] == '"')) {
+		bool quoted = !token.text.empty() && (token.text[0] == '\'' || token.text[0] == '"');
+		if (quoted && token.offset + token.length != end) {
+			throw BinderException("acl admin: %s written quoted is the whole body - nothing may follow it (write it "
+			                      "inline, or a clause before AS)",
+			                      what);
+		}
+		if (quoted) {
 			auto quote = token.text[0];
 			auto value = token.text.size() >= 2 ? token.text.substr(1, token.text.size() - 2) : string();
 			value = StringUtil::Replace(value, string(2, quote), string(1, quote));
@@ -1315,6 +1342,13 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 	ParserTokenizerBehavior behavior(text, *owned);
 	compiled->GetTokenizer().TokenizeInput(behavior);
 	TokenIterator tokens(std::move(owned));
+	for (idx_t index = 0; index < tokens.Size(); index++) {
+		// the tokenizer keeps a dollar-quoted string nobody closed as one literal to the end of the text: it would
+		// take every statement after it into the one it starts (`AS SELECT $x$; REVOKE …` stored the REVOKE as SQL)
+		if (tokens.GetToken(index).unterminated) {
+			throw BinderException("acl admin: an unterminated quoted string - the batch is refused");
+		}
+	}
 	TokenIterator cursor(tokens);
 	Parser parser(inner);
 	vector<MgmtParsed> result;
@@ -1376,14 +1410,14 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 				string value;
 				if (span.resolved) {
 					value = span.text;
-				} else if (span.span_kind == MgmtParseData::SpanKind::CLAIMS) {
-					value = ClaimsListText(text, tokens, span.start, span.end);
-				} else if (span.span_kind == MgmtParseData::SpanKind::LIST) {
-					value = ListText(text, tokens, span.start, span.end);
-				} else {
+				} else if (span.body) {
 					value = BodyText(text, tokens, span.start, span.end, span.what);
+				} else if (span.kind == MgmtParsed::TextKind::CLAIMS) {
+					value = ClaimsListText(text, tokens, span.start, span.end);
+				} else {
+					value = ListText(text, tokens, span.start, span.end, span.sql);
 				}
-				parsed.lists.push_back(MgmtParsed::ListArg {span.arg, std::move(value), span.list_kind});
+				parsed.texts.push_back(MgmtParsed::TextArg {span.arg, std::move(value), span.kind});
 			}
 		}
 		result.push_back(std::move(parsed));

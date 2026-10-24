@@ -58,13 +58,13 @@ struct MgmtParsed {
 	//! arguments written as a list or a body, as text the compiler's readers take as they always did (a list becomes a
 	//! rule in stage 4): a parenthesised claims list for ClaimsListToCsv, a columns list for UnquoteColumnsList, the
 	//! rest as is
-	enum class ListKind : uint8_t { CLAIMS, COLUMNS, TEXT };
-	struct ListArg {
+	enum class TextKind : uint8_t { CLAIMS, COLUMNS, TEXT };
+	struct TextArg {
 		idx_t arg;
 		string text;
-		ListKind kind;
+		TextKind kind;
 	};
-	vector<ListArg> lists;
+	vector<TextArg> texts;
 };
 
 //! A marker's words as a client writes them: `TRACE`, `LINEAGE JOB`, ...

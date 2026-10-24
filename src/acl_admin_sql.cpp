@@ -86,17 +86,6 @@ string ClaimsListToCsv(const string &list) {
 	return StringUtil::Join(entries, ",");
 }
 
-//! `('api://hugr', 'api://other')` or `(RS256, ES256)` -> the stored csv
-string ValueListToCsv(const string &list) {
-	vector<string> entries;
-	for (auto &item : SplitTopLevel(list, ',')) {
-		if (!item.empty()) {
-			entries.push_back(Unquoted(item));
-		}
-	}
-	return StringUtil::Join(entries, ",");
-}
-
 //! `(tid => tenant, oid => user_id)` -> the stored JSON `{"tid": "tenant", "oid": "user_id"}`
 string ClaimMapToJson(const string &list) {
 	vector<string> entries;
@@ -442,10 +431,8 @@ public:
 //! not read as its rule, said in the form's own words
 [[noreturn]] void RefuseObjectForm(AdminScanner &s, bool add) {
 	auto kind = StringUtil::Lower(s.PeekWord());
-	AdminScanner ahead(s.text);
-	ahead.pos = s.pos;
-	ahead.Accept(kind.c_str());
-	bool function = kind == "scalar" || (kind == "table" && ahead.Accept("function"));
+	s.Accept(kind.c_str());
+	bool function = kind == "scalar" || (kind == "table" && s.Accept("function"));
 	if (add) {
 		if (kind == "view") {
 			RefuseMovedForm("write ADD VIEW <catalog>.<name> [(<columns>)] AS <sql>");
@@ -457,7 +444,10 @@ public:
 			RefuseMovedForm("write ADD SCALAR | TABLE FUNCTION <catalog>.<name>[(<parameters>)] [RETURNS <type> | "
 			                "RETURNS TABLE (<columns>)] MACRO <body> | ALIAS [OF] <function>");
 		}
-		RefuseMovedForm("write ADD TABLE <physical table> AS <catalog>.<name> [COLUMNS (...)] [RLS (...)]");
+		if (kind == "table") {
+			RefuseMovedForm("write ADD TABLE <physical table> AS <catalog>.<name> [COLUMNS (...)] [RLS (...)]");
+		}
+		RefuseMovedForm("write ADD VIEW | SCHEMA | SCALAR | TABLE FUNCTION | TABLE ...");
 	}
 	if (kind == "catalog") {
 		RefuseMovedForm("write CREATE [OR REPLACE] VIRTUAL CATALOG [IF NOT EXISTS] <catalog> [COMMENT '<text>']");
@@ -465,8 +455,8 @@ public:
 	if (kind == "reference") {
 		RefuseMovedForm(
 		    "write CREATE [OR REPLACE] VIRTUAL REFERENCE [IF NOT EXISTS] <catalog>.<name> FROM <object> TO "
-		    "[FUNCTION] <object>[(<arguments>)] [ON (<pairs>) | ON EXPRESSION '<sql>'] [CARDINALITY <kind>] "
-		    "[OPTIONAL] [JOIN <method>] [COMMENT '<text>']");
+		    "<object> ON (<pairs>) | ON EXPRESSION '<sql>' - or TO FUNCTION <function>[(<param> => "
+		    "<column>, ...)] [ON ...] - [CARDINALITY <kind>] [OPTIONAL] [JOIN <method>] [COMMENT '<text>']");
 	}
 	if (kind == "schema") {
 		RefuseMovedForm("write CREATE [OR REPLACE] VIRTUAL SCHEMA [IF NOT EXISTS] <catalog>.<path> AS | FROM <physical "
@@ -481,8 +471,12 @@ public:
 		                "<catalog>.<name>[(<parameters>)] [RETURNS <type> | RETURNS TABLE (<columns>)] [PRIMARY KEY "
 		                "(<columns>)] [COMMENT '<text>'] AS <body> | ALIAS OF <function> [COMMENT '<text>']");
 	}
-	RefuseMovedForm("write CREATE [OR REPLACE] VIRTUAL TABLE [IF NOT EXISTS] <catalog>.<name> AS <physical table> "
-	                "[COLUMNS (...)] [RLS (...)] [PRIMARY KEY (...)] [COMMENT '<text>']");
+	if (kind == "table") {
+		RefuseMovedForm("write CREATE [OR REPLACE] VIRTUAL TABLE [IF NOT EXISTS] <catalog>.<name> AS <physical table> "
+		                "[COLUMNS (...)] [RLS (...)] [PRIMARY KEY (...)] [COMMENT '<text>']");
+	}
+	RefuseMovedForm("write CREATE [OR REPLACE] VIRTUAL CATALOG | REFERENCE | SCHEMA | VIEW | SCALAR | TABLE FUNCTION | "
+	                "TABLE ...");
 }
 
 //! spec 072: a function as a grant or a member names it - `read_parquet`, `lake.main.peek`, a
@@ -1794,15 +1788,15 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 			}
 			continue;
 		}
-		for (auto &list : entry.lists) {
+		for (auto &list : entry.texts) {
 			switch (list.kind) {
-			case MgmtParsed::ListKind::CLAIMS:
+			case MgmtParsed::TextKind::CLAIMS:
 				entry.args[list.arg] = Value(ClaimsListToCsv(list.text));
 				break;
-			case MgmtParsed::ListKind::COLUMNS:
+			case MgmtParsed::TextKind::COLUMNS:
 				entry.args[list.arg] = Value(UnquoteColumnsList(list.text));
 				break;
-			case MgmtParsed::ListKind::TEXT:
+			case MgmtParsed::TextKind::TEXT:
 				entry.args[list.arg] = Value(list.text);
 				break;
 			}

@@ -184,19 +184,29 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   read with the key rules); `List` is `AclList <- AclParenList / AclQuotedValue`, a parenthesised one as written with
   each comment a space (`TokensText`, refused unless the tokens tile it - the lone `$` of 3b); a body is `AclBody <-
   AclTailToken+`: one plain quoted token is its value, anything else the text from its first token to its last as
-  written (its comments kept, one after its last token not). A columns list goes to `UnquoteColumnsList` and a
-  claims list to `ClaimsListToCsv` as before (`MgmtParsed::lists`). Changed: comments are accepted inside these
-  forms, and a list's comment is a space - `RLS (a > 0 -- note⏎)` left an open comment in the stored predicate, which
-  spec 148 refused; an inline body's trailing comment is not stored; a body that starts with a quoted string and goes
-  on (`AS 'tag:' || acl_arg(1)`) is inline (the scanner refused the rest); spaces or a comment around a path's dot are
-  accepted, a leading-digit part is one word (`objects.9t`), `CREATE VIRTUAL CATALOG ""` is the tokenizer's
-  zero-length identifier; a `;` ends a body wherever it stands outside a literal (the scanner kept one inside
-  parentheses: such a body was never one statement), while a `$$…$$` string in a body is one token (the scanner did
-  not know it). Part 2: `ALTER | DROP VIRTUAL …`, `DROP RELATION | REFERENCE`, `COMMENT ON VIRTUAL`, `CHECK`,
+  written (the comments inside it kept). A columns list goes to `UnquoteColumnsList` and a
+  claims list to `ClaimsListToCsv` as before (`MgmtParsed::texts`). Changed: a comment is accepted after `VIRTUAL` /
+  `ADD` (before it the text check that tells management from native SQL still misses it - 3g), and a list's comment
+  is a space - `RLS (a > 0 -- note⏎)` left an open comment in the stored predicate, which spec 148 refused, and a
+  column list stored a column named `/* hidden */ b`; a body's comments before its first token and after its last are
+  not stored; spaces or a comment before a path's dot are accepted (after one they always were); a `""` value
+  (`COMMENT ""`, `RLS ""`, a body `AS ""`) is the tokenizer's zero-length identifier, as in 3b (`''` is the empty
+  text); a `;` ends a body wherever it stands outside a literal (the scanner kept one inside parentheses: such a body
+  was never one statement), while a `$$…$$` string in a body is one token (the scanner did not know it); a name the
+  scanner took as a keyword is a name (`CREATE VIRTUAL CATALOG if`, `CREATE VIRTUAL TABLE function.t`). A body
+  written quoted is still the whole body: `AS 'SELECT 1' COMMENT 'x'` is refused, never stored as the view's SQL.
+  A list our readers split (columns, keys, pairs, parameters, a result's columns - `SplitTopLevel` knows `'…'` and
+  `"…"` only) takes `'…'` literals only, as 3b's claims list: `COLUMNS (a, $$x, b, y$$)` was three columns to the
+  reader where the tokenizer reads one literal; an RLS predicate (SQL, duckdb's parser reads it) takes any. A line
+  comment in a list is a line break, not a space - it ends a line as one does, and two quoted strings a line apart
+  are one. A batch holding a dollar-quoted string nobody closed is refused whole: duckdb's tokenizer keeps it as one
+  literal to the end of the text (`MatcherToken::unterminated`), so `AS SELECT $x$ AS a; DROP ROLE r` stored the DROP
+  as the view's SQL - and never ran it - while the batch answered success (found in review).
+  Part 2: `ALTER | DROP VIRTUAL …`, `DROP RELATION | REFERENCE`, `COMMENT ON VIRTUAL`, `CHECK`,
   `REPAIR`, `ANALYZE VIRTUAL`.
 - 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).
 - 3e: issuers and clients (spec 095).
-- 3f: function categories and grants, platform grants, sources, resource groups, references.
+- 3f: function categories and grants, platform grants, sources, resource groups.
 - 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;
   `AdminScanner` and `SplitBatchText` go; `RegisterMgmtGrammar` becomes rules (hugr-node re-pins).
 
