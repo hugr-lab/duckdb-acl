@@ -200,13 +200,12 @@ ACL ADMIN CREATE VIRTUAL CATALOG grammar_cat;
 statement ok
 ACL ADMIN ALTER RESOURCE GROUP grammar_one SET COMMENT ""; RESUME NODE;
 
-# ... and a moved form's `""` is the tokenizer's zero-length identifier
+# ... and a moved form's `""` is the tokenizer's zero-length identifier (`''` is the empty text)
 statement error
 ACL ADMIN ALTER VIRTUAL CATALOG grammar_cat SET COMMENT "";
 ----
 zero-length delimited identifier
 
-# a moved form's `""` is the tokenizer's zero-length identifier (`''` is the empty text)
 statement error
 ACL ADMIN ALTER ROLE grammar_one SET COMMENT "";
 ----
@@ -939,6 +938,90 @@ statement ok
 ACL ADMIN ANALYZE VIRTUAL CATALOG changes; ANALYZE VIRTUAL TABLE changes.t; ANALYZE VIRTUAL changes.v;
 REPAIR VIRTUAL TABLE changes.t DROP MISSING COLUMNS AND MASKS; REPAIR VIRTUAL TABLE changes.t REMAP (a = a);
 
+# a view's key between SET and DROP; a table function's key is the result's (kind table); ALIAS without OF; a
+# reference's comment by ALTER; ANALYZE of a scalar and of a table function
+statement ok
+ACL ADMIN ALTER VIRTUAL VIEW changes.v SET PRIMARY KEY (a);
+
+query II
+SELECT kind, "column" FROM aclcat.acl.keys WHERE vcat = 'changes';
+----
+relation	a
+
+statement ok
+ACL ADMIN ALTER VIRTUAL VIEW changes.v DROP PRIMARY KEY;
+CREATE VIRTUAL TABLE FUNCTION changes.g(x INTEGER) RETURNS TABLE (a INTEGER) AS SELECT a FROM phys.main.t;
+ALTER VIRTUAL TABLE FUNCTION changes.g SET PRIMARY KEY (a); ALTER VIRTUAL SCALAR changes.s SET ALIAS lower;
+ALTER VIRTUAL REFERENCE changes.r SET COMMENT 'by alter'; ANALYZE VIRTUAL SCALAR changes.s;
+ANALYZE VIRTUAL TABLE FUNCTION changes.g;
+
+query IIII
+SELECT (SELECT string_agg(kind || ':' || "column", ',') FROM aclcat.acl.keys WHERE vcat = 'changes'),
+       (SELECT form || ':' || target FROM aclcat.acl.functions WHERE vcat = 'changes' AND vname = 's'),
+       (SELECT comment FROM aclcat.acl.references WHERE vcat = 'changes' AND name = 'r'),
+       (SELECT count(*) FROM aclcat.acl.keys WHERE vcat = 'changes' AND kind = 'relation');
+----
+table:a	alias:lower	by alter	0
+
+statement ok
+ACL ADMIN ALTER VIRTUAL TABLE FUNCTION changes.g DROP PRIMARY KEY; ALTER VIRTUAL SCALAR changes.s SET MACRO acl_arg(1) * 3;
+
+# a physical path may be the legacy single-quoted whole path wherever one is taken
+statement ok
+ACL ADMIN ALTER VIRTUAL SCHEMA changes.live SET PHYS 'phys.main'; ADD SCHEMA 'phys.main' AS changes.old;
+ADD TABLE 'phys.main.t' AS changes.y;
+
+query II
+SELECT (SELECT string_agg(path || '=' || phys_path, ',' ORDER BY path) FROM aclcat.acl.schemas WHERE vcat = 'changes'),
+       (SELECT phys FROM aclcat.acl.relations WHERE vcat = 'changes' AND vname = 'y');
+----
+live=phys.main,old=phys.main	phys.main.t
+
+# a name the scanner took as a keyword is a name: `TABLE function.x` is table x of catalog `function`, `if` a catalog
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG function; CREATE VIRTUAL TABLE function.x AS phys.main.t;
+COMMENT ON VIRTUAL TABLE function.x IS 'in function'; ANALYZE VIRTUAL TABLE function.x; ANALYZE VIRTUAL function.x;
+ALTER VIRTUAL TABLE function.x SET RLS (a > 1); CREATE VIRTUAL CATALOG if; DROP VIRTUAL CATALOG if;
+
+query II
+SELECT comment, rls FROM aclcat.acl.relations WHERE vcat = 'function' AND vname = 'x';
+----
+in function	a > 1
+
+statement ok
+ACL ADMIN DROP VIRTUAL CATALOG function CASCADE;
+
+# CHECK names what no longer holds - a quoted catalog's, its repair to paste
+statement ok
+CREATE TABLE phys.main.w (a INTEGER, b INTEGER);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG "Sales Mart"; ALTER VIRTUAL CATALOG "Sales Mart" SET COMMENT 'sm';
+CREATE VIRTUAL TABLE "Sales Mart".w AS phys.main.w COLUMNS (a, b);
+
+statement ok
+ALTER TABLE phys.main.w DROP COLUMN b;
+
+query IIIIIII
+ACL ADMIN CHECK VIRTUAL CATALOG "Sales Mart";
+----
+Sales Mart	table	w	NULL	column_missing	declared column "b" reads a source column of that name, which "phys.main.w" no longer has: Binder Error: Referenced column "b" not found in FROM clause!	REPAIR VIRTUAL TABLE "Sales Mart".w REMAP (b = <column>)  -- or DROP MISSING COLUMNS
+
+statement ok
+ACL ADMIN DROP VIRTUAL CATALOG "Sales Mart" CASCADE;
+
+# a block comment nobody closed hides the rest of the batch: refused, whatever else the batch holds (a `""` sends it
+# to the statement-by-statement reading, which used to drop the comment and run the rest)
+statement error
+ACL ADMIN ALTER RESOURCE GROUP grammar_one SET COMMENT ""; COMMENT ON VIRTUAL TABLE changes.t IS 'u'; /* DROP VIRTUAL TABLE changes.y;
+----
+unterminated /* comment
+
+query I
+SELECT comment FROM aclcat.acl.relations WHERE vcat = 'changes' AND vname = 't';
+----
+tab
+
 # a change that does not read as its rule says how it is written
 statement error
 ACL ADMIN ALTER VIRTUAL TABLE changes.t SET MACRO acl_arg(1);
@@ -969,6 +1052,56 @@ statement error
 ACL ADMIN DROP VIRTUAL GADGET changes.g;
 ----
 write DROP VIRTUAL TABLE | VIEW
+
+statement error
+ACL ADMIN ALTER VIRTUAL REFERENCE changes.r SET OPTIONAL;
+----
+write ALTER VIRTUAL REFERENCE
+
+statement error
+ACL ADMIN ALTER VIRTUAL CATALOG changes SET 'x';
+----
+write ALTER VIRTUAL CATALOG
+
+statement error
+ACL ADMIN ALTER VIRTUAL VIEW changes.v SET PHYS phys.main.t;
+----
+write ALTER VIRTUAL VIEW
+
+statement error
+ACL ADMIN ALTER VIRTUAL SCHEMA changes.live REFRESH ALL;
+----
+write ALTER VIRTUAL SCHEMA
+
+statement error
+ACL ADMIN ALTER VIRTUAL TABLE FUNCTION changes.f SET RLS (true);
+----
+write ALTER VIRTUAL SCALAR | TABLE FUNCTION
+
+statement error
+ACL ADMIN DROP VIRTUAL CATALOG changes extra;
+----
+write DROP VIRTUAL CATALOG
+
+statement error
+ACL ADMIN DROP VIRTUAL SCHEMA changes.live RESTRICT;
+----
+write DROP VIRTUAL SCHEMA
+
+statement error
+ACL ADMIN DROP RELATION;
+----
+write DROP RELATION
+
+statement error
+ACL ADMIN DROP REFERENCE changes.r CASCADE;
+----
+write DROP [VIRTUAL] REFERENCE
+
+statement error
+ACL ADMIN ANALYZE VIRTUAL CATALOG changes extra;
+----
+write ANALYZE VIRTUAL CATALOG
 
 # a body a rule reads takes nothing past an unterminated dollar string
 statement error

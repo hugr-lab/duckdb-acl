@@ -1427,7 +1427,7 @@ namespace {
 
 //! Where a comment that opens at `start` ends, as duckdb's tokenizer reads it (spec 150: the batch's split and the
 //! grammar's agree) - a line comment at a line break of either kind, a block comment at the `*/` of its own depth
-idx_t CommentEnd(const string &text, idx_t start) {
+idx_t CommentEnd(const string &text, idx_t start, optional_ptr<bool> open = nullptr) {
 	if (text.compare(start, 2, "--") == 0) {
 		auto end = text.find_first_of("\n\r", start);
 		return end == string::npos ? text.size() : end;
@@ -1444,12 +1444,25 @@ idx_t CommentEnd(const string &text, idx_t start) {
 			i++;
 		}
 	}
+	if (open) {
+		*open = true; // a block comment nobody closed
+	}
 	return text.size();
 }
+
+//! SplitBatchText, and whether a block comment runs open to the end (the split drops it with what it hides)
+vector<string> SplitBatch(const string &text, bool &open_comment);
 
 } // namespace
 
 vector<string> SplitBatchText(const string &text) {
+	bool open_comment = false;
+	return SplitBatch(text, open_comment);
+}
+
+namespace {
+
+vector<string> SplitBatch(const string &text, bool &open_comment) {
 	vector<string> out;
 	string current;
 	idx_t depth = 0;
@@ -1507,7 +1520,7 @@ vector<string> SplitBatchText(const string &text) {
 			}
 		}
 		if ((c == '-' || c == '/') && i + 1 < text.size() && text[i + 1] == (c == '-' ? '-' : '*')) {
-			auto end = CommentEnd(text, i);
+			auto end = CommentEnd(text, i, &open_comment);
 			current += text.substr(i, end - i);
 			i = end - 1;
 			continue;
@@ -1525,6 +1538,8 @@ vector<string> SplitBatchText(const string &text) {
 	flush();
 	return out;
 }
+
+} // namespace
 
 void RefuseRepeatedPrefix(const string &text) {
 	auto statements = SplitBatchText(text);
@@ -1593,7 +1608,16 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		// what is wrong in its own words, as it did
 		ErrorData batch_error(batch_refusal);
 		pieces.clear();
-		for (auto &piece : SplitBatchText(text)) {
+		bool open_comment = false;
+		auto split = SplitBatch(text, open_comment);
+		if (open_comment) {
+			// a block comment nobody closed hides the rest of the text, and the split drops it: never run without it
+			auto info = batch_error.ExtraInfo();
+			info.erase("position");
+			info.erase("location");
+			throw ParserException(info, "unterminated /* comment - the batch is refused");
+		}
+		for (auto &piece : split) {
 			try {
 				for (auto &parsed : grammar.ReadManagement(piece, options)) {
 					pieces.push_back(Piece {std::move(parsed), nullptr});

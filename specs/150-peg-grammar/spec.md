@@ -211,9 +211,15 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   Part 2 (built): `ALTER VIRTUAL CATALOG | REFERENCE | VIEW | TABLE | SCALAR | TABLE FUNCTION | SCHEMA …`,
   `COMMENT ON VIRTUAL …`, `CHECK VIRTUAL CATALOG` (a table call, `MgmtParsed::table_call`), `REPAIR VIRTUAL TABLE`,
   `ANALYZE VIRTUAL …`, `DROP RELATION | [VIRTUAL] REFERENCE`, `DROP VIRTUAL CATALOG | SCHEMA | TABLE | VIEW | SCALAR |
-  TABLE FUNCTION` - one `ObjectChangeInto` for the SET / DROP PRIMARY KEY changes, part 1's paths, lists and bodies.
-  Changed as in part 1 (comments, `""`, lists' literals); a scalar's PRIMARY KEY is refused in its own words (the
-  scanner said `expected alias`).
+  TABLE FUNCTION` - one `ObjectChangeInto` for every SET / DROP change of a view, a table and a function, part 1's
+  paths, lists and bodies. Changed as in part 1 (comments, `""`, the lists' literal rule - REMAP's list too, as a
+  columns list); a scalar's PRIMARY KEY is refused in its own words (the scanner said `expected alias` / `expected
+  set`); a physical path may be the legacy single-quoted string in `ALTER VIRTUAL SCHEMA … SET PHYS`, `ADD SCHEMA`
+  and `ADD TABLE` too, as the notation always said; a table function's COMMENT ON / ANALYZE form is a rule of its own
+  and a kind is read only before a path, so `TABLE function.x` and `ANALYZE VIRTUAL table.t` name catalogs
+  `function` / `table` (the scanner refused them; `CHECK` writes such repairs). On the batch's statement-by-statement
+  reading (a `""` anywhere) a block comment nobody closed refuses the batch, instead of being dropped with what it
+  hides (found in review).
 - 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).
 - 3e: issuers and clients (spec 095).
 - 3f: function categories and grants, platform grants, sources, resource groups.

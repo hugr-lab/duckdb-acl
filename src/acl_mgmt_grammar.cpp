@@ -355,6 +355,11 @@ string NameOf(ParseResult &result, const char *what) {
 	return name;
 }
 
+//! `AclName` naming a catalog, as its key (one identifier: `"Sales Mart"`, `"a.b"`)
+string CatalogKeyOf(ParseResult &result) {
+	return NamePath::QuotePart(NameOf(result, "a catalog name"));
+}
+
 //! `AclNameValue <- StringLiteral / AclDottedToken / Identifier`: a name that is a value (spec 116 §3) as `NameValue`
 //! read it - quoted either way, as written, or words joined by `.`
 string NameValueOf(PEGTransformer &transformer, ParseResult &result, const char *what, MgmtParseData &data) {
@@ -572,6 +577,11 @@ string OptionalKeyword(ListParseResult &list, idx_t index) {
 	return part.HasResult() ? KeywordOf(part.GetResult()) : string();
 }
 
+//! `AclIfExists?` at part `index`: `IF EXISTS` says nothing-to-drop is not an error (spec 010) - "skip", else ''
+string DropMode(ListParseResult &list, idx_t index) {
+	return OptionalKeyword(list, index) == "if" ? "skip" : "";
+}
+
 //! `'CREATE' AclOrReplace? … AclIfNotExists?`: what the statement promises about an existing object (spec 013) -
 //! CREATE refuses to overwrite one, OR REPLACE overwrites, IF NOT EXISTS keeps it
 string CreateMode(ListParseResult &list, idx_t or_replace, idx_t if_not_exists) {
@@ -622,7 +632,7 @@ arena_ptr<TransformResultValue> FinalizeDropRole(PEGTransformer &transformer, Pa
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = Call("acl_drop_role");
 	data->args.emplace_back(NameOf(list.GetChild(3), "a role name"));
-	data->args.emplace_back(OptionalKeyword(list, 2) == "if" ? "skip" : "");
+	data->args.emplace_back(DropMode(list, 2));
 	return MgmtResult(transformer, std::move(data));
 }
 
@@ -712,7 +722,7 @@ ListParseResult &ClauseList(ParseResult &clause) {
 arena_ptr<TransformResultValue> FinalizeCreateCatalog(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = Call("acl_create_catalog");
-	data->args.emplace_back(NamePath::QuotePart(NameOf(list.GetChild(5), "a catalog name")));
+	data->args.emplace_back(CatalogKeyOf(list.GetChild(5)));
 	data->args.emplace_back(OptionalComment(transformer, list, 6, *data));
 	data->args.emplace_back(CreateMode(list, 1, 4));
 	return MgmtResult(transformer, std::move(data));
@@ -955,7 +965,8 @@ arena_ptr<TransformResultValue> FinalizeAddSchema(PEGTransformer &transformer, P
 	auto data = Call("acl_add_schema_alias");
 	string vcat, alias;
 	SplitVirtualName(PathOf(list.GetChild(4)), vcat, alias);
-	data->args = {Value(vcat), Value(alias), Value(PathOf(list.GetChild(2)))};
+	data->args = {Value(vcat), Value(alias),
+	              Value(PathNameOf(transformer, list.GetChild(2), "a physical schema path", *data))};
 	return MgmtResult(transformer, std::move(data));
 }
 
@@ -990,7 +1001,8 @@ arena_ptr<TransformResultValue> FinalizeAddTable(PEGTransformer &transformer, Pa
 	auto data = Call("acl_add_relation");
 	string vcat, vname;
 	SplitVirtualName(PathOf(list.GetChild(4)), vcat, vname);
-	data->args = {Value(vcat), Value(vname), Value(PathOf(list.GetChild(2)))};
+	data->args = {Value(vcat), Value(vname),
+	              Value(PathNameOf(transformer, list.GetChild(2), "a physical table path", *data))};
 	auto columns = AddArg(*data);
 	auto rls = AddArg(*data);
 	auto &columns_part = list.Child<OptionalParseResult>(5);
@@ -1006,19 +1018,13 @@ arena_ptr<TransformResultValue> FinalizeAddTable(PEGTransformer &transformer, Pa
 	return MgmtResult(transformer, std::move(data));
 }
 
-// --- the virtual catalog's objects, changed and dropped (specs 010, 039, 048, 099, 120)
-// --------------------------------
+// --- the objects changed and dropped (specs 010, 039, 048, 099, 120) -----------------------------------------------
 
 //! A virtual name `<catalog>.<name>` at part `index` of a rule, into the call's first two arguments
 void VirtualNameArgs(ListParseResult &list, idx_t index, MgmtParseData &data) {
 	string vcat, vname;
 	SplitVirtualName(PathOf(list.GetChild(index)), vcat, vname);
 	data.args = {Value(vcat), Value(vname)};
-}
-
-//! `AclIfExists?` at part `index`: `IF EXISTS` says nothing-to-drop is not an error (spec 010) - "skip", else ''
-string DropMode(ListParseResult &list, idx_t index) {
-	return OptionalKeyword(list, index) == "if" ? "skip" : "";
 }
 
 // AclAlterReference <- 'ALTER' 'VIRTUAL' 'REFERENCE' AclPath 'SET' AclReferenceSet (spec 120) - AclReferenceSet <-
@@ -1039,7 +1045,7 @@ arena_ptr<TransformResultValue> FinalizeAlterReference(PEGTransformer &transform
 arena_ptr<TransformResultValue> FinalizeAlterCatalog(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = Call("acl_alter_catalog");
-	data->args.emplace_back(NamePath::QuotePart(NameOf(list.GetChild(3), "a catalog name")));
+	data->args.emplace_back(CatalogKeyOf(list.GetChild(3)));
 	data->args.emplace_back(Quoted(transformer, ClauseList(list.GetChild(5)), 1, "comment", *data));
 	return MgmtResult(transformer, std::move(data));
 }
@@ -1098,26 +1104,20 @@ void ObjectChangeInto(PEGTransformer &transformer, ParseResult &result, const ch
 		data.args.emplace_back("columns");
 		ListInto(transformer, ClauseList(parts.GetChild(1)).GetChild(1), AddArg(data), MgmtParsed::TextKind::COLUMNS,
 		         false, "columns list", data);
-	} else {
+	} else if (name == "AclSetRls") {
 		// AclSetRls <- 'SET' AclRlsClause
 		data.args.emplace_back("rls");
 		ListInto(transformer, ClauseList(parts.GetChild(1)).GetChild(1), AddArg(data), MgmtParsed::TextKind::TEXT, true,
 		         "RLS predicate", data);
+	} else {
+		throw ParserException("acl admin: an object change no rule names");
 	}
 }
 
-// AclAlterView <- 'ALTER' 'VIRTUAL' 'VIEW' AclPath AclViewChange - SET AS <sql> | SET|DROP PRIMARY KEY | SET TYPES
-arena_ptr<TransformResultValue> FinalizeAlterView(PEGTransformer &transformer, ParseResult &parse_result) {
-	auto &list = parse_result.Cast<ListParseResult>();
-	auto data = make_uniq<MgmtParseData>();
-	VirtualNameArgs(list, 3, *data);
-	ObjectChangeInto(transformer, list.GetChild(4), "relation", "", *data);
-	return MgmtResult(transformer, std::move(data));
-}
-
+// AclAlterView <- 'ALTER' 'VIRTUAL' 'VIEW' AclPath AclViewChange - SET AS <sql> | SET|DROP PRIMARY KEY | SET TYPES;
 // AclAlterTable <- 'ALTER' 'VIRTUAL' 'TABLE' AclPath AclTableChange - SET PHYS | COLUMNS | RLS | TYPES, SET|DROP
 // PRIMARY KEY
-arena_ptr<TransformResultValue> FinalizeAlterTable(PEGTransformer &transformer, ParseResult &parse_result) {
+arena_ptr<TransformResultValue> FinalizeAlterRelation(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = make_uniq<MgmtParseData>();
 	VirtualNameArgs(list, 3, *data);
@@ -1143,15 +1143,15 @@ arena_ptr<TransformResultValue> FinalizeAlterSchema(PEGTransformer &transformer,
 	auto data = make_uniq<MgmtParseData>();
 	VirtualNameArgs(list, 3, *data);
 	auto &change = Strip(list.GetChild(4));
-	if (change.Name() == "AclSetPhysPath") {
-		// AclSetPhysPath <- 'SET' 'PHYS' AclPath
+	if (change.Name() == "AclSetSchemaPhys") {
+		// AclSetSchemaPhys <- 'SET' 'PHYS' AclPathName
 		data->function = "acl_alter_schema_alias";
-		data->args.emplace_back(PathOf(change.Cast<ListParseResult>().GetChild(2)));
+		data->args.emplace_back(
+		    PathNameOf(transformer, change.Cast<ListParseResult>().GetChild(2), "a physical schema path", *data));
 	} else {
 		// AclRefresh <- 'REFRESH' AclPrune?
 		data->function = "acl_refresh_schema_objects";
-		bool prune = KeywordOf(change) == "refresh" && OptionalKeyword(change.Cast<ListParseResult>(), 1) == "prune";
-		data->args.emplace_back(Value::BOOLEAN(prune));
+		data->args.emplace_back(Value::BOOLEAN(OptionalKeyword(change.Cast<ListParseResult>(), 1) == "prune"));
 	}
 	return MgmtResult(transformer, std::move(data));
 }
@@ -1190,7 +1190,7 @@ arena_ptr<TransformResultValue> FinalizeCheckCatalog(PEGTransformer &transformer
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = Call("acl_check_catalog");
 	data->table_call = true;
-	data->args.emplace_back(NamePath::QuotePart(NameOf(list.GetChild(3), "a catalog name")));
+	data->args.emplace_back(CatalogKeyOf(list.GetChild(3)));
 	return MgmtResult(transformer, std::move(data));
 }
 
@@ -1218,15 +1218,20 @@ arena_ptr<TransformResultValue> FinalizeRepairTable(PEGTransformer &transformer,
 arena_ptr<TransformResultValue> FinalizeAnalyzeCatalog(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = Call("acl_refresh_schema");
-	data->args = {Value(NamePath::QuotePart(NameOf(list.GetChild(3), "a catalog name"))), Value("")};
+	data->args = {Value(CatalogKeyOf(list.GetChild(3))), Value("")};
 	return MgmtResult(transformer, std::move(data));
 }
 
-// AclAnalyzeObject <- 'ANALYZE' 'VIRTUAL' AclAnalyzeKind? AclPath - one object's
+// AclAnalyzeObject <- 'ANALYZE' 'VIRTUAL' AclAnalyzeTarget - one object's (AclAnalyzeTarget <- AclAnalyzeFunctionTarget
+// / AclAnalyzeKindTarget / AclPath: the path last, a kind before it or none)
 arena_ptr<TransformResultValue> FinalizeAnalyzeObject(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = Call("acl_refresh_schema");
-	VirtualNameArgs(list, 3, *data);
+	auto &target = Strip(list.GetChild(2));
+	auto &path = target.type == ParseResultType::LIST ? target.Cast<ListParseResult>().GetChild(1) : target;
+	string vcat, vname;
+	SplitVirtualName(PathOf(path), vcat, vname);
+	data->args = {Value(vcat), Value(vname)};
 	return MgmtResult(transformer, std::move(data));
 }
 
@@ -1252,8 +1257,8 @@ arena_ptr<TransformResultValue> FinalizeDropReference(PEGTransformer &transforme
 arena_ptr<TransformResultValue> FinalizeDropCatalog(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = Call("acl_drop_catalog");
-	data->args = {Value(NamePath::QuotePart(NameOf(list.GetChild(4), "a catalog name"))),
-	              Value::BOOLEAN(list.Child<OptionalParseResult>(5).HasResult()), Value(DropMode(list, 3))};
+	data->args = {Value(CatalogKeyOf(list.GetChild(4))), Value::BOOLEAN(list.Child<OptionalParseResult>(5).HasResult()),
+	              Value(DropMode(list, 3))};
 	return MgmtResult(transformer, std::move(data));
 }
 
@@ -1460,17 +1465,17 @@ public:
 		                                         Start<FinalizeCreateTable>));
 		changes.push_back(GrammarChange::AddRule("AclAddView <- 'ADD' 'VIEW' AclPath AclParenList? 'AS' AclBody",
 		                                         Start<FinalizeAddView>));
-		changes.push_back(
-		    GrammarChange::AddRule("AclAddSchema <- 'ADD' 'SCHEMA' AclPath 'AS' AclPath", Start<FinalizeAddSchema>));
+		changes.push_back(GrammarChange::AddRule("AclAddSchema <- 'ADD' 'SCHEMA' AclPathName 'AS' AclPath",
+		                                         Start<FinalizeAddSchema>));
 		changes.push_back(GrammarChange::AddRule("AclAddMacro <- 'MACRO' AclBody"));
 		changes.push_back(GrammarChange::AddRule("AclAddAlias <- 'ALIAS' 'OF'? AclPathName"));
 		changes.push_back(GrammarChange::AddRule("AclAddDefinition <- AclAddMacro / AclAddAlias"));
 		changes.push_back(GrammarChange::AddRule(
 		    "AclAddFunction <- 'ADD' AclFunctionKind AclPath AclParenList? AclReturns? AclAddDefinition",
 		    Start<FinalizeAddFunction>));
-		changes.push_back(
-		    GrammarChange::AddRule("AclAddTable <- 'ADD' 'TABLE' AclPath 'AS' AclPath AclColumnsClause? AclRlsClause?",
-		                           Start<FinalizeAddTable>));
+		changes.push_back(GrammarChange::AddRule(
+		    "AclAddTable <- 'ADD' 'TABLE' AclPathName 'AS' AclPath AclColumnsClause? AclRlsClause?",
+		    Start<FinalizeAddTable>));
 		// the objects changed and dropped
 		changes.push_back(GrammarChange::AddRule("AclRefOptionalSet <- 'OPTIONAL' AclWordToken"));
 		changes.push_back(
@@ -1491,7 +1496,7 @@ public:
 		changes.push_back(GrammarChange::AddRule("AclSetAlias <- 'SET' 'ALIAS' 'OF'? AclPathName"));
 		changes.push_back(GrammarChange::AddRule("AclViewChange <- AclDropKey / AclSetKey / AclSetTypes / AclSetBody"));
 		changes.push_back(GrammarChange::AddRule("AclAlterView <- 'ALTER' 'VIRTUAL' 'VIEW' AclPath AclViewChange",
-		                                         Start<FinalizeAlterView>));
+		                                         Start<FinalizeAlterRelation>));
 		changes.push_back(
 		    GrammarChange::AddRule("AclFunctionChange <- AclDropKey / AclSetKey / AclSetMacro / AclSetAlias"));
 		changes.push_back(
@@ -1500,20 +1505,23 @@ public:
 		changes.push_back(GrammarChange::AddRule(
 		    "AclTableChange <- AclDropKey / AclSetKey / AclSetPhys / AclSetTypes / AclSetColumns / AclSetRls"));
 		changes.push_back(GrammarChange::AddRule("AclAlterTable <- 'ALTER' 'VIRTUAL' 'TABLE' AclPath AclTableChange",
-		                                         Start<FinalizeAlterTable>));
+		                                         Start<FinalizeAlterRelation>));
 		changes.push_back(GrammarChange::AddRule("AclPrune <- 'PRUNE'"));
 		changes.push_back(GrammarChange::AddRule("AclRefresh <- 'REFRESH' AclPrune?"));
-		changes.push_back(GrammarChange::AddRule("AclSetPhysPath <- 'SET' 'PHYS' AclPath"));
-		changes.push_back(GrammarChange::AddRule("AclSchemaChange <- AclRefresh / AclSetPhysPath"));
+		changes.push_back(GrammarChange::AddRule("AclSetSchemaPhys <- 'SET' 'PHYS' AclPathName"));
+		changes.push_back(GrammarChange::AddRule("AclSchemaChange <- AclRefresh / AclSetSchemaPhys"));
 		changes.push_back(GrammarChange::AddRule("AclAlterSchema <- 'ALTER' 'VIRTUAL' 'SCHEMA' AclPath AclSchemaChange",
 		                                         Start<FinalizeAlterSchema>));
 		changes.push_back(
 		    GrammarChange::AddRule("AclCommentReference <- 'COMMENT' 'ON' 'VIRTUAL' 'REFERENCE' AclPath 'IS' "
 		                           "AclQuotedValue",
 		                           Start<FinalizeCommentReference>));
-		changes.push_back(
-		    GrammarChange::AddRule("AclCommentKind <- 'SCHEMA' / 'SCALAR' / AclTableFunctionKind / 'TABLE' / 'VIEW'"));
+		changes.push_back(GrammarChange::AddRule("AclCommentKind <- 'SCHEMA' / 'SCALAR' / 'TABLE' / 'VIEW'"));
 		changes.push_back(GrammarChange::AddRule("AclCommentColumn <- 'COLUMN' AclName"));
+		// a table function's form is a rule of its own: `TABLE function.t` is a table named in catalog `function`
+		changes.push_back(GrammarChange::AddRule("AclCommentFunction <- 'COMMENT' 'ON' 'VIRTUAL' AclTableFunctionKind "
+		                                         "AclPath AclCommentColumn? 'IS' AclQuotedValue",
+		                                         Start<FinalizeCommentObject>));
 		changes.push_back(GrammarChange::AddRule("AclCommentObject <- 'COMMENT' 'ON' 'VIRTUAL' AclCommentKind AclPath "
 		                                         "AclCommentColumn? 'IS' AclQuotedValue",
 		                                         Start<FinalizeCommentObject>));
@@ -1527,9 +1535,13 @@ public:
 		                                         Start<FinalizeRepairTable>));
 		changes.push_back(GrammarChange::AddRule("AclAnalyzeCatalog <- 'ANALYZE' 'VIRTUAL' 'CATALOG' AclName",
 		                                         Start<FinalizeAnalyzeCatalog>));
+		// the kind is read only before a path: `ANALYZE VIRTUAL table.t` names catalog `table`
+		changes.push_back(GrammarChange::AddRule("AclAnalyzeKind <- 'SCALAR' / 'VIEW' / 'TABLE'"));
+		changes.push_back(GrammarChange::AddRule("AclAnalyzeFunctionTarget <- AclTableFunctionKind AclPath"));
+		changes.push_back(GrammarChange::AddRule("AclAnalyzeKindTarget <- AclAnalyzeKind AclPath"));
 		changes.push_back(
-		    GrammarChange::AddRule("AclAnalyzeKind <- 'SCALAR' / 'VIEW' / AclTableFunctionKind / 'TABLE'"));
-		changes.push_back(GrammarChange::AddRule("AclAnalyzeObject <- 'ANALYZE' 'VIRTUAL' AclAnalyzeKind? AclPath",
+		    GrammarChange::AddRule("AclAnalyzeTarget <- AclAnalyzeFunctionTarget / AclAnalyzeKindTarget / AclPath"));
+		changes.push_back(GrammarChange::AddRule("AclAnalyzeObject <- 'ANALYZE' 'VIRTUAL' AclAnalyzeTarget",
 		                                         Start<FinalizeAnalyzeObject>));
 		changes.push_back(GrammarChange::AddRule("AclCascade <- 'CASCADE'"));
 		changes.push_back(GrammarChange::AddRule("AclDropRelation <- 'DROP' 'RELATION' AclIfExists? AclPath",
@@ -1560,7 +1572,8 @@ public:
 		    "AclResetViewAs / AclCreateCatalog / AclCreateReference / AclCreateSchema / AclCreateView / "
 		    "AclCreateFunction / AclCreateTable / AclAddView / AclAddSchema / AclAddFunction / AclAddTable / "
 		    "AclAlterReference / AclAlterCatalog / AclAlterView / AclAlterFunction / AclAlterTable / AclAlterSchema / "
-		    "AclCommentReference / AclCommentObject / AclCheckCatalog / AclRepairTable / AclAnalyzeCatalog / "
+		    "AclCommentReference / AclCommentFunction / AclCommentObject / AclCheckCatalog / AclRepairTable / "
+		    "AclAnalyzeCatalog / "
 		    "AclAnalyzeObject / AclDropRelation / AclDropReference / AclDropCatalog / AclDropSchema / "
 		    "AclDropFunction / AclDropObject / AclMgmtLegacy"));
 		// the batch holds management statements only: duckdb's own are not ours to read here
