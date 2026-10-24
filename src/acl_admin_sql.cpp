@@ -1427,7 +1427,7 @@ namespace {
 
 //! Where a comment that opens at `start` ends, as duckdb's tokenizer reads it (spec 150: the batch's split and the
 //! grammar's agree) - a line comment at a line break of either kind, a block comment at the `*/` of its own depth
-idx_t CommentEnd(const string &text, idx_t start, optional_ptr<bool> open = nullptr) {
+idx_t CommentEnd(const string &text, idx_t start) {
 	if (text.compare(start, 2, "--") == 0) {
 		auto end = text.find_first_of("\n\r", start);
 		return end == string::npos ? text.size() : end;
@@ -1444,25 +1444,12 @@ idx_t CommentEnd(const string &text, idx_t start, optional_ptr<bool> open = null
 			i++;
 		}
 	}
-	if (open) {
-		*open = true; // a block comment nobody closed
-	}
 	return text.size();
 }
-
-//! SplitBatchText, and whether a block comment runs open to the end (the split drops it with what it hides)
-vector<string> SplitBatch(const string &text, bool &open_comment);
 
 } // namespace
 
 vector<string> SplitBatchText(const string &text) {
-	bool open_comment = false;
-	return SplitBatch(text, open_comment);
-}
-
-namespace {
-
-vector<string> SplitBatch(const string &text, bool &open_comment) {
 	vector<string> out;
 	string current;
 	idx_t depth = 0;
@@ -1520,7 +1507,7 @@ vector<string> SplitBatch(const string &text, bool &open_comment) {
 			}
 		}
 		if ((c == '-' || c == '/') && i + 1 < text.size() && text[i + 1] == (c == '-' ? '-' : '*')) {
-			auto end = CommentEnd(text, i, &open_comment);
+			auto end = CommentEnd(text, i);
 			current += text.substr(i, end - i);
 			i = end - 1;
 			continue;
@@ -1538,8 +1525,6 @@ vector<string> SplitBatch(const string &text, bool &open_comment) {
 	flush();
 	return out;
 }
-
-} // namespace
 
 void RefuseRepeatedPrefix(const string &text) {
 	auto statements = SplitBatchText(text);
@@ -1603,36 +1588,18 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 			pieces.push_back(Piece {std::move(parsed), nullptr});
 		}
 	} catch (ParserException &batch_refusal) {
-		// a text duckdb's tokenizer refuses (an empty quoted name, an unterminated string): piece by piece as the batch
-		// splits - each piece the grammar reads is its rules', and the one it refuses goes to the compiler, which says
-		// what is wrong in its own words, as it did
+		// a text duckdb's tokenizer refuses (an empty quoted name): statement by statement as that tokenizer ends them
+		// - never a split of ours, which read quotes and comments otherwise (`$1$`, backticks, `E'\''`) and so could
+		// hide a statement end or an open comment. Each statement the grammar reads is its rules', and the one it
+		// refuses goes to the compiler, which says what is wrong in its own words, as it did
 		ErrorData batch_error(batch_refusal);
 		pieces.clear();
-		bool open_comment = false;
-		auto split = SplitBatch(text, open_comment);
-		if (open_comment) {
-			// a block comment nobody closed hides the rest of the text, and the split drops it: never run without it
-			auto info = batch_error.ExtraInfo();
-			info.erase("position");
-			info.erase("location");
-			throw ParserException(info, "unterminated /* comment - the batch is refused");
-		}
-		for (auto &piece : split) {
+		for (auto &piece : grammar.SplitManagement(text)) {
 			try {
 				for (auto &parsed : grammar.ReadManagement(piece, options)) {
 					pieces.push_back(Piece {std::move(parsed), nullptr});
 				}
 			} catch (ParserException &refusal) {
-				// a piece holding a `;` is never compiled from its text: the split and duckdb's tokenizer may disagree
-				// on where a statement ends (a `;` inside parentheses, a `$1$` the split took for a quote), and a body
-				// would take the statement after it (`SET AS SELECT (1 AS ""; DROP ROLE r)`) - the tokenizer's words
-				// refuse it
-				if (piece.find(';') != string::npos) {
-					auto info = ErrorData(refusal).ExtraInfo();
-					info.erase("position");
-					info.erase("location");
-					throw ParserException(info, ErrorData(refusal).RawMessage());
-				}
 				MgmtParsed parsed;
 				parsed.legacy = true;
 				parsed.text = piece;
@@ -1644,8 +1611,7 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 			reproduced = reproduced || piece.refused;
 		}
 		if (!reproduced) {
-			// no piece holds what the tokenizer refused (an unterminated comment the split dropped as one): the batch
-			// is refused as a whole, never run without it
+			// no statement holds what the tokenizer refused: the batch is refused as a whole, never run without it
 			auto info = batch_error.ExtraInfo();
 			info.erase("position");
 			info.erase("location");

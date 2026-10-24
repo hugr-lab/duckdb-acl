@@ -1011,16 +1011,29 @@ statement ok
 ACL ADMIN DROP VIRTUAL CATALOG "Sales Mart" CASCADE;
 
 # a block comment nobody closed hides the rest of the batch: refused, whatever else the batch holds (a `""` sends it
-# to the statement-by-statement reading, which used to drop the comment and run the rest)
+# to the statement-by-statement reading, whose split of its own dropped the comment and ran the rest) - and the
+# statements are duckdb's: an opener the split took for inside a quote (`$1$`, a backtick name) hides no end
 statement error
 ACL ADMIN ALTER RESOURCE GROUP grammar_one SET COMMENT ""; COMMENT ON VIRTUAL TABLE changes.t IS 'u'; /* DROP VIRTUAL TABLE changes.y;
 ----
-unterminated /* comment
+unterminated
 
-query I
-SELECT comment FROM aclcat.acl.relations WHERE vcat = 'changes' AND vname = 't';
+statement error
+ACL ADMIN GRANT CATALOG changes TO ROLE grammar_one WITH (select, $1$ /* $1$); COMMENT ON VIRTUAL TABLE changes.t IS 'u'; DROP VIRTUAL TABLE changes.y;
 ----
-tab
+unterminated
+
+statement error
+ACL ADMIN GRANT CATALOG changes TO ROLE grammar_one WITH (select, `'` /* '); COMMENT ON VIRTUAL TABLE changes.t IS 'u'; DROP VIRTUAL TABLE changes.y;
+----
+unterminated
+
+query III
+SELECT (SELECT comment FROM aclcat.acl.relations WHERE vcat = 'changes' AND vname = 't'),
+       (SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'changes' AND vname = 'y'),
+       (SELECT count(*) FROM aclcat.acl.role_catalogs WHERE vcat = 'changes');
+----
+tab	1	0
 
 # a change that does not read as its rule says how it is written
 statement error

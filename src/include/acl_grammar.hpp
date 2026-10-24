@@ -16,6 +16,7 @@
 #include "duckdb/parser/parser_options.hpp"
 
 namespace duckdb {
+class CompiledGrammar;
 class GrammarExtension;
 
 namespace acl {
@@ -85,12 +86,17 @@ public:
 	//! spec 150, stage 3: a management batch's statements, each by its rule or as text. Throws a ParserException for a
 	//! text the grammar refuses.
 	vector<MgmtParsed> ReadManagement(const string &text, const ParserOptions &options);
+	//! A management batch's statements as duckdb's tokenizer ends them, for a batch it refuses to read whole (a `""`
+	//! in one statement): each statement's text, first token to last. Throws a ParserException when the text ends
+	//! inside a comment, a string or a quoted name - what it hides is never run without it
+	vector<string> SplitManagement(const string &text);
 
 	//! The rules as a grammar extension, registered so a connection may switch them on for completion
 	//! (`SET active_grammar_extensions = ['acl']`); the override never depends on it being on
 	shared_ptr<GrammarExtension> Extension() const;
 
 private:
+	shared_ptr<CompiledGrammar> ManagementGrammar();
 	struct Impl;
 	unique_ptr<Impl> impl;
 };

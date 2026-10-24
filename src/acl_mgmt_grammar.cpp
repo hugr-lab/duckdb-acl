@@ -1728,6 +1728,75 @@ string BodyText(const string &text, const TokenIterator &tokens, idx_t start, id
 
 } // namespace
 
+namespace {
+
+//! duckdb's tokenizer as the parser runs it, refusing nothing: an empty quoted name is a token, and the text ending
+//! inside a comment, a string or a quoted name is noted (the parser's behavior throws for those)
+class SplitTokenizerBehavior final : public TokenizerBehavior {
+public:
+	SplitTokenizerBehavior(const string &sql, vector<MatcherToken> &tokens) : TokenizerBehavior(sql, tokens) {
+	}
+
+	void PushToken(idx_t start, idx_t end, TokenType type, bool unterminated) override {
+		if (type == TokenType::COMMENT && unterminated) {
+			open = "unterminated /* comment";
+		}
+		TokenizerBehavior::PushToken(start, end, type, unterminated);
+	}
+	void OnStatementEnd(idx_t pos) override {
+		tokens.emplace_back(";", pos, TokenType::TERMINATOR);
+	}
+	void OnLastToken(const Tokenizer &tokenizer, TokenizeState state, string last_word, idx_t last_pos) override {
+		if (state == TokenizeState::STRING_LITERAL) {
+			open = "unterminated string literal";
+		} else if (state == TokenizeState::QUOTED_IDENTIFIER) {
+			open = "unterminated quoted identifier";
+		}
+		TokenizerBehavior::OnLastToken(tokenizer, state, std::move(last_word), last_pos);
+	}
+
+	//! what the text ends inside, in the tokenizer's words ('' when nothing)
+	string open;
+};
+
+} // namespace
+
+vector<string> SplitMgmtStatements(shared_ptr<CompiledGrammar> compiled, const string &text) {
+	vector<MatcherToken> tokens;
+	SplitTokenizerBehavior behavior(text, tokens);
+	compiled->GetTokenizer().TokenizeInput(behavior);
+	auto open = behavior.open;
+	for (auto &token : tokens) {
+		if (open.empty() && token.unterminated) {
+			open = "unterminated quoted string";
+		}
+	}
+	if (!open.empty()) {
+		throw ParserException("acl admin: %s - the batch ends inside it, and what that hides is never run without it",
+		                      open);
+	}
+	vector<string> statements;
+	optional_idx start;
+	idx_t end = 0;
+	auto flush = [&]() {
+		if (start.IsValid()) {
+			statements.push_back(text.substr(start.GetIndex(), end - start.GetIndex()));
+		}
+		start = optional_idx();
+		end = 0;
+	};
+	for (auto &token : tokens) {
+		if (token.type == TokenType::TERMINATOR) {
+			flush();
+		} else if (token.type != TokenType::END_OF_INPUT && token.type != TokenType::END_OF_INPUT_AUTOCOMPLETE) {
+			start = start.IsValid() ? MinValue(start.GetIndex(), token.offset) : token.offset;
+			end = MaxValue(end, token.offset + token.length);
+		}
+	}
+	flush();
+	return statements;
+}
+
 shared_ptr<GrammarExtension> MakeMgmtGrammar() {
 	return make_shared_ptr<AclMgmtGrammar>();
 }
