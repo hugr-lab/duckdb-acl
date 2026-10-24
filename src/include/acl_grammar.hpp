@@ -55,6 +55,8 @@ struct MgmtParsed {
 	vector<Value> args;
 	//! the first argument is the session the batch runs under (`PROFILE SESSION CURRENT`)
 	bool current_session = false;
+	//! the call is a table function, read in FROM (`CHECK VIRTUAL CATALOG`)
+	bool table_call = false;
 	//! arguments written as a list or a body, as text the compiler's readers take as they always did (a list becomes a
 	//! rule in stage 4): a parenthesised claims list for ClaimsListToCsv, a columns list for UnquoteColumnsList, the
 	//! rest as is

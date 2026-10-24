@@ -260,12 +260,12 @@ ACL ADMIN CREATE VIRTUAL SCALAR c.twice AS 'acl_arg(1) * 2';
 statement error
 ACL ADMIN ALTER VIRTUAL SCALAR c.twice SET PRIMARY KEY (value);
 ----
-alias
+a scalar has no PRIMARY KEY
 
 statement error
 ACL ADMIN ALTER VIRTUAL SCALAR c.twice DROP PRIMARY KEY;
 ----
-expected set
+a scalar has no PRIMARY KEY
 
 # 3. a masked column cannot carry the key's NOT NULL implication - the mask may answer NULL
 #    whatever the physical rows hold; an explicit NOT NULL is the admin's own promise and passes

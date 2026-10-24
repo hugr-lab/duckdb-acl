@@ -479,6 +479,64 @@ public:
 	                "TABLE ...");
 }
 
+//! spec 150, stage 3c part 2: ALTER / COMMENT ON / CHECK / REPAIR / ANALYZE / DROP of the objects are rules - one
+//! that reaches here did not read as its rule, said in the form's own words (`s` stands after `VIRTUAL`)
+[[noreturn]] void RefuseObjectChange(AdminScanner &s, const string &verb) {
+	auto kind = StringUtil::Lower(s.PeekWord());
+	s.Accept(kind.c_str());
+	bool function = kind == "scalar" || (kind == "table" && s.Accept("function"));
+	if (verb == "alter") {
+		if (kind == "reference") {
+			RefuseMovedForm("write ALTER VIRTUAL REFERENCE <catalog>.<name> SET COMMENT '<text>' | SET CARDINALITY "
+			                "<kind> | SET OPTIONAL true | false");
+		}
+		if (kind == "catalog") {
+			RefuseMovedForm("write ALTER VIRTUAL CATALOG <catalog> SET COMMENT '<text>'");
+		}
+		if (kind == "view") {
+			RefuseMovedForm("write ALTER VIRTUAL VIEW <catalog>.<name> SET AS <sql> | SET TYPES (...) | SET PRIMARY "
+			                "KEY (...) | DROP PRIMARY KEY");
+		}
+		if (kind == "schema") {
+			RefuseMovedForm("write ALTER VIRTUAL SCHEMA <catalog>.<path> REFRESH [PRUNE] | SET PHYS <physical schema>");
+		}
+		if (function) {
+			RefuseMovedForm("write ALTER VIRTUAL SCALAR | TABLE FUNCTION <catalog>.<name> SET MACRO <body> | SET ALIAS "
+			                "[OF] <function> - a table function also SET PRIMARY KEY (...) | DROP PRIMARY KEY");
+		}
+		if (kind == "table") {
+			RefuseMovedForm(
+			    "write ALTER VIRTUAL TABLE <catalog>.<name> SET PHYS <physical table> | SET COLUMNS (...) | "
+			    "SET RLS (...) | SET TYPES (...) | SET PRIMARY KEY (...) | DROP PRIMARY KEY");
+		}
+		RefuseMovedForm(
+		    "write ALTER VIRTUAL CATALOG | SCHEMA | TABLE | VIEW | SCALAR | TABLE FUNCTION | REFERENCE ...");
+	}
+	if (verb == "drop") {
+		if (kind == "catalog") {
+			RefuseMovedForm("write DROP VIRTUAL CATALOG [IF EXISTS] <catalog> [CASCADE]");
+		}
+		if (kind == "schema") {
+			RefuseMovedForm("write DROP VIRTUAL SCHEMA [IF EXISTS] <catalog>.<path> [CASCADE]");
+		}
+		RefuseMovedForm("write DROP VIRTUAL TABLE | VIEW | SCALAR | TABLE FUNCTION | REFERENCE [IF EXISTS] "
+		                "<catalog>.<name>");
+	}
+	if (verb == "comment") {
+		RefuseMovedForm("write COMMENT ON VIRTUAL TABLE | VIEW | SCHEMA | SCALAR | TABLE FUNCTION <catalog>.<name> "
+		                "[COLUMN <column>] IS '<text>', or COMMENT ON VIRTUAL REFERENCE <catalog>.<name> IS '<text>'");
+	}
+	if (verb == "check") {
+		RefuseMovedForm("write CHECK VIRTUAL CATALOG <catalog>");
+	}
+	if (verb == "repair") {
+		RefuseMovedForm("write REPAIR VIRTUAL TABLE <catalog>.<name> REMAP (<column> = <expression>, ...) | DROP "
+		                "MISSING COLUMNS [AND MASKS]");
+	}
+	RefuseMovedForm("write ANALYZE VIRTUAL CATALOG <catalog>, or ANALYZE VIRTUAL [TABLE | VIEW | SCALAR | TABLE "
+	                "FUNCTION] <catalog>.<name>");
+}
+
 //! spec 072: a function as a grant or a member names it - `read_parquet`, `lake.main.peek`, a
 //! double-quoted operator (`"+"`, `"IS DISTINCT FROM"`) - optionally followed by TABLE (or SCALAR,
 //! the default); the text goes to the admin function as one spec, which parses it once more with
@@ -1305,179 +1363,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		}
 		// the object forms carry the VIRTUAL marker, so they never shadow duckdb's own ALTER
 		s.Expect("virtual");
-		if (s.Accept(
-		        "reference")) { // spec 120: ALTER VIRTUAL REFERENCE c.n SET COMMENT '…' | CARDINALITY x | OPTIONAL t|f
-			string vcat, name;
-			SplitVirtual(s.Dotted("a reference name"), vcat, name);
-			s.Expect("set");
-			if (s.Accept("comment")) {
-				return MakeAdminCall("acl_alter_reference",
-				                     {Value(vcat), Value(name), Value("comment"), Value(s.Quoted("comment"))});
-			}
-			if (s.Accept("cardinality")) {
-				return MakeAdminCall("acl_alter_reference",
-				                     {Value(vcat), Value(name), Value("cardinality"), Value(s.Word("a cardinality"))});
-			}
-			s.Expect("optional");
-			return MakeAdminCall("acl_alter_reference",
-			                     {Value(vcat), Value(name), Value("optional"), Value(s.Word("true or false"))});
-		}
-		if (s.Accept("catalog")) { // ALTER VIRTUAL CATALOG c SET COMMENT '...'
-			auto vcat = s.IdentKey("a catalog name");
-			s.Expect("set");
-			s.Expect("comment");
-			return MakeAdminCall("acl_alter_catalog", {Value(vcat), Value(s.Quoted("comment"))});
-		}
-		if (s.Accept("view")) { // ALTER VIRTUAL VIEW v.n SET AS '...' | SET|DROP PRIMARY KEY (spec 048)
-			string vcat, vname;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			if (s.Accept("drop")) {
-				s.Expect("primary");
-				s.Expect("key");
-				return MakeAdminCall("acl_set_key", {Value(vcat), Value(vname), Value("relation"), Value("")});
-			}
-			s.Expect("set");
-			if (s.Accept("primary")) {
-				s.Expect("key");
-				return MakeAdminCall("acl_set_key",
-				                     {Value(vcat), Value(vname), Value("relation"), Value(s.List("key columns"))});
-			}
-			if (s.Accept("types")) { // spec 099: ALTER VIRTUAL VIEW v.n SET TYPES (aliases = ..., enums = ...)
-				return MakeAdminCall("acl_alter_relation",
-				                     {Value(vcat), Value(vname), Value("types"), Value(s.List("types list"))});
-			}
-			s.Expect("as");
-			return MakeAdminCall("acl_alter_relation",
-			                     {Value(vcat), Value(vname), Value("view"), Value(s.Body("view SQL"))});
-		}
-		if (s.Accept("schema")) { // ALTER VIRTUAL SCHEMA v.path SET PHYS <path> | REFRESH [PRUNE]
-			string vcat, alias;
-			SplitVirtual(s.Dotted("a virtual schema path"), vcat, alias);
-			if (s.Accept("refresh")) {
-				bool prune = s.Accept("prune");
-				return MakeAdminCall("acl_refresh_schema_objects", {Value(vcat), Value(alias), Value::BOOLEAN(prune)});
-			}
-			s.Expect("set");
-			s.Expect("phys");
-			return MakeAdminCall("acl_alter_schema_alias",
-			                     {Value(vcat), Value(alias), Value(s.Dotted("a physical schema path"))});
-		}
-		bool scalar = s.Accept("scalar");
-		if (scalar || s.Accept("table")) {
-			bool table_function = !scalar && s.Accept("function");
-			string vcat, vname;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			if (!scalar && s.Accept("drop")) { // ALTER VIRTUAL ... DROP PRIMARY KEY (spec 048: a scalar has none)
-				s.Expect("primary");
-				s.Expect("key");
-				return MakeAdminCall("acl_set_key", {Value(vcat), Value(vname),
-				                                     Value(string(table_function ? "table" : "relation")), Value("")});
-			}
-			s.Expect("set");
-			if (!scalar && s.Accept("primary")) { // ALTER VIRTUAL ... SET PRIMARY KEY (col, ...)
-				s.Expect("key");
-				return MakeAdminCall("acl_set_key",
-				                     {Value(vcat), Value(vname), Value(string(table_function ? "table" : "relation")),
-				                      Value(s.List("key columns"))});
-			}
-			if (scalar || table_function) { // ALTER VIRTUAL [TABLE FUNCTION|SCALAR] v.n SET MACRO|ALIAS '...'
-				bool is_macro = s.Accept("macro");
-				if (!is_macro) {
-					s.Expect("alias");
-				}
-				if (!is_macro) {
-					s.Accept("of"); // SET ALIAS OF <fn>, like the CREATE form
-				}
-				return MakeAdminCall("acl_alter_function",
-				                     {Value(vcat), Value(vname), Value(scalar ? "scalar" : "table"),
-				                      Value(is_macro ? "macro" : "alias"),
-				                      Value(is_macro ? s.Body("definition") : s.PathName("a target function"))});
-			}
-			// ALTER VIRTUAL TABLE v.n SET PHYS <path> | SET COLUMNS '...' | SET RLS '...'
-			if (s.Accept("phys")) {
-				return MakeAdminCall("acl_alter_relation", {Value(vcat), Value(vname), Value("phys"),
-				                                            Value(s.PathName("a physical table path"))});
-			}
-			if (s.Accept("types")) { // spec 099: SET TYPES (aliases = base|keep|default, enums = ...)
-				return MakeAdminCall("acl_alter_relation",
-				                     {Value(vcat), Value(vname), Value("types"), Value(s.List("types list"))});
-			}
-			if (s.Accept("columns")) {
-				return MakeAdminCall("acl_alter_relation", {Value(vcat), Value(vname), Value("columns"),
-				                                            Value(UnquoteColumnsList(s.List("columns list")))});
-			}
-			s.Expect("rls");
-			return MakeAdminCall("acl_alter_relation",
-			                     {Value(vcat), Value(vname), Value("rls"), Value(s.List("RLS predicate"))});
-		}
-		throw BinderException("acl admin: unknown ALTER VIRTUAL target");
+		RefuseObjectChange(s, "alter");
 	}
-	if (StringUtil::CIEquals(keyword, "comment")) {
-		// COMMENT ON VIRTUAL TABLE|VIEW|SCHEMA|TABLE FUNCTION|SCALAR v.n [COLUMN c] IS '...'
-		s.Expect("on");
-		s.Expect("virtual");
-		if (s.Accept("reference")) { // spec 120
-			string vcat, name;
-			SplitVirtual(s.Dotted("a reference name"), vcat, name);
-			s.Expect("is");
-			return MakeAdminCall("acl_alter_reference",
-			                     {Value(vcat), Value(name), Value("comment"), Value(s.Quoted("comment"))});
-		}
-		bool schema = s.Accept("schema");
-		bool scalar = !schema && s.Accept("scalar");
-		bool table_function = false;
-		if (!schema && !scalar && s.Accept("table")) {
-			table_function = s.Accept("function");
-		} else if (!schema && !scalar) {
-			s.Expect("view");
-		}
-		string vcat, vname;
-		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-		string column;
-		if (s.Accept("column")) {
-			column = s.Ident("a column name");
-		}
-		s.Expect("is");
-		auto comment = s.Quoted("comment");
-		auto kind = schema ? "schema" : (scalar ? "scalar" : (table_function ? "table" : "relation"));
-		return MakeAdminCall("acl_comment", {Value(vcat), Value(vname), Value(kind), Value(column), Value(comment)});
-	}
-	if (StringUtil::CIEquals(keyword, "check")) {
-		// CHECK VIRTUAL CATALOG c: what no longer holds against the source (spec 039), one row each
-		s.Expect("virtual");
-		s.Expect("catalog");
-		return MakeAdminTableCall("acl_check_catalog", {Value(s.IdentKey("a catalog name"))});
-	}
-	if (StringUtil::CIEquals(keyword, "repair")) {
-		// REPAIR VIRTUAL TABLE c.n REMAP (v = expr, ...) | DROP MISSING COLUMNS [AND MASKS] (spec 039)
-		s.Expect("virtual");
-		s.Expect("table");
-		string vcat, vname;
-		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-		if (s.Accept("remap")) {
-			return MakeAdminCall("acl_repair_relation", {Value(vcat), Value(vname), Value("remap"),
-			                                             Value(UnquoteColumnsList(s.List("remap list")))});
-		}
-		s.Expect("drop");
-		s.Expect("missing");
-		s.Expect("columns");
-		string action = "drop_missing";
-		if (s.Accept("and")) {
-			s.Expect("masks");
-			action = "drop_missing_and_masks";
-		}
-		return MakeAdminCall("acl_repair_relation", {Value(vcat), Value(vname), Value(action)});
-	}
-	if (StringUtil::CIEquals(keyword, "analyze")) {
-		// ANALYZE VIRTUAL CATALOG c [TABLE|VIEW|... v.n]: re-derive stored schemas
-		s.Expect("virtual");
-		if (s.Accept("catalog")) {
-			return MakeAdminCall("acl_refresh_schema", {Value(s.IdentKey("a catalog name")), Value("")});
-		}
-		s.Accept("scalar") || s.Accept("view") || (s.Accept("table") && s.Accept("function"));
-		string vcat, vname;
-		SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-		return MakeAdminCall("acl_refresh_schema", {Value(vcat), Value(vname)});
+	if (StringUtil::CIEquals(keyword, "comment") || StringUtil::CIEquals(keyword, "check") ||
+	    StringUtil::CIEquals(keyword, "repair") || StringUtil::CIEquals(keyword, "analyze")) {
+		s.Accept("on");
+		s.Accept("virtual");
+		RefuseObjectChange(s, StringUtil::Lower(keyword));
 	}
 	if (StringUtil::CIEquals(keyword, "drop")) {
 		// `IF EXISTS` says nothing-to-drop is not an error; without it a missing target is reported,
@@ -1489,11 +1381,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 				mode = "skip";
 			}
 		};
-		if (s.Accept("relation")) { // the spec-008 spelling, kept
-			if_exists(s);
-			string vcat, vname;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname), Value(mode)});
+		if (s.Accept("relation")) {
+			RefuseMovedForm("write DROP RELATION [IF EXISTS] <catalog>.<name>");
 		}
 		if (s.Accept("resource")) {
 			// DROP RESOURCE GROUP [IF EXISTS] g (spec 085): its role bindings go too
@@ -1508,10 +1397,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			return MakeAdminCall("acl_drop_function_category", {Value(s.Ident("a category name")), Value(mode)});
 		}
 		if (s.Accept("reference")) {
-			if_exists(s);
-			string vcat, name;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, name);
-			return MakeAdminCall("acl_drop_reference", {Value(vcat), Value(name), Value(mode)});
+			RefuseMovedForm("write DROP [VIRTUAL] REFERENCE [IF EXISTS] <catalog>.<name>");
 		}
 		if (s.Accept("role")) {
 			RefuseMovedForm("write DROP ROLE [IF EXISTS] <role>");
@@ -1528,45 +1414,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			RefuseMovedForm("write DROP MAP GROUP | CLAIM '<value>' FROM CLIENT | ISSUER <name> TO ROLE <role>");
 		}
 		s.Expect("virtual");
-		if (s.Accept("catalog")) { // DROP VIRTUAL CATALOG c [CASCADE]
-			if_exists(s);
-			auto vcat = s.IdentKey("a catalog name");
-			bool cascade = s.Accept("cascade");
-			return MakeAdminCall("acl_drop_catalog", {Value(vcat), Value::BOOLEAN(cascade), Value(mode)});
-		}
-		if (s.Accept("schema")) { // DROP VIRTUAL SCHEMA v.path [CASCADE]
-			if_exists(s);
-			string vcat, alias;
-			SplitVirtual(s.Dotted("a virtual schema path"), vcat, alias);
-			bool cascade = s.Accept("cascade");
-			return MakeAdminCall("acl_drop_schema_alias",
-			                     {Value(vcat), Value(alias), Value(mode), Value::BOOLEAN(cascade)});
-		}
-		bool scalar = s.Accept("scalar");
-		if (scalar || s.Accept("table")) {
-			bool table_function = !scalar && s.Accept("function");
-			if_exists(s);
-			string vcat, vname;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			if (scalar || table_function) {
-				return MakeAdminCall("acl_drop_function",
-				                     {Value(vcat), Value(vname), Value(scalar ? "scalar" : "table"), Value(mode)});
-			}
-			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname), Value(mode)});
-		}
-		if (s.Accept("view")) {
-			if_exists(s);
-			string vcat, vname;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, vname);
-			return MakeAdminCall("acl_drop_relation", {Value(vcat), Value(vname), Value(mode)});
-		}
-		if (s.Accept("reference")) {
-			if_exists(s);
-			string vcat, name;
-			SplitVirtual(s.Dotted("a virtual name"), vcat, name);
-			return MakeAdminCall("acl_drop_reference", {Value(vcat), Value(name), Value(mode)});
-		}
-		throw BinderException("acl admin: unknown DROP VIRTUAL target");
+		RefuseObjectChange(s, "drop");
 	}
 	throw BinderException("acl admin: unknown management statement \"%s\"", keyword);
 }
@@ -1819,7 +1667,8 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 			}
 			entry.args[0] = Value(current_session);
 		}
-		statements.push_back(MakeAdminCall(entry.function, entry.args));
+		statements.push_back(entry.table_call ? MakeAdminTableCall(entry.function, entry.args)
+		                                      : MakeAdminCall(entry.function, entry.args));
 	}
 	if (statements.empty()) {
 		throw BinderException("acl admin: empty management batch");

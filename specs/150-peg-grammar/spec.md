@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c part 1 built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b, 3c built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -208,8 +208,12 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   its text only when it holds no `;` - the batch's split and duckdb's tokenizer may disagree on where a statement
   ends (`ALTER VIRTUAL VIEW … SET AS SELECT (1 AS ""; DROP ROLE r)`, or `$1$; …; $1$`, which the split took for a
   quote, did the same through the compiler's `Rest`) - both found in review.
-  Part 2: `ALTER | DROP VIRTUAL …`, `DROP RELATION | REFERENCE`, `COMMENT ON VIRTUAL`, `CHECK`,
-  `REPAIR`, `ANALYZE VIRTUAL`.
+  Part 2 (built): `ALTER VIRTUAL CATALOG | REFERENCE | VIEW | TABLE | SCALAR | TABLE FUNCTION | SCHEMA …`,
+  `COMMENT ON VIRTUAL …`, `CHECK VIRTUAL CATALOG` (a table call, `MgmtParsed::table_call`), `REPAIR VIRTUAL TABLE`,
+  `ANALYZE VIRTUAL …`, `DROP RELATION | [VIRTUAL] REFERENCE`, `DROP VIRTUAL CATALOG | SCHEMA | TABLE | VIEW | SCALAR |
+  TABLE FUNCTION` - one `ObjectChangeInto` for the SET / DROP PRIMARY KEY changes, part 1's paths, lists and bodies.
+  Changed as in part 1 (comments, `""`, lists' literals); a scalar's PRIMARY KEY is refused in its own words (the
+  scanner said `expected alias`).
 - 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).
 - 3e: issuers and clients (spec 095).
 - 3f: function categories and grants, platform grants, sources, resource groups.
