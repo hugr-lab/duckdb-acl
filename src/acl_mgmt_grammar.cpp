@@ -16,6 +16,7 @@
 #include "duckdb/parser/peg/compiled_grammar.hpp"
 #include "duckdb/parser/peg/matcher.hpp"
 #include "duckdb/parser/peg/passthrough_dialect.hpp"
+#include "duckdb/parser/peg/special_string_utils.hpp"
 #include "duckdb/parser/peg/tokenizer/parser_tokenizer.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
 
@@ -1210,17 +1211,29 @@ public:
 
 const char *const TILING_REFUSAL = "acl admin: a list or a body does not read as written - its tokens do not tile it";
 
-//! Whether a token is a plain `'…'` string literal
-bool IsSingleQuoted(const MatcherToken &token) {
-	return token.type == TokenType::STRING_LITERAL && !token.text.empty() && token.text[0] == '\'';
+//! Whether duckdb's parser reads `next` as the continuation of the string `previous` - its StringLiteralMatcher's
+//! rule: a quoted string (any prefix) then a plain `'…'` on a new line with no block comment between
+bool JoinsStrings(const MatcherToken &previous, const MatcherToken &next) {
+	auto quoted = [](const MatcherToken &token, const SpecialStringInfo &info) {
+		return token.type == TokenType::STRING_LITERAL && info.prefix_len > 0 &&
+		       token.text.size() >= info.prefix_len + 1 && token.text[info.prefix_len - 1] == '\'' &&
+		       token.text.back() == '\'';
+	};
+	if (!next.preceded_by_newline || next.preceded_by_block_comment) {
+		return false;
+	}
+	auto next_info = GetSpecialStringInfo(next.text);
+	return next_info.type == SpecialStringCharacter::STANDARD && quoted(next, next_info) &&
+	       quoted(previous, GetSpecialStringInfo(previous.text));
 }
 
 //! The text of the tokens in [start, end) - a list between its parentheses or a body - refused unless the tokens
 //! tile it as written (only whitespace and comments between them: after a lone `$` duckdb's tokenizer places the next
-//! token at the `$`). A gap that holds a comment is, when `comments_as_space`, a space - in SQL (`sql`) a line break
-//! where duckdb's tokenizer would join the strings on its two sides (`'a' -- c⏎'b'` is `'ab'`) - else as written
+//! token at the `$`). A gap that holds a comment is, when `comments_as_space`, a space - a line break where duckdb
+//! would join the strings on its two sides (`'a' -- c⏎'b'` is `'ab'`) and the list's reader does too (`joins`) - else
+//! as written
 string TokensText(const string &text, const TokenIterator &tokens, idx_t start, idx_t end, bool comments_as_space,
-                  bool sql, const string &refusal, const std::function<void(const MatcherToken &)> &judge) {
+                  bool joins, const string &refusal, const std::function<void(const MatcherToken &)> &judge) {
 	auto refuse = [&refusal]() {
 		throw BinderException(refusal);
 	};
@@ -1247,9 +1260,7 @@ string TokensText(const string &text, const TokenIterator &tokens, idx_t start, 
 				}
 				inside += gap;
 			} else if (StringUtil::StartsWith(blank, "--") || StringUtil::StartsWith(blank, "/*")) {
-				bool joins = sql && previous && IsSingleQuoted(*previous) && IsSingleQuoted(token) &&
-				             token.preceded_by_newline && !token.preceded_by_block_comment;
-				inside += joins ? "\n" : " ";
+				inside += joins && previous && JoinsStrings(*previous, token) ? "\n" : " ";
 			} else {
 				refuse();
 			}
@@ -1279,7 +1290,7 @@ string ListText(const string &text, const TokenIterator &tokens, idx_t start, id
 	if (!BetweenParentheses(text, start, end)) {
 		throw BinderException(TILING_REFUSAL);
 	}
-	return TokensText(text, tokens, start, end, true, sql, TILING_REFUSAL, [sql](const MatcherToken &token) {
+	return TokensText(text, tokens, start, end, true, true, TILING_REFUSAL, [sql](const MatcherToken &token) {
 		if (sql || token.text.empty()) {
 			return;
 		}

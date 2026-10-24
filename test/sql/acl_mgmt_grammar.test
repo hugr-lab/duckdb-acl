@@ -833,3 +833,23 @@ SELECT (SELECT count(*) FROM aclcat.acl.roles WHERE role = 'grammar_one'),
        (SELECT view_sql FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'v');
 ----
 1	SELECT a /* kept */ FROM phys.main.t
+
+statement error
+ACL ADMIN ALTER VIRTUAL VIEW objects.v SET AS SELECT (1 AS "", $1$; DROP ROLE grammar_one; $1$);
+----
+zero-length delimited identifier
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role = 'grammar_one';
+----
+1
+
+# duckdb continues a quoted string of any prefix with a plain one on the next line: so does a list's text
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE objects.escaped AS phys.main.t RLS (tenant = E'a' -- the first half
+'b');
+
+query I
+SELECT rls = 'tenant = E''a''' || chr(10) || '''b''' FROM aclcat.acl.relations WHERE vcat = 'objects' AND vname = 'escaped';
+----
+true

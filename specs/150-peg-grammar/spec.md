@@ -198,14 +198,16 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   A list our readers split (columns, keys, pairs, parameters, a result's columns - `SplitTopLevel` knows `'…'` with
   `''` and `"…"` only) refuses a literal it would split otherwise than the tokenizer reads it - a `$$…$$` string, an
   `E'…'` one with a backslash, a backtick name: `COLUMNS (a, $$x, b, y$$)` was three columns to the reader where the
-  tokenizer reads one literal; an RLS predicate (SQL, duckdb's parser reads it) takes any, and there a comment
-  between two `'…'` strings a line apart is a line break where duckdb joins them (`'a' -- c⏎'b'` is `'ab'`: the
-  token's `preceded_by_newline` without `preceded_by_block_comment`), a space elsewhere. A batch holding a
+  tokenizer reads one literal; an RLS predicate (SQL, duckdb's parser reads it) takes any. A comment between two
+  strings duckdb joins (`'a' -- c⏎'b'` is `'ab'`: a quoted string of any prefix, then a plain one with
+  `preceded_by_newline` and no `preceded_by_block_comment` - its StringLiteralMatcher's rule, `JoinsStrings`) is a
+  line break, a space elsewhere (a declared column's name and type stay apart); a claims list's is always a space. A batch holding a
   dollar-quoted string nobody closed is refused whole: duckdb's tokenizer keeps it as one literal to the end of the
   text (`MatcherToken::unterminated`), so `AS SELECT $x$ AS a; DROP ROLE r` stored the DROP as the view's SQL - and
   never ran it - while the batch answered success; and a statement the tokenizer refuses (a `""`) is compiled from
-  its text only when the split kept no `;` inside its parentheses (`ALTER VIRTUAL VIEW … SET AS SELECT (1 AS "";
-  DROP ROLE r)` did the same through the compiler's `Rest`) - both found in review.
+  its text only when it holds no `;` - the batch's split and duckdb's tokenizer may disagree on where a statement
+  ends (`ALTER VIRTUAL VIEW … SET AS SELECT (1 AS ""; DROP ROLE r)`, or `$1$; …; $1$`, which the split took for a
+  quote, did the same through the compiler's `Rest`) - both found in review.
   Part 2: `ALTER | DROP VIRTUAL …`, `DROP RELATION | REFERENCE`, `COMMENT ON VIRTUAL`, `CHECK`,
   `REPAIR`, `ANALYZE VIRTUAL`.
 - 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).
