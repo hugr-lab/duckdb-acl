@@ -4,6 +4,7 @@
 // The grammar compiles text into acl_* admin-function calls; the parser override is its only caller.
 
 #include "acl_admin_sql.hpp"
+#include "acl_grammar.hpp"
 #include "acl_admin_scanner.hpp"
 #include "acl_platform.hpp"
 
@@ -428,6 +429,18 @@ bool IsMgmtStart(const string &text) {
 //! stay accepted: a gateway generates them, and every existing script uses them.
 
 namespace {
+
+//! spec 150, stage 3: a moved family's form written so its rule did not read it - the form's own words. Its own type,
+//! so a batch whose tokenizer refused that very statement says the tokenizer's words instead (an unterminated string)
+class MovedFormRefusal : public BinderException {
+public:
+	explicit MovedFormRefusal(const string &usage) : BinderException("acl admin: " + usage) {
+	}
+};
+
+[[noreturn]] void RefuseMovedForm(const string &usage) {
+	throw MovedFormRefusal(usage);
+}
 
 unique_ptr<SQLStatement> ParseCreateVirtual(AdminScanner &s, string mode) {
 	//! `IF NOT EXISTS` after the kind keyword: keep what is there instead of refusing
@@ -1133,46 +1146,21 @@ string ResourceLimitsJson(const string &inside) {
 	return "{" + StringUtil::Join(entries, ", ") + "}";
 }
 
-unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &current_session) {
+unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 	auto keyword = s.Word("a management keyword");
 	if (auto parse = FindMgmtGrammar(keyword)) {
 		return parse(s); // spec 126: a linked module's form
 	}
+	// spec 150, stage 3: the operations of a node are rules (acl_mgmt_grammar.cpp); one that reaches here did not
+	// read as its rule - said in the form's own words
 	if (StringUtil::CIEquals(keyword, "profile")) {
-		// PROFILE SESSION CURRENT | '<id>' ON | ALL | SAMPLED | OFF (spec 074 slice 3): the operator's
-		// profile level on a session - the caller's own (the session the prefix names) or another
-		// open one by its ops id from acl_sessions(); OFF clears it back to the policy and the node
-		s.Expect("session");
-		string id;
-		if (s.Accept("current")) {
-			if (current_session.empty()) {
-				throw BinderException("acl admin: PROFILE SESSION CURRENT needs a session - the statement runs "
-				                      "under no ACL SESSION prefix");
-			}
-			id = current_session;
-		} else {
-			id = s.Quoted("a session id");
-		}
-		auto word = StringUtil::Lower(s.Word("a profile level (ON, ALL, SAMPLED, OFF)"));
-		string level;
-		if (word == "on" || word == "all") {
-			level = "all";
-		} else if (word == "sampled") {
-			level = "sampled";
-		} else if (word == "off") {
-			level = "";
-		} else {
-			throw BinderException("acl admin: PROFILE SESSION expects ON, ALL, SAMPLED or OFF, not \"%s\"", word);
-		}
-		return MakeAdminCall("acl_session_profile", {Value(id), Value(level)});
+		RefuseMovedForm("write PROFILE SESSION CURRENT | '<id>' ON | ALL | SAMPLED | OFF");
 	}
 	if (StringUtil::CIEquals(keyword, "kill")) {
-		// KILL SESSION '<id>' (spec 118): the id is acl_sessions()' / platform.sessions' - never a handle
-		s.Expect("session");
-		return MakeAdminCall("acl_session_kill", {Value(s.Quoted("a session id"))});
+		RefuseMovedForm("write KILL SESSION '<id>'");
 	}
 	if (StringUtil::CIEquals(keyword, "set")) {
-		// SET SESSION '<id>' AUDIT LEVEL off | denied | decisions | all | DEFAULT (spec 118 over spec 069)
+		// SET SESSION VIEW AS ROLE here; SET SESSION '<id>' AUDIT LEVEL is a rule
 		s.Expect("session");
 		if (s.Accept("view")) {
 			// SET SESSION VIEW AS ROLE '<r>' (spec 120.3): this session, as role r, metadata only
@@ -1180,11 +1168,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 			s.Expect("role");
 			return MakeAdminCall("acl_session_view_as", {Value(s.NameValue("a role"))});
 		}
-		auto id = s.Quoted("a session id");
-		s.Expect("audit");
-		s.Expect("level");
-		auto word = StringUtil::Lower(s.Word("an audit level (OFF, DENIED, DECISIONS, ALL, DEFAULT)"));
-		return MakeAdminCall("acl_session_audit_level", {Value(id), Value(word == "default" ? string() : word)});
+		RefuseMovedForm("write SET SESSION '<id>' AUDIT LEVEL OFF | DENIED | DECISIONS | ALL | DEFAULT");
 	}
 	if (StringUtil::CIEquals(keyword, "reset")) {
 		// RESET SESSION VIEW AS (spec 120.3): back to the session's own principal
@@ -1194,20 +1178,11 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 		return MakeAdminCall("acl_session_view_as", {Value(string())});
 	}
 	if (StringUtil::CIEquals(keyword, "drain") || StringUtil::CIEquals(keyword, "resume")) {
-		// DRAIN NODE / RESUME NODE (spec 118 over spec 066): this node
-		s.Expect("node");
-		return MakeAdminCall(StringUtil::CIEquals(keyword, "drain") ? "acl_drain" : "acl_resume", {});
+		RefuseMovedForm("write DRAIN NODE / RESUME NODE");
 	}
 	if (StringUtil::CIEquals(keyword, "migrate")) {
-		// MIGRATE POLICY CATALOG <db>[.<schema>] (spec 118 over spec 094): passthrough's
-		s.Expect("policy");
-		s.Expect("catalog");
-		auto database = s.Ident("a database");
-		if (s.pos < s.text.size() && s.text[s.pos] == '.') {
-			s.pos++;
-			return MakeAdminCall("acl_migrate_catalog", {Value(database), Value(s.Ident("a schema"))});
-		}
-		return MakeAdminCall("acl_migrate_catalog", {Value(database)});
+		RefuseMovedForm("write MIGRATE POLICY CATALOG <database>[.<schema>] - a name that is an SQL keyword in double "
+		                "quotes");
 	}
 	if (StringUtil::CIEquals(keyword, "deny")) {
 		// DENY FUNCTION CATEGORY c TO ROLE r | ALL ROLES; DENY FUNCTION f [TABLE] TO ROLE r | ALL ROLES
@@ -1918,6 +1893,32 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s, const string &curre
 
 } // namespace
 
+namespace {
+
+//! Where a comment that opens at `start` ends, as duckdb's tokenizer reads it (spec 150: the batch's split and the
+//! grammar's agree) - a line comment at a line break of either kind, a block comment at the `*/` of its own depth
+idx_t CommentEnd(const string &text, idx_t start) {
+	if (text.compare(start, 2, "--") == 0) {
+		auto end = text.find_first_of("\n\r", start);
+		return end == string::npos ? text.size() : end;
+	}
+	idx_t depth = 0;
+	for (idx_t i = start; i + 1 < text.size(); i++) {
+		if (text[i] == '/' && text[i + 1] == '*') {
+			depth++;
+			i++;
+		} else if (text[i] == '*' && text[i + 1] == '/') {
+			if (--depth == 0) {
+				return i + 2;
+			}
+			i++;
+		}
+	}
+	return text.size();
+}
+
+} // namespace
+
 vector<string> SplitBatchText(const string &text) {
 	vector<string> out;
 	string current;
@@ -1928,12 +1929,8 @@ vector<string> SplitBatchText(const string &text) {
 		while (i < current.size()) {
 			if (StringUtil::CharacterIsSpace(current[i])) {
 				i++;
-			} else if (current.compare(i, 2, "--") == 0) {
-				auto end = current.find('\n', i);
-				i = end == string::npos ? current.size() : end + 1;
-			} else if (current.compare(i, 2, "/*") == 0) {
-				auto end = current.find("*/", i + 2);
-				i = end == string::npos ? current.size() : end + 2;
+			} else if (current.compare(i, 2, "--") == 0 || current.compare(i, 2, "/*") == 0) {
+				i = CommentEnd(current, i);
 			} else {
 				break;
 			}
@@ -1979,16 +1976,8 @@ vector<string> SplitBatchText(const string &text) {
 				}
 			}
 		}
-		if (c == '-' && i + 1 < text.size() && text[i + 1] == '-') {
-			auto end = text.find('\n', i);
-			end = end == string::npos ? text.size() : end;
-			current += text.substr(i, end - i);
-			i = end - 1;
-			continue;
-		}
-		if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
-			auto end = text.find("*/", i + 2);
-			end = end == string::npos ? text.size() : end + 2;
+		if ((c == '-' || c == '/') && i + 1 < text.size() && text[i + 1] == (c == '-' ? '-' : '*')) {
+			auto end = CommentEnd(text, i);
 			current += text.substr(i, end - i);
 			i = end - 1;
 			continue;
@@ -2038,22 +2027,94 @@ bool BatchIsAllMgmt(const string &text) {
 	return !statements.empty();
 }
 
-vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session) {
+//! One management statement written as text, compiled by the management compiler (a family no rule reads yet)
+unique_ptr<SQLStatement> CompileMgmtText(const string &text) {
+	AdminScanner scanner(text);
+	auto statement = ParseMgmtStatement(scanner);
+	if (!scanner.Done()) {
+		throw BinderException("acl admin: unexpected trailing text at position %llu", scanner.pos);
+	}
+	return statement;
+}
+
+vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string &current_session,
+                                                AclGrammarCache &grammar, const ParserOptions &options) {
 	RefuseRepeatedPrefix(text);
 	if (!BatchIsAllMgmt(text) && BatchHasMgmtStatement(text)) {
 		// spec 117: a batch is all management or all queries - a mix would run half of it in each world
 		throw BinderException("acl admin: a batch mixing management statements and queries is refused - send each "
 		                      "kind in a batch of its own");
 	}
-	vector<unique_ptr<SQLStatement>> statements;
-	// statement by statement, as the batch splits (quotes, comments and parentheses respected): a comment
-	// in front of a statement says nothing, and a `;` inside a body's literal ends nothing
-	for (auto &piece : SplitBatchText(text)) {
-		AdminScanner scanner(piece);
-		statements.push_back(ParseMgmtStatement(scanner, current_session));
-		if (!scanner.Done()) {
-			throw BinderException("acl admin: unexpected trailing text at position %llu", scanner.pos);
+	// spec 150, stage 3: statement by statement as duckdb's grammar splits the batch - each by its rule, or as its own
+	// text by the management compiler
+	struct Piece {
+		MgmtParsed parsed;
+		//! the tokenizer refused this statement: a moved form says the tokenizer's words
+		shared_ptr<ErrorData> refused;
+	};
+	vector<Piece> pieces;
+	try {
+		for (auto &parsed : grammar.ReadManagement(text, options)) {
+			pieces.push_back(Piece {std::move(parsed), nullptr});
 		}
+	} catch (ParserException &batch_refusal) {
+		// a text duckdb's tokenizer refuses (an empty quoted name, an unterminated string): piece by piece as the batch
+		// splits - each piece the grammar reads is its rules', and the one it refuses goes to the compiler, which says
+		// what is wrong in its own words, as it did
+		ErrorData batch_error(batch_refusal);
+		pieces.clear();
+		for (auto &piece : SplitBatchText(text)) {
+			try {
+				for (auto &parsed : grammar.ReadManagement(piece, options)) {
+					pieces.push_back(Piece {std::move(parsed), nullptr});
+				}
+			} catch (ParserException &refusal) {
+				MgmtParsed parsed;
+				parsed.legacy = true;
+				parsed.text = piece;
+				pieces.push_back(Piece {std::move(parsed), make_shared_ptr<ErrorData>(refusal)});
+			}
+		}
+		bool reproduced = false;
+		for (auto &piece : pieces) {
+			reproduced = reproduced || piece.refused;
+		}
+		if (!reproduced) {
+			// no piece holds what the tokenizer refused (an unterminated comment the split dropped as one): the batch
+			// is refused as a whole, never run without it
+			auto info = batch_error.ExtraInfo();
+			info.erase("position");
+			info.erase("location");
+			throw ParserException(info, batch_error.RawMessage());
+		}
+	}
+	vector<unique_ptr<SQLStatement>> statements;
+	for (auto &piece : pieces) {
+		auto &entry = piece.parsed;
+		if (entry.legacy) {
+			try {
+				statements.push_back(CompileMgmtText(entry.text));
+			} catch (MovedFormRefusal &) {
+				if (piece.refused) {
+					// the tokenizer's words - its position counts in the piece, not in the batch, so it goes
+					auto info = piece.refused->ExtraInfo();
+					info.erase("position");
+					info.erase("location");
+					throw ParserException(info, piece.refused->RawMessage());
+				}
+				throw;
+			}
+			continue;
+		}
+		if (entry.current_session) {
+			if (current_session.empty()) {
+				throw BinderException(
+				    "acl admin: PROFILE SESSION CURRENT needs a session - the statement runs under no "
+				    "ACL SESSION prefix");
+			}
+			entry.args[0] = Value(current_session);
+		}
+		statements.push_back(MakeAdminCall(entry.function, entry.args));
 	}
 	if (statements.empty()) {
 		throw BinderException("acl admin: empty management batch");

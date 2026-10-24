@@ -32,6 +32,7 @@ set(EXTENSION_SOURCES
     ${ACL_ROOT}/src/acl_introspection.cpp
     ${ACL_ROOT}/src/acl_admin_sql.cpp
     ${ACL_ROOT}/src/acl_grammar.cpp
+    ${ACL_ROOT}/src/acl_mgmt_grammar.cpp
     ${ACL_ROOT}/src/acl_parser_override.cpp
     ${ACL_ROOT}/src/acl_door_auth.cpp
     ${ACL_ROOT}/src/acl_door_common.cpp

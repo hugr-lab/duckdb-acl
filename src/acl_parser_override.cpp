@@ -687,7 +687,7 @@ bool OnlyViewAsCalls(vector<unique_ptr<SQLStatement>> &statements) {
 //! One prefixed batch, decided. Every refusal throws; the caller turns the outcome into the audit's
 //! events, so this only has to say what it is doing (`audit.phase`) and whom it is doing it for.
 ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, ParserOptions &options,
-                              StatementAudit &audit) {
+                              StatementAudit &audit, AclGrammarCache &grammar) {
 	auto mode = prefix.mode;
 	bool anonymous = prefix.kind == AclPrefix::Kind::ADMIN;
 	bool principal_prefix = prefix.kind == AclPrefix::Kind::ROLE || prefix.kind == AclPrefix::Kind::TOKEN ||
@@ -788,7 +788,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, Parse
 		audit.phase = Reason::PARSE;
 		vector<unique_ptr<SQLStatement>> statements;
 		ParseOfRest(nullptr, ErrorsAsJson(options), // CURRENT is this session
-		            [&]() { statements = ParseMgmtBatch(prefix.rest, audit.proto.session); });
+		            [&]() { statements = ParseMgmtBatch(prefix.rest, audit.proto.session, grammar, options); });
 		if (!viewing.empty() && !OnlyViewAsCalls(statements)) {
 			RefuseInViewAs();
 		}
@@ -1040,7 +1040,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		audit.OnSession(store, prefix.value); // known before anything is judged: a parse error names it too
 	}
 	try {
-		auto result = Prefixed(store, prefix, options, audit);
+		auto result = Prefixed(store, prefix, options, audit, *info->Cast<AclParserInfo>().grammar);
 		audit.Allowed();
 		return result;
 	} catch (std::exception &ex) {
