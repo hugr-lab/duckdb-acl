@@ -1098,28 +1098,6 @@ unique_ptr<SQLStatement> ParseAlterClient(AdminScanner &s) {
 }
 
 //! [DROP] MAP GROUP|CLAIM '<v>' FROM CLIENT|ISSUER <name> TO ROLE r
-unique_ptr<SQLStatement> ParseMapping(AdminScanner &s, const char *function) {
-	bool is_group = s.Accept("group");
-	if (!is_group) {
-		s.Expect("claim");
-	}
-	auto external = s.Quoted("external value");
-	s.Expect("from");
-	string kind;
-	if (s.Accept("client")) {
-		kind = "client";
-	} else {
-		s.Expect("issuer");
-		kind = "issuer";
-	}
-	auto scope = s.NameValue(kind == "client" ? "a client name" : "an issuer name");
-	s.Expect("to");
-	s.Expect("role");
-	auto role = s.Ident("a role name");
-	return MakeAdminCall(
-	    function, {Value(kind), Value(scope), Value(is_group ? "group" : "claim-value"), Value(external), Value(role)});
-}
-
 //! `(window_max 64, batch_bytes '32MiB', …)` - a resource group's limits as the JSON the admin functions take
 //! (spec 085; ALTER RESOURCE GROUP … SET (…), spec 120)
 string ResourceLimitsJson(const string &inside) {
@@ -1160,22 +1138,11 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		RefuseMovedForm("write KILL SESSION '<id>'");
 	}
 	if (StringUtil::CIEquals(keyword, "set")) {
-		// SET SESSION VIEW AS ROLE here; SET SESSION '<id>' AUDIT LEVEL is a rule
-		s.Expect("session");
-		if (s.Accept("view")) {
-			// SET SESSION VIEW AS ROLE '<r>' (spec 120.3): this session, as role r, metadata only
-			s.Expect("as");
-			s.Expect("role");
-			return MakeAdminCall("acl_session_view_as", {Value(s.NameValue("a role"))});
-		}
-		RefuseMovedForm("write SET SESSION '<id>' AUDIT LEVEL OFF | DENIED | DECISIONS | ALL | DEFAULT");
+		RefuseMovedForm("write SET SESSION '<id>' AUDIT LEVEL OFF | DENIED | DECISIONS | ALL | DEFAULT, or SET SESSION "
+		                "VIEW AS ROLE <role>");
 	}
 	if (StringUtil::CIEquals(keyword, "reset")) {
-		// RESET SESSION VIEW AS (spec 120.3): back to the session's own principal
-		s.Expect("session");
-		s.Expect("view");
-		s.Expect("as");
-		return MakeAdminCall("acl_session_view_as", {Value(string())});
+		RefuseMovedForm("write RESET SESSION VIEW AS");
 	}
 	if (StringUtil::CIEquals(keyword, "drain") || StringUtil::CIEquals(keyword, "resume")) {
 		RefuseMovedForm("write DRAIN NODE / RESUME NODE");
@@ -1219,19 +1186,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			return ParseCreateVirtual(s, mode);
 		}
 		if (s.Accept("role")) {
-			if (s.Accept("if")) {
-				s.Expect("not");
-				s.Expect("exists");
-				if (mode == "create") {
-					mode = "skip";
-				}
-			}
-			auto role = s.Ident("a role name");
-			string claims;
-			if (s.Accept("claims")) {
-				claims = s.AtParen() ? ClaimsListToCsv(s.Parens()) : s.Quoted("claims list");
-			}
-			return MakeAdminCall("acl_define_role", {Value(role), Value(claims), Value(mode)});
+			RefuseMovedForm("write CREATE [OR REPLACE] ROLE [IF NOT EXISTS] <role> [CLAIMS (name = 'value', ...)]");
 		}
 		if (s.Accept("resource")) {
 			// CREATE [OR REPLACE] RESOURCE GROUP g [WITH] (window_max 64, batch_bytes '32MiB', …)
@@ -1370,13 +1325,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			return MakeAdminCall("acl_grant_resource_group", {Value(s.Ident("a role name")), Value(group)});
 		}
 		if (s.Accept("admin")) {
-			// GRANT ADMIN <scope> TO ROLE r - the GLOBAL scope; managing one catalog is granted with
-			// GRANT CATALOG c TO ROLE r CAPS '{"manage": true}'
-			auto scope = s.Word("an admin scope");
-			s.Expect("to");
-			s.Expect("role");
-			auto role = s.Ident("a role name");
-			return MakeAdminCall("acl_grant_admin", {Value(role), Value(scope)});
+			RefuseMovedForm("write GRANT ADMIN <scope> TO ROLE <role>");
 		}
 		if (s.Accept("function")) {
 			// GRANT FUNCTION CATEGORY c TO ROLE r | ALL ROLES; GRANT FUNCTION f [TABLE] TO ROLE r | ALL
@@ -1465,19 +1414,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			return MakeAdminCall("acl_revoke_source", {Value(s.Ident("a role name")), Value(source)});
 		}
 		if (s.Accept("admin")) {
-			// REVOKE ADMIN FROM ROLE r - every administration of the role; REVOKE ADMIN <bundle> FROM ROLE r -
-			// that one bundle (spec 117)
-			string scope;
-			if (!StringUtil::CIEquals(s.PeekWord(), "from")) {
-				scope = s.Word("an admin scope");
-			}
-			s.Expect("from");
-			s.Expect("role");
-			auto role = s.Ident("a role name");
-			if (scope.empty()) {
-				return MakeAdminCall("acl_revoke_admin", {Value(role)});
-			}
-			return MakeAdminCall("acl_revoke_admin", {Value(role), Value(scope)});
+			RefuseMovedForm("write REVOKE ADMIN [<scope>] FROM ROLE <role>");
 		}
 		{
 			// spec 117: REVOKE VIEW|FUNCTION platform.<x> FROM ROLE r
@@ -1535,7 +1472,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		return MakeAdminCall("acl_revoke_catalog", {Value(role), Value(vcat)});
 	}
 	if (StringUtil::CIEquals(keyword, "map")) {
-		return ParseMapping(s, "acl_map_role");
+		RefuseMovedForm("write MAP GROUP | CLAIM '<value>' FROM CLIENT | ISSUER <name> TO ROLE <role>");
 	}
 	if (StringUtil::CIEquals(keyword, "alter")) {
 		if (s.Accept("function")) {
@@ -1580,15 +1517,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			return MakeAdminCall("acl_alter_resource_group",
 			                     {Value(group), Value("default"), Value(set ? "true" : "false")});
 		}
-		if (s.Accept("role")) { // ALTER ROLE r SET CLAIMS (...) | '...' | SET COMMENT '…' (spec 120)
-			auto role = s.Ident("a role name");
-			s.Expect("set");
-			if (s.Accept("comment")) {
-				return MakeAdminCall("acl_comment_role", {Value(role), Value(s.Quoted("comment"))});
-			}
-			s.Expect("claims");
-			auto claims = s.AtParen() ? ClaimsListToCsv(s.Parens()) : s.Quoted("claims list");
-			return MakeAdminCall("acl_alter_role", {Value(role), Value(claims)});
+		if (s.Accept("role")) {
+			RefuseMovedForm("write ALTER ROLE <role> SET COMMENT '<text>' | SET CLAIMS (name = 'value', ...)");
 		}
 		if (s.Accept("issuer")) { // spec 095: ALTER ISSUER i SET … | DROP [CLIENT] FROM SECRET
 			return ParseAlterIssuer(s);
@@ -1831,8 +1761,7 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			return MakeAdminCall("acl_drop_reference", {Value(vcat), Value(name), Value(mode)});
 		}
 		if (s.Accept("role")) {
-			if_exists(s);
-			return MakeAdminCall("acl_drop_role", {Value(s.Ident("a role name")), Value(mode)});
+			RefuseMovedForm("write DROP ROLE [IF EXISTS] <role>");
 		}
 		if (s.Accept("issuer")) {
 			if_exists(s);
@@ -1842,8 +1771,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 			if_exists(s);
 			return MakeAdminCall("acl_drop_client", {Value(s.NameValue("a client name")), Value(mode)});
 		}
-		if (s.Accept("map")) { // DROP MAP GROUP|CLAIM '<value>' FROM CLIENT|ISSUER n TO ROLE r
-			return ParseMapping(s, "acl_drop_role_mapping");
+		if (s.Accept("map")) {
+			RefuseMovedForm("write DROP MAP GROUP | CLAIM '<value>' FROM CLIENT | ISSUER <name> TO ROLE <role>");
 		}
 		s.Expect("virtual");
 		if (s.Accept("catalog")) { // DROP VIRTUAL CATALOG c [CASCADE]
@@ -2105,6 +2034,9 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 				throw;
 			}
 			continue;
+		}
+		for (auto &list : entry.claims_lists) {
+			entry.args[list.first] = Value(ClaimsListToCsv(list.second));
 		}
 		if (entry.current_session) {
 			if (current_session.empty()) {

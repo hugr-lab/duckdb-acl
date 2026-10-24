@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a built), stage 4 to come
+- **Status**: accepted; stages 1 and 2 implemented, stage 3 in progress (3a, 3b built), stage 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -154,7 +154,15 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   `RESUME NODE`, `MIGRATE POLICY CATALOG <db>[.<schema>]`. Newly accepted: comments inside these forms; a quoted
   level stays refused, as it was; a SQL keyword as a database name must be quoted now (the refusal says so); an inline body's trailing comment is no longer part of a legacy statement's text. A rule's checks run over
   the batch before the compiler's statements, so a later statement's error may be the one reported.
-- 3b: roles, admin scopes, role mappings, view-as (names as values, spec 116's `NameValue`).
+- 3b (built): roles, admin scopes, role mappings, view-as - `CREATE [OR REPLACE] ROLE [IF NOT EXISTS] r [CLAIMS
+  (…) | '…']`, `ALTER ROLE r SET COMMENT | CLAIMS`, `DROP ROLE [IF EXISTS] r`, `GRANT ADMIN s TO ROLE r`, `REVOKE ADMIN
+  [s] FROM ROLE r`, `[DROP] MAP GROUP | CLAIM '<v>' FROM CLIENT | ISSUER n TO ROLE r`, `SET SESSION VIEW AS ROLE r`,
+  `RESET SESSION VIEW AS`. The compiler's values on duckdb's tokens: a matcher of ours (`AclTokenMatcher`) reads a word
+  (letters, digits, `_` - a keyword too: `CREATE ROLE select` works as it did), a double-quoted name, or a list's item;
+  `Ident` is `AclName`, `NameValue` `AclNameValue` (quoted either way, or words joined by `.`), a parenthesised claims
+  list keeps its text for the compiler's `ClaimsListToCsv` (a rule in stage 4). Changed: a moved form's `""` is the
+  tokenizer's zero-length identifier (`ALTER ROLE r SET COMMENT ""` cleared the comment; `''` does), `REVOKE ADMIN`'s
+  scope and `FROM` are told apart by the rule, never by peeking.
 - 3c: the virtual catalog's objects (`CREATE | ALTER | DROP VIRTUAL …`, `ADD …`, `CHECK`, `REPAIR`, comments) -
   spec 116's paths and the bodies (still their text until stage 4).
 - 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).

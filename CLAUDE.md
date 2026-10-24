@@ -478,7 +478,9 @@ read by acl_mgmt_grammar.cpp's grammar (`Statement <- AclMgmtStatement`, compile
 family's rule yields the acl_* call (`MgmtParsed` -> `MakeAdminCall`), anything else passes through as tokens
 (`AclMgmtLegacy`) to the compiler as its own text (`CompileMgmtText`); a moved family's text form stays only as a
 refusal in its own words. 3a: KILL SESSION, SET SESSION … AUDIT LEVEL, PROFILE SESSION, DRAIN / RESUME NODE, MIGRATE
-POLICY CATALOG. Stage 4 the policy texts. Tests `acl_prefix_grammar.test`, `acl_prefix_completion.test`,
+POLICY CATALOG. 3b: CREATE / ALTER / DROP ROLE, GRANT / REVOKE ADMIN, [DROP] MAP, SET / RESET SESSION VIEW AS - the
+compiler's values on duckdb's tokens (`AclTokenMatcher`: a word, a quoted name, a list item; `AclName`, `AclNameValue`,
+a claims list's text for `ClaimsListToCsv`). Stage 4 the policy texts. Tests `acl_prefix_grammar.test`, `acl_prefix_completion.test`,
 `acl_mgmt_grammar.test`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
