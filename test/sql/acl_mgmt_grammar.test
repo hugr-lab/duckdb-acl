@@ -1140,3 +1140,49 @@ query I
 SELECT count(*) FROM aclcat.acl.catalogs WHERE vcat = 'changes';
 ----
 0
+
+# a statement no rule reads yet goes to the compiler as its text, whose scanner knows '...' and "..." and whitespace
+# only: a comment, a $$...$$ string, an E'...' one with a backslash or a backtick name would be read otherwise than
+# written (`WITH (select, /*, manage, */ insert)` granted manage) - refused until its family is a rule
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG hidden; CREATE ROLE hider;
+
+statement error
+ACL ADMIN GRANT CATALOG hidden TO ROLE hider WITH (select, /*, manage, */ insert) MAIN;
+----
+a comment in a statement no rule reads yet
+
+statement error
+ACL ADMIN GRANT CATALOG hidden TO ROLE hider WITH (select, $q$x, manage, y$q$) MAIN;
+----
+a $$...$$ string in a statement no rule reads yet
+
+statement error
+ACL ADMIN GRANT CATALOG hidden TO ROLE hider WITH (select, `x, manage, y`) MAIN;
+----
+a backtick name in a statement no rule reads yet
+
+query I
+SELECT count(*) FROM aclcat.acl.role_catalogs WHERE role = 'hider';
+----
+0
+
+# ... while a statement that does not compile keeps its own refusal, and one without them runs as before
+statement error
+ACL ADMIN GRANT GADGET /* x */ hidden;
+----
+GADGET
+
+statement ok
+ACL ADMIN GRANT CATALOG hidden TO ROLE hider WITH (select) MAIN;
+
+# a body whose parentheses do not balance was cut by a `;` inside them - never stored as the body
+statement error
+ACL ADMIN CREATE VIRTUAL VIEW hidden.v AS SELECT (1; CREATE VIRTUAL VIEW hidden.w AS SELECT 2);
+----
+a body's parentheses do not balance
+
+query I
+SELECT count(*) FROM aclcat.acl.relations WHERE vcat = 'hidden';
+----
+0

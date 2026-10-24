@@ -222,7 +222,12 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   a string or a quoted name refused - never by `SplitBatchText`, whose own reading of quotes and comments (`$1$`, a
   backtick name, `E'\''`) hid an open comment and let the statements it hides run (found in review, four times, on
   that path: a `;` inside parentheses, `$1$`, an open comment, an opener inside what it took for a quote); part 1's
-  "no `;` in a refused piece" guard is gone with it.
+  "no `;` in a refused piece" guard is gone with it. A statement no rule reads yet goes to the compiler as its text,
+  whose scanner knows `'…'`, `"…"` and whitespace only: once it compiles, a comment inside it, a `$$…$$` string, an
+  `E'…'` one with a backslash or a backtick name refuses it (`MgmtParsed::unreadable`, `LegacyUnreadable`) -
+  `GRANT CATALOG c TO ROLE r WITH (select, /*, manage, */ insert)` stored `manage` (found in review; a statement
+  that does not compile keeps its own refusal; comments before, between and after statements are untouched). A
+  body whose parentheses do not balance was cut by a `;` inside them and is refused (`AS SELECT (1; …`).
 - 3d: grants (`GRANT | REVOKE CATALOG | SCHEMA | TABLE | VIEW | OBJECT`, `ALTER GRANT`, CAPS / RLS / COLUMNS clauses).
 - 3e: issuers and clients (spec 095).
 - 3f: function categories and grants, platform grants, sources, resource groups.

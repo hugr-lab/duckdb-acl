@@ -142,6 +142,7 @@ shared_ptr<GrammarExtension> MakeMgmtGrammar();
 vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, const string &text,
                                       const ParserOptions &options);
 vector<string> SplitMgmtStatements(shared_ptr<CompiledGrammar> compiled, const string &text);
+string JudgeLegacyText(shared_ptr<CompiledGrammar> compiled, const string &text);
 
 } // namespace acl
 } // namespace duckdb

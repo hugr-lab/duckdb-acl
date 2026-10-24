@@ -51,6 +51,10 @@ struct MgmtParsed {
 	bool legacy = false;
 	//! legacy: the statement as written, its first token to its last
 	string text;
+	//! legacy: why the compiler cannot read it as written ('' when it can) - a comment, a `$$…$$` string, an `E'…'`
+	//! string with a backslash or a backtick name, which its scanner does not know: judged once it compiled, so a form
+	//! that does not compile keeps its own refusal
+	string unreadable;
 	//! a rule's: the acl_* function and its arguments
 	string function;
 	vector<Value> args;
@@ -90,6 +94,9 @@ public:
 	//! in one statement): each statement's text, first token to last. Throws a ParserException when the text ends
 	//! inside a comment, a string or a quoted name - what it hides is never run without it
 	vector<string> SplitManagement(const string &text);
+	//! Why the management compiler cannot read `text` (one statement) as written, '' when it can
+	//! (MgmtParsed::unreadable)
+	string JudgeLegacy(const string &text);
 
 	//! The rules as a grammar extension, registered so a connection may switch them on for completion
 	//! (`SET active_grammar_extensions = ['acl']`); the override never depends on it being on

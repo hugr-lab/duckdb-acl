@@ -1699,6 +1699,42 @@ string ClaimsListText(const string &text, const TokenIterator &tokens, idx_t sta
 	    });
 }
 
+//! Why the management compiler cannot read the tokens in [start, end) as written, '' when it can: its scanner knows
+//! `'…'` and `"…"` and whitespace only, so a comment, a `$$…$$` string, an `E'…'` string with a backslash or a
+//! backtick name would be read as something else than duckdb reads (`WITH (select, /*, manage, */ insert)` granted
+//! manage) - refused until its family is a rule
+string LegacyUnreadable(const string &text, const TokenIterator &tokens, idx_t start, idx_t end) {
+	optional_idx previous_end;
+	for (idx_t index = grammar::FirstTokenFrom(tokens, start); index < tokens.Size(); index++) {
+		auto &token = tokens.GetToken(index);
+		if (token.offset >= end || token.type == TokenType::END_OF_INPUT || token.type == TokenType::TERMINATOR) {
+			break;
+		}
+		if (previous_end.IsValid()) {
+			if (token.offset < previous_end.GetIndex()) {
+				return "its text does not read as written";
+			}
+			auto gap = text.substr(previous_end.GetIndex(), token.offset - previous_end.GetIndex());
+			StringUtil::Trim(gap);
+			if (!gap.empty()) {
+				return "a comment";
+			}
+		}
+		if (!token.text.empty() && token.type == TokenType::STRING_LITERAL && token.text[0] == '$') {
+			return "a $$...$$ string";
+		}
+		if (token.type == TokenType::STRING_LITERAL && !token.text.empty() &&
+		    (token.text[0] == 'E' || token.text[0] == 'e') && StringUtil::Contains(token.text, "\\")) {
+			return "an E'...' string with a backslash";
+		}
+		if (!token.text.empty() && token.text[0] == '`') {
+			return "a backtick name";
+		}
+		previous_end = token.offset + token.length;
+	}
+	return string();
+}
+
 //! A body's text, its first token to its last as written (the comments inside it are the body's own; one before its
 //! first token or after its last is not part of it) - or, written as a quoted string, that string's value: the whole
 //! body, as the compiler's `Body` read it (a clause written after it - `AS 'SELECT 1' COMMENT 'x'` - is refused, never
@@ -1723,7 +1759,20 @@ string BodyText(const string &text, const TokenIterator &tokens, idx_t start, id
 			return value;
 		}
 	}
-	return TokensText(text, tokens, start, end, false, true, TILING_REFUSAL, [](const MatcherToken &) {});
+	// a `;` ends a statement wherever it stands outside a literal: a body whose parentheses do not balance was cut by
+	// one (`AS SELECT (1; …`) - never stored as the body
+	int64_t depth = 0;
+	auto body = TokensText(text, tokens, start, end, false, true, TILING_REFUSAL, [&depth](const MatcherToken &token) {
+		if (token.text == "(") {
+			depth++;
+		} else if (token.text == ")" && --depth < 0) {
+			throw BinderException("acl admin: a body's parentheses do not balance");
+		}
+	});
+	if (depth != 0) {
+		throw BinderException("acl admin: a body's parentheses do not balance - a `;` inside them ends the statement");
+	}
+	return body;
 }
 
 } // namespace
@@ -1795,6 +1844,14 @@ vector<string> SplitMgmtStatements(shared_ptr<CompiledGrammar> compiled, const s
 	}
 	flush();
 	return statements;
+}
+
+string JudgeLegacyText(shared_ptr<CompiledGrammar> compiled, const string &text) {
+	vector<MatcherToken> owned;
+	SplitTokenizerBehavior behavior(text, owned);
+	compiled->GetTokenizer().TokenizeInput(behavior);
+	TokenIterator tokens(owned);
+	return LegacyUnreadable(text, tokens, 0, text.size());
 }
 
 shared_ptr<GrammarExtension> MakeMgmtGrammar() {
@@ -1869,6 +1926,7 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 		parsed.legacy = data.legacy;
 		if (data.legacy) {
 			parsed.text = text.substr(data.start, data.end - data.start);
+			parsed.unreadable = LegacyUnreadable(text, tokens, data.start, data.end);
 		} else {
 			parsed.function = data.function;
 			parsed.args = data.args;

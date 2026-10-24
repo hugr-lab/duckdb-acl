@@ -1603,6 +1603,7 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 				MgmtParsed parsed;
 				parsed.legacy = true;
 				parsed.text = piece;
+				parsed.unreadable = grammar.JudgeLegacy(piece);
 				pieces.push_back(Piece {std::move(parsed), make_shared_ptr<ErrorData>(refusal)});
 			}
 		}
@@ -1624,6 +1625,13 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		if (entry.legacy) {
 			try {
 				statements.push_back(CompileMgmtText(entry.text));
+				if (!entry.unreadable.empty()) {
+					// it compiled - from text its scanner reads otherwise than duckdb does
+					throw BinderException("acl admin: %s in a statement no rule reads yet - its compiler would read it "
+					                      "otherwise than written; write it without (its family becomes a rule in "
+					                      "stage 3)",
+					                      entry.unreadable);
+				}
 			} catch (MovedFormRefusal &) {
 				if (piece.refused) {
 					// the tokenizer's words - its position counts in the piece, not in the batch, so it goes
