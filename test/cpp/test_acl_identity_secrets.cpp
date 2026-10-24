@@ -267,6 +267,19 @@ int main(int argc, char *argv[]) {
 			Check(One(con, "SELECT flows FROM acl_clients() WHERE name = 'short'") == "[\"password\"]",
 			      "a confidential implicit client runs the password flow: " +
 			          One(con, "SELECT flows FROM acl_clients() WHERE name = 'short'"));
+			// DROP … FROM SECRET goes to its object: the issuer's own (its URL was there), the implicit client's (its
+			// client id was), a client's own
+			Refused(con, "ACL ADMIN ALTER ISSUER short DROP FROM SECRET", "issuer \"short\" has no URL");
+			Refused(con, "ACL ADMIN ALTER ISSUER short DROP CLIENT FROM SECRET",
+			        "client \"short\" names FLOWS but has no CLIENT ID");
+			Exec(con, "CREATE PERSISTENT SECRET extra_conn IN corp (TYPE oidc_client, CLIENT_ID 'extra-app')");
+			Exec(con, "ACL ADMIN CREATE CLIENT extra ISSUER kf AUDIENCES ('api://extra') ROLES FROM ('roles') FROM "
+			          "SECRET extra_conn");
+			Exec(con, "ACL ADMIN ALTER CLIENT extra DROP FROM SECRET");
+			Check(One(con, "SELECT secret IS NULL AND client_id IS NULL FROM acl_clients() WHERE name = 'extra'") ==
+			          "true",
+			      "a client's own secret dropped: " + One(con, "SELECT * FROM acl_clients() WHERE name = 'extra'"));
+			Exec(con, "ACL ADMIN DROP CLIENT extra");
 		});
 
 		Scenario("two services: an unnamed one is ambiguous, IN names it", [&] {

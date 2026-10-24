@@ -593,7 +593,7 @@ unique_ptr<SQLStatement> PlatformGrant(AdminScanner &s, const char *kind, const 
 	return MakeAdminCall("acl_revoke_platform", {Value(role), Value(kind), Value(object)});
 }
 
-// --- spec 095: issuers, clients, mappings --------------------------------------------------------
+// --- spec 095: the readers of an issuer's and a client's lists ---------------------------------------
 
 string JsonList(const vector<string> &values) {
 	vector<string> quoted;
@@ -810,12 +810,8 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		return MakeAdminCall("acl_grant_function", {Value(role), Value(spec), Value("false")});
 	}
 	if (StringUtil::CIEquals(keyword, "create")) {
-		// what the statement promises about an existing object: CREATE refuses to overwrite one,
-		// OR REPLACE overwrites, IF NOT EXISTS keeps it (spec 013). The legacy ADD forms upsert.
-		string mode = "create";
 		if (s.Accept("or")) {
 			s.Expect("replace");
-			mode = "replace";
 		}
 		if (s.Accept("virtual")) {
 			RefuseObjectForm(s, false);
@@ -860,11 +856,13 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		}
 		// spec 150, stage 3e: CREATE ISSUER | CLIENT are rules - one that reaches here did not read as its rule
 		if (s.Accept("client")) {
-			RefuseMovedForm("write CREATE [OR REPLACE] CLIENT [IF NOT EXISTS] <client> ISSUER <issuer> [<client "
-			                "clause> ...]");
+			RefuseMovedForm("write CREATE [OR REPLACE] CLIENT [IF NOT EXISTS] <client> ISSUER <issuer> [FROM SECRET "
+			                "<secret> [IN <service>]] [<client clause> ...]");
 		}
+		s.Expect("issuer");
 		RefuseMovedForm("write CREATE [OR REPLACE] ISSUER [IF NOT EXISTS] <issuer> | '<url>' [URL '<url>'] [FROM "
-		                "SECRET <secret> [IN <service>]] [<client clause> ...]");
+		                "SECRET <secret> [IN <service>]] [CLIENT FROM SECRET <secret> [IN <service>]] [<client clause> "
+		                "...]");
 	}
 	if (StringUtil::CIEquals(keyword, "add")) {
 		RefuseObjectForm(s, true);
@@ -1016,11 +1014,12 @@ unique_ptr<SQLStatement> ParseMgmtStatement(AdminScanner &s) {
 		}
 		if (s.Accept("issuer")) {
 			RefuseMovedForm(
-			    "write ALTER ISSUER <issuer> SET <URL '<url>' | FROM SECRET <secret> | client clause> ... | "
-			    "DROP [CLIENT] FROM SECRET");
+			    "write ALTER ISSUER <issuer> SET URL '<url>' | [CLIENT] FROM SECRET <secret> [IN <service>] | "
+			    "<client clause> ... | DROP [CLIENT] FROM SECRET");
 		}
 		if (s.Accept("client")) {
-			RefuseMovedForm("write ALTER CLIENT <client> SET <client clause> ... | DROP FROM SECRET");
+			RefuseMovedForm("write ALTER CLIENT <client> SET FROM SECRET <secret> [IN <service>] | <client clause> "
+			                "... | DROP FROM SECRET");
 		}
 		if (s.Accept("grant")) {
 			RefuseMovedForm("write ALTER GRANT CATALOG <catalog> TO ROLE <role> SET CAPS '<json>' | SET RLS "
@@ -1326,7 +1325,7 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 				read = AttributesJson(list.text);
 				break;
 			case MgmtParsed::TextKind::CLAIM_MAP:
-				read = JsonQuote(ClaimMapToJson(list.text)); // text: parsed by the spec, never spliced
+				read = JsonQuote(ClaimMapToJson(list.text)); // kept as a JSON string, which the spec parses
 				break;
 			}
 			if (list.splice.empty()) {
@@ -1334,6 +1333,12 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 			} else {
 				// a list inside a JSON spec: its reading where the rule left its marker
 				entry.args[list.arg] = Value(StringUtil::Replace(entry.args[list.arg].ToString(), list.splice, read));
+			}
+		}
+		for (auto &list : entry.texts) {
+			// a reading is JSON, which never holds a raw control character: one left is a marker nothing replaced
+			if (!list.splice.empty() && StringUtil::Contains(entry.args[list.arg].ToString(), "\x01")) {
+				throw BinderException("acl admin: a list's marker is left in a spec");
 			}
 		}
 		if (entry.current_session) {

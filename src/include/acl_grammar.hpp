@@ -63,10 +63,9 @@ struct MgmtParsed {
 	//! the call is a table function, read in FROM (`CHECK VIRTUAL CATALOG`)
 	bool table_call = false;
 	//! arguments written as a list or a body, as text the compiler's readers take as they always did (a list becomes a
-	//! rule in stage 4): a parenthesised claims list for ClaimsListToCsv, a columns list for UnquoteColumnsList, the
-	//! rest as is
-	//! (spec 095's lists, read inside a JSON spec: ITEMS a list of values, REQUIRE / ATTRIBUTES / CLAIM_MAP their
-	//! readers' JSON - `splice` the marker in the argument the result replaces, '' = the whole argument)
+	//! rule in stage 4): a parenthesised claims list for ClaimsListToCsv, a columns list for UnquoteColumnsList, spec
+	//! 095's lists read into a JSON spec (ITEMS a list of values, REQUIRE / ATTRIBUTES / CLAIM_MAP their readers'
+	//! JSON), the rest as is; `splice` is the marker in the argument the reading replaces, '' = the whole argument
 	enum class TextKind : uint8_t { CLAIMS, COLUMNS, TEXT, ITEMS, REQUIRE, ATTRIBUTES, CLAIM_MAP };
 	struct TextArg {
 		idx_t arg;

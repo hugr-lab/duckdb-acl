@@ -1536,6 +1536,108 @@ ACL ADMIN CREATE CLIENT never 'test/idp/a';
 ----
 write CREATE [OR REPLACE] CLIENT
 
+# each clause once by what it writes: ROLE CLAIM / ROLES FROM both name the role sources, ATTRIBUTES / CLAIM MAP
+# both the attributes - the last took effect (CLAIM MAP read `tenant` from the token where ATTRIBUTES pinned it)
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ROLE CLAIM 'admins' ROLES FROM ('groups');
+----
+ROLE CLAIM / ROLES FROM is written twice
+
+statement error
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET CLAIM MAP (tid => tenant) ATTRIBUTES (tenant = CONSTANT 'acme');
+----
+ATTRIBUTES / CLAIM MAP is written twice
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ROLES FROM ('a') ROLES FROM ('b');
+----
+ROLE CLAIM / ROLES FROM is written twice
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ROLES CONSTANT ('a') ROLES CONSTANT ('b');
+----
+ROLES CONSTANT is written twice
+
+# a comment inside a clause is a space
+statement ok
+ACL ADMIN ALTER ISSUER 'test/idp/a' SET ROLE /* the claim */ CLAIM 'groups' CLAIM -- the map
+MAP (tid => tenant);
+
+query II
+SELECT roles_from, attributes FROM acl_clients() WHERE name = 'test/idp/a';
+----
+["groups"]	[{"name":"tenant","paths":["tid"]}]
+
+# IF NOT EXISTS keeps the client there
+statement ok
+ACL ADMIN CREATE CLIENT IF NOT EXISTS svc ISSUER 'test/idp/a' AUDIENCES ('api://other');
+
+query I
+SELECT audiences FROM acl_clients() WHERE name = 'svc';
+----
+["api://svc2","api://svc3"]
+
+# REQUIRE and ATTRIBUTES take parentheses; a list's items are plain literals - a bare word, `""`, a $$…$$ string and
+# a string continued on the next line (duckdb joins `'api://'⏎'x'`, the list's reader stored the line break) refused
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') REQUIRE 'sub = x';
+----
+REQUIRE takes its conditions in parentheses
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ATTRIBUTES 'tenant = tid';
+----
+ATTRIBUTES takes its list in parentheses
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES api;
+----
+expected audiences, quoted
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') CLIENT ID "";
+----
+zero-length delimited identifier
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ($$x$$);
+----
+a list is written with '...' literals
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') REQUIRE (sub = $$x$$);
+----
+a list is written with '...' literals
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('api://'
+'x');
+----
+a string continued on the next line
+
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ROLES FROM ('rol' -- a note
+'es');
+----
+a string continued on the next line
+
+statement error
+ACL ADMIN CREATE ROLE never CLAIMS (tenant = 'ac'
+'me');
+----
+a string continued on the next line
+
+# ALGS is a key's, a client secret is never written - in a client's ALTER it names FROM SECRET
+statement error
+ACL ADMIN CREATE CLIENT never ISSUER 'test/idp/a' AUDIENCES ('x') ALGS ('RS256');
+----
+keys and algorithms are never written into the policy
+
+statement error
+ACL ADMIN ALTER CLIENT svc SET CLIENT SECRET 's';
+----
+name that secret (FROM SECRET s)
+
 statement ok
 ACL ADMIN DROP CLIENT IF EXISTS nobody; DROP CLIENT svc; DROP ISSUER IF EXISTS 'nobody';
 

@@ -69,8 +69,8 @@ catalog forms refuse.
   so it never reads as two levels. Lineage names a dataset by the same key rules
   (`Sales Mart.main.Order Items`, `c."a.b".Sink`).
 - Quoted values take `'…'` or `"…"`; a doubled quote is a literal one. The empty text is `''` - in
-  the forms read by duckdb's tokenizer (roles, mappings, view-as, the virtual catalog's objects) `""`
-  is an empty identifier, which it refuses.
+  the forms read by duckdb's tokenizer (roles, mappings, view-as, the virtual catalog's objects,
+  grants, issuers and clients) `""` is an empty identifier, which it refuses.
 - A body (after `AS` or `MACRO`) is either one quoted string - the whole body, nothing after it - or
   written inline to the end of the statement: a `;` inside a literal does not end it, one outside
   does. In the forms of the virtual catalog's objects (`CREATE | ALTER VIRTUAL …`, `ADD …`) a `$$…$$`
@@ -78,9 +78,11 @@ catalog forms refuse.
   token or after its last.
 - A list is written `( … )` or as the legacy quoted csv/JSON string; both are accepted wherever a
   list is taken. `WITH (select, insert)` and `CAPS '{"select": true, "insert": true}'` store the same.
-  In the forms of the virtual catalog's objects a comment inside a parenthesised list reads as a space,
-  and a list split into items (columns, keys, pairs, parameters, REMAP, TYPES) refuses a `$$…$$` string,
-  an `E'…'` string with a backslash and a backtick name - an RLS predicate takes any literal.
+  In the forms of the virtual catalog's objects, grants, issuers and clients a comment inside a
+  parenthesised list reads as a space, and a list split into items (columns, keys, pairs, parameters,
+  REMAP, TYPES, an issuer's or a client's lists) refuses a `$$…$$` string, an `E'…'` string with a
+  backslash, a backtick name and a string continued on the next line - an RLS predicate takes any
+  literal.
 - Keywords are case-insensitive. Statements of a batch are separated by `;`.
 - Write modes on `CREATE`: `CREATE` refuses an existing object, `CREATE OR REPLACE` overwrites,
   `CREATE … IF NOT EXISTS` keeps what is there. The legacy `ADD` forms always upsert. Where a
@@ -398,12 +400,13 @@ Functions: `acl_define_role(role, claims_csv[, mode])`, `acl_alter_role(role, cl
 ```
 CREATE [OR REPLACE] ISSUER [IF NOT EXISTS] <name | '<url>'> [URL '<url>'] [FROM SECRET <s> [IN <service>]]
     [<client clause> …] [CLIENT FROM SECRET <s> [IN <service>]]
-ALTER ISSUER <name> SET [URL '<url>'] [FROM SECRET <s> [IN <service>]] [<client clause> …]
+ALTER ISSUER <name> SET [URL '<url>'] [FROM SECRET <s> [IN <service>]] [CLIENT FROM SECRET <s> [IN <service>]]
+    [<client clause> …]
 ALTER ISSUER <name> DROP FROM SECRET | DROP CLIENT FROM SECRET
 DROP ISSUER [IF EXISTS] <name>
 
 CREATE [OR REPLACE] CLIENT [IF NOT EXISTS] <name> ISSUER <issuer> <client clause> … [FROM SECRET <s> [IN <service>]]
-ALTER CLIENT <name> SET <client clause> … | DROP FROM SECRET
+ALTER CLIENT <name> SET [FROM SECRET <s> [IN <service>]] <client clause> … | DROP FROM SECRET
 DROP CLIENT [IF EXISTS] <name>
 
 <client clause> := AUDIENCES ('<aud>', …) | AZP ('<azp>', …)
@@ -418,7 +421,9 @@ DROP CLIENT [IF EXISTS] <name>
 
 An issuer is the trust anchor of one IdP (spec 095); a client is which of its tokens count and what
 they become. The model, the routing and the role rules are in
-[authentication.md](authentication.md#issuers-and-clients-spec-095).
+[authentication.md](authentication.md#issuers-and-clients-spec-095). The clauses come in any order,
+each once - and `ROLE CLAIM` / `ROLES FROM` (both the role sources) and `ATTRIBUTES` / `CLAIM MAP`
+(both the attributes) are one clause each: the second would take effect while a reader saw the first.
 
 - **The short form.** A quoted URL in place of a name, with client clauses, is one issuer and its
   implicit client of the same name - `UNMAPPED AS ROLE`, flows `authcode, device` for a public client

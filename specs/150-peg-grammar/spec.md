@@ -277,8 +277,14 @@ until the last PR of the stage, which judges the batch by its parse and drops `A
   the lists' literal rule. Fixed with the move (3c's review): `ClaimMapToJson` quotes each side as JSON and splits at
   an `=>` outside quotes - it pasted the sides, so `('x' => 'a", "groups": "tenant')` stored a second, hidden
   attribute (`tenant` from `groups`, what RLS reads through `acl_claim`), and `('a=>b' => 'c')` split inside the
-  quotes. Changed: each clause once (a repeated one wrote its key twice into the spec JSON), comments inside these
-  forms, `""` the tokenizer's.
+  quotes. Changed: each clause once, by what it writes - `ROLE CLAIM` / `ROLES FROM` (both `roles_from`) and
+  `ATTRIBUTES` / `CLAIM MAP` (both the attributes) are one clause each (a repeated one wrote its key twice into the
+  spec JSON and the last took effect: `ATTRIBUTES (tenant = CONSTANT 'acme') CLAIM MAP (tid => tenant)` read
+  `tenant` from the token); comments inside these forms after their first words (one after `CREATE` / `ALTER` /
+  `DROP` is 3g's classification); `""` the tokenizer's; a list item continued on the next line refused (duckdb joins
+  `'rol'⏎'es'`, the list's reader stored `rol'⏎'es`) - in the claims lists of 3b too. 3e's review also found two
+  holes of spec 117's authorizer (a name written in another case, a batch mapping and granting manage together) -
+  spec 152's.
 - 3f: function categories and grants, platform grants, sources, resource groups.
 - 3g: `GRANT | REVOKE SECRET`, `USE [SCHEMA]`, `ATTACH … LINEAGE`, the batch's classification by its parse;
   `AdminScanner` and `SplitBatchText` go; `RegisterMgmtGrammar` becomes rules (hugr-node re-pins).
