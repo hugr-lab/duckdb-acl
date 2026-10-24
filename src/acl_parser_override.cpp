@@ -54,151 +54,88 @@ struct AclPrefix {
 	string traceparent;
 	//! spec 107: the client's lineage context - `LINEAGE PARENT '<ns/job/run>' [ROOT '<...>'] [JOB '<name>']`
 	LineageContext lineage;
-	bool lineage_written = false; // spec 150: written, whatever its values (an empty JOB '' is still written)
 };
 
-AclPrefix ParseAclPrefix(const string &query) {
+//! spec 150: the prefix's head as the rule read it, held to the rules the scanner kept - each marker once, a
+//! lineage parent a run reference, an INGEST with no mode marker, an ADMIN native unless marked - and its rest.
+//! A text that does not start with the word ACL is nobody's prefix and costs no tokenizing.
+AclPrefix ReadAclPrefix(AclGrammarCache &grammar, const string &query, ParserOptions &options) {
 	AclPrefix prefix;
 	idx_t pos = 0;
 	SkipWhitespace(query, pos);
-	auto keyword = ReadWord(query, pos);
-	if (!StringUtil::CIEquals(keyword, "acl")) {
+	if (!StringUtil::CIEquals(ReadWord(query, pos), "acl")) {
 		return prefix; // not our syntax
 	}
-	SkipWhitespace(query, pos);
-	auto mode = ReadWord(query, pos);
-	//! Read the client's marker off the remainder: `ACL [NATIVE]`
-	auto read_marker = [&](idx_t &scan) {
-		SkipWhitespace(query, scan);
-		auto saved = scan;
-		if (!StringUtil::CIEquals(ReadWord(query, scan), "acl")) {
-			scan = saved;
-			return AclPrefix::Mode::QUERY;
-		}
-		SkipWhitespace(query, scan);
-		auto after_acl = scan;
-		if (StringUtil::CIEquals(ReadWord(query, scan), "native")) {
-			return AclPrefix::Mode::NATIVE;
-		}
-		scan = after_acl;
-		return AclPrefix::Mode::MANAGE;
-	};
-	//! Read the trace markers off the remainder, in either order: `[TRACE '<id>'] [PARENT '<tp>']`.
-	//! Each at most once: the one the door or the gateway composed is the statement's, and a second
-	//! one written in the SQL text behind it must not replace it (the 2026-09-04 review).
-	auto read_trace = [&](idx_t &scan) {
-		bool seen_trace = false;
-		bool seen_parent = false;
-		bool seen_lineage = false;
-		for (;;) {
-			SkipWhitespace(query, scan);
-			auto saved = scan;
-			auto word = ReadWord(query, scan);
-			bool trace = StringUtil::CIEquals(word, "trace");
-			bool parent = StringUtil::CIEquals(word, "parent");
-			if (StringUtil::CIEquals(word, "lineage")) {
-				// spec 107: `LINEAGE [PARENT '<ns/job/run>'] [ROOT '<ns/job/run>'] [JOB '<name>']` - once
-				if (seen_lineage) {
-					throw ParserException("acl_rewrite: ACL LINEAGE may be written once in a prefix");
-				}
-				seen_lineage = true;
-				prefix.lineage_written = true;
-				bool any = false;
-				for (;;) {
-					SkipWhitespace(query, scan);
-					auto part_start = scan;
-					auto part = ReadWord(query, scan);
-					string *target = StringUtil::CIEquals(part, "parent") ? &prefix.lineage.parent
-					                 : StringUtil::CIEquals(part, "root") ? &prefix.lineage.root_parent
-					                 : StringUtil::CIEquals(part, "job")  ? &prefix.lineage.job
-					                                                      : nullptr;
-					if (!target) {
-						scan = part_start;
-						break;
-					}
-					if (!target->empty()) {
-						throw ParserException("acl_rewrite: ACL LINEAGE %s may be written once",
-						                      StringUtil::Upper(part));
-					}
-					SkipWhitespace(query, scan);
-					if (scan >= query.size() || (query[scan] != '\'' && query[scan] != '"')) {
-						throw ParserException("acl_rewrite: ACL LINEAGE %s requires a quoted value",
-						                      StringUtil::Upper(part));
-					}
-					auto raw = ReadQuoted(query, scan);
-					// spec 109: a parent the transport would have to drop is refused here, where the
-					// client can still hear it - judged before the bound, which would cut its runId
-					string malformed;
-					if (target != &prefix.lineage.job && !LineageRunRefCheck(raw, malformed)) {
-						throw ParserException("acl_rewrite: ACL LINEAGE %s: %s", StringUtil::Upper(part), malformed);
-					}
-					*target = BoundLineage(raw);
-					any = true;
-				}
-				if (!any) {
-					throw ParserException("acl_rewrite: ACL LINEAGE needs PARENT, ROOT or JOB");
-				}
-				continue;
-			}
-			if (!trace && !parent) {
-				scan = saved;
-				return;
-			}
-			if (trace ? seen_trace : seen_parent) {
-				throw ParserException("acl_rewrite: ACL %s may be written once in a prefix",
-				                      trace ? "TRACE" : "PARENT");
-			}
-			(trace ? seen_trace : seen_parent) = true;
-			SkipWhitespace(query, scan);
-			if (scan >= query.size() || (query[scan] != '\'' && query[scan] != '"')) {
-				throw ParserException("acl_rewrite: ACL %s requires a quoted value", trace ? "TRACE" : "PARENT");
-			}
-			(trace ? prefix.correlation_id : prefix.traceparent) = ReadQuoted(query, scan);
-		}
-	};
-	if (StringUtil::CIEquals(mode, "admin")) {
-		prefix.kind = AclPrefix::Kind::ADMIN;
-		read_trace(pos);
-		// the gateway's own hatch: native by default, management when marked (or written bare)
-		auto marked = read_marker(pos);
-		prefix.marked = marked != AclPrefix::Mode::QUERY;
-		prefix.mode = prefix.marked ? marked : AclPrefix::Mode::NATIVE;
-		prefix.rest = query.substr(pos);
-		return prefix;
-	}
-	if (StringUtil::CIEquals(mode, "ingest")) {
-		// spec 049: the door's own composition for its ingest INSERT - a session handle, then the
-		// statement. Only the trace and lineage markers ride here (spec 112 §4: an ingest's run has
-		// its call's context); no mode marker - the remainder must be the INSERT itself, and an
-		// embedded `ACL ...` is mid-statement garbage exactly as it is after any other prefix.
-		SkipWhitespace(query, pos);
-		if (pos >= query.size() || (query[pos] != '\'' && query[pos] != '"')) {
-			throw ParserException("acl_rewrite: ACL INGEST requires a quoted session handle");
-		}
-		prefix.kind = AclPrefix::Kind::INGEST;
-		prefix.value = ReadQuoted(query, pos);
-		read_trace(pos);
-		prefix.rest = query.substr(pos);
-		return prefix;
-	}
-	bool is_role = StringUtil::CIEquals(mode, "role");
-	bool is_token = StringUtil::CIEquals(mode, "token");
-	// a session stands for a token a door already verified, so the handle rides where the token did
-	// and everything after it - the markers, the batch - reads the same way (spec 040)
-	bool is_session = StringUtil::CIEquals(mode, "session");
-	if (!is_role && !is_token && !is_session) {
+	GrammarPrefix head;
+	if (!grammar.ReadPrefix(query, options, head)) {
 		return prefix; // "ACL <unknown>" -> leave for the native parser (NONE)
 	}
-	SkipWhitespace(query, pos);
-	if (pos >= query.size() || (query[pos] != '\'' && query[pos] != '"')) {
-		throw ParserException("acl_rewrite: ACL %s requires a quoted value", mode);
+	switch (head.kind) {
+	case GrammarPrefix::Kind::ROLE:
+		prefix.kind = AclPrefix::Kind::ROLE;
+		break;
+	case GrammarPrefix::Kind::TOKEN:
+		prefix.kind = AclPrefix::Kind::TOKEN;
+		break;
+	case GrammarPrefix::Kind::SESSION:
+		// a session stands for a token a door already verified (spec 040)
+		prefix.kind = AclPrefix::Kind::SESSION;
+		break;
+	case GrammarPrefix::Kind::INGEST:
+		// spec 049: the door's own composition for its ingest INSERT - the remainder is the INSERT itself
+		prefix.kind = AclPrefix::Kind::INGEST;
+		break;
+	case GrammarPrefix::Kind::ADMIN:
+		prefix.kind = AclPrefix::Kind::ADMIN;
+		break;
 	}
-	prefix.kind = is_role ? AclPrefix::Kind::ROLE : (is_session ? AclPrefix::Kind::SESSION : AclPrefix::Kind::TOKEN);
-	prefix.value = ReadQuoted(query, pos);
-	read_trace(pos);
-	prefix.mode = read_marker(pos);
-	prefix.marked = prefix.mode != AclPrefix::Mode::QUERY;
-	prefix.rest = query.substr(pos);
+	prefix.value = head.value;
+	// each marker at most once: the one the door or the gateway composed is the statement's, and a second one
+	// written in the SQL text behind it must not replace it (the 2026-09-04 review)
+	if (head.lineage_written > 1) {
+		throw ParserException("acl_rewrite: ACL LINEAGE may be written once in a prefix");
+	}
+	for (auto &marker : head.markers) {
+		if (marker.word == "trace" || marker.word == "parent") {
+			auto &target = marker.word == "trace" ? prefix.correlation_id : prefix.traceparent;
+			if (!target.empty()) {
+				throw ParserException("acl_rewrite: ACL %s may be written once in a prefix",
+				                      StringUtil::Upper(marker.word));
+			}
+			target = marker.value;
+			continue;
+		}
+		// spec 107: `LINEAGE [PARENT '<ns/job/run>'] [ROOT '<ns/job/run>'] [JOB '<name>']`
+		auto part = marker.word.substr(strlen("lineage."));
+		string *target = part == "parent" ? &prefix.lineage.parent
+		                 : part == "root" ? &prefix.lineage.root_parent
+		                                  : &prefix.lineage.job;
+		if (!target->empty()) {
+			throw ParserException("acl_rewrite: ACL LINEAGE %s may be written once", StringUtil::Upper(part));
+		}
+		// spec 109: a parent the transport would have to drop is refused here, where the client can still hear
+		// it - judged before the bound, which would cut its runId
+		string malformed;
+		if (target != &prefix.lineage.job && !LineageRunRefCheck(marker.value, malformed)) {
+			throw ParserException("acl_rewrite: ACL LINEAGE %s: %s", StringUtil::Upper(part), malformed);
+		}
+		*target = BoundLineage(marker.value);
+	}
+	if (prefix.kind == AclPrefix::Kind::INGEST) {
+		if (head.mode_written) {
+			throw ParserException("acl_rewrite: ACL INGEST carries no mode marker - the remainder is the INSERT");
+		}
+	} else if (prefix.kind == AclPrefix::Kind::ADMIN) {
+		// the gateway's own hatch: native by default, management when marked (or written bare)
+		prefix.marked = head.mode_written;
+		prefix.mode = head.mode_written && !head.native ? AclPrefix::Mode::MANAGE : AclPrefix::Mode::NATIVE;
+	} else {
+		prefix.marked = head.mode_written;
+		prefix.mode = !head.mode_written ? AclPrefix::Mode::QUERY
+		              : head.native      ? AclPrefix::Mode::NATIVE
+		                                 : AclPrefix::Mode::MANAGE;
+	}
+	prefix.rest = query.substr(head.rest_start);
 	return prefix;
 }
 
@@ -704,8 +641,8 @@ bool OnlyViewAsCalls(vector<unique_ptr<SQLStatement>> &statements) {
 
 //! One prefixed batch, decided. Every refusal throws; the caller turns the outcome into the audit's
 //! events, so this only has to say what it is doing (`audit.phase`) and whom it is doing it for.
-ParserOverrideResult Prefixed(PolicyStore &store, const string &query, const AclPrefix &prefix, ParserOptions &options,
-                              StatementAudit &audit, optional_ptr<AclGrammarCache> grammar) {
+ParserOverrideResult Prefixed(PolicyStore &store, const AclPrefix &prefix, ParserOptions &options,
+                              StatementAudit &audit) {
 	auto mode = prefix.mode;
 	bool anonymous = prefix.kind == AclPrefix::Kind::ADMIN;
 	bool principal_prefix = prefix.kind == AclPrefix::Kind::ROLE || prefix.kind == AclPrefix::Kind::TOKEN ||
@@ -843,41 +780,7 @@ ParserOverrideResult Prefixed(PolicyStore &store, const string &query, const Acl
 		inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
 	}
 	vector<unique_ptr<SQLStatement>> statements;
-	// spec 150, stage 1: the role prefix and its statements as ONE parse of duckdb's parser with our rule
-	bool peg = false;
-	if (grammar && PegPrefixEnabled(options) && prefix.kind == AclPrefix::Kind::ROLE &&
-	    mode == AclPrefix::Mode::QUERY && !prefix.marked && !prefix.lineage_written &&
-	    UseSchemaAsSet(prefix.rest) == prefix.rest) {
-		AclParseGuard guard;
-		PegPrefix parsed;
-		if (grammar->ParsePrefixed(query, options, parsed)) {
-			// the two readers must agree on the principal, the markers and where the statement starts. The scanner
-			// reads no comment: what lies between where it stopped and where the rule's statement starts may be
-			// comments only (a tool's `/* … */` before its SQL), and separators when the prefix has no statement of
-			// its own - a marker there is the two reading two prefixes
-			auto rest_start = query.size() - prefix.rest.size();
-			bool agree = parsed.role == prefix.value && parsed.correlation_id == prefix.correlation_id &&
-			             parsed.traceparent == prefix.traceparent && parsed.statement_start >= rest_start;
-			if (agree) {
-				auto gap = query.substr(rest_start, parsed.statement_start - rest_start);
-				for (auto &token : Parser::Tokenize(gap)) {
-					bool separator = !parsed.has_statement &&
-					                 token.type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR &&
-					                 gap[token.start] == ';';
-					agree = agree && (token.type == SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT || separator);
-				}
-			}
-			if (!agree) {
-				NoteDenyReason(Reason::PARSE);
-				throw ParserException(
-				    "acl_rewrite: the ACL prefix reads two ways - write the principal and its markers "
-				    "plainly, with no comment or split string among them (spec 150)");
-			}
-			statements = std::move(parsed.statements);
-			peg = true;
-		}
-	}
-	if (!peg && (mode != AclPrefix::Mode::NATIVE || !ParseAttachLineage(prefix.rest, inner, statements))) {
+	if (mode != AclPrefix::Mode::NATIVE || !ParseAttachLineage(prefix.rest, inner, statements)) {
 		AclParseGuard guard;
 		Parser parser(inner);
 		// spec 114: `USE SCHEMA s` - a form duckdb's grammar lacks - is the session's default schema
@@ -1041,7 +944,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 	auto &store = *info->Cast<AclParserInfo>().store;
 	AclPrefix prefix;
 	try {
-		prefix = ParseAclPrefix(query);
+		prefix = ReadAclPrefix(*info->Cast<AclParserInfo>().grammar, query, options);
 	} catch (std::exception &ex) {
 		// a prefix that does not scan (an unterminated quote, a bare ACL TOKEN) is a refusal too, and
 		// counted as one: nobody is known yet, so it is the gateway's, and a parse
@@ -1084,7 +987,7 @@ ParserOverrideResult AclParserOverride(ParserExtensionInfo *info, const string &
 		audit.OnSession(store, prefix.value); // known before anything is judged: a parse error names it too
 	}
 	try {
-		auto result = Prefixed(store, query, prefix, options, audit, info->Cast<AclParserInfo>().grammar.get());
+		auto result = Prefixed(store, prefix, options, audit);
 		audit.Allowed();
 		return result;
 	} catch (std::exception &ex) {

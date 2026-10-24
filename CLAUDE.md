@@ -458,18 +458,21 @@ copies the caller's `ParserOptions`, so a grammar extension's ordinary AST is wa
 (confined, not refused) and one yielding an `ExtensionStatement` is denied; the grammar is the
 connection owner's (`SET active_grammar_extensions` / `current_dialect` refused under every prefix). The
 prefix/management grammar as PEG rules is spec 150's.
-**Spec 150 — our grammar on the PEG parser** (in stages; stage 1 built): no statement text parsed by hand. Stage 1
-(`acl_grammar.{hpp,cpp}`, behind `acl_peg_prefix`, GLOBAL, off): `AclPrefixedStatement <- 'ACL' 'ROLE' AclQuotedValue
-AclTraceMarker* Statement?`, prepended to `Statement`; its transform yields an `ExtensionStatement` whose plan function
-refuses (`IsPrefixStatement`), carrying the role, the markers and the statement (its PIVOT entries taken and cleared,
-its named parameters, its text cut from the rule's offsets). `AclGrammarCache` (on `AclParserInfo`, per instance)
-compiles the connection's grammar extensions with ours behind them (`CompiledGrammar::Create`); the rules are also
-registered as the grammar extension `acl` for CLI completion only (`SET active_grammar_extensions = ['acl']`). In
-`Prefixed` a role prefix in query mode (no LINEAGE / `ACL [NATIVE]` / `USE SCHEMA`; not CONNECT-ed, no dialect) takes
-the rule's statements; the readers must agree on role, markers and where the statement starts (only comments between,
-and `;` for a prefix with no statement, judged by `Parser::Tokenize`), else `parse` "reads two ways". The whole suite passed with it on by default; no cost
-past noise. Stage 2 moves every prefix and marker and drops the scanner; CONNECT-ed / dialect connections refuse a
-prefix. Tests `acl_peg_prefix.test`, `acl_peg_completion.test`.
+**Spec 150 — our grammar on the PEG parser** (in stages; 1 and 2 built): no statement text parsed by hand. The prefix's
+HEAD is a rule (`acl_grammar.{hpp,cpp}`): `AclPrefixedStatement <- 'ACL' AclPrincipal AclMarker* AclMode? AclTail?`
+(`ROLE|TOKEN|SESSION|INGEST` + `AclQuotedValue`, or `ADMIN`; `TRACE|PARENT` and `LINEAGE PARENT|ROOT|JOB` markers;
+`ACL [NATIVE]`), prepended to `Statement`, its transform an `ExtensionStatement` whose plan function refuses
+(`IsPrefixStatement`). The override's variant (`acl_prefix_head`, never registered) passes the rest through as tokens
+(`AclTail <- AclTailToken+`, duckdb's `PassthroughTokenMatcher` as a terminal override) and `ReadPrefix` parses ONE
+top-level statement on duckdb's tokens, then: each value one plain literal (`WrittenPlainly`: the token is the value in
+its quotes - no string joined across a line break, no `E'…'`, no bare name; never empty), `rest_start` past the head's
+last token and its whitespace (where the scanner left it). `ReadAclPrefix` (acl_parser_override.cpp) keeps the
+scanner's rules (markers once, LINEAGE parent a run ref, INGEST no mode marker, ADMIN native unless marked) and the
+rest is parsed as its own text per mode, as before (positions, peelers, NATIVE). The registered variant (`acl`, tail
+`Statement`) is for CLI completion only. `AclGrammarCache` (on `AclParserInfo`, per instance) compiles the connection's
+grammar extensions with ours behind them; a CONNECT-ed / dialect connection refuses a prefix. A text not starting with
+the word ACL is never tokenized. Stage 3 moves the management statements, stage 4 the policy texts. Tests
+`acl_prefix_grammar.test`, `acl_prefix_completion.test`.
 
 **Spec 082 — secrets through the ACL** (tresor spec 009's acl side): the node's secrets live in an
 attached catalog of type `tresor`, never its own secret manager. Under the explicit `secrets`

@@ -1,6 +1,6 @@
 # Spec 150: our grammar on the PEG parser - no statement text parsed by hand
 
-- **Status**: draft (stage 1, the prototype, in progress)
+- **Status**: accepted; stages 1 and 2 implemented, 3 and 4 to come
 - **Date**: 2026-10-23
 - **Author**: hugr lab (the owner, 2026-10-23: "отдельная спека с переделкой всей нашей семантики (грамматики) в
   рерайтере на peg парсер ... вообще не будем разбирать текст запроса вручную")
@@ -56,15 +56,26 @@ by the same compiled grammar, which includes them.
 statements there; it is the connection owner's native mode (the owner, 2026-10-23), refused under every prefix
 (`statement type CONNECT is not permitted under ACL`, also `DISCONNECT`). A prefix on a CONNECT-ed connection, or under
 a dialect (`current_dialect`, refused under a prefix since spec 132), is refused from stage 2 on: nothing of ours can
-be added to their grammars, and nothing there runs as a principal. Stage 1 leaves both to the scanner.
+be added to their grammars, and nothing there runs as a principal.
 
-**What the rules yield.** A rule's transform (`std::function<arena_ptr<TransformProcess>(PEGTransformer &,
-ParseResult &)>`) returns typed results. duckdb parses a text one top-level statement at a time, so the prefix rule
-is a choice of `Statement` and yields one statement of ours, an `ExtensionStatement` of acl's parser extension. It
-carries the principal, the markers and the statement behind them; the statements after it in the batch are the
-prefix's too, and a second prefix among them is refused. The override verifies the principal and rewrites the statements, as it does today
-from the scanner's output. A management rule yields the compiled call it compiles to today, so the authorizer and the
-admin functions do not change.
+**What the rules yield (stage 2, the owner's choice of 2026-10-24).** The prefix rule reads the HEAD -
+`ACL ROLE|TOKEN|SESSION|INGEST '<value>' | ACL ADMIN`, the markers (`TRACE`, `PARENT`, `LINEAGE PARENT|ROOT|JOB`, in
+any order) and the client's mode marker (`ACL`, `ACL NATIVE`) - and passes the rest of its statement through as
+tokens: `AclTail <- AclTailToken+`, the token matched by duckdb's own `PassthroughTokenMatcher` (the mechanism of its
+passthrough dialect) as a terminal override. The override parses ONE top-level statement on duckdb's tokens; the
+transform yields an `ExtensionStatement` carrying what the head says and where the rest starts. The rest is then parsed
+as its own text, the way its mode parses it - a query by the standard parser with the connection's grammar extensions
+(their syntax under `ACL ROLE` is confined or refused exactly as spec 132 says), `ACL NATIVE` as duckdb's own SQL
+(other extensions' parsers included - break-glass), management by today's compiler until stage 3. Two calls, not one:
+the rest parsed as its own text keeps every error position right and keeps the prefix - a token, a session handle -
+out of duckdb's query text; stage 1 parsed the statement inside the rule, and its positions counted from the whole text
+(no generic walker could shift them all, spec 139). A management rule (stage 3) yields the compiled call it compiles to
+today, so the authorizer and the admin functions do not change.
+
+**Each value is one plain literal.** duckdb's tokenizer joins string literals across a line break (`'ana'` then
+`'lyst'` on the next line is `'analyst'`) - a client writing after a gateway's `ACL ROLE 'ana'` would finish its role's
+name. Every value in the head must be its own token, written as the value in its quotes (`WrittenPlainly`): no joined
+string, no `E'…'`, no bare name, never empty. Comments among the markers are comments now (the scanner read none).
 
 **Batches.** A prefix covers a statement list, as today:
 
@@ -79,52 +90,39 @@ quack does (the same collector), and Flight refuses a batch at Prepare. Owner, 2
 
 1. A prototype: the prefix `ACL ROLE "r" <statements>` as a rule beside the scanner, behind a setting. It answers the
    open questions below and measures the parse; the owner decides the shape.
-2. The prefix and its markers move; the scanner goes.
+2. The prefix and its markers move; the scanner goes. Built (below).
 3. The management statements move, one statement family per PR; the compiled calls stay unchanged.
 4. Policy texts become rules and stored rows are emitted from trees; `ParseColumnList` / `SplitTopLevel` go.
 
-**Stage 1, measured (2026-10-23)** - `acl_grammar.{hpp,cpp}`, behind `acl_peg_prefix` (GLOBAL, off):
-`AclPrefixedStatement <- 'ACL' 'ROLE' AclQuotedValue AclTraceMarker* Statement?`, prepended to `Statement`, taken
-by the override for a role prefix in query mode (LINEAGE, the `ACL [NATIVE]` markers, `USE SCHEMA` and management
-stay the scanner's in this stage; the scanner's text checks still run first).
+**Stage 1, the prototype (2026-10-23, #259)** - the role prefix as a rule taking the statement inside it, behind
+`acl_peg_prefix`, beside the scanner. Measured with the rule on by default: the whole suite and `make test-cpp` pass;
+5,000 prefixed statements 1.04-1.06 s against the scanner's 1.02-1.12 s; the grammar compiles once per set of the
+caller's extensions, about 2 ms; a rule's keyword reserves nothing (`SELECT acl FROM acl`). Its reviews found what
+stage 2 is built on: a comment inside the prefix made the two readers disagree (an internal error a principal could
+reach), the statement inside the rule had its positions counted from the whole text, and an implicit PIVOT's entries
+and the statement's parameters must be taken by the rule. Found building it: a helper rule without a transform cannot
+be transformed (descend to `StringLiteral` / `Identifier`); a token rule (`QuotedIdentifier`) cannot be named from a
+rule.
 
-- With the rule on by default, the whole sqllogictest suite (129 files) and `make test-cpp` (29) pass. Two PIVOT files
-  failed at first: the rule must take the statement's pivot entries itself and clear them, or the top level wraps
-  the prefix in them again. The role and the markers never differed from the scanner's.
-- `acl` stays a name: a rule keyword that is no keyword of duckdb's reserves nothing (`SELECT acl FROM acl`).
-- Cost: 5,000 prefixed statements 1.04-1.06 s against the scanner's 1.02-1.12 s - no difference past noise; the
-  first statement compiles the grammar, about 2 ms, once per set of the caller's grammar extensions.
-- Found in building it: a helper rule without a transform cannot be transformed (the transform descends to the base
-  rules - `StringLiteral`, `Identifier`); a token rule (`QuotedIdentifier`) cannot be named from a rule (it is a
-  regex), so "quoted only" is judged on the token in stage 2; the inner statement's text, a CREATE's `sql` and the
-  named parameters are set by the rule's caller, not by duckdb, for a statement inside a rule.
-- The two readers must agree on the role, the markers and where the statement starts; between where the scanner
-  stopped and the rule's statement only comments may lie (and separators for a prefix with no statement of its own),
-  judged by duckdb's tokenizer. A comment inside the prefix or a string the tokenizer joins across a line break makes
-  them read two prefixes - refused as a parse ("reads two ways"), never an internal error (the reviews found the
-  internal error reachable by a principal, with its stack trace sent to the client).
-- Where they still differ, found by the reviews, for stage 2 to decide: `ACL ROLE ""` (the rule refuses a zero-length
-  quoted identifier, the scanner reads an empty role; `''` reads the same either way); a syntax error's caret in the
-  first statement, and a binder error's, in the first statement lands the prefix's length to the
-  right on one path or the other (the rule's expressions count from the whole text, its text is cut) - the rule's
-  statement must carry positions of its own; foreign syntax after the prefix (a co-loaded extension's peeler) is refused as `parse`, the scanner's path
-  as `statement_type` (spec 067) - stage 2 hands the remainder to the peeler for `ACL NATIVE`.
-- A prefix in a position where duckdb's grammar takes a `Statement` - `PREPARE p AS ACL ROLE …`, a CTE body, a CTAS -
-  parses to our statement and is refused by duckdb's own transforms ("not a preparable statement" and the like);
-  were one ever to pass, the plan function refuses it.
-- Completion: with `SET active_grammar_extensions = ['acl']`, `sql_auto_complete('AC')` offers `ACL`, `'ACL '` offers
-  `role`, and after the prefix the statements; a rule's keywords are suggested unless the rule suppresses them.
+**Stage 2 (2026-10-24)** - `ReadAclPrefix` (acl_parser_override.cpp) over `AclGrammarCache::ReadPrefix`
+(acl_grammar.cpp): a text not starting with the word ACL is never tokenized; `ACL <unknown>` is left to duckdb's
+parser, as before; the scanner's rules are kept (each marker once, a lineage parent a run reference, INGEST with no
+mode marker, ADMIN native unless marked) and the rest starts where the scanner left it, past the head and its
+whitespace. The scanner, the stage 1 path and `acl_peg_prefix` are gone. The registered `acl` grammar (completion) has
+`AclTail <- Statement`, so the CLI offers the statements after the prefix. A prefix in a position where duckdb's
+grammar takes a `Statement` - `PREPARE p AS ACL ROLE …`, a CTE body, a CTAS - parses to our statement (on a connection
+with `acl` on) and is refused by duckdb's own transforms or by the plan function.
 
 **Open questions**
 
-1. Errors and completion: the parser's error positions and suggestions for `ACL …`.
-2. Stored policy rows are text by contract (read back and pasted). Either parse them with the rule at read and emit
+1. Stored policy rows are text by contract (read back and pasted). Either parse them with the rule at read and emit
    the tree, or keep spec 148's check.
 
 ## Enforcement & security
 
-- **One reader.** The text is parsed once, by duckdb's parser with our rules. The prefix, the markers and the
-  statements are the parse tree's, so there is no second reading to disagree with.
+- **One reader.** The head is read by duckdb's tokenizer and our rule; the rest starts at a token boundary the rule
+  found and is parsed by duckdb's parser. No hand scanner reads where the prefix ends, so there is no second reading
+  to disagree with. Each value is one plain literal - a string continuation cannot extend a principal's name.
 - **Fail closed.**
   - The override still claims every text (`STRICT`), and a parse that fails is a refusal, as now.
   - With the override off (`DEFAULT`), an `ACL …` text is a parse error on a connection that has not switched `acl`
@@ -132,25 +130,31 @@ stay the scanner's in this stage; the scanner's text checks still run first).
     plans nothing.
   - Our statement never leaves the override unrewritten.
   - A rule never yields a statement the rewriter has not seen.
-- **Nothing widens.** Every refusal the scanner makes is kept: a second prefix, a mixed batch, `USE` without a
-  session, foreign syntax under the prefix (spec 067's three rows and spec 132's fourth). The tests pin them before the
-  scanner goes.
+- **Nothing widens.** Every refusal the scanner made is kept: a second prefix, a mixed batch, `USE` without a
+  session, foreign syntax under the prefix (spec 067's three rows and spec 132's fourth), each marker once. Newly
+  refused: an empty value, a value that is not one plain literal, a prefix on a CONNECT-ed connection or under a
+  dialect, a mode marker after INGEST.
 - **The golden rule holds.** A rule adds no parameters; a client's `$1` / `?` stays the only parameter.
 
 ## Testing
 
 - Every existing grammar test passes unchanged at each stage, since the grammar is the same language.
-- Before stage 2, tests pin the batch behaviour: the gateway answers the first row-returning result, the quack door
-  answers as native quack, and Flight refuses a batch.
+- The batch behaviour is pinned: the gateway answers the first row-returning result (`acl_prefix_grammar.test`), the
+  quack door answers as native quack and refuses the batch when one statement is refused (`test_acl_quack_embed`),
+  Flight refuses a batch at Prepare (`test/e2e/flight/adbc_client.py`).
+- `acl_prefix_grammar.test`: every kind, the markers in any order and quoted either way, each value one plain literal,
+  the rest's text and error positions, the empty prefix and a separator after it; `acl_prefix_completion.test`.
 - Negative tests cover what the hand parser accepted and the rules refuse.
-- The prototype ran the whole suite with the rule on by default; on every statement it takes, the role, the markers
-  and the statement's start are compared with the scanner's (a parse refusal when they differ), and the tests that
-  make them differ (a comment or a split string inside the prefix) are what shows the rule's path ran.
+- Stage 1 ran the whole suite with the rule on by default beside the scanner; stage 2 runs it with the rule alone.
 
 ## Alternatives considered
 
 - **Keep the scanner and harden it.** The disagreement class stays, and every new form needs both readers kept in
   step.
+- **One call: the statement inside the prefix rule** (stage 1's form). The AST is the same - duckdb's parser with the
+  connection's grammar extensions builds it either way - but the statement's positions count from the whole text while
+  its text must stay cut (the prefix carries a token or a session handle), `ACL NATIVE` would lose other extensions'
+  own parsers, and management text has no rule until stage 3.
 - **Depend on the registered grammar** (switched on per connection by `active_grammar_extensions`). A connection owner
   could switch it off, and every door and gateway connection would have to set it. The override compiles ours in, and
   the registration is for completion only.

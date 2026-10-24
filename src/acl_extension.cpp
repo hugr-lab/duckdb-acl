@@ -86,10 +86,6 @@ shared_ptr<acl::PolicyStore> LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("acl_jwt_clock_skew", "acl: allowed clock skew in seconds for JWT exp/nbf checks",
 	                          LogicalType::BIGINT, Value::BIGINT(60), nullptr, SetScope::GLOBAL);
-	// spec 150, stage 1 (the prototype): the role prefix parsed by duckdb's parser with our rule
-	config.AddExtensionOption("acl_peg_prefix",
-	                          "acl: parse `ACL ROLE` batches with the PEG prefix rule (spec 150 prototype)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::GLOBAL);
 	// the audit (spec 069): the instance's level, the pipeline's bounds, the base file sink, the node's
 	// name on every event, the Prometheus rendering on the embedded listener - all read through the
 	// instance by the audit thread and the emitting seams, so GLOBAL

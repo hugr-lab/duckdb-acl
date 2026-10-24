@@ -1,0 +1,259 @@
+# name: test/sql/acl_prefix_grammar.test
+# description: spec 150, stage 2 - the ACL prefix's head read by a rule of duckdb's parser, the rest parsed
+#   as its own text: every kind, the markers in any order and quoted either way, each value one plain
+#   literal, the rest where the scanner left it, and a bare statement parsed as before
+# group: [sql]
+
+require acl
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.sales(region VARCHAR, quarter VARCHAR, amount INT);
+
+statement ok
+INSERT INTO phys.main.sales VALUES ('east', 'q1', 10), ('east', 'q2', 20), ('west', 'q1', 5), ('hidden', 'q9', 99);
+
+statement ok
+CREATE SCHEMA phys.lake;
+
+statement ok
+ATTACH ':memory:' AS aclcat;
+
+statement ok
+SELECT acl_use_db('aclcat', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SET GLOBAL acl_audit_level='decisions';
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.sales AS phys.main.sales;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE c.sales TO ROLE analyst WITH (select) RLS (region <> 'hidden');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL SCHEMA c.lake FROM phys.lake;
+
+statement ok
+ACL ADMIN GRANT SCHEMA c.lake TO ROLE analyst WITH (select, insert, create);
+
+statement ok
+ACL ADMIN GRANT FUNCTION current_query TO ROLE analyst;
+
+# --- a bare statement parses as before: `acl` stays a name ---------------------------------------
+
+statement ok
+CREATE TABLE acl AS SELECT 1 AS acl;
+
+query I
+SELECT acl FROM acl;
+----
+1
+
+statement error
+ACL FOO SELECT 1;
+----
+syntax error
+
+# --- the principal's value: quoted either way, one plain literal, never empty --------------------
+
+query II
+ACL ROLE "analyst" SELECT region, sum(amount) FROM sales GROUP BY region ORDER BY region;
+----
+east	30
+west	5
+
+query I
+ACL ROLE 'analyst' SELECT count(*) FROM sales;
+----
+3
+
+statement error
+ACL ROLE analyst SELECT 1;
+----
+requires a quoted value
+
+# a string the tokenizer joins across a line break would be `analyst` from two literals - a client writing after
+# a gateway's `ACL ROLE 'ana'` must not finish its role name
+statement error
+ACL ROLE 'ana'
+'lyst' SELECT 1;
+----
+written as one plain literal
+
+statement error
+ACL ROLE E'analyst' SELECT 1;
+----
+requires a quoted value
+
+statement error
+ACL ROLE '' SELECT 1;
+----
+requires a value
+
+# a role prefix is the gateway's word: an unknown role is a principal with no grant, reading nothing
+statement error
+ACL ROLE "nobody" SELECT count(*) FROM sales;
+----
+no access to object
+
+# --- the markers: any order, quoted either way, each once; a comment among them is a comment ------
+
+query I
+ACL ROLE "analyst" PARENT '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01' TRACE "peg-trace-1" SELECT count(*) FROM sales;
+----
+3
+
+statement ok
+SELECT acl_audit_flush();
+
+query II
+SELECT correlation_id, traceparent FROM acl_audit_events() WHERE kind = 'statement' AND verdict = 'allowed' ORDER BY seq DESC LIMIT 1;
+----
+peg-trace-1	00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
+
+query I
+ACL ROLE "analyst" /* the gateway's note */ TRACE 'peg-trace-2' SELECT count(*) FROM sales;
+----
+3
+
+statement error
+ACL ROLE "analyst" TRACE 'a' TRACE 'b' SELECT 1;
+----
+may be written once
+
+statement error
+ACL ROLE "analyst" TRACE 'a'
+'b' SELECT 1;
+----
+written as one plain literal
+
+query I
+ACL ROLE "analyst" LINEAGE JOB 'peg-job' SELECT count(*) FROM sales;
+----
+3
+
+statement error
+ACL ROLE "analyst" LINEAGE JOB 'a' LINEAGE JOB 'b' SELECT 1;
+----
+LINEAGE may be written once
+
+statement error
+ACL ROLE "analyst" LINEAGE PARENT 'not-a-run' SELECT 1;
+----
+LINEAGE PARENT
+
+# --- the rest: where the scanner left it, parsed as its own text ----------------------------------
+
+# a statement's text is its own, never the prefix
+query I
+ACL ROLE "analyst" /* a tool's note */ SELECT current_query();
+----
+SELECT current_query();
+
+# an error points into the statement, not into the prefix
+statement error
+ACL ROLE "analyst" SELECT nope FROM sales;
+----
+<REGEX>:.*LINE 1: SELECT nope FROM sales.*
+
+# a prefix with no statement of its own, a separator right after it, the batch under one prefix
+statement ok
+ACL ROLE "analyst";
+
+query I
+ACL ROLE "analyst" ; SELECT count(*) FROM sales;
+----
+3
+
+query I
+ACL ROLE "analyst" SELECT 1; SELECT count(*) FROM sales;
+----
+1
+
+statement error
+ACL ROLE "analyst" SELECT count(*) FROM sales; SELECT * FROM phys.main.sales;
+----
+no access to object
+
+statement error
+ACL ROLE "analyst" SELECT 1; ACL ROLE "analyst" SELECT 2;
+----
+one ACL prefix per batch
+
+# an implicit PIVOT's enum step stays inside the prefix
+query III
+ACL ROLE "analyst" PIVOT sales ON quarter USING sum(amount) GROUP BY region ORDER BY region;
+----
+east	10	20
+west	5	NULL
+
+statement ok
+ACL ROLE "analyst" CREATE TABLE lake.landing(id INTEGER);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'landing';
+----
+1
+
+# --- the mode marker and the other kinds ------------------------------------------------------------
+
+statement error
+ACL ROLE "analyst" ACL NATIVE SELECT 1;
+----
+no ACL administration scope
+
+query I
+ACL ADMIN SELECT 42;
+----
+42
+
+statement ok
+ACL ADMIN ACL CREATE ROLE grammar_made;
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role = 'grammar_made';
+----
+1
+
+statement error
+ACL TOKEN 'not-a-token' SELECT 1;
+----
+token verification failed
+
+statement error
+ACL SESSION 'no-such-handle' SELECT 1;
+----
+session
+
+statement error
+ACL INGEST 'no-such-handle' ACL INSERT INTO sales VALUES ('x', 'q1', 1);
+----
+carries no mode marker
+
+# --- a connection that switched the rules on itself gets the same grammar, ours once ------------
+
+statement ok
+SET active_grammar_extensions = ['acl'];
+
+query I
+ACL ROLE "analyst" SELECT count(*) FROM sales;
+----
+3
+
+statement ok
+RESET active_grammar_extensions;

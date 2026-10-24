@@ -54,6 +54,17 @@ with connect(acme_token) as conn:
     cur.execute("SELECT count(*) FROM orders")
     check("the cursor survives (no poison)", cur.fetchall() == [(5,)])
 
+    # spec 150: a batch of statements is refused at Prepare - Flight SQL answers one statement a call (the owner,
+    # 2026-10-23: no batch on this door)
+    try:
+        cur.execute("SELECT 1; SELECT count(*) FROM orders")
+        cur.fetchall()
+        check("a batch is refused", False, "it ran")
+    except Exception as ex:
+        check("a batch is refused", "multiple statements" in str(ex), ex)
+    cur.execute("SELECT count(*) FROM orders")
+    check("...and the cursor survives it", cur.fetchall() == [(5,)])
+
     # --- executemany: rows land under the grant, and the predicate judges each row on write -------
     cur.executemany("INSERT INTO orders (id, tenant, amount, customer_id) VALUES (?, ?, ?, ?)",
                     [(300, "acme", 1, 0), (301, "acme", 2, 1)])

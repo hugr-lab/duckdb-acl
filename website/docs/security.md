@@ -22,13 +22,17 @@ stripped (spec 001) and the inner parse runs with the override disabled, so `ACL
 ACL ADMIN CREATE VIRTUAL CATALOG x` reaches duckdb's own parser as `ACL ADMIN CREATE …` and fails
 there - no re-entry, no mode laundering" (spec 009).
 
-**The prefix as a grammar rule (spec 150, being built).** The prefix is moving from a hand scanner to a rule of
-DuckDB's own PEG parser, so the text is read once, by one reader. Stage 1 reads `ACL ROLE` batches with the rule when
-`SET GLOBAL acl_peg_prefix = true` (off by default). The scanner still runs as well; where the two would read
-different prefixes (a comment or a split string inside the prefix), the statement is refused as a parse. The rules are
-also registered as the grammar extension `acl`, for completion only: `SET active_grammar_extensions = ['acl']` makes
-the CLI offer `ACL`, `ROLE` and the statements after it. A prefixed text that reaches DuckDB's own parser with that
-grammar on - the override turned off - is refused at bind, never run.
+**The prefix is read by a grammar rule (spec 150).** The prefix's head - the principal, the markers (`TRACE`, `PARENT`,
+`LINEAGE …`) and the client's `ACL` / `ACL NATIVE` - is read by a rule of DuckDB's own PEG parser, with DuckDB's
+tokenizer: no hand scanner reads the text, so there is no second reading of where the prefix ends. The rest of the
+statement is then parsed as its own text the way its mode parses it - a query by DuckDB's parser with the connection's
+grammar extensions, `ACL NATIVE` as DuckDB's own SQL, management by the management compiler. Each value in the head is
+one quoted literal written plainly (`'…'` or `"…"`, never empty): a string the tokenizer would join across a line break
+(`'ana'` then `'lyst'` on the next line) is refused, so a client writing after a gateway's prefix cannot finish the
+principal's name. Comments among the markers are comments. The rules are also registered as the grammar extension
+`acl`, for completion only: `SET active_grammar_extensions = ['acl']` makes the CLI offer `ACL`, the kinds and the
+statements after them; a prefixed text that reaches DuckDB's own parser with that grammar on - the override turned off -
+is refused at bind, never run. A prefix on a `CONNECT`-ed connection or under a dialect is refused.
 
 **The rewrite happens before bind.** The extension is a `parser_override`: it rewrites the parsed
 AST and "returns real `SQLStatement`s to the normal execution path" (spec 001). Enforcement is

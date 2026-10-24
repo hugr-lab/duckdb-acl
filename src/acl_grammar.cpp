@@ -3,17 +3,17 @@
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/parser/grammar_change.hpp"
 #include "duckdb/parser/grammar_extension.hpp"
-#include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/peg/compiled_grammar.hpp"
+#include "duckdb/parser/peg/passthrough_dialect.hpp"
+#include "duckdb/parser/peg/tokenizer/parser_tokenizer.hpp"
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
-#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
+#include "duckdb/parser/token_iterator.hpp"
 
 #include <mutex>
 
@@ -21,33 +21,30 @@ namespace duckdb {
 namespace acl {
 namespace {
 
-//! What the prefix rule yields: an ExtensionStatement of ours carrying the principal, the markers and
-//! the statement behind them. It never leaves the override - and if it ever reached the binder, the
-//! plan function refuses it.
+//! What the prefix rule yields: an ExtensionStatement of ours carrying what the head says. It never
+//! leaves the override - and one that reached the binder (the registered rules switched on, the
+//! override off) is refused by the plan function.
 struct PrefixParseData : ParserExtensionParseData {
-	string role;
-	string correlation_id;
-	string traceparent;
-	unique_ptr<SQLStatement> statement;
-	//! where the statement starts, counted from the prefix's first token, and in the whole text
-	idx_t statement_offset = 0;
-	idx_t statement_start = 0;
-	//! where the prefix itself starts in the whole text
-	optional_idx prefix_start;
+	string kind;
+	string value;
+	optional_idx value_offset;
+	struct Marker {
+		string word;
+		string value;
+		optional_idx offset;
+	};
+	vector<Marker> markers;
+	idx_t lineage_written = 0;
+	bool mode_written = false;
+	bool native = false;
+	//! where the rest passed through as tokens starts (none when the head is all there is)
+	optional_idx tail_offset;
 
 	unique_ptr<ParserExtensionParseData> Copy() const override {
-		auto copy = make_uniq<PrefixParseData>();
-		copy->role = role;
-		copy->correlation_id = correlation_id;
-		copy->traceparent = traceparent;
-		copy->statement = statement ? statement->Copy() : nullptr;
-		copy->statement_offset = statement_offset;
-		copy->statement_start = statement_start;
-		copy->prefix_start = prefix_start;
-		return std::move(copy);
+		return make_uniq<PrefixParseData>(*this);
 	}
 	string ToString() const override {
-		return "ACL ROLE " + SQLIdentifier::ToString(role) + " " + (statement ? statement->ToString() : "");
+		return "ACL " + StringUtil::Upper(kind) + (value_offset.IsValid() ? " " + SQLString::ToString(value) : "");
 	}
 };
 
@@ -85,15 +82,18 @@ void Collect(ParseResult &result, vector<reference<ParseResult>> &out) {
 	out.push_back(result);
 }
 
-//! The base rule under one of our helper rules (a choice, or a list of one part): ours have no transform
-ParseResult &BaseOf(ParseResult &result) {
+//! Under one of our helper rules: the choice taken, a list of one part - ours have no transform
+ParseResult &Strip(ParseResult &result) {
 	if (result.type == ParseResultType::CHOICE) {
-		return BaseOf(result.Cast<ChoiceParseResult>().GetResult());
+		return Strip(result.Cast<ChoiceParseResult>().GetResult());
+	}
+	if (result.type == ParseResultType::OPTIONAL && result.Cast<OptionalParseResult>().HasResult()) {
+		return Strip(result.Cast<OptionalParseResult>().GetResult());
 	}
 	if (result.type == ParseResultType::LIST && StringUtil::StartsWith(result.Name(), "Acl")) {
 		auto &list = result.Cast<ListParseResult>();
 		if (list.GetChildren().size() == 1) {
-			return BaseOf(list.GetChild(0));
+			return Strip(list.GetChild(0));
 		}
 	}
 	return result;
@@ -119,87 +119,160 @@ string KeywordOf(ParseResult &result) {
 	}
 }
 
-// AclPrefixedStatement <- 'ACL' 'ROLE' AclQuotedValue AclTraceMarker* Statement?
-arena_ptr<TransformResultValue> FinalizePrefixed(PEGTransformer &transformer, ParseResult &parse_result) {
+//! A quoted value (`AclQuotedValue <- StringLiteral / Identifier`): its text and where its token starts
+string ValueOf(PEGTransformer &transformer, ParseResult &result, optional_idx &offset) {
+	auto &base = Strip(result);
+	offset = base.offset;
+	return transformer.Transform<string>(base);
+}
+
+// AclPrefixedStatement <- 'ACL' AclPrincipal AclMarker* AclMode? AclTail?
+arena_ptr<TransformResultValue> FinalizePrefix(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto data = make_uniq<PrefixParseData>();
-	data->prefix_start = parse_result.offset;
-	data->role = transformer.Transform<string>(BaseOf(list.GetChild(2)));
+	// AclPrincipal <- AclPrincipalWord AclQuotedValue / 'ADMIN'
+	auto &principal = Strip(list.GetChild(1));
+	data->kind = KeywordOf(principal);
+	if (principal.type == ParseResultType::LIST) {
+		data->value = ValueOf(transformer, principal.Cast<ListParseResult>().GetChild(1), data->value_offset);
+	}
 	vector<reference<ParseResult>> markers;
-	Collect(list.GetChild(3), markers);
+	Collect(list.GetChild(2), markers);
 	for (auto &marker_result : markers) {
-		// AclTraceMarker <- AclTraceWord AclQuotedValue
-		auto &marker = marker_result.get().Cast<ListParseResult>();
-		bool trace = KeywordOf(marker.GetChild(0)) == "trace";
-		auto &target = trace ? data->correlation_id : data->traceparent;
-		if (!target.empty()) {
-			throw ParserException("acl_rewrite: ACL %s may be written once in a prefix", trace ? "TRACE" : "PARENT");
+		auto &marker = Strip(marker_result.get()).Cast<ListParseResult>();
+		if (KeywordOf(marker) == "lineage") {
+			// AclLineageMarker <- 'LINEAGE' AclLineagePart+, AclLineagePart <- AclLineageWord AclQuotedValue
+			data->lineage_written++;
+			vector<reference<ParseResult>> parts;
+			Collect(marker.GetChild(1), parts);
+			for (auto &part_result : parts) {
+				auto &part = Strip(part_result.get()).Cast<ListParseResult>();
+				PrefixParseData::Marker entry;
+				entry.word = "lineage." + KeywordOf(part.GetChild(0));
+				entry.value = ValueOf(transformer, part.GetChild(1), entry.offset);
+				data->markers.push_back(std::move(entry));
+			}
+			continue;
 		}
-		target = transformer.Transform<string>(BaseOf(marker.GetChild(1)));
+		// AclTraceMarker <- AclTraceWord AclQuotedValue
+		PrefixParseData::Marker entry;
+		entry.word = KeywordOf(marker.GetChild(0));
+		entry.value = ValueOf(transformer, marker.GetChild(1), entry.offset);
+		data->markers.push_back(std::move(entry));
 	}
-	auto &optional_statement = list.Child<OptionalParseResult>(4);
-	if (!optional_statement.HasResult()) {
-		// a prefix with no statement of its own (`ACL ROLE "r";`, a batch whose first part is empty), as the scanner
-		// reads it: the statements after it are still the prefix's
-		unique_ptr<SQLStatement> result = make_uniq<ExtensionStatement>(PrefixExtension(), std::move(data));
-		return transformer.MakeResult<unique_ptr<SQLStatement>>(std::move(result));
+	// AclMode <- 'ACL' AclNative?
+	auto &mode = list.Child<OptionalParseResult>(3);
+	if (mode.HasResult()) {
+		data->mode_written = true;
+		auto &mode_list = Strip(mode.GetResult()).Cast<ListParseResult>();
+		data->native = mode_list.GetChildren().size() > 1 && mode_list.Child<OptionalParseResult>(1).HasResult();
 	}
-	auto &statement_result = optional_statement.GetResult();
-	auto statement = transformer.Transform<unique_ptr<SQLStatement>>(statement_result);
-	if (IsPrefixStatement(*statement)) {
-		throw ParserException("acl_rewrite: a prefix inside a prefix is refused");
+	auto &tail = list.Child<OptionalParseResult>(4);
+	if (tail.HasResult()) {
+		data->tail_offset = tail.GetResult().offset;
+		if (!data->tail_offset.IsValid()) {
+			// the rest is cut from here: without its position the head would be read as part of it
+			throw ParserException("acl_rewrite: the ACL prefix's rest has no position");
+		}
 	}
-	// what duckdb's top level does for a statement (ExtractAndTransformStatement), done here for ours: the
-	// parameters on it, its PIVOT enums inside the prefix - never beside it (spec 075) - and the parameters on
-	// the wrapper too; taken, so the top level does not wrap the prefix in them again
-	if (!transformer.named_parameter_map.empty()) {
-		statement->named_param_map = transformer.named_parameter_map;
-	}
-	if (!transformer.pivot_entries.empty()) {
-		statement = transformer.CreatePivotStatement(std::move(statement));
-		statement->named_param_map = transformer.named_parameter_map;
-		transformer.pivot_entries.clear();
-	}
-	if (!parse_result.offset.IsValid() || !statement_result.offset.IsValid() ||
-	    statement_result.offset.GetIndex() < parse_result.offset.GetIndex()) {
-		// the statement's own text is cut from here: without it the prefix would be in it
-		throw ParserException("acl_rewrite: the ACL prefix's statement has no position");
-	}
-	data->statement_offset = statement_result.offset.GetIndex() - parse_result.offset.GetIndex();
-	data->statement_start = statement_result.offset.GetIndex();
-	data->statement = std::move(statement);
 	unique_ptr<SQLStatement> result = make_uniq<ExtensionStatement>(PrefixExtension(), std::move(data));
 	return transformer.MakeResult<unique_ptr<SQLStatement>>(std::move(result));
 }
 
-arena_ptr<TransformProcess> StartPrefixed(PEGTransformer &transformer, ParseResult &parse_result) {
-	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, FinalizePrefixed);
+arena_ptr<TransformProcess> StartPrefix(PEGTransformer &transformer, ParseResult &parse_result) {
+	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, FinalizePrefix);
 }
 
+//! The rules. The override's variant passes the rest through as tokens - it is parsed as its own text
+//! afterwards, by whatever reads that mode - and the registered one (completion only) offers a statement
 class AclPrefixGrammar final : public GrammarExtension {
 public:
-	AclPrefixGrammar() : GrammarExtension("acl", "acl: the ACL prefix (spec 150, stage 1)") {
+	AclPrefixGrammar(string name, bool passthrough_tail)
+	    : GrammarExtension(std::move(name), "acl: the ACL prefix (spec 150)"), passthrough_tail(passthrough_tail) {
 	}
 
 	vector<GrammarChange> GetChanges() const override {
 		vector<GrammarChange> changes;
 		changes.push_back(GrammarChange::AddRule(
-		    "AclPrefixedStatement <- 'ACL' 'ROLE' AclQuotedValue AclTraceMarker* Statement?", StartPrefixed));
-		// a value is any quoted text, as the scanner reads it ('…' or "…"); the value itself is no keyword to offer
+		    "AclPrefixedStatement <- 'ACL' AclPrincipal AclMarker* AclMode? AclTail?", StartPrefix));
+		changes.push_back(GrammarChange::AddRule("AclPrincipal <- AclPrincipalWord AclQuotedValue / 'ADMIN'"));
+		changes.push_back(GrammarChange::AddRule("AclPrincipalWord <- 'ROLE' / 'TOKEN' / 'SESSION' / 'INGEST'"));
+		// a value is quoted text, '…' or "…" (the reader refuses anything but one literal written plainly); the
+		// value itself is no keyword to offer
 		changes.push_back(GrammarChange::AddRule("AclQuotedValue <- StringLiteral / Identifier", nullptr,
 		                                         /*suppress_suggestions=*/true));
-		changes.push_back(GrammarChange::AddRule("AclTraceMarker <- AclTraceWord AclQuotedValue", nullptr,
-		                                         /*suppress_suggestions=*/true));
+		changes.push_back(GrammarChange::AddRule("AclMarker <- AclLineageMarker / AclTraceMarker"));
+		changes.push_back(GrammarChange::AddRule("AclTraceMarker <- AclTraceWord AclQuotedValue"));
 		changes.push_back(GrammarChange::AddRule("AclTraceWord <- 'TRACE' / 'PARENT'"));
+		changes.push_back(GrammarChange::AddRule("AclLineageMarker <- 'LINEAGE' AclLineagePart+"));
+		changes.push_back(GrammarChange::AddRule("AclLineagePart <- AclLineageWord AclQuotedValue"));
+		changes.push_back(GrammarChange::AddRule("AclLineageWord <- 'PARENT' / 'ROOT' / 'JOB'"));
+		changes.push_back(GrammarChange::AddRule("AclMode <- 'ACL' AclNative?"));
+		changes.push_back(GrammarChange::AddRule("AclNative <- 'NATIVE'"));
+		if (passthrough_tail) {
+			// any token up to the statement's end, the way duckdb's own passthrough dialect matches one
+			changes.push_back(GrammarChange::AddRule("AclTailToken <- Identifier"));
+			changes.push_back(GrammarChange::AddTerminalRuleOverride(
+			    "AclTailToken",
+			    [](const PEGKeywordHelper &) -> unique_ptr<Matcher> { return make_uniq<PassthroughTokenMatcher>(); }));
+			changes.push_back(GrammarChange::AddRule("AclTail <- AclTailToken+"));
+		} else {
+			changes.push_back(GrammarChange::AddRule("AclTail <- Statement"));
+		}
 		changes.push_back(GrammarChange::PrependChoice("Statement", "AclPrefixedStatement"));
 		return changes;
 	}
+
+private:
+	bool passthrough_tail;
 };
+
+//! The text a value's token must be: the value in its quotes, written plainly - so a string the tokenizer
+//! joins across a line break, an escape string or an unquoted name never stands for the value
+bool WrittenPlainly(const string &query, const MatcherToken &token, const string &value) {
+	if (token.offset + token.length > query.size() || query.compare(token.offset, token.length, token.text) != 0) {
+		return false;
+	}
+	if (token.text.empty() || (token.text[0] != '\'' && token.text[0] != '"')) {
+		return false;
+	}
+	auto quote = token.text[0];
+	string written(1, quote);
+	written += StringUtil::Replace(value, string(1, quote), string(2, quote));
+	written += quote;
+	return token.text == written;
+}
+
+optional_ptr<const MatcherToken> TokenAt(const TokenIterator &tokens, idx_t offset) {
+	for (idx_t i = 0; i < tokens.Size(); i++) {
+		auto &token = tokens.GetToken(i);
+		if (token.offset == offset && token.type != TokenType::END_OF_INPUT) {
+			return &token;
+		}
+	}
+	return nullptr;
+}
+
+//! `ACL <kind>`: the text's first two tokens - anything else is not a prefix of ours
+bool StartsWithPrefix(const TokenIterator &tokens) {
+	if (tokens.Size() < 2 || !StringUtil::CIEquals(tokens.GetToken(0).text, "acl")) {
+		return false;
+	}
+	auto &kind = tokens.GetToken(1).text;
+	for (auto word : {"role", "token", "session", "ingest", "admin"}) {
+		if (StringUtil::CIEquals(kind, word)) {
+			return true;
+		}
+	}
+	return false;
+}
 
 } // namespace
 
 struct AclGrammarCache::Impl {
-	shared_ptr<AclPrefixGrammar> grammar = make_shared_ptr<AclPrefixGrammar>();
+	//! what the override parses with, never registered; and what a connection may switch on
+	shared_ptr<AclPrefixGrammar> grammar = make_shared_ptr<AclPrefixGrammar>("acl_prefix_head", true);
+	shared_ptr<AclPrefixGrammar> registered = make_shared_ptr<AclPrefixGrammar>("acl", false);
 	std::mutex lock;
 	//! the caller's grammar extensions, in order -> the grammar compiled with ours behind them
 	vector<pair<vector<string>, shared_ptr<CompiledGrammar>>> compiled;
@@ -213,8 +286,8 @@ struct AclGrammarCache::Impl {
 			auto &callbacks = ExtensionCallbackManager::Get(*context);
 			for (auto &name : config.active_grammar_extensions) {
 				auto extension = callbacks.FindGrammarExtension(name);
-				// the connection switched ours on itself (CLI completion): it goes behind the others, once
-				if (extension && extension->Name() != grammar->Name()) {
+				// the registered rules are ours: the override's own take their place
+				if (extension && extension->Name() != registered->Name()) {
 					names.push_back(extension->Name());
 					extensions.emplace_back(*extension);
 				}
@@ -243,69 +316,101 @@ AclGrammarCache::~AclGrammarCache() {
 }
 
 shared_ptr<GrammarExtension> AclGrammarCache::Extension() const {
-	return impl->grammar;
+	return impl->registered;
 }
 
-bool AclGrammarCache::ParsePrefixed(const string &query, const ParserOptions &options, PegPrefix &out) {
+bool AclGrammarCache::ReadPrefix(const string &query, const ParserOptions &options, GrammarPrefix &out) {
 	auto context = options.context;
-	if (context) {
-		auto &config = ClientConfig::GetConfig(*context);
-		if (config.connected_grammar || config.current_dialect) {
-			return false;
-		}
-	}
 	ParserOptions inner = options;
 	inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
 	inner.compiled_grammar = impl->For(context);
-	Parser parser(inner);
-	parser.ParseQuery(query);
-	if (parser.statements.empty() || !IsPrefixStatement(*parser.statements[0])) {
-		throw ParserException("acl_rewrite: the ACL prefix did not parse as a prefix");
-	}
-	for (idx_t i = 0; i < parser.statements.size(); i++) {
-		auto &statement = parser.statements[i];
-		if (i > 0) {
-			if (IsPrefixStatement(*statement)) {
-				throw ParserException("acl_rewrite: a batch carries one prefix");
-			}
-			out.statements.push_back(std::move(statement));
-			continue;
-		}
-		auto &data = statement->Cast<ExtensionStatement>().parse_data->Cast<PrefixParseData>();
-		auto parsed_start = data.prefix_start;
-		out.role = data.role;
-		out.correlation_id = data.correlation_id;
-		out.traceparent = data.traceparent;
-		out.has_statement = data.statement != nullptr;
-		out.statement_start = data.statement_start;
-		if (!data.statement) {
-			// where the prefix's own part of the text ends: past its separators, at the next statement
-			if (!parsed_start.IsValid()) {
-				throw ParserException("acl_rewrite: the ACL prefix has no position");
-			}
-			out.statement_start = parsed_start.GetIndex() + statement->query.size();
-			continue;
-		}
-		auto inner_statement = std::move(data.statement);
-		// the statement's own text, as the scanner's inner parse gave it: the prefix's text past the markers
-		inner_statement->query =
-		    statement->query.substr(MinValue<idx_t>(data.statement_offset, statement->query.size()));
-		inner_statement->stmt_location = QueryLocation(0, inner_statement->query.size());
-		if (inner_statement->type == StatementType::CREATE_STATEMENT) {
-			inner_statement->Cast<CreateStatement>().info->sql = inner_statement->query;
-		}
-		out.statements.push_back(std::move(inner_statement));
-	}
-	return true;
-}
-
-bool PegPrefixEnabled(const ParserOptions &options) {
-	if (!options.context) {
+	auto owned = make_uniq<vector<MatcherToken>>();
+	ParserTokenizerBehavior behavior(query, *owned);
+	inner.compiled_grammar->GetTokenizer().TokenizeInput(behavior);
+	TokenIterator tokens(std::move(owned));
+	if (!StartsWithPrefix(tokens)) {
 		return false;
 	}
-	Value value;
-	auto &db = DatabaseInstance::GetDatabase(*options.context);
-	return db.TryGetCurrentSetting("acl_peg_prefix", value) && !value.IsNull() && value.GetValue<bool>();
+	if (context) {
+		auto &config = ClientConfig::GetConfig(*context);
+		if (config.connected_grammar || config.current_dialect) {
+			// a grammar of the connection owner's choosing: nothing of ours can be added to it, and nothing
+			// there runs as a principal
+			throw ParserException("acl_rewrite: an ACL prefix is refused on a CONNECT-ed connection or under a "
+			                      "dialect - DISCONNECT, or RESET current_dialect");
+		}
+	}
+	// a principal's value must follow its kind as a quoted token - said here, in the scanner's words, rather than as
+	// the rule's syntax error at whatever came instead
+	auto kind_word = StringUtil::Lower(tokens.GetToken(1).text);
+	if (kind_word != "admin") {
+		auto value_quoted = tokens.Size() > 2 && !tokens.GetToken(2).text.empty() &&
+		                    (tokens.GetToken(2).text[0] == '\'' || tokens.GetToken(2).text[0] == '"');
+		if (!value_quoted) {
+			if (kind_word == "ingest") {
+				throw ParserException("acl_rewrite: ACL INGEST requires a quoted session handle");
+			}
+			throw ParserException("acl_rewrite: ACL %s requires a quoted value", StringUtil::Upper(kind_word));
+		}
+	}
+	// the head and the rest of its statement, passed through; the statements after it are the rest's
+	TokenIterator cursor(tokens);
+	Parser parser(inner);
+	auto statement = parser.ParseTopLevelStatement(cursor);
+	if (!statement || !IsPrefixStatement(*statement)) {
+		throw ParserException("acl_rewrite: the ACL prefix does not parse");
+	}
+	auto &data = statement->Cast<ExtensionStatement>().parse_data->Cast<PrefixParseData>();
+	auto written_plainly = [&](const optional_idx &offset, const string &value, const string &what) {
+		auto token = offset.IsValid() ? TokenAt(tokens, offset.GetIndex()) : nullptr;
+		if (!token || !WrittenPlainly(query, *token, value)) {
+			throw ParserException("acl_rewrite: ACL %s requires a quoted value, written as one plain literal", what);
+		}
+	};
+	if (data.kind == "role") {
+		out.kind = GrammarPrefix::Kind::ROLE;
+	} else if (data.kind == "token") {
+		out.kind = GrammarPrefix::Kind::TOKEN;
+	} else if (data.kind == "session") {
+		out.kind = GrammarPrefix::Kind::SESSION;
+	} else if (data.kind == "ingest") {
+		out.kind = GrammarPrefix::Kind::INGEST;
+	} else {
+		out.kind = GrammarPrefix::Kind::ADMIN;
+	}
+	if (out.kind != GrammarPrefix::Kind::ADMIN) {
+		written_plainly(data.value_offset, data.value, StringUtil::Upper(data.kind));
+		if (data.value.empty()) {
+			throw ParserException("acl_rewrite: ACL %s requires a value", StringUtil::Upper(data.kind));
+		}
+		out.value = data.value;
+	}
+	for (auto &marker : data.markers) {
+		auto word = StringUtil::Upper(StringUtil::Replace(marker.word, "lineage.", "LINEAGE "));
+		written_plainly(marker.offset, marker.value, word);
+		out.markers.push_back(GrammarPrefix::Marker {marker.word, marker.value});
+	}
+	out.lineage_written = data.lineage_written;
+	out.mode_written = data.mode_written;
+	out.native = data.native;
+	// the rest starts past the head's last token and the whitespace after it - as the scanner left it
+	idx_t head_end = 0;
+	auto head_tokens = cursor.Position();
+	for (idx_t i = 0; i < head_tokens && i < tokens.Size(); i++) {
+		auto &token = tokens.GetToken(i);
+		if (data.tail_offset.IsValid() && token.offset >= data.tail_offset.GetIndex()) {
+			break;
+		}
+		if (token.type == TokenType::TERMINATOR || token.type == TokenType::END_OF_INPUT) {
+			break;
+		}
+		head_end = token.offset + token.length;
+	}
+	while (head_end < query.size() && StringUtil::CharacterIsSpace(query[head_end])) {
+		head_end++;
+	}
+	out.rest_start = head_end;
+	return true;
 }
 
 } // namespace acl
