@@ -2057,10 +2057,11 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 		for (auto &parsed : grammar.ReadManagement(text, options)) {
 			pieces.push_back(Piece {std::move(parsed), nullptr});
 		}
-	} catch (ParserException &) {
+	} catch (ParserException &batch_refusal) {
 		// a text duckdb's tokenizer refuses (an empty quoted name, an unterminated string): piece by piece as the batch
 		// splits - each piece the grammar reads is its rules', and the one it refuses goes to the compiler, which says
 		// what is wrong in its own words, as it did
+		ErrorData batch_error(batch_refusal);
 		pieces.clear();
 		for (auto &piece : SplitBatchText(text)) {
 			try {
@@ -2074,6 +2075,18 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 				pieces.push_back(Piece {std::move(parsed), make_shared_ptr<ErrorData>(refusal)});
 			}
 		}
+		bool reproduced = false;
+		for (auto &piece : pieces) {
+			reproduced = reproduced || piece.refused;
+		}
+		if (!reproduced) {
+			// no piece holds what the tokenizer refused (an unterminated comment the split dropped as one): the batch
+			// is refused as a whole, never run without it
+			auto info = batch_error.ExtraInfo();
+			info.erase("position");
+			info.erase("location");
+			throw ParserException(info, batch_error.RawMessage());
+		}
 	}
 	vector<unique_ptr<SQLStatement>> statements;
 	for (auto &piece : pieces) {
@@ -2083,7 +2096,11 @@ vector<unique_ptr<SQLStatement>> ParseMgmtBatch(const string &text, const string
 				statements.push_back(CompileMgmtText(entry.text));
 			} catch (MovedFormRefusal &) {
 				if (piece.refused) {
-					piece.refused->Throw();
+					// the tokenizer's words - its position counts in the piece, not in the batch, so it goes
+					auto info = piece.refused->ExtraInfo();
+					info.erase("position");
+					info.erase("location");
+					throw ParserException(info, piece.refused->RawMessage());
 				}
 				throw;
 			}

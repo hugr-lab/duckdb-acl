@@ -141,8 +141,10 @@ the `;`, as text, to the compiler - the batch's other statements are not blamed.
 `;` inside parentheses now ends a statement - none of ours holds one; `SplitBatchText` reads comments as the
 tokenizer does, a line comment ending at either line break, block comments nested); a text the tokenizer refuses is
 read piece by piece - the pieces it reads by their rules, the refused one by the compiler in its own words (a moved
-form refused there says the tokenizer's: an unterminated string). Values a rule reads are checked against their
-tokens - one plain quoted literal (an empty one passes, as it did: the function judges it), a level a bare word. hugr-node's registered forms
+form refused there says the tokenizer's: an unterminated string), and a batch no piece of which holds the refusal (an
+unterminated comment the split drops) is refused whole - never run without it. Values a rule reads are checked against their
+tokens - one plain quoted literal (an empty `''` passes, as it did: the function judges it; `""` is a zero-length
+identifier the tokenizer refuses), a level a bare word. hugr-node's registered forms
 (`RegisterMgmtGrammar`, spec 126) take the legacy path unchanged. The text checks that tell a management batch from
 native SQL (`IsMgmtStart`, `StartsWithMgmt`, `BatchHasMgmtStatement`, `SplitBatchText`, `RefuseRepeatedPrefix`) stay
 until the last PR of the stage, which judges the batch by its parse and drops `AdminScanner`.

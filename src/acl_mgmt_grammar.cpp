@@ -298,8 +298,8 @@ vector<MgmtParsed> ReadMgmtStatements(shared_ptr<CompiledGrammar> compiled, cons
 		}
 		for (auto &bare : data.bare) {
 			auto index = bare.offset.IsValid() ? TokenIndexAt(tokens, bare.offset.GetIndex()) : optional_idx();
-			if (!index.IsValid() || tokens.GetToken(index.GetIndex()).text.empty() ||
-			    tokens.GetToken(index.GetIndex()).text[0] == '"') {
+			auto written = index.IsValid() ? tokens.GetToken(index.GetIndex()).text : string();
+			if (written.empty() || written[0] == '"' || written[0] == '`') {
 				throw BinderException("acl admin: expected %s written as a word, not a quoted name", bare.what);
 			}
 		}

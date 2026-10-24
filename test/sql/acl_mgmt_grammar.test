@@ -189,6 +189,41 @@ SELECT count(*) FROM aclcat.acl.roles WHERE role = 'never_made';
 statement ok
 ACL ADMIN ALTER ROLE grammar_one SET COMMENT ""; RESUME NODE;
 
+# a batch the tokenizer refuses never runs without what it refused - an unterminated comment the split would drop
+statement error
+ACL ADMIN DRAIN NODE; /* never closed RESUME NODE;
+----
+unterminated
+
+query I
+SELECT acl_drain_status();
+----
+serving
+
+statement error
+ACL ADMIN CREATE ROLE made_anyway; /* a /* b */ DROP ROLE made_anyway;
+----
+unterminated
+
+query I
+SELECT count(*) FROM aclcat.acl.roles WHERE role = 'made_anyway';
+----
+0
+
+# block comments nest, as duckdb's tokenizer reads them: a comment that holds one before the statement says nothing
+query I
+ACL ADMIN /* a /* b */ c */ DRAIN NODE;
+----
+0
+
+statement ok
+ACL ADMIN RESUME NODE;
+
+statement error
+ACL ADMIN PROFILE SESSION 'x' `on`;
+----
+expected a profile level written as a word
+
 # a moved form the tokenizer refuses says the tokenizer's words
 statement error
 ACL ADMIN KILL SESSION 'unterminated;
